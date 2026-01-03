@@ -1,0 +1,25 @@
+[project]
+name = "vernon-lang"
+version = "0.1.0"
+description = "General parallel compiler"
+requires-python = ">=3.11.9,<3.12"
+authors = [{ name = "Xinyu Yuan", email = "1282503538@qq.com" }]
+
+dependencies = [
+    "pybind11>=3.0.0",
+    "sympy>=1.13.3",
+    "numpy>=1.26,<2.0",
+    "pandas>=2.3.1",
+    "pyyaml>=6.0.2",
+    "nanobind>=2.7.0",
+    "clang>=20.1.5",
+    "pyserial>=3.5",
+    "clang-format==20.1.8",
+    "yapf==0.43.0",
+    "fastapi>=0.115.7",
+    "uvicorn>=0.29.0",
+    "watchdog>=4.0.0",
+    "requests>=2.28.1",
+    "taichi>=1.7.4",
+    "conan>=2.22.0",
+]
