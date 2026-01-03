@@ -13,6 +13,9 @@ add_mlir_dialect_library(MLIRVernonDialect
 
   LINK_LIBS PUBLIC
   MLIRArithDialect
+  MLIRTensorDialect
+  MLIRVectorDialect
+  MLIRLinalgDialect
   MLIRIR
   MLIRSideEffectInterfaces
   MLIRInferTypeOpInterface

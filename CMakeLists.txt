@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20.0)
 
 project(VernonDSL VERSION 0.1.0 LANGUAGES CXX C)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ standard to conform to")
 set(MLIR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/llvm-project/install/lib/cmake/mlir)
 # Find MLIR

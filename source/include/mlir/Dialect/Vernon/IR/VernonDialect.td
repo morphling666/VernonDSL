@@ -27,12 +27,14 @@ def Vernon_Dialect : Dialect {
     - Type aliases for common vector and matrix types (vec2, vec3, vec4, mat2, mat3, mat4)
     - Operations for component access and swizzling (.r, .g, .b, .a, .rg, .rgb, etc.)
   }];
-  let usePropertiesForAttributes = 1;
+
   let hasCanonicalizer = 1;
   let hasConstantMaterializer = 1;
   let dependentDialects = [
     "arith::ArithDialect",
-    "tensor::TensorDialect"
+    "tensor::TensorDialect",
+    "vector::VectorDialect",
+    "linalg::LinalgDialect"
   ];
 }
 
