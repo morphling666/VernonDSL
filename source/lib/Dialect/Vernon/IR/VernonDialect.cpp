@@ -19,7 +19,6 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 
-
 using namespace mlir;
 using namespace mlir::vernon;
 
@@ -38,4 +37,15 @@ void VernonDialect::initialize() {
 #define GET_OP_LIST
 #include "mlir/Dialect/Vernon/IR/VernonOps.cpp.inc"
       >();
+}
+
+void VernonDialect::getCanonicalizationPatterns(
+    RewritePatternSet &patterns) const {
+  // empty for now
+}
+
+Operation *VernonDialect::materializeConstant(OpBuilder &builder,
+                                              Attribute value, Type type,
+                                              Location loc) {
+  return nullptr;
 }
