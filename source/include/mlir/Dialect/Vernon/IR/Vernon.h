@@ -8,6 +8,7 @@
 #ifndef MLIR_DIALECT_VERNON_IR_VERNON_H_
 #define MLIR_DIALECT_VERNON_IR_VERNON_H_
 
+#include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/OpImplementation.h"

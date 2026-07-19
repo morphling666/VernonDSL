@@ -4,6 +4,40 @@ project(VernonDSL VERSION 0.1.0 LANGUAGES CXX C)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ standard to conform to")
+include(CTest)
+
+option(VERNON_ENABLE_SPIRV_CROSS
+  "Build OpenGL, OpenGL ES, Metal, and HLSL source backends" ON)
+if(VERNON_ENABLE_SPIRV_CROSS)
+  include(FetchContent)
+  set(SPIRV_CROSS_CLI OFF CACHE BOOL "" FORCE)
+  set(SPIRV_CROSS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+  set(SPIRV_CROSS_ENABLE_C_API OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(spirv_cross
+    GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Cross.git
+    GIT_TAG main
+    GIT_SHALLOW TRUE
+  )
+  FetchContent_GetProperties(spirv_cross)
+  if(NOT spirv_cross_POPULATED)
+    if(POLICY CMP0169)
+      cmake_policy(PUSH)
+      cmake_policy(SET CMP0169 OLD)
+    endif()
+    FetchContent_Populate(spirv_cross)
+    if(POLICY CMP0169)
+      cmake_policy(POP)
+    endif()
+    # SPIRV-Cross is statically linked into the compiler. Excluding its
+    # directory keeps its unrelated install rules out of the Vernon SDK.
+    add_subdirectory(
+      ${spirv_cross_SOURCE_DIR}
+      ${spirv_cross_BINARY_DIR}
+      EXCLUDE_FROM_ALL
+    )
+  endif()
+endif()
+
 set(MLIR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/llvm-project/install/lib/cmake/mlir)
 # Find MLIR
 find_package(MLIR REQUIRED CONFIG)

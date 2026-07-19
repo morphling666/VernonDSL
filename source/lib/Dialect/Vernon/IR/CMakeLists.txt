@@ -1,4 +1,5 @@
 add_mlir_dialect_library(MLIRVernonDialect
+  VernonAttrs.cpp
   VernonDialect.cpp
   VernonTypes.cpp
   VernonOps.cpp
@@ -16,6 +17,7 @@ add_mlir_dialect_library(MLIRVernonDialect
   MLIRTensorDialect
   MLIRVectorDialect
   MLIRLinalgDialect
+  MLIRMemRefDialect
   MLIRIR
   MLIRSideEffectInterfaces
   MLIRInferTypeOpInterface

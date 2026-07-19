@@ -20,3 +20,9 @@ using namespace mlir::vernon;
 
 #define GET_OP_CLASSES
 #include "mlir/Dialect/Vernon/IR/VernonOps.cpp.inc"
+
+LogicalResult IntrinsicOp::verify() {
+  if (getNameAttr().getValue().empty())
+    return emitOpError("requires a non-empty intrinsic name");
+  return success();
+}

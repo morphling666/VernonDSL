@@ -26,8 +26,12 @@ module {
     %view_model_pos = tensor.from_elements %zero, %zero, %zero, %zero: tensor<4xf32>
     %gl_Position = tensor.from_elements %zero, %zero, %zero, %zero: tensor<4xf32>
 
-    //linalg.matvec ins(%model, %pos4 : tensor<4x4xf32>, tensor<4xf32>)
-    //              outs(%model_pos : tensor<4xf32>)
+    //%A = memref.alloc() : memref<4x4xf32>
+    //%B = memref.alloc() : memref<4xf32>
+    //%C = memref.alloc() : memref<4xf32>
+    linalg.matvec
+      ins(%model, %pos4: tensor<4x4xf32>, tensor<4xf32>)
+      outs(%model_pos: tensor<4xf32>)
 
     //linalg.matvec ins(%view, %model_pos : tensor<4x4xf32>, tensor<4xf32>)
     //              outs(%view_model_pos : tensor<4xf32>)

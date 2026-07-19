@@ -23,3 +23,16 @@ dependencies = [
     "taichi>=1.7.4",
     "conan>=2.22.0",
 ]
+
+[project.scripts]
+vernon-compile-python = "vernon_dsl.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]
