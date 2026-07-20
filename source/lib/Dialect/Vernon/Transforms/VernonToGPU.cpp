@@ -129,6 +129,18 @@ struct VernonToGPUPass
             spirv::getInterfaceVarABIAttr(binding.first, binding.second,
                                           std::nullopt, source.getContext()));
       }
+      if (useSpirvStorage) {
+        for (unsigned index = 0; index < kernel.getNumArguments(); ++index) {
+          if (kernel.getArgAttr(index, spirv::getInterfaceVarABIAttrName()))
+            continue;
+          std::optional<spirv::StorageClass> storageClass;
+          if (kernel.getArgument(index).getType().isIntOrIndexOrFloat())
+            storageClass = spirv::StorageClass::StorageBuffer;
+          kernel.setArgAttr(index, spirv::getInterfaceVarABIAttrName(),
+                            spirv::getInterfaceVarABIAttr(
+                                0, index, storageClass, source.getContext()));
+        }
+      }
 
       Block *entry = &kernel.front();
       OpBuilder bodyBuilder = OpBuilder::atBlockBegin(entry);
@@ -200,6 +212,30 @@ struct VernonToGPUPass
           }
         }
         bodyBuilder.clone(operation, mapping);
+      }
+
+      // Intrinsics nested under structured control flow are cloned recursively,
+      // so lower them after the complete kernel body has been materialized.
+      SmallVector<IntrinsicOp> nestedIntrinsics;
+      kernel.walk([&](IntrinsicOp intrinsic) {
+        nestedIntrinsics.push_back(intrinsic);
+      });
+      for (IntrinsicOp intrinsic : nestedIntrinsics) {
+        OpBuilder builder(intrinsic);
+        if (intrinsic.getName() == "buffer_load") {
+          Value loaded = memref::LoadOp::create(builder, intrinsic.getLoc(),
+                                                intrinsic.getOperand(0),
+                                                intrinsic.getOperand(1));
+          intrinsic.getResult().replaceAllUsesWith(loaded);
+          intrinsic.erase();
+          continue;
+        }
+        if (intrinsic.getName() == "buffer_store") {
+          memref::StoreOp::create(
+              builder, intrinsic.getLoc(), intrinsic.getOperand(2),
+              intrinsic.getOperand(0), intrinsic.getOperand(1));
+          intrinsic.erase();
+        }
       }
     }
   }

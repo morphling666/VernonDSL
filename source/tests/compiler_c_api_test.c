@@ -1,6 +1,7 @@
 #include "VernonCompiler.h"
 
 #include <assert.h>
+#include <stdio.h>
 #include <string.h>
 
 static int view_contains(VernonStringView value, const char *needle) {
@@ -91,6 +92,99 @@ int main(void) {
       "    return\n"
       "  }\n"
       "}\n";
+  static const char cuda_while_module[] =
+      "module {\n"
+      "  func.func @loop(%values: !vernon.buffer<f32, \"read_write\"> "
+      "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
+      "vernon.binding = 0 : i64}, %phase: f32 "
+      "{vernon.interface = \"input\", vernon.location = 1 : i64}) "
+      "attributes {vernon.entry, "
+      "vernon.stage = \"compute\", "
+      "vernon.workgroup_size = array<i32: 1, 1, 1>} {\n"
+      "    %true = arith.constant true\n"
+      "    scf.if %true {\n"
+      "      %minus_point_eight = arith.constant -8.000000e-01 : f32\n"
+      "      %cosine = math.cos %phase : f32\n"
+      "      %point_two = arith.constant 2.000000e-01 : f32\n"
+      "      %imaginary = arith.mulf %cosine, %point_two : f32\n"
+      "      %c = \"vernon.intrinsic\"(%minus_point_eight, %imaginary) "
+      "{name = \"construct\"} : (f32, f32) -> tensor<2xf32>\n"
+      "      %point_one = arith.constant 1.000000e-01 : f32\n"
+      "      %z = \"vernon.intrinsic\"(%point_one, %point_two) "
+      "{name = \"construct\"} : (f32, f32) -> tensor<2xf32>\n"
+      "      %initial = arith.constant 0 : i32\n"
+      "      %result, %final = scf.while "
+      "(%iteration = %initial, %value = %z) : "
+      "(i32, tensor<2xf32>) -> (i32, tensor<2xf32>) {\n"
+      "        %squared = \"vernon.intrinsic\"(%value, %value) "
+      "{name = \"dot\"} : (tensor<2xf32>, tensor<2xf32>) -> f32\n"
+      "        %length = math.sqrt %squared : f32\n"
+      "        %radius = arith.constant 2.000000e+01 : f32\n"
+      "        %inside = arith.cmpf olt, %length, %radius : f32\n"
+      "        %limit = arith.constant 4 : i32\n"
+      "        %below_limit = arith.cmpi slt, %iteration, %limit : i32\n"
+      "        %condition = arith.andi %inside, %below_limit : i1\n"
+      "        scf.condition(%condition) %iteration, %value "
+      ": i32, tensor<2xf32>\n"
+      "      } do {\n"
+      "        ^bb0(%iteration: i32, %value: tensor<2xf32>):\n"
+      "        %one = arith.constant 1 : i32\n"
+      "        %next = arith.addi %iteration, %one : i32\n"
+      "        scf.yield %next, %c : i32, tensor<2xf32>\n"
+      "      }\n"
+      "      %index = arith.constant 0 : index\n"
+      "      %value = arith.sitofp %result : i32 to f32\n"
+      "      \"vernon.intrinsic\"(%values, %index, %value) "
+      "{name = \"buffer_store\"} : "
+      "(!vernon.buffer<f32, \"read_write\">, index, f32) -> ()\n"
+      "      scf.yield\n"
+      "    } else {\n"
+      "      scf.yield\n"
+      "    }\n"
+      "    return\n"
+      "  }\n"
+      "}\n";
+  static const char cuda_rank_three_tensor_module[] =
+      "module {\n"
+      "  func.func @tensor3(%values: !vernon.buffer<f32, \"read_write\"> "
+      "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
+      "vernon.binding = 0 : i64}) attributes {vernon.entry, "
+      "vernon.stage = \"compute\", "
+      "vernon.workgroup_size = array<i32: 1, 1, 1>} {\n"
+      "    %ones = arith.constant dense<1.0> : tensor<2x3x4xf32>\n"
+      "    %two = arith.constant 2.0 : f32\n"
+      "    %twos = tensor.splat %two : tensor<2x3x4xf32>\n"
+      "    %sum = arith.addf %ones, %twos : tensor<2x3x4xf32>\n"
+      "    %i = arith.constant 1 : index\n"
+      "    %j = arith.constant 2 : index\n"
+      "    %k = arith.constant 3 : index\n"
+      "    %value = tensor.extract %sum[%i, %j, %k] "
+      ": tensor<2x3x4xf32>\n"
+      "    %index = arith.constant 0 : index\n"
+      "    \"vernon.intrinsic\"(%values, %index, %value) "
+      "{name = \"buffer_store\"} : "
+      "(!vernon.buffer<f32, \"read_write\">, index, f32) -> ()\n"
+      "    return\n"
+      "  }\n"
+      "}\n";
+  static const char cuda_dynamic_local_tensor_module[] =
+      "module {\n"
+      "  func.func @dynamic_local("
+      "%values: !vernon.buffer<f32, \"read_write\"> "
+      "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
+      "vernon.binding = 0 : i64}) attributes {vernon.entry, "
+      "vernon.stage = \"compute\", "
+      "vernon.workgroup_size = array<i32: 1, 1, 1>} {\n"
+      "    %size = arith.constant 4 : index\n"
+      "    %value = tensor.empty(%size) : tensor<?xf32>\n"
+      "    %index = arith.constant 0 : index\n"
+      "    %element = tensor.extract %value[%index] : tensor<?xf32>\n"
+      "    \"vernon.intrinsic\"(%values, %index, %element) "
+      "{name = \"buffer_store\"} : "
+      "(!vernon.buffer<f32, \"read_write\">, index, f32) -> ()\n"
+      "    return\n"
+      "  }\n"
+      "}\n";
   static const char cpu_texture_module[] =
       "module {\n"
       "  func.func @sample_color("
@@ -127,6 +221,8 @@ int main(void) {
       vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_OPENGL);
   VernonTargetCapabilities opengles =
       vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_OPENGL_ES);
+  VernonTargetCapabilities metal =
+      vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_METAL);
 
   VernonCompileResult *validation =
       vernonCompilerValidateMlir(context, module, strlen(module));
@@ -245,6 +341,60 @@ int main(void) {
   assert(ptx.size != 0);
   assert(strstr(ptx.data, ".version") != NULL);
   vernonCompileResultDestroy(cuda_compile);
+
+  VernonCompileResult *cuda_while_compile =
+      vernonCompilerCompileMlir(context, cuda_while_module,
+                                strlen(cuda_while_module), VERNON_TARGET_CUDA);
+  assert(cuda_while_compile != NULL);
+  assert(vernonCompileResultGetStatus(cuda_while_compile) == VERNON_STATUS_OK);
+  VernonStringView while_ptx =
+      vernonCompileResultGetArtifactData(cuda_while_compile, 0);
+  assert(while_ptx.size != 0);
+  assert(view_contains(while_ptx, ".version"));
+  assert(view_contains(while_ptx, "cos.approx"));
+  assert(view_contains(while_ptx, "sqrt.rn"));
+  assert(!view_contains(while_ptx, "__nv_"));
+  vernonCompileResultDestroy(cuda_while_compile);
+
+  if (metal.available) {
+    VernonCompileResult *metal_compute = vernonCompilerCompileMlir(
+        context, cuda_while_module, strlen(cuda_while_module),
+        VERNON_TARGET_METAL);
+    assert(metal_compute != NULL);
+    assert(vernonCompileResultGetStatus(metal_compute) == VERNON_STATUS_OK);
+    VernonStringView metal_source =
+        vernonCompileResultGetArtifactData(metal_compute, 0);
+    assert(view_contains(metal_source, "kernel void loop"));
+    assert(view_contains(vernonCompileResultGetReflection(metal_compute),
+                         "\"target\":\"metal\""));
+    vernonCompileResultDestroy(metal_compute);
+  }
+
+  VernonCompileResult *cuda_rank_three_compile = vernonCompilerCompileMlir(
+      context, cuda_rank_three_tensor_module,
+      strlen(cuda_rank_three_tensor_module), VERNON_TARGET_CUDA);
+  assert(cuda_rank_three_compile != NULL);
+  if (vernonCompileResultGetStatus(cuda_rank_three_compile) !=
+      VERNON_STATUS_OK) {
+    VernonStringView diagnostics =
+        vernonCompileResultGetDiagnostics(cuda_rank_three_compile);
+    fprintf(stderr, "%.*s\n", (int)diagnostics.size, diagnostics.data);
+  }
+  assert(vernonCompileResultGetStatus(cuda_rank_three_compile) ==
+         VERNON_STATUS_OK);
+  assert(vernonCompileResultGetArtifactCount(cuda_rank_three_compile) == 1);
+  vernonCompileResultDestroy(cuda_rank_three_compile);
+
+  VernonCompileResult *cuda_dynamic_local_compile = vernonCompilerCompileMlir(
+      context, cuda_dynamic_local_tensor_module,
+      strlen(cuda_dynamic_local_tensor_module), VERNON_TARGET_CUDA);
+  assert(cuda_dynamic_local_compile != NULL);
+  assert(vernonCompileResultGetStatus(cuda_dynamic_local_compile) !=
+         VERNON_STATUS_OK);
+  assert(view_contains(
+      vernonCompileResultGetDiagnostics(cuda_dynamic_local_compile),
+      "dynamic local value Tensor"));
+  vernonCompileResultDestroy(cuda_dynamic_local_compile);
 
   VernonCompileResult *cpu_compile = vernonCompilerCompileMlir(
       context, cpu_module, strlen(cpu_module), VERNON_TARGET_CPU);

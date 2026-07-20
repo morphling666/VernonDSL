@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
 from .diagnostics import CompileError, SourceLocation
 from .module_graph import load_project
+from .struct_methods import normalize_struct_methods
 
 _SCALARS = {
     "bool": "i1",
@@ -103,6 +105,7 @@ class FunctionSignature:
 class Value:
     name: str
     type: DslType
+    fields: tuple["Value", ...] | None = None
 
 
 @dataclass
@@ -113,6 +116,7 @@ class _ModuleContext:
     signatures: dict[str, FunctionSignature] = field(default_factory=dict)
     result_annotations: dict[str, AnnotatedType
                              | None] = field(default_factory=dict)
+    shared_functions: set[str] = field(default_factory=set)
 
     def error(self, node: ast.AST, message: str) -> CompileError:
         return CompileError(
@@ -337,6 +341,54 @@ class _FunctionEmitter:
         self.environment: dict[str, Value] = {}
         self.returned = False
 
+    def _entry_result_fields(
+            self) -> tuple[tuple[str, AnnotatedType], ...] | None:
+        if (self.stage not in {"vertex", "fragment"}
+                or self.signature.result is None
+                or self.signature.result.kind != "struct"):
+            return None
+        fields = self.context.structs[self.signature.result.name]
+        occupied: set[int] = set()
+        builtins: set[str] = set()
+        for field_name, annotation in fields:
+            locations = [
+                int(item.arguments[0]) for item in annotation.metadata
+                if item.kind == "location"
+            ]
+            builtin_values = [
+                str(item.arguments[0]) for item in annotation.metadata
+                if item.kind == "builtin"
+            ]
+            if self.stage == "fragment" and (len(locations) != 1
+                                             or builtin_values):
+                raise self.context.error(
+                    self.node,
+                    f"fragment output field '{field_name}' requires exactly one location"
+                )
+            if self.stage == "vertex" and (len(locations) + len(builtin_values)
+                                           != 1):
+                raise self.context.error(
+                    self.node,
+                    f"vertex output field '{field_name}' requires exactly one location or builtin"
+                )
+            if builtin_values:
+                builtin = builtin_values[0]
+                if builtin in builtins:
+                    raise self.context.error(
+                        self.node,
+                        f"vertex output builtin '{builtin}' is used more than once"
+                    )
+                builtins.add(builtin)
+                continue
+            location = locations[0]
+            if location in occupied:
+                raise self.context.error(
+                    self.node,
+                    f"fragment output location {location} is used more than once"
+                )
+            occupied.add(location)
+        return fields
+
     def emit(self) -> list[str]:
         arguments: list[str] = []
         for index, (argument, annotation) in enumerate(
@@ -383,7 +435,23 @@ class _FunctionEmitter:
             suffix = f" {{{', '.join(attributes)}}}" if attributes else ""
             arguments.append(f"{value.name}: {value.type.mlir}{suffix}")
         result = ""
-        if self.signature.result:
+        entry_fields = self._entry_result_fields()
+        if entry_fields is not None:
+            flattened_results: list[str] = []
+            for field_name, annotation in entry_fields:
+                result_attributes = self._metadata_attributes(
+                    annotation.metadata,
+                    stage=self.stage,
+                    is_result=True,
+                    default_location=0,
+                )
+                result_attributes.append(
+                    f'vernon.source_name = "{field_name}"')
+                flattened_results.append(
+                    f"{annotation.type.mlir} {{{', '.join(result_attributes)}}}"
+                )
+            result = f" -> ({', '.join(flattened_results)})"
+        elif self.signature.result:
             result_metadata = self.result_annotation.metadata if self.result_annotation else (
             )
             result_attributes = self._metadata_attributes(result_metadata,
@@ -475,7 +543,7 @@ class _FunctionEmitter:
                         f"vernon.binding = {item.arguments[1]} : i64",
                     ))
             elif item.kind == "varying":
-                continue
+                attributes.append("vernon.varying = true")
             else:
                 attributes.append(
                     f'vernon.{item.kind} = "{item.arguments[0]}"')
@@ -547,7 +615,21 @@ class _FunctionEmitter:
                 value = self._expression(node.value, self.signature.result)
                 self._require_same_type(node.value, self.signature.result,
                                         value.type)
-                self._line(f"func.return {value.name} : {value.type.mlir}")
+                entry_fields = self._entry_result_fields()
+                if entry_fields is not None:
+                    if value.fields is None or len(
+                            value.fields) != len(entry_fields):
+                        raise self.context.error(
+                            node.value,
+                            "entry struct results must be constructed from field values in the entry function"
+                        )
+                    self._line("func.return " +
+                               ", ".join(field.name
+                                         for field in value.fields) + " : " +
+                               ", ".join(field.type.mlir
+                                         for field in value.fields))
+                else:
+                    self._line(f"func.return {value.name} : {value.type.mlir}")
             self.returned = True
             return
         if isinstance(node, ast.If):
@@ -997,6 +1079,37 @@ class _FunctionEmitter:
                     node, f"{name} requires exactly {size} scalar components")
             result_type = DslType("tensor", "Tensor", (element, size))
             return self._intrinsic(node, "construct", arguments, result_type)
+        if name in {"mat2", "mat3", "mat4"}:
+            size = int(name[-1])
+            if not arguments:
+                raise self.context.error(
+                    node, f"{name} requires component arguments")
+            element: DslType | None = None
+            component_count = 0
+            for argument in arguments:
+                if argument.type.kind == "scalar":
+                    argument_element = argument.type
+                    component_count += 1
+                elif argument.type.kind == "tensor":
+                    argument_element = argument.type.arguments[0]
+                    assert isinstance(argument_element, DslType)
+                    component_count += math.prod(
+                        int(dimension)
+                        for dimension in argument.type.arguments[1:])
+                else:
+                    raise self.context.error(
+                        node, f"{name} arguments must be scalars or Tensors")
+                if element is None:
+                    element = argument_element
+                else:
+                    self._require_same_type(node, element, argument_element)
+            expected = size * size
+            if component_count != expected or element is None:
+                raise self.context.error(
+                    node,
+                    f"{name} requires exactly {expected} scalar components")
+            result_type = DslType("tensor", "Tensor", (element, size, size))
+            return self._intrinsic(node, "construct", arguments, result_type)
         if name in {"normalize", "reflect"}:
             expected = 1 if name == "normalize" else 2
             if len(arguments) != expected or any(argument.type.kind != "tensor"
@@ -1077,6 +1190,11 @@ class _FunctionEmitter:
                     node, "matmul operands have incompatible shapes")
             return self._intrinsic(node, name, arguments, result_type)
         if name == "texture_sample":
+            if self.node.name in self.context.shared_functions:
+                raise self.context.error(
+                    node,
+                    f"shared function '{self.node.name}' uses device-only operation 'texture_sample'"
+                )
             if len(arguments
                    ) != 3 or arguments[0].type.kind != "texture" or arguments[
                        1].type.kind != "sampler":
@@ -1099,16 +1217,28 @@ class _FunctionEmitter:
                                                  strict=True):
                 self._require_same_type(node, annotation.type, argument.type)
             result_type = DslType("struct", name)
+            # Entry-point structs are interface aggregates flattened by the
+            # frontend. Materializing them would leave an otherwise dead
+            # custom struct operation for SPIR-V lowering.
+            if self.stage is not None and self.signature.result == result_type:
+                return Value("", result_type, tuple(arguments))
             result = self._fresh()
-            operand_types = ", ".join(argument.type.mlir
-                                      for argument in arguments)
             self._line(
                 f'{result} = "vernon.struct_create"({", ".join(argument.name for argument in arguments)}) '
-                f'{{type_name = "{name}"}} : ({operand_types}) -> {result_type.mlir}'
+                f'{{type_name = "{name}"}} : '
+                f'({", ".join(argument.type.mlir for argument in arguments)}) -> {result_type.mlir}'
             )
-            return Value(result, result_type)
+            # Retain the aggregate fields so entry-point struct results can
+            # still be flattened without struct extraction operations.
+            return Value(result, result_type, tuple(arguments))
         if name not in self.context.signatures:
             raise self.context.error(node, f"unknown DSL function '{name}'")
+        if (self.node.name in self.context.shared_functions
+                and name not in self.context.shared_functions):
+            raise self.context.error(
+                node,
+                f"shared function '{self.node.name}' cannot call device-only function '{name}'"
+            )
         signature = self.context.signatures[name]
         if len(arguments) != len(signature.arguments):
             raise self.context.error(
@@ -1171,12 +1301,16 @@ class _FunctionEmitter:
     def _attribute(self, node: ast.Attribute) -> Value:
         value = self._expression(node.value)
         if value.type.kind == "struct":
-            fields = dict(self.context.structs[value.type.name])
-            if node.attr not in fields:
+            fields = self.context.structs[value.type.name]
+            field_names = [name for name, _ in fields]
+            if node.attr not in field_names:
                 raise self.context.error(
                     node,
                     f"struct '{value.type.name}' has no field '{node.attr}'")
-            result_type = fields[node.attr].type
+            field_index = field_names.index(node.attr)
+            if value.fields is not None:
+                return value.fields[field_index]
+            result_type = fields[field_index][1].type
             result = self._fresh()
             self._line(
                 f'{result} = "vernon.struct_get"({value.name}) {{field = "{node.attr}"}} : '
@@ -1340,6 +1474,7 @@ class Compiler:
                 error.msg,
                 SourceLocation(filename, error.lineno or 1, error.offset or 1),
             ) from None
+        module = normalize_struct_methods(module, filename)
         context = _ModuleContext(filename)
         self._collect_struct_names(module, context)
         type_parser = _TypeParser(context)
@@ -1438,7 +1573,10 @@ class Compiler:
                 continue
             fields: list[tuple[str, AnnotatedType]] = []
             for statement in node.body:
-                if isinstance(statement, ast.Pass):
+                if isinstance(statement, ast.Pass) or (
+                        isinstance(statement, ast.Expr)
+                        and isinstance(statement.value, ast.Constant)
+                        and isinstance(statement.value.value, str)):
                     continue
                 if not isinstance(statement, ast.AnnAssign) or not isinstance(
                         statement.target,
@@ -1457,6 +1595,9 @@ class Compiler:
         for node in module.body:
             if not isinstance(node, ast.FunctionDef):
                 continue
+            shared = Compiler._is_shared_function(node)
+            if shared:
+                context.shared_functions.add(node.name)
             if node.args.posonlyargs or node.args.kwonlyargs or node.args.vararg or node.args.kwarg or node.args.defaults:
                 raise context.error(
                     node,
@@ -1468,7 +1609,15 @@ class Compiler:
                         argument,
                         f"argument '{argument.arg}' requires a type annotation"
                     )
-                arguments.append(parser.parse(argument.annotation).type)
+                annotation = parser.parse(argument.annotation)
+                if shared and (annotation.metadata or annotation.type.kind in {
+                        "addressable_tensor", "buffer", "sampler", "texture"
+                }):
+                    raise context.error(
+                        argument,
+                        f"shared function '{node.name}' uses a device-only argument"
+                    )
+                arguments.append(annotation.type)
             result = None
             result_annotation = None
             if node.returns is not None and not (
@@ -1476,9 +1625,28 @@ class Compiler:
                     and node.returns.value is None):
                 result_annotation = parser.parse(node.returns)
                 result = result_annotation.type
+                if shared and (result_annotation.metadata or result.kind in {
+                        "addressable_tensor", "buffer", "sampler", "texture"
+                }):
+                    raise context.error(
+                        node.returns,
+                        f"shared function '{node.name}' uses a device-only result"
+                    )
             context.signatures[node.name] = FunctionSignature(
                 tuple(arguments), result)
             context.result_annotations[node.name] = result_annotation
+
+    @staticmethod
+    def _is_shared_function(node: ast.FunctionDef) -> bool:
+        if len(node.decorator_list) != 1:
+            return False
+        decorator = node.decorator_list[0]
+        if not isinstance(decorator, ast.Call) or (_name(
+                decorator.func) or "").split(".")[-1] != "func":
+            return False
+        return any(
+            keyword.arg == "shared" and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True for keyword in decorator.keywords)
 
     @staticmethod
     def _decorator(
@@ -1486,21 +1654,31 @@ class Compiler:
     ) -> tuple[str | None, tuple[int, int, int] | None]:
         stage = None
         workgroup_size = None
+        function_kind = None
         for decorator in node.decorator_list:
             if isinstance(decorator, ast.Name) or isinstance(
                     decorator, ast.Attribute):
                 name = (_name(decorator) or "").split(".")[-1]
                 if name in {"vertex", "fragment"}:
+                    function_kind = name
                     stage = name
                 elif name in {"compute", "kernel"}:
+                    function_kind = "compute"
                     stage = "compute"
                     workgroup_size = (1, 1, 1)
+                elif name == "func":
+                    function_kind = "func"
                 else:
                     raise context.error(decorator,
                                         f"unknown DSL decorator '{name}'")
             elif isinstance(decorator, ast.Call) and (
                     _name(decorator.func)
                     or "").split(".")[-1] in {"compute", "kernel"}:
+                if function_kind is not None:
+                    raise context.error(
+                        decorator,
+                        "DSL functions require exactly one function decorator")
+                function_kind = "compute"
                 stage = "compute"
                 values = None
                 for keyword in decorator.keywords:
@@ -1523,8 +1701,32 @@ class Compiler:
                         )
                     parsed.append(value.value)
                 workgroup_size = tuple(parsed)  # type: ignore[assignment]
+            elif isinstance(decorator, ast.Call) and (_name(
+                    decorator.func) or "").split(".")[-1] == "func":
+                if function_kind is not None:
+                    raise context.error(
+                        decorator,
+                        "DSL functions require exactly one function decorator")
+                function_kind = "func"
+                if decorator.args or len(decorator.keywords) != 1:
+                    raise context.error(decorator,
+                                        "@func accepts only shared=True")
+                keyword = decorator.keywords[0]
+                if keyword.arg != "shared" or not isinstance(
+                        keyword.value,
+                        ast.Constant) or keyword.value.value is not True:
+                    raise context.error(decorator,
+                                        "@func accepts only shared=True")
             else:
                 raise context.error(decorator, "unsupported decorator syntax")
+            if len(node.decorator_list) > 1:
+                raise context.error(
+                    decorator,
+                    "DSL functions require exactly one function decorator")
+        if function_kind is None:
+            raise context.error(
+                node,
+                "DSL functions require @func, @vertex, @fragment, or @kernel")
         return stage, workgroup_size
 
 

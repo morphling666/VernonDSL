@@ -1,15 +1,21 @@
 #include "VernonCompiler.h"
 
 #include "mlir/Conversion/GPUToSPIRV/GPUToSPIRVPass.h"
+#include "mlir/Conversion/MathToSPIRV/MathToSPIRVPass.h"
+#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/GPU/Pipelines/Passes.h"
+#include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
 #include "mlir/Dialect/SPIRV/Transforms/Passes.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerCUDAMath.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUTensors.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonToGPU.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonToSpirv.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonValidation.h"
@@ -1118,8 +1124,14 @@ bool compileVulkan(VernonCompilerContext *context, const char *source,
   // sees the same implementation.
   passManager.addPass(std::make_unique<InlineVernonHelpersPass>());
   passManager.addPass(mlir::vernon::createVernonToGPUPass(true));
+  passManager.addNestedPass<mlir::gpu::GPUModuleOp>(
+      mlir::vernon::createVernonLowerGPUTensorsPass());
+  passManager.addNestedPass<mlir::gpu::GPUModuleOp>(
+      mlir::createConvertMathToSPIRVPass());
   passManager.addPass(mlir::createConvertGPUToSPIRVPass());
   passManager.addPass(mlir::vernon::createVernonToSPIRVPass());
+  passManager.addNestedPass<mlir::spirv::ModuleOp>(
+      mlir::spirv::createSPIRVLowerABIAttributesPass());
   passManager.addNestedPass<mlir::spirv::ModuleOp>(
       std::make_unique<AttachSpirvTargetPass>());
   passManager.addNestedPass<mlir::spirv::ModuleOp>(
@@ -1170,6 +1182,22 @@ bool compileCuda(VernonCompilerContext *context, const char *source,
   passManager.addPass(std::make_unique<InlineVernonHelpersPass>());
   passManager.addPass(mlir::vernon::createVernonToGPUPass());
   passManager.addPass(std::make_unique<KeepGpuModulesPass>());
+  passManager.addNestedPass<mlir::gpu::GPUModuleOp>(
+      mlir::vernon::createVernonLowerGPUTensorsPass());
+  passManager.addNestedPass<mlir::gpu::GPUModuleOp>(
+      mlir::createConvertElementwiseToLinalgPass());
+  mlir::bufferization::OneShotBufferizePassOptions bufferizationOptions;
+  bufferizationOptions.allowUnknownOps = true;
+  passManager.addPass(
+      mlir::bufferization::createOneShotBufferizePass(bufferizationOptions));
+  passManager.addNestedPass<mlir::gpu::GPUModuleOp>(
+      mlir::createConvertLinalgToLoopsPass());
+  passManager.addNestedPass<mlir::gpu::GPUModuleOp>(
+      mlir::vernon::createVernonLowerCUDAMathPass());
+  // VernonToGPU creates gpu.module directly, so the top-level SCF conversion
+  // in MLIR's NVVM pipeline cannot enter that isolated symbol table.
+  passManager.addNestedPass<mlir::gpu::GPUModuleOp>(
+      mlir::createSCFToControlFlowPass());
   mlir::gpu::GPUToNVVMPipelineOptions options;
   options.cubinFormat = "isa";
   mlir::gpu::buildLowerToNVVMPassPipeline(passManager, options);
@@ -1299,10 +1327,34 @@ bool crossCompile(VernonCompileResult &result, VernonTarget target,
         } else {
           spirv_cross::CompilerGLSL compiler(words);
           compiler.set_entry_point(entry.name, entry.execution_model);
+          const spirv_cross::ShaderResources resources =
+              compiler.get_shader_resources();
+          auto canonicalizeInterface = [&](const auto &variables) {
+            for (const spirv_cross::Resource &variable : variables) {
+              if (!compiler.has_decoration(variable.id,
+                                           spv::DecorationLocation))
+                continue;
+              const uint32_t location =
+                  compiler.get_decoration(variable.id, spv::DecorationLocation);
+              compiler.set_name(variable.id,
+                                "vernon_location_" + std::to_string(location));
+            }
+          };
+          // Separate stage compilations otherwise inherit entry-specific
+          // SPIR-V names. Canonical location names let GLSL 3.30 link vertex
+          // outputs to fragment inputs. Vertex inputs and fragment outputs
+          // keep their names to avoid same-location identifier collisions.
+          if (entry.execution_model == spv::ExecutionModelVertex)
+            canonicalizeInterface(resources.stage_outputs);
+          else if (entry.execution_model == spv::ExecutionModelFragment)
+            canonicalizeInterface(resources.stage_inputs);
           spirv_cross::CompilerGLSL::Options options;
           options.es = target == VERNON_TARGET_OPENGL_ES;
           options.version =
-              glslVersion != 0 ? glslVersion : (options.es ? 310 : 330);
+              glslVersion != 0 ? glslVersion
+              : options.es     ? 310
+              : entry.execution_model == spv::ExecutionModelGLCompute ? 430
+                                                                      : 330;
           options.enable_420pack_extension = options.es;
           compiler.set_common_options(options);
           source = compiler.compile();

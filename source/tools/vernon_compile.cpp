@@ -305,9 +305,10 @@ int main(int argc, char **argv) {
             computeEntry->getString("symbol").value_or("").str();
         manifest["artifact"] = artifactFilename;
         manifest["artifact_format"] =
-            *target == VERNON_TARGET_CUDA
-                ? "ptx"
-                : (*target == VERNON_TARGET_VULKAN ? "spirv" : "llvm_ir");
+            *target == VERNON_TARGET_CUDA     ? "ptx"
+            : *target == VERNON_TARGET_VULKAN ? "spirv"
+            : *target == VERNON_TARGET_METAL  ? "msl"
+                                              : "llvm_ir";
         manifest["artifact_size"] = static_cast<int64_t>(artifactData.size);
         manifest["artifact_sha256"] = digest;
         manifest["reflection"] = std::move(*parsedReflection);

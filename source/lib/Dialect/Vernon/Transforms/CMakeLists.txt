@@ -1,4 +1,6 @@
 add_mlir_library(MLIRVernonTransforms
+  VernonLowerCUDAMath.cpp
+  VernonLowerGPUTensors.cpp
   VernonValidation.cpp
   VernonToGPU.cpp
   VernonToSpirv.cpp
@@ -13,10 +15,15 @@ add_mlir_library(MLIRVernonTransforms
   MLIRArithDialect
   MLIRFuncDialect
   MLIRGPUDialect
+  MLIRLLVMDialect
+  MLIRMathDialect
   MLIRMemRefDialect
+  MLIRSCFDialect
+  MLIRSCFTransforms
   MLIRVernonDialect
   MLIRSPIRVDialect
   MLIRTensorDialect
+  MLIRVectorDialect
   MLIRIR
   MLIRPass
   MLIRSupport

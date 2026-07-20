@@ -7,16 +7,33 @@ input module. These Python objects exist for editor completion and type syntax.
 from typing import Annotated
 
 from .compiler import Compiler, compile_file, compile_source
-from .decorators import compute, fragment, kernel, struct, vertex
+from .decorators import compute, fragment, func, kernel, struct, vertex
 from .diagnostics import CompileError
 from .intrinsics import abs, clamp, cos, cross, dot, exp, log, matmul, max, min, norm, normalize, pow, reflect, sin, sqrt, texture_sample
-from .runtime import Kernel, Tensor, cpu, cuda, init
+from .runtime import (
+    Kernel,
+    Pipeline,
+    PrimitiveTopology,
+    Tensor,
+    TensorLayout,
+    TensorView,
+    Texture,
+    cpu,
+    cuda,
+    init,
+    lines,
+    opengl,
+    opengles,
+    pipeline,
+    points,
+    triangles,
+    vulkan,
+)
 from .types import (
     Array,
     Buffer,
     Feature,
     Sampler,
-    Texture,
     When,
     bool,
     builtin,
@@ -50,8 +67,12 @@ __all__ = [
     "Compiler",
     "Feature",
     "Kernel",
+    "Pipeline",
+    "PrimitiveTopology",
     "Sampler",
     "Tensor",
+    "TensorLayout",
+    "TensorView",
     "Texture",
     "When",
     "bool",
@@ -71,10 +92,12 @@ __all__ = [
     "f64",
     "feature",
     "fragment",
+    "func",
     "i32",
     "instance",
     "init",
     "location",
+    "lines",
     "log",
     "kernel",
     "matmul",
@@ -86,13 +109,18 @@ __all__ = [
     "min",
     "norm",
     "normalize",
+    "opengl",
+    "opengles",
     "pow",
+    "pipeline",
+    "points",
     "resource",
     "reflect",
     "sin",
     "sqrt",
     "struct",
     "texture_sample",
+    "triangles",
     "u32",
     "uniform",
     "varying",
@@ -101,4 +129,5 @@ __all__ = [
     "vec3",
     "vec4",
     "vertex",
+    "vulkan",
 ]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+from pathlib import Path
 from typing import Annotated
 
 import vernon_dsl as vd
@@ -40,12 +42,38 @@ def render(time: float = 0.0) -> vd.Tensor:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Render the VernonDSL Julia set")
+    parser.add_argument("--arch",
+                        choices=("cpu", "cuda", "vulkan", "opengl",
+                                 "opengles"),
+                        default="cuda")
+    parser.add_argument("--time", type=float, default=0.0)
+    parser.add_argument("--emit-metal", type=Path)
+    arguments = parser.parse_args()
+    if arguments.emit_metal is not None:
+        pixels = vd.Tensor.zeros(dtype=vd.f32, shape=(HEIGHT, WIDTH))
+        source, _ = paint.compile_artifact(pixels,
+                                           arguments.time,
+                                           target="metal")
+        arguments.emit_metal.write_bytes(source)
+        print(f"Wrote {arguments.emit_metal}")
+        return
+
     try:
         import cv2  # pyright: ignore[reportMissingImports]
     except ImportError as error:
         raise SystemExit("Install the optional example dependencies with "
                          "'uv sync --extra examples'.") from error
-    image = render().to_numpy()
+    architectures = {
+        "cpu": vd.cpu,
+        "cuda": vd.cuda,
+        "vulkan": vd.vulkan,
+        "opengl": vd.opengl,
+        "opengles": vd.opengles,
+    }
+    vd.init(arch=architectures[arguments.arch])
+    image = render(arguments.time).to_numpy()
     cv2.imshow("VernonDSL Julia Set", image)
     cv2.waitKey(0)
 

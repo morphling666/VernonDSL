@@ -106,9 +106,11 @@ def parse_shader_pipeline_manifest(
     stage_names = set(raw_stages)
     graphics = stage_names == {"vertex", "fragment"}
     compute = stage_names == {"compute"}
-    if not graphics and not compute:
+    compute_graphics = stage_names == {"compute", "vertex", "fragment"}
+    if not graphics and not compute and not compute_graphics:
         raise ShaderAssetError(
-            "pipeline must contain vertex+fragment or one compute stage")
+            "pipeline must contain vertex+fragment, compute+vertex+fragment, "
+            "or one compute stage")
     stages: dict[str, ShaderStageReference] = {}
     for stage, reference in raw_stages.items():
         if not isinstance(reference, dict) or not isinstance(
@@ -343,7 +345,7 @@ def cook_shader_pipeline(*,
             stage_records.setdefault(stage_id, record)
             mapping[stage] = stage_id
             records_for_variant[stage] = record
-        if set(pipeline.stages) == {"vertex", "fragment"}:
+        if {"vertex", "fragment"}.issubset(pipeline.stages):
             _validate_graphics_interfaces(records_for_variant["vertex"],
                                           records_for_variant["fragment"])
         variants.append({"key": list(variant), "stages": mapping})

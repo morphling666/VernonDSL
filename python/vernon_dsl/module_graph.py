@@ -8,9 +8,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .diagnostics import CompileError, SourceLocation
+from .struct_methods import normalize_struct_methods
 
-_HOST_MODULES = {"__future__", "typing", "vernon_dsl"}
+_HOST_MODULES = {
+    "__future__",
+    "argparse",
+    "cv2",
+    "numpy",
+    "pathlib",
+    "typing",
+    "unittest",
+    "vernon_dsl",
+}
 _STAGE_DECORATORS = {"vertex", "fragment", "compute", "kernel"}
+_FUNCTION_DECORATORS = _STAGE_DECORATORS | {"func"}
 
 
 def _dotted_name(node: ast.AST) -> str | None:
@@ -35,6 +46,7 @@ class _Module:
     tree: ast.Module
     definitions: dict[str, ast.FunctionDef
                       | ast.ClassDef] = field(default_factory=dict)
+    host_functions: set[str] = field(default_factory=set)
     features: dict[str, str] = field(default_factory=dict)
     constants: dict[str, int | float | bool] = field(default_factory=dict)
     symbol_imports: dict[str, tuple["_Module",
@@ -380,7 +392,18 @@ class _ReferenceRewriter(ast.NodeTransformer):
     def visit_ClassDef(self, node: ast.ClassDef) -> ast.AST:
         original_name = node.name
         node.name = self.emitted_names[(self.module.path, original_name)]
-        node.body = [self.visit(statement) for statement in node.body]
+        rewritten: list[ast.stmt] = []
+        for statement in node.body:
+            if isinstance(statement, ast.FunctionDef):
+                statement.args = self.visit(statement.args)
+                statement.returns = self._rewrite_annotation(statement.returns)
+                statement.body = [
+                    self.visit(value) for value in statement.body
+                ]
+                rewritten.append(statement)
+            else:
+                rewritten.append(self.visit(statement))
+        node.body = rewritten
         return node
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AST:
@@ -439,6 +462,7 @@ class ModuleGraph:
         body: list[ast.stmt] = []
         function_sources: dict[str, tuple[_Module, ast.FunctionDef]] = {}
         entry_names: set[str] = set()
+        host_function_names: set[str] = set()
         for module in self.order:
             rewriter = _ReferenceRewriter(module, emitted_names)
             for original_name, definition in module.definitions.items():
@@ -447,22 +471,38 @@ class ModuleGraph:
                     self, module, self.enabled_features).visit(transformed)
                 assert isinstance(transformed, (ast.FunctionDef, ast.ClassDef))
                 if isinstance(transformed, ast.FunctionDef):
-                    if module is not root:
-                        transformed.decorator_list = []
-                    elif any(
-                            _decorator_name(decorator) in _STAGE_DECORATORS
-                            for decorator in transformed.decorator_list):
+                    is_entry = any(
+                        _decorator_name(decorator) in _STAGE_DECORATORS
+                        for decorator in transformed.decorator_list)
+                    if is_entry:
                         entry_names.add(emitted_names[(module.path,
                                                        original_name)])
+                    if module is not root:
+                        # Imported entries are retained as private functions.
+                        # The call-graph check still remembers their original
+                        # stage identity and rejects calls to them.
+                        transformed.decorator_list = [
+                            ast.Name(id="func", ctx=ast.Load())
+                        ]
                 transformed = rewriter.visit(transformed)
                 assert isinstance(transformed, (ast.FunctionDef, ast.ClassDef))
-                body.append(transformed)
                 if isinstance(transformed, ast.FunctionDef):
                     function_sources[transformed.name] = (module, definition)
+                    if original_name in module.host_functions:
+                        host_function_names.add(transformed.name)
+                        continue
+                body.append(transformed)
 
+        normalized = normalize_struct_methods(
+            ast.Module(body=body, type_ignores=[]), str(root.path))
+        body = normalized.body
+        for statement in body:
+            if isinstance(statement, ast.FunctionDef):
+                function_sources.setdefault(statement.name, (root, statement))
         if self.entry is not None:
             body = self._prune_to_entry(body, self.entry, root)
-        self._validate_call_graph(body, function_sources, entry_names)
+        self._validate_call_graph(body, function_sources, entry_names,
+                                  host_function_names)
         combined = ast.fix_missing_locations(
             ast.Module(body=body, type_ignores=[]))
         dependencies = tuple(
@@ -525,6 +565,19 @@ class ModuleGraph:
             if node.name in module.definitions or node.name in module.features:
                 self._error(module, node,
                             f"duplicate DSL symbol '{node.name}'")
+            if isinstance(node, ast.FunctionDef):
+                decorators = [
+                    _decorator_name(decorator)
+                    for decorator in node.decorator_list
+                ]
+                if not decorators:
+                    module.host_functions.add(node.name)
+                elif len(decorators
+                         ) != 1 or decorators[0] not in _FUNCTION_DECORATORS:
+                    self._error(
+                        module, node,
+                        "DSL functions require exactly one of @func, @vertex, "
+                        "@fragment, or @kernel")
             module.definitions[node.name] = node
 
     def _collect_feature(self, module: _Module, node: ast.Assign) -> None:
@@ -675,17 +728,42 @@ class ModuleGraph:
         body: list[ast.stmt],
         function_sources: dict[str, tuple[_Module, ast.FunctionDef]],
         entry_names: set[str],
+        host_function_names: set[str],
     ) -> None:
         calls: dict[str, set[str]] = {name: set() for name in function_sources}
         call_nodes: dict[tuple[str, str], ast.Call] = {}
+        function_nodes = {
+            statement.name: statement
+            for statement in body if isinstance(statement, ast.FunctionDef)
+        }
+        shared_functions = {
+            name
+            for name, node in function_nodes.items()
+            if self._is_shared_function(node)
+        }
         for statement in body:
             if not isinstance(statement, ast.FunctionDef):
                 continue
+            if statement.name in shared_functions:
+                self._validate_shared_surface(
+                    function_sources[statement.name][0], statement)
             for node in ast.walk(statement):
                 if isinstance(node, ast.Call) and isinstance(
                         node.func, ast.Name) and node.func.id in calls:
+                    if node.func.id in host_function_names:
+                        module, _ = function_sources[statement.name]
+                        self._error(
+                            module, node,
+                            f"shader helper '{node.func.id}' requires @func")
                     calls[statement.name].add(node.func.id)
                     call_nodes[(statement.name, node.func.id)] = node
+                    if (statement.name in shared_functions
+                            and node.func.id not in shared_functions):
+                        module, _ = function_sources[statement.name]
+                        self._error(
+                            module, node,
+                            f"shared function '{statement.name}' cannot call "
+                            f"device-only function '{node.func.id}'")
                     if node.func.id in entry_names:
                         module, _ = function_sources[statement.name]
                         self._error(
@@ -716,6 +794,51 @@ class ModuleGraph:
         for name in sorted(calls):
             if states.get(name, 0) == 0:
                 visit(name)
+
+    @staticmethod
+    def _is_shared_function(node: ast.FunctionDef) -> bool:
+        for decorator in node.decorator_list:
+            if not isinstance(decorator, ast.Call) or _decorator_name(
+                    decorator) != "func":
+                continue
+            return any(keyword.arg == "shared" and isinstance(
+                keyword.value, ast.Constant) and keyword.value.value is True
+                       for keyword in decorator.keywords)
+        return False
+
+    def _validate_shared_surface(self, module: _Module,
+                                 node: ast.FunctionDef) -> None:
+        device_only_names = {
+            "Buffer",
+            "Sampler",
+            "Texture",
+            "builtin",
+            "resource",
+            "texture_sample",
+        }
+        annotations: list[ast.expr] = [
+            argument.annotation for argument in node.args.args
+            if argument.annotation is not None
+        ]
+        if node.returns is not None:
+            annotations.append(node.returns)
+        for annotation in annotations:
+            for value in ast.walk(annotation):
+                name = (_dotted_name(value) or "").split(".")[-1]
+                if name in device_only_names:
+                    self._error(
+                        module, value,
+                        f"shared function '{node.name}' uses device-only "
+                        f"type or annotation '{name}'")
+        for value in ast.walk(node):
+            if not isinstance(value, ast.Call):
+                continue
+            name = (_dotted_name(value.func) or "").split(".")[-1]
+            if name == "texture_sample":
+                self._error(
+                    module, value,
+                    f"shared function '{node.name}' uses device-only operation "
+                    "'texture_sample'")
 
     def _symbol_prefix(self, module: _Module) -> str:
         relative = self._display_path(module.path).removesuffix(".py")

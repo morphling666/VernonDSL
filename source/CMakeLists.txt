@@ -29,16 +29,20 @@ target_include_directories(VernonDSLCompiler
     $<INSTALL_INTERFACE:include>
 )
 target_link_libraries(VernonDSLCompiler PRIVATE
+  MLIRBufferizationTransforms
   MLIRVernonDialect
   MLIRVernonTransforms
   MLIRFuncDialect
   MLIRGPUToSPIRV
   MLIRGPUPipelines
   MLIRIR
+  MLIRLinalgTransforms
+  MLIRMathToSPIRV
   MLIRParser
   MLIRPass
   MLIRRegisterAllDialects
   MLIRRegisterAllExtensions
+  MLIRSCFToControlFlow
   MLIRSPIRVDialect
   MLIRSPIRVSerialization
   MLIRSPIRVTransforms
@@ -80,6 +84,16 @@ if(VERNON_ENABLE_RUNTIME)
   if(VERNON_ENABLE_CUDA_RUNTIME)
     target_compile_definitions(VernonDSLRuntime PRIVATE
       VERNON_HAS_CUDA_RUNTIME=1)
+  endif()
+  if(VERNON_ENABLE_VULKAN_RUNTIME)
+    target_compile_definitions(VernonDSLRuntime PRIVATE
+      VERNON_HAS_VULKAN_RUNTIME=1 VK_NO_PROTOTYPES=1)
+    target_link_libraries(VernonDSLRuntime PRIVATE Vulkan::Headers)
+  endif()
+  if(VERNON_ENABLE_OPENGL_RUNTIME)
+    target_compile_definitions(VernonDSLRuntime PRIVATE
+      VERNON_HAS_OPENGL_RUNTIME=1 GLFW_INCLUDE_NONE=1)
+    target_link_libraries(VernonDSLRuntime PRIVATE glfw)
   endif()
   install(TARGETS VernonDSLRuntime
     RUNTIME DESTINATION bin
@@ -156,6 +170,20 @@ if(BUILD_TESTING)
       add_executable(vernon-runtime-cuda-test tests/runtime_cuda_test.cpp)
       target_link_libraries(vernon-runtime-cuda-test PRIVATE VernonDSLRuntime)
       add_test(NAME vernon-runtime-cuda-test COMMAND vernon-runtime-cuda-test)
+    endif()
+    if(VERNON_ENABLE_VULKAN_RUNTIME)
+      add_executable(vernon-runtime-vulkan-test tests/runtime_vulkan_test.cpp)
+      target_link_libraries(vernon-runtime-vulkan-test PRIVATE
+        VernonDSLCompiler VernonDSLRuntime)
+      add_test(NAME vernon-runtime-vulkan-test
+        COMMAND vernon-runtime-vulkan-test)
+    endif()
+    if(VERNON_ENABLE_OPENGL_RUNTIME)
+      add_executable(vernon-runtime-opengl-test tests/runtime_opengl_test.cpp)
+      target_link_libraries(vernon-runtime-opengl-test PRIVATE
+        VernonDSLCompiler VernonDSLRuntime)
+      add_test(NAME vernon-runtime-opengl-test
+        COMMAND vernon-runtime-opengl-test)
     endif()
   endif()
 endif()

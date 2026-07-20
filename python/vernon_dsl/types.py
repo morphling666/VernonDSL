@@ -3,6 +3,39 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
+
+
+def _host_dtype(values: tuple[Any, ...]) -> np.dtype[Any]:
+    dtypes: list[np.dtype[Any]] = []
+    for value in values:
+        array = np.asarray(value)
+        if isinstance(value, float) and not isinstance(value, np.generic):
+            dtypes.append(np.dtype(np.float32))
+        elif isinstance(value, int) and not isinstance(value, np.generic):
+            dtypes.append(np.dtype(np.int32))
+        else:
+            dtypes.append(array.dtype)
+    return np.result_type(*dtypes) if dtypes else np.dtype(np.float32)
+
+
+def _host_tensor(name: str, values: tuple[Any, ...],
+                 shape: tuple[int, ...]) -> np.ndarray[Any, Any]:
+    if not values:
+        raise TypeError(f"{name} requires component arguments")
+    dtype = _host_dtype(values)
+    components = [
+        np.asarray(value, dtype=dtype).reshape(-1) for value in values
+    ]
+    result = np.concatenate(components)
+    expected = int(np.prod(shape))
+    if result.size != expected:
+        raise TypeError(
+            f"{name} requires exactly {expected} scalar components")
+    result = result.reshape(shape)
+    result.setflags(write=False)
+    return result
+
 
 @dataclass(frozen=True)
 class TypeExpr:
@@ -50,32 +83,55 @@ class mat(_TypeConstructor):
 
 
 class vec2(_TypeConstructor):
-    pass
+
+    def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
+        return _host_tensor("vec2", values, (2, ))
 
 
 class vec3(_TypeConstructor):
-    pass
+
+    def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
+        return _host_tensor("vec3", values, (3, ))
 
 
 class vec4(_TypeConstructor):
-    pass
+
+    def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
+        return _host_tensor("vec4", values, (4, ))
 
 
 class mat2(_TypeConstructor):
-    pass
+
+    def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
+        return _host_tensor("mat2", values, (2, 2))
 
 
 class mat3(_TypeConstructor):
-    pass
+
+    def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
+        return _host_tensor("mat3", values, (3, 3))
 
 
 class mat4(_TypeConstructor):
-    pass
+
+    def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
+        return _host_tensor("mat4", values, (4, 4))
 
 
 @dataclass(frozen=True)
 class _Scalar:
     name: str
+
+    def __call__(self, value: Any) -> Any:
+        dtypes = {
+            "bool": np.bool_,
+            "i32": np.int32,
+            "u32": np.uint32,
+            "f16": np.float16,
+            "f32": np.float32,
+            "f64": np.float64,
+        }
+        return dtypes[self.name](value)
 
 
 bool = _Scalar("bool")

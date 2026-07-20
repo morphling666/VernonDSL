@@ -19,6 +19,7 @@ class Vertex:
     position: Tensor[f32, (3,)]
     weights: Array[f32, 4]
 
+@func
 def resources(
     a: vec3[f32],
     b: mat[2, 3, f32],
@@ -113,6 +114,7 @@ def update(
         source = """
 from vernon_dsl import *
 
+@func
 def choose(value: f32, condition: bool) -> f32:
     result = value
     if condition:
@@ -142,6 +144,7 @@ raise RuntimeError("must not execute")
         source = """
 from vernon_dsl import *
 
+@func
 def bad(x: f32) -> f32:
     while x > 0.0:
         x = x - 1.0
@@ -185,6 +188,7 @@ class ModuleGraphTests(unittest.TestCase):
             shader = root / "shader.py"
             helper.write_text(
                 "from vernon_dsl import *\n"
+                "@func\n"
                 "def scale(value: f32, factor: f32) -> f32:\n"
                 "    return value * factor\n",
                 encoding="utf-8",
@@ -214,6 +218,8 @@ class ModuleGraphTests(unittest.TestCase):
                                        encoding="utf-8")
             (root / "b.py").write_text(
                 "from a import main\n"
+                "from vernon_dsl import func\n"
+                "@func\n"
                 "def helper(value: f32) -> f32:\n"
                 "    return value\n",
                 encoding="utf-8")
@@ -225,14 +231,31 @@ class ModuleGraphTests(unittest.TestCase):
             path = Path(directory) / "recursive.py"
             path.write_text(
                 "from vernon_dsl import *\n"
+                "@func\n"
                 "def first(value: f32) -> f32:\n"
                 "    return second(value)\n"
+                "@func\n"
                 "def second(value: f32) -> f32:\n"
                 "    return first(value)\n",
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(CompileError,
                                         "recursive DSL call graph"):
+                compile_file(path)
+
+    def test_undecorated_helper_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing_func.py"
+            path.write_text(
+                "from vernon_dsl import *\n"
+                "def helper(value: f32) -> f32:\n"
+                "    return value\n"
+                "@fragment\n"
+                "def main(value: f32) -> f32:\n"
+                "    return helper(value)\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(CompileError, "requires @func"):
                 compile_file(path)
 
 

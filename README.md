@@ -84,7 +84,7 @@ Tensors. Builtin arguments are synthesized and omitted from the call:
 from typing import Annotated
 import vernon_dsl as vd
 
-vd.init(arch=vd.cpu)  # use vd.cuda when the optional Driver backend is built
+vd.init(arch=vd.cpu)  # vd.cuda and vd.vulkan execute on a GPU
 output = vd.Tensor.zeros(dtype=vd.f32, shape=(8,))
 
 @vd.kernel(workgroup_size=(8, 1, 1))
@@ -105,9 +105,55 @@ values = output.to_numpy()
 `VERNON_ENABLE_RUNTIME` builds the standalone `VernonDSLRuntime` C API and
 CPU reference backend. `VERNON_ENABLE_CUDA_RUNTIME` dynamically loads the
 CUDA Driver API from `nvcuda.dll`/`libcuda.so.1`; no CUDA Toolkit or `nvcc`
-installation is required. Compiler CUDA capability remains independent of
-runtime/device availability. `VERNON_ENABLE_PYTHON_BINDINGS` builds the
-nanobind `_native` module when Python 3.11 and nanobind are available.
+installation is required. `VERNON_ENABLE_VULKAN_RUNTIME` dynamically loads the
+system Vulkan loader and uses host-visible storage buffers for compute
+dispatch. `VERNON_ENABLE_OPENGL_RUNTIME` uses GLFW to create a hidden OpenGL
+4.3 compute context. The `opengles` runtime selection uses this desktop
+compatibility path; `--target opengles` still emits native GLSL ES 3.10 source.
+Compiler capabilities remain independent of runtime/device availability.
+`VERNON_ENABLE_PYTHON_BINDINGS` builds the nanobind `_native` module when
+Python 3.11 and nanobind are available.
+
+Run the fractal directly on either GPU backend, or emit Metal source for use on
+macOS:
+
+```powershell
+uv run python fractal.py --arch cuda
+uv run python fractal.py --arch vulkan
+uv run python fractal.py --arch opengl
+uv run python fractal.py --arch opengles
+uv run python fractal.py --emit-metal build/fractal.metal
+```
+
+Run the advanced OpenGL example with an indexed quad, instance attributes,
+interactive `PICKING` specialization, and two named render targets:
+
+```powershell
+uv sync --extra examples
+uv run python examples/advanced_pipeline.py --frames 2 --headless `
+  --output build/advanced-color.png `
+  --id-output build/advanced-object-id.png
+```
+
+For one end-to-end example that combines shared definitions with three-stage
+compute/vertex/fragment composition, three feature variants, indexed
+instancing, named MRT outputs, and per-frame input/index/uniform rebinding:
+
+```powershell
+uv run python examples/complete_pipeline.py --frames 3 --headless `
+  --output build/complete-color.png `
+  --id-output build/complete-object-id.png `
+  --method-mlir build/complete-methods.mlir
+```
+
+Run the shared-definition example to exercise immutable host structs,
+shared and device-only methods, NumPy intrinsics, CPU device parity, and
+method lowering:
+
+```powershell
+uv run python examples/shared_struct_methods.py `
+  --mlir build/shared-struct-methods.mlir
+```
 
 Persist a kernel for C or C++ loading with:
 
@@ -206,4 +252,3 @@ build/source/Release/vernon-compile.exe `
   --output-dir build/cpu `
   --reflection build/cpu/material.json
 ```
-uv run --extra examples python fractal.py

@@ -7,6 +7,8 @@
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
 
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerCUDAMath.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUTensors.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonToGPU.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonToSpirv.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonValidation.h"
@@ -61,6 +63,8 @@ int main(int argc, char **argv) {
   spirv::registerSPIRVPasses();
   // Register passes
   vernon::registerVernonValidatePass();
+  vernon::registerVernonLowerCUDAMathPass();
+  vernon::registerVernonLowerGPUTensorsPass();
   vernon::registerVernonToGPUPass();
   vernon::registerVernonToSPIRVPass();
 

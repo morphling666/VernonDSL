@@ -1,6 +1,7 @@
 from vernon_dsl import *
 
 
+@func
 def shadow_visibility(
     sampled_depth: f32,
     fragment_depth: f32,
