@@ -8,6 +8,7 @@ target_link_libraries(vernon-opt PRIVATE
 
   # Dialects
   MLIRFuncDialect
+  MLIRFuncInlinerExtension
   MLIRArithDialect
   MLIRTensorDialect
   MLIRVectorDialect

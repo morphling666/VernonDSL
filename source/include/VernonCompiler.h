@@ -50,6 +50,14 @@ typedef struct VernonTargetCapabilities {
   uint8_t reserved;
 } VernonTargetCapabilities;
 
+typedef struct VernonCompileOptions {
+  // Set to sizeof(VernonCompileOptions). This permits ABI-compatible extension.
+  uint32_t struct_size;
+  // Zero selects the target default. Used only by OpenGL and OpenGL ES.
+  uint32_t glsl_version;
+  uint32_t reserved[6];
+} VernonCompileOptions;
+
 typedef struct VernonCpuTextureCallbacks {
   void *user_data;
   void (*sample_2d)(void *user_data, uintptr_t texture, float u, float v,
@@ -85,6 +93,9 @@ vernonCompilerValidateMlir(VernonCompilerContext *context, const char *source,
 VERNON_DSL_CAPI VernonCompileResult *
 vernonCompilerCompileMlir(VernonCompilerContext *context, const char *source,
                           size_t source_size, VernonTarget target);
+VERNON_DSL_CAPI VernonCompileResult *vernonCompilerCompileMlirWithOptions(
+    VernonCompilerContext *context, const char *source, size_t source_size,
+    VernonTarget target, const VernonCompileOptions *options);
 
 VERNON_DSL_CAPI void vernonCompileResultDestroy(VernonCompileResult *result);
 VERNON_DSL_CAPI VernonStatus

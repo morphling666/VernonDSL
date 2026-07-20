@@ -138,7 +138,7 @@ raise RuntimeError("must not execute")
                                     "unsupported module-level syntax"):
             compile_source(source, "safe.py")
 
-    def test_unsupported_syntax_has_file_line_and_column(self) -> None:
+    def test_while_and_augmented_assignment_lower_to_scf(self) -> None:
         source = """
 from vernon_dsl import *
 
@@ -147,11 +147,9 @@ def bad(x: f32) -> f32:
         x = x - 1.0
     return x
 """
-        with self.assertRaises(CompileError) as caught:
-            compile_source(source, "shader.py")
-        message = str(caught.exception)
-        self.assertIn("shader.py:5:5: error:", message)
-        self.assertIn("While", message)
+        output = compile_source(source, "shader.py")
+        self.assertIn("scf.while", output)
+        self.assertIn("arith.subf", output)
 
     def test_output_is_deterministic(self) -> None:
         source = """
@@ -178,6 +176,159 @@ def main(value: f32) -> f32:
                           output_path.read_text(encoding="utf-8"))
 
 
+class ModuleGraphTests(unittest.TestCase):
+
+    def test_project_local_helper_is_namespaced_and_hashed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = root / "lighting.py"
+            shader = root / "shader.py"
+            helper.write_text(
+                "from vernon_dsl import *\n"
+                "def scale(value: f32, factor: f32) -> f32:\n"
+                "    return value * factor\n",
+                encoding="utf-8",
+            )
+            shader.write_text(
+                "from vernon_dsl import *\n"
+                "from lighting import scale\n"
+                "@fragment\n"
+                "def main(value: f32) -> f32:\n"
+                "    return scale(value, 2.0)\n",
+                encoding="utf-8",
+            )
+
+            output = compile_file(shader)
+
+            self.assertIn("func.func private @__vernon_lighting__scale",
+                          output)
+            self.assertIn("func.call @__vernon_lighting__scale", output)
+            self.assertIn("vernon.source_dependencies", output)
+            self.assertIn("lighting.py=", output)
+            self.assertIn("shader.py=", output)
+
+    def test_import_cycle_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "a.py").write_text("from b import helper\n",
+                                       encoding="utf-8")
+            (root / "b.py").write_text(
+                "from a import main\n"
+                "def helper(value: f32) -> f32:\n"
+                "    return value\n",
+                encoding="utf-8")
+            with self.assertRaisesRegex(CompileError, "import cycle"):
+                compile_file(root / "a.py")
+
+    def test_recursive_helpers_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "recursive.py"
+            path.write_text(
+                "from vernon_dsl import *\n"
+                "def first(value: f32) -> f32:\n"
+                "    return second(value)\n"
+                "def second(value: f32) -> f32:\n"
+                "    return first(value)\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(CompileError,
+                                        "recursive DSL call graph"):
+                compile_file(path)
+
+
+class FeatureVariantTests(unittest.TestCase):
+
+    def test_features_specialize_interfaces_and_control_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "variants.py"
+            path.write_text(
+                "from vernon_dsl import *\n"
+                "INSTANCE = feature(\"INSTANCE\")\n"
+                "SKIN = feature(\"SKIN\")\n"
+                "@vertex\n"
+                "def mesh_vertex(\n"
+                "    position: vec3[f32],\n"
+                "    transform: When[INSTANCE, Annotated[mat4[f32], instance()]],\n"
+                "    joints: When[SKIN, vec4[u32]],\n"
+                "    weights: When[SKIN, vec4[f32]],\n"
+                ") -> Annotated[vec4[f32], builtin(\"position\")]:\n"
+                "    result = vec4(position, 1.0)\n"
+                "    if INSTANCE:\n"
+                "        result = matmul(transform, result)\n"
+                "    if SKIN:\n"
+                "        result = result + weights\n"
+                "    return result\n",
+                encoding="utf-8",
+            )
+
+            static = compile_file(path)
+            instanced = compile_file(path, features={"INSTANCE"})
+            skinned = compile_file(path, features={"SKIN"})
+            combined = compile_file(path, features={"SKIN", "INSTANCE"})
+
+            for output in (static, instanced, skinned, combined):
+                self.assertNotIn("scf.if", output)
+            self.assertNotIn("vernon.instance_divisor", static)
+            self.assertIn("vernon.instance_divisor", instanced)
+            self.assertNotIn("vernon.location = 5", instanced)
+            self.assertIn("vernon.location = 5", skinned)
+            self.assertIn("vernon.location = 6", skinned)
+            self.assertIn("vernon.location = 5", combined)
+            self.assertIn("vernon.location = 6", combined)
+            self.assertIn("vernon.location = 1", instanced)
+            self.assertIn('vernon.variant_key = ["INSTANCE", "SKIN"]',
+                          combined)
+
+    def test_explicit_location_overlap_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "overlap.py"
+            path.write_text(
+                "from vernon_dsl import *\n"
+                "@vertex\n"
+                "def main(\n"
+                "    transform: Annotated[mat4[f32], location(1)],\n"
+                "    value: Annotated[vec4[f32], location(2)],\n"
+                ") -> vec4[f32]:\n"
+                "    return value\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(CompileError, "location overlap"):
+                compile_file(path)
+
+    def test_disabled_value_and_unknown_feature_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bad.py"
+            path.write_text(
+                "from vernon_dsl import *\n"
+                "INSTANCE = feature(\"INSTANCE\")\n"
+                "@vertex\n"
+                "def main(value: When[INSTANCE, f32]) -> f32:\n"
+                "    return value\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(CompileError, "disabled value"):
+                compile_file(path)
+            with self.assertRaisesRegex(CompileError, "undeclared feature"):
+                compile_file(path, features={"SKIN"})
+
+    def test_selected_entry_prunes_unrelated_stages(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "stages.py"
+            path.write_text(
+                "from vernon_dsl import *\n"
+                "@vertex\n"
+                "def vertex_main(value: f32) -> f32:\n"
+                "    return value\n"
+                "@fragment\n"
+                "def fragment_main(value: f32) -> f32:\n"
+                "    return value\n",
+                encoding="utf-8",
+            )
+            output = compile_file(path, entry="fragment_main")
+            self.assertIn("@fragment_main", output)
+            self.assertNotIn("@vertex_main", output)
+
+
 class ExampleRegressionTests(unittest.TestCase):
 
     def test_material_and_custom_vertex_examples_compile(self) -> None:
@@ -186,6 +337,8 @@ class ExampleRegressionTests(unittest.TestCase):
             "blinn_phong.py": "@blinn_phong_fragment",
             "blinn_phong_vertices.py": "@skinned_vertex",
             "planet_terrain.py": "@planet_terrain_vertex",
+            "shadowed_material.py": "@shadowed_fragment",
+            "runtime_shader.py": "@runtime_fragment",
         }
         for filename, entry in expected_entries.items():
             with self.subTest(filename=filename):

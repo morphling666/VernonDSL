@@ -6,6 +6,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -43,7 +44,7 @@ struct VernonToGPUPass
   }
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect, gpu::GPUDialect, memref::MemRefDialect,
-                    spirv::SPIRVDialect>();
+                    spirv::SPIRVDialect, tensor::TensorDialect>();
   }
 
   void runOnOperation() override {
@@ -79,8 +80,9 @@ struct VernonToGPUPass
 
     for (func::FuncOp source : computeEntries) {
       SmallVector<Type> kernelArgumentTypes;
-      SmallVector<unsigned> resourceArgumentIndices;
-      SmallVector<std::pair<unsigned, unsigned>> resourceBindings;
+      SmallVector<unsigned> kernelSourceArgumentIndices;
+      SmallVector<std::pair<unsigned, std::pair<unsigned, unsigned>>>
+          resourceBindings;
       for (auto [index, type] : llvm::enumerate(source.getArgumentTypes())) {
         InterfaceAttrs attrs =
             parseInterfaceAttrs(source.getArgAttrDict(index));
@@ -93,12 +95,18 @@ struct VernonToGPUPass
                                << index << " type " << type;
             return signalPassFailure();
           }
-          resourceArgumentIndices.push_back(index);
+          unsigned kernelIndex = kernelArgumentTypes.size();
+          kernelSourceArgumentIndices.push_back(index);
           kernelArgumentTypes.push_back(*converted);
           auto descriptorSet = cast<IntegerAttr>(attrs.descriptorSet);
           auto binding = cast<IntegerAttr>(attrs.binding);
-          resourceBindings.emplace_back(descriptorSet.getInt(),
-                                        binding.getInt());
+          resourceBindings.emplace_back(
+              kernelIndex,
+              std::make_pair(descriptorSet.getInt(), binding.getInt()));
+        } else if (!attrs.builtin &&
+                   (type.isIntOrIndexOrFloat() || isa<VectorType>(type))) {
+          kernelSourceArgumentIndices.push_back(index);
+          kernelArgumentTypes.push_back(type);
         }
       }
 
@@ -115,7 +123,7 @@ struct VernonToGPUPass
                         spirv::getEntryPointABIAttr(source.getContext(),
                                                     workgroup.asArrayRef()));
       }
-      for (auto [index, binding] : llvm::enumerate(resourceBindings)) {
+      for (auto [index, binding] : resourceBindings) {
         kernel.setArgAttr(
             index, spirv::getInterfaceVarABIAttrName(),
             spirv::getInterfaceVarABIAttr(binding.first, binding.second,
@@ -126,7 +134,7 @@ struct VernonToGPUPass
       OpBuilder bodyBuilder = OpBuilder::atBlockBegin(entry);
       IRMapping mapping;
       for (auto [sourceIndex, kernelArgument] :
-           llvm::zip_equal(resourceArgumentIndices, entry->getArguments()))
+           llvm::zip_equal(kernelSourceArgumentIndices, entry->getArguments()))
         mapping.map(source.getArgument(sourceIndex), kernelArgument);
 
       for (auto [index, argument] : llvm::enumerate(source.getArguments())) {
@@ -141,12 +149,32 @@ struct VernonToGPUPass
               << " is neither a resource nor a supported builtin";
           return signalPassFailure();
         }
-        Value globalId = gpu::GlobalIdOp::create(bodyBuilder, source.getLoc(),
-                                                 gpu::Dimension::x);
-        if (!argument.getType().isIndex())
-          globalId = arith::IndexCastUIOp::create(bodyBuilder, source.getLoc(),
-                                                  argument.getType(), globalId);
-        mapping.map(argument, globalId);
+        if (auto tensorType = dyn_cast<RankedTensorType>(argument.getType())) {
+          if (tensorType.getRank() != 1 || tensorType.getDimSize(0) != 3 ||
+              !tensorType.getElementType().isInteger(32)) {
+            source.emitError()
+                << "global_invocation_id Tensor must have type tensor<3xi32>";
+            return signalPassFailure();
+          }
+          SmallVector<Value> components;
+          for (gpu::Dimension dimension :
+               {gpu::Dimension::x, gpu::Dimension::y, gpu::Dimension::z}) {
+            Value id = gpu::GlobalIdOp::create(bodyBuilder, source.getLoc(),
+                                               dimension);
+            components.push_back(arith::IndexCastUIOp::create(
+                bodyBuilder, source.getLoc(), tensorType.getElementType(), id));
+          }
+          mapping.map(argument, tensor::FromElementsOp::create(
+                                    bodyBuilder, source.getLoc(), tensorType,
+                                    components));
+        } else {
+          Value globalId = gpu::GlobalIdOp::create(bodyBuilder, source.getLoc(),
+                                                   gpu::Dimension::x);
+          if (!argument.getType().isIndex())
+            globalId = arith::IndexCastUIOp::create(
+                bodyBuilder, source.getLoc(), argument.getType(), globalId);
+          mapping.map(argument, globalId);
+        }
       }
 
       for (Operation &operation : source.front()) {

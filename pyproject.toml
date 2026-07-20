@@ -6,7 +6,6 @@ requires-python = ">=3.11.9,<3.12"
 authors = [{ name = "Xinyu Yuan", email = "1282503538@qq.com" }]
 
 dependencies = [
-    "pybind11>=3.0.0",
     "sympy>=1.13.3",
     "numpy>=1.26,<2.0",
     "pandas>=2.3.1",
@@ -24,8 +23,12 @@ dependencies = [
     "conan>=2.22.0",
 ]
 
+[project.optional-dependencies]
+examples = ["opencv-python>=4.10"]
+
 [project.scripts]
 vernon-compile-python = "vernon_dsl.cli:main"
+vernon-cook-shader = "vernon_dsl.shader_asset_cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]

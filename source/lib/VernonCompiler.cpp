@@ -8,6 +8,7 @@
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
 #include "mlir/Dialect/SPIRV/Transforms/Passes.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonToGPU.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonToSpirv.h"
@@ -16,6 +17,8 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/DialectRegistry.h"
+#include "mlir/IR/IRMapping.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/InitAllDialects.h"
 #include "mlir/InitAllExtensions.h"
@@ -36,6 +39,7 @@
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
@@ -44,6 +48,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -87,6 +92,168 @@ struct VernonCompileResult {
 };
 
 namespace {
+
+llvm::StringRef targetName(VernonTarget target) {
+  switch (target) {
+  case VERNON_TARGET_CPU:
+    return "cpu";
+  case VERNON_TARGET_OPENGL:
+    return "opengl";
+  case VERNON_TARGET_OPENGL_ES:
+    return "opengles";
+  case VERNON_TARGET_VULKAN:
+    return "vulkan";
+  case VERNON_TARGET_METAL:
+    return "metal";
+  case VERNON_TARGET_DIRECTX:
+    return "directx";
+  case VERNON_TARGET_CUDA:
+    return "cuda";
+  }
+  return "unknown";
+}
+
+llvm::StringRef artifactFormat(llvm::StringRef filename) {
+  llvm::StringRef extension = llvm::sys::path::extension(filename);
+  if (extension == ".spv")
+    return "spirv";
+  if (extension == ".glsl")
+    return "glsl";
+  if (extension == ".gles")
+    return "gles";
+  if (extension == ".metal")
+    return "msl";
+  if (extension == ".ptx")
+    return "ptx";
+  if (extension == ".ll")
+    return "llvm_ir";
+  return "unknown";
+}
+
+void addArtifactTable(VernonCompileResult &result, VernonTarget target,
+                      uint32_t glslVersion) {
+  llvm::Expected<llvm::json::Value> parsed =
+      llvm::json::parse(result.reflection);
+  if (!parsed)
+    return;
+  llvm::json::Object *root = parsed->getAsObject();
+  if (!root)
+    return;
+
+  (*root)["schema_version"] = int64_t{2};
+  (*root)["target"] = targetName(target).str();
+  llvm::json::Object targetOptions;
+  if (target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES)
+    targetOptions["glsl_version"] = static_cast<int64_t>(glslVersion);
+  (*root)["target_options"] = std::move(targetOptions);
+
+  llvm::json::Array table;
+  llvm::json::Array *entries = root->getArray("entries");
+  if (entries) {
+    for (auto [artifactIndex, artifact] : llvm::enumerate(result.artifacts)) {
+      llvm::StringRef artifactName = artifact.name;
+      for (auto [entryIndex, entryValue] : llvm::enumerate(*entries)) {
+        llvm::json::Object *entry = entryValue.getAsObject();
+        if (!entry)
+          continue;
+        std::optional<llvm::StringRef> entryName = entry->getString("name");
+        std::optional<llvm::StringRef> stage = entry->getString("stage");
+        if (!entryName || !stage)
+          continue;
+
+        // Cross-compiled artifacts carry the entry name. Binary module
+        // artifacts are emitted in the same deterministic order as entries;
+        // a single module may contain every entry.
+        const bool namedArtifact =
+            artifactName.starts_with(*entryName) &&
+            artifactName.drop_front(entryName->size()).starts_with(".");
+        const bool sharedArtifact = result.artifacts.size() == 1;
+        const bool parallelArtifact =
+            result.artifacts.size() == entries->size() &&
+            artifactIndex == entryIndex;
+        if (!namedArtifact && !sharedArtifact && !parallelArtifact)
+          continue;
+
+        llvm::json::Object row;
+        row["entry_point"] = entryName->str();
+        row["stage"] = stage->str();
+        row["target"] = targetName(target).str();
+        row["format"] = artifactFormat(artifactName).str();
+        row["filename"] = artifact.name;
+        table.emplace_back(std::move(row));
+      }
+    }
+  }
+  (*root)["artifacts"] = std::move(table);
+
+  result.reflection.clear();
+  llvm::raw_string_ostream stream(result.reflection);
+  stream << llvm::json::Value(std::move(*root));
+}
+
+struct InlineVernonHelpersPass
+    : public mlir::PassWrapper<InlineVernonHelpersPass,
+                               mlir::OperationPass<mlir::ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(InlineVernonHelpersPass)
+
+  void runOnOperation() override {
+    mlir::ModuleOp module = getOperation();
+    unsigned maxIterations = 1;
+    for ([[maybe_unused]] mlir::func::FuncOp function :
+         module.getOps<mlir::func::FuncOp>())
+      ++maxIterations;
+    for (unsigned iteration = 0; iteration < maxIterations; ++iteration) {
+      llvm::SmallVector<mlir::func::CallOp> calls;
+      module.walk([&](mlir::func::CallOp call) { calls.push_back(call); });
+      if (calls.empty())
+        return;
+
+      for (mlir::func::CallOp call : calls) {
+        mlir::func::FuncOp callee =
+            module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
+        if (!callee) {
+          call.emitError() << "cannot resolve helper '" << call.getCallee()
+                           << "'";
+          return signalPassFailure();
+        }
+        if (callee->hasAttr("vernon.entry")) {
+          call.emitError("Vernon entry functions cannot be called");
+          return signalPassFailure();
+        }
+        if (!llvm::hasSingleElement(callee.getBody())) {
+          call.emitError("helper inlining requires a single function block");
+          return signalPassFailure();
+        }
+        auto returnOp = mlir::dyn_cast<mlir::func::ReturnOp>(
+            callee.front().getTerminator());
+        if (!returnOp) {
+          call.emitError("helper function has no func.return terminator");
+          return signalPassFailure();
+        }
+
+        mlir::IRMapping mapping;
+        mapping.map(callee.getArguments(), call.getOperands());
+        mlir::OpBuilder builder(call);
+        for (mlir::Operation &operation : callee.front().without_terminator())
+          builder.clone(operation, mapping);
+        llvm::SmallVector<mlir::Value> replacements;
+        for (mlir::Value value : returnOp.getOperands())
+          replacements.push_back(mapping.lookupOrDefault(value));
+        call->replaceAllUsesWith(replacements);
+        call.erase();
+      }
+    }
+
+    llvm::SmallVector<mlir::func::CallOp> remainingCalls;
+    module.walk(
+        [&](mlir::func::CallOp call) { remainingCalls.push_back(call); });
+    if (!remainingCalls.empty()) {
+      remainingCalls.front().emitError(
+          "helper inlining did not converge; recursive calls are forbidden");
+      signalPassFailure();
+    }
+  }
+};
 
 struct KeepGpuModulesPass
     : public mlir::PassWrapper<KeepGpuModulesPass,
@@ -148,6 +315,21 @@ llvm::json::Value attributeToJson(mlir::Attribute attribute) {
 }
 
 std::string buildReflection(mlir::ModuleOp module) {
+  auto scalarDtype = [](mlir::Type type) -> std::string {
+    if (type.isF16())
+      return "f16";
+    if (type.isF32())
+      return "f32";
+    if (type.isF64())
+      return "f64";
+    if (type.isInteger(1))
+      return "bool";
+    if (type.isInteger(32))
+      return "u32";
+    if (type.isIndex())
+      return "index";
+    return "";
+  };
   auto cpuTypeSize = [](mlir::Type type) -> uint64_t {
     if (type.isIntOrFloat())
       return std::max<uint64_t>(type.getIntOrFloatBitWidth() / 8, 1);
@@ -205,6 +387,55 @@ std::string buildReflection(mlir::ModuleOp module) {
         }
       }
       mlir::Type argumentType = function.getArgumentTypes()[index];
+      if (stage.getValue() == "compute") {
+        auto attrs = function.getArgAttrDict(index);
+        auto builtin = attrs.getAs<mlir::StringAttr>("vernon.builtin");
+        auto sourceDtype = attrs.getAs<mlir::StringAttr>("vernon.dtype");
+        if (builtin) {
+          argument["kind"] = "builtin";
+          argument["builtin"] = builtin.getValue().str();
+          if (sourceDtype)
+            argument["dtype"] = sourceDtype.getValue().str();
+        } else if (auto buffer =
+                       mlir::dyn_cast<mlir::vernon::BufferType>(argumentType)) {
+          argument["kind"] = "tensor";
+          argument["cuda_abi"] = "strided_memref_1d";
+          argument["dtype"] = sourceDtype
+                                  ? sourceDtype.getValue().str()
+                                  : scalarDtype(buffer.getElementType());
+          argument["access"] = buffer.getAccess().str();
+          uint64_t elementSize = std::max<uint64_t>(
+              buffer.getElementType().getIntOrFloatBitWidth() / 8, 1);
+          argument["alignment"] = static_cast<int64_t>(elementSize);
+          if (auto shape =
+                  attrs.getAs<mlir::DenseI64ArrayAttr>("vernon.tensor_shape")) {
+            llvm::json::Array dimensions;
+            llvm::json::Array strides;
+            int64_t stride = 1;
+            llvm::SmallVector<int64_t> reversedStrides(shape.size());
+            for (int64_t dimensionIndex =
+                     static_cast<int64_t>(shape.size()) - 1;
+                 dimensionIndex >= 0; --dimensionIndex) {
+              reversedStrides[dimensionIndex] = stride;
+              stride *= shape[dimensionIndex];
+            }
+            for (auto [dimension, tensorStride] :
+                 llvm::zip_equal(shape.asArrayRef(), reversedStrides)) {
+              dimensions.emplace_back(dimension);
+              strides.emplace_back(tensorStride);
+            }
+            argument["rank"] = static_cast<int64_t>(shape.size());
+            argument["shape"] = std::move(dimensions);
+            argument["strides"] = std::move(strides);
+          }
+        } else {
+          argument["kind"] = "scalar";
+          argument["dtype"] = sourceDtype ? sourceDtype.getValue().str()
+                                          : scalarDtype(argumentType);
+          argument["alignment"] = static_cast<int64_t>(
+              std::max<uint64_t>(cpuTypeSize(argumentType), 1));
+        }
+      }
       if (mlir::isa<mlir::vernon::BufferType>(argumentType))
         requiredFeatures.insert("buffers");
       if (mlir::isa<mlir::vernon::TextureType>(argumentType))
@@ -238,19 +469,42 @@ std::string buildReflection(mlir::ModuleOp module) {
 
     llvm::json::Object entry;
     entry["name"] = function.getSymName().str();
+    entry["symbol"] = function.getSymName().str();
     entry["stage"] = stage.getValue().str();
     entry["arguments"] = std::move(arguments);
     entry["results"] = std::move(results);
     entry["cpu_arguments_size"] = static_cast<int64_t>(argumentOffset);
     entry["cpu_results_size"] = static_cast<int64_t>(resultSize);
-    if (auto workgroup = function->getAttr("vernon.workgroup_size"))
-      entry["workgroup_size"] = attributeToJson(workgroup);
+    if (auto workgroup = function->getAttrOfType<mlir::DenseI32ArrayAttr>(
+            "vernon.workgroup_size")) {
+      llvm::json::Array dimensions;
+      for (int32_t dimension : workgroup.asArrayRef())
+        dimensions.emplace_back(static_cast<int64_t>(dimension));
+      entry["workgroup_size"] = std::move(dimensions);
+    }
     entries.emplace_back(std::move(entry));
   });
 
   llvm::json::Object root;
-  root["schema_version"] = int64_t{1};
+  root["schema_version"] = int64_t{2};
+  root["gpu_launch_abi_version"] = int64_t{1};
   root["entries"] = std::move(entries);
+  root["artifacts"] = llvm::json::Array();
+  llvm::json::Array dependencies;
+  if (auto encoded = module->getAttrOfType<mlir::ArrayAttr>(
+          "vernon.source_dependencies")) {
+    for (mlir::Attribute attribute : encoded) {
+      auto value = mlir::dyn_cast<mlir::StringAttr>(attribute);
+      if (!value)
+        continue;
+      auto [path, digest] = value.getValue().split('=');
+      llvm::json::Object dependency;
+      dependency["path"] = path.str();
+      dependency["sha256"] = digest.str();
+      dependencies.emplace_back(std::move(dependency));
+    }
+  }
+  root["dependencies"] = std::move(dependencies);
   llvm::json::Array features;
   for (const std::string &feature : requiredFeatures)
     features.emplace_back(feature);
@@ -620,6 +874,30 @@ private:
                      mlir::dyn_cast<mlir::vernon::IntrinsicOp>(operation)) {
         requiresTextureCallbacks |= intrinsic.getName() == "texture_sample";
         result = emitIntrinsic(intrinsic, builder, values);
+      } else if (auto extract =
+                     mlir::dyn_cast<mlir::tensor::ExtractOp>(operation)) {
+        llvm::Value *tensor = values.lookup(extract.getTensor());
+        auto tensorType =
+            mlir::cast<mlir::RankedTensorType>(extract.getTensor().getType());
+        llvm::Value *linearIndex =
+            llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
+        for (auto [dimension, index] : llvm::enumerate(extract.getIndices())) {
+          llvm::Value *convertedIndex = values.lookup(index);
+          if (!convertedIndex)
+            return mlir::failure();
+          if (!convertedIndex->getType()->isIntegerTy(64))
+            convertedIndex = builder.CreateZExtOrTrunc(
+                convertedIndex, llvm::Type::getInt64Ty(context));
+          if (dimension != 0)
+            linearIndex = builder.CreateMul(
+                linearIndex,
+                llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
+                                       tensorType.getDimSize(dimension)));
+          linearIndex = builder.CreateAdd(linearIndex, convertedIndex);
+        }
+        result = llvm::isa<llvm::VectorType>(tensor->getType())
+                     ? builder.CreateExtractElement(tensor, linearIndex)
+                     : tensor;
       } else if (auto returnOp =
                      mlir::dyn_cast<mlir::func::ReturnOp>(operation)) {
         if (returnOp.getNumOperands() == 0)
@@ -627,6 +905,27 @@ private:
         else
           builder.CreateRet(values.lookup(returnOp.getOperand(0)));
         continue;
+      } else if (operation.getNumOperands() == 1 &&
+                 operation.getNumResults() == 1) {
+        llvm::Value *input = values.lookup(operation.getOperand(0));
+        llvm::Type *target = convertType(operation.getResult(0).getType());
+        llvm::StringRef name = operation.getName().getStringRef();
+        if (name == "arith.index_cast")
+          result = builder.CreateIntCast(input, target, true);
+        else if (name == "arith.index_castui")
+          result = builder.CreateIntCast(input, target, false);
+        else if (name == "arith.uitofp")
+          result = builder.CreateUIToFP(input, target);
+        else if (name == "arith.sitofp")
+          result = builder.CreateSIToFP(input, target);
+        else if (name == "arith.fptoui")
+          result = builder.CreateFPToUI(input, target);
+        else if (name == "arith.fptosi")
+          result = builder.CreateFPToSI(input, target);
+        else if (name == "arith.extf")
+          result = builder.CreateFPExt(input, target);
+        else if (name == "arith.truncf")
+          result = builder.CreateFPTrunc(input, target);
       } else if (operation.getNumOperands() == 2 &&
                  operation.getNumResults() == 1) {
         llvm::Value *lhs = values.lookup(operation.getOperand(0));
@@ -814,6 +1113,10 @@ bool compileVulkan(VernonCompilerContext *context, const char *source,
 
   mlir::PassManager passManager(&context->context);
   passManager.addPass(mlir::vernon::createVernonValidatePass());
+  // Backend lowerings intentionally only handle entry bodies. Inline shared
+  // helpers while the module is still in common typed MLIR so every target
+  // sees the same implementation.
+  passManager.addPass(std::make_unique<InlineVernonHelpersPass>());
   passManager.addPass(mlir::vernon::createVernonToGPUPass(true));
   passManager.addPass(mlir::createConvertGPUToSPIRVPass());
   passManager.addPass(mlir::vernon::createVernonToSPIRVPass());
@@ -864,6 +1167,7 @@ bool compileCuda(VernonCompilerContext *context, const char *source,
 
   mlir::PassManager passManager(&context->context);
   passManager.addPass(mlir::vernon::createVernonValidatePass());
+  passManager.addPass(std::make_unique<InlineVernonHelpersPass>());
   passManager.addPass(mlir::vernon::createVernonToGPUPass());
   passManager.addPass(std::make_unique<KeepGpuModulesPass>());
   mlir::gpu::GPUToNVVMPipelineOptions options;
@@ -896,6 +1200,12 @@ bool compileCpu(VernonCompilerContext *compilerContext, const char *source,
   mlir::OwningOpRef<mlir::ModuleOp> sourceModule =
       mlir::parseSourceString<mlir::ModuleOp>(text, &compilerContext->context);
   if (!sourceModule)
+    return false;
+
+  mlir::PassManager passManager(&compilerContext->context);
+  passManager.addPass(mlir::vernon::createVernonValidatePass());
+  passManager.addPass(std::make_unique<InlineVernonHelpersPass>());
+  if (mlir::failed(passManager.run(*sourceModule)))
     return false;
 
   auto targetMachine = llvm::orc::JITTargetMachineBuilder::detectHost();
@@ -967,7 +1277,8 @@ llvm::StringRef stageSuffix(spv::ExecutionModel model) {
   }
 }
 
-bool crossCompile(VernonCompileResult &result, VernonTarget target) {
+bool crossCompile(VernonCompileResult &result, VernonTarget target,
+                  uint32_t glslVersion) {
   std::vector<VernonCompileResult::Artifact> translated;
   try {
     for (const VernonCompileResult::Artifact &artifact : result.artifacts) {
@@ -990,7 +1301,9 @@ bool crossCompile(VernonCompileResult &result, VernonTarget target) {
           compiler.set_entry_point(entry.name, entry.execution_model);
           spirv_cross::CompilerGLSL::Options options;
           options.es = target == VERNON_TARGET_OPENGL_ES;
-          options.version = options.es ? 310 : 450;
+          options.version =
+              glslVersion != 0 ? glslVersion : (options.es ? 310 : 330);
+          options.enable_420pack_extension = options.es;
           compiler.set_common_options(options);
           source = compiler.compile();
           extension = options.es ? "gles" : "glsl";
@@ -1059,6 +1372,13 @@ VernonCompileResult *vernonCompilerCompileMlir(VernonCompilerContext *context,
                                                const char *source,
                                                size_t sourceSize,
                                                VernonTarget target) {
+  return vernonCompilerCompileMlirWithOptions(context, source, sourceSize,
+                                              target, nullptr);
+}
+
+VernonCompileResult *vernonCompilerCompileMlirWithOptions(
+    VernonCompilerContext *context, const char *source, size_t sourceSize,
+    VernonTarget target, const VernonCompileOptions *options) {
   auto result = validate(context, source, sourceSize);
   if (result->status != VERNON_STATUS_OK)
     return result.release();
@@ -1070,9 +1390,37 @@ VernonCompileResult *vernonCompilerCompileMlir(VernonCompilerContext *context,
     return result.release();
   }
 
+  uint32_t glslVersion = 0;
+  if (options) {
+    constexpr size_t requiredOptionsSize =
+        offsetof(VernonCompileOptions, glsl_version) + sizeof(uint32_t);
+    if (options->struct_size < requiredOptionsSize) {
+      result->status = VERNON_STATUS_INVALID_ARGUMENT;
+      result->diagnostics = "compile options structure is too small";
+      result->artifacts.clear();
+      return result.release();
+    }
+    glslVersion = options->glsl_version;
+    if (glslVersion != 0 && target != VERNON_TARGET_OPENGL &&
+        target != VERNON_TARGET_OPENGL_ES) {
+      result->status = VERNON_STATUS_INVALID_ARGUMENT;
+      result->diagnostics =
+          "GLSL version is valid only for OpenGL and OpenGL ES targets";
+      result->artifacts.clear();
+      return result.release();
+    }
+    if (glslVersion != 0 && (glslVersion < 100 || glslVersion > 999)) {
+      result->status = VERNON_STATUS_INVALID_ARGUMENT;
+      result->diagnostics = "GLSL version must be a three-digit version number";
+      result->artifacts.clear();
+      return result.release();
+    }
+  }
+
   if (target == VERNON_TARGET_CPU) {
     result->diagnostics.clear();
     if (compileCpu(context, source, sourceSize, *result)) {
+      addArtifactTable(*result, target, glslVersion);
       result->status = VERNON_STATUS_OK;
       return result.release();
     }
@@ -1086,7 +1434,8 @@ VernonCompileResult *vernonCompilerCompileMlir(VernonCompilerContext *context,
     result->diagnostics.clear();
     if (compileVulkan(context, source, sourceSize, *result)) {
 #if defined(VERNON_HAS_SPIRV_CROSS)
-      if (target != VERNON_TARGET_VULKAN && !crossCompile(*result, target)) {
+      if (target != VERNON_TARGET_VULKAN &&
+          !crossCompile(*result, target, glslVersion)) {
         result->status = VERNON_STATUS_INTERNAL_ERROR;
         result->artifacts.clear();
         return result.release();
@@ -1099,6 +1448,7 @@ VernonCompileResult *vernonCompilerCompileMlir(VernonCompilerContext *context,
         return result.release();
       }
 #endif
+      addArtifactTable(*result, target, glslVersion);
       result->status = VERNON_STATUS_OK;
       return result.release();
     }
@@ -1110,6 +1460,7 @@ VernonCompileResult *vernonCompilerCompileMlir(VernonCompilerContext *context,
   if (target == VERNON_TARGET_CUDA) {
     result->diagnostics.clear();
     if (compileCuda(context, source, sourceSize, *result)) {
+      addArtifactTable(*result, target, glslVersion);
       result->status = VERNON_STATUS_OK;
       return result.release();
     }

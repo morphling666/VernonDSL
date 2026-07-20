@@ -16,6 +16,7 @@ add_mlir_library(MLIRVernonTransforms
   MLIRMemRefDialect
   MLIRVernonDialect
   MLIRSPIRVDialect
+  MLIRTensorDialect
   MLIRIR
   MLIRPass
   MLIRSupport

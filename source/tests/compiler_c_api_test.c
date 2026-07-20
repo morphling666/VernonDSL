@@ -3,6 +3,17 @@
 #include <assert.h>
 #include <string.h>
 
+static int view_contains(VernonStringView value, const char *needle) {
+  const size_t needle_size = strlen(needle);
+  if (needle_size == 0 || needle_size > value.size)
+    return 0;
+  for (size_t index = 0; index + needle_size <= value.size; ++index) {
+    if (memcmp(value.data + index, needle, needle_size) == 0)
+      return 1;
+  }
+  return 0;
+}
+
 static void sample_texture(void *user_data, uintptr_t texture, float u, float v,
                            float out_rgba[4]) {
   const float bias = *(const float *)user_data;
@@ -112,6 +123,10 @@ int main(void) {
   VernonTargetCapabilities cpu =
       vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_CPU);
   assert(cpu.available && cpu.supports_graphics && cpu.supports_compute);
+  VernonTargetCapabilities opengl =
+      vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_OPENGL);
+  VernonTargetCapabilities opengles =
+      vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_OPENGL_ES);
 
   VernonCompileResult *validation =
       vernonCompilerValidateMlir(context, module, strlen(module));
@@ -161,7 +176,56 @@ int main(void) {
   assert(spirv.size >= sizeof(magic));
   memcpy(&magic, spirv.data, sizeof(magic));
   assert(magic == 0x07230203u);
+  VernonStringView vulkan_reflection =
+      vernonCompileResultGetReflection(vulkan_compile);
+  assert(view_contains(vulkan_reflection, "\"schema_version\":2"));
+  assert(view_contains(vulkan_reflection, "\"target\":\"vulkan\""));
+  assert(view_contains(vulkan_reflection, "\"entry_point\":\"vertex_main\""));
+  assert(view_contains(vulkan_reflection, "\"filename\":\"module.spv\""));
   vernonCompileResultDestroy(vulkan_compile);
+
+  if (opengl.available) {
+    VernonCompileOptions options = {sizeof(VernonCompileOptions), 450, {0}};
+    VernonCompileResult *opengl_compile = vernonCompilerCompileMlirWithOptions(
+        context, cpu_module, strlen(cpu_module), VERNON_TARGET_OPENGL,
+        &options);
+    assert(opengl_compile != NULL);
+    assert(vernonCompileResultGetStatus(opengl_compile) == VERNON_STATUS_OK);
+    VernonStringView glsl =
+        vernonCompileResultGetArtifactData(opengl_compile, 0);
+    assert(glsl.size >= strlen("#version 450"));
+    assert(memcmp(glsl.data, "#version 450", strlen("#version 450")) == 0);
+    VernonStringView opengl_reflection =
+        vernonCompileResultGetReflection(opengl_compile);
+    assert(view_contains(opengl_reflection, "\"target\":\"opengl\""));
+    assert(view_contains(opengl_reflection, "\"glsl_version\":450"));
+    assert(view_contains(opengl_reflection, "\"format\":\"glsl\""));
+    vernonCompileResultDestroy(opengl_compile);
+
+    options.glsl_version = 330;
+    VernonCompileResult *invalid_options = vernonCompilerCompileMlirWithOptions(
+        context, module, strlen(module), VERNON_TARGET_VULKAN, &options);
+    assert(invalid_options != NULL);
+    assert(vernonCompileResultGetStatus(invalid_options) ==
+           VERNON_STATUS_INVALID_ARGUMENT);
+    vernonCompileResultDestroy(invalid_options);
+  }
+
+  if (opengles.available) {
+    VernonCompileOptions options = {sizeof(VernonCompileOptions), 310, {0}};
+    VernonCompileResult *opengles_compile =
+        vernonCompilerCompileMlirWithOptions(context, cpu_module,
+                                             strlen(cpu_module),
+                                             VERNON_TARGET_OPENGL_ES, &options);
+    assert(opengles_compile != NULL);
+    assert(vernonCompileResultGetStatus(opengles_compile) == VERNON_STATUS_OK);
+    VernonStringView glsl =
+        vernonCompileResultGetArtifactData(opengles_compile, 0);
+    assert(glsl.size >= strlen("#version 310 es"));
+    assert(memcmp(glsl.data, "#version 310 es", strlen("#version 310 es")) ==
+           0);
+    vernonCompileResultDestroy(opengles_compile);
+  }
 
   VernonCompileResult *vulkan_compute_compile = vernonCompilerCompileMlir(
       context, cpu_compute_module, strlen(cpu_compute_module),

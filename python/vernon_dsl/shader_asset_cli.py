@@ -1,0 +1,42 @@
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from .diagnostics import CompileError
+from .shader_assets import ShaderAssetError, cook_shader_pipeline
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="vernon-cook-shader",
+        description=
+        "Cook a shader-pipeline manifest into a Vernon asset directory.",
+    )
+    parser.add_argument("pipeline", type=Path)
+    parser.add_argument("--asset-root", type=Path, required=True)
+    parser.add_argument("--compiler", type=Path, required=True)
+    parser.add_argument("--target", default="opengl")
+    parser.add_argument("-o", "--output", type=Path, required=True)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = _parser().parse_args(argv)
+    try:
+        cook_shader_pipeline(
+            pipeline_manifest=arguments.pipeline,
+            asset_root=arguments.asset_root,
+            compiler=arguments.compiler,
+            output=arguments.output,
+            target=arguments.target,
+        )
+    except (CompileError, ShaderAssetError, OSError) as error:
+        print(error, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

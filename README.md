@@ -75,6 +75,103 @@ build/source/Release/vernon-compile.exe `
   --output-dir build/vulkan
 ```
 
+## Run an explicit compute kernel
+
+Runtime kernels use an explicit global grid and runtime-owned contiguous
+Tensors. Builtin arguments are synthesized and omitted from the call:
+
+```python
+from typing import Annotated
+import vernon_dsl as vd
+
+vd.init(arch=vd.cpu)  # use vd.cuda when the optional Driver backend is built
+output = vd.Tensor.zeros(dtype=vd.f32, shape=(8,))
+
+@vd.kernel(workgroup_size=(8, 1, 1))
+def scale(
+    output: vd.Tensor[vd.f32, (None,)],
+    factor: vd.f32,
+    gid: Annotated[
+        vd.Tensor[vd.u32, (3,)],
+        vd.builtin("global_invocation_id"),
+    ],
+) -> None:
+    output[gid[0]] = vd.f32(gid[0]) * factor
+
+scale(output, 2.0, grid=(8, 1, 1))
+values = output.to_numpy()
+```
+
+`VERNON_ENABLE_RUNTIME` builds the standalone `VernonDSLRuntime` C API and
+CPU reference backend. `VERNON_ENABLE_CUDA_RUNTIME` dynamically loads the
+CUDA Driver API from `nvcuda.dll`/`libcuda.so.1`; no CUDA Toolkit or `nvcc`
+installation is required. Compiler CUDA capability remains independent of
+runtime/device availability. `VERNON_ENABLE_PYTHON_BINDINGS` builds the
+nanobind `_native` module when Python 3.11 and nanobind are available.
+
+Persist a kernel for C or C++ loading with:
+
+```powershell
+vernon-compile-python kernel.py --entry scale -o build/scale.mlir
+build/source/Release/vernon-compile.exe `
+  --target cpu build/scale.mlir `
+  --compute-bundle build/scale
+```
+
+OpenGL and OpenGL ES source versions are selectable per compilation. Omitting
+the option uses the backend default:
+
+```powershell
+build/source/Release/vernon-compile.exe `
+  --target opengl build/runtime.mlir `
+  --glsl-version 330 `
+  --output-dir build/opengl
+```
+
+To cook an OpenGL shader directly into a Vernon asset, provide its stable
+asset ID and a normal output directory:
+
+```powershell
+build/source/Release/vernon-compile.exe `
+  --target opengl build/runtime.mlir `
+  --glsl-version 330 `
+  --bundle assets/shaders/runtime `
+  --asset-id shaders/runtime
+```
+
+The cooked directory contains `shader.json` plus readable generated vertex
+and fragment GLSL files. The manifest records schema-versioned reflection,
+source dependency hashes, the module hash, and an explicit
+entry/stage/artifact table.
+Mount the containing asset root in Vernon, then load `Shader` asset
+`shaders/runtime`.
+
+For variant families, author `*.shader-module.json` and
+`*.shader-pipeline.json`, then cook every explicitly included feature key:
+
+```powershell
+uv run --frozen vernon-cook-shader `
+  examples/variant_mesh.shader-pipeline.json `
+  --asset-root examples `
+  --compiler build/source/Release/vernon-compile.exe `
+  --target opengl `
+  -o build/variant_mesh_asset
+```
+
+The resulting `shader.json` maps exact canonical feature keys to shared stage
+artifacts. For the four `INSTANCE`/`SKIN` combinations, four specialized
+vertex files share one unchanged fragment file. Vernon rejects missing
+variants rather than falling back.
+
+`feature("NAME")`, `When[FEATURE, T]`, `if FEATURE`, and `if not FEATURE` are
+specialized before type checking. Interface locations are inferred from
+declaration order and type span before specialization; disabled fields reserve
+their ranges, keeping surviving locations stable across variants. Explicit
+locations remain available and overlapping ranges are diagnosed.
+
+Reflected resource binding and material `(set, binding)` values remain the next
+asset-pipeline milestone.
+
 Shader regression examples are in `examples/`: `blinn_phong.py` implements
 Blinn-Phong lighting, `blinn_phong_vertices.py` covers static, custom-instance,
 and skinned vertex variants, and `planet_terrain.py` exercises a non-template
@@ -109,3 +206,4 @@ build/source/Release/vernon-compile.exe `
   --output-dir build/cpu `
   --reflection build/cpu/material.json
 ```
+uv run --extra examples python fractal.py

@@ -5,6 +5,7 @@ add_library(VernonDSLCompiler SHARED
   lib/VernonCompiler.cpp
 )
 llvm_map_components_to_libnames(VERNON_LLVM_JIT_LIBS
+  AsmParser
   Core
   OrcJIT
   native
@@ -61,10 +62,72 @@ install(TARGETS VernonDSLCompiler
 install(FILES include/VernonCompiler.h DESTINATION include)
 install(FILES include/vernon-c/Compiler.h DESTINATION include/vernon-c)
 
+if(VERNON_ENABLE_RUNTIME)
+  add_library(VernonDSLRuntime SHARED lib/VernonRuntime.cpp)
+  target_compile_definitions(VernonDSLRuntime PRIVATE VERNON_DSL_RUNTIME_BUILD)
+  target_include_directories(VernonDSLRuntime
+    PUBLIC
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+      $<INSTALL_INTERFACE:include>
+  )
+  target_link_libraries(VernonDSLRuntime PRIVATE
+    LLVMSupport
+    ${VERNON_LLVM_JIT_LIBS}
+  )
+  if(MSVC)
+    target_compile_options(VernonDSLRuntime PRIVATE /EHsc)
+  endif()
+  if(VERNON_ENABLE_CUDA_RUNTIME)
+    target_compile_definitions(VernonDSLRuntime PRIVATE
+      VERNON_HAS_CUDA_RUNTIME=1)
+  endif()
+  install(TARGETS VernonDSLRuntime
+    RUNTIME DESTINATION bin
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+  )
+  install(FILES include/VernonRuntime.h DESTINATION include)
+  install(FILES include/vernon-c/Runtime.h DESTINATION include/vernon-c)
+
+  if(VERNON_ENABLE_PYTHON_BINDINGS)
+    find_package(Python 3.11 EXACT COMPONENTS Interpreter Development.Module QUIET)
+    if(Python_FOUND)
+      execute_process(
+        COMMAND ${Python_EXECUTABLE} -m nanobind --cmake_dir
+        OUTPUT_VARIABLE VERNON_NANOBIND_CMAKE_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE VERNON_NANOBIND_RESULT
+      )
+      if(VERNON_NANOBIND_RESULT EQUAL 0)
+        list(APPEND CMAKE_PREFIX_PATH "${VERNON_NANOBIND_CMAKE_DIR}")
+        find_package(nanobind CONFIG QUIET)
+      endif()
+    endif()
+    if(nanobind_FOUND)
+      nanobind_add_module(vernon-dsl-native python/native_module.cpp)
+      target_link_libraries(vernon-dsl-native PRIVATE
+        VernonDSLCompiler VernonDSLRuntime)
+      if(MSVC)
+        target_compile_options(vernon-dsl-native PRIVATE /EHsc)
+      endif()
+      set_target_properties(vernon-dsl-native PROPERTIES OUTPUT_NAME "_native")
+      install(TARGETS vernon-dsl-native
+        RUNTIME DESTINATION vernon_dsl
+        LIBRARY DESTINATION vernon_dsl
+      )
+    else()
+      message(STATUS "nanobind not found; skipping vernon_dsl._native")
+    endif()
+  endif()
+endif()
+
 add_executable(vernon-compile
   tools/vernon_compile.cpp
 )
-target_link_libraries(vernon-compile PRIVATE VernonDSLCompiler)
+target_link_libraries(vernon-compile PRIVATE VernonDSLCompiler LLVMSupport)
+if(MSVC)
+  target_compile_options(vernon-compile PRIVATE /EHsc)
+endif()
 install(TARGETS vernon-compile RUNTIME DESTINATION bin)
 
 if(BUILD_TESTING)
@@ -83,6 +146,18 @@ if(BUILD_TESTING)
   add_test(NAME vernon-compiler-cpp-api-test
     COMMAND vernon-compiler-cpp-api-test
   )
+  if(VERNON_ENABLE_RUNTIME)
+    add_executable(vernon-runtime-c-api-test tests/runtime_c_api_test.c)
+    target_link_libraries(vernon-runtime-c-api-test PRIVATE VernonDSLRuntime)
+    target_compile_definitions(vernon-runtime-c-api-test PRIVATE
+      VERNON_CPU_BUNDLE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/assets/cpu_compute_bundle")
+    add_test(NAME vernon-runtime-c-api-test COMMAND vernon-runtime-c-api-test)
+    if(VERNON_ENABLE_CUDA_RUNTIME)
+      add_executable(vernon-runtime-cuda-test tests/runtime_cuda_test.cpp)
+      target_link_libraries(vernon-runtime-cuda-test PRIVATE VernonDSLRuntime)
+      add_test(NAME vernon-runtime-cuda-test COMMAND vernon-runtime-cuda-test)
+    endif()
+  endif()
 endif()
 
 add_subdirectory(tools/vernon_opt)
@@ -94,5 +169,6 @@ if(BUILD_TESTING AND WIN32)
       -ProjectRoot ${CMAKE_SOURCE_DIR}
       -BinaryDir ${CMAKE_CURRENT_BINARY_DIR}
       -VernonOpt $<TARGET_FILE:vernon-opt>
+      -VernonCompiler $<TARGET_FILE:vernon-compile>
   )
 endif()

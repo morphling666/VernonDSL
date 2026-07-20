@@ -63,35 +63,67 @@ Compute DSL -> MLIR GPU dialect
 
 SPIR-V is canonical for graphics and Vulkan compute, but it is not the universal compute backend. CUDA must not be routed through SPIR-V. The project must not maintain independent GLSL, MSL, or HLSL emitters; those languages are produced through SPIRV-Cross, with target capability validation before translation.
 
+GLSL language versions are compile options, not backend constants. A zero
+version selects the target default; OpenGL and OpenGL ES callers may request a
+specific version through the stable C API or CLI. Other targets reject this
+option rather than silently ignoring it.
+
+## Completed module and artifact work
+
+1. Project-local absolute and relative imports are resolved from source without
+   executing imported Python.
+2. Transitive symbols are namespaced, with diagnostics for missing or duplicate
+   symbols and import cycles.
+3. The function call graph is validated and recursion is rejected.
+4. Non-entry helpers are deterministically inlined before Vulkan, CUDA, and CPU
+   backend routing.
+5. Transitive SHA-256 source dependencies are emitted into MLIR and reflection,
+   so the canonical module hash changes with imported source.
+6. A shared branchless shadow helper is compiled through Vulkan SPIR-V, CPU
+   LLVM, and OpenGL GLSL integration tests. CUDA helper coverage remains pending
+   until a compute shader uses the shared module.
+7. OpenGL and OpenGL ES GLSL versions are selectable through the stable C API
+   and `--glsl-version`; zero retains the target default.
+8. Vernon can compile paired generated GLSL source and publish it through
+   `ShaderProvider`. This is source loading only; reflected resources are not
+   yet bound.
+9. Compiler reflection schema 2 includes target options and an explicit
+   entry-point/stage/format/filename artifact table. The CLI cooks a normally
+   named directory containing `shader.json` and separate readable OpenGL
+   artifacts; Vernon validates, registers, mounts, and lazily links these
+   bundles through `ShaderProvider`. This first runtime asset slice requires one
+   vertex and one fragment artifact.
+10. The Python frontend specializes `feature`, `When`, and compile-time feature
+    branches, prunes compilation to a selected stage entry, and infers stable
+    interface locations from the unspecialized signature. Shader-module and
+    shader-pipeline manifests cook explicit variant sets into a schema-2
+    `shader.json`; unchanged stages are content-deduplicated. Vernon parses this
+    variant map and resolves exact canonical feature sets without fallback.
+
 ## Next implementation session
 
-The next priority is reusable, multi-file DSL functions. The current frontend
-ignores Python import statements, and although calls to functions in the same
-source file can be emitted as `func.call`, those calls are not yet supported by
-all backend lowerings. Therefore shared functions such as shadow evaluation
-cannot yet be used end to end.
+Make compiler code and reflection a single runtime-consumable shader bundle:
 
-Implement this without executing imported Python:
+Shader variant authoring, stage composition, cooking, and asset integration are
+specified in [shader_variant_asset_plan.md](shader_variant_asset_plan.md).
 
-1. Resolve project-local absolute and relative imports from source files.
-2. Collect transitive structs and function signatures into a namespaced module
-   graph; diagnose missing symbols, duplicate symbols, and import cycles.
-3. Build and validate the function call graph. Recursion is forbidden.
-4. Inline non-entry helper functions in common typed MLIR before the graphics,
-   GPU, and CPU backend split. This keeps backend-specific call lowering out of
-   each target and allows one helper implementation to serve all targets.
-5. Include transitive source hashes in compiler cache keys and reflection
-   dependencies.
-6. Add a shared shadow helper in a separate module and test it through Vulkan
-   SPIR-V, CUDA PTX where applicable, and CPU reference execution.
+1. Extend reflection with an artifact table mapping entry point, stage, target,
+   format, and artifact filename. Do not infer stage pairing from filenames.
+2. Record each cross-compiled resource's exact generated block/uniform/member
+   name and layout alongside its DSL argument index, kind, set, and binding.
+3. Add a Vernon `CompiledShaderBundle` loader that validates reflection schema,
+   target, GLSL version, module hash, dependencies, and required vertex/fragment
+   artifacts before publishing a program.
+4. Implement OpenGL reflection binding. Inputs/outputs continue to use explicit
+   locations; uniforms use reflected UBO layouts and textures/samplers use a
+   deterministic `(set, binding)` to OpenGL binding-point mapping.
+5. Make materials provide typed values by `(set, binding)` instead of generated
+   GLSL names. Keep the existing named-uniform path for legacy shaders.
+6. Add shader variant keys and persistent cache invalidation from target,
+   requested GLSL version, feature set, module hash, and dependency hashes.
+7. Test bundle parsing and binding without a window where possible. GPU/GUI
+   shader tests must be run explicitly by the developer.
 
-After module support, the remaining integration work is:
-
-- connect compiler artifacts and reflection to Vernon's shader/material asset
-  service;
-- add shader variant keys, dependency invalidation, and persistent artifact
-  caching;
-- bind reflected resources and CPU entry ABI from C++;
-- extend graphics/CPU control flow and resource coverage as real shaders
-  require it;
-- complete the DirectX route with DXC-to-DXIL when DXC is available.
+After bundle integration, remaining backend work includes CUDA shared-helper
+coverage, graphics/CPU control flow and texture coverage required by real
+materials, and DXC-to-DXIL artifact generation when DXC is available.

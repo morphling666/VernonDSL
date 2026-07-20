@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "type": "shader_module",
+  "id": "shader_modules/variant_mesh",
+  "source": "variant_mesh.py"
+}

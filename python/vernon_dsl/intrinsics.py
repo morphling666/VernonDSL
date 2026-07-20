@@ -3,6 +3,30 @@
 from typing import Any
 
 
+def sin(value: Any) -> Any:
+    ...
+
+
+def cos(value: Any) -> Any:
+    ...
+
+
+def exp(value: Any) -> Any:
+    ...
+
+
+def log(value: Any) -> Any:
+    ...
+
+
+def sqrt(value: Any) -> Any:
+    ...
+
+
+def abs(value: Any) -> Any:
+    ...
+
+
 def dot(left: Any, right: Any) -> Any:
     ...
 
@@ -12,6 +36,10 @@ def cross(left: Any, right: Any) -> Any:
 
 
 def normalize(value: Any) -> Any:
+    ...
+
+
+def norm(value: Any) -> Any:
     ...
 
 

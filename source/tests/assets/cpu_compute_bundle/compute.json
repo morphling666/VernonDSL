@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "compiler_version": "fixture",
+  "gpu_launch_abi_version": 1,
+  "target": "cpu",
+  "entry": "fill",
+  "symbol": "__vernon_cpu_fill",
+  "artifact": "module.ll",
+  "artifact_format": "llvm_ir",
+  "artifact_size": 1041,
+  "artifact_sha256": "88cdca6df2610c1f91909db4f1f022d59d041c60d0eea9c16b2a80b24ae32a6f",
+  "reflection": {
+    "gpu_launch_abi_version": 1,
+    "entries": [
+      {
+        "name": "fill",
+        "cpu_arguments_size": 20,
+        "workgroup_size": [2, 2, 1],
+        "arguments": [
+          {
+            "kind": "tensor",
+            "cpu_offset": 0,
+            "cpu_size": 8
+          },
+          {
+            "kind": "builtin",
+            "builtin": "global_invocation_id",
+            "cpu_offset": 8,
+            "cpu_size": 12
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -37,6 +37,10 @@ class Texture(_TypeConstructor):
     pass
 
 
+class When(_TypeConstructor):
+    pass
+
+
 class vec(_TypeConstructor):
     pass
 
@@ -84,6 +88,18 @@ Sampler = TypeExpr("Sampler")
 
 
 @dataclass(frozen=True)
+class Feature:
+    name: str
+
+    def __bool__(self) -> bool:
+        raise TypeError("Vernon features are compile-time-only values")
+
+
+def feature(name: str) -> Feature:
+    return Feature(name)
+
+
+@dataclass(frozen=True)
 class Annotation:
     kind: str
     arguments: tuple[Any, ...]
@@ -115,5 +131,6 @@ def resource(set: int, binding: int) -> Annotation:
     return _annotation("resource", set, binding)
 
 
-def instance(location: int, divisor: int = 1) -> Annotation:
-    return _annotation("instance", location, divisor)
+def instance(location: int | None = None, divisor: int = 1) -> Annotation:
+    return _annotation("instance",
+                       *((location, divisor) if location is not None else ()))

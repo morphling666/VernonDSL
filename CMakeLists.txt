@@ -8,6 +8,10 @@ include(CTest)
 
 option(VERNON_ENABLE_SPIRV_CROSS
   "Build OpenGL, OpenGL ES, Metal, and HLSL source backends" ON)
+option(VERNON_ENABLE_RUNTIME "Build the Vernon kernel runtime" ON)
+option(VERNON_ENABLE_CUDA_RUNTIME
+  "Enable dynamically loaded CUDA Driver runtime backend" ON)
+option(VERNON_ENABLE_PYTHON_BINDINGS "Build the nanobind Python module" ON)
 if(VERNON_ENABLE_SPIRV_CROSS)
   include(FetchContent)
   set(SPIRV_CROSS_CLI OFF CACHE BOOL "" FORCE)

@@ -1,6 +1,7 @@
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 
+#include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
@@ -50,6 +51,7 @@ int main(int argc, char **argv) {
 
   // Target dialect
   registry.insert<spirv::SPIRVDialect>();
+  func::registerInlinerExtension(registry);
 
   // mlir::registerAllPasses();
   registerTransformsPasses();
