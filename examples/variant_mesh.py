@@ -21,5 +21,7 @@ def mesh_vertex(
 
 
 @fragment
-def mesh_fragment() -> Annotated[vec4[f32], location(0)]:
-    return vec4(1.0, 1.0, 1.0, 1.0)
+def mesh_fragment(
+    tint: Annotated[vec4[f32], uniform()],
+) -> Annotated[vec4[f32], location(0)]:
+    return tint

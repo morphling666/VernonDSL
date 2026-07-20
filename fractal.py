@@ -47,7 +47,9 @@ def main() -> None:
     parser.add_argument("--arch",
                         choices=("cpu", "cuda", "vulkan", "opengl",
                                  "opengles"),
-                        default="cuda")
+                        default="cuda",
+                        help=("execution backend; OpenGL profiles require a "
+                              "host to register an external context first"))
     parser.add_argument("--time", type=float, default=0.0)
     parser.add_argument("--emit-metal", type=Path)
     arguments = parser.parse_args()

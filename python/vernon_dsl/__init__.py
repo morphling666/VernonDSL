@@ -11,6 +11,7 @@ from .decorators import compute, fragment, func, kernel, struct, vertex
 from .diagnostics import CompileError
 from .intrinsics import abs, clamp, cos, cross, dot, exp, log, matmul, max, min, norm, normalize, pow, reflect, sin, sqrt, texture_sample
 from .runtime import (
+    CpuAotRuntime,
     Kernel,
     Pipeline,
     PrimitiveTopology,
@@ -26,6 +27,7 @@ from .runtime import (
     opengles,
     pipeline,
     points,
+    register_external_opengl_context,
     triangles,
     vulkan,
 )

@@ -52,8 +52,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run indexed, instanced, variant MRT rendering.")
     parser.add_argument("--arch",
-                        choices=("opengl", "opengles"),
-                        default="opengl")
+                        choices=("opengl", "opengles", "vulkan"),
+                        default="vulkan",
+                        help=("graphics backend; OpenGL profiles require host "
+                              "context registration"))
     parser.add_argument("--size", type=int, default=512)
     parser.add_argument("--instances", type=int, default=7)
     parser.add_argument("--frames",
@@ -76,8 +78,12 @@ def main() -> None:
     architecture = {
         "opengl": vd.opengl,
         "opengles": vd.opengles,
+        "vulkan": vd.vulkan,
     }[args.arch]
-    vd.init(arch=architecture, api_version=(3, 3))
+    vd.init(
+        arch=architecture,
+        api_version=(3, 3) if args.arch in {"opengl", "opengles"} else None,
+    )
     render = vd.pipeline(
         vertex_main,
         fragment_main,
@@ -119,8 +125,13 @@ def main() -> None:
                     "color": color,
                 },
             )
-            color_rgba = np.ascontiguousarray(np.flipud(color.to_numpy()))
-            id_rgba = np.ascontiguousarray(np.flipud(object_id.to_numpy()))
+            color_rgba = color.to_numpy()
+            id_rgba = object_id.to_numpy()
+            if args.arch in {"opengl", "opengles"}:
+                color_rgba = np.flipud(color_rgba)
+                id_rgba = np.flipud(id_rgba)
+            color_rgba = np.ascontiguousarray(color_rgba)
+            id_rgba = np.ascontiguousarray(id_rgba)
             color_image = cv2.cvtColor(color_rgba, cv2.COLOR_RGBA2BGRA)
             id_image = cv2.cvtColor(id_rgba, cv2.COLOR_RGBA2BGRA)
             frame += 1

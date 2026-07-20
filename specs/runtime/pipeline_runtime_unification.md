@@ -37,7 +37,8 @@ callers should not implement separate binding planners.
 
 ## Current architecture
 
-The current pipeline is split across two runtime implementations:
+Native execution is unified in `source/lib/VernonRuntime.cpp` and the
+`Vernon::Runtime` target:
 
 ```text
 Python DSL + manifests
@@ -52,20 +53,20 @@ Vernon compiler
         v
 shader.json + stages/*
         |
-        +-- Python Pipeline: parses reflection, plans bindings, calls VernonRuntime
+        +-- Python/Vernon/C callers load VernonPipelineBundle
         |
-        +-- Vernon: parses bundle, extracts GLSL, uses its own Shader binding path
+        +-- VernonRuntime validates reflection and executes the selected backend
 ```
 
-The native runtime already executes the final operations:
+The native runtime executes the maintained operations:
 
 - `vernonRuntimeLaunch` dispatches compute;
-- `vernonRuntimeDraw` binds prepared graphics arguments and submits a draw;
-- `vernonRuntimeComputeToGraphicsBarrier` orders composed stages;
+- `vernonRuntimePipelineInvoke` submits compute/graphics pipeline bundles;
 - `vernonRuntimeLoadComputeBundle` loads cooked compute assets.
 
-However, graphics reflection and invocation planning still live primarily in
-Python. Vernon has a separate OpenGL shader, material, and draw implementation.
+Python exposes the same runtime through the single `_native` module. OpenGL and
+OpenGL ES require a host-owned external context; Vulkan and CUDA resolve their
+system drivers dynamically.
 
 ### Concrete gaps
 
@@ -181,7 +182,8 @@ commands. It makes those differences invisible to callers.
 - Metal compiles/loads MSL libraries and creates compute/render pipeline
   states.
 - CUDA loads PTX modules and resolves kernel functions.
-- CPU loads or JIT-compiles native entry points.
+- CPU loads AOT native-library entry points. Python development execution uses
+  its interpreter separately from the deployable runtime.
 
 ### Resource binding
 
@@ -224,27 +226,25 @@ Examples:
 - CUDA supports compute only. A pipeline containing a draw step is rejected
   unless a future explicit CUDA/graphics external-memory interop path is used.
 
-The bundle therefore retains target-specific artifacts:
+Pipeline bundles are canonical JSON with target-specific stage artifacts:
 
 ```text
-pipeline.bundle/
-  layout.bin
-  variants.bin
-  opengl/*.glsl
-  opengles/*.gles
-  vulkan/*.spv
-  metal/*.metal
-  cuda/*.ptx
-  cpu/*.llvm
+pipeline.bundle
+  target
+  variants[]
+  stage_artifacts{}
+    OpenGL/OpenGL ES: GLSL source
+    Vulkan: base64 SPIR-V plus SHA-256
 ```
 
-Loading selects the artifact family matching `BackendDevice`; invocation code
-remains unchanged.
+CUDA PTX and CPU native-library AOT use compute artifacts/bundles rather than
+graphics pipeline bundles. Loading validates that the artifact family matches
+the selected runtime backend.
 
 ## Pipeline invocation ABI
 
-The invocation ABI must be versioned independently of the existing compute
-launch and graphics draw ABIs.
+The pipeline invocation ABI is versioned independently of the compute launch
+ABI.
 
 ```c
 typedef struct VernonDeviceSampler VernonDeviceSampler;
@@ -571,9 +571,9 @@ Vernon's higher-level render graph.
 This is the main integration blocker.
 
 Vernon owns its production graphics context, graphics thread, texture storage,
-and render graph. The standalone VernonRuntime OpenGL backend can create a
-hidden GLFW context and owns separate buffer/texture handles. Vernon must not
-render through that second context.
+and render graph. `VernonRuntime` consumes that current context through host
+callbacks and imports Vernon buffer/texture handles; it never creates a second
+context.
 
 The shared runtime needs one of these integration models:
 
@@ -626,7 +626,7 @@ This prevents a pipeline asset from becoming an opaque mini render engine.
 
 ## Migration plan
 
-### Phase 1: Native graphics reflection and planner
+### Phase 1: Native graphics reflection and planner — implemented
 
 - define the pipeline-level parameter schema and invocation ABI;
 - implement its parser in VernonRuntime;
@@ -634,7 +634,7 @@ This prevents a pipeline asset from becoming an opaque mini render engine.
   validation, and interface merging out of Python;
 - make Python call the native planner.
 
-### Phase 2: Unified bundle format and loader
+### Phase 2: Unified bundle format and loader — implemented
 
 - converge legacy shader schema version 1 and pipeline schema version 2;
 - add `vernonRuntimeLoadPipelineBundle`;
@@ -643,17 +643,16 @@ This prevents a pipeline asset from becoming an opaque mini render engine.
 - make JIT compilation construct the same in-memory bundle representation as
   AOT cooking.
 
-### Phase 3: Shared backend targets
+### Phase 3: Shared backend drivers — implemented
 
-- split engine-independent OpenGL/GLES, Vulkan, Metal, CUDA, and CPU execution
-  into independent backend libraries;
-- define `BackendDevice`, backend capability queries, and common resource
-  handles;
-- make standalone VernonRuntime create devices through those implementations;
-- preserve explicit errors for unsupported stage combinations, especially
-  graphics steps on CUDA.
+- keep engine-independent OpenGL/GLES, Vulkan, CUDA, platform loading, and
+  hashing helpers under `source/lib/runtime`;
+- expose backend capability queries and common runtime resource handles;
+- resolve CUDA and Vulkan drivers dynamically and consume host OpenGL/GLES
+  callbacks;
+- preserve explicit errors for unsupported stage combinations.
 
-### Phase 4: Vernon device adapter
+### Phase 4: Vernon device adapter — remaining integration
 
 - let the runtime use Vernon graphics context and resources;
 - make `ShaderProvider` return a loaded pipeline asset rather than only a
@@ -661,7 +660,7 @@ This prevents a pipeline asset from becoming an opaque mini render engine.
 - replace named material bindings with slot-based invocation;
 - integrate loaded variants into production render passes.
 
-### Phase 5: Residency and typed wrappers
+### Phase 5: Residency and typed wrappers — remaining integration
 
 - move optional dirty-generation tracking into the shared native runtime;
 - generate C/C++ argument wrappers from pipeline signatures;
@@ -669,8 +668,7 @@ This prevents a pipeline asset from becoming an opaque mini render engine.
 
 ## Compatibility rules
 
-- compute launch ABI, graphics draw ABI, and pipeline invocation ABI are
-  versioned independently;
+- compute launch ABI and pipeline invocation ABI are versioned independently;
 - all public structs use additive `struct_size` extension;
 - bundle loaders reject unsupported ABI versions before creating GPU objects;
 - exact feature variant matching remains deterministic;
@@ -739,24 +737,10 @@ artifact remains backend-specific. Cross-platform means the source signature,
 asset identity, and invocation ABI remain stable while the loader selects the
 artifact matching the current `BackendDevice`.
 
-## Recommended next implementation step
+## Implementation status
 
-Implement a native, read-only `VernonPipelineLayout` first:
-
-```c
-VernonPipelineLayout *vernonPipelineLayoutParse(
-    const char *reflection,
-    size_t reflection_size);
-
-VernonStatus vernonPipelinePlanInvocation(
-    const VernonPipelineLayout *layout,
-    const VernonPipelineArgument *arguments,
-    size_t argument_count,
-    VernonPlannedInvocation *result);
-```
-
-Use it from Python while keeping the current `vernonRuntimeDraw` executor.
-This moves the most duplicated and error-prone logic behind the C ABI without
-immediately changing context ownership or Vernon rendering. Once this planner
-is stable, bundle loading and external-device integration can build on the
-same layout representation.
+The public runtime now loads versioned pipeline bundles, resolves feature
+variants, validates reflected argument slots, and executes
+`VernonPipelineInvocation` directly. Python uses this path through `_native`;
+Vernon can consume the same `Vernon::Runtime` target and external-context
+resource imports. Legacy standalone program/draw entry points are removed.

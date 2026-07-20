@@ -24,6 +24,7 @@
   "targets": {
     "opengl": {
       "glsl_version": 330
-    }
+    },
+    "vulkan": {}
   }
 }

@@ -53,7 +53,7 @@ int main() {
     "gpu_launch_abi_version": 1,
     "entries": [{
       "name": "scale",
-      "workgroup_size": [8, 1, 1],
+      "workgroup_size": [4, 1, 1],
       "cpu_arguments_size": 12,
       "arguments": [
         {

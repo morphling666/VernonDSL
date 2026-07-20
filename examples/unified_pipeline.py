@@ -49,10 +49,10 @@ def parse_args() -> argparse.Namespace:
         description="Run a VernonDSL compute -> graphics pipeline.")
     parser.add_argument(
         "--arch",
-        choices=("opengl", "opengles"),
-        default="opengl",
-        help=("graphics backend; opengles currently uses the desktop OpenGL "
-              "compatibility path"),
+        choices=("opengl", "opengles", "vulkan"),
+        default="vulkan",
+        help=("graphics backend; OpenGL profiles require host context "
+              "registration"),
     )
     parser.add_argument("--size", type=int, default=256)
     parser.add_argument(
@@ -62,6 +62,7 @@ def parse_args() -> argparse.Namespace:
         help="number of frames; zero runs until Escape or Q",
     )
     parser.add_argument("--fps", type=int, default=60)
+    parser.add_argument("--headless", action="store_true")
     parser.add_argument("--output",
                         type=Path,
                         help="optional screenshot path, for example frame.png")
@@ -76,8 +77,12 @@ def main() -> None:
     architecture = {
         "opengl": vd.opengl,
         "opengles": vd.opengles,
+        "vulkan": vd.vulkan,
     }[args.arch]
-    vd.init(arch=architecture, api_version=(4, 3))
+    vd.init(
+        arch=architecture,
+        api_version=(4, 3) if args.arch in {"opengl", "opengles"} else None,
+    )
 
     base_array = np.array(
         (
@@ -128,16 +133,20 @@ def main() -> None:
                 color=color,
                 target=target,
             )
-            # OpenGL textures are bottom-up and OpenCV displays BGR images.
-            rgba = np.ascontiguousarray(np.flipud(target.to_numpy()))
+            rgba = target.to_numpy()
+            if args.arch in {"opengl", "opengles"}:
+                rgba = np.flipud(rgba)
+            rgba = np.ascontiguousarray(rgba)
             image = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR)
-            cv2.imshow(window_name, image)
+            if not args.headless:
+                cv2.imshow(window_name, image)
             frame += 1
-            key = cv2.waitKey(delay_ms) & 0xFF
+            key = cv2.waitKey(delay_ms) & 0xFF if not args.headless else -1
             if key in (27, ord("q")):
                 break
     finally:
-        cv2.destroyAllWindows()
+        if not args.headless:
+            cv2.destroyAllWindows()
 
     if args.output is not None and image is not None:
         if not cv2.imwrite(str(args.output), image):

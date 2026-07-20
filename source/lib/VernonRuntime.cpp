@@ -1,684 +1,124 @@
 #include "VernonRuntime.h"
+#include "runtime/backend_cuda_driver.h"
+#include "runtime/backend_opengl_driver.h"
+#include "runtime/content_hash.h"
+#include "runtime/platform_library.h"
 
-#include "llvm/ADT/StringExtras.h"
-#include "llvm/AsmParser/Parser.h"
-#include "llvm/ExecutionEngine/Orc/LLJIT.h"
-#include "llvm/IR/LLVMContext.h"
-#include "llvm/Support/DynamicLibrary.h"
-#include "llvm/Support/JSON.h"
-#include "llvm/Support/SHA256.h"
-#include "llvm/Support/SourceMgr.h"
-#include "llvm/Support/TargetSelect.h"
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+#include "runtime/backend_vulkan_driver.h"
+#endif
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
-
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-#include <vulkan/vulkan.h>
-#endif
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-#include <GLFW/glfw3.h>
-#endif
 
 namespace {
 
-#if defined(VERNON_HAS_CUDA_RUNTIME)
-using CudaDevice = int;
-using CudaDevicePointer = unsigned long long;
-using CudaContext = struct CudaContextOpaque *;
-using CudaModule = struct CudaModuleOpaque *;
-using CudaFunction = struct CudaFunctionOpaque *;
-using CudaStream = struct CudaStreamOpaque *;
-using CudaResult = int;
+using namespace vernon::runtime;
 
-constexpr CudaResult kCudaSuccess = 0;
-
-struct CudaDriver {
-  using Init = CudaResult (*)(unsigned);
-  using DeviceGet = CudaResult (*)(CudaDevice *, int);
-  using PrimaryContextRetain = CudaResult (*)(CudaContext *, CudaDevice);
-  using PrimaryContextRelease = CudaResult (*)(CudaDevice);
-  using ContextSetCurrent = CudaResult (*)(CudaContext);
-  using ContextSynchronize = CudaResult (*)();
-  using ErrorName = CudaResult (*)(CudaResult, const char **);
-  using ErrorString = CudaResult (*)(CudaResult, const char **);
-  using MemoryAllocate = CudaResult (*)(CudaDevicePointer *, size_t);
-  using MemoryFree = CudaResult (*)(CudaDevicePointer);
-  using CopyHostToDevice = CudaResult (*)(CudaDevicePointer, const void *,
-                                          size_t);
-  using CopyDeviceToHost = CudaResult (*)(void *, CudaDevicePointer, size_t);
-  using ModuleLoadData = CudaResult (*)(CudaModule *, const void *, unsigned,
-                                        int *, void **);
-  using ModuleGetFunction = CudaResult (*)(CudaFunction *, CudaModule,
-                                           const char *);
-  using ModuleUnload = CudaResult (*)(CudaModule);
-  using LaunchKernel = CudaResult (*)(CudaFunction, unsigned, unsigned,
-                                      unsigned, unsigned, unsigned, unsigned,
-                                      unsigned, CudaStream, void **, void **);
-
-  bool load() {
-    std::lock_guard<std::mutex> guard(mutex);
-    if (attempted)
-      return available;
-    attempted = true;
-#if defined(_WIN32)
-    constexpr const char *libraryName = "nvcuda.dll";
-#else
-    constexpr const char *libraryName = "libcuda.so.1";
-#endif
-    library =
-        llvm::sys::DynamicLibrary::getPermanentLibrary(libraryName, &error);
-    if (!library.isValid())
-      return false;
-
-#define VERNON_LOAD_CUDA(member, symbol)                                       \
-  member =                                                                     \
-      reinterpret_cast<decltype(member)>(library.getAddressOfSymbol(symbol));  \
-  if (!member) {                                                               \
-    error = std::string("CUDA Driver is missing symbol ") + symbol;            \
-    return false;                                                              \
-  }
-    VERNON_LOAD_CUDA(init, "cuInit");
-    VERNON_LOAD_CUDA(deviceGet, "cuDeviceGet");
-    VERNON_LOAD_CUDA(primaryContextRetain, "cuDevicePrimaryCtxRetain");
-    VERNON_LOAD_CUDA(primaryContextRelease, "cuDevicePrimaryCtxRelease");
-    VERNON_LOAD_CUDA(contextSetCurrent, "cuCtxSetCurrent");
-    VERNON_LOAD_CUDA(contextSynchronize, "cuCtxSynchronize");
-    VERNON_LOAD_CUDA(errorName, "cuGetErrorName");
-    VERNON_LOAD_CUDA(errorString, "cuGetErrorString");
-    memoryAllocate = reinterpret_cast<MemoryAllocate>(
-        library.getAddressOfSymbol("cuMemAlloc_v2"));
-    if (!memoryAllocate)
-      memoryAllocate = reinterpret_cast<MemoryAllocate>(
-          library.getAddressOfSymbol("cuMemAlloc"));
-    if (!memoryAllocate) {
-      error = "CUDA Driver is missing symbol cuMemAlloc_v2";
-      return false;
-    }
-    memoryFree = reinterpret_cast<MemoryFree>(
-        library.getAddressOfSymbol("cuMemFree_v2"));
-    if (!memoryFree)
-      memoryFree =
-          reinterpret_cast<MemoryFree>(library.getAddressOfSymbol("cuMemFree"));
-    if (!memoryFree) {
-      error = "CUDA Driver is missing symbol cuMemFree_v2";
-      return false;
-    }
-    copyHostToDevice = reinterpret_cast<CopyHostToDevice>(
-        library.getAddressOfSymbol("cuMemcpyHtoD_v2"));
-    if (!copyHostToDevice)
-      copyHostToDevice = reinterpret_cast<CopyHostToDevice>(
-          library.getAddressOfSymbol("cuMemcpyHtoD"));
-    if (!copyHostToDevice) {
-      error = "CUDA Driver is missing symbol cuMemcpyHtoD_v2";
-      return false;
-    }
-    copyDeviceToHost = reinterpret_cast<CopyDeviceToHost>(
-        library.getAddressOfSymbol("cuMemcpyDtoH_v2"));
-    if (!copyDeviceToHost)
-      copyDeviceToHost = reinterpret_cast<CopyDeviceToHost>(
-          library.getAddressOfSymbol("cuMemcpyDtoH"));
-    if (!copyDeviceToHost) {
-      error = "CUDA Driver is missing symbol cuMemcpyDtoH_v2";
-      return false;
-    }
-    VERNON_LOAD_CUDA(moduleLoadData, "cuModuleLoadDataEx");
-    VERNON_LOAD_CUDA(moduleGetFunction, "cuModuleGetFunction");
-    VERNON_LOAD_CUDA(moduleUnload, "cuModuleUnload");
-    VERNON_LOAD_CUDA(launchKernel, "cuLaunchKernel");
-#undef VERNON_LOAD_CUDA
-    available = true;
-    return true;
-  }
-
-  llvm::sys::DynamicLibrary library;
-  std::mutex mutex;
-  std::string error;
-  bool attempted{false};
-  bool available{false};
-  Init init{};
-  DeviceGet deviceGet{};
-  PrimaryContextRetain primaryContextRetain{};
-  PrimaryContextRelease primaryContextRelease{};
-  ContextSetCurrent contextSetCurrent{};
-  ContextSynchronize contextSynchronize{};
-  ErrorName errorName{};
-  ErrorString errorString{};
-  MemoryAllocate memoryAllocate{};
-  MemoryFree memoryFree{};
-  CopyHostToDevice copyHostToDevice{};
-  CopyDeviceToHost copyDeviceToHost{};
-  ModuleLoadData moduleLoadData{};
-  ModuleGetFunction moduleGetFunction{};
-  ModuleUnload moduleUnload{};
-  LaunchKernel launchKernel{};
+struct ParameterUse {
+  std::string stage;
+  std::string interfaceKind;
+  std::string uniformName;
+  std::string dtype;
+  std::vector<uint64_t> shape;
+  uint32_t index{};
+  uint32_t location{UINT32_MAX};
+  uint32_t divisor{};
+  uint32_t binding{UINT32_MAX};
 };
 
-CudaDriver &cudaDriver() {
-  static CudaDriver driver;
-  return driver;
-}
-#endif
-
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-struct VulkanDriver {
-  bool load() {
-    std::lock_guard<std::mutex> guard(mutex);
-    if (attempted)
-      return available;
-    attempted = true;
-#if defined(_WIN32)
-    constexpr const char *libraryName = "vulkan-1.dll";
-#elif defined(__APPLE__)
-    constexpr const char *libraryName = "libvulkan.1.dylib";
-#else
-    constexpr const char *libraryName = "libvulkan.so.1";
-#endif
-    library =
-        llvm::sys::DynamicLibrary::getPermanentLibrary(libraryName, &error);
-    if (!library.isValid())
-      return false;
-    getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
-        library.getAddressOfSymbol("vkGetInstanceProcAddr"));
-    if (!getInstanceProcAddr) {
-      error = "Vulkan loader is missing vkGetInstanceProcAddr";
-      return false;
-    }
-    createInstance = reinterpret_cast<PFN_vkCreateInstance>(
-        getInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance"));
-    if (!createInstance) {
-      error = "Vulkan loader is missing vkCreateInstance";
-      return false;
-    }
-    available = true;
-    return true;
-  }
-
-  bool loadInstance(VkInstance instance) {
-#define VERNON_LOAD_VULKAN_INSTANCE(member, symbol)                            \
-  member = reinterpret_cast<decltype(member)>(                                 \
-      getInstanceProcAddr(instance, symbol));                                  \
-  if (!member) {                                                               \
-    error = std::string("Vulkan loader is missing ") + symbol;                 \
-    return false;                                                              \
-  }
-    VERNON_LOAD_VULKAN_INSTANCE(destroyInstance, "vkDestroyInstance");
-    VERNON_LOAD_VULKAN_INSTANCE(enumeratePhysicalDevices,
-                                "vkEnumeratePhysicalDevices");
-    VERNON_LOAD_VULKAN_INSTANCE(getPhysicalDeviceQueueFamilyProperties,
-                                "vkGetPhysicalDeviceQueueFamilyProperties");
-    VERNON_LOAD_VULKAN_INSTANCE(getPhysicalDeviceMemoryProperties,
-                                "vkGetPhysicalDeviceMemoryProperties");
-    VERNON_LOAD_VULKAN_INSTANCE(createDevice, "vkCreateDevice");
-    VERNON_LOAD_VULKAN_INSTANCE(getDeviceProcAddr, "vkGetDeviceProcAddr");
-#undef VERNON_LOAD_VULKAN_INSTANCE
-    return true;
-  }
-
-  bool loadDevice(VkDevice device) {
-#define VERNON_LOAD_VULKAN_DEVICE(member, symbol)                              \
-  member =                                                                     \
-      reinterpret_cast<decltype(member)>(getDeviceProcAddr(device, symbol));   \
-  if (!member) {                                                               \
-    error = std::string("Vulkan device is missing ") + symbol;                 \
-    return false;                                                              \
-  }
-    VERNON_LOAD_VULKAN_DEVICE(destroyDevice, "vkDestroyDevice");
-    VERNON_LOAD_VULKAN_DEVICE(deviceWaitIdle, "vkDeviceWaitIdle");
-    VERNON_LOAD_VULKAN_DEVICE(getDeviceQueue, "vkGetDeviceQueue");
-    VERNON_LOAD_VULKAN_DEVICE(createCommandPool, "vkCreateCommandPool");
-    VERNON_LOAD_VULKAN_DEVICE(destroyCommandPool, "vkDestroyCommandPool");
-    VERNON_LOAD_VULKAN_DEVICE(allocateCommandBuffers,
-                              "vkAllocateCommandBuffers");
-    VERNON_LOAD_VULKAN_DEVICE(freeCommandBuffers, "vkFreeCommandBuffers");
-    VERNON_LOAD_VULKAN_DEVICE(beginCommandBuffer, "vkBeginCommandBuffer");
-    VERNON_LOAD_VULKAN_DEVICE(endCommandBuffer, "vkEndCommandBuffer");
-    VERNON_LOAD_VULKAN_DEVICE(queueSubmit, "vkQueueSubmit");
-    VERNON_LOAD_VULKAN_DEVICE(queueWaitIdle, "vkQueueWaitIdle");
-    VERNON_LOAD_VULKAN_DEVICE(createBuffer, "vkCreateBuffer");
-    VERNON_LOAD_VULKAN_DEVICE(destroyBuffer, "vkDestroyBuffer");
-    VERNON_LOAD_VULKAN_DEVICE(getBufferMemoryRequirements,
-                              "vkGetBufferMemoryRequirements");
-    VERNON_LOAD_VULKAN_DEVICE(allocateMemory, "vkAllocateMemory");
-    VERNON_LOAD_VULKAN_DEVICE(freeMemory, "vkFreeMemory");
-    VERNON_LOAD_VULKAN_DEVICE(bindBufferMemory, "vkBindBufferMemory");
-    VERNON_LOAD_VULKAN_DEVICE(mapMemory, "vkMapMemory");
-    VERNON_LOAD_VULKAN_DEVICE(unmapMemory, "vkUnmapMemory");
-    VERNON_LOAD_VULKAN_DEVICE(createShaderModule, "vkCreateShaderModule");
-    VERNON_LOAD_VULKAN_DEVICE(destroyShaderModule, "vkDestroyShaderModule");
-    VERNON_LOAD_VULKAN_DEVICE(createDescriptorSetLayout,
-                              "vkCreateDescriptorSetLayout");
-    VERNON_LOAD_VULKAN_DEVICE(destroyDescriptorSetLayout,
-                              "vkDestroyDescriptorSetLayout");
-    VERNON_LOAD_VULKAN_DEVICE(createPipelineLayout, "vkCreatePipelineLayout");
-    VERNON_LOAD_VULKAN_DEVICE(destroyPipelineLayout, "vkDestroyPipelineLayout");
-    VERNON_LOAD_VULKAN_DEVICE(createComputePipelines,
-                              "vkCreateComputePipelines");
-    VERNON_LOAD_VULKAN_DEVICE(destroyPipeline, "vkDestroyPipeline");
-    VERNON_LOAD_VULKAN_DEVICE(createDescriptorPool, "vkCreateDescriptorPool");
-    VERNON_LOAD_VULKAN_DEVICE(destroyDescriptorPool, "vkDestroyDescriptorPool");
-    VERNON_LOAD_VULKAN_DEVICE(allocateDescriptorSets,
-                              "vkAllocateDescriptorSets");
-    VERNON_LOAD_VULKAN_DEVICE(updateDescriptorSets, "vkUpdateDescriptorSets");
-    VERNON_LOAD_VULKAN_DEVICE(cmdBindPipeline, "vkCmdBindPipeline");
-    VERNON_LOAD_VULKAN_DEVICE(cmdBindDescriptorSets, "vkCmdBindDescriptorSets");
-    VERNON_LOAD_VULKAN_DEVICE(cmdDispatch, "vkCmdDispatch");
-#undef VERNON_LOAD_VULKAN_DEVICE
-    return true;
-  }
-
-  llvm::sys::DynamicLibrary library;
-  std::mutex mutex;
-  std::string error;
-  bool attempted{false};
-  bool available{false};
-  PFN_vkGetInstanceProcAddr getInstanceProcAddr{};
-  PFN_vkCreateInstance createInstance{};
-  PFN_vkDestroyInstance destroyInstance{};
-  PFN_vkEnumeratePhysicalDevices enumeratePhysicalDevices{};
-  PFN_vkGetPhysicalDeviceQueueFamilyProperties
-      getPhysicalDeviceQueueFamilyProperties{};
-  PFN_vkGetPhysicalDeviceMemoryProperties getPhysicalDeviceMemoryProperties{};
-  PFN_vkCreateDevice createDevice{};
-  PFN_vkGetDeviceProcAddr getDeviceProcAddr{};
-  PFN_vkDestroyDevice destroyDevice{};
-  PFN_vkDeviceWaitIdle deviceWaitIdle{};
-  PFN_vkGetDeviceQueue getDeviceQueue{};
-  PFN_vkCreateCommandPool createCommandPool{};
-  PFN_vkDestroyCommandPool destroyCommandPool{};
-  PFN_vkAllocateCommandBuffers allocateCommandBuffers{};
-  PFN_vkFreeCommandBuffers freeCommandBuffers{};
-  PFN_vkBeginCommandBuffer beginCommandBuffer{};
-  PFN_vkEndCommandBuffer endCommandBuffer{};
-  PFN_vkQueueSubmit queueSubmit{};
-  PFN_vkQueueWaitIdle queueWaitIdle{};
-  PFN_vkCreateBuffer createBuffer{};
-  PFN_vkDestroyBuffer destroyBuffer{};
-  PFN_vkGetBufferMemoryRequirements getBufferMemoryRequirements{};
-  PFN_vkAllocateMemory allocateMemory{};
-  PFN_vkFreeMemory freeMemory{};
-  PFN_vkBindBufferMemory bindBufferMemory{};
-  PFN_vkMapMemory mapMemory{};
-  PFN_vkUnmapMemory unmapMemory{};
-  PFN_vkCreateShaderModule createShaderModule{};
-  PFN_vkDestroyShaderModule destroyShaderModule{};
-  PFN_vkCreateDescriptorSetLayout createDescriptorSetLayout{};
-  PFN_vkDestroyDescriptorSetLayout destroyDescriptorSetLayout{};
-  PFN_vkCreatePipelineLayout createPipelineLayout{};
-  PFN_vkDestroyPipelineLayout destroyPipelineLayout{};
-  PFN_vkCreateComputePipelines createComputePipelines{};
-  PFN_vkDestroyPipeline destroyPipeline{};
-  PFN_vkCreateDescriptorPool createDescriptorPool{};
-  PFN_vkDestroyDescriptorPool destroyDescriptorPool{};
-  PFN_vkAllocateDescriptorSets allocateDescriptorSets{};
-  PFN_vkUpdateDescriptorSets updateDescriptorSets{};
-  PFN_vkCmdBindPipeline cmdBindPipeline{};
-  PFN_vkCmdBindDescriptorSets cmdBindDescriptorSets{};
-  PFN_vkCmdDispatch cmdDispatch{};
+struct Parameter {
+  uint32_t slot{};
+  std::string name;
+  std::string kind;
+  std::string access;
+  std::vector<ParameterUse> uses;
 };
 
-VulkanDriver &vulkanDriver() {
-  static VulkanDriver driver;
-  return driver;
-}
-#endif
-
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-#if defined(_WIN32)
-#define VERNON_GL_APIENTRY __stdcall
-#else
-#define VERNON_GL_APIENTRY
-#endif
-using GlEnum = unsigned int;
-using GlUint = unsigned int;
-using GlInt = int;
-using GlSize = int;
-using GlBoolean = unsigned char;
-using GlBitfield = unsigned int;
-using GlSizePtr = intptr_t;
-using GlChar = char;
-
-constexpr GlEnum kGlComputeShader = 0x91B9;
-constexpr GlEnum kGlVertexShader = 0x8B31;
-constexpr GlEnum kGlFragmentShader = 0x8B30;
-constexpr GlEnum kGlCompileStatus = 0x8B81;
-constexpr GlEnum kGlLinkStatus = 0x8B82;
-constexpr GlEnum kGlInfoLogLength = 0x8B84;
-constexpr GlEnum kGlShaderStorageBuffer = 0x90D2;
-constexpr GlEnum kGlArrayBuffer = 0x8892;
-constexpr GlEnum kGlElementArrayBuffer = 0x8893;
-constexpr GlEnum kGlDynamicCopy = 0x88EA;
-constexpr GlEnum kGlFloat = 0x1406;
-constexpr GlEnum kGlUnsignedByte = 0x1401;
-constexpr GlEnum kGlUnsignedInt = 0x1405;
-constexpr GlEnum kGlMapReadBit = 0x0001;
-constexpr GlEnum kGlMapWriteBit = 0x0002;
-constexpr GlEnum kGlTexture2D = 0x0DE1;
-constexpr GlEnum kGlRgba = 0x1908;
-constexpr GlEnum kGlRgba8 = 0x8058;
-constexpr GlEnum kGlTextureMinFilter = 0x2801;
-constexpr GlEnum kGlTextureMagFilter = 0x2800;
-constexpr GlEnum kGlNearest = 0x2600;
-constexpr GlEnum kGlFramebuffer = 0x8D40;
-constexpr GlEnum kGlColorAttachment0 = 0x8CE0;
-constexpr GlEnum kGlFramebufferComplete = 0x8CD5;
-constexpr GlEnum kGlTriangles = 0x0004;
-constexpr GlEnum kGlLines = 0x0001;
-constexpr GlEnum kGlPoints = 0x0000;
-constexpr GlEnum kGlNone = 0;
-constexpr GlBitfield kGlColorBufferBit = 0x00004000;
-constexpr GlBitfield kGlVertexAttribArrayBarrierBit = 0x00000001;
-constexpr GlBitfield kGlShaderStorageBarrierBit = 0x00002000;
-
-struct OpenGLDriver {
-  bool initialize(std::string &error) {
-    std::lock_guard<std::mutex> guard(mutex);
-    if (!initialized && !glfwInit()) {
-      error = "GLFW could not initialize a window-system backend";
-      return false;
-    }
-    initialized = true;
-    ++contexts;
-    return true;
-  }
-
-  void release() {
-    std::lock_guard<std::mutex> guard(mutex);
-    if (contexts)
-      --contexts;
-    if (!contexts && initialized) {
-      glfwTerminate();
-      initialized = false;
-      loaded = false;
-    }
-  }
-
-  bool load(std::string &error) {
-    if (loaded)
-      return true;
-#define VERNON_LOAD_GL(member, symbol)                                         \
-  member = reinterpret_cast<decltype(member)>(glfwGetProcAddress(symbol));     \
-  if (!member) {                                                               \
-    error = std::string("OpenGL context is missing ") + symbol;                \
-    return false;                                                              \
-  }
-    VERNON_LOAD_GL(createShader, "glCreateShader");
-    VERNON_LOAD_GL(shaderSource, "glShaderSource");
-    VERNON_LOAD_GL(compileShader, "glCompileShader");
-    VERNON_LOAD_GL(getShaderiv, "glGetShaderiv");
-    VERNON_LOAD_GL(getShaderInfoLog, "glGetShaderInfoLog");
-    VERNON_LOAD_GL(deleteShader, "glDeleteShader");
-    VERNON_LOAD_GL(createProgram, "glCreateProgram");
-    VERNON_LOAD_GL(attachShader, "glAttachShader");
-    VERNON_LOAD_GL(linkProgram, "glLinkProgram");
-    VERNON_LOAD_GL(getProgramiv, "glGetProgramiv");
-    VERNON_LOAD_GL(getProgramInfoLog, "glGetProgramInfoLog");
-    VERNON_LOAD_GL(deleteProgram, "glDeleteProgram");
-    VERNON_LOAD_GL(useProgram, "glUseProgram");
-    VERNON_LOAD_GL(genBuffers, "glGenBuffers");
-    VERNON_LOAD_GL(deleteBuffers, "glDeleteBuffers");
-    VERNON_LOAD_GL(bindBuffer, "glBindBuffer");
-    VERNON_LOAD_GL(bufferData, "glBufferData");
-    VERNON_LOAD_GL(bufferSubData, "glBufferSubData");
-    VERNON_LOAD_GL(mapBufferRange, "glMapBufferRange");
-    VERNON_LOAD_GL(unmapBuffer, "glUnmapBuffer");
-    VERNON_LOAD_GL(bindBufferBase, "glBindBufferBase");
-    VERNON_LOAD_GL(genVertexArrays, "glGenVertexArrays");
-    VERNON_LOAD_GL(deleteVertexArrays, "glDeleteVertexArrays");
-    VERNON_LOAD_GL(bindVertexArray, "glBindVertexArray");
-    VERNON_LOAD_GL(enableVertexAttribArray, "glEnableVertexAttribArray");
-    VERNON_LOAD_GL(vertexAttribPointer, "glVertexAttribPointer");
-    VERNON_LOAD_GL(vertexAttribDivisor, "glVertexAttribDivisor");
-    VERNON_LOAD_GL(genTextures, "glGenTextures");
-    VERNON_LOAD_GL(deleteTextures, "glDeleteTextures");
-    VERNON_LOAD_GL(bindTexture, "glBindTexture");
-    VERNON_LOAD_GL(texParameteri, "glTexParameteri");
-    VERNON_LOAD_GL(texImage2D, "glTexImage2D");
-    VERNON_LOAD_GL(texSubImage2D, "glTexSubImage2D");
-    VERNON_LOAD_GL(getTexImage, "glGetTexImage");
-    VERNON_LOAD_GL(genFramebuffers, "glGenFramebuffers");
-    VERNON_LOAD_GL(deleteFramebuffers, "glDeleteFramebuffers");
-    VERNON_LOAD_GL(bindFramebuffer, "glBindFramebuffer");
-    VERNON_LOAD_GL(framebufferTexture2D, "glFramebufferTexture2D");
-    VERNON_LOAD_GL(checkFramebufferStatus, "glCheckFramebufferStatus");
-    VERNON_LOAD_GL(viewport, "glViewport");
-    VERNON_LOAD_GL(clearColor, "glClearColor");
-    VERNON_LOAD_GL(clear, "glClear");
-    VERNON_LOAD_GL(drawArrays, "glDrawArrays");
-    VERNON_LOAD_GL(drawArraysInstanced, "glDrawArraysInstanced");
-    VERNON_LOAD_GL(drawElementsInstanced, "glDrawElementsInstanced");
-    VERNON_LOAD_GL(drawBuffers, "glDrawBuffers");
-    VERNON_LOAD_GL(getUniformLocation, "glGetUniformLocation");
-    VERNON_LOAD_GL(uniform1fv, "glUniform1fv");
-    VERNON_LOAD_GL(uniform2fv, "glUniform2fv");
-    VERNON_LOAD_GL(uniform3fv, "glUniform3fv");
-    VERNON_LOAD_GL(uniform4fv, "glUniform4fv");
-    VERNON_LOAD_GL(uniformMatrix2fv, "glUniformMatrix2fv");
-    VERNON_LOAD_GL(uniformMatrix3fv, "glUniformMatrix3fv");
-    VERNON_LOAD_GL(uniformMatrix4fv, "glUniformMatrix4fv");
-    VERNON_LOAD_GL(finish, "glFinish");
-#undef VERNON_LOAD_GL
-    dispatchCompute = reinterpret_cast<decltype(dispatchCompute)>(
-        glfwGetProcAddress("glDispatchCompute"));
-    memoryBarrier = reinterpret_cast<decltype(memoryBarrier)>(
-        glfwGetProcAddress("glMemoryBarrier"));
-    loaded = true;
-    return true;
-  }
-
-  std::mutex mutex;
-  bool initialized{false};
-  bool loaded{false};
-  size_t contexts{0};
-  GlUint(VERNON_GL_APIENTRY *createShader)(GlEnum) {};
-  void(VERNON_GL_APIENTRY *shaderSource)(GlUint, GlSize, const GlChar *const *,
-                                         const GlInt *){};
-  void(VERNON_GL_APIENTRY *compileShader)(GlUint){};
-  void(VERNON_GL_APIENTRY *getShaderiv)(GlUint, GlEnum, GlInt *){};
-  void(VERNON_GL_APIENTRY *getShaderInfoLog)(GlUint, GlSize, GlSize *,
-                                             GlChar *){};
-  void(VERNON_GL_APIENTRY *deleteShader)(GlUint){};
-  GlUint(VERNON_GL_APIENTRY *createProgram)() {};
-  void(VERNON_GL_APIENTRY *attachShader)(GlUint, GlUint){};
-  void(VERNON_GL_APIENTRY *linkProgram)(GlUint){};
-  void(VERNON_GL_APIENTRY *getProgramiv)(GlUint, GlEnum, GlInt *){};
-  void(VERNON_GL_APIENTRY *getProgramInfoLog)(GlUint, GlSize, GlSize *,
-                                              GlChar *){};
-  void(VERNON_GL_APIENTRY *deleteProgram)(GlUint){};
-  void(VERNON_GL_APIENTRY *useProgram)(GlUint){};
-  void(VERNON_GL_APIENTRY *genBuffers)(GlSize, GlUint *){};
-  void(VERNON_GL_APIENTRY *deleteBuffers)(GlSize, const GlUint *){};
-  void(VERNON_GL_APIENTRY *bindBuffer)(GlEnum, GlUint){};
-  void(VERNON_GL_APIENTRY *bufferData)(GlEnum, GlSizePtr, const void *,
-                                       GlEnum){};
-  void(VERNON_GL_APIENTRY *bufferSubData)(GlEnum, GlSizePtr, GlSizePtr,
-                                          const void *){};
-  void *(VERNON_GL_APIENTRY *mapBufferRange)(GlEnum, GlSizePtr, GlSizePtr,
-                                             GlBitfield){};
-  GlBoolean(VERNON_GL_APIENTRY *unmapBuffer)(GlEnum) {};
-  void(VERNON_GL_APIENTRY *bindBufferBase)(GlEnum, GlUint, GlUint){};
-  void(VERNON_GL_APIENTRY *genVertexArrays)(GlSize, GlUint *){};
-  void(VERNON_GL_APIENTRY *deleteVertexArrays)(GlSize, const GlUint *){};
-  void(VERNON_GL_APIENTRY *bindVertexArray)(GlUint){};
-  void(VERNON_GL_APIENTRY *enableVertexAttribArray)(GlUint){};
-  void(VERNON_GL_APIENTRY *vertexAttribPointer)(GlUint, GlInt, GlEnum,
-                                                GlBoolean, GlSize,
-                                                const void *){};
-  void(VERNON_GL_APIENTRY *vertexAttribDivisor)(GlUint, GlUint){};
-  void(VERNON_GL_APIENTRY *genTextures)(GlSize, GlUint *){};
-  void(VERNON_GL_APIENTRY *deleteTextures)(GlSize, const GlUint *){};
-  void(VERNON_GL_APIENTRY *bindTexture)(GlEnum, GlUint){};
-  void(VERNON_GL_APIENTRY *texParameteri)(GlEnum, GlEnum, GlInt){};
-  void(VERNON_GL_APIENTRY *texImage2D)(GlEnum, GlInt, GlInt, GlSize, GlSize,
-                                       GlInt, GlEnum, GlEnum, const void *){};
-  void(VERNON_GL_APIENTRY *texSubImage2D)(GlEnum, GlInt, GlInt, GlInt, GlSize,
-                                          GlSize, GlEnum, GlEnum,
-                                          const void *){};
-  void(VERNON_GL_APIENTRY *getTexImage)(GlEnum, GlInt, GlEnum, GlEnum,
-                                        void *){};
-  void(VERNON_GL_APIENTRY *genFramebuffers)(GlSize, GlUint *){};
-  void(VERNON_GL_APIENTRY *deleteFramebuffers)(GlSize, const GlUint *){};
-  void(VERNON_GL_APIENTRY *bindFramebuffer)(GlEnum, GlUint){};
-  void(VERNON_GL_APIENTRY *framebufferTexture2D)(GlEnum, GlEnum, GlEnum, GlUint,
-                                                 GlInt){};
-  GlEnum(VERNON_GL_APIENTRY *checkFramebufferStatus)(GlEnum) {};
-  void(VERNON_GL_APIENTRY *viewport)(GlInt, GlInt, GlSize, GlSize){};
-  void(VERNON_GL_APIENTRY *clearColor)(float, float, float, float){};
-  void(VERNON_GL_APIENTRY *clear)(GlBitfield){};
-  void(VERNON_GL_APIENTRY *drawArrays)(GlEnum, GlInt, GlSize){};
-  void(VERNON_GL_APIENTRY *drawArraysInstanced)(GlEnum, GlInt, GlSize,
-                                                GlSize){};
-  void(VERNON_GL_APIENTRY *drawElementsInstanced)(GlEnum, GlSize, GlEnum,
-                                                  const void *, GlSize){};
-  void(VERNON_GL_APIENTRY *drawBuffers)(GlSize, const GlEnum *){};
-  GlInt(VERNON_GL_APIENTRY *getUniformLocation)(GlUint, const GlChar *) {};
-  void(VERNON_GL_APIENTRY *uniform1fv)(GlInt, GlSize, const float *){};
-  void(VERNON_GL_APIENTRY *uniform2fv)(GlInt, GlSize, const float *){};
-  void(VERNON_GL_APIENTRY *uniform3fv)(GlInt, GlSize, const float *){};
-  void(VERNON_GL_APIENTRY *uniform4fv)(GlInt, GlSize, const float *){};
-  void(VERNON_GL_APIENTRY *uniformMatrix2fv)(GlInt, GlSize, GlBoolean,
-                                             const float *){};
-  void(VERNON_GL_APIENTRY *uniformMatrix3fv)(GlInt, GlSize, GlBoolean,
-                                             const float *){};
-  void(VERNON_GL_APIENTRY *uniformMatrix4fv)(GlInt, GlSize, GlBoolean,
-                                             const float *){};
-  void(VERNON_GL_APIENTRY *dispatchCompute)(GlUint, GlUint, GlUint){};
-  void(VERNON_GL_APIENTRY *memoryBarrier)(GlBitfield){};
-  void(VERNON_GL_APIENTRY *finish)(){};
+struct Stage {
+  std::string stage;
+  std::string entry;
+  std::string source;
+  std::string reflection;
+  std::vector<uint8_t> binary;
+  uint32_t workgroup[3]{1, 1, 1};
 };
 
-OpenGLDriver &openGLDriver() {
-  static OpenGLDriver driver;
-  return driver;
-}
-#undef VERNON_GL_APIENTRY
-#endif
+struct Variant {
+  std::vector<std::string> key;
+  std::vector<Parameter> parameters;
+  std::string compute;
+  std::string vertex;
+  std::string fragment;
+  bool barrier{};
+};
 
 struct ReflectedArgument {
   std::string kind;
   std::string builtin;
-  size_t cpuOffset{0};
-  size_t cpuSize{0};
-  size_t tensorBytes{0};
-  size_t tensorElements{0};
-  size_t tensorElementSize{0};
+  size_t cpuOffset{};
+  size_t cpuSize{};
+  size_t tensorBytes{};
+  size_t tensorElements{};
+  size_t tensorElementSize{};
   size_t alignment{1};
-  uint32_t descriptorSet{0};
+  uint32_t descriptorSet{};
   uint32_t binding{UINT32_MAX};
 };
 
 struct ReflectedEntry {
   std::vector<ReflectedArgument> arguments;
-  size_t cpuArgumentsSize{0};
+  size_t cpuArgumentsSize{};
   uint32_t workgroup[3]{1, 1, 1};
 };
 
-bool parseReflection(llvm::StringRef text, llvm::StringRef selected,
-                     ReflectedEntry &output, std::string &error) {
-  llvm::Expected<llvm::json::Value> parsed = llvm::json::parse(text);
-  if (!parsed) {
-    error = "invalid reflection JSON";
-    return false;
-  }
-  llvm::json::Object *root = parsed->getAsObject();
-  if (!root || root->getInteger("gpu_launch_abi_version").value_or(0) != 1) {
-    error = "unsupported GPU launch ABI version";
-    return false;
-  }
-  llvm::json::Array *entries = root->getArray("entries");
-  if (!entries) {
-    error = "reflection has no entries";
-    return false;
-  }
-  for (llvm::json::Value &value : *entries) {
-    llvm::json::Object *entry = value.getAsObject();
-    if (!entry || entry->getString("name").value_or("") != selected)
-      continue;
-    output.cpuArgumentsSize = static_cast<size_t>(
-        entry->getInteger("cpu_arguments_size").value_or(0));
-    if (llvm::json::Array *workgroup = entry->getArray("workgroup_size")) {
-      if (workgroup->size() == 3) {
-        for (size_t index = 0; index < 3; ++index)
-          output.workgroup[index] = static_cast<uint32_t>(
-              (*workgroup)[index].getAsInteger().value_or(1));
-      }
-    }
-    llvm::json::Array *arguments = entry->getArray("arguments");
-    if (!arguments) {
-      error = "entry has no argument reflection";
-      return false;
-    }
-    for (llvm::json::Value &argumentValue : *arguments) {
-      llvm::json::Object *argument = argumentValue.getAsObject();
-      if (!argument) {
-        error = "invalid argument reflection";
-        return false;
-      }
-      ReflectedArgument reflected;
-      reflected.kind = argument->getString("kind").value_or("scalar").str();
-      reflected.builtin = argument->getString("builtin").value_or("").str();
-      reflected.cpuOffset =
-          static_cast<size_t>(argument->getInteger("cpu_offset").value_or(0));
-      reflected.cpuSize =
-          static_cast<size_t>(argument->getInteger("cpu_size").value_or(0));
-      reflected.alignment =
-          static_cast<size_t>(argument->getInteger("alignment").value_or(1));
-      reflected.descriptorSet =
-          static_cast<uint32_t>(argument->getInteger("vernon.set").value_or(0));
-      if (std::optional<int64_t> binding =
-              argument->getInteger("vernon.binding"))
-        reflected.binding = static_cast<uint32_t>(*binding);
-      llvm::StringRef dtype = argument->getString("dtype").value_or("");
-      reflected.tensorElementSize = dtype == "f64"    ? 8
-                                    : dtype == "f16"  ? 2
-                                    : dtype == "bool" ? 1
-                                                      : 4;
-      if (llvm::json::Array *shape = argument->getArray("shape")) {
-        size_t elements = 1;
-        for (llvm::json::Value &dimension : *shape)
-          elements *= static_cast<size_t>(dimension.getAsInteger().value_or(0));
-        reflected.tensorElements = elements;
-        reflected.tensorBytes = elements * reflected.tensorElementSize;
-      }
-      output.arguments.push_back(std::move(reflected));
-    }
-    return true;
-  }
-  error = "selected entry is absent from reflection";
-  return false;
+std::string shaderLog(OpenGLDriver &gl, GlUint shader) {
+  GlInt size = 0;
+  gl.getShaderiv(shader, kInfoLogLength, &size);
+  std::string result(static_cast<size_t>(std::max(size, 1)), '\0');
+  GlSize written = 0;
+  gl.getShaderInfoLog(shader, size, &written, result.data());
+  result.resize(static_cast<size_t>(std::max(written, 0)));
+  return result;
 }
 
-std::string readFile(const std::filesystem::path &path) {
-  std::ifstream input(path, std::ios::binary);
-  return std::string(std::istreambuf_iterator<char>(input),
-                     std::istreambuf_iterator<char>());
+std::string programLog(OpenGLDriver &gl, GlUint program) {
+  GlInt size = 0;
+  gl.getProgramiv(program, kInfoLogLength, &size);
+  std::string result(static_cast<size_t>(std::max(size, 1)), '\0');
+  GlSize written = 0;
+  gl.getProgramInfoLog(program, size, &written, result.data());
+  result.resize(static_cast<size_t>(std::max(written, 0)));
+  return result;
 }
 
 } // namespace
 
 struct VernonRuntimeContext {
   VernonRuntimeBackend backend{VERNON_RUNTIME_CPU};
+  VernonExternalOpenGLContext external{};
+  OpenGLDriver gl{};
   std::string error;
-  size_t liveBuffers{0};
-  size_t liveKernels{0};
-  size_t liveTextures{0};
-  size_t livePrograms{0};
-  uint16_t apiVersionMajor{0};
-  uint16_t apiVersionMinor{0};
-  uint16_t requestedApiVersionMajor{0};
-  uint16_t requestedApiVersionMinor{0};
+  size_t liveBuffers{};
+  size_t liveKernels{};
+  size_t liveTextures{};
+  size_t liveBundles{};
+  size_t livePipelines{};
 #if defined(VERNON_HAS_CUDA_RUNTIME)
-  CudaDevice device{};
-  CudaContext cudaContext{};
+  vernon::runtime::CudaDevice cudaDevice{};
+  vernon::runtime::CudaContext cudaContext{};
 #endif
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
   VkInstance vulkanInstance{};
@@ -689,35 +129,59 @@ struct VernonRuntimeContext {
   VkCommandPool vulkanCommandPool{};
   VkPhysicalDeviceMemoryProperties vulkanMemoryProperties{};
 #endif
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-  GLFWwindow *openGLWindow{};
-#endif
 };
 
 struct VernonDeviceBuffer {
   VernonRuntimeContext *context{};
+  GlUint name{};
   size_t size{};
   size_t alignment{};
   std::vector<unsigned char> host;
 #if defined(VERNON_HAS_CUDA_RUNTIME)
-  CudaDevicePointer device{};
+  vernon::runtime::CudaDevicePointer cudaDevice{};
 #endif
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
   VkBuffer vulkanBuffer{};
   VkDeviceMemory vulkanMemory{};
 #endif
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-  GlUint openGLBuffer{};
-#endif
 };
 
 struct VernonDeviceTexture {
   VernonRuntimeContext *context{};
+  GlUint name{};
   uint32_t width{};
   uint32_t height{};
   VernonTextureFormat format{VERNON_TEXTURE_RGBA8_UNORM};
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-  GlUint openGLTexture{};
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+  VkImage vulkanImage{};
+  VkDeviceMemory vulkanMemory{};
+  VkImageView vulkanView{};
+  VkImageLayout vulkanLayout{VK_IMAGE_LAYOUT_UNDEFINED};
+#endif
+};
+
+struct VernonPipelineBundle {
+  VernonRuntimeContext *context{};
+  std::string id;
+  std::vector<std::string> features;
+  std::unordered_map<std::string, Stage> stages;
+  std::vector<Variant> variants;
+};
+
+struct VernonLoadedPipeline {
+  VernonRuntimeContext *context{};
+  Variant variant;
+  GlUint computeProgram{};
+  GlUint graphicsProgram{};
+  GlUint vertexArray{};
+  GlUint framebuffer{};
+  uint32_t workgroup[3]{1, 1, 1};
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+  VernonLoadedKernel *vulkanCompute{};
+  VkShaderModule vulkanVertex{};
+  VkShaderModule vulkanFragment{};
+  std::string vulkanVertexEntry;
+  std::string vulkanFragmentEntry;
 #endif
 };
 
@@ -725,10 +189,10 @@ struct VernonLoadedKernel {
   VernonRuntimeContext *context{};
   ReflectedEntry reflection;
   VernonCpuEntryPoint cpuEntry{};
-  std::unique_ptr<llvm::orc::LLJIT> cpuJit;
+  vernon::runtime::PlatformLibrary nativeLibrary;
 #if defined(VERNON_HAS_CUDA_RUNTIME)
-  CudaModule cudaModule{};
-  CudaFunction cudaFunction{};
+  vernon::runtime::CudaModule cudaModule{};
+  vernon::runtime::CudaFunction cudaFunction{};
 #endif
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
   VkShaderModule vulkanShader{};
@@ -736,38 +200,26 @@ struct VernonLoadedKernel {
   VkPipelineLayout vulkanPipelineLayout{};
   VkPipeline vulkanPipeline{};
 #endif
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-  GlUint openGLProgram{};
-#endif
-};
-
-struct VernonLoadedProgram {
-  VernonRuntimeContext *context{};
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-  GlUint openGLProgram{};
-  GlUint openGLVertexArray{};
-  GlUint openGLFramebuffer{};
-  std::vector<uint32_t> openGLAttachmentLocations;
-#endif
 };
 
 namespace {
 
-VernonStatus fail(VernonRuntimeContext *context, std::string message,
+VernonStatus fail(VernonRuntimeContext *context, std::string error,
                   VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) {
   if (context)
-    context->error = std::move(message);
+    context->error = std::move(error);
   return status;
 }
 
 #if defined(VERNON_HAS_CUDA_RUNTIME)
-VernonStatus cudaFail(VernonRuntimeContext *context, CudaResult result,
+VernonStatus cudaFail(VernonRuntimeContext *context,
+                      vernon::runtime::CudaResult result,
                       const char *operation) {
-  if (result == kCudaSuccess)
+  if (result == vernon::runtime::kCudaSuccess)
     return VERNON_STATUS_OK;
   const char *name = nullptr;
   const char *description = nullptr;
-  CudaDriver &driver = cudaDriver();
+  vernon::runtime::CudaDriver &driver = vernon::runtime::cudaDriver();
   driver.errorName(result, &name);
   driver.errorString(result, &description);
   return fail(context,
@@ -793,21 +245,23 @@ std::optional<uint32_t>
 findVulkanMemoryType(const VernonRuntimeContext *context, uint32_t typeBits,
                      VkMemoryPropertyFlags required) {
   for (uint32_t index = 0;
-       index < context->vulkanMemoryProperties.memoryTypeCount; ++index) {
+       index < context->vulkanMemoryProperties.memoryTypeCount; ++index)
     if ((typeBits & (uint32_t{1} << index)) &&
         (context->vulkanMemoryProperties.memoryTypes[index].propertyFlags &
          required) == required)
       return index;
-  }
   return std::nullopt;
 }
 
 bool createVulkanBuffer(VernonRuntimeContext *context, VkDeviceSize size,
                         VkBuffer &buffer, VkDeviceMemory &memory) {
-  VulkanDriver &driver = vulkanDriver();
+  vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
   VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   bufferInfo.size = size;
-  bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+  bufferInfo.usage =
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+      VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+      VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   if (vulkanFail(context,
                  driver.createBuffer(context->vulkanDevice, &bufferInfo,
@@ -817,7 +271,7 @@ bool createVulkanBuffer(VernonRuntimeContext *context, VkDeviceSize size,
   VkMemoryRequirements requirements{};
   driver.getBufferMemoryRequirements(context->vulkanDevice, buffer,
                                      &requirements);
-  std::optional<uint32_t> memoryType =
+  const std::optional<uint32_t> memoryType =
       findVulkanMemoryType(context, requirements.memoryTypeBits,
                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -851,17 +305,81 @@ bool createVulkanBuffer(VernonRuntimeContext *context, VkDeviceSize size,
   return true;
 }
 
+template <typename Record>
+bool submitVulkanCommands(VernonRuntimeContext *context, Record record) {
+  vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
+  VkCommandBufferAllocateInfo allocation{
+      VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  allocation.commandPool = context->vulkanCommandPool;
+  allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  allocation.commandBufferCount = 1;
+  VkCommandBuffer command = VK_NULL_HANDLE;
+  if (vulkanFail(context,
+                 driver.allocateCommandBuffers(context->vulkanDevice,
+                                               &allocation, &command),
+                 "vkAllocateCommandBuffers") != VERNON_STATUS_OK)
+    return false;
+  VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  if (vulkanFail(context, driver.beginCommandBuffer(command, &begin),
+                 "vkBeginCommandBuffer") != VERNON_STATUS_OK) {
+    driver.freeCommandBuffers(context->vulkanDevice, context->vulkanCommandPool,
+                              1, &command);
+    return false;
+  }
+  record(command);
+  const bool recorded = vulkanFail(context, driver.endCommandBuffer(command),
+                                   "vkEndCommandBuffer") == VERNON_STATUS_OK;
+  VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  submit.commandBufferCount = 1;
+  submit.pCommandBuffers = &command;
+  const bool submitted =
+      recorded &&
+      vulkanFail(
+          context,
+          driver.queueSubmit(context->vulkanQueue, 1, &submit, VK_NULL_HANDLE),
+          "vkQueueSubmit") == VERNON_STATUS_OK &&
+      vulkanFail(context, driver.queueWaitIdle(context->vulkanQueue),
+                 "vkQueueWaitIdle") == VERNON_STATUS_OK;
+  driver.freeCommandBuffers(context->vulkanDevice, context->vulkanCommandPool,
+                            1, &command);
+  return submitted;
+}
+
+void transitionVulkanImage(VkCommandBuffer command,
+                           VernonDeviceTexture *texture,
+                           VkImageLayout newLayout) {
+  VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  barrier.oldLayout = texture->vulkanLayout;
+  barrier.newLayout = newLayout;
+  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.image = texture->vulkanImage;
+  barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  barrier.subresourceRange.levelCount = 1;
+  barrier.subresourceRange.layerCount = 1;
+  barrier.srcAccessMask =
+      VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+  barrier.dstAccessMask =
+      VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+  vernon::runtime::vulkanDriver().cmdPipelineBarrier(
+      command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1,
+      &barrier);
+  texture->vulkanLayout = newLayout;
+}
+
 bool initializeVulkanContext(VernonRuntimeContext *context,
                              uint32_t deviceIndex) {
-  VulkanDriver &driver = vulkanDriver();
+  vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
   if (!driver.load()) {
     context->error = driver.error;
     return false;
   }
   VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-  application.pApplicationName = "VernonDSL";
+  application.pApplicationName = "VernonRuntime";
   application.applicationVersion = VK_MAKE_API_VERSION(0, 0, 1, 0);
-  application.pEngineName = "VernonDSL";
+  application.pEngineName = "VernonRuntime";
   application.engineVersion = VK_MAKE_API_VERSION(0, 0, 1, 0);
   application.apiVersion = VK_API_VERSION_1_1;
   VkInstanceCreateInfo instanceInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
@@ -883,21 +401,22 @@ bool initializeVulkanContext(VernonRuntimeContext *context,
     context->error = "Vulkan device index is unavailable";
     return false;
   }
-  std::vector<VkPhysicalDevice> physicalDevices(physicalDeviceCount);
+  std::vector<VkPhysicalDevice> devices(physicalDeviceCount);
   if (driver.enumeratePhysicalDevices(context->vulkanInstance,
                                       &physicalDeviceCount,
-                                      physicalDevices.data()) != VK_SUCCESS)
+                                      devices.data()) != VK_SUCCESS)
     return false;
-  context->vulkanPhysicalDevice = physicalDevices[deviceIndex];
+  context->vulkanPhysicalDevice = devices[deviceIndex];
   uint32_t queueCount = 0;
   driver.getPhysicalDeviceQueueFamilyProperties(context->vulkanPhysicalDevice,
                                                 &queueCount, nullptr);
   std::vector<VkQueueFamilyProperties> queues(queueCount);
   driver.getPhysicalDeviceQueueFamilyProperties(context->vulkanPhysicalDevice,
                                                 &queueCount, queues.data());
-  auto queue = llvm::find_if(queues, [](const VkQueueFamilyProperties &family) {
-    return family.queueFlags & VK_QUEUE_COMPUTE_BIT;
-  });
+  const auto queue = std::find_if(
+      queues.begin(), queues.end(), [](const VkQueueFamilyProperties &family) {
+        return family.queueFlags & VK_QUEUE_COMPUTE_BIT;
+      });
   if (queue == queues.end()) {
     context->error = "Vulkan device has no compute queue";
     return false;
@@ -936,7 +455,7 @@ bool initializeVulkanContext(VernonRuntimeContext *context,
 }
 
 void destroyVulkanContext(VernonRuntimeContext *context) {
-  VulkanDriver &driver = vulkanDriver();
+  vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
   if (context->vulkanDevice) {
     driver.deviceWaitIdle(context->vulkanDevice);
     if (context->vulkanCommandPool)
@@ -952,81 +471,307 @@ void destroyVulkanContext(VernonRuntimeContext *context) {
 }
 #endif
 
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-bool initializeOpenGLContext(VernonRuntimeContext *context, uint16_t major = 4,
-                             uint16_t minor = 3) {
-  OpenGLDriver &driver = openGLDriver();
-  if (!driver.initialize(context->error))
-    return false;
-  glfwDefaultWindowHints();
-  context->requestedApiVersionMajor = major;
-  context->requestedApiVersionMinor = minor;
-  glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
-  glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_API);
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, major);
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, minor);
-  glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-  context->openGLWindow =
-      glfwCreateWindow(1, 1, "VernonDSL Runtime", nullptr, nullptr);
-  if (!context->openGLWindow) {
-    context->error = "cannot create requested OpenGL " + std::to_string(major) +
-                     "." + std::to_string(minor) + " context";
-    driver.release();
+void makeCurrent(VernonRuntimeContext *context) {
+  context->external.make_current(context->external.user_data);
+}
+
+GlUint compileShader(VernonRuntimeContext *context, GlEnum kind,
+                     const std::string &source) {
+  OpenGLDriver &gl = context->gl;
+  const GlUint shader = gl.createShader(kind);
+  const char *data = source.data();
+  const GlInt size = static_cast<GlInt>(source.size());
+  gl.shaderSource(shader, 1, &data, &size);
+  gl.compileShader(shader);
+  GlInt compiled = 0;
+  gl.getShaderiv(shader, kCompileStatus, &compiled);
+  if (compiled)
+    return shader;
+  fail(context, "OpenGL shader compilation failed: " + shaderLog(gl, shader));
+  gl.deleteShader(shader);
+  return 0;
+}
+
+GlUint linkProgram(VernonRuntimeContext *context,
+                   const std::vector<GlUint> &shaders) {
+  OpenGLDriver &gl = context->gl;
+  const GlUint program = gl.createProgram();
+  for (GlUint shader : shaders)
+    gl.attachShader(program, shader);
+  gl.linkProgram(program);
+  for (GlUint shader : shaders)
+    gl.deleteShader(shader);
+  GlInt linked = 0;
+  gl.getProgramiv(program, kLinkStatus, &linked);
+  if (linked)
+    return program;
+  fail(context, "OpenGL program link failed: " + programLog(gl, program));
+  gl.deleteProgram(program);
+  return 0;
+}
+
+bool parseUse(const nlohmann::json &value, ParameterUse &use,
+              std::string &error) {
+  if (!value.is_object()) {
+    error = "pipeline parameter use must be an object";
     return false;
   }
-  glfwMakeContextCurrent(context->openGLWindow);
-  if (!driver.load(context->error)) {
-    glfwDestroyWindow(context->openGLWindow);
-    context->openGLWindow = nullptr;
-    driver.release();
-    return false;
-  }
-  context->apiVersionMajor = static_cast<uint16_t>(
-      glfwGetWindowAttrib(context->openGLWindow, GLFW_CONTEXT_VERSION_MAJOR));
-  context->apiVersionMinor = static_cast<uint16_t>(
-      glfwGetWindowAttrib(context->openGLWindow, GLFW_CONTEXT_VERSION_MINOR));
-  if ((major > 4 || (major == 4 && minor >= 3)) &&
-      (!driver.dispatchCompute || !driver.memoryBarrier)) {
-    context->error =
-        "requested OpenGL context does not expose compute shader operations";
-    glfwDestroyWindow(context->openGLWindow);
-    context->openGLWindow = nullptr;
-    driver.release();
+  use.stage = value.value("stage", "");
+  use.interfaceKind = value.value("interface", "");
+  use.uniformName = value.value("uniform_name", "");
+  if (value.contains("dtype") && value["dtype"].is_string())
+    use.dtype = value["dtype"].get<std::string>();
+  use.index = value.value("index", 0u);
+  use.location = value.value("vernon.location", UINT32_MAX);
+  use.divisor = value.value("vernon.instance_divisor", 0u);
+  use.binding = value.value("vernon.binding", UINT32_MAX);
+  if (value.contains("shape") && value["shape"].is_array())
+    for (const nlohmann::json &dimension : value["shape"])
+      use.shape.push_back(dimension.is_number_unsigned()
+                              ? dimension.get<uint64_t>()
+                              : uint64_t{0});
+  if (use.stage.empty() || use.interfaceKind.empty()) {
+    error = "pipeline parameter use is missing stage/interface metadata";
     return false;
   }
   return true;
 }
 
-void destroyOpenGLContext(VernonRuntimeContext *context) {
-  if (!context->openGLWindow)
-    return;
-  glfwMakeContextCurrent(context->openGLWindow);
-  openGLDriver().finish();
-  glfwDestroyWindow(context->openGLWindow);
-  context->openGLWindow = nullptr;
-  openGLDriver().release();
+bool parseVariant(const nlohmann::json &value, Variant &variant,
+                  std::string &error) {
+  if (!value.is_object() || !value.contains("key") ||
+      !value.contains("parameters") || !value.contains("steps") ||
+      !value["key"].is_array() || !value["parameters"].is_array() ||
+      !value["steps"].is_array()) {
+    error = "pipeline variant tables are invalid";
+    return false;
+  }
+  for (const nlohmann::json &feature : value["key"]) {
+    if (!feature.is_string()) {
+      error = "pipeline variant feature is not a string";
+      return false;
+    }
+    variant.key.push_back(feature.get<std::string>());
+  }
+  if (!std::is_sorted(variant.key.begin(), variant.key.end()) ||
+      std::adjacent_find(variant.key.begin(), variant.key.end()) !=
+          variant.key.end()) {
+    error = "pipeline variant feature key is not canonical";
+    return false;
+  }
+  for (const nlohmann::json &row : value["parameters"]) {
+    if (!row.is_object() || !row.contains("slot") || !row.contains("uses") ||
+        !row["uses"].is_array()) {
+      error = "pipeline parameter record is invalid";
+      return false;
+    }
+    Parameter parameter;
+    parameter.slot = row["slot"].get<uint32_t>();
+    parameter.name = row.value("name", "");
+    parameter.kind = row.value("kind", "");
+    parameter.access = row.value("access", "read");
+    for (const nlohmann::json &useValue : row["uses"]) {
+      ParameterUse use;
+      if (!parseUse(useValue, use, error))
+        return false;
+      parameter.uses.push_back(std::move(use));
+    }
+    if (parameter.name.empty() || parameter.uses.empty()) {
+      error = "pipeline parameter has no name or uses";
+      return false;
+    }
+    variant.parameters.push_back(std::move(parameter));
+  }
+  std::sort(variant.parameters.begin(), variant.parameters.end(),
+            [](const Parameter &left, const Parameter &right) {
+              return left.slot < right.slot;
+            });
+  if (std::adjacent_find(variant.parameters.begin(), variant.parameters.end(),
+                         [](const Parameter &left, const Parameter &right) {
+                           return left.slot == right.slot;
+                         }) != variant.parameters.end()) {
+    error = "pipeline variant contains duplicate parameter slots";
+    return false;
+  }
+  for (const nlohmann::json &step : value["steps"]) {
+    const std::string kind = step.value("kind", "");
+    if (kind == "dispatch")
+      variant.compute = step.value("stage", "");
+    else if (kind == "barrier")
+      variant.barrier = true;
+    else if (kind == "draw") {
+      variant.vertex = step.value("vertex", "");
+      variant.fragment = step.value("fragment", "");
+    } else {
+      error = "pipeline step kind is unsupported";
+      return false;
+    }
+  }
+  if (variant.vertex.empty() != variant.fragment.empty()) {
+    error = "graphics pipeline requires both vertex and fragment stages";
+    return false;
+  }
+  return !variant.compute.empty() || !variant.vertex.empty();
 }
 
-std::string getOpenGLShaderLog(OpenGLDriver &driver, GlUint shader) {
-  GlInt length = 0;
-  driver.getShaderiv(shader, kGlInfoLogLength, &length);
-  std::string log(std::max(length, 1), '\0');
-  GlSize written = 0;
-  driver.getShaderInfoLog(shader, static_cast<GlSize>(log.size()), &written,
-                          log.data());
-  log.resize(std::max(written, 0));
-  return log;
+bool parseReflection(const nlohmann::json &root, const std::string &selected,
+                     ReflectedEntry &output, std::string &error) {
+  if (!root.is_object() || root.value("gpu_launch_abi_version", 0) != 1 ||
+      !root.contains("entries") || !root["entries"].is_array()) {
+    error = "unsupported or invalid compute reflection";
+    return false;
+  }
+  for (const nlohmann::json &entry : root["entries"]) {
+    if (!entry.is_object() || entry.value("name", "") != selected)
+      continue;
+    output.cpuArgumentsSize = entry.value("cpu_arguments_size", size_t{0});
+    if (entry.contains("workgroup_size") &&
+        entry["workgroup_size"].is_array() &&
+        entry["workgroup_size"].size() == 3)
+      for (size_t index = 0; index < 3; ++index)
+        output.workgroup[index] =
+            entry["workgroup_size"][index].get<uint32_t>();
+    if (!output.cpuArgumentsSize || !entry.contains("arguments") ||
+        !entry["arguments"].is_array()) {
+      error = "CPU entry has no argument layout";
+      return false;
+    }
+    for (const nlohmann::json &value : entry["arguments"]) {
+      if (!value.is_object()) {
+        error = "CPU entry contains invalid argument reflection";
+        return false;
+      }
+      ReflectedArgument argument;
+      argument.kind = value.value("kind", "scalar");
+      argument.builtin = value.value("builtin", "");
+      argument.cpuOffset = value.value("cpu_offset", size_t{0});
+      argument.cpuSize = value.value("cpu_size", size_t{0});
+      argument.alignment = value.value("alignment", size_t{1});
+      argument.descriptorSet = value.value("vernon.set", uint32_t{0});
+      argument.binding = value.value("vernon.binding", UINT32_MAX);
+      const std::string dtype = value.value("dtype", "");
+      const size_t elementSize = dtype == "f64"    ? 8
+                                 : dtype == "f16"  ? 2
+                                 : dtype == "bool" ? 1
+                                                   : 4;
+      argument.tensorElementSize = elementSize;
+      if (value.contains("shape") && value["shape"].is_array()) {
+        size_t elements = 1;
+        for (const nlohmann::json &dimension : value["shape"]) {
+          if (!dimension.is_number_unsigned()) {
+            elements = 0;
+            break;
+          }
+          elements *= dimension.get<size_t>();
+        }
+        argument.tensorElements = elements;
+        argument.tensorBytes = elements * elementSize;
+      }
+      if (!argument.cpuSize || argument.cpuOffset > output.cpuArgumentsSize ||
+          argument.cpuSize > output.cpuArgumentsSize - argument.cpuOffset ||
+          (argument.kind != "tensor" && argument.kind != "scalar" &&
+           argument.kind != "builtin")) {
+        error = "CPU argument layout is invalid";
+        return false;
+      }
+      output.arguments.push_back(std::move(argument));
+    }
+    return true;
+  }
+  error = "selected CPU entry is absent from reflection";
+  return false;
 }
 
-std::string getOpenGLProgramLog(OpenGLDriver &driver, GlUint program) {
-  GlInt length = 0;
-  driver.getProgramiv(program, kGlInfoLogLength, &length);
-  std::string log(std::max(length, 1), '\0');
-  GlSize written = 0;
-  driver.getProgramInfoLog(program, static_cast<GlSize>(log.size()), &written,
-                           log.data());
-  log.resize(std::max(written, 0));
-  return log;
+std::string readFile(const std::filesystem::path &path) {
+  std::ifstream input(path, std::ios::binary);
+  return std::string(std::istreambuf_iterator<char>(input),
+                     std::istreambuf_iterator<char>());
+}
+
+const char *hostOperatingSystem() {
+#if defined(_WIN32)
+  return "windows";
+#elif defined(__APPLE__)
+  return "macos";
+#elif defined(__linux__)
+  return "linux";
+#else
+  return "unknown";
+#endif
+}
+
+const char *hostArchitecture() {
+#if defined(_M_X64) || defined(__x86_64__)
+  return "x86_64";
+#elif defined(_M_ARM64) || defined(__aarch64__)
+  return "aarch64";
+#else
+  return "unknown";
+#endif
+}
+
+std::vector<uint8_t> decodeBase64(const std::string &encoded) {
+  static constexpr char alphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::vector<uint8_t> result;
+  uint32_t accumulator = 0;
+  int bits = 0;
+  for (unsigned char character : encoded) {
+    if (character == '=')
+      break;
+    const char *position =
+        std::find(std::begin(alphabet), std::end(alphabet) - 1, character);
+    if (position == std::end(alphabet) - 1)
+      return {};
+    const auto value = static_cast<uint32_t>(position - alphabet);
+    accumulator = (accumulator << 6) | static_cast<uint32_t>(value);
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      result.push_back(static_cast<uint8_t>(accumulator >> bits));
+      accumulator &= (uint32_t{1} << bits) - 1;
+    }
+  }
+  return result;
+}
+
+bool argumentKindMatches(const Parameter &parameter,
+                         const VernonPipelineArgument &argument) {
+  return (parameter.kind == "tensor" &&
+          argument.kind == VERNON_PIPELINE_TENSOR) ||
+         (parameter.kind == "texture" &&
+          argument.kind == VERNON_PIPELINE_TEXTURE) ||
+         (parameter.kind == "inline" &&
+          argument.kind == VERNON_PIPELINE_INLINE_VALUE);
+}
+
+GlEnum topologyMode(VernonPrimitiveTopology topology) {
+  if (topology == VERNON_TOPOLOGY_LINE_LIST)
+    return kLines;
+  if (topology == VERNON_TOPOLOGY_POINT_LIST)
+    return kPoints;
+  return kTriangles;
+}
+
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+VkPrimitiveTopology vulkanTopology(VernonPrimitiveTopology topology) {
+  if (topology == VERNON_TOPOLOGY_LINE_LIST)
+    return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+  if (topology == VERNON_TOPOLOGY_POINT_LIST)
+    return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+  return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+}
+
+VkFormat vulkanVertexFormat(uint32_t components) {
+  if (components == 1)
+    return VK_FORMAT_R32_SFLOAT;
+  if (components == 2)
+    return VK_FORMAT_R32G32_SFLOAT;
+  if (components == 3)
+    return VK_FORMAT_R32G32B32_SFLOAT;
+  if (components == 4)
+    return VK_FORMAT_R32G32B32A32_SFLOAT;
+  return VK_FORMAT_UNDEFINED;
 }
 #endif
 
@@ -1038,86 +783,51 @@ VernonRuntimeCapabilities
 vernonRuntimeGetCapabilities(VernonRuntimeBackend backend) {
   static std::string diagnostic;
   diagnostic.clear();
-  VernonRuntimeCapabilities capabilities{};
-  capabilities.supports_compute = 1;
+  VernonRuntimeCapabilities result{};
   if (backend == VERNON_RUNTIME_CPU) {
-    capabilities.available = 1;
+    result.available = 1;
+    result.supports_compute = 1;
+    result.supports_storage_buffers = 1;
   } else if (backend == VERNON_RUNTIME_CUDA) {
 #if defined(VERNON_HAS_CUDA_RUNTIME)
-    CudaDriver &driver = cudaDriver();
+    vernon::runtime::CudaDriver &driver = vernon::runtime::cudaDriver();
     if (!driver.load()) {
-      diagnostic = driver.error.empty() ? "CUDA Driver API is unavailable"
-                                        : driver.error;
+      diagnostic = driver.error;
     } else {
-      CudaDevice device{};
-      CudaResult status = driver.init(0);
-      if (status == kCudaSuccess)
+      vernon::runtime::CudaDevice device{};
+      vernon::runtime::CudaResult status = driver.init(0);
+      if (status == vernon::runtime::kCudaSuccess)
         status = driver.deviceGet(&device, 0);
-      capabilities.available = status == kCudaSuccess;
-      if (!capabilities.available)
-        diagnostic = "CUDA Driver API loaded but no usable device was found";
+      result.available = status == vernon::runtime::kCudaSuccess;
+      result.supports_compute = result.available;
+      result.supports_storage_buffers = result.available;
+      if (!result.available)
+        diagnostic = "CUDA Driver loaded but no usable device was found";
     }
 #else
-    diagnostic = "VernonDSLRuntime was built without CUDA Driver support";
+    diagnostic = "VernonRuntime was built without CUDA support";
 #endif
   } else if (backend == VERNON_RUNTIME_VULKAN) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     VernonRuntimeContext probe;
-    probe.backend = VERNON_RUNTIME_VULKAN;
-    capabilities.available = initializeVulkanContext(&probe, 0);
+    probe.backend = backend;
+    result.available = initializeVulkanContext(&probe, 0);
+    result.supports_compute = result.available;
+    result.supports_storage_buffers = result.available;
     diagnostic = probe.error;
     destroyVulkanContext(&probe);
 #else
-    diagnostic = "VernonDSLRuntime was built without Vulkan support";
+    diagnostic = "VernonRuntime was built without Vulkan support";
 #endif
   } else if (backend == VERNON_RUNTIME_OPENGL ||
              backend == VERNON_RUNTIME_OPENGL_ES) {
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-    VernonRuntimeContext probe;
-    probe.backend = backend;
-    capabilities.available = initializeOpenGLContext(&probe);
-    capabilities.supports_graphics = capabilities.available;
-    capabilities.supports_storage_buffers = capabilities.available;
-    capabilities.api_version_major = probe.apiVersionMajor;
-    capabilities.api_version_minor = probe.apiVersionMinor;
-    capabilities.graphics_draw_abi_version = capabilities.available ? 2 : 0;
-    diagnostic = probe.error;
-    destroyOpenGLContext(&probe);
-#else
-    diagnostic = "VernonDSLRuntime was built without OpenGL support";
-#endif
+    result.supports_graphics = 1;
+    diagnostic = "backend requires a host-owned external context";
   } else {
-    diagnostic = "unknown runtime backend";
+    diagnostic = "VernonRuntime backend is not enabled";
   }
-  if (capabilities.available && backend != VERNON_RUNTIME_OPENGL &&
-      backend != VERNON_RUNTIME_OPENGL_ES)
-    capabilities.supports_storage_buffers = 1;
-  capabilities.diagnostic = {diagnostic.data(), diagnostic.size()};
-  return capabilities;
-}
-
-VernonRuntimeCapabilities
-vernonRuntimeGetContextCapabilities(const VernonRuntimeContext *context) {
-  VernonRuntimeCapabilities capabilities{};
-  if (!context)
-    return capabilities;
-  capabilities.available = 1;
-  capabilities.diagnostic = {context->error.data(), context->error.size()};
-  if (context->backend == VERNON_RUNTIME_OPENGL ||
-      context->backend == VERNON_RUNTIME_OPENGL_ES) {
-    capabilities.supports_graphics = 1;
-    capabilities.supports_compute = context->requestedApiVersionMajor > 4 ||
-                                    (context->requestedApiVersionMajor == 4 &&
-                                     context->requestedApiVersionMinor >= 3);
-    capabilities.supports_storage_buffers = capabilities.supports_compute;
-    capabilities.api_version_major = context->apiVersionMajor;
-    capabilities.api_version_minor = context->apiVersionMinor;
-    capabilities.graphics_draw_abi_version = 2;
-  } else {
-    capabilities.supports_compute = 1;
-    capabilities.supports_storage_buffers = 1;
-  }
-  return capabilities;
+  result.diagnostic = {diagnostic.data(), diagnostic.size()};
+  return result;
 }
 
 VernonRuntimeContext *vernonRuntimeCreate(VernonRuntimeBackend backend,
@@ -1125,10 +835,6 @@ VernonRuntimeContext *vernonRuntimeCreate(VernonRuntimeBackend backend,
   VernonRuntimeCreateOptions options{};
   options.struct_size = sizeof(options);
   options.device_index = deviceIndex;
-  if (backend == VERNON_RUNTIME_OPENGL || backend == VERNON_RUNTIME_OPENGL_ES) {
-    options.api_version_major = 4;
-    options.api_version_minor = 3;
-  }
   return vernonRuntimeCreateWithOptions(backend, &options);
 }
 
@@ -1137,85 +843,95 @@ vernonRuntimeCreateWithOptions(VernonRuntimeBackend backend,
                                const VernonRuntimeCreateOptions *options) {
   if (!options || options->struct_size < sizeof(VernonRuntimeCreateOptions))
     return nullptr;
-  const uint32_t deviceIndex = options->device_index;
-  static std::once_flag nativeTargetInitialization;
-  std::call_once(nativeTargetInitialization, [] {
-    llvm::InitializeNativeTarget();
-    llvm::InitializeNativeTargetAsmPrinter();
-    llvm::InitializeNativeTargetAsmParser();
-  });
   auto context = std::make_unique<VernonRuntimeContext>();
   context->backend = backend;
   if (backend == VERNON_RUNTIME_CPU)
-    return context.release();
+    return options->device_index == 0 ? context.release() : nullptr;
   if (backend == VERNON_RUNTIME_VULKAN) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-    if (!initializeVulkanContext(context.get(), deviceIndex)) {
+    if (!initializeVulkanContext(context.get(), options->device_index)) {
       destroyVulkanContext(context.get());
       return nullptr;
     }
     return context.release();
 #else
-    (void)deviceIndex;
-    return nullptr;
-#endif
-  }
-  if (backend == VERNON_RUNTIME_OPENGL || backend == VERNON_RUNTIME_OPENGL_ES) {
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-    const uint16_t major =
-        options->api_version_major ? options->api_version_major : 4;
-    const uint16_t minor =
-        options->api_version_major ? options->api_version_minor : 3;
-    if (major < 3 || (major == 3 && minor < 3) ||
-        !initializeOpenGLContext(context.get(), major, minor))
-      return nullptr;
-    return context.release();
-#else
-    (void)deviceIndex;
     return nullptr;
 #endif
   }
   if (backend != VERNON_RUNTIME_CUDA)
     return nullptr;
 #if defined(VERNON_HAS_CUDA_RUNTIME)
-  CudaDriver &driver = cudaDriver();
-  if (!driver.load() || driver.init(0) != kCudaSuccess ||
-      driver.deviceGet(&context->device, static_cast<int>(deviceIndex)) !=
-          kCudaSuccess ||
-      driver.primaryContextRetain(&context->cudaContext, context->device) !=
-          kCudaSuccess)
+  vernon::runtime::CudaDriver &driver = vernon::runtime::cudaDriver();
+  if (!driver.load() || driver.init(0) != vernon::runtime::kCudaSuccess ||
+      driver.deviceGet(&context->cudaDevice,
+                       static_cast<int>(options->device_index)) !=
+          vernon::runtime::kCudaSuccess ||
+      driver.primaryContextRetain(&context->cudaContext, context->cudaDevice) !=
+          vernon::runtime::kCudaSuccess)
     return nullptr;
-  if (driver.contextSetCurrent(context->cudaContext) != kCudaSuccess) {
-    driver.primaryContextRelease(context->device);
+  if (driver.contextSetCurrent(context->cudaContext) !=
+      vernon::runtime::kCudaSuccess) {
+    driver.primaryContextRelease(context->cudaDevice);
     return nullptr;
   }
   return context.release();
 #else
-  (void)deviceIndex;
   return nullptr;
 #endif
+}
+
+VernonRuntimeContext *vernonRuntimeCreateExternalOpenGL(
+    const VernonExternalOpenGLContext *externalContext) {
+  return vernonRuntimeCreateExternalOpenGLForBackend(VERNON_RUNTIME_OPENGL,
+                                                     externalContext);
+}
+
+VernonRuntimeContext *vernonRuntimeCreateExternalOpenGLForBackend(
+    VernonRuntimeBackend backend,
+    const VernonExternalOpenGLContext *externalContext) {
+  if (!externalContext ||
+      externalContext->struct_size < sizeof(VernonExternalOpenGLContext) ||
+      !externalContext->make_current || !externalContext->get_proc_address ||
+      (backend != VERNON_RUNTIME_OPENGL &&
+       backend != VERNON_RUNTIME_OPENGL_ES) ||
+      externalContext->api_version_major < 2)
+    return nullptr;
+  auto context = std::make_unique<VernonRuntimeContext>();
+  context->backend = backend;
+  context->external = *externalContext;
+  makeCurrent(context.get());
+  if (!loadOpenGLDriver(context->external, context->gl, context->error))
+    return nullptr;
+  const bool computeExpected =
+      backend == VERNON_RUNTIME_OPENGL_ES
+          ? (externalContext->api_version_major > 3 ||
+             (externalContext->api_version_major == 3 &&
+              externalContext->api_version_minor >= 1))
+          : (externalContext->api_version_major > 4 ||
+             (externalContext->api_version_major == 4 &&
+              externalContext->api_version_minor >= 3));
+  if (computeExpected) {
+    if (!context->gl.dispatchCompute || !context->gl.memoryBarrier)
+      return nullptr;
+  }
+  return context.release();
 }
 
 VernonStatus vernonRuntimeDestroy(VernonRuntimeContext *context) {
   if (!context)
     return VERNON_STATUS_OK;
   if (context->liveBuffers || context->liveKernels || context->liveTextures ||
-      context->livePrograms)
+      context->liveBundles || context->livePipelines)
     return fail(context, "runtime context still owns live handles");
 #if defined(VERNON_HAS_CUDA_RUNTIME)
   if (context->backend == VERNON_RUNTIME_CUDA) {
-    cudaDriver().contextSynchronize();
-    cudaDriver().primaryContextRelease(context->device);
+    vernon::runtime::cudaDriver().contextSynchronize();
+    vernon::runtime::cudaDriver().primaryContextRelease(context->cudaDevice);
   }
 #endif
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
   if (context->backend == VERNON_RUNTIME_VULKAN)
     destroyVulkanContext(context);
-#endif
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-  if (context->backend == VERNON_RUNTIME_OPENGL ||
-      context->backend == VERNON_RUNTIME_OPENGL_ES)
-    destroyOpenGLContext(context);
 #endif
   delete context;
   return VERNON_STATUS_OK;
@@ -1223,85 +939,120 @@ VernonStatus vernonRuntimeDestroy(VernonRuntimeContext *context) {
 
 VernonStringView
 vernonRuntimeGetLastError(const VernonRuntimeContext *context) {
+  return context
+             ? VernonStringView{context->error.data(), context->error.size()}
+             : VernonStringView{nullptr, 0};
+}
+
+VernonRuntimeCapabilities
+vernonRuntimeGetContextCapabilities(const VernonRuntimeContext *context) {
+  VernonRuntimeCapabilities result{};
   if (!context)
-    return {nullptr, 0};
-  return {context->error.data(), context->error.size()};
+    return result;
+  result.available = 1;
+  if (context->backend == VERNON_RUNTIME_CPU ||
+      context->backend == VERNON_RUNTIME_CUDA ||
+      context->backend == VERNON_RUNTIME_VULKAN) {
+    result.supports_compute = 1;
+    result.supports_storage_buffers = 1;
+    result.diagnostic = {context->error.data(), context->error.size()};
+    return result;
+  }
+  result.supports_graphics = 1;
+  result.api_version_major = context->external.api_version_major;
+  result.api_version_minor = context->external.api_version_minor;
+  result.supports_compute =
+      context->backend == VERNON_RUNTIME_OPENGL_ES
+          ? (result.api_version_major > 3 ||
+             (result.api_version_major == 3 &&
+              result.api_version_minor >= 1))
+          : (result.api_version_major > 4 ||
+             (result.api_version_major == 4 &&
+              result.api_version_minor >= 3));
+  result.supports_storage_buffers = result.supports_compute;
+  result.graphics_draw_abi_version = 2;
+  result.diagnostic = {context->error.data(), context->error.size()};
+  return result;
 }
 
 VernonDeviceBuffer *vernonRuntimeBufferAllocate(VernonRuntimeContext *context,
                                                 size_t size, size_t alignment) {
-  if (!context || !size || !alignment || (alignment & (alignment - 1))) {
-    fail(context, "buffer size and power-of-two alignment are required");
+  if (!context ||
+      (context->backend != VERNON_RUNTIME_CPU &&
+       context->backend != VERNON_RUNTIME_CUDA &&
+       context->backend != VERNON_RUNTIME_VULKAN) ||
+      !size || !alignment || (alignment & (alignment - 1))) {
+    fail(context, "invalid compute buffer allocation");
     return nullptr;
   }
-  auto buffer = std::make_unique<VernonDeviceBuffer>();
-  buffer->context = context;
-  buffer->size = size;
-  buffer->alignment = alignment;
+  auto result = std::make_unique<VernonDeviceBuffer>();
+  result->context = context;
+  result->size = size;
+  result->alignment = alignment;
   if (context->backend == VERNON_RUNTIME_CPU) {
-    buffer->host.resize(size);
-  } else if (context->backend == VERNON_RUNTIME_VULKAN) {
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-    if (!createVulkanBuffer(context, size, buffer->vulkanBuffer,
-                            buffer->vulkanMemory))
+    result->host.resize(size);
+  } else if (context->backend == VERNON_RUNTIME_CUDA) {
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+    if (cudaFail(context,
+                 vernon::runtime::cudaDriver().memoryAllocate(
+                     &result->cudaDevice, size),
+                 "cuMemAlloc") != VERNON_STATUS_OK)
       return nullptr;
 #else
     return nullptr;
 #endif
-  } else if (context->backend == VERNON_RUNTIME_OPENGL ||
-             context->backend == VERNON_RUNTIME_OPENGL_ES) {
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-    glfwMakeContextCurrent(context->openGLWindow);
-    OpenGLDriver &driver = openGLDriver();
-    driver.genBuffers(1, &buffer->openGLBuffer);
-    driver.bindBuffer(kGlShaderStorageBuffer, buffer->openGLBuffer);
-    driver.bufferData(kGlShaderStorageBuffer, static_cast<GlSizePtr>(size),
-                      nullptr, kGlDynamicCopy);
-#else
-    return nullptr;
-#endif
   } else {
-#if defined(VERNON_HAS_CUDA_RUNTIME)
-    if (cudaFail(context, cudaDriver().memoryAllocate(&buffer->device, size),
-                 "cuMemAlloc") != VERNON_STATUS_OK)
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+    if (!createVulkanBuffer(context, size, result->vulkanBuffer,
+                            result->vulkanMemory))
       return nullptr;
 #else
     return nullptr;
 #endif
   }
   ++context->liveBuffers;
-  return buffer.release();
+  return result.release();
+}
+
+VernonDeviceBuffer *
+vernonRuntimeImportOpenGLBuffer(VernonRuntimeContext *context, uint32_t buffer,
+                                size_t size, size_t alignment) {
+  if (!context || !buffer || !size || !alignment ||
+      (alignment & (alignment - 1)) ||
+      (context->backend != VERNON_RUNTIME_OPENGL &&
+       context->backend != VERNON_RUNTIME_OPENGL_ES))
+    return nullptr;
+  auto result = std::make_unique<VernonDeviceBuffer>();
+  result->context = context;
+  result->name = buffer;
+  result->size = size;
+  result->alignment = alignment;
+  ++context->liveBuffers;
+  return result.release();
 }
 
 VernonStatus vernonRuntimeBufferFree(VernonDeviceBuffer *buffer) {
   if (!buffer)
     return VERNON_STATUS_OK;
-  VernonRuntimeContext *context = buffer->context;
 #if defined(VERNON_HAS_CUDA_RUNTIME)
-  if (context->backend == VERNON_RUNTIME_CUDA && buffer->device)
-    if (cudaFail(context, cudaDriver().memoryFree(buffer->device),
-                 "cuMemFree") != VERNON_STATUS_OK)
-      return VERNON_STATUS_INTERNAL_ERROR;
+  if (buffer->context->backend == VERNON_RUNTIME_CUDA && buffer->cudaDevice &&
+      cudaFail(buffer->context,
+               vernon::runtime::cudaDriver().memoryFree(buffer->cudaDevice),
+               "cuMemFree") != VERNON_STATUS_OK)
+    return VERNON_STATUS_INTERNAL_ERROR;
 #endif
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-  if (context->backend == VERNON_RUNTIME_VULKAN) {
-    VulkanDriver &driver = vulkanDriver();
+  if (buffer->context->backend == VERNON_RUNTIME_VULKAN) {
+    vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
     if (buffer->vulkanBuffer)
-      driver.destroyBuffer(context->vulkanDevice, buffer->vulkanBuffer,
+      driver.destroyBuffer(buffer->context->vulkanDevice, buffer->vulkanBuffer,
                            nullptr);
     if (buffer->vulkanMemory)
-      driver.freeMemory(context->vulkanDevice, buffer->vulkanMemory, nullptr);
+      driver.freeMemory(buffer->context->vulkanDevice, buffer->vulkanMemory,
+                        nullptr);
   }
 #endif
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-  if (context->backend == VERNON_RUNTIME_OPENGL ||
-      context->backend == VERNON_RUNTIME_OPENGL_ES) {
-    glfwMakeContextCurrent(context->openGLWindow);
-    if (buffer->openGLBuffer)
-      openGLDriver().deleteBuffers(1, &buffer->openGLBuffer);
-  }
-#endif
-  --context->liveBuffers;
+  --buffer->context->liveBuffers;
   delete buffer;
   return VERNON_STATUS_OK;
 }
@@ -1309,92 +1060,73 @@ VernonStatus vernonRuntimeBufferFree(VernonDeviceBuffer *buffer) {
 VernonStatus vernonRuntimeCopyFromHost(VernonDeviceBuffer *buffer,
                                        size_t offset, const void *source,
                                        size_t size) {
-  if (!buffer || !source || offset > buffer->size ||
-      size > buffer->size - offset)
-    return fail(buffer ? buffer->context : nullptr,
-                "invalid host upload range");
-  if (buffer->context->backend == VERNON_RUNTIME_CPU)
-    std::memcpy(buffer->host.data() + offset, source, size);
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-  else if (buffer->context->backend == VERNON_RUNTIME_VULKAN) {
-    void *mapped = nullptr;
-    VulkanDriver &driver = vulkanDriver();
-    if (vulkanFail(buffer->context,
-                   driver.mapMemory(buffer->context->vulkanDevice,
-                                    buffer->vulkanMemory, offset, size, 0,
-                                    &mapped),
-                   "vkMapMemory") != VERNON_STATUS_OK)
-      return VERNON_STATUS_INTERNAL_ERROR;
-    std::memcpy(mapped, source, size);
-    driver.unmapMemory(buffer->context->vulkanDevice, buffer->vulkanMemory);
-  }
-#endif
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-  else if (buffer->context->backend == VERNON_RUNTIME_OPENGL ||
-           buffer->context->backend == VERNON_RUNTIME_OPENGL_ES) {
-    glfwMakeContextCurrent(buffer->context->openGLWindow);
-    OpenGLDriver &driver = openGLDriver();
-    driver.bindBuffer(kGlShaderStorageBuffer, buffer->openGLBuffer);
-    driver.bufferSubData(kGlShaderStorageBuffer, static_cast<GlSizePtr>(offset),
-                         static_cast<GlSizePtr>(size), source);
-  }
-#endif
+  if (!buffer || buffer->context->backend != VERNON_RUNTIME_CPU || !source ||
+      offset > buffer->size || size > buffer->size - offset) {
 #if defined(VERNON_HAS_CUDA_RUNTIME)
-  else
-    return cudaFail(
-        buffer->context,
-        cudaDriver().copyHostToDevice(buffer->device + offset, source, size),
-        "cuMemcpyHtoD");
+    if (buffer && buffer->context->backend == VERNON_RUNTIME_CUDA && source &&
+        offset <= buffer->size && size <= buffer->size - offset)
+      return cudaFail(buffer->context,
+                      vernon::runtime::cudaDriver().copyHostToDevice(
+                          buffer->cudaDevice + offset, source, size),
+                      "cuMemcpyHtoD");
 #endif
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+    if (buffer && buffer->context->backend == VERNON_RUNTIME_VULKAN && source &&
+        offset <= buffer->size && size <= buffer->size - offset) {
+      void *mapped = nullptr;
+      vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
+      if (vulkanFail(buffer->context,
+                     driver.mapMemory(buffer->context->vulkanDevice,
+                                      buffer->vulkanMemory, offset, size, 0,
+                                      &mapped),
+                     "vkMapMemory") != VERNON_STATUS_OK)
+        return VERNON_STATUS_INTERNAL_ERROR;
+      std::memcpy(mapped, source, size);
+      driver.unmapMemory(buffer->context->vulkanDevice, buffer->vulkanMemory);
+      return VERNON_STATUS_OK;
+    }
+#endif
+    return fail(buffer ? buffer->context : nullptr,
+                "invalid compute buffer upload");
+  }
+  std::memcpy(buffer->host.data() + offset, source, size);
   return VERNON_STATUS_OK;
 }
 
 VernonStatus vernonRuntimeCopyToHost(const VernonDeviceBuffer *buffer,
                                      size_t offset, void *destination,
                                      size_t size) {
-  if (!buffer || !destination || offset > buffer->size ||
-      size > buffer->size - offset)
-    return fail(buffer ? buffer->context : nullptr,
-                "invalid host download range");
-  if (buffer->context->backend == VERNON_RUNTIME_CPU)
-    std::memcpy(destination, buffer->host.data() + offset, size);
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-  else if (buffer->context->backend == VERNON_RUNTIME_VULKAN) {
-    void *mapped = nullptr;
-    VulkanDriver &driver = vulkanDriver();
-    if (vulkanFail(buffer->context,
-                   driver.mapMemory(buffer->context->vulkanDevice,
-                                    buffer->vulkanMemory, offset, size, 0,
-                                    &mapped),
-                   "vkMapMemory") != VERNON_STATUS_OK)
-      return VERNON_STATUS_INTERNAL_ERROR;
-    std::memcpy(destination, mapped, size);
-    driver.unmapMemory(buffer->context->vulkanDevice, buffer->vulkanMemory);
-  }
-#endif
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-  else if (buffer->context->backend == VERNON_RUNTIME_OPENGL ||
-           buffer->context->backend == VERNON_RUNTIME_OPENGL_ES) {
-    glfwMakeContextCurrent(buffer->context->openGLWindow);
-    OpenGLDriver &driver = openGLDriver();
-    driver.bindBuffer(kGlShaderStorageBuffer, buffer->openGLBuffer);
-    void *mapped = driver.mapBufferRange(
-        kGlShaderStorageBuffer, static_cast<GlSizePtr>(offset),
-        static_cast<GlSizePtr>(size), kGlMapReadBit);
-    if (!mapped)
-      return fail(buffer->context, "glMapBufferRange failed",
-                  VERNON_STATUS_INTERNAL_ERROR);
-    std::memcpy(destination, mapped, size);
-    driver.unmapBuffer(kGlShaderStorageBuffer);
-  }
-#endif
+  if (!buffer || buffer->context->backend != VERNON_RUNTIME_CPU ||
+      !destination || offset > buffer->size || size > buffer->size - offset) {
 #if defined(VERNON_HAS_CUDA_RUNTIME)
-  else
-    return cudaFail(buffer->context,
-                    cudaDriver().copyDeviceToHost(
-                        destination, buffer->device + offset, size),
-                    "cuMemcpyDtoH");
+    if (buffer && buffer->context->backend == VERNON_RUNTIME_CUDA &&
+        destination && offset <= buffer->size && size <= buffer->size - offset)
+      return cudaFail(buffer->context,
+                      vernon::runtime::cudaDriver().copyDeviceToHost(
+                          destination, buffer->cudaDevice + offset, size),
+                      "cuMemcpyDtoH");
 #endif
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+    if (buffer && buffer->context->backend == VERNON_RUNTIME_VULKAN &&
+        destination && offset <= buffer->size &&
+        size <= buffer->size - offset) {
+      void *mapped = nullptr;
+      vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
+      if (vulkanFail(buffer->context,
+                     driver.mapMemory(buffer->context->vulkanDevice,
+                                      buffer->vulkanMemory, offset, size, 0,
+                                      &mapped),
+                     "vkMapMemory") != VERNON_STATUS_OK)
+        return VERNON_STATUS_INTERNAL_ERROR;
+      std::memcpy(destination, mapped, size);
+      driver.unmapMemory(buffer->context->vulkanDevice, buffer->vulkanMemory);
+      return VERNON_STATUS_OK;
+    }
+#endif
+    return fail(buffer ? buffer->context : nullptr,
+                "invalid compute buffer readback");
+  }
+  std::memcpy(destination, buffer->host.data() + offset, size);
   return VERNON_STATUS_OK;
 }
 
@@ -1402,31 +1134,79 @@ VernonDeviceTexture *vernonRuntimeTextureCreate2D(VernonRuntimeContext *context,
                                                   uint32_t width,
                                                   uint32_t height,
                                                   VernonTextureFormat format) {
-  if (!context || !width || !height || format != VERNON_TEXTURE_RGBA8_UNORM) {
-    fail(context, "RGBA8 texture dimensions are required");
+  if (!context || context->backend != VERNON_RUNTIME_VULKAN || !width ||
+      !height || format != VERNON_TEXTURE_RGBA8_UNORM)
     return nullptr;
-  }
-  if (context->backend != VERNON_RUNTIME_OPENGL &&
-      context->backend != VERNON_RUNTIME_OPENGL_ES) {
-    fail(context, "textures are currently supported by OpenGL only",
-         VERNON_STATUS_UNSUPPORTED_TARGET);
-    return nullptr;
-  }
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
   auto texture = std::make_unique<VernonDeviceTexture>();
   texture->context = context;
   texture->width = width;
   texture->height = height;
   texture->format = format;
-  glfwMakeContextCurrent(context->openGLWindow);
-  OpenGLDriver &driver = openGLDriver();
-  driver.genTextures(1, &texture->openGLTexture);
-  driver.bindTexture(kGlTexture2D, texture->openGLTexture);
-  driver.texParameteri(kGlTexture2D, kGlTextureMinFilter, kGlNearest);
-  driver.texParameteri(kGlTexture2D, kGlTextureMagFilter, kGlNearest);
-  driver.texImage2D(kGlTexture2D, 0, kGlRgba8, static_cast<GlSize>(width),
-                    static_cast<GlSize>(height), 0, kGlRgba, kGlUnsignedByte,
-                    nullptr);
+  vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
+  VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  imageInfo.imageType = VK_IMAGE_TYPE_2D;
+  imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+  imageInfo.extent = {width, height, 1};
+  imageInfo.mipLevels = 1;
+  imageInfo.arrayLayers = 1;
+  imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+  imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+  imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (vulkanFail(context,
+                 driver.createImage(context->vulkanDevice, &imageInfo, nullptr,
+                                    &texture->vulkanImage),
+                 "vkCreateImage") != VERNON_STATUS_OK)
+    return nullptr;
+  VkMemoryRequirements requirements{};
+  driver.getImageMemoryRequirements(context->vulkanDevice, texture->vulkanImage,
+                                    &requirements);
+  const std::optional<uint32_t> memoryType =
+      findVulkanMemoryType(context, requirements.memoryTypeBits,
+                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  if (!memoryType) {
+    driver.destroyImage(context->vulkanDevice, texture->vulkanImage, nullptr);
+    fail(context, "Vulkan device has no device-local image memory");
+    return nullptr;
+  }
+  VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  allocation.allocationSize = requirements.size;
+  allocation.memoryTypeIndex = *memoryType;
+  if (vulkanFail(context,
+                 driver.allocateMemory(context->vulkanDevice, &allocation,
+                                       nullptr, &texture->vulkanMemory),
+                 "vkAllocateMemory") != VERNON_STATUS_OK) {
+    driver.destroyImage(context->vulkanDevice, texture->vulkanImage, nullptr);
+    return nullptr;
+  }
+  if (vulkanFail(context,
+                 driver.bindImageMemory(context->vulkanDevice,
+                                        texture->vulkanImage,
+                                        texture->vulkanMemory, 0),
+                 "vkBindImageMemory") != VERNON_STATUS_OK) {
+    driver.destroyImage(context->vulkanDevice, texture->vulkanImage, nullptr);
+    driver.freeMemory(context->vulkanDevice, texture->vulkanMemory, nullptr);
+    return nullptr;
+  }
+  VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  viewInfo.image = texture->vulkanImage;
+  viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+  viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  viewInfo.subresourceRange.levelCount = 1;
+  viewInfo.subresourceRange.layerCount = 1;
+  if (vulkanFail(context,
+                 driver.createImageView(context->vulkanDevice, &viewInfo,
+                                        nullptr, &texture->vulkanView),
+                 "vkCreateImageView") != VERNON_STATUS_OK) {
+    driver.destroyImage(context->vulkanDevice, texture->vulkanImage, nullptr);
+    driver.freeMemory(context->vulkanDevice, texture->vulkanMemory, nullptr);
+    return nullptr;
+  }
   ++context->liveTextures;
   return texture.release();
 #else
@@ -1434,13 +1214,42 @@ VernonDeviceTexture *vernonRuntimeTextureCreate2D(VernonRuntimeContext *context,
 #endif
 }
 
+VernonDeviceTexture *vernonRuntimeImportOpenGLTexture2D(
+    VernonRuntimeContext *context, uint32_t texture, uint32_t width,
+    uint32_t height, VernonTextureFormat format) {
+  if (!context ||
+      (context->backend != VERNON_RUNTIME_OPENGL &&
+       context->backend != VERNON_RUNTIME_OPENGL_ES) ||
+      !texture ||
+      !width || !height || format != VERNON_TEXTURE_RGBA8_UNORM)
+    return nullptr;
+  auto result = std::make_unique<VernonDeviceTexture>();
+  result->context = context;
+  result->name = texture;
+  result->width = width;
+  result->height = height;
+  result->format = format;
+  ++context->liveTextures;
+  return result.release();
+}
+
 VernonStatus vernonRuntimeTextureFree(VernonDeviceTexture *texture) {
   if (!texture)
     return VERNON_STATUS_OK;
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-  glfwMakeContextCurrent(texture->context->openGLWindow);
-  if (texture->openGLTexture)
-    openGLDriver().deleteTextures(1, &texture->openGLTexture);
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+  if (texture->context->backend == VERNON_RUNTIME_VULKAN) {
+    vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
+    driver.deviceWaitIdle(texture->context->vulkanDevice);
+    if (texture->vulkanView)
+      driver.destroyImageView(texture->context->vulkanDevice,
+                              texture->vulkanView, nullptr);
+    if (texture->vulkanImage)
+      driver.destroyImage(texture->context->vulkanDevice, texture->vulkanImage,
+                          nullptr);
+    if (texture->vulkanMemory)
+      driver.freeMemory(texture->context->vulkanDevice, texture->vulkanMemory,
+                        nullptr);
+  }
 #endif
   --texture->context->liveTextures;
   delete texture;
@@ -1451,17 +1260,45 @@ VernonStatus vernonRuntimeTextureCopyFromHost(VernonDeviceTexture *texture,
                                               const void *source, size_t size) {
   const size_t expected =
       texture ? static_cast<size_t>(texture->width) * texture->height * 4 : 0;
-  if (!texture || !source || size != expected)
+  if (!texture || texture->context->backend != VERNON_RUNTIME_VULKAN ||
+      !source || size != expected)
     return fail(texture ? texture->context : nullptr,
-                "texture upload must contain width * height * 4 bytes");
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-  glfwMakeContextCurrent(texture->context->openGLWindow);
-  OpenGLDriver &driver = openGLDriver();
-  driver.bindTexture(kGlTexture2D, texture->openGLTexture);
-  driver.texSubImage2D(
-      kGlTexture2D, 0, 0, 0, static_cast<GlSize>(texture->width),
-      static_cast<GlSize>(texture->height), kGlRgba, kGlUnsignedByte, source);
-  return VERNON_STATUS_OK;
+                "invalid Vulkan texture upload");
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+  VernonRuntimeContext *context = texture->context;
+  VkBuffer staging = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  if (!createVulkanBuffer(context, size, staging, memory))
+    return VERNON_STATUS_INTERNAL_ERROR;
+  vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
+  void *mapped = nullptr;
+  if (vulkanFail(
+          context,
+          driver.mapMemory(context->vulkanDevice, memory, 0, size, 0, &mapped),
+          "vkMapMemory") != VERNON_STATUS_OK) {
+    driver.destroyBuffer(context->vulkanDevice, staging, nullptr);
+    driver.freeMemory(context->vulkanDevice, memory, nullptr);
+    return VERNON_STATUS_INTERNAL_ERROR;
+  }
+  std::memcpy(mapped, source, size);
+  driver.unmapMemory(context->vulkanDevice, memory);
+  const bool copied =
+      submitVulkanCommands(context, [&](VkCommandBuffer command) {
+        transitionVulkanImage(command, texture,
+                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy region{};
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent = {texture->width, texture->height, 1};
+        driver.cmdCopyBufferToImage(command, staging, texture->vulkanImage,
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                                    &region);
+        transitionVulkanImage(command, texture,
+                              VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+      });
+  driver.destroyBuffer(context->vulkanDevice, staging, nullptr);
+  driver.freeMemory(context->vulkanDevice, memory, nullptr);
+  return copied ? VERNON_STATUS_OK : VERNON_STATUS_INTERNAL_ERROR;
 #else
   return VERNON_STATUS_UNSUPPORTED_TARGET;
 #endif
@@ -1471,15 +1308,49 @@ VernonStatus vernonRuntimeTextureCopyToHost(const VernonDeviceTexture *texture,
                                             void *destination, size_t size) {
   const size_t expected =
       texture ? static_cast<size_t>(texture->width) * texture->height * 4 : 0;
-  if (!texture || !destination || size != expected)
+  if (!texture || texture->context->backend != VERNON_RUNTIME_VULKAN ||
+      !destination || size != expected)
     return fail(texture ? texture->context : nullptr,
-                "texture readback must contain width * height * 4 bytes");
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-  glfwMakeContextCurrent(texture->context->openGLWindow);
-  OpenGLDriver &driver = openGLDriver();
-  driver.bindTexture(kGlTexture2D, texture->openGLTexture);
-  driver.getTexImage(kGlTexture2D, 0, kGlRgba, kGlUnsignedByte, destination);
-  return VERNON_STATUS_OK;
+                "invalid Vulkan texture readback");
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+  auto *mutableTexture = const_cast<VernonDeviceTexture *>(texture);
+  VernonRuntimeContext *context = texture->context;
+  VkBuffer staging = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  if (!createVulkanBuffer(context, size, staging, memory))
+    return VERNON_STATUS_INTERNAL_ERROR;
+  vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
+  const bool copied =
+      submitVulkanCommands(context, [&](VkCommandBuffer command) {
+        transitionVulkanImage(command, mutableTexture,
+                              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy region{};
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent = {texture->width, texture->height, 1};
+        driver.cmdCopyImageToBuffer(command, texture->vulkanImage,
+                                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                    staging, 1, &region);
+        transitionVulkanImage(command, mutableTexture,
+                              VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+      });
+  if (copied) {
+    void *mapped = nullptr;
+    if (vulkanFail(context,
+                   driver.mapMemory(context->vulkanDevice, memory, 0, size, 0,
+                                    &mapped),
+                   "vkMapMemory") == VERNON_STATUS_OK) {
+      std::memcpy(destination, mapped, size);
+      driver.unmapMemory(context->vulkanDevice, memory);
+    } else {
+      driver.destroyBuffer(context->vulkanDevice, staging, nullptr);
+      driver.freeMemory(context->vulkanDevice, memory, nullptr);
+      return VERNON_STATUS_INTERNAL_ERROR;
+    }
+  }
+  driver.destroyBuffer(context->vulkanDevice, staging, nullptr);
+  driver.freeMemory(context->vulkanDevice, memory, nullptr);
+  return copied ? VERNON_STATUS_OK : VERNON_STATUS_INTERNAL_ERROR;
 #else
   return VERNON_STATUS_UNSUPPORTED_TARGET;
 #endif
@@ -1492,17 +1363,25 @@ VernonLoadedKernel *vernonRuntimeLoadCpuEntry(VernonRuntimeContext *context,
                                               const char *entry,
                                               size_t entrySize) {
   if (!context || context->backend != VERNON_RUNTIME_CPU || !entryPoint ||
-      !reflection || !entry)
+      !reflection || !reflectionSize || !entry || !entrySize)
     return nullptr;
-  auto kernel = std::make_unique<VernonLoadedKernel>();
-  kernel->context = context;
-  kernel->cpuEntry = entryPoint;
-  if (!parseReflection(llvm::StringRef(reflection, reflectionSize),
-                       llvm::StringRef(entry, entrySize), kernel->reflection,
-                       context->error))
+  try {
+    const nlohmann::json parsed = nlohmann::json::parse(
+        reflection, reflection + reflectionSize, nullptr, false);
+    auto kernel = std::make_unique<VernonLoadedKernel>();
+    kernel->context = context;
+    kernel->cpuEntry = entryPoint;
+    if (parsed.is_discarded() ||
+        !parseReflection(parsed, std::string(entry, entrySize),
+                         kernel->reflection, context->error))
+      return nullptr;
+    ++context->liveKernels;
+    return kernel.release();
+  } catch (const std::exception &error) {
+    fail(context, std::string("failed to load CPU entry: ") + error.what(),
+         VERNON_STATUS_INTERNAL_ERROR);
     return nullptr;
-  ++context->liveKernels;
-  return kernel.release();
+  }
 }
 
 VernonLoadedKernel *
@@ -1510,123 +1389,45 @@ vernonRuntimeLoadArtifact(VernonRuntimeContext *context, const void *artifact,
                           size_t artifactSize, const char *reflection,
                           size_t reflectionSize, const char *entry,
                           size_t entrySize) {
-  if (!context || !artifact || !reflection || !entry)
+  if (!context || !artifact || !artifactSize || !reflection ||
+      !reflectionSize || !entry || !entrySize)
     return nullptr;
-  if (context->backend == VERNON_RUNTIME_CPU) {
-    auto kernel = std::make_unique<VernonLoadedKernel>();
-    kernel->context = context;
-    if (!parseReflection(llvm::StringRef(reflection, reflectionSize),
-                         llvm::StringRef(entry, entrySize), kernel->reflection,
-                         context->error))
-      return nullptr;
-    auto targetMachine = llvm::orc::JITTargetMachineBuilder::detectHost();
-    if (!targetMachine) {
-      fail(context, llvm::toString(targetMachine.takeError()),
+  if (context->backend == VERNON_RUNTIME_CUDA) {
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+    try {
+      const nlohmann::json parsed = nlohmann::json::parse(
+          reflection, reflection + reflectionSize, nullptr, false);
+      auto kernel = std::make_unique<VernonLoadedKernel>();
+      kernel->context = context;
+      const std::string entryName(entry, entrySize);
+      if (parsed.is_discarded() ||
+          !parseReflection(parsed, entryName, kernel->reflection,
+                           context->error))
+        return nullptr;
+      std::string image(static_cast<const char *>(artifact), artifactSize);
+      image.push_back('\0');
+      vernon::runtime::CudaDriver &driver = vernon::runtime::cudaDriver();
+      if (cudaFail(context,
+                   driver.moduleLoadData(&kernel->cudaModule, image.data(), 0,
+                                         nullptr, nullptr),
+                   "cuModuleLoadDataEx") != VERNON_STATUS_OK)
+        return nullptr;
+      if (cudaFail(context,
+                   driver.moduleGetFunction(&kernel->cudaFunction,
+                                            kernel->cudaModule,
+                                            entryName.c_str()),
+                   "cuModuleGetFunction") != VERNON_STATUS_OK) {
+        driver.moduleUnload(kernel->cudaModule);
+        return nullptr;
+      }
+      ++context->liveKernels;
+      return kernel.release();
+    } catch (const std::exception &error) {
+      fail(context,
+           std::string("failed to load CUDA artifact: ") + error.what(),
            VERNON_STATUS_INTERNAL_ERROR);
       return nullptr;
     }
-    auto dataLayout = targetMachine->getDefaultDataLayoutForTarget();
-    if (!dataLayout) {
-      fail(context, llvm::toString(dataLayout.takeError()),
-           VERNON_STATUS_INTERNAL_ERROR);
-      return nullptr;
-    }
-    auto jit = llvm::orc::LLJITBuilder()
-                   .setJITTargetMachineBuilder(std::move(*targetMachine))
-                   .setDataLayout(*dataLayout)
-                   .create();
-    if (!jit) {
-      fail(context, llvm::toString(jit.takeError()),
-           VERNON_STATUS_INTERNAL_ERROR);
-      return nullptr;
-    }
-    auto llvmContext = std::make_unique<llvm::LLVMContext>();
-    llvm::SMDiagnostic diagnostic;
-    std::unique_ptr<llvm::Module> module = llvm::parseAssemblyString(
-        llvm::StringRef(static_cast<const char *>(artifact), artifactSize),
-        diagnostic, *llvmContext);
-    if (!module) {
-      std::string message;
-      llvm::raw_string_ostream stream(message);
-      diagnostic.print("VernonDSLRuntime", stream);
-      fail(context, stream.str(), VERNON_STATUS_PARSE_ERROR);
-      return nullptr;
-    }
-    module->setDataLayout(*dataLayout);
-    module->setTargetTriple((*jit)->getTargetTriple());
-    if (llvm::Error error = (*jit)->addIRModule(llvm::orc::ThreadSafeModule(
-            std::move(module), std::move(llvmContext)))) {
-      fail(context, llvm::toString(std::move(error)),
-           VERNON_STATUS_INTERNAL_ERROR);
-      return nullptr;
-    }
-    std::string symbolName = "__vernon_cpu_" + std::string(entry, entrySize);
-    auto symbol = (*jit)->lookup(symbolName);
-    if (!symbol) {
-      fail(context, llvm::toString(symbol.takeError()),
-           VERNON_STATUS_INTERNAL_ERROR);
-      return nullptr;
-    }
-    kernel->cpuEntry = symbol->toPtr<VernonCpuEntryPoint>();
-    kernel->cpuJit = std::move(*jit);
-    ++context->liveKernels;
-    return kernel.release();
-  }
-  if (context->backend == VERNON_RUNTIME_OPENGL ||
-      context->backend == VERNON_RUNTIME_OPENGL_ES) {
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-    auto kernel = std::make_unique<VernonLoadedKernel>();
-    kernel->context = context;
-    if (!parseReflection(llvm::StringRef(reflection, reflectionSize),
-                         llvm::StringRef(entry, entrySize), kernel->reflection,
-                         context->error))
-      return nullptr;
-    glfwMakeContextCurrent(context->openGLWindow);
-    OpenGLDriver &driver = openGLDriver();
-    if (context->requestedApiVersionMajor < 4 ||
-        (context->requestedApiVersionMajor == 4 &&
-         context->requestedApiVersionMinor < 3) ||
-        !driver.dispatchCompute || !driver.memoryBarrier) {
-      fail(context, "OpenGL 4.3 is required for compute shaders",
-           VERNON_STATUS_UNSUPPORTED_TARGET);
-      return nullptr;
-    }
-    GlUint shader = driver.createShader(kGlComputeShader);
-    const GlChar *source = static_cast<const GlChar *>(artifact);
-    GlInt sourceLength = static_cast<GlInt>(artifactSize);
-    driver.shaderSource(shader, 1, &source, &sourceLength);
-    driver.compileShader(shader);
-    GlInt compiled = 0;
-    driver.getShaderiv(shader, kGlCompileStatus, &compiled);
-    if (!compiled) {
-      context->error = "OpenGL compute shader compilation failed: " +
-                       getOpenGLShaderLog(driver, shader);
-      driver.deleteShader(shader);
-      return nullptr;
-    }
-    kernel->openGLProgram = driver.createProgram();
-    driver.attachShader(kernel->openGLProgram, shader);
-    driver.linkProgram(kernel->openGLProgram);
-    driver.deleteShader(shader);
-    GlInt linked = 0;
-    driver.getProgramiv(kernel->openGLProgram, kGlLinkStatus, &linked);
-    if (!linked) {
-      context->error = "OpenGL compute program link failed: " +
-                       getOpenGLProgramLog(driver, kernel->openGLProgram);
-      driver.deleteProgram(kernel->openGLProgram);
-      kernel->openGLProgram = 0;
-      return nullptr;
-    }
-    uint32_t kernelArgumentIndex = 0;
-    for (ReflectedArgument &argument : kernel->reflection.arguments) {
-      if (argument.kind == "builtin")
-        continue;
-      if (argument.binding == UINT32_MAX)
-        argument.binding = kernelArgumentIndex;
-      ++kernelArgumentIndex;
-    }
-    ++context->liveKernels;
-    return kernel.release();
 #else
     return nullptr;
 #endif
@@ -1637,208 +1438,176 @@ vernonRuntimeLoadArtifact(VernonRuntimeContext *context, const void *artifact,
       fail(context, "Vulkan artifact is not aligned SPIR-V");
       return nullptr;
     }
-    auto kernel = std::make_unique<VernonLoadedKernel>();
-    kernel->context = context;
-    if (!parseReflection(llvm::StringRef(reflection, reflectionSize),
-                         llvm::StringRef(entry, entrySize), kernel->reflection,
-                         context->error))
-      return nullptr;
-    VulkanDriver &driver = vulkanDriver();
-    VkShaderModuleCreateInfo shaderInfo{
-        VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    shaderInfo.codeSize = artifactSize;
-    shaderInfo.pCode = static_cast<const uint32_t *>(artifact);
-    if (vulkanFail(context,
-                   driver.createShaderModule(context->vulkanDevice, &shaderInfo,
-                                             nullptr, &kernel->vulkanShader),
-                   "vkCreateShaderModule") != VERNON_STATUS_OK)
-      return nullptr;
-
-    std::vector<VkDescriptorSetLayoutBinding> bindings;
-    uint32_t kernelArgumentIndex = 0;
-    for (ReflectedArgument &argument : kernel->reflection.arguments) {
-      if (argument.kind == "builtin")
-        continue;
-      if (argument.descriptorSet != 0) {
-        fail(context,
-             "Vulkan runtime currently supports descriptor set zero only");
-        driver.destroyShaderModule(context->vulkanDevice, kernel->vulkanShader,
-                                   nullptr);
+    try {
+      const nlohmann::json parsed = nlohmann::json::parse(
+          reflection, reflection + reflectionSize, nullptr, false);
+      auto kernel = std::make_unique<VernonLoadedKernel>();
+      kernel->context = context;
+      const std::string entryName(entry, entrySize);
+      if (parsed.is_discarded() ||
+          !parseReflection(parsed, entryName, kernel->reflection,
+                           context->error))
         return nullptr;
+      vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
+      VkShaderModuleCreateInfo shaderInfo{
+          VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+      shaderInfo.codeSize = artifactSize;
+      shaderInfo.pCode = static_cast<const uint32_t *>(artifact);
+      if (vulkanFail(context,
+                     driver.createShaderModule(context->vulkanDevice,
+                                               &shaderInfo, nullptr,
+                                               &kernel->vulkanShader),
+                     "vkCreateShaderModule") != VERNON_STATUS_OK)
+        return nullptr;
+      std::vector<VkDescriptorSetLayoutBinding> bindings;
+      uint32_t index = 0;
+      for (ReflectedArgument &argument : kernel->reflection.arguments) {
+        if (argument.kind == "builtin")
+          continue;
+        if (argument.descriptorSet != 0) {
+          fail(context, "Vulkan compute supports descriptor set zero only");
+          return nullptr;
+        }
+        if (argument.binding == UINT32_MAX)
+          argument.binding = index;
+        bindings.push_back({argument.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                            1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
+        ++index;
       }
-      if (argument.binding == UINT32_MAX)
-        argument.binding = kernelArgumentIndex;
-      bindings.push_back({argument.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                          1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
-      ++kernelArgumentIndex;
-    }
-    VkDescriptorSetLayoutCreateInfo descriptorLayoutInfo{
-        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    descriptorLayoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
-    descriptorLayoutInfo.pBindings = bindings.data();
-    if (vulkanFail(context,
-                   driver.createDescriptorSetLayout(
-                       context->vulkanDevice, &descriptorLayoutInfo, nullptr,
-                       &kernel->vulkanDescriptorSetLayout),
-                   "vkCreateDescriptorSetLayout") != VERNON_STATUS_OK) {
-      driver.destroyShaderModule(context->vulkanDevice, kernel->vulkanShader,
-                                 nullptr);
+      VkDescriptorSetLayoutCreateInfo descriptorInfo{
+          VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+      descriptorInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+      descriptorInfo.pBindings = bindings.data();
+      if (vulkanFail(context,
+                     driver.createDescriptorSetLayout(
+                         context->vulkanDevice, &descriptorInfo, nullptr,
+                         &kernel->vulkanDescriptorSetLayout),
+                     "vkCreateDescriptorSetLayout") != VERNON_STATUS_OK)
+        return nullptr;
+      VkPipelineLayoutCreateInfo layoutInfo{
+          VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+      layoutInfo.setLayoutCount = 1;
+      layoutInfo.pSetLayouts = &kernel->vulkanDescriptorSetLayout;
+      if (vulkanFail(context,
+                     driver.createPipelineLayout(context->vulkanDevice,
+                                                 &layoutInfo, nullptr,
+                                                 &kernel->vulkanPipelineLayout),
+                     "vkCreatePipelineLayout") != VERNON_STATUS_OK)
+        return nullptr;
+      VkPipelineShaderStageCreateInfo stage{
+          VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+      stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+      stage.module = kernel->vulkanShader;
+      stage.pName = entryName.c_str();
+      VkComputePipelineCreateInfo pipelineInfo{
+          VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+      pipelineInfo.stage = stage;
+      pipelineInfo.layout = kernel->vulkanPipelineLayout;
+      if (vulkanFail(context,
+                     driver.createComputePipelines(
+                         context->vulkanDevice, VK_NULL_HANDLE, 1,
+                         &pipelineInfo, nullptr, &kernel->vulkanPipeline),
+                     "vkCreateComputePipelines") != VERNON_STATUS_OK)
+        return nullptr;
+      ++context->liveKernels;
+      return kernel.release();
+    } catch (const std::exception &error) {
+      fail(context,
+           std::string("failed to load Vulkan artifact: ") + error.what(),
+           VERNON_STATUS_INTERNAL_ERROR);
       return nullptr;
     }
-    VkPipelineLayoutCreateInfo pipelineLayoutInfo{
-        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    pipelineLayoutInfo.setLayoutCount = 1;
-    pipelineLayoutInfo.pSetLayouts = &kernel->vulkanDescriptorSetLayout;
-    if (vulkanFail(context,
-                   driver.createPipelineLayout(context->vulkanDevice,
-                                               &pipelineLayoutInfo, nullptr,
-                                               &kernel->vulkanPipelineLayout),
-                   "vkCreatePipelineLayout") != VERNON_STATUS_OK) {
-      driver.destroyDescriptorSetLayout(
-          context->vulkanDevice, kernel->vulkanDescriptorSetLayout, nullptr);
-      driver.destroyShaderModule(context->vulkanDevice, kernel->vulkanShader,
-                                 nullptr);
-      return nullptr;
-    }
-    std::string symbol(entry, entrySize);
-    VkPipelineShaderStageCreateInfo stage{
-        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-    stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    stage.module = kernel->vulkanShader;
-    stage.pName = symbol.c_str();
-    VkComputePipelineCreateInfo pipelineInfo{
-        VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-    pipelineInfo.stage = stage;
-    pipelineInfo.layout = kernel->vulkanPipelineLayout;
-    if (vulkanFail(context,
-                   driver.createComputePipelines(
-                       context->vulkanDevice, VK_NULL_HANDLE, 1, &pipelineInfo,
-                       nullptr, &kernel->vulkanPipeline),
-                   "vkCreateComputePipelines") != VERNON_STATUS_OK) {
-      driver.destroyPipelineLayout(context->vulkanDevice,
-                                   kernel->vulkanPipelineLayout, nullptr);
-      driver.destroyDescriptorSetLayout(
-          context->vulkanDevice, kernel->vulkanDescriptorSetLayout, nullptr);
-      driver.destroyShaderModule(context->vulkanDevice, kernel->vulkanShader,
-                                 nullptr);
-      return nullptr;
-    }
-    ++context->liveKernels;
-    return kernel.release();
 #else
     return nullptr;
 #endif
   }
-  if (context->backend != VERNON_RUNTIME_CUDA)
-    return nullptr;
-#if defined(VERNON_HAS_CUDA_RUNTIME)
-  auto kernel = std::make_unique<VernonLoadedKernel>();
-  kernel->context = context;
-  if (!parseReflection(llvm::StringRef(reflection, reflectionSize),
-                       llvm::StringRef(entry, entrySize), kernel->reflection,
-                       context->error))
-    return nullptr;
-  std::string image(static_cast<const char *>(artifact), artifactSize);
-  image.push_back('\0');
-  if (cudaFail(context,
-               cudaDriver().moduleLoadData(&kernel->cudaModule, image.data(), 0,
-                                           nullptr, nullptr),
-               "cuModuleLoadDataEx") != VERNON_STATUS_OK)
-    return nullptr;
-  std::string symbol(entry, entrySize);
-  if (cudaFail(context,
-               cudaDriver().moduleGetFunction(
-                   &kernel->cudaFunction, kernel->cudaModule, symbol.c_str()),
-               "cuModuleGetFunction") != VERNON_STATUS_OK) {
-    cudaDriver().moduleUnload(kernel->cudaModule);
-    return nullptr;
-  }
-  ++context->liveKernels;
-  return kernel.release();
-#else
-  (void)artifactSize;
-  (void)reflectionSize;
-  (void)entrySize;
+  fail(context,
+       "CPU AOT artifacts must be loaded from a compute bundle so the native "
+       "library target and content hash can be validated",
+       VERNON_STATUS_UNSUPPORTED_TARGET);
   return nullptr;
-#endif
 }
 
 VernonLoadedKernel *
 vernonRuntimeLoadComputeBundle(VernonRuntimeContext *context,
                                const char *directory) {
-  if (!context || !directory)
+  if (!context || context->backend != VERNON_RUNTIME_CPU || !directory)
     return nullptr;
-  std::filesystem::path root(directory);
-  std::string manifestText = readFile(root / "compute.json");
-  llvm::Expected<llvm::json::Value> parsed = llvm::json::parse(manifestText);
-  if (!parsed || !parsed->getAsObject()) {
-    fail(context, "cannot parse compute.json");
+  try {
+    const std::filesystem::path root(directory);
+    const std::string manifestText = readFile(root / "compute.json");
+    const nlohmann::json manifest =
+        nlohmann::json::parse(manifestText, nullptr, false);
+    if (manifest.is_discarded() || !manifest.is_object() ||
+        manifest.value("schema_version", 0) != 2 ||
+        manifest.value("cpu_invocation_abi_version", 0) !=
+            VERNON_CPU_INVOCATION_ABI_VERSION ||
+        manifest.value("target", "") != "cpu" ||
+        manifest.value("operating_system", "") != hostOperatingSystem() ||
+        manifest.value("architecture", "") != hostArchitecture() ||
+        manifest.value("artifact_format", "") != "native_library" ||
+        !manifest.contains("reflection")) {
+      fail(context, "unsupported or invalid CPU AOT bundle");
+      return nullptr;
+    }
+    const std::string entry = manifest.value("entry", "");
+    const std::string symbol = manifest.value("symbol", "");
+    const std::string artifactName = manifest.value("artifact", "");
+    const std::string expectedHash = manifest.value("artifact_sha256", "");
+    const std::filesystem::path relativeArtifact(artifactName);
+    if (entry.empty() || symbol.empty() || artifactName.empty() ||
+        expectedHash.size() != 64 || relativeArtifact.is_absolute() ||
+        relativeArtifact.has_root_path() ||
+        std::find(relativeArtifact.begin(), relativeArtifact.end(), "..") !=
+            relativeArtifact.end()) {
+      fail(context, "CPU AOT bundle fields are invalid");
+      return nullptr;
+    }
+    const std::filesystem::path artifactPath = root / relativeArtifact;
+    const std::string artifact = readFile(artifactPath);
+    if (artifact.empty() ||
+        manifest.value("artifact_size", uint64_t{0}) != artifact.size() ||
+        vernon::runtime::sha256Hex(artifact.data(), artifact.size()) !=
+            expectedHash) {
+      fail(context, "CPU AOT artifact size or SHA-256 mismatch");
+      return nullptr;
+    }
+    auto kernel = std::make_unique<VernonLoadedKernel>();
+    kernel->context = context;
+    if (!parseReflection(manifest["reflection"], entry, kernel->reflection,
+                         context->error))
+      return nullptr;
+    const std::string nativePath = artifactPath.string();
+    if (!kernel->nativeLibrary.open(nativePath.c_str(), context->error))
+      return nullptr;
+    kernel->cpuEntry = reinterpret_cast<VernonCpuEntryPoint>(
+        kernel->nativeLibrary.symbol(symbol.c_str()));
+    if (!kernel->cpuEntry) {
+      fail(context, "CPU AOT library does not export symbol '" + symbol + "'");
+      return nullptr;
+    }
+    ++context->liveKernels;
+    return kernel.release();
+  } catch (const std::exception &error) {
+    fail(context, std::string("failed to load CPU AOT bundle: ") + error.what(),
+         VERNON_STATUS_INTERNAL_ERROR);
     return nullptr;
   }
-  llvm::json::Object &manifest = *parsed->getAsObject();
-  if (manifest.getInteger("schema_version").value_or(0) != 1 ||
-      manifest.getInteger("gpu_launch_abi_version").value_or(0) != 1) {
-    fail(context, "unsupported compute bundle schema or launch ABI");
-    return nullptr;
-  }
-  llvm::StringRef expectedTarget =
-      context->backend == VERNON_RUNTIME_CPU      ? "cpu"
-      : context->backend == VERNON_RUNTIME_CUDA   ? "cuda"
-      : context->backend == VERNON_RUNTIME_VULKAN ? "vulkan"
-      : context->backend == VERNON_RUNTIME_OPENGL ? "opengl"
-                                                  : "opengles";
-  if (manifest.getString("target").value_or("") != expectedTarget) {
-    fail(context, "compute bundle target does not match runtime backend");
-    return nullptr;
-  }
-  std::string entry = manifest.getString("entry").value_or("").str();
-  std::string artifactName = manifest.getString("artifact").value_or("").str();
-  llvm::json::Value *reflectionValue = manifest.get("reflection");
-  if (entry.empty() || artifactName.empty() || !reflectionValue) {
-    fail(context, "compute bundle is missing required fields");
-    return nullptr;
-  }
-  std::string reflection;
-  llvm::raw_string_ostream reflectionStream(reflection);
-  reflectionStream << *reflectionValue;
-  reflectionStream.flush();
-  std::string artifact = readFile(root / artifactName);
-  if (artifact.empty()) {
-    fail(context, "compute bundle artifact is empty or absent");
-    return nullptr;
-  }
-  if (manifest.getInteger("artifact_size").value_or(-1) !=
-      static_cast<int64_t>(artifact.size())) {
-    fail(context, "compute bundle artifact size mismatch");
-    return nullptr;
-  }
-  std::string expectedHash =
-      manifest.getString("artifact_sha256").value_or("").str();
-  llvm::ArrayRef<uint8_t> bytes(
-      reinterpret_cast<const uint8_t *>(artifact.data()), artifact.size());
-  std::string actualHash = llvm::toHex(llvm::SHA256::hash(bytes), true);
-  if (expectedHash.empty() ||
-      !llvm::StringRef(expectedHash).equals_insensitive(actualHash)) {
-    fail(context, "compute bundle artifact SHA-256 mismatch");
-    return nullptr;
-  }
-  return vernonRuntimeLoadArtifact(context, artifact.data(), artifact.size(),
-                                   reflection.data(), reflection.size(),
-                                   entry.data(), entry.size());
 }
 
 VernonStatus vernonRuntimeKernelUnload(VernonLoadedKernel *kernel) {
   if (!kernel)
     return VERNON_STATUS_OK;
 #if defined(VERNON_HAS_CUDA_RUNTIME)
-  if (kernel->context->backend == VERNON_RUNTIME_CUDA && kernel->cudaModule)
-    if (cudaFail(kernel->context, cudaDriver().moduleUnload(kernel->cudaModule),
-                 "cuModuleUnload") != VERNON_STATUS_OK)
-      return VERNON_STATUS_INTERNAL_ERROR;
+  if (kernel->context->backend == VERNON_RUNTIME_CUDA && kernel->cudaModule &&
+      cudaFail(kernel->context,
+               vernon::runtime::cudaDriver().moduleUnload(kernel->cudaModule),
+               "cuModuleUnload") != VERNON_STATUS_OK)
+    return VERNON_STATUS_INTERNAL_ERROR;
 #endif
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
   if (kernel->context->backend == VERNON_RUNTIME_VULKAN) {
-    VulkanDriver &driver = vulkanDriver();
+    vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
     driver.deviceWaitIdle(kernel->context->vulkanDevice);
     if (kernel->vulkanPipeline)
       driver.destroyPipeline(kernel->context->vulkanDevice,
@@ -1855,14 +1624,6 @@ VernonStatus vernonRuntimeKernelUnload(VernonLoadedKernel *kernel) {
                                  kernel->vulkanShader, nullptr);
   }
 #endif
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-  if (kernel->context->backend == VERNON_RUNTIME_OPENGL ||
-      kernel->context->backend == VERNON_RUNTIME_OPENGL_ES) {
-    glfwMakeContextCurrent(kernel->context->openGLWindow);
-    if (kernel->openGLProgram)
-      openGLDriver().deleteProgram(kernel->openGLProgram);
-  }
-#endif
   --kernel->context->liveKernels;
   delete kernel;
   return VERNON_STATUS_OK;
@@ -1874,7 +1635,7 @@ VernonStatus vernonRuntimeLaunch(VernonLoadedKernel *kernel,
                                  size_t argumentCount) {
   if (!kernel || !globalSize.x || !globalSize.y || !globalSize.z)
     return fail(kernel ? kernel->context : nullptr,
-                "grid dimensions must be positive");
+                "compute launch grid dimensions must be positive");
   const size_t expected = static_cast<size_t>(std::count_if(
       kernel->reflection.arguments.begin(), kernel->reflection.arguments.end(),
       [](const ReflectedArgument &argument) {
@@ -1882,12 +1643,13 @@ VernonStatus vernonRuntimeLaunch(VernonLoadedKernel *kernel,
       }));
   if (argumentCount != expected || (expected && !arguments))
     return fail(kernel->context,
-                "launch argument count does not match reflection");
-  size_t validatedIndex = 0;
+                "compute launch argument count does not match reflection");
+
+  size_t validated = 0;
   for (const ReflectedArgument &reflected : kernel->reflection.arguments) {
     if (reflected.kind == "builtin")
       continue;
-    const VernonLaunchArgument &argument = arguments[validatedIndex++];
+    const VernonLaunchArgument &argument = arguments[validated++];
     if (reflected.kind == "tensor") {
       if (argument.kind != VERNON_LAUNCH_TENSOR || !argument.buffer ||
           argument.buffer->context != kernel->context ||
@@ -1895,105 +1657,66 @@ VernonStatus vernonRuntimeLaunch(VernonLoadedKernel *kernel,
            argument.buffer->size < reflected.tensorBytes) ||
           argument.buffer->alignment < reflected.alignment)
         return fail(kernel->context,
-                    "Tensor launch argument does not match reflection");
+                    "compute Tensor argument does not match reflection");
     } else if (argument.kind != VERNON_LAUNCH_SCALAR || !argument.scalar_data ||
-               (reflected.cpuSize &&
-                argument.scalar_size != reflected.cpuSize)) {
+               argument.scalar_size != reflected.cpuSize) {
       return fail(kernel->context,
-                  "scalar launch argument does not match reflection");
+                  "compute scalar argument does not match reflection");
     }
   }
 
-  if (kernel->context->backend == VERNON_RUNTIME_CPU) {
-    std::vector<unsigned char> packed(kernel->reflection.cpuArgumentsSize);
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+  if (kernel->context->backend == VERNON_RUNTIME_CUDA) {
+    struct CudaMemRefDescriptor {
+      vernon::runtime::CudaDevicePointer allocated;
+      vernon::runtime::CudaDevicePointer aligned;
+      uint64_t offset;
+      uint64_t size;
+      uint64_t stride;
+    };
+    std::vector<CudaMemRefDescriptor> descriptors;
+    std::vector<void *> parameters;
+    descriptors.reserve(argumentCount);
+    parameters.reserve(argumentCount * 5);
     size_t supplied = 0;
     for (const ReflectedArgument &reflected : kernel->reflection.arguments) {
       if (reflected.kind == "builtin")
         continue;
       const VernonLaunchArgument &argument = arguments[supplied++];
-      if (reflected.kind == "tensor") {
-        if (argument.kind != VERNON_LAUNCH_TENSOR || !argument.buffer ||
-            argument.buffer->context != kernel->context ||
-            reflected.cpuSize != sizeof(uintptr_t) ||
-            (reflected.tensorBytes &&
-             argument.buffer->size < reflected.tensorBytes) ||
-            argument.buffer->alignment < reflected.alignment)
-          return fail(kernel->context, "invalid Tensor launch argument");
-        uintptr_t pointer =
-            reinterpret_cast<uintptr_t>(argument.buffer->host.data());
-        std::memcpy(packed.data() + reflected.cpuOffset, &pointer,
-                    sizeof(pointer));
-      } else {
-        if (argument.kind != VERNON_LAUNCH_SCALAR ||
-            argument.scalar_size != reflected.cpuSize || !argument.scalar_data)
-          return fail(kernel->context, "invalid scalar launch argument");
-        std::memcpy(packed.data() + reflected.cpuOffset, argument.scalar_data,
-                    argument.scalar_size);
-      }
-    }
-    for (uint32_t z = 0; z < globalSize.z; ++z)
-      for (uint32_t y = 0; y < globalSize.y; ++y)
-        for (uint32_t x = 0; x < globalSize.x; ++x) {
-          uint32_t id[3]{x, y, z};
-          for (const ReflectedArgument &reflected :
-               kernel->reflection.arguments)
-            if (reflected.kind == "builtin" &&
-                reflected.builtin == "global_invocation_id")
-              std::memcpy(packed.data() + reflected.cpuOffset, id,
-                          std::min(reflected.cpuSize, sizeof(id)));
-          VernonCpuInvocation invocation{packed.data(), packed.size(), nullptr,
-                                         0, nullptr};
-          VernonStatus status = kernel->cpuEntry(&invocation);
-          if (status != VERNON_STATUS_OK)
-            return fail(kernel->context, "CPU kernel invocation failed",
-                        status);
-        }
-    return VERNON_STATUS_OK;
-  }
-
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-  if (kernel->context->backend == VERNON_RUNTIME_OPENGL ||
-      kernel->context->backend == VERNON_RUNTIME_OPENGL_ES) {
-    VernonRuntimeContext *context = kernel->context;
-    glfwMakeContextCurrent(context->openGLWindow);
-    OpenGLDriver &driver = openGLDriver();
-    driver.useProgram(kernel->openGLProgram);
-    std::vector<GlUint> scalarBuffers;
-    size_t supplied = 0;
-    for (const ReflectedArgument &reflected : kernel->reflection.arguments) {
-      if (reflected.kind == "builtin")
-        continue;
-      const VernonLaunchArgument &argument = arguments[supplied++];
-      GlUint buffer = 0;
       if (argument.kind == VERNON_LAUNCH_TENSOR) {
-        buffer = argument.buffer->openGLBuffer;
+        descriptors.push_back(
+            {argument.buffer->cudaDevice, argument.buffer->cudaDevice, 0,
+             reflected.tensorElements
+                 ? reflected.tensorElements
+                 : argument.buffer->size /
+                       std::max(reflected.tensorElementSize, size_t{1}),
+             1});
+        CudaMemRefDescriptor &descriptor = descriptors.back();
+        parameters.push_back(&descriptor.allocated);
+        parameters.push_back(&descriptor.aligned);
+        parameters.push_back(&descriptor.offset);
+        parameters.push_back(&descriptor.size);
+        parameters.push_back(&descriptor.stride);
       } else {
-        driver.genBuffers(1, &buffer);
-        scalarBuffers.push_back(buffer);
-        driver.bindBuffer(kGlShaderStorageBuffer, buffer);
-        driver.bufferData(kGlShaderStorageBuffer,
-                          static_cast<GlSizePtr>(argument.scalar_size),
-                          argument.scalar_data, kGlDynamicCopy);
+        parameters.push_back(const_cast<void *>(argument.scalar_data));
       }
-      driver.bindBufferBase(kGlShaderStorageBuffer, reflected.binding, buffer);
     }
-    uint32_t *workgroup = kernel->reflection.workgroup;
-    driver.dispatchCompute((globalSize.x + workgroup[0] - 1) / workgroup[0],
-                           (globalSize.y + workgroup[1] - 1) / workgroup[1],
-                           (globalSize.z + workgroup[2] - 1) / workgroup[2]);
-    driver.memoryBarrier(kGlShaderStorageBarrierBit);
-    driver.finish();
-    if (!scalarBuffers.empty())
-      driver.deleteBuffers(static_cast<GlSize>(scalarBuffers.size()),
-                           scalarBuffers.data());
-    return VERNON_STATUS_OK;
+    const uint32_t *workgroup = kernel->reflection.workgroup;
+    return cudaFail(
+        kernel->context,
+        vernon::runtime::cudaDriver().launchKernel(
+            kernel->cudaFunction,
+            (globalSize.x + workgroup[0] - 1) / workgroup[0],
+            (globalSize.y + workgroup[1] - 1) / workgroup[1],
+            (globalSize.z + workgroup[2] - 1) / workgroup[2], workgroup[0],
+            workgroup[1], workgroup[2], 0, nullptr, parameters.data(), nullptr),
+        "cuLaunchKernel");
   }
 #endif
-
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
   if (kernel->context->backend == VERNON_RUNTIME_VULKAN) {
     VernonRuntimeContext *context = kernel->context;
-    VulkanDriver &driver = vulkanDriver();
+    vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
     std::vector<std::pair<VkBuffer, VkDeviceMemory>> scalarBuffers;
@@ -2005,12 +1728,11 @@ VernonStatus vernonRuntimeLaunch(VernonLoadedKernel *kernel,
       if (descriptorPool)
         driver.destroyDescriptorPool(context->vulkanDevice, descriptorPool,
                                      nullptr);
-      for (auto [buffer, memory] : scalarBuffers) {
+      for (const auto &[buffer, memory] : scalarBuffers) {
         driver.destroyBuffer(context->vulkanDevice, buffer, nullptr);
         driver.freeMemory(context->vulkanDevice, memory, nullptr);
       }
     };
-
     VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                   static_cast<uint32_t>(expected)};
     VkDescriptorPoolCreateInfo poolInfo{
@@ -2036,7 +1758,6 @@ VernonStatus vernonRuntimeLaunch(VernonLoadedKernel *kernel,
       cleanup();
       return VERNON_STATUS_INTERNAL_ERROR;
     }
-
     std::vector<VkDescriptorBufferInfo> bufferInfos;
     std::vector<VkWriteDescriptorSet> writes;
     bufferInfos.reserve(expected);
@@ -2083,7 +1804,6 @@ VernonStatus vernonRuntimeLaunch(VernonLoadedKernel *kernel,
     driver.updateDescriptorSets(context->vulkanDevice,
                                 static_cast<uint32_t>(writes.size()),
                                 writes.data(), 0, nullptr);
-
     VkCommandBufferAllocateInfo commandInfo{
         VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     commandInfo.commandPool = context->vulkanCommandPool;
@@ -2110,7 +1830,7 @@ VernonStatus vernonRuntimeLaunch(VernonLoadedKernel *kernel,
     driver.cmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                                  kernel->vulkanPipelineLayout, 0, 1,
                                  &descriptorSet, 0, nullptr);
-    uint32_t *workgroup = kernel->reflection.workgroup;
+    const uint32_t *workgroup = kernel->reflection.workgroup;
     driver.cmdDispatch(commandBuffer,
                        (globalSize.x + workgroup[0] - 1) / workgroup[0],
                        (globalSize.y + workgroup[1] - 1) / workgroup[1],
@@ -2123,401 +1843,1047 @@ VernonStatus vernonRuntimeLaunch(VernonLoadedKernel *kernel,
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &commandBuffer;
-    if (vulkanFail(context,
+    const bool submitted =
+        vulkanFail(context,
                    driver.queueSubmit(context->vulkanQueue, 1, &submit,
                                       VK_NULL_HANDLE),
-                   "vkQueueSubmit") != VERNON_STATUS_OK ||
+                   "vkQueueSubmit") == VERNON_STATUS_OK &&
         vulkanFail(context, driver.queueWaitIdle(context->vulkanQueue),
-                   "vkQueueWaitIdle") != VERNON_STATUS_OK) {
-      cleanup();
-      return VERNON_STATUS_INTERNAL_ERROR;
-    }
+                   "vkQueueWaitIdle") == VERNON_STATUS_OK;
     cleanup();
-    return VERNON_STATUS_OK;
+    return submitted ? VERNON_STATUS_OK : VERNON_STATUS_INTERNAL_ERROR;
   }
 #endif
+  if (kernel->context->backend != VERNON_RUNTIME_CPU)
+    return fail(kernel->context, "compute backend is unsupported",
+                VERNON_STATUS_UNSUPPORTED_TARGET);
 
-#if defined(VERNON_HAS_CUDA_RUNTIME)
-  struct CudaMemRefDescriptor {
-    CudaDevicePointer allocated;
-    CudaDevicePointer aligned;
-    uint64_t offset;
-    uint64_t size;
-    uint64_t stride;
-  };
-  std::vector<CudaMemRefDescriptor> descriptors;
-  std::vector<void *> parameters;
-  descriptors.reserve(argumentCount);
-  parameters.reserve(argumentCount * 5);
-  size_t suppliedIndex = 0;
+  std::vector<unsigned char> packed(kernel->reflection.cpuArgumentsSize);
+  size_t supplied = 0;
   for (const ReflectedArgument &reflected : kernel->reflection.arguments) {
     if (reflected.kind == "builtin")
       continue;
-    const VernonLaunchArgument &argument = arguments[suppliedIndex++];
-    if (argument.kind == VERNON_LAUNCH_TENSOR) {
-      if (!argument.buffer || argument.buffer->context != kernel->context)
-        return fail(kernel->context, "invalid CUDA Tensor argument");
-      descriptors.push_back(
-          {argument.buffer->device, argument.buffer->device, 0,
-           reflected.tensorElements
-               ? reflected.tensorElements
-               : argument.buffer->size /
-                     std::max(reflected.tensorElementSize, size_t{1}),
-           1});
-      CudaMemRefDescriptor &descriptor = descriptors.back();
-      parameters.push_back(&descriptor.allocated);
-      parameters.push_back(&descriptor.aligned);
-      parameters.push_back(&descriptor.offset);
-      parameters.push_back(&descriptor.size);
-      parameters.push_back(&descriptor.stride);
+    const VernonLaunchArgument &argument = arguments[supplied++];
+    if (reflected.kind == "tensor") {
+      if (argument.kind != VERNON_LAUNCH_TENSOR || !argument.buffer ||
+          argument.buffer->context != kernel->context ||
+          reflected.cpuSize != sizeof(uintptr_t) ||
+          (reflected.tensorBytes &&
+           argument.buffer->size < reflected.tensorBytes) ||
+          argument.buffer->alignment < reflected.alignment)
+        return fail(kernel->context, "invalid CPU Tensor launch argument");
+      const uintptr_t pointer =
+          reinterpret_cast<uintptr_t>(argument.buffer->host.data());
+      std::memcpy(packed.data() + reflected.cpuOffset, &pointer,
+                  sizeof(pointer));
     } else {
-      if (!argument.scalar_data || !argument.scalar_size)
-        return fail(kernel->context, "invalid CUDA scalar argument");
-      parameters.push_back(const_cast<void *>(argument.scalar_data));
+      if (argument.kind != VERNON_LAUNCH_SCALAR || !argument.scalar_data ||
+          argument.scalar_size != reflected.cpuSize)
+        return fail(kernel->context, "invalid CPU scalar launch argument");
+      std::memcpy(packed.data() + reflected.cpuOffset, argument.scalar_data,
+                  argument.scalar_size);
     }
   }
-  uint32_t *workgroup = kernel->reflection.workgroup;
-  return cudaFail(kernel->context,
-                  cudaDriver().launchKernel(
-                      kernel->cudaFunction,
-                      (globalSize.x + workgroup[0] - 1) / workgroup[0],
-                      (globalSize.y + workgroup[1] - 1) / workgroup[1],
-                      (globalSize.z + workgroup[2] - 1) / workgroup[2],
-                      workgroup[0], workgroup[1], workgroup[2], 0, nullptr,
-                      parameters.data(), nullptr),
-                  "cuLaunchKernel");
-#else
-  return fail(kernel->context, "CUDA runtime support is not built",
-              VERNON_STATUS_UNSUPPORTED_TARGET);
-#endif
-}
-
-VernonLoadedProgram *
-vernonRuntimeProgramLoadGraphics(VernonRuntimeContext *context,
-                                 VernonGraphicsStageArtifact vertex,
-                                 VernonGraphicsStageArtifact fragment) {
-  if (!context || !vertex.data || !vertex.size || !fragment.data ||
-      !fragment.size)
-    return nullptr;
-  if (context->backend != VERNON_RUNTIME_OPENGL &&
-      context->backend != VERNON_RUNTIME_OPENGL_ES) {
-    fail(context, "graphics programs are currently supported by OpenGL only",
-         VERNON_STATUS_UNSUPPORTED_TARGET);
-    return nullptr;
-  }
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-  glfwMakeContextCurrent(context->openGLWindow);
-  OpenGLDriver &driver = openGLDriver();
-  auto compileStage = [&](GlEnum stage, VernonGraphicsStageArtifact artifact,
-                          const char *name) -> GlUint {
-    GlUint shader = driver.createShader(stage);
-    const GlChar *source = static_cast<const GlChar *>(artifact.data);
-    GlInt length = static_cast<GlInt>(artifact.size);
-    driver.shaderSource(shader, 1, &source, &length);
-    driver.compileShader(shader);
-    GlInt compiled = 0;
-    driver.getShaderiv(shader, kGlCompileStatus, &compiled);
-    if (!compiled) {
-      context->error =
-          std::string("OpenGL ") + name +
-          " shader compilation failed: " + getOpenGLShaderLog(driver, shader);
-      driver.deleteShader(shader);
-      return 0;
-    }
-    return shader;
-  };
-  GlUint vertexShader = compileStage(kGlVertexShader, vertex, "vertex");
-  if (!vertexShader)
-    return nullptr;
-  GlUint fragmentShader = compileStage(kGlFragmentShader, fragment, "fragment");
-  if (!fragmentShader) {
-    driver.deleteShader(vertexShader);
-    return nullptr;
-  }
-  auto program = std::make_unique<VernonLoadedProgram>();
-  program->context = context;
-  program->openGLProgram = driver.createProgram();
-  driver.attachShader(program->openGLProgram, vertexShader);
-  driver.attachShader(program->openGLProgram, fragmentShader);
-  driver.linkProgram(program->openGLProgram);
-  driver.deleteShader(vertexShader);
-  driver.deleteShader(fragmentShader);
-  GlInt linked = 0;
-  driver.getProgramiv(program->openGLProgram, kGlLinkStatus, &linked);
-  if (!linked) {
-    context->error = "OpenGL graphics program link failed: " +
-                     getOpenGLProgramLog(driver, program->openGLProgram);
-    driver.deleteProgram(program->openGLProgram);
-    return nullptr;
-  }
-  driver.genVertexArrays(1, &program->openGLVertexArray);
-  driver.genFramebuffers(1, &program->openGLFramebuffer);
-  ++context->livePrograms;
-  return program.release();
-#else
-  return nullptr;
-#endif
-}
-
-VernonStatus vernonRuntimeProgramUnload(VernonLoadedProgram *program) {
-  if (!program)
-    return VERNON_STATUS_OK;
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-  glfwMakeContextCurrent(program->context->openGLWindow);
-  OpenGLDriver &driver = openGLDriver();
-  if (program->openGLFramebuffer)
-    driver.deleteFramebuffers(1, &program->openGLFramebuffer);
-  if (program->openGLVertexArray)
-    driver.deleteVertexArrays(1, &program->openGLVertexArray);
-  if (program->openGLProgram)
-    driver.deleteProgram(program->openGLProgram);
-#endif
-  --program->context->livePrograms;
-  delete program;
+  for (uint32_t z = 0; z < globalSize.z; ++z)
+    for (uint32_t y = 0; y < globalSize.y; ++y)
+      for (uint32_t x = 0; x < globalSize.x; ++x) {
+        const uint32_t id[3]{x, y, z};
+        for (const ReflectedArgument &reflected : kernel->reflection.arguments)
+          if (reflected.kind == "builtin" &&
+              reflected.builtin == "global_invocation_id")
+            std::memcpy(packed.data() + reflected.cpuOffset, id,
+                        std::min(reflected.cpuSize, sizeof(id)));
+        VernonCpuInvocation invocation{packed.data(), packed.size(), nullptr, 0,
+                                       nullptr};
+        const VernonStatus status = kernel->cpuEntry(&invocation);
+        if (status != VERNON_STATUS_OK)
+          return fail(kernel->context, "CPU AOT entry invocation failed",
+                      status);
+      }
   return VERNON_STATUS_OK;
 }
 
-VernonStatus vernonRuntimeDraw(VernonLoadedProgram *program,
-                               const VernonDrawDescription *description) {
-  constexpr size_t legacyDrawSize =
-      offsetof(VernonDrawDescription, index_binding);
-  if (!program || !description || description->struct_size < legacyDrawSize ||
-      !description->instance_count ||
-      (description->binding_count && !description->bindings) ||
-      (description->uniform_count && !description->uniforms))
-    return fail(program ? program->context : nullptr,
-                "invalid graphics draw description");
-  auto hasField = [&](size_t offset, size_t size) {
-    return description->struct_size >= offset + size;
-  };
-  const VernonIndexBinding *indexBinding =
-      hasField(offsetof(VernonDrawDescription, index_binding),
-               sizeof(description->index_binding))
-          ? description->index_binding
-          : nullptr;
-  const VernonColorAttachment *colorAttachments =
-      hasField(offsetof(VernonDrawDescription, color_attachments),
-               sizeof(description->color_attachments))
-          ? description->color_attachments
-          : nullptr;
-  const size_t colorAttachmentCount =
-      hasField(offsetof(VernonDrawDescription, color_attachment_count),
-               sizeof(description->color_attachment_count))
-          ? description->color_attachment_count
-          : 0;
-  const VernonPrimitiveTopology topology =
-      hasField(offsetof(VernonDrawDescription, topology),
-               sizeof(description->topology))
-          ? description->topology
-          : VERNON_TOPOLOGY_TRIANGLE_LIST;
-  if ((colorAttachmentCount && !colorAttachments) ||
-      (!colorAttachmentCount && !description->target))
-    return fail(program->context, "graphics draw requires a color attachment");
-  std::vector<VernonColorAttachment> normalizedAttachments;
-  if (colorAttachmentCount) {
-    normalizedAttachments.assign(colorAttachments,
-                                 colorAttachments + colorAttachmentCount);
-  } else {
-    normalizedAttachments.push_back({0, description->target});
+VernonPipelineBundle *
+vernonRuntimeLoadPipelineBundle(VernonRuntimeContext *context,
+                                const void *bundleData, size_t bundleSize) {
+  if (!context ||
+      (context->backend != VERNON_RUNTIME_OPENGL &&
+       context->backend != VERNON_RUNTIME_OPENGL_ES &&
+       context->backend != VERNON_RUNTIME_VULKAN) ||
+      !bundleData || !bundleSize)
+    return nullptr;
+  try {
+    const nlohmann::json root = nlohmann::json::parse(
+        static_cast<const char *>(bundleData),
+        static_cast<const char *>(bundleData) + bundleSize, nullptr, false);
+    const char *expectedTarget =
+        context->backend == VERNON_RUNTIME_VULKAN
+            ? "vulkan"
+            : (context->backend == VERNON_RUNTIME_OPENGL_ES ? "opengles"
+                                                            : "opengl");
+    if (root.is_discarded() || !root.is_object() ||
+        root.value("pipeline_bundle_schema_version", 0) != 1 ||
+        root.value("invocation_abi_version", 0) !=
+            VERNON_PIPELINE_INVOCATION_ABI_VERSION ||
+        root.value("type", "") != "vernon_pipeline_bundle" ||
+        root.value("target", "") != expectedTarget ||
+        !root.contains("stage_artifacts") ||
+        !root["stage_artifacts"].is_object() || !root.contains("variants") ||
+        !root["variants"].is_array()) {
+      fail(context, "unsupported or invalid pipeline bundle");
+      return nullptr;
+    }
+    auto bundle = std::make_unique<VernonPipelineBundle>();
+    bundle->context = context;
+    bundle->id = root.value("id", "");
+    for (const nlohmann::json &feature :
+         root.value("features", nlohmann::json::array()))
+      bundle->features.push_back(feature.get<std::string>());
+    for (const auto &[id, value] : root["stage_artifacts"].items()) {
+      Stage stage;
+      stage.stage = value.value("stage", "");
+      stage.entry = value.value("entry", "");
+      stage.source = value.value("source", "");
+      if (value.contains("reflection") &&
+          value["reflection"].contains("entries")) {
+        stage.reflection = value["reflection"].dump();
+        for (const nlohmann::json &entry : value["reflection"]["entries"]) {
+          if (entry.value("name", "") != stage.entry)
+            continue;
+          const auto workgroup =
+              entry.value("workgroup_size", nlohmann::json::array());
+          if (workgroup.size() == 3)
+            for (size_t index = 0; index < 3; ++index) {
+              stage.workgroup[index] = workgroup[index].get<uint32_t>();
+              if (!stage.workgroup[index]) {
+                fail(context, "compute workgroup dimensions must be non-zero");
+                return nullptr;
+              }
+            }
+        }
+      }
+      if (context->backend == VERNON_RUNTIME_VULKAN &&
+          value.contains("artifact") && value["artifact"].is_object()) {
+        const nlohmann::json &artifact = value["artifact"];
+        if (artifact.value("format", "") == "spirv" &&
+            artifact.value("encoding", "") == "base64") {
+          stage.binary = decodeBase64(artifact.value("data", ""));
+          if (vernon::runtime::sha256Hex(stage.binary.data(),
+                                         stage.binary.size()) !=
+              artifact.value("sha256", ""))
+            stage.binary.clear();
+        }
+      }
+      const bool hasArtifact =
+          context->backend == VERNON_RUNTIME_VULKAN
+              ? !stage.binary.empty() &&
+                    stage.binary.size() % sizeof(uint32_t) == 0 &&
+                    !stage.reflection.empty()
+              : !stage.source.empty();
+      if (stage.stage.empty() || stage.entry.empty() || !hasArtifact) {
+        fail(context, "pipeline stage artifact is invalid");
+        return nullptr;
+      }
+      bundle->stages.emplace(id, std::move(stage));
+    }
+    for (const nlohmann::json &value : root["variants"]) {
+      Variant variant;
+      if (!parseVariant(value, variant, context->error))
+        return nullptr;
+      auto validStage = [&](const std::string &id, const char *kind) {
+        if (id.empty())
+          return true;
+        const auto found = bundle->stages.find(id);
+        return found != bundle->stages.end() && found->second.stage == kind;
+      };
+      if (!validStage(variant.compute, "compute") ||
+          !validStage(variant.vertex, "vertex") ||
+          !validStage(variant.fragment, "fragment")) {
+        fail(context, "pipeline variant references an invalid stage");
+        return nullptr;
+      }
+      bundle->variants.push_back(std::move(variant));
+    }
+    std::sort(bundle->variants.begin(), bundle->variants.end(),
+              [](const Variant &left, const Variant &right) {
+                return left.key < right.key;
+              });
+    if (std::adjacent_find(bundle->variants.begin(), bundle->variants.end(),
+                           [](const Variant &left, const Variant &right) {
+                             return left.key == right.key;
+                           }) != bundle->variants.end()) {
+      fail(context, "pipeline bundle contains duplicate feature variants");
+      return nullptr;
+    }
+    if (bundle->id.empty() || bundle->variants.empty())
+      return nullptr;
+    ++context->liveBundles;
+    return bundle.release();
+  } catch (const nlohmann::json::exception &error) {
+    fail(context, std::string("invalid pipeline bundle: ") + error.what());
+    return nullptr;
+  } catch (const std::exception &error) {
+    fail(context,
+         std::string("failed to load pipeline bundle: ") + error.what(),
+         VERNON_STATUS_INTERNAL_ERROR);
+    return nullptr;
+  } catch (...) {
+    fail(context, "failed to load pipeline bundle",
+         VERNON_STATUS_INTERNAL_ERROR);
+    return nullptr;
   }
+}
+
+VernonStringView
+vernonRuntimePipelineBundleGetId(const VernonPipelineBundle *bundle) {
+  return bundle ? VernonStringView{bundle->id.data(), bundle->id.size()}
+                : VernonStringView{nullptr, 0};
+}
+
+void vernonRuntimePipelineBundleDestroy(VernonPipelineBundle *bundle) {
+  if (!bundle)
+    return;
+  --bundle->context->liveBundles;
+  delete bundle;
+}
+
+VernonLoadedPipeline *
+vernonRuntimeResolvePipeline(VernonPipelineBundle *bundle,
+                             VernonFeatureSetView features) {
+  if (!bundle || (features.count && !features.names))
+    return nullptr;
+  std::vector<std::string> key;
+  for (size_t index = 0; index < features.count; ++index) {
+    if (!features.names[index])
+      return nullptr;
+    key.emplace_back(features.names[index]);
+  }
+  std::sort(key.begin(), key.end());
+  const auto found =
+      std::find_if(bundle->variants.begin(), bundle->variants.end(),
+                   [&](const Variant &variant) { return variant.key == key; });
+  if (found == bundle->variants.end()) {
+    fail(bundle->context, "pipeline bundle has no exact feature variant");
+    return nullptr;
+  }
+  auto pipeline = std::make_unique<VernonLoadedPipeline>();
+  pipeline->context = bundle->context;
+  pipeline->variant = *found;
+  if (bundle->context->backend == VERNON_RUNTIME_VULKAN) {
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+    if (!found->compute.empty()) {
+      const Stage &stage = bundle->stages.at(found->compute);
+      pipeline->vulkanCompute = vernonRuntimeLoadArtifact(
+          bundle->context, stage.binary.data(), stage.binary.size(),
+          stage.reflection.data(), stage.reflection.size(), stage.entry.data(),
+          stage.entry.size());
+      if (!pipeline->vulkanCompute)
+        return nullptr;
+    }
+    if (!found->vertex.empty()) {
+      const Stage &vertex = bundle->stages.at(found->vertex);
+      const Stage &fragment = bundle->stages.at(found->fragment);
+      vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
+      auto createModule = [&](const Stage &stage, VkShaderModule &module) {
+        VkShaderModuleCreateInfo info{
+            VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        info.codeSize = stage.binary.size();
+        info.pCode = reinterpret_cast<const uint32_t *>(stage.binary.data());
+        return vulkanFail(
+                   bundle->context,
+                   driver.createShaderModule(bundle->context->vulkanDevice,
+                                             &info, nullptr, &module),
+                   "vkCreateShaderModule") == VERNON_STATUS_OK;
+      };
+      if (!createModule(vertex, pipeline->vulkanVertex) ||
+          !createModule(fragment, pipeline->vulkanFragment)) {
+        if (pipeline->vulkanCompute)
+          vernonRuntimeKernelUnload(pipeline->vulkanCompute);
+        if (pipeline->vulkanVertex)
+          driver.destroyShaderModule(bundle->context->vulkanDevice,
+                                     pipeline->vulkanVertex, nullptr);
+        return nullptr;
+      }
+      pipeline->vulkanVertexEntry = vertex.entry;
+      pipeline->vulkanFragmentEntry = fragment.entry;
+    }
+    ++bundle->context->livePipelines;
+    return pipeline.release();
+#else
+    return nullptr;
+#endif
+  }
+  makeCurrent(bundle->context);
+  if (!found->compute.empty()) {
+    const Stage &stage = bundle->stages.at(found->compute);
+    std::copy(std::begin(stage.workgroup), std::end(stage.workgroup),
+              std::begin(pipeline->workgroup));
+    const GlUint shader =
+        compileShader(bundle->context, kComputeShader, stage.source);
+    if (!shader)
+      return nullptr;
+    pipeline->computeProgram = linkProgram(bundle->context, {shader});
+    if (!pipeline->computeProgram)
+      return nullptr;
+  }
+  if (!found->vertex.empty()) {
+    const GlUint vertex =
+        compileShader(bundle->context, kVertexShader,
+                      bundle->stages.at(found->vertex).source);
+    const GlUint fragment =
+        compileShader(bundle->context, kFragmentShader,
+                      bundle->stages.at(found->fragment).source);
+    if (!vertex || !fragment) {
+      if (vertex)
+        bundle->context->gl.deleteShader(vertex);
+      if (fragment)
+        bundle->context->gl.deleteShader(fragment);
+      return nullptr;
+    }
+    pipeline->graphicsProgram =
+        linkProgram(bundle->context, {vertex, fragment});
+    if (!pipeline->graphicsProgram)
+      return nullptr;
+    bundle->context->gl.genVertexArrays(1, &pipeline->vertexArray);
+    bundle->context->gl.genFramebuffers(1, &pipeline->framebuffer);
+  }
+  ++bundle->context->livePipelines;
+  return pipeline.release();
+}
+
+void vernonRuntimeLoadedPipelineDestroy(VernonLoadedPipeline *pipeline) {
+  if (!pipeline)
+    return;
+  if (pipeline->context->backend == VERNON_RUNTIME_VULKAN) {
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+    vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
+    driver.deviceWaitIdle(pipeline->context->vulkanDevice);
+    if (pipeline->vulkanCompute)
+      vernonRuntimeKernelUnload(pipeline->vulkanCompute);
+    if (pipeline->vulkanVertex)
+      driver.destroyShaderModule(pipeline->context->vulkanDevice,
+                                 pipeline->vulkanVertex, nullptr);
+    if (pipeline->vulkanFragment)
+      driver.destroyShaderModule(pipeline->context->vulkanDevice,
+                                 pipeline->vulkanFragment, nullptr);
+#endif
+    --pipeline->context->livePipelines;
+    delete pipeline;
+    return;
+  }
+  makeCurrent(pipeline->context);
+  OpenGLDriver &gl = pipeline->context->gl;
+  if (pipeline->framebuffer)
+    gl.deleteFramebuffers(1, &pipeline->framebuffer);
+  if (pipeline->vertexArray)
+    gl.deleteVertexArrays(1, &pipeline->vertexArray);
+  if (pipeline->graphicsProgram)
+    gl.deleteProgram(pipeline->graphicsProgram);
+  if (pipeline->computeProgram)
+    gl.deleteProgram(pipeline->computeProgram);
+  --pipeline->context->livePipelines;
+  delete pipeline;
+}
+
+VernonStatus
+vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
+                            const VernonPipelineInvocation *invocation) {
+  if (!pipeline || !invocation ||
+      invocation->struct_size < sizeof(VernonPipelineInvocation) ||
+      invocation->abi_version != VERNON_PIPELINE_INVOCATION_ABI_VERSION ||
+      (invocation->argument_count && !invocation->arguments))
+    return fail(pipeline ? pipeline->context : nullptr,
+                "invalid pipeline invocation");
+  std::unordered_map<uint32_t, const VernonPipelineArgument *> arguments;
+  for (size_t index = 0; index < invocation->argument_count; ++index)
+    if (!arguments
+             .emplace(invocation->arguments[index].slot,
+                      &invocation->arguments[index])
+             .second)
+      return fail(pipeline->context, "duplicate pipeline argument slot");
+  if (arguments.size() != pipeline->variant.parameters.size())
+    return fail(pipeline->context,
+                "pipeline argument count does not match layout");
+  for (const Parameter &parameter : pipeline->variant.parameters) {
+    const auto found = arguments.find(parameter.slot);
+    if (found == arguments.end() ||
+        !argumentKindMatches(parameter, *found->second))
+      return fail(pipeline->context,
+                  "pipeline argument kind does not match layout");
+  }
+
+  if (pipeline->context->backend == VERNON_RUNTIME_VULKAN) {
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+    if (pipeline->vulkanCompute) {
+      struct IndexedArgument {
+        uint32_t index;
+        VernonLaunchArgument argument;
+      };
+      std::vector<IndexedArgument> indexed;
+      for (const Parameter &parameter : pipeline->variant.parameters) {
+        const VernonPipelineArgument &supplied = *arguments.at(parameter.slot);
+        for (const ParameterUse &use : parameter.uses) {
+          if (use.stage != "compute")
+            continue;
+          VernonLaunchArgument argument{};
+          if (supplied.kind == VERNON_PIPELINE_TENSOR) {
+            if (!supplied.tensor.buffer ||
+                supplied.tensor.buffer->context != pipeline->context ||
+                supplied.tensor.byte_offset != 0)
+              return fail(pipeline->context,
+                          "Vulkan compute Tensor view is invalid");
+            argument.kind = VERNON_LAUNCH_TENSOR;
+            argument.buffer = supplied.tensor.buffer;
+          } else if (supplied.kind == VERNON_PIPELINE_INLINE_VALUE) {
+            argument.kind = VERNON_LAUNCH_SCALAR;
+            argument.scalar_data = supplied.inline_value.data;
+            argument.scalar_size = supplied.inline_value.data_size;
+          } else {
+            return fail(pipeline->context,
+                        "Vulkan compute argument kind is unsupported");
+          }
+          indexed.push_back({use.index, argument});
+        }
+      }
+      std::sort(indexed.begin(), indexed.end(),
+                [](const IndexedArgument &left, const IndexedArgument &right) {
+                  return left.index < right.index;
+                });
+      std::vector<VernonLaunchArgument> launchArguments;
+      for (const IndexedArgument &value : indexed)
+        launchArguments.push_back(value.argument);
+      VernonLaunchSize grid = invocation->compute_grid;
+      if (!grid.x || !grid.y || !grid.z) {
+        for (const auto &[slot, argument] : arguments) {
+          (void)slot;
+          if (argument->kind != VERNON_PIPELINE_TENSOR ||
+              !argument->tensor.rank || !argument->tensor.shape)
+            continue;
+          grid = {1, 1, 1};
+          const uint32_t rank = argument->tensor.rank;
+          grid.x = static_cast<uint32_t>(argument->tensor.shape[rank - 1]);
+          if (rank > 1)
+            grid.y = static_cast<uint32_t>(argument->tensor.shape[rank - 2]);
+          if (rank > 2)
+            grid.z = static_cast<uint32_t>(argument->tensor.shape[rank - 3]);
+          break;
+        }
+      }
+      const VernonStatus status =
+          vernonRuntimeLaunch(pipeline->vulkanCompute, grid,
+                              launchArguments.data(), launchArguments.size());
+      if (status != VERNON_STATUS_OK)
+        return status;
+    }
+    if (!pipeline->vulkanVertex)
+      return VERNON_STATUS_OK;
+    if (!invocation->color_attachment_count || !invocation->color_attachments)
+      return fail(pipeline->context,
+                  "Vulkan graphics pipeline requires color attachments");
+
+    std::vector<VkVertexInputBindingDescription> bindingDescriptions;
+    std::vector<VkVertexInputAttributeDescription> attributeDescriptions;
+    std::vector<VkBuffer> vertexBuffers;
+    std::vector<VkDeviceSize> vertexOffsets;
+    struct PushConstantValue {
+      uint32_t slot;
+      const void *data;
+      uint32_t size;
+      VkShaderStageFlags stages;
+    };
+    std::vector<PushConstantValue> pushConstants;
+    uint32_t vertexCount = invocation->vertex_count;
+    uint32_t instanceCount = invocation->instance_count;
+    for (const Parameter &parameter : pipeline->variant.parameters) {
+      const VernonPipelineArgument &argument = *arguments.at(parameter.slot);
+      for (const ParameterUse &use : parameter.uses) {
+        if (use.stage != "vertex" && use.stage != "fragment")
+          continue;
+        if (use.interfaceKind == "uniform") {
+          if (use.binding != UINT32_MAX)
+            return fail(pipeline->context,
+                        "Vulkan descriptor uniforms are not implemented",
+                        VERNON_STATUS_UNSUPPORTED_TARGET);
+          if (argument.kind != VERNON_PIPELINE_INLINE_VALUE ||
+              !argument.inline_value.data || !argument.inline_value.data_size ||
+              argument.inline_value.data_size > 128 ||
+              argument.inline_value.data_size % sizeof(uint32_t) != 0)
+            return fail(pipeline->context,
+                        "Vulkan push constant value is invalid");
+          const VkShaderStageFlags stage = use.stage == "vertex"
+                                               ? VK_SHADER_STAGE_VERTEX_BIT
+                                               : VK_SHADER_STAGE_FRAGMENT_BIT;
+          auto existing =
+              std::find_if(pushConstants.begin(), pushConstants.end(),
+                           [&](const PushConstantValue &value) {
+                             return value.slot == parameter.slot;
+                           });
+          if (existing != pushConstants.end()) {
+            existing->stages |= stage;
+          } else {
+            if (std::any_of(pushConstants.begin(), pushConstants.end(),
+                            [&](const PushConstantValue &value) {
+                              return (value.stages & stage) != 0;
+                            }))
+              return fail(
+                  pipeline->context,
+                  "Vulkan supports one push-constant parameter per stage",
+                  VERNON_STATUS_UNSUPPORTED_TARGET);
+            pushConstants.push_back(
+                {parameter.slot, argument.inline_value.data,
+                 static_cast<uint32_t>(argument.inline_value.data_size),
+                 stage});
+          }
+          continue;
+        }
+        if (use.interfaceKind != "input" && use.interfaceKind != "instance")
+          continue;
+        if (argument.kind != VERNON_PIPELINE_TENSOR ||
+            argument.tensor.dtype != VERNON_DATA_F32 ||
+            !argument.tensor.buffer ||
+            argument.tensor.buffer->context != pipeline->context ||
+            !argument.tensor.rank || !argument.tensor.shape ||
+            !argument.tensor.byte_strides || use.location == UINT32_MAX)
+          return fail(pipeline->context,
+                      "Vulkan graphics Tensor view is invalid");
+        uint32_t components = 1;
+        for (uint32_t dimension = 1; dimension < argument.tensor.rank;
+             ++dimension)
+          components *= static_cast<uint32_t>(argument.tensor.shape[dimension]);
+        const uint32_t leading =
+            static_cast<uint32_t>(argument.tensor.shape[0]);
+        const bool instanced =
+            use.interfaceKind == "instance" || use.divisor != 0;
+        uint32_t &inferred = instanced ? instanceCount : vertexCount;
+        if (inferred && inferred != leading)
+          return fail(pipeline->context,
+                      "Vulkan graphics Tensor leading dimensions conflict");
+        inferred = leading;
+        const uint32_t binding =
+            static_cast<uint32_t>(bindingDescriptions.size());
+        bindingDescriptions.push_back(
+            {binding, static_cast<uint32_t>(argument.tensor.byte_strides[0]),
+             instanced ? VK_VERTEX_INPUT_RATE_INSTANCE
+                       : VK_VERTEX_INPUT_RATE_VERTEX});
+        vertexBuffers.push_back(argument.tensor.buffer->vulkanBuffer);
+        vertexOffsets.push_back(argument.tensor.byte_offset);
+        if (components <= 4) {
+          attributeDescriptions.push_back(
+              {use.location, binding, vulkanVertexFormat(components), 0});
+        } else if (argument.tensor.rank == 3 && argument.tensor.shape[2] <= 4) {
+          const uint32_t columns =
+              static_cast<uint32_t>(argument.tensor.shape[1]);
+          const uint32_t rows = static_cast<uint32_t>(argument.tensor.shape[2]);
+          for (uint32_t column = 0; column < columns; ++column)
+            attributeDescriptions.push_back({use.location + column, binding,
+                                             vulkanVertexFormat(rows),
+                                             column * rows * sizeof(float)});
+        } else {
+          return fail(pipeline->context,
+                      "Vulkan vertex attribute shape is unsupported");
+        }
+      }
+    }
+    if (!vertexCount || !instanceCount)
+      return fail(pipeline->context,
+                  "Vulkan graphics draw counts cannot be inferred");
+    if (invocation->index_binding &&
+        (!invocation->index_binding->buffer ||
+         invocation->index_binding->buffer->context != pipeline->context ||
+         invocation->index_binding->type != VERNON_INDEX_U32 ||
+         !invocation->index_binding->index_count))
+      return fail(pipeline->context, "Vulkan index binding is invalid");
+
+    std::vector<const VernonColorAttachment *> attachments;
+    for (size_t index = 0; index < invocation->color_attachment_count;
+         ++index) {
+      const VernonColorAttachment &attachment =
+          invocation->color_attachments[index];
+      if (!attachment.texture ||
+          attachment.texture->context != pipeline->context)
+        return fail(pipeline->context, "Vulkan render target is invalid");
+      attachments.push_back(&attachment);
+    }
+    std::sort(attachments.begin(), attachments.end(),
+              [](const VernonColorAttachment *left,
+                 const VernonColorAttachment *right) {
+                return left->location < right->location;
+              });
+    const uint32_t width = attachments.front()->texture->width;
+    const uint32_t height = attachments.front()->texture->height;
+    const uint32_t maximumLocation = attachments.back()->location;
+    std::vector<VkAttachmentDescription> attachmentDescriptions;
+    std::vector<VkAttachmentReference> attachmentReferences(
+        maximumLocation + 1,
+        {VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL});
+    std::vector<VkImageView> imageViews;
+    for (size_t index = 0; index < attachments.size(); ++index) {
+      if (attachments[index]->texture->width != width ||
+          attachments[index]->texture->height != height)
+        return fail(pipeline->context, "Vulkan render target extents differ");
+      VkAttachmentDescription description{};
+      description.format = VK_FORMAT_R8G8B8A8_UNORM;
+      description.samples = VK_SAMPLE_COUNT_1_BIT;
+      description.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+      description.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      description.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      description.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      attachmentDescriptions.push_back(description);
+      attachmentReferences[attachments[index]->location] = {
+          static_cast<uint32_t>(index),
+          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+      imageViews.push_back(attachments[index]->texture->vulkanView);
+    }
+
+    VernonRuntimeContext *context = pipeline->context;
+    vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
+    VkRenderPass renderPass = VK_NULL_HANDLE;
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    VkPipeline graphicsPipeline = VK_NULL_HANDLE;
+    VkFramebuffer framebuffer = VK_NULL_HANDLE;
+    auto cleanup = [&] {
+      if (framebuffer)
+        driver.destroyFramebuffer(context->vulkanDevice, framebuffer, nullptr);
+      if (graphicsPipeline)
+        driver.destroyPipeline(context->vulkanDevice, graphicsPipeline,
+                               nullptr);
+      if (pipelineLayout)
+        driver.destroyPipelineLayout(context->vulkanDevice, pipelineLayout,
+                                     nullptr);
+      if (renderPass)
+        driver.destroyRenderPass(context->vulkanDevice, renderPass, nullptr);
+    };
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount =
+        static_cast<uint32_t>(attachmentReferences.size());
+    subpass.pColorAttachments = attachmentReferences.data();
+    VkRenderPassCreateInfo renderPassInfo{
+        VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    renderPassInfo.attachmentCount =
+        static_cast<uint32_t>(attachmentDescriptions.size());
+    renderPassInfo.pAttachments = attachmentDescriptions.data();
+    renderPassInfo.subpassCount = 1;
+    renderPassInfo.pSubpasses = &subpass;
+    if (vulkanFail(context,
+                   driver.createRenderPass(context->vulkanDevice,
+                                           &renderPassInfo, nullptr,
+                                           &renderPass),
+                   "vkCreateRenderPass") != VERNON_STATUS_OK)
+      return VERNON_STATUS_INTERNAL_ERROR;
+    VkPipelineLayoutCreateInfo layoutInfo{
+        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    std::vector<VkPushConstantRange> pushConstantRanges;
+    for (const PushConstantValue &value : pushConstants)
+      pushConstantRanges.push_back({value.stages, 0, value.size});
+    layoutInfo.pushConstantRangeCount =
+        static_cast<uint32_t>(pushConstantRanges.size());
+    layoutInfo.pPushConstantRanges = pushConstantRanges.data();
+    if (vulkanFail(context,
+                   driver.createPipelineLayout(context->vulkanDevice,
+                                               &layoutInfo, nullptr,
+                                               &pipelineLayout),
+                   "vkCreatePipelineLayout") != VERNON_STATUS_OK) {
+      cleanup();
+      return VERNON_STATUS_INTERNAL_ERROR;
+    }
+    const VkPipelineShaderStageCreateInfo shaderStages[] = {
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+         VK_SHADER_STAGE_VERTEX_BIT, pipeline->vulkanVertex,
+         pipeline->vulkanVertexEntry.c_str(), nullptr},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+         VK_SHADER_STAGE_FRAGMENT_BIT, pipeline->vulkanFragment,
+         pipeline->vulkanFragmentEntry.c_str(), nullptr}};
+    VkPipelineVertexInputStateCreateInfo vertexInput{
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vertexInput.vertexBindingDescriptionCount =
+        static_cast<uint32_t>(bindingDescriptions.size());
+    vertexInput.pVertexBindingDescriptions = bindingDescriptions.data();
+    vertexInput.vertexAttributeDescriptionCount =
+        static_cast<uint32_t>(attributeDescriptions.size());
+    vertexInput.pVertexAttributeDescriptions = attributeDescriptions.data();
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{
+        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    inputAssembly.topology = vulkanTopology(invocation->topology);
+    VkPipelineViewportStateCreateInfo viewportState{
+        VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rasterization{
+        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterization.cullMode = VK_CULL_MODE_NONE;
+    rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rasterization.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo multisample{
+        VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    std::vector<VkPipelineColorBlendAttachmentState> blendStates(
+        attachmentDescriptions.size());
+    for (auto &blend : blendStates)
+      blend.colorWriteMask =
+          VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo blend{
+        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blend.attachmentCount = static_cast<uint32_t>(blendStates.size());
+    blend.pAttachments = blendStates.data();
+    const VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT,
+                                            VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{
+        VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic.dynamicStateCount = 2;
+    dynamic.pDynamicStates = dynamicStates;
+    VkGraphicsPipelineCreateInfo pipelineInfo{
+        VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    pipelineInfo.stageCount = 2;
+    pipelineInfo.pStages = shaderStages;
+    pipelineInfo.pVertexInputState = &vertexInput;
+    pipelineInfo.pInputAssemblyState = &inputAssembly;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterization;
+    pipelineInfo.pMultisampleState = &multisample;
+    pipelineInfo.pColorBlendState = &blend;
+    pipelineInfo.pDynamicState = &dynamic;
+    pipelineInfo.layout = pipelineLayout;
+    pipelineInfo.renderPass = renderPass;
+    if (vulkanFail(context,
+                   driver.createGraphicsPipelines(
+                       context->vulkanDevice, VK_NULL_HANDLE, 1, &pipelineInfo,
+                       nullptr, &graphicsPipeline),
+                   "vkCreateGraphicsPipelines") != VERNON_STATUS_OK) {
+      cleanup();
+      return VERNON_STATUS_INTERNAL_ERROR;
+    }
+    VkFramebufferCreateInfo framebufferInfo{
+        VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    framebufferInfo.renderPass = renderPass;
+    framebufferInfo.attachmentCount = static_cast<uint32_t>(imageViews.size());
+    framebufferInfo.pAttachments = imageViews.data();
+    framebufferInfo.width = width;
+    framebufferInfo.height = height;
+    framebufferInfo.layers = 1;
+    if (vulkanFail(context,
+                   driver.createFramebuffer(context->vulkanDevice,
+                                            &framebufferInfo, nullptr,
+                                            &framebuffer),
+                   "vkCreateFramebuffer") != VERNON_STATUS_OK) {
+      cleanup();
+      return VERNON_STATUS_INTERNAL_ERROR;
+    }
+    const bool submitted = submitVulkanCommands(context, [&](VkCommandBuffer
+                                                                 command) {
+      if (pipeline->variant.barrier) {
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+        driver.cmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                  VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 1,
+                                  &barrier, 0, nullptr, 0, nullptr);
+      }
+      for (const VernonColorAttachment *attachment : attachments)
+        if (attachment->texture->vulkanLayout !=
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+          transitionVulkanImage(command, attachment->texture,
+                                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+      std::vector<VkClearValue> clearValues(attachments.size());
+      VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+      begin.renderPass = renderPass;
+      begin.framebuffer = framebuffer;
+      begin.renderArea.extent = {width, height};
+      begin.clearValueCount = static_cast<uint32_t>(clearValues.size());
+      begin.pClearValues = clearValues.data();
+      driver.cmdBeginRenderPass(command, &begin, VK_SUBPASS_CONTENTS_INLINE);
+      driver.cmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                             graphicsPipeline);
+      for (const PushConstantValue &value : pushConstants)
+        driver.cmdPushConstants(command, pipelineLayout, value.stages, 0,
+                                value.size, value.data);
+      const bool hasViewport =
+          invocation->viewport[2] && invocation->viewport[3];
+      const bool hasScissor = invocation->scissor[2] && invocation->scissor[3];
+      VkViewport viewport{
+          static_cast<float>(hasViewport ? invocation->viewport[0] : 0),
+          static_cast<float>(hasViewport ? invocation->viewport[1] : 0),
+          static_cast<float>(hasViewport ? invocation->viewport[2] : width),
+          static_cast<float>(hasViewport ? invocation->viewport[3] : height),
+          0.0f,
+          1.0f};
+      VkRect2D scissor{
+          {static_cast<int32_t>(hasScissor ? invocation->scissor[0] : 0),
+           static_cast<int32_t>(hasScissor ? invocation->scissor[1] : 0)},
+          {hasScissor ? invocation->scissor[2] : width,
+           hasScissor ? invocation->scissor[3] : height}};
+      driver.cmdSetViewport(command, 0, 1, &viewport);
+      driver.cmdSetScissor(command, 0, 1, &scissor);
+      if (!vertexBuffers.empty())
+        driver.cmdBindVertexBuffers(command, 0,
+                                    static_cast<uint32_t>(vertexBuffers.size()),
+                                    vertexBuffers.data(), vertexOffsets.data());
+      if (invocation->index_binding) {
+        driver.cmdBindIndexBuffer(
+            command, invocation->index_binding->buffer->vulkanBuffer,
+            invocation->index_binding->offset, VK_INDEX_TYPE_UINT32);
+        driver.cmdDrawIndexed(command, invocation->index_binding->index_count,
+                              instanceCount, 0, 0, 0);
+      } else {
+        driver.cmdDraw(command, vertexCount, instanceCount, 0, 0);
+      }
+      driver.cmdEndRenderPass(command);
+    });
+    cleanup();
+    return submitted ? VERNON_STATUS_OK : VERNON_STATUS_INTERNAL_ERROR;
+#else
+    return VERNON_STATUS_UNSUPPORTED_TARGET;
+#endif
+  }
+
+  makeCurrent(pipeline->context);
+  OpenGLDriver &gl = pipeline->context->gl;
+  if (pipeline->computeProgram) {
+    gl.useProgram(pipeline->computeProgram);
+    std::vector<GlUint> temporaryBuffers;
+    for (const Parameter &parameter : pipeline->variant.parameters) {
+      const VernonPipelineArgument &argument = *arguments.at(parameter.slot);
+      for (const ParameterUse &use : parameter.uses) {
+        if (use.stage != "compute")
+          continue;
+        if (use.binding == UINT32_MAX)
+          return fail(pipeline->context,
+                      "compute parameter has no resource binding");
+        GlUint buffer = 0;
+        if (argument.kind == VERNON_PIPELINE_TENSOR) {
+          if (!argument.tensor.buffer ||
+              argument.tensor.buffer->context != pipeline->context ||
+              argument.tensor.byte_offset != 0)
+            return fail(pipeline->context, "compute Tensor view is invalid");
+          buffer = argument.tensor.buffer->name;
+        } else if (argument.kind == VERNON_PIPELINE_INLINE_VALUE) {
+          if (!argument.inline_value.data || !argument.inline_value.data_size)
+            return fail(pipeline->context, "compute inline value is empty");
+          gl.genBuffers(1, &buffer);
+          temporaryBuffers.push_back(buffer);
+          gl.bindBuffer(kShaderStorageBuffer, buffer);
+          gl.bufferData(kShaderStorageBuffer,
+                        static_cast<GlSizePtr>(argument.inline_value.data_size),
+                        argument.inline_value.data, kDynamicCopy);
+        } else {
+          return fail(pipeline->context,
+                      "compute textures are not supported yet");
+        }
+        gl.bindBufferBase(kShaderStorageBuffer, use.binding, buffer);
+      }
+    }
+    VernonLaunchSize grid = invocation->compute_grid;
+    if (!grid.x || !grid.y || !grid.z) {
+      for (const auto &[slot, argument] : arguments) {
+        (void)slot;
+        if (argument->kind != VERNON_PIPELINE_TENSOR ||
+            !argument->tensor.rank || !argument->tensor.shape)
+          continue;
+        grid = {1, 1, 1};
+        const uint32_t rank = argument->tensor.rank;
+        grid.x = static_cast<uint32_t>(argument->tensor.shape[rank - 1]);
+        if (rank > 1)
+          grid.y = static_cast<uint32_t>(argument->tensor.shape[rank - 2]);
+        if (rank > 2)
+          grid.z = static_cast<uint32_t>(argument->tensor.shape[rank - 3]);
+        break;
+      }
+    }
+    if (!grid.x || !grid.y || !grid.z)
+      return fail(pipeline->context, "compute grid cannot be inferred");
+    gl.dispatchCompute(
+        (grid.x + pipeline->workgroup[0] - 1) / pipeline->workgroup[0],
+        (grid.y + pipeline->workgroup[1] - 1) / pipeline->workgroup[1],
+        (grid.z + pipeline->workgroup[2] - 1) / pipeline->workgroup[2]);
+    gl.memoryBarrier(kShaderStorageBarrierBit);
+    if (!temporaryBuffers.empty())
+      gl.deleteBuffers(static_cast<GlSize>(temporaryBuffers.size()),
+                       temporaryBuffers.data());
+  }
+  if (pipeline->variant.barrier)
+    gl.memoryBarrier(kShaderStorageBarrierBit | kVertexAttribArrayBarrierBit);
+  if (!pipeline->graphicsProgram)
+    return VERNON_STATUS_OK;
+
+  gl.useProgram(pipeline->graphicsProgram);
+  gl.bindVertexArray(pipeline->vertexArray);
+  uint32_t vertexCount = invocation->vertex_count;
+  uint32_t instanceCount = invocation->instance_count;
+  for (const Parameter &parameter : pipeline->variant.parameters) {
+    const VernonPipelineArgument &argument = *arguments.at(parameter.slot);
+    for (const ParameterUse &use : parameter.uses) {
+      if (use.stage != "vertex" && use.stage != "fragment")
+        continue;
+      if (use.interfaceKind == "uniform") {
+        if (argument.kind != VERNON_PIPELINE_INLINE_VALUE ||
+            argument.inline_value.dtype != VERNON_DATA_F32 ||
+            !argument.inline_value.data ||
+            argument.inline_value.data_size % sizeof(float) != 0)
+          return fail(pipeline->context, "graphics uniform is invalid");
+        const GlInt location = gl.getUniformLocation(pipeline->graphicsProgram,
+                                                     use.uniformName.c_str());
+        if (location < 0)
+          return fail(pipeline->context,
+                      "graphics uniform location is missing");
+        const auto *data =
+            static_cast<const float *>(argument.inline_value.data);
+        const uint32_t count = static_cast<uint32_t>(
+            argument.inline_value.data_size / sizeof(float));
+        if (count == 1)
+          gl.uniform1fv(location, 1, data);
+        else if (count == 2)
+          gl.uniform2fv(location, 1, data);
+        else if (count == 3)
+          gl.uniform3fv(location, 1, data);
+        else if (count == 4)
+          gl.uniform4fv(location, 1, data);
+        else if (count == 9)
+          gl.uniformMatrix3fv(location, 1, 1, data);
+        else if (count == 16)
+          gl.uniformMatrix4fv(location, 1, 1, data);
+        else
+          return fail(pipeline->context,
+                      "graphics uniform size is unsupported");
+        continue;
+      }
+      if (use.interfaceKind != "input" && use.interfaceKind != "instance")
+        continue;
+      if (argument.kind != VERNON_PIPELINE_TENSOR ||
+          argument.tensor.dtype != VERNON_DATA_F32 || !argument.tensor.buffer ||
+          argument.tensor.buffer->context != pipeline->context ||
+          !argument.tensor.rank || !argument.tensor.shape ||
+          !argument.tensor.byte_strides || use.location == UINT32_MAX)
+        return fail(pipeline->context, "graphics Tensor view is invalid");
+      uint32_t components = 1;
+      for (uint32_t dimension = 1; dimension < argument.tensor.rank;
+           ++dimension)
+        components *= static_cast<uint32_t>(argument.tensor.shape[dimension]);
+      const uint32_t leading = static_cast<uint32_t>(argument.tensor.shape[0]);
+      const bool instanced =
+          use.interfaceKind == "instance" || use.divisor != 0;
+      uint32_t &inferred = instanced ? instanceCount : vertexCount;
+      if (inferred && inferred != leading)
+        return fail(pipeline->context,
+                    "graphics Tensor leading dimensions conflict");
+      inferred = leading;
+      gl.bindBuffer(kArrayBuffer, argument.tensor.buffer->name);
+      if (components <= 4) {
+        gl.enableVertexAttribArray(use.location);
+        gl.vertexAttribPointer(
+            use.location, static_cast<GlInt>(components), kFloat, 0,
+            static_cast<GlSize>(argument.tensor.byte_strides[0]),
+            reinterpret_cast<const void *>(argument.tensor.byte_offset));
+        gl.vertexAttribDivisor(use.location,
+                               instanced ? std::max(use.divisor, 1u) : 0);
+      } else if (argument.tensor.rank == 3 && argument.tensor.shape[2] <= 4) {
+        const uint32_t columns =
+            static_cast<uint32_t>(argument.tensor.shape[1]);
+        const uint32_t rows = static_cast<uint32_t>(argument.tensor.shape[2]);
+        for (uint32_t column = 0; column < columns; ++column) {
+          gl.enableVertexAttribArray(use.location + column);
+          gl.vertexAttribPointer(
+              use.location + column, static_cast<GlInt>(rows), kFloat, 0,
+              static_cast<GlSize>(argument.tensor.byte_strides[0]),
+              reinterpret_cast<const void *>(argument.tensor.byte_offset +
+                                             column * rows * sizeof(float)));
+          gl.vertexAttribDivisor(use.location + column,
+                                 instanced ? std::max(use.divisor, 1u) : 0);
+        }
+      } else {
+        return fail(pipeline->context,
+                    "graphics Tensor component shape is unsupported");
+      }
+    }
+  }
+  if (!vertexCount || !instanceCount)
+    return fail(pipeline->context, "graphics draw counts cannot be inferred");
+  if (!invocation->color_attachment_count || !invocation->color_attachments)
+    return fail(pipeline->context, "graphics pipeline requires targets");
+  gl.bindFramebuffer(kFramebuffer, pipeline->framebuffer);
   uint32_t width = 0;
   uint32_t height = 0;
-  std::vector<uint32_t> attachmentLocations;
-  attachmentLocations.reserve(normalizedAttachments.size());
-  for (const VernonColorAttachment &attachment : normalizedAttachments) {
-    if (!attachment.texture || attachment.texture->context != program->context)
-      return fail(program->context,
-                  "color attachment belongs to another runtime");
-    if (attachment.location >= 32)
-      return fail(program->context, "color attachment location is too large");
-    if (std::find(attachmentLocations.begin(), attachmentLocations.end(),
-                  attachment.location) != attachmentLocations.end())
-      return fail(program->context, "duplicate color attachment location");
-    attachmentLocations.push_back(attachment.location);
+  uint32_t maximumLocation = 0;
+  for (size_t index = 0; index < invocation->color_attachment_count; ++index) {
+    const VernonColorAttachment &attachment =
+        invocation->color_attachments[index];
+    if (!attachment.texture || attachment.texture->context != pipeline->context)
+      return fail(pipeline->context, "render target is invalid");
     if (!width) {
       width = attachment.texture->width;
       height = attachment.texture->height;
     } else if (width != attachment.texture->width ||
                height != attachment.texture->height) {
-      return fail(program->context,
-                  "all color attachments must have the same extent");
+      return fail(pipeline->context, "render target extents differ");
     }
+    maximumLocation = std::max(maximumLocation, attachment.location);
+    gl.framebufferTexture2D(kFramebuffer,
+                            kColorAttachment0 + attachment.location, kTexture2D,
+                            attachment.texture->name, 0);
   }
-  uint32_t elementCount = description->vertex_count;
-  if (indexBinding) {
-    if (!indexBinding->buffer ||
-        indexBinding->buffer->context != program->context ||
-        indexBinding->type != VERNON_INDEX_U32 || !indexBinding->index_count ||
-        indexBinding->offset + static_cast<size_t>(indexBinding->index_count) *
-                                   sizeof(uint32_t) >
-            indexBinding->buffer->size)
-      return fail(program->context, "invalid graphics index binding");
-    elementCount = indexBinding->index_count;
-  } else if (!elementCount) {
-    return fail(program->context, "graphics draw has no vertices");
+  std::vector<GlEnum> drawBuffers(maximumLocation + 1, kNone);
+  for (size_t index = 0; index < invocation->color_attachment_count; ++index) {
+    const uint32_t location = invocation->color_attachments[index].location;
+    drawBuffers[location] = kColorAttachment0 + location;
   }
-  if ((topology == VERNON_TOPOLOGY_TRIANGLE_LIST && elementCount % 3 != 0) ||
-      (topology == VERNON_TOPOLOGY_LINE_LIST && elementCount % 2 != 0) ||
-      (topology != VERNON_TOPOLOGY_TRIANGLE_LIST &&
-       topology != VERNON_TOPOLOGY_LINE_LIST &&
-       topology != VERNON_TOPOLOGY_POINT_LIST))
-    return fail(program->context,
-                "draw count is incompatible with primitive topology");
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-  VernonRuntimeContext *context = program->context;
-  glfwMakeContextCurrent(context->openGLWindow);
-  OpenGLDriver &driver = openGLDriver();
-  driver.useProgram(program->openGLProgram);
-  for (size_t index = 0; index < description->uniform_count; ++index) {
-    const VernonUniformBinding &uniform = description->uniforms[index];
-    if (!uniform.name || !uniform.values)
-      return fail(context, "invalid uniform binding");
-    GlInt location =
-        driver.getUniformLocation(program->openGLProgram, uniform.name);
-    if (location < 0)
-      return fail(context, std::string("graphics program has no uniform '") +
-                               uniform.name + "'");
-    switch (uniform.value_count) {
-    case 1:
-      driver.uniform1fv(location, 1, uniform.values);
-      break;
-    case 2:
-      driver.uniform2fv(location, 1, uniform.values);
-      break;
-    case 3:
-      driver.uniform3fv(location, 1, uniform.values);
-      break;
-    case 4:
-      driver.uniform4fv(location, 1, uniform.values);
-      break;
-    case 9:
-      driver.uniformMatrix3fv(location, 1, 1, uniform.values);
-      break;
-    case 16:
-      driver.uniformMatrix4fv(location, 1, 1, uniform.values);
-      break;
-    default:
-      return fail(context, "unsupported uniform component count");
-    }
-  }
-  driver.bindVertexArray(program->openGLVertexArray);
-  if (indexBinding)
-    driver.bindBuffer(kGlElementArrayBuffer,
-                      indexBinding->buffer->openGLBuffer);
-  for (size_t index = 0; index < description->binding_count; ++index) {
-    const VernonDrawBinding &binding = description->bindings[index];
-    if (!binding.buffer || binding.buffer->context != context ||
-        binding.component_count < 1 || binding.component_count > 4)
-      return fail(context, "vertex binding does not match the runtime");
-    const uint32_t stride =
-        binding.stride ? binding.stride : binding.component_count * 4;
-    const uint32_t elementCount =
-        binding.instance_divisor
-            ? (description->instance_count + binding.instance_divisor - 1) /
-                  binding.instance_divisor
-            : description->vertex_count;
-    const size_t required = binding.offset +
-                            static_cast<size_t>(stride) * (elementCount - 1) +
-                            binding.component_count * 4;
-    if (required > binding.buffer->size)
-      return fail(context, "vertex binding buffer is too small");
-    driver.bindBuffer(kGlArrayBuffer, binding.buffer->openGLBuffer);
-    driver.enableVertexAttribArray(binding.location);
-    driver.vertexAttribPointer(binding.location,
-                               static_cast<GlInt>(binding.component_count),
-                               kGlFloat, 0, static_cast<GlSize>(stride),
-                               reinterpret_cast<const void *>(binding.offset));
-    driver.vertexAttribDivisor(binding.location, binding.instance_divisor);
-  }
-  driver.bindFramebuffer(kGlFramebuffer, program->openGLFramebuffer);
-  for (uint32_t location : program->openGLAttachmentLocations)
-    if (std::find(attachmentLocations.begin(), attachmentLocations.end(),
-                  location) == attachmentLocations.end())
-      driver.framebufferTexture2D(
-          kGlFramebuffer, kGlColorAttachment0 + location, kGlTexture2D, 0, 0);
-  const uint32_t maximumLocation =
-      *std::max_element(attachmentLocations.begin(), attachmentLocations.end());
-  std::vector<GlEnum> drawBuffers(maximumLocation + 1, kGlNone);
-  for (const VernonColorAttachment &attachment : normalizedAttachments) {
-    const GlEnum slot = kGlColorAttachment0 + attachment.location;
-    driver.framebufferTexture2D(kGlFramebuffer, slot, kGlTexture2D,
-                                attachment.texture->openGLTexture, 0);
-    drawBuffers[attachment.location] = slot;
-  }
-  driver.drawBuffers(static_cast<GlSize>(drawBuffers.size()),
-                     drawBuffers.data());
-  program->openGLAttachmentLocations = std::move(attachmentLocations);
-  if (driver.checkFramebufferStatus(kGlFramebuffer) != kGlFramebufferComplete)
-    return fail(context, "OpenGL framebuffer is incomplete",
+  gl.drawBuffers(static_cast<GlSize>(drawBuffers.size()), drawBuffers.data());
+  if (gl.checkFramebufferStatus(kFramebuffer) != kFramebufferComplete)
+    return fail(pipeline->context, "OpenGL framebuffer is incomplete",
                 VERNON_STATUS_INTERNAL_ERROR);
-  driver.viewport(0, 0, static_cast<GlSize>(width),
-                  static_cast<GlSize>(height));
-  driver.clearColor(description->clear_color[0], description->clear_color[1],
-                    description->clear_color[2], description->clear_color[3]);
-  driver.clear(kGlColorBufferBit);
-  const GlEnum mode = topology == VERNON_TOPOLOGY_LINE_LIST    ? kGlLines
-                      : topology == VERNON_TOPOLOGY_POINT_LIST ? kGlPoints
-                                                               : kGlTriangles;
-  if (indexBinding) {
-    driver.drawElementsInstanced(
-        mode, static_cast<GlSize>(indexBinding->index_count), kGlUnsignedInt,
-        reinterpret_cast<const void *>(indexBinding->offset),
-        static_cast<GlSize>(description->instance_count));
-  } else if (description->instance_count == 1) {
-    driver.drawArrays(mode, 0, static_cast<GlSize>(description->vertex_count));
+  gl.viewport(0, 0, static_cast<GlSize>(width), static_cast<GlSize>(height));
+  const GlEnum mode = topologyMode(invocation->topology);
+  if (invocation->index_binding) {
+    const VernonIndexBinding &index = *invocation->index_binding;
+    if (!index.buffer || index.buffer->context != pipeline->context ||
+        index.type != VERNON_INDEX_U32 || !index.index_count)
+      return fail(pipeline->context, "index binding is invalid");
+    gl.bindBuffer(kElementArrayBuffer, index.buffer->name);
+    gl.drawElementsInstanced(mode, static_cast<GlSize>(index.index_count),
+                             kUnsignedInt,
+                             reinterpret_cast<const void *>(index.offset),
+                             static_cast<GlSize>(instanceCount));
+  } else if (instanceCount == 1) {
+    gl.drawArrays(mode, 0, static_cast<GlSize>(vertexCount));
   } else {
-    driver.drawArraysInstanced(
-        mode, 0, static_cast<GlSize>(description->vertex_count),
-        static_cast<GlSize>(description->instance_count));
+    gl.drawArraysInstanced(mode, 0, static_cast<GlSize>(vertexCount),
+                           static_cast<GlSize>(instanceCount));
   }
   return VERNON_STATUS_OK;
-#else
-  return VERNON_STATUS_UNSUPPORTED_TARGET;
-#endif
 }
 
 VernonStatus
 vernonRuntimeComputeToGraphicsBarrier(VernonRuntimeContext *context) {
-  if (!context)
-    return VERNON_STATUS_INVALID_ARGUMENT;
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-  if (context->backend == VERNON_RUNTIME_OPENGL ||
-      context->backend == VERNON_RUNTIME_OPENGL_ES) {
-    glfwMakeContextCurrent(context->openGLWindow);
-    OpenGLDriver &driver = openGLDriver();
-    if (!driver.memoryBarrier)
-      return fail(context, "OpenGL context does not support memory barriers",
-                  VERNON_STATUS_UNSUPPORTED_TARGET);
-    driver.memoryBarrier(kGlShaderStorageBarrierBit |
-                         kGlVertexAttribArrayBarrierBit);
-    return VERNON_STATUS_OK;
-  }
-#endif
-  return fail(context, "compute-to-graphics barriers are unsupported",
-              VERNON_STATUS_UNSUPPORTED_TARGET);
+  if (!context ||
+      (context->backend != VERNON_RUNTIME_OPENGL &&
+       context->backend != VERNON_RUNTIME_OPENGL_ES) ||
+      !context->gl.memoryBarrier)
+    return VERNON_STATUS_UNSUPPORTED_TARGET;
+  makeCurrent(context);
+  context->gl.memoryBarrier(kShaderStorageBarrierBit |
+                            kVertexAttribArrayBarrierBit);
+  return VERNON_STATUS_OK;
 }
 
 VernonStatus vernonRuntimeSynchronize(VernonRuntimeContext *context) {
   if (!context)
     return VERNON_STATUS_INVALID_ARGUMENT;
+  if (context->backend == VERNON_RUNTIME_CPU)
+    return VERNON_STATUS_OK;
 #if defined(VERNON_HAS_CUDA_RUNTIME)
   if (context->backend == VERNON_RUNTIME_CUDA)
-    return cudaFail(context, cudaDriver().contextSynchronize(),
+    return cudaFail(context, vernon::runtime::cudaDriver().contextSynchronize(),
                     "cuCtxSynchronize");
 #endif
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
   if (context->backend == VERNON_RUNTIME_VULKAN)
-    return vulkanFail(context,
-                      vulkanDriver().deviceWaitIdle(context->vulkanDevice),
-                      "vkDeviceWaitIdle");
+    return vulkanFail(
+        context,
+        vernon::runtime::vulkanDriver().deviceWaitIdle(context->vulkanDevice),
+        "vkDeviceWaitIdle");
 #endif
-#if defined(VERNON_HAS_OPENGL_RUNTIME)
-  if (context->backend == VERNON_RUNTIME_OPENGL ||
-      context->backend == VERNON_RUNTIME_OPENGL_ES) {
-    glfwMakeContextCurrent(context->openGLWindow);
-    openGLDriver().finish();
-  }
-#endif
+  makeCurrent(context);
+  context->gl.finish();
   return VERNON_STATUS_OK;
 }
 

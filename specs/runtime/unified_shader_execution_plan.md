@@ -1,11 +1,14 @@
 # Unified Shader Execution Plan
 
+Status: implemented through versioned pipeline bundles and
+`vernonRuntimePipelineInvoke`.
+
 ## Goal
 
 Give compute and graphics the same Tensor-first Python model:
 
 ```python
-vd.init(arch=vd.opengl, api_version=(4, 3))
+vd.init(arch=vd.vulkan)
 
 compute_shader(tensor, time, grid=(width, height, 1))
 
@@ -15,10 +18,10 @@ render = vd.pipeline(vertex_shader, fragment_shader)
 render(vertices=vertices, transform=transform, target=target)
 ```
 
-The standalone VernonDSL runtime owns this API. OpenGL 4.3 offscreen rendering
-is the first graphics implementation; Vernon Engine integration, presentation,
-Vulkan graphics, geometry/tessellation, bindless resources, transform feedback,
-and native EGL/GLES execution are later work.
+The unified Vernon runtime owns this API. Vulkan supports offscreen graphics;
+OpenGL and OpenGL ES use host-owned external contexts. Vernon Engine
+integration, presentation, geometry/tessellation, bindless resources, and
+transform feedback remain separate work.
 
 ## Function kinds
 
@@ -100,12 +103,10 @@ Initialization accepts an explicit context version:
 vd.init(arch=vd.opengl, api_version=(4, 3))
 ```
 
-`api_version` selects the runtime context. OpenGL defaults to `(4, 3)` for
-compatibility with the existing compute backend; graphics-only programs may
-request `(3, 3)`. MVP compute support does not rely on `ARB_compute_shader` in
-an older context. Native OpenGL ES version selection remains deferred with the
-EGL runtime; the current desktop compatibility path uses the desktop context
-version.
+`api_version` records the host context version. OpenGL graphics requires 3.3
+and compute requires 4.3; OpenGL ES graphics requires 3.0 and compute requires
+3.1. The host registers matching context callbacks before `vd.init`; there is
+no desktop compatibility routing for OpenGL ES.
 
 `glsl_version` remains a compiler option and must not be interpreted as the
 context version. Runtime capability reporting records the actual context
@@ -174,26 +175,19 @@ buffers from reflection, execute optional compute, apply barriers, draw, and
 read pixels. Reuse the proven patterns in Vernon Engine's
 `render/shader.cpp` and `render/mesh_render_pass.cpp`.
 
-## Implementation tasks
+## Implemented surface
 
-- [ ] Add and export mandatory `@vd.func`; validate local, imported, and
-      transitive helper call graphs and migrate existing helpers.
-- [ ] Add `vd.pipeline`, merged-name routing, legal stage-order checks, shape
-      inference, and deterministic cache keys.
-- [ ] Add automatic per-runtime Tensor residency, dirty version tracking,
-      partial updates, and lazy readback while preserving direct kernel calls.
-- [ ] Add Texture and graphics/multi-stage C runtime APIs without changing
-      `vernonRuntimeLaunch`.
-- [ ] Add `vd.init(..., api_version=...)`, exact OpenGL/OpenGL ES context
-      requests, actual-version reporting, and reflected capability validation.
-- [ ] Compile interactive stage callables and cache their native artifacts;
-      preserve cooked assets as the AOT path.
-- [ ] Implement OpenGL offscreen vertex/fragment execution and optional
-      compute-to-graphics barriers.
-- [ ] Expose only the focused Python surface: `vd.init`, `Tensor`, `Texture`,
-      directly callable compute kernels, and directly callable pipelines.
-- [ ] Record final ABI and non-obvious ordering constraints in runtime/compiler
-      design documents.
+- Mandatory `@vd.func` and validated helper call graphs.
+- `vd.pipeline`, merged-name routing, legal stage order, shape inference, and
+  deterministic cache keys.
+- Per-runtime Tensor residency, dirty tracking, and lazy readback.
+- Versioned Texture and pipeline-bundle C APIs alongside
+  `vernonRuntimeLaunch`.
+- External OpenGL/OpenGL ES context registration with actual-version
+  capability reporting.
+- Cached interactive artifacts and cooked AOT pipeline bundles.
+- Vulkan and external-context OpenGL/OpenGL ES offscreen execution.
+- One `_native` Python module exposing compiler and runtime services.
 
 ## Verification
 

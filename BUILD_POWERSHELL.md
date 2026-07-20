@@ -15,10 +15,22 @@
    cmake .. -DMLIR_DIR="..\llvm-project\install\lib\cmake\mlir"
    ```
 
-4. **Build:**
+4. **Build and test:**
    ```powershell
-   cmake --build . --target MLIRVernonDialect
+   cmake --build . --config Release --parallel 4
+   ctest -C Release --output-on-failure
    ```
+
+## Runtime-only build
+
+The standalone runtime does not require LLVM/MLIR:
+
+```powershell
+cmake -S . -B runtime_build `
+  -DVERNON_ENABLE_COMPILER=OFF `
+  -DVERNON_ENABLE_RUNTIME=ON
+cmake --build runtime_build --config Release --target VernonRuntime --parallel 4
+```
 
 ## Alternative: Use Absolute Path
 

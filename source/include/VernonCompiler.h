@@ -1,8 +1,7 @@
 #ifndef VERNON_C_COMPILER_H
 #define VERNON_C_COMPILER_H
 
-#include <stddef.h>
-#include <stdint.h>
+#include "VernonCommon.h"
 
 #if defined(_WIN32) && defined(VERNON_DSL_COMPILER_BUILD)
 #define VERNON_DSL_CAPI __declspec(dllexport)
@@ -18,20 +17,6 @@ extern "C" {
 
 typedef struct VernonCompilerContext VernonCompilerContext;
 typedef struct VernonCompileResult VernonCompileResult;
-
-typedef struct VernonStringView {
-  const char *data;
-  size_t size;
-} VernonStringView;
-
-typedef enum VernonStatus {
-  VERNON_STATUS_OK = 0,
-  VERNON_STATUS_INVALID_ARGUMENT = 1,
-  VERNON_STATUS_PARSE_ERROR = 2,
-  VERNON_STATUS_VERIFICATION_ERROR = 3,
-  VERNON_STATUS_UNSUPPORTED_TARGET = 4,
-  VERNON_STATUS_INTERNAL_ERROR = 5
-} VernonStatus;
 
 typedef enum VernonTarget {
   VERNON_TARGET_CPU = 0,
@@ -57,26 +42,6 @@ typedef struct VernonCompileOptions {
   uint32_t glsl_version;
   uint32_t reserved[6];
 } VernonCompileOptions;
-
-typedef struct VernonCpuTextureCallbacks {
-  void *user_data;
-  void (*sample_2d)(void *user_data, uintptr_t texture, float u, float v,
-                    float out_rgba[4]);
-  void (*size_2d)(void *user_data, uintptr_t texture, int32_t level,
-                  int32_t out_size[2]);
-} VernonCpuTextureCallbacks;
-
-typedef struct VernonCpuInvocation {
-  // Argument and result layouts are described by the compile reflection.
-  const void *arguments;
-  size_t arguments_size;
-  void *results;
-  size_t results_size;
-  const VernonCpuTextureCallbacks *textures;
-} VernonCpuInvocation;
-
-typedef VernonStatus (*VernonCpuEntryPoint)(
-    const VernonCpuInvocation *invocation);
 
 VERNON_DSL_CAPI VernonCompilerContext *vernonCompilerCreate(void);
 VERNON_DSL_CAPI void vernonCompilerDestroy(VernonCompilerContext *context);

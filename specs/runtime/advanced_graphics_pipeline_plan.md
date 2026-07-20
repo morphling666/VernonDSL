@@ -1,5 +1,8 @@
 # Advanced Graphics Pipeline Plan
 
+Status: implemented for Vulkan and external-context OpenGL/OpenGL ES pipeline
+bundles.
+
 ## Goal
 
 Extend the direct Tensor-first pipeline API with instancing, indexed drawing,
@@ -99,7 +102,7 @@ Rules:
   parameter;
 - cache the native index allocation through normal Tensor residency.
 
-Extend the graphics draw ABI with an optional index binding containing the
+`VernonPipelineInvocation` carries an optional index binding containing the
 buffer, element type, byte offset, and index count. OpenGL uses
 `glDrawElementsInstanced`; Vulkan uses `vkCmdBindIndexBuffer` and
 `vkCmdDrawIndexed`.
@@ -244,8 +247,8 @@ Backend work:
 - Vulkan: create render-pass/framebuffer or dynamic-rendering state for the
   reflected attachment locations, include attachment formats/count in the
   graphics pipeline cache key, and select indexed/non-indexed commands.
-- OpenGL ES compatibility inherits the desktop OpenGL implementation until the
-  native EGL/GLES runtime exists.
+- OpenGL ES consumes GLES-profile bundles through a host-owned external
+  context and never routes through desktop OpenGL.
 
 ## Ordering and residency
 
@@ -311,9 +314,8 @@ allocations.
 ### Backends and assets
 
 - OpenGL graphics-only and compute-to-graphics pipelines;
-- Vulkan equivalents after
-  `specs/runtime/vulkan_graphics_runtime_plan.md` is complete;
-- desktop OpenGL ES compatibility path;
+- Vulkan compute/graphics pipeline bundles;
+- host-context OpenGL ES with matching GLSL ES artifacts;
 - interactive and cooked variants produce equivalent stage selection;
 - complete Release CTest and Python suites.
 

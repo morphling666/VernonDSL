@@ -39,6 +39,9 @@ and exports guarded C ABI entry points for reference execution. DirectX
 remains unavailable until the HLSL produced by SPIRV-Cross is completed by a
 DXC-to-DXIL artifact step.
 
+That JIT is a compiler reference facility, not a deployable runtime format.
+`VernonRuntime` accepts CPU native-library AOT bundles only.
+
 ## Build on Windows
 
 Build and install LLVM/MLIR first as described in
@@ -52,8 +55,20 @@ cmake --build build --config Release --parallel 4
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-The public native API is declared in
-[`source/include/vernon-c/Compiler.h`](source/include/vernon-c/Compiler.h).
+Configure a runtime-only build without LLVM/MLIR using the canonical options:
+
+```powershell
+cmake -S . -B runtime_build `
+  -DVERNON_ENABLE_COMPILER=OFF `
+  -DVERNON_ENABLE_RUNTIME=ON
+cmake --build runtime_build --config Release --target VernonRuntime --parallel 4
+```
+
+The public native APIs are declared in
+[`source/include/vernon-c/Compiler.h`](source/include/vernon-c/Compiler.h) and
+[`source/include/vernon-c/Runtime.h`](source/include/vernon-c/Runtime.h).
+The canonical runtime CMake target is `VernonRuntime`, exported as
+`Vernon::Runtime`.
 Compiler architecture decisions are recorded in
 [`specs/compiler/design.md`](specs/compiler/design.md).
 
@@ -102,17 +117,27 @@ scale(output, 2.0, grid=(8, 1, 1))
 values = output.to_numpy()
 ```
 
-`VERNON_ENABLE_RUNTIME` builds the standalone `VernonDSLRuntime` C API and
-CPU reference backend. `VERNON_ENABLE_CUDA_RUNTIME` dynamically loads the
+`VERNON_ENABLE_RUNTIME` builds the standalone `VernonRuntime` C API with CPU
+AOT execution. `VERNON_ENABLE_CUDA_RUNTIME` dynamically loads the
 CUDA Driver API from `nvcuda.dll`/`libcuda.so.1`; no CUDA Toolkit or `nvcc`
 installation is required. `VERNON_ENABLE_VULKAN_RUNTIME` dynamically loads the
-system Vulkan loader and uses host-visible storage buffers for compute
-dispatch. `VERNON_ENABLE_OPENGL_RUNTIME` uses GLFW to create a hidden OpenGL
-4.3 compute context. The `opengles` runtime selection uses this desktop
-compatibility path; `--target opengles` still emits native GLSL ES 3.10 source.
-Compiler capabilities remain independent of runtime/device availability.
-`VERNON_ENABLE_PYTHON_BINDINGS` builds the nanobind `_native` module when
-Python 3.11 and nanobind are available.
+system Vulkan loader and supports compute plus offscreen graphics pipeline
+bundles. OpenGL and OpenGL ES use host-owned external contexts and native GLSL
+for the matching profile; the runtime never creates a GLFW context.
+`vd.register_external_opengl_context(...)` must be called before selecting
+either external backend. Compiler capabilities remain independent of
+runtime/device availability. `VERNON_ENABLE_PYTHON_BINDINGS` builds the single
+nanobind `_native` compiler/runtime module when Python 3.11 and nanobind are
+available.
+
+External-context registration accepts the backend (`vd.opengl` or
+`vd.opengles`), opaque host user-data address, `make_current` callback address,
+`get_proc_address` callback address, and the actual context version. The host
+must keep the context and callbacks alive for the runtime lifetime.
+
+`VernonRuntime` links only its JSON parser and operating-system libraries.
+Vulkan headers are compile-time-only; LLVM/MLIR, GLFW, the CUDA Toolkit, and
+the Vulkan loader import library are outside its dependency closure.
 
 Run the fractal directly on either GPU backend, or emit Metal source for use on
 macOS:
@@ -120,17 +145,15 @@ macOS:
 ```powershell
 uv run python fractal.py --arch cuda
 uv run python fractal.py --arch vulkan
-uv run python fractal.py --arch opengl
-uv run python fractal.py --arch opengles
 uv run python fractal.py --emit-metal build/fractal.metal
 ```
 
-Run the advanced OpenGL example with an indexed quad, instance attributes,
+Run the advanced graphics example with an indexed quad, instance attributes,
 interactive `PICKING` specialization, and two named render targets:
 
 ```powershell
 uv sync --extra examples
-uv run python examples/advanced_pipeline.py --frames 2 --headless `
+uv run python examples/advanced_pipeline.py --arch vulkan --frames 2 --headless `
   --output build/advanced-color.png `
   --id-output build/advanced-object-id.png
 ```
@@ -140,7 +163,7 @@ compute/vertex/fragment composition, three feature variants, indexed
 instancing, named MRT outputs, and per-frame input/index/uniform rebinding:
 
 ```powershell
-uv run python examples/complete_pipeline.py --frames 3 --headless `
+uv run python examples/complete_pipeline.py --arch vulkan --frames 3 --headless `
   --output build/complete-color.png `
   --id-output build/complete-object-id.png `
   --method-mlir build/complete-methods.mlir
@@ -151,7 +174,9 @@ shared and device-only methods, NumPy intrinsics, CPU device parity, and
 method lowering:
 
 ```powershell
-uv run python examples/shared_struct_methods.py `
+uv run python examples/shared_struct_methods.py --arch cpu `
+  --mlir build/shared-struct-methods.mlir
+uv run python examples/shared_struct_methods.py --arch vulkan `
   --mlir build/shared-struct-methods.mlir
 ```
 

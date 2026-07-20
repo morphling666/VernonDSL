@@ -8,14 +8,38 @@ include(CTest)
 
 option(VERNON_ENABLE_SPIRV_CROSS
   "Build OpenGL, OpenGL ES, Metal, and HLSL source backends" ON)
+option(VERNON_ENABLE_COMPILER "Build the Vernon compiler" ON)
 option(VERNON_ENABLE_RUNTIME "Build the Vernon kernel runtime" ON)
 option(VERNON_ENABLE_CUDA_RUNTIME
   "Enable dynamically loaded CUDA Driver runtime backend" ON)
 option(VERNON_ENABLE_VULKAN_RUNTIME
   "Enable dynamically loaded Vulkan runtime backend" ON)
-option(VERNON_ENABLE_OPENGL_RUNTIME
-  "Enable the OpenGL compute runtime backend" ON)
 option(VERNON_ENABLE_PYTHON_BINDINGS "Build the nanobind Python module" ON)
+if(VERNON_ENABLE_RUNTIME)
+  find_package(nlohmann_json CONFIG QUIET)
+  if(NOT nlohmann_json_FOUND)
+    include(FetchContent)
+    FetchContent_Declare(nlohmann_json
+      GIT_REPOSITORY https://github.com/nlohmann/json.git
+      GIT_TAG v3.12.0
+      GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(nlohmann_json)
+  endif()
+endif()
+if(VERNON_ENABLE_VULKAN_RUNTIME AND VERNON_ENABLE_RUNTIME)
+  include(FetchContent)
+  FetchContent_Declare(vulkan_headers
+    GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+    GIT_TAG main
+    GIT_SHALLOW TRUE
+  )
+  FetchContent_MakeAvailable(vulkan_headers)
+endif()
+if(NOT VERNON_ENABLE_COMPILER)
+  add_subdirectory(source)
+  return()
+endif()
 if(VERNON_ENABLE_SPIRV_CROSS)
   include(FetchContent)
   set(SPIRV_CROSS_CLI OFF CACHE BOOL "" FORCE)
@@ -45,29 +69,6 @@ if(VERNON_ENABLE_SPIRV_CROSS)
     )
   endif()
 endif()
-if(VERNON_ENABLE_RUNTIME AND VERNON_ENABLE_VULKAN_RUNTIME)
-  include(FetchContent)
-  FetchContent_Declare(vulkan_headers
-    GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
-    GIT_TAG main
-    GIT_SHALLOW TRUE
-  )
-  FetchContent_MakeAvailable(vulkan_headers)
-endif()
-if(VERNON_ENABLE_RUNTIME AND VERNON_ENABLE_OPENGL_RUNTIME)
-  include(FetchContent)
-  set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-  set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-  set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-  set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
-  FetchContent_Declare(glfw
-    GIT_REPOSITORY https://github.com/glfw/glfw.git
-    GIT_TAG master
-    GIT_SHALLOW TRUE
-  )
-  FetchContent_MakeAvailable(glfw)
-endif()
-
 set(MLIR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/llvm-project/install/lib/cmake/mlir)
 # Find MLIR
 find_package(MLIR REQUIRED CONFIG)

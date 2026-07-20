@@ -1,3 +1,16 @@
+if(VERNON_ENABLE_RUNTIME)
+  include(VernonRuntimeTarget.cmake)
+  vernon_add_runtime()
+endif()
+
+if(NOT VERNON_ENABLE_COMPILER)
+  if(BUILD_TESTING AND VERNON_ENABLE_RUNTIME)
+    include(VernonRuntimeTests.cmake)
+    vernon_add_runtime_tests()
+  endif()
+  return()
+endif()
+
 add_subdirectory(include/mlir/Dialect/Vernon)
 add_subdirectory(lib/Dialect/Vernon)
 
@@ -63,46 +76,16 @@ install(TARGETS VernonDSLCompiler
   LIBRARY DESTINATION lib
   ARCHIVE DESTINATION lib
 )
-install(FILES include/VernonCompiler.h DESTINATION include)
-install(FILES include/vernon-c/Compiler.h DESTINATION include/vernon-c)
+install(FILES
+  include/VernonCommon.h
+  include/VernonCompiler.h
+  DESTINATION include)
+install(FILES
+  include/vernon-c/Common.h
+  include/vernon-c/Compiler.h
+  DESTINATION include/vernon-c)
 
 if(VERNON_ENABLE_RUNTIME)
-  add_library(VernonDSLRuntime SHARED lib/VernonRuntime.cpp)
-  target_compile_definitions(VernonDSLRuntime PRIVATE VERNON_DSL_RUNTIME_BUILD)
-  target_include_directories(VernonDSLRuntime
-    PUBLIC
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-      $<INSTALL_INTERFACE:include>
-  )
-  target_link_libraries(VernonDSLRuntime PRIVATE
-    LLVMSupport
-    ${VERNON_LLVM_JIT_LIBS}
-  )
-  if(MSVC)
-    target_compile_options(VernonDSLRuntime PRIVATE /EHsc)
-  endif()
-  if(VERNON_ENABLE_CUDA_RUNTIME)
-    target_compile_definitions(VernonDSLRuntime PRIVATE
-      VERNON_HAS_CUDA_RUNTIME=1)
-  endif()
-  if(VERNON_ENABLE_VULKAN_RUNTIME)
-    target_compile_definitions(VernonDSLRuntime PRIVATE
-      VERNON_HAS_VULKAN_RUNTIME=1 VK_NO_PROTOTYPES=1)
-    target_link_libraries(VernonDSLRuntime PRIVATE Vulkan::Headers)
-  endif()
-  if(VERNON_ENABLE_OPENGL_RUNTIME)
-    target_compile_definitions(VernonDSLRuntime PRIVATE
-      VERNON_HAS_OPENGL_RUNTIME=1 GLFW_INCLUDE_NONE=1)
-    target_link_libraries(VernonDSLRuntime PRIVATE glfw)
-  endif()
-  install(TARGETS VernonDSLRuntime
-    RUNTIME DESTINATION bin
-    LIBRARY DESTINATION lib
-    ARCHIVE DESTINATION lib
-  )
-  install(FILES include/VernonRuntime.h DESTINATION include)
-  install(FILES include/vernon-c/Runtime.h DESTINATION include/vernon-c)
-
   if(VERNON_ENABLE_PYTHON_BINDINGS)
     find_package(Python 3.11 EXACT COMPONENTS Interpreter Development.Module QUIET)
     if(Python_FOUND)
@@ -120,7 +103,7 @@ if(VERNON_ENABLE_RUNTIME)
     if(nanobind_FOUND)
       nanobind_add_module(vernon-dsl-native python/native_module.cpp)
       target_link_libraries(vernon-dsl-native PRIVATE
-        VernonDSLCompiler VernonDSLRuntime)
+        VernonDSLCompiler Vernon::Runtime)
       if(MSVC)
         target_compile_options(vernon-dsl-native PRIVATE /EHsc)
       endif()
@@ -145,6 +128,10 @@ endif()
 install(TARGETS vernon-compile RUNTIME DESTINATION bin)
 
 if(BUILD_TESTING)
+  if(VERNON_ENABLE_RUNTIME)
+    include(VernonRuntimeTests.cmake)
+    vernon_add_runtime_tests()
+  endif()
   add_executable(vernon-compiler-c-api-test
     tests/compiler_c_api_test.c
   )
@@ -160,30 +147,49 @@ if(BUILD_TESTING)
   add_test(NAME vernon-compiler-cpp-api-test
     COMMAND vernon-compiler-cpp-api-test
   )
-  if(VERNON_ENABLE_RUNTIME)
-    add_executable(vernon-runtime-c-api-test tests/runtime_c_api_test.c)
-    target_link_libraries(vernon-runtime-c-api-test PRIVATE VernonDSLRuntime)
-    target_compile_definitions(vernon-runtime-c-api-test PRIVATE
-      VERNON_CPU_BUNDLE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/assets/cpu_compute_bundle")
-    add_test(NAME vernon-runtime-c-api-test COMMAND vernon-runtime-c-api-test)
-    if(VERNON_ENABLE_CUDA_RUNTIME)
-      add_executable(vernon-runtime-cuda-test tests/runtime_cuda_test.cpp)
-      target_link_libraries(vernon-runtime-cuda-test PRIVATE VernonDSLRuntime)
-      add_test(NAME vernon-runtime-cuda-test COMMAND vernon-runtime-cuda-test)
+  if(VERNON_ENABLE_RUNTIME AND VERNON_ENABLE_VULKAN_RUNTIME)
+    find_package(Python 3.11 EXACT COMPONENTS Interpreter QUIET)
+    if(Python_FOUND)
+      set(VERNON_VULKAN_PIPELINE_TEST_DIR
+        ${CMAKE_CURRENT_BINARY_DIR}/vulkan_pipeline_bundle)
+      add_custom_command(
+        OUTPUT ${VERNON_VULKAN_PIPELINE_TEST_DIR}/pipeline.bundle
+        COMMAND ${CMAKE_COMMAND} -E env
+          "PYTHONPATH=${CMAKE_SOURCE_DIR}/python"
+          ${Python_EXECUTABLE} -m vernon_dsl.shader_asset_cli
+          ${CMAKE_SOURCE_DIR}/examples/variant_mesh.shader-pipeline.json
+          --asset-root ${CMAKE_SOURCE_DIR}/examples
+          --compiler $<TARGET_FILE:vernon-compile>
+          --target vulkan
+          --output ${VERNON_VULKAN_PIPELINE_TEST_DIR}
+        DEPENDS vernon-compile
+          ${CMAKE_SOURCE_DIR}/examples/variant_mesh.shader-pipeline.json
+          ${CMAKE_SOURCE_DIR}/examples/variant_mesh.shader-module.json
+          ${CMAKE_SOURCE_DIR}/examples/variant_mesh.py
+          ${CMAKE_SOURCE_DIR}/python/vernon_dsl/shader_assets.py
+        VERBATIM)
+      add_custom_target(vernon-vulkan-pipeline-test-bundle
+        DEPENDS ${VERNON_VULKAN_PIPELINE_TEST_DIR}/pipeline.bundle)
+      add_executable(vernon-runtime-vulkan-pipeline-test
+        tests/runtime_vulkan_pipeline_test.cpp)
+      target_link_libraries(vernon-runtime-vulkan-pipeline-test PRIVATE
+        Vernon::Runtime)
+      target_compile_definitions(vernon-runtime-vulkan-pipeline-test
+        PRIVATE
+          VERNON_VULKAN_PIPELINE_BUNDLE="${VERNON_VULKAN_PIPELINE_TEST_DIR}/pipeline.bundle")
+      add_dependencies(vernon-runtime-vulkan-pipeline-test
+        vernon-vulkan-pipeline-test-bundle)
+      add_test(NAME vernon-runtime-vulkan-pipeline-test
+        COMMAND vernon-runtime-vulkan-pipeline-test)
     endif()
+  endif()
+  if(VERNON_ENABLE_RUNTIME)
     if(VERNON_ENABLE_VULKAN_RUNTIME)
       add_executable(vernon-runtime-vulkan-test tests/runtime_vulkan_test.cpp)
       target_link_libraries(vernon-runtime-vulkan-test PRIVATE
-        VernonDSLCompiler VernonDSLRuntime)
+        VernonDSLCompiler Vernon::Runtime)
       add_test(NAME vernon-runtime-vulkan-test
         COMMAND vernon-runtime-vulkan-test)
-    endif()
-    if(VERNON_ENABLE_OPENGL_RUNTIME)
-      add_executable(vernon-runtime-opengl-test tests/runtime_opengl_test.cpp)
-      target_link_libraries(vernon-runtime-opengl-test PRIVATE
-        VernonDSLCompiler VernonDSLRuntime)
-      add_test(NAME vernon-runtime-opengl-test
-        COMMAND vernon-runtime-opengl-test)
     endif()
   endif()
 endif()

@@ -45,6 +45,15 @@ class PipelineContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "contiguous"):
             tensor.swizzle("zx")
 
+    def test_external_gl_backends_require_registration(self) -> None:
+        for architecture in (vd.opengl, vd.opengles):
+            with self.subTest(architecture=architecture.name):
+                with self.assertRaisesRegex(
+                        RuntimeError,
+                        "requires a registered host-owned external context"):
+                    vd.init(arch=architecture)
+        vd.init(arch=vd.cpu)
+
 
 class OpenGLPipelineTests(unittest.TestCase):
 
@@ -272,6 +281,59 @@ class OpenGLPipelineTests(unittest.TestCase):
         vd.pipeline(triangle_vertex, solid_fragment)(position=point_positions,
                                                      target=target,
                                                      topology=vd.points)
+
+
+class VulkanPipelineTests(unittest.TestCase):
+
+    def setUp(self) -> None:
+        try:
+            vd.init(arch=vd.vulkan)
+        except RuntimeError:
+            self.skipTest("Vulkan runtime unavailable")
+
+    @staticmethod
+    def _triangle() -> vd.Tensor:
+        return vd.Tensor.from_numpy(
+            np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)),
+                     dtype=np.float32))
+
+    def test_triangle_and_compute_graphics_pipeline(self) -> None:
+        positions = self._triangle()
+        target = vd.Texture.zeros(shape=(64, 64))
+        render = vd.pipeline(translate_vertices, triangle_vertex,
+                             solid_fragment)
+        render(position=positions, offset=np.float32(0.25), target=target)
+        pixels = target.to_numpy()
+        self.assertGreater(int(pixels[32, 40, 0]), 240)
+        np.testing.assert_allclose(
+            positions.to_numpy()[:, 0],
+            np.array((-0.5, 1.0, 0.25), dtype=np.float32),
+        )
+        self.assertEqual(render.compile_count, 1)
+
+    def test_indexed_instanced_mrt(self) -> None:
+        render = vd.pipeline(advanced_vertex,
+                             advanced_fragment,
+                             features={"PICKING"})
+        positions, offsets, indices = OpenGLPipelineTests._advanced_inputs()
+        color = vd.Texture.zeros(shape=(64, 64))
+        object_id = vd.Texture.zeros(shape=(64, 64))
+        render(position=positions,
+               offset=offsets,
+               indices=indices,
+               targets={
+                   "color": color,
+                   "object_id": object_id,
+               })
+        self.assertGreater(int(color.to_numpy()[32, 19, 2]), 240)
+        self.assertGreater(int(object_id.to_numpy()[32, 19, 0]), 240)
+
+    def test_cpu_graphics_has_explicit_error(self) -> None:
+        vd.init(arch=vd.cpu)
+        with self.assertRaisesRegex(RuntimeError, "software rasterizer"):
+            vd.pipeline(triangle_vertex,
+                        solid_fragment)(position=self._triangle(),
+                                        target=vd.Texture.zeros(shape=(8, 8)))
 
 
 if __name__ == "__main__":

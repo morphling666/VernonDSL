@@ -1,5 +1,8 @@
 # Python and Native GPU Kernel Runtime Plan
 
+Status: implemented. Current native execution is provided by the unified
+`VernonRuntime`; deployable CPU execution is AOT-only.
+
 ## Goal
 
 Add explicit GPU kernel dispatch to VernonDSL without automatic loop
@@ -109,7 +112,7 @@ flowchart LR
   Mlir --> Compiler["VernonDSLCompiler"]
   Compiler --> Bundle["Compute bundle"]
   PythonCall["Python Kernel proxy"] --> AstFrontend
-  PythonCall --> Runtime["VernonDSLRuntime"]
+  PythonCall --> Runtime["VernonRuntime"]
   NativeCall["C or C++ application"] --> Runtime
   Bundle --> Runtime
   Runtime --> Backend["CPU, CUDA, or Vulkan backend"]
@@ -201,7 +204,7 @@ Python objects or a Python cache.
 
 ## Native runtime
 
-Add a separately linkable `VernonDSLRuntime` library and stable C API:
+The separately linkable `VernonRuntime` library provides the stable C API:
 
 - runtime creation, destruction, and capability queries;
 - Tensor-compatible allocation and free;
@@ -233,16 +236,12 @@ Compiler capability and runtime capability are separate:
 - runtime capability means a driver/device can allocate, load, launch, copy,
   and synchronize.
 
-## CPU reference backend
+## CPU execution
 
-The CPU backend must implement the same `global_size` launch contract as GPU
-backends. It loops over `(x, y, z)`, synthesizes the builtin ID for each
-invocation, and calls the compiled CPU entry with the same logical
-Tensor/scalar arguments.
-
-Do not expose the existing single-invocation packed CPU entry as if it were a
-grid dispatcher. Its packed layout remains a compiler-internal ABI unless
-adapted behind `VernonDSLRuntime`.
+Python `vd.cpu` uses the AST interpreter for deterministic development and
+reference execution. Deployable native execution loads schema-versioned AOT
+compute bundles containing a platform shared library and stable C wrapper.
+Raw LLVM IR and ORC JIT artifacts are not accepted by `VernonRuntime`.
 
 ## CUDA backend
 
@@ -297,12 +296,14 @@ Add OpenCV as an optional example dependency, not a core runtime dependency.
 The numerical test compares a small result against a NumPy reference with a
 documented tolerance.
 
-## Build changes
+## Build configuration
 
-- Add `VERNON_ENABLE_RUNTIME` and `VERNON_ENABLE_CUDA_RUNTIME`.
-- Add separately installable `VernonDSLRuntime` and runtime C headers.
-- Add the nanobind `vernon_dsl._native` module linked to
-  `VernonDSLCompiler` and `VernonDSLRuntime`.
+- `VERNON_ENABLE_RUNTIME` and `VERNON_ENABLE_CUDA_RUNTIME` control the runtime.
+- `VernonRuntime` and its runtime C headers are separately installable.
+- The sole nanobind `vernon_dsl._native` module links
+  `VernonDSLCompiler` and `Vernon::Runtime`.
+- A runtime-only configuration uses `VERNON_ENABLE_COMPILER=OFF` and
+  `VERNON_ENABLE_RUNTIME=ON`.
 - Keep the compiler library usable without the runtime and both usable without
   Python.
 - Use one binding technology; remove `pybind11` from this runtime path.

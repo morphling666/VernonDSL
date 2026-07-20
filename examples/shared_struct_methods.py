@@ -74,6 +74,10 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="optional path for the lowered struct-method frontend MLIR",
     )
+    parser.add_argument("--arch",
+                        choices=("cpu", "vulkan"),
+                        default="cpu",
+                        help="compute backend")
     return parser.parse_args()
 
 
@@ -102,7 +106,7 @@ def main() -> None:
     except TypeError as error:
         print("expected host domain error:", error)
 
-    vd.init(arch=vd.cpu)
+    vd.init(arch={"cpu": vd.cpu, "vulkan": vd.vulkan}[args.arch])
     output = vd.Tensor.zeros(dtype=vd.f32, shape=(4, ))
     evaluate_falloff(output, 1.0, grid=(4, 1, 1))
     device_values = output.to_numpy()

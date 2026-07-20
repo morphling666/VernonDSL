@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import subprocess
@@ -45,6 +46,34 @@ def _canonical_json(value: Any) -> str:
                       sort_keys=True,
                       separators=(",", ":"),
                       ensure_ascii=False)
+
+
+def encode_runtime_stage(record: dict[str, Any],
+                         artifact: bytes) -> dict[str, Any]:
+    if record.get("format") == "spirv":
+        return {
+            **record,
+            "artifact": {
+                "format": "spirv",
+                "encoding": "base64",
+                "data": base64.b64encode(artifact).decode("ascii"),
+                "sha256": hashlib.sha256(artifact).hexdigest(),
+            },
+        }
+    return {
+        **record,
+        "source": artifact.decode("utf-8"),
+    }
+
+
+def serialize_runtime_pipeline_bundle(bundle: dict[str, Any]) -> bytes:
+    document = dict(bundle)
+    document.pop("content_hash", None)
+    document["content_hash"] = hashlib.sha256(
+        _canonical_json(document).encode("utf-8")).hexdigest()
+    return (json.dumps(
+        document, sort_keys=True, separators=(",", ":"), ensure_ascii=False) +
+            "\n").encode("utf-8")
 
 
 def _read_manifest(path: Path) -> dict[str, Any]:
@@ -261,6 +290,7 @@ def _compile_stage(module: ShaderModuleDescriptor,
             "module_hash": reflection.get("module_hash"),
             "dependencies": reflection.get("dependencies", []),
             "interface": entry_reflection,
+            "reflection": reflection,
         }
         return stage_id, record
 
@@ -289,6 +319,88 @@ def _validate_graphics_interfaces(vertex: dict[str, Any],
         if outputs.get(location) != value_type:
             raise ShaderAssetError(
                 f"vertex/fragment interface mismatch at location {location}")
+
+
+def _external_parameters(
+        records: dict[str, dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    parameters: dict[str, list[dict[str, Any]]] = {}
+    for stage in ("compute", "vertex", "fragment"):
+        record = records.get(stage)
+        if record is None:
+            continue
+        for row in record["interface"].get("arguments", []):
+            if "vernon.builtin" in row or row.get("vernon.varying", False):
+                continue
+            name = row.get("vernon.source_name")
+            interface = row.get("vernon.interface")
+            if not isinstance(name, str) or not name or not isinstance(
+                    interface, str):
+                raise ShaderAssetError(
+                    f"{stage} external argument is missing source metadata")
+            use = {
+                "stage": stage,
+                "entry": record["entry"],
+                "index": row.get("index"),
+                "kind": row.get("kind", "scalar"),
+                "type": row.get("type"),
+                "dtype": row.get("dtype"),
+                "shape": row.get("shape", []),
+                "interface": interface,
+                "access": row.get("access", "read"),
+            }
+            for key in ("vernon.location", "vernon.instance_divisor",
+                        "vernon.set", "vernon.binding"):
+                if key in row:
+                    use[key] = row[key]
+            if interface == "uniform":
+                use["uniform_name"] = (
+                    f"{record['entry']}_arg_{int(row['index'])}._m0")
+            parameters.setdefault(name, []).append(use)
+    return parameters
+
+
+def _merge_parameter_uses(name: str, uses: list[dict[str,
+                                                     Any]]) -> dict[str, Any]:
+    first = uses[0]
+    kind = "texture" if first["kind"] == "texture" else (
+        "inline" if first["interface"] == "uniform" or
+        (first["stage"] == "compute" and first["kind"] != "tensor") else
+        "tensor")
+    for use in uses[1:]:
+        other_kind = "texture" if use["kind"] == "texture" else (
+            "inline" if use["interface"] == "uniform" or
+            (use["stage"] == "compute" and use["kind"] != "tensor") else
+            "tensor")
+        if (other_kind != kind or use.get("type") != first.get("type")
+                or use.get("dtype") != first.get("dtype")
+                or use.get("shape", []) != first.get("shape", [])):
+            raise ShaderAssetError(f"incompatible pipeline parameter {name!r}")
+    access_values = {str(use.get("access", "read")) for use in uses}
+    access = ("read_write" if "read_write" in access_values
+              or access_values == {"read", "write"} else next(
+                  iter(access_values)))
+    return {
+        "name": name,
+        "kind": kind,
+        "type": first.get("type"),
+        "dtype": first.get("dtype"),
+        "shape": first.get("shape", []),
+        "access": access,
+        "uses": uses,
+    }
+
+
+def _fragment_outputs(
+        records: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    fragment = records.get("fragment")
+    if fragment is None:
+        return []
+    return [{
+        "name": row.get("vernon.source_name"),
+        "location": row["vernon.location"],
+        "type": row.get("type"),
+    } for row in fragment["interface"].get("results", [])
+            if "vernon.location" in row]
 
 
 def cook_shader_pipeline(*,
@@ -327,6 +439,7 @@ def cook_shader_pipeline(*,
     output_path.mkdir(parents=True, exist_ok=True)
     stage_records: dict[str, dict[str, Any]] = {}
     variants: list[dict[str, Any]] = []
+    records_by_variant: list[dict[str, dict[str, Any]]] = []
     compile_cache: dict[tuple[str, str, tuple[str, ...]],
                         tuple[str, dict[str, Any]]] = {}
     for variant in pipeline.variants:
@@ -349,6 +462,54 @@ def cook_shader_pipeline(*,
             _validate_graphics_interfaces(records_for_variant["vertex"],
                                           records_for_variant["fragment"])
         variants.append({"key": list(variant), "stages": mapping})
+        records_by_variant.append(records_for_variant)
+
+    parameter_names = sorted({
+        name
+        for records in records_by_variant
+        for name in _external_parameters(records)
+    })
+    slots = {name: slot for slot, name in enumerate(parameter_names)}
+    pipeline_variants: list[dict[str, Any]] = []
+    for variant, records in zip(pipeline.variants, records_by_variant):
+        external = _external_parameters(records)
+        parameters = []
+        for name in parameter_names:
+            uses = external.get(name)
+            if uses is None:
+                continue
+            parameter = _merge_parameter_uses(name, uses)
+            parameter["slot"] = slots[name]
+            parameters.append(parameter)
+        steps: list[dict[str, Any]] = []
+        if "compute" in records:
+            steps.append({
+                "kind":
+                "dispatch",
+                "stage":
+                variants[len(pipeline_variants)]["stages"]["compute"],
+            })
+        if "compute" in records and "vertex" in records:
+            steps.append({
+                "kind": "barrier",
+                "source": "compute_write",
+                "destination": "vertex_read",
+            })
+        if "vertex" in records:
+            steps.append({
+                "kind":
+                "draw",
+                "vertex":
+                variants[len(pipeline_variants)]["stages"]["vertex"],
+                "fragment":
+                variants[len(pipeline_variants)]["stages"]["fragment"],
+            })
+        pipeline_variants.append({
+            "key": list(variant),
+            "parameters": parameters,
+            "outputs": _fragment_outputs(records),
+            "steps": steps,
+        })
 
     bundle: dict[str, Any] = {
         "schema_version": 2,
@@ -366,6 +527,26 @@ def cook_shader_pipeline(*,
     }
     bundle["content_hash"] = hashlib.sha256(
         _canonical_json(bundle).encode("utf-8")).hexdigest()
+    pipeline_bundle: dict[str, Any] = {
+        "pipeline_bundle_schema_version": 1,
+        "invocation_abi_version": 1,
+        "type": "vernon_pipeline_bundle",
+        "id": pipeline.id,
+        "target": target,
+        "target_options": target_options,
+        "features": sorted(declared_features),
+        "variants": pipeline_variants,
+        "stage_artifacts": {
+            key:
+            encode_runtime_stage(stage_records[key],
+                                 (output_path /
+                                  stage_records[key]["filename"]).read_bytes())
+            for key in sorted(stage_records)
+        },
+    }
+    pipeline_bundle_bytes = serialize_runtime_pipeline_bundle(pipeline_bundle)
+    (output_path / "pipeline.bundle").write_bytes(pipeline_bundle_bytes)
+    bundle["pipeline_bundle"] = "pipeline.bundle"
     manifest_path = output_path / "shader.json"
     manifest_path.write_text(
         json.dumps(bundle, indent=2, sort_keys=True, ensure_ascii=False) +

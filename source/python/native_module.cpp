@@ -5,7 +5,10 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unique_ptr.h>
+#include <nanobind/stl/vector.h>
 
+#include <cstring>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -78,7 +81,7 @@ struct Compiler {
 
 struct Runtime;
 struct Texture;
-struct LoadedProgram;
+struct LoadedPipeline;
 
 struct Buffer {
   Buffer(Runtime *owner, size_t size, size_t alignment);
@@ -163,106 +166,118 @@ struct Texture {
   uint32_t height{};
 };
 
-struct LoadedProgram {
-  LoadedProgram(Runtime *owner, VernonRuntimeContext *runtimeHandle,
-                VernonLoadedProgram *handle)
-      : owner(owner), runtimeHandle(runtimeHandle), handle(handle) {}
-  ~LoadedProgram() { vernonRuntimeProgramUnload(handle); }
+struct LoadedPipeline {
+  LoadedPipeline(Runtime *owner, VernonRuntimeContext *runtime,
+                 VernonPipelineBundle *bundle, VernonLoadedPipeline *pipeline)
+      : owner(owner), runtime(runtime), bundle(bundle), pipeline(pipeline) {}
+  ~LoadedPipeline() {
+    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    vernonRuntimePipelineBundleDestroy(bundle);
+  }
 
-  void draw(Texture *target, const nb::list &attachmentValues,
-            const nb::list &values, const nb::list &uniformValues,
-            uint32_t vertexCount, uint32_t instanceCount, Buffer *indexBuffer,
-            uint32_t indexCount, size_t indexOffset,
-            VernonPrimitiveTopology topology,
-            const std::tuple<float, float, float, float> &clear) {
-    if (target && target->owner != owner)
-      throw std::runtime_error("target belongs to another runtime");
+  void invoke(const nb::list &argumentValues, Buffer *indexBuffer,
+              uint32_t indexCount, size_t indexOffset,
+              const nb::list &attachmentValues, uint32_t topology,
+              uint32_t vertexCount, uint32_t instanceCount,
+              const std::tuple<uint32_t, uint32_t, uint32_t> &computeGrid,
+              const std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>
+                  &viewport,
+              const std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>
+                  &scissor) {
+    std::vector<VernonPipelineArgument> arguments;
+    std::vector<std::vector<uint64_t>> shapes;
+    std::vector<std::vector<uint64_t>> strides;
+    std::vector<std::string> inlineStorage;
+    arguments.reserve(argumentValues.size());
+    shapes.reserve(argumentValues.size());
+    strides.reserve(argumentValues.size());
+    inlineStorage.reserve(argumentValues.size());
+    for (nb::handle value : argumentValues) {
+      nb::tuple row = nb::cast<nb::tuple>(value);
+      const std::string kind = nb::cast<std::string>(row[0]);
+      VernonPipelineArgument argument{};
+      if (kind == "tensor" && row.size() == 8) {
+        Buffer *buffer = nb::cast<Buffer *>(row[2]);
+        if (!buffer || buffer->owner != owner)
+          throw std::runtime_error("pipeline buffer belongs to another runtime");
+        shapes.push_back(nb::cast<std::vector<uint64_t>>(row[5]));
+        strides.push_back(nb::cast<std::vector<uint64_t>>(row[6]));
+        argument.slot = nb::cast<uint32_t>(row[1]);
+        argument.kind = VERNON_PIPELINE_TENSOR;
+        argument.tensor = {
+            buffer->handle,
+            static_cast<VernonDataType>(nb::cast<uint32_t>(row[3])),
+            static_cast<VernonValueAccess>(nb::cast<uint32_t>(row[4])),
+            static_cast<uint32_t>(shapes.back().size()),
+            shapes.back().data(),
+            strides.back().data(),
+            nb::cast<size_t>(row[7]),
+        };
+      } else if (kind == "inline" && row.size() == 5) {
+        nb::bytes bytes = nb::cast<nb::bytes>(row[3]);
+        inlineStorage.emplace_back(bytes.c_str(), bytes.size());
+        shapes.push_back(nb::cast<std::vector<uint64_t>>(row[4]));
+        argument.slot = nb::cast<uint32_t>(row[1]);
+        argument.kind = VERNON_PIPELINE_INLINE_VALUE;
+        argument.inline_value = {
+            static_cast<VernonDataType>(nb::cast<uint32_t>(row[2])),
+            static_cast<uint32_t>(shapes.back().size()),
+            shapes.back().data(),
+            inlineStorage.back().data(),
+            inlineStorage.back().size(),
+        };
+      } else {
+        throw std::runtime_error("invalid pipeline argument row");
+      }
+      arguments.push_back(argument);
+    }
     std::vector<VernonColorAttachment> attachments;
-    attachments.reserve(attachmentValues.size());
     for (nb::handle value : attachmentValues) {
       nb::tuple row = nb::cast<nb::tuple>(value);
-      if (row.size() != 2)
-        throw std::runtime_error("color attachment requires two fields");
       Texture *texture = nb::cast<Texture *>(row[1]);
-      if (!texture || texture->owner != owner)
-        throw std::runtime_error("color attachment belongs to another runtime");
+      if (row.size() != 2 || !texture || texture->owner != owner)
+        throw std::runtime_error("invalid color attachment");
       attachments.push_back({nb::cast<uint32_t>(row[0]), texture->handle});
     }
     VernonIndexBinding index{};
-    if (indexBuffer) {
-      if (indexBuffer->owner != owner)
-        throw std::runtime_error("index buffer belongs to another runtime");
+    if (indexBuffer)
       index = {indexBuffer->handle, VERNON_INDEX_U32, indexOffset, indexCount};
-    }
-    std::vector<VernonDrawBinding> bindings;
-    bindings.reserve(values.size());
-    for (nb::handle value : values) {
-      nb::tuple row = nb::cast<nb::tuple>(value);
-      if (row.size() != 6)
-        throw std::runtime_error("draw binding requires six fields");
-      Buffer *buffer = nb::cast<Buffer *>(row[1]);
-      if (!buffer || buffer->owner != owner)
-        throw std::runtime_error("draw buffer belongs to another runtime");
-      bindings.push_back({
-          nb::cast<uint32_t>(row[0]),
-          buffer->handle,
-          nb::cast<uint32_t>(row[2]),
-          nb::cast<uint32_t>(row[3]),
-          nb::cast<size_t>(row[4]),
-          nb::cast<uint32_t>(row[5]),
-      });
-    }
-    std::vector<VernonUniformBinding> uniforms;
-    std::vector<std::string> uniformNames;
-    std::vector<std::vector<float>> uniformData;
-    uniforms.reserve(uniformValues.size());
-    uniformNames.reserve(uniformValues.size());
-    uniformData.reserve(uniformValues.size());
-    for (nb::handle value : uniformValues) {
-      nb::tuple row = nb::cast<nb::tuple>(value);
-      if (row.size() != 3)
-        throw std::runtime_error("uniform binding requires three fields");
-      uniformNames.push_back(nb::cast<std::string>(row[0]));
-      nb::bytes bytes = nb::cast<nb::bytes>(row[1]);
-      uint32_t count = nb::cast<uint32_t>(row[2]);
-      if (bytes.size() != static_cast<size_t>(count) * sizeof(float))
-        throw std::runtime_error(
-            "uniform byte size does not match value count");
-      uniformData.emplace_back(count);
-      std::memcpy(uniformData.back().data(), bytes.c_str(), bytes.size());
-      uniforms.push_back(
-          {uniformNames.back().c_str(), uniformData.back().data(), count});
-    }
-    VernonDrawDescription description{};
-    description.struct_size = sizeof(description);
-    description.target = target ? target->handle : nullptr;
-    description.bindings = bindings.data();
-    description.binding_count = bindings.size();
-    description.uniforms = uniforms.data();
-    description.uniform_count = uniforms.size();
-    description.vertex_count = vertexCount;
-    description.instance_count = instanceCount;
-    description.index_binding = indexBuffer ? &index : nullptr;
-    description.color_attachments =
-        attachments.empty() ? nullptr : attachments.data();
-    description.color_attachment_count = attachments.size();
-    description.topology = topology;
-    description.clear_color[0] = std::get<0>(clear);
-    description.clear_color[1] = std::get<1>(clear);
-    description.clear_color[2] = std::get<2>(clear);
-    description.clear_color[3] = std::get<3>(clear);
-    if (vernonRuntimeDraw(handle, &description) != VERNON_STATUS_OK)
+    VernonPipelineInvocation invocation{};
+    invocation.struct_size = sizeof(invocation);
+    invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+    invocation.arguments = arguments.data();
+    invocation.argument_count = arguments.size();
+    invocation.index_binding = indexBuffer ? &index : nullptr;
+    invocation.color_attachments = attachments.data();
+    invocation.color_attachment_count = attachments.size();
+    invocation.topology = static_cast<VernonPrimitiveTopology>(topology);
+    invocation.vertex_count = vertexCount;
+    invocation.instance_count = instanceCount;
+    invocation.compute_grid = {std::get<0>(computeGrid),
+                               std::get<1>(computeGrid),
+                               std::get<2>(computeGrid)};
+    const uint32_t viewportValues[] = {
+        std::get<0>(viewport), std::get<1>(viewport), std::get<2>(viewport),
+        std::get<3>(viewport)};
+    const uint32_t scissorValues[] = {
+        std::get<0>(scissor), std::get<1>(scissor), std::get<2>(scissor),
+        std::get<3>(scissor)};
+    std::memcpy(invocation.viewport, viewportValues, sizeof(viewportValues));
+    std::memcpy(invocation.scissor, scissorValues, sizeof(scissorValues));
+    if (vernonRuntimePipelineInvoke(pipeline, &invocation) != VERNON_STATUS_OK)
       throw std::runtime_error(
-          "graphics draw failed: " +
-          stringView(vernonRuntimeGetLastError(runtimeHandle)));
+          "pipeline invocation failed: " +
+          stringView(vernonRuntimeGetLastError(runtime)));
   }
 
   Runtime *owner{};
-  VernonRuntimeContext *runtimeHandle{};
-  VernonLoadedProgram *handle{};
+  VernonRuntimeContext *runtime{};
+  VernonPipelineBundle *bundle{};
+  VernonLoadedPipeline *pipeline{};
 };
 
 struct Runtime {
+  explicit Runtime(VernonRuntimeContext *handle) : handle(handle) {}
   explicit Runtime(VernonRuntimeBackend backend, uint16_t apiMajor = 0,
                    uint16_t apiMinor = 0) {
     VernonRuntimeCreateOptions options{};
@@ -274,6 +289,26 @@ struct Runtime {
       throw std::runtime_error("requested runtime backend is unavailable");
   }
   ~Runtime() { vernonRuntimeDestroy(handle); }
+
+  static std::unique_ptr<Runtime>
+  createExternalOpenGL(VernonRuntimeBackend backend, uintptr_t userData,
+                       uintptr_t makeCurrent, uintptr_t getProcAddress,
+                       uint16_t apiMajor, uint16_t apiMinor) {
+    VernonExternalOpenGLContext external{};
+    external.struct_size = sizeof(external);
+    external.user_data = reinterpret_cast<void *>(userData);
+    external.make_current =
+        reinterpret_cast<VernonOpenGLMakeCurrentFn>(makeCurrent);
+    external.get_proc_address =
+        reinterpret_cast<VernonOpenGLGetProcAddressFn>(getProcAddress);
+    external.api_version_major = apiMajor;
+    external.api_version_minor = apiMinor;
+    VernonRuntimeContext *handle =
+        vernonRuntimeCreateExternalOpenGLForBackend(backend, &external);
+    if (!handle)
+      throw std::runtime_error("external OpenGL context is invalid");
+    return std::make_unique<Runtime>(handle);
+  }
 
   std::unique_ptr<Buffer> allocate(size_t size, size_t alignment) {
     return std::make_unique<Buffer>(this, size, alignment);
@@ -291,24 +326,42 @@ struct Runtime {
     return std::make_unique<LoadedKernel>(this, kernel);
   }
 
+  std::unique_ptr<LoadedKernel>
+  loadComputeBundle(const std::string &directory) {
+    VernonLoadedKernel *kernel =
+        vernonRuntimeLoadComputeBundle(handle, directory.c_str());
+    if (!kernel)
+      throw std::runtime_error(
+          "cannot load compute bundle: " +
+          stringView(vernonRuntimeGetLastError(handle)));
+    return std::make_unique<LoadedKernel>(this, kernel);
+  }
+
   std::unique_ptr<Texture> createTexture(uint32_t width, uint32_t height) {
     return std::make_unique<Texture>(this, width, height);
   }
 
-  std::unique_ptr<LoadedProgram> loadGraphics(const nb::bytes &vertex,
-                                              const nb::bytes &fragment) {
-    VernonLoadedProgram *program = vernonRuntimeProgramLoadGraphics(
-        handle, {vertex.c_str(), vertex.size()},
-        {fragment.c_str(), fragment.size()});
-    if (!program)
-      throw std::runtime_error("cannot load graphics program: " +
-                               stringView(vernonRuntimeGetLastError(handle)));
-    return std::make_unique<LoadedProgram>(this, handle, program);
-  }
-
-  void barrier() {
-    if (vernonRuntimeComputeToGraphicsBarrier(handle) != VERNON_STATUS_OK)
-      throw std::runtime_error("compute-to-graphics barrier failed");
+  std::unique_ptr<LoadedPipeline>
+  loadPipeline(const nb::bytes &data,
+               const std::vector<std::string> &features) {
+    VernonPipelineBundle *bundle =
+        vernonRuntimeLoadPipelineBundle(handle, data.c_str(), data.size());
+    if (!bundle)
+      throw std::runtime_error(
+          "cannot load pipeline bundle: " +
+          stringView(vernonRuntimeGetLastError(handle)));
+    std::vector<const char *> names;
+    for (const std::string &feature : features)
+      names.push_back(feature.c_str());
+    VernonLoadedPipeline *pipeline =
+        vernonRuntimeResolvePipeline(bundle, {names.data(), names.size()});
+    if (!pipeline) {
+      vernonRuntimePipelineBundleDestroy(bundle);
+      throw std::runtime_error(
+          "cannot resolve pipeline bundle: " +
+          stringView(vernonRuntimeGetLastError(handle)));
+    }
+    return std::make_unique<LoadedPipeline>(this, handle, bundle, pipeline);
   }
 
   void synchronize() {
@@ -364,11 +417,16 @@ NB_MODULE(_native, module) {
       .def(nb::init<VernonRuntimeBackend, uint16_t, uint16_t>(),
            nb::arg("backend"), nb::arg("api_major") = 0,
            nb::arg("api_minor") = 0)
+      .def_static("create_external_opengl", &Runtime::createExternalOpenGL,
+                  nb::arg("backend"), nb::arg("user_data"),
+                  nb::arg("make_current"), nb::arg("get_proc_address"),
+                  nb::arg("api_major"), nb::arg("api_minor"))
       .def("allocate", &Runtime::allocate, nb::keep_alive<0, 1>())
       .def("load", &Runtime::load, nb::keep_alive<0, 1>())
+      .def("load_compute_bundle", &Runtime::loadComputeBundle,
+           nb::keep_alive<0, 1>())
       .def("create_texture", &Runtime::createTexture, nb::keep_alive<0, 1>())
-      .def("load_graphics", &Runtime::loadGraphics, nb::keep_alive<0, 1>())
-      .def("barrier", &Runtime::barrier)
+      .def("load_pipeline", &Runtime::loadPipeline, nb::keep_alive<0, 1>())
       .def("synchronize", &Runtime::synchronize);
   nb::class_<Buffer>(module, "Buffer")
       .def("upload", &Buffer::upload)
@@ -380,14 +438,30 @@ NB_MODULE(_native, module) {
       .def_prop_ro("height", [](const Texture &value) { return value.height; })
       .def("upload", &Texture::upload)
       .def("download", &Texture::download);
-  nb::class_<LoadedProgram>(module, "LoadedProgram")
-      .def("draw", &LoadedProgram::draw, nb::arg("target"),
-           nb::arg("attachments"), nb::arg("bindings"), nb::arg("uniforms"),
-           nb::arg("vertex_count"), nb::arg("instance_count") = 1,
+  nb::class_<LoadedPipeline>(module, "LoadedPipeline")
+      .def("invoke", &LoadedPipeline::invoke, nb::arg("arguments"),
            nb::arg("index_buffer") = nullptr, nb::arg("index_count") = 0,
-           nb::arg("index_offset") = 0,
-           nb::arg("topology") = VERNON_TOPOLOGY_TRIANGLE_LIST,
-           nb::arg("clear") = std::make_tuple(0.0f, 0.0f, 0.0f, 0.0f));
+           nb::arg("index_offset") = 0, nb::arg("attachments") = nb::list(),
+           nb::arg("topology") =
+               static_cast<uint32_t>(VERNON_TOPOLOGY_TRIANGLE_LIST),
+           nb::arg("vertex_count") = 0, nb::arg("instance_count") = 1,
+           nb::arg("compute_grid") = std::make_tuple(0u, 0u, 0u),
+           nb::arg("viewport") = std::make_tuple(0u, 0u, 0u, 0u),
+           nb::arg("scissor") = std::make_tuple(0u, 0u, 0u, 0u));
+  module.attr("DATA_BOOL") = static_cast<uint32_t>(VERNON_DATA_BOOL);
+  module.attr("DATA_I32") = static_cast<uint32_t>(VERNON_DATA_I32);
+  module.attr("DATA_U32") = static_cast<uint32_t>(VERNON_DATA_U32);
+  module.attr("DATA_F16") = static_cast<uint32_t>(VERNON_DATA_F16);
+  module.attr("DATA_F32") = static_cast<uint32_t>(VERNON_DATA_F32);
+  module.attr("DATA_F64") = static_cast<uint32_t>(VERNON_DATA_F64);
+  module.attr("ACCESS_READ_WRITE") =
+      static_cast<uint32_t>(VERNON_ACCESS_READ_WRITE);
+  module.attr("TOPOLOGY_TRIANGLE_LIST") =
+      static_cast<uint32_t>(VERNON_TOPOLOGY_TRIANGLE_LIST);
+  module.attr("TOPOLOGY_LINE_LIST") =
+      static_cast<uint32_t>(VERNON_TOPOLOGY_LINE_LIST);
+  module.attr("TOPOLOGY_POINT_LIST") =
+      static_cast<uint32_t>(VERNON_TOPOLOGY_POINT_LIST);
   module.def("runtime_available", [](VernonRuntimeBackend backend) {
     return vernonRuntimeGetCapabilities(backend).available != 0;
   });

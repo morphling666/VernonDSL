@@ -17,6 +17,8 @@ import numpy as np
 
 from .compiler import Compiler
 from .module_graph import load_project
+from .shader_assets import (encode_runtime_stage,
+                            serialize_runtime_pipeline_bundle)
 from .types import Annotation, TypeExpr, _Scalar
 
 _native_dll_directories: list[Any] = []
@@ -81,6 +83,8 @@ _architecture = cpu
 _native_runtime: Any | None = None
 _runtime_generation = 0
 _api_version: tuple[int, int] | None = None
+_external_opengl_contexts: dict[_Architecture,
+                                tuple[int, int, int, tuple[int, int]]] = {}
 
 
 @dataclass(frozen=True)
@@ -117,18 +121,65 @@ def init(*,
             opengl: _native.RuntimeBackend.OPENGL,
             opengles: _native.RuntimeBackend.OPENGL_ES,
         }[arch]
-        if not _native.runtime_available(backend):
+        if arch in {opengl, opengles}:
+            external = _external_opengl_contexts.get(arch)
+            if external is None:
+                raise RuntimeError(
+                    f"{arch.name} requires a registered host-owned external context"
+                )
+            user_data, make_current, get_proc_address, registered_version = external
+            requested = api_version or registered_version
+            _native_runtime = _native.Runtime.create_external_opengl(
+                backend, user_data, make_current, get_proc_address, *requested)
+        elif not _native.runtime_available(backend):
             raise RuntimeError(
                 f"{arch.name} loader or a usable device is unavailable")
-        requested = api_version or (4, 3)
-        _native_runtime = _native.Runtime(backend, *requested)
+        else:
+            requested = api_version or (4, 3)
+            _native_runtime = _native.Runtime(backend, *requested)
     else:
-        _native_runtime = (_native.Runtime(_native.RuntimeBackend.CPU)
-                           if _native is not None else None)
+        _native_runtime = None
     _architecture = arch
     _api_version = api_version or ((4,
                                     3) if arch in {opengl, opengles} else None)
     _runtime_generation += 1
+
+
+def register_external_opengl_context(
+    *,
+    arch: _Architecture,
+    user_data: int,
+    make_current: int,
+    get_proc_address: int,
+    api_version: tuple[int, int],
+) -> None:
+    if arch not in {opengl, opengles}:
+        raise ValueError("external contexts are only valid for OpenGL backends")
+    if (not all(isinstance(value, int) and value >= 0
+                for value in (user_data, make_current, get_proc_address))
+            or not make_current or not get_proc_address):
+        raise ValueError("external context callbacks must be non-zero addresses")
+    if (len(api_version) != 2
+            or any(not isinstance(value, int) or value < 0
+                   for value in api_version)):
+        raise ValueError("api_version must be a non-negative major/minor pair")
+    _external_opengl_contexts[arch] = (user_data, make_current,
+                                       get_proc_address, api_version)
+
+
+class CpuAotRuntime:
+    """Low-level deployable CPU AOT bundle runtime."""
+
+    def __init__(self) -> None:
+        if _native is None:
+            raise RuntimeError("native runtime module is unavailable")
+        self._native = _native.Runtime(_native.RuntimeBackend.CPU)
+
+    def allocate(self, size: int, alignment: int = 16) -> Any:
+        return self._native.allocate(size, alignment)
+
+    def load_bundle(self, directory: str | Path) -> Any:
+        return self._native.load_compute_bundle(str(Path(directory).resolve()))
 
 
 _NUMPY_DTYPES = {
@@ -548,9 +599,7 @@ class Kernel:
                 cuda: _native.Target.CUDA,
                 vulkan: _native.Target.VULKAN,
                 opengl: _native.Target.OPENGL,
-                # Execute the supported compute subset through a desktop
-                # OpenGL compatibility context when EGL/GLES is unavailable.
-                opengles: _native.Target.OPENGL,
+                opengles: _native.Target.OPENGL_ES,
             }[_architecture]
             try:
                 artifact, reflection = _native.Compiler().compile(mlir, target)
@@ -748,6 +797,7 @@ class _CompiledPipeline:
     parameters: tuple[_ReflectedParameter, ...]
     outputs: tuple[_ReflectedOutput, ...]
     key: str
+    slots: Mapping[str, int]
 
 
 def _annotation_parts(value: Any) -> tuple[Any, tuple[Annotation, ...]]:
@@ -763,7 +813,7 @@ def _reflection_shape(type_name: str) -> tuple[int, ...]:
         return ()
     dimensions = type_name[7:-1].split("x")[:-1]
     if not all(value.isdigit() for value in dimensions):
-        raise RuntimeError(f"unsupported reflected graphics type {type_name}")
+        return ()
     return tuple(int(value) for value in dimensions)
 
 
@@ -823,143 +873,233 @@ class Pipeline:
             bool(row.get("vernon.varying", False)),
         )
 
-    def _compile(self) -> _CompiledPipeline:
-        if (self._compiled is not None
-                and self._compiled_generation == _runtime_generation):
-            return self._compiled
-        if _architecture not in {
-                opengl, opengles
-        } or _native is None or (_native_runtime is None):
-            raise RuntimeError(
-                "graphics pipelines require the OpenGL native runtime")
-        compiled_stages: list[tuple[Any, str, list[tuple[str, bytes]], str,
-                                    str]] = []
+    def _compile_pipeline_bundle(
+            self, call_arguments: Mapping[str, Any]) -> _CompiledPipeline:
+        if _native is None or _native_runtime is None:
+            raise RuntimeError("graphics requires the native pipeline runtime")
+        targets = {
+            vulkan: (_native.Target.VULKAN, "vulkan", 0),
+            opengl: (_native.Target.OPENGL, "opengl", 330),
+            opengles: (_native.Target.OPENGL_ES, "opengles", 310),
+        }
+        native_target, target_name, glsl_version = targets[_architecture]
+        stage_values = ([self._compute] if self._compute is not None else
+                        []) + [self._vertex, self._fragment]
+        compiled_stages: list[dict[str, Any]] = []
         native_compiler = _native.Compiler()
-        for stage in (self._vertex, self._fragment):
-            path = Path(inspect.getsourcefile(stage.function) or "")
-            mlir = Compiler().compile_file(path,
-                                           features=self._features,
-                                           entry=stage.__name__)
-            artifacts, reflection = native_compiler.compile_program(
-                mlir, _native.Target.OPENGL, 330)
-            compiled_stages.append((stage, mlir, list(artifacts), reflection,
-                                    str(path.resolve())))
+        for stage_value in stage_values:
+            function = getattr(stage_value, "_function",
+                               getattr(stage_value, "function", None))
+            if function is None:
+                raise RuntimeError("pipeline stage has no Python function")
+            entry_name = function.__name__
+            path = Path(inspect.getsourcefile(function) or "")
+            if stage_value is self._compute:
+                signature = inspect.signature(self._compute._function)
+                hints = get_type_hints(self._compute._function,
+                                       include_extras=True)
+                values = []
+                for parameter in signature.parameters.values():
+                    _, metadata = _annotation_parts(hints[parameter.name])
+                    if any(item.kind == "builtin" for item in metadata):
+                        continue
+                    if parameter.name not in call_arguments:
+                        raise TypeError(
+                            f"missing pipeline argument {parameter.name!r}")
+                    values.append(call_arguments[parameter.name])
+                mlir, _, _, _, _ = self._compute._lower(
+                    tuple(values), self._features)
+            else:
+                mlir = Compiler().compile_file(path,
+                                               features=self._features,
+                                               entry=entry_name)
+            artifacts, reflection_text = native_compiler.compile_program(
+                mlir, native_target, glsl_version)
+            reflection = json.loads(reflection_text)
+            entry = self._entry(reflection_text, entry_name)
+            artifact_rows = [
+                row for row in reflection.get("artifacts", ())
+                if row.get("entry_point") == entry_name
+                and row.get("stage") == entry["stage"]
+            ]
+            if len(artifact_rows) != 1:
+                raise RuntimeError(
+                    f"compiler reflection has no unique {entry['stage']} artifact"
+                )
+            reflected_filename = artifact_rows[0].get("filename")
+            matches = [(name, bytes(data)) for name, data in artifacts
+                       if name == reflected_filename]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"compiler produced no unique {entry['stage']} artifact")
+            artifact_name, artifact = matches[0]
+            stage_id = hashlib.sha256((entry_name + entry["stage"] +
+                                       reflection_text).encode("utf-8") +
+                                      artifact).hexdigest()
+            record = {
+                "id": stage_id,
+                "entry": entry_name,
+                "stage": entry["stage"],
+                "target": target_name,
+                "format": artifact_rows[0].get("format"),
+                "filename": artifact_name,
+                "reflection": reflection,
+            }
+            compiled_stages.append({
+                "id": stage_id,
+                "entry": entry,
+                "record": record,
+                "artifact": artifact,
+                "mlir": mlir,
+                "reflection": reflection_text,
+                "path": str(path.resolve()),
+            })
 
-        parameters: list[_ReflectedParameter] = []
-        entries: list[dict[str, Any]] = []
-        for stage, _, _, reflection, _ in compiled_stages:
-            entry = self._entry(reflection, stage.__name__)
-            entries.append(entry)
+        uses_by_name: dict[str, list[dict[str, Any]]] = {}
+        reflected_parameters: list[_ReflectedParameter] = []
+        for stage in compiled_stages:
+            entry = stage["entry"]
             for row in entry.get("arguments", ()):
                 parameter = self._parameter(entry["stage"], entry["name"], row)
-                if parameter is not None:
-                    parameters.append(parameter)
-        unsupported = sorted({
-            value.name
-            for value in parameters if value.interface == "resource"
-        })
-        if unsupported:
-            raise NotImplementedError(
-                "OpenGL graphics resources are not supported: " +
-                ", ".join(unsupported))
+                if parameter is None:
+                    continue
+                reflected_parameters.append(parameter)
+                if parameter.varying:
+                    continue
+                use = {
+                    "stage": entry["stage"],
+                    "entry": entry["name"],
+                    "index": int(row["index"]),
+                    "kind": row.get("kind", "scalar"),
+                    "type": row.get("type"),
+                    "dtype": row.get("dtype"),
+                    "shape": row.get("shape", []),
+                    "interface": row["vernon.interface"],
+                    "access": row.get("access", "read"),
+                }
+                for name in ("vernon.location", "vernon.instance_divisor",
+                             "vernon.set", "vernon.binding"):
+                    if name in row:
+                        use[name] = row[name]
+                uses_by_name.setdefault(parameter.name, []).append(use)
 
-        vertex_outputs = {
-            int(row["vernon.location"]): str(row["type"])
-            for row in entries[0].get("results", ())
-            if "vernon.location" in row
+        slots = {name: slot for slot, name in enumerate(sorted(uses_by_name))}
+        parameter_rows = []
+        for name in sorted(uses_by_name):
+            uses = uses_by_name[name]
+            first = uses[0]
+            kinds = {
+                "inline" if use["interface"] == "uniform" or
+                (use["stage"] == "compute"
+                 and use["kind"] not in {"tensor", "texture"}) else
+                ("texture" if use["kind"] == "texture" else "tensor")
+                for use in uses
+            }
+            if len(kinds) != 1:
+                raise TypeError(f"incompatible pipeline parameter {name!r}")
+            accesses = {str(use.get("access", "read")) for use in uses}
+            access = ("read_write" if "read_write" in accesses or accesses
+                      == {"read", "write"} else next(iter(accesses)))
+            parameter_rows.append({
+                "name": name,
+                "slot": slots[name],
+                "kind": next(iter(kinds)),
+                "type": first.get("type"),
+                "dtype": first.get("dtype"),
+                "shape": first.get("shape", []),
+                "access": access,
+                "uses": uses,
+            })
+
+        stage_by_kind = {
+            stage["entry"]["stage"]: stage
+            for stage in compiled_stages
         }
-        for parameter in parameters:
-            if parameter.stage != "fragment" or not parameter.varying:
-                continue
-            if parameter.location is None or vertex_outputs.get(
-                    parameter.location) != next(
-                        str(row["type"]) for row in entries[1]["arguments"]
-                        if int(row["index"]) == parameter.index):
-                raise RuntimeError(
-                    f"fragment varying {parameter.name!r} has no compatible vertex output"
-                )
-
+        fragment_entry = stage_by_kind["fragment"]["entry"]
         outputs = tuple(
-            _ReflectedOutput(
-                row.get("vernon.source_name"),
-                int(row["vernon.location"]),
-                str(row["type"]),
-            ) for row in entries[1].get("results", ())
+            _ReflectedOutput(row.get("vernon.source_name"),
+                             int(row["vernon.location"]), str(row["type"]))
+            for row in fragment_entry.get("results", ())
             if "vernon.location" in row)
-        if not outputs:
-            raise RuntimeError("fragment shader has no color output")
-
-        merged: dict[str, _ReflectedParameter] = {}
-        for parameter in parameters:
-            if parameter.varying:
-                continue
-            previous = merged.get(parameter.name)
-            if previous is not None and (
-                    previous.interface != parameter.interface
-                    or previous.value_shape != parameter.value_shape
-                    or previous.interface != "uniform"):
-                raise TypeError(
-                    f"incompatible pipeline parameter {parameter.name!r}")
-            merged.setdefault(parameter.name, parameter)
-
-        def artifact_hashes(
-                rows: list[tuple[str, bytes]]) -> tuple[tuple[str, str], ...]:
-            return tuple((name, hashlib.sha256(bytes(data)).hexdigest())
-                         for name, data in rows)
-
-        key_data = (
-            2,
-            _runtime_generation,
-            _architecture.name,
-            _api_version,
-            self._features,
-            tuple((stage.__name__, path,
-                   hashlib.sha256(mlir.encode("utf-8")).hexdigest(),
-                   hashlib.sha256(reflection.encode("utf-8")).hexdigest(),
-                   artifact_hashes(artifacts)) for stage, mlir, artifacts,
-                  reflection, path in compiled_stages),
-            tuple((value.name, value.interface, value.location, value.divisor,
-                   value.value_shape) for value in merged.values()),
-            tuple((value.name, value.location, value.type_name)
-                  for value in outputs),
-        )
-        key = hashlib.sha256(repr(key_data).encode("utf-8")).hexdigest()
+        steps = []
+        if "compute" in stage_by_kind:
+            steps.append({
+                "kind": "dispatch",
+                "stage": stage_by_kind["compute"]["id"],
+            })
+            steps.append({
+                "kind": "barrier",
+                "source": "compute_write",
+                "destination": "vertex_read",
+            })
+        steps.append({
+            "kind": "draw",
+            "vertex": stage_by_kind["vertex"]["id"],
+            "fragment": stage_by_kind["fragment"]["id"],
+        })
+        bundle = {
+            "pipeline_bundle_schema_version":
+            1,
+            "invocation_abi_version":
+            1,
+            "type":
+            "vernon_pipeline_bundle",
+            "id":
+            "interactive/" + hashlib.sha256(
+                repr((tuple(stage["id"] for stage in compiled_stages),
+                      self._features)).encode("utf-8")).hexdigest(),
+            "target":
+            target_name,
+            "target_options": {},
+            "features":
+            list(self._features),
+            "variants": [{
+                "key":
+                list(self._features),
+                "parameters":
+                parameter_rows,
+                "outputs": [{
+                    "name": output.name,
+                    "location": output.location,
+                    "type": output.type_name,
+                } for output in outputs],
+                "steps":
+                steps,
+            }],
+            "stage_artifacts": {
+                stage["id"]:
+                encode_runtime_stage(stage["record"], stage["artifact"])
+                for stage in compiled_stages
+            },
+        }
+        bundle_bytes = serialize_runtime_pipeline_bundle(bundle)
+        key = hashlib.sha256(bundle_bytes).hexdigest()
         cached = self._cache.get(key)
         if cached is None:
-
-            def select(artifacts: list[tuple[str, bytes]],
-                       marker: str) -> bytes:
-                for name, data in artifacts:
-                    if marker in name:
-                        return data
-                raise RuntimeError(f"compiler produced no {marker} artifact")
-
-            native = _native_runtime.load_graphics(
-                select(compiled_stages[0][2], ".vert."),
-                select(compiled_stages[1][2], ".frag."))
-            cached = _CompiledPipeline(native, tuple(parameters), outputs, key)
+            native = _native_runtime.load_pipeline(bundle_bytes,
+                                                   list(self._features))
+            cached = _CompiledPipeline(native, tuple(reflected_parameters),
+                                       outputs, key, slots)
             self._cache[key] = cached
             self.compile_count += 1
         self._compiled = cached
         self._compiled_generation = _runtime_generation
         return cached
 
-    @staticmethod
-    def _native_topology(topology: PrimitiveTopology) -> Any:
-        if not isinstance(topology, PrimitiveTopology):
-            raise TypeError(
-                "topology must be vd.triangles, vd.lines, or vd.points")
-        if not hasattr(_native, "PrimitiveTopology"):
-            if topology != triangles:
-                raise RuntimeError(
-                    "the native runtime must be rebuilt for line or point topology"
-                )
-            return 0
-        return {
-            triangles: _native.PrimitiveTopology.TRIANGLE_LIST,
-            lines: _native.PrimitiveTopology.LINE_LIST,
-            points: _native.PrimitiveTopology.POINT_LIST,
-        }[topology]
+    def _compile(
+            self,
+            call_arguments: Mapping[str, Any] | None = None
+    ) -> _CompiledPipeline:
+        if (self._compiled is not None
+                and self._compiled_generation == _runtime_generation):
+            return self._compiled
+        if _architecture in {vulkan, opengl, opengles}:
+            return self._compile_pipeline_bundle(call_arguments or {})
+        if _architecture == cpu:
+            raise RuntimeError(
+                "CPU graphics pipelines require a software rasterizer, which "
+                "Vernon does not provide; CPU supports compute kernels only")
+        raise RuntimeError("unsupported graphics backend")
 
     def __call__(self, **arguments: Any) -> None:
         target = arguments.pop("target", None)
@@ -968,31 +1108,23 @@ class Pipeline:
         topology = arguments.pop("topology", triangles)
         if target is not None and targets is not None:
             raise TypeError("pipeline call cannot use both target and targets")
-        compiled = self._compile()
-        if self._compute is not None:
-            if _api_version is None or _api_version < (4, 3):
-                raise RuntimeError(
-                    "compute+graphics pipelines require OpenGL 4.3")
-            signature = inspect.signature(self._compute._function)
-            hints = get_type_hints(self._compute._function,
-                                   include_extras=True)
-            compute_arguments = []
-            for parameter in signature.parameters.values():
-                _, metadata = _annotation_parts(hints[parameter.name])
-                if any(item.kind == "builtin" for item in metadata):
-                    continue
-                if parameter.name not in arguments:
-                    raise TypeError(
-                        f"missing pipeline argument {parameter.name!r}")
-                compute_arguments.append(arguments[parameter.name])
-            self._compute(*compute_arguments,
-                          _pipeline_features=self._features)
-            assert _native_runtime is not None
-            _native_runtime.barrier()
+        compiled = self._compile(arguments)
+        uses_pipeline_runtime = _architecture in {vulkan, opengl, opengles}
 
         host_parameters = [
             value for value in compiled.parameters if not value.varying
         ]
+        if uses_pipeline_runtime:
+            merged_parameters: dict[str, _ReflectedParameter] = {}
+            for value in host_parameters:
+                previous = merged_parameters.get(value.name)
+                if previous is None or previous.stage == "compute":
+                    merged_parameters[value.name] = value
+            host_parameters = [
+                merged_parameters[name]
+                for name in sorted(merged_parameters,
+                                   key=lambda name: compiled.slots[name])
+            ]
         expected = {value.name for value in host_parameters}
         compute_names: set[str] = set()
         if self._compute is not None:
@@ -1016,6 +1148,7 @@ class Pipeline:
 
         bindings: list[tuple[Any, ...]] = []
         uniforms: list[tuple[str, bytes, int]] = []
+        pipeline_arguments: list[tuple[Any, ...]] = []
         vertex_count: int | None = None
         instance_count: int | None = None
         for parameter in host_parameters:
@@ -1033,10 +1166,49 @@ class Pipeline:
                 uniforms.append(
                     (f"{parameter.entry}_arg_{parameter.index}._m0",
                      values.tobytes(order="C"), parameter.components))
+                if uses_pipeline_runtime:
+                    pipeline_arguments.append(
+                        ("inline", compiled.slots[parameter.name],
+                         _native.DATA_F32,
+                         values.tobytes(order="C"), list(values.shape)))
+                continue
+            if uses_pipeline_runtime and not isinstance(value,
+                                                        (Tensor, TensorView)):
+                scalar = np.asarray(value)
+                if scalar.dtype.kind == "f":
+                    scalar = np.asarray(value, dtype=np.float32)
+                    dtype = _native.DATA_F32
+                elif scalar.dtype.kind == "u":
+                    scalar = np.asarray(value, dtype=np.uint32)
+                    dtype = _native.DATA_U32
+                else:
+                    scalar = np.asarray(value, dtype=np.int32)
+                    dtype = _native.DATA_I32
+                pipeline_arguments.append(
+                    ("inline", compiled.slots[parameter.name], dtype,
+                     scalar.tobytes(), list(scalar.shape)))
                 continue
             if not isinstance(value, (Tensor, TensorView)):
                 raise TypeError(
                     f"pipeline argument {parameter.name!r} must be a Tensor")
+            if uses_pipeline_runtime and parameter.stage == "compute":
+                dtype = {
+                    np.dtype(np.float32): _native.DATA_F32,
+                    np.dtype(np.uint32): _native.DATA_U32,
+                    np.dtype(np.int32): _native.DATA_I32,
+                    np.dtype(np.float64): _native.DATA_F64,
+                }.get(value.dtype)
+                if dtype is None:
+                    raise TypeError(
+                        f"Vulkan pipeline does not support dtype {value.dtype}"
+                    )
+                layout = value.layout
+                pipeline_arguments.append(
+                    ("tensor", compiled.slots[parameter.name],
+                     value._resident_buffer(), dtype,
+                     _native.ACCESS_READ_WRITE, list(value.shape),
+                     list(layout.byte_strides), layout.byte_offset))
+                continue
             if value.dtype != np.dtype(np.float32):
                 raise TypeError("OpenGL vertex inputs require f32")
             if not value.shape or value.shape[1:] != parameter.value_shape:
@@ -1064,6 +1236,21 @@ class Pipeline:
             layout = value.layout
             stride = layout.byte_strides[0]
             buffer = value._resident_buffer()
+            if uses_pipeline_runtime:
+                dtype = {
+                    np.dtype(np.float32): _native.DATA_F32,
+                    np.dtype(np.uint32): _native.DATA_U32,
+                    np.dtype(np.int32): _native.DATA_I32,
+                    np.dtype(np.float64): _native.DATA_F64,
+                }.get(value.dtype)
+                if dtype is None:
+                    raise TypeError(
+                        f"Vulkan pipeline does not support dtype {value.dtype}"
+                    )
+                pipeline_arguments.append(
+                    ("tensor", compiled.slots[parameter.name], buffer, dtype,
+                     _native.ACCESS_READ_WRITE, list(value.shape),
+                     list(layout.byte_strides), layout.byte_offset))
             if len(parameter.value_shape) == 2:
                 columns, rows = parameter.value_shape
                 for column in range(columns):
@@ -1134,30 +1321,30 @@ class Pipeline:
             native_target = target._resident_texture()
             rendered_targets.append(target)
 
-        if hasattr(_native, "PrimitiveTopology"):
-            compiled.native.draw(
-                native_target,
-                native_attachments,
-                bindings,
-                uniforms,
-                vertex_count,
-                instance_count or 1,
+        if uses_pipeline_runtime:
+            native_topology = {
+                triangles: _native.TOPOLOGY_TRIANGLE_LIST,
+                lines: _native.TOPOLOGY_LINE_LIST,
+                points: _native.TOPOLOGY_POINT_LIST,
+            }[topology]
+            compiled.native.invoke(
+                pipeline_arguments,
                 native_index,
                 index_count,
                 0,
-                self._native_topology(topology),
-                (0.0, 0.0, 0.0, 0.0),
+                native_attachments
+                or ([(0, native_target)] if native_target is not None else []),
+                native_topology,
+                vertex_count,
+                instance_count or 1,
             )
-        else:
-            if native_attachments or native_index is not None:
-                raise RuntimeError(
-                    "the native runtime must be rebuilt for indices or multiple targets"
-                )
-            compiled.native.draw(native_target, bindings, uniforms,
-                                 vertex_count, instance_count or 1,
-                                 (0.0, 0.0, 0.0, 0.0))
         assert _native_runtime is not None
         _native_runtime.synchronize()
+        if uses_pipeline_runtime and self._compute is not None:
+            for name in compute_names:
+                value = arguments.get(name)
+                if isinstance(value, Tensor):
+                    value._mark_device_dirty()
         for texture in rendered_targets:
             texture._mark_device_dirty()
 

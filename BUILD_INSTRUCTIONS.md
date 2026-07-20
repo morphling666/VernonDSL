@@ -1,6 +1,16 @@
-# Building the Vernon Dialect (Standalone)
+# Building VernonDSL
 
-The Vernon dialect is built as a standalone project that uses MLIR as a third-party dependency. The `llvm-project` directory remains untouched.
+The compiler uses an installed LLVM/MLIR tree. `VernonRuntime` is a separate
+lightweight target and can be configured without the compiler.
+
+For a runtime-only build:
+
+```bash
+cmake -S . -B runtime_build \
+  -DVERNON_ENABLE_COMPILER=OFF \
+  -DVERNON_ENABLE_RUNTIME=ON
+cmake --build runtime_build --target VernonRuntime
+```
 
 ## Prerequisites
 
@@ -51,7 +61,7 @@ The Vernon dialect is built as a standalone project that uses MLIR as a third-pa
 
 3. **Build:**
    ```powershell
-   cmake --build . --target MLIRVernonDialect
+   cmake --build . --config Release --parallel 4
    ```
 
    Or build everything:
@@ -79,7 +89,7 @@ The Vernon dialect is built as a standalone project that uses MLIR as a third-pa
 
 3. **Build:**
    ```bash
-   cmake --build . --target MLIRVernonDialect
+   cmake --build . --parallel 4
    ```
 
 ## Project Structure

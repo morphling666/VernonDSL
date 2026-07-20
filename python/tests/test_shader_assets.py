@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import tempfile
 import unittest
@@ -87,6 +89,52 @@ class ShaderAssetCookTests(unittest.TestCase):
                 if "vernon.location" in value
             ]
             self.assertEqual(locations, [0, 1, 5, 6])
+            runtime_bundle = json.loads(
+                (Path(directory) /
+                 "pipeline.bundle").read_text(encoding="utf-8"))
+            self.assertEqual(runtime_bundle["pipeline_bundle_schema_version"],
+                             1)
+            self.assertEqual(runtime_bundle["invocation_abi_version"], 1)
+            self.assertEqual(runtime_bundle["id"], "shaders/variant_mesh")
+            self.assertEqual(len(runtime_bundle["variants"]), 4)
+            combined_runtime = next(variant
+                                    for variant in runtime_bundle["variants"]
+                                    if variant["key"] == ["INSTANCE", "SKIN"])
+            self.assertEqual(combined_runtime["steps"][0]["kind"], "draw")
+            slots = {
+                parameter["name"]: parameter["slot"]
+                for parameter in combined_runtime["parameters"]
+            }
+            self.assertEqual(sorted(slots.values()), list(range(len(slots))))
+            self.assertTrue(
+                all("source" in stage
+                    for stage in runtime_bundle["stage_artifacts"].values()))
+
+    def test_vulkan_pipeline_bundle_embeds_verified_spirv(self) -> None:
+        root = Path(__file__).parents[2]
+        compiler = root / "build" / "source" / "Release" / "vernon-compile.exe"
+        if not compiler.is_file():
+            self.skipTest("native Vernon compiler is not built")
+        with tempfile.TemporaryDirectory() as directory:
+            cook_shader_pipeline(
+                pipeline_manifest=root / "examples" /
+                "variant_mesh.shader-pipeline.json",
+                asset_root=root / "examples",
+                compiler=compiler,
+                output=directory,
+                target="vulkan",
+            )
+            runtime_bundle = json.loads(
+                (Path(directory) /
+                 "pipeline.bundle").read_text(encoding="utf-8"))
+            for stage in runtime_bundle["stage_artifacts"].values():
+                self.assertNotIn("source", stage)
+                artifact = stage["artifact"]
+                self.assertEqual(artifact["format"], "spirv")
+                self.assertEqual(artifact["encoding"], "base64")
+                decoded = base64.b64decode(artifact["data"], validate=True)
+                self.assertEqual(hashlib.sha256(decoded).hexdigest(),
+                                 artifact["sha256"])
 
 
 if __name__ == "__main__":

@@ -2,11 +2,45 @@
 
 ## CPU compute bundles
 
-CPU bundles persist the compiler's textual LLVM IR artifact. The standalone
-runtime loads it with LLVM ORC and keeps the JIT alive for the lifetime of the
-loaded kernel. This keeps bundle loading independent of CPython and
-`VernonDSLCompiler`, while avoiding platform-specific shared-library link steps
-in the asset cooker.
+Deployable CPU bundles contain a platform-native shared library with stable C
+entry wrappers. Schema version 2 records the operating system, architecture,
+CPU invocation ABI, exported symbol, artifact size, and SHA-256. The
+runtime validates all metadata before loading the library through Win32 or
+POSIX APIs. LLVM IR and ORC JIT are not runtime bundle formats.
+
+## Backend loading
+
+`VernonRuntime` owns the shared Win32/POSIX library loader used by CPU AOT,
+CUDA, and Vulkan. CUDA Driver and Vulkan loader symbols are resolved at runtime;
+Vulkan headers are compile-only. This keeps LLVM, GLFW, CUDA Toolkit libraries,
+and the Vulkan loader import library outside the deployable runtime dependency
+closure.
+
+OpenGL function resolution is isolated in `backend_opengl_driver`; unlike CUDA
+and Vulkan it consumes a host callback because the host owns the current
+context. OpenGL and OpenGL ES are distinct external-context backends and only
+accept bundles for their matching GLSL profile. Context creation is host policy.
+
+## Vulkan graphics bundles
+
+Vulkan pipeline bundles store each SPIR-V stage as base64 with an SHA-256
+digest because JSON strings cannot safely carry binary modules. Resolution
+creates immutable shader modules. Invocation creates render-pass and pipeline
+state from the concrete attachment and vertex layouts, submits synchronously,
+then releases that transient state. This first implementation favors correct
+layout specialization; a later cache can key the same state without changing
+the bundle ABI. RGBA8 offscreen images use optimal tiling and staging buffers
+for host upload/readback. Unbound graphics uniforms use the compiler's single
+push-constant block ABI; descriptor-bound uniforms remain a later extension.
+
+## Python native module
+
+Python exposes compiler services and all runtime backends through one `_native`
+module. The module links the compiler DLL and `VernonRuntime`; the runtime DLL
+itself retains its dependency boundary. Interactive GPU pipelines serialize
+the same bundle schema as the asset cooker. CPU interpreter examples remain
+compute-only because Vernon does not provide a software rasterizer; deployable
+CPU execution loads native AOT bundles.
 
 ## Launch ownership
 
@@ -60,19 +94,18 @@ normalization. CUDA's LLVM math pass is never used: Vulkan retains standard
 math operations for SPIR-V lowering, and Metal source is cross-compiled from
 the same SPIR-V module.
 
-## OpenGL compute runtime
+## OpenGL and OpenGL ES runtime
 
-The OpenGL backend uses GLFW only to create a hidden OpenGL 4.3 core context
-and resolve compute entry points. Tensor and scalar arguments are shader
-storage buffers bound according to reflection; launches are synchronous and
-issue a shader-storage memory barrier before host access.
+OpenGL and OpenGL ES are external-context backends. The host supplies
+`make_current` and `get_proc_address` callbacks through
+`vernonRuntimeCreateExternalOpenGLForBackend`; Python registers the same
+addresses with `register_external_opengl_context`. `VernonRuntime` never
+creates or links a window-system context.
 
-OpenGL ES source remains available as GLSL ES 3.10 through SPIRV-Cross.
-Runtime `opengles` currently executes the same supported compute subset through
-the desktop OpenGL compatibility path because EGL and a GLES implementation
-are not system components on every desktop platform. A native GLES runtime
-will require an explicit EGL provider rather than silently depending on one
-installed by another application.
+Each backend accepts only pipeline bundles compiled for its matching GLSL
+profile. Compute requires OpenGL 4.3 or OpenGL ES 3.1 and binds reflected
+storage buffers before issuing a shader-storage barrier. Graphics imports host
+buffer and texture handles, so resources remain owned by the host context.
 
 ## Tensor indexing
 
@@ -82,12 +115,12 @@ indices are flattened in NumPy-compatible row-major order:
 
 ## Unified compute and graphics execution
 
-The compute launch ABI remains version 1 and `vernonRuntimeLaunch` is
-unchanged. Graphics is an additive ABI: versioned context creation,
-RGBA8 Texture lifetime and transfer operations, graphics program loading,
-reflected vertex bindings, uniform uploads, offscreen draw submission, and an
-explicit compute-to-graphics barrier. OpenGL 3.3 is sufficient for a
-vertex/fragment pipeline; compositions containing compute require OpenGL 4.3.
+The compute launch ABI remains version 1. Maintained graphics execution uses
+`VernonPipelineBundle`, `VernonLoadedPipeline`, and
+`vernonRuntimePipelineInvoke`. Bundle resolution validates feature variants,
+stage artifacts, reflected parameter slots, and output layouts before
+submission. OpenGL 3.3 or OpenGL ES 3.0 is sufficient for graphics;
+compute/graphics compositions require OpenGL 4.3 or OpenGL ES 3.1.
 
 Pipeline submission order is fixed: upload host-dirty Tensors, dispatch the
 optional compute entry, issue the storage/vertex-input barrier, bind the
@@ -101,7 +134,7 @@ runtime invalidates cached native handles. Within a generation, unchanged
 host data is not uploaded again, shader writes remain device-resident, and
 `to_numpy()` is the synchronization point that downloads device-dirty data.
 
-## Advanced OpenGL draw state
+## Graphics invocation state
 
 Index buffers remain ordinary resident `u32` Tensors, but `indices` is a
 host-only draw argument and never enters a shader interface. Primitive topology
@@ -114,9 +147,10 @@ iteration order. Feature specialization runs before the vertex/fragment
 interfaces are merged and validated, making the specialized reflection the
 only runtime binding contract.
 
-Graphics draw ABI version 2 appends index, color-attachment, and topology
-fields after the version-1 prefix. `struct_size` gates access to those fields;
-version-1 descriptions normalize their single `target` to location zero.
+Pipeline invocation ABI version 1 carries index bindings, color attachments,
+topology, viewport, scissor, compute grid, and reflected argument slots.
+Backend-specific command encoding consumes this common invocation without
+exposing legacy program/draw entry points.
 
 ## Shared definitions and struct methods
 
