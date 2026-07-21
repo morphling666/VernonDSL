@@ -6,20 +6,29 @@ requires-python = ">=3.11.9,<3.12"
 authors = [{ name = "Xinyu Yuan", email = "1282503538@qq.com" }]
 
 dependencies = [
-    "pybind11>=3.0.0",
-    "sympy>=1.13.3",
     "numpy>=1.26,<2.0",
-    "pandas>=2.3.1",
-    "pyyaml>=6.0.2",
-    "nanobind>=2.7.0",
-    "clang>=20.1.5",
-    "pyserial>=3.5",
-    "clang-format==20.1.8",
-    "yapf==0.43.0",
-    "fastapi>=0.115.7",
-    "uvicorn>=0.29.0",
-    "watchdog>=4.0.0",
-    "requests>=2.28.1",
-    "taichi>=1.7.4",
-    "conan>=2.22.0",
 ]
+
+[project.optional-dependencies]
+examples = ["opencv-python>=4.10"]
+build = [
+    "nanobind>=2.7.0",
+    "clang-format==20.1.8",
+]
+
+[project.scripts]
+vernon-compile-python = "vernon_dsl.cli:main"
+vernon-cook-shader = "vernon_dsl.shader_asset_cli:main"
+
+[build-system]
+requires = [
+    "scikit-build-core>=0.11",
+    "nanobind>=2.7.0",
+]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+wheel.packages = ["python/vernon_dsl"]
+cmake.build-type = "Release"
+cmake.args = ["-DBUILD_TESTING=OFF"]
+install.components = ["VernonWheel"]

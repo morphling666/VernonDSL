@@ -13,6 +13,7 @@
 #include "mlir/IR/Types.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/ErrorHandling.h"
 
 using namespace mlir;
@@ -20,3 +21,14 @@ using namespace mlir::vernon;
 
 #define GET_TYPEDEF_CLASSES
 #include "mlir/Dialect/Vernon/IR/VernonTypes.cpp.inc"
+
+void VernonDialect::initialize() {
+  addTypes<
+#define GET_TYPEDEF_LIST
+#include "mlir/Dialect/Vernon/IR/VernonTypes.cpp.inc"
+      >();
+  addOperations<
+#define GET_OP_LIST
+#include "mlir/Dialect/Vernon/IR/VernonOps.cpp.inc"
+      >();
+}

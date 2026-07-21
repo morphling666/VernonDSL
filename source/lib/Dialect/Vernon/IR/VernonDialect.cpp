@@ -16,8 +16,10 @@
 // ADD THESE
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+
 
 using namespace mlir;
 using namespace mlir::vernon;
@@ -27,17 +29,6 @@ using namespace mlir::vernon;
 //===----------------------------------------------------------------------===//
 // VernonDialect Methods
 //===----------------------------------------------------------------------===//
-
-void VernonDialect::initialize() {
-  addTypes<
-#define GET_TYPEDEF_LIST
-#include "mlir/Dialect/Vernon/IR/VernonTypes.cpp.inc"
-      >();
-  addOperations<
-#define GET_OP_LIST
-#include "mlir/Dialect/Vernon/IR/VernonOps.cpp.inc"
-      >();
-}
 
 void VernonDialect::getCanonicalizationPatterns(
     RewritePatternSet &patterns) const {

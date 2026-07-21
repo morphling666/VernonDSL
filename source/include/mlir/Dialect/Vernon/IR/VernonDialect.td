@@ -19,19 +19,21 @@ def Vernon_Dialect : Dialect {
   let cppNamespace = "::mlir::vernon";
 
   let description = [{
-    The Vernon dialect defines types and operations for tensor computations
-    with support for n-dimensional shapes and swizzling accessors.
+    The Vernon dialect defines shader stage and interface semantics around
+    MLIR-native computation.
 
     The dialect provides:
-    - A general tensor type with n-dimensional shape support
-    - Type aliases for common vector and matrix types (vec2, vec3, vec4, mat2, mat3, mat4)
-    - Operations for component access and swizzling (.r, .g, .b, .a, .rg, .rgb, etc.)
+    - Stable stage and interface annotations for function boundaries
+    - Semantic attributes used by validation and future lowering
+    - Standard tensor/vector/linalg types and operations for ordinary values
   }];
 
   let hasCanonicalizer = 1;
   let hasConstantMaterializer = 1;
+  let useDefaultTypePrinterParser = 1;
   let dependentDialects = [
     "arith::ArithDialect",
+    "memref::MemRefDialect",
     "tensor::TensorDialect",
     "vector::VectorDialect",
     "linalg::LinalgDialect"
