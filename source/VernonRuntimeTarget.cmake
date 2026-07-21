@@ -10,13 +10,14 @@ function(vernon_add_runtime)
   add_library(Vernon::Runtime ALIAS VernonRuntime)
   target_compile_definitions(VernonRuntime PRIVATE VERNON_RUNTIME_BUILD)
   if(VERNON_ENABLE_CUDA_RUNTIME)
-    target_compile_definitions(VernonRuntime PRIVATE VERNON_HAS_CUDA_RUNTIME=1)
+    target_compile_definitions(VernonRuntime PUBLIC VERNON_HAS_CUDA_RUNTIME=1)
   endif()
   if(VERNON_ENABLE_VULKAN_RUNTIME)
     target_sources(VernonRuntime PRIVATE
       ${_VERNON_RUNTIME_SOURCE_DIR}/lib/runtime/backend_vulkan_driver.cpp)
-    target_compile_definitions(VernonRuntime PRIVATE
-      VERNON_HAS_VULKAN_RUNTIME=1 VK_NO_PROTOTYPES=1)
+    target_compile_definitions(VernonRuntime
+      PUBLIC VERNON_HAS_VULKAN_RUNTIME=1
+      PRIVATE VK_NO_PROTOTYPES=1)
     target_link_libraries(VernonRuntime PRIVATE Vulkan::Headers)
   endif()
   target_include_directories(VernonRuntime PUBLIC

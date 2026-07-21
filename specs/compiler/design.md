@@ -49,6 +49,15 @@ executing user code and emits textual MLIR. The C API accepts that MLIR,
 validates it, emits reflection, and invokes an available target pipeline. It
 does not embed CPython.
 
+## Pipeline asset declarations
+
+Persistent pipeline composition is declared with a module-level
+`pipeline_asset(...)` assignment beside its stage functions. The cooker parses
+that assignment from the source AST; it must not import or execute the module.
+Assets explicitly enumerate allowed feature combinations, preventing implicit
+powerset growth. Stage compilation remains cached per entry and feature key, so
+unchanged artifacts are content-addressed and shared across variants.
+
 A target is reported as available only after its complete lowering and
 artifact generation pipeline is registered. An IR-only prototype must return
 `VERNON_STATUS_UNSUPPORTED_TARGET`.
@@ -120,17 +129,15 @@ option rather than silently ignoring it.
    `ShaderProvider`. This is source loading only; reflected resources are not
    yet bound.
 9. Compiler reflection schema 2 includes target options and an explicit
-   entry-point/stage/format/filename artifact table. The CLI cooks a normally
-   named directory containing `shader.json` and separate readable OpenGL
-   artifacts; Vernon validates, registers, mounts, and lazily links these
-   bundles through `ShaderProvider`. This first runtime asset slice requires one
-   vertex and one fragment artifact.
+   entry-point/stage/format/filename artifact table. The cooker emits one
+   `<name>.pipeline.json` plus content-addressed external artifacts; it no
+   longer emits the retired `shader.json` compatibility manifest.
 10. The Python frontend specializes `feature`, `When`, and compile-time feature
     branches, prunes compilation to a selected stage entry, and infers stable
-    interface locations from the unspecialized signature. Shader-module and
-    shader-pipeline manifests cook explicit variant sets into a schema-2
-    `shader.json`; unchanged stages are content-deduplicated. Vernon parses this
-    variant map and resolves exact canonical feature sets without fallback.
+   interface locations from the unspecialized signature. Pipeline asset
+   declarations cook explicit variant sets into the schema-2 pipeline manifest;
+   unchanged stages are content-deduplicated. Vernon resolves exact canonical
+   feature sets without fallback.
 
 ## Shader function kinds
 

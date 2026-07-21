@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -16,15 +17,20 @@ int main() {
   if (!vernonRuntimeGetCapabilities(VERNON_RUNTIME_VULKAN).available)
     return 0;
 
-  std::ifstream input(VERNON_VULKAN_PIPELINE_BUNDLE, std::ios::binary);
+  const std::filesystem::path manifestPath = VERNON_VULKAN_PIPELINE_BUNDLE;
+  std::ifstream input(manifestPath, std::ios::binary);
   const std::string bundle((std::istreambuf_iterator<char>(input)),
                            std::istreambuf_iterator<char>());
   assert(!bundle.empty());
 
   VernonRuntimeContext *runtime = vernonRuntimeCreate(VERNON_RUNTIME_VULKAN, 0);
   assert(runtime);
-  VernonPipelineBundle *loaded =
-      vernonRuntimeLoadPipelineBundle(runtime, bundle.data(), bundle.size());
+  const std::string bundleDirectory = manifestPath.parent_path().u8string();
+  VernonPipelineBundleLoadOptions options{};
+  options.struct_size = sizeof(options);
+  options.bundle_directory = bundleDirectory.c_str();
+  VernonPipelineBundle *loaded = vernonRuntimeLoadPipelineBundleWithOptions(
+      runtime, bundle.data(), bundle.size(), &options);
   if (!loaded) {
     const VernonStringView error = vernonRuntimeGetLastError(runtime);
     std::fwrite(error.data, 1, error.size, stderr);

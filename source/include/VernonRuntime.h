@@ -286,6 +286,10 @@ typedef struct VernonPipelineOutputView {
 
 typedef struct VernonPipelineBundleLoadOptions {
   uint32_t struct_size;
+  /*
+   * UTF-8 directory containing the manifest. Required by schema-2 external
+   * artifact descriptors and legacy CPU native-library sidecars.
+   */
   const char *bundle_directory;
   /* Reserved for future use; initialize all elements to zero. */
   uint32_t reserved[4];
@@ -293,6 +297,10 @@ typedef struct VernonPipelineBundleLoadOptions {
 
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimePipelineBundleInspectTarget(
     const void *bundle, size_t bundle_size, VernonRuntimeBackend *target);
+/*
+ * Loads legacy pipeline-bundle schema 1 or pipeline schema 2. The convenience
+ * form supports inline artifacts; use the options form for external artifacts.
+ */
 /* Compatibility convenience API; prefer the options-based loader. */
 VERNON_RUNTIME_CAPI VernonPipelineBundle *
 vernonRuntimeLoadPipelineBundle(VernonRuntimeContext *context,

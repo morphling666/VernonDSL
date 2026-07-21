@@ -1,7 +1,13 @@
 #include "VernonRuntime.h"
+#include "runtime/content_hash.h"
+
+#include <nlohmann/json.hpp>
 
 #include <cassert>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
 
 namespace {
 
@@ -43,7 +49,7 @@ void GL_CALL drawArrays(GlEnum, GlInt, GlSize) { ++drawCount; }
 
 void *getProcAddress(void *, const char *name) {
 #define PROC(glName, function)                                                 \
-  if (std::strcmp(name, glName) == 0)                                         \
+  if (std::strcmp(name, glName) == 0)                                          \
   return reinterpret_cast<void *>(&function)
   PROC("glCreateShader", createName);
   PROC("glShaderSource", shaderSource);
@@ -69,6 +75,49 @@ VernonRuntimeContext *create(VernonRuntimeBackend backend, uint16_t major,
   return vernonRuntimeCreateExternalOpenGLForBackend(backend, &external);
 }
 
+std::string schema2Bundle(const nlohmann::json &artifact) {
+  nlohmann::json root = {
+      {"schema_version", 2},
+      {"type", "pipeline"},
+      {"id", "schema2/gl"},
+      {"target", "opengl"},
+      {"invocation_abi_version", 1},
+      {"features", nlohmann::json::array()},
+      {"variants",
+       nlohmann::json::array(
+           {{{"key", nlohmann::json::array()},
+             {"parameters", nlohmann::json::array()},
+             {"steps", nlohmann::json::array({{{"kind", "draw"},
+                                               {"vertex", "vs"},
+                                               {"fragment", "fs"}}})}}})},
+      {"stage_artifacts",
+       {{"vs",
+         {{"id", "vs"},
+          {"stage", "vertex"},
+          {"entry", "main"},
+          {"target", "opengl"},
+          {"artifact", artifact}}},
+        {"fs",
+         {{"id", "fs"},
+          {"stage", "fragment"},
+          {"entry", "main"},
+          {"target", "opengl"},
+          {"artifact", artifact}}}}}};
+  const std::string canonical = root.dump(-1, ' ', false);
+  root["content_hash"] =
+      vernon::runtime::sha256Hex(canonical.data(), canonical.size());
+  return root.dump(-1, ' ', false);
+}
+
+nlohmann::json inlineArtifact(const std::string &source) {
+  return {{"format", "glsl"},
+          {"storage", "inline"},
+          {"encoding", "utf8"},
+          {"data", source},
+          {"size", source.size()},
+          {"sha256", vernon::runtime::sha256Hex(source.data(), source.size())}};
+}
+
 } // namespace
 
 int main() {
@@ -82,7 +131,8 @@ int main() {
   VernonRuntimeCapabilities capabilities =
       vernonRuntimeGetContextCapabilities(gl);
   assert(capabilities.available && capabilities.supports_graphics);
-  assert(capabilities.supports_compute && capabilities.supports_storage_buffers);
+  assert(capabilities.supports_compute &&
+         capabilities.supports_storage_buffers);
   constexpr char glBundle[] =
       R"({"pipeline_bundle_schema_version":1,"invocation_abi_version":1,"type":"vernon_pipeline_bundle","id":"external-gl","target":"opengl","features":[],"variants":[{"key":[],"parameters":[],"steps":[{"kind":"draw","vertex":"vs","fragment":"fs"}]}],"stage_artifacts":{"vs":{"stage":"vertex","entry":"main","source":"#version 330\nvoid main(){gl_Position=vec4(0.0);}"},"fs":{"stage":"fragment","entry":"main","source":"#version 330\nout vec4 color;void main(){color=vec4(1.0);}"}}})";
   VernonPipelineBundle *glLoaded =
@@ -91,9 +141,8 @@ int main() {
   VernonLoadedPipeline *pipeline =
       vernonRuntimeResolvePipeline(glLoaded, {nullptr, 0});
   assert(pipeline);
-  VernonDeviceTexture *target =
-      vernonRuntimeImportOpenGLTexture2D(gl, 7, 16, 16,
-                                         VERNON_TEXTURE_RGBA8_UNORM);
+  VernonDeviceTexture *target = vernonRuntimeImportOpenGLTexture2D(
+      gl, 7, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
   assert(target);
   VernonColorAttachment attachment{0, target};
   VernonPipelineInvocation invocation{};
@@ -104,11 +153,104 @@ int main() {
   invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
   invocation.vertex_count = 3;
   invocation.instance_count = 1;
-  assert(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
+  assert(vernonRuntimePipelineInvoke(pipeline, &invocation) ==
+         VERNON_STATUS_OK);
   assert(drawCount == 1);
   assert(vernonRuntimeTextureFree(target) == VERNON_STATUS_OK);
   vernonRuntimeLoadedPipelineDestroy(pipeline);
   vernonRuntimePipelineBundleDestroy(glLoaded);
+  assert(vernonRuntimeDestroy(gl) == VERNON_STATUS_OK);
+
+  gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+  assert(gl);
+  const std::string source = "#version 330\nvoid main(){}";
+  const std::string inlineBundle = schema2Bundle(inlineArtifact(source));
+  VernonRuntimeBackend schema2Target = VERNON_RUNTIME_CPU;
+  assert(vernonRuntimePipelineBundleInspectTarget(
+             inlineBundle.data(), inlineBundle.size(), &schema2Target) ==
+         VERNON_STATUS_OK);
+  assert(schema2Target == VERNON_RUNTIME_OPENGL);
+  glLoaded = vernonRuntimeLoadPipelineBundle(gl, inlineBundle.data(),
+                                             inlineBundle.size());
+  assert(glLoaded);
+  vernonRuntimePipelineBundleDestroy(glLoaded);
+
+  std::string corruptManifest = inlineBundle;
+  const size_t contentHash = corruptManifest.find("\"content_hash\":\"");
+  assert(contentHash != std::string::npos);
+  corruptManifest[contentHash + std::strlen("\"content_hash\":\"")] ^= 1;
+  assert(!vernonRuntimeLoadPipelineBundle(gl, corruptManifest.data(),
+                                          corruptManifest.size()));
+
+  nlohmann::json corruptInline = inlineArtifact(source);
+  corruptInline["sha256"] = std::string(64, '0');
+  const std::string corruptInlineBundle = schema2Bundle(corruptInline);
+  assert(!vernonRuntimeLoadPipelineBundle(gl, corruptInlineBundle.data(),
+                                          corruptInlineBundle.size()));
+  nlohmann::json wrongFormat = inlineArtifact(source);
+  wrongFormat["format"] = "ptx";
+  const std::string wrongFormatBundle = schema2Bundle(wrongFormat);
+  assert(!vernonRuntimeLoadPipelineBundle(gl, wrongFormatBundle.data(),
+                                          wrongFormatBundle.size()));
+
+  const std::filesystem::path assetRoot =
+      std::filesystem::temp_directory_path() / "vernon_runtime_schema2_test";
+  std::filesystem::remove_all(assetRoot);
+  std::filesystem::create_directories(assetRoot / "artifacts");
+  const std::filesystem::path artifactPath = assetRoot / "artifacts/stage.glsl";
+  {
+    std::ofstream output(artifactPath, std::ios::binary);
+    output.write(source.data(), static_cast<std::streamsize>(source.size()));
+  }
+  const nlohmann::json externalArtifact = {
+      {"format", "glsl"},
+      {"storage", "external"},
+      {"path", "artifacts/stage.glsl"},
+      {"size", source.size()},
+      {"sha256", vernon::runtime::sha256Hex(source.data(), source.size())}};
+  const std::string externalBundle = schema2Bundle(externalArtifact);
+  const std::string assetRootUtf8 = assetRoot.u8string();
+  VernonPipelineBundleLoadOptions options{};
+  options.struct_size = sizeof(options);
+  options.bundle_directory = assetRootUtf8.c_str();
+  glLoaded = vernonRuntimeLoadPipelineBundleWithOptions(
+      gl, externalBundle.data(), externalBundle.size(), &options);
+  assert(glLoaded);
+  vernonRuntimePipelineBundleDestroy(glLoaded);
+
+  nlohmann::json traversalArtifact = externalArtifact;
+  traversalArtifact["path"] = "../stage.glsl";
+  const std::string traversalBundle = schema2Bundle(traversalArtifact);
+  assert(!vernonRuntimeLoadPipelineBundleWithOptions(
+      gl, traversalBundle.data(), traversalBundle.size(), &options));
+  assert(!vernonRuntimeLoadPipelineBundle(gl, externalBundle.data(),
+                                          externalBundle.size()));
+
+  const std::filesystem::path outsidePath =
+      assetRoot.parent_path() / "vernon_runtime_schema2_escape.glsl";
+  {
+    std::ofstream output(outsidePath, std::ios::binary);
+    output.write(source.data(), static_cast<std::streamsize>(source.size()));
+  }
+  std::error_code symlinkError;
+  const std::filesystem::path symlinkPath = assetRoot / "artifacts/escape.glsl";
+  std::filesystem::create_symlink(outsidePath, symlinkPath, symlinkError);
+  if (!symlinkError) {
+    nlohmann::json symlinkArtifact = externalArtifact;
+    symlinkArtifact["path"] = "artifacts/escape.glsl";
+    const std::string symlinkBundle = schema2Bundle(symlinkArtifact);
+    assert(!vernonRuntimeLoadPipelineBundleWithOptions(
+        gl, symlinkBundle.data(), symlinkBundle.size(), &options));
+  }
+  std::filesystem::remove(outsidePath);
+
+  {
+    std::ofstream output(artifactPath, std::ios::binary | std::ios::trunc);
+    output << "corrupt";
+  }
+  assert(!vernonRuntimeLoadPipelineBundleWithOptions(
+      gl, externalBundle.data(), externalBundle.size(), &options));
+  std::filesystem::remove_all(assetRoot);
   assert(vernonRuntimeDestroy(gl) == VERNON_STATUS_OK);
 
   VernonRuntimeContext *gles = create(VERNON_RUNTIME_OPENGL_ES, 3, 1);

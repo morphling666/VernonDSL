@@ -253,29 +253,42 @@ build/source/Release/vernon-compile.exe `
   --asset-id shaders/runtime
 ```
 
-The cooked directory contains `shader.json` plus readable generated vertex
-and fragment GLSL files. The manifest records schema-versioned reflection,
-source dependency hashes, the module hash, and an explicit
-entry/stage/artifact table.
-Mount the containing asset root in Vernon, then load `Shader` asset
-`shaders/runtime`.
+This direct `--bundle` compatibility path contains `shader.json` plus readable
+generated vertex and fragment GLSL files. It remains available for legacy
+OpenGL tooling; new production cooking uses `vernon-cook-shader` below and
+loads a Pipeline asset through VernonRuntime.
 
-For variant families, author `*.shader-module.json` and
-`*.shader-pipeline.json`, then cook every explicitly included feature key:
+Declare persistent assets beside their stage functions. The declaration is
+read from the source AST and never imports or executes the module:
+
+```python
+mesh_asset = vd.pipeline_asset(
+    id="pipelines/mesh",
+    vertex=mesh_vertex,
+    fragment=mesh_fragment,
+    variants=((), (INSTANCE,), (SKIN,), (INSTANCE, SKIN)),
+    targets={"opengl": {"glsl_version": 330}},
+)
+```
+
+Cook the named declaration with the external host tool:
 
 ```powershell
 uv run --frozen vernon-cook-shader `
-  examples/variant_mesh.shader-pipeline.json `
+  examples/variant_mesh.py:mesh_asset `
   --asset-root examples `
   --compiler build/source/Release/vernon-compile.exe `
   --target opengl `
   -o build/variant_mesh_asset
 ```
 
-The resulting `shader.json` maps exact canonical feature keys to shared stage
-artifacts. For the four `INSTANCE`/`SKIN` combinations, four specialized
-vertex files share one unchanged fragment file. Vernon rejects missing
-variants rather than falling back.
+The resulting `variant_mesh_asset.pipeline.json` maps exact canonical feature
+keys to shared stage artifacts. For the four `INSTANCE`/`SKIN` combinations,
+four specialized vertex files share one unchanged fragment file by content
+hash. Vernon rejects missing variants rather than falling back.
+
+The older `*.shader-module.json` plus `*.shader-pipeline.json` authoring format
+remains readable for migration, but new assets should use `pipeline_asset`.
 
 `feature("NAME")`, `When[FEATURE, T]`, `if FEATURE`, and `if not FEATURE` are
 specialized before type checking. Interface locations are inferred from

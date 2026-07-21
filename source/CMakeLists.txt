@@ -185,8 +185,10 @@ if(BUILD_TESTING)
     if(Python_FOUND)
       set(VERNON_VULKAN_PIPELINE_TEST_DIR
         ${CMAKE_CURRENT_BINARY_DIR}/vulkan_pipeline_bundle)
+      set(VERNON_VULKAN_PIPELINE_TEST_MANIFEST
+        ${VERNON_VULKAN_PIPELINE_TEST_DIR}/vulkan_pipeline_bundle.pipeline.json)
       add_custom_command(
-        OUTPUT ${VERNON_VULKAN_PIPELINE_TEST_DIR}/pipeline.bundle
+        OUTPUT ${VERNON_VULKAN_PIPELINE_TEST_MANIFEST}
         COMMAND ${CMAKE_COMMAND} -E env
           "PYTHONPATH=${CMAKE_SOURCE_DIR}/python"
           ${Python_EXECUTABLE} -m vernon_dsl.shader_asset_cli
@@ -202,14 +204,14 @@ if(BUILD_TESTING)
           ${CMAKE_SOURCE_DIR}/python/vernon_dsl/shader_assets.py
         VERBATIM)
       add_custom_target(vernon-vulkan-pipeline-test-bundle
-        DEPENDS ${VERNON_VULKAN_PIPELINE_TEST_DIR}/pipeline.bundle)
+        DEPENDS ${VERNON_VULKAN_PIPELINE_TEST_MANIFEST})
       add_executable(vernon-runtime-vulkan-pipeline-test
         tests/runtime_vulkan_pipeline_test.cpp)
       target_link_libraries(vernon-runtime-vulkan-pipeline-test PRIVATE
         Vernon::Runtime)
       target_compile_definitions(vernon-runtime-vulkan-pipeline-test
         PRIVATE
-          VERNON_VULKAN_PIPELINE_BUNDLE="${VERNON_VULKAN_PIPELINE_TEST_DIR}/pipeline.bundle")
+          VERNON_VULKAN_PIPELINE_BUNDLE="${VERNON_VULKAN_PIPELINE_TEST_MANIFEST}")
       add_dependencies(vernon-runtime-vulkan-pipeline-test
         vernon-vulkan-pipeline-test-bundle)
       add_test(NAME vernon-runtime-vulkan-pipeline-test

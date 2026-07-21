@@ -1,7 +1,13 @@
 # Pipeline Runtime Unification
 
-Status: runtime unification implemented. Vernon Engine material/render-graph
-adoption and Engine-owned Vulkan resource integration remain future work.
+Status: runtime and invocation unification implemented. Pipeline schema 2 adds
+one cooked manifest and external-artifact contract while retaining schema-1
+read compatibility. Vernon Engine material/render-graph adoption and
+Engine-owned Vulkan resource integration remain future work.
+
+Vernon asset providers have completed compatibility retirement: they no longer
+discover `pipeline.bundle` or execute `shader.json`. Direct VernonRuntime
+schema-1 loading remains available for non-Engine callers during migration.
 
 ## Decision
 
@@ -54,7 +60,7 @@ Vernon compiler
         +-- variant mapping
         |
         v
-shader.json + stages/*
+<asset-name>.pipeline.json + artifacts/*
         |
         +-- Python/Vernon/C callers load VernonPipelineBundle
         |
@@ -232,18 +238,25 @@ Examples:
 - CUDA supports compute only. A pipeline containing a draw step is rejected
   unless a future explicit CUDA/graphics external-memory interop path is used.
 
-Pipeline bundles are canonical JSON with target-specific stage artifacts:
+Cooked pipeline schema 2 is canonical JSON with target-specific external stage
+artifacts:
 
 ```text
-pipeline.bundle
+<asset-name>.pipeline.json
   target
   variants[]
   stage_artifacts{}
-    OpenGL/OpenGL ES: GLSL source
-    Vulkan: base64 SPIR-V plus SHA-256
-    CUDA: PTX source plus compute reflection
-    CPU: relative host-native library sidecar plus SHA-256 and reflection
+    artifact
+      storage: external
+      path: artifacts/<sha256>.<backend-extension>
+      size + SHA-256
 ```
+
+OpenGL/OpenGL ES use GLSL, Vulkan uses SPIR-V, CUDA uses PTX, and CPU
+uses a platform-native library plus symbol/OS/architecture/ABI metadata.
+Interactive Python execution uses schema 2 with inline UTF-8 or base64
+descriptors because no persistent asset directory exists. The runtime retains
+schema-1 `pipeline.bundle` parsing during migration.
 
 CUDA uses the unified pipeline bundle and invocation ABI for dispatch-only
 pipelines. CUDA bundle loading rejects draw and barrier steps, then loads PTX
@@ -253,8 +266,9 @@ native library is a path-relative sidecar rather than embedded bytes, CPU
 pipeline loading requires the bundle directory. The runtime rejects rooted,
 parent-traversing, and canonical-escape paths and validates host OS,
 architecture, CPU invocation ABI, file size, and SHA-256 before opening the
-library. Loading validates that the artifact family matches the selected
-runtime backend.
+library. Schema 2 applies the same containment, size, and digest checks to every
+external artifact before backend use. Loading validates that the artifact
+family matches the selected runtime backend.
 
 ## Pipeline invocation ABI
 
@@ -425,9 +439,9 @@ or call `glGetUniformLocation` by source name.
 
 ## Asset contents
 
-A unified pipeline bundle should contain:
+A schema-2 pipeline manifest contains:
 
-- `pipeline_bundle_schema_version`;
+- `schema_version: 2` and `type: pipeline`;
 - `invocation_abi_version`;
 - pipeline ID and content hash;
 - source dependency hashes;
@@ -437,7 +451,7 @@ A unified pipeline bundle should contain:
 - host-only parameters such as indices, topology, targets, and compute grid;
 - stage ordering and required barriers;
 - backend and capability requirements;
-- backend artifacts;
+- inline or external backend artifact descriptors (cooked assets are external);
 - optional readable reflection for tools.
 
 The existing stage-level reflection remains useful, but runtime execution

@@ -12,9 +12,13 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vernon-cook-shader",
         description=
-        "Cook a shader-pipeline manifest into a Vernon asset directory.",
+        "Cook a shader-pipeline manifest into a schema-2 pipeline asset.",
     )
-    parser.add_argument("pipeline", type=Path)
+    parser.add_argument(
+        "pipeline",
+        type=Path,
+        help="legacy JSON manifest or Python source.py:descriptor_name",
+    )
     parser.add_argument("--asset-root", type=Path, required=True)
     parser.add_argument("--compiler", type=Path, required=True)
     parser.add_argument("--target", default="opengl")

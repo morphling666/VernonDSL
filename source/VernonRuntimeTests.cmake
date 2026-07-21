@@ -6,8 +6,15 @@ function(vernon_add_runtime_tests)
     COMMAND vernon-runtime-public-header-test)
 
   add_executable(vernon-runtime-external-gl-test
-    ${_VERNON_RUNTIME_SOURCE_DIR}/tests/runtime_external_gl_test.cpp)
-  target_link_libraries(vernon-runtime-external-gl-test PRIVATE Vernon::Runtime)
+    ${_VERNON_RUNTIME_SOURCE_DIR}/tests/runtime_external_gl_test.cpp
+    ${_VERNON_RUNTIME_SOURCE_DIR}/lib/runtime/content_hash.cpp)
+  target_include_directories(vernon-runtime-external-gl-test PRIVATE
+    ${_VERNON_RUNTIME_SOURCE_DIR}/lib)
+  target_link_libraries(vernon-runtime-external-gl-test PRIVATE
+    Vernon::Runtime nlohmann_json::nlohmann_json)
+  if(MSVC)
+    target_compile_options(vernon-runtime-external-gl-test PRIVATE /EHsc)
+  endif()
   add_test(NAME vernon-runtime-external-gl-test
     COMMAND vernon-runtime-external-gl-test)
 
@@ -51,32 +58,41 @@ function(vernon_add_runtime_tests)
   add_dependencies(vernon-runtime-cpu-aot-test vernon-cpu-aot-test-bundle)
   add_test(NAME vernon-runtime-cpu-aot-test COMMAND vernon-runtime-cpu-aot-test)
 
-  set(compiler_cpu_bundle
-    ${CMAKE_CURRENT_BINARY_DIR}/compiler_cpu_aot_bundle)
-  add_custom_command(
-    OUTPUT ${compiler_cpu_bundle}/compute.json
-    COMMAND $<TARGET_FILE:vernon-compile> --target cpu
-      ${_VERNON_RUNTIME_SOURCE_DIR}/tests/integration/cpu-aot-smoke.mlir
-      --compute-bundle ${compiler_cpu_bundle}
-    DEPENDS vernon-compile
-      ${_VERNON_RUNTIME_SOURCE_DIR}/tests/integration/cpu-aot-smoke.mlir
-    VERBATIM)
-  add_custom_target(vernon-compiler-cpu-aot-test-bundle
-    DEPENDS ${compiler_cpu_bundle}/compute.json)
-  add_executable(vernon-runtime-compiler-cpu-aot-test
-    ${_VERNON_RUNTIME_SOURCE_DIR}/tests/runtime_compiler_cpu_aot_test.c)
-  target_link_libraries(vernon-runtime-compiler-cpu-aot-test PRIVATE
-    Vernon::Runtime)
-  target_compile_definitions(vernon-runtime-compiler-cpu-aot-test PRIVATE
-    VERNON_COMPILER_CPU_BUNDLE_PATH="${compiler_cpu_bundle}")
-  add_dependencies(vernon-runtime-compiler-cpu-aot-test
-    vernon-compiler-cpu-aot-test-bundle)
-  add_test(NAME vernon-runtime-compiler-cpu-aot-test
-    COMMAND vernon-runtime-compiler-cpu-aot-test)
+  if(TARGET vernon-compile)
+    set(compiler_cpu_bundle
+      ${CMAKE_CURRENT_BINARY_DIR}/compiler_cpu_aot_bundle)
+    add_custom_command(
+      OUTPUT ${compiler_cpu_bundle}/compute.json
+      COMMAND $<TARGET_FILE:vernon-compile> --target cpu
+        ${_VERNON_RUNTIME_SOURCE_DIR}/tests/integration/cpu-aot-smoke.mlir
+        --compute-bundle ${compiler_cpu_bundle}
+      DEPENDS vernon-compile
+        ${_VERNON_RUNTIME_SOURCE_DIR}/tests/integration/cpu-aot-smoke.mlir
+      VERBATIM)
+    add_custom_target(vernon-compiler-cpu-aot-test-bundle
+      DEPENDS ${compiler_cpu_bundle}/compute.json)
+    add_executable(vernon-runtime-compiler-cpu-aot-test
+      ${_VERNON_RUNTIME_SOURCE_DIR}/tests/runtime_compiler_cpu_aot_test.c)
+    target_link_libraries(vernon-runtime-compiler-cpu-aot-test PRIVATE
+      Vernon::Runtime)
+    target_compile_definitions(vernon-runtime-compiler-cpu-aot-test PRIVATE
+      VERNON_COMPILER_CPU_BUNDLE_PATH="${compiler_cpu_bundle}")
+    add_dependencies(vernon-runtime-compiler-cpu-aot-test
+      vernon-compiler-cpu-aot-test-bundle)
+    add_test(NAME vernon-runtime-compiler-cpu-aot-test
+      COMMAND vernon-runtime-compiler-cpu-aot-test)
+  endif()
 
   add_executable(vernon-runtime-cpu-pipeline-test
-    ${_VERNON_RUNTIME_SOURCE_DIR}/tests/runtime_cpu_pipeline_test.cpp)
-  target_link_libraries(vernon-runtime-cpu-pipeline-test PRIVATE Vernon::Runtime)
+    ${_VERNON_RUNTIME_SOURCE_DIR}/tests/runtime_cpu_pipeline_test.cpp
+    ${_VERNON_RUNTIME_SOURCE_DIR}/lib/runtime/content_hash.cpp)
+  target_include_directories(vernon-runtime-cpu-pipeline-test PRIVATE
+    ${_VERNON_RUNTIME_SOURCE_DIR}/lib)
+  target_link_libraries(vernon-runtime-cpu-pipeline-test PRIVATE
+    Vernon::Runtime nlohmann_json::nlohmann_json)
+  if(MSVC)
+    target_compile_options(vernon-runtime-cpu-pipeline-test PRIVATE /EHsc)
+  endif()
   target_compile_definitions(vernon-runtime-cpu-pipeline-test PRIVATE
     VERNON_CPU_BUNDLE_PATH="${cpu_bundle}"
     VERNON_RUNTIME_TEST_OS="${runtime_test_os}"

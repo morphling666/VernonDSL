@@ -1,27 +1,43 @@
-from vernon_dsl import *
+from typing import Annotated
 
-INSTANCE = feature("INSTANCE")
-SKIN = feature("SKIN")
+import vernon_dsl as vd
+
+INSTANCE = vd.feature("INSTANCE")
+SKIN = vd.feature("SKIN")
 
 
-@vertex
+@vd.vertex
 def mesh_vertex(
-    position: vec3[f32],
-    instance_transform: When[INSTANCE, Annotated[mat4[f32],
-                                                 instance()]],
-    joints: When[SKIN, vec4[u32]],
-    weights: When[SKIN, vec4[f32]],
-) -> Annotated[vec4[f32], builtin("position")]:
-    result = vec4(position, 1.0)
+    position: vd.vec3[vd.f32],
+    instance_transform: vd.When[INSTANCE, Annotated[vd.mat4[vd.f32],
+                                                    vd.instance()]],
+    joints: vd.When[SKIN, vd.vec4[vd.u32]],
+    weights: vd.When[SKIN, vd.vec4[vd.f32]],
+) -> Annotated[vd.vec4[vd.f32], vd.builtin("position")]:
+    result = vd.vec4(position, 1.0)
     if INSTANCE:
-        result = matmul(instance_transform, result)
+        result = vd.matmul(instance_transform, result)
     if SKIN:
         result = result + weights
     return result
 
 
-@fragment
+@vd.fragment
 def mesh_fragment(
-    tint: Annotated[vec4[f32], uniform()],
-) -> Annotated[vec4[f32], location(0)]:
+    tint: Annotated[vd.vec4[vd.f32], vd.uniform()],
+) -> Annotated[vd.vec4[vd.f32], vd.location(0)]:
     return tint
+
+
+mesh_asset = vd.pipeline_asset(
+    id="shaders/variant_mesh",
+    vertex=mesh_vertex,
+    fragment=mesh_fragment,
+    variants=((), (INSTANCE, ), (SKIN, ), (INSTANCE, SKIN)),
+    targets={
+        "opengl": {
+            "glsl_version": 330
+        },
+        "vulkan": {},
+    },
+)

@@ -19,28 +19,34 @@ closure.
 OpenGL function resolution is isolated in `backend_opengl_driver`; unlike CUDA
 and Vulkan it consumes a host callback because the host owns the current
 context. OpenGL and OpenGL ES are distinct external-context backends and only
-accept bundles for their matching GLSL profile. Context creation is host policy.
+accept pipeline manifests for their matching GLSL profile. Cooked GLSL is an
+external content-addressed artifact; interactive GLSL remains inline. Context
+creation is host policy.
 
 ## Vulkan graphics bundles
 
-Vulkan pipeline bundles store each SPIR-V stage as base64 with an SHA-256
-digest because JSON strings cannot safely carry binary modules. Resolution
-creates immutable shader modules. Invocation creates render-pass and pipeline
-state from the concrete attachment and vertex layouts, submits synchronously,
-then releases that transient state. This first implementation favors correct
-layout specialization; a later cache can key the same state without changing
-the bundle ABI. RGBA8 offscreen images use optimal tiling and staging buffers
-for host upload/readback. Unbound graphics uniforms use the compiler's single
-push-constant block ABI; descriptor-bound uniforms remain a later extension.
+Cooked pipeline schema 2 stores each SPIR-V stage as a content-addressed
+external `.spv` artifact. The manifest records its relative path, byte size,
+and SHA-256, all of which the common artifact resolver validates before Vulkan
+sees the bytes. Non-persistent interactive execution uses the same descriptor
+shape with inline base64 storage because it has no durable asset directory.
+Resolution creates immutable shader modules. Invocation creates render-pass
+and pipeline state from the concrete attachment and vertex layouts, submits
+synchronously, then releases that transient state. This first implementation
+favors correct layout specialization; a later cache can key the same state
+without changing the bundle ABI. RGBA8 offscreen images use optimal tiling and
+staging buffers for host upload/readback. Unbound graphics uniforms use the
+compiler's single push-constant block ABI; descriptor-bound uniforms remain a
+later extension.
 
 ## Python native module
 
 Python exposes compiler services and all runtime backends through one `_native`
 module. The module links the compiler DLL and `VernonRuntime`; the runtime DLL
 itself retains its dependency boundary. Interactive GPU pipelines serialize
-the same bundle schema as the asset cooker. CPU execution uses native AOT
-bundles and remains compute-only because Vernon does not provide a software
-rasterizer.
+pipeline schema 2 with inline artifact descriptors; the cooker emits the same
+schema with external descriptors only. CPU execution uses native AOT bundles
+and remains compute-only because Vernon does not provide a software rasterizer.
 
 ## Launch ownership
 

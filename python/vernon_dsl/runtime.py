@@ -1125,12 +1125,12 @@ class Pipeline:
             "fragment": stage_by_kind["fragment"]["id"],
         })
         bundle = {
-            "pipeline_bundle_schema_version":
-            1,
+            "schema_version":
+            2,
             "invocation_abi_version":
             1,
             "type":
-            "vernon_pipeline_bundle",
+            "pipeline",
             "id":
             "interactive/" + hashlib.sha256(
                 repr((tuple(stage["id"] for stage in compiled_stages),

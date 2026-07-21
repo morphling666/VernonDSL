@@ -30,6 +30,7 @@ from .runtime import (
     triangles,
     vulkan,
 )
+from .shader_assets import PipelineAssetDeclaration, pipeline_asset
 from .types import (
     Array,
     Buffer,
@@ -69,6 +70,7 @@ __all__ = [
     "Feature",
     "Kernel",
     "Pipeline",
+    "PipelineAssetDeclaration",
     "PrimitiveTopology",
     "Sampler",
     "Tensor",
@@ -114,6 +116,7 @@ __all__ = [
     "opengles",
     "pow",
     "pipeline",
+    "pipeline_asset",
     "points",
     "resource",
     "reflect",

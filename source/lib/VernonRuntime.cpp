@@ -72,6 +72,13 @@ struct CpuNativeArtifact {
   nlohmann::json reflection;
 };
 
+struct ResolvedArtifact {
+  std::string format;
+  std::vector<uint8_t> bytes;
+  std::filesystem::path path;
+  bool external{};
+};
+
 struct Stage {
   std::string stage;
   std::string entry;
@@ -807,6 +814,180 @@ std::string readFile(const std::filesystem::path &path) {
                      std::istreambuf_iterator<char>());
 }
 
+bool isSha256(const std::string &value) {
+  return value.size() == 64 &&
+         std::all_of(value.begin(), value.end(), [](unsigned char character) {
+           return (character >= '0' && character <= '9') ||
+                  (character >= 'a' && character <= 'f');
+         });
+}
+
+bool validateManifestHash(const nlohmann::json &root, bool required,
+                          std::string &error) {
+  if (!root.contains("content_hash")) {
+    if (!required)
+      return true;
+    error = "pipeline manifest content_hash is missing";
+    return false;
+  }
+  if (!root["content_hash"].is_string()) {
+    error = "pipeline manifest content_hash is invalid";
+    return false;
+  }
+  const std::string expected = root["content_hash"].get<std::string>();
+  if (!isSha256(expected)) {
+    error = "pipeline manifest content_hash is invalid";
+    return false;
+  }
+  nlohmann::json canonical = root;
+  canonical.erase("content_hash");
+  const std::string bytes =
+      canonical.dump(-1, ' ', false, nlohmann::json::error_handler_t::strict);
+  if (vernon::runtime::sha256Hex(bytes.data(), bytes.size()) != expected) {
+    error = "pipeline manifest content_hash does not match canonical content";
+    return false;
+  }
+  return true;
+}
+
+std::optional<std::vector<uint8_t>>
+decodeBase64Strict(const std::string &encoded) {
+  static constexpr char alphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  if (encoded.size() % 4 != 0)
+    return std::nullopt;
+  std::vector<uint8_t> result;
+  result.reserve(encoded.size() / 4 * 3);
+  for (size_t offset = 0; offset < encoded.size(); offset += 4) {
+    uint32_t value = 0;
+    size_t padding = 0;
+    for (size_t index = 0; index < 4; ++index) {
+      const unsigned char character = encoded[offset + index];
+      if (character == '=') {
+        if (index < 2 || offset + 4 != encoded.size())
+          return std::nullopt;
+        ++padding;
+        value <<= 6;
+        continue;
+      }
+      if (padding)
+        return std::nullopt;
+      const char *position =
+          std::find(std::begin(alphabet), std::end(alphabet) - 1, character);
+      if (position == std::end(alphabet) - 1)
+        return std::nullopt;
+      value = (value << 6) | static_cast<uint32_t>(position - alphabet);
+    }
+    if (padding > 2 || (padding == 1 && (value & 0xffu) != 0) ||
+        (padding == 2 && (value & 0xffffu) != 0))
+      return std::nullopt;
+    result.push_back(static_cast<uint8_t>(value >> 16));
+    if (padding < 2)
+      result.push_back(static_cast<uint8_t>(value >> 8));
+    if (!padding)
+      result.push_back(static_cast<uint8_t>(value));
+  }
+  return result;
+}
+
+bool resolveArtifact(VernonRuntimeContext *context,
+                     const nlohmann::json &descriptor,
+                     const std::optional<std::filesystem::path> &directory,
+                     ResolvedArtifact &output) {
+  if (!descriptor.is_object() || !descriptor.contains("format") ||
+      !descriptor["format"].is_string() || !descriptor.contains("storage") ||
+      !descriptor["storage"].is_string() || !descriptor.contains("size") ||
+      !descriptor["size"].is_number_unsigned() ||
+      !descriptor.contains("sha256") || !descriptor["sha256"].is_string()) {
+    fail(context, "pipeline artifact descriptor is invalid");
+    return false;
+  }
+  output.format = descriptor["format"].get<std::string>();
+  const std::string storage = descriptor["storage"].get<std::string>();
+  const uint64_t declaredSize = descriptor["size"].get<uint64_t>();
+  const std::string expectedHash = descriptor["sha256"].get<std::string>();
+  if (output.format.empty() || !isSha256(expectedHash)) {
+    fail(context, "pipeline artifact format or SHA-256 is invalid");
+    return false;
+  }
+
+  if (storage == "inline") {
+    if (!descriptor.contains("encoding") ||
+        !descriptor["encoding"].is_string() || !descriptor.contains("data") ||
+        !descriptor["data"].is_string()) {
+      fail(context, "inline pipeline artifact is invalid");
+      return false;
+    }
+    const std::string encoding = descriptor["encoding"].get<std::string>();
+    const std::string data = descriptor["data"].get<std::string>();
+    if (encoding == "utf8")
+      output.bytes.assign(data.begin(), data.end());
+    else if (encoding == "base64") {
+      const auto decoded = decodeBase64Strict(data);
+      if (!decoded) {
+        fail(context, "inline pipeline artifact base64 is invalid");
+        return false;
+      }
+      output.bytes = *decoded;
+    } else {
+      fail(context, "inline pipeline artifact encoding is unsupported");
+      return false;
+    }
+  } else if (storage == "external") {
+    if (!directory || !descriptor.contains("path") ||
+        !descriptor["path"].is_string()) {
+      fail(context,
+           "external pipeline artifacts require a bundle directory and path");
+      return false;
+    }
+    const std::filesystem::path relative =
+        std::filesystem::u8path(descriptor["path"].get<std::string>());
+    if (relative.empty() || relative.is_absolute() ||
+        relative.has_root_path() || relative == std::filesystem::path(".") ||
+        relative.lexically_normal() != relative ||
+        std::find(relative.begin(), relative.end(),
+                  std::filesystem::path("..")) != relative.end()) {
+      fail(context, "external pipeline artifact path is not normalized");
+      return false;
+    }
+    std::error_code filesystemError;
+    const std::filesystem::path root =
+        std::filesystem::canonical(*directory, filesystemError);
+    if (filesystemError ||
+        !std::filesystem::is_directory(root, filesystemError)) {
+      fail(context, "pipeline bundle directory is invalid");
+      return false;
+    }
+    output.path = std::filesystem::canonical(root / relative, filesystemError);
+    if (filesystemError ||
+        !std::filesystem::is_regular_file(output.path, filesystemError)) {
+      fail(context, "external pipeline artifact cannot be resolved");
+      return false;
+    }
+    const std::filesystem::path contained =
+        output.path.lexically_relative(root);
+    if (contained.empty() || contained.is_absolute() ||
+        *contained.begin() == std::filesystem::path("..")) {
+      fail(context, "external pipeline artifact escapes the bundle directory");
+      return false;
+    }
+    const std::string bytes = readFile(output.path);
+    output.bytes.assign(bytes.begin(), bytes.end());
+    output.external = true;
+  } else {
+    fail(context, "pipeline artifact storage is unsupported");
+    return false;
+  }
+
+  if (output.bytes.size() != declaredSize ||
+      vernon::runtime::sha256Hex(output.bytes.data(), output.bytes.size()) !=
+          expectedHash) {
+    fail(context, "pipeline artifact size or SHA-256 mismatch");
+    return false;
+  }
+  return true;
+}
+
 const char *hostOperatingSystem() {
 #if defined(_WIN32)
   return "windows";
@@ -908,31 +1089,6 @@ VernonLoadedKernel *loadCpuNativeArtifact(VernonRuntimeContext *context,
   }
   ++context->liveKernels;
   return kernel.release();
-}
-
-std::vector<uint8_t> decodeBase64(const std::string &encoded) {
-  static constexpr char alphabet[] =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  std::vector<uint8_t> result;
-  uint32_t accumulator = 0;
-  int bits = 0;
-  for (unsigned char character : encoded) {
-    if (character == '=')
-      break;
-    const char *position =
-        std::find(std::begin(alphabet), std::end(alphabet) - 1, character);
-    if (position == std::end(alphabet) - 1)
-      return {};
-    const auto value = static_cast<uint32_t>(position - alphabet);
-    accumulator = (accumulator << 6) | static_cast<uint32_t>(value);
-    bits += 6;
-    if (bits >= 8) {
-      bits -= 8;
-      result.push_back(static_cast<uint8_t>(accumulator >> bits));
-      accumulator &= (uint32_t{1} << bits) - 1;
-    }
-  }
-  return result;
 }
 
 bool argumentKindMatches(const Parameter &parameter,
@@ -2203,9 +2359,13 @@ VernonStatus vernonRuntimePipelineBundleInspectTarget(
     const nlohmann::json root = nlohmann::json::parse(
         static_cast<const char *>(bundleData),
         static_cast<const char *>(bundleData) + bundleSize, nullptr, false);
-    if (root.is_discarded() || !root.is_object() ||
-        root.value("pipeline_bundle_schema_version", 0) != 1 ||
-        root.value("type", "") != "vernon_pipeline_bundle")
+    if (root.is_discarded() || !root.is_object())
+      return VERNON_STATUS_PARSE_ERROR;
+    const bool legacy = root.value("pipeline_bundle_schema_version", 0) == 1 &&
+                        root.value("type", "") == "vernon_pipeline_bundle";
+    const bool schema2 = root.value("schema_version", 0) == 2 &&
+                         root.value("type", "") == "pipeline";
+    if (!legacy && !schema2)
       return VERNON_STATUS_PARSE_ERROR;
     const std::string name = root.value("target", "");
     if (name == "cpu")
@@ -2251,12 +2411,6 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(
     if (options && options->bundle_directory &&
         options->bundle_directory[0] != '\0')
       bundleDirectory = std::filesystem::u8path(options->bundle_directory);
-    if (context->backend == VERNON_RUNTIME_CPU && !bundleDirectory) {
-      fail(context,
-           "CPU pipeline bundles require a UTF-8 bundle directory for native "
-           "sidecars");
-      return nullptr;
-    }
     const nlohmann::json root = nlohmann::json::parse(
         static_cast<const char *>(bundleData),
         static_cast<const char *>(bundleData) + bundleSize);
@@ -2267,11 +2421,15 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(
             ? "vulkan"
             : (context->backend == VERNON_RUNTIME_OPENGL_ES ? "opengles"
                                                             : "opengl");
-    if (!root.is_object() ||
-        root.value("pipeline_bundle_schema_version", 0) != 1 ||
+    const bool legacy = root.is_object() &&
+                        root.value("pipeline_bundle_schema_version", 0) == 1 &&
+                        root.value("type", "") == "vernon_pipeline_bundle";
+    const bool schema2 = root.is_object() &&
+                         root.value("schema_version", 0) == 2 &&
+                         root.value("type", "") == "pipeline";
+    if ((!legacy && !schema2) ||
         root.value("invocation_abi_version", 0) !=
             VERNON_PIPELINE_INVOCATION_ABI_VERSION ||
-        root.value("type", "") != "vernon_pipeline_bundle" ||
         root.value("target", "") != expectedTarget ||
         !root.contains("stage_artifacts") ||
         !root["stage_artifacts"].is_object() || !root.contains("variants") ||
@@ -2279,17 +2437,33 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(
       fail(context, "unsupported or invalid pipeline bundle");
       return nullptr;
     }
+    if (!validateManifestHash(root, schema2, context->error))
+      return nullptr;
     auto bundle = std::make_unique<VernonPipelineBundle>();
     bundle->context = context;
     bundle->id = root.value("id", "");
     for (const nlohmann::json &feature :
          root.value("features", nlohmann::json::array()))
       bundle->features.push_back(feature.get<std::string>());
+    if (schema2 &&
+        (!std::is_sorted(bundle->features.begin(), bundle->features.end()) ||
+         std::adjacent_find(bundle->features.begin(), bundle->features.end()) !=
+             bundle->features.end())) {
+      fail(context, "pipeline feature table is not canonical");
+      return nullptr;
+    }
     for (const auto &[id, value] : root["stage_artifacts"].items()) {
+      if (!value.is_object() ||
+          (value.contains("id") && (!value["id"].is_string() ||
+                                    value["id"].get<std::string>() != id))) {
+        fail(context, "pipeline stage id is invalid");
+        return nullptr;
+      }
       Stage stage;
       stage.stage = value.value("stage", "");
       stage.entry = value.value("entry", "");
-      stage.source = value.value("source", "");
+      if (legacy)
+        stage.source = value.value("source", "");
       if (value.contains("reflection") &&
           value["reflection"].contains("entries")) {
         stage.reflection = value["reflection"].dump();
@@ -2308,7 +2482,41 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(
             }
         }
       }
+      std::optional<ResolvedArtifact> resolved;
+      if (schema2) {
+        if (!value.contains("artifact")) {
+          fail(context, "pipeline stage artifact descriptor is missing");
+          return nullptr;
+        }
+        ResolvedArtifact artifact;
+        if (!resolveArtifact(context, value["artifact"], bundleDirectory,
+                             artifact))
+          return nullptr;
+        const char *expectedFormat =
+            context->backend == VERNON_RUNTIME_CPU         ? "native_library"
+            : context->backend == VERNON_RUNTIME_CUDA      ? "ptx"
+            : context->backend == VERNON_RUNTIME_VULKAN    ? "spirv"
+            : context->backend == VERNON_RUNTIME_OPENGL_ES ? "gles"
+                                                           : "glsl";
+        const std::string encoding = value["artifact"].value("encoding", "");
+        if (artifact.format != expectedFormat ||
+            (artifact.external && value["artifact"].contains("encoding")) ||
+            (!artifact.external &&
+             ((artifact.format == "spirv" && encoding != "base64") ||
+              (artifact.format != "spirv" && encoding != "utf8"))) ||
+            value.value("target", "") != expectedTarget) {
+          fail(context, "pipeline stage artifact format is invalid for target");
+          return nullptr;
+        }
+        resolved = std::move(artifact);
+      }
       if (context->backend == VERNON_RUNTIME_CPU) {
+        if (!bundleDirectory ||
+            (schema2 && (!resolved || !resolved->external))) {
+          fail(context,
+               "CPU pipeline artifacts require an external bundle directory");
+          return nullptr;
+        }
         const nlohmann::json &nativeArtifact =
             value.contains("artifact") && value["artifact"].is_object()
                 ? value["artifact"]
@@ -2328,21 +2536,29 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(
         if (value.contains("reflection"))
           artifact.reflection = value["reflection"];
         std::filesystem::path validatedPath;
-        if (value.value("format", "") != "native_library" ||
+        const std::string format =
+            schema2 ? resolved->format : value.value("format", "");
+        if (format != "native_library" ||
             !resolveCpuNativeArtifact(context, artifact, validatedPath,
                                       nullptr))
           return nullptr;
         stage.cpuArtifact = std::move(artifact);
       }
-      if (context->backend == VERNON_RUNTIME_VULKAN &&
+      if (schema2 && context->backend == VERNON_RUNTIME_VULKAN)
+        stage.binary = std::move(resolved->bytes);
+      else if (schema2 && context->backend != VERNON_RUNTIME_CPU)
+        stage.source.assign(resolved->bytes.begin(), resolved->bytes.end());
+      if (legacy && context->backend == VERNON_RUNTIME_VULKAN &&
           value.contains("artifact") && value["artifact"].is_object()) {
         const nlohmann::json &artifact = value["artifact"];
         if (artifact.value("format", "") == "spirv" &&
             artifact.value("encoding", "") == "base64") {
-          stage.binary = decodeBase64(artifact.value("data", ""));
-          if (vernon::runtime::sha256Hex(stage.binary.data(),
-                                         stage.binary.size()) !=
-              artifact.value("sha256", ""))
+          const auto decoded = decodeBase64Strict(artifact.value("data", ""));
+          if (decoded)
+            stage.binary = *decoded;
+          if (!decoded || vernon::runtime::sha256Hex(stage.binary.data(),
+                                                     stage.binary.size()) !=
+                              artifact.value("sha256", ""))
             stage.binary.clear();
         }
       }
@@ -2353,8 +2569,8 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(
                     stage.binary.size() % sizeof(uint32_t) == 0 &&
                     !stage.reflection.empty()
           : context->backend == VERNON_RUNTIME_CUDA
-              ? value.value("format", "") == "ptx" && !stage.source.empty() &&
-                    !stage.reflection.empty()
+              ? (schema2 || value.value("format", "") == "ptx") &&
+                    !stage.source.empty() && !stage.reflection.empty()
               : !stage.source.empty();
       if (stage.stage.empty() || stage.entry.empty() || !hasArtifact) {
         fail(context, "pipeline stage artifact is invalid");

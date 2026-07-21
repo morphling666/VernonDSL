@@ -1,4 +1,7 @@
+#include "runtime/content_hash.h"
 #include "vernon-c/Runtime.h"
+
+#include <nlohmann/json.hpp>
 
 #include <cassert>
 #include <cstdint>
@@ -45,6 +48,23 @@ VernonPipelineBundle *loadWithDirectory(VernonRuntimeContext *runtime,
                                                     bundle.size(), &options);
 }
 
+std::string schema2Bundle(const std::string &legacy) {
+  nlohmann::json root = nlohmann::json::parse(legacy);
+  root.erase("pipeline_bundle_schema_version");
+  root["schema_version"] = 2;
+  root["type"] = "pipeline";
+  for (auto &[_, stage] : root["stage_artifacts"].items()) {
+    stage["artifact"]["format"] = stage["format"];
+    stage["artifact"]["storage"] = "external";
+    stage.erase("format");
+  }
+  root.erase("content_hash");
+  const std::string canonical = root.dump(-1, ' ', false);
+  root["content_hash"] =
+      vernon::runtime::sha256Hex(canonical.data(), canonical.size());
+  return root.dump(-1, ' ', false);
+}
+
 } // namespace
 
 int main() {
@@ -63,6 +83,25 @@ int main() {
 
   assert(
       !vernonRuntimeLoadPipelineBundle(runtime, bundle.data(), bundle.size()));
+
+  const std::string schema2 = schema2Bundle(bundle);
+  target = VERNON_RUNTIME_CUDA;
+  assert(vernonRuntimePipelineBundleInspectTarget(
+             schema2.data(), schema2.size(), &target) == VERNON_STATUS_OK);
+  assert(target == VERNON_RUNTIME_CPU);
+  VernonPipelineBundle *schema2Loaded =
+      loadWithDirectory(runtime, schema2, directoryUtf8);
+  assert(schema2Loaded);
+  vernonRuntimePipelineBundleDestroy(schema2Loaded);
+
+  nlohmann::json invalidSchema2 = nlohmann::json::parse(schema2);
+  invalidSchema2["stage_artifacts"]["fill"]["cpu_invocation_abi_version"] = 2;
+  invalidSchema2.erase("content_hash");
+  std::string canonical = invalidSchema2.dump(-1, ' ', false);
+  invalidSchema2["content_hash"] =
+      vernon::runtime::sha256Hex(canonical.data(), canonical.size());
+  canonical = invalidSchema2.dump(-1, ' ', false);
+  assert(!loadWithDirectory(runtime, canonical, directoryUtf8));
 
   VernonPipelineBundleLoadOptions shortOptions{};
   shortOptions.struct_size = sizeof(shortOptions) - 1;
