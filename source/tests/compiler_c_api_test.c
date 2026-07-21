@@ -425,8 +425,36 @@ int main(void) {
       context, cpu_module, strlen(cpu_module), VERNON_TARGET_CPU);
   assert(cpu_compile != NULL);
   assert(vernonCompileResultGetStatus(cpu_compile) == VERNON_STATUS_OK);
-  assert(view_contains(vernonCompileResultGetArtifactData(cpu_compile, 0),
-                       "__vernon_cpu_add_vectors"));
+#if defined(_WIN32)
+  assert(view_contains(vernonCompileResultGetArtifactName(cpu_compile, 0),
+                       "module.obj"));
+#else
+  assert(view_contains(vernonCompileResultGetArtifactName(cpu_compile, 0),
+                       "module.o"));
+#endif
+  assert(view_contains(vernonCompileResultGetReflection(cpu_compile),
+                       "__vernon_cpu_"));
+  assert(view_contains(vernonCompileResultGetReflection(cpu_compile),
+                       "_add_vectors"));
+  VernonStringView host_object =
+      vernonCompileResultGetArtifactData(cpu_compile, 0);
+  VernonCompileResult *host_library =
+      vernonCompilerLinkHostObject(context, host_object.data, host_object.size);
+  assert(host_library != NULL);
+  assert(vernonCompileResultGetStatus(host_library) == VERNON_STATUS_OK);
+  VernonStringView host_library_data =
+      vernonCompileResultGetArtifactData(host_library, 0);
+  assert(host_library_data.size > 4);
+#if defined(_WIN32)
+  assert(host_library_data.data[0] == 'M' && host_library_data.data[1] == 'Z');
+#elif defined(__APPLE__)
+  assert((unsigned char)host_library_data.data[0] == 0xcf);
+#else
+  assert((unsigned char)host_library_data.data[0] == 0x7f);
+  assert(host_library_data.data[1] == 'E' && host_library_data.data[2] == 'L' &&
+         host_library_data.data[3] == 'F');
+#endif
+  vernonCompileResultDestroy(host_library);
   VernonCpuEntryPoint add_vectors =
       vernonCompileResultGetCpuEntry(cpu_compile, "add_vectors", 11);
   assert(add_vectors != NULL);
@@ -447,6 +475,26 @@ int main(void) {
   assert(add_vectors(&invocation) == VERNON_STATUS_INVALID_ARGUMENT);
   assert(add_vectors(NULL) == VERNON_STATUS_INVALID_ARGUMENT);
   vernonCompileResultDestroy(cpu_compile);
+
+  const char *ios_triple = "arm64-apple-ios17.0";
+  VernonCompileOptions ios_options = {0};
+  ios_options.struct_size = sizeof(ios_options);
+  ios_options.cpu_target_triple.data = ios_triple;
+  ios_options.cpu_target_triple.size = strlen(ios_triple);
+  VernonCompileResult *ios_cpu_compile = vernonCompilerCompileMlirWithOptions(
+      context, cpu_module, strlen(cpu_module), VERNON_TARGET_CPU, &ios_options);
+  assert(ios_cpu_compile != NULL);
+  assert(vernonCompileResultGetStatus(ios_cpu_compile) == VERNON_STATUS_OK);
+  VernonStringView ios_object =
+      vernonCompileResultGetArtifactData(ios_cpu_compile, 0);
+  assert(ios_object.size > 4);
+  assert((unsigned char)ios_object.data[0] == 0xcf);
+  assert((unsigned char)ios_object.data[1] == 0xfa);
+  assert((unsigned char)ios_object.data[2] == 0xed);
+  assert((unsigned char)ios_object.data[3] == 0xfe);
+  assert(vernonCompileResultGetCpuEntry(ios_cpu_compile, "add_vectors", 11) ==
+         NULL);
+  vernonCompileResultDestroy(ios_cpu_compile);
 
   VernonCompileResult *cpu_large_compile = vernonCompilerCompileMlir(
       context, cpu_large_vector_module, strlen(cpu_large_vector_module),

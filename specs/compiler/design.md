@@ -72,17 +72,27 @@ CPU kernel bodies lower through the registered in-process
 `vernon-cpu-pipeline`: Vernon value tensors become unrestricted static MLIR
 vectors, resources become memrefs or integer handles, SCF becomes control
 flow, and the standard MLIR conversion interfaces produce LLVM dialect IR.
-`translateModuleToLLVMIR` then creates the host LLVM module. This avoids a
-second hand-written implementation of arithmetic, vector, math, and SCF
-semantics.
+`translateModuleToLLVMIR` then creates the target LLVM module. LLVM
+`TargetMachine` emits a relocatable object for the requested triple. This
+avoids a second hand-written implementation of arithmetic, vector, math, and
+SCF semantics.
 
-The external `__vernon_cpu_<entry>` ABI remains a dedicated LLVM-only host
-component. It validates `VernonCpuInvocation`, unpacks direct values, constructs
-the five internal rank-one memref arguments from each packed raw buffer pointer
-(zero offset, captured static extent or zero, unit stride), and appends the
-texture callback table. The private texture helper owns callback-table layout
-knowledge; generic Vernon conversion patterns do not. Internal entry functions
-and memref descriptors are never exported.
+The external `__vernon_cpu_<module-hash>_<entry>` ABI remains a dedicated
+LLVM-only component. The module hash prevents symbol collisions when many
+objects are statically linked into one game. The wrapper validates
+`VernonCpuInvocation`, unpacks direct values, constructs the five internal
+rank-one memref arguments from each packed raw buffer pointer (zero offset,
+captured static extent or zero, unit stride), and appends the texture callback
+table. The private texture helper owns callback-table layout knowledge; generic
+Vernon conversion patterns do not. Internal entry functions and memref
+descriptors are never exported.
+
+Relocatable objects are the canonical persistent CPU artifact. Desktop Python
+uses the same-host LLD driver embedded in `VernonDSLCompiler` to create an
+ephemeral shared library for immediate execution. Vernon desktop/mobile builds
+link target objects into the application and register their exported wrappers;
+the lightweight Runtime never embeds an object linker. Initial cross-target
+support covers the compiler host and iOS arm64 Mach-O.
 
 ## Target routing invariant
 

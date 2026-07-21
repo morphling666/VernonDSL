@@ -2,17 +2,22 @@
 
 ## CPU compute bundles
 
-Deployable CPU bundles contain a platform-native shared library with stable C
-entry wrappers. Schema version 2 records the operating system, architecture,
-CPU invocation ABI, exported symbol, artifact size, and SHA-256. The
-runtime validates all metadata before loading the library through Win32 or
-POSIX APIs. LLVM IR and ORC JIT are not runtime bundle formats.
+Persistent CPU bundles contain a target relocatable object with stable,
+module-hashed C entry wrappers. The manifest records the target triple, object
+format, CPU invocation ABI, exported symbol, artifact size, and SHA-256.
+Applications link the object at build time and register its wrapper with
+VernonRuntime; Runtime validates the external descriptor but never parses or
+relocates object files. Host-native shared-library bundles remain readable for
+migration and Python immediate execution, where embedded LLD finalizes a host
+object into an ephemeral DLL/so/dylib. LLVM IR and ORC JIT are not persistent
+runtime bundle formats.
 
 ## Backend loading
 
-`VernonRuntime` owns the shared Win32/POSIX library loader used by CPU AOT,
-CUDA, and Vulkan. CUDA Driver and Vulkan loader symbols are resolved at runtime;
-Vulkan headers are compile-only. This keeps LLVM, GLFW, CUDA Toolkit libraries,
+`VernonRuntime` owns the Win32/POSIX library loader retained for legacy CPU AOT
+bundles, CUDA, and Vulkan. New CPU objects resolve through the static entry
+registry. CUDA Driver and Vulkan loader symbols are resolved at runtime; Vulkan
+headers are compile-only. This keeps LLVM, LLD, GLFW, CUDA Toolkit libraries,
 and the Vulkan loader import library outside the deployable runtime dependency
 closure.
 

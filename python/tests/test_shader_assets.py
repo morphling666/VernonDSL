@@ -211,10 +211,10 @@ class ShaderAssetCookTests(unittest.TestCase):
         )
         self.assertEqual(encoded["reflection"], reflection)
 
-    def test_cpu_pipeline_copies_content_addressed_native_sidecar(
+    def test_cpu_pipeline_copies_content_addressed_object(
             self) -> None:
-        native_library = b"mock native library"
-        digest = hashlib.sha256(native_library).hexdigest()
+        relocatable_object = b"mock relocatable object"
+        digest = hashlib.sha256(relocatable_object).hexdigest()
         reflection = {
             "schema_version":
             2,
@@ -223,7 +223,7 @@ class ShaderAssetCookTests(unittest.TestCase):
             "dependencies": [],
             "entries": [{
                 "name": "scale",
-                "symbol": "__vernon_cpu_scale",
+                "symbol": "__vernon_cpu_module_scale",
                 "stage": "compute",
                 "arguments": [],
                 "results": [],
@@ -236,20 +236,20 @@ class ShaderAssetCookTests(unittest.TestCase):
             commands.append(command)
             bundle = Path(command[command.index("--compute-bundle") + 1])
             bundle.mkdir(parents=True)
-            (bundle / "compute.dll").write_bytes(native_library)
+            (bundle / "module.obj").write_bytes(relocatable_object)
             (bundle / "compute.json").write_text(
                 json.dumps({
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "compiler_version": "0.1.0",
                     "cpu_invocation_abi_version": 1,
                     "target": "cpu",
-                    "operating_system": "windows",
-                    "architecture": "x86_64",
+                    "target_triple": "x86_64-pc-windows-msvc",
+                    "object_format": "coff",
                     "entry": "scale",
-                    "symbol": "__vernon_cpu_scale",
-                    "artifact": "compute.dll",
-                    "artifact_format": "native_library",
-                    "artifact_size": len(native_library),
+                    "symbol": "__vernon_cpu_module_scale",
+                    "artifact": "module.obj",
+                    "artifact_format": "relocatable_object",
+                    "artifact_size": len(relocatable_object),
                     "artifact_sha256": digest,
                     "reflection": reflection,
                 }),
@@ -313,19 +313,22 @@ class ShaderAssetCookTests(unittest.TestCase):
             self.assertNotIn("--output-dir", commands[0])
             bundle = json.loads(manifest_path.read_text(encoding="utf-8"))
             stage = next(iter(bundle["stage_artifacts"].values()))
-            self.assertEqual(stage["format"], "native_library")
-            self.assertEqual(stage["symbol"], "__vernon_cpu_scale")
-            self.assertEqual(stage["operating_system"], "windows")
-            self.assertEqual(stage["architecture"], "x86_64")
+            self.assertEqual(stage["format"], "relocatable_object")
+            self.assertEqual(stage["symbol"], "__vernon_cpu_module_scale")
+            self.assertEqual(stage["target_triple"],
+                             "x86_64-pc-windows-msvc")
+            self.assertEqual(stage["object_format"], "coff")
             self.assertEqual(stage["cpu_invocation_abi_version"], 1)
             self.assertEqual(stage["artifact"]["sha256"], digest)
-            self.assertEqual(stage["artifact"]["size"], len(native_library))
+            self.assertEqual(stage["artifact"]["size"],
+                             len(relocatable_object))
             self.assertEqual(stage["artifact"]["storage"], "external")
-            self.assertEqual(stage["artifact"]["format"], "native_library")
+            self.assertEqual(stage["artifact"]["format"],
+                             "relocatable_object")
             self.assertEqual(stage["artifact"]["path"],
-                             f"artifacts/{digest}.dll")
+                             f"artifacts/{digest}.obj")
             self.assertEqual((output / stage["artifact"]["path"]).read_bytes(),
-                             native_library)
+                             relocatable_object)
             self.assertEqual(manifest_path.name, "cooked.pipeline.json")
             self.assertFalse((output / "pipeline.bundle").exists())
             self.assertFalse((output / "shader.json").exists())

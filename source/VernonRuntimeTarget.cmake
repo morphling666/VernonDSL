@@ -1,7 +1,15 @@
-set(_VERNON_RUNTIME_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}")
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/lib/VernonRuntime.cpp")
+  set(_VERNON_RUNTIME_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}")
+else()
+  get_filename_component(_VERNON_RUNTIME_SOURCE_DIR
+    "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+endif()
 
 function(vernon_add_runtime)
-  add_library(VernonRuntime SHARED
+  if(NOT DEFINED VERNON_RUNTIME_LIBRARY_TYPE)
+    set(VERNON_RUNTIME_LIBRARY_TYPE SHARED)
+  endif()
+  add_library(VernonRuntime ${VERNON_RUNTIME_LIBRARY_TYPE}
     ${_VERNON_RUNTIME_SOURCE_DIR}/lib/VernonRuntime.cpp
     ${_VERNON_RUNTIME_SOURCE_DIR}/lib/runtime/backend_cuda_driver.cpp
     ${_VERNON_RUNTIME_SOURCE_DIR}/lib/runtime/backend_opengl_driver.cpp
@@ -9,6 +17,9 @@ function(vernon_add_runtime)
     ${_VERNON_RUNTIME_SOURCE_DIR}/lib/runtime/platform_library.cpp)
   add_library(Vernon::Runtime ALIAS VernonRuntime)
   target_compile_definitions(VernonRuntime PRIVATE VERNON_RUNTIME_BUILD)
+  if(VERNON_RUNTIME_LIBRARY_TYPE STREQUAL "STATIC")
+    target_compile_definitions(VernonRuntime PUBLIC VERNON_RUNTIME_STATIC)
+  endif()
   if(VERNON_ENABLE_CUDA_RUNTIME)
     target_compile_definitions(VernonRuntime PUBLIC VERNON_HAS_CUDA_RUNTIME=1)
   endif()
@@ -28,8 +39,22 @@ function(vernon_add_runtime)
   if(MSVC)
     target_compile_options(VernonRuntime PRIVATE /EHsc)
   endif()
+  if(SKBUILD)
+    set(_vernon_runtime_bin_destination vernon_dsl)
+    set(_vernon_runtime_lib_destination vernon_dsl)
+    set_target_properties(VernonRuntime PROPERTIES
+      OUTPUT_NAME VernonDSLHostRuntime)
+  else()
+    set(_vernon_runtime_bin_destination bin)
+    set(_vernon_runtime_lib_destination lib)
+  endif()
   install(TARGETS VernonRuntime EXPORT VernonRuntimeTargets
-    RUNTIME DESTINATION bin LIBRARY DESTINATION lib ARCHIVE DESTINATION lib)
+    RUNTIME DESTINATION ${_vernon_runtime_bin_destination}
+      COMPONENT VernonWheel
+    LIBRARY DESTINATION ${_vernon_runtime_lib_destination}
+      COMPONENT VernonWheel
+    ARCHIVE DESTINATION lib
+      COMPONENT VernonDevelopment)
   install(FILES
     ${_VERNON_RUNTIME_SOURCE_DIR}/include/VernonCommon.h
     ${_VERNON_RUNTIME_SOURCE_DIR}/include/VernonRuntime.h

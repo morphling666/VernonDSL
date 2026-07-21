@@ -1,13 +1,12 @@
 #include "VernonCompiler.h"
 
 #include "llvm/ADT/StringExtras.h"
-#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/JSON.h"
-#include "llvm/Support/Process.h"
-#include "llvm/Support/Program.h"
 #include "llvm/Support/SHA256.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Host.h"
+#include "llvm/TargetParser/Triple.h"
 
 #include <charconv>
 #include <filesystem>
@@ -86,92 +85,41 @@ std::string_view hostArchitecture() {
 #endif
 }
 
-std::string_view nativeLibraryFilename() {
-#if defined(_WIN32)
-  return "compute.dll";
-#elif defined(__APPLE__)
-  return "compute.dylib";
-#else
-  return "compute.so";
-#endif
+std::string objectFormat(const llvm::Triple &triple) {
+  if (triple.isOSBinFormatCOFF())
+    return "coff";
+  if (triple.isOSBinFormatMachO())
+    return "macho";
+  if (triple.isWasm())
+    return "wasm";
+  return "elf";
 }
 
-std::optional<std::string>
-findClang(const std::optional<std::filesystem::path> &overridePath,
-          const char *argv0, std::string &diagnostic) {
-  auto checkExplicit =
-      [&](const std::filesystem::path &path,
-          std::string_view source) -> std::optional<std::string> {
-    std::error_code error;
-    if (std::filesystem::is_regular_file(path, error))
-      return path.string();
-    diagnostic = std::string(source) +
-                 " does not name a clang executable: " + path.string();
-    return std::nullopt;
-  };
-  if (overridePath)
-    return checkExplicit(*overridePath, "--clang");
-  if (std::optional<std::string> environment =
-          llvm::sys::Process::GetEnv("VERNON_CLANG"))
-    return checkExplicit(*environment, "VERNON_CLANG");
-
-#if defined(_WIN32)
-  constexpr std::string_view clangName = "clang.exe";
-#else
-  constexpr std::string_view clangName = "clang";
-#endif
-  std::vector<std::filesystem::path> toolchainCandidates;
-#if defined(VERNON_LLVM_TOOLS_DIR)
-  toolchainCandidates.emplace_back(
-      std::filesystem::path(VERNON_LLVM_TOOLS_DIR) / clangName);
-#endif
-  const std::filesystem::path executable =
-      llvm::sys::fs::getMainExecutable(argv0, nullptr);
-  toolchainCandidates.emplace_back(executable.parent_path() / clangName);
-  for (const std::filesystem::path &candidate : toolchainCandidates) {
-    std::error_code error;
-    if (std::filesystem::is_regular_file(candidate, error))
-      return candidate.string();
-  }
-  if (llvm::ErrorOr<std::string> path = llvm::sys::findProgramByName(clangName))
-    return *path;
-  diagnostic =
-      "cannot find clang from the LLVM toolchain; pass --clang <path> or set "
-      "VERNON_CLANG";
-  return std::nullopt;
-}
-
-bool compileNativeLibrary(const std::string &clang,
-                          const std::filesystem::path &llvmIr,
-                          const std::filesystem::path &output) {
-  std::vector<std::string> storage = {clang, llvmIr.string(), "-shared", "-O2",
-                                      "-o",  output.string()};
-  llvm::SmallVector<llvm::StringRef> arguments;
-  for (const std::string &argument : storage)
-    arguments.push_back(argument);
-  std::string error;
-  bool executionFailed = false;
-  const int exitCode = llvm::sys::ExecuteAndWait(
-      clang, arguments, std::nullopt, {}, 0, 0, &error, &executionFailed);
-  if (executionFailed || exitCode != 0) {
-    std::cerr << "clang failed to create " << output.string();
-    if (!error.empty())
-      std::cerr << ": " << error;
-    std::cerr << " (exit code " << exitCode << ")\n"
-              << "command:";
-    for (const std::string &argument : storage)
-      std::cerr << ' ' << argument;
-    std::cerr << '\n';
+bool linkHostLibrary(VernonCompilerContext *context, VernonStringView object,
+                     std::string &filename, std::string &library,
+                     std::string &diagnostic) {
+  VernonCompileResult *linked =
+      vernonCompilerLinkHostObject(context, object.data, object.size);
+  if (!linked || vernonCompileResultGetStatus(linked) != VERNON_STATUS_OK) {
+    if (linked) {
+      VernonStringView error = vernonCompileResultGetDiagnostics(linked);
+      diagnostic.assign(error.data ? error.data : "", error.size);
+      vernonCompileResultDestroy(linked);
+    } else {
+      diagnostic = "embedded LLD returned no result";
+    }
     return false;
   }
-#if defined(_WIN32)
-  for (std::string_view extension : {".lib", ".exp"}) {
-    std::filesystem::path linkerArtifact = output;
-    linkerArtifact.replace_extension(extension);
-    std::error_code error;
-    std::filesystem::remove(linkerArtifact, error);
+  if (vernonCompileResultGetArtifactCount(linked) != 1) {
+    diagnostic = "embedded LLD returned an invalid artifact set";
+    vernonCompileResultDestroy(linked);
+    return false;
   }
-#endif
+  VernonStringView name = vernonCompileResultGetArtifactName(linked, 0);
+  VernonStringView data = vernonCompileResultGetArtifactData(linked, 0);
+  filename.assign(name.data, name.size);
+  library.assign(data.data, data.size);
+  vernonCompileResultDestroy(linked);
   return true;
 }
 
@@ -184,11 +132,13 @@ int main(int argc, char **argv) {
                  "[--output-dir <directory>] [--reflection <file>] "
                  "[--glsl-version <version>] "
                  "[--bundle <directory> --asset-id <id>] "
-                 "[--compute-bundle <directory>] [--clang <path>] "
-                 "[--keep-llvm-ir]\n"
+                 "[--compute-bundle <directory>] [--host-runtime-bundle] "
+                 "[--target-triple <triple>] [--cpu <name>] "
+                 "[--cpu-features <features>]\n"
                  "  --bundle writes a compiled OpenGL shader asset.\n"
-                 "  --compute-bundle writes a runtime compute bundle; pipeline "
-                 "bundles are assembled by vernon_dsl.shader_asset_cli.\n";
+                 "  --compute-bundle writes a relocatable CPU object bundle.\n"
+                 "  --host-runtime-bundle finalizes that object with embedded "
+                 "LLD for immediate host execution.\n";
     return 2;
   }
 
@@ -199,10 +149,12 @@ int main(int argc, char **argv) {
   std::optional<std::filesystem::path> reflectionPath;
   std::optional<std::filesystem::path> bundlePath;
   std::optional<std::filesystem::path> computeBundlePath;
-  std::optional<std::filesystem::path> clangPath;
   std::optional<std::string> assetId;
   std::optional<uint32_t> glslVersion;
-  bool keepLlvmIr = false;
+  std::optional<std::string> targetTriple;
+  std::optional<std::string> cpuName;
+  std::optional<std::string> cpuFeatures;
+  bool hostRuntimeBundle = false;
   if (!validateOnly) {
     if (argc < 4 || !(target = parseTarget(argv[2]))) {
       std::cerr << "unknown target\n";
@@ -211,8 +163,8 @@ int main(int argc, char **argv) {
     inputPath = argv[3];
     for (int index = 4; index < argc;) {
       std::string_view option = argv[index];
-      if (option == "--keep-llvm-ir") {
-        keepLlvmIr = true;
+      if (option == "--host-runtime-bundle") {
+        hostRuntimeBundle = true;
         ++index;
         continue;
       }
@@ -228,10 +180,14 @@ int main(int argc, char **argv) {
         bundlePath = argv[index + 1];
       else if (option == "--compute-bundle")
         computeBundlePath = argv[index + 1];
-      else if (option == "--clang")
-        clangPath = argv[index + 1];
       else if (option == "--asset-id")
         assetId = argv[index + 1];
+      else if (option == "--target-triple")
+        targetTriple = argv[index + 1];
+      else if (option == "--cpu")
+        cpuName = argv[index + 1];
+      else if (option == "--cpu-features")
+        cpuFeatures = argv[index + 1];
       else if (option == "--glsl-version") {
         std::string_view value = argv[index + 1];
         uint32_t parsed = 0;
@@ -267,10 +223,19 @@ int main(int argc, char **argv) {
                    "--output-dir\n";
       return 2;
     }
-    if ((clangPath || keepLlvmIr) &&
+    if (hostRuntimeBundle &&
         (!computeBundlePath || *target != VERNON_TARGET_CPU)) {
-      std::cerr << "--clang and --keep-llvm-ir require a CPU "
-                   "--compute-bundle\n";
+      std::cerr << "--host-runtime-bundle requires a CPU --compute-bundle\n";
+      return 2;
+    }
+    if ((targetTriple || cpuName || cpuFeatures) &&
+        *target != VERNON_TARGET_CPU) {
+      std::cerr << "CPU target options require --target cpu\n";
+      return 2;
+    }
+    if (hostRuntimeBundle && targetTriple) {
+      std::cerr
+          << "--host-runtime-bundle always uses the compiler host target\n";
       return 2;
     }
   } else if (argc != 2) {
@@ -295,10 +260,17 @@ int main(int argc, char **argv) {
   VernonCompileResult *result = nullptr;
   if (validateOnly) {
     result = vernonCompilerValidateMlir(context, source.data(), source.size());
-  } else if (glslVersion) {
+  } else if (glslVersion || targetTriple || cpuName || cpuFeatures) {
     VernonCompileOptions options = {};
     options.struct_size = sizeof(options);
-    options.glsl_version = *glslVersion;
+    options.glsl_version = glslVersion.value_or(0);
+    auto view = [](const std::optional<std::string> &value) {
+      return value ? VernonStringView{value->data(), value->size()}
+                   : VernonStringView{};
+    };
+    options.cpu_target_triple = view(targetTriple);
+    options.cpu_name = view(cpuName);
+    options.cpu_features = view(cpuFeatures);
     result = vernonCompilerCompileMlirWithOptions(
         context, source.data(), source.size(), *target, &options);
   } else {
@@ -433,61 +405,26 @@ int main(int argc, char **argv) {
         std::string artifactFilename(artifactName.data, artifactName.size);
         std::string packagedArtifact(artifactData.data, artifactData.size);
         if (*target == VERNON_TARGET_CPU) {
-          if (artifactFilename != "module.ll") {
-            std::cerr << "CPU compilation did not produce module.ll\n";
+          if (artifactFilename != "module.obj" &&
+              artifactFilename != "module.o") {
+            std::cerr
+                << "CPU compilation did not produce a relocatable object\n";
             status = VERNON_STATUS_INTERNAL_ERROR;
-          } else {
-            const std::filesystem::path llvmIrPath =
-                *computeBundlePath / "module.ll";
-            std::ofstream llvmIrOutput(llvmIrPath, std::ios::binary);
-            writeView(llvmIrOutput, artifactData);
-            llvmIrOutput.close();
-            if (!llvmIrOutput) {
-              std::cerr << "cannot write temporary CPU LLVM IR "
-                        << llvmIrPath.string() << '\n';
+          } else if (hostRuntimeBundle) {
+            std::string linkDiagnostic;
+            if (!linkHostLibrary(context, artifactData, artifactFilename,
+                                 packagedArtifact, linkDiagnostic)) {
+              std::cerr << linkDiagnostic << '\n';
               status = VERNON_STATUS_INTERNAL_ERROR;
-            } else {
-              std::string clangDiagnostic;
-              std::optional<std::string> clang =
-                  findClang(clangPath, argv[0], clangDiagnostic);
-              if (!clang) {
-                std::cerr << clangDiagnostic << '\n';
-                status = VERNON_STATUS_INTERNAL_ERROR;
-              } else {
-                artifactFilename = std::string(nativeLibraryFilename());
-                const std::filesystem::path nativePath =
-                    *computeBundlePath / artifactFilename;
-                if (!compileNativeLibrary(*clang, llvmIrPath, nativePath)) {
-                  status = VERNON_STATUS_INTERNAL_ERROR;
-                } else {
-                  std::ifstream nativeInput(nativePath, std::ios::binary);
-                  packagedArtifact.assign(
-                      std::istreambuf_iterator<char>(nativeInput),
-                      std::istreambuf_iterator<char>());
-                  if (!nativeInput || packagedArtifact.empty()) {
-                    std::cerr << "clang did not produce a readable native "
-                                 "library at "
-                              << nativePath.string() << '\n';
-                    status = VERNON_STATUS_INTERNAL_ERROR;
-                  }
-                }
-              }
-            }
-            if (!keepLlvmIr) {
-              std::error_code removeError;
-              std::filesystem::remove(llvmIrPath, removeError);
-              if (removeError && status == VERNON_STATUS_OK) {
-                std::cerr << "cannot remove temporary LLVM IR "
-                          << llvmIrPath.string() << ": "
-                          << removeError.message() << '\n';
-                status = VERNON_STATUS_INTERNAL_ERROR;
-              }
             }
           }
-        } else {
+        }
+        if (status == VERNON_STATUS_OK) {
           std::ofstream artifactOutput(*computeBundlePath / artifactFilename,
                                        std::ios::binary);
-          writeView(artifactOutput, artifactData);
+          artifactOutput.write(
+              packagedArtifact.data(),
+              static_cast<std::streamsize>(packagedArtifact.size()));
           artifactOutput.close();
           if (!artifactOutput) {
             std::cerr << "cannot write compute artifact " << artifactFilename
@@ -503,12 +440,21 @@ int main(int argc, char **argv) {
         std::string digest = llvm::toHex(llvm::SHA256::hash(bytes), true);
         llvm::json::Object manifest;
         manifest["schema_version"] =
-            *target == VERNON_TARGET_CPU ? int64_t{2} : int64_t{1};
+            *target == VERNON_TARGET_CPU
+                ? (hostRuntimeBundle ? int64_t{2} : int64_t{3})
+                : int64_t{1};
         manifest["compiler_version"] = "0.1.0";
         if (*target == VERNON_TARGET_CPU) {
           manifest["cpu_invocation_abi_version"] = int64_t{1};
-          manifest["operating_system"] = std::string(hostOperatingSystem());
-          manifest["architecture"] = std::string(hostArchitecture());
+          if (hostRuntimeBundle) {
+            manifest["operating_system"] = std::string(hostOperatingSystem());
+            manifest["architecture"] = std::string(hostArchitecture());
+          } else {
+            const llvm::Triple triple(llvm::Triple::normalize(
+                targetTriple.value_or(llvm::sys::getDefaultTargetTriple())));
+            manifest["target_triple"] = triple.str();
+            manifest["object_format"] = objectFormat(triple);
+          }
         } else {
           manifest["gpu_launch_abi_version"] = int64_t{1};
         }
@@ -518,7 +464,8 @@ int main(int argc, char **argv) {
             computeEntry->getString("symbol").value_or("").str();
         manifest["artifact"] = artifactFilename;
         manifest["artifact_format"] =
-            *target == VERNON_TARGET_CPU      ? "native_library"
+            *target == VERNON_TARGET_CPU
+                ? (hostRuntimeBundle ? "native_library" : "relocatable_object")
             : *target == VERNON_TARGET_CUDA   ? "ptx"
             : *target == VERNON_TARGET_VULKAN ? "spirv"
             : *target == VERNON_TARGET_METAL  ? "msl"

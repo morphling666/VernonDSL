@@ -1,6 +1,7 @@
 #include "VernonCompiler.h"
 #include "VernonCpuAbiWrapper.h"
 
+#include "lld/Common/Driver.h"
 #include "mlir/Conversion/GPUToSPIRV/GPUToSPIRVPass.h"
 #include "mlir/Conversion/MathToSPIRV/MathToSPIRVPass.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
@@ -42,17 +43,28 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/CodeGen.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/TargetParser/Host.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -61,6 +73,14 @@
 #include <set>
 #include <string>
 #include <vector>
+
+#if defined(_WIN32)
+LLD_HAS_DRIVER(coff)
+#elif defined(__APPLE__)
+LLD_HAS_DRIVER(macho)
+#else
+LLD_HAS_DRIVER(elf)
+#endif
 
 #if defined(VERNON_HAS_SPIRV_CROSS)
 #include "spirv_glsl.hpp"
@@ -73,9 +93,11 @@ struct VernonCompilerContext {
   VernonCompilerContext() {
     static std::once_flag initializeLLVM;
     std::call_once(initializeLLVM, [] {
-      llvm::InitializeNativeTarget();
-      llvm::InitializeNativeTargetAsmPrinter();
-      llvm::InitializeNativeTargetAsmParser();
+      llvm::InitializeAllTargetInfos();
+      llvm::InitializeAllTargets();
+      llvm::InitializeAllTargetMCs();
+      llvm::InitializeAllAsmPrinters();
+      llvm::InitializeAllAsmParsers();
     });
     mlir::DialectRegistry registry;
     mlir::registerAllDialects(registry);
@@ -137,11 +159,16 @@ llvm::StringRef artifactFormat(llvm::StringRef filename) {
     return "ptx";
   if (extension == ".ll")
     return "llvm_ir";
+  if (extension == ".o" || extension == ".obj")
+    return "relocatable_object";
   return "unknown";
 }
 
 void addArtifactTable(VernonCompileResult &result, VernonTarget target,
-                      uint32_t glslVersion) {
+                      uint32_t glslVersion,
+                      llvm::StringRef cpuTargetTriple = {},
+                      llvm::StringRef cpu = {},
+                      llvm::StringRef cpuFeatures = {}) {
   llvm::Expected<llvm::json::Value> parsed =
       llvm::json::parse(result.reflection);
   if (!parsed)
@@ -155,6 +182,15 @@ void addArtifactTable(VernonCompileResult &result, VernonTarget target,
   llvm::json::Object targetOptions;
   if (target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES)
     targetOptions["glsl_version"] = static_cast<int64_t>(glslVersion);
+  if (target == VERNON_TARGET_CPU) {
+    targetOptions["target_triple"] = llvm::Triple::normalize(
+        cpuTargetTriple.empty() ? llvm::sys::getDefaultTargetTriple()
+                                : cpuTargetTriple);
+    if (!cpu.empty())
+      targetOptions["cpu"] = cpu.str();
+    if (!cpuFeatures.empty())
+      targetOptions["cpu_features"] = cpuFeatures.str();
+  }
   (*root)["target_options"] = std::move(targetOptions);
 
   llvm::json::Array table;
@@ -464,7 +500,9 @@ std::string buildReflection(mlir::ModuleOp module) {
   return output;
 }
 
-bool setCpuReflectionSymbols(VernonCompileResult &result) {
+bool setCpuReflectionSymbols(
+    VernonCompileResult &result,
+    const std::vector<vernon::CpuAbiWrapperMetadata> &metadata) {
   llvm::Expected<llvm::json::Value> parsed =
       llvm::json::parse(result.reflection);
   if (!parsed)
@@ -479,7 +517,12 @@ bool setCpuReflectionSymbols(VernonCompileResult &result) {
         entry ? entry->getString("name") : std::nullopt;
     if (!name)
       return false;
-    (*entry)["symbol"] = ("__vernon_cpu_" + *name).str();
+    auto found = llvm::find_if(metadata, [&](const auto &candidate) {
+      return candidate.internalFunctionSymbol == *name;
+    });
+    if (found == metadata.end())
+      return false;
+    (*entry)["symbol"] = found->exportedWrapperSymbol;
   }
   result.reflection.clear();
   llvm::raw_string_ostream stream(result.reflection);
@@ -533,6 +576,7 @@ std::unique_ptr<VernonCompileResult> validate(VernonCompilerContext *context,
 
 bool captureCpuAbiMetadata(mlir::ModuleOp module,
                            std::vector<vernon::CpuAbiWrapperMetadata> &entries,
+                           llvm::StringRef moduleHash,
                            std::string &diagnostics) {
   for (mlir::func::FuncOp function : module.getOps<mlir::func::FuncOp>()) {
     if (!function->hasAttr("vernon.entry"))
@@ -541,7 +585,7 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module,
     vernon::CpuAbiWrapperMetadata metadata;
     metadata.internalFunctionSymbol = function.getSymName().str();
     metadata.exportedWrapperSymbol =
-        "__vernon_cpu_" + function.getSymName().str();
+        "__vernon_cpu_" + moduleHash.str() + "_" + function.getSymName().str();
     metadata.argumentsSize = 0;
     metadata.requiresTextureCallbacks = false;
     function.walk([&](mlir::vernon::IntrinsicOp intrinsic) {
@@ -730,8 +774,145 @@ bool compileCuda(VernonCompilerContext *context, const char *source,
   return true;
 }
 
+struct CpuCodegenOptions {
+  std::string targetTriple;
+  std::string cpu;
+  std::string features;
+};
+
+std::string copyStringView(VernonStringView value) {
+  return value.data && value.size ? std::string(value.data, value.size)
+                                  : std::string();
+}
+
+std::string cpuObjectFilename(const llvm::Triple &triple) {
+  return triple.isOSBinFormatCOFF() ? "module.obj" : "module.o";
+}
+
+bool emitCpuObject(llvm::Module &module, llvm::TargetMachine &targetMachine,
+                   std::string &object, std::string &diagnostics) {
+  std::unique_ptr<llvm::Module> codegenModule = llvm::CloneModule(module);
+  llvm::SmallVector<char> bytes;
+  llvm::raw_svector_ostream stream(bytes);
+  llvm::legacy::PassManager passManager;
+  if (targetMachine.addPassesToEmitFile(passManager, stream, nullptr,
+                                        llvm::CodeGenFileType::ObjectFile)) {
+    diagnostics = "selected CPU target cannot emit a relocatable object";
+    return false;
+  }
+  passManager.run(*codegenModule);
+  object.assign(bytes.begin(), bytes.end());
+  if (object.empty()) {
+    diagnostics = "CPU TargetMachine emitted an empty relocatable object";
+    return false;
+  }
+  return true;
+}
+
+std::string hostNativeLibraryFilename() {
+#if defined(_WIN32)
+  return "module.dll";
+#elif defined(__APPLE__)
+  return "module.dylib";
+#else
+  return "module.so";
+#endif
+}
+
+bool linkHostObject(llvm::StringRef object, std::string &library,
+                    std::string &diagnostics) {
+  llvm::SmallString<128> directory;
+  if (std::error_code error =
+          llvm::sys::fs::createUniqueDirectory("vernon_cpu_link", directory)) {
+    diagnostics = "cannot create temporary LLD directory: " + error.message();
+    return false;
+  }
+  const std::filesystem::path root(directory.str().str());
+#if defined(_WIN32)
+  const std::filesystem::path objectPath = root / "module.obj";
+#else
+  const std::filesystem::path objectPath = root / "module.o";
+#endif
+  const std::filesystem::path outputPath = root / hostNativeLibraryFilename();
+  auto cleanup = [&] {
+    std::error_code ignored;
+    std::filesystem::remove_all(root, ignored);
+  };
+  {
+    std::ofstream output(objectPath, std::ios::binary);
+    output.write(object.data(), static_cast<std::streamsize>(object.size()));
+    if (!output) {
+      diagnostics = "cannot write temporary CPU object";
+      cleanup();
+      return false;
+    }
+  }
+
+  std::vector<std::string> storage;
+#if defined(_WIN32)
+  storage = {"lld-link", "/dll", "/noentry", "/out:" + outputPath.string(),
+             objectPath.string()};
+  const lld::DriverDef driver{lld::WinLink, &lld::coff::link};
+#elif defined(__APPLE__)
+#if defined(__aarch64__)
+  constexpr const char *hostArch = "arm64";
+#else
+  constexpr const char *hostArch = "x86_64";
+#endif
+  storage = {"ld64.lld",
+             "-dylib",
+             "-arch",
+             hostArch,
+             "-platform_version",
+             "macos",
+             "11.0",
+             "11.0",
+             "-install_name",
+             "@rpath/module.dylib",
+             "-o",
+             outputPath.string(),
+             objectPath.string()};
+  const lld::DriverDef driver{lld::Darwin, &lld::macho::link};
+#else
+  storage = {"ld.lld", "-shared", objectPath.string(), "-o",
+             outputPath.string()};
+  const lld::DriverDef driver{lld::Gnu, &lld::elf::link};
+#endif
+  std::vector<const char *> arguments;
+  arguments.reserve(storage.size());
+  for (const std::string &argument : storage)
+    arguments.push_back(argument.c_str());
+
+  std::string linkerOutput;
+  llvm::raw_string_ostream linkerStream(linkerOutput);
+  static std::mutex linkerMutex;
+  lld::Result linkResult{1, false};
+  {
+    std::lock_guard<std::mutex> lock(linkerMutex);
+    linkResult = lld::lldMain(arguments, linkerStream, linkerStream, {driver});
+  }
+  linkerStream.flush();
+  if (linkResult.retCode != 0 || !linkResult.canRunAgain) {
+    diagnostics =
+        linkerOutput.empty() ? "embedded LLD failed" : std::move(linkerOutput);
+    cleanup();
+    return false;
+  }
+  std::ifstream input(outputPath, std::ios::binary);
+  library.assign(std::istreambuf_iterator<char>(input),
+                 std::istreambuf_iterator<char>());
+  if (!input || library.empty()) {
+    diagnostics = "embedded LLD produced no readable native library";
+    cleanup();
+    return false;
+  }
+  cleanup();
+  return true;
+}
+
 bool compileCpu(VernonCompilerContext *compilerContext, const char *source,
-                size_t sourceSize, VernonCompileResult &result) {
+                size_t sourceSize, const CpuCodegenOptions &options,
+                VernonCompileResult &result) {
   mlir::ScopedDiagnosticHandler handler(
       &compilerContext->context, [&](mlir::Diagnostic &diagnostic) {
         appendDiagnostic(result.diagnostics, diagnostic);
@@ -747,34 +928,53 @@ bool compileCpu(VernonCompilerContext *compilerContext, const char *source,
   if (mlir::failed(metadataPassManager.run(*sourceModule)))
     return false;
 
+  llvm::Expected<llvm::json::Value> parsedReflection =
+      llvm::json::parse(result.reflection);
+  llvm::json::Object *reflectionRoot =
+      parsedReflection ? parsedReflection->getAsObject() : nullptr;
+  std::optional<llvm::StringRef> moduleHash =
+      reflectionRoot ? reflectionRoot->getString("module_hash") : std::nullopt;
+  if (!moduleHash || moduleHash->empty()) {
+    result.diagnostics = "CPU reflection is missing its module hash";
+    return false;
+  }
   std::vector<vernon::CpuAbiWrapperMetadata> entries;
-  if (!captureCpuAbiMetadata(*sourceModule, entries, result.diagnostics))
+  if (!captureCpuAbiMetadata(*sourceModule, entries, *moduleHash,
+                             result.diagnostics))
     return false;
 
-  auto targetMachine = llvm::orc::JITTargetMachineBuilder::detectHost();
-  if (!targetMachine) {
-    result.diagnostics = llvm::toString(targetMachine.takeError());
+  const bool hostTarget = options.targetTriple.empty();
+  const std::string targetTriple = llvm::Triple::normalize(
+      hostTarget ? llvm::sys::getDefaultTargetTriple() : options.targetTriple);
+  const llvm::Triple parsedTriple(targetTriple);
+  if (!parsedTriple.isArch64Bit()) {
+    result.diagnostics =
+        "CPU relocatable objects currently require a 64-bit target triple";
     return false;
   }
-  auto dataLayout = targetMachine->getDefaultDataLayoutForTarget();
-  if (!dataLayout) {
-    result.diagnostics = llvm::toString(dataLayout.takeError());
+  std::string lookupError;
+  const llvm::Target *target =
+      llvm::TargetRegistry::lookupTarget(parsedTriple, lookupError);
+  if (!target) {
+    result.diagnostics =
+        "CPU target '" + targetTriple + "' is unavailable: " + lookupError;
     return false;
   }
-  std::string targetTriple = targetMachine->getTargetTriple().str();
-  auto jit = llvm::orc::LLJITBuilder()
-                 .setJITTargetMachineBuilder(std::move(*targetMachine))
-                 .setDataLayout(*dataLayout)
-                 .create();
-  if (!jit) {
-    result.diagnostics = llvm::toString(jit.takeError());
+  llvm::TargetOptions targetOptions;
+  std::unique_ptr<llvm::TargetMachine> objectTargetMachine(
+      target->createTargetMachine(parsedTriple, options.cpu, options.features,
+                                  targetOptions, llvm::Reloc::PIC_));
+  if (!objectTargetMachine) {
+    result.diagnostics =
+        "failed to create TargetMachine for '" + targetTriple + "'";
     return false;
   }
+  const llvm::DataLayout dataLayout = objectTargetMachine->createDataLayout();
 
   sourceModule->getOperation()->setAttr(
       mlir::LLVM::LLVMDialect::getDataLayoutAttrName(),
       mlir::StringAttr::get(&compilerContext->context,
-                            dataLayout->getStringRepresentation()));
+                            dataLayout.getStringRepresentation()));
   sourceModule->getOperation()->setAttr(
       mlir::LLVM::LLVMDialect::getTargetTripleAttrName(),
       mlir::StringAttr::get(&compilerContext->context, targetTriple));
@@ -790,7 +990,7 @@ bool compileCpu(VernonCompilerContext *compilerContext, const char *source,
     result.diagnostics = "failed to translate lowered CPU MLIR to LLVM IR";
     return false;
   }
-  llvmModule->setDataLayout(*dataLayout);
+  llvmModule->setDataLayout(dataLayout);
   llvmModule->setTargetTriple(llvm::Triple(targetTriple));
   if (llvm::Error error = vernon::defineCpuTextureSampleHelper(*llvmModule)) {
     result.diagnostics = llvm::toString(std::move(error));
@@ -802,35 +1002,61 @@ bool compileCpu(VernonCompilerContext *compilerContext, const char *source,
       return false;
     }
   }
+  if (parsedTriple.isOSWindows() && !llvmModule->getNamedGlobal("_fltused"))
+    new llvm::GlobalVariable(
+        *llvmModule, llvm::Type::getInt32Ty(*llvmContext), true,
+        llvm::GlobalValue::WeakAnyLinkage,
+        llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llvmContext), 0),
+        "_fltused");
   if (llvm::verifyModule(*llvmModule, &llvm::errs())) {
     result.diagnostics = "generated CPU LLVM IR failed verification";
     return false;
   }
-  std::string llvmIR;
-  llvm::raw_string_ostream llvmIRStream(llvmIR);
-  llvmModule->print(llvmIRStream, nullptr);
-  if (llvm::Error error = (*jit)->addIRModule(llvm::orc::ThreadSafeModule(
-          std::move(llvmModule), std::move(llvmContext)))) {
-    result.diagnostics = llvm::toString(std::move(error));
+  std::string object;
+  if (!emitCpuObject(*llvmModule, *objectTargetMachine, object,
+                     result.diagnostics))
     return false;
-  }
-  for (const vernon::CpuAbiWrapperMetadata &entry : entries) {
-    auto symbol = (*jit)->lookup(entry.exportedWrapperSymbol);
-    if (!symbol) {
-      result.diagnostics = llvm::toString(symbol.takeError());
+
+  std::unique_ptr<llvm::orc::LLJIT> jit;
+  if (hostTarget) {
+    auto jitTargetMachine = llvm::orc::JITTargetMachineBuilder::detectHost();
+    if (!jitTargetMachine) {
+      result.diagnostics = llvm::toString(jitTargetMachine.takeError());
       return false;
     }
-    result.cpuEntries.emplace(entry.internalFunctionSymbol,
-                              symbol->toPtr<VernonCpuEntryPoint>());
+    auto createdJit =
+        llvm::orc::LLJITBuilder()
+            .setJITTargetMachineBuilder(std::move(*jitTargetMachine))
+            .setDataLayout(dataLayout)
+            .create();
+    if (!createdJit) {
+      result.diagnostics = llvm::toString(createdJit.takeError());
+      return false;
+    }
+    jit = std::move(*createdJit);
+    if (llvm::Error error = jit->addIRModule(llvm::orc::ThreadSafeModule(
+            std::move(llvmModule), std::move(llvmContext)))) {
+      result.diagnostics = llvm::toString(std::move(error));
+      return false;
+    }
+    for (const vernon::CpuAbiWrapperMetadata &entry : entries) {
+      auto symbol = jit->lookup(entry.exportedWrapperSymbol);
+      if (!symbol) {
+        result.diagnostics = llvm::toString(symbol.takeError());
+        return false;
+      }
+      result.cpuEntries.emplace(entry.internalFunctionSymbol,
+                                symbol->toPtr<VernonCpuEntryPoint>());
+    }
   }
   result.artifacts.clear();
-  result.artifacts.push_back(
-      VernonCompileResult::Artifact{"module.ll", std::move(llvmIR)});
-  if (!setCpuReflectionSymbols(result)) {
+  result.artifacts.push_back(VernonCompileResult::Artifact{
+      cpuObjectFilename(parsedTriple), std::move(object)});
+  if (!setCpuReflectionSymbols(result, entries)) {
     result.diagnostics = "compiler produced invalid CPU reflection metadata";
     return false;
   }
-  result.cpuJit = std::move(*jit);
+  result.cpuJit = std::move(jit);
   return true;
 }
 
@@ -986,6 +1212,7 @@ VernonCompileResult *vernonCompilerCompileMlirWithOptions(
   }
 
   uint32_t glslVersion = 0;
+  CpuCodegenOptions cpuOptions;
   if (options) {
     constexpr size_t requiredOptionsSize =
         offsetof(VernonCompileOptions, glsl_version) + sizeof(uint32_t);
@@ -1010,12 +1237,44 @@ VernonCompileResult *vernonCompilerCompileMlirWithOptions(
       result->artifacts.clear();
       return result.release();
     }
+    auto readCpuOption = [&](size_t offset, std::string &destination) -> bool {
+      if (options->struct_size < offset + sizeof(VernonStringView))
+        return true;
+      VernonStringView value{};
+      std::memcpy(&value, reinterpret_cast<const char *>(options) + offset,
+                  sizeof(value));
+      if (value.size != 0 && !value.data) {
+        result->status = VERNON_STATUS_INVALID_ARGUMENT;
+        result->diagnostics = "CPU compile option has null data";
+        result->artifacts.clear();
+        return false;
+      }
+      destination = copyStringView(value);
+      return true;
+    };
+    if (!readCpuOption(offsetof(VernonCompileOptions, cpu_target_triple),
+                       cpuOptions.targetTriple) ||
+        !readCpuOption(offsetof(VernonCompileOptions, cpu_name),
+                       cpuOptions.cpu) ||
+        !readCpuOption(offsetof(VernonCompileOptions, cpu_features),
+                       cpuOptions.features))
+      return result.release();
+    if (target != VERNON_TARGET_CPU &&
+        (!cpuOptions.targetTriple.empty() || !cpuOptions.cpu.empty() ||
+         !cpuOptions.features.empty())) {
+      result->status = VERNON_STATUS_INVALID_ARGUMENT;
+      result->diagnostics =
+          "CPU code generation options are valid only for the CPU target";
+      result->artifacts.clear();
+      return result.release();
+    }
   }
 
   if (target == VERNON_TARGET_CPU) {
     result->diagnostics.clear();
-    if (compileCpu(context, source, sourceSize, *result)) {
-      addArtifactTable(*result, target, glslVersion);
+    if (compileCpu(context, source, sourceSize, cpuOptions, *result)) {
+      addArtifactTable(*result, target, glslVersion, cpuOptions.targetTriple,
+                       cpuOptions.cpu, cpuOptions.features);
       result->status = VERNON_STATUS_OK;
       return result.release();
     }
@@ -1068,6 +1327,29 @@ VernonCompileResult *vernonCompilerCompileMlirWithOptions(
   result->diagnostics =
       "the requested target lowering pipeline is not available";
   result->artifacts.clear();
+  return result.release();
+}
+
+VernonCompileResult *
+vernonCompilerLinkHostObject(VernonCompilerContext *context, const void *object,
+                             size_t objectSize) {
+  auto result = std::make_unique<VernonCompileResult>();
+  if (!context || !object || objectSize == 0) {
+    result->status = VERNON_STATUS_INVALID_ARGUMENT;
+    result->diagnostics =
+        "host object linking requires a compiler context and object bytes";
+    return result.release();
+  }
+  std::string library;
+  if (!linkHostObject(
+          llvm::StringRef(static_cast<const char *>(object), objectSize),
+          library, result->diagnostics)) {
+    result->status = VERNON_STATUS_INTERNAL_ERROR;
+    return result.release();
+  }
+  result->artifacts.push_back(VernonCompileResult::Artifact{
+      hostNativeLibraryFilename(), std::move(library)});
+  result->status = VERNON_STATUS_OK;
   return result.release();
 }
 

@@ -41,6 +41,15 @@ typedef struct VernonCompileOptions {
   // Zero selects the target default. Used only by OpenGL and OpenGL ES.
   uint32_t glsl_version;
   uint32_t reserved[6];
+  /*
+   * CPU object target. Empty selects the compiler host triple. Examples:
+   * "x86_64-pc-windows-msvc" and "arm64-apple-ios17.0".
+   */
+  VernonStringView cpu_target_triple;
+  /* Empty selects the target's generic CPU. */
+  VernonStringView cpu_name;
+  /* Comma-separated LLVM target features, for example "+neon". */
+  VernonStringView cpu_features;
 } VernonCompileOptions;
 
 VERNON_DSL_CAPI VernonCompilerContext *vernonCompilerCreate(void);
@@ -61,6 +70,13 @@ vernonCompilerCompileMlir(VernonCompilerContext *context, const char *source,
 VERNON_DSL_CAPI VernonCompileResult *vernonCompilerCompileMlirWithOptions(
     VernonCompilerContext *context, const char *source, size_t source_size,
     VernonTarget target, const VernonCompileOptions *options);
+/*
+ * Finalizes a host relocatable object into a temporary-loadable native
+ * library. The result contains exactly one DLL/so/dylib artifact.
+ */
+VERNON_DSL_CAPI VernonCompileResult *
+vernonCompilerLinkHostObject(VernonCompilerContext *context, const void *object,
+                             size_t object_size);
 
 VERNON_DSL_CAPI void vernonCompileResultDestroy(VernonCompileResult *result);
 VERNON_DSL_CAPI VernonStatus

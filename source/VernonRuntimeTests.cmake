@@ -66,6 +66,7 @@ function(vernon_add_runtime_tests)
       COMMAND $<TARGET_FILE:vernon-compile> --target cpu
         ${_VERNON_RUNTIME_SOURCE_DIR}/tests/integration/cpu-aot-smoke.mlir
         --compute-bundle ${compiler_cpu_bundle}
+        --host-runtime-bundle
       DEPENDS vernon-compile
         ${_VERNON_RUNTIME_SOURCE_DIR}/tests/integration/cpu-aot-smoke.mlir
       VERBATIM)

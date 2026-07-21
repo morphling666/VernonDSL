@@ -148,6 +148,9 @@ def _artifact_extension(artifact_format: str, stage: str,
     if artifact_format == "native_library":
         suffix = Path(original_name).suffix
         return suffix or ".native"
+    if artifact_format == "relocatable_object":
+        suffix = Path(original_name).suffix
+        return suffix if suffix in {".o", ".obj"} else ".o"
     suffix = Path(original_name).suffix
     return suffix or f".{artifact_format}"
 
@@ -573,6 +576,15 @@ def _compile_stage(module: ShaderModuleDescriptor,
         command = [str(compiler), "--target", target, str(mlir_path)]
         if target == "cpu":
             command.extend(("--compute-bundle", str(artifact_directory)))
+            for option, flag in (("target_triple", "--target-triple"),
+                                 ("cpu", "--cpu"),
+                                 ("cpu_features", "--cpu-features")):
+                value = target_options.get(option)
+                if value is not None:
+                    if not isinstance(value, str) or not value:
+                        raise ShaderAssetError(
+                            f"{option} must be a non-empty string")
+                    command.extend((flag, value))
         else:
             command.extend(("--output-dir", str(artifact_directory)))
         glsl_version = target_options.get("glsl_version", 0)
@@ -599,18 +611,35 @@ def _compile_stage(module: ShaderModuleDescriptor,
             artifact_sha256 = manifest.get("artifact_sha256")
             operating_system = manifest.get("operating_system")
             architecture = manifest.get("architecture")
+            target_triple = manifest.get("target_triple")
+            object_format = manifest.get("object_format")
             abi_version = manifest.get("cpu_invocation_abi_version")
-            if (manifest.get("schema_version") != 2
+            artifact_format = manifest.get("artifact_format")
+            legacy_native = (manifest.get("schema_version") == 2
+                             and artifact_format == "native_library")
+            relocatable = (manifest.get("schema_version") == 3
+                           and artifact_format == "relocatable_object")
+            valid_symbol = (
+                isinstance(symbol, str)
+                and symbol.startswith("__vernon_cpu_")
+                and symbol.endswith(f"_{reference.entry}")
+            )
+            if (not (legacy_native or relocatable)
                     or manifest.get("target") != "cpu"
-                    or manifest.get("artifact_format") != "native_library"
                     or manifest.get("entry") != reference.entry
-                    or symbol != f"__vernon_cpu_{reference.entry}"
+                    or not valid_symbol
                     or not isinstance(artifact_name, str) or not artifact_name
                     or not isinstance(artifact_size, int)
                     or not isinstance(artifact_sha256, str)
                     or len(artifact_sha256) != 64
-                    or not isinstance(operating_system, str)
-                    or not isinstance(architecture, str)
+                    or (legacy_native
+                        and (not isinstance(operating_system, str)
+                             or not isinstance(architecture, str)))
+                    or (relocatable
+                        and (not isinstance(target_triple, str)
+                             or not target_triple
+                             or object_format not in
+                             {"coff", "elf", "macho", "wasm"}))
                     or not isinstance(abi_version, int)):
                 raise ShaderAssetError(
                     f"compiler emitted an invalid CPU bundle for {reference.entry}"
@@ -649,24 +678,28 @@ def _compile_stage(module: ShaderModuleDescriptor,
             stage_id = hashlib.sha256(
                 _canonical_json(identity).encode("utf-8")).hexdigest()
             artifact = _write_external_artifact(
-                output, artifact_data, "native_library", stage, artifact_name)
+                output, artifact_data, artifact_format, stage, artifact_name)
             record = {
                 "id": stage_id,
                 "module": module.id,
                 "entry": reference.entry,
                 "stage": stage,
                 "target": target,
-                "format": "native_library",
+                "format": artifact_format,
                 "artifact": artifact,
                 "symbol": symbol,
-                "operating_system": operating_system,
-                "architecture": architecture,
                 "cpu_invocation_abi_version": abi_version,
                 "module_hash": reflection.get("module_hash"),
                 "dependencies": reflection.get("dependencies", []),
                 "interface": entry_reflection,
                 "reflection": reflection,
             }
+            if legacy_native:
+                record["operating_system"] = operating_system
+                record["architecture"] = architecture
+            else:
+                record["target_triple"] = target_triple
+                record["object_format"] = object_format
             return stage_id, record
         reflection_path = artifact_directory / "reflection.json"
         reflection = _read_manifest(reflection_path)

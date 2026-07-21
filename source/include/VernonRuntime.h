@@ -3,7 +3,9 @@
 
 #include "VernonCommon.h"
 
-#if defined(_WIN32) && defined(VERNON_RUNTIME_BUILD)
+#if defined(VERNON_RUNTIME_STATIC)
+#define VERNON_RUNTIME_CAPI
+#elif defined(_WIN32) && defined(VERNON_RUNTIME_BUILD)
 #define VERNON_RUNTIME_CAPI __declspec(dllexport)
 #elif defined(_WIN32)
 #define VERNON_RUNTIME_CAPI __declspec(dllimport)
@@ -148,6 +150,12 @@ vernonRuntimeLoadCpuEntry(VernonRuntimeContext *context,
                           VernonCpuEntryPoint entry_point,
                           const char *reflection, size_t reflection_size,
                           const char *entry, size_t entry_size);
+/*
+ * Registers an AOT entry that was statically linked into the application.
+ * Re-registering the same symbol and pointer is idempotent.
+ */
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeRegisterStaticCpuEntry(
+    VernonStringView symbol, VernonCpuEntryPoint entry_point);
 VERNON_RUNTIME_CAPI VernonLoadedKernel *
 vernonRuntimeLoadComputeBundle(VernonRuntimeContext *context,
                                const char *directory);

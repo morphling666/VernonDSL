@@ -10,9 +10,15 @@ Python wheel. `uv sync` installs the source but does not compile it. Vernon
 locates that installed source during CMake configuration and compiles it with
 Vernon's own desktop, mobile, or WebAssembly toolchain.
 
-The Python wheel also contains a prebuilt runtime for standalone Python use.
-When Python is embedded in Vernon, the Engine-built runtime is the process
-runtime provider and `_native` must reuse it.
+The Python wheel also contains a desktop runtime for standalone Python,
+Editor, and asset-cooking use. This host runtime is independent from the
+runtime that Vernon compiles from `runtime_src` with its target toolchain.
+Runtime contexts, resources, and handles must not cross between them.
+
+The initial package supports desktop hosts. CPU cooking emits relocatable
+objects through LLVM TargetMachine for the compiler host or an explicit target
+triple; the first cross target is iOS arm64. Android and WebAssembly CPU object
+verification remains deferred.
 
 ## Wheel layout
 
@@ -22,7 +28,7 @@ Install the minimum standalone source closure:
 vernon_dsl/
   _native.*
   VernonDSLCompiler.*
-  VernonRuntime.*              # standalone Python fallback
+  VernonRuntime.*              # private desktop host runtime
   runtime_src/
     CMakeLists.txt
     include/
@@ -206,23 +212,24 @@ remains available for standalone Python/headless execution. Engine builds use
 the external constructor, ensuring Vernon rendering and pipeline bundles share
 one device, queue schedule, pipeline cache policy, and resource universe.
 
-## ABI and same-process ownership
+## Host and target runtime separation
 
 Add runtime ABI-major, semantic version, source revision, and build-id queries
 to `VernonRuntime.h`.
 
-- ABI-major and source revision must match between `_native` and the
-  Engine-built runtime.
-- Build-id may differ because Vernon uses a different toolchain or static/shared
-  configuration; it is diagnostic, not an equality requirement.
-- The Engine loads its runtime before initializing embedded Python.
-- The fallback runtime in the wheel uses the same ABI-major library basename.
-  The platform loader must reuse the already-loaded Engine runtime.
-- `_native` fails import with a precise version diagnostic when the loaded
-  runtime is incompatible.
-
-Runtime handles and imported graphics resources must never cross between two
-different loaded runtime modules.
+- `_native` uses the wheel's private desktop host runtime.
+- Vernon uses the runtime it compiled from `runtime_src` with its own target
+  toolchain, sysroot, architecture, and profile.
+- The host and target runtimes are independent even when Editor Python is
+  embedded in a desktop Vernon process.
+- Give the wheel runtime a private library identity, or link it statically into
+  `_native`, so the platform loader cannot accidentally substitute Vernon's
+  runtime.
+- Runtime contexts, handles, imported graphics resources, and global state
+  must never cross between the host and target runtime instances.
+- Semantic version and source revision identify the source shipped by the
+  wheel. Build-id remains diagnostic because every target build may use a
+  different toolchain and configuration.
 
 ## Python build backend
 
@@ -231,15 +238,15 @@ CMake installs:
 
 - `_native`;
 - `VernonDSLCompiler` and required compiler libraries;
-- the standalone fallback `VernonRuntime`;
+- the private desktop host `VernonRuntime`;
 - `runtime_src` package data.
 
 Move build/development tools such as Conan, clang-format, Taichi, and web
 services out of mandatory runtime dependencies into optional extras.
 
 Use `cibuildwheel` for host platform wheels. Packaging repair tools must retain
-the stable Runtime library identity instead of renaming it to a wheel-private
-ABI name.
+the wheel-private host Runtime identity and must not introduce a dependency on
+an Engine-built Runtime.
 
 ## Vernon integration
 
@@ -266,22 +273,29 @@ import it. Static mobile/web builds require no runtime staging.
    - Install `runtime_src` and expose the discovery API/CLI.
    - Add a test that compares packaged source revision with `_native`.
 
-3. **Vernon discovery**
+3. **CPU relocatable objects**
+   - Make relocatable objects the persistent CPU artifact format.
+   - Embed the host LLD driver for Python's ephemeral DLL/so/dylib execution.
+   - Emit iOS arm64 Mach-O objects for static Engine/Xcode linking.
+   - Register statically linked CPU entry symbols in VernonRuntime.
+
+4. **Vernon discovery**
    - Query the selected uv Python during configure.
    - Preserve explicit checkout override.
    - Compile in a Vernon-owned binary directory with Vernon's toolchain.
 
-4. **External Vulkan integration**
+5. **External Vulkan integration**
    - Add the external instance/device/queue constructor.
    - Add borrowed buffer/image imports and layout/queue ownership metadata.
    - Integrate submission with Vernon's graphics thread and synchronization.
 
-5. **Runtime provider validation**
+6. **Host/target separation validation**
    - Add ABI/version query APIs.
-   - Validate the runtime loaded by `_native`.
-   - Test standalone Python and same-process Vernon embedded Python.
+   - Verify `_native` uses its private desktop host runtime.
+   - Test standalone Python and same-process Vernon embedded Python without
+     sharing Runtime state or handles.
 
-6. **Cross-platform verification**
+7. **Cross-platform verification**
    - Desktop shared builds and DLL/RPATH staging.
    - Android/iOS static mobile profile.
    - Emscripten static web profile.
@@ -293,9 +307,8 @@ import it. Static mobile/web builds require no runtime staging.
   Vernon using only the wheel-provided `runtime_src`.
 - Confirm Vernon compile commands use Vernon's selected compiler, sysroot,
   architecture, sanitizer flags, and Emscripten/mobile toolchain.
-- Build normal desktop tests and verify only one runtime module is loaded in
-  the embedded-Python process.
-- Reject wheel/Engine ABI or source-revision mismatches before creating runtime
-  contexts.
+- Build normal desktop tests and verify the wheel host runtime and Vernon
+  target runtime remain independent in an embedded-Python process.
+- Verify the packaged `runtime_src` revision matches the wheel version metadata.
 - Inspect desktop imports to confirm no LLVM, MLIR, GLFW, CUDA Toolkit, or
   Vulkan loader import-library dependency enters `VernonRuntime`.

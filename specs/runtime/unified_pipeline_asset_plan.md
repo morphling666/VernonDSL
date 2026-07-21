@@ -47,7 +47,7 @@ Examples:
 cpu_compute_asset/
   cpu_compute_asset.pipeline.json
   artifacts/
-    <sha256>.dll
+    <sha256>.obj
 
 cuda_compute_asset/
   cuda_compute_asset.pipeline.json
@@ -76,7 +76,11 @@ All cooked/deployment artifacts are external:
 - GLSL and GLSL ES source;
 - PTX;
 - SPIR-V;
-- CPU `.dll`, `.so`, or `.dylib`.
+- CPU relocatable `.obj` or `.o`.
+
+The CPU manifest records its target triple and object format. Desktop Python
+may finalize a host object into an ephemeral DLL/so/dylib through embedded LLD,
+but that dynamic library is not the persistent asset format.
 
 The JSON manifest contains no compiled payload bytes. This avoids duplicate
 source in JSON, SPIR-V base64 expansion, and backend-specific loading rules,

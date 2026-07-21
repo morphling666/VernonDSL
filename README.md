@@ -53,7 +53,8 @@ Prerequisites are CMake, a C/C++ toolchain, Python 3.11, and
 
 ```powershell
 cmake -S llvm-project/llvm -B llvm-project/build `
-  -DLLVM_ENABLE_PROJECTS=mlir `
+  -DLLVM_ENABLE_PROJECTS="mlir;lld" `
+  -DLLVM_TARGETS_TO_BUILD="X86;AArch64;NVPTX;AMDGPU" `
   -DCMAKE_INSTALL_PREFIX="$PWD/llvm-project/install"
 cmake --build llvm-project/build --config Release --target install --parallel 4
 ```
@@ -74,7 +75,8 @@ On a single-configuration Linux or macOS generator, use the equivalent:
 
 ```bash
 cmake -S llvm-project/llvm -B llvm-project/build \
-  -DLLVM_ENABLE_PROJECTS=mlir \
+  -DLLVM_ENABLE_PROJECTS="mlir;lld" \
+  -DLLVM_TARGETS_TO_BUILD="X86;AArch64;NVPTX;AMDGPU" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$PWD/llvm-project/install"
 cmake --build llvm-project/build --target install --parallel 4
@@ -155,10 +157,11 @@ values = output.to_numpy()
 All three compute backends lower the restricted Python AST to Vernon MLIR on
 the first specialized call, compile a target artifact, cache the loaded native
 kernel, and launch through `VernonRuntime`. CPU execution creates a temporary
-validated AOT compute bundle using `vernon-compile` and clang; set
-`VERNON_COMPILER` when the compiler executable is not beside `_native`, in the
-checkout build directory, or on `PATH`. There is no Python interpreter
-fallback for `@kernel`.
+validated AOT compute bundle using `vernon-compile`: LLVM emits a host
+relocatable object and the embedded host LLD driver finalizes an ephemeral
+native library. Set `VERNON_COMPILER` when the compiler executable is not
+beside `_native`, in the checkout build directory, or on `PATH`. There is no
+external Clang or Python interpreter fallback for `@kernel`.
 
 `VERNON_ENABLE_RUNTIME` builds the standalone `VernonRuntime` C API with CPU
 AOT execution. `VERNON_ENABLE_CUDA_RUNTIME` dynamically loads the
@@ -223,7 +226,7 @@ uv run python examples/shared_struct_methods.py --arch vulkan `
   --mlir build/shared-struct-methods.mlir
 ```
 
-Persist a kernel for C or C++ loading with:
+Emit a relocatable CPU object bundle with:
 
 ```powershell
 vernon-compile-python kernel.py --entry scale -o build/scale.mlir
@@ -231,6 +234,22 @@ build/source/Release/vernon-compile.exe `
   --target cpu build/scale.mlir `
   --compute-bundle build/scale
 ```
+
+On Windows this writes `module.obj`; ELF and Mach-O targets write `module.o`.
+The bundle records the target triple, object format, stable exported wrapper,
+size, and SHA-256. It is intended for static application linking, not direct
+dynamic loading. To cross-compile an iOS object:
+
+```powershell
+build/source/Release/vernon-compile.exe `
+  --target cpu build/scale.mlir `
+  --target-triple arm64-apple-ios17.0 `
+  --compute-bundle build/scale-ios
+```
+
+`--host-runtime-bundle` may be added only for immediate desktop execution. It
+uses the LLD driver embedded in `VernonDSLCompiler` to finalize the host object
+as a temporary DLL/so/dylib; persistent assets should retain the object.
 
 OpenGL and OpenGL ES source versions are selectable per compilation. Omitting
 the option uses the backend default:
@@ -281,6 +300,22 @@ uv run --frozen vernon-cook-shader `
   --target opengl `
   -o build/variant_mesh_asset
 ```
+
+For a CPU pipeline declaration, use the same cooker with `--target cpu`:
+
+```powershell
+uv run --frozen vernon-cook-shader `
+  python/tests/pipeline_asset_fixture.py:scale_asset `
+  --asset-root . `
+  --compiler build/source/Release/vernon-compile.exe `
+  --target cpu `
+  -o build/cpu_scale
+```
+
+The result contains `cpu_scale.pipeline.json` and a content-addressed
+`artifacts/<sha256>.obj` or `.o`. Consumers should parse the JSON manifest and
+link the referenced object; the cooker does not generate an executable CMake
+fragment.
 
 The resulting `variant_mesh_asset.pipeline.json` maps exact canonical feature
 keys to shared stage artifacts. For the four `INSTANCE`/`SKIN` combinations,

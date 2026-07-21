@@ -59,8 +59,15 @@ try {
 
   Remove-Item -Recurse -Force $cpuOutput -ErrorAction SilentlyContinue
   & $VernonCompiler --target cpu $shaderMlirPath --output-dir $cpuOutput
+  $cpuArtifact = if (
+    [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+      [System.Runtime.InteropServices.OSPlatform]::Windows)) {
+    "module.obj"
+  } else {
+    "module.o"
+  }
   if ($LASTEXITCODE -ne 0 -or
-      -not (Test-Path (Join-Path $cpuOutput "module.ll"))) {
+      -not (Test-Path (Join-Path $cpuOutput $cpuArtifact))) {
     throw "CPU reference shader compilation failed"
   }
 

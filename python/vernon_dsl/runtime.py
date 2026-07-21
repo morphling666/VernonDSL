@@ -689,7 +689,7 @@ class Kernel:
         command = [
             str(self._native_compiler_path()), "--target", "cpu",
             str(mlir_path), "--compute-bundle",
-            str(bundle_path)
+            str(bundle_path), "--host-runtime-bundle"
         ]
         try:
             result = subprocess.run(command,

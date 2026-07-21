@@ -65,6 +65,21 @@ std::string schema2Bundle(const std::string &legacy) {
   return root.dump(-1, ' ', false);
 }
 
+VernonStatus staticallyLinkedFill(const VernonCpuInvocation *invocation) {
+  uintptr_t address = 0;
+  uint32_t gid[3] = {0, 0, 0};
+  if (!invocation || invocation->arguments_size < 20)
+    return VERNON_STATUS_INVALID_ARGUMENT;
+  std::memcpy(&address, invocation->arguments, sizeof(address));
+  std::memcpy(gid,
+              static_cast<const unsigned char *>(invocation->arguments) + 8,
+              sizeof(gid));
+  float *values = reinterpret_cast<float *>(address);
+  values[gid[2] * 6 + gid[1] * 3 + gid[0]] =
+      static_cast<float>(gid[0] + 10 * gid[1] + 100 * gid[2]);
+  return VERNON_STATUS_OK;
+}
+
 } // namespace
 
 int main() {
@@ -93,6 +108,39 @@ int main() {
       loadWithDirectory(runtime, schema2, directoryUtf8);
   assert(schema2Loaded);
   vernonRuntimePipelineBundleDestroy(schema2Loaded);
+
+  const std::string objectBytes = "test relocatable object";
+  const std::filesystem::path objectPath = directory / "test_static.o";
+  {
+    std::ofstream objectOutput(objectPath, std::ios::binary);
+    objectOutput << objectBytes;
+  }
+  nlohmann::json objectBundle = nlohmann::json::parse(schema2);
+  nlohmann::json &objectStage = objectBundle["stage_artifacts"]["fill"];
+  objectStage["artifact"]["format"] = "relocatable_object";
+  objectStage["artifact"]["path"] = objectPath.filename().string();
+  objectStage["artifact"]["size"] = objectBytes.size();
+  objectStage["artifact"]["sha256"] =
+      vernon::runtime::sha256Hex(objectBytes.data(), objectBytes.size());
+  objectStage["format"] = "relocatable_object";
+  objectStage["target_triple"] = "test-host-triple";
+  objectStage["object_format"] = "elf";
+  objectBundle.erase("content_hash");
+  std::string objectCanonical = objectBundle.dump(-1, ' ', false);
+  objectBundle["content_hash"] = vernon::runtime::sha256Hex(
+      objectCanonical.data(), objectCanonical.size());
+  const std::string objectManifest = objectBundle.dump(-1, ' ', false);
+  assert(vernonRuntimeRegisterStaticCpuEntry(
+             {"vernon_test_fill", std::strlen("vernon_test_fill")},
+             staticallyLinkedFill) == VERNON_STATUS_OK);
+  VernonPipelineBundle *objectLoaded =
+      loadWithDirectory(runtime, objectManifest, directoryUtf8);
+  assert(objectLoaded);
+  VernonLoadedPipeline *objectPipeline =
+      vernonRuntimeResolvePipeline(objectLoaded, {nullptr, 0});
+  assert(objectPipeline);
+  vernonRuntimeLoadedPipelineDestroy(objectPipeline);
+  vernonRuntimePipelineBundleDestroy(objectLoaded);
 
   nlohmann::json invalidSchema2 = nlohmann::json::parse(schema2);
   invalidSchema2["stage_artifacts"]["fill"]["cpu_invocation_abi_version"] = 2;

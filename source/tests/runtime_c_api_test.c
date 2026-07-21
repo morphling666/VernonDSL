@@ -21,6 +21,16 @@ static VernonStatus fill_grid(const VernonCpuInvocation *invocation) {
 }
 
 int main(void) {
+  static const char static_symbol[] = "__vernon_cpu_test_fill";
+  assert(vernonRuntimeRegisterStaticCpuEntry(
+             (VernonStringView){static_symbol, sizeof(static_symbol) - 1},
+             fill_grid) == VERNON_STATUS_OK);
+  assert(vernonRuntimeRegisterStaticCpuEntry(
+             (VernonStringView){static_symbol, sizeof(static_symbol) - 1},
+             fill_grid) == VERNON_STATUS_OK);
+  assert(vernonRuntimeRegisterStaticCpuEntry((VernonStringView){NULL, 0},
+                                             fill_grid) ==
+         VERNON_STATUS_INVALID_ARGUMENT);
   static const char reflection[] =
       "{\"gpu_launch_abi_version\":1,\"entries\":[{\"name\":\"fill\","
       "\"cpu_arguments_size\":20,\"workgroup_size\":[2,2,1],\"arguments\":["

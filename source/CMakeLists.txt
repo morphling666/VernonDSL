@@ -1,6 +1,34 @@
 if(VERNON_ENABLE_RUNTIME)
   include(VernonRuntimeTarget.cmake)
   vernon_add_runtime()
+
+  if(SKBUILD)
+    install(DIRECTORY "${CMAKE_SOURCE_DIR}/runtime_src/"
+      DESTINATION vernon_dsl/runtime_src
+      COMPONENT VernonWheel)
+    install(FILES
+      "${CMAKE_CURRENT_SOURCE_DIR}/VernonRuntimeTarget.cmake"
+      DESTINATION vernon_dsl/runtime_src/cmake
+      COMPONENT VernonWheel)
+    install(FILES
+      "${CMAKE_CURRENT_SOURCE_DIR}/include/VernonCommon.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/include/VernonRuntime.h"
+      DESTINATION vernon_dsl/runtime_src/include
+      COMPONENT VernonWheel)
+    install(FILES
+      "${CMAKE_CURRENT_SOURCE_DIR}/include/vernon-c/Common.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/include/vernon-c/Runtime.h"
+      DESTINATION vernon_dsl/runtime_src/include/vernon-c
+      COMPONENT VernonWheel)
+    install(FILES
+      "${CMAKE_CURRENT_SOURCE_DIR}/lib/VernonRuntime.cpp"
+      DESTINATION vernon_dsl/runtime_src/lib
+      COMPONENT VernonWheel)
+    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/lib/runtime/"
+      DESTINATION vernon_dsl/runtime_src/lib/runtime
+      COMPONENT VernonWheel
+      FILES_MATCHING PATTERN "*.cpp" PATTERN "*.h")
+  endif()
 endif()
 
 if(NOT VERNON_ENABLE_COMPILER)
@@ -28,9 +56,14 @@ add_library(VernonDSLCompiler SHARED
   lib/VernonCompiler.cpp
 )
 llvm_map_components_to_libnames(VERNON_LLVM_JIT_LIBS
+  AllTargetsAsmParsers
+  AllTargetsCodeGens
+  AllTargetsDescs
+  AllTargetsInfos
   AsmParser
   Core
   OrcJIT
+  Target
   native
 )
 target_compile_definitions(VernonDSLCompiler PRIVATE
@@ -82,6 +115,13 @@ target_link_libraries(VernonDSLCompiler PRIVATE
   MLIRVectorToLLVM
   ${VERNON_LLVM_JIT_LIBS}
 )
+if(WIN32)
+  target_link_libraries(VernonDSLCompiler PRIVATE lldCommon lldCOFF)
+elseif(APPLE)
+  target_link_libraries(VernonDSLCompiler PRIVATE lldCommon lldMachO)
+else()
+  target_link_libraries(VernonDSLCompiler PRIVATE lldCommon lldELF)
+endif()
 if(VERNON_ENABLE_SPIRV_CROSS)
   target_link_libraries(VernonDSLCompiler PRIVATE
     spirv-cross-glsl
@@ -90,10 +130,20 @@ if(VERNON_ENABLE_SPIRV_CROSS)
   )
 endif()
 
+if(SKBUILD)
+  set(_vernon_compiler_runtime_destination vernon_dsl)
+  set(_vernon_compiler_library_destination vernon_dsl)
+else()
+  set(_vernon_compiler_runtime_destination bin)
+  set(_vernon_compiler_library_destination lib)
+endif()
 install(TARGETS VernonDSLCompiler
-  RUNTIME DESTINATION bin
-  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION ${_vernon_compiler_runtime_destination}
+    COMPONENT VernonWheel
+  LIBRARY DESTINATION ${_vernon_compiler_library_destination}
+    COMPONENT VernonWheel
   ARCHIVE DESTINATION lib
+    COMPONENT VernonDevelopment
 )
 install(FILES
   include/VernonCommon.h
@@ -126,9 +176,16 @@ if(VERNON_ENABLE_RUNTIME)
         target_compile_options(vernon-dsl-native PRIVATE /EHsc)
       endif()
       set_target_properties(vernon-dsl-native PROPERTIES OUTPUT_NAME "_native")
+      if(APPLE)
+        set_target_properties(vernon-dsl-native PROPERTIES
+          INSTALL_RPATH "@loader_path")
+      elseif(UNIX)
+        set_target_properties(vernon-dsl-native PROPERTIES
+          INSTALL_RPATH "$ORIGIN")
+      endif()
       install(TARGETS vernon-dsl-native
-        RUNTIME DESTINATION vernon_dsl
-        LIBRARY DESTINATION vernon_dsl
+        RUNTIME DESTINATION vernon_dsl COMPONENT VernonWheel
+        LIBRARY DESTINATION vernon_dsl COMPONENT VernonWheel
       )
     else()
       message(STATUS "nanobind not found; skipping vernon_dsl._native")
@@ -151,14 +208,20 @@ endif()
 add_executable(vernon-compile
   tools/vernon_compile.cpp
 )
-target_compile_definitions(vernon-compile PRIVATE
-  VERNON_LLVM_TOOLS_DIR="${LLVM_TOOLS_BINARY_DIR}"
+target_link_libraries(vernon-compile PRIVATE
+  VernonDSLCompiler
+  LLVMSupport
+  LLVMTargetParser
 )
-target_link_libraries(vernon-compile PRIVATE VernonDSLCompiler LLVMSupport)
 if(MSVC)
   target_compile_options(vernon-compile PRIVATE /EHsc)
 endif()
-install(TARGETS vernon-compile RUNTIME DESTINATION bin)
+if(SKBUILD)
+  install(TARGETS vernon-compile
+    RUNTIME DESTINATION vernon_dsl COMPONENT VernonWheel)
+else()
+  install(TARGETS vernon-compile RUNTIME DESTINATION bin)
+endif()
 
 if(BUILD_TESTING)
   if(VERNON_ENABLE_RUNTIME)

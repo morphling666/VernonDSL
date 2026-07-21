@@ -62,10 +62,13 @@ struct Output {
 struct CpuNativeArtifact {
   std::filesystem::path root;
   std::filesystem::path relativeLibrary;
+  std::string format{"native_library"};
   std::string entry;
   std::string symbol;
   std::string operatingSystem;
   std::string architecture;
+  std::string targetTriple;
+  std::string objectFormat;
   uint32_t invocationAbiVersion{};
   uint64_t size{};
   std::string sha256;
@@ -237,6 +240,16 @@ struct VernonLoadedKernel {
 };
 
 namespace {
+
+std::mutex &staticCpuEntriesMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_map<std::string, VernonCpuEntryPoint> &staticCpuEntries() {
+  static std::unordered_map<std::string, VernonCpuEntryPoint> entries;
+  return entries;
+}
 
 VernonStatus fail(VernonRuntimeContext *context, std::string error,
                   VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) {
@@ -1014,10 +1027,18 @@ bool resolveCpuNativeArtifact(VernonRuntimeContext *context,
                               const CpuNativeArtifact &artifact,
                               std::filesystem::path &libraryPath,
                               ReflectedEntry *reflection) {
+  const bool nativeLibrary = artifact.format == "native_library";
+  const bool relocatableObject = artifact.format == "relocatable_object";
   if (artifact.entry.empty() || artifact.symbol.empty() ||
       artifact.relativeLibrary.empty() || artifact.sha256.size() != 64 ||
-      artifact.operatingSystem != hostOperatingSystem() ||
-      artifact.architecture != hostArchitecture() ||
+      (!nativeLibrary && !relocatableObject) ||
+      (nativeLibrary && (artifact.operatingSystem != hostOperatingSystem() ||
+                         artifact.architecture != hostArchitecture())) ||
+      (relocatableObject &&
+       (artifact.targetTriple.empty() ||
+        (artifact.objectFormat != "coff" && artifact.objectFormat != "elf" &&
+         artifact.objectFormat != "macho" &&
+         artifact.objectFormat != "wasm"))) ||
       artifact.invocationAbiVersion != VERNON_CPU_INVOCATION_ABI_VERSION) {
     fail(context, "unsupported or invalid CPU AOT artifact");
     return false;
@@ -1027,7 +1048,7 @@ bool resolveCpuNativeArtifact(VernonRuntimeContext *context,
       std::find(artifact.relativeLibrary.begin(),
                 artifact.relativeLibrary.end(), std::filesystem::path("..")) !=
           artifact.relativeLibrary.end()) {
-    fail(context, "CPU AOT native library path is invalid");
+    fail(context, "CPU AOT artifact path is invalid");
     return false;
   }
 
@@ -1041,14 +1062,14 @@ bool resolveCpuNativeArtifact(VernonRuntimeContext *context,
   const std::filesystem::path candidate = std::filesystem::weakly_canonical(
       canonicalRoot / artifact.relativeLibrary, error);
   if (error) {
-    fail(context, "CPU AOT native library path cannot be resolved");
+    fail(context, "CPU AOT artifact path cannot be resolved");
     return false;
   }
   const std::filesystem::path relative =
       candidate.lexically_relative(canonicalRoot);
   if (relative.empty() || relative.is_absolute() ||
       (!relative.empty() && *relative.begin() == std::filesystem::path(".."))) {
-    fail(context, "CPU AOT native library escapes the bundle directory");
+    fail(context, "CPU AOT artifact escapes the bundle directory");
     return false;
   }
 
@@ -1077,14 +1098,24 @@ VernonLoadedKernel *loadCpuNativeArtifact(VernonRuntimeContext *context,
   if (!resolveCpuNativeArtifact(context, artifact, libraryPath,
                                 &kernel->reflection))
     return nullptr;
-  const std::string nativePath = libraryPath.u8string();
-  if (!kernel->nativeLibrary.open(nativePath.c_str(), context->error))
-    return nullptr;
-  kernel->cpuEntry = reinterpret_cast<VernonCpuEntryPoint>(
-      kernel->nativeLibrary.symbol(artifact.symbol.c_str()));
+  if (artifact.format == "relocatable_object") {
+    std::lock_guard<std::mutex> lock(staticCpuEntriesMutex());
+    auto found = staticCpuEntries().find(artifact.symbol);
+    if (found != staticCpuEntries().end())
+      kernel->cpuEntry = found->second;
+  } else {
+    const std::string nativePath = libraryPath.u8string();
+    if (!kernel->nativeLibrary.open(nativePath.c_str(), context->error))
+      return nullptr;
+    kernel->cpuEntry = reinterpret_cast<VernonCpuEntryPoint>(
+        kernel->nativeLibrary.symbol(artifact.symbol.c_str()));
+  }
   if (!kernel->cpuEntry) {
-    fail(context,
-         "CPU AOT library does not export symbol '" + artifact.symbol + "'");
+    fail(context, artifact.format == "relocatable_object"
+                      ? "CPU AOT object symbol '" + artifact.symbol +
+                            "' was not statically registered"
+                      : "CPU AOT library does not export symbol '" +
+                            artifact.symbol + "'");
     return nullptr;
   }
   ++context->liveKernels;
@@ -1860,6 +1891,19 @@ VernonLoadedKernel *vernonRuntimeLoadCpuEntry(VernonRuntimeContext *context,
   }
 }
 
+VernonStatus
+vernonRuntimeRegisterStaticCpuEntry(VernonStringView symbol,
+                                    VernonCpuEntryPoint entryPoint) {
+  if (!symbol.data || !symbol.size || !entryPoint)
+    return VERNON_STATUS_INVALID_ARGUMENT;
+  const std::string name(symbol.data, symbol.size);
+  std::lock_guard<std::mutex> lock(staticCpuEntriesMutex());
+  auto [found, inserted] = staticCpuEntries().emplace(name, entryPoint);
+  return inserted || found->second == entryPoint
+             ? VERNON_STATUS_OK
+             : VERNON_STATUS_INVALID_ARGUMENT;
+}
+
 VernonLoadedKernel *
 vernonRuntimeLoadArtifact(VernonRuntimeContext *context, const void *artifact,
                           size_t artifactSize, const char *reflection,
@@ -2493,13 +2537,18 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(
                              artifact))
           return nullptr;
         const char *expectedFormat =
-            context->backend == VERNON_RUNTIME_CPU         ? "native_library"
-            : context->backend == VERNON_RUNTIME_CUDA      ? "ptx"
+            context->backend == VERNON_RUNTIME_CUDA        ? "ptx"
             : context->backend == VERNON_RUNTIME_VULKAN    ? "spirv"
             : context->backend == VERNON_RUNTIME_OPENGL_ES ? "gles"
                                                            : "glsl";
         const std::string encoding = value["artifact"].value("encoding", "");
-        if (artifact.format != expectedFormat ||
+        const bool validCpuFormat = context->backend == VERNON_RUNTIME_CPU &&
+                                    (artifact.format == "native_library" ||
+                                     artifact.format == "relocatable_object");
+        const bool validFormat = context->backend == VERNON_RUNTIME_CPU
+                                     ? validCpuFormat
+                                     : artifact.format == expectedFormat;
+        if (!validFormat ||
             (artifact.external && value["artifact"].contains("encoding")) ||
             (!artifact.external &&
              ((artifact.format == "spirv" && encoding != "base64") ||
@@ -2526,9 +2575,13 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(
         artifact.relativeLibrary = std::filesystem::u8path(
             nativeArtifact.value("path", value.value("native_library", "")));
         artifact.entry = stage.entry;
+        artifact.format =
+            schema2 ? resolved->format : value.value("format", "");
         artifact.symbol = value.value("symbol", "");
         artifact.operatingSystem = value.value("operating_system", "");
         artifact.architecture = value.value("architecture", "");
+        artifact.targetTriple = value.value("target_triple", "");
+        artifact.objectFormat = value.value("object_format", "");
         artifact.invocationAbiVersion =
             value.value("cpu_invocation_abi_version", 0u);
         artifact.size = nativeArtifact.value("size", uint64_t{0});
@@ -2538,7 +2591,7 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(
         std::filesystem::path validatedPath;
         const std::string format =
             schema2 ? resolved->format : value.value("format", "");
-        if (format != "native_library" ||
+        if ((format != "native_library" && format != "relocatable_object") ||
             !resolveCpuNativeArtifact(context, artifact, validatedPath,
                                       nullptr))
           return nullptr;

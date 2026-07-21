@@ -6,6 +6,16 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ standard to conform to")
 include(CTest)
 
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/runtime_src/VERSION"
+  VERNON_RUNTIME_SOURCE_VERSION)
+string(STRIP "${VERNON_RUNTIME_SOURCE_VERSION}"
+  VERNON_RUNTIME_SOURCE_VERSION)
+if(NOT VERNON_RUNTIME_SOURCE_VERSION VERSION_EQUAL PROJECT_VERSION)
+  message(FATAL_ERROR
+    "runtime_src/VERSION (${VERNON_RUNTIME_SOURCE_VERSION}) must match "
+    "VernonDSL project version (${PROJECT_VERSION})")
+endif()
+
 option(VERNON_ENABLE_SPIRV_CROSS
   "Build OpenGL, OpenGL ES, Metal, and HLSL source backends" ON)
 option(VERNON_ENABLE_COMPILER "Build the Vernon compiler" ON)
@@ -71,11 +81,19 @@ if(VERNON_ENABLE_SPIRV_CROSS)
 endif()
 set(MLIR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/llvm-project/install/lib/cmake/mlir"
   CACHE PATH "Directory containing MLIRConfig.cmake")
+set(LLD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/llvm-project/install/lib/cmake/lld"
+  CACHE PATH "Directory containing LLDConfig.cmake")
+if(LLD_DIR MATCHES "-NOTFOUND$")
+  set(LLD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/llvm-project/install/lib/cmake/lld"
+    CACHE PATH "Directory containing LLDConfig.cmake" FORCE)
+endif()
 # Find MLIR
 find_package(MLIR REQUIRED CONFIG)
+find_package(LLD REQUIRED CONFIG)
 
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
+message(STATUS "Using LLDConfig.cmake in: ${LLD_DIR}")
 
 # Add MLIR's CMake modules to the path
 list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
@@ -93,6 +111,7 @@ set(MLIR_BINARY_DIR ${CMAKE_BINARY_DIR})
 
 include_directories(${LLVM_INCLUDE_DIRS})
 include_directories(${MLIR_INCLUDE_DIRS})
+include_directories(${LLD_INCLUDE_DIRS})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/source/include)
 include_directories(${CMAKE_BINARY_DIR}/source/include)
 

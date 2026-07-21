@@ -7,8 +7,8 @@
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
 
-#include <cstring>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -49,10 +49,18 @@ struct Compiler {
   }
 
   nb::tuple compileProgram(const std::string &mlir, VernonTarget target,
-                           uint32_t glslVersion) {
+                           uint32_t glslVersion,
+                           const std::string &targetTriple,
+                           const std::string &cpu,
+                           const std::string &cpuFeatures) {
     VernonCompileOptions options{};
     options.struct_size = sizeof(options);
     options.glsl_version = glslVersion;
+    options.cpu_target_triple =
+        VernonStringView{targetTriple.data(), targetTriple.size()};
+    options.cpu_name = VernonStringView{cpu.data(), cpu.size()};
+    options.cpu_features =
+        VernonStringView{cpuFeatures.data(), cpuFeatures.size()};
     VernonCompileResult *raw = vernonCompilerCompileMlirWithOptions(
         context, mlir.data(), mlir.size(), target, &options);
     std::unique_ptr<VernonCompileResult, decltype(&vernonCompileResultDestroy)>
@@ -175,15 +183,14 @@ struct LoadedPipeline {
     vernonRuntimePipelineBundleDestroy(bundle);
   }
 
-  void invoke(const nb::list &argumentValues, Buffer *indexBuffer,
-              uint32_t indexCount, size_t indexOffset,
-              const nb::list &attachmentValues, uint32_t topology,
-              uint32_t vertexCount, uint32_t instanceCount,
-              const std::tuple<uint32_t, uint32_t, uint32_t> &computeGrid,
-              const std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>
-                  &viewport,
-              const std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>
-                  &scissor) {
+  void
+  invoke(const nb::list &argumentValues, Buffer *indexBuffer,
+         uint32_t indexCount, size_t indexOffset,
+         const nb::list &attachmentValues, uint32_t topology,
+         uint32_t vertexCount, uint32_t instanceCount,
+         const std::tuple<uint32_t, uint32_t, uint32_t> &computeGrid,
+         const std::tuple<uint32_t, uint32_t, uint32_t, uint32_t> &viewport,
+         const std::tuple<uint32_t, uint32_t, uint32_t, uint32_t> &scissor) {
     std::vector<VernonPipelineArgument> arguments;
     std::vector<std::vector<uint64_t>> shapes;
     std::vector<std::vector<uint64_t>> strides;
@@ -199,7 +206,8 @@ struct LoadedPipeline {
       if (kind == "tensor" && row.size() == 8) {
         Buffer *buffer = nb::cast<Buffer *>(row[2]);
         if (!buffer || buffer->owner != owner)
-          throw std::runtime_error("pipeline buffer belongs to another runtime");
+          throw std::runtime_error(
+              "pipeline buffer belongs to another runtime");
         shapes.push_back(nb::cast<std::vector<uint64_t>>(row[5]));
         strides.push_back(nb::cast<std::vector<uint64_t>>(row[6]));
         argument.slot = nb::cast<uint32_t>(row[1]);
@@ -265,9 +273,8 @@ struct LoadedPipeline {
     std::memcpy(invocation.viewport, viewportValues, sizeof(viewportValues));
     std::memcpy(invocation.scissor, scissorValues, sizeof(scissorValues));
     if (vernonRuntimePipelineInvoke(pipeline, &invocation) != VERNON_STATUS_OK)
-      throw std::runtime_error(
-          "pipeline invocation failed: " +
-          stringView(vernonRuntimeGetLastError(runtime)));
+      throw std::runtime_error("pipeline invocation failed: " +
+                               stringView(vernonRuntimeGetLastError(runtime)));
   }
 
   Runtime *owner{};
@@ -331,9 +338,8 @@ struct Runtime {
     VernonLoadedKernel *kernel =
         vernonRuntimeLoadComputeBundle(handle, directory.c_str());
     if (!kernel)
-      throw std::runtime_error(
-          "cannot load compute bundle: " +
-          stringView(vernonRuntimeGetLastError(handle)));
+      throw std::runtime_error("cannot load compute bundle: " +
+                               stringView(vernonRuntimeGetLastError(handle)));
     return std::make_unique<LoadedKernel>(this, kernel);
   }
 
@@ -347,9 +353,8 @@ struct Runtime {
     VernonPipelineBundle *bundle =
         vernonRuntimeLoadPipelineBundle(handle, data.c_str(), data.size());
     if (!bundle)
-      throw std::runtime_error(
-          "cannot load pipeline bundle: " +
-          stringView(vernonRuntimeGetLastError(handle)));
+      throw std::runtime_error("cannot load pipeline bundle: " +
+                               stringView(vernonRuntimeGetLastError(handle)));
     std::vector<const char *> names;
     for (const std::string &feature : features)
       names.push_back(feature.c_str());
@@ -357,9 +362,8 @@ struct Runtime {
         vernonRuntimeResolvePipeline(bundle, {names.data(), names.size()});
     if (!pipeline) {
       vernonRuntimePipelineBundleDestroy(bundle);
-      throw std::runtime_error(
-          "cannot resolve pipeline bundle: " +
-          stringView(vernonRuntimeGetLastError(handle)));
+      throw std::runtime_error("cannot resolve pipeline bundle: " +
+                               stringView(vernonRuntimeGetLastError(handle)));
     }
     return std::make_unique<LoadedPipeline>(this, handle, bundle, pipeline);
   }
@@ -412,7 +416,9 @@ NB_MODULE(_native, module) {
       .def(nb::init<>())
       .def("compile", &Compiler::compile)
       .def("compile_program", &Compiler::compileProgram, nb::arg("mlir"),
-           nb::arg("target"), nb::arg("glsl_version") = 0);
+           nb::arg("target"), nb::arg("glsl_version") = 0,
+           nb::arg("target_triple") = "", nb::arg("cpu") = "",
+           nb::arg("cpu_features") = "");
   nb::class_<Runtime>(module, "Runtime")
       .def(nb::init<VernonRuntimeBackend, uint16_t, uint16_t>(),
            nb::arg("backend"), nb::arg("api_major") = 0,
