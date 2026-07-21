@@ -50,6 +50,76 @@ def resources(
         self.assertIn(": f16", output)
         self.assertIn(": f64", output)
 
+    def test_texture_dimensions_and_coordinate_ranks(self) -> None:
+        for dimension, vector in (("2d", "vec2"), ("3d", "vec3"),
+                                  ("cube", "vec3")):
+            source = f"""
+from vernon_dsl import *
+
+@fragment
+def sample(
+    image: Annotated[Texture["{dimension}", f32], resource(set=0, binding=0)],
+    sampler: Annotated[Sampler, resource(set=0, binding=1)],
+    uv: {vector}[f32],
+) -> vec4[f32]:
+    return texture_sample(image, sampler, uv)
+"""
+            output = compile_source(source, f"texture_{dimension}.py")
+            self.assertIn(f'!vernon.texture<"{dimension}", f32>', output)
+            self.assertIn('name = "texture_sample"', output)
+
+    def test_texture_dimension_and_coordinate_rank_are_validated(self) -> None:
+        invalid_dimension = """
+from vernon_dsl import *
+@fragment
+def sample(image: Texture["1d", f32]) -> f32:
+    return 0.0
+"""
+        with self.assertRaisesRegex(CompileError,
+                                    "texture dimension must be one of"):
+            compile_source(invalid_dimension, "bad_dimension.py")
+
+        invalid_coordinates = """
+from vernon_dsl import *
+@fragment
+def sample(image: Texture["cube", f32], sampler: Sampler,
+           uv: vec2[f32]) -> vec4[f32]:
+    return texture_sample(image, sampler, uv)
+"""
+        with self.assertRaisesRegex(CompileError, "3-component"):
+            compile_source(invalid_coordinates, "bad_coordinates.py")
+
+    def test_swizzle_aliases_are_canonicalized(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@func
+def aliases(color: vec4[f32]) -> vec4[f32]:
+    red = color.r
+    green = color.g
+    blue = color.b
+    alpha = color.a
+    rgb = color.rgb
+    rgba = color.rgba
+    return vec4(rgb, alpha)
+"""
+        output = compile_source(source, "swizzle_aliases.py")
+        for mask in ("x", "y", "z", "w", "xyz", "xyzw"):
+            self.assertIn(f'mask = "{mask}"', output)
+        self.assertNotIn('mask = "rgb"', output)
+        self.assertNotIn('mask = "rgba"', output)
+
+        invalid = """
+from vernon_dsl import *
+
+@func
+def invalid(color: vec3[f32]) -> f32:
+    return color.a
+"""
+        with self.assertRaisesRegex(CompileError,
+                                    "swizzle 'a' is out of bounds"):
+            compile_source(invalid, "invalid_swizzle_alias.py")
+
 
 class StageTests(unittest.TestCase):
 

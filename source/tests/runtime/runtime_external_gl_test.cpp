@@ -3,10 +3,10 @@
 
 #include <nlohmann/json.hpp>
 
-#include <cassert>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <gtest/gtest.h>
 #include <string>
 
 namespace {
@@ -120,30 +120,43 @@ nlohmann::json inlineArtifact(const std::string &source) {
 
 } // namespace
 
-int main() {
+TEST(RuntimeExternalGl, LoadsAssetsAndInvokesPipeline) {
   VernonRuntimeCapabilities global =
       vernonRuntimeGetCapabilities(VERNON_RUNTIME_OPENGL_ES);
-  assert(!global.available);
-  assert(global.supports_graphics);
+  ASSERT_TRUE(!global.available);
+  ASSERT_TRUE(global.supports_graphics);
 
   VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
-  assert(gl);
+  ASSERT_TRUE(gl);
   VernonRuntimeCapabilities capabilities =
       vernonRuntimeGetContextCapabilities(gl);
-  assert(capabilities.available && capabilities.supports_graphics);
-  assert(capabilities.supports_compute &&
-         capabilities.supports_storage_buffers);
+  ASSERT_TRUE(capabilities.available && capabilities.supports_graphics);
+  ASSERT_TRUE(capabilities.supports_compute &&
+              capabilities.supports_storage_buffers);
   constexpr char glBundle[] =
       R"({"pipeline_bundle_schema_version":1,"invocation_abi_version":1,"type":"vernon_pipeline_bundle","id":"external-gl","target":"opengl","features":[],"variants":[{"key":[],"parameters":[],"steps":[{"kind":"draw","vertex":"vs","fragment":"fs"}]}],"stage_artifacts":{"vs":{"stage":"vertex","entry":"main","source":"#version 330\nvoid main(){gl_Position=vec4(0.0);}"},"fs":{"stage":"fragment","entry":"main","source":"#version 330\nout vec4 color;void main(){color=vec4(1.0);}"}}})";
   VernonPipelineBundle *glLoaded =
       vernonRuntimeLoadPipelineBundle(gl, glBundle, std::strlen(glBundle));
-  assert(glLoaded);
+  ASSERT_TRUE(glLoaded);
   VernonLoadedPipeline *pipeline =
       vernonRuntimeResolvePipeline(glLoaded, {nullptr, 0});
-  assert(pipeline);
+  ASSERT_TRUE(pipeline);
   VernonDeviceTexture *target = vernonRuntimeImportOpenGLTexture2D(
       gl, 7, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
-  assert(target);
+  ASSERT_TRUE(target);
+  VernonTextureDescriptor cubeDescriptor{};
+  cubeDescriptor.struct_size = sizeof(cubeDescriptor);
+  cubeDescriptor.dimension = VERNON_TEXTURE_CUBE;
+  cubeDescriptor.format = VERNON_TEXTURE_RGBA16_FLOAT;
+  cubeDescriptor.width = 32;
+  cubeDescriptor.height = 32;
+  cubeDescriptor.depth = 1;
+  cubeDescriptor.mip_levels = 6;
+  VernonDeviceTexture *cube =
+      vernonRuntimeImportOpenGLTexture(gl, 8, &cubeDescriptor);
+  ASSERT_TRUE(cube);
+  VernonDeviceSampler *sampler = vernonRuntimeImportOpenGLSampler(gl, 9);
+  ASSERT_TRUE(sampler);
   VernonColorAttachment attachment{0, target};
   VernonPipelineInvocation invocation{};
   invocation.struct_size = sizeof(invocation);
@@ -153,45 +166,47 @@ int main() {
   invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
   invocation.vertex_count = 3;
   invocation.instance_count = 1;
-  assert(vernonRuntimePipelineInvoke(pipeline, &invocation) ==
-         VERNON_STATUS_OK);
-  assert(drawCount == 1);
-  assert(vernonRuntimeTextureFree(target) == VERNON_STATUS_OK);
+  ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) ==
+              VERNON_STATUS_OK);
+  ASSERT_TRUE(drawCount == 1);
+  ASSERT_TRUE(vernonRuntimeTextureFree(target) == VERNON_STATUS_OK);
+  ASSERT_TRUE(vernonRuntimeTextureFree(cube) == VERNON_STATUS_OK);
+  ASSERT_TRUE(vernonRuntimeSamplerFree(sampler) == VERNON_STATUS_OK);
   vernonRuntimeLoadedPipelineDestroy(pipeline);
   vernonRuntimePipelineBundleDestroy(glLoaded);
-  assert(vernonRuntimeDestroy(gl) == VERNON_STATUS_OK);
+  ASSERT_TRUE(vernonRuntimeDestroy(gl) == VERNON_STATUS_OK);
 
   gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
-  assert(gl);
+  ASSERT_TRUE(gl);
   const std::string source = "#version 330\nvoid main(){}";
   const std::string inlineBundle = schema2Bundle(inlineArtifact(source));
   VernonRuntimeBackend schema2Target = VERNON_RUNTIME_CPU;
-  assert(vernonRuntimePipelineBundleInspectTarget(
-             inlineBundle.data(), inlineBundle.size(), &schema2Target) ==
-         VERNON_STATUS_OK);
-  assert(schema2Target == VERNON_RUNTIME_OPENGL);
+  ASSERT_TRUE(vernonRuntimePipelineBundleInspectTarget(
+                  inlineBundle.data(), inlineBundle.size(), &schema2Target) ==
+              VERNON_STATUS_OK);
+  ASSERT_TRUE(schema2Target == VERNON_RUNTIME_OPENGL);
   glLoaded = vernonRuntimeLoadPipelineBundle(gl, inlineBundle.data(),
                                              inlineBundle.size());
-  assert(glLoaded);
+  ASSERT_TRUE(glLoaded);
   vernonRuntimePipelineBundleDestroy(glLoaded);
 
   std::string corruptManifest = inlineBundle;
   const size_t contentHash = corruptManifest.find("\"content_hash\":\"");
-  assert(contentHash != std::string::npos);
+  ASSERT_TRUE(contentHash != std::string::npos);
   corruptManifest[contentHash + std::strlen("\"content_hash\":\"")] ^= 1;
-  assert(!vernonRuntimeLoadPipelineBundle(gl, corruptManifest.data(),
-                                          corruptManifest.size()));
+  ASSERT_TRUE(!vernonRuntimeLoadPipelineBundle(gl, corruptManifest.data(),
+                                               corruptManifest.size()));
 
   nlohmann::json corruptInline = inlineArtifact(source);
   corruptInline["sha256"] = std::string(64, '0');
   const std::string corruptInlineBundle = schema2Bundle(corruptInline);
-  assert(!vernonRuntimeLoadPipelineBundle(gl, corruptInlineBundle.data(),
-                                          corruptInlineBundle.size()));
+  ASSERT_TRUE(!vernonRuntimeLoadPipelineBundle(gl, corruptInlineBundle.data(),
+                                               corruptInlineBundle.size()));
   nlohmann::json wrongFormat = inlineArtifact(source);
   wrongFormat["format"] = "ptx";
   const std::string wrongFormatBundle = schema2Bundle(wrongFormat);
-  assert(!vernonRuntimeLoadPipelineBundle(gl, wrongFormatBundle.data(),
-                                          wrongFormatBundle.size()));
+  ASSERT_TRUE(!vernonRuntimeLoadPipelineBundle(gl, wrongFormatBundle.data(),
+                                               wrongFormatBundle.size()));
 
   const std::filesystem::path assetRoot =
       std::filesystem::temp_directory_path() / "vernon_runtime_schema2_test";
@@ -215,16 +230,16 @@ int main() {
   options.bundle_directory = assetRootUtf8.c_str();
   glLoaded = vernonRuntimeLoadPipelineBundleWithOptions(
       gl, externalBundle.data(), externalBundle.size(), &options);
-  assert(glLoaded);
+  ASSERT_TRUE(glLoaded);
   vernonRuntimePipelineBundleDestroy(glLoaded);
 
   nlohmann::json traversalArtifact = externalArtifact;
   traversalArtifact["path"] = "../stage.glsl";
   const std::string traversalBundle = schema2Bundle(traversalArtifact);
-  assert(!vernonRuntimeLoadPipelineBundleWithOptions(
+  ASSERT_TRUE(!vernonRuntimeLoadPipelineBundleWithOptions(
       gl, traversalBundle.data(), traversalBundle.size(), &options));
-  assert(!vernonRuntimeLoadPipelineBundle(gl, externalBundle.data(),
-                                          externalBundle.size()));
+  ASSERT_TRUE(!vernonRuntimeLoadPipelineBundle(gl, externalBundle.data(),
+                                               externalBundle.size()));
 
   const std::filesystem::path outsidePath =
       assetRoot.parent_path() / "vernon_runtime_schema2_escape.glsl";
@@ -239,7 +254,7 @@ int main() {
     nlohmann::json symlinkArtifact = externalArtifact;
     symlinkArtifact["path"] = "artifacts/escape.glsl";
     const std::string symlinkBundle = schema2Bundle(symlinkArtifact);
-    assert(!vernonRuntimeLoadPipelineBundleWithOptions(
+    ASSERT_TRUE(!vernonRuntimeLoadPipelineBundleWithOptions(
         gl, symlinkBundle.data(), symlinkBundle.size(), &options));
   }
   std::filesystem::remove(outsidePath);
@@ -248,23 +263,22 @@ int main() {
     std::ofstream output(artifactPath, std::ios::binary | std::ios::trunc);
     output << "corrupt";
   }
-  assert(!vernonRuntimeLoadPipelineBundleWithOptions(
+  ASSERT_TRUE(!vernonRuntimeLoadPipelineBundleWithOptions(
       gl, externalBundle.data(), externalBundle.size(), &options));
   std::filesystem::remove_all(assetRoot);
-  assert(vernonRuntimeDestroy(gl) == VERNON_STATUS_OK);
+  ASSERT_TRUE(vernonRuntimeDestroy(gl) == VERNON_STATUS_OK);
 
   VernonRuntimeContext *gles = create(VERNON_RUNTIME_OPENGL_ES, 3, 1);
-  assert(gles);
+  ASSERT_TRUE(gles);
   capabilities = vernonRuntimeGetContextCapabilities(gles);
-  assert(capabilities.supports_compute);
+  ASSERT_TRUE(capabilities.supports_compute);
   constexpr char bundle[] =
       R"({"pipeline_bundle_schema_version":1,"invocation_abi_version":1,"type":"vernon_pipeline_bundle","id":"gles-profile","target":"opengles","features":[],"variants":[{"key":[],"parameters":[],"steps":[{"kind":"draw","vertex":"vs","fragment":"fs"}]}],"stage_artifacts":{"vs":{"stage":"vertex","entry":"main","source":"#version 310 es\nvoid main(){}"},"fs":{"stage":"fragment","entry":"main","source":"#version 310 es\nvoid main(){}"}}})";
   VernonPipelineBundle *loaded =
       vernonRuntimeLoadPipelineBundle(gles, bundle, std::strlen(bundle));
-  assert(loaded);
+  ASSERT_TRUE(loaded);
   vernonRuntimePipelineBundleDestroy(loaded);
-  assert(vernonRuntimeDestroy(gles) == VERNON_STATUS_OK);
-  return 0;
+  ASSERT_TRUE(vernonRuntimeDestroy(gles) == VERNON_STATUS_OK);
 }
 
 #undef GL_CALL

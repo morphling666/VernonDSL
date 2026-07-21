@@ -317,8 +317,8 @@ documented tolerance.
 Add:
 
 - `python/tests/test_kernel_runtime.py`
-- `source/tests/runtime_c_api_test.c`
-- `source/tests/runtime_cuda_test.cpp`
+- `source/tests/runtime/runtime_c_api_test.cpp`
+- `source/tests/runtime/runtime_cuda_test.cpp`
 
 Required checks:
 

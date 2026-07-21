@@ -12,6 +12,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace nb = nanobind;
@@ -29,67 +30,121 @@ struct Compiler {
   }
   ~Compiler() { vernonCompilerDestroy(context); }
 
-  nb::tuple compile(const std::string &mlir, VernonTarget target) {
-    VernonCompileResult *raw =
-        vernonCompilerCompileMlir(context, mlir.data(), mlir.size(), target);
-    std::unique_ptr<VernonCompileResult, decltype(&vernonCompileResultDestroy)>
-        result(raw, &vernonCompileResultDestroy);
-    if (!result ||
-        vernonCompileResultGetStatus(result.get()) != VERNON_STATUS_OK)
-      throw std::runtime_error(
-          result ? stringView(vernonCompileResultGetDiagnostics(result.get()))
-                 : "compiler returned no result");
-    if (vernonCompileResultGetArtifactCount(result.get()) != 1)
-      throw std::runtime_error("kernel compilation must produce one artifact");
-    VernonStringView artifact =
-        vernonCompileResultGetArtifactData(result.get(), 0);
-    return nb::make_tuple(
-        nb::bytes(artifact.data, artifact.size),
-        stringView(vernonCompileResultGetReflection(result.get())));
+  VernonCompilerContext *context{};
+};
+
+struct Runtime;
+struct CompiledProgram;
+struct Texture;
+struct Sampler;
+struct LoadedPipeline;
+
+using SharedCompileResult = std::shared_ptr<VernonCompileResult>;
+
+struct CompiledProgram {
+  CompiledProgram(VernonCompileResult *result, VernonTarget target,
+                  uint32_t glslVersion, std::string targetTriple,
+                  std::string cpu, std::string cpuFeatures)
+      : result(result, &vernonCompileResultDestroy), target(target),
+        glslVersion(glslVersion), targetTriple(std::move(targetTriple)),
+        cpu(std::move(cpu)), cpuFeatures(std::move(cpuFeatures)) {
+    if (!this->result)
+      throw std::runtime_error("compiler returned no result");
   }
 
-  nb::tuple compileProgram(const std::string &mlir, VernonTarget target,
-                           uint32_t glslVersion,
-                           const std::string &targetTriple,
-                           const std::string &cpu,
-                           const std::string &cpuFeatures) {
-    VernonCompileOptions options{};
-    options.struct_size = sizeof(options);
-    options.glsl_version = glslVersion;
-    options.cpu_target_triple =
-        VernonStringView{targetTriple.data(), targetTriple.size()};
-    options.cpu_name = VernonStringView{cpu.data(), cpu.size()};
-    options.cpu_features =
-        VernonStringView{cpuFeatures.data(), cpuFeatures.size()};
-    VernonCompileResult *raw = vernonCompilerCompileMlirWithOptions(
-        context, mlir.data(), mlir.size(), target, &options);
-    std::unique_ptr<VernonCompileResult, decltype(&vernonCompileResultDestroy)>
-        result(raw, &vernonCompileResultDestroy);
-    if (!result ||
-        vernonCompileResultGetStatus(result.get()) != VERNON_STATUS_OK)
-      throw std::runtime_error(
-          result ? stringView(vernonCompileResultGetDiagnostics(result.get()))
-                 : "compiler returned no result");
-    nb::list artifacts;
+  bool ok() const {
+    return vernonCompileResultGetStatus(result.get()) == VERNON_STATUS_OK;
+  }
+
+  VernonStatus status() const {
+    return vernonCompileResultGetStatus(result.get());
+  }
+
+  std::string diagnostics() const {
+    return stringView(vernonCompileResultGetDiagnostics(result.get()));
+  }
+
+  std::string reflection() const {
+    return stringView(vernonCompileResultGetReflection(result.get()));
+  }
+
+  nb::list artifacts() const {
+    nb::list values;
     for (size_t index = 0;
          index < vernonCompileResultGetArtifactCount(result.get()); ++index) {
       VernonStringView name =
           vernonCompileResultGetArtifactName(result.get(), index);
       VernonStringView data =
           vernonCompileResultGetArtifactData(result.get(), index);
-      artifacts.append(
+      values.append(
           nb::make_tuple(stringView(name), nb::bytes(data.data, data.size)));
     }
-    return nb::make_tuple(
-        artifacts, stringView(vernonCompileResultGetReflection(result.get())));
+    return values;
   }
 
-  VernonCompilerContext *context{};
+  bool hasCpuEntry(const std::string &entry) const {
+    return vernonCompileResultGetCpuEntry(result.get(), entry.data(),
+                                          entry.size()) != nullptr;
+  }
+
+  void requireSuccess() const {
+    if (!ok()) {
+      std::string message = diagnostics();
+      throw std::runtime_error(message.empty() ? "compilation failed"
+                                               : message);
+    }
+  }
+
+  SharedCompileResult result;
+  VernonTarget target;
+  uint32_t glslVersion{};
+  std::string targetTriple;
+  std::string cpu;
+  std::string cpuFeatures;
 };
 
-struct Runtime;
-struct Texture;
-struct LoadedPipeline;
+std::unique_ptr<CompiledProgram>
+compileProgramResult(Compiler &compiler, const std::string &mlir,
+                     VernonTarget target, uint32_t glslVersion,
+                     const std::string &targetTriple, const std::string &cpu,
+                     const std::string &cpuFeatures) {
+  VernonCompileOptions options{};
+  options.struct_size = sizeof(options);
+  options.glsl_version = glslVersion;
+  options.cpu_target_triple =
+      VernonStringView{targetTriple.data(), targetTriple.size()};
+  options.cpu_name = VernonStringView{cpu.data(), cpu.size()};
+  options.cpu_features =
+      VernonStringView{cpuFeatures.data(), cpuFeatures.size()};
+  return std::make_unique<CompiledProgram>(
+      vernonCompilerCompileMlirWithOptions(compiler.context, mlir.data(),
+                                           mlir.size(), target, &options),
+      target, glslVersion, targetTriple, cpu, cpuFeatures);
+}
+
+nb::tuple compile(Compiler &compiler, const std::string &mlir,
+                  VernonTarget target) {
+  std::unique_ptr<CompiledProgram> program =
+      compileProgramResult(compiler, mlir, target, 0, "", "", "");
+  program->requireSuccess();
+  if (vernonCompileResultGetArtifactCount(program->result.get()) != 1)
+    throw std::runtime_error("kernel compilation must produce one artifact");
+  VernonStringView artifact =
+      vernonCompileResultGetArtifactData(program->result.get(), 0);
+  return nb::make_tuple(nb::bytes(artifact.data, artifact.size),
+                        program->reflection());
+}
+
+nb::tuple compileProgram(Compiler &compiler, const std::string &mlir,
+                         VernonTarget target, uint32_t glslVersion,
+                         const std::string &targetTriple,
+                         const std::string &cpu,
+                         const std::string &cpuFeatures) {
+  std::unique_ptr<CompiledProgram> program = compileProgramResult(
+      compiler, mlir, target, glslVersion, targetTriple, cpu, cpuFeatures);
+  program->requireSuccess();
+  return nb::make_tuple(program->artifacts(), program->reflection());
+}
 
 struct Buffer {
   Buffer(Runtime *owner, size_t size, size_t alignment);
@@ -117,8 +172,10 @@ struct Buffer {
 };
 
 struct LoadedKernel {
-  LoadedKernel(Runtime *owner, VernonLoadedKernel *handle)
-      : owner(owner), handle(handle) {}
+  LoadedKernel(Runtime *owner, VernonLoadedKernel *handle,
+               SharedCompileResult retainedResult = {})
+      : owner(owner), handle(handle),
+        retainedResult(std::move(retainedResult)) {}
   ~LoadedKernel() { vernonRuntimeKernelUnload(handle); }
 
   void launch(uint32_t x, uint32_t y, uint32_t z, const nb::list &values) {
@@ -148,6 +205,8 @@ struct LoadedKernel {
 
   Runtime *owner{};
   VernonLoadedKernel *handle{};
+  // ORC entry pointers are valid only while their compile result owns the JIT.
+  SharedCompileResult retainedResult;
 };
 
 struct Texture {
@@ -172,6 +231,15 @@ struct Texture {
   VernonDeviceTexture *handle{};
   uint32_t width{};
   uint32_t height{};
+};
+
+struct Sampler {
+  Sampler(Runtime *owner, VernonDeviceSampler *handle)
+      : owner(owner), handle(handle) {}
+  ~Sampler() { vernonRuntimeSamplerFree(handle); }
+
+  Runtime *owner{};
+  VernonDeviceSampler *handle{};
 };
 
 struct LoadedPipeline {
@@ -234,6 +302,30 @@ struct LoadedPipeline {
             inlineStorage.back().data(),
             inlineStorage.back().size(),
         };
+      } else if (kind == "texture" && row.size() == 9) {
+        Texture *texture = nb::cast<Texture *>(row[2]);
+        if (!texture || texture->owner != owner)
+          throw std::runtime_error(
+              "pipeline texture belongs to another runtime");
+        argument.slot = nb::cast<uint32_t>(row[1]);
+        argument.kind = VERNON_PIPELINE_TEXTURE;
+        argument.texture = {
+            texture->handle,
+            static_cast<VernonTextureFormat>(nb::cast<uint32_t>(row[3])),
+            static_cast<VernonValueAccess>(nb::cast<uint32_t>(row[4])),
+            static_cast<VernonTextureDimension>(nb::cast<uint32_t>(row[5])),
+            nb::cast<uint32_t>(row[6]),
+            nb::cast<uint32_t>(row[7]),
+            nb::cast<uint32_t>(row[8]),
+        };
+      } else if (kind == "sampler" && row.size() == 3) {
+        Sampler *sampler = nb::cast<Sampler *>(row[2]);
+        if (!sampler || sampler->owner != owner)
+          throw std::runtime_error(
+              "pipeline sampler belongs to another runtime");
+        argument.slot = nb::cast<uint32_t>(row[1]);
+        argument.kind = VERNON_PIPELINE_SAMPLER;
+        argument.sampler = sampler->handle;
       } else {
         throw std::runtime_error("invalid pipeline argument row");
       }
@@ -333,6 +425,29 @@ struct Runtime {
     return std::make_unique<LoadedKernel>(this, kernel);
   }
 
+  std::unique_ptr<LoadedKernel> loadCpuEntry(const CompiledProgram &program,
+                                             const std::string &entry) {
+    program.requireSuccess();
+    if (program.target != VERNON_TARGET_CPU)
+      throw std::runtime_error(
+          "CPU entries can be loaded only from CPU compiled programs");
+    if (entry.empty())
+      throw std::runtime_error("CPU entry name must not be empty");
+    VernonCpuEntryPoint entryPoint = vernonCompileResultGetCpuEntry(
+        program.result.get(), entry.data(), entry.size());
+    if (!entryPoint)
+      throw std::runtime_error("CPU entry '" + entry +
+                               "' was not found in compiled program");
+    const std::string reflection = program.reflection();
+    VernonLoadedKernel *kernel = vernonRuntimeLoadCpuEntry(
+        handle, entryPoint, reflection.data(), reflection.size(), entry.data(),
+        entry.size());
+    if (!kernel)
+      throw std::runtime_error("cannot load CPU entry: " +
+                               stringView(vernonRuntimeGetLastError(handle)));
+    return std::make_unique<LoadedKernel>(this, kernel, program.result);
+  }
+
   std::unique_ptr<LoadedKernel>
   loadComputeBundle(const std::string &directory) {
     VernonLoadedKernel *kernel =
@@ -345,6 +460,14 @@ struct Runtime {
 
   std::unique_ptr<Texture> createTexture(uint32_t width, uint32_t height) {
     return std::make_unique<Texture>(this, width, height);
+  }
+
+  std::unique_ptr<Sampler> importOpenGLSampler(uint32_t name) {
+    VernonDeviceSampler *sampler =
+        vernonRuntimeImportOpenGLSampler(handle, name);
+    if (!sampler)
+      throw std::runtime_error("cannot import OpenGL sampler");
+    return std::make_unique<Sampler>(this, sampler);
   }
 
   std::unique_ptr<LoadedPipeline>
@@ -402,6 +525,13 @@ NB_MODULE(_native, module) {
       .value("METAL", VERNON_TARGET_METAL)
       .value("OPENGL", VERNON_TARGET_OPENGL)
       .value("OPENGL_ES", VERNON_TARGET_OPENGL_ES);
+  nb::enum_<VernonStatus>(module, "Status")
+      .value("OK", VERNON_STATUS_OK)
+      .value("INVALID_ARGUMENT", VERNON_STATUS_INVALID_ARGUMENT)
+      .value("PARSE_ERROR", VERNON_STATUS_PARSE_ERROR)
+      .value("VERIFICATION_ERROR", VERNON_STATUS_VERIFICATION_ERROR)
+      .value("UNSUPPORTED_TARGET", VERNON_STATUS_UNSUPPORTED_TARGET)
+      .value("INTERNAL_ERROR", VERNON_STATUS_INTERNAL_ERROR);
   nb::enum_<VernonRuntimeBackend>(module, "RuntimeBackend")
       .value("CPU", VERNON_RUNTIME_CPU)
       .value("CUDA", VERNON_RUNTIME_CUDA)
@@ -414,11 +544,35 @@ NB_MODULE(_native, module) {
       .value("POINT_LIST", VERNON_TOPOLOGY_POINT_LIST);
   nb::class_<Compiler>(module, "Compiler")
       .def(nb::init<>())
-      .def("compile", &Compiler::compile)
-      .def("compile_program", &Compiler::compileProgram, nb::arg("mlir"),
+      .def("compile", &compile)
+      .def("compile_program_result", &compileProgramResult, nb::arg("mlir"),
+           nb::arg("target"), nb::arg("glsl_version") = 0,
+           nb::arg("target_triple") = "", nb::arg("cpu") = "",
+           nb::arg("cpu_features") = "")
+      .def("compile_program", &compileProgram, nb::arg("mlir"),
            nb::arg("target"), nb::arg("glsl_version") = 0,
            nb::arg("target_triple") = "", nb::arg("cpu") = "",
            nb::arg("cpu_features") = "");
+  nb::class_<CompiledProgram>(module, "CompiledProgram")
+      .def_prop_ro("ok", &CompiledProgram::ok)
+      .def_prop_ro("status", &CompiledProgram::status)
+      .def_prop_ro("diagnostics", &CompiledProgram::diagnostics)
+      .def_prop_ro("artifacts", &CompiledProgram::artifacts)
+      .def_prop_ro("reflection", &CompiledProgram::reflection)
+      .def_prop_ro("target",
+                   [](const CompiledProgram &value) { return value.target; })
+      .def_prop_ro(
+          "glsl_version",
+          [](const CompiledProgram &value) { return value.glslVersion; })
+      .def_prop_ro(
+          "target_triple",
+          [](const CompiledProgram &value) { return value.targetTriple; })
+      .def_prop_ro("cpu",
+                   [](const CompiledProgram &value) { return value.cpu; })
+      .def_prop_ro(
+          "cpu_features",
+          [](const CompiledProgram &value) { return value.cpuFeatures; })
+      .def("has_cpu_entry", &CompiledProgram::hasCpuEntry);
   nb::class_<Runtime>(module, "Runtime")
       .def(nb::init<VernonRuntimeBackend, uint16_t, uint16_t>(),
            nb::arg("backend"), nb::arg("api_major") = 0,
@@ -429,9 +583,12 @@ NB_MODULE(_native, module) {
                   nb::arg("api_major"), nb::arg("api_minor"))
       .def("allocate", &Runtime::allocate, nb::keep_alive<0, 1>())
       .def("load", &Runtime::load, nb::keep_alive<0, 1>())
+      .def("load_cpu_entry", &Runtime::loadCpuEntry, nb::keep_alive<0, 1>())
       .def("load_compute_bundle", &Runtime::loadComputeBundle,
            nb::keep_alive<0, 1>())
       .def("create_texture", &Runtime::createTexture, nb::keep_alive<0, 1>())
+      .def("import_opengl_sampler", &Runtime::importOpenGLSampler,
+           nb::keep_alive<0, 1>())
       .def("load_pipeline", &Runtime::loadPipeline, nb::keep_alive<0, 1>())
       .def("synchronize", &Runtime::synchronize);
   nb::class_<Buffer>(module, "Buffer")
@@ -444,6 +601,7 @@ NB_MODULE(_native, module) {
       .def_prop_ro("height", [](const Texture &value) { return value.height; })
       .def("upload", &Texture::upload)
       .def("download", &Texture::download);
+  nb::class_<Sampler>(module, "Sampler");
   nb::class_<LoadedPipeline>(module, "LoadedPipeline")
       .def("invoke", &LoadedPipeline::invoke, nb::arg("arguments"),
            nb::arg("index_buffer") = nullptr, nb::arg("index_count") = 0,

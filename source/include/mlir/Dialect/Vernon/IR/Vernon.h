@@ -15,6 +15,8 @@
 #include "mlir/Interfaces/InferTypeOpInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
+#include <optional>
+
 //===----------------------------------------------------------------------===//
 // Vernon Dialect
 //===----------------------------------------------------------------------===//
@@ -27,6 +29,13 @@
 
 #define GET_TYPEDEF_CLASSES
 #include "mlir/Dialect/Vernon/IR/VernonTypes.h.inc"
+
+namespace mlir::vernon {
+
+/// Returns the zero-based vector index for an XYZW or RGBA component alias.
+std::optional<unsigned> decodeSwizzleComponent(char component);
+
+} // namespace mlir::vernon
 
 //===----------------------------------------------------------------------===//
 // Vernon Dialect Operations

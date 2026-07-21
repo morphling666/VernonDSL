@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -28,6 +29,11 @@ namespace {
 
 using namespace vernon::runtime;
 
+struct SampledTextureBinding {
+  uint32_t descriptorSet{};
+  uint32_t binding{UINT32_MAX};
+};
+
 struct ParameterUse {
   std::string stage;
   std::string interfaceKind;
@@ -37,7 +43,9 @@ struct ParameterUse {
   uint32_t index{};
   uint32_t location{UINT32_MAX};
   uint32_t divisor{};
+  uint32_t descriptorSet{};
   uint32_t binding{UINT32_MAX};
+  std::vector<SampledTextureBinding> sampledTextureBindings;
 };
 
 struct Parameter {
@@ -46,6 +54,7 @@ struct Parameter {
   std::string kind;
   std::string dtype;
   std::string access;
+  std::string dimension;
   std::vector<uint64_t> shape;
   std::vector<ParameterUse> uses;
 };
@@ -151,6 +160,7 @@ struct VernonRuntimeContext {
   size_t liveBuffers{};
   size_t liveKernels{};
   size_t liveTextures{};
+  size_t liveSamplers{};
   size_t liveBundles{};
   size_t livePipelines{};
 #if defined(VERNON_HAS_CUDA_RUNTIME)
@@ -188,12 +198,27 @@ struct VernonDeviceTexture {
   GlUint name{};
   uint32_t width{};
   uint32_t height{};
+  uint32_t depth{1};
+  uint32_t mipLevels{1};
+  VernonTextureDimension dimension{VERNON_TEXTURE_2D};
   VernonTextureFormat format{VERNON_TEXTURE_RGBA8_UNORM};
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
   VkImage vulkanImage{};
   VkDeviceMemory vulkanMemory{};
   VkImageView vulkanView{};
   VkImageLayout vulkanLayout{VK_IMAGE_LAYOUT_UNDEFINED};
+  VkFormat vulkanFormat{VK_FORMAT_UNDEFINED};
+  bool vulkanColorAttachment{};
+#endif
+};
+
+struct VernonDeviceSampler {
+  VernonRuntimeContext *context{};
+  GlUint name{};
+  VernonSamplerDescriptor descriptor{};
+  bool imported{};
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+  VkSampler vulkanSampler{};
 #endif
 };
 
@@ -403,15 +428,48 @@ void transitionVulkanImage(VkCommandBuffer command,
   barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   barrier.image = texture->vulkanImage;
   barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-  barrier.subresourceRange.levelCount = 1;
-  barrier.subresourceRange.layerCount = 1;
-  barrier.srcAccessMask =
-      VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
-  barrier.dstAccessMask =
-      VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+  barrier.subresourceRange.levelCount = texture->mipLevels;
+  barrier.subresourceRange.layerCount =
+      texture->dimension == VERNON_TEXTURE_CUBE ? 6 : 1;
+  VkPipelineStageFlags sourceStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  if (texture->vulkanLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+    barrier.srcAccessMask = 0;
+    sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+  } else if (texture->vulkanLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+  } else if (texture->vulkanLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+  } else if (texture->vulkanLayout ==
+             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
+    barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    sourceStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  } else if (texture->vulkanLayout ==
+             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+    barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    sourceStage = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  }
+  VkPipelineStageFlags destinationStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+  if (newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+  } else if (newLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+  } else if (newLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
+    barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    destinationStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  } else if (newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    destinationStage = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+  }
   vernon::runtime::vulkanDriver().cmdPipelineBarrier(
-      command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1,
+      command, sourceStage, destinationStage, 0, 0, nullptr, 0, nullptr, 1,
       &barrier);
   texture->vulkanLayout = newLayout;
 }
@@ -544,6 +602,57 @@ void destroyVulkanContext(VernonRuntimeContext *context) {
   context->vulkanPhysicalDevice = VK_NULL_HANDLE;
   context->vulkanInstance = VK_NULL_HANDLE;
 }
+
+std::optional<VkFormat> vulkanTextureFormat(VernonTextureFormat format) {
+  switch (format) {
+  case VERNON_TEXTURE_R8_UNORM:
+    return VK_FORMAT_R8_UNORM;
+  case VERNON_TEXTURE_RG8_UNORM:
+    return VK_FORMAT_R8G8_UNORM;
+  case VERNON_TEXTURE_RGB8_UNORM:
+    return VK_FORMAT_R8G8B8_UNORM;
+  case VERNON_TEXTURE_RGBA8_UNORM:
+    return VK_FORMAT_R8G8B8A8_UNORM;
+  case VERNON_TEXTURE_RGBA8_SRGB:
+    return VK_FORMAT_R8G8B8A8_SRGB;
+  case VERNON_TEXTURE_RGBA16_FLOAT:
+    return VK_FORMAT_R16G16B16A16_SFLOAT;
+  case VERNON_TEXTURE_RGBA32_FLOAT:
+    return VK_FORMAT_R32G32B32A32_SFLOAT;
+  case VERNON_TEXTURE_R11G11B10_FLOAT:
+    return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+  case VERNON_TEXTURE_R16_FLOAT:
+    return VK_FORMAT_R16_SFLOAT;
+  case VERNON_TEXTURE_R32_FLOAT:
+    return VK_FORMAT_R32_SFLOAT;
+  }
+  return std::nullopt;
+}
+
+std::optional<VkSamplerAddressMode>
+vulkanSamplerAddressMode(VernonSamplerWrapMode mode) {
+  switch (mode) {
+  case VERNON_SAMPLER_REPEAT:
+    return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+  case VERNON_SAMPLER_MIRRORED_REPEAT:
+    return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+  case VERNON_SAMPLER_CLAMP_TO_EDGE:
+    return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  case VERNON_SAMPLER_CLAMP_TO_BORDER:
+    return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+  }
+  return std::nullopt;
+}
+
+std::optional<VkFilter> vulkanSamplerFilter(VernonSamplerFilter filter) {
+  switch (filter) {
+  case VERNON_SAMPLER_NEAREST:
+    return VK_FILTER_NEAREST;
+  case VERNON_SAMPLER_LINEAR:
+    return VK_FILTER_LINEAR;
+  }
+  return std::nullopt;
+}
 #endif
 
 void makeCurrent(VernonRuntimeContext *context) {
@@ -599,7 +708,42 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use,
   use.index = value.value("index", 0u);
   use.location = value.value("vernon.location", UINT32_MAX);
   use.divisor = value.value("vernon.instance_divisor", 0u);
+  use.descriptorSet = value.value("vernon.set", 0u);
   use.binding = value.value("vernon.binding", UINT32_MAX);
+  if (value.contains("sampled_texture_bindings")) {
+    const nlohmann::json &bindings = value["sampled_texture_bindings"];
+    if (!bindings.is_array()) {
+      error = "sampled_texture_bindings must be an array";
+      return false;
+    }
+    for (const nlohmann::json &binding : bindings) {
+      if (!binding.is_object() || !binding.contains("set") ||
+          !binding["set"].is_number_unsigned() ||
+          !binding.contains("binding") ||
+          !binding["binding"].is_number_unsigned()) {
+        error = "sampled texture binding must contain unsigned set/binding";
+        return false;
+      }
+      use.sampledTextureBindings.push_back(
+          {binding["set"].get<uint32_t>(),
+           binding["binding"].get<uint32_t>()});
+    }
+  } else {
+    const uint32_t sampledTextureSet =
+        value.value("sampled_texture_set", UINT32_MAX);
+    const uint32_t sampledTextureBinding =
+        value.value("sampled_texture_binding", UINT32_MAX);
+    if (sampledTextureSet != UINT32_MAX ||
+        sampledTextureBinding != UINT32_MAX) {
+      if (sampledTextureSet == UINT32_MAX ||
+          sampledTextureBinding == UINT32_MAX) {
+        error = "legacy sampled texture pairing is incomplete";
+        return false;
+      }
+      use.sampledTextureBindings.push_back(
+          {sampledTextureSet, sampledTextureBinding});
+    }
+  }
   if (value.contains("shape") && value["shape"].is_array())
     for (const nlohmann::json &dimension : value["shape"])
       use.shape.push_back(dimension.is_number_unsigned()
@@ -676,6 +820,7 @@ bool parseVariant(const nlohmann::json &value, Variant &variant,
     parameter.kind = row.value("kind", "");
     parameter.dtype = row.value("dtype", "");
     parameter.access = row.value("access", "read");
+    parameter.dimension = row.value("dimension", "");
     if (row.contains("shape") && row["shape"].is_array())
       for (const nlohmann::json &dimension : row["shape"])
         parameter.shape.push_back(dimension.is_number_unsigned()
@@ -1128,6 +1273,8 @@ bool argumentKindMatches(const Parameter &parameter,
           argument.kind == VERNON_PIPELINE_TENSOR) ||
          (parameter.kind == "texture" &&
           argument.kind == VERNON_PIPELINE_TEXTURE) ||
+         (parameter.kind == "sampler" &&
+          argument.kind == VERNON_PIPELINE_SAMPLER) ||
          (parameter.kind == "inline" &&
           argument.kind == VERNON_PIPELINE_INLINE_VALUE);
 }
@@ -1138,6 +1285,8 @@ pipelineArgumentKind(const std::string &kind) {
     return VERNON_PIPELINE_TENSOR;
   if (kind == "texture")
     return VERNON_PIPELINE_TEXTURE;
+  if (kind == "sampler")
+    return VERNON_PIPELINE_SAMPLER;
   if (kind == "inline")
     return VERNON_PIPELINE_INLINE_VALUE;
   return std::nullopt;
@@ -1431,7 +1580,7 @@ VernonStatus vernonRuntimeDestroy(VernonRuntimeContext *context) {
   if (!context)
     return VERNON_STATUS_OK;
   if (context->liveBuffers || context->liveKernels || context->liveTextures ||
-      context->liveBundles || context->livePipelines)
+      context->liveSamplers || context->liveBundles || context->livePipelines)
     return fail(context, "runtime context still owns live handles");
 #if defined(VERNON_HAS_CUDA_RUNTIME)
   if (context->backend == VERNON_RUNTIME_CUDA) {
@@ -1638,31 +1787,86 @@ VernonStatus vernonRuntimeCopyToHost(const VernonDeviceBuffer *buffer,
   return VERNON_STATUS_OK;
 }
 
-VernonDeviceTexture *vernonRuntimeTextureCreate2D(VernonRuntimeContext *context,
-                                                  uint32_t width,
-                                                  uint32_t height,
-                                                  VernonTextureFormat format) {
-  if (!context || context->backend != VERNON_RUNTIME_VULKAN || !width ||
-      !height || format != VERNON_TEXTURE_RGBA8_UNORM)
+VernonDeviceTexture *
+vernonRuntimeTextureCreate(VernonRuntimeContext *context,
+                           const VernonTextureDescriptor *descriptor) {
+  if (!context || !descriptor ||
+      descriptor->struct_size < sizeof(VernonTextureDescriptor) ||
+      !descriptor->width || !descriptor->height || !descriptor->depth ||
+      !descriptor->mip_levels)
     return nullptr;
+  if (context->backend != VERNON_RUNTIME_VULKAN) {
+    fail(context, "owned sampled textures require the Vulkan backend",
+         VERNON_STATUS_UNSUPPORTED_TARGET);
+    return nullptr;
+  }
+  if (descriptor->dimension > VERNON_TEXTURE_CUBE ||
+      (descriptor->dimension != VERNON_TEXTURE_3D && descriptor->depth != 1) ||
+      (descriptor->dimension == VERNON_TEXTURE_CUBE &&
+       descriptor->width != descriptor->height)) {
+    fail(context, "sampled texture descriptor dimensions are invalid");
+    return nullptr;
+  }
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
+  const std::optional<VkFormat> format =
+      vulkanTextureFormat(descriptor->format);
+  if (!format) {
+    fail(context, "sampled texture format is unsupported");
+    return nullptr;
+  }
+  uint32_t maximumMipLevels = 1;
+  uint32_t maximumExtent =
+      std::max({descriptor->width, descriptor->height, descriptor->depth});
+  while (maximumExtent > 1) {
+    maximumExtent >>= 1;
+    ++maximumMipLevels;
+  }
+  if (descriptor->mip_levels > maximumMipLevels) {
+    fail(context, "sampled texture mip count exceeds its extent");
+    return nullptr;
+  }
+  vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
+  VkFormatProperties formatProperties{};
+  driver.getPhysicalDeviceFormatProperties(context->vulkanPhysicalDevice,
+                                           *format, &formatProperties);
+  if (!(formatProperties.optimalTilingFeatures &
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+    fail(context, "Vulkan device cannot sample the requested texture format",
+         VERNON_STATUS_UNSUPPORTED_TARGET);
+    return nullptr;
+  }
   auto texture = std::make_unique<VernonDeviceTexture>();
   texture->context = context;
-  texture->width = width;
-  texture->height = height;
-  texture->format = format;
-  vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
+  texture->width = descriptor->width;
+  texture->height = descriptor->height;
+  texture->depth = descriptor->depth;
+  texture->mipLevels = descriptor->mip_levels;
+  texture->dimension = descriptor->dimension;
+  texture->format = descriptor->format;
+  texture->vulkanFormat = *format;
+  texture->vulkanColorAttachment = descriptor->dimension == VERNON_TEXTURE_2D &&
+                                   (formatProperties.optimalTilingFeatures &
+                                    VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT);
   VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-  imageInfo.imageType = VK_IMAGE_TYPE_2D;
-  imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
-  imageInfo.extent = {width, height, 1};
-  imageInfo.mipLevels = 1;
-  imageInfo.arrayLayers = 1;
+  imageInfo.flags = descriptor->dimension == VERNON_TEXTURE_CUBE
+                        ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT
+                        : 0;
+  imageInfo.imageType = descriptor->dimension == VERNON_TEXTURE_3D
+                            ? VK_IMAGE_TYPE_3D
+                            : VK_IMAGE_TYPE_2D;
+  imageInfo.format = *format;
+  imageInfo.extent = {
+      descriptor->width, descriptor->height,
+      descriptor->dimension == VERNON_TEXTURE_3D ? descriptor->depth : 1};
+  imageInfo.mipLevels = descriptor->mip_levels;
+  imageInfo.arrayLayers = descriptor->dimension == VERNON_TEXTURE_CUBE ? 6 : 1;
   imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
   imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-  imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+  imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT |
                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                     VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  if (texture->vulkanColorAttachment)
+    imageInfo.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
   imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   if (vulkanFail(context,
@@ -1702,11 +1906,15 @@ VernonDeviceTexture *vernonRuntimeTextureCreate2D(VernonRuntimeContext *context,
   }
   VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
   viewInfo.image = texture->vulkanImage;
-  viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-  viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+  viewInfo.viewType =
+      descriptor->dimension == VERNON_TEXTURE_3D     ? VK_IMAGE_VIEW_TYPE_3D
+      : descriptor->dimension == VERNON_TEXTURE_CUBE ? VK_IMAGE_VIEW_TYPE_CUBE
+                                                     : VK_IMAGE_VIEW_TYPE_2D;
+  viewInfo.format = *format;
   viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-  viewInfo.subresourceRange.levelCount = 1;
-  viewInfo.subresourceRange.layerCount = 1;
+  viewInfo.subresourceRange.levelCount = descriptor->mip_levels;
+  viewInfo.subresourceRange.layerCount =
+      descriptor->dimension == VERNON_TEXTURE_CUBE ? 6 : 1;
   if (vulkanFail(context,
                  driver.createImageView(context->vulkanDevice, &viewInfo,
                                         nullptr, &texture->vulkanView),
@@ -1722,22 +1930,63 @@ VernonDeviceTexture *vernonRuntimeTextureCreate2D(VernonRuntimeContext *context,
 #endif
 }
 
-VernonDeviceTexture *vernonRuntimeImportOpenGLTexture2D(
-    VernonRuntimeContext *context, uint32_t texture, uint32_t width,
-    uint32_t height, VernonTextureFormat format) {
+VernonDeviceTexture *vernonRuntimeTextureCreate2D(VernonRuntimeContext *context,
+                                                  uint32_t width,
+                                                  uint32_t height,
+                                                  VernonTextureFormat format) {
+  const VernonTextureDescriptor descriptor{sizeof(VernonTextureDescriptor),
+                                           VERNON_TEXTURE_2D,
+                                           format,
+                                           width,
+                                           height,
+                                           1,
+                                           1,
+                                           {0, 0, 0, 0}};
+  return vernonRuntimeTextureCreate(context, &descriptor);
+}
+
+VernonDeviceTexture *
+vernonRuntimeImportOpenGLTexture(VernonRuntimeContext *context,
+                                 uint32_t texture,
+                                 const VernonTextureDescriptor *descriptor) {
   if (!context ||
       (context->backend != VERNON_RUNTIME_OPENGL &&
        context->backend != VERNON_RUNTIME_OPENGL_ES) ||
-      !texture || !width || !height || format != VERNON_TEXTURE_RGBA8_UNORM)
+      !texture || !descriptor ||
+      descriptor->struct_size < sizeof(VernonTextureDescriptor) ||
+      !descriptor->width || !descriptor->height || !descriptor->depth ||
+      !descriptor->mip_levels ||
+      descriptor->format > VERNON_TEXTURE_R11G11B10_FLOAT ||
+      descriptor->dimension > VERNON_TEXTURE_CUBE ||
+      (descriptor->dimension != VERNON_TEXTURE_3D && descriptor->depth != 1) ||
+      (descriptor->dimension == VERNON_TEXTURE_CUBE &&
+       descriptor->width != descriptor->height))
     return nullptr;
   auto result = std::make_unique<VernonDeviceTexture>();
   result->context = context;
   result->name = texture;
-  result->width = width;
-  result->height = height;
-  result->format = format;
+  result->width = descriptor->width;
+  result->height = descriptor->height;
+  result->depth = descriptor->depth;
+  result->mipLevels = descriptor->mip_levels;
+  result->dimension = descriptor->dimension;
+  result->format = descriptor->format;
   ++context->liveTextures;
   return result.release();
+}
+
+VernonDeviceTexture *vernonRuntimeImportOpenGLTexture2D(
+    VernonRuntimeContext *context, uint32_t texture, uint32_t width,
+    uint32_t height, VernonTextureFormat format) {
+  const VernonTextureDescriptor descriptor{sizeof(VernonTextureDescriptor),
+                                           VERNON_TEXTURE_2D,
+                                           format,
+                                           width,
+                                           height,
+                                           1,
+                                           1,
+                                           {0, 0, 0, 0}};
+  return vernonRuntimeImportOpenGLTexture(context, texture, &descriptor);
 }
 
 VernonStatus vernonRuntimeTextureFree(VernonDeviceTexture *texture) {
@@ -1763,14 +2012,101 @@ VernonStatus vernonRuntimeTextureFree(VernonDeviceTexture *texture) {
   return VERNON_STATUS_OK;
 }
 
+VernonDeviceSampler *
+vernonRuntimeSamplerCreate(VernonRuntimeContext *context,
+                           const VernonSamplerDescriptor *descriptor) {
+  if (!context || !descriptor ||
+      descriptor->struct_size < sizeof(VernonSamplerDescriptor))
+    return nullptr;
+  if (context->backend != VERNON_RUNTIME_VULKAN) {
+    fail(context,
+         "owned sampler creation requires Vulkan; import an OpenGL sampler",
+         VERNON_STATUS_UNSUPPORTED_TARGET);
+    return nullptr;
+  }
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+  const auto wrapU = vulkanSamplerAddressMode(descriptor->wrap_u);
+  const auto wrapV = vulkanSamplerAddressMode(descriptor->wrap_v);
+  const auto wrapW = vulkanSamplerAddressMode(descriptor->wrap_w);
+  const auto minFilter = vulkanSamplerFilter(descriptor->min_filter);
+  const auto magFilter = vulkanSamplerFilter(descriptor->mag_filter);
+  if (!wrapU || !wrapV || !wrapW || !minFilter || !magFilter ||
+      descriptor->mip_filter > VERNON_SAMPLER_LINEAR) {
+    fail(context, "sampler descriptor contains an invalid enum value");
+    return nullptr;
+  }
+  auto sampler = std::make_unique<VernonDeviceSampler>();
+  sampler->context = context;
+  sampler->descriptor = *descriptor;
+  VkSamplerCreateInfo createInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+  createInfo.magFilter = *magFilter;
+  createInfo.minFilter = *minFilter;
+  createInfo.mipmapMode = descriptor->mip_filter == VERNON_SAMPLER_LINEAR
+                              ? VK_SAMPLER_MIPMAP_MODE_LINEAR
+                              : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  createInfo.addressModeU = *wrapU;
+  createInfo.addressModeV = *wrapV;
+  createInfo.addressModeW = *wrapW;
+  createInfo.minLod = 0.0f;
+  createInfo.maxLod = VK_LOD_CLAMP_NONE;
+  createInfo.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+  if (vulkanFail(context,
+                 vernon::runtime::vulkanDriver().createSampler(
+                     context->vulkanDevice, &createInfo, nullptr,
+                     &sampler->vulkanSampler),
+                 "vkCreateSampler") != VERNON_STATUS_OK)
+    return nullptr;
+  ++context->liveSamplers;
+  return sampler.release();
+#else
+  return nullptr;
+#endif
+}
+
+VernonDeviceSampler *
+vernonRuntimeImportOpenGLSampler(VernonRuntimeContext *context,
+                                 uint32_t sampler) {
+  if (!context ||
+      (context->backend != VERNON_RUNTIME_OPENGL &&
+       context->backend != VERNON_RUNTIME_OPENGL_ES) ||
+      !sampler)
+    return nullptr;
+  auto result = std::make_unique<VernonDeviceSampler>();
+  result->context = context;
+  result->name = sampler;
+  result->imported = true;
+  ++context->liveSamplers;
+  return result.release();
+}
+
+VernonStatus vernonRuntimeSamplerFree(VernonDeviceSampler *sampler) {
+  if (!sampler)
+    return VERNON_STATUS_OK;
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+  if (sampler->context->backend == VERNON_RUNTIME_VULKAN &&
+      sampler->vulkanSampler) {
+    vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
+    driver.deviceWaitIdle(sampler->context->vulkanDevice);
+    driver.destroySampler(sampler->context->vulkanDevice,
+                          sampler->vulkanSampler, nullptr);
+  }
+#endif
+  --sampler->context->liveSamplers;
+  delete sampler;
+  return VERNON_STATUS_OK;
+}
+
 VernonStatus vernonRuntimeTextureCopyFromHost(VernonDeviceTexture *texture,
                                               const void *source, size_t size) {
   const size_t expected =
       texture ? static_cast<size_t>(texture->width) * texture->height * 4 : 0;
   if (!texture || texture->context->backend != VERNON_RUNTIME_VULKAN ||
-      !source || size != expected)
+      texture->dimension != VERNON_TEXTURE_2D ||
+      texture->format != VERNON_TEXTURE_RGBA8_UNORM ||
+      texture->mipLevels != 1 || !source || size != expected)
     return fail(texture ? texture->context : nullptr,
-                "invalid Vulkan texture upload");
+                "Vulkan host upload supports one-mip RGBA8 2D textures only",
+                VERNON_STATUS_UNSUPPORTED_TARGET);
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
   VernonRuntimeContext *context = texture->context;
   VkBuffer staging = VK_NULL_HANDLE;
@@ -1801,7 +2137,7 @@ VernonStatus vernonRuntimeTextureCopyFromHost(VernonDeviceTexture *texture,
                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                                     &region);
         transitionVulkanImage(command, texture,
-                              VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
       });
   driver.destroyBuffer(context->vulkanDevice, staging, nullptr);
   driver.freeMemory(context->vulkanDevice, memory, nullptr);
@@ -1816,9 +2152,12 @@ VernonStatus vernonRuntimeTextureCopyToHost(const VernonDeviceTexture *texture,
   const size_t expected =
       texture ? static_cast<size_t>(texture->width) * texture->height * 4 : 0;
   if (!texture || texture->context->backend != VERNON_RUNTIME_VULKAN ||
-      !destination || size != expected)
+      texture->dimension != VERNON_TEXTURE_2D ||
+      texture->format != VERNON_TEXTURE_RGBA8_UNORM ||
+      texture->mipLevels != 1 || !destination || size != expected)
     return fail(texture ? texture->context : nullptr,
-                "invalid Vulkan texture readback");
+                "Vulkan host readback supports one-mip RGBA8 2D textures only",
+                VERNON_STATUS_UNSUPPORTED_TARGET);
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
   auto *mutableTexture = const_cast<VernonDeviceTexture *>(texture);
   VernonRuntimeContext *context = texture->context;
@@ -1827,6 +2166,10 @@ VernonStatus vernonRuntimeTextureCopyToHost(const VernonDeviceTexture *texture,
   if (!createVulkanBuffer(context, size, staging, memory))
     return VERNON_STATUS_INTERNAL_ERROR;
   vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
+  const VkImageLayout restoreLayout =
+      texture->vulkanLayout == VK_IMAGE_LAYOUT_UNDEFINED
+          ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+          : texture->vulkanLayout;
   const bool copied =
       submitVulkanCommands(context, [&](VkCommandBuffer command) {
         transitionVulkanImage(command, mutableTexture,
@@ -1838,8 +2181,7 @@ VernonStatus vernonRuntimeTextureCopyToHost(const VernonDeviceTexture *texture,
         driver.cmdCopyImageToBuffer(command, texture->vulkanImage,
                                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                     staging, 1, &region);
-        transitionVulkanImage(command, mutableTexture,
-                              VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        transitionVulkanImage(command, mutableTexture, restoreLayout);
       });
   if (copied) {
     void *mapped = nullptr;
@@ -2732,7 +3074,9 @@ namespace {
 bool fillParameterView(const Parameter &source,
                        VernonPipelineParameterView &destination) {
   const auto kind = pipelineArgumentKind(source.kind);
-  const auto dtype = pipelineDataType(source.dtype);
+  const auto dtype = source.kind == "sampler"
+                         ? std::optional<VernonDataType>(VERNON_DATA_F32)
+                         : pipelineDataType(source.dtype);
   const auto access = pipelineValueAccess(source.access);
   if (!kind || !dtype || !access)
     return false;
@@ -3027,6 +3371,30 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
         !argumentKindMatches(parameter, *found->second))
       return fail(pipeline->context,
                   "pipeline argument kind does not match layout");
+    const VernonPipelineArgument &argument = *found->second;
+    if (argument.kind == VERNON_PIPELINE_TEXTURE) {
+      if (!argument.texture.texture ||
+          argument.texture.texture->context != pipeline->context ||
+          argument.texture.format != argument.texture.texture->format ||
+          argument.texture.dimension != argument.texture.texture->dimension ||
+          argument.texture.width != argument.texture.texture->width ||
+          argument.texture.height != argument.texture.texture->height ||
+          argument.texture.depth != argument.texture.texture->depth ||
+          (!parameter.dimension.empty() &&
+           ((parameter.dimension == "2d" &&
+             argument.texture.dimension != VERNON_TEXTURE_2D) ||
+            (parameter.dimension == "3d" &&
+             argument.texture.dimension != VERNON_TEXTURE_3D) ||
+            (parameter.dimension == "cube" &&
+             argument.texture.dimension != VERNON_TEXTURE_CUBE))))
+        return fail(pipeline->context,
+                    "pipeline texture argument does not match layout");
+    } else if (argument.kind == VERNON_PIPELINE_SAMPLER &&
+               (!argument.sampler ||
+                argument.sampler->context != pipeline->context)) {
+      return fail(pipeline->context,
+                  "pipeline sampler belongs to another runtime");
+    }
   }
 
   if (pipeline->computeKernel) {
@@ -3065,6 +3433,12 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
       VkShaderStageFlags stages;
     };
     std::vector<PushConstantValue> pushConstants;
+    struct SampledResource {
+      VernonDeviceTexture *texture{};
+      VernonDeviceSampler *sampler{};
+      VkShaderStageFlags stages{};
+    };
+    std::map<std::pair<uint32_t, uint32_t>, SampledResource> sampledResources;
     uint32_t vertexCount = invocation->vertex_count;
     uint32_t instanceCount = invocation->instance_count;
     for (const Parameter &parameter : pipeline->variant.parameters) {
@@ -3072,6 +3446,39 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
       for (const ParameterUse &use : parameter.uses) {
         if (use.stage != "vertex" && use.stage != "fragment")
           continue;
+        const VkShaderStageFlags shaderStage =
+            use.stage == "vertex" ? VK_SHADER_STAGE_VERTEX_BIT
+                                  : VK_SHADER_STAGE_FRAGMENT_BIT;
+        if (argument.kind == VERNON_PIPELINE_TEXTURE) {
+          if (use.binding == UINT32_MAX)
+            return fail(pipeline->context,
+                        "Vulkan sampled texture is missing set/binding");
+          SampledResource &resource =
+              sampledResources[{use.descriptorSet, use.binding}];
+          if (resource.texture && resource.texture != argument.texture.texture)
+            return fail(pipeline->context,
+                        "Vulkan sampled texture binding is ambiguous");
+          resource.texture = argument.texture.texture;
+          resource.stages |= shaderStage;
+          continue;
+        }
+        if (argument.kind == VERNON_PIPELINE_SAMPLER) {
+          if (use.sampledTextureBindings.empty())
+            return fail(
+                pipeline->context,
+                "sampler reflection has no paired sampled texture binding");
+          for (const SampledTextureBinding &binding :
+               use.sampledTextureBindings) {
+            SampledResource &resource =
+                sampledResources[{binding.descriptorSet, binding.binding}];
+            if (resource.sampler && resource.sampler != argument.sampler)
+              return fail(pipeline->context,
+                          "Vulkan sampler pairing is ambiguous");
+            resource.sampler = argument.sampler;
+            resource.stages |= shaderStage;
+          }
+          continue;
+        }
         if (use.interfaceKind == "uniform") {
           if (use.binding != UINT32_MAX)
             return fail(pipeline->context,
@@ -3083,9 +3490,7 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
               argument.inline_value.data_size % sizeof(uint32_t) != 0)
             return fail(pipeline->context,
                         "Vulkan push constant value is invalid");
-          const VkShaderStageFlags stage = use.stage == "vertex"
-                                               ? VK_SHADER_STAGE_VERTEX_BIT
-                                               : VK_SHADER_STAGE_FRAGMENT_BIT;
+          const VkShaderStageFlags stage = shaderStage;
           auto existing =
               std::find_if(pushConstants.begin(), pushConstants.end(),
                            [&](const PushConstantValue &value) {
@@ -3157,6 +3562,11 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
         }
       }
     }
+    for (const auto &[binding, resource] : sampledResources)
+      if (!resource.texture || !resource.sampler ||
+          !resource.sampler->vulkanSampler)
+        return fail(pipeline->context,
+                    "Vulkan sampled image requires paired texture and sampler");
     if (!vertexCount || !instanceCount)
       return fail(pipeline->context,
                   "Vulkan graphics draw counts cannot be inferred");
@@ -3173,10 +3583,20 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
       const VernonColorAttachment &attachment =
           invocation->color_attachments[index];
       if (!attachment.texture ||
-          attachment.texture->context != pipeline->context)
+          attachment.texture->context != pipeline->context ||
+          attachment.texture->dimension != VERNON_TEXTURE_2D ||
+          !attachment.texture->vulkanColorAttachment)
         return fail(pipeline->context, "Vulkan render target is invalid");
       attachments.push_back(&attachment);
     }
+    for (const auto &[binding, resource] : sampledResources)
+      if (std::any_of(attachments.begin(), attachments.end(),
+                      [&](const VernonColorAttachment *attachment) {
+                        return attachment->texture == resource.texture;
+                      }))
+        return fail(pipeline->context,
+                    "a Vulkan texture cannot be sampled and rendered to in "
+                    "the same invocation");
     std::sort(attachments.begin(), attachments.end(),
               [](const VernonColorAttachment *left,
                  const VernonColorAttachment *right) {
@@ -3195,7 +3615,7 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
           attachments[index]->texture->height != height)
         return fail(pipeline->context, "Vulkan render target extents differ");
       VkAttachmentDescription description{};
-      description.format = VK_FORMAT_R8G8B8A8_UNORM;
+      description.format = attachments[index]->texture->vulkanFormat;
       description.samples = VK_SAMPLE_COUNT_1_BIT;
       description.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
       description.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -3214,6 +3634,9 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
     VkPipeline graphicsPipeline = VK_NULL_HANDLE;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
+    VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+    std::vector<VkDescriptorSetLayout> descriptorSetLayouts;
+    std::vector<VkDescriptorSet> descriptorSets;
     auto cleanup = [&] {
       if (framebuffer)
         driver.destroyFramebuffer(context->vulkanDevice, framebuffer, nullptr);
@@ -3223,6 +3646,12 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
       if (pipelineLayout)
         driver.destroyPipelineLayout(context->vulkanDevice, pipelineLayout,
                                      nullptr);
+      if (descriptorPool)
+        driver.destroyDescriptorPool(context->vulkanDevice, descriptorPool,
+                                     nullptr);
+      for (VkDescriptorSetLayout layout : descriptorSetLayouts)
+        driver.destroyDescriptorSetLayout(context->vulkanDevice, layout,
+                                          nullptr);
       if (renderPass)
         driver.destroyRenderPass(context->vulkanDevice, renderPass, nullptr);
     };
@@ -3246,6 +3675,84 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
       return VERNON_STATUS_INTERNAL_ERROR;
     VkPipelineLayoutCreateInfo layoutInfo{
         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    if (!sampledResources.empty()) {
+      const uint32_t maximumSet = sampledResources.rbegin()->first.first;
+      descriptorSetLayouts.resize(maximumSet + 1, VK_NULL_HANDLE);
+      for (uint32_t set = 0; set <= maximumSet; ++set) {
+        std::vector<VkDescriptorSetLayoutBinding> bindings;
+        for (const auto &[key, resource] : sampledResources)
+          if (key.first == set)
+            bindings.push_back({key.second,
+                                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                                resource.stages, nullptr});
+        VkDescriptorSetLayoutCreateInfo descriptorLayoutInfo{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        descriptorLayoutInfo.bindingCount =
+            static_cast<uint32_t>(bindings.size());
+        descriptorLayoutInfo.pBindings = bindings.data();
+        if (vulkanFail(context,
+                       driver.createDescriptorSetLayout(
+                           context->vulkanDevice, &descriptorLayoutInfo,
+                           nullptr, &descriptorSetLayouts[set]),
+                       "vkCreateDescriptorSetLayout") != VERNON_STATUS_OK) {
+          cleanup();
+          return VERNON_STATUS_INTERNAL_ERROR;
+        }
+      }
+      VkDescriptorPoolSize poolSize{
+          VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+          static_cast<uint32_t>(sampledResources.size())};
+      VkDescriptorPoolCreateInfo poolInfo{
+          VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+      poolInfo.maxSets = static_cast<uint32_t>(descriptorSetLayouts.size());
+      poolInfo.poolSizeCount = 1;
+      poolInfo.pPoolSizes = &poolSize;
+      if (vulkanFail(context,
+                     driver.createDescriptorPool(context->vulkanDevice,
+                                                 &poolInfo, nullptr,
+                                                 &descriptorPool),
+                     "vkCreateDescriptorPool") != VERNON_STATUS_OK) {
+        cleanup();
+        return VERNON_STATUS_INTERNAL_ERROR;
+      }
+      descriptorSets.resize(descriptorSetLayouts.size());
+      VkDescriptorSetAllocateInfo allocateInfo{
+          VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+      allocateInfo.descriptorPool = descriptorPool;
+      allocateInfo.descriptorSetCount =
+          static_cast<uint32_t>(descriptorSetLayouts.size());
+      allocateInfo.pSetLayouts = descriptorSetLayouts.data();
+      if (vulkanFail(context,
+                     driver.allocateDescriptorSets(context->vulkanDevice,
+                                                   &allocateInfo,
+                                                   descriptorSets.data()),
+                     "vkAllocateDescriptorSets") != VERNON_STATUS_OK) {
+        cleanup();
+        return VERNON_STATUS_INTERNAL_ERROR;
+      }
+      std::vector<VkDescriptorImageInfo> imageInfos;
+      std::vector<VkWriteDescriptorSet> writes;
+      imageInfos.reserve(sampledResources.size());
+      writes.reserve(sampledResources.size());
+      for (const auto &[key, resource] : sampledResources) {
+        imageInfos.push_back({resource.sampler->vulkanSampler,
+                              resource.texture->vulkanView,
+                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = descriptorSets[key.first];
+        write.dstBinding = key.second;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &imageInfos.back();
+        writes.push_back(write);
+      }
+      driver.updateDescriptorSets(context->vulkanDevice,
+                                  static_cast<uint32_t>(writes.size()),
+                                  writes.data(), 0, nullptr);
+      layoutInfo.setLayoutCount =
+          static_cast<uint32_t>(descriptorSetLayouts.size());
+      layoutInfo.pSetLayouts = descriptorSetLayouts.data();
+    }
     std::vector<VkPushConstantRange> pushConstantRanges;
     for (const PushConstantValue &value : pushConstants)
       pushConstantRanges.push_back({value.stages, 0, value.size});
@@ -3359,6 +3866,11 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
           transitionVulkanImage(command, attachment->texture,
                                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+      for (const auto &[binding, resource] : sampledResources)
+        if (resource.texture->vulkanLayout !=
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+          transitionVulkanImage(command, resource.texture,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
       std::vector<VkClearValue> clearValues(attachments.size());
       VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
       begin.renderPass = renderPass;
@@ -3369,6 +3881,11 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
       driver.cmdBeginRenderPass(command, &begin, VK_SUBPASS_CONTENTS_INLINE);
       driver.cmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
                              graphicsPipeline);
+      if (!descriptorSets.empty())
+        driver.cmdBindDescriptorSets(
+            command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0,
+            static_cast<uint32_t>(descriptorSets.size()), descriptorSets.data(),
+            0, nullptr);
       for (const PushConstantValue &value : pushConstants)
         driver.cmdPushConstants(command, pipelineLayout, value.stages, 0,
                                 value.size, value.data);
@@ -3489,6 +4006,40 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
     for (const ParameterUse &use : parameter.uses) {
       if (use.stage != "vertex" && use.stage != "fragment")
         continue;
+      if (argument.kind == VERNON_PIPELINE_TEXTURE) {
+        if (use.descriptorSet != 0 || use.binding == UINT32_MAX)
+          return fail(pipeline->context,
+                      "OpenGL sampled texture requires set zero and a binding");
+        const VernonDeviceTexture *texture = argument.texture.texture;
+        const GlEnum target =
+            texture->dimension == VERNON_TEXTURE_2D   ? kTexture2D
+            : texture->dimension == VERNON_TEXTURE_3D ? kTexture3D
+                                                      : kTextureCubeMap;
+        gl.activeTexture(kTexture0 + use.binding);
+        gl.bindTexture(target, texture->name);
+        const std::string uniformName =
+            use.uniformName.empty() ? "main_arg_" + std::to_string(use.index)
+                                    : use.uniformName;
+        const GlInt location = gl.getUniformLocation(pipeline->graphicsProgram,
+                                                     uniformName.c_str());
+        if (location >= 0)
+          gl.uniform1i(location, static_cast<GlInt>(use.binding));
+        continue;
+      }
+      if (argument.kind == VERNON_PIPELINE_SAMPLER) {
+        if (use.sampledTextureBindings.empty())
+          return fail(pipeline->context,
+                      "OpenGL sampler has no paired sampled texture binding");
+        for (const SampledTextureBinding &binding :
+             use.sampledTextureBindings) {
+          if (binding.descriptorSet != 0 || binding.binding == UINT32_MAX)
+            return fail(
+                pipeline->context,
+                "OpenGL sampled texture requires set zero and a binding");
+          gl.bindSampler(binding.binding, argument.sampler->name);
+        }
+        continue;
+      }
       if (use.interfaceKind == "uniform") {
         if (argument.kind != VERNON_PIPELINE_INLINE_VALUE ||
             argument.inline_value.dtype != VERNON_DATA_F32 ||

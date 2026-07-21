@@ -63,6 +63,10 @@ bool loadOpenGLDriver(const VernonExternalOpenGLContext &external,
   LOAD(uniformMatrix2fv, "glUniformMatrix2fv");
   LOAD(uniformMatrix3fv, "glUniformMatrix3fv");
   LOAD(uniformMatrix4fv, "glUniformMatrix4fv");
+  LOAD(uniform1i, "glUniform1i");
+  LOAD(activeTexture, "glActiveTexture");
+  LOAD(bindTexture, "glBindTexture");
+  LOAD(bindSampler, "glBindSampler");
   LOAD(finish, "glFinish");
 #undef LOAD
   driver.dispatchCompute = reinterpret_cast<decltype(driver.dispatchCompute)>(

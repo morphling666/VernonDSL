@@ -77,6 +77,24 @@ Python exposes the same runtime through the single `_native` module. OpenGL and
 OpenGL ES require a host-owned external context; Vulkan and CUDA resolve their
 system drivers dynamically.
 
+Sampled-texture portability stops at an explicitly sized 2D, 3D, or Cube
+descriptor, a portable sampled format, and separate wrap/filter sampler state.
+The invocation ABI carries opaque texture and sampler handles; allocation,
+pixel upload layout, render-target policy, and native ownership remain backend
+or host-adapter responsibilities. Vulkan may allocate empty sampled resources
+from the portable descriptor, but this does not define a portable upload
+layout or render-target usage model. `TextureBuffer` is deliberately outside
+this boundary.
+
+SPIR-V represents each DSL `texture_sample(texture, sampler, coordinates)` as
+one combined sampled-image descriptor at the texture parameter's reflected
+set/binding. The standalone sampler parameter remains part of the portable
+invocation ABI, but has no separate SPIR-V variable; its reflection records
+`sampled_texture_set` and `sampled_texture_binding`. OpenGL and Vulkan must
+pair the supplied sampler to that exact texture binding and reject missing,
+conflicting, or multiply-paired metadata rather than inferring from parameter
+order.
+
 ### Historical gaps and current boundary
 
 The native pipeline-bundle loader, schema unification, reflected slot

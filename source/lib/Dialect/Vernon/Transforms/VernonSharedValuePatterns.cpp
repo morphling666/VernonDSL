@@ -323,11 +323,12 @@ struct SwizzlePattern final : OpConversionPattern<SwizzleOp> {
       return failure();
     SmallVector<Value> elements;
     for (char component : op.getMask()) {
-      size_t index = StringRef("xyzw").find(component);
-      if (index == StringRef::npos)
-        return failure();
+      std::optional<unsigned> index = decodeSwizzleComponent(component);
+      if (!index)
+        return rewriter.notifyMatchFailure(
+            op, "swizzle mask contains an invalid component alias");
       elements.push_back(vector::ExtractOp::create(
-          rewriter, op.getLoc(), input, static_cast<int64_t>(index)));
+          rewriter, op.getLoc(), input, static_cast<int64_t>(*index)));
     }
     Type converted = getTypeConverter()->convertType(op.getResult().getType());
     if (auto vectorType = dyn_cast_if_present<VectorType>(converted))

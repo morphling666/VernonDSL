@@ -5,13 +5,9 @@ import atexit
 import hashlib
 import importlib
 import inspect
-import json
 import os
-import shutil
 import struct
-import subprocess
 import sys
-import tempfile
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,10 +15,22 @@ from typing import Annotated, Any, ClassVar, get_args, get_origin, get_type_hint
 
 import numpy as np
 
-from .compiler import Compiler
-from .module_graph import load_project
-from .shader_assets import (_dtype_and_shape, encode_runtime_stage,
-                            serialize_runtime_pipeline_bundle)
+from .compiler import (
+    Compiler,
+    FrontendCompileRequest,
+    FrontendCompileResult,
+)
+from .pipeline_compile import (
+    CompiledStage,
+    PipelineCompileError,
+    TargetOptions,
+    build_bundle_plan,
+    canonical_json,
+    compiled_stage_from_program,
+    inline_artifact_descriptor,
+    materialize_bundle,
+    serialize_bundle,
+)
 from .types import Annotation, TypeExpr, _Scalar
 
 _native_dll_directories: list[Any] = []
@@ -116,7 +124,7 @@ def init(*,
             "api_version is a (major, minor) pair for OpenGL runtimes")
     kernel_type = globals().get("Kernel")
     if kernel_type is not None:
-        kernel_type.clear_cache()
+        kernel_type.invalidate_loaded()
     if arch in {cpu, cuda, vulkan, opengl, opengles}:
         if _native is None:
             raise RuntimeError(
@@ -173,6 +181,14 @@ def register_external_opengl_context(
         raise ValueError("api_version must be a non-negative major/minor pair")
     _external_opengl_contexts[arch] = (user_data, make_current,
                                        get_proc_address, api_version)
+
+
+def _interactive_glsl_version() -> int:
+    if _architecture not in {opengl, opengles}:
+        return 0
+    major, minor = _api_version or ((4, 3) if _architecture == opengl else
+                                    (3, 1))
+    return major * 100 + minor * 10
 
 
 class CpuAotRuntime:
@@ -365,36 +381,15 @@ class TensorView:
         return self._owner._resident_buffer()
 
 
-@dataclass(frozen=True)
+@dataclass
 class _CompiledKernel:
     mlir: str
     function: ast.FunctionDef
     builtin_names: tuple[str, ...]
     writable_names: tuple[str, ...]
+    program: Any
     native: Any | None = None
-
-
-class _CpuAotKernel:
-    """Keep an ephemeral CPU bundle alive until its native library unloads."""
-
-    def __init__(self, native: Any, temporary: Path):
-        self._native = native
-        self._temporary = temporary
-
-    def launch(self, x: int, y: int, z: int, values: list[Any]) -> None:
-        if self._native is None:
-            raise RuntimeError("CPU AOT kernel is closed")
-        self._native.launch(x, y, z, values)
-
-    def close(self) -> None:
-        if self._native is None:
-            return
-        native, self._native = self._native, None
-        del native
-        shutil.rmtree(self._temporary)
-
-    def __del__(self) -> None:
-        self.close()
+    native_generation: int = -1
 
 
 class Kernel:
@@ -422,10 +417,13 @@ class Kernel:
 
     @classmethod
     def clear_cache(cls) -> None:
-        for compiled in cls._cache.values():
-            if isinstance(compiled.native, _CpuAotKernel):
-                compiled.native.close()
         cls._cache.clear()
+
+    @classmethod
+    def invalidate_loaded(cls) -> None:
+        for compiled in cls._cache.values():
+            compiled.native = None
+            compiled.native_generation = -1
 
     @staticmethod
     def _annotation_name(node: ast.AST) -> str:
@@ -434,55 +432,6 @@ class Kernel:
         if isinstance(node, ast.Attribute):
             return node.attr
         return ""
-
-    def _specialized_tree(self, source: str,
-                          tensor_arguments: dict[str, Tensor]) -> ast.Module:
-        tree = ast.parse(source, filename=str(self._file))
-        selected: ast.FunctionDef | None = None
-        for node in tree.body:
-            if isinstance(node, ast.FunctionDef) and node.name == self._entry:
-                selected = node
-                break
-        if selected is None:
-            raise RuntimeError(
-                f"kernel entry {self._entry!r} is not top-level")
-        for argument in selected.args.args:
-            tensor = tensor_arguments.get(argument.arg)
-            if tensor is None or argument.annotation is None:
-                continue
-            annotation = argument.annotation
-            if (isinstance(annotation, ast.Subscript) and
-                    self._annotation_name(annotation.value) == "Annotated"):
-                annotation = (annotation.slice.elts[0] if isinstance(
-                    annotation.slice, ast.Tuple) else annotation.slice)
-            if not (isinstance(annotation, ast.Subscript)
-                    and self._annotation_name(annotation.value) == "Tensor"):
-                continue
-            items = (list(annotation.slice.elts) if isinstance(
-                annotation.slice, ast.Tuple) else [annotation.slice])
-            if len(items) < 2:
-                continue
-            shape_node = items[1]
-            shape_nodes = (list(shape_node.elts) if isinstance(
-                shape_node, ast.Tuple) else items[1:])
-            if len(shape_nodes) != len(tensor.shape):
-                raise ValueError(
-                    f"Tensor argument {argument.arg!r} rank does not match annotation"
-                )
-            for index, (shape, concrete) in enumerate(
-                    zip(shape_nodes, tensor.shape, strict=True)):
-                if isinstance(shape, ast.Constant) and shape.value is None:
-                    shape_nodes[index] = ast.copy_location(
-                        ast.Constant(value=concrete), shape)
-                elif not (isinstance(shape, ast.Constant)
-                          and shape.value == concrete):
-                    raise ValueError(
-                        f"Tensor argument {argument.arg!r} shape does not match annotation"
-                    )
-            items[1] = ast.Tuple(elts=shape_nodes, ctx=ast.Load())
-            annotation.slice = ast.Tuple(elts=items, ctx=ast.Load())
-        ast.fix_missing_locations(tree)
-        return tree
 
     @staticmethod
     def _builtin_parameters(function: ast.FunctionDef) -> tuple[str, ...]:
@@ -520,18 +469,9 @@ class Kernel:
         self,
         arguments: tuple[Any, ...],
         features: tuple[str, ...] = (),
-    ) -> tuple[str, ast.FunctionDef, tuple[str, ...], dict[str, Tensor], str]:
-        original_source = self._file.read_text(encoding="utf-8")
-        original_tree = ast.parse(original_source, filename=str(self._file))
-        has_helpers = any(
-            isinstance(node, ast.FunctionDef) and any(
-                Kernel._annotation_name(decorator.func if isinstance(
-                    decorator, ast.Call) else decorator) == "func"
-                for decorator in node.decorator_list)
-            for node in original_tree.body)
-        project = (load_project(self._file, features, self._entry)
-                   if features or has_helpers else None)
-        source = project.source if project is not None else original_source
+    ) -> tuple[FrontendCompileResult, ast.FunctionDef, tuple[str, ...],
+               dict[str, Tensor]]:
+        source = self._file.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(self._file))
         function = next(
             (node for node in tree.body
@@ -556,32 +496,32 @@ class Kernel:
             for name, value in zip(user_parameters, arguments, strict=True)
             if isinstance(value, Tensor)
         }
-        specialized = self._specialized_tree(source, tensors)
-        specialized_function = next(
-            node for node in specialized.body
-            if isinstance(node, ast.FunctionDef) and node.name == self._entry)
-        specialized_function = _CapturedConstantSpecializer(
-            self._globals).visit(specialized_function)
-        assert isinstance(specialized_function, ast.FunctionDef)
-        ast.fix_missing_locations(specialized_function)
-        if project is not None:
-            specialized.body = [
-                specialized_function if isinstance(node, ast.FunctionDef)
-                and node.name == self._entry else node
-                for node in specialized.body
-            ]
-            specialized_source = ast.unparse(specialized)
-        else:
-            specialized_source = ast.unparse(
-                ast.Module(body=[specialized_function], type_ignores=[]))
-        mlir = Compiler().compile(
-            specialized_source,
-            str(self._file),
-            project.dependencies if project is not None else (),
-            project.features if project is not None else (),
-            features,
+        loaded_names = {
+            node.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+        }
+        constants = tuple(
+            (name, value)
+            for name, value in self._globals.items()
+            if name in loaded_names and isinstance(value, (int, float, bool))
         )
-        return mlir, specialized_function, builtins, tensors, source
+        request = FrontendCompileRequest(
+            self._file,
+            self._entry,
+            features,
+            tuple((name, value.dtype.str, value.shape)
+                  for name, value in tensors.items()),
+            constants,
+            self._workgroup_size,
+        )
+        frontend = Compiler().compile_request(request)
+        specialized_tree = ast.parse(frontend.specialized_source,
+                                     filename=str(self._file))
+        specialized_function = next(
+            node for node in specialized_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == self._entry)
+        return frontend, specialized_function, builtins, tensors
 
     def compile_artifact(self, *arguments: Any,
                          target: str) -> tuple[bytes, str]:
@@ -599,115 +539,82 @@ class Kernel:
         if target not in targets:
             raise ValueError("target must be cpu, cuda, vulkan, metal, "
                              "opengl, or opengles")
-        mlir, _, _, _, _ = self._lower(arguments)
-        return _native.Compiler().compile(mlir, targets[target])
+        frontend, _, _, _ = self._lower(arguments)
+        target_options = TargetOptions(
+            target, {
+                "glsl_version": 430
+            } if target == "opengl" else {
+                "glsl_version": 310
+            } if target == "opengles" else {})
+        program = _native.Compiler().compile_program_result(
+            frontend.mlir, targets[target], **target_options.native_options)
+        if not program.ok:
+            raise RuntimeError(program.diagnostics)
+        if len(program.artifacts) != 1:
+            raise RuntimeError(
+                "kernel compilation must produce exactly one artifact")
+        return bytes(program.artifacts[0][1]), str(program.reflection)
 
     def _compile(
         self, arguments: tuple[Any, ...], features: tuple[str, ...] = ()
     ) -> _CompiledKernel:
-        mlir, specialized_function, builtins, tensors, source = self._lower(
+        frontend, specialized_function, builtins, tensors = self._lower(
             arguments, features)
+        target = {
+            cpu: _native.Target.CPU,
+            cuda: _native.Target.CUDA,
+            vulkan: _native.Target.VULKAN,
+            opengl: _native.Target.OPENGL,
+            opengles: _native.Target.OPENGL_ES,
+        }.get(_architecture) if _native is not None else None
+        target_options = TargetOptions(
+            _architecture.name, {
+                "glsl_version": _interactive_glsl_version()
+            } if _architecture in {opengl, opengles} else {})
         key_data = {
-            "version":
-            1,
-            "source":
-            hashlib.sha256(source.encode()).hexdigest(),
-            "entry":
-            self._entry,
-            "arch":
-            _architecture.name,
-            "workgroup":
-            self._workgroup_size,
-            "runtime_generation":
-            _runtime_generation,
-            "features":
-            features,
-            "tensors": [(name, value.dtype.str, value.shape)
-                        for name, value in tensors.items()],
+            "version": 2,
+            "frontend": frontend.semantic_inputs,
+            "target": target_options.target,
+            "target_options": dict(target_options.options),
         }
-        key = hashlib.sha256(repr(sorted(
-            key_data.items())).encode("utf-8")).hexdigest()
+        key = hashlib.sha256(
+            canonical_json(key_data).encode("utf-8")).hexdigest()
         cached = self._cache.get(key)
-        if cached is not None:
-            return cached
         if _native is None or _native_runtime is None:
             raise RuntimeError(
                 f"{_architecture.name} kernel execution requires the native runtime"
             )
-        if _architecture == cpu:
-            native_kernel = self._compile_cpu_aot(mlir)
-        else:
-            target = {
-                cuda: _native.Target.CUDA,
-                vulkan: _native.Target.VULKAN,
-                opengl: _native.Target.OPENGL,
-                opengles: _native.Target.OPENGL_ES,
-            }[_architecture]
-            artifact, reflection = _native.Compiler().compile(mlir, target)
-            native_kernel = _native_runtime.load(artifact, reflection,
-                                                 self._entry)
-        compiled = _CompiledKernel(
-            mlir, specialized_function, builtins,
-            self._writable_parameters(specialized_function), native_kernel)
-        self._cache[key] = compiled
-        self.compile_count += 1
-        return compiled
-
-    @staticmethod
-    def _native_compiler_path() -> Path:
-        executable = "vernon-compile.exe" if os.name == "nt" else "vernon-compile"
-        configured = os.environ.get("VERNON_COMPILER")
-        if configured:
-            path = Path(configured).expanduser().resolve()
-            if path.is_file():
-                return path
-            raise RuntimeError(f"VERNON_COMPILER does not name a file: {path}")
-        assert _native is not None
-        repository = Path(__file__).resolve().parents[2]
-        source_build = repository / "build" / "source"
-        candidates = [Path(_native.__file__).resolve().with_name(executable)]
-        candidates.extend(
-            source_build / configuration / executable
-            for configuration in ("Release", "Debug", "RelWithDebInfo",
-                                  "MinSizeRel"))
-        candidates.append(source_build / executable)
-        discovered = shutil.which(executable)
-        if discovered:
-            candidates.append(Path(discovered))
-        for candidate in candidates:
-            if candidate.is_file():
-                return candidate
-        raise RuntimeError(
-            "CPU AOT requires vernon-compile; set VERNON_COMPILER to its path")
-
-    def _compile_cpu_aot(self, mlir: str) -> _CpuAotKernel:
-        assert _native_runtime is not None
-        root = Path(tempfile.mkdtemp(prefix="vernon_cpu_kernel_"))
-        mlir_path = root / "kernel.mlir"
-        bundle_path = root / "bundle"
-        mlir_path.write_text(mlir, encoding="utf-8", newline="\n")
-        command = [
-            str(self._native_compiler_path()), "--target", "cpu",
-            str(mlir_path), "--compute-bundle",
-            str(bundle_path), "--host-runtime-bundle"
-        ]
-        try:
-            result = subprocess.run(command,
-                                    capture_output=True,
-                                    text=True,
-                                    encoding="utf-8",
-                                    errors="replace",
-                                    check=False)
-            if result.returncode != 0:
-                diagnostics = result.stderr.strip() or result.stdout.strip()
-                raise RuntimeError(
-                    f"CPU AOT compilation failed for {self._entry}: {diagnostics}"
+        if cached is None:
+            assert target is not None
+            program = _native.Compiler().compile_program_result(
+                frontend.mlir, target, **target_options.native_options)
+            if not program.ok:
+                raise RuntimeError(program.diagnostics)
+            cached = _CompiledKernel(
+                frontend.mlir,
+                specialized_function,
+                builtins,
+                self._writable_parameters(specialized_function),
+                program,
+            )
+            self._cache[key] = cached
+            self.compile_count += 1
+        if (cached.native is None
+                or cached.native_generation != _runtime_generation):
+            if _architecture == cpu:
+                cached.native = _native_runtime.load_cpu_entry(
+                    cached.program, self._entry)
+            else:
+                if len(cached.program.artifacts) != 1:
+                    raise RuntimeError(
+                        "kernel compilation must produce exactly one artifact")
+                cached.native = _native_runtime.load(
+                    cached.program.artifacts[0][1],
+                    cached.program.reflection,
+                    self._entry,
                 )
-            native = _native_runtime.load_compute_bundle(str(bundle_path))
-            return _CpuAotKernel(native, root)
-        except BaseException:
-            shutil.rmtree(root, ignore_errors=True)
-            raise
+            cached.native_generation = _runtime_generation
+        return cached
 
     def __call__(
         self,
@@ -875,13 +782,26 @@ class _ReflectedOutput:
     type_name: str
 
 
-@dataclass(frozen=True)
+@dataclass
 class _CompiledPipeline:
     native: Any
     parameters: tuple[_ReflectedParameter, ...]
     outputs: tuple[_ReflectedOutput, ...]
     key: str
     slots: Mapping[str, int]
+    bundle: bytes
+    target_identity: str
+    native_generation: int
+
+
+@dataclass(frozen=True)
+class _PipelineStageRequest:
+    frontend: FrontendCompileResult
+    module: str
+    module_manifest: str
+    entry: str
+    target: TargetOptions
+    native_target: Any
 
 
 def _annotation_parts(value: Any) -> tuple[Any, tuple[Annotation, ...]]:
@@ -890,15 +810,6 @@ def _annotation_parts(value: Any) -> tuple[Any, tuple[Annotation, ...]]:
         return arguments[0], tuple(item for item in arguments[1:]
                                    if isinstance(item, Annotation))
     return value, ()
-
-
-def _reflection_shape(type_name: str) -> tuple[int, ...]:
-    if not type_name.startswith("tensor<") or not type_name.endswith(">"):
-        return ()
-    dimensions = type_name[7:-1].split("x")[:-1]
-    if not all(value.isdigit() for value in dimensions):
-        return ()
-    return tuple(int(value) for value in dimensions)
 
 
 class Pipeline:
@@ -927,34 +838,63 @@ class Pipeline:
         self.compile_count = 0
 
     @staticmethod
-    def _entry(reflection: str, entry_name: str) -> dict[str, Any]:
-        document = json.loads(reflection)
-        for entry in document.get("entries", ()):
-            if entry.get("name") == entry_name:
-                return entry
-        raise RuntimeError(f"compiler reflection has no entry {entry_name!r}")
-
-    @staticmethod
-    def _parameter(stage: str, entry: str,
-                   row: Mapping[str, Any]) -> _ReflectedParameter | None:
-        if "vernon.builtin" in row:
-            return None
-        name = row.get("vernon.source_name")
-        interface = row.get("vernon.interface")
-        if not isinstance(name, str) or not isinstance(interface, str):
-            raise RuntimeError(
-                "graphics reflection is missing source metadata")
-        location = row.get("vernon.location")
+    def _planned_parameter(row: Mapping[str, Any]) -> _ReflectedParameter:
+        uses = row.get("uses")
+        if not isinstance(uses, list) or not uses:
+            raise RuntimeError("planned pipeline parameter has no stage uses")
+        use = next((value for value in uses
+                    if value.get("stage") != "compute"), uses[0])
+        location = use.get("vernon.location")
         return _ReflectedParameter(
-            stage,
-            entry,
-            name,
-            int(row["index"]),
-            interface,
+            str(use["stage"]),
+            str(use["entry"]),
+            str(row["name"]),
+            int(use["index"]),
+            str(use["interface"]),
             int(location) if location is not None else None,
-            int(row.get("vernon.instance_divisor", 0)),
-            _reflection_shape(str(row["type"])),
-            bool(row.get("vernon.varying", False)),
+            int(use.get("vernon.instance_divisor", 0)),
+            tuple(int(value) for value in use.get("shape", ())),
+            False,
+        )
+
+    def _stage_request(
+        self,
+        stage_value: Any,
+        call_arguments: Mapping[str, Any],
+        target: TargetOptions,
+        native_target: Any,
+    ) -> _PipelineStageRequest:
+        function = getattr(stage_value, "_function",
+                           getattr(stage_value, "function", None))
+        if function is None:
+            raise RuntimeError("pipeline stage has no Python function")
+        entry = function.__name__
+        path = Path(inspect.getsourcefile(function) or "").resolve()
+        if stage_value is self._compute:
+            signature = inspect.signature(self._compute._function)
+            hints = get_type_hints(self._compute._function,
+                                   include_extras=True)
+            values = []
+            for parameter in signature.parameters.values():
+                _, metadata = _annotation_parts(hints[parameter.name])
+                if any(item.kind == "builtin" for item in metadata):
+                    continue
+                if parameter.name not in call_arguments:
+                    raise TypeError(
+                        f"missing pipeline argument {parameter.name!r}")
+                values.append(call_arguments[parameter.name])
+            frontend, _, _, _ = self._compute._lower(
+                tuple(values), self._features)
+        else:
+            frontend = Compiler().compile_request(
+                FrontendCompileRequest(path, entry, self._features))
+        return _PipelineStageRequest(
+            frontend,
+            f"python/{path.stem}",
+            canonical_json(frontend.semantic_inputs),
+            entry,
+            target,
+            native_target,
         )
 
     def _compile_pipeline_bundle(
@@ -962,217 +902,97 @@ class Pipeline:
         if _native is None or _native_runtime is None:
             raise RuntimeError("graphics requires the native pipeline runtime")
         targets = {
-            vulkan: (_native.Target.VULKAN, "vulkan", 0),
-            opengl: (_native.Target.OPENGL, "opengl", 330),
-            opengles: (_native.Target.OPENGL_ES, "opengles", 310),
+            vulkan: (_native.Target.VULKAN, "vulkan"),
+            opengl: (_native.Target.OPENGL, "opengl"),
+            opengles: (_native.Target.OPENGL_ES, "opengles"),
         }
-        native_target, target_name, glsl_version = targets[_architecture]
+        native_target, target_name = targets[_architecture]
+        target_options = TargetOptions(
+            target_name, {
+                "glsl_version": _interactive_glsl_version()
+            } if _architecture in {opengl, opengles} else {})
         stage_values = ([self._compute] if self._compute is not None else
                         []) + [self._vertex, self._fragment]
-        compiled_stages: list[dict[str, Any]] = []
+        requests = [
+            self._stage_request(stage, call_arguments, target_options,
+                                native_target) for stage in stage_values
+        ]
+        compiled_stages: list[CompiledStage] = []
         native_compiler = _native.Compiler()
-        for stage_value in stage_values:
-            function = getattr(stage_value, "_function",
-                               getattr(stage_value, "function", None))
-            if function is None:
-                raise RuntimeError("pipeline stage has no Python function")
-            entry_name = function.__name__
-            path = Path(inspect.getsourcefile(function) or "")
-            if stage_value is self._compute:
-                signature = inspect.signature(self._compute._function)
-                hints = get_type_hints(self._compute._function,
-                                       include_extras=True)
-                values = []
-                for parameter in signature.parameters.values():
-                    _, metadata = _annotation_parts(hints[parameter.name])
-                    if any(item.kind == "builtin" for item in metadata):
-                        continue
-                    if parameter.name not in call_arguments:
-                        raise TypeError(
-                            f"missing pipeline argument {parameter.name!r}")
-                    values.append(call_arguments[parameter.name])
-                mlir, _, _, _, _ = self._compute._lower(
-                    tuple(values), self._features)
-            else:
-                mlir = Compiler().compile_file(path,
-                                               features=self._features,
-                                               entry=entry_name)
-            artifacts, reflection_text = native_compiler.compile_program(
-                mlir, native_target, glsl_version)
-            reflection = json.loads(reflection_text)
-            entry = self._entry(reflection_text, entry_name)
-            artifact_rows = [
-                row for row in reflection.get("artifacts", ())
-                if row.get("entry_point") == entry_name
-                and row.get("stage") == entry["stage"]
-            ]
-            if len(artifact_rows) != 1:
-                raise RuntimeError(
-                    f"compiler reflection has no unique {entry['stage']} artifact"
-                )
-            reflected_filename = artifact_rows[0].get("filename")
-            matches = [(name, bytes(data)) for name, data in artifacts
-                       if name == reflected_filename]
-            if len(matches) != 1:
-                raise RuntimeError(
-                    f"compiler produced no unique {entry['stage']} artifact")
-            artifact_name, artifact = matches[0]
-            stage_id = hashlib.sha256((entry_name + entry["stage"] +
-                                       reflection_text).encode("utf-8") +
-                                      artifact).hexdigest()
-            record = {
-                "id": stage_id,
-                "entry": entry_name,
-                "stage": entry["stage"],
-                "target": target_name,
-                "format": artifact_rows[0].get("format"),
-                "filename": artifact_name,
-                "reflection": reflection,
-            }
-            compiled_stages.append({
-                "id": stage_id,
-                "entry": entry,
-                "record": record,
-                "artifact": artifact,
-                "mlir": mlir,
-                "reflection": reflection_text,
-                "path": str(path.resolve()),
-            })
+        for request in requests:
+            program = native_compiler.compile_program_result(
+                request.frontend.mlir,
+                request.native_target,
+                **request.target.native_options,
+            )
+            try:
+                compiled_stages.append(
+                    compiled_stage_from_program(
+                        program,
+                        module=request.module,
+                        module_manifest=request.module_manifest,
+                        entry=request.entry,
+                        target=request.target,
+                    ))
+            except PipelineCompileError as error:
+                raise RuntimeError(str(error)) from None
 
-        uses_by_name: dict[str, list[dict[str, Any]]] = {}
-        reflected_parameters: list[_ReflectedParameter] = []
-        for stage in compiled_stages:
-            entry = stage["entry"]
-            for row in entry.get("arguments", ()):
-                parameter = self._parameter(entry["stage"], entry["name"], row)
-                if parameter is None:
-                    continue
-                reflected_parameters.append(parameter)
-                if parameter.varying:
-                    continue
-                inferred_dtype, inferred_shape = _dtype_and_shape(
-                    row.get("type"))
-                use = {
-                    "stage": entry["stage"],
-                    "entry": entry["name"],
-                    "index": int(row["index"]),
-                    "kind": row.get("kind", "scalar"),
-                    "type": row.get("type"),
-                    "dtype": (row.get("dtype") or row.get("vernon.dtype")
-                              or inferred_dtype),
-                    "shape": row.get("shape", inferred_shape),
-                    "interface": row["vernon.interface"],
-                    "access": row.get("access", "read"),
-                }
-                for name in ("vernon.location", "vernon.instance_divisor",
-                             "vernon.set", "vernon.binding"):
-                    if name in row:
-                        use[name] = row[name]
-                uses_by_name.setdefault(parameter.name, []).append(use)
-
-        slots = {name: slot for slot, name in enumerate(sorted(uses_by_name))}
-        parameter_rows = []
-        for name in sorted(uses_by_name):
-            uses = uses_by_name[name]
-            first = uses[0]
-            kinds = {
-                "inline" if use["interface"] == "uniform" or
-                (use["stage"] == "compute"
-                 and use["kind"] not in {"tensor", "texture"}) else
-                ("texture" if use["kind"] == "texture" else "tensor")
-                for use in uses
-            }
-            if len(kinds) != 1:
-                raise TypeError(f"incompatible pipeline parameter {name!r}")
-            accesses = {str(use.get("access", "read")) for use in uses}
-            access = ("read_write" if "read_write" in accesses or accesses
-                      == {"read", "write"} else next(iter(accesses)))
-            parameter_rows.append({
-                "name": name,
-                "slot": slots[name],
-                "kind": next(iter(kinds)),
-                "type": first.get("type"),
-                "dtype": first.get("dtype"),
-                "shape": first.get("shape", []),
-                "access": access,
-                "uses": uses,
-            })
-
-        stage_by_kind = {
-            stage["entry"]["stage"]: stage
+        pipeline_id = "interactive/" + hashlib.sha256(canonical_json({
+            "stages": [stage.id for stage in compiled_stages],
+            "features": self._features,
+            "target": target_name,
+            "target_options": dict(target_options.options),
+        }).encode("utf-8")).hexdigest()
+        planned_by_kind = {
+            stage.stage: stage
             for stage in compiled_stages
         }
-        fragment_entry = stage_by_kind["fragment"]["entry"]
-        outputs = tuple(
-            _ReflectedOutput(row.get("vernon.source_name"),
-                             int(row["vernon.location"]), str(row["type"]))
-            for row in fragment_entry.get("results", ())
-            if "vernon.location" in row)
-        steps = []
-        if "compute" in stage_by_kind:
-            steps.append({
-                "kind": "dispatch",
-                "stage": stage_by_kind["compute"]["id"],
-            })
-            steps.append({
-                "kind": "barrier",
-                "source": "compute_write",
-                "destination": "vertex_read",
-            })
-        steps.append({
-            "kind": "draw",
-            "vertex": stage_by_kind["vertex"]["id"],
-            "fragment": stage_by_kind["fragment"]["id"],
-        })
-        bundle = {
-            "schema_version":
-            2,
-            "invocation_abi_version":
-            1,
-            "type":
-            "pipeline",
-            "id":
-            "interactive/" + hashlib.sha256(
-                repr((tuple(stage["id"] for stage in compiled_stages),
-                      self._features)).encode("utf-8")).hexdigest(),
-            "target":
-            target_name,
-            "target_options": {},
-            "features":
-            list(self._features),
-            "variants": [{
-                "key":
-                list(self._features),
-                "parameters":
-                parameter_rows,
-                "outputs": [{
-                    "name": output.name or f"output_{output.location}",
-                    "kind": "texture",
-                    "dtype": _dtype_and_shape(output.type_name)[0],
-                    "shape": _dtype_and_shape(output.type_name)[1],
-                    "access": "write",
-                    "location": output.location,
-                    "type": output.type_name,
-                } for output in outputs],
-                "steps":
-                steps,
-            }],
-            "stage_artifacts": {
-                stage["id"]:
-                encode_runtime_stage(stage["record"], stage["artifact"])
-                for stage in compiled_stages
-            },
+        try:
+            plan = build_bundle_plan(
+                pipeline_id,
+                target_options,
+                self._features,
+                [(self._features, planned_by_kind)],
+            )
+            bundle = materialize_bundle(
+                plan, {
+                    stage.id: inline_artifact_descriptor(stage.artifact)
+                    for stage in compiled_stages
+                })
+        except PipelineCompileError as error:
+            raise TypeError(str(error)) from None
+        parameter_rows = plan.variants[0].parameters
+        slots = {
+            str(parameter["name"]): int(parameter["slot"])
+            for parameter in parameter_rows
         }
-        bundle_bytes = serialize_runtime_pipeline_bundle(bundle)
+        parameters = tuple(
+            self._planned_parameter(parameter)
+            for parameter in parameter_rows)
+        outputs = tuple(
+            _ReflectedOutput(
+                None if output.get("name") == f"output_{output['location']}"
+                else output.get("name"), int(output["location"]),
+                             str(output["type"]))
+            for output in plan.variants[0].outputs)
+        bundle_bytes = serialize_bundle(bundle)
         key = hashlib.sha256(bundle_bytes).hexdigest()
         cached = self._cache.get(key)
         if cached is None:
             native = _native_runtime.load_pipeline(bundle_bytes,
                                                    list(self._features))
-            cached = _CompiledPipeline(native, tuple(reflected_parameters),
-                                       outputs, key, slots)
+            cached = _CompiledPipeline(
+                native, parameters, outputs, key, slots, bundle_bytes,
+                canonical_json({
+                    "target": target_name,
+                    "target_options": dict(target_options.options),
+                }), _runtime_generation)
             self._cache[key] = cached
             self.compile_count += 1
+        elif cached.native_generation != _runtime_generation:
+            cached.native = _native_runtime.load_pipeline(
+                cached.bundle, list(self._features))
+            cached.native_generation = _runtime_generation
         self._compiled = cached
         self._compiled_generation = _runtime_generation
         return cached
@@ -1185,6 +1005,20 @@ class Pipeline:
                 and self._compiled_generation == _runtime_generation):
             return self._compiled
         if _architecture in {vulkan, opengl, opengles}:
+            target_identity = canonical_json({
+                "target": _architecture.name,
+                "target_options": ({
+                    "glsl_version": _interactive_glsl_version()
+                } if _architecture in {opengl, opengles} else {}),
+            })
+            if (self._compiled is not None
+                    and self._compiled.target_identity == target_identity):
+                assert _native_runtime is not None
+                self._compiled.native = _native_runtime.load_pipeline(
+                    self._compiled.bundle, list(self._features))
+                self._compiled.native_generation = _runtime_generation
+                self._compiled_generation = _runtime_generation
+                return self._compiled
             return self._compile_pipeline_bundle(call_arguments or {})
         if _architecture == cpu:
             raise RuntimeError(
@@ -1200,22 +1034,9 @@ class Pipeline:
         if target is not None and targets is not None:
             raise TypeError("pipeline call cannot use both target and targets")
         compiled = self._compile(arguments)
-        uses_pipeline_runtime = _architecture in {vulkan, opengl, opengles}
-
         host_parameters = [
             value for value in compiled.parameters if not value.varying
         ]
-        if uses_pipeline_runtime:
-            merged_parameters: dict[str, _ReflectedParameter] = {}
-            for value in host_parameters:
-                previous = merged_parameters.get(value.name)
-                if previous is None or previous.stage == "compute":
-                    merged_parameters[value.name] = value
-            host_parameters = [
-                merged_parameters[name]
-                for name in sorted(merged_parameters,
-                                   key=lambda name: compiled.slots[name])
-            ]
         expected = {value.name for value in host_parameters}
         compute_names: set[str] = set()
         if self._compute is not None:
@@ -1237,8 +1058,6 @@ class Pipeline:
                 f"unexpected pipeline argument(s): {', '.join(sorted(unexpected))}"
             )
 
-        bindings: list[tuple[Any, ...]] = []
-        uniforms: list[tuple[str, bytes, int]] = []
         pipeline_arguments: list[tuple[Any, ...]] = []
         vertex_count: int | None = None
         instance_count: int | None = None
@@ -1254,17 +1073,12 @@ class Pipeline:
                     raise ValueError(
                         f"uniform {parameter.name!r} has incompatible dtype or shape"
                     )
-                uniforms.append(
-                    (f"{parameter.entry}_arg_{parameter.index}._m0",
-                     values.tobytes(order="C"), parameter.components))
-                if uses_pipeline_runtime:
-                    pipeline_arguments.append(
-                        ("inline", compiled.slots[parameter.name],
-                         _native.DATA_F32, values.tobytes(order="C"),
-                         list(values.shape)))
+                pipeline_arguments.append(
+                    ("inline", compiled.slots[parameter.name],
+                     _native.DATA_F32, values.tobytes(order="C"),
+                     list(values.shape)))
                 continue
-            if uses_pipeline_runtime and not isinstance(
-                    value, (Tensor, TensorView)):
+            if not isinstance(value, (Tensor, TensorView)):
                 scalar = np.asarray(value)
                 if scalar.dtype.kind == "f":
                     scalar = np.asarray(value, dtype=np.float32)
@@ -1282,7 +1096,7 @@ class Pipeline:
             if not isinstance(value, (Tensor, TensorView)):
                 raise TypeError(
                     f"pipeline argument {parameter.name!r} must be a Tensor")
-            if uses_pipeline_runtime and parameter.stage == "compute":
+            if parameter.stage == "compute":
                 dtype = {
                     np.dtype(np.float32): _native.DATA_F32,
                     np.dtype(np.uint32): _native.DATA_U32,
@@ -1306,13 +1120,6 @@ class Pipeline:
                 raise ValueError(
                     f"pipeline argument {parameter.name!r} has incompatible shape"
                 )
-            if parameter.location is None:
-                raise RuntimeError(
-                    f"vertex input {parameter.name!r} has no location")
-            if parameter.divisor not in {0, 1}:
-                raise RuntimeError(
-                    "OpenGL runtime currently supports instance divisor 1 only"
-                )
             count = value.shape[0]
             if parameter.divisor:
                 if instance_count is not None and instance_count != count:
@@ -1325,34 +1132,20 @@ class Pipeline:
                         "all vertex inputs must share a leading dimension")
                 vertex_count = count
             layout = value.layout
-            stride = layout.byte_strides[0]
             buffer = value._resident_buffer()
-            if uses_pipeline_runtime:
-                dtype = {
-                    np.dtype(np.float32): _native.DATA_F32,
-                    np.dtype(np.uint32): _native.DATA_U32,
-                    np.dtype(np.int32): _native.DATA_I32,
-                    np.dtype(np.float64): _native.DATA_F64,
-                }.get(value.dtype)
-                if dtype is None:
-                    raise TypeError(
-                        f"Vulkan pipeline does not support dtype {value.dtype}"
-                    )
-                pipeline_arguments.append(
-                    ("tensor", compiled.slots[parameter.name], buffer, dtype,
-                     _native.ACCESS_READ_WRITE, list(value.shape),
-                     list(layout.byte_strides), layout.byte_offset))
-            if len(parameter.value_shape) == 2:
-                columns, rows = parameter.value_shape
-                for column in range(columns):
-                    bindings.append(
-                        (parameter.location + column, buffer, rows, stride,
-                         layout.byte_offset + column * rows * 4,
-                         parameter.divisor))
-            else:
-                bindings.append(
-                    (parameter.location, buffer, parameter.components, stride,
-                     layout.byte_offset, parameter.divisor))
+            dtype = {
+                np.dtype(np.float32): _native.DATA_F32,
+                np.dtype(np.uint32): _native.DATA_U32,
+                np.dtype(np.int32): _native.DATA_I32,
+                np.dtype(np.float64): _native.DATA_F64,
+            }.get(value.dtype)
+            if dtype is None:
+                raise TypeError(
+                    f"Vulkan pipeline does not support dtype {value.dtype}")
+            pipeline_arguments.append(
+                ("tensor", compiled.slots[parameter.name], buffer, dtype,
+                 _native.ACCESS_READ_WRITE, list(value.shape),
+                 list(layout.byte_strides), layout.byte_offset))
         if vertex_count is None:
             raise ValueError("pipeline requires at least one vertex input")
 
@@ -1412,26 +1205,25 @@ class Pipeline:
             native_target = target._resident_texture()
             rendered_targets.append(target)
 
-        if uses_pipeline_runtime:
-            native_topology = {
-                triangles: _native.TOPOLOGY_TRIANGLE_LIST,
-                lines: _native.TOPOLOGY_LINE_LIST,
-                points: _native.TOPOLOGY_POINT_LIST,
-            }[topology]
-            compiled.native.invoke(
-                pipeline_arguments,
-                native_index,
-                index_count,
-                0,
-                native_attachments
-                or ([(0, native_target)] if native_target is not None else []),
-                native_topology,
-                vertex_count,
-                instance_count or 1,
-            )
+        native_topology = {
+            triangles: _native.TOPOLOGY_TRIANGLE_LIST,
+            lines: _native.TOPOLOGY_LINE_LIST,
+            points: _native.TOPOLOGY_POINT_LIST,
+        }[topology]
+        compiled.native.invoke(
+            pipeline_arguments,
+            native_index,
+            index_count,
+            0,
+            native_attachments
+            or ([(0, native_target)] if native_target is not None else []),
+            native_topology,
+            vertex_count,
+            instance_count or 1,
+        )
         assert _native_runtime is not None
         _native_runtime.synchronize()
-        if uses_pipeline_runtime and self._compute is not None:
+        if self._compute is not None:
             for name in compute_names:
                 value = arguments.get(name)
                 if isinstance(value, Tensor):
@@ -1442,16 +1234,3 @@ class Pipeline:
 
 def pipeline(*stages: Any, features: Iterable[str] = ()) -> Pipeline:
     return Pipeline(*stages, features=features)
-
-
-class _CapturedConstantSpecializer(ast.NodeTransformer):
-
-    def __init__(self, globals_: dict[str, Any]):
-        self.globals = globals_
-
-    def visit_Name(self, node: ast.Name) -> ast.expr:
-        value = self.globals.get(node.id)
-        if isinstance(node.ctx, ast.Load) and isinstance(
-                value, (int, float, bool)):
-            return ast.copy_location(ast.Constant(value=value), node)
-        return node

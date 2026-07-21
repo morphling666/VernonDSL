@@ -1,6 +1,7 @@
 # Unified Pipeline Asset Plan
 
-Status: proposed; not started.
+Status: schema-2 production and shared planning implemented; compatibility
+retirement remains pending.
 
 This plan defines the cooked asset contract between VernonDSL and Vernon. It
 replaces backend-specific runtime packaging with one pipeline asset directory
@@ -90,6 +91,15 @@ Non-persistent Python interactive/JIT execution may retain inline artifacts
 because it has no durable asset directory. Inline and external descriptors use
 the same schema, but the cooker always emits external storage.
 
+Inline and external bundles are two storage policies over one logical
+`BundlePlan`. Stage IDs, reflection, parameter slots, variants, outputs, steps,
+and target options are identical for the same specialization. Comparisons may
+normalize only the artifact descriptor's storage fields (`storage`,
+`encoding`/`data`, or `path`); exact artifact size and SHA-256 remain semantic
+parity checks. A bundle `content_hash` covers its canonical JSON including the
+chosen storage descriptor, so an inline and external bundle normally have
+different valid content hashes even when they carry identical artifact bytes.
+
 ### Runtime ownership
 
 `PipelineProvider` and VernonRuntime are the only production consumers of
@@ -98,6 +108,28 @@ VernonDSL pipeline assets. Vernon must not parse backend artifact internals.
 `CompiledShaderBundle` and `shader.json` remain read-only compatibility paths
 during migration. `compute.json` remains a legacy single-kernel API and is not
 the production pipeline asset format.
+
+The native compiler owns compilation; VernonRuntime owns execution. Cooking,
+the C API, `_native.CompiledProgram`, and `vernon-compile` produce no runtime
+context. Interactive execution creates a context only after compilation and
+loads the resulting inline bundle. CPU JIT entry pointers are retained through
+the owning compile result; cooked CPU assets use external relocatable objects
+and never persist JIT pointers or ephemeral host libraries.
+
+`vernon-compile` remains a command-line compatibility and packaging adapter.
+The Python cooker calls the native compiler in process and never shells out to
+that executable.
+
+### Cache semantics
+
+The frontend cache key is the canonical specialization request plus transitive
+source dependency hashes. The cooker compiles each distinct specialized MLIR,
+entry, and target-option tuple once per cook, even when several variants
+produce that same stage. Compiled stage IDs use semantic compiler inputs and
+artifact SHA-256, not pipeline declaration text or inline/external storage.
+Artifacts are content-addressed and deduplicated by exact bytes. Bundle JSON is
+serialized canonically, and `content_hash` is SHA-256 of that canonical object
+with the `content_hash` member omitted.
 
 ## Pipeline schema 2
 

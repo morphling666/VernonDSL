@@ -156,12 +156,10 @@ values = output.to_numpy()
 
 All three compute backends lower the restricted Python AST to Vernon MLIR on
 the first specialized call, compile a target artifact, cache the loaded native
-kernel, and launch through `VernonRuntime`. CPU execution creates a temporary
-validated AOT compute bundle using `vernon-compile`: LLVM emits a host
-relocatable object and the embedded host LLD driver finalizes an ephemeral
-native library. Set `VERNON_COMPILER` when the compiler executable is not
-beside `_native`, in the checkout build directory, or on `PATH`. There is no
-external Clang or Python interpreter fallback for `@kernel`.
+kernel, and launch through `VernonRuntime`. CPU execution retains the owning
+in-process compiler result and loads its JIT entry directly into the runtime;
+`@kernel` does not invoke a compiler subprocess or create a temporary compute
+bundle.
 
 `VERNON_ENABLE_RUNTIME` builds the standalone `VernonRuntime` C API with CPU
 AOT execution. `VERNON_ENABLE_CUDA_RUNTIME` dynamically loads the
@@ -290,13 +288,11 @@ mesh_asset = vd.pipeline_asset(
 )
 ```
 
-Cook the named declaration with the external host tool:
+Cook the named declaration in process:
 
 ```powershell
 uv run --frozen vernon-cook-shader `
   examples/variant_mesh.py:mesh_asset `
-  --asset-root examples `
-  --compiler build/source/Release/vernon-compile.exe `
   --target opengl `
   -o build/variant_mesh_asset
 ```
@@ -306,8 +302,6 @@ For a CPU pipeline declaration, use the same cooker with `--target cpu`:
 ```powershell
 uv run --frozen vernon-cook-shader `
   python/tests/pipeline_asset_fixture.py:scale_asset `
-  --asset-root . `
-  --compiler build/source/Release/vernon-compile.exe `
   --target cpu `
   -o build/cpu_scale
 ```
@@ -321,9 +315,6 @@ The resulting `variant_mesh_asset.pipeline.json` maps exact canonical feature
 keys to shared stage artifacts. For the four `INSTANCE`/`SKIN` combinations,
 four specialized vertex files share one unchanged fragment file by content
 hash. Vernon rejects missing variants rather than falling back.
-
-The older `*.shader-module.json` plus `*.shader-pipeline.json` authoring format
-remains readable for migration, but new assets should use `pipeline_asset`.
 
 `feature("NAME")`, `When[FEATURE, T]`, `if FEATURE`, and `if not FEATURE` are
 specialized before type checking. Interface locations are inferred from

@@ -49,6 +49,34 @@ executing user code and emits textual MLIR. The C API accepts that MLIR,
 validates it, emits reflection, and invokes an available target pipeline. It
 does not embed CPython.
 
+### Unified compilation surfaces
+
+There is one Python AST-to-MLIR frontend (`FrontendCompileRequest`) and one
+native compiler implementation behind the stable C API. Interactive
+`Kernel`/`Pipeline`, the owning `_native.CompiledProgram`, `vernon-compile`,
+and `vernon-cook-shader` must pass the same specialized MLIR and target options
+to that C API; none may carry an independent lowering or reflection path.
+`vernon-compile` is a compatibility and file-packaging shell over the C API,
+not an internal compiler service. Python runtime and cooker code must never
+invoke it as a subprocess.
+
+Compilation stops at owned artifacts, reflection, and optional CPU JIT entry
+points. Creating a runtime context, loading a pipeline, and dispatching work
+are separate execution operations. Offline compilation and cooking therefore
+must not create CPU, CUDA, Vulkan, or OpenGL runtime contexts. The CPU JIT is
+in-process reference execution only: an entry pointer remains valid for the
+lifetime of its owning compile result, and a loaded runtime kernel retains
+that result. Relocatable objects remain the persistent CPU format.
+
+Stage cache identity is derived from the semantic module ID, entry, stage,
+target options, reflected dependencies and interface, and exact artifact
+digest. Pipeline-declaration serialization is deliberately excluded: changing
+asset packaging without changing the specialized program must not create a
+different stage. Frontend specialization caches include source dependency
+hashes, enabled features, captured constants, runtime tensor shapes, and
+workgroup size. Cache hits must preserve byte-identical artifacts and canonical
+reflection; content changes must invalidate the corresponding key.
+
 ## Pipeline asset declarations
 
 Persistent pipeline composition is declared with a module-level
@@ -164,11 +192,33 @@ code and gives interactive and cooked compilation the same call-graph rules.
 SPIR-V locations are the canonical vertex-output/fragment-input linkage.
 SPIRV-Cross normally derives GLSL identifiers from each entry point, but Vernon
 compiles interactive pipeline stages separately and GLSL 3.30 links varyings
-by identifier. Before GLSL emission, Vernon therefore renames located vertex
-outputs and fragment inputs to `vernon_location_N`. Vertex inputs, fragment
-outputs, and builtins remain untouched to avoid same-stage identifier
-collisions. This preserves location-based DSL semantics without requiring
-GLSL 4.30 explicit varying-location qualifiers.
+by identifier. Vernon therefore uses the sanitized source-derived vertex
+output name for both sides of each located varying. Other interfaces retain
+their source names; module-wide SPIR-V symbol collisions receive a deterministic
+stage suffix. This preserves location-based linkage without discarding author
+names or requiring GLSL 4.30 varying-location qualifiers.
+
+Value-yielding graphics `scf.if` lowers to a structured SPIR-V selection with
+explicit header, branch, and merge blocks. Function-local result slots carry
+yielded values across the merge, matching MLIR's standard SCF-to-SPIR-V
+strategy while allowing nested straight-line selection regions.
+
+## Sampled-resource provenance
+
+Reflection analyzes an inlined clone of validated typed MLIR, leaving the
+canonical reflected artifact and module hash unchanged. A forward fixed-point
+analysis traces texture and sampler values through casts, selects, SCF
+conditionals and loop-carried arguments, and supported CFG branches back to
+entry arguments. Unresolved provenance is invalid instead of producing
+incomplete runtime metadata.
+
+Sampler reflection is a relation from one sampler argument to every sampled
+texture descriptor binding it can reach. OpenGL binds that sampler object to
+each corresponding texture unit, and Vulkan writes it into each corresponding
+combined-image descriptor. The current SPIR-V representation stores the
+sampled image at the texture binding and does not dynamically select a sampler;
+therefore one texture binding reaching multiple sampler entry arguments is
+rejected during reflection.
 
 ## Asset integration status and remaining work
 

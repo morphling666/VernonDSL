@@ -1,22 +1,38 @@
 from __future__ import annotations
 
 import ast
-import base64
 import hashlib
 import json
-import subprocess
-import tempfile
+import keyword
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from .compiler import compile_file
 from .module_graph import load_project
+from .pipeline_compile import (
+    CompiledArtifact,
+    CompiledStage,
+    PipelineCompileError,
+    TargetOptions,
+    build_bundle_plan,
+    canonical_json,
+    compiled_stage_from_program,
+    dtype_and_shape,
+    external_parameters,
+    fragment_outputs,
+    inline_artifact_descriptor,
+    interface_by_location,
+    materialize_bundle,
+    merge_parameter_uses,
+    serialize_bundle,
+    validate_graphics_interfaces,
+    with_content_hash,
+)
 from .types import Feature
 
 
-class ShaderAssetError(ValueError):
-    pass
+ShaderAssetError = PipelineCompileError
 
 
 @dataclass(frozen=True)
@@ -79,22 +95,15 @@ class ShaderPipelineDescriptor:
     targets: dict[str, dict[str, Any]]
     manifest_path: Path
     canonical_manifest: str
-    modules: dict[str, ShaderModuleDescriptor] | None = None
+    modules: dict[str, ShaderModuleDescriptor]
 
 
 def _canonical_json(value: Any) -> str:
-    return json.dumps(value,
-                      sort_keys=True,
-                      separators=(",", ":"),
-                      ensure_ascii=False)
+    return canonical_json(value)
 
 
 def _with_content_hash(document: dict[str, Any]) -> dict[str, Any]:
-    result = dict(document)
-    result.pop("content_hash", None)
-    result["content_hash"] = hashlib.sha256(
-        _canonical_json(result).encode("utf-8")).hexdigest()
-    return result
+    return with_content_hash(document)
 
 
 def encode_runtime_stage(record: dict[str, Any],
@@ -102,29 +111,15 @@ def encode_runtime_stage(record: dict[str, Any],
     artifact_format = record.get("format")
     if not isinstance(artifact_format, str) or not artifact_format:
         raise ShaderAssetError("runtime stage artifact format is missing")
-    digest = hashlib.sha256(artifact).hexdigest()
-    encoding = "base64" if artifact_format == "spirv" else "utf8"
-    try:
-        data = (base64.b64encode(artifact).decode("ascii")
-                if encoding == "base64" else artifact.decode("utf-8"))
-    except UnicodeDecodeError:
-        raise ShaderAssetError(
-            f"{artifact_format} runtime artifact is not UTF-8") from None
     return {
         **record,
-        "artifact": {
-            "format": artifact_format,
-            "storage": "inline",
-            "encoding": encoding,
-            "data": data,
-            "size": len(artifact),
-            "sha256": digest,
-        },
+        "artifact": inline_artifact_descriptor(
+            CompiledArtifact(artifact_format, artifact)),
     }
 
 
 def serialize_runtime_pipeline_bundle(bundle: dict[str, Any]) -> bytes:
-    return (_canonical_json(_with_content_hash(bundle)) + "\n").encode("utf-8")
+    return serialize_bundle(bundle)
 
 
 def _artifact_extension(artifact_format: str, stage: str,
@@ -178,17 +173,6 @@ def _write_external_artifact(output: Path, artifact: bytes,
     }
 
 
-def _read_manifest(path: Path) -> dict[str, Any]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ShaderAssetError(
-            f"cannot read shader manifest {path}: {error}") from None
-    if not isinstance(value, dict):
-        raise ShaderAssetError(f"shader manifest must be an object: {path}")
-    return value
-
-
 def _call_name(node: ast.expr) -> str:
     if isinstance(node, ast.Name):
         return node.id
@@ -198,17 +182,20 @@ def _call_name(node: ast.expr) -> str:
     return ""
 
 
-def _pipeline_source_reference(
-        value: str | Path) -> tuple[Path, str] | None:
+def _pipeline_asset_reference(value: str | Path) -> tuple[Path, str]:
     spelling = str(value)
     marker = spelling.rfind(".py:")
     if marker < 0:
-        return None
+        raise ShaderAssetError(
+            "pipeline asset input must be a Python descriptor reference "
+            "in source.py:descriptor_name form")
     source = Path(spelling[:marker + 3]).resolve()
     descriptor_name = spelling[marker + 4:]
-    if not descriptor_name:
+    if (not descriptor_name or not descriptor_name.isidentifier()
+            or keyword.iskeyword(descriptor_name)):
         raise ShaderAssetError(
-            "Python pipeline asset reference requires a descriptor name")
+            "pipeline asset reference requires a valid Python descriptor name "
+            "after source.py:")
     return source, descriptor_name
 
 
@@ -435,473 +422,154 @@ def parse_python_pipeline_asset(
     )
 
 
-def parse_shader_module_manifest(path: str | Path) -> ShaderModuleDescriptor:
-    manifest_path = Path(path).resolve()
-    value = _read_manifest(manifest_path)
-    if value.get("schema_version") != 1 or value.get(
-            "type") != "shader_module":
+def _native_module() -> Any:
+    # Runtime owns native-module discovery so interactive and offline compilation
+    # select the same packaged extension and development-build fallback.
+    from . import runtime
+
+    if runtime._native is None:
         raise ShaderAssetError(
-            f"invalid shader-module manifest header: {manifest_path}")
-    module_id = value.get("id")
-    source = value.get("source")
-    if not isinstance(module_id, str) or not module_id or not isinstance(
-            source, str) or not source:
-        raise ShaderAssetError(
-            f"shader-module manifest requires id and source: {manifest_path}")
-    source_path = (manifest_path.parent / source).resolve()
+            "shader cooking requires vernon_dsl._native; build the native "
+            "extension or install a wheel containing it")
+    return runtime._native
+
+
+def _native_target(native: Any, target: str) -> Any:
+    targets = {
+        "cpu": native.Target.CPU,
+        "cuda": native.Target.CUDA,
+        "vulkan": native.Target.VULKAN,
+        "metal": native.Target.METAL,
+        "opengl": native.Target.OPENGL,
+        "opengles": native.Target.OPENGL_ES,
+    }
     try:
-        source_path.relative_to(manifest_path.parent.resolve())
-    except ValueError:
+        return targets[target]
+    except KeyError:
         raise ShaderAssetError(
-            f"shader module source escapes its manifest directory: {source}"
+            f"target '{target}' is not available through the native compiler"
         ) from None
-    if not source_path.is_file():
-        raise ShaderAssetError(
-            f"shader module source does not exist: {source}")
-    return ShaderModuleDescriptor(module_id, source_path, manifest_path,
-                                  _canonical_json(value))
 
 
-def parse_shader_pipeline_manifest(
-        path: str | Path) -> ShaderPipelineDescriptor:
-    source_reference = _pipeline_source_reference(path)
-    if source_reference is not None:
-        return parse_python_pipeline_asset(*source_reference)
-    manifest_path = Path(path).resolve()
-    value = _read_manifest(manifest_path)
-    if value.get("schema_version") != 1 or value.get(
-            "type") != "shader_pipeline":
-        raise ShaderAssetError(
-            f"invalid shader-pipeline manifest header: {manifest_path}")
-    pipeline_id = value.get("id")
-    raw_stages = value.get("stages")
-    raw_variants = value.get("variants")
-    targets = value.get("targets")
-    if not isinstance(pipeline_id, str) or not pipeline_id:
-        raise ShaderAssetError("shader pipeline id must be a non-empty string")
-    if not isinstance(raw_stages, dict) or not isinstance(
-            raw_variants, dict) or not isinstance(targets, dict):
-        raise ShaderAssetError(
-            "shader pipeline requires stages, variants, and targets")
-    stage_names = set(raw_stages)
-    graphics = stage_names == {"vertex", "fragment"}
-    compute = stage_names == {"compute"}
-    compute_graphics = stage_names == {"compute", "vertex", "fragment"}
-    if not graphics and not compute and not compute_graphics:
-        raise ShaderAssetError(
-            "pipeline must contain vertex+fragment, compute+vertex+fragment, "
-            "or one compute stage")
-    stages: dict[str, ShaderStageReference] = {}
-    for stage, reference in raw_stages.items():
-        if not isinstance(reference, dict) or not isinstance(
-                reference.get("module"), str) or not isinstance(
-                    reference.get("entry"), str):
-            raise ShaderAssetError(f"invalid {stage} stage reference")
-        stages[stage] = ShaderStageReference(reference["module"],
-                                             reference["entry"])
-    include = raw_variants.get("include")
-    max_variants = raw_variants.get("max_variants", 16)
-    if not isinstance(include, list) or not isinstance(
-            max_variants, int) or max_variants <= 0:
-        raise ShaderAssetError(
-            "variants.include and a positive max_variants are required")
-    if len(include) > max_variants:
-        raise ShaderAssetError(
-            f"pipeline declares {len(include)} variants, exceeding cap {max_variants}"
-        )
-    variants: list[tuple[str, ...]] = []
-    seen: set[tuple[str, ...]] = set()
-    for raw_key in include:
-        if not isinstance(raw_key, list) or any(
-                not isinstance(name, str) or not name for name in raw_key):
-            raise ShaderAssetError(
-                "each included variant must be a list of feature names")
-        key = tuple(sorted(set(raw_key)))
-        if len(key) != len(raw_key) or key in seen:
-            raise ShaderAssetError(
-                f"duplicate or non-canonical variant: {raw_key}")
-        seen.add(key)
-        variants.append(key)
-    if not variants:
-        raise ShaderAssetError("pipeline must include at least one variant")
-    normalized_targets: dict[str, dict[str, Any]] = {}
-    for target, options in targets.items():
-        if not isinstance(target, str) or not isinstance(options, dict):
-            raise ShaderAssetError("pipeline target options must be objects")
-        normalized_targets[target] = options
-    return ShaderPipelineDescriptor(pipeline_id, stages, tuple(variants),
-                                    normalized_targets, manifest_path,
-                                    _canonical_json(value))
+def _cpu_object_format(filename: str, target_triple: str) -> str:
+    if Path(filename).suffix == ".obj":
+        return "coff"
+    normalized = target_triple.lower()
+    if "wasm" in normalized:
+        return "wasm"
+    if any(name in normalized
+           for name in ("apple", "darwin", "macos", "ios")):
+        return "macho"
+    return "elf"
 
 
-def discover_shader_modules(
-        asset_root: str | Path) -> dict[str, ShaderModuleDescriptor]:
-    root = Path(asset_root).resolve()
-    modules: dict[str, ShaderModuleDescriptor] = {}
-    for path in sorted(root.rglob("*.shader-module.json")):
-        descriptor = parse_shader_module_manifest(path)
-        if descriptor.id in modules:
-            raise ShaderAssetError(
-                f"duplicate shader module id: {descriptor.id}")
-        modules[descriptor.id] = descriptor
-    return modules
-
-
-def _entry_reflection(reflection: dict[str, Any],
-                      entry: str) -> dict[str, Any]:
-    matches = [
-        value for value in reflection.get("entries", [])
-        if isinstance(value, dict) and value.get("name") == entry
-    ]
-    if len(matches) != 1:
+def _cpu_stage_metadata(stage: CompiledStage) -> dict[str, Any]:
+    symbol = stage.interface.get("symbol")
+    reflected_options = stage.reflection.get("target_options")
+    if not isinstance(symbol, str) or not symbol:
         raise ShaderAssetError(
-            f"compiler reflection does not contain exactly one '{entry}' entry"
-        )
-    return matches[0]
+            f"CPU compiler reflection has no exported symbol for {stage.entry}")
+    if not isinstance(reflected_options, Mapping):
+        raise ShaderAssetError("CPU compiler reflection has no target options")
+    target_triple = reflected_options.get("target_triple")
+    if not isinstance(target_triple, str) or not target_triple:
+        raise ShaderAssetError(
+            "CPU compiler reflection has no normalized target triple")
+    metadata: dict[str, Any] = {
+        "symbol": symbol,
+        "cpu_invocation_abi_version": 1,
+        "target_triple": target_triple,
+        "object_format":
+        _cpu_object_format(stage.artifact.filename, target_triple),
+    }
+    for name in ("cpu", "cpu_features"):
+        value = reflected_options.get(name)
+        if isinstance(value, str):
+            metadata[name] = value
+    return metadata
 
 
 def _compile_stage(module: ShaderModuleDescriptor,
                    reference: ShaderStageReference, stage: str,
-                   variant: tuple[str,
-                                  ...], target: str, target_options: dict[str,
-                                                                          Any],
-                   compiler: Path, output: Path) -> tuple[str, dict[str, Any]]:
-    mlir = compile_file(module.source, features=variant, entry=reference.entry)
-    with tempfile.TemporaryDirectory(
-            prefix="vernon_shader_stage_") as directory:
-        temporary = Path(directory)
-        mlir_path = temporary / "stage.mlir"
-        artifact_directory = temporary / "artifacts"
-        mlir_path.write_text(mlir, encoding="utf-8", newline="\n")
-        command = [str(compiler), "--target", target, str(mlir_path)]
-        if target == "cpu":
-            command.extend(("--compute-bundle", str(artifact_directory)))
-            for option, flag in (("target_triple", "--target-triple"),
-                                 ("cpu", "--cpu"),
-                                 ("cpu_features", "--cpu-features")):
-                value = target_options.get(option)
-                if value is not None:
-                    if not isinstance(value, str) or not value:
-                        raise ShaderAssetError(
-                            f"{option} must be a non-empty string")
-                    command.extend((flag, value))
-        else:
-            command.extend(("--output-dir", str(artifact_directory)))
-        glsl_version = target_options.get("glsl_version", 0)
-        if glsl_version:
-            if not isinstance(glsl_version, int):
-                raise ShaderAssetError("glsl_version must be an integer")
-            command.extend(("--glsl-version", str(glsl_version)))
-        result = subprocess.run(command,
-                                capture_output=True,
-                                text=True,
-                                encoding="utf-8",
-                                errors="replace",
-                                check=False)
-        if result.returncode != 0:
-            diagnostics = result.stderr.strip() or result.stdout.strip()
+                   variant: tuple[str, ...], target: TargetOptions,
+                   compiler: Any, native_target: Any,
+                   mlir: str | None = None) -> CompiledStage:
+    if mlir is None:
+        mlir = compile_file(module.source,
+                            features=variant,
+                            entry=reference.entry)
+    program = compiler.compile_program_result(mlir, native_target,
+                                              **target.native_options)
+    compiled = compiled_stage_from_program(
+        program,
+        module=module.id,
+        module_manifest=module.canonical_manifest,
+        entry=reference.entry,
+        target=target,
+    )
+    if compiled.stage != stage:
+        raise ShaderAssetError(
+            f"compiler reflected {reference.entry} as {compiled.stage}, "
+            f"expected {stage}")
+    if target.target == "cpu":
+        compiled = CompiledStage(
+            compiled.module,
+            compiled.module_manifest,
+            compiled.entry,
+            compiled.stage,
+            compiled.target,
+            compiled.reflection,
+            compiled.interface,
+            compiled.artifact,
+            _cpu_stage_metadata(compiled),
+        )
+        if compiled.artifact.format != "relocatable_object":
             raise ShaderAssetError(
-                f"native compilation failed for {reference.entry}: {diagnostics}"
-            )
-        if target == "cpu":
-            manifest = _read_manifest(artifact_directory / "compute.json")
-            symbol = manifest.get("symbol")
-            artifact_name = manifest.get("artifact")
-            artifact_size = manifest.get("artifact_size")
-            artifact_sha256 = manifest.get("artifact_sha256")
-            operating_system = manifest.get("operating_system")
-            architecture = manifest.get("architecture")
-            target_triple = manifest.get("target_triple")
-            object_format = manifest.get("object_format")
-            abi_version = manifest.get("cpu_invocation_abi_version")
-            artifact_format = manifest.get("artifact_format")
-            legacy_native = (manifest.get("schema_version") == 2
-                             and artifact_format == "native_library")
-            relocatable = (manifest.get("schema_version") == 3
-                           and artifact_format == "relocatable_object")
-            valid_symbol = (
-                isinstance(symbol, str)
-                and symbol.startswith("__vernon_cpu_")
-                and symbol.endswith(f"_{reference.entry}")
-            )
-            if (not (legacy_native or relocatable)
-                    or manifest.get("target") != "cpu"
-                    or manifest.get("entry") != reference.entry
-                    or not valid_symbol
-                    or not isinstance(artifact_name, str) or not artifact_name
-                    or not isinstance(artifact_size, int)
-                    or not isinstance(artifact_sha256, str)
-                    or len(artifact_sha256) != 64
-                    or (legacy_native
-                        and (not isinstance(operating_system, str)
-                             or not isinstance(architecture, str)))
-                    or (relocatable
-                        and (not isinstance(target_triple, str)
-                             or not target_triple
-                             or object_format not in
-                             {"coff", "elf", "macho", "wasm"}))
-                    or not isinstance(abi_version, int)):
-                raise ShaderAssetError(
-                    f"compiler emitted an invalid CPU bundle for {reference.entry}"
-                )
-            relative_artifact = Path(artifact_name)
-            if relative_artifact.is_absolute(
-            ) or ".." in relative_artifact.parts:
-                raise ShaderAssetError(
-                    "CPU bundle artifact path must stay inside its bundle")
-            artifact_data = (artifact_directory /
-                             relative_artifact).read_bytes()
-            digest = hashlib.sha256(artifact_data).hexdigest()
-            if len(artifact_data
-                   ) != artifact_size or digest != artifact_sha256:
-                raise ShaderAssetError(
-                    "CPU bundle artifact size or SHA-256 does not match its manifest"
-                )
-            reflection = manifest.get("reflection")
-            if not isinstance(reflection, dict):
-                raise ShaderAssetError(
-                    "CPU bundle reflection must be an object")
-            entry_reflection = _entry_reflection(reflection, reference.entry)
-            identity = {
-                "cache_version": 1,
-                "compiler_version": 1,
-                "module": module.id,
-                "module_manifest": module.canonical_manifest,
-                "entry": reference.entry,
-                "stage": stage,
-                "target": target,
-                "target_options": target_options,
-                "dependencies": reflection.get("dependencies", []),
-                "interface": entry_reflection,
-                "artifact_sha256": digest,
-            }
-            stage_id = hashlib.sha256(
-                _canonical_json(identity).encode("utf-8")).hexdigest()
-            artifact = _write_external_artifact(
-                output, artifact_data, artifact_format, stage, artifact_name)
-            record = {
-                "id": stage_id,
-                "module": module.id,
-                "entry": reference.entry,
-                "stage": stage,
-                "target": target,
-                "format": artifact_format,
-                "artifact": artifact,
-                "symbol": symbol,
-                "cpu_invocation_abi_version": abi_version,
-                "module_hash": reflection.get("module_hash"),
-                "dependencies": reflection.get("dependencies", []),
-                "interface": entry_reflection,
-                "reflection": reflection,
-            }
-            if legacy_native:
-                record["operating_system"] = operating_system
-                record["architecture"] = architecture
-            else:
-                record["target_triple"] = target_triple
-                record["object_format"] = object_format
-            return stage_id, record
-        reflection_path = artifact_directory / "reflection.json"
-        reflection = _read_manifest(reflection_path)
-        artifact_rows = [
-            value for value in reflection.get("artifacts", [])
-            if isinstance(value, dict) and value.get("entry_point") ==
-            reference.entry and value.get("stage") == stage
-        ]
-        if len(artifact_rows) != 1:
-            raise ShaderAssetError(
-                f"compiler did not emit exactly one {stage} artifact for {reference.entry}"
-            )
-        artifact_row = artifact_rows[0]
-        artifact_name = artifact_row.get("filename")
-        if not isinstance(artifact_name, str):
-            raise ShaderAssetError("compiler artifact filename is invalid")
-        artifact_data = (artifact_directory / artifact_name).read_bytes()
-        entry_reflection = _entry_reflection(reflection, reference.entry)
-        identity = {
-            "cache_version": 1,
-            "compiler_version": 1,
-            "module": module.id,
-            "module_manifest": module.canonical_manifest,
-            "entry": reference.entry,
-            "stage": stage,
-            "target": target,
-            "target_options": target_options,
-            "dependencies": reflection.get("dependencies", []),
-            "interface": entry_reflection,
-            "artifact_sha256": hashlib.sha256(artifact_data).hexdigest(),
-        }
-        stage_id = hashlib.sha256(
-            _canonical_json(identity).encode("utf-8")).hexdigest()
-        artifact_format = artifact_row.get("format")
-        if not isinstance(artifact_format, str) or not artifact_format:
-            raise ShaderAssetError("compiler artifact format is invalid")
-        artifact = _write_external_artifact(output, artifact_data,
-                                            artifact_format, stage,
-                                            artifact_name)
-        record = {
-            "id": stage_id,
-            "module": module.id,
-            "entry": reference.entry,
-            "stage": stage,
-            "target": target,
-            "format": artifact_format,
-            "artifact": artifact,
-            "module_hash": reflection.get("module_hash"),
-            "dependencies": reflection.get("dependencies", []),
-            "interface": entry_reflection,
-            "reflection": reflection,
-        }
-        return stage_id, record
+                "CPU cooking requires the compiler relocatable object artifact")
+    return compiled
 
 
 def _interface_by_location(values: list[dict[str, Any]],
                            interface: str) -> dict[int, str]:
-    result: dict[int, str] = {}
-    for value in values:
-        if value.get(
-                "vernon.interface") != interface or "vernon.builtin" in value:
-            continue
-        location = value.get("vernon.location")
-        value_type = value.get("type")
-        if isinstance(location, int) and isinstance(value_type, str):
-            result[location] = value_type
-    return result
+    return interface_by_location(values, interface)
 
 
 def _validate_graphics_interfaces(vertex: dict[str, Any],
                                   fragment: dict[str, Any]) -> None:
-    outputs = _interface_by_location(vertex["interface"].get("results", []),
-                                     "output")
-    inputs = _interface_by_location(fragment["interface"].get("arguments", []),
-                                    "input")
-    for location, value_type in inputs.items():
-        if outputs.get(location) != value_type:
-            raise ShaderAssetError(
-                f"vertex/fragment interface mismatch at location {location}")
+    validate_graphics_interfaces(vertex, fragment)
 
 
 def _dtype_and_shape(type_name: object) -> tuple[str | None, list[int]]:
-    if not isinstance(type_name, str):
-        return None, []
-    if not type_name.startswith("tensor<") or not type_name.endswith(">"):
-        return type_name, []
-    parts = type_name[7:-1].split("x")
-    if not parts:
-        return None, []
-    return parts[-1], [
-        0 if dimension == "?" else int(dimension)
-        for dimension in parts[:-1]
-    ]
+    return dtype_and_shape(type_name)
 
 
 def _external_parameters(
         records: dict[str, dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    parameters: dict[str, list[dict[str, Any]]] = {}
-    for stage in ("compute", "vertex", "fragment"):
-        record = records.get(stage)
-        if record is None:
-            continue
-        for row in record["interface"].get("arguments", []):
-            if "vernon.builtin" in row or row.get("vernon.varying", False):
-                continue
-            name = row.get("vernon.source_name")
-            interface = row.get("vernon.interface")
-            if not isinstance(name, str) or not name or not isinstance(
-                    interface, str):
-                raise ShaderAssetError(
-                    f"{stage} external argument is missing source metadata")
-            inferred_dtype, inferred_shape = _dtype_and_shape(row.get("type"))
-            use = {
-                "stage": stage,
-                "entry": record["entry"],
-                "index": row.get("index"),
-                "kind": row.get("kind", "scalar"),
-                "type": row.get("type"),
-                "dtype": (row.get("dtype") or row.get("vernon.dtype")
-                          or inferred_dtype),
-                "shape": row.get("shape", inferred_shape),
-                "interface": interface,
-                "access": row.get("access", "read"),
-            }
-            for key in ("vernon.location", "vernon.instance_divisor",
-                        "vernon.set", "vernon.binding"):
-                if key in row:
-                    use[key] = row[key]
-            if interface == "uniform":
-                use["uniform_name"] = (
-                    f"{record['entry']}_arg_{int(row['index'])}._m0")
-            parameters.setdefault(name, []).append(use)
-    return parameters
+    return external_parameters(records)
 
 
 def _merge_parameter_uses(name: str, uses: list[dict[str,
                                                      Any]]) -> dict[str, Any]:
-    first = uses[0]
-    kind = "texture" if first["kind"] == "texture" else (
-        "inline" if first["interface"] == "uniform" or
-        (first["stage"] == "compute" and first["kind"] != "tensor") else
-        "tensor")
-    for use in uses[1:]:
-        other_kind = "texture" if use["kind"] == "texture" else (
-            "inline" if use["interface"] == "uniform" or
-            (use["stage"] == "compute" and use["kind"] != "tensor") else
-            "tensor")
-        if (other_kind != kind or use.get("type") != first.get("type")
-                or use.get("dtype") != first.get("dtype")
-                or use.get("shape", []) != first.get("shape", [])):
-            raise ShaderAssetError(f"incompatible pipeline parameter {name!r}")
-    access_values = {str(use.get("access", "read")) for use in uses}
-    access = ("read_write" if "read_write" in access_values
-              or access_values == {"read", "write"} else next(
-                  iter(access_values)))
-    return {
-        "name": name,
-        "kind": kind,
-        "type": first.get("type"),
-        "dtype": first.get("dtype"),
-        "shape": first.get("shape", []),
-        "access": access,
-        "uses": uses,
-    }
+    return merge_parameter_uses(name, uses)
 
 
 def _fragment_outputs(
         records: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
-    fragment = records.get("fragment")
-    if fragment is None:
-        return []
-    outputs: list[dict[str, Any]] = []
-    for row in fragment["interface"].get("results", []):
-        if "vernon.location" not in row:
-            continue
-        location = row["vernon.location"]
-        type_name = row.get("type")
-        dtype, shape = _dtype_and_shape(type_name)
-        outputs.append({
-            "name": row.get("vernon.source_name") or f"output_{location}",
-            "kind": "texture",
-            "dtype": dtype,
-            "shape": shape,
-            "access": "write",
-            "location": location,
-            "type": type_name,
-        })
-    return outputs
+    return fragment_outputs(records)
 
 
 def cook_shader_pipeline(*,
-                         pipeline_manifest: str | Path,
-                         asset_root: str | Path,
-                         compiler: str | Path,
+                         pipeline_asset: str | Path,
+                         compiler: str | Path | None = None,
                          output: str | Path,
                          target: str = "opengl") -> Path:
-    pipeline = parse_shader_pipeline_manifest(pipeline_manifest)
-    modules = pipeline.modules or discover_shader_modules(asset_root)
-    compiler_path = Path(compiler).resolve()
-    if not compiler_path.is_file():
-        raise ShaderAssetError(
-            f"native Vernon compiler does not exist: {compiler_path}")
+    """Cook with the owning native compiler result.
+
+    ``compiler`` is retained for API compatibility and is intentionally ignored.
+    """
+    source, descriptor_name = _pipeline_asset_reference(pipeline_asset)
+    pipeline = parse_python_pipeline_asset(source, descriptor_name)
+    modules = pipeline.modules
     if target not in pipeline.targets:
         raise ShaderAssetError(
             f"pipeline does not declare requested target '{target}'")
@@ -909,7 +577,10 @@ def cook_shader_pipeline(*,
         raise ShaderAssetError(
             "CPU pipeline bundles support one compute stage and no graphics "
             "or barrier steps")
-    target_options = pipeline.targets[target]
+    target_options = TargetOptions(target, pipeline.targets[target])
+    native = _native_module()
+    native_target = _native_target(native, target)
+    native_compiler = native.Compiler()
     selected_modules: dict[str, ShaderModuleDescriptor] = {}
     declared_features: set[str] = set()
     for stage, reference in pipeline.stages.items():
@@ -928,95 +599,47 @@ def cook_shader_pipeline(*,
 
     output_path = Path(output).resolve()
     output_path.mkdir(parents=True, exist_ok=True)
-    stage_records: dict[str, dict[str, Any]] = {}
-    variants: list[dict[str, Any]] = []
-    records_by_variant: list[dict[str, dict[str, Any]]] = []
-    compile_cache: dict[tuple[str, str, tuple[str, ...]],
-                        tuple[str, dict[str, Any]]] = {}
+    planned_variants: list[tuple[tuple[str, ...],
+                                 dict[str, CompiledStage]]] = []
+    compile_cache: dict[tuple[str, str, str, str], CompiledStage] = {}
     for variant in pipeline.variants:
-        mapping: dict[str, str] = {}
-        records_for_variant: dict[str, dict[str, Any]] = {}
+        stages_for_variant: dict[str, CompiledStage] = {}
         for stage, reference in pipeline.stages.items():
-            cache_key = (reference.module, reference.entry, variant)
+            mlir = compile_file(selected_modules[stage].source,
+                                features=variant,
+                                entry=reference.entry)
+            cache_key = (
+                reference.module,
+                reference.entry,
+                hashlib.sha256(mlir.encode("utf-8")).hexdigest(),
+                canonical_json({
+                    "target": target_options.target,
+                    "options": dict(target_options.options),
+                }),
+            )
             compiled = compile_cache.get(cache_key)
             if compiled is None:
                 compiled = _compile_stage(selected_modules[stage], reference,
-                                          stage, variant, target,
-                                          target_options, compiler_path,
-                                          output_path)
+                                          stage, variant, target_options,
+                                          native_compiler, native_target, mlir)
                 compile_cache[cache_key] = compiled
-            stage_id, record = compiled
-            stage_records.setdefault(stage_id, record)
-            mapping[stage] = stage_id
-            records_for_variant[stage] = record
-        if {"vertex", "fragment"}.issubset(pipeline.stages):
-            _validate_graphics_interfaces(records_for_variant["vertex"],
-                                          records_for_variant["fragment"])
-        variants.append({"key": list(variant), "stages": mapping})
-        records_by_variant.append(records_for_variant)
+            stages_for_variant[stage] = compiled
+        planned_variants.append((variant, stages_for_variant))
 
-    parameter_names = sorted({
-        name
-        for records in records_by_variant
-        for name in _external_parameters(records)
-    })
-    slots = {name: slot for slot, name in enumerate(parameter_names)}
-    pipeline_variants: list[dict[str, Any]] = []
-    for variant, records in zip(pipeline.variants, records_by_variant):
-        external = _external_parameters(records)
-        parameters = []
-        for name in parameter_names:
-            uses = external.get(name)
-            if uses is None:
-                continue
-            parameter = _merge_parameter_uses(name, uses)
-            parameter["slot"] = slots[name]
-            parameters.append(parameter)
-        steps: list[dict[str, Any]] = []
-        if "compute" in records:
-            steps.append({
-                "kind":
-                "dispatch",
-                "stage":
-                variants[len(pipeline_variants)]["stages"]["compute"],
-            })
-        if "compute" in records and "vertex" in records:
-            steps.append({
-                "kind": "barrier",
-                "source": "compute_write",
-                "destination": "vertex_read",
-            })
-        if "vertex" in records:
-            steps.append({
-                "kind":
-                "draw",
-                "vertex":
-                variants[len(pipeline_variants)]["stages"]["vertex"],
-                "fragment":
-                variants[len(pipeline_variants)]["stages"]["fragment"],
-            })
-        pipeline_variants.append({
-            "key": list(variant),
-            "parameters": parameters,
-            "outputs": _fragment_outputs(records),
-            "steps": steps,
-        })
-
-    pipeline_bundle: dict[str, Any] = {
-        "schema_version": 2,
-        "invocation_abi_version": 1,
-        "type": "pipeline",
-        "id": pipeline.id,
-        "target": target,
-        "target_options": target_options,
-        "features": sorted(declared_features),
-        "variants": pipeline_variants,
-        "stage_artifacts": {
-            key: stage_records[key]
-            for key in sorted(stage_records)
-        },
+    plan = build_bundle_plan(
+        pipeline.id,
+        target_options,
+        sorted(declared_features),
+        planned_variants,
+    )
+    descriptors = {
+        stage.id:
+        _write_external_artifact(output_path, stage.artifact.data,
+                                 stage.artifact.format, stage.stage,
+                                 stage.artifact.filename)
+        for stage in plan.stages
     }
-    pipeline_bundle = _with_content_hash(pipeline_bundle)
+    pipeline_bundle = materialize_bundle(plan, descriptors)
     manifest_path = output_path / f"{output_path.name}.pipeline.json"
     manifest_path.write_text(
         json.dumps(pipeline_bundle,

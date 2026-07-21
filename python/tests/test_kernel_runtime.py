@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import os
 import unittest
 from pathlib import Path
 from types import ModuleType
@@ -249,13 +248,32 @@ class KernelTests(unittest.TestCase):
         fill(output, 20.0, grid=(3, 2, 1))
         self.assertEqual(fill.compile_count, 1)
 
-    def test_cpu_aot_compiler_failure_does_not_fall_back(self) -> None:
+    def test_cpu_kernel_uses_in_process_owning_compiler(self) -> None:
         output = vd.Tensor.zeros(dtype=vd.f32, shape=(2, 3))
-        missing = os.fspath(os.path.abspath("missing-vernon-compile-for-test"))
-        with mock.patch.dict(os.environ, {"VERNON_COMPILER": missing}):
-            with self.assertRaisesRegex(
-                    RuntimeError, "VERNON_COMPILER does not name a file"):
-                fill(output, 1.0)
+        with mock.patch("subprocess.run",
+                        side_effect=AssertionError("subprocess prohibited")):
+            fill(output, 1.0)
+        np.testing.assert_array_equal(
+            output.to_numpy(),
+            np.array([[0, 1, 2], [1, 2, 3]], dtype=np.float32),
+        )
+
+    def test_compile_artifact_uses_in_process_owning_compiler(self) -> None:
+        output = vd.Tensor.zeros(dtype=vd.f32, shape=(2, 3))
+        with mock.patch("subprocess.run",
+                        side_effect=AssertionError("subprocess prohibited")):
+            artifact, reflection = fill.compile_artifact(
+                output, 1.0, target="vulkan")
+        self.assertTrue(artifact)
+        self.assertIn('"target":"vulkan"', reflection)
+
+    def test_runtime_reinit_reloads_without_recompiling(self) -> None:
+        output = vd.Tensor.zeros(dtype=vd.f32, shape=(2, 3))
+        fill(output, 1.0)
+        self.assertEqual(fill.compile_count, 1)
+        vd.init(arch=vd.cpu)
+        fill(output, 2.0)
+        self.assertEqual(fill.compile_count, 1)
 
     def test_specialized_shape_invalidates_cache(self) -> None:
         first = vd.Tensor.zeros(dtype=vd.f32, shape=(2, 3))

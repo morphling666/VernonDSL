@@ -5,7 +5,7 @@ import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 from .diagnostics import CompileError, SourceLocation
 from .module_graph import load_project
@@ -99,6 +99,59 @@ class AnnotatedType:
 class FunctionSignature:
     arguments: tuple[DslType, ...]
     result: DslType | None
+
+
+@dataclass(frozen=True)
+class FrontendCompileRequest:
+    """Complete, deterministic inputs to one Python frontend specialization."""
+
+    source_path: Path
+    entry: str
+    enabled_features: tuple[str, ...] = ()
+    tensor_shapes: tuple[tuple[str, str, tuple[int, ...]], ...] = ()
+    captured_constants: tuple[tuple[str, int | float | bool], ...] = ()
+    workgroup_size: tuple[int, int, int] | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source_path", Path(self.source_path).resolve())
+        object.__setattr__(
+            self, "enabled_features",
+            tuple(sorted(set(self.enabled_features))))
+        object.__setattr__(
+            self, "tensor_shapes",
+            tuple(
+                sorted((name, dtype, tuple(shape))
+                       for name, dtype, shape in self.tensor_shapes)))
+        object.__setattr__(
+            self, "captured_constants",
+            tuple(sorted(self.captured_constants, key=lambda value: value[0])))
+
+
+@dataclass(frozen=True)
+class FrontendCompileResult:
+    mlir: str
+    specialized_source: str
+    dependencies: tuple[tuple[str, str], ...]
+    declared_features: tuple[str, ...]
+    request: FrontendCompileRequest
+
+    @property
+    def semantic_inputs(self) -> dict[str, Any]:
+        return {
+            "frontend_version": 2,
+            "entry": self.request.entry,
+            "enabled_features": list(self.request.enabled_features),
+            "tensor_shapes": [[name, dtype, list(shape)]
+                              for name, dtype, shape
+                              in self.request.tensor_shapes],
+            "captured_constants": [[name, type(value).__name__, value]
+                                   for name, value
+                                   in self.request.captured_constants],
+            "workgroup_size": (list(self.request.workgroup_size)
+                               if self.request.workgroup_size else None),
+            "dependencies": [[path, digest]
+                             for path, digest in self.dependencies],
+        }
 
 
 @dataclass(frozen=True)
@@ -226,11 +279,16 @@ class _TypeParser:
             if len(items) != 2:
                 raise self.context.error(
                     node, "Texture requires a dimension and element type")
+            dimension = self._string_or_name(items[0], "texture dimension")
+            if dimension not in {"2d", "3d", "cube"}:
+                raise self.context.error(
+                    items[0],
+                    "texture dimension must be one of '2d', '3d', or 'cube'",
+                )
             return DslType(
                 "texture",
                 "Texture",
-                (self._string_or_name(
-                    items[0], "texture dimension"), self.parse_type(items[1])),
+                (dimension, self.parse_type(items[1])),
             )
         raise self.context.error(
             node, f"unknown DSL type constructor '{constructor}'")
@@ -1204,6 +1262,17 @@ class _FunctionEmitter:
                 )
             element = arguments[0].type.arguments[1]
             assert isinstance(element, DslType)
+            dimension = arguments[0].type.arguments[0]
+            coordinate_rank = {"2d": 2, "3d": 3, "cube": 3}[dimension]
+            coordinates = arguments[2].type
+            if (coordinates.kind != "tensor"
+                    or coordinates.arguments != (element, coordinate_rank)
+                    or not coordinates.is_float):
+                raise self.context.error(
+                    node.args[2],
+                    f"texture_sample coordinates for a {dimension} texture "
+                    f"must be a {coordinate_rank}-component floating-point vector",
+                )
             return self._intrinsic(node, name, arguments,
                                    DslType("tensor", "Tensor", (element, 4)))
         if name in self.context.structs:
@@ -1330,13 +1399,14 @@ class _FunctionEmitter:
             if any(index >= int(shape[0]) for index in indices):
                 raise self.context.error(
                     node, f"swizzle '{node.attr}' is out of bounds")
+            canonical_mask = "".join("xyzw"[index] for index in indices)
             element = value.type.arguments[0]
             assert isinstance(element, DslType)
             result_type = element if len(indices) == 1 else DslType(
                 "tensor", "Tensor", (element, len(indices)))
             result = self._fresh()
             self._line(
-                f'{result} = "vernon.swizzle"({value.name}) {{mask = "{node.attr}"}} : '
+                f'{result} = "vernon.swizzle"({value.name}) {{mask = "{canonical_mask}"}} : '
                 f"({value.type.mlir}) -> {result_type.mlir}")
             return Value(result, result_type)
         raise self.context.error(
@@ -1456,6 +1526,80 @@ class _FunctionEmitter:
                 f"type mismatch: expected {expected.mlir}, got {actual.mlir}")
 
 
+def _specialize_frontend_source(source: str,
+                                request: FrontendCompileRequest) -> str:
+    tree = ast.parse(source, filename=str(request.source_path))
+    function = next(
+        (node for node in tree.body
+         if isinstance(node, ast.FunctionDef) and node.name == request.entry),
+        None,
+    )
+    if function is None:
+        raise CompileError(
+            f"entry function '{request.entry}' was not found",
+            SourceLocation(str(request.source_path), 1, 1),
+        )
+    shapes = {
+        name: shape
+        for name, _, shape in request.tensor_shapes
+    }
+    for argument in function.args.args:
+        shape = shapes.get(argument.arg)
+        if shape is None or argument.annotation is None:
+            continue
+        annotation = argument.annotation
+        if isinstance(annotation, ast.Subscript) and (
+                _name(annotation.value) or "").split(".")[-1] == "Annotated":
+            values = (list(annotation.slice.elts) if isinstance(
+                annotation.slice, ast.Tuple) else [annotation.slice])
+            annotation = values[0]
+        if not (isinstance(annotation, ast.Subscript) and
+                (_name(annotation.value) or "").split(".")[-1] == "Tensor"):
+            continue
+        items = (list(annotation.slice.elts) if isinstance(
+            annotation.slice, ast.Tuple) else [annotation.slice])
+        if len(items) < 2:
+            continue
+        shape_node = items[1]
+        shape_nodes = (list(shape_node.elts) if isinstance(
+            shape_node, ast.Tuple) else items[1:])
+        if len(shape_nodes) != len(shape):
+            raise CompileError(
+                f"Tensor argument '{argument.arg}' rank does not match annotation",
+                SourceLocation(str(request.source_path), argument.lineno,
+                               argument.col_offset + 1),
+            )
+        for index, (declared, concrete) in enumerate(
+                zip(shape_nodes, shape, strict=True)):
+            if isinstance(declared, ast.Constant) and declared.value is None:
+                shape_nodes[index] = ast.copy_location(
+                    ast.Constant(value=concrete), declared)
+            elif not (isinstance(declared, ast.Constant)
+                      and declared.value == concrete):
+                raise CompileError(
+                    f"Tensor argument '{argument.arg}' shape does not match annotation",
+                    SourceLocation(str(request.source_path), argument.lineno,
+                                   argument.col_offset + 1),
+                )
+        items[1] = ast.Tuple(elts=shape_nodes, ctx=ast.Load())
+        annotation.slice = ast.Tuple(elts=items, ctx=ast.Load())
+
+    constants = dict(request.captured_constants)
+
+    class ConstantSpecializer(ast.NodeTransformer):
+
+        def visit_Name(self, node: ast.Name) -> ast.expr:
+            if isinstance(node.ctx, ast.Load) and node.id in constants:
+                return ast.copy_location(ast.Constant(constants[node.id]),
+                                         node)
+            return node
+
+    specialized = ConstantSpecializer().visit(tree)
+    assert isinstance(specialized, ast.Module)
+    ast.fix_missing_locations(specialized)
+    return ast.unparse(specialized)
+
+
 class Compiler:
     """Compiles a restricted Python source string without importing or executing it."""
 
@@ -1547,9 +1691,35 @@ class Compiler:
                      entry: str | None = None) -> str:
         path = Path(input_path)
         enabled_features = tuple(sorted(set(features)))
-        project = load_project(path, enabled_features, entry)
-        return self.compile(project.source, str(path), project.dependencies,
-                            project.features, enabled_features)
+        if entry is None:
+            project = load_project(path, enabled_features, entry)
+            return self.compile(project.source, str(path),
+                                project.dependencies, project.features,
+                                enabled_features)
+        return self.compile_request(
+            FrontendCompileRequest(path, entry, enabled_features)).mlir
+
+    def compile_request(
+            self, request: FrontendCompileRequest) -> FrontendCompileResult:
+        project = load_project(request.source_path,
+                               request.enabled_features,
+                               request.entry)
+        specialized_source = _specialize_frontend_source(
+            project.source, request)
+        mlir = self.compile(
+            specialized_source,
+            str(request.source_path),
+            project.dependencies,
+            project.features,
+            request.enabled_features,
+        )
+        return FrontendCompileResult(
+            mlir,
+            specialized_source,
+            project.dependencies,
+            project.features,
+            request,
+        )
 
     @staticmethod
     def _collect_struct_names(module: ast.Module,

@@ -1,6 +1,6 @@
 #include "VernonCompiler.h"
 
-#include <assert.h>
+#include <gtest/gtest.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -24,7 +24,7 @@ static void sample_texture(void *user_data, uintptr_t texture, float u, float v,
   out_rgba[3] = bias;
 }
 
-int main(void) {
+TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
   static const char module[] =
       "module {\n"
       "  func.func @vertex_main("
@@ -232,16 +232,17 @@ int main(void) {
       "}\n";
 
   VernonCompilerContext *context = vernonCompilerCreate();
-  assert(context != NULL);
+  ASSERT_TRUE(context != NULL);
   VernonTargetCapabilities vulkan =
       vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_VULKAN);
-  assert(vulkan.available && vulkan.supports_graphics);
+  ASSERT_TRUE(vulkan.available && vulkan.supports_graphics);
   VernonTargetCapabilities cuda =
       vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_CUDA);
-  assert(cuda.available && cuda.supports_compute && !cuda.supports_graphics);
+  ASSERT_TRUE(cuda.available && cuda.supports_compute &&
+              !cuda.supports_graphics);
   VernonTargetCapabilities cpu =
       vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_CPU);
-  assert(cpu.available && cpu.supports_graphics && cpu.supports_compute);
+  ASSERT_TRUE(cpu.available && cpu.supports_graphics && cpu.supports_compute);
   VernonTargetCapabilities opengl =
       vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_OPENGL);
   VernonTargetCapabilities opengles =
@@ -251,58 +252,60 @@ int main(void) {
 
   VernonCompileResult *validation =
       vernonCompilerValidateMlir(context, module, strlen(module));
-  assert(validation != NULL);
-  assert(vernonCompileResultGetStatus(validation) == VERNON_STATUS_OK);
+  ASSERT_TRUE(validation != NULL);
+  ASSERT_TRUE(vernonCompileResultGetStatus(validation) == VERNON_STATUS_OK);
 
   VernonStringView reflection = vernonCompileResultGetReflection(validation);
-  assert(reflection.data != NULL);
-  assert(reflection.size != 0);
-  assert(reflection.data[0] == '{');
-  assert(vernonCompileResultGetCpuEntry(validation, "vertex_main", 11) == NULL);
+  ASSERT_TRUE(reflection.data != NULL);
+  ASSERT_TRUE(reflection.size != 0);
+  ASSERT_TRUE(reflection.data[0] == '{');
+  ASSERT_TRUE(vernonCompileResultGetCpuEntry(validation, "vertex_main", 11) ==
+              NULL);
   vernonCompileResultDestroy(validation);
 
   VernonCompileResult *invalid = vernonCompilerValidateMlir(
       context, invalid_module, strlen(invalid_module));
-  assert(invalid != NULL);
-  assert(vernonCompileResultGetStatus(invalid) ==
-         VERNON_STATUS_VERIFICATION_ERROR);
+  ASSERT_TRUE(invalid != NULL);
+  ASSERT_TRUE(vernonCompileResultGetStatus(invalid) ==
+              VERNON_STATUS_VERIFICATION_ERROR);
   vernonCompileResultDestroy(invalid);
 
   VernonCompileResult *parse_error =
       vernonCompilerValidateMlir(context, "not mlir", 8);
-  assert(parse_error != NULL);
-  assert(vernonCompileResultGetStatus(parse_error) ==
-         VERNON_STATUS_PARSE_ERROR);
-  assert(vernonCompileResultGetDiagnostics(parse_error).size != 0);
+  ASSERT_TRUE(parse_error != NULL);
+  ASSERT_TRUE(vernonCompileResultGetStatus(parse_error) ==
+              VERNON_STATUS_PARSE_ERROR);
+  ASSERT_TRUE(vernonCompileResultGetDiagnostics(parse_error).size != 0);
   vernonCompileResultDestroy(parse_error);
 
   VernonCompileResult *compile = vernonCompilerCompileMlir(
       context, module, strlen(module), VERNON_TARGET_DIRECTX);
-  assert(compile != NULL);
-  assert(vernonCompileResultGetStatus(compile) ==
-         VERNON_STATUS_UNSUPPORTED_TARGET);
+  ASSERT_TRUE(compile != NULL);
+  ASSERT_TRUE(vernonCompileResultGetStatus(compile) ==
+              VERNON_STATUS_UNSUPPORTED_TARGET);
   vernonCompileResultDestroy(compile);
 
   VernonCompileResult *vulkan_compile = vernonCompilerCompileMlir(
       context, module, strlen(module), VERNON_TARGET_VULKAN);
-  assert(vulkan_compile != NULL);
-  assert(vernonCompileResultGetStatus(vulkan_compile) == VERNON_STATUS_OK);
-  assert(vernonCompileResultGetArtifactCount(vulkan_compile) == 1);
+  ASSERT_TRUE(vulkan_compile != NULL);
+  ASSERT_TRUE(vernonCompileResultGetStatus(vulkan_compile) == VERNON_STATUS_OK);
+  ASSERT_TRUE(vernonCompileResultGetArtifactCount(vulkan_compile) == 1);
   VernonStringView name = vernonCompileResultGetArtifactName(vulkan_compile, 0);
-  assert(name.size == strlen("module.spv"));
-  assert(memcmp(name.data, "module.spv", name.size) == 0);
+  ASSERT_TRUE(name.size == strlen("module.spv"));
+  ASSERT_TRUE(memcmp(name.data, "module.spv", name.size) == 0);
   VernonStringView spirv =
       vernonCompileResultGetArtifactData(vulkan_compile, 0);
   uint32_t magic = 0;
-  assert(spirv.size >= sizeof(magic));
+  ASSERT_TRUE(spirv.size >= sizeof(magic));
   memcpy(&magic, spirv.data, sizeof(magic));
-  assert(magic == 0x07230203u);
+  ASSERT_TRUE(magic == 0x07230203u);
   VernonStringView vulkan_reflection =
       vernonCompileResultGetReflection(vulkan_compile);
-  assert(view_contains(vulkan_reflection, "\"schema_version\":2"));
-  assert(view_contains(vulkan_reflection, "\"target\":\"vulkan\""));
-  assert(view_contains(vulkan_reflection, "\"entry_point\":\"vertex_main\""));
-  assert(view_contains(vulkan_reflection, "\"filename\":\"module.spv\""));
+  ASSERT_TRUE(view_contains(vulkan_reflection, "\"schema_version\":2"));
+  ASSERT_TRUE(view_contains(vulkan_reflection, "\"target\":\"vulkan\""));
+  ASSERT_TRUE(
+      view_contains(vulkan_reflection, "\"entry_point\":\"vertex_main\""));
+  ASSERT_TRUE(view_contains(vulkan_reflection, "\"filename\":\"module.spv\""));
   vernonCompileResultDestroy(vulkan_compile);
 
   if (opengl.available) {
@@ -310,25 +313,26 @@ int main(void) {
     VernonCompileResult *opengl_compile = vernonCompilerCompileMlirWithOptions(
         context, cpu_module, strlen(cpu_module), VERNON_TARGET_OPENGL,
         &options);
-    assert(opengl_compile != NULL);
-    assert(vernonCompileResultGetStatus(opengl_compile) == VERNON_STATUS_OK);
+    ASSERT_TRUE(opengl_compile != NULL);
+    ASSERT_TRUE(vernonCompileResultGetStatus(opengl_compile) ==
+                VERNON_STATUS_OK);
     VernonStringView glsl =
         vernonCompileResultGetArtifactData(opengl_compile, 0);
-    assert(glsl.size >= strlen("#version 450"));
-    assert(memcmp(glsl.data, "#version 450", strlen("#version 450")) == 0);
+    ASSERT_TRUE(glsl.size >= strlen("#version 450"));
+    ASSERT_TRUE(memcmp(glsl.data, "#version 450", strlen("#version 450")) == 0);
     VernonStringView opengl_reflection =
         vernonCompileResultGetReflection(opengl_compile);
-    assert(view_contains(opengl_reflection, "\"target\":\"opengl\""));
-    assert(view_contains(opengl_reflection, "\"glsl_version\":450"));
-    assert(view_contains(opengl_reflection, "\"format\":\"glsl\""));
+    ASSERT_TRUE(view_contains(opengl_reflection, "\"target\":\"opengl\""));
+    ASSERT_TRUE(view_contains(opengl_reflection, "\"glsl_version\":450"));
+    ASSERT_TRUE(view_contains(opengl_reflection, "\"format\":\"glsl\""));
     vernonCompileResultDestroy(opengl_compile);
 
     options.glsl_version = 330;
     VernonCompileResult *invalid_options = vernonCompilerCompileMlirWithOptions(
         context, module, strlen(module), VERNON_TARGET_VULKAN, &options);
-    assert(invalid_options != NULL);
-    assert(vernonCompileResultGetStatus(invalid_options) ==
-           VERNON_STATUS_INVALID_ARGUMENT);
+    ASSERT_TRUE(invalid_options != NULL);
+    ASSERT_TRUE(vernonCompileResultGetStatus(invalid_options) ==
+                VERNON_STATUS_INVALID_ARGUMENT);
     vernonCompileResultDestroy(invalid_options);
   }
 
@@ -338,142 +342,148 @@ int main(void) {
         vernonCompilerCompileMlirWithOptions(context, cpu_module,
                                              strlen(cpu_module),
                                              VERNON_TARGET_OPENGL_ES, &options);
-    assert(opengles_compile != NULL);
-    assert(vernonCompileResultGetStatus(opengles_compile) == VERNON_STATUS_OK);
+    ASSERT_TRUE(opengles_compile != NULL);
+    ASSERT_TRUE(vernonCompileResultGetStatus(opengles_compile) ==
+                VERNON_STATUS_OK);
     VernonStringView glsl =
         vernonCompileResultGetArtifactData(opengles_compile, 0);
-    assert(glsl.size >= strlen("#version 310 es"));
-    assert(memcmp(glsl.data, "#version 310 es", strlen("#version 310 es")) ==
-           0);
+    ASSERT_TRUE(glsl.size >= strlen("#version 310 es"));
+    ASSERT_TRUE(
+        memcmp(glsl.data, "#version 310 es", strlen("#version 310 es")) == 0);
     vernonCompileResultDestroy(opengles_compile);
   }
 
   VernonCompileResult *vulkan_compute_compile = vernonCompilerCompileMlir(
       context, cpu_compute_module, strlen(cpu_compute_module),
       VERNON_TARGET_VULKAN);
-  assert(vulkan_compute_compile != NULL);
-  assert(vernonCompileResultGetStatus(vulkan_compute_compile) ==
-         VERNON_STATUS_OK);
-  assert(vernonCompileResultGetArtifactCount(vulkan_compute_compile) == 1);
+  ASSERT_TRUE(vulkan_compute_compile != NULL);
+  ASSERT_TRUE(vernonCompileResultGetStatus(vulkan_compute_compile) ==
+              VERNON_STATUS_OK);
+  ASSERT_TRUE(vernonCompileResultGetArtifactCount(vulkan_compute_compile) == 1);
   vernonCompileResultDestroy(vulkan_compute_compile);
 
   VernonCompileResult *cuda_compile =
       vernonCompilerCompileMlir(context, cpu_compute_module,
                                 strlen(cpu_compute_module), VERNON_TARGET_CUDA);
-  assert(cuda_compile != NULL);
-  assert(vernonCompileResultGetStatus(cuda_compile) == VERNON_STATUS_OK);
+  ASSERT_TRUE(cuda_compile != NULL);
+  ASSERT_TRUE(vernonCompileResultGetStatus(cuda_compile) == VERNON_STATUS_OK);
   VernonStringView ptx = vernonCompileResultGetArtifactData(cuda_compile, 0);
-  assert(ptx.size != 0);
-  assert(strstr(ptx.data, ".version") != NULL);
+  ASSERT_TRUE(ptx.size != 0);
+  ASSERT_TRUE(strstr(ptx.data, ".version") != NULL);
   vernonCompileResultDestroy(cuda_compile);
 
   VernonCompileResult *cuda_while_compile =
       vernonCompilerCompileMlir(context, cuda_while_module,
                                 strlen(cuda_while_module), VERNON_TARGET_CUDA);
-  assert(cuda_while_compile != NULL);
-  assert(vernonCompileResultGetStatus(cuda_while_compile) == VERNON_STATUS_OK);
+  ASSERT_TRUE(cuda_while_compile != NULL);
+  ASSERT_TRUE(vernonCompileResultGetStatus(cuda_while_compile) ==
+              VERNON_STATUS_OK);
   VernonStringView while_ptx =
       vernonCompileResultGetArtifactData(cuda_while_compile, 0);
-  assert(while_ptx.size != 0);
-  assert(view_contains(while_ptx, ".version"));
-  assert(view_contains(while_ptx, "cos.approx"));
-  assert(view_contains(while_ptx, "sqrt.rn"));
-  assert(!view_contains(while_ptx, "__nv_"));
+  ASSERT_TRUE(while_ptx.size != 0);
+  ASSERT_TRUE(view_contains(while_ptx, ".version"));
+  ASSERT_TRUE(view_contains(while_ptx, "cos.approx"));
+  ASSERT_TRUE(view_contains(while_ptx, "sqrt.rn"));
+  ASSERT_TRUE(!view_contains(while_ptx, "__nv_"));
   vernonCompileResultDestroy(cuda_while_compile);
 
   if (metal.available) {
     VernonCompileResult *metal_compute = vernonCompilerCompileMlir(
         context, cuda_while_module, strlen(cuda_while_module),
         VERNON_TARGET_METAL);
-    assert(metal_compute != NULL);
-    assert(vernonCompileResultGetStatus(metal_compute) == VERNON_STATUS_OK);
+    ASSERT_TRUE(metal_compute != NULL);
+    ASSERT_TRUE(vernonCompileResultGetStatus(metal_compute) ==
+                VERNON_STATUS_OK);
     VernonStringView metal_source =
         vernonCompileResultGetArtifactData(metal_compute, 0);
-    assert(view_contains(metal_source, "kernel void loop"));
-    assert(view_contains(vernonCompileResultGetReflection(metal_compute),
-                         "\"target\":\"metal\""));
+    ASSERT_TRUE(view_contains(metal_source, "kernel void loop"));
+    ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(metal_compute),
+                              "\"target\":\"metal\""));
     vernonCompileResultDestroy(metal_compute);
   }
 
   VernonCompileResult *cuda_rank_three_compile = vernonCompilerCompileMlir(
       context, cuda_rank_three_tensor_module,
       strlen(cuda_rank_three_tensor_module), VERNON_TARGET_CUDA);
-  assert(cuda_rank_three_compile != NULL);
+  ASSERT_TRUE(cuda_rank_three_compile != NULL);
   if (vernonCompileResultGetStatus(cuda_rank_three_compile) !=
       VERNON_STATUS_OK) {
     VernonStringView diagnostics =
         vernonCompileResultGetDiagnostics(cuda_rank_three_compile);
     fprintf(stderr, "%.*s\n", (int)diagnostics.size, diagnostics.data);
   }
-  assert(vernonCompileResultGetStatus(cuda_rank_three_compile) ==
-         VERNON_STATUS_OK);
-  assert(vernonCompileResultGetArtifactCount(cuda_rank_three_compile) == 1);
+  ASSERT_TRUE(vernonCompileResultGetStatus(cuda_rank_three_compile) ==
+              VERNON_STATUS_OK);
+  ASSERT_TRUE(vernonCompileResultGetArtifactCount(cuda_rank_three_compile) ==
+              1);
   vernonCompileResultDestroy(cuda_rank_three_compile);
 
   VernonCompileResult *cuda_dynamic_local_compile = vernonCompilerCompileMlir(
       context, cuda_dynamic_local_tensor_module,
       strlen(cuda_dynamic_local_tensor_module), VERNON_TARGET_CUDA);
-  assert(cuda_dynamic_local_compile != NULL);
-  assert(vernonCompileResultGetStatus(cuda_dynamic_local_compile) !=
-         VERNON_STATUS_OK);
-  assert(view_contains(
+  ASSERT_TRUE(cuda_dynamic_local_compile != NULL);
+  ASSERT_TRUE(vernonCompileResultGetStatus(cuda_dynamic_local_compile) !=
+              VERNON_STATUS_OK);
+  ASSERT_TRUE(view_contains(
       vernonCompileResultGetDiagnostics(cuda_dynamic_local_compile),
       "dynamic local value Tensor"));
   vernonCompileResultDestroy(cuda_dynamic_local_compile);
 
   VernonCompileResult *cpu_compile = vernonCompilerCompileMlir(
       context, cpu_module, strlen(cpu_module), VERNON_TARGET_CPU);
-  assert(cpu_compile != NULL);
-  assert(vernonCompileResultGetStatus(cpu_compile) == VERNON_STATUS_OK);
+  ASSERT_TRUE(cpu_compile != NULL);
+  ASSERT_TRUE(vernonCompileResultGetStatus(cpu_compile) == VERNON_STATUS_OK);
 #if defined(_WIN32)
-  assert(view_contains(vernonCompileResultGetArtifactName(cpu_compile, 0),
-                       "module.obj"));
+  ASSERT_TRUE(view_contains(vernonCompileResultGetArtifactName(cpu_compile, 0),
+                            "module.obj"));
 #else
-  assert(view_contains(vernonCompileResultGetArtifactName(cpu_compile, 0),
-                       "module.o"));
+  ASSERT_TRUE(view_contains(vernonCompileResultGetArtifactName(cpu_compile, 0),
+                            "module.o"));
 #endif
-  assert(view_contains(vernonCompileResultGetReflection(cpu_compile),
-                       "__vernon_cpu_"));
-  assert(view_contains(vernonCompileResultGetReflection(cpu_compile),
-                       "_add_vectors"));
+  ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(cpu_compile),
+                            "__vernon_cpu_"));
+  ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(cpu_compile),
+                            "_add_vectors"));
   VernonStringView host_object =
       vernonCompileResultGetArtifactData(cpu_compile, 0);
   VernonCompileResult *host_library =
       vernonCompilerLinkHostObject(context, host_object.data, host_object.size);
-  assert(host_library != NULL);
-  assert(vernonCompileResultGetStatus(host_library) == VERNON_STATUS_OK);
+  ASSERT_TRUE(host_library != NULL);
+  ASSERT_TRUE(vernonCompileResultGetStatus(host_library) == VERNON_STATUS_OK);
   VernonStringView host_library_data =
       vernonCompileResultGetArtifactData(host_library, 0);
-  assert(host_library_data.size > 4);
+  ASSERT_TRUE(host_library_data.size > 4);
 #if defined(_WIN32)
-  assert(host_library_data.data[0] == 'M' && host_library_data.data[1] == 'Z');
+  ASSERT_TRUE(host_library_data.data[0] == 'M' &&
+              host_library_data.data[1] == 'Z');
 #elif defined(__APPLE__)
-  assert((unsigned char)host_library_data.data[0] == 0xcf);
+  ASSERT_TRUE((unsigned char)host_library_data.data[0] == 0xcf);
 #else
-  assert((unsigned char)host_library_data.data[0] == 0x7f);
-  assert(host_library_data.data[1] == 'E' && host_library_data.data[2] == 'L' &&
-         host_library_data.data[3] == 'F');
+  ASSERT_TRUE((unsigned char)host_library_data.data[0] == 0x7f);
+  ASSERT_TRUE(host_library_data.data[1] == 'E' &&
+              host_library_data.data[2] == 'L' &&
+              host_library_data.data[3] == 'F');
 #endif
   vernonCompileResultDestroy(host_library);
   VernonCpuEntryPoint add_vectors =
       vernonCompileResultGetCpuEntry(cpu_compile, "add_vectors", 11);
-  assert(add_vectors != NULL);
+  ASSERT_TRUE(add_vectors != NULL);
   float cpu_arguments[8] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
   float cpu_results[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   VernonCpuInvocation invocation = {cpu_arguments, sizeof(cpu_arguments),
                                     cpu_results, sizeof(cpu_results), NULL};
-  assert(add_vectors(&invocation) == VERNON_STATUS_OK);
-  assert(cpu_results[0] == 6.0f && cpu_results[1] == 8.0f);
-  assert(cpu_results[2] == 10.0f && cpu_results[3] == 12.0f);
+  ASSERT_TRUE(add_vectors(&invocation) == VERNON_STATUS_OK);
+  ASSERT_TRUE(cpu_results[0] == 6.0f && cpu_results[1] == 8.0f);
+  ASSERT_TRUE(cpu_results[2] == 10.0f && cpu_results[3] == 12.0f);
   invocation.arguments_size = 0;
-  assert(add_vectors(&invocation) == VERNON_STATUS_INVALID_ARGUMENT);
+  ASSERT_TRUE(add_vectors(&invocation) == VERNON_STATUS_INVALID_ARGUMENT);
   invocation.arguments_size = sizeof(cpu_arguments);
   invocation.results_size = 0;
-  assert(add_vectors(&invocation) == VERNON_STATUS_INVALID_ARGUMENT);
+  ASSERT_TRUE(add_vectors(&invocation) == VERNON_STATUS_INVALID_ARGUMENT);
   invocation.results_size = sizeof(cpu_results);
   invocation.results = NULL;
-  assert(add_vectors(&invocation) == VERNON_STATUS_INVALID_ARGUMENT);
-  assert(add_vectors(NULL) == VERNON_STATUS_INVALID_ARGUMENT);
+  ASSERT_TRUE(add_vectors(&invocation) == VERNON_STATUS_INVALID_ARGUMENT);
+  ASSERT_TRUE(add_vectors(NULL) == VERNON_STATUS_INVALID_ARGUMENT);
   vernonCompileResultDestroy(cpu_compile);
 
   const char *ios_triple = "arm64-apple-ios17.0";
@@ -483,32 +493,34 @@ int main(void) {
   ios_options.cpu_target_triple.size = strlen(ios_triple);
   VernonCompileResult *ios_cpu_compile = vernonCompilerCompileMlirWithOptions(
       context, cpu_module, strlen(cpu_module), VERNON_TARGET_CPU, &ios_options);
-  assert(ios_cpu_compile != NULL);
-  assert(vernonCompileResultGetStatus(ios_cpu_compile) == VERNON_STATUS_OK);
+  ASSERT_TRUE(ios_cpu_compile != NULL);
+  ASSERT_TRUE(vernonCompileResultGetStatus(ios_cpu_compile) ==
+              VERNON_STATUS_OK);
   VernonStringView ios_object =
       vernonCompileResultGetArtifactData(ios_cpu_compile, 0);
-  assert(ios_object.size > 4);
-  assert((unsigned char)ios_object.data[0] == 0xcf);
-  assert((unsigned char)ios_object.data[1] == 0xfa);
-  assert((unsigned char)ios_object.data[2] == 0xed);
-  assert((unsigned char)ios_object.data[3] == 0xfe);
-  assert(vernonCompileResultGetCpuEntry(ios_cpu_compile, "add_vectors", 11) ==
-         NULL);
+  ASSERT_TRUE(ios_object.size > 4);
+  ASSERT_TRUE((unsigned char)ios_object.data[0] == 0xcf);
+  ASSERT_TRUE((unsigned char)ios_object.data[1] == 0xfa);
+  ASSERT_TRUE((unsigned char)ios_object.data[2] == 0xed);
+  ASSERT_TRUE((unsigned char)ios_object.data[3] == 0xfe);
+  ASSERT_TRUE(vernonCompileResultGetCpuEntry(ios_cpu_compile, "add_vectors",
+                                             11) == NULL);
   vernonCompileResultDestroy(ios_cpu_compile);
 
   VernonCompileResult *cpu_large_compile = vernonCompilerCompileMlir(
       context, cpu_large_vector_module, strlen(cpu_large_vector_module),
       VERNON_TARGET_CPU);
-  assert(cpu_large_compile != NULL);
+  ASSERT_TRUE(cpu_large_compile != NULL);
   if (vernonCompileResultGetStatus(cpu_large_compile) != VERNON_STATUS_OK) {
     VernonStringView diagnostics =
         vernonCompileResultGetDiagnostics(cpu_large_compile);
     fprintf(stderr, "%.*s\n", (int)diagnostics.size, diagnostics.data);
   }
-  assert(vernonCompileResultGetStatus(cpu_large_compile) == VERNON_STATUS_OK);
+  ASSERT_TRUE(vernonCompileResultGetStatus(cpu_large_compile) ==
+              VERNON_STATUS_OK);
   VernonCpuEntryPoint add_large =
       vernonCompileResultGetCpuEntry(cpu_large_compile, "add_large", 9);
-  assert(add_large != NULL);
+  ASSERT_TRUE(add_large != NULL);
   float large_arguments[40];
   float large_results[20] = {0};
   for (size_t index = 0; index < 20; ++index) {
@@ -518,47 +530,50 @@ int main(void) {
   VernonCpuInvocation large_invocation = {
       large_arguments, sizeof(large_arguments), large_results,
       sizeof(large_results), NULL};
-  assert(add_large(&large_invocation) == VERNON_STATUS_OK);
-  assert(large_results[0] == 2.0f && large_results[19] == 21.0f);
+  ASSERT_TRUE(add_large(&large_invocation) == VERNON_STATUS_OK);
+  ASSERT_TRUE(large_results[0] == 2.0f && large_results[19] == 21.0f);
   vernonCompileResultDestroy(cpu_large_compile);
 
   VernonCompileResult *cpu_unknown_compile = vernonCompilerCompileMlir(
       context, cpu_unknown_intrinsic_module,
       strlen(cpu_unknown_intrinsic_module), VERNON_TARGET_CPU);
-  assert(cpu_unknown_compile != NULL);
-  assert(vernonCompileResultGetStatus(cpu_unknown_compile) != VERNON_STATUS_OK);
-  assert(view_contains(vernonCompileResultGetDiagnostics(cpu_unknown_compile),
-                       "not_a_cpu_intrinsic"));
-  assert(view_contains(vernonCompileResultGetDiagnostics(cpu_unknown_compile),
-                       "unknown_cpu"));
+  ASSERT_TRUE(cpu_unknown_compile != NULL);
+  ASSERT_TRUE(vernonCompileResultGetStatus(cpu_unknown_compile) !=
+              VERNON_STATUS_OK);
+  ASSERT_TRUE(
+      view_contains(vernonCompileResultGetDiagnostics(cpu_unknown_compile),
+                    "not_a_cpu_intrinsic"));
+  ASSERT_TRUE(view_contains(
+      vernonCompileResultGetDiagnostics(cpu_unknown_compile), "unknown_cpu"));
   vernonCompileResultDestroy(cpu_unknown_compile);
 
   VernonCompileResult *cpu_intrinsic_compile = vernonCompilerCompileMlir(
       context, cpu_intrinsic_module, strlen(cpu_intrinsic_module),
       VERNON_TARGET_CPU);
-  assert(cpu_intrinsic_compile != NULL);
-  assert(vernonCompileResultGetStatus(cpu_intrinsic_compile) ==
-         VERNON_STATUS_OK);
+  ASSERT_TRUE(cpu_intrinsic_compile != NULL);
+  ASSERT_TRUE(vernonCompileResultGetStatus(cpu_intrinsic_compile) ==
+              VERNON_STATUS_OK);
   VernonCpuEntryPoint normal_score =
       vernonCompileResultGetCpuEntry(cpu_intrinsic_compile, "normal_score", 12);
-  assert(normal_score != NULL);
+  ASSERT_TRUE(normal_score != NULL);
   float intrinsic_arguments[7] = {0.0f, 0.0f, 2.0f, 0.0f, 0.0f, 0.0f, 1.0f};
   float intrinsic_result = 0.0f;
   VernonCpuInvocation intrinsic_invocation = {
       intrinsic_arguments, sizeof(intrinsic_arguments), &intrinsic_result,
       sizeof(intrinsic_result), NULL};
-  assert(normal_score(&intrinsic_invocation) == VERNON_STATUS_OK);
-  assert(intrinsic_result == 1.0f);
+  ASSERT_TRUE(normal_score(&intrinsic_invocation) == VERNON_STATUS_OK);
+  ASSERT_TRUE(intrinsic_result == 1.0f);
   vernonCompileResultDestroy(cpu_intrinsic_compile);
 
   VernonCompileResult *cpu_compute_compile =
       vernonCompilerCompileMlir(context, cpu_compute_module,
                                 strlen(cpu_compute_module), VERNON_TARGET_CPU);
-  assert(cpu_compute_compile != NULL);
-  assert(vernonCompileResultGetStatus(cpu_compute_compile) == VERNON_STATUS_OK);
+  ASSERT_TRUE(cpu_compute_compile != NULL);
+  ASSERT_TRUE(vernonCompileResultGetStatus(cpu_compute_compile) ==
+              VERNON_STATUS_OK);
   VernonCpuEntryPoint increment =
       vernonCompileResultGetCpuEntry(cpu_compute_compile, "increment", 9);
-  assert(increment != NULL);
+  ASSERT_TRUE(increment != NULL);
   float compute_values[3] = {2.0f, 4.0f, 6.0f};
   struct {
     float *values;
@@ -566,18 +581,19 @@ int main(void) {
   } compute_arguments = {compute_values, 1};
   VernonCpuInvocation compute_invocation = {
       &compute_arguments, sizeof(compute_arguments), NULL, 0, NULL};
-  assert(increment(&compute_invocation) == VERNON_STATUS_OK);
-  assert(compute_values[0] == 2.0f && compute_values[1] == 5.0f &&
-         compute_values[2] == 6.0f);
+  ASSERT_TRUE(increment(&compute_invocation) == VERNON_STATUS_OK);
+  ASSERT_TRUE(compute_values[0] == 2.0f && compute_values[1] == 5.0f &&
+              compute_values[2] == 6.0f);
   vernonCompileResultDestroy(cpu_compute_compile);
 
   VernonCompileResult *cpu_scf_compile = vernonCompilerCompileMlir(
       context, cuda_while_module, strlen(cuda_while_module), VERNON_TARGET_CPU);
-  assert(cpu_scf_compile != NULL);
-  assert(vernonCompileResultGetStatus(cpu_scf_compile) == VERNON_STATUS_OK);
+  ASSERT_TRUE(cpu_scf_compile != NULL);
+  ASSERT_TRUE(vernonCompileResultGetStatus(cpu_scf_compile) ==
+              VERNON_STATUS_OK);
   VernonCpuEntryPoint loop =
       vernonCompileResultGetCpuEntry(cpu_scf_compile, "loop", 4);
-  assert(loop != NULL);
+  ASSERT_TRUE(loop != NULL);
   float loop_values[1] = {0.0f};
   struct {
     float *values;
@@ -585,18 +601,19 @@ int main(void) {
   } loop_arguments = {loop_values, 0.0f};
   VernonCpuInvocation loop_invocation = {&loop_arguments,
                                          sizeof(loop_arguments), NULL, 0, NULL};
-  assert(loop(&loop_invocation) == VERNON_STATUS_OK);
-  assert(loop_values[0] == 4.0f);
+  ASSERT_TRUE(loop(&loop_invocation) == VERNON_STATUS_OK);
+  ASSERT_TRUE(loop_values[0] == 4.0f);
   vernonCompileResultDestroy(cpu_scf_compile);
 
   VernonCompileResult *cpu_texture_compile =
       vernonCompilerCompileMlir(context, cpu_texture_module,
                                 strlen(cpu_texture_module), VERNON_TARGET_CPU);
-  assert(cpu_texture_compile != NULL);
-  assert(vernonCompileResultGetStatus(cpu_texture_compile) == VERNON_STATUS_OK);
+  ASSERT_TRUE(cpu_texture_compile != NULL);
+  ASSERT_TRUE(vernonCompileResultGetStatus(cpu_texture_compile) ==
+              VERNON_STATUS_OK);
   VernonCpuEntryPoint sample_color =
       vernonCompileResultGetCpuEntry(cpu_texture_compile, "sample_color", 12);
-  assert(sample_color != NULL);
+  ASSERT_TRUE(sample_color != NULL);
   struct {
     uintptr_t texture;
     uintptr_t sampler;
@@ -609,13 +626,13 @@ int main(void) {
   VernonCpuInvocation texture_invocation = {
       &texture_arguments, sizeof(texture_arguments), texture_result,
       sizeof(texture_result), &texture_callbacks};
-  assert(sample_color(&texture_invocation) == VERNON_STATUS_OK);
-  assert(texture_result[0] == 0.25f && texture_result[1] == 0.75f);
-  assert(texture_result[2] == 3.0f && texture_result[3] == 0.5f);
+  ASSERT_TRUE(sample_color(&texture_invocation) == VERNON_STATUS_OK);
+  ASSERT_TRUE(texture_result[0] == 0.25f && texture_result[1] == 0.75f);
+  ASSERT_TRUE(texture_result[2] == 3.0f && texture_result[3] == 0.5f);
   texture_invocation.textures = NULL;
-  assert(sample_color(&texture_invocation) == VERNON_STATUS_INVALID_ARGUMENT);
+  ASSERT_TRUE(sample_color(&texture_invocation) ==
+              VERNON_STATUS_INVALID_ARGUMENT);
   vernonCompileResultDestroy(cpu_texture_compile);
 
   vernonCompilerDestroy(context);
-  return 0;
 }

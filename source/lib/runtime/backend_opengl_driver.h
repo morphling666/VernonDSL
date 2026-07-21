@@ -28,6 +28,9 @@ constexpr GlEnum kInfoLogLength = 0x8B84;
 constexpr GlEnum kFloat = 0x1406;
 constexpr GlEnum kUnsignedInt = 0x1405;
 constexpr GlEnum kTexture2D = 0x0DE1;
+constexpr GlEnum kTexture3D = 0x806F;
+constexpr GlEnum kTextureCubeMap = 0x8513;
+constexpr GlEnum kTexture0 = 0x84C0;
 constexpr GlEnum kFramebuffer = 0x8D40;
 constexpr GlEnum kColorAttachment0 = 0x8CE0;
 constexpr GlEnum kFramebufferComplete = 0x8CD5;
@@ -94,6 +97,10 @@ struct OpenGLDriver {
                                          const float *){};
   void(VERNON_GL_CALL *uniformMatrix4fv)(GlInt, GlSize, GlBoolean,
                                          const float *){};
+  void(VERNON_GL_CALL *uniform1i)(GlInt, GlInt){};
+  void(VERNON_GL_CALL *activeTexture)(GlEnum){};
+  void(VERNON_GL_CALL *bindTexture)(GlEnum, GlUint){};
+  void(VERNON_GL_CALL *bindSampler)(GlUint, GlUint){};
   void(VERNON_GL_CALL *dispatchCompute)(GlUint, GlUint, GlUint){};
   void(VERNON_GL_CALL *memoryBarrier)(unsigned){};
   void(VERNON_GL_CALL *finish)(){};

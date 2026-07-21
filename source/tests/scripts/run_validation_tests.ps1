@@ -1,12 +1,12 @@
 param(
   [string]$VernonOpt = (
-    Join-Path $PSScriptRoot "..\..\build\source\tools\vernon_opt\Release\vernon-opt.exe"
+    Join-Path $PSScriptRoot "..\..\..\build\source\tools\vernon_opt\Release\vernon-opt.exe"
   )
 )
 
 $ErrorActionPreference = "Stop"
-$valid = Join-Path $PSScriptRoot "integration\validate-valid.mlir"
-$invalid = Join-Path $PSScriptRoot "integration\validate-invalid.mlir"
+$valid = Join-Path $PSScriptRoot "..\integration\validate-valid.mlir"
+$invalid = Join-Path $PSScriptRoot "..\integration\validate-invalid.mlir"
 
 & $VernonOpt --vernon-validate $valid | Out-Null
 if ($LASTEXITCODE -ne 0) {

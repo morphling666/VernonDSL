@@ -14,9 +14,13 @@ _HOST_MODULES = {
     "__future__",
     "argparse",
     "cv2",
+    "importlib",
     "numpy",
+    "os",
     "pathlib",
+    "sys",
     "typing",
+    "types",
     "unittest",
     "vernon_dsl",
 }
@@ -493,14 +497,14 @@ class ModuleGraph:
                         continue
                 body.append(transformed)
 
+        if self.entry is not None:
+            body = self._prune_to_entry(body, self.entry, root)
         normalized = normalize_struct_methods(
             ast.Module(body=body, type_ignores=[]), str(root.path))
         body = normalized.body
         for statement in body:
             if isinstance(statement, ast.FunctionDef):
                 function_sources.setdefault(statement.name, (root, statement))
-        if self.entry is not None:
-            body = self._prune_to_entry(body, self.entry, root)
         self._validate_call_graph(body, function_sources, entry_names,
                                   host_function_names)
         combined = ast.fix_missing_locations(
@@ -719,8 +723,11 @@ class ModuleGraph:
                     pending.append(callee)
         return [
             statement for statement in body
-            if not isinstance(statement, ast.FunctionDef)
-            or statement.name in reachable
+            if ((isinstance(statement, ast.FunctionDef)
+                 and statement.name in reachable)
+                or (isinstance(statement, ast.ClassDef) and any(
+                    _decorator_name(decorator) == "struct"
+                    for decorator in statement.decorator_list)))
         ]
 
     def _validate_call_graph(

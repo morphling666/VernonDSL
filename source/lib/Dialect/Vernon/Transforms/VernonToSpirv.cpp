@@ -2,6 +2,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVAttributes.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
@@ -12,12 +13,30 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringSwitch.h"
 
 namespace mlir::vernon {
 namespace {
 
 FailureOr<Type> convertValueType(Type type) {
+  if (auto texture = dyn_cast<TextureType>(type)) {
+    std::optional<spirv::Dim> dimension =
+        llvm::StringSwitch<std::optional<spirv::Dim>>(texture.getDimension())
+            .Case("2d", spirv::Dim::Dim2D)
+            .Case("3d", spirv::Dim::Dim3D)
+            .Case("cube", spirv::Dim::Cube)
+            .Default(std::nullopt);
+    if (!dimension)
+      return failure();
+    auto image = spirv::ImageType::get(
+        texture.getElementType(), *dimension, spirv::ImageDepthInfo::NoDepth,
+        spirv::ImageArrayedInfo::NonArrayed,
+        spirv::ImageSamplingInfo::SingleSampled,
+        spirv::ImageSamplerUseInfo::NeedSampler, spirv::ImageFormat::Unknown);
+    return spirv::SampledImageType::get(image);
+  }
   if (auto tensor = dyn_cast<RankedTensorType>(type)) {
     if (!tensor.hasStaticShape())
       return failure();
@@ -54,6 +73,40 @@ std::optional<spirv::BuiltIn> parseBuiltIn(StringRef name) {
       .Case("local_invocation_id", spirv::BuiltIn::LocalInvocationId)
       .Case("workgroup_id", spirv::BuiltIn::WorkgroupId)
       .Default(std::nullopt);
+}
+
+std::string sanitizeInterfaceName(StringRef sourceName, StringRef fallback,
+                                  bool varying) {
+  StringRef input = sourceName.empty() ? fallback : sourceName;
+  std::string result;
+  bool uppercaseNext = varying && input.contains('_');
+  for (char character : input) {
+    if (llvm::isAlnum(character)) {
+      result.push_back(uppercaseNext ? llvm::toUpper(character) : character);
+      uppercaseNext = false;
+    } else if (character == '_' && varying) {
+      uppercaseNext = true;
+    } else {
+      result.push_back('_');
+      uppercaseNext = false;
+    }
+  }
+  if (result.empty())
+    result = "interface_value";
+  if (!llvm::isAlpha(result.front()) && result.front() != '_')
+    result.insert(result.begin(), '_');
+  return result;
+}
+
+std::string uniqueInterfaceName(StringRef preferred, StringRef stage,
+                                llvm::StringSet<> &usedNames) {
+  if (usedNames.insert(preferred).second)
+    return preferred.str();
+  std::string candidate = (preferred + "_" + stage).str();
+  unsigned suffix = 2;
+  while (!usedNames.insert(candidate).second)
+    candidate = (preferred + "_" + stage + "_" + Twine(suffix++)).str();
+  return candidate;
 }
 
 spirv::GlobalVariableOp
@@ -124,8 +177,15 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder,
     if (!input)
       return failure();
     SmallVector<int32_t> components;
-    for (char component : swizzle.getMask())
-      components.push_back(StringRef("xyzw").find(component));
+    for (char component : swizzle.getMask()) {
+      std::optional<unsigned> index = decodeSwizzleComponent(component);
+      if (!index) {
+        swizzle.emitError()
+            << "cannot lower invalid swizzle component '" << component << "'";
+        return failure();
+      }
+      components.push_back(static_cast<int32_t>(*index));
+    }
     FailureOr<Type> resultType =
         convertValueType(swizzle.getResult().getType());
     if (failed(resultType))
@@ -144,6 +204,18 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder,
   }
 
   if (auto intrinsic = dyn_cast<IntrinsicOp>(operation)) {
+    if (intrinsic.getName() == "texture_sample") {
+      Value sampledImage = mapped(intrinsic.getOperand(0));
+      Value coordinates = mapped(intrinsic.getOperand(2));
+      FailureOr<Type> resultType =
+          convertValueType(intrinsic.getResult().getType());
+      if (!sampledImage || !coordinates || failed(resultType))
+        return failure();
+      return spirv::ImageSampleImplicitLodOp::create(
+                 builder, location, *resultType, sampledImage, coordinates,
+                 spirv::ImageOperandsAttr(), ValueRange{})
+          .getResult();
+    }
     SmallVector<Value> operands;
     for (Value operand : intrinsic.getOperands()) {
       Value converted = mapped(operand);
@@ -187,6 +259,75 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder,
     return builder.create(state)->getResult(0);
   }
 
+  if (auto compare = dyn_cast<arith::CmpFOp>(operation)) {
+    Value lhs = mapped(compare.getLhs());
+    Value rhs = mapped(compare.getRhs());
+    if (!lhs || !rhs)
+      return failure();
+    switch (compare.getPredicate()) {
+    case arith::CmpFPredicate::OEQ:
+      return spirv::FOrdEqualOp::create(builder, location, lhs, rhs)
+          .getResult();
+    case arith::CmpFPredicate::ONE:
+      return spirv::FOrdNotEqualOp::create(builder, location, lhs, rhs)
+          .getResult();
+    case arith::CmpFPredicate::OLT:
+      return spirv::FOrdLessThanOp::create(builder, location, lhs, rhs)
+          .getResult();
+    case arith::CmpFPredicate::OLE:
+      return spirv::FOrdLessThanEqualOp::create(builder, location, lhs, rhs)
+          .getResult();
+    case arith::CmpFPredicate::OGT:
+      return spirv::FOrdGreaterThanOp::create(builder, location, lhs, rhs)
+          .getResult();
+    case arith::CmpFPredicate::OGE:
+      return spirv::FOrdGreaterThanEqualOp::create(builder, location, lhs, rhs)
+          .getResult();
+    default:
+      return failure();
+    }
+  }
+
+  if (auto compare = dyn_cast<arith::CmpIOp>(operation)) {
+    Value lhs = mapped(compare.getLhs());
+    Value rhs = mapped(compare.getRhs());
+    if (!lhs || !rhs)
+      return failure();
+    switch (compare.getPredicate()) {
+    case arith::CmpIPredicate::eq:
+      return spirv::IEqualOp::create(builder, location, lhs, rhs).getResult();
+    case arith::CmpIPredicate::ne:
+      return spirv::INotEqualOp::create(builder, location, lhs, rhs)
+          .getResult();
+    case arith::CmpIPredicate::slt:
+      return spirv::SLessThanOp::create(builder, location, lhs, rhs)
+          .getResult();
+    case arith::CmpIPredicate::sle:
+      return spirv::SLessThanEqualOp::create(builder, location, lhs, rhs)
+          .getResult();
+    case arith::CmpIPredicate::sgt:
+      return spirv::SGreaterThanOp::create(builder, location, lhs, rhs)
+          .getResult();
+    case arith::CmpIPredicate::sge:
+      return spirv::SGreaterThanEqualOp::create(builder, location, lhs, rhs)
+          .getResult();
+    default:
+      return failure();
+    }
+  }
+
+  if (auto select = dyn_cast<arith::SelectOp>(operation)) {
+    Value condition = mapped(select.getCondition());
+    Value trueValue = mapped(select.getTrueValue());
+    Value falseValue = mapped(select.getFalseValue());
+    FailureOr<Type> resultType = convertValueType(select.getType());
+    if (!condition || !trueValue || !falseValue || failed(resultType))
+      return failure();
+    return spirv::SelectOp::create(builder, location, *resultType, condition,
+                                   trueValue, falseValue)
+        .getResult();
+  }
+
   if (operation.getNumOperands() == 2 && operation.getNumResults() == 1) {
     Value lhs = mapped(operation.getOperand(0));
     Value rhs = mapped(operation.getOperand(1));
@@ -212,8 +353,120 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder,
   return failure();
 }
 
+LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder,
+                                         Block *functionEntry,
+                                         IRMapping &mapping,
+                                         SmallVectorImpl<Value> &yieldedValues);
+
+LogicalResult lowerIf(scf::IfOp ifOp, OpBuilder &builder, Block *functionEntry,
+                      IRMapping &mapping, SmallVectorImpl<Value> &results) {
+  Value condition = mapping.lookupOrNull(ifOp.getCondition());
+  if (!condition || !ifOp.getThenRegion().hasOneBlock() ||
+      (!ifOp.getElseRegion().empty() && !ifOp.getElseRegion().hasOneBlock()))
+    return failure();
+
+  SmallVector<Value> resultVariables;
+  OpBuilder variableBuilder = OpBuilder::atBlockBegin(functionEntry);
+  for (Type sourceType : ifOp.getResultTypes()) {
+    FailureOr<Type> type = convertValueType(sourceType);
+    if (failed(type))
+      return failure();
+    auto pointerType =
+        spirv::PointerType::get(*type, spirv::StorageClass::Function);
+    resultVariables.push_back(spirv::VariableOp::create(
+        variableBuilder, ifOp.getLoc(), pointerType,
+        spirv::StorageClass::Function, /*initializer=*/nullptr));
+  }
+
+  auto selection = spirv::SelectionOp::create(builder, ifOp.getLoc(),
+                                              spirv::SelectionControl::None);
+  {
+    OpBuilder::InsertionGuard guard(builder);
+    Region &body = selection.getBody();
+    Block *header = builder.createBlock(&body, body.end());
+    Block *thenBlock = builder.createBlock(&body, body.end());
+    Block *elseBlock = builder.createBlock(&body, body.end());
+    Block *mergeBlock = builder.createBlock(&body, body.end());
+
+    builder.setInsertionPointToEnd(header);
+    spirv::BranchConditionalOp::create(builder, ifOp.getLoc(), condition,
+                                       thenBlock, ValueRange{}, elseBlock,
+                                       ValueRange{});
+
+    SmallVector<Value> thenValues;
+    OpBuilder thenBuilder = OpBuilder::atBlockBegin(thenBlock);
+    if (failed(translateStraightLineBlock(ifOp.getThenRegion().front(),
+                                          thenBuilder, functionEntry, mapping,
+                                          thenValues)) ||
+        thenValues.size() != resultVariables.size())
+      return failure();
+    for (auto [variable, value] : llvm::zip_equal(resultVariables, thenValues))
+      spirv::StoreOp::create(thenBuilder, ifOp.getLoc(), variable, value);
+    spirv::BranchOp::create(thenBuilder, ifOp.getLoc(), mergeBlock);
+
+    SmallVector<Value> elseValues;
+    OpBuilder elseBuilder = OpBuilder::atBlockBegin(elseBlock);
+    if (ifOp.getElseRegion().empty()) {
+      if (!resultVariables.empty())
+        return failure();
+    } else if (failed(translateStraightLineBlock(ifOp.getElseRegion().front(),
+                                                 elseBuilder, functionEntry,
+                                                 mapping, elseValues)) ||
+               elseValues.size() != resultVariables.size()) {
+      return failure();
+    }
+    for (auto [variable, value] : llvm::zip_equal(resultVariables, elseValues))
+      spirv::StoreOp::create(elseBuilder, ifOp.getLoc(), variable, value);
+    spirv::BranchOp::create(elseBuilder, ifOp.getLoc(), mergeBlock);
+
+    builder.setInsertionPointToEnd(mergeBlock);
+    spirv::MergeOp::create(builder, ifOp.getLoc());
+  }
+
+  for (Value variable : resultVariables)
+    results.push_back(
+        spirv::LoadOp::create(builder, ifOp.getLoc(), variable).getResult());
+  return success();
+}
+
+LogicalResult
+translateStraightLineBlock(Block &source, OpBuilder &builder,
+                           Block *functionEntry, IRMapping &mapping,
+                           SmallVectorImpl<Value> &yieldedValues) {
+  for (Operation &operation : source) {
+    if (auto yield = dyn_cast<scf::YieldOp>(operation)) {
+      for (Value operand : yield.getOperands()) {
+        Value mapped = mapping.lookupOrNull(operand);
+        if (!mapped)
+          return failure();
+        yieldedValues.push_back(mapped);
+      }
+      return success();
+    }
+    if (auto ifOp = dyn_cast<scf::IfOp>(operation)) {
+      SmallVector<Value> translatedResults;
+      if (failed(lowerIf(ifOp, builder, functionEntry, mapping,
+                         translatedResults)))
+        return failure();
+      if (translatedResults.size() != ifOp.getNumResults())
+        return failure();
+      for (auto [sourceResult, translatedResult] :
+           llvm::zip_equal(ifOp.getResults(), translatedResults))
+        mapping.map(sourceResult, translatedResult);
+      continue;
+    }
+    FailureOr<Value> translated =
+        translateOperation(operation, builder, mapping);
+    if (failed(translated) || operation.getNumResults() != 1)
+      return failure();
+    mapping.map(operation.getResult(0), *translated);
+  }
+  return success();
+}
+
 LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target,
-                         OpBuilder &moduleBuilder) {
+                         OpBuilder &moduleBuilder,
+                         llvm::StringSet<> &usedInterfaceNames) {
   auto stage = source->getAttrOfType<StringAttr>(kStageAttrName);
   if (!stage)
     return success();
@@ -226,6 +479,10 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target,
   SmallVector<spirv::GlobalVariableOp> outputs;
   SmallVector<Attribute> interfaceSymbols;
   for (auto [index, type] : llvm::enumerate(source.getArgumentTypes())) {
+    if (isa<SamplerType>(type)) {
+      inputs.push_back({});
+      continue;
+    }
     FailureOr<Type> converted = convertValueType(type);
     if (failed(converted))
       return source.emitError() << "cannot lower argument #" << index
@@ -236,12 +493,20 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target,
       return source.emitError()
              << "argument #" << index << " has no Vernon interface kind";
     spirv::StorageClass storageClass =
-        kind.getValue() == "input" ? spirv::StorageClass::Input
+        isa<TextureType>(type)       ? spirv::StorageClass::UniformConstant
+        : kind.getValue() == "input" ? spirv::StorageClass::Input
         : kind.getValue() == "uniform"
             ? (attrs.binding ? spirv::StorageClass::Uniform
                              : spirv::StorageClass::PushConstant)
             : spirv::StorageClass::StorageBuffer;
-    std::string name = (source.getSymName() + "_arg_" + Twine(index)).str();
+    std::string fallback = (source.getSymName() + "_arg_" + Twine(index)).str();
+    auto sourceName =
+        source.getArgAttrOfType<StringAttr>(index, "vernon.source_name");
+    std::string preferred =
+        sanitizeInterfaceName(sourceName ? sourceName.getValue() : StringRef(),
+                              fallback, kind.getValue() == "input");
+    std::string name =
+        uniqueInterfaceName(preferred, stage.getValue(), usedInterfaceNames);
     auto global = createInterfaceVariable(moduleBuilder, source.getLoc(), name,
                                           *converted, storageClass,
                                           source.getArgAttrDict(index));
@@ -254,7 +519,15 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target,
     if (failed(converted))
       return source.emitError() << "cannot lower result #" << index << " type "
                                 << type << " to SPIR-V";
-    std::string name = (source.getSymName() + "_result_" + Twine(index)).str();
+    std::string fallback =
+        (source.getSymName() + "_result_" + Twine(index)).str();
+    auto sourceName =
+        source.getResultAttrOfType<StringAttr>(index, "vernon.source_name");
+    std::string preferred =
+        sanitizeInterfaceName(sourceName ? sourceName.getValue() : StringRef(),
+                              fallback, stage.getValue() == "vertex");
+    std::string name =
+        uniqueInterfaceName(preferred, stage.getValue(), usedInterfaceNames);
     auto global = createInterfaceVariable(
         moduleBuilder, source.getLoc(), name, *converted,
         spirv::StorageClass::Output, source.getResultAttrDict(index));
@@ -271,6 +544,8 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target,
   IRMapping mapping;
   for (auto [argument, global] :
        llvm::zip_equal(source.getArguments(), inputs)) {
+    if (!global)
+      continue;
     Value pointer =
         spirv::AddressOfOp::create(bodyBuilder, source.getLoc(), global);
     auto pointerType = cast<spirv::PointerType>(pointer.getType());
@@ -294,6 +569,18 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target,
                                mapping.lookup(value));
       }
       spirv::ReturnOp::create(bodyBuilder, source.getLoc());
+      continue;
+    }
+    if (auto ifOp = dyn_cast<scf::IfOp>(operation)) {
+      SmallVector<Value> translatedResults;
+      if (failed(
+              lowerIf(ifOp, bodyBuilder, entry, mapping, translatedResults)) ||
+          translatedResults.size() != ifOp.getNumResults())
+        return operation.emitError(
+            "structured conditional is not supported by SPIR-V lowering");
+      for (auto [sourceResult, translatedResult] :
+           llvm::zip_equal(ifOp.getResults(), translatedResults))
+        mapping.map(sourceResult, translatedResult);
       continue;
     }
     FailureOr<Value> translated =
@@ -352,9 +639,11 @@ struct VernonToSPIRVPass
     target->setAttr(spirv::getTargetEnvAttrName(),
                     spirv::getDefaultTargetEnv(module.getContext()));
     OpBuilder moduleBuilder = OpBuilder::atBlockBegin(target.getBody());
+    llvm::StringSet<> usedInterfaceNames;
 
     for (func::FuncOp function : entries) {
-      if (failed(lowerEntry(function, target, moduleBuilder))) {
+      if (failed(lowerEntry(function, target, moduleBuilder,
+                            usedInterfaceNames))) {
         target.erase();
         return signalPassFailure();
       }

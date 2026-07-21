@@ -1,26 +1,26 @@
 #include "vernon-c/Runtime.h"
 
-#include <cassert>
 #include <cstring>
+#include <gtest/gtest.h>
 
-int main() {
+TEST(RuntimeCuda, CopiesAndLaunchesKernel) {
   VernonRuntimeCapabilities capabilities =
       vernonRuntimeGetCapabilities(VERNON_RUNTIME_CUDA);
   if (!capabilities.available)
-    return 0;
+    GTEST_SKIP() << "CUDA runtime backend is unavailable";
   VernonRuntimeContext *runtime = vernonRuntimeCreate(VERNON_RUNTIME_CUDA, 0);
-  assert(runtime);
+  ASSERT_TRUE(runtime);
   VernonDeviceBuffer *buffer =
       vernonRuntimeBufferAllocate(runtime, 16, alignof(float));
-  assert(buffer);
+  ASSERT_TRUE(buffer);
   float input[4] = {1, 2, 3, 4};
   float output[4] = {};
-  assert(vernonRuntimeCopyFromHost(buffer, 0, input, sizeof(input)) ==
-         VERNON_STATUS_OK);
-  assert(vernonRuntimeCopyToHost(buffer, 0, output, sizeof(output)) ==
-         VERNON_STATUS_OK);
+  ASSERT_TRUE(vernonRuntimeCopyFromHost(buffer, 0, input, sizeof(input)) ==
+              VERNON_STATUS_OK);
+  ASSERT_TRUE(vernonRuntimeCopyToHost(buffer, 0, output, sizeof(output)) ==
+              VERNON_STATUS_OK);
   for (int index = 0; index < 4; ++index)
-    assert(input[index] == output[index]);
+    ASSERT_TRUE(input[index] == output[index]);
 
   static constexpr char ptx[] = R"(
 .version 8.0
@@ -77,22 +77,21 @@ int main() {
   VernonLoadedKernel *kernel =
       vernonRuntimeLoadArtifact(runtime, ptx, std::strlen(ptx), reflection,
                                 std::strlen(reflection), "scale", 5);
-  assert(kernel);
+  ASSERT_TRUE(kernel);
   const float factor = 2.0f;
   VernonLaunchArgument arguments[] = {
       {VERNON_LAUNCH_TENSOR, buffer, nullptr, 0},
       {VERNON_LAUNCH_SCALAR, nullptr, &factor, sizeof(factor)},
   };
-  assert(vernonRuntimeLaunch(kernel, {4, 1, 1}, arguments, 2) ==
-         VERNON_STATUS_OK);
-  assert(vernonRuntimeSynchronize(runtime) == VERNON_STATUS_OK);
-  assert(vernonRuntimeCopyToHost(buffer, 0, output, sizeof(output)) ==
-         VERNON_STATUS_OK);
+  ASSERT_TRUE(vernonRuntimeLaunch(kernel, {4, 1, 1}, arguments, 2) ==
+              VERNON_STATUS_OK);
+  ASSERT_TRUE(vernonRuntimeSynchronize(runtime) == VERNON_STATUS_OK);
+  ASSERT_TRUE(vernonRuntimeCopyToHost(buffer, 0, output, sizeof(output)) ==
+              VERNON_STATUS_OK);
   for (int index = 0; index < 4; ++index)
-    assert(output[index] == static_cast<float>(index) * factor);
-  assert(vernonRuntimeKernelUnload(kernel) == VERNON_STATUS_OK);
+    ASSERT_TRUE(output[index] == static_cast<float>(index) * factor);
+  ASSERT_TRUE(vernonRuntimeKernelUnload(kernel) == VERNON_STATUS_OK);
 
-  assert(vernonRuntimeBufferFree(buffer) == VERNON_STATUS_OK);
-  assert(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
-  return 0;
+  ASSERT_TRUE(vernonRuntimeBufferFree(buffer) == VERNON_STATUS_OK);
+  ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
 }

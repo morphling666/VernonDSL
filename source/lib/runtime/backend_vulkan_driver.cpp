@@ -47,6 +47,8 @@ bool VulkanDriver::loadInstance(VkInstance instance) {
                               "vkGetPhysicalDeviceQueueFamilyProperties");
   VERNON_LOAD_VULKAN_INSTANCE(getPhysicalDeviceMemoryProperties,
                               "vkGetPhysicalDeviceMemoryProperties");
+  VERNON_LOAD_VULKAN_INSTANCE(getPhysicalDeviceFormatProperties,
+                              "vkGetPhysicalDeviceFormatProperties");
   VERNON_LOAD_VULKAN_INSTANCE(createDevice, "vkCreateDevice");
   VERNON_LOAD_VULKAN_INSTANCE(getDeviceProcAddr, "vkGetDeviceProcAddr");
 #undef VERNON_LOAD_VULKAN_INSTANCE
@@ -105,6 +107,8 @@ bool VulkanDriver::loadDevice(VkDevice device) {
   VERNON_LOAD_VULKAN_DEVICE(bindImageMemory, "vkBindImageMemory");
   VERNON_LOAD_VULKAN_DEVICE(createImageView, "vkCreateImageView");
   VERNON_LOAD_VULKAN_DEVICE(destroyImageView, "vkDestroyImageView");
+  VERNON_LOAD_VULKAN_DEVICE(createSampler, "vkCreateSampler");
+  VERNON_LOAD_VULKAN_DEVICE(destroySampler, "vkDestroySampler");
   VERNON_LOAD_VULKAN_DEVICE(createRenderPass, "vkCreateRenderPass");
   VERNON_LOAD_VULKAN_DEVICE(destroyRenderPass, "vkDestroyRenderPass");
   VERNON_LOAD_VULKAN_DEVICE(createFramebuffer, "vkCreateFramebuffer");

@@ -128,7 +128,7 @@ The native program cache key includes:
 - target and target options;
 - generated artifact hashes.
 
-AOT `shader-pipeline` manifests continue to enumerate permitted feature keys.
+AOT `vd.pipeline_asset` descriptors enumerate permitted feature keys.
 Interactive and cooked variants must produce equivalent canonical keys and
 interface validation diagnostics.
 

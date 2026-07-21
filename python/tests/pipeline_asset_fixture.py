@@ -19,6 +19,14 @@ def solid_fragment() -> Annotated[vd.vec4[vd.f32], vd.location(0)]:
     return vd.vec4(1.0, 0.25, 0.0, 1.0)
 
 
+@vd.fragment
+def sampled_fragment(
+    image: Annotated[vd.Texture["2d", vd.f32], vd.resource(set=0, binding=0)],
+    sampler: Annotated[vd.Sampler, vd.resource(set=0, binding=1)],
+) -> Annotated[vd.vec4[vd.f32], vd.location(0)]:
+    return vd.texture_sample(image, sampler, vd.vec2(0.5, 0.5))
+
+
 @vd.kernel(workgroup_size=(1, 1, 1))
 def scale(
     values: vd.Tensor[vd.f32, (4, )],
@@ -37,7 +45,15 @@ triangle_asset = vd.pipeline_asset(
     variants=((), (OFFSET, )),
     targets={"opengl": {
         "glsl_version": 330
-    }},
+    }, "vulkan": {}},
+)
+
+sampled_asset = vd.pipeline_asset(
+    id="pipelines/sampled_triangle",
+    vertex=triangle_vertex,
+    fragment=sampled_fragment,
+    variants=((), ),
+    targets={"vulkan": {}},
 )
 
 scale_asset = vd.pipeline_asset(

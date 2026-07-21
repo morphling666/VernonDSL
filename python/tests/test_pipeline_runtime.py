@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import unittest
+from unittest import mock
 
 import numpy as np
 
 import vernon_dsl as vd
+import vernon_dsl.runtime as runtime_module
 from advanced_pipeline_shader import (
     advanced_fragment, advanced_vertex, feature_compute,
 )
@@ -309,6 +312,46 @@ class VulkanPipelineTests(unittest.TestCase):
             positions.to_numpy()[:, 0],
             np.array((-0.5, 1.0, 0.25), dtype=np.float32),
         )
+        self.assertEqual(render.compile_count, 1)
+
+    def test_pipeline_uses_owning_compiler_and_shared_planner(self) -> None:
+        render = vd.pipeline(triangle_vertex, solid_fragment)
+        positions = self._triangle()
+        target = vd.Texture.zeros(shape=(16, 16))
+        with mock.patch(
+                "subprocess.run",
+                side_effect=AssertionError("subprocess prohibited"),
+        ), mock.patch.object(
+                runtime_module,
+                "build_bundle_plan",
+                wraps=runtime_module.build_bundle_plan,
+        ) as planner:
+            render(position=positions, target=target)
+        planner.assert_called_once()
+
+    def test_bundle_parameter_output_layout_and_reinit_cache(self) -> None:
+        render = vd.pipeline(triangle_vertex, solid_fragment)
+        positions = self._triangle()
+        target = vd.Texture.zeros(shape=(16, 16))
+        render(position=positions, target=target)
+        compiled = render._compiled
+        self.assertIsNotNone(compiled)
+        assert compiled is not None
+        bundle = json.loads(compiled.bundle)
+        variant = bundle["variants"][0]
+        self.assertEqual(
+            [(row["name"], row["slot"], row["kind"])
+             for row in variant["parameters"]],
+            [("position", 0, "tensor")],
+        )
+        self.assertEqual(
+            [(row["name"], row["location"], row["type"])
+             for row in variant["outputs"]],
+            [("output_0", 0, "tensor<4xf32>")],
+        )
+        self.assertEqual(render.compile_count, 1)
+        vd.init(arch=vd.vulkan)
+        render(position=positions, target=target)
         self.assertEqual(render.compile_count, 1)
 
     def test_indexed_instanced_mrt(self) -> None:

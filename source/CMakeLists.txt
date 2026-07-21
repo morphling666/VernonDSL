@@ -32,9 +32,8 @@ if(VERNON_ENABLE_RUNTIME)
 endif()
 
 if(NOT VERNON_ENABLE_COMPILER)
-  if(BUILD_TESTING AND VERNON_ENABLE_RUNTIME)
-    include(VernonRuntimeTests.cmake)
-    vernon_add_runtime_tests()
+  if(BUILD_TESTING)
+    add_subdirectory(tests)
   endif()
   return()
 endif()
@@ -193,27 +192,22 @@ if(VERNON_ENABLE_RUNTIME)
   endif()
 endif()
 
-if(BUILD_TESTING AND Python_Interpreter_FOUND)
-  foreach(test_module IN ITEMS test_compiler.py test_shared_definitions.py
-                               test_blinn_phong_numeric.py)
-    string(REPLACE ".py" "" test_name "${test_module}")
-    add_test(NAME "vernon-python-${test_name}"
-      COMMAND ${Python_EXECUTABLE} -m unittest discover
-        -s ${CMAKE_SOURCE_DIR}/python/tests -p ${test_module})
-    set_tests_properties("vernon-python-${test_name}" PROPERTIES
-      ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python")
-  endforeach()
-endif()
-
-add_executable(vernon-compile
-  tools/vernon_compile.cpp
+add_library(vernon-compile-packaging STATIC
+  tools/vernon_compile_packaging.cpp
 )
-target_link_libraries(vernon-compile PRIVATE
+target_include_directories(vernon-compile-packaging PUBLIC tools)
+target_link_libraries(vernon-compile-packaging PUBLIC
   VernonDSLCompiler
+  PRIVATE
   LLVMSupport
   LLVMTargetParser
 )
+add_executable(vernon-compile
+  tools/vernon_compile.cpp
+)
+target_link_libraries(vernon-compile PRIVATE vernon-compile-packaging)
 if(MSVC)
+  target_compile_options(vernon-compile-packaging PRIVATE /EHsc)
   target_compile_options(vernon-compile PRIVATE /EHsc)
 endif()
 if(SKBUILD)
@@ -223,96 +217,8 @@ else()
   install(TARGETS vernon-compile RUNTIME DESTINATION bin)
 endif()
 
-if(BUILD_TESTING)
-  if(VERNON_ENABLE_RUNTIME)
-    include(VernonRuntimeTests.cmake)
-    vernon_add_runtime_tests()
-  endif()
-  add_executable(vernon-compiler-c-api-test
-    tests/compiler_c_api_test.c
-  )
-  target_link_libraries(vernon-compiler-c-api-test PRIVATE VernonDSLCompiler)
-  add_test(NAME vernon-compiler-c-api-test
-    COMMAND vernon-compiler-c-api-test
-  )
-
-  add_executable(vernon-compiler-cpp-api-test
-    tests/compiler_cpp_api_test.cpp
-  )
-  target_link_libraries(vernon-compiler-cpp-api-test PRIVATE VernonDSLCompiler)
-  add_test(NAME vernon-compiler-cpp-api-test
-    COMMAND vernon-compiler-cpp-api-test
-  )
-  if(VERNON_ENABLE_RUNTIME AND VERNON_ENABLE_VULKAN_RUNTIME)
-    find_package(Python 3.11 EXACT COMPONENTS Interpreter QUIET)
-    if(Python_FOUND)
-      set(VERNON_VULKAN_PIPELINE_TEST_DIR
-        ${CMAKE_CURRENT_BINARY_DIR}/vulkan_pipeline_bundle)
-      set(VERNON_VULKAN_PIPELINE_TEST_MANIFEST
-        ${VERNON_VULKAN_PIPELINE_TEST_DIR}/vulkan_pipeline_bundle.pipeline.json)
-      add_custom_command(
-        OUTPUT ${VERNON_VULKAN_PIPELINE_TEST_MANIFEST}
-        COMMAND ${CMAKE_COMMAND} -E env
-          "PYTHONPATH=${CMAKE_SOURCE_DIR}/python"
-          ${Python_EXECUTABLE} -m vernon_dsl.shader_asset_cli
-          ${CMAKE_SOURCE_DIR}/examples/variant_mesh.shader-pipeline.json
-          --asset-root ${CMAKE_SOURCE_DIR}/examples
-          --compiler $<TARGET_FILE:vernon-compile>
-          --target vulkan
-          --output ${VERNON_VULKAN_PIPELINE_TEST_DIR}
-        DEPENDS vernon-compile
-          ${CMAKE_SOURCE_DIR}/examples/variant_mesh.shader-pipeline.json
-          ${CMAKE_SOURCE_DIR}/examples/variant_mesh.shader-module.json
-          ${CMAKE_SOURCE_DIR}/examples/variant_mesh.py
-          ${CMAKE_SOURCE_DIR}/python/vernon_dsl/shader_assets.py
-        VERBATIM)
-      add_custom_target(vernon-vulkan-pipeline-test-bundle
-        DEPENDS ${VERNON_VULKAN_PIPELINE_TEST_MANIFEST})
-      add_executable(vernon-runtime-vulkan-pipeline-test
-        tests/runtime_vulkan_pipeline_test.cpp)
-      target_link_libraries(vernon-runtime-vulkan-pipeline-test PRIVATE
-        Vernon::Runtime)
-      target_compile_definitions(vernon-runtime-vulkan-pipeline-test
-        PRIVATE
-          VERNON_VULKAN_PIPELINE_BUNDLE="${VERNON_VULKAN_PIPELINE_TEST_MANIFEST}")
-      add_dependencies(vernon-runtime-vulkan-pipeline-test
-        vernon-vulkan-pipeline-test-bundle)
-      add_test(NAME vernon-runtime-vulkan-pipeline-test
-        COMMAND vernon-runtime-vulkan-pipeline-test)
-    endif()
-  endif()
-  if(VERNON_ENABLE_RUNTIME)
-    if(VERNON_ENABLE_VULKAN_RUNTIME)
-      add_executable(vernon-runtime-vulkan-test tests/runtime_vulkan_test.cpp)
-      target_link_libraries(vernon-runtime-vulkan-test PRIVATE
-        VernonDSLCompiler Vernon::Runtime)
-      add_test(NAME vernon-runtime-vulkan-test
-        COMMAND vernon-runtime-vulkan-test)
-    endif()
-  endif()
-endif()
-
 add_subdirectory(tools/vernon_opt)
 
 if(BUILD_TESTING)
-  add_test(NAME vernon-cpu-lowering-integration
-    COMMAND ${CMAKE_COMMAND}
-      "-DVERNON_OPT=$<TARGET_FILE:vernon-opt>"
-      "-DTEST_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/tests/integration"
-      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_cpu_lowering_tests.cmake)
-endif()
-
-if(BUILD_TESTING AND WIN32)
-  add_test(NAME vernon-validation-integration
-    COMMAND powershell -ExecutionPolicy Bypass
-      -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_validation_tests.ps1
-      -VernonOpt $<TARGET_FILE:vernon-opt>)
-  add_test(NAME vernon-python-native-integration
-    COMMAND powershell -ExecutionPolicy Bypass
-      -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_frontend_integration.ps1
-      -ProjectRoot ${CMAKE_SOURCE_DIR}
-      -BinaryDir ${CMAKE_CURRENT_BINARY_DIR}
-      -VernonOpt $<TARGET_FILE:vernon-opt>
-      -VernonCompiler $<TARGET_FILE:vernon-compile>
-  )
+  add_subdirectory(tests)
 endif()

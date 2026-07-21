@@ -1,0 +1,46 @@
+{
+  "graphics": {
+    "entries": {
+      "fragment": "solid_fragment",
+      "vertex": "triangle_vertex"
+    },
+    "features": [
+      "OFFSET"
+    ],
+    "outputs": [
+      {
+        "access": "write",
+        "dtype": "f32",
+        "kind": "texture",
+        "location": 0,
+        "name": "output_0",
+        "shape": [
+          4
+        ],
+        "type": "tensor<4xf32>"
+      }
+    ],
+    "parameters": [
+      {
+        "kind": "tensor",
+        "name": "position",
+        "slot": 0
+      }
+    ],
+    "step_kinds": [
+      "draw"
+    ],
+    "variants": [
+      [],
+      [
+        "OFFSET"
+      ]
+    ]
+  },
+  "targets": {
+    "opengl": {
+      "glsl_version": 330
+    },
+    "vulkan": {}
+  }
+}

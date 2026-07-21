@@ -68,6 +68,16 @@ reject_text("tensor/vector" "${TENSOR_OUTPUT}" "tensor<3xf32>")
 reject_text("struct declaration cleanup" "${TENSOR_OUTPUT}" "vernon.struct")
 
 run_case(
+  SWIZZLE
+  "cpu-swizzle-aliases.mlir"
+  "--vernon-lower-cpu-tensors"
+  FALSE
+)
+require_text("swizzle aliases" "${SWIZZLE_OUTPUT}" "vector.extract")
+require_text("alpha swizzle alias" "${SWIZZLE_OUTPUT}" "[3]")
+reject_text("swizzle aliases" "${SWIZZLE_OUTPUT}" "vernon.swizzle")
+
+run_case(
   BUFFER
   "cpu-buffer-memref.mlir"
   "--vernon-lower-cpu-resources"

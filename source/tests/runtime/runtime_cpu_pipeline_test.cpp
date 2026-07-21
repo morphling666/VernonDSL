@@ -3,11 +3,11 @@
 
 #include <nlohmann/json.hpp>
 
-#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <gtest/gtest.h>
 #include <iterator>
 #include <string>
 
@@ -34,7 +34,7 @@ std::string readFile(const std::filesystem::path &path) {
 void replaceOnce(std::string &text, const std::string &from,
                  const std::string &to) {
   const size_t position = text.find(from);
-  assert(position != std::string::npos);
+  ASSERT_TRUE(position != std::string::npos);
   text.replace(position, from.size(), to);
 }
 
@@ -82,31 +82,31 @@ VernonStatus staticallyLinkedFill(const VernonCpuInvocation *invocation) {
 
 } // namespace
 
-int main() {
+TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
   const std::filesystem::path directory = VERNON_CPU_BUNDLE_PATH;
   const std::string directoryUtf8 = directory.u8string();
   const std::string bundle = readFile(directory / "pipeline.bundle");
-  assert(!bundle.empty());
+  ASSERT_TRUE(!bundle.empty());
 
   VernonRuntimeBackend target = VERNON_RUNTIME_CUDA;
-  assert(vernonRuntimePipelineBundleInspectTarget(bundle.data(), bundle.size(),
-                                                  &target) == VERNON_STATUS_OK);
-  assert(target == VERNON_RUNTIME_CPU);
+  ASSERT_TRUE(vernonRuntimePipelineBundleInspectTarget(
+                  bundle.data(), bundle.size(), &target) == VERNON_STATUS_OK);
+  ASSERT_TRUE(target == VERNON_RUNTIME_CPU);
 
   VernonRuntimeContext *runtime = vernonRuntimeCreate(VERNON_RUNTIME_CPU, 0);
-  assert(runtime);
+  ASSERT_TRUE(runtime);
 
-  assert(
+  ASSERT_TRUE(
       !vernonRuntimeLoadPipelineBundle(runtime, bundle.data(), bundle.size()));
 
   const std::string schema2 = schema2Bundle(bundle);
   target = VERNON_RUNTIME_CUDA;
-  assert(vernonRuntimePipelineBundleInspectTarget(
-             schema2.data(), schema2.size(), &target) == VERNON_STATUS_OK);
-  assert(target == VERNON_RUNTIME_CPU);
+  ASSERT_TRUE(vernonRuntimePipelineBundleInspectTarget(
+                  schema2.data(), schema2.size(), &target) == VERNON_STATUS_OK);
+  ASSERT_TRUE(target == VERNON_RUNTIME_CPU);
   VernonPipelineBundle *schema2Loaded =
       loadWithDirectory(runtime, schema2, directoryUtf8);
-  assert(schema2Loaded);
+  ASSERT_TRUE(schema2Loaded);
   vernonRuntimePipelineBundleDestroy(schema2Loaded);
 
   const std::string objectBytes = "test relocatable object";
@@ -130,15 +130,15 @@ int main() {
   objectBundle["content_hash"] = vernon::runtime::sha256Hex(
       objectCanonical.data(), objectCanonical.size());
   const std::string objectManifest = objectBundle.dump(-1, ' ', false);
-  assert(vernonRuntimeRegisterStaticCpuEntry(
-             {"vernon_test_fill", std::strlen("vernon_test_fill")},
-             staticallyLinkedFill) == VERNON_STATUS_OK);
+  ASSERT_TRUE(vernonRuntimeRegisterStaticCpuEntry(
+                  {"vernon_test_fill", std::strlen("vernon_test_fill")},
+                  staticallyLinkedFill) == VERNON_STATUS_OK);
   VernonPipelineBundle *objectLoaded =
       loadWithDirectory(runtime, objectManifest, directoryUtf8);
-  assert(objectLoaded);
+  ASSERT_TRUE(objectLoaded);
   VernonLoadedPipeline *objectPipeline =
       vernonRuntimeResolvePipeline(objectLoaded, {nullptr, 0});
-  assert(objectPipeline);
+  ASSERT_TRUE(objectPipeline);
   vernonRuntimeLoadedPipelineDestroy(objectPipeline);
   vernonRuntimePipelineBundleDestroy(objectLoaded);
 
@@ -149,89 +149,89 @@ int main() {
   invalidSchema2["content_hash"] =
       vernon::runtime::sha256Hex(canonical.data(), canonical.size());
   canonical = invalidSchema2.dump(-1, ' ', false);
-  assert(!loadWithDirectory(runtime, canonical, directoryUtf8));
+  ASSERT_TRUE(!loadWithDirectory(runtime, canonical, directoryUtf8));
 
   VernonPipelineBundleLoadOptions shortOptions{};
   shortOptions.struct_size = sizeof(shortOptions) - 1;
   shortOptions.bundle_directory = directoryUtf8.c_str();
-  assert(!vernonRuntimeLoadPipelineBundleWithOptions(
+  ASSERT_TRUE(!vernonRuntimeLoadPipelineBundleWithOptions(
       runtime, bundle.data(), bundle.size(), &shortOptions));
 
   std::string invalid = bundle;
   replaceOnce(invalid, R"("steps": [{"kind": "dispatch", "stage": "fill"}])",
               R"("steps": [{"kind": "dispatch", "stage": "fill"},)"
               R"({"kind": "barrier"}])");
-  assert(!loadWithDirectory(runtime, invalid, directoryUtf8));
+  ASSERT_TRUE(!loadWithDirectory(runtime, invalid, directoryUtf8));
 
   invalid = bundle;
   replaceOnce(invalid, R"("steps": [{"kind": "dispatch", "stage": "fill"}])",
               R"("steps": [{"kind": "draw", "vertex": "fill", )"
               R"("fragment": "fill"}])");
-  assert(!loadWithDirectory(runtime, invalid, directoryUtf8));
+  ASSERT_TRUE(!loadWithDirectory(runtime, invalid, directoryUtf8));
 
   invalid = bundle;
   const std::string hashMarker = R"("sha256": ")";
   size_t position = invalid.find(hashMarker);
-  assert(position != std::string::npos);
+  ASSERT_TRUE(position != std::string::npos);
   position += hashMarker.size();
   invalid[position] = invalid[position] == '0' ? '1' : '0';
-  assert(!loadWithDirectory(runtime, invalid, directoryUtf8));
+  ASSERT_TRUE(!loadWithDirectory(runtime, invalid, directoryUtf8));
 
   invalid = bundle;
   const std::string libraryMarker = R"("path": ")";
   position = invalid.find(libraryMarker);
-  assert(position != std::string::npos);
+  ASSERT_TRUE(position != std::string::npos);
   position += libraryMarker.size();
   invalid.insert(position, "../");
-  assert(!loadWithDirectory(runtime, invalid, directoryUtf8));
+  ASSERT_TRUE(!loadWithDirectory(runtime, invalid, directoryUtf8));
 
   invalid = bundle;
   replaceOnce(invalid,
               std::string(R"("operating_system": ")") + VERNON_RUNTIME_TEST_OS +
                   "\"",
               R"("operating_system": "unsupported")");
-  assert(!loadWithDirectory(runtime, invalid, directoryUtf8));
+  ASSERT_TRUE(!loadWithDirectory(runtime, invalid, directoryUtf8));
 
   invalid = bundle;
   replaceOnce(invalid,
               std::string(R"("architecture": ")") + VERNON_RUNTIME_TEST_ARCH +
                   "\"",
               R"("architecture": "unsupported")");
-  assert(!loadWithDirectory(runtime, invalid, directoryUtf8));
+  ASSERT_TRUE(!loadWithDirectory(runtime, invalid, directoryUtf8));
 
   VernonPipelineBundle *loaded = vernonRuntimeLoadPipelineBundleFromDirectory(
       runtime, directoryUtf8.c_str());
-  assert(loaded);
+  ASSERT_TRUE(loaded);
   const VernonStringView id = vernonRuntimePipelineBundleGetId(loaded);
-  assert(id.size == std::strlen("cpu/fill"));
-  assert(std::memcmp(id.data, "cpu/fill", id.size) == 0);
+  ASSERT_TRUE(id.size == std::strlen("cpu/fill"));
+  ASSERT_TRUE(std::memcmp(id.data, "cpu/fill", id.size) == 0);
 
   VernonLoadedPipeline *pipeline =
       vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
-  assert(pipeline);
-  assert(vernonRuntimeLoadedPipelineGetParameterCount(pipeline) == 1);
+  ASSERT_TRUE(pipeline);
+  ASSERT_TRUE(vernonRuntimeLoadedPipelineGetParameterCount(pipeline) == 1);
   VernonPipelineParameterView parameter{};
-  assert(vernonRuntimeLoadedPipelineGetParameterByIndex(
-             pipeline, 0, &parameter) == VERNON_STATUS_OK);
-  assert(parameter.slot == 0 && parameter.kind == VERNON_PIPELINE_TENSOR &&
-         parameter.dtype == VERNON_DATA_F32 &&
-         parameter.access == VERNON_ACCESS_WRITE && parameter.rank == 1 &&
-         parameter.static_shape[0] == 12);
-  assert(vernonRuntimeLoadedPipelineFindParameter(
-             pipeline, {"output", std::strlen("output")}, &parameter) ==
-         VERNON_STATUS_OK);
-  assert(vernonRuntimeLoadedPipelineGetOutputCount(pipeline) == 1);
+  ASSERT_TRUE(vernonRuntimeLoadedPipelineGetParameterByIndex(
+                  pipeline, 0, &parameter) == VERNON_STATUS_OK);
+  ASSERT_TRUE(parameter.slot == 0 && parameter.kind == VERNON_PIPELINE_TENSOR &&
+              parameter.dtype == VERNON_DATA_F32 &&
+              parameter.access == VERNON_ACCESS_WRITE && parameter.rank == 1 &&
+              parameter.static_shape[0] == 12);
+  ASSERT_TRUE(vernonRuntimeLoadedPipelineFindParameter(
+                  pipeline, {"output", std::strlen("output")}, &parameter) ==
+              VERNON_STATUS_OK);
+  ASSERT_TRUE(vernonRuntimeLoadedPipelineGetOutputCount(pipeline) == 1);
   VernonPipelineOutputView outputView{};
-  assert(vernonRuntimeLoadedPipelineFindOutput(
-             pipeline, {"result", std::strlen("result")}, &outputView) ==
-         VERNON_STATUS_OK);
-  assert(outputView.kind == VERNON_PIPELINE_TENSOR &&
-         outputView.dtype == VERNON_DATA_F32 && outputView.rank == 1 &&
-         outputView.static_shape[0] == 12 && outputView.location == 0);
+  ASSERT_TRUE(vernonRuntimeLoadedPipelineFindOutput(
+                  pipeline, {"result", std::strlen("result")}, &outputView) ==
+              VERNON_STATUS_OK);
+  ASSERT_TRUE(outputView.kind == VERNON_PIPELINE_TENSOR &&
+              outputView.dtype == VERNON_DATA_F32 && outputView.rank == 1 &&
+              outputView.static_shape[0] == 12 && outputView.location == 0);
 
   VernonDeviceBuffer *buffer =
       vernonRuntimeBufferAllocate(runtime, 12 * sizeof(float), alignof(float));
-  assert(buffer);
+  ASSERT_TRUE(buffer);
   const uint64_t shape[] = {12};
   const uint64_t strides[] = {sizeof(float)};
   VernonPipelineArgument argument{};
@@ -245,18 +245,17 @@ int main() {
   invocation.arguments = &argument;
   invocation.argument_count = 1;
   invocation.compute_grid = {3, 2, 2};
-  assert(vernonRuntimePipelineInvoke(pipeline, &invocation) ==
-         VERNON_STATUS_OK);
+  ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) ==
+              VERNON_STATUS_OK);
 
   float output[12]{};
-  assert(vernonRuntimeCopyToHost(buffer, 0, output, sizeof(output)) ==
-         VERNON_STATUS_OK);
-  assert(output[0] == 0.0f && output[2] == 2.0f);
-  assert(output[3] == 10.0f && output[11] == 112.0f);
+  ASSERT_TRUE(vernonRuntimeCopyToHost(buffer, 0, output, sizeof(output)) ==
+              VERNON_STATUS_OK);
+  ASSERT_TRUE(output[0] == 0.0f && output[2] == 2.0f);
+  ASSERT_TRUE(output[3] == 10.0f && output[11] == 112.0f);
 
-  assert(vernonRuntimeBufferFree(buffer) == VERNON_STATUS_OK);
+  ASSERT_TRUE(vernonRuntimeBufferFree(buffer) == VERNON_STATUS_OK);
   vernonRuntimeLoadedPipelineDestroy(pipeline);
   vernonRuntimePipelineBundleDestroy(loaded);
-  assert(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
-  return 0;
+  ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
 }

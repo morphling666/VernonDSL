@@ -20,6 +20,7 @@ extern "C" {
 typedef struct VernonRuntimeContext VernonRuntimeContext;
 typedef struct VernonDeviceBuffer VernonDeviceBuffer;
 typedef struct VernonDeviceTexture VernonDeviceTexture;
+typedef struct VernonDeviceSampler VernonDeviceSampler;
 typedef struct VernonLoadedKernel VernonLoadedKernel;
 typedef struct VernonPipelineBundle VernonPipelineBundle;
 typedef struct VernonLoadedPipeline VernonLoadedPipeline;
@@ -123,14 +124,73 @@ vernonRuntimeCopyToHost(const VernonDeviceBuffer *buffer, size_t offset,
                         void *destination, size_t size);
 
 typedef enum VernonTextureFormat {
-  VERNON_TEXTURE_RGBA8_UNORM = 0
+  VERNON_TEXTURE_RGBA8_UNORM = 0,
+  VERNON_TEXTURE_RGBA8_SRGB = 1,
+  VERNON_TEXTURE_RGBA16_FLOAT = 2,
+  VERNON_TEXTURE_RGBA32_FLOAT = 3,
+  VERNON_TEXTURE_R8_UNORM = 4,
+  VERNON_TEXTURE_R16_FLOAT = 5,
+  VERNON_TEXTURE_R32_FLOAT = 6,
+  VERNON_TEXTURE_RG8_UNORM = 7,
+  VERNON_TEXTURE_RGB8_UNORM = 8,
+  VERNON_TEXTURE_R11G11B10_FLOAT = 9
 } VernonTextureFormat;
 
+typedef enum VernonTextureDimension {
+  VERNON_TEXTURE_2D = 0,
+  VERNON_TEXTURE_3D = 1,
+  VERNON_TEXTURE_CUBE = 2
+} VernonTextureDimension;
+
+typedef struct VernonTextureDescriptor {
+  uint32_t struct_size;
+  VernonTextureDimension dimension;
+  VernonTextureFormat format;
+  uint32_t width;
+  uint32_t height;
+  /* 3D depth; must be one for 2D and Cube sampled textures. */
+  uint32_t depth;
+  uint32_t mip_levels;
+  uint32_t reserved[4];
+} VernonTextureDescriptor;
+
+typedef enum VernonSamplerWrapMode {
+  VERNON_SAMPLER_REPEAT = 0,
+  VERNON_SAMPLER_MIRRORED_REPEAT = 1,
+  VERNON_SAMPLER_CLAMP_TO_EDGE = 2,
+  VERNON_SAMPLER_CLAMP_TO_BORDER = 3
+} VernonSamplerWrapMode;
+
+typedef enum VernonSamplerFilter {
+  VERNON_SAMPLER_NEAREST = 0,
+  VERNON_SAMPLER_LINEAR = 1
+} VernonSamplerFilter;
+
+typedef struct VernonSamplerDescriptor {
+  uint32_t struct_size;
+  VernonSamplerWrapMode wrap_u;
+  VernonSamplerWrapMode wrap_v;
+  VernonSamplerWrapMode wrap_w;
+  VernonSamplerFilter min_filter;
+  VernonSamplerFilter mag_filter;
+  VernonSamplerFilter mip_filter;
+  uint32_t reserved[4];
+} VernonSamplerDescriptor;
+
+VERNON_RUNTIME_CAPI VernonDeviceTexture *
+vernonRuntimeTextureCreate(VernonRuntimeContext *context,
+                           const VernonTextureDescriptor *descriptor);
+/* Compatibility convenience API for a one-mip 2D sampled texture. */
 VERNON_RUNTIME_CAPI VernonDeviceTexture *
 vernonRuntimeTextureCreate2D(VernonRuntimeContext *context, uint32_t width,
                              uint32_t height, VernonTextureFormat format);
 VERNON_RUNTIME_CAPI VernonStatus
 vernonRuntimeTextureFree(VernonDeviceTexture *texture);
+VERNON_RUNTIME_CAPI VernonDeviceTexture *
+vernonRuntimeImportOpenGLTexture(VernonRuntimeContext *context,
+                                 uint32_t texture,
+                                 const VernonTextureDescriptor *descriptor);
+/* Compatibility convenience API for importing a 2D OpenGL texture. */
 VERNON_RUNTIME_CAPI VernonDeviceTexture *
 vernonRuntimeImportOpenGLTexture2D(VernonRuntimeContext *context,
                                    uint32_t texture, uint32_t width,
@@ -139,6 +199,14 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeTextureCopyFromHost(
     VernonDeviceTexture *texture, const void *source, size_t size);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeTextureCopyToHost(
     const VernonDeviceTexture *texture, void *destination, size_t size);
+VERNON_RUNTIME_CAPI VernonDeviceSampler *
+vernonRuntimeSamplerCreate(VernonRuntimeContext *context,
+                           const VernonSamplerDescriptor *descriptor);
+VERNON_RUNTIME_CAPI VernonDeviceSampler *
+vernonRuntimeImportOpenGLSampler(VernonRuntimeContext *context,
+                                 uint32_t sampler);
+VERNON_RUNTIME_CAPI VernonStatus
+vernonRuntimeSamplerFree(VernonDeviceSampler *sampler);
 
 VERNON_RUNTIME_CAPI VernonLoadedKernel *
 vernonRuntimeLoadArtifact(VernonRuntimeContext *context, const void *artifact,
@@ -226,7 +294,7 @@ typedef struct VernonTextureView {
   VernonDeviceTexture *texture;
   VernonTextureFormat format;
   VernonValueAccess access;
-  uint32_t dimension;
+  VernonTextureDimension dimension;
   uint32_t width;
   uint32_t height;
   uint32_t depth;
@@ -243,7 +311,8 @@ typedef struct VernonInlineValue {
 typedef enum VernonPipelineArgumentKind {
   VERNON_PIPELINE_TENSOR = 0,
   VERNON_PIPELINE_TEXTURE = 1,
-  VERNON_PIPELINE_INLINE_VALUE = 2
+  VERNON_PIPELINE_INLINE_VALUE = 2,
+  VERNON_PIPELINE_SAMPLER = 3
 } VernonPipelineArgumentKind;
 
 typedef struct VernonPipelineArgument {
@@ -253,6 +322,7 @@ typedef struct VernonPipelineArgument {
     VernonTensorView tensor;
     VernonTextureView texture;
     VernonInlineValue inline_value;
+    VernonDeviceSampler *sampler;
   };
 } VernonPipelineArgument;
 

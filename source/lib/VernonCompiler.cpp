@@ -29,6 +29,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/DialectRegistry.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/InitAllDialects.h"
@@ -39,6 +40,7 @@
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Target/SPIRV/Serialization.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
@@ -66,12 +68,14 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #if defined(_WIN32)
@@ -314,7 +318,207 @@ uint64_t cpuSourceTypeSize(mlir::Type type) {
                      tensor.getElementType().getIntOrFloatBitWidth() / 8, 1);
 }
 
-std::string buildReflection(mlir::ModuleOp module) {
+enum class ResourceKind { None, Texture, Sampler };
+
+ResourceKind resourceKind(mlir::Type type) {
+  if (mlir::isa<mlir::vernon::TextureType>(type))
+    return ResourceKind::Texture;
+  if (mlir::isa<mlir::vernon::SamplerType>(type))
+    return ResourceKind::Sampler;
+  return ResourceKind::None;
+}
+
+struct SampledTextureBinding {
+  int64_t descriptorSet;
+  int64_t binding;
+
+  bool operator<(const SampledTextureBinding &other) const {
+    return std::tie(descriptorSet, binding) <
+           std::tie(other.descriptorSet, other.binding);
+  }
+};
+
+using ResourceOrigins = std::set<unsigned>;
+using ResourceProvenance =
+    llvm::DenseMap<mlir::Value, ResourceOrigins>;
+
+mlir::FailureOr<std::map<unsigned, std::set<SampledTextureBinding>>>
+analyzeSampledTextureBindings(mlir::func::FuncOp function) {
+  struct ForwardingEdge {
+    mlir::Value source;
+    mlir::Value destination;
+  };
+
+  ResourceProvenance provenance;
+  for (auto [index, argument] : llvm::enumerate(function.getArguments()))
+    if (resourceKind(argument.getType()) != ResourceKind::None)
+      provenance[argument].insert(index);
+
+  llvm::SmallVector<ForwardingEdge> edges;
+  auto addEdge = [&](mlir::Value source, mlir::Value destination) {
+    ResourceKind sourceKind = resourceKind(source.getType());
+    if (sourceKind != ResourceKind::None &&
+        sourceKind == resourceKind(destination.getType()))
+      edges.push_back({source, destination});
+  };
+
+  function.walk([&](mlir::Operation *operation) {
+    if (auto select = mlir::dyn_cast<mlir::arith::SelectOp>(operation)) {
+      addEdge(select.getTrueValue(), select.getResult());
+      addEdge(select.getFalseValue(), select.getResult());
+    } else if (mlir::isa<mlir::UnrealizedConversionCastOp>(operation) &&
+               operation->getNumOperands() == 1 &&
+               operation->getNumResults() == 1) {
+      addEdge(operation->getOperand(0), operation->getResult(0));
+    } else if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(operation)) {
+      auto thenYield =
+          mlir::cast<mlir::scf::YieldOp>(ifOp.thenBlock()->getTerminator());
+      auto elseYield =
+          mlir::cast<mlir::scf::YieldOp>(ifOp.elseBlock()->getTerminator());
+      for (auto [result, thenValue, elseValue] :
+           llvm::zip_equal(ifOp.getResults(), thenYield.getOperands(),
+                           elseYield.getOperands())) {
+        addEdge(thenValue, result);
+        addEdge(elseValue, result);
+      }
+    } else if (auto forOp = mlir::dyn_cast<mlir::scf::ForOp>(operation)) {
+      for (auto [init, iterArgument, yielded, result] :
+           llvm::zip_equal(forOp.getInitArgs(), forOp.getRegionIterArgs(),
+                           forOp.getYieldedValues(), forOp.getResults())) {
+        addEdge(init, iterArgument);
+        addEdge(yielded, iterArgument);
+        addEdge(init, result);
+        addEdge(yielded, result);
+      }
+    } else if (auto whileOp = mlir::dyn_cast<mlir::scf::WhileOp>(operation)) {
+      auto condition = mlir::cast<mlir::scf::ConditionOp>(
+          whileOp.getBefore().front().getTerminator());
+      auto yield = mlir::cast<mlir::scf::YieldOp>(
+          whileOp.getAfter().front().getTerminator());
+      for (auto [init, beforeArgument, conditionValue, afterArgument, yielded,
+                 result] :
+           llvm::zip_equal(whileOp.getInits(), whileOp.getBeforeArguments(),
+                           condition.getArgs(), whileOp.getAfterArguments(),
+                           yield.getOperands(), whileOp.getResults())) {
+        addEdge(init, beforeArgument);
+        addEdge(yielded, beforeArgument);
+        addEdge(conditionValue, afterArgument);
+        addEdge(conditionValue, result);
+      }
+    }
+
+    auto branch = mlir::dyn_cast<mlir::BranchOpInterface>(operation);
+    if (!branch)
+      return;
+    for (auto [successorIndex, successor] :
+         llvm::enumerate(operation->getSuccessors())) {
+      mlir::SuccessorOperands successorOperands =
+          branch.getSuccessorOperands(successorIndex);
+      for (unsigned argumentIndex =
+               successorOperands.getProducedOperandCount();
+           argumentIndex < successorOperands.size() &&
+           argumentIndex < successor->getNumArguments();
+           ++argumentIndex)
+        addEdge(successorOperands[argumentIndex],
+                successor->getArgument(argumentIndex));
+    }
+  });
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (const ForwardingEdge &edge : edges) {
+      const ResourceOrigins &source = provenance[edge.source];
+      ResourceOrigins &destination = provenance[edge.destination];
+      size_t previousSize = destination.size();
+      destination.insert(source.begin(), source.end());
+      changed |= destination.size() != previousSize;
+    }
+  }
+
+  std::map<unsigned, std::set<SampledTextureBinding>> samplerBindings;
+  std::map<SampledTextureBinding, std::set<unsigned>> bindingSamplers;
+  bool invalid = false;
+  function.walk([&](mlir::vernon::IntrinsicOp intrinsic) {
+    if (intrinsic.getName() != "texture_sample")
+      return;
+    const ResourceOrigins &textureOrigins =
+        provenance[intrinsic.getOperand(0)];
+    const ResourceOrigins &samplerOrigins =
+        provenance[intrinsic.getOperand(1)];
+    if (textureOrigins.empty() || samplerOrigins.empty()) {
+      intrinsic.emitError()
+          << "cannot resolve texture_sample "
+          << (textureOrigins.empty() && samplerOrigins.empty()
+                  ? "texture and sampler"
+                  : textureOrigins.empty() ? "texture" : "sampler")
+          << " provenance to entry arguments";
+      invalid = true;
+      return;
+    }
+
+    for (unsigned textureOrigin : textureOrigins) {
+      if (textureOrigin >= function.getNumArguments() ||
+          resourceKind(function.getArgumentTypes()[textureOrigin]) !=
+              ResourceKind::Texture) {
+        intrinsic.emitError()
+            << "texture_sample texture provenance includes non-texture entry "
+               "argument #"
+            << textureOrigin;
+        invalid = true;
+        continue;
+      }
+      auto attrs = function.getArgAttrDict(textureOrigin);
+      auto descriptorSet = attrs.getAs<mlir::IntegerAttr>("vernon.set");
+      auto binding = attrs.getAs<mlir::IntegerAttr>("vernon.binding");
+      if (!descriptorSet || !binding) {
+        intrinsic.emitError()
+            << "texture_sample texture entry argument #" << textureOrigin
+            << " has no descriptor set/binding";
+        invalid = true;
+        continue;
+      }
+      SampledTextureBinding sampledBinding{descriptorSet.getInt(),
+                                           binding.getInt()};
+      for (unsigned samplerOrigin : samplerOrigins) {
+        if (samplerOrigin >= function.getNumArguments() ||
+            resourceKind(function.getArgumentTypes()[samplerOrigin]) !=
+                ResourceKind::Sampler) {
+          intrinsic.emitError()
+              << "texture_sample sampler provenance includes non-sampler "
+                 "entry argument #"
+              << samplerOrigin;
+          invalid = true;
+          continue;
+        }
+        samplerBindings[samplerOrigin].insert(sampledBinding);
+        bindingSamplers[sampledBinding].insert(samplerOrigin);
+      }
+    }
+  });
+  if (invalid)
+    return mlir::failure();
+
+  for (const auto &[binding, samplers] : bindingSamplers) {
+    if (samplers.size() <= 1)
+      continue;
+    std::string samplerList;
+    llvm::raw_string_ostream stream(samplerList);
+    llvm::interleaveComma(samplers, stream,
+                          [&](unsigned sampler) { stream << '#' << sampler; });
+    function.emitError()
+        << "sampled texture at set " << binding.descriptorSet << ", binding "
+        << binding.binding << " may use multiple sampler entry arguments ("
+        << samplerList
+        << "); the current combined-image SPIR-V model requires one sampler "
+           "origin per sampled texture binding";
+    return mlir::failure();
+  }
+  return samplerBindings;
+}
+
+mlir::FailureOr<std::string>
+buildReflection(mlir::ModuleOp module, mlir::ModuleOp sourceModule) {
   auto scalarDtype = [](mlir::Type type) -> std::string {
     if (type.isF16())
       return "f16";
@@ -332,12 +536,20 @@ std::string buildReflection(mlir::ModuleOp module) {
   };
   llvm::json::Array entries;
   std::set<std::string> requiredFeatures;
+  bool invalid = false;
   module.walk([&](mlir::func::FuncOp function) {
     auto stage = function->getAttrOfType<mlir::StringAttr>("vernon.stage");
     if (!stage)
       return;
     if (stage.getValue() == "compute")
       requiredFeatures.insert("compute");
+
+    mlir::FailureOr<std::map<unsigned, std::set<SampledTextureBinding>>>
+        sampledBindings = analyzeSampledTextureBindings(function);
+    if (mlir::failed(sampledBindings)) {
+      invalid = true;
+      return;
+    }
 
     llvm::json::Array arguments;
     uint64_t argumentOffset = 0;
@@ -367,6 +579,33 @@ std::string buildReflection(mlir::ModuleOp module) {
         }
       }
       mlir::Type argumentType = function.getArgumentTypes()[index];
+      if (auto texture =
+              mlir::dyn_cast<mlir::vernon::TextureType>(argumentType)) {
+        argument["kind"] = "texture";
+        argument["dtype"] = scalarDtype(texture.getElementType());
+        argument["dimension"] = texture.getDimension().str();
+        argument["access"] = "read";
+      } else if (mlir::isa<mlir::vernon::SamplerType>(argumentType)) {
+        argument["kind"] = "sampler";
+        argument["access"] = "read";
+        auto pairs = sampledBindings->find(index);
+        if (pairs != sampledBindings->end()) {
+          llvm::json::Array bindings;
+          for (const SampledTextureBinding &pair : pairs->second) {
+            llvm::json::Object reflectedBinding;
+            reflectedBinding["set"] = pair.descriptorSet;
+            reflectedBinding["binding"] = pair.binding;
+            bindings.emplace_back(std::move(reflectedBinding));
+          }
+          argument["sampled_texture_bindings"] = std::move(bindings);
+          if (pairs->second.size() == 1) {
+            argument["sampled_texture_set"] =
+                pairs->second.begin()->descriptorSet;
+            argument["sampled_texture_binding"] =
+                pairs->second.begin()->binding;
+          }
+        }
+      }
       if (stage.getValue() == "compute") {
         auto attrs = function.getArgAttrDict(index);
         auto builtin = attrs.getAs<mlir::StringAttr>("vernon.builtin");
@@ -376,6 +615,9 @@ std::string buildReflection(mlir::ModuleOp module) {
           argument["builtin"] = builtin.getValue().str();
           if (sourceDtype)
             argument["dtype"] = sourceDtype.getValue().str();
+        } else if (mlir::isa<mlir::vernon::TextureType,
+                             mlir::vernon::SamplerType>(argumentType)) {
+          // Resource kind and binding metadata are emitted above.
         } else if (auto buffer =
                        mlir::dyn_cast<mlir::vernon::BufferType>(argumentType)) {
           argument["kind"] = "tensor";
@@ -420,6 +662,8 @@ std::string buildReflection(mlir::ModuleOp module) {
         requiredFeatures.insert("buffers");
       if (mlir::isa<mlir::vernon::TextureType>(argumentType))
         requiredFeatures.insert("textures");
+      if (mlir::isa<mlir::vernon::SamplerType>(argumentType))
+        requiredFeatures.insert("samplers");
       arguments.emplace_back(std::move(argument));
     }
 
@@ -464,6 +708,8 @@ std::string buildReflection(mlir::ModuleOp module) {
     }
     entries.emplace_back(std::move(entry));
   });
+  if (invalid)
+    return mlir::failure();
 
   llvm::json::Object root;
   root["schema_version"] = int64_t{2};
@@ -471,7 +717,7 @@ std::string buildReflection(mlir::ModuleOp module) {
   root["entries"] = std::move(entries);
   root["artifacts"] = llvm::json::Array();
   llvm::json::Array dependencies;
-  if (auto encoded = module->getAttrOfType<mlir::ArrayAttr>(
+  if (auto encoded = sourceModule->getAttrOfType<mlir::ArrayAttr>(
           "vernon.source_dependencies")) {
     for (mlir::Attribute attribute : encoded) {
       auto value = mlir::dyn_cast<mlir::StringAttr>(attribute);
@@ -491,7 +737,8 @@ std::string buildReflection(mlir::ModuleOp module) {
   root["required_features"] = std::move(features);
   std::string canonicalModule;
   llvm::raw_string_ostream moduleStream(canonicalModule);
-  module.print(moduleStream, mlir::OpPrintingFlags().enableDebugInfo(false));
+  sourceModule.print(moduleStream,
+                     mlir::OpPrintingFlags().enableDebugInfo(false));
   root["module_hash"] = llvm::utohexstr(llvm::xxHash64(canonicalModule));
 
   std::string output;
@@ -569,7 +816,23 @@ std::unique_ptr<VernonCompileResult> validate(VernonCompilerContext *context,
   module->print(artifactStream, mlir::OpPrintingFlags().enableDebugInfo(false));
   result->artifacts.push_back(
       VernonCompileResult::Artifact{"module.mlir", std::move(canonicalModule)});
-  result->reflection = buildReflection(*module);
+
+  mlir::OwningOpRef<mlir::ModuleOp> reflectionModule(
+      mlir::cast<mlir::ModuleOp>(module->clone()));
+  mlir::PassManager reflectionPassManager(&context->context);
+  reflectionPassManager.addPass(
+      mlir::vernon::createVernonInlineHelpersPass());
+  if (mlir::failed(reflectionPassManager.run(*reflectionModule))) {
+    result->status = VERNON_STATUS_VERIFICATION_ERROR;
+    return result;
+  }
+  mlir::FailureOr<std::string> reflection =
+      buildReflection(*reflectionModule, *module);
+  if (mlir::failed(reflection)) {
+    result->status = VERNON_STATUS_VERIFICATION_ERROR;
+    return result;
+  }
+  result->reflection = std::move(*reflection);
   result->status = VERNON_STATUS_OK;
   return result;
 }
@@ -1084,8 +1347,46 @@ bool crossCompile(VernonCompileResult &result, VernonTarget target,
       std::vector<uint32_t> words(artifact.data.size() / sizeof(uint32_t));
       std::memcpy(words.data(), artifact.data.data(), artifact.data.size());
       spirv_cross::Compiler probe(words);
-      for (const spirv_cross::EntryPoint &entry :
-           probe.get_entry_points_and_stages()) {
+      const auto entryPoints = probe.get_entry_points_and_stages();
+      std::map<uint32_t, std::string> varyingNames;
+      if (target != VERNON_TARGET_METAL) {
+        auto sourceName = [](std::string name) {
+          for (llvm::StringRef suffix : {"_vertex", "_fragment"}) {
+            if (llvm::StringRef(name).ends_with(suffix)) {
+              name.resize(name.size() - suffix.size());
+              break;
+            }
+          }
+          return name;
+        };
+        for (const spirv_cross::EntryPoint &entry : entryPoints) {
+          spirv_cross::CompilerGLSL interfaceCompiler(words);
+          interfaceCompiler.set_entry_point(entry.name, entry.execution_model);
+          const spirv_cross::ShaderResources resources =
+              interfaceCompiler.get_shader_resources();
+          const auto *variables =
+              entry.execution_model == spv::ExecutionModelVertex
+                  ? &resources.stage_outputs
+              : entry.execution_model == spv::ExecutionModelFragment
+                  ? &resources.stage_inputs
+                  : nullptr;
+          if (!variables)
+            continue;
+          for (const spirv_cross::Resource &variable : *variables) {
+            if (!interfaceCompiler.has_decoration(variable.id,
+                                                  spv::DecorationLocation))
+              continue;
+            const uint32_t location = interfaceCompiler.get_decoration(
+                variable.id, spv::DecorationLocation);
+            std::string name = sourceName(variable.name);
+            if (entry.execution_model == spv::ExecutionModelVertex)
+              varyingNames[location] = std::move(name);
+            else
+              varyingNames.try_emplace(location, std::move(name));
+          }
+        }
+      }
+      for (const spirv_cross::EntryPoint &entry : entryPoints) {
         std::string source;
         std::string extension;
         if (target == VERNON_TARGET_METAL) {
@@ -1105,14 +1406,17 @@ bool crossCompile(VernonCompileResult &result, VernonTarget target,
                 continue;
               const uint32_t location =
                   compiler.get_decoration(variable.id, spv::DecorationLocation);
+              const auto name = varyingNames.find(location);
               compiler.set_name(variable.id,
-                                "vernon_location_" + std::to_string(location));
+                                name != varyingNames.end()
+                                    ? name->second
+                                    : "vernon_location_" +
+                                          std::to_string(location));
             }
           };
-          // Separate stage compilations otherwise inherit entry-specific
-          // SPIR-V names. Canonical location names let GLSL 3.30 link vertex
-          // outputs to fragment inputs. Vertex inputs and fragment outputs
-          // keep their names to avoid same-location identifier collisions.
+          // Canonical location names let GLSL 3.30 link vertex outputs to
+          // fragment inputs. Prefer the source-derived vertex output name;
+          // vertex inputs and fragment outputs retain their own source names.
           if (entry.execution_model == spv::ExecutionModelVertex)
             canonicalizeInterface(resources.stage_outputs);
           else if (entry.execution_model == spv::ExecutionModelFragment)

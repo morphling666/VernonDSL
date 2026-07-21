@@ -152,8 +152,8 @@ program cache keys include:
 - merged external interface;
 - generated stage artifact hashes.
 
-The existing `shader-module` / `shader-pipeline` manifests and cooked
-`shader.json` bundles remain the AOT deployment format.
+Python `vd.pipeline_asset` descriptors are the AOT authoring format. Cooking
+produces versioned schema-2 `.pipeline.json` bundles.
 
 ## Native runtime additions
 

@@ -34,6 +34,7 @@ def Vernon_SwizzleOp : Vernon_Op<"swizzle", [Pure]> {
   let summary = "Extract or reorder components of a rank-one tensor";
   let arguments = (ins AnyType:$input, StrAttr:$mask);
   let results = (outs AnyType:$result);
+  let hasVerifier = 1;
 }
 
 def Vernon_IntrinsicOp : Vernon_Op<"intrinsic"> {

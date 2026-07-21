@@ -27,6 +27,7 @@ struct VulkanDriver {
   PFN_vkGetPhysicalDeviceQueueFamilyProperties
       getPhysicalDeviceQueueFamilyProperties{};
   PFN_vkGetPhysicalDeviceMemoryProperties getPhysicalDeviceMemoryProperties{};
+  PFN_vkGetPhysicalDeviceFormatProperties getPhysicalDeviceFormatProperties{};
   PFN_vkCreateDevice createDevice{};
   PFN_vkGetDeviceProcAddr getDeviceProcAddr{};
   PFN_vkDestroyDevice destroyDevice{};
@@ -69,6 +70,8 @@ struct VulkanDriver {
   PFN_vkBindImageMemory bindImageMemory{};
   PFN_vkCreateImageView createImageView{};
   PFN_vkDestroyImageView destroyImageView{};
+  PFN_vkCreateSampler createSampler{};
+  PFN_vkDestroySampler destroySampler{};
   PFN_vkCreateRenderPass createRenderPass{};
   PFN_vkDestroyRenderPass destroyRenderPass{};
   PFN_vkCreateFramebuffer createFramebuffer{};
