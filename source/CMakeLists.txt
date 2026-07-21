@@ -121,6 +121,9 @@ endif()
 add_executable(vernon-compile
   tools/vernon_compile.cpp
 )
+target_compile_definitions(vernon-compile PRIVATE
+  VERNON_LLVM_TOOLS_DIR="${LLVM_TOOLS_BINARY_DIR}"
+)
 target_link_libraries(vernon-compile PRIVATE VernonDSLCompiler LLVMSupport)
 if(MSVC)
   target_compile_options(vernon-compile PRIVATE /EHsc)

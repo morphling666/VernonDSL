@@ -43,8 +43,32 @@ struct Parameter {
   uint32_t slot{};
   std::string name;
   std::string kind;
+  std::string dtype;
   std::string access;
+  std::vector<uint64_t> shape;
   std::vector<ParameterUse> uses;
+};
+
+struct Output {
+  std::string name;
+  std::string kind;
+  std::string dtype;
+  std::string access;
+  std::vector<uint64_t> shape;
+  uint32_t location{UINT32_MAX};
+};
+
+struct CpuNativeArtifact {
+  std::filesystem::path root;
+  std::filesystem::path relativeLibrary;
+  std::string entry;
+  std::string symbol;
+  std::string operatingSystem;
+  std::string architecture;
+  uint32_t invocationAbiVersion{};
+  uint64_t size{};
+  std::string sha256;
+  nlohmann::json reflection;
 };
 
 struct Stage {
@@ -53,12 +77,14 @@ struct Stage {
   std::string source;
   std::string reflection;
   std::vector<uint8_t> binary;
+  std::optional<CpuNativeArtifact> cpuArtifact;
   uint32_t workgroup[3]{1, 1, 1};
 };
 
 struct Variant {
   std::vector<std::string> key;
   std::vector<Parameter> parameters;
+  std::vector<Output> outputs;
   std::string compute;
   std::string vertex;
   std::string fragment;
@@ -171,13 +197,13 @@ struct VernonPipelineBundle {
 struct VernonLoadedPipeline {
   VernonRuntimeContext *context{};
   Variant variant;
+  VernonLoadedKernel *computeKernel{};
   GlUint computeProgram{};
   GlUint graphicsProgram{};
   GlUint vertexArray{};
   GlUint framebuffer{};
   uint32_t workgroup[3]{1, 1, 1};
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-  VernonLoadedKernel *vulkanCompute{};
   VkShaderModule vulkanVertex{};
   VkShaderModule vulkanFragment{};
   std::string vulkanVertexEntry;
@@ -537,6 +563,36 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use,
   return true;
 }
 
+void parseStaticType(const std::string &type, std::string &dtype,
+                     std::vector<uint64_t> &shape) {
+  if (type.rfind("tensor<", 0) != 0 || type.size() < 9 || type.back() != '>') {
+    dtype = type;
+    return;
+  }
+  const std::string body = type.substr(7, type.size() - 8);
+  size_t begin = 0;
+  while (true) {
+    const size_t separator = body.find('x', begin);
+    if (separator == std::string::npos) {
+      dtype = body.substr(begin);
+      return;
+    }
+    const std::string dimension = body.substr(begin, separator - begin);
+    if (dimension == "?")
+      shape.push_back(0);
+    else {
+      try {
+        shape.push_back(std::stoull(dimension));
+      } catch (...) {
+        dtype.clear();
+        shape.clear();
+        return;
+      }
+    }
+    begin = separator + 1;
+  }
+}
+
 bool parseVariant(const nlohmann::json &value, Variant &variant,
                   std::string &error) {
   if (!value.is_object() || !value.contains("key") ||
@@ -569,7 +625,13 @@ bool parseVariant(const nlohmann::json &value, Variant &variant,
     parameter.slot = row["slot"].get<uint32_t>();
     parameter.name = row.value("name", "");
     parameter.kind = row.value("kind", "");
+    parameter.dtype = row.value("dtype", "");
     parameter.access = row.value("access", "read");
+    if (row.contains("shape") && row["shape"].is_array())
+      for (const nlohmann::json &dimension : row["shape"])
+        parameter.shape.push_back(dimension.is_number_unsigned()
+                                      ? dimension.get<uint64_t>()
+                                      : uint64_t{0});
     for (const nlohmann::json &useValue : row["uses"]) {
       ParameterUse use;
       if (!parseUse(useValue, use, error))
@@ -592,6 +654,34 @@ bool parseVariant(const nlohmann::json &value, Variant &variant,
                          }) != variant.parameters.end()) {
     error = "pipeline variant contains duplicate parameter slots";
     return false;
+  }
+  for (const nlohmann::json &row :
+       value.value("outputs", nlohmann::json::array())) {
+    if (!row.is_object()) {
+      error = "pipeline output record is invalid";
+      return false;
+    }
+    Output output;
+    output.name = row.value("name", "");
+    output.kind = row.value("kind", "texture");
+    output.dtype = row.value("dtype", "");
+    output.access = row.value("access", "write");
+    output.location = row.value("location", UINT32_MAX);
+    if (output.name.empty() && output.location != UINT32_MAX)
+      output.name = "output_" + std::to_string(output.location);
+    if (row.contains("shape") && row["shape"].is_array())
+      for (const nlohmann::json &dimension : row["shape"])
+        output.shape.push_back(dimension.is_number_unsigned()
+                                   ? dimension.get<uint64_t>()
+                                   : uint64_t{0});
+    if (output.dtype.empty())
+      parseStaticType(row.value("type", ""), output.dtype, output.shape);
+    if (output.name.empty() || output.dtype.empty() ||
+        output.location == UINT32_MAX) {
+      error = "pipeline output metadata is incomplete";
+      return false;
+    }
+    variant.outputs.push_back(std::move(output));
   }
   for (const nlohmann::json &step : value["steps"]) {
     const std::string kind = step.value("kind", "");
@@ -710,6 +800,87 @@ const char *hostArchitecture() {
 #endif
 }
 
+bool resolveCpuNativeArtifact(VernonRuntimeContext *context,
+                              const CpuNativeArtifact &artifact,
+                              std::filesystem::path &libraryPath,
+                              ReflectedEntry *reflection) {
+  if (artifact.entry.empty() || artifact.symbol.empty() ||
+      artifact.relativeLibrary.empty() || artifact.sha256.size() != 64 ||
+      artifact.operatingSystem != hostOperatingSystem() ||
+      artifact.architecture != hostArchitecture() ||
+      artifact.invocationAbiVersion != VERNON_CPU_INVOCATION_ABI_VERSION) {
+    fail(context, "unsupported or invalid CPU AOT artifact");
+    return false;
+  }
+  if (artifact.relativeLibrary.is_absolute() ||
+      artifact.relativeLibrary.has_root_path() ||
+      std::find(artifact.relativeLibrary.begin(),
+                artifact.relativeLibrary.end(), std::filesystem::path("..")) !=
+          artifact.relativeLibrary.end()) {
+    fail(context, "CPU AOT native library path is invalid");
+    return false;
+  }
+
+  std::error_code error;
+  const std::filesystem::path canonicalRoot =
+      std::filesystem::canonical(artifact.root, error);
+  if (error || !std::filesystem::is_directory(canonicalRoot, error)) {
+    fail(context, "CPU AOT bundle directory is invalid");
+    return false;
+  }
+  const std::filesystem::path candidate = std::filesystem::weakly_canonical(
+      canonicalRoot / artifact.relativeLibrary, error);
+  if (error) {
+    fail(context, "CPU AOT native library path cannot be resolved");
+    return false;
+  }
+  const std::filesystem::path relative =
+      candidate.lexically_relative(canonicalRoot);
+  if (relative.empty() || relative.is_absolute() ||
+      (!relative.empty() && *relative.begin() == std::filesystem::path(".."))) {
+    fail(context, "CPU AOT native library escapes the bundle directory");
+    return false;
+  }
+
+  const std::string bytes = readFile(candidate);
+  if (bytes.empty() || artifact.size != bytes.size() ||
+      vernon::runtime::sha256Hex(bytes.data(), bytes.size()) !=
+          artifact.sha256) {
+    fail(context, "CPU AOT artifact size or SHA-256 mismatch");
+    return false;
+  }
+  ReflectedEntry parsed;
+  if (!parseReflection(artifact.reflection, artifact.entry, parsed,
+                       context->error))
+    return false;
+  libraryPath = candidate;
+  if (reflection)
+    *reflection = std::move(parsed);
+  return true;
+}
+
+VernonLoadedKernel *loadCpuNativeArtifact(VernonRuntimeContext *context,
+                                          const CpuNativeArtifact &artifact) {
+  std::filesystem::path libraryPath;
+  auto kernel = std::make_unique<VernonLoadedKernel>();
+  kernel->context = context;
+  if (!resolveCpuNativeArtifact(context, artifact, libraryPath,
+                                &kernel->reflection))
+    return nullptr;
+  const std::string nativePath = libraryPath.u8string();
+  if (!kernel->nativeLibrary.open(nativePath.c_str(), context->error))
+    return nullptr;
+  kernel->cpuEntry = reinterpret_cast<VernonCpuEntryPoint>(
+      kernel->nativeLibrary.symbol(artifact.symbol.c_str()));
+  if (!kernel->cpuEntry) {
+    fail(context,
+         "CPU AOT library does not export symbol '" + artifact.symbol + "'");
+    return nullptr;
+  }
+  ++context->liveKernels;
+  return kernel.release();
+}
+
 std::vector<uint8_t> decodeBase64(const std::string &encoded) {
   static constexpr char alphabet[] =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -743,6 +914,112 @@ bool argumentKindMatches(const Parameter &parameter,
           argument.kind == VERNON_PIPELINE_TEXTURE) ||
          (parameter.kind == "inline" &&
           argument.kind == VERNON_PIPELINE_INLINE_VALUE);
+}
+
+std::optional<VernonPipelineArgumentKind>
+pipelineArgumentKind(const std::string &kind) {
+  if (kind == "tensor")
+    return VERNON_PIPELINE_TENSOR;
+  if (kind == "texture")
+    return VERNON_PIPELINE_TEXTURE;
+  if (kind == "inline")
+    return VERNON_PIPELINE_INLINE_VALUE;
+  return std::nullopt;
+}
+
+std::optional<VernonDataType> pipelineDataType(const std::string &dtype) {
+  if (dtype == "bool")
+    return VERNON_DATA_BOOL;
+  if (dtype == "i32")
+    return VERNON_DATA_I32;
+  if (dtype == "u32")
+    return VERNON_DATA_U32;
+  if (dtype == "f16")
+    return VERNON_DATA_F16;
+  if (dtype == "f32")
+    return VERNON_DATA_F32;
+  if (dtype == "f64")
+    return VERNON_DATA_F64;
+  return std::nullopt;
+}
+
+std::optional<VernonValueAccess>
+pipelineValueAccess(const std::string &access) {
+  if (access == "read")
+    return VERNON_ACCESS_READ;
+  if (access == "write")
+    return VERNON_ACCESS_WRITE;
+  if (access == "read_write")
+    return VERNON_ACCESS_READ_WRITE;
+  return std::nullopt;
+}
+
+using PipelineArgumentMap =
+    std::unordered_map<uint32_t, const VernonPipelineArgument *>;
+
+VernonStatus
+prepareComputeLaunch(VernonRuntimeContext *context, const Variant &variant,
+                     const PipelineArgumentMap &arguments,
+                     const VernonPipelineInvocation &invocation,
+                     std::vector<VernonLaunchArgument> &launchArguments,
+                     VernonLaunchSize &grid) {
+  struct IndexedArgument {
+    uint32_t index;
+    VernonLaunchArgument argument;
+  };
+  std::vector<IndexedArgument> indexed;
+  for (const Parameter &parameter : variant.parameters) {
+    const VernonPipelineArgument &supplied = *arguments.at(parameter.slot);
+    for (const ParameterUse &use : parameter.uses) {
+      if (use.stage != "compute")
+        continue;
+      VernonLaunchArgument argument{};
+      if (supplied.kind == VERNON_PIPELINE_TENSOR) {
+        if (!supplied.tensor.buffer ||
+            supplied.tensor.buffer->context != context ||
+            supplied.tensor.byte_offset != 0)
+          return fail(context, "compute Tensor view is invalid");
+        argument.kind = VERNON_LAUNCH_TENSOR;
+        argument.buffer = supplied.tensor.buffer;
+      } else if (supplied.kind == VERNON_PIPELINE_INLINE_VALUE) {
+        if (!supplied.inline_value.data || !supplied.inline_value.data_size)
+          return fail(context, "compute inline value is empty");
+        argument.kind = VERNON_LAUNCH_SCALAR;
+        argument.scalar_data = supplied.inline_value.data;
+        argument.scalar_size = supplied.inline_value.data_size;
+      } else {
+        return fail(context, "compute argument kind is unsupported");
+      }
+      indexed.push_back({use.index, argument});
+    }
+  }
+  std::sort(indexed.begin(), indexed.end(),
+            [](const IndexedArgument &left, const IndexedArgument &right) {
+              return left.index < right.index;
+            });
+  for (const IndexedArgument &value : indexed)
+    launchArguments.push_back(value.argument);
+
+  grid = invocation.compute_grid;
+  if (!grid.x || !grid.y || !grid.z) {
+    for (const auto &[slot, argument] : arguments) {
+      (void)slot;
+      if (argument->kind != VERNON_PIPELINE_TENSOR || !argument->tensor.rank ||
+          !argument->tensor.shape)
+        continue;
+      grid = {1, 1, 1};
+      const uint32_t rank = argument->tensor.rank;
+      grid.x = static_cast<uint32_t>(argument->tensor.shape[rank - 1]);
+      if (rank > 1)
+        grid.y = static_cast<uint32_t>(argument->tensor.shape[rank - 2]);
+      if (rank > 2)
+        grid.z = static_cast<uint32_t>(argument->tensor.shape[rank - 3]);
+      break;
+    }
+  }
+  if (!grid.x || !grid.y || !grid.z)
+    return fail(context, "compute grid cannot be inferred");
+  return VERNON_STATUS_OK;
 }
 
 GlEnum topologyMode(VernonPrimitiveTopology topology) {
@@ -964,11 +1241,9 @@ vernonRuntimeGetContextCapabilities(const VernonRuntimeContext *context) {
   result.supports_compute =
       context->backend == VERNON_RUNTIME_OPENGL_ES
           ? (result.api_version_major > 3 ||
-             (result.api_version_major == 3 &&
-              result.api_version_minor >= 1))
+             (result.api_version_major == 3 && result.api_version_minor >= 1))
           : (result.api_version_major > 4 ||
-             (result.api_version_major == 4 &&
-              result.api_version_minor >= 3));
+             (result.api_version_major == 4 && result.api_version_minor >= 3));
   result.supports_storage_buffers = result.supports_compute;
   result.graphics_draw_abi_version = 2;
   result.diagnostic = {context->error.data(), context->error.size()};
@@ -1220,8 +1495,7 @@ VernonDeviceTexture *vernonRuntimeImportOpenGLTexture2D(
   if (!context ||
       (context->backend != VERNON_RUNTIME_OPENGL &&
        context->backend != VERNON_RUNTIME_OPENGL_ES) ||
-      !texture ||
-      !width || !height || format != VERNON_TEXTURE_RGBA8_UNORM)
+      !texture || !width || !height || format != VERNON_TEXTURE_RGBA8_UNORM)
     return nullptr;
   auto result = std::make_unique<VernonDeviceTexture>();
   result->context = context;
@@ -1534,60 +1808,32 @@ vernonRuntimeLoadComputeBundle(VernonRuntimeContext *context,
   if (!context || context->backend != VERNON_RUNTIME_CPU || !directory)
     return nullptr;
   try {
-    const std::filesystem::path root(directory);
+    const std::filesystem::path root = std::filesystem::u8path(directory);
     const std::string manifestText = readFile(root / "compute.json");
     const nlohmann::json manifest =
         nlohmann::json::parse(manifestText, nullptr, false);
     if (manifest.is_discarded() || !manifest.is_object() ||
         manifest.value("schema_version", 0) != 2 ||
-        manifest.value("cpu_invocation_abi_version", 0) !=
-            VERNON_CPU_INVOCATION_ABI_VERSION ||
         manifest.value("target", "") != "cpu" ||
-        manifest.value("operating_system", "") != hostOperatingSystem() ||
-        manifest.value("architecture", "") != hostArchitecture() ||
         manifest.value("artifact_format", "") != "native_library" ||
         !manifest.contains("reflection")) {
       fail(context, "unsupported or invalid CPU AOT bundle");
       return nullptr;
     }
-    const std::string entry = manifest.value("entry", "");
-    const std::string symbol = manifest.value("symbol", "");
-    const std::string artifactName = manifest.value("artifact", "");
-    const std::string expectedHash = manifest.value("artifact_sha256", "");
-    const std::filesystem::path relativeArtifact(artifactName);
-    if (entry.empty() || symbol.empty() || artifactName.empty() ||
-        expectedHash.size() != 64 || relativeArtifact.is_absolute() ||
-        relativeArtifact.has_root_path() ||
-        std::find(relativeArtifact.begin(), relativeArtifact.end(), "..") !=
-            relativeArtifact.end()) {
-      fail(context, "CPU AOT bundle fields are invalid");
-      return nullptr;
-    }
-    const std::filesystem::path artifactPath = root / relativeArtifact;
-    const std::string artifact = readFile(artifactPath);
-    if (artifact.empty() ||
-        manifest.value("artifact_size", uint64_t{0}) != artifact.size() ||
-        vernon::runtime::sha256Hex(artifact.data(), artifact.size()) !=
-            expectedHash) {
-      fail(context, "CPU AOT artifact size or SHA-256 mismatch");
-      return nullptr;
-    }
-    auto kernel = std::make_unique<VernonLoadedKernel>();
-    kernel->context = context;
-    if (!parseReflection(manifest["reflection"], entry, kernel->reflection,
-                         context->error))
-      return nullptr;
-    const std::string nativePath = artifactPath.string();
-    if (!kernel->nativeLibrary.open(nativePath.c_str(), context->error))
-      return nullptr;
-    kernel->cpuEntry = reinterpret_cast<VernonCpuEntryPoint>(
-        kernel->nativeLibrary.symbol(symbol.c_str()));
-    if (!kernel->cpuEntry) {
-      fail(context, "CPU AOT library does not export symbol '" + symbol + "'");
-      return nullptr;
-    }
-    ++context->liveKernels;
-    return kernel.release();
+    CpuNativeArtifact artifact;
+    artifact.root = root;
+    artifact.relativeLibrary =
+        std::filesystem::u8path(manifest.value("artifact", ""));
+    artifact.entry = manifest.value("entry", "");
+    artifact.symbol = manifest.value("symbol", "");
+    artifact.operatingSystem = manifest.value("operating_system", "");
+    artifact.architecture = manifest.value("architecture", "");
+    artifact.invocationAbiVersion =
+        manifest.value("cpu_invocation_abi_version", 0u);
+    artifact.size = manifest.value("artifact_size", uint64_t{0});
+    artifact.sha256 = manifest.value("artifact_sha256", "");
+    artifact.reflection = manifest["reflection"];
+    return loadCpuNativeArtifact(context, artifact);
   } catch (const std::exception &error) {
     fail(context, std::string("failed to load CPU AOT bundle: ") + error.what(),
          VERNON_STATUS_INTERNAL_ERROR);
@@ -1702,15 +1948,15 @@ VernonStatus vernonRuntimeLaunch(VernonLoadedKernel *kernel,
       }
     }
     const uint32_t *workgroup = kernel->reflection.workgroup;
-    return cudaFail(
-        kernel->context,
-        vernon::runtime::cudaDriver().launchKernel(
-            kernel->cudaFunction,
-            (globalSize.x + workgroup[0] - 1) / workgroup[0],
-            (globalSize.y + workgroup[1] - 1) / workgroup[1],
-            (globalSize.z + workgroup[2] - 1) / workgroup[2], workgroup[0],
-            workgroup[1], workgroup[2], 0, nullptr, parameters.data(), nullptr),
-        "cuLaunchKernel");
+    return cudaFail(kernel->context,
+                    vernon::runtime::cudaDriver().launchKernel(
+                        kernel->cudaFunction,
+                        (globalSize.x + workgroup[0] - 1) / workgroup[0],
+                        (globalSize.y + workgroup[1] - 1) / workgroup[1],
+                        (globalSize.z + workgroup[2] - 1) / workgroup[2],
+                        workgroup[0], workgroup[1], workgroup[2], 0, nullptr,
+                        parameters.data(), nullptr),
+                    "cuLaunchKernel");
   }
 #endif
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
@@ -1903,21 +2149,75 @@ VernonStatus vernonRuntimeLaunch(VernonLoadedKernel *kernel,
   return VERNON_STATUS_OK;
 }
 
-VernonPipelineBundle *
-vernonRuntimeLoadPipelineBundle(VernonRuntimeContext *context,
-                                const void *bundleData, size_t bundleSize) {
-  if (!context ||
-      (context->backend != VERNON_RUNTIME_OPENGL &&
-       context->backend != VERNON_RUNTIME_OPENGL_ES &&
-       context->backend != VERNON_RUNTIME_VULKAN) ||
-      !bundleData || !bundleSize)
-    return nullptr;
+VernonStatus vernonRuntimePipelineBundleInspectTarget(
+    const void *bundleData, size_t bundleSize, VernonRuntimeBackend *target) {
+  if (!bundleData || !bundleSize || !target)
+    return VERNON_STATUS_INVALID_ARGUMENT;
   try {
     const nlohmann::json root = nlohmann::json::parse(
         static_cast<const char *>(bundleData),
         static_cast<const char *>(bundleData) + bundleSize, nullptr, false);
+    if (root.is_discarded() || !root.is_object() ||
+        root.value("pipeline_bundle_schema_version", 0) != 1 ||
+        root.value("type", "") != "vernon_pipeline_bundle")
+      return VERNON_STATUS_PARSE_ERROR;
+    const std::string name = root.value("target", "");
+    if (name == "cpu")
+      *target = VERNON_RUNTIME_CPU;
+    else if (name == "cuda")
+      *target = VERNON_RUNTIME_CUDA;
+    else if (name == "vulkan")
+      *target = VERNON_RUNTIME_VULKAN;
+    else if (name == "opengl")
+      *target = VERNON_RUNTIME_OPENGL;
+    else if (name == "opengles")
+      *target = VERNON_RUNTIME_OPENGL_ES;
+    else
+      return VERNON_STATUS_UNSUPPORTED_TARGET;
+    return VERNON_STATUS_OK;
+  } catch (...) {
+    return VERNON_STATUS_PARSE_ERROR;
+  }
+}
+
+VernonPipelineBundle *
+vernonRuntimeLoadPipelineBundle(VernonRuntimeContext *context,
+                                const void *bundleData, size_t bundleSize) {
+  return vernonRuntimeLoadPipelineBundleWithOptions(context, bundleData,
+                                                    bundleSize, nullptr);
+}
+
+VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(
+    VernonRuntimeContext *context, const void *bundleData, size_t bundleSize,
+    const VernonPipelineBundleLoadOptions *options) {
+  if (!context ||
+      (context->backend != VERNON_RUNTIME_CPU &&
+       context->backend != VERNON_RUNTIME_OPENGL &&
+       context->backend != VERNON_RUNTIME_OPENGL_ES &&
+       context->backend != VERNON_RUNTIME_VULKAN &&
+       context->backend != VERNON_RUNTIME_CUDA) ||
+      !bundleData || !bundleSize ||
+      (options &&
+       options->struct_size < sizeof(VernonPipelineBundleLoadOptions)))
+    return nullptr;
+  try {
+    std::optional<std::filesystem::path> bundleDirectory;
+    if (options && options->bundle_directory &&
+        options->bundle_directory[0] != '\0')
+      bundleDirectory = std::filesystem::u8path(options->bundle_directory);
+    if (context->backend == VERNON_RUNTIME_CPU && !bundleDirectory) {
+      fail(context,
+           "CPU pipeline bundles require a UTF-8 bundle directory for native "
+           "sidecars");
+      return nullptr;
+    }
+    const nlohmann::json root = nlohmann::json::parse(
+        static_cast<const char *>(bundleData),
+        static_cast<const char *>(bundleData) + bundleSize, nullptr, false);
     const char *expectedTarget =
-        context->backend == VERNON_RUNTIME_VULKAN
+        context->backend == VERNON_RUNTIME_CPU    ? "cpu"
+        : context->backend == VERNON_RUNTIME_CUDA ? "cuda"
+        : context->backend == VERNON_RUNTIME_VULKAN
             ? "vulkan"
             : (context->backend == VERNON_RUNTIME_OPENGL_ES ? "opengles"
                                                             : "opengl");
@@ -1962,6 +2262,32 @@ vernonRuntimeLoadPipelineBundle(VernonRuntimeContext *context,
             }
         }
       }
+      if (context->backend == VERNON_RUNTIME_CPU) {
+        const nlohmann::json &nativeArtifact =
+            value.contains("artifact") && value["artifact"].is_object()
+                ? value["artifact"]
+                : value;
+        CpuNativeArtifact artifact;
+        artifact.root = *bundleDirectory;
+        artifact.relativeLibrary = std::filesystem::u8path(
+            nativeArtifact.value("path", value.value("native_library", "")));
+        artifact.entry = stage.entry;
+        artifact.symbol = value.value("symbol", "");
+        artifact.operatingSystem = value.value("operating_system", "");
+        artifact.architecture = value.value("architecture", "");
+        artifact.invocationAbiVersion =
+            value.value("cpu_invocation_abi_version", 0u);
+        artifact.size = nativeArtifact.value("size", uint64_t{0});
+        artifact.sha256 = nativeArtifact.value("sha256", "");
+        if (value.contains("reflection"))
+          artifact.reflection = value["reflection"];
+        std::filesystem::path validatedPath;
+        if (value.value("format", "") != "native_library" ||
+            !resolveCpuNativeArtifact(context, artifact, validatedPath,
+                                      nullptr))
+          return nullptr;
+        stage.cpuArtifact = std::move(artifact);
+      }
       if (context->backend == VERNON_RUNTIME_VULKAN &&
           value.contains("artifact") && value["artifact"].is_object()) {
         const nlohmann::json &artifact = value["artifact"];
@@ -1975,9 +2301,13 @@ vernonRuntimeLoadPipelineBundle(VernonRuntimeContext *context,
         }
       }
       const bool hasArtifact =
-          context->backend == VERNON_RUNTIME_VULKAN
+          context->backend == VERNON_RUNTIME_CPU ? stage.cpuArtifact.has_value()
+          : context->backend == VERNON_RUNTIME_VULKAN
               ? !stage.binary.empty() &&
                     stage.binary.size() % sizeof(uint32_t) == 0 &&
+                    !stage.reflection.empty()
+          : context->backend == VERNON_RUNTIME_CUDA
+              ? value.value("format", "") == "ptx" && !stage.source.empty() &&
                     !stage.reflection.empty()
               : !stage.source.empty();
       if (stage.stage.empty() || stage.entry.empty() || !hasArtifact) {
@@ -2000,6 +2330,16 @@ vernonRuntimeLoadPipelineBundle(VernonRuntimeContext *context,
           !validStage(variant.vertex, "vertex") ||
           !validStage(variant.fragment, "fragment")) {
         fail(context, "pipeline variant references an invalid stage");
+        return nullptr;
+      }
+      if ((context->backend == VERNON_RUNTIME_CPU ||
+           context->backend == VERNON_RUNTIME_CUDA) &&
+          (variant.compute.empty() || !variant.vertex.empty() ||
+           variant.barrier)) {
+        fail(context,
+             std::string(expectedTarget) +
+                 " pipeline bundles support dispatch steps only",
+             VERNON_STATUS_UNSUPPORTED_TARGET);
         return nullptr;
       }
       bundle->variants.push_back(std::move(variant));
@@ -2034,11 +2374,80 @@ vernonRuntimeLoadPipelineBundle(VernonRuntimeContext *context,
   }
 }
 
+VernonPipelineBundle *
+vernonRuntimeLoadPipelineBundleFromDirectory(VernonRuntimeContext *context,
+                                             const char *directory) {
+  if (!context || !directory || !directory[0])
+    return nullptr;
+  try {
+    const std::filesystem::path root = std::filesystem::u8path(directory);
+    const std::string bundle = readFile(root / "pipeline.bundle");
+    if (bundle.empty()) {
+      fail(context, "pipeline.bundle is empty or cannot be read");
+      return nullptr;
+    }
+    VernonPipelineBundleLoadOptions options{};
+    options.struct_size = sizeof(options);
+    options.bundle_directory = directory;
+    return vernonRuntimeLoadPipelineBundleWithOptions(context, bundle.data(),
+                                                      bundle.size(), &options);
+  } catch (const std::exception &error) {
+    fail(context,
+         std::string("failed to load pipeline bundle directory: ") +
+             error.what(),
+         VERNON_STATUS_INTERNAL_ERROR);
+    return nullptr;
+  }
+}
+
 VernonStringView
 vernonRuntimePipelineBundleGetId(const VernonPipelineBundle *bundle) {
   return bundle ? VernonStringView{bundle->id.data(), bundle->id.size()}
                 : VernonStringView{nullptr, 0};
 }
+
+namespace {
+
+bool fillParameterView(const Parameter &source,
+                       VernonPipelineParameterView &destination) {
+  const auto kind = pipelineArgumentKind(source.kind);
+  const auto dtype = pipelineDataType(source.dtype);
+  const auto access = pipelineValueAccess(source.access);
+  if (!kind || !dtype || !access)
+    return false;
+  destination = {source.slot,
+                 {source.name.data(), source.name.size()},
+                 *kind,
+                 *dtype,
+                 *access,
+                 static_cast<uint32_t>(source.shape.size()),
+                 source.shape.empty() ? nullptr : source.shape.data()};
+  return true;
+}
+
+bool fillOutputView(const Output &source,
+                    VernonPipelineOutputView &destination) {
+  const auto kind = pipelineArgumentKind(source.kind);
+  const auto dtype = pipelineDataType(source.dtype);
+  const auto access = pipelineValueAccess(source.access);
+  if (!kind || !dtype || !access)
+    return false;
+  destination = {{source.name.data(), source.name.size()},
+                 *kind,
+                 *dtype,
+                 *access,
+                 static_cast<uint32_t>(source.shape.size()),
+                 source.shape.empty() ? nullptr : source.shape.data(),
+                 source.location};
+  return true;
+}
+
+bool stringViewEquals(VernonStringView view, const std::string &value) {
+  return view.size == value.size() &&
+         (!view.size || std::memcmp(view.data, value.data(), view.size) == 0);
+}
+
+} // namespace
 
 void vernonRuntimePipelineBundleDestroy(VernonPipelineBundle *bundle) {
   if (!bundle)
@@ -2069,15 +2478,35 @@ vernonRuntimeResolvePipeline(VernonPipelineBundle *bundle,
   auto pipeline = std::make_unique<VernonLoadedPipeline>();
   pipeline->context = bundle->context;
   pipeline->variant = *found;
+  if (bundle->context->backend == VERNON_RUNTIME_CPU) {
+    const Stage &stage = bundle->stages.at(found->compute);
+    pipeline->computeKernel =
+        loadCpuNativeArtifact(bundle->context, *stage.cpuArtifact);
+    if (!pipeline->computeKernel)
+      return nullptr;
+    ++bundle->context->livePipelines;
+    return pipeline.release();
+  }
+  if (bundle->context->backend == VERNON_RUNTIME_CUDA) {
+    const Stage &stage = bundle->stages.at(found->compute);
+    pipeline->computeKernel = vernonRuntimeLoadArtifact(
+        bundle->context, stage.source.data(), stage.source.size(),
+        stage.reflection.data(), stage.reflection.size(), stage.entry.data(),
+        stage.entry.size());
+    if (!pipeline->computeKernel)
+      return nullptr;
+    ++bundle->context->livePipelines;
+    return pipeline.release();
+  }
   if (bundle->context->backend == VERNON_RUNTIME_VULKAN) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     if (!found->compute.empty()) {
       const Stage &stage = bundle->stages.at(found->compute);
-      pipeline->vulkanCompute = vernonRuntimeLoadArtifact(
+      pipeline->computeKernel = vernonRuntimeLoadArtifact(
           bundle->context, stage.binary.data(), stage.binary.size(),
           stage.reflection.data(), stage.reflection.size(), stage.entry.data(),
           stage.entry.size());
-      if (!pipeline->vulkanCompute)
+      if (!pipeline->computeKernel)
         return nullptr;
     }
     if (!found->vertex.empty()) {
@@ -2097,8 +2526,8 @@ vernonRuntimeResolvePipeline(VernonPipelineBundle *bundle,
       };
       if (!createModule(vertex, pipeline->vulkanVertex) ||
           !createModule(fragment, pipeline->vulkanFragment)) {
-        if (pipeline->vulkanCompute)
-          vernonRuntimeKernelUnload(pipeline->vulkanCompute);
+        if (pipeline->computeKernel)
+          vernonRuntimeKernelUnload(pipeline->computeKernel);
         if (pipeline->vulkanVertex)
           driver.destroyShaderModule(bundle->context->vulkanDevice,
                                      pipeline->vulkanVertex, nullptr);
@@ -2151,15 +2580,82 @@ vernonRuntimeResolvePipeline(VernonPipelineBundle *bundle,
   return pipeline.release();
 }
 
+size_t vernonRuntimeLoadedPipelineGetParameterCount(
+    const VernonLoadedPipeline *pipeline) {
+  return pipeline ? pipeline->variant.parameters.size() : 0;
+}
+
+VernonStatus vernonRuntimeLoadedPipelineGetParameterByIndex(
+    const VernonLoadedPipeline *pipeline, size_t index,
+    VernonPipelineParameterView *parameter) {
+  if (!pipeline || !parameter || index >= pipeline->variant.parameters.size())
+    return VERNON_STATUS_INVALID_ARGUMENT;
+  return fillParameterView(pipeline->variant.parameters[index], *parameter)
+             ? VERNON_STATUS_OK
+             : VERNON_STATUS_PARSE_ERROR;
+}
+
+VernonStatus vernonRuntimeLoadedPipelineFindParameter(
+    const VernonLoadedPipeline *pipeline, VernonStringView name,
+    VernonPipelineParameterView *parameter) {
+  if (!pipeline || !parameter || (name.size && !name.data))
+    return VERNON_STATUS_INVALID_ARGUMENT;
+  const auto found = std::find_if(
+      pipeline->variant.parameters.begin(), pipeline->variant.parameters.end(),
+      [&](const Parameter &p) { return stringViewEquals(name, p.name); });
+  if (found == pipeline->variant.parameters.end())
+    return VERNON_STATUS_INVALID_ARGUMENT;
+  return fillParameterView(*found, *parameter) ? VERNON_STATUS_OK
+                                               : VERNON_STATUS_PARSE_ERROR;
+}
+
+size_t vernonRuntimeLoadedPipelineGetOutputCount(
+    const VernonLoadedPipeline *pipeline) {
+  return pipeline ? pipeline->variant.outputs.size() : 0;
+}
+
+VernonStatus vernonRuntimeLoadedPipelineGetOutputByIndex(
+    const VernonLoadedPipeline *pipeline, size_t index,
+    VernonPipelineOutputView *output) {
+  if (!pipeline || !output || index >= pipeline->variant.outputs.size())
+    return VERNON_STATUS_INVALID_ARGUMENT;
+  return fillOutputView(pipeline->variant.outputs[index], *output)
+             ? VERNON_STATUS_OK
+             : VERNON_STATUS_PARSE_ERROR;
+}
+
+VernonStatus
+vernonRuntimeLoadedPipelineFindOutput(const VernonLoadedPipeline *pipeline,
+                                      VernonStringView name,
+                                      VernonPipelineOutputView *output) {
+  if (!pipeline || !output || (name.size && !name.data))
+    return VERNON_STATUS_INVALID_ARGUMENT;
+  const auto found = std::find_if(
+      pipeline->variant.outputs.begin(), pipeline->variant.outputs.end(),
+      [&](const Output &value) { return stringViewEquals(name, value.name); });
+  if (found == pipeline->variant.outputs.end())
+    return VERNON_STATUS_INVALID_ARGUMENT;
+  return fillOutputView(*found, *output) ? VERNON_STATUS_OK
+                                         : VERNON_STATUS_PARSE_ERROR;
+}
+
 void vernonRuntimeLoadedPipelineDestroy(VernonLoadedPipeline *pipeline) {
   if (!pipeline)
     return;
+  if (pipeline->context->backend == VERNON_RUNTIME_CPU ||
+      pipeline->context->backend == VERNON_RUNTIME_CUDA) {
+    if (pipeline->computeKernel)
+      vernonRuntimeKernelUnload(pipeline->computeKernel);
+    --pipeline->context->livePipelines;
+    delete pipeline;
+    return;
+  }
   if (pipeline->context->backend == VERNON_RUNTIME_VULKAN) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
     driver.deviceWaitIdle(pipeline->context->vulkanDevice);
-    if (pipeline->vulkanCompute)
-      vernonRuntimeKernelUnload(pipeline->vulkanCompute);
+    if (pipeline->computeKernel)
+      vernonRuntimeKernelUnload(pipeline->computeKernel);
     if (pipeline->vulkanVertex)
       driver.destroyShaderModule(pipeline->context->vulkanDevice,
                                  pipeline->vulkanVertex, nullptr);
@@ -2194,7 +2690,7 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
       (invocation->argument_count && !invocation->arguments))
     return fail(pipeline ? pipeline->context : nullptr,
                 "invalid pipeline invocation");
-  std::unordered_map<uint32_t, const VernonPipelineArgument *> arguments;
+  PipelineArgumentMap arguments;
   for (size_t index = 0; index < invocation->argument_count; ++index)
     if (!arguments
              .emplace(invocation->arguments[index].slot,
@@ -2212,69 +2708,25 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
                   "pipeline argument kind does not match layout");
   }
 
+  if (pipeline->computeKernel) {
+    std::vector<VernonLaunchArgument> launchArguments;
+    VernonLaunchSize grid{};
+    const VernonStatus prepareStatus =
+        prepareComputeLaunch(pipeline->context, pipeline->variant, arguments,
+                             *invocation, launchArguments, grid);
+    if (prepareStatus != VERNON_STATUS_OK)
+      return prepareStatus;
+    const VernonStatus launchStatus =
+        vernonRuntimeLaunch(pipeline->computeKernel, grid,
+                            launchArguments.data(), launchArguments.size());
+    if (launchStatus != VERNON_STATUS_OK ||
+        pipeline->context->backend == VERNON_RUNTIME_CPU ||
+        pipeline->context->backend == VERNON_RUNTIME_CUDA)
+      return launchStatus;
+  }
+
   if (pipeline->context->backend == VERNON_RUNTIME_VULKAN) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-    if (pipeline->vulkanCompute) {
-      struct IndexedArgument {
-        uint32_t index;
-        VernonLaunchArgument argument;
-      };
-      std::vector<IndexedArgument> indexed;
-      for (const Parameter &parameter : pipeline->variant.parameters) {
-        const VernonPipelineArgument &supplied = *arguments.at(parameter.slot);
-        for (const ParameterUse &use : parameter.uses) {
-          if (use.stage != "compute")
-            continue;
-          VernonLaunchArgument argument{};
-          if (supplied.kind == VERNON_PIPELINE_TENSOR) {
-            if (!supplied.tensor.buffer ||
-                supplied.tensor.buffer->context != pipeline->context ||
-                supplied.tensor.byte_offset != 0)
-              return fail(pipeline->context,
-                          "Vulkan compute Tensor view is invalid");
-            argument.kind = VERNON_LAUNCH_TENSOR;
-            argument.buffer = supplied.tensor.buffer;
-          } else if (supplied.kind == VERNON_PIPELINE_INLINE_VALUE) {
-            argument.kind = VERNON_LAUNCH_SCALAR;
-            argument.scalar_data = supplied.inline_value.data;
-            argument.scalar_size = supplied.inline_value.data_size;
-          } else {
-            return fail(pipeline->context,
-                        "Vulkan compute argument kind is unsupported");
-          }
-          indexed.push_back({use.index, argument});
-        }
-      }
-      std::sort(indexed.begin(), indexed.end(),
-                [](const IndexedArgument &left, const IndexedArgument &right) {
-                  return left.index < right.index;
-                });
-      std::vector<VernonLaunchArgument> launchArguments;
-      for (const IndexedArgument &value : indexed)
-        launchArguments.push_back(value.argument);
-      VernonLaunchSize grid = invocation->compute_grid;
-      if (!grid.x || !grid.y || !grid.z) {
-        for (const auto &[slot, argument] : arguments) {
-          (void)slot;
-          if (argument->kind != VERNON_PIPELINE_TENSOR ||
-              !argument->tensor.rank || !argument->tensor.shape)
-            continue;
-          grid = {1, 1, 1};
-          const uint32_t rank = argument->tensor.rank;
-          grid.x = static_cast<uint32_t>(argument->tensor.shape[rank - 1]);
-          if (rank > 1)
-            grid.y = static_cast<uint32_t>(argument->tensor.shape[rank - 2]);
-          if (rank > 2)
-            grid.z = static_cast<uint32_t>(argument->tensor.shape[rank - 3]);
-          break;
-        }
-      }
-      const VernonStatus status =
-          vernonRuntimeLaunch(pipeline->vulkanCompute, grid,
-                              launchArguments.data(), launchArguments.size());
-      if (status != VERNON_STATUS_OK)
-        return status;
-    }
     if (!pipeline->vulkanVertex)
       return VERNON_STATUS_OK;
     if (!invocation->color_attachment_count || !invocation->color_attachments)

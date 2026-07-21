@@ -182,8 +182,9 @@ commands. It makes those differences invisible to callers.
 - Metal compiles/loads MSL libraries and creates compute/render pipeline
   states.
 - CUDA loads PTX modules and resolves kernel functions.
-- CPU loads AOT native-library entry points. Python development execution uses
-  its interpreter separately from the deployable runtime.
+- CPU loads AOT native-library entry points. Python `@kernel` execution uses
+  the same validated native compute-bundle path; AST processing ends after
+  Vernon MLIR generation and never executes the kernel.
 
 ### Resource binding
 
@@ -200,7 +201,9 @@ commands. It makes those differences invisible to callers.
 - OpenGL/GLES issue dispatch/draw calls and memory barriers.
 - Metal records compute/render command encoders and resource fences.
 - CUDA launches kernels on streams and uses events where required.
-- CPU invokes a function and applies host memory ordering.
+- CPU invokes a function serially and applies host memory ordering. A future
+  multithreaded CPU executor may parallelize the invocation grid without
+  changing the pipeline or CPU entry-point ABI.
 
 ### Capability rules
 
@@ -235,11 +238,20 @@ pipeline.bundle
   stage_artifacts{}
     OpenGL/OpenGL ES: GLSL source
     Vulkan: base64 SPIR-V plus SHA-256
+    CUDA: PTX source plus compute reflection
+    CPU: relative host-native library sidecar plus SHA-256 and reflection
 ```
 
-CUDA PTX and CPU native-library AOT use compute artifacts/bundles rather than
-graphics pipeline bundles. Loading validates that the artifact family matches
-the selected runtime backend.
+CUDA uses the unified pipeline bundle and invocation ABI for dispatch-only
+pipelines. CUDA bundle loading rejects draw and barrier steps, then loads PTX
+plus reflection through the normal compute artifact path. CPU uses that same
+dispatch-only pipeline model, rejecting draw and barrier steps. Because its
+native library is a path-relative sidecar rather than embedded bytes, CPU
+pipeline loading requires the bundle directory. The runtime rejects rooted,
+parent-traversing, and canonical-escape paths and validates host OS,
+architecture, CPU invocation ABI, file size, and SHA-256 before opening the
+library. Loading validates that the artifact family matches the selected
+runtime backend.
 
 ## Pipeline invocation ABI
 

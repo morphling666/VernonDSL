@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import ast
+import atexit
 import hashlib
 import importlib
 import inspect
 import json
 import os
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -83,8 +87,8 @@ _architecture = cpu
 _native_runtime: Any | None = None
 _runtime_generation = 0
 _api_version: tuple[int, int] | None = None
-_external_opengl_contexts: dict[_Architecture,
-                                tuple[int, int, int, tuple[int, int]]] = {}
+_external_opengl_contexts: dict[_Architecture, tuple[int, int, int,
+                                                     tuple[int, int]]] = {}
 
 
 @dataclass(frozen=True)
@@ -110,12 +114,16 @@ def init(*,
                                         for value in api_version)):
         raise ValueError(
             "api_version is a (major, minor) pair for OpenGL runtimes")
-    if arch in {cuda, vulkan, opengl, opengles}:
+    kernel_type = globals().get("Kernel")
+    if kernel_type is not None:
+        kernel_type.clear_cache()
+    if arch in {cpu, cuda, vulkan, opengl, opengles}:
         if _native is None:
             raise RuntimeError(
                 f"{arch.name} requires vernon_dsl._native; build the Release native "
                 "targets or install a wheel containing the native module")
         backend = {
+            cpu: _native.RuntimeBackend.CPU,
             cuda: _native.RuntimeBackend.CUDA,
             vulkan: _native.RuntimeBackend.VULKAN,
             opengl: _native.RuntimeBackend.OPENGL,
@@ -137,8 +145,6 @@ def init(*,
         else:
             requested = api_version or (4, 3)
             _native_runtime = _native.Runtime(backend, *requested)
-    else:
-        _native_runtime = None
     _architecture = arch
     _api_version = api_version or ((4,
                                     3) if arch in {opengl, opengles} else None)
@@ -154,14 +160,16 @@ def register_external_opengl_context(
     api_version: tuple[int, int],
 ) -> None:
     if arch not in {opengl, opengles}:
-        raise ValueError("external contexts are only valid for OpenGL backends")
-    if (not all(isinstance(value, int) and value >= 0
-                for value in (user_data, make_current, get_proc_address))
+        raise ValueError(
+            "external contexts are only valid for OpenGL backends")
+    if (not all(
+            isinstance(value, int) and value >= 0
+            for value in (user_data, make_current, get_proc_address))
             or not make_current or not get_proc_address):
-        raise ValueError("external context callbacks must be non-zero addresses")
-    if (len(api_version) != 2
-            or any(not isinstance(value, int) or value < 0
-                   for value in api_version)):
+        raise ValueError(
+            "external context callbacks must be non-zero addresses")
+    if (len(api_version) != 2 or any(not isinstance(value, int) or value < 0
+                                     for value in api_version)):
         raise ValueError("api_version must be a non-negative major/minor pair")
     _external_opengl_contexts[arch] = (user_data, make_current,
                                        get_proc_address, api_version)
@@ -366,6 +374,29 @@ class _CompiledKernel:
     native: Any | None = None
 
 
+class _CpuAotKernel:
+    """Keep an ephemeral CPU bundle alive until its native library unloads."""
+
+    def __init__(self, native: Any, temporary: Path):
+        self._native = native
+        self._temporary = temporary
+
+    def launch(self, x: int, y: int, z: int, values: list[Any]) -> None:
+        if self._native is None:
+            raise RuntimeError("CPU AOT kernel is closed")
+        self._native.launch(x, y, z, values)
+
+    def close(self) -> None:
+        if self._native is None:
+            return
+        native, self._native = self._native, None
+        del native
+        shutil.rmtree(self._temporary)
+
+    def __del__(self) -> None:
+        self.close()
+
+
 class Kernel:
     _cache: ClassVar[dict[str, _CompiledKernel]] = {}
 
@@ -388,6 +419,13 @@ class Kernel:
         self._workgroup_size = workgroup_size
         self._globals = function.__globals__
         self.compile_count = 0
+
+    @classmethod
+    def clear_cache(cls) -> None:
+        for compiled in cls._cache.values():
+            if isinstance(compiled.native, _CpuAotKernel):
+                compiled.native.close()
+        cls._cache.clear()
 
     @staticmethod
     def _annotation_name(node: ast.AST) -> str:
@@ -592,28 +630,82 @@ class Kernel:
         cached = self._cache.get(key)
         if cached is not None:
             return cached
-        native_kernel = None
-        if _native is not None and _native_runtime is not None:
+        if _native is None or _native_runtime is None:
+            raise RuntimeError(
+                f"{_architecture.name} kernel execution requires the native runtime"
+            )
+        if _architecture == cpu:
+            native_kernel = self._compile_cpu_aot(mlir)
+        else:
             target = {
-                cpu: _native.Target.CPU,
                 cuda: _native.Target.CUDA,
                 vulkan: _native.Target.VULKAN,
                 opengl: _native.Target.OPENGL,
                 opengles: _native.Target.OPENGL_ES,
             }[_architecture]
-            try:
-                artifact, reflection = _native.Compiler().compile(mlir, target)
-                native_kernel = _native_runtime.load(artifact, reflection,
-                                                     self._entry)
-            except RuntimeError:
-                if _architecture in {cuda, vulkan, opengl, opengles}:
-                    raise
+            artifact, reflection = _native.Compiler().compile(mlir, target)
+            native_kernel = _native_runtime.load(artifact, reflection,
+                                                 self._entry)
         compiled = _CompiledKernel(
             mlir, specialized_function, builtins,
             self._writable_parameters(specialized_function), native_kernel)
         self._cache[key] = compiled
         self.compile_count += 1
         return compiled
+
+    @staticmethod
+    def _native_compiler_path() -> Path:
+        executable = "vernon-compile.exe" if os.name == "nt" else "vernon-compile"
+        configured = os.environ.get("VERNON_COMPILER")
+        if configured:
+            path = Path(configured).expanduser().resolve()
+            if path.is_file():
+                return path
+            raise RuntimeError(f"VERNON_COMPILER does not name a file: {path}")
+        assert _native is not None
+        repository = Path(__file__).resolve().parents[2]
+        candidates = [
+            Path(_native.__file__).resolve().with_name(executable),
+            repository / "build" / "source" / "Release" / executable,
+            repository / "build" / "source" / executable,
+        ]
+        discovered = shutil.which(executable)
+        if discovered:
+            candidates.append(Path(discovered))
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        raise RuntimeError(
+            "CPU AOT requires vernon-compile; set VERNON_COMPILER to its path")
+
+    def _compile_cpu_aot(self, mlir: str) -> _CpuAotKernel:
+        assert _native_runtime is not None
+        root = Path(tempfile.mkdtemp(prefix="vernon_cpu_kernel_"))
+        mlir_path = root / "kernel.mlir"
+        bundle_path = root / "bundle"
+        mlir_path.write_text(mlir, encoding="utf-8", newline="\n")
+        command = [
+            str(self._native_compiler_path()), "--target", "cpu",
+            str(mlir_path), "--compute-bundle",
+            str(bundle_path)
+        ]
+        try:
+            result = subprocess.run(command,
+                                    capture_output=True,
+                                    text=True,
+                                    encoding="utf-8",
+                                    errors="replace",
+                                    check=False)
+            if result.returncode != 0:
+                diagnostics = result.stderr.strip() or result.stdout.strip()
+                raise RuntimeError(
+                    f"CPU AOT compilation failed for {self._entry}: {diagnostics}"
+                )
+            native = _native_runtime.load_compute_bundle(str(bundle_path))
+            return _CpuAotKernel(native, root)
+        except BaseException:
+            shutil.rmtree(root, ignore_errors=True)
+            raise
 
     def __call__(
         self,
@@ -649,44 +741,34 @@ class Kernel:
         if (len(grid) != 3 or any(not isinstance(value, int) or value <= 0
                                   for value in grid)):
             raise ValueError("grid must contain three positive integers")
-        if compiled.native is not None:
-            assert _native_runtime is not None
-            native_values: list[Any] = []
-            for parameter, value in zip(
-                (argument for argument in compiled.function.args.args
-                 if argument.arg not in compiled.builtin_names),
-                    arguments,
-                    strict=True,
-            ):
-                if isinstance(value, Tensor):
-                    native_values.append(value._resident_buffer())
+        assert _native_runtime is not None and compiled.native is not None
+        native_values: list[Any] = []
+        for parameter, value in zip(
+            (argument for argument in compiled.function.args.args
+             if argument.arg not in compiled.builtin_names),
+                arguments,
+                strict=True,
+        ):
+            if isinstance(value, Tensor):
+                native_values.append(value._resident_buffer())
+            else:
+                annotation = self._annotation_name(parameter.annotation)
+                if annotation == "u32":
+                    native_values.append(struct.pack("<I", int(value)))
+                elif annotation == "i32":
+                    native_values.append(struct.pack("<i", int(value)))
+                elif annotation == "f64":
+                    native_values.append(struct.pack("<d", float(value)))
                 else:
-                    annotation = self._annotation_name(parameter.annotation)
-                    if annotation == "u32":
-                        native_values.append(struct.pack("<I", int(value)))
-                    elif annotation == "i32":
-                        native_values.append(struct.pack("<i", int(value)))
-                    elif annotation == "f64":
-                        native_values.append(struct.pack("<d", float(value)))
-                    else:
-                        native_values.append(struct.pack("<f", float(value)))
-            compiled.native.launch(*grid, native_values)
-            _native_runtime.synchronize()
-            for name, value in zip(user_parameters, arguments, strict=True):
-                if name in compiled.writable_names and isinstance(
-                        value, Tensor):
-                    value._mark_device_dirty()
-            return
-        base = dict(zip(user_parameters, arguments, strict=True))
-        for z in range(grid[2]):
-            for y in range(grid[1]):
-                for x in range(grid[0]):
-                    environment = base.copy()
-                    gid = np.array((x, y, z), dtype=np.uint32)
-                    for name in compiled.builtin_names:
-                        environment[name] = gid
-                    _AstInterpreter(self._globals,
-                                    environment).run(compiled.function.body)
+                    native_values.append(struct.pack("<f", float(value)))
+        compiled.native.launch(*grid, native_values)
+        _native_runtime.synchronize()
+        for name, value in zip(user_parameters, arguments, strict=True):
+            if name in compiled.writable_names and isinstance(value, Tensor):
+                value._mark_device_dirty()
+
+
+atexit.register(Kernel.clear_cache)
 
 
 class Texture:
@@ -1169,11 +1251,11 @@ class Pipeline:
                 if uses_pipeline_runtime:
                     pipeline_arguments.append(
                         ("inline", compiled.slots[parameter.name],
-                         _native.DATA_F32,
-                         values.tobytes(order="C"), list(values.shape)))
+                         _native.DATA_F32, values.tobytes(order="C"),
+                         list(values.shape)))
                 continue
-            if uses_pipeline_runtime and not isinstance(value,
-                                                        (Tensor, TensorView)):
+            if uses_pipeline_runtime and not isinstance(
+                    value, (Tensor, TensorView)):
                 scalar = np.asarray(value)
                 if scalar.dtype.kind == "f":
                     scalar = np.asarray(value, dtype=np.float32)
@@ -1351,174 +1433,6 @@ class Pipeline:
 
 def pipeline(*stages: Any, features: Iterable[str] = ()) -> Pipeline:
     return Pipeline(*stages, features=features)
-
-
-class _AstInterpreter:
-
-    def __init__(self, globals_: dict[str, Any], environment: dict[str, Any]):
-        self.globals = globals_
-        self.environment = environment
-
-    def run(self, statements: list[ast.stmt]) -> Any:
-        for statement in statements:
-            result = self.statement(statement)
-            if isinstance(result, _Return):
-                return result.value
-        return None
-
-    def statement(self, node: ast.stmt) -> "_Return | None":
-        if isinstance(node, ast.Pass):
-            return None
-        if isinstance(node, ast.Assign) and len(node.targets) == 1:
-            value = self.expression(node.value)
-            self.assign(node.targets[0], value)
-            return None
-        if isinstance(node, ast.AnnAssign) and node.value is not None:
-            self.assign(node.target, self.expression(node.value))
-            return None
-        if isinstance(node, ast.AugAssign):
-            current = self.expression(node.target)
-            value = self.binary(node.op, current, self.expression(node.value))
-            self.assign(node.target, value)
-            return None
-        if isinstance(node, ast.If):
-            return self.run(
-                node.body if self.expression(node.test) else node.orelse)
-        if isinstance(node, ast.While):
-            iterations = 0
-            while self.expression(node.test):
-                result = self.run(node.body)
-                if isinstance(result, _Return):
-                    return result
-                iterations += 1
-                if iterations > 10_000_000:
-                    raise RuntimeError(
-                        "kernel while loop exceeded safety limit")
-            return None
-        if isinstance(node, ast.Expr):
-            self.expression(node.value)
-            return None
-        if isinstance(node, ast.Return):
-            return _Return(self.expression(node.value) if node.value else None)
-        raise RuntimeError(
-            f"unsupported runtime statement {type(node).__name__}")
-
-    def assign(self, target: ast.expr, value: Any) -> None:
-        if isinstance(target, ast.Name):
-            self.environment[target.id] = value
-            return
-        if isinstance(target, ast.Subscript):
-            owner = self.expression(target.value)
-            index = self.subscript(target.slice)
-            array = owner._array if isinstance(owner, Tensor) else owner
-            array[index] = value
-            return
-        raise RuntimeError("unsupported runtime assignment target")
-
-    def expression(self, node: ast.expr) -> Any:
-        if isinstance(node, ast.Constant):
-            return node.value
-        if isinstance(node, ast.Name):
-            if node.id in self.environment:
-                return self.environment[node.id]
-            if node.id in self.globals and isinstance(self.globals[node.id],
-                                                      (int, float, bool)):
-                return self.globals[node.id]
-            raise RuntimeError(f"unsupported captured value {node.id!r}")
-        if isinstance(node, ast.Subscript):
-            owner = self.expression(node.value)
-            array = owner._array if isinstance(owner, Tensor) else owner
-            return array[self.subscript(node.slice)]
-        if isinstance(node, ast.BinOp):
-            return self.binary(node.op, self.expression(node.left),
-                               self.expression(node.right))
-        if isinstance(node, ast.UnaryOp):
-            value = self.expression(node.operand)
-            if isinstance(node.op, ast.USub):
-                return -value
-            if isinstance(node.op, ast.UAdd):
-                return value
-            if isinstance(node.op, ast.Not):
-                return not value
-        if isinstance(node, ast.Compare) and len(node.ops) == 1:
-            left = self.expression(node.left)
-            right = self.expression(node.comparators[0])
-            operation = node.ops[0]
-            if isinstance(operation, ast.Lt):
-                return left < right
-            if isinstance(operation, ast.LtE):
-                return left <= right
-            if isinstance(operation, ast.Gt):
-                return left > right
-            if isinstance(operation, ast.GtE):
-                return left >= right
-            if isinstance(operation, ast.Eq):
-                return left == right
-            if isinstance(operation, ast.NotEq):
-                return left != right
-        if isinstance(node, ast.BoolOp):
-            values = [bool(self.expression(value)) for value in node.values]
-            return all(values) if isinstance(node.op, ast.And) else any(values)
-        if isinstance(node, ast.Call):
-            name = Kernel._annotation_name(node.func)
-            values = [self.expression(argument) for argument in node.args]
-            if name in {"vec2", "vec3", "vec4"}:
-                return np.asarray(
-                    [
-                        item for value in values
-                        for item in np.asarray(value).flat
-                    ],
-                    dtype=np.float32,
-                )
-            operations = {
-                "sin": np.sin,
-                "cos": np.cos,
-                "exp": np.exp,
-                "log": np.log,
-                "sqrt": np.sqrt,
-                "abs": np.abs,
-                "min": np.minimum,
-                "max": np.maximum,
-                "pow": np.power,
-                "dot": np.dot,
-                "norm": np.linalg.norm,
-                "int": int,
-                "float": float,
-                "i32": np.int32,
-                "u32": np.uint32,
-                "f32": np.float32,
-                "f64": np.float64,
-            }
-            if name in operations:
-                return operations[name](*values)
-        raise RuntimeError(f"unsupported runtime expression {ast.dump(node)}")
-
-    @staticmethod
-    def binary(operation: ast.operator, left: Any, right: Any) -> Any:
-        if isinstance(operation, ast.Add):
-            return left + right
-        if isinstance(operation, ast.Sub):
-            return left - right
-        if isinstance(operation, ast.Mult):
-            return left * right
-        if isinstance(operation, ast.Div):
-            return left / right
-        if isinstance(operation, ast.Mod):
-            return left % right
-        if isinstance(operation, ast.Pow):
-            return left**right
-        raise RuntimeError(
-            f"unsupported runtime binary operator {type(operation).__name__}")
-
-    def subscript(self, node: ast.expr) -> Any:
-        if isinstance(node, ast.Tuple):
-            return tuple(self.expression(value) for value in node.elts)
-        return self.expression(node)
-
-
-@dataclass(frozen=True)
-class _Return:
-    value: Any
 
 
 class _CapturedConstantSpecializer(ast.NodeTransformer):

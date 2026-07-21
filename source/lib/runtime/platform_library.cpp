@@ -28,6 +28,18 @@ std::string windowsError(DWORD code) {
     result.pop_back();
   return result;
 }
+
+std::wstring utf8ToWide(const char *value) {
+  const int size =
+      MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1, nullptr, 0);
+  if (!size)
+    return {};
+  std::wstring result(static_cast<size_t>(size), L'\0');
+  if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value, -1,
+                           result.data(), size))
+    return {};
+  return result;
+}
 #endif
 
 } // namespace
@@ -52,7 +64,12 @@ bool PlatformLibrary::open(const char *path, std::string &error) {
     return false;
   }
 #if defined(_WIN32)
-  handle_ = LoadLibraryA(path);
+  const std::wstring widePath = utf8ToWide(path);
+  if (widePath.empty()) {
+    error = "dynamic library path is not valid UTF-8";
+    return false;
+  }
+  handle_ = LoadLibraryW(widePath.c_str());
   if (!handle_)
     error = "cannot load dynamic library '" + std::string(path) +
             "': " + windowsError(GetLastError());

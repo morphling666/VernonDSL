@@ -9,6 +9,7 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/GPU/Pipelines/Passes.h"
 #include "mlir/Dialect/Linalg/Passes.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
 #include "mlir/Dialect/SPIRV/Transforms/Passes.h"
@@ -49,6 +50,7 @@
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
+#include "llvm/TargetParser/Triple.h"
 
 #include <cstring>
 #include <memory>
@@ -526,6 +528,29 @@ std::string buildReflection(mlir::ModuleOp module) {
   return output;
 }
 
+bool setCpuReflectionSymbols(VernonCompileResult &result) {
+  llvm::Expected<llvm::json::Value> parsed =
+      llvm::json::parse(result.reflection);
+  if (!parsed)
+    return false;
+  llvm::json::Object *root = parsed->getAsObject();
+  llvm::json::Array *entries = root ? root->getArray("entries") : nullptr;
+  if (!entries)
+    return false;
+  for (llvm::json::Value &entryValue : *entries) {
+    llvm::json::Object *entry = entryValue.getAsObject();
+    std::optional<llvm::StringRef> name =
+        entry ? entry->getString("name") : std::nullopt;
+    if (!name)
+      return false;
+    (*entry)["symbol"] = ("__vernon_cpu_" + *name).str();
+  }
+  result.reflection.clear();
+  llvm::raw_string_ostream stream(result.reflection);
+  stream << llvm::json::Value(std::move(*root));
+  return true;
+}
+
 std::unique_ptr<VernonCompileResult> validate(VernonCompilerContext *context,
                                               const char *source,
                                               size_t sourceSize) {
@@ -579,10 +604,17 @@ public:
     for (mlir::func::FuncOp function : source.getOps<mlir::func::FuncOp>()) {
       if (!function->hasAttr("vernon.entry"))
         continue;
-      if (mlir::failed(emitFunction(function)))
+      unsupportedOperation.clear();
+      if (mlir::failed(emitFunction(function))) {
+        if (!unsupportedOperation.empty())
+          return llvm::createStringError(
+              "unsupported operation '%s' in CPU entry '%s'",
+              unsupportedOperation.c_str(),
+              function.getSymName().str().c_str());
         return llvm::createStringError(
             "unsupported operation in CPU entry '%s'",
             function.getSymName().str().c_str());
+      }
       entryNames.push_back(function.getSymName().str());
     }
     if (entryNames.empty())
@@ -824,6 +856,390 @@ private:
     return result;
   }
 
+  llvm::CmpInst::Predicate
+  convertPredicate(mlir::arith::CmpIPredicate predicate) {
+    switch (predicate) {
+    case mlir::arith::CmpIPredicate::eq:
+      return llvm::CmpInst::ICMP_EQ;
+    case mlir::arith::CmpIPredicate::ne:
+      return llvm::CmpInst::ICMP_NE;
+    case mlir::arith::CmpIPredicate::slt:
+      return llvm::CmpInst::ICMP_SLT;
+    case mlir::arith::CmpIPredicate::sle:
+      return llvm::CmpInst::ICMP_SLE;
+    case mlir::arith::CmpIPredicate::sgt:
+      return llvm::CmpInst::ICMP_SGT;
+    case mlir::arith::CmpIPredicate::sge:
+      return llvm::CmpInst::ICMP_SGE;
+    case mlir::arith::CmpIPredicate::ult:
+      return llvm::CmpInst::ICMP_ULT;
+    case mlir::arith::CmpIPredicate::ule:
+      return llvm::CmpInst::ICMP_ULE;
+    case mlir::arith::CmpIPredicate::ugt:
+      return llvm::CmpInst::ICMP_UGT;
+    case mlir::arith::CmpIPredicate::uge:
+      return llvm::CmpInst::ICMP_UGE;
+    }
+    llvm_unreachable("unknown arith.cmpi predicate");
+  }
+
+  llvm::CmpInst::Predicate
+  convertPredicate(mlir::arith::CmpFPredicate predicate) {
+    switch (predicate) {
+    case mlir::arith::CmpFPredicate::AlwaysFalse:
+      return llvm::CmpInst::FCMP_FALSE;
+    case mlir::arith::CmpFPredicate::OEQ:
+      return llvm::CmpInst::FCMP_OEQ;
+    case mlir::arith::CmpFPredicate::OGT:
+      return llvm::CmpInst::FCMP_OGT;
+    case mlir::arith::CmpFPredicate::OGE:
+      return llvm::CmpInst::FCMP_OGE;
+    case mlir::arith::CmpFPredicate::OLT:
+      return llvm::CmpInst::FCMP_OLT;
+    case mlir::arith::CmpFPredicate::OLE:
+      return llvm::CmpInst::FCMP_OLE;
+    case mlir::arith::CmpFPredicate::ONE:
+      return llvm::CmpInst::FCMP_ONE;
+    case mlir::arith::CmpFPredicate::ORD:
+      return llvm::CmpInst::FCMP_ORD;
+    case mlir::arith::CmpFPredicate::UEQ:
+      return llvm::CmpInst::FCMP_UEQ;
+    case mlir::arith::CmpFPredicate::UGT:
+      return llvm::CmpInst::FCMP_UGT;
+    case mlir::arith::CmpFPredicate::UGE:
+      return llvm::CmpInst::FCMP_UGE;
+    case mlir::arith::CmpFPredicate::ULT:
+      return llvm::CmpInst::FCMP_ULT;
+    case mlir::arith::CmpFPredicate::ULE:
+      return llvm::CmpInst::FCMP_ULE;
+    case mlir::arith::CmpFPredicate::UNE:
+      return llvm::CmpInst::FCMP_UNE;
+    case mlir::arith::CmpFPredicate::UNO:
+      return llvm::CmpInst::FCMP_UNO;
+    case mlir::arith::CmpFPredicate::AlwaysTrue:
+      return llvm::CmpInst::FCMP_TRUE;
+    }
+    llvm_unreachable("unknown arith.cmpf predicate");
+  }
+
+  mlir::LogicalResult
+  emitBlock(mlir::Block &source, llvm::IRBuilder<> &builder,
+            llvm::DenseMap<mlir::Value, llvm::Value *> &values) {
+    for (mlir::Operation &operation : source.without_terminator())
+      if (mlir::failed(emitOperation(operation, builder, values)))
+        return mlir::failure();
+    return mlir::success();
+  }
+
+  mlir::LogicalResult
+  emitIf(mlir::scf::IfOp ifOp, llvm::IRBuilder<> &builder,
+         llvm::DenseMap<mlir::Value, llvm::Value *> &values) {
+    llvm::Value *condition = values.lookup(ifOp.getCondition());
+    if (!condition)
+      return mlir::failure();
+
+    llvm::Function *function = builder.GetInsertBlock()->getParent();
+    llvm::BasicBlock *thenBlock =
+        llvm::BasicBlock::Create(context, "if.then", function);
+    llvm::BasicBlock *elseBlock =
+        llvm::BasicBlock::Create(context, "if.else", function);
+    llvm::BasicBlock *continueBlock =
+        llvm::BasicBlock::Create(context, "if.end", function);
+    builder.CreateCondBr(condition, thenBlock, elseBlock);
+
+    llvm::SmallVector<llvm::Value *> thenValues;
+    builder.SetInsertPoint(thenBlock);
+    mlir::Block &sourceThen = ifOp.getThenRegion().front();
+    if (mlir::failed(emitBlock(sourceThen, builder, values)))
+      return mlir::failure();
+    auto thenYield =
+        mlir::dyn_cast<mlir::scf::YieldOp>(sourceThen.getTerminator());
+    if (!thenYield)
+      return mlir::failure();
+    for (mlir::Value value : thenYield.getOperands()) {
+      llvm::Value *converted = values.lookup(value);
+      if (!converted)
+        return mlir::failure();
+      thenValues.push_back(converted);
+    }
+    llvm::BasicBlock *thenExit = builder.GetInsertBlock();
+    builder.CreateBr(continueBlock);
+
+    llvm::SmallVector<llvm::Value *> elseValues;
+    builder.SetInsertPoint(elseBlock);
+    if (!ifOp.getElseRegion().empty()) {
+      mlir::Block &sourceElse = ifOp.getElseRegion().front();
+      if (mlir::failed(emitBlock(sourceElse, builder, values)))
+        return mlir::failure();
+      auto elseYield =
+          mlir::dyn_cast<mlir::scf::YieldOp>(sourceElse.getTerminator());
+      if (!elseYield)
+        return mlir::failure();
+      for (mlir::Value value : elseYield.getOperands()) {
+        llvm::Value *converted = values.lookup(value);
+        if (!converted)
+          return mlir::failure();
+        elseValues.push_back(converted);
+      }
+    }
+    llvm::BasicBlock *elseExit = builder.GetInsertBlock();
+    builder.CreateBr(continueBlock);
+
+    if (thenValues.size() != ifOp.getNumResults() ||
+        elseValues.size() != ifOp.getNumResults())
+      return mlir::failure();
+    builder.SetInsertPoint(continueBlock);
+    for (auto [index, result] : llvm::enumerate(ifOp.getResults())) {
+      llvm::Type *type = convertType(result.getType());
+      if (!type)
+        return mlir::failure();
+      llvm::PHINode *phi = builder.CreatePHI(type, 2, "if.result");
+      phi->addIncoming(thenValues[index], thenExit);
+      phi->addIncoming(elseValues[index], elseExit);
+      values[result] = phi;
+    }
+    return mlir::success();
+  }
+
+  mlir::LogicalResult
+  emitWhile(mlir::scf::WhileOp whileOp, llvm::IRBuilder<> &builder,
+            llvm::DenseMap<mlir::Value, llvm::Value *> &values) {
+    llvm::Function *function = builder.GetInsertBlock()->getParent();
+    llvm::BasicBlock *preheader = builder.GetInsertBlock();
+    llvm::BasicBlock *beforeBlock =
+        llvm::BasicBlock::Create(context, "while.before", function);
+    llvm::BasicBlock *afterBlock =
+        llvm::BasicBlock::Create(context, "while.body", function);
+    llvm::BasicBlock *continueBlock =
+        llvm::BasicBlock::Create(context, "while.end", function);
+    builder.CreateBr(beforeBlock);
+
+    mlir::Block &sourceBefore = whileOp.getBefore().front();
+    if (sourceBefore.getNumArguments() != whileOp.getNumOperands())
+      return mlir::failure();
+    builder.SetInsertPoint(beforeBlock);
+    llvm::SmallVector<llvm::PHINode *> beforePhis;
+    for (auto [argument, initial] :
+         llvm::zip_equal(sourceBefore.getArguments(), whileOp.getOperands())) {
+      llvm::Value *initialValue = values.lookup(initial);
+      llvm::Type *type = convertType(argument.getType());
+      if (!initialValue || !type)
+        return mlir::failure();
+      llvm::PHINode *phi = builder.CreatePHI(type, 2, "while.iter");
+      phi->addIncoming(initialValue, preheader);
+      values[argument] = phi;
+      beforePhis.push_back(phi);
+    }
+    if (mlir::failed(emitBlock(sourceBefore, builder, values)))
+      return mlir::failure();
+    auto condition =
+        mlir::dyn_cast<mlir::scf::ConditionOp>(sourceBefore.getTerminator());
+    if (!condition)
+      return mlir::failure();
+    llvm::Value *conditionValue = values.lookup(condition.getCondition());
+    if (!conditionValue ||
+        condition.getArgs().size() != whileOp.getNumResults())
+      return mlir::failure();
+    llvm::SmallVector<llvm::Value *> forwarded;
+    for (mlir::Value value : condition.getArgs()) {
+      llvm::Value *converted = values.lookup(value);
+      if (!converted)
+        return mlir::failure();
+      forwarded.push_back(converted);
+    }
+    llvm::BasicBlock *conditionBlock = builder.GetInsertBlock();
+    builder.CreateCondBr(conditionValue, afterBlock, continueBlock);
+
+    mlir::Block &sourceAfter = whileOp.getAfter().front();
+    if (sourceAfter.getNumArguments() != forwarded.size())
+      return mlir::failure();
+    builder.SetInsertPoint(afterBlock);
+    for (auto [argument, value] :
+         llvm::zip_equal(sourceAfter.getArguments(), forwarded)) {
+      llvm::Type *type = convertType(argument.getType());
+      if (!type)
+        return mlir::failure();
+      llvm::PHINode *phi = builder.CreatePHI(type, 1, "while.body.arg");
+      phi->addIncoming(value, conditionBlock);
+      values[argument] = phi;
+    }
+    if (mlir::failed(emitBlock(sourceAfter, builder, values)))
+      return mlir::failure();
+    auto yield =
+        mlir::dyn_cast<mlir::scf::YieldOp>(sourceAfter.getTerminator());
+    if (!yield || yield.getOperands().size() != beforePhis.size())
+      return mlir::failure();
+    llvm::SmallVector<llvm::Value *> yielded;
+    for (mlir::Value value : yield.getOperands()) {
+      llvm::Value *converted = values.lookup(value);
+      if (!converted)
+        return mlir::failure();
+      yielded.push_back(converted);
+    }
+    llvm::BasicBlock *afterExit = builder.GetInsertBlock();
+    builder.CreateBr(beforeBlock);
+    for (auto [phi, value] : llvm::zip_equal(beforePhis, yielded))
+      phi->addIncoming(value, afterExit);
+
+    builder.SetInsertPoint(continueBlock);
+    for (auto [result, value] :
+         llvm::zip_equal(whileOp.getResults(), forwarded)) {
+      llvm::Type *type = convertType(result.getType());
+      if (!type)
+        return mlir::failure();
+      llvm::PHINode *phi = builder.CreatePHI(type, 1, "while.result");
+      phi->addIncoming(value, conditionBlock);
+      values[result] = phi;
+    }
+    return mlir::success();
+  }
+
+  mlir::LogicalResult
+  emitOperation(mlir::Operation &operation, llvm::IRBuilder<> &builder,
+                llvm::DenseMap<mlir::Value, llvm::Value *> &values) {
+    unsupportedOperation = operation.getName().getStringRef().str();
+    if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(operation))
+      return emitIf(ifOp, builder, values);
+    if (auto whileOp = mlir::dyn_cast<mlir::scf::WhileOp>(operation))
+      return emitWhile(whileOp, builder, values);
+
+    llvm::Value *result = nullptr;
+    if (auto constant = mlir::dyn_cast<mlir::arith::ConstantOp>(operation)) {
+      if (auto floatValue =
+              mlir::dyn_cast<mlir::FloatAttr>(constant.getValue()))
+        result = llvm::ConstantFP::get(context, floatValue.getValue());
+      else if (auto integer =
+                   mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue()))
+        result = llvm::ConstantInt::get(convertType(constant.getType()),
+                                        integer.getValue());
+    } else if (auto compare = mlir::dyn_cast<mlir::arith::CmpIOp>(operation)) {
+      llvm::Value *lhs = values.lookup(compare.getLhs());
+      llvm::Value *rhs = values.lookup(compare.getRhs());
+      if (lhs && rhs)
+        result = builder.CreateICmp(convertPredicate(compare.getPredicate()),
+                                    lhs, rhs);
+    } else if (auto compare = mlir::dyn_cast<mlir::arith::CmpFOp>(operation)) {
+      llvm::Value *lhs = values.lookup(compare.getLhs());
+      llvm::Value *rhs = values.lookup(compare.getRhs());
+      if (lhs && rhs)
+        result = builder.CreateFCmp(convertPredicate(compare.getPredicate()),
+                                    lhs, rhs);
+    } else if (auto swizzle =
+                   mlir::dyn_cast<mlir::vernon::SwizzleOp>(operation)) {
+      llvm::Value *input = values.lookup(swizzle.getInput());
+      if (!input)
+        return mlir::failure();
+      llvm::SmallVector<int> mask;
+      for (char component : swizzle.getMask())
+        mask.push_back(llvm::StringRef("xyzw").find(component));
+      result = mask.size() == 1
+                   ? builder.CreateExtractElement(input, mask.front())
+                   : builder.CreateShuffleVector(input, mask);
+    } else if (auto intrinsic =
+                   mlir::dyn_cast<mlir::vernon::IntrinsicOp>(operation)) {
+      requiresTextureCallbacks |= intrinsic.getName() == "texture_sample";
+      result = emitIntrinsic(intrinsic, builder, values);
+    } else if (auto extract =
+                   mlir::dyn_cast<mlir::tensor::ExtractOp>(operation)) {
+      llvm::Value *tensor = values.lookup(extract.getTensor());
+      if (!tensor)
+        return mlir::failure();
+      auto tensorType =
+          mlir::cast<mlir::RankedTensorType>(extract.getTensor().getType());
+      llvm::Value *linearIndex =
+          llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
+      for (auto [dimension, index] : llvm::enumerate(extract.getIndices())) {
+        llvm::Value *convertedIndex = values.lookup(index);
+        if (!convertedIndex)
+          return mlir::failure();
+        if (!convertedIndex->getType()->isIntegerTy(64))
+          convertedIndex = builder.CreateZExtOrTrunc(
+              convertedIndex, llvm::Type::getInt64Ty(context));
+        if (dimension != 0)
+          linearIndex = builder.CreateMul(
+              linearIndex,
+              llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
+                                     tensorType.getDimSize(dimension)));
+        linearIndex = builder.CreateAdd(linearIndex, convertedIndex);
+      }
+      result = llvm::isa<llvm::VectorType>(tensor->getType())
+                   ? builder.CreateExtractElement(tensor, linearIndex)
+                   : tensor;
+    } else if (auto returnOp =
+                   mlir::dyn_cast<mlir::func::ReturnOp>(operation)) {
+      if (returnOp.getNumOperands() == 0)
+        builder.CreateRetVoid();
+      else if (llvm::Value *value = values.lookup(returnOp.getOperand(0)))
+        builder.CreateRet(value);
+      else
+        return mlir::failure();
+      return mlir::success();
+    } else if (operation.getNumOperands() == 1 &&
+               operation.getNumResults() == 1) {
+      llvm::Value *input = values.lookup(operation.getOperand(0));
+      llvm::Type *target = convertType(operation.getResult(0).getType());
+      if (!input || !target)
+        return mlir::failure();
+      llvm::StringRef name = operation.getName().getStringRef();
+      if (name == "arith.index_cast")
+        result = builder.CreateIntCast(input, target, true);
+      else if (name == "arith.index_castui")
+        result = builder.CreateIntCast(input, target, false);
+      else if (name == "arith.uitofp")
+        result = builder.CreateUIToFP(input, target);
+      else if (name == "arith.sitofp")
+        result = builder.CreateSIToFP(input, target);
+      else if (name == "arith.fptoui")
+        result = builder.CreateFPToUI(input, target);
+      else if (name == "arith.fptosi")
+        result = builder.CreateFPToSI(input, target);
+      else if (name == "arith.extf")
+        result = builder.CreateFPExt(input, target);
+      else if (name == "arith.truncf")
+        result = builder.CreateFPTrunc(input, target);
+      else if (name == "arith.negf")
+        result = builder.CreateFNeg(input);
+      else if (name == "math.cos" || name == "math.sqrt") {
+        llvm::Intrinsic::ID id =
+            name == "math.cos" ? llvm::Intrinsic::cos : llvm::Intrinsic::sqrt;
+        llvm::Function *function =
+            llvm::Intrinsic::getOrInsertDeclaration(&module, id, {target});
+        result = builder.CreateCall(function, input);
+      }
+    } else if (operation.getNumOperands() == 2 &&
+               operation.getNumResults() == 1) {
+      llvm::Value *lhs = values.lookup(operation.getOperand(0));
+      llvm::Value *rhs = values.lookup(operation.getOperand(1));
+      if (!lhs || !rhs)
+        return mlir::failure();
+      llvm::StringRef name = operation.getName().getStringRef();
+      if (name == "arith.addf")
+        result = builder.CreateFAdd(lhs, rhs);
+      else if (name == "arith.subf")
+        result = builder.CreateFSub(lhs, rhs);
+      else if (name == "arith.mulf")
+        result = builder.CreateFMul(lhs, rhs);
+      else if (name == "arith.divf")
+        result = builder.CreateFDiv(lhs, rhs);
+      else if (name == "arith.addi")
+        result = builder.CreateAdd(lhs, rhs);
+      else if (name == "arith.subi")
+        result = builder.CreateSub(lhs, rhs);
+      else if (name == "arith.muli")
+        result = builder.CreateMul(lhs, rhs);
+      else if (name == "arith.andi")
+        result = builder.CreateAnd(lhs, rhs);
+    }
+    if (!result)
+      return mlir::failure();
+    if (operation.getNumResults() == 0)
+      return mlir::success();
+    if (operation.getNumResults() != 1)
+      return mlir::failure();
+    values[operation.getResult(0)] = result;
+    return mlir::success();
+  }
+
   mlir::LogicalResult emitFunction(mlir::func::FuncOp source) {
     llvm::SmallVector<llvm::Type *> argumentTypes;
     for (mlir::Type type : source.getArgumentTypes()) {
@@ -853,113 +1269,10 @@ private:
     for (auto [index, sourceArgument] : llvm::enumerate(source.getArguments()))
       values[sourceArgument] = function->getArg(index);
     textureCallbacks = function->getArg(source.getNumArguments());
-    bool requiresTextureCallbacks = false;
-
-    for (mlir::Operation &operation : source.front()) {
-      llvm::Value *result = nullptr;
-      if (auto constant = mlir::dyn_cast<mlir::arith::ConstantOp>(operation)) {
-        if (auto floatValue =
-                mlir::dyn_cast<mlir::FloatAttr>(constant.getValue()))
-          result = llvm::ConstantFP::get(context, floatValue.getValue());
-        else if (auto integer =
-                     mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue()))
-          result = llvm::ConstantInt::get(convertType(constant.getType()),
-                                          integer.getValue());
-        else
-          return mlir::failure();
-      } else if (auto swizzle =
-                     mlir::dyn_cast<mlir::vernon::SwizzleOp>(operation)) {
-        llvm::Value *input = values.lookup(swizzle.getInput());
-        llvm::SmallVector<int> mask;
-        for (char component : swizzle.getMask())
-          mask.push_back(llvm::StringRef("xyzw").find(component));
-        result = mask.size() == 1
-                     ? builder.CreateExtractElement(input, mask.front())
-                     : builder.CreateShuffleVector(input, mask);
-      } else if (auto intrinsic =
-                     mlir::dyn_cast<mlir::vernon::IntrinsicOp>(operation)) {
-        requiresTextureCallbacks |= intrinsic.getName() == "texture_sample";
-        result = emitIntrinsic(intrinsic, builder, values);
-      } else if (auto extract =
-                     mlir::dyn_cast<mlir::tensor::ExtractOp>(operation)) {
-        llvm::Value *tensor = values.lookup(extract.getTensor());
-        auto tensorType =
-            mlir::cast<mlir::RankedTensorType>(extract.getTensor().getType());
-        llvm::Value *linearIndex =
-            llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
-        for (auto [dimension, index] : llvm::enumerate(extract.getIndices())) {
-          llvm::Value *convertedIndex = values.lookup(index);
-          if (!convertedIndex)
-            return mlir::failure();
-          if (!convertedIndex->getType()->isIntegerTy(64))
-            convertedIndex = builder.CreateZExtOrTrunc(
-                convertedIndex, llvm::Type::getInt64Ty(context));
-          if (dimension != 0)
-            linearIndex = builder.CreateMul(
-                linearIndex,
-                llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                       tensorType.getDimSize(dimension)));
-          linearIndex = builder.CreateAdd(linearIndex, convertedIndex);
-        }
-        result = llvm::isa<llvm::VectorType>(tensor->getType())
-                     ? builder.CreateExtractElement(tensor, linearIndex)
-                     : tensor;
-      } else if (auto returnOp =
-                     mlir::dyn_cast<mlir::func::ReturnOp>(operation)) {
-        if (returnOp.getNumOperands() == 0)
-          builder.CreateRetVoid();
-        else
-          builder.CreateRet(values.lookup(returnOp.getOperand(0)));
-        continue;
-      } else if (operation.getNumOperands() == 1 &&
-                 operation.getNumResults() == 1) {
-        llvm::Value *input = values.lookup(operation.getOperand(0));
-        llvm::Type *target = convertType(operation.getResult(0).getType());
-        llvm::StringRef name = operation.getName().getStringRef();
-        if (name == "arith.index_cast")
-          result = builder.CreateIntCast(input, target, true);
-        else if (name == "arith.index_castui")
-          result = builder.CreateIntCast(input, target, false);
-        else if (name == "arith.uitofp")
-          result = builder.CreateUIToFP(input, target);
-        else if (name == "arith.sitofp")
-          result = builder.CreateSIToFP(input, target);
-        else if (name == "arith.fptoui")
-          result = builder.CreateFPToUI(input, target);
-        else if (name == "arith.fptosi")
-          result = builder.CreateFPToSI(input, target);
-        else if (name == "arith.extf")
-          result = builder.CreateFPExt(input, target);
-        else if (name == "arith.truncf")
-          result = builder.CreateFPTrunc(input, target);
-      } else if (operation.getNumOperands() == 2 &&
-                 operation.getNumResults() == 1) {
-        llvm::Value *lhs = values.lookup(operation.getOperand(0));
-        llvm::Value *rhs = values.lookup(operation.getOperand(1));
-        llvm::StringRef name = operation.getName().getStringRef();
-        if (name == "arith.addf")
-          result = builder.CreateFAdd(lhs, rhs);
-        else if (name == "arith.subf")
-          result = builder.CreateFSub(lhs, rhs);
-        else if (name == "arith.mulf")
-          result = builder.CreateFMul(lhs, rhs);
-        else if (name == "arith.divf")
-          result = builder.CreateFDiv(lhs, rhs);
-        else if (name == "arith.addi")
-          result = builder.CreateAdd(lhs, rhs);
-        else if (name == "arith.subi")
-          result = builder.CreateSub(lhs, rhs);
-        else if (name == "arith.muli")
-          result = builder.CreateMul(lhs, rhs);
-      }
-      if (!result)
+    requiresTextureCallbacks = false;
+    for (mlir::Operation &operation : source.front())
+      if (mlir::failed(emitOperation(operation, builder, values)))
         return mlir::failure();
-      if (operation.getNumResults() == 0)
-        continue;
-      if (operation.getNumResults() != 1)
-        return mlir::failure();
-      values[operation.getResult(0)] = result;
-    }
     if (!block->getTerminator())
       return mlir::failure();
     emitWrapper(function, source.getNumArguments(), requiresTextureCallbacks);
@@ -975,6 +1288,10 @@ private:
     llvm::Function *wrapper =
         llvm::Function::Create(wrapperType, llvm::GlobalValue::ExternalLinkage,
                                "__vernon_cpu_" + function->getName(), module);
+    if (llvm::Triple(module.getTargetTriple()).isOSWindows())
+      wrapper->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
+    else
+      wrapper->setVisibility(llvm::GlobalValue::DefaultVisibility);
     llvm::BasicBlock *entryBlock =
         llvm::BasicBlock::Create(context, "entry", wrapper);
     llvm::BasicBlock *sizeBlock =
@@ -1102,6 +1419,8 @@ private:
   llvm::Module &module;
   llvm::LLVMContext &context;
   llvm::Value *textureCallbacks{nullptr};
+  bool requiresTextureCallbacks{false};
+  std::string unsupportedOperation;
   llvm::SmallVector<std::string> entryNames;
 };
 
@@ -1287,6 +1606,10 @@ bool compileCpu(VernonCompilerContext *compilerContext, const char *source,
   result.artifacts.clear();
   result.artifacts.push_back(
       VernonCompileResult::Artifact{"module.ll", std::move(*llvmIR)});
+  if (!setCpuReflectionSymbols(result)) {
+    result.diagnostics = "compiler produced invalid CPU reflection metadata";
+    return false;
+  }
   result.cpuJit = std::move(*jit);
   return true;
 }

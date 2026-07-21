@@ -50,6 +50,8 @@ def _canonical_json(value: Any) -> str:
 
 def encode_runtime_stage(record: dict[str, Any],
                          artifact: bytes) -> dict[str, Any]:
+    if record.get("format") == "native_library":
+        return dict(record)
     if record.get("format") == "spirv":
         return {
             **record,
@@ -222,11 +224,11 @@ def _compile_stage(module: ShaderModuleDescriptor,
         mlir_path = temporary / "stage.mlir"
         artifact_directory = temporary / "artifacts"
         mlir_path.write_text(mlir, encoding="utf-8", newline="\n")
-        command = [
-            str(compiler), "--target", target,
-            str(mlir_path), "--output-dir",
-            str(artifact_directory)
-        ]
+        command = [str(compiler), "--target", target, str(mlir_path)]
+        if target == "cpu":
+            command.extend(("--compute-bundle", str(artifact_directory)))
+        else:
+            command.extend(("--output-dir", str(artifact_directory)))
         glsl_version = target_options.get("glsl_version", 0)
         if glsl_version:
             if not isinstance(glsl_version, int):
@@ -241,6 +243,91 @@ def _compile_stage(module: ShaderModuleDescriptor,
             raise ShaderAssetError(
                 f"native compilation failed for {reference.entry}: {diagnostics}"
             )
+        if target == "cpu":
+            manifest = _read_manifest(artifact_directory / "compute.json")
+            symbol = manifest.get("symbol")
+            artifact_name = manifest.get("artifact")
+            artifact_size = manifest.get("artifact_size")
+            artifact_sha256 = manifest.get("artifact_sha256")
+            operating_system = manifest.get("operating_system")
+            architecture = manifest.get("architecture")
+            abi_version = manifest.get("cpu_invocation_abi_version")
+            if (manifest.get("schema_version") != 2
+                    or manifest.get("target") != "cpu"
+                    or manifest.get("artifact_format") != "native_library"
+                    or manifest.get("entry") != reference.entry
+                    or symbol != f"__vernon_cpu_{reference.entry}"
+                    or not isinstance(artifact_name, str) or not artifact_name
+                    or not isinstance(artifact_size, int)
+                    or not isinstance(artifact_sha256, str)
+                    or len(artifact_sha256) != 64
+                    or not isinstance(operating_system, str)
+                    or not isinstance(architecture, str)
+                    or not isinstance(abi_version, int)):
+                raise ShaderAssetError(
+                    f"compiler emitted an invalid CPU bundle for {reference.entry}"
+                )
+            relative_artifact = Path(artifact_name)
+            if relative_artifact.is_absolute(
+            ) or ".." in relative_artifact.parts:
+                raise ShaderAssetError(
+                    "CPU bundle artifact path must stay inside its bundle")
+            artifact_data = (artifact_directory /
+                             relative_artifact).read_bytes()
+            digest = hashlib.sha256(artifact_data).hexdigest()
+            if len(artifact_data
+                   ) != artifact_size or digest != artifact_sha256:
+                raise ShaderAssetError(
+                    "CPU bundle artifact size or SHA-256 does not match its manifest"
+                )
+            reflection = manifest.get("reflection")
+            if not isinstance(reflection, dict):
+                raise ShaderAssetError(
+                    "CPU bundle reflection must be an object")
+            entry_reflection = _entry_reflection(reflection, reference.entry)
+            identity = {
+                "cache_version": 1,
+                "compiler_version": 1,
+                "module": module.id,
+                "module_manifest": module.canonical_manifest,
+                "entry": reference.entry,
+                "stage": stage,
+                "target": target,
+                "target_options": target_options,
+                "dependencies": reflection.get("dependencies", []),
+                "interface": entry_reflection,
+                "artifact_sha256": digest,
+            }
+            stage_id = hashlib.sha256(
+                _canonical_json(identity).encode("utf-8")).hexdigest()
+            suffix = relative_artifact.suffix
+            cooked_filename = f"stages/{digest}{suffix}"
+            cooked_path = output / cooked_filename
+            cooked_path.parent.mkdir(parents=True, exist_ok=True)
+            if not cooked_path.exists():
+                cooked_path.write_bytes(artifact_data)
+            record = {
+                "id": stage_id,
+                "module": module.id,
+                "entry": reference.entry,
+                "stage": stage,
+                "target": target,
+                "format": "native_library",
+                "artifact": {
+                    "path": cooked_filename,
+                    "sha256": digest,
+                    "size": len(artifact_data),
+                },
+                "symbol": symbol,
+                "operating_system": operating_system,
+                "architecture": architecture,
+                "cpu_invocation_abi_version": abi_version,
+                "module_hash": reflection.get("module_hash"),
+                "dependencies": reflection.get("dependencies", []),
+                "interface": entry_reflection,
+                "reflection": reflection,
+            }
+            return stage_id, record
         reflection_path = artifact_directory / "reflection.json"
         reflection = _read_manifest(reflection_path)
         artifact_rows = [
@@ -395,12 +482,35 @@ def _fragment_outputs(
     fragment = records.get("fragment")
     if fragment is None:
         return []
-    return [{
-        "name": row.get("vernon.source_name"),
-        "location": row["vernon.location"],
-        "type": row.get("type"),
-    } for row in fragment["interface"].get("results", [])
-            if "vernon.location" in row]
+    outputs: list[dict[str, Any]] = []
+    for row in fragment["interface"].get("results", []):
+        if "vernon.location" not in row:
+            continue
+        location = row["vernon.location"]
+        type_name = row.get("type")
+        dtype: str | None = None
+        shape: list[int] = []
+        if isinstance(type_name, str):
+            if type_name.startswith("tensor<") and type_name.endswith(">"):
+                parts = type_name[7:-1].split("x")
+                if parts:
+                    dtype = parts[-1]
+                    shape = [
+                        0 if dimension == "?" else int(dimension)
+                        for dimension in parts[:-1]
+                    ]
+            else:
+                dtype = type_name
+        outputs.append({
+            "name": row.get("vernon.source_name") or f"output_{location}",
+            "kind": "texture",
+            "dtype": dtype,
+            "shape": shape,
+            "access": "write",
+            "location": location,
+            "type": type_name,
+        })
+    return outputs
 
 
 def cook_shader_pipeline(*,
@@ -418,6 +528,10 @@ def cook_shader_pipeline(*,
     if target not in pipeline.targets:
         raise ShaderAssetError(
             f"pipeline does not declare requested target '{target}'")
+    if target == "cpu" and set(pipeline.stages) != {"compute"}:
+        raise ShaderAssetError(
+            "CPU pipeline bundles support one compute stage and no graphics "
+            "or barrier steps")
     target_options = pipeline.targets[target]
     selected_modules: dict[str, ShaderModuleDescriptor] = {}
     declared_features: set[str] = set()
@@ -538,9 +652,10 @@ def cook_shader_pipeline(*,
         "variants": pipeline_variants,
         "stage_artifacts": {
             key:
-            encode_runtime_stage(stage_records[key],
-                                 (output_path /
-                                  stage_records[key]["filename"]).read_bytes())
+            encode_runtime_stage(
+                stage_records[key], b""
+                if stage_records[key].get("format") == "native_library" else
+                (output_path / stage_records[key]["filename"]).read_bytes())
             for key in sorted(stage_records)
         },
     }

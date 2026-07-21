@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import unittest
 from typing import Annotated
+from unittest import mock
 
 import numpy as np
 
@@ -219,7 +221,7 @@ class KernelTests(unittest.TestCase):
     def setUp(self) -> None:
         vd.init(arch=vd.cpu)
         fill.compile_count = 0
-        fill._cache.clear()
+        type(fill).clear_cache()
 
     def test_explicit_grid_and_cache(self) -> None:
         output = vd.Tensor.zeros(dtype=vd.f32, shape=(2, 3))
@@ -231,6 +233,14 @@ class KernelTests(unittest.TestCase):
         self.assertEqual(fill.compile_count, 1)
         fill(output, 20.0, grid=(3, 2, 1))
         self.assertEqual(fill.compile_count, 1)
+
+    def test_cpu_aot_compiler_failure_does_not_fall_back(self) -> None:
+        output = vd.Tensor.zeros(dtype=vd.f32, shape=(2, 3))
+        missing = os.fspath(os.path.abspath("missing-vernon-compile-for-test"))
+        with mock.patch.dict(os.environ, {"VERNON_COMPILER": missing}):
+            with self.assertRaisesRegex(
+                    RuntimeError, "VERNON_COMPILER does not name a file"):
+                fill(output, 1.0)
 
     def test_specialized_shape_invalidates_cache(self) -> None:
         first = vd.Tensor.zeros(dtype=vd.f32, shape=(2, 3))
@@ -250,8 +260,6 @@ class KernelTests(unittest.TestCase):
             fill(output, 1.0, grid=(3, 0, 1))
 
     def test_native_tensor_residency_and_lazy_download(self) -> None:
-        if not KernelTensorRuntimeTests._runtime_available(vd.opengl):
-            self.skipTest("OpenGL runtime unavailable")
         output = vd.Tensor.zeros(dtype=vd.f32, shape=(2, 3))
         fill(output, 2.0)
         fill(output, 3.0)

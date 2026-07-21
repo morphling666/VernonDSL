@@ -31,7 +31,7 @@ function(vernon_add_runtime_tests)
     ${_VERNON_RUNTIME_SOURCE_DIR}/include)
   set(cpu_bundle ${CMAKE_CURRENT_BINARY_DIR}/cpu_aot_bundle)
   add_custom_command(
-    OUTPUT ${cpu_bundle}/compute.json
+    OUTPUT ${cpu_bundle}/compute.json ${cpu_bundle}/pipeline.bundle
     COMMAND ${CMAKE_COMMAND}
       "-DARTIFACT=$<TARGET_FILE:vernon-cpu-aot-fixture>"
       "-DOUTPUT=${cpu_bundle}"
@@ -42,7 +42,7 @@ function(vernon_add_runtime_tests)
       ${_VERNON_RUNTIME_SOURCE_DIR}/tests/write_cpu_aot_bundle.cmake
     VERBATIM)
   add_custom_target(vernon-cpu-aot-test-bundle
-    DEPENDS ${cpu_bundle}/compute.json)
+    DEPENDS ${cpu_bundle}/compute.json ${cpu_bundle}/pipeline.bundle)
   add_executable(vernon-runtime-cpu-aot-test
     ${_VERNON_RUNTIME_SOURCE_DIR}/tests/runtime_c_api_test.c)
   target_link_libraries(vernon-runtime-cpu-aot-test PRIVATE Vernon::Runtime)
@@ -51,10 +51,29 @@ function(vernon_add_runtime_tests)
   add_dependencies(vernon-runtime-cpu-aot-test vernon-cpu-aot-test-bundle)
   add_test(NAME vernon-runtime-cpu-aot-test COMMAND vernon-runtime-cpu-aot-test)
 
+  add_executable(vernon-runtime-cpu-pipeline-test
+    ${_VERNON_RUNTIME_SOURCE_DIR}/tests/runtime_cpu_pipeline_test.cpp)
+  target_link_libraries(vernon-runtime-cpu-pipeline-test PRIVATE Vernon::Runtime)
+  target_compile_definitions(vernon-runtime-cpu-pipeline-test PRIVATE
+    VERNON_CPU_BUNDLE_PATH="${cpu_bundle}"
+    VERNON_RUNTIME_TEST_OS="${runtime_test_os}"
+    VERNON_RUNTIME_TEST_ARCH="${runtime_test_arch}")
+  add_dependencies(vernon-runtime-cpu-pipeline-test
+    vernon-cpu-aot-test-bundle)
+  add_test(NAME vernon-runtime-cpu-pipeline-test
+    COMMAND vernon-runtime-cpu-pipeline-test)
+
   if(VERNON_ENABLE_CUDA_RUNTIME)
     add_executable(vernon-runtime-cuda-test
       ${_VERNON_RUNTIME_SOURCE_DIR}/tests/runtime_cuda_test.cpp)
     target_link_libraries(vernon-runtime-cuda-test PRIVATE Vernon::Runtime)
     add_test(NAME vernon-runtime-cuda-test COMMAND vernon-runtime-cuda-test)
+
+    add_executable(vernon-runtime-cuda-pipeline-test
+      ${_VERNON_RUNTIME_SOURCE_DIR}/tests/runtime_cuda_pipeline_test.cpp)
+    target_link_libraries(vernon-runtime-cuda-pipeline-test PRIVATE
+      Vernon::Runtime)
+    add_test(NAME vernon-runtime-cuda-pipeline-test
+      COMMAND vernon-runtime-cuda-pipeline-test)
   endif()
 endfunction()

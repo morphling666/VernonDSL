@@ -59,6 +59,12 @@ CPU shader execution will receive plain ABI input/output structures plus an
 explicit callback table for texture sampling and queries. It executes shader
 entry functions for reference testing; it is not a software rasterizer.
 
+CPU structured control flow is emitted directly from SCF. `scf.if` results use
+merge-block phi nodes; `scf.while` loop-carried scalar and fixed-vector values
+use header phis with explicit preheader and backedge inputs. This keeps the CPU
+reference path independent of the GPU lowering pipelines while preserving MLIR
+SSA semantics.
+
 ## Target routing invariant
 
 The common typed MLIR is the last shared representation. Backend routing is:

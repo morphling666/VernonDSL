@@ -259,9 +259,44 @@ typedef struct VernonPipelineInvocation {
   uint32_t scissor[4];
 } VernonPipelineInvocation;
 
+typedef struct VernonPipelineParameterView {
+  uint32_t slot;
+  VernonStringView name;
+  VernonPipelineArgumentKind kind;
+  VernonDataType dtype;
+  VernonValueAccess access;
+  uint32_t rank;
+  const uint64_t *static_shape;
+} VernonPipelineParameterView;
+
+typedef struct VernonPipelineOutputView {
+  VernonStringView name;
+  VernonPipelineArgumentKind kind;
+  VernonDataType dtype;
+  VernonValueAccess access;
+  uint32_t rank;
+  const uint64_t *static_shape;
+  uint32_t location;
+} VernonPipelineOutputView;
+
+typedef struct VernonPipelineBundleLoadOptions {
+  uint32_t struct_size;
+  const char *bundle_directory;
+  uint32_t reserved[4];
+} VernonPipelineBundleLoadOptions;
+
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimePipelineBundleInspectTarget(
+    const void *bundle, size_t bundle_size, VernonRuntimeBackend *target);
 VERNON_RUNTIME_CAPI VernonPipelineBundle *
 vernonRuntimeLoadPipelineBundle(VernonRuntimeContext *context,
                                 const void *bundle, size_t bundle_size);
+VERNON_RUNTIME_CAPI VernonPipelineBundle *
+vernonRuntimeLoadPipelineBundleWithOptions(
+    VernonRuntimeContext *context, const void *bundle, size_t bundle_size,
+    const VernonPipelineBundleLoadOptions *options);
+VERNON_RUNTIME_CAPI VernonPipelineBundle *
+vernonRuntimeLoadPipelineBundleFromDirectory(VernonRuntimeContext *context,
+                                             const char *directory);
 VERNON_RUNTIME_CAPI VernonStringView
 vernonRuntimePipelineBundleGetId(const VernonPipelineBundle *bundle);
 VERNON_RUNTIME_CAPI void
@@ -271,6 +306,22 @@ vernonRuntimeResolvePipeline(VernonPipelineBundle *bundle,
                              VernonFeatureSetView features);
 VERNON_RUNTIME_CAPI void
 vernonRuntimeLoadedPipelineDestroy(VernonLoadedPipeline *pipeline);
+VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetParameterCount(
+    const VernonLoadedPipeline *pipeline);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetParameterByIndex(
+    const VernonLoadedPipeline *pipeline, size_t index,
+    VernonPipelineParameterView *parameter);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineFindParameter(
+    const VernonLoadedPipeline *pipeline, VernonStringView name,
+    VernonPipelineParameterView *parameter);
+VERNON_RUNTIME_CAPI size_t
+vernonRuntimeLoadedPipelineGetOutputCount(const VernonLoadedPipeline *pipeline);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetOutputByIndex(
+    const VernonLoadedPipeline *pipeline, size_t index,
+    VernonPipelineOutputView *output);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineFindOutput(
+    const VernonLoadedPipeline *pipeline, VernonStringView name,
+    VernonPipelineOutputView *output);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimePipelineInvoke(
     VernonLoadedPipeline *pipeline, const VernonPipelineInvocation *invocation);
 

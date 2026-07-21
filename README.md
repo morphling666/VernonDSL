@@ -99,7 +99,7 @@ Tensors. Builtin arguments are synthesized and omitted from the call:
 from typing import Annotated
 import vernon_dsl as vd
 
-vd.init(arch=vd.cpu)  # vd.cuda and vd.vulkan execute on a GPU
+vd.init(arch=vd.cpu)  # vd.cuda and vd.vulkan use the same native Kernel API
 output = vd.Tensor.zeros(dtype=vd.f32, shape=(8,))
 
 @vd.kernel(workgroup_size=(8, 1, 1))
@@ -116,6 +116,14 @@ def scale(
 scale(output, 2.0, grid=(8, 1, 1))
 values = output.to_numpy()
 ```
+
+All three compute backends lower the restricted Python AST to Vernon MLIR on
+the first specialized call, compile a target artifact, cache the loaded native
+kernel, and launch through `VernonRuntime`. CPU execution creates a temporary
+validated AOT compute bundle using `vernon-compile` and clang; set
+`VERNON_COMPILER` when the compiler executable is not beside `_native`, in the
+checkout build directory, or on `PATH`. There is no Python interpreter
+fallback for `@kernel`.
 
 `VERNON_ENABLE_RUNTIME` builds the standalone `VernonRuntime` C API with CPU
 AOT execution. `VERNON_ENABLE_CUDA_RUNTIME` dynamically loads the

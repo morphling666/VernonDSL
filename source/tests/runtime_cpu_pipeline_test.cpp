@@ -1,0 +1,175 @@
+#include "vernon-c/Runtime.h"
+
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <string>
+
+#ifndef VERNON_CPU_BUNDLE_PATH
+#error VERNON_CPU_BUNDLE_PATH must name the CPU bundle test fixture
+#endif
+
+#ifndef VERNON_RUNTIME_TEST_OS
+#error VERNON_RUNTIME_TEST_OS must name the host operating system
+#endif
+
+#ifndef VERNON_RUNTIME_TEST_ARCH
+#error VERNON_RUNTIME_TEST_ARCH must name the host architecture
+#endif
+
+namespace {
+
+std::string readFile(const std::filesystem::path &path) {
+  std::ifstream input(path, std::ios::binary);
+  return std::string(std::istreambuf_iterator<char>(input),
+                     std::istreambuf_iterator<char>());
+}
+
+void replaceOnce(std::string &text, const std::string &from,
+                 const std::string &to) {
+  const size_t position = text.find(from);
+  assert(position != std::string::npos);
+  text.replace(position, from.size(), to);
+}
+
+VernonPipelineBundle *loadWithDirectory(VernonRuntimeContext *runtime,
+                                        const std::string &bundle,
+                                        const std::string &directory) {
+  VernonPipelineBundleLoadOptions options{};
+  options.struct_size = sizeof(options);
+  options.bundle_directory = directory.c_str();
+  return vernonRuntimeLoadPipelineBundleWithOptions(runtime, bundle.data(),
+                                                    bundle.size(), &options);
+}
+
+} // namespace
+
+int main() {
+  const std::filesystem::path directory = VERNON_CPU_BUNDLE_PATH;
+  const std::string directoryUtf8 = directory.u8string();
+  const std::string bundle = readFile(directory / "pipeline.bundle");
+  assert(!bundle.empty());
+
+  VernonRuntimeBackend target = VERNON_RUNTIME_CUDA;
+  assert(vernonRuntimePipelineBundleInspectTarget(bundle.data(), bundle.size(),
+                                                  &target) == VERNON_STATUS_OK);
+  assert(target == VERNON_RUNTIME_CPU);
+
+  VernonRuntimeContext *runtime = vernonRuntimeCreate(VERNON_RUNTIME_CPU, 0);
+  assert(runtime);
+
+  assert(
+      !vernonRuntimeLoadPipelineBundle(runtime, bundle.data(), bundle.size()));
+
+  VernonPipelineBundleLoadOptions shortOptions{};
+  shortOptions.struct_size = sizeof(shortOptions) - 1;
+  shortOptions.bundle_directory = directoryUtf8.c_str();
+  assert(!vernonRuntimeLoadPipelineBundleWithOptions(
+      runtime, bundle.data(), bundle.size(), &shortOptions));
+
+  std::string invalid = bundle;
+  replaceOnce(invalid, R"("steps": [{"kind": "dispatch", "stage": "fill"}])",
+              R"("steps": [{"kind": "dispatch", "stage": "fill"},)"
+              R"({"kind": "barrier"}])");
+  assert(!loadWithDirectory(runtime, invalid, directoryUtf8));
+
+  invalid = bundle;
+  replaceOnce(invalid, R"("steps": [{"kind": "dispatch", "stage": "fill"}])",
+              R"("steps": [{"kind": "draw", "vertex": "fill", )"
+              R"("fragment": "fill"}])");
+  assert(!loadWithDirectory(runtime, invalid, directoryUtf8));
+
+  invalid = bundle;
+  const std::string hashMarker = R"("sha256": ")";
+  size_t position = invalid.find(hashMarker);
+  assert(position != std::string::npos);
+  position += hashMarker.size();
+  invalid[position] = invalid[position] == '0' ? '1' : '0';
+  assert(!loadWithDirectory(runtime, invalid, directoryUtf8));
+
+  invalid = bundle;
+  const std::string libraryMarker = R"("path": ")";
+  position = invalid.find(libraryMarker);
+  assert(position != std::string::npos);
+  position += libraryMarker.size();
+  invalid.insert(position, "../");
+  assert(!loadWithDirectory(runtime, invalid, directoryUtf8));
+
+  invalid = bundle;
+  replaceOnce(invalid,
+              std::string(R"("operating_system": ")") + VERNON_RUNTIME_TEST_OS +
+                  "\"",
+              R"("operating_system": "unsupported")");
+  assert(!loadWithDirectory(runtime, invalid, directoryUtf8));
+
+  invalid = bundle;
+  replaceOnce(invalid,
+              std::string(R"("architecture": ")") + VERNON_RUNTIME_TEST_ARCH +
+                  "\"",
+              R"("architecture": "unsupported")");
+  assert(!loadWithDirectory(runtime, invalid, directoryUtf8));
+
+  VernonPipelineBundle *loaded = vernonRuntimeLoadPipelineBundleFromDirectory(
+      runtime, directoryUtf8.c_str());
+  assert(loaded);
+  const VernonStringView id = vernonRuntimePipelineBundleGetId(loaded);
+  assert(id.size == std::strlen("cpu/fill"));
+  assert(std::memcmp(id.data, "cpu/fill", id.size) == 0);
+
+  VernonLoadedPipeline *pipeline =
+      vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
+  assert(pipeline);
+  assert(vernonRuntimeLoadedPipelineGetParameterCount(pipeline) == 1);
+  VernonPipelineParameterView parameter{};
+  assert(vernonRuntimeLoadedPipelineGetParameterByIndex(
+             pipeline, 0, &parameter) == VERNON_STATUS_OK);
+  assert(parameter.slot == 0 && parameter.kind == VERNON_PIPELINE_TENSOR &&
+         parameter.dtype == VERNON_DATA_F32 &&
+         parameter.access == VERNON_ACCESS_WRITE && parameter.rank == 1 &&
+         parameter.static_shape[0] == 12);
+  assert(vernonRuntimeLoadedPipelineFindParameter(
+             pipeline, {"output", std::strlen("output")}, &parameter) ==
+         VERNON_STATUS_OK);
+  assert(vernonRuntimeLoadedPipelineGetOutputCount(pipeline) == 1);
+  VernonPipelineOutputView outputView{};
+  assert(vernonRuntimeLoadedPipelineFindOutput(
+             pipeline, {"result", std::strlen("result")}, &outputView) ==
+         VERNON_STATUS_OK);
+  assert(outputView.kind == VERNON_PIPELINE_TENSOR &&
+         outputView.dtype == VERNON_DATA_F32 && outputView.rank == 1 &&
+         outputView.static_shape[0] == 12 && outputView.location == 0);
+
+  VernonDeviceBuffer *buffer =
+      vernonRuntimeBufferAllocate(runtime, 12 * sizeof(float), alignof(float));
+  assert(buffer);
+  const uint64_t shape[] = {12};
+  const uint64_t strides[] = {sizeof(float)};
+  VernonPipelineArgument argument{};
+  argument.slot = 0;
+  argument.kind = VERNON_PIPELINE_TENSOR;
+  argument.tensor = {
+      buffer, VERNON_DATA_F32, VERNON_ACCESS_WRITE, 1, shape, strides, 0};
+  VernonPipelineInvocation invocation{};
+  invocation.struct_size = sizeof(invocation);
+  invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+  invocation.arguments = &argument;
+  invocation.argument_count = 1;
+  invocation.compute_grid = {3, 2, 2};
+  assert(vernonRuntimePipelineInvoke(pipeline, &invocation) ==
+         VERNON_STATUS_OK);
+
+  float output[12]{};
+  assert(vernonRuntimeCopyToHost(buffer, 0, output, sizeof(output)) ==
+         VERNON_STATUS_OK);
+  assert(output[0] == 0.0f && output[2] == 2.0f);
+  assert(output[3] == 10.0f && output[11] == 112.0f);
+
+  assert(vernonRuntimeBufferFree(buffer) == VERNON_STATUS_OK);
+  vernonRuntimeLoadedPipelineDestroy(pipeline);
+  vernonRuntimePipelineBundleDestroy(loaded);
+  assert(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
+  return 0;
+}

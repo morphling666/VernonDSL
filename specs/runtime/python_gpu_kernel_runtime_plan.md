@@ -238,10 +238,11 @@ Compiler capability and runtime capability are separate:
 
 ## CPU execution
 
-Python `vd.cpu` uses the AST interpreter for deterministic development and
-reference execution. Deployable native execution loads schema-versioned AOT
+Python `vd.cpu` and deployable native execution both load schema-versioned AOT
 compute bundles containing a platform shared library and stable C wrapper.
-Raw LLVM IR and ORC JIT artifacts are not accepted by `VernonRuntime`.
+The Python frontend uses AST only to generate Vernon MLIR; it does not interpret
+kernel bodies. Raw LLVM IR and ORC JIT artifacts are not accepted by
+`VernonRuntime`.
 
 ## CUDA backend
 
@@ -263,8 +264,9 @@ APIs; it does not implement backend behavior in Python or use `ctypes`.
 1. validate user arguments and explicit grid;
 2. specialize `None` dimensions;
 3. call `compile_file(..., entry=...)` without executing the kernel body;
-4. compile MLIR in-process through the compiler binding;
-5. validate reflection and load the artifact;
+4. compile MLIR through the selected backend compiler; CPU invokes
+   `vernon-compile` to create a temporary native compute bundle;
+5. validate reflection and load the artifact or CPU bundle;
 6. cache and launch the loaded kernel.
 
 The in-memory cache key is SHA-256 over canonical data containing:
@@ -324,7 +326,7 @@ Required checks:
 - first call compiles once and the second call hits the cache;
 - dependency, backend, workgroup, or specialized shape changes invalidate the
   cache;
-- CPU reference dispatch has correct 1D, 2D, and 3D builtin IDs;
+- CPU AOT dispatch has correct 1D, 2D, and 3D builtin IDs;
 - reflection and runtime reject invalid arguments and ABI versions;
 - a compute bundle loads and executes through C without Python;
 - Python and native launch paths produce the same result;
