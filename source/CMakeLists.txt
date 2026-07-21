@@ -14,7 +14,17 @@ endif()
 add_subdirectory(include/mlir/Dialect/Vernon)
 add_subdirectory(lib/Dialect/Vernon)
 
+if(VERNON_ENABLE_PYTHON_BINDINGS OR BUILD_TESTING)
+  set(vernon_python_components Interpreter)
+  if(VERNON_ENABLE_PYTHON_BINDINGS)
+    list(APPEND vernon_python_components Development.Module)
+  endif()
+  find_package(Python 3.11.9...<3.12
+    COMPONENTS ${vernon_python_components} QUIET)
+endif()
+
 add_library(VernonDSLCompiler SHARED
+  lib/VernonCpuAbiWrapper.cpp
   lib/VernonCompiler.cpp
 )
 llvm_map_components_to_libnames(VERNON_LLVM_JIT_LIBS
@@ -42,15 +52,22 @@ target_include_directories(VernonDSLCompiler
     $<INSTALL_INTERFACE:include>
 )
 target_link_libraries(VernonDSLCompiler PRIVATE
+  MLIRArithToLLVM
   MLIRBufferizationTransforms
+  MLIRControlFlowToLLVM
+  MLIRConvertToLLVMPass
   MLIRVernonDialect
   MLIRVernonTransforms
   MLIRFuncDialect
+  MLIRFuncToLLVM
   MLIRGPUToSPIRV
   MLIRGPUPipelines
   MLIRIR
+  MLIRIndexToLLVM
   MLIRLinalgTransforms
+  MLIRMathToLLVM
   MLIRMathToSPIRV
+  MLIRMemRefToLLVM
   MLIRParser
   MLIRPass
   MLIRRegisterAllDialects
@@ -61,6 +78,8 @@ target_link_libraries(VernonDSLCompiler PRIVATE
   MLIRSPIRVTransforms
   MLIRSupport
   MLIRToLLVMIRTranslationRegistration
+  MLIRUBToLLVM
+  MLIRVectorToLLVM
   ${VERNON_LLVM_JIT_LIBS}
 )
 if(VERNON_ENABLE_SPIRV_CROSS)
@@ -87,7 +106,6 @@ install(FILES
 
 if(VERNON_ENABLE_RUNTIME)
   if(VERNON_ENABLE_PYTHON_BINDINGS)
-    find_package(Python 3.11 EXACT COMPONENTS Interpreter Development.Module QUIET)
     if(Python_FOUND)
       execute_process(
         COMMAND ${Python_EXECUTABLE} -m nanobind --cmake_dir
@@ -116,6 +134,18 @@ if(VERNON_ENABLE_RUNTIME)
       message(STATUS "nanobind not found; skipping vernon_dsl._native")
     endif()
   endif()
+endif()
+
+if(BUILD_TESTING AND Python_Interpreter_FOUND)
+  foreach(test_module IN ITEMS test_compiler.py test_shared_definitions.py
+                               test_blinn_phong_numeric.py)
+    string(REPLACE ".py" "" test_name "${test_module}")
+    add_test(NAME "vernon-python-${test_name}"
+      COMMAND ${Python_EXECUTABLE} -m unittest discover
+        -s ${CMAKE_SOURCE_DIR}/python/tests -p ${test_module})
+    set_tests_properties("vernon-python-${test_name}" PROPERTIES
+      ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python")
+  endforeach()
 endif()
 
 add_executable(vernon-compile
@@ -199,7 +229,19 @@ endif()
 
 add_subdirectory(tools/vernon_opt)
 
+if(BUILD_TESTING)
+  add_test(NAME vernon-cpu-lowering-integration
+    COMMAND ${CMAKE_COMMAND}
+      "-DVERNON_OPT=$<TARGET_FILE:vernon-opt>"
+      "-DTEST_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/tests/integration"
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_cpu_lowering_tests.cmake)
+endif()
+
 if(BUILD_TESTING AND WIN32)
+  add_test(NAME vernon-validation-integration
+    COMMAND powershell -ExecutionPolicy Bypass
+      -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_validation_tests.ps1
+      -VernonOpt $<TARGET_FILE:vernon-opt>)
   add_test(NAME vernon-python-native-integration
     COMMAND powershell -ExecutionPolicy Bypass
       -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_frontend_integration.ps1

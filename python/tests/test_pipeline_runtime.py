@@ -5,10 +5,10 @@ import unittest
 import numpy as np
 
 import vernon_dsl as vd
-from python.tests.advanced_pipeline_shader import (  # type: ignore[import-not-found]
+from advanced_pipeline_shader import (
     advanced_fragment, advanced_vertex, feature_compute,
 )
-from python.tests.pipeline_shader import (  # type: ignore[import-not-found]
+from pipeline_shader import (
     solid_fragment, translate_vertices, triangle_vertex, translated_vertex,
 )
 

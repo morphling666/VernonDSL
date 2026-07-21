@@ -1,5 +1,9 @@
 # Lightweight Multibackend Runtime Plan
 
+Status: implemented for CPU AOT, dynamically loaded CUDA, runtime-owned Vulkan,
+and external-context OpenGL/OpenGL ES. Deferred Engine-owned Vulkan and
+cross-platform restrictions remain future integration work.
+
 ## Goal
 
 Make `VernonRuntime` the deployable execution library shared by Vernon Engine,
@@ -13,7 +17,7 @@ Python, and pure C/C++ applications. It must support:
 `VernonRuntime` must not link LLVM, MLIR, GLFW, the Vulkan loader, or the CUDA
 Toolkit. Compiler and display-tool dependencies remain in VernonDSL tooling.
 
-The first functional milestone is:
+The implemented end-to-end regression example is:
 
 ```powershell
 uv run python examples/complete_pipeline.py --arch vulkan --headless --frames 3
@@ -72,9 +76,8 @@ The bundle records:
 - native artifact content hash.
 
 `VernonRuntime` uses `LoadLibrary/GetProcAddress` or `dlopen/dlsym` and invokes
-the wrapper directly. Interactive Python CPU execution uses the AST
-interpreter; deployable Python can use `CpuAotRuntime` to load the same native
-bundle format. LLVM remains a compiler dependency only.
+the wrapper directly. Interactive and deployable Python CPU execution uses the
+same validated AOT bundle path. LLVM remains a compiler dependency only.
 
 Static registration may be added later for platforms that prohibit dynamic
 code loading.
@@ -120,7 +123,11 @@ argument validation, resource binding, dispatch/draw orchestration, and
 pipeline-local synchronization. Python and Vernon only map ergonomic names and
 native resource wrappers to stable slots.
 
-## Implementation Plan
+## Historical implementation plan
+
+The following stages are retained as the implementation record. The completed
+state is summarized above; unchecked Engine integration is listed under
+Deferred Work.
 
 ### 1. Split the lightweight runtime
 

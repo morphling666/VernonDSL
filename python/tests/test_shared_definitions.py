@@ -8,7 +8,7 @@ import numpy as np
 
 import vernon_dsl as vd
 
-from python.tests.shared_kernel import (  # type: ignore[import-not-found]
+from shared_kernel import (
     evaluate_shared, shared_polynomial,
 )
 

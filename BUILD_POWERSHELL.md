@@ -1,68 +1,16 @@
-# Building Vernon DSL on Windows (PowerShell)
+# PowerShell build notes
 
-## Quick Start
+[`README.md`](README.md#build-and-test) is the canonical Windows build and test
+guide. Run its `cmake -S ... -B ...` commands from the repository root; they do
+not require changing into the build directory and avoid source-directory
+ambiguity.
 
-1. **Make sure you're in the project root directory** (where `CMakeLists.txt` is located)
-
-2. **Create and enter the build directory:**
-   ```powershell
-   mkdir build -ErrorAction SilentlyContinue
-   cd build
-   ```
-
-3. **Configure CMake (use backslashes for Windows paths):**
-   ```powershell
-   cmake .. -DMLIR_DIR="..\llvm-project\install\lib\cmake\mlir"
-   ```
-
-4. **Build and test:**
-   ```powershell
-   cmake --build . --config Release --parallel 4
-   ctest -C Release --output-on-failure
-   ```
-
-## Runtime-only build
-
-The standalone runtime does not require LLVM/MLIR:
+If configuration cannot find MLIR, verify the canonical install location:
 
 ```powershell
-cmake -S . -B runtime_build `
-  -DVERNON_ENABLE_COMPILER=OFF `
-  -DVERNON_ENABLE_RUNTIME=ON
-cmake --build runtime_build --config Release --target VernonRuntime --parallel 4
+Test-Path "$PWD/llvm-project/install/lib/cmake/mlir/MLIRConfig.cmake"
 ```
 
-## Alternative: Use Absolute Path
-
-If relative paths don't work, use an absolute path:
-
-```powershell
-$mlirDir = Resolve-Path "..\llvm-project\install\lib\cmake\mlir"
-cmake .. -DMLIR_DIR="$mlirDir"
-```
-
-## Common Issues
-
-### Issue: "CMake Error: The source directory does not appear to contain CMakeLists.txt"
-
-**Solution:** Make sure you're running cmake from the `build` directory, not from the project root:
-```powershell
-# Wrong - running from project root:
-cd VernonDSL
-cmake .. -DMLIR_DIR=...  # This looks for CMakeLists.txt in parent directory
-
-# Correct - running from build directory:
-cd VernonDSL
-mkdir build
-cd build
-cmake .. -DMLIR_DIR="..\llvm-project\install\lib\cmake\mlir"  # This looks for CMakeLists.txt in parent (project root)
-```
-
-### Issue: Path not found
-
-**Solution:** Verify MLIR is installed:
-```powershell
-Test-Path "..\llvm-project\install\lib\cmake\mlir"
-```
-
-If this returns `False`, you need to build and install MLIR first (see BUILD_INSTRUCTIONS.md).
+If that returns `False`, build and install LLVM/MLIR with the commands in the
+README before configuring VernonDSL. Runtime-only builds do not require
+LLVM/MLIR.

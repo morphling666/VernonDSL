@@ -1,5 +1,8 @@
 # Pipeline Runtime Unification
 
+Status: runtime unification implemented. Vernon Engine material/render-graph
+adoption and Engine-owned Vulkan resource integration remain future work.
+
 ## Decision
 
 Treat a cooked pipeline asset as a function-like, context-bound executable,
@@ -68,20 +71,20 @@ Python exposes the same runtime through the single `_native` module. OpenGL and
 OpenGL ES require a host-owned external context; Vulkan and CUDA resolve their
 system drivers dynamically.
 
-### Concrete gaps
+### Historical gaps and current boundary
 
-1. There is no native graphics or composed-pipeline bundle loader equivalent
-   to `vernonRuntimeLoadComputeBundle`.
-2. Pipeline cooker schema version 2 and the legacy CLI shader bundle schema
-   version 1 coexist.
-3. Vernon parses variant stage records but does not retain their reflected
-   argument interfaces for binding.
-4. Python owns graphics argument merging, Tensor layout expansion, residency,
-   MRT routing, index validation, and compute-to-graphics orchestration.
-5. Vernon production render passes still use legacy named uniforms and do not
+The native pipeline-bundle loader, schema unification, reflected slot
+validation, and shared runtime invocation planner described by this record are
+implemented. Python no longer owns a separate graphics binding or
+compute-to-graphics orchestration implementation.
+
+The remaining gaps are Engine integration boundaries:
+
+1. Vernon production render passes still use legacy named uniforms and do not
    use cooked DSL assets as their normal draw path.
-6. Vernon and VernonRuntime currently own different graphics contexts and
-   resource handle types.
+2. Vernon and VernonRuntime still require explicit external-context/resource
+   adoption to share Engine-owned graphics objects. External OpenGL is
+   supported; Engine-owned Vulkan adoption remains future work.
 
 ## Target architecture
 

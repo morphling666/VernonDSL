@@ -1,5 +1,10 @@
 # Vulkan Offscreen Graphics Plan
 
+Status: implemented through versioned pipeline bundles and
+`vernonRuntimePipelineInvoke`. This document is retained as the original
+offscreen Vulkan architecture and verification record; swapchain presentation
+and Engine-owned Vulkan remain out of scope.
+
 ## Goal
 
 Run the existing Tensor-first graphics API on Vulkan:

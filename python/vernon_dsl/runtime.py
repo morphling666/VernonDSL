@@ -21,7 +21,7 @@ import numpy as np
 
 from .compiler import Compiler
 from .module_graph import load_project
-from .shader_assets import (encode_runtime_stage,
+from .shader_assets import (_dtype_and_shape, encode_runtime_stage,
                             serialize_runtime_pipeline_bundle)
 from .types import Annotation, TypeExpr, _Scalar
 
@@ -664,11 +664,13 @@ class Kernel:
             raise RuntimeError(f"VERNON_COMPILER does not name a file: {path}")
         assert _native is not None
         repository = Path(__file__).resolve().parents[2]
-        candidates = [
-            Path(_native.__file__).resolve().with_name(executable),
-            repository / "build" / "source" / "Release" / executable,
-            repository / "build" / "source" / executable,
-        ]
+        source_build = repository / "build" / "source"
+        candidates = [Path(_native.__file__).resolve().with_name(executable)]
+        candidates.extend(
+            source_build / configuration / executable
+            for configuration in ("Release", "Debug", "RelWithDebInfo",
+                                  "MinSizeRel"))
+        candidates.append(source_build / executable)
         discovered = shutil.which(executable)
         if discovered:
             candidates.append(Path(discovered))
@@ -1048,14 +1050,17 @@ class Pipeline:
                 reflected_parameters.append(parameter)
                 if parameter.varying:
                     continue
+                inferred_dtype, inferred_shape = _dtype_and_shape(
+                    row.get("type"))
                 use = {
                     "stage": entry["stage"],
                     "entry": entry["name"],
                     "index": int(row["index"]),
                     "kind": row.get("kind", "scalar"),
                     "type": row.get("type"),
-                    "dtype": row.get("dtype"),
-                    "shape": row.get("shape", []),
+                    "dtype": (row.get("dtype") or row.get("vernon.dtype")
+                              or inferred_dtype),
+                    "shape": row.get("shape", inferred_shape),
                     "interface": row["vernon.interface"],
                     "access": row.get("access", "read"),
                 }
@@ -1141,7 +1146,11 @@ class Pipeline:
                 "parameters":
                 parameter_rows,
                 "outputs": [{
-                    "name": output.name,
+                    "name": output.name or f"output_{output.location}",
+                    "kind": "texture",
+                    "dtype": _dtype_and_shape(output.type_name)[0],
+                    "shape": _dtype_and_shape(output.type_name)[1],
+                    "access": "write",
                     "location": output.location,
                     "type": output.type_name,
                 } for output in outputs],

@@ -408,6 +408,20 @@ def _validate_graphics_interfaces(vertex: dict[str, Any],
                 f"vertex/fragment interface mismatch at location {location}")
 
 
+def _dtype_and_shape(type_name: object) -> tuple[str | None, list[int]]:
+    if not isinstance(type_name, str):
+        return None, []
+    if not type_name.startswith("tensor<") or not type_name.endswith(">"):
+        return type_name, []
+    parts = type_name[7:-1].split("x")
+    if not parts:
+        return None, []
+    return parts[-1], [
+        0 if dimension == "?" else int(dimension)
+        for dimension in parts[:-1]
+    ]
+
+
 def _external_parameters(
         records: dict[str, dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     parameters: dict[str, list[dict[str, Any]]] = {}
@@ -424,14 +438,16 @@ def _external_parameters(
                     interface, str):
                 raise ShaderAssetError(
                     f"{stage} external argument is missing source metadata")
+            inferred_dtype, inferred_shape = _dtype_and_shape(row.get("type"))
             use = {
                 "stage": stage,
                 "entry": record["entry"],
                 "index": row.get("index"),
                 "kind": row.get("kind", "scalar"),
                 "type": row.get("type"),
-                "dtype": row.get("dtype"),
-                "shape": row.get("shape", []),
+                "dtype": (row.get("dtype") or row.get("vernon.dtype")
+                          or inferred_dtype),
+                "shape": row.get("shape", inferred_shape),
                 "interface": interface,
                 "access": row.get("access", "read"),
             }
@@ -488,19 +504,7 @@ def _fragment_outputs(
             continue
         location = row["vernon.location"]
         type_name = row.get("type")
-        dtype: str | None = None
-        shape: list[int] = []
-        if isinstance(type_name, str):
-            if type_name.startswith("tensor<") and type_name.endswith(">"):
-                parts = type_name[7:-1].split("x")
-                if parts:
-                    dtype = parts[-1]
-                    shape = [
-                        0 if dimension == "?" else int(dimension)
-                        for dimension in parts[:-1]
-                    ]
-            else:
-                dtype = type_name
+        dtype, shape = _dtype_and_shape(type_name)
         outputs.append({
             "name": row.get("vernon.source_name") or f"output_{location}",
             "kind": "texture",

@@ -185,7 +185,10 @@ int main(int argc, char **argv) {
                  "[--glsl-version <version>] "
                  "[--bundle <directory> --asset-id <id>] "
                  "[--compute-bundle <directory>] [--clang <path>] "
-                 "[--keep-llvm-ir]\n";
+                 "[--keep-llvm-ir]\n"
+                 "  --bundle writes a compiled OpenGL shader asset.\n"
+                 "  --compute-bundle writes a runtime compute bundle; pipeline "
+                 "bundles are assembled by vernon_dsl.shader_asset_cli.\n";
     return 2;
   }
 
@@ -250,7 +253,9 @@ int main(int argc, char **argv) {
       return 2;
     }
     if (bundlePath && *target != VERNON_TARGET_OPENGL) {
-      std::cerr << "Vernon runtime bundles currently require target opengl\n";
+      std::cerr << "--bundle writes a compiled shader asset and requires "
+                   "target opengl; use --compute-bundle for runtime compute "
+                   "artifacts\n";
       return 2;
     }
     if (bundlePath && outputDirectory) {

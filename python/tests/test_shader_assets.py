@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +14,22 @@ from unittest import mock
 from vernon_dsl.shader_assets import (ShaderAssetError, cook_shader_pipeline,
                                       encode_runtime_stage,
                                       parse_shader_pipeline_manifest)
+
+
+def _find_native_compiler(root: Path) -> Path | None:
+    executable = "vernon-compile.exe" if os.name == "nt" else "vernon-compile"
+    configured = os.environ.get("VERNON_COMPILER")
+    candidates = [Path(configured).expanduser()] if configured else []
+    source_build = root / "build" / "source"
+    candidates.extend(source_build / configuration / executable
+                      for configuration in ("Release", "Debug",
+                                            "RelWithDebInfo", "MinSizeRel"))
+    candidates.append(source_build / executable)
+    discovered = shutil.which(executable)
+    if discovered:
+        candidates.append(Path(discovered))
+    return next((path.resolve() for path in candidates if path.is_file()),
+                None)
 
 
 class ShaderAssetManifestTests(unittest.TestCase):
@@ -236,8 +254,8 @@ class ShaderAssetCookTests(unittest.TestCase):
 
     def test_four_variants_share_unchanged_fragment(self) -> None:
         root = Path(__file__).parents[2]
-        compiler = root / "build" / "source" / "Release" / "vernon-compile.exe"
-        if not compiler.is_file():
+        compiler = _find_native_compiler(root)
+        if compiler is None:
             self.skipTest("native Vernon compiler is not built")
         with tempfile.TemporaryDirectory() as directory:
             manifest = cook_shader_pipeline(
@@ -293,8 +311,8 @@ class ShaderAssetCookTests(unittest.TestCase):
 
     def test_vulkan_pipeline_bundle_embeds_verified_spirv(self) -> None:
         root = Path(__file__).parents[2]
-        compiler = root / "build" / "source" / "Release" / "vernon-compile.exe"
-        if not compiler.is_file():
+        compiler = _find_native_compiler(root)
+        if compiler is None:
             self.skipTest("native Vernon compiler is not built")
         with tempfile.TemporaryDirectory() as directory:
             cook_shader_pipeline(

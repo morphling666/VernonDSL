@@ -42,18 +42,53 @@ DXC-to-DXIL artifact step.
 That JIT is a compiler reference facility, not a deployable runtime format.
 `VernonRuntime` accepts CPU native-library AOT bundles only.
 
-## Build on Windows
+## Build and test
 
-Build and install LLVM/MLIR first as described in
-[`BUILD_POWERSHELL.md`](BUILD_POWERSHELL.md), then:
+This section is the canonical setup guide. The compiler build expects the
+matching LLVM checkout at `llvm-project/` because Vernon TableGen definitions
+use MLIR source files that are not installed.
+
+Prerequisites are CMake, a C/C++ toolchain, Python 3.11, and
+[uv](https://docs.astral.sh/uv/). Build and install LLVM/MLIR once:
 
 ```powershell
-cmake -S . -B build `
+cmake -S llvm-project/llvm -B llvm-project/build `
+  -DLLVM_ENABLE_PROJECTS=mlir `
+  -DCMAKE_INSTALL_PREFIX="$PWD/llvm-project/install"
+cmake --build llvm-project/build --config Release --target install --parallel 4
+```
+
+Install the locked Python environment, including nanobind for the native
+module, then configure, build, and test VernonDSL from the repository root:
+
+```powershell
+uv sync --extra build
+uv run cmake -S . -B build `
   -DMLIR_DIR="$PWD/llvm-project/install/lib/cmake/mlir" `
   -DVERNON_ENABLE_SPIRV_CROSS=ON
 cmake --build build --config Release --parallel 4
 ctest --test-dir build -C Release --output-on-failure
 ```
+
+On a single-configuration Linux or macOS generator, use the equivalent:
+
+```bash
+cmake -S llvm-project/llvm -B llvm-project/build \
+  -DLLVM_ENABLE_PROJECTS=mlir \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX="$PWD/llvm-project/install"
+cmake --build llvm-project/build --target install --parallel 4
+uv sync --extra build
+uv run cmake -S . -B build \
+  -DMLIR_DIR="$PWD/llvm-project/install/lib/cmake/mlir" \
+  -DVERNON_ENABLE_SPIRV_CROSS=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel 4
+ctest --test-dir build --output-on-failure
+```
+
+Use plain `uv sync` only for the frontend/runtime Python package without
+building `_native`. Run Python commands through `uv run --frozen`.
 
 Configure a runtime-only build without LLVM/MLIR using the canonical options:
 

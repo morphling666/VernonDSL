@@ -44,8 +44,10 @@ typedef struct VernonRuntimeCapabilities {
 typedef struct VernonRuntimeCreateOptions {
   uint32_t struct_size;
   uint32_t device_index;
+  /* Reserved for ABI compatibility; initialize both fields to zero. */
   uint16_t api_version_major;
   uint16_t api_version_minor;
+  /* Reserved for future use; initialize all elements to zero. */
   uint32_t reserved[4];
 } VernonRuntimeCreateOptions;
 
@@ -60,6 +62,7 @@ typedef struct VernonExternalOpenGLContext {
   VernonOpenGLGetProcAddressFn get_proc_address;
   uint16_t api_version_major;
   uint16_t api_version_minor;
+  /* Reserved for future use; initialize all elements to zero. */
   uint32_t reserved[4];
 } VernonExternalOpenGLContext;
 
@@ -85,11 +88,13 @@ VERNON_RUNTIME_CAPI VernonRuntimeCapabilities
 vernonRuntimeGetCapabilities(VernonRuntimeBackend backend);
 VERNON_RUNTIME_CAPI VernonRuntimeCapabilities
 vernonRuntimeGetContextCapabilities(const VernonRuntimeContext *context);
+/* Compatibility convenience API; prefer vernonRuntimeCreateWithOptions. */
 VERNON_RUNTIME_CAPI VernonRuntimeContext *
 vernonRuntimeCreate(VernonRuntimeBackend backend, uint32_t device_index);
 VERNON_RUNTIME_CAPI VernonRuntimeContext *
 vernonRuntimeCreateWithOptions(VernonRuntimeBackend backend,
                                const VernonRuntimeCreateOptions *options);
+/* Compatibility shorthand for the VERNON_RUNTIME_OPENGL backend. */
 VERNON_RUNTIME_CAPI VernonRuntimeContext *vernonRuntimeCreateExternalOpenGL(
     const VernonExternalOpenGLContext *external_context);
 VERNON_RUNTIME_CAPI VernonRuntimeContext *
@@ -282,11 +287,13 @@ typedef struct VernonPipelineOutputView {
 typedef struct VernonPipelineBundleLoadOptions {
   uint32_t struct_size;
   const char *bundle_directory;
+  /* Reserved for future use; initialize all elements to zero. */
   uint32_t reserved[4];
 } VernonPipelineBundleLoadOptions;
 
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimePipelineBundleInspectTarget(
     const void *bundle, size_t bundle_size, VernonRuntimeBackend *target);
+/* Compatibility convenience API; prefer the options-based loader. */
 VERNON_RUNTIME_CAPI VernonPipelineBundle *
 vernonRuntimeLoadPipelineBundle(VernonRuntimeContext *context,
                                 const void *bundle, size_t bundle_size);

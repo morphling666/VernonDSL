@@ -17,6 +17,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -395,12 +396,24 @@ void transitionVulkanImage(VkCommandBuffer command,
   texture->vulkanLayout = newLayout;
 }
 
+void destroyVulkanContext(VernonRuntimeContext *context);
+
 bool initializeVulkanContext(VernonRuntimeContext *context,
                              uint32_t deviceIndex) {
+  // VulkanDriver stores dispatch functions globally, so serialize updates to
+  // its instance/device dispatch table while a context is initialized.
+  static std::mutex initializationMutex;
+  std::lock_guard<std::mutex> guard(initializationMutex);
   vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
+  const auto failInitialization = [&]() {
+    // Keep the diagnostic set by the failing operation while releasing every
+    // handle that was successfully created before it.
+    destroyVulkanContext(context);
+    return false;
+  };
   if (!driver.load()) {
     context->error = driver.error;
-    return false;
+    return failInitialization();
   }
   VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO};
   application.pApplicationName = "VernonRuntime";
@@ -414,10 +427,10 @@ bool initializeVulkanContext(VernonRuntimeContext *context,
                  driver.createInstance(&instanceInfo, nullptr,
                                        &context->vulkanInstance),
                  "vkCreateInstance") != VERNON_STATUS_OK)
-    return false;
+    return failInitialization();
   if (!driver.loadInstance(context->vulkanInstance)) {
     context->error = driver.error;
-    return false;
+    return failInitialization();
   }
   uint32_t physicalDeviceCount = 0;
   if (driver.enumeratePhysicalDevices(context->vulkanInstance,
@@ -425,13 +438,13 @@ bool initializeVulkanContext(VernonRuntimeContext *context,
                                       nullptr) != VK_SUCCESS ||
       deviceIndex >= physicalDeviceCount) {
     context->error = "Vulkan device index is unavailable";
-    return false;
+    return failInitialization();
   }
   std::vector<VkPhysicalDevice> devices(physicalDeviceCount);
   if (driver.enumeratePhysicalDevices(context->vulkanInstance,
                                       &physicalDeviceCount,
                                       devices.data()) != VK_SUCCESS)
-    return false;
+    return failInitialization();
   context->vulkanPhysicalDevice = devices[deviceIndex];
   uint32_t queueCount = 0;
   driver.getPhysicalDeviceQueueFamilyProperties(context->vulkanPhysicalDevice,
@@ -445,7 +458,7 @@ bool initializeVulkanContext(VernonRuntimeContext *context,
       });
   if (queue == queues.end()) {
     context->error = "Vulkan device has no compute queue";
-    return false;
+    return failInitialization();
   }
   context->vulkanQueueFamily =
       static_cast<uint32_t>(std::distance(queues.begin(), queue));
@@ -461,10 +474,10 @@ bool initializeVulkanContext(VernonRuntimeContext *context,
                  driver.createDevice(context->vulkanPhysicalDevice, &deviceInfo,
                                      nullptr, &context->vulkanDevice),
                  "vkCreateDevice") != VERNON_STATUS_OK)
-    return false;
+    return failInitialization();
   if (!driver.loadDevice(context->vulkanDevice)) {
     context->error = driver.error;
-    return false;
+    return failInitialization();
   }
   driver.getDeviceQueue(context->vulkanDevice, context->vulkanQueueFamily, 0,
                         &context->vulkanQueue);
@@ -473,26 +486,42 @@ bool initializeVulkanContext(VernonRuntimeContext *context,
   VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
   poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
   poolInfo.queueFamilyIndex = context->vulkanQueueFamily;
-  return vulkanFail(context,
-                    driver.createCommandPool(context->vulkanDevice, &poolInfo,
-                                             nullptr,
-                                             &context->vulkanCommandPool),
-                    "vkCreateCommandPool") == VERNON_STATUS_OK;
+  if (vulkanFail(context,
+                 driver.createCommandPool(context->vulkanDevice, &poolInfo,
+                                          nullptr, &context->vulkanCommandPool),
+                 "vkCreateCommandPool") != VERNON_STATUS_OK)
+    return failInitialization();
+  return true;
 }
 
 void destroyVulkanContext(VernonRuntimeContext *context) {
   vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
   if (context->vulkanDevice) {
-    driver.deviceWaitIdle(context->vulkanDevice);
-    if (context->vulkanCommandPool)
+    if (driver.deviceWaitIdle)
+      driver.deviceWaitIdle(context->vulkanDevice);
+    if (context->vulkanCommandPool && driver.destroyCommandPool)
       driver.destroyCommandPool(context->vulkanDevice,
                                 context->vulkanCommandPool, nullptr);
-    driver.destroyDevice(context->vulkanDevice, nullptr);
+    PFN_vkDestroyDevice destroyDevice = driver.destroyDevice;
+    if (!destroyDevice && driver.getDeviceProcAddr)
+      destroyDevice = reinterpret_cast<PFN_vkDestroyDevice>(
+          driver.getDeviceProcAddr(context->vulkanDevice, "vkDestroyDevice"));
+    if (destroyDevice)
+      destroyDevice(context->vulkanDevice, nullptr);
   }
-  if (context->vulkanInstance && driver.destroyInstance)
-    driver.destroyInstance(context->vulkanInstance, nullptr);
+  if (context->vulkanInstance) {
+    PFN_vkDestroyInstance destroyInstance = driver.destroyInstance;
+    if (!destroyInstance && driver.getInstanceProcAddr)
+      destroyInstance =
+          reinterpret_cast<PFN_vkDestroyInstance>(driver.getInstanceProcAddr(
+              context->vulkanInstance, "vkDestroyInstance"));
+    if (destroyInstance)
+      destroyInstance(context->vulkanInstance, nullptr);
+  }
   context->vulkanCommandPool = VK_NULL_HANDLE;
+  context->vulkanQueue = VK_NULL_HANDLE;
   context->vulkanDevice = VK_NULL_HANDLE;
+  context->vulkanPhysicalDevice = VK_NULL_HANDLE;
   context->vulkanInstance = VK_NULL_HANDLE;
 }
 #endif
@@ -1050,6 +1079,26 @@ VkFormat vulkanVertexFormat(uint32_t components) {
     return VK_FORMAT_R32G32B32A32_SFLOAT;
   return VK_FORMAT_UNDEFINED;
 }
+
+struct VulkanCapabilityProbe {
+  bool available{};
+  std::string diagnostic;
+};
+
+const VulkanCapabilityProbe &cachedVulkanCapabilityProbe() {
+  // Function-local static initialization makes the expensive device probe
+  // happen once and safely publishes both its result and diagnostic.
+  static const VulkanCapabilityProbe probe = [] {
+    VulkanCapabilityProbe result;
+    VernonRuntimeContext context;
+    context.backend = VERNON_RUNTIME_VULKAN;
+    result.available = initializeVulkanContext(&context, 0);
+    result.diagnostic = context.error;
+    destroyVulkanContext(&context);
+    return result;
+  }();
+  return probe;
+}
 #endif
 
 } // namespace
@@ -1058,7 +1107,7 @@ extern "C" {
 
 VernonRuntimeCapabilities
 vernonRuntimeGetCapabilities(VernonRuntimeBackend backend) {
-  static std::string diagnostic;
+  static thread_local std::string diagnostic;
   diagnostic.clear();
   VernonRuntimeCapabilities result{};
   if (backend == VERNON_RUNTIME_CPU) {
@@ -1086,13 +1135,12 @@ vernonRuntimeGetCapabilities(VernonRuntimeBackend backend) {
 #endif
   } else if (backend == VERNON_RUNTIME_VULKAN) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-    VernonRuntimeContext probe;
-    probe.backend = backend;
-    result.available = initializeVulkanContext(&probe, 0);
+    const VulkanCapabilityProbe &probe = cachedVulkanCapabilityProbe();
+    result.available = probe.available;
     result.supports_compute = result.available;
     result.supports_storage_buffers = result.available;
-    diagnostic = probe.error;
-    destroyVulkanContext(&probe);
+    result.diagnostic = {probe.diagnostic.data(), probe.diagnostic.size()};
+    return result;
 #else
     diagnostic = "VernonRuntime was built without Vulkan support";
 #endif
@@ -1126,10 +1174,8 @@ vernonRuntimeCreateWithOptions(VernonRuntimeBackend backend,
     return options->device_index == 0 ? context.release() : nullptr;
   if (backend == VERNON_RUNTIME_VULKAN) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-    if (!initializeVulkanContext(context.get(), options->device_index)) {
-      destroyVulkanContext(context.get());
+    if (!initializeVulkanContext(context.get(), options->device_index))
       return nullptr;
-    }
     return context.release();
 #else
     return nullptr;
@@ -2213,7 +2259,7 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(
     }
     const nlohmann::json root = nlohmann::json::parse(
         static_cast<const char *>(bundleData),
-        static_cast<const char *>(bundleData) + bundleSize, nullptr, false);
+        static_cast<const char *>(bundleData) + bundleSize);
     const char *expectedTarget =
         context->backend == VERNON_RUNTIME_CPU    ? "cpu"
         : context->backend == VERNON_RUNTIME_CUDA ? "cuda"
@@ -2221,7 +2267,7 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(
             ? "vulkan"
             : (context->backend == VERNON_RUNTIME_OPENGL_ES ? "opengles"
                                                             : "opengl");
-    if (root.is_discarded() || !root.is_object() ||
+    if (!root.is_object() ||
         root.value("pipeline_bundle_schema_version", 0) != 1 ||
         root.value("invocation_abi_version", 0) !=
             VERNON_PIPELINE_INVOCATION_ABI_VERSION ||
@@ -2355,8 +2401,14 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(
       fail(context, "pipeline bundle contains duplicate feature variants");
       return nullptr;
     }
-    if (bundle->id.empty() || bundle->variants.empty())
+    if (bundle->id.empty()) {
+      fail(context, "pipeline bundle id is missing or empty");
       return nullptr;
+    }
+    if (bundle->variants.empty()) {
+      fail(context, "pipeline bundle contains no variants");
+      return nullptr;
+    }
     ++context->liveBundles;
     return bundle.release();
   } catch (const nlohmann::json::exception &error) {

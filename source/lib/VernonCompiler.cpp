@@ -1,4 +1,5 @@
 #include "VernonCompiler.h"
+#include "VernonCpuAbiWrapper.h"
 
 #include "mlir/Conversion/GPUToSPIRV/GPUToSPIRVPass.h"
 #include "mlir/Conversion/MathToSPIRV/MathToSPIRVPass.h"
@@ -8,6 +9,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/GPU/Pipelines/Passes.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
@@ -15,6 +17,8 @@
 #include "mlir/Dialect/SPIRV/Transforms/Passes.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonCpuPipeline.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonInlineHelpers.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCUDAMath.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUTensors.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonToGPU.h"
@@ -24,7 +28,6 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/DialectRegistry.h"
-#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/InitAllDialects.h"
@@ -32,16 +35,13 @@
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/All.h"
+#include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Target/SPIRV/Serialization.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
-#include "llvm/IR/Constants.h"
-#include "llvm/IR/DerivedTypes.h"
-#include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/Error.h"
@@ -53,6 +53,7 @@
 #include "llvm/TargetParser/Triple.h"
 
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -80,6 +81,7 @@ struct VernonCompilerContext {
     mlir::registerAllDialects(registry);
     mlir::registerAllExtensions(registry);
     mlir::registerAllToLLVMIRTranslations(registry);
+    mlir::vernon::registerVernonCpuPipelineDialects(registry);
     registry.insert<mlir::vernon::VernonDialect>();
     context.appendDialectRegistry(registry);
   }
@@ -199,70 +201,6 @@ void addArtifactTable(VernonCompileResult &result, VernonTarget target,
   stream << llvm::json::Value(std::move(*root));
 }
 
-struct InlineVernonHelpersPass
-    : public mlir::PassWrapper<InlineVernonHelpersPass,
-                               mlir::OperationPass<mlir::ModuleOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(InlineVernonHelpersPass)
-
-  void runOnOperation() override {
-    mlir::ModuleOp module = getOperation();
-    unsigned maxIterations = 1;
-    for ([[maybe_unused]] mlir::func::FuncOp function :
-         module.getOps<mlir::func::FuncOp>())
-      ++maxIterations;
-    for (unsigned iteration = 0; iteration < maxIterations; ++iteration) {
-      llvm::SmallVector<mlir::func::CallOp> calls;
-      module.walk([&](mlir::func::CallOp call) { calls.push_back(call); });
-      if (calls.empty())
-        return;
-
-      for (mlir::func::CallOp call : calls) {
-        mlir::func::FuncOp callee =
-            module.lookupSymbol<mlir::func::FuncOp>(call.getCallee());
-        if (!callee) {
-          call.emitError() << "cannot resolve helper '" << call.getCallee()
-                           << "'";
-          return signalPassFailure();
-        }
-        if (callee->hasAttr("vernon.entry")) {
-          call.emitError("Vernon entry functions cannot be called");
-          return signalPassFailure();
-        }
-        if (!llvm::hasSingleElement(callee.getBody())) {
-          call.emitError("helper inlining requires a single function block");
-          return signalPassFailure();
-        }
-        auto returnOp = mlir::dyn_cast<mlir::func::ReturnOp>(
-            callee.front().getTerminator());
-        if (!returnOp) {
-          call.emitError("helper function has no func.return terminator");
-          return signalPassFailure();
-        }
-
-        mlir::IRMapping mapping;
-        mapping.map(callee.getArguments(), call.getOperands());
-        mlir::OpBuilder builder(call);
-        for (mlir::Operation &operation : callee.front().without_terminator())
-          builder.clone(operation, mapping);
-        llvm::SmallVector<mlir::Value> replacements;
-        for (mlir::Value value : returnOp.getOperands())
-          replacements.push_back(mapping.lookupOrDefault(value));
-        call->replaceAllUsesWith(replacements);
-        call.erase();
-      }
-    }
-
-    llvm::SmallVector<mlir::func::CallOp> remainingCalls;
-    module.walk(
-        [&](mlir::func::CallOp call) { remainingCalls.push_back(call); });
-    if (!remainingCalls.empty()) {
-      remainingCalls.front().emitError(
-          "helper inlining did not converge; recursive calls are forbidden");
-      signalPassFailure();
-    }
-  }
-};
-
 struct KeepGpuModulesPass
     : public mlir::PassWrapper<KeepGpuModulesPass,
                                mlir::OperationPass<mlir::ModuleOp>> {
@@ -322,6 +260,24 @@ llvm::json::Value attributeToJson(mlir::Attribute attribute) {
   return printed;
 }
 
+uint64_t cpuSourceTypeSize(mlir::Type type) {
+  if (type.isIntOrFloat())
+    return std::max<uint64_t>(type.getIntOrFloatBitWidth() / 8, 1);
+  if (type.isIndex())
+    return sizeof(uint64_t);
+  if (mlir::isa<mlir::vernon::BufferType, mlir::vernon::TextureType,
+                mlir::vernon::SamplerType>(type))
+    return sizeof(uintptr_t);
+  auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type);
+  if (!tensor || !tensor.hasStaticShape())
+    return 0;
+  uint64_t count = 1;
+  for (int64_t dimension : tensor.getShape())
+    count *= static_cast<uint64_t>(dimension);
+  return count * std::max<uint64_t>(
+                     tensor.getElementType().getIntOrFloatBitWidth() / 8, 1);
+}
+
 std::string buildReflection(mlir::ModuleOp module) {
   auto scalarDtype = [](mlir::Type type) -> std::string {
     if (type.isF16())
@@ -337,26 +293,6 @@ std::string buildReflection(mlir::ModuleOp module) {
     if (type.isIndex())
       return "index";
     return "";
-  };
-  auto cpuTypeSize = [](mlir::Type type) -> uint64_t {
-    if (type.isIntOrFloat())
-      return std::max<uint64_t>(type.getIntOrFloatBitWidth() / 8, 1);
-    if (type.isIndex())
-      return sizeof(uint64_t);
-    if (mlir::isa<mlir::vernon::BufferType, mlir::vernon::TextureType,
-                  mlir::vernon::SamplerType>(type))
-      return sizeof(uintptr_t);
-    if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type)) {
-      if (!tensor.hasStaticShape())
-        return 0;
-      uint64_t count = 1;
-      for (int64_t dimension : tensor.getShape())
-        count *= dimension;
-      return count *
-             std::max<uint64_t>(
-                 tensor.getElementType().getIntOrFloatBitWidth() / 8, 1);
-    }
-    return 0;
   };
   llvm::json::Array entries;
   std::set<std::string> requiredFeatures;
@@ -377,7 +313,7 @@ std::string buildReflection(mlir::ModuleOp module) {
       llvm::raw_string_ostream typeStream(type);
       function.getArgumentTypes()[index].print(typeStream);
       argument["type"] = std::move(type);
-      uint64_t size = cpuTypeSize(function.getArgumentTypes()[index]);
+      uint64_t size = cpuSourceTypeSize(function.getArgumentTypes()[index]);
       if (size) {
         uint64_t alignment = size >= 16 ? 16 : size >= 8 ? 8 : 4;
         argumentOffset = llvm::alignTo(argumentOffset, alignment);
@@ -441,7 +377,7 @@ std::string buildReflection(mlir::ModuleOp module) {
           argument["dtype"] = sourceDtype ? sourceDtype.getValue().str()
                                           : scalarDtype(argumentType);
           argument["alignment"] = static_cast<int64_t>(
-              std::max<uint64_t>(cpuTypeSize(argumentType), 1));
+              std::max<uint64_t>(cpuSourceTypeSize(argumentType), 1));
         }
       }
       if (mlir::isa<mlir::vernon::BufferType>(argumentType))
@@ -461,7 +397,7 @@ std::string buildReflection(mlir::ModuleOp module) {
       llvm::raw_string_ostream typeStream(type);
       function.getResultTypes()[index].print(typeStream);
       output["type"] = std::move(type);
-      resultSize = cpuTypeSize(function.getResultTypes()[index]);
+      resultSize = cpuSourceTypeSize(function.getResultTypes()[index]);
       if (resultSize) {
         output["cpu_offset"] = int64_t{0};
         output["cpu_size"] = static_cast<int64_t>(resultSize);
@@ -595,834 +531,87 @@ std::unique_ptr<VernonCompileResult> validate(VernonCompilerContext *context,
   return result;
 }
 
-class CpuLLVMEmitter {
-public:
-  CpuLLVMEmitter(llvm::Module &module)
-      : module(module), context(module.getContext()) {}
+bool captureCpuAbiMetadata(mlir::ModuleOp module,
+                           std::vector<vernon::CpuAbiWrapperMetadata> &entries,
+                           std::string &diagnostics) {
+  for (mlir::func::FuncOp function : module.getOps<mlir::func::FuncOp>()) {
+    if (!function->hasAttr("vernon.entry"))
+      continue;
 
-  llvm::Expected<std::string> emit(mlir::ModuleOp source) {
-    for (mlir::func::FuncOp function : source.getOps<mlir::func::FuncOp>()) {
-      if (!function->hasAttr("vernon.entry"))
-        continue;
-      unsupportedOperation.clear();
-      if (mlir::failed(emitFunction(function))) {
-        if (!unsupportedOperation.empty())
-          return llvm::createStringError(
-              "unsupported operation '%s' in CPU entry '%s'",
-              unsupportedOperation.c_str(),
-              function.getSymName().str().c_str());
-        return llvm::createStringError(
-            "unsupported operation in CPU entry '%s'",
-            function.getSymName().str().c_str());
+    vernon::CpuAbiWrapperMetadata metadata;
+    metadata.internalFunctionSymbol = function.getSymName().str();
+    metadata.exportedWrapperSymbol =
+        "__vernon_cpu_" + function.getSymName().str();
+    metadata.argumentsSize = 0;
+    metadata.requiresTextureCallbacks = false;
+    function.walk([&](mlir::vernon::IntrinsicOp intrinsic) {
+      metadata.requiresTextureCallbacks |=
+          intrinsic.getName() == "texture_sample";
+    });
+
+    for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+      mlir::Type type = function.getArgumentTypes()[index];
+      uint64_t size = cpuSourceTypeSize(type);
+      if (size == 0) {
+        diagnostics = "unsupported CPU ABI argument type in entry '" +
+                      function.getSymName().str() + "'";
+        return false;
       }
-      entryNames.push_back(function.getSymName().str());
-    }
-    if (entryNames.empty())
-      return llvm::createStringError("module has no CPU entry points");
-    std::string text;
-    llvm::raw_string_ostream stream(text);
-    module.print(stream, nullptr);
-    return text;
-  }
-
-  llvm::ArrayRef<std::string> getEntryNames() const { return entryNames; }
-
-private:
-  llvm::Type *convertType(mlir::Type type) {
-    if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type))
-      return llvm::IntegerType::get(context, integer.getWidth());
-    if (type.isIndex())
-      return llvm::Type::getInt64Ty(context);
-    if (type.isF16())
-      return llvm::Type::getHalfTy(context);
-    if (type.isF32())
-      return llvm::Type::getFloatTy(context);
-    if (type.isF64())
-      return llvm::Type::getDoubleTy(context);
-    if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type)) {
-      if (!tensor.hasStaticShape())
-        return nullptr;
-      int64_t count = 1;
-      for (int64_t dimension : tensor.getShape())
-        count *= dimension;
-      llvm::Type *element = convertType(tensor.getElementType());
-      return element && count > 1 ? llvm::FixedVectorType::get(element, count)
-                                  : element;
-    }
-    if (mlir::isa<mlir::vernon::BufferType>(type))
-      return llvm::PointerType::get(context, 0);
-    if (mlir::isa<mlir::vernon::TextureType, mlir::vernon::SamplerType>(type))
-      return llvm::Type::getInt64Ty(context);
-    return nullptr;
-  }
-
-  llvm::Value *splat(llvm::IRBuilder<> &builder, llvm::Value *value,
-                     unsigned count) {
-    llvm::Value *result = llvm::PoisonValue::get(
-        llvm::FixedVectorType::get(value->getType(), count));
-    for (unsigned index = 0; index < count; ++index)
-      result = builder.CreateInsertElement(result, value, index);
-    return result;
-  }
-
-  llvm::Value *dot(llvm::IRBuilder<> &builder, llvm::Value *lhs,
-                   llvm::Value *rhs) {
-    auto vectorType = llvm::cast<llvm::FixedVectorType>(lhs->getType());
-    llvm::Value *product = builder.CreateFMul(lhs, rhs);
-    llvm::Value *sum = llvm::ConstantFP::get(vectorType->getElementType(), 0.0);
-    for (unsigned index = 0; index < vectorType->getNumElements(); ++index)
-      sum =
-          builder.CreateFAdd(sum, builder.CreateExtractElement(product, index));
-    return sum;
-  }
-
-  llvm::Value *
-  emitIntrinsic(mlir::vernon::IntrinsicOp intrinsic, llvm::IRBuilder<> &builder,
-                llvm::DenseMap<mlir::Value, llvm::Value *> &values) {
-    llvm::SmallVector<llvm::Value *> operands;
-    for (mlir::Value operand : intrinsic.getOperands()) {
-      llvm::Value *value = values.lookup(operand);
-      if (!value)
-        return nullptr;
-      operands.push_back(value);
-    }
-    llvm::StringRef name = intrinsic.getName();
-    if (name == "buffer_load") {
-      llvm::Type *elementType = convertType(intrinsic.getResult().getType());
-      llvm::Value *address =
-          builder.CreateGEP(elementType, operands[0], operands[1]);
-      llvm::LoadInst *load = builder.CreateLoad(elementType, address);
-      load->setAlignment(llvm::Align(1));
-      return load;
-    }
-    if (name == "buffer_store") {
-      llvm::Value *address =
-          builder.CreateGEP(operands[2]->getType(), operands[0], operands[1]);
-      llvm::StoreInst *store = builder.CreateStore(operands[2], address);
-      store->setAlignment(llvm::Align(1));
-      return store;
-    }
-    if (name == "texture_sample" && textureCallbacks) {
-      llvm::Type *pointerType = llvm::PointerType::get(context, 0);
-      llvm::Value *sampleAddress = builder.CreateGEP(
-          llvm::Type::getInt8Ty(context), textureCallbacks,
-          llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8));
-      llvm::LoadInst *sampleFunction =
-          builder.CreateLoad(pointerType, sampleAddress);
-      sampleFunction->setAlignment(llvm::Align(1));
-      llvm::LoadInst *userData =
-          builder.CreateLoad(pointerType, textureCallbacks);
-      userData->setAlignment(llvm::Align(1));
-      llvm::Value *output = builder.CreateAlloca(
-          llvm::ArrayType::get(llvm::Type::getFloatTy(context), 4));
-      auto callbackType = llvm::FunctionType::get(
-          llvm::Type::getVoidTy(context),
-          {pointerType, llvm::Type::getInt64Ty(context),
-           llvm::Type::getFloatTy(context), llvm::Type::getFloatTy(context),
-           pointerType},
-          false);
-      builder.CreateCall(
-          callbackType, sampleFunction,
-          {userData, operands[0],
-           builder.CreateExtractElement(operands[2], uint64_t{0}),
-           builder.CreateExtractElement(operands[2], uint64_t{1}), output});
-      llvm::LoadInst *sample = builder.CreateLoad(
-          llvm::FixedVectorType::get(llvm::Type::getFloatTy(context), 4),
-          output);
-      sample->setAlignment(llvm::Align(1));
-      return sample;
-    }
-    if (intrinsic.getNumResults() != 1)
-      return nullptr;
-    llvm::Type *resultType = convertType(intrinsic.getResult().getType());
-    if (name == "construct") {
-      auto outputType = llvm::dyn_cast<llvm::FixedVectorType>(resultType);
-      if (!outputType)
-        return nullptr;
-      llvm::Value *result = llvm::PoisonValue::get(outputType);
-      unsigned outputIndex = 0;
-      for (llvm::Value *operand : operands) {
-        if (auto inputType =
-                llvm::dyn_cast<llvm::FixedVectorType>(operand->getType())) {
-          for (unsigned index = 0; index < inputType->getNumElements(); ++index)
-            result = builder.CreateInsertElement(
-                result, builder.CreateExtractElement(operand, index),
-                outputIndex++);
-        } else {
-          result = builder.CreateInsertElement(result, operand, outputIndex++);
-        }
-      }
-      return result;
-    }
-    if (name == "dot")
-      return dot(builder, operands[0], operands[1]);
-    if (name == "normalize") {
-      llvm::Value *lengthSquared = dot(builder, operands[0], operands[0]);
-      llvm::Function *sqrt = llvm::Intrinsic::getOrInsertDeclaration(
-          &module, llvm::Intrinsic::sqrt, {lengthSquared->getType()});
-      llvm::Value *length = builder.CreateCall(sqrt, lengthSquared);
-      auto vectorType =
-          llvm::cast<llvm::FixedVectorType>(operands[0]->getType());
-      return builder.CreateFDiv(
-          operands[0], splat(builder, length, vectorType->getNumElements()));
-    }
-    if (name == "cross") {
-      llvm::Value *result = llvm::PoisonValue::get(operands[0]->getType());
-      constexpr unsigned lhsIndices[] = {1, 2, 0};
-      constexpr unsigned rhsIndices[] = {2, 0, 1};
-      constexpr unsigned lhsIndices2[] = {2, 0, 1};
-      constexpr unsigned rhsIndices2[] = {1, 2, 0};
-      for (unsigned index = 0; index < 3; ++index) {
-        llvm::Value *first = builder.CreateFMul(
-            builder.CreateExtractElement(operands[0], lhsIndices[index]),
-            builder.CreateExtractElement(operands[1], rhsIndices[index]));
-        llvm::Value *second = builder.CreateFMul(
-            builder.CreateExtractElement(operands[0], lhsIndices2[index]),
-            builder.CreateExtractElement(operands[1], rhsIndices2[index]));
-        result = builder.CreateInsertElement(
-            result, builder.CreateFSub(first, second), index);
-      }
-      return result;
-    }
-    if (name == "reflect") {
-      llvm::Value *factor = builder.CreateFMul(
-          llvm::ConstantFP::get(
-              dot(builder, operands[1], operands[0])->getType(), 2.0),
-          dot(builder, operands[1], operands[0]));
-      auto vectorType =
-          llvm::cast<llvm::FixedVectorType>(operands[0]->getType());
-      return builder.CreateFSub(
-          operands[0],
-          builder.CreateFMul(operands[1], splat(builder, factor,
-                                                vectorType->getNumElements())));
-    }
-    if (name == "matmul")
-      return emitMatrixMultiply(intrinsic, builder, operands);
-    llvm::Intrinsic::ID id = llvm::Intrinsic::not_intrinsic;
-    if (name == "min")
-      id = llvm::Intrinsic::minnum;
-    else if (name == "max")
-      id = llvm::Intrinsic::maxnum;
-    else if (name == "pow")
-      id = llvm::Intrinsic::pow;
-    if (id != llvm::Intrinsic::not_intrinsic) {
-      llvm::Function *function =
-          llvm::Intrinsic::getOrInsertDeclaration(&module, id, {resultType});
-      return builder.CreateCall(function, operands);
-    }
-    if (name == "clamp") {
-      llvm::Function *maximum = llvm::Intrinsic::getOrInsertDeclaration(
-          &module, llvm::Intrinsic::maxnum, {resultType});
-      llvm::Function *minimum = llvm::Intrinsic::getOrInsertDeclaration(
-          &module, llvm::Intrinsic::minnum, {resultType});
-      return builder.CreateCall(
-          minimum, {builder.CreateCall(maximum, {operands[0], operands[1]}),
-                    operands[2]});
-    }
-    return nullptr;
-  }
-
-  llvm::Value *emitMatrixMultiply(mlir::vernon::IntrinsicOp intrinsic,
-                                  llvm::IRBuilder<> &builder,
-                                  llvm::ArrayRef<llvm::Value *> operands) {
-    auto leftType =
-        mlir::cast<mlir::RankedTensorType>(intrinsic.getOperand(0).getType());
-    int64_t rows = leftType.getShape()[0];
-    int64_t columns = leftType.getShape()[1];
-    auto rightType =
-        mlir::cast<mlir::RankedTensorType>(intrinsic.getOperand(1).getType());
-    int64_t resultColumns =
-        rightType.getRank() == 1 ? 1 : rightType.getShape()[1];
-    auto resultType = llvm::cast<llvm::FixedVectorType>(
-        convertType(intrinsic.getResult().getType()));
-    llvm::Value *result = llvm::PoisonValue::get(resultType);
-    for (int64_t row = 0; row < rows; ++row) {
-      for (int64_t column = 0; column < resultColumns; ++column) {
-        llvm::Value *sum =
-            llvm::ConstantFP::get(resultType->getElementType(), 0.0);
-        for (int64_t inner = 0; inner < columns; ++inner) {
-          llvm::Value *lhs =
-              builder.CreateExtractElement(operands[0], row * columns + inner);
-          int64_t rhsIndex =
-              rightType.getRank() == 1 ? inner : inner * resultColumns + column;
-          llvm::Value *rhs =
-              builder.CreateExtractElement(operands[1], rhsIndex);
-          sum = builder.CreateFAdd(sum, builder.CreateFMul(lhs, rhs));
-        }
-        result = builder.CreateInsertElement(result, sum,
-                                             row * resultColumns + column);
-      }
-    }
-    return result;
-  }
-
-  llvm::CmpInst::Predicate
-  convertPredicate(mlir::arith::CmpIPredicate predicate) {
-    switch (predicate) {
-    case mlir::arith::CmpIPredicate::eq:
-      return llvm::CmpInst::ICMP_EQ;
-    case mlir::arith::CmpIPredicate::ne:
-      return llvm::CmpInst::ICMP_NE;
-    case mlir::arith::CmpIPredicate::slt:
-      return llvm::CmpInst::ICMP_SLT;
-    case mlir::arith::CmpIPredicate::sle:
-      return llvm::CmpInst::ICMP_SLE;
-    case mlir::arith::CmpIPredicate::sgt:
-      return llvm::CmpInst::ICMP_SGT;
-    case mlir::arith::CmpIPredicate::sge:
-      return llvm::CmpInst::ICMP_SGE;
-    case mlir::arith::CmpIPredicate::ult:
-      return llvm::CmpInst::ICMP_ULT;
-    case mlir::arith::CmpIPredicate::ule:
-      return llvm::CmpInst::ICMP_ULE;
-    case mlir::arith::CmpIPredicate::ugt:
-      return llvm::CmpInst::ICMP_UGT;
-    case mlir::arith::CmpIPredicate::uge:
-      return llvm::CmpInst::ICMP_UGE;
-    }
-    llvm_unreachable("unknown arith.cmpi predicate");
-  }
-
-  llvm::CmpInst::Predicate
-  convertPredicate(mlir::arith::CmpFPredicate predicate) {
-    switch (predicate) {
-    case mlir::arith::CmpFPredicate::AlwaysFalse:
-      return llvm::CmpInst::FCMP_FALSE;
-    case mlir::arith::CmpFPredicate::OEQ:
-      return llvm::CmpInst::FCMP_OEQ;
-    case mlir::arith::CmpFPredicate::OGT:
-      return llvm::CmpInst::FCMP_OGT;
-    case mlir::arith::CmpFPredicate::OGE:
-      return llvm::CmpInst::FCMP_OGE;
-    case mlir::arith::CmpFPredicate::OLT:
-      return llvm::CmpInst::FCMP_OLT;
-    case mlir::arith::CmpFPredicate::OLE:
-      return llvm::CmpInst::FCMP_OLE;
-    case mlir::arith::CmpFPredicate::ONE:
-      return llvm::CmpInst::FCMP_ONE;
-    case mlir::arith::CmpFPredicate::ORD:
-      return llvm::CmpInst::FCMP_ORD;
-    case mlir::arith::CmpFPredicate::UEQ:
-      return llvm::CmpInst::FCMP_UEQ;
-    case mlir::arith::CmpFPredicate::UGT:
-      return llvm::CmpInst::FCMP_UGT;
-    case mlir::arith::CmpFPredicate::UGE:
-      return llvm::CmpInst::FCMP_UGE;
-    case mlir::arith::CmpFPredicate::ULT:
-      return llvm::CmpInst::FCMP_ULT;
-    case mlir::arith::CmpFPredicate::ULE:
-      return llvm::CmpInst::FCMP_ULE;
-    case mlir::arith::CmpFPredicate::UNE:
-      return llvm::CmpInst::FCMP_UNE;
-    case mlir::arith::CmpFPredicate::UNO:
-      return llvm::CmpInst::FCMP_UNO;
-    case mlir::arith::CmpFPredicate::AlwaysTrue:
-      return llvm::CmpInst::FCMP_TRUE;
-    }
-    llvm_unreachable("unknown arith.cmpf predicate");
-  }
-
-  mlir::LogicalResult
-  emitBlock(mlir::Block &source, llvm::IRBuilder<> &builder,
-            llvm::DenseMap<mlir::Value, llvm::Value *> &values) {
-    for (mlir::Operation &operation : source.without_terminator())
-      if (mlir::failed(emitOperation(operation, builder, values)))
-        return mlir::failure();
-    return mlir::success();
-  }
-
-  mlir::LogicalResult
-  emitIf(mlir::scf::IfOp ifOp, llvm::IRBuilder<> &builder,
-         llvm::DenseMap<mlir::Value, llvm::Value *> &values) {
-    llvm::Value *condition = values.lookup(ifOp.getCondition());
-    if (!condition)
-      return mlir::failure();
-
-    llvm::Function *function = builder.GetInsertBlock()->getParent();
-    llvm::BasicBlock *thenBlock =
-        llvm::BasicBlock::Create(context, "if.then", function);
-    llvm::BasicBlock *elseBlock =
-        llvm::BasicBlock::Create(context, "if.else", function);
-    llvm::BasicBlock *continueBlock =
-        llvm::BasicBlock::Create(context, "if.end", function);
-    builder.CreateCondBr(condition, thenBlock, elseBlock);
-
-    llvm::SmallVector<llvm::Value *> thenValues;
-    builder.SetInsertPoint(thenBlock);
-    mlir::Block &sourceThen = ifOp.getThenRegion().front();
-    if (mlir::failed(emitBlock(sourceThen, builder, values)))
-      return mlir::failure();
-    auto thenYield =
-        mlir::dyn_cast<mlir::scf::YieldOp>(sourceThen.getTerminator());
-    if (!thenYield)
-      return mlir::failure();
-    for (mlir::Value value : thenYield.getOperands()) {
-      llvm::Value *converted = values.lookup(value);
-      if (!converted)
-        return mlir::failure();
-      thenValues.push_back(converted);
-    }
-    llvm::BasicBlock *thenExit = builder.GetInsertBlock();
-    builder.CreateBr(continueBlock);
-
-    llvm::SmallVector<llvm::Value *> elseValues;
-    builder.SetInsertPoint(elseBlock);
-    if (!ifOp.getElseRegion().empty()) {
-      mlir::Block &sourceElse = ifOp.getElseRegion().front();
-      if (mlir::failed(emitBlock(sourceElse, builder, values)))
-        return mlir::failure();
-      auto elseYield =
-          mlir::dyn_cast<mlir::scf::YieldOp>(sourceElse.getTerminator());
-      if (!elseYield)
-        return mlir::failure();
-      for (mlir::Value value : elseYield.getOperands()) {
-        llvm::Value *converted = values.lookup(value);
-        if (!converted)
-          return mlir::failure();
-        elseValues.push_back(converted);
-      }
-    }
-    llvm::BasicBlock *elseExit = builder.GetInsertBlock();
-    builder.CreateBr(continueBlock);
-
-    if (thenValues.size() != ifOp.getNumResults() ||
-        elseValues.size() != ifOp.getNumResults())
-      return mlir::failure();
-    builder.SetInsertPoint(continueBlock);
-    for (auto [index, result] : llvm::enumerate(ifOp.getResults())) {
-      llvm::Type *type = convertType(result.getType());
-      if (!type)
-        return mlir::failure();
-      llvm::PHINode *phi = builder.CreatePHI(type, 2, "if.result");
-      phi->addIncoming(thenValues[index], thenExit);
-      phi->addIncoming(elseValues[index], elseExit);
-      values[result] = phi;
-    }
-    return mlir::success();
-  }
-
-  mlir::LogicalResult
-  emitWhile(mlir::scf::WhileOp whileOp, llvm::IRBuilder<> &builder,
-            llvm::DenseMap<mlir::Value, llvm::Value *> &values) {
-    llvm::Function *function = builder.GetInsertBlock()->getParent();
-    llvm::BasicBlock *preheader = builder.GetInsertBlock();
-    llvm::BasicBlock *beforeBlock =
-        llvm::BasicBlock::Create(context, "while.before", function);
-    llvm::BasicBlock *afterBlock =
-        llvm::BasicBlock::Create(context, "while.body", function);
-    llvm::BasicBlock *continueBlock =
-        llvm::BasicBlock::Create(context, "while.end", function);
-    builder.CreateBr(beforeBlock);
-
-    mlir::Block &sourceBefore = whileOp.getBefore().front();
-    if (sourceBefore.getNumArguments() != whileOp.getNumOperands())
-      return mlir::failure();
-    builder.SetInsertPoint(beforeBlock);
-    llvm::SmallVector<llvm::PHINode *> beforePhis;
-    for (auto [argument, initial] :
-         llvm::zip_equal(sourceBefore.getArguments(), whileOp.getOperands())) {
-      llvm::Value *initialValue = values.lookup(initial);
-      llvm::Type *type = convertType(argument.getType());
-      if (!initialValue || !type)
-        return mlir::failure();
-      llvm::PHINode *phi = builder.CreatePHI(type, 2, "while.iter");
-      phi->addIncoming(initialValue, preheader);
-      values[argument] = phi;
-      beforePhis.push_back(phi);
-    }
-    if (mlir::failed(emitBlock(sourceBefore, builder, values)))
-      return mlir::failure();
-    auto condition =
-        mlir::dyn_cast<mlir::scf::ConditionOp>(sourceBefore.getTerminator());
-    if (!condition)
-      return mlir::failure();
-    llvm::Value *conditionValue = values.lookup(condition.getCondition());
-    if (!conditionValue ||
-        condition.getArgs().size() != whileOp.getNumResults())
-      return mlir::failure();
-    llvm::SmallVector<llvm::Value *> forwarded;
-    for (mlir::Value value : condition.getArgs()) {
-      llvm::Value *converted = values.lookup(value);
-      if (!converted)
-        return mlir::failure();
-      forwarded.push_back(converted);
-    }
-    llvm::BasicBlock *conditionBlock = builder.GetInsertBlock();
-    builder.CreateCondBr(conditionValue, afterBlock, continueBlock);
-
-    mlir::Block &sourceAfter = whileOp.getAfter().front();
-    if (sourceAfter.getNumArguments() != forwarded.size())
-      return mlir::failure();
-    builder.SetInsertPoint(afterBlock);
-    for (auto [argument, value] :
-         llvm::zip_equal(sourceAfter.getArguments(), forwarded)) {
-      llvm::Type *type = convertType(argument.getType());
-      if (!type)
-        return mlir::failure();
-      llvm::PHINode *phi = builder.CreatePHI(type, 1, "while.body.arg");
-      phi->addIncoming(value, conditionBlock);
-      values[argument] = phi;
-    }
-    if (mlir::failed(emitBlock(sourceAfter, builder, values)))
-      return mlir::failure();
-    auto yield =
-        mlir::dyn_cast<mlir::scf::YieldOp>(sourceAfter.getTerminator());
-    if (!yield || yield.getOperands().size() != beforePhis.size())
-      return mlir::failure();
-    llvm::SmallVector<llvm::Value *> yielded;
-    for (mlir::Value value : yield.getOperands()) {
-      llvm::Value *converted = values.lookup(value);
-      if (!converted)
-        return mlir::failure();
-      yielded.push_back(converted);
-    }
-    llvm::BasicBlock *afterExit = builder.GetInsertBlock();
-    builder.CreateBr(beforeBlock);
-    for (auto [phi, value] : llvm::zip_equal(beforePhis, yielded))
-      phi->addIncoming(value, afterExit);
-
-    builder.SetInsertPoint(continueBlock);
-    for (auto [result, value] :
-         llvm::zip_equal(whileOp.getResults(), forwarded)) {
-      llvm::Type *type = convertType(result.getType());
-      if (!type)
-        return mlir::failure();
-      llvm::PHINode *phi = builder.CreatePHI(type, 1, "while.result");
-      phi->addIncoming(value, conditionBlock);
-      values[result] = phi;
-    }
-    return mlir::success();
-  }
-
-  mlir::LogicalResult
-  emitOperation(mlir::Operation &operation, llvm::IRBuilder<> &builder,
-                llvm::DenseMap<mlir::Value, llvm::Value *> &values) {
-    unsupportedOperation = operation.getName().getStringRef().str();
-    if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(operation))
-      return emitIf(ifOp, builder, values);
-    if (auto whileOp = mlir::dyn_cast<mlir::scf::WhileOp>(operation))
-      return emitWhile(whileOp, builder, values);
-
-    llvm::Value *result = nullptr;
-    if (auto constant = mlir::dyn_cast<mlir::arith::ConstantOp>(operation)) {
-      if (auto floatValue =
-              mlir::dyn_cast<mlir::FloatAttr>(constant.getValue()))
-        result = llvm::ConstantFP::get(context, floatValue.getValue());
-      else if (auto integer =
-                   mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue()))
-        result = llvm::ConstantInt::get(convertType(constant.getType()),
-                                        integer.getValue());
-    } else if (auto compare = mlir::dyn_cast<mlir::arith::CmpIOp>(operation)) {
-      llvm::Value *lhs = values.lookup(compare.getLhs());
-      llvm::Value *rhs = values.lookup(compare.getRhs());
-      if (lhs && rhs)
-        result = builder.CreateICmp(convertPredicate(compare.getPredicate()),
-                                    lhs, rhs);
-    } else if (auto compare = mlir::dyn_cast<mlir::arith::CmpFOp>(operation)) {
-      llvm::Value *lhs = values.lookup(compare.getLhs());
-      llvm::Value *rhs = values.lookup(compare.getRhs());
-      if (lhs && rhs)
-        result = builder.CreateFCmp(convertPredicate(compare.getPredicate()),
-                                    lhs, rhs);
-    } else if (auto swizzle =
-                   mlir::dyn_cast<mlir::vernon::SwizzleOp>(operation)) {
-      llvm::Value *input = values.lookup(swizzle.getInput());
-      if (!input)
-        return mlir::failure();
-      llvm::SmallVector<int> mask;
-      for (char component : swizzle.getMask())
-        mask.push_back(llvm::StringRef("xyzw").find(component));
-      result = mask.size() == 1
-                   ? builder.CreateExtractElement(input, mask.front())
-                   : builder.CreateShuffleVector(input, mask);
-    } else if (auto intrinsic =
-                   mlir::dyn_cast<mlir::vernon::IntrinsicOp>(operation)) {
-      requiresTextureCallbacks |= intrinsic.getName() == "texture_sample";
-      result = emitIntrinsic(intrinsic, builder, values);
-    } else if (auto extract =
-                   mlir::dyn_cast<mlir::tensor::ExtractOp>(operation)) {
-      llvm::Value *tensor = values.lookup(extract.getTensor());
-      if (!tensor)
-        return mlir::failure();
-      auto tensorType =
-          mlir::cast<mlir::RankedTensorType>(extract.getTensor().getType());
-      llvm::Value *linearIndex =
-          llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 0);
-      for (auto [dimension, index] : llvm::enumerate(extract.getIndices())) {
-        llvm::Value *convertedIndex = values.lookup(index);
-        if (!convertedIndex)
-          return mlir::failure();
-        if (!convertedIndex->getType()->isIntegerTy(64))
-          convertedIndex = builder.CreateZExtOrTrunc(
-              convertedIndex, llvm::Type::getInt64Ty(context));
-        if (dimension != 0)
-          linearIndex = builder.CreateMul(
-              linearIndex,
-              llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                     tensorType.getDimSize(dimension)));
-        linearIndex = builder.CreateAdd(linearIndex, convertedIndex);
-      }
-      result = llvm::isa<llvm::VectorType>(tensor->getType())
-                   ? builder.CreateExtractElement(tensor, linearIndex)
-                   : tensor;
-    } else if (auto returnOp =
-                   mlir::dyn_cast<mlir::func::ReturnOp>(operation)) {
-      if (returnOp.getNumOperands() == 0)
-        builder.CreateRetVoid();
-      else if (llvm::Value *value = values.lookup(returnOp.getOperand(0)))
-        builder.CreateRet(value);
-      else
-        return mlir::failure();
-      return mlir::success();
-    } else if (operation.getNumOperands() == 1 &&
-               operation.getNumResults() == 1) {
-      llvm::Value *input = values.lookup(operation.getOperand(0));
-      llvm::Type *target = convertType(operation.getResult(0).getType());
-      if (!input || !target)
-        return mlir::failure();
-      llvm::StringRef name = operation.getName().getStringRef();
-      if (name == "arith.index_cast")
-        result = builder.CreateIntCast(input, target, true);
-      else if (name == "arith.index_castui")
-        result = builder.CreateIntCast(input, target, false);
-      else if (name == "arith.uitofp")
-        result = builder.CreateUIToFP(input, target);
-      else if (name == "arith.sitofp")
-        result = builder.CreateSIToFP(input, target);
-      else if (name == "arith.fptoui")
-        result = builder.CreateFPToUI(input, target);
-      else if (name == "arith.fptosi")
-        result = builder.CreateFPToSI(input, target);
-      else if (name == "arith.extf")
-        result = builder.CreateFPExt(input, target);
-      else if (name == "arith.truncf")
-        result = builder.CreateFPTrunc(input, target);
-      else if (name == "arith.negf")
-        result = builder.CreateFNeg(input);
-      else if (name == "math.cos" || name == "math.sqrt") {
-        llvm::Intrinsic::ID id =
-            name == "math.cos" ? llvm::Intrinsic::cos : llvm::Intrinsic::sqrt;
-        llvm::Function *function =
-            llvm::Intrinsic::getOrInsertDeclaration(&module, id, {target});
-        result = builder.CreateCall(function, input);
-      }
-    } else if (operation.getNumOperands() == 2 &&
-               operation.getNumResults() == 1) {
-      llvm::Value *lhs = values.lookup(operation.getOperand(0));
-      llvm::Value *rhs = values.lookup(operation.getOperand(1));
-      if (!lhs || !rhs)
-        return mlir::failure();
-      llvm::StringRef name = operation.getName().getStringRef();
-      if (name == "arith.addf")
-        result = builder.CreateFAdd(lhs, rhs);
-      else if (name == "arith.subf")
-        result = builder.CreateFSub(lhs, rhs);
-      else if (name == "arith.mulf")
-        result = builder.CreateFMul(lhs, rhs);
-      else if (name == "arith.divf")
-        result = builder.CreateFDiv(lhs, rhs);
-      else if (name == "arith.addi")
-        result = builder.CreateAdd(lhs, rhs);
-      else if (name == "arith.subi")
-        result = builder.CreateSub(lhs, rhs);
-      else if (name == "arith.muli")
-        result = builder.CreateMul(lhs, rhs);
-      else if (name == "arith.andi")
-        result = builder.CreateAnd(lhs, rhs);
-    }
-    if (!result)
-      return mlir::failure();
-    if (operation.getNumResults() == 0)
-      return mlir::success();
-    if (operation.getNumResults() != 1)
-      return mlir::failure();
-    values[operation.getResult(0)] = result;
-    return mlir::success();
-  }
-
-  mlir::LogicalResult emitFunction(mlir::func::FuncOp source) {
-    llvm::SmallVector<llvm::Type *> argumentTypes;
-    for (mlir::Type type : source.getArgumentTypes()) {
-      llvm::Type *converted = convertType(type);
-      if (!converted)
-        return mlir::failure();
-      argumentTypes.push_back(converted);
-    }
-    argumentTypes.push_back(llvm::PointerType::get(context, 0));
-    llvm::Type *resultType = llvm::Type::getVoidTy(context);
-    if (source.getNumResults() == 1) {
-      resultType = convertType(source.getResultTypes()[0]);
-      if (!resultType)
-        return mlir::failure();
-    } else if (source.getNumResults() > 1) {
-      return mlir::failure();
-    }
-    auto functionType =
-        llvm::FunctionType::get(resultType, argumentTypes, false);
-    llvm::Function *function =
-        llvm::Function::Create(functionType, llvm::GlobalValue::InternalLinkage,
-                               source.getSymName().str(), module);
-    llvm::BasicBlock *block =
-        llvm::BasicBlock::Create(context, "entry", function);
-    llvm::IRBuilder<> builder(block);
-    llvm::DenseMap<mlir::Value, llvm::Value *> values;
-    for (auto [index, sourceArgument] : llvm::enumerate(source.getArguments()))
-      values[sourceArgument] = function->getArg(index);
-    textureCallbacks = function->getArg(source.getNumArguments());
-    requiresTextureCallbacks = false;
-    for (mlir::Operation &operation : source.front())
-      if (mlir::failed(emitOperation(operation, builder, values)))
-        return mlir::failure();
-    if (!block->getTerminator())
-      return mlir::failure();
-    emitWrapper(function, source.getNumArguments(), requiresTextureCallbacks);
-    textureCallbacks = nullptr;
-    return mlir::success();
-  }
-
-  void emitWrapper(llvm::Function *function, unsigned sourceArgumentCount,
-                   bool requiresTextureCallbacks) {
-    llvm::Type *pointerType = llvm::PointerType::get(context, 0);
-    auto wrapperType = llvm::FunctionType::get(llvm::Type::getInt32Ty(context),
-                                               {pointerType}, false);
-    llvm::Function *wrapper =
-        llvm::Function::Create(wrapperType, llvm::GlobalValue::ExternalLinkage,
-                               "__vernon_cpu_" + function->getName(), module);
-    if (llvm::Triple(module.getTargetTriple()).isOSWindows())
-      wrapper->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
-    else
-      wrapper->setVisibility(llvm::GlobalValue::DefaultVisibility);
-    llvm::BasicBlock *entryBlock =
-        llvm::BasicBlock::Create(context, "entry", wrapper);
-    llvm::BasicBlock *sizeBlock =
-        llvm::BasicBlock::Create(context, "check_sizes", wrapper);
-    llvm::BasicBlock *callBlock =
-        llvm::BasicBlock::Create(context, "call", wrapper);
-    llvm::BasicBlock *invalidBlock =
-        llvm::BasicBlock::Create(context, "invalid", wrapper);
-
-    llvm::SmallVector<uint64_t> argumentOffsets;
-    uint64_t requiredArgumentsSize = 0;
-    for (unsigned index = 0; index < sourceArgumentCount; ++index) {
-      llvm::Argument &argument = *function->getArg(index);
-      uint64_t size =
-          module.getDataLayout().getTypeStoreSize(argument.getType());
       uint64_t alignment = size >= 16 ? 16 : size >= 8 ? 8 : 4;
-      requiredArgumentsSize = llvm::alignTo(requiredArgumentsSize, alignment);
-      argumentOffsets.push_back(requiredArgumentsSize);
-      requiredArgumentsSize += size;
+      metadata.argumentsSize = llvm::alignTo(metadata.argumentsSize, alignment);
+
+      vernon::CpuAbiArgumentPacking packing{
+          metadata.argumentsSize, size,
+          mlir::isa<mlir::vernon::BufferType>(type)
+              ? vernon::CpuAbiArgumentKind::Buffer
+              : vernon::CpuAbiArgumentKind::Direct,
+          0};
+      if (packing.kind == vernon::CpuAbiArgumentKind::Buffer) {
+        auto attrs = function.getArgAttrDict(index);
+        if (auto shape =
+                attrs.getAs<mlir::DenseI64ArrayAttr>("vernon.tensor_shape")) {
+          uint64_t extent = 1;
+          for (int64_t dimension : shape.asArrayRef()) {
+            if (dimension < 0 ||
+                (dimension != 0 &&
+                 extent > std::numeric_limits<uint64_t>::max() /
+                              static_cast<uint64_t>(dimension))) {
+              diagnostics = "invalid vernon.tensor_shape on CPU buffer in "
+                            "entry '" +
+                            function.getSymName().str() + "'";
+              return false;
+            }
+            extent *= static_cast<uint64_t>(dimension);
+          }
+          packing.staticExtent = extent;
+        }
+      }
+      metadata.sourceArguments.push_back(packing);
+      metadata.argumentsSize += size;
     }
-    uint64_t requiredResultsSize =
-        function->getReturnType()->isVoidTy()
+
+    if (function.getNumResults() > 1) {
+      diagnostics = "CPU entry '" + function.getSymName().str() +
+                    "' has more than one result";
+      return false;
+    }
+    metadata.resultsSize =
+        function.getNumResults() == 0
             ? 0
-            : module.getDataLayout().getTypeStoreSize(
-                  function->getReturnType());
-
-    llvm::IRBuilder<> builder(entryBlock);
-    llvm::Value *invocation = wrapper->getArg(0);
-    builder.CreateCondBr(
-        builder.CreateICmpEQ(invocation,
-                             llvm::ConstantPointerNull::get(
-                                 llvm::cast<llvm::PointerType>(pointerType))),
-        invalidBlock, sizeBlock);
-
-    builder.SetInsertPoint(sizeBlock);
-    llvm::LoadInst *argumentsLoad =
-        builder.CreateLoad(pointerType, invocation, "arguments");
-    argumentsLoad->setAlignment(llvm::Align(1));
-    llvm::Value *arguments = argumentsLoad;
-    llvm::Value *argumentsSizeAddress = builder.CreateGEP(
-        llvm::Type::getInt8Ty(context), invocation,
-        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8));
-    llvm::LoadInst *argumentsSize = builder.CreateLoad(
-        llvm::Type::getInt64Ty(context), argumentsSizeAddress);
-    argumentsSize->setAlignment(llvm::Align(1));
-    llvm::Value *resultsAddress = builder.CreateGEP(
-        llvm::Type::getInt8Ty(context), invocation,
-        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 16));
-    llvm::LoadInst *resultsLoad =
-        builder.CreateLoad(pointerType, resultsAddress, "results");
-    resultsLoad->setAlignment(llvm::Align(1));
-    llvm::Value *results = resultsLoad;
-    llvm::Value *resultsSizeAddress = builder.CreateGEP(
-        llvm::Type::getInt8Ty(context), invocation,
-        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 24));
-    llvm::LoadInst *resultsSize =
-        builder.CreateLoad(llvm::Type::getInt64Ty(context), resultsSizeAddress);
-    resultsSize->setAlignment(llvm::Align(1));
-    llvm::Value *validArguments =
-        requiredArgumentsSize == 0
-            ? llvm::ConstantInt::getTrue(context)
-            : builder.CreateAnd(
-                  builder.CreateICmpNE(
-                      arguments,
-                      llvm::ConstantPointerNull::get(
-                          llvm::cast<llvm::PointerType>(pointerType))),
-                  builder.CreateICmpUGE(
-                      argumentsSize,
-                      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                             requiredArgumentsSize)));
-    llvm::Value *validResults =
-        requiredResultsSize == 0
-            ? llvm::ConstantInt::getTrue(context)
-            : builder.CreateAnd(
-                  builder.CreateICmpNE(
-                      results, llvm::ConstantPointerNull::get(
-                                   llvm::cast<llvm::PointerType>(pointerType))),
-                  builder.CreateICmpUGE(
-                      resultsSize,
-                      llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
-                                             requiredResultsSize)));
-    llvm::Value *texturesAddress = builder.CreateGEP(
-        llvm::Type::getInt8Ty(context), invocation,
-        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 32));
-    llvm::LoadInst *textures =
-        builder.CreateLoad(pointerType, texturesAddress, "textures");
-    textures->setAlignment(llvm::Align(1));
-    llvm::Value *validTextures =
-        requiresTextureCallbacks
-            ? builder.CreateICmpNE(
-                  textures, llvm::ConstantPointerNull::get(
-                                llvm::cast<llvm::PointerType>(pointerType)))
-            : llvm::ConstantInt::getTrue(context);
-    builder.CreateCondBr(
-        builder.CreateAnd(builder.CreateAnd(validArguments, validResults),
-                          validTextures),
-        callBlock, invalidBlock);
-
-    builder.SetInsertPoint(callBlock);
-    llvm::SmallVector<llvm::Value *> argumentsToCall;
-    for (unsigned index = 0; index < sourceArgumentCount; ++index) {
-      llvm::Argument &argument = *function->getArg(index);
-      uint64_t offset = argumentOffsets[index];
-      llvm::Value *address = builder.CreateGEP(
-          llvm::Type::getInt8Ty(context), arguments,
-          llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), offset));
-      llvm::LoadInst *load = builder.CreateLoad(argument.getType(), address);
-      load->setAlignment(llvm::Align(1));
-      argumentsToCall.push_back(load);
+            : cpuSourceTypeSize(function.getResultTypes()[0]);
+    if (function.getNumResults() != 0 && metadata.resultsSize == 0) {
+      diagnostics = "unsupported CPU ABI result type in entry '" +
+                    function.getSymName().str() + "'";
+      return false;
     }
-    argumentsToCall.push_back(textures);
-    llvm::CallInst *call = builder.CreateCall(function, argumentsToCall);
-    if (!function->getReturnType()->isVoidTy()) {
-      llvm::StoreInst *store = builder.CreateStore(call, results);
-      store->setAlignment(llvm::Align(1));
-    }
-    builder.CreateRet(
-        llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0));
-
-    builder.SetInsertPoint(invalidBlock);
-    builder.CreateRet(
-        llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 1));
+    entries.push_back(std::move(metadata));
   }
-
-  llvm::Module &module;
-  llvm::LLVMContext &context;
-  llvm::Value *textureCallbacks{nullptr};
-  bool requiresTextureCallbacks{false};
-  std::string unsupportedOperation;
-  llvm::SmallVector<std::string> entryNames;
-};
+  if (entries.empty()) {
+    diagnostics = "module has no CPU entry points";
+    return false;
+  }
+  return true;
+}
 
 bool compileVulkan(VernonCompilerContext *context, const char *source,
                    size_t sourceSize, VernonCompileResult &result) {
@@ -1441,7 +630,7 @@ bool compileVulkan(VernonCompilerContext *context, const char *source,
   // Backend lowerings intentionally only handle entry bodies. Inline shared
   // helpers while the module is still in common typed MLIR so every target
   // sees the same implementation.
-  passManager.addPass(std::make_unique<InlineVernonHelpersPass>());
+  passManager.addPass(mlir::vernon::createVernonInlineHelpersPass());
   passManager.addPass(mlir::vernon::createVernonToGPUPass(true));
   passManager.addNestedPass<mlir::gpu::GPUModuleOp>(
       mlir::vernon::createVernonLowerGPUTensorsPass());
@@ -1498,7 +687,7 @@ bool compileCuda(VernonCompilerContext *context, const char *source,
 
   mlir::PassManager passManager(&context->context);
   passManager.addPass(mlir::vernon::createVernonValidatePass());
-  passManager.addPass(std::make_unique<InlineVernonHelpersPass>());
+  passManager.addPass(mlir::vernon::createVernonInlineHelpersPass());
   passManager.addPass(mlir::vernon::createVernonToGPUPass());
   passManager.addPass(std::make_unique<KeepGpuModulesPass>());
   passManager.addNestedPass<mlir::gpu::GPUModuleOp>(
@@ -1543,16 +732,23 @@ bool compileCuda(VernonCompilerContext *context, const char *source,
 
 bool compileCpu(VernonCompilerContext *compilerContext, const char *source,
                 size_t sourceSize, VernonCompileResult &result) {
+  mlir::ScopedDiagnosticHandler handler(
+      &compilerContext->context, [&](mlir::Diagnostic &diagnostic) {
+        appendDiagnostic(result.diagnostics, diagnostic);
+      });
   llvm::StringRef text(source ? source : "", sourceSize);
   mlir::OwningOpRef<mlir::ModuleOp> sourceModule =
       mlir::parseSourceString<mlir::ModuleOp>(text, &compilerContext->context);
   if (!sourceModule)
     return false;
 
-  mlir::PassManager passManager(&compilerContext->context);
-  passManager.addPass(mlir::vernon::createVernonValidatePass());
-  passManager.addPass(std::make_unique<InlineVernonHelpersPass>());
-  if (mlir::failed(passManager.run(*sourceModule)))
+  mlir::PassManager metadataPassManager(&compilerContext->context);
+  mlir::vernon::buildVernonCpuPreparationPipeline(metadataPassManager);
+  if (mlir::failed(metadataPassManager.run(*sourceModule)))
+    return false;
+
+  std::vector<vernon::CpuAbiWrapperMetadata> entries;
+  if (!captureCpuAbiMetadata(*sourceModule, entries, result.diagnostics))
     return false;
 
   auto targetMachine = llvm::orc::JITTargetMachineBuilder::detectHost();
@@ -1565,6 +761,7 @@ bool compileCpu(VernonCompilerContext *compilerContext, const char *source,
     result.diagnostics = llvm::toString(dataLayout.takeError());
     return false;
   }
+  std::string targetTriple = targetMachine->getTargetTriple().str();
   auto jit = llvm::orc::LLJITBuilder()
                  .setJITTargetMachineBuilder(std::move(*targetMachine))
                  .setDataLayout(*dataLayout)
@@ -1574,38 +771,61 @@ bool compileCpu(VernonCompilerContext *compilerContext, const char *source,
     return false;
   }
 
-  auto llvmContext = std::make_unique<llvm::LLVMContext>();
-  auto llvmModule = std::make_unique<llvm::Module>("vernon_cpu", *llvmContext);
-  llvmModule->setDataLayout(*dataLayout);
-  llvmModule->setTargetTriple((*jit)->getTargetTriple());
-  CpuLLVMEmitter emitter(*llvmModule);
-  llvm::Expected<std::string> llvmIR = emitter.emit(*sourceModule);
-  if (!llvmIR) {
-    result.diagnostics = llvm::toString(llvmIR.takeError());
+  sourceModule->getOperation()->setAttr(
+      mlir::LLVM::LLVMDialect::getDataLayoutAttrName(),
+      mlir::StringAttr::get(&compilerContext->context,
+                            dataLayout->getStringRepresentation()));
+  sourceModule->getOperation()->setAttr(
+      mlir::LLVM::LLVMDialect::getTargetTripleAttrName(),
+      mlir::StringAttr::get(&compilerContext->context, targetTriple));
+  mlir::PassManager passManager(&compilerContext->context);
+  mlir::vernon::buildVernonCpuLoweringPipeline(passManager);
+  if (mlir::failed(passManager.run(*sourceModule)))
     return false;
+
+  auto llvmContext = std::make_unique<llvm::LLVMContext>();
+  std::unique_ptr<llvm::Module> llvmModule =
+      mlir::translateModuleToLLVMIR(*sourceModule, *llvmContext);
+  if (!llvmModule) {
+    result.diagnostics = "failed to translate lowered CPU MLIR to LLVM IR";
+    return false;
+  }
+  llvmModule->setDataLayout(*dataLayout);
+  llvmModule->setTargetTriple(llvm::Triple(targetTriple));
+  if (llvm::Error error = vernon::defineCpuTextureSampleHelper(*llvmModule)) {
+    result.diagnostics = llvm::toString(std::move(error));
+    return false;
+  }
+  for (const vernon::CpuAbiWrapperMetadata &entry : entries) {
+    if (llvm::Error error = vernon::emitCpuAbiWrapper(*llvmModule, entry)) {
+      result.diagnostics = llvm::toString(std::move(error));
+      return false;
+    }
   }
   if (llvm::verifyModule(*llvmModule, &llvm::errs())) {
     result.diagnostics = "generated CPU LLVM IR failed verification";
     return false;
   }
-  std::vector<std::string> entryNames(emitter.getEntryNames().begin(),
-                                      emitter.getEntryNames().end());
+  std::string llvmIR;
+  llvm::raw_string_ostream llvmIRStream(llvmIR);
+  llvmModule->print(llvmIRStream, nullptr);
   if (llvm::Error error = (*jit)->addIRModule(llvm::orc::ThreadSafeModule(
           std::move(llvmModule), std::move(llvmContext)))) {
     result.diagnostics = llvm::toString(std::move(error));
     return false;
   }
-  for (const std::string &entryName : entryNames) {
-    auto symbol = (*jit)->lookup("__vernon_cpu_" + entryName);
+  for (const vernon::CpuAbiWrapperMetadata &entry : entries) {
+    auto symbol = (*jit)->lookup(entry.exportedWrapperSymbol);
     if (!symbol) {
       result.diagnostics = llvm::toString(symbol.takeError());
       return false;
     }
-    result.cpuEntries.emplace(entryName, symbol->toPtr<VernonCpuEntryPoint>());
+    result.cpuEntries.emplace(entry.internalFunctionSymbol,
+                              symbol->toPtr<VernonCpuEntryPoint>());
   }
   result.artifacts.clear();
   result.artifacts.push_back(
-      VernonCompileResult::Artifact{"module.ll", std::move(*llvmIR)});
+      VernonCompileResult::Artifact{"module.ll", std::move(llvmIR)});
   if (!setCpuReflectionSymbols(result)) {
     result.diagnostics = "compiler produced invalid CPU reflection metadata";
     return false;

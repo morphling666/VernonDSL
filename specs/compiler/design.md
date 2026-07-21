@@ -55,15 +55,25 @@ artifact generation pipeline is registered. An IR-only prototype must return
 
 ## CPU resource ABI
 
-CPU shader execution will receive plain ABI input/output structures plus an
+CPU shader execution receives plain ABI input/output structures plus an
 explicit callback table for texture sampling and queries. It executes shader
 entry functions for reference testing; it is not a software rasterizer.
 
-CPU structured control flow is emitted directly from SCF. `scf.if` results use
-merge-block phi nodes; `scf.while` loop-carried scalar and fixed-vector values
-use header phis with explicit preheader and backedge inputs. This keeps the CPU
-reference path independent of the GPU lowering pipelines while preserving MLIR
-SSA semantics.
+CPU kernel bodies lower through the registered in-process
+`vernon-cpu-pipeline`: Vernon value tensors become unrestricted static MLIR
+vectors, resources become memrefs or integer handles, SCF becomes control
+flow, and the standard MLIR conversion interfaces produce LLVM dialect IR.
+`translateModuleToLLVMIR` then creates the host LLVM module. This avoids a
+second hand-written implementation of arithmetic, vector, math, and SCF
+semantics.
+
+The external `__vernon_cpu_<entry>` ABI remains a dedicated LLVM-only host
+component. It validates `VernonCpuInvocation`, unpacks direct values, constructs
+the five internal rank-one memref arguments from each packed raw buffer pointer
+(zero offset, captured static extent or zero, unit stride), and appends the
+texture callback table. The private texture helper owns callback-table layout
+knowledge; generic Vernon conversion patterns do not. Internal entry functions
+and memref descriptors are never exported.
 
 ## Target routing invariant
 
@@ -143,30 +153,22 @@ outputs, and builtins remain untouched to avoid same-stage identifier
 collisions. This preserves location-based DSL semantics without requiring
 GLSL 4.30 explicit varying-location qualifiers.
 
-## Next implementation session
-
-Make compiler code and reflection a single runtime-consumable shader bundle:
+## Asset integration status and remaining work
 
 Shader variant authoring, stage composition, cooking, and asset integration are
 specified in [shader_variant_asset_plan.md](shader_variant_asset_plan.md).
+Reflection artifact tables, schema-2 cooked bundles, exact variant keys,
+dependency-based invalidation, and Vernon's `CompiledShaderBundle` loading path
+are implemented.
 
-1. Extend reflection with an artifact table mapping entry point, stage, target,
-   format, and artifact filename. Do not infer stage pairing from filenames.
-2. Record each cross-compiled resource's exact generated block/uniform/member
-   name and layout alongside its DSL argument index, kind, set, and binding.
-3. Add a Vernon `CompiledShaderBundle` loader that validates reflection schema,
-   target, GLSL version, module hash, dependencies, and required vertex/fragment
-   artifacts before publishing a program.
-4. Implement OpenGL reflection binding. Inputs/outputs continue to use explicit
-   locations; uniforms use reflected UBO layouts and textures/samplers use a
-   deterministic `(set, binding)` to OpenGL binding-point mapping.
-5. Make materials provide typed values by `(set, binding)` instead of generated
-   GLSL names. Keep the existing named-uniform path for legacy shaders.
-6. Add shader variant keys and persistent cache invalidation from target,
-   requested GLSL version, feature set, module hash, and dependency hashes.
-7. Test bundle parsing and binding without a window where possible. GPU/GUI
-   shader tests must be run explicitly by the developer.
+The remaining asset work is reflected resource binding: record complete
+cross-compiled block/uniform/member layouts, bind OpenGL resources from that
+reflection, and let materials provide typed values by `(set, binding)` while
+retaining the named-uniform path for legacy shaders. Bundle parsing should
+remain testable without a window; GPU/GUI shader tests remain explicit
+developer runs.
 
-After bundle integration, remaining backend work includes CUDA shared-helper
-coverage, graphics/CPU control flow and texture coverage required by real
+Future backend and Engine integration work includes moving Vernon production
+materials and render passes onto cooked DSL assets, CUDA shared-helper
+coverage, graphics/CPU control-flow and texture coverage required by real
 materials, and DXC-to-DXIL artifact generation when DXC is available.

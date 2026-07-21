@@ -38,9 +38,9 @@ push-constant block ABI; descriptor-bound uniforms remain a later extension.
 Python exposes compiler services and all runtime backends through one `_native`
 module. The module links the compiler DLL and `VernonRuntime`; the runtime DLL
 itself retains its dependency boundary. Interactive GPU pipelines serialize
-the same bundle schema as the asset cooker. CPU interpreter examples remain
-compute-only because Vernon does not provide a software rasterizer; deployable
-CPU execution loads native AOT bundles.
+the same bundle schema as the asset cooker. CPU execution uses native AOT
+bundles and remains compute-only because Vernon does not provide a software
+rasterizer.
 
 ## Launch ownership
 

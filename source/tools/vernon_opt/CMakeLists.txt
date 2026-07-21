@@ -10,6 +10,9 @@ target_link_libraries(vernon-opt PRIVATE
   MLIRFuncDialect
   MLIRFuncInlinerExtension
   MLIRArithDialect
+  MLIRControlFlowDialect
+  MLIRIndexDialect
+  MLIRLLVMDialect
   MLIRTensorDialect
   MLIRVectorDialect
   MLIRLinalgDialect
@@ -20,6 +23,16 @@ target_link_libraries(vernon-opt PRIVATE
   MLIRSPIRVDialect
 
   # Passes
+  MLIRArithToLLVM
+  MLIRControlFlowToLLVM
+  MLIRConvertToLLVMPass
+  MLIRFuncToLLVM
+  MLIRIndexToLLVM
+  MLIRMathToLLVM
+  MLIRMemRefToLLVM
+  MLIRSCFToControlFlow
+  MLIRUBToLLVM
+  MLIRVectorToLLVM
   MLIRTransforms
   MLIRBufferizationTransforms
   MLIRLinalgTransforms
@@ -30,6 +43,7 @@ target_link_libraries(vernon-opt PRIVATE
   MLIRIR
   MLIRPass
   MLIRParser
+  MLIRRegisterAllExtensions
   MLIRSupport
   MLIROptLib
 )

@@ -1,14 +1,29 @@
 from __future__ import annotations
 
+import importlib.util
 import os
 import unittest
+from pathlib import Path
+from types import ModuleType
 from typing import Annotated
 from unittest import mock
 
 import numpy as np
 
 import vernon_dsl as vd
-import fractal
+
+
+def _load_fractal() -> ModuleType:
+    path = Path(__file__).resolve().parents[2] / "fractal.py"
+    spec = importlib.util.spec_from_file_location("vernon_test_fractal", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load test module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+fractal = _load_fractal()
 
 
 @vd.kernel(workgroup_size=(4, 2, 1))

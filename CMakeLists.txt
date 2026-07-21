@@ -31,7 +31,7 @@ if(VERNON_ENABLE_VULKAN_RUNTIME AND VERNON_ENABLE_RUNTIME)
   include(FetchContent)
   FetchContent_Declare(vulkan_headers
     GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
-    GIT_TAG main
+    GIT_TAG v1.4.357
     GIT_SHALLOW TRUE
   )
   FetchContent_MakeAvailable(vulkan_headers)
@@ -47,7 +47,7 @@ if(VERNON_ENABLE_SPIRV_CROSS)
   set(SPIRV_CROSS_ENABLE_C_API OFF CACHE BOOL "" FORCE)
   FetchContent_Declare(spirv_cross
     GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Cross.git
-    GIT_TAG main
+    GIT_TAG vulkan-sdk-1.4.350.1
     GIT_SHALLOW TRUE
   )
   FetchContent_GetProperties(spirv_cross)
@@ -69,7 +69,8 @@ if(VERNON_ENABLE_SPIRV_CROSS)
     )
   endif()
 endif()
-set(MLIR_DIR ${CMAKE_CURRENT_SOURCE_DIR}/llvm-project/install/lib/cmake/mlir)
+set(MLIR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/llvm-project/install/lib/cmake/mlir"
+  CACHE PATH "Directory containing MLIRConfig.cmake")
 # Find MLIR
 find_package(MLIR REQUIRED CONFIG)
 

@@ -71,12 +71,37 @@ int main(void) {
       "    return %score : f32\n"
       "  }\n"
       "}\n";
+  static const char cpu_large_vector_module[] =
+      "module {\n"
+      "  func.func @add_large(%left: tensor<20xf32> "
+      "{vernon.interface = \"input\", vernon.location = 0 : i64}, "
+      "%right: tensor<20xf32> "
+      "{vernon.interface = \"input\", vernon.location = 1 : i64}) -> "
+      "(tensor<20xf32> {vernon.interface = \"output\", "
+      "vernon.location = 0 : i64}) attributes "
+      "{vernon.entry, vernon.stage = \"fragment\"} {\n"
+      "    %sum = arith.addf %left, %right : tensor<20xf32>\n"
+      "    return %sum : tensor<20xf32>\n"
+      "  }\n"
+      "}\n";
+  static const char cpu_unknown_intrinsic_module[] =
+      "module {\n"
+      "  func.func @unknown_cpu(%value: f32 "
+      "{vernon.interface = \"input\", vernon.location = 0 : i64}) -> "
+      "(f32 {vernon.interface = \"output\", "
+      "vernon.location = 0 : i64}) attributes "
+      "{vernon.entry, vernon.stage = \"fragment\"} {\n"
+      "    %result = \"vernon.intrinsic\"(%value) "
+      "{name = \"not_a_cpu_intrinsic\"} : (f32) -> f32\n"
+      "    return %result : f32\n"
+      "  }\n"
+      "}\n";
   static const char cpu_compute_module[] =
       "module {\n"
       "  func.func @increment("
       "%values: !vernon.buffer<f32, \"read_write\"> "
       "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
-      "vernon.binding = 0 : i64}, "
+      "vernon.binding = 0 : i64, vernon.tensor_shape = array<i64: 3>}, "
       "%id: index {vernon.interface = \"input\", "
       "vernon.builtin = \"global_invocation_id\"}) attributes {vernon.entry, "
       "vernon.stage = \"compute\", "
@@ -400,6 +425,8 @@ int main(void) {
       context, cpu_module, strlen(cpu_module), VERNON_TARGET_CPU);
   assert(cpu_compile != NULL);
   assert(vernonCompileResultGetStatus(cpu_compile) == VERNON_STATUS_OK);
+  assert(view_contains(vernonCompileResultGetArtifactData(cpu_compile, 0),
+                       "__vernon_cpu_add_vectors"));
   VernonCpuEntryPoint add_vectors =
       vernonCompileResultGetCpuEntry(cpu_compile, "add_vectors", 11);
   assert(add_vectors != NULL);
@@ -412,7 +439,51 @@ int main(void) {
   assert(cpu_results[2] == 10.0f && cpu_results[3] == 12.0f);
   invocation.arguments_size = 0;
   assert(add_vectors(&invocation) == VERNON_STATUS_INVALID_ARGUMENT);
+  invocation.arguments_size = sizeof(cpu_arguments);
+  invocation.results_size = 0;
+  assert(add_vectors(&invocation) == VERNON_STATUS_INVALID_ARGUMENT);
+  invocation.results_size = sizeof(cpu_results);
+  invocation.results = NULL;
+  assert(add_vectors(&invocation) == VERNON_STATUS_INVALID_ARGUMENT);
+  assert(add_vectors(NULL) == VERNON_STATUS_INVALID_ARGUMENT);
   vernonCompileResultDestroy(cpu_compile);
+
+  VernonCompileResult *cpu_large_compile = vernonCompilerCompileMlir(
+      context, cpu_large_vector_module, strlen(cpu_large_vector_module),
+      VERNON_TARGET_CPU);
+  assert(cpu_large_compile != NULL);
+  if (vernonCompileResultGetStatus(cpu_large_compile) != VERNON_STATUS_OK) {
+    VernonStringView diagnostics =
+        vernonCompileResultGetDiagnostics(cpu_large_compile);
+    fprintf(stderr, "%.*s\n", (int)diagnostics.size, diagnostics.data);
+  }
+  assert(vernonCompileResultGetStatus(cpu_large_compile) == VERNON_STATUS_OK);
+  VernonCpuEntryPoint add_large =
+      vernonCompileResultGetCpuEntry(cpu_large_compile, "add_large", 9);
+  assert(add_large != NULL);
+  float large_arguments[40];
+  float large_results[20] = {0};
+  for (size_t index = 0; index < 20; ++index) {
+    large_arguments[index] = (float)index;
+    large_arguments[index + 20] = 2.0f;
+  }
+  VernonCpuInvocation large_invocation = {
+      large_arguments, sizeof(large_arguments), large_results,
+      sizeof(large_results), NULL};
+  assert(add_large(&large_invocation) == VERNON_STATUS_OK);
+  assert(large_results[0] == 2.0f && large_results[19] == 21.0f);
+  vernonCompileResultDestroy(cpu_large_compile);
+
+  VernonCompileResult *cpu_unknown_compile = vernonCompilerCompileMlir(
+      context, cpu_unknown_intrinsic_module,
+      strlen(cpu_unknown_intrinsic_module), VERNON_TARGET_CPU);
+  assert(cpu_unknown_compile != NULL);
+  assert(vernonCompileResultGetStatus(cpu_unknown_compile) != VERNON_STATUS_OK);
+  assert(view_contains(vernonCompileResultGetDiagnostics(cpu_unknown_compile),
+                       "not_a_cpu_intrinsic"));
+  assert(view_contains(vernonCompileResultGetDiagnostics(cpu_unknown_compile),
+                       "unknown_cpu"));
+  vernonCompileResultDestroy(cpu_unknown_compile);
 
   VernonCompileResult *cpu_intrinsic_compile = vernonCompilerCompileMlir(
       context, cpu_intrinsic_module, strlen(cpu_intrinsic_module),
@@ -451,6 +522,24 @@ int main(void) {
   assert(compute_values[0] == 2.0f && compute_values[1] == 5.0f &&
          compute_values[2] == 6.0f);
   vernonCompileResultDestroy(cpu_compute_compile);
+
+  VernonCompileResult *cpu_scf_compile = vernonCompilerCompileMlir(
+      context, cuda_while_module, strlen(cuda_while_module), VERNON_TARGET_CPU);
+  assert(cpu_scf_compile != NULL);
+  assert(vernonCompileResultGetStatus(cpu_scf_compile) == VERNON_STATUS_OK);
+  VernonCpuEntryPoint loop =
+      vernonCompileResultGetCpuEntry(cpu_scf_compile, "loop", 4);
+  assert(loop != NULL);
+  float loop_values[1] = {0.0f};
+  struct {
+    float *values;
+    float phase;
+  } loop_arguments = {loop_values, 0.0f};
+  VernonCpuInvocation loop_invocation = {&loop_arguments,
+                                         sizeof(loop_arguments), NULL, 0, NULL};
+  assert(loop(&loop_invocation) == VERNON_STATUS_OK);
+  assert(loop_values[0] == 4.0f);
+  vernonCompileResultDestroy(cpu_scf_compile);
 
   VernonCompileResult *cpu_texture_compile =
       vernonCompilerCompileMlir(context, cpu_texture_module,

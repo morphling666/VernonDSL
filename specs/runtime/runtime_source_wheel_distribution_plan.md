@@ -1,5 +1,8 @@
 # Runtime Source-in-Wheel Distribution Plan
 
+Status: proposed; not started. This is a future packaging and Vernon Engine
+integration design, not a description of the current setuptools package.
+
 ## Goal
 
 Ship the version-matched `VernonRuntime` source tree inside the VernonDSL

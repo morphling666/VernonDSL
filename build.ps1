@@ -1,50 +1,40 @@
-# Build script for Vernon DSL
+param(
+    [string]$BuildDirectory = "build",
+    [string]$Configuration = "Release",
+    [string]$MlirDirectory = "",
+    [switch]$SkipTests
+)
 
-# Check if we're in the right directory
-if (-not (Test-Path "CMakeLists.txt")) {
-    Write-Host "Error: CMakeLists.txt not found. Please run this script from the project root."
-    exit 1
+$ErrorActionPreference = "Stop"
+if (-not (Test-Path (Join-Path $PSScriptRoot "CMakeLists.txt"))) {
+    throw "CMakeLists.txt not found next to build.ps1."
 }
 
-# Check if MLIR is installed
-$mlirDir = "llvm-project\install\lib\cmake\mlir"
-if (-not (Test-Path $mlirDir)) {
-    Write-Host "Error: MLIR not found at $mlirDir"
-    Write-Host "Please build and install MLIR first:"
-    Write-Host "  cd llvm-project"
-    Write-Host "  mkdir build"
-    Write-Host "  cd build"
-    Write-Host "  cmake ..\llvm -DLLVM_ENABLE_PROJECTS=`"mlir`" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=..\install"
-    Write-Host "  cmake --build . --target install"
-    exit 1
+if (-not $MlirDirectory) {
+    $MlirDirectory = Join-Path $PSScriptRoot "llvm-project\install\lib\cmake\mlir"
+}
+if (-not (Test-Path (Join-Path $MlirDirectory "MLIRConfig.cmake"))) {
+    throw "MLIRConfig.cmake not found under '$MlirDirectory'. Pass -MlirDirectory explicitly."
 }
 
-# Create build directory if it doesn't exist
-if (-not (Test-Path "build")) {
-    New-Item -ItemType Directory -Path "build" | Out-Null
-    Write-Host "Created build directory"
+$buildPath = Join-Path $PSScriptRoot $BuildDirectory
+$cmakeArguments = @(
+    "-S", $PSScriptRoot,
+    "-B", $buildPath,
+    "-DMLIR_DIR=$MlirDirectory",
+    "-DCMAKE_BUILD_TYPE=$Configuration"
+)
+$venvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+if (Test-Path $venvPython) {
+    $cmakeArguments += "-DPython_EXECUTABLE=$venvPython"
 }
+cmake @cmakeArguments
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-# Configure and build
-Set-Location build
+cmake --build $buildPath --config $Configuration --parallel
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-Write-Host "Configuring CMake..."
-cmake .. -DMLIR_DIR="$PSScriptRoot\llvm-project\install\lib\cmake\mlir"
-
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "Building..."
-    cmake --build . --target MLIRVernonDialect
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "Build successful!"
-    } else {
-        Write-Host "Build failed!"
-        Set-Location ..
-        exit 1
-    }
-} else {
-    Write-Host "CMake configuration failed!"
-    Set-Location ..
-    exit 1
+if (-not $SkipTests) {
+    ctest --test-dir $buildPath -C $Configuration --output-on-failure
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
-
-Set-Location ..

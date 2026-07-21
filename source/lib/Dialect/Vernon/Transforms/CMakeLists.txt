@@ -1,6 +1,11 @@
 add_mlir_library(MLIRVernonTransforms
+  VernonCpuPipeline.cpp
+  VernonInlineHelpers.cpp
+  VernonLowerCPUResources.cpp
+  VernonLowerCPUTensors.cpp
   VernonLowerCUDAMath.cpp
   VernonLowerGPUTensors.cpp
+  VernonSharedValuePatterns.cpp
   VernonValidation.cpp
   VernonToGPU.cpp
   VernonToSpirv.cpp
@@ -12,17 +17,29 @@ add_mlir_library(MLIRVernonTransforms
   MLIRSPIRVUtils
 
   LINK_LIBS PUBLIC
+  MLIRArithToLLVM
   MLIRArithDialect
+  MLIRControlFlowDialect
+  MLIRControlFlowToLLVM
+  MLIRConvertToLLVMPass
   MLIRFuncDialect
+  MLIRFuncToLLVM
   MLIRGPUDialect
+  MLIRIndexDialect
+  MLIRIndexToLLVM
   MLIRLLVMDialect
+  MLIRMathToLLVM
   MLIRMathDialect
+  MLIRMemRefToLLVM
   MLIRMemRefDialect
+  MLIRSCFToControlFlow
   MLIRSCFDialect
   MLIRSCFTransforms
   MLIRVernonDialect
   MLIRSPIRVDialect
   MLIRTensorDialect
+  MLIRUBToLLVM
+  MLIRVectorToLLVM
   MLIRVectorDialect
   MLIRIR
   MLIRPass

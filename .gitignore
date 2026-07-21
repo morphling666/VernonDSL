@@ -1,4 +1,10 @@
 *.pyc
 *build/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 .cache/
 .vscode/
