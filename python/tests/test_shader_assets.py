@@ -488,7 +488,7 @@ asset = vd.pipeline_asset(
                         manifest_path.read_text(encoding="utf-8"))
                     self.assertEqual(document["schema_version"], 2)
                     self.assertEqual(document["type"], "pipeline")
-                    self.assertEqual(document["invocation_abi_version"], 1)
+                    self.assertEqual(document["invocation_abi_version"], 3)
                     self.assertFalse((output / "pipeline.bundle").exists())
                     descriptors = [
                         value["artifact"]
@@ -603,7 +603,7 @@ asset = vd.pipeline_asset(
             runtime_bundle = bundle
             self.assertEqual(runtime_bundle["schema_version"], 2)
             self.assertEqual(runtime_bundle["type"], "pipeline")
-            self.assertEqual(runtime_bundle["invocation_abi_version"], 1)
+            self.assertEqual(runtime_bundle["invocation_abi_version"], 3)
             self.assertEqual(runtime_bundle["id"], "shaders/variant_mesh")
             self.assertEqual(len(runtime_bundle["variants"]), 4)
             combined_runtime = next(variant

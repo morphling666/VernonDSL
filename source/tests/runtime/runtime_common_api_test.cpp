@@ -20,7 +20,7 @@ TEST(RuntimeCommonApi, InitializesOptionsAndReportsErrors) {
   EXPECT_EQ(bundleOptions.reserved[0], 0);
   EXPECT_EQ(invocation.arguments, nullptr);
   EXPECT_EQ(invocation.arguments_size, 0);
-  EXPECT_EQ(VERNON_PIPELINE_INVOCATION_ABI_VERSION, 1);
+  EXPECT_EQ(VERNON_PIPELINE_INVOCATION_ABI_VERSION, 3);
 
   const VernonRuntimeCapabilities capabilities =
       vernonRuntimeGetCapabilities(VERNON_RUNTIME_CPU);

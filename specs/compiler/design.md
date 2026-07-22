@@ -198,6 +198,12 @@ their source names; module-wide SPIR-V symbol collisions receive a deterministic
 stage suffix. This preserves location-based linkage without discarding author
 names or requiring GLSL 4.30 varying-location qualifiers.
 
+Unbound graphics uniforms use target-specific SPIR-V interfaces. Vulkan packs
+them into one aligned push-constant block per stage, while OpenGL, OpenGL ES,
+and Metal represent each value as a separately named `UniformConstant` so
+SPIRV-Cross preserves plain source-level uniforms. Explicitly descriptor-bound
+uniforms remain `Uniform` blocks.
+
 Value-yielding graphics `scf.if` lowers to a structured SPIR-V selection with
 explicit header, branch, and merge blocks. Function-local result slots carry
 yielded values across the merge, matching MLIR's standard SCF-to-SPIR-V
@@ -219,6 +225,31 @@ combined-image descriptor. The current SPIR-V representation stores the
 sampled image at the texture binding and does not dynamically select a sampler;
 therefore one texture binding reaching multiple sampler entry arguments is
 rejected during reflection.
+
+### Generated graphics inputs
+
+Parameterless graphics builtins are source-level intrinsics but become
+generated entry inputs, so stage validation and SPIR-V interface lowering use
+the same path as explicitly annotated inputs. Generated inputs carry
+`vernon.implicit` metadata and deterministic source names. `resolution()` is a
+generated viewport uniform; fragment/vertex hardware values use SPIR-V builtin
+decorations.
+
+Raw `builtin(...)` annotations use the same closed stage/direction/type
+contracts as generated inputs. In particular, graphics IDs are `u32`,
+fragment coordinates and vertex position are `vec4[f32]`, and compute IDs are
+`vec3[u32]`; unknown builtin spellings are rejected by the frontend.
+
+An implicit `texture_sample` receives a generated sampler resource at a free
+descriptor binding. The normal sampled-resource provenance analysis still
+associates it with the sampled texture binding, preserving the explicit
+sampler ABI and reflection model.
+
+`texture_size` is a native image query and never creates an external parameter.
+The pinned MLIR SPIR-V dialect lacks `OpImageQuerySizeLod`, so lowering emits a
+verified `spirv.Image` plus adjacent scalar/vector marker operations and the
+compiler materializes `OpImageQuerySizeLod` in the serialized binary.
+SPIRV-Cross therefore receives the target instruction and emits `textureSize`.
 
 ## Asset integration status and remaining work
 

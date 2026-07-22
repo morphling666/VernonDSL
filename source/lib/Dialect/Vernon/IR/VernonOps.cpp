@@ -117,21 +117,17 @@ LogicalResult SwizzleOp::verify() {
 LogicalResult IntrinsicOp::verify() {
   if (getNameAttr().getValue().empty())
     return emitOpError("requires a non-empty intrinsic name");
-  if (getName() != "texture_sample")
+  if (getName() != "texture_sample" && getName() != "texture_size")
     return success();
 
-  if (getNumOperands() != 3)
-    return emitOpError(
-        "texture_sample requires exactly three operands: texture, sampler, "
-        "and coordinates");
   if (getNumResults() != 1)
-    return emitOpError("texture_sample requires exactly one result");
+    return emitOpError() << getName() << " requires exactly one result";
+  if (getNumOperands() == 0)
+    return emitOpError() << getName() << " requires a texture operand";
 
   auto texture = dyn_cast<TextureType>(getOperand(0).getType());
   if (!texture)
-    return emitOpError("texture_sample operand #0 must be a Vernon texture");
-  if (!isa<SamplerType>(getOperand(1).getType()))
-    return emitOpError("texture_sample operand #1 must be a Vernon sampler");
+    return emitOpError() << getName() << " operand #0 must be a Vernon texture";
 
   auto shapedWidthAndElement =
       [](Type type) -> std::optional<std::pair<int64_t, Type>> {
@@ -150,6 +146,29 @@ LogicalResult IntrinsicOp::verify() {
     return std::nullopt;
   };
 
+  if (getName() == "texture_size") {
+    if (getNumOperands() < 1 || getNumOperands() > 2)
+      return emitOpError(
+          "texture_size requires a texture and an optional integer lod");
+    if (getNumOperands() == 2 && !getOperand(1).getType().isSignlessInteger(32))
+      return emitOpError("texture_size lod must be a 32-bit integer scalar");
+    const int64_t expectedResultWidth = texture.getDimension() == "3d" ? 3 : 2;
+    auto result = shapedWidthAndElement(getResult().getType());
+    if (!result || result->first != expectedResultWidth ||
+        !result->second.isSignlessInteger(32))
+      return emitOpError()
+             << "texture_size result must be a statically sized rank-one "
+             << expectedResultWidth << "-component i32 tensor or vector";
+    return success();
+  }
+
+  if (getNumOperands() < 3 || getNumOperands() > 4)
+    return emitOpError(
+        "texture_sample requires texture, sampler, coordinates, and optional "
+        "lod");
+  if (!isa<SamplerType>(getOperand(1).getType()))
+    return emitOpError("texture_sample operand #1 must be a Vernon sampler");
+
   std::optional<std::pair<int64_t, Type>> coordinates =
       shapedWidthAndElement(getOperand(2).getType());
   const int64_t expectedCoordinateWidth =
@@ -161,6 +180,9 @@ LogicalResult IntrinsicOp::verify() {
            << "texture_sample operand #2 must be a statically sized rank-one "
            << expectedCoordinateWidth << "-component "
            << texture.getElementType() << " tensor or vector";
+  if (getNumOperands() == 4 && !isa<FloatType>(getOperand(3).getType()))
+    return emitOpError(
+        "texture_sample operand #3 lod must be a floating-point scalar");
 
   std::optional<std::pair<int64_t, Type>> result =
       shapedWidthAndElement(getResult().getType());

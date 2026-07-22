@@ -45,6 +45,8 @@ bool VulkanDriver::loadInstance(VkInstance instance) {
                               "vkEnumeratePhysicalDevices");
   VERNON_LOAD_VULKAN_INSTANCE(getPhysicalDeviceQueueFamilyProperties,
                               "vkGetPhysicalDeviceQueueFamilyProperties");
+  VERNON_LOAD_VULKAN_INSTANCE(getPhysicalDeviceProperties,
+                              "vkGetPhysicalDeviceProperties");
   VERNON_LOAD_VULKAN_INSTANCE(getPhysicalDeviceMemoryProperties,
                               "vkGetPhysicalDeviceMemoryProperties");
   VERNON_LOAD_VULKAN_INSTANCE(getPhysicalDeviceFormatProperties,

@@ -150,11 +150,35 @@ if(VERNON_ENABLE_RUNTIME)
     )
     add_custom_target(vernon-vulkan-pipeline-test-bundle
       DEPENDS "${vulkan_pipeline_test_manifest}")
+    set(vulkan_cube_map_test_dir
+      "${VERNON_TEST_BINARY_ROOT}/vulkan_cube_map_bundle")
+    set(vulkan_cube_map_test_manifest
+      "${vulkan_cube_map_test_dir}/vulkan_cube_map_bundle.pipeline.json")
+    add_custom_command(
+      OUTPUT "${vulkan_cube_map_test_manifest}"
+      COMMAND ${CMAKE_COMMAND} -E env
+        "PYTHONPATH=${PROJECT_SOURCE_DIR}/python"
+        ${Python_EXECUTABLE} -m vernon_dsl.shader_asset_cli
+        "${PROJECT_SOURCE_DIR}/python/tests/cube_map_shader.py:cube_map_asset"
+        --target vulkan
+        --output "${vulkan_cube_map_test_dir}"
+      DEPENDS vernon-dsl-native
+        "${PROJECT_SOURCE_DIR}/python/tests/cube_map_shader.py"
+        "${PROJECT_SOURCE_DIR}/python/vernon_dsl/pipeline_compile.py"
+        "${PROJECT_SOURCE_DIR}/python/vernon_dsl/shader_assets.py"
+      VERBATIM
+    )
+    add_custom_target(vernon-vulkan-cube-map-test-bundle
+      DEPENDS "${vulkan_cube_map_test_manifest}")
     target_sources(VernonRuntimeTests PRIVATE
-      runtime/runtime_vulkan_pipeline_test.cpp)
+      runtime/runtime_vulkan_pipeline_test.cpp
+      runtime/runtime_vulkan_cube_map_test.cpp)
     target_compile_definitions(VernonRuntimeTests PRIVATE
-      VERNON_VULKAN_PIPELINE_BUNDLE="${vulkan_pipeline_test_manifest}")
-    add_dependencies(VernonRuntimeTests vernon-vulkan-pipeline-test-bundle)
+      VERNON_VULKAN_PIPELINE_BUNDLE="${vulkan_pipeline_test_manifest}"
+      VERNON_VULKAN_CUBE_MAP_BUNDLE="${vulkan_cube_map_test_manifest}")
+    add_dependencies(VernonRuntimeTests
+      vernon-vulkan-pipeline-test-bundle
+      vernon-vulkan-cube-map-test-bundle)
   endif()
 
   vernon_discover_gtests(VernonRuntimeTests)

@@ -42,7 +42,10 @@ favors correct layout specialization; a later cache can key the same state
 without changing the bundle ABI. RGBA8 offscreen images use optimal tiling and
 staging buffers for host upload/readback. Unbound graphics uniforms use the
 compiler's single push-constant block ABI; descriptor-bound uniforms remain a
-later extension.
+later extension. Block members follow source argument order with Vulkan
+scalar/vector/matrix alignment, and Runtime reproduces that layout from
+reflection before checking the device's `maxPushConstantsSize`. One-mip RGBA8
+Cube uploads store tightly packed faces in `+X, -X, +Y, -Y, +Z, -Z` order.
 
 ## Python native module
 
@@ -117,6 +120,18 @@ Each backend accepts only pipeline bundles compiled for its matching GLSL
 profile. Compute requires OpenGL 4.3 or OpenGL ES 3.1 and binds reflected
 storage buffers before issuing a shader-storage barrier. Graphics imports host
 buffer and texture handles, so resources remain owned by the host context.
+Pipeline ABI v3 represents every numeric argument as one `VernonTensorView`.
+The storage discriminator selects borrowed host memory or a runtime-owned
+device buffer; shape and positive byte strides describe logical indexing, and
+byte offset/size bound every reachable element. Host pointers are borrowed only
+for the synchronous invocation. Device compute views remain contiguous
+whole-buffer views because the compute launch ABI has no offset/stride fields.
+
+OpenGL uploads native column-major matrices directly with `transpose=false`.
+Desktop OpenGL also uploads native row-major matrices directly with
+`transpose=true`; OpenGL ES and arbitrary strided layouts are packed into a
+small column-major scratch because GLES requires `transpose=false`. Vulkan
+push constants are packed by logical indices and Tensor strides.
 
 ## Tensor indexing
 
@@ -158,10 +173,40 @@ iteration order. Feature specialization runs before the vertex/fragment
 interfaces are merged and validated, making the specialized reflection the
 only runtime binding contract.
 
-Pipeline invocation ABI version 1 carries index bindings, color attachments,
+Pipeline invocation ABI version 3 carries index bindings, color attachments,
 topology, viewport, scissor, compute grid, and reflected argument slots.
 Backend-specific command encoding consumes this common invocation without
 exposing legacy program/draw entry points.
+
+## Compiler-generated graphics values
+
+Compiler reflection marks generated entry arguments with
+`vernon.implicit`. An implicit sampler carries
+`vernon.implicit = "sampler"` and `vernon.implicit_texture = <source name>`;
+its existing `sampled_texture_bindings` relation identifies every concrete
+texture descriptor it samples. A generated resolution argument carries
+`vernon.implicit = "resolution"` and has type `tensor<2xf32>`.
+
+The schema-2 cooker removes these arguments from the external `parameters`
+table and records them in `internal_parameters`. Each internal record has
+`source: "implicit_sampler"` or `source: "system_value"`; resolution also has
+`system_value: "resolution"`. Stage uses retain concrete uniform names,
+argument indices, descriptor set/binding values, and sampled-texture
+relations. This is the backend ABI: public parameter enumeration and
+invocation slots expose only source parameters.
+
+An explicitly declared sampler is not compiler-generated and remains an
+external sampler slot, overriding implicit sampler generation.
+`VernonTextureView.sampler` optionally supplies the policy for an implicit
+sampler and must belong to the pipeline context. OpenGL binds that sampler
+object, while Vulkan combines it with the reflected texture descriptor. A null
+field uses the backend runtime default: OpenGL sampler object zero or a
+transient Vulkan linear/repeat sampler. Explicit sampler parameters ignore the
+texture-view field.
+The runtime supplies resolution as `(width, height)` from a non-empty
+invocation viewport, falling back to the common color-attachment extent.
+Generated resolution is an OpenGL uniform or a Vulkan push constant according
+to its reflected stage use.
 
 ## Shared definitions and struct methods
 

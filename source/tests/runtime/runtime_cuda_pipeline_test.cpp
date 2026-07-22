@@ -1,4 +1,7 @@
+#include "runtime/content_hash.h"
 #include "vernon-c/Runtime.h"
+
+#include <nlohmann/json.hpp>
 
 #include <cstdio>
 #include <cstring>
@@ -66,15 +69,15 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
       ]
     }]
   })";
-  const std::string bundle =
-      R"({"pipeline_bundle_schema_version":1,"invocation_abi_version":1,)"
+  std::string bundle =
+      R"({"pipeline_bundle_schema_version":1,"invocation_abi_version":3,)"
       R"("type":"vernon_pipeline_bundle","id":"cuda/scale","target":"cuda",)"
       R"("features":[],"variants":[{"key":[],"parameters":[)"
       R"({"slot":0,"name":"output","kind":"tensor","dtype":"f32",)"
       R"("shape":[4],"access":"write","uses":[{"stage":"compute",)"
       R"("entry":"scale","index":0,"kind":"tensor","dtype":"f32",)"
       R"("shape":[4],"interface":"storage","access":"write"}]},)"
-      R"({"slot":1,"name":"factor","kind":"inline","dtype":"f32",)"
+      R"({"slot":1,"name":"factor","kind":"tensor","dtype":"f32",)"
       R"("shape":[],"access":"read","uses":[{"stage":"compute",)"
       R"("entry":"scale","index":1,"kind":"scalar","dtype":"f32",)"
       R"("shape":[],"interface":"value","access":"read"}]})"
@@ -84,6 +87,29 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
       R"("stage_artifacts":{"scale":{"id":"scale","entry":"scale",)"
       R"("stage":"compute","target":"cuda","format":"ptx","source":)" +
       jsonString(ptx) + R"(,"reflection":)" + reflection + "}}}";
+  nlohmann::json schema2 = nlohmann::json::parse(bundle);
+  schema2.erase("pipeline_bundle_schema_version");
+  schema2["schema_version"] = 2;
+  schema2["type"] = "pipeline";
+  for (auto &[_, stage] : schema2["stage_artifacts"].items()) {
+    const std::string source = stage["source"].get<std::string>();
+    stage["target"] = "cuda";
+    stage["artifact"] = {
+        {"format", "ptx"},
+        {"storage", "inline"},
+        {"encoding", "utf8"},
+        {"data", source},
+        {"size", source.size()},
+        {"sha256", vernon::runtime::sha256Hex(source.data(), source.size())},
+    };
+    stage.erase("format");
+    stage.erase("source");
+  }
+  schema2.erase("content_hash");
+  std::string canonical = schema2.dump(-1, ' ', false);
+  schema2["content_hash"] =
+      vernon::runtime::sha256Hex(canonical.data(), canonical.size());
+  bundle = schema2.dump(-1, ' ', false);
 
   VernonRuntimeBackend target = VERNON_RUNTIME_CPU;
   ASSERT_TRUE(vernonRuntimePipelineBundleInspectTarget(
@@ -124,8 +150,7 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
   ASSERT_TRUE(vernonRuntimeLoadedPipelineFindParameter(
                   pipeline, {"factor", std::strlen("factor")}, &parameter) ==
               VERNON_STATUS_OK);
-  ASSERT_TRUE(parameter.slot == 1 &&
-              parameter.kind == VERNON_PIPELINE_INLINE_VALUE);
+  ASSERT_TRUE(parameter.slot == 1 && parameter.kind == VERNON_PIPELINE_TENSOR);
   ASSERT_TRUE(vernonRuntimeLoadedPipelineGetOutputCount(pipeline) == 1);
   VernonPipelineOutputView pipelineOutput{};
   ASSERT_TRUE(vernonRuntimeLoadedPipelineFindOutput(
@@ -146,12 +171,23 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
   VernonPipelineArgument arguments[2]{};
   arguments[0].slot = 0;
   arguments[0].kind = VERNON_PIPELINE_TENSOR;
-  arguments[0].tensor = {
-      buffer, VERNON_DATA_F32, VERNON_ACCESS_WRITE, 1, shape, strides, 0};
+  arguments[0].tensor.struct_size = sizeof(VernonTensorView);
+  arguments[0].tensor.storage = VERNON_TENSOR_DEVICE;
+  arguments[0].tensor.buffer = buffer;
+  arguments[0].tensor.dtype = VERNON_DATA_F32;
+  arguments[0].tensor.access = VERNON_ACCESS_WRITE;
+  arguments[0].tensor.rank = 1;
+  arguments[0].tensor.shape = shape;
+  arguments[0].tensor.byte_strides = strides;
+  arguments[0].tensor.byte_size = 4 * sizeof(float);
   arguments[1].slot = 1;
-  arguments[1].kind = VERNON_PIPELINE_INLINE_VALUE;
-  arguments[1].inline_value = {VERNON_DATA_F32, 0, nullptr, &factor,
-                               sizeof(factor)};
+  arguments[1].kind = VERNON_PIPELINE_TENSOR;
+  arguments[1].tensor.struct_size = sizeof(VernonTensorView);
+  arguments[1].tensor.storage = VERNON_TENSOR_HOST;
+  arguments[1].tensor.host_data = &factor;
+  arguments[1].tensor.dtype = VERNON_DATA_F32;
+  arguments[1].tensor.access = VERNON_ACCESS_READ;
+  arguments[1].tensor.byte_size = sizeof(factor);
   VernonPipelineInvocation invocation{};
   invocation.struct_size = sizeof(invocation);
   invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;

@@ -52,6 +52,7 @@ std::string schema2Bundle(const std::string &legacy) {
   nlohmann::json root = nlohmann::json::parse(legacy);
   root.erase("pipeline_bundle_schema_version");
   root["schema_version"] = 2;
+  root["invocation_abi_version"] = 3;
   root["type"] = "pipeline";
   for (auto &[_, stage] : root["stage_artifacts"].items()) {
     stage["artifact"]["format"] = stage["format"];
@@ -90,8 +91,8 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
 
   VernonRuntimeBackend target = VERNON_RUNTIME_CUDA;
   ASSERT_TRUE(vernonRuntimePipelineBundleInspectTarget(
-                  bundle.data(), bundle.size(), &target) == VERNON_STATUS_OK);
-  ASSERT_TRUE(target == VERNON_RUNTIME_CPU);
+                  bundle.data(), bundle.size(), &target) ==
+              VERNON_STATUS_PARSE_ERROR);
 
   VernonRuntimeContext *runtime = vernonRuntimeCreate(VERNON_RUNTIME_CPU, 0);
   ASSERT_TRUE(runtime);
@@ -107,7 +108,8 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
   VernonPipelineBundle *schema2Loaded =
       loadWithDirectory(runtime, schema2, directoryUtf8);
   ASSERT_TRUE(schema2Loaded);
-  vernonRuntimePipelineBundleDestroy(schema2Loaded);
+  ASSERT_TRUE(!vernonRuntimeLoadPipelineBundleFromDirectory(
+      runtime, directoryUtf8.c_str()));
 
   const std::string objectBytes = "test relocatable object";
   const std::filesystem::path objectPath = directory / "test_static.o";
@@ -199,9 +201,7 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
               R"("architecture": "unsupported")");
   ASSERT_TRUE(!loadWithDirectory(runtime, invalid, directoryUtf8));
 
-  VernonPipelineBundle *loaded = vernonRuntimeLoadPipelineBundleFromDirectory(
-      runtime, directoryUtf8.c_str());
-  ASSERT_TRUE(loaded);
+  VernonPipelineBundle *loaded = schema2Loaded;
   const VernonStringView id = vernonRuntimePipelineBundleGetId(loaded);
   ASSERT_TRUE(id.size == std::strlen("cpu/fill"));
   ASSERT_TRUE(std::memcmp(id.data, "cpu/fill", id.size) == 0);
@@ -237,8 +237,15 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
   VernonPipelineArgument argument{};
   argument.slot = 0;
   argument.kind = VERNON_PIPELINE_TENSOR;
-  argument.tensor = {
-      buffer, VERNON_DATA_F32, VERNON_ACCESS_WRITE, 1, shape, strides, 0};
+  argument.tensor.struct_size = sizeof(VernonTensorView);
+  argument.tensor.storage = VERNON_TENSOR_DEVICE;
+  argument.tensor.buffer = buffer;
+  argument.tensor.dtype = VERNON_DATA_F32;
+  argument.tensor.access = VERNON_ACCESS_WRITE;
+  argument.tensor.rank = 1;
+  argument.tensor.shape = shape;
+  argument.tensor.byte_strides = strides;
+  argument.tensor.byte_size = 12 * sizeof(float);
   VernonPipelineInvocation invocation{};
   invocation.struct_size = sizeof(invocation);
   invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;

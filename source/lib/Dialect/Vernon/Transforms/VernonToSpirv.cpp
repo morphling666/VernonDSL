@@ -2,6 +2,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVAttributes.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
@@ -67,6 +68,8 @@ std::optional<spirv::ExecutionModel> parseExecutionModel(StringRef stage) {
 std::optional<spirv::BuiltIn> parseBuiltIn(StringRef name) {
   return llvm::StringSwitch<std::optional<spirv::BuiltIn>>(name)
       .Case("position", spirv::BuiltIn::Position)
+      .Case("frag_coord", spirv::BuiltIn::FragCoord)
+      .Case("front_facing", spirv::BuiltIn::FrontFacing)
       .Case("vertex_index", spirv::BuiltIn::VertexIndex)
       .Case("instance_index", spirv::BuiltIn::InstanceIndex)
       .Case("global_invocation_id", spirv::BuiltIn::GlobalInvocationId)
@@ -109,6 +112,58 @@ std::string uniqueInterfaceName(StringRef preferred, StringRef stage,
   return candidate;
 }
 
+struct VulkanLayout {
+  uint32_t alignment;
+  uint32_t size;
+  std::optional<uint32_t> matrixStride;
+};
+
+FailureOr<VulkanLayout> getVulkanLayout(Type type) {
+  if (type.isIntOrFloat()) {
+    uint32_t bitWidth = type.getIntOrFloatBitWidth();
+    if (bitWidth < 8 || bitWidth % 8 != 0)
+      return failure();
+    uint32_t size = bitWidth / 8;
+    return VulkanLayout{size, size, std::nullopt};
+  }
+  if (auto vector = dyn_cast<VectorType>(type)) {
+    if (vector.getRank() != 1 || vector.getNumElements() < 2 ||
+        vector.getNumElements() > 4 || !vector.getElementType().isIntOrFloat())
+      return failure();
+    uint32_t bitWidth = vector.getElementType().getIntOrFloatBitWidth();
+    if (bitWidth < 8 || bitWidth % 8 != 0)
+      return failure();
+    uint32_t elementSize = bitWidth / 8;
+    uint32_t count = static_cast<uint32_t>(vector.getNumElements());
+    uint32_t alignment = (count == 2 ? 2 : 4) * elementSize;
+    return VulkanLayout{alignment, count * elementSize, std::nullopt};
+  }
+  if (auto matrix = dyn_cast<spirv::MatrixType>(type)) {
+    FailureOr<VulkanLayout> columnLayout =
+        getVulkanLayout(matrix.getColumnType());
+    if (failed(columnLayout))
+      return failure();
+    uint32_t stride =
+        llvm::alignTo(columnLayout->size, columnLayout->alignment);
+    return VulkanLayout{columnLayout->alignment,
+                        stride * static_cast<uint32_t>(matrix.getNumColumns()),
+                        stride};
+  }
+  return failure();
+}
+
+void appendMemberDecorations(
+    OpBuilder &builder, uint32_t member, Type type,
+    SmallVectorImpl<spirv::StructType::MemberDecorationInfo> &decorations) {
+  if (auto layout = getVulkanLayout(type);
+      succeeded(layout) && layout->matrixStride) {
+    decorations.emplace_back(member, spirv::Decoration::MatrixStride,
+                             builder.getI32IntegerAttr(*layout->matrixStride));
+    decorations.emplace_back(member, spirv::Decoration::ColMajor,
+                             builder.getUnitAttr());
+  }
+}
+
 spirv::GlobalVariableOp
 createInterfaceVariable(OpBuilder &builder, Location location, StringRef name,
                         Type valueType, spirv::StorageClass storageClass,
@@ -118,18 +173,7 @@ createInterfaceVariable(OpBuilder &builder, Location location, StringRef name,
       storageClass == spirv::StorageClass::PushConstant ||
       storageClass == spirv::StorageClass::StorageBuffer) {
     SmallVector<spirv::StructType::MemberDecorationInfo> memberDecorations;
-    if (auto matrix = dyn_cast<spirv::MatrixType>(valueType)) {
-      uint32_t elementBytes =
-          matrix.getElementType().getIntOrFloatBitWidth() / 8;
-      uint32_t rowCount = matrix.getNumRows();
-      uint32_t alignment =
-          rowCount >= 3 ? 4 * elementBytes : rowCount * elementBytes;
-      uint32_t stride = llvm::alignTo(rowCount * elementBytes, alignment);
-      memberDecorations.emplace_back(0, spirv::Decoration::MatrixStride,
-                                     builder.getI32IntegerAttr(stride));
-      memberDecorations.emplace_back(0, spirv::Decoration::ColMajor,
-                                     builder.getUnitAttr());
-    }
+    appendMemberDecorations(builder, 0, valueType, memberDecorations);
     SmallVector<spirv::StructType::StructDecorationInfo> structDecorations;
     structDecorations.emplace_back(spirv::Decoration::Block,
                                    builder.getUnitAttr());
@@ -211,9 +255,64 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder,
           convertValueType(intrinsic.getResult().getType());
       if (!sampledImage || !coordinates || failed(resultType))
         return failure();
+      if (intrinsic.getNumOperands() == 4) {
+        Value lod = mapped(intrinsic.getOperand(3));
+        if (!lod)
+          return failure();
+        auto imageOperands = spirv::ImageOperandsAttr::get(
+            builder.getContext(), spirv::ImageOperands::Lod);
+        return spirv::ImageSampleExplicitLodOp::create(
+                   builder, location, *resultType, sampledImage, coordinates,
+                   imageOperands, ValueRange{lod})
+            .getResult();
+      }
       return spirv::ImageSampleImplicitLodOp::create(
                  builder, location, *resultType, sampledImage, coordinates,
                  spirv::ImageOperandsAttr(), ValueRange{})
+          .getResult();
+    }
+    if (intrinsic.getName() == "texture_size") {
+      Value sampledImage = mapped(intrinsic.getOperand(0));
+      FailureOr<Type> resultType =
+          convertValueType(intrinsic.getResult().getType());
+      auto sampledImageType =
+          sampledImage
+              ? dyn_cast<spirv::SampledImageType>(sampledImage.getType())
+              : nullptr;
+      auto vectorType =
+          succeeded(resultType) ? dyn_cast<VectorType>(*resultType) : nullptr;
+      if (!sampledImageType || !vectorType)
+        return failure();
+
+      Value lod;
+      Type lodType = builder.getI32Type();
+      if (intrinsic.getNumOperands() == 2) {
+        lod = mapped(intrinsic.getOperand(1));
+        if (!lod)
+          return failure();
+        lodType = lod.getType();
+      } else {
+        lod = spirv::ConstantOp::create(builder, location, lodType,
+                                        builder.getI32IntegerAttr(0));
+      }
+      Value zero = spirv::ConstantOp::create(
+          builder, location, lodType, builder.getIntegerAttr(lodType, 0));
+      auto zeros = DenseElementsAttr::get(
+          vectorType,
+          IntegerAttr::get(vectorType.getElementType(), APInt(32, 0)));
+      Value zeroVector =
+          spirv::ConstantOp::create(builder, location, vectorType, zeros);
+      Type imageType = sampledImageType.getImageType();
+      Value image =
+          spirv::ImageOp::create(builder, location, imageType, sampledImage);
+      (void)image;
+      // MLIR has no ImageQuerySizeLod op. The adjacent scalar/vector IAdds
+      // retain the lod and result IDs in valid SPIR-V dialect operations;
+      // VernonCompiler rewrites this marker sequence after serialization.
+      Value serializedLod =
+          spirv::IAddOp::create(builder, location, lod, zero).getResult();
+      (void)serializedLod;
+      return spirv::IAddOp::create(builder, location, zeroVector, zeroVector)
           .getResult();
     }
     SmallVector<Value> operands;
@@ -257,6 +356,29 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder,
     state.addOperands(operands);
     state.addTypes(*resultType);
     return builder.create(state)->getResult(0);
+  }
+
+  if (operation.getNumOperands() == 1 && operation.getNumResults() == 1) {
+    Value operand = mapped(operation.getOperand(0));
+    FailureOr<Type> resultType =
+        convertValueType(operation.getResult(0).getType());
+    if (!operand || failed(resultType))
+      return failure();
+    StringRef operationName =
+        llvm::StringSwitch<StringRef>(operation.getName().getStringRef())
+            .Case(math::SinOp::getOperationName(), "spirv.GL.Sin")
+            .Case(math::CosOp::getOperationName(), "spirv.GL.Cos")
+            .Case(math::ExpOp::getOperationName(), "spirv.GL.Exp")
+            .Case(math::LogOp::getOperationName(), "spirv.GL.Log")
+            .Case(math::SqrtOp::getOperationName(), "spirv.GL.Sqrt")
+            .Case(math::AbsFOp::getOperationName(), "spirv.GL.FAbs")
+            .Default("");
+    if (!operationName.empty()) {
+      OperationState state(location, operationName);
+      state.addOperands(operand);
+      state.addTypes(*resultType);
+      return builder.create(state)->getResult(0);
+    }
   }
 
   if (auto compare = dyn_cast<arith::CmpFOp>(operation)) {
@@ -466,7 +588,8 @@ translateStraightLineBlock(Block &source, OpBuilder &builder,
 
 LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target,
                          OpBuilder &moduleBuilder,
-                         llvm::StringSet<> &usedInterfaceNames) {
+                         llvm::StringSet<> &usedInterfaceNames,
+                         bool aggregatePushConstants) {
   auto stage = source->getAttrOfType<StringAttr>(kStageAttrName);
   if (!stage)
     return success();
@@ -476,11 +599,68 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target,
     return source.emitError("unsupported SPIR-V execution model");
 
   SmallVector<spirv::GlobalVariableOp> inputs;
+  SmallVector<std::optional<uint32_t>> inputMembers;
   SmallVector<spirv::GlobalVariableOp> outputs;
   SmallVector<Attribute> interfaceSymbols;
+  struct PushConstantMember {
+    uint32_t argumentIndex;
+    Type type;
+    uint32_t offset;
+  };
+  SmallVector<PushConstantMember> pushConstantMembers;
+  uint32_t pushConstantSize = 0;
+  for (auto [index, type] : llvm::enumerate(source.getArgumentTypes())) {
+    if (!aggregatePushConstants)
+      break;
+    InterfaceAttrs attrs = parseInterfaceAttrs(source.getArgAttrDict(index));
+    auto kind = dyn_cast_if_present<StringAttr>(attrs.kind);
+    if (!kind || kind.getValue() != "uniform" || attrs.binding)
+      continue;
+    FailureOr<Type> converted = convertValueType(type);
+    if (failed(converted))
+      return source.emitError() << "cannot lower push-constant argument #"
+                                << index << " type " << type << " to SPIR-V";
+    FailureOr<VulkanLayout> layout = getVulkanLayout(*converted);
+    if (failed(layout))
+      return source.emitError()
+             << "push-constant argument #" << index
+             << " does not have a Vulkan scalar/vector/matrix layout";
+    pushConstantSize = llvm::alignTo(pushConstantSize, layout->alignment);
+    pushConstantMembers.push_back(
+        {static_cast<uint32_t>(index), *converted, pushConstantSize});
+    pushConstantSize += layout->size;
+  }
+  spirv::GlobalVariableOp pushConstantBlock;
+  if (!pushConstantMembers.empty()) {
+    SmallVector<Type> memberTypes;
+    SmallVector<uint32_t> memberOffsets;
+    SmallVector<spirv::StructType::MemberDecorationInfo> memberDecorations;
+    for (auto [member, value] : llvm::enumerate(pushConstantMembers)) {
+      memberTypes.push_back(value.type);
+      memberOffsets.push_back(value.offset);
+      appendMemberDecorations(moduleBuilder, static_cast<uint32_t>(member),
+                              value.type, memberDecorations);
+    }
+    SmallVector<spirv::StructType::StructDecorationInfo> structDecorations;
+    structDecorations.emplace_back(spirv::Decoration::Block,
+                                   moduleBuilder.getUnitAttr());
+    auto blockType = spirv::StructType::get(
+        memberTypes, memberOffsets, memberDecorations, structDecorations);
+    std::string preferred = (source.getSymName() + "_push_constants").str();
+    std::string name =
+        uniqueInterfaceName(preferred, stage.getValue(), usedInterfaceNames);
+    pushConstantBlock = spirv::GlobalVariableOp::create(
+        moduleBuilder, source.getLoc(),
+        spirv::PointerType::get(blockType, spirv::StorageClass::PushConstant),
+        name, FlatSymbolRefAttr(), IntegerAttr(), IntegerAttr(), IntegerAttr(),
+        StringAttr(), spirv::LinkageAttributesAttr());
+    interfaceSymbols.push_back(SymbolRefAttr::get(
+        source.getContext(), pushConstantBlock.getSymName()));
+  }
   for (auto [index, type] : llvm::enumerate(source.getArgumentTypes())) {
     if (isa<SamplerType>(type)) {
       inputs.push_back({});
+      inputMembers.push_back(std::nullopt);
       continue;
     }
     FailureOr<Type> converted = convertValueType(type);
@@ -496,9 +676,23 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target,
         isa<TextureType>(type)       ? spirv::StorageClass::UniformConstant
         : kind.getValue() == "input" ? spirv::StorageClass::Input
         : kind.getValue() == "uniform"
-            ? (attrs.binding ? spirv::StorageClass::Uniform
-                             : spirv::StorageClass::PushConstant)
+            ? (attrs.binding || aggregatePushConstants
+                   ? spirv::StorageClass::Uniform
+                   : spirv::StorageClass::UniformConstant)
             : spirv::StorageClass::StorageBuffer;
+    if (aggregatePushConstants && kind.getValue() == "uniform" &&
+        !attrs.binding) {
+      auto member = llvm::find_if(pushConstantMembers,
+                                  [&](const PushConstantMember &value) {
+                                    return value.argumentIndex == index;
+                                  });
+      if (member == pushConstantMembers.end())
+        return source.emitError("push-constant member layout is inconsistent");
+      inputs.push_back(pushConstantBlock);
+      inputMembers.push_back(static_cast<uint32_t>(
+          std::distance(pushConstantMembers.begin(), member)));
+      continue;
+    }
     std::string fallback = (source.getSymName() + "_arg_" + Twine(index)).str();
     auto sourceName =
         source.getArgAttrOfType<StringAttr>(index, "vernon.source_name");
@@ -511,6 +705,7 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target,
                                           *converted, storageClass,
                                           source.getArgAttrDict(index));
     inputs.push_back(global);
+    inputMembers.push_back(std::nullopt);
     interfaceSymbols.push_back(
         SymbolRefAttr::get(source.getContext(), global.getSymName()));
   }
@@ -542,18 +737,19 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target,
   Block *entry = function.addEntryBlock();
   OpBuilder bodyBuilder = OpBuilder::atBlockBegin(entry);
   IRMapping mapping;
-  for (auto [argument, global] :
-       llvm::zip_equal(source.getArguments(), inputs)) {
+  for (auto [argument, global, member] :
+       llvm::zip_equal(source.getArguments(), inputs, inputMembers)) {
     if (!global)
       continue;
     Value pointer =
         spirv::AddressOfOp::create(bodyBuilder, source.getLoc(), global);
     auto pointerType = cast<spirv::PointerType>(pointer.getType());
     if (isa<spirv::StructType>(pointerType.getPointeeType())) {
-      Value zero = spirv::ConstantOp::getZero(bodyBuilder.getI32Type(),
-                                              source.getLoc(), bodyBuilder);
+      Value memberIndex = spirv::ConstantOp::create(
+          bodyBuilder, source.getLoc(), bodyBuilder.getI32Type(),
+          bodyBuilder.getI32IntegerAttr(member.value_or(0)));
       pointer = spirv::AccessChainOp::create(bodyBuilder, source.getLoc(),
-                                             pointer, zero);
+                                             pointer, memberIndex);
     }
     Value value = spirv::LoadOp::create(bodyBuilder, source.getLoc(), pointer);
     mapping.map(argument, value);
@@ -611,6 +807,10 @@ struct VernonToSPIRVPass
     : public PassWrapper<VernonToSPIRVPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VernonToSPIRVPass)
 
+  VernonToSPIRVPass() = default;
+  explicit VernonToSPIRVPass(bool aggregatePushConstants)
+      : aggregatePushConstants(aggregatePushConstants) {}
+
   StringRef getArgument() const final { return "vernon-to-spirv"; }
   StringRef getDescription() const final {
     return "Lower Vernon graphics and Vulkan compute entries to SPIR-V";
@@ -642,19 +842,21 @@ struct VernonToSPIRVPass
     llvm::StringSet<> usedInterfaceNames;
 
     for (func::FuncOp function : entries) {
-      if (failed(lowerEntry(function, target, moduleBuilder,
-                            usedInterfaceNames))) {
+      if (failed(lowerEntry(function, target, moduleBuilder, usedInterfaceNames,
+                            aggregatePushConstants))) {
         target.erase();
         return signalPassFailure();
       }
     }
   }
+
+  bool aggregatePushConstants = true;
 };
 
 } // namespace
 
-std::unique_ptr<Pass> createVernonToSPIRVPass() {
-  return std::make_unique<VernonToSPIRVPass>();
+std::unique_ptr<Pass> createVernonToSPIRVPass(bool aggregatePushConstants) {
+  return std::make_unique<VernonToSPIRVPass>(aggregatePushConstants);
 }
 
 void registerVernonToSPIRVPass() { PassRegistration<VernonToSPIRVPass>(); }

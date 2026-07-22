@@ -303,6 +303,10 @@ class Tensor:
         self.synchronize()
         return self._array.copy(order="C")
 
+    def _borrowed_array(self) -> np.ndarray:
+        self.synchronize()
+        return self._array
+
     def copy_from_numpy(self, array: np.ndarray) -> None:
         if (not isinstance(array, np.ndarray) or array.dtype != self.dtype
                 or array.shape != self.shape or not array.flags.c_contiguous):
@@ -376,6 +380,11 @@ class TensorView:
         return np.array(self._owner._array[..., self._first_component:stop],
                         copy=True,
                         order="C")
+
+    def _borrowed_array(self) -> np.ndarray:
+        self._owner.synchronize()
+        stop = self._first_component + self._component_count
+        return self._owner._array[..., self._first_component:stop]
 
     def _resident_buffer(self) -> Any:
         return self._owner._resident_buffer()
@@ -1067,16 +1076,15 @@ class Pipeline:
                 if not isinstance(value, (Tensor, TensorView)):
                     raise TypeError(
                         f"uniform {parameter.name!r} must be a Tensor")
-                values = value.to_numpy()
+                values = value._borrowed_array()
                 if (values.dtype != np.dtype(np.float32)
                         or values.size != parameter.components):
                     raise ValueError(
                         f"uniform {parameter.name!r} has incompatible dtype or shape"
                     )
                 pipeline_arguments.append(
-                    ("inline", compiled.slots[parameter.name],
-                     _native.DATA_F32, values.tobytes(order="C"),
-                     list(values.shape)))
+                    ("tensor", compiled.slots[parameter.name], values,
+                     _native.DATA_F32, _native.ACCESS_READ))
                 continue
             if not isinstance(value, (Tensor, TensorView)):
                 scalar = np.asarray(value)
@@ -1090,8 +1098,8 @@ class Pipeline:
                     scalar = np.asarray(value, dtype=np.int32)
                     dtype = _native.DATA_I32
                 pipeline_arguments.append(
-                    ("inline", compiled.slots[parameter.name], dtype,
-                     scalar.tobytes(), list(scalar.shape)))
+                    ("tensor", compiled.slots[parameter.name], scalar, dtype,
+                     _native.ACCESS_READ))
                 continue
             if not isinstance(value, (Tensor, TensorView)):
                 raise TypeError(
@@ -1193,7 +1201,7 @@ class Pipeline:
             if len({texture.shape for texture in rendered_targets}) != 1:
                 raise ValueError("all targets must have the same extent")
             # The native binding keeps the legacy target positional argument
-            # non-null; ABI v2 ignores it when explicit attachments are set.
+            # non-null; ABI v3 ignores it when explicit attachments are set.
             native_target = native_attachments[0][1]
         else:
             if (not isinstance(target, Texture) or len(compiled.outputs) != 1

@@ -401,7 +401,8 @@ module {
           return %sample : tensor<4xf32>
         }
       })mlir",
-                   "texture_sample requires exactly three operands");
+                   "texture_sample requires texture, sampler, coordinates, "
+                   "and optional lod");
 
   struct InvalidSwizzleCase {
     std::string_view module;

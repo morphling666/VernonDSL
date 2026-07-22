@@ -89,6 +89,77 @@ def sample(image: Texture["cube", f32], sampler: Sampler,
         with self.assertRaisesRegex(CompileError, "3-component"):
             compile_source(invalid_coordinates, "bad_coordinates.py")
 
+    def test_sampling_overloads_and_texture_size(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@fragment
+def implicit_sample(
+    image: Annotated[Texture["2d", f32], resource(set=0, binding=0)],
+    uv: vec2[f32],
+) -> vec4[f32]:
+    a = texture_sample(image, uv)
+    b = texture_sample(image, uv, 2.0)
+    size = texture_size(image)
+    mip_size = texture_size(image, 2)
+    return a + b
+
+@fragment
+def explicit_sample(
+    image: Annotated[Texture["2d", f32], resource(set=0, binding=0)],
+    sampler: Annotated[Sampler, resource(set=0, binding=1)],
+    uv: vec2[f32],
+) -> vec4[f32]:
+    a = texture_sample(image, sampler, uv)
+    b = texture_sample(image, sampler, uv, 1.0)
+    return a + b
+"""
+        output = compile_source(source, "sampling_overloads.py")
+        self.assertEqual(output.count('name = "texture_sample"'), 4)
+        self.assertEqual(output.count('name = "texture_size"'), 2)
+        self.assertIn('vernon.implicit = "sampler"', output)
+        self.assertNotIn('vernon.implicit = "texture_size"', output)
+        self.assertIn(
+            "(!vernon.texture<\"2d\", f32>, !vernon.sampler, tensor<2xf32>, f32)",
+            output)
+        explicit_only = compile_source(
+            """
+from vernon_dsl import *
+@fragment
+def main(image: Texture["2d", f32], sampler: Sampler,
+         uv: vec2[f32]) -> vec4[f32]:
+    return texture_sample(image, sampler, uv)
+""", "explicit_only.py")
+        self.assertNotIn('vernon.implicit = "sampler"', explicit_only)
+
+    def test_sampling_stage_and_lod_types_are_validated(self) -> None:
+        vertex_implicit_lod = """
+from vernon_dsl import *
+@vertex
+def main(image: Texture["2d", f32], uv: vec2[f32]) -> vec4[f32]:
+    return texture_sample(image, uv)
+"""
+        with self.assertRaisesRegex(CompileError, "without lod"):
+            compile_source(vertex_implicit_lod, "vertex_implicit_lod.py")
+
+        invalid_sample_lod = """
+from vernon_dsl import *
+@fragment
+def main(image: Texture["2d", f32], uv: vec2[f32]) -> vec4[f32]:
+    return texture_sample(image, uv, 1)
+"""
+        with self.assertRaisesRegex(CompileError, "floating-point scalar"):
+            compile_source(invalid_sample_lod, "invalid_sample_lod.py")
+
+        invalid_size_lod = """
+from vernon_dsl import *
+@fragment
+def main(image: Texture["2d", f32]) -> vec2[u32]:
+    return texture_size(image, 1.0)
+"""
+        with self.assertRaisesRegex(CompileError, "integer scalar"):
+            compile_source(invalid_size_lod, "invalid_size_lod.py")
+
     def test_swizzle_aliases_are_canonicalized(self) -> None:
         source = """
 from vernon_dsl import *
@@ -122,6 +193,152 @@ def invalid(color: vec3[f32]) -> f32:
 
 
 class StageTests(unittest.TestCase):
+
+    def test_raw_builtin_contracts(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@vertex
+def vertex_main(
+    vertex: Annotated[u32, builtin("vertex_index")],
+    instance: Annotated[u32, builtin("instance_index")],
+) -> Annotated[vec4[f32], builtin("position")]:
+    return vec4(0.0, 0.0, 0.0, 1.0)
+
+@fragment
+def fragment_main(
+    coordinate: Annotated[vec4[f32], builtin("frag_coord")],
+    facing: Annotated[bool, builtin("front_facing")],
+) -> vec4[f32]:
+    return coordinate
+
+@compute(workgroup_size=(1, 1, 1))
+def compute_main(
+    global_id: Annotated[vec3[u32], builtin("global_invocation_id")],
+    local_id: Annotated[vec3[u32], builtin("local_invocation_id")],
+    group_id: Annotated[vec3[u32], builtin("workgroup_id")],
+) -> None:
+    pass
+"""
+        output = compile_source(source, "raw_builtins.py")
+        for builtin_name in (
+                "position",
+                "vertex_index",
+                "instance_index",
+                "frag_coord",
+                "front_facing",
+                "global_invocation_id",
+                "local_invocation_id",
+                "workgroup_id",
+        ):
+            self.assertIn(f'vernon.builtin = "{builtin_name}"', output)
+
+    def test_raw_builtin_contract_diagnostics(self) -> None:
+        cases = (
+            (
+                """
+from vernon_dsl import *
+@vertex
+def main(value: Annotated[u32, builtin("mystery")]) -> vec4[f32]:
+    return vec4(0.0, 0.0, 0.0, 1.0)
+""",
+                "unknown builtin 'mystery'",
+            ),
+            (
+                """
+from vernon_dsl import *
+@fragment
+def main(value: Annotated[u32, builtin("vertex_index")]) -> vec4[f32]:
+    return vec4(0.0, 0.0, 0.0, 1.0)
+""",
+                "requires a vertex input",
+            ),
+            (
+                """
+from vernon_dsl import *
+@vertex
+def main() -> Annotated[u32, builtin("vertex_index")]:
+    return 0
+""",
+                "requires a vertex input",
+            ),
+            (
+                """
+from vernon_dsl import *
+@compute(workgroup_size=(1, 1, 1))
+def main(gid: Annotated[u32, builtin("global_invocation_id")]) -> None:
+    pass
+""",
+                "requires type tensor<3xi32>",
+            ),
+            (
+                """
+from vernon_dsl import *
+@vertex
+def main() -> vec3[f32]:
+    return vec3(0.0, 0.0, 0.0)
+""",
+                "builtin 'position' requires type tensor<4xf32>",
+            ),
+        )
+        for index, (source, diagnostic) in enumerate(cases):
+            with self.subTest(index=index), self.assertRaisesRegex(
+                    CompileError, diagnostic):
+                compile_source(source, f"bad_builtin_{index}.py")
+
+    def test_texture_cannot_mix_implicit_and_explicit_samplers(self) -> None:
+        source = """
+from vernon_dsl import *
+@fragment
+def main(
+    image: Annotated[Texture["2d", f32], resource(set=0, binding=0)],
+    sampler: Annotated[Sampler, resource(set=0, binding=1)],
+    uv: vec2[f32],
+) -> vec4[f32]:
+    implicit_value = texture_sample(image, uv)
+    explicit_value = texture_sample(image, sampler, uv)
+    return implicit_value + explicit_value
+"""
+        with self.assertRaisesRegex(
+                CompileError, "both implicit and explicit sampler forms"):
+            compile_source(source, "mixed_sampler_forms.py")
+
+    def test_parameterless_graphics_builtins(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@vertex
+def vertex_main(position: vec4[f32]) -> vec4[f32]:
+    vertex = vertex_id()
+    instance = instance_id()
+    return position
+
+@fragment
+def fragment_main() -> vec4[f32]:
+    size = resolution()
+    coordinate = fragment_coord()
+    facing = front_facing()
+    return coordinate
+"""
+        output = compile_source(source, "graphics_builtins.py")
+        for marker in (
+                'vernon.implicit = "resolution"',
+                'vernon.builtin = "frag_coord"',
+                'vernon.builtin = "front_facing"',
+                'vernon.builtin = "vertex_index"',
+                'vernon.builtin = "instance_index"',
+        ):
+            self.assertIn(marker, output)
+
+    def test_parameterless_graphics_builtins_enforce_stage(self) -> None:
+        invalid = """
+from vernon_dsl import *
+@fragment
+def main() -> u32:
+    return instance_id()
+"""
+        with self.assertRaisesRegex(CompileError, "only in vertex shaders"):
+            compile_source(invalid, "bad_builtin_stage.py")
 
     def test_graphics_intrinsics_and_bound_uniforms(self) -> None:
         source = """
@@ -163,10 +380,10 @@ def shade(color: Annotated[vec4[f32], varying()]) -> f32:
 @compute(workgroup_size=(8, 4, 1))
 def update(
     values: Annotated[Buffer[f32], resource(set=0, binding=3)],
-    invocation: Annotated[u32, builtin("global_invocation_id")],
+    invocation: Annotated[vec3[u32], builtin("global_invocation_id")],
 ) -> None:
-    current = values[invocation]
-    values[invocation] = current + 1.0
+    current = values[invocation[0]]
+    values[invocation[0]] = current + 1.0
     for i in range(0, 4):
         local = i
 """
@@ -240,7 +457,7 @@ def main(value: f32) -> f32:
             input_path = Path(directory) / "input.py"
             output_path = Path(directory) / "output.mlir"
             input_path.write_text(
-                "from vernon_dsl import *\n@vertex\ndef main(x: f32) -> f32:\n    return x\n",
+                "from vernon_dsl import *\n@fragment\ndef main(x: f32) -> f32:\n    return x\n",
                 encoding="utf-8",
             )
             self.assertEqual(main([str(input_path), "-o",

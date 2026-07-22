@@ -397,7 +397,65 @@ class _FunctionEmitter:
         self.indent = 1
         self.next_value = 0
         self.environment: dict[str, Value] = {}
+        self.generated_values: dict[str, Value] = {}
+        self.implicit_samplers: dict[str, Value] = {}
+        self.texture_sampler_modes: dict[str, str] = {}
         self.returned = False
+
+    @staticmethod
+    def _builtin_contracts() -> dict[str, tuple[str, str, DslType]]:
+        f32 = DslType("scalar", "f32")
+        u32 = DslType("scalar", "u32")
+        return {
+            "position": ("vertex", "output",
+                         DslType("tensor", "Tensor", (f32, 4))),
+            "vertex_index": ("vertex", "input", u32),
+            "instance_index": ("vertex", "input", u32),
+            "frag_coord": ("fragment", "input",
+                           DslType("tensor", "Tensor", (f32, 4))),
+            "front_facing": ("fragment", "input",
+                             DslType("scalar", "bool")),
+            "global_invocation_id":
+            ("compute", "input", DslType("tensor", "Tensor", (u32, 3))),
+            "local_invocation_id":
+            ("compute", "input", DslType("tensor", "Tensor", (u32, 3))),
+            "workgroup_id":
+            ("compute", "input", DslType("tensor", "Tensor", (u32, 3))),
+        }
+
+    def _validate_builtin_contract(self, builtin: str, value_type: DslType,
+                                   direction: str, label: str) -> None:
+        contract = self._builtin_contracts().get(builtin)
+        if contract is None:
+            raise self.context.error(
+                self.node, f"{label} uses unknown builtin '{builtin}'")
+        expected_stage, expected_direction, expected_type = contract
+        if self.stage != expected_stage or direction != expected_direction:
+            raise self.context.error(
+                self.node,
+                f"builtin '{builtin}' requires a {expected_stage} "
+                f"{expected_direction}, but {label} is a "
+                f"{self.stage or 'non-entry'} {direction}",
+            )
+        if value_type != expected_type:
+            raise self.context.error(
+                self.node,
+                f"builtin '{builtin}' requires type {expected_type.mlir}, "
+                f"but {label} has type {value_type.mlir}",
+            )
+
+    def _validate_builtin_annotation(self, annotation: AnnotatedType,
+                                     direction: str, label: str) -> None:
+        builtins = [
+            str(item.arguments[0]) for item in annotation.metadata
+            if item.kind == "builtin"
+        ]
+        if len(builtins) > 1:
+            raise self.context.error(
+                self.node, f"{label} has more than one builtin annotation")
+        if builtins:
+            self._validate_builtin_contract(builtins[0], annotation.type,
+                                            direction, label)
 
     def _entry_result_fields(
             self) -> tuple[tuple[str, AnnotatedType], ...] | None:
@@ -409,6 +467,8 @@ class _FunctionEmitter:
         occupied: set[int] = set()
         builtins: set[str] = set()
         for field_name, annotation in fields:
+            self._validate_builtin_annotation(
+                annotation, "output", f"output field '{field_name}'")
             locations = [
                 int(item.arguments[0]) for item in annotation.metadata
                 if item.kind == "location"
@@ -453,6 +513,8 @@ class _FunctionEmitter:
                 zip(self.node.args.args,
                     self.argument_annotations,
                     strict=True)):
+            self._validate_builtin_annotation(
+                annotation, "input", f"argument '{argument.arg}'")
             value_type = annotation.type
             has_builtin = any(item.kind == "builtin"
                               for item in annotation.metadata)
@@ -492,6 +554,7 @@ class _FunctionEmitter:
                 attributes.append(f"vernon.tensor_shape = array<i64: {shape}>")
             suffix = f" {{{', '.join(attributes)}}}" if attributes else ""
             arguments.append(f"{value.name}: {value.type.mlir}{suffix}")
+        self._append_generated_arguments(arguments)
         result = ""
         entry_fields = self._entry_result_fields()
         if entry_fields is not None:
@@ -512,6 +575,16 @@ class _FunctionEmitter:
         elif self.signature.result:
             result_metadata = self.result_annotation.metadata if self.result_annotation else (
             )
+            if self.result_annotation is not None:
+                self._validate_builtin_annotation(self.result_annotation,
+                                                  "output", "result")
+            has_result_slot = any(
+                item.kind in {"location", "builtin", "instance"}
+                for item in result_metadata)
+            if self.stage == "vertex" and not has_result_slot:
+                self._validate_builtin_contract("position",
+                                                self.signature.result,
+                                                "output", "result")
             result_attributes = self._metadata_attributes(result_metadata,
                                                           stage=self.stage,
                                                           is_result=True,
@@ -542,6 +615,112 @@ class _FunctionEmitter:
             self._line("func.return")
         self.lines.append("  }")
         return self.lines
+
+    def _append_generated_arguments(self, arguments: list[str]) -> None:
+        argument_types = {
+            argument.arg: annotation.type
+            for argument, annotation in zip(self.node.args.args,
+                                            self.argument_annotations,
+                                            strict=True)
+        }
+        argument_metadata = {
+            argument.arg: annotation.metadata
+            for argument, annotation in zip(self.node.args.args,
+                                            self.argument_annotations,
+                                            strict=True)
+        }
+        used_bindings = {
+            (int(item.arguments[0]), int(item.arguments[1]))
+            for metadata in argument_metadata.values()
+            for item in metadata
+            if item.kind in {"resource", "uniform"} and len(item.arguments) == 2
+        }
+        implicit_textures: set[str] = set()
+        called_apis: set[str] = set()
+        for value in ast.walk(self.node):
+            if not isinstance(value, ast.Call):
+                continue
+            name = (_name(value.func) or "").split(".")[-1]
+            called_apis.add(name)
+            if name != "texture_sample" or not value.args:
+                continue
+            texture_name = (value.args[0].id
+                            if isinstance(value.args[0], ast.Name) else None)
+            if texture_name is None or argument_types.get(
+                    texture_name, DslType("void", "void")).kind != "texture":
+                continue
+            explicit_sampler = (
+                len(value.args) >= 3 and isinstance(value.args[1], ast.Name)
+                and argument_types.get(
+                    value.args[1].id, DslType("void", "void")).kind == "sampler")
+            if len(value.args) == 2 or (len(value.args) == 3
+                                        and not explicit_sampler):
+                implicit_textures.add(texture_name)
+
+        for texture_name in sorted(implicit_textures):
+            if self.stage not in {"vertex", "fragment"}:
+                raise self.context.error(
+                    self.node,
+                    "implicit texture samplers are supported only in graphics stages"
+                )
+            index = len(arguments)
+            value = Value(f"%arg{index}", DslType("sampler", "Sampler"))
+            self.implicit_samplers[self.environment[texture_name].name] = value
+            source_name = f"__vernon_implicit_sampler_{texture_name}"
+            resource = next(
+                (item for item in argument_metadata[texture_name]
+                 if item.kind == "resource"), None)
+            descriptor_set = (int(resource.arguments[0])
+                              if resource is not None else 0)
+            binding = 0
+            while (descriptor_set, binding) in used_bindings:
+                binding += 1
+            used_bindings.add((descriptor_set, binding))
+            binding_attributes = (
+                f", vernon.set = {descriptor_set} : i64"
+                f", vernon.binding = {binding} : i64")
+            arguments.append(
+                f'{value.name}: !vernon.sampler {{vernon.interface = "resource", '
+                f'vernon.source_name = "{source_name}", '
+                f'vernon.implicit = "sampler", '
+                f'vernon.implicit_texture = "{texture_name}"'
+                f"{binding_attributes}}}")
+
+        generated_apis = (
+            ("resolution", "fragment", DslType(
+                "tensor", "Tensor", (DslType("scalar", "f32"), 2)),
+             "uniform", None),
+            ("fragment_coord", "fragment",
+             DslType("tensor", "Tensor",
+                     (DslType("scalar", "f32"), 4)), "input", "frag_coord"),
+            ("front_facing", "fragment", DslType("scalar", "bool"), "input",
+             "front_facing"),
+            ("vertex_id", "vertex", DslType("scalar", "u32"), "input",
+             "vertex_index"),
+            ("instance_id", "vertex", DslType("scalar", "u32"), "input",
+             "instance_index"),
+        )
+        for api, required_stage, value_type, interface, builtin_name in generated_apis:
+            if api not in called_apis:
+                continue
+            if self.stage != required_stage:
+                raise self.context.error(
+                    self.node,
+                    f"{api}() is available only in {required_stage} shaders")
+            index = len(arguments)
+            value = Value(f"%arg{index}", value_type)
+            self.generated_values[api] = value
+            attributes = [
+                f'vernon.interface = "{interface}"',
+                f'vernon.source_name = "__vernon_{api}"',
+                f'vernon.implicit = "{api}"',
+            ]
+            if builtin_name is not None:
+                attributes.append(f'vernon.builtin = "{builtin_name}"')
+            else:
+                attributes.append('vernon.dtype = "f32"')
+            arguments.append(
+                f"{value.name}: {value.type.mlir} {{{', '.join(attributes)}}}")
 
     def _line(self, text: str) -> None:
         self.lines.append("  " * self.indent + text)
@@ -1109,6 +1288,21 @@ class _FunctionEmitter:
                 f"{result} = {math_operations[name]} {arguments[0].name} : {arguments[0].type.mlir}"
             )
             return Value(result, arguments[0].type)
+        if name in {
+                "resolution",
+                "fragment_coord",
+                "front_facing",
+                "vertex_id",
+                "instance_id",
+        }:
+            if arguments:
+                raise self.context.error(node,
+                                         f"{name} does not accept arguments")
+            value = self.generated_values.get(name)
+            if value is None:
+                raise self.context.error(
+                    node, f"{name}() is not available in this shader stage")
+            return value
         if name in {"vec2", "vec3", "vec4"}:
             size = int(name[-1])
             if not arguments:
@@ -1253,28 +1447,98 @@ class _FunctionEmitter:
                     node,
                     f"shared function '{self.node.name}' uses device-only operation 'texture_sample'"
                 )
-            if len(arguments
-                   ) != 3 or arguments[0].type.kind != "texture" or arguments[
-                       1].type.kind != "sampler":
+            if len(arguments) not in {2, 3, 4} or arguments[
+                    0].type.kind != "texture":
                 raise self.context.error(
                     node,
-                    "texture_sample requires texture, sampler, and coordinates"
+                    "texture_sample requires texture, optional sampler, coordinates, and optional lod"
                 )
-            element = arguments[0].type.arguments[1]
-            assert isinstance(element, DslType)
-            dimension = arguments[0].type.arguments[0]
-            coordinate_rank = {"2d": 2, "3d": 3, "cube": 3}[dimension]
-            coordinates = arguments[2].type
-            if (coordinates.kind != "tensor"
-                    or coordinates.arguments != (element, coordinate_rank)
-                    or not coordinates.is_float):
+            texture = arguments[0]
+            explicit_sampler = (len(arguments) >= 3
+                                and arguments[1].type.kind == "sampler")
+            if len(arguments) == 4 and not explicit_sampler:
                 raise self.context.error(
-                    node.args[2],
+                    node,
+                    "the four-argument texture_sample form requires an explicit sampler"
+                )
+            sampler_mode = "explicit" if explicit_sampler else "implicit"
+            previous_mode = self.texture_sampler_modes.get(texture.name)
+            if previous_mode is not None and previous_mode != sampler_mode:
+                raise self.context.error(
+                    node,
+                    "one texture entry parameter cannot be sampled through "
+                    "both implicit and explicit sampler forms in the same stage"
+                )
+            self.texture_sampler_modes[texture.name] = sampler_mode
+            if explicit_sampler:
+                sampler = arguments[1]
+                coordinates = arguments[2]
+                lod = arguments[3] if len(arguments) == 4 else None
+            else:
+                sampler = self.implicit_samplers.get(texture.name)
+                if sampler is None:
+                    raise self.context.error(
+                        node.args[0],
+                        "implicitly sampled texture must be a texture entry parameter"
+                    )
+                coordinates = arguments[1]
+                lod = arguments[2] if len(arguments) == 3 else None
+            if lod is None and self.stage not in {"fragment", "compute"}:
+                raise self.context.error(
+                    node,
+                    "texture_sample without lod is available only in fragment shaders"
+                )
+            if lod is not None:
+                if self.stage not in {"vertex", "fragment"}:
+                    raise self.context.error(
+                        node,
+                        "texture_sample with lod is supported only in graphics stages"
+                    )
+                if lod.type.kind != "scalar" or not lod.type.is_float:
+                    raise self.context.error(
+                        node.args[-1],
+                        "texture_sample lod must be a floating-point scalar")
+            element = texture.type.arguments[1]
+            assert isinstance(element, DslType)
+            dimension = texture.type.arguments[0]
+            coordinate_rank = {"2d": 2, "3d": 3, "cube": 3}[dimension]
+            if (coordinates.type.kind != "tensor"
+                    or coordinates.type.arguments != (element,
+                                                       coordinate_rank)
+                    or not coordinates.type.is_float):
+                raise self.context.error(
+                    node.args[2] if explicit_sampler else node.args[1],
                     f"texture_sample coordinates for a {dimension} texture "
                     f"must be a {coordinate_rank}-component floating-point vector",
                 )
-            return self._intrinsic(node, name, arguments,
+            operands = [texture, sampler, coordinates]
+            if lod is not None:
+                operands.append(lod)
+            return self._intrinsic(node, name, operands,
                                    DslType("tensor", "Tensor", (element, 4)))
+        if name == "texture_size":
+            if self.node.name in self.context.shared_functions:
+                raise self.context.error(
+                    node,
+                    f"shared function '{self.node.name}' uses device-only operation 'texture_size'"
+                )
+            if (len(arguments) not in {1, 2}
+                    or arguments[0].type.kind != "texture"):
+                raise self.context.error(
+                    node, "texture_size requires texture and optional lod")
+            if self.stage not in {"vertex", "fragment"}:
+                raise self.context.error(
+                    node, "texture_size is supported only in graphics stages")
+            if len(arguments) == 2 and (arguments[1].type.kind != "scalar"
+                                       or not arguments[1].type.is_integer):
+                raise self.context.error(
+                    node.args[1], "texture_size lod must be an integer scalar")
+            dimension = arguments[0].type.arguments[0]
+            result_rank = 3 if dimension == "3d" else 2
+            return self._intrinsic(
+                node, name, arguments,
+                DslType("tensor", "Tensor",
+                        (DslType("scalar", "u32"), result_rank)))
         if name in self.context.structs:
             fields = self.context.structs[name]
             if len(arguments) != len(fields):

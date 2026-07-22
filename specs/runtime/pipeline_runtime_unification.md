@@ -311,14 +311,25 @@ typedef enum VernonValueAccess {
   VERNON_ACCESS_READ_WRITE
 } VernonValueAccess;
 
+typedef enum VernonTensorStorage {
+  VERNON_TENSOR_HOST,
+  VERNON_TENSOR_DEVICE
+} VernonTensorStorage;
+
 typedef struct VernonTensorView {
-  VernonDeviceBuffer *buffer;
+  uint32_t struct_size;
+  VernonTensorStorage storage;
+  union {
+    const void *host_data;
+    VernonDeviceBuffer *buffer;
+  };
   VernonDataType dtype;
   VernonValueAccess access;
   uint32_t rank;
   const uint64_t *shape;
   const uint64_t *byte_strides;
   size_t byte_offset;
+  size_t byte_size;
 } VernonTensorView;
 
 typedef struct VernonTextureView {
@@ -331,19 +342,10 @@ typedef struct VernonTextureView {
   uint32_t depth;
 } VernonTextureView;
 
-typedef struct VernonInlineValue {
-  VernonDataType dtype;
-  uint32_t rank;
-  const uint64_t *shape;
-  const void *data;
-  size_t data_size;
-} VernonInlineValue;
-
 typedef enum VernonPipelineArgumentKind {
   VERNON_PIPELINE_TENSOR,
   VERNON_PIPELINE_TEXTURE,
-  VERNON_PIPELINE_SAMPLER,
-  VERNON_PIPELINE_INLINE_VALUE
+  VERNON_PIPELINE_SAMPLER
 } VernonPipelineArgumentKind;
 
 typedef struct VernonPipelineArgument {
@@ -353,7 +355,6 @@ typedef struct VernonPipelineArgument {
     VernonTensorView tensor;
     VernonTextureView texture;
     VernonDeviceSampler *sampler;
-    VernonInlineValue inline_value;
   };
 } VernonPipelineArgument;
 
@@ -398,17 +399,16 @@ asset parameter constraint
         |
         v
 invoke-time value
-  VernonTensorView / VernonTextureView / VernonInlineValue
+  VernonTensorView / VernonTextureView / VernonDeviceSampler
 ```
 
 The asset stores type constraints; it never stores a concrete Python or C++
 object layout. Invocation supplies context-bound resources and concrete
 layouts.
 
-`VernonTensorView` preserves shape, byte strides, and byte offset, so the same
-ABI represents contiguous Tensors, interleaved vertex data, slices, and
-runtime swizzles. Vectors, matrices, and primitive scalar values use
-`VernonInlineValue` and do not require a device-buffer allocation.
+`VernonTensorView` preserves storage, shape, byte strides, byte offset, and
+byte span, so the same ABI represents borrowed host scalars/matrices, device
+Tensors, interleaved vertex data, slices, and runtime swizzles.
 
 Python `Tensor`/`TensorView` and Vernon C++ Tensor wrappers convert to borrowed
 `VernonTensorView` values. Python and Vernon Texture wrappers similarly convert

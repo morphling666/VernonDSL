@@ -195,6 +195,10 @@ VERNON_RUNTIME_CAPI VernonDeviceTexture *
 vernonRuntimeImportOpenGLTexture2D(VernonRuntimeContext *context,
                                    uint32_t texture, uint32_t width,
                                    uint32_t height, VernonTextureFormat format);
+/*
+ * Cube uploads contain six tightly packed faces in +X, -X, +Y, -Y, +Z, -Z
+ * order. The current host upload path supports one-mip RGBA8 textures.
+ */
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeTextureCopyFromHost(
     VernonDeviceTexture *texture, const void *source, size_t size);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeTextureCopyToHost(
@@ -258,7 +262,7 @@ vernonRuntimeComputeToGraphicsBarrier(VernonRuntimeContext *context);
 VERNON_RUNTIME_CAPI VernonStatus
 vernonRuntimeSynchronize(VernonRuntimeContext *context);
 
-enum { VERNON_PIPELINE_INVOCATION_ABI_VERSION = 1 };
+enum { VERNON_PIPELINE_INVOCATION_ABI_VERSION = 3 };
 
 typedef struct VernonFeatureSetView {
   const char *const *names;
@@ -280,14 +284,25 @@ typedef enum VernonValueAccess {
   VERNON_ACCESS_READ_WRITE = 2
 } VernonValueAccess;
 
+typedef enum VernonTensorStorage {
+  VERNON_TENSOR_HOST = 0,
+  VERNON_TENSOR_DEVICE = 1
+} VernonTensorStorage;
+
 typedef struct VernonTensorView {
-  VernonDeviceBuffer *buffer;
+  uint32_t struct_size;
+  VernonTensorStorage storage;
+  union {
+    const void *host_data;
+    VernonDeviceBuffer *buffer;
+  };
   VernonDataType dtype;
   VernonValueAccess access;
   uint32_t rank;
   const uint64_t *shape;
   const uint64_t *byte_strides;
   size_t byte_offset;
+  size_t byte_size;
 } VernonTensorView;
 
 typedef struct VernonTextureView {
@@ -298,21 +313,18 @@ typedef struct VernonTextureView {
   uint32_t width;
   uint32_t height;
   uint32_t depth;
+  /*
+   * Optional sampling policy for compiler-generated implicit sampler
+   * parameters. Explicit sampler parameters take precedence and ignore this
+   * field. The sampler must belong to the pipeline runtime context.
+   */
+  VernonDeviceSampler *sampler;
 } VernonTextureView;
-
-typedef struct VernonInlineValue {
-  VernonDataType dtype;
-  uint32_t rank;
-  const uint64_t *shape;
-  const void *data;
-  size_t data_size;
-} VernonInlineValue;
 
 typedef enum VernonPipelineArgumentKind {
   VERNON_PIPELINE_TENSOR = 0,
   VERNON_PIPELINE_TEXTURE = 1,
-  VERNON_PIPELINE_INLINE_VALUE = 2,
-  VERNON_PIPELINE_SAMPLER = 3
+  VERNON_PIPELINE_SAMPLER = 2
 } VernonPipelineArgumentKind;
 
 typedef struct VernonPipelineArgument {
@@ -321,7 +333,6 @@ typedef struct VernonPipelineArgument {
   union {
     VernonTensorView tensor;
     VernonTextureView texture;
-    VernonInlineValue inline_value;
     VernonDeviceSampler *sampler;
   };
 } VernonPipelineArgument;

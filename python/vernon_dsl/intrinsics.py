@@ -1,6 +1,6 @@
 """Editor-visible declarations for compiler-recognized DSL intrinsics."""
 
-from typing import Any
+from typing import Any, overload
 
 import numpy as np
 
@@ -70,6 +70,48 @@ def matmul(left: Any, right: Any) -> Any:
     return np.matmul(left, right)
 
 
-def texture_sample(texture: Any, sampler: Any, coordinates: Any) -> Any:
-    del texture, sampler, coordinates
+@overload
+def texture_sample(texture: Any, coordinates: Any) -> Any: ...
+
+
+@overload
+def texture_sample(texture: Any, coordinates: Any, lod: Any) -> Any: ...
+
+
+@overload
+def texture_sample(texture: Any, sampler: Any, coordinates: Any) -> Any: ...
+
+
+@overload
+def texture_sample(texture: Any, sampler: Any, coordinates: Any,
+                   lod: Any) -> Any: ...
+
+
+def texture_sample(texture: Any, *arguments: Any) -> Any:
+    del texture, arguments
     raise TypeError("texture_sample is device-only and cannot execute on host")
+
+
+def texture_size(texture: Any, lod: Any | None = None) -> Any:
+    del texture, lod
+    raise TypeError("texture_size is device-only and cannot execute on host")
+
+
+def resolution() -> Any:
+    raise TypeError("resolution is device-only and cannot execute on host")
+
+
+def fragment_coord() -> Any:
+    raise TypeError("fragment_coord is device-only and cannot execute on host")
+
+
+def front_facing() -> Any:
+    raise TypeError("front_facing is device-only and cannot execute on host")
+
+
+def vertex_id() -> Any:
+    raise TypeError("vertex_id is device-only and cannot execute on host")
+
+
+def instance_id() -> Any:
+    raise TypeError("instance_id is device-only and cannot execute on host")

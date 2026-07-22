@@ -154,23 +154,29 @@ class VariantPlan:
     key: tuple[str, ...]
     stages: Mapping[str, str]
     parameters: tuple[Mapping[str, Any], ...]
+    internal_parameters: tuple[Mapping[str, Any], ...]
     outputs: tuple[Mapping[str, Any], ...]
     steps: tuple[Mapping[str, Any], ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "stages", _frozen_mapping(self.stages))
-        for name in ("parameters", "outputs", "steps"):
+        for name in ("parameters", "internal_parameters", "outputs", "steps"):
             values = tuple(_frozen_mapping(value)
                            for value in getattr(self, name))
             object.__setattr__(self, name, values)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "key": list(self.key),
             "parameters": [dict(value) for value in self.parameters],
             "outputs": [dict(value) for value in self.outputs],
             "steps": [dict(value) for value in self.steps],
         }
+        if self.internal_parameters:
+            result["internal_parameters"] = [
+                dict(value) for value in self.internal_parameters
+            ]
+        return result
 
 
 @dataclass(frozen=True)
@@ -184,7 +190,7 @@ class BundlePlan:
     def logical_dict(self) -> dict[str, Any]:
         return {
             "schema_version": 2,
-            "invocation_abi_version": 1,
+            "invocation_abi_version": 3,
             "type": "pipeline",
             "id": self.pipeline_id,
             "target": self.target.target,
@@ -318,10 +324,30 @@ def _backend_name(name: str) -> str:
     return f"_{result}" if not result or result[0].isdigit() else result
 
 
-def external_parameters(
+def _internal_parameter_source(row: Mapping[str, Any]) -> str | None:
+    implicit = row.get("vernon.implicit")
+    system_value = (implicit
+                    if implicit == "resolution"
+                    else row.get("vernon.system_value"))
+    if system_value is not None:
+        if system_value != "resolution":
+            raise PipelineCompileError(
+                f"unsupported compiler system value {system_value!r}")
+        return "system_value"
+    if row.get("kind") == "sampler" and (
+            implicit == "sampler"
+            or row.get("vernon.implicit_sampler") is True
+            or row.get("vernon.compiler_generated") is True):
+        return "implicit_sampler"
+    return None
+
+
+def reflected_parameters(
     records: Mapping[str, Mapping[str, Any]],
-) -> dict[str, list[dict[str, Any]]]:
-    parameters: dict[str, list[dict[str, Any]]] = {}
+) -> tuple[dict[str, list[dict[str, Any]]],
+           dict[str, list[dict[str, Any]]]]:
+    external: dict[str, list[dict[str, Any]]] = {}
+    internal: dict[str, list[dict[str, Any]]] = {}
     for stage in ("compute", "vertex", "fragment"):
         record = records.get(stage)
         if record is None:
@@ -336,10 +362,15 @@ def external_parameters(
                     f"{stage} interface argument must be an object")
             if "vernon.builtin" in row or row.get("vernon.varying", False):
                 continue
+            internal_source = _internal_parameter_source(row)
             name = row.get("vernon.source_name")
             interface_name = row.get("vernon.interface")
-            if not isinstance(name, str) or not name or not isinstance(
-                    interface_name, str):
+            if internal_source is not None and (not isinstance(name, str)
+                                                or not name):
+                name = (f"__vernon_{internal_source}_{stage}_"
+                        f"{row.get('index', 0)}")
+            if (not isinstance(name, str) or not name
+                    or not isinstance(interface_name, str)):
                 raise PipelineCompileError(
                     f"{stage} external argument is missing source metadata")
             inferred_dtype, inferred_shape = dtype_and_shape(row.get("type"))
@@ -356,6 +387,10 @@ def external_parameters(
                 "access": row.get("access", "read"),
                 "dimension": row.get("dimension"),
             }
+            if internal_source is not None:
+                use["internal_source"] = internal_source
+                if internal_source == "system_value":
+                    use["system_value"] = "resolution"
             for key in ("vernon.location", "vernon.instance_divisor",
                         "vernon.set", "vernon.binding",
                         "sampled_texture_set", "sampled_texture_binding",
@@ -364,20 +399,34 @@ def external_parameters(
                     use[key] = row[key]
             backend_name = _backend_name(name)
             if interface_name == "uniform":
-                use["uniform_name"] = f"{backend_name}._m0"
+                if (record.get("target") in {"opengl", "opengles", "metal"}
+                        and "vernon.binding" not in row):
+                    use["uniform_name"] = backend_name
+                else:
+                    use["uniform_name"] = f"{backend_name}._m0"
             elif row.get("kind") == "texture":
                 use["uniform_name"] = backend_name
-            parameters.setdefault(name, []).append(use)
-    return parameters
+            table = internal if internal_source is not None else external
+            table.setdefault(name, []).append(use)
+    return external, internal
+
+
+def external_parameters(
+    records: Mapping[str, Mapping[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    return reflected_parameters(records)[0]
+
+
+def internal_parameters(
+    records: Mapping[str, Mapping[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    return reflected_parameters(records)[1]
 
 
 def classify_parameter_use(use: Mapping[str, Any]) -> str:
     kind = use.get("kind")
     if kind in {"texture", "sampler"}:
         return str(kind)
-    if (use.get("interface") == "uniform"
-            or (use.get("stage") == "compute" and kind != "tensor")):
-        return "inline"
     return "tensor"
 
 
@@ -418,6 +467,31 @@ def merge_parameter_uses(name: str,
     }
     return {key: value for key, value in parameter.items()
             if value is not None}
+
+
+def merge_internal_parameter_uses(
+        name: str, uses: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    parameter = merge_parameter_uses(name, uses)
+    sources = {use.get("internal_source") for use in uses}
+    if len(sources) != 1 or None in sources:
+        raise PipelineCompileError(
+            f"inconsistent internal pipeline parameter {name!r}")
+    source = next(iter(sources))
+    parameter["source"] = source
+    if source == "system_value":
+        values = {use.get("system_value") for use in uses}
+        if values != {"resolution"}:
+            raise PipelineCompileError(
+                f"inconsistent resolution system value {name!r}")
+        parameter["system_value"] = "resolution"
+        if parameter.get("dtype") != "f32" or parameter.get("shape") != [2]:
+            raise PipelineCompileError(
+                "resolution system value must have reflected type tensor<2xf32>"
+            )
+    elif parameter.get("kind") != "sampler":
+        raise PipelineCompileError(
+            "implicit sampler metadata must annotate a sampler argument")
+    return parameter
 
 
 def assign_parameter_slots(
@@ -516,16 +590,22 @@ def plan_variant(key: Sequence[str],
                 "graphics variants require vertex and fragment stages")
         validate_graphics_interfaces(records["vertex"], records["fragment"])
     external = external_parameters(records)
+    internal = internal_parameters(records)
     parameters = []
     for name in sorted(external, key=lambda value: slots[value]):
         parameter = merge_parameter_uses(name, external[name])
         parameter["slot"] = slots[name]
         parameters.append(parameter)
+    internal_rows = [
+        merge_internal_parameter_uses(name, internal[name])
+        for name in sorted(internal)
+    ]
     stage_ids = {
         stage: str(record["id"])
         for stage, record in records.items()
     }
     return VariantPlan(tuple(key), stage_ids, tuple(parameters),
+                       tuple(internal_rows),
                        tuple(fragment_outputs(records)),
                        tuple(build_steps(stage_ids)))
 

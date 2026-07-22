@@ -29,18 +29,18 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/DialectRegistry.h"
-#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/InitAllDialects.h"
 #include "mlir/InitAllExtensions.h"
+#include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/All.h"
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Target/SPIRV/Serialization.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
@@ -339,8 +339,7 @@ struct SampledTextureBinding {
 };
 
 using ResourceOrigins = std::set<unsigned>;
-using ResourceProvenance =
-    llvm::DenseMap<mlir::Value, ResourceOrigins>;
+using ResourceProvenance = llvm::DenseMap<mlir::Value, ResourceOrigins>;
 
 mlir::FailureOr<std::map<unsigned, std::set<SampledTextureBinding>>>
 analyzeSampledTextureBindings(mlir::func::FuncOp function) {
@@ -414,8 +413,7 @@ analyzeSampledTextureBindings(mlir::func::FuncOp function) {
          llvm::enumerate(operation->getSuccessors())) {
       mlir::SuccessorOperands successorOperands =
           branch.getSuccessorOperands(successorIndex);
-      for (unsigned argumentIndex =
-               successorOperands.getProducedOperandCount();
+      for (unsigned argumentIndex = successorOperands.getProducedOperandCount();
            argumentIndex < successorOperands.size() &&
            argumentIndex < successor->getNumArguments();
            ++argumentIndex)
@@ -442,17 +440,15 @@ analyzeSampledTextureBindings(mlir::func::FuncOp function) {
   function.walk([&](mlir::vernon::IntrinsicOp intrinsic) {
     if (intrinsic.getName() != "texture_sample")
       return;
-    const ResourceOrigins &textureOrigins =
-        provenance[intrinsic.getOperand(0)];
-    const ResourceOrigins &samplerOrigins =
-        provenance[intrinsic.getOperand(1)];
+    const ResourceOrigins &textureOrigins = provenance[intrinsic.getOperand(0)];
+    const ResourceOrigins &samplerOrigins = provenance[intrinsic.getOperand(1)];
     if (textureOrigins.empty() || samplerOrigins.empty()) {
-      intrinsic.emitError()
-          << "cannot resolve texture_sample "
-          << (textureOrigins.empty() && samplerOrigins.empty()
-                  ? "texture and sampler"
-                  : textureOrigins.empty() ? "texture" : "sampler")
-          << " provenance to entry arguments";
+      intrinsic.emitError() << "cannot resolve texture_sample "
+                            << (textureOrigins.empty() && samplerOrigins.empty()
+                                    ? "texture and sampler"
+                                : textureOrigins.empty() ? "texture"
+                                                         : "sampler")
+                            << " provenance to entry arguments";
       invalid = true;
       return;
     }
@@ -517,8 +513,8 @@ analyzeSampledTextureBindings(mlir::func::FuncOp function) {
   return samplerBindings;
 }
 
-mlir::FailureOr<std::string>
-buildReflection(mlir::ModuleOp module, mlir::ModuleOp sourceModule) {
+mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module,
+                                             mlir::ModuleOp sourceModule) {
   auto scalarDtype = [](mlir::Type type) -> std::string {
     if (type.isF16())
       return "f16";
@@ -820,8 +816,7 @@ std::unique_ptr<VernonCompileResult> validate(VernonCompilerContext *context,
   mlir::OwningOpRef<mlir::ModuleOp> reflectionModule(
       mlir::cast<mlir::ModuleOp>(module->clone()));
   mlir::PassManager reflectionPassManager(&context->context);
-  reflectionPassManager.addPass(
-      mlir::vernon::createVernonInlineHelpersPass());
+  reflectionPassManager.addPass(mlir::vernon::createVernonInlineHelpersPass());
   if (mlir::failed(reflectionPassManager.run(*reflectionModule))) {
     result->status = VERNON_STATUS_VERIFICATION_ERROR;
     return result;
@@ -920,8 +915,45 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module,
   return true;
 }
 
+bool materializeImageQuerySizeLod(llvm::SmallVectorImpl<uint32_t> &words,
+                                  std::string &diagnostics) {
+  constexpr uint16_t opImage = 100;
+  constexpr uint16_t opIAdd = 128;
+  constexpr uint16_t opImageQuerySizeLod = 103;
+  if (words.size() < 5)
+    return true;
+
+  size_t previousPrevious = 0;
+  size_t previous = 0;
+  for (size_t cursor = 5; cursor < words.size();) {
+    const uint16_t wordCount = static_cast<uint16_t>(words[cursor] >> 16);
+    const uint16_t opcode = static_cast<uint16_t>(words[cursor]);
+    if (wordCount == 0 || cursor + wordCount > words.size()) {
+      diagnostics = "serialized SPIR-V instruction stream is malformed";
+      return false;
+    }
+    if (opcode == opIAdd && wordCount == 5 && previous >= 5 &&
+        previousPrevious >= 5 &&
+        static_cast<uint16_t>(words[previous]) == opIAdd &&
+        static_cast<uint16_t>(words[previous] >> 16) == 5 &&
+        static_cast<uint16_t>(words[previousPrevious]) == opImage) {
+      const uint32_t imageId = words[previousPrevious + 2];
+      const uint32_t lodId = words[previous + 2];
+      words[cursor] =
+          (static_cast<uint32_t>(wordCount) << 16) | opImageQuerySizeLod;
+      words[cursor + 3] = imageId;
+      words[cursor + 4] = lodId;
+    }
+    previousPrevious = previous;
+    previous = cursor;
+    cursor += wordCount;
+  }
+  return true;
+}
+
 bool compileVulkan(VernonCompilerContext *context, const char *source,
-                   size_t sourceSize, VernonCompileResult &result) {
+                   size_t sourceSize, VernonTarget target,
+                   VernonCompileResult &result) {
   mlir::ScopedDiagnosticHandler handler(
       &context->context, [&](mlir::Diagnostic &diagnostic) {
         appendDiagnostic(result.diagnostics, diagnostic);
@@ -944,7 +976,8 @@ bool compileVulkan(VernonCompilerContext *context, const char *source,
   passManager.addNestedPass<mlir::gpu::GPUModuleOp>(
       mlir::createConvertMathToSPIRVPass());
   passManager.addPass(mlir::createConvertGPUToSPIRVPass());
-  passManager.addPass(mlir::vernon::createVernonToSPIRVPass());
+  passManager.addPass(
+      mlir::vernon::createVernonToSPIRVPass(target == VERNON_TARGET_VULKAN));
   passManager.addNestedPass<mlir::spirv::ModuleOp>(
       mlir::spirv::createSPIRVLowerABIAttributesPass());
   passManager.addNestedPass<mlir::spirv::ModuleOp>(
@@ -968,6 +1001,8 @@ bool compileVulkan(VernonCompilerContext *context, const char *source,
   for (auto [index, spirvModule] : llvm::enumerate(spirvModules)) {
     llvm::SmallVector<uint32_t> words;
     if (mlir::failed(mlir::spirv::serialize(spirvModule, words)))
+      return false;
+    if (!materializeImageQuerySizeLod(words, result.diagnostics))
       return false;
     std::string binary(reinterpret_cast<const char *>(words.data()),
                        words.size() * sizeof(uint32_t));
@@ -1590,7 +1625,7 @@ VernonCompileResult *vernonCompilerCompileMlirWithOptions(
   if (target == VERNON_TARGET_VULKAN || target == VERNON_TARGET_OPENGL ||
       target == VERNON_TARGET_OPENGL_ES || target == VERNON_TARGET_METAL) {
     result->diagnostics.clear();
-    if (compileVulkan(context, source, sourceSize, *result)) {
+    if (compileVulkan(context, source, sourceSize, target, *result)) {
 #if defined(VERNON_HAS_SPIRV_CROSS)
       if (target != VERNON_TARGET_VULKAN &&
           !crossCompile(*result, target, glslVersion)) {

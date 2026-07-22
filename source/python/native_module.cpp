@@ -262,11 +262,9 @@ struct LoadedPipeline {
     std::vector<VernonPipelineArgument> arguments;
     std::vector<std::vector<uint64_t>> shapes;
     std::vector<std::vector<uint64_t>> strides;
-    std::vector<std::string> inlineStorage;
     arguments.reserve(argumentValues.size());
     shapes.reserve(argumentValues.size());
     strides.reserve(argumentValues.size());
-    inlineStorage.reserve(argumentValues.size());
     for (nb::handle value : argumentValues) {
       nb::tuple row = nb::cast<nb::tuple>(value);
       const std::string kind = nb::cast<std::string>(row[0]);
@@ -280,28 +278,50 @@ struct LoadedPipeline {
         strides.push_back(nb::cast<std::vector<uint64_t>>(row[6]));
         argument.slot = nb::cast<uint32_t>(row[1]);
         argument.kind = VERNON_PIPELINE_TENSOR;
-        argument.tensor = {
-            buffer->handle,
-            static_cast<VernonDataType>(nb::cast<uint32_t>(row[3])),
-            static_cast<VernonValueAccess>(nb::cast<uint32_t>(row[4])),
-            static_cast<uint32_t>(shapes.back().size()),
-            shapes.back().data(),
-            strides.back().data(),
-            nb::cast<size_t>(row[7]),
-        };
-      } else if (kind == "inline" && row.size() == 5) {
-        nb::bytes bytes = nb::cast<nb::bytes>(row[3]);
-        inlineStorage.emplace_back(bytes.c_str(), bytes.size());
-        shapes.push_back(nb::cast<std::vector<uint64_t>>(row[4]));
+        argument.tensor.struct_size = sizeof(VernonTensorView);
+        argument.tensor.storage = VERNON_TENSOR_DEVICE;
+        argument.tensor.buffer = buffer->handle;
+        argument.tensor.dtype =
+            static_cast<VernonDataType>(nb::cast<uint32_t>(row[3]));
+        argument.tensor.access =
+            static_cast<VernonValueAccess>(nb::cast<uint32_t>(row[4]));
+        argument.tensor.rank = static_cast<uint32_t>(shapes.back().size());
+        argument.tensor.shape = shapes.back().data();
+        argument.tensor.byte_strides = strides.back().data();
+        argument.tensor.byte_offset = nb::cast<size_t>(row[7]);
+        argument.tensor.byte_size = buffer->size;
+      } else if (kind == "tensor" && row.size() == 5) {
+        nb::object array = nb::borrow<nb::object>(row[2]);
+        shapes.push_back(nb::cast<std::vector<uint64_t>>(array.attr("shape")));
+        const std::vector<int64_t> signedStrides =
+            nb::cast<std::vector<int64_t>>(array.attr("strides"));
+        if (signedStrides.size() != shapes.back().size())
+          throw std::runtime_error("NumPy Tensor shape/stride mismatch");
+        strides.emplace_back();
+        size_t span = nb::cast<size_t>(array.attr("dtype").attr("itemsize"));
+        for (size_t dimension = 0; dimension < signedStrides.size();
+             ++dimension) {
+          if (signedStrides[dimension] <= 0)
+            throw std::runtime_error("NumPy Tensor strides must be positive");
+          strides.back().push_back(
+              static_cast<uint64_t>(signedStrides[dimension]));
+          span += (shapes.back()[dimension] - 1) * strides.back()[dimension];
+        }
         argument.slot = nb::cast<uint32_t>(row[1]);
-        argument.kind = VERNON_PIPELINE_INLINE_VALUE;
-        argument.inline_value = {
-            static_cast<VernonDataType>(nb::cast<uint32_t>(row[2])),
-            static_cast<uint32_t>(shapes.back().size()),
-            shapes.back().data(),
-            inlineStorage.back().data(),
-            inlineStorage.back().size(),
-        };
+        argument.kind = VERNON_PIPELINE_TENSOR;
+        argument.tensor.struct_size = sizeof(VernonTensorView);
+        argument.tensor.storage = VERNON_TENSOR_HOST;
+        argument.tensor.host_data = reinterpret_cast<const void *>(
+            nb::cast<uintptr_t>(array.attr("ctypes").attr("data")));
+        argument.tensor.dtype =
+            static_cast<VernonDataType>(nb::cast<uint32_t>(row[3]));
+        argument.tensor.access =
+            static_cast<VernonValueAccess>(nb::cast<uint32_t>(row[4]));
+        argument.tensor.rank = static_cast<uint32_t>(shapes.back().size());
+        argument.tensor.shape = shapes.back().data();
+        argument.tensor.byte_strides = strides.back().data();
+        argument.tensor.byte_offset = 0;
+        argument.tensor.byte_size = span;
       } else if (kind == "texture" && row.size() == 9) {
         Texture *texture = nb::cast<Texture *>(row[2]);
         if (!texture || texture->owner != owner)
@@ -317,6 +337,7 @@ struct LoadedPipeline {
             nb::cast<uint32_t>(row[6]),
             nb::cast<uint32_t>(row[7]),
             nb::cast<uint32_t>(row[8]),
+            nullptr,
         };
       } else if (kind == "sampler" && row.size() == 3) {
         Sampler *sampler = nb::cast<Sampler *>(row[2]);
@@ -618,6 +639,8 @@ NB_MODULE(_native, module) {
   module.attr("DATA_F16") = static_cast<uint32_t>(VERNON_DATA_F16);
   module.attr("DATA_F32") = static_cast<uint32_t>(VERNON_DATA_F32);
   module.attr("DATA_F64") = static_cast<uint32_t>(VERNON_DATA_F64);
+  module.attr("ACCESS_READ") = static_cast<uint32_t>(VERNON_ACCESS_READ);
+  module.attr("ACCESS_WRITE") = static_cast<uint32_t>(VERNON_ACCESS_WRITE);
   module.attr("ACCESS_READ_WRITE") =
       static_cast<uint32_t>(VERNON_ACCESS_READ_WRITE);
   module.attr("TOPOLOGY_TRIANGLE_LIST") =

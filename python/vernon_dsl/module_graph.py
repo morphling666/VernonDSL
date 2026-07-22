@@ -821,7 +821,13 @@ class ModuleGraph:
             "Texture",
             "builtin",
             "resource",
+            "fragment_coord",
+            "front_facing",
+            "instance_id",
+            "resolution",
             "texture_sample",
+            "texture_size",
+            "vertex_id",
         }
         annotations: list[ast.expr] = [
             argument.annotation for argument in node.args.args
@@ -841,11 +847,19 @@ class ModuleGraph:
             if not isinstance(value, ast.Call):
                 continue
             name = (_dotted_name(value.func) or "").split(".")[-1]
-            if name == "texture_sample":
+            if name in {
+                    "fragment_coord",
+                    "front_facing",
+                    "instance_id",
+                    "resolution",
+                    "texture_sample",
+                    "texture_size",
+                    "vertex_id",
+            }:
                 self._error(
                     module, value,
                     f"shared function '{node.name}' uses device-only operation "
-                    "'texture_sample'")
+                    f"'{name}'")
 
     def _symbol_prefix(self, module: _Module) -> str:
         relative = self._display_path(module.path).removesuffix(".py")

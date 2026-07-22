@@ -1,5 +1,9 @@
 #include "VernonRuntime.h"
+#include "runtime/content_hash.h"
 
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -19,9 +23,27 @@ TEST(RuntimeVulkanPipeline, SupportsTexturesAndRendering) {
 
   const std::filesystem::path manifestPath = VERNON_VULKAN_PIPELINE_BUNDLE;
   std::ifstream input(manifestPath, std::ios::binary);
-  const std::string bundle((std::istreambuf_iterator<char>(input)),
-                           std::istreambuf_iterator<char>());
+  std::string bundle((std::istreambuf_iterator<char>(input)),
+                     std::istreambuf_iterator<char>());
   ASSERT_TRUE(!bundle.empty());
+  nlohmann::json document = nlohmann::json::parse(bundle);
+  nlohmann::json &parameters = document["variants"][0]["parameters"];
+  const auto samplerRow = std::find_if(
+      parameters.begin(), parameters.end(), [](const nlohmann::json &row) {
+        return row.value("kind", "") == "sampler";
+      });
+  ASSERT_NE(samplerRow, parameters.end());
+  nlohmann::json implicitSampler = *samplerRow;
+  implicitSampler.erase("slot");
+  implicitSampler["source"] = "implicit_sampler";
+  parameters.erase(samplerRow);
+  document["variants"][0]["internal_parameters"] =
+      nlohmann::json::array({std::move(implicitSampler)});
+  document.erase("content_hash");
+  const std::string canonical = document.dump(-1, ' ', false);
+  document["content_hash"] =
+      vernon::runtime::sha256Hex(canonical.data(), canonical.size());
+  bundle = document.dump(-1, ' ', false);
 
   VernonRuntimeContext *runtime = vernonRuntimeCreate(VERNON_RUNTIME_VULKAN, 0);
   ASSERT_TRUE(runtime);
@@ -80,6 +102,7 @@ TEST(RuntimeVulkanPipeline, SupportsTexturesAndRendering) {
   VernonLoadedPipeline *pipeline =
       vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
   ASSERT_TRUE(pipeline);
+  ASSERT_EQ(vernonRuntimeLoadedPipelineGetParameterCount(pipeline), 2u);
 
   constexpr float positions[] = {-0.8f, -0.8f, 0.8f, -0.8f, 0.0f, 0.8f};
   VernonDeviceBuffer *vertices =
@@ -113,13 +136,12 @@ TEST(RuntimeVulkanPipeline, SupportsTexturesAndRendering) {
   samplerDescriptor.min_filter = VERNON_SAMPLER_NEAREST;
   samplerDescriptor.mag_filter = VERNON_SAMPLER_NEAREST;
   samplerDescriptor.mip_filter = VERNON_SAMPLER_NEAREST;
-  VernonDeviceSampler *sampler =
+  VernonDeviceSampler *textureSampler =
       vernonRuntimeSamplerCreate(runtime, &samplerDescriptor);
-  ASSERT_TRUE(sampler);
-
+  ASSERT_TRUE(textureSampler);
   const uint64_t shape[] = {3, 2};
   const uint64_t strides[] = {2 * sizeof(float), sizeof(float)};
-  VernonPipelineArgument arguments[3]{};
+  VernonPipelineArgument arguments[2]{};
   arguments[0].slot = 0; // Slots are stable and sorted by source name.
   arguments[0].kind = VERNON_PIPELINE_TEXTURE;
   arguments[0].texture = {sampled,
@@ -128,26 +150,38 @@ TEST(RuntimeVulkanPipeline, SupportsTexturesAndRendering) {
                           VERNON_TEXTURE_2D,
                           1,
                           1,
-                          1};
+                          1,
+                          textureSampler};
   arguments[1].slot = 1;
   arguments[1].kind = VERNON_PIPELINE_TENSOR;
-  arguments[1].tensor = {
-      vertices, VERNON_DATA_F32, VERNON_ACCESS_READ, 2, shape, strides, 0};
-  arguments[2].slot = 2;
-  arguments[2].kind = VERNON_PIPELINE_SAMPLER;
-  arguments[2].sampler = sampler;
+  arguments[1].tensor.struct_size = sizeof(VernonTensorView);
+  arguments[1].tensor.storage = VERNON_TENSOR_DEVICE;
+  arguments[1].tensor.buffer = vertices;
+  arguments[1].tensor.dtype = VERNON_DATA_F32;
+  arguments[1].tensor.access = VERNON_ACCESS_READ;
+  arguments[1].tensor.rank = 2;
+  arguments[1].tensor.shape = shape;
+  arguments[1].tensor.byte_strides = strides;
+  arguments[1].tensor.byte_size = sizeof(positions);
   VernonColorAttachment attachment{0, target};
   VernonPipelineInvocation invocation{};
   invocation.struct_size = sizeof(invocation);
   invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
   invocation.arguments = arguments;
-  invocation.argument_count = 3;
+  invocation.argument_count = std::size(arguments);
   invocation.color_attachments = &attachment;
   invocation.color_attachment_count = 1;
   invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
   invocation.instance_count = 1;
-  ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) ==
-              VERNON_STATUS_OK);
+  ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation),
+            VERNON_STATUS_OK)
+      << std::string(vernonRuntimeGetLastError(runtime).data,
+                     vernonRuntimeGetLastError(runtime).size);
+  arguments[0].texture.sampler = nullptr;
+  ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation),
+            VERNON_STATUS_OK)
+      << std::string(vernonRuntimeGetLastError(runtime).data,
+                     vernonRuntimeGetLastError(runtime).size);
 
   std::vector<uint8_t> pixels(32 * 32 * 4);
   ASSERT_TRUE(vernonRuntimeTextureCopyToHost(
@@ -162,7 +196,7 @@ TEST(RuntimeVulkanPipeline, SupportsTexturesAndRendering) {
   ASSERT_TRUE(pixels[center + 1] > 190 && pixels[center + 1] < 210);
   ASSERT_TRUE(pixels[center + 2] > 90 && pixels[center + 2] < 110);
 
-  ASSERT_TRUE(vernonRuntimeSamplerFree(sampler) == VERNON_STATUS_OK);
+  ASSERT_TRUE(vernonRuntimeSamplerFree(textureSampler) == VERNON_STATUS_OK);
   ASSERT_TRUE(vernonRuntimeTextureFree(sampled) == VERNON_STATUS_OK);
   ASSERT_TRUE(vernonRuntimeTextureFree(target) == VERNON_STATUS_OK);
   ASSERT_TRUE(vernonRuntimeBufferFree(vertices) == VERNON_STATUS_OK);

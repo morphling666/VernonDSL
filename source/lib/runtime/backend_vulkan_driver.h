@@ -26,6 +26,7 @@ struct VulkanDriver {
   PFN_vkEnumeratePhysicalDevices enumeratePhysicalDevices{};
   PFN_vkGetPhysicalDeviceQueueFamilyProperties
       getPhysicalDeviceQueueFamilyProperties{};
+  PFN_vkGetPhysicalDeviceProperties getPhysicalDeviceProperties{};
   PFN_vkGetPhysicalDeviceMemoryProperties getPhysicalDeviceMemoryProperties{};
   PFN_vkGetPhysicalDeviceFormatProperties getPhysicalDeviceFormatProperties{};
   PFN_vkCreateDevice createDevice{};

@@ -11,8 +11,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -52,6 +54,8 @@ struct Parameter {
   uint32_t slot{};
   std::string name;
   std::string kind;
+  std::string source;
+  std::string systemValue;
   std::string dtype;
   std::string access;
   std::string dimension;
@@ -104,6 +108,7 @@ struct Stage {
 struct Variant {
   std::vector<std::string> key;
   std::vector<Parameter> parameters;
+  std::vector<Parameter> internalParameters;
   std::vector<Output> outputs;
   std::string compute;
   std::string vertex;
@@ -173,6 +178,7 @@ struct VernonRuntimeContext {
   VkDevice vulkanDevice{};
   VkQueue vulkanQueue{};
   uint32_t vulkanQueueFamily{};
+  uint32_t vulkanMaxPushConstantsSize{};
   VkCommandPool vulkanCommandPool{};
   VkPhysicalDeviceMemoryProperties vulkanMemoryProperties{};
 #endif
@@ -524,6 +530,10 @@ bool initializeVulkanContext(VernonRuntimeContext *context,
                                       devices.data()) != VK_SUCCESS)
     return failInitialization();
   context->vulkanPhysicalDevice = devices[deviceIndex];
+  VkPhysicalDeviceProperties properties{};
+  driver.getPhysicalDeviceProperties(context->vulkanPhysicalDevice,
+                                     &properties);
+  context->vulkanMaxPushConstantsSize = properties.limits.maxPushConstantsSize;
   uint32_t queueCount = 0;
   driver.getPhysicalDeviceQueueFamilyProperties(context->vulkanPhysicalDevice,
                                                 &queueCount, nullptr);
@@ -725,8 +735,7 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use,
         return false;
       }
       use.sampledTextureBindings.push_back(
-          {binding["set"].get<uint32_t>(),
-           binding["binding"].get<uint32_t>()});
+          {binding["set"].get<uint32_t>(), binding["binding"].get<uint32_t>()});
     }
   } else {
     const uint32_t sampledTextureSet =
@@ -808,16 +817,20 @@ bool parseVariant(const nlohmann::json &value, Variant &variant,
     error = "pipeline variant feature key is not canonical";
     return false;
   }
-  for (const nlohmann::json &row : value["parameters"]) {
-    if (!row.is_object() || !row.contains("slot") || !row.contains("uses") ||
-        !row["uses"].is_array()) {
-      error = "pipeline parameter record is invalid";
+  auto parseParameter = [&](const nlohmann::json &row, bool internal,
+                            Parameter &parameter) {
+    if (!row.is_object() || (!internal && !row.contains("slot")) ||
+        !row.contains("uses") || !row["uses"].is_array()) {
+      error = internal ? "internal pipeline parameter record is invalid"
+                       : "pipeline parameter record is invalid";
       return false;
     }
-    Parameter parameter;
-    parameter.slot = row["slot"].get<uint32_t>();
+    if (!internal)
+      parameter.slot = row["slot"].get<uint32_t>();
     parameter.name = row.value("name", "");
     parameter.kind = row.value("kind", "");
+    parameter.source = row.value("source", "");
+    parameter.systemValue = row.value("system_value", "");
     parameter.dtype = row.value("dtype", "");
     parameter.access = row.value("access", "read");
     parameter.dimension = row.value("dimension", "");
@@ -833,10 +846,46 @@ bool parseVariant(const nlohmann::json &value, Variant &variant,
       parameter.uses.push_back(std::move(use));
     }
     if (parameter.name.empty() || parameter.uses.empty()) {
-      error = "pipeline parameter has no name or uses";
+      error = internal ? "internal pipeline parameter has no name or uses"
+                       : "pipeline parameter has no name or uses";
       return false;
     }
+    if (internal) {
+      const bool implicitSampler = parameter.source == "implicit_sampler" &&
+                                   parameter.kind == "sampler" &&
+                                   parameter.systemValue.empty();
+      const bool resolution = parameter.source == "system_value" &&
+                              parameter.systemValue == "resolution" &&
+                              parameter.kind == "tensor" &&
+                              parameter.dtype == "f32" &&
+                              parameter.shape == std::vector<uint64_t>{2};
+      if (!implicitSampler && !resolution) {
+        error = "internal pipeline parameter metadata is unsupported";
+        return false;
+      }
+    } else if (!parameter.source.empty() || !parameter.systemValue.empty()) {
+      error = "external pipeline parameter contains internal metadata";
+      return false;
+    }
+    return true;
+  };
+  for (const nlohmann::json &row : value["parameters"]) {
+    Parameter parameter;
+    if (!parseParameter(row, false, parameter))
+      return false;
     variant.parameters.push_back(std::move(parameter));
+  }
+  const nlohmann::json internalRows =
+      value.value("internal_parameters", nlohmann::json::array());
+  if (!internalRows.is_array()) {
+    error = "internal_parameters must be an array";
+    return false;
+  }
+  for (const nlohmann::json &row : internalRows) {
+    Parameter parameter;
+    if (!parseParameter(row, true, parameter))
+      return false;
+    variant.internalParameters.push_back(std::move(parameter));
   }
   std::sort(variant.parameters.begin(), variant.parameters.end(),
             [](const Parameter &left, const Parameter &right) {
@@ -848,6 +897,28 @@ bool parseVariant(const nlohmann::json &value, Variant &variant,
                          }) != variant.parameters.end()) {
     error = "pipeline variant contains duplicate parameter slots";
     return false;
+  }
+  std::sort(variant.internalParameters.begin(),
+            variant.internalParameters.end(),
+            [](const Parameter &left, const Parameter &right) {
+              return left.name < right.name;
+            });
+  if (std::adjacent_find(variant.internalParameters.begin(),
+                         variant.internalParameters.end(),
+                         [](const Parameter &left, const Parameter &right) {
+                           return left.name == right.name;
+                         }) != variant.internalParameters.end()) {
+    error = "pipeline variant contains duplicate internal parameters";
+    return false;
+  }
+  for (const Parameter &parameter : variant.internalParameters) {
+    if (parameter.source != "implicit_sampler")
+      continue;
+    for (const ParameterUse &use : parameter.uses)
+      if (use.sampledTextureBindings.empty()) {
+        error = "implicit sampler has no paired sampled texture binding";
+        return false;
+      }
   }
   for (const nlohmann::json &row :
        value.value("outputs", nlohmann::json::array())) {
@@ -1274,9 +1345,7 @@ bool argumentKindMatches(const Parameter &parameter,
          (parameter.kind == "texture" &&
           argument.kind == VERNON_PIPELINE_TEXTURE) ||
          (parameter.kind == "sampler" &&
-          argument.kind == VERNON_PIPELINE_SAMPLER) ||
-         (parameter.kind == "inline" &&
-          argument.kind == VERNON_PIPELINE_INLINE_VALUE);
+          argument.kind == VERNON_PIPELINE_SAMPLER);
 }
 
 std::optional<VernonPipelineArgumentKind>
@@ -1287,8 +1356,6 @@ pipelineArgumentKind(const std::string &kind) {
     return VERNON_PIPELINE_TEXTURE;
   if (kind == "sampler")
     return VERNON_PIPELINE_SAMPLER;
-  if (kind == "inline")
-    return VERNON_PIPELINE_INLINE_VALUE;
   return std::nullopt;
 }
 
@@ -1306,6 +1373,164 @@ std::optional<VernonDataType> pipelineDataType(const std::string &dtype) {
   if (dtype == "f64")
     return VERNON_DATA_F64;
   return std::nullopt;
+}
+
+size_t dataTypeSize(VernonDataType dtype) {
+  switch (dtype) {
+  case VERNON_DATA_BOOL:
+    return 1;
+  case VERNON_DATA_F16:
+    return 2;
+  case VERNON_DATA_I32:
+  case VERNON_DATA_U32:
+  case VERNON_DATA_F32:
+    return 4;
+  case VERNON_DATA_F64:
+    return 8;
+  }
+  return 0;
+}
+
+std::optional<size_t> tensorRequiredSpan(const VernonTensorView &tensor) {
+  const size_t elementSize = dataTypeSize(tensor.dtype);
+  if (!elementSize || (tensor.rank && (!tensor.shape || !tensor.byte_strides)))
+    return std::nullopt;
+  size_t span = elementSize;
+  for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension) {
+    if (!tensor.shape[dimension] || !tensor.byte_strides[dimension])
+      return std::nullopt;
+    const uint64_t steps = tensor.shape[dimension] - 1;
+    if (steps > (std::numeric_limits<size_t>::max() - span) /
+                    tensor.byte_strides[dimension])
+      return std::nullopt;
+    span += static_cast<size_t>(steps * tensor.byte_strides[dimension]);
+  }
+  return span;
+}
+
+bool validTensorView(VernonRuntimeContext *context,
+                     const VernonTensorView &tensor) {
+  if (tensor.struct_size < sizeof(VernonTensorView) ||
+      tensor.access > VERNON_ACCESS_READ_WRITE ||
+      (tensor.storage != VERNON_TENSOR_HOST &&
+       tensor.storage != VERNON_TENSOR_DEVICE))
+    return false;
+  const std::optional<size_t> span = tensorRequiredSpan(tensor);
+  if (!span || tensor.byte_offset > tensor.byte_size ||
+      *span > tensor.byte_size - tensor.byte_offset)
+    return false;
+  if (tensor.storage == VERNON_TENSOR_HOST)
+    return tensor.host_data != nullptr;
+  return tensor.buffer && tensor.buffer->context == context &&
+         tensor.byte_size <= tensor.buffer->size;
+}
+
+const uint8_t *hostTensorData(const VernonTensorView &tensor) {
+  return static_cast<const uint8_t *>(tensor.host_data) + tensor.byte_offset;
+}
+
+std::optional<size_t> tensorElementCount(const VernonTensorView &tensor) {
+  size_t count = 1;
+  for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension) {
+    if (tensor.shape[dimension] > std::numeric_limits<size_t>::max() / count)
+      return std::nullopt;
+    count *= static_cast<size_t>(tensor.shape[dimension]);
+  }
+  return count;
+}
+
+bool isRowMajorContiguous(const VernonTensorView &tensor) {
+  size_t stride = dataTypeSize(tensor.dtype);
+  for (uint32_t dimension = tensor.rank; dimension-- > 0;) {
+    if (tensor.byte_strides[dimension] != stride)
+      return false;
+    stride *= static_cast<size_t>(tensor.shape[dimension]);
+  }
+  return true;
+}
+
+std::optional<std::vector<uint8_t>>
+packTensorRowMajor(const VernonTensorView &tensor) {
+  if (tensor.storage != VERNON_TENSOR_HOST)
+    return std::nullopt;
+  const std::optional<size_t> elementCount = tensorElementCount(tensor);
+  const size_t elementSize = dataTypeSize(tensor.dtype);
+  if (!elementCount ||
+      *elementCount > std::numeric_limits<size_t>::max() / elementSize)
+    return std::nullopt;
+  std::vector<uint8_t> packed(*elementCount * elementSize);
+  const uint8_t *source = hostTensorData(tensor);
+  for (size_t linear = 0; linear < *elementCount; ++linear) {
+    size_t remainder = linear;
+    size_t sourceOffset = 0;
+    for (uint32_t dimension = tensor.rank; dimension-- > 0;) {
+      const size_t index = remainder % tensor.shape[dimension];
+      remainder /= tensor.shape[dimension];
+      sourceOffset += index * tensor.byte_strides[dimension];
+    }
+    std::memcpy(packed.data() + linear * elementSize, source + sourceOffset,
+                elementSize);
+  }
+  return packed;
+}
+
+struct VulkanPushConstantLayout {
+  uint32_t alignment{};
+  uint32_t hostSize{};
+  uint32_t storageSize{};
+  uint32_t matrixColumnSize{};
+  uint32_t matrixStride{};
+  uint32_t matrixColumns{};
+};
+
+std::optional<uint32_t> vulkanScalarSize(const std::string &dtype) {
+  if (dtype == "i32" || dtype == "u32" || dtype == "f32")
+    return 4;
+  if (dtype == "f16")
+    return 2;
+  if (dtype == "f64")
+    return 8;
+  return std::nullopt;
+}
+
+std::optional<VulkanPushConstantLayout>
+vulkanPushConstantLayout(const ParameterUse &use, std::string &error) {
+  const std::optional<uint32_t> scalarSize = vulkanScalarSize(use.dtype);
+  if (!scalarSize) {
+    error = "Vulkan push constant has unsupported reflected dtype '" +
+            use.dtype + "'";
+    return std::nullopt;
+  }
+  if (use.shape.empty())
+    return VulkanPushConstantLayout{*scalarSize, *scalarSize, *scalarSize};
+  if (use.shape.size() > 2) {
+    error = "Vulkan push constants support only scalars, vectors, and matrices";
+    return std::nullopt;
+  }
+  const uint64_t rows = use.shape[0];
+  if (rows < 2 || rows > 4) {
+    error = "Vulkan push constant vector dimension must be between 2 and 4";
+    return std::nullopt;
+  }
+  const uint32_t rowCount = static_cast<uint32_t>(rows);
+  const uint32_t vectorAlignment = (rowCount == 2 ? 2 : 4) * *scalarSize;
+  const uint32_t vectorSize = rowCount * *scalarSize;
+  if (use.shape.size() == 1)
+    return VulkanPushConstantLayout{vectorAlignment, vectorSize, vectorSize};
+  const uint64_t columns = use.shape[1];
+  if (columns < 2 || columns > 4) {
+    error = "Vulkan push constant matrix dimension must be between 2 and 4";
+    return std::nullopt;
+  }
+  const uint32_t columnCount = static_cast<uint32_t>(columns);
+  const uint32_t stride =
+      (vectorSize + vectorAlignment - 1) / vectorAlignment * vectorAlignment;
+  return VulkanPushConstantLayout{vectorAlignment,
+                                  vectorSize * columnCount,
+                                  stride * columnCount,
+                                  vectorSize,
+                                  stride,
+                                  columnCount};
 }
 
 std::optional<VernonValueAccess>
@@ -1327,6 +1552,7 @@ prepareComputeLaunch(VernonRuntimeContext *context, const Variant &variant,
                      const PipelineArgumentMap &arguments,
                      const VernonPipelineInvocation &invocation,
                      std::vector<VernonLaunchArgument> &launchArguments,
+                     std::deque<std::vector<uint8_t>> &hostTensorStorage,
                      VernonLaunchSize &grid) {
   struct IndexedArgument {
     uint32_t index;
@@ -1339,21 +1565,35 @@ prepareComputeLaunch(VernonRuntimeContext *context, const Variant &variant,
       if (use.stage != "compute")
         continue;
       VernonLaunchArgument argument{};
-      if (supplied.kind == VERNON_PIPELINE_TENSOR) {
+      if (supplied.kind != VERNON_PIPELINE_TENSOR)
+        return fail(context, "compute argument kind is unsupported");
+      if (supplied.tensor.storage == VERNON_TENSOR_DEVICE) {
         if (!supplied.tensor.buffer ||
             supplied.tensor.buffer->context != context ||
-            supplied.tensor.byte_offset != 0)
-          return fail(context, "compute Tensor view is invalid");
+            supplied.tensor.byte_offset != 0 ||
+            !isRowMajorContiguous(supplied.tensor))
+          return fail(
+              context,
+              "compute device Tensor must be a contiguous whole-buffer view");
         argument.kind = VERNON_LAUNCH_TENSOR;
         argument.buffer = supplied.tensor.buffer;
-      } else if (supplied.kind == VERNON_PIPELINE_INLINE_VALUE) {
-        if (!supplied.inline_value.data || !supplied.inline_value.data_size)
-          return fail(context, "compute inline value is empty");
-        argument.kind = VERNON_LAUNCH_SCALAR;
-        argument.scalar_data = supplied.inline_value.data;
-        argument.scalar_size = supplied.inline_value.data_size;
       } else {
-        return fail(context, "compute argument kind is unsupported");
+        const std::optional<size_t> elementCount =
+            tensorElementCount(supplied.tensor);
+        const size_t elementSize = dataTypeSize(supplied.tensor.dtype);
+        if (!elementCount)
+          return fail(context, "compute host Tensor is invalid");
+        argument.kind = VERNON_LAUNCH_SCALAR;
+        argument.scalar_size = *elementCount * elementSize;
+        if (isRowMajorContiguous(supplied.tensor)) {
+          argument.scalar_data = hostTensorData(supplied.tensor);
+        } else {
+          auto packed = packTensorRowMajor(supplied.tensor);
+          if (!packed)
+            return fail(context, "failed to pack compute host Tensor");
+          hostTensorStorage.push_back(std::move(*packed));
+          argument.scalar_data = hostTensorStorage.back().data();
+        }
       }
       indexed.push_back({use.index, argument});
     }
@@ -1369,8 +1609,9 @@ prepareComputeLaunch(VernonRuntimeContext *context, const Variant &variant,
   if (!grid.x || !grid.y || !grid.z) {
     for (const auto &[slot, argument] : arguments) {
       (void)slot;
-      if (argument->kind != VERNON_PIPELINE_TENSOR || !argument->tensor.rank ||
-          !argument->tensor.shape)
+      if (argument->kind != VERNON_PIPELINE_TENSOR ||
+          argument->tensor.storage != VERNON_TENSOR_DEVICE ||
+          !argument->tensor.rank || !argument->tensor.shape)
         continue;
       grid = {1, 1, 1};
       const uint32_t rank = argument->tensor.rank;
@@ -2098,14 +2339,19 @@ VernonStatus vernonRuntimeSamplerFree(VernonDeviceSampler *sampler) {
 
 VernonStatus vernonRuntimeTextureCopyFromHost(VernonDeviceTexture *texture,
                                               const void *source, size_t size) {
-  const size_t expected =
-      texture ? static_cast<size_t>(texture->width) * texture->height * 4 : 0;
+  const uint32_t layers =
+      texture && texture->dimension == VERNON_TEXTURE_CUBE ? 6 : 1;
+  const size_t expected = texture ? static_cast<size_t>(texture->width) *
+                                        texture->height * 4 * layers
+                                  : 0;
   if (!texture || texture->context->backend != VERNON_RUNTIME_VULKAN ||
-      texture->dimension != VERNON_TEXTURE_2D ||
+      (texture->dimension != VERNON_TEXTURE_2D &&
+       texture->dimension != VERNON_TEXTURE_CUBE) ||
       texture->format != VERNON_TEXTURE_RGBA8_UNORM ||
       texture->mipLevels != 1 || !source || size != expected)
     return fail(texture ? texture->context : nullptr,
-                "Vulkan host upload supports one-mip RGBA8 2D textures only",
+                "Vulkan host upload supports one-mip RGBA8 2D and Cube "
+                "textures only",
                 VERNON_STATUS_UNSUPPORTED_TARGET);
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
   VernonRuntimeContext *context = texture->context;
@@ -2131,7 +2377,7 @@ VernonStatus vernonRuntimeTextureCopyFromHost(VernonDeviceTexture *texture,
                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkBufferImageCopy region{};
         region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.imageSubresource.layerCount = 1;
+        region.imageSubresource.layerCount = layers;
         region.imageExtent = {texture->width, texture->height, 1};
         driver.cmdCopyBufferToImage(command, staging, texture->vulkanImage,
                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
@@ -2747,11 +2993,13 @@ VernonStatus vernonRuntimePipelineBundleInspectTarget(
         static_cast<const char *>(bundleData) + bundleSize, nullptr, false);
     if (root.is_discarded() || !root.is_object())
       return VERNON_STATUS_PARSE_ERROR;
-    const bool legacy = root.value("pipeline_bundle_schema_version", 0) == 1 &&
-                        root.value("type", "") == "vernon_pipeline_bundle";
     const bool schema2 = root.value("schema_version", 0) == 2 &&
                          root.value("type", "") == "pipeline";
-    if (!legacy && !schema2)
+    std::string manifestError;
+    if (!schema2 ||
+        root.value("invocation_abi_version", 0) !=
+            VERNON_PIPELINE_INVOCATION_ABI_VERSION ||
+        !validateManifestHash(root, true, manifestError))
       return VERNON_STATUS_PARSE_ERROR;
     const std::string name = root.value("target", "");
     if (name == "cpu")
@@ -2807,13 +3055,10 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(
             ? "vulkan"
             : (context->backend == VERNON_RUNTIME_OPENGL_ES ? "opengles"
                                                             : "opengl");
-    const bool legacy = root.is_object() &&
-                        root.value("pipeline_bundle_schema_version", 0) == 1 &&
-                        root.value("type", "") == "vernon_pipeline_bundle";
     const bool schema2 = root.is_object() &&
                          root.value("schema_version", 0) == 2 &&
                          root.value("type", "") == "pipeline";
-    if ((!legacy && !schema2) ||
+    if (!schema2 ||
         root.value("invocation_abi_version", 0) !=
             VERNON_PIPELINE_INVOCATION_ABI_VERSION ||
         root.value("target", "") != expectedTarget ||
@@ -2823,7 +3068,7 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(
       fail(context, "unsupported or invalid pipeline bundle");
       return nullptr;
     }
-    if (!validateManifestHash(root, schema2, context->error))
+    if (!validateManifestHash(root, true, context->error))
       return nullptr;
     auto bundle = std::make_unique<VernonPipelineBundle>();
     bundle->context = context;
@@ -2848,8 +3093,6 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(
       Stage stage;
       stage.stage = value.value("stage", "");
       stage.entry = value.value("entry", "");
-      if (legacy)
-        stage.source = value.value("source", "");
       if (value.contains("reflection") &&
           value["reflection"].contains("entries")) {
         stage.reflection = value["reflection"].dump();
@@ -2943,20 +3186,6 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(
         stage.binary = std::move(resolved->bytes);
       else if (schema2 && context->backend != VERNON_RUNTIME_CPU)
         stage.source.assign(resolved->bytes.begin(), resolved->bytes.end());
-      if (legacy && context->backend == VERNON_RUNTIME_VULKAN &&
-          value.contains("artifact") && value["artifact"].is_object()) {
-        const nlohmann::json &artifact = value["artifact"];
-        if (artifact.value("format", "") == "spirv" &&
-            artifact.value("encoding", "") == "base64") {
-          const auto decoded = decodeBase64Strict(artifact.value("data", ""));
-          if (decoded)
-            stage.binary = *decoded;
-          if (!decoded || vernon::runtime::sha256Hex(stage.binary.data(),
-                                                     stage.binary.size()) !=
-                              artifact.value("sha256", ""))
-            stage.binary.clear();
-        }
-      }
       const bool hasArtifact =
           context->backend == VERNON_RUNTIME_CPU ? stage.cpuArtifact.has_value()
           : context->backend == VERNON_RUNTIME_VULKAN
@@ -3372,7 +3601,33 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
       return fail(pipeline->context,
                   "pipeline argument kind does not match layout");
     const VernonPipelineArgument &argument = *found->second;
-    if (argument.kind == VERNON_PIPELINE_TEXTURE) {
+    if (argument.kind == VERNON_PIPELINE_TENSOR) {
+      const auto dtype = pipelineDataType(parameter.dtype);
+      if (!dtype || argument.tensor.dtype != *dtype ||
+          !validTensorView(pipeline->context, argument.tensor))
+        return fail(pipeline->context,
+                    "pipeline Tensor argument does not match layout");
+      const bool allowLeading =
+          std::any_of(parameter.uses.begin(), parameter.uses.end(),
+                      [](const ParameterUse &use) {
+                        return use.interfaceKind == "input" ||
+                               use.interfaceKind == "instance";
+                      });
+      const size_t offset =
+          allowLeading && argument.tensor.rank == parameter.shape.size() + 1
+              ? 1
+              : 0;
+      if (argument.tensor.rank != parameter.shape.size() + offset)
+        return fail(pipeline->context,
+                    "pipeline Tensor rank does not match layout");
+      for (size_t dimension = 0; dimension < parameter.shape.size();
+           ++dimension)
+        if (parameter.shape[dimension] &&
+            parameter.shape[dimension] !=
+                argument.tensor.shape[dimension + offset])
+          return fail(pipeline->context,
+                      "pipeline Tensor shape does not match layout");
+    } else if (argument.kind == VERNON_PIPELINE_TEXTURE) {
       if (!argument.texture.texture ||
           argument.texture.texture->context != pipeline->context ||
           argument.texture.format != argument.texture.texture->format ||
@@ -3380,6 +3635,8 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
           argument.texture.width != argument.texture.texture->width ||
           argument.texture.height != argument.texture.texture->height ||
           argument.texture.depth != argument.texture.texture->depth ||
+          (argument.texture.sampler &&
+           argument.texture.sampler->context != pipeline->context) ||
           (!parameter.dimension.empty() &&
            ((parameter.dimension == "2d" &&
              argument.texture.dimension != VERNON_TEXTURE_2D) ||
@@ -3399,10 +3656,11 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
 
   if (pipeline->computeKernel) {
     std::vector<VernonLaunchArgument> launchArguments;
+    std::deque<std::vector<uint8_t>> hostTensorStorage;
     VernonLaunchSize grid{};
-    const VernonStatus prepareStatus =
-        prepareComputeLaunch(pipeline->context, pipeline->variant, arguments,
-                             *invocation, launchArguments, grid);
+    const VernonStatus prepareStatus = prepareComputeLaunch(
+        pipeline->context, pipeline->variant, arguments, *invocation,
+        launchArguments, hostTensorStorage, grid);
     if (prepareStatus != VERNON_STATUS_OK)
       return prepareStatus;
     const VernonStatus launchStatus =
@@ -3421,24 +3679,57 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
     if (!invocation->color_attachment_count || !invocation->color_attachments)
       return fail(pipeline->context,
                   "Vulkan graphics pipeline requires color attachments");
+    VernonRuntimeContext *context = pipeline->context;
 
     std::vector<VkVertexInputBindingDescription> bindingDescriptions;
     std::vector<VkVertexInputAttributeDescription> attributeDescriptions;
     std::vector<VkBuffer> vertexBuffers;
     std::vector<VkDeviceSize> vertexOffsets;
-    struct PushConstantValue {
-      uint32_t slot;
-      const void *data;
-      uint32_t size;
-      VkShaderStageFlags stages;
+    struct PushConstantUse {
+      const Parameter *parameter;
+      const ParameterUse *use;
+      const VernonPipelineArgument *argument;
     };
-    std::vector<PushConstantValue> pushConstants;
+    std::vector<PushConstantUse> pushConstantUses;
+    struct PushConstantBlock {
+      VkShaderStageFlags stage;
+      std::vector<uint8_t> data;
+    };
+    std::vector<PushConstantBlock> pushConstantBlocks;
     struct SampledResource {
       VernonDeviceTexture *texture{};
       VernonDeviceSampler *sampler{};
+      VernonDeviceSampler *textureSampler{};
+      bool implicitSampler{};
       VkShaderStageFlags stages{};
     };
     std::map<std::pair<uint32_t, uint32_t>, SampledResource> sampledResources;
+    const bool hasViewport = invocation->viewport[2] && invocation->viewport[3];
+    const VernonDeviceTexture *primaryAttachment =
+        invocation->color_attachment_count && invocation->color_attachments
+            ? invocation->color_attachments[0].texture
+            : nullptr;
+    std::array<float, 2> systemResolution{
+        static_cast<float>(hasViewport         ? invocation->viewport[2]
+                           : primaryAttachment ? primaryAttachment->width
+                                               : 0),
+        static_cast<float>(hasViewport         ? invocation->viewport[3]
+                           : primaryAttachment ? primaryAttachment->height
+                                               : 0)};
+    const std::array<uint64_t, 1> systemResolutionShape{2};
+    const std::array<uint64_t, 1> systemResolutionStrides{sizeof(float)};
+    VernonPipelineArgument systemResolutionArgument{};
+    systemResolutionArgument.kind = VERNON_PIPELINE_TENSOR;
+    systemResolutionArgument.tensor.struct_size = sizeof(VernonTensorView);
+    systemResolutionArgument.tensor.storage = VERNON_TENSOR_HOST;
+    systemResolutionArgument.tensor.host_data = systemResolution.data();
+    systemResolutionArgument.tensor.dtype = VERNON_DATA_F32;
+    systemResolutionArgument.tensor.access = VERNON_ACCESS_READ;
+    systemResolutionArgument.tensor.rank = 1;
+    systemResolutionArgument.tensor.shape = systemResolutionShape.data();
+    systemResolutionArgument.tensor.byte_strides =
+        systemResolutionStrides.data();
+    systemResolutionArgument.tensor.byte_size = sizeof(systemResolution);
     uint32_t vertexCount = invocation->vertex_count;
     uint32_t instanceCount = invocation->instance_count;
     for (const Parameter &parameter : pipeline->variant.parameters) {
@@ -3459,6 +3750,7 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
             return fail(pipeline->context,
                         "Vulkan sampled texture binding is ambiguous");
           resource.texture = argument.texture.texture;
+          resource.textureSampler = argument.texture.sampler;
           resource.stages |= shaderStage;
           continue;
         }
@@ -3484,39 +3776,13 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
             return fail(pipeline->context,
                         "Vulkan descriptor uniforms are not implemented",
                         VERNON_STATUS_UNSUPPORTED_TARGET);
-          if (argument.kind != VERNON_PIPELINE_INLINE_VALUE ||
-              !argument.inline_value.data || !argument.inline_value.data_size ||
-              argument.inline_value.data_size > 128 ||
-              argument.inline_value.data_size % sizeof(uint32_t) != 0)
-            return fail(pipeline->context,
-                        "Vulkan push constant value is invalid");
-          const VkShaderStageFlags stage = shaderStage;
-          auto existing =
-              std::find_if(pushConstants.begin(), pushConstants.end(),
-                           [&](const PushConstantValue &value) {
-                             return value.slot == parameter.slot;
-                           });
-          if (existing != pushConstants.end()) {
-            existing->stages |= stage;
-          } else {
-            if (std::any_of(pushConstants.begin(), pushConstants.end(),
-                            [&](const PushConstantValue &value) {
-                              return (value.stages & stage) != 0;
-                            }))
-              return fail(
-                  pipeline->context,
-                  "Vulkan supports one push-constant parameter per stage",
-                  VERNON_STATUS_UNSUPPORTED_TARGET);
-            pushConstants.push_back(
-                {parameter.slot, argument.inline_value.data,
-                 static_cast<uint32_t>(argument.inline_value.data_size),
-                 stage});
-          }
+          pushConstantUses.push_back({&parameter, &use, &argument});
           continue;
         }
         if (use.interfaceKind != "input" && use.interfaceKind != "instance")
           continue;
         if (argument.kind != VERNON_PIPELINE_TENSOR ||
+            argument.tensor.storage != VERNON_TENSOR_DEVICE ||
             argument.tensor.dtype != VERNON_DATA_F32 ||
             !argument.tensor.buffer ||
             argument.tensor.buffer->context != pipeline->context ||
@@ -3546,25 +3812,166 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
         vertexBuffers.push_back(argument.tensor.buffer->vulkanBuffer);
         vertexOffsets.push_back(argument.tensor.byte_offset);
         if (components <= 4) {
+          if (argument.tensor.rank > 1 &&
+              argument.tensor.byte_strides[argument.tensor.rank - 1] !=
+                  sizeof(float))
+            return fail(pipeline->context,
+                        "Vulkan vertex components must be contiguous");
           attributeDescriptions.push_back(
               {use.location, binding, vulkanVertexFormat(components), 0});
         } else if (argument.tensor.rank == 3 && argument.tensor.shape[2] <= 4) {
           const uint32_t columns =
               static_cast<uint32_t>(argument.tensor.shape[1]);
           const uint32_t rows = static_cast<uint32_t>(argument.tensor.shape[2]);
+          if (argument.tensor.byte_strides[2] != sizeof(float))
+            return fail(pipeline->context,
+                        "Vulkan matrix rows must be contiguous");
           for (uint32_t column = 0; column < columns; ++column)
-            attributeDescriptions.push_back({use.location + column, binding,
-                                             vulkanVertexFormat(rows),
-                                             column * rows * sizeof(float)});
+            attributeDescriptions.push_back(
+                {use.location + column, binding, vulkanVertexFormat(rows),
+                 static_cast<uint32_t>(column *
+                                       argument.tensor.byte_strides[1])});
         } else {
           return fail(pipeline->context,
                       "Vulkan vertex attribute shape is unsupported");
         }
       }
     }
+    for (const Parameter &parameter : pipeline->variant.internalParameters) {
+      for (const ParameterUse &use : parameter.uses) {
+        if (use.stage != "vertex" && use.stage != "fragment")
+          continue;
+        const VkShaderStageFlags shaderStage =
+            use.stage == "vertex" ? VK_SHADER_STAGE_VERTEX_BIT
+                                  : VK_SHADER_STAGE_FRAGMENT_BIT;
+        if (parameter.source == "implicit_sampler") {
+          for (const SampledTextureBinding &binding :
+               use.sampledTextureBindings) {
+            SampledResource &resource =
+                sampledResources[{binding.descriptorSet, binding.binding}];
+            if (resource.sampler)
+              return fail(pipeline->context,
+                          "implicit and explicit Vulkan samplers conflict");
+            resource.sampler = resource.textureSampler;
+            resource.implicitSampler = true;
+            resource.stages |= shaderStage;
+          }
+          continue;
+        }
+        if (parameter.systemValue == "resolution") {
+          if (use.interfaceKind != "uniform" || use.binding != UINT32_MAX)
+            return fail(
+                pipeline->context,
+                "Vulkan resolution system value must be a push constant");
+          pushConstantUses.push_back(
+              {&parameter, &use, &systemResolutionArgument});
+        }
+      }
+    }
+    for (const auto &[stageName, stageFlag] :
+         std::array<std::pair<const char *, VkShaderStageFlags>, 2>{
+             {{"vertex", VK_SHADER_STAGE_VERTEX_BIT},
+              {"fragment", VK_SHADER_STAGE_FRAGMENT_BIT}}}) {
+      std::vector<PushConstantUse> stageUses;
+      for (const PushConstantUse &value : pushConstantUses)
+        if (value.use->stage == stageName)
+          stageUses.push_back(value);
+      if (stageUses.empty())
+        continue;
+      std::sort(stageUses.begin(), stageUses.end(),
+                [](const PushConstantUse &left, const PushConstantUse &right) {
+                  return left.use->index < right.use->index;
+                });
+      if (std::adjacent_find(
+              stageUses.begin(), stageUses.end(),
+              [](const PushConstantUse &left, const PushConstantUse &right) {
+                return left.use->index == right.use->index;
+              }) != stageUses.end())
+        return fail(pipeline->context,
+                    std::string("Vulkan ") + stageName +
+                        " push-constant reflection has duplicate indices");
+      PushConstantBlock block{stageFlag, {}};
+      uint32_t size = 0;
+      for (const PushConstantUse &value : stageUses) {
+        const Parameter &parameter = *value.parameter;
+        const ParameterUse &use = *value.use;
+        const VernonPipelineArgument &argument = *value.argument;
+        if (parameter.dtype != use.dtype || parameter.shape != use.shape)
+          return fail(pipeline->context,
+                      std::string("Vulkan ") + stageName +
+                          " push-constant reflection is inconsistent for '" +
+                          parameter.name + "'");
+        std::string layoutError;
+        std::optional<VulkanPushConstantLayout> layout =
+            vulkanPushConstantLayout(use, layoutError);
+        if (!layout)
+          return fail(pipeline->context,
+                      std::string("Vulkan ") + stageName + " push-constant '" +
+                          parameter.name + "': " + layoutError);
+        const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
+        if (!dtype || argument.kind != VERNON_PIPELINE_TENSOR ||
+            argument.tensor.storage != VERNON_TENSOR_HOST ||
+            argument.tensor.dtype != *dtype ||
+            argument.tensor.rank != use.shape.size())
+          return fail(pipeline->context,
+                      std::string("Vulkan ") + stageName +
+                          " push-constant value has the wrong type or size for "
+                          "'" +
+                          parameter.name + "'");
+        for (size_t dimension = 0; dimension < use.shape.size(); ++dimension)
+          if (argument.tensor.shape[dimension] != use.shape[dimension])
+            return fail(pipeline->context,
+                        std::string("Vulkan ") + stageName +
+                            " push-constant value has the wrong shape for '" +
+                            parameter.name + "'");
+        const uint32_t offset = (size + layout->alignment - 1) /
+                                layout->alignment * layout->alignment;
+        if (offset > context->vulkanMaxPushConstantsSize ||
+            layout->storageSize > context->vulkanMaxPushConstantsSize - offset)
+          return fail(pipeline->context,
+                      std::string("Vulkan ") + stageName +
+                          " push-constant block exceeds device limit of " +
+                          std::to_string(context->vulkanMaxPushConstantsSize) +
+                          " bytes",
+                      VERNON_STATUS_UNSUPPORTED_TARGET);
+        size = offset + layout->storageSize;
+        block.data.resize(size);
+        const uint8_t *source = hostTensorData(argument.tensor);
+        const size_t elementSize = dataTypeSize(argument.tensor.dtype);
+        if (use.shape.empty()) {
+          std::memcpy(block.data.data() + offset, source, elementSize);
+        } else if (use.shape.size() == 1) {
+          for (uint32_t row = 0; row < use.shape[0]; ++row)
+            std::memcpy(block.data.data() + offset + row * elementSize,
+                        source + row * argument.tensor.byte_strides[0],
+                        elementSize);
+        } else {
+          const uint32_t rows = static_cast<uint32_t>(use.shape[0]);
+          const uint32_t columns = static_cast<uint32_t>(use.shape[1]);
+          for (uint32_t column = 0; column < columns; ++column)
+            for (uint32_t row = 0; row < rows; ++row)
+              std::memcpy(block.data.data() + offset +
+                              column * layout->matrixStride + row * elementSize,
+                          source + row * argument.tensor.byte_strides[0] +
+                              column * argument.tensor.byte_strides[1],
+                          elementSize);
+        }
+      }
+      const uint32_t rangeSize = (size + 3) / 4 * 4;
+      if (rangeSize > context->vulkanMaxPushConstantsSize)
+        return fail(pipeline->context,
+                    std::string("Vulkan ") + stageName +
+                        " push-constant block exceeds device limit of " +
+                        std::to_string(context->vulkanMaxPushConstantsSize) +
+                        " bytes",
+                    VERNON_STATUS_UNSUPPORTED_TARGET);
+      block.data.resize(rangeSize);
+      pushConstantBlocks.push_back(std::move(block));
+    }
     for (const auto &[binding, resource] : sampledResources)
-      if (!resource.texture || !resource.sampler ||
-          !resource.sampler->vulkanSampler)
+      if (!resource.texture ||
+          ((!resource.sampler || !resource.sampler->vulkanSampler) &&
+           !resource.implicitSampler))
         return fail(pipeline->context,
                     "Vulkan sampled image requires paired texture and sampler");
     if (!vertexCount || !instanceCount)
@@ -3628,13 +4035,13 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
       imageViews.push_back(attachments[index]->texture->vulkanView);
     }
 
-    VernonRuntimeContext *context = pipeline->context;
     vernon::runtime::VulkanDriver &driver = vernon::runtime::vulkanDriver();
     VkRenderPass renderPass = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
     VkPipeline graphicsPipeline = VK_NULL_HANDLE;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+    VkSampler implicitSampler = VK_NULL_HANDLE;
     std::vector<VkDescriptorSetLayout> descriptorSetLayouts;
     std::vector<VkDescriptorSet> descriptorSets;
     auto cleanup = [&] {
@@ -3649,12 +4056,34 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
       if (descriptorPool)
         driver.destroyDescriptorPool(context->vulkanDevice, descriptorPool,
                                      nullptr);
+      if (implicitSampler)
+        driver.destroySampler(context->vulkanDevice, implicitSampler, nullptr);
       for (VkDescriptorSetLayout layout : descriptorSetLayouts)
         driver.destroyDescriptorSetLayout(context->vulkanDevice, layout,
                                           nullptr);
       if (renderPass)
         driver.destroyRenderPass(context->vulkanDevice, renderPass, nullptr);
     };
+    if (std::any_of(sampledResources.begin(), sampledResources.end(),
+                    [](const auto &entry) {
+                      return entry.second.implicitSampler &&
+                             !entry.second.sampler;
+                    })) {
+      VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+      samplerInfo.magFilter = VK_FILTER_LINEAR;
+      samplerInfo.minFilter = VK_FILTER_LINEAR;
+      samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+      samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+      samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+      samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+      if (vulkanFail(context,
+                     driver.createSampler(context->vulkanDevice, &samplerInfo,
+                                          nullptr, &implicitSampler),
+                     "vkCreateSampler") != VERNON_STATUS_OK) {
+        cleanup();
+        return VERNON_STATUS_INTERNAL_ERROR;
+      }
+    }
     VkSubpassDescription subpass{};
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     subpass.colorAttachmentCount =
@@ -3735,7 +4164,8 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
       imageInfos.reserve(sampledResources.size());
       writes.reserve(sampledResources.size());
       for (const auto &[key, resource] : sampledResources) {
-        imageInfos.push_back({resource.sampler->vulkanSampler,
+        imageInfos.push_back({resource.sampler ? resource.sampler->vulkanSampler
+                                               : implicitSampler,
                               resource.texture->vulkanView,
                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
         VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -3754,8 +4184,9 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
       layoutInfo.pSetLayouts = descriptorSetLayouts.data();
     }
     std::vector<VkPushConstantRange> pushConstantRanges;
-    for (const PushConstantValue &value : pushConstants)
-      pushConstantRanges.push_back({value.stages, 0, value.size});
+    for (const PushConstantBlock &block : pushConstantBlocks)
+      pushConstantRanges.push_back(
+          {block.stage, 0, static_cast<uint32_t>(block.data.size())});
     layoutInfo.pushConstantRangeCount =
         static_cast<uint32_t>(pushConstantRanges.size());
     layoutInfo.pPushConstantRanges = pushConstantRanges.data();
@@ -3886,11 +4317,10 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
             command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0,
             static_cast<uint32_t>(descriptorSets.size()), descriptorSets.data(),
             0, nullptr);
-      for (const PushConstantValue &value : pushConstants)
-        driver.cmdPushConstants(command, pipelineLayout, value.stages, 0,
-                                value.size, value.data);
-      const bool hasViewport =
-          invocation->viewport[2] && invocation->viewport[3];
+      for (const PushConstantBlock &block : pushConstantBlocks)
+        driver.cmdPushConstants(command, pipelineLayout, block.stage, 0,
+                                static_cast<uint32_t>(block.data.size()),
+                                block.data.data());
       const bool hasScissor = invocation->scissor[2] && invocation->scissor[3];
       VkViewport viewport{
           static_cast<float>(hasViewport ? invocation->viewport[0] : 0),
@@ -3942,24 +4372,23 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
           return fail(pipeline->context,
                       "compute parameter has no resource binding");
         GlUint buffer = 0;
-        if (argument.kind == VERNON_PIPELINE_TENSOR) {
+        if (argument.tensor.storage == VERNON_TENSOR_DEVICE) {
           if (!argument.tensor.buffer ||
               argument.tensor.buffer->context != pipeline->context ||
-              argument.tensor.byte_offset != 0)
+              argument.tensor.byte_offset != 0 ||
+              !isRowMajorContiguous(argument.tensor))
             return fail(pipeline->context, "compute Tensor view is invalid");
           buffer = argument.tensor.buffer->name;
-        } else if (argument.kind == VERNON_PIPELINE_INLINE_VALUE) {
-          if (!argument.inline_value.data || !argument.inline_value.data_size)
-            return fail(pipeline->context, "compute inline value is empty");
+        } else {
+          auto packed = packTensorRowMajor(argument.tensor);
+          if (!packed)
+            return fail(pipeline->context, "compute host Tensor is invalid");
           gl.genBuffers(1, &buffer);
           temporaryBuffers.push_back(buffer);
           gl.bindBuffer(kShaderStorageBuffer, buffer);
           gl.bufferData(kShaderStorageBuffer,
-                        static_cast<GlSizePtr>(argument.inline_value.data_size),
-                        argument.inline_value.data, kDynamicCopy);
-        } else {
-          return fail(pipeline->context,
-                      "compute textures are not supported yet");
+                        static_cast<GlSizePtr>(packed->size()), packed->data(),
+                        kDynamicCopy);
         }
         gl.bindBufferBase(kShaderStorageBuffer, use.binding, buffer);
       }
@@ -4001,6 +4430,20 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
   gl.bindVertexArray(pipeline->vertexArray);
   uint32_t vertexCount = invocation->vertex_count;
   uint32_t instanceCount = invocation->instance_count;
+  const bool hasViewport = invocation->viewport[2] && invocation->viewport[3];
+  const VernonDeviceTexture *primaryAttachment =
+      invocation->color_attachment_count && invocation->color_attachments
+          ? invocation->color_attachments[0].texture
+          : nullptr;
+  const std::array<float, 2> systemResolution{
+      static_cast<float>(hasViewport         ? invocation->viewport[2]
+                         : primaryAttachment ? primaryAttachment->width
+                                             : 0),
+      static_cast<float>(hasViewport         ? invocation->viewport[3]
+                         : primaryAttachment ? primaryAttachment->height
+                                             : 0)};
+  std::map<std::pair<uint32_t, uint32_t>, VernonDeviceSampler *>
+      textureSamplers;
   for (const Parameter &parameter : pipeline->variant.parameters) {
     const VernonPipelineArgument &argument = *arguments.at(parameter.slot);
     for (const ParameterUse &use : parameter.uses) {
@@ -4010,6 +4453,13 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
         if (use.descriptorSet != 0 || use.binding == UINT32_MAX)
           return fail(pipeline->context,
                       "OpenGL sampled texture requires set zero and a binding");
+        const auto samplerKey = std::make_pair(use.descriptorSet, use.binding);
+        const auto [samplerEntry, inserted] =
+            textureSamplers.emplace(samplerKey, argument.texture.sampler);
+        if (!inserted && samplerEntry->second != argument.texture.sampler)
+          return fail(
+              pipeline->context,
+              "OpenGL texture binding has conflicting sampler policies");
         const VernonDeviceTexture *texture = argument.texture.texture;
         const GlEnum target =
             texture->dimension == VERNON_TEXTURE_2D   ? kTexture2D
@@ -4041,20 +4491,29 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
         continue;
       }
       if (use.interfaceKind == "uniform") {
-        if (argument.kind != VERNON_PIPELINE_INLINE_VALUE ||
-            argument.inline_value.dtype != VERNON_DATA_F32 ||
-            !argument.inline_value.data ||
-            argument.inline_value.data_size % sizeof(float) != 0)
+        if (argument.kind != VERNON_PIPELINE_TENSOR ||
+            argument.tensor.storage != VERNON_TENSOR_HOST ||
+            argument.tensor.dtype != VERNON_DATA_F32)
           return fail(pipeline->context, "graphics uniform is invalid");
         const GlInt location = gl.getUniformLocation(pipeline->graphicsProgram,
                                                      use.uniformName.c_str());
         if (location < 0)
           return fail(pipeline->context,
                       "graphics uniform location is missing");
-        const auto *data =
-            static_cast<const float *>(argument.inline_value.data);
-        const uint32_t count = static_cast<uint32_t>(
-            argument.inline_value.data_size / sizeof(float));
+        const std::optional<size_t> elementCount =
+            tensorElementCount(argument.tensor);
+        if (!elementCount)
+          return fail(pipeline->context, "graphics uniform is invalid");
+        const uint32_t count = static_cast<uint32_t>(*elementCount);
+        const float *data =
+            reinterpret_cast<const float *>(hostTensorData(argument.tensor));
+        std::optional<std::vector<uint8_t>> packed;
+        if (count <= 4 && !isRowMajorContiguous(argument.tensor)) {
+          packed = packTensorRowMajor(argument.tensor);
+          if (!packed)
+            return fail(pipeline->context, "failed to pack graphics uniform");
+          data = reinterpret_cast<const float *>(packed->data());
+        }
         if (count == 1)
           gl.uniform1fv(location, 1, data);
         else if (count == 2)
@@ -4063,11 +4522,40 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
           gl.uniform3fv(location, 1, data);
         else if (count == 4)
           gl.uniform4fv(location, 1, data);
-        else if (count == 9)
-          gl.uniformMatrix3fv(location, 1, 1, data);
-        else if (count == 16)
-          gl.uniformMatrix4fv(location, 1, 1, data);
-        else
+        else if (count == 9 || count == 16) {
+          const uint32_t dimension = count == 9 ? 3 : 4;
+          if (argument.tensor.rank != 2 ||
+              argument.tensor.shape[0] != dimension ||
+              argument.tensor.shape[1] != dimension)
+            return fail(pipeline->context,
+                        "graphics matrix uniform shape is unsupported");
+          const bool columnMajor =
+              argument.tensor.byte_strides[0] == sizeof(float) &&
+              argument.tensor.byte_strides[1] == dimension * sizeof(float);
+          const bool rowMajor =
+              argument.tensor.byte_strides[1] == sizeof(float) &&
+              argument.tensor.byte_strides[0] == dimension * sizeof(float);
+          GlBoolean transpose = 0;
+          std::vector<float> matrix;
+          if (!columnMajor && !(rowMajor && pipeline->context->backend !=
+                                                VERNON_RUNTIME_OPENGL_ES)) {
+            matrix.resize(count);
+            const uint8_t *source = hostTensorData(argument.tensor);
+            for (uint32_t column = 0; column < dimension; ++column)
+              for (uint32_t row = 0; row < dimension; ++row)
+                std::memcpy(&matrix[column * dimension + row],
+                            source + row * argument.tensor.byte_strides[0] +
+                                column * argument.tensor.byte_strides[1],
+                            sizeof(float));
+            data = matrix.data();
+          } else if (rowMajor) {
+            transpose = 1;
+          }
+          if (dimension == 3)
+            gl.uniformMatrix3fv(location, 1, transpose, data);
+          else
+            gl.uniformMatrix4fv(location, 1, transpose, data);
+        } else
           return fail(pipeline->context,
                       "graphics uniform size is unsupported");
         continue;
@@ -4075,6 +4563,7 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
       if (use.interfaceKind != "input" && use.interfaceKind != "instance")
         continue;
       if (argument.kind != VERNON_PIPELINE_TENSOR ||
+          argument.tensor.storage != VERNON_TENSOR_DEVICE ||
           argument.tensor.dtype != VERNON_DATA_F32 || !argument.tensor.buffer ||
           argument.tensor.buffer->context != pipeline->context ||
           !argument.tensor.rank || !argument.tensor.shape ||
@@ -4094,6 +4583,11 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
       inferred = leading;
       gl.bindBuffer(kArrayBuffer, argument.tensor.buffer->name);
       if (components <= 4) {
+        if (argument.tensor.rank > 1 &&
+            argument.tensor.byte_strides[argument.tensor.rank - 1] !=
+                sizeof(float))
+          return fail(pipeline->context,
+                      "graphics Tensor components must be contiguous");
         gl.enableVertexAttribArray(use.location);
         gl.vertexAttribPointer(
             use.location, static_cast<GlInt>(components), kFloat, 0,
@@ -4105,19 +4599,58 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
         const uint32_t columns =
             static_cast<uint32_t>(argument.tensor.shape[1]);
         const uint32_t rows = static_cast<uint32_t>(argument.tensor.shape[2]);
+        if (argument.tensor.byte_strides[2] != sizeof(float))
+          return fail(pipeline->context,
+                      "graphics matrix rows must be contiguous");
         for (uint32_t column = 0; column < columns; ++column) {
           gl.enableVertexAttribArray(use.location + column);
           gl.vertexAttribPointer(
               use.location + column, static_cast<GlInt>(rows), kFloat, 0,
               static_cast<GlSize>(argument.tensor.byte_strides[0]),
-              reinterpret_cast<const void *>(argument.tensor.byte_offset +
-                                             column * rows * sizeof(float)));
+              reinterpret_cast<const void *>(
+                  argument.tensor.byte_offset +
+                  column * argument.tensor.byte_strides[1]));
           gl.vertexAttribDivisor(use.location + column,
                                  instanced ? std::max(use.divisor, 1u) : 0);
         }
       } else {
         return fail(pipeline->context,
                     "graphics Tensor component shape is unsupported");
+      }
+    }
+  }
+  for (const Parameter &parameter : pipeline->variant.internalParameters) {
+    for (const ParameterUse &use : parameter.uses) {
+      if (use.stage != "vertex" && use.stage != "fragment")
+        continue;
+      if (parameter.source == "implicit_sampler") {
+        for (const SampledTextureBinding &binding :
+             use.sampledTextureBindings) {
+          if (binding.descriptorSet != 0 || binding.binding == UINT32_MAX)
+            return fail(
+                pipeline->context,
+                "OpenGL implicit sampler requires set zero and a binding");
+          const auto found =
+              textureSamplers.find({binding.descriptorSet, binding.binding});
+          if (found == textureSamplers.end())
+            return fail(pipeline->context,
+                        "OpenGL implicit sampler has no paired texture");
+          // Sampler object zero selects the context's texture sampling state.
+          gl.bindSampler(binding.binding,
+                         found->second ? found->second->name : 0);
+        }
+        continue;
+      }
+      if (parameter.systemValue == "resolution") {
+        if (use.interfaceKind != "uniform")
+          return fail(pipeline->context,
+                      "OpenGL resolution system value must be a uniform");
+        const GlInt location = gl.getUniformLocation(pipeline->graphicsProgram,
+                                                     use.uniformName.c_str());
+        if (location < 0)
+          return fail(pipeline->context,
+                      "resolution system uniform location is missing");
+        gl.uniform2fv(location, 1, systemResolution.data());
       }
     }
   }
@@ -4155,7 +4688,11 @@ vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
   if (gl.checkFramebufferStatus(kFramebuffer) != kFramebufferComplete)
     return fail(pipeline->context, "OpenGL framebuffer is incomplete",
                 VERNON_STATUS_INTERNAL_ERROR);
-  gl.viewport(0, 0, static_cast<GlSize>(width), static_cast<GlSize>(height));
+  gl.viewport(
+      static_cast<GlInt>(hasViewport ? invocation->viewport[0] : 0),
+      static_cast<GlInt>(hasViewport ? invocation->viewport[1] : 0),
+      static_cast<GlSize>(hasViewport ? invocation->viewport[2] : width),
+      static_cast<GlSize>(hasViewport ? invocation->viewport[3] : height));
   const GlEnum mode = topologyMode(invocation->topology);
   if (invocation->index_binding) {
     const VernonIndexBinding &index = *invocation->index_binding;

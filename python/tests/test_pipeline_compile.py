@@ -11,6 +11,7 @@ from vernon_dsl.pipeline_compile import (
     TargetOptions,
     build_bundle_plan,
     canonical_json,
+    external_parameters,
     inline_artifact_descriptor,
     materialize_bundle,
     merge_parameter_uses,
@@ -53,6 +54,110 @@ def _stage(stage: str, artifact: bytes,
 
 
 class PipelineCompileTests(unittest.TestCase):
+
+    def test_generated_sampler_and_resolution_are_internal(self) -> None:
+        records = {
+            "fragment": {
+                "entry": "fragment_main",
+                "target": "opengl",
+                "interface": {
+                    "arguments": [{
+                        "index": 0,
+                        "kind": "texture",
+                        "type": "!vernon.texture<2d, f32>",
+                        "dtype": "f32",
+                        "dimension": "2d",
+                        "vernon.source_name": "image",
+                        "vernon.interface": "resource",
+                        "vernon.set": 0,
+                        "vernon.binding": 3,
+                    }, {
+                        "index": 1,
+                        "kind": "sampler",
+                        "type": "!vernon.sampler",
+                        "vernon.source_name": "__image_sampler",
+                        "vernon.interface": "resource",
+                        "vernon.implicit": "sampler",
+                        "vernon.implicit_texture": "image",
+                        "sampled_texture_bindings": [{
+                            "set": 0,
+                            "binding": 3,
+                        }],
+                    }, {
+                        "index": 2,
+                        "kind": "scalar",
+                        "type": "tensor<2xf32>",
+                        "vernon.source_name": "__resolution",
+                        "vernon.interface": "uniform",
+                        "vernon.implicit": "resolution",
+                    }],
+                },
+            },
+        }
+        external = external_parameters(records)
+        self.assertEqual(set(external), {"image"})
+        fragment = _stage("fragment", b"fragment", records["fragment"]
+                          ["interface"])
+        vertex = _stage("vertex", b"vertex", {
+            "arguments": [],
+            "results": [],
+        })
+        plan = build_bundle_plan("pipeline", fragment.target, (),
+                                 [((), {
+                                     "vertex": vertex,
+                                     "fragment": fragment,
+                                 })])
+        variant = plan.variants[0].to_dict()
+        self.assertEqual([row["name"] for row in variant["parameters"]],
+                         ["image"])
+        self.assertEqual(
+            [(row["source"], row.get("system_value"))
+             for row in variant["internal_parameters"]],
+            [("implicit_sampler", None), ("system_value", "resolution")],
+        )
+
+    def test_explicit_sampler_remains_external(self) -> None:
+        records = {
+            "fragment": {
+                "entry": "fragment_main",
+                "target": "vulkan",
+                "interface": {
+                    "arguments": [{
+                        "index": 0,
+                        "kind": "sampler",
+                        "type": "!vernon.sampler",
+                        "vernon.source_name": "linear_sampler",
+                        "vernon.interface": "resource",
+                        "sampled_texture_bindings": [{
+                            "set": 0,
+                            "binding": 1,
+                        }],
+                    }],
+                },
+            },
+        }
+        self.assertEqual(set(external_parameters(records)),
+                         {"linear_sampler"})
+
+    def test_descriptor_bound_uniform_keeps_block_member_name(self) -> None:
+        records = {
+            "vertex": {
+                "entry": "vertex_main",
+                "target": "opengl",
+                "interface": {
+                    "arguments": [{
+                        "index": 0,
+                        "type": "tensor<4x4xf32>",
+                        "vernon.source_name": "material",
+                        "vernon.interface": "uniform",
+                        "vernon.set": 0,
+                        "vernon.binding": 2,
+                    }],
+                },
+            },
+        }
+        uses = external_parameters(records)["material"]
+        self.assertEqual(uses[0]["uniform_name"], "material._m0")
 
     def test_parameter_merge_and_slot_layout_are_exact(self) -> None:
         uses = [{
@@ -131,6 +236,10 @@ class PipelineCompileTests(unittest.TestCase):
         parameters = plan.variants[0].to_dict()["parameters"]
         self.assertEqual([(row["name"], row["slot"]) for row in parameters],
                          [("alpha", 0), ("z_position", 1)])
+        self.assertEqual(
+            parameters[0]["uses"][0]["uniform_name"],
+            "alpha",
+        )
 
     def test_variant_steps_outputs_and_graphics_interface_are_exact(
             self) -> None:
