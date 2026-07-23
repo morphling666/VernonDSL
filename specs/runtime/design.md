@@ -7,26 +7,32 @@ module-hashed C entry wrappers. The manifest records the target triple, object
 format, CPU invocation ABI, exported symbol, artifact size, and SHA-256.
 Applications link the object at build time and register its wrapper with
 VernonRuntime; Runtime validates the external descriptor but never parses or
-relocates object files. Host-native shared-library bundles remain readable for
-migration and Python immediate execution, where embedded LLD finalizes a host
-object into an ephemeral DLL/so/dylib. LLVM IR and ORC JIT are not persistent
-runtime bundle formats.
+relocates object files. Python immediate execution may use a host-native
+shared-library descriptor after embedded LLD finalizes the object into an
+ephemeral DLL/so/dylib. LLVM IR and ORC JIT are not persistent runtime bundle
+formats.
 
 ## Backend loading
 
-`VernonRuntime` owns the Win32/POSIX library loader retained for legacy CPU AOT
-bundles, CUDA, and Vulkan. New CPU objects resolve through the static entry
-registry. CUDA Driver and Vulkan loader symbols are resolved at runtime; Vulkan
-headers are compile-only. This keeps LLVM, LLD, GLFW, CUDA Toolkit libraries,
-and the Vulkan loader import library outside the deployable runtime dependency
-closure.
+`VernonRuntime` owns the Win32/POSIX library loader used by CPU native-library
+descriptors, CUDA, and Vulkan. CPU relocatable objects resolve through the
+static entry registry. CUDA Driver and Vulkan loader symbols are resolved at
+runtime; Vulkan headers are compile-only. This keeps LLVM, LLD, GLFW, CUDA
+Toolkit libraries, and the Vulkan loader import library outside the deployable
+runtime dependency closure.
 
 OpenGL function resolution is isolated in `backend_opengl_driver`; unlike CUDA
-and Vulkan it consumes a host callback because the host owns the current
-context. OpenGL and OpenGL ES are distinct external-context backends and only
-accept pipeline manifests for their matching GLSL profile. Cooked GLSL is an
-external content-addressed artifact; interactive GLSL remains inline. Context
-creation is host policy.
+and Vulkan it consumes context callbacks. OpenGL and OpenGL ES are distinct
+external-context backends and only accept pipeline manifests for their matching
+GLSL profile. Cooked GLSL is an external content-addressed artifact;
+interactive GLSL remains inline.
+
+Context ownership is a separate layer: `Context Owner -> external callbacks ->
+AHI`. `VernonRuntime` is the GLFW-free AHI and always consumes the same
+external-context contract. Vernon Engine supplies callbacks for its existing
+context. The Python wheel's separate `_gl_context` extension links GLFW, owns a
+hidden window/context, and keeps that owner alive until after all AHI children
+and the runtime are destroyed. Runtime-only builds never discover GLFW.
 
 ## Vulkan graphics bundles
 
@@ -35,17 +41,22 @@ external `.spv` artifact. The manifest records its relative path, byte size,
 and SHA-256, all of which the common artifact resolver validates before Vulkan
 sees the bytes. Non-persistent interactive execution uses the same descriptor
 shape with inline base64 storage because it has no durable asset directory.
-Resolution creates immutable shader modules. Invocation creates render-pass
-and pipeline state from the concrete attachment and vertex layouts, submits
-synchronously, then releases that transient state. This first implementation
-favors correct layout specialization; a later cache can key the same state
-without changing the bundle ABI. RGBA8 offscreen images use optimal tiling and
-staging buffers for host upload/readback. Unbound graphics uniforms use the
+Resolution creates immutable shader modules and content-keyed descriptor-set
+layouts, pipeline layouts, and graphics pipelines. Graphics pipeline keys
+include render-pass attachment compatibility, topology, vertex input, and the
+full layout key; invocation retains descriptor writes and allocation, render
+passes, framebuffers, attachment views, and command recording as transient
+state. RGBA8 offscreen images use optimal tiling and staging buffers for host
+upload/readback. Unbound graphics uniforms use the
 compiler's single push-constant block ABI; descriptor-bound uniforms remain a
 later extension. Block members follow source argument order with Vulkan
 scalar/vector/matrix alignment, and Runtime reproduces that layout from
-reflection before checking the device's `maxPushConstantsSize`. One-mip RGBA8
-Cube uploads store tightly packed faces in `+X, -X, +Y, -Y, +Z, -Z` order.
+reflection before checking the device's `maxPushConstantsSize`. Vertex and
+fragment blocks occupy disjoint ranges; Runtime relocates the fragment
+SPIR-V member offsets by the planned range base so one stage cannot overwrite
+the other stage's values. A negative Vulkan viewport height preserves the
+OpenGL clip-space and host-readback Y convention. One-mip RGBA8 Cube uploads
+store tightly packed faces in `+X, -X, +Y, -Y, +Z, -Z` order.
 
 ## Python native module
 
@@ -62,6 +73,12 @@ Runtime contexts own one backend device/context. Buffers and loaded kernels
 retain their context in language bindings; the C API rejects context
 destruction while handles remain live. Transfers are synchronous and a launch
 retains all argument storage through synchronization.
+
+Backend dispatch is centralized in `runtime_dispatch`. `VernonRuntime.cpp`
+owns public validation and handle lifetime but never includes backend headers
+or reads concrete backend state. This keeps disabled CUDA/Vulkan translation
+units out of the build and prevents backend payload types from leaking into
+the C API shell.
 
 ## CUDA driver loading
 
@@ -110,16 +127,20 @@ the same SPIR-V module.
 
 ## OpenGL and OpenGL ES runtime
 
-OpenGL and OpenGL ES are external-context backends. The host supplies
-`make_current` and `get_proc_address` callbacks through
-`vernonRuntimeCreateExternalOpenGLForBackend`; Python registers the same
-addresses with `register_external_opengl_context`. `VernonRuntime` never
-creates or links a window-system context.
+OpenGL and OpenGL ES are external-context AHI backends. The context owner
+supplies `make_current` and `get_proc_address` callbacks through
+`vernonRuntimeCreateExternalOpenGLForBackend`; Engine may register its existing
+context with `register_external_opengl_context`. Otherwise Python creates a
+hidden context through the separately linked `_gl_context` GLFW extension.
+`VernonRuntime` itself never creates or links a window-system context.
 
 Each backend accepts only pipeline bundles compiled for its matching GLSL
 profile. Compute requires OpenGL 4.3 or OpenGL ES 3.1 and binds reflected
-storage buffers before issuing a shader-storage barrier. Graphics imports host
-buffer and texture handles, so resources remain owned by the host context.
+storage buffers before issuing a shader-storage barrier. Graphics accepts
+imported host buffer, texture, and sampler names without deleting them. It also
+creates owned child resources for standalone execution; all GL allocation,
+transfer, deletion, and invocation operations first make the associated
+context current.
 Pipeline ABI v3 represents every numeric argument as one `VernonTensorView`.
 The storage discriminator selects borrowed host memory or a runtime-owned
 device buffer; shape and positive byte strides describe logical indexing, and
@@ -138,6 +159,10 @@ push constants are packed by logical indices and Tensor strides.
 Addressable Tensor parameters lower to Vernon buffers. Multidimensional
 indices are flattened in NumPy-compatible row-major order:
 `linear = ((i0 * d1 + i1) * d2 + i2) ...`.
+Strided host packing identifies the maximal row-major contiguous suffix and
+copies one block per outer index. This preserves arbitrary positive-stride
+views while avoiding per-element index division and tiny copies for common
+padded-row and sliced-batch layouts.
 
 ## Unified compute and graphics execution
 
@@ -148,10 +173,18 @@ stage artifacts, reflected parameter slots, and output layouts before
 submission. OpenGL 3.3 or OpenGL ES 3.0 is sufficient for graphics;
 compute/graphics compositions require OpenGL 4.3 or OpenGL ES 3.1.
 
+Pipeline loading accepts schema-2 manifests only. Inline artifacts may use the
+convenience byte loader; external artifacts require
+`vernonRuntimeLoadPipelineBundleWithOptions` with the manifest's parent
+directory. There is no directory-scanning C API and no schema-1 conversion
+path. Pipeline invocation ABI version 3 remains the public execution contract.
+
 Pipeline submission order is fixed: upload host-dirty Tensors, dispatch the
 optional compute entry, issue the storage/vertex-input barrier, bind the
-offscreen target and reflected arguments, draw, then mark the target
-device-dirty. Readback is lazy. This order is required because a Tensor may be
+offscreen target and reflected arguments, clear every color attachment to
+transparent black, draw, then mark the target device-dirty. Vulkan render-pass
+load operations and OpenGL attachment clears implement the same per-invocation
+semantics. Readback is lazy. This order is required because a Tensor may be
 written through an SSBO and consumed immediately as a vertex input without a
 host round trip.
 
@@ -200,9 +233,9 @@ external sampler slot, overriding implicit sampler generation.
 `VernonTextureView.sampler` optionally supplies the policy for an implicit
 sampler and must belong to the pipeline context. OpenGL binds that sampler
 object, while Vulkan combines it with the reflected texture descriptor. A null
-field uses the backend runtime default: OpenGL sampler object zero or a
-transient Vulkan linear/repeat sampler. Explicit sampler parameters ignore the
-texture-view field.
+field uses the backend runtime default: OpenGL sampler object zero or the
+runtime-context-owned cached Vulkan linear/repeat sampler. Explicit sampler
+parameters ignore the texture-view field.
 The runtime supplies resolution as `(width, height)` from a non-empty
 invocation viewport, falling back to the common color-attachment extent.
 Generated resolution is an OpenGL uniform or a Vulkan push constant according

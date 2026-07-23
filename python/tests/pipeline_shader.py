@@ -7,8 +7,7 @@ import vernon_dsl as vd
 def translate_vertices(
     position: vd.Tensor[vd.f32, (None, 2)],
     offset: vd.f32,
-    gid: Annotated[vd.Tensor[vd.u32, (3, )],
-                   vd.builtin("global_invocation_id")],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     component = gid[0]
     vertex = gid[1]
@@ -34,3 +33,10 @@ def translated_vertex(
 @vd.fragment
 def solid_fragment() -> Annotated[vd.vec4[vd.f32], vd.location(0)]:
     return vd.vec4(1.0, 0.25, 0.0, 1.0)
+
+
+@vd.fragment
+def colored_fragment(
+    color: Annotated[vd.vec4[vd.f32], vd.uniform()],
+) -> Annotated[vd.vec4[vd.f32], vd.location(0)]:
+    return color

@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import json
+import types
 import unittest
 from unittest import mock
 
 import numpy as np
-
 import vernon_dsl as vd
 import vernon_dsl.runtime as runtime_module
 from advanced_pipeline_shader import (
-    advanced_fragment, advanced_vertex, feature_compute,
+    advanced_fragment,
+    advanced_vertex,
+    feature_compute,
 )
 from pipeline_shader import (
-    solid_fragment, translate_vertices, triangle_vertex, translated_vertex,
+    colored_fragment,
+    solid_fragment,
+    translate_vertices,
+    translated_vertex,
+    triangle_vertex,
 )
 
 
@@ -22,7 +28,6 @@ def shader_helper(value: vd.f32) -> vd.f32:
 
 
 class PipelineContractTests(unittest.TestCase):
-
     def test_declarative_functions_reject_host_calls(self) -> None:
         with self.assertRaisesRegex(TypeError, "shader-only"):
             triangle_vertex(None)
@@ -48,18 +53,80 @@ class PipelineContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "contiguous"):
             tensor.swizzle("zx")
 
-    def test_external_gl_backends_require_registration(self) -> None:
-        for architecture in (vd.opengl, vd.opengles):
-            with self.subTest(architecture=architecture.name):
-                with self.assertRaisesRegex(
-                        RuntimeError,
-                        "requires a registered host-owned external context"):
-                    vd.init(arch=architecture)
-        vd.init(arch=vd.cpu)
+    def test_owned_gl_context_is_selected_and_retained(self) -> None:
+        created: list[object] = []
+        runtime_calls: list[tuple[object, ...]] = []
+
+        class FakeContext:
+            def __init__(self, backend: str, major: int, minor: int):
+                self.request = (backend, major, minor)
+                self.user_data = 11
+                self.make_current = 12
+                self.get_proc_address = 13
+                created.append(self)
+
+        class FakeRuntime:
+            @staticmethod
+            def create_external_opengl(*arguments: object) -> object:
+                runtime_calls.append(arguments)
+                return object()
+
+        fake_native = types.SimpleNamespace(
+            Runtime=FakeRuntime,
+            RuntimeBackend=types.SimpleNamespace(CPU=0, CUDA=1, VULKAN=2, OPENGL=3, OPENGL_ES=4),
+        )
+        helper = types.SimpleNamespace(Context=FakeContext)
+        with (
+            mock.patch.object(runtime_module, "_native", fake_native),
+            mock.patch.object(runtime_module, "_gl_context", helper),
+        ):
+            vd.init(arch=vd.opengl)
+            self.assertEqual(created[-1].request, ("opengl", 4, 3))
+            self.assertIs(runtime_module._owned_opengl_context, created[-1])
+            self.assertEqual(runtime_calls[-1], (3, 11, 12, 13, 4, 3))
+            vd.init(arch=vd.opengles)
+            self.assertEqual(created[-1].request, ("opengles", 3, 1))
+            self.assertEqual(runtime_calls[-1], (4, 11, 12, 13, 3, 1))
+            runtime_module._release_runtime()
+
+    def test_registered_context_takes_priority_over_owned_factory(self) -> None:
+        class FakeRuntime:
+            calls: list[tuple[object, ...]] = []
+
+            @staticmethod
+            def create_external_opengl(*arguments: object) -> object:
+                FakeRuntime.calls.append(arguments)
+                return object()
+
+        fake_native = types.SimpleNamespace(
+            Runtime=FakeRuntime,
+            RuntimeBackend=types.SimpleNamespace(CPU=0, CUDA=1, VULKAN=2, OPENGL=3, OPENGL_ES=4),
+        )
+        helper = mock.Mock()
+        previous = runtime_module._external_opengl_contexts.pop(vd.opengl, None)
+        try:
+            vd.register_external_opengl_context(
+                arch=vd.opengl,
+                user_data=21,
+                make_current=22,
+                get_proc_address=23,
+                api_version=(3, 3),
+            )
+            with (
+                mock.patch.object(runtime_module, "_native", fake_native),
+                mock.patch.object(runtime_module, "_gl_context", helper),
+            ):
+                vd.init(arch=vd.opengl)
+                helper.Context.assert_not_called()
+                self.assertEqual(FakeRuntime.calls[-1], (3, 21, 22, 23, 3, 3))
+                runtime_module._release_runtime()
+        finally:
+            runtime_module._external_opengl_contexts.pop(vd.opengl, None)
+            if previous is not None:
+                runtime_module._external_opengl_contexts[vd.opengl] = previous
 
 
 class OpenGLPipelineTests(unittest.TestCase):
-
     def setUp(self) -> None:
         try:
             vd.init(arch=vd.opengl, api_version=(4, 3))
@@ -76,7 +143,8 @@ class OpenGLPipelineTests(unittest.TestCase):
                     (0.0, 0.75),
                 ],
                 dtype=np.float32,
-            ))
+            )
+        )
         target = vd.Texture.zeros(shape=(64, 64))
 
         render(position=positions, target=target)
@@ -92,8 +160,7 @@ class OpenGLPipelineTests(unittest.TestCase):
         self.assertEqual(render.compile_count, 1)
 
     def test_compute_stage_runs_before_graphics(self) -> None:
-        render = vd.pipeline(translate_vertices, triangle_vertex,
-                             solid_fragment)
+        render = vd.pipeline(translate_vertices, triangle_vertex, solid_fragment)
         positions = vd.Tensor.from_numpy(
             np.array(
                 [
@@ -102,7 +169,8 @@ class OpenGLPipelineTests(unittest.TestCase):
                     (0.0, 0.75),
                 ],
                 dtype=np.float32,
-            ))
+            )
+        )
         target = vd.Texture.zeros(shape=(64, 64))
 
         render(position=positions, offset=2.0, target=target)
@@ -119,7 +187,8 @@ class OpenGLPipelineTests(unittest.TestCase):
                     (0.0, 0.75),
                 ],
                 dtype=np.float32,
-            ))
+            )
+        )
         offset = vd.Tensor.from_numpy(np.array((2.0, 0.0), dtype=np.float32))
         target = vd.Texture.zeros(shape=(64, 64))
 
@@ -132,8 +201,7 @@ class OpenGLPipelineTests(unittest.TestCase):
             vd.init(arch=vd.opengl, api_version=(3, 3))
         except RuntimeError:
             self.skipTest("OpenGL 3.3 context unavailable")
-        render = vd.pipeline(translate_vertices, triangle_vertex,
-                             solid_fragment)
+        render = vd.pipeline(translate_vertices, triangle_vertex, solid_fragment)
         positions = vd.Tensor.from_numpy(np.zeros((3, 2), dtype=np.float32))
         target = vd.Texture.zeros(shape=(8, 8))
         with self.assertRaisesRegex(RuntimeError, "OpenGL 4.3"):
@@ -145,9 +213,7 @@ class OpenGLPipelineTests(unittest.TestCase):
         except RuntimeError:
             self.skipTest("OpenGL 3.3 context unavailable")
         render = vd.pipeline(triangle_vertex, solid_fragment)
-        positions = vd.Tensor.from_numpy(
-            np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)),
-                     dtype=np.float32))
+        positions = vd.Tensor.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
         target = vd.Texture.zeros(shape=(16, 16))
         render(position=positions, target=target)
         self.assertGreater(int(target.to_numpy()[8, 8, 0]), 240)
@@ -158,17 +224,14 @@ class OpenGLPipelineTests(unittest.TestCase):
             np.array(
                 ((-0.25, -0.25), (0.25, -0.25), (0.25, 0.25), (-0.25, 0.25)),
                 dtype=np.float32,
-            ))
-        offsets = vd.Tensor.from_numpy(
-            np.array(((-0.4, 0.0), (0.4, 0.0)), dtype=np.float32))
-        indices = vd.Tensor.from_numpy(
-            np.array((0, 1, 2, 0, 2, 3), dtype=np.uint32))
+            )
+        )
+        offsets = vd.Tensor.from_numpy(np.array(((-0.4, 0.0), (0.4, 0.0)), dtype=np.float32))
+        indices = vd.Tensor.from_numpy(np.array((0, 1, 2, 0, 2, 3), dtype=np.uint32))
         return positions, offsets, indices
 
     def test_indexed_instanced_mrt_variant_and_residency(self) -> None:
-        render = vd.pipeline(advanced_vertex,
-                             advanced_fragment,
-                             features={"PICKING"})
+        render = vd.pipeline(advanced_vertex, advanced_fragment, features={"PICKING"})
         positions, offsets, indices = self._advanced_inputs()
         color = vd.Texture.zeros(shape=(64, 64))
         object_id = vd.Texture.zeros(shape=(64, 64))
@@ -197,97 +260,76 @@ class OpenGLPipelineTests(unittest.TestCase):
         self.assertEqual(render.compile_count, 1)
 
     def test_compute_stage_uses_pipeline_feature_set(self) -> None:
-        render = vd.pipeline(feature_compute,
-                             advanced_vertex,
-                             advanced_fragment,
-                             features={"PICKING"})
+        render = vd.pipeline(feature_compute, advanced_vertex, advanced_fragment, features={"PICKING"})
         positions, offsets, indices = self._advanced_inputs()
-        render(position=positions,
-               offset=offsets,
-               indices=indices,
-               targets={
-                   "color": vd.Texture.zeros(shape=(16, 16)),
-                   "object_id": vd.Texture.zeros(shape=(16, 16)),
-               })
+        render(
+            position=positions,
+            offset=offsets,
+            indices=indices,
+            targets={
+                "color": vd.Texture.zeros(shape=(16, 16)),
+                "object_id": vd.Texture.zeros(shape=(16, 16)),
+            },
+        )
         self.assertEqual(feature_compute.compile_count, 1)
 
     def test_feature_and_advanced_draw_validation(self) -> None:
         positions, offsets, indices = self._advanced_inputs()
         color = vd.Texture.zeros(shape=(32, 32))
         object_id = vd.Texture.zeros(shape=(32, 32))
-        render = vd.pipeline(advanced_vertex,
-                             advanced_fragment,
-                             features=("PICKING", "PICKING"))
+        render = vd.pipeline(advanced_vertex, advanced_fragment, features=("PICKING", "PICKING"))
         with self.assertRaisesRegex(ValueError, "exactly match"):
-            render(position=positions,
-                   offset=offsets,
-                   indices=indices,
-                   targets={"color": color})
-        with self.assertRaisesRegex(ValueError, "same extent"):
-            render(position=positions,
-                   offset=offsets,
-                   indices=indices,
-                   targets={
-                       "color": color,
-                       "object_id": vd.Texture.zeros(shape=(16, 16)),
-                   })
-        with self.assertRaisesRegex(ValueError, "incompatible shape"):
-            render(position=positions,
-                   offset=vd.Tensor.zeros(dtype=vd.f32, shape=(3, 3)),
-                   indices=indices,
-                   targets={
-                       "color": color,
-                       "object_id": object_id,
-                   })
-        invalid_indices = vd.Tensor.from_numpy(
-            np.array((0, 1, 9), dtype=np.uint32))
-        with self.assertRaisesRegex(ValueError, "missing vertex"):
-            render(position=positions,
-                   offset=offsets,
-                   indices=invalid_indices,
-                   targets={
-                       "color": color,
-                       "object_id": object_id,
-                   })
-        unknown = vd.pipeline(advanced_vertex,
-                              advanced_fragment,
-                              features={"UNKNOWN"})
+            render(position=positions, offset=offsets, indices=indices, targets={"color": color})
+        with self.assertRaisesRegex(RuntimeError, "extents differ"):
+            render(
+                position=positions,
+                offset=offsets,
+                indices=indices,
+                targets={
+                    "color": color,
+                    "object_id": vd.Texture.zeros(shape=(16, 16)),
+                },
+            )
+        with self.assertRaisesRegex(RuntimeError, "shape"):
+            render(
+                position=positions,
+                offset=vd.Tensor.zeros(dtype=vd.f32, shape=(3, 3)),
+                indices=indices,
+                targets={
+                    "color": color,
+                    "object_id": object_id,
+                },
+            )
+        unknown = vd.pipeline(advanced_vertex, advanced_fragment, features={"UNKNOWN"})
         with self.assertRaisesRegex(vd.CompileError, "undeclared feature"):
-            unknown(position=positions,
-                    offset=offsets,
-                    indices=indices,
-                    targets={
-                        "color": color,
-                        "object_id": object_id,
-                    })
+            unknown(
+                position=positions,
+                offset=offsets,
+                indices=indices,
+                targets={
+                    "color": color,
+                    "object_id": object_id,
+                },
+            )
 
     def test_layout_view_and_topologies(self) -> None:
         interleaved = vd.Tensor.from_numpy(
             np.array(
-                ((9.0, -0.75, -0.75, 1.0), (9.0, 0.75, -0.75, 1.0),
-                 (9.0, 0.0, 0.75, 1.0)),
+                ((9.0, -0.75, -0.75, 1.0), (9.0, 0.75, -0.75, 1.0), (9.0, 0.0, 0.75, 1.0)),
                 dtype=np.float32,
-            ))
+            )
+        )
         target = vd.Texture.zeros(shape=(32, 32))
-        vd.pipeline(triangle_vertex,
-                    solid_fragment)(position=interleaved.swizzle("yz"),
-                                    target=target)
+        vd.pipeline(triangle_vertex, solid_fragment)(position=interleaved.swizzle("yz"), target=target)
         self.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
 
-        line_positions = vd.Tensor.from_numpy(
-            np.array(((-0.5, 0.0), (0.5, 0.0)), dtype=np.float32))
-        vd.pipeline(triangle_vertex, solid_fragment)(position=line_positions,
-                                                     target=target,
-                                                     topology=vd.lines)
-        point_positions = vd.Tensor.from_numpy(
-            np.array(((0.0, 0.0), ), dtype=np.float32))
-        vd.pipeline(triangle_vertex, solid_fragment)(position=point_positions,
-                                                     target=target,
-                                                     topology=vd.points)
+        line_positions = vd.Tensor.from_numpy(np.array(((-0.5, 0.0), (0.5, 0.0)), dtype=np.float32))
+        vd.pipeline(triangle_vertex, solid_fragment)(position=line_positions, target=target, topology=vd.lines)
+        point_positions = vd.Tensor.from_numpy(np.array(((0.0, 0.0),), dtype=np.float32))
+        vd.pipeline(triangle_vertex, solid_fragment)(position=point_positions, target=target, topology=vd.points)
 
 
 class VulkanPipelineTests(unittest.TestCase):
-
     def setUp(self) -> None:
         try:
             vd.init(arch=vd.vulkan)
@@ -296,15 +338,12 @@ class VulkanPipelineTests(unittest.TestCase):
 
     @staticmethod
     def _triangle() -> vd.Tensor:
-        return vd.Tensor.from_numpy(
-            np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)),
-                     dtype=np.float32))
+        return vd.Tensor.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
 
     def test_triangle_and_compute_graphics_pipeline(self) -> None:
         positions = self._triangle()
         target = vd.Texture.zeros(shape=(64, 64))
-        render = vd.pipeline(translate_vertices, triangle_vertex,
-                             solid_fragment)
+        render = vd.pipeline(translate_vertices, triangle_vertex, solid_fragment)
         render(position=positions, offset=np.float32(0.25), target=target)
         pixels = target.to_numpy()
         self.assertGreater(int(pixels[32, 40, 0]), 240)
@@ -314,18 +353,35 @@ class VulkanPipelineTests(unittest.TestCase):
         )
         self.assertEqual(render.compile_count, 1)
 
+    def test_stage_uniforms_do_not_overlap_and_y_matches_opengl(self) -> None:
+        target = vd.Texture.zeros(shape=(64, 64))
+        offset = vd.Tensor.from_numpy(np.zeros(2, dtype=np.float32))
+        color = vd.Tensor.from_numpy(np.array((0.8, 0.7, 0.2, 1.0), dtype=np.float32))
+
+        vd.pipeline(translated_vertex, colored_fragment)(
+            position=self._triangle(), offset=offset, color=color, target=target
+        )
+        pixels = target.to_numpy()
+
+        np.testing.assert_allclose(pixels[32, 32], np.array((204, 178, 51, 255)), atol=1)
+        self.assertEqual(tuple(pixels[16, 16]), (0, 0, 0, 0))
+        self.assertGreater(int(pixels[48, 16, 0]), 190)
+
     def test_pipeline_uses_owning_compiler_and_shared_planner(self) -> None:
         render = vd.pipeline(triangle_vertex, solid_fragment)
         positions = self._triangle()
         target = vd.Texture.zeros(shape=(16, 16))
-        with mock.patch(
+        with (
+            mock.patch(
                 "subprocess.run",
                 side_effect=AssertionError("subprocess prohibited"),
-        ), mock.patch.object(
+            ),
+            mock.patch.object(
                 runtime_module,
                 "build_bundle_plan",
                 wraps=runtime_module.build_bundle_plan,
-        ) as planner:
+            ) as planner,
+        ):
             render(position=positions, target=target)
         planner.assert_called_once()
 
@@ -337,16 +393,25 @@ class VulkanPipelineTests(unittest.TestCase):
         compiled = render._compiled
         self.assertIsNotNone(compiled)
         assert compiled is not None
+        self.assertFalse(hasattr(compiled.native, "invoke"))
+        self.assertEqual(
+            [(parameter.name, parameter.slot, tuple(parameter.shape)) for parameter in compiled.native.parameters],
+            [("position", 0, (2,))],
+        )
+        self.assertEqual(
+            [(output.name, output.location) for output in compiled.native.outputs],
+            [("output_0", 0)],
+        )
+        with self.assertRaisesRegex(ValueError, "different reflected kind"):
+            compiled.native.invocation_builder().texture(0, target._resident_texture())
         bundle = json.loads(compiled.bundle)
         variant = bundle["variants"][0]
         self.assertEqual(
-            [(row["name"], row["slot"], row["kind"])
-             for row in variant["parameters"]],
+            [(row["name"], row["slot"], row["kind"]) for row in variant["parameters"]],
             [("position", 0, "tensor")],
         )
         self.assertEqual(
-            [(row["name"], row["location"], row["type"])
-             for row in variant["outputs"]],
+            [(row["name"], row["location"], row["type"]) for row in variant["outputs"]],
             [("output_0", 0, "tensor<4xf32>")],
         )
         self.assertEqual(render.compile_count, 1)
@@ -355,28 +420,28 @@ class VulkanPipelineTests(unittest.TestCase):
         self.assertEqual(render.compile_count, 1)
 
     def test_indexed_instanced_mrt(self) -> None:
-        render = vd.pipeline(advanced_vertex,
-                             advanced_fragment,
-                             features={"PICKING"})
+        render = vd.pipeline(advanced_vertex, advanced_fragment, features={"PICKING"})
         positions, offsets, indices = OpenGLPipelineTests._advanced_inputs()
         color = vd.Texture.zeros(shape=(64, 64))
         object_id = vd.Texture.zeros(shape=(64, 64))
-        render(position=positions,
-               offset=offsets,
-               indices=indices,
-               targets={
-                   "color": color,
-                   "object_id": object_id,
-               })
+        render(
+            position=positions,
+            offset=offsets,
+            indices=indices,
+            targets={
+                "color": color,
+                "object_id": object_id,
+            },
+        )
         self.assertGreater(int(color.to_numpy()[32, 19, 2]), 240)
         self.assertGreater(int(object_id.to_numpy()[32, 19, 0]), 240)
 
     def test_cpu_graphics_has_explicit_error(self) -> None:
         vd.init(arch=vd.cpu)
         with self.assertRaisesRegex(RuntimeError, "software rasterizer"):
-            vd.pipeline(triangle_vertex,
-                        solid_fragment)(position=self._triangle(),
-                                        target=vd.Texture.zeros(shape=(8, 8)))
+            vd.pipeline(triangle_vertex, solid_fragment)(
+                position=self._triangle(), target=vd.Texture.zeros(shape=(8, 8))
+            )
 
 
 if __name__ == "__main__":

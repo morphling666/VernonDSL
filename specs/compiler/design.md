@@ -84,7 +84,15 @@ Persistent pipeline composition is declared with a module-level
 that assignment from the source AST; it must not import or execute the module.
 Assets explicitly enumerate allowed feature combinations, preventing implicit
 powerset growth. Stage compilation remains cached per entry and feature key, so
-unchanged artifacts are content-addressed and shared across variants.
+unchanged artifacts are content-addressed and shared across variants. The
+manifest-level `features` list is exactly the union of names present in those
+variant keys; features declared by source modules but omitted from every
+pipeline variant are not part of the asset contract.
+
+Texture parameter constraints are queried through a separate `struct_size`-
+versioned runtime view so `VernonPipelineParameterView` remains ABI-stable.
+Dimension is required; manifests may additionally provide canonical
+`texture_format` names. Omitted formats are explicitly unconstrained.
 
 A target is reported as available only after its complete lowering and
 artifact generation pipeline is registered. An IR-only prototype must return
@@ -247,26 +255,16 @@ sampler ABI and reflection model.
 
 `texture_size` is a native image query and never creates an external parameter.
 The pinned MLIR SPIR-V dialect lacks `OpImageQuerySizeLod`, so lowering emits a
-verified `spirv.Image` plus adjacent scalar/vector marker operations and the
-compiler materializes `OpImageQuerySizeLod` in the serialized binary.
+verified `spirv.Image` plus adjacent uniquely marked scalar/vector operations.
+It also records the expected query count on the SPIR-V module. The compiler
+validates marker operands, SSA IDs, and that count before materializing
+`OpImageQuerySizeLod` in the serialized binary; any mismatch fails compilation.
 SPIRV-Cross therefore receives the target instruction and emits `textureSize`.
 
-## Asset integration status and remaining work
+## Persistent asset contract
 
-Shader variant authoring, stage composition, cooking, and asset integration are
-specified in [shader_variant_asset_plan.md](shader_variant_asset_plan.md).
-Reflection artifact tables, schema-2 cooked bundles, exact variant keys,
-dependency-based invalidation, and Vernon's `CompiledShaderBundle` loading path
-are implemented.
-
-The remaining asset work is reflected resource binding: record complete
-cross-compiled block/uniform/member layouts, bind OpenGL resources from that
-reflection, and let materials provide typed values by `(set, binding)` while
-retaining the named-uniform path for legacy shaders. Bundle parsing should
-remain testable without a window; GPU/GUI shader tests remain explicit
-developer runs.
-
-Future backend and Engine integration work includes moving Vernon production
-materials and render passes onto cooked DSL assets, CUDA shared-helper
-coverage, graphics/CPU control-flow and texture coverage required by real
-materials, and DXC-to-DXIL artifact generation when DXC is available.
+`vernon-cook-shader` emits one schema-2 `*.pipeline.json` manifest and
+content-addressed external artifacts. It compiles in process through
+`vernon_dsl._native`; there is no compiler-executable argument or compatibility
+manifest. Runtime, not the Engine, validates manifest structure, content hashes,
+artifact paths, sizes, digests, reflection, and exact feature keys.

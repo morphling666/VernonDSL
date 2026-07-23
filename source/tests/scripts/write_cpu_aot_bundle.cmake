@@ -1,16 +1,23 @@
-if(NOT DEFINED ARTIFACT OR NOT DEFINED OUTPUT OR NOT DEFINED OPERATING_SYSTEM
+if(NOT DEFINED ARTIFACT
+   OR NOT DEFINED OUTPUT
+   OR NOT DEFINED OPERATING_SYSTEM
    OR NOT DEFINED ARCHITECTURE)
-  message(FATAL_ERROR "CPU AOT bundle generator arguments are incomplete")
+    message(FATAL_ERROR "CPU AOT bundle generator arguments are incomplete")
 endif()
 
 file(MAKE_DIRECTORY "${OUTPUT}")
 get_filename_component(ARTIFACT_NAME "${ARTIFACT}" NAME)
-file(COPY_FILE "${ARTIFACT}" "${OUTPUT}/${ARTIFACT_NAME}" ONLY_IF_DIFFERENT)
+file(
+    COPY_FILE
+    "${ARTIFACT}"
+    "${OUTPUT}/${ARTIFACT_NAME}"
+    ONLY_IF_DIFFERENT)
 file(SIZE "${ARTIFACT}" ARTIFACT_SIZE)
 file(SHA256 "${ARTIFACT}" ARTIFACT_SHA256)
 
-file(WRITE "${OUTPUT}/compute.json"
-"{
+file(
+    WRITE "${OUTPUT}/compute.json"
+    "{
   \"schema_version\": 2,
   \"cpu_invocation_abi_version\": 1,
   \"target\": \"cpu\",
@@ -48,84 +55,30 @@ file(WRITE "${OUTPUT}/compute.json"
 }
 ")
 
-file(WRITE "${OUTPUT}/pipeline.bundle"
-"{
-  \"pipeline_bundle_schema_version\": 1,
-  \"invocation_abi_version\": 1,
-  \"type\": \"vernon_pipeline_bundle\",
-  \"id\": \"cpu/fill\",
-  \"target\": \"cpu\",
-  \"features\": [],
-  \"variants\": [{
-    \"key\": [],
-    \"parameters\": [{
-      \"slot\": 0,
-      \"name\": \"output\",
-      \"kind\": \"tensor\",
-      \"dtype\": \"f32\",
-      \"shape\": [12],
-      \"access\": \"write\",
-      \"uses\": [{
-        \"stage\": \"compute\",
-        \"entry\": \"fill\",
-        \"index\": 0,
-        \"kind\": \"tensor\",
-        \"dtype\": \"f32\",
-        \"shape\": [12],
-        \"interface\": \"storage\",
-        \"access\": \"write\"
-      }]
-    }],
-    \"outputs\": [{
-      \"name\": \"result\",
-      \"kind\": \"tensor\",
-      \"dtype\": \"f32\",
-      \"shape\": [12],
-      \"access\": \"write\",
-      \"location\": 0
-    }],
-    \"steps\": [{\"kind\": \"dispatch\", \"stage\": \"fill\"}]
-  }],
-  \"stage_artifacts\": {
-    \"fill\": {
-      \"id\": \"fill\",
-      \"entry\": \"fill\",
-      \"stage\": \"compute\",
-      \"target\": \"cpu\",
-      \"format\": \"native_library\",
-      \"artifact\": {
-        \"path\": \"${ARTIFACT_NAME}\",
-        \"size\": ${ARTIFACT_SIZE},
-        \"sha256\": \"${ARTIFACT_SHA256}\"
-      },
-      \"symbol\": \"vernon_test_fill\",
-      \"operating_system\": \"${OPERATING_SYSTEM}\",
-      \"architecture\": \"${ARCHITECTURE}\",
-      \"cpu_invocation_abi_version\": 1,
-      \"reflection\": {
-        \"gpu_launch_abi_version\": 1,
-        \"entries\": [{
-          \"name\": \"fill\",
-          \"cpu_arguments_size\": 20,
-          \"workgroup_size\": [2, 2, 1],
-          \"arguments\": [
-            {
-              \"kind\": \"tensor\",
-              \"dtype\": \"f32\",
-              \"alignment\": 4,
-              \"cpu_offset\": 0,
-              \"cpu_size\": 8
-            },
-            {
-              \"kind\": \"builtin\",
-              \"builtin\": \"global_invocation_id\",
-              \"cpu_offset\": 8,
-              \"cpu_size\": 12
-            }
-          ]
-        }]
-      }
-    }
-  }
-}
-")
+set(PIPELINE_CANONICAL
+    "{\"features\":[],\"id\":\"cpu/fill\",\"invocation_abi_version\":3,\"schema_version\":2,\
+\"stage_artifacts\":{\"fill\":{\"architecture\":\"${ARCHITECTURE}\",\
+\"artifact\":{\"format\":\"native_library\",\"path\":\"${ARTIFACT_NAME}\",\
+\"sha256\":\"${ARTIFACT_SHA256}\",\"size\":${ARTIFACT_SIZE},\"storage\":\"external\"},\
+\"cpu_invocation_abi_version\":1,\"entry\":\"fill\",\"format\":\"native_library\",\
+\"id\":\"fill\",\"operating_system\":\"${OPERATING_SYSTEM}\",\
+\"reflection\":{\"entries\":[{\"arguments\":[\
+{\"alignment\":4,\"cpu_offset\":0,\"cpu_size\":8,\"dtype\":\"f32\",\"kind\":\"tensor\"},\
+{\"builtin\":\"global_invocation_id\",\"cpu_offset\":8,\"cpu_size\":12,\"kind\":\"builtin\"}],\
+\"cpu_arguments_size\":20,\"name\":\"fill\",\"workgroup_size\":[2,2,1]}],\
+\"gpu_launch_abi_version\":1},\"stage\":\"compute\",\"symbol\":\"vernon_test_fill\",\
+\"target\":\"cpu\"}},\"target\":\"cpu\",\"type\":\"pipeline\",\
+\"variants\":[{\"key\":[],\"outputs\":[{\"access\":\"write\",\"dtype\":\"f32\",\
+\"kind\":\"tensor\",\"location\":0,\"name\":\"result\",\"shape\":[12]}],\
+\"parameters\":[{\"access\":\"write\",\"dtype\":\"f32\",\"kind\":\"tensor\",\
+\"name\":\"output\",\"shape\":[12],\"slot\":0,\"uses\":[{\"access\":\"write\",\
+\"dtype\":\"f32\",\"entry\":\"fill\",\"index\":0,\"interface\":\"storage\",\
+\"kind\":\"tensor\",\"shape\":[12],\"stage\":\"compute\"}]}],\
+\"steps\":[{\"kind\":\"dispatch\",\"stage\":\"fill\"}]}]}")
+string(SHA256 PIPELINE_HASH "${PIPELINE_CANONICAL}")
+string(
+    SUBSTRING "${PIPELINE_CANONICAL}"
+              1
+              -1
+              PIPELINE_BODY)
+file(WRITE "${OUTPUT}/cpu_fill.pipeline.json" "{\"content_hash\":\"${PIPELINE_HASH}\",${PIPELINE_BODY}\n")

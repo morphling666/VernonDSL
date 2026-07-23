@@ -1,0 +1,194 @@
+#include "VernonCpuAbiWrapper.h"
+
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Support/Error.h"
+#include "llvm/TargetParser/Triple.h"
+
+namespace vernon {
+namespace {
+
+llvm::Error invalidAbi(const llvm::Twine &message) { return llvm::createStringError(message); }
+
+llvm::Constant *integerConstant(llvm::Type *type, uint64_t value) {
+    auto *integerType = llvm::dyn_cast<llvm::IntegerType>(type);
+    return integerType ? llvm::ConstantInt::get(integerType, value) : nullptr;
+}
+
+} // namespace
+
+llvm::Error defineCpuTextureSampleHelper(llvm::Module &module) {
+    llvm::Function *helper = module.getFunction("__vernon_cpu_texture_sample");
+    if (!helper)
+        return llvm::Error::success();
+    if (!helper->empty())
+        return invalidAbi("CPU texture helper unexpectedly has a body");
+
+    llvm::LLVMContext &context = module.getContext();
+    llvm::Type *pointerType = llvm::PointerType::get(context, 0);
+    auto *uvType = llvm::FixedVectorType::get(llvm::Type::getFloatTy(context), 2);
+    auto *resultType = llvm::FixedVectorType::get(llvm::Type::getFloatTy(context), 4);
+    if (helper->arg_size() != 4 || helper->getArg(0)->getType() != llvm::Type::getInt64Ty(context) ||
+        helper->getArg(1)->getType() != llvm::Type::getInt64Ty(context) || helper->getArg(2)->getType() != uvType ||
+        helper->getArg(3)->getType() != pointerType || helper->getReturnType() != resultType)
+        return invalidAbi("lowered CPU texture helper has an incompatible type");
+
+    helper->setLinkage(llvm::GlobalValue::InternalLinkage);
+    llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", helper);
+    llvm::IRBuilder<> builder(entry);
+    llvm::Value *callbacks = helper->getArg(3);
+    llvm::LoadInst *userData = builder.CreateLoad(pointerType, callbacks, "user_data");
+    userData->setAlignment(llvm::Align(1));
+    llvm::Value *sampleAddress = builder.CreateGEP(llvm::Type::getInt8Ty(context), callbacks,
+                                                   llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8));
+    llvm::LoadInst *sampleFunction = builder.CreateLoad(pointerType, sampleAddress, "sample_2d");
+    sampleFunction->setAlignment(llvm::Align(1));
+    llvm::Value *output = builder.CreateAlloca(llvm::ArrayType::get(llvm::Type::getFloatTy(context), 4));
+    auto callbackType =
+        llvm::FunctionType::get(llvm::Type::getVoidTy(context),
+                                {pointerType, llvm::Type::getInt64Ty(context), llvm::Type::getFloatTy(context),
+                                 llvm::Type::getFloatTy(context), pointerType},
+                                false);
+    llvm::Value *uv = helper->getArg(2);
+    builder.CreateCall(callbackType, sampleFunction,
+                       {userData, helper->getArg(0), builder.CreateExtractElement(uv, uint64_t{0}),
+                        builder.CreateExtractElement(uv, uint64_t{1}), output});
+    llvm::LoadInst *sample = builder.CreateLoad(resultType, output);
+    sample->setAlignment(llvm::Align(1));
+    builder.CreateRet(sample);
+    return llvm::Error::success();
+}
+
+llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata &metadata) {
+    llvm::Function *function = module.getFunction(metadata.internalFunctionSymbol);
+    if (!function)
+        return invalidAbi("CPU ABI wrapper internal function '" + metadata.internalFunctionSymbol + "' does not exist");
+
+    size_t loweredArgumentCount = 1;
+    for (const CpuAbiArgumentPacking &argument : metadata.sourceArguments)
+        loweredArgumentCount += argument.kind == CpuAbiArgumentKind::Buffer ? 5 : 1;
+    if (function->arg_size() != loweredArgumentCount)
+        return invalidAbi("lowered CPU entry '" + metadata.internalFunctionSymbol +
+                          "' has an incompatible argument count");
+
+    llvm::LLVMContext &context = module.getContext();
+    llvm::Type *pointerType = llvm::PointerType::get(context, 0);
+    auto wrapperType = llvm::FunctionType::get(llvm::Type::getInt32Ty(context), {pointerType}, false);
+    llvm::Function *wrapper =
+        llvm::Function::Create(wrapperType, llvm::GlobalValue::ExternalLinkage, metadata.exportedWrapperSymbol, module);
+    if (llvm::Triple(module.getTargetTriple()).isOSWindows())
+        wrapper->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
+    else
+        wrapper->setVisibility(llvm::GlobalValue::DefaultVisibility);
+    llvm::BasicBlock *entryBlock = llvm::BasicBlock::Create(context, "entry", wrapper);
+    llvm::BasicBlock *sizeBlock = llvm::BasicBlock::Create(context, "check_sizes", wrapper);
+    llvm::BasicBlock *callBlock = llvm::BasicBlock::Create(context, "call", wrapper);
+    llvm::BasicBlock *invalidBlock = llvm::BasicBlock::Create(context, "invalid", wrapper);
+
+    llvm::IRBuilder<> builder(entryBlock);
+    llvm::Value *invocation = wrapper->getArg(0);
+    builder.CreateCondBr(
+        builder.CreateICmpEQ(invocation, llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(pointerType))),
+        invalidBlock, sizeBlock);
+
+    builder.SetInsertPoint(sizeBlock);
+    llvm::LoadInst *argumentsLoad = builder.CreateLoad(pointerType, invocation, "arguments");
+    argumentsLoad->setAlignment(llvm::Align(1));
+    llvm::Value *arguments = argumentsLoad;
+    llvm::Value *argumentsSizeAddress = builder.CreateGEP(llvm::Type::getInt8Ty(context), invocation,
+                                                          llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8));
+    llvm::LoadInst *argumentsSize = builder.CreateLoad(llvm::Type::getInt64Ty(context), argumentsSizeAddress);
+    argumentsSize->setAlignment(llvm::Align(1));
+    llvm::Value *resultsAddress = builder.CreateGEP(llvm::Type::getInt8Ty(context), invocation,
+                                                    llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 16));
+    llvm::LoadInst *resultsLoad = builder.CreateLoad(pointerType, resultsAddress, "results");
+    resultsLoad->setAlignment(llvm::Align(1));
+    llvm::Value *results = resultsLoad;
+    llvm::Value *resultsSizeAddress = builder.CreateGEP(llvm::Type::getInt8Ty(context), invocation,
+                                                        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 24));
+    llvm::LoadInst *resultsSize = builder.CreateLoad(llvm::Type::getInt64Ty(context), resultsSizeAddress);
+    resultsSize->setAlignment(llvm::Align(1));
+    llvm::Value *validArguments =
+        metadata.argumentsSize == 0
+            ? llvm::ConstantInt::getTrue(context)
+            : builder.CreateAnd(
+                  builder.CreateICmpNE(arguments,
+                                       llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(pointerType))),
+                  builder.CreateICmpUGE(
+                      argumentsSize, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), metadata.argumentsSize)));
+    llvm::Value *validResults =
+        metadata.resultsSize == 0
+            ? llvm::ConstantInt::getTrue(context)
+            : builder.CreateAnd(
+                  builder.CreateICmpNE(results,
+                                       llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(pointerType))),
+                  builder.CreateICmpUGE(resultsSize,
+                                        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), metadata.resultsSize)));
+    llvm::Value *texturesAddress = builder.CreateGEP(llvm::Type::getInt8Ty(context), invocation,
+                                                     llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 32));
+    llvm::LoadInst *textures = builder.CreateLoad(pointerType, texturesAddress, "textures");
+    textures->setAlignment(llvm::Align(1));
+    llvm::Value *validTextures =
+        metadata.requiresTextureCallbacks
+            ? builder.CreateICmpNE(textures, llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(pointerType)))
+            : llvm::ConstantInt::getTrue(context);
+    builder.CreateCondBr(builder.CreateAnd(builder.CreateAnd(validArguments, validResults), validTextures), callBlock,
+                         invalidBlock);
+
+    builder.SetInsertPoint(callBlock);
+    llvm::SmallVector<llvm::Value *> argumentsToCall;
+    size_t loweredIndex = 0;
+    for (const CpuAbiArgumentPacking &packing : metadata.sourceArguments) {
+        llvm::Value *address =
+            builder.CreateGEP(llvm::Type::getInt8Ty(context), arguments,
+                              llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), packing.offset));
+        if (packing.kind == CpuAbiArgumentKind::Direct) {
+            llvm::Type *argumentType = function->getArg(loweredIndex++)->getType();
+            if (module.getDataLayout().getTypeStoreSize(argumentType) != packing.size)
+                return invalidAbi("CPU ABI packing size does not match lowered direct "
+                                  "argument type");
+            llvm::LoadInst *load = builder.CreateLoad(argumentType, address);
+            load->setAlignment(llvm::Align(1));
+            argumentsToCall.push_back(load);
+            continue;
+        }
+
+        if (packing.size != module.getDataLayout().getPointerSize())
+            return invalidAbi("CPU buffer ABI packing size is not one pointer");
+        llvm::Type *allocatedType = function->getArg(loweredIndex++)->getType();
+        llvm::Type *alignedType = function->getArg(loweredIndex++)->getType();
+        llvm::Type *offsetType = function->getArg(loweredIndex++)->getType();
+        llvm::Type *sizeType = function->getArg(loweredIndex++)->getType();
+        llvm::Type *strideType = function->getArg(loweredIndex++)->getType();
+        if (allocatedType != pointerType || alignedType != pointerType)
+            return invalidAbi("lowered CPU buffer descriptor pointer types are "
+                              "incompatible");
+        llvm::Constant *offset = integerConstant(offsetType, 0);
+        llvm::Constant *extent = integerConstant(sizeType, packing.staticExtent);
+        llvm::Constant *stride = integerConstant(strideType, 1);
+        if (!offset || !extent || !stride)
+            return invalidAbi("lowered CPU buffer descriptor index types are "
+                              "incompatible");
+        llvm::LoadInst *rawPointer = builder.CreateLoad(pointerType, address, "buffer");
+        rawPointer->setAlignment(llvm::Align(1));
+        argumentsToCall.append({rawPointer, rawPointer, offset, extent, stride});
+    }
+    argumentsToCall.push_back(textures);
+    llvm::CallInst *call = builder.CreateCall(function, argumentsToCall);
+    if (!function->getReturnType()->isVoidTy()) {
+        llvm::StoreInst *store = builder.CreateStore(call, results);
+        store->setAlignment(llvm::Align(1));
+    }
+    builder.CreateRet(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0));
+
+    builder.SetInsertPoint(invalidBlock);
+    builder.CreateRet(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 1));
+    return llvm::Error::success();
+}
+
+} // namespace vernon

@@ -9,7 +9,6 @@ from vernon_dsl.cli import main
 
 
 class TypeSystemTests(unittest.TestCase):
-
     def test_tensor_aliases_and_fixed_resource_types(self) -> None:
         source = """
 from vernon_dsl import *
@@ -39,8 +38,7 @@ def resources(
         self.assertIn("tensor<3xf32>", output)
         self.assertIn("tensor<2x3xf32>", output)
         self.assertIn("!vernon.array<4 x f32>", output)
-        self.assertIn('!vernon.buffer<!vernon.struct<"Vertex">, "read">',
-                      output)
+        self.assertIn('!vernon.buffer<!vernon.struct<"Vertex">, "read">', output)
         self.assertIn('!vernon.texture<"2d", f32>', output)
         self.assertIn('vernon.interface = "resource"', output)
         self.assertIn("vernon.set = 1 : i64", output)
@@ -51,8 +49,7 @@ def resources(
         self.assertIn(": f64", output)
 
     def test_texture_dimensions_and_coordinate_ranks(self) -> None:
-        for dimension, vector in (("2d", "vec2"), ("3d", "vec3"),
-                                  ("cube", "vec3")):
+        for dimension, vector in (("2d", "vec2"), ("3d", "vec3"), ("cube", "vec3")):
             source = f"""
 from vernon_dsl import *
 
@@ -75,8 +72,7 @@ from vernon_dsl import *
 def sample(image: Texture["1d", f32]) -> f32:
     return 0.0
 """
-        with self.assertRaisesRegex(CompileError,
-                                    "texture dimension must be one of"):
+        with self.assertRaisesRegex(CompileError, "texture dimension must be one of"):
             compile_source(invalid_dimension, "bad_dimension.py")
 
         invalid_coordinates = """
@@ -117,11 +113,9 @@ def explicit_sample(
         output = compile_source(source, "sampling_overloads.py")
         self.assertEqual(output.count('name = "texture_sample"'), 4)
         self.assertEqual(output.count('name = "texture_size"'), 2)
-        self.assertIn('vernon.implicit = "sampler"', output)
+        self.assertEqual(output.count('vernon.implicit = "sampler"'), 1)
         self.assertNotIn('vernon.implicit = "texture_size"', output)
-        self.assertIn(
-            "(!vernon.texture<\"2d\", f32>, !vernon.sampler, tensor<2xf32>, f32)",
-            output)
+        self.assertIn('(!vernon.texture<"2d", f32>, !vernon.sampler, tensor<2xf32>, f32)', output)
         explicit_only = compile_source(
             """
 from vernon_dsl import *
@@ -129,7 +123,9 @@ from vernon_dsl import *
 def main(image: Texture["2d", f32], sampler: Sampler,
          uv: vec2[f32]) -> vec4[f32]:
     return texture_sample(image, sampler, uv)
-""", "explicit_only.py")
+""",
+            "explicit_only.py",
+        )
         self.assertNotIn('vernon.implicit = "sampler"', explicit_only)
 
     def test_sampling_stage_and_lod_types_are_validated(self) -> None:
@@ -160,6 +156,41 @@ def main(image: Texture["2d", f32]) -> vec2[u32]:
         with self.assertRaisesRegex(CompileError, "integer scalar"):
             compile_source(invalid_size_lod, "invalid_size_lod.py")
 
+        compute_implicit_lod = """
+from vernon_dsl import *
+@compute(workgroup_size=(1, 1, 1))
+def main(image: Texture["2d", f32], sampler: Sampler,
+         uv: vec2[f32]) -> None:
+    color = texture_sample(image, sampler, uv)
+"""
+        with self.assertRaisesRegex(CompileError, "without lod.*fragment shaders"):
+            compile_source(compute_implicit_lod, "compute_implicit_lod.py")
+
+        compute_explicit_lod = """
+from vernon_dsl import *
+@compute(workgroup_size=(1, 1, 1))
+def main(image: Texture["2d", f32], sampler: Sampler) -> None:
+    color = texture_sample(image, sampler, vec2(0.0, 0.0), 0.0)
+"""
+        output = compile_source(compute_explicit_lod, "compute_explicit_lod.py")
+        self.assertIn('name = "texture_sample"', output)
+
+    def test_implicit_sampler_binding_skips_declared_resources(self) -> None:
+        source = """
+from vernon_dsl import *
+@fragment
+def main(
+    image: Annotated[Texture["2d", f32], resource(set=1, binding=2)],
+    occupied: Annotated[f32, uniform(set=1, binding=0)],
+    uv: vec2[f32],
+) -> vec4[f32]:
+    return texture_sample(image, uv)
+"""
+        output = compile_source(source, "sampler_binding_collision.py")
+        sampler = output[output.index('vernon.source_name = "__vernon_implicit_sampler_image"') :]
+        self.assertIn("vernon.set = 1 : i64", sampler)
+        self.assertIn("vernon.binding = 1 : i64", sampler)
+
     def test_swizzle_aliases_are_canonicalized(self) -> None:
         source = """
 from vernon_dsl import *
@@ -187,13 +218,11 @@ from vernon_dsl import *
 def invalid(color: vec3[f32]) -> f32:
     return color.a
 """
-        with self.assertRaisesRegex(CompileError,
-                                    "swizzle 'a' is out of bounds"):
+        with self.assertRaisesRegex(CompileError, "swizzle 'a' is out of bounds"):
             compile_source(invalid, "invalid_swizzle_alias.py")
 
 
 class StageTests(unittest.TestCase):
-
     def test_raw_builtin_contracts(self) -> None:
         source = """
 from vernon_dsl import *
@@ -222,14 +251,14 @@ def compute_main(
 """
         output = compile_source(source, "raw_builtins.py")
         for builtin_name in (
-                "position",
-                "vertex_index",
-                "instance_index",
-                "frag_coord",
-                "front_facing",
-                "global_invocation_id",
-                "local_invocation_id",
-                "workgroup_id",
+            "position",
+            "vertex_index",
+            "instance_index",
+            "frag_coord",
+            "front_facing",
+            "global_invocation_id",
+            "local_invocation_id",
+            "workgroup_id",
         ):
             self.assertIn(f'vernon.builtin = "{builtin_name}"', output)
 
@@ -282,8 +311,7 @@ def main() -> vec3[f32]:
             ),
         )
         for index, (source, diagnostic) in enumerate(cases):
-            with self.subTest(index=index), self.assertRaisesRegex(
-                    CompileError, diagnostic):
+            with self.subTest(index=index), self.assertRaisesRegex(CompileError, diagnostic):
                 compile_source(source, f"bad_builtin_{index}.py")
 
     def test_texture_cannot_mix_implicit_and_explicit_samplers(self) -> None:
@@ -299,8 +327,7 @@ def main(
     explicit_value = texture_sample(image, sampler, uv)
     return implicit_value + explicit_value
 """
-        with self.assertRaisesRegex(
-                CompileError, "both implicit and explicit sampler forms"):
+        with self.assertRaisesRegex(CompileError, "both implicit and explicit sampler forms"):
             compile_source(source, "mixed_sampler_forms.py")
 
     def test_parameterless_graphics_builtins(self) -> None:
@@ -322,11 +349,11 @@ def fragment_main() -> vec4[f32]:
 """
         output = compile_source(source, "graphics_builtins.py")
         for marker in (
-                'vernon.implicit = "resolution"',
-                'vernon.builtin = "frag_coord"',
-                'vernon.builtin = "front_facing"',
-                'vernon.builtin = "vertex_index"',
-                'vernon.builtin = "instance_index"',
+            'vernon.implicit = "resolution"',
+            'vernon.builtin = "frag_coord"',
+            'vernon.builtin = "front_facing"',
+            'vernon.builtin = "vertex_index"',
+            'vernon.builtin = "instance_index"',
         ):
             self.assertIn(marker, output)
 
@@ -416,15 +443,13 @@ def choose(value: f32, condition: bool) -> f32:
 
 
 class SafetyAndDiagnosticsTests(unittest.TestCase):
-
     def test_compilation_does_not_execute_input(self) -> None:
         source = """
 from vernon_dsl import *
 
 raise RuntimeError("must not execute")
 """
-        with self.assertRaisesRegex(CompileError,
-                                    "unsupported module-level syntax"):
+        with self.assertRaisesRegex(CompileError, "unsupported module-level syntax"):
             compile_source(source, "safe.py")
 
     def test_while_and_augmented_assignment_lower_to_scf(self) -> None:
@@ -449,8 +474,7 @@ from vernon_dsl import *
 def main(value: f32) -> f32:
     return value * 2.0
 """
-        self.assertEqual(compile_source(source, "same.py"),
-                         compile_source(source, "same.py"))
+        self.assertEqual(compile_source(source, "same.py"), compile_source(source, "same.py"))
 
     def test_cli_writes_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -460,14 +484,11 @@ def main(value: f32) -> f32:
                 "from vernon_dsl import *\n@fragment\ndef main(x: f32) -> f32:\n    return x\n",
                 encoding="utf-8",
             )
-            self.assertEqual(main([str(input_path), "-o",
-                                   str(output_path)]), 0)
-            self.assertIn("func.func @main",
-                          output_path.read_text(encoding="utf-8"))
+            self.assertEqual(main([str(input_path), "-o", str(output_path)]), 0)
+            self.assertIn("func.func @main", output_path.read_text(encoding="utf-8"))
 
 
 class ModuleGraphTests(unittest.TestCase):
-
     def test_project_local_helper_is_namespaced_and_hashed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -491,8 +512,7 @@ class ModuleGraphTests(unittest.TestCase):
 
             output = compile_file(shader)
 
-            self.assertIn("func.func private @__vernon_lighting__scale",
-                          output)
+            self.assertIn("func.func private @__vernon_lighting__scale", output)
             self.assertIn("func.call @__vernon_lighting__scale", output)
             self.assertIn("vernon.source_dependencies", output)
             self.assertIn("lighting.py=", output)
@@ -501,15 +521,15 @@ class ModuleGraphTests(unittest.TestCase):
     def test_import_cycle_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "a.py").write_text("from b import helper\n",
-                                       encoding="utf-8")
+            (root / "a.py").write_text("from b import helper\n", encoding="utf-8")
             (root / "b.py").write_text(
                 "from a import main\n"
                 "from vernon_dsl import func\n"
                 "@func\n"
                 "def helper(value: f32) -> f32:\n"
                 "    return value\n",
-                encoding="utf-8")
+                encoding="utf-8",
+            )
             with self.assertRaisesRegex(CompileError, "import cycle"):
                 compile_file(root / "a.py")
 
@@ -526,8 +546,7 @@ class ModuleGraphTests(unittest.TestCase):
                 "    return first(value)\n",
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(CompileError,
-                                        "recursive DSL call graph"):
+            with self.assertRaisesRegex(CompileError, "recursive DSL call graph"):
                 compile_file(path)
 
     def test_undecorated_helper_is_rejected(self) -> None:
@@ -547,21 +566,20 @@ class ModuleGraphTests(unittest.TestCase):
 
 
 class FeatureVariantTests(unittest.TestCase):
-
     def test_features_specialize_interfaces_and_control_flow(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "variants.py"
             path.write_text(
                 "from vernon_dsl import *\n"
-                "INSTANCE = feature(\"INSTANCE\")\n"
-                "SKIN = feature(\"SKIN\")\n"
+                'INSTANCE = feature("INSTANCE")\n'
+                'SKIN = feature("SKIN")\n'
                 "@vertex\n"
                 "def mesh_vertex(\n"
                 "    position: vec3[f32],\n"
                 "    transform: When[INSTANCE, Annotated[mat4[f32], instance()]],\n"
                 "    joints: When[SKIN, vec4[u32]],\n"
                 "    weights: When[SKIN, vec4[f32]],\n"
-                ") -> Annotated[vec4[f32], builtin(\"position\")]:\n"
+                ') -> Annotated[vec4[f32], builtin("position")]:\n'
                 "    result = vec4(position, 1.0)\n"
                 "    if INSTANCE:\n"
                 "        result = matmul(transform, result)\n"
@@ -586,8 +604,7 @@ class FeatureVariantTests(unittest.TestCase):
             self.assertIn("vernon.location = 5", combined)
             self.assertIn("vernon.location = 6", combined)
             self.assertIn("vernon.location = 1", instanced)
-            self.assertIn('vernon.variant_key = ["INSTANCE", "SKIN"]',
-                          combined)
+            self.assertIn('vernon.variant_key = ["INSTANCE", "SKIN"]', combined)
 
     def test_explicit_location_overlap_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -610,7 +627,7 @@ class FeatureVariantTests(unittest.TestCase):
             path = Path(directory) / "bad.py"
             path.write_text(
                 "from vernon_dsl import *\n"
-                "INSTANCE = feature(\"INSTANCE\")\n"
+                'INSTANCE = feature("INSTANCE")\n'
                 "@vertex\n"
                 "def main(value: When[INSTANCE, f32]) -> f32:\n"
                 "    return value\n",
@@ -640,7 +657,6 @@ class FeatureVariantTests(unittest.TestCase):
 
 
 class ExampleRegressionTests(unittest.TestCase):
-
     def test_material_and_custom_vertex_examples_compile(self) -> None:
         root = Path(__file__).parents[2]
         expected_entries = {

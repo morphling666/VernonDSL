@@ -2,6 +2,7 @@
 name = "vernon-lang"
 version = "0.1.0"
 description = "General parallel compiler"
+readme = "README.md"
 requires-python = ">=3.11.9,<3.12"
 authors = [{ name = "Xinyu Yuan", email = "1282503538@qq.com" }]
 
@@ -14,6 +15,10 @@ examples = ["opencv-python>=4.10"]
 build = [
     "nanobind>=2.7.0",
     "clang-format==20.1.8",
+    "cmakelang>=0.6.13",
+    "pyyaml>=6.0.2",
+    "ruff>=0.15.6",
+    "pytest>=9.0.3",
 ]
 
 [project.scripts]
@@ -32,3 +37,10 @@ wheel.packages = ["python/vernon_dsl"]
 cmake.build-type = "Release"
 cmake.args = ["-DBUILD_TESTING=OFF"]
 install.components = ["VernonWheel"]
+
+[tool.ruff]
+line-length = 120
+fix = true
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]

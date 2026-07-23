@@ -23,16 +23,17 @@ def _decorator(node: ast.expr, expected: str, filename: str) -> bool:
     if not isinstance(node, ast.Call):
         return False
     if node.args:
-        _error(filename, node,
-               f"@{expected} accepts only the shared keyword option")
+        _error(filename, node, f"@{expected} accepts only the shared keyword option")
     shared = False
     seen = False
     for keyword in node.keywords:
-        if keyword.arg != "shared" or seen or not isinstance(
-                keyword.value, ast.Constant) or not isinstance(
-                    keyword.value.value, bool):
-            _error(filename, keyword,
-                   f"@{expected} accepts only shared=True or shared=False")
+        if (
+            keyword.arg != "shared"
+            or seen
+            or not isinstance(keyword.value, ast.Constant)
+            or not isinstance(keyword.value.value, bool)
+        ):
+            _error(filename, keyword, f"@{expected} accepts only shared=True or shared=False")
         shared = keyword.value.value
         seen = True
     return shared
@@ -41,10 +42,8 @@ def _decorator(node: ast.expr, expected: str, filename: str) -> bool:
 def _annotation_name(node: ast.expr | None) -> str | None:
     if node is None:
         return None
-    if isinstance(node, ast.Subscript) and (_name(node.value) or
-                                            "").split(".")[-1] == "Annotated":
-        items = node.slice.elts if isinstance(node.slice,
-                                              ast.Tuple) else [node.slice]
+    if isinstance(node, ast.Subscript) and (_name(node.value) or "").split(".")[-1] == "Annotated":
+        items = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
         return _annotation_name(items[0])
     return _name(node)
 
@@ -52,8 +51,7 @@ def _annotation_name(node: ast.expr | None) -> str | None:
 def _error(filename: str, node: ast.AST, message: str) -> None:
     raise CompileError(
         message,
-        SourceLocation(filename, getattr(node, "lineno", 1),
-                       getattr(node, "col_offset", 0) + 1),
+        SourceLocation(filename, getattr(node, "lineno", 1), getattr(node, "col_offset", 0) + 1),
     )
 
 
@@ -71,21 +69,16 @@ def _is_self_attribute(node: ast.AST) -> bool:
     return False
 
 
-def _validate_method(method: ast.FunctionDef, shared_struct: bool,
-                     filename: str) -> bool:
+def _validate_method(method: ast.FunctionDef, shared_struct: bool, filename: str) -> bool:
     if len(method.decorator_list) != 1:
-        _error(filename, method,
-               "struct methods require exactly one @func decorator")
+        _error(filename, method, "struct methods require exactly one @func decorator")
     shared = _decorator(method.decorator_list[0], "func", filename)
     if shared and not shared_struct:
-        _error(filename, method,
-               "a shared method requires @struct(shared=True)")
+        _error(filename, method, "a shared method requires @struct(shared=True)")
     if not method.args.args or method.args.args[0].arg != "self":
-        _error(filename, method,
-               "struct methods require 'self' as the first argument")
+        _error(filename, method, "struct methods require 'self' as the first argument")
     if method.args.args[0].annotation is not None:
-        _error(filename, method.args.args[0],
-               "the self type is supplied by the containing @struct")
+        _error(filename, method.args.args[0], "the self type is supplied by the containing @struct")
     for node in ast.walk(method):
         targets: list[ast.AST] = []
         if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
@@ -99,9 +92,7 @@ def _validate_method(method: ast.FunctionDef, shared_struct: bool,
 
 
 class _MethodCallRewriter(ast.NodeTransformer):
-
-    def __init__(self, structs: dict[str, _StructInfo],
-                 function_results: dict[str, str], filename: str):
+    def __init__(self, structs: dict[str, _StructInfo], function_results: dict[str, str], filename: str):
         self.structs = structs
         self.function_results = function_results
         self.filename = filename
@@ -142,33 +133,18 @@ class _MethodCallRewriter(ast.NodeTransformer):
     def visit_Call(self, node: ast.Call) -> ast.expr:
         if isinstance(node.func, ast.Attribute):
             receiver = node.func.value
-            candidates = [
-                name for name, info in self.structs.items()
-                if node.func.attr in info.methods
-            ]
+            candidates = [name for name, info in self.structs.items() if node.func.attr in info.methods]
             if candidates:
                 struct_name = self._expression_struct(receiver)
                 if struct_name is None:
-                    _error(
-                        self.filename, node.func,
-                        f"cannot resolve struct receiver for method '{node.func.attr}'"
-                    )
+                    _error(self.filename, node.func, f"cannot resolve struct receiver for method '{node.func.attr}'")
                 info = self.structs.get(struct_name)
                 if info is None or node.func.attr not in info.methods:
-                    _error(
-                        self.filename, node.func,
-                        f"struct '{struct_name}' has no method '{node.func.attr}'"
-                    )
+                    _error(self.filename, node.func, f"struct '{struct_name}' has no method '{node.func.attr}'")
                 rewritten = ast.Call(
-                    func=ast.Name(id=info.methods[node.func.attr],
-                                  ctx=ast.Load()),
-                    args=[
-                        self.visit(receiver),
-                        *(self.visit(value) for value in node.args)
-                    ],
-                    keywords=[
-                        self.visit(keyword) for keyword in node.keywords
-                    ],
+                    func=ast.Name(id=info.methods[node.func.attr], ctx=ast.Load()),
+                    args=[self.visit(receiver), *(self.visit(value) for value in node.args)],
+                    keywords=[self.visit(keyword) for keyword in node.keywords],
                 )
                 return ast.copy_location(rewritten, node)
         return self.generic_visit(node)
@@ -176,16 +152,13 @@ class _MethodCallRewriter(ast.NodeTransformer):
     def visit_Attribute(self, node: ast.Attribute) -> ast.expr:
         if not isinstance(getattr(node, "_method_callee", None), bool):
             struct_name = self._expression_struct(node.value)
-            if struct_name is not None and node.attr in self.structs[
-                    struct_name].methods:
-                _error(self.filename, node,
-                       "struct methods cannot be used as first-class values")
+            if struct_name is not None and node.attr in self.structs[struct_name].methods:
+                _error(self.filename, node, "struct methods cannot be used as first-class values")
         return self.generic_visit(node)
 
     def _expression_struct(self, node: ast.expr) -> str | None:
         if isinstance(node, ast.Name):
-            return self.environments[-1].get(
-                node.id) if self.environments else None
+            return self.environments[-1].get(node.id) if self.environments else None
         if isinstance(node, ast.Call):
             called = _name(node.func)
             if called in self.structs:
@@ -207,41 +180,44 @@ def normalize_struct_methods(module: ast.Module, filename: str) -> ast.Module:
     for node in module.body:
         if not isinstance(node, ast.ClassDef):
             continue
+        if not any(
+            (_name(decorator.func if isinstance(decorator, ast.Call) else decorator) or "").split(".")[-1] == "struct"
+            for decorator in node.decorator_list
+        ):
+            continue
         if node.bases or node.keywords:
-            _error(filename, node,
-                   "@struct classes do not support inheritance")
+            _error(filename, node, "@struct classes do not support inheritance")
         if len(node.decorator_list) != 1:
-            _error(filename, node,
-                   "DSL classes require exactly one @struct decorator")
+            _error(filename, node, "DSL classes require exactly one @struct decorator")
         shared_struct = _decorator(node.decorator_list[0], "struct", filename)
         fields: dict[str, ast.expr] = {}
         methods: dict[str, str] = {}
         kept: list[ast.stmt] = []
         for statement in node.body:
-            if isinstance(statement, ast.Expr) and isinstance(
-                    statement.value, ast.Constant) and isinstance(
-                        statement.value.value, str):
+            if (
+                isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Constant)
+                and isinstance(statement.value.value, str)
+            ):
                 kept.append(statement)
                 continue
             if isinstance(statement, ast.Pass):
                 kept.append(statement)
                 continue
-            if isinstance(statement, ast.AnnAssign) and isinstance(
-                    statement.target, ast.Name) and statement.value is None:
+            if (
+                isinstance(statement, ast.AnnAssign)
+                and isinstance(statement.target, ast.Name)
+                and statement.value is None
+            ):
                 if statement.target.id in fields:
-                    _error(filename, statement,
-                           f"duplicate struct field '{statement.target.id}'")
-                fields[statement.target.id] = copy.deepcopy(
-                    statement.annotation)
+                    _error(filename, statement, f"duplicate struct field '{statement.target.id}'")
+                fields[statement.target.id] = copy.deepcopy(statement.annotation)
                 kept.append(statement)
                 continue
             if not isinstance(statement, ast.FunctionDef):
-                _error(
-                    filename, statement,
-                    "@struct bodies may contain only fields and @func methods")
+                _error(filename, statement, "@struct bodies may contain only fields and @func methods")
             if statement.name in methods or statement.name in fields:
-                _error(filename, statement,
-                       f"duplicate struct member '{statement.name}'")
+                _error(filename, statement, f"duplicate struct member '{statement.name}'")
             _validate_method(statement, shared_struct, filename)
             helper_name = f"{node.name}__{statement.name}"
             methods[statement.name] = helper_name
@@ -260,10 +236,10 @@ def normalize_struct_methods(module: ast.Module, filename: str) -> ast.Module:
     module.body.extend(extracted)
     function_results = {
         node.name: result
-        for node in module.body if isinstance(node, ast.FunctionDef)
+        for node in module.body
+        if isinstance(node, ast.FunctionDef)
         if (result := _annotation_name(node.returns)) in structs
     }
-    rewritten = _MethodCallRewriter(structs, function_results,
-                                    filename).visit(module)
+    rewritten = _MethodCallRewriter(structs, function_results, filename).visit(module)
     assert isinstance(rewritten, ast.Module)
     return ast.fix_missing_locations(rewritten)

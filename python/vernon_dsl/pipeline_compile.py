@@ -13,24 +13,17 @@ class PipelineCompileError(ValueError):
 
 
 def _frozen_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
-    return MappingProxyType({
-        key: value[key]
-        for key in sorted(value)
-    })
+    return MappingProxyType({key: value[key] for key in sorted(value)})
 
 
 def canonical_json(value: Any) -> str:
-    return json.dumps(value,
-                      sort_keys=True,
-                      separators=(",", ":"),
-                      ensure_ascii=False)
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def content_hash(value: Mapping[str, Any]) -> str:
     unhashed = dict(value)
     unhashed.pop("content_hash", None)
-    return hashlib.sha256(
-        canonical_json(unhashed).encode("utf-8")).hexdigest()
+    return hashlib.sha256(canonical_json(unhashed).encode("utf-8")).hexdigest()
 
 
 def with_content_hash(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -52,12 +45,9 @@ class TargetOptions:
         glsl_version = options.get("glsl_version")
         if glsl_version is not None:
             if self.target not in {"opengl", "opengles"}:
-                raise PipelineCompileError(
-                    "glsl_version is valid only for OpenGL targets")
-            if (not isinstance(glsl_version, int)
-                    or isinstance(glsl_version, bool) or glsl_version <= 0):
-                raise PipelineCompileError(
-                    "glsl_version must be a positive integer")
+                raise PipelineCompileError("glsl_version is valid only for OpenGL targets")
+            if not isinstance(glsl_version, int) or isinstance(glsl_version, bool) or glsl_version <= 0:
+                raise PipelineCompileError("glsl_version must be a positive integer")
         for name in ("target_triple", "cpu", "cpu_features"):
             value = options.get(name)
             if value is not None and not isinstance(value, str):
@@ -105,8 +95,7 @@ class CompiledStage:
     def __post_init__(self) -> None:
         if not self.entry or not self.stage:
             raise PipelineCompileError("compiled stage requires entry and stage")
-        object.__setattr__(self, "reflection",
-                           _frozen_mapping(self.reflection))
+        object.__setattr__(self, "reflection", _frozen_mapping(self.reflection))
         object.__setattr__(self, "interface", _frozen_mapping(self.interface))
         object.__setattr__(self, "metadata", _frozen_mapping(self.metadata))
 
@@ -127,8 +116,7 @@ class CompiledStage:
 
     @property
     def id(self) -> str:
-        return hashlib.sha256(
-            canonical_json(self.identity).encode("utf-8")).hexdigest()
+        return hashlib.sha256(canonical_json(self.identity).encode("utf-8")).hexdigest()
 
     def logical_record(self) -> dict[str, Any]:
         record = {
@@ -161,8 +149,7 @@ class VariantPlan:
     def __post_init__(self) -> None:
         object.__setattr__(self, "stages", _frozen_mapping(self.stages))
         for name in ("parameters", "internal_parameters", "outputs", "steps"):
-            values = tuple(_frozen_mapping(value)
-                           for value in getattr(self, name))
+            values = tuple(_frozen_mapping(value) for value in getattr(self, name))
             object.__setattr__(self, name, values)
 
     def to_dict(self) -> dict[str, Any]:
@@ -173,9 +160,7 @@ class VariantPlan:
             "steps": [dict(value) for value in self.steps],
         }
         if self.internal_parameters:
-            result["internal_parameters"] = [
-                dict(value) for value in self.internal_parameters
-            ]
+            result["internal_parameters"] = [dict(value) for value in self.internal_parameters]
         return result
 
 
@@ -198,49 +183,40 @@ class BundlePlan:
             "features": list(self.features),
             "variants": [variant.to_dict() for variant in self.variants],
             "stage_artifacts": {
-                stage.id: stage.logical_record()
-                for stage in sorted(self.stages, key=lambda value: value.id)
+                stage.id: stage.logical_record() for stage in sorted(self.stages, key=lambda value: value.id)
             },
         }
 
 
-def parse_reflection_json(reflection: str | bytes |
-                          Mapping[str, Any]) -> dict[str, Any]:
+def parse_reflection_json(reflection: str | bytes | Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(reflection, Mapping):
         return dict(reflection)
     try:
         value = json.loads(reflection)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise PipelineCompileError(
-            f"compiler reflection is invalid JSON: {error}") from None
+        raise PipelineCompileError(f"compiler reflection is invalid JSON: {error}") from None
     if not isinstance(value, dict):
         raise PipelineCompileError("compiler reflection must be an object")
     return value
 
 
-def select_entry(reflection: Mapping[str, Any],
-                 entry: str) -> dict[str, Any]:
+def select_entry(reflection: Mapping[str, Any], entry: str) -> dict[str, Any]:
     matches = [
-        value for value in reflection.get("entries", [])
-        if isinstance(value, dict) and value.get("name") == entry
+        value for value in reflection.get("entries", []) if isinstance(value, dict) and value.get("name") == entry
     ]
     if len(matches) != 1:
-        raise PipelineCompileError(
-            f"compiler reflection does not contain exactly one '{entry}' entry"
-        )
+        raise PipelineCompileError(f"compiler reflection does not contain exactly one '{entry}' entry")
     return matches[0]
 
 
-def select_artifact(reflection: Mapping[str, Any], entry: str,
-                    stage: str) -> dict[str, Any]:
+def select_artifact(reflection: Mapping[str, Any], entry: str, stage: str) -> dict[str, Any]:
     matches = [
-        value for value in reflection.get("artifacts", [])
-        if isinstance(value, dict) and value.get("entry_point") == entry
-        and value.get("stage") == stage
+        value
+        for value in reflection.get("artifacts", [])
+        if isinstance(value, dict) and value.get("entry_point") == entry and value.get("stage") == stage
     ]
     if len(matches) != 1:
-        raise PipelineCompileError(
-            f"compiler did not emit exactly one {stage} artifact for {entry}")
+        raise PipelineCompileError(f"compiler did not emit exactly one {stage} artifact for {entry}")
     return matches[0]
 
 
@@ -251,11 +227,9 @@ def select_artifact_bytes(
     filename = artifact_row.get("filename")
     if not isinstance(filename, str) or not filename:
         raise PipelineCompileError("compiler artifact filename is invalid")
-    matches = [(name, bytes(data)) for name, data in artifacts
-               if name == filename]
+    matches = [(name, bytes(data)) for name, data in artifacts if name == filename]
     if len(matches) != 1:
-        raise PipelineCompileError(
-            f"compiler produced no unique artifact {filename!r}")
+        raise PipelineCompileError(f"compiler produced no unique artifact {filename!r}")
     return matches[0]
 
 
@@ -270,17 +244,14 @@ def compiled_stage_from_program(
 ) -> CompiledStage:
     """Normalize one owning compiler result into the shared stage model."""
     if not bool(program.ok):
-        raise PipelineCompileError(
-            str(program.diagnostics) or f"native compilation failed for {entry}")
+        raise PipelineCompileError(str(program.diagnostics) or f"native compilation failed for {entry}")
     reflection = parse_reflection_json(program.reflection)
     interface = select_entry(reflection, entry)
     stage = interface.get("stage")
     if not isinstance(stage, str) or not stage:
-        raise PipelineCompileError(
-            f"compiler reflection has no stage for {entry}")
+        raise PipelineCompileError(f"compiler reflection has no stage for {entry}")
     artifact_row = select_artifact(reflection, entry, stage)
-    artifact_name, artifact_data = select_artifact_bytes(
-        program.artifacts, artifact_row)
+    artifact_name, artifact_data = select_artifact_bytes(program.artifacts, artifact_row)
     artifact_format = artifact_row.get("format")
     if not isinstance(artifact_format, str) or not artifact_format:
         raise PipelineCompileError("compiler artifact format is invalid")
@@ -306,46 +277,38 @@ def dtype_and_shape(type_name: object) -> tuple[str | None, list[int]]:
     if not parts:
         return None, []
     try:
-        shape = [
-            0 if dimension == "?" else int(dimension)
-            for dimension in parts[:-1]
-        ]
+        shape = [0 if dimension == "?" else int(dimension) for dimension in parts[:-1]]
     except ValueError:
-        raise PipelineCompileError(
-            f"invalid reflected tensor type {type_name!r}") from None
+        raise PipelineCompileError(f"invalid reflected tensor type {type_name!r}") from None
     return parts[-1], shape
 
 
 def _backend_name(name: str) -> str:
     result = "".join(
-        character if character.isascii() and
-        (character.isalnum() or character == "_") else "_"
-        for character in name)
+        character if character.isascii() and (character.isalnum() or character == "_") else "_" for character in name
+    )
     return f"_{result}" if not result or result[0].isdigit() else result
 
 
 def _internal_parameter_source(row: Mapping[str, Any]) -> str | None:
+    legacy_markers = ("vernon.compiler_generated", "vernon.implicit_sampler", "vernon.system_value")
+    if any(marker in row for marker in legacy_markers):
+        raise PipelineCompileError("legacy compiler-generated parameter metadata is unsupported")
     implicit = row.get("vernon.implicit")
-    system_value = (implicit
-                    if implicit == "resolution"
-                    else row.get("vernon.system_value"))
-    if system_value is not None:
-        if system_value != "resolution":
-            raise PipelineCompileError(
-                f"unsupported compiler system value {system_value!r}")
+    if implicit == "resolution":
         return "system_value"
-    if row.get("kind") == "sampler" and (
-            implicit == "sampler"
-            or row.get("vernon.implicit_sampler") is True
-            or row.get("vernon.compiler_generated") is True):
+    if implicit == "sampler":
+        if row.get("kind") != "sampler":
+            raise PipelineCompileError("implicit sampler metadata must annotate a sampler argument")
         return "implicit_sampler"
+    if implicit is not None:
+        raise PipelineCompileError(f"unsupported compiler-generated parameter {implicit!r}")
     return None
 
 
 def reflected_parameters(
     records: Mapping[str, Mapping[str, Any]],
-) -> tuple[dict[str, list[dict[str, Any]]],
-           dict[str, list[dict[str, Any]]]]:
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
     external: dict[str, list[dict[str, Any]]] = {}
     internal: dict[str, list[dict[str, Any]]] = {}
     for stage in ("compute", "vertex", "fragment"):
@@ -354,25 +317,19 @@ def reflected_parameters(
             continue
         interface = record.get("interface", {})
         if not isinstance(interface, Mapping):
-            raise PipelineCompileError(
-                f"{stage} stage interface must be an object")
+            raise PipelineCompileError(f"{stage} stage interface must be an object")
         for row in interface.get("arguments", []):
             if not isinstance(row, Mapping):
-                raise PipelineCompileError(
-                    f"{stage} interface argument must be an object")
+                raise PipelineCompileError(f"{stage} interface argument must be an object")
             if "vernon.builtin" in row or row.get("vernon.varying", False):
                 continue
             internal_source = _internal_parameter_source(row)
             name = row.get("vernon.source_name")
             interface_name = row.get("vernon.interface")
-            if internal_source is not None and (not isinstance(name, str)
-                                                or not name):
-                name = (f"__vernon_{internal_source}_{stage}_"
-                        f"{row.get('index', 0)}")
-            if (not isinstance(name, str) or not name
-                    or not isinstance(interface_name, str)):
-                raise PipelineCompileError(
-                    f"{stage} external argument is missing source metadata")
+            if internal_source is not None and (not isinstance(name, str) or not name):
+                name = f"__vernon_{internal_source}_{stage}_{row.get('index', 0)}"
+            if not isinstance(name, str) or not name or not isinstance(interface_name, str):
+                raise PipelineCompileError(f"{stage} external argument is missing source metadata")
             inferred_dtype, inferred_shape = dtype_and_shape(row.get("type"))
             use = {
                 "stage": stage,
@@ -380,8 +337,7 @@ def reflected_parameters(
                 "index": row.get("index"),
                 "kind": row.get("kind", "scalar"),
                 "type": row.get("type"),
-                "dtype": (row.get("dtype") or row.get("vernon.dtype")
-                          or inferred_dtype),
+                "dtype": (row.get("dtype") or row.get("vernon.dtype") or inferred_dtype),
                 "shape": row.get("shape", inferred_shape),
                 "interface": interface_name,
                 "access": row.get("access", "read"),
@@ -391,16 +347,23 @@ def reflected_parameters(
                 use["internal_source"] = internal_source
                 if internal_source == "system_value":
                     use["system_value"] = "resolution"
-            for key in ("vernon.location", "vernon.instance_divisor",
-                        "vernon.set", "vernon.binding",
-                        "sampled_texture_set", "sampled_texture_binding",
-                        "sampled_texture_bindings"):
+            for key in (
+                "vernon.location",
+                "vernon.instance_divisor",
+                "vernon.set",
+                "vernon.binding",
+                "sampled_texture_bindings",
+            ):
                 if key in row:
                     use[key] = row[key]
+            if stage == "compute" and record.get("target") in {"opengl", "opengles"} and "vernon.binding" not in use:
+                # SPIRV-Cross materializes scalar compute arguments as storage
+                # buffers in source argument order.
+                use["vernon.set"] = 0
+                use["vernon.binding"] = int(row.get("index", 0))
             backend_name = _backend_name(name)
             if interface_name == "uniform":
-                if (record.get("target") in {"opengl", "opengles", "metal"}
-                        and "vernon.binding" not in row):
+                if record.get("target") in {"opengl", "opengles", "metal"} and "vernon.binding" not in row:
                     use["uniform_name"] = backend_name
                 else:
                     use["uniform_name"] = f"{backend_name}._m0"
@@ -430,31 +393,27 @@ def classify_parameter_use(use: Mapping[str, Any]) -> str:
     return "tensor"
 
 
-def merge_parameter_uses(name: str,
-                         uses: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def merge_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     if not uses:
-        raise PipelineCompileError(
-            f"pipeline parameter {name!r} has no uses")
+        raise PipelineCompileError(f"pipeline parameter {name!r} has no uses")
     normalized = [dict(use) for use in uses]
     first = normalized[0]
     kind = classify_parameter_use(first)
     for use in normalized[1:]:
-        incompatible_layout = (
-            kind != "tensor"
-            and (use.get("type") != first.get("type")
-                 or use.get("shape", []) != first.get("shape", [])))
-        if (classify_parameter_use(use) != kind
-                or use.get("dtype") != first.get("dtype")
-                or incompatible_layout):
-            raise PipelineCompileError(
-                f"incompatible pipeline parameter {name!r}")
-    representative = (next(
-        (use for use in normalized if use.get("stage") != "compute"), first)
-                      if kind == "tensor" else first)
+        incompatible_layout = kind != "tensor" and (
+            use.get("type") != first.get("type") or use.get("shape", []) != first.get("shape", [])
+        )
+        if classify_parameter_use(use) != kind or use.get("dtype") != first.get("dtype") or incompatible_layout:
+            raise PipelineCompileError(f"incompatible pipeline parameter {name!r}")
+    representative = (
+        next((use for use in normalized if use.get("stage") != "compute"), first) if kind == "tensor" else first
+    )
     access_values = {str(use.get("access", "read")) for use in normalized}
-    access = ("read_write" if "read_write" in access_values
-              or access_values == {"read", "write"} else
-              next(iter(access_values)))
+    access = (
+        "read_write"
+        if "read_write" in access_values or access_values == {"read", "write"}
+        else next(iter(access_values))
+    )
     parameter = {
         "name": name,
         "kind": kind,
@@ -465,52 +424,52 @@ def merge_parameter_uses(name: str,
         "dimension": first.get("dimension"),
         "uses": normalized,
     }
-    return {key: value for key, value in parameter.items()
-            if value is not None}
+    return {key: value for key, value in parameter.items() if value is not None}
 
 
-def merge_internal_parameter_uses(
-        name: str, uses: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def merge_internal_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     parameter = merge_parameter_uses(name, uses)
     sources = {use.get("internal_source") for use in uses}
     if len(sources) != 1 or None in sources:
-        raise PipelineCompileError(
-            f"inconsistent internal pipeline parameter {name!r}")
+        raise PipelineCompileError(f"inconsistent internal pipeline parameter {name!r}")
     source = next(iter(sources))
     parameter["source"] = source
     if source == "system_value":
         values = {use.get("system_value") for use in uses}
         if values != {"resolution"}:
-            raise PipelineCompileError(
-                f"inconsistent resolution system value {name!r}")
+            raise PipelineCompileError(f"inconsistent resolution system value {name!r}")
         parameter["system_value"] = "resolution"
         if parameter.get("dtype") != "f32" or parameter.get("shape") != [2]:
-            raise PipelineCompileError(
-                "resolution system value must have reflected type tensor<2xf32>"
-            )
-    elif parameter.get("kind") != "sampler":
-        raise PipelineCompileError(
-            "implicit sampler metadata must annotate a sampler argument")
+            raise PipelineCompileError("resolution system value must have reflected type tensor<2xf32>")
+        if any(use.get("sampled_texture_bindings") for use in uses):
+            raise PipelineCompileError("resolution system value cannot pair sampled textures")
+    else:
+        if parameter.get("kind") != "sampler":
+            raise PipelineCompileError("implicit sampler metadata must annotate a sampler argument")
+        for use in uses:
+            bindings = use.get("sampled_texture_bindings")
+            if (
+                not isinstance(bindings, list)
+                or len(bindings) != 1
+                or not isinstance(bindings[0], Mapping)
+                or not isinstance(bindings[0].get("set"), int)
+                or not isinstance(bindings[0].get("binding"), int)
+            ):
+                raise PipelineCompileError("implicit sampler must have exactly one sampled texture binding")
     return parameter
 
 
 def assign_parameter_slots(
     records_by_variant: Sequence[Mapping[str, Mapping[str, Any]]],
 ) -> dict[str, int]:
-    names = sorted({
-        name
-        for records in records_by_variant
-        for name in external_parameters(records)
-    })
+    names = sorted({name for records in records_by_variant for name in external_parameters(records)})
     return {name: slot for slot, name in enumerate(names)}
 
 
-def interface_by_location(values: Sequence[Mapping[str, Any]],
-                          interface: str) -> dict[int, str]:
+def interface_by_location(values: Sequence[Mapping[str, Any]], interface: str) -> dict[int, str]:
     result: dict[int, str] = {}
     for value in values:
-        if value.get(
-                "vernon.interface") != interface or "vernon.builtin" in value:
+        if value.get("vernon.interface") != interface or "vernon.builtin" in value:
             continue
         location = value.get("vernon.location")
         value_type = value.get("type")
@@ -519,18 +478,14 @@ def interface_by_location(values: Sequence[Mapping[str, Any]],
     return result
 
 
-def validate_graphics_interfaces(vertex: Mapping[str, Any],
-                                 fragment: Mapping[str, Any]) -> None:
+def validate_graphics_interfaces(vertex: Mapping[str, Any], fragment: Mapping[str, Any]) -> None:
     vertex_interface = vertex.get("interface", {})
     fragment_interface = fragment.get("interface", {})
-    outputs = interface_by_location(vertex_interface.get("results", []),
-                                    "output")
-    inputs = interface_by_location(fragment_interface.get("arguments", []),
-                                   "input")
+    outputs = interface_by_location(vertex_interface.get("results", []), "output")
+    inputs = interface_by_location(fragment_interface.get("arguments", []), "input")
     for location, value_type in inputs.items():
         if outputs.get(location) != value_type:
-            raise PipelineCompileError(
-                f"vertex/fragment interface mismatch at location {location}")
+            raise PipelineCompileError(f"vertex/fragment interface mismatch at location {location}")
 
 
 def fragment_outputs(
@@ -547,15 +502,17 @@ def fragment_outputs(
         location = row["vernon.location"]
         type_name = row.get("type")
         dtype, shape = dtype_and_shape(type_name)
-        outputs.append({
-            "name": row.get("vernon.source_name") or f"output_{location}",
-            "kind": "texture",
-            "dtype": dtype,
-            "shape": shape,
-            "access": "write",
-            "location": location,
-            "type": type_name,
-        })
+        outputs.append(
+            {
+                "name": row.get("vernon.source_name") or f"output_{location}",
+                "kind": "texture",
+                "dtype": dtype,
+                "shape": shape,
+                "access": "write",
+                "location": location,
+                "type": type_name,
+            }
+        )
     return outputs
 
 
@@ -564,30 +521,30 @@ def build_steps(stage_ids: Mapping[str, str]) -> list[dict[str, Any]]:
     if "compute" in stage_ids:
         steps.append({"kind": "dispatch", "stage": stage_ids["compute"]})
     if "compute" in stage_ids and "vertex" in stage_ids:
-        steps.append({
-            "kind": "barrier",
-            "source": "compute_write",
-            "destination": "vertex_read",
-        })
+        steps.append(
+            {
+                "kind": "barrier",
+                "source": "compute_write",
+                "destination": "vertex_read",
+            }
+        )
     if "vertex" in stage_ids:
         if "fragment" not in stage_ids:
-            raise PipelineCompileError(
-                "draw step requires vertex and fragment stages")
-        steps.append({
-            "kind": "draw",
-            "vertex": stage_ids["vertex"],
-            "fragment": stage_ids["fragment"],
-        })
+            raise PipelineCompileError("draw step requires vertex and fragment stages")
+        steps.append(
+            {
+                "kind": "draw",
+                "vertex": stage_ids["vertex"],
+                "fragment": stage_ids["fragment"],
+            }
+        )
     return steps
 
 
-def plan_variant(key: Sequence[str],
-                 records: Mapping[str, Mapping[str, Any]],
-                 slots: Mapping[str, int]) -> VariantPlan:
+def plan_variant(key: Sequence[str], records: Mapping[str, Mapping[str, Any]], slots: Mapping[str, int]) -> VariantPlan:
     if "vertex" in records or "fragment" in records:
         if not {"vertex", "fragment"}.issubset(records):
-            raise PipelineCompileError(
-                "graphics variants require vertex and fragment stages")
+            raise PipelineCompileError("graphics variants require vertex and fragment stages")
         validate_graphics_interfaces(records["vertex"], records["fragment"])
     external = external_parameters(records)
     internal = internal_parameters(records)
@@ -596,52 +553,47 @@ def plan_variant(key: Sequence[str],
         parameter = merge_parameter_uses(name, external[name])
         parameter["slot"] = slots[name]
         parameters.append(parameter)
-    internal_rows = [
-        merge_internal_parameter_uses(name, internal[name])
-        for name in sorted(internal)
-    ]
-    stage_ids = {
-        stage: str(record["id"])
-        for stage, record in records.items()
-    }
-    return VariantPlan(tuple(key), stage_ids, tuple(parameters),
-                       tuple(internal_rows),
-                       tuple(fragment_outputs(records)),
-                       tuple(build_steps(stage_ids)))
+    internal_rows = [merge_internal_parameter_uses(name, internal[name]) for name in sorted(internal)]
+    stage_ids = {stage: str(record["id"]) for stage, record in records.items()}
+    return VariantPlan(
+        tuple(key),
+        stage_ids,
+        tuple(parameters),
+        tuple(internal_rows),
+        tuple(fragment_outputs(records)),
+        tuple(build_steps(stage_ids)),
+    )
 
 
-def build_bundle_plan(pipeline_id: str, target: TargetOptions,
-                      features: Sequence[str],
-                      variants: Sequence[tuple[Sequence[str],
-                                               Mapping[str,
-                                                       CompiledStage]]]
-                      ) -> BundlePlan:
-    records_by_variant = [{
-        name: stage.logical_record()
-        for name, stage in stages.items()
-    } for _, stages in variants]
+def build_bundle_plan(
+    pipeline_id: str,
+    target: TargetOptions,
+    features: Sequence[str],
+    variants: Sequence[tuple[Sequence[str], Mapping[str, CompiledStage]]],
+) -> BundlePlan:
+    records_by_variant = [{name: stage.logical_record() for name, stage in stages.items()} for _, stages in variants]
     slots = assign_parameter_slots(records_by_variant)
     variant_plans = tuple(
-        plan_variant(key, records, slots)
-        for (key, _), records in zip(variants, records_by_variant, strict=True))
-    unique_stages = {
-        stage.id: stage
-        for _, stages in variants for stage in stages.values()
-    }
-    return BundlePlan(pipeline_id, target, tuple(sorted(set(features))),
-                      variant_plans,
-                      tuple(unique_stages[key]
-                            for key in sorted(unique_stages)))
+        plan_variant(key, records, slots) for (key, _), records in zip(variants, records_by_variant, strict=True)
+    )
+    unique_stages = {stage.id: stage for _, stages in variants for stage in stages.values()}
+    return BundlePlan(
+        pipeline_id,
+        target,
+        tuple(sorted(set(features))),
+        variant_plans,
+        tuple(unique_stages[key] for key in sorted(unique_stages)),
+    )
 
 
 def inline_artifact_descriptor(artifact: CompiledArtifact) -> dict[str, Any]:
     encoding = "base64" if artifact.format == "spirv" else "utf8"
     try:
-        data = (base64.b64encode(artifact.data).decode("ascii")
-                if encoding == "base64" else artifact.data.decode("utf-8"))
+        data = (
+            base64.b64encode(artifact.data).decode("ascii") if encoding == "base64" else artifact.data.decode("utf-8")
+        )
     except UnicodeDecodeError:
-        raise PipelineCompileError(
-            f"{artifact.format} runtime artifact is not UTF-8") from None
+        raise PipelineCompileError(f"{artifact.format} runtime artifact is not UTF-8") from None
     return {
         "format": artifact.format,
         "storage": "inline",
@@ -659,14 +611,10 @@ def materialize_bundle(
     document = plan.logical_dict()
     records = document["stage_artifacts"]
     if set(records) != set(artifact_descriptors):
-        raise PipelineCompileError(
-            "artifact descriptors do not match planned stages")
+        raise PipelineCompileError("artifact descriptors do not match planned stages")
     for stage_id, descriptor in artifact_descriptors.items():
-        if descriptor.get("sha256") != next(
-                stage.artifact.sha256 for stage in plan.stages
-                if stage.id == stage_id):
-            raise PipelineCompileError(
-                f"artifact descriptor digest does not match stage {stage_id}")
+        if descriptor.get("sha256") != next(stage.artifact.sha256 for stage in plan.stages if stage.id == stage_id):
+            raise PipelineCompileError(f"artifact descriptor digest does not match stage {stage_id}")
         records[stage_id]["artifact"] = dict(descriptor)
     return with_content_hash(document)
 

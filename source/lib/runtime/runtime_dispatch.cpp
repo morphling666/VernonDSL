@@ -1,0 +1,643 @@
+#include "runtime_dispatch.h"
+
+#include "backend_cpu.h"
+#include "backend_opengl.h"
+#include "graphics_opengl_encoder.h"
+
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+#include "backend_cuda.h"
+#endif
+
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+#include "backend_vulkan.h"
+#include "graphics_vulkan_encoder.h"
+#endif
+
+#if defined(VERNON_RUNTIME_TESTING)
+#include "runtime_test_hooks.h"
+#endif
+
+#include <nlohmann/json.hpp>
+
+#include <memory>
+
+namespace vernon::runtime {
+namespace {
+
+VernonStatus fail(VernonRuntimeContext &context, std::string error,
+                  VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) {
+    context.error = std::move(error);
+    return status;
+}
+
+} // namespace
+
+bool isOpenGLBackend(VernonRuntimeBackend backend) {
+    return backend == VERNON_RUNTIME_OPENGL || backend == VERNON_RUNTIME_OPENGL_ES;
+}
+
+bool probeBackend(VernonRuntimeBackend backend, std::string &diagnostic) {
+    switch (backend) {
+    case VERNON_RUNTIME_CPU:
+        return true;
+    case VERNON_RUNTIME_CUDA:
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+        return probeCuda(diagnostic);
+#else
+        diagnostic = "VernonRuntime was built without CUDA support";
+        return false;
+#endif
+    case VERNON_RUNTIME_VULKAN:
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+        return probeVulkan(diagnostic);
+#else
+        diagnostic = "VernonRuntime was built without Vulkan support";
+        return false;
+#endif
+    case VERNON_RUNTIME_OPENGL:
+    case VERNON_RUNTIME_OPENGL_ES:
+        diagnostic = "backend requires a host-owned external context";
+        return false;
+    default:
+        diagnostic = "VernonRuntime backend is not enabled";
+        return false;
+    }
+}
+
+bool initializeBackend(VernonRuntimeContext &context, uint32_t deviceIndex) {
+    switch (context.backend) {
+    case VERNON_RUNTIME_CPU:
+        return deviceIndex == 0;
+    case VERNON_RUNTIME_CUDA:
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+        return initializeCudaContext(context, deviceIndex);
+#else
+        return false;
+#endif
+    case VERNON_RUNTIME_VULKAN:
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+        return initializeVulkanContext(context, deviceIndex);
+#else
+        return false;
+#endif
+    default:
+        return false;
+    }
+}
+
+bool initializeOpenGLBackend(VernonRuntimeContext &context, const VernonExternalOpenGLContext &externalContext) {
+    return isOpenGLBackend(context.backend) && initializeOpenGLContext(context, externalContext);
+}
+
+void destroyBackend(VernonRuntimeContext &context) {
+    switch (context.backend) {
+    case VERNON_RUNTIME_CUDA:
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+        destroyCudaContext(context);
+#endif
+        break;
+    case VERNON_RUNTIME_VULKAN:
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+        destroyVulkanContext(context);
+#endif
+        break;
+    default:
+        break;
+    }
+    destroyRuntimeBackendState(context);
+}
+
+void fillBackendCapabilities(const VernonRuntimeContext &context, VernonRuntimeCapabilities &result) {
+    result.available = 1;
+    if (context.backend == VERNON_RUNTIME_CPU || context.backend == VERNON_RUNTIME_CUDA ||
+        context.backend == VERNON_RUNTIME_VULKAN) {
+        result.supports_compute = 1;
+        result.supports_storage_buffers = 1;
+        return;
+    }
+    result.supports_graphics = 1;
+    const VernonExternalOpenGLContext &external = openGLState(context).external;
+    result.api_version_major = external.api_version_major;
+    result.api_version_minor = external.api_version_minor;
+    result.supports_compute =
+        context.backend == VERNON_RUNTIME_OPENGL_ES
+            ? (result.api_version_major > 3 || (result.api_version_major == 3 && result.api_version_minor >= 1))
+            : (result.api_version_major > 4 || (result.api_version_major == 4 && result.api_version_minor >= 3));
+    result.supports_storage_buffers = result.supports_compute;
+    result.graphics_draw_abi_version = 2;
+}
+
+bool createBackendBuffer(VernonDeviceBuffer &buffer) {
+    switch (buffer.context->backend) {
+    case VERNON_RUNTIME_CPU:
+        return createCpuBuffer(buffer);
+    case VERNON_RUNTIME_CUDA:
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+        return createCudaBuffer(buffer);
+#else
+        return false;
+#endif
+    case VERNON_RUNTIME_OPENGL:
+    case VERNON_RUNTIME_OPENGL_ES:
+        return createOpenGLBuffer(buffer);
+    case VERNON_RUNTIME_VULKAN:
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+        return createVulkanBuffer(buffer);
+#else
+        return false;
+#endif
+    default:
+        return false;
+    }
+}
+
+void importBackendOpenGLBuffer(VernonDeviceBuffer &buffer, uint32_t name) { importOpenGLBuffer(buffer, name); }
+
+VernonStatus destroyBackendBuffer(VernonDeviceBuffer &buffer) {
+    switch (buffer.context->backend) {
+    case VERNON_RUNTIME_CUDA:
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+        return destroyCudaBuffer(buffer);
+#else
+        break;
+#endif
+    case VERNON_RUNTIME_OPENGL:
+    case VERNON_RUNTIME_OPENGL_ES:
+        destroyOpenGLBuffer(buffer);
+        break;
+    case VERNON_RUNTIME_VULKAN:
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+        destroyVulkanBuffer(buffer);
+#endif
+        break;
+    default:
+        break;
+    }
+    return VERNON_STATUS_OK;
+}
+
+VernonStatus copyToBackendBuffer(VernonDeviceBuffer &buffer, size_t offset, const void *source, size_t size) {
+    switch (buffer.context->backend) {
+    case VERNON_RUNTIME_CPU:
+        return copyToCpuBuffer(buffer, offset, source, size);
+    case VERNON_RUNTIME_CUDA:
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+        return copyToCudaBuffer(buffer, offset, source, size);
+#else
+        break;
+#endif
+    case VERNON_RUNTIME_OPENGL:
+    case VERNON_RUNTIME_OPENGL_ES:
+        return copyToOpenGLBuffer(buffer, offset, source, size);
+    case VERNON_RUNTIME_VULKAN:
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+        return copyToVulkanBuffer(buffer, offset, source, size);
+#else
+        break;
+#endif
+    default:
+        break;
+    }
+    return VERNON_STATUS_UNSUPPORTED_TARGET;
+}
+
+VernonStatus copyFromBackendBuffer(const VernonDeviceBuffer &buffer, size_t offset, void *destination, size_t size) {
+    switch (buffer.context->backend) {
+    case VERNON_RUNTIME_CPU:
+        return copyFromCpuBuffer(buffer, offset, destination, size);
+    case VERNON_RUNTIME_CUDA:
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+        return copyFromCudaBuffer(buffer, offset, destination, size);
+#else
+        break;
+#endif
+    case VERNON_RUNTIME_OPENGL:
+    case VERNON_RUNTIME_OPENGL_ES:
+        return copyFromOpenGLBuffer(buffer, offset, destination, size);
+    case VERNON_RUNTIME_VULKAN:
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+        return copyFromVulkanBuffer(buffer, offset, destination, size);
+#else
+        break;
+#endif
+    default:
+        break;
+    }
+    return VERNON_STATUS_UNSUPPORTED_TARGET;
+}
+
+bool createBackendTexture(VernonDeviceTexture &texture) {
+    if (isOpenGLBackend(texture.context->backend))
+        return createOpenGLTexture(texture);
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+    if (texture.context->backend == VERNON_RUNTIME_VULKAN)
+        return createVulkanTexture(texture);
+#endif
+    return false;
+}
+
+void importBackendOpenGLTexture(VernonDeviceTexture &texture, uint32_t name) { importOpenGLTexture(texture, name); }
+
+void destroyBackendTexture(VernonDeviceTexture &texture) {
+    if (isOpenGLBackend(texture.context->backend))
+        destroyOpenGLTexture(texture);
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+    else if (texture.context->backend == VERNON_RUNTIME_VULKAN)
+        destroyVulkanTexture(texture);
+#endif
+}
+
+VernonStatus copyToBackendTexture(VernonDeviceTexture &texture, const void *source, size_t size) {
+    if (isOpenGLBackend(texture.context->backend))
+        return copyToOpenGLTexture(texture, source, size);
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+    if (texture.context->backend == VERNON_RUNTIME_VULKAN)
+        return copyToVulkanTexture(texture, source, size);
+#endif
+    return VERNON_STATUS_UNSUPPORTED_TARGET;
+}
+
+VernonStatus copyFromBackendTexture(const VernonDeviceTexture &texture, void *destination, size_t size) {
+    if (isOpenGLBackend(texture.context->backend))
+        return copyFromOpenGLTexture(texture, destination, size);
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+    if (texture.context->backend == VERNON_RUNTIME_VULKAN)
+        return copyFromVulkanTexture(texture, destination, size);
+#endif
+    return VERNON_STATUS_UNSUPPORTED_TARGET;
+}
+
+bool createBackendSampler(VernonDeviceSampler &sampler) {
+    if (isOpenGLBackend(sampler.context->backend))
+        return createOpenGLSampler(sampler);
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+    if (sampler.context->backend == VERNON_RUNTIME_VULKAN)
+        return createVulkanSampler(sampler);
+#endif
+    return false;
+}
+
+void importBackendOpenGLSampler(VernonDeviceSampler &sampler, uint32_t name) { importOpenGLSampler(sampler, name); }
+
+void destroyBackendSampler(VernonDeviceSampler &sampler) {
+    if (isOpenGLBackend(sampler.context->backend))
+        destroyOpenGLSampler(sampler);
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+    else if (sampler.context->backend == VERNON_RUNTIME_VULKAN)
+        destroyVulkanSampler(sampler);
+#endif
+}
+
+VernonLoadedKernel *loadBackendCpuNativeArtifact(VernonRuntimeContext &context, const CpuNativeArtifact &artifact) {
+    auto kernel = std::make_unique<VernonLoadedKernel>();
+    kernel->context = &context;
+    installRuntimeBackendState(*kernel, new CpuKernelState());
+    if (!loadCpuNativeArtifact(artifact, runtimeBackendState<CpuKernelState>(*kernel), kernel->reflection,
+                               context.error)) {
+        destroyRuntimeBackendState(*kernel);
+        return nullptr;
+    }
+    ++context.liveKernels;
+    return kernel.release();
+}
+
+VernonLoadedKernel *loadBackendCpuEntry(VernonRuntimeContext &context, VernonCpuEntryPoint entryPoint,
+                                        const char *reflection, size_t reflectionSize, const char *entry,
+                                        size_t entrySize) {
+    auto kernel = std::make_unique<VernonLoadedKernel>();
+    kernel->context = &context;
+    installRuntimeBackendState(*kernel, new CpuKernelState());
+    if (!loadCpuEntry(entryPoint, reflection, reflectionSize, entry, entrySize,
+                      runtimeBackendState<CpuKernelState>(*kernel), kernel->reflection, context.error)) {
+        destroyRuntimeBackendState(*kernel);
+        return nullptr;
+    }
+    ++context.liveKernels;
+    return kernel.release();
+}
+
+VernonStatus registerBackendStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint entryPoint) {
+    return registerStaticCpuEntry(symbol, entryPoint);
+}
+
+VernonLoadedKernel *loadBackendArtifact(VernonRuntimeContext &context, const void *artifact, size_t artifactSize,
+                                        const char *reflection, size_t reflectionSize, const char *entry,
+                                        size_t entrySize) {
+    auto kernel = std::make_unique<VernonLoadedKernel>();
+    kernel->context = &context;
+    if (isOpenGLBackend(context.backend)) {
+        try {
+            const nlohmann::json parsed =
+                nlohmann::json::parse(reflection, reflection + reflectionSize, nullptr, false);
+            if (parsed.is_discarded() ||
+                !parseReflection(parsed, std::string(entry, entrySize), kernel->reflection, context.error))
+                return nullptr;
+            uint32_t binding = 0;
+            for (ReflectedArgument &argument : kernel->reflection.arguments) {
+                if (argument.kind == "builtin")
+                    continue;
+                if (argument.binding == UINT32_MAX)
+                    argument.binding = binding;
+                ++binding;
+            }
+            makeCurrent(&context);
+            const std::string source(static_cast<const char *>(artifact), artifactSize);
+            const GlUint shader = compileShader(&context, kComputeShader, source);
+            if (!shader)
+                return nullptr;
+            const GlUint program = linkProgram(&context, {shader});
+            if (!program)
+                return nullptr;
+            auto *state = new OpenGLKernelState();
+            state->program = program;
+            installRuntimeBackendState(*kernel, state);
+        } catch (const std::exception &error) {
+            context.error = std::string("failed to load OpenGL artifact: ") + error.what();
+            return nullptr;
+        }
+    } else if (context.backend == VERNON_RUNTIME_CUDA) {
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+        installRuntimeBackendState(*kernel, new CudaKernelState());
+        if (!loadCudaKernel(context, artifact, artifactSize, reflection, reflectionSize, entry, entrySize,
+                            runtimeBackendState<CudaKernelState>(*kernel), kernel->reflection)) {
+            destroyRuntimeBackendState(*kernel);
+            return nullptr;
+        }
+#else
+        return nullptr;
+#endif
+    } else if (context.backend == VERNON_RUNTIME_VULKAN) {
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+        installRuntimeBackendState(*kernel, new VulkanKernelState());
+        if (!loadVulkanKernel(context, artifact, artifactSize, reflection, reflectionSize, entry, entrySize,
+                              runtimeBackendState<VulkanKernelState>(*kernel), kernel->reflection)) {
+            destroyRuntimeBackendState(*kernel);
+            return nullptr;
+        }
+#else
+        return nullptr;
+#endif
+    } else {
+        return nullptr;
+    }
+    ++context.liveKernels;
+    return kernel.release();
+}
+
+VernonStatus unloadBackendKernel(VernonLoadedKernel &kernel) {
+    if (isOpenGLBackend(kernel.context->backend))
+        destroyOpenGLProgram(*kernel.context, runtimeBackendState<OpenGLKernelState>(kernel).program);
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+    else if (kernel.context->backend == VERNON_RUNTIME_CUDA) {
+        const VernonStatus status = destroyCudaKernel(*kernel.context, runtimeBackendState<CudaKernelState>(kernel));
+        if (status != VERNON_STATUS_OK)
+            return status;
+    }
+#endif
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+    else if (kernel.context->backend == VERNON_RUNTIME_VULKAN)
+        destroyVulkanKernel(*kernel.context, runtimeBackendState<VulkanKernelState>(kernel));
+#endif
+    destroyRuntimeBackendState(kernel);
+    return VERNON_STATUS_OK;
+}
+
+VernonStatus launchBackendKernel(VernonLoadedKernel &kernel, VernonLaunchSize globalSize,
+                                 const VernonLaunchArgument *arguments, size_t argumentCount) {
+    if (isOpenGLBackend(kernel.context->backend))
+        return launchOpenGLKernel(*kernel.context, runtimeBackendState<OpenGLKernelState>(kernel).program,
+                                  kernel.reflection, globalSize, arguments, argumentCount);
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+    if (kernel.context->backend == VERNON_RUNTIME_CUDA)
+        return launchCudaKernel(*kernel.context, runtimeBackendState<CudaKernelState>(kernel), kernel.reflection,
+                                globalSize, arguments, argumentCount);
+#endif
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+    if (kernel.context->backend == VERNON_RUNTIME_VULKAN)
+        return launchVulkanKernel(*kernel.context, runtimeBackendState<VulkanKernelState>(kernel), kernel.reflection,
+                                  globalSize, arguments, argumentCount);
+#endif
+    if (kernel.context->backend == VERNON_RUNTIME_CPU)
+        return launchCpuKernel(*kernel.context, runtimeBackendState<CpuKernelState>(kernel), kernel.reflection,
+                               globalSize, arguments, argumentCount, kernel.context->error);
+    return VERNON_STATUS_UNSUPPORTED_TARGET;
+}
+
+VernonLoadedKernel *backendPipelineComputeKernel(VernonLoadedPipeline &pipeline) {
+    switch (pipeline.context->backend) {
+    case VERNON_RUNTIME_CPU:
+        return runtimeBackendState<CpuPipelineState>(pipeline).kernel;
+    case VERNON_RUNTIME_CUDA:
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+        return runtimeBackendState<CudaPipelineState>(pipeline).kernel;
+#else
+        return nullptr;
+#endif
+    case VERNON_RUNTIME_VULKAN:
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+        return runtimeBackendState<VulkanPipelineState>(pipeline).computeKernel;
+#else
+        return nullptr;
+#endif
+    default:
+        return nullptr;
+    }
+}
+
+bool resolveBackendPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline) {
+    if (bundle.context->backend == VERNON_RUNTIME_CPU) {
+        auto *state = new CpuPipelineState();
+        state->kernel = loadBackendCpuNativeArtifact(*bundle.context, *bundle.stages.at(variant.compute).cpuArtifact);
+        if (!state->kernel) {
+            delete state;
+            return false;
+        }
+        installRuntimeBackendState(pipeline, state);
+        return true;
+    }
+    if (bundle.context->backend == VERNON_RUNTIME_CUDA) {
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+        const Stage &stage = bundle.stages.at(variant.compute);
+        auto *state = new CudaPipelineState();
+        state->kernel =
+            loadBackendArtifact(*bundle.context, stage.source.data(), stage.source.size(), stage.reflection.data(),
+                                stage.reflection.size(), stage.entry.data(), stage.entry.size());
+        if (!state->kernel) {
+            delete state;
+            return false;
+        }
+        installRuntimeBackendState(pipeline, state);
+        return true;
+#else
+        return false;
+#endif
+    }
+    if (bundle.context->backend == VERNON_RUNTIME_VULKAN) {
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+        auto *state = new VulkanPipelineState();
+        if (!variant.compute.empty()) {
+            const Stage &stage = bundle.stages.at(variant.compute);
+            state->computeKernel =
+                loadBackendArtifact(*bundle.context, stage.binary.data(), stage.binary.size(), stage.reflection.data(),
+                                    stage.reflection.size(), stage.entry.data(), stage.entry.size());
+            if (!state->computeKernel) {
+                delete state;
+                return false;
+            }
+        }
+        if (!variant.vertex.empty()) {
+            const Stage &vertex = bundle.stages.at(variant.vertex);
+            const Stage &fragment = bundle.stages.at(variant.fragment);
+            VulkanPushConstantRanges pushConstantRanges;
+            if (!planVulkanPushConstantRanges(variant, vulkanState(*bundle.context).maxPushConstantsSize,
+                                              pushConstantRanges, bundle.context->error)) {
+                if (state->computeKernel)
+                    vernonRuntimeKernelUnload(state->computeKernel);
+                delete state;
+                return false;
+            }
+            if (!createVulkanShaderModule(*bundle.context, vertex.binary.data(), vertex.binary.size(), state->vertex,
+                                          pushConstantRanges.vertex.size ? pushConstantRanges.vertex.offset : 0) ||
+                !createVulkanShaderModule(*bundle.context, fragment.binary.data(), fragment.binary.size(),
+                                          state->fragment,
+                                          pushConstantRanges.fragment.size ? pushConstantRanges.fragment.offset : 0)) {
+                if (state->computeKernel)
+                    vernonRuntimeKernelUnload(state->computeKernel);
+                destroyVulkanShaderModule(*bundle.context, state->vertex);
+                delete state;
+                return false;
+            }
+            state->vertexEntry = vertex.entry;
+            state->fragmentEntry = fragment.entry;
+        }
+        installRuntimeBackendState(pipeline, state);
+        return true;
+#else
+        return false;
+#endif
+    }
+    auto *state = new OpenGLPipelineState();
+    if (!createOpenGLPipeline(*bundle.context, variant, bundle.stages, state->computeProgram, state->graphicsProgram,
+                              state->vertexArray, state->framebuffer, state->workgroup)) {
+        delete state;
+        return false;
+    }
+    installRuntimeBackendState(pipeline, state);
+    return true;
+}
+
+void destroyBackendPipeline(VernonLoadedPipeline &pipeline) {
+    if (pipeline.context->backend == VERNON_RUNTIME_CPU || pipeline.context->backend == VERNON_RUNTIME_CUDA) {
+        if (VernonLoadedKernel *kernel = backendPipelineComputeKernel(pipeline))
+            vernonRuntimeKernelUnload(kernel);
+    } else if (pipeline.context->backend == VERNON_RUNTIME_VULKAN) {
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+        VulkanPipelineState &state = runtimeBackendState<VulkanPipelineState>(pipeline);
+        if (state.computeKernel)
+            vernonRuntimeKernelUnload(state.computeKernel);
+        else
+            synchronizeVulkan(*pipeline.context);
+        destroyVulkanGraphicsCache(pipeline.context, state.graphicsCache);
+        destroyVulkanShaderModule(*pipeline.context, state.vertex);
+        destroyVulkanShaderModule(*pipeline.context, state.fragment);
+#endif
+    } else {
+        OpenGLPipelineState &state = runtimeBackendState<OpenGLPipelineState>(pipeline);
+        destroyOpenGLPipeline(*pipeline.context, state.computeProgram, state.graphicsProgram, state.vertexArray,
+                              state.framebuffer);
+    }
+    destroyRuntimeBackendState(pipeline);
+}
+
+VernonStatus invokeBackendPipeline(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
+                                   const PlannedGraphicsInvocation &plan) {
+    if (pipeline.context->backend == VERNON_RUNTIME_CPU || pipeline.context->backend == VERNON_RUNTIME_CUDA)
+        return VERNON_STATUS_OK;
+    if (pipeline.context->backend == VERNON_RUNTIME_VULKAN) {
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+        VulkanPipelineState &state = runtimeBackendState<VulkanPipelineState>(pipeline);
+        if (!state.vertex)
+            return VERNON_STATUS_OK;
+        std::string error;
+        const VulkanGraphicsState graphicsState{pipeline.context,        state.vertex,         state.fragment,
+                                                &state.vertexEntry,      &state.fragmentEntry, &state.graphicsCache,
+                                                pipeline.variant.barrier};
+        const VernonStatus status =
+            encodeAndSubmitVulkanGraphics(graphicsState, pipeline.variant, invocation, plan, error);
+        return status == VERNON_STATUS_OK ? status : fail(*pipeline.context, error, status);
+#else
+        return VERNON_STATUS_UNSUPPORTED_TARGET;
+#endif
+    }
+    OpenGLPipelineState &state = runtimeBackendState<OpenGLPipelineState>(pipeline);
+    if (state.computeProgram) {
+        std::string error;
+        const VernonStatus status = encodeAndSubmitOpenGLCompute(
+            *pipeline.context, state.computeProgram, state.workgroup, pipeline.variant, invocation, plan, error);
+        if (status != VERNON_STATUS_OK)
+            return fail(*pipeline.context, error, status);
+    }
+    if (pipeline.variant.barrier) {
+        const VernonStatus status = openGLComputeToGraphicsBarrier(*pipeline.context);
+        if (status != VERNON_STATUS_OK)
+            return status;
+    }
+    if (!state.graphicsProgram)
+        return VERNON_STATUS_OK;
+    std::string error;
+    const OpenGLGraphicsState graphicsState{pipeline.context, state.graphicsProgram, state.vertexArray,
+                                            state.framebuffer};
+    const VernonStatus status = encodeAndSubmitOpenGLGraphics(graphicsState, pipeline.variant, invocation, plan, error);
+    return status == VERNON_STATUS_OK ? status : fail(*pipeline.context, error, status);
+}
+
+VernonStatus backendComputeToGraphicsBarrier(VernonRuntimeContext &context) {
+    return isOpenGLBackend(context.backend) ? openGLComputeToGraphicsBarrier(context)
+                                            : VERNON_STATUS_UNSUPPORTED_TARGET;
+}
+
+VernonStatus synchronizeBackend(VernonRuntimeContext &context) {
+    switch (context.backend) {
+    case VERNON_RUNTIME_CPU:
+        return VERNON_STATUS_OK;
+    case VERNON_RUNTIME_CUDA:
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+        return synchronizeCuda(context);
+#else
+        return VERNON_STATUS_UNSUPPORTED_TARGET;
+#endif
+    case VERNON_RUNTIME_VULKAN:
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+        return synchronizeVulkan(context);
+#else
+        return VERNON_STATUS_UNSUPPORTED_TARGET;
+#endif
+    case VERNON_RUNTIME_OPENGL:
+    case VERNON_RUNTIME_OPENGL_ES:
+        return synchronizeOpenGL(context);
+    default:
+        return VERNON_STATUS_UNSUPPORTED_TARGET;
+    }
+}
+
+#if defined(VERNON_RUNTIME_TESTING)
+VulkanGraphicsCacheStats getVulkanGraphicsCacheStats(const VernonRuntimeContext *context,
+                                                     const VernonLoadedPipeline *pipeline) {
+    VulkanGraphicsCacheStats result;
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+    if (!context || !pipeline || pipeline->context != context || context->backend != VERNON_RUNTIME_VULKAN)
+        return result;
+    result.defaultImplicitSamplerCreations = vulkanState(*context).defaultImplicitSamplerCreations;
+    const VulkanGraphicsCache &cache = runtimeBackendState<VulkanPipelineState>(*pipeline).graphicsCache;
+    result.descriptorSetLayoutCreations = cache.descriptorSetLayoutCreations;
+    result.pipelineLayoutCreations = cache.pipelineLayoutCreations;
+    result.graphicsPipelineCreations = cache.graphicsPipelineCreations;
+#else
+    (void)context;
+    (void)pipeline;
+#endif
+    return result;
+}
+#endif
+
+} // namespace vernon::runtime

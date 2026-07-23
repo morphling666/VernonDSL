@@ -65,8 +65,7 @@ module, then configure, build, and test VernonDSL from the repository root:
 ```powershell
 uv sync --extra build
 uv run cmake -S . -B build `
-  -DMLIR_DIR="$PWD/llvm-project/install/lib/cmake/mlir" `
-  -DVERNON_ENABLE_SPIRV_CROSS=ON
+  -DMLIR_DIR="$PWD/llvm-project/install/lib/cmake/mlir"
 cmake --build build --config Release --parallel 4
 ctest --test-dir build -C Release --output-on-failure
 ```
@@ -83,7 +82,6 @@ cmake --build llvm-project/build --target install --parallel 4
 uv sync --extra build
 uv run cmake -S . -B build \
   -DMLIR_DIR="$PWD/llvm-project/install/lib/cmake/mlir" \
-  -DVERNON_ENABLE_SPIRV_CROSS=ON \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel 4
 ctest --test-dir build --output-on-failure
@@ -92,12 +90,10 @@ ctest --test-dir build --output-on-failure
 Use plain `uv sync` only for the frontend/runtime Python package without
 building `_native`. Run Python commands through `uv run --frozen`.
 
-Configure a runtime-only build without LLVM/MLIR using the canonical options:
+Configure the Runtime subproject directly without LLVM/MLIR:
 
 ```powershell
-cmake -S . -B runtime_build `
-  -DVERNON_ENABLE_COMPILER=OFF `
-  -DVERNON_ENABLE_RUNTIME=ON
+cmake -S source/lib/runtime -B runtime_build
 cmake --build runtime_build --config Release --target VernonRuntime --parallel 4
 ```
 
@@ -161,18 +157,19 @@ in-process compiler result and loads its JIT entry directly into the runtime;
 `@kernel` does not invoke a compiler subprocess or create a temporary compute
 bundle.
 
-`VERNON_ENABLE_RUNTIME` builds the standalone `VernonRuntime` C API with CPU
-AOT execution. `VERNON_ENABLE_CUDA_RUNTIME` dynamically loads the
+The `source/lib/runtime/` subproject builds the standalone `VernonRuntime` C
+API with CPU AOT execution. `VERNON_ENABLE_CUDA_RUNTIME` dynamically loads the
 CUDA Driver API from `nvcuda.dll`/`libcuda.so.1`; no CUDA Toolkit or `nvcc`
 installation is required. `VERNON_ENABLE_VULKAN_RUNTIME` dynamically loads the
 system Vulkan loader and supports compute plus offscreen graphics pipeline
-bundles. OpenGL and OpenGL ES use host-owned external contexts and native GLSL
-for the matching profile; the runtime never creates a GLFW context.
-`vd.register_external_opengl_context(...)` must be called before selecting
-either external backend. Compiler capabilities remain independent of
-runtime/device availability. `VERNON_ENABLE_PYTHON_BINDINGS` builds the single
-nanobind `_native` compiler/runtime module when Python 3.11 and nanobind are
-available.
+bundles. OpenGL and OpenGL ES use the AHI external-context API and native GLSL
+for the matching profile. Python wheels include a separate `_gl_context`
+extension that owns a hidden GLFW context, so `vd.init(arch=vd.opengl)` runs
+directly. Vernon Engine can continue to call
+`vd.register_external_opengl_context(...)` to use its existing context.
+Compiler capabilities remain independent of runtime/device availability.
+`VERNON_ENABLE_PYTHON_BINDINGS` builds the `_native` compiler/runtime module;
+full Python builds also include `_gl_context` by default.
 
 External-context registration accepts the backend (`vd.opengl` or
 `vd.opengles`), opaque host user-data address, `make_current` callback address,
@@ -181,7 +178,9 @@ must keep the context and callbacks alive for the runtime lifetime.
 
 `VernonRuntime` links only its JSON parser and operating-system libraries.
 Vulkan headers are compile-time-only; LLVM/MLIR, GLFW, the CUDA Toolkit, and
-the Vulkan loader import library are outside its dependency closure.
+the Vulkan loader import library are outside its dependency closure. GLFW is
+linked only by the optional Python context-owner extension and is never
+discovered by runtime-only/AHI builds.
 
 Run the fractal directly on either GPU backend, or emit Metal source for use on
 macOS:

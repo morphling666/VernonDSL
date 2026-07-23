@@ -6,8 +6,8 @@ tests, Python environment, and runtime-only build commands are maintained in
 
 Use out-of-source builds from the repository root. A full compiler build needs
 both the installed MLIR CMake package and the matching `llvm-project` source
-checkout for TableGen includes. A runtime-only build sets
-`VERNON_ENABLE_COMPILER=OFF` and does not require LLVM/MLIR.
+checkout for TableGen includes. A runtime-only build uses
+`cmake -S source/lib/runtime` and does not require LLVM/MLIR.
 
 This file intentionally does not duplicate setup commands; update the README
 when the supported build procedure changes.
