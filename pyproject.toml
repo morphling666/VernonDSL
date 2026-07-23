@@ -44,3 +44,14 @@ fix = true
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"examples/blinn_phong.py" = ["F403", "F405"]
+"examples/blinn_phong_vertices.py" = ["F403", "F405"]
+"examples/planet_terrain.py" = ["F403", "F405"]
+"examples/runtime_shader.py" = ["F403", "F405"]
+"examples/shader_lib/shadow.py" = ["F403", "F405"]
+"examples/shadowed_material.py" = ["F403", "F405"]
+"python/tests/cube_map_shader.py" = ["F821"]
+"python/tests/pipeline_asset_fixture.py" = ["F722"]
+"python/tests/smoke_shader.py" = ["F403", "F405", "F841"]

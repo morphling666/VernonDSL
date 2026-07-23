@@ -10,8 +10,7 @@ def static_vertex(
     model_view_projection: Annotated[mat4[f32], uniform()],
 ) -> BlinnPhongVertexData:
     clip_position = matmul(model_view_projection, vec4(position, 1.0))
-    return BlinnPhongVertexData(clip_position, normal, position,
-                                vec4(1.0, 1.0, 1.0, 1.0))
+    return BlinnPhongVertexData(clip_position, normal, position, vec4(1.0, 1.0, 1.0, 1.0))
 
 
 @vertex
@@ -25,8 +24,7 @@ def instanced_vertex(
 ) -> BlinnPhongVertexData:
     world_position = position * instance_scale + instance_offset
     clip_position = matmul(view_projection, vec4(world_position, 1.0))
-    return BlinnPhongVertexData(clip_position, normal, world_position,
-                                custom_tint)
+    return BlinnPhongVertexData(clip_position, normal, world_position, custom_tint)
 
 
 @vertex
@@ -45,5 +43,4 @@ def skinned_vertex(
     weight1 = vec4(weights.y, weights.y, weights.y, weights.y)
     skinned_position = transformed0 * weight0 + transformed1 * weight1
     clip_position = matmul(view_projection, skinned_position)
-    return BlinnPhongVertexData(clip_position, normal, skinned_position.xyz,
-                                vec4(1.0, 1.0, 1.0, 1.0))
+    return BlinnPhongVertexData(clip_position, normal, skinned_position.xyz, vec4(1.0, 1.0, 1.0, 1.0))

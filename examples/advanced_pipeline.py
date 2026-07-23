@@ -6,7 +6,6 @@ from typing import Annotated
 
 import cv2
 import numpy as np
-
 import vernon_dsl as vd
 
 PICKING = vd.feature("PICKING")
@@ -27,8 +26,7 @@ class GBuffer:
 @vd.vertex
 def vertex_main(
     position: Annotated[vd.vec2[vd.f32], vd.location(0)],
-    offset: Annotated[vd.vec2[vd.f32],
-                      vd.instance(location=1)],
+    offset: Annotated[vd.vec2[vd.f32], vd.instance(location=1)],
 ) -> VertexData:
     clip_position = vd.vec4(position + offset, 0.0, 1.0)
     local_color = position + vd.vec2(0.5, 0.5)
@@ -37,9 +35,7 @@ def vertex_main(
 
 @vd.fragment
 def fragment_main(
-    local_color: Annotated[vd.vec2[vd.f32],
-                           vd.varying(),
-                           vd.location(0)],
+    local_color: Annotated[vd.vec2[vd.f32], vd.varying(), vd.location(0)],
 ) -> GBuffer:
     color = vd.vec4(local_color, 1.0, 1.0)
     object_id = vd.vec4(0.0, 0.0, 0.0, 1.0)
@@ -49,19 +45,16 @@ def fragment_main(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Run indexed, instanced, variant MRT rendering.")
-    parser.add_argument("--arch",
-                        choices=("opengl", "opengles", "vulkan"),
-                        default="vulkan",
-                        help=("graphics backend; OpenGL profiles require host "
-                              "context registration"))
+    parser = argparse.ArgumentParser(description="Run indexed, instanced, variant MRT rendering.")
+    parser.add_argument(
+        "--arch",
+        choices=("opengl", "opengles", "vulkan"),
+        default="vulkan",
+        help=("graphics backend; OpenGL profiles require host context registration"),
+    )
     parser.add_argument("--size", type=int, default=512)
     parser.add_argument("--instances", type=int, default=7)
-    parser.add_argument("--frames",
-                        type=int,
-                        default=0,
-                        help="zero runs until Escape or Q")
+    parser.add_argument("--frames", type=int, default=0, help="zero runs until Escape or Q")
     parser.add_argument("--fps", type=int, default=60)
     parser.add_argument("--no-picking", action="store_true")
     parser.add_argument("--headless", action="store_true")
@@ -72,8 +65,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if (args.size <= 0 or args.instances <= 0 or args.frames < 0
-            or args.fps <= 0):
+    if args.size <= 0 or args.instances <= 0 or args.frames < 0 or args.fps <= 0:
         raise ValueError("size, instances, and fps must be positive")
     architecture = {
         "opengl": vd.opengl,
@@ -94,9 +86,9 @@ def main() -> None:
         np.array(
             ((-0.09, -0.09), (0.09, -0.09), (0.09, 0.09), (-0.09, 0.09)),
             dtype=np.float32,
-        ))
-    indices = vd.Tensor.from_numpy(
-        np.array((0, 1, 2, 0, 2, 3), dtype=np.uint32))
+        )
+    )
+    indices = vd.Tensor.from_numpy(np.array((0, 1, 2, 0, 2, 3), dtype=np.uint32))
     offsets = vd.Tensor.zeros(dtype=vd.f32, shape=(args.instances, 2))
     color = vd.Texture.zeros(shape=(args.size, args.size))
     object_id = vd.Texture.zeros(shape=(args.size, args.size))
@@ -110,11 +102,9 @@ def main() -> None:
         while args.frames == 0 or frame < args.frames:
             phase = frame / args.fps
             instance_values = np.column_stack(
-                (base_x,
-                 np.sin(base_x * np.float32(5.0) + np.float32(phase * 2.0)) *
-                 np.float32(0.35))).astype(np.float32)
-            offsets.copy_from_numpy(
-                np.ascontiguousarray(instance_values, dtype=np.float32))
+                (base_x, np.sin(base_x * np.float32(5.0) + np.float32(phase * 2.0)) * np.float32(0.35))
+            ).astype(np.float32)
+            offsets.copy_from_numpy(np.ascontiguousarray(instance_values, dtype=np.float32))
             render(
                 position=positions,
                 offset=offsets,
@@ -149,9 +139,11 @@ def main() -> None:
     if args.id_output is not None and id_image is not None:
         if not cv2.imwrite(str(args.id_output), id_image):
             raise RuntimeError(f"cannot write {args.id_output}")
-    print(f"backend={args.arch} frames={frame} instances={args.instances} "
-          f"variant={'base' if args.no_picking else 'PICKING'} "
-          f"compiled={render.compile_count}")
+    print(
+        f"backend={args.arch} frames={frame} instances={args.instances} "
+        f"variant={'base' if args.no_picking else 'PICKING'} "
+        f"compiled={render.compile_count}"
+    )
 
 
 if __name__ == "__main__":

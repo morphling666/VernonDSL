@@ -9,8 +9,7 @@ SKIN = vd.feature("SKIN")
 @vd.vertex
 def mesh_vertex(
     position: vd.vec3[vd.f32],
-    instance_transform: vd.When[INSTANCE, Annotated[vd.mat4[vd.f32],
-                                                    vd.instance()]],
+    instance_transform: vd.When[INSTANCE, Annotated[vd.mat4[vd.f32], vd.instance()]],
     joints: vd.When[SKIN, vd.vec4[vd.u32]],
     weights: vd.When[SKIN, vd.vec4[vd.f32]],
 ) -> Annotated[vd.vec4[vd.f32], vd.builtin("position")]:
@@ -33,11 +32,9 @@ mesh_asset = vd.pipeline_asset(
     id="shaders/variant_mesh",
     vertex=mesh_vertex,
     fragment=mesh_fragment,
-    variants=((), (INSTANCE, ), (SKIN, ), (INSTANCE, SKIN)),
+    variants=((), (INSTANCE,), (SKIN,), (INSTANCE, SKIN)),
     targets={
-        "opengl": {
-            "glsl_version": 330
-        },
+        "opengl": {"glsl_version": 330},
         "vulkan": {},
     },
 )

@@ -29,10 +29,9 @@ def sampled_fragment(
 
 @vd.kernel(workgroup_size=(1, 1, 1))
 def scale(
-    values: vd.Tensor[vd.f32, (4, )],
+    values: vd.Tensor[vd.f32, (4,)],
     factor: vd.f32,
-    gid: Annotated[vd.Tensor[vd.u32, (3, )],
-                   vd.builtin("global_invocation_id")],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     index = gid[0]
     values[index] = values[index] * factor
@@ -42,24 +41,22 @@ triangle_asset = vd.pipeline_asset(
     id="pipelines/triangle",
     vertex=triangle_vertex,
     fragment=solid_fragment,
-    variants=((), (OFFSET, )),
-    targets={"opengl": {
-        "glsl_version": 330
-    }, "vulkan": {}},
+    variants=((), (OFFSET,)),
+    targets={"opengl": {"glsl_version": 330}, "vulkan": {}},
 )
 
 sampled_asset = vd.pipeline_asset(
     id="pipelines/sampled_triangle",
     vertex=triangle_vertex,
     fragment=sampled_fragment,
-    variants=((), ),
+    variants=((),),
     targets={"vulkan": {}},
 )
 
 scale_asset = vd.pipeline_asset(
     id="pipelines/scale",
     compute=scale,
-    variants=((), ),
+    variants=((),),
     targets={
         "cpu": {},
         "cuda": {},

@@ -19,19 +19,15 @@ def _host_dtype(values: tuple[Any, ...]) -> np.dtype[Any]:
     return np.result_type(*dtypes) if dtypes else np.dtype(np.float32)
 
 
-def _host_tensor(name: str, values: tuple[Any, ...],
-                 shape: tuple[int, ...]) -> np.ndarray[Any, Any]:
+def _host_tensor(name: str, values: tuple[Any, ...], shape: tuple[int, ...]) -> np.ndarray[Any, Any]:
     if not values:
         raise TypeError(f"{name} requires component arguments")
     dtype = _host_dtype(values)
-    components = [
-        np.asarray(value, dtype=dtype).reshape(-1) for value in values
-    ]
+    components = [np.asarray(value, dtype=dtype).reshape(-1) for value in values]
     result = np.concatenate(components)
     expected = int(np.prod(shape))
     if result.size != expected:
-        raise TypeError(
-            f"{name} requires exactly {expected} scalar components")
+        raise TypeError(f"{name} requires exactly {expected} scalar components")
     result = result.reshape(shape)
     result.setflags(write=False)
     return result
@@ -44,13 +40,12 @@ class TypeExpr:
 
 
 class _TypeConstructor:
-
     def __init__(self, name: str):
         self.name = name
 
     def __class_getitem__(cls, arguments: Any) -> TypeExpr:
         if not isinstance(arguments, tuple):
-            arguments = (arguments, )
+            arguments = (arguments,)
         return TypeExpr(cls.__name__, arguments)
 
 
@@ -83,37 +78,31 @@ class mat(_TypeConstructor):
 
 
 class vec2(_TypeConstructor):
-
     def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
-        return _host_tensor("vec2", values, (2, ))
+        return _host_tensor("vec2", values, (2,))
 
 
 class vec3(_TypeConstructor):
-
     def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
-        return _host_tensor("vec3", values, (3, ))
+        return _host_tensor("vec3", values, (3,))
 
 
 class vec4(_TypeConstructor):
-
     def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
-        return _host_tensor("vec4", values, (4, ))
+        return _host_tensor("vec4", values, (4,))
 
 
 class mat2(_TypeConstructor):
-
     def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
         return _host_tensor("mat2", values, (2, 2))
 
 
 class mat3(_TypeConstructor):
-
     def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
         return _host_tensor("mat3", values, (3, 3))
 
 
 class mat4(_TypeConstructor):
-
     def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
         return _host_tensor("mat4", values, (4, 4))
 
@@ -188,5 +177,4 @@ def resource(set: int, binding: int) -> Annotation:
 
 
 def instance(location: int | None = None, divisor: int = 1) -> Annotation:
-    return _annotation("instance",
-                       *((location, divisor) if location is not None else ()))
+    return _annotation("instance", *((location, divisor) if location is not None else ()))

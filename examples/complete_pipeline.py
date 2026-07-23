@@ -6,7 +6,6 @@ from typing import Annotated
 
 import cv2  # type: ignore[import-not-found]
 import numpy as np
-
 import vernon_dsl as vd
 
 ANIMATE = vd.feature("ANIMATE")
@@ -54,24 +53,21 @@ def animate_instances(
     offset: vd.Tensor[vd.f32, (None, 2)],
     base_offset: vd.Tensor[vd.f32, (None, 2)],
     phase: vd.f32,
-    gid: Annotated[vd.Tensor[vd.u32, (3, )],
-                   vd.builtin("global_invocation_id")],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     component = gid[0]
     instance_index = gid[1]
     value = base_offset[instance_index, component]
     if ANIMATE:
         if component == 1:
-            value = value + vd.sin(phase + vd.f32(instance_index) *
-                                   vd.f32(0.7)) * vd.f32(0.18)
+            value = value + vd.sin(phase + vd.f32(instance_index) * vd.f32(0.7)) * vd.f32(0.18)
     offset[instance_index, component] = value
 
 
 @vd.vertex
 def vertex_main(
     position: Annotated[vd.vec2[vd.f32], vd.location(0)],
-    offset: Annotated[vd.vec2[vd.f32],
-                      vd.instance(location=1)],
+    offset: Annotated[vd.vec2[vd.f32], vd.instance(location=1)],
 ) -> VertexData:
     return VertexData(
         vd.vec4(position + offset, 0.0, 1.0),
@@ -81,9 +77,7 @@ def vertex_main(
 
 @vd.fragment
 def fragment_main(
-    local_color: Annotated[vd.vec2[vd.f32],
-                           vd.varying(),
-                           vd.location(0)],
+    local_color: Annotated[vd.vec2[vd.f32], vd.varying(), vd.location(0)],
     tint: Annotated[vd.vec4[vd.f32], vd.uniform()],
 ) -> GBuffer:
     source = vd.vec4(local_color, 1.0, 1.0)
@@ -106,13 +100,16 @@ def method_lowering_preview(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=("Run a three-stage variant pipeline with instancing, "
-                     "indexed MRT drawing, and dynamic input rebinding."))
-    parser.add_argument("--arch",
-                        choices=("opengl", "opengles", "vulkan"),
-                        default="vulkan",
-                        help=("graphics backend; OpenGL profiles require host "
-                              "context registration"))
+        description=(
+            "Run a three-stage variant pipeline with instancing, indexed MRT drawing, and dynamic input rebinding."
+        )
+    )
+    parser.add_argument(
+        "--arch",
+        choices=("opengl", "opengles", "vulkan"),
+        default="vulkan",
+        help=("graphics backend; OpenGL profiles require host context registration"),
+    )
     parser.add_argument("--size", type=int, default=384)
     parser.add_argument("--instances", type=int, default=7)
     parser.add_argument(
@@ -138,8 +135,7 @@ def _write_image(path: Path | None, image: np.ndarray | None) -> None:
 
 def main() -> None:
     args = parse_args()
-    if (args.size <= 0 or args.instances <= 0 or args.frames < 0
-            or args.fps <= 0):
+    if args.size <= 0 or args.instances <= 0 or args.frames < 0 or args.fps <= 0:
         raise ValueError("size, instances, and fps must be positive")
 
     architecture = {
@@ -178,7 +174,8 @@ def main() -> None:
         np.array(
             ((-0.09, -0.09), (0.09, -0.09), (0.09, 0.09), (-0.09, 0.09)),
             dtype=np.float32,
-        ))
+        )
+    )
     interleaved_positions = vd.Tensor.from_numpy(
         np.array(
             (
@@ -188,7 +185,8 @@ def main() -> None:
                 (99.0, -0.09, 0.09, 1.0),
             ),
             dtype=np.float32,
-        ))
+        )
+    )
     position_bindings = (
         ("packed Tensor", packed_positions),
         ("interleaved TensorView.yz", interleaved_positions.swizzle("yz")),
@@ -200,12 +198,8 @@ def main() -> None:
     )
     base_x = np.linspace(-0.75, 0.75, args.instances, dtype=np.float32)
     base_offsets = (
-        vd.Tensor.from_numpy(
-            np.column_stack(
-                (base_x, np.zeros_like(base_x))).astype(np.float32)),
-        vd.Tensor.from_numpy(
-            np.column_stack((base_x, np.full_like(base_x,
-                                                  0.08))).astype(np.float32)),
+        vd.Tensor.from_numpy(np.column_stack((base_x, np.zeros_like(base_x))).astype(np.float32)),
+        vd.Tensor.from_numpy(np.column_stack((base_x, np.full_like(base_x, 0.08))).astype(np.float32)),
     )
     offsets = vd.Tensor.zeros(dtype=vd.f32, shape=(args.instances, 2))
 
@@ -227,8 +221,7 @@ def main() -> None:
     try:
         while args.frames == 0 or frame < args.frames:
             variant_name, render = variants[frame % len(variants)]
-            binding_name, positions = position_bindings[frame %
-                                                        len(position_bindings)]
+            binding_name, positions = position_bindings[frame % len(position_bindings)]
             binding_index = frame % 2
             render(
                 position=positions,
@@ -257,7 +250,8 @@ def main() -> None:
             print(
                 f"frame={frame} variant={variant_name} "
                 f"position={binding_name} index_buffer={binding_index} "
-                f"tint_buffer={binding_index} compiled={render.compile_count}")
+                f"tint_buffer={binding_index} compiled={render.compile_count}"
+            )
             frame += 1
             if not args.headless:
                 cv2.imshow("VernonDSL complete color", color_image)

@@ -8,12 +8,11 @@ from typing import Annotated
 from unittest import mock
 
 import numpy as np
-
 import vernon_dsl as vd
 
 
 def _load_fractal() -> ModuleType:
-    path = Path(__file__).resolve().parents[2] / "fractal.py"
+    path = Path(__file__).resolve().parents[2] / "examples" / "fractal.py"
     spec = importlib.util.spec_from_file_location("vernon_test_fractal", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load test module: {path}")
@@ -31,41 +30,40 @@ def tensor_operators(
     left: vd.Tensor[vd.f32, (None, None, None)],
     right: vd.Tensor[vd.f32, (None, None, None)],
     scale: vd.f32,
-    gid: Annotated[vd.Tensor[vd.u32, (3, )],
-                   vd.builtin("global_invocation_id")],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     x = gid[0]
     y = gid[1]
     z = gid[2]
-    output[z, y, x] = (
-        (left[z, y, x] + right[z, y, x]) * scale - right[z, y, x]) / scale
+    output[z, y, x] = ((left[z, y, x] + right[z, y, x]) * scale - right[z, y, x]) / scale
 
 
 @vd.kernel(workgroup_size=(8, 1, 1))
 def vector_while(
-    output: vd.Tensor[vd.f32, (None, )],
+    output: vd.Tensor[vd.f32, (None,)],
     phase: vd.f32,
-    gid: Annotated[vd.Tensor[vd.u32, (3, )],
-                   vd.builtin("global_invocation_id")],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     x = gid[0]
     c = vd.vec2(-0.8, vd.cos(phase) * 0.2)
     z = vd.vec2(vd.f32(x) * 0.01, 0.1)
     iterations = 0
     while vd.norm(z) < 20.0 and iterations < 8:
-        z = vd.vec2(
-            z[0] * z[0] - z[1] * z[1],
-            z[1] * z[0] * 2.0,
-        ) + c
+        z = (
+            vd.vec2(
+                z[0] * z[0] - z[1] * z[1],
+                z[1] * z[0] * 2.0,
+            )
+            + c
+        )
         iterations += 1
     output[x] = vd.f32(iterations)
 
 
 @vd.kernel(workgroup_size=(2, 1, 1))
 def matrix_vector(
-    output: vd.Tensor[vd.f32, (None, )],
-    gid: Annotated[vd.Tensor[vd.u32, (3, )],
-                   vd.builtin("global_invocation_id")],
+    output: vd.Tensor[vd.f32, (None,)],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     x = gid[0]
     matrix = vd.mat2(1.0, 2.0, 3.0, 4.0)
@@ -74,14 +72,12 @@ def matrix_vector(
 
 
 class KernelTensorRuntimeTests(unittest.TestCase):
-
     @staticmethod
     def _run_tensor_operators(arch: object) -> np.ndarray:
         vd.init(arch=arch)  # type: ignore[arg-type]
         shape = (2, 3, 4)
         left_array = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
-        right_array = np.linspace(0.25, 2.5, np.prod(shape),
-                                  dtype=np.float32).reshape(shape)
+        right_array = np.linspace(0.25, 2.5, np.prod(shape), dtype=np.float32).reshape(shape)
         output = vd.Tensor.zeros(dtype=vd.f32, shape=shape)
         tensor_operators(
             output,
@@ -95,7 +91,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
     @staticmethod
     def _run_vector_while(arch: object) -> np.ndarray:
         vd.init(arch=arch)  # type: ignore[arg-type]
-        output = vd.Tensor.zeros(dtype=vd.f32, shape=(16, ))
+        output = vd.Tensor.zeros(dtype=vd.f32, shape=(16,))
         vector_while(output, 0.35, grid=(16, 1, 1))
         return output.to_numpy()
 
@@ -130,8 +126,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         actual = self._run_tensor_operators(vd.cpu)
         shape = (2, 3, 4)
         left = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
-        right = np.linspace(0.25, 2.5, np.prod(shape),
-                            dtype=np.float32).reshape(shape)
+        right = np.linspace(0.25, 2.5, np.prod(shape), dtype=np.float32).reshape(shape)
         expected = ((left + right) * 2.0 - right) / 2.0
         np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
 
@@ -146,10 +141,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         for backend in backends:
             with self.subTest(backend=backend.name):
                 backend_actual = self._run_tensor_operators(backend)
-                np.testing.assert_allclose(backend_actual,
-                                           expected,
-                                           rtol=0.0,
-                                           atol=1e-6)
+                np.testing.assert_allclose(backend_actual, expected, rtol=0.0, atol=1e-6)
 
     def test_loop_carried_vector_norm(self) -> None:
         expected = self._run_vector_while(vd.cpu)
@@ -161,10 +153,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         for backend in backends:
             with self.subTest(backend=backend.name):
                 actual = self._run_vector_while(backend)
-                np.testing.assert_allclose(actual,
-                                           expected,
-                                           rtol=0.0,
-                                           atol=1e-6)
+                np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
 
     def test_matrix_specialization(self) -> None:
         backends = []
@@ -175,16 +164,14 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         for backend in backends:
             with self.subTest(backend=backend.name):
                 vd.init(arch=backend)
-                output = vd.Tensor.zeros(dtype=vd.f32, shape=(2, ))
+                output = vd.Tensor.zeros(dtype=vd.f32, shape=(2,))
                 matrix_vector(output, grid=(2, 1, 1))
-                np.testing.assert_allclose(output.to_numpy(),
-                                           np.array((17.0, 39.0),
-                                                    dtype=np.float32),
-                                           rtol=0.0,
-                                           atol=1e-6)
+                np.testing.assert_allclose(
+                    output.to_numpy(), np.array((17.0, 39.0), dtype=np.float32), rtol=0.0, atol=1e-6
+                )
 
     def test_cross_compiled_source_generation(self) -> None:
-        output = vd.Tensor.zeros(dtype=vd.f32, shape=(16, ))
+        output = vd.Tensor.zeros(dtype=vd.f32, shape=(16,))
         cases = {
             "metal": "kernel void vector_while",
             "opengl": "#version 430",
@@ -192,8 +179,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         }
         for target, marker in cases.items():
             with self.subTest(target=target):
-                source, reflection = vector_while.compile_artifact(
-                    output, 0.35, target=target)
+                source, reflection = vector_while.compile_artifact(output, 0.35, target=target)
                 self.assertIn(marker, source.decode())
                 self.assertIn(f'"target":"{target}"', reflection)
 
@@ -202,8 +188,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
 def fill(
     output: vd.Tensor[vd.f32, (None, None)],
     scale: vd.f32,
-    gid: Annotated[vd.Tensor[vd.u32, (3, )],
-                   vd.builtin("global_invocation_id")],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     x = gid[0]
     y = gid[1]
@@ -212,14 +197,11 @@ def fill(
 
 
 class TensorTests(unittest.TestCase):
-
     def test_numpy_copy_contract(self) -> None:
         source = np.arange(6, dtype=np.float32).reshape(2, 3)
         tensor = vd.Tensor.from_numpy(source)
         source.fill(0)
-        np.testing.assert_array_equal(
-            tensor.to_numpy(),
-            np.arange(6, dtype=np.float32).reshape(2, 3))
+        np.testing.assert_array_equal(tensor.to_numpy(), np.arange(6, dtype=np.float32).reshape(2, 3))
         result = tensor.to_numpy()
         result.fill(0)
         self.assertNotEqual(float(tensor.to_numpy()[1, 2]), 0.0)
@@ -231,7 +213,6 @@ class TensorTests(unittest.TestCase):
 
 
 class KernelTests(unittest.TestCase):
-
     def setUp(self) -> None:
         vd.init(arch=vd.cpu)
         fill.compile_count = 0
@@ -250,8 +231,7 @@ class KernelTests(unittest.TestCase):
 
     def test_cpu_kernel_uses_in_process_owning_compiler(self) -> None:
         output = vd.Tensor.zeros(dtype=vd.f32, shape=(2, 3))
-        with mock.patch("subprocess.run",
-                        side_effect=AssertionError("subprocess prohibited")):
+        with mock.patch("subprocess.run", side_effect=AssertionError("subprocess prohibited")):
             fill(output, 1.0)
         np.testing.assert_array_equal(
             output.to_numpy(),
@@ -260,10 +240,8 @@ class KernelTests(unittest.TestCase):
 
     def test_compile_artifact_uses_in_process_owning_compiler(self) -> None:
         output = vd.Tensor.zeros(dtype=vd.f32, shape=(2, 3))
-        with mock.patch("subprocess.run",
-                        side_effect=AssertionError("subprocess prohibited")):
-            artifact, reflection = fill.compile_artifact(
-                output, 1.0, target="vulkan")
+        with mock.patch("subprocess.run", side_effect=AssertionError("subprocess prohibited")):
+            artifact, reflection = fill.compile_artifact(output, 1.0, target="vulkan")
         self.assertTrue(artifact)
         self.assertIn('"target":"vulkan"', reflection)
 
@@ -305,8 +283,7 @@ class KernelTests(unittest.TestCase):
     def test_fractal_matches_vectorized_numpy_reference(self) -> None:
         width, height = 4, 3
         time = 0.2
-        output = vd.Tensor.zeros(dtype=vd.f32,
-                                 shape=(fractal.HEIGHT, fractal.WIDTH))
+        output = vd.Tensor.zeros(dtype=vd.f32, shape=(fractal.HEIGHT, fractal.WIDTH))
         fractal.paint(output, time, grid=(width, height, 1))
 
         y, x = np.mgrid[:height, :width]
@@ -331,10 +308,7 @@ class KernelTests(unittest.TestCase):
             z = np.where(active[..., None], squared + c, z)
             iterations += active
         expected = 1.0 - iterations.astype(np.float32) * 0.02
-        np.testing.assert_allclose(output.to_numpy()[:height, :width],
-                                   expected,
-                                   rtol=1e-5,
-                                   atol=1e-6)
+        np.testing.assert_allclose(output.to_numpy()[:height, :width], expected, rtol=1e-5, atol=1e-6)
 
 
 if __name__ == "__main__":

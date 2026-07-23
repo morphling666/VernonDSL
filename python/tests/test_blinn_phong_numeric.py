@@ -24,12 +24,11 @@ def blinn_phong(
     view_direction = normalize(camera_position - world_position)
     half_direction = normalize(light_direction + view_direction)
     diffuse = max(float(np.dot(unit_normal, light_direction)), 0.0)
-    specular = max(float(np.dot(unit_normal, half_direction)), 0.0)**shininess
+    specular = max(float(np.dot(unit_normal, half_direction)), 0.0) ** shininess
     return ambient_color + albedo * diffuse + specular_color * specular
 
 
 class BlinnPhongNumericTests(unittest.TestCase):
-
     def test_frontal_light_matches_closed_form(self) -> None:
         color = blinn_phong(
             normal=np.array([0.0, 0.0, 1.0]),

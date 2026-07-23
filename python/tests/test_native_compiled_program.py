@@ -84,22 +84,17 @@ module {
 
 
 class CompiledProgramTests(unittest.TestCase):
-
     def test_named_artifacts_and_compatibility_reflection(self) -> None:
         compiler = native.Compiler()
-        program = compiler.compile_program_result(MULTI_ENTRY_MODULE,
-                                                   native.Target.OPENGL,
-                                                   glsl_version=330)
+        program = compiler.compile_program_result(MULTI_ENTRY_MODULE, native.Target.OPENGL, glsl_version=330)
         self.assertTrue(program.ok, program.diagnostics)
         self.assertEqual(program.target, native.Target.OPENGL)
         self.assertEqual(program.glsl_version, 330)
         self.assertEqual(len(program.artifacts), 2)
         self.assertEqual(len({name for name, _ in program.artifacts}), 2)
-        self.assertTrue(all(name.endswith(".glsl")
-                            for name, _ in program.artifacts))
+        self.assertTrue(all(name.endswith(".glsl") for name, _ in program.artifacts))
 
-        artifacts, reflection = compiler.compile_program(
-            MULTI_ENTRY_MODULE, native.Target.OPENGL, glsl_version=330)
+        artifacts, reflection = compiler.compile_program(MULTI_ENTRY_MODULE, native.Target.OPENGL, glsl_version=330)
         self.assertEqual(program.artifacts, artifacts)
         self.assertEqual(program.reflection, reflection)
 
@@ -107,8 +102,7 @@ class CompiledProgramTests(unittest.TestCase):
 
         def compile_locally() -> object:
             compiler = native.Compiler()
-            result = compiler.compile_program_result(CPU_MODULE,
-                                                     native.Target.CPU)
+            result = compiler.compile_program_result(CPU_MODULE, native.Target.CPU)
             self.assertTrue(result.ok, result.diagnostics)
             return result
 
@@ -121,8 +115,7 @@ class CompiledProgramTests(unittest.TestCase):
         self.assertTrue(reflection["target_options"]["target_triple"])
 
         runtime = native.Runtime(native.RuntimeBackend.CPU)
-        with self.assertRaisesRegex(RuntimeError,
-                                    "CPU entry 'missing' was not found"):
+        with self.assertRaisesRegex(RuntimeError, "CPU entry 'missing' was not found"):
             runtime.load_cpu_entry(program, "missing")
         kernel = runtime.load_cpu_entry(program, "increment")
         del program
@@ -131,8 +124,7 @@ class CompiledProgramTests(unittest.TestCase):
         values = runtime.allocate(12, 4)
         values.upload(struct.pack("=3f", 2.0, 4.0, 6.0))
         kernel.launch(3, 1, 1, [values])
-        self.assertEqual(struct.unpack("=3f", values.download()),
-                         (3.0, 5.0, 7.0))
+        self.assertEqual(struct.unpack("=3f", values.download()), (3.0, 5.0, 7.0))
 
     def test_diagnostics_and_target_options(self) -> None:
         compiler = native.Compiler()
@@ -146,17 +138,12 @@ class CompiledProgramTests(unittest.TestCase):
         self.assertIn("valid only for OpenGL", invalid.diagnostics)
         self.assertEqual(invalid.glsl_version, 450)
 
-        program = compiler.compile_program_result(CPU_MODULE,
-                                                  native.Target.CPU,
-                                                  cpu="generic",
-                                                  cpu_features="")
+        program = compiler.compile_program_result(CPU_MODULE, native.Target.CPU, cpu="generic", cpu_features="")
         self.assertTrue(program.ok, program.diagnostics)
         self.assertEqual(program.cpu, "generic")
         self.assertEqual(program.cpu_features, "")
-        default_program = compiler.compile_program_result(CPU_MODULE,
-                                                          native.Target.CPU)
-        _, compatibility_reflection = compiler.compile(CPU_MODULE,
-                                                       native.Target.CPU)
+        default_program = compiler.compile_program_result(CPU_MODULE, native.Target.CPU)
+        _, compatibility_reflection = compiler.compile(CPU_MODULE, native.Target.CPU)
         self.assertEqual(default_program.reflection, compatibility_reflection)
 
 

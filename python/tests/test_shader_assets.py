@@ -366,9 +366,17 @@ asset = vd.pipeline_asset(
                     )
                     compile_index = 0
 
-                    def compile_program_result(_mlir: str, native_target: object, **options: object) -> SimpleNamespace:
+                    def compile_program_result(
+                        _mlir: str,
+                        native_target: object,
+                        *,
+                        _target: str = target,
+                        _stages: tuple[str, ...] = stages,
+                        _artifact_format: str = artifact_format,
+                        **options: object,
+                    ) -> SimpleNamespace:
                         nonlocal compile_index
-                        self.assertEqual(native_target, target)
+                        self.assertEqual(native_target, _target)
                         self.assertEqual(
                             options,
                             {
@@ -378,14 +386,14 @@ asset = vd.pipeline_asset(
                                 "cpu_features": "",
                             },
                         )
-                        stage = stages[compile_index % len(stages)]
+                        stage = _stages[compile_index % len(_stages)]
                         compile_index += 1
                         extension = {
                             "glsl": ".glsl",
                             "gles": ".gles",
                             "ptx": ".ptx",
                             "spirv": ".spv",
-                        }[artifact_format]
+                        }[_artifact_format]
                         filename = f"{stage}{extension}"
                         artifact = (
                             {
@@ -393,7 +401,7 @@ asset = vd.pipeline_asset(
                                 "fragment": b"fragment artifact\n",
                                 "compute": b"compute artifact\n",
                             }[stage]
-                            if artifact_format != "spirv"
+                            if _artifact_format != "spirv"
                             else b"\x03\x02\x23\x07" + stage.encode("ascii")
                         )
                         reflection = {
@@ -411,7 +419,7 @@ asset = vd.pipeline_asset(
                                 {
                                     "entry_point": f"{stage}_main",
                                     "stage": stage,
-                                    "format": artifact_format,
+                                    "format": _artifact_format,
                                     "filename": filename,
                                 }
                             ],

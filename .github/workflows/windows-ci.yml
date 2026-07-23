@@ -1,0 +1,244 @@
+name: Windows CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - dev
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.9.7"
+  PYTHON_VERSION: "3.11.9"
+  CMAKE_GENERATOR: Visual Studio 17 2022
+
+jobs:
+  style:
+    name: Style
+    runs-on: windows-2022
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Visual Studio Build Tools
+        uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: "[17.0,18.0)"
+          msbuild-architecture: x64
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install style tools
+        run: uv sync --extra build --no-install-project --frozen
+
+      - name: Check formatting
+        shell: pwsh
+        run: |
+          $base = "${{ github.event.pull_request.base.sha }}"
+          if (-not $base) {
+            $base = "${{ github.event.before }}"
+          }
+          if (-not $base -or $base -match "^0+$") {
+            $base = "HEAD^"
+          }
+          uv run --frozen --no-sync python scripts/fix_code_style.py --since $base --check
+
+      - name: Run Ruff
+        shell: pwsh
+        run: |
+          uv run --frozen --no-sync ruff check --no-fix examples python scripts
+          uv run --frozen --no-sync ruff format --check examples python scripts
+
+  runtime:
+    name: Runtime
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Visual Studio Build Tools
+        uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: "[17.0,18.0)"
+          msbuild-architecture: x64
+
+      - name: Configure Runtime
+        run: >
+          cmake -S source/lib/runtime -B runtime-build
+          -G "${{ env.CMAKE_GENERATOR }}" -A x64
+          -DBUILD_TESTING=ON
+
+      - name: Build Runtime tests
+        run: cmake --build runtime-build --config Release --target VernonRuntimeTests --parallel 4
+
+      - name: Run Runtime tests
+        run: ctest --test-dir runtime-build -C Release --output-on-failure
+
+      - name: Upload Runtime test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-runtime-test-logs
+          path: runtime-build/Testing/Temporary/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  compiler-wheel:
+    name: Compiler and wheel
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check out pinned LLVM
+        shell: pwsh
+        run: git submodule update --init --depth 1 llvm-project
+
+      - name: Set up Visual Studio Build Tools
+        uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: "[17.0,18.0)"
+          msbuild-architecture: x64
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Read LLVM revision
+        id: llvm-revision
+        shell: pwsh
+        run: |
+          $revision = git rev-parse HEAD:llvm-project
+          "sha=$revision" >> $env:GITHUB_OUTPUT
+
+      - name: Restore LLVM installation
+        id: llvm-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: llvm-project/install
+          key: windows-x64-llvm-${{ steps.llvm-revision.outputs.sha }}-vs17-v1
+
+      - name: Configure LLVM
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          cmake -S llvm-project/llvm -B llvm-project/build-ci `
+            -G "${{ env.CMAKE_GENERATOR }}" -A x64 `
+            -DLLVM_ENABLE_PROJECTS="mlir;lld" `
+            -DLLVM_TARGETS_TO_BUILD="X86;NVPTX" `
+            -DLLVM_ENABLE_ASSERTIONS=OFF `
+            -DLLVM_INCLUDE_TESTS=OFF `
+            -DMLIR_INCLUDE_TESTS=OFF `
+            -DLLVM_INCLUDE_EXAMPLES=OFF `
+            -DLLVM_INCLUDE_BENCHMARKS=OFF `
+            -DLLVM_INCLUDE_DOCS=OFF `
+            -DLLVM_INSTALL_UTILS=ON `
+            -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE/llvm-project/install"
+
+      - name: Build and install LLVM
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: >
+          cmake --build llvm-project/build-ci
+          --config Release --target install --parallel 4
+
+      - name: Save LLVM installation
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: llvm-project/install
+          key: windows-x64-llvm-${{ steps.llvm-revision.outputs.sha }}-vs17-v1
+
+      - name: Install Python build environment
+        run: uv sync --extra build --frozen
+
+      - name: Configure VernonDSL
+        shell: pwsh
+        run: |
+          uv run --frozen cmake -S . -B build-ci `
+            -G "${{ env.CMAKE_GENERATOR }}" -A x64 `
+            -DMLIR_DIR="$env:GITHUB_WORKSPACE/llvm-project/install/lib/cmake/mlir" `
+            -DLLD_DIR="$env:GITHUB_WORKSPACE/llvm-project/install/lib/cmake/lld" `
+            -DVERNON_INSTALL_GIT_HOOK=OFF `
+            -DBUILD_TESTING=ON
+
+      - name: Build VernonDSL tests
+        run: cmake --build build-ci --config Release --parallel 4
+
+      - name: Run VernonDSL tests
+        run: ctest --test-dir build-ci -C Release --output-on-failure
+
+      - name: Build clean wheel
+        run: uv build --wheel --no-cache
+
+      - name: Validate wheel metadata
+        run: uvx --from twine twine check dist/*.whl
+
+      - name: Test wheel in a fresh environment
+        shell: pwsh
+        run: |
+          $wheel = (Get-ChildItem dist/*.whl | Select-Object -First 1).FullName
+          $venv = Join-Path $env:RUNNER_TEMP "vernon-wheel"
+          uv venv $venv --python "${{ env.PYTHON_VERSION }}"
+          uv pip install --python "$venv/Scripts/python.exe" --no-cache $wheel
+          & "$venv/Scripts/python.exe" -c @'
+          import vernon_dsl._gl_context
+          import vernon_dsl._native
+          from vernon_dsl.runtime_source import cmake_source_dir, version
+
+          assert cmake_source_dir().is_dir()
+          assert version() == "0.1.0"
+          print("Fresh wheel import and Runtime source checks passed.")
+          '@
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: vernon-lang-windows-cp311
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Compiler test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-compiler-test-logs
+          path: build-ci/Testing/Temporary/*.log
+          if-no-files-found: ignore
+          retention-days: 14

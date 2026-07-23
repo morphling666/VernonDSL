@@ -905,9 +905,10 @@ class _FunctionEmitter:
             after_arguments.append(argument)
             self.environment[name] = Value(argument, value_type)
         if after_arguments:
-            self._line(
-                f"^bb0({', '.join(f'{name}: {value_type.mlir}' for name, value_type in zip(after_arguments, carried_types, strict=True))}):"
+            block_arguments = ", ".join(
+                f"{name}: {value_type.mlir}" for name, value_type in zip(after_arguments, carried_types, strict=True)
             )
+            self._line(f"^bb0({block_arguments}):")
         for statement in node.body:
             self._statement(statement)
         yielded = ", ".join(self.environment[name].name for name in carried_names)

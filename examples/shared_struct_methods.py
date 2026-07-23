@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Annotated
 
 import numpy as np
-
 import vernon_dsl as vd
 
 
@@ -46,10 +45,9 @@ class Light:
 
 @vd.kernel(workgroup_size=(4, 1, 1))
 def evaluate_falloff(
-    output: vd.Tensor[vd.f32, (4, )],
+    output: vd.Tensor[vd.f32, (4,)],
     start_distance: vd.f32,
-    gid: Annotated[vd.Tensor[vd.u32, (3, )],
-                   vd.builtin("global_invocation_id")],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     distance = start_distance + vd.f32(gid[0])
     output[gid[0]] = inverse_square_falloff(distance)
@@ -66,18 +64,13 @@ def preview_fragment(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Demonstrate shared functions and immutable struct methods."
-    )
+    parser = argparse.ArgumentParser(description="Demonstrate shared functions and immutable struct methods.")
     parser.add_argument(
         "--mlir",
         type=Path,
         help="optional path for the lowered struct-method frontend MLIR",
     )
-    parser.add_argument("--arch",
-                        choices=("cpu", "cuda", "vulkan"),
-                        default="cpu",
-                        help="compute backend")
+    parser.add_argument("--arch", choices=("cpu", "cuda", "vulkan"), default="cpu", help="compute backend")
     return parser.parse_args()
 
 
@@ -106,12 +99,8 @@ def main() -> None:
     except TypeError as error:
         print("expected host domain error:", error)
 
-    vd.init(arch={
-        "cpu": vd.cpu,
-        "cuda": vd.cuda,
-        "vulkan": vd.vulkan
-    }[args.arch])
-    output = vd.Tensor.zeros(dtype=vd.f32, shape=(4, ))
+    vd.init(arch={"cpu": vd.cpu, "cuda": vd.cuda, "vulkan": vd.vulkan}[args.arch])
+    output = vd.Tensor.zeros(dtype=vd.f32, shape=(4,))
     evaluate_falloff(output, 1.0, grid=(4, 1, 1))
     device_values = output.to_numpy()
     host_values = np.array(

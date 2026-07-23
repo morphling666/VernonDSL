@@ -4,10 +4,8 @@ from vernon_dsl import *
 @fragment
 def blinn_phong_fragment(
     normal: Annotated[vec3[f32], varying(), location(0)],
-    world_position: Annotated[vec3[f32], varying(),
-                              location(1)],
-    custom_tint: Annotated[vec4[f32], varying(),
-                           location(2)],
+    world_position: Annotated[vec3[f32], varying(), location(1)],
+    custom_tint: Annotated[vec4[f32], varying(), location(2)],
     albedo: Annotated[vec3[f32], uniform()],
     specular_color: Annotated[vec3[f32], uniform()],
     ambient_color: Annotated[vec3[f32], uniform()],

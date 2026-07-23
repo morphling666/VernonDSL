@@ -1,6 +1,5 @@
-from vernon_dsl import *
-
 from shader_lib.shadow import shadow_visibility
+from vernon_dsl import *
 
 
 @vertex

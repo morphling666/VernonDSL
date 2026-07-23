@@ -90,6 +90,19 @@ ctest --test-dir build --output-on-failure
 Use plain `uv sync` only for the frontend/runtime Python package without
 building `_native`. Run Python commands through `uv run --frozen`.
 
+### Windows CI
+
+GitHub Actions runs the supported CI configuration on `windows-2022` with
+Visual Studio 17 2022 and Python 3.11.9. The workflow installs `uv` explicitly;
+it does not rely on software inherited from the runner image.
+
+The Runtime and style jobs do not check out or build LLVM. The Compiler job
+builds a reduced `mlir;lld` LLVM installation on the first run, then caches the
+installation by the pinned `llvm-project` submodule revision. Consequently, the
+first run after changing that revision is expected to be much slower. Later
+runs reuse the matching installation; changing the LLVM build recipe requires
+bumping the cache recipe suffix in `.github/workflows/windows-ci.yml`.
+
 Configure the Runtime subproject directly without LLVM/MLIR:
 
 ```powershell
