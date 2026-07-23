@@ -71,6 +71,23 @@ jobs:
           uv run --frozen --no-sync ruff check --no-fix examples python scripts
           uv run --frozen --no-sync ruff format --check examples python scripts
 
+      - name: Measure Python coverage
+        env:
+          PYTHONPATH: python
+        run: |
+          uv run --frozen --no-sync coverage run -m pytest python/tests -q
+          uv run --frozen --no-sync coverage json -o coverage.json
+          uv run --frozen --no-sync python scripts/check_python_coverage.py coverage.json
+          uv run --frozen --no-sync coverage xml -o coverage.xml
+
+      - name: Upload Python coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-python-coverage
+          path: coverage.xml
+          if-no-files-found: error
+          retention-days: 14
+
   runtime:
     name: Runtime
     runs-on: windows-2022

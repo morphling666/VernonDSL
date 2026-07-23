@@ -48,7 +48,8 @@ def vector_while(
     c = vd.vec2(-0.8, vd.cos(phase) * 0.2)
     z = vd.vec2(vd.f32(x) * 0.01, 0.1)
     iterations = 0
-    while vd.norm(z) < 20.0 and iterations < 8:
+    running = vd.norm(z) < 20.0
+    while running:
         z = (
             vd.vec2(
                 z[0] * z[0] - z[1] * z[1],
@@ -57,6 +58,9 @@ def vector_while(
             + c
         )
         iterations += 1
+        running = vd.norm(z) < 20.0
+        if iterations >= 8:
+            running = False
     output[x] = vd.f32(iterations)
 
 
@@ -224,8 +228,9 @@ def fill(
 ) -> None:
     x = gid[0]
     y = gid[1]
-    if x < 3 and y < 2:
-        output[y, x] = vd.f32(x) + vd.f32(y) * scale
+    if x < 3:
+        if y < 2:
+            output[y, x] = vd.f32(x) + vd.f32(y) * scale
 
 
 class TensorTests(unittest.TestCase):

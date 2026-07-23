@@ -49,19 +49,7 @@ class _TypeConstructor:
         return TypeExpr(cls.__name__, arguments)
 
 
-class Tensor(_TypeConstructor):
-    pass
-
-
-class Array(_TypeConstructor):
-    pass
-
-
 class Buffer(_TypeConstructor):
-    pass
-
-
-class Texture(_TypeConstructor):
     pass
 
 
@@ -75,6 +63,24 @@ class vec(_TypeConstructor):
 
 class mat(_TypeConstructor):
     pass
+
+
+class Vector:
+    """Construct an immutable rank-one host value from an iterable."""
+
+    def __new__(cls, values: Any) -> np.ndarray[Any, Any]:
+        components = tuple(values)
+        return _host_tensor("Vector", components, (len(components),))
+
+
+class Matrix:
+    """Construct an immutable rank-two host value from nested iterables."""
+
+    def __new__(cls, values: Any) -> np.ndarray[Any, Any]:
+        rows = tuple(tuple(row) for row in values)
+        if not rows or not rows[0] or any(len(row) != len(rows[0]) for row in rows):
+            raise TypeError("Matrix requires a non-empty rectangular sequence")
+        return _host_tensor("Matrix", tuple(value for row in rows for value in row), (len(rows), len(rows[0])))
 
 
 class vec2(_TypeConstructor):

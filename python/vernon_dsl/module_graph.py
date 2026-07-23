@@ -8,6 +8,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .diagnostics import CompileError, SourceLocation
+from .language.ast_utils import decorator_name as _decorator_name
+from .language.ast_utils import dotted_name as _dotted_name
+from .language.syntax import ENTRY_DECORATORS, FUNCTION_DECORATORS
 from .shader_contracts import DEVICE_ONLY_OPERATION_NAMES, DEVICE_ONLY_TYPE_NAMES
 from .struct_methods import normalize_struct_methods
 
@@ -25,22 +28,8 @@ _HOST_MODULES = {
     "unittest",
     "vernon_dsl",
 }
-_STAGE_DECORATORS = {"vertex", "fragment", "compute", "kernel"}
-_FUNCTION_DECORATORS = _STAGE_DECORATORS | {"func"}
-
-
-def _dotted_name(node: ast.AST) -> str | None:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        prefix = _dotted_name(node.value)
-        return f"{prefix}.{node.attr}" if prefix else None
-    return None
-
-
-def _decorator_name(node: ast.expr) -> str:
-    target = node.func if isinstance(node, ast.Call) else node
-    return (_dotted_name(target) or "").split(".")[-1]
+_STAGE_DECORATORS = ENTRY_DECORATORS
+_FUNCTION_DECORATORS = FUNCTION_DECORATORS
 
 
 @dataclass
@@ -225,13 +214,6 @@ class _FeatureSpecializer(ast.NodeTransformer):
             shape = arguments[1].elts if isinstance(arguments[1], ast.Tuple) else arguments[1:]
             if len(shape) == 2 and isinstance(shape[1], ast.Constant) and isinstance(shape[1].value, int):
                 return shape[1].value
-        if (
-            constructor == "Array"
-            and len(arguments) == 2
-            and isinstance(arguments[1], ast.Constant)
-            and isinstance(arguments[1].value, int)
-        ):
-            return self._location_span(arguments[0]) * arguments[1].value
         return 1
 
     def visit_If(self, node: ast.If) -> ast.AST | list[ast.stmt]:

@@ -103,23 +103,6 @@ std::unique_ptr<CompiledProgram> compileProgramResult(Compiler &compiler, const 
         glslVersion, targetTriple, cpu, cpuFeatures);
 }
 
-nb::tuple compile(Compiler &compiler, const std::string &mlir, VernonTarget target) {
-    std::unique_ptr<CompiledProgram> program = compileProgramResult(compiler, mlir, target, 0, "", "", "");
-    program->requireSuccess();
-    if (vernonCompileResultGetArtifactCount(program->result.get()) != 1)
-        throw std::runtime_error("kernel compilation must produce one artifact");
-    VernonStringView artifact = vernonCompileResultGetArtifactData(program->result.get(), 0);
-    return nb::make_tuple(nb::bytes(artifact.data, artifact.size), program->reflection());
-}
-
-nb::tuple compileProgram(Compiler &compiler, const std::string &mlir, VernonTarget target, uint32_t glslVersion,
-                         const std::string &targetTriple, const std::string &cpu, const std::string &cpuFeatures) {
-    std::unique_ptr<CompiledProgram> program =
-        compileProgramResult(compiler, mlir, target, glslVersion, targetTriple, cpu, cpuFeatures);
-    program->requireSuccess();
-    return nb::make_tuple(program->artifacts(), program->reflection());
-}
-
 struct Buffer {
     Buffer(Runtime *owner, size_t size, size_t alignment);
     ~Buffer() { vernonRuntimeBufferFree(handle); }
@@ -674,12 +657,9 @@ NB_MODULE(_native, module) {
         .value("POINT_LIST", VERNON_TOPOLOGY_POINT_LIST);
     nb::class_<Compiler>(module, "Compiler")
         .def(nb::init<>())
-        .def("compile", &compile)
         .def("compile_program_result", &compileProgramResult, nb::arg("mlir"), nb::arg("target"),
              nb::arg("glsl_version") = 0, nb::arg("target_triple") = "", nb::arg("cpu") = "",
-             nb::arg("cpu_features") = "")
-        .def("compile_program", &compileProgram, nb::arg("mlir"), nb::arg("target"), nb::arg("glsl_version") = 0,
-             nb::arg("target_triple") = "", nb::arg("cpu") = "", nb::arg("cpu_features") = "");
+             nb::arg("cpu_features") = "");
     nb::class_<CompiledProgram>(module, "CompiledProgram")
         .def_prop_ro("ok", &CompiledProgram::ok)
         .def_prop_ro("status", &CompiledProgram::status)

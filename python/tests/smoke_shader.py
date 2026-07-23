@@ -16,7 +16,7 @@ def fragment_main(
     return color
 
 
-@compute(workgroup_size=(8, 4, 1))
+@kernel(workgroup_size=(8, 4, 1))
 def compute_main(
     values: Annotated[Buffer[f32], resource(set=0, binding=0)],
     invocation: Annotated[vec3[u32], builtin("global_invocation_id")],

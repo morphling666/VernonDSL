@@ -11,7 +11,7 @@ from unittest import mock
 
 from vernon_dsl.pipeline_compile import build_bundle_plan
 from vernon_dsl.shader_assets import (
-    ShaderAssetError,
+    PipelineCompileError,
     cook_shader_pipeline,
     encode_runtime_stage,
     parse_python_pipeline_asset,
@@ -30,11 +30,11 @@ def _fake_native(compile_program_result: object) -> SimpleNamespace:
 
 def _native_available() -> bool:
     try:
-        from vernon_dsl.shader_assets import _native_module
+        from vernon_dsl._shader_assets.cooking import _native_module
 
         _native_module()
         return True
-    except ShaderAssetError:
+    except PipelineCompileError:
         return False
 
 
@@ -94,7 +94,7 @@ asset = vd.pipeline_asset(
 """,
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(ShaderAssetError, "not canonical"):
+            with self.assertRaisesRegex(PipelineCompileError, "not canonical"):
                 parse_python_pipeline_asset(source, "asset")
 
     def test_python_pipeline_asset_enforces_variant_cap(self) -> None:
@@ -120,7 +120,7 @@ asset = vd.pipeline_asset(
 """,
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(ShaderAssetError, "variant cap 16"):
+            with self.assertRaisesRegex(PipelineCompileError, "variant cap 16"):
                 parse_python_pipeline_asset(source, "asset")
 
     def test_example_pipeline_asset_has_canonical_variants(self) -> None:
@@ -137,12 +137,12 @@ class ShaderAssetCookTests(unittest.TestCase):
     def test_cooker_rejects_non_python_pipeline_asset_references(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with self.assertRaisesRegex(ShaderAssetError, "source.py:descriptor_name"):
+            with self.assertRaisesRegex(PipelineCompileError, "source.py:descriptor_name"):
                 cook_shader_pipeline(
                     pipeline_asset=root / "asset.json",
                     output=root / "output",
                 )
-            with self.assertRaisesRegex(ShaderAssetError, "valid Python descriptor name"):
+            with self.assertRaisesRegex(PipelineCompileError, "valid Python descriptor name"):
                 cook_shader_pipeline(
                     pipeline_asset=f"{root / 'asset.py'}:",
                     output=root / "output",
@@ -276,13 +276,16 @@ asset = vd.pipeline_asset(
             )
             output = root / "cooked"
             with (
-                mock.patch("vernon_dsl.shader_assets.compile_file", return_value="module {}"),
-                mock.patch("vernon_dsl.shader_assets.load_project", return_value=SimpleNamespace(features={"UNUSED"})),
+                mock.patch("vernon_dsl._shader_assets.cooking.compile_file", return_value="module {}"),
                 mock.patch(
-                    "vernon_dsl.shader_assets._native_module", return_value=_fake_native(compile_program_result)
+                    "vernon_dsl._shader_assets.cooking.load_project", return_value=SimpleNamespace(features={"UNUSED"})
+                ),
+                mock.patch(
+                    "vernon_dsl._shader_assets.cooking._native_module",
+                    return_value=_fake_native(compile_program_result),
                 ),
                 mock.patch("subprocess.run", side_effect=AssertionError("cooker invoked subprocess")),
-                mock.patch("vernon_dsl.shader_assets.build_bundle_plan", side_effect=capture_plan),
+                mock.patch("vernon_dsl._shader_assets.cooking.build_bundle_plan", side_effect=capture_plan),
             ):
                 manifest_path = cook_shader_pipeline(
                     pipeline_asset=f"{source}:asset",
@@ -433,12 +436,14 @@ asset = vd.pipeline_asset(
 
                     output = case_root / f"{target}_asset"
                     with (
-                        mock.patch("vernon_dsl.shader_assets.compile_file", return_value="module {}"),
+                        mock.patch("vernon_dsl._shader_assets.cooking.compile_file", return_value="module {}"),
                         mock.patch(
-                            "vernon_dsl.shader_assets.load_project", return_value=SimpleNamespace(features={"FEATURE"})
+                            "vernon_dsl._shader_assets.cooking.load_project",
+                            return_value=SimpleNamespace(features={"FEATURE"}),
                         ),
                         mock.patch(
-                            "vernon_dsl.shader_assets._native_module", return_value=_fake_native(compile_program_result)
+                            "vernon_dsl._shader_assets.cooking._native_module",
+                            return_value=_fake_native(compile_program_result),
                         ),
                     ):
                         manifest_path = cook_shader_pipeline(
@@ -518,7 +523,7 @@ asset = vd.pipeline_asset(
 """,
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(ShaderAssetError, "CPU pipeline bundles support"):
+            with self.assertRaisesRegex(PipelineCompileError, "CPU pipeline bundles support"):
                 cook_shader_pipeline(
                     pipeline_asset=f"{source}:asset",
                     output=root / "output",

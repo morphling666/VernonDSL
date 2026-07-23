@@ -56,7 +56,8 @@ def func(function: _T | None = None, *, shared: bool = False) -> _T | Callable[[
     return decorate(function) if function is not None else decorate
 
 
-def compute(function: _T | None = None, *, workgroup_size: tuple[int, int, int] = (1, 1, 1)) -> _T | Callable[[_T], _T]:
+def kernel(function: _T | None = None, *, workgroup_size: tuple[int, int, int] = (1, 1, 1)) -> _T | Callable[[_T], _T]:
+    """Declare a compute entry point."""
 
     def decorate(value: _T) -> _T:
         from .runtime import Kernel
@@ -64,11 +65,6 @@ def compute(function: _T | None = None, *, workgroup_size: tuple[int, int, int] 
         return Kernel(value, workgroup_size=workgroup_size)  # type: ignore[return-value]
 
     return decorate(function) if function is not None else decorate
-
-
-def kernel(function: _T | None = None, *, workgroup_size: tuple[int, int, int] = (1, 1, 1)) -> _T | Callable[[_T], _T]:
-    """Mark a compute kernel; ``compute`` remains the compatibility spelling."""
-    return compute(function, workgroup_size=workgroup_size)
 
 
 def struct(value: _T | None = None, *, shared: bool = False) -> _T | Callable[[_T], _T]:

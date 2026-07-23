@@ -7,7 +7,8 @@ from unittest import mock
 
 import numpy as np
 import vernon_dsl as vd
-import vernon_dsl.runtime as runtime_module
+import vernon_dsl._runtime.pipeline as pipeline_module
+import vernon_dsl._runtime.session as runtime_module
 from advanced_pipeline_shader import (
     advanced_fragment,
     advanced_vertex,
@@ -376,10 +377,9 @@ class VulkanPipelineTests(unittest.TestCase):
                 "subprocess.run",
                 side_effect=AssertionError("subprocess prohibited"),
             ),
-            mock.patch.object(
-                runtime_module,
-                "build_bundle_plan",
-                wraps=runtime_module.build_bundle_plan,
+            mock.patch(
+                "vernon_dsl._runtime.pipeline.build_bundle_plan",
+                wraps=pipeline_module.build_bundle_plan,
             ) as planner,
         ):
             render(position=positions, target=target)

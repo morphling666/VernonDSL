@@ -15,6 +15,15 @@ computation IR across all targets, then selects a target-specific lowering:
 
 SPIR-V is intentionally not treated as the universal backend IR.
 
+The current Python frontend language version is 3. Entry points keep explicit
+ABI annotations, while `@func` helpers may infer parameters and results from
+their call sites. Python `int`/`float` mean `i32`/`f32`; safe numeric widening
+and integer true division are deterministic across targets. Use
+`vd.Vector([...])` and `vd.Matrix([...])` for inferred value construction.
+The complete contract and migration notes are in
+[`specs/language/contract.md`](specs/language/contract.md) and
+[`specs/language/v2_to_v3.md`](specs/language/v2_to_v3.md).
+
 ## Current status
 
 The compiler is under active development. A target is reported as available

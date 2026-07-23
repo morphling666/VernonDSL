@@ -7,7 +7,7 @@ input module. These Python objects exist for editor completion and type syntax.
 from typing import Annotated
 
 from .compiler import Compiler, compile_file, compile_source
-from .decorators import compute, fragment, func, kernel, struct, vertex
+from .decorators import fragment, func, kernel, struct, vertex
 from .diagnostics import CompileError
 from .intrinsics import (
     abs,
@@ -56,10 +56,11 @@ from .runtime import (
 )
 from .shader_assets import PipelineAssetDeclaration, pipeline_asset
 from .types import (
-    Array,
     Buffer,
     Feature,
+    Matrix,
     Sampler,
+    Vector,
     When,
     bool,
     builtin,
@@ -87,12 +88,12 @@ from .types import (
 __all__ = [
     "Annotated",
     "abs",
-    "Array",
     "Buffer",
     "CompileError",
     "Compiler",
     "Feature",
     "Kernel",
+    "Matrix",
     "Pipeline",
     "PipelineAssetDeclaration",
     "PrimitiveTopology",
@@ -107,7 +108,6 @@ __all__ = [
     "clamp",
     "compile_file",
     "compile_source",
-    "compute",
     "cos",
     "cpu",
     "cross",
@@ -165,4 +165,5 @@ __all__ = [
     "vertex",
     "vertex_id",
     "vulkan",
+    "Vector",
 ]

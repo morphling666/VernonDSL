@@ -6,6 +6,7 @@
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
 #include "mlir/Dialect/SPIRV/Transforms/Passes.h"
+#include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonInlineHelpers.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUTensors.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonSpirvMarkers.h"
@@ -171,6 +172,31 @@ bool materializeImageQuerySizeLod(llvm::SmallVectorImpl<uint32_t> &words, size_t
 namespace vernon::compiler {
 namespace {
 
+bool containsF16(mlir::Type type) {
+    if (type.isF16())
+        return true;
+    if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(type))
+        return containsF16(shaped.getElementType());
+    if (auto buffer = mlir::dyn_cast<mlir::vernon::BufferType>(type))
+        return containsF16(buffer.getElementType());
+    if (auto function = mlir::dyn_cast<mlir::FunctionType>(type))
+        return llvm::any_of(function.getInputs(), containsF16) || llvm::any_of(function.getResults(), containsF16);
+    return false;
+}
+
+bool moduleUsesF16(mlir::ModuleOp module) {
+    bool usesF16 = false;
+    module.walk([&](mlir::Operation *operation) {
+        usesF16 = usesF16 || llvm::any_of(operation->getOperandTypes(), containsF16) ||
+                  llvm::any_of(operation->getResultTypes(), containsF16);
+        for (mlir::Region &region : operation->getRegions())
+            for (mlir::Block &block : region)
+                usesF16 = usesF16 || llvm::any_of(block.getArgumentTypes(), containsF16);
+        return usesF16 ? mlir::WalkResult::interrupt() : mlir::WalkResult::advance();
+    });
+    return usesF16;
+}
+
 struct AttachSpirvTargetPass
     : public mlir::PassWrapper<AttachSpirvTargetPass, mlir::OperationPass<mlir::spirv::ModuleOp>> {
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AttachSpirvTargetPass)
@@ -197,6 +223,10 @@ bool compileSpirv(mlir::MLIRContext &context, const char *source, size_t sourceS
     mlir::OwningOpRef<mlir::ModuleOp> module = mlir::parseSourceString<mlir::ModuleOp>(text, &context);
     if (!module)
         return false;
+    if (target == VERNON_TARGET_VULKAN && moduleUsesF16(module.get())) {
+        diagnostics = "Vulkan target does not support f16 until shaderFloat16 and 16-bit storage features are enabled";
+        return false;
+    }
 
     mlir::PassManager passManager(&context);
     passManager.addPass(mlir::vernon::createVernonValidatePass());

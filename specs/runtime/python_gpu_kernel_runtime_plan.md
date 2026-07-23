@@ -70,8 +70,8 @@ Builtin arguments are synthesized by the backend and omitted from the Python
 and native launch argument lists. `grid` is always explicit; VernonDSL does not
 infer parallel dispatch from Python loops.
 
-`@kernel` is the public runtime decorator. `@compute` remains a compatibility
-alias.
+`@kernel` is the public runtime decorator. Language v3 removed the `@compute`
+compatibility alias.
 
 ## Tensor model
 
@@ -133,7 +133,7 @@ API and consume the returned artifact and reflection in memory.
 Modify the Python frontend and Vernon-to-GPU lowering before implementing the
 fractal runtime path:
 
-- recognize `@kernel` as compute and keep `@compute` compatible;
+- recognize `@kernel` as the only compute-entry spelling;
 - specialize `None` Tensor dimensions from call arguments;
 - allow addressable Tensor load/store and multidimensional indexing;
 - lower multidimensional indexing to a documented row-major linear index;

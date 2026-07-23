@@ -19,6 +19,7 @@ build = [
     "pyyaml>=6.0.2",
     "ruff>=0.15.6",
     "pytest>=9.0.3",
+    "coverage[toml]>=7.10",
 ]
 
 [project.scripts]
@@ -55,3 +56,11 @@ select = ["E", "F", "I", "B"]
 "python/tests/cube_map_shader.py" = ["F821"]
 "python/tests/pipeline_asset_fixture.py" = ["F722"]
 "python/tests/smoke_shader.py" = ["F403", "F405", "F841"]
+
+[tool.coverage.run]
+branch = true
+source = ["python/vernon_dsl"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

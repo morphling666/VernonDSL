@@ -5,7 +5,8 @@ import sys
 from pathlib import Path
 
 from .diagnostics import CompileError
-from .shader_assets import ShaderAssetError, cook_shader_pipeline
+from .pipeline_compile import PipelineCompileError
+from .shader_assets import cook_shader_pipeline
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -31,7 +32,7 @@ def main(argv: list[str] | None = None) -> int:
             output=arguments.output,
             target=arguments.target,
         )
-    except (CompileError, ShaderAssetError, OSError) as error:
+    except (CompileError, PipelineCompileError, OSError) as error:
         print(error, file=sys.stderr)
         return 1
     return 0

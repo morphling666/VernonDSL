@@ -26,17 +26,22 @@ def paint(
 ) -> None:
     x = gid[0]
     y = gid[1]
-    if x < WIDTH and y < HEIGHT:
-        c = vd.vec2(-0.8, vd.cos(time) * 0.2)
-        z = vd.vec2(
-            (vd.f32(x) / vd.f32(HEIGHT) - 1.0) * 2.0,
-            (vd.f32(y) / vd.f32(HEIGHT) - 0.5) * 2.0,
-        )
-        iterations = 0
-        while vd.norm(z) < 20.0 and iterations < 50:
-            z = complex_square(z) + c
-            iterations += 1
-        pixels[y, x] = 1.0 - vd.f32(iterations) * 0.02
+    if x < WIDTH:
+        if y < HEIGHT:
+            c = vd.vec2(-0.8, vd.cos(time) * 0.2)
+            z = vd.vec2(
+                (vd.f32(x) / vd.f32(HEIGHT) - 1.0) * 2.0,
+                (vd.f32(y) / vd.f32(HEIGHT) - 0.5) * 2.0,
+            )
+            iterations = 0
+            running = vd.norm(z) < 20.0
+            while running:
+                z = complex_square(z) + c
+                iterations += 1
+                running = vd.norm(z) < 20.0
+                if iterations >= 50:
+                    running = False
+            pixels[y, x] = 1.0 - vd.f32(iterations) * 0.02
 
 
 def render(time: float = 0.0) -> vd.Tensor:

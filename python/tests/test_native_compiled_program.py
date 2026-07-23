@@ -12,7 +12,7 @@ from types import ModuleType
 
 def _load_native() -> ModuleType:
     if len(sys.argv) < 2 or not Path(sys.argv[1]).is_file():
-        from vernon_dsl.runtime import _native
+        from vernon_dsl._runtime.session import _native
 
         return _native
     module_path = Path(sys.argv.pop(1)).resolve()
@@ -84,7 +84,7 @@ module {
 
 
 class CompiledProgramTests(unittest.TestCase):
-    def test_named_artifacts_and_compatibility_reflection(self) -> None:
+    def test_named_artifacts_and_reflection(self) -> None:
         compiler = native.Compiler()
         program = compiler.compile_program_result(MULTI_ENTRY_MODULE, native.Target.OPENGL, glsl_version=330)
         self.assertTrue(program.ok, program.diagnostics)
@@ -93,10 +93,6 @@ class CompiledProgramTests(unittest.TestCase):
         self.assertEqual(len(program.artifacts), 2)
         self.assertEqual(len({name for name, _ in program.artifacts}), 2)
         self.assertTrue(all(name.endswith(".glsl") for name, _ in program.artifacts))
-
-        artifacts, reflection = compiler.compile_program(MULTI_ENTRY_MODULE, native.Target.OPENGL, glsl_version=330)
-        self.assertEqual(program.artifacts, artifacts)
-        self.assertEqual(program.reflection, reflection)
 
     def test_cpu_entry_execution_and_result_lifetime(self) -> None:
 
@@ -143,8 +139,8 @@ class CompiledProgramTests(unittest.TestCase):
         self.assertEqual(program.cpu, "generic")
         self.assertEqual(program.cpu_features, "")
         default_program = compiler.compile_program_result(CPU_MODULE, native.Target.CPU)
-        _, compatibility_reflection = compiler.compile(CPU_MODULE, native.Target.CPU)
-        self.assertEqual(default_program.reflection, compatibility_reflection)
+        self.assertTrue(default_program.ok, default_program.diagnostics)
+        self.assertEqual(json.loads(default_program.reflection)["target"], "cpu")
 
 
 if __name__ == "__main__":

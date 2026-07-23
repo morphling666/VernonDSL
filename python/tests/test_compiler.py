@@ -16,7 +16,7 @@ from vernon_dsl import *
 @struct
 class Vertex:
     position: Tensor[f32, (3,)]
-    weights: Array[f32, 4]
+    weights: Tensor[f32, (4,)]
 
 @func
 def resources(
@@ -37,7 +37,7 @@ def resources(
         output = compile_source(source, "types.py")
         self.assertIn("tensor<3xf32>", output)
         self.assertIn("tensor<2x3xf32>", output)
-        self.assertIn("!vernon.array<4 x f32>", output)
+        self.assertEqual(output.count("tensor<4xf32>"), 1)
         self.assertIn('!vernon.buffer<!vernon.struct<"Vertex">, "read">', output)
         self.assertIn('!vernon.texture<"2d", f32>', output)
         self.assertIn('vernon.interface = "resource"', output)
@@ -158,7 +158,7 @@ def main(image: Texture["2d", f32]) -> vec2[u32]:
 
         compute_implicit_lod = """
 from vernon_dsl import *
-@compute(workgroup_size=(1, 1, 1))
+@kernel(workgroup_size=(1, 1, 1))
 def main(image: Texture["2d", f32], sampler: Sampler,
          uv: vec2[f32]) -> None:
     color = texture_sample(image, sampler, uv)
@@ -168,7 +168,7 @@ def main(image: Texture["2d", f32], sampler: Sampler,
 
         compute_explicit_lod = """
 from vernon_dsl import *
-@compute(workgroup_size=(1, 1, 1))
+@kernel(workgroup_size=(1, 1, 1))
 def main(image: Texture["2d", f32], sampler: Sampler) -> None:
     color = texture_sample(image, sampler, vec2(0.0, 0.0), 0.0)
 """
@@ -241,7 +241,7 @@ def fragment_main(
 ) -> vec4[f32]:
     return coordinate
 
-@compute(workgroup_size=(1, 1, 1))
+@kernel(workgroup_size=(1, 1, 1))
 def compute_main(
     global_id: Annotated[vec3[u32], builtin("global_invocation_id")],
     local_id: Annotated[vec3[u32], builtin("local_invocation_id")],
@@ -294,7 +294,7 @@ def main() -> Annotated[u32, builtin("vertex_index")]:
             (
                 """
 from vernon_dsl import *
-@compute(workgroup_size=(1, 1, 1))
+@kernel(workgroup_size=(1, 1, 1))
 def main(gid: Annotated[u32, builtin("global_invocation_id")]) -> None:
     pass
 """,
@@ -436,7 +436,7 @@ def transform(
 def shade(color: Annotated[vec4[f32], varying()]) -> f32:
     return color.x
 
-@compute(workgroup_size=(8, 4, 1))
+@kernel(workgroup_size=(8, 4, 1))
 def update(
     values: Annotated[Buffer[f32], resource(set=0, binding=3)],
     invocation: Annotated[vec3[u32], builtin("global_invocation_id")],
