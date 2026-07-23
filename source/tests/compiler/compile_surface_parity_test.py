@@ -268,12 +268,16 @@ class CompileSurfaceParityTests(unittest.TestCase):
         for target_name, architecture, api_version in cases:
             with self.subTest(target=target_name), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                capture = SimpleNamespace(
-                    bundles=[],
-                    load_pipeline=lambda data, features: (
-                        capture.bundles.append((bytes(data), tuple(features))) or object()
-                    ),
-                )
+
+                class PipelineCapture:
+                    def __init__(self) -> None:
+                        self.bundles: list[tuple[bytes, tuple[str, ...]]] = []
+
+                    def load_pipeline(self, data: bytes, features: list[str]) -> object:
+                        self.bundles.append((bytes(data), tuple(features)))
+                        return object()
+
+                capture = PipelineCapture()
                 runtime_module.Pipeline._cache.clear()
                 pipeline = vd.pipeline(triangle_vertex, solid_fragment, features={OFFSET.name})
                 with mock.patch.multiple(
