@@ -963,10 +963,10 @@ class _FunctionEmitter:
         elif isinstance(node.value, int):
             value_type = (
                 expected
-                if expected and expected.kind == "scalar" and expected.name in {"i32", "u32"}
+                if expected and expected.kind == "scalar" and (expected.is_float or expected.name in {"i32", "u32"})
                 else DslType("scalar", "i32")
             )
-            literal = str(node.value)
+            literal = f"{node.value}.0" if value_type.is_float else str(node.value)
         elif isinstance(node.value, float):
             value_type = (
                 expected if expected and expected.kind == "scalar" and expected.is_float else DslType("scalar", "f32")
@@ -982,13 +982,22 @@ class _FunctionEmitter:
 
     def _binary(self, node: ast.BinOp) -> Value:
         left = self._expression(node.left)
-        right = self._expression(node.right, left.type if left.type.kind == "scalar" else None)
+        right_expected = left.type if left.type.kind == "scalar" else None
+        if left.type.kind == "tensor":
+            element = left.type.arguments[0]
+            assert isinstance(element, DslType)
+            right_expected = element
+        right = self._expression(node.right, right_expected)
         if left.type.kind == "tensor" and right.type.kind == "scalar":
             right = self._splat(node.right, right, left.type)
         elif left.type.kind == "scalar" and right.type.kind == "tensor":
             left = self._splat(node.left, left, right.type)
         self._require_same_type(node, left.type, right.type)
         floating = left.type.is_float
+        if isinstance(node.op, ast.Pow):
+            if not floating:
+                raise self.context.error(node, "power requires floating-point operands")
+            return self._intrinsic(node, "pow", [left, right], left.type)
         operations = {
             ast.Add: "arith.addf" if floating else "arith.addi",
             ast.Sub: "arith.subf" if floating else "arith.subi",

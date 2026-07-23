@@ -71,6 +71,17 @@ def matrix_vector(
     output[x] = value[x]
 
 
+@vd.kernel(workgroup_size=(8, 1, 1))
+def floating_power(
+    output: vd.Tensor[vd.f32, (None,)],
+    values: vd.Tensor[vd.f32, (None,)],
+    exponent: vd.f32,
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    x = gid[0]
+    output[x] = values[x] ** 2.5 + values[x] ** exponent
+
+
 class KernelTensorRuntimeTests(unittest.TestCase):
     @staticmethod
     def _run_tensor_operators(arch: object) -> np.ndarray:
@@ -169,6 +180,27 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                 np.testing.assert_allclose(
                     output.to_numpy(), np.array((17.0, 39.0), dtype=np.float32), rtol=0.0, atol=1e-6
                 )
+
+    def test_literal_and_dynamic_floating_power(self) -> None:
+        values = np.linspace(0.25, 2.0, 16, dtype=np.float32)
+        exponent = 1.75
+        expected = values ** np.float32(2.5) + values ** np.float32(exponent)
+        backends = [vd.cpu]
+        if self._cuda_available():
+            backends.append(vd.cuda)
+        if self._vulkan_available():
+            backends.append(vd.vulkan)
+        for backend in backends:
+            with self.subTest(backend=backend.name):
+                vd.init(arch=backend)
+                output = vd.Tensor.zeros(dtype=vd.f32, shape=values.shape)
+                floating_power(
+                    output,
+                    vd.Tensor.from_numpy(values),
+                    exponent,
+                    grid=(values.size, 1, 1),
+                )
+                np.testing.assert_allclose(output.to_numpy(), expected, rtol=2e-6, atol=2e-6)
 
     def test_cross_compiled_source_generation(self) -> None:
         output = vd.Tensor.zeros(dtype=vd.f32, shape=(16,))

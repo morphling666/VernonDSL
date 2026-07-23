@@ -10,6 +10,14 @@ WIDTH = 640
 HEIGHT = 320
 
 
+@vd.func
+def complex_square(z: vd.vec2[vd.f32]) -> vd.vec2[vd.f32]:
+    return vd.vec2(
+        z[0] ** 2 - z[1] ** 2,
+        z[1] * z[0] * 2,
+    )
+
+
 @vd.kernel(workgroup_size=(16, 16, 1))
 def paint(
     pixels: vd.Tensor[vd.f32, (None, None)],
@@ -26,13 +34,7 @@ def paint(
         )
         iterations = 0
         while vd.norm(z) < 20.0 and iterations < 50:
-            z = (
-                vd.vec2(
-                    z[0] * z[0] - z[1] * z[1],
-                    z[1] * z[0] * 2.0,
-                )
-                + c
-            )
+            z = complex_square(z) + c
             iterations += 1
         pixels[y, x] = 1.0 - vd.f32(iterations) * 0.02
 
@@ -52,6 +54,8 @@ def main() -> None:
         help=("execution backend; OpenGL profiles require a host to register an external context first"),
     )
     parser.add_argument("--time", type=float, default=0.0)
+    parser.add_argument("--frames", type=int, default=1_000_000)
+    parser.add_argument("--time-step", type=float, default=0.03)
     parser.add_argument("--emit-metal", type=Path)
     arguments = parser.parse_args()
     if arguments.emit_metal is not None:
@@ -73,9 +77,21 @@ def main() -> None:
         "opengles": vd.opengles,
     }
     vd.init(arch=architectures[arguments.arch])
-    image = render(arguments.time).to_numpy()
-    cv2.imshow("VernonDSL Julia Set", image)
-    cv2.waitKey(0)
+    pixels = vd.Tensor.zeros(dtype=vd.f32, shape=(HEIGHT, WIDTH))
+    window = "VernonDSL Julia Set"
+    cv2.namedWindow(window)
+    try:
+        for frame in range(arguments.frames):
+            paint(
+                pixels,
+                arguments.time + frame * arguments.time_step,
+                grid=(WIDTH, HEIGHT, 1),
+            )
+            cv2.imshow(window, pixels.to_numpy())
+            if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+                break
+    finally:
+        cv2.destroyWindow(window)
 
 
 if __name__ == "__main__":

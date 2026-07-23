@@ -152,7 +152,17 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: llvm-project/install
-          key: windows-x64-llvm-${{ steps.llvm-revision.outputs.sha }}-vs17-v1
+          key: windows-x64-llvm-${{ steps.llvm-revision.outputs.sha }}-vs17-libdevice-cu12.9.86-v1
+
+      - name: Install NVIDIA libdevice
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          uv pip install --target llvm-project/nvidia-nvcc `
+            --no-cache nvidia-cuda-nvcc-cu12==12.9.86
+          $libdevice = Resolve-Path `
+            "llvm-project/nvidia-nvcc/nvidia/cuda_nvcc/nvvm/libdevice/libdevice.10.bc"
+          "LIBDEVICE_PATH=$libdevice" >> $env:GITHUB_ENV
 
       - name: Configure LLVM
         if: steps.llvm-cache.outputs.cache-hit != 'true'
@@ -169,6 +179,8 @@ jobs:
             -DLLVM_INCLUDE_BENCHMARKS=OFF `
             -DLLVM_INCLUDE_DOCS=OFF `
             -DLLVM_INSTALL_UTILS=ON `
+            -DMLIR_NVVM_EMBED_LIBDEVICE=ON `
+            -DMLIR_NVVM_LIBDEVICE_PATH="$env:LIBDEVICE_PATH" `
             -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE/llvm-project/install"
 
       - name: Build and install LLVM
@@ -182,7 +194,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: llvm-project/install
-          key: windows-x64-llvm-${{ steps.llvm-revision.outputs.sha }}-vs17-v1
+          key: windows-x64-llvm-${{ steps.llvm-revision.outputs.sha }}-vs17-libdevice-cu12.9.86-v1
 
       - name: Install Python build environment
         run: uv sync --extra build --frozen

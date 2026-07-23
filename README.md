@@ -52,9 +52,15 @@ Prerequisites are CMake, a C/C++ toolchain, Python 3.11, and
 [uv](https://docs.astral.sh/uv/). Build and install LLVM/MLIR once:
 
 ```powershell
+uv pip install --target llvm-project/nvidia-nvcc `
+  nvidia-cuda-nvcc-cu12==12.9.86
+$libdevice = Resolve-Path `
+  llvm-project/nvidia-nvcc/nvidia/cuda_nvcc/nvvm/libdevice/libdevice.10.bc
 cmake -S llvm-project/llvm -B llvm-project/build `
   -DLLVM_ENABLE_PROJECTS="mlir;lld" `
   -DLLVM_TARGETS_TO_BUILD="X86;AArch64;NVPTX;AMDGPU" `
+  -DMLIR_NVVM_EMBED_LIBDEVICE=ON `
+  -DMLIR_NVVM_LIBDEVICE_PATH="$libdevice" `
   -DCMAKE_INSTALL_PREFIX="$PWD/llvm-project/install"
 cmake --build llvm-project/build --config Release --target install --parallel 4
 ```
@@ -73,9 +79,14 @@ ctest --test-dir build -C Release --output-on-failure
 On a single-configuration Linux or macOS generator, use the equivalent:
 
 ```bash
+uv pip install --target llvm-project/nvidia-nvcc \
+  nvidia-cuda-nvcc-cu12==12.9.86
+LIBDEVICE="$PWD/llvm-project/nvidia-nvcc/nvidia/cuda_nvcc/nvvm/libdevice/libdevice.10.bc"
 cmake -S llvm-project/llvm -B llvm-project/build \
   -DLLVM_ENABLE_PROJECTS="mlir;lld" \
   -DLLVM_TARGETS_TO_BUILD="X86;AArch64;NVPTX;AMDGPU" \
+  -DMLIR_NVVM_EMBED_LIBDEVICE=ON \
+  -DMLIR_NVVM_LIBDEVICE_PATH="$LIBDEVICE" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$PWD/llvm-project/install"
 cmake --build llvm-project/build --target install --parallel 4
@@ -98,10 +109,13 @@ it does not rely on software inherited from the runner image.
 
 The Runtime and style jobs do not check out or build LLVM. The Compiler job
 builds a reduced `mlir;lld` LLVM installation on the first run, then caches the
-installation by the pinned `llvm-project` submodule revision. Consequently, the
-first run after changing that revision is expected to be much slower. Later
-runs reuse the matching installation; changing the LLVM build recipe requires
-bumping the cache recipe suffix in `.github/workflows/windows-ci.yml`.
+installation by the pinned `llvm-project` submodule revision. It obtains
+NVIDIA's redistributable `libdevice.10.bc` from the pinned
+`nvidia-cuda-nvcc-cu12` package and embeds it in MLIR's NVVM target library, so
+the published compiler wheel does not require a CUDA Toolkit installation.
+Consequently, the first run after changing the LLVM revision, libdevice
+version, or cache recipe is expected to be much slower. Later runs reuse the
+matching installation.
 
 Configure the Runtime subproject directly without LLVM/MLIR:
 

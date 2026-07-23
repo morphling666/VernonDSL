@@ -261,6 +261,14 @@ validates marker operands, SSA IDs, and that count before materializing
 `OpImageQuerySizeLod` in the serialized binary; any mismatch fails compilation.
 SPIRV-Cross therefore receives the target instruction and emits `textureSize`.
 
+## Power operator
+
+`base ** exponent` is the operator spelling of the floating-point `pow`
+intrinsic and accepts literal or dynamic exponents. CUDA compiler builds embed
+NVIDIA's redistributable `libdevice.10.bc` into MLIR's NVVM target support, so
+generated PTX has no end-user CUDA Toolkit dependency. Integer literals inherit
+the floating-point type of the other operand.
+
 ## Persistent asset contract
 
 `vernon-cook-shader` emits one schema-2 `*.pipeline.json` manifest and

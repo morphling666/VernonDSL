@@ -388,6 +388,38 @@ def transform(
         self.assertIn("vernon.set = 1 : i64", output)
         self.assertIn("vernon.binding = 2 : i64", output)
 
+    def test_power_operator_lowers_literal_and_dynamic_exponents(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@func
+def scalar_power(value: f32) -> f32:
+    return value ** 2.5
+
+@func
+def vector_power(value: vec2[f32], exponent: vec2[f32]) -> vec2[f32]:
+    return value ** exponent
+
+@func
+def integer_literal(value: f32) -> f32:
+    return value ** 2
+"""
+        output = compile_source(source, "power.py")
+        self.assertEqual(output.count('name = "pow"'), 3)
+        self.assertIn("arith.constant 2.5 : f32", output)
+        self.assertIn("arith.constant 2.0 : f32", output)
+
+    def test_power_operator_rejects_integer_base(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@func
+def integer_power(value: i32, exponent: i32) -> i32:
+    return value ** exponent
+"""
+        with self.assertRaisesRegex(CompileError, "power requires floating-point operands"):
+            compile_source(source, "integer_power.py")
+
     def test_vertex_fragment_and_compute(self) -> None:
         source = """
 from vernon_dsl import *
