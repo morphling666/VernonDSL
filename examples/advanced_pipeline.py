@@ -13,34 +13,34 @@ PICKING = vd.feature("PICKING")
 
 @vd.struct
 class VertexData:
-    position: Annotated[vd.vec4[vd.f32], vd.builtin("position")]
-    local_color: Annotated[vd.vec2[vd.f32], vd.location(0)]
+    position: Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]
+    local_color: Annotated[vd.Vector[vd.f32, 2], vd.location(0)]
 
 
 @vd.struct
 class GBuffer:
-    color: Annotated[vd.vec4[vd.f32], vd.location(0)]
-    object_id: Annotated[vd.vec4[vd.f32], vd.location(1)]
+    color: Annotated[vd.Vector[vd.f32, 4], vd.location(0)]
+    object_id: Annotated[vd.Vector[vd.f32, 4], vd.location(1)]
 
 
 @vd.vertex
 def vertex_main(
-    position: Annotated[vd.vec2[vd.f32], vd.location(0)],
-    offset: Annotated[vd.vec2[vd.f32], vd.instance(location=1)],
+    position: Annotated[vd.Vector[vd.f32, 2], vd.location(0)],
+    offset: Annotated[vd.Vector[vd.f32, 2], vd.instance(location=1)],
 ) -> VertexData:
-    clip_position = vd.vec4(position + offset, 0.0, 1.0)
-    local_color = position + vd.vec2(0.5, 0.5)
+    clip_position = vd.Vector([position + offset, 0.0, 1.0])
+    local_color = position + vd.Vector([0.5, 0.5])
     return VertexData(clip_position, local_color)
 
 
 @vd.fragment
 def fragment_main(
-    local_color: Annotated[vd.vec2[vd.f32], vd.varying(), vd.location(0)],
+    local_color: Annotated[vd.Vector[vd.f32, 2], vd.varying(), vd.location(0)],
 ) -> GBuffer:
-    color = vd.vec4(local_color, 1.0, 1.0)
-    object_id = vd.vec4(0.0, 0.0, 0.0, 1.0)
+    color = vd.Vector([local_color, 1.0, 1.0])
+    object_id = vd.Vector([0.0, 0.0, 0.0, 1.0])
     if PICKING:
-        object_id = vd.vec4(1.0, 0.25, 0.0, 1.0)
+        object_id = vd.Vector([1.0, 0.25, 0.0, 1.0])
     return GBuffer(color, object_id)
 
 
@@ -82,14 +82,14 @@ def main() -> None:
         features=() if args.no_picking else {"PICKING"},
     )
 
-    positions = vd.Tensor.from_numpy(
+    positions = vd.storage.from_numpy(
         np.array(
             ((-0.09, -0.09), (0.09, -0.09), (0.09, 0.09), (-0.09, 0.09)),
             dtype=np.float32,
         )
     )
-    indices = vd.Tensor.from_numpy(np.array((0, 1, 2, 0, 2, 3), dtype=np.uint32))
-    offsets = vd.Tensor.zeros(dtype=vd.f32, shape=(args.instances, 2))
+    indices = vd.storage.from_numpy(np.array((0, 1, 2, 0, 2, 3), dtype=np.uint32))
+    offsets = vd.storage.zeros(dtype=vd.f32, shape=(args.instances, 2))
     color = vd.Texture.zeros(shape=(args.size, args.size))
     object_id = vd.Texture.zeros(shape=(args.size, args.size))
     base_x = np.linspace(-0.75, 0.75, args.instances, dtype=np.float32)

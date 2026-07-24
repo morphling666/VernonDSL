@@ -8,6 +8,23 @@ endif()
 option(VERNON_ENABLE_GLFW_CONTEXT_OWNER "Build the Python GLFW OpenGL context-owner module"
        ${_vernon_gl_context_default})
 
+set(VERNON_PYTHON_PACKAGE_DIR "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl")
+
+function(vernon_set_python_module_output target)
+    set_target_properties(
+        ${target}
+        PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${VERNON_PYTHON_PACKAGE_DIR}"
+                   RUNTIME_OUTPUT_DIRECTORY "${VERNON_PYTHON_PACKAGE_DIR}"
+                   LIBRARY_OUTPUT_DIRECTORY_DEBUG "${VERNON_PYTHON_PACKAGE_DIR}"
+                   LIBRARY_OUTPUT_DIRECTORY_RELEASE "${VERNON_PYTHON_PACKAGE_DIR}"
+                   LIBRARY_OUTPUT_DIRECTORY_RELWITHDEBINFO "${VERNON_PYTHON_PACKAGE_DIR}"
+                   LIBRARY_OUTPUT_DIRECTORY_MINSIZEREL "${VERNON_PYTHON_PACKAGE_DIR}"
+                   RUNTIME_OUTPUT_DIRECTORY_DEBUG "${VERNON_PYTHON_PACKAGE_DIR}"
+                   RUNTIME_OUTPUT_DIRECTORY_RELEASE "${VERNON_PYTHON_PACKAGE_DIR}"
+                   RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${VERNON_PYTHON_PACKAGE_DIR}"
+                   RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${VERNON_PYTHON_PACKAGE_DIR}")
+endfunction()
+
 if(VERNON_ENABLE_GLFW_CONTEXT_OWNER)
     include("${VERNON_REPOSITORY_ROOT}/cmake/IncludeGlfw.cmake")
     include_glfw()
@@ -44,15 +61,18 @@ if(TARGET VernonRuntime AND TARGET VernonDSLCompiler)
         endif()
         if(nanobind_FOUND)
             nanobind_add_module(vernon-dsl-native python/native_module.cpp)
+            vernon_set_python_module_output(vernon-dsl-native)
             target_link_libraries(vernon-dsl-native PRIVATE VernonDSLCompiler Vernon::Runtime)
             if(MSVC)
                 target_compile_options(vernon-dsl-native PRIVATE /EHsc)
-                add_custom_command(
-                    TARGET vernon-dsl-native
-                    POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:VernonRuntime>
-                            $<TARGET_FILE_DIR:vernon-dsl-native>)
             endif()
+            add_custom_command(
+                TARGET vernon-dsl-native
+                POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:VernonDSLCompiler>
+                        $<TARGET_FILE_DIR:vernon-dsl-native>
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:VernonRuntime>
+                        $<TARGET_FILE_DIR:vernon-dsl-native>)
             set_target_properties(vernon-dsl-native PROPERTIES OUTPUT_NAME "_native")
             if(APPLE)
                 set_target_properties(vernon-dsl-native PROPERTIES INSTALL_RPATH "@loader_path")
@@ -65,6 +85,7 @@ if(TARGET VernonRuntime AND TARGET VernonDSLCompiler)
                 LIBRARY DESTINATION vernon_dsl COMPONENT VernonWheel)
             if(VERNON_ENABLE_GLFW_CONTEXT_OWNER AND TARGET glfw)
                 nanobind_add_module(vernon-dsl-gl-context python/gl_context_module.cpp)
+                vernon_set_python_module_output(vernon-dsl-gl-context)
                 target_link_libraries(vernon-dsl-gl-context PRIVATE glfw)
                 if(MSVC)
                     target_compile_options(vernon-dsl-gl-context PRIVATE /EHsc)

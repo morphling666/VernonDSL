@@ -141,7 +141,7 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
     VernonDeviceBuffer *buffer = vernonRuntimeBufferAllocate(runtime, 4 * sizeof(float), alignof(float));
     ASSERT_TRUE(buffer);
     const uint64_t shape[] = {4};
-    const uint64_t strides[] = {sizeof(float)};
+    const int64_t strides[] = {sizeof(float)};
     const float factor = 3.0f;
     VernonPipelineArgument arguments[2]{};
     arguments[0].slot = 0;

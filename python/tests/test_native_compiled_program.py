@@ -1,35 +1,17 @@
 from __future__ import annotations
 
 import gc
-import importlib.util
 import json
 import struct
-import sys
 import unittest
-from pathlib import Path
-from types import ModuleType
 
-
-def _load_native() -> ModuleType:
-    if len(sys.argv) < 2 or not Path(sys.argv[1]).is_file():
-        from vernon_dsl._runtime.session import _native
-
-        return _native
-    module_path = Path(sys.argv.pop(1)).resolve()
-    spec = importlib.util.spec_from_file_location("_native", module_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load native module: {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-native = _load_native()
+from vernon_dsl import _native as native
+from vernon_dsl.frontend.lowering import compile_source
 
 CPU_MODULE = r"""
 module {
   func.func @increment(
-      %values: !vernon.buffer<f32, "read_write"> {
+      %values: !vernon.tensor_view<f32, 1, "read_write"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
         vernon.binding = 0 : i64,
@@ -41,14 +23,18 @@ module {
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",
-        vernon.workgroup_size = array<i32: 1, 1, 1>
+        vernon.workgroup_size = array<i32: 1, 1, 1>,
+        vernon.storage_effects = [
+          {kind = "read", owner = "values", region = "unknown"},
+          {kind = "write", owner = "values", region = "unknown"}
+        ]
       } {
-    %value = "vernon.intrinsic"(%values, %id) {name = "buffer_load"} :
-        (!vernon.buffer<f32, "read_write">, index) -> f32
+    %value = "vernon.intrinsic"(%values, %id) {name = "tensor_view_load"} :
+        (!vernon.tensor_view<f32, 1, "read_write">, index) -> f32
     %one = arith.constant 1.0 : f32
     %sum = arith.addf %value, %one : f32
-    "vernon.intrinsic"(%values, %id, %sum) {name = "buffer_store"} :
-        (!vernon.buffer<f32, "read_write">, index, f32) -> ()
+    "vernon.intrinsic"(%values, %id, %sum) {name = "tensor_view_store"} :
+        (!vernon.tensor_view<f32, 1, "read_write">, index, f32) -> ()
     return
   }
 }
@@ -82,8 +68,112 @@ module {
 }
 """
 
+CPU_TUPLE_MODULE = r"""
+module attributes {
+  vernon.frontend = "python",
+  vernon.frontend_version = 3 : i64,
+  vernon.value_abi_version = 1 : i64
+} {
+  "vernon.struct"() {
+    abi_alignment = 8 : i64,
+    abi_field_offsets = array<i64: 0, 8>,
+    abi_size = 16 : i64,
+    fields = ["value:f32", "weight:f64"],
+    sym_name = "ReflectedRecord"
+  } : () -> ()
+  func.func @tuple_first(
+      %value: f32 {
+        vernon.interface = "input",
+        vernon.location = 0 : i64
+      }) -> (f32 {
+        vernon.interface = "output",
+        vernon.location = 0 : i64
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "fragment"
+      } {
+    %constant = arith.constant 2 : i32
+    %tuple = "vernon.tuple_create"(%value, %constant)
+        : (f32, i32) -> tuple<f32, i32>
+    %first = "vernon.tuple_get"(%tuple) {index = 0 : i64}
+        : (tuple<f32, i32>) -> f32
+    return %first : f32
+  }
+}
+"""
+
+CPU_TUPLE_ENTRY_MODULE = r"""
+module attributes {
+  vernon.frontend = "python",
+  vernon.frontend_version = 4 : i64,
+  vernon.value_abi_version = 1 : i64
+} {
+  func.func @tuple_passthrough(
+      %value: tuple<f32, i32> {
+        vernon.abi_alignment = 4 : i64,
+        vernon.abi_field_offsets = array<i64: 0, 4>,
+        vernon.abi_size = 8 : i64,
+        vernon.interface = "input",
+        vernon.location = 0 : i64
+      }
+    ) -> (
+      tuple<f32, i32> {
+        vernon.abi_alignment = 4 : i64,
+        vernon.abi_field_offsets = array<i64: 0, 4>,
+        vernon.abi_size = 8 : i64,
+        vernon.interface = "output",
+        vernon.location = 0 : i64
+      }
+    ) attributes {
+      vernon.entry,
+      vernon.stage = "compute",
+      vernon.workgroup_size = array<i32: 1, 1, 1>
+    } {
+    return %value : tuple<f32, i32>
+  }
+}
+"""
+
 
 class CompiledProgramTests(unittest.TestCase):
+    def test_graphics_dynamic_bounds_structured_loop_compiles(self) -> None:
+        module = compile_source(
+            "from vernon_dsl import *\n"
+            "@fragment\n"
+            "def main(start: i32, stop: i32) -> i32:\n"
+            "    result = 0\n"
+            "    for index in range(start, stop, 1):\n"
+            "        result += i32(index)\n"
+            "    return result\n",
+            "graphics_loop.py",
+        )
+        for target, options in (
+            (native.Target.VULKAN, {}),
+            (native.Target.OPENGL, {"glsl_version": 330}),
+            (native.Target.OPENGL_ES, {"glsl_version": 310}),
+        ):
+            with self.subTest(target=target):
+                program = native.Compiler().compile_program_result(module, target, **options)
+                self.assertTrue(program.ok, program.diagnostics)
+
+    def test_spirv_dynamic_step_reports_contract_capability(self) -> None:
+        module = compile_source(
+            "from vernon_dsl import *\n"
+            "@fragment\n"
+            "def main(start: i32, stop: i32, step: i32) -> i32:\n"
+            "    result = 0\n"
+            "    for index in range(start, stop, step):\n"
+            "        result += i32(index)\n"
+            "    return result\n",
+            "graphics_dynamic_step.py",
+        )
+        program = native.Compiler().compile_program_result(module, native.Target.VULKAN)
+        self.assertFalse(program.ok)
+        self.assertIn(
+            "SPIR-V targets do not support dynamic range steps",
+            program.diagnostics,
+        )
+
     def test_named_artifacts_and_reflection(self) -> None:
         compiler = native.Compiler()
         program = compiler.compile_program_result(MULTI_ENTRY_MODULE, native.Target.OPENGL, glsl_version=330)
@@ -109,6 +199,13 @@ class CompiledProgramTests(unittest.TestCase):
         reflection = json.loads(program.reflection)
         self.assertEqual(reflection["target"], "cpu")
         self.assertTrue(reflection["target_options"]["target_triple"])
+        self.assertEqual(
+            reflection["entries"][0]["effects"],
+            [
+                {"kind": "read", "owner": "values", "region": "unknown", "indices": []},
+                {"kind": "write", "owner": "values", "region": "unknown", "indices": []},
+            ],
+        )
 
         runtime = native.Runtime(native.RuntimeBackend.CPU)
         with self.assertRaisesRegex(RuntimeError, "CPU entry 'missing' was not found"):
@@ -121,6 +218,74 @@ class CompiledProgramTests(unittest.TestCase):
         values.upload(struct.pack("=3f", 2.0, 4.0, 6.0))
         kernel.launch(3, 1, 1, [values])
         self.assertEqual(struct.unpack("=3f", values.download()), (3.0, 5.0, 7.0))
+
+    def test_cpu_tuple_create_and_constant_extract_lowering(self) -> None:
+        program = native.Compiler().compile_program_result(CPU_TUPLE_MODULE, native.Target.CPU)
+        self.assertTrue(program.ok, program.diagnostics)
+        self.assertTrue(program.has_cpu_entry("tuple_first"))
+        reflection = json.loads(program.reflection)
+        self.assertEqual(reflection["value_abi_version"], 1)
+        self.assertEqual(
+            reflection["struct_layouts"],
+            [
+                {
+                    "alignment": 8,
+                    "field_offsets": [0, 8],
+                    "fields": ["value:f32", "weight:f64"],
+                    "name": "ReflectedRecord",
+                    "size": 16,
+                }
+            ],
+        )
+        vulkan = native.Compiler().compile_program_result(CPU_TUPLE_MODULE, native.Target.VULKAN)
+        self.assertTrue(vulkan.ok, vulkan.diagnostics)
+        self.assertEqual(json.loads(vulkan.reflection)["struct_layouts"], reflection["struct_layouts"])
+        opengl = native.Compiler().compile_program_result(
+            CPU_TUPLE_MODULE,
+            native.Target.OPENGL,
+            glsl_version=450,
+        )
+        self.assertTrue(opengl.ok, opengl.diagnostics)
+        self.assertEqual(json.loads(opengl.reflection)["struct_layouts"], reflection["struct_layouts"])
+
+    def test_cpu_tuple_entry_uses_portable_value_abi(self) -> None:
+        program = native.Compiler().compile_program_result(CPU_TUPLE_ENTRY_MODULE, native.Target.CPU)
+        self.assertTrue(program.ok, program.diagnostics)
+        entry = json.loads(program.reflection)["entries"][0]
+        self.assertEqual(entry["cpu_arguments_size"], 8)
+        self.assertEqual(entry["cpu_results_size"], 8)
+        self.assertEqual(entry["arguments"][0]["vernon.abi_field_offsets"], [0, 4])
+        self.assertEqual(entry["results"][0]["vernon.abi_field_offsets"], [0, 4])
+
+    def test_tuple_and_struct_aggregates_lower_on_every_backend(self) -> None:
+        from vernon_dsl import compile_source
+
+        module = compile_source(
+            "from vernon_dsl import *\n"
+            "@struct\n"
+            "class Pair:\n"
+            "    first: f32\n"
+            "    second: i32\n"
+            "@kernel\n"
+            "def aggregate_kernel() -> None:\n"
+            "    pairs = Tensor([Tuple(1.0, 2), Tuple(3.0, 4)])\n"
+            "    pair = pairs[1]\n"
+            "    value = Pair(pair[0], pair[1])\n"
+            "    copy = Pair(value.first, value.second)\n",
+            "aggregate_backends.py",
+        )
+        layouts: list[object] = []
+        for target in (
+            native.Target.CPU,
+            native.Target.CUDA,
+            native.Target.VULKAN,
+            native.Target.OPENGL,
+        ):
+            with self.subTest(target=target):
+                program = native.Compiler().compile_program_result(module, target)
+                self.assertTrue(program.ok, program.diagnostics)
+                layouts.append(json.loads(program.reflection)["struct_layouts"])
+        self.assertTrue(all(layout == layouts[0] for layout in layouts[1:]))
 
     def test_diagnostics_and_target_options(self) -> None:
         compiler = native.Compiler()

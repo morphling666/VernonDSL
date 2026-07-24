@@ -8,6 +8,7 @@
 #include "runtime_state.h"
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct VernonDeviceBuffer;
@@ -25,7 +26,7 @@ struct CpuBufferState {
 };
 
 struct CpuPipelineState {
-    VernonLoadedKernel *kernel{};
+    std::unordered_map<std::string, VernonLoadedKernel *> kernels;
 };
 
 inline CpuBufferState &cpuBufferState(VernonDeviceBuffer &buffer) {

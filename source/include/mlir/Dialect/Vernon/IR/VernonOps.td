@@ -26,7 +26,25 @@ def Vernon_StructCreateOp : Vernon_Op<"struct_create", [Pure]> {
 
 def Vernon_StructGetOp : Vernon_Op<"struct_get", [Pure]> {
   let summary = "Extract a named field from a DSL struct value";
-  let arguments = (ins AnyType:$input, StrAttr:$field);
+  let arguments = (ins AnyType:$input, StrAttr:$field, I64Attr:$index);
+  let results = (outs AnyType:$result);
+}
+
+def Vernon_TupleCreateOp : Vernon_Op<"tuple_create", [Pure]> {
+  let summary = "Construct a structural Tuple value";
+  let arguments = (ins Variadic<AnyType>:$elements);
+  let results = (outs AnyType:$result);
+}
+
+def Vernon_TupleGetOp : Vernon_Op<"tuple_get", [Pure]> {
+  let summary = "Extract a constant-indexed Tuple element";
+  let arguments = (ins AnyType:$input, I64Attr:$index);
+  let results = (outs AnyType:$result);
+}
+
+def Vernon_TensorGetOp : Vernon_Op<"tensor_get", [Pure]> {
+  let summary = "Extract an element from an aggregate-element Tensor Value";
+  let arguments = (ins AnyType:$input, Variadic<Index>:$indices);
   let results = (outs AnyType:$result);
 }
 

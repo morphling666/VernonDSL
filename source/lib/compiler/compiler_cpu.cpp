@@ -8,6 +8,7 @@
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonCpuPipeline.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
@@ -82,27 +83,49 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
 
         for (unsigned index = 0; index < function.getNumArguments(); ++index) {
             mlir::Type type = function.getArgumentTypes()[index];
-            uint64_t size = sourceTypeSize(type);
+            mlir::DictionaryAttr attrs = function.getArgAttrDict(index);
+            mlir::IntegerAttr reflectedSize;
+            mlir::IntegerAttr reflectedAlignment;
+            if (attrs) {
+                reflectedSize = attrs.getAs<mlir::IntegerAttr>("vernon.abi_size");
+                reflectedAlignment = attrs.getAs<mlir::IntegerAttr>("vernon.abi_alignment");
+            }
+            uint64_t size = reflectedSize ? static_cast<uint64_t>(reflectedSize.getInt()) : sourceTypeSize(type);
             if (size == 0) {
                 diagnostics = "unsupported CPU ABI argument type in entry '" + function.getSymName().str() + "'";
                 return false;
             }
-            uint64_t alignment = size >= 16 ? 16 : size >= 8 ? 8 : 4;
+            uint64_t alignment = reflectedAlignment ? static_cast<uint64_t>(reflectedAlignment.getInt())
+                                 : size >= 16       ? 16
+                                 : size >= 8        ? 8
+                                                    : 4;
             metadata.argumentsSize = llvm::alignTo(metadata.argumentsSize, alignment);
 
-            vernon::CpuAbiArgumentPacking packing{metadata.argumentsSize, size,
-                                                  mlir::isa<mlir::vernon::BufferType>(type)
-                                                      ? vernon::CpuAbiArgumentKind::Buffer
+            vernon::CpuAbiArgumentPacking packing{metadata.argumentsSize,
+                                                  size,
+                                                  mlir::isa<mlir::vernon::TensorViewType>(type)
+                                                      ? vernon::CpuAbiArgumentKind::TensorView
                                                       : vernon::CpuAbiArgumentKind::Direct,
-                                                  0};
-            if (packing.kind == vernon::CpuAbiArgumentKind::Buffer) {
-                auto attrs = function.getArgAttrDict(index);
+                                                  0,
+                                                  {}};
+            if (packing.kind == vernon::CpuAbiArgumentKind::TensorView) {
+                auto view = mlir::cast<mlir::vernon::TensorViewType>(type);
+                mlir::FailureOr<mlir::vernon::StorageLayout> layout =
+                    mlir::vernon::resolveStorageLayout(view.getElementType(), module);
+                if (mlir::failed(layout)) {
+                    diagnostics =
+                        "invalid aggregate TensorView layout in CPU entry '" + function.getSymName().str() + "'";
+                    return false;
+                }
+                for (const mlir::vernon::StorageLeaf &leaf : layout->leaves)
+                    packing.tensorLeafElementSizes.push_back(
+                        std::max<uint64_t>(leaf.type.getIntOrFloatBitWidth() / 8, 1));
                 if (auto shape = attrs.getAs<mlir::DenseI64ArrayAttr>("vernon.tensor_shape")) {
                     uint64_t extent = 1;
                     for (int64_t dimension : shape.asArrayRef()) {
                         if (dimension < 0 || (dimension != 0 && extent > std::numeric_limits<uint64_t>::max() /
                                                                              static_cast<uint64_t>(dimension))) {
-                            diagnostics = "invalid vernon.tensor_shape on CPU buffer in "
+                            diagnostics = "invalid vernon.tensor_shape on CPU TensorView in "
                                           "entry '" +
                                           function.getSymName().str() + "'";
                             return false;
@@ -120,7 +143,15 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
             diagnostics = "CPU entry '" + function.getSymName().str() + "' has more than one result";
             return false;
         }
-        metadata.resultsSize = function.getNumResults() == 0 ? 0 : sourceTypeSize(function.getResultTypes()[0]);
+        if (function.getNumResults() == 0) {
+            metadata.resultsSize = 0;
+        } else {
+            mlir::DictionaryAttr attrs = function.getResultAttrDict(0);
+            mlir::IntegerAttr reflectedSize =
+                attrs ? attrs.getAs<mlir::IntegerAttr>("vernon.abi_size") : mlir::IntegerAttr();
+            metadata.resultsSize = reflectedSize ? static_cast<uint64_t>(reflectedSize.getInt())
+                                                 : sourceTypeSize(function.getResultTypes()[0]);
+        }
         if (function.getNumResults() != 0 && metadata.resultsSize == 0) {
             diagnostics = "unsupported CPU ABI result type in entry '" + function.getSymName().str() + "'";
             return false;

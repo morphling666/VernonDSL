@@ -201,15 +201,13 @@ class _FeatureSpecializer(ast.NodeTransformer):
             return 1
         constructor = (_dotted_name(value.value) or "").split(".")[-1]
         arguments = list(value.slice.elts) if isinstance(value.slice, ast.Tuple) else [value.slice]
-        if constructor in {"mat2", "mat3", "mat4"}:
-            return int(constructor[-1])
         if (
-            constructor == "mat"
-            and len(arguments) >= 2
-            and isinstance(arguments[1], ast.Constant)
-            and isinstance(arguments[1].value, int)
+            constructor == "Matrix"
+            and len(arguments) == 3
+            and isinstance(arguments[2], ast.Constant)
+            and isinstance(arguments[2].value, int)
         ):
-            return arguments[1].value
+            return arguments[2].value
         if constructor == "Tensor" and len(arguments) >= 2:
             shape = arguments[1].elts if isinstance(arguments[1], ast.Tuple) else arguments[1:]
             if len(shape) == 2 and isinstance(shape[1], ast.Constant) and isinstance(shape[1].value, int):

@@ -54,6 +54,23 @@ struct Output {
     uint32_t location{UINT32_MAX};
 };
 
+enum class PipelineStepKind {
+    Dispatch,
+    Barrier,
+    Draw,
+};
+
+struct PipelineStep {
+    PipelineStepKind kind{PipelineStepKind::Dispatch};
+    std::string stage;
+    std::string vertex;
+    std::string fragment;
+    std::string source;
+    std::string destination;
+    VernonLaunchSize grid{};
+    bool hasGrid{};
+};
+
 struct Variant {
     std::vector<std::string> key;
     std::vector<Parameter> parameters;
@@ -63,6 +80,7 @@ struct Variant {
     std::string vertex;
     std::string fragment;
     bool barrier{};
+    std::vector<PipelineStep> steps;
 
     bool validate(std::string &error) const;
 };

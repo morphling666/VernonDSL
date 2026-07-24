@@ -23,7 +23,7 @@ from ..pipeline_compile import (
     serialize_bundle,
 )
 from ..types import Annotation
-from .resources import Tensor, TensorView, Texture
+from .resources import TensorStorage, TensorView, Texture, _dispatch_borrow_scope
 
 
 def _session_state() -> Any:
@@ -254,7 +254,7 @@ class Pipeline:
             )
         raise RuntimeError("unsupported graphics backend")
 
-    def __call__(self, **arguments: Any) -> None:
+    def _invoke_direct(self, arguments: dict[str, Any]) -> None:
         state = _session_state()
         target = arguments.pop("target", None)
         targets = arguments.pop("targets", None)
@@ -279,6 +279,17 @@ class Pipeline:
         unexpected = set(arguments) - expected - compute_names
         if unexpected:
             raise TypeError(f"unexpected pipeline argument(s): {', '.join(sorted(unexpected))}")
+        access_names = {
+            state._native.ACCESS_READ: "read",
+            state._native.ACCESS_WRITE: "write",
+            state._native.ACCESS_READ_WRITE: "read_write",
+        }
+        dispatch_borrows = [
+            (parameter.name, arguments[parameter.name], access_names[parameter.access])
+            for parameter in parameters
+            if parameter.kind == state._native.PIPELINE_TENSOR
+            and isinstance(arguments[parameter.name], (TensorStorage, TensorView))
+        ]
         builder = compiled.native.invocation_builder()
         dtype_codes = {
             np.dtype(np.bool_): state._native.DATA_BOOL,
@@ -300,7 +311,7 @@ class Pipeline:
                 continue
             if parameter.kind != state._native.PIPELINE_TENSOR:
                 raise TypeError(f"pipeline parameter {parameter.name!r} has unsupported kind")
-            if not isinstance(value, (Tensor, TensorView)):
+            if not isinstance(value, (TensorStorage, TensorView)):
                 scalar = np.asarray(value)
                 if scalar.dtype.kind == "f":
                     scalar = np.asarray(value, dtype=np.float32)
@@ -354,13 +365,14 @@ class Pipeline:
             rendered_targets.append(target)
         if indices is not None:
             if (
-                not isinstance(indices, Tensor)
+                not isinstance(indices, TensorStorage)
                 or indices.dtype != np.dtype(np.uint32)
                 or len(indices.shape) != 1
                 or not indices.shape[0]
             ):
-                raise TypeError("indices must be a non-empty rank-one u32 Tensor")
+                raise TypeError("indices must be a non-empty rank-one u32 TensorStorage")
             builder.index_binding(indices._resident_buffer(), indices.shape[0])
+            dispatch_borrows.append(("indices", indices, "read"))
         native_topology = {
             triangles: state._native.TOPOLOGY_TRIANGLE_LIST,
             lines: state._native.TOPOLOGY_LINE_LIST,
@@ -369,16 +381,24 @@ class Pipeline:
         if native_topology is None:
             raise TypeError("topology must be triangles, lines, or points")
         builder.topology(native_topology)
-        builder.invoke()
         assert state._native_runtime is not None
-        state._native_runtime.synchronize()
-        if self._compute is not None:
-            for name in compute_names:
-                value = arguments.get(name)
-                if isinstance(value, Tensor):
-                    value._mark_device_dirty()
+        with _dispatch_borrow_scope(dispatch_borrows):
+            builder.invoke()
+            state._native_runtime.synchronize()
+            if self._compute is not None:
+                for name in compute_names:
+                    value = arguments.get(name)
+                    if isinstance(value, (TensorStorage, TensorView)):
+                        value._mark_device_dirty()
         for texture in rendered_targets:
             texture._mark_device_dirty()
+
+    def __call__(self, **arguments: Any) -> None:
+        from ..execution import ExecutionGraph
+
+        graph = ExecutionGraph()
+        graph.draw(self, **arguments)
+        graph.run()
 
 
 def pipeline(*stages: Any, features: Iterable[str] = ()) -> Pipeline:

@@ -12,7 +12,7 @@ def shared_polynomial(value: vd.f32) -> vd.f32:
 
 @vd.kernel(workgroup_size=(1, 1, 1))
 def evaluate_shared(
-    output: vd.Tensor[vd.f32, (3,)],
+    output: vd.TensorView[vd.f32, 1, vd.write],
     value: vd.f32,
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:

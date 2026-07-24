@@ -187,7 +187,7 @@ VernonStatus encodeAndSubmitVulkanGraphics(const VulkanGraphicsState &state, con
     const bool hasViewport = invocation.viewport[2] && invocation.viewport[3];
 
     const std::array<uint64_t, 1> resolutionShape{2};
-    const std::array<uint64_t, 1> resolutionStrides{sizeof(float)};
+    const std::array<int64_t, 1> resolutionStrides{sizeof(float)};
     VernonPipelineArgument resolutionArgument{};
     resolutionArgument.kind = VERNON_PIPELINE_TENSOR;
     resolutionArgument.tensor.struct_size = sizeof(VernonTensorView);

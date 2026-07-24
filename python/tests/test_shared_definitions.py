@@ -13,17 +13,17 @@ from shared_kernel import (
 
 
 @vd.func(shared=True)
-def shared_length(value: vd.vec3[vd.f32]) -> vd.f32:
+def shared_length(value: vd.Vector[vd.f32, 3]) -> vd.f32:
     return vd.norm(value)
 
 
 @vd.struct(shared=True)
 class SharedLight:
-    position: vd.vec3[vd.f32]
+    position: vd.Vector[vd.f32, 3]
     intensity: vd.f32
 
     @vd.func(shared=True)
-    def contribution(self, point: vd.vec3[vd.f32]) -> vd.f32:
+    def contribution(self, point: vd.Vector[vd.f32, 3]) -> vd.f32:
         distance = shared_length(self.position - point)
         return self.intensity / (distance * distance)
 
@@ -34,7 +34,7 @@ class SharedLight:
 
 class SharedHostTests(unittest.TestCase):
     def test_shared_function_and_intrinsics_execute_on_host(self) -> None:
-        vector = vd.vec3(3.0, 4.0, 0.0)
+        vector = vd.Vector([3.0, 4.0, 0.0])
         self.assertEqual(vector.dtype, np.float32)
         self.assertAlmostEqual(float(shared_length(vector)), 5.0)
         self.assertTrue(np.allclose(vd.normalize(vector), np.array([0.6, 0.8, 0.0])))
@@ -46,7 +46,7 @@ class SharedHostTests(unittest.TestCase):
 
         self.assertEqual(float(light.position[0]), 1.0)
         self.assertFalse(light.position.flags.writeable)
-        self.assertAlmostEqual(float(light.contribution(vd.vec3(1.0, 2.0, 1.0))), 2.0)
+        self.assertAlmostEqual(float(light.contribution(vd.Vector([1.0, 2.0, 1.0]))), 2.0)
         with self.assertRaisesRegex(AttributeError, "immutable"):
             light.intensity = vd.f32(2.0)
         with self.assertRaises(ValueError):
@@ -71,7 +71,7 @@ class SharedHostTests(unittest.TestCase):
 
     def test_shared_helper_matches_cpu_compilation(self) -> None:
         vd.init(arch=vd.cpu)
-        output = vd.Tensor.zeros(dtype=vd.f32, shape=(3,))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(3,))
         evaluate_shared(output, 2.0, grid=(3, 1, 1))
         expected = np.array(
             [shared_polynomial(vd.f32(value)) for value in (2.0, 3.0, 4.0)],
@@ -87,15 +87,15 @@ from vernon_dsl import *
 
 @struct(shared=True)
 class Light:
-    position: vec3[f32]
+    position: Vector[f32, 3]
     intensity: f32
 
     @func(shared=True)
-    def distance(self, point: vec3[f32]) -> f32:
+    def distance(self, point: Vector[f32, 3]) -> f32:
         return norm(self.position - point)
 
     @func(shared=True)
-    def contribution(self, point: vec3[f32]) -> f32:
+    def contribution(self, point: Vector[f32, 3]) -> f32:
         distance = self.distance(point)
         return self.intensity / (distance * distance)
 
@@ -104,19 +104,19 @@ class Light:
         return value + self.intensity
 
 @func(shared=True)
-def evaluate(light: Light, point: vec3[f32]) -> f32:
+def evaluate(light: Light, point: Vector[f32, 3]) -> f32:
     return light.contribution(point)
 
 @func
-def make_light(position: vec3[f32], intensity: f32) -> Light:
+def make_light(position: Vector[f32, 3], intensity: f32) -> Light:
     return Light(position, intensity)
 
 @func
-def evaluate_factory(position: vec3[f32], intensity: f32) -> f32:
+def evaluate_factory(position: Vector[f32, 3], intensity: f32) -> f32:
     return make_light(position, intensity).device_bias(1.0)
 
 @fragment
-def main(light: Light, point: vec3[f32]) -> f32:
+def main(light: Light, point: Vector[f32, 3]) -> f32:
     return light.device_bias(evaluate(light, point))
 """
         output = vd.compile_source(source, "shared_methods.py")

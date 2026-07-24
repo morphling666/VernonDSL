@@ -208,6 +208,17 @@ struct PipelineOutputMetadata {
     uint32_t location{};
 };
 
+struct PipelineStepMetadata {
+    VernonPipelineStepKind kind{};
+    std::string stage;
+    std::string vertex;
+    std::string fragment;
+    std::string source;
+    std::string destination;
+    bool hasGrid{};
+    VernonLaunchSize grid{};
+};
+
 PipelineParameterMetadata parameterMetadata(const VernonPipelineParameterView &view) {
     PipelineParameterMetadata result;
     result.slot = view.slot;
@@ -260,7 +271,7 @@ struct PipelineInvocationBuilder {
     struct OwnedArgument {
         VernonPipelineArgument value{};
         std::vector<uint64_t> shape;
-        std::vector<uint64_t> strides;
+        std::vector<int64_t> strides;
         nb::object hostOwner;
     };
 
@@ -303,17 +314,30 @@ struct PipelineInvocationBuilder {
         if (signedStrides.size() != argument.shape.size())
             throw std::invalid_argument("NumPy Tensor shape/stride mismatch");
         argument.strides.reserve(signedStrides.size());
-        size_t span = nb::cast<size_t>(array.attr("dtype").attr("itemsize"));
+        const size_t elementSize = nb::cast<size_t>(array.attr("dtype").attr("itemsize"));
+        size_t before = 0;
+        size_t after = 0;
         for (size_t dimension = 0; dimension < signedStrides.size(); ++dimension) {
-            if (signedStrides[dimension] <= 0 || !argument.shape[dimension])
-                throw std::invalid_argument("NumPy Tensor dimensions and strides must be positive");
-            const uint64_t stride = static_cast<uint64_t>(signedStrides[dimension]);
+            if (!argument.shape[dimension])
+                throw std::invalid_argument("NumPy Tensor dimensions must be positive");
+            const int64_t stride = signedStrides[dimension];
+            const uint64_t magnitude =
+                stride < 0 ? static_cast<uint64_t>(-(stride + 1)) + 1 : static_cast<uint64_t>(stride);
             const uint64_t steps = argument.shape[dimension] - 1;
-            if (steps && stride > (std::numeric_limits<size_t>::max() - span) / steps)
+            if (magnitude > std::numeric_limits<size_t>::max() ||
+                (steps && magnitude > std::numeric_limits<size_t>::max() / steps))
                 throw std::invalid_argument("NumPy Tensor byte span overflows");
-            span += static_cast<size_t>(steps * stride);
+            const size_t extent = static_cast<size_t>(steps * magnitude);
+            size_t &bound = stride < 0 ? before : after;
+            if (extent > std::numeric_limits<size_t>::max() - bound)
+                throw std::invalid_argument("NumPy Tensor byte span overflows");
+            bound += extent;
             argument.strides.push_back(stride);
         }
+        if (after > std::numeric_limits<size_t>::max() - before ||
+            elementSize > std::numeric_limits<size_t>::max() - before - after)
+            throw std::invalid_argument("NumPy Tensor byte span overflows");
+        const size_t span = before + after + elementSize;
         const VernonDataType dtype = numpyDataType(array);
         if (dtype != parameter.dtype)
             throw std::invalid_argument("host tensor dtype does not match pipeline reflection");
@@ -321,19 +345,20 @@ struct PipelineInvocationBuilder {
         argument.value.tensor.struct_size = sizeof(VernonTensorView);
         argument.value.tensor.storage = VERNON_TENSOR_HOST;
         argument.value.tensor.host_data =
-            reinterpret_cast<const void *>(nb::cast<uintptr_t>(array.attr("ctypes").attr("data")));
+            reinterpret_cast<const void *>(nb::cast<uintptr_t>(array.attr("ctypes").attr("data")) - before);
         argument.value.tensor.dtype = dtype;
         argument.value.tensor.access = parameter.access;
         argument.value.tensor.rank = static_cast<uint32_t>(argument.shape.size());
         argument.value.tensor.shape = argument.shape.data();
         argument.value.tensor.byte_strides = argument.strides.data();
+        argument.value.tensor.byte_offset = before;
         argument.value.tensor.byte_size = span;
         return *this;
     }
 
     PipelineInvocationBuilder &deviceTensor(const nb::object &identifier, Buffer *buffer, uint32_t dtype,
                                             uint32_t access, const std::vector<uint64_t> &shape,
-                                            const std::vector<uint64_t> &strides, size_t offset) {
+                                            const std::vector<int64_t> &strides, size_t offset) {
         if (!buffer || buffer->owner != owner)
             throw std::invalid_argument("pipeline buffer belongs to another runtime");
         if (shape.size() != strides.size() || shape.empty())
@@ -507,6 +532,21 @@ struct LoadedPipeline {
         return result;
     }
 
+    std::vector<PipelineStepMetadata> steps() const {
+        std::vector<PipelineStepMetadata> result;
+        const size_t count = vernonRuntimeLoadedPipelineGetStepCount(pipeline);
+        result.reserve(count);
+        for (size_t index = 0; index < count; ++index) {
+            VernonPipelineStepView view{};
+            view.struct_size = sizeof(view);
+            if (vernonRuntimeLoadedPipelineGetStepByIndex(pipeline, index, &view) != VERNON_STATUS_OK)
+                throw std::runtime_error("cannot read loaded pipeline step");
+            result.push_back({view.kind, stringView(view.stage), stringView(view.vertex), stringView(view.fragment),
+                              stringView(view.source), stringView(view.destination), view.has_grid != 0, view.grid});
+        }
+        return result;
+    }
+
     Runtime *owner{};
     VernonRuntimeContext *runtime{};
     VernonPipelineBundle *bundle{};
@@ -607,6 +647,27 @@ struct Runtime {
         return std::make_unique<LoadedPipeline>(this, handle, bundle, pipeline);
     }
 
+    std::unique_ptr<LoadedPipeline> loadPipelineAsset(const nb::bytes &data, const std::string &directory,
+                                                      const std::vector<std::string> &features) {
+        VernonPipelineBundleLoadOptions options{};
+        options.struct_size = sizeof(options);
+        options.bundle_directory = directory.c_str();
+        VernonPipelineBundle *bundle =
+            vernonRuntimeLoadPipelineBundleWithOptions(handle, data.c_str(), data.size(), &options);
+        if (!bundle)
+            throw std::runtime_error("cannot load pipeline bundle: " + stringView(vernonRuntimeGetLastError(handle)));
+        std::vector<const char *> names;
+        for (const std::string &feature : features)
+            names.push_back(feature.c_str());
+        VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {names.data(), names.size()});
+        if (!pipeline) {
+            vernonRuntimePipelineBundleDestroy(bundle);
+            throw std::runtime_error("cannot resolve pipeline bundle: " +
+                                     stringView(vernonRuntimeGetLastError(handle)));
+        }
+        return std::make_unique<LoadedPipeline>(this, handle, bundle, pipeline);
+    }
+
     void synchronize() {
         if (vernonRuntimeSynchronize(handle) != VERNON_STATUS_OK)
             throw std::runtime_error("runtime synchronization failed");
@@ -684,6 +745,7 @@ NB_MODULE(_native, module) {
         .def("create_texture", &Runtime::createTexture, nb::keep_alive<0, 1>())
         .def("import_opengl_sampler", &Runtime::importOpenGLSampler, nb::keep_alive<0, 1>())
         .def("load_pipeline", &Runtime::loadPipeline, nb::keep_alive<0, 1>())
+        .def("load_pipeline_asset", &Runtime::loadPipelineAsset, nb::keep_alive<0, 1>())
         .def("synchronize", &Runtime::synchronize);
     nb::class_<Buffer>(module, "Buffer").def("upload", &Buffer::upload).def("download", &Buffer::download);
     nb::class_<LoadedKernel>(module, "LoadedKernel").def("launch", &LoadedKernel::launch);
@@ -708,6 +770,17 @@ NB_MODULE(_native, module) {
         .def_prop_ro("access", [](const PipelineOutputMetadata &value) { return static_cast<uint32_t>(value.access); })
         .def_ro("shape", &PipelineOutputMetadata::shape)
         .def_ro("location", &PipelineOutputMetadata::location);
+    nb::class_<PipelineStepMetadata>(module, "PipelineStep")
+        .def_prop_ro("kind", [](const PipelineStepMetadata &value) { return static_cast<uint32_t>(value.kind); })
+        .def_ro("stage", &PipelineStepMetadata::stage)
+        .def_ro("vertex", &PipelineStepMetadata::vertex)
+        .def_ro("fragment", &PipelineStepMetadata::fragment)
+        .def_ro("source", &PipelineStepMetadata::source)
+        .def_ro("destination", &PipelineStepMetadata::destination)
+        .def_ro("has_grid", &PipelineStepMetadata::hasGrid)
+        .def_prop_ro("grid", [](const PipelineStepMetadata &value) {
+            return nb::make_tuple(value.grid.x, value.grid.y, value.grid.z);
+        });
     nb::class_<PipelineInvocationBuilder>(module, "PipelineInvocationBuilder")
         .def("host_tensor", &PipelineInvocationBuilder::hostTensor, nb::arg("parameter"), nb::arg("array"),
              nb::rv_policy::reference_internal)
@@ -737,7 +810,8 @@ NB_MODULE(_native, module) {
     nb::class_<LoadedPipeline>(module, "LoadedPipeline")
         .def("invocation_builder", &LoadedPipeline::invocationBuilder, nb::keep_alive<0, 1>())
         .def_prop_ro("parameters", &LoadedPipeline::parameters)
-        .def_prop_ro("outputs", &LoadedPipeline::outputs);
+        .def_prop_ro("outputs", &LoadedPipeline::outputs)
+        .def_prop_ro("steps", &LoadedPipeline::steps);
     module.attr("DATA_BOOL") = static_cast<uint32_t>(VERNON_DATA_BOOL);
     module.attr("DATA_I32") = static_cast<uint32_t>(VERNON_DATA_I32);
     module.attr("DATA_U32") = static_cast<uint32_t>(VERNON_DATA_U32);

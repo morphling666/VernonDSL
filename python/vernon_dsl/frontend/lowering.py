@@ -2,26 +2,29 @@ from __future__ import annotations
 
 import ast
 import json
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
 from ..diagnostics import CompileError, SourceLocation
 from ..language.ast_utils import dotted_name as _name
+from ..language.ast_utils import rectangular_literal
 from ..language.syntax import FRONTEND_VERSION, INTRINSIC_METHODS
 from ..module_graph import load_project
 from ..shader_contracts import BUILTIN_CONTRACTS, GENERATED_INTERFACE_CONTRACTS, TypeContract, texture_sampling_contract
 from ..struct_methods import normalize_struct_methods
+from .abi import value_abi_layout
 from .interfaces import plan_generated_interface
 from .model import (
     AccessMode,
     ConcreteType,
-    StorageClass,
+    StorageEffect,
+    StorageRegionKind,
     Termination,
     TypedExpression,
     TypedFunctionInstance,
     TypedStatement,
+    is_abi_stable_value,
 )
 from .monomorphize import infer_and_monomorphize_helpers
 from .request import FrontendCompileRequest, FrontendCompileResult
@@ -47,25 +50,34 @@ class FunctionSignature:
 
 
 @dataclass(frozen=True)
+class _ViewLayout:
+    shape: tuple[int, ...]
+    strides: tuple[int, ...]
+    offset: int
+
+
+@dataclass(frozen=True)
 class Value:
     name: str
     type: DslType
     fields: tuple["Value", ...] | None = None
-    storage: StorageClass = StorageClass.VALUE
     access: AccessMode = AccessMode.READ
+    view_layout: _ViewLayout | None = None
 
     @property
     def abi_type(self) -> DslType:
-        if self.storage is StorageClass.ADDRESSABLE and self.type.kind == "tensor":
-            element = self.type.arguments[0]
+        if self.type.kind == "tensor_view":
+            element, rank, _ = self.type.arguments
             assert isinstance(element, DslType)
-            return DslType("buffer", "Buffer", (element, self.access.value))
+            return DslType("tensor_view_abi", "TensorViewAbi", (element, rank, self.access.value))
         return self.type
 
 
 @dataclass
 class _ModuleContext:
     filename: str
+    runtime_entry: str | None = None
+    tensor_view_layouts: dict[str, _ViewLayout] = field(default_factory=dict)
     structs: dict[str, tuple[tuple[str, AnnotatedType], ...]] = field(default_factory=dict)
     signatures: dict[str, FunctionSignature] = field(default_factory=dict)
     result_annotations: dict[str, AnnotatedType | None] = field(default_factory=dict)
@@ -113,6 +125,16 @@ class _FunctionEmitter:
         self.implicit_samplers: dict[str, Value] = {}
         self.interface_plan = plan_generated_interface(context, self.node, argument_annotations, stage)
         self.returned = False
+        self.loop_controls: list[str] = []
+        self.next_hidden = 0
+        direct_returns = {id(statement) for statement in self.node.body if isinstance(statement, ast.Return)}
+        self.use_return_state = any(
+            isinstance(value, ast.Return) and id(value) not in direct_returns for value in ast.walk(self.node)
+        )
+        self.return_flag_name = self._hidden_name("returned") if self.use_return_state else None
+        self.return_value_name = (
+            self._hidden_name("return_value") if self.use_return_state and self.signature.result is not None else None
+        )
 
     def _index_typed_statements(self, statements: tuple[TypedStatement, ...]) -> None:
         for statement in statements:
@@ -187,6 +209,7 @@ class _FunctionEmitter:
         return fields
 
     def emit(self) -> list[str]:
+        emit_value_abi_metadata = self.stage is not None or self.node.name in self.context.shared_functions
         arguments: list[str] = []
         for index, (argument, annotation) in enumerate(
             zip(self.node.args.args, self.argument_annotations, strict=True)
@@ -194,9 +217,18 @@ class _FunctionEmitter:
             self._validate_builtin_annotation(annotation, "input", f"argument '{argument.arg}'")
             value_type = annotation.type
             typed_parameter = self.typed_function.parameters[index]
-            storage = typed_parameter.storage
             access = typed_parameter.access
-            value = Value(f"%arg{index}", value_type, storage=storage, access=access)
+            view_layout = (
+                self.context.tensor_view_layouts.get(argument.arg)
+                if self.node.name == self.context.runtime_entry and value_type.kind == "tensor_view"
+                else None
+            )
+            value = Value(
+                f"%arg{index}",
+                value_type,
+                access=access,
+                view_layout=view_layout,
+            )
             self.environment[argument.arg] = value
             attributes = self._metadata_attributes(
                 annotation.metadata, stage=self.stage, is_result=False, default_location=index
@@ -208,21 +240,27 @@ class _FunctionEmitter:
                 element_type = annotation.type.arguments[0]
                 assert isinstance(element_type, DslType)
                 attributes.append(f'vernon.dtype = "{element_type.name}"')
-            if storage is StorageClass.ADDRESSABLE and value_type.kind == "tensor":
+            elif annotation.type.kind == "tensor_view":
+                element_type = annotation.type.arguments[0]
+                assert isinstance(element_type, DslType)
+                if element_type.kind == "scalar":
+                    attributes.append(f'vernon.dtype = "{element_type.name}"')
+                attributes.extend(
+                    attribute.replace("vernon.abi_", "vernon.element_abi_")
+                    for attribute in self._abi_attributes(element_type)
+                )
+            if emit_value_abi_metadata and value_type.kind in {"scalar", "tensor", "tuple", "struct"}:
+                attributes.extend(self._abi_attributes(value_type))
+            if value_type.kind == "tensor_view":
+                has_explicit_binding = any(attribute.startswith("vernon.binding") for attribute in attributes)
                 attributes = [
                     attribute
                     for attribute in attributes
                     if not attribute.startswith(("vernon.interface", "vernon.location"))
                 ]
-                attributes.extend(
-                    (
-                        'vernon.interface = "resource"',
-                        "vernon.set = 0 : i64",
-                        f"vernon.binding = {index} : i64",
-                    )
-                )
-                shape = ", ".join(str(value) for value in value_type.arguments[1:])
-                attributes.append(f"vernon.tensor_shape = array<i64: {shape}>")
+                attributes.append('vernon.interface = "resource"')
+                if not has_explicit_binding:
+                    attributes.extend(("vernon.set = 0 : i64", f"vernon.binding = {index} : i64"))
             suffix = f" {{{', '.join(attributes)}}}" if attributes else ""
             arguments.append(f"{value.name}: {value.abi_type.mlir}{suffix}")
         self._append_generated_arguments(arguments)
@@ -238,6 +276,8 @@ class _FunctionEmitter:
                     default_location=0,
                 )
                 result_attributes.append(f'vernon.source_name = "{field_name}"')
+                if emit_value_abi_metadata:
+                    result_attributes.extend(self._abi_attributes(annotation.type))
                 flattened_results.append(f"{annotation.type.mlir} {{{', '.join(result_attributes)}}}")
             result = f" -> ({', '.join(flattened_results)})"
         elif self.signature.result:
@@ -250,28 +290,72 @@ class _FunctionEmitter:
             result_attributes = self._metadata_attributes(
                 result_metadata, stage=self.stage, is_result=True, default_location=0
             )
+            if emit_value_abi_metadata:
+                result_attributes.extend(self._abi_attributes(self.signature.result))
             suffix = f" {{{', '.join(result_attributes)}}}" if result_attributes else ""
             result = f" -> ({self.signature.result.mlir}{suffix})"
         function_attributes: list[str] = []
         if self.stage:
             function_attributes.append("vernon.entry")
             function_attributes.append(f'vernon.stage = "{self.stage}"')
+            reflected_effects: list[str] = []
+            for effect in self.typed_function.effects:
+                if not isinstance(effect, StorageEffect):
+                    continue
+                fields = [
+                    f'kind = "{effect.kind.value}"',
+                    f'owner = "{effect.owner.parameter}"',
+                    f'region = "{effect.region.kind.value}"',
+                ]
+                if effect.region.kind is StorageRegionKind.ELEMENT:
+                    indices = ", ".join(str(index) for index in effect.region.indices)
+                    fields.append(f"indices = array<i64: {indices}>")
+                reflected_effects.append("{" + ", ".join(fields) + "}")
+            function_attributes.append(f"vernon.storage_effects = [{', '.join(reflected_effects)}]")
+        elif emit_value_abi_metadata:
+            function_attributes.append("vernon.shared")
         if self.workgroup_size:
             values = ", ".join(str(value) for value in self.workgroup_size)
             function_attributes.append(f"vernon.workgroup_size = array<i32: {values}>")
         attributes = f" attributes {{{', '.join(function_attributes)}}}" if function_attributes else ""
         visibility = "" if self.stage else " private"
         self.lines.append(f"  func.func{visibility} @{self.node.name}({', '.join(arguments)}){result}{attributes} {{")
-        for statement in self.typed_function.body:
-            self._statement(statement)
-            if statement.termination is Termination.RETURN:
-                break
+        if self.use_return_state:
+            assert self.return_flag_name is not None
+            self.environment[self.return_flag_name] = self._bool_constant(False)
+            if self.return_value_name is not None:
+                assert self.signature.result is not None
+                self.environment[self.return_value_name] = self._default_value(self.node, self.signature.result)
+        self._emit_source_block(self.node.body)
+        if self.use_return_state:
+            value = self.environment[self.return_value_name] if self.return_value_name is not None else None
+            self._emit_function_return(self.node, value)
+            self.returned = True
         if not self.returned:
             if self.signature.result is not None:
                 raise self.context.error(self.node, f"function '{self.node.name}' may exit without returning a value")
             self._line("func.return")
         self.lines.append("  }")
         return self.lines
+
+    def _abi_attributes(self, value_type: DslType) -> list[str]:
+        if value_type.kind not in {"scalar", "tensor", "tuple", "struct"}:
+            return []
+
+        def fields(name: str) -> tuple[DslType, ...]:
+            return tuple(annotation.type for _, annotation in self.context.structs[name])
+
+        layout = value_abi_layout(value_type, fields)
+        attributes = [
+            f"vernon.abi_alignment = {layout.alignment} : i64",
+            f"vernon.abi_size = {layout.size} : i64",
+        ]
+        if layout.field_offsets:
+            offsets = ", ".join(str(offset) for offset in layout.field_offsets)
+            attributes.append(f"vernon.abi_field_offsets = array<i64: {offsets}>")
+        if layout.element_stride is not None:
+            attributes.append(f"vernon.abi_element_stride = {layout.element_stride} : i64")
+        return attributes
 
     def _append_generated_arguments(self, arguments: list[str]) -> None:
         for sampler_plan in self.interface_plan.implicit_samplers:
@@ -382,8 +466,11 @@ class _FunctionEmitter:
             if len(node.targets) == 1 and isinstance(node.targets[0], ast.Subscript):
                 self._store_index(node.targets[0], self._expression(node.value))
                 return
+            if len(node.targets) == 1 and isinstance(node.targets[0], (ast.Tuple, ast.List)):
+                self._destructure(node.targets[0], self._expression(node.value))
+                return
             if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
-                raise self.context.error(node, "assignment target must be a local name or buffer element")
+                raise self.context.error(node, "assignment target must be a local name or TensorView element")
             value = self._expression(node.value)
             if value.type.kind == "void":
                 raise self.context.error(node.value, "a void function call cannot be assigned")
@@ -436,28 +523,31 @@ class _FunctionEmitter:
             if node.value is None:
                 if self.signature.result is not None:
                     raise self.context.error(node, "return value is required")
-                self._line("func.return")
+                value = None
             else:
                 if self.signature.result is None:
                     raise self.context.error(node, "void function cannot return a value")
                 value = self._expression(node.value, self.signature.result)
                 value = self._coerce_implicit(node.value, value, self.signature.result)
-                entry_fields = self._entry_result_fields()
-                if entry_fields is not None:
-                    if value.fields is None or len(value.fields) != len(entry_fields):
-                        raise self.context.error(
-                            node.value,
-                            "entry struct results must be constructed from field values in the entry function",
-                        )
-                    self._line(
-                        "func.return "
-                        + ", ".join(field.name for field in value.fields)
-                        + " : "
-                        + ", ".join(field.type.mlir for field in value.fields)
-                    )
-                else:
-                    self._line(f"func.return {value.name} : {value.type.mlir}")
+            if self.use_return_state:
+                assert self.return_flag_name is not None
+                self.environment[self.return_flag_name] = self._bool_constant(True)
+                if self.return_value_name is not None:
+                    assert value is not None
+                    self.environment[self.return_value_name] = value
+                return
+            self._emit_function_return(node, value)
             self.returned = True
+            return
+        if isinstance(node, ast.Break):
+            if not self.loop_controls:
+                raise self.context.error(node, "break is only valid inside a loop")
+            self.environment[self.loop_controls[-1]] = self._control_constant(1)
+            return
+        if isinstance(node, ast.Continue):
+            if not self.loop_controls:
+                raise self.context.error(node, "continue is only valid inside a loop")
+            self.environment[self.loop_controls[-1]] = self._control_constant(2)
             return
         if isinstance(node, ast.If):
             self._if(node)
@@ -470,6 +560,67 @@ class _FunctionEmitter:
             return
         raise self.context.error(node, f"unsupported statement syntax: {type(node).__name__}")
 
+    def _hidden_name(self, prefix: str) -> str:
+        name = f"${prefix}_{self.next_hidden}"
+        self.next_hidden += 1
+        return name
+
+    def _control_constant(self, value: int) -> Value:
+        result = self._fresh()
+        self._line(f"{result} = arith.constant {value} : i32")
+        return Value(result, DslType("scalar", "i32"))
+
+    def _bool_constant(self, value: bool) -> Value:
+        result = self._fresh()
+        self._line(f"{result} = arith.constant {'true' if value else 'false'}")
+        return Value(result, DslType("scalar", "bool"))
+
+    def _emit_function_return(self, node: ast.AST, value: Value | None) -> None:
+        if value is None:
+            self._line("func.return")
+            return
+        entry_fields = self._entry_result_fields()
+        if entry_fields is None:
+            self._line(f"func.return {value.name} : {value.type.mlir}")
+            return
+        fields = self._struct_value_fields(node, value)
+        if len(fields) != len(entry_fields):
+            raise self.context.error(node, "entry struct result field count does not match its annotation")
+        self._line(
+            "func.return "
+            + ", ".join(field.name for field in fields)
+            + " : "
+            + ", ".join(field.type.mlir for field in fields)
+        )
+
+    def _struct_value_fields(self, node: ast.AST, value: Value) -> tuple[Value, ...]:
+        if value.fields is not None:
+            return value.fields
+        if value.type.kind != "struct":
+            raise self.context.error(node, "entry struct result requires a Struct value")
+        fields: list[Value] = []
+        for index, (name, annotation) in enumerate(self.context.structs[value.type.name]):
+            result = self._fresh()
+            self._line(
+                f'{result} = "vernon.struct_get"({value.name}) '
+                f'{{field = "{name}", index = {index} : i64}} : '
+                f"({value.type.mlir}) -> {annotation.type.mlir}"
+            )
+            fields.append(Value(result, annotation.type))
+        return tuple(fields)
+
+    def _destructure(self, target: ast.Tuple | ast.List, value: Value) -> None:
+        fields = self._tuple_fields(target, value)
+        if len(target.elts) != len(fields):
+            raise self.context.error(target, "Tuple destructuring arity does not match the value")
+        for item, tuple_field in zip(target.elts, fields, strict=True):
+            if isinstance(item, ast.Name):
+                self.environment[item.id] = tuple_field
+            elif isinstance(item, (ast.Tuple, ast.List)):
+                self._destructure(item, tuple_field)
+            else:
+                raise self.context.error(item, "Tuple destructuring targets must be local names")
+
     def _statement_from_source(self, statement: ast.stmt) -> None:
         typed = self.typed_statements.get(id(statement))
         if typed is None:
@@ -477,12 +628,19 @@ class _FunctionEmitter:
         self._statement(typed)
 
     def _if(self, node: ast.If) -> None:
-        self._reject_nested_returns(node)
         condition = self._expression(node.test)
         self._require_same_type(node.test, DslType("scalar", "bool"), condition.type)
         typed_statement = self.typed_statements[id(node)]
         merged_names = [merge.name for merge in typed_statement.branch_merges]
         merged_types = [merge.type for merge in typed_statement.branch_merges]
+        for control_name in self.loop_controls:
+            if control_name not in merged_names:
+                merged_names.append(control_name)
+                merged_types.append(DslType("scalar", "i32"))
+        for return_name, return_type in self._return_state_items():
+            if return_name not in merged_names:
+                merged_names.append(return_name)
+                merged_types.append(return_type)
         outer = self.environment.copy()
         outer_lines = self.lines
         outer_indent = self.indent
@@ -490,15 +648,13 @@ class _FunctionEmitter:
         self.lines = []
         self.indent = outer_indent + 1
         self.environment = outer.copy()
-        for statement in node.body:
-            self._statement_from_source(statement)
+        self._emit_source_block(node.body)
         then_lines = self.lines
         then_environment = self.environment.copy()
 
         self.lines = []
         self.environment = outer.copy()
-        for statement in node.orelse:
-            self._statement_from_source(statement)
+        self._emit_source_block(node.orelse)
         else_lines = self.lines
         else_environment = self.environment.copy()
 
@@ -523,6 +679,24 @@ class _FunctionEmitter:
         for name, result, result_type in zip(merged_names, results, merged_types, strict=True):
             self.environment[name] = Value(result, result_type)
 
+    def _emit_source_block(self, statements: list[ast.stmt]) -> None:
+        needs_guard = False
+        for statement in statements:
+            typed = self.typed_statements.get(id(statement))
+            if typed is None:
+                break
+            if needs_guard:
+                control_name = self.loop_controls[-1] if self.loop_controls else None
+                self._emit_guarded_statement(typed, control_name)
+            else:
+                self._statement(typed)
+            if self._contains_return(typed) or (
+                self.loop_controls and self._contains_loop_exit(typed, typed.loop_depth)
+            ):
+                needs_guard = True
+            if typed.termination is not Termination.FALLTHROUGH:
+                break
+
     def _yield_merged(self, node: ast.If, names: list[str], types: list[DslType]) -> None:
         values: list[Value] = []
         for name, expected in zip(names, types, strict=True):
@@ -536,8 +710,172 @@ class _FunctionEmitter:
         else:
             self._line("scf.yield")
 
+    def _default_value(self, node: ast.AST, value_type: DslType) -> Value:
+        if value_type.kind in {"scalar", "index"}:
+            result = self._fresh()
+            literal = "0.0" if value_type.is_float else "false" if value_type.name == "bool" else "0"
+            self._line(f"{result} = arith.constant {literal} : {value_type.mlir}")
+            return Value(result, value_type)
+        if value_type.kind == "tensor":
+            element = value_type.arguments[0]
+            assert isinstance(element, DslType)
+            if element.kind == "scalar":
+                result = self._fresh()
+                literal = "0.0" if element.is_float else "false" if element.name == "bool" else "0"
+                self._line(f"{result} = arith.constant dense<{literal}> : {value_type.mlir}")
+                return Value(result, value_type)
+            count = 1
+            for extent in value_type.arguments[1:]:
+                assert isinstance(extent, int)
+                count *= extent
+            values = [self._default_value(node, element) for _ in range(count)]
+            result = self._fresh()
+            self._line(
+                f'{result} = "vernon.intrinsic"({", ".join(value.name for value in values)}) '
+                f'{{name = "construct"}} : '
+                f"({', '.join(value.type.mlir for value in values)}) -> {value_type.mlir}"
+            )
+            return Value(result, value_type)
+        if value_type.kind == "tuple":
+            elements = [element for element in value_type.arguments if isinstance(element, DslType)]
+            values = [self._default_value(node, element) for element in elements]
+            result = self._fresh()
+            self._line(
+                f'{result} = "vernon.tuple_create"({", ".join(value.name for value in values)}) : '
+                f"({', '.join(value.type.mlir for value in values)}) -> {value_type.mlir}"
+            )
+            return Value(result, value_type, tuple(values))
+        if value_type.kind == "struct":
+            fields = self.context.structs[value_type.name]
+            values = [self._default_value(node, annotation.type) for _, annotation in fields]
+            result = self._fresh()
+            self._line(
+                f'{result} = "vernon.struct_create"({", ".join(value.name for value in values)}) '
+                f'{{type_name = "{value_type.name}"}} : '
+                f"({', '.join(value.type.mlir for value in values)}) -> {value_type.mlir}"
+            )
+            return Value(result, value_type, tuple(values))
+        raise self.context.error(node, f"cannot create a control-flow payload for {value_type.mlir}")
+
+    def _contains_loop_exit(self, statement: TypedStatement, target_depth: int) -> bool:
+        if statement.termination in {Termination.BREAK, Termination.CONTINUE} and statement.loop_depth == target_depth:
+            return True
+        if isinstance(statement.source, (ast.For, ast.While)):
+            return False
+        return any(self._contains_loop_exit(child, target_depth) for child in statement.children)
+
+    @classmethod
+    def _contains_return(cls, statement: TypedStatement) -> bool:
+        if statement.termination is Termination.RETURN:
+            return True
+        return any(cls._contains_return(child) for child in statement.children)
+
+    def _return_state_items(self) -> list[tuple[str, DslType]]:
+        items: list[tuple[str, DslType]] = []
+        if self.return_flag_name is not None:
+            items.append((self.return_flag_name, DslType("scalar", "bool")))
+        if self.return_value_name is not None:
+            assert self.signature.result is not None
+            items.append((self.return_value_name, self.signature.result))
+        return items
+
+    def _emit_guarded_statement(self, typed: TypedStatement, control_name: str | None) -> None:
+        outer = self.environment.copy()
+        assigned = self._assigned_names([typed.source])
+        lvalue_types = {value.name: value.type for value in typed.lvalues if value.kind == "local"}
+        for name in sorted(assigned - outer.keys()):
+            value_type = lvalue_types.get(name)
+            if value_type is not None:
+                outer[name] = self._default_value(typed.source, value_type)
+        carried_names = [
+            name
+            for name in sorted(assigned & outer.keys())
+            if outer[name].type.kind not in {"sampler", "tensor_storage", "tensor_view", "texture"}
+        ]
+        for name in self.loop_controls:
+            if name in outer and name not in carried_names:
+                carried_names.append(name)
+        for name, _ in self._return_state_items():
+            if name in outer and name not in carried_names:
+                carried_names.append(name)
+        carried_types = [outer[name].type for name in carried_names]
+        active: Value | None = None
+        if control_name is not None:
+            zero = self._control_constant(0)
+            control_active = self._fresh()
+            self._line(f"{control_active} = arith.cmpi eq, {outer[control_name].name}, {zero.name} : i32")
+            active = Value(control_active, DslType("scalar", "bool"))
+        if self.return_flag_name is not None:
+            false_value = self._bool_constant(False)
+            not_returned = self._fresh()
+            self._line(f"{not_returned} = arith.cmpi eq, {outer[self.return_flag_name].name}, {false_value.name} : i1")
+            if active is None:
+                active = Value(not_returned, DslType("scalar", "bool"))
+            else:
+                combined = self._fresh()
+                self._line(f"{combined} = arith.andi {active.name}, {not_returned} : i1")
+                active = Value(combined, DslType("scalar", "bool"))
+        if active is None:
+            self._statement(typed)
+            return
+
+        outer_lines = self.lines
+        outer_indent = self.indent
+        self.lines = []
+        self.indent = outer_indent + 1
+        self.environment = outer.copy()
+        self._statement(typed)
+        self._yield_values(typed.source, carried_names, carried_types)
+        then_lines = self.lines
+
+        self.lines = []
+        self.environment = outer.copy()
+        self._yield_values(typed.source, carried_names, carried_types)
+        else_lines = self.lines
+
+        results = [self._fresh() for _ in carried_names]
+        result_prefix = f"{', '.join(results)} = " if results else ""
+        result_types = f" -> ({', '.join(value.mlir for value in carried_types)})" if results else ""
+        self.lines = outer_lines
+        self.indent = outer_indent
+        self.environment = outer
+        self._line(f"{result_prefix}scf.if {active.name}{result_types} {{")
+        self.lines.extend(then_lines)
+        self._line("} else {")
+        self.lines.extend(else_lines)
+        self._line("}")
+        for name, result, value_type in zip(carried_names, results, carried_types, strict=True):
+            self.environment[name] = Value(result, value_type)
+
+    def _yield_values(self, node: ast.AST, names: list[str], types: list[DslType]) -> None:
+        values = [
+            self._coerce_implicit(node, self.environment[name], value_type)
+            for name, value_type in zip(names, types, strict=True)
+        ]
+        if values:
+            self._line(
+                f"scf.yield {', '.join(value.name for value in values)} : "
+                f"{', '.join(value.type.mlir for value in values)}"
+            )
+        else:
+            self._line("scf.yield")
+
+    def _emit_loop_body(self, statements: list[ast.stmt], control_name: str, target_depth: int) -> None:
+        needs_guard = False
+        for source in statements:
+            typed = self.typed_statements.get(id(source))
+            if typed is None:
+                break
+            if needs_guard:
+                self._emit_guarded_statement(typed, control_name)
+            else:
+                self._statement(typed)
+            if self._contains_loop_exit(typed, target_depth) or self._contains_return(typed):
+                needs_guard = True
+            if typed.termination is not Termination.FALLTHROUGH:
+                break
+
     def _for(self, node: ast.For) -> None:
-        self._reject_nested_returns(node)
         if (
             not isinstance(node.target, ast.Name)
             or not isinstance(node.iter, ast.Call)
@@ -547,55 +885,171 @@ class _FunctionEmitter:
         if node.orelse:
             raise self.context.error(node, "for-else is not supported")
         if not 1 <= len(node.iter.args) <= 3 or node.iter.keywords:
-            raise self.context.error(node.iter, "range requires one to three positional integer literals")
-        integer_arguments: list[int] = []
-        for argument in node.iter.args:
-            if (
-                not isinstance(argument, ast.Constant)
-                or not isinstance(argument.value, int)
-                or isinstance(argument.value, bool)
-            ):
-                raise self.context.error(argument, "range bounds must be integer literals in the first frontend stage")
-            integer_arguments.append(argument.value)
-        if len(integer_arguments) == 1:
-            start, stop, step = 0, integer_arguments[0], 1
-        elif len(integer_arguments) == 2:
-            start, stop = integer_arguments
-            step = 1
+            raise self.context.error(node.iter, "range requires one to three positional i32 arguments")
+        integer_type = DslType("scalar", "i32")
+        arguments = [
+            self._coerce_implicit(argument, self._expression(argument, integer_type), integer_type)
+            for argument in node.iter.args
+        ]
+        zero = self._control_constant(0)
+        one = self._control_constant(1)
+        if len(arguments) == 1:
+            start, stop, step = zero, arguments[0], one
+        elif len(arguments) == 2:
+            start, stop = arguments
+            step = one
         else:
-            start, stop, step = integer_arguments
-        if step <= 0:
-            raise self.context.error(node.iter, "range step must be positive")
-        constants = []
-        index_type = DslType("index", "index")
-        for value in (start, stop, step):
-            result = self._fresh()
-            self._line(f"{result} = arith.constant {value} : index")
-            constants.append(result)
+            start, stop, step = arguments
+        if len(node.iter.args) == 3 and self._literal_integer(node.iter.args[2]) == 0:
+            raise self.context.error(node.iter.args[2], "range step must not be zero")
+        if len(node.iter.args) == 3 and self._literal_integer(node.iter.args[2]) is None:
+            nonzero = self._fresh()
+            self._line(f"{nonzero} = arith.cmpi ne, {step.name}, {zero.name} : i32")
+            self._line(f'cf.assert {nonzero}, "range step must not be zero"')
+
         outer = self.environment.copy()
-        mutated = self._assigned_names(node.body) & outer.keys()
-        if mutated:
-            raise self.context.error(node, f"loop-carried assignment is not supported: {', '.join(sorted(mutated))}")
-        induction = self._fresh()
-        self._line(f"scf.for {induction} = {constants[0]} to {constants[1]} step {constants[2]} {{")
+        typed_statement = self.typed_statements[id(node)]
+        control_name = self._hidden_name("loop_control")
+        current_name = self._hidden_name("range_current")
+        active_name = self._hidden_name("range_active")
+        outer[control_name] = self._control_constant(0)
+        outer[current_name] = start
+        outer[active_name] = self._bool_constant(True)
+        carried_names = [merge.name for merge in typed_statement.branch_merges]
+        carried_types = [merge.type for merge in typed_statement.branch_merges]
+        carried_names.extend((current_name, active_name, control_name))
+        carried_types.extend((integer_type, DslType("scalar", "bool"), integer_type))
+        for return_name, return_type in self._return_state_items():
+            if return_name not in carried_names:
+                carried_names.append(return_name)
+                carried_types.append(return_type)
+        for name, value_type in zip(carried_names, carried_types, strict=True):
+            outer[name] = self._coerce_implicit(node, outer[name], value_type)
+
+        results = [self._fresh() for _ in carried_names]
+        before_arguments = [self._fresh() for _ in carried_names]
+        operand_types = ", ".join(value_type.mlir for value_type in carried_types)
+        assignments = ", ".join(
+            f"{argument} = {outer[name].name}" for argument, name in zip(before_arguments, carried_names, strict=True)
+        )
+        self._line(f"{', '.join(results)} = scf.while ({assignments}) : ({operand_types}) -> ({operand_types}) {{")
         self.indent += 1
         self.environment = outer.copy()
-        self.environment[node.target.id] = Value(induction, index_type)
-        for statement in node.body:
-            self._statement_from_source(statement)
-        self._line("scf.yield")
+        for name, value_type, argument in zip(carried_names, carried_types, before_arguments, strict=True):
+            self.environment[name] = Value(argument, value_type)
+        step_positive = self._fresh()
+        self._line(f"{step_positive} = arith.cmpi sgt, {step.name}, {zero.name} : i32")
+        forward = self._fresh()
+        self._line(f"{forward} = arith.cmpi slt, {self.environment[current_name].name}, {stop.name} : i32")
+        backward = self._fresh()
+        self._line(f"{backward} = arith.cmpi sgt, {self.environment[current_name].name}, {stop.name} : i32")
+        range_condition = self._fresh()
+        self._line(f"{range_condition} = arith.select {step_positive}, {forward}, {backward} : i1")
+        break_value = self._control_constant(1)
+        control_active = self._fresh()
+        self._line(f"{control_active} = arith.cmpi ne, {self.environment[control_name].name}, {break_value.name} : i32")
+        condition = self._fresh()
+        self._line(f"{condition} = arith.andi {range_condition}, {self.environment[active_name].name} : i1")
+        combined = self._fresh()
+        self._line(f"{combined} = arith.andi {condition}, {control_active} : i1")
+        condition = combined
+        if self.return_flag_name is not None:
+            false_value = self._bool_constant(False)
+            not_returned = self._fresh()
+            self._line(
+                f"{not_returned} = arith.cmpi eq, {self.environment[self.return_flag_name].name}, "
+                f"{false_value.name} : i1"
+            )
+            combined = self._fresh()
+            self._line(f"{combined} = arith.andi {condition}, {not_returned} : i1")
+            condition = combined
+        forwarded = ", ".join(self.environment[name].name for name in carried_names)
+        self._line(f"scf.condition({condition}) {forwarded} : {operand_types}")
+        self.indent -= 1
+        self._line("} do {")
+        self.indent += 1
+        self.environment = outer.copy()
+        after_arguments = [self._fresh() for _ in carried_names]
+        block_arguments = ", ".join(
+            f"{argument}: {value_type.mlir}"
+            for argument, value_type in zip(after_arguments, carried_types, strict=True)
+        )
+        self._line(f"^bb0({block_arguments}):")
+        for name, value_type, argument in zip(carried_names, carried_types, after_arguments, strict=True):
+            self.environment[name] = Value(argument, value_type)
+        induction = self._fresh()
+        self._line(f"{induction} = arith.index_cast {self.environment[current_name].name} : i32 to index")
+        self.environment[node.target.id] = Value(induction, DslType("index", "index"))
+        self.loop_controls.append(control_name)
+        self._emit_loop_body(node.body, control_name, typed_statement.loop_depth + 1)
+        self.loop_controls.pop()
+
+        next_value = self._fresh()
+        self._line(f"{next_value} = arith.addi {self.environment[current_name].name}, {step.name} : i32")
+        positive_overflow = self._fresh()
+        self._line(f"{positive_overflow} = arith.cmpi slt, {next_value}, {self.environment[current_name].name} : i32")
+        negative_overflow = self._fresh()
+        self._line(f"{negative_overflow} = arith.cmpi sgt, {next_value}, {self.environment[current_name].name} : i32")
+        body_step_positive = self._fresh()
+        self._line(f"{body_step_positive} = arith.cmpi sgt, {step.name}, {zero.name} : i32")
+        overflow = self._fresh()
+        self._line(f"{overflow} = arith.select {body_step_positive}, {positive_overflow}, {negative_overflow} : i1")
+        false_value = self._bool_constant(False)
+        no_overflow = self._fresh()
+        self._line(f"{no_overflow} = arith.cmpi eq, {overflow}, {false_value.name} : i1")
+        continue_value = self._control_constant(2)
+        normal_value = self._control_constant(0)
+        is_continue = self._fresh()
+        self._line(f"{is_continue} = arith.cmpi eq, {self.environment[control_name].name}, {continue_value.name} : i32")
+        normalized_control = self._fresh()
+        self._line(
+            f"{normalized_control} = arith.select {is_continue}, {normal_value.name}, "
+            f"{self.environment[control_name].name} : i32"
+        )
+        self.environment[control_name] = Value(normalized_control, integer_type)
+        self.environment[current_name] = Value(next_value, integer_type)
+        self.environment[active_name] = Value(no_overflow, DslType("scalar", "bool"))
+        yielded = ", ".join(self.environment[name].name for name in carried_names)
+        self._line(f"scf.yield {yielded} : {operand_types}")
         self.indent -= 1
         self._line("}")
         self.environment = outer
+        internal_names = {current_name, active_name, control_name}
+        for name, result, value_type in zip(carried_names, results, carried_types, strict=True):
+            if name not in internal_names:
+                self.environment[name] = Value(result, value_type)
+        for name in internal_names:
+            self.environment.pop(name, None)
+
+    @staticmethod
+    def _literal_integer(node: ast.expr) -> int | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+            return node.value
+        if (
+            isinstance(node, ast.UnaryOp)
+            and isinstance(node.op, (ast.UAdd, ast.USub))
+            and isinstance(node.operand, ast.Constant)
+            and isinstance(node.operand.value, int)
+            and not isinstance(node.operand.value, bool)
+        ):
+            return node.operand.value if isinstance(node.op, ast.UAdd) else -node.operand.value
+        return None
 
     def _while(self, node: ast.While) -> None:
-        self._reject_nested_returns(node)
         if node.orelse:
             raise self.context.error(node, "while-else is not supported")
         outer = self.environment.copy()
         typed_statement = self.typed_statements[id(node)]
+        control_name = self._hidden_name("loop_control")
+        outer[control_name] = self._control_constant(0)
         carried_names = [merge.name for merge in typed_statement.branch_merges]
         carried_types = [merge.type for merge in typed_statement.branch_merges]
+        carried_names.append(control_name)
+        carried_types.append(DslType("scalar", "i32"))
+        for return_name, return_type in self._return_state_items():
+            if return_name not in carried_names:
+                carried_names.append(return_name)
+                carried_types.append(return_type)
         for name, value_type in zip(carried_names, carried_types, strict=True):
             outer[name] = self._coerce_implicit(node, outer[name], value_type)
         results = [self._fresh() for _ in carried_names]
@@ -611,11 +1065,36 @@ class _FunctionEmitter:
         self.environment = outer.copy()
         for name, value_type, argument in zip(carried_names, carried_types, before_arguments, strict=True):
             self.environment[name] = Value(argument, value_type)
+        break_value = self._control_constant(1)
+        active = self._fresh()
+        self._line(f"{active} = arith.cmpi ne, {self.environment[control_name].name}, {break_value.name} : i32")
+        if self.return_flag_name is not None:
+            false_value = self._bool_constant(False)
+            not_returned = self._fresh()
+            self._line(
+                f"{not_returned} = arith.cmpi eq, {self.environment[self.return_flag_name].name}, "
+                f"{false_value.name} : i1"
+            )
+            combined = self._fresh()
+            self._line(f"{combined} = arith.andi {active}, {not_returned} : i1")
+            active = combined
+        condition_result = self._fresh()
+        self._line(f"{condition_result} = scf.if {active} -> (i1) {{")
+        self.indent += 1
         condition = self._expression(node.test)
         self._require_same_type(node.test, DslType("scalar", "bool"), condition.type)
+        self._line(f"scf.yield {condition.name} : i1")
+        self.indent -= 1
+        self._line("} else {")
+        self.indent += 1
+        false_value = self._fresh()
+        self._line(f"{false_value} = arith.constant false")
+        self._line(f"scf.yield {false_value} : i1")
+        self.indent -= 1
+        self._line("}")
         forwarded = ", ".join(self.environment[name].name for name in carried_names)
         suffix = f" : {operand_types}" if carried_names else ""
-        self._line(f"scf.condition({condition.name}) {forwarded}{suffix}")
+        self._line(f"scf.condition({condition_result}) {forwarded}{suffix}")
         self.indent -= 1
         self._line("} do {")
         self.indent += 1
@@ -630,15 +1109,28 @@ class _FunctionEmitter:
                 f"{name}: {value_type.mlir}" for name, value_type in zip(after_arguments, carried_types, strict=True)
             )
             self._line(f"^bb0({block_arguments}):")
-        for statement in node.body:
-            self._statement_from_source(statement)
+        self.loop_controls.append(control_name)
+        self._emit_loop_body(node.body, control_name, typed_statement.loop_depth + 1)
+        self.loop_controls.pop()
+        continue_value = self._control_constant(2)
+        normal_value = self._control_constant(0)
+        is_continue = self._fresh()
+        self._line(f"{is_continue} = arith.cmpi eq, {self.environment[control_name].name}, {continue_value.name} : i32")
+        normalized_control = self._fresh()
+        self._line(
+            f"{normalized_control} = arith.select {is_continue}, {normal_value.name}, "
+            f"{self.environment[control_name].name} : i32"
+        )
+        self.environment[control_name] = Value(normalized_control, DslType("scalar", "i32"))
         yielded = ", ".join(self.environment[name].name for name in carried_names)
         self._line(f"scf.yield {yielded}{suffix}")
         self.indent -= 1
         self._line("}")
         self.environment = outer
         for name, result, result_type in zip(carried_names, results, carried_types, strict=True):
-            self.environment[name] = Value(result, result_type)
+            if name != control_name:
+                self.environment[name] = Value(result, result_type)
+        self.environment.pop(control_name, None)
 
     def _reject_nested_returns(self, node: ast.If | ast.For | ast.While) -> None:
         nested = next((value for value in ast.walk(node) if isinstance(value, ast.Return)), None)
@@ -648,9 +1140,18 @@ class _FunctionEmitter:
     @staticmethod
     def _assigned_names(statements: Iterable[ast.stmt]) -> set[str]:
         result: set[str] = set()
+
+        def target_names(target: ast.expr) -> set[str]:
+            if isinstance(target, ast.Name):
+                return {target.id}
+            if isinstance(target, (ast.Tuple, ast.List)):
+                return set().union(*(target_names(item) for item in target.elts))
+            return set()
+
         for statement in statements:
             if isinstance(statement, ast.Assign):
-                result.update(target.id for target in statement.targets if isinstance(target, ast.Name))
+                for target in statement.targets:
+                    result.update(target_names(target))
             elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
                 result.add(statement.target.id)
             elif isinstance(statement, ast.AugAssign) and isinstance(statement.target, ast.Name):
@@ -675,9 +1176,11 @@ class _FunctionEmitter:
         if isinstance(node, ast.UnaryOp):
             return self._unary(node)
         if isinstance(node, ast.BoolOp):
-            raise self.context.error(node, "and/or require short-circuit semantics and are not supported")
+            return self._bool_op(node)
         if isinstance(node, ast.Compare):
             return self._compare(node)
+        if isinstance(node, ast.Tuple):
+            return self._tuple(node)
         if isinstance(node, ast.Call):
             return self._call(node)
         if isinstance(node, ast.Attribute):
@@ -685,8 +1188,70 @@ class _FunctionEmitter:
         if isinstance(node, ast.Subscript):
             return self._index(node)
         if isinstance(node, ast.IfExp):
-            raise self.context.error(node, "conditional expressions are not supported; use an if statement")
+            return self._conditional_expression(node)
         raise self.context.error(node, f"unsupported expression syntax: {type(node).__name__}")
+
+    def _conditional_expression(self, node: ast.IfExp) -> Value:
+        typed = self._typed_expression(node)
+        condition = self._expression(node.test, DslType("scalar", "bool"))
+        self._require_same_type(node.test, DslType("scalar", "bool"), condition.type)
+        result = self._fresh()
+        self._line(f"{result} = scf.if {condition.name} -> ({typed.type.mlir}) {{")
+        self.indent += 1
+        then_value = self._coerce_implicit(node.body, self._expression(node.body, typed.type), typed.type)
+        self._line(f"scf.yield {then_value.name} : {typed.type.mlir}")
+        self.indent -= 1
+        self._line("} else {")
+        self.indent += 1
+        else_value = self._coerce_implicit(node.orelse, self._expression(node.orelse, typed.type), typed.type)
+        self._line(f"scf.yield {else_value.name} : {typed.type.mlir}")
+        self.indent -= 1
+        self._line("}")
+        return Value(result, typed.type)
+
+    def _bool_op(self, node: ast.BoolOp) -> Value:
+        result_type = self._typed_expression(node).type
+        self._require_same_type(node, DslType("scalar", "bool"), result_type)
+        current = self._expression(node.values[0], result_type)
+        self._require_same_type(node.values[0], result_type, current.type)
+        for source in node.values[1:]:
+            result = self._fresh()
+            self._line(f"{result} = scf.if {current.name} -> ({result_type.mlir}) {{")
+            self.indent += 1
+            if isinstance(node.op, ast.And):
+                alternative = self._expression(source, result_type)
+                self._line(f"scf.yield {alternative.name} : {result_type.mlir}")
+            else:
+                self._line(f"scf.yield {current.name} : {result_type.mlir}")
+            self.indent -= 1
+            self._line("} else {")
+            self.indent += 1
+            if isinstance(node.op, ast.And):
+                self._line(f"scf.yield {current.name} : {result_type.mlir}")
+            else:
+                alternative = self._expression(source, result_type)
+                self._line(f"scf.yield {alternative.name} : {result_type.mlir}")
+            self.indent -= 1
+            self._line("}")
+            current = Value(result, result_type)
+        return current
+
+    def _tuple(self, node: ast.Tuple) -> Value:
+        return self._tuple_values(node, node.elts)
+
+    def _tuple_values(self, node: ast.expr, sources: list[ast.expr]) -> Value:
+        result_type = self._typed_expression(node).type
+        elements = [element for element in result_type.arguments if isinstance(element, DslType)]
+        values = [
+            self._coerce_implicit(source, self._expression(source, expected), expected)
+            for source, expected in zip(sources, elements, strict=True)
+        ]
+        result = self._fresh()
+        self._line(
+            f'{result} = "vernon.tuple_create"({", ".join(value.name for value in values)}) : '
+            f"({', '.join(value.type.mlir for value in values)}) -> {result_type.mlir}"
+        )
+        return Value(result, result_type, tuple(values))
 
     def _constant(self, node: ast.Constant, expected: DslType | None) -> Value:
         if isinstance(node.value, bool):
@@ -771,21 +1336,8 @@ class _FunctionEmitter:
                 self._line(f"{result} = {operation} {zero}, {operand.name} : {operand.type.mlir}")
             return Value(result, result_type)
         if isinstance(node.op, ast.UAdd):
-            return Value(operand.name, result_type, operand.fields, operand.storage, operand.access)
+            return Value(operand.name, result_type, operand.fields, operand.access)
         raise self.context.error(node, "unsupported unary operation")
-
-    def _boolean(self, node: ast.BoolOp) -> Value:
-        values = [self._expression(value) for value in node.values]
-        bool_type = DslType("scalar", "bool")
-        for value in values:
-            self._require_same_type(node, bool_type, value.type)
-        operation = "arith.andi" if isinstance(node.op, ast.And) else "arith.ori"
-        current = values[0]
-        for value in values[1:]:
-            result = self._fresh()
-            self._line(f"{result} = {operation} {current.name}, {value.name} : i1")
-            current = Value(result, bool_type)
-        return current
 
     def _compare(self, node: ast.Compare) -> Value:
         if len(node.ops) != 1:
@@ -825,8 +1377,10 @@ class _FunctionEmitter:
             raise self.context.error(node, "function calls do not support keyword arguments")
         typed_call = self._typed_expression(node)
         name = typed_call.operation or ""
-        if name in {"Vector", "Matrix"}:
+        if name in {"Tensor", "Vector", "Matrix"}:
             return self._aggregate_constructor(node, name)
+        if name == "Tuple":
+            return self._tuple_values(node, node.args)
         known_signature = self.context.signatures.get(name)
         struct_fields = self.context.structs.get(name)
         if struct_fields is not None and len(node.args) == len(struct_fields):
@@ -890,43 +1444,6 @@ class _FunctionEmitter:
             if value is None:
                 raise self.context.error(node, f"{name}() is not available in this shader stage")
             return value
-        if name in {"vec2", "vec3", "vec4"}:
-            size = int(name[-1])
-            if not arguments:
-                raise self.context.error(node, f"{name} requires component arguments")
-            result_type = self._typed_expression(node).type
-            element = self._element_type(result_type)
-            component_count = 0
-            for argument in arguments:
-                if argument.type.kind == "scalar":
-                    component_count += 1
-                elif argument.type.kind == "tensor" and len(argument.type.arguments) == 2:
-                    component_count += int(argument.type.arguments[1])
-                else:
-                    raise self.context.error(node, f"{name} arguments must be scalars or vectors")
-            if component_count != size:
-                raise self.context.error(node, f"{name} requires exactly {size} scalar components")
-            arguments = [self._coerce_constructor_argument(node, argument, element) for argument in arguments]
-            return self._intrinsic(node, "construct", arguments, result_type)
-        if name in {"mat2", "mat3", "mat4"}:
-            size = int(name[-1])
-            if not arguments:
-                raise self.context.error(node, f"{name} requires component arguments")
-            result_type = self._typed_expression(node).type
-            element = self._element_type(result_type)
-            component_count = 0
-            for argument in arguments:
-                if argument.type.kind == "scalar":
-                    component_count += 1
-                elif argument.type.kind == "tensor":
-                    component_count += math.prod(int(dimension) for dimension in argument.type.arguments[1:])
-                else:
-                    raise self.context.error(node, f"{name} arguments must be scalars or Tensors")
-            expected = size * size
-            if component_count != expected:
-                raise self.context.error(node, f"{name} requires exactly {expected} scalar components")
-            arguments = [self._coerce_constructor_argument(node, argument, element) for argument in arguments]
-            return self._intrinsic(node, "construct", arguments, result_type)
         if name in {"normalize", "reflect"}:
             expected = 1 if name == "normalize" else 2
             if len(arguments) != expected or any(
@@ -1100,23 +1617,27 @@ class _FunctionEmitter:
         return Value(result, signature.result)
 
     def _aggregate_constructor(self, node: ast.Call, name: str) -> Value:
-        if len(node.args) != 1 or not isinstance(node.args[0], (ast.List, ast.Tuple)):
-            raise self.context.error(node, f"{name} requires one list or tuple literal")
-        outer = list(node.args[0].elts)
+        if len(node.args) != 1:
+            raise self.context.error(node, f"{name} requires one sequence literal")
         if name == "Vector":
-            if not outer or any(isinstance(value, (ast.List, ast.Tuple)) for value in outer):
-                raise self.context.error(node, "Vector requires a non-empty flat sequence")
-            elements = outer
-        else:
-            if not outer or any(not isinstance(row, (ast.List, ast.Tuple)) for row in outer):
-                raise self.context.error(node, "Matrix requires a non-empty nested sequence")
-            rows = [list(row.elts) for row in outer if isinstance(row, (ast.List, ast.Tuple))]
-            if not rows[0] or any(len(row) != len(rows[0]) for row in rows):
-                raise self.context.error(node, "Matrix rows must be non-empty and rectangular")
-            elements = [value for row in rows for value in row]
+            sequence = node.args[0]
+            if not isinstance(sequence, (ast.List, ast.Tuple)) or not sequence.elts:
+                raise self.context.error(node, "Vector requires a non-empty sequence literal")
+            result_type = self._typed_expression(node).type
+            element_type = self._element_type(result_type)
+            values = [
+                self._coerce_constructor_argument(value, self._expression(value), element_type)
+                for value in sequence.elts
+            ]
+            return self._intrinsic(node, "construct", values, result_type)
+        literal = rectangular_literal(node.args[0])
+        if literal is None:
+            raise self.context.error(node, f"{name} requires a non-empty rectangular sequence literal")
+        elements, shape = literal
+        expected_rank = {"Vector": 1, "Matrix": 2}.get(name)
+        if expected_rank is not None and len(shape) != expected_rank:
+            raise self.context.error(node, f"{name} requires a rank-{expected_rank} sequence literal")
         values = [self._expression(value) for value in elements]
-        if any(value.type.kind != "scalar" for value in values):
-            raise self.context.error(node, f"{name} elements must be scalar")
         result_type = self._typed_expression(node).type
         element_type = self._element_type(result_type)
         values = [
@@ -1202,7 +1723,8 @@ class _FunctionEmitter:
             result_type = fields[field_index][1].type
             result = self._fresh()
             self._line(
-                f'{result} = "vernon.struct_get"({value.name}) {{field = "{node.attr}"}} : '
+                f'{result} = "vernon.struct_get"({value.name}) '
+                f'{{field = "{node.attr}", index = {field_index} : i64}} : '
                 f"({value.type.mlir}) -> {result_type.mlir}"
             )
             return Value(result, result_type)
@@ -1229,22 +1751,25 @@ class _FunctionEmitter:
 
     def _index(self, node: ast.Subscript) -> Value:
         value = self._expression(node.value)
-        if value.type.kind == "buffer" or value.storage is StorageClass.ADDRESSABLE:
-            index = (
-                self._tensor_buffer_index(node, value.type)
-                if value.type.kind == "tensor"
-                else self._buffer_index(node.slice)
-            )
+        if value.type.kind == "tuple":
+            assert isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, int)
+            index = node.slice.value
+            if index < 0:
+                index += len(value.type.arguments)
+            fields = self._tuple_fields(node, value)
+            return fields[index]
+        if value.type.kind == "tensor_view":
+            index = self._tensor_view_index(node, value)
             element = value.type.arguments[0]
             assert isinstance(element, DslType)
             result = self._fresh()
             self._line(
                 f'{result} = "vernon.intrinsic"({value.name}, {index.name}) '
-                f'{{name = "buffer_load"}} : ({value.abi_type.mlir}, index) -> {element.mlir}'
+                f'{{name = "tensor_view_load"}} : ({value.abi_type.mlir}, index) -> {element.mlir}'
             )
             return Value(result, element)
         if value.type.kind != "tensor":
-            raise self.context.error(node, "indexing requires a Tensor or Buffer value")
+            raise self.context.error(node, "indexing requires a Tensor or TensorView value")
         indices = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
         if len(indices) != len(value.type.arguments) - 1:
             raise self.context.error(node, "tensor.extract requires one index per tensor dimension")
@@ -1263,27 +1788,29 @@ class _FunctionEmitter:
         assert isinstance(element, DslType)
         result_type = element
         result = self._fresh()
-        self._line(f"{result} = tensor.extract {value.name}[{', '.join(index_values)}] : {value.type.mlir}")
+        if element.kind == "scalar":
+            self._line(f"{result} = tensor.extract {value.name}[{', '.join(index_values)}] : {value.type.mlir}")
+        else:
+            operands = ", ".join((value.name, *index_values))
+            operand_types = ", ".join((value.type.mlir, *(["index"] * len(index_values))))
+            self._line(f'{result} = "vernon.tensor_get"({operands}) : ({operand_types}) -> {result_type.mlir}')
         return Value(result, result_type)
 
-    def _tensor_buffer_index(self, node: ast.Subscript, value_type: DslType) -> Value:
-        index_nodes = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
-        shape = value_type.arguments[1:]
-        if len(index_nodes) != len(shape):
-            raise self.context.error(node, "Tensor indexing requires one index per dimension")
-        indices = [self._buffer_index(index) for index in index_nodes]
-        current = indices[0]
-        for dimension, index in zip(shape[1:], indices[1:], strict=True):
-            if not isinstance(dimension, int):
-                raise self.context.error(node, "runtime Tensor dimensions must be specialized before lowering")
-            extent = self._fresh()
-            self._line(f"{extent} = arith.constant {dimension} : index")
-            multiplied = self._fresh()
-            self._line(f"{multiplied} = arith.muli {current.name}, {extent} : index")
-            added = self._fresh()
-            self._line(f"{added} = arith.addi {multiplied}, {index.name} : index")
-            current = Value(added, DslType("index", "index"))
-        return current
+    def _tuple_fields(self, node: ast.AST, value: Value) -> tuple[Value, ...]:
+        if value.fields is not None:
+            return value.fields
+        if value.type.kind != "tuple":
+            raise self.context.error(node, "internal error: expected a Tuple value")
+        element_types = [element for element in value.type.arguments if isinstance(element, DslType)]
+        fields: list[Value] = []
+        for index, element in enumerate(element_types):
+            result = self._fresh()
+            self._line(
+                f'{result} = "vernon.tuple_get"({value.name}) {{index = {index} : i64}} : '
+                f"({value.type.mlir}) -> {element.mlir}"
+            )
+            fields.append(Value(result, element))
+        return tuple(fields)
 
     def _buffer_index(self, node: ast.AST) -> Value:
         if isinstance(node, ast.Tuple):
@@ -1297,25 +1824,57 @@ class _FunctionEmitter:
         self._line(f"{cast} = arith.index_cast {index.name} : {index.type.mlir} to index")
         return Value(cast, DslType("index", "index"))
 
+    def _tensor_view_index(self, node: ast.Subscript, value: Value) -> Value:
+        rank = value.type.arguments[1]
+        index_nodes = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
+        if len(index_nodes) != rank:
+            raise self.context.error(node, "TensorView indexing requires one index per dimension")
+        if value.view_layout is None:
+            if rank == 1:
+                return self._buffer_index(index_nodes[0])
+            raise self.context.error(
+                node,
+                "multi-dimensional TensorView lowering requires runtime stride descriptors and is not implemented",
+            )
+        layout = value.view_layout
+        if len(layout.shape) != rank or len(layout.strides) != rank:
+            raise self.context.error(node, "runtime TensorView layout rank does not match its annotation")
+
+        physical: Value | None = None
+        if layout.offset:
+            offset = self._fresh()
+            self._line(f"{offset} = arith.constant {layout.offset} : index")
+            physical = Value(offset, DslType("index", "index"))
+        for index_node, stride in zip(index_nodes, layout.strides, strict=True):
+            term = self._buffer_index(index_node)
+            if stride != 1:
+                stride_value = self._fresh()
+                self._line(f"{stride_value} = arith.constant {stride} : index")
+                multiplied = self._fresh()
+                self._line(f"{multiplied} = arith.muli {term.name}, {stride_value} : index")
+                term = Value(multiplied, DslType("index", "index"))
+            if physical is None:
+                physical = term
+            else:
+                added = self._fresh()
+                self._line(f"{added} = arith.addi {physical.name}, {term.name} : index")
+                physical = Value(added, DslType("index", "index"))
+        assert physical is not None
+        return physical
+
     def _store_index(self, target: ast.Subscript, value: Value) -> None:
         buffer = self._expression(target.value)
-        if buffer.type.kind != "buffer" and buffer.storage is not StorageClass.ADDRESSABLE:
-            raise self.context.error(
-                target, "indexed assignment is supported only for addressable Tensor or Buffer values"
-            )
+        if buffer.type.kind != "tensor_view":
+            raise self.context.error(target, "indexed assignment is supported only for TensorView values")
         element = buffer.type.arguments[0]
         assert isinstance(element, DslType)
         if buffer.access is AccessMode.READ:
-            raise self.context.error(target, "cannot assign through a read-only buffer")
+            raise self.context.error(target, "cannot assign through a read-only TensorView")
         value = self._coerce_implicit(target, value, element)
-        index = (
-            self._tensor_buffer_index(target, buffer.type)
-            if buffer.type.kind == "tensor"
-            else self._buffer_index(target.slice)
-        )
+        index = self._tensor_view_index(target, buffer)
         self._line(
             f'"vernon.intrinsic"({buffer.name}, {index.name}, {value.name}) '
-            f'{{name = "buffer_store"}} : ({buffer.abi_type.mlir}, index, {element.mlir}) -> ()'
+            f'{{name = "tensor_view_store"}} : ({buffer.abi_type.mlir}, index, {element.mlir}) -> ()'
         )
 
     def _require_same_type(self, node: ast.AST, expected: DslType, actual: DslType) -> None:
@@ -1390,6 +1949,8 @@ class Compiler:
         dependencies: tuple[tuple[str, str], ...] = (),
         declared_features: tuple[str, ...] = (),
         enabled_features: tuple[str, ...] = (),
+        runtime_entry: str | None = None,
+        tensor_view_layouts: dict[str, _ViewLayout] | None = None,
     ) -> str:
         try:
             module = ast.parse(source, filename=filename, type_comments=False)
@@ -1399,7 +1960,11 @@ class Compiler:
                 SourceLocation(filename, error.lineno or 1, error.offset or 1),
             ) from None
         module = normalize_struct_methods(module, filename)
-        context = _ModuleContext(filename)
+        context = _ModuleContext(
+            filename,
+            runtime_entry=runtime_entry,
+            tensor_view_layouts=tensor_view_layouts or {},
+        )
         self._collect_struct_names(module, context)
         type_parser = TypeParser(context)
         self._collect_structs(module, context, type_parser)
@@ -1418,6 +1983,7 @@ class Compiler:
         module_attributes = [
             'vernon.frontend = "python"',
             f"vernon.frontend_version = {FRONTEND_VERSION} : i64",
+            "vernon.value_abi_version = 1 : i64",
         ]
         if dependencies:
             encoded = ", ".join(json.dumps(f"{path}={digest}") for path, digest in dependencies)
@@ -1429,10 +1995,20 @@ class Compiler:
             variant = ", ".join(json.dumps(name) for name in sorted(enabled_features))
             module_attributes.append(f"vernon.variant_key = [{variant}]")
         body: list[str] = [f"module attributes {{{', '.join(module_attributes)}}} {{"]
+
+        def struct_field_types(name: str) -> tuple[ConcreteType, ...]:
+            return tuple(annotation.type for _, annotation in context.structs[name])
+
         for name in sorted(context.structs):
             fields = context.structs[name]
             field_text = ", ".join(f'"{field_name}:{annotation.type.mlir}"' for field_name, annotation in fields)
-            body.append(f'  "vernon.struct"() {{fields = [{field_text}], sym_name = "{name}"}} : () -> ()')
+            layout = value_abi_layout(ConcreteType("struct", name), struct_field_types)
+            offsets = ", ".join(str(offset) for offset in layout.field_offsets)
+            body.append(
+                f'  "vernon.struct"() {{abi_alignment = {layout.alignment} : i64, '
+                f"abi_field_offsets = array<i64: {offsets}>, abi_size = {layout.size} : i64, "
+                f'fields = [{field_text}], sym_name = "{name}"}} : () -> ()'
+            )
         for node in module.body:
             if isinstance(node, ast.FunctionDef):
                 stage, workgroup_size = self._decorator(node, context)
@@ -1478,6 +2054,11 @@ class Compiler:
             project.dependencies,
             project.features,
             request.enabled_features,
+            request.entry,
+            {
+                name: _ViewLayout(shape, strides, offset)
+                for name, _, shape, strides, offset in request.tensor_view_layouts
+            },
         )
         return FrontendCompileResult(
             mlir,
@@ -1548,6 +2129,23 @@ class Compiler:
                 fields.append((statement.target.id, parser.parse(statement.annotation)))
             context.structs[node.name] = tuple(fields)
 
+        def field_types(name: str) -> tuple[ConcreteType, ...]:
+            return tuple(annotation.type for _, annotation in context.structs[name])
+
+        for node in module.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for statement, (field_name, annotation) in zip(
+                (item for item in node.body if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name)),
+                context.structs[node.name],
+                strict=True,
+            ):
+                if not is_abi_stable_value(annotation.type, field_types):
+                    raise context.error(
+                        statement.annotation,
+                        f"Struct field '{node.name}.{field_name}' must be an ABI-stable Value",
+                    )
+
     @staticmethod
     def _collect_signatures(module: ast.Module, context: _ModuleContext, parser: TypeParser) -> None:
         for node in module.body:
@@ -1569,7 +2167,15 @@ class Compiler:
                 if argument.annotation is None:
                     raise context.error(argument, f"argument '{argument.arg}' requires a type annotation")
                 annotation = parser.parse(argument.annotation)
-                if shared and (annotation.metadata or annotation.type.kind in {"buffer", "sampler", "texture"}):
+                if annotation.type.kind == "tensor_storage":
+                    raise context.error(
+                        argument,
+                        "TensorStorage is a host-runtime owner; device parameters must use TensorView",
+                    )
+                if shared and (
+                    annotation.metadata
+                    or annotation.type.kind in {"sampler", "tensor_storage", "tensor_view", "texture"}
+                ):
                     raise context.error(argument, f"shared function '{node.name}' uses a device-only argument")
                 arguments.append(annotation.type)
             result = None
@@ -1577,7 +2183,9 @@ class Compiler:
             if node.returns is not None and not (isinstance(node.returns, ast.Constant) and node.returns.value is None):
                 result_annotation = parser.parse(node.returns)
                 result = result_annotation.type
-                if shared and (result_annotation.metadata or result.kind in {"buffer", "sampler", "texture"}):
+                if shared and (
+                    result_annotation.metadata or result.kind in {"sampler", "tensor_storage", "tensor_view", "texture"}
+                ):
                     raise context.error(node.returns, f"shared function '{node.name}' uses a device-only result")
             context.signatures[node.name] = FunctionSignature(tuple(arguments), result)
             context.result_annotations[node.name] = result_annotation

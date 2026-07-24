@@ -13,6 +13,12 @@
 
 namespace vernon::runtime {
 
+struct ReflectedStorageLeaf {
+    size_t elementSize{};
+    size_t byteOffset{};
+    uint32_t binding{UINT32_MAX};
+};
+
 struct ReflectedArgument {
     std::string kind;
     std::string builtin;
@@ -24,6 +30,7 @@ struct ReflectedArgument {
     size_t alignment{1};
     uint32_t descriptorSet{};
     uint32_t binding{UINT32_MAX};
+    std::vector<ReflectedStorageLeaf> storageLeaves;
 };
 
 struct ReflectedEntry {

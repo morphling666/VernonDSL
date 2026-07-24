@@ -8,4 +8,11 @@ __pycache__/
 htmlcov/
 .cache/
 .vscode/
+*.dll
+*.so
+*.dylib
+*.o
+*.obj
+*.lib
+*.exp
 secret/

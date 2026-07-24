@@ -12,6 +12,7 @@
 #include <map>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 struct VernonRuntimeContext;
@@ -110,7 +111,7 @@ struct VulkanGraphicsCache {
 };
 
 struct VulkanPipelineState {
-    VernonLoadedKernel *computeKernel{};
+    std::unordered_map<std::string, VernonLoadedKernel *> computeKernels;
     VkShaderModule vertex{};
     VkShaderModule fragment{};
     std::string vertexEntry;

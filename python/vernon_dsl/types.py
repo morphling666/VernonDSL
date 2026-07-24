@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from dataclasses import dataclass
 from typing import Any
 
@@ -49,68 +50,87 @@ class _TypeConstructor:
         return TypeExpr(cls.__name__, arguments)
 
 
-class Buffer(_TypeConstructor):
-    pass
+@dataclass(frozen=True)
+class _Access:
+    name: str
+
+
+read = _Access("read")
+write = _Access("write")
+read_write = _Access("read_write")
 
 
 class When(_TypeConstructor):
     pass
 
 
-class vec(_TypeConstructor):
-    pass
+class Tuple(_TypeConstructor):
+    def __new__(cls, *values: Any) -> builtins.tuple[Any, ...]:
+        return builtins.tuple(values)
 
 
-class mat(_TypeConstructor):
-    pass
+class Tensor:
+    """Construct an immutable rectangular host Tensor Value."""
+
+    @classmethod
+    def __class_getitem__(cls, arguments: Any) -> TypeExpr:
+        if not isinstance(arguments, tuple):
+            arguments = (arguments,)
+        return TypeExpr("Tensor", arguments)
+
+    def __new__(cls, values: Any) -> np.ndarray[Any, Any]:
+        def shape_and_values(current: Any) -> tuple[tuple[int, ...], tuple[Any, ...]]:
+            if isinstance(current, np.ndarray):
+                if current.ndim == 0:
+                    return (), (current[()],)
+                return current.shape, tuple(current.reshape(-1))
+            if not isinstance(current, (list, builtins.tuple)):
+                return (), (current,)
+            if not current:
+                raise TypeError("Tensor requires a non-empty rectangular sequence")
+            children = tuple(shape_and_values(value) for value in current)
+            child_shape = children[0][0]
+            if any(shape != child_shape for shape, _ in children[1:]):
+                raise TypeError("Tensor requires a non-empty rectangular sequence")
+            return (len(current), *child_shape), tuple(
+                component for _, components in children for component in components
+            )
+
+        shape, components = shape_and_values(values)
+        if not shape:
+            raise TypeError("Tensor requires a non-empty rectangular sequence")
+        return _host_tensor("Tensor", components, shape)
 
 
 class Vector:
     """Construct an immutable rank-one host value from an iterable."""
 
+    @classmethod
+    def __class_getitem__(cls, arguments: Any) -> TypeExpr:
+        if not isinstance(arguments, tuple):
+            arguments = (arguments,)
+        return TypeExpr("Vector", arguments)
+
     def __new__(cls, values: Any) -> np.ndarray[Any, Any]:
         components = tuple(values)
-        return _host_tensor("Vector", components, (len(components),))
+        size = sum(np.asarray(component).size for component in components)
+        return _host_tensor("Vector", components, (size,))
 
 
 class Matrix:
     """Construct an immutable rank-two host value from nested iterables."""
+
+    @classmethod
+    def __class_getitem__(cls, arguments: Any) -> TypeExpr:
+        if not isinstance(arguments, tuple):
+            arguments = (arguments,)
+        return TypeExpr("Matrix", arguments)
 
     def __new__(cls, values: Any) -> np.ndarray[Any, Any]:
         rows = tuple(tuple(row) for row in values)
         if not rows or not rows[0] or any(len(row) != len(rows[0]) for row in rows):
             raise TypeError("Matrix requires a non-empty rectangular sequence")
         return _host_tensor("Matrix", tuple(value for row in rows for value in row), (len(rows), len(rows[0])))
-
-
-class vec2(_TypeConstructor):
-    def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
-        return _host_tensor("vec2", values, (2,))
-
-
-class vec3(_TypeConstructor):
-    def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
-        return _host_tensor("vec3", values, (3,))
-
-
-class vec4(_TypeConstructor):
-    def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
-        return _host_tensor("vec4", values, (4,))
-
-
-class mat2(_TypeConstructor):
-    def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
-        return _host_tensor("mat2", values, (2, 2))
-
-
-class mat3(_TypeConstructor):
-    def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
-        return _host_tensor("mat3", values, (3, 3))
-
-
-class mat4(_TypeConstructor):
-    def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
-        return _host_tensor("mat4", values, (4, 4))
 
 
 @dataclass(frozen=True)

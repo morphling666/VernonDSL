@@ -4,21 +4,26 @@ import ast
 import copy
 import hashlib
 from collections.abc import Callable
+from dataclasses import replace
 
-from ..language.ast_utils import decorator_name, dotted_name
+from ..language.ast_utils import decorator_name, dotted_name, rectangular_literal
 from ..shader_contracts import GENERATED_INTERFACE_CONTRACTS, TypeContract
 from .model import (
     AccessMode,
     BranchMerge,
     ConcreteType,
-    Effect,
     LValue,
-    StorageClass,
+    StorageEffect,
+    StorageEffectKind,
+    StorageOwner,
+    StorageRegion,
+    StorageRegionKind,
     Termination,
     TypedExpression,
     TypedFunctionInstance,
     TypedParameter,
     TypedStatement,
+    is_abi_stable_value,
 )
 from .type_solver import (
     InferenceType,
@@ -71,17 +76,22 @@ def _annotation(value_type: ConcreteType) -> ast.expr:
             slice=ast.Tuple(elts=[_annotation(element), shape], ctx=ast.Load()),
             ctx=ast.Load(),
         )
-    if value_type.kind == "buffer":
-        element = value_type.arguments[0]
-        assert isinstance(element, ConcreteType)
-        access = value_type.arguments[1] if len(value_type.arguments) > 1 else "read_write"
-        items: list[ast.expr] = [_annotation(element)]
-        if access != "read_write":
-            items.append(ast.Constant(value=access))
-        slice_value: ast.expr = items[0] if len(items) == 1 else ast.Tuple(elts=items, ctx=ast.Load())
+    if value_type.kind == "tuple":
+        elements = [element for element in value_type.arguments if isinstance(element, ConcreteType)]
         return ast.Subscript(
-            value=ast.Name(id="Buffer", ctx=ast.Load()),
-            slice=slice_value,
+            value=ast.Name(id="Tuple", ctx=ast.Load()),
+            slice=ast.Tuple(elts=[_annotation(element) for element in elements], ctx=ast.Load()),
+            ctx=ast.Load(),
+        )
+    if value_type.kind == "tensor_view":
+        element, rank, access = value_type.arguments
+        assert isinstance(element, ConcreteType)
+        return ast.Subscript(
+            value=ast.Name(id="TensorView", ctx=ast.Load()),
+            slice=ast.Tuple(
+                elts=[_annotation(element), ast.Constant(value=rank), ast.Name(id=str(access), ctx=ast.Load())],
+                ctx=ast.Load(),
+            ),
             ctx=ast.Load(),
         )
     if value_type.kind == "texture":
@@ -152,6 +162,12 @@ class _Inference:
             }
             returns = self._statements(function.body, environment)
             self._validate_declared_returns(function, returns)
+            if (
+                function.returns is not None
+                and not (isinstance(function.returns, ast.Constant) and function.returns.value is None)
+                and not self._block_always_returns(function.body)
+            ):
+                raise self.error(function, f"function '{function.name}' may exit without returning a value")
         reachable = self._reachable_instance_symbols(roots)
         specialization_keys = tuple(
             (key[0], tuple(value.mlir for value in key[1]), key[2])
@@ -206,6 +222,20 @@ class _Inference:
                 assert return_nodes[index].value is not None
                 self._constrain_literal(return_nodes[index].value, expected)
 
+    @classmethod
+    def _block_always_returns(cls, statements: list[ast.stmt]) -> bool:
+        for statement in statements:
+            if isinstance(statement, ast.Return):
+                return True
+            if (
+                isinstance(statement, ast.If)
+                and statement.orelse
+                and cls._block_always_returns(statement.body)
+                and cls._block_always_returns(statement.orelse)
+            ):
+                return True
+        return False
+
     def _reachable_instance_symbols(self, roots: list[ast.FunctionDef]) -> set[str]:
         by_symbol = {instance.name: instance for instance in self.instances.values()}
         reachable: set[str] = set()
@@ -232,23 +262,14 @@ class _Inference:
         for function in self.module.body:
             if not isinstance(function, ast.FunctionDef):
                 continue
-            decorator = decorator_name(function.decorator_list[0])
-            stage = "compute" if decorator == "kernel" else decorator if decorator in {"vertex", "fragment"} else None
             parameters: list[TypedParameter] = []
             for argument in function.args.args:
                 argument_type = self.parse_type(argument.annotation)
-                storage = StorageClass.VALUE
                 access = AccessMode.READ
-                if argument_type.kind == "buffer":
-                    storage = StorageClass.ADDRESSABLE
-                    access_name = argument_type.arguments[1] if len(argument_type.arguments) > 1 else "read_write"
+                if argument_type.kind == "tensor_view":
+                    access_name = argument_type.arguments[2]
                     access = AccessMode(str(access_name))
-                elif (
-                    stage == "compute" and argument_type.kind == "tensor" and not self._has_builtin(argument.annotation)
-                ):
-                    storage = StorageClass.ADDRESSABLE
-                    access = AccessMode.READ_WRITE
-                parameters.append(TypedParameter(argument.arg, argument_type, storage, access))
+                parameters.append(TypedParameter(argument.arg, argument_type, access))
             result_type = (
                 None
                 if function.returns is None
@@ -256,7 +277,7 @@ class _Inference:
                 else self.parse_type(function.returns)
             )
             parameter_map = {parameter.name: parameter for parameter in parameters}
-            body = tuple(self._typed_statement(statement, parameter_map) for statement in function.body)
+            body = self._typed_block(function.body, parameter_map)
             functions.append(
                 TypedFunctionInstance(
                     getattr(function, "_vernon_qualified_name", function.name),
@@ -269,19 +290,129 @@ class _Inference:
                     tuple(parameters),
                 )
             )
-        return tuple(functions)
+        by_symbol = {function.symbol: function for function in functions}
+        resolved: dict[str, TypedFunctionInstance] = {}
+        active: list[str] = []
+
+        def resolve(symbol: str) -> TypedFunctionInstance:
+            existing = resolved.get(symbol)
+            if existing is not None:
+                return existing
+            function = by_symbol[symbol]
+            if symbol in active:
+                raise self.error(function.source, f"recursive typed effect propagation for '{function.qualified_name}'")
+            active.append(symbol)
+            body = tuple(resolve_statement(statement, function) for statement in function.body)
+            active.pop()
+            effects = self._function_storage_effects(body)
+            result = replace(function, body=body, effects=effects)
+            resolved[symbol] = result
+            return result
+
+        def resolve_statement(statement: TypedStatement, caller: TypedFunctionInstance) -> TypedStatement:
+            children = tuple(resolve_statement(child, caller) for child in statement.children)
+            effects = list(statement.effects)
+            caller_parameters = {parameter.name: parameter for parameter in caller.parameters}
+            for expression in statement.expressions:
+                call = expression.source
+                if not isinstance(call, ast.Call):
+                    continue
+                callee = by_symbol.get(expression.operation or "")
+                if callee is None:
+                    continue
+                callee = resolve(callee.symbol)
+                formal_indices = {parameter.name: index for index, parameter in enumerate(callee.parameters)}
+                mapped: list[tuple[str, StorageEffect]] = []
+                for effect in callee.effects:
+                    formal_index = formal_indices.get(effect.owner.parameter)
+                    if formal_index is None or formal_index >= len(call.args):
+                        raise self.error(call, f"cannot bind effect owner '{effect.owner.parameter}'")
+                    actual = call.args[formal_index]
+                    if not isinstance(actual, ast.Name) or actual.id not in caller_parameters:
+                        raise self.error(actual, "effectful helper arguments must be TensorView parameters")
+                    parameter = caller_parameters[actual.id]
+                    if parameter.type.kind != "tensor_view":
+                        raise self.error(actual, "effectful helper owner must bind to a TensorView parameter")
+                    self._validate_effect_access(effect, parameter, actual)
+                    mapped_effect = replace(effect, owner=StorageOwner(parameter.name))
+                    mapped.append((effect.owner.parameter, mapped_effect))
+                self._validate_call_aliases(call, mapped)
+                for _, effect in mapped:
+                    if effect not in effects:
+                        effects.append(effect)
+            return replace(statement, effects=tuple(effects), children=children)
+
+        typed_functions = tuple(resolve(function.symbol) for function in functions)
+        for function in typed_functions:
+            for effect in function.effects:
+                if not isinstance(effect, StorageEffect):
+                    continue
+                parameter = next(
+                    (parameter for parameter in function.parameters if parameter.name == effect.owner.parameter),
+                    None,
+                )
+                if parameter is None:
+                    raise self.error(function.source, f"effect owner '{effect.owner.parameter}' is not a parameter")
+                self._validate_effect_access(effect, parameter, function.source)
+            function_kind = decorator_name(function.source.decorator_list[0])
+            if function_kind == "func" and function.effects:
+                raise self.error(
+                    function.source,
+                    f"pure helper '{function.qualified_name}' has Storage effects",
+                )
+            if function_kind not in {"func", "kernel", "vertex", "fragment"} and function.effects:
+                raise self.error(
+                    function.source,
+                    f"function stage '{function_kind}' does not allow Storage effects",
+                )
+        return typed_functions
 
     @staticmethod
-    def _has_builtin(annotation: ast.expr) -> bool:
-        return any(
-            isinstance(node, ast.Call) and (dotted_name(node.func) or "").split(".")[-1] == "builtin"
-            for node in ast.walk(annotation)
-        )
+    def _function_storage_effects(body: tuple[TypedStatement, ...]) -> tuple[StorageEffect, ...]:
+        effects: list[StorageEffect] = []
+
+        def collect(statement: TypedStatement) -> None:
+            for effect in statement.effects:
+                if isinstance(effect, StorageEffect) and effect not in effects:
+                    effects.append(effect)
+            for child in statement.children:
+                collect(child)
+
+        for statement in body:
+            collect(statement)
+        return tuple(effects)
+
+    def _validate_effect_access(
+        self,
+        effect: StorageEffect,
+        parameter: TypedParameter,
+        source: ast.AST,
+    ) -> None:
+        if effect.kind is StorageEffectKind.READ and parameter.access is AccessMode.WRITE:
+            raise self.error(source, f"effect reads write-only TensorView '{parameter.name}'")
+        if effect.kind is StorageEffectKind.WRITE and parameter.access is AccessMode.READ:
+            raise self.error(source, f"effect writes read-only TensorView '{parameter.name}'")
+
+    def _validate_call_aliases(
+        self,
+        call: ast.Call,
+        effects: list[tuple[str, StorageEffect]],
+    ) -> None:
+        for index, (left_formal, left) in enumerate(effects):
+            for right_formal, right in effects[index + 1 :]:
+                if left_formal == right_formal or left.owner != right.owner:
+                    continue
+                if (
+                    left.kind is StorageEffectKind.WRITE or right.kind is StorageEffectKind.WRITE
+                ) and left.region.overlaps(right.region):
+                    name = (dotted_name(call.func) or "").split(".")[-1]
+                    raise self.error(call, f"helper call '{name}' has incompatible aliased Storage effects")
 
     def _typed_statement(
         self,
         statement: ast.stmt,
         parameters: dict[str, TypedParameter],
+        loop_depth: int = 0,
     ) -> TypedStatement:
         typed_expressions: list[TypedExpression] = []
         for expression in self._statement_expressions(statement):
@@ -290,11 +421,9 @@ class _Inference:
                 continue
             _, inferred, operation = record
             value_type = default_type(inferred)
-            storage = StorageClass.VALUE
             access = AccessMode.READ
             if isinstance(expression, ast.Name) and expression.id in parameters:
                 parameter = parameters[expression.id]
-                storage = parameter.storage
                 access = parameter.access
             typed_expressions.append(
                 TypedExpression(
@@ -302,37 +431,111 @@ class _Inference:
                     value_type,
                     operation,
                     self._typed_operand_types(expression, value_type),
-                    storage,
                     access,
                 )
             )
         lvalues = self._statement_lvalues(statement, parameters)
         children: list[TypedStatement] = []
         if isinstance(statement, ast.If):
-            children.extend(self._typed_statement(child, parameters) for child in statement.body)
-            children.extend(self._typed_statement(child, parameters) for child in statement.orelse)
+            children.extend(self._typed_block(statement.body, parameters, loop_depth))
+            children.extend(self._typed_block(statement.orelse, parameters, loop_depth))
         elif isinstance(statement, (ast.For, ast.While)):
-            children.extend(self._typed_statement(child, parameters) for child in statement.body)
-            children.extend(self._typed_statement(child, parameters) for child in statement.orelse)
-        effect = (
-            Effect.WRITE
-            if lvalues
-            else Effect.READ
-            if any(
-                expression.operation in {"index", "texture_sample", "texture_size"} for expression in typed_expressions
-            )
-            else Effect.PURE
+            children.extend(self._typed_block(statement.body, parameters, loop_depth + 1))
+            children.extend(self._typed_block(statement.orelse, parameters, loop_depth))
+        effects = self._storage_effects(statement, typed_expressions, parameters)
+        termination = (
+            Termination.RETURN
+            if isinstance(statement, ast.Return)
+            else Termination.BREAK
+            if isinstance(statement, ast.Break)
+            else Termination.CONTINUE
+            if isinstance(statement, ast.Continue)
+            else Termination.FALLTHROUGH
         )
-        termination = Termination.RETURN if isinstance(statement, ast.Return) else Termination.FALLTHROUGH
+        return_type = None
+        if isinstance(statement, ast.Return) and statement.value is not None:
+            record = self.expression_records.get(id(statement.value))
+            if record is not None:
+                return_type = default_type(record[1])
         return TypedStatement(
             statement,
-            effect,
             termination,
+            effects,
             tuple(typed_expressions),
             lvalues,
             self.statement_merges.get(id(statement), ()),
             tuple(children),
+            loop_depth,
+            return_type,
         )
+
+    def _typed_block(
+        self,
+        statements: list[ast.stmt],
+        parameters: dict[str, TypedParameter],
+        loop_depth: int = 0,
+    ) -> tuple[TypedStatement, ...]:
+        typed: list[TypedStatement] = []
+        for statement in statements:
+            item = self._typed_statement(statement, parameters, loop_depth)
+            typed.append(item)
+            if item.termination is not Termination.FALLTHROUGH:
+                break
+        return tuple(typed)
+
+    @staticmethod
+    def _storage_region(node: ast.Subscript) -> StorageRegion:
+        indices = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
+        constants: list[int] = []
+        for index in indices:
+            if not isinstance(index, ast.Constant) or not isinstance(index.value, int) or isinstance(index.value, bool):
+                return StorageRegion(StorageRegionKind.UNKNOWN)
+            constants.append(index.value)
+        return StorageRegion(StorageRegionKind.ELEMENT, tuple(constants))
+
+    @classmethod
+    def _storage_effects(
+        cls,
+        statement: ast.stmt,
+        expressions: list[TypedExpression],
+        parameters: dict[str, TypedParameter],
+    ) -> tuple[StorageEffect, ...]:
+        effects: list[StorageEffect] = []
+
+        def effect_for(node: ast.Subscript, kind: StorageEffectKind) -> StorageEffect | None:
+            if not isinstance(node.value, ast.Name):
+                return None
+            parameter = parameters.get(node.value.id)
+            if parameter is None or parameter.type.kind != "tensor_view":
+                return None
+            return StorageEffect(
+                kind,
+                StorageOwner(parameter.name),
+                cls._storage_region(node),
+            )
+
+        augmented_target = statement.target if isinstance(statement, ast.AugAssign) else None
+        for expression in expressions:
+            node = expression.source
+            if not isinstance(node, ast.Subscript):
+                continue
+            if not isinstance(node.ctx, ast.Load) and node is not augmented_target:
+                continue
+            effect = effect_for(node, StorageEffectKind.READ)
+            if effect is not None and effect not in effects:
+                effects.append(effect)
+
+        target: ast.expr | None = None
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            target = statement.targets[0]
+        elif isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
+            target = statement.target
+        if isinstance(target, ast.Subscript):
+            effect = effect_for(target, StorageEffectKind.WRITE)
+            if effect is not None and effect not in effects:
+                effects.append(effect)
+
+        return tuple(effects)
 
     def _typed_operand_types(
         self,
@@ -341,6 +544,10 @@ class _Inference:
     ) -> tuple[ConcreteType, ...]:
         if isinstance(expression, ast.BinOp):
             return (result_type, result_type)
+        if isinstance(expression, ast.BoolOp):
+            return tuple(result_type for _ in expression.values)
+        if isinstance(expression, ast.IfExp):
+            return (_scalar("bool"), result_type, result_type)
         if isinstance(expression, ast.Compare) and expression.comparators:
             left = self.expression_records.get(id(expression.left))
             right = self.expression_records.get(id(expression.comparators[0]))
@@ -388,6 +595,23 @@ class _Inference:
             record = self.expression_records.get(id(value)) if value is not None else None
             value_type = default_type(record[1]) if record is not None else ConcreteType("void", "void")
             return (LValue("local", target.id, value_type),)
+        if isinstance(target, (ast.Tuple, ast.List)):
+            record = self.expression_records.get(id(value)) if value is not None else None
+            value_type = default_type(record[1]) if record is not None else ConcreteType("void", "void")
+
+            def destructured_lvalues(node: ast.expr, node_type: ConcreteType) -> tuple[LValue, ...]:
+                if isinstance(node, ast.Name):
+                    return (LValue("local", node.id, node_type),)
+                if not isinstance(node, (ast.Tuple, ast.List)) or node_type.kind != "tuple":
+                    return ()
+                return tuple(
+                    lvalue
+                    for item, element in zip(node.elts, node_type.arguments, strict=True)
+                    if isinstance(element, ConcreteType)
+                    for lvalue in destructured_lvalues(item, element)
+                )
+
+            return destructured_lvalues(target, value_type)
         if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
             parameter = parameters.get(target.value.id)
             if parameter is not None:
@@ -398,7 +622,6 @@ class _Inference:
                         "index",
                         target.value.id,
                         element,
-                        parameter.storage,
                         parameter.access,
                     ),
                 )
@@ -408,6 +631,7 @@ class _Inference:
         self,
         statements: list[ast.stmt],
         environment: dict[str, InferenceType],
+        loop_depth: int = 0,
     ) -> list[InferenceType | None]:
         returns: list[InferenceType | None] = []
         for statement in statements:
@@ -419,26 +643,24 @@ class _Inference:
                     environment[name] = _common(previous, value_type) if previous is not None else value_type
                     if environment[name] is None:
                         raise self.error(statement, f"local '{name}' has incompatible assignment types")
+                elif len(statement.targets) == 1 and isinstance(statement.targets[0], (ast.Tuple, ast.List)):
+                    self._bind_destructuring(statement.targets[0], value_type, environment)
                 elif len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Subscript):
                     target_type = self._expression(statement.targets[0].value, environment)
                     self._infer_indices(statement.targets[0].slice, environment)
                     if not isinstance(target_type, ConcreteType) or target_type.kind not in {
-                        "buffer",
                         "tensor",
+                        "tensor_view",
                     }:
-                        raise self.error(statement.targets[0], "indexed assignment requires a writable buffer")
-                    if (
-                        target_type.kind == "buffer"
-                        and len(target_type.arguments) > 1
-                        and target_type.arguments[1] == "read"
-                    ):
-                        raise self.error(statement.targets[0], "cannot assign through a read-only buffer")
+                        raise self.error(statement.targets[0], "indexed assignment requires writable Storage")
+                    if target_type.kind == "tensor_view" and target_type.arguments[2] == "read":
+                        raise self.error(statement.targets[0], "cannot assign through a read-only TensorView")
                     expected = target_type.arguments[0]
                     assert isinstance(expected, ConcreteType)
                     if not can_convert(value_type, expected):
                         raise self.error(statement.value, f"cannot store {describe(value_type)} as {expected.mlir}")
                 else:
-                    raise self.error(statement, "assignment target must be a local name or buffer element")
+                    raise self.error(statement, "assignment target must be a local name or TensorView element")
             elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
                 value_type = self._expression(statement.value, environment)
                 expected = self.parse_type(statement.annotation)
@@ -458,6 +680,14 @@ class _Inference:
                     environment[statement.target.id] = common
             elif isinstance(statement, ast.Expr):
                 self._expression(statement.value, environment)
+            elif isinstance(statement, ast.Break):
+                if loop_depth == 0:
+                    raise self.error(statement, "break is only valid inside a loop")
+                break
+            elif isinstance(statement, ast.Continue):
+                if loop_depth == 0:
+                    raise self.error(statement, "continue is only valid inside a loop")
+                break
             elif isinstance(statement, ast.Return):
                 returns.append(None if statement.value is None else self._expression(statement.value, environment))
                 break
@@ -466,8 +696,8 @@ class _Inference:
                 before = environment.copy()
                 then_environment = before.copy()
                 else_environment = before.copy()
-                returns.extend(self._statements(statement.body, then_environment))
-                returns.extend(self._statements(statement.orelse, else_environment))
+                returns.extend(self._statements(statement.body, then_environment, loop_depth))
+                returns.extend(self._statements(statement.orelse, else_environment, loop_depth))
                 branch_merges: list[BranchMerge] = []
                 assigned = self._assigned_names((*statement.body, *statement.orelse))
                 for name in sorted(then_environment.keys() & else_environment.keys() & assigned):
@@ -485,7 +715,7 @@ class _Inference:
                 assigned = self._assigned_names(statement.body)
                 for _ in range(8):
                     candidate = loop_environment.copy()
-                    loop_returns = self._statements(statement.body, candidate)
+                    loop_returns = self._statements(statement.body, candidate, loop_depth + 1)
                     merged_environment = before.copy()
                     for name in sorted(before.keys() & candidate.keys() & assigned):
                         merged = _common(before[name], candidate[name])
@@ -504,19 +734,111 @@ class _Inference:
                 )
                 returns.extend(loop_returns)
             elif isinstance(statement, ast.For):
-                loop_environment = environment.copy()
-                if isinstance(statement.target, ast.Name):
-                    loop_environment[statement.target.id] = ConcreteType("index", "index")
-                returns.extend(self._statements(statement.body, loop_environment))
+                if not isinstance(statement.target, ast.Name):
+                    raise self.error(statement.target, "for loop target must be a local name")
+                if (
+                    not isinstance(statement.iter, ast.Call)
+                    or dotted_name(statement.iter.func) != "range"
+                    or not 1 <= len(statement.iter.args) <= 3
+                    or statement.iter.keywords
+                ):
+                    raise self.error(
+                        statement.iter,
+                        "for loops require range(stop), range(start, stop), or range(start, stop, step)",
+                    )
+                range_type = ConcreteType("scalar", "i32")
+                for argument in statement.iter.args:
+                    inferred_argument = self._expression(argument, environment)
+                    concrete_argument = default_type(inferred_argument)
+                    if concrete_argument.kind != "scalar" or not concrete_argument.is_integer:
+                        raise self.error(argument, "range arguments must be i32 Values or integer literals")
+                    if concrete_argument.name == "u32":
+                        raise self.error(argument, "range u32 arguments require an explicit i32 conversion")
+                    self._constrain_literal(argument, range_type)
+                if len(statement.iter.args) == 3 and self._is_literal_zero(statement.iter.args[2]):
+                    raise self.error(statement.iter.args[2], "range step must not be zero")
+                before = environment.copy()
+                index_type = ConcreteType("index", "index")
+                loop_environment = {**before, statement.target.id: index_type}
+                loop_returns: list[InferenceType | None] = []
+                assigned = self._assigned_names(statement.body)
+                for _ in range(8):
+                    candidate = loop_environment.copy()
+                    loop_returns = self._statements(statement.body, candidate, loop_depth + 1)
+                    merged_environment = before.copy()
+                    for name in sorted(before.keys() & candidate.keys() & assigned):
+                        merged = _common(before[name], candidate[name])
+                        if merged is None:
+                            raise self.error(statement, f"loop local '{name}' has incompatible types")
+                        merged_environment[name] = merged
+                    next_environment = {**merged_environment, statement.target.id: index_type}
+                    if next_environment == loop_environment:
+                        break
+                    loop_environment = next_environment
+                else:
+                    raise self.error(statement, "loop-carried type inference did not converge")
+                environment.update(
+                    {name: value for name, value in loop_environment.items() if name != statement.target.id}
+                )
+                self.statement_merges[id(statement)] = tuple(
+                    BranchMerge(name, default_type(loop_environment[name]))
+                    for name in sorted(before.keys() & loop_environment.keys() & assigned)
+                )
+                returns.extend(loop_returns)
         return returns
+
+    @staticmethod
+    def _is_literal_zero(node: ast.expr) -> bool:
+        if isinstance(node, ast.Constant):
+            return isinstance(node.value, int) and not isinstance(node.value, bool) and node.value == 0
+        return (
+            isinstance(node, ast.UnaryOp)
+            and isinstance(node.op, (ast.UAdd, ast.USub))
+            and isinstance(node.operand, ast.Constant)
+            and isinstance(node.operand.value, int)
+            and not isinstance(node.operand.value, bool)
+            and node.operand.value == 0
+        )
+
+    def _bind_destructuring(
+        self,
+        target: ast.Tuple | ast.List,
+        value_type: InferenceType,
+        environment: dict[str, InferenceType],
+    ) -> None:
+        if not isinstance(value_type, ConcreteType) or value_type.kind != "tuple":
+            raise self.error(target, "assignment target destructuring requires a Tuple value")
+        if len(target.elts) != len(value_type.arguments):
+            raise self.error(target, "Tuple destructuring arity does not match the value")
+        for item, element in zip(target.elts, value_type.arguments, strict=True):
+            assert isinstance(element, ConcreteType)
+            if isinstance(item, ast.Name):
+                previous = environment.get(item.id)
+                merged = _common(previous, element) if previous is not None else element
+                if merged is None:
+                    raise self.error(item, f"local '{item.id}' has incompatible assignment types")
+                environment[item.id] = merged
+            elif isinstance(item, (ast.Tuple, ast.List)):
+                self._bind_destructuring(item, element, environment)
+            else:
+                raise self.error(item, "Tuple destructuring targets must be local names")
 
     @staticmethod
     def _assigned_names(statements: tuple[ast.stmt, ...] | list[ast.stmt]) -> set[str]:
         names: set[str] = set()
+
+        def target_names(target: ast.expr) -> set[str]:
+            if isinstance(target, ast.Name):
+                return {target.id}
+            if isinstance(target, (ast.Tuple, ast.List)):
+                return set().union(*(target_names(item) for item in target.elts))
+            return set()
+
         for statement in statements:
             for node in ast.walk(statement):
                 if isinstance(node, ast.Assign):
-                    names.update(target.id for target in node.targets if isinstance(target, ast.Name))
+                    for target in node.targets:
+                        names.update(target_names(target))
                 elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
                     names.add(node.target.id)
                 elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
@@ -550,7 +872,26 @@ class _Inference:
         if isinstance(node, ast.UnaryOp):
             return _scalar("bool") if isinstance(node.op, ast.Not) else self._expression(node.operand, environment)
         if isinstance(node, ast.BoolOp):
-            raise self.error(node, "and/or require short-circuit semantics and are not supported")
+            boolean = _scalar("bool")
+            for value in node.values:
+                value_type = default_type(self._expression(value, environment))
+                if value_type != boolean:
+                    raise self.error(value, "and/or operands must be bool Values")
+            return boolean
+        if isinstance(node, ast.IfExp):
+            boolean = _scalar("bool")
+            condition = default_type(self._expression(node.test, environment))
+            if condition != boolean:
+                raise self.error(node.test, "conditional expression condition must be a bool Value")
+            then_type = self._expression(node.body, environment)
+            else_type = self._expression(node.orelse, environment)
+            result = _common(then_type, else_type)
+            if result is None:
+                raise self.error(node, "conditional expression branches have incompatible types")
+            result = default_type(result)
+            self._constrain_literal(node.body, result)
+            self._constrain_literal(node.orelse, result)
+            return result
         if isinstance(node, ast.Compare):
             left = self._expression(node.left, environment)
             for value in node.comparators:
@@ -562,10 +903,39 @@ class _Inference:
                 self._constrain_literal(value, common)
                 left = right
             return _scalar("bool")
+        if isinstance(node, ast.Tuple):
+            if not node.elts:
+                raise self.error(node, "Tuple values must contain at least one element")
+            return ConcreteType(
+                "tuple",
+                "Tuple",
+                tuple(default_type(self._expression(element, environment)) for element in node.elts),
+            )
         if isinstance(node, ast.Subscript):
             value_type = self._expression(node.value, environment)
+            if isinstance(value_type, ConcreteType) and value_type.kind == "tuple":
+                if (
+                    not isinstance(node.slice, ast.Constant)
+                    or not isinstance(node.slice.value, int)
+                    or isinstance(node.slice.value, bool)
+                ):
+                    raise self.error(node.slice, "Tuple indexing requires an integer literal")
+                index = node.slice.value
+                if index < 0:
+                    index += len(value_type.arguments)
+                if index < 0 or index >= len(value_type.arguments):
+                    raise self.error(node.slice, "Tuple index is out of bounds")
+                element = value_type.arguments[index]
+                assert isinstance(element, ConcreteType)
+                return element
             self._infer_indices(node.slice, environment)
-            if isinstance(value_type, ConcreteType) and value_type.kind in {"tensor", "buffer"}:
+            if (
+                isinstance(value_type, ConcreteType)
+                and value_type.kind == "tensor_view"
+                and value_type.arguments[2] == "write"
+            ):
+                raise self.error(node, "cannot load through a write-only TensorView")
+            if isinstance(value_type, ConcreteType) and value_type.kind in {"tensor", "tensor_view"}:
                 element = value_type.arguments[0]
                 assert isinstance(element, ConcreteType)
                 return element
@@ -607,6 +977,10 @@ class _Inference:
             }.get(type(node.op))
         if isinstance(node, ast.UnaryOp):
             return "not" if isinstance(node.op, ast.Not) else "neg" if isinstance(node.op, ast.USub) else "identity"
+        if isinstance(node, ast.BoolOp):
+            return "and" if isinstance(node.op, ast.And) else "or"
+        if isinstance(node, ast.IfExp):
+            return "conditional"
         if isinstance(node, ast.Compare):
             return type(node.ops[0]).__name__.lower() if node.ops else "compare"
         if isinstance(node, ast.Subscript):
@@ -615,6 +989,8 @@ class _Inference:
             return "attribute"
         if isinstance(node, ast.Call):
             return (dotted_name(node.func) or "").split(".")[-1]
+        if isinstance(node, ast.Tuple):
+            return "tuple"
         if isinstance(node, ast.Constant):
             return "constant"
         if isinstance(node, ast.Name):
@@ -623,6 +999,19 @@ class _Inference:
 
     def _constrain_literal(self, node: ast.expr, expected: InferenceType) -> None:
         if not isinstance(expected, ConcreteType):
+            return
+        tuple_elements = (
+            node.elts
+            if isinstance(node, ast.Tuple)
+            else node.args
+            if isinstance(node, ast.Call) and (dotted_name(node.func) or "").split(".")[-1] == "Tuple"
+            else None
+        )
+        if tuple_elements is not None and expected.kind == "tuple" and len(tuple_elements) == len(expected.arguments):
+            for element, element_type in zip(tuple_elements, expected.arguments, strict=True):
+                assert isinstance(element_type, ConcreteType)
+                self._constrain_literal(element, element_type)
+            self.expression_records[id(node)] = (node, expected, "Tuple" if isinstance(node, ast.Call) else "tuple")
             return
         record = self.expression_records.get(id(node))
         if record is None:
@@ -635,9 +1024,13 @@ class _Inference:
     def _call(self, node: ast.Call, environment: dict[str, InferenceType]) -> InferenceType:
         resolved_name = (dotted_name(node.func) or "").split(".")[-1]
         name = getattr(node, "_vernon_generic_name", resolved_name)
-        if name in {"Vector", "Matrix"}:
+        if name in {"Tensor", "Vector", "Matrix"}:
             return self._aggregate(node, environment, name)
         arguments = [self._expression(argument, environment) for argument in node.args]
+        if name == "Tuple":
+            if not arguments:
+                raise self.error(node, "Tuple values must contain at least one element")
+            return ConcreteType("tuple", "Tuple", tuple(default_type(argument) for argument in arguments))
         if (
             isinstance(node.func, ast.Attribute)
             and name in {"norm", "normalize"}
@@ -676,6 +1069,10 @@ class _Inference:
                 if result is None or (isinstance(result, ast.Constant) and result.value is None)
                 else self.parse_type(result)
             )
+        if name == "atomic" or name.startswith("atomic_"):
+            raise self.error(node, "atomic operations are reserved for Phase 6 and are not supported")
+        if name in {"barrier", "workgroup_barrier", "storage_barrier"}:
+            raise self.error(node, "barrier operations are reserved for Phase 6 and are not supported")
         if name in {"int", "i32"}:
             return _scalar("i32")
         if name == "u32":
@@ -697,23 +1094,6 @@ class _Inference:
                     raise self.error(node, f"cannot pass {describe(inferred)} as {expected.mlir}")
                 self._constrain_literal(source, expected)
             return ConcreteType("struct", name)
-        if name in {"vec2", "vec3", "vec4", "mat2", "mat3", "mat4"}:
-            if not arguments:
-                raise self.error(node, f"{name} requires arguments")
-            element = _element(arguments[0])
-            for argument in arguments[1:]:
-                common = _common(element, _element(argument))
-                if common is None:
-                    raise self.error(node, f"{name} arguments have incompatible types")
-                element = common
-            element = default_type(element)
-            if element.kind != "scalar":
-                raise self.error(node, f"{name} arguments have incompatible types")
-            for source in node.args:
-                self._constrain_literal(source, element)
-            size = int(name[-1])
-            shape = (size,) if name.startswith("vec") else (size, size)
-            return ConcreteType("tensor", "Tensor", (element, *shape))
         if name == "matmul":
             if len(arguments) != 2:
                 raise self.error(node, "matmul requires two arguments")
@@ -790,20 +1170,43 @@ class _Inference:
         environment: dict[str, InferenceType],
         name: str,
     ) -> ConcreteType:
-        if len(node.args) != 1 or not isinstance(node.args[0], (ast.List, ast.Tuple)):
+        if len(node.args) != 1:
             raise self.error(node, f"{name} requires one sequence literal")
-        outer = list(node.args[0].elts)
         if name == "Vector":
-            elements = outer
-            shape = (len(outer),)
-        else:
-            rows = [list(row.elts) for row in outer if isinstance(row, (ast.List, ast.Tuple))]
-            if len(rows) != len(outer) or not rows or not rows[0] or any(len(row) != len(rows[0]) for row in rows):
-                raise self.error(node, "Matrix requires a rectangular nested sequence")
-            elements = [value for row in rows for value in row]
-            shape = (len(rows), len(rows[0]))
-        if not elements:
-            raise self.error(node, f"{name} cannot be empty")
+            sequence = node.args[0]
+            if not isinstance(sequence, (ast.List, ast.Tuple)) or not sequence.elts:
+                raise self.error(node, "Vector requires a non-empty sequence literal")
+            values = [default_type(self._expression(value, environment)) for value in sequence.elts]
+            if any(
+                not isinstance(value, ConcreteType)
+                or (value.kind != "scalar" and not (value.kind == "tensor" and len(value.arguments) == 2))
+                for value in values
+            ):
+                raise self.error(node, "Vector elements must be scalars or rank-one Tensor Values")
+            element = _element(values[0])
+            count = 0
+            for value in values:
+                common = _common(element, _element(value))
+                if common is None:
+                    raise self.error(node, "Vector elements have incompatible types")
+                element = common
+                count += 1 if value.kind == "scalar" else int(value.arguments[1])
+            element = default_type(element)
+            for source, value in zip(sequence.elts, values, strict=True):
+                expected = (
+                    element
+                    if value.kind == "scalar"
+                    else ConcreteType("tensor", "Tensor", (element, value.arguments[1]))
+                )
+                self._constrain_literal(source, expected)
+            return ConcreteType("tensor", "Tensor", (element, count))
+        literal = rectangular_literal(node.args[0])
+        if literal is None:
+            raise self.error(node, f"{name} requires a non-empty rectangular sequence literal")
+        elements, shape = literal
+        expected_rank = {"Vector": 1, "Matrix": 2}.get(name)
+        if expected_rank is not None and len(shape) != expected_rank:
+            raise self.error(node, f"{name} requires a rank-{expected_rank} sequence literal")
         element = self._expression(elements[0], environment)
         for value in elements[1:]:
             common = _common(element, self._expression(value, environment))
@@ -811,7 +1214,7 @@ class _Inference:
                 raise self.error(node, f"{name} elements have incompatible types")
             element = common
         element = default_type(element)
-        if element.kind != "scalar":
+        if not is_abi_stable_value(element):
             raise self.error(node, f"{name} elements have incompatible types")
         for value in elements:
             self._constrain_literal(value, element)

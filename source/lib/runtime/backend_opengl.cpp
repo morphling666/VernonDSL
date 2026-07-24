@@ -429,7 +429,12 @@ VernonStatus launchOpenGLKernel(VernonRuntimeContext &context, GlUint program, c
             gl.bufferData(kShaderStorageBuffer, static_cast<GlSizePtr>(argument.scalar_size), argument.scalar_data,
                           kDynamicCopy);
         }
-        gl.bindBufferBase(kShaderStorageBuffer, reflected.binding, name);
+        if (reflected.kind == "tensor" && !reflected.storageLeaves.empty()) {
+            for (const ReflectedStorageLeaf &leaf : reflected.storageLeaves)
+                gl.bindBufferBase(kShaderStorageBuffer, leaf.binding, name);
+        } else {
+            gl.bindBufferBase(kShaderStorageBuffer, reflected.binding, name);
+        }
     }
     const uint32_t *workgroup = reflection.workgroup;
     gl.dispatchCompute((globalSize.x - 1) / workgroup[0] + 1, (globalSize.y - 1) / workgroup[1] + 1,
@@ -525,7 +530,7 @@ VernonStatus encodeAndSubmitOpenGLCompute(VernonRuntimeContext &context, GlUint 
     for (const Parameter &parameter : variant.parameters) {
         const VernonPipelineArgument &argument = *plan.arguments.at(parameter.slot);
         for (const ParameterUse &use : parameter.uses) {
-            if (use.stage != "compute")
+            if (use.stage != "compute" && use.stage != variant.compute)
                 continue;
             if (use.binding == UINT32_MAX)
                 return failCompute("compute parameter has no resource binding");

@@ -23,7 +23,7 @@ bool planComputeLaunch(const Variant &variant, const ComputeArgumentMap &argumen
     size_t computeArgumentCount = 0;
     for (const Parameter &parameter : variant.parameters)
         for (const ParameterUse &use : parameter.uses)
-            computeArgumentCount += use.stage == "compute";
+            computeArgumentCount += use.stage == "compute" || use.stage == variant.compute;
 
     plan = {};
     plan.arguments.resize(computeArgumentCount);
@@ -36,7 +36,7 @@ bool planComputeLaunch(const Variant &variant, const ComputeArgumentMap &argumen
             return fail(error, "compute argument is missing");
         const VernonPipelineArgument &supplied = *suppliedIt->second;
         for (const ParameterUse &use : parameter.uses) {
-            if (use.stage != "compute")
+            if (use.stage != "compute" && use.stage != variant.compute)
                 continue;
             if (use.index >= computeArgumentCount || assigned[use.index])
                 return fail(error, "compute argument indices are not contiguous");
@@ -47,8 +47,8 @@ bool planComputeLaunch(const Variant &variant, const ComputeArgumentMap &argumen
             if (supplied.tensor.storage == VERNON_TENSOR_DEVICE) {
                 if (!supplied.tensor.buffer || !callbacks.bufferContext ||
                     callbacks.bufferContext(callbacks.userData, supplied.tensor.buffer) != expectedContext ||
-                    supplied.tensor.byte_offset != 0 || !isRowMajorContiguous(supplied.tensor))
-                    return fail(error, "compute device Tensor must be a contiguous whole-buffer view");
+                    !tensorFitsAllocation(supplied.tensor))
+                    return fail(error, "compute device Tensor view is invalid");
                 argument.kind = VERNON_LAUNCH_TENSOR;
                 argument.buffer = supplied.tensor.buffer;
             } else {

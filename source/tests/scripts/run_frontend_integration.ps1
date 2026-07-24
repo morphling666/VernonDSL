@@ -21,10 +21,11 @@ $runtimeShaderPath = Join-Path $ProjectRoot "examples\runtime_shader.py"
 $runtimeMlirPath = Join-Path $BinaryDir "runtime-shader.mlir"
 $openGlOutput = Join-Path $BinaryDir "runtime-shader-opengl"
 $bundlePath = Join-Path $BinaryDir "runtime-shader"
+$env:PYTHONPATH = Join-Path $ProjectRoot "python"
 
 Push-Location $ProjectRoot
 try {
-  & uv run --frozen vernon-compile-python $inputPath -o $outputPath
+  & uv run --frozen python -m vernon_dsl.cli $inputPath -o $outputPath
   if ($LASTEXITCODE -ne 0) {
     throw "Python frontend compilation failed"
   }
@@ -34,7 +35,7 @@ try {
     throw "Native Vernon MLIR validation failed"
   }
 
-  & uv run --frozen vernon-compile-python $shaderPath -o $shaderMlirPath
+  & uv run --frozen python -m vernon_dsl.cli $shaderPath -o $shaderMlirPath
   if ($LASTEXITCODE -ne 0) {
     throw "Multi-file shader frontend compilation failed"
   }
@@ -71,7 +72,7 @@ try {
     throw "CPU reference shader compilation failed"
   }
 
-  & uv run --frozen vernon-compile-python $runtimeShaderPath -o $runtimeMlirPath
+  & uv run --frozen python -m vernon_dsl.cli $runtimeShaderPath -o $runtimeMlirPath
   if ($LASTEXITCODE -ne 0) {
     throw "Runtime shader frontend compilation failed"
   }

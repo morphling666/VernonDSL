@@ -26,9 +26,9 @@ fractal = _load_fractal()
 
 @vd.kernel(workgroup_size=(4, 2, 1))
 def tensor_operators(
-    output: vd.Tensor[vd.f32, (None, None, None)],
-    left: vd.Tensor[vd.f32, (None, None, None)],
-    right: vd.Tensor[vd.f32, (None, None, None)],
+    output: vd.TensorView[vd.f32, 3, vd.write],
+    left: vd.TensorView[vd.f32, 3, vd.read],
+    right: vd.TensorView[vd.f32, 3, vd.read],
     scale: vd.f32,
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
@@ -40,20 +40,22 @@ def tensor_operators(
 
 @vd.kernel(workgroup_size=(8, 1, 1))
 def vector_while(
-    output: vd.Tensor[vd.f32, (None,)],
+    output: vd.TensorView[vd.f32, 1, vd.write],
     phase: vd.f32,
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     x = gid[0]
-    c = vd.vec2(-0.8, vd.cos(phase) * 0.2)
-    z = vd.vec2(vd.f32(x) * 0.01, 0.1)
+    c = vd.Vector([-0.8, vd.cos(phase) * 0.2])
+    z = vd.Vector([vd.f32(x) * 0.01, 0.1])
     iterations = 0
     running = vd.norm(z) < 20.0
     while running:
         z = (
-            vd.vec2(
-                z[0] * z[0] - z[1] * z[1],
-                z[1] * z[0] * 2.0,
+            vd.Vector(
+                [
+                    z[0] * z[0] - z[1] * z[1],
+                    z[1] * z[0] * 2.0,
+                ]
             )
             + c
         )
@@ -66,24 +68,256 @@ def vector_while(
 
 @vd.kernel(workgroup_size=(2, 1, 1))
 def matrix_vector(
-    output: vd.Tensor[vd.f32, (None,)],
+    output: vd.TensorView[vd.f32, 1, vd.write],
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     x = gid[0]
-    matrix = vd.mat2(1.0, 2.0, 3.0, 4.0)
-    value = vd.matmul(matrix, vd.vec2(5.0, 6.0))
+    matrix = vd.Matrix([[1.0, 2.0], [3.0, 4.0]])
+    value = vd.matmul(matrix, vd.Vector([5.0, 6.0]))
     output[x] = value[x]
 
 
 @vd.kernel(workgroup_size=(8, 1, 1))
 def floating_power(
-    output: vd.Tensor[vd.f32, (None,)],
-    values: vd.Tensor[vd.f32, (None,)],
+    output: vd.TensorView[vd.f32, 1, vd.write],
+    values: vd.TensorView[vd.f32, 1, vd.read],
     exponent: vd.f32,
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     x = gid[0]
     output[x] = values[x] ** 2.5 + values[x] ** exponent
+
+
+@vd.kernel(workgroup_size=(4, 2, 1))
+def copy_tensor_view(
+    output: vd.TensorView[vd.f32, 2, vd.read_write],
+    source: vd.TensorView[vd.f32, 2, vd.read],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    output[gid[1], gid[0]] = source[gid[1], gid[0]]
+
+
+@vd.kernel(workgroup_size=(4, 1, 1))
+def short_circuit_boolean(
+    output: vd.TensorView[vd.i32, 1, vd.write],
+    left: vd.TensorView[vd.i32, 1, vd.read],
+    right: vd.TensorView[vd.i32, 1, vd.read],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    x = gid[0]
+    if left[x] > 0 and right[x] > 0:
+        output[x] = 1
+    else:
+        output[x] = 0
+
+
+@vd.kernel(workgroup_size=(4, 1, 1))
+def conditional_select(
+    output: vd.TensorView[vd.i32, 1, vd.write],
+    left: vd.TensorView[vd.i32, 1, vd.read],
+    right: vd.TensorView[vd.i32, 1, vd.read],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    x = gid[0]
+    output[x] = left[x] if x % 2 == 0 else right[x]
+
+
+@vd.func
+def sum_odds_until_break(limit: vd.i32) -> vd.i32:
+    index = 0
+    total = 0
+    while index < limit:
+        index += 1
+        if index % 2 == 0:
+            continue
+        if index > 7:
+            break
+        total += index
+    return total
+
+
+@vd.kernel
+def loop_control(
+    output: vd.TensorView[vd.i32, 1, vd.write],
+    limit: vd.i32,
+) -> None:
+    output[0] = sum_odds_until_break(limit)
+
+
+@vd.func
+def nested_loop_control_value() -> vd.i32:
+    outer = 0
+    total = 0
+    while outer < 3:
+        outer += 1
+        inner = 0
+        while inner < 5:
+            inner += 1
+            if inner == 2:
+                break
+            total += 10
+        if outer == 2:
+            continue
+        total += 1
+    return total
+
+
+@vd.kernel
+def nested_loop_control(
+    output: vd.TensorView[vd.i32, 1, vd.write],
+) -> None:
+    output[0] = nested_loop_control_value()
+
+
+@vd.func
+def early_return_from_loop(limit: vd.i32) -> vd.i32:
+    index = 0
+    while index < limit:
+        index += 1
+        if index == 3:
+            return index * 10
+    return -1
+
+
+@vd.kernel
+def loop_early_return(
+    output: vd.TensorView[vd.i32, 1, vd.write],
+    source: vd.TensorView[vd.i32, 1, vd.read],
+) -> None:
+    output[0] = early_return_from_loop(source[0])
+
+
+@vd.func
+def dynamic_range_sum(start: vd.i32, stop: vd.i32, step: vd.i32) -> vd.i32:
+    total = 0
+    for index in range(start, stop, step):
+        total += vd.i32(index)
+    return total
+
+
+@vd.kernel
+def dynamic_range(
+    output: vd.TensorView[vd.i32, 1, vd.write],
+    controls: vd.TensorView[vd.i32, 1, vd.read],
+) -> None:
+    output[0] = dynamic_range_sum(controls[0], controls[1], controls[2])
+
+
+@vd.func
+def signed_literal_step_range_sum(
+    start: vd.i32,
+    stop: vd.i32,
+    direction: vd.i32,
+) -> vd.i32:
+    total = 0
+    if direction > 0:
+        for index in range(start, stop, 2):
+            total += vd.i32(index)
+    else:
+        for index in range(start, stop, -3):
+            total += vd.i32(index)
+    return total
+
+
+@vd.kernel
+def signed_literal_step_range(
+    output: vd.TensorView[vd.i32, 1, vd.write],
+    controls: vd.TensorView[vd.i32, 1, vd.read],
+) -> None:
+    output[0] = signed_literal_step_range_sum(controls[0], controls[1], controls[2])
+
+
+@vd.func
+def range_loop_control_value(stop: vd.i32) -> vd.i32:
+    total = 0
+    for index in range(0, stop):
+        value = vd.i32(index)
+        if value == 2:
+            continue
+        if value == 6:
+            break
+        total += value
+    return total
+
+
+@vd.func
+def range_early_return_value(stop: vd.i32) -> vd.i32:
+    for index in range(0, stop):
+        value = vd.i32(index)
+        if value == 3:
+            return value * 10
+    return -1
+
+
+@vd.kernel
+def range_control_flow(
+    output: vd.TensorView[vd.i32, 1, vd.write],
+    controls: vd.TensorView[vd.i32, 1, vd.read],
+) -> None:
+    output[0] = range_loop_control_value(controls[0])
+    output[1] = range_early_return_value(controls[0])
+
+
+@vd.struct(shared=True)
+class AggregateRecord:
+    vector: vd.Tensor[vd.f32, (2,)]
+    pair: vd.Tuple[vd.i32, vd.f32]
+
+
+@vd.func
+def early_record(flag: vd.bool) -> AggregateRecord:
+    if flag:
+        return AggregateRecord(vd.Vector([5.0, 6.0]), (7, 2.5))
+    return AggregateRecord(vd.Vector([10.0, 11.0]), (9, 4.5))
+
+
+@vd.func
+def early_tuple(flag: vd.bool) -> vd.Tuple[vd.i32, vd.f32]:
+    if flag:
+        return (3, 4.5)
+    return (8, 9.5)
+
+
+@vd.kernel
+def early_return_values(
+    output: vd.TensorView[vd.f32, 1, vd.write],
+    flag: vd.i32,
+) -> None:
+    record = early_record(flag != 0)
+    pair = early_tuple(flag != 0)
+    output[0] = vd.f32(record.pair[0])
+    output[1] = record.pair[1]
+    output[2] = vd.f32(pair[0])
+    output[3] = pair[1]
+    output[4] = record.vector[0]
+    output[5] = record.vector[1]
+
+
+@vd.kernel(workgroup_size=(4, 1, 1))
+def copy_aggregate_tensor_view(
+    output: vd.TensorView[AggregateRecord, 1, vd.write],
+    source: vd.TensorView[AggregateRecord, 1, vd.read],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    output[gid[0]] = source[gid[0]]
+
+
+@vd.kernel(workgroup_size=(2, 1, 1))
+def copy_tuple_tensor_view(
+    output: vd.TensorView[vd.Tuple[vd.i32, vd.f32], 1, vd.write],
+    source: vd.TensorView[vd.Tuple[vd.i32, vd.f32], 1, vd.read],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    output[gid[0]] = source[gid[0]]
+
+
+@vd.kernel(workgroup_size=(2, 1, 1))
+def copy_value_tensor_view(
+    output: vd.TensorView[vd.Tensor[vd.f32, (2,)], 1, vd.write],
+    source: vd.TensorView[vd.Tensor[vd.f32, (2,)], 1, vd.read],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    output[gid[0]] = source[gid[0]]
 
 
 class KernelTensorRuntimeTests(unittest.TestCase):
@@ -93,11 +327,11 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         shape = (2, 3, 4)
         left_array = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
         right_array = np.linspace(0.25, 2.5, np.prod(shape), dtype=np.float32).reshape(shape)
-        output = vd.Tensor.zeros(dtype=vd.f32, shape=shape)
+        output = vd.storage.zeros(dtype=vd.f32, shape=shape)
         tensor_operators(
             output,
-            vd.Tensor.from_numpy(left_array),
-            vd.Tensor.from_numpy(right_array),
+            vd.storage.from_numpy(left_array),
+            vd.storage.from_numpy(right_array),
             2.0,
             grid=(shape[2], shape[1], shape[0]),
         )
@@ -106,7 +340,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
     @staticmethod
     def _run_vector_while(arch: object) -> np.ndarray:
         vd.init(arch=arch)  # type: ignore[arg-type]
-        output = vd.Tensor.zeros(dtype=vd.f32, shape=(16,))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(16,))
         vector_while(output, 0.35, grid=(16, 1, 1))
         return output.to_numpy()
 
@@ -158,6 +392,182 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                 backend_actual = self._run_tensor_operators(backend)
                 np.testing.assert_allclose(backend_actual, expected, rtol=0.0, atol=1e-6)
 
+    def test_lazy_short_circuit_boolean_backend_parity(self) -> None:
+        left_values = np.array((1, 0, -1, 2), dtype=np.int32)
+        right_values = np.array((1, 1, 1, -2), dtype=np.int32)
+        expected = np.array((1, 0, 0, 0), dtype=np.int32)
+        backends = [vd.cpu]
+        if self._cuda_available():
+            backends.append(vd.cuda)
+        if self._vulkan_available():
+            backends.append(vd.vulkan)
+        for backend in backends:
+            with self.subTest(backend=backend.name):
+                vd.init(arch=backend)
+                output = vd.storage.zeros(dtype=vd.i32, shape=(4,))
+                short_circuit_boolean(
+                    output,
+                    vd.storage.from_numpy(left_values),
+                    vd.storage.from_numpy(right_values),
+                    grid=(4, 1, 1),
+                )
+                np.testing.assert_array_equal(output.to_numpy(), expected)
+
+    def test_conditional_expression_backend_parity(self) -> None:
+        left_values = np.array((10, 20, 30, 40), dtype=np.int32)
+        right_values = np.array((1, 2, 3, 4), dtype=np.int32)
+        expected = np.array((10, 2, 30, 4), dtype=np.int32)
+        backends = [vd.cpu]
+        if self._cuda_available():
+            backends.append(vd.cuda)
+        if self._vulkan_available():
+            backends.append(vd.vulkan)
+        for backend in backends:
+            with self.subTest(backend=backend.name):
+                vd.init(arch=backend)
+                output = vd.storage.zeros(dtype=vd.i32, shape=(4,))
+                conditional_select(
+                    output,
+                    vd.storage.from_numpy(left_values),
+                    vd.storage.from_numpy(right_values),
+                    grid=(4, 1, 1),
+                )
+                np.testing.assert_array_equal(output.to_numpy(), expected)
+
+    def test_break_continue_backend_parity(self) -> None:
+        backends = [vd.cpu]
+        if self._cuda_available():
+            backends.append(vd.cuda)
+        if self._vulkan_available():
+            backends.append(vd.vulkan)
+        for backend in backends:
+            with self.subTest(backend=backend.name):
+                vd.init(arch=backend)
+                output = vd.storage.zeros(dtype=vd.i32, shape=(1,))
+                loop_control(output, 20)
+                np.testing.assert_array_equal(output.to_numpy(), np.array((16,), dtype=np.int32))
+
+    def test_nested_loop_control_targets_nearest_loop(self) -> None:
+        backends = [vd.cpu]
+        if self._cuda_available():
+            backends.append(vd.cuda)
+        if self._vulkan_available():
+            backends.append(vd.vulkan)
+        for backend in backends:
+            with self.subTest(backend=backend.name):
+                vd.init(arch=backend)
+                output = vd.storage.zeros(dtype=vd.i32, shape=(1,))
+                nested_loop_control(output)
+                np.testing.assert_array_equal(output.to_numpy(), np.array((32,), dtype=np.int32))
+
+    def test_early_return_aggregate_payload_backend_parity(self) -> None:
+        backends = [vd.cpu]
+        if self._cuda_available():
+            backends.append(vd.cuda)
+        if self._vulkan_available():
+            backends.append(vd.vulkan)
+        for backend in backends:
+            for flag, expected in (
+                (True, np.array((7.0, 2.5, 3.0, 4.5, 5.0, 6.0), dtype=np.float32)),
+                (False, np.array((9.0, 4.5, 8.0, 9.5, 10.0, 11.0), dtype=np.float32)),
+            ):
+                with self.subTest(backend=backend.name, flag=flag):
+                    vd.init(arch=backend)
+                    output = vd.storage.zeros(dtype=vd.f32, shape=(6,))
+                    early_return_values(output, 1 if flag else 0, grid=(1, 1, 1))
+                    np.testing.assert_array_equal(output.to_numpy(), expected)
+
+    def test_loop_early_return_backend_parity(self) -> None:
+        backends = [vd.cpu]
+        if self._cuda_available():
+            backends.append(vd.cuda)
+        if self._vulkan_available():
+            backends.append(vd.vulkan)
+        for backend in backends:
+            for limit, expected in ((2, -1), (8, 30)):
+                with self.subTest(backend=backend.name, limit=limit):
+                    vd.init(arch=backend)
+                    output = vd.storage.zeros(dtype=vd.i32, shape=(1,))
+                    source = vd.storage.from_numpy(np.array((limit,), dtype=np.int32))
+                    loop_early_return(output, source)
+                    np.testing.assert_array_equal(output.to_numpy(), np.array((expected,), dtype=np.int32))
+
+    def test_dynamic_signed_range_step_cpu_cuda_parity(self) -> None:
+        cases = (
+            ((0, 10, 2), 20),
+            ((10, 0, -3), 22),
+            ((5, 5, 1), 0),
+            ((0, 5, -1), 0),
+            ((2_147_483_646, 2_147_483_647, 2), 2_147_483_646),
+            ((-2_147_483_647, -2_147_483_648, -2), -2_147_483_647),
+        )
+        backends = [vd.cpu]
+        if self._cuda_available():
+            backends.append(vd.cuda)
+        for backend in backends:
+            for controls, expected in cases:
+                with self.subTest(backend=backend.name, controls=controls):
+                    vd.init(arch=backend)
+                    output = vd.storage.zeros(dtype=vd.i32, shape=(1,))
+                    control_values = vd.storage.from_numpy(np.array(controls, dtype=np.int32))
+                    dynamic_range(output, control_values, grid=(1, 1, 1))
+                    np.testing.assert_array_equal(output.to_numpy(), np.array((expected,), dtype=np.int32))
+
+    def test_dynamic_zero_range_step_is_runtime_contract_violation(self) -> None:
+        import os
+        import subprocess
+        import sys
+
+        project = Path(__file__).resolve().parents[2]
+        script = (
+            "import sys; "
+            "sys.path.insert(0, 'python/tests'); "
+            "import numpy as np, test_kernel_runtime as tests, vernon_dsl as vd; "
+            "vd.init(arch=vd.cpu); "
+            "output = vd.storage.zeros(dtype=vd.i32, shape=(1,)); "
+            "controls = vd.storage.from_numpy(np.array((0, 4, 0), dtype=np.int32)); "
+            "tests.dynamic_range(output, controls, grid=(1, 1, 1))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=project,
+            env={**os.environ, "PYTHONPATH": "python"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_dynamic_range_bounds_all_backend_parity(self) -> None:
+        cases = (((0, 10, 1), 20), ((10, 0, -1), 22), ((5, 5, 1), 0))
+        backends = [vd.cpu]
+        if self._cuda_available():
+            backends.append(vd.cuda)
+        if self._vulkan_available():
+            backends.append(vd.vulkan)
+        for backend in backends:
+            for controls, expected in cases:
+                with self.subTest(backend=backend.name, controls=controls):
+                    vd.init(arch=backend)
+                    output = vd.storage.zeros(dtype=vd.i32, shape=(1,))
+                    control_values = vd.storage.from_numpy(np.array(controls, dtype=np.int32))
+                    signed_literal_step_range(output, control_values, grid=(1, 1, 1))
+                    np.testing.assert_array_equal(output.to_numpy(), np.array((expected,), dtype=np.int32))
+
+    def test_range_break_continue_and_early_return_backend_parity(self) -> None:
+        backends = [vd.cpu]
+        if self._cuda_available():
+            backends.append(vd.cuda)
+        if self._vulkan_available():
+            backends.append(vd.vulkan)
+        for backend in backends:
+            with self.subTest(backend=backend.name):
+                vd.init(arch=backend)
+                output = vd.storage.zeros(dtype=vd.i32, shape=(2,))
+                controls = vd.storage.from_numpy(np.array((10,), dtype=np.int32))
+                range_control_flow(output, controls, grid=(1, 1, 1))
+                np.testing.assert_array_equal(output.to_numpy(), np.array((13, 30), dtype=np.int32))
+
     def test_loop_carried_vector_norm(self) -> None:
         expected = self._run_vector_while(vd.cpu)
         backends = []
@@ -179,7 +589,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         for backend in backends:
             with self.subTest(backend=backend.name):
                 vd.init(arch=backend)
-                output = vd.Tensor.zeros(dtype=vd.f32, shape=(2,))
+                output = vd.storage.zeros(dtype=vd.f32, shape=(2,))
                 matrix_vector(output, grid=(2, 1, 1))
                 np.testing.assert_allclose(
                     output.to_numpy(), np.array((17.0, 39.0), dtype=np.float32), rtol=0.0, atol=1e-6
@@ -197,17 +607,124 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         for backend in backends:
             with self.subTest(backend=backend.name):
                 vd.init(arch=backend)
-                output = vd.Tensor.zeros(dtype=vd.f32, shape=values.shape)
+                output = vd.storage.zeros(dtype=vd.f32, shape=values.shape)
                 floating_power(
                     output,
-                    vd.Tensor.from_numpy(values),
+                    vd.storage.from_numpy(values),
                     exponent,
                     grid=(values.size, 1, 1),
                 )
                 np.testing.assert_allclose(output.to_numpy(), expected, rtol=2e-6, atol=2e-6)
 
+    def test_strided_tensor_view_dispatch(self) -> None:
+        backends = [vd.cpu]
+        if self._cuda_available():
+            backends.append(vd.cuda)
+        if self._vulkan_available():
+            backends.append(vd.vulkan)
+        expected = np.array([[2.0, 1.0, 0.0], [8.0, 7.0, 6.0]], dtype=np.float32)
+        for backend in backends:
+            with self.subTest(backend=backend.name):
+                vd.init(arch=backend)
+                source_bytes = bytearray(np.arange(12, dtype=np.float32).tobytes())
+                output_bytes = bytearray(12 * np.dtype(np.float32).itemsize)
+                source = vd.interop.RawBuffer.from_buffer(source_bytes, alignment=4).typed_view(
+                    dtype=vd.f32,
+                    shape=(2, 3),
+                    byte_strides=(24, -4),
+                    byte_offset=8,
+                    access="read",
+                    layout_units="bytes",
+                )
+                output = vd.interop.RawBuffer.from_buffer(output_bytes, alignment=4).typed_view(
+                    dtype=vd.f32,
+                    shape=(2, 3),
+                    byte_strides=(20, 4),
+                    byte_offset=4,
+                    access="read_write",
+                    layout_units="bytes",
+                )
+
+                copy_tensor_view(output, source)
+                np.testing.assert_array_equal(output.to_numpy(), expected)
+
+        for target in ("cuda", "vulkan"):
+            with self.subTest(target=target):
+                artifact, reflection = copy_tensor_view.compile_artifact(output, source, target=target)
+                self.assertTrue(artifact)
+                self.assertIn('"tensor_views"', reflection)
+
+    def test_aggregate_tensor_view_dispatch(self) -> None:
+        values = tuple(
+            AggregateRecord(
+                np.array([float(index), float(index) + 0.5], dtype=np.float32),
+                (vd.i32(index * 3), vd.f32(index + 0.25)),
+            )
+            for index in range(4)
+        )
+        backends = [vd.cpu]
+        if self._cuda_available():
+            backends.append(vd.cuda)
+        if self._vulkan_available():
+            backends.append(vd.vulkan)
+        for architecture in (vd.opengl, vd.opengles):
+            if self._runtime_available(architecture):
+                backends.append(architecture)
+        for backend in backends:
+            with self.subTest(backend=backend.name):
+                vd.init(arch=backend)
+                source = vd.storage.from_values(values, dtype=AggregateRecord).view(
+                    shape=(4,), strides=(-1,), offset=3, access="read"
+                )
+                output_storage = vd.storage.zeros(dtype=AggregateRecord, shape=(4,))
+                output = output_storage.view(access="write")
+                copy_aggregate_tensor_view(output, source, grid=(4, 1, 1))
+                actual = output_storage.to_values()
+                for result, expected in zip(actual, reversed(values), strict=True):
+                    np.testing.assert_array_equal(result.vector, expected.vector)
+                    self.assertEqual(result.pair, expected.pair)
+
+                tuple_type = vd.Tuple[vd.i32, vd.f32]
+                tuple_values = ((vd.i32(2), vd.f32(3.5)), (vd.i32(5), vd.f32(7.5)))
+                tuple_source = vd.storage.from_values(tuple_values, dtype=tuple_type)
+                tuple_output = vd.storage.zeros(dtype=tuple_type, shape=(2,))
+                copy_tuple_tensor_view(
+                    tuple_output.view(access="write"),
+                    tuple_source.view(access="read"),
+                    grid=(2, 1, 1),
+                )
+                self.assertEqual(tuple_output.to_values(), tuple_values)
+
+                tensor_type = vd.Tensor[vd.f32, (2,)]
+                tensor_values = (
+                    np.array([1.0, 2.0], dtype=np.float32),
+                    np.array([3.0, 4.0], dtype=np.float32),
+                )
+                tensor_source_bytes = bytearray(np.asarray(tensor_values, dtype=np.float32).tobytes())
+                tensor_output_bytes = bytearray(4 * np.dtype(np.float32).itemsize)
+                tensor_source = vd.interop.RawBuffer.from_buffer(tensor_source_bytes, alignment=4).typed_view(
+                    dtype=tensor_type,
+                    shape=(2,),
+                    byte_strides=(8,),
+                    access="read",
+                    layout_units="bytes",
+                )
+                tensor_output = vd.interop.RawBuffer.from_buffer(tensor_output_bytes, alignment=4).typed_view(
+                    dtype=tensor_type,
+                    shape=(2,),
+                    byte_strides=(8,),
+                    access="write",
+                    layout_units="bytes",
+                )
+                copy_value_tensor_view(tensor_output, tensor_source, grid=(2, 1, 1))
+                tensor_output.owner.synchronize()
+                np.testing.assert_array_equal(
+                    np.frombuffer(tensor_output_bytes, dtype=np.float32).reshape(2, 2),
+                    np.asarray(tensor_values),
+                )
+
     def test_cross_compiled_source_generation(self) -> None:
-        output = vd.Tensor.zeros(dtype=vd.f32, shape=(16,))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(16,))
         cases = {
             "metal": "kernel void vector_while",
             "opengl": "#version 430",
@@ -222,7 +739,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
 
 @vd.kernel(workgroup_size=(4, 2, 1))
 def fill(
-    output: vd.Tensor[vd.f32, (None, None)],
+    output: vd.TensorView[vd.f32, 2, vd.write],
     scale: vd.f32,
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
@@ -236,7 +753,7 @@ def fill(
 class TensorTests(unittest.TestCase):
     def test_numpy_copy_contract(self) -> None:
         source = np.arange(6, dtype=np.float32).reshape(2, 3)
-        tensor = vd.Tensor.from_numpy(source)
+        tensor = vd.storage.from_numpy(source)
         source.fill(0)
         np.testing.assert_array_equal(tensor.to_numpy(), np.arange(6, dtype=np.float32).reshape(2, 3))
         result = tensor.to_numpy()
@@ -244,7 +761,7 @@ class TensorTests(unittest.TestCase):
         self.assertNotEqual(float(tensor.to_numpy()[1, 2]), 0.0)
 
     def test_copy_validates_layout(self) -> None:
-        tensor = vd.Tensor.zeros(dtype=vd.f32, shape=(2, 3))
+        tensor = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
         with self.assertRaises(ValueError):
             tensor.copy_from_numpy(np.zeros((3, 2), dtype=np.float32))
 
@@ -256,7 +773,7 @@ class KernelTests(unittest.TestCase):
         type(fill).clear_cache()
 
     def test_explicit_grid_and_cache(self) -> None:
-        output = vd.Tensor.zeros(dtype=vd.f32, shape=(2, 3))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
         fill(output, 10.0, grid=(3, 2, 1))
         np.testing.assert_array_equal(
             output.to_numpy(),
@@ -267,7 +784,7 @@ class KernelTests(unittest.TestCase):
         self.assertEqual(fill.compile_count, 1)
 
     def test_cpu_kernel_uses_in_process_owning_compiler(self) -> None:
-        output = vd.Tensor.zeros(dtype=vd.f32, shape=(2, 3))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
         with mock.patch("subprocess.run", side_effect=AssertionError("subprocess prohibited")):
             fill(output, 1.0)
         np.testing.assert_array_equal(
@@ -276,14 +793,14 @@ class KernelTests(unittest.TestCase):
         )
 
     def test_compile_artifact_uses_in_process_owning_compiler(self) -> None:
-        output = vd.Tensor.zeros(dtype=vd.f32, shape=(2, 3))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
         with mock.patch("subprocess.run", side_effect=AssertionError("subprocess prohibited")):
             artifact, reflection = fill.compile_artifact(output, 1.0, target="vulkan")
         self.assertTrue(artifact)
         self.assertIn('"target":"vulkan"', reflection)
 
     def test_runtime_reinit_reloads_without_recompiling(self) -> None:
-        output = vd.Tensor.zeros(dtype=vd.f32, shape=(2, 3))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
         fill(output, 1.0)
         self.assertEqual(fill.compile_count, 1)
         vd.init(arch=vd.cpu)
@@ -291,14 +808,14 @@ class KernelTests(unittest.TestCase):
         self.assertEqual(fill.compile_count, 1)
 
     def test_specialized_shape_invalidates_cache(self) -> None:
-        first = vd.Tensor.zeros(dtype=vd.f32, shape=(2, 3))
-        second = vd.Tensor.zeros(dtype=vd.f32, shape=(3, 3))
+        first = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
+        second = vd.storage.zeros(dtype=vd.f32, shape=(3, 3))
         fill(first, 1.0, grid=(3, 2, 1))
         fill(second, 1.0, grid=(3, 2, 1))
         self.assertEqual(fill.compile_count, 2)
 
     def test_grid_is_inferred_and_validated(self) -> None:
-        output = vd.Tensor.zeros(dtype=vd.f32, shape=(2, 3))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
         fill(output, 1.0)
         np.testing.assert_array_equal(
             output.to_numpy(),
@@ -308,7 +825,7 @@ class KernelTests(unittest.TestCase):
             fill(output, 1.0, grid=(3, 0, 1))
 
     def test_native_tensor_residency_and_lazy_download(self) -> None:
-        output = vd.Tensor.zeros(dtype=vd.f32, shape=(2, 3))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
         fill(output, 2.0)
         fill(output, 3.0)
         self.assertEqual(output._allocation_count, 1)
@@ -320,7 +837,7 @@ class KernelTests(unittest.TestCase):
     def test_fractal_matches_vectorized_numpy_reference(self) -> None:
         width, height = 4, 3
         time = 0.2
-        output = vd.Tensor.zeros(dtype=vd.f32, shape=(fractal.HEIGHT, fractal.WIDTH))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(fractal.HEIGHT, fractal.WIDTH))
         fractal.paint(output, time, grid=(width, height, 1))
 
         y, x = np.mgrid[:height, :width]

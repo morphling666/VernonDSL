@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -25,6 +26,20 @@ class ConcreteType:
     name: str
     arguments: tuple["ConcreteType | int | str", ...] = ()
 
+    def __post_init__(self) -> None:
+        if self.kind != "tensor" or not self.arguments:
+            return
+        element = self.arguments[0]
+        if not isinstance(element, ConcreteType) or element.kind != "tensor":
+            return
+        # Tensor nesting is logical shape composition. Structs remain nominal
+        # because only an immediately nested Tensor is flattened here.
+        object.__setattr__(
+            self,
+            "arguments",
+            (element.arguments[0], *self.arguments[1:], *element.arguments[1:]),
+        )
+
     @property
     def mlir(self) -> str:
         if self.kind == "scalar":
@@ -36,15 +51,27 @@ class ConcreteType:
         if self.kind == "tensor":
             element = self.arguments[0]
             assert isinstance(element, ConcreteType)
+            if element.kind != "scalar":
+                shape = ", ".join(str(value) for value in self.arguments[1:])
+                return f"!vernon.tensor<{element.mlir}, [{shape}]>"
             dimensions = "x".join(str(value) for value in self.arguments[1:])
             return f"tensor<{dimensions}x{element.mlir}>"
+        if self.kind == "tuple":
+            elements = self.arguments
+            assert all(isinstance(element, ConcreteType) for element in elements)
+            return f"tuple<{', '.join(element.mlir for element in elements if isinstance(element, ConcreteType))}>"
         if self.kind == "struct":
             return f'!vernon.struct<"{self.name}">'
-        if self.kind == "buffer":
-            element = self.arguments[0]
-            access = self.arguments[1] if len(self.arguments) > 1 else "read_write"
+        if self.kind == "tensor_view_abi":
+            element, rank, access = self.arguments
             assert isinstance(element, ConcreteType)
-            return f'!vernon.buffer<{element.mlir}, "{access}">'
+            return f'!vernon.tensor_view<{element.mlir}, {rank}, "{access}">'
+        if self.kind == "tensor_storage":
+            raise ValueError("TensorStorage is host-runtime only and has no device IR type")
+        if self.kind == "tensor_view":
+            element, rank, access = self.arguments
+            assert isinstance(element, ConcreteType)
+            return f'!vernon.tensor_view<{element.mlir}, {rank}, "{access}">'
         if self.kind == "texture":
             dimension, element = self.arguments
             assert isinstance(element, ConcreteType)
@@ -68,13 +95,52 @@ class ConcreteType:
         return self.kind == "tensor" and isinstance(self.arguments[0], ConcreteType) and self.arguments[0].is_integer
 
 
-class StorageClass(Enum):
+class SemanticCategory(Enum):
     VALUE = "value"
-    ADDRESSABLE = "addressable"
+    STORAGE = "storage"
+    RESOURCE = "resource"
+
+
+def semantic_category(value_type: ConcreteType) -> SemanticCategory | None:
+    if value_type.kind in {"scalar", "tensor", "tuple", "struct"}:
+        return SemanticCategory.VALUE
+    if value_type.kind in {"tensor_storage", "tensor_view"}:
+        return SemanticCategory.STORAGE
+    if value_type.kind in {"texture", "sampler"}:
+        return SemanticCategory.RESOURCE
+    return None
+
+
+def is_abi_stable_value(
+    value_type: ConcreteType,
+    struct_fields: Callable[[str], tuple[ConcreteType, ...]] | None = None,
+    active_structs: frozenset[str] = frozenset(),
+) -> bool:
+    """Return whether a type has a finite, deterministic Value ABI."""
+    if value_type.kind == "scalar":
+        return True
+    if value_type.kind == "tensor":
+        element = value_type.arguments[0] if value_type.arguments else None
+        return isinstance(element, ConcreteType) and is_abi_stable_value(element, struct_fields, active_structs)
+    if value_type.kind == "tuple":
+        return all(
+            isinstance(element, ConcreteType) and is_abi_stable_value(element, struct_fields, active_structs)
+            for element in value_type.arguments
+        )
+    if value_type.kind == "struct":
+        if struct_fields is None:
+            # Nominal declarations are resolved after all Struct bodies are collected.
+            return True
+        if value_type.name in active_structs:
+            return False
+        nested = active_structs | {value_type.name}
+        return all(is_abi_stable_value(field, struct_fields, nested) for field in struct_fields(value_type.name))
+    return False
 
 
 class AccessMode(Enum):
     READ = "read"
+    WRITE = "write"
     READ_WRITE = "read_write"
 
 
@@ -84,7 +150,6 @@ class TypedExpression:
     type: ConcreteType
     operation: str | None = None
     operand_types: tuple[ConcreteType, ...] = ()
-    storage: StorageClass = StorageClass.VALUE
     access: AccessMode = AccessMode.READ
 
 
@@ -92,7 +157,6 @@ class TypedExpression:
 class TypedParameter:
     name: str
     type: ConcreteType
-    storage: StorageClass = StorageClass.VALUE
     access: AccessMode = AccessMode.READ
 
 
@@ -102,8 +166,77 @@ class Effect(Enum):
     WRITE = "write"
 
 
+class StorageEffectKind(Enum):
+    READ = "read"
+    WRITE = "write"
+
+
+class StorageRegionKind(Enum):
+    ELEMENT = "element"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class StorageOwner:
+    # Frontend effects name symbolic parameter owners; runtime binding resolves
+    # them to allocations and performs concrete alias/lifetime validation.
+    parameter: str
+
+
+@dataclass(frozen=True)
+class StorageRegion:
+    kind: StorageRegionKind
+    indices: tuple[int, ...] = ()
+
+    def overlaps(self, other: "StorageRegion") -> bool:
+        if self.kind is StorageRegionKind.UNKNOWN or other.kind is StorageRegionKind.UNKNOWN:
+            return True
+        return self.indices == other.indices
+
+
+@dataclass(frozen=True)
+class StorageEffect:
+    kind: StorageEffectKind
+    owner: StorageOwner
+    region: StorageRegion
+
+
+class MemoryOrdering(Enum):
+    RELAXED = "relaxed"
+    ACQUIRE = "acquire"
+    RELEASE = "release"
+    ACQUIRE_RELEASE = "acquire_release"
+    SEQUENTIAL = "sequential"
+
+
+class EffectScope(Enum):
+    INVOCATION = "invocation"
+    WORKGROUP = "workgroup"
+    DEVICE = "device"
+
+
+@dataclass(frozen=True)
+class AtomicEffect:
+    operation: str
+    owner: StorageOwner
+    region: StorageRegion
+    ordering: MemoryOrdering
+    scope: EffectScope
+
+
+@dataclass(frozen=True)
+class BarrierEffect:
+    ordering: MemoryOrdering
+    scope: EffectScope
+
+
+TypedEffect = StorageEffect | AtomicEffect | BarrierEffect
+
+
 class Termination(Enum):
     FALLTHROUGH = "fallthrough"
+    BREAK = "break"
+    CONTINUE = "continue"
     RETURN = "return"
 
 
@@ -112,7 +245,6 @@ class LValue:
     kind: str
     name: str
     type: ConcreteType
-    storage: StorageClass = StorageClass.VALUE
     access: AccessMode = AccessMode.READ_WRITE
 
 
@@ -125,12 +257,41 @@ class BranchMerge:
 @dataclass(frozen=True)
 class TypedStatement:
     source: ast.stmt
-    effect: Effect
     termination: Termination
+    effects: tuple[TypedEffect, ...] = ()
     expressions: tuple[TypedExpression, ...] = ()
     lvalues: tuple[LValue, ...] = ()
     branch_merges: tuple[BranchMerge, ...] = ()
     children: tuple["TypedStatement", ...] = ()
+    loop_depth: int = 0
+    return_type: ConcreteType | None = None
+
+    @property
+    def effect(self) -> Effect:
+        nested_effects = self._nested_effects()
+        storage_effects = tuple(effect for effect in nested_effects if isinstance(effect, StorageEffect))
+        if any(effect.kind is StorageEffectKind.WRITE for effect in storage_effects) or any(
+            isinstance(effect, (AtomicEffect, BarrierEffect)) for effect in nested_effects
+        ):
+            return Effect.WRITE
+        if any(effect.kind is StorageEffectKind.READ for effect in storage_effects):
+            return Effect.READ
+        # Resource operations remain separate from Storage effects while
+        # retaining the legacy coarse diagnostic until resource summaries land.
+        if any(expression.operation in {"texture_sample", "texture_size"} for expression in self.expressions) or any(
+            child.effect is Effect.READ for child in self.children
+        ):
+            return Effect.READ
+        return Effect.PURE
+
+    def _nested_effects(self) -> tuple[TypedEffect, ...]:
+        return (
+            *self.effects,
+            *(effect for child in self.children for effect in child._nested_effects()),
+        )
+
+    def _nested_storage_effects(self) -> tuple[StorageEffect, ...]:
+        return tuple(effect for effect in self._nested_effects() if isinstance(effect, StorageEffect))
 
 
 @dataclass(frozen=True)
@@ -143,6 +304,7 @@ class TypedFunctionInstance:
     source: ast.FunctionDef
     body: tuple[TypedStatement, ...] = ()
     parameters: tuple[TypedParameter, ...] = ()
+    effects: tuple[TypedEffect, ...] = ()
 
     @property
     def specialization_key(self) -> tuple[str, tuple[ConcreteType, ...], tuple[str, ...]]:
@@ -152,8 +314,16 @@ class TypedFunctionInstance:
 SemanticType = SourceType | LiteralType | ConcreteType
 SemanticValue = (
     SemanticType
+    | AtomicEffect
+    | BarrierEffect
+    | EffectScope
+    | MemoryOrdering
     | TypedExpression
     | TypedParameter
+    | StorageOwner
+    | StorageRegion
+    | StorageEffect
+    | TypedEffect
     | LValue
     | BranchMerge
     | TypedStatement

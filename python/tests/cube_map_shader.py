@@ -7,29 +7,29 @@ import vernon_dsl as vd
 
 @vd.struct
 class CubeMapVertexOutput:
-    position: Annotated[vd.vec4[vd.f32], vd.builtin("position")]
-    tex_coord: Annotated[vd.vec3[vd.f32], vd.location(0)]
+    position: Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]
+    tex_coord: Annotated[vd.Vector[vd.f32, 3], vd.location(0)]
 
 
 @vd.struct
 class CubeMapFragmentOutput:
-    color: Annotated[vd.vec4[vd.f32], vd.location(0)]
-    bloom_color: Annotated[vd.vec4[vd.f32], vd.location(1)]
+    color: Annotated[vd.Vector[vd.f32, 4], vd.location(0)]
+    bloom_color: Annotated[vd.Vector[vd.f32, 4], vd.location(1)]
 
 
 @vd.vertex
 def cube_map_vertex(
-    aPos: Annotated[vd.vec3[vd.f32], vd.location(0)],
-    projection: Annotated[vd.mat4[vd.f32], vd.uniform()],
-    view: Annotated[vd.mat4[vd.f32], vd.uniform()],
-    model: Annotated[vd.mat4[vd.f32], vd.uniform()],
+    aPos: Annotated[vd.Vector[vd.f32, 3], vd.location(0)],
+    projection: Annotated[vd.Matrix[vd.f32, 4, 4], vd.uniform()],
+    view: Annotated[vd.Matrix[vd.f32, 4, 4], vd.uniform()],
+    model: Annotated[vd.Matrix[vd.f32, 4, 4], vd.uniform()],
 ) -> CubeMapVertexOutput:
     position = vd.matmul(
         projection,
-        vd.matmul(view, vd.matmul(model, vd.vec4(aPos, 1.0))),
+        vd.matmul(view, vd.matmul(model, vd.Vector([aPos, 1.0]))),
     )
     return CubeMapVertexOutput(
-        vd.vec4(position.x, position.y, position.w, position.w),
+        vd.Vector([position.x, position.y, position.w, position.w]),
         aPos,
     )
 
@@ -37,7 +37,7 @@ def cube_map_vertex(
 @vd.fragment
 def cube_map_fragment(
     tex_coord: Annotated[
-        vd.vec3[vd.f32],
+        vd.Vector[vd.f32, 3],
         vd.varying(),
         vd.location(0),
     ],
@@ -47,8 +47,8 @@ def cube_map_fragment(
     ],
 ) -> CubeMapFragmentOutput:
     color = vd.texture_sample(cubeMap, tex_coord)
-    brightness = vd.dot(color.rgb, vd.vec3(0.2126, 0.7152, 0.0722))
-    bloom_color = vd.vec4(0.0, 0.0, 0.0, 1.0)
+    brightness = vd.dot(color.rgb, vd.Vector([0.2126, 0.7152, 0.0722]))
+    bloom_color = vd.Vector([0.0, 0.0, 0.0, 1.0])
     if brightness > 1.0:
         bloom_color = color
     return CubeMapFragmentOutput(color, bloom_color)

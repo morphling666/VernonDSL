@@ -634,16 +634,21 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                 const auto found = bundle->stages.find(id);
                 return found != bundle->stages.end() && found->second.stage == kind;
             };
-            if (!validStage(variant.compute, "compute") || !validStage(variant.vertex, "vertex") ||
-                !validStage(variant.fragment, "fragment")) {
-                fail(context, "pipeline variant references an invalid stage");
-                return nullptr;
-            }
-            if ((context->backend == VERNON_RUNTIME_CPU || context->backend == VERNON_RUNTIME_CUDA) &&
-                (variant.compute.empty() || !variant.vertex.empty() || variant.barrier)) {
-                fail(context, std::string(expectedTarget) + " pipeline bundles support dispatch steps only",
-                     VERNON_STATUS_UNSUPPORTED_TARGET);
-                return nullptr;
+            for (const PipelineStep &step : variant.steps) {
+                const bool valid = step.kind == PipelineStepKind::Dispatch ? validStage(step.stage, "compute")
+                                   : step.kind == PipelineStepKind::Draw
+                                       ? validStage(step.vertex, "vertex") && validStage(step.fragment, "fragment")
+                                       : true;
+                if (!valid) {
+                    fail(context, "pipeline variant references an invalid stage");
+                    return nullptr;
+                }
+                if ((context->backend == VERNON_RUNTIME_CPU || context->backend == VERNON_RUNTIME_CUDA) &&
+                    step.kind != PipelineStepKind::Dispatch && step.kind != PipelineStepKind::Barrier) {
+                    fail(context, std::string(expectedTarget) + " pipeline bundles support dispatch steps only",
+                         VERNON_STATUS_UNSUPPORTED_TARGET);
+                    return nullptr;
+                }
             }
             bundle->variants.push_back(std::move(variant));
         }
@@ -836,6 +841,30 @@ VernonStatus vernonRuntimeLoadedPipelineFindOutput(const VernonLoadedPipeline *p
     return fillOutputView(*found, *output) ? VERNON_STATUS_OK : VERNON_STATUS_PARSE_ERROR;
 }
 
+size_t vernonRuntimeLoadedPipelineGetStepCount(const VernonLoadedPipeline *pipeline) {
+    return pipeline ? pipeline->variant.steps.size() : 0;
+}
+
+VernonStatus vernonRuntimeLoadedPipelineGetStepByIndex(const VernonLoadedPipeline *pipeline, size_t index,
+                                                       VernonPipelineStepView *step) {
+    if (!pipeline || !step || step->struct_size < sizeof(VernonPipelineStepView) ||
+        index >= pipeline->variant.steps.size())
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    const PipelineStep &source = pipeline->variant.steps[index];
+    const auto view = [](const std::string &value) { return VernonStringView{value.data(), value.size()}; };
+    step->kind = source.kind == PipelineStepKind::Dispatch  ? VERNON_PIPELINE_DISPATCH
+                 : source.kind == PipelineStepKind::Barrier ? VERNON_PIPELINE_BARRIER
+                                                            : VERNON_PIPELINE_DRAW;
+    step->stage = view(source.stage);
+    step->vertex = view(source.vertex);
+    step->fragment = view(source.fragment);
+    step->source = view(source.source);
+    step->destination = view(source.destination);
+    step->has_grid = source.hasGrid ? 1u : 0u;
+    step->grid = source.grid;
+    return VERNON_STATUS_OK;
+}
+
 void vernonRuntimeLoadedPipelineDestroy(VernonLoadedPipeline *pipeline) {
     if (!pipeline)
         return;
@@ -858,22 +887,46 @@ VernonStatus vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline, const V
         return fail(pipeline->context, planningError);
     const auto &arguments = plan.arguments;
 
-    VernonLoadedKernel *computeKernel = backendPipelineComputeKernel(*pipeline);
-    if (computeKernel) {
+    for (const PipelineStep &step : pipeline->variant.steps) {
+        if (step.kind == PipelineStepKind::Barrier) {
+            const VernonStatus status = isOpenGLBackend(pipeline->context->backend)
+                                            ? backendComputeToGraphicsBarrier(*pipeline->context)
+                                            : synchronizeBackend(*pipeline->context);
+            if (status != VERNON_STATUS_OK)
+                return status;
+            continue;
+        }
+        if (step.kind == PipelineStepKind::Draw) {
+            const VernonStatus status = invokeBackendPipeline(*pipeline, *invocation, plan);
+            if (status != VERNON_STATUS_OK)
+                return status;
+            continue;
+        }
+        if (isOpenGLBackend(pipeline->context->backend)) {
+            const VernonStatus status = invokeBackendPipelineDispatch(*pipeline, step, *invocation, plan);
+            if (status != VERNON_STATUS_OK)
+                return status;
+            continue;
+        }
+        VernonLoadedKernel *computeKernel = backendPipelineComputeKernel(*pipeline, step.stage);
+        if (!computeKernel)
+            return fail(pipeline->context, "graph dispatch stage is not loaded");
+        Variant dispatchVariant = pipeline->variant;
+        dispatchVariant.compute = step.stage;
         PlannedComputeLaunch computePlan;
         std::string computePlanningError;
         const ComputePlannerCallbacks computePlannerCallbacks{nullptr, &plannerBufferContext};
-        if (!planComputeLaunch(pipeline->variant, arguments, *invocation, pipeline->context, computePlannerCallbacks,
+        if (!planComputeLaunch(dispatchVariant, arguments, *invocation, pipeline->context, computePlannerCallbacks,
                                computePlan, computePlanningError))
             return fail(pipeline->context, computePlanningError);
+        if (step.hasGrid)
+            computePlan.grid = step.grid;
         const VernonStatus launchStatus = vernonRuntimeLaunch(
             computeKernel, computePlan.grid, computePlan.arguments.data(), computePlan.arguments.size());
-        if (launchStatus != VERNON_STATUS_OK || pipeline->context->backend == VERNON_RUNTIME_CPU ||
-            pipeline->context->backend == VERNON_RUNTIME_CUDA)
+        if (launchStatus != VERNON_STATUS_OK)
             return launchStatus;
     }
-
-    return invokeBackendPipeline(*pipeline, *invocation, plan);
+    return VERNON_STATUS_OK;
 }
 
 VernonStatus vernonRuntimeComputeToGraphicsBarrier(VernonRuntimeContext *context) {

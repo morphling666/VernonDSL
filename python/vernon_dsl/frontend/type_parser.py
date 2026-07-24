@@ -6,7 +6,7 @@ from typing import Protocol
 
 from ..language.ast_utils import dotted_name, subscript_items
 from ..language.scalar_types import SCALAR_ALIASES, SCALAR_TYPES
-from .model import ConcreteType
+from .model import ConcreteType, is_abi_stable_value, semantic_category
 
 
 class TypeContext(Protocol):
@@ -64,29 +64,38 @@ class TypeParser:
             element = self.parse_type(items[0])
             shape_nodes = items[1].elts if len(items) == 2 and isinstance(items[1], ast.Tuple) else items[1:]
             shape = tuple(self._positive_int(item, "tensor dimension") for item in shape_nodes)
-            return ConcreteType("tensor", "Tensor", (element, *shape))
-        if constructor in {"vec", "mat"}:
-            dimensions = 1 if constructor == "vec" else 2
-            if len(items) != dimensions + 1:
+            return self._tensor_type(items[0], element, shape)
+        if constructor in {"Vector", "Matrix"}:
+            rank = 1 if constructor == "Vector" else 2
+            if len(items) != rank + 1:
                 raise self.context.error(
                     node,
-                    f"{constructor} requires {dimensions} dimension(s) followed by an element type",
+                    f"{constructor} requires an element type followed by {rank} dimension(s)",
                 )
-            shape = tuple(self._positive_int(item, f"{constructor} dimension") for item in items[:dimensions])
-            return ConcreteType("tensor", "Tensor", (self.parse_type(items[-1]), *shape))
-        if constructor in {"vec2", "vec3", "vec4", "mat2", "mat3", "mat4"}:
+            element = self.parse_type(items[0])
+            shape = tuple(self._positive_int(item, f"{constructor} dimension") for item in items[1:])
+            return self._tensor_type(items[0], element, shape)
+        if constructor == "Tuple":
+            elements = tuple(self.parse_type(item) for item in items)
+            if any(not is_abi_stable_value(element) for element in elements):
+                raise self.context.error(node, "Tuple elements must be ABI-stable Values")
+            return ConcreteType("tuple", "Tuple", elements)
+        if constructor == "TensorStorage":
             if len(items) != 1:
-                raise self.context.error(node, f"{constructor} requires one element type")
-            size = int(constructor[-1])
-            shape = (size,) if constructor.startswith("vec") else (size, size)
-            return ConcreteType("tensor", "Tensor", (self.parse_type(items[0]), *shape))
-        if constructor == "Buffer":
-            if not 1 <= len(items) <= 2:
-                raise self.context.error(node, "Buffer requires an element type and optional access string")
-            arguments: tuple[ConcreteType | int | str, ...] = (self.parse_type(items[0]),)
-            if len(items) == 2:
-                arguments += (self._string_or_name(items[1], "buffer access"),)
-            return ConcreteType("buffer", "Buffer", arguments)
+                raise self.context.error(node, "TensorStorage requires one ABI-stable Value element type")
+            element = self.parse_type(items[0])
+            self._require_storage_element(items[0], element, "TensorStorage")
+            return ConcreteType("tensor_storage", "TensorStorage", (element,))
+        if constructor == "TensorView":
+            if len(items) != 3:
+                raise self.context.error(node, "TensorView requires an element type, rank, and access mode")
+            element = self.parse_type(items[0])
+            self._require_storage_element(items[0], element, "TensorView")
+            rank = self._positive_int(items[1], "TensorView rank")
+            access = self._string_or_name(items[2], "TensorView access")
+            if access not in {"read", "write", "read_write"}:
+                raise self.context.error(items[2], "TensorView access must be read, write, or read_write")
+            return ConcreteType("tensor_view", "TensorView", (element, rank, access))
         if constructor == "Texture":
             if len(items) != 2:
                 raise self.context.error(node, "Texture requires a dimension and element type")
@@ -102,6 +111,30 @@ class TypeParser:
                 (dimension, self.parse_type(items[1])),
             )
         raise self.context.error(node, f"unknown DSL type constructor '{constructor}'")
+
+    def _require_storage_element(self, node: ast.AST, element: ConcreteType, constructor: str) -> None:
+        if not is_abi_stable_value(element):
+            category = semantic_category(element)
+            description = category.value.capitalize() if category is not None else f"type kind '{element.kind}'"
+            raise self.context.error(
+                node,
+                f"{constructor} element type must be an ABI-stable Value, not {description} '{element.name}'",
+            )
+
+    def _tensor_type(
+        self,
+        element_node: ast.AST,
+        element: ConcreteType,
+        shape: tuple[int | str, ...],
+    ) -> ConcreteType:
+        if not is_abi_stable_value(element):
+            category = semantic_category(element)
+            description = category.value.capitalize() if category is not None else f"type kind '{element.kind}'"
+            raise self.context.error(
+                element_node,
+                f"Tensor element type must be an ABI-stable Value, not {description} '{element.name}'",
+            )
+        return ConcreteType("tensor", "Tensor", (element, *shape))
 
     def _positive_int(self, node: ast.AST, description: str) -> int | str:
         if description == "tensor dimension" and isinstance(node, ast.Constant) and node.value is None:

@@ -28,6 +28,12 @@ def shader_helper(value: vd.f32) -> vd.f32:
     return value
 
 
+@vd.struct
+class InterleavedVertex:
+    ignored: vd.f32
+    position: vd.Vector[vd.f32, 2]
+
+
 class PipelineContractTests(unittest.TestCase):
     def test_declarative_functions_reject_host_calls(self) -> None:
         with self.assertRaisesRegex(TypeError, "shader-only"):
@@ -44,7 +50,7 @@ class PipelineContractTests(unittest.TestCase):
             vd.pipeline(solid_fragment, triangle_vertex)
 
     def test_tensor_layout_and_contiguous_swizzle(self) -> None:
-        tensor = vd.Tensor.from_numpy(np.zeros((3, 4), dtype=np.float32))
+        tensor = vd.storage.from_numpy(np.zeros((3, 4), dtype=np.float32))
         self.assertEqual(tensor.layout.shape, (3, 4))
         self.assertEqual(tensor.layout.byte_strides, (16, 4))
         view = tensor.swizzle("yz")
@@ -136,7 +142,7 @@ class OpenGLPipelineTests(unittest.TestCase):
 
     def test_triangle_renders_to_rgba8_texture(self) -> None:
         render = vd.pipeline(triangle_vertex, solid_fragment)
-        positions = vd.Tensor.from_numpy(
+        positions = vd.storage.from_numpy(
             np.array(
                 [
                     (-0.75, -0.75),
@@ -162,7 +168,7 @@ class OpenGLPipelineTests(unittest.TestCase):
 
     def test_compute_stage_runs_before_graphics(self) -> None:
         render = vd.pipeline(translate_vertices, triangle_vertex, solid_fragment)
-        positions = vd.Tensor.from_numpy(
+        positions = vd.storage.from_numpy(
             np.array(
                 [
                     (-0.75, -0.75),
@@ -180,7 +186,7 @@ class OpenGLPipelineTests(unittest.TestCase):
 
     def test_uniform_tensor_is_shared_draw_state(self) -> None:
         render = vd.pipeline(translated_vertex, solid_fragment)
-        positions = vd.Tensor.from_numpy(
+        positions = vd.storage.from_numpy(
             np.array(
                 [
                     (-0.75, -0.75),
@@ -190,7 +196,7 @@ class OpenGLPipelineTests(unittest.TestCase):
                 dtype=np.float32,
             )
         )
-        offset = vd.Tensor.from_numpy(np.array((2.0, 0.0), dtype=np.float32))
+        offset = vd.storage.from_numpy(np.array((2.0, 0.0), dtype=np.float32))
         target = vd.Texture.zeros(shape=(64, 64))
 
         render(position=positions, offset=offset, target=target)
@@ -203,7 +209,7 @@ class OpenGLPipelineTests(unittest.TestCase):
         except RuntimeError:
             self.skipTest("OpenGL 3.3 context unavailable")
         render = vd.pipeline(translate_vertices, triangle_vertex, solid_fragment)
-        positions = vd.Tensor.from_numpy(np.zeros((3, 2), dtype=np.float32))
+        positions = vd.storage.from_numpy(np.zeros((3, 2), dtype=np.float32))
         target = vd.Texture.zeros(shape=(8, 8))
         with self.assertRaisesRegex(RuntimeError, "OpenGL 4.3"):
             render(position=positions, offset=0.0, target=target)
@@ -214,21 +220,21 @@ class OpenGLPipelineTests(unittest.TestCase):
         except RuntimeError:
             self.skipTest("OpenGL 3.3 context unavailable")
         render = vd.pipeline(triangle_vertex, solid_fragment)
-        positions = vd.Tensor.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+        positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
         target = vd.Texture.zeros(shape=(16, 16))
         render(position=positions, target=target)
         self.assertGreater(int(target.to_numpy()[8, 8, 0]), 240)
 
     @staticmethod
     def _advanced_inputs() -> tuple[vd.Tensor, vd.Tensor, vd.Tensor]:
-        positions = vd.Tensor.from_numpy(
+        positions = vd.storage.from_numpy(
             np.array(
                 ((-0.25, -0.25), (0.25, -0.25), (0.25, 0.25), (-0.25, 0.25)),
                 dtype=np.float32,
             )
         )
-        offsets = vd.Tensor.from_numpy(np.array(((-0.4, 0.0), (0.4, 0.0)), dtype=np.float32))
-        indices = vd.Tensor.from_numpy(np.array((0, 1, 2, 0, 2, 3), dtype=np.uint32))
+        offsets = vd.storage.from_numpy(np.array(((-0.4, 0.0), (0.4, 0.0)), dtype=np.float32))
+        indices = vd.storage.from_numpy(np.array((0, 1, 2, 0, 2, 3), dtype=np.uint32))
         return positions, offsets, indices
 
     def test_indexed_instanced_mrt_variant_and_residency(self) -> None:
@@ -294,7 +300,7 @@ class OpenGLPipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "shape"):
             render(
                 position=positions,
-                offset=vd.Tensor.zeros(dtype=vd.f32, shape=(3, 3)),
+                offset=vd.storage.zeros(dtype=vd.f32, shape=(3, 3)),
                 indices=indices,
                 targets={
                     "color": color,
@@ -314,7 +320,7 @@ class OpenGLPipelineTests(unittest.TestCase):
             )
 
     def test_layout_view_and_topologies(self) -> None:
-        interleaved = vd.Tensor.from_numpy(
+        interleaved = vd.storage.from_numpy(
             np.array(
                 ((9.0, -0.75, -0.75, 1.0), (9.0, 0.75, -0.75, 1.0), (9.0, 0.0, 0.75, 1.0)),
                 dtype=np.float32,
@@ -324,9 +330,17 @@ class OpenGLPipelineTests(unittest.TestCase):
         vd.pipeline(triangle_vertex, solid_fragment)(position=interleaved.swizzle("yz"), target=target)
         self.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
 
-        line_positions = vd.Tensor.from_numpy(np.array(((-0.5, 0.0), (0.5, 0.0)), dtype=np.float32))
+        vertices = vd.TensorStorage.zeros(dtype=InterleavedVertex, shape=(3,))
+        vertices.field("position").copy_from_numpy(
+            np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32)
+        )
+        target = vd.Texture.zeros(shape=(32, 32))
+        vd.pipeline(triangle_vertex, solid_fragment)(position=vertices.field("position"), target=target)
+        self.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
+
+        line_positions = vd.storage.from_numpy(np.array(((-0.5, 0.0), (0.5, 0.0)), dtype=np.float32))
         vd.pipeline(triangle_vertex, solid_fragment)(position=line_positions, target=target, topology=vd.lines)
-        point_positions = vd.Tensor.from_numpy(np.array(((0.0, 0.0),), dtype=np.float32))
+        point_positions = vd.storage.from_numpy(np.array(((0.0, 0.0),), dtype=np.float32))
         vd.pipeline(triangle_vertex, solid_fragment)(position=point_positions, target=target, topology=vd.points)
 
 
@@ -339,7 +353,7 @@ class VulkanPipelineTests(unittest.TestCase):
 
     @staticmethod
     def _triangle() -> vd.Tensor:
-        return vd.Tensor.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+        return vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
 
     def test_triangle_and_compute_graphics_pipeline(self) -> None:
         positions = self._triangle()
@@ -356,8 +370,8 @@ class VulkanPipelineTests(unittest.TestCase):
 
     def test_stage_uniforms_do_not_overlap_and_y_matches_opengl(self) -> None:
         target = vd.Texture.zeros(shape=(64, 64))
-        offset = vd.Tensor.from_numpy(np.zeros(2, dtype=np.float32))
-        color = vd.Tensor.from_numpy(np.array((0.8, 0.7, 0.2, 1.0), dtype=np.float32))
+        offset = vd.storage.from_numpy(np.zeros(2, dtype=np.float32))
+        color = vd.storage.from_numpy(np.array((0.8, 0.7, 0.2, 1.0), dtype=np.float32))
 
         vd.pipeline(translated_vertex, colored_fragment)(
             position=self._triangle(), offset=offset, color=color, target=target

@@ -38,8 +38,22 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
             argument.alignment = value.value("alignment", size_t{1});
             argument.descriptorSet = value.value("vernon.set", uint32_t{0});
             argument.binding = value.value("vernon.binding", UINT32_MAX);
+            if (value.contains("storage_leaves") && value["storage_leaves"].is_array()) {
+                for (const nlohmann::json &leaf : value["storage_leaves"]) {
+                    if (!leaf.is_object() || !leaf.contains("element_size") || !leaf.contains("binding")) {
+                        error = "Tensor storage-leaf reflection is invalid";
+                        return false;
+                    }
+                    argument.storageLeaves.push_back({leaf["element_size"].get<size_t>(),
+                                                      leaf.value("byte_offset", size_t{0}),
+                                                      leaf["binding"].get<uint32_t>()});
+                }
+            }
             const std::string dtype = value.value("dtype", "");
-            const size_t elementSize = dtype == "f64" ? 8 : dtype == "f16" ? 2 : dtype == "bool" ? 1 : 4;
+            const size_t elementSize = value.value("element_abi_size", dtype == "f64"    ? size_t{8}
+                                                                       : dtype == "f16"  ? size_t{2}
+                                                                       : dtype == "bool" ? size_t{1}
+                                                                                         : size_t{4});
             argument.tensorElementSize = elementSize;
             if (value.contains("shape") && value["shape"].is_array()) {
                 size_t elements = 1;

@@ -272,7 +272,7 @@ std::string explicitSamplerBundle() {
 }
 
 void expectMatrixUpload(VernonRuntimeBackend backend, const char *target, uint16_t major, uint16_t minor,
-                        const std::array<float, 16> &storage, const std::array<uint64_t, 2> &strides,
+                        const std::array<float, 16> &storage, const std::array<int64_t, 2> &strides,
                         GlBoolean expectedTranspose, const std::array<float, 16> &expectedUpload) {
     matrixTranspose = expectedTranspose ? 0 : 1;
     matrixUpload.fill(0.0F);
@@ -389,7 +389,7 @@ TEST(RuntimeExternalGl, OwnsAllocatedResourcesButNotImportedNames) {
 }
 
 TEST(RuntimeExternalGl, UploadsColumnMajorMatricesWithoutCopying) {
-    constexpr std::array<uint64_t, 2> strides = {sizeof(float), 4 * sizeof(float)};
+    constexpr std::array<int64_t, 2> strides = {sizeof(float), 4 * sizeof(float)};
     constexpr std::array<float, 16> columnMajor = {
         1.0F, 5.0F, 9.0F, 13.0F, 2.0F, 6.0F, 10.0F, 14.0F, 3.0F, 7.0F, 11.0F, 15.0F, 4.0F, 8.0F, 12.0F, 16.0F,
     };
@@ -397,7 +397,7 @@ TEST(RuntimeExternalGl, UploadsColumnMajorMatricesWithoutCopying) {
 }
 
 TEST(RuntimeExternalGl, UploadsRowMajorMatricesWithDesktopTranspose) {
-    constexpr std::array<uint64_t, 2> strides = {4 * sizeof(float), sizeof(float)};
+    constexpr std::array<int64_t, 2> strides = {4 * sizeof(float), sizeof(float)};
     constexpr std::array<float, 16> rowMajor = {
         1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F, 9.0F, 10.0F, 11.0F, 12.0F, 13.0F, 14.0F, 15.0F, 16.0F,
     };
@@ -405,7 +405,7 @@ TEST(RuntimeExternalGl, UploadsRowMajorMatricesWithDesktopTranspose) {
 }
 
 TEST(RuntimeExternalGl, PacksRowMajorMatricesForOpenGlEs) {
-    constexpr std::array<uint64_t, 2> strides = {4 * sizeof(float), sizeof(float)};
+    constexpr std::array<int64_t, 2> strides = {4 * sizeof(float), sizeof(float)};
     constexpr std::array<float, 16> rowMajor = {
         1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F, 9.0F, 10.0F, 11.0F, 12.0F, 13.0F, 14.0F, 15.0F, 16.0F,
     };

@@ -4,6 +4,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -23,20 +24,68 @@
 
 namespace vernon::compiler {
 
+namespace {
+
+uint64_t sourceTypeAlignment(mlir::Type type);
+
+uint64_t productTypeSize(mlir::TypeRange fields) {
+    uint64_t offset = 0;
+    uint64_t alignment = 1;
+    for (mlir::Type field : fields) {
+        uint64_t fieldSize = sourceTypeSize(field);
+        uint64_t fieldAlignment = sourceTypeAlignment(field);
+        if (!fieldSize || !fieldAlignment)
+            return 0;
+        offset = llvm::alignTo(offset, fieldAlignment);
+        offset += fieldSize;
+        alignment = std::max(alignment, fieldAlignment);
+    }
+    return llvm::alignTo(offset, alignment);
+}
+
+uint64_t sourceTypeAlignment(mlir::Type type) {
+    if (type.isIntOrFloat())
+        return std::max<uint64_t>(type.getIntOrFloatBitWidth() / 8, 1);
+    if (type.isIndex() ||
+        mlir::isa<mlir::vernon::TensorViewType, mlir::vernon::TextureType, mlir::vernon::SamplerType>(type))
+        return sizeof(uintptr_t);
+    if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type))
+        return sourceTypeAlignment(tensor.getElementType());
+    if (auto tuple = mlir::dyn_cast<mlir::TupleType>(type)) {
+        uint64_t alignment = 1;
+        for (mlir::Type element : tuple.getTypes()) {
+            uint64_t elementAlignment = sourceTypeAlignment(element);
+            if (!elementAlignment)
+                return 0;
+            alignment = std::max(alignment, elementAlignment);
+        }
+        return alignment;
+    }
+    return 0;
+}
+
+} // namespace
+
 uint64_t sourceTypeSize(mlir::Type type) {
     if (type.isIntOrFloat())
         return std::max<uint64_t>(type.getIntOrFloatBitWidth() / 8, 1);
     if (type.isIndex())
         return sizeof(uint64_t);
-    if (mlir::isa<mlir::vernon::BufferType, mlir::vernon::TextureType, mlir::vernon::SamplerType>(type))
+    if (mlir::isa<mlir::vernon::TensorViewType, mlir::vernon::TextureType, mlir::vernon::SamplerType>(type))
         return sizeof(uintptr_t);
-    auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type);
-    if (!tensor || !tensor.hasStaticShape())
-        return 0;
-    uint64_t count = 1;
-    for (int64_t dimension : tensor.getShape())
-        count *= static_cast<uint64_t>(dimension);
-    return count * std::max<uint64_t>(tensor.getElementType().getIntOrFloatBitWidth() / 8, 1);
+    if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type)) {
+        if (!tensor.hasStaticShape())
+            return 0;
+        uint64_t count = 1;
+        for (int64_t dimension : tensor.getShape())
+            count *= static_cast<uint64_t>(dimension);
+        uint64_t elementSize = sourceTypeSize(tensor.getElementType());
+        uint64_t elementAlignment = sourceTypeAlignment(tensor.getElementType());
+        return elementSize && elementAlignment ? count * llvm::alignTo(elementSize, elementAlignment) : 0;
+    }
+    if (auto tuple = mlir::dyn_cast<mlir::TupleType>(type))
+        return productTypeSize(tuple.getTypes());
+    return 0;
 }
 
 namespace {
@@ -48,6 +97,24 @@ llvm::json::Value attributeToJson(mlir::Attribute attribute) {
         return string.getValue().str();
     if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(attribute))
         return integer.getInt();
+    if (auto integers = mlir::dyn_cast<mlir::DenseI64ArrayAttr>(attribute)) {
+        llvm::json::Array values;
+        for (int64_t value : integers.asArrayRef())
+            values.emplace_back(value);
+        return values;
+    }
+    if (auto integers = mlir::dyn_cast<mlir::DenseI32ArrayAttr>(attribute)) {
+        llvm::json::Array values;
+        for (int32_t value : integers.asArrayRef())
+            values.emplace_back(static_cast<int64_t>(value));
+        return values;
+    }
+    if (auto array = mlir::dyn_cast<mlir::ArrayAttr>(attribute)) {
+        llvm::json::Array values;
+        for (mlir::Attribute value : array)
+            values.emplace_back(attributeToJson(value));
+        return values;
+    }
 
     std::string printed;
     llvm::raw_string_ostream stream(printed);
@@ -262,6 +329,12 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
 
         llvm::json::Array arguments;
         uint64_t argumentOffset = 0;
+        uint32_t nextBinding = 0;
+        for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+            mlir::DictionaryAttr attrs = function.getArgAttrDict(index);
+            if (auto binding = attrs.getAs<mlir::IntegerAttr>("vernon.binding"))
+                nextBinding = std::max(nextBinding, static_cast<uint32_t>(binding.getInt() + 1));
+        }
         for (unsigned index = 0; index < function.getNumArguments(); ++index) {
             llvm::json::Object argument;
             argument["index"] = static_cast<int64_t>(index);
@@ -270,17 +343,28 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
             llvm::raw_string_ostream typeStream(type);
             function.getArgumentTypes()[index].print(typeStream);
             argument["type"] = std::move(type);
-            uint64_t size = sourceTypeSize(function.getArgumentTypes()[index]);
+            mlir::DictionaryAttr argumentAttrs = function.getArgAttrDict(index);
+            mlir::IntegerAttr reflectedSize;
+            mlir::IntegerAttr reflectedAlignment;
+            if (argumentAttrs) {
+                reflectedSize = argumentAttrs.getAs<mlir::IntegerAttr>("vernon.abi_size");
+                reflectedAlignment = argumentAttrs.getAs<mlir::IntegerAttr>("vernon.abi_alignment");
+            }
+            uint64_t size = reflectedSize ? static_cast<uint64_t>(reflectedSize.getInt())
+                                          : sourceTypeSize(function.getArgumentTypes()[index]);
             if (size) {
-                uint64_t alignment = size >= 16 ? 16 : size >= 8 ? 8 : 4;
+                uint64_t alignment = reflectedAlignment ? static_cast<uint64_t>(reflectedAlignment.getInt())
+                                     : size >= 16       ? 16
+                                     : size >= 8        ? 8
+                                                        : 4;
                 argumentOffset = llvm::alignTo(argumentOffset, alignment);
                 argument["cpu_offset"] = static_cast<int64_t>(argumentOffset);
                 argument["cpu_size"] = static_cast<int64_t>(size);
                 argumentOffset += size;
             }
 
-            if (auto attrs = function.getArgAttrDict(index)) {
-                for (mlir::NamedAttribute attr : attrs) {
+            if (argumentAttrs) {
+                for (mlir::NamedAttribute attr : argumentAttrs) {
                     argument[attr.getName().strref().str()] = attributeToJson(attr.getValue());
                     if (attr.getName().strref() == "vernon.instance_divisor")
                         requiredFeatures.insert("instancing");
@@ -318,14 +402,47 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
                         argument["dtype"] = sourceDtype.getValue().str();
                 } else if (mlir::isa<mlir::vernon::TextureType, mlir::vernon::SamplerType>(argumentType)) {
                     // Resource kind and binding metadata are emitted above.
-                } else if (auto buffer = mlir::dyn_cast<mlir::vernon::BufferType>(argumentType)) {
+                } else if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(argumentType)) {
                     argument["kind"] = "tensor";
                     argument["cuda_abi"] = "strided_memref_1d";
-                    argument["dtype"] =
-                        sourceDtype ? sourceDtype.getValue().str() : scalarDtype(buffer.getElementType());
-                    argument["access"] = buffer.getAccess().str();
-                    uint64_t elementSize = std::max<uint64_t>(buffer.getElementType().getIntOrFloatBitWidth() / 8, 1);
-                    argument["alignment"] = static_cast<int64_t>(elementSize);
+                    const std::string dtype =
+                        sourceDtype ? sourceDtype.getValue().str() : scalarDtype(view.getElementType());
+                    if (!dtype.empty())
+                        argument["dtype"] = dtype;
+                    argument["access"] = view.getAccess().str();
+                    argument["rank"] = static_cast<int64_t>(view.getRank());
+                    auto abiSize = attrs.getAs<mlir::IntegerAttr>("vernon.element_abi_size");
+                    auto abiAlignment = attrs.getAs<mlir::IntegerAttr>("vernon.element_abi_alignment");
+                    uint64_t elementSize =
+                        view.getElementType().isIntOrFloat()
+                            ? std::max<uint64_t>(view.getElementType().getIntOrFloatBitWidth() / 8, 1)
+                        : abiSize ? static_cast<uint64_t>(abiSize.getInt())
+                                  : 0;
+                    uint64_t elementAlignment =
+                        abiAlignment ? static_cast<uint64_t>(abiAlignment.getInt()) : elementSize;
+                    argument["element_abi_size"] = static_cast<int64_t>(elementSize);
+                    argument["alignment"] = static_cast<int64_t>(std::max<uint64_t>(elementAlignment, 1));
+                    mlir::FailureOr<mlir::vernon::StorageLayout> storageLayout =
+                        mlir::vernon::resolveStorageLayout(view.getElementType(), module);
+                    if (mlir::failed(storageLayout)) {
+                        function.emitError("cannot reflect aggregate TensorView storage layout");
+                        invalid = true;
+                        return;
+                    }
+                    const uint32_t firstBinding =
+                        attrs.getAs<mlir::IntegerAttr>("vernon.binding")
+                            ? static_cast<uint32_t>(attrs.getAs<mlir::IntegerAttr>("vernon.binding").getInt())
+                            : index;
+                    llvm::json::Array storageLeaves;
+                    for (auto [leafIndex, leaf] : llvm::enumerate(storageLayout->leaves)) {
+                        llvm::json::Object reflectedLeaf;
+                        reflectedLeaf["element_size"] =
+                            static_cast<int64_t>(std::max<uint64_t>(leaf.type.getIntOrFloatBitWidth() / 8, 1));
+                        reflectedLeaf["byte_offset"] = static_cast<int64_t>(leaf.byteOffset);
+                        reflectedLeaf["binding"] = static_cast<int64_t>(leafIndex == 0 ? firstBinding : nextBinding++);
+                        storageLeaves.emplace_back(std::move(reflectedLeaf));
+                    }
+                    argument["storage_leaves"] = std::move(storageLeaves);
                     if (auto shape = attrs.getAs<mlir::DenseI64ArrayAttr>("vernon.tensor_shape")) {
                         llvm::json::Array dimensions;
                         llvm::json::Array strides;
@@ -350,8 +467,8 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
                     argument["alignment"] = static_cast<int64_t>(std::max<uint64_t>(sourceTypeSize(argumentType), 1));
                 }
             }
-            if (mlir::isa<mlir::vernon::BufferType>(argumentType))
-                requiredFeatures.insert("buffers");
+            if (mlir::isa<mlir::vernon::TensorViewType>(argumentType))
+                requiredFeatures.insert("tensor_views");
             if (mlir::isa<mlir::vernon::TextureType>(argumentType))
                 requiredFeatures.insert("textures");
             if (mlir::isa<mlir::vernon::SamplerType>(argumentType))
@@ -369,14 +486,19 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
             llvm::raw_string_ostream typeStream(type);
             function.getResultTypes()[index].print(typeStream);
             output["type"] = std::move(type);
-            resultSize = sourceTypeSize(function.getResultTypes()[index]);
+            mlir::DictionaryAttr resultAttrs = function.getResultAttrDict(index);
+            mlir::IntegerAttr reflectedSize;
+            if (resultAttrs)
+                reflectedSize = resultAttrs.getAs<mlir::IntegerAttr>("vernon.abi_size");
+            resultSize = reflectedSize ? static_cast<uint64_t>(reflectedSize.getInt())
+                                       : sourceTypeSize(function.getResultTypes()[index]);
             if (resultSize) {
                 output["cpu_offset"] = int64_t{0};
                 output["cpu_size"] = static_cast<int64_t>(resultSize);
             }
 
-            if (auto attrs = function.getResultAttrDict(index)) {
-                for (mlir::NamedAttribute attr : attrs)
+            if (resultAttrs) {
+                for (mlir::NamedAttribute attr : resultAttrs)
                     output[attr.getName().strref().str()] = attributeToJson(attr.getValue());
             }
             results.emplace_back(std::move(output));
@@ -396,6 +518,30 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
                 dimensions.emplace_back(static_cast<int64_t>(dimension));
             entry["workgroup_size"] = std::move(dimensions);
         }
+        llvm::json::Array effects;
+        if (auto reflectedEffects = function->getAttrOfType<mlir::ArrayAttr>("vernon.storage_effects")) {
+            for (mlir::Attribute reflectedEffect : reflectedEffects) {
+                auto effect = mlir::dyn_cast<mlir::DictionaryAttr>(reflectedEffect);
+                if (!effect)
+                    continue;
+                auto kind = effect.getAs<mlir::StringAttr>("kind");
+                auto owner = effect.getAs<mlir::StringAttr>("owner");
+                auto region = effect.getAs<mlir::StringAttr>("region");
+                if (!kind || !owner || !region)
+                    continue;
+                llvm::json::Object reflected;
+                reflected["kind"] = kind.getValue().str();
+                reflected["owner"] = owner.getValue().str();
+                reflected["region"] = region.getValue().str();
+                llvm::json::Array indices;
+                if (auto values = effect.getAs<mlir::DenseI64ArrayAttr>("indices"))
+                    for (int64_t index : values.asArrayRef())
+                        indices.emplace_back(index);
+                reflected["indices"] = std::move(indices);
+                effects.emplace_back(std::move(reflected));
+            }
+        }
+        entry["effects"] = std::move(effects);
         entries.emplace_back(std::move(entry));
     });
     if (invalid)
@@ -404,8 +550,39 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
     llvm::json::Object root;
     root["schema_version"] = int64_t{2};
     root["gpu_launch_abi_version"] = int64_t{1};
+    int64_t valueAbiVersion = 0;
+    if (auto version = sourceModule->getAttrOfType<mlir::IntegerAttr>("vernon.value_abi_version"))
+        valueAbiVersion = version.getInt();
+    root["value_abi_version"] = valueAbiVersion;
     root["entries"] = std::move(entries);
     root["artifacts"] = llvm::json::Array();
+    std::map<std::string, llvm::json::Object> structLayouts;
+    for (mlir::vernon::StructDeclOp declaration : sourceModule.getOps<mlir::vernon::StructDeclOp>()) {
+        llvm::json::Object layout;
+        layout["name"] = declaration.getSymName().str();
+        if (auto size = declaration->getAttrOfType<mlir::IntegerAttr>("abi_size"))
+            layout["size"] = size.getInt();
+        if (auto alignment = declaration->getAttrOfType<mlir::IntegerAttr>("abi_alignment"))
+            layout["alignment"] = alignment.getInt();
+        llvm::json::Array offsets;
+        if (auto values = declaration->getAttrOfType<mlir::DenseI64ArrayAttr>("abi_field_offsets"))
+            for (int64_t offset : values.asArrayRef())
+                offsets.emplace_back(offset);
+        layout["field_offsets"] = std::move(offsets);
+        llvm::json::Array fields;
+        if (auto values = declaration->getAttrOfType<mlir::ArrayAttr>("fields"))
+            for (mlir::Attribute value : values)
+                if (auto field = mlir::dyn_cast<mlir::StringAttr>(value))
+                    fields.emplace_back(field.getValue().str());
+        layout["fields"] = std::move(fields);
+        structLayouts.emplace(declaration.getSymName().str(), std::move(layout));
+    }
+    llvm::json::Array reflectedStructs;
+    for (auto &[name, layout] : structLayouts) {
+        (void)name;
+        reflectedStructs.emplace_back(std::move(layout));
+    }
+    root["struct_layouts"] = std::move(reflectedStructs);
     llvm::json::Array dependencies;
     if (auto encoded = sourceModule->getAttrOfType<mlir::ArrayAttr>("vernon.source_dependencies")) {
         for (mlir::Attribute attribute : encoded) {

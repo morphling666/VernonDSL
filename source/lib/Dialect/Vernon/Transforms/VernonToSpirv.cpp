@@ -10,6 +10,7 @@
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVTypes.h"
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -18,6 +19,8 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringSwitch.h"
+
+#include <iterator>
 
 namespace mlir::vernon {
 namespace {
@@ -47,8 +50,18 @@ FailureOr<Type> convertValueType(Type type) {
         }
         return failure();
     }
+    if (auto tuple = dyn_cast<TupleType>(type)) {
+        SmallVector<Type> elements;
+        for (Type element : tuple.getTypes()) {
+            FailureOr<Type> converted = convertValueType(element);
+            if (failed(converted))
+                return failure();
+            elements.push_back(*converted);
+        }
+        return spirv::StructType::get(elements);
+    }
     if (type.isIntOrIndexOrFloat())
-        return type.isIndex() ? Type(IndexType::get(type.getContext())) : type;
+        return type.isIndex() ? Type(IntegerType::get(type.getContext(), 32)) : type;
     if (isa<VectorType>(type))
         return type;
     return failure();
@@ -186,6 +199,18 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
     Location location = operation.getLoc();
     auto mapped = [&](Value value) { return mapping.lookupOrNull(value); };
 
+    if (auto splat = dyn_cast<tensor::SplatOp>(operation)) {
+        Value input = mapped(splat.getInput());
+        FailureOr<Type> resultType = convertValueType(splat.getType());
+        if (!input || failed(resultType))
+            return failure();
+        auto vectorType = dyn_cast<VectorType>(*resultType);
+        if (!vectorType)
+            return failure();
+        SmallVector<Value> elements(vectorType.getNumElements(), input);
+        return spirv::CompositeConstructOp::create(builder, location, *resultType, elements).getResult();
+    }
+
     if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
         FailureOr<Type> type = convertValueType(constant.getType());
         if (failed(type))
@@ -219,6 +244,29 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
             componentAttrs.push_back(builder.getI32IntegerAttr(component));
         return spirv::VectorShuffleOp::create(builder, location, *resultType, input, input,
                                               builder.getArrayAttr(componentAttrs))
+            .getResult();
+    }
+
+    if (auto tuple = dyn_cast<TupleCreateOp>(operation)) {
+        SmallVector<Value> elements;
+        for (Value element : tuple.getElements()) {
+            Value converted = mapped(element);
+            if (!converted)
+                return failure();
+            elements.push_back(converted);
+        }
+        FailureOr<Type> resultType = convertValueType(tuple.getResult().getType());
+        if (failed(resultType))
+            return failure();
+        return spirv::CompositeConstructOp::create(builder, location, *resultType, elements).getResult();
+    }
+
+    if (auto tuple = dyn_cast<TupleGetOp>(operation)) {
+        Value input = mapped(tuple.getInput());
+        if (!input)
+            return failure();
+        return spirv::CompositeExtractOp::create(builder, location, input,
+                                                 ArrayRef<int32_t>{static_cast<int32_t>(tuple.getIndex())})
             .getResult();
     }
 
@@ -367,8 +415,12 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
             return failure();
         switch (compare.getPredicate()) {
         case arith::CmpIPredicate::eq:
+            if (lhs.getType().isInteger(1))
+                return spirv::LogicalEqualOp::create(builder, location, lhs, rhs).getResult();
             return spirv::IEqualOp::create(builder, location, lhs, rhs).getResult();
         case arith::CmpIPredicate::ne:
+            if (lhs.getType().isInteger(1))
+                return spirv::LogicalNotEqualOp::create(builder, location, lhs, rhs).getResult();
             return spirv::INotEqualOp::create(builder, location, lhs, rhs).getResult();
         case arith::CmpIPredicate::slt:
             return spirv::SLessThanOp::create(builder, location, lhs, rhs).getResult();
@@ -393,6 +445,14 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
         return spirv::SelectOp::create(builder, location, *resultType, condition, trueValue, falseValue).getResult();
     }
 
+    if (auto cast = dyn_cast<arith::IndexCastOp>(operation)) {
+        Value input = mapped(cast.getIn());
+        FailureOr<Type> resultType = convertValueType(cast.getType());
+        if (!input || failed(resultType) || input.getType() != *resultType)
+            return failure();
+        return input;
+    }
+
     if (operation.getNumOperands() == 2 && operation.getNumResults() == 1) {
         Value lhs = mapped(operation.getOperand(0));
         Value rhs = mapped(operation.getOperand(1));
@@ -413,13 +473,28 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
             return spirv::ISubOp::create(builder, location, lhs, rhs).getResult();
         if (name == arith::MulIOp::getOperationName())
             return spirv::IMulOp::create(builder, location, lhs, rhs).getResult();
+        if (name == arith::AndIOp::getOperationName()) {
+            if (operation.getResult(0).getType().isInteger(1))
+                return spirv::LogicalAndOp::create(builder, location, lhs, rhs).getResult();
+            return spirv::BitwiseAndOp::create(builder, location, lhs, rhs).getResult();
+        }
+        if (name == arith::OrIOp::getOperationName()) {
+            if (operation.getResult(0).getType().isInteger(1))
+                return spirv::LogicalOrOp::create(builder, location, lhs, rhs).getResult();
+            return spirv::BitwiseOrOp::create(builder, location, lhs, rhs).getResult();
+        }
+        if (name == arith::XOrIOp::getOperationName())
+            return spirv::BitwiseXorOp::create(builder, location, lhs, rhs).getResult();
     }
 
     return failure();
 }
 
 LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder, Block *functionEntry, IRMapping &mapping,
-                                         SmallVectorImpl<Value> &yieldedValues);
+                                         SmallVectorImpl<Value> &yieldedValues, Value *condition = nullptr);
+
+LogicalResult lowerWhile(scf::WhileOp whileOp, OpBuilder &builder, Block *functionEntry, IRMapping &mapping,
+                         SmallVectorImpl<Value> &results);
 
 LogicalResult lowerIf(scf::IfOp ifOp, OpBuilder &builder, Block *functionEntry, IRMapping &mapping,
                       SmallVectorImpl<Value> &results) {
@@ -486,8 +561,22 @@ LogicalResult lowerIf(scf::IfOp ifOp, OpBuilder &builder, Block *functionEntry, 
 }
 
 LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder, Block *functionEntry, IRMapping &mapping,
-                                         SmallVectorImpl<Value> &yieldedValues) {
+                                         SmallVectorImpl<Value> &yieldedValues, Value *condition) {
     for (Operation &operation : source) {
+        if (auto conditionOp = dyn_cast<scf::ConditionOp>(operation)) {
+            if (!condition)
+                return failure();
+            *condition = mapping.lookupOrNull(conditionOp.getCondition());
+            if (!*condition)
+                return failure();
+            for (Value operand : conditionOp.getArgs()) {
+                Value mapped = mapping.lookupOrNull(operand);
+                if (!mapped)
+                    return failure();
+                yieldedValues.push_back(mapped);
+            }
+            return success();
+        }
         if (auto yield = dyn_cast<scf::YieldOp>(operation)) {
             for (Value operand : yield.getOperands()) {
                 Value mapped = mapping.lookupOrNull(operand);
@@ -507,11 +596,98 @@ LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder, Bloc
                 mapping.map(sourceResult, translatedResult);
             continue;
         }
+        if (auto whileOp = dyn_cast<scf::WhileOp>(operation)) {
+            SmallVector<Value> translatedResults;
+            if (failed(lowerWhile(whileOp, builder, functionEntry, mapping, translatedResults)) ||
+                translatedResults.size() != whileOp.getNumResults())
+                return failure();
+            for (auto [sourceResult, translatedResult] : llvm::zip_equal(whileOp.getResults(), translatedResults))
+                mapping.map(sourceResult, translatedResult);
+            continue;
+        }
         FailureOr<Value> translated = translateOperation(operation, builder, mapping);
         if (failed(translated) || operation.getNumResults() != 1)
-            return failure();
+            return operation.emitError() << "operation cannot be translated inside structured control flow: "
+                                         << operation.getName();
         mapping.map(operation.getResult(0), *translated);
     }
+    return success();
+}
+
+LogicalResult lowerWhile(scf::WhileOp whileOp, OpBuilder &builder, Block *functionEntry, IRMapping &mapping,
+                         SmallVectorImpl<Value> &results) {
+    if (!whileOp.getBefore().hasOneBlock() || !whileOp.getAfter().hasOneBlock())
+        return whileOp.emitError("structured loop regions must contain one block");
+
+    SmallVector<Value> resultVariables;
+    OpBuilder variableBuilder = OpBuilder::atBlockBegin(functionEntry);
+    for (Type sourceType : whileOp.getResultTypes()) {
+        FailureOr<Type> type = convertValueType(sourceType);
+        if (failed(type))
+            return whileOp.emitError("cannot convert a structured loop result type");
+        auto pointerType = spirv::PointerType::get(*type, spirv::StorageClass::Function);
+        resultVariables.push_back(spirv::VariableOp::create(variableBuilder, whileOp.getLoc(), pointerType,
+                                                            spirv::StorageClass::Function, /*initializer=*/nullptr));
+    }
+
+    auto loop = spirv::LoopOp::create(builder, whileOp.getLoc(), spirv::LoopControl::None);
+    loop.addEntryAndMergeBlock(builder);
+    {
+        OpBuilder::InsertionGuard guard(builder);
+        Region &body = loop.getBody();
+        Block *entryBlock = loop.getEntryBlock();
+        Block *mergeBlock = loop.getMergeBlock();
+        Block *beforeBlock = builder.createBlock(&body, std::prev(body.end()));
+        Block *afterBlock = builder.createBlock(&body, std::prev(body.end()));
+
+        SmallVector<Value> initialValues;
+        for (Value operand : whileOp.getInits()) {
+            Value mapped = mapping.lookupOrNull(operand);
+            if (!mapped)
+                return whileOp.emitError("structured loop initial value is not mapped");
+            initialValues.push_back(mapped);
+        }
+        for (auto [argument, value] : llvm::zip_equal(whileOp.getBefore().front().getArguments(), initialValues)) {
+            FailureOr<Type> type = convertValueType(argument.getType());
+            if (failed(type))
+                return whileOp.emitError("cannot convert a structured loop before argument type");
+            BlockArgument targetArgument = beforeBlock->addArgument(*type, argument.getLoc());
+            mapping.map(argument, targetArgument);
+        }
+
+        SmallVector<Value> conditionValues;
+        Value condition;
+        OpBuilder beforeBuilder = OpBuilder::atBlockBegin(beforeBlock);
+        if (failed(translateStraightLineBlock(whileOp.getBefore().front(), beforeBuilder, functionEntry, mapping,
+                                              conditionValues, &condition)) ||
+            conditionValues.size() != whileOp.getAfter().front().getNumArguments())
+            return whileOp.emitError("cannot translate a structured loop condition region");
+        for (auto [argument, value] : llvm::zip_equal(whileOp.getAfter().front().getArguments(), conditionValues)) {
+            FailureOr<Type> type = convertValueType(argument.getType());
+            if (failed(type) || value.getType() != *type)
+                return whileOp.emitError("structured loop condition value type does not match its body argument");
+            BlockArgument targetArgument = afterBlock->addArgument(*type, argument.getLoc());
+            mapping.map(argument, targetArgument);
+        }
+        for (auto [variable, value] : llvm::zip_equal(resultVariables, conditionValues))
+            spirv::StoreOp::create(beforeBuilder, whileOp.getLoc(), variable, value);
+        spirv::BranchConditionalOp::create(beforeBuilder, whileOp.getLoc(), condition, afterBlock, conditionValues,
+                                           mergeBlock, ValueRange{});
+
+        SmallVector<Value> yieldedValues;
+        OpBuilder afterBuilder = OpBuilder::atBlockBegin(afterBlock);
+        if (failed(translateStraightLineBlock(whileOp.getAfter().front(), afterBuilder, functionEntry, mapping,
+                                              yieldedValues)) ||
+            yieldedValues.size() != beforeBlock->getNumArguments())
+            return whileOp.emitError("cannot translate a structured loop body region");
+        spirv::BranchOp::create(afterBuilder, whileOp.getLoc(), beforeBlock, yieldedValues);
+
+        OpBuilder entryBuilder = OpBuilder::atBlockBegin(entryBlock);
+        spirv::BranchOp::create(entryBuilder, whileOp.getLoc(), beforeBlock, initialValues);
+    }
+
+    for (Value variable : resultVariables)
+        results.push_back(spirv::LoadOp::create(builder, whileOp.getLoc(), variable).getResult());
     return success();
 }
 
@@ -663,6 +839,15 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
                 translatedResults.size() != ifOp.getNumResults())
                 return operation.emitError("structured conditional is not supported by SPIR-V lowering");
             for (auto [sourceResult, translatedResult] : llvm::zip_equal(ifOp.getResults(), translatedResults))
+                mapping.map(sourceResult, translatedResult);
+            continue;
+        }
+        if (auto whileOp = dyn_cast<scf::WhileOp>(operation)) {
+            SmallVector<Value> translatedResults;
+            if (failed(lowerWhile(whileOp, bodyBuilder, entry, mapping, translatedResults)) ||
+                translatedResults.size() != whileOp.getNumResults())
+                return operation.emitError("structured loop is not supported by SPIR-V lowering");
+            for (auto [sourceResult, translatedResult] : llvm::zip_equal(whileOp.getResults(), translatedResults))
                 mapping.map(sourceResult, translatedResult);
             continue;
         }

@@ -30,16 +30,6 @@ def Vernon_SemanticAttr : AttrDef<Vernon_Dialect, "Semantic"> {
   let assemblyFormat = "`<` $name `>`";
 }
 
-def Vernon_ArrayType : TypeDef<Vernon_Dialect, "Array"> {
-  let mnemonic = "array";
-  let summary = "Fixed-size array used by shader interfaces and structs";
-  let parameters = (ins
-    AttrOrTypeParameter<"unsigned", "number of elements">:$size,
-    TypeParameter<"::mlir::Type", "element type">:$elementType
-  );
-  let assemblyFormat = "`<` $size `x` $elementType `>`";
-}
-
 def Vernon_StructType : TypeDef<Vernon_Dialect, "Struct"> {
   let mnemonic = "struct";
   let summary = "Reference to a named DSL struct declaration";
@@ -47,14 +37,25 @@ def Vernon_StructType : TypeDef<Vernon_Dialect, "Struct"> {
   let assemblyFormat = "`<` $name `>`";
 }
 
-def Vernon_BufferType : TypeDef<Vernon_Dialect, "Buffer"> {
-  let mnemonic = "buffer";
-  let summary = "Addressable compute or graphics storage buffer";
+def Vernon_TensorType : TypeDef<Vernon_Dialect, "Tensor"> {
+  let mnemonic = "tensor";
+  let summary = "Static Tensor Value whose element is an aggregate Value";
   let parameters = (ins
     TypeParameter<"::mlir::Type", "element type">:$elementType,
+    ArrayRefParameter<"int64_t", "static shape">:$shape
+  );
+  let assemblyFormat = "`<` $elementType `,` `[` $shape `]` `>`";
+}
+
+def Vernon_TensorViewType : TypeDef<Vernon_Dialect, "TensorView"> {
+  let mnemonic = "tensor_view";
+  let summary = "Borrowed shaped storage with runtime layout";
+  let parameters = (ins
+    TypeParameter<"::mlir::Type", "element type">:$elementType,
+    AttrOrTypeParameter<"unsigned", "logical rank">:$rank,
     StringRefParameter<"read, write, or read_write access">:$access
   );
-  let assemblyFormat = "`<` $elementType `,` $access `>`";
+  let assemblyFormat = "`<` $elementType `,` $rank `,` $access `>`";
 }
 
 def Vernon_TextureType : TypeDef<Vernon_Dialect, "Texture"> {

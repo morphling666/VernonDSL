@@ -200,13 +200,11 @@ if(TARGET VernonDSLCompiler)
 
     if(TARGET vernon-dsl-native)
         add_test(NAME vernon-python-native-compiled-program
-                 COMMAND ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/python/tests/test_native_compiled_program.py"
-                         $<TARGET_FILE:vernon-dsl-native>)
-        add_test(
-            NAME vernon-python-compile-surface-parity
-            COMMAND ${Python_EXECUTABLE} "${VERNON_TEST_ROOT}/compiler/compile_surface_parity_test.py"
-                    $<TARGET_FILE:vernon-dsl-native> $<TARGET_FILE:VernonDSLCompiler> $<TARGET_FILE:vernon-compile>)
-        set_tests_properties(vernon-python-compile-surface-parity
+                 COMMAND ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/python/tests/test_native_compiled_program.py")
+        add_test(NAME vernon-python-compile-surface-parity
+                 COMMAND ${Python_EXECUTABLE} "${VERNON_TEST_ROOT}/compiler/compile_surface_parity_test.py"
+                         $<TARGET_FILE:VernonDSLCompiler> $<TARGET_FILE:vernon-compile>)
+        set_tests_properties(vernon-python-native-compiled-program vernon-python-compile-surface-parity
                              PROPERTIES ENVIRONMENT "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python")
     endif()
 

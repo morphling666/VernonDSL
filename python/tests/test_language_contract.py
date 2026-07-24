@@ -1,28 +1,102 @@
 from __future__ import annotations
 
+import ast
 import tempfile
 import unittest
 from pathlib import Path
 
+import vernon_dsl as vd
 from vernon_dsl import CompileError, Compiler, compile_source
 from vernon_dsl.compiler import FrontendCompileRequest
-from vernon_dsl.frontend.analysis import dump_typed_model
-from vernon_dsl.frontend.model import AccessMode, ConcreteType, StorageClass, TypedParameter
+from vernon_dsl.frontend.abi import ValueAbiLayout, value_abi_layout
+from vernon_dsl.frontend.analysis import dump_typed_model, typed_effect_data, typed_model_data
+from vernon_dsl.frontend.model import (
+    AccessMode,
+    AtomicEffect,
+    BarrierEffect,
+    ConcreteType,
+    Effect,
+    EffectScope,
+    MemoryOrdering,
+    StorageEffect,
+    StorageEffectKind,
+    StorageOwner,
+    StorageRegion,
+    StorageRegionKind,
+    Termination,
+    TypedFunctionInstance,
+    TypedParameter,
+    TypedStatement,
+)
 
 
 class LanguageVersionTests(unittest.TestCase):
-    def test_tensor_addressability_is_parameter_storage_not_a_type_kind(self) -> None:
+    def test_v3_vector_and_matrix_aliases_are_removed(self) -> None:
+        for name in ("vec", "mat", "vec2", "vec3", "vec4", "mat2", "mat3", "mat4"):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(vd, name))
+
+    def test_tensor_values_and_tensor_view_resources_are_distinct(self) -> None:
         element = ConcreteType("scalar", "f32")
         tensor = ConcreteType("tensor", "Tensor", (element, 4))
-        parameter = TypedParameter(
-            "output",
-            tensor,
-            StorageClass.ADDRESSABLE,
-            AccessMode.READ_WRITE,
+        view = ConcreteType("tensor_view", "TensorView", (element, 1, "write"))
+        parameter = TypedParameter("output", view, AccessMode.WRITE)
+
+        self.assertEqual(tensor.mlir, "tensor<4xf32>")
+        self.assertEqual(parameter.type.mlir, '!vernon.tensor_view<f32, 1, "write">')
+        self.assertEqual(parameter.access, AccessMode.WRITE)
+
+    def test_portable_value_abi_layout_is_deterministic(self) -> None:
+        f16 = ConcreteType("scalar", "f16")
+        f32 = ConcreteType("scalar", "f32")
+        f64 = ConcreteType("scalar", "f64")
+        boolean = ConcreteType("scalar", "bool")
+        tuple_type = ConcreteType("tuple", "Tuple", (f16, f64, boolean))
+        vertex = ConcreteType("struct", "Vertex")
+        fields = {
+            "Vertex": (
+                ConcreteType("tensor", "Tensor", (f32, 3)),
+                f64,
+            )
+        }
+
+        self.assertEqual(
+            value_abi_layout(tuple_type, fields.__getitem__),
+            ValueAbiLayout(24, 8, (0, 8, 16)),
         )
-        self.assertEqual(parameter.type.kind, "tensor")
-        self.assertEqual(parameter.type.mlir, "tensor<4xf32>")
-        self.assertEqual(parameter.storage, StorageClass.ADDRESSABLE)
+        self.assertEqual(
+            value_abi_layout(vertex, fields.__getitem__),
+            ValueAbiLayout(24, 8, (0, 16)),
+        )
+        self.assertEqual(
+            value_abi_layout(
+                ConcreteType("tensor", "Tensor", (vertex, 2)),
+                fields.__getitem__,
+            ),
+            ValueAbiLayout(48, 8, element_stride=24),
+        )
+
+        output = compile_source(
+            "from vernon_dsl import *\n@struct\nclass Vertex:\n    position: Tensor[f32, (3,)]\n    weight: f64\n",
+            "abi_layout.py",
+        )
+        self.assertIn("vernon.value_abi_version = 1 : i64", output)
+        self.assertIn("abi_alignment = 8 : i64", output)
+        self.assertIn("abi_field_offsets = array<i64: 0, 16>", output)
+        self.assertIn("abi_size = 24 : i64", output)
+
+        shared_output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func(shared=True)\n"
+            "def preserve(values: Tensor[Tuple[f32, i32], (2,)])"
+            " -> Tensor[Tuple[f32, i32], (2,)]:\n"
+            "    return values\n",
+            "shared_abi_layout.py",
+        )
+        self.assertIn("attributes {vernon.shared}", shared_output)
+        self.assertIn("vernon.abi_alignment = 4 : i64", shared_output)
+        self.assertIn("vernon.abi_element_stride = 8 : i64", shared_output)
+        self.assertIn("vernon.abi_size = 16 : i64", shared_output)
 
     def test_frontend_and_semantic_identity_are_version_three(self) -> None:
         source = "from vernon_dsl import *\n@fragment\ndef main(value: float) -> float:\n    return value\n"
@@ -82,8 +156,218 @@ class LanguageVersionTests(unittest.TestCase):
         branch = function.body[1]
         self.assertEqual([(merge.name, merge.type.mlir) for merge in branch.branch_merges], [("result", "f32")])
         self.assertTrue(branch.children[0].lvalues)
-        self.assertEqual(branch.children[0].effect.value, "write")
+        self.assertEqual(branch.children[0].effects, ())
+        self.assertEqual(branch.children[0].effect, Effect.PURE)
+        self.assertEqual(branch.effect, Effect.PURE)
         self.assertIn('"operation": "add"', dump_typed_model(result.typed_functions))
+
+    def test_structured_storage_effects_track_owner_and_region(self) -> None:
+        source = (
+            "from typing import Annotated\n"
+            "from vernon_dsl import *\n"
+            "@kernel\n"
+            "def main(\n"
+            "    output: TensorView[f32, 1, write],\n"
+            "    source: TensorView[f32, 1, read],\n"
+            "    gid: Annotated[Tensor[u32, (3,)], builtin('global_invocation_id')],\n"
+            ") -> None:\n"
+            "    local = source[2]\n"
+            "    output[gid[0]] = local\n"
+            "    if gid[0] > 0:\n"
+            "        output[1] = source[gid[0]]\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "structured_effects.py"
+            path.write_text(source, encoding="utf-8")
+            first = Compiler().compile_request(FrontendCompileRequest(path, "main"))
+            second = Compiler().compile_request(FrontendCompileRequest(path, "main"))
+
+        function = next(function for function in first.typed_functions if function.symbol == "main")
+        read_static, write_dynamic, branch = function.body
+        self.assertEqual(
+            read_static.effects,
+            (
+                StorageEffect(
+                    StorageEffectKind.READ,
+                    StorageOwner("source"),
+                    StorageRegion(StorageRegionKind.ELEMENT, (2,)),
+                ),
+            ),
+        )
+        self.assertEqual(
+            write_dynamic.effects,
+            (
+                StorageEffect(
+                    StorageEffectKind.WRITE,
+                    StorageOwner("output"),
+                    StorageRegion(StorageRegionKind.UNKNOWN),
+                ),
+            ),
+        )
+        self.assertEqual(
+            branch.children[0].effects,
+            (
+                StorageEffect(
+                    StorageEffectKind.READ,
+                    StorageOwner("source"),
+                    StorageRegion(StorageRegionKind.UNKNOWN),
+                ),
+                StorageEffect(
+                    StorageEffectKind.WRITE,
+                    StorageOwner("output"),
+                    StorageRegion(StorageRegionKind.ELEMENT, (1,)),
+                ),
+            ),
+        )
+        self.assertEqual(read_static.effect, Effect.READ)
+        self.assertEqual(write_dynamic.effect, Effect.WRITE)
+        self.assertEqual(branch.effect, Effect.WRITE)
+        self.assertEqual(
+            function.effects,
+            (
+                read_static.effects[0],
+                write_dynamic.effects[0],
+                branch.children[0].effects[0],
+                branch.children[0].effects[1],
+            ),
+        )
+        self.assertEqual(dump_typed_model(first.typed_functions), dump_typed_model(second.typed_functions))
+        self.assertEqual(first.semantic_inputs["entry_effects"], second.semantic_inputs["entry_effects"])
+        self.assertEqual(
+            first.semantic_inputs["entry_effects"],
+            [typed_effect_data(effect) for effect in function.effects],
+        )
+        self.assertNotIn("allocation", str(first.semantic_inputs["entry_effects"]))
+        self.assertNotIn("transfer", str(first.semantic_inputs["entry_effects"]))
+        self.assertIn("vernon.storage_effects = [", first.mlir)
+        self.assertEqual(
+            typed_model_data(first.typed_functions)[0]["body"][0]["effects"],
+            [
+                {
+                    "kind": "read",
+                    "owner": "source",
+                    "region": {"kind": "element", "indices": [2]},
+                }
+            ],
+        )
+
+    def test_value_and_resource_reads_are_not_storage_effects(self) -> None:
+        value_source = (
+            "from vernon_dsl import *\n@fragment\ndef main(value: Tensor[f32, (2,)]) -> f32:\n    return value[0]\n"
+        )
+        resource_source = (
+            "from vernon_dsl import *\n"
+            "@fragment\n"
+            "def main(image: Texture['2d', f32], sampler: Sampler, uv: Vector[f32, 2]) -> Vector[f32, 4]:\n"
+            "    return texture_sample(image, sampler, uv)\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            value_path = Path(directory) / "value_effect.py"
+            value_path.write_text(value_source, encoding="utf-8")
+            value_result = Compiler().compile_request(FrontendCompileRequest(value_path, "main"))
+            resource_path = Path(directory) / "resource_effect.py"
+            resource_path.write_text(resource_source, encoding="utf-8")
+            resource_result = Compiler().compile_request(FrontendCompileRequest(resource_path, "main"))
+
+        value_statement = value_result.typed_functions[0].body[0]
+        resource_statement = resource_result.typed_functions[0].body[0]
+        self.assertEqual(value_statement.effects, ())
+        self.assertEqual(value_statement.effect, Effect.PURE)
+        self.assertEqual(resource_statement.effects, ())
+        self.assertEqual(resource_statement.effect, Effect.READ)
+
+    def test_atomic_and_barrier_effect_records_are_reserved_and_deterministic(self) -> None:
+        function_source = ast.parse("@kernel\ndef main() -> None:\n    pass\n").body[0]
+        assert isinstance(function_source, ast.FunctionDef)
+        atomic = AtomicEffect(
+            "add",
+            StorageOwner("values"),
+            StorageRegion(StorageRegionKind.ELEMENT, (3,)),
+            MemoryOrdering.RELAXED,
+            EffectScope.DEVICE,
+        )
+        barrier = BarrierEffect(MemoryOrdering.ACQUIRE_RELEASE, EffectScope.WORKGROUP)
+        statement = TypedStatement(
+            function_source.body[0],
+            Termination.FALLTHROUGH,
+            (atomic, barrier),
+        )
+        function = TypedFunctionInstance(
+            "main",
+            "main",
+            (),
+            None,
+            (),
+            function_source,
+            (statement,),
+            effects=(atomic, barrier),
+        )
+
+        model = typed_model_data((function,))[0]
+        self.assertEqual(model["body"][0]["effect"], "write")
+        self.assertEqual(
+            model["effects"],
+            [
+                {
+                    "kind": "atomic",
+                    "operation": "add",
+                    "owner": "values",
+                    "region": {"kind": "element", "indices": [3]},
+                    "ordering": "relaxed",
+                    "scope": "device",
+                },
+                {
+                    "kind": "barrier",
+                    "ordering": "acquire_release",
+                    "scope": "workgroup",
+                },
+            ],
+        )
+        self.assertEqual(dump_typed_model((function,)), dump_typed_model((function,)))
+
+    def test_atomic_and_barrier_language_operations_are_explicitly_unsupported(self) -> None:
+        cases = (
+            (
+                "@kernel\ndef bad(values: TensorView[i32, 1, read_write]) -> None:\n    atomic_add(values, 0, 1)\n",
+                "atomic operations are reserved for Phase 6 and are not supported",
+            ),
+            (
+                "@kernel\ndef bad() -> None:\n    barrier()\n",
+                "barrier operations are reserved for Phase 6 and are not supported",
+            ),
+        )
+        for body, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(CompileError, message):
+                compile_source("from vernon_dsl import *\n" + body, "reserved_effect.py")
+
+    def test_pure_helper_rejects_propagated_storage_effects(self) -> None:
+        with self.assertRaisesRegex(CompileError, "pure helper 'copy' has Storage effects"):
+            compile_source(
+                "from vernon_dsl import *\n"
+                "@func\n"
+                "def copy(output: TensorView[f32, 1, write], source: TensorView[f32, 1, read]) -> None:\n"
+                "    output[0] = source[0]\n"
+                "@kernel\n"
+                "def main(output: TensorView[f32, 1, write], source: TensorView[f32, 1, read]) -> None:\n"
+                "    copy(output, source)\n",
+                "effectful_helper.py",
+            )
+
+    def test_helper_call_rejects_known_incompatible_aliases(self) -> None:
+        with self.assertRaisesRegex(CompileError, "helper call 'combine' has incompatible aliased Storage effects"):
+            compile_source(
+                "from vernon_dsl import *\n"
+                "@func\n"
+                "def combine(\n"
+                "    left: TensorView[f32, 1, read_write],\n"
+                "    right: TensorView[f32, 1, read_write],\n"
+                ") -> None:\n"
+                "    left[0] = right[0]\n"
+                "@kernel\n"
+                "def main(data: TensorView[f32, 1, read_write]) -> None:\n"
+                "    combine(data, data)\n",
+                "aliased_helper.py",
+            )
 
     def test_removed_v2_spelling_and_array_fail_at_the_frontend(self) -> None:
         with self.assertRaisesRegex(CompileError, "unknown DSL decorator 'compute'"):
@@ -97,17 +381,262 @@ class LanguageVersionTests(unittest.TestCase):
                 "array.py",
             )
 
-    def test_short_circuit_and_nested_return_are_rejected_consistently(self) -> None:
-        with self.assertRaisesRegex(CompileError, "short-circuit semantics"):
+    def test_tensor_elements_are_recursively_abi_stable_values(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@struct\n"
+            "class Particle:\n"
+            "    position: Tensor[f32, (3,)]\n"
+            "    lifetime: f32\n"
+            "@func\n"
+            "def identity(value: Tensor[Particle, (4,)]) -> Tensor[Particle, (4,)]:\n"
+            "    return value\n",
+            "aggregate_elements.py",
+        )
+        self.assertIn('!vernon.tensor<!vernon.struct<"Particle">, [4]>', output)
+
+    def test_nested_tensor_types_canonicalize_by_shape_composition(self) -> None:
+        scalar = ConcreteType("scalar", "f32")
+        nested = ConcreteType(
+            "tensor",
+            "Tensor",
+            (ConcreteType("tensor", "Tensor", (scalar, 3)), 8),
+        )
+        flat = ConcreteType("tensor", "Tensor", (scalar, 8, 3))
+        self.assertEqual(nested, flat)
+
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def identity(\n"
+            "    value: Tensor[Tensor[f32, (3,)], (8,)],\n"
+            ") -> Tensor[f32, (8, 3)]:\n"
+            "    return value\n",
+            "nested_tensor.py",
+        )
+        self.assertIn("tensor<8x3xf32>", output)
+        self.assertNotIn("tensor<8xtensor", output)
+
+    def test_tensor_rejects_storage_and_resource_elements(self) -> None:
+        cases = (
+            ("TensorView[f32, 1, read]", "Storage 'TensorView'"),
+            ('Texture["2d", f32]', "Resource 'Texture'"),
+            ("Sampler", "Resource 'Sampler'"),
+        )
+        for index, (element, diagnostic) in enumerate(cases):
+            with self.subTest(element=element), self.assertRaisesRegex(CompileError, diagnostic):
+                compile_source(
+                    f"from vernon_dsl import *\n@func\ndef bad(value: Tensor[{element}, (2,)]) -> None:\n    pass\n",
+                    f"invalid_tensor_element_{index}.py",
+                )
+
+    def test_struct_fields_must_be_finite_abi_stable_values(self) -> None:
+        cases = (
+            (
+                "@struct\nclass Bad:\n    data: TensorView[f32, 1, read]\n",
+                "Struct field 'Bad.data' must be an ABI-stable Value",
+            ),
+            (
+                "@struct\nclass Recursive:\n    next: Recursive\n",
+                "Struct field 'Recursive.next' must be an ABI-stable Value",
+            ),
+        )
+        for index, (declaration, diagnostic) in enumerate(cases):
+            with self.subTest(index=index), self.assertRaisesRegex(CompileError, diagnostic):
+                compile_source(
+                    f"from vernon_dsl import *\n{declaration}",
+                    f"invalid_struct_{index}.py",
+                )
+
+    def test_lazy_short_circuit_boolean_expressions_yield_values(self) -> None:
+        source = (
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def choose(a: bool, b: bool, c: bool) -> bool:\n"
+            "    return a and b and c\n"
+            "@kernel\n"
+            "def main(\n"
+            "    output: TensorView[i32, 1, write],\n"
+            "    source: TensorView[i32, 1, read],\n"
+            "    enabled: bool,\n"
+            ") -> None:\n"
+            "    if enabled and source[0] > 0:\n"
+            "        output[0] = 1\n"
+        )
+        output = compile_source(source, "short_circuit.py")
+        self.assertGreaterEqual(output.count("scf.if"), 3)
+        self.assertNotIn("arith.andi", output)
+        expression_if = output.index("scf.if", output.index("@main"))
+        load = output.index('name = "tensor_view_load"', expression_if)
+        outer_if = output.index("scf.if", load)
+        self.assertLess(expression_if, load)
+        self.assertLess(load, outer_if)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "short_circuit.py"
+            path.write_text(source, encoding="utf-8")
+            result = Compiler().compile_request(FrontendCompileRequest(path, "main"))
+        main = next(function for function in result.typed_functions if function.symbol == "main")
+        boolean_expression = next(
+            expression for expression in main.body[0].expressions if expression.operation == "and"
+        )
+        self.assertEqual([value.mlir for value in boolean_expression.operand_types], ["i1", "i1"])
+
+        with self.assertRaisesRegex(CompileError, "and/or operands must be bool Values"):
             compile_source(
-                "from vernon_dsl import *\n@func\ndef both(a: bool, b: bool) -> bool:\n    return a and b\n",
-                "boolean.py",
+                "from vernon_dsl import *\n@func\ndef bad(a: f32, b: f32) -> f32:\n    return a or b\n",
+                "numeric_short_circuit.py",
             )
-        with self.assertRaisesRegex(CompileError, "nested return is not supported"):
+
+    def test_nested_return_uses_structured_payload_state(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n@func\ndef stop(a: bool) -> f32:\n"
+            "    while a:\n        if a:\n            return 1.0\n    return 0.0\n",
+            "return.py",
+        )
+        self.assertIn("scf.while", output)
+        self.assertEqual(output.count("func.return"), 1)
+
+        with self.assertRaisesRegex(CompileError, "may exit without returning a value"):
             compile_source(
-                "from vernon_dsl import *\n@func\ndef stop(a: bool) -> f32:\n"
-                "    while a:\n        if a:\n            return 1.0\n    return 0.0\n",
-                "return.py",
+                "from vernon_dsl import *\n@func\ndef incomplete(a: bool) -> f32:\n    if a:\n        return 1.0\n",
+                "incomplete_return.py",
+            )
+
+    def test_conditional_expressions_unify_types_and_merge_effects(self) -> None:
+        source = (
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def choose(condition: bool, narrow: f32, wide: f64) -> f64:\n"
+            "    return narrow if condition else wide\n"
+            "@kernel\n"
+            "def main(\n"
+            "    output: TensorView[f32, 1, write],\n"
+            "    left: TensorView[f32, 1, read],\n"
+            "    right: TensorView[f32, 1, read],\n"
+            "    condition: bool,\n"
+            ") -> None:\n"
+            "    output[0] = left[0] if condition else right[0]\n"
+        )
+        output = compile_source(source, "conditional_expression.py")
+        self.assertGreaterEqual(output.count("scf.if"), 2)
+        self.assertIn("arith.extf", output)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "conditional_expression.py"
+            path.write_text(source, encoding="utf-8")
+            result = Compiler().compile_request(FrontendCompileRequest(path, "main"))
+        main = next(function for function in result.typed_functions if function.symbol == "main")
+        conditional = next(
+            expression for expression in main.body[0].expressions if expression.operation == "conditional"
+        )
+        self.assertEqual([value.mlir for value in conditional.operand_types], ["i1", "f32", "f32"])
+        self.assertEqual(
+            [(effect.kind.value, effect.owner.parameter) for effect in main.effects],
+            [("read", "left"), ("read", "right"), ("write", "output")],
+        )
+        self.assertEqual(
+            result.semantic_inputs["entry_effects"],
+            [typed_effect_data(effect) for effect in main.effects],
+        )
+
+        with self.assertRaisesRegex(CompileError, "conditional expression branches have incompatible types"):
+            compile_source(
+                "from vernon_dsl import *\n"
+                "@func\n"
+                "def bad(condition: bool, value: f32) -> f32:\n"
+                "    return value if condition else False\n",
+                "invalid_conditional_expression.py",
+            )
+
+    def test_typed_break_and_continue_target_nearest_loop(self) -> None:
+        source = (
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def sum_odds(limit: i32) -> i32:\n"
+            "    index = 0\n"
+            "    total = 0\n"
+            "    while index < limit:\n"
+            "        index += 1\n"
+            "        if index % 2 == 0:\n"
+            "            continue\n"
+            "        if index > 7:\n"
+            "            break\n"
+            "        total += index\n"
+            "    return total\n"
+            "@fragment\n"
+            "def main(limit: i32) -> i32:\n"
+            "    return sum_odds(limit)\n"
+        )
+        output = compile_source(source, "loop_control.py")
+        self.assertIn("scf.while", output)
+        self.assertIn("arith.select", output)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "loop_control.py"
+            path.write_text(source, encoding="utf-8")
+            result = Compiler().compile_request(FrontendCompileRequest(path, "main"))
+        function = next(function for function in result.typed_functions if function.qualified_name == "sum_odds")
+        loop = function.body[2]
+        exits = [
+            child
+            for statement in loop.children
+            for child in statement.children
+            if child.termination in {Termination.BREAK, Termination.CONTINUE}
+        ]
+        self.assertEqual(
+            [(statement.termination.value, statement.loop_depth) for statement in exits],
+            [("continue", 1), ("break", 1)],
+        )
+        self.assertEqual(function.body[-1].return_type, ConcreteType("scalar", "i32"))
+
+        for keyword in ("break", "continue"):
+            with (
+                self.subTest(keyword=keyword),
+                self.assertRaisesRegex(CompileError, f"{keyword} is only valid inside a loop"),
+            ):
+                compile_source(
+                    f"from vernon_dsl import *\n@func\ndef bad() -> None:\n    {keyword}\n",
+                    f"invalid_{keyword}.py",
+                )
+
+    def test_dynamic_range_contract_and_type_rules(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def total(start: i32, stop: i32, step: i32) -> i32:\n"
+            "    result = 0\n"
+            "    for index in range(start, stop, step):\n"
+            "        result += i32(index)\n"
+            "    return result\n",
+            "dynamic_range.py",
+        )
+        self.assertIn("cf.assert", output)
+        self.assertIn("scf.while", output)
+        self.assertNotIn("scf.for", output)
+
+        with self.assertRaisesRegex(CompileError, "range step must not be zero"):
+            compile_source(
+                "from vernon_dsl import *\n"
+                "@func\n"
+                "def zero_step() -> i32:\n"
+                "    result = 0\n"
+                "    for index in range(0, 4, 0):\n"
+                "        result += i32(index)\n"
+                "    return result\n",
+                "zero_range.py",
+            )
+
+        with self.assertRaisesRegex(CompileError, "range u32 arguments require an explicit i32 conversion"):
+            compile_source(
+                "from vernon_dsl import *\n"
+                "@func\n"
+                "def unsigned_range(stop: u32) -> i32:\n"
+                "    result = 0\n"
+                "    for index in range(stop):\n"
+                "        result += i32(index)\n"
+                "    return result\n",
+                "unsigned_range.py",
             )
 
 
@@ -425,28 +954,25 @@ class NumericInferenceTests(unittest.TestCase):
         self.assertIn('!vernon.struct<"Pair">', output)
         self.assertIn("vernon.struct_get", output)
 
-    def test_generic_buffer_store_infers_resource_and_widens_value(self) -> None:
+    def test_kernel_tensor_view_store_infers_resource_and_widens_value(self) -> None:
         output = compile_source(
             "from typing import Annotated\n"
             "from vernon_dsl import *\n"
-            "@func\n"
-            "def store(output, index, value):\n"
-            "    output[index] = value\n"
             "@kernel\n"
             "def main(\n"
-            "    output: Annotated[Buffer[f32], resource(set=0, binding=0)],\n"
+            "    output: Annotated[TensorView[f32, 1, read_write], resource(set=0, binding=0)],\n"
             "    index: u32,\n"
             "    value: f16,\n"
             ") -> None:\n"
-            "    store(output, index, value)\n",
-            "generic_buffer.py",
+            "    output[index] = value\n",
+            "kernel_tensor_view.py",
         )
-        self.assertIn('!vernon.buffer<f32, "read_write">', output)
+        self.assertIn('!vernon.tensor_view<f32, 1, "read_write">', output)
         self.assertIn("arith.extf", output)
-        self.assertIn('name = "buffer_store"', output)
+        self.assertIn('name = "tensor_view_store"', output)
 
-    def test_generic_buffer_store_rejects_read_only_resource(self) -> None:
-        with self.assertRaisesRegex(CompileError, "cannot assign through a read-only buffer"):
+    def test_generic_tensor_view_store_rejects_read_only_resource(self) -> None:
+        with self.assertRaisesRegex(CompileError, "cannot assign through a read-only TensorView"):
             compile_source(
                 "from typing import Annotated\n"
                 "from vernon_dsl import *\n"
@@ -455,11 +981,11 @@ class NumericInferenceTests(unittest.TestCase):
                 "    output[0] = value\n"
                 "@kernel\n"
                 "def main(\n"
-                '    output: Annotated[Buffer[f32, "read"], resource(set=0, binding=0)],\n'
+                "    output: Annotated[TensorView[f32, 1, read], resource(set=0, binding=0)],\n"
                 "    value: f32,\n"
                 ") -> None:\n"
                 "    store(output, value)\n",
-                "readonly_buffer.py",
+                "readonly_tensor_view.py",
             )
 
     def test_matrix_rejects_ragged_and_empty_literals(self) -> None:
@@ -472,23 +998,98 @@ class NumericInferenceTests(unittest.TestCase):
                 ),
             ):
                 compile_source(
-                    f"from vernon_dsl import *\n@func\ndef bad() -> mat2[f32]:\n    return {expression}\n",
+                    f"from vernon_dsl import *\n@func\ndef bad() -> Matrix[f32, 2, 2]:\n    return {expression}\n",
                     f"bad_matrix_{index}.py",
                 )
 
-    def test_pythonic_and_legacy_aggregate_constructors_share_types(self) -> None:
+    def test_vector_and_matrix_constructors_share_tensor_types(self) -> None:
         output = compile_source(
             "from vernon_dsl import *\n"
             "@func\n"
-            "def aggregates(value: f64) -> vec2[f64]:\n"
-            "    pythonic = Vector([1, value])\n"
-            "    legacy = vec2(1, value)\n"
+            "def aggregates(value: f64) -> Vector[f64, 2]:\n"
+            "    vector = Vector([1, value])\n"
             "    matrix = Matrix([[1, value], [3.0, 4]])\n"
-            "    return pythonic + legacy + matmul(matrix, pythonic)\n",
+            "    return vector + matmul(matrix, vector)\n",
             "aggregate_parity.py",
         )
-        self.assertGreaterEqual(output.count("tensor<2xf64>"), 3)
+        self.assertGreaterEqual(output.count("tensor<2xf64>"), 2)
         self.assertIn("tensor<2x2xf64>", output)
+
+    def test_tensor_is_the_canonical_rectangular_value_constructor(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def tensor_value(value: f64) -> Tensor[f64, (2, 2, 1)]:\n"
+            "    return Tensor([[[1], [value]], [[3.0], [4]]])\n",
+            "tensor_constructor.py",
+        )
+        self.assertIn("tensor<2x2x1xf64>", output)
+        self.assertIn('name = "construct"', output)
+
+        with self.assertRaisesRegex(CompileError, "non-empty rectangular"):
+            compile_source(
+                "from vernon_dsl import *\n"
+                "@func\n"
+                "def ragged() -> Tensor[f32, (2, 2)]:\n"
+                "    return Tensor([[1], [2, 3]])\n",
+                "ragged_tensor.py",
+            )
+
+    def test_vector_and_matrix_are_tensor_rank_aliases(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def aliases(\n"
+            "    vector: Vector[f32, 2],\n"
+            "    matrix: Matrix[f32, 2, 2],\n"
+            ") -> Tensor[f32, (2,)]:\n"
+            "    return vector + matmul(matrix, vector)\n",
+            "rank_aliases.py",
+        )
+        self.assertIn("tensor<2xf32>", output)
+        self.assertIn("tensor<2x2xf32>", output)
+
+    def test_tuple_construction_constant_indexing_and_destructuring(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def make(value: f64) -> Tuple[f64, i32]:\n"
+            "    return (value, 2)\n"
+            "@func\n"
+            "def consume(value: f64) -> f64:\n"
+            "    pair = make(value)\n"
+            "    first, second = pair\n"
+            "    return first + f64(second) + pair[0]\n",
+            "tuple_values.py",
+        )
+        self.assertIn("tuple<f64, i32>", output)
+        self.assertIn('"vernon.tuple_create"', output)
+        self.assertIn('"vernon.tuple_get"', output)
+
+    def test_tensor_may_contain_homogeneous_tuple_values(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def records(value: f32) -> Tensor[Tuple[f32, i32], (2,)]:\n"
+            "    return Tensor([Tuple(value, 1), Tuple(value, 2)])\n",
+            "tuple_tensor.py",
+        )
+        self.assertIn("!vernon.tensor<tuple<f32, i32>, [2]>", output)
+
+    def test_tuple_indexing_requires_an_in_bounds_constant(self) -> None:
+        cases = (
+            ("pair[index]", "Tuple indexing requires an integer literal"),
+            ("pair[2]", "Tuple index is out of bounds"),
+        )
+        for index, (expression, diagnostic) in enumerate(cases):
+            with self.subTest(expression=expression), self.assertRaisesRegex(CompileError, diagnostic):
+                compile_source(
+                    "from vernon_dsl import *\n"
+                    "@func\n"
+                    "def bad(pair: Tuple[f32, i32], index: i32) -> f32:\n"
+                    f"    return {expression}\n",
+                    f"tuple_index_{index}.py",
+                )
 
     def test_operator_and_intrinsic_power_share_types(self) -> None:
         output = compile_source(
@@ -563,7 +1164,7 @@ class NumericInferenceTests(unittest.TestCase):
         output = compile_source(
             "from vernon_dsl import *\n"
             "@func\n"
-            "def lengths(value: vec2[f64]) -> f64:\n"
+            "def lengths(value: Vector[f64, 2]) -> f64:\n"
             "    return value.norm() + norm(value)\n",
             "norm_parity.py",
         )

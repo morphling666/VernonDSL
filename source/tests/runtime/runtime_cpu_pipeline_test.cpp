@@ -222,6 +222,12 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
 
     VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
     ASSERT_TRUE(pipeline);
+    ASSERT_TRUE(vernonRuntimeLoadedPipelineGetStepCount(pipeline) == 1);
+    VernonPipelineStepView step{};
+    step.struct_size = sizeof(step);
+    ASSERT_TRUE(vernonRuntimeLoadedPipelineGetStepByIndex(pipeline, 0, &step) == VERNON_STATUS_OK);
+    ASSERT_TRUE(step.kind == VERNON_PIPELINE_DISPATCH);
+    ASSERT_TRUE(step.stage.size == std::strlen("fill") && std::memcmp(step.stage.data, "fill", step.stage.size) == 0);
     ASSERT_TRUE(vernonRuntimeLoadedPipelineGetParameterCount(pipeline) == 1);
     VernonPipelineParameterView parameter{};
     ASSERT_TRUE(vernonRuntimeLoadedPipelineGetParameterByIndex(pipeline, 0, &parameter) == VERNON_STATUS_OK);
@@ -239,7 +245,7 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     VernonDeviceBuffer *buffer = vernonRuntimeBufferAllocate(runtime, 12 * sizeof(float), alignof(float));
     ASSERT_TRUE(buffer);
     const uint64_t shape[] = {12};
-    const uint64_t strides[] = {sizeof(float)};
+    const int64_t strides[] = {sizeof(float)};
     VernonPipelineArgument argument{};
     argument.slot = 0;
     argument.kind = VERNON_PIPELINE_TENSOR;

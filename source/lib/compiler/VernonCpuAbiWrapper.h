@@ -14,7 +14,7 @@ namespace vernon {
 
 enum class CpuAbiArgumentKind {
     Direct,
-    Buffer,
+    TensorView,
 };
 
 struct CpuAbiArgumentPacking {
@@ -22,6 +22,7 @@ struct CpuAbiArgumentPacking {
     uint64_t size;
     CpuAbiArgumentKind kind;
     uint64_t staticExtent;
+    std::vector<uint64_t> tensorLeafElementSizes;
 };
 
 struct CpuAbiWrapperMetadata {

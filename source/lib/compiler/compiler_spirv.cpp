@@ -2,6 +2,7 @@
 
 #include "mlir/Conversion/GPUToSPIRV/GPUToSPIRVPass.h"
 #include "mlir/Conversion/MathToSPIRV/MathToSPIRVPass.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
@@ -177,8 +178,8 @@ bool containsF16(mlir::Type type) {
         return true;
     if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(type))
         return containsF16(shaped.getElementType());
-    if (auto buffer = mlir::dyn_cast<mlir::vernon::BufferType>(type))
-        return containsF16(buffer.getElementType());
+    if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(type))
+        return containsF16(view.getElementType());
     if (auto function = mlir::dyn_cast<mlir::FunctionType>(type))
         return llvm::any_of(function.getInputs(), containsF16) || llvm::any_of(function.getResults(), containsF16);
     return false;
@@ -223,6 +224,13 @@ bool compileSpirv(mlir::MLIRContext &context, const char *source, size_t sourceS
     mlir::OwningOpRef<mlir::ModuleOp> module = mlir::parseSourceString<mlir::ModuleOp>(text, &context);
     if (!module)
         return false;
+    bool requiresRuntimeContractViolation = false;
+    module->walk([&](mlir::cf::AssertOp) { requiresRuntimeContractViolation = true; });
+    if (requiresRuntimeContractViolation) {
+        diagnostics = "SPIR-V targets do not support dynamic range steps because they cannot report the required "
+                      "runtime contract violation for step=0";
+        return false;
+    }
     if (target == VERNON_TARGET_VULKAN && moduleUsesF16(module.get())) {
         diagnostics = "Vulkan target does not support f16 until shaderFloat16 and 16-bit storage features are enabled";
         return false;
@@ -235,7 +243,7 @@ bool compileSpirv(mlir::MLIRContext &context, const char *source, size_t sourceS
     // sees the same implementation.
     passManager.addPass(mlir::vernon::createVernonInlineHelpersPass());
     passManager.addPass(mlir::vernon::createVernonToGPUPass(true));
-    passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerGPUTensorsPass());
+    passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerGPUTensorsPass(true));
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::createConvertMathToSPIRVPass());
     passManager.addPass(mlir::createConvertGPUToSPIRVPass());
     passManager.addPass(mlir::vernon::createVernonToSPIRVPass(target == VERNON_TARGET_VULKAN));

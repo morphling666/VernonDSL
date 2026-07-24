@@ -25,8 +25,8 @@ def transform(value):
 
 @vd.kernel(workgroup_size=(8, 1, 1))
 def inferred_numeric(
-    output: vd.Tensor[vd.f32, (None,)],
-    values: vd.Tensor[vd.f32, (None,)],
+    output: vd.TensorView[vd.f32, 1, vd.write],
+    values: vd.TensorView[vd.f32, 1, vd.read],
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     x = gid[0]
@@ -39,8 +39,8 @@ def inferred_numeric(
 
 @vd.kernel(workgroup_size=(8, 1, 1))
 def scale_f16(
-    output: vd.Tensor[vd.f16, (None,)],
-    values: vd.Tensor[vd.f16, (None,)],
+    output: vd.TensorView[vd.f16, 1, vd.write],
+    values: vd.TensorView[vd.f16, 1, vd.read],
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     x = gid[0]
@@ -49,8 +49,8 @@ def scale_f16(
 
 @vd.kernel(workgroup_size=(8, 1, 1))
 def scale_f64(
-    output: vd.Tensor[vd.f64, (None,)],
-    values: vd.Tensor[vd.f64, (None,)],
+    output: vd.TensorView[vd.f64, 1, vd.write],
+    values: vd.TensorView[vd.f64, 1, vd.read],
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     x = gid[0]
@@ -70,10 +70,10 @@ class InferenceBackendNumericTests(unittest.TestCase):
     @staticmethod
     def _run(architecture: object, values: np.ndarray) -> np.ndarray:
         vd.init(arch=architecture)  # type: ignore[arg-type]
-        output = vd.Tensor.zeros(dtype=vd.f32, shape=values.shape)
+        output = vd.storage.zeros(dtype=vd.f32, shape=values.shape)
         inferred_numeric(
             output,
-            vd.Tensor.from_numpy(values),
+            vd.storage.from_numpy(values),
             grid=(values.size, 1, 1),
         )
         return output.to_numpy()
@@ -99,8 +99,8 @@ class InferenceBackendNumericTests(unittest.TestCase):
                 )
 
     def test_specialization_and_artifact_generation_are_deterministic(self) -> None:
-        values = vd.Tensor.from_numpy(np.arange(8, dtype=np.float32))
-        output = vd.Tensor.zeros(dtype=vd.f32, shape=(8,))
+        values = vd.storage.from_numpy(np.arange(8, dtype=np.float32))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(8,))
         first_source, first_reflection = inferred_numeric.compile_artifact(output, values, target="cpu")
         second_source, second_reflection = inferred_numeric.compile_artifact(output, values, target="cpu")
         self.assertEqual(first_source, second_source)
@@ -119,11 +119,11 @@ class InferenceBackendNumericTests(unittest.TestCase):
             for kernel, dsl_type, numpy_type in cases:
                 with self.subTest(backend=architecture.name, dtype=dsl_type.name):
                     values_array = np.linspace(0.25, 2.0, 8, dtype=numpy_type)
-                    output = vd.Tensor.zeros(dtype=dsl_type, shape=values_array.shape)
+                    output = vd.storage.zeros(dtype=dsl_type, shape=values_array.shape)
                     try:
                         kernel(
                             output,
-                            vd.Tensor.from_numpy(values_array),
+                            vd.storage.from_numpy(values_array),
                             grid=(values_array.size, 1, 1),
                         )
                     except RuntimeError as error:

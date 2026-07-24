@@ -24,9 +24,16 @@ def imported_modules(path: Path) -> set[str]:
 
 class DependencyBoundaryTests(unittest.TestCase):
     def test_runtime_resource_implementations_live_outside_session(self) -> None:
-        for resource in (vd.Tensor, vd.TensorLayout, vd.TensorView, vd.Texture):
+        for resource in (
+            vd.interop.RawBuffer,
+            vd.TensorLayout,
+            vd.TensorStorage,
+            vd.TensorView,
+            vd.Texture,
+        ):
             with self.subTest(resource=resource.__name__):
                 self.assertEqual(resource.__module__, "vernon_dsl._runtime.resources")
+        self.assertEqual(vd.Tensor.__module__, "vernon_dsl.types")
         self.assertEqual(vd.Kernel.__module__, "vernon_dsl._runtime.kernel")
         self.assertEqual(vd.Pipeline.__module__, "vernon_dsl._runtime.pipeline")
         self.assertEqual(vd.PrimitiveTopology.__module__, "vernon_dsl._runtime.pipeline")

@@ -4,7 +4,6 @@ from __future__ import annotations
 import base64
 import ctypes
 import hashlib
-import importlib.util
 import json
 import struct
 import subprocess
@@ -12,7 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -21,27 +20,13 @@ PROJECT_ROOT = Path(__file__).parents[3]
 PYTHON_TEST_ROOT = PROJECT_ROOT / "python" / "tests"
 sys.path.insert(0, str(PYTHON_TEST_ROOT))
 
+from vernon_dsl import _native as native  # noqa: E402
 
-def _load_native(path: Path) -> ModuleType:
-    spec = importlib.util.spec_from_file_location("_native", path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load native module: {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["_native"] = module
-    sys.modules["vernon_dsl._native"] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-if len(sys.argv) >= 4:
-    NATIVE_PATH = Path(sys.argv.pop(1)).resolve()
+NATIVE_PATH = Path(native.__file__).resolve()
+if len(sys.argv) >= 3:
     COMPILER_LIBRARY = Path(sys.argv.pop(1)).resolve()
     COMPILE_CLI = Path(sys.argv.pop(1)).resolve()
-    native = _load_native(NATIVE_PATH)
 else:
-    from vernon_dsl import _native as native
-
-    NATIVE_PATH = Path(native.__file__).resolve()
     COMPILE_CLI = NATIVE_PATH.with_name("vernon-compile.exe" if sys.platform == "win32" else "vernon-compile")
     COMPILER_LIBRARY = NATIVE_PATH.with_name(
         "VernonDSLCompiler.dll"
@@ -367,7 +352,7 @@ class CompileSurfaceParityTests(unittest.TestCase):
 
     def test_cpu_owning_program_and_kernel_execution_match_and_cache(self) -> None:
         source = np.array((1.0, 2.0, 3.0, 4.0), dtype=np.float32)
-        frontend_tensor = vd.Tensor.from_numpy(source)
+        frontend_tensor = vd.storage.from_numpy(source)
         frontend, _, _, _ = scale._lower((frontend_tensor, 2.5))
         program = native.Compiler().compile_program_result(frontend.mlir, native.Target.CPU)
         self.assertTrue(program.ok, program.diagnostics)
@@ -386,8 +371,8 @@ class CompileSurfaceParityTests(unittest.TestCase):
         runtime_module.Kernel.clear_cache()
         scale.compile_count = 0
         vd.init(arch=vd.cpu)
-        first = vd.Tensor.from_numpy(source)
-        second = vd.Tensor.from_numpy(source)
+        first = vd.storage.from_numpy(source)
+        second = vd.storage.from_numpy(source)
         with mock.patch(
             "subprocess.run", side_effect=AssertionError("interactive kernel spawned a compiler subprocess")
         ):

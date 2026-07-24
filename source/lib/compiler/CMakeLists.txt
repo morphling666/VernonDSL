@@ -53,8 +53,10 @@ set(MLIR_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 include_directories(${LLVM_INCLUDE_DIRS})
 include_directories(${MLIR_INCLUDE_DIRS})
 include_directories(${LLD_INCLUDE_DIRS})
-include_directories("${VERNON_SOURCE_DIR}/include")
-include_directories("${CMAKE_CURRENT_BINARY_DIR}/include")
+# Project dialect headers and their freshly generated TableGen files must win over any older Vernon headers present in
+# the MLIR installation prefix.
+include_directories(BEFORE "${VERNON_SOURCE_DIR}/include")
+include_directories(BEFORE "${CMAKE_CURRENT_BINARY_DIR}/include")
 
 set(MLIR_SOURCE_DIR "${VERNON_REPOSITORY_ROOT}/llvm-project/mlir")
 set(MLIR_TABLEGEN_INCLUDE_DIRS "${MLIR_SOURCE_DIR}/include" ${LLVM_INCLUDE_DIRS})

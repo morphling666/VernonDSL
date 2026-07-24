@@ -126,7 +126,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     VernonDeviceSampler *textureSampler = vernonRuntimeSamplerCreate(runtime, &samplerDescriptor);
     ASSERT_TRUE(textureSampler);
     const uint64_t shape[] = {3, 2};
-    const uint64_t strides[] = {2 * sizeof(float), sizeof(float)};
+    const int64_t strides[] = {2 * sizeof(float), sizeof(float)};
     VernonPipelineArgument arguments[2]{};
     arguments[0].slot = 0; // Slots are stable and sorted by source name.
     arguments[0].kind = VERNON_PIPELINE_TEXTURE;

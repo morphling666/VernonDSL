@@ -20,9 +20,7 @@ bool validTensor(const VernonTensorView &tensor, const void *expectedContext,
     if (tensor.struct_size < sizeof(VernonTensorView) || tensor.access > VERNON_ACCESS_READ_WRITE ||
         (tensor.storage != VERNON_TENSOR_HOST && tensor.storage != VERNON_TENSOR_DEVICE))
         return false;
-    size_t span = 0;
-    if (!tensorRequiredSpan(tensor, span) || tensor.byte_offset > tensor.byte_size ||
-        span > tensor.byte_size - tensor.byte_offset)
+    if (!tensorFitsAllocation(tensor))
         return false;
     if (tensor.storage == VERNON_TENSOR_HOST)
         return tensor.host_data != nullptr;
@@ -184,6 +182,9 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
                 tensor.dtype != VERNON_DATA_F32 || !tensor.buffer || !tensor.rank || !tensor.shape ||
                 !tensor.byte_strides || use.location == UINT32_MAX)
                 return fail(error, "graphics Tensor view is invalid");
+            for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension)
+                if (tensor.byte_strides[dimension] <= 0)
+                    return fail(error, "graphics Tensor strides must be positive");
             uint64_t components = 1;
             for (uint32_t dimension = 1; dimension < tensor.rank; ++dimension) {
                 if (tensor.shape[dimension] > std::numeric_limits<uint32_t>::max() / components)

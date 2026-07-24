@@ -80,6 +80,26 @@ or reads concrete backend state. This keeps disabled CUDA/Vulkan translation
 units out of the build and prevents backend payload types from leaking into
 the C API shell.
 
+## Distribution and Engine ownership
+
+`VernonRuntime` is a standalone source project and CMake target. The Python
+wheel owns a private host Runtime used by `_native` and also carries the
+version-matched Runtime source closure for consumers that must compile it with
+their own toolchain. Vernon Engine builds that source as part of the Engine
+configuration. Host-wheel and Engine-built Runtime contexts, resources, and
+handles are separate and must never cross.
+
+The deployable Runtime does not depend on LLVM, MLIR, GLFW, the CUDA Toolkit,
+or a statically linked Vulkan loader. Compiler and asset cooking remain host
+tools. CPU deployment uses registered AOT object entry points; CUDA and Vulkan
+resolve system drivers dynamically; OpenGL/GLES consume an externally owned
+context.
+
+Engine-owned Vulkan instance/device/queue and borrowed image/buffer adoption
+remain a future integration boundary. That work must preserve queue ownership,
+layout, synchronization, and lifetime metadata explicitly rather than treating
+native handles as untyped integers.
+
 ## CUDA driver loading
 
 The optional CUDA backend dynamically resolves the stable Driver API from
@@ -94,7 +114,8 @@ isolated symbol table, the top-level SCF conversion in MLIR's standard NVVM
 pipeline does not rewrite control flow inside the kernel. Vernon therefore
 runs value-Tensor and SCF lowering as nested `gpu.module` passes before
 invoking the standard pipeline. Static value Tensors with at most 16 elements
-are flattened in row-major order to register vectors. The limit covers `mat4`
+are flattened in row-major order to register vectors. The limit covers
+`Matrix[f32, 4, 4]`
 and bounds the register pressure from scalarized operations. Larger static
 values use elementwise-to-Linalg, one-shot bufferization to private memrefs,
 and Linalg-to-SCF loops. Dynamic local value Tensors are rejected; addressable
@@ -156,7 +177,8 @@ push constants are packed by logical indices and Tensor strides.
 
 ## Tensor indexing
 
-Addressable Tensor parameters lower to Vernon buffers. Multidimensional
+Addressable Tensor and explicit TensorView parameters lower from
+`!vernon.tensor_view` to backend memrefs or storage resources. Multidimensional
 indices are flattened in NumPy-compatible row-major order:
 `linear = ((i0 * d1 + i1) * d2 + i2) ...`.
 Strided host packing identifies the maximal row-major contiguous suffix and
@@ -164,29 +186,33 @@ copies one block per outer index. This preserves arbitrary positive-stride
 views while avoiding per-element index division and tiny copies for common
 padded-row and sliced-batch layouts.
 
-## Unified compute and graphics execution
+## Program runtime boundary
 
-The compute launch ABI remains version 1. Maintained graphics execution uses
-`VernonPipelineBundle`, `VernonLoadedPipeline`, and
-`vernonRuntimePipelineInvoke`. Bundle resolution validates feature variants,
-stage artifacts, reflected parameter slots, and output layouts before
-submission. OpenGL 3.3 or OpenGL ES 3.0 is sufficient for graphics;
-compute/graphics compositions require OpenGL 4.3 or OpenGL ES 3.1.
+Kernel is the compute program form. Pipeline is the graphics program form and
+contains a validated tuple of graphics stages. A persistent ProgramAsset wraps
+exactly one of those forms; compute and graphics entries are never combined in
+one program.
 
-Pipeline loading accepts schema-2 manifests only. Inline artifacts may use the
-convenience byte loader; external artifacts require
-`vernonRuntimeLoadPipelineBundleWithOptions` with the manifest's parent
-directory. There is no directory-scanning C API and no schema-1 conversion
-path. Pipeline invocation ABI version 3 remains the public execution contract.
+ProgramAsset target architecture and options are selected by the cooker. A
+compute ProgramAsset resolves only against a compute backend, while a graphics
+ProgramAsset resolves only against a graphics backend. The target profile is
+part of artifact identity and the cooked manifest, not the source declaration.
 
-Pipeline submission order is fixed: upload host-dirty Tensors, dispatch the
-optional compute entry, issue the storage/vertex-input barrier, bind the
-offscreen target and reflected arguments, clear every color attachment to
-transparent black, draw, then mark the target device-dirty. Vulkan render-pass
-load operations and OpenGL attachment clears implement the same per-invocation
-semantics. Readback is lazy. This order is required because a Tensor may be
-written through an SSBO and consumed immediately as a vertex input without a
-host round trip.
+The graphics stage tuple is extensible through the language's versioned stage
+registry and topology rules. Runtime loading must reject a language-valid
+stage topology with an explicit unsupported-target result when that backend
+does not implement it. Manifest parsing must not hard-code vertex-plus-fragment
+as the only representable topology.
+
+The currently implemented schema-2 Pipeline bundle and invocation ABI remain
+migration surfaces. Their optional combined compute-plus-graphics sequence is
+legacy behavior, not the target ProgramAsset contract. New program semantics
+must not depend on that fixed upload/dispatch/barrier/draw sequence.
+
+Multi-program orchestration, render-pass and attachment state, framebuffer or
+renderbuffer abstraction, resource transitions, and compute/graphics backend
+pairing are deferred. The archived Pass-graph proposal in
+`specs/backup/execution_graph_design.md` is non-normative.
 
 Tensor allocations belong to one runtime generation. Reinitializing the
 runtime invalidates cached native handles. Within a generation, unchanged

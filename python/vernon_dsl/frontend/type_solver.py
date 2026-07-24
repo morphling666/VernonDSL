@@ -92,6 +92,13 @@ def can_convert(value_type: InferenceType, target: ConcreteType) -> bool:
         return True
     if source.kind != target.kind:
         return False
+    if source.kind == "tuple":
+        return len(source.arguments) == len(target.arguments) and all(
+            isinstance(source_element, ConcreteType)
+            and isinstance(target_element, ConcreteType)
+            and can_convert(source_element, target_element)
+            for source_element, target_element in zip(source.arguments, target.arguments, strict=True)
+        )
     if source.kind == "tensor" and source.arguments[1:] != target.arguments[1:]:
         return False
     source_element = element_type(source)

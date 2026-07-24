@@ -178,7 +178,7 @@ bool Variant::validate(std::string &error) const {
             }
         }
     }
-    if (vertex.empty() != fragment.empty() || (compute.empty() && vertex.empty())) {
+    if (vertex.empty() != fragment.empty() || (compute.empty() && vertex.empty()) || steps.empty()) {
         error = "pipeline variant has no valid execution stages";
         return false;
     }
@@ -327,17 +327,52 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
     }
     for (const nlohmann::json &step : value["steps"]) {
         const std::string kind = step.value("kind", "");
-        if (kind == "dispatch")
-            variant.compute = step.value("stage", "");
-        else if (kind == "barrier")
+        PipelineStep parsed;
+        if (kind == "dispatch") {
+            parsed.kind = PipelineStepKind::Dispatch;
+            parsed.stage = step.value("stage", "");
+            if (parsed.stage.empty()) {
+                error = "dispatch step stage is missing";
+                return false;
+            }
+            if (step.contains("grid")) {
+                if (!step["grid"].is_array() || step["grid"].size() != 3 ||
+                    !std::all_of(step["grid"].begin(), step["grid"].end(), [](const nlohmann::json &item) {
+                        return item.is_number_unsigned() && item.get<uint32_t>() > 0;
+                    })) {
+                    error = "dispatch step grid must contain three positive integers";
+                    return false;
+                }
+                parsed.grid = {step["grid"][0].get<uint32_t>(), step["grid"][1].get<uint32_t>(),
+                               step["grid"][2].get<uint32_t>()};
+                parsed.hasGrid = true;
+            }
+            if (variant.compute.empty())
+                variant.compute = parsed.stage;
+        } else if (kind == "barrier") {
+            parsed.kind = PipelineStepKind::Barrier;
+            parsed.source = step.value("source", "");
+            parsed.destination = step.value("destination", "");
+            if (parsed.source.empty() || parsed.destination.empty()) {
+                error = "barrier step transition is incomplete";
+                return false;
+            }
             variant.barrier = true;
-        else if (kind == "draw") {
-            variant.vertex = step.value("vertex", "");
-            variant.fragment = step.value("fragment", "");
+        } else if (kind == "draw") {
+            parsed.kind = PipelineStepKind::Draw;
+            parsed.vertex = step.value("vertex", "");
+            parsed.fragment = step.value("fragment", "");
+            if (parsed.vertex.empty() || parsed.fragment.empty()) {
+                error = "draw step requires vertex and fragment stages";
+                return false;
+            }
+            variant.vertex = parsed.vertex;
+            variant.fragment = parsed.fragment;
         } else {
             error = "pipeline step kind is unsupported";
             return false;
         }
+        variant.steps.push_back(std::move(parsed));
     }
     if (variant.vertex.empty() != variant.fragment.empty()) {
         error = "graphics pipeline requires both vertex and fragment stages";

@@ -85,7 +85,7 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     variant.internalParameters.push_back(implicitSampler);
 
     const std::array<uint64_t, 2> vertexShape{4, 3};
-    const std::array<uint64_t, 2> vertexStrides{12, 4};
+    std::array<int64_t, 2> vertexStrides{12, 4};
     VernonPipelineArgument arguments[2]{};
     arguments[0].slot = 0;
     arguments[0].kind = VERNON_PIPELINE_TENSOR;
@@ -135,6 +135,11 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     EXPECT_EQ(sampled->second.sampler, sampler);
     EXPECT_TRUE(sampled->second.implicitSampler);
     EXPECT_EQ(sampled->second.stages, PLANNED_STAGE_FRAGMENT);
+
+    vertexStrides[0] = -12;
+    arguments[0].tensor.byte_offset = 36;
+    EXPECT_FALSE(planGraphicsInvocation(variant, invocation, context, callbacks, plan, error));
+    EXPECT_EQ(error, "graphics Tensor strides must be positive");
 }
 
 } // namespace

@@ -7,7 +7,6 @@ from typing import Any, Mapping
 
 from ..compiler import compile_file
 from ..module_graph import load_project
-from ..native_loader import load_native
 from ..pipeline_compile import (
     CompiledStage,
     PipelineCompileError,
@@ -23,11 +22,12 @@ from .parsing import parse_python_pipeline_asset, pipeline_asset_reference
 
 
 def _native_module() -> Any:
-    native = load_native()
-    if native is None:
+    try:
+        from .. import _native as native
+    except (ImportError, OSError):
         raise PipelineCompileError(
             "shader cooking requires vernon_dsl._native; build the native extension or install a wheel containing it"
-        )
+        ) from None
     return native
 
 

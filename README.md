@@ -20,9 +20,9 @@ ABI annotations, while `@func` helpers may infer parameters and results from
 their call sites. Python `int`/`float` mean `i32`/`f32`; safe numeric widening
 and integer true division are deterministic across targets. Use
 `vd.Vector([...])` and `vd.Matrix([...])` for inferred value construction.
-The complete contract and migration notes are in
-[`specs/language/contract.md`](specs/language/contract.md) and
-[`specs/language/v2_to_v3.md`](specs/language/v2_to_v3.md).
+The active specifications and reading order are in
+[`specs/README.md`](specs/README.md). The language contract, including
+migration rules, is [`specs/language/contract.md`](specs/language/contract.md).
 
 ## Current status
 
@@ -107,8 +107,12 @@ cmake --build build --parallel 4
 ctest --test-dir build --output-on-failure
 ```
 
-Use plain `uv sync` only for the frontend/runtime Python package without
-building `_native`. Run Python commands through `uv run --frozen`.
+CMake writes `_native`, `_gl_context`, and their shared-library dependencies
+to `python/vernon_dsl/`, which is the sole development import location.
+`uv sync` installs dependencies but does not create an editable wheel; use
+`uv build` explicitly when producing a release wheel. Run Python commands
+through `uv run --frozen` with `python/` on `PYTHONPATH` when they are not
+launched by CTest.
 
 ### Windows CI
 
@@ -237,9 +241,10 @@ uv run python examples/advanced_pipeline.py --arch vulkan --frames 2 --headless 
   --id-output build/advanced-object-id.png
 ```
 
-For one end-to-end example that combines shared definitions with three-stage
-compute/vertex/fragment composition, three feature variants, indexed
-instancing, named MRT outputs, and per-frame input/index/uniform rebinding:
+The legacy end-to-end example currently combines shared definitions with
+three-stage compute/vertex/fragment composition, three feature variants,
+indexed instancing, named MRT outputs, and per-frame input/index/uniform
+rebinding:
 
 ```powershell
 uv run python examples/complete_pipeline.py --arch vulkan --frames 3 --headless `
@@ -307,49 +312,59 @@ build/source/Release/vernon-compile.exe `
 
 This direct `--bundle` compatibility path contains `shader.json` plus readable
 generated vertex and fragment GLSL files. It remains available for legacy
-OpenGL tooling; new production cooking uses `vernon-cook-shader` below and
-loads a Pipeline asset through VernonRuntime.
+OpenGL tooling. The target ProgramAsset cooker is `vernon-cook-program`; the
+currently implemented `vernon-cook-shader` command remains the legacy migration
+surface.
 
 Declare persistent assets beside their stage functions. The declaration is
-read from the source AST and never imports or executes the module:
+read from the source AST and never imports or executes the module. The target
+ProgramAsset API is:
 
 ```python
-mesh_asset = vd.pipeline_asset(
+mesh_asset = vd.program_asset(
     id="pipelines/mesh",
-    vertex=mesh_vertex,
-    fragment=mesh_fragment,
+    program=(mesh_vertex, mesh_fragment),
     variants=((), (INSTANCE,), (SKIN,), (INSTANCE, SKIN)),
-    targets={"opengl": {"glsl_version": 330}},
 )
 ```
 
-Cook the named declaration in process:
+`program=` is either one compute Kernel or a non-empty tuple of graphics
+stages. Graphics stage kinds come from their decorators, allowing the tuple
+topology to grow beyond vertex-plus-fragment without changing the asset shape.
+Target architecture and options are supplied by the cooker rather than source.
+The following shows the target CLI contract; `program_asset` and
+`vernon-cook-program` implementation are pending.
+
+Cook the named declaration in process for one target:
 
 ```powershell
-uv run --frozen vernon-cook-shader `
+uv run --frozen vernon-cook-program `
   examples/variant_mesh.py:mesh_asset `
   --target opengl `
   -o build/variant_mesh_asset
 ```
 
-For a CPU pipeline declaration, use the same cooker with `--target cpu`:
+For a compute ProgramAsset, use the same cooker with `--target cpu`:
 
 ```powershell
-uv run --frozen vernon-cook-shader `
+uv run --frozen vernon-cook-program `
   python/tests/pipeline_asset_fixture.py:scale_asset `
   --target cpu `
   -o build/cpu_scale
 ```
 
-The result contains `cpu_scale.pipeline.json` and a content-addressed
-`artifacts/<sha256>.obj` or `.o`. Consumers should parse the JSON manifest and
-link the referenced object; the cooker does not generate an executable CMake
-fragment.
+The current `vernon-cook-shader` command still implements the legacy
+`pipeline_asset` input contract.
 
-The resulting `variant_mesh_asset.pipeline.json` maps exact canonical feature
-keys to shared stage artifacts. For the four `INSTANCE`/`SKIN` combinations,
-four specialized vertex files share one unchanged fragment file by content
-hash. Vernon rejects missing variants rather than falling back.
+The current legacy cooker result contains `cpu_scale.pipeline.json` and a
+content-addressed `artifacts/<sha256>.obj` or `.o`. Consumers should parse the
+JSON manifest and link the referenced object; the cooker does not generate an
+executable CMake fragment.
+
+The legacy `variant_mesh_asset.pipeline.json` maps exact canonical feature keys
+to shared stage artifacts. For the four `INSTANCE`/`SKIN` combinations, four
+specialized vertex files share one unchanged fragment file by content hash.
+Vernon rejects missing variants rather than falling back.
 
 `feature("NAME")`, `When[FEATURE, T]`, `if FEATURE`, and `if not FEATURE` are
 specialized before type checking. Interface locations are inferred from

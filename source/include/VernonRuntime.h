@@ -265,7 +265,7 @@ typedef struct VernonTensorView {
     VernonValueAccess access;
     uint32_t rank;
     const uint64_t *shape;
-    const uint64_t *byte_strides;
+    const int64_t *byte_strides;
     size_t byte_offset;
     size_t byte_size;
 } VernonTensorView;
@@ -347,6 +347,24 @@ typedef struct VernonPipelineOutputView {
     uint32_t location;
 } VernonPipelineOutputView;
 
+typedef enum VernonPipelineStepKind {
+    VERNON_PIPELINE_DISPATCH = 0,
+    VERNON_PIPELINE_BARRIER = 1,
+    VERNON_PIPELINE_DRAW = 2
+} VernonPipelineStepKind;
+
+typedef struct VernonPipelineStepView {
+    uint32_t struct_size;
+    VernonPipelineStepKind kind;
+    VernonStringView stage;
+    VernonStringView vertex;
+    VernonStringView fragment;
+    VernonStringView source;
+    VernonStringView destination;
+    uint32_t has_grid;
+    VernonLaunchSize grid;
+} VernonPipelineStepView;
+
 typedef struct VernonPipelineBundleLoadOptions {
     uint32_t struct_size;
     /*
@@ -390,6 +408,9 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetOutputByIndex(con
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineFindOutput(const VernonLoadedPipeline *pipeline,
                                                                        VernonStringView name,
                                                                        VernonPipelineOutputView *output);
+VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetStepCount(const VernonLoadedPipeline *pipeline);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetStepByIndex(const VernonLoadedPipeline *pipeline,
+                                                                           size_t index, VernonPipelineStepView *step);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
                                                              const VernonPipelineInvocation *invocation);
 

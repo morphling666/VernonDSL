@@ -4,6 +4,35 @@
 #include <limits>
 
 namespace vernon::runtime {
+namespace {
+
+uint64_t strideMagnitude(int64_t stride) {
+    return stride < 0 ? static_cast<uint64_t>(-(stride + 1)) + 1 : static_cast<uint64_t>(stride);
+}
+
+bool tensorRelativeBounds(const VernonTensorView &tensor, size_t &before, size_t &after) {
+    if (tensor.rank && (!tensor.shape || !tensor.byte_strides))
+        return false;
+    before = 0;
+    after = 0;
+    for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension) {
+        if (!tensor.shape[dimension])
+            return true;
+        const uint64_t steps = tensor.shape[dimension] - 1;
+        const uint64_t magnitude = strideMagnitude(tensor.byte_strides[dimension]);
+        if (magnitude > std::numeric_limits<size_t>::max() ||
+            (steps && magnitude > std::numeric_limits<size_t>::max() / steps))
+            return false;
+        const size_t extent = static_cast<size_t>(steps * magnitude);
+        size_t &bound = tensor.byte_strides[dimension] < 0 ? before : after;
+        if (extent > std::numeric_limits<size_t>::max() - bound)
+            return false;
+        bound += extent;
+    }
+    return true;
+}
+
+} // namespace
 
 size_t dataTypeSize(VernonDataType dtype) {
     switch (dtype) {
@@ -49,18 +78,36 @@ std::optional<size_t> tensorLogicalByteSize(const VernonTensorView &tensor) {
 
 bool tensorRequiredSpan(const VernonTensorView &tensor, size_t &span) {
     const size_t elementSize = dataTypeSize(tensor.dtype);
-    if (!elementSize || (tensor.rank && (!tensor.shape || !tensor.byte_strides)))
+    const std::optional<size_t> elementCount = tensorElementCount(tensor);
+    if (!elementSize || !elementCount)
         return false;
-    span = elementSize;
-    for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension) {
-        if (!tensor.shape[dimension] || !tensor.byte_strides[dimension])
-            return false;
-        const uint64_t steps = tensor.shape[dimension] - 1;
-        if (steps && tensor.byte_strides[dimension] > (std::numeric_limits<size_t>::max() - span) / steps)
-            return false;
-        span += static_cast<size_t>(steps * tensor.byte_strides[dimension]);
+    if (!*elementCount) {
+        span = 0;
+        return true;
     }
+    size_t before = 0;
+    size_t after = 0;
+    if (!tensorRelativeBounds(tensor, before, after) || after > std::numeric_limits<size_t>::max() - before ||
+        elementSize > std::numeric_limits<size_t>::max() - before - after)
+        return false;
+    span = before + after + elementSize;
     return true;
+}
+
+bool tensorFitsAllocation(const VernonTensorView &tensor) {
+    size_t span = 0;
+    const std::optional<size_t> elementCount = tensorElementCount(tensor);
+    if (!elementCount || !tensorRequiredSpan(tensor, span) || tensor.byte_offset > tensor.byte_size)
+        return false;
+    if (!*elementCount)
+        return true;
+    size_t before = 0;
+    size_t after = 0;
+    if (!tensorRelativeBounds(tensor, before, after) || before > tensor.byte_offset)
+        return false;
+    const size_t availableAfter = tensor.byte_size - tensor.byte_offset;
+    const size_t elementSize = dataTypeSize(tensor.dtype);
+    return after <= availableAfter && elementSize <= availableAfter - after;
 }
 
 bool isRowMajorContiguous(const VernonTensorView &tensor) {
@@ -69,7 +116,8 @@ bool isRowMajorContiguous(const VernonTensorView &tensor) {
         return false;
     size_t stride = elementSize;
     for (uint32_t dimension = tensor.rank; dimension-- > 0;) {
-        if (tensor.byte_strides[dimension] != stride)
+        if (stride > static_cast<size_t>(std::numeric_limits<int64_t>::max()) ||
+            tensor.byte_strides[dimension] != static_cast<int64_t>(stride))
             return false;
         if (dimension == 0)
             continue;
@@ -91,7 +139,7 @@ std::optional<std::vector<uint8_t>> packTensorRowMajor(const VernonTensorView &t
     std::vector<uint8_t> packed(*packedSize);
     if (*packedSize == 0)
         return packed;
-    if (tensor.byte_offset > tensor.byte_size || (tensor.rank && !tensor.byte_strides))
+    if (!tensorFitsAllocation(tensor))
         return std::nullopt;
     const uint8_t *source = hostTensorData(tensor);
     if (!source)
@@ -103,36 +151,19 @@ std::optional<std::vector<uint8_t>> packTensorRowMajor(const VernonTensorView &t
         return packed;
     }
 
-    uint32_t contiguousBegin = tensor.rank;
-    size_t blockBytes = elementSize;
-    while (contiguousBegin != 0) {
-        const uint32_t dimension = contiguousBegin - 1;
-        if (tensor.byte_strides[dimension] != blockBytes)
-            break;
-        if (tensor.shape[dimension] > std::numeric_limits<size_t>::max() / blockBytes)
-            return std::nullopt;
-        blockBytes *= static_cast<size_t>(tensor.shape[dimension]);
-        contiguousBegin = dimension;
-    }
-
-    const size_t outerCount = *packedSize / blockBytes;
-    for (size_t outer = 0; outer < outerCount; ++outer) {
-        size_t remainder = outer;
-        size_t sourceOffset = 0;
-        for (uint32_t dimension = contiguousBegin; dimension-- > 0;) {
+    const size_t elementCount = *packedSize / elementSize;
+    for (size_t linear = 0; linear < elementCount; ++linear) {
+        size_t remainder = linear;
+        size_t positiveOffset = 0;
+        size_t negativeOffset = 0;
+        for (uint32_t dimension = tensor.rank; dimension-- > 0;) {
             const size_t extent = static_cast<size_t>(tensor.shape[dimension]);
             const size_t index = remainder % extent;
             remainder /= extent;
-            if (tensor.byte_strides[dimension] > std::numeric_limits<size_t>::max() ||
-                (index && static_cast<size_t>(tensor.byte_strides[dimension]) >
-                              (std::numeric_limits<size_t>::max() - sourceOffset) / index))
-                return std::nullopt;
-            sourceOffset += index * static_cast<size_t>(tensor.byte_strides[dimension]);
+            const size_t offset = index * static_cast<size_t>(strideMagnitude(tensor.byte_strides[dimension]));
+            (tensor.byte_strides[dimension] < 0 ? negativeOffset : positiveOffset) += offset;
         }
-        if (sourceOffset > tensor.byte_size - tensor.byte_offset ||
-            blockBytes > tensor.byte_size - tensor.byte_offset - sourceOffset)
-            return std::nullopt;
-        std::memcpy(packed.data() + outer * blockBytes, source + sourceOffset, blockBytes);
+        std::memcpy(packed.data() + linear * elementSize, source + positiveOffset - negativeOffset, elementSize);
     }
     return packed;
 }

@@ -26,6 +26,9 @@ build = [
 vernon-compile-python = "vernon_dsl.cli:main"
 vernon-cook-shader = "vernon_dsl.shader_asset_cli:main"
 
+[tool.uv]
+package = false
+
 [build-system]
 requires = [
     "scikit-build-core>=0.11",

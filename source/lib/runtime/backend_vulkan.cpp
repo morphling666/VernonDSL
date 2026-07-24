@@ -849,7 +849,11 @@ bool loadVulkanKernel(VernonRuntimeContext &context, const void *artifact, size_
             return false;
         VulkanContextState &contextState = vulkanState(context);
         std::vector<VkDescriptorSetLayoutBinding> bindings;
-        bindings.reserve(metadata.arguments.size());
+        size_t bindingCount = 0;
+        for (const ReflectedArgument &argument : metadata.arguments)
+            if (argument.kind != "builtin")
+                bindingCount += argument.kind == "tensor" ? std::max(argument.storageLeaves.size(), size_t{1}) : 1;
+        bindings.reserve(bindingCount);
         uint32_t index = 0;
         for (ReflectedArgument &argument : metadata.arguments) {
             if (argument.kind == "builtin")
@@ -859,11 +863,18 @@ bool loadVulkanKernel(VernonRuntimeContext &context, const void *artifact, size_
                 destroyVulkanKernel(context, state);
                 return false;
             }
-            if (argument.binding == UINT32_MAX)
-                argument.binding = index;
-            bindings.push_back(
-                {argument.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
-            ++index;
+            if (argument.kind == "tensor" && !argument.storageLeaves.empty()) {
+                for (const ReflectedStorageLeaf &leaf : argument.storageLeaves)
+                    bindings.push_back(
+                        {leaf.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
+                index += argument.storageLeaves.size();
+            } else {
+                if (argument.binding == UINT32_MAX)
+                    argument.binding = index;
+                bindings.push_back(
+                    {argument.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
+                ++index;
+            }
         }
         VkDescriptorSetLayoutCreateInfo descriptorInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         descriptorInfo.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -962,11 +973,16 @@ VernonStatus launchVulkanKernel(VernonRuntimeContext &context, const VulkanKerne
             driver.freeMemory(contextState.device, memory, nullptr);
         }
     };
-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<uint32_t>(argumentCount)};
+    size_t descriptorCount = 0;
+    for (const ReflectedArgument &reflected : metadata.arguments)
+        if (reflected.kind != "builtin")
+            descriptorCount +=
+                reflected.kind == "tensor" ? std::max(reflected.storageLeaves.size(), size_t{1}) : size_t{1};
+    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<uint32_t>(descriptorCount)};
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.maxSets = 1;
-    poolInfo.poolSizeCount = argumentCount ? 1u : 0u;
-    poolInfo.pPoolSizes = argumentCount ? &poolSize : nullptr;
+    poolInfo.poolSizeCount = descriptorCount ? 1u : 0u;
+    poolInfo.pPoolSizes = descriptorCount ? &poolSize : nullptr;
     if (vkFail(context, driver.createDescriptorPool(contextState.device, &poolInfo, nullptr, &descriptorPool),
                "vkCreateDescriptorPool") != VERNON_STATUS_OK)
         return VERNON_STATUS_INTERNAL_ERROR;
@@ -982,8 +998,8 @@ VernonStatus launchVulkanKernel(VernonRuntimeContext &context, const VulkanKerne
     }
     std::vector<VkDescriptorBufferInfo> bufferInfos;
     std::vector<VkWriteDescriptorSet> writes;
-    bufferInfos.reserve(argumentCount);
-    writes.reserve(argumentCount);
+    bufferInfos.reserve(descriptorCount);
+    writes.reserve(descriptorCount);
     size_t supplied = 0;
     for (const ReflectedArgument &reflected : metadata.arguments) {
         if (reflected.kind == "builtin")
@@ -1011,14 +1027,19 @@ VernonStatus launchVulkanKernel(VernonRuntimeContext &context, const VulkanKerne
             driver.unmapMemory(contextState.device, memory);
             size = argument.scalar_size;
         }
-        bufferInfos.push_back({buffer, 0, size});
-        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        write.dstSet = descriptorSet;
-        write.dstBinding = reflected.binding;
-        write.descriptorCount = 1;
-        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        write.pBufferInfo = &bufferInfos.back();
-        writes.push_back(write);
+        const size_t bindingCount =
+            reflected.kind == "tensor" ? std::max(reflected.storageLeaves.size(), size_t{1}) : size_t{1};
+        for (size_t bindingIndex = 0; bindingIndex < bindingCount; ++bindingIndex) {
+            bufferInfos.push_back({buffer, 0, size});
+            VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            write.dstSet = descriptorSet;
+            write.dstBinding =
+                reflected.storageLeaves.empty() ? reflected.binding : reflected.storageLeaves[bindingIndex].binding;
+            write.descriptorCount = 1;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            write.pBufferInfo = &bufferInfos.back();
+            writes.push_back(write);
+        }
     }
     driver.updateDescriptorSets(contextState.device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     VkCommandBufferAllocateInfo commandInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};

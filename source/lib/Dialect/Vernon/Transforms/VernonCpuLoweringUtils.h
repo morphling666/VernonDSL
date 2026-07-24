@@ -6,31 +6,29 @@
 namespace mlir::vernon {
 
 enum class CpuIntrinsicKind {
-  SharedValue,
-  BufferLoad,
-  BufferStore,
-  TextureSample,
-  Unknown,
+    SharedValue,
+    TensorViewLoad,
+    TensorViewStore,
+    TextureSample,
+    Unknown,
 };
 
 inline CpuIntrinsicKind classifyCpuIntrinsic(llvm::StringRef name) {
-  if (name == "buffer_load")
-    return CpuIntrinsicKind::BufferLoad;
-  if (name == "buffer_store")
-    return CpuIntrinsicKind::BufferStore;
-  if (name == "texture_sample")
-    return CpuIntrinsicKind::TextureSample;
-  if (name == "construct" || name == "dot" || name == "normalize" ||
-      name == "cross" || name == "reflect" || name == "matmul" ||
-      name == "min" || name == "max" || name == "pow" || name == "clamp")
-    return CpuIntrinsicKind::SharedValue;
-  return CpuIntrinsicKind::Unknown;
+    if (name == "tensor_view_load")
+        return CpuIntrinsicKind::TensorViewLoad;
+    if (name == "tensor_view_store")
+        return CpuIntrinsicKind::TensorViewStore;
+    if (name == "texture_sample")
+        return CpuIntrinsicKind::TextureSample;
+    if (name == "construct" || name == "dot" || name == "normalize" || name == "cross" || name == "reflect" ||
+        name == "matmul" || name == "min" || name == "max" || name == "pow" || name == "clamp")
+        return CpuIntrinsicKind::SharedValue;
+    return CpuIntrinsicKind::Unknown;
 }
 
 inline bool isCpuResourceIntrinsic(CpuIntrinsicKind kind) {
-  return kind == CpuIntrinsicKind::BufferLoad ||
-         kind == CpuIntrinsicKind::BufferStore ||
-         kind == CpuIntrinsicKind::TextureSample;
+    return kind == CpuIntrinsicKind::TensorViewLoad || kind == CpuIntrinsicKind::TensorViewStore ||
+           kind == CpuIntrinsicKind::TextureSample;
 }
 
 } // namespace mlir::vernon

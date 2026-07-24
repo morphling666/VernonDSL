@@ -10,9 +10,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
+import numpy as np
+
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
 from ..pipeline_compile import TargetOptions, canonical_json
-from .resources import Tensor
+from ..types import TypeExpr, _Scalar
+from .resources import TensorStorage, TensorView, _dispatch_borrow_scope
 
 
 def _session_state() -> Any:
@@ -100,11 +103,108 @@ class Kernel:
                     writable.add(target.id)
         return tuple(sorted(writable))
 
+    @classmethod
+    def _tensor_view_access(cls, annotation: ast.expr | None) -> str | None:
+        if not isinstance(annotation, ast.Subscript) or cls._annotation_name(annotation.value) != "TensorView":
+            return None
+        arguments = annotation.slice.elts if isinstance(annotation.slice, ast.Tuple) else [annotation.slice]
+        if len(arguments) != 3:
+            return None
+        access = cls._annotation_name(arguments[2])
+        return access if access in {"read", "write", "read_write"} else None
+
+    def _validate_tensor_view_arguments(
+        self,
+        frontend: FrontendCompileResult,
+        user_parameters: list[str],
+        arguments: tuple[Any, ...],
+    ) -> None:
+        entry = next(
+            (function for function in frontend.typed_functions if function.source.name == self._entry),
+            None,
+        )
+        if entry is None:
+            raise RuntimeError("compiled kernel has no typed entry function")
+        typed_parameters = {parameter.name: parameter for parameter in entry.parameters}
+        scalar_dtypes = {
+            "bool": np.dtype(np.bool_),
+            "i32": np.dtype(np.int32),
+            "u32": np.dtype(np.uint32),
+            "f16": np.dtype(np.float16),
+            "f32": np.dtype(np.float32),
+            "f64": np.dtype(np.float64),
+        }
+        access_compatibility = {
+            "read": {"read", "read_write"},
+            "write": {"write", "read_write"},
+            "read_write": {"read_write"},
+        }
+
+        def dsl_signature(value_type: Any) -> Any:
+            if value_type.kind == "scalar":
+                return ("scalar", value_type.name)
+            if value_type.kind == "struct":
+                return ("struct", value_type.name)
+            if value_type.kind == "tuple":
+                return ("tuple", tuple(dsl_signature(item) for item in value_type.arguments))
+            if value_type.kind == "tensor":
+                return (
+                    "tensor",
+                    dsl_signature(value_type.arguments[0]),
+                    tuple(value_type.arguments[1:]),
+                )
+            return (value_type.kind, value_type.name)
+
+        def runtime_signature(annotation: Any) -> Any:
+            if isinstance(annotation, _Scalar):
+                return ("scalar", annotation.name)
+            if isinstance(annotation, TypeExpr):
+                if annotation.name == "Tuple":
+                    return ("tuple", tuple(runtime_signature(item) for item in annotation.arguments))
+                if annotation.name == "Tensor" and len(annotation.arguments) == 2:
+                    return (
+                        "tensor",
+                        runtime_signature(annotation.arguments[0]),
+                        tuple(annotation.arguments[1]),
+                    )
+            if isinstance(annotation, type) and getattr(annotation, "__vernon_dsl__", (None, {}))[0] == "struct":
+                return ("struct", annotation.__name__)
+            return None
+
+        for name, value in zip(user_parameters, arguments, strict=True):
+            parameter = typed_parameters[name]
+            if parameter.type.kind != "tensor_view":
+                if isinstance(value, (TensorStorage, TensorView)):
+                    raise TypeError(f"kernel argument {name!r} is runtime storage but its annotation is not TensorView")
+                continue
+            if not isinstance(value, TensorView):
+                raise TypeError(f"kernel argument {name!r} must be a TensorView")
+            element, rank, declared_access = parameter.type.arguments
+            if len(value.shape) != rank:
+                raise TypeError(f"kernel TensorView argument {name!r} has rank {len(value.shape)}, expected {rank}")
+            if element.kind == "scalar":
+                matches_element = value.dtype == scalar_dtypes[element.name]
+            else:
+                matches_element = runtime_signature(value.element_type) == dsl_signature(element)
+            if not matches_element:
+                raise TypeError(
+                    f"kernel TensorView argument {name!r} dtype {value.dtype} does not match {element.name}"
+                )
+            if value.access not in access_compatibility[declared_access]:
+                raise TypeError(
+                    f"kernel TensorView argument {name!r} access {value.access!r} does not satisfy {declared_access!r}"
+                )
+
     def _lower(
         self,
         arguments: tuple[Any, ...],
         features: tuple[str, ...] = (),
-    ) -> tuple[FrontendCompileResult, ast.FunctionDef, tuple[str, ...], dict[str, Tensor]]:
+    ) -> tuple[
+        FrontendCompileResult,
+        ast.FunctionDef,
+        tuple[str, ...],
+        dict[str, TensorStorage | TensorView],
+    ]:
         source = self._file.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(self._file))
         function = next(
@@ -117,8 +217,21 @@ class Kernel:
         user_parameters = [argument.arg for argument in function.args.args if argument.arg not in builtins]
         if len(arguments) != len(user_parameters):
             raise TypeError(f"{self._entry} expects {len(user_parameters)} launch arguments")
+        declared_access = {
+            argument.arg: self._tensor_view_access(argument.annotation)
+            for argument in function.args.args
+            if argument.arg in user_parameters
+        }
+        normalized_arguments = tuple(
+            value.view(access=declared_access[name])
+            if isinstance(value, TensorStorage) and declared_access[name] is not None
+            else value
+            for name, value in zip(user_parameters, arguments, strict=True)
+        )
         tensors = {
-            name: value for name, value in zip(user_parameters, arguments, strict=True) if isinstance(value, Tensor)
+            name: value
+            for name, value in zip(user_parameters, normalized_arguments, strict=True)
+            if isinstance(value, (TensorStorage, TensorView))
         }
         loaded_names = {
             node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
@@ -132,11 +245,27 @@ class Kernel:
             self._file,
             self._entry,
             features,
-            tuple((name, value.dtype.str, value.shape) for name, value in tensors.items()),
+            tuple(
+                (name, value.dtype.str, value.shape)
+                for name, value in tensors.items()
+                if isinstance(value, TensorStorage)
+            ),
+            tuple(
+                (
+                    name,
+                    value.dtype.str,
+                    value.shape,
+                    value.layout.element_strides,
+                    value.layout.element_offset,
+                )
+                for name, value in tensors.items()
+                if isinstance(value, TensorView)
+            ),
             constants,
             self._workgroup_size,
         )
         frontend = Compiler().compile_request(request)
+        self._validate_tensor_view_arguments(frontend, user_parameters, normalized_arguments)
         specialized_tree = ast.parse(frontend.specialized_source, filename=str(self._file))
         specialized_function = next(
             node for node in specialized_tree.body if isinstance(node, ast.FunctionDef) and node.name == self._entry
@@ -232,10 +361,10 @@ class Kernel:
             cached.native_generation = state._runtime_generation
         return cached
 
-    def __call__(
+    def _invoke_direct(
         self,
-        *arguments: Any,
-        grid: tuple[int, int, int] | None = None,
+        arguments: tuple[Any, ...],
+        grid: tuple[int, int, int] | None,
         _pipeline_features: tuple[str, ...] = (),
     ) -> None:
         state = _session_state()
@@ -247,7 +376,7 @@ class Kernel:
             writable_shapes = {
                 value.shape
                 for name, value in zip(user_parameters, arguments, strict=True)
-                if name in compiled.writable_names and isinstance(value, Tensor)
+                if name in compiled.writable_names and isinstance(value, (TensorStorage, TensorView))
             }
             if not writable_shapes:
                 raise TypeError("grid is required when no writable Tensor domain can be inferred")
@@ -260,28 +389,49 @@ class Kernel:
         if len(grid) != 3 or any(not isinstance(value, int) or value <= 0 for value in grid):
             raise ValueError("grid must contain three positive integers")
         assert state._native_runtime is not None and compiled.native is not None
-        native_values: list[Any] = []
-        parameters = (
-            argument for argument in compiled.function.args.args if argument.arg not in compiled.builtin_names
-        )
-        for parameter, value in zip(parameters, arguments, strict=True):
-            if isinstance(value, Tensor):
-                native_values.append(value._resident_buffer())
-            else:
-                annotation = self._annotation_name(parameter.annotation)
-                if annotation == "u32":
-                    native_values.append(struct.pack("<I", int(value)))
-                elif annotation == "i32":
-                    native_values.append(struct.pack("<i", int(value)))
-                elif annotation == "f64":
-                    native_values.append(struct.pack("<d", float(value)))
+        dispatch_borrows = [
+            (name, value, "write" if name in compiled.writable_names else "read")
+            for name, value in zip(user_parameters, arguments, strict=True)
+            if isinstance(value, (TensorStorage, TensorView))
+        ]
+        with _dispatch_borrow_scope(dispatch_borrows):
+            native_values: list[Any] = []
+            parameters = (
+                argument for argument in compiled.function.args.args if argument.arg not in compiled.builtin_names
+            )
+            for parameter, value in zip(parameters, arguments, strict=True):
+                if isinstance(value, (TensorStorage, TensorView)):
+                    native_values.append(value._resident_buffer())
                 else:
-                    native_values.append(struct.pack("<f", float(value)))
-        compiled.native.launch(*grid, native_values)
-        state._native_runtime.synchronize()
-        for name, value in zip(user_parameters, arguments, strict=True):
-            if name in compiled.writable_names and isinstance(value, Tensor):
-                value._mark_device_dirty()
+                    annotation = self._annotation_name(parameter.annotation)
+                    if annotation == "u32":
+                        native_values.append(struct.pack("<I", int(value)))
+                    elif annotation == "i32":
+                        native_values.append(struct.pack("<i", int(value)))
+                    elif annotation == "f64":
+                        native_values.append(struct.pack("<d", float(value)))
+                    else:
+                        native_values.append(struct.pack("<f", float(value)))
+            compiled.native.launch(*grid, native_values)
+            state._native_runtime.synchronize()
+            for name, value in zip(user_parameters, arguments, strict=True):
+                if name in compiled.writable_names and isinstance(value, (TensorStorage, TensorView)):
+                    value._mark_device_dirty()
+
+    def __call__(
+        self,
+        *arguments: Any,
+        grid: tuple[int, int, int] | None = None,
+        _pipeline_features: tuple[str, ...] = (),
+    ) -> None:
+        if _pipeline_features:
+            self._invoke_direct(tuple(arguments), grid, _pipeline_features)
+            return
+        from ..execution import ExecutionGraph
+
+        graph = ExecutionGraph()
+        graph.dispatch(self, *arguments, grid=grid)
+        graph.run()
 
 
 atexit.register(Kernel.clear_cache)

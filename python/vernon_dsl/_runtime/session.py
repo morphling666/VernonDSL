@@ -1,36 +1,20 @@
 from __future__ import annotations
 
 import atexit
-import importlib
 import weakref
 from dataclasses import dataclass
 from typing import Any
 
-from ..native_loader import load_native
 from .kernel import Kernel
 from .pipeline import Pipeline, PrimitiveTopology, lines, pipeline, points, triangles
-from .resources import Tensor, TensorLayout, TensorView, Texture
-
-
-def _load_gl_context() -> Any | None:
-    try:
-        from . import _gl_context as packaged_context
-
-        return packaged_context
-    except ImportError:
-        pass
-    try:
-        return importlib.import_module("_gl_context")
-    except ImportError:
-        return None
-
+from .resources import TensorLayout, TensorStorage, TensorView, Texture
 
 try:
-    _native = load_native()
+    from .. import _native
 except (ImportError, OSError):
     _native = None
 try:
-    _gl_context = _load_gl_context()
+    from .. import _gl_context
 except (ImportError, OSError):
     _gl_context = None
 
@@ -166,8 +150,8 @@ __all__ = [
     "Kernel",
     "Pipeline",
     "PrimitiveTopology",
-    "Tensor",
     "TensorLayout",
+    "TensorStorage",
     "TensorView",
     "Texture",
     "cpu",

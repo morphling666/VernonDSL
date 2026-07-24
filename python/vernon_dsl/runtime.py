@@ -2,7 +2,7 @@
 
 from ._runtime.kernel import Kernel
 from ._runtime.pipeline import Pipeline, PrimitiveTopology, lines, pipeline, points, triangles
-from ._runtime.resources import Tensor, TensorLayout, TensorView, Texture
+from ._runtime.resources import TensorLayout, TensorStorage, TensorView, Texture
 from ._runtime.session import (
     cpu,
     cuda,
@@ -12,19 +12,24 @@ from ._runtime.session import (
     register_external_opengl_context,
     vulkan,
 )
+from .execution import ExecutionGraph, ExecutionGraphAsset, NodeHandle, load_execution_graph_asset
 
 __all__ = [
     "Kernel",
+    "ExecutionGraph",
+    "ExecutionGraphAsset",
+    "NodeHandle",
     "Pipeline",
     "PrimitiveTopology",
-    "Tensor",
     "TensorLayout",
+    "TensorStorage",
     "TensorView",
     "Texture",
     "cpu",
     "cuda",
     "init",
     "lines",
+    "load_execution_graph_asset",
     "opengl",
     "opengles",
     "pipeline",

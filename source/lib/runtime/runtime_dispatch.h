@@ -43,11 +43,14 @@ VernonStatus unloadBackendKernel(VernonLoadedKernel &kernel);
 VernonStatus launchBackendKernel(VernonLoadedKernel &kernel, VernonLaunchSize globalSize,
                                  const VernonLaunchArgument *arguments, size_t argumentCount);
 
-VernonLoadedKernel *backendPipelineComputeKernel(VernonLoadedPipeline &pipeline);
+VernonLoadedKernel *backendPipelineComputeKernel(VernonLoadedPipeline &pipeline, const std::string &stage);
 bool resolveBackendPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline);
 void destroyBackendPipeline(VernonLoadedPipeline &pipeline);
 VernonStatus invokeBackendPipeline(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
                                    const PlannedGraphicsInvocation &plan);
+VernonStatus invokeBackendPipelineDispatch(VernonLoadedPipeline &pipeline, const PipelineStep &step,
+                                           const VernonPipelineInvocation &invocation,
+                                           const PlannedGraphicsInvocation &plan);
 
 VernonStatus backendComputeToGraphicsBarrier(VernonRuntimeContext &context);
 VernonStatus synchronizeBackend(VernonRuntimeContext &context);

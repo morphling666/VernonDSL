@@ -18,6 +18,7 @@ std::optional<size_t> tensorElementCount(const VernonTensorView &tensor);
 std::optional<size_t> tensorLogicalByteSize(const VernonTensorView &tensor);
 
 bool tensorRequiredSpan(const VernonTensorView &tensor, size_t &span);
+bool tensorFitsAllocation(const VernonTensorView &tensor);
 
 bool isRowMajorContiguous(const VernonTensorView &tensor);
 

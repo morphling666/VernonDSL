@@ -20,9 +20,9 @@ class Vertex:
 
 @func
 def resources(
-    a: vec3[f32],
-    b: mat[2, 3, f32],
-    data: Annotated[Buffer[Vertex, "read"], resource(set=1, binding=2)],
+    a: Vector[f32, 3],
+    b: Matrix[f32, 2, 3],
+    data: Annotated[TensorView[Vertex, 1, read], resource(set=1, binding=2)],
     image: Texture["2d", f32],
     sampler: Sampler,
     flag: bool,
@@ -38,7 +38,7 @@ def resources(
         self.assertIn("tensor<3xf32>", output)
         self.assertIn("tensor<2x3xf32>", output)
         self.assertEqual(output.count("tensor<4xf32>"), 1)
-        self.assertIn('!vernon.buffer<!vernon.struct<"Vertex">, "read">', output)
+        self.assertIn('!vernon.tensor_view<!vernon.struct<"Vertex">, 1, "read">', output)
         self.assertIn('!vernon.texture<"2d", f32>', output)
         self.assertIn('vernon.interface = "resource"', output)
         self.assertIn("vernon.set = 1 : i64", output)
@@ -49,7 +49,7 @@ def resources(
         self.assertIn(": f64", output)
 
     def test_texture_dimensions_and_coordinate_ranks(self) -> None:
-        for dimension, vector in (("2d", "vec2"), ("3d", "vec3"), ("cube", "vec3")):
+        for dimension, rank in (("2d", 2), ("3d", 3), ("cube", 3)):
             source = f"""
 from vernon_dsl import *
 
@@ -57,8 +57,8 @@ from vernon_dsl import *
 def sample(
     image: Annotated[Texture["{dimension}", f32], resource(set=0, binding=0)],
     sampler: Annotated[Sampler, resource(set=0, binding=1)],
-    uv: {vector}[f32],
-) -> vec4[f32]:
+    uv: Vector[f32, {rank}],
+) -> Vector[f32, 4]:
     return texture_sample(image, sampler, uv)
 """
             output = compile_source(source, f"texture_{dimension}.py")
@@ -79,7 +79,7 @@ def sample(image: Texture["1d", f32]) -> f32:
 from vernon_dsl import *
 @fragment
 def sample(image: Texture["cube", f32], sampler: Sampler,
-           uv: vec2[f32]) -> vec4[f32]:
+           uv: Vector[f32, 2]) -> Vector[f32, 4]:
     return texture_sample(image, sampler, uv)
 """
         with self.assertRaisesRegex(CompileError, "3-component"):
@@ -92,8 +92,8 @@ from vernon_dsl import *
 @fragment
 def implicit_sample(
     image: Annotated[Texture["2d", f32], resource(set=0, binding=0)],
-    uv: vec2[f32],
-) -> vec4[f32]:
+    uv: Vector[f32, 2],
+) -> Vector[f32, 4]:
     a = texture_sample(image, uv)
     b = texture_sample(image, uv, 2.0)
     size = texture_size(image)
@@ -104,8 +104,8 @@ def implicit_sample(
 def explicit_sample(
     image: Annotated[Texture["2d", f32], resource(set=0, binding=0)],
     sampler: Annotated[Sampler, resource(set=0, binding=1)],
-    uv: vec2[f32],
-) -> vec4[f32]:
+    uv: Vector[f32, 2],
+) -> Vector[f32, 4]:
     a = texture_sample(image, sampler, uv)
     b = texture_sample(image, sampler, uv, 1.0)
     return a + b
@@ -121,7 +121,7 @@ def explicit_sample(
 from vernon_dsl import *
 @fragment
 def main(image: Texture["2d", f32], sampler: Sampler,
-         uv: vec2[f32]) -> vec4[f32]:
+         uv: Vector[f32, 2]) -> Vector[f32, 4]:
     return texture_sample(image, sampler, uv)
 """,
             "explicit_only.py",
@@ -132,7 +132,7 @@ def main(image: Texture["2d", f32], sampler: Sampler,
         vertex_implicit_lod = """
 from vernon_dsl import *
 @vertex
-def main(image: Texture["2d", f32], uv: vec2[f32]) -> vec4[f32]:
+def main(image: Texture["2d", f32], uv: Vector[f32, 2]) -> Vector[f32, 4]:
     return texture_sample(image, uv)
 """
         with self.assertRaisesRegex(CompileError, "without lod"):
@@ -141,7 +141,7 @@ def main(image: Texture["2d", f32], uv: vec2[f32]) -> vec4[f32]:
         invalid_sample_lod = """
 from vernon_dsl import *
 @fragment
-def main(image: Texture["2d", f32], uv: vec2[f32]) -> vec4[f32]:
+def main(image: Texture["2d", f32], uv: Vector[f32, 2]) -> Vector[f32, 4]:
     return texture_sample(image, uv, 1)
 """
         with self.assertRaisesRegex(CompileError, "floating-point scalar"):
@@ -150,7 +150,7 @@ def main(image: Texture["2d", f32], uv: vec2[f32]) -> vec4[f32]:
         invalid_size_lod = """
 from vernon_dsl import *
 @fragment
-def main(image: Texture["2d", f32]) -> vec2[u32]:
+def main(image: Texture["2d", f32]) -> Vector[u32, 2]:
     return texture_size(image, 1.0)
 """
         with self.assertRaisesRegex(CompileError, "integer scalar"):
@@ -160,7 +160,7 @@ def main(image: Texture["2d", f32]) -> vec2[u32]:
 from vernon_dsl import *
 @kernel(workgroup_size=(1, 1, 1))
 def main(image: Texture["2d", f32], sampler: Sampler,
-         uv: vec2[f32]) -> None:
+         uv: Vector[f32, 2]) -> None:
     color = texture_sample(image, sampler, uv)
 """
         with self.assertRaisesRegex(CompileError, "without lod.*fragment shaders"):
@@ -170,7 +170,7 @@ def main(image: Texture["2d", f32], sampler: Sampler,
 from vernon_dsl import *
 @kernel(workgroup_size=(1, 1, 1))
 def main(image: Texture["2d", f32], sampler: Sampler) -> None:
-    color = texture_sample(image, sampler, vec2(0.0, 0.0), 0.0)
+    color = texture_sample(image, sampler, Vector([0.0, 0.0]), 0.0)
 """
         output = compile_source(compute_explicit_lod, "compute_explicit_lod.py")
         self.assertIn('name = "texture_sample"', output)
@@ -182,8 +182,8 @@ from vernon_dsl import *
 def main(
     image: Annotated[Texture["2d", f32], resource(set=1, binding=2)],
     occupied: Annotated[f32, uniform(set=1, binding=0)],
-    uv: vec2[f32],
-) -> vec4[f32]:
+    uv: Vector[f32, 2],
+) -> Vector[f32, 4]:
     return texture_sample(image, uv)
 """
         output = compile_source(source, "sampler_binding_collision.py")
@@ -196,14 +196,14 @@ def main(
 from vernon_dsl import *
 
 @func
-def aliases(color: vec4[f32]) -> vec4[f32]:
+def aliases(color: Vector[f32, 4]) -> Vector[f32, 4]:
     red = color.r
     green = color.g
     blue = color.b
     alpha = color.a
     rgb = color.rgb
     rgba = color.rgba
-    return vec4(rgb, alpha)
+    return Vector([rgb, alpha])
 """
         output = compile_source(source, "swizzle_aliases.py")
         for mask in ("x", "y", "z", "w", "xyz", "xyzw"):
@@ -215,7 +215,7 @@ def aliases(color: vec4[f32]) -> vec4[f32]:
 from vernon_dsl import *
 
 @func
-def invalid(color: vec3[f32]) -> f32:
+def invalid(color: Vector[f32, 3]) -> f32:
     return color.a
 """
         with self.assertRaisesRegex(CompileError, "swizzle 'a' is out of bounds"):
@@ -231,21 +231,21 @@ from vernon_dsl import *
 def vertex_main(
     vertex: Annotated[u32, builtin("vertex_index")],
     instance: Annotated[u32, builtin("instance_index")],
-) -> Annotated[vec4[f32], builtin("position")]:
-    return vec4(0.0, 0.0, 0.0, 1.0)
+) -> Annotated[Vector[f32, 4], builtin("position")]:
+    return Vector([0.0, 0.0, 0.0, 1.0])
 
 @fragment
 def fragment_main(
-    coordinate: Annotated[vec4[f32], builtin("frag_coord")],
+    coordinate: Annotated[Vector[f32, 4], builtin("frag_coord")],
     facing: Annotated[bool, builtin("front_facing")],
-) -> vec4[f32]:
+) -> Vector[f32, 4]:
     return coordinate
 
 @kernel(workgroup_size=(1, 1, 1))
 def compute_main(
-    global_id: Annotated[vec3[u32], builtin("global_invocation_id")],
-    local_id: Annotated[vec3[u32], builtin("local_invocation_id")],
-    group_id: Annotated[vec3[u32], builtin("workgroup_id")],
+    global_id: Annotated[Vector[u32, 3], builtin("global_invocation_id")],
+    local_id: Annotated[Vector[u32, 3], builtin("local_invocation_id")],
+    group_id: Annotated[Vector[u32, 3], builtin("workgroup_id")],
 ) -> None:
     pass
 """
@@ -268,8 +268,8 @@ def compute_main(
                 """
 from vernon_dsl import *
 @vertex
-def main(value: Annotated[u32, builtin("mystery")]) -> vec4[f32]:
-    return vec4(0.0, 0.0, 0.0, 1.0)
+def main(value: Annotated[u32, builtin("mystery")]) -> Vector[f32, 4]:
+    return Vector([0.0, 0.0, 0.0, 1.0])
 """,
                 "unknown builtin 'mystery'",
             ),
@@ -277,8 +277,8 @@ def main(value: Annotated[u32, builtin("mystery")]) -> vec4[f32]:
                 """
 from vernon_dsl import *
 @fragment
-def main(value: Annotated[u32, builtin("vertex_index")]) -> vec4[f32]:
-    return vec4(0.0, 0.0, 0.0, 1.0)
+def main(value: Annotated[u32, builtin("vertex_index")]) -> Vector[f32, 4]:
+    return Vector([0.0, 0.0, 0.0, 1.0])
 """,
                 "requires a vertex input",
             ),
@@ -304,8 +304,8 @@ def main(gid: Annotated[u32, builtin("global_invocation_id")]) -> None:
                 """
 from vernon_dsl import *
 @vertex
-def main() -> vec3[f32]:
-    return vec3(0.0, 0.0, 0.0)
+def main() -> Vector[f32, 3]:
+    return Vector([0.0, 0.0, 0.0])
 """,
                 "builtin 'position' requires type tensor<4xf32>",
             ),
@@ -321,8 +321,8 @@ from vernon_dsl import *
 def main(
     image: Annotated[Texture["2d", f32], resource(set=0, binding=0)],
     sampler: Annotated[Sampler, resource(set=0, binding=1)],
-    uv: vec2[f32],
-) -> vec4[f32]:
+    uv: Vector[f32, 2],
+) -> Vector[f32, 4]:
     implicit_value = texture_sample(image, uv)
     explicit_value = texture_sample(image, sampler, uv)
     return implicit_value + explicit_value
@@ -335,13 +335,13 @@ def main(
 from vernon_dsl import *
 
 @vertex
-def vertex_main(position: vec4[f32]) -> vec4[f32]:
+def vertex_main(position: Vector[f32, 4]) -> Vector[f32, 4]:
     vertex = vertex_id()
     instance = instance_id()
     return position
 
 @fragment
-def fragment_main() -> vec4[f32]:
+def fragment_main() -> Vector[f32, 4]:
     size = resolution()
     coordinate = fragment_coord()
     facing = front_facing()
@@ -373,12 +373,12 @@ from vernon_dsl import *
 
 @vertex
 def transform(
-    position: Annotated[vec3[f32], location(0)],
-    transform: Annotated[mat4[f32], uniform(set=1, binding=2)],
-) -> vec4[f32]:
+    position: Annotated[Vector[f32, 3], location(0)],
+    transform: Annotated[Matrix[f32, 4, 4], uniform(set=1, binding=2)],
+) -> Vector[f32, 4]:
     direction = normalize(position)
     amount = max(dot(direction, direction), 0.0)
-    return matmul(transform, vec4(direction * vec3(amount, amount, amount), 1.0))
+    return matmul(transform, Vector([direction * Vector([amount, amount, amount]), 1.0]))
 """
         output = compile_source(source, "intrinsics.py")
         self.assertIn('name = "normalize"', output)
@@ -397,7 +397,7 @@ def scalar_power(value: f32) -> f32:
     return value ** 2.5
 
 @func
-def vector_power(value: vec2[f32], exponent: vec2[f32]) -> vec2[f32]:
+def vector_power(value: Vector[f32, 2], exponent: Vector[f32, 2]) -> Vector[f32, 2]:
     return value ** exponent
 
 @func
@@ -426,20 +426,20 @@ from vernon_dsl import *
 
 @vertex
 def transform(
-    position: Annotated[vec4[f32], location(0)],
-    offset: Annotated[vec4[f32], uniform()],
-) -> vec4[f32]:
+    position: Annotated[Vector[f32, 4], location(0)],
+    offset: Annotated[Vector[f32, 4], uniform()],
+) -> Vector[f32, 4]:
     moved = position + offset
     return moved
 
 @fragment
-def shade(color: Annotated[vec4[f32], varying()]) -> f32:
+def shade(color: Annotated[Vector[f32, 4], varying()]) -> f32:
     return color.x
 
 @kernel(workgroup_size=(8, 4, 1))
 def update(
-    values: Annotated[Buffer[f32], resource(set=0, binding=3)],
-    invocation: Annotated[vec3[u32], builtin("global_invocation_id")],
+    values: Annotated[TensorView[f32, 1, read_write], resource(set=0, binding=3)],
+    invocation: Annotated[Vector[u32, 3], builtin("global_invocation_id")],
 ) -> None:
     current = values[invocation[0]]
     values[invocation[0]] = current + 1.0
@@ -452,9 +452,9 @@ def update(
         self.assertIn('vernon.stage = "compute"', output)
         self.assertIn("vernon.workgroup_size = array<i32: 8, 4, 1>", output)
         self.assertIn('"vernon.swizzle"', output)
-        self.assertIn('name = "buffer_load"', output)
-        self.assertIn('name = "buffer_store"', output)
-        self.assertIn("scf.for", output)
+        self.assertIn('name = "tensor_view_load"', output)
+        self.assertIn('name = "tensor_view_store"', output)
+        self.assertIn("scf.while", output)
 
     def test_if_merges_existing_values(self) -> None:
         source = """
@@ -607,12 +607,12 @@ class FeatureVariantTests(unittest.TestCase):
                 'SKIN = feature("SKIN")\n'
                 "@vertex\n"
                 "def mesh_vertex(\n"
-                "    position: vec3[f32],\n"
-                "    transform: When[INSTANCE, Annotated[mat4[f32], instance()]],\n"
-                "    joints: When[SKIN, vec4[u32]],\n"
-                "    weights: When[SKIN, vec4[f32]],\n"
-                ') -> Annotated[vec4[f32], builtin("position")]:\n'
-                "    result = vec4(position, 1.0)\n"
+                "    position: Vector[f32, 3],\n"
+                "    transform: When[INSTANCE, Annotated[Matrix[f32, 4, 4], instance()]],\n"
+                "    joints: When[SKIN, Vector[u32, 4]],\n"
+                "    weights: When[SKIN, Vector[f32, 4]],\n"
+                ') -> Annotated[Vector[f32, 4], builtin("position")]:\n'
+                "    result = Vector([position, 1.0])\n"
                 "    if INSTANCE:\n"
                 "        result = matmul(transform, result)\n"
                 "    if SKIN:\n"
@@ -645,9 +645,9 @@ class FeatureVariantTests(unittest.TestCase):
                 "from vernon_dsl import *\n"
                 "@vertex\n"
                 "def main(\n"
-                "    transform: Annotated[mat4[f32], location(1)],\n"
-                "    value: Annotated[vec4[f32], location(2)],\n"
-                ") -> vec4[f32]:\n"
+                "    transform: Annotated[Matrix[f32, 4, 4], location(1)],\n"
+                "    value: Annotated[Vector[f32, 4], location(2)],\n"
+                ") -> Vector[f32, 4]:\n"
                 "    return value\n",
                 encoding="utf-8",
             )

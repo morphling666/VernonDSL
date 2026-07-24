@@ -229,8 +229,12 @@ VernonStatus launchCudaKernel(VernonRuntimeContext &context, const CudaKernelSta
     };
     std::vector<MemRefDescriptor> descriptors;
     std::vector<void *> parameters;
-    descriptors.reserve(argumentCount);
-    parameters.reserve(argumentCount * 5);
+    size_t descriptorCount = 0;
+    for (const ReflectedArgument &reflected : metadata.arguments)
+        if (reflected.kind == "tensor")
+            descriptorCount += std::max(reflected.storageLeaves.size(), size_t{1});
+    descriptors.reserve(descriptorCount);
+    parameters.reserve(argumentCount + descriptorCount * 5);
     size_t supplied = 0;
     for (const ReflectedArgument &reflected : metadata.arguments) {
         if (reflected.kind == "builtin")
@@ -238,17 +242,20 @@ VernonStatus launchCudaKernel(VernonRuntimeContext &context, const CudaKernelSta
         const VernonLaunchArgument &argument = arguments[supplied++];
         if (argument.kind == VERNON_LAUNCH_TENSOR) {
             const CudaDevicePointer devicePointer = cudaBufferState(*argument.buffer).devicePointer;
-            descriptors.push_back({devicePointer, devicePointer, 0,
-                                   reflected.tensorElements
-                                       ? reflected.tensorElements
-                                       : argument.buffer->size / std::max(reflected.tensorElementSize, size_t{1}),
-                                   1});
-            MemRefDescriptor &descriptor = descriptors.back();
-            parameters.push_back(&descriptor.allocated);
-            parameters.push_back(&descriptor.aligned);
-            parameters.push_back(&descriptor.offset);
-            parameters.push_back(&descriptor.size);
-            parameters.push_back(&descriptor.stride);
+            const size_t leafCount = std::max(reflected.storageLeaves.size(), size_t{1});
+            for (size_t leafIndex = 0; leafIndex < leafCount; ++leafIndex) {
+                const size_t elementSize = reflected.storageLeaves.empty()
+                                               ? reflected.tensorElementSize
+                                               : reflected.storageLeaves[leafIndex].elementSize;
+                descriptors.push_back(
+                    {devicePointer, devicePointer, 0, argument.buffer->size / std::max(elementSize, size_t{1}), 1});
+                MemRefDescriptor &descriptor = descriptors.back();
+                parameters.push_back(&descriptor.allocated);
+                parameters.push_back(&descriptor.aligned);
+                parameters.push_back(&descriptor.offset);
+                parameters.push_back(&descriptor.size);
+                parameters.push_back(&descriptor.stride);
+            }
         } else {
             parameters.push_back(const_cast<void *>(argument.scalar_data));
         }

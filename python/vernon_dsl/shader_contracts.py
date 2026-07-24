@@ -66,8 +66,9 @@ GENERATED_INTERFACE_CONTRACTS = {
 
 DEVICE_ONLY_TYPE_NAMES = frozenset(
     {
-        "Buffer",
         "Sampler",
+        "TensorStorage",
+        "TensorView",
         "Texture",
         "builtin",
         "resource",

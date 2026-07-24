@@ -71,7 +71,8 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
 
     size_t loweredArgumentCount = 1;
     for (const CpuAbiArgumentPacking &argument : metadata.sourceArguments)
-        loweredArgumentCount += argument.kind == CpuAbiArgumentKind::Buffer ? 5 : 1;
+        loweredArgumentCount +=
+            argument.kind == CpuAbiArgumentKind::TensorView ? 5 * argument.tensorLeafElementSizes.size() : 1;
     if (function->arg_size() != loweredArgumentCount)
         return invalidAbi("lowered CPU entry '" + metadata.internalFunctionSymbol +
                           "' has an incompatible argument count");
@@ -160,23 +161,25 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
 
         if (packing.size != module.getDataLayout().getPointerSize())
             return invalidAbi("CPU buffer ABI packing size is not one pointer");
-        llvm::Type *allocatedType = function->getArg(loweredIndex++)->getType();
-        llvm::Type *alignedType = function->getArg(loweredIndex++)->getType();
-        llvm::Type *offsetType = function->getArg(loweredIndex++)->getType();
-        llvm::Type *sizeType = function->getArg(loweredIndex++)->getType();
-        llvm::Type *strideType = function->getArg(loweredIndex++)->getType();
-        if (allocatedType != pointerType || alignedType != pointerType)
-            return invalidAbi("lowered CPU buffer descriptor pointer types are "
-                              "incompatible");
-        llvm::Constant *offset = integerConstant(offsetType, 0);
-        llvm::Constant *extent = integerConstant(sizeType, packing.staticExtent);
-        llvm::Constant *stride = integerConstant(strideType, 1);
-        if (!offset || !extent || !stride)
-            return invalidAbi("lowered CPU buffer descriptor index types are "
-                              "incompatible");
         llvm::LoadInst *rawPointer = builder.CreateLoad(pointerType, address, "buffer");
         rawPointer->setAlignment(llvm::Align(1));
-        argumentsToCall.append({rawPointer, rawPointer, offset, extent, stride});
+        for (size_t leafIndex = 0; leafIndex < packing.tensorLeafElementSizes.size(); ++leafIndex) {
+            llvm::Type *allocatedType = function->getArg(loweredIndex++)->getType();
+            llvm::Type *alignedType = function->getArg(loweredIndex++)->getType();
+            llvm::Type *offsetType = function->getArg(loweredIndex++)->getType();
+            llvm::Type *sizeType = function->getArg(loweredIndex++)->getType();
+            llvm::Type *strideType = function->getArg(loweredIndex++)->getType();
+            if (allocatedType != pointerType || alignedType != pointerType)
+                return invalidAbi("lowered CPU buffer descriptor pointer types are "
+                                  "incompatible");
+            llvm::Constant *offset = integerConstant(offsetType, 0);
+            llvm::Constant *extent = integerConstant(sizeType, packing.staticExtent);
+            llvm::Constant *stride = integerConstant(strideType, 1);
+            if (!offset || !extent || !stride)
+                return invalidAbi("lowered CPU buffer descriptor index types are "
+                                  "incompatible");
+            argumentsToCall.append({rawPointer, rawPointer, offset, extent, stride});
+        }
     }
     argumentsToCall.push_back(textures);
     llvm::CallInst *call = builder.CreateCall(function, argumentsToCall);

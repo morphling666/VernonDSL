@@ -4,16 +4,54 @@ from typing import Any
 
 from .model import (
     AccessMode,
+    AtomicEffect,
+    BarrierEffect,
     BranchMerge,
     Effect,
+    EffectScope,
     LValue,
-    StorageClass,
+    MemoryOrdering,
+    StorageEffect,
+    StorageEffectKind,
+    StorageOwner,
+    StorageRegion,
+    StorageRegionKind,
     Termination,
+    TypedEffect,
     TypedExpression,
     TypedFunctionInstance,
     TypedParameter,
     TypedStatement,
 )
+
+
+def typed_effect_data(effect: TypedEffect) -> dict[str, Any]:
+    if isinstance(effect, StorageEffect):
+        return {
+            "kind": effect.kind.value,
+            "owner": effect.owner.parameter,
+            "region": {
+                "kind": effect.region.kind.value,
+                "indices": list(effect.region.indices),
+            },
+        }
+    if isinstance(effect, AtomicEffect):
+        return {
+            "kind": "atomic",
+            "operation": effect.operation,
+            "owner": effect.owner.parameter,
+            "region": {
+                "kind": effect.region.kind.value,
+                "indices": list(effect.region.indices),
+            },
+            "ordering": effect.ordering.value,
+            "scope": effect.scope.value,
+        }
+    return {
+        "kind": "barrier",
+        "ordering": effect.ordering.value,
+        "scope": effect.scope.value,
+    }
 
 
 def typed_model_data(functions: Iterable[TypedFunctionInstance]) -> list[dict[str, Any]]:
@@ -22,7 +60,10 @@ def typed_model_data(functions: Iterable[TypedFunctionInstance]) -> list[dict[st
             "kind": type(statement.source).__name__,
             "line": getattr(statement.source, "lineno", 0),
             "effect": statement.effect.value,
+            "effects": [typed_effect_data(effect) for effect in statement.effects],
             "termination": statement.termination.value,
+            "loop_depth": statement.loop_depth,
+            "return_type": statement.return_type.mlir if statement.return_type is not None else None,
             "expressions": [
                 {
                     "kind": type(expression.source).__name__,
@@ -30,7 +71,6 @@ def typed_model_data(functions: Iterable[TypedFunctionInstance]) -> list[dict[st
                     "operation": expression.operation,
                     "type": expression.type.mlir,
                     "operand_types": [value.mlir for value in expression.operand_types],
-                    "storage": expression.storage.value,
                     "access": expression.access.value,
                 }
                 for expression in statement.expressions
@@ -40,7 +80,6 @@ def typed_model_data(functions: Iterable[TypedFunctionInstance]) -> list[dict[st
                     "kind": value.kind,
                     "name": value.name,
                     "type": value.type.mlir,
-                    "storage": value.storage.value,
                     "access": value.access.value,
                 }
                 for value in statement.lvalues
@@ -57,13 +96,13 @@ def typed_model_data(functions: Iterable[TypedFunctionInstance]) -> list[dict[st
                 {
                     "name": parameter.name,
                     "type": parameter.type.mlir,
-                    "storage": parameter.storage.value,
                     "access": parameter.access.value,
                 }
                 for parameter in function.parameters
             ],
             "result": function.result_type.mlir if function.result_type is not None else None,
             "features": list(function.enabled_features),
+            "effects": [typed_effect_data(effect) for effect in function.effects],
             "body": [statement_data(statement) for statement in function.body],
         }
         for function in functions
@@ -76,15 +115,25 @@ def dump_typed_model(functions: Iterable[TypedFunctionInstance]) -> str:
 
 __all__ = [
     "AccessMode",
+    "AtomicEffect",
+    "BarrierEffect",
     "BranchMerge",
     "Effect",
+    "EffectScope",
     "LValue",
-    "StorageClass",
+    "MemoryOrdering",
+    "StorageEffect",
+    "StorageEffectKind",
+    "StorageOwner",
+    "StorageRegion",
+    "StorageRegionKind",
     "Termination",
     "TypedExpression",
+    "TypedEffect",
     "TypedFunctionInstance",
     "TypedParameter",
     "TypedStatement",
     "dump_typed_model",
+    "typed_effect_data",
     "typed_model_data",
 ]

@@ -42,12 +42,10 @@ class TypeParserCoverageTests(unittest.TestCase):
             "Record": '!vernon.struct<"Record">',
             "Sampler": "!vernon.sampler",
             "Tensor[f32, (None, 4)]": "tensor<?x4xf32>",
-            "vec[3, f32]": "tensor<3xf32>",
-            "mat[2, 3, f64]": "tensor<2x3xf64>",
-            "vec4[f16]": "tensor<4xf16>",
-            "mat3[f32]": "tensor<3x3xf32>",
-            "Buffer[f32]": '!vernon.buffer<f32, "read_write">',
-            "Buffer[f32, read]": '!vernon.buffer<f32, "read">',
+            "Vector[f16, 4]": "tensor<4xf16>",
+            "Matrix[f32, 3, 3]": "tensor<3x3xf32>",
+            "TensorView[f32, 1, read]": '!vernon.tensor_view<f32, 1, "read">',
+            "TensorView[f32, 2, read_write]": '!vernon.tensor_view<f32, 2, "read_write">',
             'Texture["cube", f32]': '!vernon.texture<"cube", f32>',
         }
         for source, mlir in expected.items():
@@ -62,11 +60,14 @@ class TypeParserCoverageTests(unittest.TestCase):
             "Tensor[f32]": "Tensor requires",
             "Tensor[f32, 0]": "positive integer",
             "Tensor[f32, True]": "positive integer",
-            "vec[3]": "vec requires",
-            "mat[2, f32]": "mat requires",
-            "vec2[f32, f64]": "vec2 requires",
-            "Buffer[]": "invalid syntax",
-            "Buffer[f32, read, write]": "Buffer requires",
+            "vec[3, f32]": "unknown DSL type constructor",
+            "mat[2, 3, f64]": "unknown DSL type constructor",
+            "vec2[f32]": "unknown DSL type constructor",
+            "mat4[f32]": "unknown DSL type constructor",
+            "Vector[f32, f64, 2]": "Vector requires",
+            "Buffer[f32]": "unknown DSL type constructor 'Buffer'",
+            "TensorView[f32, read]": "TensorView requires",
+            "TensorView[f32, 1, missing]": "TensorView access",
             "Texture[f32]": "Texture requires",
             'Texture["1d", f32]': "texture dimension",
             "Texture[value(), f32]": "string literal or name",
@@ -193,7 +194,7 @@ class TypeSolverCoverageTests(unittest.TestCase):
             "def touch(value):\n"
             "    return\n"
             "@fragment\n"
-            "def main(image: Texture['2d', f32], sampler: Sampler, uv: vec2[f32]) -> vec4[f32]:\n"
+            "def main(image: Texture['2d', f32], sampler: Sampler, uv: Vector[f32, 2]) -> Vector[f32, 4]:\n"
             "    touch(image)\n"
             "    touch(sampler)\n"
             "    return texture_sample(image, sampler, uv)\n",
@@ -230,7 +231,7 @@ class InferenceDiagnosticCoverageTests(unittest.TestCase):
             ),
             (
                 "@fragment\ndef main(value: f32) -> f32:\n    value[0] = 1\n    return value\n",
-                "writable buffer",
+                "writable Storage",
             ),
             (
                 "@fragment\ndef main(value: f32) -> f32:\n    result: i32 = value\n    return value\n",
@@ -245,7 +246,7 @@ class InferenceDiagnosticCoverageTests(unittest.TestCase):
                 "cannot infer expression syntax",
             ),
             (
-                "@fragment\ndef main(value: vec2[f32], index: f32) -> f32:\n    return value[index]\n",
+                "@fragment\ndef main(value: Vector[f32, 2], index: f32) -> f32:\n    return value[index]\n",
                 "index must be an integer",
             ),
         )
@@ -275,12 +276,12 @@ class InferenceDiagnosticCoverageTests(unittest.TestCase):
                 "constructor requires 2",
             ),
             (
-                "@fragment\ndef main(value: f32) -> f32:\n    return vec2()[0]\n",
-                "vec2 requires arguments",
+                "@fragment\ndef main(value: f32) -> f32:\n    return Vector([])[0]\n",
+                "requires a non-empty sequence literal",
             ),
             (
-                "@fragment\ndef main(value: f32) -> f32:\n    return vec2(value, True)[0]\n",
-                "arguments have incompatible types",
+                "@fragment\ndef main(value: f32) -> f32:\n    return Vector([value, True])[0]\n",
+                "elements have incompatible types",
             ),
             (
                 "@fragment\ndef main(value: f32) -> f32:\n    return matmul(value)\n",
@@ -291,12 +292,16 @@ class InferenceDiagnosticCoverageTests(unittest.TestCase):
                 "left operand must be a matrix",
             ),
             (
-                "@fragment\ndef main(value: mat2[f32]) -> f32:\n    return matmul(value, 1)\n",
+                "@fragment\ndef main(value: Matrix[f32, 2, 2]) -> f32:\n    return matmul(value, 1)\n",
                 "right operand must be a Tensor",
             ),
             (
                 "@fragment\ndef main(value: f32) -> f32:\n    return unknown(value)\n",
                 "cannot infer call",
+            ),
+            (
+                "@fragment\ndef main(value: f32) -> f32:\n    return vec2(value, value)[0]\n",
+                "cannot infer call to 'vec2'",
             ),
         )
         for body, message in cases:

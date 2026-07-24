@@ -11,8 +11,8 @@ import vernon_dsl as vd
 
 @vd.kernel(workgroup_size=(2, 1, 1))
 def animate_vertices(
-    positions: vd.Tensor[vd.f32, (None, 2)],
-    base_positions: vd.Tensor[vd.f32, (None, 2)],
+    positions: vd.TensorView[vd.f32, 2, vd.write],
+    base_positions: vd.TensorView[vd.f32, 2, vd.read],
     phase: vd.f32,
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
@@ -27,16 +27,16 @@ def animate_vertices(
 
 @vd.vertex
 def vertex_main(
-    positions: Annotated[vd.vec2[vd.f32], vd.location(0)],
-    draw_offset: Annotated[vd.vec2[vd.f32], vd.uniform()],
-) -> Annotated[vd.vec4[vd.f32], vd.builtin("position")]:
-    return vd.vec4(positions + draw_offset, 0.0, 1.0)
+    positions: Annotated[vd.Vector[vd.f32, 2], vd.location(0)],
+    draw_offset: Annotated[vd.Vector[vd.f32, 2], vd.uniform()],
+) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
+    return vd.Vector([positions + draw_offset, 0.0, 1.0])
 
 
 @vd.fragment
 def fragment_main(
-    color: Annotated[vd.vec4[vd.f32], vd.uniform()],
-) -> Annotated[vd.vec4[vd.f32], vd.location(0)]:
+    color: Annotated[vd.Vector[vd.f32, 4], vd.uniform()],
+) -> Annotated[vd.Vector[vd.f32, 4], vd.location(0)]:
     return color
 
 
@@ -83,10 +83,10 @@ def main() -> None:
         ),
         dtype=np.float32,
     )
-    base_positions = vd.Tensor.from_numpy(base_array)
-    positions = vd.Tensor.from_numpy(base_array)
-    draw_offset = vd.Tensor.from_numpy(np.zeros((2,), dtype=np.float32))
-    color = vd.Tensor.from_numpy(np.array((0.1, 0.65, 1.0, 1.0), dtype=np.float32))
+    base_positions = vd.storage.from_numpy(base_array)
+    positions = vd.storage.from_numpy(base_array)
+    draw_offset = vd.storage.from_numpy(np.zeros((2,), dtype=np.float32))
+    color = vd.storage.from_numpy(np.array((0.1, 0.65, 1.0, 1.0), dtype=np.float32))
     target = vd.Texture.zeros(shape=(args.size, args.size))
     render = vd.pipeline(animate_vertices, vertex_main, fragment_main)
 
