@@ -430,14 +430,6 @@ class PipelineCompileTests(unittest.TestCase):
         )
 
     def test_variant_steps_outputs_and_graphics_interface_are_exact(self) -> None:
-        compute = _stage(
-            "compute",
-            b"compute",
-            {
-                "arguments": [],
-                "results": [],
-            },
-        )
         vertex = _stage(
             "vertex",
             b"vertex",
