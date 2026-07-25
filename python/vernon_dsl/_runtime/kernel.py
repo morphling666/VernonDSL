@@ -29,12 +29,14 @@ class _CompiledKernel:
     builtin_names: tuple[str, ...]
     writable_names: tuple[str, ...]
     program: Any
+    dependency_hashes: tuple[tuple[Path, str], ...] = ()
     native: Any | None = None
     native_generation: int = -1
 
 
 class Kernel:
     _cache: ClassVar[dict[str, _CompiledKernel]] = {}
+    _dispatch_cache: ClassVar[dict[tuple[Any, ...], _CompiledKernel]] = {}
 
     def __init__(self, function: Any, *, workgroup_size: tuple[int, int, int] = (1, 1, 1)):
         if len(workgroup_size) != 3 or any(not isinstance(value, int) or value <= 0 for value in workgroup_size):
@@ -53,12 +55,98 @@ class Kernel:
     @classmethod
     def clear_cache(cls) -> None:
         cls._cache.clear()
+        cls._dispatch_cache.clear()
 
     @classmethod
     def invalidate_loaded(cls) -> None:
         for compiled in cls._cache.values():
             compiled.native = None
             compiled.native_generation = -1
+
+    def _resolve_dependency(self, spelling: str) -> Path:
+        path = Path(spelling)
+        if path.is_absolute():
+            return path
+        for parent in (self._file.parent, *self._file.parents):
+            candidate = parent / path
+            if candidate.is_file():
+                return candidate
+        return path
+
+    def _dependency_hashes(self, frontend: FrontendCompileResult) -> tuple[tuple[Path, str], ...]:
+        return tuple(
+            (self._resolve_dependency(str(path)), str(digest))
+            for path, digest in frontend.semantic_inputs.get("dependencies", ())
+        )
+
+    @staticmethod
+    def _dependencies_current(compiled: _CompiledKernel) -> bool:
+        try:
+            return all(
+                hashlib.sha256(path.read_text(encoding="utf-8").encode("utf-8")).hexdigest() == digest
+                for path, digest in compiled.dependency_hashes
+            )
+        except OSError:
+            return False
+
+    @staticmethod
+    def _argument_signature(value: Any) -> tuple[Any, ...]:
+        if isinstance(value, TensorStorage):
+            return ("storage", value.dtype.str, value.shape)
+        if isinstance(value, TensorView):
+            layout = value.layout
+            return (
+                "view",
+                value.dtype.str,
+                value.shape,
+                layout.element_strides,
+                layout.element_offset,
+                value.access,
+            )
+        return ("value", type(value).__module__, type(value).__qualname__)
+
+    def _dispatch_key(
+        self,
+        arguments: tuple[Any, ...],
+        features: tuple[str, ...],
+        target: str,
+        target_options: tuple[tuple[str, Any], ...],
+    ) -> tuple[Any, ...]:
+        source_digest = hashlib.sha256(self._file.read_bytes()).hexdigest()
+        constants = tuple(
+            sorted(
+                (name, type(value).__name__, repr(value))
+                for name, value in self._globals.items()
+                if isinstance(value, (int, float, bool))
+            )
+        )
+        return (
+            str(self._file.resolve()),
+            source_digest,
+            self._entry,
+            self._workgroup_size,
+            target,
+            target_options,
+            features,
+            tuple(self._argument_signature(value) for value in arguments),
+            constants,
+        )
+
+    @staticmethod
+    def _load_native(compiled: _CompiledKernel, state: Any, entry: str) -> None:
+        if compiled.native is not None and compiled.native_generation == state._runtime_generation:
+            return
+        if state._architecture == state.cpu:
+            compiled.native = state._native_runtime.load_cpu_entry(compiled.program, entry)
+        else:
+            if len(compiled.program.artifacts) != 1:
+                raise RuntimeError("kernel compilation must produce exactly one artifact")
+            compiled.native = state._native_runtime.load(
+                compiled.program.artifacts[0][1],
+                compiled.program.reflection,
+                entry,
+            )
+        compiled.native_generation = state._runtime_generation
 
     @staticmethod
     def _annotation_name(node: ast.AST) -> str:
@@ -223,7 +311,7 @@ class Kernel:
             if argument.arg in user_parameters
         }
         normalized_arguments = tuple(
-            value.view(access=declared_access[name])
+            value._full_view(declared_access[name])
             if isinstance(value, TensorStorage) and declared_access[name] is not None
             else value
             for name, value in zip(user_parameters, arguments, strict=True)
@@ -303,7 +391,8 @@ class Kernel:
 
     def _compile(self, arguments: tuple[Any, ...], features: tuple[str, ...] = ()) -> _CompiledKernel:
         state = _session_state()
-        frontend, function, builtins, _ = self._lower(arguments, features)
+        if state._native is None or state._native_runtime is None:
+            raise RuntimeError(f"{state._architecture.name} kernel execution requires the native runtime")
         target = (
             {
                 state.cpu: state._native.Target.CPU,
@@ -322,6 +411,13 @@ class Kernel:
             if state._architecture in {state.opengl, state.opengles}
             else {},
         )
+        dispatch_key = self._dispatch_key(arguments, features, options.target, tuple(sorted(options.options.items())))
+        cached = self._dispatch_cache.get(dispatch_key)
+        if cached is not None and self._dependencies_current(cached):
+            self._load_native(cached, state, self._entry)
+            return cached
+
+        frontend, function, builtins, _ = self._lower(arguments, features)
         key = hashlib.sha256(
             canonical_json(
                 {
@@ -333,8 +429,6 @@ class Kernel:
             ).encode()
         ).hexdigest()
         cached = self._cache.get(key)
-        if state._native is None or state._native_runtime is None:
-            raise RuntimeError(f"{state._architecture.name} kernel execution requires the native runtime")
         if cached is None:
             assert target is not None
             program = state._native.Compiler().compile_program_result(frontend.mlir, target, **options.native_options)
@@ -346,21 +440,14 @@ class Kernel:
                 builtins,
                 self._writable_parameters(function),
                 program,
+                self._dependency_hashes(frontend),
             )
             self._cache[key] = cached
             self.compile_count += 1
-        if cached.native is None or cached.native_generation != state._runtime_generation:
-            if state._architecture == state.cpu:
-                cached.native = state._native_runtime.load_cpu_entry(cached.program, self._entry)
-            else:
-                if len(cached.program.artifacts) != 1:
-                    raise RuntimeError("kernel compilation must produce exactly one artifact")
-                cached.native = state._native_runtime.load(
-                    cached.program.artifacts[0][1],
-                    cached.program.reflection,
-                    self._entry,
-                )
-            cached.native_generation = state._runtime_generation
+        elif not cached.dependency_hashes:
+            cached.dependency_hashes = self._dependency_hashes(frontend)
+        self._dispatch_cache[dispatch_key] = cached
+        self._load_native(cached, state, self._entry)
         return cached
 
     def _invoke_direct(
@@ -414,8 +501,7 @@ class Kernel:
                         native_values.append(struct.pack("<d", float(value)))
                     else:
                         native_values.append(struct.pack("<f", float(value)))
-            compiled.native.launch(*grid, native_values)
-            state._native_runtime.synchronize()
+            compiled.native.invoke(*grid, native_values)
             for name, value in zip(user_parameters, arguments, strict=True):
                 if name in compiled.writable_names and isinstance(value, (TensorStorage, TensorView)):
                     value._mark_device_dirty()

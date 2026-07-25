@@ -37,6 +37,7 @@ bool tensorRelativeBounds(const VernonTensorView &tensor, size_t &before, size_t
 size_t dataTypeSize(VernonDataType dtype) {
     switch (dtype) {
     case VERNON_DATA_BOOL:
+    case VERNON_DATA_U8:
         return 1;
     case VERNON_DATA_F16:
         return 2;

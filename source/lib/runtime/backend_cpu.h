@@ -1,10 +1,12 @@
 #ifndef VERNON_RUNTIME_BACKEND_CPU_H
 #define VERNON_RUNTIME_BACKEND_CPU_H
 
+#include "../platform/platform_library.h"
 #include "VernonRuntime.h"
+#include "VernonRuntimeCore.h"
+#include "VernonRuntimeProvider.h"
 #include "pipeline_bundle.h"
 #include "pipeline_metadata.h"
-#include "platform_library.h"
 #include "runtime_state.h"
 
 #include <string>
@@ -20,13 +22,34 @@ struct CpuKernelState {
     PlatformLibrary nativeLibrary;
 };
 
+struct CpuContextState {
+    VernonRuntimeDeviceProvider provider{};
+    std::string error;
+};
+
 struct CpuBufferState {
     std::vector<unsigned char> storage;
 };
 
 struct CpuPipelineState {
-    VernonLoadedKernel *kernel{};
+    VernonRuntimeCorePipeline *pipeline{};
+    VernonRuntimeCoreBindings *bindings{};
+    std::vector<VernonRuntimeProviderBindingLayoutEntry> layout;
+    std::vector<VernonRuntimeProviderBindingValue> values;
+    uint32_t workgroup[3]{1, 1, 1};
 };
+
+struct CpuProviderShaderPayload {
+    CpuKernelState *kernel{};
+    ReflectedEntry *reflection{};
+};
+
+bool initializeCpuContext(VernonRuntimeContext &context, uint32_t deviceIndex);
+const VernonRuntimeDeviceProvider *cpuProvider(VernonRuntimeContext &context);
+uint64_t cpuProviderResourceIdentity(const VernonRuntimeContext &context);
+VernonStringView cpuProviderLastError(const VernonRuntimeContext &context);
+bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState kernel, ReflectedEntry reflection,
+                               CpuPipelineState &state);
 
 inline CpuBufferState &cpuBufferState(VernonDeviceBuffer &buffer) {
     return runtimeBackendState<CpuBufferState>(buffer);
@@ -47,10 +70,6 @@ bool loadCpuNativeArtifact(const CpuNativeArtifact &artifact, CpuKernelState &st
 bool createCpuBuffer(VernonDeviceBuffer &buffer);
 VernonStatus copyToCpuBuffer(VernonDeviceBuffer &buffer, size_t offset, const void *source, size_t size);
 VernonStatus copyFromCpuBuffer(const VernonDeviceBuffer &buffer, size_t offset, void *destination, size_t size);
-
-VernonStatus launchCpuKernel(VernonRuntimeContext &context, const CpuKernelState &state, const ReflectedEntry &metadata,
-                             VernonLaunchSize globalSize, const VernonLaunchArgument *arguments, size_t argumentCount,
-                             std::string &error);
 
 } // namespace vernon::runtime
 

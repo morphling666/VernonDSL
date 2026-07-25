@@ -15,6 +15,17 @@ file(
 file(SIZE "${ARTIFACT}" ARTIFACT_SIZE)
 file(SHA256 "${ARTIFACT}" ARTIFACT_SHA256)
 
+if(OPERATING_SYSTEM STREQUAL "windows")
+    set(TARGET_TRIPLE "${ARCHITECTURE}-pc-windows-msvc")
+    set(OBJECT_FORMAT "coff")
+elseif(OPERATING_SYSTEM STREQUAL "darwin")
+    set(TARGET_TRIPLE "${ARCHITECTURE}-apple-darwin")
+    set(OBJECT_FORMAT "macho")
+else()
+    set(TARGET_TRIPLE "${ARCHITECTURE}-unknown-linux-gnu")
+    set(OBJECT_FORMAT "elf")
+endif()
+
 file(
     WRITE "${OUTPUT}/compute.json"
     "{
@@ -56,7 +67,10 @@ file(
 ")
 
 set(PIPELINE_CANONICAL
-    "{\"features\":[],\"id\":\"cpu/fill\",\"invocation_abi_version\":3,\"schema_version\":2,\
+    "{\"features\":[],\"id\":\"cpu/fill\",\"invocation_abi_version\":3,\
+\"runtime_requirements\":{\"backend\":\"cpu\",\"features\":[\"compute\",\"tensor_views\"],\
+\"invocation_abi_version\":1,\"object_format\":\"${OBJECT_FORMAT}\",\"target_triple\":\"${TARGET_TRIPLE}\"},\
+\"schema_version\":2,\
 \"stage_artifacts\":{\"fill\":{\"architecture\":\"${ARCHITECTURE}\",\
 \"artifact\":{\"format\":\"native_library\",\"path\":\"${ARTIFACT_NAME}\",\
 \"sha256\":\"${ARTIFACT_SHA256}\",\"size\":${ARTIFACT_SIZE},\"storage\":\"external\"},\

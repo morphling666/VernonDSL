@@ -104,6 +104,8 @@ std::optional<VernonDataType> pipelineDataType(const std::string &dtype) {
         return VERNON_DATA_F32;
     if (dtype == "f64")
         return VERNON_DATA_F64;
+    if (dtype == "u8")
+        return VERNON_DATA_U8;
     return std::nullopt;
 }
 

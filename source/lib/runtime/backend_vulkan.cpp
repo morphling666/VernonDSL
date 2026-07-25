@@ -1,5 +1,6 @@
 #include "backend_vulkan.h"
 
+#include "rhi_adapter/adapter_internal.h"
 #include "runtime_state.h"
 
 #include <nlohmann/json.hpp>
@@ -8,7 +9,6 @@
 #include <cstring>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -22,23 +22,6 @@ VernonStatus vkFail(VernonRuntimeContext &context, VkResult result, const char *
         return VERNON_STATUS_OK;
     context.error = std::string(operation) + " failed with VkResult " + std::to_string(result);
     return VERNON_STATUS_INTERNAL_ERROR;
-}
-
-bool vkSucceeded(VkResult result, const char *operation, std::string &error) {
-    if (result == VK_SUCCESS)
-        return true;
-    error = std::string(operation) + " failed with Vulkan error " + std::to_string(static_cast<int>(result));
-    return false;
-}
-
-std::optional<uint32_t> findMemoryType(const VernonRuntimeContext &context, uint32_t typeBits,
-                                       VkMemoryPropertyFlags required) {
-    const VulkanContextState &state = vulkanState(context);
-    for (uint32_t index = 0; index < state.memoryProperties.memoryTypeCount; ++index)
-        if ((typeBits & (uint32_t{1} << index)) &&
-            (state.memoryProperties.memoryTypes[index].propertyFlags & required) == required)
-            return index;
-    return std::nullopt;
 }
 
 std::optional<VkFormat> textureFormat(VernonTextureFormat format) {
@@ -112,36 +95,11 @@ template <typename Record> bool submitCommands(VernonRuntimeContext &context, Re
 } // namespace
 
 bool beginVulkanCommands(VernonRuntimeContext &context, VkCommandBuffer &command, std::string &error) {
-    VulkanDriver &driver = vulkanDriver();
-    VulkanContextState &state = vulkanState(context);
-    VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    allocation.commandPool = state.commandPool;
-    allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocation.commandBufferCount = 1;
-    if (!vkSucceeded(driver.allocateCommandBuffers(state.device, &allocation, &command), "vkAllocateCommandBuffers",
-                     error))
-        return false;
-    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkSucceeded(driver.beginCommandBuffer(command, &begin), "vkBeginCommandBuffer", error))
-        return true;
-    driver.freeCommandBuffers(state.device, state.commandPool, 1, &command);
-    command = VK_NULL_HANDLE;
-    return false;
+    return vulkanState(context).beginCommands(command, error);
 }
 
 bool submitVulkanCommands(VernonRuntimeContext &context, VkCommandBuffer command, std::string &error) {
-    VulkanDriver &driver = vulkanDriver();
-    VulkanContextState &state = vulkanState(context);
-    const bool recorded = vkSucceeded(driver.endCommandBuffer(command), "vkEndCommandBuffer", error);
-    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &command;
-    const bool submitted =
-        recorded && vkSucceeded(driver.queueSubmit(state.queue, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit", error) &&
-        vkSucceeded(driver.queueWaitIdle(state.queue), "vkQueueWaitIdle", error);
-    driver.freeCommandBuffers(state.device, state.commandPool, 1, &command);
-    return submitted;
+    return vulkanState(context).submitCommands(command, error);
 }
 
 void transitionVulkanImageLayout(VkCommandBuffer command, VernonDeviceTexture &texture, VkImageLayout newLayout) {
@@ -186,7 +144,8 @@ void transitionVulkanImageLayout(VkCommandBuffer command, VernonDeviceTexture &t
         barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         destinationStage = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     }
-    vulkanDriver().cmdPipelineBarrier(command, sourceStage, destinationStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    rhi::vulkan::driver().cmdPipelineBarrier(command, sourceStage, destinationStage, 0, 0, nullptr, 0, nullptr, 1,
+                                             &barrier);
     state.layout = newLayout;
 }
 
@@ -197,102 +156,19 @@ namespace {
 
 bool initializeVulkanContext(VernonRuntimeContext &context, uint32_t deviceIndex) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-    // VulkanDriver owns one mutable dispatch table. Initialization is rare and
-    // must not race while instance/device function pointers are replaced.
-    static std::mutex initializationMutex;
-    std::lock_guard<std::mutex> guard(initializationMutex);
-    VulkanDriver &driver = vulkanDriver();
-    if (!driver.load()) {
-        context.error = driver.error;
-        return false;
-    }
     installRuntimeBackendState(context, new VulkanContextState());
     VulkanContextState &state = vulkanState(context);
-    const auto failInitialization = [&]() {
-        const std::string diagnostic = context.error;
-        destroyVulkanContext(context);
+    if (!state.initialize(deviceIndex, context.error)) {
         destroyRuntimeBackendState(context);
-        context.error = diagnostic;
         return false;
-    };
-    VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-    application.pApplicationName = "VernonRuntime";
-    application.applicationVersion = VK_MAKE_API_VERSION(0, 0, 1, 0);
-    application.pEngineName = "VernonRuntime";
-    application.engineVersion = VK_MAKE_API_VERSION(0, 0, 1, 0);
-    application.apiVersion = VK_API_VERSION_1_1;
-    VkInstanceCreateInfo instanceInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
-    instanceInfo.pApplicationInfo = &application;
-    if (vkFail(context, driver.createInstance(&instanceInfo, nullptr, &state.instance), "vkCreateInstance") !=
-        VERNON_STATUS_OK)
-        return failInitialization();
-    if (!driver.loadInstance(state.instance)) {
-        context.error = driver.error;
-        return failInitialization();
     }
-    uint32_t deviceCount = 0;
-    if (driver.enumeratePhysicalDevices(state.instance, &deviceCount, nullptr) != VK_SUCCESS ||
-        deviceIndex >= deviceCount) {
-        context.error = "Vulkan device index is unavailable";
-        return failInitialization();
+    state.adapter = createBorrowedVulkanRhiAdapter(state);
+    if (!state.adapter) {
+        context.error = "failed to create borrowed Vulkan RHI adapter";
+        state.shutdown();
+        destroyRuntimeBackendState(context);
+        return false;
     }
-    std::vector<VkPhysicalDevice> devices(deviceCount);
-    if (driver.enumeratePhysicalDevices(state.instance, &deviceCount, devices.data()) != VK_SUCCESS)
-        return failInitialization();
-    state.physicalDevice = devices[deviceIndex];
-    VkPhysicalDeviceProperties properties{};
-    driver.getPhysicalDeviceProperties(state.physicalDevice, &properties);
-    state.maxPushConstantsSize = properties.limits.maxPushConstantsSize;
-    state.apiVersion = properties.apiVersion;
-    state.maxComputeWorkGroupInvocations = properties.limits.maxComputeWorkGroupInvocations;
-    for (size_t index = 0; index < 3; ++index)
-        state.maxComputeWorkGroupSize[index] = properties.limits.maxComputeWorkGroupSize[index];
-    uint32_t queueCount = 0;
-    driver.getPhysicalDeviceQueueFamilyProperties(state.physicalDevice, &queueCount, nullptr);
-    std::vector<VkQueueFamilyProperties> queues(queueCount);
-    driver.getPhysicalDeviceQueueFamilyProperties(state.physicalDevice, &queueCount, queues.data());
-    const auto queue = std::find_if(queues.begin(), queues.end(), [](const VkQueueFamilyProperties &family) {
-        return family.queueFlags & VK_QUEUE_COMPUTE_BIT;
-    });
-    if (queue == queues.end()) {
-        context.error = "Vulkan device has no compute queue";
-        return failInitialization();
-    }
-    state.queueFamily = static_cast<uint32_t>(std::distance(queues.begin(), queue));
-    float priority = 1.0f;
-    VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-    queueInfo.queueFamilyIndex = state.queueFamily;
-    queueInfo.queueCount = 1;
-    queueInfo.pQueuePriorities = &priority;
-    VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    deviceInfo.queueCreateInfoCount = 1;
-    deviceInfo.pQueueCreateInfos = &queueInfo;
-    if (vkFail(context, driver.createDevice(state.physicalDevice, &deviceInfo, nullptr, &state.device),
-               "vkCreateDevice") != VERNON_STATUS_OK)
-        return failInitialization();
-    if (!driver.loadDevice(state.device)) {
-        context.error = driver.error;
-        return failInitialization();
-    }
-    driver.getDeviceQueue(state.device, state.queueFamily, 0, &state.queue);
-    driver.getPhysicalDeviceMemoryProperties(state.physicalDevice, &state.memoryProperties);
-    VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    poolInfo.queueFamilyIndex = state.queueFamily;
-    if (vkFail(context, driver.createCommandPool(state.device, &poolInfo, nullptr, &state.commandPool),
-               "vkCreateCommandPool") != VERNON_STATUS_OK)
-        return failInitialization();
-    VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    samplerInfo.magFilter = VK_FILTER_LINEAR;
-    samplerInfo.minFilter = VK_FILTER_LINEAR;
-    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    if (vkFail(context, driver.createSampler(state.device, &samplerInfo, nullptr, &state.defaultImplicitSampler),
-               "vkCreateSampler") != VERNON_STATUS_OK)
-        return failInitialization();
-    ++state.defaultImplicitSamplerCreations;
     return true;
 #else
     (void)context;
@@ -303,36 +179,10 @@ bool initializeVulkanContext(VernonRuntimeContext &context, uint32_t deviceIndex
 
 void destroyVulkanContext(VernonRuntimeContext &context) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-    VulkanDriver &driver = vulkanDriver();
     VulkanContextState &state = vulkanState(context);
-    if (state.device) {
-        if (driver.deviceWaitIdle)
-            driver.deviceWaitIdle(state.device);
-        if (state.defaultImplicitSampler && driver.destroySampler)
-            driver.destroySampler(state.device, state.defaultImplicitSampler, nullptr);
-        if (state.commandPool && driver.destroyCommandPool)
-            driver.destroyCommandPool(state.device, state.commandPool, nullptr);
-        PFN_vkDestroyDevice destroyDevice = driver.destroyDevice;
-        if (!destroyDevice && driver.getDeviceProcAddr)
-            destroyDevice =
-                reinterpret_cast<PFN_vkDestroyDevice>(driver.getDeviceProcAddr(state.device, "vkDestroyDevice"));
-        if (destroyDevice)
-            destroyDevice(state.device, nullptr);
-    }
-    if (state.instance) {
-        PFN_vkDestroyInstance destroyInstance = driver.destroyInstance;
-        if (!destroyInstance && driver.getInstanceProcAddr)
-            destroyInstance = reinterpret_cast<PFN_vkDestroyInstance>(
-                driver.getInstanceProcAddr(state.instance, "vkDestroyInstance"));
-        if (destroyInstance)
-            destroyInstance(state.instance, nullptr);
-    }
-    state.commandPool = VK_NULL_HANDLE;
-    state.defaultImplicitSampler = VK_NULL_HANDLE;
-    state.queue = VK_NULL_HANDLE;
-    state.device = VK_NULL_HANDLE;
-    state.physicalDevice = VK_NULL_HANDLE;
-    state.instance = VK_NULL_HANDLE;
+    vernonRuntimeRhiAdapterDestroy(state.adapter);
+    state.adapter = nullptr;
+    state.shutdown();
 #else
     (void)context;
 #endif
@@ -366,131 +216,36 @@ bool probeVulkan(std::string &diagnostic) {
 
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
 bool createVulkanBuffer(VernonRuntimeContext &context, VkDeviceSize size, VkBuffer &buffer, VkDeviceMemory &memory) {
-    VulkanDriver &driver = vulkanDriver();
-    VulkanContextState &state = vulkanState(context);
-    VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bufferInfo.size = size;
-    bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                       VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                       VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkFail(context, driver.createBuffer(state.device, &bufferInfo, nullptr, &buffer), "vkCreateBuffer") !=
-        VERNON_STATUS_OK)
+    VulkanBufferState state;
+    if (!vulkanState(context).createBuffer(
+            state, size,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, context.error))
         return false;
-    VkMemoryRequirements requirements{};
-    driver.getBufferMemoryRequirements(state.device, buffer, &requirements);
-    const auto memoryType = findMemoryType(context, requirements.memoryTypeBits,
-                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (!memoryType) {
-        driver.destroyBuffer(state.device, buffer, nullptr);
-        buffer = VK_NULL_HANDLE;
-        context.error = "Vulkan device has no host-visible coherent memory type";
-        return false;
-    }
-    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    allocation.allocationSize = requirements.size;
-    allocation.memoryTypeIndex = *memoryType;
-    if (vkFail(context, driver.allocateMemory(state.device, &allocation, nullptr, &memory), "vkAllocateMemory") !=
-        VERNON_STATUS_OK) {
-        driver.destroyBuffer(state.device, buffer, nullptr);
-        buffer = VK_NULL_HANDLE;
-        return false;
-    }
-    if (vkFail(context, driver.bindBufferMemory(state.device, buffer, memory, 0), "vkBindBufferMemory") ==
-        VERNON_STATUS_OK)
-        return true;
-    driver.freeMemory(state.device, memory, nullptr);
-    driver.destroyBuffer(state.device, buffer, nullptr);
-    memory = VK_NULL_HANDLE;
+    buffer = state.buffer;
+    memory = state.memory;
+    return true;
+}
+
+void destroyVulkanBuffer(VernonRuntimeContext &context, VkBuffer &buffer, VkDeviceMemory &memory) {
+    VulkanBufferState state{buffer, memory};
+    vulkanState(context).destroyBuffer(state);
     buffer = VK_NULL_HANDLE;
-    return false;
+    memory = VK_NULL_HANDLE;
 }
 
-bool createVulkanShaderModule(VernonRuntimeContext &context, const void *data, size_t size, VkShaderModule &module,
-                              uint32_t pushConstantBaseOffset) {
-    if (!data || !size || size % sizeof(uint32_t) != 0) {
-        context.error = "Vulkan shader artifact is not aligned SPIR-V";
-        return false;
-    }
-    std::vector<uint32_t> alignedData;
-    const uint32_t *spirv = static_cast<const uint32_t *>(data);
-    if (pushConstantBaseOffset || reinterpret_cast<uintptr_t>(data) % alignof(uint32_t) != 0) {
-        alignedData.resize(size / sizeof(uint32_t));
-        std::memcpy(alignedData.data(), data, size);
-        spirv = alignedData.data();
-    }
-    if (pushConstantBaseOffset) {
-        constexpr uint32_t spirvMagic = 0x07230203;
-        constexpr uint16_t opTypePointer = 32;
-        constexpr uint16_t opVariable = 59;
-        constexpr uint16_t opMemberDecorate = 72;
-        constexpr uint32_t storageClassPushConstant = 9;
-        constexpr uint32_t decorationOffset = 35;
-        if (alignedData.size() < 5 || alignedData[0] != spirvMagic) {
-            context.error = "Vulkan shader artifact has an invalid SPIR-V header";
-            return false;
-        }
-        uint32_t pushConstantStruct = 0;
-        std::vector<std::pair<uint32_t, uint32_t>> pushConstantPointers;
-        for (size_t index = 5; index < alignedData.size();) {
-            const uint32_t instruction = alignedData[index];
-            const uint16_t wordCount = static_cast<uint16_t>(instruction >> 16);
-            const uint16_t opcode = static_cast<uint16_t>(instruction);
-            if (!wordCount || wordCount > alignedData.size() - index) {
-                context.error = "Vulkan shader artifact has malformed SPIR-V";
-                return false;
-            }
-            if (opcode == opTypePointer && wordCount == 4 && alignedData[index + 2] == storageClassPushConstant)
-                pushConstantPointers.emplace_back(alignedData[index + 1], alignedData[index + 3]);
-            else if (opcode == opVariable && wordCount >= 4 && alignedData[index + 3] == storageClassPushConstant) {
-                const uint32_t pointerType = alignedData[index + 1];
-                const auto pointer = std::find_if(pushConstantPointers.begin(), pushConstantPointers.end(),
-                                                  [=](const auto &entry) { return entry.first == pointerType; });
-                if (pointer != pushConstantPointers.end())
-                    pushConstantStruct = pointer->second;
-            }
-            index += wordCount;
-        }
-        bool relocated = false;
-        for (size_t index = 5; index < alignedData.size();) {
-            const uint32_t instruction = alignedData[index];
-            const uint16_t wordCount = static_cast<uint16_t>(instruction >> 16);
-            const uint16_t opcode = static_cast<uint16_t>(instruction);
-            if (opcode == opMemberDecorate && wordCount >= 5 && alignedData[index + 1] == pushConstantStruct &&
-                alignedData[index + 3] == decorationOffset) {
-                if (alignedData[index + 4] > std::numeric_limits<uint32_t>::max() - pushConstantBaseOffset) {
-                    context.error = "Vulkan push-constant offset overflows uint32";
-                    return false;
-                }
-                alignedData[index + 4] += pushConstantBaseOffset;
-                relocated = true;
-            }
-            index += wordCount;
-        }
-        if (!pushConstantStruct || !relocated) {
-            context.error = "Vulkan shader push-constant block could not be relocated";
-            return false;
-        }
-    }
-    VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    info.codeSize = size;
-    info.pCode = spirv;
-    return vkFail(context, vulkanDriver().createShaderModule(vulkanState(context).device, &info, nullptr, &module),
-                  "vkCreateShaderModule") == VERNON_STATUS_OK;
-}
-
-void destroyVulkanShaderModule(VernonRuntimeContext &context, VkShaderModule &module) {
-    if (!module)
-        return;
-    vulkanDriver().destroyShaderModule(vulkanState(context).device, module, nullptr);
-    module = VK_NULL_HANDLE;
-}
 #endif
 
 bool createVulkanBuffer(VernonDeviceBuffer &buffer) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     auto *state = new VulkanBufferState();
-    if (!createVulkanBuffer(*buffer.context, buffer.size, state->buffer, state->memory)) {
+    if (!vulkanState(*buffer.context)
+             .createBuffer(*state, buffer.size,
+                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                               VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, buffer.context->error)) {
         delete state;
         return false;
     }
@@ -504,15 +259,7 @@ bool createVulkanBuffer(VernonDeviceBuffer &buffer) {
 
 void destroyVulkanBuffer(VernonDeviceBuffer &buffer) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-    VulkanDriver &driver = vulkanDriver();
-    VulkanContextState &state = vulkanState(*buffer.context);
-    VulkanBufferState &bufferState = vulkanBufferState(buffer);
-    if (bufferState.buffer)
-        driver.destroyBuffer(state.device, bufferState.buffer, nullptr);
-    if (bufferState.memory)
-        driver.freeMemory(state.device, bufferState.memory, nullptr);
-    bufferState.buffer = VK_NULL_HANDLE;
-    bufferState.memory = VK_NULL_HANDLE;
+    vulkanState(*buffer.context).destroyBuffer(vulkanBufferState(buffer));
 #else
     (void)buffer;
 #endif
@@ -524,16 +271,32 @@ VernonStatus copyToVulkanBuffer(VernonDeviceBuffer &buffer, size_t offset, const
         buffer.context->error = "invalid compute buffer upload";
         return VERNON_STATUS_INVALID_ARGUMENT;
     }
-    void *mapped = nullptr;
-    VulkanDriver &driver = vulkanDriver();
+    rhi::vulkan::Driver &driver = rhi::vulkan::driver();
     VulkanContextState &state = vulkanState(*buffer.context);
     VulkanBufferState &bufferState = vulkanBufferState(buffer);
-    if (vkFail(*buffer.context, driver.mapMemory(state.device, bufferState.memory, offset, size, 0, &mapped),
-               "vkMapMemory") != VERNON_STATUS_OK)
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceSize stagingOffset = 0;
+    uint8_t *mapped = nullptr;
+    if (!state.acquireStaging(true, size, 16, staging, stagingOffset, mapped, buffer.context->error))
         return VERNON_STATUS_INTERNAL_ERROR;
     std::memcpy(mapped, source, size);
-    driver.unmapMemory(state.device, bufferState.memory);
-    return VERNON_STATUS_OK;
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    if (!state.beginCommands(command, buffer.context->error))
+        return VERNON_STATUS_INTERNAL_ERROR;
+    const VkBufferCopy copy{stagingOffset, offset, size};
+    driver.cmdCopyBuffer(command, staging, bufferState.buffer, 1, &copy);
+    VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                            VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = bufferState.buffer;
+    barrier.offset = offset;
+    barrier.size = size;
+    driver.cmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
+                              nullptr, 1, &barrier, 0, nullptr);
+    return state.submitCommands(command, buffer.context->error) ? VERNON_STATUS_OK : VERNON_STATUS_INTERNAL_ERROR;
 #else
     (void)buffer;
     (void)offset;
@@ -549,15 +312,38 @@ VernonStatus copyFromVulkanBuffer(const VernonDeviceBuffer &buffer, size_t offse
         buffer.context->error = "invalid compute buffer readback";
         return VERNON_STATUS_INVALID_ARGUMENT;
     }
-    void *mapped = nullptr;
-    VulkanDriver &driver = vulkanDriver();
+    rhi::vulkan::Driver &driver = rhi::vulkan::driver();
     VulkanContextState &state = vulkanState(*buffer.context);
     const VulkanBufferState &bufferState = vulkanBufferState(buffer);
-    if (vkFail(*buffer.context, driver.mapMemory(state.device, bufferState.memory, offset, size, 0, &mapped),
-               "vkMapMemory") != VERNON_STATUS_OK)
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceSize stagingOffset = 0;
+    uint8_t *mapped = nullptr;
+    if (!state.acquireStaging(false, size, 16, staging, stagingOffset, mapped, buffer.context->error))
+        return VERNON_STATUS_INTERNAL_ERROR;
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    if (!state.beginCommands(command, buffer.context->error))
+        return VERNON_STATUS_INTERNAL_ERROR;
+    VkBufferMemoryBarrier before{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    before.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    before.buffer = bufferState.buffer;
+    before.offset = offset;
+    before.size = size;
+    driver.cmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                              nullptr, 1, &before, 0, nullptr);
+    const VkBufferCopy copy{offset, stagingOffset, size};
+    driver.cmdCopyBuffer(command, bufferState.buffer, staging, 1, &copy);
+    VkBufferMemoryBarrier after = before;
+    after.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    after.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
+                          VK_ACCESS_INDEX_READ_BIT;
+    driver.cmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
+                              nullptr, 1, &after, 0, nullptr);
+    if (!state.submitCommands(command, buffer.context->error))
         return VERNON_STATUS_INTERNAL_ERROR;
     std::memcpy(destination, mapped, size);
-    driver.unmapMemory(state.device, bufferState.memory);
     return VERNON_STATUS_OK;
 #else
     (void)buffer;
@@ -586,7 +372,7 @@ bool createVulkanTexture(VernonDeviceTexture &texture) {
         context.error = "sampled texture mip count exceeds its extent";
         return false;
     }
-    VulkanDriver &driver = vulkanDriver();
+    rhi::vulkan::Driver &driver = rhi::vulkan::driver();
     VulkanContextState &contextState = vulkanState(context);
     VkFormatProperties properties{};
     driver.getPhysicalDeviceFormatProperties(contextState.physicalDevice, *format, &properties);
@@ -613,33 +399,7 @@ bool createVulkanTexture(VernonDeviceTexture &texture) {
         imageInfo.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (vkFail(context, driver.createImage(contextState.device, &imageInfo, nullptr, &textureState->image),
-               "vkCreateImage") != VERNON_STATUS_OK) {
-        destroyRuntimeBackendState(texture);
-        return false;
-    }
-    VkMemoryRequirements requirements{};
-    driver.getImageMemoryRequirements(contextState.device, textureState->image, &requirements);
-    const auto memoryType = findMemoryType(context, requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (!memoryType) {
-        context.error = "Vulkan device has no device-local image memory";
-        destroyVulkanTexture(texture);
-        destroyRuntimeBackendState(texture);
-        return false;
-    }
-    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    allocation.allocationSize = requirements.size;
-    allocation.memoryTypeIndex = *memoryType;
-    if (vkFail(context, driver.allocateMemory(contextState.device, &allocation, nullptr, &textureState->memory),
-               "vkAllocateMemory") != VERNON_STATUS_OK ||
-        vkFail(context, driver.bindImageMemory(contextState.device, textureState->image, textureState->memory, 0),
-               "vkBindImageMemory") != VERNON_STATUS_OK) {
-        destroyVulkanTexture(texture);
-        destroyRuntimeBackendState(texture);
-        return false;
-    }
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    viewInfo.image = textureState->image;
     viewInfo.viewType = texture.dimension == VERNON_TEXTURE_3D     ? VK_IMAGE_VIEW_TYPE_3D
                         : texture.dimension == VERNON_TEXTURE_CUBE ? VK_IMAGE_VIEW_TYPE_CUBE
                                                                    : VK_IMAGE_VIEW_TYPE_2D;
@@ -647,9 +407,8 @@ bool createVulkanTexture(VernonDeviceTexture &texture) {
     viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     viewInfo.subresourceRange.levelCount = texture.mipLevels;
     viewInfo.subresourceRange.layerCount = texture.dimension == VERNON_TEXTURE_CUBE ? 6 : 1;
-    if (vkFail(context, driver.createImageView(contextState.device, &viewInfo, nullptr, &textureState->view),
-               "vkCreateImageView") != VERNON_STATUS_OK) {
-        destroyVulkanTexture(texture);
+    if (!contextState.createImage(*textureState, imageInfo, viewInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                  context.error)) {
         destroyRuntimeBackendState(texture);
         return false;
     }
@@ -662,19 +421,9 @@ bool createVulkanTexture(VernonDeviceTexture &texture) {
 
 void destroyVulkanTexture(VernonDeviceTexture &texture) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-    VulkanDriver &driver = vulkanDriver();
     VulkanContextState &contextState = vulkanState(*texture.context);
-    VulkanTextureState &state = vulkanTextureState(texture);
-    driver.deviceWaitIdle(contextState.device);
-    if (state.view)
-        driver.destroyImageView(contextState.device, state.view, nullptr);
-    if (state.image)
-        driver.destroyImage(contextState.device, state.image, nullptr);
-    if (state.memory)
-        driver.freeMemory(contextState.device, state.memory, nullptr);
-    state.view = VK_NULL_HANDLE;
-    state.image = VK_NULL_HANDLE;
-    state.memory = VK_NULL_HANDLE;
+    (void)contextState.synchronize(texture.context->error);
+    contextState.destroyImage(vulkanTextureState(texture));
 #else
     (void)texture;
 #endif
@@ -692,24 +441,18 @@ VernonStatus copyToVulkanTexture(VernonDeviceTexture &texture, const void *sourc
     }
     VernonRuntimeContext &context = *texture.context;
     VkBuffer staging = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    if (!createVulkanBuffer(context, size, staging, memory))
-        return VERNON_STATUS_INTERNAL_ERROR;
-    VulkanDriver &driver = vulkanDriver();
+    rhi::vulkan::Driver &driver = rhi::vulkan::driver();
     VulkanContextState &state = vulkanState(context);
     VulkanTextureState &textureState = vulkanTextureState(texture);
-    void *mapped = nullptr;
-    if (vkFail(context, driver.mapMemory(state.device, memory, 0, size, 0, &mapped), "vkMapMemory") !=
-        VERNON_STATUS_OK) {
-        driver.destroyBuffer(state.device, staging, nullptr);
-        driver.freeMemory(state.device, memory, nullptr);
+    VkDeviceSize stagingOffset = 0;
+    uint8_t *mapped = nullptr;
+    if (!state.acquireStaging(true, size, 16, staging, stagingOffset, mapped, context.error))
         return VERNON_STATUS_INTERNAL_ERROR;
-    }
     std::memcpy(mapped, source, size);
-    driver.unmapMemory(state.device, memory);
     const bool copied = submitCommands(context, [&](VkCommandBuffer command) {
         transitionVulkanImageLayout(command, texture, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkBufferImageCopy region{};
+        region.bufferOffset = stagingOffset;
         region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         region.imageSubresource.layerCount = layers;
         region.imageExtent = {texture.width, texture.height, 1};
@@ -717,8 +460,6 @@ VernonStatus copyToVulkanTexture(VernonDeviceTexture &texture, const void *sourc
                                     &region);
         transitionVulkanImageLayout(command, texture, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     });
-    driver.destroyBuffer(state.device, staging, nullptr);
-    driver.freeMemory(state.device, memory, nullptr);
     return copied ? VERNON_STATUS_OK : VERNON_STATUS_INTERNAL_ERROR;
 #else
     (void)texture;
@@ -739,18 +480,20 @@ VernonStatus copyFromVulkanTexture(const VernonDeviceTexture &texture, void *des
     auto &mutableTexture = const_cast<VernonDeviceTexture &>(texture);
     VernonRuntimeContext &context = *texture.context;
     VkBuffer staging = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    if (!createVulkanBuffer(context, size, staging, memory))
-        return VERNON_STATUS_INTERNAL_ERROR;
-    VulkanDriver &driver = vulkanDriver();
+    rhi::vulkan::Driver &driver = rhi::vulkan::driver();
     VulkanContextState &state = vulkanState(context);
     VulkanTextureState &textureState = vulkanTextureState(mutableTexture);
+    VkDeviceSize stagingOffset = 0;
+    uint8_t *mapped = nullptr;
+    if (!state.acquireStaging(false, size, 16, staging, stagingOffset, mapped, context.error))
+        return VERNON_STATUS_INTERNAL_ERROR;
     const VkImageLayout restoreLayout = textureState.layout == VK_IMAGE_LAYOUT_UNDEFINED
                                             ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                                             : textureState.layout;
     const bool copied = submitCommands(context, [&](VkCommandBuffer command) {
         transitionVulkanImageLayout(command, mutableTexture, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         VkBufferImageCopy region{};
+        region.bufferOffset = stagingOffset;
         region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         region.imageSubresource.layerCount = 1;
         region.imageExtent = {texture.width, texture.height, 1};
@@ -758,20 +501,8 @@ VernonStatus copyFromVulkanTexture(const VernonDeviceTexture &texture, void *des
                                     &region);
         transitionVulkanImageLayout(command, mutableTexture, restoreLayout);
     });
-    if (copied) {
-        void *mapped = nullptr;
-        if (vkFail(context, driver.mapMemory(state.device, memory, 0, size, 0, &mapped), "vkMapMemory") ==
-            VERNON_STATUS_OK) {
-            std::memcpy(destination, mapped, size);
-            driver.unmapMemory(state.device, memory);
-        } else {
-            driver.destroyBuffer(state.device, staging, nullptr);
-            driver.freeMemory(state.device, memory, nullptr);
-            return VERNON_STATUS_INTERNAL_ERROR;
-        }
-    }
-    driver.destroyBuffer(state.device, staging, nullptr);
-    driver.freeMemory(state.device, memory, nullptr);
+    if (copied)
+        std::memcpy(destination, mapped, size);
     return copied ? VERNON_STATUS_OK : VERNON_STATUS_INTERNAL_ERROR;
 #else
     (void)texture;
@@ -805,10 +536,7 @@ bool createVulkanSampler(VernonDeviceSampler &sampler) {
     createInfo.maxLod = VK_LOD_CLAMP_NONE;
     createInfo.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     auto *state = new VulkanSamplerState();
-    if (vkFail(
-            *sampler.context,
-            vulkanDriver().createSampler(vulkanState(*sampler.context).device, &createInfo, nullptr, &state->sampler),
-            "vkCreateSampler") != VERNON_STATUS_OK) {
+    if (!vulkanState(*sampler.context).createSampler(*state, createInfo, sampler.context->error)) {
         delete state;
         return false;
     }
@@ -825,281 +553,17 @@ void destroyVulkanSampler(VernonDeviceSampler &sampler) {
     VulkanSamplerState &samplerState = vulkanSamplerState(sampler);
     if (!samplerState.sampler)
         return;
-    VulkanDriver &driver = vulkanDriver();
     VulkanContextState &state = vulkanState(*sampler.context);
-    driver.deviceWaitIdle(state.device);
-    driver.destroySampler(state.device, samplerState.sampler, nullptr);
-    samplerState.sampler = VK_NULL_HANDLE;
+    (void)state.synchronize(sampler.context->error);
+    state.destroySampler(samplerState);
 #else
     (void)sampler;
 #endif
 }
 
-bool loadVulkanKernel(VernonRuntimeContext &context, const void *artifact, size_t artifactSize, const char *reflection,
-                      size_t reflectionSize, const char *entry, size_t entrySize, VulkanKernelState &state,
-                      ReflectedEntry &metadata) {
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-    if (artifactSize % sizeof(uint32_t) != 0) {
-        context.error = "Vulkan artifact is not aligned SPIR-V";
-        return false;
-    }
-    try {
-        const nlohmann::json parsed = nlohmann::json::parse(reflection, reflection + reflectionSize, nullptr, false);
-        const std::string entryName(entry, entrySize);
-        if (parsed.is_discarded() || !parseReflection(parsed, entryName, metadata, context.error))
-            return false;
-        VulkanDriver &driver = vulkanDriver();
-        if (!createVulkanShaderModule(context, artifact, artifactSize, state.shader))
-            return false;
-        VulkanContextState &contextState = vulkanState(context);
-        std::vector<VkDescriptorSetLayoutBinding> bindings;
-        size_t bindingCount = 0;
-        for (const ReflectedArgument &argument : metadata.arguments)
-            if (argument.kind != "builtin")
-                bindingCount += argument.kind == "tensor" ? std::max(argument.storageLeaves.size(), size_t{1}) : 1;
-        bindings.reserve(bindingCount);
-        uint32_t index = 0;
-        for (ReflectedArgument &argument : metadata.arguments) {
-            if (argument.kind == "builtin")
-                continue;
-            if (argument.descriptorSet != 0) {
-                context.error = "Vulkan compute supports descriptor set zero only";
-                destroyVulkanKernel(context, state);
-                return false;
-            }
-            if (argument.kind == "tensor" && !argument.storageLeaves.empty()) {
-                for (const ReflectedStorageLeaf &leaf : argument.storageLeaves)
-                    bindings.push_back(
-                        {leaf.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
-                index += argument.storageLeaves.size();
-            } else {
-                if (argument.binding == UINT32_MAX)
-                    argument.binding = index;
-                bindings.push_back(
-                    {argument.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
-                ++index;
-            }
-        }
-        VkDescriptorSetLayoutCreateInfo descriptorInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        descriptorInfo.bindingCount = static_cast<uint32_t>(bindings.size());
-        descriptorInfo.pBindings = bindings.data();
-        if (vkFail(context,
-                   driver.createDescriptorSetLayout(contextState.device, &descriptorInfo, nullptr,
-                                                    &state.descriptorSetLayout),
-                   "vkCreateDescriptorSetLayout") != VERNON_STATUS_OK) {
-            destroyVulkanKernel(context, state);
-            return false;
-        }
-        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layoutInfo.setLayoutCount = 1;
-        layoutInfo.pSetLayouts = &state.descriptorSetLayout;
-        if (vkFail(context,
-                   driver.createPipelineLayout(contextState.device, &layoutInfo, nullptr, &state.pipelineLayout),
-                   "vkCreatePipelineLayout") != VERNON_STATUS_OK) {
-            destroyVulkanKernel(context, state);
-            return false;
-        }
-        VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = state.shader;
-        stage.pName = entryName.c_str();
-        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        pipelineInfo.stage = stage;
-        pipelineInfo.layout = state.pipelineLayout;
-        if (vkFail(context,
-                   driver.createComputePipelines(contextState.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
-                                                 &state.pipeline),
-                   "vkCreateComputePipelines") != VERNON_STATUS_OK) {
-            destroyVulkanKernel(context, state);
-            return false;
-        }
-        return true;
-    } catch (const std::exception &exception) {
-        context.error = std::string("failed to load Vulkan artifact: ") + exception.what();
-        destroyVulkanKernel(context, state);
-        return false;
-    }
-#else
-    (void)context;
-    (void)artifact;
-    (void)artifactSize;
-    (void)reflection;
-    (void)reflectionSize;
-    (void)entry;
-    (void)entrySize;
-    (void)state;
-    (void)metadata;
-    return false;
-#endif
-}
-
-void destroyVulkanKernel(VernonRuntimeContext &context, VulkanKernelState &state) {
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-    VulkanDriver &driver = vulkanDriver();
-    VulkanContextState &contextState = vulkanState(context);
-    driver.deviceWaitIdle(contextState.device);
-    if (state.pipeline)
-        driver.destroyPipeline(contextState.device, state.pipeline, nullptr);
-    if (state.pipelineLayout)
-        driver.destroyPipelineLayout(contextState.device, state.pipelineLayout, nullptr);
-    if (state.descriptorSetLayout)
-        driver.destroyDescriptorSetLayout(contextState.device, state.descriptorSetLayout, nullptr);
-    if (state.shader)
-        driver.destroyShaderModule(contextState.device, state.shader, nullptr);
-    state = {};
-#else
-    (void)context;
-    (void)state;
-#endif
-}
-
-VernonStatus launchVulkanKernel(VernonRuntimeContext &context, const VulkanKernelState &state,
-                                const ReflectedEntry &metadata, VernonLaunchSize globalSize,
-                                const VernonLaunchArgument *arguments, size_t argumentCount) {
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-    if (argumentCount > UINT32_MAX) {
-        context.error = "Vulkan compute argument count exceeds API limits";
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    }
-    VulkanDriver &driver = vulkanDriver();
-    VulkanContextState &contextState = vulkanState(context);
-    VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
-    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-    std::vector<std::pair<VkBuffer, VkDeviceMemory>> scalarBuffers;
-    scalarBuffers.reserve(argumentCount);
-    const auto cleanup = [&] {
-        if (commandBuffer)
-            driver.freeCommandBuffers(contextState.device, contextState.commandPool, 1, &commandBuffer);
-        if (descriptorPool)
-            driver.destroyDescriptorPool(contextState.device, descriptorPool, nullptr);
-        for (const auto &[buffer, memory] : scalarBuffers) {
-            driver.destroyBuffer(contextState.device, buffer, nullptr);
-            driver.freeMemory(contextState.device, memory, nullptr);
-        }
-    };
-    size_t descriptorCount = 0;
-    for (const ReflectedArgument &reflected : metadata.arguments)
-        if (reflected.kind != "builtin")
-            descriptorCount +=
-                reflected.kind == "tensor" ? std::max(reflected.storageLeaves.size(), size_t{1}) : size_t{1};
-    VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, static_cast<uint32_t>(descriptorCount)};
-    VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    poolInfo.maxSets = 1;
-    poolInfo.poolSizeCount = descriptorCount ? 1u : 0u;
-    poolInfo.pPoolSizes = descriptorCount ? &poolSize : nullptr;
-    if (vkFail(context, driver.createDescriptorPool(contextState.device, &poolInfo, nullptr, &descriptorPool),
-               "vkCreateDescriptorPool") != VERNON_STATUS_OK)
-        return VERNON_STATUS_INTERNAL_ERROR;
-    VkDescriptorSetAllocateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    setInfo.descriptorPool = descriptorPool;
-    setInfo.descriptorSetCount = 1;
-    setInfo.pSetLayouts = &state.descriptorSetLayout;
-    VkDescriptorSet descriptorSet{};
-    if (vkFail(context, driver.allocateDescriptorSets(contextState.device, &setInfo, &descriptorSet),
-               "vkAllocateDescriptorSets") != VERNON_STATUS_OK) {
-        cleanup();
-        return VERNON_STATUS_INTERNAL_ERROR;
-    }
-    std::vector<VkDescriptorBufferInfo> bufferInfos;
-    std::vector<VkWriteDescriptorSet> writes;
-    bufferInfos.reserve(descriptorCount);
-    writes.reserve(descriptorCount);
-    size_t supplied = 0;
-    for (const ReflectedArgument &reflected : metadata.arguments) {
-        if (reflected.kind == "builtin")
-            continue;
-        const VernonLaunchArgument &argument = arguments[supplied++];
-        VkBuffer buffer = VK_NULL_HANDLE;
-        VkDeviceSize size = 0;
-        if (argument.kind == VERNON_LAUNCH_TENSOR) {
-            buffer = vulkanBufferState(*argument.buffer).buffer;
-            size = argument.buffer->size;
-        } else {
-            VkDeviceMemory memory = VK_NULL_HANDLE;
-            if (!createVulkanBuffer(context, argument.scalar_size, buffer, memory)) {
-                cleanup();
-                return VERNON_STATUS_INTERNAL_ERROR;
-            }
-            scalarBuffers.emplace_back(buffer, memory);
-            void *mapped = nullptr;
-            if (vkFail(context, driver.mapMemory(contextState.device, memory, 0, argument.scalar_size, 0, &mapped),
-                       "vkMapMemory") != VERNON_STATUS_OK) {
-                cleanup();
-                return VERNON_STATUS_INTERNAL_ERROR;
-            }
-            std::memcpy(mapped, argument.scalar_data, argument.scalar_size);
-            driver.unmapMemory(contextState.device, memory);
-            size = argument.scalar_size;
-        }
-        const size_t bindingCount =
-            reflected.kind == "tensor" ? std::max(reflected.storageLeaves.size(), size_t{1}) : size_t{1};
-        for (size_t bindingIndex = 0; bindingIndex < bindingCount; ++bindingIndex) {
-            bufferInfos.push_back({buffer, 0, size});
-            VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            write.dstSet = descriptorSet;
-            write.dstBinding =
-                reflected.storageLeaves.empty() ? reflected.binding : reflected.storageLeaves[bindingIndex].binding;
-            write.descriptorCount = 1;
-            write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            write.pBufferInfo = &bufferInfos.back();
-            writes.push_back(write);
-        }
-    }
-    driver.updateDescriptorSets(contextState.device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    VkCommandBufferAllocateInfo commandInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    commandInfo.commandPool = contextState.commandPool;
-    commandInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    commandInfo.commandBufferCount = 1;
-    if (vkFail(context, driver.allocateCommandBuffers(contextState.device, &commandInfo, &commandBuffer),
-               "vkAllocateCommandBuffers") != VERNON_STATUS_OK) {
-        cleanup();
-        return VERNON_STATUS_INTERNAL_ERROR;
-    }
-    VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkFail(context, driver.beginCommandBuffer(commandBuffer, &beginInfo), "vkBeginCommandBuffer") !=
-        VERNON_STATUS_OK) {
-        cleanup();
-        return VERNON_STATUS_INTERNAL_ERROR;
-    }
-    driver.cmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, state.pipeline);
-    driver.cmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, state.pipelineLayout, 0, 1,
-                                 &descriptorSet, 0, nullptr);
-    const uint32_t *workgroup = metadata.workgroup;
-    if (!workgroup[0] || !workgroup[1] || !workgroup[2]) {
-        context.error = "Vulkan workgroup dimensions must be positive";
-        cleanup();
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    }
-    driver.cmdDispatch(commandBuffer, (globalSize.x - 1) / workgroup[0] + 1, (globalSize.y - 1) / workgroup[1] + 1,
-                       (globalSize.z - 1) / workgroup[2] + 1);
-    if (vkFail(context, driver.endCommandBuffer(commandBuffer), "vkEndCommandBuffer") != VERNON_STATUS_OK) {
-        cleanup();
-        return VERNON_STATUS_INTERNAL_ERROR;
-    }
-    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &commandBuffer;
-    const bool submitted =
-        vkFail(context, driver.queueSubmit(contextState.queue, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit") ==
-            VERNON_STATUS_OK &&
-        vkFail(context, driver.queueWaitIdle(contextState.queue), "vkQueueWaitIdle") == VERNON_STATUS_OK;
-    cleanup();
-    return submitted ? VERNON_STATUS_OK : VERNON_STATUS_INTERNAL_ERROR;
-#else
-    (void)context;
-    (void)state;
-    (void)metadata;
-    (void)globalSize;
-    (void)arguments;
-    (void)argumentCount;
-    return VERNON_STATUS_UNSUPPORTED_TARGET;
-#endif
-}
-
 VernonStatus synchronizeVulkan(VernonRuntimeContext &context) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-    return vkFail(context, vulkanDriver().deviceWaitIdle(vulkanState(context).device), "vkDeviceWaitIdle");
+    return vulkanState(context).synchronize(context.error) ? VERNON_STATUS_OK : VERNON_STATUS_INTERNAL_ERROR;
 #else
     (void)context;
     return VERNON_STATUS_UNSUPPORTED_TARGET;

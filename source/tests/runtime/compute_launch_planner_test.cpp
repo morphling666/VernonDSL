@@ -14,10 +14,14 @@ TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
     Parameter contiguous;
     contiguous.slot = 0;
     contiguous.kind = "tensor";
+    contiguous.dtype = "f32";
+    contiguous.source = "direct";
     contiguous.uses.push_back({"compute", "buffer", "", "f32", {2}, 1, UINT32_MAX, 0, 0, 0, {}});
     Parameter strided;
     strided.slot = 1;
     strided.kind = "tensor";
+    strided.dtype = "f32";
+    strided.source = "direct";
     strided.uses.push_back({"compute", "buffer", "", "f32", {2}, 0, UINT32_MAX, 0, 0, 1, {}});
     variant.parameters = {contiguous, strided};
 
@@ -51,18 +55,19 @@ TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
                           stridedStride.data(),
                           0,
                           sizeof(stridedValues)};
-    const ComputeArgumentMap arguments{{0, &supplied[0]}, {1, &supplied[1]}};
     VernonPipelineInvocation invocation{};
+    invocation.arguments = supplied;
+    invocation.argument_count = 2;
     invocation.compute_grid = {4, 1, 1};
 
     PlannedComputeLaunch plan;
     std::string error;
-    ASSERT_TRUE(planComputeLaunch(variant, arguments, invocation, nullptr, {}, plan, error)) << error;
+    ASSERT_TRUE(planComputeInvocation(variant, invocation, nullptr, {}, plan, error)) << error;
     ASSERT_EQ(plan.arguments.size(), 2u);
     ASSERT_EQ(plan.hostTensorStorage.size(), 1u);
     const std::array<float, 2> expectedPacked{1, 2};
-    EXPECT_EQ(std::memcmp(plan.arguments[0].scalar_data, expectedPacked.data(), sizeof(expectedPacked)), 0);
-    EXPECT_EQ(plan.arguments[1].scalar_data, contiguousValues.data());
+    EXPECT_EQ(std::memcmp(plan.arguments[0].scalarData, expectedPacked.data(), sizeof(expectedPacked)), 0);
+    EXPECT_EQ(plan.arguments[1].scalarData, contiguousValues.data());
     EXPECT_EQ(plan.grid.x, 4u);
     EXPECT_EQ(plan.grid.y, 1u);
     EXPECT_EQ(plan.grid.z, 1u);
@@ -73,6 +78,8 @@ TEST(ComputeLaunchPlannerTest, AcceptsValidatedStridedDeviceTensorView) {
     Parameter parameter;
     parameter.slot = 0;
     parameter.kind = "tensor";
+    parameter.dtype = "f32";
+    parameter.source = "direct";
     parameter.uses.push_back({"compute", "buffer", "", "f32", {2, 3}, 0, UINT32_MAX, 0, 0, 0, {}});
     variant.parameters = {parameter};
 
@@ -92,8 +99,9 @@ TEST(ComputeLaunchPlannerTest, AcceptsValidatedStridedDeviceTensorView) {
                        strides.data(),
                        2 * sizeof(float),
                        12 * sizeof(float)};
-    const ComputeArgumentMap arguments{{0, &supplied}};
     VernonPipelineInvocation invocation{};
+    invocation.arguments = &supplied;
+    invocation.argument_count = 1;
     int context = 0;
     ComputePlannerCallbacks callbacks{
         &context,
@@ -102,7 +110,7 @@ TEST(ComputeLaunchPlannerTest, AcceptsValidatedStridedDeviceTensorView) {
 
     PlannedComputeLaunch plan;
     std::string error;
-    ASSERT_TRUE(planComputeLaunch(variant, arguments, invocation, &context, callbacks, plan, error)) << error;
+    ASSERT_TRUE(planComputeInvocation(variant, invocation, &context, callbacks, plan, error)) << error;
     ASSERT_EQ(plan.arguments.size(), 1u);
     EXPECT_EQ(plan.arguments[0].buffer, buffer);
     EXPECT_EQ(plan.grid.x, 3u);

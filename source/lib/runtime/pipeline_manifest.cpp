@@ -219,15 +219,16 @@ bool Variant::validate(std::string &error) const {
 
 bool parseRuntimeRequirements(const nlohmann::json &root, const std::string &target, RuntimeRequirements &requirements,
                               std::string &error) {
-    if (!root.contains("runtime_requirements"))
-        return true;
+    if (!root.contains("runtime_requirements")) {
+        error = "pipeline manifest requires runtime_requirements";
+        return false;
+    }
     const nlohmann::json &value = root["runtime_requirements"];
     if (!value.is_object() || !value.contains("backend") || !value["backend"].is_string() ||
         !value.contains("features") || !value["features"].is_array()) {
         error = "runtime_requirements must contain backend and features";
         return false;
     }
-    requirements.present = true;
     requirements.backend = value["backend"].get<std::string>();
     if (requirements.backend != target) {
         error = "runtime_requirements backend does not match pipeline target";

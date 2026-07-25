@@ -1,11 +1,11 @@
-#include "backend_opengl_driver.h"
+#include "opengl_driver.h"
 
-namespace vernon::runtime {
+namespace vernon::rhi::opengl {
 namespace {
 
 template <typename Function>
-bool loadProc(const VernonExternalOpenGLContext &external, Function &function, const char *name, std::string &error) {
-    function = reinterpret_cast<Function>(external.get_proc_address(external.user_data, name));
+bool loadProc(const VernonOpenGLContextCallbacks &callbacks, Function &function, const char *name, std::string &error) {
+    function = reinterpret_cast<Function>(callbacks.get_proc_address(callbacks.user_data, name));
     if (function)
         return true;
     error = std::string("external OpenGL context is missing ") + name;
@@ -14,9 +14,15 @@ bool loadProc(const VernonExternalOpenGLContext &external, Function &function, c
 
 } // namespace
 
-bool loadOpenGLDriver(const VernonExternalOpenGLContext &external, OpenGLDriver &driver, std::string &error) {
+bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, std::string &error) {
+    if (callbacks.struct_size < sizeof(VernonOpenGLContextCallbacks) || !callbacks.make_current ||
+        !callbacks.get_proc_address) {
+        error = "external OpenGL context callbacks are missing";
+        return false;
+    }
+    callbacks.make_current(callbacks.user_data);
 #define LOAD(member, name)                                                                                             \
-    if (!loadProc(external, driver.member, name, error))                                                               \
+    if (!loadProc(callbacks, driver.member, name, error))                                                              \
     return false
     LOAD(createShader, "glCreateShader");
     LOAD(shaderSource, "glShaderSource");
@@ -70,7 +76,11 @@ bool loadOpenGLDriver(const VernonExternalOpenGLContext &external, OpenGLDriver 
     LOAD(deleteTextures, "glDeleteTextures");
     LOAD(bindTexture, "glBindTexture");
     LOAD(texImage2D, "glTexImage2D");
+    LOAD(texImage3D, "glTexImage3D");
     LOAD(texSubImage2D, "glTexSubImage2D");
+    LOAD(texSubImage3D, "glTexSubImage3D");
+    LOAD(texParameteri, "glTexParameteri");
+    LOAD(generateMipmap, "glGenerateMipmap");
     LOAD(pixelStorei, "glPixelStorei");
     LOAD(readPixels, "glReadPixels");
     LOAD(genSamplers, "glGenSamplers");
@@ -80,10 +90,10 @@ bool loadOpenGLDriver(const VernonExternalOpenGLContext &external, OpenGLDriver 
     LOAD(finish, "glFinish");
 #undef LOAD
     driver.dispatchCompute = reinterpret_cast<decltype(driver.dispatchCompute)>(
-        external.get_proc_address(external.user_data, "glDispatchCompute"));
+        callbacks.get_proc_address(callbacks.user_data, "glDispatchCompute"));
     driver.memoryBarrier = reinterpret_cast<decltype(driver.memoryBarrier)>(
-        external.get_proc_address(external.user_data, "glMemoryBarrier"));
+        callbacks.get_proc_address(callbacks.user_data, "glMemoryBarrier"));
     return true;
 }
 
-} // namespace vernon::runtime
+} // namespace vernon::rhi::opengl

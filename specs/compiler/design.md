@@ -82,11 +82,11 @@ descriptor module. Cooking receives only the validated immutable descriptor,
 so parser diagnostics and variant canonicalization remain testable without a
 native compiler.
 
-Compute Kernel compilation and launch behavior lives in `_runtime.kernel`.
-Kernel code queries session-owned backend state at compile/launch time, while
-its semantic/artifact cache remains owned by the Kernel class. Reinitializing a
-session invalidates loaded native entries without discarding deterministic
-frontend and compiler results.
+Compute source compilation and invocation behavior lives in `_runtime.kernel`.
+The `Kernel` frontend decorator retains the semantic/artifact cache, but loaded
+native entries are `LoadedPipeline` objects and invoke the same compute pipeline
+ABI as PipelineAssets. Reinitializing a session invalidates loaded pipelines
+without discarding deterministic frontend and compiler results.
 Graphics Pipeline bundle compilation, binding, and invocation live in
 `_runtime.pipeline`; session now contains only backend/context lifecycle and
 generation state. The public Runtime and shader-asset modules are thin facades,

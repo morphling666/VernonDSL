@@ -1,65 +1,52 @@
 #ifndef VERNON_RUNTIME_BACKEND_DIRECTX12_H
 #define VERNON_RUNTIME_BACKEND_DIRECTX12_H
 
+#include "VernonRuntimeCore.h"
 #include "pipeline_metadata.h"
 #include "runtime_state.h"
 
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+#include "../rhi/directx12_backend.h"
 #include <d3d12.h>
-#include <dxgi1_6.h>
-#include <windows.h>
 #endif
 
 #include <string>
-#include <unordered_map>
 #include <vector>
+
+struct VernonRuntimeRhiAdapter;
 
 namespace vernon::runtime {
 
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-struct DirectX12ContextState {
-    IDXGIFactory6 *factory{};
-    IDXGIAdapter1 *adapter{};
-    ID3D12Device *device{};
-    ID3D12CommandQueue *queue{};
-    ID3D12CommandAllocator *allocator{};
-    ID3D12GraphicsCommandList *commands{};
-    ID3D12Fence *fence{};
-    HANDLE fenceEvent{};
-    uint64_t fenceValue{};
-    D3D_FEATURE_LEVEL featureLevel{D3D_FEATURE_LEVEL_11_0};
-    D3D_SHADER_MODEL shaderModel{D3D_SHADER_MODEL_6_0};
-    D3D_ROOT_SIGNATURE_VERSION rootSignatureVersion{D3D_ROOT_SIGNATURE_VERSION_1_0};
-    D3D12_RESOURCE_BINDING_TIER resourceBindingTier{D3D12_RESOURCE_BINDING_TIER_1};
-    uint32_t maxComputeWorkGroupSize[3]{1024, 1024, 64};
-    uint32_t maxComputeInvocations{1024};
+struct DirectX12ContextState : rhi::directx12::DeviceState {
+    VernonRuntimeRhiAdapter *adapter{};
 };
-
-struct DirectX12BufferState {
-    ID3D12Resource *resource{};
-    D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};
-};
-
-struct DirectX12TextureState {
-    ID3D12Resource *resource{};
-    DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
-    D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};
-};
-
-struct DirectX12SamplerState {};
-
-struct DirectX12KernelState {
-    ID3D12RootSignature *rootSignature{};
-    ID3D12PipelineState *pipeline{};
-    uint32_t descriptorCount{};
-};
+using DirectX12BufferState = rhi::directx12::Buffer;
+using DirectX12TextureState = rhi::directx12::Image;
+using DirectX12SamplerState = rhi::directx12::Sampler;
 
 struct DirectX12PipelineState {
-    VernonLoadedKernel *kernel{};
-    std::vector<uint8_t> vertexDxil;
-    std::vector<uint8_t> fragmentDxil;
-    std::unordered_map<std::string, ID3D12PipelineState *> graphicsPipelines;
-    size_t graphicsPipelineCreations{};
+    struct GraphicsBinding {
+        enum Source { EXTERNAL_VERTEX, EXTERNAL_TEXTURE, EXTERNAL_SAMPLER, IMPLICIT_SAMPLER };
+        Source source{};
+        uint32_t externalSlot{};
+    };
+
+    VernonRuntimeCorePipeline *rhiComputePipeline{};
+    VernonRuntimeCoreBindings *rhiComputeBindings{};
+    std::vector<VernonRuntimeProviderBindingLayoutEntry> rhiComputeLayout;
+    std::vector<VernonRuntimeProviderBindingValue> rhiComputeValues;
+    std::vector<uint64_t> rhiComputeResourceOffsets;
+    uint32_t rhiComputeWorkgroup[3]{1, 1, 1};
+    VernonRuntimeCorePipeline *rhiGraphicsPipeline{};
+    VernonRuntimeCoreBindings *rhiGraphicsBindings{};
+    VernonRuntimeCoreGraphicsVariant *rhiGraphicsVariant{};
+    std::vector<uint32_t> rhiGraphicsFormats;
+    uint64_t rhiGraphicsVertexLayoutIdentity{};
+    uint32_t rhiGraphicsTopology{};
+    std::vector<VernonRuntimeProviderBindingLayoutEntry> rhiGraphicsLayout;
+    std::vector<VernonRuntimeProviderBindingValue> rhiGraphicsValues;
+    std::vector<GraphicsBinding> rhiGraphicsBindingsPlan;
 };
 
 inline DirectX12ContextState &directX12State(VernonRuntimeContext &context) {
@@ -80,8 +67,6 @@ inline DirectX12TextureState &directX12TextureState(VernonDeviceTexture &texture
 inline const DirectX12TextureState &directX12TextureState(const VernonDeviceTexture &texture) {
     return runtimeBackendState<DirectX12TextureState>(texture);
 }
-#else
-struct DirectX12KernelState {};
 #endif
 
 bool probeDirectX12(std::string &diagnostic);
@@ -100,14 +85,6 @@ VernonStatus copyToDirectX12Texture(VernonDeviceTexture &texture, const void *so
 VernonStatus copyFromDirectX12Texture(const VernonDeviceTexture &texture, void *destination, size_t size);
 bool createDirectX12Sampler(VernonDeviceSampler &sampler);
 void destroyDirectX12Sampler(VernonDeviceSampler &sampler);
-
-bool loadDirectX12Kernel(VernonRuntimeContext &context, const void *artifact, size_t artifactSize,
-                         const char *reflection, size_t reflectionSize, const char *entry, size_t entrySize,
-                         DirectX12KernelState &state, ReflectedEntry &metadata);
-void destroyDirectX12Kernel(VernonRuntimeContext &context, DirectX12KernelState &state);
-VernonStatus launchDirectX12Kernel(VernonRuntimeContext &context, const DirectX12KernelState &state,
-                                   const ReflectedEntry &metadata, VernonLaunchSize globalSize,
-                                   const VernonLaunchArgument *arguments, size_t argumentCount);
 
 } // namespace vernon::runtime
 

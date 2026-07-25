@@ -1,18 +1,25 @@
 #ifndef VERNON_RUNTIME_BACKEND_CUDA_H
 #define VERNON_RUNTIME_BACKEND_CUDA_H
 
+#include "../rhi/cuda_backend.h"
 #include "VernonRuntime.h"
-#include "backend_cuda_driver.h"
+#include "VernonRuntimeCore.h"
 #include "pipeline_metadata.h"
 #include "runtime_state.h"
 
 #include <string>
+#include <vector>
 struct VernonDeviceBuffer;
+struct VernonRuntimeRhiAdapter;
 namespace vernon::runtime {
 
+using CudaDevicePointer = rhi::cuda::DevicePointer;
+using CudaResult = rhi::cuda::Result;
+constexpr CudaResult kCudaSuccess = rhi::cuda::kSuccess;
+
 struct CudaContextState {
-    CudaDevice device{};
-    CudaContext context{};
+    rhi::cuda::DeviceState device;
+    VernonRuntimeRhiAdapter *adapter{};
     uint32_t computeCapabilityMajor{};
     uint32_t computeCapabilityMinor{};
     uint32_t driverVersion{};
@@ -23,7 +30,11 @@ struct CudaBufferState {
 };
 
 struct CudaPipelineState {
-    VernonLoadedKernel *kernel{};
+    VernonRuntimeCorePipeline *pipeline{};
+    VernonRuntimeCoreBindings *bindings{};
+    std::vector<VernonRuntimeProviderBindingLayoutEntry> layout;
+    std::vector<VernonRuntimeProviderBindingValue> values;
+    uint32_t workgroup[3]{1, 1, 1};
 };
 
 inline CudaContextState &cudaState(VernonRuntimeContext &context) {
@@ -42,11 +53,6 @@ inline const CudaBufferState &cudaBufferState(const VernonDeviceBuffer &buffer) 
     return runtimeBackendState<CudaBufferState>(buffer);
 }
 
-struct CudaKernelState {
-    CudaModule module{};
-    CudaFunction function{};
-};
-
 bool probeCuda(std::string &diagnostic);
 bool initializeCudaContext(VernonRuntimeContext &context, uint32_t deviceIndex);
 void destroyCudaContext(VernonRuntimeContext &context);
@@ -56,14 +62,6 @@ bool createCudaBuffer(VernonDeviceBuffer &buffer);
 VernonStatus destroyCudaBuffer(VernonDeviceBuffer &buffer);
 VernonStatus copyToCudaBuffer(VernonDeviceBuffer &buffer, size_t offset, const void *source, size_t size);
 VernonStatus copyFromCudaBuffer(const VernonDeviceBuffer &buffer, size_t offset, void *destination, size_t size);
-
-bool loadCudaKernel(VernonRuntimeContext &context, const void *artifact, size_t artifactSize, const char *reflection,
-                    size_t reflectionSize, const char *entry, size_t entrySize, CudaKernelState &state,
-                    ReflectedEntry &metadata);
-VernonStatus destroyCudaKernel(VernonRuntimeContext &context, CudaKernelState &state);
-VernonStatus launchCudaKernel(VernonRuntimeContext &context, const CudaKernelState &state,
-                              const ReflectedEntry &metadata, VernonLaunchSize globalSize,
-                              const VernonLaunchArgument *arguments, size_t argumentCount);
 
 } // namespace vernon::runtime
 

@@ -364,7 +364,7 @@ class VulkanPipelineTests(unittest.TestCase):
         compiled = render._compiled
         self.assertIsNotNone(compiled)
         assert compiled is not None
-        self.assertFalse(hasattr(compiled.native, "invoke"))
+        self.assertTrue(callable(compiled.native.invoke))
         self.assertEqual(
             [(parameter.name, parameter.slot, tuple(parameter.shape)) for parameter in compiled.native.parameters],
             [("position", 0, (2,))],
@@ -374,7 +374,7 @@ class VulkanPipelineTests(unittest.TestCase):
             [("output_0", 0)],
         )
         with self.assertRaisesRegex(ValueError, "different reflected kind"):
-            compiled.native.invocation_builder().texture(0, target._resident_texture())
+            compiled.native.invocation_builder().rhi_texture(0, target._resident_texture())
         bundle = json.loads(compiled.bundle)
         variant = bundle["variants"][0]
         self.assertEqual(

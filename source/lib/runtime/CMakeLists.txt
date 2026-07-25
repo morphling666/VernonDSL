@@ -130,7 +130,14 @@ if(SKBUILD)
         DESTINATION vernon_dsl/runtime_src/cmake
         COMPONENT VernonWheel)
     install(
-        FILES "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonCommon.h" "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntime.h"
+        FILES "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonCommon.h"
+              "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonOpenGLContext.h"
+              "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.h"
+              "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.hpp"
+              "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntime.h"
+              "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntimeCore.h"
+              "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntimeProvider.h"
+              "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntimeRHIAdapter.h"
         DESTINATION vernon_dsl/runtime_src/include
         COMPONENT VernonWheel)
     install(
@@ -140,6 +147,20 @@ if(SKBUILD)
     install(
         DIRECTORY "${_VERNON_RUNTIME_IMPL_DIR}/"
         DESTINATION vernon_dsl/runtime_src/lib/runtime
+        COMPONENT VernonWheel
+        FILES_MATCHING
+        PATTERN "*.cpp"
+        PATTERN "*.h")
+    install(
+        DIRECTORY "${_VERNON_RUNTIME_IMPL_DIR}/../rhi/"
+        DESTINATION vernon_dsl/runtime_src/lib/rhi
+        COMPONENT VernonWheel
+        FILES_MATCHING
+        PATTERN "*.cpp"
+        PATTERN "*.h")
+    install(
+        DIRECTORY "${_VERNON_RUNTIME_IMPL_DIR}/../platform/"
+        DESTINATION vernon_dsl/runtime_src/lib/platform
         COMPONENT VernonWheel
         FILES_MATCHING
         PATTERN "*.cpp"

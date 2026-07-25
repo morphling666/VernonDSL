@@ -1,4 +1,5 @@
 #include "VernonCompiler.h"
+#include "VernonRHI.h"
 #include "VernonRuntime.h"
 
 #include <nanobind/nanobind.h>
@@ -34,12 +35,169 @@ struct Compiler {
     VernonCompilerContext *context{};
 };
 
+struct RhiHostState;
 struct Runtime;
+RhiHostState *runtimeRhiHost(const Runtime *runtime);
 struct CompiledProgram;
-struct Texture;
-struct Sampler;
 struct LoadedPipeline;
 struct PipelineInvocationBuilder;
+
+struct RhiHostState {
+    RhiHostState(VernonRhiBackend backend, uint32_t deviceIndex) : backend(backend) {
+        VernonRhiOwnedDeviceDescriptor descriptor{};
+        descriptor.struct_size = sizeof(descriptor);
+        descriptor.backend = backend;
+        descriptor.device_index = deviceIndex;
+        device = vernonRhiCreateDevice(&descriptor);
+        if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+            throw std::runtime_error("cannot create Vernon RHI device");
+    }
+    RhiHostState(VernonRhiBackend backend, const VernonOpenGLContextCallbacks &callbacks) : backend(backend) {
+        VernonRhiOwnedDeviceDescriptor descriptor{};
+        descriptor.struct_size = sizeof(descriptor);
+        descriptor.backend = backend;
+        descriptor.opengl_callbacks = &callbacks;
+        device = vernonRhiCreateDevice(&descriptor);
+        if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+            throw std::runtime_error("cannot create external OpenGL RHI device");
+    }
+    ~RhiHostState() { vernonRhiDestroyDevice(device); }
+
+    VernonRhiBackend backend;
+    VernonRhiDevice device{};
+};
+
+struct RhiBuffer {
+    RhiBuffer(std::shared_ptr<RhiHostState> host, size_t size) : host(std::move(host)), size(size) {
+        VernonRhiBufferDescriptor descriptor{};
+        descriptor.struct_size = sizeof(descriptor);
+        descriptor.size = size;
+        descriptor.usage = VERNON_RHI_BUFFER_TRANSFER_SOURCE | VERNON_RHI_BUFFER_TRANSFER_DESTINATION |
+                           VERNON_RHI_BUFFER_UNIFORM | VERNON_RHI_BUFFER_STORAGE | VERNON_RHI_BUFFER_VERTEX |
+                           VERNON_RHI_BUFFER_INDEX;
+        descriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
+        if (vernonRhiDeviceCreateBuffer(this->host->device, &descriptor, &handle) != VERNON_RHI_STATUS_OK)
+            throw std::runtime_error("cannot create Vernon RHI buffer");
+    }
+    ~RhiBuffer() { vernonRhiDeviceDestroyBuffer(host->device, handle); }
+
+    void upload(const nb::bytes &data) {
+        if (data.size() != size ||
+            vernonRhiDeviceUploadBuffer(host->device, handle, 0, data.c_str(), data.size()) != VERNON_RHI_STATUS_OK)
+            throw std::runtime_error("RHI buffer upload failed");
+    }
+    nb::bytes download() const {
+        std::string data(size, '\0');
+        if (vernonRhiDeviceDownloadBuffer(host->device, handle, 0, data.data(), data.size()) != VERNON_RHI_STATUS_OK)
+            throw std::runtime_error("RHI buffer download failed");
+        return nb::bytes(data.data(), data.size());
+    }
+
+    std::shared_ptr<RhiHostState> host;
+    VernonRhiBuffer handle{};
+    size_t size{};
+};
+
+struct RhiImage {
+    RhiImage(std::shared_ptr<RhiHostState> host, uint32_t width, uint32_t height)
+        : host(std::move(host)), width(width), height(height) {
+        VernonRhiImageDescriptor descriptor{};
+        descriptor.struct_size = sizeof(descriptor);
+        descriptor.dimension = VERNON_RHI_IMAGE_2D;
+        descriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+        descriptor.width = width;
+        descriptor.height = height;
+        descriptor.depth = 1;
+        descriptor.mip_levels = 1;
+        descriptor.array_layers = 1;
+        descriptor.sample_count = 1;
+        descriptor.usage = VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION |
+                           VERNON_RHI_IMAGE_SAMPLED | VERNON_RHI_IMAGE_COLOR_ATTACHMENT;
+        if (vernonRhiDeviceCreateImage(this->host->device, &descriptor, &handle) != VERNON_RHI_STATUS_OK)
+            throw std::runtime_error("cannot create Vernon RHI image");
+    }
+    ~RhiImage() { vernonRhiDeviceDestroyImage(host->device, handle); }
+
+    void upload(const nb::bytes &data) {
+        if (data.size() != static_cast<size_t>(width) * height * 4)
+            throw std::runtime_error("RHI image upload size does not match RGBA8 extent");
+        VernonRhiImageUploadDescriptor descriptor{};
+        descriptor.struct_size = sizeof(descriptor);
+        descriptor.width = width;
+        descriptor.height = height;
+        descriptor.depth = 1;
+        descriptor.source_format = VERNON_RHI_IMAGE_DATA_RGBA;
+        descriptor.source_type = VERNON_RHI_IMAGE_DATA_UINT8;
+        descriptor.data = data.c_str();
+        if (vernonRhiDeviceUploadImage(host->device, handle, &descriptor, 1) != VERNON_RHI_STATUS_OK)
+            throw std::runtime_error("RHI image upload failed");
+    }
+    nb::bytes download() const {
+        std::string data(static_cast<size_t>(width) * height * 4, '\0');
+        if (vernonRhiDeviceDownloadImage(host->device, handle, data.data(), data.size()) != VERNON_RHI_STATUS_OK)
+            throw std::runtime_error("RHI image download failed");
+        return nb::bytes(data.data(), data.size());
+    }
+
+    std::shared_ptr<RhiHostState> host;
+    VernonRhiImage handle{};
+    uint32_t width{};
+    uint32_t height{};
+};
+
+struct RhiSampler {
+    explicit RhiSampler(std::shared_ptr<RhiHostState> host) : host(std::move(host)) {
+        VernonRhiSamplerDescriptor descriptor{};
+        descriptor.struct_size = sizeof(descriptor);
+        descriptor.min_filter = VERNON_RHI_FILTER_LINEAR;
+        descriptor.mag_filter = VERNON_RHI_FILTER_LINEAR;
+        descriptor.mip_filter = VERNON_RHI_FILTER_LINEAR;
+        descriptor.address_u = VERNON_RHI_ADDRESS_REPEAT;
+        descriptor.address_v = VERNON_RHI_ADDRESS_REPEAT;
+        descriptor.address_w = VERNON_RHI_ADDRESS_REPEAT;
+        descriptor.max_anisotropy = 1.0f;
+        if (vernonRhiDeviceCreateSampler(this->host->device, &descriptor, &handle) != VERNON_RHI_STATUS_OK)
+            throw std::runtime_error("cannot create Vernon RHI sampler");
+    }
+    ~RhiSampler() { vernonRhiDeviceDestroySampler(host->device, handle); }
+
+    std::shared_ptr<RhiHostState> host;
+    VernonRhiSampler handle{};
+};
+
+struct RhiHost {
+    RhiHost(VernonRhiBackend backend, uint32_t deviceIndex)
+        : state(std::make_shared<RhiHostState>(backend, deviceIndex)) {}
+    explicit RhiHost(std::shared_ptr<RhiHostState> state) : state(std::move(state)) {}
+
+    static std::unique_ptr<RhiHost> createExternalOpenGL(VernonRhiBackend backend, uintptr_t userData,
+                                                         uintptr_t makeCurrent, uintptr_t getProcAddress,
+                                                         uint16_t apiMajor, uint16_t apiMinor) {
+        if (backend != VERNON_RHI_BACKEND_OPENGL && backend != VERNON_RHI_BACKEND_OPENGL_ES)
+            throw std::invalid_argument("external OpenGL host requires an OpenGL backend");
+        VernonOpenGLContextCallbacks callbacks{};
+        callbacks.struct_size = sizeof(callbacks);
+        callbacks.user_data = reinterpret_cast<void *>(userData);
+        callbacks.make_current = reinterpret_cast<VernonOpenGLMakeCurrentFn>(makeCurrent);
+        callbacks.get_proc_address = reinterpret_cast<VernonOpenGLGetProcAddressFn>(getProcAddress);
+        callbacks.api_version_major = apiMajor;
+        callbacks.api_version_minor = apiMinor;
+        return std::make_unique<RhiHost>(std::make_shared<RhiHostState>(backend, callbacks));
+    }
+
+    std::unique_ptr<RhiBuffer> createBuffer(size_t size) { return std::make_unique<RhiBuffer>(state, size); }
+    std::unique_ptr<RhiImage> createImage(uint32_t width, uint32_t height) {
+        return std::make_unique<RhiImage>(state, width, height);
+    }
+    std::unique_ptr<RhiSampler> createSampler() { return std::make_unique<RhiSampler>(state); }
+    std::unique_ptr<Runtime> createRuntime();
+    void synchronize() {
+        if (vernonRhiDeviceSynchronize(state->device) != VERNON_RHI_STATUS_OK)
+            throw std::runtime_error("RHI device synchronization failed");
+    }
+
+    std::shared_ptr<RhiHostState> state;
+};
 
 using SharedCompileResult = std::shared_ptr<VernonCompileResult>;
 
@@ -128,70 +286,6 @@ struct Buffer {
     Runtime *owner{};
     VernonDeviceBuffer *handle{};
     size_t size{};
-};
-
-struct LoadedKernel {
-    LoadedKernel(Runtime *owner, VernonLoadedKernel *handle, SharedCompileResult retainedResult = {})
-        : owner(owner), handle(handle), retainedResult(std::move(retainedResult)) {}
-    ~LoadedKernel() { vernonRuntimeKernelUnload(handle); }
-
-    void launch(uint32_t x, uint32_t y, uint32_t z, const nb::list &values) {
-        std::vector<VernonLaunchArgument> arguments;
-        std::vector<std::string> scalars;
-        arguments.reserve(values.size());
-        scalars.reserve(values.size());
-        for (nb::handle value : values) {
-            if (nb::isinstance<Buffer>(value)) {
-                Buffer *buffer = nb::cast<Buffer *>(value);
-                if (buffer->owner != owner)
-                    throw std::runtime_error("buffer belongs to another runtime");
-                arguments.push_back({VERNON_LAUNCH_TENSOR, buffer->handle, nullptr, 0});
-            } else if (nb::isinstance<nb::bytes>(value)) {
-                nb::bytes bytes = nb::borrow<nb::bytes>(value);
-                scalars.emplace_back(bytes.c_str(), bytes.size());
-                arguments.push_back({VERNON_LAUNCH_SCALAR, nullptr, scalars.back().data(), scalars.back().size()});
-            } else {
-                throw std::runtime_error("launch values must be Buffer or bytes");
-            }
-        }
-        if (vernonRuntimeLaunch(handle, {x, y, z}, arguments.data(), arguments.size()) != VERNON_STATUS_OK)
-            throw std::runtime_error("native kernel launch failed");
-    }
-
-    Runtime *owner{};
-    VernonLoadedKernel *handle{};
-    // ORC entry pointers are valid only while their compile result owns the JIT.
-    SharedCompileResult retainedResult;
-};
-
-struct Texture {
-    Texture(Runtime *owner, uint32_t width, uint32_t height);
-    ~Texture() { vernonRuntimeTextureFree(handle); }
-
-    void upload(const nb::bytes &data) {
-        if (vernonRuntimeTextureCopyFromHost(handle, data.c_str(), data.size()) != VERNON_STATUS_OK)
-            throw std::runtime_error("runtime texture upload failed");
-    }
-
-    nb::bytes download() const {
-        std::string data(static_cast<size_t>(width) * height * 4, '\0');
-        if (vernonRuntimeTextureCopyToHost(handle, data.data(), data.size()) != VERNON_STATUS_OK)
-            throw std::runtime_error("runtime texture readback failed");
-        return nb::bytes(data.data(), data.size());
-    }
-
-    Runtime *owner{};
-    VernonDeviceTexture *handle{};
-    uint32_t width{};
-    uint32_t height{};
-};
-
-struct Sampler {
-    Sampler(Runtime *owner, VernonDeviceSampler *handle) : owner(owner), handle(handle) {}
-    ~Sampler() { vernonRuntimeSamplerFree(handle); }
-
-    Runtime *owner{};
-    VernonDeviceSampler *handle{};
 };
 
 struct PipelineParameterMetadata {
@@ -284,6 +378,8 @@ struct PipelineInvocationBuilder {
         const std::string name = nb::cast<std::string>(array.attr("dtype").attr("name"));
         if (name == "bool")
             return VERNON_DATA_BOOL;
+        if (name == "uint8")
+            return VERNON_DATA_U8;
         if (name == "int32")
             return VERNON_DATA_I32;
         if (name == "uint32")
@@ -349,20 +445,20 @@ struct PipelineInvocationBuilder {
         return *this;
     }
 
-    PipelineInvocationBuilder &deviceTensor(const nb::object &identifier, Buffer *buffer, uint32_t dtype,
-                                            uint32_t access, const std::vector<uint64_t> &shape,
-                                            const std::vector<int64_t> &strides, size_t offset) {
-        if (!buffer || buffer->owner != owner)
-            throw std::invalid_argument("pipeline buffer belongs to another runtime");
-        if (shape.size() != strides.size() || shape.empty())
-            throw std::invalid_argument("device tensor shape and strides must have equal non-zero rank");
+    PipelineInvocationBuilder &rhiTensor(const nb::object &identifier, RhiBuffer *buffer, uint32_t dtype,
+                                         uint32_t access, const std::vector<uint64_t> &shape,
+                                         const std::vector<int64_t> &strides, size_t offset) {
+        if (!buffer || shape.size() != strides.size() || shape.empty())
+            throw std::invalid_argument("RHI Tensor shape and strides must have equal non-zero rank");
         const PipelineParameterMetadata parameter = resolveParameter(identifier);
         OwnedArgument &argument = addArgument(parameter, VERNON_PIPELINE_TENSOR);
         argument.shape = shape;
         argument.strides = strides;
         argument.value.tensor.struct_size = sizeof(VernonTensorView);
-        argument.value.tensor.storage = VERNON_TENSOR_DEVICE;
-        argument.value.tensor.buffer = buffer->handle;
+        argument.value.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+        if (vernonRuntimeReferenceRhiBuffer(runtime, buffer->handle, 0, buffer->size,
+                                            &argument.value.tensor.resource) != VERNON_STATUS_OK)
+            throw std::invalid_argument("RHI buffer belongs to another Runtime device");
         argument.value.tensor.dtype = static_cast<VernonDataType>(dtype);
         argument.value.tensor.access = static_cast<VernonValueAccess>(access);
         argument.value.tensor.rank = static_cast<uint32_t>(shape.size());
@@ -373,42 +469,60 @@ struct PipelineInvocationBuilder {
         return *this;
     }
 
-    PipelineInvocationBuilder &texture(const nb::object &identifier, Texture *texture, Sampler *sampler) {
-        if (!texture || texture->owner != owner || (sampler && sampler->owner != owner))
-            throw std::invalid_argument("pipeline texture or sampler belongs to another runtime");
+    PipelineInvocationBuilder &rhiTexture(const nb::object &identifier, RhiImage *texture, RhiSampler *sampler) {
+        if (!texture || (sampler && sampler->host != texture->host))
+            throw std::invalid_argument("RHI texture and sampler belong to different devices");
         const PipelineParameterMetadata parameter = resolveParameter(identifier);
         OwnedArgument &argument = addArgument(parameter, VERNON_PIPELINE_TEXTURE);
-        argument.value.texture = {texture->handle,
-                                  VERNON_TEXTURE_RGBA8_UNORM,
-                                  parameter.access,
-                                  VERNON_TEXTURE_2D,
-                                  texture->width,
-                                  texture->height,
-                                  1,
-                                  sampler ? sampler->handle : nullptr};
+        if (vernonRuntimeReferenceRhiImage(runtime, texture->handle, &argument.value.texture.resource) !=
+            VERNON_STATUS_OK)
+            throw std::invalid_argument("RHI image belongs to another Runtime device");
+        if (sampler && vernonRuntimeReferenceRhiSampler(runtime, sampler->handle,
+                                                        &argument.value.texture.sampler_resource) != VERNON_STATUS_OK)
+            throw std::invalid_argument("RHI sampler belongs to another Runtime device");
+        argument.value.texture.format = VERNON_TEXTURE_RGBA8_UNORM;
+        argument.value.texture.access = parameter.access;
+        argument.value.texture.dimension = VERNON_TEXTURE_2D;
+        argument.value.texture.width = texture->width;
+        argument.value.texture.height = texture->height;
+        argument.value.texture.depth = 1;
         return *this;
     }
 
-    PipelineInvocationBuilder &sampler(const nb::object &identifier, Sampler *sampler) {
-        if (!sampler || sampler->owner != owner)
-            throw std::invalid_argument("pipeline sampler belongs to another runtime");
+    PipelineInvocationBuilder &rhiSampler(const nb::object &identifier, RhiSampler *sampler) {
+        if (!sampler)
+            throw std::invalid_argument("RHI sampler is null");
         const PipelineParameterMetadata parameter = resolveParameter(identifier);
         OwnedArgument &argument = addArgument(parameter, VERNON_PIPELINE_SAMPLER);
-        argument.value.sampler = sampler->handle;
+        if (vernonRuntimeReferenceRhiSampler(runtime, sampler->handle, &argument.value.resource) != VERNON_STATUS_OK)
+            throw std::invalid_argument("RHI sampler belongs to another Runtime device");
         return *this;
     }
 
-    PipelineInvocationBuilder &colorAttachment(uint32_t location, Texture *texture) {
-        if (!texture || texture->owner != owner)
-            throw std::invalid_argument("color attachment belongs to another runtime");
-        attachments.push_back({location, texture->handle});
+    PipelineInvocationBuilder &rhiColorAttachment(uint32_t location, RhiImage *texture) {
+        if (!texture)
+            throw std::invalid_argument("RHI color attachment is null");
+        VernonColorAttachment attachment{};
+        attachment.location = location;
+        if (vernonRuntimeReferenceRhiImage(runtime, texture->handle, &attachment.resource) != VERNON_STATUS_OK)
+            throw std::invalid_argument("RHI color attachment belongs to another Runtime device");
+        attachment.width = texture->width;
+        attachment.height = texture->height;
+        attachment.format = VERNON_TEXTURE_RGBA8_UNORM;
+        attachments.push_back(attachment);
         return *this;
     }
 
-    PipelineInvocationBuilder &indexBinding(Buffer *buffer, uint32_t count, size_t offset) {
-        if (!buffer || buffer->owner != owner)
-            throw std::invalid_argument("index buffer belongs to another runtime");
-        index = {buffer->handle, VERNON_INDEX_U32, offset, count};
+    PipelineInvocationBuilder &rhiIndexBinding(RhiBuffer *buffer, uint32_t count, size_t offset) {
+        if (!buffer || offset > buffer->size)
+            throw std::invalid_argument("RHI index buffer is null");
+        index = {};
+        if (vernonRuntimeReferenceRhiBuffer(runtime, buffer->handle, offset, buffer->size - offset, &index.resource) !=
+            VERNON_STATUS_OK)
+            throw std::invalid_argument("RHI index buffer belongs to another Runtime device");
+        index.type = VERNON_INDEX_U32;
+        index.offset = offset;
+        index.index_count = count;
         hasIndex = true;
         return *this;
     }
@@ -488,8 +602,9 @@ struct PipelineInvocationBuilder {
 
 struct LoadedPipeline {
     LoadedPipeline(Runtime *owner, VernonRuntimeContext *runtime, VernonPipelineBundle *bundle,
-                   VernonLoadedPipeline *pipeline)
-        : owner(owner), runtime(runtime), bundle(bundle), pipeline(pipeline) {}
+                   VernonLoadedPipeline *pipeline, SharedCompileResult retainedResult = {})
+        : owner(owner), runtime(runtime), bundle(bundle), pipeline(pipeline),
+          retainedResult(std::move(retainedResult)) {}
     ~LoadedPipeline() {
         vernonRuntimeLoadedPipelineDestroy(pipeline);
         vernonRuntimePipelineBundleDestroy(bundle);
@@ -497,6 +612,97 @@ struct LoadedPipeline {
 
     std::unique_ptr<PipelineInvocationBuilder> invocationBuilder() {
         return std::make_unique<PipelineInvocationBuilder>(owner, runtime, pipeline);
+    }
+
+    void invoke(PipelineInvocationBuilder &builder) {
+        if (builder.pipeline != pipeline)
+            throw std::invalid_argument("invocation builder belongs to another pipeline");
+        builder.invoke();
+    }
+
+    static size_t dataTypeSize(VernonDataType type) {
+        switch (type) {
+        case VERNON_DATA_BOOL:
+        case VERNON_DATA_U8:
+            return 1;
+        case VERNON_DATA_F16:
+            return 2;
+        case VERNON_DATA_I32:
+        case VERNON_DATA_U32:
+        case VERNON_DATA_F32:
+            return 4;
+        case VERNON_DATA_F64:
+            return 8;
+        }
+        throw std::invalid_argument("unsupported compute pipeline data type");
+    }
+
+    void invokeCompute(uint32_t x, uint32_t y, uint32_t z, const nb::list &values) {
+        const std::vector<PipelineParameterMetadata> metadata = parameters();
+        if (values.size() != metadata.size())
+            throw std::invalid_argument("compute pipeline value count does not match reflection");
+        std::deque<std::string> scalarStorage;
+        std::deque<std::vector<uint64_t>> shapes;
+        std::deque<std::vector<int64_t>> strides;
+        std::vector<VernonPipelineArgument> arguments;
+        arguments.reserve(metadata.size());
+        for (size_t index = 0; index < metadata.size(); ++index) {
+            const PipelineParameterMetadata &parameter = metadata[index];
+            if (parameter.kind != VERNON_PIPELINE_TENSOR)
+                throw std::invalid_argument("direct compute pipelines accept only Tensor/value parameters");
+            shapes.push_back(parameter.shape);
+            strides.emplace_back(parameter.shape.size());
+            size_t stride = dataTypeSize(parameter.dtype);
+            for (size_t dimension = parameter.shape.size(); dimension-- != 0;) {
+                strides.back()[dimension] = static_cast<int64_t>(stride);
+                stride *= static_cast<size_t>(parameter.shape[dimension]);
+            }
+            VernonPipelineArgument argument{};
+            argument.slot = parameter.slot;
+            argument.kind = VERNON_PIPELINE_TENSOR;
+            argument.tensor.struct_size = sizeof(VernonTensorView);
+            argument.tensor.dtype = parameter.dtype;
+            argument.tensor.access = parameter.access;
+            argument.tensor.rank = static_cast<uint32_t>(shapes.back().size());
+            argument.tensor.shape = shapes.back().empty() ? nullptr : shapes.back().data();
+            argument.tensor.byte_strides = strides.back().empty() ? nullptr : strides.back().data();
+            nb::handle value = values[index];
+            if (nb::isinstance<Buffer>(value)) {
+                Buffer *buffer = nb::cast<Buffer *>(value);
+                if (!buffer || buffer->owner != owner)
+                    throw std::invalid_argument("compute pipeline buffer belongs to another runtime");
+                argument.tensor.storage = VERNON_TENSOR_DEVICE;
+                argument.tensor.buffer = buffer->handle;
+                argument.tensor.byte_size = buffer->size;
+            } else if (nb::isinstance<RhiBuffer>(value)) {
+                RhiBuffer *buffer = nb::cast<RhiBuffer *>(value);
+                if (!buffer || runtimeRhiHost(owner) != buffer->host.get())
+                    throw std::invalid_argument("compute pipeline RHI buffer belongs to another device");
+                argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+                if (vernonRuntimeReferenceRhiBuffer(runtime, buffer->handle, 0, buffer->size,
+                                                    &argument.tensor.resource) != VERNON_STATUS_OK)
+                    throw std::invalid_argument("compute pipeline RHI buffer is invalid");
+                argument.tensor.byte_size = buffer->size;
+            } else if (nb::isinstance<nb::bytes>(value)) {
+                nb::bytes bytes = nb::borrow<nb::bytes>(value);
+                scalarStorage.emplace_back(bytes.c_str(), bytes.size());
+                argument.tensor.storage = VERNON_TENSOR_HOST;
+                argument.tensor.host_data = scalarStorage.back().data();
+                argument.tensor.byte_size = scalarStorage.back().size();
+            } else {
+                throw std::invalid_argument("compute pipeline values must be Buffer or bytes");
+            }
+            arguments.push_back(argument);
+        }
+        VernonPipelineInvocation invocation{};
+        invocation.struct_size = sizeof(invocation);
+        invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+        invocation.arguments = arguments.data();
+        invocation.argument_count = arguments.size();
+        invocation.compute_grid = {x, y, z};
+        if (vernonRuntimePipelineInvoke(pipeline, &invocation) != VERNON_STATUS_OK)
+            throw std::runtime_error("compute pipeline invocation failed: " +
+                                     stringView(vernonRuntimeGetLastError(runtime)));
     }
 
     std::vector<PipelineParameterMetadata> parameters() const {
@@ -529,9 +735,12 @@ struct LoadedPipeline {
     VernonRuntimeContext *runtime{};
     VernonPipelineBundle *bundle{};
     VernonLoadedPipeline *pipeline{};
+    // ORC entry pointers are valid only while their compile result owns the JIT.
+    SharedCompileResult retainedResult;
 };
 struct Runtime {
-    explicit Runtime(VernonRuntimeContext *handle) : handle(handle) {}
+    explicit Runtime(VernonRuntimeContext *handle, std::shared_ptr<RhiHostState> rhiHost = {})
+        : handle(handle), rhiHost(std::move(rhiHost)) {}
     explicit Runtime(VernonRuntimeBackend backend, uint16_t apiMajor = 0, uint16_t apiMinor = 0) {
         VernonRuntimeCreateOptions options{};
         options.struct_size = sizeof(options);
@@ -546,14 +755,14 @@ struct Runtime {
     static std::unique_ptr<Runtime> createExternalOpenGL(VernonRuntimeBackend backend, uintptr_t userData,
                                                          uintptr_t makeCurrent, uintptr_t getProcAddress,
                                                          uint16_t apiMajor, uint16_t apiMinor) {
-        VernonExternalOpenGLContext external{};
-        external.struct_size = sizeof(external);
-        external.user_data = reinterpret_cast<void *>(userData);
-        external.make_current = reinterpret_cast<VernonOpenGLMakeCurrentFn>(makeCurrent);
-        external.get_proc_address = reinterpret_cast<VernonOpenGLGetProcAddressFn>(getProcAddress);
-        external.api_version_major = apiMajor;
-        external.api_version_minor = apiMinor;
-        VernonRuntimeContext *handle = vernonRuntimeCreateExternalOpenGLForBackend(backend, &external);
+        VernonOpenGLContextCallbacks callbacks{};
+        callbacks.struct_size = sizeof(callbacks);
+        callbacks.user_data = reinterpret_cast<void *>(userData);
+        callbacks.make_current = reinterpret_cast<VernonOpenGLMakeCurrentFn>(makeCurrent);
+        callbacks.get_proc_address = reinterpret_cast<VernonOpenGLGetProcAddressFn>(getProcAddress);
+        callbacks.api_version_major = apiMajor;
+        callbacks.api_version_minor = apiMinor;
+        VernonRuntimeContext *handle = vernonRuntimeCreateOpenGLWithCallbacks(backend, &callbacks);
         if (!handle)
             throw std::runtime_error("external OpenGL context is invalid");
         return std::make_unique<Runtime>(handle);
@@ -563,17 +772,17 @@ struct Runtime {
         return std::make_unique<Buffer>(this, size, alignment);
     }
 
-    std::unique_ptr<LoadedKernel> load(const nb::bytes &artifact, const std::string &reflection,
-                                       const std::string &entry) {
-        VernonLoadedKernel *kernel =
+    std::unique_ptr<LoadedPipeline> load(const nb::bytes &artifact, const std::string &reflection,
+                                         const std::string &entry) {
+        VernonLoadedPipeline *pipeline =
             vernonRuntimeLoadArtifact(handle, artifact.c_str(), artifact.size(), reflection.data(), reflection.size(),
                                       entry.data(), entry.size());
-        if (!kernel)
-            throw std::runtime_error("cannot load native kernel: " + stringView(vernonRuntimeGetLastError(handle)));
-        return std::make_unique<LoadedKernel>(this, kernel);
+        if (!pipeline)
+            throw std::runtime_error("cannot load compute pipeline: " + stringView(vernonRuntimeGetLastError(handle)));
+        return std::make_unique<LoadedPipeline>(this, handle, nullptr, pipeline);
     }
 
-    std::unique_ptr<LoadedKernel> loadCpuEntry(const CompiledProgram &program, const std::string &entry) {
+    std::unique_ptr<LoadedPipeline> loadCpuEntry(const CompiledProgram &program, const std::string &entry) {
         program.requireSuccess();
         if (program.target != VERNON_TARGET_CPU)
             throw std::runtime_error("CPU entries can be loaded only from CPU compiled programs");
@@ -584,33 +793,23 @@ struct Runtime {
         if (!entryPoint)
             throw std::runtime_error("CPU entry '" + entry + "' was not found in compiled program");
         const std::string reflection = program.reflection();
-        VernonLoadedKernel *kernel = vernonRuntimeLoadCpuEntry(handle, entryPoint, reflection.data(), reflection.size(),
-                                                               entry.data(), entry.size());
-        if (!kernel)
+        VernonLoadedPipeline *pipeline = vernonRuntimeLoadCpuEntry(handle, entryPoint, reflection.data(),
+                                                                   reflection.size(), entry.data(), entry.size());
+        if (!pipeline)
             throw std::runtime_error("cannot load CPU entry: " + stringView(vernonRuntimeGetLastError(handle)));
-        return std::make_unique<LoadedKernel>(this, kernel, program.result);
+        return std::make_unique<LoadedPipeline>(this, handle, nullptr, pipeline, program.result);
     }
 
-    std::unique_ptr<LoadedKernel> loadComputeBundle(const std::string &directory) {
-        VernonLoadedKernel *kernel = vernonRuntimeLoadComputeBundle(handle, directory.c_str());
-        if (!kernel)
+    std::unique_ptr<LoadedPipeline> loadComputeBundle(const std::string &directory) {
+        VernonLoadedPipeline *pipeline = vernonRuntimeLoadComputeBundle(handle, directory.c_str());
+        if (!pipeline)
             throw std::runtime_error("cannot load compute bundle: " + stringView(vernonRuntimeGetLastError(handle)));
-        return std::make_unique<LoadedKernel>(this, kernel);
-    }
-
-    std::unique_ptr<Texture> createTexture(uint32_t width, uint32_t height) {
-        return std::make_unique<Texture>(this, width, height);
-    }
-
-    std::unique_ptr<Sampler> importOpenGLSampler(uint32_t name) {
-        VernonDeviceSampler *sampler = vernonRuntimeImportOpenGLSampler(handle, name);
-        if (!sampler)
-            throw std::runtime_error("cannot import OpenGL sampler");
-        return std::make_unique<Sampler>(this, sampler);
+        return std::make_unique<LoadedPipeline>(this, handle, nullptr, pipeline);
     }
 
     std::unique_ptr<LoadedPipeline> loadPipeline(const nb::bytes &data, const std::vector<std::string> &features) {
-        VernonPipelineBundle *bundle = vernonRuntimeLoadPipelineBundle(handle, data.c_str(), data.size());
+        VernonPipelineBundle *bundle =
+            vernonRuntimeLoadPipelineBundleWithOptions(handle, data.c_str(), data.size(), nullptr);
         if (!bundle)
             throw std::runtime_error("cannot load pipeline bundle: " + stringView(vernonRuntimeGetLastError(handle)));
         std::vector<const char *> names;
@@ -652,18 +851,40 @@ struct Runtime {
     }
 
     VernonRuntimeContext *handle{};
+    std::shared_ptr<RhiHostState> rhiHost;
 };
+
+RhiHostState *runtimeRhiHost(const Runtime *runtime) { return runtime ? runtime->rhiHost.get() : nullptr; }
+
+std::unique_ptr<Runtime> RhiHost::createRuntime() {
+    VernonRuntimeBackend backend;
+    switch (state->backend) {
+    case VERNON_RHI_BACKEND_CUDA:
+        backend = VERNON_RUNTIME_CUDA;
+        break;
+    case VERNON_RHI_BACKEND_VULKAN:
+        backend = VERNON_RUNTIME_VULKAN;
+        break;
+    case VERNON_RHI_BACKEND_DIRECTX12:
+        backend = VERNON_RUNTIME_DIRECTX12;
+        break;
+    case VERNON_RHI_BACKEND_OPENGL:
+        backend = VERNON_RUNTIME_OPENGL;
+        break;
+    case VERNON_RHI_BACKEND_OPENGL_ES:
+        backend = VERNON_RUNTIME_OPENGL_ES;
+        break;
+    }
+    VernonRuntimeContext *runtime = vernonRuntimeCreateForRhiDevice(backend, state->device);
+    if (!runtime)
+        throw std::runtime_error("cannot create Runtime for Vernon RHI device");
+    return std::make_unique<Runtime>(runtime, state);
+}
 
 Buffer::Buffer(Runtime *owner, size_t size, size_t alignment) : owner(owner), size(size) {
     handle = vernonRuntimeBufferAllocate(owner->handle, size, alignment);
     if (!handle)
         throw std::runtime_error("runtime buffer allocation failed");
-}
-
-Texture::Texture(Runtime *owner, uint32_t width, uint32_t height) : owner(owner), width(width), height(height) {
-    handle = vernonRuntimeTextureCreate2D(owner->handle, width, height, VERNON_TEXTURE_RGBA8_UNORM);
-    if (!handle)
-        throw std::runtime_error("runtime texture allocation failed");
 }
 
 } // namespace
@@ -692,6 +913,12 @@ NB_MODULE(_native, module) {
         .value("OPENGL", VERNON_RUNTIME_OPENGL)
         .value("OPENGL_ES", VERNON_RUNTIME_OPENGL_ES)
         .value("DIRECTX12", VERNON_RUNTIME_DIRECTX12);
+    nb::enum_<VernonRhiBackend>(module, "RhiBackend")
+        .value("CUDA", VERNON_RHI_BACKEND_CUDA)
+        .value("VULKAN", VERNON_RHI_BACKEND_VULKAN)
+        .value("DIRECTX12", VERNON_RHI_BACKEND_DIRECTX12)
+        .value("OPENGL", VERNON_RHI_BACKEND_OPENGL)
+        .value("OPENGL_ES", VERNON_RHI_BACKEND_OPENGL_ES);
     nb::enum_<VernonPrimitiveTopology>(module, "PrimitiveTopology")
         .value("TRIANGLE_LIST", VERNON_TOPOLOGY_TRIANGLE_LIST)
         .value("LINE_LIST", VERNON_TOPOLOGY_LINE_LIST)
@@ -714,6 +941,25 @@ NB_MODULE(_native, module) {
         .def_prop_ro("cpu", [](const CompiledProgram &value) { return value.cpu; })
         .def_prop_ro("cpu_features", [](const CompiledProgram &value) { return value.cpuFeatures; })
         .def("has_cpu_entry", &CompiledProgram::hasCpuEntry);
+    nb::class_<RhiHost>(module, "RhiHost")
+        .def(nb::init<VernonRhiBackend, uint32_t>(), nb::arg("backend"), nb::arg("device_index") = 0)
+        .def_static("create_external_opengl", &RhiHost::createExternalOpenGL, nb::arg("backend"), nb::arg("user_data"),
+                    nb::arg("make_current"), nb::arg("get_proc_address"), nb::arg("api_major"), nb::arg("api_minor"))
+        .def("create_buffer", &RhiHost::createBuffer)
+        .def("create_image", &RhiHost::createImage)
+        .def("create_sampler", &RhiHost::createSampler)
+        .def("create_runtime", &RhiHost::createRuntime, nb::keep_alive<0, 1>())
+        .def("synchronize", &RhiHost::synchronize);
+    nb::class_<RhiBuffer>(module, "RhiBuffer")
+        .def_prop_ro("size", [](const RhiBuffer &value) { return value.size; })
+        .def("upload", &RhiBuffer::upload)
+        .def("download", &RhiBuffer::download);
+    nb::class_<RhiImage>(module, "RhiImage")
+        .def_prop_ro("width", [](const RhiImage &value) { return value.width; })
+        .def_prop_ro("height", [](const RhiImage &value) { return value.height; })
+        .def("upload", &RhiImage::upload)
+        .def("download", &RhiImage::download);
+    nb::class_<RhiSampler>(module, "RhiSampler");
     nb::class_<Runtime>(module, "Runtime")
         .def(nb::init<VernonRuntimeBackend, uint16_t, uint16_t>(), nb::arg("backend"), nb::arg("api_major") = 0,
              nb::arg("api_minor") = 0)
@@ -723,19 +969,10 @@ NB_MODULE(_native, module) {
         .def("load", &Runtime::load, nb::keep_alive<0, 1>())
         .def("load_cpu_entry", &Runtime::loadCpuEntry, nb::keep_alive<0, 1>())
         .def("load_compute_bundle", &Runtime::loadComputeBundle, nb::keep_alive<0, 1>())
-        .def("create_texture", &Runtime::createTexture, nb::keep_alive<0, 1>())
-        .def("import_opengl_sampler", &Runtime::importOpenGLSampler, nb::keep_alive<0, 1>())
         .def("load_pipeline", &Runtime::loadPipeline, nb::keep_alive<0, 1>())
         .def("load_pipeline_asset", &Runtime::loadPipelineAsset, nb::keep_alive<0, 1>())
         .def("synchronize", &Runtime::synchronize);
     nb::class_<Buffer>(module, "Buffer").def("upload", &Buffer::upload).def("download", &Buffer::download);
-    nb::class_<LoadedKernel>(module, "LoadedKernel").def("launch", &LoadedKernel::launch);
-    nb::class_<Texture>(module, "Texture")
-        .def_prop_ro("width", [](const Texture &value) { return value.width; })
-        .def_prop_ro("height", [](const Texture &value) { return value.height; })
-        .def("upload", &Texture::upload)
-        .def("download", &Texture::download);
-    nb::class_<Sampler>(module, "Sampler");
     nb::class_<PipelineParameterMetadata>(module, "PipelineParameter")
         .def_ro("slot", &PipelineParameterMetadata::slot)
         .def_ro("name", &PipelineParameterMetadata::name)
@@ -754,17 +991,17 @@ NB_MODULE(_native, module) {
     nb::class_<PipelineInvocationBuilder>(module, "PipelineInvocationBuilder")
         .def("host_tensor", &PipelineInvocationBuilder::hostTensor, nb::arg("parameter"), nb::arg("array"),
              nb::rv_policy::reference_internal)
-        .def("device_tensor", &PipelineInvocationBuilder::deviceTensor, nb::arg("parameter"), nb::arg("buffer"),
+        .def("rhi_tensor", &PipelineInvocationBuilder::rhiTensor, nb::arg("parameter"), nb::arg("buffer"),
              nb::arg("dtype"), nb::arg("access"), nb::arg("shape"), nb::arg("strides"), nb::arg("offset") = 0,
              nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
-        .def("texture", &PipelineInvocationBuilder::texture, nb::arg("parameter"), nb::arg("texture"),
+        .def("rhi_texture", &PipelineInvocationBuilder::rhiTexture, nb::arg("parameter"), nb::arg("texture"),
              nb::arg("sampler") = nullptr, nb::rv_policy::reference_internal, nb::keep_alive<1, 3>(),
              nb::keep_alive<1, 4>())
-        .def("sampler", &PipelineInvocationBuilder::sampler, nb::arg("parameter"), nb::arg("sampler"),
+        .def("rhi_sampler", &PipelineInvocationBuilder::rhiSampler, nb::arg("parameter"), nb::arg("sampler"),
              nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
-        .def("color_attachment", &PipelineInvocationBuilder::colorAttachment, nb::arg("location"), nb::arg("texture"),
-             nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
-        .def("index_binding", &PipelineInvocationBuilder::indexBinding, nb::arg("buffer"), nb::arg("count"),
+        .def("rhi_color_attachment", &PipelineInvocationBuilder::rhiColorAttachment, nb::arg("location"),
+             nb::arg("texture"), nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
+        .def("rhi_index_binding", &PipelineInvocationBuilder::rhiIndexBinding, nb::arg("buffer"), nb::arg("count"),
              nb::arg("offset") = 0, nb::rv_policy::reference_internal, nb::keep_alive<1, 2>())
         .def("topology", &PipelineInvocationBuilder::setTopology, nb::arg("topology"),
              nb::rv_policy::reference_internal)
@@ -779,6 +1016,15 @@ NB_MODULE(_native, module) {
         .def("invoke", &PipelineInvocationBuilder::invoke);
     nb::class_<LoadedPipeline>(module, "LoadedPipeline")
         .def("invocation_builder", &LoadedPipeline::invocationBuilder, nb::keep_alive<0, 1>())
+        .def(
+            "invoke",
+            [](LoadedPipeline &pipeline, uint32_t x, uint32_t y, uint32_t z, const nb::list &values) {
+                pipeline.invokeCompute(x, y, z, values);
+            },
+            nb::arg("x"), nb::arg("y"), nb::arg("z"), nb::arg("values"))
+        .def(
+            "invoke", [](LoadedPipeline &pipeline, PipelineInvocationBuilder &builder) { pipeline.invoke(builder); },
+            nb::arg("builder"))
         .def_prop_ro("parameters", &LoadedPipeline::parameters)
         .def_prop_ro("outputs", &LoadedPipeline::outputs);
     module.attr("DATA_BOOL") = static_cast<uint32_t>(VERNON_DATA_BOOL);

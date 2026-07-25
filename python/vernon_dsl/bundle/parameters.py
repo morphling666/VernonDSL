@@ -68,6 +68,10 @@ def reflected_parameters(
             if not isinstance(name, str) or not name or not isinstance(interface_name, str):
                 raise PipelineCompileError(f"{stage} external argument is missing source metadata")
             inferred_dtype, inferred_shape = dtype_and_shape(row.get("type"))
+            if row.get("kind") == "tensor" and "shape" not in row:
+                rank = row.get("rank")
+                if isinstance(rank, int) and rank >= 0:
+                    inferred_shape = [0] * rank
             use = {
                 "stage": stage,
                 "entry": record["entry"],

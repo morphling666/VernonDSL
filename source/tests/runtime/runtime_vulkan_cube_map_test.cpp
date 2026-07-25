@@ -16,6 +16,13 @@
 
 namespace {
 
+VernonDeviceTexture *createTexture2D(VernonRuntimeContext *runtime, uint32_t width, uint32_t height,
+                                     VernonTextureFormat format) {
+    const VernonTextureDescriptor descriptor{
+        sizeof(VernonTextureDescriptor), VERNON_TEXTURE_2D, format, width, height, 1, 1, {0, 0, 0, 0}};
+    return vernonRuntimeTextureCreate(runtime, &descriptor);
+}
+
 VernonPipelineParameterView parameter(VernonLoadedPipeline *pipeline, const char *name) {
     VernonPipelineParameterView result{};
     const VernonStringView view{name, std::char_traits<char>::length(name)};
@@ -44,7 +51,7 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
     const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     ASSERT_FALSE(bundle.empty());
 
-    VernonRuntimeContext *runtime = vernonRuntimeCreate(VERNON_RUNTIME_VULKAN, 0);
+    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_VULKAN, nullptr);
     ASSERT_TRUE(runtime);
     const std::string bundleDirectory = manifestPath.parent_path().u8string();
     VernonPipelineBundleLoadOptions options{};
@@ -90,8 +97,8 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
     VernonDeviceSampler *sampler = vernonRuntimeSamplerCreate(runtime, &samplerDescriptor);
     ASSERT_TRUE(sampler);
 
-    VernonDeviceTexture *color = vernonRuntimeTextureCreate2D(runtime, 32, 32, VERNON_TEXTURE_RGBA8_UNORM);
-    VernonDeviceTexture *bloom = vernonRuntimeTextureCreate2D(runtime, 32, 32, VERNON_TEXTURE_RGBA8_UNORM);
+    VernonDeviceTexture *color = createTexture2D(runtime, 32, 32, VERNON_TEXTURE_RGBA8_UNORM);
+    VernonDeviceTexture *bloom = createTexture2D(runtime, 32, 32, VERNON_TEXTURE_RGBA8_UNORM);
     ASSERT_TRUE(color);
     ASSERT_TRUE(bloom);
 

@@ -109,7 +109,7 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
         GTEST_SKIP() << "CUDA runtime backend is unavailable";
     }
 
-    VernonRuntimeContext *runtime = vernonRuntimeCreate(VERNON_RUNTIME_CUDA, 0);
+    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CUDA, nullptr);
     ASSERT_TRUE(runtime);
     VernonPipelineBundleLoadOptions options{};
     options.struct_size = sizeof(options);

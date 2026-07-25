@@ -81,22 +81,25 @@ def _is_injective(shape: tuple[int, ...], strides: tuple[int, ...]) -> bool:
         return True
     if any(extent > 1 and stride == 0 for extent, stride in zip(shape, strides, strict=True)):
         return False
-    # Exact validation keeps unusual but legal interleaved layouts usable.
-    # Large descriptors use a conservative mixed-radix proof to avoid
-    # allocating memory proportional to an untrusted runtime shape.
-    if count <= 1_000_000:
-        addresses = {
-            sum(index * stride for index, stride in zip(indices, strides, strict=True)) for indices in np.ndindex(shape)
-        }
-        return len(addresses) == count
+    # Prove ordinary contiguous, transposed, and padded layouts in O(rank).
+    # Fall back to exact validation only for unusual small descriptors.
     covered_span = 0
+    proven = True
     for extent, stride in sorted(zip(shape, strides, strict=True), key=lambda item: abs(item[1])):
         if extent <= 1:
             continue
         if abs(stride) <= covered_span:
-            return False
+            proven = False
+            break
         covered_span += (extent - 1) * abs(stride)
-    return True
+    if proven:
+        return True
+    if count > 1_000_000:
+        return False
+    addresses = {
+        sum(index * stride for index, stride in zip(indices, strides, strict=True)) for indices in np.ndindex(shape)
+    }
+    return len(addresses) == count
 
 
 def _matches_logical_value(value: Any, element_type: Any) -> bool:
@@ -211,6 +214,7 @@ class TensorStorage:
         self._download_count = 0
         self._borrow_lock = threading.RLock()
         self._active_borrows: list[tuple[object, TensorView, str]] = []
+        self._full_views: dict[str, TensorView] = {}
         _session_state()._runtime_children.add(self)
 
     @classmethod
@@ -331,6 +335,14 @@ class TensorStorage:
             element_type=self._element_type,
         )
 
+    def _full_view(self, access: str) -> TensorView:
+        access = _checked_access(access)
+        view = self._full_views.get(access)
+        if view is None:
+            view = self.view(access=access)
+            self._full_views[access] = view
+        return view
+
     def swizzle(self, components: str) -> TensorView:
         if len(self.shape) < 2:
             raise ValueError("Tensor swizzle requires a trailing component axis")
@@ -415,7 +427,11 @@ class TensorStorage:
         if state._native_runtime is None:
             raise RuntimeError("native TensorStorage residency requires a runtime")
         if self._native_buffer is None or self._native_generation != state._runtime_generation:
-            self._native_buffer = state._native_runtime.allocate(self._array.nbytes, self._element_alignment)
+            self._native_buffer = (
+                state._rhi_host.create_buffer(self._array.nbytes)
+                if state._rhi_host is not None
+                else state._native_runtime.allocate(self._array.nbytes, self._element_alignment)
+            )
             self._native_generation = state._runtime_generation
             self._uploaded_version = 0
             self._device_dirty = False
@@ -541,7 +557,11 @@ class RawBuffer:
         if state._native_runtime is None:
             raise RuntimeError("native RawBuffer residency requires a runtime")
         if self._native_buffer is None or self._native_generation != state._runtime_generation:
-            self._native_buffer = state._native_runtime.allocate(self.byte_size, self.alignment)
+            self._native_buffer = (
+                state._rhi_host.create_buffer(self.byte_size)
+                if state._rhi_host is not None
+                else state._native_runtime.allocate(self.byte_size, self.alignment)
+            )
             self._native_generation = state._runtime_generation
             self._uploaded_version = 0
             self._device_dirty = False
@@ -690,7 +710,7 @@ def _normalize_dispatch_borrows(
     normalized: list[tuple[str, TensorView, str]] = []
     for name, value, access in borrows:
         access = _checked_access(access)
-        view = value.view(access="read_write") if isinstance(value, TensorStorage) else value
+        view = value._full_view("read_write") if isinstance(value, TensorStorage) else value
         if access in {"read", "read_write"} and view.access == "write":
             raise ValueError(f"TensorView argument '{name}' does not permit reads")
         if access in {"write", "read_write"} and view.access == "read":
@@ -819,7 +839,9 @@ class Texture:
             raise RuntimeError("Texture requires an initialized native runtime")
         if self._native_texture is None or self._native_generation != state._runtime_generation:
             height, width = self.shape
-            self._native_texture = state._native_runtime.create_texture(width, height)
+            if state._rhi_host is None:
+                raise RuntimeError("Texture requires a GPU RHI host")
+            self._native_texture = state._rhi_host.create_image(width, height)
             self._native_generation = state._runtime_generation
             self._host_dirty = True
             self._device_dirty = False

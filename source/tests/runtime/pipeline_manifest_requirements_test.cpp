@@ -9,11 +9,11 @@ namespace {
 using vernon::runtime::parseRuntimeRequirements;
 using vernon::runtime::RuntimeRequirements;
 
-TEST(PipelineManifestRequirements, MissingFieldPreservesLegacyBehavior) {
+TEST(PipelineManifestRequirements, RejectsMissingRuntimeRequirements) {
     RuntimeRequirements requirements;
     std::string error;
-    EXPECT_TRUE(parseRuntimeRequirements(nlohmann::json::object(), "cpu", requirements, error));
-    EXPECT_FALSE(requirements.present);
+    EXPECT_FALSE(parseRuntimeRequirements(nlohmann::json::object(), "cpu", requirements, error));
+    EXPECT_EQ(error, "pipeline manifest requires runtime_requirements");
 }
 
 TEST(PipelineManifestRequirements, ParsesEveryRuntimeBackendShape) {
@@ -62,7 +62,7 @@ TEST(PipelineManifestRequirements, ParsesEveryRuntimeBackendShape) {
         std::string error;
         const nlohmann::json root = {{"runtime_requirements", value}};
         EXPECT_TRUE(parseRuntimeRequirements(root, target, requirements, error)) << target << ": " << error;
-        EXPECT_TRUE(requirements.present);
+        EXPECT_EQ(requirements.backend, target);
     }
 }
 

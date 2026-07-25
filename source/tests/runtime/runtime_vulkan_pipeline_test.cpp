@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -17,6 +18,20 @@
 #ifndef VERNON_VULKAN_PIPELINE_BUNDLE
 #error VERNON_VULKAN_PIPELINE_BUNDLE must name the cooked pipeline bundle
 #endif
+#ifndef VERNON_VULKAN_COMPUTE_PIPELINE_BUNDLE
+#error VERNON_VULKAN_COMPUTE_PIPELINE_BUNDLE must name the cooked compute pipeline bundle
+#endif
+
+namespace {
+
+VernonDeviceTexture *createTexture2D(VernonRuntimeContext *runtime, uint32_t width, uint32_t height,
+                                     VernonTextureFormat format) {
+    const VernonTextureDescriptor descriptor{
+        sizeof(VernonTextureDescriptor), VERNON_TEXTURE_2D, format, width, height, 1, 1, {0, 0, 0, 0}};
+    return vernonRuntimeTextureCreate(runtime, &descriptor);
+}
+
+} // namespace
 
 TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     if (!vernonRuntimeGetCapabilities(VERNON_RUNTIME_VULKAN).available)
@@ -41,7 +56,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     document["content_hash"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
     bundle = document.dump(-1, ' ', false);
 
-    VernonRuntimeContext *runtime = vernonRuntimeCreate(VERNON_RUNTIME_VULKAN, 0);
+    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_VULKAN, nullptr);
     ASSERT_TRUE(runtime);
     size_t supportedFormatCount = 0;
     for (VernonTextureFormat format :
@@ -113,9 +128,9 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     VernonDeviceBuffer *vertices = vernonRuntimeBufferAllocate(runtime, sizeof(positions), alignof(float));
     ASSERT_TRUE(vertices);
     ASSERT_TRUE(vernonRuntimeCopyFromHost(vertices, 0, positions, sizeof(positions)) == VERNON_STATUS_OK);
-    VernonDeviceTexture *firstTarget = vernonRuntimeTextureCreate2D(runtime, 32, 32, VERNON_TEXTURE_RGBA8_UNORM);
+    VernonDeviceTexture *firstTarget = createTexture2D(runtime, 32, 32, VERNON_TEXTURE_RGBA8_UNORM);
     ASSERT_TRUE(firstTarget);
-    VernonDeviceTexture *secondTarget = vernonRuntimeTextureCreate2D(runtime, 48, 24, VERNON_TEXTURE_RGBA8_UNORM);
+    VernonDeviceTexture *secondTarget = createTexture2D(runtime, 48, 24, VERNON_TEXTURE_RGBA8_UNORM);
     ASSERT_TRUE(secondTarget);
     VernonTextureDescriptor sampledDescriptor{};
     sampledDescriptor.struct_size = sizeof(sampledDescriptor);
@@ -175,6 +190,10 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(firstStats.descriptorSetLayoutCreations, 1u);
     EXPECT_EQ(firstStats.pipelineLayoutCreations, 1u);
     EXPECT_EQ(firstStats.graphicsPipelineCreations, 1u);
+    EXPECT_EQ(firstStats.commandBufferAllocations, 3u);
+    EXPECT_EQ(firstStats.descriptorPoolCreations, 1u);
+    EXPECT_GT(firstStats.stagingBufferAllocations, 0u);
+    EXPECT_EQ(firstStats.renderPassCreations, firstStats.dynamicRendering ? 0u : 1u);
 
     constexpr uint8_t secondSampledPixel[] = {180, 40, 220, 255};
     ASSERT_TRUE(vernonRuntimeTextureCopyFromHost(sampled, secondSampledPixel, sizeof(secondSampledPixel)) ==
@@ -193,6 +212,10 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(secondStats.descriptorSetLayoutCreations, firstStats.descriptorSetLayoutCreations);
     EXPECT_EQ(secondStats.pipelineLayoutCreations, firstStats.pipelineLayoutCreations);
     EXPECT_EQ(secondStats.graphicsPipelineCreations, firstStats.graphicsPipelineCreations);
+    EXPECT_EQ(secondStats.commandBufferAllocations, firstStats.commandBufferAllocations);
+    EXPECT_EQ(secondStats.descriptorPoolCreations, firstStats.descriptorPoolCreations);
+    EXPECT_EQ(secondStats.stagingBufferAllocations, firstStats.stagingBufferAllocations);
+    EXPECT_EQ(secondStats.renderPassCreations, firstStats.renderPassCreations);
 
     std::vector<uint8_t> pixels(32 * 32 * 4);
     ASSERT_TRUE(vernonRuntimeTextureCopyToHost(firstTarget, pixels.data(), pixels.size()) == VERNON_STATUS_OK);
@@ -225,4 +248,77 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     vernonRuntimePipelineBundleDestroy(loaded);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
+}
+
+TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
+    if (!vernonRuntimeGetCapabilities(VERNON_RUNTIME_VULKAN).available)
+        GTEST_SKIP() << "Vulkan runtime backend is unavailable";
+    const std::filesystem::path manifestPath = VERNON_VULKAN_COMPUTE_PIPELINE_BUNDLE;
+    std::ifstream input(manifestPath, std::ios::binary);
+    const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    ASSERT_FALSE(bundle.empty());
+    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_VULKAN, nullptr);
+    ASSERT_NE(runtime, nullptr);
+    const std::string directory = manifestPath.parent_path().u8string();
+    VernonPipelineBundleLoadOptions options{};
+    options.struct_size = sizeof(options);
+    options.bundle_directory = directory.c_str();
+    VernonPipelineBundle *loaded =
+        vernonRuntimeLoadPipelineBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+    ASSERT_NE(loaded, nullptr);
+    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
+    ASSERT_NE(pipeline, nullptr) << std::string(vernonRuntimeGetLastError(runtime).data,
+                                                vernonRuntimeGetLastError(runtime).size);
+    VernonPipelineParameterView valuesParameter{};
+    VernonPipelineParameterView factorParameter{};
+    ASSERT_EQ(vernonRuntimeLoadedPipelineFindParameter(pipeline, {"values", 6}, &valuesParameter), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeLoadedPipelineFindParameter(pipeline, {"factor", 6}, &factorParameter), VERNON_STATUS_OK);
+
+    constexpr std::array<float, 4> source{0, 1, 2, 3};
+    VernonDeviceBuffer *buffer = vernonRuntimeBufferAllocate(runtime, sizeof(source), alignof(float));
+    ASSERT_NE(buffer, nullptr);
+    ASSERT_EQ(vernonRuntimeCopyFromHost(buffer, 0, source.data(), sizeof(source)), VERNON_STATUS_OK);
+    constexpr uint64_t shape[]{4};
+    constexpr uint64_t scalarShape[]{1};
+    constexpr int64_t strides[]{sizeof(float)};
+    constexpr float factor = 3.0f;
+    VernonPipelineArgument arguments[2]{};
+    arguments[0].slot = valuesParameter.slot;
+    arguments[0].kind = VERNON_PIPELINE_TENSOR;
+    arguments[0].tensor.struct_size = sizeof(VernonTensorView);
+    arguments[0].tensor.storage = VERNON_TENSOR_DEVICE;
+    arguments[0].tensor.buffer = buffer;
+    arguments[0].tensor.dtype = VERNON_DATA_F32;
+    arguments[0].tensor.access = VERNON_ACCESS_WRITE;
+    arguments[0].tensor.rank = 1;
+    arguments[0].tensor.shape = shape;
+    arguments[0].tensor.byte_strides = strides;
+    arguments[0].tensor.byte_size = sizeof(source);
+    arguments[1].slot = factorParameter.slot;
+    arguments[1].kind = VERNON_PIPELINE_TENSOR;
+    arguments[1].tensor.struct_size = sizeof(VernonTensorView);
+    arguments[1].tensor.storage = VERNON_TENSOR_HOST;
+    arguments[1].tensor.host_data = &factor;
+    arguments[1].tensor.dtype = VERNON_DATA_F32;
+    arguments[1].tensor.access = VERNON_ACCESS_READ;
+    arguments[1].tensor.rank = 1;
+    arguments[1].tensor.shape = scalarShape;
+    arguments[1].tensor.byte_strides = strides;
+    arguments[1].tensor.byte_size = sizeof(factor);
+    VernonPipelineInvocation invocation{};
+    invocation.struct_size = sizeof(invocation);
+    invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+    invocation.arguments = arguments;
+    invocation.argument_count = std::size(arguments);
+    invocation.compute_grid = {4, 1, 1};
+    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
+        << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
+    std::array<float, 4> output{};
+    ASSERT_EQ(vernonRuntimeCopyToHost(buffer, 0, output.data(), sizeof(output)), VERNON_STATUS_OK);
+    for (size_t index = 0; index < output.size(); ++index)
+        EXPECT_EQ(output[index], source[index] * factor);
+    EXPECT_EQ(vernonRuntimeBufferFree(buffer), VERNON_STATUS_OK);
+    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    vernonRuntimePipelineBundleDestroy(loaded);
+    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
 }

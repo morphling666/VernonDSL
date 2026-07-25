@@ -258,10 +258,10 @@ class Pipeline:
             if parameter.kind == state._native.PIPELINE_TEXTURE:
                 if not isinstance(value, Texture):
                     raise TypeError(f"texture {parameter.name!r} must be a Texture")
-                builder.texture(parameter.name, value._resident_texture())
+                builder.rhi_texture(parameter.name, value._resident_texture())
                 continue
             if parameter.kind == state._native.PIPELINE_SAMPLER:
-                builder.sampler(parameter.name, value)
+                builder.rhi_sampler(parameter.name, value)
                 continue
             if parameter.kind != state._native.PIPELINE_TENSOR:
                 raise TypeError(f"pipeline parameter {parameter.name!r} has unsupported kind")
@@ -282,7 +282,9 @@ class Pipeline:
             if dtype is None:
                 raise TypeError(f"pipeline does not support dtype {value.dtype}")
             layout = value.layout
-            builder.device_tensor(
+            if state._rhi_host is None:
+                raise RuntimeError("device pipeline Tensor arguments require a GPU RHI host")
+            builder.rhi_tensor(
                 parameter.name,
                 value._resident_buffer(),
                 dtype,
@@ -305,7 +307,7 @@ class Pipeline:
                 texture = targets[name]
                 if not isinstance(texture, Texture):
                     raise TypeError(f"target {name!r} must be a Texture")
-                builder.color_attachment(output.location, texture._resident_texture())
+                builder.rhi_color_attachment(output.location, texture._resident_texture())
                 rendered_targets.append(texture)
         else:
             if (
@@ -315,7 +317,7 @@ class Pipeline:
                 or outputs[0].name != "output_0"
             ):
                 raise TypeError("target=Texture requires one unnamed fragment output at location zero")
-            builder.color_attachment(0, target._resident_texture())
+            builder.rhi_color_attachment(0, target._resident_texture())
             rendered_targets.append(target)
         if indices is not None:
             if (
@@ -325,7 +327,7 @@ class Pipeline:
                 or not indices.shape[0]
             ):
                 raise TypeError("indices must be a non-empty rank-one u32 TensorStorage")
-            builder.index_binding(indices._resident_buffer(), indices.shape[0])
+            builder.rhi_index_binding(indices._resident_buffer(), indices.shape[0])
             dispatch_borrows.append(("indices", indices, "read"))
         native_topology = {
             triangles: state._native.TOPOLOGY_TRIANGLE_LIST,
@@ -337,8 +339,7 @@ class Pipeline:
         builder.topology(native_topology)
         assert state._native_runtime is not None
         with _dispatch_borrow_scope(dispatch_borrows):
-            builder.invoke()
-            state._native_runtime.synchronize()
+            compiled.native.invoke(builder)
         for texture in rendered_targets:
             texture._mark_device_dirty()
 

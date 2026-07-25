@@ -6,12 +6,19 @@
 
 #include <cstdint>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace vernon::runtime {
 
-using ComputeArgumentMap = std::unordered_map<uint32_t, const VernonPipelineArgument *>;
+enum class ComputeLaunchArgumentKind { Tensor, Scalar };
+
+struct ComputeLaunchArgument {
+    ComputeLaunchArgumentKind kind{ComputeLaunchArgumentKind::Tensor};
+    VernonDeviceBuffer *buffer{};
+    VernonRuntimeProviderResourceReference resource{};
+    const void *scalarData{};
+    size_t scalarSize{};
+};
 
 struct ComputePlannerCallbacks {
     const void *userData{};
@@ -19,14 +26,14 @@ struct ComputePlannerCallbacks {
 };
 
 struct PlannedComputeLaunch {
-    std::vector<VernonLaunchArgument> arguments;
+    std::vector<ComputeLaunchArgument> arguments;
     std::vector<std::vector<uint8_t>> hostTensorStorage;
     VernonLaunchSize grid{};
 };
 
-bool planComputeLaunch(const Variant &variant, const ComputeArgumentMap &arguments,
-                       const VernonPipelineInvocation &invocation, const void *expectedContext,
-                       const ComputePlannerCallbacks &callbacks, PlannedComputeLaunch &plan, std::string &error);
+bool planComputeInvocation(const Variant &variant, const VernonPipelineInvocation &invocation,
+                           const void *expectedContext, const ComputePlannerCallbacks &callbacks,
+                           PlannedComputeLaunch &plan, std::string &error);
 
 } // namespace vernon::runtime
 

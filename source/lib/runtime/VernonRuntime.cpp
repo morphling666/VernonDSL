@@ -93,38 +93,36 @@ VernonRuntimeCapabilities vernonRuntimeGetCapabilities(VernonRuntimeBackend back
     return result;
 }
 
-VernonRuntimeContext *vernonRuntimeCreate(VernonRuntimeBackend backend, uint32_t deviceIndex) {
-    VernonRuntimeCreateOptions options{};
-    options.struct_size = sizeof(options);
-    options.device_index = deviceIndex;
-    return vernonRuntimeCreateWithOptions(backend, &options);
-}
-
 VernonRuntimeContext *vernonRuntimeCreateWithOptions(VernonRuntimeBackend backend,
                                                      const VernonRuntimeCreateOptions *options) {
-    if (!options || options->struct_size < sizeof(VernonRuntimeCreateOptions))
+    if (options && options->struct_size < sizeof(VernonRuntimeCreateOptions))
         return nullptr;
     auto context = std::make_unique<VernonRuntimeContext>();
     context->backend = backend;
-    if (!initializeBackend(*context, options->device_index))
+    if (!initializeBackend(*context, options ? options->device_index : 0))
         return nullptr;
     return context.release();
 }
 
-VernonRuntimeContext *vernonRuntimeCreateExternalOpenGL(const VernonExternalOpenGLContext *externalContext) {
-    return vernonRuntimeCreateExternalOpenGLForBackend(VERNON_RUNTIME_OPENGL, externalContext);
-}
-
-VernonRuntimeContext *vernonRuntimeCreateExternalOpenGLForBackend(VernonRuntimeBackend backend,
-                                                                  const VernonExternalOpenGLContext *externalContext) {
-    if (!externalContext || externalContext->struct_size < sizeof(VernonExternalOpenGLContext) ||
-        !externalContext->make_current || !externalContext->get_proc_address ||
-        (backend != VERNON_RUNTIME_OPENGL && backend != VERNON_RUNTIME_OPENGL_ES) ||
-        externalContext->api_version_major < 2)
+VernonRuntimeContext *vernonRuntimeCreateForRhiDevice(VernonRuntimeBackend backend, VernonRhiDevice device) {
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
         return nullptr;
     auto context = std::make_unique<VernonRuntimeContext>();
     context->backend = backend;
-    if (!initializeOpenGLBackend(*context, *externalContext))
+    if (!initializeBackendForRhiDevice(*context, device))
+        return nullptr;
+    return context.release();
+}
+
+VernonRuntimeContext *vernonRuntimeCreateOpenGLWithCallbacks(VernonRuntimeBackend backend,
+                                                             const VernonOpenGLContextCallbacks *callbacks) {
+    if (!callbacks || callbacks->struct_size < sizeof(VernonOpenGLContextCallbacks) || !callbacks->make_current ||
+        !callbacks->get_proc_address || (backend != VERNON_RUNTIME_OPENGL && backend != VERNON_RUNTIME_OPENGL_ES) ||
+        callbacks->api_version_major < 2)
+        return nullptr;
+    auto context = std::make_unique<VernonRuntimeContext>();
+    context->backend = backend;
+    if (!initializeOpenGLBackend(*context, *callbacks))
         return nullptr;
     return context.release();
 }
@@ -132,8 +130,8 @@ VernonRuntimeContext *vernonRuntimeCreateExternalOpenGLForBackend(VernonRuntimeB
 VernonStatus vernonRuntimeDestroy(VernonRuntimeContext *context) {
     if (!context)
         return VERNON_STATUS_OK;
-    if (context->liveBuffers || context->liveKernels || context->liveTextures || context->liveSamplers ||
-        context->liveBundles || context->livePipelines)
+    if (context->liveBuffers || context->liveTextures || context->liveSamplers || context->liveBundles ||
+        context->livePipelines)
         return fail(context, "runtime context still owns live handles");
     destroyBackend(*context);
     delete context;
@@ -253,13 +251,6 @@ VernonDeviceTexture *vernonRuntimeTextureCreate(VernonRuntimeContext *context,
     return texture.release();
 }
 
-VernonDeviceTexture *vernonRuntimeTextureCreate2D(VernonRuntimeContext *context, uint32_t width, uint32_t height,
-                                                  VernonTextureFormat format) {
-    const VernonTextureDescriptor descriptor{
-        sizeof(VernonTextureDescriptor), VERNON_TEXTURE_2D, format, width, height, 1, 1, {0, 0, 0, 0}};
-    return vernonRuntimeTextureCreate(context, &descriptor);
-}
-
 VernonDeviceTexture *vernonRuntimeImportOpenGLTexture(VernonRuntimeContext *context, uint32_t texture,
                                                       const VernonTextureDescriptor *descriptor) {
     if (!context || (context->backend != VERNON_RUNTIME_OPENGL && context->backend != VERNON_RUNTIME_OPENGL_ES) ||
@@ -280,13 +271,6 @@ VernonDeviceTexture *vernonRuntimeImportOpenGLTexture(VernonRuntimeContext *cont
     importBackendOpenGLTexture(*result, texture);
     ++context->liveTextures;
     return result.release();
-}
-
-VernonDeviceTexture *vernonRuntimeImportOpenGLTexture2D(VernonRuntimeContext *context, uint32_t texture, uint32_t width,
-                                                        uint32_t height, VernonTextureFormat format) {
-    const VernonTextureDescriptor descriptor{
-        sizeof(VernonTextureDescriptor), VERNON_TEXTURE_2D, format, width, height, 1, 1, {0, 0, 0, 0}};
-    return vernonRuntimeImportOpenGLTexture(context, texture, &descriptor);
 }
 
 VernonStatus vernonRuntimeTextureFree(VernonDeviceTexture *texture) {
@@ -361,22 +345,22 @@ VernonStatus vernonRuntimeTextureCopyToHost(const VernonDeviceTexture *texture, 
                 VERNON_STATUS_UNSUPPORTED_TARGET);
 }
 
-VernonLoadedKernel *vernonRuntimeLoadCpuEntry(VernonRuntimeContext *context, VernonCpuEntryPoint entryPoint,
-                                              const char *reflection, size_t reflectionSize, const char *entry,
-                                              size_t entrySize) {
+VernonLoadedPipeline *vernonRuntimeLoadCpuEntry(VernonRuntimeContext *context, VernonCpuEntryPoint entryPoint,
+                                                const char *reflection, size_t reflectionSize, const char *entry,
+                                                size_t entrySize) {
     if (!context || context->backend != VERNON_RUNTIME_CPU || !entryPoint || !reflection || !reflectionSize || !entry ||
         !entrySize)
         return nullptr;
-    return loadBackendCpuEntry(*context, entryPoint, reflection, reflectionSize, entry, entrySize);
+    return loadBackendCpuEntryPipeline(*context, entryPoint, reflection, reflectionSize, entry, entrySize);
 }
 
 VernonStatus vernonRuntimeRegisterStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint entryPoint) {
     return registerBackendStaticCpuEntry(symbol, entryPoint);
 }
 
-VernonLoadedKernel *vernonRuntimeLoadArtifact(VernonRuntimeContext *context, const void *artifact, size_t artifactSize,
-                                              const char *reflection, size_t reflectionSize, const char *entry,
-                                              size_t entrySize) {
+VernonLoadedPipeline *vernonRuntimeLoadArtifact(VernonRuntimeContext *context, const void *artifact,
+                                                size_t artifactSize, const char *reflection, size_t reflectionSize,
+                                                const char *entry, size_t entrySize) {
     if (!context || !artifact || !artifactSize || !reflection || !reflectionSize || !entry || !entrySize)
         return nullptr;
     if (context->backend == VERNON_RUNTIME_CPU) {
@@ -386,10 +370,10 @@ VernonLoadedKernel *vernonRuntimeLoadArtifact(VernonRuntimeContext *context, con
              VERNON_STATUS_UNSUPPORTED_TARGET);
         return nullptr;
     }
-    return loadBackendArtifact(*context, artifact, artifactSize, reflection, reflectionSize, entry, entrySize);
+    return loadBackendArtifactPipeline(*context, artifact, artifactSize, reflection, reflectionSize, entry, entrySize);
 }
 
-VernonLoadedKernel *vernonRuntimeLoadComputeBundle(VernonRuntimeContext *context, const char *directory) {
+VernonLoadedPipeline *vernonRuntimeLoadComputeBundle(VernonRuntimeContext *context, const char *directory) {
     if (!context || context->backend != VERNON_RUNTIME_CPU || !directory)
         return nullptr;
     try {
@@ -397,54 +381,11 @@ VernonLoadedKernel *vernonRuntimeLoadComputeBundle(VernonRuntimeContext *context
         CpuNativeArtifact artifact;
         if (!parseCpuComputeBundle(root, artifact, context->error))
             return nullptr;
-        return loadBackendCpuNativeArtifact(*context, artifact);
+        return loadBackendCpuNativePipeline(*context, artifact);
     } catch (const std::exception &error) {
         fail(context, std::string("failed to load CPU AOT bundle: ") + error.what(), VERNON_STATUS_INTERNAL_ERROR);
         return nullptr;
     }
-}
-
-VernonStatus vernonRuntimeKernelUnload(VernonLoadedKernel *kernel) {
-    if (!kernel)
-        return VERNON_STATUS_OK;
-    const VernonStatus status = unloadBackendKernel(*kernel);
-    if (status != VERNON_STATUS_OK)
-        return status;
-    --kernel->context->liveKernels;
-    delete kernel;
-    return VERNON_STATUS_OK;
-}
-
-VernonStatus vernonRuntimeLaunch(VernonLoadedKernel *kernel, VernonLaunchSize globalSize,
-                                 const VernonLaunchArgument *arguments, size_t argumentCount) {
-    if (!kernel || !globalSize.x || !globalSize.y || !globalSize.z)
-        return fail(kernel ? kernel->context : nullptr, "compute launch grid dimensions must be positive");
-    const size_t expected = static_cast<size_t>(
-        std::count_if(kernel->reflection.arguments.begin(), kernel->reflection.arguments.end(),
-                      [](const ReflectedArgument &argument) { return argument.kind != "builtin"; }));
-    if (argumentCount != expected || (expected && !arguments))
-        return fail(kernel->context, "compute launch argument count does not match reflection");
-
-    size_t validated = 0;
-    for (const ReflectedArgument &reflected : kernel->reflection.arguments) {
-        if (reflected.kind == "builtin")
-            continue;
-        const VernonLaunchArgument &argument = arguments[validated++];
-        if (reflected.kind == "tensor") {
-            if (argument.kind != VERNON_LAUNCH_TENSOR || !argument.buffer ||
-                argument.buffer->context != kernel->context ||
-                (reflected.tensorBytes && argument.buffer->size < reflected.tensorBytes) ||
-                argument.buffer->alignment < reflected.alignment)
-                return fail(kernel->context, "compute Tensor argument does not match reflection");
-        } else if (argument.kind != VERNON_LAUNCH_SCALAR || !argument.scalar_data ||
-                   argument.scalar_size != reflected.cpuSize) {
-            return fail(kernel->context, "compute scalar argument does not match reflection");
-        }
-    }
-
-    const VernonStatus status = launchBackendKernel(*kernel, globalSize, arguments, argumentCount);
-    return status == VERNON_STATUS_UNSUPPORTED_TARGET ? fail(kernel->context, "compute backend is unsupported", status)
-                                                      : status;
 }
 
 VernonStatus vernonRuntimePipelineBundleInspectTarget(const void *bundleData, size_t bundleSize,
@@ -480,11 +421,6 @@ VernonStatus vernonRuntimePipelineBundleInspectTarget(const void *bundleData, si
     } catch (...) {
         return VERNON_STATUS_PARSE_ERROR;
     }
-}
-
-VernonPipelineBundle *vernonRuntimeLoadPipelineBundle(VernonRuntimeContext *context, const void *bundleData,
-                                                      size_t bundleSize) {
-    return vernonRuntimeLoadPipelineBundleWithOptions(context, bundleData, bundleSize, nullptr);
 }
 
 VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeContext *context, const void *bundleData,
@@ -873,6 +809,19 @@ VernonStatus vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline, const V
         invocation->abi_version != VERNON_PIPELINE_INVOCATION_ABI_VERSION ||
         (invocation->argument_count && !invocation->arguments))
         return fail(pipeline ? pipeline->context : nullptr, "invalid pipeline invocation");
+    if (!pipeline->variant.compute.empty()) {
+        PlannedComputeLaunch plan;
+        std::string planningError;
+        const ComputePlannerCallbacks plannerCallbacks{
+            nullptr, [](const void *, const VernonDeviceBuffer *buffer) -> const void * {
+                return buffer ? buffer->context : nullptr;
+            }};
+        if (!planComputeInvocation(pipeline->variant, *invocation, pipeline->context, plannerCallbacks, plan,
+                                   planningError))
+            return fail(pipeline->context, planningError);
+        return invokeBackendComputePipeline(*pipeline, plan);
+    }
+
     PlannedGraphicsInvocation plan;
     std::string planningError;
     const GraphicsPlannerCallbacks plannerCallbacks{nullptr, &plannerBufferSnapshot, &plannerTextureSnapshot,
@@ -880,23 +829,7 @@ VernonStatus vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline, const V
     if (!planGraphicsInvocation(pipeline->variant, *invocation, pipeline->context, plannerCallbacks, plan,
                                 planningError))
         return fail(pipeline->context, planningError);
-    const auto &arguments = plan.arguments;
-
-    if (pipeline->variant.compute.empty())
-        return invokeBackendPipeline(*pipeline, *invocation, plan);
-    if (isOpenGLBackend(pipeline->context->backend))
-        return invokeBackendComputePipeline(*pipeline, *invocation, plan);
-    VernonLoadedKernel *computeKernel = backendPipelineComputeKernel(*pipeline);
-    if (!computeKernel)
-        return fail(pipeline->context, "compute pipeline program is not loaded");
-    PlannedComputeLaunch computePlan;
-    std::string computePlanningError;
-    const ComputePlannerCallbacks computePlannerCallbacks{nullptr, &plannerBufferContext};
-    if (!planComputeLaunch(pipeline->variant, arguments, *invocation, pipeline->context, computePlannerCallbacks,
-                           computePlan, computePlanningError))
-        return fail(pipeline->context, computePlanningError);
-    return vernonRuntimeLaunch(computeKernel, computePlan.grid, computePlan.arguments.data(),
-                               computePlan.arguments.size());
+    return invokeBackendPipeline(*pipeline, *invocation, plan);
 }
 
 VernonStatus vernonRuntimeComputeToGraphicsBarrier(VernonRuntimeContext *context) {
@@ -909,6 +842,23 @@ VernonStatus vernonRuntimeSynchronize(VernonRuntimeContext *context) {
     if (!context)
         return VERNON_STATUS_INVALID_ARGUMENT;
     return synchronizeBackend(*context);
+}
+
+VernonStatus vernonRuntimeReferenceRhiBuffer(VernonRuntimeContext *context, VernonRhiBuffer buffer, uint64_t offset,
+                                             uint64_t size, VernonRuntimeProviderResourceReference *output) {
+    if (!context || !output)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    return referenceBackendRhiBuffer(*context, buffer, offset, size, *output);
+}
+
+VernonStatus vernonRuntimeReferenceRhiImage(VernonRuntimeContext *context, VernonRhiImage image,
+                                            VernonRuntimeProviderResourceReference *output) {
+    return context && output ? referenceBackendRhiImage(*context, image, *output) : VERNON_STATUS_INVALID_ARGUMENT;
+}
+
+VernonStatus vernonRuntimeReferenceRhiSampler(VernonRuntimeContext *context, VernonRhiSampler sampler,
+                                              VernonRuntimeProviderResourceReference *output) {
+    return context && output ? referenceBackendRhiSampler(*context, sampler, *output) : VERNON_STATUS_INVALID_ARGUMENT;
 }
 
 } // extern "C"

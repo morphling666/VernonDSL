@@ -65,7 +65,7 @@ TEST(RuntimeCpuPipeline, ReflectsVersionedTextureConstraints) {
     const std::string bundle = readFile(directory / "cpu_fill.pipeline.json");
     ASSERT_FALSE(bundle.empty());
 
-    VernonRuntimeContext *runtime = vernonRuntimeCreate(VERNON_RUNTIME_CPU, 0);
+    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(runtime, nullptr);
 
     VernonPipelineBundle *tensorBundle = loadWithDirectory(runtime, bundle, directoryUtf8);
@@ -140,10 +140,10 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     ASSERT_TRUE(vernonRuntimePipelineBundleInspectTarget(bundle.data(), bundle.size(), &target) == VERNON_STATUS_OK);
     ASSERT_TRUE(target == VERNON_RUNTIME_CPU);
 
-    VernonRuntimeContext *runtime = vernonRuntimeCreate(VERNON_RUNTIME_CPU, 0);
+    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_TRUE(runtime);
 
-    ASSERT_TRUE(!vernonRuntimeLoadPipelineBundle(runtime, bundle.data(), bundle.size()));
+    ASSERT_TRUE(!vernonRuntimeLoadPipelineBundleWithOptions(runtime, bundle.data(), bundle.size(), nullptr));
 
     VernonPipelineBundle *loaded = loadWithDirectory(runtime, bundle, directoryUtf8);
     ASSERT_TRUE(loaded);

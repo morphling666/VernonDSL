@@ -17,13 +17,13 @@ struct VernonRuntimeContext {
     VernonRuntimeBackend backend{VERNON_RUNTIME_CPU};
     std::string error;
     size_t liveBuffers{};
-    size_t liveKernels{};
     size_t liveTextures{};
     size_t liveSamplers{};
     size_t liveBundles{};
     size_t livePipelines{};
     void *backendState{};
     void (*destroyBackendState)(void *){};
+    bool borrowedRhiDevice{};
 };
 
 template <typename State, typename Handle> State &runtimeBackendState(Handle &handle) {
@@ -84,13 +84,6 @@ struct VernonPipelineBundle {
 struct VernonLoadedPipeline {
     VernonRuntimeContext *context{};
     vernon::runtime::Variant variant;
-    void *backendState{};
-    void (*destroyBackendState)(void *){};
-};
-
-struct VernonLoadedKernel {
-    VernonRuntimeContext *context{};
-    vernon::runtime::ReflectedEntry reflection;
     void *backendState{};
     void (*destroyBackendState)(void *){};
 };

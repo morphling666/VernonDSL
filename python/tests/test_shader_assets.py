@@ -708,6 +708,9 @@ asset = vd.pipeline_asset(
                     {stage["stage"] for stage in document["stage_artifacts"].values()},
                     stages,
                 )
+                if target in {"cuda", "cpu"}:
+                    parameters = {parameter["name"]: parameter for parameter in document["variants"][0]["parameters"]}
+                    self.assertEqual(parameters["values"]["shape"], [0])
                 if target == "opengl":
                     self.assertEqual(len({variant["program"]["vertex"] for variant in document["variants"]}), 2)
                     self.assertEqual(len({variant["program"]["fragment"] for variant in document["variants"]}), 1)

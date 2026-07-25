@@ -136,6 +136,37 @@ module attributes {
 
 
 class CompiledProgramTests(unittest.TestCase):
+    def test_context_owned_python_gpu_resource_api_is_removed(self) -> None:
+        self.assertFalse(hasattr(native.Runtime, "create_texture"))
+        self.assertFalse(hasattr(native.Runtime, "import_opengl_sampler"))
+        self.assertFalse(hasattr(native, "Texture"))
+        self.assertFalse(hasattr(native, "Sampler"))
+
+    def test_standalone_rhi_buffer_owns_generational_resource(self) -> None:
+        try:
+            host = native.RhiHost(native.RhiBackend.CUDA)
+        except RuntimeError:
+            self.skipTest("CUDA RHI device is unavailable")
+        source = struct.pack("4I", 1, 2, 3, 4)
+        buffer = host.create_buffer(len(source))
+        buffer.upload(source)
+        self.assertEqual(buffer.download(), source)
+        runtime = host.create_runtime()
+        self.assertIsNotNone(runtime)
+        host.synchronize()
+
+    def test_standalone_rhi_image_upload_and_download(self) -> None:
+        for backend in (native.RhiBackend.VULKAN, native.RhiBackend.DIRECTX12):
+            with self.subTest(backend=backend):
+                try:
+                    host = native.RhiHost(backend)
+                except RuntimeError:
+                    continue
+                source = bytes(range(16))
+                image = host.create_image(2, 2)
+                image.upload(source)
+                self.assertEqual(image.download(), source)
+
     def test_graphics_dynamic_bounds_structured_loop_compiles(self) -> None:
         module = compile_source(
             "from vernon_dsl import *\n"
@@ -210,13 +241,13 @@ class CompiledProgramTests(unittest.TestCase):
         runtime = native.Runtime(native.RuntimeBackend.CPU)
         with self.assertRaisesRegex(RuntimeError, "CPU entry 'missing' was not found"):
             runtime.load_cpu_entry(program, "missing")
-        kernel = runtime.load_cpu_entry(program, "increment")
+        pipeline = runtime.load_cpu_entry(program, "increment")
         del program
         gc.collect()
 
         values = runtime.allocate(12, 4)
         values.upload(struct.pack("=3f", 2.0, 4.0, 6.0))
-        kernel.launch(3, 1, 1, [values])
+        pipeline.invoke(3, 1, 1, [values])
         self.assertEqual(struct.unpack("=3f", values.download()), (3.0, 5.0, 7.0))
 
     def test_cpu_tuple_create_and_constant_extract_lowering(self) -> None:

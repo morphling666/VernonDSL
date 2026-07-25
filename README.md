@@ -164,16 +164,17 @@ build/source/Release/vernon-compile.exe `
   --output-dir build/vulkan
 ```
 
-## Run an explicit compute kernel
+## Run an explicit compute pipeline
 
-Runtime kernels use an explicit global grid and runtime-owned contiguous
-Tensors. Builtin arguments are synthesized and omitted from the call:
+The `@kernel` frontend compiles to a compute pipeline with an explicit global
+grid and runtime-owned contiguous Tensors. Builtin arguments are synthesized
+and omitted from the call:
 
 ```python
 from typing import Annotated
 import vernon_dsl as vd
 
-vd.init(arch=vd.cpu)  # vd.cuda and vd.vulkan use the same native Kernel API
+vd.init(arch=vd.cpu)  # vd.cuda and vd.vulkan use the same LoadedPipeline API
 output = vd.Tensor.zeros(dtype=vd.f32, shape=(8,))
 
 @vd.kernel(workgroup_size=(8, 1, 1))
@@ -192,11 +193,12 @@ values = output.to_numpy()
 ```
 
 All three compute backends lower the restricted Python AST to Vernon MLIR on
-the first specialized call, compile a target artifact, cache the loaded native
-kernel, and launch through `VernonRuntime`. CPU execution retains the owning
+the first specialized call, compile a target artifact, cache a native
+`LoadedPipeline`, and invoke it through `VernonRuntime`. CPU execution retains the owning
 in-process compiler result and loads its JIT entry directly into the runtime;
 `@kernel` does not invoke a compiler subprocess or create a temporary compute
-bundle.
+bundle. CPU entries use RuntimeCpuProvider; GPU artifacts use
+VernonRuntimeRHIAdapter. Both execute through RuntimeCore.
 
 The `source/lib/runtime/` subproject builds the standalone `VernonRuntime` C
 API with CPU AOT execution. `VERNON_ENABLE_CUDA_RUNTIME` dynamically loads the

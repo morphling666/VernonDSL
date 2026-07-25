@@ -2,54 +2,30 @@
 #define VERNON_RUNTIME_BACKEND_VULKAN_H
 
 #include "VernonRuntime.h"
+#include "VernonRuntimeCore.h"
 #include "pipeline_metadata.h"
 #include "runtime_state.h"
 
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-#include "backend_vulkan_driver.h"
+#include "../rhi/vulkan_backend.h"
 #endif
 
 #include <string>
+#include <vector>
 
 struct VernonDeviceBuffer;
 struct VernonDeviceSampler;
 struct VernonDeviceTexture;
+struct VernonRuntimeRhiAdapter;
 namespace vernon::runtime {
 
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-struct VulkanContextState {
-    VkInstance instance{};
-    VkPhysicalDevice physicalDevice{};
-    VkDevice device{};
-    VkQueue queue{};
-    uint32_t queueFamily{};
-    uint32_t maxPushConstantsSize{};
-    uint32_t apiVersion{};
-    uint32_t maxComputeWorkGroupInvocations{};
-    uint32_t maxComputeWorkGroupSize[3]{};
-    VkCommandPool commandPool{};
-    VkPhysicalDeviceMemoryProperties memoryProperties{};
-    VkSampler defaultImplicitSampler{};
-    size_t defaultImplicitSamplerCreations{};
+struct VulkanContextState : rhi::vulkan::DeviceState {
+    VernonRuntimeRhiAdapter *adapter{};
 };
-
-struct VulkanBufferState {
-    VkBuffer buffer{};
-    VkDeviceMemory memory{};
-};
-
-struct VulkanTextureState {
-    VkImage image{};
-    VkDeviceMemory memory{};
-    VkImageView view{};
-    VkImageLayout layout{VK_IMAGE_LAYOUT_UNDEFINED};
-    VkFormat format{VK_FORMAT_UNDEFINED};
-    bool colorAttachment{};
-};
-
-struct VulkanSamplerState {
-    VkSampler sampler{};
-};
+using VulkanBufferState = rhi::vulkan::Buffer;
+using VulkanTextureState = rhi::vulkan::Image;
+using VulkanSamplerState = rhi::vulkan::Sampler;
 
 inline VulkanContextState &vulkanState(VernonRuntimeContext &context) {
     return runtimeBackendState<VulkanContextState>(context);
@@ -83,14 +59,37 @@ inline const VulkanSamplerState &vulkanSamplerState(const VernonDeviceSampler &s
     return runtimeBackendState<VulkanSamplerState>(sampler);
 }
 
-struct VulkanKernelState {
-    VkShaderModule shader{};
-    VkDescriptorSetLayout descriptorSetLayout{};
-    VkPipelineLayout pipelineLayout{};
-    VkPipeline pipeline{};
+struct VulkanPipelineState {
+    struct Binding {
+        enum Source {
+            EXTERNAL_VERTEX,
+            EXTERNAL_TEXTURE,
+            EXTERNAL_SAMPLER,
+            EXTERNAL_UNIFORM,
+            IMPLICIT_SAMPLER,
+            RESOLUTION
+        };
+        Source source{};
+        uint32_t externalSlot{};
+        std::vector<uint8_t> storage;
+    };
+
+    VernonRuntimeCorePipeline *rhiComputePipeline{};
+    VernonRuntimeCoreBindings *rhiComputeBindings{};
+    std::vector<VernonRuntimeProviderBindingLayoutEntry> rhiComputeLayout;
+    std::vector<VernonRuntimeProviderBindingValue> rhiComputeValues;
+    std::vector<uint64_t> rhiComputeResourceOffsets;
+    uint32_t rhiComputeWorkgroup[3]{1, 1, 1};
+    VernonRuntimeCorePipeline *rhiGraphicsPipeline{};
+    VernonRuntimeCoreBindings *rhiGraphicsBindings{};
+    VernonRuntimeCoreGraphicsVariant *rhiGraphicsVariant{};
+    std::vector<VernonRuntimeProviderBindingLayoutEntry> rhiGraphicsLayout;
+    std::vector<VernonRuntimeProviderBindingValue> rhiGraphicsValues;
+    std::vector<Binding> rhiGraphicsBindingPlan;
+    std::vector<uint32_t> rhiGraphicsFormats;
+    uint64_t rhiGraphicsVertexLayoutIdentity{};
+    uint32_t rhiGraphicsTopology{};
 };
-#else
-struct VulkanKernelState {};
 #endif
 
 bool probeVulkan(std::string &diagnostic);
@@ -100,9 +99,6 @@ VernonStatus synchronizeVulkan(VernonRuntimeContext &context);
 
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
 bool createVulkanBuffer(VernonRuntimeContext &context, VkDeviceSize size, VkBuffer &buffer, VkDeviceMemory &memory);
-bool createVulkanShaderModule(VernonRuntimeContext &context, const void *data, size_t size, VkShaderModule &module,
-                              uint32_t pushConstantBaseOffset = 0);
-void destroyVulkanShaderModule(VernonRuntimeContext &context, VkShaderModule &module);
 void transitionVulkanImageLayout(VkCommandBuffer command, VernonDeviceTexture &texture, VkImageLayout newLayout);
 bool beginVulkanCommands(VernonRuntimeContext &context, VkCommandBuffer &command, std::string &error);
 bool submitVulkanCommands(VernonRuntimeContext &context, VkCommandBuffer command, std::string &error);
@@ -118,14 +114,6 @@ VernonStatus copyToVulkanTexture(VernonDeviceTexture &texture, const void *sourc
 VernonStatus copyFromVulkanTexture(const VernonDeviceTexture &texture, void *destination, size_t size);
 bool createVulkanSampler(VernonDeviceSampler &sampler);
 void destroyVulkanSampler(VernonDeviceSampler &sampler);
-
-bool loadVulkanKernel(VernonRuntimeContext &context, const void *artifact, size_t artifactSize, const char *reflection,
-                      size_t reflectionSize, const char *entry, size_t entrySize, VulkanKernelState &state,
-                      ReflectedEntry &metadata);
-void destroyVulkanKernel(VernonRuntimeContext &context, VulkanKernelState &state);
-VernonStatus launchVulkanKernel(VernonRuntimeContext &context, const VulkanKernelState &state,
-                                const ReflectedEntry &metadata, VernonLaunchSize globalSize,
-                                const VernonLaunchArgument *arguments, size_t argumentCount);
 
 } // namespace vernon::runtime
 

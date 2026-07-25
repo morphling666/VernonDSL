@@ -783,6 +783,13 @@ class KernelTests(unittest.TestCase):
         fill(output, 20.0, grid=(3, 2, 1))
         self.assertEqual(fill.compile_count, 1)
 
+    def test_warm_dispatch_skips_frontend_lowering(self) -> None:
+        output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
+        with mock.patch.object(fill, "_lower", wraps=fill._lower) as lower:
+            fill(output, 10.0, grid=(3, 2, 1))
+            fill(output, 20.0, grid=(3, 2, 1))
+        lower.assert_called_once()
+
     def test_cpu_kernel_uses_in_process_owning_compiler(self) -> None:
         output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
         with mock.patch("subprocess.run", side_effect=AssertionError("subprocess prohibited")):

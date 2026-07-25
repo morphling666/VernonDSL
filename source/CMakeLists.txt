@@ -62,7 +62,7 @@ if(TARGET VernonRuntime AND TARGET VernonDSLCompiler)
         if(nanobind_FOUND)
             nanobind_add_module(vernon-dsl-native python/native_module.cpp)
             vernon_set_python_module_output(vernon-dsl-native)
-            target_link_libraries(vernon-dsl-native PRIVATE VernonDSLCompiler Vernon::Runtime)
+            target_link_libraries(vernon-dsl-native PRIVATE VernonDSLCompiler Vernon::Runtime Vernon::RHI)
             if(MSVC)
                 target_compile_options(vernon-dsl-native PRIVATE /EHsc)
             endif()
@@ -72,6 +72,8 @@ if(TARGET VernonRuntime AND TARGET VernonDSLCompiler)
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:VernonDSLCompiler>
                         $<TARGET_FILE_DIR:vernon-dsl-native>
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:VernonRuntime>
+                        $<TARGET_FILE_DIR:vernon-dsl-native>
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:VernonRHI>
                         $<TARGET_FILE_DIR:vernon-dsl-native>)
             set_target_properties(vernon-dsl-native PROPERTIES OUTPUT_NAME "_native")
             if(APPLE)

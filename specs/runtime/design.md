@@ -34,6 +34,15 @@ context. The Python wheel's separate `_gl_context` extension links GLFW, owns a
 hidden window/context, and keeps that owner alive until after all AHI children
 and the runtime are destroyed. Runtime-only builds never discover GLFW.
 
+The OpenGL function table, external-context callbacks, buffers, images,
+samplers, shader compilation, programs, vertex arrays, and attachment
+framebuffer objects are owned by VernonRHI. Runtime retains format and
+invocation policy while PipelineAsset and direct compute-artifact loaders both
+produce `VernonLoadedPipeline` and execute through RuntimeCore and the RHI
+provider adapter.
+`VernonOpenGLContextCallbacks` is the single context contract for Python and
+Engine owners; backend behavior never branches on context origin.
+
 ## Vulkan graphics bundles
 
 Cooked pipeline schema 2 stores each SPIR-V stage as a content-addressed
@@ -69,7 +78,7 @@ and remains compute-only because Vernon does not provide a software rasterizer.
 
 ## Target execution architecture
 
-GPU execution is split into three independent targets:
+Execution is split across RuntimeCore and backend-specific providers:
 
 - `VernonRHI` is the hardware layer. Capability facets separate Compute,
   Graphics, and NativeInterop; CUDA implements Compute only.
@@ -79,6 +88,8 @@ GPU execution is split into three independent targets:
 - `VernonRuntimeRHIAdapter` implements that SPI with VernonRHI. A foreign
   engine may instead implement the SPI with its own RHI and depend only on
   RuntimeCore.
+- `RuntimeCpuProvider` implements the Compute facet directly over CPU AOT/JIT
+  entries and host buffers. It does not link VernonRHI; dispatch is synchronous.
 
 RuntimeCore never owns textures, framebuffers, render graphs, queues, or
 resource state. Provider-owned resource references are non-owning opaque
@@ -88,10 +99,27 @@ submission, completion, and transient descriptor/upload storage.
 Pipeline loading prepares layouts and immutable pipelines once. Invocation
 uses pre-resolved slots and prepared bindings; it must not parse manifests,
 perform name lookup, or create pipeline/layout objects on the hot path.
+The OpenGL provider covers compute plus graphics pipelines with storage
+buffers, inline scalar buffers, float uniforms, sampled images, explicit or
+implicit samplers, vertex inputs, index buffers, and color attachments. Shader
+compilation, uniform-location lookup, program linking, VAO, binding storage,
+and attachment FBO creation happen during pipeline preparation. Dispatch and
+draw encode into those stable objects. RuntimeCore preallocates both sides of
+its resource-reference swap so repeated binding updates do not allocate merely
+because an optional sampler changes between a native object and the provider
+default.
 
-The current context-owned backend API remains a migration implementation.
-Python standalone execution will create a VernonRHI device and use the same
-RuntimeCore/provider path rather than retaining a second backend encoder.
+Runtime implementation is separated by responsibility:
+`runtime_backend_dispatch` handles contexts and resources,
+`runtime_pipeline_direct` adapts direct compute artifacts and CPU entries into
+synthetic compute pipelines, and `runtime_pipeline_dispatch` routes
+PipelineAsset resolution plus compute/graphics invocation. Pipeline
+preparation, destruction, and invocation live in the CPU, CUDA, Vulkan, D3D12,
+and OpenGL pipeline translation units; the dispatch file contains only backend
+routing and synchronization. There is no Runtime Kernel handle or kernel
+dispatch layer. RHI provider implementations are split into common, CUDA,
+D3D12, OpenGL, and Vulkan translation units; CPU provider preparation remains
+with RuntimeCpuProvider.
 
 ## Distribution and Engine ownership
 
@@ -102,6 +130,51 @@ without adopting VernonRHI.
 
 RHI and provider handles are scoped to their creating device and must never
 cross devices or independently loaded Runtime/RHI copies.
+When Runtime is a shared library, VernonRHI is also shared. Engine and Runtime
+must resolve one RHI module so process-wide device handles cannot accidentally
+address duplicate static registries.
+
+D3D12 device selection, COM device/queue/allocator/list/fence ownership,
+resource creation, and resource destruction live in VernonRHI. RuntimeCore
+owns format and invocation planning; the D3D12 provider owns preparation and
+encoding. Three command frames rotate allocator/list ownership. Persistently
+mapped upload/readback rings and persistent RTV/resource/sampler descriptor
+rings grow geometrically and reuse storage after completed submissions. The
+current C ABI submission remains synchronous, so ring wrap cannot overwrite
+in-flight GPU data; asynchronous submission will require fence-tagged ring
+segments.
+
+D3D12 graphics preparation is lazy because render-target formats, topology,
+and concrete vertex strides arrive with the first invocation. The resulting
+root signature (including descriptor tables), input layout, and PSO are cached
+as one prepared entry keyed by those invocation-stable properties. Repeated
+draws reuse the complete entry without creating new D3D12 pipeline objects.
+
+D3D12 NativeInterop uses external-recording ownership. Borrowed devices,
+queues, and open direct command lists are referenced without `AddRef`; imported
+buffers, images, and descriptor ranges receive RHI generational handles but
+remain owner-managed COM objects. Destroying those RHI handles only invalidates
+the slots. RHI does not close, execute, signal, synchronize, or release the
+borrowed objects; the owner submits the recorded command list and controls
+completion.
+
+Vulkan loader dispatch and instance, physical/logical device, queue, command
+pool, buffer/memory, image/view/memory, and sampler ownership live in
+VernonRHI. Runtime keeps shader reflection and invocation compatibility while
+delegating allocation, destruction, command recording, submission, and device
+completion to the RHI device state.
+
+Runtime-visible Vulkan buffers use device-local memory. Host transfers pass
+through persistent mapped upload/readback rings. Three command buffers and
+fences rotate from one RHI-owned command pool, and descriptor sets come from
+one resettable device pool. Submission remains synchronous for compatibility,
+so completed submissions safely reset transient ring offsets and descriptor
+allocations without per-invocation Vulkan object creation.
+
+Vulkan graphics prefers dynamic rendering when Vulkan 1.3, or Vulkan 1.2 with
+`VK_KHR_dynamic_rendering`, exposes the feature. Older devices use cached render
+passes keyed by attachment-location formats; framebuffers remain invocation
+specific because they contain the concrete image views and extent.
 
 The deployable Runtime does not depend on LLVM, MLIR, GLFW, the CUDA Toolkit,
 or a statically linked Vulkan loader. Compiler and asset cooking remain host
@@ -109,10 +182,13 @@ tools. CPU deployment uses registered AOT object entry points; CUDA and Vulkan
 resolve system drivers dynamically; OpenGL/GLES consume an externally owned
 context.
 
-Engine-owned Vulkan instance/device/queue and borrowed image/buffer adoption
-remain a future integration boundary. That work must preserve queue ownership,
-layout, synchronization, and lifetime metadata explicitly rather than treating
-native handles as untyped integers.
+Vulkan NativeInterop adopts an externally owned instance, physical/logical
+device, queue, and command buffer without submitting, synchronizing, resetting,
+or destroying them. Imported buffers, images, and image views use generational
+RHI handles while retaining explicit size, format, subresource, usage, layout,
+and queue-capability metadata. Image destruction is rejected while an imported
+view still references it; releasing an RHI handle never releases the borrowed
+native object.
 
 ## CUDA driver loading
 
@@ -120,6 +196,16 @@ The optional CUDA backend dynamically resolves the stable Driver API from
 `nvcuda.dll` on Windows or `libcuda.so.1` on Linux. Vernon emits PTX through
 LLVM and therefore does not require CUDA Toolkit headers, import libraries, or
 `nvcc`; a compatible installed NVIDIA display driver is sufficient.
+
+CUDA driver loading, primary-context ownership, streams, device allocation,
+modules, and functions belong to VernonRHI. Each device keeps one persistent
+non-default stream, and synchronous compatibility transfers reuse a
+size-matched pinned staging pool around asynchronous Driver API copies. Compute
+pipeline preparation fixes the argument pointer layout once; dispatch only
+updates preallocated descriptors and enqueues on the persistent stream. Both
+direct artifact pipelines and PipelineAsset compute pipelines use this path,
+avoiding module, stream, staging, and argument-vector allocation on the hot
+path.
 
 ## CUDA structured control flow
 
@@ -183,16 +269,16 @@ limits. Metal omits this field because it has no Runtime backend.
 `target_options` records how compilation was requested; it is not a runtime
 capability contract. `runtime_requirements` records the minimum capabilities
 needed by the resulting artifact. Runtime validates the latter after the
-manifest hash and target, but before resolving or loading artifacts. Missing
-requirements preserve legacy schema-2 loading behavior. CUDA intentionally
-does not infer a driver version from PTX; compute capability is checked early,
-and the CUDA driver JIT remains authoritative for PTX compatibility.
+manifest hash and target, but before resolving or loading artifacts. The field
+is mandatory. CUDA intentionally does not infer a driver version from PTX;
+compute capability is checked early, and the CUDA driver JIT remains
+authoritative for PTX compatibility.
 
 ## OpenGL and OpenGL ES runtime
 
 OpenGL and OpenGL ES are external-context AHI backends. The context owner
 supplies `make_current` and `get_proc_address` callbacks through
-`vernonRuntimeCreateExternalOpenGLForBackend`; Engine may register its existing
+`vernonRuntimeCreateOpenGLWithCallbacks`; Engine may register its existing
 context with `register_external_opengl_context`. Otherwise Python creates a
 hidden context through the separately linked `_gl_context` GLFW extension.
 `VernonRuntime` itself never creates or links a window-system context.
@@ -230,10 +316,11 @@ padded-row and sliced-batch layouts.
 
 ## Pipeline runtime boundary
 
-Kernel is the compute program form. Pipeline is the graphics program form and
-contains a validated tuple of graphics stages. A persistent PipelineAsset wraps
-exactly one of those forms; compute and graphics entries are never combined in
-one pipeline.
+`VernonLoadedPipeline` is the only Runtime program handle. It represents either
+one compute stage or a validated tuple of graphics stages; compute and graphics
+entries are never combined in one pipeline. A persistent PipelineAsset resolves
+to the same handle. Direct CPU entries and raw GPU artifacts synthesize a
+compute-only variant and return `VernonLoadedPipeline` as well.
 
 PipelineAsset target architecture and options are selected by the cooker. A
 compute PipelineAsset resolves only against a compute backend, while a graphics
@@ -277,6 +364,12 @@ Pipeline invocation ABI version 3 carries index bindings, color attachments,
 topology, viewport, scissor, compute grid, and reflected argument slots.
 Backend-specific command encoding consumes this common invocation without
 exposing legacy program/draw entry points.
+
+Runtime planning separates the two pipeline kinds before backend dispatch.
+Compute validation, argument packing, and grid inference produce one
+`PlannedComputeLaunch`; graphics attachment, resource-pairing, vertex-input,
+and draw-state validation produce one `PlannedGraphicsInvocation`. Backends
+consume the corresponding plan and do not repeat frontend invocation planning.
 
 ## Compiler-generated graphics values
 

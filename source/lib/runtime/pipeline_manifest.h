@@ -61,7 +61,6 @@ struct RuntimeVersion {
 };
 
 struct RuntimeRequirements {
-    bool present{};
     std::string backend;
     std::vector<std::string> features;
     RuntimeVersion apiVersion;

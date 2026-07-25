@@ -1,8 +1,9 @@
 #ifndef VERNON_RUNTIME_BACKEND_OPENGL_H
 #define VERNON_RUNTIME_BACKEND_OPENGL_H
 
+#include "../rhi/opengl_backend.h"
 #include "VernonRuntime.h"
-#include "backend_opengl_driver.h"
+#include "VernonRuntimeCore.h"
 #include "graphics_invocation_planner.h"
 #include "pipeline_bundle.h"
 #include "pipeline_metadata.h"
@@ -15,37 +16,42 @@
 struct VernonDeviceBuffer;
 struct VernonDeviceSampler;
 struct VernonDeviceTexture;
+struct VernonRuntimeRhiAdapter;
 namespace vernon::runtime {
 
 struct OpenGLContextState {
-    VernonExternalOpenGLContext external{};
-    OpenGLDriver driver{};
+    rhi::opengl::DeviceState device;
+    rhi::opengl::Driver &driver{device.driver};
+    VernonRuntimeRhiAdapter *adapter{};
 };
 
-struct OpenGLBufferState {
-    GlUint name{};
-    bool imported{};
-};
-
-struct OpenGLTextureState {
-    GlUint name{};
-    bool imported{};
-};
-
-struct OpenGLSamplerState {
-    GlUint name{};
-    bool imported{};
-};
-
-struct OpenGLKernelState {
-    GlUint program{};
-};
+using OpenGLBufferState = rhi::opengl::Buffer;
+using OpenGLTextureState = rhi::opengl::Image;
+using OpenGLSamplerState = rhi::opengl::Sampler;
 
 struct OpenGLPipelineState {
-    GlUint computeProgram{};
-    GlUint graphicsProgram{};
-    GlUint vertexArray{};
-    GlUint framebuffer{};
+    struct InlineBinding {
+        enum Source {
+            EXTERNAL_UNIFORM,
+            EXTERNAL_VERTEX,
+            EXTERNAL_TEXTURE,
+            EXTERNAL_SAMPLER,
+            EXTERNAL_STORAGE,
+            COMPUTE_INLINE,
+            IMPLICIT_SAMPLER,
+            RESOLUTION
+        };
+
+        Source source{EXTERNAL_UNIFORM};
+        uint32_t externalSlot{};
+        std::vector<uint8_t> storage;
+    };
+
+    VernonRuntimeCorePipeline *rhiPipeline{};
+    VernonRuntimeCoreBindings *rhiBindings{};
+    std::vector<VernonRuntimeProviderBindingLayoutEntry> rhiLayout;
+    std::vector<VernonRuntimeProviderBindingValue> rhiValues;
+    std::vector<InlineBinding> rhiInlineBindings;
     uint32_t workgroup[3]{1, 1, 1};
 };
 
@@ -84,42 +90,23 @@ inline const OpenGLSamplerState &openGLSamplerState(const VernonDeviceSampler &s
 bool isOpenGL(const VernonRuntimeContext *context);
 void makeCurrent(VernonRuntimeContext *context);
 
-bool initializeOpenGLContext(VernonRuntimeContext &context, const VernonExternalOpenGLContext &external);
+bool initializeOpenGLContext(VernonRuntimeContext &context, const VernonOpenGLContextCallbacks &callbacks);
 
 bool createOpenGLBuffer(VernonDeviceBuffer &buffer);
-void importOpenGLBuffer(VernonDeviceBuffer &buffer, GlUint name);
+void importOpenGLBuffer(VernonDeviceBuffer &buffer, rhi::opengl::Uint name);
 void destroyOpenGLBuffer(VernonDeviceBuffer &buffer);
 VernonStatus copyToOpenGLBuffer(VernonDeviceBuffer &buffer, size_t offset, const void *source, size_t size);
 VernonStatus copyFromOpenGLBuffer(const VernonDeviceBuffer &buffer, size_t offset, void *destination, size_t size);
 
 bool createOpenGLTexture(VernonDeviceTexture &texture);
-void importOpenGLTexture(VernonDeviceTexture &texture, GlUint name);
+void importOpenGLTexture(VernonDeviceTexture &texture, rhi::opengl::Uint name);
 void destroyOpenGLTexture(VernonDeviceTexture &texture);
 VernonStatus copyToOpenGLTexture(VernonDeviceTexture &texture, const void *source, size_t size);
 VernonStatus copyFromOpenGLTexture(const VernonDeviceTexture &texture, void *destination, size_t size);
 
 bool createOpenGLSampler(VernonDeviceSampler &sampler);
-void importOpenGLSampler(VernonDeviceSampler &sampler, GlUint name);
+void importOpenGLSampler(VernonDeviceSampler &sampler, rhi::opengl::Uint name);
 void destroyOpenGLSampler(VernonDeviceSampler &sampler);
-
-GlUint compileShader(VernonRuntimeContext *context, GlEnum kind, const std::string &source);
-GlUint linkProgram(VernonRuntimeContext *context, const std::vector<GlUint> &shaders);
-void destroyOpenGLProgram(VernonRuntimeContext &context, GlUint program);
-
-VernonStatus launchOpenGLKernel(VernonRuntimeContext &context, GlUint program, const ReflectedEntry &reflection,
-                                VernonLaunchSize globalSize, const VernonLaunchArgument *arguments,
-                                size_t argumentCount);
-
-bool createOpenGLPipeline(VernonRuntimeContext &context, const Variant &variant,
-                          const std::unordered_map<std::string, Stage> &stages, GlUint &computeProgram,
-                          GlUint &graphicsProgram, GlUint &vertexArray, GlUint &framebuffer, uint32_t (&workgroup)[3]);
-
-void destroyOpenGLPipeline(VernonRuntimeContext &context, GlUint computeProgram, GlUint graphicsProgram,
-                           GlUint vertexArray, GlUint framebuffer);
-
-VernonStatus encodeAndSubmitOpenGLCompute(VernonRuntimeContext &context, GlUint program, const uint32_t (&workgroup)[3],
-                                          const Variant &variant, const VernonPipelineInvocation &invocation,
-                                          const PlannedGraphicsInvocation &plan, std::string &error);
 
 VernonStatus openGLComputeToGraphicsBarrier(VernonRuntimeContext &context);
 VernonStatus synchronizeOpenGL(VernonRuntimeContext &context);

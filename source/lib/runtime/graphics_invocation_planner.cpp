@@ -18,12 +18,16 @@ bool kindMatches(const Parameter &parameter, const VernonPipelineArgument &argum
 bool validTensor(const VernonTensorView &tensor, const void *expectedContext,
                  const GraphicsPlannerCallbacks &callbacks) {
     if (tensor.struct_size < sizeof(VernonTensorView) || tensor.access > VERNON_ACCESS_READ_WRITE ||
-        (tensor.storage != VERNON_TENSOR_HOST && tensor.storage != VERNON_TENSOR_DEVICE))
+        (tensor.storage != VERNON_TENSOR_HOST && tensor.storage != VERNON_TENSOR_DEVICE &&
+         tensor.storage != VERNON_TENSOR_RHI_RESOURCE))
         return false;
-    if (!tensorFitsAllocation(tensor))
+    if (tensor.storage != VERNON_TENSOR_RHI_RESOURCE && !tensorFitsAllocation(tensor))
         return false;
     if (tensor.storage == VERNON_TENSOR_HOST)
         return tensor.host_data != nullptr;
+    if (tensor.storage == VERNON_TENSOR_RHI_RESOURCE)
+        return tensor.resource.identity && tensor.resource.resource.value &&
+               tensor.byte_offset <= tensor.resource.size && tensor.byte_size <= tensor.resource.size;
     if (!tensor.buffer || !callbacks.bufferSnapshot)
         return false;
     const GraphicsResourceSnapshot snapshot = callbacks.bufferSnapshot(callbacks.userData, tensor.buffer);
@@ -64,36 +68,44 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
             const std::optional<VernonDataType> dtype = pipelineDataType(parameter.dtype);
             if (!dtype || argument.tensor.dtype != *dtype || !validTensor(argument.tensor, expectedContext, callbacks))
                 return fail(error, "pipeline Tensor argument does not match layout");
-            const bool allowLeading =
-                std::any_of(parameter.uses.begin(), parameter.uses.end(), [](const ParameterUse &use) {
-                    return use.interfaceKind == "input" || use.interfaceKind == "instance";
-                });
-            const size_t offset = allowLeading && argument.tensor.rank == parameter.shape.size() + 1 ? 1 : 0;
-            if (argument.tensor.rank != parameter.shape.size() + offset)
-                return fail(error, "pipeline Tensor rank does not match layout");
-            for (size_t dimension = 0; dimension < parameter.shape.size(); ++dimension)
-                if (parameter.shape[dimension] &&
-                    parameter.shape[dimension] != argument.tensor.shape[dimension + offset])
-                    return fail(error, "pipeline Tensor shape does not match layout");
+            if (parameter.source != "direct") {
+                const bool allowLeading =
+                    std::any_of(parameter.uses.begin(), parameter.uses.end(), [](const ParameterUse &use) {
+                        return use.interfaceKind == "input" || use.interfaceKind == "instance";
+                    });
+                const size_t offset = allowLeading && argument.tensor.rank == parameter.shape.size() + 1 ? 1 : 0;
+                if (argument.tensor.rank != parameter.shape.size() + offset)
+                    return fail(error, "pipeline Tensor rank does not match layout");
+                for (size_t dimension = 0; dimension < parameter.shape.size(); ++dimension)
+                    if (parameter.shape[dimension] &&
+                        parameter.shape[dimension] != argument.tensor.shape[dimension + offset])
+                        return fail(error, "pipeline Tensor shape does not match layout");
+            }
         } else if (argument.kind == VERNON_PIPELINE_TEXTURE) {
-            if (!argument.texture.texture || !callbacks.textureSnapshot)
+            const bool rhi = argument.texture.resource.identity && argument.texture.resource.resource.value;
+            if (!rhi && (!argument.texture.texture || !callbacks.textureSnapshot))
                 return fail(error, "pipeline texture argument does not match layout");
-            const GraphicsResourceSnapshot snapshot =
-                callbacks.textureSnapshot(callbacks.userData, argument.texture.texture);
-            if (snapshot.context != expectedContext || argument.texture.format != snapshot.textureFormat ||
-                argument.texture.dimension != snapshot.textureDimension ||
-                argument.texture.width != snapshot.textureWidth || argument.texture.height != snapshot.textureHeight ||
-                argument.texture.depth != snapshot.textureDepth ||
-                (argument.texture.sampler &&
-                 (!callbacks.samplerContext ||
-                  callbacks.samplerContext(callbacks.userData, argument.texture.sampler) != expectedContext)) ||
-                (!parameter.dimension.empty() &&
-                 ((parameter.dimension == "2d" && argument.texture.dimension != VERNON_TEXTURE_2D) ||
-                  (parameter.dimension == "3d" && argument.texture.dimension != VERNON_TEXTURE_3D) ||
-                  (parameter.dimension == "cube" && argument.texture.dimension != VERNON_TEXTURE_CUBE))))
+            if (!rhi) {
+                const GraphicsResourceSnapshot snapshot =
+                    callbacks.textureSnapshot(callbacks.userData, argument.texture.texture);
+                if (snapshot.context != expectedContext || argument.texture.format != snapshot.textureFormat ||
+                    argument.texture.dimension != snapshot.textureDimension ||
+                    argument.texture.width != snapshot.textureWidth ||
+                    argument.texture.height != snapshot.textureHeight ||
+                    argument.texture.depth != snapshot.textureDepth ||
+                    (argument.texture.sampler &&
+                     (!callbacks.samplerContext ||
+                      callbacks.samplerContext(callbacks.userData, argument.texture.sampler) != expectedContext)))
+                    return fail(error, "pipeline texture argument does not match layout");
+            }
+            if (!parameter.dimension.empty() &&
+                ((parameter.dimension == "2d" && argument.texture.dimension != VERNON_TEXTURE_2D) ||
+                 (parameter.dimension == "3d" && argument.texture.dimension != VERNON_TEXTURE_3D) ||
+                 (parameter.dimension == "cube" && argument.texture.dimension != VERNON_TEXTURE_CUBE)))
                 return fail(error, "pipeline texture argument does not match layout");
-        } else if (!argument.sampler || !callbacks.samplerContext ||
-                   callbacks.samplerContext(callbacks.userData, argument.sampler) != expectedContext) {
+        } else if ((!argument.resource.identity || !argument.resource.resource.value) &&
+                   (!argument.sampler || !callbacks.samplerContext ||
+                    callbacks.samplerContext(callbacks.userData, argument.sampler) != expectedContext)) {
             return fail(error, "pipeline sampler belongs to another runtime");
         }
     }
@@ -105,15 +117,23 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
         return fail(error, "graphics pipeline requires color attachments");
     for (size_t index = 0; index < invocation.color_attachment_count; ++index) {
         const VernonColorAttachment &attachment = invocation.color_attachments[index];
-        if (!attachment.texture || !callbacks.textureSnapshot)
-            return fail(error, "render target is invalid");
-        const GraphicsResourceSnapshot snapshot = callbacks.textureSnapshot(callbacks.userData, attachment.texture);
-        if (snapshot.context != expectedContext || snapshot.textureDimension != VERNON_TEXTURE_2D)
-            return fail(error, "render target is invalid");
+        uint32_t width = attachment.width;
+        uint32_t height = attachment.height;
+        if (!attachment.resource.resource.value) {
+            if (!attachment.texture || !callbacks.textureSnapshot)
+                return fail(error, "render target is invalid");
+            const GraphicsResourceSnapshot snapshot = callbacks.textureSnapshot(callbacks.userData, attachment.texture);
+            if (snapshot.context != expectedContext || snapshot.textureDimension != VERNON_TEXTURE_2D)
+                return fail(error, "render target is invalid");
+            width = snapshot.textureWidth;
+            height = snapshot.textureHeight;
+        }
+        if (!width || !height)
+            return fail(error, "render target extent is invalid");
         if (!plan.attachmentWidth) {
-            plan.attachmentWidth = snapshot.textureWidth;
-            plan.attachmentHeight = snapshot.textureHeight;
-        } else if (plan.attachmentWidth != snapshot.textureWidth || plan.attachmentHeight != snapshot.textureHeight) {
+            plan.attachmentWidth = width;
+            plan.attachmentHeight = height;
+        } else if (plan.attachmentWidth != width || plan.attachmentHeight != height) {
             return fail(error, "render target extents differ");
         }
         plan.attachments.push_back(&attachment);
@@ -139,6 +159,9 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
         VernonDeviceTexture *texture{};
         VernonDeviceSampler *textureSampler{};
         VernonDeviceSampler *explicitSampler{};
+        VernonRuntimeProviderResourceReference imageResource{};
+        VernonRuntimeProviderResourceReference textureSamplerResource{};
+        VernonRuntimeProviderResourceReference explicitSamplerResource{};
         bool implicitSampler{};
         uint32_t stages{};
     };
@@ -159,6 +182,8 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
                     return fail(error, "texture binding has conflicting sampler policies");
                 resource.texture = argument.texture.texture;
                 resource.textureSampler = argument.texture.sampler;
+                resource.imageResource = argument.texture.resource;
+                resource.textureSamplerResource = argument.texture.sampler_resource;
                 resource.stages |= stage;
                 continue;
             }
@@ -171,6 +196,7 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
                     if (resource.explicitSampler && resource.explicitSampler != argument.sampler)
                         return fail(error, "sampler pairing is ambiguous");
                     resource.explicitSampler = argument.sampler;
+                    resource.explicitSamplerResource = argument.resource;
                     resource.stages |= stage;
                 }
                 continue;
@@ -178,9 +204,10 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
             if (use.interfaceKind != "input" && use.interfaceKind != "instance")
                 continue;
             const VernonTensorView &tensor = argument.tensor;
-            if (argument.kind != VERNON_PIPELINE_TENSOR || tensor.storage != VERNON_TENSOR_DEVICE ||
-                tensor.dtype != VERNON_DATA_F32 || !tensor.buffer || !tensor.rank || !tensor.shape ||
-                !tensor.byte_strides || use.location == UINT32_MAX)
+            if (argument.kind != VERNON_PIPELINE_TENSOR ||
+                (tensor.storage != VERNON_TENSOR_DEVICE && tensor.storage != VERNON_TENSOR_RHI_RESOURCE) ||
+                tensor.dtype != VERNON_DATA_F32 || (!tensor.buffer && !tensor.resource.resource.value) ||
+                !tensor.rank || !tensor.shape || !tensor.byte_strides || use.location == UINT32_MAX)
                 return fail(error, "graphics Tensor view is invalid");
             for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension)
                 if (tensor.byte_strides[dimension] <= 0)
@@ -229,12 +256,17 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
         }
     }
     for (const auto &[binding, resource] : sampled) {
-        if (!resource.texture || (!resource.explicitSampler && !resource.implicitSampler))
+        if ((!resource.texture && !resource.imageResource.resource.value) &&
+            (!resource.explicitSampler && !resource.explicitSamplerResource.resource.value &&
+             !resource.implicitSampler))
             return fail(error, "sampled image requires paired texture and sampler");
         plan.sampledResources.emplace(
             binding,
             PlannedSampledResource{resource.texture,
                                    resource.explicitSampler ? resource.explicitSampler : resource.textureSampler,
+                                   resource.imageResource,
+                                   resource.explicitSamplerResource.resource.value ? resource.explicitSamplerResource
+                                                                                   : resource.textureSamplerResource,
                                    resource.implicitSampler, resource.stages});
     }
 
@@ -244,8 +276,9 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
         return fail(error, "graphics draw counts cannot be inferred");
     if (invocation.index_binding) {
         const VernonIndexBinding &index = *invocation.index_binding;
-        if (!index.buffer || !callbacks.bufferSnapshot ||
-            callbacks.bufferSnapshot(callbacks.userData, index.buffer).context != expectedContext ||
+        if ((!index.resource.resource.value &&
+             (!index.buffer || !callbacks.bufferSnapshot ||
+              callbacks.bufferSnapshot(callbacks.userData, index.buffer).context != expectedContext)) ||
             index.type != VERNON_INDEX_U32 || !index.index_count)
             return fail(error, "index binding is invalid");
         plan.indexBinding = &index;

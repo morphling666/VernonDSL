@@ -39,6 +39,8 @@ enum PlannedShaderStage : uint32_t { PLANNED_STAGE_VERTEX = 1u << 0, PLANNED_STA
 struct PlannedSampledResource {
     VernonDeviceTexture *texture{};
     VernonDeviceSampler *sampler{};
+    VernonRuntimeProviderResourceReference imageResource{};
+    VernonRuntimeProviderResourceReference samplerResource{};
     bool implicitSampler{};
     uint32_t stages{};
 };

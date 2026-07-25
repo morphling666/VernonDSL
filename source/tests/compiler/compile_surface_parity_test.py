@@ -390,7 +390,7 @@ class CompileSurfaceParityTests(unittest.TestCase):
         direct_buffer = direct_runtime.allocate(source.nbytes, source.dtype.itemsize)
         direct_buffer.upload(source.tobytes())
         direct_kernel = direct_runtime.load_cpu_entry(program, "scale")
-        direct_kernel.launch(4, 1, 1, [direct_buffer, struct.pack("<f", 2.5)])
+        direct_kernel.invoke(4, 1, 1, [direct_buffer, struct.pack("<f", 2.5)])
         direct_runtime.synchronize()
         direct_values = np.frombuffer(direct_buffer.download(), dtype=np.float32).copy()
 

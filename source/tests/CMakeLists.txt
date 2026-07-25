@@ -1,3 +1,4 @@
+include("${VERNON_REPOSITORY_ROOT}/cmake/IncludeGTest.cmake")
 include_gtest()
 include(GoogleTest)
 
@@ -16,6 +17,37 @@ endfunction()
 if(TARGET VernonRuntime)
     add_library(VernonRuntimePublicCHeaderCheck OBJECT runtime/runtime_public_header_compile.c)
     target_link_libraries(VernonRuntimePublicCHeaderCheck PRIVATE Vernon::Runtime)
+    add_library(VernonRhiPublicCHeaderCheck OBJECT runtime/runtime_rhi_public_header_compile.c)
+    target_link_libraries(VernonRhiPublicCHeaderCheck PRIVATE Vernon::RHI Vernon::RuntimeCore)
+
+    get_target_property(_vernon_runtime_core_links VernonRuntimeCore LINK_LIBRARIES)
+    if(_vernon_runtime_core_links MATCHES "(^|;)Vernon(RHI|::RHI)(;|$)")
+        message(FATAL_ERROR "VernonRuntimeCore must not link VernonRHI")
+    endif()
+
+    add_executable(VernonRuntimeCoreProviderTests runtime/runtime_foreign_provider_test.cpp)
+    target_link_libraries(VernonRuntimeCoreProviderTests PRIVATE GTest::gtest_main Vernon::RuntimeCore)
+    add_dependencies(VernonRuntimeCoreProviderTests VernonRhiPublicCHeaderCheck)
+    if(MSVC)
+        target_compile_options(VernonRuntimeCoreProviderTests PRIVATE /EHsc)
+    endif()
+    vernon_discover_gtests(VernonRuntimeCoreProviderTests)
+
+    if(VERNON_ENABLE_CUDA_RUNTIME)
+        add_executable(VernonRuntimeRHIAdapterTests rhi/cuda_adapter_test.cpp)
+        target_include_directories(VernonRuntimeRHIAdapterTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib")
+        target_link_libraries(VernonRuntimeRHIAdapterTests PRIVATE GTest::gtest_main Vernon::RuntimeCore
+                                                                   Vernon::RuntimeRHIAdapter)
+        add_custom_command(
+            TARGET VernonRuntimeRHIAdapterTests
+            POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:VernonRHI>
+                    $<TARGET_FILE_DIR:VernonRuntimeRHIAdapterTests>)
+        if(MSVC)
+            target_compile_options(VernonRuntimeRHIAdapterTests PRIVATE /EHsc)
+        endif()
+        vernon_discover_gtests(VernonRuntimeRHIAdapterTests)
+    endif()
 
     if(WIN32)
         set(runtime_test_os windows)
@@ -75,6 +107,8 @@ if(TARGET VernonRuntime)
             TARGET VernonRuntimeTests
             POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:VernonRuntime>
+                    $<TARGET_FILE_DIR:VernonRuntimeTests>
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:VernonRHI>
                     $<TARGET_FILE_DIR:VernonRuntimeTests>)
     endif()
     if(MSVC)
@@ -104,11 +138,21 @@ if(TARGET VernonRuntime)
         target_link_libraries(VernonRuntimeTests PRIVATE VernonDSLCompiler)
     endif()
 
+    if(VERNON_ENABLE_VULKAN_RUNTIME)
+        target_sources(VernonRuntimeTests PRIVATE rhi/vulkan_native_interop_test.cpp)
+        target_link_libraries(VernonRuntimeTests PRIVATE Vernon::RHI Vulkan::Headers)
+    endif()
+
     if(VERNON_ENABLE_DIRECTX12_RUNTIME)
-        target_sources(VernonRuntimeTests PRIVATE runtime/runtime_directx12_test.cpp)
+        target_sources(VernonRuntimeTests PRIVATE runtime/runtime_directx12_test.cpp
+                                                  rhi/directx12_native_interop_test.cpp)
+        target_link_libraries(VernonRuntimeTests PRIVATE Vernon::RHI d3d12 dxgi)
         if(TARGET vernon-dsl-native AND Python_FOUND)
             set(directx_pipeline_test_dir "${VERNON_TEST_BINARY_ROOT}/directx_pipeline_bundle")
             set(directx_pipeline_test_manifest "${directx_pipeline_test_dir}/directx_pipeline_bundle.pipeline.json")
+            set(directx_compute_pipeline_test_dir "${VERNON_TEST_BINARY_ROOT}/directx_compute_pipeline_bundle")
+            set(directx_compute_pipeline_test_manifest
+                "${directx_compute_pipeline_test_dir}/directx_compute_pipeline_bundle.pipeline.json")
             add_custom_command(
                 OUTPUT "${directx_pipeline_test_manifest}"
                 COMMAND
@@ -120,16 +164,31 @@ if(TARGET VernonRuntime)
                         "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/requirements.py"
                 VERBATIM)
             add_custom_target(vernon-directx-pipeline-test-bundle DEPENDS "${directx_pipeline_test_manifest}")
+            add_custom_command(
+                OUTPUT "${directx_compute_pipeline_test_manifest}"
+                COMMAND
+                    ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${Python_EXECUTABLE} -m
+                    vernon_dsl.pipeline_asset_cli
+                    "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:scale_asset" --target directx
+                    --output "${directx_compute_pipeline_test_dir}"
+                DEPENDS vernon-dsl-native "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py"
+                        "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/requirements.py"
+                VERBATIM)
+            add_custom_target(vernon-directx-compute-pipeline-test-bundle
+                              DEPENDS "${directx_compute_pipeline_test_manifest}")
             target_sources(VernonRuntimeTests PRIVATE runtime/runtime_directx12_pipeline_test.cpp)
-            target_compile_definitions(VernonRuntimeTests
-                                       PRIVATE VERNON_DIRECTX_PIPELINE_BUNDLE="${directx_pipeline_test_manifest}")
+            target_compile_definitions(
+                VernonRuntimeTests
+                PRIVATE VERNON_DIRECTX_PIPELINE_BUNDLE="${directx_pipeline_test_manifest}"
+                        VERNON_DIRECTX_COMPUTE_PIPELINE_BUNDLE="${directx_compute_pipeline_test_manifest}")
             target_link_libraries(VernonRuntimeTests PRIVATE VernonDSLCompiler)
             add_custom_command(
                 TARGET VernonRuntimeTests
                 POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:VernonDSLCompiler>
                         $<TARGET_FILE_DIR:VernonRuntimeTests>)
-            add_dependencies(VernonRuntimeTests vernon-directx-pipeline-test-bundle)
+            add_dependencies(VernonRuntimeTests vernon-directx-pipeline-test-bundle
+                             vernon-directx-compute-pipeline-test-bundle)
         endif()
     endif()
 
@@ -153,6 +212,19 @@ if(TARGET VernonRuntime)
                     "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/pipeline_assets.py"
             VERBATIM)
         add_custom_target(vernon-vulkan-pipeline-test-bundle DEPENDS "${vulkan_pipeline_test_manifest}")
+        set(vulkan_compute_pipeline_test_dir "${VERNON_TEST_BINARY_ROOT}/vulkan_compute_pipeline_bundle")
+        set(vulkan_compute_pipeline_test_manifest
+            "${vulkan_compute_pipeline_test_dir}/vulkan_compute_pipeline_bundle.pipeline.json")
+        add_custom_command(
+            OUTPUT "${vulkan_compute_pipeline_test_manifest}"
+            COMMAND
+                ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${Python_EXECUTABLE} -m
+                vernon_dsl.pipeline_asset_cli
+                "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:scale_asset" --target vulkan --output
+                "${vulkan_compute_pipeline_test_dir}"
+            DEPENDS vernon-dsl-native "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py"
+            VERBATIM)
+        add_custom_target(vernon-vulkan-compute-pipeline-test-bundle DEPENDS "${vulkan_compute_pipeline_test_manifest}")
         set(vulkan_cube_map_test_dir "${VERNON_TEST_BINARY_ROOT}/vulkan_cube_map_bundle")
         set(vulkan_cube_map_test_manifest "${vulkan_cube_map_test_dir}/vulkan_cube_map_bundle.pipeline.json")
         add_custom_command(
@@ -172,9 +244,15 @@ if(TARGET VernonRuntime)
         target_sources(VernonRuntimeTests PRIVATE runtime/runtime_vulkan_pipeline_test.cpp
                                                   runtime/runtime_vulkan_cube_map_test.cpp)
         target_compile_definitions(
-            VernonRuntimeTests PRIVATE VERNON_VULKAN_PIPELINE_BUNDLE="${vulkan_pipeline_test_manifest}"
-                                       VERNON_VULKAN_CUBE_MAP_BUNDLE="${vulkan_cube_map_test_manifest}")
-        add_dependencies(VernonRuntimeTests vernon-vulkan-pipeline-test-bundle vernon-vulkan-cube-map-test-bundle)
+            VernonRuntimeTests
+            PRIVATE VERNON_VULKAN_PIPELINE_BUNDLE="${vulkan_pipeline_test_manifest}"
+                    VERNON_VULKAN_CUBE_MAP_BUNDLE="${vulkan_cube_map_test_manifest}"
+                    VERNON_VULKAN_COMPUTE_PIPELINE_BUNDLE="${vulkan_compute_pipeline_test_manifest}")
+        add_dependencies(
+            VernonRuntimeTests
+            vernon-vulkan-pipeline-test-bundle
+            vernon-vulkan-cube-map-test-bundle
+            vernon-vulkan-compute-pipeline-test-bundle)
     endif()
 
     vernon_discover_gtests(VernonRuntimeTests)
