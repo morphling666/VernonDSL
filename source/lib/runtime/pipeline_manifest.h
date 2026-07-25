@@ -6,6 +6,7 @@
 #include <nlohmann/json_fwd.hpp>
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -54,21 +55,25 @@ struct Output {
     uint32_t location{UINT32_MAX};
 };
 
-enum class PipelineStepKind {
-    Dispatch,
-    Barrier,
-    Draw,
+struct RuntimeVersion {
+    uint32_t major{};
+    uint32_t minor{};
 };
 
-struct PipelineStep {
-    PipelineStepKind kind{PipelineStepKind::Dispatch};
-    std::string stage;
-    std::string vertex;
-    std::string fragment;
-    std::string source;
-    std::string destination;
-    VernonLaunchSize grid{};
-    bool hasGrid{};
+struct RuntimeRequirements {
+    bool present{};
+    std::string backend;
+    std::vector<std::string> features;
+    RuntimeVersion apiVersion;
+    RuntimeVersion shaderVersion;
+    RuntimeVersion minimumComputeCapability;
+    uint32_t computeWorkgroupSize[3]{1, 1, 1};
+    uint32_t glslVersion{};
+    uint32_t addressSize{};
+    uint32_t invocationAbiVersion{};
+    std::string targetTriple;
+    std::string objectFormat;
+    std::string profile;
 };
 
 struct Variant {
@@ -76,11 +81,10 @@ struct Variant {
     std::vector<Parameter> parameters;
     std::vector<Parameter> internalParameters;
     std::vector<Output> outputs;
+    std::map<std::string, std::string> program;
     std::string compute;
     std::string vertex;
     std::string fragment;
-    bool barrier{};
-    std::vector<PipelineStep> steps;
 
     bool validate(std::string &error) const;
 };
@@ -90,6 +94,10 @@ std::optional<VernonTextureDimension> pipelineTextureDimension(const std::string
 std::optional<VernonTextureFormat> pipelineTextureFormat(const std::string &format);
 
 bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &error);
+bool parseRuntimeRequirements(const nlohmann::json &root, const std::string &target, RuntimeRequirements &requirements,
+                              std::string &error);
+bool runtimeVersionAtLeast(RuntimeVersion actual, RuntimeVersion required);
+uint32_t glslVersionForApi(RuntimeVersion apiVersion);
 
 } // namespace vernon::runtime
 

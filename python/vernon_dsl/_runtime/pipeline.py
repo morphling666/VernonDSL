@@ -6,7 +6,7 @@ import inspect
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, ClassVar, get_args, get_origin, get_type_hints
+from typing import Any, ClassVar
 
 import numpy as np
 
@@ -22,7 +22,6 @@ from ..pipeline_compile import (
     materialize_bundle,
     serialize_bundle,
 )
-from ..types import Annotation
 from .resources import TensorStorage, TensorView, Texture, _dispatch_borrow_scope
 
 
@@ -60,30 +59,21 @@ class _PipelineStageRequest:
     native_target: Any
 
 
-def _annotation_parts(value: Any) -> tuple[Any, tuple[Annotation, ...]]:
-    if get_origin(value) is Annotated:
-        arguments = get_args(value)
-        return arguments[0], tuple(item for item in arguments[1:] if isinstance(item, Annotation))
-    return value, ()
-
-
 class Pipeline:
-    """Callable specialized compute/graphics composition."""
+    """Callable specialized graphics pipeline."""
 
     _cache: ClassVar[dict[str, _CompiledPipeline]] = {}
 
     def __init__(self, *stages: Any, features: Iterable[str] = ()):
         kinds = tuple(getattr(stage, "__vernon_dsl__", (None,))[0] for stage in stages)
-        if kinds not in {("vertex", "fragment"), ("compute", "vertex", "fragment")}:
-            raise ValueError("pipeline stages must be (vertex, fragment) or (compute, vertex, fragment)")
+        if kinds != ("vertex", "fragment"):
+            raise ValueError("pipeline stages must be (vertex, fragment)")
         feature_values = tuple(features)
         if any(not isinstance(value, str) or not value for value in feature_values):
             raise TypeError("pipeline features must be non-empty strings")
         self._features = tuple(sorted(set(feature_values)))
         self._stages = stages
-        self._compute = stages[0] if kinds[0] == "compute" else None
-        self._vertex = stages[-2]
-        self._fragment = stages[-1]
+        self._vertex, self._fragment = stages
         self._compiled: _CompiledPipeline | None = None
         self._compiled_generation = -1
         self.compile_count = 0
@@ -92,7 +82,6 @@ class Pipeline:
     def _stage_request(
         self,
         stage_value: Any,
-        call_arguments: Mapping[str, Any],
         target: TargetOptions,
         native_target: Any,
     ) -> _PipelineStageRequest:
@@ -101,20 +90,7 @@ class Pipeline:
             raise RuntimeError("pipeline stage has no Python function")
         entry = function.__name__
         path = Path(inspect.getsourcefile(function) or "").resolve()
-        if stage_value is self._compute:
-            signature = inspect.signature(self._compute._function)
-            hints = get_type_hints(self._compute._function, include_extras=True)
-            values = []
-            for parameter in signature.parameters.values():
-                _, metadata = _annotation_parts(hints[parameter.name])
-                if any(item.kind == "builtin" for item in metadata):
-                    continue
-                if parameter.name not in call_arguments:
-                    raise TypeError(f"missing pipeline argument {parameter.name!r}")
-                values.append(call_arguments[parameter.name])
-            frontend, _, _, _ = self._compute._lower(tuple(values), self._features)
-        else:
-            frontend = Compiler().compile_request(FrontendCompileRequest(path, entry, self._features))
+        frontend = Compiler().compile_request(FrontendCompileRequest(path, entry, self._features))
         return _PipelineStageRequest(
             frontend,
             f"python/{path.stem}",
@@ -124,22 +100,10 @@ class Pipeline:
             native_target,
         )
 
-    def _compile_pipeline_bundle(self, call_arguments: Mapping[str, Any]) -> _CompiledPipeline:
+    def _compile_pipeline_bundle(self) -> _CompiledPipeline:
         state = _session_state()
         if state._native is None or state._native_runtime is None:
             raise RuntimeError("graphics requires the native pipeline runtime")
-        if (
-            self._compute is not None
-            and state._architecture == state.opengl
-            and state._interactive_glsl_version() < 430
-        ):
-            raise RuntimeError("compute/graphics composition requires OpenGL 4.3")
-        if (
-            self._compute is not None
-            and state._architecture == state.opengles
-            and state._interactive_glsl_version() < 310
-        ):
-            raise RuntimeError("compute/graphics composition requires OpenGL ES 3.1")
         native_target, target_name = {
             state.vulkan: (state._native.Target.VULKAN, "vulkan"),
             state.opengl: (state._native.Target.OPENGL, "opengl"),
@@ -151,8 +115,7 @@ class Pipeline:
             if state._architecture in {state.opengl, state.opengles}
             else {},
         )
-        stage_values = ([self._compute] if self._compute is not None else []) + [self._vertex, self._fragment]
-        requests = [self._stage_request(stage, call_arguments, options, native_target) for stage in stage_values]
+        requests = [self._stage_request(stage, options, native_target) for stage in self._stages]
         compiled_stages: list[CompiledStage] = []
         compiler = state._native.Compiler()
         for request in requests:
@@ -218,8 +181,6 @@ class Pipeline:
         self._compiled_generation = state._runtime_generation
         if self.compile_count == 0:
             self.compile_count = 1
-        if self._compute is not None and self._compute.compile_count == 0:
-            self._compute.compile_count = 1
         return cached
 
     def _compile(self, call_arguments: Mapping[str, Any] | None = None) -> _CompiledPipeline:
@@ -246,7 +207,7 @@ class Pipeline:
                 self._compiled.native_generation = state._runtime_generation
                 self._compiled_generation = state._runtime_generation
                 return self._compiled
-            return self._compile_pipeline_bundle(call_arguments or {})
+            return self._compile_pipeline_bundle()
         if state._architecture == state.cpu:
             raise RuntimeError(
                 "CPU graphics pipelines require a software rasterizer, which "
@@ -265,18 +226,10 @@ class Pipeline:
         compiled = self._compile(arguments)
         parameters = tuple(compiled.native.parameters)
         expected = {parameter.name for parameter in parameters}
-        compute_names: set[str] = set()
-        if self._compute is not None:
-            hints = get_type_hints(self._compute._function, include_extras=True)
-            compute_names = {
-                parameter.name
-                for parameter in inspect.signature(self._compute._function).parameters.values()
-                if not any(item.kind == "builtin" for item in _annotation_parts(hints[parameter.name])[1])
-            }
         missing = expected - set(arguments)
         if missing:
             raise TypeError(f"missing pipeline argument(s): {', '.join(sorted(missing))}")
-        unexpected = set(arguments) - expected - compute_names
+        unexpected = set(arguments) - expected
         if unexpected:
             raise TypeError(f"unexpected pipeline argument(s): {', '.join(sorted(unexpected))}")
         access_names = {
@@ -321,7 +274,7 @@ class Pipeline:
                     scalar = np.asarray(value, dtype=np.int32)
                 builder.host_tensor(parameter.name, scalar)
                 continue
-            if parameter.name not in compute_names and tuple(value.shape) == tuple(parameter.shape):
+            if tuple(value.shape) == tuple(parameter.shape):
                 builder.host_tensor(parameter.name, value._borrowed_array())
                 continue
             dtype = dtype_codes.get(value.dtype)
@@ -385,20 +338,11 @@ class Pipeline:
         with _dispatch_borrow_scope(dispatch_borrows):
             builder.invoke()
             state._native_runtime.synchronize()
-            if self._compute is not None:
-                for name in compute_names:
-                    value = arguments.get(name)
-                    if isinstance(value, (TensorStorage, TensorView)):
-                        value._mark_device_dirty()
         for texture in rendered_targets:
             texture._mark_device_dirty()
 
     def __call__(self, **arguments: Any) -> None:
-        from ..execution import ExecutionGraph
-
-        graph = ExecutionGraph()
-        graph.draw(self, **arguments)
-        graph.run()
+        self._invoke_direct(arguments)
 
 
 def pipeline(*stages: Any, features: Iterable[str] = ()) -> Pipeline:

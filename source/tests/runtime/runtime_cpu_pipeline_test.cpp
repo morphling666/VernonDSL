@@ -190,11 +190,11 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     ASSERT_TRUE(!vernonRuntimeLoadPipelineBundleWithOptions(runtime, bundle.data(), bundle.size(), &shortOptions));
 
     nlohmann::json invalidDocument = nlohmann::json::parse(bundle);
-    invalidDocument["variants"][0]["steps"].push_back({{"kind", "barrier"}});
+    invalidDocument["variants"][0]["program"] = nlohmann::json::object();
     ASSERT_TRUE(!loadWithDirectory(runtime, withContentHash(invalidDocument), directoryUtf8));
 
     invalidDocument = nlohmann::json::parse(bundle);
-    invalidDocument["variants"][0]["steps"] = {{{"kind", "draw"}, {"vertex", "fill"}, {"fragment", "fill"}}};
+    invalidDocument["variants"][0]["program"] = {{"compute", "fill"}, {"vertex", "fill"}, {"fragment", "fill"}};
     ASSERT_TRUE(!loadWithDirectory(runtime, withContentHash(invalidDocument), directoryUtf8));
 
     invalidDocument = nlohmann::json::parse(bundle);
@@ -222,12 +222,6 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
 
     VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
     ASSERT_TRUE(pipeline);
-    ASSERT_TRUE(vernonRuntimeLoadedPipelineGetStepCount(pipeline) == 1);
-    VernonPipelineStepView step{};
-    step.struct_size = sizeof(step);
-    ASSERT_TRUE(vernonRuntimeLoadedPipelineGetStepByIndex(pipeline, 0, &step) == VERNON_STATUS_OK);
-    ASSERT_TRUE(step.kind == VERNON_PIPELINE_DISPATCH);
-    ASSERT_TRUE(step.stage.size == std::strlen("fill") && std::memcmp(step.stage.data, "fill", step.stage.size) == 0);
     ASSERT_TRUE(vernonRuntimeLoadedPipelineGetParameterCount(pipeline) == 1);
     VernonPipelineParameterView parameter{};
     ASSERT_TRUE(vernonRuntimeLoadedPipelineGetParameterByIndex(pipeline, 0, &parameter) == VERNON_STATUS_OK);

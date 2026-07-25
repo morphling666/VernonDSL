@@ -1,11 +1,11 @@
-# Deferred execution graph design
+# Archived host Pass-graph design
 
 > **Status: archived, non-normative, and not an implementation commitment.**
 >
-> This document preserves the previous Phase 3B/3C execution-graph proposal.
+> This document preserves the previous Phase 3B/3C host orchestration proposal.
 > It was removed from the active compiler, language, and runtime contracts
 > because graphics invocation state, attachment semantics, and heterogeneous
-> compute/graphics backend ownership are not sufficiently specified. Program
+> compute/graphics backend ownership are not sufficiently specified. Pipeline
 > assets do not depend on this proposal. A future graph design may replace any
 > part of it.
 
@@ -246,5 +246,6 @@ Phase 3C proposed:
 These phase definitions are no longer active roadmap commitments. Multi-program
 orchestration, render-pass and attachment semantics, dynamic graphics state,
 cross-backend resource ownership, synchronization, and graph-level autodiff
-must be redesigned together before execution graphs return to the canonical
-specifications.
+must be redesigned together before host orchestration returns to the canonical
+specifications. This proposal is unrelated to the compiler-internal
+ProgramGraph used for autodiff inside one specialized program.

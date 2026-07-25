@@ -38,15 +38,15 @@ The native compiler library currently provides:
 - graphics lowering to SPIR-V and Vulkan `.spv` artifacts;
 - compute outlining to MLIR `gpu.module`/`gpu.func` and Vulkan SPIR-V;
 - CUDA compute lowering through NVVM to PTX;
-- SPIRV-Cross source artifacts for OpenGL, OpenGL ES, and Metal;
+- SPIRV-Cross source artifacts for OpenGL, OpenGL ES, Metal, and DirectX HLSL;
 - `vernon-opt`, the Vernon MLIR pass driver.
 
 CUDA/NVPTX and CPU/LLVM are distinct branches; they are never routed through
 SPIR-V. The CPU backend JIT-compiles the current graphics and compute numeric
 subset, including buffer load/store and callback-based 2D texture sampling,
-and exports guarded C ABI entry points for reference execution. DirectX
-remains unavailable until the HLSL produced by SPIRV-Cross is completed by a
-DXC-to-DXIL artifact step.
+and exports guarded C ABI entry points for reference execution. DirectX is a
+cook-only HLSL source target; DXC-to-DXIL compilation and DirectX runtime
+execution are not implemented.
 
 That JIT is a compiler reference facility, not a deployable runtime format.
 `VernonRuntime` accepts CPU native-library AOT bundles only.
@@ -241,10 +241,9 @@ uv run python examples/advanced_pipeline.py --arch vulkan --frames 2 --headless 
   --id-output build/advanced-object-id.png
 ```
 
-The legacy end-to-end example currently combines shared definitions with
-three-stage compute/vertex/fragment composition, three feature variants,
-indexed instancing, named MRT outputs, and per-frame input/index/uniform
-rebinding:
+The end-to-end example invokes separate compute and graphics programs while
+sharing three feature variants, indexed instancing, named MRT outputs, and
+per-frame input/index/uniform rebinding:
 
 ```powershell
 uv run python examples/complete_pipeline.py --arch vulkan --frames 3 --headless `
@@ -312,17 +311,16 @@ build/source/Release/vernon-compile.exe `
 
 This direct `--bundle` compatibility path contains `shader.json` plus readable
 generated vertex and fragment GLSL files. It remains available for legacy
-OpenGL tooling. The target ProgramAsset cooker is `vernon-cook-program`; the
-currently implemented `vernon-cook-shader` command remains the legacy migration
-surface.
+OpenGL tooling. The target PipelineAsset cooker is `vernon-cook-pipeline`; the
+target and its options are supplied at cook time.
 
 Declare persistent assets beside their stage functions. The declaration is
 read from the source AST and never imports or executes the module. The target
-ProgramAsset API is:
+PipelineAsset API is:
 
 ```python
-mesh_asset = vd.program_asset(
-    id="pipelines/mesh",
+mesh_asset = vd.pipeline_asset(
+    id="pipeline/mesh",
     program=(mesh_vertex, mesh_fragment),
     variants=((), (INSTANCE,), (SKIN,), (INSTANCE, SKIN)),
 )
@@ -332,36 +330,35 @@ mesh_asset = vd.program_asset(
 stages. Graphics stage kinds come from their decorators, allowing the tuple
 topology to grow beyond vertex-plus-fragment without changing the asset shape.
 Target architecture and options are supplied by the cooker rather than source.
-The following shows the target CLI contract; `program_asset` and
-`vernon-cook-program` implementation are pending.
+DirectX HLSL defaults to Shader Model 5.0; pass
+`--hlsl-shader-model 30|40|41|50|51|60` to select another supported source
+profile. Metal and DirectX bundles are compiler outputs only and are not
+loadable by `VernonRuntime`.
 
 Cook the named declaration in process for one target:
 
 ```powershell
-uv run --frozen vernon-cook-program `
+uv run --frozen vernon-cook-pipeline `
   examples/variant_mesh.py:mesh_asset `
   --target opengl `
   -o build/variant_mesh_asset
 ```
 
-For a compute ProgramAsset, use the same cooker with `--target cpu`:
+For a compute PipelineAsset, use the same cooker with `--target cpu`:
 
 ```powershell
-uv run --frozen vernon-cook-program `
+uv run --frozen vernon-cook-pipeline `
   python/tests/pipeline_asset_fixture.py:scale_asset `
   --target cpu `
   -o build/cpu_scale
 ```
 
-The current `vernon-cook-shader` command still implements the legacy
-`pipeline_asset` input contract.
-
-The current legacy cooker result contains `cpu_scale.pipeline.json` and a
+The cooker result contains `cpu_scale.pipeline.json` and a
 content-addressed `artifacts/<sha256>.obj` or `.o`. Consumers should parse the
 JSON manifest and link the referenced object; the cooker does not generate an
 executable CMake fragment.
 
-The legacy `variant_mesh_asset.pipeline.json` maps exact canonical feature keys
+The `variant_mesh_asset.pipeline.json` maps exact canonical feature keys
 to shared stage artifacts. For the four `INSTANCE`/`SKIN` combinations, four
 specialized vertex files share one unchanged fragment file by content hash.
 Vernon rejects missing variants rather than falling back.

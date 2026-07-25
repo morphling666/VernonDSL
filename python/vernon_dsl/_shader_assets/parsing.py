@@ -5,6 +5,7 @@ import keyword
 from pathlib import Path
 from typing import Any
 
+from ..decorators import ENTRY_DECORATOR_STAGES, GRAPHICS_STAGE_ORDER
 from ..language.ast_utils import decorator_name, dotted_name
 from ..module_graph import load_project
 from ..pipeline_compile import PipelineCompileError, canonical_json
@@ -94,34 +95,60 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
     keywords = {item.arg: item.value for item in declaration.keywords if item.arg is not None}
     if len(keywords) != len(declaration.keywords):
         raise PipelineCompileError("pipeline_asset does not accept expanded keyword arguments")
-    unknown = set(keywords) - {"id", "compute", "vertex", "fragment", "variants", "targets"}
+    unknown = set(keywords) - {"id", "program", "variants"}
     if unknown:
         raise PipelineCompileError("unknown pipeline_asset argument(s): " + ", ".join(sorted(unknown)))
 
     pipeline_id = _literal_keyword(keywords, "id")
     if not isinstance(pipeline_id, str) or not pipeline_id:
         raise PipelineCompileError("pipeline asset id must be a non-empty string")
-    stage_functions: dict[str, str] = {}
-    for stage in ("compute", "vertex", "fragment"):
-        node = keywords.get(stage)
-        if node is None:
-            continue
-        if not isinstance(node, ast.Name):
-            raise PipelineCompileError(f"pipeline_asset {stage} must reference a function in the same module")
-        stage_functions[stage] = node.id
-    if set(stage_functions) not in ({"compute"}, {"vertex", "fragment"}, {"compute", "vertex", "fragment"}):
-        raise PipelineCompileError(
-            "pipeline must contain vertex+fragment, compute+vertex+fragment, or one compute stage"
-        )
     definitions = {
         statement.name: {decorator_name(decorator) for decorator in statement.decorator_list}
         for statement in tree.body
         if isinstance(statement, ast.FunctionDef)
     }
-    expected = {"compute": {"kernel"}, "vertex": {"vertex"}, "fragment": {"fragment"}}
-    for stage, entry in stage_functions.items():
-        if entry not in definitions or not (definitions[entry] & expected[stage]):
-            raise PipelineCompileError(f"pipeline_asset {stage} entry '{entry}' has the wrong stage decorator")
+
+    def entry_stage(entry: ast.expr) -> tuple[str, str]:
+        if not isinstance(entry, ast.Name):
+            raise PipelineCompileError("pipeline_asset program entries must reference functions in the same module")
+        decorators = definitions.get(entry.id)
+        if decorators is None:
+            raise PipelineCompileError(f"pipeline_asset program entry '{entry.id}' is not a function")
+        stages = {ENTRY_DECORATOR_STAGES[name] for name in decorators if name in ENTRY_DECORATOR_STAGES}
+        if len(stages) != 1:
+            raise PipelineCompileError(
+                f"pipeline_asset program entry '{entry.id}' must have exactly one entry-stage decorator"
+            )
+        return stages.pop(), entry.id
+
+    program = keywords.get("program")
+    if program is None:
+        raise PipelineCompileError("pipeline_asset declaration requires 'program'")
+    stage_functions: dict[str, str] = {}
+    if isinstance(program, ast.Name):
+        stage, entry = entry_stage(program)
+        if stage != "compute":
+            raise PipelineCompileError("single-entry pipeline_asset program must be a compute Kernel")
+        stage_functions[stage] = entry
+    elif isinstance(program, ast.Tuple):
+        if not program.elts:
+            raise PipelineCompileError("graphics pipeline_asset program must contain at least one stage")
+        declared_stages: list[str] = []
+        for item in program.elts:
+            stage, entry = entry_stage(item)
+            if stage == "compute":
+                raise PipelineCompileError("graphics pipeline_asset program cannot contain a compute Kernel")
+            if stage in stage_functions:
+                raise PipelineCompileError(f"graphics pipeline_asset program contains duplicate '{stage}' stage")
+            stage_functions[stage] = entry
+            declared_stages.append(stage)
+        order = {stage: index for index, stage in enumerate(GRAPHICS_STAGE_ORDER)}
+        if declared_stages != sorted(declared_stages, key=lambda stage: order.get(stage, len(order))):
+            raise PipelineCompileError("graphics pipeline_asset program stages are not in topology order")
+    else:
+        raise PipelineCompileError(
+            "pipeline_asset program must be one compute Kernel or a tuple of graphics entry functions"
+        )
 
     features = _feature_bindings(tree)
     variants_node = keywords.get("variants")
@@ -149,14 +176,6 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
     if len(variants) > 16:
         raise PipelineCompileError(f"pipeline declares {len(variants)}, exceeding variant cap 16")
 
-    targets = _literal_keyword(keywords, "targets")
-    if not isinstance(targets, dict) or not targets:
-        raise PipelineCompileError("pipeline_asset targets must be a non-empty dictionary")
-    normalized_targets: dict[str, dict[str, Any]] = {}
-    for target, options in targets.items():
-        if not isinstance(target, str) or not isinstance(options, dict):
-            raise PipelineCompileError("pipeline target options must be objects")
-        normalized_targets[target] = options
     requested = {name for variant in variants for name in variant}
     unknown_features = requested - set(load_project(source_path).features)
     if unknown_features:
@@ -170,7 +189,6 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
         "id": pipeline_id,
         "stages": stage_functions,
         "variants": [list(key) for key in variants],
-        "targets": normalized_targets,
     }
     encoded = canonical_json(manifest)
     module = ShaderModuleDescriptor(module_id, source_path, source_path, encoded)
@@ -179,7 +197,6 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
         pipeline_id,
         stages,
         variants,
-        normalized_targets,
         source_path,
         encoded,
         {module_id: module},

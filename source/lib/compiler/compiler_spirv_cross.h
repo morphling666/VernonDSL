@@ -10,6 +10,6 @@
 namespace vernon::compiler {
 
 bool crossCompileSpirv(std::vector<Artifact> &artifacts, std::string &diagnostics, VernonTarget target,
-                       uint32_t glslVersion);
+                       uint32_t glslVersion, uint32_t hlslShaderModel);
 
 } // namespace vernon::compiler

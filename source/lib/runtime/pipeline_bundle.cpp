@@ -123,6 +123,31 @@ bool validateManifestHash(const nlohmann::json &root, bool required, std::string
     return true;
 }
 
+bool validateCpuRuntimeRequirements(const std::string &targetTriple, const std::string &objectFormat,
+                                    uint32_t invocationAbiVersion, std::string &error) {
+#if defined(_WIN32)
+    constexpr const char *hostFormat = "coff";
+    constexpr const char *hostOsToken = "windows";
+#elif defined(__APPLE__)
+    constexpr const char *hostFormat = "macho";
+    constexpr const char *hostOsToken = "darwin";
+#else
+    constexpr const char *hostFormat = "elf";
+    constexpr const char *hostOsToken = "linux";
+#endif
+    const std::string architecture = hostArchitecture();
+    const bool architectureMatches =
+        targetTriple.rfind(architecture, 0) == 0 || (architecture == "x86_64" && targetTriple.rfind("amd64", 0) == 0);
+    if (!architectureMatches || targetTriple.find(hostOsToken) == std::string::npos || objectFormat != hostFormat ||
+        invocationAbiVersion != VERNON_CPU_INVOCATION_ABI_VERSION) {
+        error = "pipeline requires CPU target " + targetTriple + " / " + objectFormat + " / ABI " +
+                std::to_string(invocationAbiVersion) + ", runtime provides " + architecture + "-" + hostOsToken +
+                " / " + hostFormat + " / ABI " + std::to_string(VERNON_CPU_INVOCATION_ABI_VERSION);
+        return false;
+    }
+    return true;
+}
+
 bool resolveArtifact(const nlohmann::json &descriptor, const std::optional<std::filesystem::path> &directory,
                      ResolvedArtifact &output, std::string &error) {
     if (!descriptor.is_object() || !descriptor.contains("format") || !descriptor["format"].is_string() ||

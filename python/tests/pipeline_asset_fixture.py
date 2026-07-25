@@ -39,26 +39,18 @@ def scale(
 
 triangle_asset = vd.pipeline_asset(
     id="pipelines/triangle",
-    vertex=triangle_vertex,
-    fragment=solid_fragment,
+    program=(triangle_vertex, solid_fragment),
     variants=((), (OFFSET,)),
-    targets={"opengl": {"glsl_version": 330}, "vulkan": {}},
 )
 
 sampled_asset = vd.pipeline_asset(
     id="pipelines/sampled_triangle",
-    vertex=triangle_vertex,
-    fragment=sampled_fragment,
+    program=(triangle_vertex, sampled_fragment),
     variants=((),),
-    targets={"vulkan": {}},
 )
 
 scale_asset = vd.pipeline_asset(
     id="pipelines/scale",
-    compute=scale,
+    program=scale,
     variants=((),),
-    targets={
-        "cpu": {},
-        "cuda": {},
-    },
 )

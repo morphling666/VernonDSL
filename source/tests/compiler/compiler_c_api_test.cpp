@@ -232,6 +232,8 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     VernonTargetCapabilities opengl = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_OPENGL);
     VernonTargetCapabilities opengles = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_OPENGL_ES);
     VernonTargetCapabilities metal = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_METAL);
+    VernonTargetCapabilities directx = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_DIRECTX);
+    ASSERT_TRUE(directx.available && directx.supports_graphics && directx.supports_compute);
 
     VernonCompileResult *validation = vernonCompilerValidateMlir(context, module, strlen(module));
     ASSERT_TRUE(validation != NULL);
@@ -257,8 +259,34 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
 
     VernonCompileResult *compile = vernonCompilerCompileMlir(context, module, strlen(module), VERNON_TARGET_DIRECTX);
     ASSERT_TRUE(compile != NULL);
-    ASSERT_TRUE(vernonCompileResultGetStatus(compile) == VERNON_STATUS_UNSUPPORTED_TARGET);
+    ASSERT_TRUE(vernonCompileResultGetStatus(compile) == VERNON_STATUS_OK);
+    ASSERT_TRUE(vernonCompileResultGetArtifactCount(compile) == 1);
+    VernonStringView directx_name = vernonCompileResultGetArtifactName(compile, 0);
+    ASSERT_TRUE(view_contains(directx_name, "vertex_main.vert.hlsl"));
+    VernonStringView hlsl = vernonCompileResultGetArtifactData(compile, 0);
+    ASSERT_TRUE(hlsl.size != 0);
+    VernonStringView directx_reflection = vernonCompileResultGetReflection(compile);
+    ASSERT_TRUE(view_contains(directx_reflection, "\"target\":\"directx\""));
+    ASSERT_TRUE(view_contains(directx_reflection, "\"format\":\"hlsl\""));
+    ASSERT_TRUE(view_contains(directx_reflection, "\"hlsl_shader_model\":50"));
     vernonCompileResultDestroy(compile);
+
+    VernonCompileOptions directx_options{};
+    directx_options.struct_size = sizeof(directx_options);
+    directx_options.hlsl_shader_model = 60;
+    VernonCompileResult *directx_sm60 =
+        vernonCompilerCompileMlirWithOptions(context, module, strlen(module), VERNON_TARGET_DIRECTX, &directx_options);
+    ASSERT_TRUE(directx_sm60 != NULL);
+    ASSERT_TRUE(vernonCompileResultGetStatus(directx_sm60) == VERNON_STATUS_OK);
+    ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(directx_sm60), "\"hlsl_shader_model\":60"));
+    vernonCompileResultDestroy(directx_sm60);
+
+    directx_options.hlsl_shader_model = 55;
+    VernonCompileResult *invalid_directx_options =
+        vernonCompilerCompileMlirWithOptions(context, module, strlen(module), VERNON_TARGET_DIRECTX, &directx_options);
+    ASSERT_TRUE(invalid_directx_options != NULL);
+    ASSERT_TRUE(vernonCompileResultGetStatus(invalid_directx_options) == VERNON_STATUS_INVALID_ARGUMENT);
+    vernonCompileResultDestroy(invalid_directx_options);
 
     VernonCompileResult *vulkan_compile =
         vernonCompilerCompileMlir(context, module, strlen(module), VERNON_TARGET_VULKAN);
@@ -281,7 +309,9 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     vernonCompileResultDestroy(vulkan_compile);
 
     if (opengl.available) {
-        VernonCompileOptions options = {sizeof(VernonCompileOptions), 450, {0}};
+        VernonCompileOptions options{};
+        options.struct_size = sizeof(options);
+        options.glsl_version = 450;
         VernonCompileResult *opengl_compile = vernonCompilerCompileMlirWithOptions(
             context, cpu_module, strlen(cpu_module), VERNON_TARGET_OPENGL, &options);
         ASSERT_TRUE(opengl_compile != NULL);
@@ -304,7 +334,9 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     }
 
     if (opengles.available) {
-        VernonCompileOptions options = {sizeof(VernonCompileOptions), 310, {0}};
+        VernonCompileOptions options{};
+        options.struct_size = sizeof(options);
+        options.glsl_version = 310;
         VernonCompileResult *opengles_compile = vernonCompilerCompileMlirWithOptions(
             context, cpu_module, strlen(cpu_module), VERNON_TARGET_OPENGL_ES, &options);
         ASSERT_TRUE(opengles_compile != NULL);

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import struct
 import unittest
+from types import SimpleNamespace
 
+from vernon_dsl.bundle.requirements import runtime_requirements
 from vernon_dsl.pipeline_compile import (
     CompiledArtifact,
     CompiledStage,
@@ -24,6 +27,8 @@ from vernon_dsl.pipeline_compile import (
 
 
 def _stage(stage: str, artifact: bytes, interface: dict[str, object]) -> CompiledStage:
+    if not artifact.startswith(b"#version"):
+        artifact = b"#version 330\n" + artifact
     entry = f"{stage}_main"
     reflection = {
         "module_hash": "module-hash",
@@ -57,6 +62,110 @@ def _stage(stage: str, artifact: bytes, interface: dict[str, object]) -> Compile
 
 
 class PipelineCompileTests(unittest.TestCase):
+    def test_runtime_requirements_are_derived_from_artifact_headers(self) -> None:
+        def stage(
+            target: str,
+            data: bytes,
+            *,
+            required_features: list[str] | None = None,
+            metadata: dict[str, object] | None = None,
+            interface: dict[str, object] | None = None,
+        ) -> SimpleNamespace:
+            return SimpleNamespace(
+                target=SimpleNamespace(target=target),
+                stage="compute",
+                artifact=SimpleNamespace(data=data),
+                reflection={"required_features": required_features or []},
+                metadata=metadata or {},
+                interface=interface or {},
+            )
+
+        gl = runtime_requirements(
+            "opengl",
+            [stage("opengl", b"#version 430\nvoid main() {}", required_features=["textures", "compute"])],
+        )
+        self.assertEqual(gl["api_version"], [4, 3])
+        self.assertEqual(gl["glsl_version"], 430)
+        self.assertEqual(gl["profile"], "core")
+        self.assertEqual(gl["features"], ["compute", "textures"])
+
+        spirv = struct.pack("<II", 0x07230203, 0x00010300)
+        vulkan = runtime_requirements(
+            "vulkan",
+            [stage("vulkan", spirv, interface={"workgroup_size": [8, 4, 1]})],
+        )
+        self.assertEqual(vulkan["spirv_version"], [1, 3])
+        self.assertEqual(vulkan["compute_workgroup_size"], [8, 4, 1])
+
+        ptx = b".version 8.1\n.target sm_75\n.address_size 64\n"
+        cuda = runtime_requirements("cuda", [stage("cuda", ptx)])
+        self.assertEqual(cuda["ptx_version"], [8, 1])
+        self.assertEqual(cuda["minimum_compute_capability"], [7, 5])
+        self.assertEqual(cuda["address_size"], 64)
+
+        cpu = runtime_requirements(
+            "cpu",
+            [
+                stage(
+                    "cpu",
+                    b"object",
+                    metadata={
+                        "target_triple": "x86_64-pc-windows-msvc",
+                        "object_format": "coff",
+                        "cpu_invocation_abi_version": 3,
+                    },
+                )
+            ],
+        )
+        self.assertEqual(cpu["target_triple"], "x86_64-pc-windows-msvc")
+        self.assertEqual(cpu["object_format"], "coff")
+        self.assertEqual(cpu["invocation_abi_version"], 3)
+        self.assertIsNone(runtime_requirements("metal", []))
+
+    def test_runtime_requirement_parsers_reject_incomplete_artifacts(self) -> None:
+        stage = SimpleNamespace(
+            target=SimpleNamespace(target="cuda"),
+            stage="compute",
+            artifact=SimpleNamespace(data=b".version 8.0\n"),
+            reflection={},
+            metadata={},
+            interface={},
+        )
+        with self.assertRaisesRegex(PipelineCompileError, "incomplete PTX header"):
+            runtime_requirements("cuda", [stage])
+
+    def test_runtime_requirements_change_content_hash_but_not_stage_identity(self) -> None:
+        stage = _stage("compute", b"#version 430\nvoid main() {}", {"workgroup_size": [1, 1, 1]})
+        plan = build_bundle_plan("requirements/hash", stage.target, (), [((), {"compute": stage})])
+        logical = plan.logical_dict()
+        content_hash = hashlib.sha256(canonical_json(logical).encode("utf-8")).hexdigest()
+        changed = json.loads(json.dumps(logical))
+        changed["runtime_requirements"]["glsl_version"] = 440
+        changed_hash = hashlib.sha256(canonical_json(changed).encode("utf-8")).hexdigest()
+
+        self.assertNotEqual(content_hash, changed_hash)
+        self.assertEqual(set(logical["stage_artifacts"]), {stage.id})
+        self.assertEqual(set(changed["stage_artifacts"]), {stage.id})
+
+    def test_native_options_are_scoped_to_the_selected_target(self) -> None:
+        self.assertEqual(TargetOptions("opengl", {"glsl_version": 330}).native_options, {"glsl_version": 330})
+        self.assertEqual(
+            TargetOptions("cpu", {"cpu": "generic", "cpu_features": "+sse2"}).native_options,
+            {"cpu": "generic", "cpu_features": "+sse2"},
+        )
+        self.assertEqual(TargetOptions("directx").native_options, {"hlsl_shader_model": 50})
+        self.assertEqual(
+            TargetOptions("directx", {"hlsl_shader_model": 60}).native_options,
+            {"hlsl_shader_model": 60},
+        )
+        self.assertEqual(TargetOptions("cuda").native_options, {})
+        with self.assertRaisesRegex(PipelineCompileError, "valid only for the CPU target"):
+            TargetOptions("vulkan", {"cpu": "generic"})
+        with self.assertRaisesRegex(PipelineCompileError, "valid only for the DirectX target"):
+            TargetOptions("metal", {"hlsl_shader_model": 50})
+        with self.assertRaisesRegex(PipelineCompileError, "must be one of"):
+            TargetOptions("directx", {"hlsl_shader_model": 55})
+
     def test_generated_sampler_and_resolution_are_internal(self) -> None:
         records = {
             "fragment": {
@@ -372,7 +481,6 @@ class PipelineCompileTests(unittest.TestCase):
                 (
                     ("A",),
                     {
-                        "compute": compute,
                         "vertex": vertex,
                         "fragment": fragment,
                     },
@@ -384,6 +492,10 @@ class PipelineCompileTests(unittest.TestCase):
             plan.variants[0].to_dict(),
             {
                 "key": ["A"],
+                "program": {
+                    "fragment": fragment.id,
+                    "vertex": vertex.id,
+                },
                 "parameters": [],
                 "outputs": [
                     {
@@ -395,22 +507,6 @@ class PipelineCompileTests(unittest.TestCase):
                         "location": 0,
                         "type": "tensor<4xf32>",
                     }
-                ],
-                "steps": [
-                    {
-                        "kind": "dispatch",
-                        "stage": compute.id,
-                    },
-                    {
-                        "kind": "barrier",
-                        "source": "compute_write",
-                        "destination": "vertex_read",
-                    },
-                    {
-                        "kind": "draw",
-                        "vertex": vertex.id,
-                        "fragment": fragment.id,
-                    },
                 ],
             },
         )

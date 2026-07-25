@@ -48,6 +48,8 @@ struct Stage {
 };
 
 bool validateManifestHash(const nlohmann::json &root, bool required, std::string &error);
+bool validateCpuRuntimeRequirements(const std::string &targetTriple, const std::string &objectFormat,
+                                    uint32_t invocationAbiVersion, std::string &error);
 
 bool resolveArtifact(const nlohmann::json &descriptor, const std::optional<std::filesystem::path> &directory,
                      ResolvedArtifact &output, std::string &error);

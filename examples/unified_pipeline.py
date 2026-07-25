@@ -41,7 +41,7 @@ def fragment_main(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run a VernonDSL compute -> graphics pipeline.")
+    parser = argparse.ArgumentParser(description="Run separate VernonDSL compute and graphics programs.")
     parser.add_argument(
         "--arch",
         choices=("opengl", "opengles", "vulkan"),
@@ -88,7 +88,7 @@ def main() -> None:
     draw_offset = vd.storage.from_numpy(np.zeros((2,), dtype=np.float32))
     color = vd.storage.from_numpy(np.array((0.1, 0.65, 1.0, 1.0), dtype=np.float32))
     target = vd.Texture.zeros(shape=(args.size, args.size))
-    render = vd.pipeline(animate_vertices, vertex_main, fragment_main)
+    render = vd.pipeline(vertex_main, fragment_main)
 
     frame = 0
     image: np.ndarray | None = None
@@ -117,10 +117,9 @@ def main() -> None:
                     dtype=np.float32,
                 )
             )
+            animate_vertices(positions, base_positions, np.float32(phase))
             render(
                 positions=positions,
-                base_positions=base_positions,
-                phase=phase,
                 draw_offset=draw_offset,
                 color=color,
                 target=target,

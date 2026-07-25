@@ -146,6 +146,28 @@ normalization. CUDA's LLVM math pass is never used: Vulkan retains standard
 math operations for SPIR-V lowering, and Metal source is cross-compiled from
 the same SPIR-V module.
 
+Metal MSL and DirectX HLSL PipelineAssets are cook-only compiler products.
+They deliberately have no `VernonRuntimeBackend`; target inspection and bundle
+loading return unsupported until matching runtime backends are implemented.
+
+### Pipeline runtime requirements
+
+Schema-2 PipelineAssets may contain a hash-covered `runtime_requirements`
+object. Its target-discriminated values are derived from the emitted artifact:
+CPU target triple/object format/invocation ABI, GLSL profile and API version,
+SPIR-V version plus Vulkan 1.1 and compute workgroup limits, or PTX version,
+address size, and minimum compute capability. Required reflection features are
+stored once in sorted order. Metal and DirectX omit this field because they
+have no Runtime backend.
+
+`target_options` records how compilation was requested; it is not a runtime
+capability contract. `runtime_requirements` records the minimum capabilities
+needed by the resulting artifact. Runtime validates the latter after the
+manifest hash and target, but before resolving or loading artifacts. Missing
+requirements preserve legacy schema-2 loading behavior. CUDA intentionally
+does not infer a driver version from PTX; compute capability is checked early,
+and the CUDA driver JIT remains authoritative for PTX compatibility.
+
 ## OpenGL and OpenGL ES runtime
 
 OpenGL and OpenGL ES are external-context AHI backends. The context owner
@@ -186,16 +208,16 @@ copies one block per outer index. This preserves arbitrary positive-stride
 views while avoiding per-element index division and tiny copies for common
 padded-row and sliced-batch layouts.
 
-## Program runtime boundary
+## Pipeline runtime boundary
 
 Kernel is the compute program form. Pipeline is the graphics program form and
-contains a validated tuple of graphics stages. A persistent ProgramAsset wraps
+contains a validated tuple of graphics stages. A persistent PipelineAsset wraps
 exactly one of those forms; compute and graphics entries are never combined in
-one program.
+one pipeline.
 
-ProgramAsset target architecture and options are selected by the cooker. A
-compute ProgramAsset resolves only against a compute backend, while a graphics
-ProgramAsset resolves only against a graphics backend. The target profile is
+PipelineAsset target architecture and options are selected by the cooker. A
+compute PipelineAsset resolves only against a compute backend, while a graphics
+PipelineAsset resolves only against a graphics backend. The target profile is
 part of artifact identity and the cooked manifest, not the source declaration.
 
 The graphics stage tuple is extensible through the language's versioned stage
@@ -204,10 +226,9 @@ stage topology with an explicit unsupported-target result when that backend
 does not implement it. Manifest parsing must not hard-code vertex-plus-fragment
 as the only representable topology.
 
-The currently implemented schema-2 Pipeline bundle and invocation ABI remain
-migration surfaces. Their optional combined compute-plus-graphics sequence is
-legacy behavior, not the target ProgramAsset contract. New program semantics
-must not depend on that fixed upload/dispatch/barrier/draw sequence.
+Schema-2 binds each variant directly through its `program` stage-to-artifact
+map. It contains either one compute program or one graphics-stage tuple; it has
+no dispatch/barrier/draw step list and cannot encode host orchestration.
 
 Multi-program orchestration, render-pass and attachment state, framebuffer or
 renderbuffer abstraction, resource transitions, and compute/graphics backend

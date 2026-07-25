@@ -365,10 +365,10 @@ class Kernel:
         self,
         arguments: tuple[Any, ...],
         grid: tuple[int, int, int] | None,
-        _pipeline_features: tuple[str, ...] = (),
+        features: tuple[str, ...] = (),
     ) -> None:
         state = _session_state()
-        compiled = self._compile(arguments, _pipeline_features)
+        compiled = self._compile(arguments, features)
         user_parameters = [
             argument.arg for argument in compiled.function.args.args if argument.arg not in compiled.builtin_names
         ]
@@ -422,16 +422,9 @@ class Kernel:
         self,
         *arguments: Any,
         grid: tuple[int, int, int] | None = None,
-        _pipeline_features: tuple[str, ...] = (),
+        features: tuple[str, ...] = (),
     ) -> None:
-        if _pipeline_features:
-            self._invoke_direct(tuple(arguments), grid, _pipeline_features)
-            return
-        from ..execution import ExecutionGraph
-
-        graph = ExecutionGraph()
-        graph.dispatch(self, *arguments, grid=grid)
-        graph.run()
+        self._invoke_direct(tuple(arguments), grid, features)
 
 
 atexit.register(Kernel.clear_cache)

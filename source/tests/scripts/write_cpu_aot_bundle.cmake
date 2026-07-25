@@ -74,7 +74,7 @@ set(PIPELINE_CANONICAL
 \"name\":\"output\",\"shape\":[12],\"slot\":0,\"uses\":[{\"access\":\"write\",\
 \"dtype\":\"f32\",\"entry\":\"fill\",\"index\":0,\"interface\":\"storage\",\
 \"kind\":\"tensor\",\"shape\":[12],\"stage\":\"compute\"}]}],\
-\"steps\":[{\"kind\":\"dispatch\",\"stage\":\"fill\"}]}]}")
+\"program\":{\"compute\":\"fill\"}}]}")
 string(SHA256 PIPELINE_HASH "${PIPELINE_CANONICAL}")
 string(
     SUBSTRING "${PIPELINE_CANONICAL}"

@@ -111,7 +111,7 @@ struct VulkanGraphicsCache {
 };
 
 struct VulkanPipelineState {
-    std::unordered_map<std::string, VernonLoadedKernel *> computeKernels;
+    VernonLoadedKernel *computeKernel{};
     VkShaderModule vertex{};
     VkShaderModule fragment{};
     std::string vertexEntry;
@@ -126,7 +126,6 @@ struct VulkanGraphicsState {
     const std::string *vertexEntry{};
     const std::string *fragmentEntry{};
     VulkanGraphicsCache *cache{};
-    bool barrier{};
 };
 
 struct VulkanPushConstantStageRange {

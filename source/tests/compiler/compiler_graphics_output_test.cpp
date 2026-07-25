@@ -250,8 +250,8 @@ void expectPackedPushConstants(std::string_view artifact) {
 TEST(CompilerGraphicsOutput, PreservesInterfacesTexturesAndSwizzles) {
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
-    for (VernonTarget target :
-         {VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL, VERNON_TARGET_OPENGL_ES, VERNON_TARGET_METAL}) {
+    for (VernonTarget target : {VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL, VERNON_TARGET_OPENGL_ES,
+                                VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
         VernonCompileResult *result = vernonCompilerCompileMlir(compiler, module.data(), module.size(), target);
         ASSERT_TRUE(result);
         if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {

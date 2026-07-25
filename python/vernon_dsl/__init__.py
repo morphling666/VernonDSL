@@ -35,11 +35,9 @@ from .intrinsics import (
     texture_size,
     vertex_id,
 )
+from .pipeline_assets import PipelineAssetDeclaration, pipeline_asset
 from .runtime import (
-    ExecutionGraph,
-    ExecutionGraphAsset,
     Kernel,
-    NodeHandle,
     Pipeline,
     PrimitiveTopology,
     TensorLayout,
@@ -50,7 +48,6 @@ from .runtime import (
     cuda,
     init,
     lines,
-    load_execution_graph_asset,
     opengl,
     opengles,
     pipeline,
@@ -59,7 +56,6 @@ from .runtime import (
     triangles,
     vulkan,
 )
-from .shader_assets import PipelineAssetDeclaration, pipeline_asset
 from .types import (
     Feature,
     Matrix,
@@ -91,12 +87,9 @@ __all__ = [
     "abs",
     "CompileError",
     "Compiler",
-    "ExecutionGraph",
-    "ExecutionGraphAsset",
     "Feature",
     "Kernel",
     "Matrix",
-    "NodeHandle",
     "Pipeline",
     "PipelineAssetDeclaration",
     "PrimitiveTopology",
@@ -134,7 +127,6 @@ __all__ = [
     "init",
     "location",
     "lines",
-    "load_execution_graph_asset",
     "log",
     "kernel",
     "matmul",

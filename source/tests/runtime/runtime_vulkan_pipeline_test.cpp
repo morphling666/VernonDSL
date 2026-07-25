@@ -83,6 +83,20 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     VernonPipelineBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = bundleDirectory.c_str();
+    ASSERT_TRUE(document.contains("runtime_requirements"));
+    nlohmann::json unsupportedDocument = document;
+    unsupportedDocument["runtime_requirements"]["api_version"] = nlohmann::json::array({99, 0});
+    unsupportedDocument.erase("content_hash");
+    const std::string unsupportedCanonical = unsupportedDocument.dump(-1, ' ', false);
+    unsupportedDocument["content_hash"] =
+        vernon::runtime::sha256Hex(unsupportedCanonical.data(), unsupportedCanonical.size());
+    const std::string unsupportedBundle = unsupportedDocument.dump(-1, ' ', false);
+    ASSERT_FALSE(vernonRuntimeLoadPipelineBundleWithOptions(runtime, unsupportedBundle.data(), unsupportedBundle.size(),
+                                                            &options));
+    const VernonStringView unsupportedError = vernonRuntimeGetLastError(runtime);
+    ASSERT_NE(std::string(unsupportedError.data, unsupportedError.size).find("pipeline requires Vulkan 99.0"),
+              std::string::npos);
+
     VernonPipelineBundle *loaded =
         vernonRuntimeLoadPipelineBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
     if (!loaded) {

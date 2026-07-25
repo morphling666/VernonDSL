@@ -33,15 +33,20 @@ def _native_module() -> Any:
 
 def _native_target(native: Any, target: str) -> Any:
     try:
-        return {
-            "cpu": native.Target.CPU,
-            "cuda": native.Target.CUDA,
-            "vulkan": native.Target.VULKAN,
-            "metal": native.Target.METAL,
-            "opengl": native.Target.OPENGL,
-            "opengles": native.Target.OPENGL_ES,
+        name = {
+            "cpu": "CPU",
+            "cuda": "CUDA",
+            "vulkan": "VULKAN",
+            "metal": "METAL",
+            "directx": "DIRECTX",
+            "opengl": "OPENGL",
+            "opengles": "OPENGL_ES",
         }[target]
     except KeyError:
+        raise PipelineCompileError(f"target '{target}' is not available through the native compiler") from None
+    try:
+        return getattr(native.Target, name)
+    except AttributeError:
         raise PipelineCompileError(f"target '{target}' is not available through the native compiler") from None
 
 
@@ -54,6 +59,16 @@ def _cpu_object_format(filename: str, target_triple: str) -> str:
     if any(name in normalized for name in ("apple", "darwin", "macos", "ios")):
         return "macho"
     return "elf"
+
+
+def _manifest_target_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    result = dict(options)
+    if result.get("glsl_version") == 0:
+        result.pop("glsl_version")
+    for name in ("target_triple", "cpu", "cpu_features"):
+        if result.get(name) == "":
+            result.pop(name)
+    return result
 
 
 def _cpu_stage_metadata(stage: CompiledStage) -> dict[str, Any]:
@@ -97,6 +112,21 @@ def _compile_stage(
         entry=reference.entry,
         target=target,
     )
+    reflected_options = compiled.reflection.get("target_options")
+    if isinstance(reflected_options, Mapping):
+        # Persist the compiler's normalized options (notably the default CPU
+        # target triple), so the manifest describes the artifact that was built.
+        compiled = CompiledStage(
+            compiled.module,
+            compiled.module_manifest,
+            compiled.entry,
+            compiled.stage,
+            TargetOptions(target.target, _manifest_target_options(reflected_options)),
+            compiled.reflection,
+            compiled.interface,
+            compiled.artifact,
+            compiled.metadata,
+        )
     if compiled.stage != stage:
         raise PipelineCompileError(f"compiler reflected {reference.entry} as {compiled.stage}, expected {stage}")
     if target.target == "cpu":
@@ -116,14 +146,19 @@ def _compile_stage(
     return compiled
 
 
-def cook_shader_pipeline(*, pipeline_asset: str | Path, output: str | Path, target: str = "opengl") -> Path:
+def cook_pipeline_asset(
+    *,
+    pipeline_asset: str | Path,
+    output: str | Path,
+    target: str = "opengl",
+    target_options: Mapping[str, Any] | None = None,
+) -> Path:
     source, descriptor_name = pipeline_asset_reference(pipeline_asset)
     pipeline = parse_python_pipeline_asset(source, descriptor_name)
-    if target not in pipeline.targets:
-        raise PipelineCompileError(f"pipeline does not declare requested target '{target}'")
+    target = "directx" if target == "dx" else target
     if target == "cpu" and set(pipeline.stages) != {"compute"}:
         raise PipelineCompileError("CPU pipeline bundles support one compute stage and no graphics or barrier steps")
-    target_options = TargetOptions(target, pipeline.targets[target])
+    resolved_target = TargetOptions(target, target_options or {})
     native = _native_module()
     native_target = _native_target(native, target)
     selected_modules: dict[str, ShaderModuleDescriptor] = {}
@@ -153,20 +188,28 @@ def cook_shader_pipeline(*, pipeline_asset: str | Path, output: str | Path, targ
                 reference.module,
                 reference.entry,
                 hashlib.sha256(mlir.encode()).hexdigest(),
-                canonical_json({"target": target_options.target, "options": dict(target_options.options)}),
+                canonical_json({"target": resolved_target.target, "options": dict(resolved_target.options)}),
             )
             compiled = compile_cache.get(key)
             if compiled is None:
                 compiled = _compile_stage(
-                    module, reference, stage, variant, target_options, compiler, native_target, mlir
+                    module, reference, stage, variant, resolved_target, compiler, native_target, mlir
                 )
                 compile_cache[key] = compiled
             stages[stage] = compiled
         planned_variants.append((variant, stages))
 
+    compiled_targets = {
+        canonical_json({"target": stage.target.target, "options": dict(stage.target.options)}): stage.target
+        for _, stages in planned_variants
+        for stage in stages.values()
+    }
+    if len(compiled_targets) != 1:
+        raise PipelineCompileError("compiler returned inconsistent target options across pipeline stages")
+    manifest_target = next(iter(compiled_targets.values()))
     plan = build_bundle_plan(
         pipeline.id,
-        target_options,
+        manifest_target,
         sorted({feature for variant in pipeline.variants for feature in variant}),
         planned_variants,
     )
@@ -186,4 +229,4 @@ def cook_shader_pipeline(*, pipeline_asset: str | Path, output: str | Path, targ
     return manifest
 
 
-__all__ = ["cook_shader_pipeline"]
+__all__ = ["cook_pipeline_asset"]

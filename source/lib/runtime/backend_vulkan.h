@@ -24,6 +24,9 @@ struct VulkanContextState {
     VkQueue queue{};
     uint32_t queueFamily{};
     uint32_t maxPushConstantsSize{};
+    uint32_t apiVersion{};
+    uint32_t maxComputeWorkGroupInvocations{};
+    uint32_t maxComputeWorkGroupSize[3]{};
     VkCommandPool commandPool{};
     VkPhysicalDeviceMemoryProperties memoryProperties{};
     VkSampler defaultImplicitSampler{};

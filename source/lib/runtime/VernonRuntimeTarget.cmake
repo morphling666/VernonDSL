@@ -18,6 +18,8 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/compute_launch_planner.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/content_hash.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/graphics_invocation_planner.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_bundle.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_manifest.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_metadata.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/tensor_bridge.cpp)
     target_include_directories(VernonRuntimeInternals PRIVATE ${_VERNON_RUNTIME_INCLUDE_DIR})
@@ -34,8 +36,6 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/backend_opengl.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/backend_opengl_driver.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/graphics_opengl_encoder.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_bundle.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_manifest.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/platform_library.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_dispatch.cpp)
     add_library(Vernon::Runtime ALIAS VernonRuntime)

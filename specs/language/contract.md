@@ -296,23 +296,23 @@ They are not language-v4 semantics. The archived proposal in
 - Unreachable helpers are pruned. Unreachable generic bodies have no
   diagnostic obligation.
 
-A persistent `ProgramAsset` wraps exactly one executable program. Its
+A persistent `PipelineAsset` wraps exactly one executable pipeline. Its
 `program=` is either one `@kernel` entry or a non-empty tuple containing only
 graphics entries. Kernel programs are compute-only; graphics stage tuples form
 graphics-only Pipelines. Compute and graphics entries cannot be mixed in one
-program.
+pipeline.
 
 Each graphics entry carries an explicit stage kind. A versioned,
 target-independent stage registry validates tuple topology and ordering.
 Vertex-plus-fragment is the currently implemented topology, not a permanent
 language limit. Future registered graphics stages do not require a new
-ProgramAsset shape. A language-valid topology may still fail target capability
+PipelineAsset shape. A language-valid topology may still fail target capability
 validation when a backend has not implemented it.
 
 Generated builtin functions are the preferred authoring API.
 `builtin("...")` remains a low-level entry-interface annotation and uses the
 same closed stage/direction/type registry. `vd.feature` is the single
-compile-time specialization mechanism for program code. `ProgramAsset`
+compile-time specialization mechanism for program code. `PipelineAsset`
 explicitly enumerates accepted canonical feature combinations through
 `variants=`; there is no independent public shader-variant selector. Feature
 values and `When` branches are compile-time specialization inputs, not runtime
@@ -385,6 +385,13 @@ to trace a function. V4 defines:
 - versioned custom JVP and VJP rules with validated primal, tangent, and
   adjoint signatures.
 
+The future autodiff graph is a compiler-internal `ProgramGraph` for one
+specialized Kernel or graphics Pipeline program. Its nodes and edges represent
+typed value flow, control flow, Storage effects, and differentiation
+dependencies inside that program. It is not a host orchestration graph and
+does not order PipelineAssets, dispatches, render passes, or backend
+transitions.
+
 Floating-point Scalar leaves are differentiable. Tensor, Tuple, and Struct
 Values derive tangent and adjoint structure recursively from their leaves.
 Integer, Boolean, Storage, Resource, sampler, and opaque leaves are
@@ -417,8 +424,8 @@ requires all of the following before acceptance:
 - branch/loop tape layout, bounded-loop rules, checkpointing, and
   recomputation policy;
 - explicit primal and gradient storage bindings;
-- a future orchestration model capable of reverse dispatch ordering and
-  resource transitions.
+- a typed program-internal graph capable of effect-preserving reverse traversal
+  and tape planning.
 
 Texture sampling requires custom gradient rules that distinguish coordinate,
 texel, and sampler inputs. Sampler state is non-differentiable. Rasterization,
@@ -463,7 +470,7 @@ A dense fluid simulation uses TensorStorage grids, TensorView stencil
 projections, pure numerical helpers, and multiple host-ordered compute
 dispatches. Sparse acceleration is a library data structure, not a transparent
 Tensor layout. Stateful fluid gradients remain gated on mutation, tape,
-checkpoint, reverse-execution, and a future orchestration contract.
+checkpoint, reverse traversal, and the program-internal autodiff graph.
 
 PBR and SSR use Value Tensors and Structs for local calculations,
 TensorView/Texture inputs for scene data, Sampler resources for filtering, and

@@ -109,10 +109,16 @@ void destroyBackend(VernonRuntimeContext &context) {
 
 void fillBackendCapabilities(const VernonRuntimeContext &context, VernonRuntimeCapabilities &result) {
     result.available = 1;
-    if (context.backend == VERNON_RUNTIME_CPU || context.backend == VERNON_RUNTIME_CUDA ||
-        context.backend == VERNON_RUNTIME_VULKAN) {
+    if (context.backend == VERNON_RUNTIME_CPU || context.backend == VERNON_RUNTIME_CUDA) {
         result.supports_compute = 1;
         result.supports_storage_buffers = 1;
+        return;
+    }
+    if (context.backend == VERNON_RUNTIME_VULKAN) {
+        result.supports_compute = 1;
+        result.supports_storage_buffers = 1;
+        result.supports_graphics = 1;
+        result.graphics_draw_abi_version = 2;
         return;
     }
     result.supports_graphics = 1;
@@ -125,6 +131,110 @@ void fillBackendCapabilities(const VernonRuntimeContext &context, VernonRuntimeC
             : (result.api_version_major > 4 || (result.api_version_major == 4 && result.api_version_minor >= 3));
     result.supports_storage_buffers = result.supports_compute;
     result.graphics_draw_abi_version = 2;
+}
+
+bool validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeRequirements &requirements) {
+    if (!requirements.present)
+        return true;
+    VernonRuntimeCapabilities capabilities{};
+    fillBackendCapabilities(context, capabilities);
+    for (const std::string &feature : requirements.features) {
+        const bool supported = feature == "compute"        ? capabilities.supports_compute
+                               : feature == "tensor_views" ? capabilities.supports_storage_buffers
+                               : feature == "instancing" || feature == "samplers" || feature == "textures"
+                                   ? capabilities.supports_graphics
+                                   : false;
+        if (!supported) {
+            context.error = "pipeline requires unsupported runtime feature '" + feature + "'";
+            return false;
+        }
+    }
+    if (context.backend == VERNON_RUNTIME_CPU) {
+        return validateCpuRuntimeRequirements(requirements.targetTriple, requirements.objectFormat,
+                                              requirements.invocationAbiVersion, context.error);
+    }
+    if (isOpenGLBackend(context.backend)) {
+        const VernonExternalOpenGLContext &actual = openGLState(context).external;
+        const RuntimeVersion actualApi{actual.api_version_major, actual.api_version_minor};
+        const bool apiSatisfied = runtimeVersionAtLeast(actualApi, requirements.apiVersion);
+        const uint32_t actualGlsl = glslVersionForApi(actualApi);
+        if (!apiSatisfied || actualGlsl < requirements.glslVersion) {
+            context.error = "pipeline requires API " + std::to_string(requirements.apiVersion.major) + "." +
+                            std::to_string(requirements.apiVersion.minor) + " / GLSL " +
+                            std::to_string(requirements.glslVersion) + ", context provides " +
+                            std::to_string(actual.api_version_major) + "." + std::to_string(actual.api_version_minor) +
+                            " / GLSL " + std::to_string(actualGlsl);
+            return false;
+        }
+        return true;
+    }
+    if (context.backend == VERNON_RUNTIME_VULKAN) {
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+        const VulkanContextState &actual = vulkanState(context);
+        const uint32_t actualMajor = VK_VERSION_MAJOR(actual.apiVersion);
+        const uint32_t actualMinor = VK_VERSION_MINOR(actual.apiVersion);
+        if (!runtimeVersionAtLeast({actualMajor, actualMinor}, requirements.apiVersion)) {
+            context.error = "pipeline requires Vulkan " + std::to_string(requirements.apiVersion.major) + "." +
+                            std::to_string(requirements.apiVersion.minor) + ", device provides " +
+                            std::to_string(actualMajor) + "." + std::to_string(actualMinor);
+            return false;
+        }
+        RuntimeVersion supportedSpirv{1, 0};
+        if (actualMajor > 1 || actualMinor >= 3)
+            supportedSpirv = {1, 6};
+        else if (actualMinor >= 2)
+            supportedSpirv = {1, 5};
+        else if (actualMinor >= 1)
+            supportedSpirv = {1, 3};
+        if (requirements.shaderVersion.major > supportedSpirv.major ||
+            (requirements.shaderVersion.major == supportedSpirv.major &&
+             requirements.shaderVersion.minor > supportedSpirv.minor)) {
+            context.error = "pipeline requires SPIR-V " + std::to_string(requirements.shaderVersion.major) + "." +
+                            std::to_string(requirements.shaderVersion.minor) + ", device API supports " +
+                            std::to_string(supportedSpirv.major) + "." + std::to_string(supportedSpirv.minor);
+            return false;
+        }
+        uint64_t invocations = 1;
+        for (size_t index = 0; index < 3; ++index) {
+            if (requirements.computeWorkgroupSize[index] > actual.maxComputeWorkGroupSize[index]) {
+                context.error = "pipeline compute workgroup dimension " + std::to_string(index) + " requires " +
+                                std::to_string(requirements.computeWorkgroupSize[index]) + ", device provides " +
+                                std::to_string(actual.maxComputeWorkGroupSize[index]);
+                return false;
+            }
+            invocations *= requirements.computeWorkgroupSize[index];
+        }
+        if (invocations > actual.maxComputeWorkGroupInvocations) {
+            context.error = "pipeline compute workgroup requires " + std::to_string(invocations) +
+                            " invocations, device provides " + std::to_string(actual.maxComputeWorkGroupInvocations);
+            return false;
+        }
+        return true;
+#endif
+    }
+    if (context.backend == VERNON_RUNTIME_CUDA) {
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+        const CudaContextState &actual = cudaState(context);
+        if (!runtimeVersionAtLeast({actual.computeCapabilityMajor, actual.computeCapabilityMinor},
+                                   requirements.minimumComputeCapability)) {
+            context.error = "pipeline requires CUDA compute capability " +
+                            std::to_string(requirements.minimumComputeCapability.major) + "." +
+                            std::to_string(requirements.minimumComputeCapability.minor) + ", device provides " +
+                            std::to_string(actual.computeCapabilityMajor) + "." +
+                            std::to_string(actual.computeCapabilityMinor);
+            return false;
+        }
+        const uint32_t actualAddressSize = static_cast<uint32_t>(sizeof(void *) * 8);
+        if (requirements.addressSize != actualAddressSize) {
+            context.error = "pipeline requires PTX address size " + std::to_string(requirements.addressSize) +
+                            ", runtime provides " + std::to_string(actualAddressSize);
+            return false;
+        }
+        return true;
+#endif
+    }
+    context.error = "runtime requirements cannot be validated by selected backend";
+    return false;
 }
 
 bool createBackendBuffer(VernonDeviceBuffer &buffer) {
@@ -423,30 +533,19 @@ VernonStatus launchBackendKernel(VernonLoadedKernel &kernel, VernonLaunchSize gl
     return VERNON_STATUS_UNSUPPORTED_TARGET;
 }
 
-VernonLoadedKernel *backendPipelineComputeKernel(VernonLoadedPipeline &pipeline, const std::string &stage) {
+VernonLoadedKernel *backendPipelineComputeKernel(VernonLoadedPipeline &pipeline) {
     switch (pipeline.context->backend) {
-    case VERNON_RUNTIME_CPU: {
-        auto &kernels = runtimeBackendState<CpuPipelineState>(pipeline).kernels;
-        const auto found = kernels.find(stage);
-        return found == kernels.end() ? nullptr : found->second;
-    }
+    case VERNON_RUNTIME_CPU:
+        return runtimeBackendState<CpuPipelineState>(pipeline).kernel;
     case VERNON_RUNTIME_CUDA:
 #if defined(VERNON_HAS_CUDA_RUNTIME)
-    {
-        auto &kernels = runtimeBackendState<CudaPipelineState>(pipeline).kernels;
-        const auto found = kernels.find(stage);
-        return found == kernels.end() ? nullptr : found->second;
-    }
+        return runtimeBackendState<CudaPipelineState>(pipeline).kernel;
 #else
         return nullptr;
 #endif
     case VERNON_RUNTIME_VULKAN:
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-    {
-        auto &kernels = runtimeBackendState<VulkanPipelineState>(pipeline).computeKernels;
-        const auto found = kernels.find(stage);
-        return found == kernels.end() ? nullptr : found->second;
-    }
+        return runtimeBackendState<VulkanPipelineState>(pipeline).computeKernel;
 #else
         return nullptr;
 #endif
@@ -458,18 +557,10 @@ VernonLoadedKernel *backendPipelineComputeKernel(VernonLoadedPipeline &pipeline,
 bool resolveBackendPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline) {
     if (bundle.context->backend == VERNON_RUNTIME_CPU) {
         auto *state = new CpuPipelineState();
-        for (const PipelineStep &step : variant.steps) {
-            if (step.kind != PipelineStepKind::Dispatch || state->kernels.find(step.stage) != state->kernels.end())
-                continue;
-            state->kernels[step.stage] =
-                loadBackendCpuNativeArtifact(*bundle.context, *bundle.stages.at(step.stage).cpuArtifact);
-            if (!state->kernels[step.stage]) {
-                for (const auto &[_, kernel] : state->kernels)
-                    if (kernel)
-                        vernonRuntimeKernelUnload(kernel);
-                delete state;
-                return false;
-            }
+        state->kernel = loadBackendCpuNativeArtifact(*bundle.context, *bundle.stages.at(variant.compute).cpuArtifact);
+        if (!state->kernel) {
+            delete state;
+            return false;
         }
         installRuntimeBackendState(pipeline, state);
         return true;
@@ -477,20 +568,13 @@ bool resolveBackendPipeline(VernonPipelineBundle &bundle, const Variant &variant
     if (bundle.context->backend == VERNON_RUNTIME_CUDA) {
 #if defined(VERNON_HAS_CUDA_RUNTIME)
         auto *state = new CudaPipelineState();
-        for (const PipelineStep &step : variant.steps) {
-            if (step.kind != PipelineStepKind::Dispatch || state->kernels.find(step.stage) != state->kernels.end())
-                continue;
-            const Stage &stage = bundle.stages.at(step.stage);
-            state->kernels[step.stage] =
-                loadBackendArtifact(*bundle.context, stage.source.data(), stage.source.size(), stage.reflection.data(),
-                                    stage.reflection.size(), stage.entry.data(), stage.entry.size());
-            if (!state->kernels[step.stage]) {
-                for (const auto &[_, kernel] : state->kernels)
-                    if (kernel)
-                        vernonRuntimeKernelUnload(kernel);
-                delete state;
-                return false;
-            }
+        const Stage &stage = bundle.stages.at(variant.compute);
+        state->kernel =
+            loadBackendArtifact(*bundle.context, stage.source.data(), stage.source.size(), stage.reflection.data(),
+                                stage.reflection.size(), stage.entry.data(), stage.entry.size());
+        if (!state->kernel) {
+            delete state;
+            return false;
         }
         installRuntimeBackendState(pipeline, state);
         return true;
@@ -501,18 +585,12 @@ bool resolveBackendPipeline(VernonPipelineBundle &bundle, const Variant &variant
     if (bundle.context->backend == VERNON_RUNTIME_VULKAN) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
         auto *state = new VulkanPipelineState();
-        for (const PipelineStep &step : variant.steps) {
-            if (step.kind != PipelineStepKind::Dispatch ||
-                state->computeKernels.find(step.stage) != state->computeKernels.end())
-                continue;
-            const Stage &stage = bundle.stages.at(step.stage);
-            state->computeKernels[step.stage] =
+        if (!variant.compute.empty()) {
+            const Stage &stage = bundle.stages.at(variant.compute);
+            state->computeKernel =
                 loadBackendArtifact(*bundle.context, stage.binary.data(), stage.binary.size(), stage.reflection.data(),
                                     stage.reflection.size(), stage.entry.data(), stage.entry.size());
-            if (!state->computeKernels[step.stage]) {
-                for (const auto &[_, kernel] : state->computeKernels)
-                    if (kernel)
-                        vernonRuntimeKernelUnload(kernel);
+            if (!state->computeKernel) {
                 delete state;
                 return false;
             }
@@ -523,9 +601,6 @@ bool resolveBackendPipeline(VernonPipelineBundle &bundle, const Variant &variant
             VulkanPushConstantRanges pushConstantRanges;
             if (!planVulkanPushConstantRanges(variant, vulkanState(*bundle.context).maxPushConstantsSize,
                                               pushConstantRanges, bundle.context->error)) {
-                for (const auto &[_, kernel] : state->computeKernels)
-                    if (kernel)
-                        vernonRuntimeKernelUnload(kernel);
                 delete state;
                 return false;
             }
@@ -534,9 +609,6 @@ bool resolveBackendPipeline(VernonPipelineBundle &bundle, const Variant &variant
                 !createVulkanShaderModule(*bundle.context, fragment.binary.data(), fragment.binary.size(),
                                           state->fragment,
                                           pushConstantRanges.fragment.size ? pushConstantRanges.fragment.offset : 0)) {
-                for (const auto &[_, kernel] : state->computeKernels)
-                    if (kernel)
-                        vernonRuntimeKernelUnload(kernel);
                 destroyVulkanShaderModule(*bundle.context, state->vertex);
                 delete state;
                 return false;
@@ -556,59 +628,20 @@ bool resolveBackendPipeline(VernonPipelineBundle &bundle, const Variant &variant
         delete state;
         return false;
     }
-    if (state->computeProgram) {
-        OpenGLPipelineCompute compute;
-        compute.program = state->computeProgram;
-        std::copy(std::begin(state->workgroup), std::end(state->workgroup), std::begin(compute.workgroup));
-        state->computePrograms.emplace(variant.compute, compute);
-    }
-    for (const PipelineStep &step : variant.steps) {
-        if (step.kind != PipelineStepKind::Dispatch ||
-            state->computePrograms.find(step.stage) != state->computePrograms.end())
-            continue;
-        Variant dispatchVariant = variant;
-        dispatchVariant.compute = step.stage;
-        dispatchVariant.vertex.clear();
-        dispatchVariant.fragment.clear();
-        dispatchVariant.barrier = false;
-        OpenGLPipelineCompute compute;
-        GlUint unusedGraphics = 0;
-        GlUint unusedVertexArray = 0;
-        GlUint unusedFramebuffer = 0;
-        if (!createOpenGLPipeline(*bundle.context, dispatchVariant, bundle.stages, compute.program, unusedGraphics,
-                                  unusedVertexArray, unusedFramebuffer, compute.workgroup)) {
-            for (const auto &[_, loaded] : state->computePrograms)
-                destroyOpenGLPipeline(*bundle.context, loaded.program, 0, 0, 0);
-            destroyOpenGLPipeline(*bundle.context, 0, state->graphicsProgram, state->vertexArray, state->framebuffer);
-            delete state;
-            return false;
-        }
-        state->computePrograms.emplace(step.stage, compute);
-    }
     installRuntimeBackendState(pipeline, state);
     return true;
 }
 
 void destroyBackendPipeline(VernonLoadedPipeline &pipeline) {
     if (pipeline.context->backend == VERNON_RUNTIME_CPU || pipeline.context->backend == VERNON_RUNTIME_CUDA) {
-        for (const PipelineStep &step : pipeline.variant.steps)
-            if (step.kind == PipelineStepKind::Dispatch)
-                if (VernonLoadedKernel *kernel = backendPipelineComputeKernel(pipeline, step.stage)) {
-                    vernonRuntimeKernelUnload(kernel);
-                    if (pipeline.context->backend == VERNON_RUNTIME_CPU)
-                        runtimeBackendState<CpuPipelineState>(pipeline).kernels.erase(step.stage);
-#if defined(VERNON_HAS_CUDA_RUNTIME)
-                    else
-                        runtimeBackendState<CudaPipelineState>(pipeline).kernels.erase(step.stage);
-#endif
-                }
+        if (VernonLoadedKernel *kernel = backendPipelineComputeKernel(pipeline))
+            vernonRuntimeKernelUnload(kernel);
     } else if (pipeline.context->backend == VERNON_RUNTIME_VULKAN) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
         VulkanPipelineState &state = runtimeBackendState<VulkanPipelineState>(pipeline);
-        for (const auto &[_, kernel] : state.computeKernels)
-            if (kernel)
-                vernonRuntimeKernelUnload(kernel);
-        if (state.computeKernels.empty())
+        if (state.computeKernel)
+            vernonRuntimeKernelUnload(state.computeKernel);
+        else
             synchronizeVulkan(*pipeline.context);
         destroyVulkanGraphicsCache(pipeline.context, state.graphicsCache);
         destroyVulkanShaderModule(*pipeline.context, state.vertex);
@@ -616,9 +649,8 @@ void destroyBackendPipeline(VernonLoadedPipeline &pipeline) {
 #endif
     } else {
         OpenGLPipelineState &state = runtimeBackendState<OpenGLPipelineState>(pipeline);
-        for (const auto &[_, compute] : state.computePrograms)
-            destroyOpenGLPipeline(*pipeline.context, compute.program, 0, 0, 0);
-        destroyOpenGLPipeline(*pipeline.context, 0, state.graphicsProgram, state.vertexArray, state.framebuffer);
+        destroyOpenGLPipeline(*pipeline.context, state.computeProgram, state.graphicsProgram, state.vertexArray,
+                              state.framebuffer);
     }
     destroyRuntimeBackendState(pipeline);
 }
@@ -633,9 +665,8 @@ VernonStatus invokeBackendPipeline(VernonLoadedPipeline &pipeline, const VernonP
         if (!state.vertex)
             return VERNON_STATUS_OK;
         std::string error;
-        const VulkanGraphicsState graphicsState{pipeline.context,        state.vertex,         state.fragment,
-                                                &state.vertexEntry,      &state.fragmentEntry, &state.graphicsCache,
-                                                pipeline.variant.barrier};
+        const VulkanGraphicsState graphicsState{pipeline.context,   state.vertex,         state.fragment,
+                                                &state.vertexEntry, &state.fragmentEntry, &state.graphicsCache};
         const VernonStatus status =
             encodeAndSubmitVulkanGraphics(graphicsState, pipeline.variant, invocation, plan, error);
         return status == VERNON_STATUS_OK ? status : fail(*pipeline.context, error, status);
@@ -653,24 +684,16 @@ VernonStatus invokeBackendPipeline(VernonLoadedPipeline &pipeline, const VernonP
     return status == VERNON_STATUS_OK ? status : fail(*pipeline.context, error, status);
 }
 
-VernonStatus invokeBackendPipelineDispatch(VernonLoadedPipeline &pipeline, const PipelineStep &step,
-                                           const VernonPipelineInvocation &invocation,
-                                           const PlannedGraphicsInvocation &plan) {
+VernonStatus invokeBackendComputePipeline(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
+                                          const PlannedGraphicsInvocation &plan) {
     if (!isOpenGLBackend(pipeline.context->backend))
         return VERNON_STATUS_UNSUPPORTED_TARGET;
     OpenGLPipelineState &state = runtimeBackendState<OpenGLPipelineState>(pipeline);
-    const auto found = state.computePrograms.find(step.stage);
-    if (found == state.computePrograms.end())
-        return fail(*pipeline.context, "OpenGL graph dispatch stage is not loaded");
-    Variant dispatchVariant = pipeline.variant;
-    dispatchVariant.compute = step.stage;
-    VernonPipelineInvocation dispatchInvocation = invocation;
-    if (step.hasGrid)
-        dispatchInvocation.compute_grid = step.grid;
+    if (!state.computeProgram)
+        return fail(*pipeline.context, "OpenGL compute pipeline program is not loaded");
     std::string error;
-    const VernonStatus status =
-        encodeAndSubmitOpenGLCompute(*pipeline.context, found->second.program, found->second.workgroup, dispatchVariant,
-                                     dispatchInvocation, plan, error);
+    const VernonStatus status = encodeAndSubmitOpenGLCompute(*pipeline.context, state.computeProgram, state.workgroup,
+                                                             pipeline.variant, invocation, plan, error);
     return status == VERNON_STATUS_OK ? status : fail(*pipeline.context, error, status);
 }
 

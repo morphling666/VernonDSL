@@ -14,6 +14,7 @@ bool initializeBackend(VernonRuntimeContext &context, uint32_t deviceIndex);
 bool initializeOpenGLBackend(VernonRuntimeContext &context, const VernonExternalOpenGLContext &externalContext);
 void destroyBackend(VernonRuntimeContext &context);
 void fillBackendCapabilities(const VernonRuntimeContext &context, VernonRuntimeCapabilities &capabilities);
+bool validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeRequirements &requirements);
 
 bool createBackendBuffer(VernonDeviceBuffer &buffer);
 void importBackendOpenGLBuffer(VernonDeviceBuffer &buffer, uint32_t name);
@@ -43,14 +44,13 @@ VernonStatus unloadBackendKernel(VernonLoadedKernel &kernel);
 VernonStatus launchBackendKernel(VernonLoadedKernel &kernel, VernonLaunchSize globalSize,
                                  const VernonLaunchArgument *arguments, size_t argumentCount);
 
-VernonLoadedKernel *backendPipelineComputeKernel(VernonLoadedPipeline &pipeline, const std::string &stage);
+VernonLoadedKernel *backendPipelineComputeKernel(VernonLoadedPipeline &pipeline);
 bool resolveBackendPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline);
 void destroyBackendPipeline(VernonLoadedPipeline &pipeline);
 VernonStatus invokeBackendPipeline(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
                                    const PlannedGraphicsInvocation &plan);
-VernonStatus invokeBackendPipelineDispatch(VernonLoadedPipeline &pipeline, const PipelineStep &step,
-                                           const VernonPipelineInvocation &invocation,
-                                           const PlannedGraphicsInvocation &plan);
+VernonStatus invokeBackendComputePipeline(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
+                                          const PlannedGraphicsInvocation &plan);
 
 VernonStatus backendComputeToGraphicsBarrier(VernonRuntimeContext &context);
 VernonStatus synchronizeBackend(VernonRuntimeContext &context);

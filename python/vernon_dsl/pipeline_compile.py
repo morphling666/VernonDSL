@@ -13,7 +13,7 @@ from .bundle.parameters import (
     reflected_parameters,
     validate_graphics_interfaces,
 )
-from .bundle.planner import build_bundle_plan, build_steps, plan_variant
+from .bundle.planner import build_bundle_plan, plan_variant
 from .bundle.reflection import (
     compiled_stage_from_program,
     parse_reflection_json,
@@ -40,7 +40,6 @@ __all__ = [
     "VariantPlan",
     "assign_parameter_slots",
     "build_bundle_plan",
-    "build_steps",
     "canonical_json",
     "classify_parameter_use",
     "compiled_stage_from_program",

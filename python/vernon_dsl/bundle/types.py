@@ -29,20 +29,36 @@ class TargetOptions:
                 raise PipelineCompileError("glsl_version is valid only for OpenGL targets")
             if not isinstance(glsl_version, int) or isinstance(glsl_version, bool) or glsl_version <= 0:
                 raise PipelineCompileError("glsl_version must be a positive integer")
-        for name in ("target_triple", "cpu", "cpu_features"):
+        hlsl_shader_model = options.get("hlsl_shader_model")
+        if hlsl_shader_model is not None:
+            if self.target != "directx":
+                raise PipelineCompileError("hlsl_shader_model is valid only for the DirectX target")
+            if (
+                not isinstance(hlsl_shader_model, int)
+                or isinstance(hlsl_shader_model, bool)
+                or hlsl_shader_model not in {30, 40, 41, 50, 51, 60}
+            ):
+                raise PipelineCompileError("hlsl_shader_model must be one of 30, 40, 41, 50, 51, or 60")
+        cpu_option_names = ("target_triple", "cpu", "cpu_features")
+        for name in cpu_option_names:
             value = options.get(name)
             if value is not None and not isinstance(value, str):
                 raise PipelineCompileError(f"{name} must be a string")
+        if self.target != "cpu" and any(name in options for name in cpu_option_names):
+            raise PipelineCompileError("target_triple, cpu, and cpu_features are valid only for the CPU target")
         object.__setattr__(self, "options", frozen_mapping(options))
 
     @property
     def native_options(self) -> dict[str, Any]:
-        return {
-            "glsl_version": int(self.options.get("glsl_version", 0)),
-            "target_triple": str(self.options.get("target_triple", "")),
-            "cpu": str(self.options.get("cpu", "")),
-            "cpu_features": str(self.options.get("cpu_features", "")),
-        }
+        if self.target in {"opengl", "opengles"}:
+            return {"glsl_version": self.options["glsl_version"]} if "glsl_version" in self.options else {}
+        if self.target == "cpu":
+            return {
+                name: self.options[name] for name in ("target_triple", "cpu", "cpu_features") if name in self.options
+            }
+        if self.target == "directx":
+            return {"hlsl_shader_model": self.options.get("hlsl_shader_model", 50)}
+        return {}
 
 
 @dataclass(frozen=True)
@@ -123,24 +139,23 @@ class CompiledStage:
 @dataclass(frozen=True)
 class VariantPlan:
     key: tuple[str, ...]
-    stages: Mapping[str, str]
+    program: Mapping[str, str]
     parameters: tuple[Mapping[str, Any], ...]
     internal_parameters: tuple[Mapping[str, Any], ...]
     outputs: tuple[Mapping[str, Any], ...]
-    steps: tuple[Mapping[str, Any], ...]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "stages", frozen_mapping(self.stages))
-        for name in ("parameters", "internal_parameters", "outputs", "steps"):
+        object.__setattr__(self, "program", frozen_mapping(self.program))
+        for name in ("parameters", "internal_parameters", "outputs"):
             values = tuple(frozen_mapping(value) for value in getattr(self, name))
             object.__setattr__(self, name, values)
 
     def to_dict(self) -> dict[str, Any]:
         result = {
             "key": list(self.key),
+            "program": dict(self.program),
             "parameters": [dict(value) for value in self.parameters],
             "outputs": [dict(value) for value in self.outputs],
-            "steps": [dict(value) for value in self.steps],
         }
         if self.internal_parameters:
             result["internal_parameters"] = [dict(value) for value in self.internal_parameters]
@@ -156,7 +171,9 @@ class BundlePlan:
     stages: tuple[CompiledStage, ...]
 
     def logical_dict(self) -> dict[str, Any]:
-        return {
+        from .requirements import runtime_requirements
+
+        result = {
             "schema_version": 2,
             "invocation_abi_version": 3,
             "type": "pipeline",
@@ -169,6 +186,10 @@ class BundlePlan:
                 stage.id: stage.logical_record() for stage in sorted(self.stages, key=lambda value: value.id)
             },
         }
+        requirements = runtime_requirements(self.target.target, self.stages)
+        if requirements is not None:
+            result["runtime_requirements"] = requirements
+        return result
 
 
 __all__ = [

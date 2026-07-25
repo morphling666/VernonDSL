@@ -50,6 +50,7 @@ if(TARGET VernonRuntime)
         VernonRuntimeTests
         runtime/compute_launch_planner_test.cpp
         runtime/graphics_invocation_planner_test.cpp
+        runtime/pipeline_manifest_requirements_test.cpp
         runtime/runtime_c_api_test.cpp
         runtime/runtime_common_api_test.cpp
         runtime/runtime_cpu_pipeline_test.cpp
@@ -112,13 +113,15 @@ if(TARGET VernonRuntime)
             OUTPUT "${vulkan_pipeline_test_manifest}"
             COMMAND
                 ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${Python_EXECUTABLE} -m
-                vernon_dsl.shader_asset_cli
+                vernon_dsl.pipeline_asset_cli
                 "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:sampled_asset" --target vulkan
                 --output "${vulkan_pipeline_test_dir}"
             DEPENDS vernon-dsl-native
                     "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py"
+                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/requirements.py"
+                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/types.py"
                     "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/pipeline_compile.py"
-                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/shader_assets.py"
+                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/pipeline_assets.py"
             VERBATIM)
         add_custom_target(vernon-vulkan-pipeline-test-bundle DEPENDS "${vulkan_pipeline_test_manifest}")
         set(vulkan_cube_map_test_dir "${VERNON_TEST_BINARY_ROOT}/vulkan_cube_map_bundle")
@@ -127,12 +130,14 @@ if(TARGET VernonRuntime)
             OUTPUT "${vulkan_cube_map_test_manifest}"
             COMMAND
                 ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${Python_EXECUTABLE} -m
-                vernon_dsl.shader_asset_cli "${VERNON_REPOSITORY_ROOT}/python/tests/cube_map_shader.py:cube_map_asset"
+                vernon_dsl.pipeline_asset_cli "${VERNON_REPOSITORY_ROOT}/python/tests/cube_map_shader.py:cube_map_asset"
                 --target vulkan --output "${vulkan_cube_map_test_dir}"
             DEPENDS vernon-dsl-native
                     "${VERNON_REPOSITORY_ROOT}/python/tests/cube_map_shader.py"
+                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/requirements.py"
+                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/types.py"
                     "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/pipeline_compile.py"
-                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/shader_assets.py"
+                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/pipeline_assets.py"
             VERBATIM)
         add_custom_target(vernon-vulkan-cube-map-test-bundle DEPENDS "${vulkan_cube_map_test_manifest}")
         target_sources(VernonRuntimeTests PRIVATE runtime/runtime_vulkan_pipeline_test.cpp

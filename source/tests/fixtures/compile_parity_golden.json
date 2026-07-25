@@ -27,20 +27,11 @@
         "slot": 0
       }
     ],
-    "step_kinds": [
-      "draw"
-    ],
     "variants": [
       [],
       [
         "OFFSET"
       ]
     ]
-  },
-  "targets": {
-    "opengl": {
-      "glsl_version": 330
-    },
-    "vulkan": {}
   }
 }

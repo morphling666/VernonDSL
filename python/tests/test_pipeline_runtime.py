@@ -12,7 +12,6 @@ import vernon_dsl._runtime.session as runtime_module
 from advanced_pipeline_shader import (
     advanced_fragment,
     advanced_vertex,
-    feature_compute,
 )
 from pipeline_shader import (
     colored_fragment,
@@ -166,23 +165,9 @@ class OpenGLPipelineTests(unittest.TestCase):
         render(position=positions, target=target)
         self.assertEqual(render.compile_count, 1)
 
-    def test_compute_stage_runs_before_graphics(self) -> None:
-        render = vd.pipeline(translate_vertices, triangle_vertex, solid_fragment)
-        positions = vd.storage.from_numpy(
-            np.array(
-                [
-                    (-0.75, -0.75),
-                    (0.75, -0.75),
-                    (0.0, 0.75),
-                ],
-                dtype=np.float32,
-            )
-        )
-        target = vd.Texture.zeros(shape=(64, 64))
-
-        render(position=positions, offset=2.0, target=target)
-
-        self.assertEqual(tuple(target.to_numpy()[32, 32]), (0, 0, 0, 0))
+    def test_compute_stage_cannot_join_graphics_pipeline(self) -> None:
+        with self.assertRaisesRegex(ValueError, "vertex, fragment"):
+            vd.pipeline(translate_vertices, triangle_vertex, solid_fragment)
 
     def test_uniform_tensor_is_shared_draw_state(self) -> None:
         render = vd.pipeline(translated_vertex, solid_fragment)
@@ -202,17 +187,6 @@ class OpenGLPipelineTests(unittest.TestCase):
         render(position=positions, offset=offset, target=target)
 
         self.assertEqual(tuple(target.to_numpy()[32, 32]), (0, 0, 0, 0))
-
-    def test_opengl_33_rejects_compute_composition(self) -> None:
-        try:
-            vd.init(arch=vd.opengl, api_version=(3, 3))
-        except RuntimeError:
-            self.skipTest("OpenGL 3.3 context unavailable")
-        render = vd.pipeline(translate_vertices, triangle_vertex, solid_fragment)
-        positions = vd.storage.from_numpy(np.zeros((3, 2), dtype=np.float32))
-        target = vd.Texture.zeros(shape=(8, 8))
-        with self.assertRaisesRegex(RuntimeError, "OpenGL 4.3"):
-            render(position=positions, offset=0.0, target=target)
 
     def test_opengl_33_accepts_graphics_only(self) -> None:
         try:
@@ -265,20 +239,6 @@ class OpenGLPipelineTests(unittest.TestCase):
         render(**arguments)
         self.assertEqual(indices._allocation_count, 1)
         self.assertEqual(render.compile_count, 1)
-
-    def test_compute_stage_uses_pipeline_feature_set(self) -> None:
-        render = vd.pipeline(feature_compute, advanced_vertex, advanced_fragment, features={"PICKING"})
-        positions, offsets, indices = self._advanced_inputs()
-        render(
-            position=positions,
-            offset=offsets,
-            indices=indices,
-            targets={
-                "color": vd.Texture.zeros(shape=(16, 16)),
-                "object_id": vd.Texture.zeros(shape=(16, 16)),
-            },
-        )
-        self.assertEqual(feature_compute.compile_count, 1)
 
     def test_feature_and_advanced_draw_validation(self) -> None:
         positions, offsets, indices = self._advanced_inputs()
@@ -355,17 +315,14 @@ class VulkanPipelineTests(unittest.TestCase):
     def _triangle() -> vd.Tensor:
         return vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
 
-    def test_triangle_and_compute_graphics_pipeline(self) -> None:
+    def test_triangle_graphics_pipeline(self) -> None:
         positions = self._triangle()
         target = vd.Texture.zeros(shape=(64, 64))
-        render = vd.pipeline(translate_vertices, triangle_vertex, solid_fragment)
-        render(position=positions, offset=np.float32(0.25), target=target)
+        render = vd.pipeline(triangle_vertex, solid_fragment)
+        render(position=positions, target=target)
         pixels = target.to_numpy()
-        self.assertGreater(int(pixels[32, 40, 0]), 240)
-        np.testing.assert_allclose(
-            positions.to_numpy()[:, 0],
-            np.array((-0.5, 1.0, 0.25), dtype=np.float32),
-        )
+        self.assertGreater(int(pixels[32, 32, 0]), 240)
+        np.testing.assert_allclose(positions.to_numpy()[:, 0], np.array((-0.75, 0.75, 0.0), dtype=np.float32))
         self.assertEqual(render.compile_count, 1)
 
     def test_stage_uniforms_do_not_overlap_and_y_matches_opengl(self) -> None:

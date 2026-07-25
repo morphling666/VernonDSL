@@ -575,13 +575,6 @@ VernonStatus encodeAndSubmitVulkanGraphics(const VulkanGraphicsState &state, con
     const bool submitted = submit(
         context,
         [&](VkCommandBuffer command) {
-            if (state.barrier) {
-                VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-                barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-                barrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
-                driver.cmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                          VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
-            }
             for (const VernonColorAttachment *attachment : plan.attachments)
                 if (vulkanTextureState(*attachment->texture).layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
                     transitionVulkanImageLayout(command, *attachment->texture,

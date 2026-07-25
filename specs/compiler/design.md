@@ -121,10 +121,9 @@ does not embed CPython.
 There is one Python AST-to-MLIR frontend (`FrontendCompileRequest`) and one
 native compiler implementation behind the stable C API. Interactive
 `Kernel`/`Pipeline`, the owning `_native.CompiledProgram`, `vernon-compile`,
-and the target `vernon-cook-program` tool must pass the same specialized MLIR
+and the target `vernon-cook-pipeline` tool must pass the same specialized MLIR
 and target options to that C API; none may carry an independent lowering or
-reflection path. The implemented `vernon-cook-shader` command is the legacy
-asset-cooker surface during migration.
+reflection path.
 `vernon-compile` is a compatibility and file-packaging shell over the C API,
 not an internal compiler service. Python runtime and cooker code must never
 invoke it as a subprocess.
@@ -139,19 +138,19 @@ that result. Relocatable objects remain the persistent CPU format.
 
 Stage cache identity is derived from the semantic module ID, entry, stage,
 target options, reflected dependencies and interface, and exact artifact
-digest. ProgramAsset serialization is deliberately excluded: changing
+digest. PipelineAsset serialization is deliberately excluded: changing
 asset packaging without changing the specialized program must not create a
 different stage. Frontend specialization caches include source dependency
 hashes, enabled features, captured constants, runtime tensor shapes, and
 workgroup size. Cache hits must preserve byte-identical artifacts and canonical
 reflection; content changes must invalidate the corresponding key.
 
-## Program asset declarations
+## Pipeline asset declarations
 
 A persistent executable is declared by one module-level
-`program_asset(...)` assignment beside its entry functions. The cooker parses
+`pipeline_asset(...)` assignment beside its entry functions. The cooker parses
 the assignment from the source AST and must not import or execute the module.
-The neutral `ProgramAsset` name applies equally to compute and graphics.
+`PipelineAsset` applies equally to compute and graphics pipelines.
 
 `program=` has exactly two forms:
 
@@ -163,20 +162,20 @@ The neutral `ProgramAsset` name applies equally to compute and graphics.
 FAST_PATH = vd.feature("FAST_PATH")
 SKIN = vd.feature("SKIN")
 
-compute_asset = vd.program_asset(
-    id="programs/simulate",
+compute_asset = vd.pipeline_asset(
+    id="pipeline/simulate",
     program=simulate_kernel,
     variants=((), (FAST_PATH,)),
 )
 
-graphics_asset = vd.program_asset(
-    id="pipelines/mesh",
+graphics_asset = vd.pipeline_asset(
+    id="pipeline/mesh",
     program=(mesh_vertex, mesh_fragment),
     variants=((), (SKIN,)),
 )
 ```
 
-Kernel is compute-only and Pipeline is graphics-only. A ProgramAsset cannot
+Kernel is compute-only and Pipeline is graphics-only. A PipelineAsset cannot
 mix a Kernel entry with graphics entries. The previous
 compute-plus-vertex-plus-fragment Pipeline form is invalid.
 
@@ -185,7 +184,7 @@ Tuple position does not infer stage kind. A target-independent stage registry
 and topology rules validate the set and ordering. Vertex plus fragment is the
 currently implemented minimum, not an asset-schema limit. The registry may add
 tessellation, geometry, task, mesh, or other graphics stages without changing
-`ProgramAsset` syntax or manifest structure. Unknown stages, duplicate
+`PipelineAsset` syntax or manifest structure. Unknown stages, duplicate
 singleton stages, invalid ordering, and incompatible stage families are
 program-validation errors. A topology may be valid in the language while still
 being unsupported by a target; that case fails target capability validation
@@ -198,28 +197,29 @@ the list contains no duplicate key. `()` is the empty feature key, not an
 implicit fallback. Stage compilation remains cached per entry and feature key,
 so unchanged artifacts are content-addressed and shared across variants. The
 manifest-level `features` list is exactly the union of names present in those
-keys. Features declared by source modules but omitted from every ProgramAsset
+keys. Features declared by source modules but omitted from every PipelineAsset
 variant are not part of its contract.
 
-Target architecture and target options are cooker inputs, not ProgramAsset
-source fields. A compute ProgramAsset accepts a compute target; a graphics
-ProgramAsset accepts a graphics target. The same backend-independent
-ProgramAsset may be cooked separately for multiple targets. Target and options
+Target architecture and target options are cooker inputs, not PipelineAsset
+source fields. A compute PipelineAsset accepts a compute target; a graphics
+PipelineAsset accepts a graphics target. The same backend-independent
+PipelineAsset may be cooked separately for multiple targets. Target and options
 participate in artifact and cache identity and are recorded in the resulting
 manifest, but do not alter backend-independent program semantic identity.
 
-The legacy `pipeline_asset(compute=..., vertex=..., fragment=...,
-targets=...)` declaration is not the target API. Parser and cooker migration
-remain implementation work.
+The legacy stage-specific
+`pipeline_asset(compute=..., vertex=..., fragment=..., targets=...)` signature
+is rejected.
 
-## Deferred execution graph
+## Deferred host orchestration
 
 Multi-program orchestration, render passes, attachment load/store behavior,
 dynamic graphics state, framebuffer/renderbuffer abstraction, and
 compute/graphics backend pairing are intentionally unspecified. The previous
 Pass-graph proposal is archived in
 `specs/backup/execution_graph_design.md`; it is non-normative and does not
-constrain ProgramAsset design.
+constrain PipelineAsset design. This host orchestration problem is separate
+from the compiler-internal ProgramGraph proposed for autodiff.
 
 Texture parameter constraints are queried through a separate `struct_size`-
 versioned runtime view so `VernonPipelineParameterView` remains ABI-stable.
@@ -228,7 +228,10 @@ Dimension is required; manifests may additionally provide canonical
 
 A target is reported as available only after its complete lowering and
 artifact generation pipeline is registered. An IR-only prototype must return
-`VERNON_STATUS_UNSUPPORTED_TARGET`.
+`VERNON_STATUS_UNSUPPORTED_TARGET`. Source artifacts are valid terminal
+compiler products: Metal availability means MSL generation works, and DirectX
+availability means HLSL generation works; neither implies a Vernon runtime
+backend or a platform-native binary such as DXIL.
 
 ## CPU resource ABI
 
@@ -271,7 +274,8 @@ Graphics DSL -> Vernon graphics IR -> SPIR-V
                                   |-> Vulkan consumes SPIR-V directly
                                   |-> SPIRV-Cross -> GLSL for OpenGL/OpenGL ES
                                   |-> SPIRV-Cross -> MSL for Metal
-                                  `-> SPIRV-Cross -> HLSL -> DXC -> DXIL
+                                  `-> SPIRV-Cross -> HLSL for DirectX
+                                                            `-> future DXC -> DXIL
 
 Compute DSL -> MLIR GPU dialect
                             |-> SPIR-V for Vulkan compute
@@ -286,6 +290,11 @@ GLSL language versions are compile options, not backend constants. A zero
 version selects the target default; OpenGL and OpenGL ES callers may request a
 specific version through the stable C API or CLI. Other targets reject this
 option rather than silently ignoring it.
+
+HLSL Shader Model is likewise a compile option and is valid only for DirectX.
+The stable C API and cooker encode it as major times ten plus minor (`50` for
+Shader Model 5.0), defaulting to `50`. It participates in artifact identity and
+is recorded in compiler reflection and PipelineAsset `target_options`.
 
 ## Completed module and artifact work
 
@@ -323,7 +332,7 @@ Every DSL function has exactly one explicit kind. The currently implemented
 entry decorators are `@kernel`, `@vertex`, and `@fragment`; `@func` declares a
 private, stage-polymorphic helper. Future graphics entry decorators register a
 stage kind and topology constraints through the same versioned registry rather
-than changing ProgramAsset syntax. The module graph preserves helper dependency
+than changing PipelineAsset syntax. The module graph preserves helper dependency
 hashes, rejects recursion and calls to entries, and the normal per-stage
 compiler validation checks an inlined helper's operations against each
 reachable stage. Requiring `@func` avoids silently treating unrelated host
@@ -481,13 +490,23 @@ remain exclusively in semantic analysis.
 
 ## Persistent asset contract
 
-The target `vernon-cook-program` command emits one ProgramAsset manifest and
+The target `vernon-cook-pipeline` command emits one PipelineAsset manifest and
 content-addressed external artifacts. It compiles in process through
 `vernon_dsl._native`; there is no compiler-executable argument or compatibility
-manifest. Runtime, not the Engine, validates manifest structure, content
-hashes, artifact paths, sizes, digests, reflection, and exact feature keys.
-The implemented `vernon-cook-shader` schema-2 `*.pipeline.json` output remains
-the legacy migration format.
+manifest. For runtime-backed targets, Runtime validates manifest structure,
+content hashes, artifact paths, sizes, digests, reflection, and exact feature
+keys. Metal MSL and DirectX HLSL manifests are cook-only compiler outputs;
+`VernonRuntime` intentionally rejects their targets until matching backends
+exist.
+
+Runtime-backed PipelineAssets also carry optional, hash-covered
+`runtime_requirements`. The cooker derives these from the emitted object,
+GLSL, SPIR-V, or PTX artifact and aggregates sorted reflection features.
+Requirements do not participate in stage artifact identity, so content
+addressing and cross-variant artifact deduplication remain stable.
+`target_options` describe compilation inputs; `runtime_requirements` describe
+the resulting artifact's minimum execution environment. Omitting requirements
+is reserved for legacy schema-2 bundles and cook-only Metal/DirectX targets.
 
 ## Language v4 representation boundary
 
@@ -540,7 +559,8 @@ Autodiff is a deterministic transform of specialized, validated typed Value
 IR. Generated primal, tangent, adjoint, and tape objects remain ordinary typed
 representations; gradients use separate companion Storage. V4 accepts
 first-order pure transforms only. Mutation, Storage effects, aliasing,
-gather/scatter accumulation, loops requiring tapes, checkpointing, and reverse
-dispatch ordering require a future typed orchestration model before
-stateful-kernel differentiation can be accepted. Execution-graph semantics are
-not part of the current compiler contract.
+gather/scatter accumulation, loops requiring tapes, checkpointing, and
+effect-preserving reverse traversal require a future compiler-internal
+ProgramGraph before stateful-kernel differentiation can be accepted. That
+graph represents one specialized program and is not a deployment asset or
+multi-program orchestration model.

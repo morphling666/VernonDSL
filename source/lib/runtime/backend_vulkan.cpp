@@ -243,6 +243,10 @@ bool initializeVulkanContext(VernonRuntimeContext &context, uint32_t deviceIndex
     VkPhysicalDeviceProperties properties{};
     driver.getPhysicalDeviceProperties(state.physicalDevice, &properties);
     state.maxPushConstantsSize = properties.limits.maxPushConstantsSize;
+    state.apiVersion = properties.apiVersion;
+    state.maxComputeWorkGroupInvocations = properties.limits.maxComputeWorkGroupInvocations;
+    for (size_t index = 0; index < 3; ++index)
+        state.maxComputeWorkGroupSize[index] = properties.limits.maxComputeWorkGroupSize[index];
     uint32_t queueCount = 0;
     driver.getPhysicalDeviceQueueFamilyProperties(state.physicalDevice, &queueCount, nullptr);
     std::vector<VkQueueFamilyProperties> queues(queueCount);

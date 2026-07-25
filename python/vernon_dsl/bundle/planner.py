@@ -29,36 +29,13 @@ from .serialize import (
 from .types import BundlePlan, CompiledArtifact, CompiledStage, PipelineCompileError, TargetOptions, VariantPlan
 
 
-def build_steps(stage_ids: Mapping[str, str]) -> list[dict[str, Any]]:
-    steps: list[dict[str, Any]] = []
-    if "compute" in stage_ids:
-        steps.append({"kind": "dispatch", "stage": stage_ids["compute"]})
-    if "compute" in stage_ids and "vertex" in stage_ids:
-        steps.append(
-            {
-                "kind": "barrier",
-                "source": "compute_write",
-                "destination": "vertex_read",
-            }
-        )
-    if "vertex" in stage_ids:
-        if "fragment" not in stage_ids:
-            raise PipelineCompileError("draw step requires vertex and fragment stages")
-        steps.append(
-            {
-                "kind": "draw",
-                "vertex": stage_ids["vertex"],
-                "fragment": stage_ids["fragment"],
-            }
-        )
-    return steps
-
-
 def plan_variant(
     key: Sequence[str],
     records: Mapping[str, Mapping[str, Any]],
     slots: Mapping[str, int],
 ) -> VariantPlan:
+    if ("compute" in records) == ("vertex" in records or "fragment" in records):
+        raise PipelineCompileError("pipeline variant must contain either one compute program or one graphics program")
     if "vertex" in records or "fragment" in records:
         if not {"vertex", "fragment"}.issubset(records):
             raise PipelineCompileError("graphics variants require vertex and fragment stages")
@@ -78,7 +55,6 @@ def plan_variant(
         tuple(parameters),
         tuple(internal_rows),
         tuple(fragment_outputs(records)),
-        tuple(build_steps(stage_ids)),
     )
 
 
@@ -111,7 +87,6 @@ __all__ = [
     "TargetOptions",
     "VariantPlan",
     "build_bundle_plan",
-    "build_steps",
     "canonical_json",
     "compiled_stage_from_program",
     "content_hash",

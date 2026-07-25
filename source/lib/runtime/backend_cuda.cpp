@@ -53,12 +53,25 @@ bool probeCuda(std::string &diagnostic) {
 
 bool initializeCudaContext(VernonRuntimeContext &context, uint32_t deviceIndex) {
 #if defined(VERNON_HAS_CUDA_RUNTIME)
+    constexpr int computeCapabilityMajorAttribute = 75;
+    constexpr int computeCapabilityMinorAttribute = 76;
     CudaDriver &driver = cudaDriver();
     auto state = std::make_unique<CudaContextState>();
+    int computeCapabilityMajor{};
+    int computeCapabilityMinor{};
+    int driverVersion{};
     if (!driver.load() || driver.init(0) != kCudaSuccess ||
         driver.deviceGet(&state->device, static_cast<int>(deviceIndex)) != kCudaSuccess ||
+        driver.deviceGetAttribute(&computeCapabilityMajor, computeCapabilityMajorAttribute, state->device) !=
+            kCudaSuccess ||
+        driver.deviceGetAttribute(&computeCapabilityMinor, computeCapabilityMinorAttribute, state->device) !=
+            kCudaSuccess ||
+        driver.driverGetVersion(&driverVersion) != kCudaSuccess ||
         driver.primaryContextRetain(&state->context, state->device) != kCudaSuccess)
         return false;
+    state->computeCapabilityMajor = static_cast<uint32_t>(computeCapabilityMajor);
+    state->computeCapabilityMinor = static_cast<uint32_t>(computeCapabilityMinor);
+    state->driverVersion = static_cast<uint32_t>(driverVersion);
     if (driver.contextSetCurrent(state->context) == kCudaSuccess) {
         installRuntimeBackendState(context, state.release());
         return true;

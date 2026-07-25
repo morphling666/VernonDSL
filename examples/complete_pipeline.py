@@ -149,11 +149,11 @@ def main() -> None:
     )
 
     variants = (
-        ("STATIC", vd.pipeline(animate_instances, vertex_main, fragment_main)),
+        ("STATIC", (), vd.pipeline(vertex_main, fragment_main)),
         (
             "ANIMATE",
+            ("ANIMATE",),
             vd.pipeline(
-                animate_instances,
                 vertex_main,
                 fragment_main,
                 features={"ANIMATE"},
@@ -161,8 +161,8 @@ def main() -> None:
         ),
         (
             "ANIMATE+PICKING",
+            ("ANIMATE", "PICKING"),
             vd.pipeline(
-                animate_instances,
                 vertex_main,
                 fragment_main,
                 features={"ANIMATE", "PICKING"},
@@ -220,14 +220,18 @@ def main() -> None:
     delay_ms = max(1, round(1000 / args.fps))
     try:
         while args.frames == 0 or frame < args.frames:
-            variant_name, render = variants[frame % len(variants)]
+            variant_name, features, render = variants[frame % len(variants)]
             binding_name, positions = position_bindings[frame % len(position_bindings)]
             binding_index = frame % 2
+            animate_instances(
+                offsets,
+                base_offsets[binding_index],
+                np.float32(frame / args.fps),
+                features=features,
+            )
             render(
                 position=positions,
                 offset=offsets,
-                base_offset=base_offsets[binding_index],
-                phase=np.float32(frame / args.fps),
                 tint=tint_bindings[binding_index],
                 indices=index_bindings[binding_index],
                 topology=vd.triangles,

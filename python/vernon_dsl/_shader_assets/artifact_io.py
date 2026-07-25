@@ -30,6 +30,18 @@ def artifact_extension(artifact_format: str, stage: str, original_name: str = ""
             "fragment": ".frag.gles",
             "compute": ".comp.gles",
         }.get(stage, ".gles")
+    if artifact_format == "msl":
+        return {
+            "vertex": ".vert.metal",
+            "fragment": ".frag.metal",
+            "compute": ".comp.metal",
+        }.get(stage, ".metal")
+    if artifact_format == "hlsl":
+        return {
+            "vertex": ".vert.hlsl",
+            "fragment": ".frag.hlsl",
+            "compute": ".comp.hlsl",
+        }.get(stage, ".hlsl")
     if artifact_format == "ptx":
         return ".ptx"
     if artifact_format == "spirv":

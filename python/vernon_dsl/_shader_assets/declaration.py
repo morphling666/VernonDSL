@@ -1,38 +1,42 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable
 
+from ..decorators import GRAPHICS_STAGE_ORDER
 from ..types import Feature
 
 
 @dataclass(frozen=True)
 class PipelineAssetDeclaration:
     id: str
-    stages: dict[str, Callable[..., Any]]
+    program: Callable[..., Any] | tuple[Callable[..., Any], ...]
     variants: tuple[tuple[Feature, ...], ...]
-    targets: dict[str, dict[str, Any]]
 
 
 def pipeline_asset(
     *,
     id: str,
-    compute: Callable[..., Any] | None = None,
-    vertex: Callable[..., Any] | None = None,
-    fragment: Callable[..., Any] | None = None,
+    program: Callable[..., Any] | tuple[Callable[..., Any], ...],
     variants: Iterable[Iterable[Feature]] = ((),),
-    targets: Mapping[str, Mapping[str, Any]],
 ) -> PipelineAssetDeclaration:
-    """Declare a cookable pipeline without creating a runtime pipeline."""
+    """Declare one cookable compute or graphics pipeline."""
 
-    stages = {
-        name: value
-        for name, value in (("compute", compute), ("vertex", vertex), ("fragment", fragment))
-        if value is not None
-    }
+    if isinstance(program, tuple):
+        if not program:
+            raise ValueError("graphics pipeline program must contain at least one stage")
+        kinds = [getattr(value, "__vernon_dsl__", (None,))[0] for value in program]
+        if any(kind in {None, "compute", "func", "struct"} for kind in kinds):
+            raise TypeError("graphics pipeline program must contain only graphics entry stages")
+        if len(set(kinds)) != len(kinds):
+            raise ValueError("graphics pipeline program contains a duplicate stage kind")
+        order = {kind: index for index, kind in enumerate(GRAPHICS_STAGE_ORDER)}
+        if kinds != sorted(kinds, key=lambda kind: order.get(kind, len(order))):
+            raise ValueError("graphics pipeline program stages are not in topology order")
+    elif getattr(program, "__vernon_dsl__", (None,))[0] != "compute":
+        raise TypeError("single-entry pipeline program must be a compute Kernel")
     return PipelineAssetDeclaration(
         id=id,
-        stages=stages,
+        program=program,
         variants=tuple(tuple(key) for key in variants),
-        targets={name: dict(options) for name, options in targets.items()},
     )

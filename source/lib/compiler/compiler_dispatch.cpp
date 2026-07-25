@@ -24,7 +24,8 @@ VernonTargetCapabilities targetCapabilities(VernonTarget target) {
         return VernonTargetCapabilities{1, 1, 1, 0};
     if (target == VERNON_TARGET_CUDA)
         return VernonTargetCapabilities{1, 0, 1, 0};
-    if (target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES || target == VERNON_TARGET_METAL)
+    if (target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES || target == VERNON_TARGET_METAL ||
+        target == VERNON_TARGET_DIRECTX)
         return VernonTargetCapabilities{1, 1, 1, 0};
     // Do not advertise an IR-only path as a usable target; availability means
     // the complete lowering and artifact pipeline is linked.
@@ -47,6 +48,23 @@ VernonStatus parseCompileOptions(const VernonCompileOptions *source, VernonTarge
     }
     if (options.glslVersion != 0 && (options.glslVersion < 100 || options.glslVersion > 999)) {
         diagnostics = "GLSL version must be a three-digit version number";
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    }
+    const uint32_t requestedHlslShaderModel =
+        source->struct_size >= offsetof(VernonCompileOptions, hlsl_shader_model) + sizeof(uint32_t)
+            ? source->hlsl_shader_model
+            : 0;
+    if (requestedHlslShaderModel != 0)
+        options.hlslShaderModel = requestedHlslShaderModel;
+    const bool validHlslShaderModel = options.hlslShaderModel == 30 || options.hlslShaderModel == 40 ||
+                                      options.hlslShaderModel == 41 || options.hlslShaderModel == 50 ||
+                                      options.hlslShaderModel == 51 || options.hlslShaderModel == 60;
+    if (requestedHlslShaderModel != 0 && target != VERNON_TARGET_DIRECTX) {
+        diagnostics = "HLSL Shader Model is valid only for the DirectX target";
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    }
+    if (target == VERNON_TARGET_DIRECTX && !validHlslShaderModel) {
+        diagnostics = "HLSL Shader Model must be one of 30, 40, 41, 50, 51, or 60";
         return VERNON_STATUS_INVALID_ARGUMENT;
     }
     auto readCpuOption = [&](size_t offset, std::string &destination) {
@@ -88,16 +106,17 @@ VernonStatus compileTarget(CompilerFrontend &frontend, const char *source, size_
         return VERNON_STATUS_OK;
     }
     if (target == VERNON_TARGET_VULKAN || target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES ||
-        target == VERNON_TARGET_METAL) {
+        target == VERNON_TARGET_METAL || target == VERNON_TARGET_DIRECTX) {
         if (!compileSpirv(context, source, sourceSize, target, artifacts, diagnostics)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }
-        if (target != VERNON_TARGET_VULKAN && !crossCompileSpirv(artifacts, diagnostics, target, options.glslVersion)) {
+        if (target != VERNON_TARGET_VULKAN &&
+            !crossCompileSpirv(artifacts, diagnostics, target, options.glslVersion, options.hlslShaderModel)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }
-        addArtifactTable(reflection, artifacts, target, options.glslVersion);
+        addArtifactTable(reflection, artifacts, target, options.glslVersion, {}, {}, {}, options.hlslShaderModel);
         return VERNON_STATUS_OK;
     }
     if (target == VERNON_TARGET_CUDA) {

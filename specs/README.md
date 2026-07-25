@@ -20,22 +20,24 @@ non-obvious invariant or changes an accepted contract. Temporary investigation
 notes should be tracked as issues or plans outside `specs` and removed after
 their conclusions are merged here.
 
-## Program asset reading order
+## Pipeline asset reading order
 
-The active persistent-program contract is specified in:
+The active persistent-pipeline contract is specified in:
 
 1. [`language/contract.md` — functions, interfaces, and specialization](language/contract.md#6-functions-interfaces-and-specialization)
-2. [`compiler/design.md` — Program asset declarations](compiler/design.md#program-asset-declarations)
-3. [`runtime/design.md` — Program runtime boundary](runtime/design.md#program-runtime-boundary)
+2. [`compiler/design.md` — Pipeline asset declarations](compiler/design.md#pipeline-asset-declarations)
+3. [`runtime/design.md` — Pipeline runtime boundary](runtime/design.md#pipeline-runtime-boundary)
 
 The shared contract is:
 
-- `ProgramAsset` wraps either one compute Kernel or one graphics stage tuple;
+- `PipelineAsset` wraps either one compute Kernel or one graphics stage tuple;
 - Kernel is compute-only and Pipeline is graphics-only;
 - graphics stage topology is extensible independently from backend support;
 - `variants=` enumerates accepted feature keys;
 - target architecture and options are cooker inputs, not source fields.
 
-Execution-graph and Pass proposals are deferred. Their previous non-normative
-design is preserved in
+Host orchestration and Pass proposals are deferred. Their previous
+non-normative design is preserved in
 [`backup/execution_graph_design.md`](backup/execution_graph_design.md).
+The separate low-priority `ProgramGraph` roadmap item is compiler IR inside one
+program for autodiff; it is not a deployment graph.

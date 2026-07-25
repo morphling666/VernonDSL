@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <string_view>
 
 namespace vernon::runtime {
 
@@ -111,6 +112,37 @@ void parseStaticType(const std::string &type, std::string &dtype, std::vector<ui
     }
 }
 
+bool parseUint32(const nlohmann::json &value, uint32_t &result) {
+    if (!value.is_number_integer())
+        return false;
+    if (value.is_number_unsigned()) {
+        const uint64_t parsed = value.get<uint64_t>();
+        if (parsed > UINT32_MAX)
+            return false;
+        result = static_cast<uint32_t>(parsed);
+    } else {
+        const int64_t parsed = value.get<int64_t>();
+        if (parsed < 0 || static_cast<uint64_t>(parsed) > UINT32_MAX)
+            return false;
+        result = static_cast<uint32_t>(parsed);
+    }
+    return true;
+}
+
+bool parseVersion(const nlohmann::json &value, RuntimeVersion &version) {
+    if (!value.is_array() || value.size() != 2 || !parseUint32(value[0], version.major) ||
+        !parseUint32(value[1], version.minor))
+        return false;
+    return version.major != 0;
+}
+
+bool hasOnlyKeys(const nlohmann::json &value, std::initializer_list<std::string_view> allowed) {
+    for (auto row = value.begin(); row != value.end(); ++row)
+        if (std::find(allowed.begin(), allowed.end(), row.key()) == allowed.end())
+            return false;
+    return true;
+}
+
 } // namespace
 
 bool Variant::validate(std::string &error) const {
@@ -178,16 +210,136 @@ bool Variant::validate(std::string &error) const {
             }
         }
     }
-    if (vertex.empty() != fragment.empty() || (compute.empty() && vertex.empty()) || steps.empty()) {
-        error = "pipeline variant has no valid execution stages";
+    if (program.empty() || (!compute.empty() && program.size() != 1)) {
+        error = "pipeline variant must contain either one compute program or one graphics program";
         return false;
     }
     return true;
 }
 
+bool parseRuntimeRequirements(const nlohmann::json &root, const std::string &target, RuntimeRequirements &requirements,
+                              std::string &error) {
+    if (!root.contains("runtime_requirements"))
+        return true;
+    const nlohmann::json &value = root["runtime_requirements"];
+    if (!value.is_object() || !value.contains("backend") || !value["backend"].is_string() ||
+        !value.contains("features") || !value["features"].is_array()) {
+        error = "runtime_requirements must contain backend and features";
+        return false;
+    }
+    requirements.present = true;
+    requirements.backend = value["backend"].get<std::string>();
+    if (requirements.backend != target) {
+        error = "runtime_requirements backend does not match pipeline target";
+        return false;
+    }
+    for (const nlohmann::json &feature : value["features"]) {
+        if (!feature.is_string()) {
+            error = "runtime requirement feature must be a string";
+            return false;
+        }
+        requirements.features.push_back(feature.get<std::string>());
+    }
+    static constexpr std::string_view knownFeatures[] = {"compute", "instancing", "samplers", "tensor_views",
+                                                         "textures"};
+    if (!std::is_sorted(requirements.features.begin(), requirements.features.end()) ||
+        std::adjacent_find(requirements.features.begin(), requirements.features.end()) != requirements.features.end() ||
+        std::any_of(requirements.features.begin(), requirements.features.end(), [](const std::string &feature) {
+            return std::find(std::begin(knownFeatures), std::end(knownFeatures), feature) == std::end(knownFeatures);
+        })) {
+        error = "runtime requirement features must be known, unique, and sorted";
+        return false;
+    }
+    if (target == "cpu") {
+        if (!hasOnlyKeys(value, {"backend", "features", "target_triple", "object_format", "invocation_abi_version"}) ||
+            !value.contains("target_triple") || !value["target_triple"].is_string() ||
+            value["target_triple"].get_ref<const std::string &>().empty() || !value.contains("object_format") ||
+            !value["object_format"].is_string() || !value.contains("invocation_abi_version") ||
+            !parseUint32(value["invocation_abi_version"], requirements.invocationAbiVersion)) {
+            error = "CPU runtime requirements are invalid";
+            return false;
+        }
+        requirements.targetTriple = value["target_triple"].get<std::string>();
+        requirements.objectFormat = value["object_format"].get<std::string>();
+        if ((requirements.objectFormat != "coff" && requirements.objectFormat != "elf" &&
+             requirements.objectFormat != "macho" && requirements.objectFormat != "wasm") ||
+            requirements.invocationAbiVersion == 0) {
+            error = "CPU runtime requirements are invalid";
+            return false;
+        }
+        return true;
+    }
+    if (target == "opengl" || target == "opengles") {
+        if (!hasOnlyKeys(value, {"backend", "features", "glsl_version", "profile", "api_version"}) ||
+            !value.contains("glsl_version") || !parseUint32(value["glsl_version"], requirements.glslVersion) ||
+            !value.contains("profile") || !value["profile"].is_string() || !value.contains("api_version") ||
+            !parseVersion(value["api_version"], requirements.apiVersion)) {
+            error = "OpenGL runtime requirements are invalid";
+            return false;
+        }
+        requirements.profile = value["profile"].get<std::string>();
+        if ((target == "opengles" && requirements.profile != "es") ||
+            (target == "opengl" && requirements.profile != "core" && requirements.profile != "compatibility")) {
+            error = "OpenGL runtime requirement profile does not match target";
+            return false;
+        }
+        if (requirements.glslVersion != glslVersionForApi(requirements.apiVersion)) {
+            error = "OpenGL GLSL and API versions are inconsistent";
+            return false;
+        }
+        return true;
+    }
+    if (target == "vulkan") {
+        if (!hasOnlyKeys(value, {"backend", "features", "api_version", "spirv_version", "compute_workgroup_size"}) ||
+            !value.contains("api_version") || !parseVersion(value["api_version"], requirements.apiVersion) ||
+            !value.contains("spirv_version") || !parseVersion(value["spirv_version"], requirements.shaderVersion)) {
+            error = "Vulkan runtime requirements are invalid";
+            return false;
+        }
+        if (value.contains("compute_workgroup_size")) {
+            const nlohmann::json &workgroup = value["compute_workgroup_size"];
+            if (!workgroup.is_array() || workgroup.size() != 3) {
+                error = "Vulkan compute workgroup requirement must have three dimensions";
+                return false;
+            }
+            for (size_t index = 0; index < 3; ++index) {
+                if (!parseUint32(workgroup[index], requirements.computeWorkgroupSize[index]) ||
+                    requirements.computeWorkgroupSize[index] == 0) {
+                    error = "Vulkan compute workgroup dimensions must be positive";
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    if (target == "cuda") {
+        if (!hasOnlyKeys(value, {"backend", "features", "ptx_version", "minimum_compute_capability", "address_size"}) ||
+            !value.contains("ptx_version") || !parseVersion(value["ptx_version"], requirements.shaderVersion) ||
+            !value.contains("minimum_compute_capability") ||
+            !parseVersion(value["minimum_compute_capability"], requirements.minimumComputeCapability) ||
+            !value.contains("address_size") || !parseUint32(value["address_size"], requirements.addressSize)) {
+            error = "CUDA runtime requirements are invalid";
+            return false;
+        }
+        if (requirements.addressSize != 32 && requirements.addressSize != 64) {
+            error = "CUDA PTX address size must be 32 or 64";
+            return false;
+        }
+        return true;
+    }
+    error = "runtime requirements are unsupported for pipeline target";
+    return false;
+}
+
+bool runtimeVersionAtLeast(RuntimeVersion actual, RuntimeVersion required) {
+    return actual.major > required.major || (actual.major == required.major && actual.minor >= required.minor);
+}
+
+uint32_t glslVersionForApi(RuntimeVersion apiVersion) { return apiVersion.major * 100 + apiVersion.minor * 10; }
+
 bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &error) {
-    if (!value.is_object() || !value.contains("key") || !value.contains("parameters") || !value.contains("steps") ||
-        !value["key"].is_array() || !value["parameters"].is_array() || !value["steps"].is_array()) {
+    if (!value.is_object() || !value.contains("key") || !value.contains("program") || !value.contains("parameters") ||
+        !value["key"].is_array() || !value["program"].is_object() || !value["parameters"].is_array()) {
         error = "pipeline variant tables are invalid";
         return false;
     }
@@ -325,54 +477,18 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
         }
         variant.outputs.push_back(std::move(output));
     }
-    for (const nlohmann::json &step : value["steps"]) {
-        const std::string kind = step.value("kind", "");
-        PipelineStep parsed;
-        if (kind == "dispatch") {
-            parsed.kind = PipelineStepKind::Dispatch;
-            parsed.stage = step.value("stage", "");
-            if (parsed.stage.empty()) {
-                error = "dispatch step stage is missing";
-                return false;
-            }
-            if (step.contains("grid")) {
-                if (!step["grid"].is_array() || step["grid"].size() != 3 ||
-                    !std::all_of(step["grid"].begin(), step["grid"].end(), [](const nlohmann::json &item) {
-                        return item.is_number_unsigned() && item.get<uint32_t>() > 0;
-                    })) {
-                    error = "dispatch step grid must contain three positive integers";
-                    return false;
-                }
-                parsed.grid = {step["grid"][0].get<uint32_t>(), step["grid"][1].get<uint32_t>(),
-                               step["grid"][2].get<uint32_t>()};
-                parsed.hasGrid = true;
-            }
-            if (variant.compute.empty())
-                variant.compute = parsed.stage;
-        } else if (kind == "barrier") {
-            parsed.kind = PipelineStepKind::Barrier;
-            parsed.source = step.value("source", "");
-            parsed.destination = step.value("destination", "");
-            if (parsed.source.empty() || parsed.destination.empty()) {
-                error = "barrier step transition is incomplete";
-                return false;
-            }
-            variant.barrier = true;
-        } else if (kind == "draw") {
-            parsed.kind = PipelineStepKind::Draw;
-            parsed.vertex = step.value("vertex", "");
-            parsed.fragment = step.value("fragment", "");
-            if (parsed.vertex.empty() || parsed.fragment.empty()) {
-                error = "draw step requires vertex and fragment stages";
-                return false;
-            }
-            variant.vertex = parsed.vertex;
-            variant.fragment = parsed.fragment;
-        } else {
-            error = "pipeline step kind is unsupported";
+    for (const auto &[stage, artifact] : value["program"].items()) {
+        if (!artifact.is_string() || artifact.get_ref<const std::string &>().empty()) {
+            error = "pipeline program stage artifact id is invalid";
             return false;
         }
-        variant.steps.push_back(std::move(parsed));
+        variant.program.emplace(stage, artifact.get<std::string>());
+        if (stage == "compute")
+            variant.compute = artifact.get<std::string>();
+        else if (stage == "vertex")
+            variant.vertex = artifact.get<std::string>();
+        else if (stage == "fragment")
+            variant.fragment = artifact.get<std::string>();
     }
     if (variant.vertex.empty() != variant.fragment.empty()) {
         error = "graphics pipeline requires both vertex and fragment stages";

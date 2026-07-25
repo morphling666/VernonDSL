@@ -55,8 +55,8 @@ object or dual-number dtype.
 
 The original numeric order mixed semantic prerequisites, user ergonomics,
 pure-function autodiff, and multi-dispatch runtime work. Continue in the
-dependency order below. Future orchestration work does not block pure functions
-or local structured control flow.
+dependency order below. Program-internal graph work does not block pure
+functions or local structured control flow.
 
 ## Phase 3 audit: existing execution boundaries
 
@@ -67,9 +67,8 @@ or local structured control flow.
 - [x] Keep Texture and Sampler Resource operations separate from TensorView
       load/store across types, intrinsics, lowering, reflection, and runtime
       binding.
-- [x] Provide deterministic legacy runtime pipeline dispatch/barrier/draw steps
-      and invocation planning. These manifest steps are implementation
-      infrastructure, not a current orchestration contract.
+- [x] Bind each cooked pipeline variant directly to either one compute program
+      or one graphics program and provide invocation planning for that program.
 
 ## Phase 3A: owner/region effect foundation
 
@@ -125,16 +124,30 @@ or local structured control flow.
 These ergonomics are accepted as part of the stable v4 core. Autodiff support
 for Phase 5B requires separate derivative and tape policies.
 
-## Deferred orchestration
+## Low priority: program-internal autodiff graph
 
-The former Phase 3B typed execution graph and Phase 3C Pass deployment plans
-are no longer active roadmap phases. Their previous design is preserved in
+The graph used by autodiff is compiler IR inside one specialized program. It is
+not a host graph of PipelineAssets, dispatches, render passes, or backend
+transitions.
+
+- [ ] Build a typed `ProgramGraph` from one specialized, validated Kernel or
+      graphics Pipeline program.
+- [ ] Represent value flow, control flow, Storage effects, alias constraints,
+      and differentiability boundaries without changing source semantics.
+- [ ] Use graph transforms for JVP/VJP, mutation functionalization, reverse
+      traversal, tape planning, and checkpointing.
+- [ ] Lower transformed graphs through the existing target pipelines; do not
+      serialize ProgramGraph as a deployment or orchestration asset.
+
+This work is post-v4 and lower priority than the accepted language,
+PipelineAsset target coverage, and first-order pure-function autodiff. The
+former host Pass-graph proposal is unrelated and remains archived in
 `specs/backup/execution_graph_design.md`.
 
-Multi-program ordering, render-pass and attachment semantics, dynamic graphics
-state, transitions, cross-backend ownership, synchronization, and
-GPU-readback-dependent host behavior must be designed together before a new
-orchestration phase is accepted.
+A public graph-level execution model may become useful for neural-network
+workloads that compose many kernels, parameters, and differentiable operators.
+It is not part of the current roadmap. `ProgramGraph` remains private compiler
+IR and must not implicitly become that public execution API.
 
 ## Phase 6: GPU memory and synchronization
 
@@ -146,7 +159,7 @@ orchestration phase is accepted.
 - [ ] Extend effect analysis to atomics, barriers, races, and
       differentiability-relevant reads and overwrites.
 
-## Phase 7: stateful kernel and multi-dispatch autodiff
+## Phase 7: stateful kernel autodiff
 
 - [ ] Functionalize local mutation and TensorView writes before reverse-mode
       transformation; reject unresolved aliasing and races.
@@ -156,8 +169,8 @@ orchestration phase is accepted.
       bounds, checkpointing, and recomputation.
 - [ ] Generate explicit primal and companion-gradient storage bindings without
       changing primal ABI identity.
-- [ ] Define reverse multi-dispatch ordering and resource transitions after the
-      future orchestration contract is accepted.
+- [ ] Reverse the program-internal graph while preserving validated Storage
+      effects and alias constraints.
 - [ ] Bound tape memory for multi-step fluid workloads and test gradients
       across checkpoint intervals.
 - [ ] Define texture-sampling custom gradients separately for coordinates and

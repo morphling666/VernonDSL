@@ -79,7 +79,10 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
     const std::string ptxHash = vernon::runtime::sha256Hex(ptx, sizeof(ptx) - 1);
     std::string bundle = R"({"schema_version":2,"invocation_abi_version":3,)"
                          R"("type":"pipeline","id":"cuda/scale","target":"cuda",)"
-                         R"("features":[],"variants":[{"key":[],"parameters":[)"
+                         R"("features":[],"runtime_requirements":{"backend":"cuda",)"
+                         R"("features":[],"ptx_version":[8,0],)"
+                         R"("minimum_compute_capability":[8,0],"address_size":64},)"
+                         R"("variants":[{"key":[],"parameters":[)"
                          R"({"slot":0,"name":"output","kind":"tensor","dtype":"f32",)"
                          R"("shape":[4],"access":"write","uses":[{"stage":"compute",)"
                          R"("entry":"scale","index":0,"kind":"tensor","dtype":"f32",)"
@@ -90,7 +93,7 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
                          R"("shape":[],"interface":"value","access":"read"}]})"
                          R"(],"outputs":[{"name":"result","kind":"tensor","dtype":"f32",)"
                          R"("shape":[4],"access":"write","location":0}],)"
-                         R"("steps":[{"kind":"dispatch","stage":"scale"}]}],)"
+                         R"("program":{"compute":"scale"}}],)"
                          R"("stage_artifacts":{"scale":{"id":"scale","entry":"scale",)"
                          R"("stage":"compute","target":"cuda","format":"ptx","artifact":{)"
                          R"("format":"ptx","storage":"inline","encoding":"utf8","data":)" +
@@ -108,13 +111,16 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
 
     VernonRuntimeContext *runtime = vernonRuntimeCreate(VERNON_RUNTIME_CUDA, 0);
     ASSERT_TRUE(runtime);
-    nlohmann::json barrierDocument = nlohmann::json::parse(bundle);
-    barrierDocument["variants"][0]["steps"].push_back({{"kind", "barrier"}});
-    const std::string barrierBundle = withContentHash(barrierDocument);
     VernonPipelineBundleLoadOptions options{};
     options.struct_size = sizeof(options);
-    ASSERT_TRUE(
-        !vernonRuntimeLoadPipelineBundleWithOptions(runtime, barrierBundle.data(), barrierBundle.size(), &options));
+
+    nlohmann::json unsupportedDocument = nlohmann::json::parse(bundle);
+    unsupportedDocument["runtime_requirements"]["minimum_compute_capability"] = nlohmann::json::array({99, 0});
+    const std::string unsupported = withContentHash(std::move(unsupportedDocument));
+    ASSERT_FALSE(vernonRuntimeLoadPipelineBundleWithOptions(runtime, unsupported.data(), unsupported.size(), &options));
+    const VernonStringView unsupportedError = vernonRuntimeGetLastError(runtime);
+    ASSERT_TRUE(std::string(unsupportedError.data, unsupportedError.size)
+                    .find("pipeline requires CUDA compute capability 99.0, device provides") != std::string::npos);
 
     VernonPipelineBundle *loaded =
         vernonRuntimeLoadPipelineBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);

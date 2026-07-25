@@ -3,24 +3,31 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import struct
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from vernon_dsl.pipeline_compile import build_bundle_plan
-from vernon_dsl.shader_assets import (
+from vernon_dsl.pipeline_assets import (
     PipelineCompileError,
-    cook_shader_pipeline,
+    cook_pipeline_asset,
     encode_runtime_stage,
     parse_python_pipeline_asset,
 )
+from vernon_dsl.pipeline_compile import build_bundle_plan
 
 
 def _fake_native(compile_program_result: object) -> SimpleNamespace:
     targets = SimpleNamespace(
-        CPU="cpu", CUDA="cuda", VULKAN="vulkan", METAL="metal", OPENGL="opengl", OPENGL_ES="opengles"
+        CPU="cpu",
+        CUDA="cuda",
+        VULKAN="vulkan",
+        METAL="metal",
+        DIRECTX="directx",
+        OPENGL="opengl",
+        OPENGL_ES="opengles",
     )
     return SimpleNamespace(
         Target=targets,
@@ -58,10 +65,8 @@ def fragment_main(value: vd.f32) -> vd.f32:
 
 asset = vd.pipeline_asset(
     id="pipelines/static",
-    vertex=vertex_main,
-    fragment=fragment_main,
+    program=(vertex_main, fragment_main),
     variants=((), (FEATURE,)),
-    targets={"opengl": {"glsl_version": 330}},
 )
 """,
                 encoding="utf-8",
@@ -70,7 +75,56 @@ asset = vd.pipeline_asset(
             self.assertEqual(descriptor.id, "pipelines/static")
             self.assertEqual(descriptor.variants, ((), ("FEATURE",)))
             self.assertEqual(set(descriptor.stages), {"vertex", "fragment"})
-            self.assertEqual(descriptor.targets["opengl"]["glsl_version"], 330)
+            self.assertNotIn("targets", json.loads(descriptor.canonical_manifest))
+
+    def test_python_pipeline_asset_rejects_legacy_stage_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "asset.py"
+            source.write_text(
+                """
+import vernon_dsl as vd
+
+@vd.kernel
+def compute_main() -> None:
+    pass
+
+asset = vd.pipeline_asset(
+    id="pipelines/legacy",
+    compute=compute_main,
+    variants=((),),
+    targets={"cpu": {}},
+)
+""",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(PipelineCompileError, "unknown pipeline_asset argument"):
+                parse_python_pipeline_asset(source, "asset")
+
+    def test_python_pipeline_asset_rejects_graphics_stage_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "asset.py"
+            source.write_text(
+                """
+import vernon_dsl as vd
+
+@vd.vertex
+def vertex_main() -> None:
+    pass
+
+@vd.fragment
+def fragment_main() -> None:
+    pass
+
+asset = vd.pipeline_asset(
+    id="pipelines/reversed",
+    program=(fragment_main, vertex_main),
+    variants=((),),
+)
+""",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(PipelineCompileError, "topology order"):
+                parse_python_pipeline_asset(source, "asset")
 
     def test_python_pipeline_asset_rejects_noncanonical_variants(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -87,9 +141,8 @@ def compute_main() -> None:
 
 asset = vd.pipeline_asset(
     id="pipelines/bad",
-    compute=compute_main,
+    program=compute_main,
     variants=((ZED, ALPHA),),
-    targets={"cpu": {}},
 )
 """,
                 encoding="utf-8",
@@ -113,9 +166,8 @@ def compute_main() -> None:
 
 asset = vd.pipeline_asset(
     id="pipelines/too_many",
-    compute=compute_main,
+    program=compute_main,
     variants=({variants},),
-    targets={{"cpu": {{}}}},
 )
 """,
                 encoding="utf-8",
@@ -138,12 +190,12 @@ class ShaderAssetCookTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with self.assertRaisesRegex(PipelineCompileError, "source.py:descriptor_name"):
-                cook_shader_pipeline(
+                cook_pipeline_asset(
                     pipeline_asset=root / "asset.json",
                     output=root / "output",
                 )
             with self.assertRaisesRegex(PipelineCompileError, "valid Python descriptor name"):
-                cook_shader_pipeline(
+                cook_pipeline_asset(
                     pipeline_asset=f"{root / 'asset.py'}:",
                     output=root / "output",
                 )
@@ -263,13 +315,8 @@ def scale() -> None:
 
 asset = vd.pipeline_asset(
     id="pipelines/cpu",
-    compute=scale,
+    program=scale,
     variants=((),),
-    targets={"cpu": {
-        "target_triple": "x86_64-pc-windows-msvc",
-        "cpu": "generic",
-        "cpu_features": "+sse2",
-    }},
 )
 """,
                 encoding="utf-8",
@@ -287,10 +334,14 @@ asset = vd.pipeline_asset(
                 mock.patch("subprocess.run", side_effect=AssertionError("cooker invoked subprocess")),
                 mock.patch("vernon_dsl._shader_assets.cooking.build_bundle_plan", side_effect=capture_plan),
             ):
-                manifest_path = cook_shader_pipeline(
+                manifest_path = cook_pipeline_asset(
                     pipeline_asset=f"{source}:asset",
                     output=output,
                     target="cpu",
+                    target_options={
+                        "cpu": "generic",
+                        "cpu_features": "+sse2",
+                    },
                 )
 
             self.assertEqual(
@@ -299,8 +350,6 @@ asset = vd.pipeline_asset(
                     (
                         "cpu",
                         {
-                            "glsl_version": 0,
-                            "target_triple": "x86_64-pc-windows-msvc",
                             "cpu": "generic",
                             "cpu_features": "+sse2",
                         },
@@ -309,6 +358,24 @@ asset = vd.pipeline_asset(
             )
             bundle = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(bundle["features"], [])
+            self.assertEqual(
+                bundle["target_options"],
+                {
+                    "target_triple": "x86_64-pc-windows-msvc",
+                    "cpu": "generic",
+                    "cpu_features": "+sse2",
+                },
+            )
+            self.assertEqual(
+                bundle["runtime_requirements"],
+                {
+                    "backend": "cpu",
+                    "features": [],
+                    "target_triple": "x86_64-pc-windows-msvc",
+                    "object_format": "coff",
+                    "invocation_abi_version": 1,
+                },
+            )
             logical = json.loads(json.dumps(bundle))
             logical.pop("content_hash")
             for record in logical["stage_artifacts"].values():
@@ -337,6 +404,8 @@ asset = vd.pipeline_asset(
             "opengl": (("vertex", "fragment"), "glsl", (".vert.glsl", ".frag.glsl")),
             "opengles": (("vertex", "fragment"), "gles", (".vert.gles", ".frag.gles")),
             "vulkan": (("vertex", "fragment"), "spirv", (".spv", ".spv")),
+            "metal": (("vertex", "fragment"), "msl", (".vert.metal", ".frag.metal")),
+            "directx": (("vertex", "fragment"), "hlsl", (".vert.hlsl", ".frag.hlsl")),
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -349,7 +418,11 @@ asset = vd.pipeline_asset(
                         f"@vd.{'kernel' if stage == 'compute' else stage}\ndef {stage}_main() -> None:\n    pass"
                         for stage in stages
                     )
-                    stage_arguments = "\n".join(f"    {stage}={stage}_main," for stage in stages)
+                    program_expression = (
+                        f"{stages[0]}_main"
+                        if stages == ("compute",)
+                        else "(" + ", ".join(f"{stage}_main" for stage in stages) + ")"
+                    )
                     source.write_text(
                         f"""
 import vernon_dsl as vd
@@ -360,9 +433,8 @@ FEATURE = vd.feature("FEATURE")
 
 asset = vd.pipeline_asset(
     id="pipelines/{target}",
-{stage_arguments}
+    program={program_expression},
     variants=((), (FEATURE,)),
-    targets={{{target!r}: {{}}}},
 )
 """,
                         encoding="utf-8",
@@ -380,15 +452,8 @@ asset = vd.pipeline_asset(
                     ) -> SimpleNamespace:
                         nonlocal compile_index
                         self.assertEqual(native_target, _target)
-                        self.assertEqual(
-                            options,
-                            {
-                                "glsl_version": 0,
-                                "target_triple": "",
-                                "cpu": "",
-                                "cpu_features": "",
-                            },
-                        )
+                        expected_options = {"hlsl_shader_model": 50} if _target == "directx" else {}
+                        self.assertEqual(options, expected_options)
                         stage = _stages[compile_index % len(_stages)]
                         compile_index += 1
                         extension = {
@@ -396,20 +461,24 @@ asset = vd.pipeline_asset(
                             "gles": ".gles",
                             "ptx": ".ptx",
                             "spirv": ".spv",
+                            "msl": ".metal",
+                            "hlsl": ".hlsl",
                         }[_artifact_format]
                         filename = f"{stage}{extension}"
-                        artifact = (
-                            {
-                                "vertex": b"vertex artifact\n",
-                                "fragment": b"fragment artifact\n",
-                                "compute": b"compute artifact\n",
-                            }[stage]
-                            if _artifact_format != "spirv"
-                            else b"\x03\x02\x23\x07" + stage.encode("ascii")
-                        )
+                        artifact = {
+                            "glsl": b"#version 450\nvoid main() {}\n",
+                            "gles": b"#version 310 es\nvoid main() {}\n",
+                            "ptx": b".version 8.0\n.target sm_50\n.address_size 64\n",
+                            "spirv": struct.pack("<II", 0x07230203, 0x00010300),
+                            "msl": b"// metal artifact\n",
+                            "hlsl": b"// hlsl artifact\n",
+                        }[_artifact_format]
+                        artifact += stage.encode("ascii")
                         reflection = {
                             "module_hash": "module",
                             "dependencies": [],
+                            "target": _target,
+                            "target_options": expected_options,
                             "entries": [
                                 {
                                     "name": f"{stage}_main",
@@ -446,13 +515,13 @@ asset = vd.pipeline_asset(
                             return_value=_fake_native(compile_program_result),
                         ),
                     ):
-                        manifest_path = cook_shader_pipeline(
+                        manifest_path = cook_pipeline_asset(
                             pipeline_asset=f"{source}:asset",
                             output=output,
                             target=target,
                         )
                         first_manifest = manifest_path.read_bytes()
-                        repeated_path = cook_shader_pipeline(
+                        repeated_path = cook_pipeline_asset(
                             pipeline_asset=f"{source}:asset",
                             output=output,
                             target=target,
@@ -465,6 +534,44 @@ asset = vd.pipeline_asset(
                     self.assertEqual(document["schema_version"], 2)
                     self.assertEqual(document["type"], "pipeline")
                     self.assertEqual(document["invocation_abi_version"], 3)
+                    self.assertEqual(document["target"], target)
+                    self.assertEqual(
+                        document["target_options"],
+                        {"hlsl_shader_model": 50} if target == "directx" else {},
+                    )
+                    expected_requirements = {
+                        "cuda": {
+                            "backend": "cuda",
+                            "features": [],
+                            "ptx_version": [8, 0],
+                            "minimum_compute_capability": [5, 0],
+                            "address_size": 64,
+                        },
+                        "opengl": {
+                            "backend": "opengl",
+                            "features": [],
+                            "glsl_version": 450,
+                            "profile": "core",
+                            "api_version": [4, 5],
+                        },
+                        "opengles": {
+                            "backend": "opengles",
+                            "features": [],
+                            "glsl_version": 310,
+                            "profile": "es",
+                            "api_version": [3, 1],
+                        },
+                        "vulkan": {
+                            "backend": "vulkan",
+                            "features": [],
+                            "api_version": [1, 1],
+                            "spirv_version": [1, 3],
+                        },
+                    }.get(target)
+                    if expected_requirements is None:
+                        self.assertNotIn("runtime_requirements", document)
+                    else:
+                        self.assertEqual(document["runtime_requirements"], expected_requirements)
                     self.assertFalse((output / "pipeline.bundle").exists())
                     descriptors = [value["artifact"] for value in document["stage_artifacts"].values()]
                     self.assertEqual(len(descriptors), len(stages))
@@ -515,16 +622,14 @@ def fragment_main() -> None:
 
 asset = vd.pipeline_asset(
     id="graphics",
-    vertex=vertex_main,
-    fragment=fragment_main,
+    program=(vertex_main, fragment_main),
     variants=((),),
-    targets={"cpu": {}},
 )
 """,
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(PipelineCompileError, "CPU pipeline bundles support"):
-                cook_shader_pipeline(
+                cook_pipeline_asset(
                     pipeline_asset=f"{source}:asset",
                     output=root / "output",
                     target="cpu",
@@ -535,7 +640,7 @@ asset = vd.pipeline_asset(
         if not _native_available():
             self.skipTest("native Vernon extension is not built")
         with tempfile.TemporaryDirectory() as directory:
-            manifest = cook_shader_pipeline(
+            manifest = cook_pipeline_asset(
                 pipeline_asset=f"{root / 'examples' / 'variant_mesh.py'}:mesh_asset",
                 output=directory,
             )
@@ -543,12 +648,12 @@ asset = vd.pipeline_asset(
             self.assertEqual(bundle["features"], ["INSTANCE", "SKIN"])
             self.assertEqual(len(bundle["variants"]), 4)
             self.assertEqual(len(bundle["stage_artifacts"]), 5)
-            fragment_ids = {variant["steps"][0]["fragment"] for variant in bundle["variants"]}
-            vertex_ids = {variant["steps"][0]["vertex"] for variant in bundle["variants"]}
+            fragment_ids = {variant["program"]["fragment"] for variant in bundle["variants"]}
+            vertex_ids = {variant["program"]["vertex"] for variant in bundle["variants"]}
             self.assertEqual(len(fragment_ids), 1)
             self.assertEqual(len(vertex_ids), 4)
             combined = next(variant for variant in bundle["variants"] if variant["key"] == ["INSTANCE", "SKIN"])
-            interface = bundle["stage_artifacts"][combined["steps"][0]["vertex"]]["interface"]["arguments"]
+            interface = bundle["stage_artifacts"][combined["program"]["vertex"]]["interface"]["arguments"]
             locations = [value["vernon.location"] for value in interface if "vernon.location" in value]
             self.assertEqual(locations, [0, 1, 5, 6])
             runtime_bundle = bundle
@@ -560,7 +665,7 @@ asset = vd.pipeline_asset(
             combined_runtime = next(
                 variant for variant in runtime_bundle["variants"] if variant["key"] == ["INSTANCE", "SKIN"]
             )
-            self.assertEqual(combined_runtime["steps"][0]["kind"], "draw")
+            self.assertEqual(set(combined_runtime["program"]), {"vertex", "fragment"})
             slots = {parameter["name"]: parameter["slot"] for parameter in combined_runtime["parameters"]}
             self.assertEqual(sorted(slots.values()), list(range(len(slots))))
             self.assertTrue(
@@ -583,7 +688,7 @@ asset = vd.pipeline_asset(
         with tempfile.TemporaryDirectory() as directory:
             for target, (name, asset_id, stages) in cases.items():
                 output = Path(directory) / target
-                manifest = cook_shader_pipeline(
+                manifest = cook_pipeline_asset(
                     pipeline_asset=f"{source}:{name}",
                     output=output,
                     target=target,
@@ -596,10 +701,10 @@ asset = vd.pipeline_asset(
                     stages,
                 )
                 if target == "opengl":
-                    self.assertEqual(len({variant["steps"][0]["vertex"] for variant in document["variants"]}), 2)
-                    self.assertEqual(len({variant["steps"][0]["fragment"] for variant in document["variants"]}), 1)
+                    self.assertEqual(len({variant["program"]["vertex"] for variant in document["variants"]}), 2)
+                    self.assertEqual(len({variant["program"]["fragment"] for variant in document["variants"]}), 1)
                     repeated = Path(directory) / "opengl_repeated"
-                    repeated_manifest = cook_shader_pipeline(
+                    repeated_manifest = cook_pipeline_asset(
                         pipeline_asset=f"{source}:{name}",
                         output=repeated,
                         target=target,
@@ -613,12 +718,59 @@ asset = vd.pipeline_asset(
                     self.assertEqual(len(data), artifact["size"])
                     self.assertEqual(hashlib.sha256(data).hexdigest(), artifact["sha256"])
 
+    def test_cook_only_source_targets_support_graphics_and_compute(self) -> None:
+        root = Path(__file__).parents[2]
+        if not _native_available():
+            self.skipTest("native Vernon extension is not built")
+        assets = (
+            (root / "python" / "tests" / "cube_map_shader.py", "cube_map_asset", {"vertex", "fragment"}),
+            (root / "python" / "tests" / "pipeline_asset_fixture.py", "scale_asset", {"compute"}),
+        )
+        targets = {
+            "metal": ("msl", ".metal", {}),
+            "directx": ("hlsl", ".hlsl", {"hlsl_shader_model": 60}),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            for source, name, stages in assets:
+                for target, (artifact_format, extension, target_options) in targets.items():
+                    with self.subTest(asset=name, target=target):
+                        output = Path(directory) / f"{name}_{target}"
+                        manifest = cook_pipeline_asset(
+                            pipeline_asset=f"{source}:{name}",
+                            output=output,
+                            target=target,
+                            target_options=target_options,
+                        )
+                        document = json.loads(manifest.read_text(encoding="utf-8"))
+                        self.assertEqual(document["target"], target)
+                        self.assertEqual(document["target_options"], target_options)
+                        self.assertEqual(
+                            {stage["stage"] for stage in document["stage_artifacts"].values()},
+                            stages,
+                        )
+                        if name == "cube_map_asset":
+                            uniform_uses = [
+                                use
+                                for parameter in document["variants"][0]["parameters"]
+                                for use in parameter["uses"]
+                                if use["interface"] == "uniform"
+                            ]
+                            self.assertTrue(uniform_uses)
+                            self.assertTrue(all(not use["uniform_name"].endswith("._m0") for use in uniform_uses))
+                        for stage in document["stage_artifacts"].values():
+                            artifact = stage["artifact"]
+                            self.assertEqual(artifact["format"], artifact_format)
+                            self.assertTrue(artifact["path"].endswith(extension))
+                            data = (output / artifact["path"]).read_bytes()
+                            self.assertTrue(data)
+                            data.decode("utf-8")
+
     def test_vulkan_pipeline_bundle_embeds_verified_spirv(self) -> None:
         root = Path(__file__).parents[2]
         if not _native_available():
             self.skipTest("native Vernon extension is not built")
         with tempfile.TemporaryDirectory() as directory:
-            manifest = cook_shader_pipeline(
+            manifest = cook_pipeline_asset(
                 pipeline_asset=f"{root / 'examples' / 'variant_mesh.py'}:mesh_asset",
                 output=directory,
                 target="vulkan",

@@ -24,7 +24,7 @@ build = [
 
 [project.scripts]
 vernon-compile-python = "vernon_dsl.cli:main"
-vernon-cook-shader = "vernon_dsl.shader_asset_cli:main"
+vernon-cook-pipeline = "vernon_dsl.pipeline_asset_cli:main"
 
 [tool.uv]
 package = false

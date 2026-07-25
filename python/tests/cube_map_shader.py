@@ -56,8 +56,6 @@ def cube_map_fragment(
 
 cube_map_asset = vd.pipeline_asset(
     id="pipelines/cube_map",
-    vertex=cube_map_vertex,
-    fragment=cube_map_fragment,
+    program=(cube_map_vertex, cube_map_fragment),
     variants=((),),
-    targets={"vulkan": {}},
 )

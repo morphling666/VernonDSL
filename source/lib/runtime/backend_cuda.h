@@ -7,14 +7,15 @@
 #include "runtime_state.h"
 
 #include <string>
-#include <unordered_map>
-
 struct VernonDeviceBuffer;
 namespace vernon::runtime {
 
 struct CudaContextState {
     CudaDevice device{};
     CudaContext context{};
+    uint32_t computeCapabilityMajor{};
+    uint32_t computeCapabilityMinor{};
+    uint32_t driverVersion{};
 };
 
 struct CudaBufferState {
@@ -22,7 +23,7 @@ struct CudaBufferState {
 };
 
 struct CudaPipelineState {
-    std::unordered_map<std::string, VernonLoadedKernel *> kernels;
+    VernonLoadedKernel *kernel{};
 };
 
 inline CudaContextState &cudaState(VernonRuntimeContext &context) {

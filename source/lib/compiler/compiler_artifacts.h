@@ -12,6 +12,6 @@ namespace vernon::compiler {
 
 void addArtifactTable(std::string &reflection, const std::vector<Artifact> &artifacts, VernonTarget target,
                       uint32_t glslVersion, std::string_view cpuTargetTriple = {}, std::string_view cpu = {},
-                      std::string_view cpuFeatures = {});
+                      std::string_view cpuFeatures = {}, uint32_t hlslShaderModel = 50);
 
 } // namespace vernon::compiler

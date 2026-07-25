@@ -46,6 +46,8 @@ llvm::StringRef artifactFormat(llvm::StringRef filename) {
         return "gles";
     if (extension == ".metal")
         return "msl";
+    if (extension == ".hlsl")
+        return "hlsl";
     if (extension == ".ptx")
         return "ptx";
     if (extension == ".ll")
@@ -59,7 +61,7 @@ llvm::StringRef artifactFormat(llvm::StringRef filename) {
 
 void addArtifactTable(std::string &reflection, const std::vector<Artifact> &artifacts, VernonTarget target,
                       uint32_t glslVersion, std::string_view cpuTargetTriple, std::string_view cpu,
-                      std::string_view cpuFeatures) {
+                      std::string_view cpuFeatures, uint32_t hlslShaderModel) {
     llvm::Expected<llvm::json::Value> parsed = llvm::json::parse(reflection);
     if (!parsed)
         return;
@@ -72,6 +74,8 @@ void addArtifactTable(std::string &reflection, const std::vector<Artifact> &arti
     llvm::json::Object targetOptions;
     if (target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES)
         targetOptions["glsl_version"] = static_cast<int64_t>(glslVersion);
+    if (target == VERNON_TARGET_DIRECTX)
+        targetOptions["hlsl_shader_model"] = static_cast<int64_t>(hlslShaderModel);
     if (target == VERNON_TARGET_CPU) {
         const llvm::StringRef triple = asStringRef(cpuTargetTriple);
         targetOptions["target_triple"] =

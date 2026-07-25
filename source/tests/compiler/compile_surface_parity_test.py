@@ -46,9 +46,9 @@ from pipeline_asset_fixture import (  # noqa: E402
     triangle_vertex,
 )
 from vernon_dsl.compiler import compile_file  # noqa: E402
+from vernon_dsl.pipeline_asset_cli import main as pipeline_asset_main  # noqa: E402
+from vernon_dsl.pipeline_assets import cook_pipeline_asset  # noqa: E402
 from vernon_dsl.pipeline_compile import canonical_json  # noqa: E402
-from vernon_dsl.shader_asset_cli import main as shader_asset_main  # noqa: E402
-from vernon_dsl.shader_assets import cook_shader_pipeline  # noqa: E402
 
 FIXTURE = PYTHON_TEST_ROOT / "pipeline_asset_fixture.py"
 GOLDEN = json.loads(
@@ -64,7 +64,8 @@ class _CompileOptions(ctypes.Structure):
     _fields_ = [
         ("struct_size", ctypes.c_uint32),
         ("glsl_version", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint32 * 6),
+        ("hlsl_shader_model", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32 * 5),
         ("cpu_target_triple", _StringView),
         ("cpu_name", _StringView),
         ("cpu_features", _StringView),
@@ -110,12 +111,15 @@ class _DirectCompiler:
             self.library.vernonCompilerDestroy(self.context)
             self.context = None
 
-    def compile(self, mlir: str, target: int, glsl_version: int) -> tuple[dict[str, object], list[tuple[str, bytes]]]:
+    def compile(
+        self, mlir: str, target: int, glsl_version: int, hlsl_shader_model: int = 0
+    ) -> tuple[dict[str, object], list[tuple[str, bytes]]]:
         source = mlir.encode("utf-8")
         source_buffer = ctypes.create_string_buffer(source)
         options = _CompileOptions()
         options.struct_size = ctypes.sizeof(options)
         options.glsl_version = glsl_version
+        options.hlsl_shader_model = hlsl_shader_model
         result = self.library.vernonCompilerCompileMlirWithOptions(
             self.context,
             ctypes.cast(source_buffer, ctypes.c_void_p),
@@ -184,18 +188,23 @@ class CompileSurfaceParityTests(unittest.TestCase):
 
     def test_direct_c_api_owning_program_and_cli_are_byte_identical(self) -> None:
         cases = (
-            ("opengl", native.Target.OPENGL, 1, 330),
-            ("vulkan", native.Target.VULKAN, 3, 0),
+            ("opengl", native.Target.OPENGL, 1, 330, 0),
+            ("vulkan", native.Target.VULKAN, 3, 0, 0),
+            ("metal", native.Target.METAL, 4, 0, 0),
+            ("directx", native.Target.DIRECTX, 5, 0, 60),
         )
-        for target_name, native_target, c_target, glsl_version in cases:
+        for target_name, native_target, c_target, glsl_version, hlsl_shader_model in cases:
             for entry in ("triangle_vertex", "solid_fragment"):
                 with self.subTest(target=target_name, entry=entry):
                     mlir = compile_file(FIXTURE, features=("OFFSET",), entry=entry)
-                    direct_reflection, direct_artifacts = self.direct.compile(mlir, c_target, glsl_version)
+                    direct_reflection, direct_artifacts = self.direct.compile(
+                        mlir, c_target, glsl_version, hlsl_shader_model
+                    )
                     program = native.Compiler().compile_program_result(
                         mlir,
                         native_target,
                         glsl_version=glsl_version,
+                        hlsl_shader_model=hlsl_shader_model,
                     )
                     self.assertTrue(program.ok, program.diagnostics)
                     owning_reflection = json.loads(program.reflection)
@@ -218,6 +227,8 @@ class CompileSurfaceParityTests(unittest.TestCase):
                         ]
                         if glsl_version:
                             command.extend(["--glsl-version", str(glsl_version)])
+                        if hlsl_shader_model:
+                            command.extend(["--hlsl-shader-model", str(hlsl_shader_model)])
                         (output / "fixture.mlir").write_text(mlir, encoding="utf-8")
                         completed = subprocess.run(command, capture_output=True, text=True, check=False)
                         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -233,6 +244,11 @@ class CompileSurfaceParityTests(unittest.TestCase):
                         self.assertEqual(owning_reflection["target_options"]["glsl_version"], glsl_version)
                     else:
                         self.assertNotIn("glsl_version", owning_reflection["target_options"])
+                    if hlsl_shader_model:
+                        self.assertEqual(
+                            owning_reflection["target_options"]["hlsl_shader_model"],
+                            hlsl_shader_model,
+                        )
                     self.assertTrue(owning_reflection["module_hash"])
                     self.assertEqual(
                         [(row["name"], row["stage"]) for row in owning_reflection["entries"]],
@@ -297,18 +313,27 @@ class CompileSurfaceParityTests(unittest.TestCase):
                 )
                 cooked_dir = root / "cooked"
                 cli_dir = root / "cli"
+                target_options = {"glsl_version": 330} if target_name == "opengl" else {}
+                cli_arguments = [
+                    f"{FIXTURE}:triangle_asset",
+                    "--target",
+                    target_name,
+                    "--output",
+                    str(cli_dir),
+                ]
+                if target_name == "opengl":
+                    cli_arguments.extend(["--glsl-version", "330"])
                 with (
                     mock.patch.object(shader_assets_module, "_native_module", return_value=proxy),
                     mock.patch("subprocess.run", side_effect=AssertionError("offline cooking spawned a subprocess")),
                 ):
-                    manifest_path = cook_shader_pipeline(
+                    manifest_path = cook_pipeline_asset(
                         pipeline_asset=f"{FIXTURE}:triangle_asset",
                         output=cooked_dir,
                         target=target_name,
+                        target_options=target_options,
                     )
-                    cli_status = shader_asset_main(
-                        [f"{FIXTURE}:triangle_asset", "--target", target_name, "--output", str(cli_dir)]
-                    )
+                    cli_status = pipeline_asset_main(cli_arguments)
                 self.assertEqual(cli_status, 0)
                 # Two stage/feature specializations per cook. The unchanged
                 # fragment artifact is deduplicated after compilation.
@@ -316,26 +341,27 @@ class CompileSurfaceParityTests(unittest.TestCase):
                 cooked = json.loads(manifest_path.read_text(encoding="utf-8"))
                 cli_cooked = json.loads((cli_dir / "cli.pipeline.json").read_text(encoding="utf-8"))
                 self.assertEqual(cooked, cli_cooked)
+                self.assertEqual(cooked["target"], target_name)
+                self.assertNotIn("targets", cooked)
                 self.assertEqual([variant["key"] for variant in cooked["variants"]], GOLDEN["graphics"]["variants"])
                 self.assertEqual(cooked["features"], GOLDEN["graphics"]["features"])
-                self.assertEqual(cooked["target_options"], GOLDEN["targets"][target_name])
+                self.assertEqual(cooked["target_options"], target_options)
                 selected = next(variant for variant in cooked["variants"] if variant["key"] == ["OFFSET"])
                 interactive_variant = interactive["variants"][0]
                 self.assertEqual(interactive_variant["key"], ["OFFSET"])
                 self.assertEqual(interactive_variant["parameters"], selected["parameters"])
                 self.assertEqual(interactive_variant["outputs"], selected["outputs"])
-                self.assertEqual(interactive_variant["steps"], selected["steps"])
+                self.assertEqual(interactive_variant["program"], selected["program"])
                 self.assertEqual(
                     [(row["name"], row["slot"], row["kind"]) for row in selected["parameters"]],
                     [(row["name"], row["slot"], row["kind"]) for row in GOLDEN["graphics"]["parameters"]],
                 )
                 self.assertEqual(selected["outputs"], GOLDEN["graphics"]["outputs"])
-                self.assertEqual([row["kind"] for row in selected["steps"]], GOLDEN["graphics"]["step_kinds"])
-                draw = selected["steps"][0]
-                interactive_draw = interactive_variant["steps"][0]
-                self.assertEqual(draw, interactive_draw)
+                program = selected["program"]
+                interactive_program = interactive_variant["program"]
+                self.assertEqual(program, interactive_program)
                 for stage_name in ("vertex", "fragment"):
-                    stage_id = draw[stage_name]
+                    stage_id = program[stage_name]
                     self.assertEqual(
                         _logical_stage(cooked, stage_id),
                         _logical_stage(interactive, stage_id),

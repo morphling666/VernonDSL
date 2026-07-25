@@ -30,11 +30,6 @@ def mesh_fragment(
 
 mesh_asset = vd.pipeline_asset(
     id="shaders/variant_mesh",
-    vertex=mesh_vertex,
-    fragment=mesh_fragment,
+    program=(mesh_vertex, mesh_fragment),
     variants=((), (INSTANCE,), (SKIN,), (INSTANCE, SKIN)),
-    targets={
-        "opengl": {"glsl_version": 330},
-        "vulkan": {},
-    },
 )

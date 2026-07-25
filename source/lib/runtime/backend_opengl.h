@@ -41,13 +41,7 @@ struct OpenGLKernelState {
     GlUint program{};
 };
 
-struct OpenGLPipelineCompute {
-    GlUint program{};
-    uint32_t workgroup[3]{1, 1, 1};
-};
-
 struct OpenGLPipelineState {
-    std::unordered_map<std::string, OpenGLPipelineCompute> computePrograms;
     GlUint computeProgram{};
     GlUint graphicsProgram{};
     GlUint vertexArray{};

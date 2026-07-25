@@ -44,10 +44,11 @@ struct PipelineInvocationBuilder;
 using SharedCompileResult = std::shared_ptr<VernonCompileResult>;
 
 struct CompiledProgram {
-    CompiledProgram(VernonCompileResult *result, VernonTarget target, uint32_t glslVersion, std::string targetTriple,
-                    std::string cpu, std::string cpuFeatures)
+    CompiledProgram(VernonCompileResult *result, VernonTarget target, uint32_t glslVersion, uint32_t hlslShaderModel,
+                    std::string targetTriple, std::string cpu, std::string cpuFeatures)
         : result(result, &vernonCompileResultDestroy), target(target), glslVersion(glslVersion),
-          targetTriple(std::move(targetTriple)), cpu(std::move(cpu)), cpuFeatures(std::move(cpuFeatures)) {
+          hlslShaderModel(hlslShaderModel), targetTriple(std::move(targetTriple)), cpu(std::move(cpu)),
+          cpuFeatures(std::move(cpuFeatures)) {
         if (!this->result)
             throw std::runtime_error("compiler returned no result");
     }
@@ -84,23 +85,26 @@ struct CompiledProgram {
     SharedCompileResult result;
     VernonTarget target;
     uint32_t glslVersion{};
+    uint32_t hlslShaderModel{};
     std::string targetTriple;
     std::string cpu;
     std::string cpuFeatures;
 };
 
 std::unique_ptr<CompiledProgram> compileProgramResult(Compiler &compiler, const std::string &mlir, VernonTarget target,
-                                                      uint32_t glslVersion, const std::string &targetTriple,
-                                                      const std::string &cpu, const std::string &cpuFeatures) {
+                                                      uint32_t glslVersion, uint32_t hlslShaderModel,
+                                                      const std::string &targetTriple, const std::string &cpu,
+                                                      const std::string &cpuFeatures) {
     VernonCompileOptions options{};
     options.struct_size = sizeof(options);
     options.glsl_version = glslVersion;
+    options.hlsl_shader_model = hlslShaderModel;
     options.cpu_target_triple = VernonStringView{targetTriple.data(), targetTriple.size()};
     options.cpu_name = VernonStringView{cpu.data(), cpu.size()};
     options.cpu_features = VernonStringView{cpuFeatures.data(), cpuFeatures.size()};
     return std::make_unique<CompiledProgram>(
         vernonCompilerCompileMlirWithOptions(compiler.context, mlir.data(), mlir.size(), target, &options), target,
-        glslVersion, targetTriple, cpu, cpuFeatures);
+        glslVersion, hlslShaderModel, targetTriple, cpu, cpuFeatures);
 }
 
 struct Buffer {
@@ -206,17 +210,6 @@ struct PipelineOutputMetadata {
     VernonValueAccess access{};
     std::vector<uint64_t> shape;
     uint32_t location{};
-};
-
-struct PipelineStepMetadata {
-    VernonPipelineStepKind kind{};
-    std::string stage;
-    std::string vertex;
-    std::string fragment;
-    std::string source;
-    std::string destination;
-    bool hasGrid{};
-    VernonLaunchSize grid{};
 };
 
 PipelineParameterMetadata parameterMetadata(const VernonPipelineParameterView &view) {
@@ -532,21 +525,6 @@ struct LoadedPipeline {
         return result;
     }
 
-    std::vector<PipelineStepMetadata> steps() const {
-        std::vector<PipelineStepMetadata> result;
-        const size_t count = vernonRuntimeLoadedPipelineGetStepCount(pipeline);
-        result.reserve(count);
-        for (size_t index = 0; index < count; ++index) {
-            VernonPipelineStepView view{};
-            view.struct_size = sizeof(view);
-            if (vernonRuntimeLoadedPipelineGetStepByIndex(pipeline, index, &view) != VERNON_STATUS_OK)
-                throw std::runtime_error("cannot read loaded pipeline step");
-            result.push_back({view.kind, stringView(view.stage), stringView(view.vertex), stringView(view.fragment),
-                              stringView(view.source), stringView(view.destination), view.has_grid != 0, view.grid});
-        }
-        return result;
-    }
-
     Runtime *owner{};
     VernonRuntimeContext *runtime{};
     VernonPipelineBundle *bundle{};
@@ -697,6 +675,7 @@ NB_MODULE(_native, module) {
         .value("CUDA", VERNON_TARGET_CUDA)
         .value("VULKAN", VERNON_TARGET_VULKAN)
         .value("METAL", VERNON_TARGET_METAL)
+        .value("DIRECTX", VERNON_TARGET_DIRECTX)
         .value("OPENGL", VERNON_TARGET_OPENGL)
         .value("OPENGL_ES", VERNON_TARGET_OPENGL_ES);
     nb::enum_<VernonStatus>(module, "Status")
@@ -719,8 +698,8 @@ NB_MODULE(_native, module) {
     nb::class_<Compiler>(module, "Compiler")
         .def(nb::init<>())
         .def("compile_program_result", &compileProgramResult, nb::arg("mlir"), nb::arg("target"),
-             nb::arg("glsl_version") = 0, nb::arg("target_triple") = "", nb::arg("cpu") = "",
-             nb::arg("cpu_features") = "");
+             nb::arg("glsl_version") = 0, nb::arg("hlsl_shader_model") = 0, nb::arg("target_triple") = "",
+             nb::arg("cpu") = "", nb::arg("cpu_features") = "");
     nb::class_<CompiledProgram>(module, "CompiledProgram")
         .def_prop_ro("ok", &CompiledProgram::ok)
         .def_prop_ro("status", &CompiledProgram::status)
@@ -729,6 +708,7 @@ NB_MODULE(_native, module) {
         .def_prop_ro("reflection", &CompiledProgram::reflection)
         .def_prop_ro("target", [](const CompiledProgram &value) { return value.target; })
         .def_prop_ro("glsl_version", [](const CompiledProgram &value) { return value.glslVersion; })
+        .def_prop_ro("hlsl_shader_model", [](const CompiledProgram &value) { return value.hlslShaderModel; })
         .def_prop_ro("target_triple", [](const CompiledProgram &value) { return value.targetTriple; })
         .def_prop_ro("cpu", [](const CompiledProgram &value) { return value.cpu; })
         .def_prop_ro("cpu_features", [](const CompiledProgram &value) { return value.cpuFeatures; })
@@ -770,17 +750,6 @@ NB_MODULE(_native, module) {
         .def_prop_ro("access", [](const PipelineOutputMetadata &value) { return static_cast<uint32_t>(value.access); })
         .def_ro("shape", &PipelineOutputMetadata::shape)
         .def_ro("location", &PipelineOutputMetadata::location);
-    nb::class_<PipelineStepMetadata>(module, "PipelineStep")
-        .def_prop_ro("kind", [](const PipelineStepMetadata &value) { return static_cast<uint32_t>(value.kind); })
-        .def_ro("stage", &PipelineStepMetadata::stage)
-        .def_ro("vertex", &PipelineStepMetadata::vertex)
-        .def_ro("fragment", &PipelineStepMetadata::fragment)
-        .def_ro("source", &PipelineStepMetadata::source)
-        .def_ro("destination", &PipelineStepMetadata::destination)
-        .def_ro("has_grid", &PipelineStepMetadata::hasGrid)
-        .def_prop_ro("grid", [](const PipelineStepMetadata &value) {
-            return nb::make_tuple(value.grid.x, value.grid.y, value.grid.z);
-        });
     nb::class_<PipelineInvocationBuilder>(module, "PipelineInvocationBuilder")
         .def("host_tensor", &PipelineInvocationBuilder::hostTensor, nb::arg("parameter"), nb::arg("array"),
              nb::rv_policy::reference_internal)
@@ -810,8 +779,7 @@ NB_MODULE(_native, module) {
     nb::class_<LoadedPipeline>(module, "LoadedPipeline")
         .def("invocation_builder", &LoadedPipeline::invocationBuilder, nb::keep_alive<0, 1>())
         .def_prop_ro("parameters", &LoadedPipeline::parameters)
-        .def_prop_ro("outputs", &LoadedPipeline::outputs)
-        .def_prop_ro("steps", &LoadedPipeline::steps);
+        .def_prop_ro("outputs", &LoadedPipeline::outputs);
     module.attr("DATA_BOOL") = static_cast<uint32_t>(VERNON_DATA_BOOL);
     module.attr("DATA_I32") = static_cast<uint32_t>(VERNON_DATA_I32);
     module.attr("DATA_U32") = static_cast<uint32_t>(VERNON_DATA_U32);

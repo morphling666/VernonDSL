@@ -98,7 +98,7 @@ def reflected_parameters(
                 use["vernon.binding"] = int(row.get("index", 0))
             backend_name = _backend_name(name)
             if interface_name == "uniform":
-                if record.get("target") in {"opengl", "opengles", "metal"} and "vernon.binding" not in row:
+                if record.get("target") in {"opengl", "opengles", "metal", "directx"} and "vernon.binding" not in row:
                     use["uniform_name"] = backend_name
                 else:
                     use["uniform_name"] = f"{backend_name}._m0"

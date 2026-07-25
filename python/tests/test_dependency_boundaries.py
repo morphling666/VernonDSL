@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 import vernon_dsl as vd
-from vernon_dsl.shader_assets import cook_shader_pipeline, encode_runtime_stage, parse_python_pipeline_asset
+from vernon_dsl.pipeline_assets import cook_pipeline_asset, encode_runtime_stage, parse_python_pipeline_asset
 
 ROOT = Path(__file__).parents[1] / "vernon_dsl"
 
@@ -48,7 +48,7 @@ class DependencyBoundaryTests(unittest.TestCase):
             "vernon_dsl._shader_assets.parsing",
         )
         self.assertEqual(
-            cook_shader_pipeline.__module__,
+            cook_pipeline_asset.__module__,
             "vernon_dsl._shader_assets.cooking",
         )
 
