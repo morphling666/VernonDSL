@@ -33,12 +33,8 @@ class TargetOptions:
         if hlsl_shader_model is not None:
             if self.target != "directx":
                 raise PipelineCompileError("hlsl_shader_model is valid only for the DirectX target")
-            if (
-                not isinstance(hlsl_shader_model, int)
-                or isinstance(hlsl_shader_model, bool)
-                or hlsl_shader_model not in {30, 40, 41, 50, 51, 60}
-            ):
-                raise PipelineCompileError("hlsl_shader_model must be one of 30, 40, 41, 50, 51, or 60")
+            if not isinstance(hlsl_shader_model, int) or isinstance(hlsl_shader_model, bool) or hlsl_shader_model < 60:
+                raise PipelineCompileError("hlsl_shader_model must be Shader Model 6.0 or newer")
         cpu_option_names = ("target_triple", "cpu", "cpu_features")
         for name in cpu_option_names:
             value = options.get(name)
@@ -57,7 +53,7 @@ class TargetOptions:
                 name: self.options[name] for name in ("target_triple", "cpu", "cpu_features") if name in self.options
             }
         if self.target == "directx":
-            return {"hlsl_shader_model": self.options.get("hlsl_shader_model", 50)}
+            return {"hlsl_shader_model": self.options.get("hlsl_shader_model", 60)}
         return {}
 
 

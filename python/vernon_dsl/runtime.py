@@ -6,6 +6,7 @@ from ._runtime.resources import TensorLayout, TensorStorage, TensorView, Texture
 from ._runtime.session import (
     cpu,
     cuda,
+    directx,
     init,
     opengl,
     opengles,
@@ -23,6 +24,7 @@ __all__ = [
     "Texture",
     "cpu",
     "cuda",
+    "directx",
     "init",
     "lines",
     "opengl",

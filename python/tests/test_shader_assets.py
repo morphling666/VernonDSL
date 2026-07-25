@@ -405,7 +405,7 @@ asset = vd.pipeline_asset(
             "opengles": (("vertex", "fragment"), "gles", (".vert.gles", ".frag.gles")),
             "vulkan": (("vertex", "fragment"), "spirv", (".spv", ".spv")),
             "metal": (("vertex", "fragment"), "msl", (".vert.metal", ".frag.metal")),
-            "directx": (("vertex", "fragment"), "hlsl", (".vert.hlsl", ".frag.hlsl")),
+            "directx": (("vertex", "fragment"), "dxil", (".dxil", ".dxil")),
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -452,7 +452,7 @@ asset = vd.pipeline_asset(
                     ) -> SimpleNamespace:
                         nonlocal compile_index
                         self.assertEqual(native_target, _target)
-                        expected_options = {"hlsl_shader_model": 50} if _target == "directx" else {}
+                        expected_options = {"hlsl_shader_model": 60} if _target == "directx" else {}
                         self.assertEqual(options, expected_options)
                         stage = _stages[compile_index % len(_stages)]
                         compile_index += 1
@@ -462,7 +462,7 @@ asset = vd.pipeline_asset(
                             "ptx": ".ptx",
                             "spirv": ".spv",
                             "msl": ".metal",
-                            "hlsl": ".hlsl",
+                            "dxil": ".dxil",
                         }[_artifact_format]
                         filename = f"{stage}{extension}"
                         artifact = {
@@ -471,7 +471,7 @@ asset = vd.pipeline_asset(
                             "ptx": b".version 8.0\n.target sm_50\n.address_size 64\n",
                             "spirv": struct.pack("<II", 0x07230203, 0x00010300),
                             "msl": b"// metal artifact\n",
-                            "hlsl": b"// hlsl artifact\n",
+                            "dxil": b"DXBC",
                         }[_artifact_format]
                         artifact += stage.encode("ascii")
                         reflection = {
@@ -537,7 +537,7 @@ asset = vd.pipeline_asset(
                     self.assertEqual(document["target"], target)
                     self.assertEqual(
                         document["target_options"],
-                        {"hlsl_shader_model": 50} if target == "directx" else {},
+                        {"hlsl_shader_model": 60} if target == "directx" else {},
                     )
                     expected_requirements = {
                         "cuda": {
@@ -566,6 +566,14 @@ asset = vd.pipeline_asset(
                             "features": [],
                             "api_version": [1, 1],
                             "spirv_version": [1, 3],
+                        },
+                        "directx": {
+                            "backend": "directx",
+                            "features": [],
+                            "api_version": [12, 0],
+                            "minimum_feature_level": [11, 0],
+                            "shader_model": [6, 0],
+                            "root_signature_version": [1, 0],
                         },
                     }.get(target)
                     if expected_requirements is None:
@@ -728,7 +736,7 @@ asset = vd.pipeline_asset(
         )
         targets = {
             "metal": ("msl", ".metal", {}),
-            "directx": ("hlsl", ".hlsl", {"hlsl_shader_model": 60}),
+            "directx": ("dxil", ".dxil", {"hlsl_shader_model": 60}),
         }
         with tempfile.TemporaryDirectory() as directory:
             for source, name, stages in assets:
@@ -763,7 +771,10 @@ asset = vd.pipeline_asset(
                             self.assertTrue(artifact["path"].endswith(extension))
                             data = (output / artifact["path"]).read_bytes()
                             self.assertTrue(data)
-                            data.decode("utf-8")
+                            if artifact_format != "dxil":
+                                data.decode("utf-8")
+                            else:
+                                self.assertEqual(data[:4], b"DXBC")
 
     def test_vulkan_pipeline_bundle_embeds_verified_spirv(self) -> None:
         root = Path(__file__).parents[2]

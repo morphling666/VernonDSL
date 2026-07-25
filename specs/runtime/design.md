@@ -67,27 +67,41 @@ pipeline schema 2 with inline artifact descriptors; the cooker emits the same
 schema with external descriptors only. CPU execution uses native AOT bundles
 and remains compute-only because Vernon does not provide a software rasterizer.
 
-## Launch ownership
+## Target execution architecture
 
-Runtime contexts own one backend device/context. Buffers and loaded kernels
-retain their context in language bindings; the C API rejects context
-destruction while handles remain live. Transfers are synchronous and a launch
-retains all argument storage through synchronization.
+GPU execution is split into three independent targets:
 
-Backend dispatch is centralized in `runtime_dispatch`. `VernonRuntime.cpp`
-owns public validation and handle lifetime but never includes backend headers
-or reads concrete backend state. This keeps disabled CUDA/Vulkan translation
-units out of the build and prevents backend payload types from leaking into
-the C API shell.
+- `VernonRHI` is the hardware layer. Capability facets separate Compute,
+  Graphics, and NativeInterop; CUDA implements Compute only.
+- `VernonRuntimeCore` owns PipelineAsset parsing, reflection, binding plans, and
+  prepared-pipeline caches. It calls an opaque `RuntimeDeviceProvider` SPI and
+  does not depend on VernonRHI types.
+- `VernonRuntimeRHIAdapter` implements that SPI with VernonRHI. A foreign
+  engine may instead implement the SPI with its own RHI and depend only on
+  RuntimeCore.
+
+RuntimeCore never owns textures, framebuffers, render graphs, queues, or
+resource state. Provider-owned resource references are non-owning opaque
+handles with immutable metadata. The provider owns allocation, barriers,
+submission, completion, and transient descriptor/upload storage.
+
+Pipeline loading prepares layouts and immutable pipelines once. Invocation
+uses pre-resolved slots and prepared bindings; it must not parse manifests,
+perform name lookup, or create pipeline/layout objects on the hot path.
+
+The current context-owned backend API remains a migration implementation.
+Python standalone execution will create a VernonRHI device and use the same
+RuntimeCore/provider path rather than retaining a second backend encoder.
 
 ## Distribution and Engine ownership
 
-`VernonRuntime` is a standalone source project and CMake target. The Python
-wheel owns a private host Runtime used by `_native` and also carries the
-version-matched Runtime source closure for consumers that must compile it with
-their own toolchain. Vernon Engine builds that source as part of the Engine
-configuration. Host-wheel and Engine-built Runtime contexts, resources, and
-handles are separate and must never cross.
+Distribution exports `VernonRHI`, `VernonRuntimeCore`, and the optional
+`VernonRuntimeRHIAdapter` as separate targets. Vernon Engine and the Python
+wheel use all three. A foreign engine may use RuntimeCore with its own provider
+without adopting VernonRHI.
+
+RHI and provider handles are scoped to their creating device and must never
+cross devices or independently loaded Runtime/RHI copies.
 
 The deployable Runtime does not depend on LLVM, MLIR, GLFW, the CUDA Toolkit,
 or a statically linked Vulkan loader. Compiler and asset cooking remain host
@@ -146,9 +160,14 @@ normalization. CUDA's LLVM math pass is never used: Vulkan retains standard
 math operations for SPIR-V lowering, and Metal source is cross-compiled from
 the same SPIR-V module.
 
-Metal MSL and DirectX HLSL PipelineAssets are cook-only compiler products.
-They deliberately have no `VernonRuntimeBackend`; target inspection and bundle
-loading return unsupported until matching runtime backends are implemented.
+Metal MSL remains a cook-only compiler product. DirectX cooking emits
+Shader Model 6 DXIL containers and `VernonRuntime` exposes a Windows-only
+D3D12 backend. The backend owns its device, direct queue, command allocator,
+fence, buffers, textures, samplers, descriptor heaps, and offscreen render
+targets. Deployments load pre-cooked DXIL and do not load DXC. Synchronous
+submission keeps transient upload/readback and descriptor storage alive until
+the fence completes. Tests select WARP through an internal hook; normal device
+creation skips software adapters.
 
 ### Pipeline runtime requirements
 
@@ -157,8 +176,9 @@ object. Its target-discriminated values are derived from the emitted artifact:
 CPU target triple/object format/invocation ABI, GLSL profile and API version,
 SPIR-V version plus Vulkan 1.1 and compute workgroup limits, or PTX version,
 address size, and minimum compute capability. Required reflection features are
-stored once in sorted order. Metal and DirectX omit this field because they
-have no Runtime backend.
+stored once in sorted order. DirectX additionally records D3D12, minimum
+feature level, Shader Model, root-signature version, and compute workgroup
+limits. Metal omits this field because it has no Runtime backend.
 
 `target_options` records how compilation was requested; it is not a runtime
 capability contract. `runtime_requirements` records the minimum capabilities

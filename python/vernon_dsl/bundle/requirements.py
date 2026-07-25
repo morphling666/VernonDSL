@@ -82,7 +82,7 @@ def _ptx_requirements(stage: Any) -> tuple[tuple[int, int], tuple[int, int], int
 
 def runtime_requirements(target: str, stages: Iterable[Any]) -> dict[str, Any] | None:
     stage_values = tuple(stages)
-    if target not in {"cpu", "cuda", "vulkan", "opengl", "opengles"}:
+    if target not in {"cpu", "cuda", "vulkan", "opengl", "opengles", "directx"}:
         return None
     result: dict[str, Any] = {"backend": target, "features": _features(stage_values)}
     if target == "cpu":
@@ -115,6 +115,30 @@ def runtime_requirements(target: str, stages: Iterable[Any]) -> dict[str, Any] |
         ]
         result["api_version"] = [1, 1]
         result["spirv_version"] = list(version)
+        if workgroups:
+            result["compute_workgroup_size"] = [max(value[index] for value in workgroups) for index in range(3)]
+    elif target == "directx":
+        for stage in stage_values:
+            if len(stage.artifact.data) < 4 or stage.artifact.data[:4] != b"DXBC" or stage.artifact.format != "dxil":
+                from .types import PipelineCompileError
+
+                raise PipelineCompileError("DirectX runtime artifact is not a DXIL container")
+        shader_model = _single(
+            (stage.target.options.get("hlsl_shader_model", 60) for stage in stage_values), "HLSL Shader Models"
+        )
+        if not isinstance(shader_model, int) or shader_model < 60:
+            from .types import PipelineCompileError
+
+            raise PipelineCompileError("DirectX runtime requires Shader Model 6.0 or newer")
+        result["api_version"] = [12, 0]
+        result["minimum_feature_level"] = [11, 0]
+        result["shader_model"] = [shader_model // 10, shader_model % 10]
+        result["root_signature_version"] = [1, 0]
+        workgroups = [
+            tuple(stage.interface.get("workgroup_size", (1, 1, 1)))
+            for stage in stage_values
+            if stage.stage == "compute"
+        ]
         if workgroups:
             result["compute_workgroup_size"] = [max(value[index] for value in workgroups) for index in range(3)]
     else:

@@ -260,7 +260,22 @@ TEST(CompilerGraphicsOutput, PreservesInterfacesTexturesAndSwizzles) {
                          static_cast<int>(diagnostics.size), diagnostics.data);
         }
         ASSERT_TRUE(vernonCompileResultGetStatus(result) == VERNON_STATUS_OK);
-        const std::string output = artifacts(result);
+        std::string output;
+        if (target == VERNON_TARGET_DIRECTX) {
+            for (size_t index = 0; index < vernonCompileResultGetArtifactCount(result); ++index) {
+                const VernonStringView artifact = vernonCompileResultGetArtifactData(result, index);
+                ASSERT_GE(artifact.size, 4u);
+                ASSERT_EQ(std::memcmp(artifact.data, "DXBC", 4), 0);
+            }
+            const VernonStringView reflection = vernonCompileResultGetReflection(result);
+            output.assign(reflection.data, reflection.size);
+            for (std::string_view name : {"aPos", "cubeMap", "color", "bloom_color", "projection"})
+                ASSERT_TRUE(output.find(name) != std::string::npos);
+            vernonCompileResultDestroy(result);
+            continue;
+        } else {
+            output = artifacts(result);
+        }
         for (std::string_view name : {"aPos", "TexCoord", "cubeMap", "color", "bloom_color"}) {
             if (output.find(name) == std::string::npos) {
                 std::fprintf(stderr, "target %d missing %.*s\n", static_cast<int>(target),

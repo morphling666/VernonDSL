@@ -690,7 +690,8 @@ NB_MODULE(_native, module) {
         .value("CUDA", VERNON_RUNTIME_CUDA)
         .value("VULKAN", VERNON_RUNTIME_VULKAN)
         .value("OPENGL", VERNON_RUNTIME_OPENGL)
-        .value("OPENGL_ES", VERNON_RUNTIME_OPENGL_ES);
+        .value("OPENGL_ES", VERNON_RUNTIME_OPENGL_ES)
+        .value("DIRECTX12", VERNON_RUNTIME_DIRECTX12);
     nb::enum_<VernonPrimitiveTopology>(module, "PrimitiveTopology")
         .value("TRIANGLE_LIST", VERNON_TOPOLOGY_TRIANGLE_LIST)
         .value("LINE_LIST", VERNON_TOPOLOGY_LINE_LIST)

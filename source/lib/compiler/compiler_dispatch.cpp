@@ -3,6 +3,7 @@
 #include "compiler_artifacts.h"
 #include "compiler_cpu.h"
 #include "compiler_cuda.h"
+#include "compiler_dxc.h"
 #include "compiler_frontend.h"
 #include "compiler_spirv.h"
 #include "compiler_spirv_cross.h"
@@ -20,6 +21,10 @@ std::string copyStringView(VernonStringView value) {
 } // namespace
 
 VernonTargetCapabilities targetCapabilities(VernonTarget target) {
+#if !defined(VERNON_DXC_EXECUTABLE)
+    if (target == VERNON_TARGET_DIRECTX)
+        return VernonTargetCapabilities{0, 0, 0, 0};
+#endif
     if (target == VERNON_TARGET_CPU || target == VERNON_TARGET_VULKAN)
         return VernonTargetCapabilities{1, 1, 1, 0};
     if (target == VERNON_TARGET_CUDA)
@@ -56,15 +61,13 @@ VernonStatus parseCompileOptions(const VernonCompileOptions *source, VernonTarge
             : 0;
     if (requestedHlslShaderModel != 0)
         options.hlslShaderModel = requestedHlslShaderModel;
-    const bool validHlslShaderModel = options.hlslShaderModel == 30 || options.hlslShaderModel == 40 ||
-                                      options.hlslShaderModel == 41 || options.hlslShaderModel == 50 ||
-                                      options.hlslShaderModel == 51 || options.hlslShaderModel == 60;
+    const bool validHlslShaderModel = options.hlslShaderModel >= 60;
     if (requestedHlslShaderModel != 0 && target != VERNON_TARGET_DIRECTX) {
         diagnostics = "HLSL Shader Model is valid only for the DirectX target";
         return VERNON_STATUS_INVALID_ARGUMENT;
     }
     if (target == VERNON_TARGET_DIRECTX && !validHlslShaderModel) {
-        diagnostics = "HLSL Shader Model must be one of 30, 40, 41, 50, 51, or 60";
+        diagnostics = "DirectX runtime artifacts require HLSL Shader Model 6.0 or newer";
         return VERNON_STATUS_INVALID_ARGUMENT;
     }
     auto readCpuOption = [&](size_t offset, std::string &destination) {
@@ -115,6 +118,14 @@ VernonStatus compileTarget(CompilerFrontend &frontend, const char *source, size_
             !crossCompileSpirv(artifacts, diagnostics, target, options.glslVersion, options.hlslShaderModel)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
+        }
+        if (target == VERNON_TARGET_DIRECTX) {
+            std::vector<Artifact> dxilArtifacts;
+            if (!compileHlslToDxil(artifacts, options.hlslShaderModel, dxilArtifacts, diagnostics)) {
+                artifacts.clear();
+                return VERNON_STATUS_INTERNAL_ERROR;
+            }
+            artifacts = std::move(dxilArtifacts);
         }
         addArtifactTable(reflection, artifacts, target, options.glslVersion, {}, {}, {}, options.hlslShaderModel);
         return VERNON_STATUS_OK;

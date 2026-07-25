@@ -49,9 +49,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--hlsl-shader-model",
         type=int,
-        choices=(30, 40, 41, 50, 51, 60),
+        choices=(60,),
         metavar="MODEL",
-        help="HLSL Shader Model for directx only (default: 50), encoded as major*10+minor",
+        help="HLSL Shader Model for directx only (default: 60), encoded as major*10+minor",
     )
     parser.add_argument(
         "--target-triple",

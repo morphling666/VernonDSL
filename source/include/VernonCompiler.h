@@ -42,7 +42,7 @@ typedef struct VernonCompileOptions {
     uint32_t glsl_version;
     /*
      * HLSL Shader Model encoded as major * 10 + minor (for example 50 or 60).
-     * Zero selects Shader Model 5.0. Used only by the DirectX source target.
+     * Zero selects Shader Model 6.0. DirectX runtime artifacts require 6.0+.
      */
     uint32_t hlsl_shader_model;
     uint32_t reserved[5];

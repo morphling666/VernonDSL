@@ -58,11 +58,21 @@ if(VERNON_RUNTIME_PROFILE STREQUAL "desktop")
 endif()
 option(VERNON_ENABLE_CUDA_RUNTIME "Enable the CUDA Driver backend" ${_vernon_default_desktop_backend})
 option(VERNON_ENABLE_VULKAN_RUNTIME "Enable the Vulkan backend" ${_vernon_default_desktop_backend})
+if(WIN32)
+    option(VERNON_ENABLE_DIRECTX12_RUNTIME "Enable the DirectX 12 backend" ${_vernon_default_desktop_backend})
+else()
+    set(VERNON_ENABLE_DIRECTX12_RUNTIME
+        OFF
+        CACHE BOOL "Enable the DirectX 12 backend" FORCE)
+endif()
 if(VERNON_RUNTIME_PROFILE STREQUAL "web")
     set(VERNON_ENABLE_CUDA_RUNTIME
         OFF
         CACHE BOOL "" FORCE)
     set(VERNON_ENABLE_VULKAN_RUNTIME
+        OFF
+        CACHE BOOL "" FORCE)
+    set(VERNON_ENABLE_DIRECTX12_RUNTIME
         OFF
         CACHE BOOL "" FORCE)
 endif()

@@ -2,7 +2,13 @@
 
 #include "backend_cpu.h"
 #include "backend_opengl.h"
+#include "compute_launch_planner.h"
 #include "graphics_opengl_encoder.h"
+
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+#include "backend_directx12.h"
+#include "graphics_directx12_encoder.h"
+#endif
 
 #if defined(VERNON_HAS_CUDA_RUNTIME)
 #include "backend_cuda.h"
@@ -54,6 +60,13 @@ bool probeBackend(VernonRuntimeBackend backend, std::string &diagnostic) {
         diagnostic = "VernonRuntime was built without Vulkan support";
         return false;
 #endif
+    case VERNON_RUNTIME_DIRECTX12:
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+        return probeDirectX12(diagnostic);
+#else
+        diagnostic = "VernonRuntime was built without DirectX 12 support";
+        return false;
+#endif
     case VERNON_RUNTIME_OPENGL:
     case VERNON_RUNTIME_OPENGL_ES:
         diagnostic = "backend requires a host-owned external context";
@@ -80,6 +93,12 @@ bool initializeBackend(VernonRuntimeContext &context, uint32_t deviceIndex) {
 #else
         return false;
 #endif
+    case VERNON_RUNTIME_DIRECTX12:
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+        return initializeDirectX12Context(context, deviceIndex);
+#else
+        return false;
+#endif
     default:
         return false;
     }
@@ -101,6 +120,11 @@ void destroyBackend(VernonRuntimeContext &context) {
         destroyVulkanContext(context);
 #endif
         break;
+    case VERNON_RUNTIME_DIRECTX12:
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+        destroyDirectX12Context(context);
+#endif
+        break;
     default:
         break;
     }
@@ -114,11 +138,18 @@ void fillBackendCapabilities(const VernonRuntimeContext &context, VernonRuntimeC
         result.supports_storage_buffers = 1;
         return;
     }
-    if (context.backend == VERNON_RUNTIME_VULKAN) {
+    if (context.backend == VERNON_RUNTIME_VULKAN || context.backend == VERNON_RUNTIME_DIRECTX12) {
         result.supports_compute = 1;
         result.supports_storage_buffers = 1;
         result.supports_graphics = 1;
         result.graphics_draw_abi_version = 2;
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+        if (context.backend == VERNON_RUNTIME_DIRECTX12) {
+            const DirectX12ContextState &state = directX12State(context);
+            result.api_version_major = 12;
+            result.api_version_minor = 0;
+        }
+#endif
         return;
     }
     result.supports_graphics = 1;
@@ -212,6 +243,49 @@ bool validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeReq
         return true;
 #endif
     }
+    if (context.backend == VERNON_RUNTIME_DIRECTX12) {
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+        const DirectX12ContextState &actual = directX12State(context);
+        const uint32_t featureLevel = static_cast<uint32_t>(actual.featureLevel);
+        const uint32_t requiredFeatureLevel =
+            requirements.minimumFeatureLevel.major * 0x1000 + requirements.minimumFeatureLevel.minor * 0x100;
+        if (featureLevel < requiredFeatureLevel) {
+            context.error =
+                "pipeline requires D3D feature level " + std::to_string(requirements.minimumFeatureLevel.major) + "." +
+                std::to_string(requirements.minimumFeatureLevel.minor) + ", device provides " +
+                std::to_string((featureLevel >> 12) & 0xf) + "." + std::to_string((featureLevel >> 8) & 0xf);
+            return false;
+        }
+        const uint32_t actualShaderModel = static_cast<uint32_t>(actual.shaderModel);
+        const uint32_t requiredShaderModel = requirements.shaderVersion.major * 0x10 + requirements.shaderVersion.minor;
+        if (actualShaderModel < requiredShaderModel) {
+            context.error = "pipeline requires Shader Model " + std::to_string(requirements.shaderVersion.major) + "." +
+                            std::to_string(requirements.shaderVersion.minor) + ", device provides " +
+                            std::to_string((actualShaderModel >> 4) & 0xf) + "." +
+                            std::to_string(actualShaderModel & 0xf);
+            return false;
+        }
+        const uint32_t requiredRootSignature =
+            requirements.rootSignatureVersion.major == 1 ? 1 + requirements.rootSignatureVersion.minor : UINT32_MAX;
+        if (static_cast<uint32_t>(actual.rootSignatureVersion) < requiredRootSignature) {
+            context.error = "pipeline requires a newer D3D12 root-signature version";
+            return false;
+        }
+        uint64_t invocations = 1;
+        for (size_t index = 0; index < 3; ++index) {
+            if (requirements.computeWorkgroupSize[index] > actual.maxComputeWorkGroupSize[index]) {
+                context.error = "pipeline compute workgroup dimension exceeds D3D12 device limits";
+                return false;
+            }
+            invocations *= requirements.computeWorkgroupSize[index];
+        }
+        if (invocations > actual.maxComputeInvocations) {
+            context.error = "pipeline compute workgroup exceeds D3D12 thread-group limit";
+            return false;
+        }
+        return true;
+#endif
+    }
     if (context.backend == VERNON_RUNTIME_CUDA) {
 #if defined(VERNON_HAS_CUDA_RUNTIME)
         const CudaContextState &actual = cudaState(context);
@@ -256,6 +330,12 @@ bool createBackendBuffer(VernonDeviceBuffer &buffer) {
 #else
         return false;
 #endif
+    case VERNON_RUNTIME_DIRECTX12:
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+        return createDirectX12Buffer(buffer);
+#else
+        return false;
+#endif
     default:
         return false;
     }
@@ -280,6 +360,11 @@ VernonStatus destroyBackendBuffer(VernonDeviceBuffer &buffer) {
         destroyVulkanBuffer(buffer);
 #endif
         break;
+    case VERNON_RUNTIME_DIRECTX12:
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+        destroyDirectX12Buffer(buffer);
+#endif
+        break;
     default:
         break;
     }
@@ -302,6 +387,12 @@ VernonStatus copyToBackendBuffer(VernonDeviceBuffer &buffer, size_t offset, cons
     case VERNON_RUNTIME_VULKAN:
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
         return copyToVulkanBuffer(buffer, offset, source, size);
+#else
+        break;
+#endif
+    case VERNON_RUNTIME_DIRECTX12:
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+        return copyToDirectX12Buffer(buffer, offset, source, size);
 #else
         break;
 #endif
@@ -330,6 +421,12 @@ VernonStatus copyFromBackendBuffer(const VernonDeviceBuffer &buffer, size_t offs
 #else
         break;
 #endif
+    case VERNON_RUNTIME_DIRECTX12:
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+        return copyFromDirectX12Buffer(buffer, offset, destination, size);
+#else
+        break;
+#endif
     default:
         break;
     }
@@ -343,6 +440,10 @@ bool createBackendTexture(VernonDeviceTexture &texture) {
     if (texture.context->backend == VERNON_RUNTIME_VULKAN)
         return createVulkanTexture(texture);
 #endif
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+    if (texture.context->backend == VERNON_RUNTIME_DIRECTX12)
+        return createDirectX12Texture(texture);
+#endif
     return false;
 }
 
@@ -355,6 +456,10 @@ void destroyBackendTexture(VernonDeviceTexture &texture) {
     else if (texture.context->backend == VERNON_RUNTIME_VULKAN)
         destroyVulkanTexture(texture);
 #endif
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+    else if (texture.context->backend == VERNON_RUNTIME_DIRECTX12)
+        destroyDirectX12Texture(texture);
+#endif
 }
 
 VernonStatus copyToBackendTexture(VernonDeviceTexture &texture, const void *source, size_t size) {
@@ -363,6 +468,10 @@ VernonStatus copyToBackendTexture(VernonDeviceTexture &texture, const void *sour
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     if (texture.context->backend == VERNON_RUNTIME_VULKAN)
         return copyToVulkanTexture(texture, source, size);
+#endif
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+    if (texture.context->backend == VERNON_RUNTIME_DIRECTX12)
+        return copyToDirectX12Texture(texture, source, size);
 #endif
     return VERNON_STATUS_UNSUPPORTED_TARGET;
 }
@@ -374,6 +483,10 @@ VernonStatus copyFromBackendTexture(const VernonDeviceTexture &texture, void *de
     if (texture.context->backend == VERNON_RUNTIME_VULKAN)
         return copyFromVulkanTexture(texture, destination, size);
 #endif
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+    if (texture.context->backend == VERNON_RUNTIME_DIRECTX12)
+        return copyFromDirectX12Texture(texture, destination, size);
+#endif
     return VERNON_STATUS_UNSUPPORTED_TARGET;
 }
 
@@ -383,6 +496,10 @@ bool createBackendSampler(VernonDeviceSampler &sampler) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     if (sampler.context->backend == VERNON_RUNTIME_VULKAN)
         return createVulkanSampler(sampler);
+#endif
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+    if (sampler.context->backend == VERNON_RUNTIME_DIRECTX12)
+        return createDirectX12Sampler(sampler);
 #endif
     return false;
 }
@@ -395,6 +512,10 @@ void destroyBackendSampler(VernonDeviceSampler &sampler) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     else if (sampler.context->backend == VERNON_RUNTIME_VULKAN)
         destroyVulkanSampler(sampler);
+#endif
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+    else if (sampler.context->backend == VERNON_RUNTIME_DIRECTX12)
+        destroyDirectX12Sampler(sampler);
 #endif
 }
 
@@ -487,6 +608,17 @@ VernonLoadedKernel *loadBackendArtifact(VernonRuntimeContext &context, const voi
 #else
         return nullptr;
 #endif
+    } else if (context.backend == VERNON_RUNTIME_DIRECTX12) {
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+        installRuntimeBackendState(*kernel, new DirectX12KernelState());
+        if (!loadDirectX12Kernel(context, artifact, artifactSize, reflection, reflectionSize, entry, entrySize,
+                                 runtimeBackendState<DirectX12KernelState>(*kernel), kernel->reflection)) {
+            destroyRuntimeBackendState(*kernel);
+            return nullptr;
+        }
+#else
+        return nullptr;
+#endif
     } else {
         return nullptr;
     }
@@ -508,6 +640,10 @@ VernonStatus unloadBackendKernel(VernonLoadedKernel &kernel) {
     else if (kernel.context->backend == VERNON_RUNTIME_VULKAN)
         destroyVulkanKernel(*kernel.context, runtimeBackendState<VulkanKernelState>(kernel));
 #endif
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+    else if (kernel.context->backend == VERNON_RUNTIME_DIRECTX12)
+        destroyDirectX12Kernel(*kernel.context, runtimeBackendState<DirectX12KernelState>(kernel));
+#endif
     destroyRuntimeBackendState(kernel);
     return VERNON_STATUS_OK;
 }
@@ -526,6 +662,11 @@ VernonStatus launchBackendKernel(VernonLoadedKernel &kernel, VernonLaunchSize gl
     if (kernel.context->backend == VERNON_RUNTIME_VULKAN)
         return launchVulkanKernel(*kernel.context, runtimeBackendState<VulkanKernelState>(kernel), kernel.reflection,
                                   globalSize, arguments, argumentCount);
+#endif
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+    if (kernel.context->backend == VERNON_RUNTIME_DIRECTX12)
+        return launchDirectX12Kernel(*kernel.context, runtimeBackendState<DirectX12KernelState>(kernel),
+                                     kernel.reflection, globalSize, arguments, argumentCount);
 #endif
     if (kernel.context->backend == VERNON_RUNTIME_CPU)
         return launchCpuKernel(*kernel.context, runtimeBackendState<CpuKernelState>(kernel), kernel.reflection,
@@ -546,6 +687,12 @@ VernonLoadedKernel *backendPipelineComputeKernel(VernonLoadedPipeline &pipeline)
     case VERNON_RUNTIME_VULKAN:
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
         return runtimeBackendState<VulkanPipelineState>(pipeline).computeKernel;
+#else
+        return nullptr;
+#endif
+    case VERNON_RUNTIME_DIRECTX12:
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+        return runtimeBackendState<DirectX12PipelineState>(pipeline).kernel;
 #else
         return nullptr;
 #endif
@@ -622,6 +769,34 @@ bool resolveBackendPipeline(VernonPipelineBundle &bundle, const Variant &variant
         return false;
 #endif
     }
+    if (bundle.context->backend == VERNON_RUNTIME_DIRECTX12) {
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+        auto *pipelineState = new DirectX12PipelineState();
+        if (!variant.compute.empty()) {
+            auto *state = new DirectX12KernelState();
+            const Stage &stage = bundle.stages.at(variant.compute);
+            auto kernel = std::make_unique<VernonLoadedKernel>();
+            kernel->context = bundle.context;
+            installRuntimeBackendState(*kernel, state);
+            if (!loadDirectX12Kernel(*bundle.context, stage.binary.data(), stage.binary.size(), stage.reflection.data(),
+                                     stage.reflection.size(), stage.entry.data(), stage.entry.size(), *state,
+                                     kernel->reflection)) {
+                destroyRuntimeBackendState(*kernel);
+                delete pipelineState;
+                return false;
+            }
+            ++bundle.context->liveKernels;
+            pipelineState->kernel = kernel.release();
+        } else {
+            pipelineState->vertexDxil = bundle.stages.at(variant.vertex).binary;
+            pipelineState->fragmentDxil = bundle.stages.at(variant.fragment).binary;
+        }
+        installRuntimeBackendState(pipeline, pipelineState);
+        return true;
+#else
+        return false;
+#endif
+    }
     auto *state = new OpenGLPipelineState();
     if (!createOpenGLPipeline(*bundle.context, variant, bundle.stages, state->computeProgram, state->graphicsProgram,
                               state->vertexArray, state->framebuffer, state->workgroup)) {
@@ -636,6 +811,17 @@ void destroyBackendPipeline(VernonLoadedPipeline &pipeline) {
     if (pipeline.context->backend == VERNON_RUNTIME_CPU || pipeline.context->backend == VERNON_RUNTIME_CUDA) {
         if (VernonLoadedKernel *kernel = backendPipelineComputeKernel(pipeline))
             vernonRuntimeKernelUnload(kernel);
+    } else if (pipeline.context->backend == VERNON_RUNTIME_DIRECTX12) {
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+        DirectX12PipelineState &state = runtimeBackendState<DirectX12PipelineState>(pipeline);
+        if (auto *kernel = state.kernel)
+            vernonRuntimeKernelUnload(kernel);
+        for (auto &[key, graphicsPipeline] : state.graphicsPipelines) {
+            (void)key;
+            graphicsPipeline->Release();
+        }
+        state.graphicsPipelines.clear();
+#endif
     } else if (pipeline.context->backend == VERNON_RUNTIME_VULKAN) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
         VulkanPipelineState &state = runtimeBackendState<VulkanPipelineState>(pipeline);
@@ -674,6 +860,20 @@ VernonStatus invokeBackendPipeline(VernonLoadedPipeline &pipeline, const VernonP
         return VERNON_STATUS_UNSUPPORTED_TARGET;
 #endif
     }
+    if (pipeline.context->backend == VERNON_RUNTIME_DIRECTX12) {
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+        DirectX12PipelineState &state = runtimeBackendState<DirectX12PipelineState>(pipeline);
+        if (!state.vertexDxil.empty()) {
+            std::string error;
+            const VernonStatus status =
+                encodeAndSubmitDirectX12Graphics(*pipeline.context, state, pipeline.variant, invocation, plan, error);
+            return status == VERNON_STATUS_OK ? status : fail(*pipeline.context, error, status);
+        }
+        return VERNON_STATUS_OK;
+#else
+        return VERNON_STATUS_UNSUPPORTED_TARGET;
+#endif
+    }
     OpenGLPipelineState &state = runtimeBackendState<OpenGLPipelineState>(pipeline);
     if (!state.graphicsProgram)
         return VERNON_STATUS_OK;
@@ -686,6 +886,25 @@ VernonStatus invokeBackendPipeline(VernonLoadedPipeline &pipeline, const VernonP
 
 VernonStatus invokeBackendComputePipeline(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
                                           const PlannedGraphicsInvocation &plan) {
+    if (pipeline.context->backend == VERNON_RUNTIME_DIRECTX12) {
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+        ComputeArgumentMap arguments;
+        for (const auto &[slot, argument] : plan.arguments)
+            arguments.emplace(slot, argument);
+        PlannedComputeLaunch launch;
+        const ComputePlannerCallbacks callbacks{nullptr,
+                                                [](const void *, const VernonDeviceBuffer *buffer) -> const void * {
+                                                    return buffer ? buffer->context : nullptr;
+                                                }};
+        std::string error;
+        if (!planComputeLaunch(pipeline.variant, arguments, invocation, pipeline.context, callbacks, launch, error))
+            return fail(*pipeline.context, error);
+        return vernonRuntimeLaunch(runtimeBackendState<DirectX12PipelineState>(pipeline).kernel, launch.grid,
+                                   launch.arguments.data(), launch.arguments.size());
+#else
+        return VERNON_STATUS_UNSUPPORTED_TARGET;
+#endif
+    }
     if (!isOpenGLBackend(pipeline.context->backend))
         return VERNON_STATUS_UNSUPPORTED_TARGET;
     OpenGLPipelineState &state = runtimeBackendState<OpenGLPipelineState>(pipeline);
@@ -718,6 +937,12 @@ VernonStatus synchronizeBackend(VernonRuntimeContext &context) {
 #else
         return VERNON_STATUS_UNSUPPORTED_TARGET;
 #endif
+    case VERNON_RUNTIME_DIRECTX12:
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+        return synchronizeDirectX12(context);
+#else
+        return VERNON_STATUS_UNSUPPORTED_TARGET;
+#endif
     case VERNON_RUNTIME_OPENGL:
     case VERNON_RUNTIME_OPENGL_ES:
         return synchronizeOpenGL(context);
@@ -743,6 +968,16 @@ VulkanGraphicsCacheStats getVulkanGraphicsCacheStats(const VernonRuntimeContext 
     (void)pipeline;
 #endif
     return result;
+}
+
+size_t getDirectX12GraphicsPipelineCreationCount(const VernonLoadedPipeline *pipeline) {
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+    if (pipeline && pipeline->context && pipeline->context->backend == VERNON_RUNTIME_DIRECTX12)
+        return runtimeBackendState<DirectX12PipelineState>(*pipeline).graphicsPipelineCreations;
+#else
+    (void)pipeline;
+#endif
+    return 0;
 }
 #endif
 

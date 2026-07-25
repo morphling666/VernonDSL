@@ -81,7 +81,9 @@ VernonRuntimeCapabilities vernonRuntimeGetCapabilities(VernonRuntimeBackend back
     if (backend == VERNON_RUNTIME_CPU && result.available) {
         result.supports_compute = 1;
         result.supports_storage_buffers = 1;
-    } else if ((backend == VERNON_RUNTIME_CUDA || backend == VERNON_RUNTIME_VULKAN) && result.available) {
+    } else if ((backend == VERNON_RUNTIME_CUDA || backend == VERNON_RUNTIME_VULKAN ||
+                backend == VERNON_RUNTIME_DIRECTX12) &&
+               result.available) {
         result.supports_compute = result.available;
         result.supports_storage_buffers = result.available;
     } else if (backend == VERNON_RUNTIME_OPENGL || backend == VERNON_RUNTIME_OPENGL_ES) {
@@ -154,8 +156,8 @@ VernonRuntimeCapabilities vernonRuntimeGetContextCapabilities(const VernonRuntim
 VernonDeviceBuffer *vernonRuntimeBufferAllocate(VernonRuntimeContext *context, size_t size, size_t alignment) {
     if (!context ||
         (context->backend != VERNON_RUNTIME_CPU && context->backend != VERNON_RUNTIME_CUDA &&
-         context->backend != VERNON_RUNTIME_VULKAN && context->backend != VERNON_RUNTIME_OPENGL &&
-         context->backend != VERNON_RUNTIME_OPENGL_ES) ||
+         context->backend != VERNON_RUNTIME_VULKAN && context->backend != VERNON_RUNTIME_DIRECTX12 &&
+         context->backend != VERNON_RUNTIME_OPENGL && context->backend != VERNON_RUNTIME_OPENGL_ES) ||
         !size || !alignment || (alignment & (alignment - 1))) {
         fail(context, "invalid compute buffer allocation");
         return nullptr;
@@ -227,8 +229,8 @@ VernonDeviceTexture *vernonRuntimeTextureCreate(VernonRuntimeContext *context,
         ++context->liveTextures;
         return texture.release();
     }
-    if (context->backend != VERNON_RUNTIME_VULKAN) {
-        fail(context, "owned sampled textures require the Vulkan backend", VERNON_STATUS_UNSUPPORTED_TARGET);
+    if (context->backend != VERNON_RUNTIME_VULKAN && context->backend != VERNON_RUNTIME_DIRECTX12) {
+        fail(context, "owned sampled textures require Vulkan or DirectX 12", VERNON_STATUS_UNSUPPORTED_TARGET);
         return nullptr;
     }
     if (descriptor->dimension > VERNON_TEXTURE_CUBE ||
@@ -310,8 +312,8 @@ VernonDeviceSampler *vernonRuntimeSamplerCreate(VernonRuntimeContext *context,
         ++context->liveSamplers;
         return sampler.release();
     }
-    if (context->backend != VERNON_RUNTIME_VULKAN) {
-        fail(context, "owned sampler creation requires Vulkan; import an OpenGL sampler",
+    if (context->backend != VERNON_RUNTIME_VULKAN && context->backend != VERNON_RUNTIME_DIRECTX12) {
+        fail(context, "owned sampler creation requires Vulkan or DirectX 12; import an OpenGL sampler",
              VERNON_STATUS_UNSUPPORTED_TARGET);
         return nullptr;
     }
@@ -470,6 +472,8 @@ VernonStatus vernonRuntimePipelineBundleInspectTarget(const void *bundleData, si
             *target = VERNON_RUNTIME_OPENGL;
         else if (name == "opengles")
             *target = VERNON_RUNTIME_OPENGL_ES;
+        else if (name == "directx")
+            *target = VERNON_RUNTIME_DIRECTX12;
         else
             return VERNON_STATUS_UNSUPPORTED_TARGET;
         return VERNON_STATUS_OK;
@@ -489,7 +493,7 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
     if (!context ||
         (context->backend != VERNON_RUNTIME_CPU && context->backend != VERNON_RUNTIME_OPENGL &&
          context->backend != VERNON_RUNTIME_OPENGL_ES && context->backend != VERNON_RUNTIME_VULKAN &&
-         context->backend != VERNON_RUNTIME_CUDA) ||
+         context->backend != VERNON_RUNTIME_CUDA && context->backend != VERNON_RUNTIME_DIRECTX12) ||
         !bundleData || !bundleSize || (options && options->struct_size < sizeof(VernonPipelineBundleLoadOptions)))
         return nullptr;
     try {
@@ -498,10 +502,11 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
             bundleDirectory = std::filesystem::u8path(options->bundle_directory);
         const nlohmann::json root = nlohmann::json::parse(static_cast<const char *>(bundleData),
                                                           static_cast<const char *>(bundleData) + bundleSize);
-        const char *expectedTarget = context->backend == VERNON_RUNTIME_CPU    ? "cpu"
-                                     : context->backend == VERNON_RUNTIME_CUDA ? "cuda"
-                                     : context->backend == VERNON_RUNTIME_VULKAN
-                                         ? "vulkan"
+        const char *expectedTarget = context->backend == VERNON_RUNTIME_CPU      ? "cpu"
+                                     : context->backend == VERNON_RUNTIME_CUDA   ? "cuda"
+                                     : context->backend == VERNON_RUNTIME_VULKAN ? "vulkan"
+                                     : context->backend == VERNON_RUNTIME_DIRECTX12
+                                         ? "directx"
                                          : (context->backend == VERNON_RUNTIME_OPENGL_ES ? "opengles" : "opengl");
         const bool schema2 =
             root.is_object() && root.value("schema_version", 0) == 2 && root.value("type", "") == "pipeline";
@@ -564,6 +569,7 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                     return nullptr;
                 const char *expectedFormat = context->backend == VERNON_RUNTIME_CUDA        ? "ptx"
                                              : context->backend == VERNON_RUNTIME_VULKAN    ? "spirv"
+                                             : context->backend == VERNON_RUNTIME_DIRECTX12 ? "dxil"
                                              : context->backend == VERNON_RUNTIME_OPENGL_ES ? "gles"
                                                                                             : "glsl";
                 const std::string encoding = value["artifact"].value("encoding", "");
@@ -572,9 +578,15 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                     (artifact.format == "native_library" || artifact.format == "relocatable_object");
                 const bool validFormat =
                     context->backend == VERNON_RUNTIME_CPU ? validCpuFormat : artifact.format == expectedFormat;
+                if (context->backend == VERNON_RUNTIME_DIRECTX12 && artifact.format == "hlsl") {
+                    fail(context, "legacy DirectX HLSL bundles are unsupported; re-cook the pipeline to DXIL",
+                         VERNON_STATUS_UNSUPPORTED_TARGET);
+                    return nullptr;
+                }
                 if (!validFormat || (artifact.external && value["artifact"].contains("encoding")) ||
-                    (!artifact.external && ((artifact.format == "spirv" && encoding != "base64") ||
-                                            (artifact.format != "spirv" && encoding != "utf8"))) ||
+                    (!artifact.external &&
+                     (((artifact.format == "spirv" || artifact.format == "dxil") && encoding != "base64") ||
+                      (artifact.format != "spirv" && artifact.format != "dxil" && encoding != "utf8"))) ||
                     value.value("target", "") != expectedTarget) {
                     fail(context, "pipeline stage artifact format is invalid for target");
                     return nullptr;
@@ -611,13 +623,13 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                     return nullptr;
                 stage.cpuArtifact = std::move(artifact);
             }
-            if (schema2 && context->backend == VERNON_RUNTIME_VULKAN)
+            if (schema2 && (context->backend == VERNON_RUNTIME_VULKAN || context->backend == VERNON_RUNTIME_DIRECTX12))
                 stage.binary = std::move(resolved->bytes);
             else if (schema2 && context->backend != VERNON_RUNTIME_CPU)
                 stage.source.assign(resolved->bytes.begin(), resolved->bytes.end());
             const bool hasArtifact =
                 context->backend == VERNON_RUNTIME_CPU ? stage.cpuArtifact.has_value()
-                : context->backend == VERNON_RUNTIME_VULKAN
+                : (context->backend == VERNON_RUNTIME_VULKAN || context->backend == VERNON_RUNTIME_DIRECTX12)
                     ? !stage.binary.empty() && stage.binary.size() % sizeof(uint32_t) == 0 && !stage.reflection.empty()
                 : context->backend == VERNON_RUNTIME_CUDA ? (schema2 || value.value("format", "") == "ptx") &&
                                                                 !stage.source.empty() && !stage.reflection.empty()

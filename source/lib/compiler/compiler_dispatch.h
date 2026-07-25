@@ -14,7 +14,7 @@ class CompilerFrontend;
 
 struct CompileOptions {
     uint32_t glslVersion{};
-    uint32_t hlslShaderModel{50};
+    uint32_t hlslShaderModel{60};
     CpuCodegenOptions cpu;
 };
 

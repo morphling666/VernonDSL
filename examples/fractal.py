@@ -53,9 +53,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Render the VernonDSL Julia set")
     parser.add_argument(
         "--arch",
-        choices=("cpu", "cuda", "vulkan", "opengl", "opengles"),
+        choices=("cpu", "cuda", "vulkan", "directx", "opengl", "opengles"),
         default="cuda",
-        help=("execution backend; OpenGL profiles require a host to register an external context first"),
+        help=("execution backend; OpenGL profiles require a host context; DirectX requires Windows"),
     )
     parser.add_argument("--time", type=float, default=0.0)
     parser.add_argument("--frames", type=int, default=1_000_000)
@@ -77,6 +77,7 @@ def main() -> None:
         "cpu": vd.cpu,
         "cuda": vd.cuda,
         "vulkan": vd.vulkan,
+        "directx": vd.directx,
         "opengl": vd.opengl,
         "opengles": vd.opengles,
     }

@@ -153,7 +153,7 @@ class PipelineCompileTests(unittest.TestCase):
             TargetOptions("cpu", {"cpu": "generic", "cpu_features": "+sse2"}).native_options,
             {"cpu": "generic", "cpu_features": "+sse2"},
         )
-        self.assertEqual(TargetOptions("directx").native_options, {"hlsl_shader_model": 50})
+        self.assertEqual(TargetOptions("directx").native_options, {"hlsl_shader_model": 60})
         self.assertEqual(
             TargetOptions("directx", {"hlsl_shader_model": 60}).native_options,
             {"hlsl_shader_model": 60},
@@ -163,7 +163,7 @@ class PipelineCompileTests(unittest.TestCase):
             TargetOptions("vulkan", {"cpu": "generic"})
         with self.assertRaisesRegex(PipelineCompileError, "valid only for the DirectX target"):
             TargetOptions("metal", {"hlsl_shader_model": 50})
-        with self.assertRaisesRegex(PipelineCompileError, "must be one of"):
+        with self.assertRaisesRegex(PipelineCompileError, "Shader Model 6.0 or newer"):
             TargetOptions("directx", {"hlsl_shader_model": 55})
 
     def test_generated_sampler_and_resolution_are_internal(self) -> None:

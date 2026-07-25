@@ -66,6 +66,8 @@ struct RuntimeRequirements {
     std::vector<std::string> features;
     RuntimeVersion apiVersion;
     RuntimeVersion shaderVersion;
+    RuntimeVersion minimumFeatureLevel;
+    RuntimeVersion rootSignatureVersion;
     RuntimeVersion minimumComputeCapability;
     uint32_t computeWorkgroupSize[3]{1, 1, 1};
     uint32_t glslVersion{};

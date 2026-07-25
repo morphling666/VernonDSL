@@ -48,6 +48,8 @@ llvm::StringRef artifactFormat(llvm::StringRef filename) {
         return "msl";
     if (extension == ".hlsl")
         return "hlsl";
+    if (extension == ".dxil")
+        return "dxil";
     if (extension == ".ptx")
         return "ptx";
     if (extension == ".ll")

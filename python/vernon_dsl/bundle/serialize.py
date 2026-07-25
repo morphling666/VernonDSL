@@ -26,7 +26,7 @@ def with_content_hash(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def inline_artifact_descriptor(artifact: CompiledArtifact) -> dict[str, Any]:
-    encoding = "base64" if artifact.format == "spirv" else "utf8"
+    encoding = "base64" if artifact.format in {"spirv", "dxil"} else "utf8"
     try:
         data = (
             base64.b64encode(artifact.data).decode("ascii") if encoding == "base64" else artifact.data.decode("utf-8")

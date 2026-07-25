@@ -48,6 +48,14 @@ TEST(PipelineManifestRequirements, ParsesEveryRuntimeBackendShape) {
           {"ptx_version", nlohmann::json::array({8, 0})},
           {"minimum_compute_capability", nlohmann::json::array({5, 0})},
           {"address_size", 64}}},
+        {"directx",
+         {{"backend", "directx"},
+          {"features", nlohmann::json::array({"compute", "tensor_views"})},
+          {"api_version", nlohmann::json::array({12, 0})},
+          {"minimum_feature_level", nlohmann::json::array({11, 0})},
+          {"shader_model", nlohmann::json::array({6, 0})},
+          {"root_signature_version", nlohmann::json::array({1, 0})},
+          {"compute_workgroup_size", nlohmann::json::array({8, 1, 1})}}},
     };
     for (const auto &[target, value] : cases) {
         RuntimeRequirements requirements;

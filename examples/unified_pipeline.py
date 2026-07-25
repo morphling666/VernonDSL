@@ -44,9 +44,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run separate VernonDSL compute and graphics programs.")
     parser.add_argument(
         "--arch",
-        choices=("opengl", "opengles", "vulkan"),
+        choices=("opengl", "opengles", "vulkan", "directx"),
         default="vulkan",
-        help="graphics backend; OpenGL uses a hidden packaged GLFW context",
+        help="graphics backend; OpenGL uses a hidden packaged GLFW context; DirectX requires Windows",
     )
     parser.add_argument("--size", type=int, default=256)
     parser.add_argument(
@@ -69,6 +69,7 @@ def main() -> None:
         "opengl": vd.opengl,
         "opengles": vd.opengles,
         "vulkan": vd.vulkan,
+        "directx": vd.directx,
     }[args.arch]
     vd.init(
         arch=architecture,

@@ -280,12 +280,13 @@ class Kernel:
             "cpu": state._native.Target.CPU,
             "cuda": state._native.Target.CUDA,
             "vulkan": state._native.Target.VULKAN,
+            "directx": state._native.Target.DIRECTX,
             "metal": state._native.Target.METAL,
             "opengl": state._native.Target.OPENGL,
             "opengles": state._native.Target.OPENGL_ES,
         }
         if target not in targets:
-            raise ValueError("target must be cpu, cuda, vulkan, metal, opengl, or opengles")
+            raise ValueError("target must be cpu, cuda, vulkan, directx, metal, opengl, or opengles")
         frontend, _, _, _ = self._lower(arguments)
         options = TargetOptions(
             target,
@@ -308,6 +309,7 @@ class Kernel:
                 state.cpu: state._native.Target.CPU,
                 state.cuda: state._native.Target.CUDA,
                 state.vulkan: state._native.Target.VULKAN,
+                state.directx: state._native.Target.DIRECTX,
                 state.opengl: state._native.Target.OPENGL,
                 state.opengles: state._native.Target.OPENGL_ES,
             }.get(state._architecture)

@@ -229,9 +229,9 @@ Dimension is required; manifests may additionally provide canonical
 A target is reported as available only after its complete lowering and
 artifact generation pipeline is registered. An IR-only prototype must return
 `VERNON_STATUS_UNSUPPORTED_TARGET`. Source artifacts are valid terminal
-compiler products: Metal availability means MSL generation works, and DirectX
-availability means HLSL generation works; neither implies a Vernon runtime
-backend or a platform-native binary such as DXIL.
+compiler products: Metal availability means MSL generation works. DirectX
+availability means SPIRV-Cross HLSL generation and pinned DXC compilation both
+work, producing a validated DXIL container.
 
 ## CPU resource ABI
 
@@ -274,8 +274,7 @@ Graphics DSL -> Vernon graphics IR -> SPIR-V
                                   |-> Vulkan consumes SPIR-V directly
                                   |-> SPIRV-Cross -> GLSL for OpenGL/OpenGL ES
                                   |-> SPIRV-Cross -> MSL for Metal
-                                  `-> SPIRV-Cross -> HLSL for DirectX
-                                                            `-> future DXC -> DXIL
+                                  `-> SPIRV-Cross -> HLSL -> DXC -> DXIL for DirectX
 
 Compute DSL -> MLIR GPU dialect
                             |-> SPIR-V for Vulkan compute
@@ -292,9 +291,12 @@ specific version through the stable C API or CLI. Other targets reject this
 option rather than silently ignoring it.
 
 HLSL Shader Model is likewise a compile option and is valid only for DirectX.
-The stable C API and cooker encode it as major times ten plus minor (`50` for
-Shader Model 5.0), defaulting to `50`. It participates in artifact identity and
-is recorded in compiler reflection and PipelineAsset `target_options`.
+The stable C API and cooker encode it as major times ten plus minor (`60` for
+Shader Model 6.0), defaulting to `60` and rejecting older models. It
+participates in artifact identity and is recorded in compiler reflection and
+PipelineAsset `target_options`. DXC is a pinned Windows SDK cook dependency;
+the cooker strips debug/reflection data for deterministic runtime DXIL, while
+`VernonRuntime` never links or loads DXC.
 
 ## Completed module and artifact work
 
@@ -495,18 +497,17 @@ content-addressed external artifacts. It compiles in process through
 `vernon_dsl._native`; there is no compiler-executable argument or compatibility
 manifest. For runtime-backed targets, Runtime validates manifest structure,
 content hashes, artifact paths, sizes, digests, reflection, and exact feature
-keys. Metal MSL and DirectX HLSL manifests are cook-only compiler outputs;
-`VernonRuntime` intentionally rejects their targets until matching backends
-exist.
+keys. Metal MSL manifests remain cook-only. DirectX DXIL manifests use the
+Windows D3D12 runtime backend.
 
 Runtime-backed PipelineAssets also carry optional, hash-covered
 `runtime_requirements`. The cooker derives these from the emitted object,
-GLSL, SPIR-V, or PTX artifact and aggregates sorted reflection features.
+GLSL, SPIR-V, PTX, or DXIL artifact and aggregates sorted reflection features.
 Requirements do not participate in stage artifact identity, so content
 addressing and cross-variant artifact deduplication remain stable.
 `target_options` describe compilation inputs; `runtime_requirements` describe
 the resulting artifact's minimum execution environment. Omitting requirements
-is reserved for legacy schema-2 bundles and cook-only Metal/DirectX targets.
+is reserved for legacy schema-2 bundles and the cook-only Metal target.
 
 ## Language v4 representation boundary
 

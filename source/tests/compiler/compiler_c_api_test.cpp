@@ -262,13 +262,14 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     ASSERT_TRUE(vernonCompileResultGetStatus(compile) == VERNON_STATUS_OK);
     ASSERT_TRUE(vernonCompileResultGetArtifactCount(compile) == 1);
     VernonStringView directx_name = vernonCompileResultGetArtifactName(compile, 0);
-    ASSERT_TRUE(view_contains(directx_name, "vertex_main.vert.hlsl"));
-    VernonStringView hlsl = vernonCompileResultGetArtifactData(compile, 0);
-    ASSERT_TRUE(hlsl.size != 0);
+    ASSERT_TRUE(view_contains(directx_name, "vertex_main.vert.dxil"));
+    VernonStringView dxil = vernonCompileResultGetArtifactData(compile, 0);
+    ASSERT_TRUE(dxil.size >= 4);
+    ASSERT_TRUE(std::memcmp(dxil.data, "DXBC", 4) == 0);
     VernonStringView directx_reflection = vernonCompileResultGetReflection(compile);
     ASSERT_TRUE(view_contains(directx_reflection, "\"target\":\"directx\""));
-    ASSERT_TRUE(view_contains(directx_reflection, "\"format\":\"hlsl\""));
-    ASSERT_TRUE(view_contains(directx_reflection, "\"hlsl_shader_model\":50"));
+    ASSERT_TRUE(view_contains(directx_reflection, "\"format\":\"dxil\""));
+    ASSERT_TRUE(view_contains(directx_reflection, "\"hlsl_shader_model\":60"));
     vernonCompileResultDestroy(compile);
 
     VernonCompileOptions directx_options{};

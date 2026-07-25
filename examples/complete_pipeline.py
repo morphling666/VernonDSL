@@ -106,9 +106,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--arch",
-        choices=("opengl", "opengles", "vulkan"),
+        choices=("opengl", "opengles", "vulkan", "directx"),
         default="vulkan",
-        help=("graphics backend; OpenGL profiles require host context registration"),
+        help=("graphics backend; OpenGL profiles require host context registration; DirectX requires Windows"),
     )
     parser.add_argument("--size", type=int, default=384)
     parser.add_argument("--instances", type=int, default=7)
@@ -142,6 +142,7 @@ def main() -> None:
         "opengl": vd.opengl,
         "opengles": vd.opengles,
         "vulkan": vd.vulkan,
+        "directx": vd.directx,
     }[args.arch]
     vd.init(
         arch=architecture,

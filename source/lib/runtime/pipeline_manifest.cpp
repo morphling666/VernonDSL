@@ -312,6 +312,38 @@ bool parseRuntimeRequirements(const nlohmann::json &root, const std::string &tar
         }
         return true;
     }
+    if (target == "directx") {
+        if (!hasOnlyKeys(value, {"backend", "features", "api_version", "minimum_feature_level", "shader_model",
+                                 "root_signature_version", "compute_workgroup_size"}) ||
+            !value.contains("api_version") || !parseVersion(value["api_version"], requirements.apiVersion) ||
+            !value.contains("minimum_feature_level") ||
+            !parseVersion(value["minimum_feature_level"], requirements.minimumFeatureLevel) ||
+            !value.contains("shader_model") || !parseVersion(value["shader_model"], requirements.shaderVersion) ||
+            !value.contains("root_signature_version") ||
+            !parseVersion(value["root_signature_version"], requirements.rootSignatureVersion)) {
+            error = "DirectX runtime requirements are invalid";
+            return false;
+        }
+        if (requirements.apiVersion.major != 12 || requirements.shaderVersion.major < 6 ||
+            requirements.rootSignatureVersion.major != 1) {
+            error = "DirectX runtime requires D3D12, Shader Model 6+, and root signature 1.x";
+            return false;
+        }
+        if (value.contains("compute_workgroup_size")) {
+            const nlohmann::json &workgroup = value["compute_workgroup_size"];
+            if (!workgroup.is_array() || workgroup.size() != 3) {
+                error = "DirectX compute workgroup requirement must have three dimensions";
+                return false;
+            }
+            for (size_t index = 0; index < 3; ++index)
+                if (!parseUint32(workgroup[index], requirements.computeWorkgroupSize[index]) ||
+                    requirements.computeWorkgroupSize[index] == 0) {
+                    error = "DirectX compute workgroup dimensions must be positive";
+                    return false;
+                }
+        }
+        return true;
+    }
     if (target == "cuda") {
         if (!hasOnlyKeys(value, {"backend", "features", "ptx_version", "minimum_compute_capability", "address_size"}) ||
             !value.contains("ptx_version") || !parseVersion(value["ptx_version"], requirements.shaderVersion) ||

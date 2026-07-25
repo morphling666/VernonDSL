@@ -61,6 +61,18 @@ function(vernon_add_runtime)
             PRIVATE VK_NO_PROTOTYPES=1)
         target_link_libraries(VernonRuntime PRIVATE Vulkan::Headers)
     endif()
+    if(VERNON_ENABLE_DIRECTX12_RUNTIME)
+        if(NOT WIN32)
+            message(FATAL_ERROR "VERNON_ENABLE_DIRECTX12_RUNTIME is supported only on Windows")
+        endif()
+        target_sources(VernonRuntime PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/backend_directx12.cpp
+                                             ${_VERNON_RUNTIME_IMPL_DIR}/graphics_directx12_encoder.cpp)
+        target_compile_definitions(
+            VernonRuntime
+            PUBLIC VERNON_HAS_DIRECTX12_RUNTIME=1
+            PRIVATE NOMINMAX)
+        target_link_libraries(VernonRuntime PRIVATE d3d12 dxgi dxguid)
+    endif()
     target_include_directories(
         VernonRuntime
         PUBLIC $<BUILD_INTERFACE:${_VERNON_RUNTIME_INCLUDE_DIR}> $<INSTALL_INTERFACE:include>

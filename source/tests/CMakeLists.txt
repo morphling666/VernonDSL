@@ -104,6 +104,35 @@ if(TARGET VernonRuntime)
         target_link_libraries(VernonRuntimeTests PRIVATE VernonDSLCompiler)
     endif()
 
+    if(VERNON_ENABLE_DIRECTX12_RUNTIME)
+        target_sources(VernonRuntimeTests PRIVATE runtime/runtime_directx12_test.cpp)
+        if(TARGET vernon-dsl-native AND Python_FOUND)
+            set(directx_pipeline_test_dir "${VERNON_TEST_BINARY_ROOT}/directx_pipeline_bundle")
+            set(directx_pipeline_test_manifest "${directx_pipeline_test_dir}/directx_pipeline_bundle.pipeline.json")
+            add_custom_command(
+                OUTPUT "${directx_pipeline_test_manifest}"
+                COMMAND
+                    ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${Python_EXECUTABLE} -m
+                    vernon_dsl.pipeline_asset_cli
+                    "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:sampled_asset" --target directx
+                    --output "${directx_pipeline_test_dir}"
+                DEPENDS vernon-dsl-native "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py"
+                        "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/requirements.py"
+                VERBATIM)
+            add_custom_target(vernon-directx-pipeline-test-bundle DEPENDS "${directx_pipeline_test_manifest}")
+            target_sources(VernonRuntimeTests PRIVATE runtime/runtime_directx12_pipeline_test.cpp)
+            target_compile_definitions(VernonRuntimeTests
+                                       PRIVATE VERNON_DIRECTX_PIPELINE_BUNDLE="${directx_pipeline_test_manifest}")
+            target_link_libraries(VernonRuntimeTests PRIVATE VernonDSLCompiler)
+            add_custom_command(
+                TARGET VernonRuntimeTests
+                POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:VernonDSLCompiler>
+                        $<TARGET_FILE_DIR:VernonRuntimeTests>)
+            add_dependencies(VernonRuntimeTests vernon-directx-pipeline-test-bundle)
+        endif()
+    endif()
+
     if(VERNON_ENABLE_VULKAN_RUNTIME
        AND TARGET vernon-dsl-native
        AND Python_FOUND)

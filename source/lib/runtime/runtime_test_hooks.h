@@ -18,6 +18,8 @@ struct VulkanGraphicsCacheStats {
 
 VERNON_RUNTIME_CAPI VulkanGraphicsCacheStats getVulkanGraphicsCacheStats(const VernonRuntimeContext *context,
                                                                          const VernonLoadedPipeline *pipeline);
+VERNON_RUNTIME_CAPI void setDirectX12WarpForTests(bool enabled);
+VERNON_RUNTIME_CAPI size_t getDirectX12GraphicsPipelineCreationCount(const VernonLoadedPipeline *pipeline);
 
 } // namespace vernon::runtime
 

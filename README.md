@@ -38,15 +38,16 @@ The native compiler library currently provides:
 - graphics lowering to SPIR-V and Vulkan `.spv` artifacts;
 - compute outlining to MLIR `gpu.module`/`gpu.func` and Vulkan SPIR-V;
 - CUDA compute lowering through NVVM to PTX;
-- SPIRV-Cross source artifacts for OpenGL, OpenGL ES, Metal, and DirectX HLSL;
+- SPIRV-Cross source artifacts for OpenGL, OpenGL ES, and Metal, plus
+  Shader Model 6 DXIL for DirectX;
 - `vernon-opt`, the Vernon MLIR pass driver.
 
 CUDA/NVPTX and CPU/LLVM are distinct branches; they are never routed through
 SPIR-V. The CPU backend JIT-compiles the current graphics and compute numeric
 subset, including buffer load/store and callback-based 2D texture sampling,
-and exports guarded C ABI entry points for reference execution. DirectX is a
-cook-only HLSL source target; DXC-to-DXIL compilation and DirectX runtime
-execution are not implemented.
+and exports guarded C ABI entry points for reference execution. DirectX uses
+the pinned Windows SDK DXC while cooking and executes pre-cooked DXIL through
+the Windows-only D3D12 Runtime backend.
 
 That JIT is a compiler reference facility, not a deployable runtime format.
 `VernonRuntime` accepts CPU native-library AOT bundles only.
@@ -207,6 +208,9 @@ for the matching profile. Python wheels include a separate `_gl_context`
 extension that owns a hidden GLFW context, so `vd.init(arch=vd.opengl)` runs
 directly. Vernon Engine can continue to call
 `vd.register_external_opengl_context(...)` to use its existing context.
+`VERNON_ENABLE_DIRECTX12_RUNTIME` builds the Windows D3D12 compute/offscreen
+graphics backend and links only system D3D12/DXGI libraries; runtime
+deployments do not require DXC or its DLLs.
 Compiler capabilities remain independent of runtime/device availability.
 `VERNON_ENABLE_PYTHON_BINDINGS` builds the `_native` compiler/runtime module;
 full Python builds also include `_gl_context` by default.
@@ -330,10 +334,9 @@ mesh_asset = vd.pipeline_asset(
 stages. Graphics stage kinds come from their decorators, allowing the tuple
 topology to grow beyond vertex-plus-fragment without changing the asset shape.
 Target architecture and options are supplied by the cooker rather than source.
-DirectX HLSL defaults to Shader Model 5.0; pass
-`--hlsl-shader-model 30|40|41|50|51|60` to select another supported source
-profile. Metal and DirectX bundles are compiler outputs only and are not
-loadable by `VernonRuntime`.
+DirectX defaults to Shader Model 6.0 DXIL; `--hlsl-shader-model 60` selects the
+runtime-compatible profile. Older HLSL source bundles are a broken contract
+and must be re-cooked. Metal bundles remain compiler outputs only.
 
 Cook the named declaration in process for one target:
 
@@ -387,7 +390,8 @@ entry points; destroy them with `vernonCompileResultDestroy`.
 with `vernonCompileResultGetArtifactCount`, `GetArtifactName`, and
 `GetArtifactData`; returned string views remain valid until the result is
 destroyed. Current artifact formats are SPIR-V (`.spv`), GLSL/GLES (`.glsl`),
-Metal source (`.metal`), CUDA PTX (`.ptx`), and CPU LLVM IR (`.ll`).
+Metal source (`.metal`), DirectX DXIL (`.dxil`), CUDA PTX (`.ptx`), and CPU
+LLVM IR (`.ll`).
 
 Reflection is deterministic JSON. Each entry records its stage, workgroup size
 when applicable, argument/result types, interface attributes, and CPU ABI

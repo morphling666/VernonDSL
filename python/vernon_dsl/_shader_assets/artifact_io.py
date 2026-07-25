@@ -46,6 +46,8 @@ def artifact_extension(artifact_format: str, stage: str, original_name: str = ""
         return ".ptx"
     if artifact_format == "spirv":
         return ".spv"
+    if artifact_format == "dxil":
+        return ".dxil"
     if artifact_format == "native_library":
         return Path(original_name).suffix or ".native"
     if artifact_format == "relocatable_object":
