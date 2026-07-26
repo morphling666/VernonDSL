@@ -27,7 +27,7 @@ def animate_vertices(
 
 @vd.vertex
 def vertex_main(
-    positions: Annotated[vd.Vector[vd.f32, 2], vd.location(0)],
+    positions: Annotated[vd.Vector[vd.f32, 2], vd.attribute()],
     draw_offset: Annotated[vd.Vector[vd.f32, 2], vd.uniform()],
 ) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
     return vd.Vector([positions + draw_offset, 0.0, 1.0])
@@ -36,7 +36,7 @@ def vertex_main(
 @vd.fragment
 def fragment_main(
     color: Annotated[vd.Vector[vd.f32, 4], vd.uniform()],
-) -> Annotated[vd.Vector[vd.f32, 4], vd.location(0)]:
+) -> vd.Vector[vd.f32, 4]:
     return color
 
 

@@ -1,10 +1,12 @@
 #include "VernonRHI.h"
+#include "rhi/rhi_internal.h"
 #include "rhi/vulkan_backend.h"
 
 #include <gtest/gtest.h>
 
 #include <string>
 #include <type_traits>
+#include <vector>
 
 namespace {
 
@@ -120,6 +122,59 @@ TEST(VulkanNativeInterop, BorrowsObjectsWithoutOwningTheirLifetime) {
     ASSERT_TRUE(owner.submitCommands(commands, error)) << error;
     owner.destroyImage(image);
     owner.destroyBuffer(buffer);
+}
+
+TEST(VulkanNativeInterop, KeepsOwnedResourceAddressesStableAsSlotsGrow) {
+    VernonRhiOwnedDeviceDescriptor deviceDescriptor{};
+    deviceDescriptor.struct_size = sizeof(deviceDescriptor);
+    deviceDescriptor.backend = VERNON_RHI_BACKEND_VULKAN;
+    const VernonRhiDevice device = vernonRhiCreateDevice(&deviceDescriptor);
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        GTEST_SKIP() << "Vulkan device is unavailable";
+
+    VernonRhiBufferDescriptor bufferDescriptor{};
+    bufferDescriptor.struct_size = sizeof(bufferDescriptor);
+    bufferDescriptor.size = 64;
+    bufferDescriptor.alignment = 16;
+    bufferDescriptor.usage = VERNON_RHI_BUFFER_VERTEX;
+    bufferDescriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
+
+    std::vector<VernonRhiBuffer> buffers(64);
+    for (VernonRhiBuffer &buffer : buffers)
+        ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &buffer), VERNON_RHI_STATUS_OK);
+
+    const uint64_t firstResource = vernon::rhi::bufferResource(device, buffers.front());
+    ASSERT_NE(firstResource, 0u);
+    for (size_t index = 0; index < 64; ++index) {
+        VernonRhiBuffer extra{};
+        ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &extra), VERNON_RHI_STATUS_OK);
+        buffers.push_back(extra);
+    }
+    EXPECT_EQ(vernon::rhi::bufferResource(device, buffers.front()), firstResource);
+
+    for (VernonRhiBuffer buffer : buffers)
+        EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, buffer), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
+}
+
+TEST(VulkanNativeInterop, RecyclesIndividuallyFreedDescriptorSets) {
+    std::string error;
+    vernon::rhi::vulkan::DeviceState owner;
+    if (!owner.initialize(0, error))
+        GTEST_SKIP() << error;
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    VkDescriptorSetLayout layout{};
+    auto &driver = vernon::rhi::vulkan::driver();
+    ASSERT_EQ(driver.createDescriptorSetLayout(owner.device, &layoutInfo, nullptr, &layout), VK_SUCCESS);
+
+    for (size_t index = 0; index < 512; ++index) {
+        VkDescriptorSet set{};
+        ASSERT_TRUE(owner.allocateDescriptorSet(layout, set, error)) << error;
+        ASSERT_TRUE(owner.freeDescriptorSet(set, error)) << error;
+    }
+
+    driver.destroyDescriptorSetLayout(owner.device, layout, nullptr);
 }
 
 } // namespace

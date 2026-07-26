@@ -4,6 +4,7 @@
 #include "VernonRuntimeCore.h"
 #include "pipeline_metadata.h"
 #include "runtime_state.h"
+#include "tensor_bridge.h"
 
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
 #include "../rhi/directx12_backend.h"
@@ -27,9 +28,11 @@ using DirectX12SamplerState = rhi::directx12::Sampler;
 
 struct DirectX12PipelineState {
     struct GraphicsBinding {
-        enum Source { EXTERNAL_VERTEX, EXTERNAL_TEXTURE, EXTERNAL_SAMPLER, IMPLICIT_SAMPLER };
+        enum Source { EXTERNAL_UNIFORM, EXTERNAL_VERTEX, EXTERNAL_TEXTURE, EXTERNAL_SAMPLER, IMPLICIT_SAMPLER };
         Source source{};
         uint32_t externalSlot{};
+        TensorPackingLayout packing;
+        std::vector<uint8_t> storage;
     };
 
     VernonRuntimeCorePipeline *rhiComputePipeline{};
@@ -42,9 +45,11 @@ struct DirectX12PipelineState {
     VernonRuntimeCoreBindings *rhiGraphicsBindings{};
     VernonRuntimeCoreGraphicsVariant *rhiGraphicsVariant{};
     std::vector<uint32_t> rhiGraphicsFormats;
+    uint32_t rhiGraphicsDepthFormat{};
     uint64_t rhiGraphicsVertexLayoutIdentity{};
     uint32_t rhiGraphicsTopology{};
     std::vector<VernonRuntimeProviderBindingLayoutEntry> rhiGraphicsLayout;
+    std::vector<VernonRuntimeProviderVertexAttribute> rhiGraphicsVertexAttributes;
     std::vector<VernonRuntimeProviderBindingValue> rhiGraphicsValues;
     std::vector<GraphicsBinding> rhiGraphicsBindingsPlan;
 };

@@ -29,7 +29,7 @@ endif()
 file(
     WRITE "${OUTPUT}/compute.json"
     "{
-  \"schema_version\": 2,
+  \"schema_version\": 3,
   \"cpu_invocation_abi_version\": 1,
   \"target\": \"cpu\",
   \"operating_system\": \"${OPERATING_SYSTEM}\",
@@ -67,10 +67,10 @@ file(
 ")
 
 set(PIPELINE_CANONICAL
-    "{\"features\":[],\"id\":\"cpu/fill\",\"invocation_abi_version\":3,\
+    "{\"features\":[],\"id\":\"cpu/fill\",\"invocation_abi_version\":4,\
 \"runtime_requirements\":{\"backend\":\"cpu\",\"features\":[\"compute\",\"tensor_views\"],\
 \"invocation_abi_version\":1,\"object_format\":\"${OBJECT_FORMAT}\",\"target_triple\":\"${TARGET_TRIPLE}\"},\
-\"schema_version\":2,\
+\"schema_version\":3,\
 \"stage_artifacts\":{\"fill\":{\"architecture\":\"${ARCHITECTURE}\",\
 \"artifact\":{\"format\":\"native_library\",\"path\":\"${ARTIFACT_NAME}\",\
 \"sha256\":\"${ARTIFACT_SHA256}\",\"size\":${ARTIFACT_SIZE},\"storage\":\"external\"},\

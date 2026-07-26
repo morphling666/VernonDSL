@@ -69,6 +69,7 @@ struct VERNON_RHI_CAPI DeviceState {
     bool acquireStaging(bool upload, VkDeviceSize size, VkDeviceSize alignment, VkBuffer &buffer, VkDeviceSize &offset,
                         uint8_t *&mapped, std::string &error);
     bool allocateDescriptorSet(VkDescriptorSetLayout layout, VkDescriptorSet &set, std::string &error);
+    bool freeDescriptorSet(VkDescriptorSet set, std::string &error);
 
     VkInstance instance{};
     VkPhysicalDevice physicalDevice{};
@@ -76,6 +77,7 @@ struct VERNON_RHI_CAPI DeviceState {
     VkQueue queue{};
     uint32_t queueFamily{};
     uint32_t maxPushConstantsSize{};
+    uint32_t maxVertexInputAttributes{};
     uint32_t apiVersion{};
     uint32_t maxComputeWorkGroupInvocations{};
     uint32_t maxComputeWorkGroupSize[3]{};

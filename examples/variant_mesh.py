@@ -9,7 +9,7 @@ SKIN = vd.feature("SKIN")
 @vd.vertex
 def mesh_vertex(
     position: vd.Vector[vd.f32, 3],
-    instance_transform: vd.When[INSTANCE, Annotated[vd.Matrix[vd.f32, 4, 4], vd.instance()]],
+    instance_transform: vd.When[INSTANCE, Annotated[vd.Matrix[vd.f32, 4, 4], vd.attribute(divisor=1)]],
     joints: vd.When[SKIN, vd.Vector[vd.u32, 4]],
     weights: vd.When[SKIN, vd.Vector[vd.f32, 4]],
 ) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
@@ -24,7 +24,7 @@ def mesh_vertex(
 @vd.fragment
 def mesh_fragment(
     tint: Annotated[vd.Vector[vd.f32, 4], vd.uniform()],
-) -> Annotated[vd.Vector[vd.f32, 4], vd.location(0)]:
+) -> vd.Vector[vd.f32, 4]:
     return tint
 
 

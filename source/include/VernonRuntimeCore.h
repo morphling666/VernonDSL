@@ -43,6 +43,7 @@ typedef struct VernonRuntimeCoreDrawInvocation {
     uint32_t first_instance;
     const VernonRuntimeProviderColorAttachment *color_attachments;
     size_t color_attachment_count;
+    VernonRuntimeProviderResourceReference depth_stencil_attachment;
     uint32_t viewport[4];
     uint32_t topology;
     VernonRuntimeProviderResourceReference index_buffer;
@@ -59,6 +60,8 @@ typedef struct VernonRuntimeCorePipelineDescriptor {
     size_t shader_count;
     const VernonRuntimeProviderBindingLayoutEntry *bindings;
     size_t binding_count;
+    const VernonRuntimeProviderVertexAttribute *vertex_attributes;
+    size_t vertex_attribute_count;
     uint32_t push_constant_size;
     uint32_t topology;
     const uint32_t *color_formats;

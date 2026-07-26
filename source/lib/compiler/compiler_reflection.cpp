@@ -5,6 +5,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonTensorShapeSemantics.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -27,6 +28,63 @@ namespace vernon::compiler {
 namespace {
 
 uint64_t sourceTypeAlignment(mlir::Type type);
+
+struct StaticTensorPhysicalLayout {
+    uint64_t size;
+    uint64_t alignment;
+    llvm::SmallVector<uint64_t> arrayStrides;
+    std::optional<uint64_t> matrixStride;
+    std::optional<llvm::StringRef> matrixOrder;
+};
+
+mlir::FailureOr<StaticTensorPhysicalLayout> staticTensorPhysicalLayout(mlir::RankedTensorType tensor) {
+    if (!tensor.hasStaticShape() || llvm::any_of(tensor.getShape(), [](int64_t extent) { return extent <= 0; }) ||
+        !tensor.getElementType().isIntOrFloat())
+        return mlir::failure();
+    const uint64_t elementSize = std::max<uint64_t>(tensor.getElementType().getIntOrFloatBitWidth() / 8, 1);
+    if (tensor.getRank() == 0)
+        return StaticTensorPhysicalLayout{elementSize, elementSize, {}, std::nullopt, std::nullopt};
+    if (tensor.getRank() == 1 && tensor.getDimSize(0) >= 2 && tensor.getDimSize(0) <= 4) {
+        const uint64_t count = tensor.getDimSize(0);
+        const uint64_t alignment = (count == 2 ? 2 : 4) * elementSize;
+        return StaticTensorPhysicalLayout{count * elementSize, alignment, {}, std::nullopt, std::nullopt};
+    }
+    if (tensor.getRank() == 2 && tensor.getDimSize(0) >= 2 && tensor.getDimSize(0) <= 4 && tensor.getDimSize(1) >= 2 &&
+        tensor.getDimSize(1) <= 4) {
+        const uint64_t rows = tensor.getDimSize(0);
+        const uint64_t columns = tensor.getDimSize(1);
+        const uint64_t columnAlignment = std::max<uint64_t>((rows == 2 ? 2 : 4) * elementSize, 16);
+        const uint64_t stride = llvm::alignTo(rows * elementSize, columnAlignment);
+        return StaticTensorPhysicalLayout{
+            stride * columns, columnAlignment, {}, stride, llvm::StringRef("column_major")};
+    }
+
+    uint64_t size = elementSize;
+    uint64_t alignment = elementSize;
+    llvm::SmallVector<uint64_t> reversedStrides;
+    for (int64_t extent : llvm::reverse(tensor.getShape())) {
+        alignment = std::max<uint64_t>(alignment, 16);
+        const uint64_t stride = llvm::alignTo(size, alignment);
+        reversedStrides.push_back(stride);
+        size = stride * static_cast<uint64_t>(extent);
+    }
+    return StaticTensorPhysicalLayout{size, alignment,
+                                      llvm::SmallVector<uint64_t>(reversedStrides.rbegin(), reversedStrides.rend()),
+                                      std::nullopt, std::nullopt};
+}
+
+std::string proposedStorageClass(mlir::StringRef stage, mlir::DictionaryAttr attrs) {
+    if (stage == "compute")
+        return "StorageBuffer";
+    auto kind = attrs ? attrs.getAs<mlir::StringAttr>("vernon.interface") : nullptr;
+    if (!kind)
+        return "StorageBuffer";
+    if (kind.getValue() == "input")
+        return "Input";
+    if (kind.getValue() == "uniform")
+        return attrs.get("vernon.binding") ? "Uniform" : "PushConstant";
+    return "StorageBuffer";
+}
 
 uint64_t productTypeSize(mlir::TypeRange fields) {
     uint64_t offset = 0;
@@ -313,6 +371,16 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
     llvm::json::Array entries;
     std::set<std::string> requiredFeatures;
     bool invalid = false;
+    uint32_t nextGeneratedBinding = 0;
+    module.walk([&](mlir::func::FuncOp function) {
+        for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+            mlir::DictionaryAttr attrs = function.getArgAttrDict(index);
+            auto descriptorSet = attrs.getAs<mlir::IntegerAttr>("vernon.set");
+            auto binding = attrs.getAs<mlir::IntegerAttr>("vernon.binding");
+            if (binding && (!descriptorSet || descriptorSet.getInt() == 0))
+                nextGeneratedBinding = std::max(nextGeneratedBinding, static_cast<uint32_t>(binding.getInt() + 1));
+        }
+    });
     module.walk([&](mlir::func::FuncOp function) {
         auto stage = function->getAttrOfType<mlir::StringAttr>("vernon.stage");
         if (!stage)
@@ -329,6 +397,65 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
 
         llvm::json::Array arguments;
         uint64_t argumentOffset = 0;
+        std::map<unsigned, uint32_t> generatedUniformBindings;
+        uint64_t inlineUniformSize = 0;
+        for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+            if (stage.getValue() == "compute")
+                break;
+            mlir::DictionaryAttr attrs = function.getArgAttrDict(index);
+            auto interfaceKind = attrs.getAs<mlir::StringAttr>("vernon.interface");
+            if (!interfaceKind || interfaceKind.getValue() != "uniform" || attrs.get("vernon.binding"))
+                continue;
+            mlir::Type type = function.getArgumentTypes()[index];
+            uint64_t size = sourceTypeSize(type);
+            uint64_t alignment = sourceTypeAlignment(type);
+            bool requiresBuffer = false;
+            if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type)) {
+                mlir::FailureOr<StaticTensorPhysicalLayout> layout = staticTensorPhysicalLayout(tensor);
+                if (mlir::failed(layout)) {
+                    function.emitError() << "cannot plan graphics uniform layout for argument #" << index;
+                    invalid = true;
+                    return;
+                }
+                size = layout->size;
+                alignment = layout->alignment;
+                requiresBuffer = !layout->arrayStrides.empty();
+            }
+            if (!size || !alignment) {
+                function.emitError() << "cannot plan graphics uniform layout for argument #" << index;
+                invalid = true;
+                return;
+            }
+            const uint64_t offset = llvm::alignTo(inlineUniformSize, alignment);
+            requiresBuffer = requiresBuffer || offset > 128 || size > 128 - std::min<uint64_t>(offset, 128);
+            if (requiresBuffer) {
+                generatedUniformBindings[index] = nextGeneratedBinding++;
+            } else {
+                inlineUniformSize = offset + size;
+            }
+        }
+        llvm::SmallVector<std::optional<uint32_t>> computeBindings(function.getNumArguments());
+        if (stage.getValue() == "compute") {
+            uint32_t flattenedBinding = 0;
+            for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+                mlir::DictionaryAttr attrs = function.getArgAttrDict(index);
+                if (attrs.get("vernon.builtin"))
+                    continue;
+                computeBindings[index] = flattenedBinding;
+                size_t leafCount = 1;
+                if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(function.getArgumentTypes()[index])) {
+                    mlir::FailureOr<mlir::vernon::StorageLayout> layout =
+                        mlir::vernon::resolveStorageLayout(view.getElementType(), module);
+                    if (mlir::failed(layout)) {
+                        function.emitError("cannot assign flattened compute bindings");
+                        invalid = true;
+                        return;
+                    }
+                    leafCount = layout->leaves.size();
+                }
+                flattenedBinding += static_cast<uint32_t>(std::max<size_t>(leafCount, 1));
+            }
+        }
         uint32_t nextBinding = 0;
         for (unsigned index = 0; index < function.getNumArguments(); ++index) {
             mlir::DictionaryAttr attrs = function.getArgAttrDict(index);
@@ -370,7 +497,72 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
                         requiredFeatures.insert("instancing");
                 }
             }
+            if (auto generated = generatedUniformBindings.find(index); generated != generatedUniformBindings.end()) {
+                argument["vernon.set"] = int64_t{0};
+                argument["vernon.binding"] = static_cast<int64_t>(generated->second);
+            }
+            if (computeBindings[index]) {
+                argument["vernon.set"] = int64_t{0};
+                argument["vernon.binding"] = static_cast<int64_t>(*computeBindings[index]);
+            }
             mlir::Type argumentType = function.getArgumentTypes()[index];
+            if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(argumentType)) {
+                mlir::FailureOr<StaticTensorPhysicalLayout> layout = staticTensorPhysicalLayout(tensor);
+                if (mlir::failed(layout)) {
+                    function.emitError() << "cannot reflect physical GPU layout for static Tensor argument #" << index;
+                    invalid = true;
+                    return;
+                }
+                const std::string dtype = argumentAttrs && argumentAttrs.getAs<mlir::StringAttr>("vernon.dtype")
+                                              ? argumentAttrs.getAs<mlir::StringAttr>("vernon.dtype").getValue().str()
+                                              : scalarDtype(tensor.getElementType());
+                argument["kind"] = "tensor_value";
+                argument["dtype"] = dtype;
+                llvm::json::Array shape;
+                for (int64_t extent : tensor.getShape())
+                    shape.emplace_back(extent);
+                argument["shape"] = std::move(shape);
+                argument["rank"] = static_cast<int64_t>(tensor.getRank());
+                const bool vertexAttribute =
+                    stage.getValue() == "vertex" && argumentAttrs &&
+                    argumentAttrs.getAs<mlir::StringAttr>("vernon.interface") &&
+                    argumentAttrs.getAs<mlir::StringAttr>("vernon.interface").getValue() == "input" &&
+                    argumentAttrs.getAs<mlir::IntegerAttr>("vernon.location") && !argumentAttrs.get("vernon.builtin");
+                if (vertexAttribute) {
+                    mlir::FailureOr<mlir::vernon::StaticAttributePlan> plan =
+                        mlir::vernon::getStaticAttributePlan(tensor.getElementType(), tensor.getShape());
+                    if (mlir::failed(plan)) {
+                        function.emitError() << "cannot reflect vertex attribute layout for argument #" << index;
+                        invalid = true;
+                        return;
+                    }
+                    llvm::json::Array leaves;
+                    for (const mlir::vernon::StaticAttributeLeaf &leaf : plan->leaves) {
+                        llvm::json::Object reflectedLeaf;
+                        reflectedLeaf["location_offset"] = leaf.locationOffset;
+                        reflectedLeaf["component_count"] = leaf.componentCount;
+                        reflectedLeaf["byte_offset"] = static_cast<int64_t>(leaf.byteOffset);
+                        leaves.emplace_back(std::move(reflectedLeaf));
+                    }
+                    argument["location_span"] = static_cast<int64_t>(plan->leaves.size());
+                    argument["attribute_leaves"] = std::move(leaves);
+                } else {
+                    argument["physical_size"] = static_cast<int64_t>(layout->size);
+                    argument["physical_alignment"] = static_cast<int64_t>(layout->alignment);
+                    argument["proposed_storage_class"] =
+                        generatedUniformBindings.find(index) != generatedUniformBindings.end()
+                            ? "Uniform"
+                            : proposedStorageClass(stage.getValue(), argumentAttrs);
+                    llvm::json::Array arrayStrides;
+                    for (uint64_t stride : layout->arrayStrides)
+                        arrayStrides.emplace_back(static_cast<int64_t>(stride));
+                    argument["array_strides"] = std::move(arrayStrides);
+                    if (layout->matrixStride) {
+                        argument["matrix_stride"] = static_cast<int64_t>(*layout->matrixStride);
+                        argument["matrix_order"] = layout->matrixOrder->str();
+                    }
+                }
+            }
             if (auto texture = mlir::dyn_cast<mlir::vernon::TextureType>(argumentType)) {
                 argument["kind"] = "texture";
                 argument["dtype"] = scalarDtype(texture.getElementType());
@@ -430,7 +622,8 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
                         return;
                     }
                     const uint32_t firstBinding =
-                        attrs.getAs<mlir::IntegerAttr>("vernon.binding")
+                        computeBindings[index] ? *computeBindings[index]
+                        : attrs.getAs<mlir::IntegerAttr>("vernon.binding")
                             ? static_cast<uint32_t>(attrs.getAs<mlir::IntegerAttr>("vernon.binding").getInt())
                             : index;
                     llvm::json::Array storageLeaves;
@@ -439,7 +632,10 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
                         reflectedLeaf["element_size"] =
                             static_cast<int64_t>(std::max<uint64_t>(leaf.type.getIntOrFloatBitWidth() / 8, 1));
                         reflectedLeaf["byte_offset"] = static_cast<int64_t>(leaf.byteOffset);
-                        reflectedLeaf["binding"] = static_cast<int64_t>(leafIndex == 0 ? firstBinding : nextBinding++);
+                        reflectedLeaf["binding"] =
+                            static_cast<int64_t>(computeBindings[index] ? firstBinding + leafIndex
+                                                 : leafIndex == 0       ? firstBinding
+                                                                        : nextBinding++);
                         storageLeaves.emplace_back(std::move(reflectedLeaf));
                     }
                     argument["storage_leaves"] = std::move(storageLeaves);
@@ -461,7 +657,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
                         argument["shape"] = std::move(dimensions);
                         argument["strides"] = std::move(strides);
                     }
-                } else {
+                } else if (!mlir::isa<mlir::RankedTensorType>(argumentType)) {
                     argument["kind"] = "scalar";
                     argument["dtype"] = sourceDtype ? sourceDtype.getValue().str() : scalarDtype(argumentType);
                     argument["alignment"] = static_cast<int64_t>(std::max<uint64_t>(sourceTypeSize(argumentType), 1));
@@ -548,7 +744,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
         return mlir::failure();
 
     llvm::json::Object root;
-    root["schema_version"] = int64_t{2};
+    root["schema_version"] = int64_t{3};
     root["gpu_launch_abi_version"] = int64_t{1};
     int64_t valueAbiVersion = 0;
     if (auto version = sourceModule->getAttrOfType<mlir::IntegerAttr>("vernon.value_abi_version"))

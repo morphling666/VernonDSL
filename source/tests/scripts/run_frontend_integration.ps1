@@ -98,7 +98,7 @@ try {
   $bundle = Get-Content (Join-Path $bundlePath "shader.json") -Raw |
     ConvertFrom-Json
   if ($bundle.id -ne "shaders/runtime" -or
-      $bundle.reflection.schema_version -ne 2 -or
+      $bundle.reflection.schema_version -ne 3 -or
       $bundle.reflection.target -ne "opengl" -or
       $bundle.reflection.artifacts.Count -ne 2 -or
       -not (Test-Path (Join-Path $bundlePath "runtime_vertex.vert.glsl")) -or

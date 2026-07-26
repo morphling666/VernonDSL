@@ -30,6 +30,11 @@ constexpr GlEnum kLinkStatus = 0x8B82;
 constexpr GlEnum kFramebufferComplete = 0x8CD5;
 constexpr GlEnum kArrayBuffer = 0x8892;
 constexpr GlEnum kElementArrayBuffer = 0x8893;
+constexpr GlEnum kInt = 0x1404;
+constexpr GlEnum kUnsignedInt = 0x1405;
+constexpr GlEnum kFloat = 0x1406;
+constexpr GlEnum kDouble = 0x140A;
+constexpr GlEnum kHalfFloat = 0x140B;
 
 GlUint nextName = 1;
 uint32_t drawCount = 0;
@@ -68,6 +73,8 @@ GlUint vertexAttributeArray = 0;
 GlUint vertexAttributeLocation = UINT32_MAX;
 GlUint capturedVertexAttributeDivisor = 0;
 GlInt vertexAttributeComponents = 0;
+GlEnum vertexAttributeType = 0;
+char vertexAttributePointerKind = '\0';
 GlSize vertexAttributeStride = 0;
 uintptr_t vertexAttributeOffset = 0;
 GlSize indexedDrawCount = 0;
@@ -85,6 +92,7 @@ GlUint GL_CALL createProgram() { return nextName++; }
 void GL_CALL shaderSource(GlUint, GlSize, const char *const *, const GlInt *) {}
 void GL_CALL getShaderiv(GlUint, GlEnum name, GlInt *value) { *value = name == kCompileStatus ? 1 : 0; }
 void GL_CALL getProgramiv(GlUint, GlEnum name, GlInt *value) { *value = name == kLinkStatus ? 1 : 0; }
+void GL_CALL getIntegerv(GlEnum, GlInt *value) { *value = 16; }
 void GL_CALL genNames(GlSize count, GlUint *names) {
     while (count--)
         *names++ = nextName++;
@@ -111,13 +119,23 @@ void GL_CALL bindVertexArray(GlUint name) { boundVertexArray = name; }
 void GL_CALL bindBufferBase(GlEnum, GlUint, GlUint) { ++storageBindingCount; }
 void GL_CALL dispatchCompute(GlUint, GlUint, GlUint) { ++dispatchCount; }
 void GL_CALL memoryBarrier(unsigned) { ++memoryBarrierCount; }
-void GL_CALL vertexAttribPointer(GlUint location, GlInt components, GlEnum, GlBoolean, GlSize stride,
+void GL_CALL vertexAttribPointer(GlUint location, GlInt components, GlEnum type, GlBoolean, GlSize stride,
                                  const void *offset) {
     vertexAttributeArray = boundVertexArray;
     vertexAttributeLocation = location;
     vertexAttributeComponents = components;
+    vertexAttributeType = type;
+    vertexAttributePointerKind = 'F';
     vertexAttributeStride = stride;
     vertexAttributeOffset = reinterpret_cast<uintptr_t>(offset);
+}
+void GL_CALL vertexAttribIPointer(GlUint location, GlInt components, GlEnum type, GlSize stride, const void *offset) {
+    vertexAttribPointer(location, components, type, 0, stride, offset);
+    vertexAttributePointerKind = 'I';
+}
+void GL_CALL vertexAttribLPointer(GlUint location, GlInt components, GlEnum type, GlSize stride, const void *offset) {
+    vertexAttribPointer(location, components, type, 0, stride, offset);
+    vertexAttributePointerKind = 'L';
 }
 void GL_CALL vertexAttribDivisor(GlUint, GlUint divisor) { capturedVertexAttributeDivisor = divisor; }
 void GL_CALL drawElementsInstanced(GlEnum, GlSize count, GlEnum, const void *, GlSize) {
@@ -173,6 +191,7 @@ void *getProcAddress(void *, const char *name) {
     PROC("glGetShaderiv", getShaderiv);
     PROC("glCreateProgram", createProgram);
     PROC("glGetProgramiv", getProgramiv);
+    PROC("glGetIntegerv", getIntegerv);
     PROC("glGenVertexArrays", genNames);
     PROC("glBindVertexArray", bindVertexArray);
     PROC("glGenFramebuffers", genNames);
@@ -194,6 +213,8 @@ void *getProcAddress(void *, const char *name) {
     PROC("glCheckFramebufferStatus", framebufferStatus);
     PROC("glDrawArrays", drawArrays);
     PROC("glVertexAttribPointer", vertexAttribPointer);
+    PROC("glVertexAttribIPointer", vertexAttribIPointer);
+    PROC("glVertexAttribLPointer", vertexAttribLPointer);
     PROC("glVertexAttribDivisor", vertexAttribDivisor);
     PROC("glDrawElementsInstanced", drawElementsInstanced);
     PROC("glClearBufferfv", clearBufferfv);
@@ -222,11 +243,11 @@ nlohmann::json inlineArtifact(const std::string &source);
 
 std::string schema2Bundle(const nlohmann::json &artifact) {
     nlohmann::json root = {
-        {"schema_version", 2},
+        {"schema_version", 3},
         {"type", "pipeline"},
         {"id", "schema2/gl"},
         {"target", "opengl"},
-        {"invocation_abi_version", 3},
+        {"invocation_abi_version", 4},
         {"features", nlohmann::json::array()},
         {"runtime_requirements",
          {{"backend", "opengl"},
@@ -279,22 +300,25 @@ std::string matrixBundle(const char *target) {
     return root.dump(-1, ' ', false);
 }
 
-std::string vertexInputBundle() {
+std::string vertexInputBundle(const char *dtype = "f32", uint32_t components = 3, uint32_t divisor = 1) {
     nlohmann::json root =
         nlohmann::json::parse(schema2Bundle(inlineArtifact("#version 330\nvoid main(){gl_Position=vec4(0.0);}")));
-    root["variants"][0]["parameters"] =
-        nlohmann::json::array({{{"slot", 0},
-                                {"name", "position"},
-                                {"kind", "tensor"},
-                                {"dtype", "f32"},
-                                {"access", "read"},
-                                {"shape", nlohmann::json::array({3})},
-                                {"uses", nlohmann::json::array({{{"stage", "vertex"},
-                                                                 {"interface", "input"},
-                                                                 {"vernon.location", 0},
-                                                                 {"vernon.instance_divisor", 1},
-                                                                 {"dtype", "f32"},
-                                                                 {"shape", nlohmann::json::array({3})}}})}}});
+    root["variants"][0]["parameters"] = nlohmann::json::array(
+        {{{"slot", 0},
+          {"name", "position"},
+          {"kind", "tensor"},
+          {"dtype", dtype},
+          {"access", "read"},
+          {"shape", nlohmann::json::array({components})},
+          {"uses", nlohmann::json::array({{{"stage", "vertex"},
+                                           {"interface", "input"},
+                                           {"vernon.location", 0},
+                                           {"vernon.instance_divisor", divisor},
+                                           {"dtype", dtype},
+                                           {"shape", nlohmann::json::array({components})},
+                                           {"attribute_leaves", nlohmann::json::array({{{"location_offset", 0},
+                                                                                        {"component_count", components},
+                                                                                        {"byte_offset", 0}}})}}})}}});
     root.erase("content_hash");
     const std::string canonical = root.dump(-1, ' ', false);
     root["content_hash"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
@@ -799,6 +823,88 @@ TEST(RuntimeExternalGl, BindsVertexAndIndexBuffersThroughRhi) {
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     vernonRuntimePipelineBundleDestroy(bundle);
     ASSERT_EQ(vernonRuntimeDestroy(gl), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeExternalGl, BindsAllFormalVertexNumericFormatsAndRejectsUnsupportedFormats) {
+    struct Format {
+        const char *name;
+        VernonDataType dtype;
+        uint32_t size;
+        GlEnum nativeType;
+        char pointerKind;
+    };
+    constexpr Format formats[] = {{"i32", VERNON_DATA_I32, 4, kInt, 'I'},
+                                  {"u32", VERNON_DATA_U32, 4, kUnsignedInt, 'I'},
+                                  {"f16", VERNON_DATA_F16, 2, kHalfFloat, 'F'},
+                                  {"f32", VERNON_DATA_F32, 4, kFloat, 'F'},
+                                  {"f64", VERNON_DATA_F64, 8, kDouble, 'L'}};
+    for (const Format &format : formats) {
+        SCOPED_TRACE(format.name);
+        vertexAttributeType = 0;
+        vertexAttributePointerKind = '\0';
+        VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+        ASSERT_TRUE(gl);
+        const std::string bundleData = vertexInputBundle(format.name);
+        VernonPipelineBundle *bundle =
+            vernonRuntimeLoadPipelineBundleWithOptions(gl, bundleData.data(), bundleData.size(), nullptr);
+        ASSERT_TRUE(bundle);
+        VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+        ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+
+        const uint32_t stride = 3 * format.size;
+        VernonDeviceBuffer *vertices = vernonRuntimeImportOpenGLBuffer(gl, 40, 3 * stride, format.size);
+        VernonDeviceTexture *target = importOpenGLTexture2D(gl, 8, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
+        ASSERT_TRUE(vertices && target);
+        const uint64_t shape[2] = {3, 3};
+        const int64_t strides[2] = {stride, format.size};
+        VernonPipelineArgument argument{};
+        argument.kind = VERNON_PIPELINE_TENSOR;
+        argument.tensor.struct_size = sizeof(VernonTensorView);
+        argument.tensor.storage = VERNON_TENSOR_DEVICE;
+        argument.tensor.buffer = vertices;
+        argument.tensor.dtype = format.dtype;
+        argument.tensor.access = VERNON_ACCESS_READ;
+        argument.tensor.rank = 2;
+        argument.tensor.shape = shape;
+        argument.tensor.byte_strides = strides;
+        argument.tensor.byte_size = 3 * stride;
+        const VernonColorAttachment attachment{0, target};
+        VernonPipelineInvocation invocation{};
+        invocation.struct_size = sizeof(invocation);
+        invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+        invocation.arguments = &argument;
+        invocation.argument_count = 1;
+        invocation.color_attachments = &attachment;
+        invocation.color_attachment_count = 1;
+        invocation.vertex_count = 3;
+        invocation.instance_count = 3;
+        ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
+            << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+        EXPECT_EQ(vertexAttributeType, format.nativeType);
+        EXPECT_EQ(vertexAttributePointerKind, format.pointerKind);
+        EXPECT_EQ(vertexAttributeStride, static_cast<GlSize>(stride));
+
+        ASSERT_EQ(vernonRuntimeTextureFree(target), VERNON_STATUS_OK);
+        ASSERT_EQ(vernonRuntimeBufferFree(vertices), VERNON_STATUS_OK);
+        vernonRuntimeLoadedPipelineDestroy(pipeline);
+        vernonRuntimePipelineBundleDestroy(bundle);
+        ASSERT_EQ(vernonRuntimeDestroy(gl), VERNON_STATUS_OK);
+    }
+
+    for (const char *dtype : {"bool", "u8"}) {
+        SCOPED_TRACE(dtype);
+        VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+        ASSERT_TRUE(gl);
+        const std::string bundleData = vertexInputBundle(dtype);
+        VernonPipelineBundle *bundle =
+            vernonRuntimeLoadPipelineBundleWithOptions(gl, bundleData.data(), bundleData.size(), nullptr);
+        ASSERT_TRUE(bundle);
+        EXPECT_EQ(vernonRuntimeResolvePipeline(bundle, {nullptr, 0}), nullptr);
+        const VernonStringView error = vernonRuntimeGetLastError(gl);
+        EXPECT_NE(std::string_view(error.data, error.size).find("format capabilities"), std::string_view::npos);
+        vernonRuntimePipelineBundleDestroy(bundle);
+        ASSERT_EQ(vernonRuntimeDestroy(gl), VERNON_STATUS_OK);
+    }
 }
 
 TEST(RuntimeExternalGl, LoadsAssetsAndInvokesPipeline) {

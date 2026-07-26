@@ -62,19 +62,39 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
                 argument.kind = ComputeLaunchArgumentKind::Tensor;
                 argument.resource = supplied.tensor.resource;
             } else {
-                const std::optional<size_t> byteSize = tensorLogicalByteSize(supplied.tensor);
-                if (!byteSize)
-                    return fail(error, "compute host Tensor is invalid");
                 argument.kind = ComputeLaunchArgumentKind::Scalar;
-                argument.scalarSize = *byteSize;
-                if (isRowMajorContiguous(supplied.tensor)) {
-                    argument.scalarData = hostTensorData(supplied.tensor);
-                } else {
-                    auto packed = packTensorRowMajor(supplied.tensor);
+                if (use.uniformLayout) {
+                    if (use.uniformLayout->size > std::numeric_limits<size_t>::max())
+                        return fail(error, "compute Tensor physical size exceeds the host size range");
+                    TensorPackingLayout layout;
+                    layout.dtype = supplied.tensor.dtype;
+                    layout.shape = use.shape.empty() ? parameter.shape : use.shape;
+                    layout.byteSize = static_cast<size_t>(use.uniformLayout->size);
+                    for (uint64_t stride : use.uniformLayout->byteStrides) {
+                        if (stride > std::numeric_limits<size_t>::max())
+                            return fail(error, "compute Tensor physical stride exceeds the host size range");
+                        layout.byteStrides.push_back(static_cast<size_t>(stride));
+                    }
+                    auto packed = packTensor(supplied.tensor, layout);
                     if (!packed)
-                        return fail(error, "failed to pack compute host Tensor");
+                        return fail(error, "failed to pack reflected compute Tensor layout");
                     plan.hostTensorStorage.push_back(std::move(*packed));
                     argument.scalarData = plan.hostTensorStorage.back().data();
+                    argument.scalarSize = plan.hostTensorStorage.back().size();
+                } else {
+                    const std::optional<size_t> byteSize = tensorLogicalByteSize(supplied.tensor);
+                    if (!byteSize)
+                        return fail(error, "compute host Tensor is invalid");
+                    argument.scalarSize = *byteSize;
+                    if (isRowMajorContiguous(supplied.tensor)) {
+                        argument.scalarData = hostTensorData(supplied.tensor);
+                    } else {
+                        auto packed = packTensorRowMajor(supplied.tensor);
+                        if (!packed)
+                            return fail(error, "failed to pack compute host Tensor");
+                        plan.hostTensorStorage.push_back(std::move(*packed));
+                        argument.scalarData = plan.hostTensorStorage.back().data();
+                    }
                 }
             }
             assigned[use.index] = 1;
@@ -138,10 +158,8 @@ bool planComputeInvocation(const Variant &variant, const VernonPipelineInvocatio
             (tensor.storage != VERNON_TENSOR_RHI_RESOURCE && !tensorFitsAllocation(tensor)))
             return fail(error, "pipeline Tensor argument does not match layout");
         if (parameter.source != "direct") {
-            const bool allowLeading =
-                std::any_of(parameter.uses.begin(), parameter.uses.end(), [](const ParameterUse &use) {
-                    return use.interfaceKind == "input" || use.interfaceKind == "instance";
-                });
+            const bool allowLeading = std::any_of(parameter.uses.begin(), parameter.uses.end(),
+                                                  [](const ParameterUse &use) { return use.interfaceKind == "input"; });
             const size_t offset = allowLeading && tensor.rank == parameter.shape.size() + 1 ? 1 : 0;
             if (tensor.rank != parameter.shape.size() + offset)
                 return fail(error, "pipeline Tensor rank does not match layout");

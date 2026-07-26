@@ -8,18 +8,18 @@ import vernon_dsl as vd
 @vd.struct
 class CubeMapVertexOutput:
     position: Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]
-    tex_coord: Annotated[vd.Vector[vd.f32, 3], vd.location(0)]
+    tex_coord: vd.Vector[vd.f32, 3]
 
 
 @vd.struct
 class CubeMapFragmentOutput:
-    color: Annotated[vd.Vector[vd.f32, 4], vd.location(0)]
-    bloom_color: Annotated[vd.Vector[vd.f32, 4], vd.location(1)]
+    color: vd.Vector[vd.f32, 4]
+    bloom_color: vd.Vector[vd.f32, 4]
 
 
 @vd.vertex
 def cube_map_vertex(
-    aPos: Annotated[vd.Vector[vd.f32, 3], vd.location(0)],
+    aPos: Annotated[vd.Vector[vd.f32, 3], vd.attribute()],
     projection: Annotated[vd.Matrix[vd.f32, 4, 4], vd.uniform()],
     view: Annotated[vd.Matrix[vd.f32, 4, 4], vd.uniform()],
     model: Annotated[vd.Matrix[vd.f32, 4, 4], vd.uniform()],
@@ -39,11 +39,10 @@ def cube_map_fragment(
     tex_coord: Annotated[
         vd.Vector[vd.f32, 3],
         vd.varying(),
-        vd.location(0),
     ],
     cubeMap: Annotated[
         vd.Texture["cube", vd.f32],
-        vd.resource(set=0, binding=0),
+        vd.resource(set=0, binding=1),
     ],
 ) -> CubeMapFragmentOutput:
     color = vd.texture_sample(cubeMap, tex_coord)

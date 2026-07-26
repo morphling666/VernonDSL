@@ -5,6 +5,7 @@
 #include "VernonRuntimeCore.h"
 #include "pipeline_metadata.h"
 #include "runtime_state.h"
+#include "tensor_bridge.h"
 
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
 #include "../rhi/vulkan_backend.h"
@@ -71,6 +72,7 @@ struct VulkanPipelineState {
         };
         Source source{};
         uint32_t externalSlot{};
+        TensorPackingLayout packing;
         std::vector<uint8_t> storage;
     };
 
@@ -84,9 +86,11 @@ struct VulkanPipelineState {
     VernonRuntimeCoreBindings *rhiGraphicsBindings{};
     VernonRuntimeCoreGraphicsVariant *rhiGraphicsVariant{};
     std::vector<VernonRuntimeProviderBindingLayoutEntry> rhiGraphicsLayout;
+    std::vector<VernonRuntimeProviderVertexAttribute> rhiGraphicsVertexAttributes;
     std::vector<VernonRuntimeProviderBindingValue> rhiGraphicsValues;
     std::vector<Binding> rhiGraphicsBindingPlan;
     std::vector<uint32_t> rhiGraphicsFormats;
+    uint32_t rhiGraphicsDepthFormat{};
     uint64_t rhiGraphicsVertexLayoutIdentity{};
     uint32_t rhiGraphicsTopology{};
 };

@@ -140,6 +140,8 @@ owns format and invocation planning; the D3D12 provider owns preparation and
 encoding. Three command frames rotate allocator/list ownership. Persistently
 mapped upload/readback rings and persistent RTV/resource/sampler descriptor
 rings grow geometrically and reuse storage after completed submissions. The
+RHI slot storage is address-stable because RuntimeCore resource references
+point directly at native resource state. The
 current C ABI submission remains synchronous, so ring wrap cannot overwrite
 in-flight GPU data; asynchronous submission will require fence-tagged ring
 segments.
@@ -149,6 +151,12 @@ and concrete vertex strides arrive with the first invocation. The resulting
 root signature (including descriptor tables), input layout, and PSO are cached
 as one prepared entry keyed by those invocation-stable properties. Repeated
 draws reuse the complete entry without creating new D3D12 pipeline objects.
+
+Small graphics uniforms use stage-local D3D12 root constants and Vulkan push
+constants instead of per-vertex buffers. Host matrices use the Python/NumPy
+row-major convention; Vulkan transposes square matrix payloads while packing
+push constants, while D3D12 HLSL and OpenGL consume the row-major payload
+through their native matrix binding conventions.
 
 D3D12 NativeInterop uses external-recording ownership. Borrowed devices,
 queues, and open direct command lists are referenced without `AddRef`; imported
@@ -166,15 +174,24 @@ completion to the RHI device state.
 
 Runtime-visible Vulkan buffers use device-local memory. Host transfers pass
 through persistent mapped upload/readback rings. Three command buffers and
-fences rotate from one RHI-owned command pool, and descriptor sets come from
-one resettable device pool. Submission remains synchronous for compatibility,
-so completed submissions safely reset transient ring offsets and descriptor
-allocations without per-invocation Vulkan object creation.
+fences rotate from one RHI-owned command pool. RHI resource slots use
+address-stable storage because RuntimeCore opaque resource references point at
+their native buffer, image, view, or sampler state. Descriptor sets come from
+one device pool and remain valid with their cached RuntimeCore binding sets;
+the pool is not reset per submission, and each set is individually returned
+when its binding set is destroyed. Submission remains synchronous for
+compatibility, so completed submissions safely reset transient ring offsets.
 
 Vulkan graphics prefers dynamic rendering when Vulkan 1.3, or Vulkan 1.2 with
 `VK_KHR_dynamic_rendering`, exposes the feature. Older devices use cached render
 passes keyed by attachment-location formats; framebuffers remain invocation
 specific because they contain the concrete image views and extent.
+
+Graphics draw invocations clear every color attachment to transparent black.
+An optional D32 attachment is cleared to one and enables less-than depth
+testing and depth writes in Vulkan, D3D12, and OpenGL. Python exposes this
+render-only resource as `DepthTexture`; sampled depth remains a separate
+extension because it requires an explicit shader-readable format/view contract.
 
 The deployable Runtime does not depend on LLVM, MLIR, GLFW, the CUDA Toolkit,
 or a statically linked Vulkan loader. Compiler and asset cooking remain host
@@ -420,3 +437,12 @@ names keep their module prefix before method mangling. Distinct shared and
 device-only methods may coexist on a shared struct; duplicate names are
 rejected rather than treated as host/device overloads. Device compilation
 continues to forbid recursion and mutable `self`.
+
+Graphics manifest schema 3 carries explicit vertex-attribute leaves. A bound
+Tensor has shape `(record_count, *logical_shape)`, contiguous row-major inner
+dimensions, an arbitrary positive record stride, and an independent base
+offset. Leaves select locations, dtype formats, component counts, and relative
+byte offsets; an instance divisor changes only fetch rate. OpenGL, Vulkan, and
+DirectX consume this common list and reject formats or location spans that the
+actual device cannot represent rather than applying rank or scalar-count
+limits.

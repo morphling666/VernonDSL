@@ -5,7 +5,6 @@ import atexit
 import hashlib
 import importlib
 import inspect
-import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
@@ -485,22 +484,28 @@ class Kernel:
         ]
         with _dispatch_borrow_scope(dispatch_borrows):
             native_values: list[Any] = []
-            parameters = (
-                argument for argument in compiled.function.args.args if argument.arg not in compiled.builtin_names
-            )
-            for parameter, value in zip(parameters, arguments, strict=True):
+            numpy_dtypes = {
+                state._native.DATA_BOOL: np.dtype(np.bool_),
+                state._native.DATA_I32: np.dtype(np.int32),
+                state._native.DATA_U32: np.dtype(np.uint32),
+                state._native.DATA_F16: np.dtype(np.float16),
+                state._native.DATA_F32: np.dtype(np.float32),
+                state._native.DATA_F64: np.dtype(np.float64),
+            }
+            for parameter, value in zip(compiled.native.parameters, arguments, strict=True):
                 if isinstance(value, (TensorStorage, TensorView)):
                     native_values.append(value._resident_buffer())
                 else:
-                    annotation = self._annotation_name(parameter.annotation)
-                    if annotation == "u32":
-                        native_values.append(struct.pack("<I", int(value)))
-                    elif annotation == "i32":
-                        native_values.append(struct.pack("<i", int(value)))
-                    elif annotation == "f64":
-                        native_values.append(struct.pack("<d", float(value)))
-                    else:
-                        native_values.append(struct.pack("<f", float(value)))
+                    dtype = numpy_dtypes.get(parameter.dtype)
+                    if dtype is None:
+                        raise TypeError(f"kernel parameter {parameter.name!r} has an unsupported dtype")
+                    host_value = np.asarray(value, dtype=dtype)
+                    if tuple(host_value.shape) != tuple(parameter.shape):
+                        raise ValueError(
+                            f"kernel parameter {parameter.name!r} expects shape {tuple(parameter.shape)}, "
+                            f"got {tuple(host_value.shape)}"
+                        )
+                    native_values.append(host_value.tobytes(order="C"))
             compiled.native.invoke(*grid, native_values)
             for name, value in zip(user_parameters, arguments, strict=True):
                 if name in compiled.writable_names and isinstance(value, (TensorStorage, TensorView)):

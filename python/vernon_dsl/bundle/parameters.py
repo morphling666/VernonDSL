@@ -27,6 +27,39 @@ def _backend_name(name: str) -> str:
     return f"_{result}" if not result or result[0].isdigit() else result
 
 
+def _uniform_layout(row: Mapping[str, Any], dtype: str | None, shape: Sequence[int]) -> dict[str, Any] | None:
+    size = row.get("physical_size")
+    alignment = row.get("physical_alignment")
+    storage_class = row.get("proposed_storage_class")
+    if not isinstance(size, int) or size <= 0 or not isinstance(alignment, int) or alignment <= 0:
+        return None
+    scalar_sizes = {"bool": 1, "f16": 2, "i32": 4, "u32": 4, "f32": 4, "f64": 8}
+    element_size = scalar_sizes.get(dtype or "")
+    if element_size is None:
+        return None
+    reflected_strides = row.get("array_strides")
+    if isinstance(reflected_strides, list) and len(reflected_strides) == len(shape):
+        byte_strides = reflected_strides
+    elif len(shape) == 2 and isinstance(row.get("matrix_stride"), int):
+        byte_strides = [element_size, row["matrix_stride"]]
+    elif len(shape) == 1:
+        byte_strides = [element_size]
+    elif not shape:
+        byte_strides = []
+    else:
+        return None
+    result = {
+        "storage": "uniform_buffer" if storage_class == "Uniform" else "inline",
+        "size": size,
+        "alignment": alignment,
+        "byte_strides": byte_strides,
+    }
+    matrix_order = row.get("matrix_order")
+    if isinstance(matrix_order, str):
+        result["matrix_order"] = matrix_order
+    return result
+
+
 def _internal_parameter_source(row: Mapping[str, Any]) -> str | None:
     legacy_markers = ("vernon.compiler_generated", "vernon.implicit_sampler", "vernon.system_value")
     if any(marker in row for marker in legacy_markers):
@@ -84,6 +117,12 @@ def reflected_parameters(
                 "access": row.get("access", "read"),
                 "dimension": row.get("dimension"),
             }
+            if (
+                interface_name == "uniform" or (stage == "compute" and row.get("kind") == "tensor_value")
+            ) and "uniform_layout" not in row:
+                layout = _uniform_layout(row, use["dtype"], use["shape"])
+                if layout is not None:
+                    use["uniform_layout"] = layout
             if internal_source is not None:
                 use["internal_source"] = internal_source
                 if internal_source == "system_value":
@@ -94,6 +133,9 @@ def reflected_parameters(
                 "vernon.set",
                 "vernon.binding",
                 "sampled_texture_bindings",
+                "uniform_layout",
+                "location_span",
+                "attribute_leaves",
             ):
                 if key in row:
                     use[key] = row[key]

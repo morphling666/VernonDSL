@@ -15,11 +15,296 @@ from advanced_pipeline_shader import (
 )
 from pipeline_shader import (
     colored_fragment,
+    copy_static_tensor_value,
+    depth_fragment,
+    depth_vertex,
+    divisor_two_attribute_vertex,
+    f16_attribute_vertex,
+    f32_attribute_vertex,
+    f64_attribute_vertex,
+    i32_attribute_vertex,
+    instanced_tensor_transform_vertex,
+    mat2_vertex,
+    matrix_elementwise_fragment,
+    matrix_vertex,
+    non_square_attribute_vertex,
+    numpy_tensor_fragment,
+    numpy_tensor_vertex,
+    oversized_tensor_attribute_vertex,
+    rank_three_tensor_attribute_vertex,
     solid_fragment,
+    static_tensor_fragment,
     translate_vertices,
     translated_vertex,
     triangle_vertex,
+    u32_attribute_vertex,
 )
+
+
+def assert_depth_attachment_selects_nearest(test: unittest.TestCase) -> None:
+    triangle = ((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75))
+    positions = vd.storage.from_numpy(
+        np.array(
+            [(*position, depth, 1.0) for depth in (0.2, 0.8) for position in triangle],
+            dtype=np.float32,
+        )
+    )
+    colors = vd.storage.from_numpy(
+        np.array(((1.0, 0.0, 0.0, 1.0),) * 3 + ((0.0, 1.0, 0.0, 1.0),) * 3, dtype=np.float32)
+    )
+    target = vd.Texture.zeros(shape=(32, 32))
+    depth = vd.DepthTexture.zeros(shape=(32, 32))
+
+    vd.pipeline(depth_vertex, depth_fragment)(position=positions, color=colors, target=target, depth=depth)
+
+    pixel = target.to_numpy()[16, 16]
+    test.assertGreater(int(pixel[0]), 240)
+    test.assertLess(int(pixel[1]), 10)
+
+
+def assert_rank_three_tensor_attribute_renders(test: unittest.TestCase) -> None:
+    values = np.zeros((3, 2, 2, 3), dtype=np.float32)
+    values[:, 0, 0, :2] = np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32)
+    values[:, 1, 1, :] = np.array((17.0, 23.0, 29.0), dtype=np.float32)
+    interleaved = np.zeros((3, 14), dtype=np.float32)
+    interleaved[:, :12] = values.reshape(3, 12)
+    storage = vd.storage.from_numpy(interleaved)
+    view = storage.view(shape=(3, 2, 2, 3), strides=(14, 6, 3, 1), access="read")
+    projection = np.zeros((3, 1, 3, 2), dtype=np.float32)
+    projection[:, 0, 0, 0] = 1.0
+    projection[:, 0, 1, 1] = 1.0
+    target = vd.Texture.zeros(shape=(32, 32))
+    vd.pipeline(rank_three_tensor_attribute_vertex, solid_fragment)(
+        value=view,
+        projection=vd.storage.from_numpy(projection),
+        target=target,
+    )
+    test.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
+
+
+def assert_instanced_mat4_tensor_attribute_renders(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+    transforms = np.eye(4, dtype=np.float32)[None, ...]
+    transforms[0, 0, 3] = 0.6
+    target = vd.Texture.zeros(shape=(32, 32))
+    vd.pipeline(instanced_tensor_transform_vertex, solid_fragment)(
+        position=positions,
+        transform=vd.storage.from_numpy(transforms),
+        target=target,
+    )
+    pixels = target.to_numpy()
+    test.assertGreater(int(pixels[16, 25, 0]), 240)
+    test.assertEqual(tuple(pixels[16, 16]), (0, 0, 0, 0))
+
+
+def assert_formal_attribute_formats_render(
+    test: unittest.TestCase,
+    *,
+    unsupported: frozenset[str] = frozenset(),
+) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+    cases = (
+        ("i32", i32_attribute_vertex, np.int32),
+        ("u32", u32_attribute_vertex, np.uint32),
+        ("f16", f16_attribute_vertex, np.float16),
+        ("f32", f32_attribute_vertex, np.float32),
+        ("f64", f64_attribute_vertex, np.float64),
+    )
+    for name, vertex, dtype in cases:
+        with test.subTest(dtype=name):
+            values = vd.storage.from_numpy(np.zeros((3, 2), dtype=dtype))
+            target = vd.Texture.zeros(shape=(32, 32))
+            render = vd.pipeline(vertex, solid_fragment)
+            if name in unsupported:
+                with test.assertRaisesRegex((vd.CompileError, RuntimeError), "support|capabilit|format"):
+                    render(position=positions, value=values, target=target)
+                continue
+            render(position=positions, value=values, target=target)
+            test.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
+
+
+def assert_non_square_and_divisor_two_attributes_render(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.25, -0.25), (0.25, -0.25), (0.0, 0.25)), dtype=np.float32))
+    non_square = vd.storage.from_numpy(np.zeros((3, 2, 3), dtype=np.float32))
+    target = vd.Texture.zeros(shape=(32, 32))
+    vd.pipeline(non_square_attribute_vertex, solid_fragment)(
+        position=positions,
+        value=non_square,
+        target=target,
+    )
+    test.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
+
+    offsets = vd.storage.from_numpy(np.array(((-0.5, 0.0), (0.5, 0.0)), dtype=np.float32))
+    target = vd.Texture.zeros(shape=(32, 32))
+    vd.pipeline(divisor_two_attribute_vertex, solid_fragment)(
+        position=positions,
+        offset=offsets,
+        target=target,
+    )
+    pixels = target.to_numpy()
+    test.assertGreater(int(pixels[16, 8, 0]), 240)
+    test.assertGreater(int(pixels[16, 24, 0]), 240)
+
+
+def assert_matrix_uniform_transforms_vertices(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+    transform = np.eye(4, dtype=np.float32)
+    transform[0, 3] = 0.65
+    target = vd.Texture.zeros(shape=(64, 64))
+
+    vd.pipeline(matrix_vertex, solid_fragment)(
+        position=positions,
+        transform=transform,
+        target=target,
+    )
+
+    pixels = target.to_numpy()
+    test.assertGreater(int(pixels[32, 48, 0]), 240)
+    test.assertEqual(tuple(pixels[32, 16]), (0, 0, 0, 0))
+
+
+def assert_mat2_uniform_transforms_vertices(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+    transform = np.array(((0.5, 0.0), (0.0, 1.0)), dtype=np.float32)
+    target = vd.Texture.zeros(shape=(64, 64))
+
+    vd.pipeline(mat2_vertex, solid_fragment)(position=positions, transform=transform, target=target)
+
+    pixels = target.to_numpy()
+    test.assertGreater(int(pixels[32, 32, 0]), 240)
+    test.assertEqual(tuple(pixels[32, 42]), (0, 0, 0, 0))
+
+
+def assert_rank_three_uniform_renders(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+    weights = np.zeros((2, 2, 2), dtype=np.float32)
+    weights[1, 0, 1] = 0.75
+    target = vd.Texture.zeros(shape=(32, 32))
+
+    vd.pipeline(triangle_vertex, static_tensor_fragment)(position=positions, weights=weights, target=target)
+
+    pixel = target.to_numpy()[16, 16]
+    test.assertAlmostEqual(int(pixel[0]), 191, delta=2)
+    test.assertEqual(int(pixel[1]), 0)
+    test.assertEqual(int(pixel[2]), 0)
+    test.assertGreater(int(pixel[3]), 250)
+
+
+def assert_matrix_elementwise_multiply_renders(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+    left = np.array(((0.2, 0.4), (0.6, 0.8)), dtype=np.float32)
+    right = np.array(((0.5, 0.5), (0.5, 1.0)), dtype=np.float32)
+    target = vd.Texture.zeros(shape=(32, 32))
+
+    vd.pipeline(triangle_vertex, matrix_elementwise_fragment)(
+        position=positions,
+        left=left,
+        right=right,
+        target=target,
+    )
+
+    np.testing.assert_allclose(
+        target.to_numpy()[16, 16],
+        np.rint((left * right).reshape(4) * 255.0).astype(np.uint8),
+        rtol=0.0,
+        atol=1,
+    )
+
+
+def assert_numpy_tensor_vertex_renders(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.25, -0.25), (0.25, -0.25), (0.0, 0.25)), dtype=np.float32))
+    offset_left = np.zeros((8, 8, 4), dtype=np.float32)
+    offset_left[7, 7, 0] = 0.25
+    offset_right = np.zeros((1, 8, 1), dtype=np.float32)
+    offset_right[0, 7, 0] = 0.25
+    transform = np.zeros((8, 8, 4), dtype=np.float32)
+    transform[7, 0, 0] = 1.0
+    transform[7, 1, 1] = 1.0
+    target = vd.Texture.zeros(shape=(64, 64))
+
+    vd.pipeline(numpy_tensor_vertex, solid_fragment)(
+        position=positions,
+        offset_left=offset_left,
+        offset_right=offset_right,
+        transform=transform,
+        target=target,
+    )
+
+    pixels = target.to_numpy()
+    test.assertGreater(int(pixels[32, 48, 0]), 240)
+    test.assertEqual(tuple(pixels[32, 24]), (0, 0, 0, 0))
+
+
+def assert_numpy_tensor_fragment_renders(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+    broadcast_left = np.linspace(0.05, 0.3, 8 * 8 * 4, dtype=np.float32).reshape(8, 8, 4)
+    broadcast_right = np.linspace(0.01, 0.08, 8, dtype=np.float32).reshape(1, 8, 1)
+    matmul_left = np.linspace(0.001, 0.03, 8 * 8 * 4, dtype=np.float32).reshape(8, 8, 4)
+    matmul_right = np.linspace(0.1, 0.4, 8, dtype=np.float32).reshape(1, 4, 2)
+    target = vd.Texture.zeros(shape=(32, 32))
+
+    vd.pipeline(triangle_vertex, numpy_tensor_fragment)(
+        position=positions,
+        broadcast_left=broadcast_left,
+        broadcast_right=broadcast_right,
+        matmul_left=matmul_left,
+        matmul_right=matmul_right,
+        target=target,
+    )
+
+    broadcasted = broadcast_left + broadcast_right
+    product = np.matmul(matmul_left, matmul_right)
+    expected = np.array(
+        (broadcasted[0, 0, 0], broadcasted[7, 7, 3], product[0, 0, 1], product[7, 7, 0]),
+        dtype=np.float32,
+    )
+    np.testing.assert_allclose(
+        target.to_numpy()[16, 16],
+        np.rint(expected * 255.0).astype(np.uint8),
+        rtol=0.0,
+        atol=1,
+    )
+
+
+def assert_static_tensor_compute_argument(test: unittest.TestCase) -> None:
+    output = vd.storage.from_numpy(np.full(12, -99.0, dtype=np.float32))
+    singleton = np.array((0.125,), dtype=np.float32)
+    quad = np.array((1.5, -2.0, 3.25, 4.75), dtype=np.float32)
+    weights = np.arange(8, dtype=np.float32).reshape((2, 2, 2)) * 0.25
+    large = np.arange(30, dtype=np.float32).reshape((2, 3, 5)) * -0.5
+    matrix_left = np.array(((1.5, -2.0), (3.25, 4.75)), dtype=np.float32)
+    matrix_right = np.array(((2.0, 0.5), (-1.0, 3.0)), dtype=np.float32)
+
+    copy_static_tensor_value(
+        output,
+        singleton,
+        quad,
+        weights,
+        large,
+        matrix_left,
+        matrix_right,
+        grid=(11, 1, 1),
+    )
+
+    np.testing.assert_allclose(
+        output.to_numpy(),
+        np.array(
+            (
+                singleton[0],
+                weights[0, 0, 0],
+                weights[1, 0, 1],
+                weights[1, 1, 1],
+                weights[1, 1, 0] * 2.0,
+                large[1, 2, 4],
+                quad[3],
+                *(matrix_left * matrix_right).reshape(4),
+                -99.0,
+            ),
+            dtype=np.float32,
+        ),
+        rtol=0.0,
+        atol=1e-6,
+    )
 
 
 @vd.func
@@ -133,6 +418,24 @@ class PipelineContractTests(unittest.TestCase):
 
 
 class OpenGLPipelineTests(unittest.TestCase):
+    def test_formal_attribute_numeric_formats_render_or_reject(self) -> None:
+        assert_formal_attribute_formats_render(self, unsupported=frozenset({"f16", "f64"}))
+
+    def test_non_square_and_divisor_two_attributes_render(self) -> None:
+        assert_non_square_and_divisor_two_attributes_render(self)
+
+    def test_instanced_mat4_tensor_attribute_renders(self) -> None:
+        assert_instanced_mat4_tensor_attribute_renders(self)
+
+    def test_rank_three_tensor_attribute_renders(self) -> None:
+        assert_rank_three_tensor_attribute_renders(self)
+
+    def test_oversized_tensor_attribute_reports_device_location_limit(self) -> None:
+        values = vd.storage.from_numpy(np.zeros((3, 8, 8, 4), dtype=np.float32))
+        target = vd.Texture.zeros(shape=(8, 8))
+        with self.assertRaisesRegex(RuntimeError, "location or format capabilities"):
+            vd.pipeline(oversized_tensor_attribute_vertex, solid_fragment)(value=values, target=target)
+
     def setUp(self) -> None:
         try:
             vd.init(arch=vd.opengl, api_version=(4, 3))
@@ -164,6 +467,30 @@ class OpenGLPipelineTests(unittest.TestCase):
         self.assertGreater(int(center[3]), 240)
         render(position=positions, target=target)
         self.assertEqual(render.compile_count, 1)
+
+    def test_depth_attachment_selects_nearest_fragment(self) -> None:
+        assert_depth_attachment_selects_nearest(self)
+
+    def test_matrix_uniform_transforms_vertices(self) -> None:
+        assert_matrix_uniform_transforms_vertices(self)
+
+    def test_mat2_uniform_transforms_vertices(self) -> None:
+        assert_mat2_uniform_transforms_vertices(self)
+
+    def test_rank_three_uniform_renders(self) -> None:
+        assert_rank_three_uniform_renders(self)
+
+    def test_matrix_elementwise_multiply_renders(self) -> None:
+        assert_matrix_elementwise_multiply_renders(self)
+
+    def test_numpy_tensor_vertex_renders(self) -> None:
+        assert_numpy_tensor_vertex_renders(self)
+
+    def test_numpy_tensor_fragment_renders(self) -> None:
+        assert_numpy_tensor_fragment_renders(self)
+
+    def test_static_tensor_compute_argument(self) -> None:
+        assert_static_tensor_compute_argument(self)
 
     def test_compute_stage_cannot_join_graphics_pipeline(self) -> None:
         with self.assertRaisesRegex(ValueError, "vertex, fragment"):
@@ -304,7 +631,36 @@ class OpenGLPipelineTests(unittest.TestCase):
         vd.pipeline(triangle_vertex, solid_fragment)(position=point_positions, target=target, topology=vd.points)
 
 
+class OpenGLESPipelineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        try:
+            vd.init(arch=vd.opengles, api_version=(3, 1))
+        except RuntimeError:
+            self.skipTest("OpenGL ES runtime unavailable")
+
+    def test_rank_three_tensor_attribute_arithmetic_renders(self) -> None:
+        assert_rank_three_tensor_attribute_renders(self)
+
+    def test_formal_attribute_numeric_formats_render_or_reject(self) -> None:
+        assert_formal_attribute_formats_render(self, unsupported=frozenset({"f16", "f64"}))
+
+    def test_non_square_and_divisor_two_attributes_render(self) -> None:
+        assert_non_square_and_divisor_two_attributes_render(self)
+
+
 class VulkanPipelineTests(unittest.TestCase):
+    def test_formal_attribute_numeric_formats_render_or_reject(self) -> None:
+        assert_formal_attribute_formats_render(self, unsupported=frozenset({"f16", "f64"}))
+
+    def test_non_square_and_divisor_two_attributes_render(self) -> None:
+        assert_non_square_and_divisor_two_attributes_render(self)
+
+    def test_instanced_mat4_tensor_attribute_renders(self) -> None:
+        assert_instanced_mat4_tensor_attribute_renders(self)
+
+    def test_rank_three_tensor_attribute_renders(self) -> None:
+        assert_rank_three_tensor_attribute_renders(self)
+
     def setUp(self) -> None:
         try:
             vd.init(arch=vd.vulkan)
@@ -324,6 +680,30 @@ class VulkanPipelineTests(unittest.TestCase):
         self.assertGreater(int(pixels[32, 32, 0]), 240)
         np.testing.assert_allclose(positions.to_numpy()[:, 0], np.array((-0.75, 0.75, 0.0), dtype=np.float32))
         self.assertEqual(render.compile_count, 1)
+
+    def test_depth_attachment_selects_nearest_fragment(self) -> None:
+        assert_depth_attachment_selects_nearest(self)
+
+    def test_matrix_uniform_transforms_vertices(self) -> None:
+        assert_matrix_uniform_transforms_vertices(self)
+
+    def test_mat2_uniform_transforms_vertices(self) -> None:
+        assert_mat2_uniform_transforms_vertices(self)
+
+    def test_rank_three_uniform_renders(self) -> None:
+        assert_rank_three_uniform_renders(self)
+
+    def test_matrix_elementwise_multiply_renders(self) -> None:
+        assert_matrix_elementwise_multiply_renders(self)
+
+    def test_numpy_tensor_vertex_renders(self) -> None:
+        assert_numpy_tensor_vertex_renders(self)
+
+    def test_numpy_tensor_fragment_renders(self) -> None:
+        assert_numpy_tensor_fragment_renders(self)
+
+    def test_static_tensor_compute_argument(self) -> None:
+        assert_static_tensor_compute_argument(self)
 
     def test_stage_uniforms_do_not_overlap_and_y_matches_opengl(self) -> None:
         target = vd.Texture.zeros(shape=(64, 64))
@@ -413,6 +793,47 @@ class VulkanPipelineTests(unittest.TestCase):
             vd.pipeline(triangle_vertex, solid_fragment)(
                 position=self._triangle(), target=vd.Texture.zeros(shape=(8, 8))
             )
+
+
+class DirectXPipelineTests(unittest.TestCase):
+    def test_formal_attribute_numeric_formats_render_or_reject(self) -> None:
+        assert_formal_attribute_formats_render(self, unsupported=frozenset({"f16", "f64"}))
+
+    def test_non_square_and_divisor_two_attributes_render(self) -> None:
+        assert_non_square_and_divisor_two_attributes_render(self)
+
+    def test_instanced_mat4_tensor_attribute_renders(self) -> None:
+        assert_instanced_mat4_tensor_attribute_renders(self)
+
+    def test_rank_three_tensor_attribute_renders(self) -> None:
+        assert_rank_three_tensor_attribute_renders(self)
+
+    def setUp(self) -> None:
+        try:
+            vd.init(arch=vd.directx)
+        except RuntimeError:
+            self.skipTest("DirectX 12 runtime unavailable")
+
+    def test_matrix_uniform_transforms_vertices(self) -> None:
+        assert_matrix_uniform_transforms_vertices(self)
+
+    def test_mat2_uniform_transforms_vertices(self) -> None:
+        assert_mat2_uniform_transforms_vertices(self)
+
+    def test_rank_three_uniform_renders(self) -> None:
+        assert_rank_three_uniform_renders(self)
+
+    def test_matrix_elementwise_multiply_renders(self) -> None:
+        assert_matrix_elementwise_multiply_renders(self)
+
+    def test_numpy_tensor_vertex_renders(self) -> None:
+        assert_numpy_tensor_vertex_renders(self)
+
+    def test_numpy_tensor_fragment_renders(self) -> None:
+        assert_numpy_tensor_fragment_renders(self)
+
+    def test_static_tensor_compute_argument(self) -> None:
+        assert_static_tensor_compute_argument(self)
 
 
 if __name__ == "__main__":

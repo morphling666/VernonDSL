@@ -81,8 +81,10 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     candidate.layout.argument_index = use.index;
                     candidate.layout.element_size = static_cast<uint32_t>(
                         argument.storageLeaves.empty()
-                            ? (argument.kind == "tensor" ? argument.tensorElementSize : argument.cpuSize)
+                            ? (argument.kind == "tensor" ? argument.tensorElementSize : argument.physicalSize)
                             : argument.storageLeaves[leafIndex].elementSize);
+                    // Aggregate lowering already folds each leaf's byte offset into the shader index.
+                    // Every leaf descriptor must therefore retain the base address of the original AoS buffer.
                     candidate.resourceOffset = 0;
                     candidates.push_back(candidate);
                 }
@@ -129,6 +131,7 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         const Stage &fragment = bundle.stages.at(variant.fragment);
         struct Candidate {
             VernonRuntimeProviderBindingLayoutEntry layout{};
+            std::vector<VernonRuntimeProviderVertexAttribute> attributes;
             VulkanPipelineState::Binding binding;
         };
         std::vector<Candidate> candidates;
@@ -145,34 +148,74 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
             candidate.layout.array_count = 1;
             candidate.binding.externalSlot = parameter.slot;
-            if (parameter.kind == "tensor" && parameter.dtype == "f32" && use.interfaceKind == "uniform") {
+            if (parameter.kind == "tensor" && use.interfaceKind == "uniform") {
                 const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
+                const std::optional<VernonDataType> dtype = pipelineDataType(parameter.dtype);
                 uint64_t count = 1;
-                for (uint64_t dimension : shape)
+                for (uint64_t dimension : shape) {
+                    if (!dimension || count > UINT32_MAX / dimension)
+                        return false;
                     count *= dimension;
-                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-                candidate.layout.element_size = static_cast<uint32_t>(count * sizeof(float));
+                }
+                if (!dtype)
+                    return false;
+                const size_t elementSize = dataTypeSize(*dtype);
+                candidate.layout.kind = use.uniformLayout && use.uniformLayout->storage == "uniform_buffer"
+                                            ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
+                                            : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                const uint64_t physicalSize = use.uniformLayout ? use.uniformLayout->size : count * elementSize;
+                if (!physicalSize || physicalSize > UINT32_MAX ||
+                    (candidate.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER && use.binding == UINT32_MAX))
+                    return false;
+                candidate.layout.element_size = static_cast<uint32_t>(physicalSize);
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
-                candidate.layout.value_count = static_cast<uint32_t>(count);
+                candidate.layout.element_count = static_cast<uint32_t>(count);
+                candidate.layout.binding = use.binding;
+                candidate.layout.set = use.descriptorSet;
                 candidate.binding.source = internal ? VulkanPipelineState::Binding::RESOLUTION
                                                     : VulkanPipelineState::Binding::EXTERNAL_UNIFORM;
+                candidate.binding.packing.dtype = *dtype;
+                candidate.binding.packing.shape = shape;
+                candidate.binding.packing.byteSize = static_cast<size_t>(physicalSize);
+                if (use.uniformLayout) {
+                    candidate.binding.packing.byteStrides.reserve(use.uniformLayout->byteStrides.size());
+                    for (uint64_t stride : use.uniformLayout->byteStrides) {
+                        if (stride > SIZE_MAX)
+                            return false;
+                        candidate.binding.packing.byteStrides.push_back(static_cast<size_t>(stride));
+                    }
+                } else {
+                    candidate.binding.packing.byteStrides.resize(shape.size());
+                    size_t stride = elementSize;
+                    const bool columnMajorMatrix =
+                        shape.size() == 2 && shape[0] == shape[1] && (shape[0] == 3 || shape[0] == 4);
+                    if (columnMajorMatrix) {
+                        candidate.binding.packing.byteStrides = {elementSize,
+                                                                 static_cast<size_t>(shape[0]) * elementSize};
+                    } else {
+                        for (size_t dimension = shape.size(); dimension-- > 0;) {
+                            candidate.binding.packing.byteStrides[dimension] = stride;
+                            stride *= static_cast<size_t>(shape[dimension]);
+                        }
+                    }
+                }
+                if (candidate.binding.packing.byteStrides.size() != shape.size())
+                    return false;
                 candidate.binding.storage.resize(candidate.layout.element_size);
-            } else if (parameter.kind == "tensor" && parameter.dtype == "f32" &&
-                       (use.interfaceKind == "input" || use.interfaceKind == "instance") && use.stage == "vertex") {
-                const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
-                uint64_t count = 1;
-                for (uint64_t dimension : shape)
-                    count *= dimension;
-                const uint32_t columns = shape.size() == 2 ? static_cast<uint32_t>(shape[0]) : 1;
+            } else if (parameter.kind == "tensor" && use.interfaceKind == "input" && use.stage == "vertex" &&
+                       use.location != UINT32_MAX && !use.attributeLeaves.empty()) {
+                const std::optional<VernonDataType> dtype = pipelineDataType(parameter.dtype);
+                if (!dtype || dataTypeSize(*dtype) == 0)
+                    return false;
                 candidate.layout.kind = VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
-                candidate.layout.element_size = sizeof(float);
+                candidate.layout.element_size = static_cast<uint32_t>(dataTypeSize(*dtype));
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_VERTEX_INPUT;
-                candidate.layout.value_count = static_cast<uint32_t>(count);
-                candidate.layout.column_count = columns;
-                candidate.layout.location = use.location;
                 candidate.layout.binding = vertexBinding++;
-                candidate.layout.divisor =
-                    use.interfaceKind == "instance" || use.divisor ? std::max(use.divisor, 1u) : 0;
+                candidate.layout.divisor = use.divisor;
+                for (const AttributeLeaf &leaf : use.attributeLeaves)
+                    candidate.attributes.push_back({candidate.layout.binding, use.location + leaf.locationOffset,
+                                                    static_cast<uint32_t>(*dtype), leaf.componentCount,
+                                                    leaf.byteOffset});
                 candidate.binding.source = VulkanPipelineState::Binding::EXTERNAL_VERTEX;
             } else if (parameter.kind == "texture" && use.interfaceKind == "resource") {
                 candidate.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE;
@@ -213,6 +256,8 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                   [](const auto &left, const auto &right) { return left.layout.slot < right.layout.slot; });
         for (auto &candidate : candidates) {
             state->rhiGraphicsLayout.push_back(candidate.layout);
+            state->rhiGraphicsVertexAttributes.insert(state->rhiGraphicsVertexAttributes.end(),
+                                                      candidate.attributes.begin(), candidate.attributes.end());
             state->rhiGraphicsBindingPlan.push_back(std::move(candidate.binding));
         }
         state->rhiGraphicsValues.resize(candidates.size());
@@ -240,6 +285,8 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         descriptor.shader_count = 2;
         descriptor.bindings = state->rhiGraphicsLayout.data();
         descriptor.binding_count = state->rhiGraphicsLayout.size();
+        descriptor.vertex_attributes = state->rhiGraphicsVertexAttributes.data();
+        descriptor.vertex_attribute_count = state->rhiGraphicsVertexAttributes.size();
         descriptor.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
         descriptor.sample_count = 1;
         const VernonStatus status =
@@ -354,10 +401,10 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
             if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR)
                 return fail(*pipeline.context, "Vulkan RHI uniform argument is missing");
             const VernonTensorView &tensor = found->second->tensor;
-            if (tensor.storage != VERNON_TENSOR_HOST || !tensor.host_data ||
-                tensor.byte_size != prepared.storage.size())
+            const std::optional<std::vector<uint8_t>> packed = packTensor(tensor, prepared.packing);
+            if (!packed || packed->size() != prepared.storage.size())
                 return fail(*pipeline.context, "Vulkan RHI uniform Tensor is invalid");
-            std::memcpy(prepared.storage.data(), hostTensorData(tensor), prepared.storage.size());
+            prepared.storage = *packed;
             value.inline_data = prepared.storage.data();
             value.inline_size = prepared.storage.size();
         }
@@ -379,6 +426,7 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
     if (plan.attachments.empty() || plan.attachments.size() > 8)
         return fail(*pipeline.context, "Vulkan RHI draw requires one to eight color attachments");
     std::array<VernonRuntimeProviderColorAttachment, 8> attachments{};
+    VernonRuntimeProviderResourceReference depthAttachment{};
     std::vector<uint32_t> formats;
     for (size_t index = 0; index < plan.attachments.size(); ++index) {
         attachments[index].location = plan.attachments[index]->location;
@@ -394,6 +442,15 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
             formats.push_back(static_cast<uint32_t>(texture.format));
         }
     }
+    if (plan.depthAttachment) {
+        if (plan.depthAttachment->resource.resource.value)
+            depthAttachment = plan.depthAttachment->resource;
+        else {
+            auto &texture = vulkanTextureState(*plan.depthAttachment->texture);
+            depthAttachment.identity = vulkanRhiAdapterResourceIdentity(adapter);
+            depthAttachment.resource.value = reinterpret_cast<uintptr_t>(&texture);
+        }
+    }
     uint64_t vertexIdentity = 1469598103934665603ull;
     std::vector<uint32_t> vertexStrides;
     for (size_t index = 0; index < state.rhiGraphicsLayout.size(); ++index) {
@@ -405,15 +462,17 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
         vertexStrides[binding] = state.rhiGraphicsValues[index].stride;
         vertexIdentity = (vertexIdentity ^ state.rhiGraphicsValues[index].stride) * 1099511628211ull;
     }
+    const uint32_t depthFormat = plan.depthAttachment ? static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT) : 0;
     if (!state.rhiGraphicsVariant || state.rhiGraphicsFormats != formats ||
-        state.rhiGraphicsTopology != invocation.topology || state.rhiGraphicsVertexLayoutIdentity != vertexIdentity) {
+        state.rhiGraphicsDepthFormat != depthFormat || state.rhiGraphicsTopology != invocation.topology ||
+        state.rhiGraphicsVertexLayoutIdentity != vertexIdentity) {
         vernonRuntimeCoreGraphicsVariantDestroy(state.rhiGraphicsVariant);
         state.rhiGraphicsVariant = nullptr;
         const VernonRuntimeCoreGraphicsCompatibility compatibility{sizeof(VernonRuntimeCoreGraphicsCompatibility),
                                                                    static_cast<uint32_t>(invocation.topology),
                                                                    formats.data(),
                                                                    formats.size(),
-                                                                   0,
+                                                                   depthFormat,
                                                                    1,
                                                                    vertexStrides.data(),
                                                                    vertexStrides.size(),
@@ -430,6 +489,7 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
                         status);
         }
         state.rhiGraphicsFormats = std::move(formats);
+        state.rhiGraphicsDepthFormat = depthFormat;
         state.rhiGraphicsTopology = invocation.topology;
         state.rhiGraphicsVertexLayoutIdentity = vertexIdentity;
     }
@@ -440,6 +500,7 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
     draw.instance_count = plan.instanceCount;
     draw.color_attachments = attachments.data();
     draw.color_attachment_count = plan.attachments.size();
+    draw.depth_stencil_attachment = depthAttachment;
     draw.viewport[0] = hasViewport ? invocation.viewport[0] : 0;
     draw.viewport[1] = hasViewport ? invocation.viewport[1] : 0;
     draw.viewport[2] = hasViewport ? invocation.viewport[2] : plan.attachmentWidth;
@@ -481,12 +542,19 @@ VernonStatus invokeVulkanComputePipeline(VernonLoadedPipeline &pipeline, const P
                 return fail(*pipeline.context, "Vulkan prepared storage binding requires a device Tensor");
             if (argument.resource.resource.value) {
                 value.resource = argument.resource;
-                value.resource.offset += state.rhiComputeResourceOffsets[index];
+                const uint64_t leafOffset = state.rhiComputeResourceOffsets[index];
+                if (leafOffset > value.resource.size)
+                    return fail(*pipeline.context, "Vulkan aggregate storage leaf exceeds its Tensor resource");
+                value.resource.offset += leafOffset;
+                value.resource.size -= leafOffset;
             } else {
+                const uint64_t leafOffset = state.rhiComputeResourceOffsets[index];
+                if (leafOffset > argument.buffer->size)
+                    return fail(*pipeline.context, "Vulkan aggregate storage leaf exceeds its Tensor buffer");
                 value.resource.identity = identity;
                 value.resource.resource.value = reinterpret_cast<uintptr_t>(&vulkanBufferState(*argument.buffer));
-                value.resource.offset = state.rhiComputeResourceOffsets[index];
-                value.resource.size = argument.buffer->size;
+                value.resource.offset = leafOffset;
+                value.resource.size = argument.buffer->size - leafOffset;
             }
         } else {
             if (argument.kind != ComputeLaunchArgumentKind::Scalar || !argument.scalarData)

@@ -180,8 +180,8 @@ def _annotation(kind: str, *arguments: Any) -> Annotation:
     return Annotation(kind, arguments)
 
 
-def location(index: int) -> Annotation:
-    return _annotation("location", index)
+def attribute(location: int | None = None, divisor: int = 0) -> Annotation:
+    return _annotation("attribute", -1 if location is None else location, divisor)
 
 
 def builtin(name: str) -> Annotation:
@@ -200,7 +200,3 @@ def varying() -> Annotation:
 
 def resource(set: int, binding: int) -> Annotation:
     return _annotation("resource", set, binding)
-
-
-def instance(location: int | None = None, divisor: int = 1) -> Annotation:
-    return _annotation("instance", *((location, divisor) if location is not None else ()))

@@ -161,12 +161,11 @@ class TypeParser:
             raise self.context.error(node, "DSL annotation metadata must be a call")
         kind = (dotted_name(node.func) or "").split(".")[-1]
         arities: dict[str, int | tuple[int, ...]] = {
-            "location": 1,
+            "attribute": (0, 1, 2),
             "builtin": 1,
             "uniform": (0, 2),
             "varying": 0,
             "resource": 2,
-            "instance": (1, 2),
         }
         if kind not in arities:
             raise self.context.error(node, f"unknown annotation metadata '{kind}'")
@@ -176,11 +175,13 @@ class TypeParser:
                 if keyword.arg is None:
                     raise self.context.error(keyword, "metadata does not support **kwargs")
                 values[keyword.arg] = keyword.value
-            if kind in {"resource", "uniform"} and not node.args:
+            if kind == "attribute" and not node.args:
+                args = [
+                    values.get("location", ast.Constant(value=-1)),
+                    values.get("divisor", ast.Constant(value=0)),
+                ]
+            elif kind in {"resource", "uniform"} and not node.args:
                 args = [values[key] for key in ("set", "binding") if key in values]
-            elif kind == "instance" and not node.args:
-                args = [values["location"]] if "location" in values else []
-                args.append(values.get("divisor", ast.Constant(value=1)))
             else:
                 raise self.context.error(node, f"{kind} metadata does not accept keyword arguments here")
         else:
@@ -198,6 +199,14 @@ class TypeParser:
             ):
                 raise self.context.error(argument, "metadata arguments must be integer or string literals")
             parsed.append(argument.value)
-        if kind == "instance" and len(parsed) == 1:
-            parsed.append(1)
+        if kind == "attribute":
+            if not parsed:
+                parsed.extend((-1, 0))
+            elif len(parsed) == 1:
+                parsed.append(0)
+            location, divisor = parsed
+            if not isinstance(location, int) or location < -1:
+                raise self.context.error(node, "attribute location must be non-negative")
+            if not isinstance(divisor, int) or divisor < 0:
+                raise self.context.error(node, "attribute divisor must be non-negative")
         return Metadata(kind, tuple(parsed))

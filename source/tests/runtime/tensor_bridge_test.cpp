@@ -108,4 +108,55 @@ TEST(TensorBridgeTest, PacksNegativeStrideFromLogicalFirstElement) {
     EXPECT_EQ(std::memcmp(packed->data(), expected.data(), sizeof(expected)), 0);
 }
 
+TEST(TensorBridgeTest, PacksNonSquareMatrixIntoReflectedColumnMajorLayout) {
+    const std::array<float, 6> source{1, 2, 3, 4, 5, 6};
+    const std::array<float, 6> expected{1, 4, 2, 5, 3, 6};
+    const std::array<uint64_t, 2> shape{2, 3};
+    const std::array<int64_t, 2> strides{3 * sizeof(float), sizeof(float)};
+    VernonTensorView tensor{sizeof(VernonTensorView),
+                            VERNON_TENSOR_HOST,
+                            {source.data()},
+                            VERNON_DATA_F32,
+                            VERNON_ACCESS_READ,
+                            2,
+                            shape.data(),
+                            strides.data(),
+                            0,
+                            sizeof(source)};
+    vernon::runtime::TensorPackingLayout layout{
+        VERNON_DATA_F32, {2, 3}, {sizeof(float), 2 * sizeof(float)}, sizeof(expected)};
+
+    const auto packed = vernon::runtime::packTensor(tensor, layout);
+    ASSERT_TRUE(packed);
+    EXPECT_EQ(std::memcmp(packed->data(), expected.data(), sizeof(expected)), 0);
+}
+
+TEST(TensorBridgeTest, PacksRankThreeTensorWithReflectedPadding) {
+    const std::array<float, 8> source{1, 2, 3, 4, 5, 6, 7, 8};
+    const std::array<uint64_t, 3> shape{2, 2, 2};
+    const std::array<int64_t, 3> strides{4 * sizeof(float), 2 * sizeof(float), sizeof(float)};
+    VernonTensorView tensor{sizeof(VernonTensorView),
+                            VERNON_TENSOR_HOST,
+                            {source.data()},
+                            VERNON_DATA_F32,
+                            VERNON_ACCESS_READ,
+                            3,
+                            shape.data(),
+                            strides.data(),
+                            0,
+                            sizeof(source)};
+    vernon::runtime::TensorPackingLayout layout{VERNON_DATA_F32, {2, 2, 2}, {32, 16, 4}, 56};
+
+    const auto packed = vernon::runtime::packTensor(tensor, layout);
+    ASSERT_TRUE(packed);
+    for (size_t linear = 0; linear < source.size(); ++linear) {
+        const size_t outer = linear / 4;
+        const size_t middle = (linear / 2) % 2;
+        const size_t inner = linear % 2;
+        float value = 0;
+        std::memcpy(&value, packed->data() + outer * 32 + middle * 16 + inner * 4, sizeof(value));
+        EXPECT_EQ(value, source[linear]);
+    }
+}
+
 } // namespace

@@ -93,8 +93,8 @@ bool Driver::loadDevice(VkDevice device) {
     VERNON_LOAD_VULKAN_DEVICE(destroyPipeline, "vkDestroyPipeline");
     VERNON_LOAD_VULKAN_DEVICE(createDescriptorPool, "vkCreateDescriptorPool");
     VERNON_LOAD_VULKAN_DEVICE(destroyDescriptorPool, "vkDestroyDescriptorPool");
-    VERNON_LOAD_VULKAN_DEVICE(resetDescriptorPool, "vkResetDescriptorPool");
     VERNON_LOAD_VULKAN_DEVICE(allocateDescriptorSets, "vkAllocateDescriptorSets");
+    VERNON_LOAD_VULKAN_DEVICE(freeDescriptorSets, "vkFreeDescriptorSets");
     VERNON_LOAD_VULKAN_DEVICE(updateDescriptorSets, "vkUpdateDescriptorSets");
     VERNON_LOAD_VULKAN_DEVICE(cmdBindPipeline, "vkCmdBindPipeline");
     VERNON_LOAD_VULKAN_DEVICE(cmdBindDescriptorSets, "vkCmdBindDescriptorSets");

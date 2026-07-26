@@ -32,9 +32,12 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
             }
             ReflectedArgument argument;
             argument.kind = value.value("kind", "scalar");
+            if (argument.kind == "tensor_value")
+                argument.kind = "scalar";
             argument.builtin = value.value("builtin", "");
             argument.cpuOffset = value.value("cpu_offset", size_t{0});
             argument.cpuSize = value.value("cpu_size", size_t{0});
+            argument.physicalSize = value.value("physical_size", argument.cpuSize);
             argument.alignment = value.value("alignment", size_t{1});
             argument.descriptorSet = value.value("vernon.set", uint32_t{0});
             argument.binding = value.value("vernon.binding", UINT32_MAX);

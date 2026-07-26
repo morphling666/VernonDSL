@@ -181,6 +181,35 @@ Value storageLeafIndex(Value recordIndex, uint64_t recordSize, const StorageLeaf
     return result;
 }
 
+FailureOr<SmallVector<uint64_t>> staticTensorByteStrides(RankedTensorType tensor) {
+    if (!tensor.hasStaticShape() || !tensor.getElementType().isIntOrFloat() ||
+        llvm::any_of(tensor.getShape(), [](int64_t extent) { return extent <= 0; }))
+        return failure();
+    const uint64_t elementSize = std::max<uint64_t>(tensor.getElementType().getIntOrFloatBitWidth() / 8, 1);
+    SmallVector<uint64_t> strides(tensor.getRank());
+    if (tensor.getRank() == 2 && tensor.getDimSize(0) >= 2 && tensor.getDimSize(0) <= 4 && tensor.getDimSize(1) >= 2 &&
+        tensor.getDimSize(1) <= 4) {
+        const uint64_t rows = tensor.getDimSize(0);
+        const uint64_t alignment = std::max<uint64_t>((rows == 2 ? 2 : 4) * elementSize, 16);
+        strides[0] = elementSize;
+        strides[1] = llvm::alignTo(rows * elementSize, alignment);
+        return strides;
+    }
+    if (tensor.getRank() == 1 && tensor.getDimSize(0) >= 2 && tensor.getDimSize(0) <= 4) {
+        strides[0] = elementSize;
+        return strides;
+    }
+    uint64_t size = elementSize;
+    uint64_t alignment = elementSize;
+    for (int64_t dimension = tensor.getRank(); dimension-- > 0;) {
+        alignment = std::max<uint64_t>(alignment, 16);
+        const uint64_t stride = llvm::alignTo(size, alignment);
+        strides[dimension] = stride;
+        size = stride * static_cast<uint64_t>(tensor.getDimSize(dimension));
+    }
+    return strides;
+}
+
 struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<ModuleOp>> {
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VernonToGPUPass)
 
@@ -221,19 +250,44 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
         OpBuilder moduleBuilder = OpBuilder::atBlockBegin(gpuModule.getBody());
 
         for (func::FuncOp source : computeEntries) {
+            struct InlineTensorArgument {
+                unsigned sourceIndex;
+                unsigned kernelIndex;
+                RankedTensorType type;
+            };
             SmallVector<Type> kernelArgumentTypes;
             DenseMap<unsigned, std::pair<unsigned, unsigned>> sourceArgumentRanges;
+            SmallVector<InlineTensorArgument> inlineTensorArguments;
             SmallVector<std::pair<unsigned, std::pair<unsigned, unsigned>>> resourceBindings;
-            unsigned nextBinding = 0;
-            for (unsigned index = 0; index < source.getNumArguments(); ++index) {
-                InterfaceAttrs attrs = parseInterfaceAttrs(source.getArgAttrDict(index));
-                if (attrs.binding)
-                    nextBinding =
-                        std::max(nextBinding, static_cast<unsigned>(cast<IntegerAttr>(attrs.binding).getInt() + 1));
-            }
             for (auto [index, type] : llvm::enumerate(source.getArgumentTypes())) {
                 InterfaceAttrs attrs = parseInterfaceAttrs(source.getArgAttrDict(index));
                 auto kind = dyn_cast_if_present<StringAttr>(attrs.kind);
+                if (!attrs.builtin && isa<TensorType>(type)) {
+                    source.emitError() << "aggregate-element Tensor-by-value compute argument #" << index
+                                       << " is not supported; use a scalar-element static Tensor";
+                    return signalPassFailure();
+                }
+                if (!attrs.builtin) {
+                    if (auto tensor = dyn_cast<RankedTensorType>(type)) {
+                        FailureOr<SmallVector<uint64_t>> strides = staticTensorByteStrides(tensor);
+                        if (failed(strides)) {
+                            source.emitError() << "compute Tensor-by-value argument #" << index
+                                               << " must have a positive static shape and scalar element type";
+                            return signalPassFailure();
+                        }
+                        if (!useSpirvStorage) {
+                            source.emitError()
+                                << "static Tensor-by-value compute argument #" << index
+                                << " is currently supported only by descriptor-backed SPIR-V compute targets";
+                            return signalPassFailure();
+                        }
+                        unsigned kernelIndex = kernelArgumentTypes.size();
+                        kernelArgumentTypes.push_back(convertStorageLeaf(tensor.getElementType(), true));
+                        resourceBindings.emplace_back(kernelIndex, std::make_pair(0u, kernelIndex));
+                        inlineTensorArguments.push_back({static_cast<unsigned>(index), kernelIndex, tensor});
+                        continue;
+                    }
+                }
                 if (kind && kind.getValue() == "resource") {
                     auto view = dyn_cast<TensorViewType>(type);
                     FailureOr<StorageLayout> layout = view ? resolveStorageLayout(view.getElementType(), module)
@@ -244,12 +298,10 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                     }
                     unsigned firstKernelIndex = kernelArgumentTypes.size();
                     auto descriptorSet = cast<IntegerAttr>(attrs.descriptorSet);
-                    auto binding = cast<IntegerAttr>(attrs.binding);
-                    for (auto [leafIndex, leaf] : llvm::enumerate(layout->leaves)) {
+                    for (const StorageLeaf &leaf : layout->leaves) {
                         unsigned kernelIndex = kernelArgumentTypes.size();
                         kernelArgumentTypes.push_back(convertStorageLeaf(leaf.type, useSpirvStorage));
-                        unsigned leafBinding = leafIndex == 0 ? binding.getInt() : nextBinding++;
-                        resourceBindings.emplace_back(kernelIndex, std::make_pair(descriptorSet.getInt(), leafBinding));
+                        resourceBindings.emplace_back(kernelIndex, std::make_pair(descriptorSet.getInt(), kernelIndex));
                     }
                     sourceArgumentRanges[index] = {firstKernelIndex, layout->leaves.size()};
                 } else if (!attrs.builtin && (type.isIntOrIndexOrFloat() || isa<VectorType>(type))) {
@@ -303,6 +355,30 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                                           entry->getArguments().begin() + range.first + range.second);
                 sourceViewExpansions[source.getArgument(sourceIndex)] = expansion;
                 kernelViewExpansions[first] = std::move(expansion);
+            }
+            for (const InlineTensorArgument &inlineTensor : inlineTensorArguments) {
+                RankedTensorType tensor = inlineTensor.type;
+                FailureOr<SmallVector<uint64_t>> byteStrides = staticTensorByteStrides(tensor);
+                if (failed(byteStrides))
+                    return signalPassFailure();
+                const uint64_t elementSize = std::max<uint64_t>(tensor.getElementType().getIntOrFloatBitWidth() / 8, 1);
+                SmallVector<Value> elements;
+                elements.reserve(tensor.getNumElements());
+                for (int64_t linear = 0; linear < tensor.getNumElements(); ++linear) {
+                    int64_t remaining = linear;
+                    uint64_t byteOffset = 0;
+                    for (int64_t dimension = tensor.getRank(); dimension-- > 0;) {
+                        const uint64_t index = remaining % tensor.getDimSize(dimension);
+                        remaining /= tensor.getDimSize(dimension);
+                        byteOffset += index * (*byteStrides)[dimension];
+                    }
+                    Value elementIndex =
+                        arith::ConstantIndexOp::create(bodyBuilder, source.getLoc(), byteOffset / elementSize);
+                    elements.push_back(memref::LoadOp::create(
+                        bodyBuilder, source.getLoc(), entry->getArgument(inlineTensor.kernelIndex), elementIndex));
+                }
+                mapping.map(source.getArgument(inlineTensor.sourceIndex),
+                            tensor::FromElementsOp::create(bodyBuilder, source.getLoc(), tensor, elements));
             }
 
             for (auto [index, argument] : llvm::enumerate(source.getArguments())) {

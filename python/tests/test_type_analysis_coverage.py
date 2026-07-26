@@ -84,15 +84,14 @@ class TypeParserCoverageTests(unittest.TestCase):
 
     def test_metadata_success_paths(self) -> None:
         expected = {
-            "Annotated[f32, location(1)]": ("location", (1,)),
+            "Annotated[f32, attribute()]": ("attribute", (-1, 0)),
+            "Annotated[f32, attribute(divisor=2)]": ("attribute", (-1, 2)),
+            "Annotated[f32, attribute(location=3, divisor=2)]": ("attribute", (3, 2)),
             'Annotated[f32, builtin("position")]': ("builtin", ("position",)),
             "Annotated[f32, uniform()]": ("uniform", ()),
             "Annotated[f32, uniform(set=1, binding=2)]": ("uniform", (1, 2)),
             "Annotated[f32, varying()]": ("varying", ()),
             "Annotated[f32, resource(set=1, binding=2)]": ("resource", (1, 2)),
-            "Annotated[f32, instance(3)]": ("instance", (3, 1)),
-            "Annotated[f32, instance(location=3)]": ("instance", (3, 1)),
-            "Annotated[f32, instance(location=3, divisor=2)]": ("instance", (3, 2)),
         }
         for source, metadata in expected.items():
             with self.subTest(source=source):
@@ -103,10 +102,10 @@ class TypeParserCoverageTests(unittest.TestCase):
         cases = {
             "Annotated[f32, marker]": "metadata must be a call",
             "Annotated[f32, unknown()]": "unknown annotation metadata",
-            "Annotated[f32, location()]": "wrong number",
+            "Annotated[f32, location(0)]": "unknown annotation metadata",
+            "Annotated[f32, instance(location=0)]": "unknown annotation metadata",
             "Annotated[f32, varying(1)]": "wrong number",
-            "Annotated[f32, location(True)]": "integer or string",
-            "Annotated[f32, location(value=1)]": "does not accept keyword",
+            "Annotated[f32, attribute(divisor=-1)]": "integer or string",
             "Annotated[f32, resource(**opts)]": r"\*\*kwargs",
             "Annotated[f32, resource(set=1)]": "wrong number",
         }
@@ -289,11 +288,11 @@ class InferenceDiagnosticCoverageTests(unittest.TestCase):
             ),
             (
                 "@fragment\ndef main(value: f32) -> f32:\n    return matmul(value, value)\n",
-                "left operand must be a matrix",
+                "left operand must be a non-scalar Tensor",
             ),
             (
                 "@fragment\ndef main(value: Matrix[f32, 2, 2]) -> f32:\n    return matmul(value, 1)\n",
-                "right operand must be a Tensor",
+                "right operand must be a non-scalar Tensor",
             ),
             (
                 "@fragment\ndef main(value: f32) -> f32:\n    return unknown(value)\n",

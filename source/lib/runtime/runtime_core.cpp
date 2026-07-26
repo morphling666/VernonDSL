@@ -127,6 +127,7 @@ VernonStatus retainResources(const VernonRuntimeDeviceProvider &provider,
     size_t resourceCount = 0;
     for (size_t index = 0; index < valueCount; ++index)
         resourceCount += values[index].kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
+                         values[index].kind != VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER &&
                          (values[index].flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) == 0;
     try {
         resources.reserve(resourceCount);
@@ -134,7 +135,8 @@ VernonStatus retainResources(const VernonRuntimeDeviceProvider &provider,
         return VERNON_STATUS_INTERNAL_ERROR;
     }
     for (size_t index = 0; index < valueCount; ++index) {
-        if (values[index].kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE) {
+        if (values[index].kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
+            values[index].kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
             if (!values[index].inline_data || values[index].inline_size == 0) {
                 releaseResources(provider, resources);
                 resources.clear();
@@ -205,6 +207,8 @@ extern "C" VernonStatus vernonRuntimeCorePreparePipeline(const VernonRuntimeDevi
         sizeof(VernonRuntimeProviderPipelineLayoutDescriptor),
         descriptor->bindings,
         descriptor->binding_count,
+        descriptor->vertex_attributes,
+        descriptor->vertex_attribute_count,
         descriptor->push_constant_size,
         {0, 0, 0, 0}};
     VernonStatus status = provider->prepare_pipeline_layout(provider->user_data, &layoutDescriptor, &pipeline->layout);
@@ -270,7 +274,8 @@ extern "C" VernonStatus vernonRuntimeCoreCreateBindings(VernonRuntimeCorePipelin
     try {
         size_t resourceSlotCount = 0;
         for (size_t index = 0; index < valueCount; ++index)
-            resourceSlotCount += values[index].kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+            resourceSlotCount += values[index].kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
+                                 values[index].kind != VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER;
         bindings->resources.reserve(resourceSlotCount);
         bindings->pendingResources.reserve(resourceSlotCount);
     } catch (const std::bad_alloc &) {
@@ -439,6 +444,7 @@ extern "C" VernonStatus vernonRuntimeCoreEncodeDraw(const VernonRuntimeCorePipel
                                                      firstInstance,
                                                      nullptr,
                                                      0,
+                                                     {},
                                                      {0, 0, 0, 0},
                                                      0,
                                                      {},
@@ -467,6 +473,7 @@ extern "C" VernonStatus vernonRuntimeCoreEncodeDrawInvocation(const VernonRuntim
         invocation->first_instance,
         invocation->color_attachments,
         invocation->color_attachment_count,
+        invocation->depth_stencil_attachment,
         {invocation->viewport[0], invocation->viewport[1], invocation->viewport[2], invocation->viewport[3]},
         invocation->topology,
         invocation->index_buffer,
@@ -497,6 +504,7 @@ vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(const VernonRuntimeCoreGrap
         invocation->first_instance,
         invocation->color_attachments,
         invocation->color_attachment_count,
+        invocation->depth_stencil_attachment,
         {invocation->viewport[0], invocation->viewport[1], invocation->viewport[2], invocation->viewport[3]},
         invocation->topology,
         invocation->index_buffer,

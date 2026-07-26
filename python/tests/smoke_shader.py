@@ -3,16 +3,16 @@ from vernon_dsl import *
 
 @vertex
 def vertex_main(
-    position: Annotated[Vector[f32, 4], location(0)],
+    position: Annotated[Vector[f32, 4], attribute()],
     offset: Annotated[Vector[f32, 4], uniform()],
-) -> Annotated[Vector[f32, 4], location(0)]:
+) -> Vector[f32, 4]:
     return position + offset
 
 
 @fragment
 def fragment_main(
     color: Annotated[Vector[f32, 4], varying()],
-) -> Annotated[Vector[f32, 4], location(0)]:
+) -> Vector[f32, 4]:
     return color
 
 

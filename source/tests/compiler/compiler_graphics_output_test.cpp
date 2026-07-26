@@ -237,10 +237,10 @@ void expectPackedPushConstants(std::string_view artifact) {
     }
 
     EXPECT_EQ(pushVariableCount, 1u);
-    EXPECT_EQ(structMemberCount, 3u);
-    EXPECT_EQ(offsets, (std::array<uint32_t, 3>{0, 64, 128}));
-    EXPECT_EQ(strides, (std::array<uint32_t, 3>{16, 16, 16}));
-    EXPECT_EQ(columnMajor, (std::array<bool, 3>{true, true, true}));
+    EXPECT_EQ(structMemberCount, 2u);
+    EXPECT_EQ(offsets, (std::array<uint32_t, 3>{0, 64, UINT32_MAX}));
+    EXPECT_EQ(strides, (std::array<uint32_t, 3>{16, 16, 0}));
+    EXPECT_EQ(columnMajor, (std::array<bool, 3>{true, true, false}));
     EXPECT_TRUE(blockDecorated);
     EXPECT_EQ(pushInterfaceCount, 1u);
 }
@@ -292,11 +292,9 @@ TEST(CompilerGraphicsOutput, PreservesInterfacesTexturesAndSwizzles) {
                 ASSERT_TRUE(output.find(name) != std::string::npos);
             EXPECT_EQ(output.find("cube_map_vertex_push_constants"), std::string::npos);
             if (target == VERNON_TARGET_OPENGL) {
-                for (std::string_view declaration :
-                     {"uniform mat4 projection;", "uniform mat4 view;", "uniform mat4 model;"})
+                for (std::string_view declaration : {"uniform mat4 projection;", "uniform mat4 view;"})
                     EXPECT_NE(output.find(declaration), std::string::npos);
-                EXPECT_EQ(output.find("struct "), std::string::npos);
-                EXPECT_EQ(output.find("._m0"), std::string::npos);
+                EXPECT_NE(output.find("model._m0"), std::string::npos);
             }
         }
         if (target != VERNON_TARGET_VULKAN) {
@@ -463,5 +461,272 @@ module {
         }
         vernonCompileResultDestroy(result);
     }
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerGraphicsOutput, LowersRecursiveStaticTensorValuesAndReflectsPhysicalLayout) {
+    constexpr std::string_view tensorModule = R"mlir(
+module {
+  func.func @static_tensor_fragment(
+      %value: tensor<2x3x5xf32> {
+        vernon.interface = "uniform",
+        vernon.source_name = "value",
+        vernon.dtype = "f32"
+      },
+      %matrix: tensor<3x4xf32> {
+        vernon.interface = "uniform",
+        vernon.source_name = "matrix",
+        vernon.dtype = "f32"
+      },
+      %matrix2: tensor<4x4xf32> {
+        vernon.interface = "uniform",
+        vernon.source_name = "matrix2",
+        vernon.dtype = "f32"
+      },
+      %matrix3: tensor<4x4xf32> {
+        vernon.interface = "uniform",
+        vernon.source_name = "matrix3",
+        vernon.dtype = "f32"
+      }) -> (f32 {
+        vernon.interface = "output",
+        vernon.location = 0 : i64
+      }) attributes {vernon.entry, vernon.stage = "fragment"} {
+    %ones = arith.constant dense<1.0> : tensor<2x3x5xf32>
+    %sum = arith.addf %value, %ones : tensor<2x3x5xf32>
+    %one = arith.constant 1.0 : f32
+    %two = arith.constant 2.0 : f32
+    %constructed = tensor.from_elements %one, %two : tensor<1x1x2xf32>
+    %matrix_constructed = tensor.from_elements
+        %one, %two, %one, %two, %one, %two,
+        %one, %two, %one, %two, %one, %two : tensor<3x4xf32>
+    %zero_index = arith.constant 0 : index
+    %one_index = arith.constant 1 : index
+    %two_index = arith.constant 2 : index
+    %four_index = arith.constant 4 : index
+    %selected = tensor.extract %sum[%one_index, %two_index, %four_index]
+        : tensor<2x3x5xf32>
+    %constructed_value = tensor.extract %constructed[
+        %zero_index, %zero_index, %one_index] : tensor<1x1x2xf32>
+    %matrix_value = tensor.extract %matrix_constructed[%one_index, %two_index]
+        : tensor<3x4xf32>
+    %partial = arith.addf %selected, %constructed_value : f32
+    %result = arith.addf %partial, %matrix_value : f32
+    return %result : f32
+  }
+}
+)mlir";
+
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *result =
+        vernonCompilerCompileMlir(compiler, tensorModule.data(), tensorModule.size(), VERNON_TARGET_VULKAN);
+    ASSERT_TRUE(result);
+    if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
+        const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+        std::fprintf(stderr, "static Tensor compile failed: %.*s\n", static_cast<int>(diagnostics.size),
+                     diagnostics.data);
+    }
+    ASSERT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonCompileResultGetArtifactCount(result), 1u);
+    const std::string spirv = artifacts(result);
+    ASSERT_EQ(spirv.size() % sizeof(uint32_t), 0u);
+    std::vector<uint32_t> words(spirv.size() / sizeof(uint32_t));
+    std::memcpy(words.data(), spirv.data(), spirv.size());
+    std::vector<uint32_t> arrayStrides;
+    for (size_t cursor = 5; cursor < words.size();) {
+        const uint16_t wordCount = static_cast<uint16_t>(words[cursor] >> 16);
+        ASSERT_GT(wordCount, 0u);
+        ASSERT_LE(cursor + wordCount, words.size());
+        if (static_cast<uint16_t>(words[cursor]) == 71 && wordCount == 4 && words[cursor + 2] == 6)
+            arrayStrides.push_back(words[cursor + 3]);
+        cursor += wordCount;
+    }
+    for (uint32_t stride : {16u, 80u, 240u})
+        EXPECT_NE(std::find(arrayStrides.begin(), arrayStrides.end(), stride), arrayStrides.end());
+
+    const VernonStringView reflection = vernonCompileResultGetReflection(result);
+    const std::string_view reflected(reflection.data, reflection.size);
+    EXPECT_NE(reflected.find("\"kind\":\"tensor_value\""), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"shape\":[2,3,5]"), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"array_strides\":[240,80,16]"), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"physical_size\":480"), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"physical_alignment\":16"), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"proposed_storage_class\":\"Uniform\""), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"proposed_storage_class\":\"PushConstant\""), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"vernon.binding\":0"), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"vernon.binding\":1"), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"shape\":[3,4]"), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"matrix_stride\":16"), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"matrix_order\":\"column_major\""), std::string_view::npos);
+
+    vernonCompileResultDestroy(result);
+    for (VernonTarget target : {VERNON_TARGET_OPENGL, VERNON_TARGET_DIRECTX}) {
+        result = vernonCompilerCompileMlir(compiler, tensorModule.data(), tensorModule.size(), target);
+        ASSERT_TRUE(result);
+        if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
+            const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+            std::fprintf(stderr, "target %d graphics Tensor spill compile failed: %.*s\n", static_cast<int>(target),
+                         static_cast<int>(diagnostics.size), diagnostics.data);
+        }
+        ASSERT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+        ASSERT_EQ(vernonCompileResultGetArtifactCount(result), 1u);
+        const VernonStringView targetReflection = vernonCompileResultGetReflection(result);
+        const std::string_view targetReflected(targetReflection.data, targetReflection.size);
+        EXPECT_NE(targetReflected.find("\"vernon.binding\":0"), std::string_view::npos);
+        EXPECT_NE(targetReflected.find("\"vernon.binding\":1"), std::string_view::npos);
+        if (target == VERNON_TARGET_OPENGL) {
+            const std::string output = artifacts(result);
+            EXPECT_NE(output.find("uniform"), std::string::npos);
+            EXPECT_NE(output.find("value"), std::string::npos);
+            EXPECT_NE(output.find("matrix3"), std::string::npos);
+        }
+        vernonCompileResultDestroy(result);
+    }
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerGraphicsOutput, LowersStaticTensorByValueComputeAbi) {
+    constexpr std::string_view tensorModule = R"mlir(
+module {
+  func.func @static_tensor_compute(
+      %value: tensor<2x2x2xf32> {
+        vernon.interface = "input",
+        vernon.location = 0 : i64,
+        vernon.dtype = "f32"
+      },
+      %output: !vernon.tensor_view<f32, 1, "write"> {
+        vernon.interface = "resource",
+        vernon.set = 0 : i64,
+        vernon.binding = 0 : i64,
+        vernon.tensor_shape = array<i64: 1>
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 1, 1, 1>
+      } {
+    %one = arith.constant 1 : index
+    %zero = arith.constant 0 : index
+    %ones = arith.constant dense<1.0> : tensor<2x2x2xf32>
+    %sum = arith.addf %value, %ones : tensor<2x2x2xf32>
+    %value_at_index = tensor.extract %sum[%one, %zero, %one] : tensor<2x2x2xf32>
+    "vernon.intrinsic"(%output, %zero, %value_at_index) {
+      name = "tensor_view_store"
+    } : (!vernon.tensor_view<f32, 1, "write">, index, f32) -> ()
+    return
+  }
+}
+)mlir";
+
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    for (VernonTarget target : {VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL, VERNON_TARGET_DIRECTX}) {
+        VernonCompileResult *result =
+            vernonCompilerCompileMlir(compiler, tensorModule.data(), tensorModule.size(), target);
+        ASSERT_TRUE(result);
+        if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
+            const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+            std::fprintf(stderr, "target %d static compute Tensor compile failed: %.*s\n", static_cast<int>(target),
+                         static_cast<int>(diagnostics.size), diagnostics.data);
+        }
+        ASSERT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+        ASSERT_EQ(vernonCompileResultGetArtifactCount(result), 1u);
+        const std::string artifact = artifacts(result);
+        if (target == VERNON_TARGET_VULKAN) {
+            ASSERT_EQ(artifact.size() % sizeof(uint32_t), 0u);
+            std::vector<uint32_t> words(artifact.size() / sizeof(uint32_t));
+            std::memcpy(words.data(), artifact.data(), artifact.size());
+            for (size_t cursor = 5; cursor < words.size();) {
+                const uint16_t wordCount = static_cast<uint16_t>(words[cursor] >> 16);
+                ASSERT_GT(wordCount, 0u);
+                ASSERT_LE(cursor + wordCount, words.size());
+                if (static_cast<uint16_t>(words[cursor]) == 23) {
+                    ASSERT_EQ(wordCount, 4u);
+                    EXPECT_GE(words[cursor + 3], 2u);
+                    EXPECT_LE(words[cursor + 3], 4u);
+                }
+                cursor += wordCount;
+            }
+        }
+        const VernonStringView reflection = vernonCompileResultGetReflection(result);
+        const std::string_view reflected(reflection.data, reflection.size);
+        EXPECT_NE(reflected.find("\"kind\":\"tensor_value\""), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"shape\":[2,2,2]"), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"array_strides\":[64,32,16]"), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"physical_size\":128"), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"proposed_storage_class\":\"StorageBuffer\""), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"vernon.binding\":0"), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"binding\":1"), std::string_view::npos);
+        vernonCompileResultDestroy(result);
+    }
+
+    VernonCompileResult *cudaResult =
+        vernonCompilerCompileMlir(compiler, tensorModule.data(), tensorModule.size(), VERNON_TARGET_CUDA);
+    ASSERT_TRUE(cudaResult);
+    EXPECT_NE(vernonCompileResultGetStatus(cudaResult), VERNON_STATUS_OK);
+    const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(cudaResult);
+    EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("descriptor-backed SPIR-V compute targets"),
+              std::string_view::npos);
+    vernonCompileResultDestroy(cudaResult);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerGraphicsOutput, ReflectsAndValidatesCanonicalTensorAttributeLeaves) {
+    constexpr std::string_view validModule = R"mlir(
+module {
+  func.func @tensor_attribute(
+      %value: tensor<2x3xf32> {
+        vernon.interface = "input",
+        vernon.location = 0 : i64,
+        vernon.dtype = "f32",
+        vernon.source_name = "value"
+      }) -> (tensor<4xf32> {
+        vernon.interface = "output",
+        vernon.builtin = "position"
+      }) attributes {vernon.entry, vernon.stage = "vertex"} {
+    %position = arith.constant dense<[0.0, 0.0, 0.0, 1.0]> : tensor<4xf32>
+    return %position : tensor<4xf32>
+  }
+}
+)mlir";
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *result =
+        vernonCompilerCompileMlir(compiler, validModule.data(), validModule.size(), VERNON_TARGET_VULKAN);
+    ASSERT_TRUE(result);
+    if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
+        const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+        std::fprintf(stderr, "Tensor attribute compile failed: %.*s\n", static_cast<int>(diagnostics.size),
+                     diagnostics.data);
+    }
+    ASSERT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+    const VernonStringView reflection = vernonCompileResultGetReflection(result);
+    const std::string_view reflected(reflection.data, reflection.size);
+    EXPECT_NE(reflected.find("\"location_span\":2"), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"component_count\":4"), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"component_count\":2"), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"byte_offset\":16"), std::string_view::npos);
+    vernonCompileResultDestroy(result);
+
+    constexpr std::string_view overlapModule = R"mlir(
+module {
+  func.func @overlap(
+      %value: tensor<2x3xf32> {
+        vernon.interface = "input", vernon.location = 0 : i64, vernon.dtype = "f32"
+      },
+      %other: tensor<4xf32> {
+        vernon.interface = "input", vernon.location = 1 : i64, vernon.dtype = "f32"
+      }) -> (tensor<4xf32> {
+        vernon.interface = "output", vernon.builtin = "position"
+      }) attributes {vernon.entry, vernon.stage = "vertex"} {
+    return %other : tensor<4xf32>
+  }
+}
+)mlir";
+    result = vernonCompilerCompileMlir(compiler, overlapModule.data(), overlapModule.size(), VERNON_TARGET_VULKAN);
+    ASSERT_TRUE(result);
+    EXPECT_NE(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+    const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+    EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("location:1"), std::string_view::npos);
+    vernonCompileResultDestroy(result);
     vernonCompilerDestroy(compiler);
 }

@@ -286,7 +286,7 @@ bool resolveCpuNativeArtifact(const CpuNativeArtifact &artifact, std::filesystem
 bool parseCpuComputeBundle(const std::filesystem::path &root, CpuNativeArtifact &artifact, std::string &error) {
     const std::vector<uint8_t> manifestBytes = readFile(root / "compute.json");
     const nlohmann::json manifest = nlohmann::json::parse(manifestBytes.begin(), manifestBytes.end(), nullptr, false);
-    if (manifest.is_discarded() || !manifest.is_object() || manifest.value("schema_version", 0) != 2 ||
+    if (manifest.is_discarded() || !manifest.is_object() || manifest.value("schema_version", 0) != 3 ||
         manifest.value("target", "") != "cpu" || manifest.value("artifact_format", "") != "native_library" ||
         !manifest.contains("reflection")) {
         error = "unsupported or invalid CPU AOT bundle";

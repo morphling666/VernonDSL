@@ -65,6 +65,7 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
     VkPhysicalDeviceProperties properties{};
     api.getPhysicalDeviceProperties(physicalDevice, &properties);
     maxPushConstantsSize = properties.limits.maxPushConstantsSize;
+    maxVertexInputAttributes = properties.limits.maxVertexInputAttributes;
     apiVersion = properties.apiVersion;
     maxComputeWorkGroupInvocations = properties.limits.maxComputeWorkGroupInvocations;
     for (size_t index = 0; index < 3; ++index)
@@ -172,6 +173,7 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
         {VK_DESCRIPTOR_TYPE_SAMPLER, 256},
     };
     VkDescriptorPoolCreateInfo descriptorPoolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    descriptorPoolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
     descriptorPoolInfo.maxSets = 256;
     descriptorPoolInfo.poolSizeCount = static_cast<uint32_t>(std::size(descriptorSizes));
     descriptorPoolInfo.pPoolSizes = descriptorSizes;
@@ -216,6 +218,7 @@ bool DeviceState::initializeBorrowed(VkInstance borrowedInstance, VkPhysicalDevi
     VkPhysicalDeviceProperties properties{};
     api.getPhysicalDeviceProperties(physicalDevice, &properties);
     maxPushConstantsSize = properties.limits.maxPushConstantsSize;
+    maxVertexInputAttributes = properties.limits.maxVertexInputAttributes;
     apiVersion = properties.apiVersion;
     maxComputeWorkGroupInvocations = properties.limits.maxComputeWorkGroupInvocations;
     for (size_t index = 0; index < 3; ++index)
@@ -261,6 +264,7 @@ void DeviceState::shutdown() {
     instance = VK_NULL_HANDLE;
     queueFamily = 0;
     maxPushConstantsSize = 0;
+    maxVertexInputAttributes = 0;
     apiVersion = 0;
     maxComputeWorkGroupInvocations = 0;
     dynamicRendering = false;
@@ -314,9 +318,10 @@ bool DeviceState::submitCommands(VkCommandBuffer command, std::string &error) {
     if (!recorded || !check(api.queueSubmit(queue, 1, &submit, frame.fence), "vkQueueSubmit", error))
         return false;
     frame.submitted = true;
-    if (!check(api.waitForFences(device, 1, &frame.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences", error) ||
-        !check(api.resetDescriptorPool(device, descriptorPool, 0), "vkResetDescriptorPool", error))
+    if (!check(api.waitForFences(device, 1, &frame.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences", error))
         return false;
+    // RuntimeCore caches binding sets across invocations. Resetting the shared
+    // pool here would invalidate those live descriptor-set handles.
     uploadRing.cursor = 0;
     readbackRing.cursor = 0;
     return true;
@@ -485,6 +490,14 @@ bool DeviceState::allocateDescriptorSet(VkDescriptorSetLayout layout, VkDescript
     allocation.descriptorSetCount = 1;
     allocation.pSetLayouts = &layout;
     return check(driver().allocateDescriptorSets(device, &allocation, &set), "vkAllocateDescriptorSets", error);
+}
+
+bool DeviceState::freeDescriptorSet(VkDescriptorSet set, std::string &error) {
+    if (!set || !descriptorPool) {
+        error = "Vulkan descriptor release state is incomplete";
+        return false;
+    }
+    return check(driver().freeDescriptorSets(device, descriptorPool, 1, &set), "vkFreeDescriptorSets", error);
 }
 
 } // namespace vernon::rhi::vulkan

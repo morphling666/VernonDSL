@@ -1,5 +1,6 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonToSpirv.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonSpirvMarkers.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonTensorShapeSemantics.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -11,19 +12,49 @@
 #include "mlir/Dialect/SPIRV/IR/SPIRVTypes.h"
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringSwitch.h"
 
 #include <iterator>
+#include <limits>
 
 namespace mlir::vernon {
 namespace {
+
+FailureOr<Type> convertTensorType(RankedTensorType tensor) {
+    if (!tensor.hasStaticShape() || llvm::any_of(tensor.getShape(), [](int64_t extent) { return extent <= 0; }) ||
+        !tensor.getElementType().isIntOrFloat())
+        return failure();
+    if (tensor.getRank() == 0)
+        return tensor.getElementType();
+    if (tensor.getRank() == 1 && tensor.getDimSize(0) >= 2 && tensor.getDimSize(0) <= 4)
+        return VectorType::get(tensor.getShape(), tensor.getElementType());
+    if (tensor.getRank() == 2 && tensor.getDimSize(0) >= 2 && tensor.getDimSize(0) <= 4 && tensor.getDimSize(1) >= 2 &&
+        tensor.getDimSize(1) <= 4) {
+        auto columnType = VectorType::get({tensor.getShape()[0]}, tensor.getElementType());
+        return spirv::MatrixType::get(columnType, tensor.getShape()[1]);
+    }
+    Type result = tensor.getElementType();
+    uint64_t size = std::max<uint64_t>(tensor.getElementType().getIntOrFloatBitWidth() / 8, 1);
+    uint64_t alignment = size;
+    for (int64_t extent : llvm::reverse(tensor.getShape())) {
+        alignment = std::max<uint64_t>(alignment, 16);
+        uint64_t stride = llvm::alignTo(size, alignment);
+        if (stride > std::numeric_limits<unsigned>::max())
+            return failure();
+        result = spirv::ArrayType::get(result, static_cast<unsigned>(extent), static_cast<unsigned>(stride));
+        size = stride * static_cast<uint64_t>(extent);
+    }
+    return result;
+}
 
 FailureOr<Type> convertValueType(Type type) {
     if (auto texture = dyn_cast<TextureType>(type)) {
@@ -40,15 +71,7 @@ FailureOr<Type> convertValueType(Type type) {
         return spirv::SampledImageType::get(image);
     }
     if (auto tensor = dyn_cast<RankedTensorType>(type)) {
-        if (!tensor.hasStaticShape())
-            return failure();
-        if (tensor.getRank() == 1)
-            return VectorType::get(tensor.getShape(), tensor.getElementType());
-        if (tensor.getRank() == 2) {
-            auto columnType = VectorType::get({tensor.getShape()[0]}, tensor.getElementType());
-            return spirv::MatrixType::get(columnType, tensor.getShape()[1]);
-        }
-        return failure();
+        return convertTensorType(tensor);
     }
     if (auto tuple = dyn_cast<TupleType>(type)) {
         SmallVector<Type> elements;
@@ -63,6 +86,8 @@ FailureOr<Type> convertValueType(Type type) {
     if (type.isIntOrIndexOrFloat())
         return type.isIndex() ? Type(IntegerType::get(type.getContext(), 32)) : type;
     if (isa<VectorType>(type))
+        return type;
+    if (isa<spirv::ArrayType, spirv::MatrixType, spirv::StructType>(type))
         return type;
     return failure();
 }
@@ -150,8 +175,18 @@ FailureOr<VulkanLayout> getVulkanLayout(Type type) {
         FailureOr<VulkanLayout> columnLayout = getVulkanLayout(matrix.getColumnType());
         if (failed(columnLayout))
             return failure();
-        uint32_t stride = llvm::alignTo(columnLayout->size, columnLayout->alignment);
-        return VulkanLayout{columnLayout->alignment, stride * static_cast<uint32_t>(matrix.getNumColumns()), stride};
+        uint32_t alignment = std::max<uint32_t>(columnLayout->alignment, 16);
+        uint32_t stride = llvm::alignTo(columnLayout->size, alignment);
+        return VulkanLayout{alignment, stride * static_cast<uint32_t>(matrix.getNumColumns()), stride};
+    }
+    if (auto array = dyn_cast<spirv::ArrayType>(type)) {
+        FailureOr<VulkanLayout> elementLayout = getVulkanLayout(array.getElementType());
+        if (failed(elementLayout))
+            return failure();
+        uint32_t stride = array.getArrayStride() ? array.getArrayStride()
+                                                 : llvm::alignTo(elementLayout->size, elementLayout->alignment);
+        return VulkanLayout{std::max<uint32_t>(elementLayout->alignment, 16), stride * array.getNumElements(),
+                            std::nullopt};
     }
     return failure();
 }
@@ -195,29 +230,238 @@ spirv::GlobalVariableOp createInterfaceVariable(OpBuilder &builder, Location loc
                                            bindingAttr, setAttr, builtInAttr, spirv::LinkageAttributesAttr());
 }
 
+void flattenComposite(Location location, Value value, OpBuilder &builder, SmallVectorImpl<Value> &leaves) {
+    Type type = value.getType();
+    if (auto array = dyn_cast<spirv::ArrayType>(type)) {
+        for (unsigned index = 0; index < array.getNumElements(); ++index) {
+            Value element = spirv::CompositeExtractOp::create(builder, location, value,
+                                                              ArrayRef<int32_t>{static_cast<int32_t>(index)});
+            flattenComposite(location, element, builder, leaves);
+        }
+        return;
+    }
+    if (auto matrix = dyn_cast<spirv::MatrixType>(type)) {
+        auto columnType = cast<VectorType>(matrix.getColumnType());
+        const unsigned rows = static_cast<unsigned>(columnType.getNumElements());
+        for (unsigned row = 0; row < rows; ++row)
+            for (unsigned column = 0; column < matrix.getNumColumns(); ++column)
+                leaves.push_back(spirv::CompositeExtractOp::create(
+                    builder, location, value,
+                    ArrayRef<int32_t>{static_cast<int32_t>(column), static_cast<int32_t>(row)}));
+        return;
+    }
+    if (auto vector = dyn_cast<VectorType>(type)) {
+        for (int64_t index = 0; index < vector.getNumElements(); ++index)
+            leaves.push_back(spirv::CompositeExtractOp::create(builder, location, value,
+                                                               ArrayRef<int32_t>{static_cast<int32_t>(index)}));
+        return;
+    }
+    leaves.push_back(value);
+}
+
+FailureOr<Value> constructComposite(Location location, Type type, ArrayRef<Value> leaves, unsigned &cursor,
+                                    OpBuilder &builder) {
+    auto constructElements = [&](Type elementType, unsigned count) -> FailureOr<Value> {
+        SmallVector<Value> elements;
+        elements.reserve(count);
+        for (unsigned index = 0; index < count; ++index) {
+            FailureOr<Value> element = constructComposite(location, elementType, leaves, cursor, builder);
+            if (failed(element))
+                return failure();
+            elements.push_back(*element);
+        }
+        return spirv::CompositeConstructOp::create(builder, location, type, elements).getResult();
+    };
+    if (auto array = dyn_cast<spirv::ArrayType>(type))
+        return constructElements(array.getElementType(), array.getNumElements());
+    if (auto matrix = dyn_cast<spirv::MatrixType>(type)) {
+        auto columnType = cast<VectorType>(matrix.getColumnType());
+        const unsigned rows = static_cast<unsigned>(columnType.getNumElements());
+        const unsigned columns = matrix.getNumColumns();
+        if (cursor > leaves.size() || leaves.size() - cursor < rows * columns)
+            return failure();
+        SmallVector<Value> valueColumns;
+        for (unsigned column = 0; column < columns; ++column) {
+            SmallVector<Value> columnElements;
+            for (unsigned row = 0; row < rows; ++row)
+                columnElements.push_back(leaves[cursor + row * columns + column]);
+            valueColumns.push_back(spirv::CompositeConstructOp::create(builder, location, columnType, columnElements));
+        }
+        cursor += rows * columns;
+        return spirv::CompositeConstructOp::create(builder, location, matrix, valueColumns).getResult();
+    }
+    if (auto vector = dyn_cast<VectorType>(type))
+        return constructElements(vector.getElementType(), static_cast<unsigned>(vector.getNumElements()));
+    if (cursor >= leaves.size() || leaves[cursor].getType() != type)
+        return failure();
+    return leaves[cursor++];
+}
+
+FailureOr<Value> constructComposite(Location location, Type type, ArrayRef<Value> leaves, OpBuilder &builder) {
+    unsigned cursor = 0;
+    FailureOr<Value> result = constructComposite(location, type, leaves, cursor, builder);
+    return succeeded(result) && cursor == leaves.size() ? result : FailureOr<Value>(failure());
+}
+
+Value extractStaticTensorElement(Location location, Value value, RankedTensorType sourceType, int64_t linearIndex,
+                                 OpBuilder &builder) {
+    SmallVector<int32_t> indices;
+    int64_t remaining = linearIndex;
+    for (int64_t dimension = sourceType.getRank() - 1; dimension >= 0; --dimension) {
+        indices.push_back(static_cast<int32_t>(remaining % sourceType.getDimSize(dimension)));
+        remaining /= sourceType.getDimSize(dimension);
+    }
+    std::reverse(indices.begin(), indices.end());
+    if (isa<spirv::MatrixType>(value.getType()))
+        std::swap(indices[0], indices[1]);
+    return indices.empty() ? value : spirv::CompositeExtractOp::create(builder, location, value, indices).getResult();
+}
+
+FailureOr<Value> lowerTensorExtract(tensor::ExtractOp extract, OpBuilder &builder, IRMapping &mapping) {
+    auto sourceType = dyn_cast<RankedTensorType>(extract.getTensor().getType());
+    Value input = mapping.lookupOrNull(extract.getTensor());
+    if (!sourceType || !sourceType.hasStaticShape() || !input ||
+        extract.getIndices().size() != static_cast<size_t>(sourceType.getRank()))
+        return failure();
+    if (sourceType.getRank() == 0)
+        return input;
+    Location location = extract.getLoc();
+    Value linear = mapping.lookupOrNull(extract.getIndices().front());
+    if (!linear)
+        return failure();
+    for (auto [extent, sourceIndex] :
+         llvm::zip_equal(sourceType.getShape().drop_front(), extract.getIndices().drop_front())) {
+        Value index = mapping.lookupOrNull(sourceIndex);
+        if (!index)
+            return failure();
+        Value extentValue = spirv::ConstantOp::create(builder, location, linear.getType(),
+                                                      builder.getIntegerAttr(linear.getType(), extent));
+        linear = spirv::IMulOp::create(builder, location, linear, extentValue);
+        linear = spirv::IAddOp::create(builder, location, linear, index);
+    }
+    Value selected = extractStaticTensorElement(location, input, sourceType, 0, builder);
+    for (int64_t index = 1; index < sourceType.getNumElements(); ++index) {
+        Value expected = spirv::ConstantOp::create(builder, location, linear.getType(),
+                                                   builder.getIntegerAttr(linear.getType(), index));
+        Value matches = spirv::IEqualOp::create(builder, location, linear, expected);
+        Value candidate = extractStaticTensorElement(location, input, sourceType, index, builder);
+        selected = spirv::SelectOp::create(builder, location, candidate.getType(), matches, candidate, selected);
+    }
+    return selected;
+}
+
+template <typename CreateLeaf>
+FailureOr<Value> lowerCompositeElementwise(Location location, Type resultType, ArrayRef<Value> operands,
+                                           OpBuilder &builder, CreateLeaf createLeaf) {
+    if (auto array = dyn_cast<spirv::ArrayType>(resultType)) {
+        SmallVector<Value> elements;
+        for (unsigned index = 0; index < array.getNumElements(); ++index) {
+            SmallVector<Value> extracted;
+            for (Value operand : operands)
+                extracted.push_back(spirv::CompositeExtractOp::create(builder, location, operand,
+                                                                      ArrayRef<int32_t>{static_cast<int32_t>(index)}));
+            FailureOr<Value> element =
+                lowerCompositeElementwise(location, array.getElementType(), extracted, builder, createLeaf);
+            if (failed(element))
+                return failure();
+            elements.push_back(*element);
+        }
+        return spirv::CompositeConstructOp::create(builder, location, resultType, elements).getResult();
+    }
+    if (auto matrix = dyn_cast<spirv::MatrixType>(resultType)) {
+        SmallVector<Value> columns;
+        for (unsigned column = 0; column < matrix.getNumColumns(); ++column) {
+            SmallVector<Value> extracted;
+            for (Value operand : operands)
+                extracted.push_back(spirv::CompositeExtractOp::create(builder, location, operand,
+                                                                      ArrayRef<int32_t>{static_cast<int32_t>(column)}));
+            FailureOr<Value> value =
+                lowerCompositeElementwise(location, matrix.getColumnType(), extracted, builder, createLeaf);
+            if (failed(value))
+                return failure();
+            columns.push_back(*value);
+        }
+        return spirv::CompositeConstructOp::create(builder, location, resultType, columns).getResult();
+    }
+    return createLeaf(resultType, operands);
+}
+
 FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IRMapping &mapping) {
     Location location = operation.getLoc();
     auto mapped = [&](Value value) { return mapping.lookupOrNull(value); };
+
+    if (auto construct = dyn_cast<spirv::CompositeConstructOp>(operation)) {
+        SmallVector<Value> constituents;
+        for (Value constituent : construct.getConstituents()) {
+            Value converted = mapped(constituent);
+            if (!converted)
+                return failure();
+            constituents.push_back(converted);
+        }
+        return spirv::CompositeConstructOp::create(builder, location, construct.getType(), constituents).getResult();
+    }
+    if (auto extract = dyn_cast<spirv::CompositeExtractOp>(operation)) {
+        Value composite = mapped(extract.getComposite());
+        if (!composite)
+            return failure();
+        SmallVector<int32_t> indices;
+        for (Attribute index : extract.getIndices())
+            indices.push_back(cast<IntegerAttr>(index).getInt());
+        return spirv::CompositeExtractOp::create(builder, location, composite, indices).getResult();
+    }
 
     if (auto splat = dyn_cast<tensor::SplatOp>(operation)) {
         Value input = mapped(splat.getInput());
         FailureOr<Type> resultType = convertValueType(splat.getType());
         if (!input || failed(resultType))
             return failure();
-        auto vectorType = dyn_cast<VectorType>(*resultType);
-        if (!vectorType)
-            return failure();
-        SmallVector<Value> elements(vectorType.getNumElements(), input);
-        return spirv::CompositeConstructOp::create(builder, location, *resultType, elements).getResult();
+        SmallVector<Value> elements(splat.getType().getNumElements(), input);
+        return constructComposite(location, *resultType, elements, builder);
     }
+
+    if (auto fromElements = dyn_cast<tensor::FromElementsOp>(operation)) {
+        FailureOr<Type> resultType = convertValueType(fromElements.getType());
+        SmallVector<Value> elements;
+        for (Value element : fromElements.getElements()) {
+            Value converted = mapped(element);
+            if (!converted || failed(resultType))
+                return failure();
+            flattenComposite(location, converted, builder, elements);
+        }
+        return constructComposite(location, *resultType, elements, builder);
+    }
+    if (auto fromElements = dyn_cast<vector::FromElementsOp>(operation)) {
+        FailureOr<Type> resultType = convertValueType(fromElements.getType());
+        SmallVector<Value> elements;
+        for (Value element : fromElements.getElements()) {
+            Value converted = mapped(element);
+            if (!converted || failed(resultType))
+                return failure();
+            elements.push_back(converted);
+        }
+        return constructComposite(location, *resultType, elements, builder);
+    }
+
+    if (auto extract = dyn_cast<tensor::ExtractOp>(operation))
+        return lowerTensorExtract(extract, builder, mapping);
 
     if (auto constant = dyn_cast<arith::ConstantOp>(operation)) {
         FailureOr<Type> type = convertValueType(constant.getType());
         if (failed(type))
             return failure();
         Attribute value = constant.getValue();
-        if (auto dense = dyn_cast<DenseElementsAttr>(value))
-            value = dense.reshape(cast<ShapedType>(*type));
+        if (auto dense = dyn_cast<DenseElementsAttr>(value)) {
+            SmallVector<Value> elements;
+            for (Attribute element : dense.getValues<Attribute>()) {
+                auto typed = cast<TypedAttr>(element);
+                elements.push_back(spirv::ConstantOp::create(builder, location, typed.getType(), typed));
+            }
+            return constructComposite(location, *type, elements, builder);
+        }
+        if (constant.getType().isIndex()) {
+            auto integer = cast<IntegerAttr>(value);
+            value = builder.getIntegerAttr(*type, integer.getInt());
+        }
         return spirv::ConstantOp::create(builder, location, *type, value).getResult();
     }
 
@@ -337,14 +581,64 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
         if (failed(resultType))
             return failure();
         StringRef name = intrinsic.getName();
-        if (name == "construct")
-            return spirv::CompositeConstructOp::create(builder, location, *resultType, operands).getResult();
+        if (name == "construct") {
+            SmallVector<Value> leaves;
+            for (Value operand : operands)
+                flattenComposite(location, operand, builder, leaves);
+            return constructComposite(location, *resultType, leaves, builder);
+        }
+        if (name == "broadcast") {
+            auto sourceType = dyn_cast<RankedTensorType>(intrinsic.getOperand(0).getType());
+            auto resultTensorType = dyn_cast<RankedTensorType>(intrinsic.getResult().getType());
+            if (!sourceType || !resultTensorType || operands.size() != 1)
+                return failure();
+            SmallVector<Value> leaves;
+            for (int64_t resultIndex = 0; resultIndex < resultTensorType.getNumElements(); ++resultIndex) {
+                FailureOr<int64_t> sourceIndex =
+                    getStaticBroadcastLinearIndex(sourceType.getShape(), resultTensorType.getShape(), resultIndex);
+                if (failed(sourceIndex))
+                    return failure();
+                leaves.push_back(extractStaticTensorElement(location, operands[0], sourceType, *sourceIndex, builder));
+            }
+            return constructComposite(location, *resultType, leaves, builder);
+        }
         if (name == "matmul") {
-            if (isa<spirv::MatrixType>(operands[1].getType()))
+            auto leftType = dyn_cast<RankedTensorType>(intrinsic.getOperand(0).getType());
+            auto rightType = dyn_cast<RankedTensorType>(intrinsic.getOperand(1).getType());
+            if (!leftType || !rightType || operands.size() != 2)
+                return failure();
+            if (leftType.getRank() == 2 && rightType.getRank() == 2 && isa<spirv::MatrixType>(operands[0].getType()) &&
+                isa<spirv::MatrixType>(operands[1].getType()))
                 return spirv::MatrixTimesMatrixOp::create(builder, location, *resultType, operands[0], operands[1])
                     .getResult();
-            return spirv::MatrixTimesVectorOp::create(builder, location, *resultType, operands[0], operands[1])
-                .getResult();
+            if (leftType.getRank() == 2 && rightType.getRank() == 1 && isa<spirv::MatrixType>(operands[0].getType()) &&
+                isa<VectorType>(operands[1].getType()))
+                return spirv::MatrixTimesVectorOp::create(builder, location, *resultType, operands[0], operands[1])
+                    .getResult();
+
+            FailureOr<StaticMatmulPlan> plan = getStaticMatmulPlan(leftType.getShape(), rightType.getShape());
+            if (failed(plan) || !isa<FloatType>(leftType.getElementType()))
+                return failure();
+            FailureOr<int64_t> resultCount = getStaticShapeElementCount(plan->resultShape);
+            if (failed(resultCount))
+                return failure();
+            SmallVector<Value> leaves;
+            for (int64_t resultIndex = 0; resultIndex < *resultCount; ++resultIndex) {
+                Value sum = spirv::ConstantOp::create(builder, location, leftType.getElementType(),
+                                                      builder.getFloatAttr(leftType.getElementType(), 0.0));
+                for (int64_t reduction = 0; reduction < plan->reduction; ++reduction) {
+                    FailureOr<int64_t> leftIndex = getStaticMatmulLeftLinearIndex(*plan, resultIndex, reduction);
+                    FailureOr<int64_t> rightIndex = getStaticMatmulRightLinearIndex(*plan, resultIndex, reduction);
+                    if (failed(leftIndex) || failed(rightIndex))
+                        return failure();
+                    Value lhs = extractStaticTensorElement(location, operands[0], leftType, *leftIndex, builder);
+                    Value rhs = extractStaticTensorElement(location, operands[1], rightType, *rightIndex, builder);
+                    Value product = spirv::FMulOp::create(builder, location, lhs, rhs);
+                    sum = spirv::FAddOp::create(builder, location, sum, product);
+                }
+                leaves.push_back(sum);
+            }
+            return constructComposite(location, *resultType, leaves, builder);
         }
         StringRef operationName = llvm::StringSwitch<StringRef>(name)
                                       .Case("dot", "spirv.Dot")
@@ -442,7 +736,11 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
         FailureOr<Type> resultType = convertValueType(select.getType());
         if (!condition || !trueValue || !falseValue || failed(resultType))
             return failure();
-        return spirv::SelectOp::create(builder, location, *resultType, condition, trueValue, falseValue).getResult();
+        return lowerCompositeElementwise(
+            location, *resultType, ArrayRef<Value>{trueValue, falseValue}, builder,
+            [&](Type type, ArrayRef<Value> values) -> FailureOr<Value> {
+                return spirv::SelectOp::create(builder, location, type, condition, values[0], values[1]).getResult();
+            });
     }
 
     if (auto cast = dyn_cast<arith::IndexCastOp>(operation)) {
@@ -459,20 +757,29 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
         if (!lhs || !rhs)
             return failure();
         StringRef name = operation.getName().getStringRef();
+        FailureOr<Type> resultType = convertValueType(operation.getResult(0).getType());
+        if (failed(resultType))
+            return failure();
+        auto lowerBinary = [&](auto create) {
+            return lowerCompositeElementwise(location, *resultType, ArrayRef<Value>{lhs, rhs}, builder,
+                                             [&](Type, ArrayRef<Value> values) -> FailureOr<Value> {
+                                                 return create(values[0], values[1]).getResult();
+                                             });
+        };
         if (name == arith::AddFOp::getOperationName())
-            return spirv::FAddOp::create(builder, location, lhs, rhs).getResult();
+            return lowerBinary([&](Value a, Value b) { return spirv::FAddOp::create(builder, location, a, b); });
         if (name == arith::SubFOp::getOperationName())
-            return spirv::FSubOp::create(builder, location, lhs, rhs).getResult();
+            return lowerBinary([&](Value a, Value b) { return spirv::FSubOp::create(builder, location, a, b); });
         if (name == arith::MulFOp::getOperationName())
-            return spirv::FMulOp::create(builder, location, lhs, rhs).getResult();
+            return lowerBinary([&](Value a, Value b) { return spirv::FMulOp::create(builder, location, a, b); });
         if (name == arith::DivFOp::getOperationName())
-            return spirv::FDivOp::create(builder, location, lhs, rhs).getResult();
+            return lowerBinary([&](Value a, Value b) { return spirv::FDivOp::create(builder, location, a, b); });
         if (name == arith::AddIOp::getOperationName())
-            return spirv::IAddOp::create(builder, location, lhs, rhs).getResult();
+            return lowerBinary([&](Value a, Value b) { return spirv::IAddOp::create(builder, location, a, b); });
         if (name == arith::SubIOp::getOperationName())
-            return spirv::ISubOp::create(builder, location, lhs, rhs).getResult();
+            return lowerBinary([&](Value a, Value b) { return spirv::ISubOp::create(builder, location, a, b); });
         if (name == arith::MulIOp::getOperationName())
-            return spirv::IMulOp::create(builder, location, lhs, rhs).getResult();
+            return lowerBinary([&](Value a, Value b) { return spirv::IMulOp::create(builder, location, a, b); });
         if (name == arith::AndIOp::getOperationName()) {
             if (operation.getResult(0).getType().isInteger(1))
                 return spirv::LogicalAndOp::create(builder, location, lhs, rhs).getResult();
@@ -692,7 +999,8 @@ LogicalResult lowerWhile(scf::WhileOp whileOp, OpBuilder &builder, Block *functi
 }
 
 LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder &moduleBuilder,
-                         llvm::StringSet<> &usedInterfaceNames, bool aggregatePushConstants) {
+                         llvm::StringSet<> &usedInterfaceNames, bool aggregatePushConstants,
+                         const DenseMap<Value, std::pair<uint32_t, uint32_t>> &generatedBindings) {
     auto stage = source->getAttrOfType<StringAttr>(kStageAttrName);
     if (!stage)
         return success();
@@ -700,8 +1008,9 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
     if (!executionModel)
         return source.emitError("unsupported SPIR-V execution model");
 
-    SmallVector<spirv::GlobalVariableOp> inputs;
+    SmallVector<SmallVector<spirv::GlobalVariableOp>> inputs;
     SmallVector<std::optional<uint32_t>> inputMembers;
+    SmallVector<bool> inputAttributes;
     SmallVector<spirv::GlobalVariableOp> outputs;
     SmallVector<Attribute> interfaceSymbols;
     struct PushConstantMember {
@@ -716,7 +1025,8 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             break;
         InterfaceAttrs attrs = parseInterfaceAttrs(source.getArgAttrDict(index));
         auto kind = dyn_cast_if_present<StringAttr>(attrs.kind);
-        if (!kind || kind.getValue() != "uniform" || attrs.binding)
+        if (!kind || kind.getValue() != "uniform" || attrs.binding ||
+            generatedBindings.contains(source.getArgument(index)))
             continue;
         FailureOr<Type> converted = convertValueType(type);
         if (failed(converted))
@@ -753,14 +1063,21 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
     }
     for (auto [index, type] : llvm::enumerate(source.getArgumentTypes())) {
         if (isa<SamplerType>(type)) {
-            inputs.push_back({});
+            inputs.emplace_back();
             inputMembers.push_back(std::nullopt);
+            inputAttributes.push_back(false);
             continue;
         }
         FailureOr<Type> converted = convertValueType(type);
         if (failed(converted))
             return source.emitError() << "cannot lower argument #" << index << " type " << type << " to SPIR-V";
-        InterfaceAttrs attrs = parseInterfaceAttrs(source.getArgAttrDict(index));
+        NamedAttrList effectiveAttrs(source.getArgAttrDict(index));
+        if (auto generated = generatedBindings.find(source.getArgument(index)); generated != generatedBindings.end()) {
+            effectiveAttrs.set(kDescriptorSetAttrName, moduleBuilder.getI64IntegerAttr(generated->second.first));
+            effectiveAttrs.set(kBindingAttrName, moduleBuilder.getI64IntegerAttr(generated->second.second));
+        }
+        DictionaryAttr argumentAttrs = effectiveAttrs.getDictionary(source.getContext());
+        InterfaceAttrs attrs = parseInterfaceAttrs(argumentAttrs);
         auto kind = dyn_cast_if_present<StringAttr>(attrs.kind);
         if (!kind)
             return source.emitError() << "argument #" << index << " has no Vernon interface kind";
@@ -775,8 +1092,9 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
                                         [&](const PushConstantMember &value) { return value.argumentIndex == index; });
             if (member == pushConstantMembers.end())
                 return source.emitError("push-constant member layout is inconsistent");
-            inputs.push_back(pushConstantBlock);
+            inputs.push_back({pushConstantBlock});
             inputMembers.push_back(static_cast<uint32_t>(std::distance(pushConstantMembers.begin(), member)));
+            inputAttributes.push_back(false);
             continue;
         }
         std::string fallback = (source.getSymName() + "_arg_" + Twine(index)).str();
@@ -784,11 +1102,36 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
         std::string preferred = sanitizeInterfaceName(sourceName ? sourceName.getValue() : StringRef(), fallback,
                                                       kind.getValue() == "input");
         std::string name = uniqueInterfaceName(preferred, stage.getValue(), usedInterfaceNames);
-        auto global = createInterfaceVariable(moduleBuilder, source.getLoc(), name, *converted, storageClass,
-                                              source.getArgAttrDict(index));
-        inputs.push_back(global);
+        SmallVector<spirv::GlobalVariableOp> globals;
+        auto sourceTensor = dyn_cast<RankedTensorType>(type);
+        auto location = dyn_cast_if_present<IntegerAttr>(attrs.location);
+        const bool vertexAttribute =
+            stage.getValue() == "vertex" && kind.getValue() == "input" && !attrs.builtin && sourceTensor && location;
+        if (vertexAttribute) {
+            FailureOr<StaticAttributePlan> plan =
+                getStaticAttributePlan(sourceTensor.getElementType(), sourceTensor.getShape());
+            if (failed(plan))
+                return source.emitError() << "vertex input #" << index << " has no numeric attribute layout";
+            for (const StaticAttributeLeaf &leaf : plan->leaves) {
+                Type leafType = leaf.componentCount == 1
+                                    ? sourceTensor.getElementType()
+                                    : Type(VectorType::get({leaf.componentCount}, sourceTensor.getElementType()));
+                NamedAttrList leafAttrs(argumentAttrs);
+                leafAttrs.set(kLocationAttrName,
+                              moduleBuilder.getI64IntegerAttr(location.getInt() + leaf.locationOffset));
+                std::string leafName = name + "_leaf_" + std::to_string(leaf.locationOffset);
+                globals.push_back(createInterfaceVariable(moduleBuilder, source.getLoc(), leafName, leafType,
+                                                          storageClass, leafAttrs.getDictionary(source.getContext())));
+            }
+        } else {
+            globals.push_back(
+                createInterfaceVariable(moduleBuilder, source.getLoc(), name, *converted, storageClass, argumentAttrs));
+        }
+        inputs.push_back(globals);
         inputMembers.push_back(std::nullopt);
-        interfaceSymbols.push_back(SymbolRefAttr::get(source.getContext(), global.getSymName()));
+        inputAttributes.push_back(vertexAttribute);
+        for (spirv::GlobalVariableOp global : globals)
+            interfaceSymbols.push_back(SymbolRefAttr::get(source.getContext(), global.getSymName()));
     }
     for (auto [index, type] : llvm::enumerate(source.getResultTypes())) {
         FailureOr<Type> converted = convertValueType(type);
@@ -810,18 +1153,34 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
     Block *entry = function.addEntryBlock();
     OpBuilder bodyBuilder = OpBuilder::atBlockBegin(entry);
     IRMapping mapping;
-    for (auto [argument, global, member] : llvm::zip_equal(source.getArguments(), inputs, inputMembers)) {
-        if (!global)
+    for (auto [argument, globals, member, attribute] :
+         llvm::zip_equal(source.getArguments(), inputs, inputMembers, inputAttributes)) {
+        if (globals.empty())
             continue;
-        Value pointer = spirv::AddressOfOp::create(bodyBuilder, source.getLoc(), global);
+        Value pointer = spirv::AddressOfOp::create(bodyBuilder, source.getLoc(), globals.front());
         auto pointerType = cast<spirv::PointerType>(pointer.getType());
         if (isa<spirv::StructType>(pointerType.getPointeeType())) {
             Value memberIndex = spirv::ConstantOp::create(bodyBuilder, source.getLoc(), bodyBuilder.getI32Type(),
                                                           bodyBuilder.getI32IntegerAttr(member.value_or(0)));
             pointer = spirv::AccessChainOp::create(bodyBuilder, source.getLoc(), pointer, memberIndex);
         }
-        Value value = spirv::LoadOp::create(bodyBuilder, source.getLoc(), pointer);
-        mapping.map(argument, value);
+        if (!attribute) {
+            mapping.map(argument, spirv::LoadOp::create(bodyBuilder, source.getLoc(), pointer));
+            continue;
+        }
+        SmallVector<Value> leaves;
+        for (spirv::GlobalVariableOp global : globals) {
+            Value leafPointer = spirv::AddressOfOp::create(bodyBuilder, source.getLoc(), global);
+            Value leaf = spirv::LoadOp::create(bodyBuilder, source.getLoc(), leafPointer);
+            flattenComposite(source.getLoc(), leaf, bodyBuilder, leaves);
+        }
+        FailureOr<Type> converted = convertValueType(argument.getType());
+        FailureOr<Value> value = failed(converted)
+                                     ? FailureOr<Value>(failure())
+                                     : constructComposite(source.getLoc(), *converted, leaves, bodyBuilder);
+        if (failed(value))
+            return source.emitError("cannot reconstruct logical vertex attribute Tensor");
+        mapping.map(argument, *value);
     }
 
     for (Operation &operation : source.front()) {
@@ -897,6 +1256,42 @@ struct VernonToSPIRVPass : public PassWrapper<VernonToSPIRVPass, OperationPass<M
         target->setAttr(spirv::getTargetEnvAttrName(), spirv::getDefaultTargetEnv(module.getContext()));
         OpBuilder moduleBuilder = OpBuilder::atBlockBegin(target.getBody());
         llvm::StringSet<> usedInterfaceNames;
+        DenseMap<Value, std::pair<uint32_t, uint32_t>> generatedBindings;
+        uint32_t nextGeneratedBinding = 0;
+        for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+            for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+                InterfaceAttrs attrs = parseInterfaceAttrs(function.getArgAttrDict(index));
+                auto descriptorSet = dyn_cast_if_present<IntegerAttr>(attrs.descriptorSet);
+                auto binding = dyn_cast_if_present<IntegerAttr>(attrs.binding);
+                if (binding && (!descriptorSet || descriptorSet.getInt() == 0))
+                    nextGeneratedBinding = std::max(nextGeneratedBinding, static_cast<uint32_t>(binding.getInt() + 1));
+            }
+        }
+        for (func::FuncOp function : entries) {
+            uint64_t inlineSize = 0;
+            for (auto [index, type] : llvm::enumerate(function.getArgumentTypes())) {
+                InterfaceAttrs attrs = parseInterfaceAttrs(function.getArgAttrDict(index));
+                auto kind = dyn_cast_if_present<StringAttr>(attrs.kind);
+                if (!kind || kind.getValue() != "uniform" || attrs.binding)
+                    continue;
+                FailureOr<Type> converted = convertValueType(type);
+                FailureOr<VulkanLayout> layout =
+                    succeeded(converted) ? getVulkanLayout(*converted) : FailureOr<VulkanLayout>(failure());
+                if (failed(layout)) {
+                    function.emitError() << "cannot plan graphics inline layout for argument #" << index;
+                    target.erase();
+                    return signalPassFailure();
+                }
+                uint64_t offset = llvm::alignTo(inlineSize, layout->alignment);
+                bool spill = isa<spirv::ArrayType>(*converted) || offset > 128 ||
+                             layout->size > 128 - std::min<uint64_t>(offset, 128);
+                if (spill) {
+                    generatedBindings[function.getArgument(index)] = std::make_pair(0u, nextGeneratedBinding++);
+                } else {
+                    inlineSize = offset + layout->size;
+                }
+            }
+        }
         int64_t expectedImageQueryCount = 0;
 
         for (func::FuncOp function : entries) {
@@ -904,7 +1299,8 @@ struct VernonToSPIRVPass : public PassWrapper<VernonToSPIRVPass, OperationPass<M
                 if (intrinsic.getName() == "texture_size")
                     ++expectedImageQueryCount;
             });
-            if (failed(lowerEntry(function, target, moduleBuilder, usedInterfaceNames, aggregatePushConstants))) {
+            if (failed(lowerEntry(function, target, moduleBuilder, usedInterfaceNames, aggregatePushConstants,
+                                  generatedBindings))) {
                 target.erase();
                 return signalPassFailure();
             }

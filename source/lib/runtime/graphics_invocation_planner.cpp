@@ -70,9 +70,8 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
                 return fail(error, "pipeline Tensor argument does not match layout");
             if (parameter.source != "direct") {
                 const bool allowLeading =
-                    std::any_of(parameter.uses.begin(), parameter.uses.end(), [](const ParameterUse &use) {
-                        return use.interfaceKind == "input" || use.interfaceKind == "instance";
-                    });
+                    std::any_of(parameter.uses.begin(), parameter.uses.end(),
+                                [](const ParameterUse &use) { return use.interfaceKind == "input"; });
                 const size_t offset = allowLeading && argument.tensor.rank == parameter.shape.size() + 1 ? 1 : 0;
                 if (argument.tensor.rank != parameter.shape.size() + offset)
                     return fail(error, "pipeline Tensor rank does not match layout");
@@ -138,6 +137,26 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
         }
         plan.attachments.push_back(&attachment);
     }
+    if (invocation.depth_attachment) {
+        const VernonDepthAttachment &attachment = *invocation.depth_attachment;
+        uint32_t width = attachment.width;
+        uint32_t height = attachment.height;
+        VernonTextureFormat format = attachment.format;
+        if (!attachment.resource.resource.value) {
+            if (!attachment.texture || !callbacks.textureSnapshot)
+                return fail(error, "depth attachment is invalid");
+            const GraphicsResourceSnapshot snapshot = callbacks.textureSnapshot(callbacks.userData, attachment.texture);
+            if (snapshot.context != expectedContext || snapshot.textureDimension != VERNON_TEXTURE_2D)
+                return fail(error, "depth attachment is invalid");
+            width = snapshot.textureWidth;
+            height = snapshot.textureHeight;
+            format = snapshot.textureFormat;
+        }
+        if (!width || !height || width != plan.attachmentWidth || height != plan.attachmentHeight ||
+            format != VERNON_TEXTURE_D32_FLOAT)
+            return fail(error, "depth attachment must be D32 with the render-target extent");
+        plan.depthAttachment = &attachment;
+    }
     std::sort(plan.attachments.begin(), plan.attachments.end(),
               [](const VernonColorAttachment *left, const VernonColorAttachment *right) {
                   return left->location < right->location;
@@ -201,41 +220,48 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
                 }
                 continue;
             }
-            if (use.interfaceKind != "input" && use.interfaceKind != "instance")
+            if (use.interfaceKind != "input")
                 continue;
             const VernonTensorView &tensor = argument.tensor;
             if (argument.kind != VERNON_PIPELINE_TENSOR ||
                 (tensor.storage != VERNON_TENSOR_DEVICE && tensor.storage != VERNON_TENSOR_RHI_RESOURCE) ||
-                tensor.dtype != VERNON_DATA_F32 || (!tensor.buffer && !tensor.resource.resource.value) ||
-                !tensor.rank || !tensor.shape || !tensor.byte_strides || use.location == UINT32_MAX)
+                (!tensor.buffer && !tensor.resource.resource.value) || !tensor.rank || !tensor.shape ||
+                !tensor.byte_strides || use.location == UINT32_MAX || use.attributeLeaves.empty())
                 return fail(error, "graphics Tensor view is invalid");
             for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension)
                 if (tensor.byte_strides[dimension] <= 0)
                     return fail(error, "graphics Tensor strides must be positive");
-            uint64_t components = 1;
-            for (uint32_t dimension = 1; dimension < tensor.rank; ++dimension) {
-                if (tensor.shape[dimension] > std::numeric_limits<uint32_t>::max() / components)
-                    return fail(error, "graphics Tensor component shape is unsupported");
-                components *= tensor.shape[dimension];
-            }
             if (tensor.shape[0] > std::numeric_limits<uint32_t>::max())
                 return fail(error, "graphics Tensor leading dimension is too large");
             const uint32_t leading = static_cast<uint32_t>(tensor.shape[0]);
-            const bool instanced = use.interfaceKind == "instance" || use.divisor != 0;
+            const bool instanced = use.divisor != 0;
             uint32_t &inferred = instanced ? plan.instanceCount : plan.vertexCount;
-            if (inferred && inferred != leading)
-                return fail(error, "graphics Tensor leading dimensions conflict");
-            inferred = leading;
-            if (components <= 4) {
-                if (tensor.rank > 1 && tensor.byte_strides[tensor.rank - 1] != sizeof(float))
-                    return fail(error, "graphics Tensor components must be contiguous");
-            } else if (tensor.rank == 3 && tensor.shape[2] <= 4) {
-                if (tensor.byte_strides[2] != sizeof(float))
-                    return fail(error, "graphics matrix rows must be contiguous");
+            const uint32_t divisor = instanced ? std::max(use.divisor, 1u) : 1u;
+            if (inferred) {
+                const uint32_t requiredRecords = (inferred - 1) / divisor + 1;
+                if (requiredRecords != leading)
+                    return fail(error, "graphics Tensor leading dimensions conflict");
             } else {
-                return fail(error, "graphics Tensor component shape is unsupported");
+                if (leading > std::numeric_limits<uint32_t>::max() / divisor)
+                    return fail(error, "graphics inferred draw count is too large");
+                inferred = leading * divisor;
             }
-            plan.vertexInputs.push_back({&use, &tensor, static_cast<uint32_t>(components), instanced});
+            uint64_t expectedStride = dataTypeSize(tensor.dtype);
+            if ((tensor.dtype != VERNON_DATA_I32 && tensor.dtype != VERNON_DATA_U32 &&
+                 tensor.dtype != VERNON_DATA_F16 && tensor.dtype != VERNON_DATA_F32 &&
+                 tensor.dtype != VERNON_DATA_F64) ||
+                !expectedStride)
+                return fail(error, "graphics Tensor dtype is unsupported");
+            for (uint32_t dimension = tensor.rank; dimension-- > 1;) {
+                if (tensor.byte_strides[dimension] != static_cast<int64_t>(expectedStride))
+                    return fail(error, "graphics Tensor inner dimensions must be contiguous row-major");
+                if (tensor.shape[dimension] > std::numeric_limits<uint64_t>::max() / expectedStride)
+                    return fail(error, "graphics Tensor shape is too large");
+                expectedStride *= tensor.shape[dimension];
+            }
+            if (static_cast<uint64_t>(tensor.byte_strides[0]) < expectedStride)
+                return fail(error, "graphics Tensor record stride is too small");
+            plan.vertexInputs.push_back({&use, &tensor, instanced});
         }
     }
 

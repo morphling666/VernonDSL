@@ -25,6 +25,7 @@ from .model import (
     TypedStatement,
     is_abi_stable_value,
 )
+from .tensor_shapes import matmul_shape
 from .type_solver import (
     InferenceType,
     can_convert,
@@ -1098,23 +1099,19 @@ class _Inference:
             if len(arguments) != 2:
                 raise self.error(node, "matmul requires two arguments")
             left, right = arguments
-            if not isinstance(left, ConcreteType) or left.kind != "tensor" or len(left.arguments) != 3:
-                raise self.error(node, "matmul left operand must be a matrix")
-            if not isinstance(right, ConcreteType):
-                raise self.error(node, "matmul right operand must be a Tensor")
-            element = _element(left)
-            assert isinstance(element, ConcreteType)
-            rows, columns = left.arguments[1:]
-            if right == ConcreteType("tensor", "Tensor", (element, columns)):
-                return ConcreteType("tensor", "Tensor", (element, rows))
-            if (
-                right.kind == "tensor"
-                and len(right.arguments) == 3
-                and _element(right) == element
-                and right.arguments[1] == columns
-            ):
-                return ConcreteType("tensor", "Tensor", (element, rows, right.arguments[2]))
-            raise self.error(node, "matmul operands have incompatible shapes")
+            if not isinstance(left, ConcreteType) or left.kind != "tensor":
+                raise self.error(node, "matmul left operand must be a non-scalar Tensor")
+            if not isinstance(right, ConcreteType) or right.kind != "tensor":
+                raise self.error(node, "matmul right operand must be a non-scalar Tensor")
+            result_shape = matmul_shape(left.arguments[1:], right.arguments[1:])
+            element = common_type(_element(left), _element(right))
+            if result_shape is None:
+                raise self.error(node, "matmul operands have incompatible core or batch dimensions")
+            if not isinstance(element, ConcreteType) or element.kind != "scalar":
+                raise self.error(node, "matmul operands have incompatible element types")
+            if result_shape:
+                return ConcreteType("tensor", "Tensor", (element, *result_shape))
+            return element
         if name == "texture_sample":
             if len(arguments) not in {2, 3, 4} or not isinstance(arguments[0], ConcreteType):
                 raise self.error(node, "texture_sample requires a texture and coordinates")

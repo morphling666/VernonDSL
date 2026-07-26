@@ -129,44 +129,75 @@ bool isRowMajorContiguous(const VernonTensorView &tensor) {
     return true;
 }
 
-std::optional<std::vector<uint8_t>> packTensorRowMajor(const VernonTensorView &tensor) {
-    if (tensor.storage != VERNON_TENSOR_HOST)
+std::optional<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, const TensorPackingLayout &layout) {
+    if (tensor.storage != VERNON_TENSOR_HOST || tensor.dtype != layout.dtype || tensor.rank != layout.shape.size() ||
+        layout.byteStrides.size() != layout.shape.size() || (tensor.rank && !tensor.shape))
         return std::nullopt;
     const size_t elementSize = dataTypeSize(tensor.dtype);
-    const std::optional<size_t> packedSize = tensorLogicalByteSize(tensor);
-    if (!packedSize)
+    if (!elementSize || !tensorFitsAllocation(tensor))
+        return std::nullopt;
+    for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension)
+        if (tensor.shape[dimension] != layout.shape[dimension])
+            return std::nullopt;
+
+    const std::optional<size_t> elementCount = tensorElementCount(tensor);
+    if (!elementCount)
+        return std::nullopt;
+    size_t requiredSize = *elementCount ? elementSize : 0;
+    if (*elementCount)
+        for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension) {
+            const uint64_t steps = layout.shape[dimension] - 1;
+            if (steps && layout.byteStrides[dimension] > (std::numeric_limits<size_t>::max() - requiredSize) / steps)
+                return std::nullopt;
+            requiredSize += static_cast<size_t>(steps) * layout.byteStrides[dimension];
+        }
+    if (requiredSize > layout.byteSize)
         return std::nullopt;
 
-    std::vector<uint8_t> packed(*packedSize);
-    if (*packedSize == 0)
+    std::vector<uint8_t> packed(layout.byteSize);
+    if (!*elementCount)
         return packed;
-    if (!tensorFitsAllocation(tensor))
-        return std::nullopt;
     const uint8_t *source = hostTensorData(tensor);
     if (!source)
         return std::nullopt;
-    if (isRowMajorContiguous(tensor)) {
-        if (*packedSize > tensor.byte_size - tensor.byte_offset)
-            return std::nullopt;
-        std::memcpy(packed.data(), source, *packedSize);
-        return packed;
-    }
 
-    const size_t elementCount = *packedSize / elementSize;
-    for (size_t linear = 0; linear < elementCount; ++linear) {
+    for (size_t linear = 0; linear < *elementCount; ++linear) {
         size_t remainder = linear;
         size_t positiveOffset = 0;
         size_t negativeOffset = 0;
+        size_t destinationOffset = 0;
         for (uint32_t dimension = tensor.rank; dimension-- > 0;) {
             const size_t extent = static_cast<size_t>(tensor.shape[dimension]);
             const size_t index = remainder % extent;
             remainder /= extent;
             const size_t offset = index * static_cast<size_t>(strideMagnitude(tensor.byte_strides[dimension]));
             (tensor.byte_strides[dimension] < 0 ? negativeOffset : positiveOffset) += offset;
+            destinationOffset += index * layout.byteStrides[dimension];
         }
-        std::memcpy(packed.data() + linear * elementSize, source + positiveOffset - negativeOffset, elementSize);
+        std::memcpy(packed.data() + destinationOffset, source + positiveOffset - negativeOffset, elementSize);
     }
     return packed;
+}
+
+std::optional<std::vector<uint8_t>> packTensorRowMajor(const VernonTensorView &tensor) {
+    const size_t elementSize = dataTypeSize(tensor.dtype);
+    const std::optional<size_t> packedSize = tensorLogicalByteSize(tensor);
+    if (!elementSize || !packedSize || (tensor.rank && !tensor.shape))
+        return std::nullopt;
+    TensorPackingLayout layout;
+    layout.dtype = tensor.dtype;
+    if (tensor.rank)
+        layout.shape.assign(tensor.shape, tensor.shape + tensor.rank);
+    layout.byteStrides.resize(tensor.rank);
+    size_t stride = elementSize;
+    for (uint32_t dimension = tensor.rank; dimension-- > 0;) {
+        layout.byteStrides[dimension] = stride;
+        if (layout.shape[dimension] && stride > std::numeric_limits<size_t>::max() / layout.shape[dimension])
+            return std::nullopt;
+        stride *= static_cast<size_t>(layout.shape[dimension]);
+    }
+    layout.byteSize = *packedSize;
+    return packTensor(tensor, layout);
 }
 
 } // namespace vernon::runtime

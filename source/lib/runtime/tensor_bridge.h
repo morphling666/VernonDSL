@@ -22,6 +22,15 @@ bool tensorFitsAllocation(const VernonTensorView &tensor);
 
 bool isRowMajorContiguous(const VernonTensorView &tensor);
 
+struct TensorPackingLayout {
+    VernonDataType dtype{};
+    std::vector<uint64_t> shape;
+    std::vector<size_t> byteStrides;
+    size_t byteSize{};
+};
+
+std::optional<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, const TensorPackingLayout &layout);
+
 std::optional<std::vector<uint8_t>> packTensorRowMajor(const VernonTensorView &tensor);
 
 } // namespace vernon::runtime

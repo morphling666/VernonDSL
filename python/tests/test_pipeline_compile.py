@@ -309,6 +309,13 @@ class PipelineCompileTests(unittest.TestCase):
                             "vernon.interface": "uniform",
                             "vernon.set": 0,
                             "vernon.binding": 2,
+                            "uniform_layout": {
+                                "storage": "uniform_buffer",
+                                "size": 64,
+                                "alignment": 16,
+                                "byte_strides": [16, 4],
+                                "matrix_order": "row_major",
+                            },
                         }
                     ],
                 },
@@ -316,6 +323,53 @@ class PipelineCompileTests(unittest.TestCase):
         }
         uses = external_parameters(records)["material"]
         self.assertEqual(uses[0]["uniform_name"], "material._m0")
+        self.assertEqual(
+            uses[0]["uniform_layout"],
+            {
+                "storage": "uniform_buffer",
+                "size": 64,
+                "alignment": 16,
+                "byte_strides": [16, 4],
+                "matrix_order": "row_major",
+            },
+        )
+
+    def test_reflected_static_tensor_layout_is_normalized_for_runtime(self) -> None:
+        records = {
+            "fragment": {
+                "entry": "fragment_main",
+                "target": "vulkan",
+                "interface": {
+                    "arguments": [
+                        {
+                            "index": 0,
+                            "type": "tensor<2x3x5xf32>",
+                            "kind": "tensor_value",
+                            "dtype": "f32",
+                            "shape": [2, 3, 5],
+                            "vernon.source_name": "weights",
+                            "vernon.interface": "uniform",
+                            "vernon.set": 0,
+                            "vernon.binding": 3,
+                            "physical_size": 120,
+                            "physical_alignment": 4,
+                            "array_strides": [60, 20, 4],
+                            "proposed_storage_class": "Uniform",
+                        }
+                    ],
+                },
+            },
+        }
+        use = external_parameters(records)["weights"][0]
+        self.assertEqual(
+            use["uniform_layout"],
+            {
+                "storage": "uniform_buffer",
+                "size": 120,
+                "alignment": 4,
+                "byte_strides": [60, 20, 4],
+            },
+        )
 
     def test_parameter_merge_and_slot_layout_are_exact(self) -> None:
         uses = [

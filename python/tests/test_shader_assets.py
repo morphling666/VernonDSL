@@ -256,7 +256,7 @@ class ShaderAssetCookTests(unittest.TestCase):
         relocatable_object = b"mock relocatable object"
         digest = hashlib.sha256(relocatable_object).hexdigest()
         reflection = {
-            "schema_version": 2,
+            "schema_version": 3,
             "module_hash": "module",
             "dependencies": [],
             "entries": [
@@ -531,9 +531,9 @@ asset = vd.pipeline_asset(
                     self.assertEqual(repeated_path, manifest_path)
                     self.assertEqual(manifest_path.read_bytes(), first_manifest)
                     document = json.loads(manifest_path.read_text(encoding="utf-8"))
-                    self.assertEqual(document["schema_version"], 2)
+                    self.assertEqual(document["schema_version"], 3)
                     self.assertEqual(document["type"], "pipeline")
-                    self.assertEqual(document["invocation_abi_version"], 3)
+                    self.assertEqual(document["invocation_abi_version"], 4)
                     self.assertEqual(document["target"], target)
                     self.assertEqual(
                         document["target_options"],
@@ -665,9 +665,9 @@ asset = vd.pipeline_asset(
             locations = [value["vernon.location"] for value in interface if "vernon.location" in value]
             self.assertEqual(locations, [0, 1, 5, 6])
             runtime_bundle = bundle
-            self.assertEqual(runtime_bundle["schema_version"], 2)
+            self.assertEqual(runtime_bundle["schema_version"], 3)
             self.assertEqual(runtime_bundle["type"], "pipeline")
-            self.assertEqual(runtime_bundle["invocation_abi_version"], 3)
+            self.assertEqual(runtime_bundle["invocation_abi_version"], 4)
             self.assertEqual(runtime_bundle["id"], "shaders/variant_mesh")
             self.assertEqual(len(runtime_bundle["variants"]), 4)
             combined_runtime = next(
@@ -760,14 +760,18 @@ asset = vd.pipeline_asset(
                             stages,
                         )
                         if name == "cube_map_asset":
-                            uniform_uses = [
-                                use
+                            uniform_parameters = [
+                                (parameter["name"], use)
                                 for parameter in document["variants"][0]["parameters"]
                                 for use in parameter["uses"]
                                 if use["interface"] == "uniform"
                             ]
-                            self.assertTrue(uniform_uses)
-                            self.assertTrue(all(not use["uniform_name"].endswith("._m0") for use in uniform_uses))
+                            self.assertEqual(
+                                {name for name, _ in uniform_parameters},
+                                {"projection", "view", "model"},
+                            )
+                            self.assertTrue(all(use["uniform_name"] for _, use in uniform_parameters))
+                            self.assertTrue(all(not name.endswith("._m0") for name, _ in uniform_parameters))
                         for stage in document["stage_artifacts"].values():
                             artifact = stage["artifact"]
                             self.assertEqual(artifact["format"], artifact_format)

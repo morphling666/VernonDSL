@@ -8,6 +8,7 @@
 #include "pipeline_bundle.h"
 #include "pipeline_metadata.h"
 #include "runtime_state.h"
+#include "tensor_bridge.h"
 
 #include <string>
 #include <unordered_map>
@@ -44,12 +45,15 @@ struct OpenGLPipelineState {
 
         Source source{EXTERNAL_UNIFORM};
         uint32_t externalSlot{};
+        bool transpose{};
+        TensorPackingLayout packing;
         std::vector<uint8_t> storage;
     };
 
     VernonRuntimeCorePipeline *rhiPipeline{};
     VernonRuntimeCoreBindings *rhiBindings{};
     std::vector<VernonRuntimeProviderBindingLayoutEntry> rhiLayout;
+    std::vector<VernonRuntimeProviderVertexAttribute> rhiVertexAttributes;
     std::vector<VernonRuntimeProviderBindingValue> rhiValues;
     std::vector<InlineBinding> rhiInlineBindings;
     uint32_t workgroup[3]{1, 1, 1};

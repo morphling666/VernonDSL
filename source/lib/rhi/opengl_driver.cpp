@@ -37,6 +37,7 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
     LOAD(getProgramInfoLog, "glGetProgramInfoLog");
     LOAD(deleteProgram, "glDeleteProgram");
     LOAD(useProgram, "glUseProgram");
+    LOAD(getIntegerv, "glGetIntegerv");
     LOAD(genBuffers, "glGenBuffers");
     LOAD(deleteBuffers, "glDeleteBuffers");
     LOAD(bindBuffer, "glBindBuffer");
@@ -50,6 +51,9 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
     LOAD(bindVertexArray, "glBindVertexArray");
     LOAD(enableVertexAttribArray, "glEnableVertexAttribArray");
     LOAD(vertexAttribPointer, "glVertexAttribPointer");
+    LOAD(vertexAttribIPointer, "glVertexAttribIPointer");
+    driver.vertexAttribLPointer = reinterpret_cast<decltype(driver.vertexAttribLPointer)>(
+        callbacks.get_proc_address(callbacks.user_data, "glVertexAttribLPointer"));
     LOAD(vertexAttribDivisor, "glVertexAttribDivisor");
     LOAD(genFramebuffers, "glGenFramebuffers");
     LOAD(deleteFramebuffers, "glDeleteFramebuffers");
@@ -58,6 +62,9 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
     LOAD(checkFramebufferStatus, "glCheckFramebufferStatus");
     LOAD(drawBuffers, "glDrawBuffers");
     LOAD(clearBufferfv, "glClearBufferfv");
+    LOAD(enable, "glEnable");
+    LOAD(disable, "glDisable");
+    LOAD(depthFunc, "glDepthFunc");
     LOAD(viewport, "glViewport");
     LOAD(drawArrays, "glDrawArrays");
     LOAD(drawArraysInstanced, "glDrawArraysInstanced");
@@ -68,7 +75,13 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
     LOAD(uniform3fv, "glUniform3fv");
     LOAD(uniform4fv, "glUniform4fv");
     LOAD(uniformMatrix2fv, "glUniformMatrix2fv");
+    LOAD(uniformMatrix2x3fv, "glUniformMatrix2x3fv");
+    LOAD(uniformMatrix2x4fv, "glUniformMatrix2x4fv");
+    LOAD(uniformMatrix3x2fv, "glUniformMatrix3x2fv");
     LOAD(uniformMatrix3fv, "glUniformMatrix3fv");
+    LOAD(uniformMatrix3x4fv, "glUniformMatrix3x4fv");
+    LOAD(uniformMatrix4x2fv, "glUniformMatrix4x2fv");
+    LOAD(uniformMatrix4x3fv, "glUniformMatrix4x3fv");
     LOAD(uniformMatrix4fv, "glUniformMatrix4fv");
     LOAD(uniform1i, "glUniform1i");
     LOAD(activeTexture, "glActiveTexture");

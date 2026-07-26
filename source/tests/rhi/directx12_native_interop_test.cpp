@@ -1,9 +1,12 @@
 #include "VernonRHI.h"
+#include "rhi/rhi_internal.h"
 
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <gtest/gtest.h>
 #include <wrl/client.h>
+
+#include <vector>
 
 namespace {
 
@@ -162,6 +165,39 @@ TEST(DirectX12NativeInterop, BorrowsObjectsWithoutChangingTheirLifetime) {
     image->Release();
     EXPECT_EQ(descriptorHeap->AddRef(), heapReferences);
     descriptorHeap->Release();
+}
+
+TEST(DirectX12NativeInterop, KeepsOwnedResourceAddressesStableAsSlotsGrow) {
+    VernonRhiOwnedDeviceDescriptor deviceDescriptor{};
+    deviceDescriptor.struct_size = sizeof(deviceDescriptor);
+    deviceDescriptor.backend = VERNON_RHI_BACKEND_DIRECTX12;
+    const VernonRhiDevice device = vernonRhiCreateDevice(&deviceDescriptor);
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        GTEST_SKIP() << "DirectX 12 device is unavailable";
+
+    VernonRhiBufferDescriptor bufferDescriptor{};
+    bufferDescriptor.struct_size = sizeof(bufferDescriptor);
+    bufferDescriptor.size = 64;
+    bufferDescriptor.alignment = 16;
+    bufferDescriptor.usage = VERNON_RHI_BUFFER_VERTEX;
+    bufferDescriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
+
+    std::vector<VernonRhiBuffer> buffers(64);
+    for (VernonRhiBuffer &buffer : buffers)
+        ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &buffer), VERNON_RHI_STATUS_OK);
+
+    const uint64_t firstResource = vernon::rhi::bufferResource(device, buffers.front());
+    ASSERT_NE(firstResource, 0u);
+    for (size_t index = 0; index < 64; ++index) {
+        VernonRhiBuffer extra{};
+        ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &extra), VERNON_RHI_STATUS_OK);
+        buffers.push_back(extra);
+    }
+    EXPECT_EQ(vernon::rhi::bufferResource(device, buffers.front()), firstResource);
+
+    for (VernonRhiBuffer buffer : buffers)
+        EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, buffer), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
 }
 
 } // namespace

@@ -21,6 +21,7 @@ struct PreparedLayout {
         std::string name;
     };
     std::vector<Entry> entries;
+    std::vector<VernonRuntimeProviderVertexAttribute> vertexAttributes;
 };
 
 struct PreparedPipeline {
@@ -33,11 +34,16 @@ struct PreparedPipeline {
         uint32_t binding{};
         uint32_t divisor{};
     };
+    struct VertexAttribute {
+        VernonRuntimeProviderVertexAttribute layout{};
+        uint32_t divisor{};
+    };
     rhi::opengl::DeviceState *device{};
     rhi::opengl::Uint program{};
     rhi::opengl::Uint vertexArray{};
     rhi::opengl::Uint framebuffer{};
     std::vector<Binding> bindings;
+    std::vector<VertexAttribute> vertexAttributes;
     bool compute{};
 };
 
@@ -46,13 +52,15 @@ struct PreparedBindingSet {
         uint32_t slot{};
         VernonRuntimeProviderBindingKind kind{VERNON_RUNTIME_PROVIDER_INLINE_VALUE};
         uint32_t valueCount{};
+        uint32_t columnCount{};
         uint32_t flags{};
         uint64_t resource{};
         uint64_t resourceOffset{};
         uint32_t resourceTarget{};
         uint32_t resourceStride{};
-        uint32_t resourceSecondaryStride{};
+        uint32_t binding{};
         uint32_t stageMask{};
+        size_t byteSize{};
         std::vector<float> storage;
         rhi::opengl::Buffer inlineBuffer;
     };
@@ -98,7 +106,8 @@ VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayout
                            VernonRuntimeProviderObject *output) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
-        (descriptor->binding_count != 0 && !descriptor->bindings))
+        (descriptor->binding_count != 0 && !descriptor->bindings) ||
+        (descriptor->vertex_attribute_count != 0 && !descriptor->vertex_attributes))
         return fail(adapter, "OpenGL adapter received an invalid pipeline layout");
     auto layout = std::unique_ptr<PreparedLayout>(new (std::nothrow) PreparedLayout());
     if (!layout)
@@ -112,12 +121,18 @@ VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayout
                 ((source.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE && source.binding != UINT32_MAX &&
                   source.element_size != 0) ||
                  (source.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM && source.name.data &&
-                  source.name.size != 0 &&
-                  (source.value_count == 1 || source.value_count == 2 || source.value_count == 3 ||
-                   source.value_count == 4 || source.value_count == 9 || source.value_count == 16) &&
-                  source.element_size == source.value_count * sizeof(float)));
+                  source.name.size != 0 && source.vector_count != 0 &&
+                  ((source.vector_count == 1 && source.element_count >= 1 && source.element_count <= 4) ||
+                   (source.vector_count >= 2 && source.vector_count <= 4 &&
+                    source.element_count % source.vector_count == 0 &&
+                    source.element_count / source.vector_count >= 2 &&
+                    source.element_count / source.vector_count <= 4)) &&
+                  source.element_size == source.element_count * sizeof(float)));
             const bool storageBuffer = source.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
                                        source.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE &&
+                                       source.binding != UINT32_MAX && source.element_size != 0;
+            const bool uniformBuffer = source.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER &&
+                                       source.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM &&
                                        source.binding != UINT32_MAX && source.element_size != 0;
             const bool sampledImage = source.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE &&
                                       source.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE &&
@@ -128,17 +143,32 @@ VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayout
             const bool vertexBuffer = source.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER &&
                                       source.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_VERTEX_INPUT &&
                                       source.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_VERTEX &&
-                                      source.location != UINT32_MAX && source.element_size == sizeof(float) &&
-                                      source.value_count != 0 && source.column_count != 0 &&
-                                      source.value_count % source.column_count == 0 &&
-                                      source.value_count / source.column_count <= 4 && source.column_count <= 4;
-            if (!inlineValue && !storageBuffer && !sampledImage && !sampler && !vertexBuffer)
+                                      source.binding != UINT32_MAX && source.element_size != 0;
+            if (!inlineValue && !uniformBuffer && !storageBuffer && !sampledImage && !sampler && !vertexBuffer)
                 return fail(adapter, "OpenGL adapter pipeline layout contains an unsupported binding");
             PreparedLayout::Entry entry;
             entry.layout = source;
             if (source.name.data && source.name.size)
                 entry.name.assign(source.name.data, source.name.size);
             layout->entries.push_back(std::move(entry));
+        }
+        rhi::opengl::Int maximumLocations = 0;
+        adapter.openGLDevice->driver.getIntegerv(rhi::opengl::kMaxVertexAttribs, &maximumLocations);
+        for (size_t index = 0; index < descriptor->vertex_attribute_count; ++index) {
+            const auto &attribute = descriptor->vertex_attributes[index];
+            const bool bindingExists =
+                std::any_of(layout->entries.begin(), layout->entries.end(), [&](const PreparedLayout::Entry &entry) {
+                    return entry.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER &&
+                           entry.layout.binding == attribute.binding;
+                });
+            const bool dtypeSupported =
+                attribute.dtype == VERNON_RUNTIME_PROVIDER_F16 || attribute.dtype == VERNON_RUNTIME_PROVIDER_F32 ||
+                attribute.dtype == VERNON_RUNTIME_PROVIDER_I32 || attribute.dtype == VERNON_RUNTIME_PROVIDER_U32 ||
+                (attribute.dtype == VERNON_RUNTIME_PROVIDER_F64 && adapter.openGLDevice->driver.vertexAttribLPointer);
+            if (!bindingExists || !dtypeSupported || attribute.component_count == 0 || attribute.component_count > 4 ||
+                attribute.location >= static_cast<uint32_t>(maximumLocations))
+                return fail(adapter, "OpenGL vertex attribute exceeds device location or format capabilities");
+            layout->vertexAttributes.push_back(attribute);
         }
     } catch (const std::bad_alloc &) {
         return fail(adapter, "OpenGL layout preparation ran out of memory", VERNON_STATUS_INTERNAL_ERROR);
@@ -200,21 +230,28 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
         }
         for (const auto &entry : layout->entries) {
             rhi::opengl::Int location = -1;
-            if (!compute && entry.layout.kind != VERNON_RUNTIME_PROVIDER_SAMPLER &&
+            if (!compute && entry.layout.kind != VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER &&
+                entry.layout.kind != VERNON_RUNTIME_PROVIDER_SAMPLER &&
                 entry.layout.kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
                 location = adapter.openGLDevice->driver.getUniformLocation(pipeline->program, entry.name.c_str());
-            if (!compute && entry.layout.kind != VERNON_RUNTIME_PROVIDER_SAMPLER &&
+            if (!compute && entry.layout.kind != VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER &&
+                entry.layout.kind != VERNON_RUNTIME_PROVIDER_SAMPLER &&
                 entry.layout.kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && location < 0) {
                 adapter.openGLDevice->destroyGraphicsObjects(pipeline->vertexArray, pipeline->framebuffer);
                 adapter.openGLDevice->destroyProgram(pipeline->program);
                 return fail(adapter, "OpenGL uniform location is missing");
             }
-            const auto resolvedLocation = entry.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER
-                                              ? static_cast<rhi::opengl::Int>(entry.layout.location)
-                                              : location;
-            pipeline->bindings.push_back({entry.layout.slot, entry.layout.kind, resolvedLocation,
-                                          entry.layout.value_count, entry.layout.column_count, entry.layout.binding,
-                                          entry.layout.divisor});
+            pipeline->bindings.push_back({entry.layout.slot, entry.layout.kind, location, entry.layout.element_count,
+                                          entry.layout.vector_count, entry.layout.binding, entry.layout.divisor});
+        }
+        for (const VernonRuntimeProviderVertexAttribute &attribute : layout->vertexAttributes) {
+            auto binding = std::find_if(layout->entries.begin(), layout->entries.end(), [&](const auto &entry) {
+                return entry.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER &&
+                       entry.layout.binding == attribute.binding;
+            });
+            if (binding == layout->entries.end())
+                return fail(adapter, "OpenGL vertex attribute references a missing binding");
+            pipeline->vertexAttributes.push_back({attribute, binding->layout.divisor});
         }
         *output = toHandle(pipeline.release());
         adapter.pipelinePreparations.fetch_add(1, std::memory_order_relaxed);
@@ -243,14 +280,17 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
                                         [&slot](const auto &candidate) { return candidate.slot == slot.slot; });
         if (value == values + valueCount || value->kind != slot.kind)
             return fail(adapter, "OpenGL binding slot or kind is invalid");
-        if (slot.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE) {
-            if (!value->inline_data || value->inline_size != slot.storage.size() * sizeof(float) ||
+        if (slot.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE || slot.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+            if (!value->inline_data || value->inline_size != slot.byteSize ||
                 (value->flags & ~VERNON_RUNTIME_PROVIDER_BINDING_TRANSPOSE) != 0 ||
-                ((value->flags & VERNON_RUNTIME_PROVIDER_BINDING_TRANSPOSE) != 0 && slot.valueCount != 9 &&
-                 slot.valueCount != 16))
+                (slot.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER &&
+                 (value->flags & VERNON_RUNTIME_PROVIDER_BINDING_TRANSPOSE) != 0) ||
+                (slot.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
+                 (value->flags & VERNON_RUNTIME_PROVIDER_BINDING_TRANSPOSE) != 0 && slot.columnCount <= 1))
                 return fail(adapter, "OpenGL inline binding is invalid");
             std::memcpy(slot.storage.data(), value->inline_data, value->inline_size);
-            if (slot.stageMask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE) {
+            if (slot.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
+                slot.stageMask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE) {
                 if (!bindings.device->uploadBuffer(slot.inlineBuffer, 0, value->inline_data, value->inline_size,
                                                    adapter.error))
                     return VERNON_STATUS_INTERNAL_ERROR;
@@ -268,7 +308,6 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
             slot.resourceOffset = value->resource.offset;
             slot.resourceTarget = value->stride;
             slot.resourceStride = value->stride;
-            slot.resourceSecondaryStride = value->secondary_stride;
         }
         slot.flags = value->flags;
     }
@@ -289,12 +328,19 @@ VernonStatus createBindings(void *data, const VernonRuntimeProviderBindingSetDes
             PreparedBindingSet::Slot slot;
             slot.slot = entry.layout.slot;
             slot.kind = entry.layout.kind;
-            slot.valueCount = entry.layout.value_count ? entry.layout.value_count : entry.layout.element_size / 4;
+            slot.valueCount =
+                entry.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER
+                    ? 0
+                    : (entry.layout.element_count ? entry.layout.element_count : entry.layout.element_size / 4);
+            slot.columnCount = entry.layout.vector_count;
+            slot.binding = entry.layout.binding;
             slot.stageMask = entry.layout.stage_mask;
-            if (entry.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE) {
-                slot.storage.resize(entry.layout.value_count);
-                if (entry.layout.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE) {
-                    slot.storage.resize((entry.layout.element_size + sizeof(float) - 1) / sizeof(float));
+            slot.byteSize = entry.layout.element_size;
+            if (entry.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
+                entry.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+                slot.storage.resize((entry.layout.element_size + sizeof(float) - 1) / sizeof(float));
+                if (entry.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
+                    entry.layout.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE) {
                     if (!bindings->device->createBuffer(slot.inlineBuffer, entry.layout.element_size, adapter.error))
                         return VERNON_STATUS_INTERNAL_ERROR;
                 }
@@ -387,20 +433,14 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject,
     for (size_t index = 0; index < pipeline->bindings.size(); ++index) {
         const auto &binding = pipeline->bindings[index];
         const auto &slot = bindings->slots[index];
-        if (slot.slot != binding.slot || slot.kind != binding.kind || slot.valueCount != binding.valueCount)
+        if (slot.slot != binding.slot || slot.kind != binding.kind || slot.valueCount != binding.valueCount ||
+            slot.columnCount != binding.columnCount)
             return fail(adapter, "OpenGL draw binding order does not match its pipeline");
         if (binding.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER) {
-            driver.bindBuffer(rhi::opengl::kArrayBuffer, static_cast<rhi::opengl::Uint>(slot.resource));
-            const uint32_t rows = binding.valueCount / binding.columnCount;
-            for (uint32_t column = 0; column < binding.columnCount; ++column) {
-                driver.enableVertexAttribArray(binding.location + column);
-                driver.vertexAttribPointer(
-                    binding.location + column, static_cast<rhi::opengl::Int>(rows), rhi::opengl::kFloat, 0,
-                    static_cast<rhi::opengl::Size>(slot.resourceStride),
-                    reinterpret_cast<const void *>(static_cast<uintptr_t>(
-                        slot.resourceOffset + static_cast<uint64_t>(column) * slot.resourceSecondaryStride)));
-                driver.vertexAttribDivisor(binding.location + column, binding.divisor);
-            }
+            continue;
+        } else if (binding.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+            driver.bindBufferBase(rhi::opengl::kUniformBuffer, binding.binding,
+                                  static_cast<rhi::opengl::Uint>(slot.resource));
         } else if (binding.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
             const auto target = slot.resourceTarget == 0   ? rhi::opengl::kTexture2D
                                 : slot.resourceTarget == 1 ? rhi::opengl::kTexture3D
@@ -410,7 +450,7 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject,
             driver.uniform1i(binding.location, static_cast<rhi::opengl::Int>(binding.binding));
         } else if (binding.kind == VERNON_RUNTIME_PROVIDER_SAMPLER) {
             driver.bindSampler(binding.binding, static_cast<rhi::opengl::Uint>(slot.resource));
-        } else {
+        } else if (binding.columnCount <= 1) {
             const float *value = slot.storage.data();
             if (binding.valueCount == 1)
                 driver.uniform1fv(binding.location, 1, value);
@@ -420,13 +460,61 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject,
                 driver.uniform3fv(binding.location, 1, value);
             else if (binding.valueCount == 4)
                 driver.uniform4fv(binding.location, 1, value);
-            else if (binding.valueCount == 9)
-                driver.uniformMatrix3fv(binding.location, 1,
-                                        (slot.flags & VERNON_RUNTIME_PROVIDER_BINDING_TRANSPOSE) != 0, value);
             else
-                driver.uniformMatrix4fv(binding.location, 1,
-                                        (slot.flags & VERNON_RUNTIME_PROVIDER_BINDING_TRANSPOSE) != 0, value);
+                driver.uniform4fv(binding.location, 1, value);
+        } else {
+            const float *value = slot.storage.data();
+            const auto transpose =
+                static_cast<rhi::opengl::Boolean>((slot.flags & VERNON_RUNTIME_PROVIDER_BINDING_TRANSPOSE) != 0);
+            const uint32_t columns = binding.columnCount;
+            const uint32_t rows = binding.valueCount / columns;
+            if (columns == 2 && rows == 2)
+                driver.uniformMatrix2fv(binding.location, 1, transpose, value);
+            else if (columns == 2 && rows == 3)
+                driver.uniformMatrix2x3fv(binding.location, 1, transpose, value);
+            else if (columns == 2 && rows == 4)
+                driver.uniformMatrix2x4fv(binding.location, 1, transpose, value);
+            else if (columns == 3 && rows == 2)
+                driver.uniformMatrix3x2fv(binding.location, 1, transpose, value);
+            else if (columns == 3 && rows == 3)
+                driver.uniformMatrix3fv(binding.location, 1, transpose, value);
+            else if (columns == 3 && rows == 4)
+                driver.uniformMatrix3x4fv(binding.location, 1, transpose, value);
+            else if (columns == 4 && rows == 2)
+                driver.uniformMatrix4x2fv(binding.location, 1, transpose, value);
+            else if (columns == 4 && rows == 3)
+                driver.uniformMatrix4x3fv(binding.location, 1, transpose, value);
+            else
+                driver.uniformMatrix4fv(binding.location, 1, transpose, value);
         }
+    }
+    for (const PreparedPipeline::VertexAttribute &attribute : pipeline->vertexAttributes) {
+        auto slot = std::find_if(bindings->slots.begin(), bindings->slots.end(), [&](const auto &candidate) {
+            return candidate.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER &&
+                   candidate.binding == attribute.layout.binding;
+        });
+        if (slot == bindings->slots.end())
+            return fail(adapter, "OpenGL vertex attribute binding is missing");
+        driver.bindBuffer(rhi::opengl::kArrayBuffer, static_cast<rhi::opengl::Uint>(slot->resource));
+        driver.enableVertexAttribArray(attribute.layout.location);
+        const auto pointer = reinterpret_cast<const void *>(
+            static_cast<uintptr_t>(slot->resourceOffset + attribute.layout.relative_offset));
+        if (attribute.layout.dtype == VERNON_RUNTIME_PROVIDER_I32 ||
+            attribute.layout.dtype == VERNON_RUNTIME_PROVIDER_U32) {
+            driver.vertexAttribIPointer(
+                attribute.layout.location, attribute.layout.component_count,
+                attribute.layout.dtype == VERNON_RUNTIME_PROVIDER_I32 ? rhi::opengl::kInt : rhi::opengl::kUnsignedInt,
+                slot->resourceStride, pointer);
+        } else if (attribute.layout.dtype == VERNON_RUNTIME_PROVIDER_F64) {
+            driver.vertexAttribLPointer(attribute.layout.location, attribute.layout.component_count,
+                                        rhi::opengl::kDouble, slot->resourceStride, pointer);
+        } else {
+            driver.vertexAttribPointer(attribute.layout.location, attribute.layout.component_count,
+                                       attribute.layout.dtype == VERNON_RUNTIME_PROVIDER_F16 ? rhi::opengl::kHalfFloat
+                                                                                             : rhi::opengl::kFloat,
+                                       0, slot->resourceStride, pointer);
+        }
+        driver.vertexAttribDivisor(attribute.layout.location, attribute.divisor);
     }
     driver.bindFramebuffer(rhi::opengl::kFramebuffer, pipeline->framebuffer);
     for (size_t index = 0; index < descriptor->color_attachment_count; ++index) {
@@ -440,6 +528,12 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject,
         drawBuffers[attachment.location] = target;
         drawBufferCount = std::max(drawBufferCount, static_cast<size_t>(attachment.location) + 1);
     }
+    const bool hasDepth = descriptor->depth_stencil_attachment.resource.value != 0;
+    if (hasDepth && descriptor->depth_stencil_attachment.identity != identity)
+        return fail(adapter, "OpenGL depth attachment belongs to another device");
+    driver.framebufferTexture2D(
+        rhi::opengl::kFramebuffer, rhi::opengl::kDepthAttachment, rhi::opengl::kTexture2D,
+        hasDepth ? static_cast<rhi::opengl::Uint>(descriptor->depth_stencil_attachment.resource.value) : 0, 0);
     driver.drawBuffers(static_cast<rhi::opengl::Size>(drawBufferCount), drawBuffers.data());
     if (driver.checkFramebufferStatus(rhi::opengl::kFramebuffer) != rhi::opengl::kFramebufferComplete)
         return fail(adapter, "OpenGL draw framebuffer is incomplete", VERNON_STATUS_INTERNAL_ERROR);
@@ -452,6 +546,14 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject,
         driver.clearBufferfv(rhi::opengl::kColor,
                              static_cast<rhi::opengl::Int>(descriptor->color_attachments[index].location),
                              clear.data());
+    if (hasDepth) {
+        constexpr float clearDepth = 1.0f;
+        driver.enable(rhi::opengl::kDepthTest);
+        driver.depthFunc(rhi::opengl::kLess);
+        driver.clearBufferfv(rhi::opengl::kDepth, 0, &clearDepth);
+    } else {
+        driver.disable(rhi::opengl::kDepthTest);
+    }
     rhi::opengl::Enum topology = rhi::opengl::kTriangles;
     if (descriptor->topology == 1)
         topology = rhi::opengl::kLines;

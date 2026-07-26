@@ -142,4 +142,40 @@ TEST(PipelineManifestRequirements, ComparesApiAndCpuHostRequirements) {
     EXPECT_NE(error.find("runtime provides"), std::string::npos);
 }
 
+TEST(PipelineManifestRequirements, ParsesReflectedUniformTensorLayout) {
+    const nlohmann::json manifest = {
+        {"key", nlohmann::json::array()},
+        {"program", {{"vertex", "vertex.spv"}, {"fragment", "fragment.spv"}}},
+        {"parameters",
+         nlohmann::json::array({{{"slot", 0},
+                                 {"name", "weights"},
+                                 {"kind", "tensor"},
+                                 {"dtype", "f32"},
+                                 {"shape", nlohmann::json::array({2, 3})},
+                                 {"uses", nlohmann::json::array({{{"stage", "vertex"},
+                                                                  {"interface", "uniform"},
+                                                                  {"index", 0},
+                                                                  {"shape", nlohmann::json::array({2, 3})},
+                                                                  {"vernon.set", 0},
+                                                                  {"vernon.binding", 2},
+                                                                  {"uniform_layout",
+                                                                   {{"storage", "uniform_buffer"},
+                                                                    {"size", 32},
+                                                                    {"alignment", 16},
+                                                                    {"byte_strides", nlohmann::json::array({16, 4})},
+                                                                    {"matrix_order", "row_major"}}}}})}}})}};
+    vernon::runtime::Variant variant;
+    std::string error;
+    ASSERT_TRUE(vernon::runtime::parseVariant(manifest, variant, error)) << error;
+    ASSERT_EQ(variant.parameters.size(), 1u);
+    ASSERT_EQ(variant.parameters[0].uses.size(), 1u);
+    const auto &layout = variant.parameters[0].uses[0].uniformLayout;
+    ASSERT_TRUE(layout);
+    EXPECT_EQ(layout->storage, "uniform_buffer");
+    EXPECT_EQ(layout->size, 32u);
+    EXPECT_EQ(layout->alignment, 16u);
+    EXPECT_EQ(layout->byteStrides, (std::vector<uint64_t>{16, 4}));
+    EXPECT_EQ(layout->matrixOrder, "row_major");
+}
+
 } // namespace

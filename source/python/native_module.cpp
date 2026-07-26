@@ -99,26 +99,29 @@ struct RhiBuffer {
 };
 
 struct RhiImage {
-    RhiImage(std::shared_ptr<RhiHostState> host, uint32_t width, uint32_t height)
-        : host(std::move(host)), width(width), height(height) {
+    RhiImage(std::shared_ptr<RhiHostState> host, uint32_t width, uint32_t height, bool depth)
+        : host(std::move(host)), width(width), height(height), depth(depth) {
         VernonRhiImageDescriptor descriptor{};
         descriptor.struct_size = sizeof(descriptor);
         descriptor.dimension = VERNON_RHI_IMAGE_2D;
-        descriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+        descriptor.format = depth ? VERNON_RHI_FORMAT_D32_FLOAT : VERNON_RHI_FORMAT_RGBA8_UNORM;
         descriptor.width = width;
         descriptor.height = height;
         descriptor.depth = 1;
         descriptor.mip_levels = 1;
         descriptor.array_layers = 1;
         descriptor.sample_count = 1;
-        descriptor.usage = VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION |
-                           VERNON_RHI_IMAGE_SAMPLED | VERNON_RHI_IMAGE_COLOR_ATTACHMENT;
+        descriptor.usage = depth ? VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT
+                                 : VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION |
+                                       VERNON_RHI_IMAGE_SAMPLED | VERNON_RHI_IMAGE_COLOR_ATTACHMENT;
         if (vernonRhiDeviceCreateImage(this->host->device, &descriptor, &handle) != VERNON_RHI_STATUS_OK)
             throw std::runtime_error("cannot create Vernon RHI image");
     }
     ~RhiImage() { vernonRhiDeviceDestroyImage(host->device, handle); }
 
     void upload(const nb::bytes &data) {
+        if (depth)
+            throw std::runtime_error("depth images cannot be uploaded");
         if (data.size() != static_cast<size_t>(width) * height * 4)
             throw std::runtime_error("RHI image upload size does not match RGBA8 extent");
         VernonRhiImageUploadDescriptor descriptor{};
@@ -133,9 +136,12 @@ struct RhiImage {
             throw std::runtime_error("RHI image upload failed");
     }
     nb::bytes download() const {
+        if (depth)
+            throw std::runtime_error("depth images cannot be downloaded");
         std::string data(static_cast<size_t>(width) * height * 4, '\0');
         if (vernonRhiDeviceDownloadImage(host->device, handle, data.data(), data.size()) != VERNON_RHI_STATUS_OK)
-            throw std::runtime_error("RHI image download failed");
+            throw std::runtime_error("RHI image download failed: " +
+                                     stringView(vernonRhiDeviceGetLastError(host->device)));
         return nb::bytes(data.data(), data.size());
     }
 
@@ -143,6 +149,7 @@ struct RhiImage {
     VernonRhiImage handle{};
     uint32_t width{};
     uint32_t height{};
+    bool depth{};
 };
 
 struct RhiSampler {
@@ -187,7 +194,10 @@ struct RhiHost {
 
     std::unique_ptr<RhiBuffer> createBuffer(size_t size) { return std::make_unique<RhiBuffer>(state, size); }
     std::unique_ptr<RhiImage> createImage(uint32_t width, uint32_t height) {
-        return std::make_unique<RhiImage>(state, width, height);
+        return std::make_unique<RhiImage>(state, width, height, false);
+    }
+    std::unique_ptr<RhiImage> createDepthImage(uint32_t width, uint32_t height) {
+        return std::make_unique<RhiImage>(state, width, height, true);
     }
     std::unique_ptr<RhiSampler> createSampler() { return std::make_unique<RhiSampler>(state); }
     std::unique_ptr<Runtime> createRuntime();
@@ -470,7 +480,7 @@ struct PipelineInvocationBuilder {
     }
 
     PipelineInvocationBuilder &rhiTexture(const nb::object &identifier, RhiImage *texture, RhiSampler *sampler) {
-        if (!texture || (sampler && sampler->host != texture->host))
+        if (!texture || texture->depth || (sampler && sampler->host != texture->host))
             throw std::invalid_argument("RHI texture and sampler belong to different devices");
         const PipelineParameterMetadata parameter = resolveParameter(identifier);
         OwnedArgument &argument = addArgument(parameter, VERNON_PIPELINE_TEXTURE);
@@ -500,7 +510,7 @@ struct PipelineInvocationBuilder {
     }
 
     PipelineInvocationBuilder &rhiColorAttachment(uint32_t location, RhiImage *texture) {
-        if (!texture)
+        if (!texture || texture->depth)
             throw std::invalid_argument("RHI color attachment is null");
         VernonColorAttachment attachment{};
         attachment.location = location;
@@ -510,6 +520,19 @@ struct PipelineInvocationBuilder {
         attachment.height = texture->height;
         attachment.format = VERNON_TEXTURE_RGBA8_UNORM;
         attachments.push_back(attachment);
+        return *this;
+    }
+
+    PipelineInvocationBuilder &rhiDepthAttachment(RhiImage *texture) {
+        if (!texture || !texture->depth)
+            throw std::invalid_argument("RHI depth attachment must use D32 format");
+        depthAttachment = {};
+        if (vernonRuntimeReferenceRhiImage(runtime, texture->handle, &depthAttachment.resource) != VERNON_STATUS_OK)
+            throw std::invalid_argument("RHI depth attachment belongs to another Runtime device");
+        depthAttachment.width = texture->width;
+        depthAttachment.height = texture->height;
+        depthAttachment.format = VERNON_TEXTURE_D32_FLOAT;
+        hasDepthAttachment = true;
         return *this;
     }
 
@@ -574,6 +597,7 @@ struct PipelineInvocationBuilder {
         invocation.index_binding = hasIndex ? &index : nullptr;
         invocation.color_attachments = attachments.empty() ? nullptr : attachments.data();
         invocation.color_attachment_count = attachments.size();
+        invocation.depth_attachment = hasDepthAttachment ? &depthAttachment : nullptr;
         invocation.topology = topology;
         invocation.vertex_count = vertexCount;
         invocation.instance_count = instanceCount;
@@ -590,7 +614,9 @@ struct PipelineInvocationBuilder {
     std::deque<OwnedArgument> arguments;
     std::unordered_set<uint32_t> slots;
     std::vector<VernonColorAttachment> attachments;
+    VernonDepthAttachment depthAttachment{};
     VernonIndexBinding index{};
+    bool hasDepthAttachment{};
     bool hasIndex{};
     VernonPrimitiveTopology topology{VERNON_TOPOLOGY_TRIANGLE_LIST};
     uint32_t vertexCount{};
@@ -947,6 +973,7 @@ NB_MODULE(_native, module) {
                     nb::arg("make_current"), nb::arg("get_proc_address"), nb::arg("api_major"), nb::arg("api_minor"))
         .def("create_buffer", &RhiHost::createBuffer)
         .def("create_image", &RhiHost::createImage)
+        .def("create_depth_image", &RhiHost::createDepthImage)
         .def("create_sampler", &RhiHost::createSampler)
         .def("create_runtime", &RhiHost::createRuntime, nb::keep_alive<0, 1>())
         .def("synchronize", &RhiHost::synchronize);
@@ -957,6 +984,7 @@ NB_MODULE(_native, module) {
     nb::class_<RhiImage>(module, "RhiImage")
         .def_prop_ro("width", [](const RhiImage &value) { return value.width; })
         .def_prop_ro("height", [](const RhiImage &value) { return value.height; })
+        .def_prop_ro("depth", [](const RhiImage &value) { return value.depth; })
         .def("upload", &RhiImage::upload)
         .def("download", &RhiImage::download);
     nb::class_<RhiSampler>(module, "RhiSampler");
@@ -1001,6 +1029,8 @@ NB_MODULE(_native, module) {
              nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
         .def("rhi_color_attachment", &PipelineInvocationBuilder::rhiColorAttachment, nb::arg("location"),
              nb::arg("texture"), nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
+        .def("rhi_depth_attachment", &PipelineInvocationBuilder::rhiDepthAttachment, nb::arg("texture"),
+             nb::rv_policy::reference_internal, nb::keep_alive<1, 2>())
         .def("rhi_index_binding", &PipelineInvocationBuilder::rhiIndexBinding, nb::arg("buffer"), nb::arg("count"),
              nb::arg("offset") = 0, nb::rv_policy::reference_internal, nb::keep_alive<1, 2>())
         .def("topology", &PipelineInvocationBuilder::setTopology, nb::arg("topology"),

@@ -206,7 +206,8 @@ void DeviceState::shutdown() {
         ring->capacity = 0;
         ring->cursor = 0;
     }
-    for (DescriptorRing *ring : {&resourceDescriptorRing, &samplerDescriptorRing, &rtvDescriptorRing}) {
+    for (DescriptorRing *ring :
+         {&resourceDescriptorRing, &samplerDescriptorRing, &rtvDescriptorRing, &dsvDescriptorRing}) {
         release(ring->heap);
         ring->capacity = 0;
         ring->cursor = 0;
@@ -393,6 +394,8 @@ bool DeviceState::acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE type, bool shade
         ring = &samplerDescriptorRing;
     else if (type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV && !shaderVisible)
         ring = &rtvDescriptorRing;
+    else if (type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV && !shaderVisible)
+        ring = &dsvDescriptorRing;
     if (!ring || count == 0) {
         error = "D3D12 descriptor ring request is unsupported";
         return false;

@@ -1,6 +1,7 @@
 #include "runtime_dispatch.h"
 
 #include "backend_cpu.h"
+#include "tensor_bridge.h"
 
 #include <nlohmann/json.hpp>
 
@@ -58,6 +59,36 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
         use.descriptorSet = argument.value("vernon.set", uint32_t{0});
         use.binding =
             argument.value("vernon.binding", argument.value("binding", static_cast<uint32_t>(reflectedIndex)));
+        if (argument.value("kind", std::string()) == "tensor_value" && argument.contains("physical_size") &&
+            argument.contains("physical_alignment")) {
+            UniformLayout layout;
+            layout.storage = "inline";
+            layout.size = argument["physical_size"].get<uint64_t>();
+            layout.alignment = argument["physical_alignment"].get<uint64_t>();
+            layout.matrixOrder = argument.value("matrix_order", std::string());
+            if (argument.contains("array_strides") && argument["array_strides"].is_array() &&
+                argument["array_strides"].size() == parameter.shape.size())
+                layout.byteStrides = argument["array_strides"].get<std::vector<uint64_t>>();
+            else if (parameter.shape.size() == 2 && argument.contains("matrix_stride")) {
+                const std::optional<VernonDataType> dtype = pipelineDataType(parameter.dtype);
+                if (!dtype) {
+                    error = "compute static Tensor reflection has an unsupported dtype";
+                    return false;
+                }
+                layout.byteStrides = {dataTypeSize(*dtype), argument["matrix_stride"].get<uint64_t>()};
+            } else if (parameter.shape.size() == 1) {
+                const std::optional<VernonDataType> dtype = pipelineDataType(parameter.dtype);
+                if (!dtype) {
+                    error = "compute static Tensor reflection has an unsupported dtype";
+                    return false;
+                }
+                layout.byteStrides = {dataTypeSize(*dtype)};
+            } else if (!parameter.shape.empty()) {
+                error = "compute static Tensor reflection has incomplete physical strides";
+                return false;
+            }
+            use.uniformLayout = std::move(layout);
+        }
         parameter.uses.push_back(std::move(use));
         variant.parameters.push_back(std::move(parameter));
         ++slot;

@@ -18,6 +18,20 @@ struct SampledTextureBinding {
     uint32_t binding{UINT32_MAX};
 };
 
+struct UniformLayout {
+    std::string storage;
+    std::string matrixOrder;
+    uint64_t size{};
+    uint64_t alignment{1};
+    std::vector<uint64_t> byteStrides;
+};
+
+struct AttributeLeaf {
+    uint32_t locationOffset{};
+    uint32_t componentCount{};
+    uint32_t byteOffset{};
+};
+
 struct ParameterUse {
     std::string stage;
     std::string interfaceKind;
@@ -30,6 +44,8 @@ struct ParameterUse {
     uint32_t descriptorSet{};
     uint32_t binding{UINT32_MAX};
     std::vector<SampledTextureBinding> sampledTextureBindings;
+    std::vector<AttributeLeaf> attributeLeaves;
+    std::optional<UniformLayout> uniformLayout;
 };
 
 struct Parameter {

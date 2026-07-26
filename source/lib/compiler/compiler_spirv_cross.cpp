@@ -84,16 +84,23 @@ bool crossCompileSpirv(std::vector<Artifact> &artifacts, std::string &diagnostic
                         entry.execution_model == spv::ExecutionModelVertex     ? &resources.stage_outputs
                         : entry.execution_model == spv::ExecutionModelFragment ? &resources.stage_inputs
                                                                                : nullptr;
-                    if (!variables)
-                        return;
-                    for (const spirv_cross::Resource &variable : *variables) {
-                        if (!compiler.has_decoration(variable.id, spv::DecorationLocation))
+                    if (variables) {
+                        for (const spirv_cross::Resource &variable : *variables) {
+                            if (!compiler.has_decoration(variable.id, spv::DecorationLocation))
+                                continue;
+                            const uint32_t location = compiler.get_decoration(variable.id, spv::DecorationLocation);
+                            const auto name = varyingNames.find(location);
+                            compiler.set_name(variable.id, name != varyingNames.end()
+                                                               ? name->second
+                                                               : "vernon_location_" + std::to_string(location));
+                        }
+                    }
+                    for (const spirv_cross::Resource &uniform : resources.uniform_buffers) {
+                        const std::string variableName = compiler.get_name(uniform.id);
+                        if (variableName.empty())
                             continue;
-                        const uint32_t location = compiler.get_decoration(variable.id, spv::DecorationLocation);
-                        const auto name = varyingNames.find(location);
-                        compiler.set_name(variable.id, name != varyingNames.end()
-                                                           ? name->second
-                                                           : "vernon_location_" + std::to_string(location));
+                        compiler.set_name(uniform.base_type_id, variableName + "_block");
+                        compiler.set_name(uniform.id, variableName);
                     }
                 };
                 if (target == VERNON_TARGET_METAL) {

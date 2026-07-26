@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -129,10 +130,10 @@ struct DirectX12SamplerSlot {
 
 struct DirectX12InteropDevice {
     vernon::rhi::directx12::DeviceState state;
-    std::vector<DirectX12BufferSlot> buffers;
-    std::vector<DirectX12ImageSlot> images;
-    std::vector<DirectX12SamplerSlot> samplers;
-    std::vector<DirectX12DescriptorRangeSlot> descriptorRanges;
+    std::deque<DirectX12BufferSlot> buffers;
+    std::deque<DirectX12ImageSlot> images;
+    std::deque<DirectX12SamplerSlot> samplers;
+    std::deque<DirectX12DescriptorRangeSlot> descriptorRanges;
     uint32_t queueCapabilities{};
     bool owned{};
     std::string error;
@@ -180,10 +181,10 @@ struct VulkanSamplerSlot {
 
 struct VulkanInteropDevice {
     vernon::rhi::vulkan::DeviceState state;
-    std::vector<VulkanBufferSlot> buffers;
-    std::vector<VulkanImageSlot> images;
-    std::vector<VulkanSamplerSlot> samplers;
-    std::vector<VulkanImageViewSlot> imageViews;
+    std::deque<VulkanBufferSlot> buffers;
+    std::deque<VulkanImageSlot> images;
+    std::deque<VulkanSamplerSlot> samplers;
+    std::deque<VulkanImageViewSlot> imageViews;
     uint32_t queueCapabilities{};
     bool owned{};
     std::string error;
@@ -256,20 +257,22 @@ std::shared_ptr<DirectX12InteropDevice> lookupDirectX12Device(VernonRhiDevice ha
                                                                : std::shared_ptr<DirectX12InteropDevice>{};
 }
 
-template <typename Slot, typename Handle> Slot *lookupDirectX12Slot(std::vector<Slot> &slots, Handle handle) {
+template <typename Slots, typename Handle>
+typename Slots::value_type *lookupDirectX12Slot(Slots &slots, Handle handle) {
     if (handle.index >= slots.size())
         return nullptr;
-    Slot &slot = slots[handle.index];
+    auto &slot = slots[handle.index];
     return slot.occupied && slot.generation == handle.generation ? &slot : nullptr;
 }
 
-template <typename Slot, typename Handle> Slot &allocateDirectX12Slot(std::vector<Slot> &slots, Handle &output) {
+template <typename Slots, typename Handle>
+typename Slots::value_type &allocateDirectX12Slot(Slots &slots, Handle &output) {
     uint32_t index = 0;
     while (index < slots.size() && slots[index].occupied)
         ++index;
     if (index == slots.size())
         slots.emplace_back();
-    Slot &slot = slots[index];
+    auto &slot = slots[index];
     slot.occupied = true;
     output = {index, slot.generation};
     return slot;
@@ -353,20 +356,21 @@ std::shared_ptr<VulkanInteropDevice> lookupVulkanDevice(VernonRhiDevice handle) 
     return slot.device && slot.generation == handle.generation ? slot.device : std::shared_ptr<VulkanInteropDevice>{};
 }
 
-template <typename Slot, typename Handle> Slot *lookupVulkanSlot(std::vector<Slot> &slots, Handle handle) {
+template <typename Slots, typename Handle> typename Slots::value_type *lookupVulkanSlot(Slots &slots, Handle handle) {
     if (handle.index >= slots.size())
         return nullptr;
-    Slot &slot = slots[handle.index];
+    auto &slot = slots[handle.index];
     return slot.occupied && slot.generation == handle.generation ? &slot : nullptr;
 }
 
-template <typename Slot, typename Handle> Slot &allocateVulkanSlot(std::vector<Slot> &slots, Handle &output) {
+template <typename Slots, typename Handle>
+typename Slots::value_type &allocateVulkanSlot(Slots &slots, Handle &output) {
     uint32_t index = 0;
     while (index < slots.size() && slots[index].occupied)
         ++index;
     if (index == slots.size())
         slots.emplace_back();
-    Slot &slot = slots[index];
+    auto &slot = slots[index];
     slot.occupied = true;
     output = {index, slot.generation};
     return slot;
@@ -1247,6 +1251,25 @@ vernonRhiDeviceCreateImage(VernonRhiDevice handle, const VernonRhiImageDescripto
     device->state.driver.genTextures(1, &slot.image.name);
     if (!slot.image.name)
         return fail(*device, "OpenGL RHI image allocation failed", VERNON_RHI_STATUS_INTERNAL_ERROR);
+    if ((descriptor->usage & (VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT)) != 0) {
+        auto &driver = device->state.driver;
+        driver.bindTexture(target, slot.image.name);
+        if (descriptor->dimension == VERNON_RHI_IMAGE_3D) {
+            driver.texImage3D(target, 0, format.internal, static_cast<Size>(descriptor->width),
+                              static_cast<Size>(descriptor->height), static_cast<Size>(descriptor->depth), 0,
+                              format.external, format.allocationType, nullptr);
+        } else if (descriptor->dimension == VERNON_RHI_IMAGE_CUBE) {
+            for (uint32_t face = 0; face < 6; ++face)
+                driver.texImage2D(vernon::rhi::opengl::kTextureCubeMapPositiveX + face, 0, format.internal,
+                                  static_cast<Size>(descriptor->width), static_cast<Size>(descriptor->height), 0,
+                                  format.external, format.allocationType, nullptr);
+        } else {
+            driver.texImage2D(target, 0, format.internal, static_cast<Size>(descriptor->width),
+                              static_cast<Size>(descriptor->height), 0, format.external, format.allocationType,
+                              nullptr);
+        }
+        driver.bindTexture(target, 0);
+    }
     slot.descriptor = *descriptor;
     slot.target = target;
     slot.occupied = true;

@@ -855,4 +855,34 @@ class Texture:
         self._host_dirty = False
 
 
-__all__ = ["RawBuffer", "TensorLayout", "TensorStorage", "TensorView", "Texture"]
+class DepthTexture:
+    """D32 two-dimensional depth attachment."""
+
+    def __init__(self, *, shape: tuple[int, int]):
+        if len(shape) != 2 or any(not isinstance(value, int) or value <= 0 for value in shape):
+            raise ValueError("DepthTexture shape must contain two positive dimensions")
+        self._shape = shape
+        self._native_texture: Any | None = None
+        self._native_generation = -1
+        _session_state()._runtime_children.add(self)
+
+    @classmethod
+    def zeros(cls, *, shape: tuple[int, int]) -> DepthTexture:
+        return cls(shape=shape)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self._shape
+
+    def _resident_texture(self) -> Any:
+        state = _session_state()
+        if state._native_runtime is None or state._rhi_host is None:
+            raise RuntimeError("DepthTexture requires an initialized GPU RHI runtime")
+        if self._native_texture is None or self._native_generation != state._runtime_generation:
+            height, width = self.shape
+            self._native_texture = state._rhi_host.create_depth_image(width, height)
+            self._native_generation = state._runtime_generation
+        return self._native_texture
+
+
+__all__ = ["DepthTexture", "RawBuffer", "TensorLayout", "TensorStorage", "TensorView", "Texture"]

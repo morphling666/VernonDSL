@@ -43,6 +43,20 @@ std::optional<VernonTextureFormat> pipelineTextureFormat(const std::string &form
 
 namespace {
 
+bool parseUint64(const nlohmann::json &value, uint64_t &result) {
+    if (!value.is_number_integer())
+        return false;
+    if (value.is_number_unsigned()) {
+        result = value.get<uint64_t>();
+        return true;
+    }
+    const int64_t parsed = value.get<int64_t>();
+    if (parsed < 0)
+        return false;
+    result = static_cast<uint64_t>(parsed);
+    return true;
+}
+
 bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error) {
     if (!value.is_object()) {
         error = "pipeline parameter use must be an object";
@@ -58,6 +72,61 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
     use.divisor = value.value("vernon.instance_divisor", 0u);
     use.descriptorSet = value.value("vernon.set", 0u);
     use.binding = value.value("vernon.binding", UINT32_MAX);
+    if (value.contains("attribute_leaves")) {
+        const nlohmann::json &leaves = value["attribute_leaves"];
+        if (!leaves.is_array()) {
+            error = "attribute_leaves must be an array";
+            return false;
+        }
+        for (const nlohmann::json &leaf : leaves) {
+            uint64_t locationOffset = 0;
+            uint64_t componentCount = 0;
+            uint64_t byteOffset = 0;
+            if (!leaf.is_object() || !leaf.contains("location_offset") ||
+                !parseUint64(leaf["location_offset"], locationOffset) || !leaf.contains("component_count") ||
+                !parseUint64(leaf["component_count"], componentCount) || !leaf.contains("byte_offset") ||
+                !parseUint64(leaf["byte_offset"], byteOffset) || locationOffset > UINT32_MAX ||
+                componentCount > UINT32_MAX || byteOffset > UINT32_MAX) {
+                error = "attribute leaf must contain unsigned location_offset, component_count, and byte_offset";
+                return false;
+            }
+            use.attributeLeaves.push_back({static_cast<uint32_t>(locationOffset), static_cast<uint32_t>(componentCount),
+                                           static_cast<uint32_t>(byteOffset)});
+        }
+    }
+    if (value.contains("uniform_layout")) {
+        const nlohmann::json &layout = value["uniform_layout"];
+        uint64_t size = 0;
+        uint64_t alignment = 0;
+        if (!layout.is_object() || !layout.contains("storage") || !layout["storage"].is_string() ||
+            !layout.contains("size") || !parseUint64(layout["size"], size) || !layout.contains("alignment") ||
+            !parseUint64(layout["alignment"], alignment) || !layout.contains("byte_strides") ||
+            !layout["byte_strides"].is_array()) {
+            error = "uniform_layout must contain storage, size, alignment, and byte_strides";
+            return false;
+        }
+        UniformLayout parsed;
+        parsed.storage = layout["storage"].get<std::string>();
+        parsed.matrixOrder = layout.value("matrix_order", "");
+        parsed.size = size;
+        parsed.alignment = alignment;
+        for (const nlohmann::json &stride : layout["byte_strides"]) {
+            uint64_t byteStride = 0;
+            if (!parseUint64(stride, byteStride)) {
+                error = "uniform_layout byte strides must be unsigned";
+                return false;
+            }
+            parsed.byteStrides.push_back(byteStride);
+        }
+        if ((parsed.storage != "inline" && parsed.storage != "uniform_buffer") || parsed.size == 0 ||
+            parsed.alignment == 0 ||
+            (!parsed.matrixOrder.empty() && parsed.matrixOrder != "row_major" &&
+             parsed.matrixOrder != "column_major")) {
+            error = "uniform_layout contains unsupported physical layout metadata";
+            return false;
+        }
+        use.uniformLayout = std::move(parsed);
+    }
     if (value.contains("sampled_texture_bindings")) {
         const nlohmann::json &bindings = value["sampled_texture_bindings"];
         if (!bindings.is_array()) {
@@ -76,6 +145,10 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
     if (value.contains("shape") && value["shape"].is_array())
         for (const nlohmann::json &dimension : value["shape"])
             use.shape.push_back(dimension.is_number_unsigned() ? dimension.get<uint64_t>() : uint64_t{0});
+    if (use.uniformLayout && use.uniformLayout->byteStrides.size() != use.shape.size()) {
+        error = "uniform_layout byte-stride rank does not match the logical Tensor shape";
+        return false;
+    }
     if (use.stage.empty() || use.interfaceKind.empty()) {
         error = "pipeline parameter use is missing stage/interface metadata";
         return false;

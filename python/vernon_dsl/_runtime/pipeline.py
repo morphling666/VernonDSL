@@ -22,7 +22,7 @@ from ..pipeline_compile import (
     materialize_bundle,
     serialize_bundle,
 )
-from .resources import TensorStorage, TensorView, Texture, _dispatch_borrow_scope
+from .resources import DepthTexture, TensorStorage, TensorView, Texture, _dispatch_borrow_scope
 
 
 def _session_state() -> Any:
@@ -220,6 +220,7 @@ class Pipeline:
         state = _session_state()
         target = arguments.pop("target", None)
         targets = arguments.pop("targets", None)
+        depth = arguments.pop("depth", None)
         indices = arguments.pop("indices", None)
         topology = arguments.pop("topology", triangles)
         if target is not None and targets is not None:
@@ -253,6 +254,14 @@ class Pipeline:
             np.dtype(np.float32): state._native.DATA_F32,
             np.dtype(np.float64): state._native.DATA_F64,
         }
+        numpy_dtypes = {
+            state._native.DATA_BOOL: np.dtype(np.bool_),
+            state._native.DATA_I32: np.dtype(np.int32),
+            state._native.DATA_U32: np.dtype(np.uint32),
+            state._native.DATA_F16: np.dtype(np.float16),
+            state._native.DATA_F32: np.dtype(np.float32),
+            state._native.DATA_F64: np.dtype(np.float64),
+        }
         for parameter in parameters:
             value = arguments[parameter.name]
             if parameter.kind == state._native.PIPELINE_TEXTURE:
@@ -266,13 +275,10 @@ class Pipeline:
             if parameter.kind != state._native.PIPELINE_TENSOR:
                 raise TypeError(f"pipeline parameter {parameter.name!r} has unsupported kind")
             if not isinstance(value, (TensorStorage, TensorView)):
-                scalar = np.asarray(value)
-                if scalar.dtype.kind == "f":
-                    scalar = np.asarray(value, dtype=np.float32)
-                elif scalar.dtype.kind == "u":
-                    scalar = np.asarray(value, dtype=np.uint32)
-                else:
-                    scalar = np.asarray(value, dtype=np.int32)
+                expected_dtype = numpy_dtypes.get(parameter.dtype)
+                if expected_dtype is None:
+                    raise TypeError(f"pipeline parameter {parameter.name!r} has unsupported dtype {parameter.dtype}")
+                scalar = np.asarray(value, dtype=expected_dtype)
                 builder.host_tensor(parameter.name, scalar)
                 continue
             if tuple(value.shape) == tuple(parameter.shape):
@@ -319,6 +325,10 @@ class Pipeline:
                 raise TypeError("target=Texture requires one unnamed fragment output at location zero")
             builder.rhi_color_attachment(0, target._resident_texture())
             rendered_targets.append(target)
+        if depth is not None:
+            if not isinstance(depth, DepthTexture):
+                raise TypeError("depth must be a DepthTexture")
+            builder.rhi_depth_attachment(depth._resident_texture())
         if indices is not None:
             if (
                 not isinstance(indices, TensorStorage)

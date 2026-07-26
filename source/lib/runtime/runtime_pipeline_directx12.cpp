@@ -4,6 +4,7 @@
 #include "backend_directx12.h"
 #include "compute_launch_planner.h"
 #include "rhi_adapter/adapter_internal.h"
+#include "tensor_bridge.h"
 
 #include <nlohmann/json.hpp>
 
@@ -82,10 +83,11 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                     candidate.layout.argument_index = use.index;
                     candidate.layout.element_size = static_cast<uint32_t>(
                         argument.storageLeaves.empty()
-                            ? (argument.kind == "tensor" ? argument.tensorElementSize : argument.cpuSize)
+                            ? (argument.kind == "tensor" ? argument.tensorElementSize : argument.physicalSize)
                             : argument.storageLeaves[leafIndex].elementSize);
-                    candidate.resourceOffset =
-                        argument.storageLeaves.empty() ? 0 : argument.storageLeaves[leafIndex].byteOffset;
+                    // Aggregate lowering already folds each leaf's byte offset into the shader index.
+                    // Every leaf descriptor must therefore retain the base address of the original AoS buffer.
+                    candidate.resourceOffset = 0;
                     if (candidate.layout.binding == UINT32_MAX || candidate.layout.element_size == 0) {
                         bundle.context->error = "D3D12 reflected compute binding is incomplete";
                         delete pipelineState;
@@ -135,6 +137,7 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
     } else {
         struct GraphicsCandidate {
             VernonRuntimeProviderBindingLayoutEntry layout{};
+            std::vector<VernonRuntimeProviderVertexAttribute> attributes;
             DirectX12PipelineState::GraphicsBinding binding;
         };
         std::vector<GraphicsCandidate> candidates;
@@ -154,28 +157,85 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                 use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
             candidate.layout.array_count = 1;
             candidate.binding.externalSlot = parameter.slot;
-            if (parameter.kind == "tensor" && parameter.dtype == "f32" &&
-                (use.interfaceKind == "input" || use.interfaceKind == "instance") && use.stage == "vertex" &&
-                use.location != UINT32_MAX) {
+            if (parameter.kind == "tensor" && use.interfaceKind == "uniform") {
                 const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
+                const std::optional<VernonDataType> dtype = pipelineDataType(parameter.dtype);
                 uint64_t valueCount = 1;
-                for (uint64_t dimension : shape)
+                for (uint64_t dimension : shape) {
+                    if (!dimension || valueCount > UINT32_MAX / dimension) {
+                        supported = false;
+                        break;
+                    }
                     valueCount *= dimension;
-                const uint64_t columnCount = shape.size() == 2 ? shape[0] : 1;
-                if (valueCount == 0 || columnCount == 0 || columnCount > 4 || valueCount % columnCount != 0 ||
-                    valueCount / columnCount > 4) {
+                }
+                if (!supported || !dtype) {
+                    supported = false;
+                    break;
+                }
+                const size_t elementSize = dataTypeSize(*dtype);
+                candidate.layout.kind = use.uniformLayout && use.uniformLayout->storage == "uniform_buffer"
+                                            ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
+                                            : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                uint64_t physicalSize = use.uniformLayout ? use.uniformLayout->size : valueCount * elementSize;
+                const bool matrix =
+                    shape.size() == 2 && shape[0] >= 2 && shape[0] <= 4 && shape[1] >= 2 && shape[1] <= 4;
+                if (matrix)
+                    physicalSize =
+                        std::max<uint64_t>(physicalSize, shape[0] * std::max<uint64_t>(shape[1] * elementSize, 16));
+                if (!physicalSize || physicalSize > UINT32_MAX ||
+                    (candidate.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER && use.binding == UINT32_MAX)) {
+                    supported = false;
+                    break;
+                }
+                candidate.layout.element_size = static_cast<uint32_t>(physicalSize);
+                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
+                candidate.layout.element_count = static_cast<uint32_t>(valueCount);
+                candidate.layout.binding = use.binding;
+                candidate.layout.set = use.descriptorSet;
+                candidate.binding.source = DirectX12PipelineState::GraphicsBinding::EXTERNAL_UNIFORM;
+                candidate.binding.packing.dtype = *dtype;
+                candidate.binding.packing.shape = shape;
+                candidate.binding.packing.byteSize = static_cast<size_t>(physicalSize);
+                if (matrix) {
+                    candidate.binding.packing.byteStrides = {
+                        static_cast<size_t>(std::max<uint64_t>(shape[1] * elementSize, 16)), elementSize};
+                } else if (use.uniformLayout) {
+                    for (uint64_t stride : use.uniformLayout->byteStrides) {
+                        if (stride > SIZE_MAX) {
+                            supported = false;
+                            break;
+                        }
+                        candidate.binding.packing.byteStrides.push_back(static_cast<size_t>(stride));
+                    }
+                } else {
+                    candidate.binding.packing.byteStrides.resize(shape.size());
+                    size_t stride = elementSize;
+                    for (size_t dimension = shape.size(); dimension-- > 0;) {
+                        candidate.binding.packing.byteStrides[dimension] = stride;
+                        stride *= static_cast<size_t>(shape[dimension]);
+                    }
+                }
+                if (!supported || candidate.binding.packing.byteStrides.size() != shape.size()) {
+                    supported = false;
+                    break;
+                }
+                candidate.binding.storage.resize(candidate.layout.element_size);
+            } else if (parameter.kind == "tensor" && use.interfaceKind == "input" && use.stage == "vertex" &&
+                       use.location != UINT32_MAX && !use.attributeLeaves.empty()) {
+                const std::optional<VernonDataType> dtype = pipelineDataType(parameter.dtype);
+                if (!dtype || dataTypeSize(*dtype) == 0) {
                     supported = false;
                     break;
                 }
                 candidate.layout.kind = VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
-                candidate.layout.element_size = sizeof(float);
+                candidate.layout.element_size = static_cast<uint32_t>(dataTypeSize(*dtype));
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_VERTEX_INPUT;
-                candidate.layout.value_count = static_cast<uint32_t>(valueCount);
-                candidate.layout.column_count = static_cast<uint32_t>(columnCount);
-                candidate.layout.location = use.location;
                 candidate.layout.binding = vertexInputSlot++;
-                candidate.layout.divisor =
-                    use.interfaceKind == "instance" || use.divisor != 0 ? std::max(use.divisor, 1u) : 0;
+                candidate.layout.divisor = use.divisor;
+                for (const AttributeLeaf &leaf : use.attributeLeaves)
+                    candidate.attributes.push_back({candidate.layout.binding, use.location + leaf.locationOffset,
+                                                    static_cast<uint32_t>(*dtype), leaf.componentCount,
+                                                    leaf.byteOffset});
                 candidate.binding.source = DirectX12PipelineState::GraphicsBinding::EXTERNAL_VERTEX;
             } else if (parameter.kind == "texture" && use.interfaceKind == "resource" && use.descriptorSet == 0 &&
                        use.binding != UINT32_MAX) {
@@ -227,6 +287,8 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                   [](const auto &left, const auto &right) { return left.layout.slot < right.layout.slot; });
         for (const auto &candidate : candidates) {
             pipelineState->rhiGraphicsLayout.push_back(candidate.layout);
+            pipelineState->rhiGraphicsVertexAttributes.insert(pipelineState->rhiGraphicsVertexAttributes.end(),
+                                                              candidate.attributes.begin(), candidate.attributes.end());
             pipelineState->rhiGraphicsBindingsPlan.push_back(candidate.binding);
         }
         pipelineState->rhiGraphicsValues.resize(candidates.size());
@@ -256,6 +318,8 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
         descriptor.shader_count = 2;
         descriptor.bindings = pipelineState->rhiGraphicsLayout.data();
         descriptor.binding_count = pipelineState->rhiGraphicsLayout.size();
+        descriptor.vertex_attributes = pipelineState->rhiGraphicsVertexAttributes.data();
+        descriptor.vertex_attribute_count = pipelineState->rhiGraphicsVertexAttributes.size();
         descriptor.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
         descriptor.sample_count = 1;
         const VernonStatus status = vernonRuntimeCorePreparePipeline(
@@ -299,12 +363,23 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
     const auto &adapter = *directX12State(*pipeline.context).adapter;
     for (size_t index = 0; index < state.rhiGraphicsLayout.size(); ++index) {
         const auto &layout = state.rhiGraphicsLayout[index];
-        const auto &prepared = state.rhiGraphicsBindingsPlan[index];
+        auto &prepared = state.rhiGraphicsBindingsPlan[index];
         auto &value = state.rhiGraphicsValues[index];
         value = {};
         value.slot = layout.slot;
         value.kind = layout.kind;
-        if (prepared.source == DirectX12PipelineState::GraphicsBinding::EXTERNAL_VERTEX) {
+        if (prepared.source == DirectX12PipelineState::GraphicsBinding::EXTERNAL_UNIFORM) {
+            const auto found = plan.arguments.find(prepared.externalSlot);
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR)
+                return fail(*pipeline.context, "D3D12 RHI uniform argument is missing");
+            const VernonTensorView &tensor = found->second->tensor;
+            const std::optional<std::vector<uint8_t>> packed = packTensor(tensor, prepared.packing);
+            if (!packed || packed->size() != prepared.storage.size())
+                return fail(*pipeline.context, "D3D12 RHI uniform Tensor is invalid");
+            prepared.storage = *packed;
+            value.inline_data = prepared.storage.data();
+            value.inline_size = prepared.storage.size();
+        } else if (prepared.source == DirectX12PipelineState::GraphicsBinding::EXTERNAL_VERTEX) {
             const auto found = plan.arguments.find(prepared.externalSlot);
             if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
                 (found->second->tensor.storage != VERNON_TENSOR_DEVICE &&
@@ -380,6 +455,7 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
     if (plan.attachments.empty() || plan.attachments.size() > maxAttachments)
         return fail(*pipeline.context, "D3D12 RHI draw requires one to eight color attachments");
     std::array<VernonRuntimeProviderColorAttachment, maxAttachments> attachments{};
+    VernonRuntimeProviderResourceReference depthAttachment{};
     std::vector<uint32_t> formats;
     formats.reserve(plan.attachments.size());
     for (size_t index = 0; index < plan.attachments.size(); ++index) {
@@ -397,6 +473,15 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
             formats.push_back(static_cast<uint32_t>(texture.format));
         }
     }
+    if (plan.depthAttachment) {
+        if (plan.depthAttachment->resource.resource.value)
+            depthAttachment = plan.depthAttachment->resource;
+        else {
+            auto &texture = directX12TextureState(*plan.depthAttachment->texture);
+            depthAttachment.identity = directX12RhiAdapterImageIdentity(adapter);
+            depthAttachment.resource.value = reinterpret_cast<uintptr_t>(&texture);
+        }
+    }
     uint64_t vertexLayoutIdentity = 1469598103934665603ull;
     std::vector<uint32_t> vertexStrides;
     for (const auto &value : state.rhiGraphicsValues) {
@@ -412,8 +497,9 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
                 vertexStrides.resize(binding + 1);
             vertexStrides[binding] = state.rhiGraphicsValues[index].stride;
         }
+    const uint32_t depthFormat = plan.depthAttachment ? static_cast<uint32_t>(DXGI_FORMAT_D32_FLOAT) : 0;
     if (!state.rhiGraphicsVariant || state.rhiGraphicsFormats != formats ||
-        state.rhiGraphicsTopology != invocation.topology ||
+        state.rhiGraphicsDepthFormat != depthFormat || state.rhiGraphicsTopology != invocation.topology ||
         state.rhiGraphicsVertexLayoutIdentity != vertexLayoutIdentity) {
         vernonRuntimeCoreGraphicsVariantDestroy(state.rhiGraphicsVariant);
         state.rhiGraphicsVariant = nullptr;
@@ -421,7 +507,7 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
                                                                    static_cast<uint32_t>(invocation.topology),
                                                                    formats.data(),
                                                                    formats.size(),
-                                                                   0,
+                                                                   depthFormat,
                                                                    1,
                                                                    vertexStrides.data(),
                                                                    vertexStrides.size(),
@@ -438,6 +524,7 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
                         status);
         }
         state.rhiGraphicsFormats = std::move(formats);
+        state.rhiGraphicsDepthFormat = depthFormat;
         state.rhiGraphicsTopology = invocation.topology;
         state.rhiGraphicsVertexLayoutIdentity = vertexLayoutIdentity;
     }
@@ -448,6 +535,7 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
     draw.instance_count = plan.instanceCount;
     draw.color_attachments = attachments.data();
     draw.color_attachment_count = plan.attachments.size();
+    draw.depth_stencil_attachment = depthAttachment;
     draw.viewport[0] = hasViewport ? invocation.viewport[0] : 0;
     draw.viewport[1] = hasViewport ? invocation.viewport[1] : 0;
     draw.viewport[2] = hasViewport ? invocation.viewport[2] : plan.attachmentWidth;

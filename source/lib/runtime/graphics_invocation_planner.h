@@ -48,13 +48,13 @@ struct PlannedSampledResource {
 struct PlannedVertexInput {
     const ParameterUse *use{};
     const VernonTensorView *tensor{};
-    uint32_t components{};
     bool instanced{};
 };
 
 struct PlannedGraphicsInvocation {
     PipelineArgumentMap arguments;
     std::vector<const VernonColorAttachment *> attachments;
+    const VernonDepthAttachment *depthAttachment{};
     std::map<std::pair<uint32_t, uint32_t>, PlannedSampledResource> sampledResources;
     std::vector<PlannedVertexInput> vertexInputs;
     std::array<float, 2> resolution{};

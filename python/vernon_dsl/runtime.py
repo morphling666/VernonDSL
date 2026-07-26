@@ -2,7 +2,7 @@
 
 from ._runtime.kernel import Kernel
 from ._runtime.pipeline import Pipeline, PrimitiveTopology, lines, pipeline, points, triangles
-from ._runtime.resources import TensorLayout, TensorStorage, TensorView, Texture
+from ._runtime.resources import DepthTexture, TensorLayout, TensorStorage, TensorView, Texture
 from ._runtime.session import (
     cpu,
     cuda,
@@ -16,6 +16,7 @@ from ._runtime.session import (
 
 __all__ = [
     "Kernel",
+    "DepthTexture",
     "Pipeline",
     "PrimitiveTopology",
     "TensorLayout",

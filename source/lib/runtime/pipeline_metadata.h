@@ -24,6 +24,7 @@ struct ReflectedArgument {
     std::string builtin;
     size_t cpuOffset{};
     size_t cpuSize{};
+    size_t physicalSize{};
     size_t tensorBytes{};
     size_t tensorElements{};
     size_t tensorElementSize{};

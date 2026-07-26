@@ -94,7 +94,8 @@ typedef enum VernonTextureFormat {
     VERNON_TEXTURE_R32_FLOAT = 6,
     VERNON_TEXTURE_RG8_UNORM = 7,
     VERNON_TEXTURE_RGB8_UNORM = 8,
-    VERNON_TEXTURE_R11G11B10_FLOAT = 9
+    VERNON_TEXTURE_R11G11B10_FLOAT = 9,
+    VERNON_TEXTURE_D32_FLOAT = 10
 } VernonTextureFormat;
 
 typedef enum VernonTextureDimension {
@@ -197,6 +198,14 @@ typedef struct VernonColorAttachment {
     VernonTextureFormat format;
 } VernonColorAttachment;
 
+typedef struct VernonDepthAttachment {
+    VernonDeviceTexture *texture;
+    VernonRuntimeProviderResourceReference resource;
+    uint32_t width;
+    uint32_t height;
+    VernonTextureFormat format;
+} VernonDepthAttachment;
+
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeComputeToGraphicsBarrier(VernonRuntimeContext *context);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeSynchronize(VernonRuntimeContext *context);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeReferenceRhiBuffer(VernonRuntimeContext *context, VernonRhiBuffer buffer,
@@ -208,7 +217,7 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeReferenceRhiSampler(VernonRuntimeC
                                                                   VernonRhiSampler sampler,
                                                                   VernonRuntimeProviderResourceReference *output);
 
-enum { VERNON_PIPELINE_INVOCATION_ABI_VERSION = 3 };
+enum { VERNON_PIPELINE_INVOCATION_ABI_VERSION = 4 };
 
 typedef struct VernonFeatureSetView {
     const char *const *names;
@@ -297,6 +306,7 @@ typedef struct VernonPipelineInvocation {
     const VernonIndexBinding *index_binding;
     const VernonColorAttachment *color_attachments;
     size_t color_attachment_count;
+    const VernonDepthAttachment *depth_attachment;
     VernonPrimitiveTopology topology;
     uint32_t vertex_count;
     uint32_t instance_count;

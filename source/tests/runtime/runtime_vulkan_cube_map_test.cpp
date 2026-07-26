@@ -61,7 +61,8 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
         vernonRuntimeLoadPipelineBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
     ASSERT_TRUE(loaded);
     VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
-    ASSERT_TRUE(pipeline);
+    const VernonStringView resolveError = vernonRuntimeGetLastError(runtime);
+    ASSERT_TRUE(pipeline) << (resolveError.data ? std::string(resolveError.data, resolveError.size) : std::string{});
 
     constexpr float positions[] = {
         -1.0f, -1.0f, 1.0f, 3.0f, -1.0f, 1.0f, -1.0f, 3.0f, 1.0f,

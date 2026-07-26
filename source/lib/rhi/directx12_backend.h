@@ -101,6 +101,7 @@ struct VERNON_RHI_CAPI DeviceState {
     DescriptorRing resourceDescriptorRing;
     DescriptorRing samplerDescriptorRing;
     DescriptorRing rtvDescriptorRing;
+    DescriptorRing dsvDescriptorRing;
     bool nativeObjectsBorrowed{};
 };
 

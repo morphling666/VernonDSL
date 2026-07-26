@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .diagnostics import CompileError, SourceLocation
+from .frontend.abi import attribute_layout
 from .language.ast_utils import decorator_name as _decorator_name
 from .language.ast_utils import dotted_name as _dotted_name
 from .language.syntax import ENTRY_DECORATORS, FUNCTION_DECORATORS
@@ -85,8 +86,7 @@ class _FeatureSpecializer(ast.NodeTransformer):
     def _infer_interface_locations(self, node: ast.FunctionDef) -> None:
         if not any(_decorator_name(decorator) in _STAGE_DECORATORS for decorator in node.decorator_list):
             return
-        occupied: set[int] = set()
-        next_location = 0
+        candidates: list[tuple[ast.arg, ast.expr, int, int | None]] = []
         for argument in node.args.args:
             annotation = argument.annotation
             if annotation is None:
@@ -94,28 +94,50 @@ class _FeatureSpecializer(ast.NodeTransformer):
             interface_type = self._unwrap_when(annotation)
             if self._has_metadata(interface_type, {"builtin", "uniform", "resource"}):
                 continue
-            span = self._location_span(interface_type)
-            explicit = self._explicit_location(interface_type)
-            location = explicit if explicit is not None else next_location
-            slots = set(range(location, location + span))
+            candidates.append(
+                (
+                    argument,
+                    interface_type,
+                    self._location_span(interface_type),
+                    self._explicit_location(interface_type),
+                )
+            )
+
+        occupied: set[int] = set()
+        for argument, _, span, explicit in candidates:
+            if explicit is None:
+                continue
+            annotation = argument.annotation
+            assert annotation is not None
+            slots = set(range(explicit, explicit + span))
             overlap = occupied & slots
             if overlap:
                 self.graph._error(self.module, annotation, f"interface location overlap at {min(overlap)}")
             occupied.update(slots)
-            next_location = max(next_location, location + span)
-            if explicit is None:
-                located_type = self._insert_location(interface_type, location)
-                if interface_type is annotation:
-                    argument.annotation = located_type
-                else:
-                    when_items = (
-                        list(annotation.slice.elts)
-                        if isinstance(annotation, ast.Subscript) and isinstance(annotation.slice, ast.Tuple)
-                        else [annotation.slice]
-                    )
-                    when_items[1] = located_type
-                    assert isinstance(annotation, ast.Subscript)
-                    annotation.slice = ast.Tuple(elts=when_items, ctx=ast.Load())
+
+        next_location = 0
+        for argument, interface_type, span, explicit in candidates:
+            if explicit is not None:
+                continue
+            while occupied & set(range(next_location, next_location + span)):
+                next_location += 1
+            location = next_location
+            occupied.update(range(location, location + span))
+            next_location = location + span
+            annotation = argument.annotation
+            assert annotation is not None
+            located_type = self._insert_location(interface_type, location)
+            if interface_type is annotation:
+                argument.annotation = located_type
+            else:
+                when_items = (
+                    list(annotation.slice.elts)
+                    if isinstance(annotation, ast.Subscript) and isinstance(annotation.slice, ast.Tuple)
+                    else [annotation.slice]
+                )
+                when_items[1] = located_type
+                assert isinstance(annotation, ast.Subscript)
+                annotation.slice = ast.Tuple(elts=when_items, ctx=ast.Load())
 
     def _unwrap_when(self, annotation: ast.expr) -> ast.expr:
         if isinstance(annotation, ast.Subscript) and (_dotted_name(annotation.value) or "").split(".")[-1] == "When":
@@ -149,14 +171,7 @@ class _FeatureSpecializer(ast.NodeTransformer):
             if not isinstance(item, ast.Call):
                 continue
             kind = (_dotted_name(item.func) or "").split(".")[-1]
-            if (
-                kind == "location"
-                and len(item.args) == 1
-                and isinstance(item.args[0], ast.Constant)
-                and isinstance(item.args[0].value, int)
-            ):
-                return item.args[0].value
-            if kind == "instance":
+            if kind == "attribute":
                 if item.args and isinstance(item.args[0], ast.Constant) and isinstance(item.args[0].value, int):
                     return item.args[0].value
                 for keyword in item.keywords:
@@ -178,7 +193,11 @@ class _FeatureSpecializer(ast.NodeTransformer):
                     slice=ast.Tuple(
                         elts=[
                             copy.deepcopy(annotation),
-                            ast.Call(func=ast.Name(id="location", ctx=ast.Load()), args=[location_value], keywords=[]),
+                            ast.Call(
+                                func=ast.Name(id="attribute", ctx=ast.Load()),
+                                args=[],
+                                keywords=[ast.keyword(arg="location", value=location_value)],
+                            ),
                         ],
                         ctx=ast.Load(),
                     ),
@@ -187,10 +206,16 @@ class _FeatureSpecializer(ast.NodeTransformer):
                 annotation,
             )
         for item in items[1:]:
-            if isinstance(item, ast.Call) and (_dotted_name(item.func) or "").split(".")[-1] == "instance":
+            if isinstance(item, ast.Call) and (_dotted_name(item.func) or "").split(".")[-1] == "attribute":
                 item.keywords.append(ast.keyword(arg="location", value=location_value))
                 return annotation
-        items.append(ast.Call(func=ast.Name(id="location", ctx=ast.Load()), args=[location_value], keywords=[]))
+        items.append(
+            ast.Call(
+                func=ast.Name(id="attribute", ctx=ast.Load()),
+                args=[],
+                keywords=[ast.keyword(arg="location", value=location_value)],
+            )
+        )
         annotation.slice = ast.Tuple(elts=items, ctx=ast.Load())
         return annotation
 
@@ -201,18 +226,27 @@ class _FeatureSpecializer(ast.NodeTransformer):
             return 1
         constructor = (_dotted_name(value.value) or "").split(".")[-1]
         arguments = list(value.slice.elts) if isinstance(value.slice, ast.Tuple) else [value.slice]
-        if (
-            constructor == "Matrix"
-            and len(arguments) == 3
-            and isinstance(arguments[2], ast.Constant)
-            and isinstance(arguments[2].value, int)
+        if not arguments:
+            return 1
+        dtype = (_dotted_name(arguments[0]) or "").split(".")[-1]
+        shape_nodes: list[ast.expr]
+        if constructor == "Vector" and len(arguments) == 2:
+            shape_nodes = [arguments[1]]
+        elif constructor == "Matrix" and len(arguments) == 3:
+            shape_nodes = arguments[1:]
+        elif constructor == "Tensor" and len(arguments) >= 2:
+            shape_nodes = list(arguments[1].elts) if isinstance(arguments[1], ast.Tuple) else arguments[1:]
+        else:
+            return 1
+        if not all(
+            isinstance(dimension, ast.Constant) and isinstance(dimension.value, int) for dimension in shape_nodes
         ):
-            return arguments[2].value
-        if constructor == "Tensor" and len(arguments) >= 2:
-            shape = arguments[1].elts if isinstance(arguments[1], ast.Tuple) else arguments[1:]
-            if len(shape) == 2 and isinstance(shape[1], ast.Constant) and isinstance(shape[1].value, int):
-                return shape[1].value
-        return 1
+            return 1
+        shape = tuple(dimension.value for dimension in shape_nodes if isinstance(dimension, ast.Constant))
+        try:
+            return attribute_layout(dtype, shape).location_span
+        except ValueError:
+            return 1
 
     def visit_If(self, node: ast.If) -> ast.AST | list[ast.stmt]:
         condition = self._feature_condition(node.test)

@@ -13,7 +13,7 @@ from ..language.syntax import FRONTEND_VERSION, INTRINSIC_METHODS
 from ..module_graph import load_project
 from ..shader_contracts import BUILTIN_CONTRACTS, GENERATED_INTERFACE_CONTRACTS, TypeContract, texture_sampling_contract
 from ..struct_methods import normalize_struct_methods
-from .abi import value_abi_layout
+from .abi import attribute_layout, value_abi_layout
 from .interfaces import plan_generated_interface
 from .model import (
     AccessMode,
@@ -182,34 +182,96 @@ class _FunctionEmitter:
         ):
             return None
         fields = self.context.structs[self.signature.result.name]
-        occupied: set[int] = set()
+        planned: list[tuple[str, AnnotatedType]] = []
         builtins: set[str] = set()
+        next_location = 0
         for field_name, annotation in fields:
             self._validate_builtin_annotation(annotation, "output", f"output field '{field_name}'")
-            locations = [int(item.arguments[0]) for item in annotation.metadata if item.kind == "location"]
             builtin_values = [str(item.arguments[0]) for item in annotation.metadata if item.kind == "builtin"]
-            if self.stage == "fragment" and (len(locations) != 1 or builtin_values):
-                raise self.context.error(
-                    self.node, f"fragment output field '{field_name}' requires exactly one location"
-                )
-            if self.stage == "vertex" and (len(locations) + len(builtin_values) != 1):
-                raise self.context.error(
-                    self.node, f"vertex output field '{field_name}' requires exactly one location or builtin"
-                )
+            if self.stage == "fragment" and builtin_values:
+                raise self.context.error(self.node, f"fragment output field '{field_name}' cannot be a builtin")
             if builtin_values:
                 builtin = builtin_values[0]
                 if builtin in builtins:
                     raise self.context.error(self.node, f"vertex output builtin '{builtin}' is used more than once")
                 builtins.add(builtin)
+                planned.append((field_name, annotation))
                 continue
-            location = locations[0]
-            if location in occupied:
-                raise self.context.error(self.node, f"fragment output location {location} is used more than once")
-            occupied.add(location)
-        return fields
+            value_type = annotation.type
+            if value_type.kind == "scalar":
+                dtype = value_type.name
+                shape: tuple[int, ...] = ()
+            elif value_type.kind == "tensor" and isinstance(value_type.arguments[0], ConcreteType):
+                dtype = value_type.arguments[0].name
+                shape = tuple(int(value) for value in value_type.arguments[1:])
+            else:
+                raise self.context.error(
+                    self.node, f"output field '{field_name}' is not a numeric shader interface value"
+                )
+            span = attribute_layout(dtype, shape).location_span
+            metadata = (*annotation.metadata, Metadata("attribute", (next_location, 0)))
+            planned.append((field_name, AnnotatedType(value_type, metadata)))
+            next_location += span
+        return tuple(planned)
 
     def emit(self) -> list[str]:
         emit_value_abi_metadata = self.stage is not None or self.node.name in self.context.shared_functions
+        argument_locations: dict[int, int] = {}
+        if self.stage in {"vertex", "fragment"}:
+            candidates: list[tuple[int, AnnotatedType, int, int | None]] = []
+            for index, annotation in enumerate(self.argument_annotations):
+                if any(item.kind in {"builtin", "uniform", "resource"} for item in annotation.metadata):
+                    continue
+                value_type = annotation.type
+                if value_type.kind == "scalar":
+                    dtype = value_type.name
+                    shape: tuple[int, ...] = ()
+                elif value_type.kind == "tensor" and isinstance(value_type.arguments[0], ConcreteType):
+                    dtype = value_type.arguments[0].name
+                    shape = tuple(int(value) for value in value_type.arguments[1:])
+                else:
+                    continue
+                try:
+                    span = attribute_layout(dtype, shape).location_span
+                except ValueError as error:
+                    if self.stage == "fragment":
+                        span = 1
+                    else:
+                        raise self.context.error(self.node.args.args[index], str(error)) from None
+                attribute_metadata = next(
+                    (item for item in annotation.metadata if item.kind == "attribute"),
+                    None,
+                )
+                explicit = (
+                    int(attribute_metadata.arguments[0])
+                    if attribute_metadata is not None and int(attribute_metadata.arguments[0]) >= 0
+                    else None
+                )
+                candidates.append((index, annotation, span, explicit))
+
+            occupied: set[int] = set()
+            for index, _, span, explicit in candidates:
+                if explicit is None:
+                    continue
+                slots = set(range(explicit, explicit + span))
+                overlap = occupied & slots
+                if overlap:
+                    raise self.context.error(
+                        self.node.args.args[index], f"interface location overlap at {min(overlap)}"
+                    )
+                occupied.update(slots)
+                argument_locations[index] = explicit
+
+            next_location = 0
+            for index, _, span, explicit in candidates:
+                if explicit is not None:
+                    continue
+                while occupied & set(range(next_location, next_location + span)):
+                    next_location += 1
+                argument_locations[index] = next_location
+                occupied.update(range(next_location, next_location + span))
+                next_location += span
+
         arguments: list[str] = []
         for index, (argument, annotation) in enumerate(
             zip(self.node.args.args, self.argument_annotations, strict=True)
@@ -230,9 +292,11 @@ class _FunctionEmitter:
                 view_layout=view_layout,
             )
             self.environment[argument.arg] = value
-            attributes = self._metadata_attributes(
-                annotation.metadata, stage=self.stage, is_result=False, default_location=index
-            )
+            attributes = self._metadata_attributes(annotation.metadata, stage=self.stage, is_result=False)
+            if index in argument_locations and not any(
+                attribute.startswith("vernon.location") for attribute in attributes
+            ):
+                attributes.append(f"vernon.location = {argument_locations[index]} : i64")
             attributes.append(f'vernon.source_name = "{argument.arg}"')
             if annotation.type.kind == "scalar":
                 attributes.append(f'vernon.dtype = "{annotation.type.name}"')
@@ -284,7 +348,7 @@ class _FunctionEmitter:
             result_metadata = self.result_annotation.metadata if self.result_annotation else ()
             if self.result_annotation is not None:
                 self._validate_builtin_annotation(self.result_annotation, "output", "result")
-            has_result_slot = any(item.kind in {"location", "builtin", "instance"} for item in result_metadata)
+            has_result_slot = any(item.kind in {"attribute", "builtin"} for item in result_metadata)
             if self.stage == "vertex" and not has_result_slot:
                 self._validate_builtin_contract("position", self.signature.result, "output", "result")
             result_attributes = self._metadata_attributes(
@@ -406,7 +470,7 @@ class _FunctionEmitter:
         *,
         stage: str | None,
         is_result: bool,
-        default_location: int,
+        default_location: int | None = None,
     ) -> list[str]:
         attributes: list[str] = []
         items = tuple(metadata)
@@ -420,20 +484,22 @@ class _FunctionEmitter:
         elif stage:
             interface = "output" if is_result else "input"
 
-        has_slot = any(item.kind in {"location", "builtin", "instance"} for item in items)
+        has_slot = any(item.kind in {"attribute", "builtin"} for item in items)
         if interface:
             attributes.append(f'vernon.interface = "{interface}"')
             if interface in {"input", "output"} and not has_slot:
                 if is_result and stage == "vertex":
                     attributes.append('vernon.builtin = "position"')
-                else:
+                elif default_location is not None:
                     attributes.append(f"vernon.location = {default_location} : i64")
 
         for item in items:
-            if item.kind in {"location", "instance"}:
-                attributes.append(f"vernon.location = {item.arguments[0]} : i64")
-                if item.kind == "instance":
-                    attributes.append(f"vernon.instance_divisor = {item.arguments[1]} : i64")
+            if item.kind == "attribute":
+                location, divisor = (int(value) for value in item.arguments)
+                if location >= 0:
+                    attributes.append(f"vernon.location = {location} : i64")
+                if divisor:
+                    attributes.append(f"vernon.instance_divisor = {divisor} : i64")
             elif item.kind == "resource":
                 attributes.extend(
                     (
@@ -1327,13 +1393,9 @@ class _FunctionEmitter:
             self._line(f"{result} = arith.xori {operand.name}, true : i1")
             return Value(result, result_type)
         if isinstance(node.op, ast.USub) and (operand.type.is_float or operand.type.is_integer):
-            operation = "arith.negf" if operand.type.is_float else "arith.subi"
-            if operand.type.is_float:
-                self._line(f"{result} = {operation} {operand.name} : {operand.type.mlir}")
-            else:
-                zero = self._fresh()
-                self._line(f"{zero} = arith.constant 0 : {operand.type.mlir}")
-                self._line(f"{result} = {operation} {zero}, {operand.name} : {operand.type.mlir}")
+            zero = self._default_value(node, operand.type)
+            operation = "arith.subf" if operand.type.is_float else "arith.subi"
+            self._line(f"{result} = {operation} {zero.name}, {operand.name} : {operand.type.mlir}")
             return Value(result, result_type)
         if isinstance(node.op, ast.UAdd):
             return Value(operand.name, result_type, operand.fields, operand.access)
@@ -1497,7 +1559,15 @@ class _FunctionEmitter:
         if name == "matmul":
             if len(arguments) != 2:
                 raise self.context.error(node, "matmul requires two arguments")
-            return self._intrinsic(node, name, arguments, self._typed_expression(node).type)
+            result_type = self._typed_expression(node).type
+            element = self._element_type(result_type)
+            coerced: list[Value] = []
+            for source, argument in zip(node.args, arguments, strict=True):
+                if argument.type.kind != "tensor":
+                    raise self.context.error(source, "matmul operands must be Tensors")
+                operand_type = DslType("tensor", "Tensor", (element, *argument.type.arguments[1:]))
+                coerced.append(self._coerce_implicit(source, argument, operand_type))
+            return self._intrinsic(node, name, coerced, result_type)
         if name == "texture_sample":
             if self.node.name in self.context.shared_functions:
                 raise self.context.error(
@@ -1692,6 +1762,13 @@ class _FunctionEmitter:
         if value.type.kind == "scalar" and target.kind == "tensor":
             value = self._coerce_implicit(node, value, target_element)
             return self._splat(node, value, target)
+        if value.type.kind == "tensor" and target.kind == "tensor":
+            source_shape = value.type.arguments[1:]
+            element_target = DslType("tensor", "Tensor", (target_element, *source_shape))
+            value = self._coerce_implicit(node, value, element_target)
+            if source_shape != target.arguments[1:]:
+                return self._intrinsic(node, "broadcast", [value], target)
+            return value
         return self._coerce_implicit(node, value, target)
 
     def _coerce_implicit(self, node: ast.AST, value: Value, target: DslType) -> Value:

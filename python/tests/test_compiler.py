@@ -30,7 +30,7 @@ def resources(
     unsigned: u32,
     half: f16,
     double: f64,
-    rate: Annotated[f32, instance(location=5, divisor=2)],
+    rate: Annotated[f32, attribute(location=5, divisor=2)],
 ) -> None:
     pass
 """
@@ -373,7 +373,7 @@ from vernon_dsl import *
 
 @vertex
 def transform(
-    position: Annotated[Vector[f32, 3], location(0)],
+    position: Annotated[Vector[f32, 3], attribute()],
     transform: Annotated[Matrix[f32, 4, 4], uniform(set=1, binding=2)],
 ) -> Vector[f32, 4]:
     direction = normalize(position)
@@ -409,6 +409,21 @@ def integer_literal(value: f32) -> f32:
         self.assertIn("arith.constant 2.5 : f32", output)
         self.assertIn("arith.constant 2.0 : f32", output)
 
+    def test_unary_minus_supports_vectors_and_negative_vector_literals(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@func
+def negate(value: Vector[f32, 2]) -> Vector[f32, 2]:
+    dynamic = -value
+    literal = Vector([-0.53, -0.71])
+    return dynamic + literal
+"""
+        output = compile_source(source, "unary_minus.py")
+        self.assertNotIn("arith.negf", output)
+        self.assertIn("arith.constant dense<0.0> : tensor<2xf32>", output)
+        self.assertEqual(output.count("arith.subf"), 3)
+
     def test_power_operator_rejects_integer_base(self) -> None:
         source = """
 from vernon_dsl import *
@@ -426,7 +441,7 @@ from vernon_dsl import *
 
 @vertex
 def transform(
-    position: Annotated[Vector[f32, 4], location(0)],
+    position: Annotated[Vector[f32, 4], attribute()],
     offset: Annotated[Vector[f32, 4], uniform()],
 ) -> Vector[f32, 4]:
     moved = position + offset
@@ -598,6 +613,31 @@ class ModuleGraphTests(unittest.TestCase):
 
 
 class FeatureVariantTests(unittest.TestCase):
+    def test_attribute_locations_skip_uniforms_and_reserve_explicit_ranges(self) -> None:
+        output = compile_source(
+            """
+from vernon_dsl import *
+
+@vertex
+def main(
+    transform: Annotated[Matrix[f32, 4, 4], uniform()],
+    position: Annotated[Vector[f32, 2], attribute()],
+    color: Annotated[Vector[f32, 4], uniform()],
+    offset: Annotated[Vector[f32, 2], attribute(divisor=2)],
+    fixed: Annotated[Vector[f32, 2], attribute(location=0)],
+) -> Annotated[Vector[f32, 4], builtin("position")]:
+    return Vector([position + offset, 0.0, 1.0])
+""",
+            "attribute_locations.py",
+        )
+
+        self.assertIn('vernon.source_name = "transform"', output)
+        self.assertIn('vernon.source_name = "color"', output)
+        self.assertEqual(output.count("vernon.location = 0 : i64"), 1)
+        self.assertEqual(output.count("vernon.location = 1 : i64"), 1)
+        self.assertEqual(output.count("vernon.location = 2 : i64"), 1)
+        self.assertIn("vernon.instance_divisor = 2 : i64", output)
+
     def test_features_specialize_interfaces_and_control_flow(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "variants.py"
@@ -608,7 +648,7 @@ class FeatureVariantTests(unittest.TestCase):
                 "@vertex\n"
                 "def mesh_vertex(\n"
                 "    position: Vector[f32, 3],\n"
-                "    transform: When[INSTANCE, Annotated[Matrix[f32, 4, 4], instance()]],\n"
+                "    transform: When[INSTANCE, Annotated[Matrix[f32, 4, 4], attribute(divisor=1)]],\n"
                 "    joints: When[SKIN, Vector[u32, 4]],\n"
                 "    weights: When[SKIN, Vector[f32, 4]],\n"
                 ') -> Annotated[Vector[f32, 4], builtin("position")]:\n'
@@ -645,8 +685,8 @@ class FeatureVariantTests(unittest.TestCase):
                 "from vernon_dsl import *\n"
                 "@vertex\n"
                 "def main(\n"
-                "    transform: Annotated[Matrix[f32, 4, 4], location(1)],\n"
-                "    value: Annotated[Vector[f32, 4], location(2)],\n"
+                "    transform: Annotated[Matrix[f32, 4, 4], attribute(location=1)],\n"
+                "    value: Annotated[Vector[f32, 4], attribute(location=2)],\n"
                 ") -> Vector[f32, 4]:\n"
                 "    return value\n",
                 encoding="utf-8",

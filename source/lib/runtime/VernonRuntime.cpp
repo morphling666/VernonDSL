@@ -397,7 +397,7 @@ VernonStatus vernonRuntimePipelineBundleInspectTarget(const void *bundleData, si
             static_cast<const char *>(bundleData), static_cast<const char *>(bundleData) + bundleSize, nullptr, false);
         if (root.is_discarded() || !root.is_object())
             return VERNON_STATUS_PARSE_ERROR;
-        const bool schema2 = root.value("schema_version", 0) == 2 && root.value("type", "") == "pipeline";
+        const bool schema2 = root.value("schema_version", 0) == 3 && root.value("type", "") == "pipeline";
         std::string manifestError;
         if (!schema2 || root.value("invocation_abi_version", 0) != VERNON_PIPELINE_INVOCATION_ABI_VERSION ||
             !validateManifestHash(root, true, manifestError))
@@ -445,7 +445,7 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                                          ? "directx"
                                          : (context->backend == VERNON_RUNTIME_OPENGL_ES ? "opengles" : "opengl");
         const bool schema2 =
-            root.is_object() && root.value("schema_version", 0) == 2 && root.value("type", "") == "pipeline";
+            root.is_object() && root.value("schema_version", 0) == 3 && root.value("type", "") == "pipeline";
         if (!schema2 || root.value("invocation_abi_version", 0) != VERNON_PIPELINE_INVOCATION_ABI_VERSION ||
             root.value("target", "") != expectedTarget || !root.contains("stage_artifacts") ||
             !root["stage_artifacts"].is_object() || !root.contains("variants") || !root["variants"].is_array()) {

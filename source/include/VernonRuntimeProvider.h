@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-enum { VERNON_RUNTIME_DEVICE_PROVIDER_ABI_VERSION = 2, VERNON_RUNTIME_PROVIDER_MAX_SHADER_STAGES = 8 };
+enum { VERNON_RUNTIME_DEVICE_PROVIDER_ABI_VERSION = 4, VERNON_RUNTIME_PROVIDER_MAX_SHADER_STAGES = 8 };
 
 typedef enum VernonRuntimeProviderCapabilityBits {
     VERNON_RUNTIME_PROVIDER_COMPUTE = 1u << 0,
@@ -52,6 +52,14 @@ typedef enum VernonRuntimeProviderBindingInterface {
     VERNON_RUNTIME_PROVIDER_INTERFACE_VERTEX_INPUT = 2
 } VernonRuntimeProviderBindingInterface;
 
+typedef enum VernonRuntimeProviderNumericType {
+    VERNON_RUNTIME_PROVIDER_I32 = 1,
+    VERNON_RUNTIME_PROVIDER_U32 = 2,
+    VERNON_RUNTIME_PROVIDER_F16 = 3,
+    VERNON_RUNTIME_PROVIDER_F32 = 4,
+    VERNON_RUNTIME_PROVIDER_F64 = 5
+} VernonRuntimeProviderNumericType;
+
 typedef enum VernonRuntimeProviderBindingValueFlags {
     VERNON_RUNTIME_PROVIDER_BINDING_TRANSPOSE = 1u << 0,
     VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE = 1u << 1
@@ -80,16 +88,25 @@ typedef struct VernonRuntimeProviderBindingLayoutEntry {
     uint32_t element_size;
     VernonRuntimeProviderBindingInterface interface_kind;
     VernonStringView name;
-    uint32_t value_count;
-    uint32_t column_count;
-    uint32_t location;
+    uint32_t element_count;
+    uint32_t vector_count;
     uint32_t divisor;
 } VernonRuntimeProviderBindingLayoutEntry;
+
+typedef struct VernonRuntimeProviderVertexAttribute {
+    uint32_t binding;
+    uint32_t location;
+    uint32_t dtype;
+    uint32_t component_count;
+    uint32_t relative_offset;
+} VernonRuntimeProviderVertexAttribute;
 
 typedef struct VernonRuntimeProviderPipelineLayoutDescriptor {
     uint32_t struct_size;
     const VernonRuntimeProviderBindingLayoutEntry *bindings;
     size_t binding_count;
+    const VernonRuntimeProviderVertexAttribute *vertex_attributes;
+    size_t vertex_attribute_count;
     uint32_t push_constant_size;
     uint32_t reserved[4];
 } VernonRuntimeProviderPipelineLayoutDescriptor;
@@ -127,7 +144,6 @@ typedef struct VernonRuntimeProviderBindingValue {
     size_t inline_size;
     uint32_t flags;
     uint32_t stride;
-    uint32_t secondary_stride;
 } VernonRuntimeProviderBindingValue;
 
 typedef struct VernonRuntimeProviderBindingSetDescriptor {
@@ -163,6 +179,7 @@ typedef struct VernonRuntimeProviderDrawDescriptor {
     uint32_t first_instance;
     const VernonRuntimeProviderColorAttachment *color_attachments;
     size_t color_attachment_count;
+    VernonRuntimeProviderResourceReference depth_stencil_attachment;
     uint32_t viewport[4];
     uint32_t topology;
     VernonRuntimeProviderResourceReference index_buffer;

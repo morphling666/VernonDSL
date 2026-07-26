@@ -171,7 +171,8 @@ class CompiledProgramTests(unittest.TestCase):
         module = compile_source(
             "from vernon_dsl import *\n"
             "@fragment\n"
-            "def main(start: i32, stop: i32) -> i32:\n"
+            "def main(start: Annotated[i32, uniform()], stop: Annotated[i32, uniform()])"
+            " -> i32:\n"
             "    result = 0\n"
             "    for index in range(start, stop, 1):\n"
             "        result += i32(index)\n"
@@ -191,7 +192,8 @@ class CompiledProgramTests(unittest.TestCase):
         module = compile_source(
             "from vernon_dsl import *\n"
             "@fragment\n"
-            "def main(start: i32, stop: i32, step: i32) -> i32:\n"
+            "def main(start: Annotated[i32, uniform()], stop: Annotated[i32, uniform()],"
+            " step: Annotated[i32, uniform()]) -> i32:\n"
             "    result = 0\n"
             "    for index in range(start, stop, step):\n"
             "        result += i32(index)\n"

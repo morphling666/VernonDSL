@@ -42,6 +42,17 @@ through Linalg, one-shot bufferization, and GPU-local SCF loops. Addressable
 Tensor resources remain memrefs, preserving N-D indexing through the
 frontend's row-major linearization; dynamic local value Tensors are rejected.
 
+## Graphics attribute locations
+
+`attribute(location=None, divisor=0)` is the only Python vertex-buffer
+annotation. A zero divisor advances per vertex; a positive divisor advances
+per that many instances. Explicit attribute ranges are reserved first, then
+automatic locations use declaration-order first-fit over the remaining
+contiguous ranges. Uniforms, resources, and builtins never consume locations.
+Stage outputs and varyings use the same declaration-order location planning;
+the removed `location()` and `instance()` annotations have no compatibility
+aliases.
+
 Vulkan compute uses the same shape-based small value-Tensor normalization
 before MLIR GPU-to-SPIR-V conversion. SPIR-V ABI materialization assigns
 storage-buffer descriptors to both Tensor resources and scalar kernel inputs.
@@ -285,6 +296,58 @@ Compute DSL -> MLIR GPU dialect
 
 SPIR-V is canonical for graphics and Vulkan compute, but it is not the universal compute backend. CUDA must not be routed through SPIR-V. The project must not maintain independent GLSL, MSL, or HLSL emitters; those languages are produced through SPIRV-Cross, with target capability validation before translation.
 
+### Static Tensor GPU value ABI
+
+Scalar-element, positive-shape static Tensor Values use target-native SPIR-V
+scalars, 2-4 component vectors, and 2-4 by 2-4 column-major matrices where
+legal. Every other shape is represented by shape-preserving recursive arrays.
+Those arrays use the conservative 16-byte array alignment accepted by Vulkan
+uniform buffers; compute inline-value buffers use the same reflected padding
+instead of defining a second host layout. Reflection records dtype, logical
+shape, physical size/alignment, every byte stride, matrix stride/order when
+native, and the proposed interface storage class. This physical metadata is an
+ABI description and does not alter Tensor semantic identity.
+
+Graphics lowering supports constants, construction, splats, extraction, and
+elementwise arithmetic over that representation. Each stage has a conservative
+128-byte inline-uniform budget. Unbound values that exceed that budget or use
+recursive arrays receive deterministic internal set-zero bindings and lower as
+uniform blocks; native values within the budget remain push constants or
+target-native inline uniforms. Elementwise operations on native matrices lower
+per column vector and reconstruct the matrix; they are distinct from `matmul`.
+
+Numeric Tensor elementwise arithmetic follows NumPy trailing-dimension
+broadcasting while retaining Vernon's safe dtype-promotion rules and positive
+static extents. `matmul` follows NumPy's 1D promotion/removal rules and
+broadcasts all leading batch dimensions: `(K) @ (K)` is scalar, `(K) @
+(..., K, N)` is `(..., N)`, `(..., M, K) @ (K)` is `(..., M)`, and matrix or
+batched operands produce `broadcast(batch_l, batch_r) + (M, N)`. Core
+dimensions must match, so `(4, 4, 4) @ (4, 2, 2)` is invalid while `(4, 4, 4)
+@ (4, 4, 2)` is valid. One canonical static-shape plan drives frontend
+inference and target lowering; physical vector, matrix, or aggregate choices
+must not change these logical semantics.
+
+SPIR-V compute lowers each static Tensor-by-value argument to one read-only
+descriptor-backed scalar buffer in the same flattened source-argument binding
+order used by Runtime. The kernel prologue reconstructs the logical Tensor
+using reflected physical byte strides, including the conservative 16-byte
+matrix-column stride used by host packing. Vulkan, DirectX, OpenGL, OpenGL ES, and
+Metal therefore share one binding and packing contract. CUDA does not use
+SPIR-V and continues to reject static Tensor-by-value entry arguments until it
+has a separately specified launch-parameter ABI.
+
+Resolved integration issue (2026-07-26): `VernonLowerGPUTensors` previously
+reused the 16-element register-tensor limit when selecting an MLIR vector for
+SPIR-V. That produced illegal Shader vectors such as `vector<8xf32>` before
+GPU-to-SPIR-V conversion. The SPIR-V path now uses vectors only for 2-4
+components and reconstructs larger or one-element Values as SPIR-V composites.
+The Vulkan adapter also maps compute inline values to storage-buffer
+descriptors consistently during both layout creation and descriptor updates;
+the previous fallback to a sampler descriptor caused invalid descriptor writes.
+`python/tests/test_pipeline_runtime.py *PipelineTests.test_static_tensor_compute_argument`
+covers the complete frontend, compiler, descriptor-packing, and runtime
+boundary on OpenGL, Vulkan, and DirectX.
+
 GLSL language versions are compile options, not backend constants. A zero
 version selects the target default; OpenGL and OpenGL ES callers may request a
 specific version through the stable C API or CLI. Other targets reject this
@@ -317,7 +380,7 @@ the cooker strips debug/reflection data for deterministic runtime DXIL, while
 8. Vernon can compile paired generated GLSL source and publish it through
    `ShaderProvider`. This is source loading only; reflected resources are not
    yet bound.
-9. Compiler reflection schema 2 includes target options and an explicit
+9. Compiler reflection schema 3 includes target options and an explicit
    entry-point/stage/format/filename artifact table. The cooker emits one
    `<name>.pipeline.json` plus content-addressed external artifacts; it no
    longer emits the retired `shader.json` compatibility manifest.
@@ -377,13 +440,13 @@ and Metal represent each value as a separately named `UniformConstant` so
 SPIRV-Cross preserves plain source-level uniforms. Explicitly descriptor-bound
 uniforms remain `Uniform` blocks.
 
-The OpenGL single-value uniform path must not wrap each value in a one-member
-`Block` struct. Such wrappers can produce duplicate anonymous GLSL struct names
-and force runtime lookups such as `projection._m0`. The required interface is
-the original source path, for example `uniform mat4 projection`, and reflection
-must report the same name. Regression coverage compiles at least three matrix
-uniforms, rejects duplicate wrapper declarations and `._m0` references, checks
-real OpenGL linking, and retains Vulkan packed push-constant coverage.
+The OpenGL native-inline uniform path must not wrap each value in a one-member
+`Block` struct. The required interface is the original source path, for example
+`uniform mat4 projection`. Values selected by the deterministic spill policy
+are the exception: they use a reflected uniform-buffer binding and SPIRV-Cross
+may address the block member as `model._m0`, which Runtime derives from the same
+reflection. Regression coverage checks both native-inline names and spilled
+block names while retaining Vulkan packed push-constant coverage.
 
 Value-yielding graphics `scf.if` lowers to a structured SPIR-V selection with
 explicit header, branch, and merge blocks. Function-local result slots carry
@@ -565,3 +628,11 @@ effect-preserving reverse traversal require a future compiler-internal
 ProgramGraph before stateful-kernel differentiation can be accepted. That
 graph represents one specialized program and is not a deployment asset or
 multi-program orchestration model.
+
+Vertex and instance Tensor inputs use one rank-independent attribute ABI.
+Positive static logical shapes are flattened in row-major order and partitioned
+into consecutive scalar/vector leaves with at most four components and 128
+bits. Each leaf records its location offset and contiguous byte offset; the
+SPIR-V entry prologue reconstructs the source Tensor from those leaves.
+Location allocation and direct-MLIR validation use this same plan, so Matrix
+aliases, rank-three Tensors, and instancing do not create separate layouts.

@@ -39,13 +39,13 @@ class Palette:
 @vd.struct
 class VertexData:
     position: Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]
-    local_color: Annotated[vd.Vector[vd.f32, 2], vd.location(0)]
+    local_color: vd.Vector[vd.f32, 2]
 
 
 @vd.struct
 class GBuffer:
-    color: Annotated[vd.Vector[vd.f32, 4], vd.location(0)]
-    object_id: Annotated[vd.Vector[vd.f32, 4], vd.location(1)]
+    color: vd.Vector[vd.f32, 4]
+    object_id: vd.Vector[vd.f32, 4]
 
 
 @vd.kernel(workgroup_size=(2, 1, 1))
@@ -66,8 +66,8 @@ def animate_instances(
 
 @vd.vertex
 def vertex_main(
-    position: Annotated[vd.Vector[vd.f32, 2], vd.location(0)],
-    offset: Annotated[vd.Vector[vd.f32, 2], vd.instance(location=1)],
+    position: Annotated[vd.Vector[vd.f32, 2], vd.attribute()],
+    offset: Annotated[vd.Vector[vd.f32, 2], vd.attribute(divisor=1)],
 ) -> VertexData:
     return VertexData(
         vd.Vector([position + offset, 0.0, 1.0]),
@@ -77,7 +77,7 @@ def vertex_main(
 
 @vd.fragment
 def fragment_main(
-    local_color: Annotated[vd.Vector[vd.f32, 2], vd.varying(), vd.location(0)],
+    local_color: Annotated[vd.Vector[vd.f32, 2], vd.varying()],
     tint: Annotated[vd.Vector[vd.f32, 4], vd.uniform()],
 ) -> GBuffer:
     source = vd.Vector([local_color, 1.0, 1.0])

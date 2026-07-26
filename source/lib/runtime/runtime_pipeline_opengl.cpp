@@ -29,6 +29,7 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
     auto *state = new OpenGLPipelineState();
     struct OpenGLBindingCandidate {
         VernonRuntimeProviderBindingLayoutEntry layout{};
+        std::vector<VernonRuntimeProviderVertexAttribute> attributes;
         OpenGLPipelineState::InlineBinding binding;
         std::string name;
     };
@@ -68,7 +69,7 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     candidate.layout.argument_index = use.index;
                     candidate.layout.element_size = static_cast<uint32_t>(
                         argument.storageLeaves.empty()
-                            ? (argument.kind == "tensor" ? argument.tensorElementSize : argument.cpuSize)
+                            ? (argument.kind == "tensor" ? argument.tensorElementSize : argument.physicalSize)
                             : argument.storageLeaves[leafIndex].elementSize);
                     candidate.binding.externalSlot = parameter.slot;
                     candidate.binding.source = argument.kind == "tensor"
@@ -157,54 +158,92 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
             candidate.layout.array_count = 1;
             candidate.binding.externalSlot = parameter.slot;
-            if (parameter.kind == "tensor" && parameter.dtype == "f32" && use.interfaceKind == "uniform" &&
-                !use.uniformName.empty()) {
+            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" &&
+                (!use.uniformName.empty() || (use.uniformLayout && use.uniformLayout->storage == "uniform_buffer"))) {
                 const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
+                const std::optional<VernonDataType> dtype = pipelineDataType(parameter.dtype);
                 uint64_t valueCount = 1;
                 for (uint64_t dimension : shape) {
-                    if (dimension == 0 || valueCount > 16 / dimension) {
+                    if (dimension == 0 || valueCount > UINT32_MAX / dimension) {
                         valueCount = 0;
                         break;
                     }
                     valueCount *= dimension;
                 }
-                if (valueCount != 1 && valueCount != 2 && valueCount != 3 && valueCount != 4 && valueCount != 9 &&
-                    valueCount != 16) {
+                const bool buffered = use.uniformLayout && use.uniformLayout->storage == "uniform_buffer";
+                const bool nativeInline =
+                    parameter.dtype == "f32" &&
+                    (shape.empty() || (shape.size() == 1 && shape[0] <= 4) ||
+                     (shape.size() == 2 && shape[0] >= 2 && shape[0] <= 4 && shape[1] >= 2 && shape[1] <= 4));
+                if (!dtype || valueCount == 0 || (!buffered && !nativeInline)) {
                     useRhiGraphics = false;
                     break;
                 }
-                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-                candidate.layout.element_size = static_cast<uint32_t>(valueCount * sizeof(float));
+                const size_t elementSize = dataTypeSize(*dtype);
+                candidate.layout.kind =
+                    buffered ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                const uint64_t physicalSize =
+                    buffered && use.uniformLayout ? use.uniformLayout->size : valueCount * elementSize;
+                if (!physicalSize || physicalSize > UINT32_MAX || (buffered && use.binding == UINT32_MAX)) {
+                    useRhiGraphics = false;
+                    break;
+                }
+                candidate.layout.element_size = static_cast<uint32_t>(physicalSize);
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
-                candidate.layout.value_count = static_cast<uint32_t>(valueCount);
+                candidate.layout.element_count = static_cast<uint32_t>(valueCount);
+                candidate.layout.vector_count = shape.size() == 2 ? static_cast<uint32_t>(shape[1]) : 1;
+                candidate.layout.binding = use.binding;
+                candidate.layout.set = use.descriptorSet;
                 candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_UNIFORM;
                 candidate.name = use.uniformName;
-            } else if (parameter.kind == "tensor" && parameter.dtype == "f32" &&
-                       (use.interfaceKind == "input" || use.interfaceKind == "instance") && use.stage == "vertex" &&
-                       use.location != UINT32_MAX) {
-                const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
-                uint64_t valueCount = 1;
-                for (uint64_t dimension : shape) {
-                    if (dimension == 0 || valueCount > 16 / dimension) {
-                        valueCount = 0;
-                        break;
+                candidate.binding.packing.dtype = *dtype;
+                candidate.binding.packing.shape = shape;
+                candidate.binding.packing.byteSize = static_cast<size_t>(physicalSize);
+                if (use.uniformLayout && buffered) {
+                    for (uint64_t stride : use.uniformLayout->byteStrides) {
+                        if (stride > SIZE_MAX) {
+                            useRhiGraphics = false;
+                            break;
+                        }
+                        candidate.binding.packing.byteStrides.push_back(static_cast<size_t>(stride));
                     }
-                    valueCount *= dimension;
+                } else if (shape.size() == 2) {
+                    if (bundle.context->backend == VERNON_RUNTIME_OPENGL_ES) {
+                        candidate.binding.packing.byteStrides = {elementSize,
+                                                                 static_cast<size_t>(shape[0]) * elementSize};
+                    } else {
+                        candidate.binding.packing.byteStrides = {static_cast<size_t>(shape[1]) * elementSize,
+                                                                 elementSize};
+                        candidate.binding.transpose = true;
+                    }
+                } else {
+                    candidate.binding.packing.byteStrides.resize(shape.size());
+                    size_t stride = elementSize;
+                    for (size_t dimension = shape.size(); dimension-- > 0;) {
+                        candidate.binding.packing.byteStrides[dimension] = stride;
+                        stride *= static_cast<size_t>(shape[dimension]);
+                    }
                 }
-                const uint64_t columnCount = shape.size() == 2 ? shape[0] : 1;
-                if (valueCount == 0 || columnCount == 0 || columnCount > 4 || valueCount % columnCount != 0 ||
-                    valueCount / columnCount > 4) {
+                if (!useRhiGraphics || candidate.binding.packing.byteStrides.size() != shape.size()) {
+                    useRhiGraphics = false;
+                    break;
+                }
+            } else if (parameter.kind == "tensor" && use.interfaceKind == "input" && use.stage == "vertex" &&
+                       use.location != UINT32_MAX && !use.attributeLeaves.empty()) {
+                const std::optional<VernonDataType> dtype = pipelineDataType(parameter.dtype);
+                if (!dtype || dataTypeSize(*dtype) == 0) {
                     useRhiGraphics = false;
                     break;
                 }
                 candidate.layout.kind = VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
-                candidate.layout.element_size = sizeof(float);
+                candidate.layout.element_size = static_cast<uint32_t>(dataTypeSize(*dtype));
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_VERTEX_INPUT;
-                candidate.layout.value_count = static_cast<uint32_t>(valueCount);
-                candidate.layout.column_count = static_cast<uint32_t>(columnCount);
-                candidate.layout.location = use.location;
-                candidate.layout.divisor =
-                    use.interfaceKind == "instance" || use.divisor != 0 ? std::max(use.divisor, 1u) : 0;
+                candidate.layout.binding = parameter.slot;
+                candidate.layout.divisor = use.divisor;
+                for (const AttributeLeaf &leaf : use.attributeLeaves)
+                    candidate.attributes.push_back({candidate.layout.binding, use.location + leaf.locationOffset,
+                                                    static_cast<uint32_t>(*dtype), leaf.componentCount,
+                                                    leaf.byteOffset});
                 candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_VERTEX;
             } else if (parameter.kind == "texture" && use.interfaceKind == "resource" && use.descriptorSet == 0 &&
                        use.binding != UINT32_MAX) {
@@ -255,7 +294,8 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 candidate.layout.kind = VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
                 candidate.layout.element_size = 2 * sizeof(float);
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
-                candidate.layout.value_count = 2;
+                candidate.layout.element_count = 2;
+                candidate.layout.vector_count = 1;
                 candidate.binding.source = OpenGLPipelineState::InlineBinding::RESOLUTION;
                 candidate.name = use.uniformName;
             } else {
@@ -276,6 +316,8 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         for (auto &candidate : candidates) {
             candidate.layout.name = {candidate.name.data(), candidate.name.size()};
             state->rhiLayout.push_back(candidate.layout);
+            state->rhiVertexAttributes.insert(state->rhiVertexAttributes.end(), candidate.attributes.begin(),
+                                              candidate.attributes.end());
             state->rhiInlineBindings.push_back(std::move(candidate.binding));
         }
     }
@@ -306,6 +348,8 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         descriptor.shader_count = 2;
         descriptor.bindings = state->rhiLayout.data();
         descriptor.binding_count = state->rhiLayout.size();
+        descriptor.vertex_attributes = state->rhiVertexAttributes.data();
+        descriptor.vertex_attribute_count = state->rhiVertexAttributes.size();
         descriptor.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
         descriptor.sample_count = 1;
         const VernonStatus status = vernonRuntimeCorePreparePipeline(
@@ -325,7 +369,8 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 auto &value = state->rhiValues[index];
                 value.slot = layout.slot;
                 value.kind = layout.kind;
-                if (layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE) {
+                if (layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
+                    layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
                     state->rhiInlineBindings[index].storage.resize(layout.element_size);
                     value.inline_data = state->rhiInlineBindings[index].storage.data();
                     value.inline_size = state->rhiInlineBindings[index].storage.size();
@@ -373,7 +418,6 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
         value.flags = 0;
         value.resource = {};
         value.stride = 0;
-        value.secondary_stride = 0;
         if (prepared.source == OpenGLPipelineState::InlineBinding::EXTERNAL_VERTEX) {
             const auto found = plan.arguments.find(prepared.externalSlot);
             if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
@@ -383,9 +427,7 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
                 return fail(*pipeline.context, "OpenGL RHI vertex argument is missing");
             const VernonTensorView &tensor = found->second->tensor;
             if (!tensor.byte_strides || tensor.byte_strides[0] <= 0 ||
-                static_cast<uint64_t>(tensor.byte_strides[0]) > UINT32_MAX ||
-                (layout.column_count > 1 && (tensor.rank < 3 || tensor.byte_strides[1] <= 0 ||
-                                             static_cast<uint64_t>(tensor.byte_strides[1]) > UINT32_MAX)))
+                static_cast<uint64_t>(tensor.byte_strides[0]) > UINT32_MAX)
                 return fail(*pipeline.context, "OpenGL RHI vertex Tensor strides are invalid");
             if (tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
                 value.resource = tensor.resource;
@@ -397,7 +439,6 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
                 value.resource.size = tensor.buffer->size;
             }
             value.stride = static_cast<uint32_t>(tensor.byte_strides[0]);
-            value.secondary_stride = layout.column_count > 1 ? static_cast<uint32_t>(tensor.byte_strides[1]) : 0;
             continue;
         }
         if (prepared.source == OpenGLPipelineState::InlineBinding::EXTERNAL_TEXTURE) {
@@ -451,45 +492,21 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
         if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR)
             return fail(*pipeline.context, "OpenGL RHI uniform argument is missing");
         const VernonTensorView &tensor = found->second->tensor;
-        const auto elementCount = tensorElementCount(tensor);
-        if (tensor.storage != VERNON_TENSOR_HOST || tensor.dtype != VERNON_DATA_F32 || !elementCount ||
-            *elementCount != layout.value_count || !tensorFitsAllocation(tensor))
-            return fail(*pipeline.context, "OpenGL RHI uniform Tensor is invalid");
-        auto &storage = prepared.storage;
-        const uint8_t *source = hostTensorData(tensor);
-        if (layout.value_count == 9 || layout.value_count == 16) {
-            const uint32_t dimension = layout.value_count == 9 ? 3 : 4;
-            if (tensor.rank != 2 || tensor.shape[0] != dimension || tensor.shape[1] != dimension)
-                return fail(*pipeline.context, "OpenGL RHI matrix uniform shape is invalid");
-            const bool columnMajor =
-                tensor.byte_strides[0] == sizeof(float) && tensor.byte_strides[1] == dimension * sizeof(float);
-            const bool rowMajor =
-                tensor.byte_strides[1] == sizeof(float) && tensor.byte_strides[0] == dimension * sizeof(float);
-            if (columnMajor || (rowMajor && pipeline.context->backend != VERNON_RUNTIME_OPENGL_ES)) {
-                std::memcpy(storage.data(), source, storage.size());
-                if (rowMajor)
-                    value.flags = VERNON_RUNTIME_PROVIDER_BINDING_TRANSPOSE;
-            } else {
-                for (uint32_t column = 0; column < dimension; ++column)
-                    for (uint32_t row = 0; row < dimension; ++row)
-                        std::memcpy(storage.data() + (column * dimension + row) * sizeof(float),
-                                    source + row * tensor.byte_strides[0] + column * tensor.byte_strides[1],
-                                    sizeof(float));
-            }
-        } else if (isRowMajorContiguous(tensor)) {
-            std::memcpy(storage.data(), source, storage.size());
-        } else {
-            for (size_t linear = 0; linear < *elementCount; ++linear) {
-                size_t remainder = linear;
-                int64_t sourceOffset = 0;
-                for (uint32_t dimension = tensor.rank; dimension-- > 0;) {
-                    const size_t index = remainder % tensor.shape[dimension];
-                    remainder /= tensor.shape[dimension];
-                    sourceOffset += static_cast<int64_t>(index) * tensor.byte_strides[dimension];
-                }
-                std::memcpy(storage.data() + linear * sizeof(float), source + sourceOffset, sizeof(float));
-            }
+        TensorPackingLayout packing = prepared.packing;
+        bool transpose = prepared.transpose;
+        const size_t elementSize = dataTypeSize(tensor.dtype);
+        if (transpose && tensor.rank == 2 && tensor.byte_strides &&
+            tensor.byte_strides[0] == static_cast<int64_t>(elementSize) &&
+            tensor.byte_strides[1] == static_cast<int64_t>(tensor.shape[0] * elementSize)) {
+            packing.byteStrides = {elementSize, static_cast<size_t>(tensor.shape[0]) * elementSize};
+            transpose = false;
         }
+        const std::optional<std::vector<uint8_t>> packed = packTensor(tensor, packing);
+        if (!packed || packed->size() != prepared.storage.size())
+            return fail(*pipeline.context, "OpenGL RHI uniform Tensor is invalid");
+        std::memcpy(prepared.storage.data(), packed->data(), packed->size());
+        if (transpose)
+            value.flags = VERNON_RUNTIME_PROVIDER_BINDING_TRANSPOSE;
     }
     if (state.rhiBindings) {
         const VernonStatus bindingStatus =
@@ -507,6 +524,7 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
     if (plan.attachments.size() > maxAttachments)
         return fail(*pipeline.context, "OpenGL RHI draw supports at most eight color attachments");
     std::array<VernonRuntimeProviderColorAttachment, maxAttachments> attachments{};
+    VernonRuntimeProviderResourceReference depthAttachment{};
     for (size_t index = 0; index < plan.attachments.size(); ++index) {
         const VernonColorAttachment &source = *plan.attachments[index];
         attachments[index].location = source.location;
@@ -517,6 +535,14 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
             attachments[index].image.resource.value = openGLTextureState(*source.texture).name;
         }
     }
+    if (plan.depthAttachment) {
+        if (plan.depthAttachment->resource.resource.value)
+            depthAttachment = plan.depthAttachment->resource;
+        else {
+            depthAttachment.identity = identity;
+            depthAttachment.resource.value = openGLTextureState(*plan.depthAttachment->texture).name;
+        }
+    }
     const bool hasViewport = invocation.viewport[2] && invocation.viewport[3];
     VernonRuntimeCoreDrawInvocation draw{};
     draw.struct_size = sizeof(draw);
@@ -524,6 +550,7 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
     draw.instance_count = plan.instanceCount;
     draw.color_attachments = attachments.data();
     draw.color_attachment_count = plan.attachments.size();
+    draw.depth_stencil_attachment = depthAttachment;
     draw.viewport[0] = hasViewport ? invocation.viewport[0] : 0;
     draw.viewport[1] = hasViewport ? invocation.viewport[1] : 0;
     draw.viewport[2] = hasViewport ? invocation.viewport[2] : plan.attachmentWidth;

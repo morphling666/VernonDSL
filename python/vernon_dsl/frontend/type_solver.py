@@ -4,6 +4,7 @@ from typing import TypeAlias
 
 from ..language.scalar_types import can_implicitly_convert, common_scalar
 from .model import ConcreteType, LiteralType
+from .tensor_shapes import broadcast_shape
 
 InferenceType: TypeAlias = ConcreteType | LiteralType
 
@@ -70,8 +71,16 @@ def common_type(
     assert isinstance(right, ConcreteType)
     if left.kind not in {"scalar", "tensor"} or right.kind not in {"scalar", "tensor"}:
         return left if left == right else None
-    if left.kind == "tensor" and right.kind == "tensor" and left.arguments[1:] != right.arguments[1:]:
-        return None
+    shape: tuple[int, ...] = ()
+    if left.kind == "tensor" and right.kind == "tensor":
+        broadcast = broadcast_shape(left.arguments[1:], right.arguments[1:])
+        if broadcast is None:
+            return None
+        shape = broadcast
+    elif left.kind == "tensor":
+        shape = left.arguments[1:]
+    elif right.kind == "tensor":
+        shape = right.arguments[1:]
     left_element = element_type(left)
     right_element = element_type(right)
     assert isinstance(left_element, ConcreteType)
@@ -82,7 +91,6 @@ def common_type(
     if name is None:
         return None
     element = scalar(name)
-    shape = left.arguments[1:] if left.kind == "tensor" else right.arguments[1:] if right.kind == "tensor" else ()
     return ConcreteType("tensor", "Tensor", (element, *shape)) if shape else element
 
 
