@@ -3,6 +3,7 @@
 #include "../rhi/rhi_internal.h"
 
 #include <algorithm>
+#include <atomic>
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
@@ -12,22 +13,51 @@ namespace {
 
 bool writes(AccessMode access) { return access != AccessMode::Read; }
 
+uint64_t handleKey(uint32_t index, uint32_t generation) { return (static_cast<uint64_t>(generation) << 32u) | index; }
+
+std::atomic<uint64_t> nextGraphIdentity{1};
+
 uint32_t accessBits(const ResourceUse &use) {
+    const bool reads = use.access != AccessMode::Write;
+    const bool writesResource = use.access != AccessMode::Read;
     if (use.state == VERNON_RHI_STATE_COLOR_ATTACHMENT)
-        return writes(use.access) ? VERNON_RHI_ACCESS_COLOR_WRITE : VERNON_RHI_ACCESS_COLOR_READ;
+        return (reads ? VERNON_RHI_ACCESS_COLOR_READ : 0) | (writesResource ? VERNON_RHI_ACCESS_COLOR_WRITE : 0);
     if (use.state == VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT)
-        return writes(use.access) ? VERNON_RHI_ACCESS_DEPTH_STENCIL_WRITE : VERNON_RHI_ACCESS_DEPTH_STENCIL_READ;
+        return (reads ? VERNON_RHI_ACCESS_DEPTH_STENCIL_READ : 0) |
+               (writesResource ? VERNON_RHI_ACCESS_DEPTH_STENCIL_WRITE : 0);
     if (use.state == VERNON_RHI_STATE_TRANSFER_SOURCE)
         return VERNON_RHI_ACCESS_TRANSFER_READ;
     if (use.state == VERNON_RHI_STATE_TRANSFER_DESTINATION)
         return VERNON_RHI_ACCESS_TRANSFER_WRITE;
-    return writes(use.access) ? VERNON_RHI_ACCESS_SHADER_WRITE : VERNON_RHI_ACCESS_SHADER_READ;
+    if (use.state == VERNON_RHI_STATE_SHADER_READ || use.state == VERNON_RHI_STATE_SHADER_WRITE)
+        return (reads ? VERNON_RHI_ACCESS_SHADER_READ : 0) | (writesResource ? VERNON_RHI_ACCESS_SHADER_WRITE : 0);
+    return VERNON_RHI_ACCESS_NONE;
 }
 
 bool sameView(const GraphImage &left, const GraphImage &right) {
-    return left.view.index == right.view.index && left.view.generation == right.view.generation &&
+    return left.graphIdentity == right.graphIdentity && left.id == right.id &&
+           left.handle.index == right.handle.index && left.handle.generation == right.handle.generation &&
+           left.view.index == right.view.index && left.view.generation == right.view.generation &&
            left.width == right.width && left.height == right.height && left.layers == right.layers &&
            left.samples == right.samples && left.format == right.format;
+}
+
+bool preservesBoundary(VernonRhiStoreOperation previousStore, VernonRhiLoadOperation nextLoad) {
+    return nextLoad == VERNON_RHI_LOAD_CLEAR ||
+           (nextLoad == VERNON_RHI_LOAD_PRESERVE && previousStore == VERNON_RHI_STORE_PRESERVE);
+}
+
+bool attachmentUse(const ResourceUse &use) {
+    return use.state == VERNON_RHI_STATE_COLOR_ATTACHMENT || use.state == VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT;
+}
+
+bool hasUnrepresentableHazard(const RenderPass &left, const RenderPass &right) {
+    for (const ResourceUse &first : left.uses())
+        for (const ResourceUse &second : right.uses())
+            if (first.resource.id == second.resource.id && (writes(first.access) || writes(second.access)) &&
+                !(attachmentUse(first) && attachmentUse(second) && first.state == second.state))
+                return true;
+    return false;
 }
 
 bool compatible(const RenderPass &left, const RenderPass &right) {
@@ -37,10 +67,16 @@ bool compatible(const RenderPass &left, const RenderPass &right) {
         return false;
     for (size_t index = 0; index < left.colors().size(); ++index)
         if (left.colors()[index].location != right.colors()[index].location ||
-            !sameView(left.colors()[index].image, right.colors()[index].image))
+            !sameView(left.colors()[index].image, right.colors()[index].image) ||
+            !preservesBoundary(left.colors()[index].store, right.colors()[index].load))
             return false;
-    if (left.depthAttachment() && !sameView(left.depthAttachment()->image, right.depthAttachment()->image))
-        return false;
+    if (left.depthAttachment()) {
+        const auto &previous = *left.depthAttachment();
+        const auto &next = *right.depthAttachment();
+        if (!sameView(previous.image, next.image) || previous.readOnlyDepth != next.readOnlyDepth ||
+            previous.readOnlyStencil != next.readOnlyStencil || !preservesBoundary(previous.depthStore, next.depthLoad))
+            return false;
+    }
     return std::equal(left.renderAreaData(), left.renderAreaData() + 4, right.renderAreaData());
 }
 
@@ -64,16 +100,16 @@ void ExecutionPass::setFlags(uint32_t flags) {
         owner_->dirty_ = true;
 }
 
-void ExecutionPass::read(GraphResource resource, VernonRhiResourceState state) {
-    uses_.push_back({resource, AccessMode::Read, state});
+void ExecutionPass::read(GraphResource resource, VernonRhiResourceState state, uint32_t stageMask) {
+    uses_.push_back({resource, AccessMode::Read, state, stageMask});
 }
 
-void ExecutionPass::write(GraphResource resource, VernonRhiResourceState state) {
-    uses_.push_back({resource, AccessMode::Write, state});
+void ExecutionPass::write(GraphResource resource, VernonRhiResourceState state, uint32_t stageMask) {
+    uses_.push_back({resource, AccessMode::Write, state, stageMask});
 }
 
-void ExecutionPass::readWrite(GraphResource resource, VernonRhiResourceState state) {
-    uses_.push_back({resource, AccessMode::ReadWrite, state});
+void ExecutionPass::readWrite(GraphResource resource, VernonRhiResourceState state, uint32_t stageMask) {
+    uses_.push_back({resource, AccessMode::ReadWrite, state, stageMask});
 }
 
 void ExecutionPass::resetDeclaration() { uses_.clear(); }
@@ -82,15 +118,19 @@ void RenderPass::color(uint32_t location, const ColorAttachmentUse &attachment) 
     auto value = attachment;
     value.location = location;
     colors_.push_back(value);
-    write(value.image, VERNON_RHI_STATE_COLOR_ATTACHMENT);
+    if (value.load == VERNON_RHI_LOAD_PRESERVE)
+        readWrite(value.image, VERNON_RHI_STATE_COLOR_ATTACHMENT);
+    else
+        write(value.image, VERNON_RHI_STATE_COLOR_ATTACHMENT);
 }
 
 void RenderPass::depth(const DepthStencilAttachmentUse &attachment) {
     depth_ = std::make_unique<DepthStencilAttachmentUse>(attachment);
-    if (attachment.readOnlyDepth && attachment.readOnlyStencil)
+    if ((attachment.image.format == VERNON_RHI_FORMAT_D32_FLOAT && attachment.readOnlyDepth) ||
+        (attachment.readOnlyDepth && attachment.readOnlyStencil))
         read(attachment.image, VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT);
     else
-        write(attachment.image, VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT);
+        readWrite(attachment.image, VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT);
 }
 
 void RenderPass::renderArea(uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
@@ -100,7 +140,8 @@ void RenderPass::renderArea(uint32_t x, uint32_t y, uint32_t width, uint32_t hei
     renderArea_[3] = height;
 }
 
-ExecutionGraph::ExecutionGraph(VernonRhiDevice device) : device_(device) {}
+ExecutionGraph::ExecutionGraph(VernonRhiDevice device)
+    : device_(device), graphIdentity_(nextGraphIdentity.fetch_add(1, std::memory_order_relaxed)) {}
 ExecutionGraph::~ExecutionGraph() {
     for (const ResourceRecord &record : resourceRecords_)
         if (record.resourceKey && record.resourceKey != UINT64_MAX)
@@ -112,12 +153,25 @@ ExecutionGraph::~ExecutionGraph() {
 }
 
 GraphBuffer ExecutionGraph::importBuffer(VernonRhiBuffer buffer, bool exported) {
+    const uint64_t key = handleKey(buffer.index, buffer.generation);
+    if (const auto found = importedBuffers_.find(key); found != importedBuffers_.end()) {
+        ResourceRecord &record = resourceRecords_[found->second];
+        record.exported = record.exported || exported;
+        GraphBuffer result;
+        result.id = found->second;
+        result.kind = ResourceKind::Buffer;
+        result.graphIdentity = graphIdentity_;
+        result.handle = buffer;
+        return result;
+    }
     GraphBuffer result;
     result.id = static_cast<uint32_t>(resources_.size());
     result.kind = ResourceKind::Buffer;
+    result.graphIdentity = graphIdentity_;
     result.handle = buffer;
     resources_.push_back(result);
     resourceRecords_.push_back({result, exported});
+    importedBuffers_.emplace(key, result.id);
     resourceRecords_.back().buffer = buffer;
     if (!vernon::rhi::deviceExists(device_)) {
         resourceRecords_.back().resourceKey = UINT64_MAX;
@@ -135,9 +189,27 @@ GraphBuffer ExecutionGraph::importBuffer(VernonRhiBuffer buffer, bool exported) 
 GraphImage ExecutionGraph::importImage(VernonRhiImage image, VernonRhiImageView view, VernonRhiFormat format,
                                        uint32_t width, uint32_t height, uint32_t layers, uint32_t samples,
                                        bool exported) {
+    const uint64_t key = handleKey(image.index, image.generation);
+    if (const auto found = importedImages_.find(key); found != importedImages_.end()) {
+        ResourceRecord &record = resourceRecords_[found->second];
+        record.exported = record.exported || exported;
+        GraphImage result;
+        result.id = found->second;
+        result.kind = ResourceKind::Image;
+        result.graphIdentity = graphIdentity_;
+        result.handle = image;
+        result.view = view;
+        result.format = format;
+        result.width = width;
+        result.height = height;
+        result.layers = layers;
+        result.samples = samples;
+        return result;
+    }
     GraphImage result;
     result.id = static_cast<uint32_t>(resources_.size());
     result.kind = ResourceKind::Image;
+    result.graphIdentity = graphIdentity_;
     result.handle = image;
     result.view = view;
     result.format = format;
@@ -147,6 +219,7 @@ GraphImage ExecutionGraph::importImage(VernonRhiImage image, VernonRhiImageView 
     result.samples = samples;
     resources_.push_back(result);
     resourceRecords_.push_back({result, exported});
+    importedImages_.emplace(key, result.id);
     resourceRecords_.back().image = image;
     if (!vernon::rhi::deviceExists(device_)) {
         resourceRecords_.back().resourceKey = UINT64_MAX;
@@ -165,6 +238,18 @@ bool ExecutionGraph::compile(std::string &error) {
     error.clear();
     schedule_.clear();
     scopes_.clear();
+    bool compiled = false;
+    struct FailedCompileCleanup {
+        std::vector<uint32_t> &schedule;
+        std::vector<CompiledScope> &scopes;
+        bool &compiled;
+        ~FailedCompileCleanup() {
+            if (!compiled) {
+                schedule.clear();
+                scopes.clear();
+            }
+        }
+    } cleanup{schedule_, scopes_, compiled};
     const size_t count = passes_.size();
     std::unordered_map<ExecutionPass *, uint32_t> indices;
     for (uint32_t index = 0; index < count; ++index) {
@@ -262,7 +347,15 @@ bool ExecutionGraph::compile(std::string &error) {
         auto *render = dynamic_cast<RenderPass *>(passes_[passIndex].get());
         if (render && !scopes_.empty() && scopes_.back().rendering) {
             auto *previous = dynamic_cast<RenderPass *>(passes_[scopes_.back().passIndices.back()].get());
-            if (previous && compatible(*previous, *render)) {
+            bool canMerge = previous && compatible(*previous, *render);
+            for (uint32_t previousIndex : scopes_.back().passIndices) {
+                const auto *scopePass = static_cast<const RenderPass *>(passes_[previousIndex].get());
+                if (hasUnrepresentableHazard(*scopePass, *render)) {
+                    canMerge = false;
+                    break;
+                }
+            }
+            if (canMerge) {
                 scopes_.back().passIndices.push_back(passIndex);
                 continue;
             }
@@ -275,20 +368,31 @@ bool ExecutionGraph::compile(std::string &error) {
     };
     std::vector<LastUse> lastUses(resources_.size());
     for (CompiledScope &scope : scopes_) {
-        std::unordered_map<uint32_t, ResourceUse> firstUses;
-        std::unordered_map<uint32_t, ResourceUse> finalUses;
+        std::vector<ResourceUse> firstUses(resources_.size());
+        std::vector<ResourceUse> finalUses(resources_.size());
+        std::vector<bool> firstUsePresent(resources_.size());
+        std::vector<bool> finalUsePresent(resources_.size());
         for (uint32_t passIndex : scope.passIndices) {
             const uint32_t stageMask = dynamic_cast<ComputePass *>(passes_[passIndex].get())
                                            ? VERNON_RHI_STAGE_COMPUTE
                                            : VERNON_RHI_STAGE_VERTEX | VERNON_RHI_STAGE_FRAGMENT;
             for (const ResourceUse &use : passes_[passIndex]->uses_) {
                 ResourceUse effective = use;
-                effective.stageMask = stageMask;
-                firstUses.emplace(use.resource.id, effective);
-                finalUses.insert_or_assign(use.resource.id, effective);
+                if (!effective.stageMask && (effective.state == VERNON_RHI_STATE_SHADER_READ ||
+                                             effective.state == VERNON_RHI_STATE_SHADER_WRITE))
+                    effective.stageMask = stageMask;
+                if (!firstUsePresent[use.resource.id]) {
+                    firstUses[use.resource.id] = effective;
+                    firstUsePresent[use.resource.id] = true;
+                }
+                finalUses[use.resource.id] = effective;
+                finalUsePresent[use.resource.id] = true;
             }
         }
-        for (const auto &[resourceId, use] : firstUses) {
+        for (uint32_t resourceId = 0; resourceId < firstUses.size(); ++resourceId) {
+            if (!firstUsePresent[resourceId])
+                continue;
+            const ResourceUse &use = firstUses[resourceId];
             const LastUse &previous = lastUses[resourceId];
             if (!previous.present ||
                 (previous.use.state == use.state && !writes(previous.use.access) && !writes(use.access)))
@@ -309,19 +413,50 @@ bool ExecutionGraph::compile(std::string &error) {
                 barrier.buffer = record.buffer;
             scope.barriers.push_back(barrier);
         }
-        for (const auto &[resourceId, use] : finalUses)
-            lastUses[resourceId] = {use, true};
+        for (uint32_t resourceId = 0; resourceId < finalUses.size(); ++resourceId)
+            if (finalUsePresent[resourceId])
+                lastUses[resourceId] = {finalUses[resourceId], true};
     }
+    if (!validate(error))
+        return false;
     dirty_ = false;
-    return validate(error);
+    compiled = true;
+    return true;
 }
 
 bool ExecutionGraph::validate(std::string &error) const {
-    for (const ResourceRecord &resource : resourceRecords_)
-        if (!resource.resourceKey) {
-            error = "execution graph contains a stale imported resource";
+    for (size_t index = 0; index < resourceRecords_.size(); ++index)
+        if (!resourceRecords_[index].resourceKey) {
+            error = "execution graph resource " + std::to_string(index) + " is stale";
             return false;
         }
+    const auto validateResource = [&](const std::string &passName, const GraphResource &resource) {
+        if (resource.graphIdentity != graphIdentity_ || resource.id >= resources_.size() ||
+            resources_[resource.id].graphIdentity != graphIdentity_ || resources_[resource.id].kind != resource.kind) {
+            error = "pass '" + passName + "' references resource " + std::to_string(resource.id) +
+                    " from another execution graph";
+            return false;
+        }
+        return true;
+    };
+    const auto validLoad = [](VernonRhiLoadOperation operation) {
+        return operation >= VERNON_RHI_LOAD_CLEAR && operation <= VERNON_RHI_LOAD_DISCARD;
+    };
+    const auto validStore = [](VernonRhiStoreOperation operation) {
+        return operation >= VERNON_RHI_STORE_PRESERVE && operation <= VERNON_RHI_STORE_DISCARD;
+    };
+    const auto validateImage = [&](const std::string &passName, const GraphImage &image) {
+        if (!validateResource(passName, image) || image.kind != ResourceKind::Image)
+            return false;
+        const ResourceRecord &record = resourceRecords_[image.id];
+        if (record.image.index != image.handle.index || record.image.generation != image.handle.generation ||
+            image.view.index == static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX) || !image.width ||
+            !image.height || !image.layers || !image.samples || image.format == VERNON_RHI_FORMAT_UNDEFINED) {
+            error = "pass '" + passName + "' contains an invalid image resource " + std::to_string(image.id);
+            return false;
+        }
+        return true;
+    };
     std::unordered_set<const ExecutionPass *> owned;
     std::unordered_set<std::string> names;
     for (const auto &pass : passes_) {
@@ -330,11 +465,97 @@ bool ExecutionGraph::validate(std::string &error) const {
             return false;
         }
         owned.insert(pass.get());
-        for (const ResourceUse &use : pass->uses_)
-            if (use.resource.id >= resources_.size()) {
-                error = "pass '" + pass->name() + "' references an unknown graph resource";
+        for (const ResourceUse &use : pass->uses_) {
+            if (!validateResource(pass->name(), use.resource))
+                return false;
+            const uint32_t validStages = VERNON_RHI_STAGE_COMPUTE | VERNON_RHI_STAGE_VERTEX | VERNON_RHI_STAGE_FRAGMENT;
+            if ((use.stageMask & ~validStages) != 0 || use.state <= VERNON_RHI_STATE_UNDEFINED ||
+                use.state > VERNON_RHI_STATE_PRESENT ||
+                (use.stageMask != 0 && use.state != VERNON_RHI_STATE_SHADER_READ &&
+                 use.state != VERNON_RHI_STATE_SHADER_WRITE) ||
+                (use.state == VERNON_RHI_STATE_TRANSFER_SOURCE && use.access != AccessMode::Read) ||
+                (use.state == VERNON_RHI_STATE_TRANSFER_DESTINATION && use.access == AccessMode::Read) ||
+                (use.state == VERNON_RHI_STATE_SHADER_READ && writes(use.access)) ||
+                (use.state == VERNON_RHI_STATE_SHADER_WRITE && !writes(use.access)) ||
+                (use.state == VERNON_RHI_STATE_PRESENT && use.access != AccessMode::Read) ||
+                ((use.state == VERNON_RHI_STATE_COLOR_ATTACHMENT ||
+                  use.state == VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT || use.state == VERNON_RHI_STATE_PRESENT) &&
+                 use.resource.kind != ResourceKind::Image)) {
+                error = "pass '" + pass->name() + "' declares an incompatible state/access for resource " +
+                        std::to_string(use.resource.id);
                 return false;
             }
+        }
+        const auto *render = dynamic_cast<const RenderPass *>(pass.get());
+        if (!render)
+            continue;
+        if ((render->colors_.empty() && !render->depth_) || render->colors_.size() > 8) {
+            error = "render pass '" + pass->name() + "' must declare between one and eight attachments";
+            return false;
+        }
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t layers = 0;
+        uint32_t samples = 0;
+        std::unordered_set<uint32_t> locations;
+        std::unordered_set<uint32_t> attachmentResources;
+        for (const ColorAttachmentUse &color : render->colors_) {
+            if (!validateImage(pass->name(), color.image))
+                return false;
+            if (color.image.format == VERNON_RHI_FORMAT_D32_FLOAT || color.location >= 8 ||
+                !locations.insert(color.location).second || !attachmentResources.insert(color.image.id).second ||
+                !validLoad(color.load) || !validStore(color.store)) {
+                error = "render pass '" + pass->name() + "' contains invalid color attachment resource " +
+                        std::to_string(color.image.id);
+                return false;
+            }
+            if (!width) {
+                width = color.image.width;
+                height = color.image.height;
+                layers = color.image.layers;
+                samples = color.image.samples;
+            } else if (width != color.image.width || height != color.image.height || layers != color.image.layers ||
+                       samples != color.image.samples) {
+                error = "render pass '" + pass->name() + "' color attachment resource " +
+                        std::to_string(color.image.id) + " has an incompatible extent or sample count";
+                return false;
+            }
+        }
+        if (render->depth_) {
+            const DepthStencilAttachmentUse &depth = *render->depth_;
+            if (!validateImage(pass->name(), depth.image))
+                return false;
+            if (depth.image.format != VERNON_RHI_FORMAT_D32_FLOAT ||
+                !attachmentResources.insert(depth.image.id).second || !validLoad(depth.depthLoad) ||
+                !validStore(depth.depthStore) || !validLoad(depth.stencilLoad) || !validStore(depth.stencilStore) ||
+                depth.clearDepth < 0.0f || depth.clearDepth > 1.0f ||
+                (depth.readOnlyDepth &&
+                 (depth.depthLoad == VERNON_RHI_LOAD_CLEAR || depth.depthStore == VERNON_RHI_STORE_DISCARD))) {
+                error = "render pass '" + pass->name() + "' contains invalid depth attachment resource " +
+                        std::to_string(depth.image.id);
+                return false;
+            }
+            if (!width) {
+                width = depth.image.width;
+                height = depth.image.height;
+                layers = depth.image.layers;
+                samples = depth.image.samples;
+            } else if (width != depth.image.width || height != depth.image.height || layers != depth.image.layers ||
+                       samples != depth.image.samples) {
+                error = "render pass '" + pass->name() + "' depth attachment resource " +
+                        std::to_string(depth.image.id) + " is incompatible with its colors";
+                return false;
+            }
+        }
+        if (!render->renderArea_[2] || !render->renderArea_[3] || render->renderArea_[0] > width ||
+            render->renderArea_[1] > height || render->renderArea_[2] > width - render->renderArea_[0] ||
+            render->renderArea_[3] > height - render->renderArea_[1]) {
+            const uint32_t resourceId =
+                !render->colors_.empty() ? render->colors_.front().image.id : render->depth_->image.id;
+            error = "render pass '" + pass->name() + "' render area exceeds attachment resource " +
+                    std::to_string(resourceId);
+            return false;
+        }
     }
     for (const auto &pass : passes_)
         for (const ExecutionPass *dependency : pass->dependencies_)

@@ -132,21 +132,35 @@ VernonRhiFormat rhiFormat(VernonTextureFormat format) {
     throw std::invalid_argument("unsupported attachment image format");
 }
 
+VernonRhiImageDimension rhiDimension(VernonTextureDimension dimension) {
+    switch (dimension) {
+    case VERNON_TEXTURE_2D:
+        return VERNON_RHI_IMAGE_2D;
+    case VERNON_TEXTURE_3D:
+        return VERNON_RHI_IMAGE_3D;
+    case VERNON_TEXTURE_CUBE:
+        return VERNON_RHI_IMAGE_CUBE;
+    }
+    throw std::invalid_argument("unsupported texture dimension");
+}
+
 struct RhiImage {
     RhiImage(std::shared_ptr<RhiHostState> host, uint32_t width, uint32_t height, VernonTextureFormat format,
-             uint32_t usage)
-        : host(std::move(host)), width(width), height(height), format(format), usage(usage) {
-        if (!width || !height || !usage)
+             VernonTextureDimension dimension, uint32_t usage)
+        : host(std::move(host)), width(width), height(height), format(format), dimension(dimension), usage(usage),
+          layers(dimension == VERNON_TEXTURE_CUBE ? 6u : 1u) {
+        if (!width || !height || !usage || dimension == VERNON_TEXTURE_3D ||
+            (dimension == VERNON_TEXTURE_CUBE && width != height))
             throw std::invalid_argument("RHI image extent and usage must be non-zero");
         VernonRhiImageDescriptor descriptor{};
         descriptor.struct_size = sizeof(descriptor);
-        descriptor.dimension = VERNON_RHI_IMAGE_2D;
+        descriptor.dimension = rhiDimension(dimension);
         descriptor.format = rhiFormat(format);
         descriptor.width = width;
         descriptor.height = height;
         descriptor.depth = 1;
         descriptor.mip_levels = 1;
-        descriptor.array_layers = 1;
+        descriptor.array_layers = layers;
         descriptor.sample_count = 1;
         descriptor.usage = usage;
         if (vernonRhiDeviceCreateImage(this->host->device, &descriptor, &handle) != VERNON_RHI_STATUS_OK)
@@ -155,25 +169,35 @@ struct RhiImage {
     ~RhiImage() { vernonRhiDeviceDestroyImage(host->device, handle); }
 
     void upload(const nb::bytes &data) {
-        if (format != VERNON_TEXTURE_RGBA8_UNORM || !(usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION))
-            throw std::runtime_error("image does not support RGBA8 upload");
-        if (data.size() != static_cast<size_t>(width) * height * 4)
-            throw std::runtime_error("RHI image upload size does not match RGBA8 extent");
-        VernonRhiImageUploadDescriptor descriptor{};
-        descriptor.struct_size = sizeof(descriptor);
-        descriptor.width = width;
-        descriptor.height = height;
-        descriptor.depth = 1;
-        descriptor.source_format = VERNON_RHI_IMAGE_DATA_RGBA;
-        descriptor.source_type = VERNON_RHI_IMAGE_DATA_UINT8;
-        descriptor.data = data.c_str();
-        if (vernonRhiDeviceUploadImage(host->device, handle, &descriptor, 1) != VERNON_RHI_STATUS_OK)
+        if ((format != VERNON_TEXTURE_RGBA8_UNORM && format != VERNON_TEXTURE_D32_FLOAT) ||
+            !(usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION))
+            throw std::runtime_error("image format does not support upload");
+        const size_t layerSize = static_cast<size_t>(width) * height * 4;
+        if (data.size() != layerSize * layers)
+            throw std::runtime_error("RHI image upload size does not match its extent");
+        std::vector<VernonRhiImageUploadDescriptor> descriptors(layers);
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+            VernonRhiImageUploadDescriptor &descriptor = descriptors[layer];
+            descriptor.struct_size = sizeof(descriptor);
+            descriptor.array_layer = layer;
+            descriptor.width = width;
+            descriptor.height = height;
+            descriptor.depth = 1;
+            descriptor.source_format =
+                format == VERNON_TEXTURE_D32_FLOAT ? VERNON_RHI_IMAGE_DATA_DEPTH : VERNON_RHI_IMAGE_DATA_RGBA;
+            descriptor.source_type =
+                format == VERNON_TEXTURE_D32_FLOAT ? VERNON_RHI_IMAGE_DATA_FLOAT32 : VERNON_RHI_IMAGE_DATA_UINT8;
+            descriptor.data = data.c_str() + layerSize * layer;
+        }
+        if (vernonRhiDeviceUploadImage(host->device, handle, descriptors.data(), descriptors.size()) !=
+            VERNON_RHI_STATUS_OK)
             throw std::runtime_error("RHI image upload failed");
     }
     nb::bytes download() const {
-        if (format != VERNON_TEXTURE_RGBA8_UNORM || !(usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE))
-            throw std::runtime_error("image does not support RGBA8 download");
-        std::string data(static_cast<size_t>(width) * height * 4, '\0');
+        if ((format != VERNON_TEXTURE_RGBA8_UNORM && format != VERNON_TEXTURE_D32_FLOAT) ||
+            !(usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE))
+            throw std::runtime_error("image format does not support download");
+        std::string data(static_cast<size_t>(width) * height * layers * 4, '\0');
         if (vernonRhiDeviceDownloadImage(host->device, handle, data.data(), data.size()) != VERNON_RHI_STATUS_OK)
             throw std::runtime_error("RHI image download failed: " +
                                      stringView(vernonRhiDeviceGetLastError(host->device)));
@@ -185,19 +209,23 @@ struct RhiImage {
     uint32_t width{};
     uint32_t height{};
     VernonTextureFormat format{};
+    VernonTextureDimension dimension{};
     uint32_t usage{};
+    uint32_t layers{1};
 };
 
 struct RhiSampler {
-    explicit RhiSampler(std::shared_ptr<RhiHostState> host) : host(std::move(host)) {
+    RhiSampler(std::shared_ptr<RhiHostState> host, VernonRhiSamplerAddressMode address) : host(std::move(host)) {
+        if (address > VERNON_RHI_ADDRESS_MIRRORED_REPEAT)
+            throw std::invalid_argument("unsupported sampler address mode");
         VernonRhiSamplerDescriptor descriptor{};
         descriptor.struct_size = sizeof(descriptor);
         descriptor.min_filter = VERNON_RHI_FILTER_LINEAR;
         descriptor.mag_filter = VERNON_RHI_FILTER_LINEAR;
         descriptor.mip_filter = VERNON_RHI_FILTER_LINEAR;
-        descriptor.address_u = VERNON_RHI_ADDRESS_REPEAT;
-        descriptor.address_v = VERNON_RHI_ADDRESS_REPEAT;
-        descriptor.address_w = VERNON_RHI_ADDRESS_REPEAT;
+        descriptor.address_u = address;
+        descriptor.address_v = address;
+        descriptor.address_w = address;
         descriptor.max_anisotropy = 1.0f;
         if (vernonRhiDeviceCreateSampler(this->host->device, &descriptor, &handle) != VERNON_RHI_STATUS_OK)
             throw std::runtime_error("cannot create Vernon RHI sampler");
@@ -229,10 +257,15 @@ struct RhiHost {
     }
 
     std::unique_ptr<RhiBuffer> createBuffer(size_t size) { return std::make_unique<RhiBuffer>(state, size); }
-    std::unique_ptr<RhiImage> createImage(uint32_t width, uint32_t height) {
-        return std::make_unique<RhiImage>(state, width, height, VERNON_TEXTURE_RGBA8_UNORM,
-                                          VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION |
-                                              VERNON_RHI_IMAGE_SAMPLED | VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
+    std::unique_ptr<RhiImage> createImage(uint32_t width, uint32_t height, VernonTextureFormat format,
+                                          VernonTextureDimension dimension) {
+        if (dimension == VERNON_TEXTURE_CUBE && format != VERNON_TEXTURE_RGBA8_UNORM)
+            throw std::invalid_argument("cube textures currently require RGBA8 format");
+        uint32_t usage =
+            VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION | VERNON_RHI_IMAGE_SAMPLED;
+        usage |= format == VERNON_TEXTURE_D32_FLOAT ? VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT
+                                                    : VERNON_RHI_IMAGE_COLOR_ATTACHMENT;
+        return std::make_unique<RhiImage>(state, width, height, format, dimension, usage);
     }
     std::unique_ptr<RhiImage> createAttachmentImage(uint32_t width, uint32_t height, VernonTextureFormat format,
                                                     uint32_t usage) {
@@ -244,9 +277,11 @@ struct RhiHost {
         const bool depthUsage = (usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) != 0;
         if (depthFormat != depthUsage || (depthUsage && (usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)))
             throw std::invalid_argument("attachment image format does not match its usage");
-        return std::make_unique<RhiImage>(state, width, height, format, usage);
+        return std::make_unique<RhiImage>(state, width, height, format, VERNON_TEXTURE_2D, usage);
     }
-    std::unique_ptr<RhiSampler> createSampler() { return std::make_unique<RhiSampler>(state); }
+    std::unique_ptr<RhiSampler> createSampler(VernonRhiSamplerAddressMode address) {
+        return std::make_unique<RhiSampler>(state, address);
+    }
     std::unique_ptr<Runtime> createRuntime();
     std::unique_ptr<PythonExecutionGraph> createExecutionGraph();
     void synchronize() {
@@ -277,13 +312,14 @@ struct PythonRenderPass final : vernon::execution::RenderPass {
     VernonRhiStatus execute(vernon::execution::GraphicsEncoder &encoder,
                             const vernon::execution::ExecutionResources &) override;
 
-    void use(const PythonGraphResource &resource, vernon::execution::AccessMode access, VernonRhiResourceState state) {
+    void use(const PythonGraphResource &resource, vernon::execution::AccessMode access, VernonRhiResourceState state,
+             uint32_t stageMask) {
         if (access == vernon::execution::AccessMode::Read)
-            read(resource.resource, state);
+            read(resource.resource, state, stageMask);
         else if (access == vernon::execution::AccessMode::Write)
-            write(resource.resource, state);
+            write(resource.resource, state, stageMask);
         else
-            readWrite(resource.resource, state);
+            readWrite(resource.resource, state, stageMask);
     }
 
     void addColor(uint32_t location, const PythonGraphResource &resource, VernonRhiLoadOperation load,
@@ -331,13 +367,14 @@ struct PythonComputePass final : vernon::execution::ComputePass {
     VernonRhiStatus execute(vernon::execution::ComputeEncoder &encoder,
                             const vernon::execution::ExecutionResources &) override;
 
-    void use(const PythonGraphResource &resource, vernon::execution::AccessMode access, VernonRhiResourceState state) {
+    void use(const PythonGraphResource &resource, vernon::execution::AccessMode access, VernonRhiResourceState state,
+             uint32_t stageMask) {
         if (access == vernon::execution::AccessMode::Read)
-            read(resource.resource, state);
+            read(resource.resource, state, stageMask);
         else if (access == vernon::execution::AccessMode::Write)
-            write(resource.resource, state);
+            write(resource.resource, state, stageMask);
         else
-            readWrite(resource.resource, state);
+            readWrite(resource.resource, state, stageMask);
     }
 
     PythonExecutionGraph *graph{};
@@ -382,8 +419,8 @@ struct PythonExecutionGraph {
         if (image.host != host)
             throw std::invalid_argument("image belongs to another execution graph device");
         const VernonRhiImageView view{image.handle.index, image.handle.generation};
-        return PythonGraphResource(
-            graph.importImage(image.handle, view, rhiFormat(image.format), image.width, image.height, 1, 1, exported));
+        return PythonGraphResource(graph.importImage(image.handle, view, rhiFormat(image.format), image.width,
+                                                     image.height, image.layers, 1, exported));
     }
 
     void compile() {
@@ -765,7 +802,7 @@ struct PipelineInvocationBuilder {
             throw std::invalid_argument("RHI sampler belongs to another Runtime device");
         argument.value.texture.format = texture->format;
         argument.value.texture.access = parameter.access;
-        argument.value.texture.dimension = VERNON_TEXTURE_2D;
+        argument.value.texture.dimension = texture->dimension;
         argument.value.texture.width = texture->width;
         argument.value.texture.height = texture->height;
         argument.value.texture.depth = 1;
@@ -1228,6 +1265,14 @@ NB_MODULE(_native, module) {
         .value("RGB8_UNORM", VERNON_TEXTURE_RGB8_UNORM)
         .value("R11G11B10_FLOAT", VERNON_TEXTURE_R11G11B10_FLOAT)
         .value("D32_FLOAT", VERNON_TEXTURE_D32_FLOAT);
+    nb::enum_<VernonTextureDimension>(module, "TextureDimension")
+        .value("TEXTURE_2D", VERNON_TEXTURE_2D)
+        .value("TEXTURE_3D", VERNON_TEXTURE_3D)
+        .value("CUBE", VERNON_TEXTURE_CUBE);
+    nb::enum_<VernonRhiSamplerAddressMode>(module, "SamplerAddressMode")
+        .value("REPEAT", VERNON_RHI_ADDRESS_REPEAT)
+        .value("CLAMP_TO_EDGE", VERNON_RHI_ADDRESS_CLAMP_TO_EDGE)
+        .value("MIRRORED_REPEAT", VERNON_RHI_ADDRESS_MIRRORED_REPEAT);
     module.attr("IMAGE_COLOR_ATTACHMENT") = static_cast<uint32_t>(VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
     module.attr("IMAGE_DEPTH_STENCIL_ATTACHMENT") = static_cast<uint32_t>(VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT);
     nb::class_<Compiler>(module, "Compiler")
@@ -1253,9 +1298,10 @@ NB_MODULE(_native, module) {
         .def_static("create_external_opengl", &RhiHost::createExternalOpenGL, nb::arg("backend"), nb::arg("user_data"),
                     nb::arg("make_current"), nb::arg("get_proc_address"), nb::arg("api_major"), nb::arg("api_minor"))
         .def("create_buffer", &RhiHost::createBuffer)
-        .def("create_image", &RhiHost::createImage)
+        .def("create_image", &RhiHost::createImage, nb::arg("width"), nb::arg("height"),
+             nb::arg("format") = VERNON_TEXTURE_RGBA8_UNORM, nb::arg("dimension") = VERNON_TEXTURE_2D)
         .def("create_attachment_image", &RhiHost::createAttachmentImage)
-        .def("create_sampler", &RhiHost::createSampler)
+        .def("create_sampler", &RhiHost::createSampler, nb::arg("address") = VERNON_RHI_ADDRESS_REPEAT)
         .def("create_runtime", &RhiHost::createRuntime, nb::keep_alive<0, 1>())
         .def("create_execution_graph", &RhiHost::createExecutionGraph)
         .def("synchronize", &RhiHost::synchronize);
@@ -1279,14 +1325,16 @@ NB_MODULE(_native, module) {
     nb::class_<PythonRenderPass, vernon::execution::ExecutionPass>(module, "_RenderPass")
         .def(
             "use",
-            [](PythonRenderPass &pass, const PythonGraphResource &resource, uint32_t access, uint32_t state) {
+            [](PythonRenderPass &pass, const PythonGraphResource &resource, uint32_t access, uint32_t state,
+               uint32_t stageMask) {
                 if (access > static_cast<uint32_t>(vernon::execution::AccessMode::ReadWrite) ||
-                    state > static_cast<uint32_t>(VERNON_RHI_STATE_PRESENT))
+                    state > static_cast<uint32_t>(VERNON_RHI_STATE_PRESENT) ||
+                    (stageMask & ~(VERNON_RHI_STAGE_VERTEX | VERNON_RHI_STAGE_FRAGMENT)) != 0)
                     throw std::invalid_argument("invalid execution graph resource use");
                 pass.use(resource, static_cast<vernon::execution::AccessMode>(access),
-                         static_cast<VernonRhiResourceState>(state));
+                         static_cast<VernonRhiResourceState>(state), stageMask);
             },
-            nb::arg("resource"), nb::arg("access"), nb::arg("state"))
+            nb::arg("resource"), nb::arg("access"), nb::arg("state"), nb::arg("stage_mask"))
         .def(
             "color",
             [](PythonRenderPass &pass, uint32_t location, const PythonGraphResource &resource, uint32_t load,
@@ -1322,14 +1370,16 @@ NB_MODULE(_native, module) {
     nb::class_<PythonComputePass, vernon::execution::ExecutionPass>(module, "_ComputePass")
         .def(
             "use",
-            [](PythonComputePass &pass, const PythonGraphResource &resource, uint32_t access, uint32_t state) {
+            [](PythonComputePass &pass, const PythonGraphResource &resource, uint32_t access, uint32_t state,
+               uint32_t stageMask) {
                 if (access > static_cast<uint32_t>(vernon::execution::AccessMode::ReadWrite) ||
-                    state > static_cast<uint32_t>(VERNON_RHI_STATE_PRESENT))
+                    state > static_cast<uint32_t>(VERNON_RHI_STATE_PRESENT) ||
+                    (stageMask & ~VERNON_RHI_STAGE_COMPUTE) != 0)
                     throw std::invalid_argument("invalid execution graph resource use");
                 pass.use(resource, static_cast<vernon::execution::AccessMode>(access),
-                         static_cast<VernonRhiResourceState>(state));
+                         static_cast<VernonRhiResourceState>(state), stageMask);
             },
-            nb::arg("resource"), nb::arg("access"), nb::arg("state"));
+            nb::arg("resource"), nb::arg("access"), nb::arg("state"), nb::arg("stage_mask"));
     nb::class_<PythonCompiledBarrier>(module, "_CompiledBarrier")
         .def_ro("source_stage_mask", &PythonCompiledBarrier::sourceStageMask)
         .def_ro("destination_stage_mask", &PythonCompiledBarrier::destinationStageMask)
@@ -1459,6 +1509,9 @@ NB_MODULE(_native, module) {
     module.attr("GRAPH_READ_WRITE") = static_cast<uint32_t>(vernon::execution::AccessMode::ReadWrite);
     module.attr("GRAPH_SHADER_READ") = static_cast<uint32_t>(VERNON_RHI_STATE_SHADER_READ);
     module.attr("GRAPH_SHADER_WRITE") = static_cast<uint32_t>(VERNON_RHI_STATE_SHADER_WRITE);
+    module.attr("GRAPH_STAGE_COMPUTE") = static_cast<uint32_t>(VERNON_RHI_STAGE_COMPUTE);
+    module.attr("GRAPH_STAGE_VERTEX") = static_cast<uint32_t>(VERNON_RHI_STAGE_VERTEX);
+    module.attr("GRAPH_STAGE_FRAGMENT") = static_cast<uint32_t>(VERNON_RHI_STAGE_FRAGMENT);
     module.attr("GRAPH_PASS_NEVER_CULL") = static_cast<uint32_t>(vernon::execution::PassNeverCull);
     module.attr("GRAPH_PASS_NO_MERGE") = static_cast<uint32_t>(vernon::execution::PassNoMerge);
     module.attr("GRAPH_PASS_SIDE_EFFECT") = static_cast<uint32_t>(vernon::execution::PassSideEffect);

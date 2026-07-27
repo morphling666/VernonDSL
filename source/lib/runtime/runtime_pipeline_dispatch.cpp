@@ -17,6 +17,7 @@
 
 #if defined(VERNON_RUNTIME_TESTING)
 #include "rhi/rhi_test_hooks.h"
+#include "rhi_adapter/adapter_test_hooks.h"
 #include "runtime_test_hooks.h"
 #endif
 
@@ -136,6 +137,27 @@ size_t getDirectX12GraphicsRootSignatureCreationCount(const VernonLoadedPipeline
     (void)pipeline;
 #endif
     return 0;
+}
+
+size_t getRhiAdapterRecordedCommandCount(const VernonRuntimeContext *context) {
+    if (!context)
+        return 0;
+    const VernonRuntimeRhiAdapter *adapter = nullptr;
+    if (context->backend == VERNON_RUNTIME_OPENGL || context->backend == VERNON_RUNTIME_OPENGL_ES)
+        adapter = runtimeBackendState<OpenGLContextState>(*context).adapter;
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+    else if (context->backend == VERNON_RUNTIME_VULKAN)
+        adapter = runtimeBackendState<VulkanContextState>(*context).adapter;
+#endif
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+    else if (context->backend == VERNON_RUNTIME_DIRECTX12)
+        adapter = runtimeBackendState<DirectX12ContextState>(*context).adapter;
+#endif
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+    else if (context->backend == VERNON_RUNTIME_CUDA)
+        adapter = runtimeBackendState<CudaContextState>(*context).adapter;
+#endif
+    return adapter ? getRhiAdapterPreparationStats(*adapter).dispatches : 0;
 }
 #endif
 

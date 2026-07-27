@@ -91,6 +91,7 @@ typedef struct VernonRuntimeProviderBindingLayoutEntry {
     uint32_t element_count;
     uint32_t vector_count;
     uint32_t divisor;
+    uint32_t element_alignment;
 } VernonRuntimeProviderBindingLayoutEntry;
 
 typedef struct VernonRuntimeProviderVertexAttribute {

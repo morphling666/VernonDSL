@@ -145,6 +145,7 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
             const ParameterUse &use = parameter.uses[0];
             Candidate candidate;
             candidate.layout.slot = slot;
+            candidate.layout.argument_index = use.index;
             candidate.layout.stage_mask =
                 use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
             candidate.layout.array_count = 1;
@@ -180,6 +181,11 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 candidate.layout.element_size = static_cast<uint32_t>(physicalSize);
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
                 candidate.layout.element_count = static_cast<uint32_t>(count);
+                candidate.layout.vector_count = shape.size() == 2 ? static_cast<uint32_t>(shape[0]) : 1;
+                const uint64_t physicalAlignment = use.uniformLayout ? use.uniformLayout->alignment : elementSize;
+                if (!physicalAlignment || physicalAlignment > UINT32_MAX)
+                    return false;
+                candidate.layout.element_alignment = static_cast<uint32_t>(physicalAlignment);
                 candidate.layout.binding = use.binding;
                 candidate.layout.set = use.descriptorSet;
                 candidate.binding.source = internal ? VulkanPipelineState::Binding::RESOLUTION

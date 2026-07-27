@@ -1,6 +1,7 @@
 #include "VernonExecutionGraph.h"
 #include "VernonRuntime.h"
 #include "runtime/content_hash.h"
+#include "runtime/runtime_test_hooks.h"
 #include "runtime_rhi_test_utils.h"
 
 #include <nlohmann/json.hpp>
@@ -680,10 +681,11 @@ TEST(RuntimeExternalGl, InvokesDirectComputePipelineThroughRuntimeCoreProvider) 
         vernon::tests::createBuffer(rhiRuntime(gl), 4 * sizeof(float), alignof(float), VERNON_RHI_BUFFER_STORAGE);
     ASSERT_NE(replacement.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     EXPECT_NE(replacement.handle.index, buffer.handle.index);
-    EXPECT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK);
-    EXPECT_EQ(dispatchCount, 2u);
-    EXPECT_EQ(storageBindingCount, 4u);
-    EXPECT_EQ(memoryBarrierCount, 2u);
+    for (size_t iteration = 0; iteration < 128; ++iteration)
+        ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK);
+    EXPECT_EQ(dispatchCount, 129u);
+    EXPECT_EQ(storageBindingCount, 258u);
+    EXPECT_EQ(memoryBarrierCount, 129u);
 
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     auto recycled =
@@ -913,6 +915,7 @@ TEST(RuntimeExternalGl, ExecutionGraphFusesDrawsAndSubmitsOnce) {
         invalidateCount = 0;
         lastMemoryBarrierBits = 0;
         framebufferBindCount = 0;
+        const size_t commandsBeforeGraph = vernon::runtime::getRhiAdapterRecordedCommandCount(gl);
         vernon::execution::ExecutionGraph graph(rhiRuntime(gl).device);
         const auto graphTarget = graph.importImage(target.handle, {target.handle.index, target.handle.generation},
                                                    VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 12, 1, 1, true);
@@ -933,6 +936,7 @@ TEST(RuntimeExternalGl, ExecutionGraphFusesDrawsAndSubmitsOnce) {
         EXPECT_EQ(invalidateCount, 1u);
         EXPECT_NE(lastMemoryBarrierBits & 0x00000400u, 0u);
         EXPECT_EQ(framebufferBindCount, 1u);
+        EXPECT_EQ(vernon::runtime::getRhiAdapterRecordedCommandCount(gl) - commandsBeforeGraph, 2u);
         ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, replacement.handle), VERNON_RHI_STATUS_OK);
     }
 

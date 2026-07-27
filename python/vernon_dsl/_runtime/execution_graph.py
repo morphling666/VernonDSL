@@ -247,6 +247,11 @@ class ExecutionPass:
         graph_resource = resource if isinstance(resource, GraphResource) else self._graph.import_resource(resource)
         self._graph._validate_resource(graph_resource)
         native = _session_state()._native
+        stage_mask = (
+            native.GRAPH_STAGE_COMPUTE
+            if isinstance(self, ComputePass)
+            else native.GRAPH_STAGE_VERTEX | native.GRAPH_STAGE_FRAGMENT
+        )
         self._native_pass.use(
             graph_resource._native,
             {
@@ -255,6 +260,7 @@ class ExecutionPass:
                 "read_write": native.GRAPH_READ_WRITE,
             }[access],
             native.GRAPH_SHADER_READ if access == "read" else native.GRAPH_SHADER_WRITE,
+            stage_mask,
         )
 
     def _native_declare(self) -> None:
@@ -524,8 +530,8 @@ class ExecutionGraph:
             not isinstance(resource, GraphResource)
             or resource._owner is not self._owner
             or resource._generation != self._generation
-            or resource.id >= len(self._resources)
-            or self._resources[resource.id] is not resource
+            or resource.id != resource._native.id
+            or not any(candidate is resource for candidate in self._resources)
         ):
             raise ValueError("resource does not belong to this execution graph")
 

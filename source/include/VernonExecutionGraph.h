@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -19,6 +20,7 @@ enum class AccessMode : uint8_t { Read, Write, ReadWrite };
 struct GraphResource {
     uint32_t id{UINT32_MAX};
     ResourceKind kind{ResourceKind::Buffer};
+    uint64_t graphIdentity{};
 };
 
 struct GraphBuffer : GraphResource {
@@ -106,13 +108,17 @@ public:
     void dependsOn(ExecutionPass &dependency);
     void setFlags(uint32_t flags);
     uint32_t flags() const { return flags_; }
+    const std::vector<ResourceUse> &uses() const { return uses_; }
 
     virtual void declare() = 0;
 
 protected:
-    void read(GraphResource resource, VernonRhiResourceState state = VERNON_RHI_STATE_SHADER_READ);
-    void write(GraphResource resource, VernonRhiResourceState state = VERNON_RHI_STATE_SHADER_WRITE);
-    void readWrite(GraphResource resource, VernonRhiResourceState state = VERNON_RHI_STATE_SHADER_WRITE);
+    void read(GraphResource resource, VernonRhiResourceState state = VERNON_RHI_STATE_SHADER_READ,
+              uint32_t stageMask = 0);
+    void write(GraphResource resource, VernonRhiResourceState state = VERNON_RHI_STATE_SHADER_WRITE,
+               uint32_t stageMask = 0);
+    void readWrite(GraphResource resource, VernonRhiResourceState state = VERNON_RHI_STATE_SHADER_WRITE,
+                   uint32_t stageMask = 0);
 
 private:
     friend class ExecutionGraph;
@@ -195,9 +201,12 @@ private:
     };
 
     VernonRhiDevice device_;
+    uint64_t graphIdentity_{};
     std::vector<std::unique_ptr<ExecutionPass>> passes_;
     std::vector<GraphResource> resources_;
     std::vector<ResourceRecord> resourceRecords_;
+    std::unordered_map<uint64_t, uint32_t> importedBuffers_;
+    std::unordered_map<uint64_t, uint32_t> importedImages_;
     std::vector<uint32_t> schedule_;
     std::vector<CompiledScope> scopes_;
     VernonRhiCommandEncoderStats lastStats_{};

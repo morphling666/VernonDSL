@@ -25,6 +25,7 @@ VERNON_RUNTIME_CAPI VulkanGraphicsCacheStats getVulkanGraphicsCacheStats(const V
                                                                          const VernonLoadedPipeline *pipeline);
 VERNON_RUNTIME_CAPI size_t getDirectX12GraphicsPipelineCreationCount(const VernonLoadedPipeline *pipeline);
 VERNON_RUNTIME_CAPI size_t getDirectX12GraphicsRootSignatureCreationCount(const VernonLoadedPipeline *pipeline);
+VERNON_RUNTIME_CAPI size_t getRhiAdapterRecordedCommandCount(const VernonRuntimeContext *context);
 
 } // namespace vernon::runtime
 

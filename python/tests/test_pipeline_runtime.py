@@ -24,6 +24,7 @@ from aggregate_vertex_shader import (
 from pipeline_shader import (
     colored_fragment,
     copy_static_tensor_value,
+    cube_direction_fragment,
     depth_fragment,
     depth_vertex,
     divisor_two_attribute_vertex,
@@ -35,9 +36,11 @@ from pipeline_shader import (
     mat2_vertex,
     matrix_elementwise_fragment,
     matrix_vertex,
+    mixed_uniform_fragment,
     non_square_attribute_vertex,
     numpy_tensor_fragment,
     numpy_tensor_vertex,
+    optional_texture_fragment,
     oversized_tensor_attribute_vertex,
     rank_three_tensor_attribute_vertex,
     solid_fragment,
@@ -74,6 +77,24 @@ class RenderTargetTests(unittest.TestCase):
         target.attach_depth(format=vd.depth32)
         with self.assertRaisesRegex(ValueError, "already has"):
             target.attach_depth(format=vd.depth32)
+
+    def test_generic_depth_and_cube_texture_validation(self) -> None:
+        depth = vd.Texture.zeros(shape=(16, 16), format=vd.depth32)
+        target = vd.RenderTarget(shape=depth.shape).attach_depth(texture=depth)
+        self.assertEqual(target.shape, (16, 16))
+        self.assertEqual(depth.to_numpy().dtype, np.float32)
+
+        faces = np.zeros((6, 8, 8, 4), dtype=np.uint8)
+        cube = vd.Texture.cube(faces)
+        self.assertEqual(cube.shape, (8, 8))
+        np.testing.assert_array_equal(cube.to_numpy(), faces)
+
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            vd.RenderTarget(shape=(16, 16)).attach_depth()
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            vd.RenderTarget(shape=(16, 16)).attach_depth(format=vd.depth32, texture=depth)
+        with self.assertRaisesRegex(ValueError, "6"):
+            vd.Texture.cube(np.zeros((5, 8, 8, 4), dtype=np.uint8))
 
 
 def assert_depth_attachment_selects_nearest(test: unittest.TestCase) -> None:
@@ -282,6 +303,120 @@ def assert_matrix_uniform_transforms_vertices(test: unittest.TestCase) -> None:
     pixels = target.to_numpy()
     test.assertGreater(int(pixels[32, 48, 0]), 240)
     test.assertEqual(tuple(pixels[32, 16]), (0, 0, 0, 0))
+
+
+def assert_mixed_uniform_layout_renders(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+    target = vd.Texture.zeros(shape=(32, 32))
+    render = vd.pipeline(triangle_vertex, mixed_uniform_fragment)
+
+    render(
+        position=positions,
+        first=np.array((0.05, 0.1, 0.15), dtype=np.float32),
+        second=np.array((0.2, 0.25, 0.3), dtype=np.float32),
+        scale=np.float32(0.35),
+        bias=np.float32(0.4),
+        uv=np.array((0.45, 0.5), dtype=np.float32),
+        texel=np.array((0.55, 0.6), dtype=np.float32),
+        target=render_target(target),
+    )
+
+    np.testing.assert_allclose(
+        target.to_numpy()[16, 16],
+        np.array((64, 115, 140, 255), dtype=np.uint8),
+        atol=1,
+    )
+
+    render(
+        position=positions,
+        first=np.array((0.1, 0.2, 0.3), dtype=np.float32),
+        second=np.array((0.4, 0.5, 0.6), dtype=np.float32),
+        scale=np.float32(0.1),
+        bias=np.float32(0.2),
+        uv=np.array((0.2, 0.3), dtype=np.float32),
+        texel=np.array((0.4, 0.5), dtype=np.float32),
+        target=render_target(target),
+    )
+    np.testing.assert_allclose(
+        target.to_numpy()[16, 16],
+        np.array((128, 77, 128, 153), dtype=np.uint8),
+        atol=1,
+    )
+
+
+def assert_cube_faces_remain_distinct(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+    colors = np.array(
+        (
+            (255, 0, 0, 255),
+            (0, 255, 0, 255),
+            (0, 0, 255, 255),
+            (255, 255, 0, 255),
+            (255, 0, 255, 255),
+            (0, 255, 255, 255),
+        ),
+        dtype=np.uint8,
+    )
+    faces = np.broadcast_to(colors[:, None, None, :], (6, 2, 2, 4)).copy()
+    image = vd.Texture.cube(faces)
+    sampler = vd.sampler(address="clamp_to_edge")
+    render = vd.pipeline(triangle_vertex, cube_direction_fragment)
+    directions = np.concatenate((np.eye(3, dtype=np.float32), -np.eye(3, dtype=np.float32)))
+    face_order = (0, 2, 4, 1, 3, 5)
+
+    for direction, face in zip(directions, face_order, strict=True):
+        target = vd.Texture.zeros(shape=(8, 8))
+        render(
+            position=positions,
+            direction=np.ascontiguousarray(direction),
+            image=image,
+            sampler=sampler,
+            target=render_target(target),
+        )
+        np.testing.assert_array_equal(target.to_numpy()[4, 4], colors[face])
+
+    target = vd.Texture.zeros(shape=(8, 8))
+    render(
+        position=positions,
+        direction=np.array((1.0, 0.0, 0.99), dtype=np.float32),
+        image=image,
+        sampler=sampler,
+        target=render_target(target),
+    )
+    seam_pixel = target.to_numpy()[4, 4]
+    test.assertGreater(int(seam_pixel[0]), 240)
+    test.assertLess(int(seam_pixel[1]), 16)
+    test.assertGreater(int(seam_pixel[2]), 80)
+    test.assertLess(int(seam_pixel[2]), 180)
+
+
+def assert_inactive_texture_binding_renders(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+    base_image = vd.Texture.from_numpy(np.full((2, 2, 4), (0, 255, 0, 255), dtype=np.uint8))
+    optional_image = vd.Texture.from_numpy(np.full((2, 2, 4), (255, 0, 0, 255), dtype=np.uint8))
+    target = vd.Texture.zeros(shape=(8, 8))
+
+    vd.pipeline(triangle_vertex, optional_texture_fragment)(
+        position=positions,
+        base_image=base_image,
+        base_sampler=vd.sampler(),
+        optional_image=optional_image,
+        optional_sampler=vd.sampler(),
+        target=render_target(target),
+    )
+
+    np.testing.assert_array_equal(target.to_numpy()[4, 4], np.array((0, 255, 0, 255), dtype=np.uint8))
+
+    enabled_target = vd.Texture.zeros(shape=(8, 8))
+    vd.pipeline(triangle_vertex, optional_texture_fragment, features={"OPTIONAL_IMAGE"})(
+        position=positions,
+        base_image=base_image,
+        base_sampler=vd.sampler(),
+        optional_image=optional_image,
+        optional_sampler=vd.sampler(),
+        target=render_target(enabled_target),
+    )
+    np.testing.assert_array_equal(enabled_target.to_numpy()[4, 4], np.array((255, 0, 0, 255), dtype=np.uint8))
 
 
 def assert_mat2_uniform_transforms_vertices(test: unittest.TestCase) -> None:
@@ -615,6 +750,15 @@ class OpenGLPipelineTests(unittest.TestCase):
     def test_matrix_uniform_transforms_vertices(self) -> None:
         assert_matrix_uniform_transforms_vertices(self)
 
+    def test_mixed_uniform_layout_renders(self) -> None:
+        assert_mixed_uniform_layout_renders(self)
+
+    def test_cube_faces_remain_distinct(self) -> None:
+        assert_cube_faces_remain_distinct(self)
+
+    def test_inactive_texture_binding_renders(self) -> None:
+        assert_inactive_texture_binding_renders(self)
+
     def test_mat2_uniform_transforms_vertices(self) -> None:
         assert_mat2_uniform_transforms_vertices(self)
 
@@ -827,6 +971,15 @@ class VulkanPipelineTests(unittest.TestCase):
     def test_matrix_uniform_transforms_vertices(self) -> None:
         assert_matrix_uniform_transforms_vertices(self)
 
+    def test_mixed_uniform_layout_renders(self) -> None:
+        assert_mixed_uniform_layout_renders(self)
+
+    def test_cube_faces_remain_distinct(self) -> None:
+        assert_cube_faces_remain_distinct(self)
+
+    def test_inactive_texture_binding_renders(self) -> None:
+        assert_inactive_texture_binding_renders(self)
+
     def test_mat2_uniform_transforms_vertices(self) -> None:
         assert_mat2_uniform_transforms_vertices(self)
 
@@ -961,6 +1114,15 @@ class DirectXPipelineTests(unittest.TestCase):
 
     def test_matrix_uniform_transforms_vertices(self) -> None:
         assert_matrix_uniform_transforms_vertices(self)
+
+    def test_mixed_uniform_layout_renders(self) -> None:
+        assert_mixed_uniform_layout_renders(self)
+
+    def test_cube_faces_remain_distinct(self) -> None:
+        assert_cube_faces_remain_distinct(self)
+
+    def test_inactive_texture_binding_renders(self) -> None:
+        assert_inactive_texture_binding_renders(self)
 
     def test_mat2_uniform_transforms_vertices(self) -> None:
         assert_mat2_uniform_transforms_vertices(self)

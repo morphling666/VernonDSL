@@ -120,6 +120,22 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     EXPECT_NEAR(pixels[center + 1], color[1], 2);
     EXPECT_NEAR(pixels[center + 2], color[2], 2);
 
+    const size_t commandsBeforeGraph = vernon::runtime::getRhiAdapterRecordedCommandCount(runtime);
+    {
+        vernon::execution::ExecutionGraph graph(context.device);
+        const auto graphTarget = graph.importImage(target.handle, {target.handle.index, target.handle.generation},
+                                                   VERNON_RHI_FORMAT_RGBA8_UNORM, 32, 32, 1, 1, true);
+        graph.emplacePass<vernon::tests::RuntimeGraphRenderPass>("first", graphTarget, runtime, pipeline, &invocation,
+                                                                 VERNON_RHI_LOAD_CLEAR);
+        graph.emplacePass<vernon::tests::RuntimeGraphRenderPass>("second", graphTarget, runtime, pipeline, &invocation,
+                                                                 VERNON_RHI_LOAD_PRESERVE);
+        ASSERT_EQ(graph.execute(), VERNON_RHI_STATUS_OK);
+        EXPECT_EQ(graph.lastStats().rendering_scope_count, 1u);
+        EXPECT_EQ(graph.lastStats().draw_count, 2u);
+        EXPECT_EQ(graph.lastStats().submission_count, 1u);
+    }
+    EXPECT_EQ(vernon::runtime::getRhiAdapterRecordedCommandCount(runtime) - commandsBeforeGraph, 2u);
+
     EXPECT_EQ(vernonRhiDeviceDestroySampler(context.device, sampler.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(context.device, target.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(context.device, sampled.handle), VERNON_RHI_STATUS_OK);

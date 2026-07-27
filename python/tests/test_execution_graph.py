@@ -75,6 +75,23 @@ class ExecutionGraphTests(unittest.TestCase):
         self.assertEqual(events, ["producer", "consumer"])
         self.assertEqual(len(graph.scopes[1].barriers), 1)
 
+    def test_sampled_depth_target_and_texture_share_graph_identity(self) -> None:
+        graph = vd.ExecutionGraph()
+        events: list[str] = []
+        depth = vd.Texture.zeros(shape=(8, 8), format=vd.depth32)
+        color = vd.Texture.zeros(shape=(8, 8))
+        target = vd.RenderTarget(shape=(8, 8)).attach_color(0, color).attach_depth(texture=depth)
+        writer = RecordingRenderPass("shadow", events, target)
+        reader = RecordingComputePass("sample", events, read=depth)
+        reader.side_effect = True
+        graph.add_pass(writer)
+        graph.add_pass(reader)
+
+        graph.compile()
+
+        self.assertEqual([execution_pass.name for execution_pass in graph.schedule], ["shadow", "sample"])
+        self.assertEqual(len(graph.scopes[1].barriers), 1)
+
     def test_dependency_cycle_is_rejected(self) -> None:
         graph = vd.ExecutionGraph()
         events: list[str] = []

@@ -39,6 +39,7 @@ constexpr Enum kTexture2D = 0x0DE1;
 constexpr Enum kTexture3D = 0x806F;
 constexpr Enum kTextureCubeMap = 0x8513;
 constexpr Enum kTextureCubeMapPositiveX = 0x8515;
+constexpr Enum kTextureCubeMapSeamless = 0x884F;
 constexpr Enum kTexture0 = 0x84C0;
 constexpr Enum kFramebuffer = 0x8D40;
 constexpr Enum kColorAttachment0 = 0x8CE0;

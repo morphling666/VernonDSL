@@ -35,6 +35,13 @@ bool DeviceState::initialize(const VernonOpenGLContextCallbacks &contextCallback
     embeddedProfile = isEmbeddedProfile;
     if (!loadDriver(callbacks, driver, error))
         return false;
+    if (!embeddedProfile &&
+        (callbacks.api_version_major > 3 || (callbacks.api_version_major == 3 && callbacks.api_version_minor >= 2))) {
+        makeCurrent();
+        // Desktop GL otherwise clamps linear filtering at each cube face,
+        // exposing discontinuities that Vulkan and D3D12 filter across.
+        driver.enable(kTextureCubeMapSeamless);
+    }
     if (!supportsCompute() || (driver.dispatchCompute && driver.memoryBarrier))
         return true;
     error = "OpenGL context reports compute support but required compute functions are missing";

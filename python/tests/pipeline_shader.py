@@ -2,6 +2,8 @@ from typing import Annotated
 
 import vernon_dsl as vd
 
+OPTIONAL_IMAGE = vd.feature("OPTIONAL_IMAGE")
+
 
 @vd.kernel(workgroup_size=(2, 1, 1))
 def translate_vertices(
@@ -178,6 +180,41 @@ def colored_fragment(
     color: Annotated[vd.Vector[vd.f32, 4], vd.uniform()],
 ) -> vd.Vector[vd.f32, 4]:
     return color
+
+
+@vd.fragment
+def mixed_uniform_fragment(
+    first: Annotated[vd.Vector[vd.f32, 3], vd.uniform()],
+    second: Annotated[vd.Vector[vd.f32, 3], vd.uniform()],
+    scale: Annotated[vd.f32, vd.uniform()],
+    bias: Annotated[vd.f32, vd.uniform()],
+    uv: Annotated[vd.Vector[vd.f32, 2], vd.uniform()],
+    texel: Annotated[vd.Vector[vd.f32, 2], vd.uniform()],
+) -> vd.Vector[vd.f32, 4]:
+    return vd.Vector([first.x + second.x, first.y + scale, first.z + bias, uv.x + texel.x])
+
+
+@vd.fragment
+def cube_direction_fragment(
+    direction: Annotated[vd.Vector[vd.f32, 3], vd.uniform()],
+    image: Annotated[vd.Texture["cube", vd.f32], vd.resource(set=0, binding=0)],  # noqa: F722, F821
+    sampler: Annotated[vd.Sampler, vd.resource(set=0, binding=1)],
+) -> vd.Vector[vd.f32, 4]:
+    return vd.texture_sample(image, sampler, direction)
+
+
+@vd.fragment
+def optional_texture_fragment(
+    base_image: Annotated[vd.Texture["2d", vd.f32], vd.resource(set=0, binding=0)],  # noqa: F722, F821
+    base_sampler: Annotated[vd.Sampler, vd.resource(set=0, binding=1)],
+    optional_image: Annotated[vd.Texture["2d", vd.f32], vd.resource(set=0, binding=2)],  # noqa: F722, F821
+    optional_sampler: Annotated[vd.Sampler, vd.resource(set=0, binding=3)],
+) -> vd.Vector[vd.f32, 4]:
+    result = vd.texture_sample(base_image, base_sampler, vd.Vector([0.5, 0.5]))
+    optional = vd.texture_sample(optional_image, optional_sampler, vd.Vector([0.5, 0.5]))
+    if OPTIONAL_IMAGE:
+        result = optional
+    return result
 
 
 @vd.fragment

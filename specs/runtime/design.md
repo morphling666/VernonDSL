@@ -64,7 +64,18 @@ fragment blocks occupy disjoint ranges; Runtime relocates the fragment
 SPIR-V member offsets by the planned range base so one stage cannot overwrite
 the other stage's values. A negative Vulkan viewport height preserves the
 OpenGL clip-space and host-readback Y convention. One-mip RGBA8 Cube uploads
-store tightly packed faces in `+X, -X, +Y, -Y, +Z, -Z` order.
+store tightly packed faces in `+X, -X, +Y, -Y, +Z, -Z` order on Vulkan,
+D3D12, and OpenGL. D3D12 stages each array face in its own aligned placed
+footprint because `GetCopyableFootprints` reports per-call byte size
+independently of its base offset. Desktop OpenGL enables seamless cube-map
+filtering so linear samples crossing face boundaries match Vulkan and D3D12;
+OpenGL ES already requires seamless cube filtering. OpenGL feature variants
+retain stable logical parameter slots, but linked programs may optimize
+inactive uniforms away; provider preparation omits those locations and their
+paired sampler binds instead of treating a `-1` location as a malformed
+artifact. D3D12 sampled depth uses an R32 typeless allocation with a D32 DSV
+and R32 float SRV; Vulkan and OpenGL use their native D32 sampled depth
+formats.
 
 ## Python native module
 
@@ -95,6 +106,11 @@ RuntimeCore never owns textures, framebuffers, execution graphs, queues, or
 resource state. It transactionally retains opaque provider resource references
 held by prepared bindings. The provider owns allocation, logical records,
 barriers, submission, completion, and transient descriptor/upload storage.
+Python `Texture` owns generic 2D RGBA8, sampled D32, or six-face Cube image
+storage, while `RenderTarget` only groups attachment references. A D32
+`Texture` may therefore be written as an attachment and sampled by a dependent
+pass without a dedicated depth resource type. Immutable `SamplerState` objects
+bind shader `Sampler` parameters independently of image ownership.
 
 ## Reflection-driven structured Value binding
 
@@ -159,6 +175,16 @@ scope ends. Vulkan barriers map resource state plus explicit stage/access
 masks, OpenGL emits one merged destination barrier, and D3D12 emits UAV
 barriers for same-state write hazards.
 
+ExecutionGraph resource identity combines the owning graph with the RHI
+resource kind, slot, and generation. Re-importing one RHI image through
+different views shares one hazard identity while each attachment retains its
+view metadata. Render-pass fusion requires identical attachment geometry and
+read-only policy. An intermediate clear is encoded explicitly inside the
+scope; an intermediate discard, or preserve after a discarded store, splits
+the scope because retaining the attachment would change observable contents.
+Culled passes never record encoder references, and failed compilation discards
+its partial schedule and scopes before any command encoder is created.
+
 Runtime has no resource ownership API. GPU Tensor, image, sampler, index, and
 attachment bindings are `VernonRuntimeProviderResourceReference` values
 obtained from the same RHI device used to create Runtime. Host Tensor bindings
@@ -201,7 +227,15 @@ Small graphics uniforms use stage-local D3D12 root constants and Vulkan push
 constants instead of per-vertex buffers. Host matrices use the Python/NumPy
 row-major convention; Vulkan transposes square matrix payloads while packing
 push constants, while D3D12 HLSL and OpenGL consume the row-major payload
-through their native matrix binding conventions.
+through their native matrix binding conventions. Stable parameter slots remain
+name-sorted, but root/push-constant offsets follow each shader entry's source
+argument index; otherwise multiple same-stage matrices can be silently
+exchanged. Vulkan offsets also honor each reflected physical alignment. D3D12
+offsets follow HLSL constant-buffer register packing: scalar/vector values may
+share a 16-byte register but never cross one, while matrices and aggregate
+values begin on a new register. Encoding writes one contiguous root-constant
+or push-constant range per shader stage; changing only those inline values does
+not invalidate descriptor state.
 
 D3D12 NativeInterop uses external-recording ownership. Borrowed devices,
 queues, and open direct command lists are referenced without `AddRef`; imported
@@ -215,18 +249,25 @@ Vulkan loader dispatch and instance, physical/logical device, queue, command
 pool, buffer/memory, image/view/memory, and sampler ownership live in
 VernonRHI. Runtime keeps shader reflection and invocation compatibility while
 delegating allocation, destruction, command recording, submission, and device
-completion to the RHI device state.
+completion to the RHI device state. Owned-device indices use high-performance
+ordering on both desktop APIs: D3D12 follows DXGI GPU preference, while Vulkan
+orders usable discrete, integrated, virtual, and CPU devices, breaking
+same-type ties by device-local memory.
 
 Runtime-visible Vulkan buffers use device-local memory. Host transfers pass
-through persistent mapped upload/readback rings. One command buffer and fence
-are reused from the RHI-owned command pool. RuntimeCore opaque resource
+through persistent mapped upload/readback rings. Readback memory prefers a
+host-cached, host-coherent type and falls back to host-coherent memory when the
+device does not expose that combination. One command buffer and fence are
+reused from the RHI-owned command pool. RuntimeCore opaque resource
 references resolve generation-checked logical records to native buffer, image,
-or sampler state when bindings are encoded. Each binding revision used by an
-encoder owns an immutable descriptor-set snapshot plus one combined aligned
-inline buffer; command completion returns the set and buffer. Binding updates
-therefore cannot mutate earlier commands in the same encoder. Submission
-remains synchronous, so completed submissions safely reset transient ring
-offsets.
+or sampler state when bindings are encoded. Each resource-content revision
+owns an immutable descriptor-set snapshot plus one combined aligned inline
+buffer. Unchanged snapshots are shared across command encoders; in-flight
+command references retain stale revisions until completion, while the current
+revision stays cached with the prepared binding set. Binding updates therefore
+cannot mutate earlier commands, and push-constant-only animation does not
+allocate descriptor sets. Submission remains synchronous, so completed
+submissions safely reset transient ring offsets.
 
 Vulkan graphics prefers dynamic rendering when Vulkan 1.3, or Vulkan 1.2 with
 `VK_KHR_dynamic_rendering`, exposes the feature. Older devices use cached render
@@ -239,9 +280,33 @@ Rendering scopes carry explicit `Clear`, `Preserve`, or `Discard` load
 operations and `Preserve` or `Discard` store operations. Clear values belong to
 the attachment use, not the pipeline. An optional D32 attachment enables
 less-than depth testing and depth writes in Vulkan, D3D12, and OpenGL. Python
-groups external color textures and an optional target-owned render-only depth
-image in `RenderTarget`; sampled depth remains a generic texture format/usage
-extension because it requires an explicit shader-readable view contract.
+groups external color textures with either an internal render-only depth image
+or a generic sampled D32 `Texture` in `RenderTarget`. Importing that texture
+through both its resource and target identities resolves to one native graph
+resource, so attachment-to-sampling hazards remain visible.
+
+## PBR integration reference
+
+`examples/pbr.py` is the executable multi-pass graphics reference. A shadow
+pass writes a generic D32 texture; the dependent PBR pass samples that texture
+and an RGBA8 Cube environment through separate immutable samplers. The
+procedural cube and plane keep backend validation deterministic and avoid a
+model-loader dependency. The BRDF uses Cook-Torrance with the GGX distribution
+from Walter et al. (2007), Schlick Fresnel (1994), and the separable Smith
+masking approximation. These choices match the metallic-roughness workflow
+while keeping generated shaders small enough for all three desktop backends.
+Shadow visibility uses a fixed four-tap half-texel PCF kernel and a 0.004
+receiver bias; the compact deterministic kernel is intended for portability
+validation rather than production-quality filtering. Its sampler clamps at the
+edge. OpenGL shadow UV uses an upward Y scale, while Vulkan and D3D12 use a
+downward Y scale to match their render-target coordinate convention.
+
+Native backend graph tests observe adapter calls made after native draw or
+dispatch recording and assert one RHI submission per graph. The
+`VERNON_ENABLE_SANITIZERS` CMake option enables AddressSanitizer; lifetime
+stress repeatedly invokes prepared bindings after public owner destruction.
+Vulkan validation runs set `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`
+for the same graph and PBR tests.
 
 The deployable Runtime does not depend on LLVM, MLIR, GLFW, the CUDA Toolkit,
 or a statically linked Vulkan loader. Compiler and asset cooking remain host

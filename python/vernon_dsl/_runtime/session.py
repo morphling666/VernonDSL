@@ -50,6 +50,8 @@ def _release_runtime() -> None:
             child._native_buffer = None
         if hasattr(child, "_native_texture"):
             child._native_texture = None
+        if hasattr(child, "_native_sampler"):
+            child._native_sampler = None
         if hasattr(child, "_dispose_native"):
             child._dispose_native()
         if hasattr(child, "_compiled"):

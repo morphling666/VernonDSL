@@ -18,7 +18,16 @@ from ._runtime.execution_graph import (
 )
 from ._runtime.kernel import Kernel
 from ._runtime.pipeline import Pipeline, PrimitiveTopology, lines, pipeline, points, triangles
-from ._runtime.resources import RenderTarget, TensorLayout, TensorStorage, TensorView, Texture, depth32
+from ._runtime.resources import (
+    RenderTarget,
+    SamplerState,
+    TensorLayout,
+    TensorStorage,
+    TensorView,
+    Texture,
+    depth32,
+    sampler,
+)
 from ._runtime.session import (
     cpu,
     cuda,
@@ -47,6 +56,7 @@ __all__ = [
     "PipelineInvocation",
     "PrimitiveTopology",
     "RenderTarget",
+    "SamplerState",
     "RenderPass",
     "StoreOperation",
     "TensorLayout",
@@ -64,6 +74,7 @@ __all__ = [
     "pipeline",
     "points",
     "register_external_opengl_context",
+    "sampler",
     "triangles",
     "vulkan",
 ]

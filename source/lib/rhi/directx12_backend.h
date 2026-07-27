@@ -27,6 +27,7 @@ struct Buffer {
 struct Image {
     ID3D12Resource *resource{};
     DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
+    VernonRhiImageDimension dimension{VERNON_RHI_IMAGE_2D};
     D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};
     bool owned{true};
 };

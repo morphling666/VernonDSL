@@ -36,6 +36,7 @@ struct PreparedPipeline {
         uint32_t binding{};
         uint32_t access{};
         uint32_t divisor{};
+        bool active{};
     };
     struct VertexAttribute {
         VernonRuntimeProviderVertexAttribute layout{};
@@ -275,28 +276,42 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
         }
         if (!compute)
             adapter.openGLFramebufferSignatures.emplace(pipeline->framebuffer, OpenGLFramebufferSignature{});
-        for (const auto &entry : layout->entries) {
-            rhi::opengl::Int location = -1;
+        std::vector<rhi::opengl::Int> locations(layout->entries.size(), -1);
+        std::vector<uint32_t> activeTextureBindings;
+        for (size_t index = 0; index < layout->entries.size(); ++index) {
+            const auto &entry = layout->entries[index];
             if (!compute && entry.layout.kind != VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER &&
                 entry.layout.kind != VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
                 entry.layout.kind != VERNON_RUNTIME_PROVIDER_SAMPLER &&
-                entry.layout.kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
-                location = adapter.openGLDevice->driver.getUniformLocation(pipeline->program, entry.name.c_str());
-            if (!compute && entry.layout.kind != VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER &&
-                entry.layout.kind != VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
-                entry.layout.kind != VERNON_RUNTIME_PROVIDER_SAMPLER &&
-                entry.layout.kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && location < 0) {
-                adapter.openGLDevice->destroyGraphicsObjects(pipeline->vertexArray, pipeline->framebuffer);
-                adapter.openGLDevice->destroyProgram(pipeline->program);
-                return fail(adapter, "OpenGL uniform location is missing");
+                entry.layout.kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER) {
+                locations[index] =
+                    adapter.openGLDevice->driver.getUniformLocation(pipeline->program, entry.name.c_str());
+                if (locations[index] >= 0 && entry.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE)
+                    activeTextureBindings.push_back(entry.layout.binding);
             }
+        }
+        for (size_t index = 0; index < layout->entries.size(); ++index) {
+            const auto &entry = layout->entries[index];
+            const rhi::opengl::Int location = locations[index];
+            const bool inactiveNamedUniform = !compute && entry.layout.kind != VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER &&
+                                              entry.layout.kind != VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
+                                              entry.layout.kind != VERNON_RUNTIME_PROVIDER_SAMPLER &&
+                                              entry.layout.kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER &&
+                                              location < 0;
+            const bool inactiveSampler = !compute && entry.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER &&
+                                         std::find(activeTextureBindings.begin(), activeTextureBindings.end(),
+                                                   entry.layout.binding) == activeTextureBindings.end();
+            // Linked programs legally omit feature-disabled or otherwise dead
+            // uniforms. Keep stable variant slots in the binding set, but do
+            // not issue GL calls for resources absent from this program.
+            const bool active = !inactiveNamedUniform && !inactiveSampler;
             const uint32_t valueCount =
                 entry.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER
                     ? 0
                     : (entry.layout.element_count ? entry.layout.element_count : entry.layout.element_size / 4);
             pipeline->bindings.push_back({entry.layout.slot, entry.layout.kind, location, valueCount,
                                           entry.layout.vector_count, entry.layout.binding, entry.layout.access,
-                                          entry.layout.divisor});
+                                          entry.layout.divisor, active});
         }
         for (const VernonRuntimeProviderVertexAttribute &attribute : layout->vertexAttributes) {
             auto binding = std::find_if(layout->entries.begin(), layout->entries.end(), [&](const auto &entry) {
@@ -590,6 +605,8 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
         if (slot.slot != binding.slot || slot.kind != binding.kind || slot.valueCount != binding.valueCount ||
             slot.columnCount != binding.columnCount)
             return fail(adapter, "OpenGL draw binding order does not match its pipeline");
+        if (!binding.active)
+            continue;
         if (binding.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER) {
             continue;
         } else if (binding.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {

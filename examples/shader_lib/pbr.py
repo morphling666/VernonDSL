@@ -13,6 +13,7 @@ class PbrVertexOutput:
     world_position: vd.Vector[vd.f32, 3]
     base_color: vd.Vector[vd.f32, 3]
     material: vd.Vector[vd.f32, 3]
+    light_position: vd.Vector[vd.f32, 4]
 
 
 @vd.vertex
@@ -22,14 +23,32 @@ def pbr_vertex(
     base_color: Annotated[vd.Vector[vd.f32, 3], vd.attribute()],
     material: Annotated[vd.Vector[vd.f32, 3], vd.attribute()],
     view_projection: Annotated[vd.Matrix[vd.f32, 4, 4], vd.uniform()],
+    light_view_projection: vd.When[SHADOW, Annotated[vd.Matrix[vd.f32, 4, 4], vd.uniform()]],
 ) -> PbrVertexOutput:
+    light_clip_position = vd.Vector([0.0, 0.0, 0.0, 1.0])
+    if SHADOW:
+        light_clip_position = vd.matmul(light_view_projection, vd.Vector([position, 1.0]))
     return PbrVertexOutput(
         vd.matmul(view_projection, vd.Vector([position, 1.0])),
         normal,
         position,
         base_color,
         material,
+        light_clip_position,
     )
+
+
+@vd.vertex
+def shadow_vertex(
+    position: Annotated[vd.Vector[vd.f32, 3], vd.attribute()],
+    light_view_projection: Annotated[vd.Matrix[vd.f32, 4, 4], vd.uniform()],
+) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
+    return vd.matmul(light_view_projection, vd.Vector([position, 1.0]))
+
+
+@vd.fragment
+def shadow_fragment() -> vd.Vector[vd.f32, 4]:
+    return vd.Vector([1.0, 1.0, 1.0, 1.0])
 
 
 @vd.func
@@ -69,8 +88,26 @@ def pbr_fragment(
     world_position: Annotated[vd.Vector[vd.f32, 3], vd.varying()],
     base_color: Annotated[vd.Vector[vd.f32, 3], vd.varying()],
     material: Annotated[vd.Vector[vd.f32, 3], vd.varying()],
+    shadow_position: Annotated[vd.Vector[vd.f32, 4], vd.varying()],
     camera_position: Annotated[vd.Vector[vd.f32, 3], vd.uniform()],
     light_position: Annotated[vd.Vector[vd.f32, 3], vd.uniform()],
+    shadow_depth_scale: vd.When[SHADOW, Annotated[vd.f32, vd.uniform()]],
+    shadow_depth_bias: vd.When[SHADOW, Annotated[vd.f32, vd.uniform()]],
+    shadow_uv_scale: vd.When[SHADOW, Annotated[vd.Vector[vd.f32, 2], vd.uniform()]],
+    shadow_texel_size: vd.When[SHADOW, Annotated[vd.Vector[vd.f32, 2], vd.uniform()]],
+    shadow_map: vd.When[
+        SHADOW,
+        Annotated[vd.Texture["2d", vd.f32], vd.resource(set=0, binding=0)],  # pyright: ignore  # noqa: F722
+    ],
+    shadow_sampler: vd.When[SHADOW, Annotated[vd.Sampler, vd.resource(set=0, binding=1)]],
+    environment_map: vd.When[
+        ENVIRONMENT,
+        Annotated[
+            vd.Texture["cube", vd.f32],  # pyright: ignore  # noqa: F722, F821
+            vd.resource(set=0, binding=2),
+        ],
+    ],
+    environment_sampler: vd.When[ENVIRONMENT, Annotated[vd.Sampler, vd.resource(set=0, binding=3)]],
 ) -> vd.Vector[vd.f32, 4]:
     unit_normal = vd.normalize(normal)
     view_direction = vd.normalize(camera_position - world_position)
@@ -93,25 +130,42 @@ def pbr_fragment(
     diffuse_weight = (vd.Vector([1.0, 1.0, 1.0]) - fresnel) * (1.0 - metallic)
     diffuse = diffuse_weight * base_color * 0.318309886
 
-    # The Runtime does not expose sampled D32 images yet. This deterministic
-    # receiver shadow keeps the example runnable without pretending it is PCF.
-    shadow_center = -vd.Vector([0.53, 0.71])
-    shadow_delta = world_position.xz - shadow_center
-    shadow_distance = vd.dot(shadow_delta, shadow_delta)
-    receiver_visibility = vd.clamp((shadow_distance - 0.12) * 4.0, 0.24, 1.0)
     visibility = 1.0
     if SHADOW:
-        visibility = 1.0 - (1.0 - object_mask) * (1.0 - receiver_visibility)
+        projected_shadow = shadow_position.xyz / shadow_position.w
+        shadow_uv = projected_shadow.xy * shadow_uv_scale + vd.Vector([0.5, 0.5])
+        current_depth = projected_shadow.z * shadow_depth_scale + shadow_depth_bias
+        shadow_visibility = 0.0
+        sampled_depth = vd.texture_sample(shadow_map, shadow_sampler, shadow_uv - shadow_texel_size * 0.5).x
+        if current_depth - 0.004 <= sampled_depth:
+            shadow_visibility = shadow_visibility + 0.25
+        sampled_depth = vd.texture_sample(
+            shadow_map,
+            shadow_sampler,
+            shadow_uv + vd.Vector([shadow_texel_size.x, -shadow_texel_size.y]) * 0.5,
+        ).x
+        if current_depth - 0.004 <= sampled_depth:
+            shadow_visibility = shadow_visibility + 0.25
+        sampled_depth = vd.texture_sample(
+            shadow_map,
+            shadow_sampler,
+            shadow_uv + vd.Vector([-shadow_texel_size.x, shadow_texel_size.y]) * 0.5,
+        ).x
+        if current_depth - 0.004 <= sampled_depth:
+            shadow_visibility = shadow_visibility + 0.25
+        sampled_depth = vd.texture_sample(shadow_map, shadow_sampler, shadow_uv + shadow_texel_size * 0.5).x
+        if current_depth - 0.004 <= sampled_depth:
+            shadow_visibility = shadow_visibility + 0.25
+        visibility = 1.0 - (1.0 - object_mask) * (1.0 - shadow_visibility)
 
     direct_radiance = vd.Vector([5.4, 5.0, 4.5])
     direct = (diffuse + specular) * direct_radiance * normal_dot_light * visibility
 
-    reflection = vd.reflect(-view_direction, unit_normal)
-    sky_amount = vd.clamp(reflection.y * 0.5 + 0.5, 0.0, 1.0)
-    environment = vd.Vector([0.035, 0.045, 0.055]) * (1.0 - sky_amount) + vd.Vector([0.22, 0.38, 0.62]) * sky_amount
-    environment_weight = reflectance * (1.0 - roughness * 0.65) + base_color * (1.0 - metallic) * 0.055
     ambient = base_color * 0.025
     if ENVIRONMENT:
+        reflection = vd.reflect(-view_direction, unit_normal)
+        environment = vd.texture_sample(environment_map, environment_sampler, reflection).xyz
+        environment_weight = reflectance * (1.0 - roughness * 0.65) + base_color * (1.0 - metallic) * 0.055
         ambient = ambient + environment * environment_weight
     linear_color = direct + ambient
     mapped = linear_color / (linear_color + vd.Vector([1.0, 1.0, 1.0]))

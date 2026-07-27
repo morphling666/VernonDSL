@@ -809,22 +809,55 @@ def _dispatch_borrow_scope(
                 owner._borrow_lock.release()
 
 
-class Texture:
-    """RGBA8 two-dimensional runtime texture and annotation constructor."""
+@dataclass(frozen=True)
+class _TextureFormat:
+    name: str
+    _native_name: str
+    _depth: bool = False
 
-    def __init__(self, array: np.ndarray):
-        if (
-            not isinstance(array, np.ndarray)
-            or array.dtype != np.uint8
-            or array.ndim != 3
-            or array.shape[2] != 4
-            or not array.flags.c_contiguous
-        ):
-            raise ValueError("Texture storage must be contiguous uint8 (height, width, 4)")
+
+rgba8 = _TextureFormat("rgba8", "RGBA8_UNORM")
+depth32 = _TextureFormat("depth32", "D32_FLOAT", True)
+
+
+class Texture:
+    """Runtime image storage and shader texture annotation constructor."""
+
+    def __init__(
+        self,
+        array: np.ndarray,
+        *,
+        format: _TextureFormat | None = None,
+        dimension: str = "2d",
+    ):
+        if not isinstance(array, np.ndarray):
+            raise ValueError("Texture storage must be a NumPy array")
+        format = format or rgba8
+        if dimension not in {"2d", "cube"}:
+            raise ValueError("Texture dimension must be '2d' or 'cube'")
+        if format._depth:
+            valid = dimension == "2d" and array.dtype == np.float32 and array.ndim == 2
+            expected = "contiguous float32 (height, width)"
+        elif dimension == "cube":
+            valid = (
+                array.dtype == np.uint8
+                and array.ndim == 4
+                and array.shape[0] == 6
+                and array.shape[1] == array.shape[2]
+                and array.shape[3] == 4
+            )
+            expected = "contiguous uint8 (6, size, size, 4)"
+        else:
+            valid = array.dtype == np.uint8 and array.ndim == 3 and array.shape[2] == 4
+            expected = "contiguous uint8 (height, width, 4)"
+        if not isinstance(array, np.ndarray) or not valid or not array.flags.c_contiguous:
+            raise ValueError(f"Texture storage must be {expected}")
         self._array = np.array(array, copy=True, order="C")
+        self._format = format
+        self._dimension = dimension
         self._native_texture: Any | None = None
         self._native_generation = -1
-        self._host_dirty = True
+        self._host_dirty = not format._depth
         self._device_dirty = False
         _session_state()._runtime_children.add(self)
 
@@ -835,18 +868,36 @@ class Texture:
         return TypeExpr("Texture", arguments)
 
     @classmethod
-    def zeros(cls, *, shape: tuple[int, int]) -> Texture:
+    def zeros(cls, *, shape: tuple[int, int], format: _TextureFormat | None = None) -> Texture:
+        if (
+            not isinstance(shape, tuple)
+            or len(shape) != 2
+            or any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in shape)
+        ):
+            raise ValueError("Texture shape must contain two positive dimensions")
+        if format is not None and format is not depth32:
+            raise ValueError("unsupported Texture format")
+        if format is depth32:
+            return cls(np.zeros(shape, dtype=np.float32), format=format)
         return cls(np.zeros((*shape, 4), dtype=np.uint8))
 
     @classmethod
     def from_numpy(cls, array: np.ndarray) -> Texture:
         return cls(array)
 
+    @classmethod
+    def cube(cls, faces: np.ndarray) -> Texture:
+        return cls(faces, dimension="cube")
+
     @property
     def shape(self) -> tuple[int, int]:
+        if self._dimension == "cube":
+            return self._array.shape[1:3]
         return self._array.shape[:2]
 
     def copy_from_numpy(self, array: np.ndarray) -> None:
+        if self._format._depth:
+            raise RuntimeError("depth Texture storage is produced by rendering and cannot be uploaded from the host")
         if (
             not isinstance(array, np.ndarray)
             or array.dtype != np.uint8
@@ -862,7 +913,9 @@ class Texture:
         if self._device_dirty:
             if self._native_texture is None:
                 raise RuntimeError("device-dirty Texture has no allocation")
-            downloaded = np.frombuffer(self._native_texture.download(), dtype=np.uint8).reshape(self._array.shape)
+            downloaded = np.frombuffer(self._native_texture.download(), dtype=self._array.dtype).reshape(
+                self._array.shape
+            )
             np.copyto(self._array, downloaded)
             self._device_dirty = False
             self._host_dirty = False
@@ -876,9 +929,15 @@ class Texture:
             height, width = self.shape
             if state._rhi_host is None:
                 raise RuntimeError("Texture requires a GPU RHI host")
-            self._native_texture = state._rhi_host.create_image(width, height)
+            native_format = getattr(state._native.TextureFormat, self._format._native_name)
+            native_dimension = (
+                state._native.TextureDimension.CUBE
+                if self._dimension == "cube"
+                else state._native.TextureDimension.TEXTURE_2D
+            )
+            self._native_texture = state._rhi_host.create_image(width, height, native_format, native_dimension)
             self._native_generation = state._runtime_generation
-            self._host_dirty = True
+            self._host_dirty = not self._format._depth
             self._device_dirty = False
         if self._host_dirty:
             self._native_texture.upload(self._array.tobytes(order="C"))
@@ -890,14 +949,34 @@ class Texture:
         self._host_dirty = False
 
 
-@dataclass(frozen=True)
-class _TextureFormat:
-    name: str
-    _native_name: str
-    _depth: bool = False
+class SamplerState:
+    """Immutable runtime sampler bound to a shader ``Sampler`` parameter."""
+
+    def __init__(self, *, address: str = "repeat"):
+        if address not in {"repeat", "clamp_to_edge", "mirrored_repeat"}:
+            raise ValueError("sampler address must be 'repeat', 'clamp_to_edge', or 'mirrored_repeat'")
+        self._address = address
+        self._native_sampler: Any | None = None
+        self._native_generation = -1
+        _session_state()._runtime_children.add(self)
+
+    def _resident_sampler(self) -> Any:
+        state = _session_state()
+        if state._native_runtime is None or state._rhi_host is None:
+            raise RuntimeError("SamplerState requires an initialized GPU RHI runtime")
+        if self._native_sampler is None or self._native_generation != state._runtime_generation:
+            address = {
+                "repeat": state._native.SamplerAddressMode.REPEAT,
+                "clamp_to_edge": state._native.SamplerAddressMode.CLAMP_TO_EDGE,
+                "mirrored_repeat": state._native.SamplerAddressMode.MIRRORED_REPEAT,
+            }[self._address]
+            self._native_sampler = state._rhi_host.create_sampler(address)
+            self._native_generation = state._runtime_generation
+        return self._native_sampler
 
 
-depth32 = _TextureFormat("depth32", "D32_FLOAT", True)
+def sampler(*, address: str = "repeat") -> SamplerState:
+    return SamplerState(address=address)
 
 
 class RenderTarget:
@@ -913,6 +992,7 @@ class RenderTarget:
         self._shape = shape
         self._colors: dict[int, Texture] = {}
         self._depth_format: _TextureFormat | None = None
+        self._depth_texture: Texture | None = None
         self._native_depth: Any | None = None
         self._native_depth_generation = -1
         _session_state()._runtime_children.add(self)
@@ -928,14 +1008,31 @@ class RenderTarget:
             raise ValueError(f"color attachment location {location} is already occupied")
         if not isinstance(texture, Texture):
             raise TypeError("color attachment must be a Texture")
+        if texture._format._depth or texture._dimension != "2d":
+            raise ValueError("color attachment must be a two-dimensional color Texture")
         if texture.shape != self.shape:
             raise ValueError("color attachment dimensions must match RenderTarget shape")
         self._colors[location] = texture
         return self
 
-    def attach_depth(self, *, format: _TextureFormat) -> RenderTarget:
+    def attach_depth(
+        self,
+        *,
+        format: _TextureFormat | None = None,
+        texture: Texture | None = None,
+    ) -> RenderTarget:
         if self._depth_format is not None:
             raise ValueError("RenderTarget already has a depth attachment")
+        if (format is None) == (texture is None):
+            raise ValueError("depth attachment requires exactly one of format or texture")
+        if texture is not None:
+            if texture._format is not depth32 or texture._dimension != "2d":
+                raise ValueError("depth attachment texture must be a two-dimensional depth32 Texture")
+            if texture.shape != self.shape:
+                raise ValueError("depth attachment dimensions must match RenderTarget shape")
+            self._depth_texture = texture
+            self._depth_format = depth32
+            return self
         if format is not depth32:
             raise ValueError("depth attachment requires a depth format")
         self._depth_format = format
@@ -947,6 +1044,8 @@ class RenderTarget:
     def _resident_depth_attachment(self) -> Any | None:
         if self._depth_format is None:
             return None
+        if self._depth_texture is not None:
+            return self._depth_texture._resident_texture()
         state = _session_state()
         if state._native_runtime is None or state._rhi_host is None or state._native is None:
             raise RuntimeError("RenderTarget depth attachment requires an initialized GPU RHI runtime")
@@ -966,9 +1065,11 @@ class RenderTarget:
 __all__ = [
     "RawBuffer",
     "RenderTarget",
+    "SamplerState",
     "TensorLayout",
     "TensorStorage",
     "TensorView",
     "Texture",
     "depth32",
+    "sampler",
 ]

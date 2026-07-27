@@ -9,6 +9,8 @@
 
 namespace vernon::rhi::vulkan {
 
+VERNON_RHI_CAPI uint32_t physicalDeviceTypeRank(VkPhysicalDeviceType type);
+
 struct Buffer {
     VkBuffer buffer{};
     VkDeviceMemory memory{};
@@ -54,9 +56,11 @@ struct VERNON_RHI_CAPI DeviceState {
     bool synchronize(std::string &error);
     bool beginCommands(VkCommandBuffer &command, std::string &error);
     bool submitCommands(VkCommandBuffer command, std::string &error);
-    std::optional<uint32_t> findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags required) const;
+    std::optional<uint32_t> findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags required,
+                                           VkMemoryPropertyFlags preferred = 0) const;
     bool createBuffer(Buffer &buffer, VkDeviceSize size, VkBufferUsageFlags usage,
-                      VkMemoryPropertyFlags memoryProperties, std::string &error);
+                      VkMemoryPropertyFlags memoryProperties, std::string &error,
+                      VkMemoryPropertyFlags preferredMemoryProperties = 0);
     void destroyBuffer(Buffer &buffer);
     bool createImage(Image &image, const VkImageCreateInfo &imageInfo, const VkImageViewCreateInfo &viewInfo,
                      VkMemoryPropertyFlags memoryProperties, std::string &error);

@@ -1,10 +1,13 @@
 #ifndef VERNON_TESTS_SUPPORT_RUNTIME_RHI_TEST_UTILS_H
 #define VERNON_TESTS_SUPPORT_RUNTIME_RHI_TEST_UTILS_H
 
+#include "VernonExecutionGraph.h"
 #include "VernonRuntime.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <utility>
 
 namespace vernon::tests {
 
@@ -26,6 +29,42 @@ struct RhiImage {
 struct RhiSampler {
     VernonRhiSampler handle{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     VernonRuntimeProviderResourceReference reference{};
+};
+
+class RuntimeGraphRenderPass final : public execution::RenderPass {
+public:
+    RuntimeGraphRenderPass(std::string name, execution::GraphImage target, VernonRuntimeContext *runtime,
+                           VernonLoadedPipeline *pipeline, const VernonPipelineInvocation *invocation,
+                           VernonRhiLoadOperation load = VERNON_RHI_LOAD_CLEAR,
+                           VernonRhiStoreOperation store = VERNON_RHI_STORE_PRESERVE)
+        : RenderPass(std::move(name)), target_(target), runtime_(runtime), pipeline_(pipeline), invocation_(invocation),
+          load_(load), store_(store) {}
+
+    void declare() override {
+        execution::ColorAttachmentUse attachment{};
+        attachment.image = target_;
+        attachment.load = load_;
+        attachment.store = store_;
+        color(0, attachment);
+        renderArea(0, 0, target_.width, target_.height);
+    }
+
+    VernonRhiStatus execute(execution::GraphicsEncoder &encoder, const execution::ExecutionResources &) override {
+        VernonRuntimeProviderObject providerEncoder{};
+        if (vernonRuntimeReferenceRhiCommandEncoder(runtime_, encoder.native(), &providerEncoder) != VERNON_STATUS_OK)
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return vernonRuntimePipelineEncode(providerEncoder, pipeline_, invocation_) == VERNON_STATUS_OK
+                   ? VERNON_RHI_STATUS_OK
+                   : VERNON_RHI_STATUS_INTERNAL_ERROR;
+    }
+
+private:
+    execution::GraphImage target_;
+    VernonRuntimeContext *runtime_{};
+    VernonLoadedPipeline *pipeline_{};
+    const VernonPipelineInvocation *invocation_{};
+    VernonRhiLoadOperation load_{};
+    VernonRhiStoreOperation store_{};
 };
 
 inline VernonRhiBackend rhiBackend(VernonRuntimeBackend backend) {

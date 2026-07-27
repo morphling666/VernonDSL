@@ -245,6 +245,27 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(secondPixels[outsideViewport + 1], 0u);
     EXPECT_EQ(secondPixels[outsideViewport + 2], 0u);
 
+    attachment.resource = firstTarget.reference;
+    attachment.width = 32;
+    attachment.height = 32;
+    std::fill(std::begin(invocation.viewport), std::end(invocation.viewport), 0);
+    const size_t commandsBeforeGraph = vernon::runtime::getRhiAdapterRecordedCommandCount(runtime);
+    {
+        vernon::execution::ExecutionGraph graph(context.device);
+        const auto graphTarget =
+            graph.importImage(firstTarget.handle, {firstTarget.handle.index, firstTarget.handle.generation},
+                              VERNON_RHI_FORMAT_RGBA8_UNORM, 32, 32, 1, 1, true);
+        graph.emplacePass<vernon::tests::RuntimeGraphRenderPass>("first", graphTarget, runtime, pipeline, &invocation,
+                                                                 VERNON_RHI_LOAD_CLEAR);
+        graph.emplacePass<vernon::tests::RuntimeGraphRenderPass>("second", graphTarget, runtime, pipeline, &invocation,
+                                                                 VERNON_RHI_LOAD_PRESERVE);
+        ASSERT_EQ(graph.execute(), VERNON_RHI_STATUS_OK);
+        EXPECT_EQ(graph.lastStats().rendering_scope_count, 1u);
+        EXPECT_EQ(graph.lastStats().draw_count, 2u);
+        EXPECT_EQ(graph.lastStats().submission_count, 1u);
+    }
+    EXPECT_EQ(vernon::runtime::getRhiAdapterRecordedCommandCount(runtime) - commandsBeforeGraph, 2u);
+
     ASSERT_EQ(vernonRhiDeviceDestroySampler(context.device, textureSampler.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, sampled.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, secondTarget.handle), VERNON_RHI_STATUS_OK);

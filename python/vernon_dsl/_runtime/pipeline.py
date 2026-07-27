@@ -33,6 +33,7 @@ from .execution_graph import (
 )
 from .resources import (
     RenderTarget,
+    SamplerState,
     TensorStorage,
     TensorView,
     Texture,
@@ -280,7 +281,9 @@ class Pipeline:
                 builder.rhi_texture(parameter.name, value._resident_texture())
                 continue
             if parameter.kind == state._native.PIPELINE_SAMPLER:
-                builder.rhi_sampler(parameter.name, value)
+                if not isinstance(value, SamplerState):
+                    raise TypeError(f"sampler {parameter.name!r} must be a SamplerState")
+                builder.rhi_sampler(parameter.name, value._resident_sampler())
                 continue
             if parameter.kind != state._native.PIPELINE_TENSOR:
                 raise TypeError(f"pipeline parameter {parameter.name!r} has unsupported kind")

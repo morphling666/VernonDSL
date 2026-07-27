@@ -18,6 +18,21 @@ bool check(VkResult result, const char *operation, std::string &error) {
 
 } // namespace
 
+uint32_t physicalDeviceTypeRank(VkPhysicalDeviceType type) {
+    switch (type) {
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+        return 0;
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+        return 1;
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+        return 2;
+    case VK_PHYSICAL_DEVICE_TYPE_CPU:
+        return 3;
+    default:
+        return 4;
+    }
+}
+
 DeviceState::~DeviceState() { shutdown(); }
 
 bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
@@ -48,10 +63,7 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
         return false;
     }
     uint32_t deviceCount = 0;
-    if (!check(api.enumeratePhysicalDevices(instance, &deviceCount, nullptr), "vkEnumeratePhysicalDevices", error) ||
-        deviceIndex >= deviceCount) {
-        if (deviceIndex >= deviceCount)
-            error = "Vulkan device index is unavailable";
+    if (!check(api.enumeratePhysicalDevices(instance, &deviceCount, nullptr), "vkEnumeratePhysicalDevices", error)) {
         shutdown();
         return false;
     }
@@ -61,9 +73,51 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
         shutdown();
         return false;
     }
-    physicalDevice = devices[deviceIndex];
-    VkPhysicalDeviceProperties properties{};
-    api.getPhysicalDeviceProperties(physicalDevice, &properties);
+    struct DeviceCandidate {
+        VkPhysicalDevice device{};
+        VkPhysicalDeviceProperties properties{};
+        VkDeviceSize deviceLocalMemory{};
+        uint32_t queueFamily{};
+    };
+    std::vector<DeviceCandidate> candidates;
+    candidates.reserve(devices.size());
+    for (VkPhysicalDevice candidateDevice : devices) {
+        uint32_t candidateQueueCount = 0;
+        api.getPhysicalDeviceQueueFamilyProperties(candidateDevice, &candidateQueueCount, nullptr);
+        std::vector<VkQueueFamilyProperties> candidateQueues(candidateQueueCount);
+        api.getPhysicalDeviceQueueFamilyProperties(candidateDevice, &candidateQueueCount, candidateQueues.data());
+        const auto candidateQueue =
+            std::find_if(candidateQueues.begin(), candidateQueues.end(), [](const VkQueueFamilyProperties &family) {
+                return (family.queueFlags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) ==
+                       (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT);
+            });
+        if (candidateQueue == candidateQueues.end())
+            continue;
+        DeviceCandidate candidate;
+        candidate.device = candidateDevice;
+        candidate.queueFamily = static_cast<uint32_t>(std::distance(candidateQueues.begin(), candidateQueue));
+        api.getPhysicalDeviceProperties(candidateDevice, &candidate.properties);
+        VkPhysicalDeviceMemoryProperties candidateMemory{};
+        api.getPhysicalDeviceMemoryProperties(candidateDevice, &candidateMemory);
+        for (uint32_t heapIndex = 0; heapIndex < candidateMemory.memoryHeapCount; ++heapIndex)
+            if (candidateMemory.memoryHeaps[heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                candidate.deviceLocalMemory += candidateMemory.memoryHeaps[heapIndex].size;
+        candidates.push_back(candidate);
+    }
+    std::stable_sort(
+        candidates.begin(), candidates.end(), [](const DeviceCandidate &left, const DeviceCandidate &right) {
+            const uint32_t leftRank = physicalDeviceTypeRank(left.properties.deviceType);
+            const uint32_t rightRank = physicalDeviceTypeRank(right.properties.deviceType);
+            return leftRank != rightRank ? leftRank < rightRank : left.deviceLocalMemory > right.deviceLocalMemory;
+        });
+    if (deviceIndex >= candidates.size()) {
+        error = "Vulkan high-performance device index is unavailable";
+        shutdown();
+        return false;
+    }
+    physicalDevice = candidates[deviceIndex].device;
+    queueFamily = candidates[deviceIndex].queueFamily;
+    const VkPhysicalDeviceProperties &properties = candidates[deviceIndex].properties;
     maxPushConstantsSize = properties.limits.maxPushConstantsSize;
     maxVertexInputAttributes = properties.limits.maxVertexInputAttributes;
     apiVersion = properties.apiVersion;
@@ -72,20 +126,6 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
                                                  properties.limits.minStorageBufferOffsetAlignment);
     for (size_t index = 0; index < 3; ++index)
         maxComputeWorkGroupSize[index] = properties.limits.maxComputeWorkGroupSize[index];
-    uint32_t queueCount = 0;
-    api.getPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueCount, nullptr);
-    std::vector<VkQueueFamilyProperties> queues(queueCount);
-    api.getPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueCount, queues.data());
-    const auto selected = std::find_if(queues.begin(), queues.end(), [](const VkQueueFamilyProperties &family) {
-        return (family.queueFlags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) ==
-               (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT);
-    });
-    if (selected == queues.end()) {
-        error = "Vulkan device has no combined compute and graphics queue";
-        shutdown();
-        return false;
-    }
-    queueFamily = static_cast<uint32_t>(std::distance(queues.begin(), selected));
     float priority = 1.0f;
     VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queueInfo.queueFamilyIndex = queueFamily;
@@ -322,7 +362,15 @@ bool DeviceState::submitCommands(VkCommandBuffer command, std::string &error) {
     return true;
 }
 
-std::optional<uint32_t> DeviceState::findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags required) const {
+std::optional<uint32_t> DeviceState::findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags required,
+                                                    VkMemoryPropertyFlags preferred) const {
+    if (preferred) {
+        const VkMemoryPropertyFlags preferredFlags = required | preferred;
+        for (uint32_t index = 0; index < memoryProperties.memoryTypeCount; ++index)
+            if ((typeBits & (uint32_t{1} << index)) &&
+                (memoryProperties.memoryTypes[index].propertyFlags & preferredFlags) == preferredFlags)
+                return index;
+    }
     for (uint32_t index = 0; index < memoryProperties.memoryTypeCount; ++index)
         if ((typeBits & (uint32_t{1} << index)) &&
             (memoryProperties.memoryTypes[index].propertyFlags & required) == required)
@@ -331,7 +379,8 @@ std::optional<uint32_t> DeviceState::findMemoryType(uint32_t typeBits, VkMemoryP
 }
 
 bool DeviceState::createBuffer(Buffer &buffer, VkDeviceSize size, VkBufferUsageFlags usage,
-                               VkMemoryPropertyFlags properties, std::string &error) {
+                               VkMemoryPropertyFlags properties, std::string &error,
+                               VkMemoryPropertyFlags preferredMemoryProperties) {
     Driver &api = driver();
     VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bufferInfo.size = size;
@@ -341,7 +390,7 @@ bool DeviceState::createBuffer(Buffer &buffer, VkDeviceSize size, VkBufferUsageF
         return false;
     VkMemoryRequirements requirements{};
     api.getBufferMemoryRequirements(device, buffer.buffer, &requirements);
-    const auto memoryType = findMemoryType(requirements.memoryTypeBits, properties);
+    const auto memoryType = findMemoryType(requirements.memoryTypeBits, properties, preferredMemoryProperties);
     if (!memoryType) {
         error = "Vulkan device has no compatible buffer memory type";
         destroyBuffer(buffer);
@@ -457,7 +506,8 @@ bool DeviceState::acquireStaging(bool upload, VkDeviceSize size, VkDeviceSize al
         }
         if (!createBuffer(ring.buffer, capacity,
                           upload ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT : VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, error))
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, error,
+                          upload ? 0 : VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
             return false;
         ++stagingBufferAllocations;
         if (!check(

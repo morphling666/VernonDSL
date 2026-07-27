@@ -154,6 +154,7 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
             const ParameterUse &use = parameter.uses[0];
             GraphicsCandidate candidate;
             candidate.layout.slot = parameter.slot;
+            candidate.layout.argument_index = use.index;
             candidate.layout.stage_mask =
                 use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
             candidate.layout.array_count = 1;
@@ -200,6 +201,13 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                 candidate.layout.element_size = static_cast<uint32_t>(physicalSize);
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
                 candidate.layout.element_count = static_cast<uint32_t>(valueCount);
+                candidate.layout.vector_count = shape.size() == 2 ? static_cast<uint32_t>(shape[0]) : 1;
+                const uint64_t physicalAlignment = use.uniformLayout ? use.uniformLayout->alignment : elementSize;
+                if (!physicalAlignment || physicalAlignment > UINT32_MAX) {
+                    supported = false;
+                    break;
+                }
+                candidate.layout.element_alignment = static_cast<uint32_t>(physicalAlignment);
                 candidate.layout.binding = use.binding;
                 candidate.layout.set = use.descriptorSet;
                 candidate.binding.source = DirectX12PipelineState::GraphicsBinding::EXTERNAL_UNIFORM;
@@ -282,6 +290,7 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
             }
             GraphicsCandidate candidate;
             candidate.layout.slot = ++internalSlot;
+            candidate.layout.argument_index = use.index;
             candidate.layout.stage_mask =
                 use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
             candidate.layout.array_count = 1;

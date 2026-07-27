@@ -17,6 +17,30 @@ template <typename Handle> uint64_t handleBits(Handle handle) {
         return static_cast<uint64_t>(handle);
 }
 
+TEST(VulkanDeviceSelection, RanksHighPerformanceHardwareFirst) {
+    EXPECT_LT(vernon::rhi::vulkan::physicalDeviceTypeRank(VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU),
+              vernon::rhi::vulkan::physicalDeviceTypeRank(VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU));
+    EXPECT_LT(vernon::rhi::vulkan::physicalDeviceTypeRank(VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU),
+              vernon::rhi::vulkan::physicalDeviceTypeRank(VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU));
+    EXPECT_LT(vernon::rhi::vulkan::physicalDeviceTypeRank(VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU),
+              vernon::rhi::vulkan::physicalDeviceTypeRank(VK_PHYSICAL_DEVICE_TYPE_CPU));
+}
+
+TEST(VulkanMemorySelection, PrefersCachedCoherentReadbackMemoryAndFallsBack) {
+    vernon::rhi::vulkan::DeviceState state;
+    state.memoryProperties.memoryTypeCount = 2;
+    state.memoryProperties.memoryTypes[0].propertyFlags =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    state.memoryProperties.memoryTypes[1].propertyFlags =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    constexpr VkMemoryPropertyFlags required =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+    EXPECT_EQ(state.findMemoryType(0b11, required, VK_MEMORY_PROPERTY_HOST_CACHED_BIT), 1u);
+    EXPECT_EQ(state.findMemoryType(0b01, required, VK_MEMORY_PROPERTY_HOST_CACHED_BIT), 0u);
+    EXPECT_FALSE(state.findMemoryType(0b00, required, VK_MEMORY_PROPERTY_HOST_CACHED_BIT).has_value());
+}
+
 TEST(VulkanNativeInterop, BorrowsObjectsWithoutOwningTheirLifetime) {
     std::string error;
     vernon::rhi::vulkan::DeviceState owner;
