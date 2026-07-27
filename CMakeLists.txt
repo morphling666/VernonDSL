@@ -13,7 +13,7 @@ include(CTest)
 
 option(VERNON_BUILD_RUNTIME "Build the Vernon Runtime subproject" ON)
 option(VERNON_BUILD_COMPILER "Build the Vernon Compiler subproject" ON)
-option(VERNON_INSTALL_GIT_HOOK "Install the staged-file formatting hook" ON)
+option(VERNON_INSTALL_GIT_HOOK "Install the staged-file formatting hook" OFF)
 option(VERNON_ENABLE_SANITIZERS "Build Vernon targets with AddressSanitizer" OFF)
 
 if(VERNON_ENABLE_SANITIZERS)
@@ -26,7 +26,6 @@ if(VERNON_ENABLE_SANITIZERS)
     endif()
 endif()
 
-set(VERNON_COMPOSITION_BUILD ON)
 set(VERNON_REPOSITORY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 
 if(VERNON_INSTALL_GIT_HOOK AND EXISTS "${CMAKE_SOURCE_DIR}/.git")

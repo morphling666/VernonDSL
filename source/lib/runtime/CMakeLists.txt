@@ -98,11 +98,9 @@ endif()
 include("${_vernon_runtime_target_file}")
 vernon_add_runtime()
 
-if(BUILD_TESTING
-   AND NOT VERNON_COMPOSITION_BUILD
-   AND EXISTS "${VERNON_REPOSITORY_ROOT}/source/tests")
-    include("${VERNON_REPOSITORY_ROOT}/cmake/IncludeGTest.cmake")
-    add_subdirectory("${VERNON_REPOSITORY_ROOT}/source/tests" "${CMAKE_CURRENT_BINARY_DIR}/tests")
+if(BUILD_TESTING)
+    include("${VERNON_REPOSITORY_ROOT}/cmake/VernonTests.cmake")
+    vernon_add_tests()
 endif()
 
 include(CMakePackageConfigHelpers)
@@ -136,6 +134,7 @@ if(SKBUILD)
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.hpp"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonExecutionGraph.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntime.h"
+              "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntime.hpp"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntimeCore.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntimeProvider.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntimeRHIAdapter.h"

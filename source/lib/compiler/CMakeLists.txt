@@ -14,7 +14,6 @@ endif()
 get_filename_component(VERNON_REPOSITORY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
 set(VERNON_SOURCE_DIR "${VERNON_REPOSITORY_ROOT}/source")
 
-include("${VERNON_REPOSITORY_ROOT}/cmake/IncludeGTest.cmake")
 include("${VERNON_REPOSITORY_ROOT}/cmake/IncludeSpirvCross.cmake")
 include_spirv_cross()
 
@@ -24,11 +23,6 @@ set(MLIR_DIR
 set(LLD_DIR
     "${VERNON_REPOSITORY_ROOT}/llvm-project/install/lib/cmake/lld"
     CACHE PATH "Directory containing LLDConfig.cmake")
-if(LLD_DIR MATCHES "-NOTFOUND$")
-    set(LLD_DIR
-        "${VERNON_REPOSITORY_ROOT}/llvm-project/install/lib/cmake/lld"
-        CACHE PATH "Directory containing LLDConfig.cmake" FORCE)
-endif()
 find_package(MLIR REQUIRED CONFIG)
 find_package(LLD REQUIRED CONFIG)
 
@@ -50,19 +44,33 @@ set(LLVM_RUNTIME_OUTPUT_INTDIR "${CMAKE_CURRENT_BINARY_DIR}/bin")
 set(LLVM_LIBRARY_OUTPUT_INTDIR "${CMAKE_CURRENT_BINARY_DIR}/lib")
 set(MLIR_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 
-include_directories(${LLVM_INCLUDE_DIRS})
-include_directories(${MLIR_INCLUDE_DIRS})
-include_directories(${LLD_INCLUDE_DIRS})
-# Project dialect headers and their freshly generated TableGen files must win over any older Vernon headers present in
-# the MLIR installation prefix.
-include_directories(BEFORE "${VERNON_SOURCE_DIR}/include")
-include_directories(BEFORE "${CMAKE_CURRENT_BINARY_DIR}/include")
-
 set(MLIR_SOURCE_DIR "${VERNON_REPOSITORY_ROOT}/llvm-project/mlir")
 set(MLIR_TABLEGEN_INCLUDE_DIRS "${MLIR_SOURCE_DIR}/include" ${LLVM_INCLUDE_DIRS})
 
-include("${CMAKE_CURRENT_SOURCE_DIR}/CompilerTargets.cmake")
+add_library(VernonCompilerBuildHeaders INTERFACE)
+target_include_directories(
+    VernonCompilerBuildHeaders
+    INTERFACE "${VERNON_SOURCE_DIR}/include"
+              "${CMAKE_CURRENT_BINARY_DIR}/include"
+              ${LLVM_INCLUDE_DIRS}
+              ${MLIR_INCLUDE_DIRS}
+              ${LLD_INCLUDE_DIRS})
 
-if(BUILD_TESTING AND NOT VERNON_COMPOSITION_BUILD)
-    add_subdirectory("${VERNON_SOURCE_DIR}/tests" "${CMAKE_CURRENT_BINARY_DIR}/tests")
+include("${CMAKE_CURRENT_SOURCE_DIR}/CompilerTargets.cmake")
+foreach(
+    _vernon_compiler_target IN
+    ITEMS MLIRVernonDialect
+          MLIRVernonTransforms
+          VernonDSLCompiler
+          vernon-compile-packaging
+          vernon-compile
+          vernon-opt)
+    target_link_libraries(${_vernon_compiler_target} PRIVATE VernonCompilerBuildHeaders)
+    target_include_directories(${_vernon_compiler_target} BEFORE PRIVATE "${VERNON_SOURCE_DIR}/include"
+                                                                         "${CMAKE_CURRENT_BINARY_DIR}/include")
+endforeach()
+
+if(BUILD_TESTING)
+    include("${VERNON_REPOSITORY_ROOT}/cmake/VernonTests.cmake")
+    vernon_add_tests()
 endif()

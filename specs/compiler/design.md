@@ -357,9 +357,11 @@ HLSL Shader Model is likewise a compile option and is valid only for DirectX.
 The stable C API and cooker encode it as major times ten plus minor (`60` for
 Shader Model 6.0), defaulting to `60` and rejecting older models. It
 participates in artifact identity and is recorded in compiler reflection and
-PipelineAsset `target_options`. DXC is a pinned Windows SDK cook dependency;
-the cooker strips debug/reflection data for deterministic runtime DXIL, while
-`VernonRuntime` never links or loads DXC.
+PipelineAsset `target_options`. Builds use a pinned, hash-verified official DXC
+redistributable so developer and CI artifacts share the same compiler.
+`VERNON_DXC_EXECUTABLE` remains an explicit override for offline and managed
+toolchains. The cooker strips debug/reflection data for deterministic runtime
+DXIL, while `VernonRuntime` never links or loads DXC.
 
 ## Completed module and artifact work
 

@@ -1,6 +1,7 @@
 include("${VERNON_REPOSITORY_ROOT}/cmake/IncludeGTest.cmake")
 include_gtest()
 include(GoogleTest)
+include("${VERNON_REPOSITORY_ROOT}/cmake/VernonTargetHelpers.cmake")
 
 if(NOT TARGET nlohmann_json::nlohmann_json)
     include("${VERNON_REPOSITORY_ROOT}/cmake/IncludeNlohmannJson.cmake")
@@ -38,11 +39,7 @@ if(TARGET VernonRuntime)
         target_include_directories(VernonRuntimeRHIAdapterTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib")
         target_link_libraries(VernonRuntimeRHIAdapterTests PRIVATE GTest::gtest_main Vernon::RuntimeCore
                                                                    Vernon::RuntimeRHIAdapter)
-        add_custom_command(
-            TARGET VernonRuntimeRHIAdapterTests
-            POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:VernonRHI>
-                    $<TARGET_FILE_DIR:VernonRuntimeRHIAdapterTests>)
+        vernon_stage_target_files(VernonRuntimeRHIAdapterTests VernonRHI)
         if(MSVC)
             target_compile_options(VernonRuntimeRHIAdapterTests PRIVATE /EHsc)
         endif()
@@ -108,15 +105,7 @@ if(TARGET VernonRuntime)
                                    VERNON_RUNTIME_TEST_ARCH="${runtime_test_arch}")
     add_dependencies(VernonRuntimeTests vernon-cpu-aot-test-bundle)
     add_dependencies(VernonRuntimeTests VernonRuntimePublicCHeaderCheck)
-    if(WIN32)
-        add_custom_command(
-            TARGET VernonRuntimeTests
-            POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:VernonRuntime>
-                    $<TARGET_FILE_DIR:VernonRuntimeTests>
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:VernonRHI>
-                    $<TARGET_FILE_DIR:VernonRuntimeTests>)
-    endif()
+    vernon_stage_target_files(VernonRuntimeTests VernonRuntime VernonRHI)
     if(MSVC)
         target_compile_options(VernonRuntimeTests PRIVATE /EHsc)
     endif()
@@ -188,11 +177,7 @@ if(TARGET VernonRuntime)
                 PRIVATE VERNON_DIRECTX_PIPELINE_BUNDLE="${directx_pipeline_test_manifest}"
                         VERNON_DIRECTX_COMPUTE_PIPELINE_BUNDLE="${directx_compute_pipeline_test_manifest}")
             target_link_libraries(VernonRuntimeTests PRIVATE VernonDSLCompiler)
-            add_custom_command(
-                TARGET VernonRuntimeTests
-                POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:VernonDSLCompiler>
-                        $<TARGET_FILE_DIR:VernonRuntimeTests>)
+            vernon_stage_target_files(VernonRuntimeTests VernonDSLCompiler)
             add_dependencies(VernonRuntimeTests vernon-directx-pipeline-test-bundle
                              vernon-directx-compute-pipeline-test-bundle)
         endif()
@@ -262,6 +247,17 @@ if(TARGET VernonRuntime)
     endif()
 
     vernon_discover_gtests(VernonRuntimeTests)
+    add_test(
+        NAME vernon-runtime-package-smoke
+        COMMAND
+            ${CMAKE_COMMAND} "-DVERNON_BUILD_DIR=${CMAKE_BINARY_DIR}"
+            "-DVERNON_SMOKE_SOURCE_DIR=${VERNON_TEST_ROOT}/runtime/package_smoke"
+            "-DVERNON_SMOKE_BUILD_DIR=${VERNON_TEST_BINARY_ROOT}/runtime_package_smoke_build"
+            "-DVERNON_INSTALL_PREFIX=${VERNON_TEST_BINARY_ROOT}/runtime_package_smoke_install"
+            "-DVERNON_TEST_CONFIG=$<CONFIG>" "-DVERNON_TEST_GENERATOR=${CMAKE_GENERATOR}"
+            "-DVERNON_TEST_PLATFORM=${CMAKE_GENERATOR_PLATFORM}" -P
+            "${VERNON_TEST_ROOT}/scripts/run_runtime_package_smoke.cmake")
+    set_tests_properties(vernon-runtime-package-smoke PROPERTIES RUN_SERIAL TRUE)
 endif()
 
 if(TARGET VernonDSLCompiler)
@@ -291,13 +287,7 @@ if(TARGET VernonDSLCompiler)
     if(MSVC)
         target_compile_options(VernonCompilerTests PRIVATE /EHsc)
     endif()
-    if(WIN32)
-        add_custom_command(
-            TARGET VernonCompilerTests
-            POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:VernonDSLCompiler>
-                    $<TARGET_FILE_DIR:VernonCompilerTests>)
-    endif()
+    vernon_stage_target_files(VernonCompilerTests VernonDSLCompiler)
     add_dependencies(VernonCompilerTests vernon-opt vernon-compile)
     vernon_discover_gtests(VernonCompilerTests)
 

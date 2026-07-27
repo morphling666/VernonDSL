@@ -46,8 +46,10 @@ CUDA/NVPTX and CPU/LLVM are distinct branches; they are never routed through
 SPIR-V. The CPU backend JIT-compiles the current graphics and compute numeric
 subset, including buffer load/store and callback-based 2D texture sampling,
 and exports guarded C ABI entry points for reference execution. DirectX uses
-the pinned Windows SDK DXC while cooking and executes pre-cooked DXIL through
-the Windows-only D3D12 Runtime backend.
+the pinned official DXC redistributable while cooking and executes pre-cooked
+DXIL through the Windows-only D3D12 Runtime backend. CMake downloads the
+hash-verified package by default; offline builds may provide
+`VERNON_DXC_EXECUTABLE` or disable `VERNON_FETCH_DXC`.
 
 That JIT is a compiler reference facility, not a deployable runtime format.
 `VernonRuntime` accepts CPU native-library AOT bundles only.
@@ -118,8 +120,10 @@ launched by CTest.
 ### Windows CI
 
 GitHub Actions runs the supported CI configuration on `windows-2022` with
-Visual Studio 17 2022 and Python 3.11.9. The workflow installs `uv` explicitly;
-it does not rely on software inherited from the runner image.
+Visual Studio 17 2022. Runtime and style checks use Python 3.11.9, while wheel
+builds and fresh-environment tests cover Python 3.11 through 3.14. The workflow
+installs `uv` explicitly; it does not rely on software inherited from the
+runner image.
 
 The Runtime and style jobs do not check out or build LLVM. The Compiler job
 builds a reduced `mlir;lld` LLVM installation on the first run, then caches the

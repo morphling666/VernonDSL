@@ -9,6 +9,7 @@ option(VERNON_ENABLE_GLFW_CONTEXT_OWNER "Build the Python GLFW OpenGL context-ow
        ${_vernon_gl_context_default})
 
 set(VERNON_PYTHON_PACKAGE_DIR "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl")
+include("${VERNON_REPOSITORY_ROOT}/cmake/VernonTargetHelpers.cmake")
 
 function(vernon_set_python_module_output target)
     set_target_properties(
@@ -41,7 +42,7 @@ if(VERNON_ENABLE_PYTHON_BINDINGS
    AND TARGET VernonRuntime
    AND TARGET VernonDSLCompiler)
     find_package(
-        Python 3.11.9...<3.12
+        Python 3.11...<3.15
         COMPONENTS Interpreter Development.Module
         QUIET)
 endif()
@@ -71,15 +72,11 @@ if(TARGET VernonRuntime AND TARGET VernonDSLCompiler)
             if(MSVC)
                 target_compile_options(vernon-dsl-native PRIVATE /EHsc)
             endif()
-            add_custom_command(
-                TARGET vernon-dsl-native
-                POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:VernonDSLCompiler>
-                        $<TARGET_FILE_DIR:vernon-dsl-native>
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:VernonRuntime>
-                        $<TARGET_FILE_DIR:vernon-dsl-native>
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:VernonRHI>
-                        $<TARGET_FILE_DIR:vernon-dsl-native>)
+            vernon_stage_target_files(
+                vernon-dsl-native
+                VernonDSLCompiler
+                VernonRuntime
+                VernonRHI)
             set_target_properties(vernon-dsl-native PROPERTIES OUTPUT_NAME "_native")
             if(APPLE)
                 set_target_properties(vernon-dsl-native PROPERTIES INSTALL_RPATH "@loader_path")
@@ -111,8 +108,9 @@ endif()
 
 if(BUILD_TESTING)
     find_package(
-        Python 3.11.9...<3.12
+        Python 3.11...<3.15
         COMPONENTS Interpreter
         QUIET)
-    add_subdirectory(tests)
+    include("${VERNON_REPOSITORY_ROOT}/cmake/VernonTests.cmake")
+    vernon_add_tests()
 endif()

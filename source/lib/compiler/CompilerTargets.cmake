@@ -2,13 +2,6 @@ add_subdirectory("${VERNON_SOURCE_DIR}/include/mlir/Dialect/Vernon"
                  "${CMAKE_CURRENT_BINARY_DIR}/include/mlir/Dialect/Vernon")
 add_subdirectory("${VERNON_SOURCE_DIR}/lib/Dialect/Vernon" "${CMAKE_CURRENT_BINARY_DIR}/lib/Dialect/Vernon")
 
-if(BUILD_TESTING)
-    find_package(
-        Python 3.11.9...<3.12
-        COMPONENTS Interpreter
-        QUIET)
-endif()
-
 add_library(
     VernonDSLCompiler SHARED
     compiler_artifacts.cpp
@@ -35,24 +28,40 @@ llvm_map_components_to_libnames(
     native)
 target_compile_definitions(VernonDSLCompiler PRIVATE VERNON_DSL_COMPILER_BUILD)
 if(WIN32)
-    set(VERNON_DXC_WINDOWS_SDK_VERSION
-        "10.0.26100.0"
-        CACHE STRING "Pinned Windows SDK DXC toolset version")
-    find_program(
-        VERNON_DXC_EXECUTABLE
-        NAMES dxc.exe
-        HINTS "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/bin/${VERNON_DXC_WINDOWS_SDK_VERSION}/x64"
-              "C:/Program Files (x86)/Windows Kits/10/bin/${VERNON_DXC_WINDOWS_SDK_VERSION}/x64"
-        NO_DEFAULT_PATH)
-    if(VERNON_DXC_EXECUTABLE)
+    option(VERNON_FETCH_DXC "Download the pinned DXC redistributable when no executable is specified" ON)
+    set(VERNON_DXC_EXECUTABLE
+        ""
+        CACHE FILEPATH "Optional DXC executable override")
+    if(NOT VERNON_DXC_EXECUTABLE AND VERNON_FETCH_DXC)
+        include(FetchContent)
+        FetchContent_Declare(
+            vernon_dxc
+            URL "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.dxc/1.9.2602.24/microsoft.direct3d.dxc.1.9.2602.24.nupkg"
+            URL_HASH
+                "SHA512=354182aa58f528d5138ff2bfc97fd48cd1cfe8d0fcff146830d35d7630e73e4bb1db3aa39b0e807dfe905bf13d4b96229f9385ac14d562831dbfdd0d28eafb05"
+            DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+        FetchContent_MakeAvailable(vernon_dxc)
+        if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+            set(_vernon_dxc_arch x86)
+        elseif(CMAKE_GENERATOR_PLATFORM MATCHES "^[Aa][Rr][Mm]64$" OR CMAKE_SYSTEM_PROCESSOR MATCHES
+                                                                      "^(ARM64|arm64|aarch64)$")
+            set(_vernon_dxc_arch arm64)
+        else()
+            set(_vernon_dxc_arch x64)
+        endif()
+        set(VERNON_DXC_EXECUTABLE
+            "${vernon_dxc_SOURCE_DIR}/build/native/bin/${_vernon_dxc_arch}/dxc.exe"
+            CACHE FILEPATH "DXC executable used for DirectX artifact compilation" FORCE)
+    elseif(NOT VERNON_DXC_EXECUTABLE)
+        find_program(VERNON_DXC_EXECUTABLE NAMES dxc.exe)
+    endif()
+    if(VERNON_DXC_EXECUTABLE AND EXISTS "${VERNON_DXC_EXECUTABLE}")
         file(TO_CMAKE_PATH "${VERNON_DXC_EXECUTABLE}" _vernon_dxc_path)
         target_compile_definitions(VernonDSLCompiler PRIVATE VERNON_DXC_EXECUTABLE="${_vernon_dxc_path}")
         get_filename_component(_vernon_dxc_directory "${VERNON_DXC_EXECUTABLE}" DIRECTORY)
+        message(STATUS "Using DXC: ${VERNON_DXC_EXECUTABLE}")
     else()
-        message(
-            WARNING
-                "Pinned DXC ${VERNON_DXC_WINDOWS_SDK_VERSION} was not found; the DirectX target will report unavailable"
-        )
+        message(WARNING "DXC was not found; the DirectX target will report unavailable")
     endif()
 endif()
 if(MSVC)

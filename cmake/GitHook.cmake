@@ -31,14 +31,8 @@ get_filename_component(
     ABSOLUTE
     BASE_DIR
     "${CMAKE_SOURCE_DIR}")
-set(VENV_DIR
-    "${CMAKE_SOURCE_DIR}/.venv"
-    CACHE PATH "VernonDSL virtual environment")
-if(WIN32)
-    set(FORMAT_PYTHON "${VENV_DIR}/Scripts/python.exe")
-else()
-    set(FORMAT_PYTHON "${VENV_DIR}/bin/python")
-endif()
+include("${CMAKE_CURRENT_LIST_DIR}/VernonPythonVenv.cmake")
+vernon_prepare_python_venv(FORMAT_PYTHON)
 
 file(MAKE_DIRECTORY "${GIT_DIR}/hooks")
 set(PRE_COMMIT_HOOK "${GIT_DIR}/hooks/pre-commit")
