@@ -4,8 +4,7 @@
 
 namespace mlir::vernon {
 
-std::unique_ptr<Pass>
-createVernonToSPIRVPass(bool aggregatePushConstants = true);
+std::unique_ptr<Pass> createVernonToSPIRVPass(bool aggregatePushConstants = true);
 
 void registerVernonToSPIRVPass();
 

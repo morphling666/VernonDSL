@@ -110,7 +110,10 @@ jobs:
           -DBUILD_TESTING=ON
 
       - name: Build Runtime tests
-        run: cmake --build runtime-build --config Release --target VernonRuntimeTests --parallel 4
+        run: >
+          cmake --build runtime-build --config Release
+          --target VernonRuntimeTests VernonRuntimeCoreProviderTests VernonRuntimeRHIAdapterTests
+          --parallel 4
 
       - name: Run Runtime tests
         run: ctest --test-dir runtime-build -C Release --output-on-failure
@@ -169,7 +172,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: llvm-project/install
-          key: windows-x64-llvm-${{ steps.llvm-revision.outputs.sha }}-vs17-libdevice-cu12.9.86-v1
+          key: windows-x64-llvm-${{ steps.llvm-revision.outputs.sha }}-vs17-libdevice-cu12.9.86-v2
 
       - name: Install NVIDIA libdevice
         if: steps.llvm-cache.outputs.cache-hit != 'true'
@@ -188,7 +191,7 @@ jobs:
           cmake -S llvm-project/llvm -B llvm-project/build-ci `
             -G "${{ env.CMAKE_GENERATOR }}" -A x64 `
             -DLLVM_ENABLE_PROJECTS="mlir;lld" `
-            -DLLVM_TARGETS_TO_BUILD="X86;NVPTX" `
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64;NVPTX" `
             -DLLVM_ENABLE_ASSERTIONS=OFF `
             -DLLVM_INCLUDE_TESTS=OFF `
             -DMLIR_INCLUDE_TESTS=OFF `
@@ -211,7 +214,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: llvm-project/install
-          key: windows-x64-llvm-${{ steps.llvm-revision.outputs.sha }}-vs17-libdevice-cu12.9.86-v1
+          key: windows-x64-llvm-${{ steps.llvm-revision.outputs.sha }}-vs17-libdevice-cu12.9.86-v2
 
       - name: Install Python build environment
         run: uv sync --extra build --frozen
@@ -223,6 +226,7 @@ jobs:
             -G "${{ env.CMAKE_GENERATOR }}" -A x64 `
             -DMLIR_DIR="$env:GITHUB_WORKSPACE/llvm-project/install/lib/cmake/mlir" `
             -DLLD_DIR="$env:GITHUB_WORKSPACE/llvm-project/install/lib/cmake/lld" `
+            -DPython_EXECUTABLE="$env:GITHUB_WORKSPACE/.venv/Scripts/python.exe" `
             -DVERNON_INSTALL_GIT_HOOK=OFF `
             -DBUILD_TESTING=ON
 
