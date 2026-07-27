@@ -134,6 +134,7 @@ if(SKBUILD)
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonOpenGLContext.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.hpp"
+              "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonExecutionGraph.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntime.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntimeCore.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntimeProvider.h"
@@ -147,6 +148,13 @@ if(SKBUILD)
     install(
         DIRECTORY "${_VERNON_RUNTIME_IMPL_DIR}/"
         DESTINATION vernon_dsl/runtime_src/lib/runtime
+        COMPONENT VernonWheel
+        FILES_MATCHING
+        PATTERN "*.cpp"
+        PATTERN "*.h")
+    install(
+        DIRECTORY "${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/"
+        DESTINATION vernon_dsl/runtime_src/lib/execution_graph
         COMPONENT VernonWheel
         FILES_MATCHING
         PATTERN "*.cpp"

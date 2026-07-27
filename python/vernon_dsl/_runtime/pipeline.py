@@ -10,8 +10,7 @@ from typing import Any, ClassVar
 
 import numpy as np
 
-from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
-from ..pipeline_compile import (
+from ..bundle import (
     CompiledStage,
     PipelineCompileError,
     TargetOptions,
@@ -21,6 +20,16 @@ from ..pipeline_compile import (
     inline_artifact_descriptor,
     materialize_bundle,
     serialize_bundle,
+)
+from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
+from .execution_graph import (
+    ExecutionGraph,
+    ExecutionResources,
+    GraphicsEncoder,
+    LoadOperation,
+    PipelineInvocation,
+    RenderPass,
+    StoreOperation,
 )
 from .resources import (
     RenderTarget,
@@ -223,13 +232,11 @@ class Pipeline:
             )
         raise RuntimeError("unsupported graphics backend")
 
-    def _invoke_direct(self, arguments: dict[str, Any]) -> None:
+    def _invoke_direct(self, arguments: dict[str, Any], encoder: GraphicsEncoder) -> None:
         state = _session_state()
-        target = arguments.pop("target", None)
+        target = encoder.target
         indices = arguments.pop("indices", None)
         topology = arguments.pop("topology", triangles)
-        if not isinstance(target, RenderTarget):
-            raise TypeError("target must be a RenderTarget")
         compiled = self._compile(arguments)
         parameters = tuple(compiled.native.parameters)
         expected = {parameter.name for parameter in parameters}
@@ -274,11 +281,47 @@ class Pipeline:
         attachment_locations = {location for location, _ in color_attachments}
         if attachment_locations != output_locations:
             raise ValueError("RenderTarget color locations must exactly match fragment output locations")
+        operations = encoder.attachment_operations
+        first_in_scope = operations["first_in_scope"]
+        last_in_scope = operations["last_in_scope"]
+        load_values = {
+            LoadOperation.CLEAR: state._native.ATTACHMENT_CLEAR,
+            LoadOperation.PRESERVE: state._native.ATTACHMENT_PRESERVE,
+            LoadOperation.DISCARD: state._native.ATTACHMENT_DISCARD,
+        }
+        store_values = {
+            StoreOperation.PRESERVE: state._native.ATTACHMENT_STORE,
+            StoreOperation.DISCARD: state._native.ATTACHMENT_DONT_CARE,
+        }
         for location, texture in color_attachments:
-            builder.rhi_color_attachment(location, texture._resident_texture())
+            attachment = operations["colors"][location]
+            load = (
+                attachment.load if first_in_scope or attachment.load is LoadOperation.CLEAR else LoadOperation.PRESERVE
+            )
+            store = attachment.store if last_in_scope else StoreOperation.PRESERVE
+            builder.rhi_color_attachment(
+                location,
+                texture._resident_texture(),
+                load_values[load],
+                store_values[store],
+                list(attachment.clear_value),
+            )
         depth_attachment = target._resident_depth_attachment()
         if depth_attachment is not None:
-            builder.rhi_depth_attachment(depth_attachment)
+            attachment = operations["depth"]
+            assert attachment is not None
+            load = (
+                attachment.depth_load
+                if first_in_scope or attachment.depth_load is LoadOperation.CLEAR
+                else LoadOperation.PRESERVE
+            )
+            store = attachment.depth_store if last_in_scope else StoreOperation.PRESERVE
+            builder.rhi_depth_attachment(
+                depth_attachment,
+                load_values[load],
+                store_values[store],
+                attachment.clear_depth,
+            )
         if indices is not None:
             if (
                 not isinstance(indices, TensorStorage)
@@ -297,14 +340,36 @@ class Pipeline:
         if native_topology is None:
             raise TypeError("topology must be triangles, lines, or points")
         builder.topology(native_topology)
+        if encoder.viewport is not None:
+            builder.viewport(*encoder.viewport)
+        if encoder.scissor is not None:
+            builder.scissor(*encoder.scissor)
         assert state._native_runtime is not None
         with _dispatch_borrow_scope(dispatch_borrows):
             compiled.native.invoke(builder)
         for _, texture in color_attachments:
             texture._mark_device_dirty()
 
+    def invocation(self, **arguments: Any) -> PipelineInvocation:
+        captured = dict(arguments)
+        return PipelineInvocation("graphics", lambda encoder: self._invoke_direct(dict(captured), encoder))
+
     def __call__(self, **arguments: Any) -> None:
-        self._invoke_direct(arguments)
+        target = arguments.pop("target", None)
+        if not isinstance(target, RenderTarget):
+            raise TypeError("immediate graphics execution requires target=RenderTarget")
+        invocation = self.invocation(**arguments)
+
+        class _ImmediateRenderPass(RenderPass):
+            def declare(self) -> None:
+                self.attachments(target)
+
+            def execute(self, encoder: GraphicsEncoder, resources: ExecutionResources) -> None:
+                invocation.encode(encoder, resources)
+
+        graph = ExecutionGraph()
+        graph.add_pass(_ImmediateRenderPass(f"{self._fragment.__name__} immediate"))
+        graph.execute()
 
 
 def pipeline(*stages: Any, features: Iterable[str] = ()) -> Pipeline:

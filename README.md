@@ -304,22 +304,6 @@ build/source/Release/vernon-compile.exe `
   --output-dir build/opengl
 ```
 
-To cook an OpenGL shader directly into a Vernon asset, provide its stable
-asset ID and a normal output directory:
-
-```powershell
-build/source/Release/vernon-compile.exe `
-  --target opengl build/runtime.mlir `
-  --glsl-version 330 `
-  --bundle assets/shaders/runtime `
-  --asset-id shaders/runtime
-```
-
-This direct `--bundle` compatibility path contains `shader.json` plus readable
-generated vertex and fragment GLSL files. It remains available for legacy
-OpenGL tooling. The target PipelineAsset cooker is `vernon-cook-pipeline`; the
-target and its options are supplied at cook time.
-
 Declare persistent assets beside their stage functions. The declaration is
 read from the source AST and never imports or executes the module. The target
 PipelineAsset API is:

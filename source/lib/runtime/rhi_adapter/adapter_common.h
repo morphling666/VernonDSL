@@ -4,9 +4,23 @@
 #include "adapter_internal.h"
 #include "adapter_test_hooks.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+
+struct OpenGLFramebufferSignature {
+    std::array<uint64_t, 18> values{};
+    size_t count{};
+
+    bool operator==(const OpenGLFramebufferSignature &other) const {
+        return count == other.count && std::equal(values.begin(), values.begin() + count, other.values.begin());
+    }
+};
 
 struct VernonRuntimeRhiAdapter {
     VernonRhiDevice rhiDevice{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
@@ -16,8 +30,27 @@ struct VernonRuntimeRhiAdapter {
     vernon::rhi::cuda::DeviceState *device{};
 #endif
     vernon::rhi::opengl::DeviceState *openGLDevice{};
+    uint64_t openGLProgram{};
+    uint64_t openGLVertexArray{};
+    uint64_t openGLFramebuffer{};
+    uint64_t openGLFramebufferGeneration{};
+    std::array<uint32_t, 4> openGLViewport{};
+    std::array<uint32_t, 4> openGLScissor{};
+    std::unordered_map<uint64_t, OpenGLFramebufferSignature> openGLFramebufferSignatures;
+    bool openGLProgramValid{};
+    bool openGLVertexArrayValid{};
+    bool openGLFramebufferValid{};
+    bool openGLViewportValid{};
+    bool openGLScissorValid{};
 #if defined(VERNON_HAS_DIRECTX12_RHI)
+    struct RetainedDirectX12Resource {
+        // RHI slot addresses may be reused before RuntimeCore releases an old binding.
+        // Keep native COM references in retain order so release never dereferences that slot.
+        std::deque<ID3D12Resource *> resources;
+    };
     vernon::rhi::directx12::DeviceState *directX12Device{};
+    std::mutex directX12RetainedResourceMutex;
+    std::unordered_map<uint64_t, RetainedDirectX12Resource> directX12RetainedResources;
 #endif
 #if defined(VERNON_HAS_VULKAN_RHI)
     vernon::rhi::vulkan::DeviceState *vulkanDevice{};

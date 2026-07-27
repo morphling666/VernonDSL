@@ -103,6 +103,7 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
         }
     }
 
+    plan.commandEncoder = invocation.command_encoder;
     plan.grid = invocation.compute_grid;
     if (!plan.grid.x || !plan.grid.y || !plan.grid.z) {
         for (const Parameter &parameter : variant.parameters) {

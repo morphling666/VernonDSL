@@ -16,6 +16,7 @@ struct MockProvider {
     uint32_t dispatches{};
     uint32_t retainedResources{};
     uint32_t releasedResources{};
+    VernonRuntimeProviderObject lastEncoder{};
     VernonRuntimeProviderDispatchDescriptor lastDispatch{};
 };
 
@@ -66,10 +67,11 @@ VernonRuntimeDeviceProvider makeProvider(MockProvider &mock, uint32_t capabiliti
     };
     provider.update_binding_set = [](void *, VernonRuntimeProviderObject, const VernonRuntimeProviderBindingValue *,
                                      size_t) { return VERNON_STATUS_OK; };
-    provider.encode_dispatch = [](void *data, VernonRuntimeProviderObject,
+    provider.encode_dispatch = [](void *data, VernonRuntimeProviderObject encoder,
                                   const VernonRuntimeProviderDispatchDescriptor *descriptor) {
         auto &state = *static_cast<MockProvider *>(data);
         ++state.dispatches;
+        state.lastEncoder = encoder;
         state.lastDispatch = *descriptor;
         return VERNON_STATUS_OK;
     };
@@ -156,6 +158,7 @@ TEST(RuntimeForeignProvider, PreparesBindsAndEncodesWithNumericSlots) {
     EXPECT_EQ(mock.pipelinePreparations, 1u);
     EXPECT_EQ(mock.bindingCreations, 1u);
     EXPECT_EQ(mock.dispatches, 1u);
+    EXPECT_EQ(mock.lastEncoder.value, 200u);
     EXPECT_EQ(mock.lastDispatch.group_count[0], 4u);
 
     vernonRuntimeCorePipelineDestroy(pipeline);

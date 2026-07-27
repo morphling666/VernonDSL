@@ -392,40 +392,51 @@ VernonStatus retainResource(void *data, VernonRuntimeProviderResourceReference r
     const uint64_t kind = resource.identity & kDirectX12ResourceKindMask;
     if ((resource.identity & ~kDirectX12ResourceKindMask) != deviceIdentity || resource.resource.value == 0)
         return fail(adapter, "D3D12 adapter received a foreign or invalid resource");
+    ID3D12Resource *native = nullptr;
     if (kind == kDirectX12ImageResource) {
         auto *image = fromHandle<rhi::directx12::Image>(resource.resource);
         if (!image->resource)
             return fail(adapter, "D3D12 adapter received an invalid image");
-        image->resource->AddRef();
+        native = image->resource;
     } else if (kind == kDirectX12SamplerResource) {
         if (!fromHandle<rhi::directx12::Sampler>(resource.resource))
             return fail(adapter, "D3D12 adapter received an invalid sampler");
+        return VERNON_STATUS_OK;
     } else if (kind == kDirectX12BufferResource) {
         auto *buffer = fromHandle<rhi::directx12::Buffer>(resource.resource);
         if (!buffer->resource)
             return fail(adapter, "D3D12 adapter received an invalid buffer");
-        buffer->resource->AddRef();
+        native = buffer->resource;
     } else {
-        fromHandle<ID3D12Resource>(resource.resource)->AddRef();
+        native = fromHandle<ID3D12Resource>(resource.resource);
+    }
+    std::lock_guard<std::mutex> guard(adapter.directX12RetainedResourceMutex);
+    native->AddRef();
+    try {
+        adapter.directX12RetainedResources[resource.resource.value].resources.push_back(native);
+    } catch (const std::bad_alloc &) {
+        native->Release();
+        auto retained = adapter.directX12RetainedResources.find(resource.resource.value);
+        if (retained != adapter.directX12RetainedResources.end() && retained->second.resources.empty())
+            adapter.directX12RetainedResources.erase(retained);
+        return fail(adapter, "D3D12 retained resource bookkeeping ran out of memory", VERNON_STATUS_INTERNAL_ERROR);
     }
     return VERNON_STATUS_OK;
 }
 
-void releaseResource(void *, VernonRuntimeProviderResourceReference resource) {
+void releaseResource(void *data, VernonRuntimeProviderResourceReference resource) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     const uint64_t kind = resource.identity & kDirectX12ResourceKindMask;
-    if (kind == kDirectX12ImageResource) {
-        auto *image = fromHandle<rhi::directx12::Image>(resource.resource);
-        if (image && image->resource)
-            image->resource->Release();
-    } else if (kind == kDirectX12BufferResource) {
-        auto *buffer = fromHandle<rhi::directx12::Buffer>(resource.resource);
-        if (buffer && buffer->resource)
-            buffer->resource->Release();
-    } else if (kind != kDirectX12SamplerResource) {
-        auto *buffer = fromHandle<ID3D12Resource>(resource.resource);
-        if (buffer)
-            buffer->Release();
-    }
+    if (kind == kDirectX12SamplerResource)
+        return;
+    std::lock_guard<std::mutex> guard(adapter.directX12RetainedResourceMutex);
+    auto retained = adapter.directX12RetainedResources.find(resource.resource.value);
+    if (retained == adapter.directX12RetainedResources.end() || retained->second.resources.empty())
+        return;
+    retained->second.resources.front()->Release();
+    retained->second.resources.pop_front();
+    if (retained->second.resources.empty())
+        adapter.directX12RetainedResources.erase(retained);
 }
 
 VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindingSet &bindings,
@@ -774,22 +785,68 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject,
             }
         }
     }
-    device.commands->OMSetRenderTargets(static_cast<UINT>(descriptor->color_attachment_count), renderTargets.data(),
-                                        FALSE, hasDepth ? &dsv : nullptr);
-    constexpr float clearColor[4]{};
-    for (size_t index = 0; index < descriptor->color_attachment_count; ++index)
-        device.commands->ClearRenderTargetView(renderTargets[index], clearColor, 0, nullptr);
-    if (hasDepth)
-        device.commands->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+    ID3D12GraphicsCommandList4 *renderPassCommands = nullptr;
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5{};
+    const bool supportsRenderPass =
+        SUCCEEDED(device.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options5, sizeof(options5))) &&
+        options5.RenderPassesTier != D3D12_RENDER_PASS_TIER_0 &&
+        SUCCEEDED(device.commands->QueryInterface(IID_PPV_ARGS(&renderPassCommands)));
+    std::array<D3D12_RENDER_PASS_RENDER_TARGET_DESC, 8> renderPassTargets{};
+    D3D12_RENDER_PASS_DEPTH_STENCIL_DESC renderPassDepth{};
+    if (supportsRenderPass) {
+        for (size_t index = 0; index < descriptor->color_attachment_count; ++index) {
+            const auto &source = descriptor->color_attachments[index];
+            auto *image = fromHandle<rhi::directx12::Image>(source.image.resource);
+            auto &target = renderPassTargets[index];
+            target.cpuDescriptor = renderTargets[index];
+            target.BeginningAccess.Type =
+                source.load_operation == VERNON_RHI_LOAD_CLEAR      ? D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR
+                : source.load_operation == VERNON_RHI_LOAD_PRESERVE ? D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE
+                                                                    : D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_DISCARD;
+            target.BeginningAccess.Clear.ClearValue.Format = image->format;
+            std::copy(std::begin(source.clear_color), std::end(source.clear_color),
+                      target.BeginningAccess.Clear.ClearValue.Color);
+            target.EndingAccess.Type = source.store_operation == VERNON_RHI_STORE_PRESERVE
+                                           ? D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE
+                                           : D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_DISCARD;
+        }
+        if (hasDepth) {
+            renderPassDepth.cpuDescriptor = dsv;
+            renderPassDepth.DepthBeginningAccess.Type = descriptor->depth_load_operation == VERNON_RHI_LOAD_CLEAR
+                                                            ? D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR
+                                                        : descriptor->depth_load_operation == VERNON_RHI_LOAD_PRESERVE
+                                                            ? D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE
+                                                            : D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_DISCARD;
+            renderPassDepth.DepthBeginningAccess.Clear.ClearValue.Format = DXGI_FORMAT_D32_FLOAT;
+            renderPassDepth.DepthBeginningAccess.Clear.ClearValue.DepthStencil.Depth = descriptor->clear_depth;
+            renderPassDepth.DepthEndingAccess.Type = descriptor->depth_store_operation == VERNON_RHI_STORE_PRESERVE
+                                                         ? D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE
+                                                         : D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_DISCARD;
+            renderPassDepth.StencilBeginningAccess.Type = D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_NO_ACCESS;
+            renderPassDepth.StencilEndingAccess.Type = D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_NO_ACCESS;
+        }
+        renderPassCommands->BeginRenderPass(static_cast<UINT>(descriptor->color_attachment_count),
+                                            renderPassTargets.data(), hasDepth ? &renderPassDepth : nullptr,
+                                            D3D12_RENDER_PASS_FLAG_NONE);
+    } else {
+        device.commands->OMSetRenderTargets(static_cast<UINT>(descriptor->color_attachment_count), renderTargets.data(),
+                                            FALSE, hasDepth ? &dsv : nullptr);
+        for (size_t index = 0; index < descriptor->color_attachment_count; ++index)
+            if (descriptor->color_attachments[index].load_operation == VERNON_RHI_LOAD_CLEAR)
+                device.commands->ClearRenderTargetView(renderTargets[index],
+                                                       descriptor->color_attachments[index].clear_color, 0, nullptr);
+        if (hasDepth && descriptor->depth_load_operation == VERNON_RHI_LOAD_CLEAR)
+            device.commands->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, descriptor->clear_depth, 0, 0, nullptr);
+    }
     const D3D12_VIEWPORT viewport{static_cast<float>(descriptor->viewport[0]),
                                   static_cast<float>(descriptor->viewport[1]),
                                   static_cast<float>(descriptor->viewport[2]),
                                   static_cast<float>(descriptor->viewport[3]),
                                   0,
                                   1};
-    const D3D12_RECT scissor{static_cast<LONG>(descriptor->viewport[0]), static_cast<LONG>(descriptor->viewport[1]),
-                             static_cast<LONG>(descriptor->viewport[0] + descriptor->viewport[2]),
-                             static_cast<LONG>(descriptor->viewport[1] + descriptor->viewport[3])};
+    const D3D12_RECT scissor{static_cast<LONG>(descriptor->scissor[0]), static_cast<LONG>(descriptor->scissor[1]),
+                             static_cast<LONG>(descriptor->scissor[0] + descriptor->scissor[2]),
+                             static_cast<LONG>(descriptor->scissor[1] + descriptor->scissor[3])};
     device.commands->RSSetViewports(1, &viewport);
     device.commands->RSSetScissorRects(1, &scissor);
     const D3D_PRIMITIVE_TOPOLOGY topology = descriptor->topology == 1   ? D3D_PRIMITIVE_TOPOLOGY_LINELIST
@@ -810,6 +867,21 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject,
     } else {
         device.commands->DrawInstanced(descriptor->vertex_count, descriptor->instance_count, descriptor->first_vertex,
                                        descriptor->first_instance);
+    }
+    if (renderPassCommands) {
+        renderPassCommands->EndRenderPass();
+        renderPassCommands->Release();
+    }
+    if (!supportsRenderPass) {
+        for (size_t index = 0; index < descriptor->color_attachment_count; ++index)
+            if (descriptor->color_attachments[index].store_operation == VERNON_RHI_STORE_DISCARD) {
+                auto *image = fromHandle<rhi::directx12::Image>(descriptor->color_attachments[index].image.resource);
+                device.commands->DiscardResource(image->resource, nullptr);
+            }
+        if (hasDepth && descriptor->depth_store_operation == VERNON_RHI_STORE_DISCARD) {
+            auto *image = fromHandle<rhi::directx12::Image>(descriptor->depth_stencil_attachment.resource);
+            device.commands->DiscardResource(image->resource, nullptr);
+        }
     }
     if (!device.submitCommands(adapter.error))
         return VERNON_STATUS_INTERNAL_ERROR;

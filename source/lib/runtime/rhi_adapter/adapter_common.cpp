@@ -111,6 +111,17 @@ extern "C" VernonStatus vernonRuntimeRhiAdapterSynchronize(VernonRuntimeRhiAdapt
     return fail(*adapter, "adapter has no device", VERNON_STATUS_UNSUPPORTED_TARGET);
 }
 
+extern "C" void vernonRuntimeRhiAdapterInvalidateState(VernonRuntimeRhiAdapter *adapter) {
+    if (!adapter)
+        return;
+    adapter->openGLProgramValid = false;
+    adapter->openGLVertexArrayValid = false;
+    adapter->openGLFramebufferValid = false;
+    adapter->openGLViewportValid = false;
+    adapter->openGLScissorValid = false;
+    adapter->openGLFramebufferSignatures.clear();
+}
+
 extern "C" VernonStringView vernonRuntimeRhiAdapterGetLastError(const VernonRuntimeRhiAdapter *adapter) {
     return adapter ? VernonStringView{adapter->error.data(), adapter->error.size()} : VernonStringView{};
 }

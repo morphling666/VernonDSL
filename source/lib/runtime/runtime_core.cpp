@@ -436,21 +436,13 @@ extern "C" VernonStatus vernonRuntimeCoreEncodeDraw(const VernonRuntimeCorePipel
                                                     VernonRuntimeProviderObject commandEncoder, uint32_t vertexCount,
                                                     uint32_t instanceCount, uint32_t firstVertex,
                                                     uint32_t firstInstance) {
-    const VernonRuntimeCoreDrawInvocation invocation{sizeof(VernonRuntimeCoreDrawInvocation),
-                                                     commandEncoder,
-                                                     vertexCount,
-                                                     instanceCount,
-                                                     firstVertex,
-                                                     firstInstance,
-                                                     nullptr,
-                                                     0,
-                                                     {},
-                                                     {0, 0, 0, 0},
-                                                     0,
-                                                     {},
-                                                     0,
-                                                     0,
-                                                     {0, 0, 0, 0}};
+    VernonRuntimeCoreDrawInvocation invocation{};
+    invocation.struct_size = sizeof(invocation);
+    invocation.command_encoder = commandEncoder;
+    invocation.vertex_count = vertexCount;
+    invocation.instance_count = instanceCount;
+    invocation.first_vertex = firstVertex;
+    invocation.first_instance = firstInstance;
     return vernonRuntimeCoreEncodeDrawInvocation(pipeline, bindings, &invocation);
 }
 
@@ -474,7 +466,11 @@ extern "C" VernonStatus vernonRuntimeCoreEncodeDrawInvocation(const VernonRuntim
         invocation->color_attachments,
         invocation->color_attachment_count,
         invocation->depth_stencil_attachment,
+        invocation->depth_load_operation,
+        invocation->depth_store_operation,
+        invocation->clear_depth,
         {invocation->viewport[0], invocation->viewport[1], invocation->viewport[2], invocation->viewport[3]},
+        {invocation->scissor[0], invocation->scissor[1], invocation->scissor[2], invocation->scissor[3]},
         invocation->topology,
         invocation->index_buffer,
         invocation->index_count,
@@ -505,7 +501,11 @@ vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(const VernonRuntimeCoreGrap
         invocation->color_attachments,
         invocation->color_attachment_count,
         invocation->depth_stencil_attachment,
+        invocation->depth_load_operation,
+        invocation->depth_store_operation,
+        invocation->clear_depth,
         {invocation->viewport[0], invocation->viewport[1], invocation->viewport[2], invocation->viewport[3]},
+        {invocation->scissor[0], invocation->scissor[1], invocation->scissor[2], invocation->scissor[3]},
         invocation->topology,
         invocation->index_buffer,
         invocation->index_count,

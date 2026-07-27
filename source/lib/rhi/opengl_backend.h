@@ -57,6 +57,7 @@ struct VERNON_RHI_CAPI DeviceState {
 
     VernonOpenGLContextCallbacks callbacks{};
     bool embeddedProfile{};
+    uint64_t framebufferGeneration{};
     Driver driver{};
 };
 

@@ -637,6 +637,15 @@ VernonStatus vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline, const V
     return invokeBackendPipeline(*pipeline, *invocation, plan);
 }
 
+VernonStatus vernonRuntimePipelineEncode(VernonRuntimeProviderObject encoder, VernonLoadedPipeline *pipeline,
+                                         const VernonPipelineInvocation *invocation) {
+    if (!invocation)
+        return fail(pipeline ? pipeline->context : nullptr, "invalid pipeline invocation");
+    VernonPipelineInvocation encoded = *invocation;
+    encoded.command_encoder = encoder;
+    return vernonRuntimePipelineInvoke(pipeline, &encoded);
+}
+
 VernonStatus vernonRuntimeComputeToGraphicsBarrier(VernonRuntimeContext *context) {
     if (!context || (context->backend != VERNON_RUNTIME_OPENGL && context->backend != VERNON_RUNTIME_OPENGL_ES))
         return VERNON_STATUS_UNSUPPORTED_TARGET;

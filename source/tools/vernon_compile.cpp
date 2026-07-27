@@ -44,11 +44,9 @@ int main(int argc, char **argv) {
                      "[--output-dir <directory>] [--reflection <file>] "
                      "[--glsl-version <version>] "
                      "[--hlsl-shader-model <model>] "
-                     "[--bundle <directory> --asset-id <id>] "
                      "[--compute-bundle <directory>] [--host-runtime-bundle] "
                      "[--target-triple <triple>] [--cpu <name>] "
                      "[--cpu-features <features>]\n"
-                     "  --bundle writes a compiled OpenGL shader asset.\n"
                      "  --compute-bundle writes a relocatable CPU object bundle.\n"
                      "  --host-runtime-bundle finalizes that object with embedded "
                      "LLD for immediate host execution.\n";
@@ -58,7 +56,7 @@ int main(int argc, char **argv) {
     const bool validateOnly = std::string_view(argv[1]) != "--target";
     std::optional<VernonTarget> target;
     const char *inputPath = argv[1];
-    vernon::tools::LegacyPackagingOptions packaging;
+    vernon::tools::PackagingOptions packaging;
     std::optional<uint32_t> glslVersion;
     std::optional<uint32_t> hlslShaderModel;
     std::optional<std::string> cpuName;
@@ -84,12 +82,8 @@ int main(int argc, char **argv) {
                 packaging.outputDirectory = argv[index + 1];
             else if (option == "--reflection")
                 packaging.reflectionPath = argv[index + 1];
-            else if (option == "--bundle")
-                packaging.shaderBundlePath = argv[index + 1];
             else if (option == "--compute-bundle")
                 packaging.computeBundlePath = argv[index + 1];
-            else if (option == "--asset-id")
-                packaging.assetId = argv[index + 1];
             else if (option == "--target-triple")
                 packaging.targetTriple = argv[index + 1];
             else if (option == "--cpu")
@@ -120,23 +114,8 @@ int main(int argc, char **argv) {
             }
             index += 2;
         }
-        if (packaging.shaderBundlePath.has_value() != packaging.assetId.has_value()) {
-            std::cerr << "--bundle and --asset-id must be specified together\n";
-            return 2;
-        }
-        if (packaging.shaderBundlePath && *target != VERNON_TARGET_OPENGL) {
-            std::cerr << "--bundle writes a compiled shader asset and requires "
-                         "target opengl; use --compute-bundle for runtime compute "
-                         "artifacts\n";
-            return 2;
-        }
-        if (packaging.shaderBundlePath && packaging.outputDirectory) {
-            std::cerr << "--bundle and --output-dir cannot be combined\n";
-            return 2;
-        }
-        if (packaging.computeBundlePath && (packaging.shaderBundlePath || packaging.outputDirectory)) {
-            std::cerr << "--compute-bundle cannot be combined with --bundle or "
-                         "--output-dir\n";
+        if (packaging.computeBundlePath && packaging.outputDirectory) {
+            std::cerr << "--compute-bundle cannot be combined with --output-dir\n";
             return 2;
         }
         if (packaging.hostRuntimeBundle && (!packaging.computeBundlePath || *target != VERNON_TARGET_CPU)) {

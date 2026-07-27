@@ -2190,6 +2190,22 @@ vernonRhiDeviceGetNativeDescriptorRange(VernonRhiDevice handle, VernonRhiNativeD
 #endif
 }
 
+bool vernon::rhi::deviceExists(VernonRhiDevice handle) {
+#if defined(VERNON_HAS_CUDA_RHI)
+    if (lookupCudaDevice(handle))
+        return true;
+#endif
+#if defined(VERNON_HAS_DIRECTX12_RHI)
+    if (lookupDirectX12Device(handle))
+        return true;
+#endif
+#if defined(VERNON_HAS_VULKAN_RHI)
+    if (lookupVulkanDevice(handle))
+        return true;
+#endif
+    return static_cast<bool>(lookupDevice(handle));
+}
+
 void *vernon::rhi::deviceState(VernonRhiDevice handle, VernonRhiBackend backend) {
 #if defined(VERNON_HAS_CUDA_RHI)
     if (backend == VERNON_RHI_BACKEND_CUDA)

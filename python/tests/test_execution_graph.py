@@ -1,0 +1,139 @@
+from __future__ import annotations
+
+import unittest
+
+import vernon_dsl as vd
+
+
+class RecordingComputePass(vd.ComputePass):
+    def __init__(
+        self,
+        name: str,
+        events: list[str],
+        *,
+        read: object | None = None,
+        write: object | None = None,
+    ):
+        super().__init__(name)
+        self.events = events
+        self.read_resource = read
+        self.write_resource = write
+
+    def declare(self) -> None:
+        if self.read_resource is not None:
+            self.read(self.read_resource)
+        if self.write_resource is not None:
+            self.write(self.write_resource)
+
+    def execute(self, encoder: vd.ComputeEncoder, resources: vd.ExecutionResources) -> None:
+        self.events.append(self.name)
+
+
+class RecordingRenderPass(vd.RenderPass):
+    def __init__(
+        self,
+        name: str,
+        events: list[str],
+        target: vd.RenderTarget,
+        invocation: vd.PipelineInvocation | None = None,
+    ):
+        super().__init__(name)
+        self.events = events
+        self.target = target
+        self.invocation = invocation
+
+    def declare(self) -> None:
+        self.attachments(self.target)
+
+    def execute(self, encoder: vd.GraphicsEncoder, resources: vd.ExecutionResources) -> None:
+        self.events.append(self.name)
+        if self.invocation is not None:
+            self.invocation.encode(encoder, resources)
+
+
+class ExecutionGraphTests(unittest.TestCase):
+    def test_hazards_schedule_producer_before_consumer(self) -> None:
+        graph = vd.ExecutionGraph()
+        events: list[str] = []
+        source = object()
+        intermediate = object()
+        output = object()
+        graph.add_pass(RecordingComputePass("producer", events, read=source, write=intermediate))
+        graph.add_pass(RecordingComputePass("consumer", events, read=intermediate, write=output))
+
+        graph.execute()
+
+        self.assertEqual([execution_pass.name for execution_pass in graph.schedule], ["producer", "consumer"])
+        self.assertEqual(events, ["producer", "consumer"])
+        self.assertEqual(len(graph.scopes[1].barriers), 1)
+
+    def test_cycle_is_rejected_with_pass_names(self) -> None:
+        graph = vd.ExecutionGraph()
+        events: list[str] = []
+        first = graph.add_pass(RecordingComputePass("first", events))
+        second = graph.add_pass(RecordingComputePass("second", events))
+        first.side_effect = True
+        second.side_effect = True
+        first.depends_on(second)
+        second.depends_on(first)
+
+        with self.assertRaisesRegex(ValueError, "first.*second|second.*first"):
+            graph.compile()
+
+    def test_culls_transient_work_without_live_consumers(self) -> None:
+        graph = vd.ExecutionGraph()
+        events: list[str] = []
+        transient = graph.import_resource(object(), exported=False)
+        output = graph.import_resource(object())
+        graph.add_pass(RecordingComputePass("dead", events, write=transient))
+        graph.add_pass(RecordingComputePass("live", events, write=output))
+
+        graph.execute()
+
+        self.assertEqual([execution_pass.name for execution_pass in graph.schedule], ["live"])
+        self.assertEqual(events, ["live"])
+
+    def test_compatible_render_passes_fuse_and_compute_splits(self) -> None:
+        graph = vd.ExecutionGraph()
+        events: list[str] = []
+        color = vd.Texture.zeros(shape=(8, 8))
+        target = vd.RenderTarget(shape=color.shape).attach_color(0, color)
+        graph.add_pass(RecordingRenderPass("first", events, target))
+        graph.add_pass(RecordingRenderPass("second", events, target))
+        compute = RecordingComputePass("compute", events)
+        compute.side_effect = True
+        graph.add_pass(compute)
+
+        graph.compile()
+
+        self.assertEqual([scope.kind for scope in graph.scopes], ["render", "compute"])
+        self.assertEqual([execution_pass.name for execution_pass in graph.scopes[0].passes], ["first", "second"])
+
+    def test_no_merge_splits_matching_render_targets(self) -> None:
+        graph = vd.ExecutionGraph()
+        color = vd.Texture.zeros(shape=(8, 8))
+        target = vd.RenderTarget(shape=color.shape).attach_color(0, color)
+        first = RecordingRenderPass("first", [], target)
+        second = RecordingRenderPass("second", [], target)
+        second.no_merge = True
+        graph.add_pass(first)
+        graph.add_pass(second)
+
+        graph.compile()
+
+        self.assertEqual([scope.kind for scope in graph.scopes], ["render", "render"])
+
+    def test_unified_pipeline_invocation_checks_encoder_kind(self) -> None:
+        invocation = vd.PipelineInvocation("compute", lambda encoder: None)
+        color = vd.Texture.zeros(shape=(4, 4))
+        target = vd.RenderTarget(shape=color.shape).attach_color(0, color)
+        render_pass = RecordingRenderPass("render", [], target, invocation)
+        graph = vd.ExecutionGraph()
+        graph.add_pass(render_pass)
+
+        with self.assertRaisesRegex(TypeError, "compute invocation"):
+            graph.execute()
+
+
+if __name__ == "__main__":
+    unittest.main()

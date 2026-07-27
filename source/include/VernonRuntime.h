@@ -127,6 +127,9 @@ typedef struct VernonColorAttachment {
     uint32_t width;
     uint32_t height;
     VernonTextureFormat format;
+    VernonRhiLoadOperation load_operation;
+    VernonRhiStoreOperation store_operation;
+    float clear_color[4];
 } VernonColorAttachment;
 
 typedef struct VernonDepthAttachment {
@@ -134,6 +137,9 @@ typedef struct VernonDepthAttachment {
     uint32_t width;
     uint32_t height;
     VernonTextureFormat format;
+    VernonRhiLoadOperation load_operation;
+    VernonRhiStoreOperation store_operation;
+    float clear_depth;
 } VernonDepthAttachment;
 
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeComputeToGraphicsBarrier(VernonRuntimeContext *context);
@@ -272,6 +278,7 @@ typedef struct VernonPipelineInvocation {
     VernonLaunchSize compute_grid;
     uint32_t viewport[4];
     uint32_t scissor[4];
+    VernonRuntimeProviderObject command_encoder;
 } VernonPipelineInvocation;
 
 typedef struct VernonPipelineParameterView {
@@ -348,6 +355,9 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineFindOutput(const Ver
                                                                        VernonStringView name,
                                                                        VernonPipelineOutputView *output);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
+                                                             const VernonPipelineInvocation *invocation);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimePipelineEncode(VernonRuntimeProviderObject encoder,
+                                                             VernonLoadedPipeline *pipeline,
                                                              const VernonPipelineInvocation *invocation);
 
 #ifdef __cplusplus

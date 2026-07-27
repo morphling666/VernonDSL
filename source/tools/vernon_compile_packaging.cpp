@@ -104,8 +104,8 @@ bool linkHostLibrary(VernonCompilerContext *context, VernonStringView object, st
 namespace vernon::tools {
 
 VernonStatus packageCompileResult(VernonCompilerContext *context, const VernonCompileResult *result,
-                                  VernonTarget target, const LegacyPackagingOptions &options,
-                                  std::ostream &standardOutput, std::ostream &standardError) {
+                                  VernonTarget target, const PackagingOptions &options, std::ostream &standardOutput,
+                                  std::ostream &standardError) {
     VernonStatus status = vernonCompileResultGetStatus(result);
     if (status != VERNON_STATUS_OK)
         return status;
@@ -118,7 +118,7 @@ VernonStatus packageCompileResult(VernonCompilerContext *context, const VernonCo
             std::filesystem::path path = *options.outputDirectory / std::string(name.data, name.size);
             std::ofstream output(path, std::ios::binary);
             writeView(output, vernonCompileResultGetArtifactData(result, index));
-        } else if (!options.shaderBundlePath && !options.computeBundlePath) {
+        } else if (!options.computeBundlePath) {
             if (artifactCount > 1) {
                 standardOutput << "// artifact: ";
                 writeView(standardOutput, vernonCompileResultGetArtifactName(result, index));
@@ -131,50 +131,7 @@ VernonStatus packageCompileResult(VernonCompilerContext *context, const VernonCo
     }
 
     VernonStringView reflection = vernonCompileResultGetReflection(result);
-    if (options.shaderBundlePath) {
-        llvm::json::Object bundle;
-        bundle["schema_version"] = int64_t{1};
-        bundle["type"] = "compiled_shader_bundle";
-        bundle["id"] = *options.assetId;
-        bundle["target"] = std::string(targetName(target));
-        llvm::Expected<llvm::json::Value> parsedReflection =
-            llvm::json::parse(llvm::StringRef(reflection.data, reflection.size));
-        if (!parsedReflection) {
-            standardError << "compiler produced invalid reflection JSON\n";
-            return VERNON_STATUS_INTERNAL_ERROR;
-        }
-        bundle["reflection"] = std::move(*parsedReflection);
-        std::error_code error;
-        std::filesystem::create_directories(*options.shaderBundlePath, error);
-        if (error || !std::filesystem::is_directory(*options.shaderBundlePath)) {
-            standardError << "cannot create bundle directory " << options.shaderBundlePath->string() << '\n';
-            return VERNON_STATUS_INTERNAL_ERROR;
-        }
-        for (size_t index = 0; index < artifactCount; ++index) {
-            VernonStringView name = vernonCompileResultGetArtifactName(result, index);
-            VernonStringView data = vernonCompileResultGetArtifactData(result, index);
-            std::filesystem::path artifactPath = *options.shaderBundlePath / std::string(name.data, name.size);
-            std::ofstream artifactOutput(artifactPath, std::ios::binary);
-            writeView(artifactOutput, data);
-            artifactOutput.close();
-            if (!artifactOutput) {
-                standardError << "cannot write bundle artifact " << artifactPath.string() << '\n';
-                return VERNON_STATUS_INTERNAL_ERROR;
-            }
-        }
-        std::filesystem::path manifestPath = *options.shaderBundlePath / "shader.json";
-        std::ofstream output(manifestPath, std::ios::binary);
-        std::string encoded;
-        llvm::raw_string_ostream stream(encoded);
-        stream << llvm::formatv("{0:2}", llvm::json::Value(std::move(bundle)));
-        stream.flush();
-        output << encoded << '\n';
-        output.close();
-        if (!output) {
-            standardError << "cannot write bundle manifest " << manifestPath.string() << '\n';
-            return VERNON_STATUS_INTERNAL_ERROR;
-        }
-    } else if (options.computeBundlePath) {
+    if (options.computeBundlePath) {
         llvm::Expected<llvm::json::Value> parsedReflection =
             llvm::json::parse(llvm::StringRef(reflection.data, reflection.size));
         llvm::json::Object *reflectionObject = parsedReflection ? parsedReflection->getAsObject() : nullptr;

@@ -66,6 +66,21 @@ struct PreparedBindingSet {
     }
 };
 
+VkAttachmentLoadOp attachmentLoad(uint32_t operation) {
+    switch (operation) {
+    case VERNON_RHI_LOAD_CLEAR:
+        return VK_ATTACHMENT_LOAD_OP_CLEAR;
+    case VERNON_RHI_LOAD_PRESERVE:
+        return VK_ATTACHMENT_LOAD_OP_LOAD;
+    default:
+        return VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    }
+}
+
+VkAttachmentStoreOp attachmentStore(uint32_t operation) {
+    return operation == VERNON_RHI_STORE_PRESERVE ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+}
+
 VkShaderStageFlags stages(uint32_t value) {
     VkShaderStageFlags result = 0;
     if (value & VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE)
@@ -510,7 +525,7 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
                 attachment.format = static_cast<VkFormat>(descriptor->depth_stencil_format);
                 attachment.samples = static_cast<VkSampleCountFlagBits>(std::max(1u, descriptor->sample_count));
                 attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-                attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
                 attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
                 attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
                 attachment.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -795,6 +810,18 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject,
         return VERNON_STATUS_INTERNAL_ERROR;
     std::array<VkRenderingAttachmentInfo, 8> attachments{};
     std::array<VkImageView, 9> imageViews{};
+    if (!pipeline->device->dynamicRendering) {
+        for (size_t index = 0; index < descriptor->color_attachment_count; ++index)
+            if (descriptor->color_attachments[index].load_operation != VERNON_RHI_LOAD_CLEAR ||
+                descriptor->color_attachments[index].store_operation != VERNON_RHI_STORE_PRESERVE)
+                return fail(adapter, "Vulkan render-pass fallback requires clear/store attachments",
+                            VERNON_STATUS_UNSUPPORTED_TARGET);
+        if (descriptor->depth_stencil_attachment.resource.value &&
+            (descriptor->depth_load_operation != VERNON_RHI_LOAD_CLEAR ||
+             descriptor->depth_store_operation != VERNON_RHI_STORE_PRESERVE))
+            return fail(adapter, "Vulkan render-pass fallback requires clear/store depth",
+                        VERNON_STATUS_UNSUPPORTED_TARGET);
+    }
     for (size_t index = 0; index < descriptor->color_attachment_count; ++index) {
         auto *image = fromHandle<rhi::vulkan::Image>(descriptor->color_attachments[index].image.resource);
         transitionImage(command, *image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
@@ -806,9 +833,12 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject,
                               VK_RESOLVE_MODE_NONE,
                               {},
                               VK_IMAGE_LAYOUT_UNDEFINED,
-                              VK_ATTACHMENT_LOAD_OP_CLEAR,
-                              VK_ATTACHMENT_STORE_OP_STORE,
+                              attachmentLoad(descriptor->color_attachments[index].load_operation),
+                              attachmentStore(descriptor->color_attachments[index].store_operation),
                               {}};
+        std::copy(std::begin(descriptor->color_attachments[index].clear_color),
+                  std::end(descriptor->color_attachments[index].clear_color),
+                  attachments[index].clearValue.color.float32);
     }
     VkRenderingAttachmentInfo depthAttachment{};
     if (descriptor->depth_stencil_attachment.resource.value) {
@@ -824,10 +854,10 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject,
                            VK_RESOLVE_MODE_NONE,
                            {},
                            VK_IMAGE_LAYOUT_UNDEFINED,
-                           VK_ATTACHMENT_LOAD_OP_CLEAR,
-                           VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                           attachmentLoad(descriptor->depth_load_operation),
+                           attachmentStore(descriptor->depth_store_operation),
                            {}};
-        depthAttachment.clearValue.depthStencil = {1.0f, 0};
+        depthAttachment.clearValue.depthStencil = {descriptor->clear_depth, 0};
     }
     const VkRenderingInfo rendering{
         VK_STRUCTURE_TYPE_RENDERING_INFO,
@@ -862,8 +892,11 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject,
         if (result != VK_SUCCESS)
             return failure(adapter, result, "vkCreateFramebuffer");
         std::array<VkClearValue, 9> clearValues{};
+        for (size_t index = 0; index < descriptor->color_attachment_count; ++index)
+            std::copy(std::begin(descriptor->color_attachments[index].clear_color),
+                      std::end(descriptor->color_attachments[index].clear_color), clearValues[index].color.float32);
         if (descriptor->depth_stencil_attachment.resource.value)
-            clearValues[descriptor->color_attachment_count].depthStencil = {1.0f, 0};
+            clearValues[descriptor->color_attachment_count].depthStencil = {descriptor->clear_depth, 0};
         const VkRenderPassBeginInfo begin{
             VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
             nullptr,
@@ -895,9 +928,8 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject,
                               -static_cast<float>(descriptor->viewport[3]),
                               0,
                               1};
-    const VkRect2D scissor{
-        {static_cast<int32_t>(descriptor->viewport[0]), static_cast<int32_t>(descriptor->viewport[1])},
-        {descriptor->viewport[2], descriptor->viewport[3]}};
+    const VkRect2D scissor{{static_cast<int32_t>(descriptor->scissor[0]), static_cast<int32_t>(descriptor->scissor[1])},
+                           {descriptor->scissor[2], descriptor->scissor[3]}};
     driver.cmdSetViewport(command, 0, 1, &viewport);
     driver.cmdSetScissor(command, 0, 1, &scissor);
     if (descriptor->index_count) {

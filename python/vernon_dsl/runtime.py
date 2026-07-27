@@ -1,5 +1,21 @@
 """Public Runtime facade."""
 
+from ._runtime.execution_graph import (
+    ColorAttachmentUse,
+    CompiledBarrier,
+    ComputeEncoder,
+    ComputePass,
+    DepthStencilAttachmentUse,
+    ExecutionGraph,
+    ExecutionPass,
+    ExecutionResources,
+    GraphicsEncoder,
+    GraphResource,
+    LoadOperation,
+    PipelineInvocation,
+    RenderPass,
+    StoreOperation,
+)
 from ._runtime.kernel import Kernel
 from ._runtime.pipeline import Pipeline, PrimitiveTopology, lines, pipeline, points, triangles
 from ._runtime.resources import RenderTarget, TensorLayout, TensorStorage, TensorView, Texture, depth32
@@ -16,9 +32,23 @@ from ._runtime.session import (
 
 __all__ = [
     "Kernel",
+    "ColorAttachmentUse",
+    "CompiledBarrier",
+    "ComputeEncoder",
+    "ComputePass",
+    "DepthStencilAttachmentUse",
+    "ExecutionGraph",
+    "ExecutionPass",
+    "ExecutionResources",
+    "GraphResource",
+    "GraphicsEncoder",
+    "LoadOperation",
     "Pipeline",
+    "PipelineInvocation",
     "PrimitiveTopology",
     "RenderTarget",
+    "RenderPass",
+    "StoreOperation",
     "TensorLayout",
     "TensorStorage",
     "TensorView",

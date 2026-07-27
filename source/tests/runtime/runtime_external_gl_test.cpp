@@ -44,12 +44,18 @@ uint32_t dispatchCount = 0;
 uint32_t storageBindingCount = 0;
 uint32_t memoryBarrierCount = 0;
 uint32_t clearCount = 0;
+uint32_t invalidateCount = 0;
+uint32_t programBindCount = 0;
+uint32_t framebufferBindCount = 0;
+uint32_t viewportCount = 0;
+uint32_t scissorCount = 0;
 GlInt clearedDrawBuffer = -1;
 std::array<float, 4> clearColor{};
 GlBoolean matrixTranspose = 1;
 std::array<float, 16> matrixUpload{};
 std::array<float, 2> resolutionUpload{};
 std::array<GlInt, 4> viewportUpload{};
+std::array<GlInt, 4> scissorUpload{};
 
 using vernon::tests::RhiImage;
 using vernon::tests::RhiRuntime;
@@ -134,6 +140,8 @@ void GL_CALL bindBuffer(GlEnum target, GlUint name) {
         boundIndexBuffer = name;
 }
 void GL_CALL bindVertexArray(GlUint name) { boundVertexArray = name; }
+void GL_CALL useProgram(GlUint) { ++programBindCount; }
+void GL_CALL bindFramebuffer(GlEnum, GlUint) { ++framebufferBindCount; }
 void GL_CALL bindBufferBase(GlEnum, GlUint, GlUint) { ++storageBindingCount; }
 void GL_CALL dispatchCompute(GlUint, GlUint, GlUint) { ++dispatchCount; }
 void GL_CALL memoryBarrier(unsigned) { ++memoryBarrierCount; }
@@ -186,6 +194,13 @@ void GL_CALL clearBufferfv(GlEnum, GlInt drawBuffer, const float *value) {
     clearedDrawBuffer = drawBuffer;
     std::copy_n(value, clearColor.size(), clearColor.begin());
 }
+void GL_CALL invalidateFramebuffer(GlEnum, GlSize count, const GlEnum *) {
+    invalidateCount += static_cast<uint32_t>(count);
+}
+void GL_CALL scissor(GlInt x, GlInt y, GlSize width, GlSize height) {
+    ++scissorCount;
+    scissorUpload = {x, y, width, height};
+}
 GlInt GL_CALL getUniformLocation(GlUint, const char *) { return 0; }
 void GL_CALL uniformMatrix4fv(GlInt, GlSize, GlBoolean transpose, const float *data) {
     matrixTranspose = transpose;
@@ -198,7 +213,10 @@ void GL_CALL bindSampler(GlUint unit, GlUint sampler) {
     boundSamplerUnit = unit;
     boundSamplerName = sampler;
 }
-void GL_CALL viewport(GlInt x, GlInt y, GlSize width, GlSize height) { viewportUpload = {x, y, width, height}; }
+void GL_CALL viewport(GlInt x, GlInt y, GlSize width, GlSize height) {
+    ++viewportCount;
+    viewportUpload = {x, y, width, height};
+}
 
 void *getProcAddress(void *, const char *name) {
 #define PROC(glName, function)                                                                                         \
@@ -212,6 +230,7 @@ void *getProcAddress(void *, const char *name) {
     PROC("glGetIntegerv", getIntegerv);
     PROC("glGenVertexArrays", genNames);
     PROC("glBindVertexArray", bindVertexArray);
+    PROC("glUseProgram", useProgram);
     PROC("glGenFramebuffers", genNames);
     PROC("glGenBuffers", genNames);
     PROC("glBindBuffer", bindBuffer);
@@ -229,6 +248,7 @@ void *getProcAddress(void *, const char *name) {
     PROC("glGenSamplers", genNames);
     PROC("glDeleteSamplers", deleteSamplerNames);
     PROC("glCheckFramebufferStatus", framebufferStatus);
+    PROC("glBindFramebuffer", bindFramebuffer);
     PROC("glDrawArrays", drawArrays);
     PROC("glVertexAttribPointer", vertexAttribPointer);
     PROC("glVertexAttribIPointer", vertexAttribIPointer);
@@ -236,11 +256,13 @@ void *getProcAddress(void *, const char *name) {
     PROC("glVertexAttribDivisor", vertexAttribDivisor);
     PROC("glDrawElementsInstanced", drawElementsInstanced);
     PROC("glClearBufferfv", clearBufferfv);
+    PROC("glInvalidateFramebuffer", invalidateFramebuffer);
     PROC("glGetUniformLocation", getUniformLocation);
     PROC("glUniform2fv", uniform2fv);
     PROC("glUniformMatrix4fv", uniformMatrix4fv);
     PROC("glBindSampler", bindSampler);
     PROC("glViewport", viewport);
+    PROC("glScissor", scissor);
     PROC("glDispatchCompute", dispatchCompute);
     PROC("glMemoryBarrier", memoryBarrier);
 #undef PROC
@@ -578,6 +600,53 @@ TEST(RuntimeExternalGl, InvokesDirectComputePipelineThroughRuntimeCoreProvider) 
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(rhiRuntime(gl).device, buffer.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeExternalGl, CommandEncoderSuppressesRedundantDynamicState) {
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    ASSERT_TRUE(gl);
+    VernonRhiDevice device = rhiRuntime(gl).device;
+    VernonRhiCommandEncoderDescriptor encoderDescriptor{};
+    encoderDescriptor.struct_size = sizeof(encoderDescriptor);
+    encoderDescriptor.required_capabilities = VERNON_RHI_QUEUE_GRAPHICS;
+    VernonRhiCommandEncoder encoder{};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
+
+    VernonRhiColorAttachment color{};
+    color.view = {0, 1};
+    color.load_operation = VERNON_RHI_LOAD_CLEAR;
+    color.store_operation = VERNON_RHI_STORE_PRESERVE;
+    VernonRhiRenderingDescriptor rendering{};
+    rendering.struct_size = sizeof(rendering);
+    rendering.color_attachments = &color;
+    rendering.color_attachment_count = 1;
+    rendering.width = 16;
+    rendering.height = 16;
+    rendering.layers = 1;
+    ASSERT_EQ(vernonRhiCommandEncoderBeginRendering(device, encoder, &rendering), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderBindGraphicsPipeline(device, encoder, {0, 1}), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderBindGraphicsPipeline(device, encoder, {0, 1}), VERNON_RHI_STATUS_OK);
+    const VernonRhiViewport viewport{0.0f, 0.0f, 16.0f, 16.0f, 0.0f, 1.0f};
+    ASSERT_EQ(vernonRhiCommandEncoderSetViewport(device, encoder, &viewport), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderSetViewport(device, encoder, &viewport), VERNON_RHI_STATUS_OK);
+    const float clearColor[4]{0.0f, 0.0f, 0.0f, 1.0f};
+    ASSERT_EQ(vernonRhiCommandEncoderClearColorAttachment(device, encoder, 0, clearColor), VERNON_RHI_STATUS_OK);
+    const VernonRhiDrawDescriptor draw{3, 1, 0, 0};
+    ASSERT_EQ(vernonRhiCommandEncoderDraw(device, encoder, &draw), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderEndRendering(device, encoder), VERNON_RHI_STATUS_OK);
+
+    VernonRhiCommandEncoderStats stats{};
+    ASSERT_EQ(vernonRhiCommandEncoderGetStats(device, encoder, &stats), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(stats.rendering_scope_count, 1u);
+    EXPECT_EQ(stats.graphics_pipeline_bind_count, 1u);
+    EXPECT_EQ(stats.viewport_change_count, 1u);
+    EXPECT_EQ(stats.clear_count, 1u);
+    EXPECT_EQ(stats.draw_count, 1u);
+    ASSERT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceSubmit(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceSubmit(device, encoder), VERNON_RHI_STATUS_INVALID_ARGUMENT);
+    ASSERT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, encoder), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
 }
 
 TEST(RuntimeExternalGl, UploadsColumnMajorMatricesWithoutCopying) {
@@ -929,6 +998,12 @@ TEST(RuntimeExternalGl, BindsAllFormalVertexNumericFormatsAndRejectsUnsupportedF
 
 TEST(RuntimeExternalGl, LoadsAssetsAndInvokesPipeline) {
     drawCount = 0;
+    clearCount = 0;
+    invalidateCount = 0;
+    programBindCount = 0;
+    framebufferBindCount = 0;
+    viewportCount = 0;
+    scissorCount = 0;
     VernonRuntimeCapabilities global = vernonRuntimeGetCapabilities(VERNON_RUNTIME_OPENGL_ES);
     ASSERT_TRUE(!global.available);
     ASSERT_TRUE(global.supports_graphics);
@@ -952,6 +1027,8 @@ TEST(RuntimeExternalGl, LoadsAssetsAndInvokesPipeline) {
     auto sampler = vernon::tests::createSampler(rhiRuntime(gl));
     ASSERT_NE(sampler.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     VernonColorAttachment attachment{0, target.reference, 16, 16, VERNON_TEXTURE_RGBA8_UNORM};
+    attachment.clear_color[0] = 0.25f;
+    attachment.clear_color[1] = 0.5f;
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
@@ -962,8 +1039,19 @@ TEST(RuntimeExternalGl, LoadsAssetsAndInvokesPipeline) {
     invocation.instance_count = 1;
     const GlUint nextNameAfterPreparation = nextName;
     ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
+    attachment.load_operation = VERNON_RHI_LOAD_PRESERVE;
+    attachment.store_operation = VERNON_RHI_STORE_DISCARD;
     ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
     ASSERT_TRUE(drawCount == 2);
+    ASSERT_EQ(clearCount, 1u);
+    EXPECT_FLOAT_EQ(clearColor[0], 0.25f);
+    EXPECT_FLOAT_EQ(clearColor[1], 0.5f);
+    EXPECT_EQ(invalidateCount, 1u);
+    EXPECT_EQ(scissorUpload, (std::array<GlInt, 4>{0, 0, 16, 16}));
+    EXPECT_EQ(programBindCount, 1u);
+    EXPECT_EQ(framebufferBindCount, 1u);
+    EXPECT_EQ(viewportCount, 1u);
+    EXPECT_EQ(scissorCount, 1u);
     ASSERT_TRUE(nextName == nextNameAfterPreparation);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, target.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, cube.handle), VERNON_RHI_STATUS_OK);

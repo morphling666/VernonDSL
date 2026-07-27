@@ -11,9 +11,16 @@ from typing import Any, ClassVar
 
 import numpy as np
 
+from ..bundle import TargetOptions, canonical_json
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
-from ..pipeline_compile import TargetOptions, canonical_json
 from ..types import TypeExpr, _Scalar
+from .execution_graph import (
+    ComputeEncoder,
+    ComputePass,
+    ExecutionGraph,
+    ExecutionResources,
+    PipelineInvocation,
+)
 from .resources import TensorStorage, TensorView, _bind_native_argument, _dispatch_borrow_scope
 
 
@@ -523,7 +530,36 @@ class Kernel:
         grid: tuple[int, int, int] | None = None,
         features: tuple[str, ...] = (),
     ) -> None:
-        self._invoke_direct(tuple(arguments), grid, features)
+        invocation = self.invocation(*arguments, grid=grid, features=features)
+
+        class _ImmediateComputePass(ComputePass):
+            def declare(self) -> None:
+                for value in arguments:
+                    if isinstance(value, (TensorStorage, TensorView)):
+                        if getattr(value, "access", "read_write") == "read":
+                            self.read(value)
+                        else:
+                            self.read_write(value)
+                self.side_effect = True
+
+            def execute(self, encoder: ComputeEncoder, resources: ExecutionResources) -> None:
+                invocation.encode(encoder, resources)
+
+        graph = ExecutionGraph()
+        graph.add_pass(_ImmediateComputePass(f"{self.__name__} immediate"))
+        graph.execute()
+
+    def invocation(
+        self,
+        *arguments: Any,
+        grid: tuple[int, int, int] | None = None,
+        features: tuple[str, ...] = (),
+    ) -> PipelineInvocation:
+        captured = tuple(arguments)
+        return PipelineInvocation(
+            "compute",
+            lambda encoder: self._invoke_direct(captured, grid, features),
+        )
 
 
 atexit.register(Kernel.clear_cache)

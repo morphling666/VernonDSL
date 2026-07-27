@@ -4,7 +4,7 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
-from ..pipeline_compile import CompiledArtifact, PipelineCompileError, inline_artifact_descriptor
+from ..bundle import CompiledArtifact, PipelineCompileError, inline_artifact_descriptor
 
 
 def encode_runtime_stage(record: dict[str, Any], artifact: bytes) -> dict[str, Any]:

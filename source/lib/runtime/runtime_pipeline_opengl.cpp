@@ -528,6 +528,9 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
         const VernonColorAttachment &source = *plan.attachments[index];
         attachments[index].location = source.location;
         attachments[index].image = source.resource;
+        attachments[index].load_operation = source.load_operation;
+        attachments[index].store_operation = source.store_operation;
+        std::copy(std::begin(source.clear_color), std::end(source.clear_color), attachments[index].clear_color);
     }
     if (plan.depthAttachment) {
         depthAttachment = plan.depthAttachment->resource;
@@ -535,15 +538,24 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
     const bool hasViewport = invocation.viewport[2] && invocation.viewport[3];
     VernonRuntimeCoreDrawInvocation draw{};
     draw.struct_size = sizeof(draw);
+    draw.command_encoder = invocation.command_encoder;
     draw.vertex_count = plan.vertexCount;
     draw.instance_count = plan.instanceCount;
     draw.color_attachments = attachments.data();
     draw.color_attachment_count = plan.attachments.size();
     draw.depth_stencil_attachment = depthAttachment;
+    draw.depth_load_operation =
+        plan.depthAttachment ? static_cast<uint32_t>(plan.depthAttachment->load_operation) : VERNON_RHI_LOAD_DISCARD;
+    draw.depth_store_operation =
+        plan.depthAttachment ? static_cast<uint32_t>(plan.depthAttachment->store_operation) : VERNON_RHI_STORE_DISCARD;
+    draw.clear_depth = plan.depthAttachment ? plan.depthAttachment->clear_depth : 1.0f;
     draw.viewport[0] = hasViewport ? invocation.viewport[0] : 0;
     draw.viewport[1] = hasViewport ? invocation.viewport[1] : 0;
     draw.viewport[2] = hasViewport ? invocation.viewport[2] : plan.attachmentWidth;
     draw.viewport[3] = hasViewport ? invocation.viewport[3] : plan.attachmentHeight;
+    const bool hasScissor = invocation.scissor[2] && invocation.scissor[3];
+    for (size_t index = 0; index < 4; ++index)
+        draw.scissor[index] = hasScissor ? invocation.scissor[index] : draw.viewport[index];
     draw.topology = invocation.topology;
     if (plan.indexBinding) {
         draw.index_buffer = plan.indexBinding->resource;
@@ -596,7 +608,8 @@ VernonStatus invokeOpenGLComputePipeline(VernonLoadedPipeline &pipeline, const P
         return fail(*pipeline.context, "failed to prepare OpenGL provider bindings", status);
     const uint32_t groups[3]{(launch.grid.x - 1) / state.workgroup[0] + 1, (launch.grid.y - 1) / state.workgroup[1] + 1,
                              (launch.grid.z - 1) / state.workgroup[2] + 1};
-    status = vernonRuntimeCoreEncodeDispatch(state.rhiPipeline, state.rhiBindings, {}, groups, nullptr, 0);
+    status = vernonRuntimeCoreEncodeDispatch(state.rhiPipeline, state.rhiBindings, launch.commandEncoder, groups,
+                                             nullptr, 0);
     return status == VERNON_STATUS_OK ? status
                                       : fail(*pipeline.context, "failed to encode OpenGL provider dispatch", status);
 }

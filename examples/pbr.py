@@ -197,6 +197,23 @@ def main() -> None:
     if not args.no_cubemap:
         features.add("ENVIRONMENT")
     render = vd.pipeline(pbr_vertex, pbr_fragment, features=features)
+    invocation: vd.PipelineInvocation | None = None
+
+    class PbrPass(vd.RenderPass):
+        def declare(self) -> None:
+            self.read(positions)
+            self.read(normals)
+            self.read(colors)
+            self.read(materials)
+            self.attachments(target)
+
+        def execute(self, encoder: vd.GraphicsEncoder, resources: vd.ExecutionResources) -> None:
+            if invocation is None:
+                raise RuntimeError("PBR pass invocation was not prepared")
+            invocation.encode(encoder, resources)
+
+    graph = vd.ExecutionGraph()
+    graph.add_pass(PbrPass("pbr"))
 
     projection = perspective(
         math.radians(48.0),
@@ -219,7 +236,7 @@ def main() -> None:
             )
             view = look_at(camera, np.array((0.0, 0.45, 0.0), dtype=np.float32))
             view_projection = projection @ view
-            render(
+            invocation = render.invocation(
                 position=positions,
                 normal=normals,
                 base_color=colors,
@@ -228,8 +245,8 @@ def main() -> None:
                 camera_position=np.ascontiguousarray(camera),
                 light_position=light_value,
                 topology=vd.triangles,
-                target=target,
             )
+            graph.execute()
             rgba = color.to_numpy()
             if args.arch == "opengl":
                 rgba = np.flipud(rgba)

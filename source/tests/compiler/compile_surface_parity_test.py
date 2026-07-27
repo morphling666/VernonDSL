@@ -45,10 +45,10 @@ from pipeline_asset_fixture import (  # noqa: E402
     triangle_vertex,
 )
 from vernon_dsl._runtime.resources import _bind_native_argument  # noqa: E402
+from vernon_dsl.bundle import canonical_json  # noqa: E402
 from vernon_dsl.compiler import compile_file  # noqa: E402
 from vernon_dsl.pipeline_asset_cli import main as pipeline_asset_main  # noqa: E402
 from vernon_dsl.pipeline_assets import cook_pipeline_asset  # noqa: E402
-from vernon_dsl.pipeline_compile import canonical_json  # noqa: E402
 
 FIXTURE = PYTHON_TEST_ROOT / "pipeline_asset_fixture.py"
 GOLDEN = json.loads(

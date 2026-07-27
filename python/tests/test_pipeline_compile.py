@@ -6,8 +6,7 @@ import struct
 import unittest
 from types import SimpleNamespace
 
-from vernon_dsl.bundle.requirements import runtime_requirements
-from vernon_dsl.pipeline_compile import (
+from vernon_dsl.bundle import (
     CompiledArtifact,
     CompiledStage,
     PipelineCompileError,
@@ -24,6 +23,7 @@ from vernon_dsl.pipeline_compile import (
     serialize_bundle,
     validate_graphics_interfaces,
 )
+from vernon_dsl.bundle.requirements import runtime_requirements
 
 
 def _scalar_layout(dtype: str) -> dict[str, object]:

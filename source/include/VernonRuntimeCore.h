@@ -44,7 +44,11 @@ typedef struct VernonRuntimeCoreDrawInvocation {
     const VernonRuntimeProviderColorAttachment *color_attachments;
     size_t color_attachment_count;
     VernonRuntimeProviderResourceReference depth_stencil_attachment;
+    uint32_t depth_load_operation;
+    uint32_t depth_store_operation;
+    float clear_depth;
     uint32_t viewport[4];
+    uint32_t scissor[4];
     uint32_t topology;
     VernonRuntimeProviderResourceReference index_buffer;
     uint32_t index_count;

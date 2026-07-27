@@ -81,6 +81,8 @@ if(TARGET VernonRuntime)
     add_executable(
         VernonRuntimeTests
         runtime/compute_launch_planner_test.cpp
+        runtime/directx_resource_retention_test.cpp
+        runtime/execution_graph_test.cpp
         runtime/graphics_invocation_planner_test.cpp
         runtime/pipeline_manifest_requirements_test.cpp
         runtime/runtime_c_api_test.cpp
@@ -97,6 +99,8 @@ if(TARGET VernonRuntime)
         VernonRuntimeTests
         PRIVATE GTest::gtest_main
                 Vernon::Runtime
+                Vernon::ExecutionGraph
+                Vernon::RuntimeRHIAdapter
                 VernonRuntimeInternals
                 nlohmann_json::nlohmann_json)
     target_compile_definitions(

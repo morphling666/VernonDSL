@@ -4,9 +4,9 @@ import argparse
 import sys
 from pathlib import Path
 
+from .bundle import PipelineCompileError
 from .diagnostics import CompileError
 from .pipeline_assets import cook_pipeline_asset
-from .pipeline_compile import PipelineCompileError
 
 
 def _parser() -> argparse.ArgumentParser:

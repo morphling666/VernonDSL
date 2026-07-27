@@ -5,7 +5,7 @@ from ._shader_assets.cooking import cook_pipeline_asset
 from ._shader_assets.declaration import PipelineAssetDeclaration, pipeline_asset
 from ._shader_assets.descriptors import ShaderModuleDescriptor, ShaderPipelineDescriptor, ShaderStageReference
 from ._shader_assets.parsing import parse_python_pipeline_asset
-from .pipeline_compile import PipelineCompileError
+from .bundle import PipelineCompileError
 
 __all__ = [
     "PipelineAssetDeclaration",

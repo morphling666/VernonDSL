@@ -91,7 +91,7 @@ Execution is split across RuntimeCore and backend-specific providers:
   entries and contiguous host Tensor bytes. It does not link VernonRHI;
   dispatch is synchronous.
 
-RuntimeCore never owns textures, framebuffers, render graphs, queues, or
+RuntimeCore never owns textures, framebuffers, execution graphs, queues, or
 resource state. Provider-owned resource references are non-owning opaque
 handles with immutable metadata. The provider owns allocation, barriers,
 submission, completion, and transient descriptor/upload storage.
@@ -209,12 +209,13 @@ Vulkan graphics prefers dynamic rendering when Vulkan 1.3, or Vulkan 1.2 with
 passes keyed by attachment-location formats; framebuffers remain invocation
 specific because they contain the concrete image views and extent.
 
-Graphics draw invocations clear every color attachment to transparent black.
-An optional D32 attachment is cleared to one and enables less-than depth
-testing and depth writes in Vulkan, D3D12, and OpenGL. Python groups external
-color textures and an optional target-owned render-only depth image in
-`RenderTarget`; sampled depth remains a generic texture format/usage extension
-because it requires an explicit shader-readable view contract.
+Rendering scopes carry explicit `Clear`, `Preserve`, or `Discard` load
+operations and `Preserve` or `Discard` store operations. Clear values belong to
+the attachment use, not the pipeline. An optional D32 attachment enables
+less-than depth testing and depth writes in Vulkan, D3D12, and OpenGL. Python
+groups external color textures and an optional target-owned render-only depth
+image in `RenderTarget`; sampled depth remains a generic texture format/usage
+extension because it requires an explicit shader-readable view contract.
 
 The deployable Runtime does not depend on LLVM, MLIR, GLFW, the CUDA Toolkit,
 or a statically linked Vulkan loader. Compiler and asset cooking remain host
@@ -377,10 +378,13 @@ Schema-2 binds each variant directly through its `program` stage-to-artifact
 map. It contains either one compute program or one graphics-stage tuple; it has
 no dispatch/barrier/draw step list and cannot encode host orchestration.
 
-Multi-program orchestration, render-pass and attachment state, framebuffer or
-renderbuffer abstraction, resource transitions, and compute/graphics backend
-pairing are deferred. The archived Pass-graph proposal in
-`specs/backup/execution_graph_design.md` is non-normative.
+`VernonExecutionGraph` owns multi-program orchestration above VernonRHI.
+Class-based render and compute passes declare resource uses separately from
+execution. Compilation infers RAW, WAR, and WAW edges, culls dead passes,
+produces deterministic scheduling and barriers, and fuses adjacent compatible
+render passes. Runtime pipeline invocations encode bindings and draw/dispatch
+commands into the graph-provided typed encoder; attachment ownership and clear
+policy remain outside Runtime.
 
 Tensor allocations belong to one runtime generation. Reinitializing the
 runtime invalidates cached native handles. Within a generation, unchanged
@@ -400,8 +404,9 @@ iteration order. Feature specialization runs before the vertex/fragment
 interfaces are merged and validated, making the specialized reflection the
 only runtime binding contract.
 
-Pipeline invocation ABI version 3 carries index bindings, color attachments,
-topology, viewport, scissor, compute grid, and reflected argument slots.
+Pipeline invocation ABI version 6 carries index bindings, attachment
+operations, topology, viewport, scissor, compute grid, an optional active
+encoder, and reflected argument slots.
 Backend-specific command encoding consumes this common invocation without
 exposing legacy program/draw entry points.
 

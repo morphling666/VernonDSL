@@ -36,8 +36,15 @@ The shared contract is:
 - `variants=` enumerates accepted feature keys;
 - target architecture and options are cooker inputs, not source fields.
 
-Host orchestration and Pass proposals are deferred. Their previous
-non-normative design is preserved in
+`VernonExecutionGraph` is the active host-orchestration direction. The
+remaining work required to connect its public API to real backend command
+recording is tracked in
+[`execution_graph_completion_plan.md`](execution_graph_completion_plan.md).
+The previous persistent-asset proposal remains non-normative history in
 [`backup/execution_graph_design.md`](backup/execution_graph_design.md).
 The separate low-priority `ProgramGraph` roadmap item is compiler IR inside one
 program for autodiff; it is not a deployment graph.
+
+Stable logical resource records are active phase-1 work. Multi-frame resource
+ownership and reclamation remain deferred in
+[`deferred_gpu_resource_lifetime_plan.md`](deferred_gpu_resource_lifetime_plan.md).

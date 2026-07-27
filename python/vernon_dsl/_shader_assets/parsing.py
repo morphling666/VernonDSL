@@ -5,10 +5,10 @@ import keyword
 from pathlib import Path
 from typing import Any
 
+from ..bundle import PipelineCompileError, canonical_json
 from ..decorators import ENTRY_DECORATOR_STAGES, GRAPHICS_STAGE_ORDER
 from ..language.ast_utils import decorator_name, dotted_name
 from ..module_graph import load_project
-from ..pipeline_compile import PipelineCompileError, canonical_json
 from .descriptors import ShaderModuleDescriptor, ShaderPipelineDescriptor, ShaderStageReference
 
 

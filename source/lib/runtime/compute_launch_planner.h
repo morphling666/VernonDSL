@@ -25,6 +25,7 @@ struct PlannedComputeLaunch {
     std::vector<ComputeLaunchArgument> arguments;
     std::vector<std::vector<uint8_t>> hostTensorStorage;
     VernonLaunchSize grid{};
+    VernonRuntimeProviderObject commandEncoder{};
 };
 
 bool planComputeInvocation(const Variant &variant, const VernonPipelineInvocation &invocation,

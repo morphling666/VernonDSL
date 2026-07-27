@@ -72,8 +72,8 @@ VernonStatus invokeCpuComputePipeline(VernonLoadedPipeline &pipeline, const Plan
     }
     const uint32_t groups[3]{(launch.grid.x - 1) / state.workgroup[0] + 1, (launch.grid.y - 1) / state.workgroup[1] + 1,
                              (launch.grid.z - 1) / state.workgroup[2] + 1};
-    status =
-        vernonRuntimeCoreEncodeDispatch(state.pipeline, state.bindings, {}, groups, &launch.grid, sizeof(launch.grid));
+    status = vernonRuntimeCoreEncodeDispatch(state.pipeline, state.bindings, launch.commandEncoder, groups,
+                                             &launch.grid, sizeof(launch.grid));
     if (status != VERNON_STATUS_OK) {
         const VernonStringView providerError = cpuProviderLastError(*pipeline.context);
         return fail(*pipeline.context,

@@ -5,9 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-from ..compiler import compile_file
-from ..module_graph import load_project
-from ..pipeline_compile import (
+from ..bundle import (
     CompiledStage,
     PipelineCompileError,
     TargetOptions,
@@ -16,6 +14,8 @@ from ..pipeline_compile import (
     compiled_stage_from_program,
     materialize_bundle,
 )
+from ..compiler import compile_file
+from ..module_graph import load_project
 from .artifact_io import write_external_artifact
 from .descriptors import ShaderModuleDescriptor, ShaderStageReference
 from .parsing import parse_python_pipeline_asset, pipeline_asset_reference

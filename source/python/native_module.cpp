@@ -3,11 +3,14 @@
 #include "VernonRuntime.h"
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/array.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -571,9 +574,11 @@ struct PipelineInvocationBuilder {
         return *this;
     }
 
-    PipelineInvocationBuilder &rhiColorAttachment(uint32_t location, RhiImage *texture) {
+    PipelineInvocationBuilder &rhiColorAttachment(uint32_t location, RhiImage *texture, uint32_t loadOperation,
+                                                  uint32_t storeOperation, const std::array<float, 4> &clearColor) {
         if (!texture || !(texture->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT) ||
-            texture->format == VERNON_TEXTURE_D32_FLOAT)
+            texture->format == VERNON_TEXTURE_D32_FLOAT || loadOperation > VERNON_RHI_LOAD_DISCARD ||
+            storeOperation > VERNON_RHI_STORE_DISCARD)
             throw std::invalid_argument("RHI color attachment is null");
         VernonColorAttachment attachment{};
         attachment.location = location;
@@ -582,13 +587,18 @@ struct PipelineInvocationBuilder {
         attachment.width = texture->width;
         attachment.height = texture->height;
         attachment.format = texture->format;
+        attachment.load_operation = static_cast<VernonRhiLoadOperation>(loadOperation);
+        attachment.store_operation = static_cast<VernonRhiStoreOperation>(storeOperation);
+        std::copy(clearColor.begin(), clearColor.end(), attachment.clear_color);
         attachments.push_back(attachment);
         return *this;
     }
 
-    PipelineInvocationBuilder &rhiDepthAttachment(RhiImage *texture) {
+    PipelineInvocationBuilder &rhiDepthAttachment(RhiImage *texture, uint32_t loadOperation, uint32_t storeOperation,
+                                                  float clearDepth) {
         if (!texture || !(texture->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) ||
-            texture->format != VERNON_TEXTURE_D32_FLOAT)
+            texture->format != VERNON_TEXTURE_D32_FLOAT || loadOperation > VERNON_RHI_LOAD_DISCARD ||
+            storeOperation > VERNON_RHI_STORE_DISCARD || clearDepth < 0.0f || clearDepth > 1.0f)
             throw std::invalid_argument("RHI depth attachment must use D32 format");
         depthAttachment = {};
         if (vernonRuntimeReferenceRhiImage(runtime, texture->handle, &depthAttachment.resource) != VERNON_STATUS_OK)
@@ -596,6 +606,9 @@ struct PipelineInvocationBuilder {
         depthAttachment.width = texture->width;
         depthAttachment.height = texture->height;
         depthAttachment.format = texture->format;
+        depthAttachment.load_operation = static_cast<VernonRhiLoadOperation>(loadOperation);
+        depthAttachment.store_operation = static_cast<VernonRhiStoreOperation>(storeOperation);
+        depthAttachment.clear_depth = clearDepth;
         hasDepthAttachment = true;
         return *this;
     }
@@ -1081,8 +1094,10 @@ NB_MODULE(_native, module) {
         .def("rhi_sampler", &PipelineInvocationBuilder::rhiSampler, nb::arg("parameter"), nb::arg("sampler"),
              nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
         .def("rhi_color_attachment", &PipelineInvocationBuilder::rhiColorAttachment, nb::arg("location"),
-             nb::arg("texture"), nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
+             nb::arg("texture"), nb::arg("load_operation"), nb::arg("store_operation"), nb::arg("clear_color"),
+             nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
         .def("rhi_depth_attachment", &PipelineInvocationBuilder::rhiDepthAttachment, nb::arg("texture"),
+             nb::arg("load_operation"), nb::arg("store_operation"), nb::arg("clear_depth"),
              nb::rv_policy::reference_internal, nb::keep_alive<1, 2>())
         .def("rhi_index_binding", &PipelineInvocationBuilder::rhiIndexBinding, nb::arg("buffer"), nb::arg("count"),
              nb::arg("offset") = 0, nb::rv_policy::reference_internal, nb::keep_alive<1, 2>())
@@ -1123,6 +1138,11 @@ NB_MODULE(_native, module) {
     module.attr("PIPELINE_TEXTURE") = static_cast<uint32_t>(VERNON_PIPELINE_TEXTURE);
     module.attr("PIPELINE_SAMPLER") = static_cast<uint32_t>(VERNON_PIPELINE_SAMPLER);
     module.attr("TOPOLOGY_TRIANGLE_LIST") = static_cast<uint32_t>(VERNON_TOPOLOGY_TRIANGLE_LIST);
+    module.attr("ATTACHMENT_CLEAR") = static_cast<uint32_t>(VERNON_RHI_LOAD_CLEAR);
+    module.attr("ATTACHMENT_PRESERVE") = static_cast<uint32_t>(VERNON_RHI_LOAD_PRESERVE);
+    module.attr("ATTACHMENT_DISCARD") = static_cast<uint32_t>(VERNON_RHI_LOAD_DISCARD);
+    module.attr("ATTACHMENT_STORE") = static_cast<uint32_t>(VERNON_RHI_STORE_PRESERVE);
+    module.attr("ATTACHMENT_DONT_CARE") = static_cast<uint32_t>(VERNON_RHI_STORE_DISCARD);
     module.attr("TOPOLOGY_LINE_LIST") = static_cast<uint32_t>(VERNON_TOPOLOGY_LINE_LIST);
     module.attr("TOPOLOGY_POINT_LIST") = static_cast<uint32_t>(VERNON_TOPOLOGY_POINT_LIST);
     module.def("runtime_available",

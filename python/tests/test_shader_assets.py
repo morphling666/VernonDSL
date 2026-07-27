@@ -10,13 +10,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from vernon_dsl.bundle import build_bundle_plan
 from vernon_dsl.pipeline_assets import (
     PipelineCompileError,
     cook_pipeline_asset,
     encode_runtime_stage,
     parse_python_pipeline_asset,
 )
-from vernon_dsl.pipeline_compile import build_bundle_plan
 
 
 def _fake_native(compile_program_result: object) -> SimpleNamespace:

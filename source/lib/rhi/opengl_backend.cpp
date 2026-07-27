@@ -142,6 +142,9 @@ void DeviceState::destroyImage(Image &image) {
         return;
     makeCurrent();
     driver.deleteTextures(1, &image.name);
+    // GL may immediately reuse the numeric texture name. Cached framebuffer
+    // signatures must not treat the replacement as the deleted attachment.
+    ++framebufferGeneration;
     image.name = 0;
 }
 
@@ -169,6 +172,7 @@ bool DeviceState::downloadImage2D(const Image &image, Size width, Size height, E
         return false;
     }
     driver.bindFramebuffer(kFramebuffer, framebuffer);
+    ++framebufferGeneration;
     driver.framebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, image.name, 0);
     if (driver.checkFramebufferStatus(kFramebuffer) != kFramebufferComplete) {
         driver.deleteFramebuffers(1, &framebuffer);

@@ -98,6 +98,9 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
             return fail(error, "render target is invalid");
         if (!width || !height)
             return fail(error, "render target extent is invalid");
+        if (attachment.load_operation > VERNON_RHI_LOAD_DISCARD ||
+            attachment.store_operation > VERNON_RHI_STORE_DISCARD)
+            return fail(error, "render target attachment operation is invalid");
         if (!plan.attachmentWidth) {
             plan.attachmentWidth = width;
             plan.attachmentHeight = height;
@@ -116,6 +119,10 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
         if (!width || !height || width != plan.attachmentWidth || height != plan.attachmentHeight ||
             format != VERNON_TEXTURE_D32_FLOAT)
             return fail(error, "depth attachment must be D32 with the render-target extent");
+        if (attachment.load_operation > VERNON_RHI_LOAD_DISCARD ||
+            attachment.store_operation > VERNON_RHI_STORE_DISCARD || attachment.clear_depth < 0.0f ||
+            attachment.clear_depth > 1.0f)
+            return fail(error, "depth attachment operation is invalid");
         plan.depthAttachment = &attachment;
     }
     std::sort(plan.attachments.begin(), plan.attachments.end(),

@@ -61,11 +61,15 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
     LOAD(framebufferTexture2D, "glFramebufferTexture2D");
     LOAD(checkFramebufferStatus, "glCheckFramebufferStatus");
     LOAD(drawBuffers, "glDrawBuffers");
+    driver.invalidateFramebuffer = reinterpret_cast<decltype(driver.invalidateFramebuffer)>(
+        callbacks.get_proc_address(callbacks.user_data, "glInvalidateFramebuffer"));
     LOAD(clearBufferfv, "glClearBufferfv");
     LOAD(enable, "glEnable");
     LOAD(disable, "glDisable");
     LOAD(depthFunc, "glDepthFunc");
     LOAD(viewport, "glViewport");
+    driver.scissor =
+        reinterpret_cast<decltype(driver.scissor)>(callbacks.get_proc_address(callbacks.user_data, "glScissor"));
     LOAD(drawArrays, "glDrawArrays");
     LOAD(drawArraysInstanced, "glDrawArraysInstanced");
     LOAD(drawElementsInstanced, "glDrawElementsInstanced");
