@@ -56,6 +56,20 @@ lines = PrimitiveTopology("lines", 2)
 points = PrimitiveTopology("points", 1)
 
 
+class _ImmediateRenderPass(RenderPass):
+    def __init__(self, name: str, target: RenderTarget, invocation: PipelineInvocation):
+        super().__init__(name)
+        self._immediate_target = target
+        self._invocation = invocation
+
+    def declare(self) -> None:
+        self.attachments(self._immediate_target)
+        self._invocation.declare(self)
+
+    def execute(self, encoder: GraphicsEncoder, resources: ExecutionResources) -> None:
+        self._invocation.encode(encoder, resources)
+
+
 @dataclass
 class _CompiledPipeline:
     native: Any
@@ -346,30 +360,55 @@ class Pipeline:
             builder.scissor(*encoder.scissor)
         assert state._native_runtime is not None
         with _dispatch_borrow_scope(dispatch_borrows):
-            compiled.native.invoke(builder)
+            builder.encode(encoder._native)
         for _, texture in color_attachments:
             texture._mark_device_dirty()
 
+    def _declare_invocation(self, arguments: dict[str, Any], execution_pass: RenderPass) -> None:
+        state = _session_state()
+        indices = arguments.pop("indices", None)
+        arguments.pop("topology", None)
+        compiled = self._compile(arguments)
+        for parameter in compiled.native.parameters:
+            value = arguments[parameter.name]
+            if isinstance(value, Texture):
+                execution_pass.read(value)
+            elif isinstance(value, (TensorStorage, TensorView)):
+                if parameter.access == state._native.ACCESS_READ:
+                    execution_pass.read(value)
+                elif parameter.access == state._native.ACCESS_WRITE:
+                    execution_pass.write(value)
+                else:
+                    execution_pass.read_write(value)
+        if indices is not None:
+            execution_pass.read(indices)
+
     def invocation(self, **arguments: Any) -> PipelineInvocation:
         captured = dict(arguments)
-        return PipelineInvocation("graphics", lambda encoder: self._invoke_direct(dict(captured), encoder))
+        return PipelineInvocation(
+            "graphics",
+            lambda encoder: self._invoke_direct(dict(captured), encoder),
+            lambda execution_pass: self._declare_invocation(dict(captured), execution_pass),
+        )
 
     def __call__(self, **arguments: Any) -> None:
         target = arguments.pop("target", None)
         if not isinstance(target, RenderTarget):
             raise TypeError("immediate graphics execution requires target=RenderTarget")
+        state = _session_state()
+        if state._architecture == state.cpu:
+            raise RuntimeError(
+                "CPU graphics pipelines require a software rasterizer, which "
+                "Vernon does not provide; CPU supports compute kernels only"
+            )
         invocation = self.invocation(**arguments)
 
-        class _ImmediateRenderPass(RenderPass):
-            def declare(self) -> None:
-                self.attachments(target)
-
-            def execute(self, encoder: GraphicsEncoder, resources: ExecutionResources) -> None:
-                invocation.encode(encoder, resources)
-
         graph = ExecutionGraph()
-        graph.add_pass(_ImmediateRenderPass(f"{self._fragment.__name__} immediate"))
-        graph.execute()
+        graph.add_pass(_ImmediateRenderPass(f"{self._fragment.__name__} immediate", target, invocation))
+        try:
+            graph.execute()
+        finally:
+            graph._dispose_native()
 
 
 def pipeline(*stages: Any, features: Iterable[str] = ()) -> Pipeline:

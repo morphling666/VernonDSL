@@ -37,6 +37,8 @@ VERNON_RUNTIME_RHI_ADAPTER_CAPI VernonStatus vernonRuntimeRhiAdapterReferenceIma
     const VernonRuntimeRhiAdapter *adapter, VernonRhiImage image, VernonRuntimeProviderResourceReference *output);
 VERNON_RUNTIME_RHI_ADAPTER_CAPI VernonStatus vernonRuntimeRhiAdapterReferenceSampler(
     const VernonRuntimeRhiAdapter *adapter, VernonRhiSampler sampler, VernonRuntimeProviderResourceReference *output);
+VERNON_RUNTIME_RHI_ADAPTER_CAPI VernonStatus vernonRuntimeRhiAdapterReferenceCommandEncoder(
+    const VernonRuntimeRhiAdapter *adapter, VernonRhiCommandEncoder encoder, VernonRuntimeProviderObject *output);
 
 #ifdef __cplusplus
 }

@@ -1,4 +1,5 @@
 #include "VernonCompiler.h"
+#include "VernonExecutionGraph.h"
 #include "VernonRHI.h"
 #include "VernonRuntime.h"
 
@@ -14,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -44,6 +46,7 @@ RhiHostState *runtimeRhiHost(const Runtime *runtime);
 struct CompiledProgram;
 struct LoadedPipeline;
 struct PipelineInvocationBuilder;
+struct PythonExecutionGraph;
 
 struct RhiHostState {
     RhiHostState(VernonRhiBackend backend, uint32_t deviceIndex) : backend(backend) {
@@ -245,6 +248,7 @@ struct RhiHost {
     }
     std::unique_ptr<RhiSampler> createSampler() { return std::make_unique<RhiSampler>(state); }
     std::unique_ptr<Runtime> createRuntime();
+    std::unique_ptr<PythonExecutionGraph> createExecutionGraph();
     void synchronize() {
         if (vernonRhiDeviceSynchronize(state->device) != VERNON_RHI_STATUS_OK)
             throw std::runtime_error("RHI device synchronization failed");
@@ -252,6 +256,210 @@ struct RhiHost {
 
     std::shared_ptr<RhiHostState> state;
 };
+
+struct PythonGraphResource {
+    explicit PythonGraphResource(vernon::execution::GraphBuffer value) : resource(value), buffer(value) {}
+    explicit PythonGraphResource(vernon::execution::GraphImage value) : resource(value), image(value), isImage(true) {}
+
+    vernon::execution::GraphResource resource;
+    vernon::execution::GraphBuffer buffer;
+    vernon::execution::GraphImage image;
+    bool isImage{};
+};
+
+struct PythonExecutionGraph;
+
+struct PythonRenderPass final : vernon::execution::RenderPass {
+    PythonRenderPass(PythonExecutionGraph *graph, std::string name, PyObject *owner)
+        : RenderPass(std::move(name)), graph(graph), owner(owner) {}
+
+    void declare() override;
+    VernonRhiStatus execute(vernon::execution::GraphicsEncoder &encoder,
+                            const vernon::execution::ExecutionResources &) override;
+
+    void use(const PythonGraphResource &resource, vernon::execution::AccessMode access, VernonRhiResourceState state) {
+        if (access == vernon::execution::AccessMode::Read)
+            read(resource.resource, state);
+        else if (access == vernon::execution::AccessMode::Write)
+            write(resource.resource, state);
+        else
+            readWrite(resource.resource, state);
+    }
+
+    void addColor(uint32_t location, const PythonGraphResource &resource, VernonRhiLoadOperation load,
+                  VernonRhiStoreOperation store, const std::array<float, 4> &clear) {
+        if (!resource.isImage)
+            throw std::invalid_argument("color attachment must be an image graph resource");
+        vernon::execution::ColorAttachmentUse attachment{};
+        attachment.image = resource.image;
+        attachment.load = load;
+        attachment.store = store;
+        std::copy(clear.begin(), clear.end(), attachment.clear);
+        color(location, attachment);
+    }
+
+    void setDepth(const PythonGraphResource &resource, VernonRhiLoadOperation depthLoad,
+                  VernonRhiStoreOperation depthStore, float clearDepth, VernonRhiLoadOperation stencilLoad,
+                  VernonRhiStoreOperation stencilStore, uint32_t clearStencil, bool readOnlyDepth,
+                  bool readOnlyStencil) {
+        if (!resource.isImage)
+            throw std::invalid_argument("depth attachment must be an image graph resource");
+        vernon::execution::DepthStencilAttachmentUse attachment{};
+        attachment.image = resource.image;
+        attachment.depthLoad = depthLoad;
+        attachment.depthStore = depthStore;
+        attachment.clearDepth = clearDepth;
+        attachment.stencilLoad = stencilLoad;
+        attachment.stencilStore = stencilStore;
+        attachment.clearStencil = clearStencil;
+        attachment.readOnlyDepth = readOnlyDepth;
+        attachment.readOnlyStencil = readOnlyStencil;
+        depth(attachment);
+    }
+
+    void setRenderArea(uint32_t x, uint32_t y, uint32_t width, uint32_t height) { renderArea(x, y, width, height); }
+
+    PythonExecutionGraph *graph{};
+    PyObject *owner{};
+};
+
+struct PythonComputePass final : vernon::execution::ComputePass {
+    PythonComputePass(PythonExecutionGraph *graph, std::string name, PyObject *owner)
+        : ComputePass(std::move(name)), graph(graph), owner(owner) {}
+
+    void declare() override;
+    VernonRhiStatus execute(vernon::execution::ComputeEncoder &encoder,
+                            const vernon::execution::ExecutionResources &) override;
+
+    void use(const PythonGraphResource &resource, vernon::execution::AccessMode access, VernonRhiResourceState state) {
+        if (access == vernon::execution::AccessMode::Read)
+            read(resource.resource, state);
+        else if (access == vernon::execution::AccessMode::Write)
+            write(resource.resource, state);
+        else
+            readWrite(resource.resource, state);
+    }
+
+    PythonExecutionGraph *graph{};
+    PyObject *owner{};
+};
+
+struct PythonCompiledBarrier {
+    uint32_t sourceStageMask{};
+    uint32_t destinationStageMask{};
+    uint32_t sourceAccess{};
+    uint32_t destinationAccess{};
+    uint32_t oldState{};
+    uint32_t newState{};
+    bool isImage{};
+};
+
+struct PythonCompiledScope {
+    bool rendering{};
+    std::vector<uint32_t> passIndices;
+    std::vector<PythonCompiledBarrier> barriers;
+};
+
+struct PythonExecutionGraph {
+    explicit PythonExecutionGraph(std::shared_ptr<RhiHostState> host)
+        : host(std::move(host)), graph(this->host->device) {}
+
+    PythonRenderPass *addRenderPass(const std::string &name, const nb::object &owner) {
+        return &graph.emplacePass<PythonRenderPass>(this, name, owner.ptr());
+    }
+
+    PythonComputePass *addComputePass(const std::string &name, const nb::object &owner) {
+        return &graph.emplacePass<PythonComputePass>(this, name, owner.ptr());
+    }
+
+    PythonGraphResource importBuffer(RhiBuffer &buffer, bool exported) {
+        if (buffer.host != host)
+            throw std::invalid_argument("buffer belongs to another execution graph device");
+        return PythonGraphResource(graph.importBuffer(buffer.handle, exported));
+    }
+
+    PythonGraphResource importImage(RhiImage &image, bool exported) {
+        if (image.host != host)
+            throw std::invalid_argument("image belongs to another execution graph device");
+        const VernonRhiImageView view{image.handle.index, image.handle.generation};
+        return PythonGraphResource(
+            graph.importImage(image.handle, view, rhiFormat(image.format), image.width, image.height, 1, 1, exported));
+    }
+
+    void compile() {
+        std::string error;
+        if (!graph.compile(error))
+            throw std::invalid_argument(error);
+    }
+
+    void validate() const {
+        std::string error;
+        if (!graph.validate(error))
+            throw std::invalid_argument(error);
+    }
+
+    void execute() {
+        callbackException = nullptr;
+        const VernonRhiStatus status = graph.execute();
+        if (callbackException) {
+            std::exception_ptr exception = std::exchange(callbackException, nullptr);
+            std::rethrow_exception(exception);
+        }
+        if (status != VERNON_RHI_STATUS_OK)
+            throw std::runtime_error("execution graph failed with RHI status " +
+                                     std::to_string(static_cast<uint32_t>(status)));
+    }
+
+    std::vector<PythonCompiledScope> scopes() const {
+        std::vector<PythonCompiledScope> result;
+        result.reserve(graph.scopes().size());
+        for (const auto &scope : graph.scopes()) {
+            PythonCompiledScope compiled{scope.rendering, scope.passIndices, {}};
+            compiled.barriers.reserve(scope.barriers.size());
+            for (const VernonRhiBarrier &barrier : scope.barriers)
+                compiled.barriers.push_back({barrier.source_stage_mask, barrier.destination_stage_mask,
+                                             barrier.source_access, barrier.destination_access,
+                                             static_cast<uint32_t>(barrier.old_state),
+                                             static_cast<uint32_t>(barrier.new_state), barrier.is_image != 0});
+            result.push_back(std::move(compiled));
+        }
+        return result;
+    }
+
+    std::shared_ptr<RhiHostState> host;
+    vernon::execution::ExecutionGraph graph;
+    std::exception_ptr callbackException;
+};
+
+void PythonRenderPass::declare() { nb::borrow<nb::object>(owner).attr("_native_declare")(); }
+
+VernonRhiStatus PythonRenderPass::execute(vernon::execution::GraphicsEncoder &encoder,
+                                          const vernon::execution::ExecutionResources &) {
+    try {
+        nb::borrow<nb::object>(owner).attr("_native_execute")(nb::cast(encoder));
+        return VERNON_RHI_STATUS_OK;
+    } catch (...) {
+        graph->callbackException = std::current_exception();
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    }
+}
+
+void PythonComputePass::declare() { nb::borrow<nb::object>(owner).attr("_native_declare")(); }
+
+VernonRhiStatus PythonComputePass::execute(vernon::execution::ComputeEncoder &encoder,
+                                           const vernon::execution::ExecutionResources &) {
+    try {
+        nb::borrow<nb::object>(owner).attr("_native_execute")(nb::cast(encoder));
+        return VERNON_RHI_STATUS_OK;
+    } catch (...) {
+        graph->callbackException = std::current_exception();
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    }
+}
+
+std::unique_ptr<PythonExecutionGraph> RhiHost::createExecutionGraph() {
+    return std::make_unique<PythonExecutionGraph>(state);
+}
 
 using SharedCompileResult = std::shared_ptr<VernonCompileResult>;
 
@@ -661,7 +869,7 @@ struct PipelineInvocationBuilder {
         return *this;
     }
 
-    void invoke() {
+    void submit(VernonRuntimeProviderObject *encoder) {
         std::vector<VernonPipelineArgument> values;
         values.reserve(arguments.size());
         for (const OwnedArgument &argument : arguments)
@@ -681,8 +889,21 @@ struct PipelineInvocationBuilder {
         invocation.compute_grid = computeGrid;
         std::memcpy(invocation.viewport, viewport, sizeof(viewport));
         std::memcpy(invocation.scissor, scissor, sizeof(scissor));
-        if (vernonRuntimePipelineInvoke(pipeline, &invocation) != VERNON_STATUS_OK)
-            throw std::runtime_error("pipeline invocation failed: " + stringView(vernonRuntimeGetLastError(runtime)));
+        const VernonStatus status = encoder ? vernonRuntimePipelineEncode(*encoder, pipeline, &invocation)
+                                            : vernonRuntimePipelineInvoke(pipeline, &invocation);
+        if (status != VERNON_STATUS_OK)
+            throw std::runtime_error(
+                std::string(encoder ? "pipeline encoding failed: " : "pipeline invocation failed: ") +
+                stringView(vernonRuntimeGetLastError(runtime)));
+    }
+
+    void invoke() { submit(nullptr); }
+
+    template <typename Encoder> void encode(const Encoder &encoder) {
+        VernonRuntimeProviderObject providerEncoder{};
+        if (vernonRuntimeReferenceRhiCommandEncoder(runtime, encoder.native(), &providerEncoder) != VERNON_STATUS_OK)
+            throw std::invalid_argument("command encoder belongs to another Runtime device");
+        submit(&providerEncoder);
     }
 
     Runtime *owner{};
@@ -841,11 +1062,9 @@ struct LoadedPipeline {
 struct Runtime {
     explicit Runtime(VernonRuntimeContext *handle, std::shared_ptr<RhiHostState> rhiHost = {})
         : handle(handle), rhiHost(std::move(rhiHost)) {}
-    explicit Runtime(VernonRuntimeBackend backend, uint16_t apiMajor = 0, uint16_t apiMinor = 0) {
+    explicit Runtime(VernonRuntimeBackend backend) {
         VernonRuntimeCreateOptions options{};
         options.struct_size = sizeof(options);
-        options.api_version_major = apiMajor;
-        options.api_version_minor = apiMinor;
         handle = vernonRuntimeCreateWithOptions(backend, &options);
         if (!handle)
             throw std::runtime_error("requested runtime backend is unavailable");
@@ -1038,6 +1257,7 @@ NB_MODULE(_native, module) {
         .def("create_attachment_image", &RhiHost::createAttachmentImage)
         .def("create_sampler", &RhiHost::createSampler)
         .def("create_runtime", &RhiHost::createRuntime, nb::keep_alive<0, 1>())
+        .def("create_execution_graph", &RhiHost::createExecutionGraph)
         .def("synchronize", &RhiHost::synchronize);
     nb::class_<RhiBuffer>(module, "RhiBuffer")
         .def_prop_ro("size", [](const RhiBuffer &value) { return value.size; })
@@ -1049,9 +1269,96 @@ NB_MODULE(_native, module) {
         .def("upload", &RhiImage::upload)
         .def("download", &RhiImage::download);
     nb::class_<RhiSampler>(module, "RhiSampler");
+    nb::class_<PythonGraphResource>(module, "_GraphResource")
+        .def_prop_ro("id", [](const PythonGraphResource &value) { return value.resource.id; })
+        .def_prop_ro("is_image", [](const PythonGraphResource &value) { return value.isImage; });
+    nb::class_<vernon::execution::ExecutionPass>(module, "_ExecutionPass")
+        .def("depends_on", &vernon::execution::ExecutionPass::dependsOn)
+        .def("set_flags", &vernon::execution::ExecutionPass::setFlags)
+        .def_prop_ro("flags", &vernon::execution::ExecutionPass::flags);
+    nb::class_<PythonRenderPass, vernon::execution::ExecutionPass>(module, "_RenderPass")
+        .def(
+            "use",
+            [](PythonRenderPass &pass, const PythonGraphResource &resource, uint32_t access, uint32_t state) {
+                if (access > static_cast<uint32_t>(vernon::execution::AccessMode::ReadWrite) ||
+                    state > static_cast<uint32_t>(VERNON_RHI_STATE_PRESENT))
+                    throw std::invalid_argument("invalid execution graph resource use");
+                pass.use(resource, static_cast<vernon::execution::AccessMode>(access),
+                         static_cast<VernonRhiResourceState>(state));
+            },
+            nb::arg("resource"), nb::arg("access"), nb::arg("state"))
+        .def(
+            "color",
+            [](PythonRenderPass &pass, uint32_t location, const PythonGraphResource &resource, uint32_t load,
+               uint32_t store, const std::array<float, 4> &clear) {
+                if (load > static_cast<uint32_t>(VERNON_RHI_LOAD_DISCARD) ||
+                    store > static_cast<uint32_t>(VERNON_RHI_STORE_DISCARD))
+                    throw std::invalid_argument("invalid color attachment operation");
+                pass.addColor(location, resource, static_cast<VernonRhiLoadOperation>(load),
+                              static_cast<VernonRhiStoreOperation>(store), clear);
+            },
+            nb::arg("location"), nb::arg("resource"), nb::arg("load"), nb::arg("store"), nb::arg("clear"))
+        .def(
+            "depth",
+            [](PythonRenderPass &pass, const PythonGraphResource &resource, uint32_t depthLoad, uint32_t depthStore,
+               float clearDepth, uint32_t stencilLoad, uint32_t stencilStore, uint32_t clearStencil, bool readOnlyDepth,
+               bool readOnlyStencil) {
+                if (depthLoad > static_cast<uint32_t>(VERNON_RHI_LOAD_DISCARD) ||
+                    stencilLoad > static_cast<uint32_t>(VERNON_RHI_LOAD_DISCARD) ||
+                    depthStore > static_cast<uint32_t>(VERNON_RHI_STORE_DISCARD) ||
+                    stencilStore > static_cast<uint32_t>(VERNON_RHI_STORE_DISCARD) || clearDepth < 0.0f ||
+                    clearDepth > 1.0f)
+                    throw std::invalid_argument("invalid depth attachment operation");
+                pass.setDepth(resource, static_cast<VernonRhiLoadOperation>(depthLoad),
+                              static_cast<VernonRhiStoreOperation>(depthStore), clearDepth,
+                              static_cast<VernonRhiLoadOperation>(stencilLoad),
+                              static_cast<VernonRhiStoreOperation>(stencilStore), clearStencil, readOnlyDepth,
+                              readOnlyStencil);
+            },
+            nb::arg("resource"), nb::arg("depth_load"), nb::arg("depth_store"), nb::arg("clear_depth"),
+            nb::arg("stencil_load"), nb::arg("stencil_store"), nb::arg("clear_stencil"), nb::arg("read_only_depth"),
+            nb::arg("read_only_stencil"))
+        .def("render_area", &PythonRenderPass::setRenderArea);
+    nb::class_<PythonComputePass, vernon::execution::ExecutionPass>(module, "_ComputePass")
+        .def(
+            "use",
+            [](PythonComputePass &pass, const PythonGraphResource &resource, uint32_t access, uint32_t state) {
+                if (access > static_cast<uint32_t>(vernon::execution::AccessMode::ReadWrite) ||
+                    state > static_cast<uint32_t>(VERNON_RHI_STATE_PRESENT))
+                    throw std::invalid_argument("invalid execution graph resource use");
+                pass.use(resource, static_cast<vernon::execution::AccessMode>(access),
+                         static_cast<VernonRhiResourceState>(state));
+            },
+            nb::arg("resource"), nb::arg("access"), nb::arg("state"));
+    nb::class_<PythonCompiledBarrier>(module, "_CompiledBarrier")
+        .def_ro("source_stage_mask", &PythonCompiledBarrier::sourceStageMask)
+        .def_ro("destination_stage_mask", &PythonCompiledBarrier::destinationStageMask)
+        .def_ro("source_access", &PythonCompiledBarrier::sourceAccess)
+        .def_ro("destination_access", &PythonCompiledBarrier::destinationAccess)
+        .def_ro("old_state", &PythonCompiledBarrier::oldState)
+        .def_ro("new_state", &PythonCompiledBarrier::newState)
+        .def_ro("is_image", &PythonCompiledBarrier::isImage);
+    nb::class_<PythonCompiledScope>(module, "_CompiledScope")
+        .def_ro("rendering", &PythonCompiledScope::rendering)
+        .def_ro("pass_indices", &PythonCompiledScope::passIndices)
+        .def_ro("barriers", &PythonCompiledScope::barriers);
+    nb::class_<PythonExecutionGraph>(module, "_ExecutionGraph")
+        .def("add_render_pass", &PythonExecutionGraph::addRenderPass, nb::rv_policy::reference)
+        .def("add_compute_pass", &PythonExecutionGraph::addComputePass, nb::rv_policy::reference)
+        .def("import_buffer", &PythonExecutionGraph::importBuffer, nb::arg("buffer"), nb::arg("exported") = false)
+        .def("import_image", &PythonExecutionGraph::importImage, nb::arg("image"), nb::arg("exported") = false)
+        .def("compile", &PythonExecutionGraph::compile)
+        .def("validate", &PythonExecutionGraph::validate)
+        .def("execute", &PythonExecutionGraph::execute)
+        .def_prop_ro(
+            "schedule",
+            [](const PythonExecutionGraph &value) -> const std::vector<uint32_t> & { return value.graph.schedule(); },
+            nb::rv_policy::reference_internal)
+        .def_prop_ro("scopes", &PythonExecutionGraph::scopes);
+    nb::class_<vernon::execution::GraphicsEncoder>(module, "_GraphicsEncoder");
+    nb::class_<vernon::execution::ComputeEncoder>(module, "_ComputeEncoder");
     nb::class_<Runtime>(module, "Runtime")
-        .def(nb::init<VernonRuntimeBackend, uint16_t, uint16_t>(), nb::arg("backend"), nb::arg("api_major") = 0,
-             nb::arg("api_minor") = 0)
+        .def(nb::init<VernonRuntimeBackend>(), nb::arg("backend"))
         .def("load", &Runtime::load, nb::keep_alive<0, 1>())
         .def("load_cpu_entry", &Runtime::loadCpuEntry, nb::keep_alive<0, 1>())
         .def("load_compute_bundle", &Runtime::loadComputeBundle, nb::keep_alive<0, 1>())
@@ -1111,6 +1418,10 @@ NB_MODULE(_native, module) {
              nb::arg("height"), nb::rv_policy::reference_internal)
         .def("scissor", &PipelineInvocationBuilder::setScissor, nb::arg("x"), nb::arg("y"), nb::arg("width"),
              nb::arg("height"), nb::rv_policy::reference_internal)
+        .def("encode", [](PipelineInvocationBuilder &builder,
+                          const vernon::execution::GraphicsEncoder &encoder) { builder.encode(encoder); })
+        .def("encode", [](PipelineInvocationBuilder &builder,
+                          const vernon::execution::ComputeEncoder &encoder) { builder.encode(encoder); })
         .def("invoke", &PipelineInvocationBuilder::invoke);
     nb::class_<LoadedPipeline>(module, "LoadedPipeline")
         .def("invocation_builder", &LoadedPipeline::invocationBuilder, nb::keep_alive<0, 1>())
@@ -1143,6 +1454,14 @@ NB_MODULE(_native, module) {
     module.attr("ATTACHMENT_DISCARD") = static_cast<uint32_t>(VERNON_RHI_LOAD_DISCARD);
     module.attr("ATTACHMENT_STORE") = static_cast<uint32_t>(VERNON_RHI_STORE_PRESERVE);
     module.attr("ATTACHMENT_DONT_CARE") = static_cast<uint32_t>(VERNON_RHI_STORE_DISCARD);
+    module.attr("GRAPH_READ") = static_cast<uint32_t>(vernon::execution::AccessMode::Read);
+    module.attr("GRAPH_WRITE") = static_cast<uint32_t>(vernon::execution::AccessMode::Write);
+    module.attr("GRAPH_READ_WRITE") = static_cast<uint32_t>(vernon::execution::AccessMode::ReadWrite);
+    module.attr("GRAPH_SHADER_READ") = static_cast<uint32_t>(VERNON_RHI_STATE_SHADER_READ);
+    module.attr("GRAPH_SHADER_WRITE") = static_cast<uint32_t>(VERNON_RHI_STATE_SHADER_WRITE);
+    module.attr("GRAPH_PASS_NEVER_CULL") = static_cast<uint32_t>(vernon::execution::PassNeverCull);
+    module.attr("GRAPH_PASS_NO_MERGE") = static_cast<uint32_t>(vernon::execution::PassNoMerge);
+    module.attr("GRAPH_PASS_SIDE_EFFECT") = static_cast<uint32_t>(vernon::execution::PassSideEffect);
     module.attr("TOPOLOGY_LINE_LIST") = static_cast<uint32_t>(VERNON_TOPOLOGY_LINE_LIST);
     module.attr("TOPOLOGY_POINT_LIST") = static_cast<uint32_t>(VERNON_TOPOLOGY_POINT_LIST);
     module.def("runtime_available",

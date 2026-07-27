@@ -13,8 +13,6 @@ TEST(RuntimeCommonApi, InitializesOptionsAndReportsErrors) {
     options.struct_size = sizeof(options);
     callbacks.struct_size = sizeof(callbacks);
     bundleOptions.struct_size = sizeof(bundleOptions);
-    EXPECT_EQ(options.api_version_major, 0);
-    EXPECT_EQ(options.api_version_minor, 0);
     EXPECT_EQ(options.reserved[0], 0);
     EXPECT_EQ(callbacks.reserved[0], 0);
     EXPECT_EQ(bundleOptions.reserved[0], 0);

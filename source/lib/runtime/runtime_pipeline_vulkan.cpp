@@ -1,6 +1,7 @@
 #include "runtime_pipeline_backend.h"
 
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
+#include "../rhi/rhi_internal.h"
 #include "backend_vulkan.h"
 #include "compute_launch_planner.h"
 #include "rhi_adapter/adapter_internal.h"
@@ -431,7 +432,10 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
         std::copy(std::begin(plan.attachments[index]->clear_color), std::end(plan.attachments[index]->clear_color),
                   attachments[index].clear_color);
         const auto *image = reinterpret_cast<const rhi::vulkan::Image *>(
-            static_cast<uintptr_t>(plan.attachments[index]->resource.resource.value));
+            vernon::rhi::resolveResource(pipeline.context->rhiDevice, vernon::rhi::ResourceKind::Image,
+                                         plan.attachments[index]->resource.resource.value));
+        if (!image)
+            return fail(*pipeline.context, "Vulkan RHI color attachment is stale");
         formats.push_back(static_cast<uint32_t>(image->format));
     }
     if (plan.depthAttachment) {

@@ -1,4 +1,5 @@
 #include "VernonRuntime.h"
+#include "rhi/rhi_internal.h"
 #include "runtime/compute_launch_planner.h"
 #include "runtime/graphics_invocation_planner.h"
 #include "runtime/pipeline_bundle.h"
@@ -300,11 +301,6 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                 (resolved.format == "native_library" || resolved.format == "relocatable_object");
             const bool validFormat =
                 context->backend == VERNON_RUNTIME_CPU ? validCpuFormat : resolved.format == expectedFormat;
-            if (context->backend == VERNON_RUNTIME_DIRECTX12 && resolved.format == "hlsl") {
-                fail(context, "legacy DirectX HLSL bundles are unsupported; re-cook the pipeline to DXIL",
-                     VERNON_STATUS_UNSUPPORTED_TARGET);
-                return nullptr;
-            }
             if (!validFormat || (resolved.external && value["artifact"].contains("encoding")) ||
                 (!resolved.external &&
                  (((resolved.format == "spirv" || resolved.format == "dxil") && encoding != "base64") ||
@@ -622,19 +618,54 @@ VernonStatus vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline, const V
         invocation->abi_version != VERNON_PIPELINE_INVOCATION_ABI_VERSION ||
         (invocation->argument_count && !invocation->arguments))
         return fail(pipeline ? pipeline->context : nullptr, "invalid pipeline invocation");
-    if (!pipeline->variant.compute.empty()) {
-        PlannedComputeLaunch plan;
-        std::string planningError;
-        if (!planComputeInvocation(pipeline->variant, *invocation, plan, planningError))
-            return fail(pipeline->context, planningError);
-        return invokeBackendComputePipeline(*pipeline, plan);
-    }
+    auto encode = [&](const VernonPipelineInvocation &encoded) {
+        if (!pipeline->variant.compute.empty()) {
+            PlannedComputeLaunch plan;
+            std::string planningError;
+            if (!planComputeInvocation(pipeline->variant, encoded, plan, planningError))
+                return fail(pipeline->context, planningError);
+            return invokeBackendComputePipeline(*pipeline, plan);
+        }
 
-    PlannedGraphicsInvocation plan;
-    std::string planningError;
-    if (!planGraphicsInvocation(pipeline->variant, *invocation, plan, planningError))
-        return fail(pipeline->context, planningError);
-    return invokeBackendPipeline(*pipeline, *invocation, plan);
+        PlannedGraphicsInvocation plan;
+        std::string planningError;
+        if (!planGraphicsInvocation(pipeline->variant, encoded, plan, planningError))
+            return fail(pipeline->context, planningError);
+        return invokeBackendPipeline(*pipeline, encoded, plan);
+    };
+    if (invocation->command_encoder.value != 0 || pipeline->context->rhiDevice.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        return encode(*invocation);
+
+    const bool graphics = pipeline->variant.compute.empty();
+    VernonRhiCommandEncoderDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.required_capabilities = graphics ? VERNON_RHI_QUEUE_GRAPHICS : VERNON_RHI_QUEUE_COMPUTE;
+    VernonRhiCommandEncoder native{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    if (vernonRhiDeviceCreateCommandEncoder(pipeline->context->rhiDevice, &descriptor, &native) != VERNON_RHI_STATUS_OK)
+        return fail(pipeline->context, "failed to create the immediate command encoder");
+    VernonPipelineInvocation encoded = *invocation;
+    VernonStatus status = referenceBackendCommandEncoder(*pipeline->context, native, encoded.command_encoder);
+    bool rendering = false;
+    if (status == VERNON_STATUS_OK && graphics) {
+        rendering = vernon::rhi::beginProviderRendering(pipeline->context->rhiDevice, native);
+        if (!rendering)
+            status = fail(pipeline->context, "failed to begin immediate rendering");
+    }
+    if (status == VERNON_STATUS_OK)
+        status = encode(encoded);
+    if (rendering) {
+        const VernonRhiStatus endStatus = vernonRhiCommandEncoderEndRendering(pipeline->context->rhiDevice, native);
+        if (status == VERNON_STATUS_OK && endStatus != VERNON_RHI_STATUS_OK)
+            status = fail(pipeline->context, "failed to end immediate rendering");
+    }
+    if (status == VERNON_STATUS_OK &&
+        vernonRhiCommandEncoderFinish(pipeline->context->rhiDevice, native) != VERNON_RHI_STATUS_OK)
+        status = fail(pipeline->context, "failed to finish the immediate command encoder");
+    if (status == VERNON_STATUS_OK &&
+        vernonRhiDeviceSubmit(pipeline->context->rhiDevice, native) != VERNON_RHI_STATUS_OK)
+        status = fail(pipeline->context, "failed to submit the immediate command encoder");
+    vernonRhiDeviceDestroyCommandEncoder(pipeline->context->rhiDevice, native);
+    return status;
 }
 
 VernonStatus vernonRuntimePipelineEncode(VernonRuntimeProviderObject encoder, VernonLoadedPipeline *pipeline,
@@ -644,12 +675,6 @@ VernonStatus vernonRuntimePipelineEncode(VernonRuntimeProviderObject encoder, Ve
     VernonPipelineInvocation encoded = *invocation;
     encoded.command_encoder = encoder;
     return vernonRuntimePipelineInvoke(pipeline, &encoded);
-}
-
-VernonStatus vernonRuntimeComputeToGraphicsBarrier(VernonRuntimeContext *context) {
-    if (!context || (context->backend != VERNON_RUNTIME_OPENGL && context->backend != VERNON_RUNTIME_OPENGL_ES))
-        return VERNON_STATUS_UNSUPPORTED_TARGET;
-    return backendComputeToGraphicsBarrier(*context);
 }
 
 VernonStatus vernonRuntimeSynchronize(VernonRuntimeContext *context) {
@@ -673,6 +698,12 @@ VernonStatus vernonRuntimeReferenceRhiImage(VernonRuntimeContext *context, Verno
 VernonStatus vernonRuntimeReferenceRhiSampler(VernonRuntimeContext *context, VernonRhiSampler sampler,
                                               VernonRuntimeProviderResourceReference *output) {
     return context && output ? referenceBackendRhiSampler(*context, sampler, *output) : VERNON_STATUS_INVALID_ARGUMENT;
+}
+
+VernonStatus vernonRuntimeReferenceRhiCommandEncoder(VernonRuntimeContext *context, VernonRhiCommandEncoder encoder,
+                                                     VernonRuntimeProviderObject *output) {
+    return context && output ? referenceBackendCommandEncoder(*context, encoder, *output)
+                             : VERNON_STATUS_INVALID_ARGUMENT;
 }
 
 } // extern "C"

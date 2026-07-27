@@ -1,5 +1,7 @@
 #include "VernonExecutionGraph.h"
 
+#include "../rhi/rhi_internal.h"
+
 #include <algorithm>
 #include <queue>
 #include <unordered_map>
@@ -99,7 +101,15 @@ void RenderPass::renderArea(uint32_t x, uint32_t y, uint32_t width, uint32_t hei
 }
 
 ExecutionGraph::ExecutionGraph(VernonRhiDevice device) : device_(device) {}
-ExecutionGraph::~ExecutionGraph() = default;
+ExecutionGraph::~ExecutionGraph() {
+    for (const ResourceRecord &record : resourceRecords_)
+        if (record.resourceKey && record.resourceKey != UINT64_MAX)
+            vernon::rhi::releaseResource(device_,
+                                         record.resource.kind == ResourceKind::Buffer
+                                             ? vernon::rhi::ResourceKind::Buffer
+                                             : vernon::rhi::ResourceKind::Image,
+                                         record.resourceKey);
+}
 
 GraphBuffer ExecutionGraph::importBuffer(VernonRhiBuffer buffer, bool exported) {
     GraphBuffer result;
@@ -109,6 +119,15 @@ GraphBuffer ExecutionGraph::importBuffer(VernonRhiBuffer buffer, bool exported) 
     resources_.push_back(result);
     resourceRecords_.push_back({result, exported});
     resourceRecords_.back().buffer = buffer;
+    if (!vernon::rhi::deviceExists(device_)) {
+        resourceRecords_.back().resourceKey = UINT64_MAX;
+        dirty_ = true;
+        return result;
+    }
+    resourceRecords_.back().resourceKey = vernon::rhi::bufferResource(device_, buffer);
+    if (!resourceRecords_.back().resourceKey ||
+        !vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::Buffer, resourceRecords_.back().resourceKey))
+        resourceRecords_.back().resourceKey = 0;
     dirty_ = true;
     return result;
 }
@@ -129,6 +148,15 @@ GraphImage ExecutionGraph::importImage(VernonRhiImage image, VernonRhiImageView 
     resources_.push_back(result);
     resourceRecords_.push_back({result, exported});
     resourceRecords_.back().image = image;
+    if (!vernon::rhi::deviceExists(device_)) {
+        resourceRecords_.back().resourceKey = UINT64_MAX;
+        dirty_ = true;
+        return result;
+    }
+    resourceRecords_.back().resourceKey = vernon::rhi::imageResource(device_, image);
+    if (!resourceRecords_.back().resourceKey ||
+        !vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::Image, resourceRecords_.back().resourceKey))
+        resourceRecords_.back().resourceKey = 0;
     dirty_ = true;
     return result;
 }
@@ -249,11 +277,17 @@ bool ExecutionGraph::compile(std::string &error) {
     for (CompiledScope &scope : scopes_) {
         std::unordered_map<uint32_t, ResourceUse> firstUses;
         std::unordered_map<uint32_t, ResourceUse> finalUses;
-        for (uint32_t passIndex : scope.passIndices)
+        for (uint32_t passIndex : scope.passIndices) {
+            const uint32_t stageMask = dynamic_cast<ComputePass *>(passes_[passIndex].get())
+                                           ? VERNON_RHI_STAGE_COMPUTE
+                                           : VERNON_RHI_STAGE_VERTEX | VERNON_RHI_STAGE_FRAGMENT;
             for (const ResourceUse &use : passes_[passIndex]->uses_) {
-                firstUses.emplace(use.resource.id, use);
-                finalUses.insert_or_assign(use.resource.id, use);
+                ResourceUse effective = use;
+                effective.stageMask = stageMask;
+                firstUses.emplace(use.resource.id, effective);
+                finalUses.insert_or_assign(use.resource.id, effective);
             }
+        }
         for (const auto &[resourceId, use] : firstUses) {
             const LastUse &previous = lastUses[resourceId];
             if (!previous.present ||
@@ -261,8 +295,8 @@ bool ExecutionGraph::compile(std::string &error) {
                 continue;
             VernonRhiBarrier barrier{};
             barrier.struct_size = sizeof(barrier);
-            barrier.source_stage_mask = VERNON_RHI_STAGE_COMPUTE | VERNON_RHI_STAGE_VERTEX | VERNON_RHI_STAGE_FRAGMENT;
-            barrier.destination_stage_mask = barrier.source_stage_mask;
+            barrier.source_stage_mask = previous.use.stageMask;
+            barrier.destination_stage_mask = use.stageMask;
             barrier.source_access = accessBits(previous.use);
             barrier.destination_access = accessBits(use);
             barrier.old_state = previous.use.state;
@@ -283,6 +317,11 @@ bool ExecutionGraph::compile(std::string &error) {
 }
 
 bool ExecutionGraph::validate(std::string &error) const {
+    for (const ResourceRecord &resource : resourceRecords_)
+        if (!resource.resourceKey) {
+            error = "execution graph contains a stale imported resource";
+            return false;
+        }
     std::unordered_set<const ExecutionPass *> owned;
     std::unordered_set<std::string> names;
     for (const auto &pass : passes_) {
@@ -312,6 +351,7 @@ bool ExecutionGraph::validate(std::string &error) const {
 }
 
 VernonRhiStatus ExecutionGraph::execute() {
+    lastStats_ = {};
     std::string error;
     if ((dirty_ && !compile(error)) || !validate(error))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
@@ -339,6 +379,7 @@ VernonRhiStatus ExecutionGraph::execute() {
                 const auto &finish = last->colors_[index];
                 VernonRhiColorAttachment attachment{};
                 attachment.view = begin.image.view;
+                attachment.location = begin.location;
                 attachment.initial_state = VERNON_RHI_STATE_COLOR_ATTACHMENT;
                 attachment.final_state = VERNON_RHI_STATE_COLOR_ATTACHMENT;
                 attachment.load_operation = begin.load;
@@ -416,6 +457,8 @@ VernonRhiStatus ExecutionGraph::execute() {
         status = vernonRhiCommandEncoderFinish(device_, native);
     if (status == VERNON_RHI_STATUS_OK)
         status = vernonRhiDeviceSubmit(device_, native);
+    if (status == VERNON_RHI_STATUS_OK)
+        status = vernonRhiCommandEncoderGetStats(device_, native, &lastStats_);
     const VernonRhiStatus destroyStatus = vernonRhiDeviceDestroyCommandEncoder(device_, native);
     return status == VERNON_RHI_STATUS_OK ? destroyStatus : status;
 }

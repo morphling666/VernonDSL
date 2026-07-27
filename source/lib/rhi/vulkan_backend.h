@@ -4,7 +4,6 @@
 #include "VernonRHI.h"
 #include "vulkan_driver.h"
 
-#include <array>
 #include <optional>
 #include <string>
 
@@ -32,8 +31,6 @@ struct Sampler {
 };
 
 struct VERNON_RHI_CAPI DeviceState {
-    static constexpr uint32_t frameCount = 3;
-
     struct CommandFrame {
         VkCommandBuffer command{};
         VkFence fence{};
@@ -81,12 +78,12 @@ struct VERNON_RHI_CAPI DeviceState {
     uint32_t apiVersion{};
     uint32_t maxComputeWorkGroupInvocations{};
     uint32_t maxComputeWorkGroupSize[3]{};
+    VkDeviceSize descriptorBufferOffsetAlignment{1};
     bool dynamicRendering{};
     bool nativeObjectsBorrowed{};
     VkCommandBuffer borrowedCommandBuffer{};
     VkCommandPool commandPool{};
-    std::array<CommandFrame, frameCount> frames{};
-    uint32_t currentFrame{frameCount - 1};
+    CommandFrame frame;
     VkDescriptorPool descriptorPool{};
     VkPhysicalDeviceMemoryProperties memoryProperties{};
     Sampler defaultImplicitSampler;

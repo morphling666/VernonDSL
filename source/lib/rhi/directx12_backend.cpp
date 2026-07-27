@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <new>
 
 namespace vernon::rhi::directx12 {
 namespace {
@@ -153,19 +154,15 @@ bool DeviceState::initialize(uint32_t deviceIndex, bool forceWarp, std::string &
         shutdown();
         return false;
     }
-    for (CommandFrame &frame : frames) {
-        if (!check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&frame.allocator)),
-                   "ID3D12Device::CreateCommandAllocator", error) ||
-            !check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, frame.allocator, nullptr,
-                                             IID_PPV_ARGS(&frame.commands)),
-                   "ID3D12Device::CreateCommandList", error) ||
-            !check(frame.commands->Close(), "ID3D12GraphicsCommandList::Close", error)) {
-            shutdown();
-            return false;
-        }
+    if (!check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&frame.allocator)),
+               "ID3D12Device::CreateCommandAllocator", error) ||
+        !check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, frame.allocator, nullptr,
+                                         IID_PPV_ARGS(&frame.commands)),
+               "ID3D12Device::CreateCommandList", error) ||
+        !check(frame.commands->Close(), "ID3D12GraphicsCommandList::Close", error)) {
+        shutdown();
+        return false;
     }
-    allocator = frames[0].allocator;
-    commands = frames[0].commands;
     fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!fenceEvent) {
         error = "CreateEventW failed for the D3D12 fence";
@@ -184,7 +181,7 @@ bool DeviceState::initializeBorrowed(ID3D12Device *borrowedDevice, ID3D12Command
     }
     device = borrowedDevice;
     queue = borrowedQueue;
-    commands = borrowedCommands;
+    this->borrowedCommands = borrowedCommands;
     nativeObjectsBorrowed = true;
     queryCapabilities(*this);
     return true;
@@ -209,18 +206,17 @@ void DeviceState::shutdown() {
     for (DescriptorRing *ring :
          {&resourceDescriptorRing, &samplerDescriptorRing, &rtvDescriptorRing, &dsvDescriptorRing}) {
         release(ring->heap);
+        for (ID3D12DescriptorHeap *heap : ring->retiredHeaps)
+            release(heap);
+        ring->retiredHeaps.clear();
         ring->capacity = 0;
         ring->cursor = 0;
     }
     release(fence);
-    commands = nullptr;
-    allocator = nullptr;
-    for (CommandFrame &frame : frames) {
-        release(frame.commands);
-        release(frame.allocator);
-        frame.completionValue = 0;
-    }
-    currentFrame = frameCount - 1;
+    borrowedCommands = nullptr;
+    release(frame.commands);
+    release(frame.allocator);
+    frame.completionValue = 0;
     if (nativeObjectsBorrowed) {
         queue = nullptr;
         device = nullptr;
@@ -251,25 +247,22 @@ bool DeviceState::synchronize(std::string &error) {
 
 bool DeviceState::beginCommands(std::string &error, ID3D12PipelineState *initialState) {
     if (nativeObjectsBorrowed) {
-        if (!commands) {
+        if (!borrowedCommands) {
             error = "borrowed D3D12 command list is unavailable";
             return false;
         }
         if (initialState)
-            commands->SetPipelineState(initialState);
+            borrowedCommands->SetPipelineState(initialState);
         return true;
     }
-    currentFrame = (currentFrame + 1) % frameCount;
-    CommandFrame &frame = frames[currentFrame];
     if (!waitForFence(*this, frame.completionValue, error))
         return false;
-    allocator = frame.allocator;
-    commands = frame.commands;
-    return check(allocator->Reset(), "ID3D12CommandAllocator::Reset", error) &&
-           check(commands->Reset(allocator, initialState), "ID3D12GraphicsCommandList::Reset", error);
+    return check(frame.allocator->Reset(), "ID3D12CommandAllocator::Reset", error) &&
+           check(frame.commands->Reset(frame.allocator, initialState), "ID3D12GraphicsCommandList::Reset", error);
 }
 
 bool DeviceState::submitCommands(std::string &error) {
+    ID3D12GraphicsCommandList *commands = commandList();
     if (nativeObjectsBorrowed) {
         if (!commands) {
             error = "borrowed D3D12 command list is unavailable";
@@ -284,12 +277,27 @@ bool DeviceState::submitCommands(std::string &error) {
     const uint64_t value = ++fenceValue;
     if (!check(queue->Signal(fence, value), "ID3D12CommandQueue::Signal", error))
         return false;
-    frames[currentFrame].completionValue = value;
+    frame.completionValue = value;
     if (!waitForFence(*this, value, error))
         return false;
+    recycleCommandStorage();
+    return true;
+}
+
+ID3D12GraphicsCommandList *DeviceState::commandList() const {
+    return nativeObjectsBorrowed ? borrowedCommands : frame.commands;
+}
+
+void DeviceState::recycleCommandStorage() {
     uploadRing.cursor = 0;
     readbackRing.cursor = 0;
-    return true;
+    for (DescriptorRing *ring :
+         {&resourceDescriptorRing, &samplerDescriptorRing, &rtvDescriptorRing, &dsvDescriptorRing}) {
+        for (ID3D12DescriptorHeap *heap : ring->retiredHeaps)
+            release(heap);
+        ring->retiredHeaps.clear();
+        ring->cursor = 0;
+    }
 }
 
 bool DeviceState::createBuffer(Buffer &buffer, size_t size, bool unorderedAccess, D3D12_HEAP_TYPE heapType,
@@ -400,16 +408,25 @@ bool DeviceState::acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE type, bool shade
         error = "D3D12 descriptor ring request is unsupported";
         return false;
     }
-    if (ring->heap && count <= ring->capacity && count > ring->capacity - ring->cursor)
-        ring->cursor = 0;
-    if (!ring->heap || count > ring->capacity) {
+    if (!ring->heap || count > ring->capacity - ring->cursor) {
         if (ring->heap) {
-            if (!synchronize(error))
+            try {
+                ring->retiredHeaps.push_back(ring->heap);
+            } catch (const std::bad_alloc &) {
+                error = "D3D12 descriptor heap retention allocation failed";
                 return false;
-            release(ring->heap);
+            }
+            ring->heap = nullptr;
         }
-        uint32_t capacity = 64;
+        uint32_t capacity = (std::max)(64u, ring->capacity);
         while (capacity < count) {
+            if (capacity > (std::numeric_limits<uint32_t>::max)() / 2) {
+                error = "D3D12 descriptor ring capacity overflow";
+                return false;
+            }
+            capacity *= 2;
+        }
+        if (ring->capacity && capacity <= ring->capacity) {
             if (capacity > (std::numeric_limits<uint32_t>::max)() / 2) {
                 error = "D3D12 descriptor ring capacity overflow";
                 return false;

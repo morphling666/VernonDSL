@@ -52,12 +52,20 @@ class RecordingRenderPass(vd.RenderPass):
 
 
 class ExecutionGraphTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        vd.init(arch=vd.opengl)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        vd.init(arch=vd.cpu)
+
     def test_hazards_schedule_producer_before_consumer(self) -> None:
         graph = vd.ExecutionGraph()
         events: list[str] = []
-        source = object()
-        intermediate = object()
-        output = object()
+        source = vd.storage.zeros(dtype=vd.f32, shape=(4,))
+        intermediate = vd.storage.zeros(dtype=vd.f32, shape=(4,))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(4,))
         graph.add_pass(RecordingComputePass("producer", events, read=source, write=intermediate))
         graph.add_pass(RecordingComputePass("consumer", events, read=intermediate, write=output))
 
@@ -67,7 +75,7 @@ class ExecutionGraphTests(unittest.TestCase):
         self.assertEqual(events, ["producer", "consumer"])
         self.assertEqual(len(graph.scopes[1].barriers), 1)
 
-    def test_cycle_is_rejected_with_pass_names(self) -> None:
+    def test_dependency_cycle_is_rejected(self) -> None:
         graph = vd.ExecutionGraph()
         events: list[str] = []
         first = graph.add_pass(RecordingComputePass("first", events))
@@ -77,14 +85,14 @@ class ExecutionGraphTests(unittest.TestCase):
         first.depends_on(second)
         second.depends_on(first)
 
-        with self.assertRaisesRegex(ValueError, "first.*second|second.*first"):
+        with self.assertRaisesRegex(ValueError, "dependency cycle"):
             graph.compile()
 
     def test_culls_transient_work_without_live_consumers(self) -> None:
         graph = vd.ExecutionGraph()
         events: list[str] = []
-        transient = graph.import_resource(object(), exported=False)
-        output = graph.import_resource(object())
+        transient = graph.import_resource(vd.storage.zeros(dtype=vd.f32, shape=(4,)), exported=False)
+        output = graph.import_resource(vd.storage.zeros(dtype=vd.f32, shape=(4,)))
         graph.add_pass(RecordingComputePass("dead", events, write=transient))
         graph.add_pass(RecordingComputePass("live", events, write=output))
 
@@ -122,6 +130,22 @@ class ExecutionGraphTests(unittest.TestCase):
         graph.compile()
 
         self.assertEqual([scope.kind for scope in graph.scopes], ["render", "render"])
+
+        second.no_merge = False
+        graph.compile()
+
+        self.assertEqual([scope.kind for scope in graph.scopes], ["render"])
+
+    def test_resource_from_another_graph_is_rejected(self) -> None:
+        first = vd.ExecutionGraph()
+        foreign = first.import_resource(vd.storage.zeros(dtype=vd.f32, shape=(4,)))
+        second = vd.ExecutionGraph()
+        execution_pass = RecordingComputePass("foreign", [], read=foreign)
+        execution_pass.side_effect = True
+        second.add_pass(execution_pass)
+
+        with self.assertRaisesRegex(ValueError, "does not belong"):
+            second.compile()
 
     def test_unified_pipeline_invocation_checks_encoder_kind(self) -> None:
         invocation = vd.PipelineInvocation("compute", lambda encoder: None)

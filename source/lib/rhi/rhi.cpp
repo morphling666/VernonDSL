@@ -14,6 +14,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstring>
 #include <deque>
@@ -41,24 +42,33 @@ struct FormatInfo {
     Enum allocationType{};
 };
 
+// occupied tracks the stable record, while publicAlive controls generation-checked
+// handle access. Owner destruction clears publicAlive immediately but keeps the
+// record occupied until every prepared binding releases it.
 struct ImageSlot {
     Image image;
     VernonRhiImageDescriptor descriptor{};
+    uint32_t bindingReferences{};
     Enum target{};
     uint32_t generation{1};
+    bool publicAlive{};
     bool occupied{};
 };
 
 struct BufferSlot {
     vernon::rhi::opengl::Buffer buffer;
     VernonRhiBufferDescriptor descriptor{};
+    uint32_t bindingReferences{};
     uint32_t generation{1};
+    bool publicAlive{};
     bool occupied{};
 };
 
 struct SamplerSlot {
     vernon::rhi::opengl::Sampler sampler;
+    uint32_t bindingReferences{};
     uint32_t generation{1};
+    bool publicAlive{};
     bool occupied{};
 };
 
@@ -80,7 +90,9 @@ struct DeviceSlot {
 struct CudaBufferSlot {
     vernon::rhi::cuda::DevicePointer pointer{};
     VernonRhiBufferDescriptor descriptor{};
+    uint32_t bindingReferences{};
     uint32_t generation{1};
+    bool publicAlive{};
     bool occupied{};
 };
 
@@ -105,7 +117,9 @@ struct DirectX12BufferSlot {
     vernon::rhi::directx12::Buffer buffer;
     VernonRhiDirectX12BorrowedBufferDescriptor descriptor{};
     VernonRhiBufferDescriptor ownedDescriptor{};
+    uint32_t bindingReferences{};
     uint32_t generation{1};
+    bool publicAlive{};
     bool occupied{};
 };
 
@@ -113,7 +127,9 @@ struct DirectX12ImageSlot {
     vernon::rhi::directx12::Image image;
     VernonRhiDirectX12BorrowedImageDescriptor descriptor{};
     VernonRhiImageDescriptor ownedDescriptor{};
+    uint32_t bindingReferences{};
     uint32_t generation{1};
+    bool publicAlive{};
     bool occupied{};
 };
 
@@ -125,7 +141,9 @@ struct DirectX12DescriptorRangeSlot {
 
 struct DirectX12SamplerSlot {
     vernon::rhi::directx12::Sampler sampler;
+    uint32_t bindingReferences{};
     uint32_t generation{1};
+    bool publicAlive{};
     bool occupied{};
 };
 
@@ -155,7 +173,9 @@ struct VulkanBufferSlot {
     vernon::rhi::vulkan::Buffer buffer;
     VernonRhiVulkanBorrowedBufferDescriptor descriptor{};
     VernonRhiBufferDescriptor ownedDescriptor{};
+    uint32_t bindingReferences{};
     uint32_t generation{1};
+    bool publicAlive{};
     bool occupied{};
 };
 
@@ -163,7 +183,9 @@ struct VulkanImageSlot {
     vernon::rhi::vulkan::Image image;
     VernonRhiVulkanBorrowedImageDescriptor descriptor{};
     VernonRhiImageDescriptor ownedDescriptor{};
+    uint32_t bindingReferences{};
     uint32_t generation{1};
+    bool publicAlive{};
     bool occupied{};
 };
 
@@ -176,7 +198,9 @@ struct VulkanImageViewSlot {
 
 struct VulkanSamplerSlot {
     vernon::rhi::vulkan::Sampler sampler;
+    uint32_t bindingReferences{};
     uint32_t generation{1};
+    bool publicAlive{};
     bool occupied{};
 };
 
@@ -205,6 +229,43 @@ std::mutex deviceMutex;
 std::vector<DeviceSlot> devices;
 
 VernonRhiDevice invalidDevice() { return {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0}; }
+
+template <typename Handle> uint64_t resourceKey(Handle handle) {
+    return (static_cast<uint64_t>(handle.generation) << 32) | (static_cast<uint64_t>(handle.index) + 1);
+}
+
+bool decodeResourceKey(uint64_t key, uint32_t &index, uint32_t &generation) {
+    const uint64_t encodedIndex = key & UINT32_MAX;
+    generation = static_cast<uint32_t>(key >> 32);
+    if (!encodedIndex || !generation)
+        return false;
+    index = static_cast<uint32_t>(encodedIndex - 1);
+    return true;
+}
+
+template <typename Slots> auto *lookupResourceRecord(Slots &slots, uint64_t key) {
+    uint32_t index = 0;
+    uint32_t generation = 0;
+    if (!decodeResourceKey(key, index, generation) || index >= slots.size())
+        return static_cast<typename Slots::value_type *>(nullptr);
+    auto &slot = slots[index];
+    return slot.generation == generation ? &slot : nullptr;
+}
+
+template <typename Slot, typename = void> struct HasPublicAlive : std::false_type {};
+template <typename Slot>
+struct HasPublicAlive<Slot, std::void_t<decltype(std::declval<Slot &>().publicAlive)>> : std::true_type {};
+
+template <typename Slot> bool publicAlive(const Slot &slot) {
+    if constexpr (HasPublicAlive<Slot>::value)
+        return slot.publicAlive;
+    return true;
+}
+
+template <typename Slot> void setPublicAlive(Slot &slot, bool alive) {
+    if constexpr (HasPublicAlive<Slot>::value)
+        slot.publicAlive = alive;
+}
 
 std::optional<size_t> rgba8Size(const VernonRhiImageDescriptor &descriptor) {
     if (descriptor.dimension != VERNON_RHI_IMAGE_2D || descriptor.format != VERNON_RHI_FORMAT_RGBA8_UNORM ||
@@ -241,7 +302,7 @@ CudaBufferSlot *lookupCudaBuffer(CudaDevice &device, VernonRhiBuffer handle) {
     if (handle.index >= device.buffers.size())
         return nullptr;
     CudaBufferSlot &slot = device.buffers[handle.index];
-    return slot.occupied && slot.generation == handle.generation ? &slot : nullptr;
+    return slot.occupied && slot.publicAlive && slot.generation == handle.generation ? &slot : nullptr;
 }
 #endif
 
@@ -263,7 +324,7 @@ typename Slots::value_type *lookupDirectX12Slot(Slots &slots, Handle handle) {
     if (handle.index >= slots.size())
         return nullptr;
     auto &slot = slots[handle.index];
-    return slot.occupied && slot.generation == handle.generation ? &slot : nullptr;
+    return slot.occupied && publicAlive(slot) && slot.generation == handle.generation ? &slot : nullptr;
 }
 
 template <typename Slots, typename Handle>
@@ -275,11 +336,13 @@ typename Slots::value_type &allocateDirectX12Slot(Slots &slots, Handle &output) 
         slots.emplace_back();
     auto &slot = slots[index];
     slot.occupied = true;
+    setPublicAlive(slot, true);
     output = {index, slot.generation};
     return slot;
 }
 
 template <typename Slot> void releaseDirectX12Slot(Slot &slot) {
+    setPublicAlive(slot, false);
     slot.occupied = false;
     ++slot.generation;
     if (slot.generation == 0)
@@ -308,6 +371,14 @@ D3D12_RESOURCE_STATES directX12ResourceState(VernonRhiResourceState state) {
         return D3D12_RESOURCE_STATE_COMMON;
     }
     return D3D12_RESOURCE_STATE_COMMON;
+}
+
+void restoreDirectX12BufferState(void *context, uint64_t state) {
+    static_cast<vernon::rhi::directx12::Buffer *>(context)->state = static_cast<D3D12_RESOURCE_STATES>(state);
+}
+
+void restoreDirectX12ImageState(void *context, uint64_t state) {
+    static_cast<vernon::rhi::directx12::Image *>(context)->state = static_cast<D3D12_RESOURCE_STATES>(state);
 }
 
 DXGI_FORMAT directX12Format(VernonRhiFormat format) {
@@ -361,7 +432,7 @@ template <typename Slots, typename Handle> typename Slots::value_type *lookupVul
     if (handle.index >= slots.size())
         return nullptr;
     auto &slot = slots[handle.index];
-    return slot.occupied && slot.generation == handle.generation ? &slot : nullptr;
+    return slot.occupied && publicAlive(slot) && slot.generation == handle.generation ? &slot : nullptr;
 }
 
 template <typename Slots, typename Handle>
@@ -373,11 +444,13 @@ typename Slots::value_type &allocateVulkanSlot(Slots &slots, Handle &output) {
         slots.emplace_back();
     auto &slot = slots[index];
     slot.occupied = true;
+    setPublicAlive(slot, true);
     output = {index, slot.generation};
     return slot;
 }
 
 template <typename Slot> void releaseVulkanSlot(Slot &slot) {
+    setPublicAlive(slot, false);
     slot.occupied = false;
     ++slot.generation;
     if (slot.generation == 0)
@@ -396,6 +469,10 @@ template <typename Handle> uint64_t vulkanHandleBits(Handle handle) {
         return reinterpret_cast<uint64_t>(handle);
     else
         return static_cast<uint64_t>(handle);
+}
+
+void restoreVulkanImageLayout(void *context, uint64_t layout) {
+    static_cast<vernon::rhi::vulkan::Image *>(context)->layout = static_cast<VkImageLayout>(layout);
 }
 
 VkFormat vulkanFormat(VernonRhiFormat format) {
@@ -436,44 +513,168 @@ VkImageLayout vulkanImageLayout(VernonRhiResourceState state) {
     return VK_IMAGE_LAYOUT_UNDEFINED;
 }
 
-void transitionVulkanImage(VkCommandBuffer command, VulkanImageSlot &slot, VkImageLayout target) {
+void vulkanBufferDependency(VernonRhiResourceState state, VkPipelineStageFlags &stages, VkAccessFlags &access) {
+    switch (state) {
+    case VERNON_RHI_STATE_TRANSFER_SOURCE:
+        stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        access = VK_ACCESS_TRANSFER_READ_BIT;
+        return;
+    case VERNON_RHI_STATE_TRANSFER_DESTINATION:
+        stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        access = VK_ACCESS_TRANSFER_WRITE_BIT;
+        return;
+    case VERNON_RHI_STATE_SHADER_READ:
+        stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+        access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
+                 VK_ACCESS_INDEX_READ_BIT;
+        return;
+    case VERNON_RHI_STATE_SHADER_WRITE:
+        stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        return;
+    case VERNON_RHI_STATE_COLOR_ATTACHMENT:
+        stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        return;
+    case VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT:
+        stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        return;
+    case VERNON_RHI_STATE_PRESENT:
+        stages = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+        access = VK_ACCESS_MEMORY_READ_BIT;
+        return;
+    case VERNON_RHI_STATE_UNDEFINED:
+        stages = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        access = 0;
+        return;
+    default:
+        stages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        return;
+    }
+}
+
+VkPipelineStageFlags vulkanShaderStages(uint32_t stages) {
+    VkPipelineStageFlags result = 0;
+    if (stages & VERNON_RHI_STAGE_COMPUTE)
+        result |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    if (stages & VERNON_RHI_STAGE_VERTEX)
+        result |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+    if (stages & VERNON_RHI_STAGE_FRAGMENT)
+        result |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    return result;
+}
+
+VkAccessFlags vulkanAccess(uint32_t access) {
+    VkAccessFlags result = 0;
+    if (access & VERNON_RHI_ACCESS_TRANSFER_READ)
+        result |= VK_ACCESS_TRANSFER_READ_BIT;
+    if (access & VERNON_RHI_ACCESS_TRANSFER_WRITE)
+        result |= VK_ACCESS_TRANSFER_WRITE_BIT;
+    if (access & VERNON_RHI_ACCESS_SHADER_READ)
+        result |= VK_ACCESS_SHADER_READ_BIT;
+    if (access & VERNON_RHI_ACCESS_SHADER_WRITE)
+        result |= VK_ACCESS_SHADER_WRITE_BIT;
+    if (access & VERNON_RHI_ACCESS_COLOR_READ)
+        result |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+    if (access & VERNON_RHI_ACCESS_COLOR_WRITE)
+        result |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    if (access & VERNON_RHI_ACCESS_DEPTH_STENCIL_READ)
+        result |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+    if (access & VERNON_RHI_ACCESS_DEPTH_STENCIL_WRITE)
+        result |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    if (access & VERNON_RHI_ACCESS_VERTEX_READ)
+        result |= VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+    if (access & VERNON_RHI_ACCESS_INDEX_READ)
+        result |= VK_ACCESS_INDEX_READ_BIT;
+    if (access & VERNON_RHI_ACCESS_INDIRECT_READ)
+        result |= VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+    if (access & VERNON_RHI_ACCESS_HOST_READ)
+        result |= VK_ACCESS_HOST_READ_BIT;
+    if (access & VERNON_RHI_ACCESS_HOST_WRITE)
+        result |= VK_ACCESS_HOST_WRITE_BIT;
+    return result;
+}
+
+void vulkanBarrierDependency(VernonRhiResourceState state, uint32_t stageMask, uint32_t accessMask,
+                             VkPipelineStageFlags &stages, VkAccessFlags &access) {
+    vulkanBufferDependency(state, stages, access);
+    if ((state == VERNON_RHI_STATE_SHADER_READ || state == VERNON_RHI_STATE_SHADER_WRITE) && stageMask) {
+        const VkPipelineStageFlags explicitStages = vulkanShaderStages(stageMask);
+        if (explicitStages)
+            stages = explicitStages;
+    }
+    if (accessMask)
+        access = vulkanAccess(accessMask);
+}
+
+void vulkanImageDependency(VkImageLayout layout, VkPipelineStageFlags &stages, VkAccessFlags &access) {
+    switch (layout) {
+    case VK_IMAGE_LAYOUT_UNDEFINED:
+        stages = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        access = 0;
+        return;
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+        stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        access = VK_ACCESS_TRANSFER_READ_BIT;
+        return;
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+        stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        access = VK_ACCESS_TRANSFER_WRITE_BIT;
+        return;
+    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+        stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        access = VK_ACCESS_SHADER_READ_BIT;
+        return;
+    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+        stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        return;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+        stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        return;
+    case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+        stages = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+        access = VK_ACCESS_MEMORY_READ_BIT;
+        return;
+    default:
+        stages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        return;
+    }
+}
+
+void transitionVulkanImage(VkCommandBuffer command, VulkanImageSlot &slot, VkImageLayout target,
+                           bool forceMemoryDependency = false, const VernonRhiBarrier *dependency = nullptr) {
     auto &image = slot.image;
+    if (image.layout == target && !forceMemoryDependency)
+        return;
     VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     barrier.oldLayout = image.layout;
     barrier.newLayout = target;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = image.image;
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.aspectMask =
+        image.format == VK_FORMAT_D32_SFLOAT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
     barrier.subresourceRange.levelCount = 1;
     barrier.subresourceRange.layerCount = 1;
-    VkPipelineStageFlags sourceStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    if (image.layout == VK_IMAGE_LAYOUT_UNDEFINED) {
-        barrier.srcAccessMask = 0;
-        sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-    } else if (image.layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    } else if (image.layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    } else if (image.layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
-        barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        sourceStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    } else if (image.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
-        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        sourceStage = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    }
-    VkPipelineStageFlags destinationStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    if (target == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
-        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    } else if (target == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
-        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    } else if (target == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        destinationStage = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    VkPipelineStageFlags sourceStage{};
+    VkPipelineStageFlags destinationStage{};
+    vulkanImageDependency(image.layout, sourceStage, barrier.srcAccessMask);
+    vulkanImageDependency(target, destinationStage, barrier.dstAccessMask);
+    if (dependency) {
+        vulkanBarrierDependency(static_cast<VernonRhiResourceState>(dependency->old_state),
+                                dependency->source_stage_mask, dependency->source_access, sourceStage,
+                                barrier.srcAccessMask);
+        vulkanBarrierDependency(static_cast<VernonRhiResourceState>(dependency->new_state),
+                                dependency->destination_stage_mask, dependency->destination_access, destinationStage,
+                                barrier.dstAccessMask);
     }
     vernon::rhi::vulkan::driver().cmdPipelineBarrier(command, sourceStage, destinationStage, 0, 0, nullptr, 0, nullptr,
                                                      1, &barrier);
@@ -482,6 +683,21 @@ void transitionVulkanImage(VkCommandBuffer command, VulkanImageSlot &slot, VkIma
 
 void validate(const VulkanInteropDevice &device) {
 #ifndef NDEBUG
+    for (const VulkanBufferSlot &buffer : device.buffers) {
+        assert(buffer.generation != 0);
+        assert(!buffer.publicAlive || buffer.occupied);
+        assert(buffer.bindingReferences == 0 || buffer.occupied);
+    }
+    for (const VulkanImageSlot &image : device.images) {
+        assert(image.generation != 0);
+        assert(!image.publicAlive || image.occupied);
+        assert(image.bindingReferences == 0 || image.occupied);
+    }
+    for (const VulkanSamplerSlot &sampler : device.samplers) {
+        assert(sampler.generation != 0);
+        assert(!sampler.publicAlive || sampler.occupied);
+        assert(sampler.bindingReferences == 0 || sampler.occupied);
+    }
     for (const VulkanImageViewSlot &view : device.imageViews) {
         assert(view.generation != 0);
         if (!view.occupied)
@@ -500,21 +716,21 @@ ImageSlot *lookupImage(OpenGLDevice &device, VernonRhiImage handle) {
     if (handle.index >= device.images.size())
         return nullptr;
     ImageSlot &slot = device.images[handle.index];
-    return slot.occupied && slot.generation == handle.generation ? &slot : nullptr;
+    return slot.occupied && slot.publicAlive && slot.generation == handle.generation ? &slot : nullptr;
 }
 
 BufferSlot *lookupBuffer(OpenGLDevice &device, VernonRhiBuffer handle) {
     if (handle.index >= device.buffers.size())
         return nullptr;
     BufferSlot &slot = device.buffers[handle.index];
-    return slot.occupied && slot.generation == handle.generation ? &slot : nullptr;
+    return slot.occupied && slot.publicAlive && slot.generation == handle.generation ? &slot : nullptr;
 }
 
 SamplerSlot *lookupSampler(OpenGLDevice &device, VernonRhiSampler handle) {
     if (handle.index >= device.samplers.size())
         return nullptr;
     SamplerSlot &slot = device.samplers[handle.index];
-    return slot.occupied && slot.generation == handle.generation ? &slot : nullptr;
+    return slot.occupied && slot.publicAlive && slot.generation == handle.generation ? &slot : nullptr;
 }
 
 void validate(const OpenGLDevice &device) {
@@ -522,14 +738,20 @@ void validate(const OpenGLDevice &device) {
     for (const BufferSlot &slot : device.buffers) {
         assert(slot.generation != 0);
         assert(slot.occupied == (slot.buffer.name != 0));
+        assert(!slot.publicAlive || slot.occupied);
+        assert(slot.bindingReferences == 0 || slot.occupied);
     }
     for (const ImageSlot &slot : device.images) {
         assert(slot.generation != 0);
         assert(slot.occupied == (slot.image.name != 0));
+        assert(!slot.publicAlive || slot.occupied);
+        assert(slot.bindingReferences == 0 || slot.occupied);
     }
     for (const SamplerSlot &slot : device.samplers) {
         assert(slot.generation != 0);
         assert(slot.occupied == (slot.sampler.name != 0));
+        assert(!slot.publicAlive || slot.occupied);
+        assert(slot.bindingReferences == 0 || slot.occupied);
     }
 #else
     (void)device;
@@ -711,6 +933,23 @@ vernon::rhi::VulkanCacheStats vernon::rhi::getVulkanCacheStats(VernonRhiDevice h
     return result;
 }
 
+uint64_t vernon::rhi::getTrackedBufferState(VernonRhiDevice handle, VernonRhiBuffer buffer) {
+#if defined(VERNON_HAS_DIRECTX12_RHI)
+    if (auto device = lookupDirectX12Device(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        const auto *slot = lookupResourceRecord(device->buffers, resourceKey(buffer));
+        return slot ? static_cast<uint64_t>(slot->buffer.state) : UINT64_MAX;
+    }
+#endif
+#if defined(VERNON_HAS_VULKAN_RHI)
+    if (auto device = lookupVulkanDevice(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        return lookupResourceRecord(device->buffers, resourceKey(buffer)) ? 0 : UINT64_MAX;
+    }
+#endif
+    return UINT64_MAX;
+}
+
 extern "C" VernonRhiDevice vernonRhiCreateOpenGLDevice(const VernonOpenGLContextCallbacks *callbacks,
                                                        uint32_t embeddedProfile) {
     if (!callbacks)
@@ -729,6 +968,8 @@ extern "C" VernonRhiDevice vernonRhiCreateOpenGLDevice(const VernonOpenGLContext
 }
 
 void vernon::rhi::destroyDevice(VernonRhiDevice handle) {
+    if (vernon::rhi::deviceHasActiveCommandEncoder(handle))
+        return;
 #if defined(VERNON_HAS_CUDA_RHI)
     if ((handle.index & cudaDeviceBit) != 0) {
         std::shared_ptr<CudaDevice> device;
@@ -905,6 +1146,7 @@ extern "C" VernonRhiStatus vernonRhiDeviceCreateBuffer(VernonRhiDevice handle,
             return VERNON_RHI_STATUS_INTERNAL_ERROR;
         }
         slot.descriptor = *descriptor;
+        slot.publicAlive = true;
         slot.occupied = true;
         *output = {index, slot.generation};
         return VERNON_RHI_STATUS_OK;
@@ -963,6 +1205,7 @@ extern "C" VernonRhiStatus vernonRhiDeviceCreateBuffer(VernonRhiDevice handle,
     if (!device->state.createBuffer(slot.buffer, static_cast<size_t>(descriptor->size), device->error))
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
     slot.descriptor = *descriptor;
+    slot.publicAlive = true;
     slot.occupied = true;
     *output = {index, slot.generation};
     validate(*device);
@@ -1003,10 +1246,10 @@ extern "C" VernonRhiStatus vernonRhiDeviceUploadBuffer(VernonRhiDevice handle, V
         std::memcpy(mapped, source, static_cast<size_t>(size));
         if (!device->state.beginCommands(device->error))
             return VERNON_RHI_STATUS_INTERNAL_ERROR;
-        vernon::rhi::directx12::transition(device->state.commands, slot->buffer.resource, slot->buffer.state,
+        vernon::rhi::directx12::transition(device->state.commandList(), slot->buffer.resource, slot->buffer.state,
                                            D3D12_RESOURCE_STATE_COPY_DEST);
-        device->state.commands->CopyBufferRegion(slot->buffer.resource, offset, upload, uploadOffset, size);
-        vernon::rhi::directx12::transition(device->state.commands, slot->buffer.resource, slot->buffer.state,
+        device->state.commandList()->CopyBufferRegion(slot->buffer.resource, offset, upload, uploadOffset, size);
+        vernon::rhi::directx12::transition(device->state.commandList(), slot->buffer.resource, slot->buffer.state,
                                            D3D12_RESOURCE_STATE_COMMON);
         return device->state.submitCommands(device->error) ? VERNON_RHI_STATUS_OK : VERNON_RHI_STATUS_INTERNAL_ERROR;
     }
@@ -1091,10 +1334,10 @@ extern "C" VernonRhiStatus vernonRhiDeviceDownloadBuffer(VernonRhiDevice handle,
                                           device->error) ||
             !device->state.beginCommands(device->error))
             return VERNON_RHI_STATUS_INTERNAL_ERROR;
-        vernon::rhi::directx12::transition(device->state.commands, slot->buffer.resource, slot->buffer.state,
+        vernon::rhi::directx12::transition(device->state.commandList(), slot->buffer.resource, slot->buffer.state,
                                            D3D12_RESOURCE_STATE_COPY_SOURCE);
-        device->state.commands->CopyBufferRegion(readback, readbackOffset, slot->buffer.resource, offset, size);
-        vernon::rhi::directx12::transition(device->state.commands, slot->buffer.resource, slot->buffer.state,
+        device->state.commandList()->CopyBufferRegion(readback, readbackOffset, slot->buffer.resource, offset, size);
+        vernon::rhi::directx12::transition(device->state.commandList(), slot->buffer.resource, slot->buffer.state,
                                            D3D12_RESOURCE_STATE_COMMON);
         if (!device->state.submitCommands(device->error))
             return VERNON_RHI_STATUS_INTERNAL_ERROR;
@@ -1295,6 +1538,7 @@ vernonRhiDeviceCreateImage(VernonRhiDevice handle, const VernonRhiImageDescripto
     }
     slot.descriptor = *descriptor;
     slot.target = target;
+    slot.publicAlive = true;
     slot.occupied = true;
     validate(*device);
     *output = {index, slot.generation};
@@ -1369,7 +1613,7 @@ extern "C" VernonRhiStatus vernonRhiDeviceUploadImage(VernonRhiDevice handle, Ve
                         static_cast<const uint8_t *>(upload.data) + row * rowBytes, static_cast<size_t>(rowBytes));
         if (!state.beginCommands(device->error))
             return VERNON_RHI_STATUS_INTERNAL_ERROR;
-        vernon::rhi::directx12::transition(state.commands, slot->image.resource, slot->image.state,
+        vernon::rhi::directx12::transition(state.commandList(), slot->image.resource, slot->image.state,
                                            D3D12_RESOURCE_STATE_COPY_DEST);
         D3D12_TEXTURE_COPY_LOCATION destination{};
         destination.pResource = slot->image.resource;
@@ -1378,8 +1622,8 @@ extern "C" VernonRhiStatus vernonRhiDeviceUploadImage(VernonRhiDevice handle, Ve
         source.pResource = staging;
         source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         source.PlacedFootprint = footprint;
-        state.commands->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
-        vernon::rhi::directx12::transition(state.commands, slot->image.resource, slot->image.state,
+        state.commandList()->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        vernon::rhi::directx12::transition(state.commandList(), slot->image.resource, slot->image.state,
                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         return state.submitCommands(device->error) ? VERNON_RHI_STATUS_OK : VERNON_RHI_STATUS_INTERNAL_ERROR;
     }
@@ -1535,7 +1779,7 @@ extern "C" VernonRhiStatus vernonRhiDeviceDownloadImage(VernonRhiDevice handle, 
         state.device->GetCopyableFootprints(&native, 0, 1, stagingOffset, &footprint, &rows, &rowBytes, nullptr);
         if (!state.beginCommands(device->error))
             return VERNON_RHI_STATUS_INTERNAL_ERROR;
-        vernon::rhi::directx12::transition(state.commands, slot->image.resource, slot->image.state,
+        vernon::rhi::directx12::transition(state.commandList(), slot->image.resource, slot->image.state,
                                            D3D12_RESOURCE_STATE_COPY_SOURCE);
         D3D12_TEXTURE_COPY_LOCATION target{};
         target.pResource = staging;
@@ -1544,8 +1788,8 @@ extern "C" VernonRhiStatus vernonRhiDeviceDownloadImage(VernonRhiDevice handle, 
         D3D12_TEXTURE_COPY_LOCATION source{};
         source.pResource = slot->image.resource;
         source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        state.commands->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
-        vernon::rhi::directx12::transition(state.commands, slot->image.resource, slot->image.state,
+        state.commandList()->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
+        vernon::rhi::directx12::transition(state.commandList(), slot->image.resource, slot->image.state,
                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         if (!state.submitCommands(device->error))
             return VERNON_RHI_STATUS_INTERNAL_ERROR;
@@ -1644,8 +1888,11 @@ extern "C" VernonRhiStatus vernonRhiDeviceDestroyImage(VernonRhiDevice handle, V
         DirectX12ImageSlot *slot = lookupDirectX12Slot(device->images, image);
         if (!slot)
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-        device->state.destroyImage(slot->image);
-        releaseDirectX12Slot(*slot);
+        slot->publicAlive = false;
+        if (slot->bindingReferences == 0) {
+            device->state.destroyImage(slot->image);
+            releaseDirectX12Slot(*slot);
+        }
         return VERNON_RHI_STATUS_OK;
     }
 #endif
@@ -1660,8 +1907,11 @@ extern "C" VernonRhiStatus vernonRhiDeviceDestroyImage(VernonRhiDevice handle, V
                        view.descriptor.descriptor.image.generation == image.generation;
             }))
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-        device->state.destroyImage(slot->image);
-        releaseVulkanSlot(*slot);
+        slot->publicAlive = false;
+        if (slot->bindingReferences == 0) {
+            device->state.destroyImage(slot->image);
+            releaseVulkanSlot(*slot);
+        }
         validate(*device);
         return VERNON_RHI_STATUS_OK;
     }
@@ -1673,11 +1923,14 @@ extern "C" VernonRhiStatus vernonRhiDeviceDestroyImage(VernonRhiDevice handle, V
     ImageSlot *slot = lookupImage(*device, image);
     if (!slot)
         return fail(*device, "OpenGL RHI image handle is stale");
-    device->state.destroyImage(slot->image);
-    slot->occupied = false;
-    ++slot->generation;
-    if (slot->generation == 0)
-        slot->generation = 1;
+    slot->publicAlive = false;
+    if (slot->bindingReferences == 0) {
+        device->state.destroyImage(slot->image);
+        slot->occupied = false;
+        ++slot->generation;
+        if (slot->generation == 0)
+            slot->generation = 1;
+    }
     validate(*device);
     return VERNON_RHI_STATUS_OK;
 }
@@ -1785,6 +2038,7 @@ extern "C" VernonRhiStatus vernonRhiDeviceCreateSampler(VernonRhiDevice handle,
     SamplerSlot &slot = device->samplers[index];
     if (!device->state.createSampler(slot.sampler, addressU, addressV, addressW, minFilter, magFilter, device->error))
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    slot.publicAlive = true;
     slot.occupied = true;
     *output = {index, slot.generation};
     validate(*device);
@@ -1798,7 +2052,9 @@ extern "C" VernonRhiStatus vernonRhiDeviceDestroySampler(VernonRhiDevice handle,
         DirectX12SamplerSlot *slot = lookupDirectX12Slot(device->samplers, sampler);
         if (!slot)
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-        releaseDirectX12Slot(*slot);
+        slot->publicAlive = false;
+        if (slot->bindingReferences == 0)
+            releaseDirectX12Slot(*slot);
         return VERNON_RHI_STATUS_OK;
     }
 #endif
@@ -1808,8 +2064,11 @@ extern "C" VernonRhiStatus vernonRhiDeviceDestroySampler(VernonRhiDevice handle,
         VulkanSamplerSlot *slot = lookupVulkanSlot(device->samplers, sampler);
         if (!slot)
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-        device->state.destroySampler(slot->sampler);
-        releaseVulkanSlot(*slot);
+        slot->publicAlive = false;
+        if (slot->bindingReferences == 0) {
+            device->state.destroySampler(slot->sampler);
+            releaseVulkanSlot(*slot);
+        }
         return VERNON_RHI_STATUS_OK;
     }
 #endif
@@ -1820,11 +2079,14 @@ extern "C" VernonRhiStatus vernonRhiDeviceDestroySampler(VernonRhiDevice handle,
     SamplerSlot *slot = lookupSampler(*device, sampler);
     if (!slot)
         return fail(*device, "OpenGL RHI sampler handle is stale");
-    device->state.destroySampler(slot->sampler);
-    slot->occupied = false;
-    ++slot->generation;
-    if (slot->generation == 0)
-        slot->generation = 1;
+    slot->publicAlive = false;
+    if (slot->bindingReferences == 0) {
+        device->state.destroySampler(slot->sampler);
+        slot->occupied = false;
+        ++slot->generation;
+        if (slot->generation == 0)
+            slot->generation = 1;
+    }
     validate(*device);
     return VERNON_RHI_STATUS_OK;
 }
@@ -1941,7 +2203,7 @@ extern "C" VernonRhiStatus vernonRhiDirectX12DeviceGetBorrowedCommandList(Vernon
     auto device = lookupDirectX12Device(handle);
     if (!device || !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    *output = device->state.commands;
+    *output = device->state.commandList();
     return VERNON_RHI_STATUS_OK;
 #else
     (void)handle;
@@ -2074,16 +2336,20 @@ extern "C" VernonRhiStatus vernonRhiDeviceDestroyBuffer(VernonRhiDevice handle, 
         CudaBufferSlot *slot = lookupCudaBuffer(*device, buffer);
         if (!slot)
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-        const auto status = device->state.free(slot->pointer);
-        if (status != vernon::rhi::cuda::kSuccess) {
-            device->error = vernon::rhi::cuda::describeResult(status, "cuMemFree");
-            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        slot->publicAlive = false;
+        if (slot->bindingReferences == 0) {
+            const auto status = device->state.free(slot->pointer);
+            if (status != vernon::rhi::cuda::kSuccess) {
+                slot->publicAlive = true;
+                device->error = vernon::rhi::cuda::describeResult(status, "cuMemFree");
+                return VERNON_RHI_STATUS_INTERNAL_ERROR;
+            }
+            slot->pointer = 0;
+            slot->occupied = false;
+            ++slot->generation;
+            if (slot->generation == 0)
+                slot->generation = 1;
         }
-        slot->pointer = 0;
-        slot->occupied = false;
-        ++slot->generation;
-        if (slot->generation == 0)
-            slot->generation = 1;
         return VERNON_RHI_STATUS_OK;
     }
 #endif
@@ -2093,8 +2359,11 @@ extern "C" VernonRhiStatus vernonRhiDeviceDestroyBuffer(VernonRhiDevice handle, 
         DirectX12BufferSlot *slot = lookupDirectX12Slot(device->buffers, buffer);
         if (!slot)
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-        device->state.destroyBuffer(slot->buffer);
-        releaseDirectX12Slot(*slot);
+        slot->publicAlive = false;
+        if (slot->bindingReferences == 0) {
+            device->state.destroyBuffer(slot->buffer);
+            releaseDirectX12Slot(*slot);
+        }
         return VERNON_RHI_STATUS_OK;
     }
 #endif
@@ -2104,8 +2373,11 @@ extern "C" VernonRhiStatus vernonRhiDeviceDestroyBuffer(VernonRhiDevice handle, 
         VulkanBufferSlot *slot = lookupVulkanSlot(device->buffers, buffer);
         if (!slot)
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-        device->state.destroyBuffer(slot->buffer);
-        releaseVulkanSlot(*slot);
+        slot->publicAlive = false;
+        if (slot->bindingReferences == 0) {
+            device->state.destroyBuffer(slot->buffer);
+            releaseVulkanSlot(*slot);
+        }
         return VERNON_RHI_STATUS_OK;
     }
 #endif
@@ -2116,11 +2388,14 @@ extern "C" VernonRhiStatus vernonRhiDeviceDestroyBuffer(VernonRhiDevice handle, 
     BufferSlot *slot = lookupBuffer(*device, buffer);
     if (!slot)
         return fail(*device, "OpenGL RHI buffer handle is stale");
-    device->state.destroyBuffer(slot->buffer);
-    slot->occupied = false;
-    ++slot->generation;
-    if (slot->generation == 0)
-        slot->generation = 1;
+    slot->publicAlive = false;
+    if (slot->bindingReferences == 0) {
+        device->state.destroyBuffer(slot->buffer);
+        slot->occupied = false;
+        ++slot->generation;
+        if (slot->generation == 0)
+            slot->generation = 1;
+    }
     validate(*device);
     return VERNON_RHI_STATUS_OK;
 }
@@ -2228,32 +2503,511 @@ void *vernon::rhi::deviceState(VernonRhiDevice handle, VernonRhiBackend backend)
     return nullptr;
 }
 
+bool vernon::rhi::beginCommandRecording(VernonRhiDevice handle, uint64_t &native, VernonRhiBackend &backend) {
+    native = 0;
+#if defined(VERNON_HAS_CUDA_RHI)
+    if (auto device = lookupCudaDevice(handle)) {
+        backend = VERNON_RHI_BACKEND_CUDA;
+        native = reinterpret_cast<uintptr_t>(&device->state);
+        return true;
+    }
+#endif
+#if defined(VERNON_HAS_DIRECTX12_RHI)
+    if (auto device = lookupDirectX12Device(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        if (!device->state.beginCommands(device->error))
+            return false;
+        backend = VERNON_RHI_BACKEND_DIRECTX12;
+        native = reinterpret_cast<uintptr_t>(device->state.commandList());
+        return true;
+    }
+#endif
+#if defined(VERNON_HAS_VULKAN_RHI)
+    if (auto device = lookupVulkanDevice(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        VkCommandBuffer command{};
+        if (!device->state.beginCommands(command, device->error))
+            return false;
+        backend = VERNON_RHI_BACKEND_VULKAN;
+        native = vulkanHandleBits(command);
+        return true;
+    }
+#endif
+    if (auto device = lookupDevice(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        device->state.makeCurrent();
+        backend = device->state.embeddedProfile ? VERNON_RHI_BACKEND_OPENGL_ES : VERNON_RHI_BACKEND_OPENGL;
+        native = reinterpret_cast<uintptr_t>(&device->state);
+        return true;
+    }
+    return false;
+}
+
+bool vernon::rhi::submitCommandRecording(VernonRhiDevice handle, uint64_t native, bool computeWrites, bool &completed) {
+    completed = false;
+#if defined(VERNON_HAS_CUDA_RHI)
+    if (auto device = lookupCudaDevice(handle)) {
+        if (!native)
+            return false;
+        std::lock_guard<std::mutex> guard(device->mutex);
+        completed = device->state.synchronize() == vernon::rhi::cuda::kSuccess;
+        return completed;
+    }
+#endif
+#if defined(VERNON_HAS_DIRECTX12_RHI)
+    if (auto device = lookupDirectX12Device(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        if (native != reinterpret_cast<uintptr_t>(device->state.commandList()))
+            return false;
+        const bool submitted = device->state.submitCommands(device->error);
+        completed = submitted && !device->state.nativeObjectsBorrowed;
+        return submitted;
+    }
+#endif
+#if defined(VERNON_HAS_VULKAN_RHI)
+    if (auto device = lookupVulkanDevice(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
+        const bool submitted = command && device->state.submitCommands(command, device->error);
+        completed = submitted && !device->state.nativeObjectsBorrowed;
+        return submitted;
+    }
+#endif
+    if (auto device = lookupDevice(handle)) {
+        if (native != reinterpret_cast<uintptr_t>(&device->state))
+            return false;
+        std::lock_guard<std::mutex> guard(device->mutex);
+        device->state.makeCurrent();
+        if (computeWrites)
+            device->state.driver.memoryBarrier(
+                vernon::rhi::opengl::kShaderStorageBarrierBit | vernon::rhi::opengl::kVertexAttribArrayBarrierBit |
+                vernon::rhi::opengl::kTextureFetchBarrierBit | vernon::rhi::opengl::kBufferUpdateBarrierBit);
+        completed = true;
+        return true;
+    }
+    return false;
+}
+
+void vernon::rhi::completeBorrowedCommandRecording(VernonRhiDevice handle, uint64_t native) {
+#if defined(VERNON_HAS_DIRECTX12_RHI)
+    if (auto device = lookupDirectX12Device(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        if (device->state.nativeObjectsBorrowed && native == reinterpret_cast<uintptr_t>(device->state.commandList()))
+            device->state.recycleCommandStorage();
+    }
+#else
+    (void)handle;
+    (void)native;
+#endif
+}
+
+void vernon::rhi::abandonCommandRecording(VernonRhiDevice handle, uint64_t native) {
+#if defined(VERNON_HAS_DIRECTX12_RHI)
+    if (auto device = lookupDirectX12Device(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        if (native == reinterpret_cast<uintptr_t>(device->state.commandList())) {
+            if (!device->state.nativeObjectsBorrowed)
+                device->state.commandList()->Close();
+            device->state.recycleCommandStorage();
+        }
+        return;
+    }
+#endif
+#if defined(VERNON_HAS_VULKAN_RHI)
+    if (auto device = lookupVulkanDevice(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        if (!device->state.nativeObjectsBorrowed) {
+            const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
+            if (command)
+                vernon::rhi::vulkan::driver().endCommandBuffer(command);
+        }
+        return;
+    }
+#endif
+    (void)handle;
+    (void)native;
+}
+
+bool vernon::rhi::recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native,
+                                 const VernonRhiBarrier *barriers, size_t barrierCount) {
+#if defined(VERNON_HAS_CUDA_RHI)
+    if (lookupCudaDevice(handle))
+        return native != 0;
+#endif
+#if defined(VERNON_HAS_DIRECTX12_RHI)
+    if (auto device = lookupDirectX12Device(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        auto *commands = reinterpret_cast<ID3D12GraphicsCommandList *>(native);
+        if (!commands || commands != device->state.commandList())
+            return false;
+        std::vector<D3D12_RESOURCE_BARRIER> nativeBarriers;
+        try {
+            nativeBarriers.reserve(barrierCount);
+        } catch (const std::bad_alloc &) {
+            return false;
+        }
+        for (size_t index = 0; index < barrierCount; ++index) {
+            const D3D12_RESOURCE_STATES target = directX12ResourceState(barriers[index].new_state);
+            D3D12_RESOURCE_STATES *current{};
+            ID3D12Resource *resource{};
+            void (*restore)(void *, uint64_t){};
+            void *rollbackContext{};
+            if (barriers[index].is_image) {
+                auto *slot = lookupResourceRecord(device->images, resourceKey(barriers[index].image));
+                if (!slot)
+                    return false;
+                current = &slot->image.state;
+                resource = slot->image.resource;
+                restore = restoreDirectX12ImageState;
+                rollbackContext = &slot->image;
+            } else {
+                auto *slot = lookupResourceRecord(device->buffers, resourceKey(barriers[index].buffer));
+                if (!slot)
+                    return false;
+                current = &slot->buffer.state;
+                resource = slot->buffer.resource;
+                restore = restoreDirectX12BufferState;
+                rollbackContext = &slot->buffer;
+            }
+            if (!deferCommandRollback(handle, encoderKey, rollbackContext, static_cast<uint64_t>(*current), restore))
+                return false;
+            if (*current == target) {
+                if (barriers[index].new_state == VERNON_RHI_STATE_SHADER_WRITE) {
+                    D3D12_RESOURCE_BARRIER barrier{};
+                    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                    barrier.UAV.pResource = resource;
+                    nativeBarriers.push_back(barrier);
+                }
+                continue;
+            }
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = resource;
+            barrier.Transition.StateBefore = *current;
+            barrier.Transition.StateAfter = target;
+            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            nativeBarriers.push_back(barrier);
+            *current = target;
+        }
+        if (!nativeBarriers.empty())
+            commands->ResourceBarrier(static_cast<UINT>(nativeBarriers.size()), nativeBarriers.data());
+        return true;
+    }
+#endif
+#if defined(VERNON_HAS_VULKAN_RHI)
+    if (auto device = lookupVulkanDevice(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
+        if (!command)
+            return false;
+        std::vector<VkBufferMemoryBarrier> bufferBarriers;
+        std::vector<VkImageMemoryBarrier> imageBarriers;
+        try {
+            bufferBarriers.reserve(barrierCount);
+            imageBarriers.reserve(barrierCount);
+        } catch (const std::bad_alloc &) {
+            return false;
+        }
+        VkPipelineStageFlags sourceStages = 0;
+        VkPipelineStageFlags destinationStages = 0;
+        for (size_t index = 0; index < barrierCount; ++index) {
+            if (barriers[index].is_image) {
+                auto *slot = lookupResourceRecord(device->images, resourceKey(barriers[index].image));
+                if (!slot)
+                    return false;
+                if (!deferCommandRollback(handle, encoderKey, &slot->image, static_cast<uint64_t>(slot->image.layout),
+                                          restoreVulkanImageLayout))
+                    return false;
+                const VkImageLayout target = vulkanImageLayout(barriers[index].new_state);
+                VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                barrier.oldLayout = slot->image.layout;
+                barrier.newLayout = target;
+                barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier.image = slot->image.image;
+                barrier.subresourceRange.aspectMask =
+                    slot->image.format == VK_FORMAT_D32_SFLOAT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+                barrier.subresourceRange.levelCount = 1;
+                barrier.subresourceRange.layerCount = 1;
+                VkPipelineStageFlags source{};
+                VkPipelineStageFlags destination{};
+                vulkanBarrierDependency(static_cast<VernonRhiResourceState>(barriers[index].old_state),
+                                        barriers[index].source_stage_mask, barriers[index].source_access, source,
+                                        barrier.srcAccessMask);
+                vulkanBarrierDependency(static_cast<VernonRhiResourceState>(barriers[index].new_state),
+                                        barriers[index].destination_stage_mask, barriers[index].destination_access,
+                                        destination, barrier.dstAccessMask);
+                sourceStages |= source;
+                destinationStages |= destination;
+                imageBarriers.push_back(barrier);
+                slot->image.layout = target;
+            } else {
+                auto *slot = lookupResourceRecord(device->buffers, resourceKey(barriers[index].buffer));
+                if (!slot)
+                    return false;
+                VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+                VkPipelineStageFlags source{};
+                VkPipelineStageFlags destination{};
+                vulkanBarrierDependency(static_cast<VernonRhiResourceState>(barriers[index].old_state),
+                                        barriers[index].source_stage_mask, barriers[index].source_access, source,
+                                        barrier.srcAccessMask);
+                vulkanBarrierDependency(static_cast<VernonRhiResourceState>(barriers[index].new_state),
+                                        barriers[index].destination_stage_mask, barriers[index].destination_access,
+                                        destination, barrier.dstAccessMask);
+                barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barrier.buffer = slot->buffer.buffer;
+                barrier.offset = 0;
+                barrier.size = VK_WHOLE_SIZE;
+                sourceStages |= source;
+                destinationStages |= destination;
+                bufferBarriers.push_back(barrier);
+            }
+        }
+        if (!bufferBarriers.empty() || !imageBarriers.empty())
+            vernon::rhi::vulkan::driver().cmdPipelineBarrier(
+                command, sourceStages ? sourceStages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                destinationStages ? destinationStages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr,
+                static_cast<uint32_t>(bufferBarriers.size()), bufferBarriers.data(),
+                static_cast<uint32_t>(imageBarriers.size()), imageBarriers.data());
+        return true;
+    }
+#endif
+    if (auto device = lookupDevice(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        if (native != reinterpret_cast<uintptr_t>(&device->state))
+            return false;
+        uint32_t bits = 0;
+        for (size_t index = 0; index < barrierCount; ++index) {
+            const uint32_t access = barriers[index].destination_access;
+            if (access) {
+                if (access & VERNON_RHI_ACCESS_SHADER_READ)
+                    bits |= barriers[index].is_image ? vernon::rhi::opengl::kTextureFetchBarrierBit
+                                                     : vernon::rhi::opengl::kShaderStorageBarrierBit |
+                                                           vernon::rhi::opengl::kUniformBarrierBit;
+                if (access & VERNON_RHI_ACCESS_SHADER_WRITE)
+                    bits |= barriers[index].is_image ? vernon::rhi::opengl::kShaderImageAccessBarrierBit
+                                                     : vernon::rhi::opengl::kShaderStorageBarrierBit;
+                if (access & VERNON_RHI_ACCESS_VERTEX_READ)
+                    bits |= vernon::rhi::opengl::kVertexAttribArrayBarrierBit;
+                if (access & VERNON_RHI_ACCESS_INDEX_READ)
+                    bits |= vernon::rhi::opengl::kElementArrayBarrierBit;
+                if (access & (VERNON_RHI_ACCESS_COLOR_READ | VERNON_RHI_ACCESS_COLOR_WRITE |
+                              VERNON_RHI_ACCESS_DEPTH_STENCIL_READ | VERNON_RHI_ACCESS_DEPTH_STENCIL_WRITE))
+                    bits |= vernon::rhi::opengl::kFramebufferBarrierBit;
+                if (access & (VERNON_RHI_ACCESS_TRANSFER_READ | VERNON_RHI_ACCESS_TRANSFER_WRITE))
+                    bits |= barriers[index].is_image ? vernon::rhi::opengl::kTextureUpdateBarrierBit
+                                                     : vernon::rhi::opengl::kBufferUpdateBarrierBit;
+                continue;
+            }
+            const auto state = static_cast<VernonRhiResourceState>(barriers[index].new_state);
+            if (barriers[index].is_image) {
+                if (state == VERNON_RHI_STATE_SHADER_READ)
+                    bits |= vernon::rhi::opengl::kTextureFetchBarrierBit;
+                else if (state == VERNON_RHI_STATE_SHADER_WRITE)
+                    bits |= vernon::rhi::opengl::kShaderImageAccessBarrierBit;
+                else if (state == VERNON_RHI_STATE_TRANSFER_SOURCE || state == VERNON_RHI_STATE_TRANSFER_DESTINATION)
+                    bits |= vernon::rhi::opengl::kTextureUpdateBarrierBit;
+                else if (state == VERNON_RHI_STATE_COLOR_ATTACHMENT ||
+                         state == VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT)
+                    bits |= vernon::rhi::opengl::kFramebufferBarrierBit;
+            } else {
+                if (state == VERNON_RHI_STATE_SHADER_READ)
+                    bits |= vernon::rhi::opengl::kShaderStorageBarrierBit | vernon::rhi::opengl::kUniformBarrierBit |
+                            vernon::rhi::opengl::kVertexAttribArrayBarrierBit |
+                            vernon::rhi::opengl::kElementArrayBarrierBit;
+                else if (state == VERNON_RHI_STATE_SHADER_WRITE)
+                    bits |= vernon::rhi::opengl::kShaderStorageBarrierBit;
+                else if (state == VERNON_RHI_STATE_TRANSFER_SOURCE || state == VERNON_RHI_STATE_TRANSFER_DESTINATION)
+                    bits |= vernon::rhi::opengl::kBufferUpdateBarrierBit;
+            }
+        }
+        device->state.makeCurrent();
+        if (bits)
+            device->state.driver.memoryBarrier(bits);
+        return true;
+    }
+    return false;
+}
+
+bool vernon::rhi::endCommandRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend,
+                                      uint32_t backendKind, uint32_t colorDiscardMask, uint32_t depthStencilDiscard,
+                                      const uint64_t *colorResources, size_t colorCount, uint64_t depthResource) {
+#if defined(VERNON_HAS_VULKAN_RHI)
+    if (backend == VERNON_RHI_BACKEND_VULKAN) {
+        auto device = lookupVulkanDevice(handle);
+        const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
+        if (!device || !command)
+            return false;
+        std::lock_guard<std::mutex> guard(device->mutex);
+        if (backendKind == CommandRenderingDynamic)
+            vernon::rhi::vulkan::driver().cmdEndRendering(command);
+        else if (backendKind == CommandRenderingRenderPass)
+            vernon::rhi::vulkan::driver().cmdEndRenderPass(command);
+        else
+            return false;
+        return true;
+    }
+#endif
+#if defined(VERNON_HAS_DIRECTX12_RHI)
+    if (backend == VERNON_RHI_BACKEND_DIRECTX12 && backendKind == CommandRenderingStateless) {
+        auto device = lookupDirectX12Device(handle);
+        auto *commands = reinterpret_cast<ID3D12GraphicsCommandList *>(native);
+        if (!device || !commands || (colorCount && !colorResources))
+            return false;
+        std::lock_guard<std::mutex> guard(device->mutex);
+        for (size_t index = 0; index < colorCount; ++index)
+            if ((colorDiscardMask & (uint32_t{1} << index)) && colorResources[index])
+                commands->DiscardResource(reinterpret_cast<ID3D12Resource *>(colorResources[index]), nullptr);
+        if (depthStencilDiscard && depthResource)
+            commands->DiscardResource(reinterpret_cast<ID3D12Resource *>(depthResource), nullptr);
+        return true;
+    }
+#endif
+    if ((backend == VERNON_RHI_BACKEND_OPENGL || backend == VERNON_RHI_BACKEND_OPENGL_ES) &&
+        backendKind == CommandRenderingStateless) {
+        auto device = lookupDevice(handle);
+        if (!device || native != reinterpret_cast<uintptr_t>(&device->state))
+            return false;
+        std::array<vernon::rhi::opengl::Enum, 9> discarded{};
+        size_t discardedCount = 0;
+        for (size_t index = 0; index < colorCount; ++index)
+            if (colorDiscardMask & (uint32_t{1} << index))
+                discarded[discardedCount++] = vernon::rhi::opengl::kColorAttachment0 + static_cast<Enum>(index);
+        if (depthStencilDiscard & VERNON_RHI_ATTACHMENT_DEPTH)
+            discarded[discardedCount++] = vernon::rhi::opengl::kDepthAttachment;
+        if (depthStencilDiscard & VERNON_RHI_ATTACHMENT_STENCIL)
+            discarded[discardedCount++] = vernon::rhi::opengl::kStencilAttachment;
+        std::lock_guard<std::mutex> guard(device->mutex);
+        device->state.makeCurrent();
+        if (discardedCount && device->state.driver.invalidateFramebuffer)
+            device->state.driver.invalidateFramebuffer(vernon::rhi::opengl::kFramebuffer,
+                                                       static_cast<Size>(discardedCount), discarded.data());
+        return true;
+    }
+    return false;
+}
+
+bool vernon::rhi::clearCommandColor(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend,
+                                    uint32_t backendKind, int32_t x, int32_t y, uint32_t width, uint32_t height,
+                                    uint32_t layers, uint64_t target, uint32_t location, const float color[4]) {
+#if defined(VERNON_HAS_DIRECTX12_RHI)
+    if (backend == VERNON_RHI_BACKEND_DIRECTX12 && backendKind == CommandRenderingStateless) {
+        auto device = lookupDirectX12Device(handle);
+        auto *commands = reinterpret_cast<ID3D12GraphicsCommandList *>(native);
+        if (!device || !commands || !target)
+            return false;
+        std::lock_guard<std::mutex> guard(device->mutex);
+        commands->ClearRenderTargetView({target}, color, 0, nullptr);
+        return true;
+    }
+#endif
+#if defined(VERNON_HAS_VULKAN_RHI)
+    if (backend == VERNON_RHI_BACKEND_VULKAN &&
+        (backendKind == CommandRenderingDynamic || backendKind == CommandRenderingRenderPass)) {
+        auto device = lookupVulkanDevice(handle);
+        const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
+        if (!device || !command)
+            return false;
+        VkClearAttachment clear{};
+        clear.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        clear.colorAttachment = location;
+        std::copy(color, color + 4, clear.clearValue.color.float32);
+        const VkClearRect rectangle{{{x, y}, {width, height}}, 0, layers};
+        std::lock_guard<std::mutex> guard(device->mutex);
+        vernon::rhi::vulkan::driver().cmdClearAttachments(command, 1, &clear, 1, &rectangle);
+        return true;
+    }
+#endif
+    if (backend == VERNON_RHI_BACKEND_OPENGL || backend == VERNON_RHI_BACKEND_OPENGL_ES) {
+        auto device = lookupDevice(handle);
+        if (!device || native != reinterpret_cast<uintptr_t>(&device->state) ||
+            backendKind != CommandRenderingStateless)
+            return false;
+        std::lock_guard<std::mutex> guard(device->mutex);
+        device->state.makeCurrent();
+        device->state.driver.clearBufferfv(vernon::rhi::opengl::kColor, static_cast<Int>(location), color);
+        return true;
+    }
+    return false;
+}
+
+bool vernon::rhi::clearCommandDepthStencil(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend,
+                                           uint32_t backendKind, int32_t x, int32_t y, uint32_t width, uint32_t height,
+                                           uint32_t layers, uint64_t target, float depth, uint32_t stencil,
+                                           uint32_t aspects) {
+#if defined(VERNON_HAS_DIRECTX12_RHI)
+    if (backend == VERNON_RHI_BACKEND_DIRECTX12 && backendKind == CommandRenderingStateless) {
+        auto device = lookupDirectX12Device(handle);
+        auto *commands = reinterpret_cast<ID3D12GraphicsCommandList *>(native);
+        if (!device || !commands || !target)
+            return false;
+        D3D12_CLEAR_FLAGS flags = static_cast<D3D12_CLEAR_FLAGS>(0);
+        if (aspects & VERNON_RHI_ATTACHMENT_DEPTH)
+            flags |= D3D12_CLEAR_FLAG_DEPTH;
+        if (aspects & VERNON_RHI_ATTACHMENT_STENCIL)
+            flags |= D3D12_CLEAR_FLAG_STENCIL;
+        std::lock_guard<std::mutex> guard(device->mutex);
+        commands->ClearDepthStencilView({target}, flags, depth, static_cast<UINT8>(stencil), 0, nullptr);
+        return true;
+    }
+#endif
+#if defined(VERNON_HAS_VULKAN_RHI)
+    if (backend == VERNON_RHI_BACKEND_VULKAN &&
+        (backendKind == CommandRenderingDynamic || backendKind == CommandRenderingRenderPass)) {
+        auto device = lookupVulkanDevice(handle);
+        const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
+        if (!device || !command)
+            return false;
+        VkClearAttachment clear{};
+        clear.aspectMask = ((aspects & VERNON_RHI_ATTACHMENT_DEPTH) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) |
+                           ((aspects & VERNON_RHI_ATTACHMENT_STENCIL) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+        clear.clearValue.depthStencil = {depth, stencil};
+        const VkClearRect rectangle{{{x, y}, {width, height}}, 0, layers};
+        std::lock_guard<std::mutex> guard(device->mutex);
+        vernon::rhi::vulkan::driver().cmdClearAttachments(command, 1, &clear, 1, &rectangle);
+        return true;
+    }
+#endif
+    if (backend == VERNON_RHI_BACKEND_OPENGL || backend == VERNON_RHI_BACKEND_OPENGL_ES) {
+        auto device = lookupDevice(handle);
+        if (!device || native != reinterpret_cast<uintptr_t>(&device->state) ||
+            backendKind != CommandRenderingStateless || aspects != VERNON_RHI_ATTACHMENT_DEPTH)
+            return false;
+        std::lock_guard<std::mutex> guard(device->mutex);
+        device->state.makeCurrent();
+        device->state.driver.clearBufferfv(vernon::rhi::opengl::kDepth, 0, &depth);
+        return true;
+    }
+    return false;
+}
+
 uint64_t vernon::rhi::bufferResource(VernonRhiDevice handle, VernonRhiBuffer buffer) {
 #if defined(VERNON_HAS_CUDA_RHI)
     if (auto device = lookupCudaDevice(handle)) {
         std::lock_guard<std::mutex> guard(device->mutex);
         if (CudaBufferSlot *slot = lookupCudaBuffer(*device, buffer))
-            return slot->pointer;
+            return resourceKey(buffer);
     }
 #endif
 #if defined(VERNON_HAS_DIRECTX12_RHI)
     if (auto device = lookupDirectX12Device(handle)) {
         std::lock_guard<std::mutex> guard(device->mutex);
         if (DirectX12BufferSlot *slot = lookupDirectX12Slot(device->buffers, buffer))
-            return reinterpret_cast<uintptr_t>(&slot->buffer);
+            return resourceKey(buffer);
     }
 #endif
 #if defined(VERNON_HAS_VULKAN_RHI)
     if (auto device = lookupVulkanDevice(handle)) {
         std::lock_guard<std::mutex> guard(device->mutex);
         if (VulkanBufferSlot *slot = lookupVulkanSlot(device->buffers, buffer))
-            return reinterpret_cast<uintptr_t>(&slot->buffer);
+            return resourceKey(buffer);
     }
 #endif
     if (auto device = lookupDevice(handle)) {
         std::lock_guard<std::mutex> guard(device->mutex);
         if (BufferSlot *slot = lookupBuffer(*device, buffer))
-            return slot->buffer.name;
+            return resourceKey(buffer);
     }
     return 0;
 }
@@ -2263,20 +3017,20 @@ uint64_t vernon::rhi::imageResource(VernonRhiDevice handle, VernonRhiImage image
     if (auto device = lookupDirectX12Device(handle)) {
         std::lock_guard<std::mutex> guard(device->mutex);
         if (DirectX12ImageSlot *slot = lookupDirectX12Slot(device->images, image))
-            return reinterpret_cast<uintptr_t>(&slot->image);
+            return resourceKey(image);
     }
 #endif
 #if defined(VERNON_HAS_VULKAN_RHI)
     if (auto device = lookupVulkanDevice(handle)) {
         std::lock_guard<std::mutex> guard(device->mutex);
         if (VulkanImageSlot *slot = lookupVulkanSlot(device->images, image))
-            return reinterpret_cast<uintptr_t>(&slot->image);
+            return resourceKey(image);
     }
 #endif
     if (auto device = lookupDevice(handle)) {
         std::lock_guard<std::mutex> guard(device->mutex);
         if (ImageSlot *slot = lookupImage(*device, image))
-            return slot->image.name;
+            return resourceKey(image);
     }
     return 0;
 }
@@ -2286,22 +3040,302 @@ uint64_t vernon::rhi::samplerResource(VernonRhiDevice handle, VernonRhiSampler s
     if (auto device = lookupDirectX12Device(handle)) {
         std::lock_guard<std::mutex> guard(device->mutex);
         if (DirectX12SamplerSlot *slot = lookupDirectX12Slot(device->samplers, sampler))
-            return reinterpret_cast<uintptr_t>(&slot->sampler);
+            return resourceKey(sampler);
     }
 #endif
 #if defined(VERNON_HAS_VULKAN_RHI)
     if (auto device = lookupVulkanDevice(handle)) {
         std::lock_guard<std::mutex> guard(device->mutex);
         if (VulkanSamplerSlot *slot = lookupVulkanSlot(device->samplers, sampler))
-            return reinterpret_cast<uintptr_t>(&slot->sampler);
+            return resourceKey(sampler);
     }
 #endif
     if (auto device = lookupDevice(handle)) {
         std::lock_guard<std::mutex> guard(device->mutex);
         if (SamplerSlot *slot = lookupSampler(*device, sampler))
-            return slot->sampler.name;
+            return resourceKey(sampler);
     }
     return 0;
+}
+
+bool vernon::rhi::retainResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
+#if defined(VERNON_HAS_CUDA_RHI)
+    if (auto device = lookupCudaDevice(handle)) {
+        if (kind != ResourceKind::Buffer)
+            return false;
+        std::lock_guard<std::mutex> guard(device->mutex);
+        CudaBufferSlot *slot = lookupResourceRecord(device->buffers, key);
+        if (!slot || !slot->occupied || slot->bindingReferences == UINT32_MAX)
+            return false;
+        ++slot->bindingReferences;
+        return true;
+    }
+#endif
+#if defined(VERNON_HAS_DIRECTX12_RHI)
+    if (auto device = lookupDirectX12Device(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        if (kind == ResourceKind::Buffer) {
+            DirectX12BufferSlot *slot = lookupResourceRecord(device->buffers, key);
+            if (!slot || !slot->occupied || slot->bindingReferences == UINT32_MAX)
+                return false;
+            ++slot->bindingReferences;
+            return true;
+        }
+        if (kind == ResourceKind::Image) {
+            DirectX12ImageSlot *slot = lookupResourceRecord(device->images, key);
+            if (!slot || !slot->occupied || slot->bindingReferences == UINT32_MAX)
+                return false;
+            ++slot->bindingReferences;
+            return true;
+        }
+        DirectX12SamplerSlot *slot = lookupResourceRecord(device->samplers, key);
+        if (!slot || !slot->occupied || slot->bindingReferences == UINT32_MAX)
+            return false;
+        ++slot->bindingReferences;
+        return true;
+    }
+#endif
+#if defined(VERNON_HAS_VULKAN_RHI)
+    if (auto device = lookupVulkanDevice(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        if (kind == ResourceKind::Buffer) {
+            VulkanBufferSlot *slot = lookupResourceRecord(device->buffers, key);
+            if (!slot || !slot->occupied || slot->bindingReferences == UINT32_MAX)
+                return false;
+            ++slot->bindingReferences;
+            return true;
+        }
+        if (kind == ResourceKind::Image) {
+            VulkanImageSlot *slot = lookupResourceRecord(device->images, key);
+            if (!slot || !slot->occupied || slot->bindingReferences == UINT32_MAX)
+                return false;
+            ++slot->bindingReferences;
+            return true;
+        }
+        VulkanSamplerSlot *slot = lookupResourceRecord(device->samplers, key);
+        if (!slot || !slot->occupied || slot->bindingReferences == UINT32_MAX)
+            return false;
+        ++slot->bindingReferences;
+        return true;
+    }
+#endif
+    auto device = lookupDevice(handle);
+    if (!device)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    if (kind == ResourceKind::Buffer) {
+        BufferSlot *slot = lookupResourceRecord(device->buffers, key);
+        if (!slot || !slot->occupied || slot->bindingReferences == UINT32_MAX)
+            return false;
+        ++slot->bindingReferences;
+        return true;
+    }
+    if (kind == ResourceKind::Image) {
+        ImageSlot *slot = lookupResourceRecord(device->images, key);
+        if (!slot || !slot->occupied || slot->bindingReferences == UINT32_MAX)
+            return false;
+        ++slot->bindingReferences;
+        return true;
+    }
+    SamplerSlot *slot = lookupResourceRecord(device->samplers, key);
+    if (!slot || !slot->occupied || slot->bindingReferences == UINT32_MAX)
+        return false;
+    ++slot->bindingReferences;
+    return true;
+}
+
+uint64_t vernon::rhi::resolveResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
+#if defined(VERNON_HAS_CUDA_RHI)
+    if (auto device = lookupCudaDevice(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        CudaBufferSlot *slot = kind == ResourceKind::Buffer ? lookupResourceRecord(device->buffers, key) : nullptr;
+        return slot && slot->occupied ? slot->pointer : 0;
+    }
+#endif
+#if defined(VERNON_HAS_DIRECTX12_RHI)
+    if (auto device = lookupDirectX12Device(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        if (kind == ResourceKind::Buffer) {
+            auto *slot = lookupResourceRecord(device->buffers, key);
+            return slot && slot->occupied ? reinterpret_cast<uintptr_t>(&slot->buffer) : 0;
+        }
+        if (kind == ResourceKind::Image) {
+            auto *slot = lookupResourceRecord(device->images, key);
+            return slot && slot->occupied ? reinterpret_cast<uintptr_t>(&slot->image) : 0;
+        }
+        auto *slot = lookupResourceRecord(device->samplers, key);
+        return slot && slot->occupied ? reinterpret_cast<uintptr_t>(&slot->sampler) : 0;
+    }
+#endif
+#if defined(VERNON_HAS_VULKAN_RHI)
+    if (auto device = lookupVulkanDevice(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        if (kind == ResourceKind::Buffer) {
+            auto *slot = lookupResourceRecord(device->buffers, key);
+            return slot && slot->occupied ? reinterpret_cast<uintptr_t>(&slot->buffer) : 0;
+        }
+        if (kind == ResourceKind::Image) {
+            auto *slot = lookupResourceRecord(device->images, key);
+            return slot && slot->occupied ? reinterpret_cast<uintptr_t>(&slot->image) : 0;
+        }
+        auto *slot = lookupResourceRecord(device->samplers, key);
+        return slot && slot->occupied ? reinterpret_cast<uintptr_t>(&slot->sampler) : 0;
+    }
+#endif
+    auto device = lookupDevice(handle);
+    if (!device)
+        return 0;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    if (kind == ResourceKind::Buffer) {
+        auto *slot = lookupResourceRecord(device->buffers, key);
+        return slot && slot->occupied ? slot->buffer.name : 0;
+    }
+    if (kind == ResourceKind::Image) {
+        auto *slot = lookupResourceRecord(device->images, key);
+        return slot && slot->occupied ? slot->image.name : 0;
+    }
+    auto *slot = lookupResourceRecord(device->samplers, key);
+    return slot && slot->occupied ? slot->sampler.name : 0;
+}
+
+void vernon::rhi::releaseResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
+#if defined(VERNON_HAS_CUDA_RHI)
+    if (auto device = lookupCudaDevice(handle)) {
+        if (kind != ResourceKind::Buffer)
+            return;
+        std::lock_guard<std::mutex> guard(device->mutex);
+        CudaBufferSlot *slot = lookupResourceRecord(device->buffers, key);
+        if (!slot || !slot->occupied || slot->bindingReferences == 0)
+            return;
+        --slot->bindingReferences;
+        if (!slot->publicAlive && slot->bindingReferences == 0) {
+            const auto status = device->state.free(slot->pointer);
+            if (status != vernon::rhi::cuda::kSuccess) {
+                device->error = vernon::rhi::cuda::describeResult(status, "cuMemFree");
+                return;
+            }
+            slot->pointer = 0;
+            slot->occupied = false;
+            ++slot->generation;
+            if (slot->generation == 0)
+                slot->generation = 1;
+        }
+        return;
+    }
+#endif
+#if defined(VERNON_HAS_DIRECTX12_RHI)
+    if (auto device = lookupDirectX12Device(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        if (kind == ResourceKind::Buffer) {
+            auto *slot = lookupResourceRecord(device->buffers, key);
+            if (!slot || !slot->occupied || slot->bindingReferences == 0)
+                return;
+            --slot->bindingReferences;
+            if (!slot->publicAlive && slot->bindingReferences == 0) {
+                device->state.destroyBuffer(slot->buffer);
+                releaseDirectX12Slot(*slot);
+            }
+            return;
+        }
+        if (kind == ResourceKind::Image) {
+            auto *slot = lookupResourceRecord(device->images, key);
+            if (!slot || !slot->occupied || slot->bindingReferences == 0)
+                return;
+            --slot->bindingReferences;
+            if (!slot->publicAlive && slot->bindingReferences == 0) {
+                device->state.destroyImage(slot->image);
+                releaseDirectX12Slot(*slot);
+            }
+            return;
+        }
+        auto *slot = lookupResourceRecord(device->samplers, key);
+        if (!slot || !slot->occupied || slot->bindingReferences == 0)
+            return;
+        --slot->bindingReferences;
+        if (!slot->publicAlive && slot->bindingReferences == 0)
+            releaseDirectX12Slot(*slot);
+        return;
+    }
+#endif
+#if defined(VERNON_HAS_VULKAN_RHI)
+    if (auto device = lookupVulkanDevice(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        if (kind == ResourceKind::Buffer) {
+            auto *slot = lookupResourceRecord(device->buffers, key);
+            if (!slot || !slot->occupied || slot->bindingReferences == 0)
+                return;
+            --slot->bindingReferences;
+            if (!slot->publicAlive && slot->bindingReferences == 0) {
+                device->state.destroyBuffer(slot->buffer);
+                releaseVulkanSlot(*slot);
+            }
+            return;
+        }
+        if (kind == ResourceKind::Image) {
+            auto *slot = lookupResourceRecord(device->images, key);
+            if (!slot || !slot->occupied || slot->bindingReferences == 0)
+                return;
+            --slot->bindingReferences;
+            if (!slot->publicAlive && slot->bindingReferences == 0) {
+                device->state.destroyImage(slot->image);
+                releaseVulkanSlot(*slot);
+            }
+            return;
+        }
+        auto *slot = lookupResourceRecord(device->samplers, key);
+        if (!slot || !slot->occupied || slot->bindingReferences == 0)
+            return;
+        --slot->bindingReferences;
+        if (!slot->publicAlive && slot->bindingReferences == 0) {
+            device->state.destroySampler(slot->sampler);
+            releaseVulkanSlot(*slot);
+        }
+        return;
+    }
+#endif
+    auto device = lookupDevice(handle);
+    if (!device)
+        return;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    if (kind == ResourceKind::Buffer) {
+        auto *slot = lookupResourceRecord(device->buffers, key);
+        if (!slot || !slot->occupied || slot->bindingReferences == 0)
+            return;
+        --slot->bindingReferences;
+        if (!slot->publicAlive && slot->bindingReferences == 0) {
+            device->state.destroyBuffer(slot->buffer);
+            slot->occupied = false;
+            ++slot->generation;
+            if (slot->generation == 0)
+                slot->generation = 1;
+        }
+        return;
+    }
+    if (kind == ResourceKind::Image) {
+        auto *slot = lookupResourceRecord(device->images, key);
+        if (!slot || !slot->occupied || slot->bindingReferences == 0)
+            return;
+        --slot->bindingReferences;
+        if (!slot->publicAlive && slot->bindingReferences == 0) {
+            device->state.destroyImage(slot->image);
+            slot->occupied = false;
+            ++slot->generation;
+            if (slot->generation == 0)
+                slot->generation = 1;
+        }
+        return;
+    }
+    auto *slot = lookupResourceRecord(device->samplers, key);
+    if (!slot || !slot->occupied || slot->bindingReferences == 0)
+        return;
+    --slot->bindingReferences;
+    if (!slot->publicAlive && slot->bindingReferences == 0) {
+        device->state.destroySampler(slot->sampler);
+        slot->occupied = false;
+        ++slot->generation;
+        if (slot->generation == 0)
+            slot->generation = 1;
+    }
 }
 
 extern "C" VernonRhiDevice

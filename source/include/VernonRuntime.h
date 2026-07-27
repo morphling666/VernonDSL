@@ -47,9 +47,6 @@ typedef struct VernonRuntimeCapabilities {
 typedef struct VernonRuntimeCreateOptions {
     uint32_t struct_size;
     uint32_t device_index;
-    /* Reserved for ABI compatibility; initialize both fields to zero. */
-    uint16_t api_version_major;
-    uint16_t api_version_minor;
     /* Reserved for future use; initialize all elements to zero. */
     uint32_t reserved[4];
 } VernonRuntimeCreateOptions;
@@ -142,7 +139,6 @@ typedef struct VernonDepthAttachment {
     float clear_depth;
 } VernonDepthAttachment;
 
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeComputeToGraphicsBarrier(VernonRuntimeContext *context);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeSynchronize(VernonRuntimeContext *context);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeReferenceRhiBuffer(VernonRuntimeContext *context, VernonRhiBuffer buffer,
                                                                  uint64_t offset, uint64_t size,
@@ -152,6 +148,9 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeReferenceRhiImage(VernonRuntimeCon
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeReferenceRhiSampler(VernonRuntimeContext *context,
                                                                   VernonRhiSampler sampler,
                                                                   VernonRuntimeProviderResourceReference *output);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeReferenceRhiCommandEncoder(VernonRuntimeContext *context,
+                                                                         VernonRhiCommandEncoder encoder,
+                                                                         VernonRuntimeProviderObject *output);
 
 enum { VERNON_PIPELINE_INVOCATION_ABI_VERSION = 6 };
 

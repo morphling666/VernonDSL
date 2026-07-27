@@ -48,9 +48,14 @@ TEST(CudaRhiAdapter, BorrowsOwnedRhiDeviceAndReferencesGenerationalBuffer) {
 }
 
 TEST(CudaRhiAdapter, PreparesAndDispatchesThroughRuntimeCore) {
-    VernonRuntimeRhiAdapter *adapter = vernonRuntimeRhiAdapterCreateCuda(0);
-    if (!adapter)
+    VernonRhiOwnedDeviceDescriptor deviceDescriptor{};
+    deviceDescriptor.struct_size = sizeof(deviceDescriptor);
+    deviceDescriptor.backend = VERNON_RHI_BACKEND_CUDA;
+    const VernonRhiDevice device = vernonRhiCreateDevice(&deviceDescriptor);
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
         GTEST_SKIP() << "CUDA RHI adapter is unavailable";
+    VernonRuntimeRhiAdapter *adapter = vernonRuntimeRhiAdapterCreateForDevice(device, VERNON_RHI_BACKEND_CUDA);
+    ASSERT_NE(adapter, nullptr);
 
     static constexpr char ptx[] = R"(
 .version 7.0
@@ -95,13 +100,25 @@ TEST(CudaRhiAdapter, PreparesAndDispatchesThroughRuntimeCore) {
     value.inline_size = sizeof(factor);
     VernonRuntimeCoreBindings *bindings = nullptr;
     ASSERT_EQ(vernonRuntimeCoreCreateBindings(pipeline, &value, 1, &bindings), VERNON_STATUS_OK);
+    VernonRhiCommandEncoderDescriptor encoderDescriptor{};
+    encoderDescriptor.struct_size = sizeof(encoderDescriptor);
+    encoderDescriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE;
+    VernonRhiCommandEncoder encoder{};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
+    VernonRuntimeProviderObject providerEncoder{};
+    ASSERT_EQ(vernonRuntimeRhiAdapterReferenceCommandEncoder(adapter, encoder, &providerEncoder), VERNON_STATUS_OK);
     factor = 3.0f;
     ASSERT_EQ(vernonRuntimeCoreUpdateBindings(bindings, &value, 1), VERNON_STATUS_OK);
     const uint32_t groups[3]{1, 1, 1};
-    EXPECT_EQ(vernonRuntimeCoreEncodeDispatch(pipeline, bindings, {}, groups, nullptr, 0), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeCoreEncodeDispatch(pipeline, bindings, providerEncoder, groups, nullptr, 0),
+              VERNON_STATUS_OK);
     factor = 4.0f;
     ASSERT_EQ(vernonRuntimeCoreUpdateBindings(bindings, &value, 1), VERNON_STATUS_OK);
-    EXPECT_EQ(vernonRuntimeCoreEncodeDispatch(pipeline, bindings, {}, groups, nullptr, 0), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeCoreEncodeDispatch(pipeline, bindings, providerEncoder, groups, nullptr, 0),
+              VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceSubmit(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, encoder), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRuntimeRhiAdapterSynchronize(adapter), VERNON_STATUS_OK);
     const vernon::runtime::RhiAdapterPreparationStats stats = vernon::runtime::getRhiAdapterPreparationStats(*adapter);
     EXPECT_EQ(stats.shaderPreparations, 1u);
@@ -113,4 +130,5 @@ TEST(CudaRhiAdapter, PreparesAndDispatchesThroughRuntimeCore) {
     vernonRuntimeCoreBindingsDestroy(bindings);
     vernonRuntimeCorePipelineDestroy(pipeline);
     vernonRuntimeRhiAdapterDestroy(adapter);
+    vernonRhiDestroyDevice(device);
 }

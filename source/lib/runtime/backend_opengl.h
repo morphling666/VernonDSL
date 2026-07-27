@@ -63,7 +63,6 @@ inline const OpenGLContextState &openGLState(const VernonRuntimeContext &context
 bool isOpenGL(const VernonRuntimeContext *context);
 void makeCurrent(VernonRuntimeContext *context);
 
-VernonStatus openGLComputeToGraphicsBarrier(VernonRuntimeContext &context);
 VernonStatus synchronizeOpenGL(VernonRuntimeContext &context);
 
 } // namespace vernon::runtime

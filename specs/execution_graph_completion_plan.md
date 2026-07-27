@@ -18,55 +18,34 @@ and VernonRHI to backend command recording and submission.
 This plan does not include Vernon Engine migration, asynchronous multi-frame
 execution, or compatibility branches for the incomplete command path.
 
-## Current gaps
+## Completed foundations and current gaps
 
-### Command recording is descriptive
+### Native command recording is complete
 
-- `source/lib/rhi/rhi_command.cpp` validates encoder state and records
-  statistics, but does not issue backend commands.
-- Runtime RHI adapters ignore the provider command-encoder argument and execute
-  through their existing immediate paths.
-- `vernonRuntimePipelineEncode` therefore still reaches an immediate backend
-  invocation rather than recording into the supplied encoder.
-- Python `ExecutionGraph` computes scopes and barriers independently, but
-  `execute()` does not encode its barriers and each pipeline invocation may
-  submit separately.
+- Every official GPU adapter requires a non-null provider command encoder.
+- Immediate invocation creates an ephemeral RHI encoder and uses the same
+  adapter recording path as graph execution.
+- RHI barriers are batched per backend call, and failed or abandoned recordings
+  roll back optimistic native resource-state tracking.
+- Fused scopes use a bounded backend attachment-object cache; entries in use by
+  the active encoder cannot be evicted, and overflow objects are command-owned.
+- Per-encoder resource, cleanup, and rollback deduplication is O(1).
+- OpenGL tracks unconsumed compute writes so submit emits a fallback memory
+  barrier only when no explicit resource barrier consumed them.
+- Synchronous DirectX 12 and Vulkan devices own one reusable command frame.
 
-Consequently, reported render-scope fusion is not physical fusion and graph
-barriers do not synchronize backend work.
+### Resource identity is stable
 
-### Resource identity is unstable
+Provider references and graph imports retain generation-checked logical
+resource records. Public destruction invalidates handles immediately without
+allowing slot reuse to alias a retained record.
 
-The DirectX 12 retention workaround keeps COM objects in a FIFO deque keyed by
-a recyclable RHI slot address. It can keep an old native object alive, but it
-does not make a stale provider reference resolve to the correct logical
-resource after slot reuse. Independent binding sets also need not release
-references in retain order.
+### Public ABI baseline is complete
 
-The existing slot-reuse regression test checks one retain/release sequence. It
-does not encode with the retained reference, reverse destruction order, or
-cover image, sampler, attachment, and replacement-binding cases.
-
-This activates phase 1 of
-[`deferred_gpu_resource_lifetime_plan.md`](deferred_gpu_resource_lifetime_plan.md).
-Phases 2 and 3 remain deferred.
-
-### Public ABI layouts changed
-
-The current changes modify public layouts while retaining their previous
-version numbers:
-
-- `VernonRuntimeProviderDrawDescriptor` gains attachment operations and
-  scissor fields while the provider ABI remains 4.
-- `VernonRhiGraphicsPipelineDescriptor` and
-  `VernonRhiRenderingDescriptor` change while the RHI API remains 4.
-- `VernonPipelineInvocation` gains an encoder field while the invocation ABI
-  remains 6.
-
-Several consumers require `struct_size >= sizeof(current_type)`, so these
-changes are not automatically compatible with older callers. Do not change a
-version merely to reserve future fields, but do not reuse an existing version
-for an incompatible layout.
+There is one current command layout and one backend recording path. Callers
+must provide the current `struct_size`; no compatibility normalization is
+performed, and the existing RHI, provider, and invocation version constants
+remain unchanged.
 
 ### Graph validation is incomplete
 
@@ -89,27 +68,22 @@ multi-pass resource chain.
 
 ## Implementation order
 
-### Phase 1: make ABI changes explicit
+### Phase 1: establish the completed ABI baseline (complete)
 
-1. Inventory every changed public structure and function across VernonRHI,
-   Runtime, RuntimeCore, and the provider SPI.
-2. For append-only structures, either accept documented older `struct_size`
-   values and supply defaults for missing tails, or assign a new version.
-3. For inserted or reordered fields, assign a new ABI/API version unless the
-   old layout is restored.
-4. Add tests using the previous structure size and version so compatibility is
-   demonstrated rather than assumed.
-5. Keep one implementation path; do not add old-layout and new-layout backend
+1. Keep only the completed public structures used by the native command path.
+2. Remove old layout definitions, compatibility normalization, and old backend
    branches.
+3. Require the current `struct_size` at every affected boundary.
+4. Keep the existing version constants unchanged for this unreleased baseline.
 
 Acceptance:
 
-- no two incompatible layouts advertise the same version;
-- every accepted older structure size has deterministic defaults;
-- bundle and provider version diagnostics name the expected and received
-  versions.
+- there is one current layout and one implementation path;
+- older incomplete structure sizes are rejected rather than normalized;
+- no compatibility-only data structure or backend branch remains;
+- RHI API 4, provider ABI 4, and invocation ABI 6 remain unchanged.
 
-### Phase 2: implement stable logical resource records
+### Phase 2: implement stable logical resource records (complete)
 
 Implement phase 1 of the deferred resource lifetime plan before relying on
 retained bindings or graph recording:
@@ -133,7 +107,7 @@ Acceptance:
   enabled backend;
 - repeated updates do not grow retention storage without bound.
 
-### Phase 3: lower one native command encoder
+### Phase 3: lower one native command encoder (complete)
 
 1. Give each RHI command encoder a backend recording object or an explicit
    borrowed external recording target.
@@ -147,6 +121,20 @@ Acceptance:
    scopes, finish once, and submit once.
 6. Define failure cleanup so partially recorded work and retained resources are
    released without submission.
+7. Retain deduplicated RHI resources and prepared provider objects until owned
+   submission completes or the owner destroys a borrowed encoder.
+8. Use a generation-checked O(1) registry with per-encoder synchronization;
+   backend fence waits must not hold the registry lock.
+9. Apply fused-scope load/store operations once, map barriers from declared
+   state/stage/access, and keep descriptor storage valid until submission.
+10. Roll back optimistic backend resource-state tracking when an encoder is
+    abandoned before submission.
+11. Batch native barriers and reuse immutable descriptor/rendering objects
+    within their retained logical-resource lifetime.
+12. Bound persistent backend caches, make command deduplication O(1), and keep
+    only one native command frame while submission remains synchronous.
+13. Snapshot mutable Vulkan bindings per encoder revision and resolve numeric
+    binding slots in O(n) without repeated layout scans.
 
 Acceptance:
 
@@ -155,7 +143,21 @@ Acceptance:
 - barriers cause backend transitions or memory barriers;
 - no official RHI adapter ignores the command-encoder argument;
 - command statistics are observations of actual recording, not the
-  implementation of recording.
+  implementation of recording;
+- destroying resource, pipeline, or binding owners after encode cannot
+  invalidate recorded commands;
+- fused final discard and same-state write barriers preserve backend semantics;
+- repeated fused draws neither recreate attachment descriptors nor overwrite
+  descriptor storage still referenced by the active command stream.
+- abandoned recordings leave tracked native resource state unchanged;
+- repeated identical binding sets and Vulkan fallback scopes reuse cached
+  backend objects without unbounded attachment retention;
+- repeated DirectX 12 compute dispatches with unchanged bindings reuse
+  descriptors within the active encoder;
+- multiple Vulkan invocations in one encoder retain their original descriptor
+  and inline-value snapshots;
+- explicit OpenGL resource barriers suppress the redundant submit fallback;
+- no manual compute-to-graphics compatibility API remains.
 
 ### Phase 4: use one graph compiler from Python
 

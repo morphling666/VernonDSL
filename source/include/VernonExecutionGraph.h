@@ -41,6 +41,7 @@ struct ResourceUse {
     GraphResource resource;
     AccessMode access{AccessMode::Read};
     VernonRhiResourceState state{VERNON_RHI_STATE_COMMON};
+    uint32_t stageMask{};
 };
 
 struct ColorAttachmentUse {
@@ -181,12 +182,14 @@ public:
 
     const std::vector<uint32_t> &schedule() const { return schedule_; }
     const std::vector<CompiledScope> &scopes() const { return scopes_; }
+    const VernonRhiCommandEncoderStats &lastStats() const { return lastStats_; }
 
 private:
     friend class ExecutionPass;
     struct ResourceRecord {
         GraphResource resource;
         bool exported{};
+        uint64_t resourceKey{};
         VernonRhiBuffer buffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
         VernonRhiImage image{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     };
@@ -197,6 +200,7 @@ private:
     std::vector<ResourceRecord> resourceRecords_;
     std::vector<uint32_t> schedule_;
     std::vector<CompiledScope> scopes_;
+    VernonRhiCommandEncoderStats lastStats_{};
     bool dirty_{true};
 };
 

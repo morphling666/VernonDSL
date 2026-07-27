@@ -20,7 +20,6 @@ $cpuOutput = Join-Path $BinaryDir "shadowed-material-cpu"
 $runtimeShaderPath = Join-Path $ProjectRoot "examples\runtime_shader.py"
 $runtimeMlirPath = Join-Path $BinaryDir "runtime-shader.mlir"
 $openGlOutput = Join-Path $BinaryDir "runtime-shader-opengl"
-$bundlePath = Join-Path $BinaryDir "runtime-shader"
 $env:PYTHONPATH = Join-Path $ProjectRoot "python"
 
 Push-Location $ProjectRoot
@@ -88,22 +87,15 @@ try {
       -not $fragmentSource.StartsWith("#version 330")) {
     throw "OpenGL artifacts must target Vernon's GLSL 3.3 runtime"
   }
-
-  Remove-Item -Recurse -Force $bundlePath -ErrorAction SilentlyContinue
-  & $VernonCompiler --target opengl $runtimeMlirPath --glsl-version 330 `
-    --bundle $bundlePath --asset-id "shaders/runtime"
-  if ($LASTEXITCODE -ne 0) {
-    throw "Vernon shader bundle compilation failed"
-  }
-  $bundle = Get-Content (Join-Path $bundlePath "shader.json") -Raw |
+  $openGlReflection = Get-Content (Join-Path $openGlOutput "reflection.json") -Raw |
     ConvertFrom-Json
-  if ($bundle.id -ne "shaders/runtime" -or
-      $bundle.reflection.schema_version -ne 4 -or
-      $bundle.reflection.target -ne "opengl" -or
-      $bundle.reflection.artifacts.Count -ne 2 -or
-      -not (Test-Path (Join-Path $bundlePath "runtime_vertex.vert.glsl")) -or
-      -not (Test-Path (Join-Path $bundlePath "runtime_fragment.frag.glsl"))) {
-    throw "Vernon shader bundle is missing reflected runtime artifacts"
+  if ($openGlReflection.schema_version -ne 4 -or
+      $openGlReflection.target -ne "opengl" -or
+      $openGlReflection.target_options.glsl_version -ne 330 -or
+      $openGlReflection.artifacts.Count -ne 2 -or
+      -not ($openGlReflection.artifacts.filename -contains "runtime_vertex.vert.glsl") -or
+      -not ($openGlReflection.artifacts.filename -contains "runtime_fragment.frag.glsl")) {
+    throw "OpenGL output is missing reflected runtime artifacts"
   }
 } finally {
   Pop-Location

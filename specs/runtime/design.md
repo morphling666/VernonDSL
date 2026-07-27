@@ -92,9 +92,9 @@ Execution is split across RuntimeCore and backend-specific providers:
   dispatch is synchronous.
 
 RuntimeCore never owns textures, framebuffers, execution graphs, queues, or
-resource state. Provider-owned resource references are non-owning opaque
-handles with immutable metadata. The provider owns allocation, barriers,
-submission, completion, and transient descriptor/upload storage.
+resource state. It transactionally retains opaque provider resource references
+held by prepared bindings. The provider owns allocation, logical records,
+barriers, submission, completion, and transient descriptor/upload storage.
 
 ## Reflection-driven structured Value binding
 
@@ -137,6 +137,28 @@ dispatch layer. RHI provider implementations are split into common, CUDA,
 D3D12, OpenGL, and Vulkan translation units; CPU provider preparation remains
 with RuntimeCpuProvider.
 
+GPU invocation always records through one VernonRHI command encoder. A
+non-null provider encoder resolves to the encoder's active native command list,
+command buffer, context, or stream; provider draw and dispatch callbacks record
+commands but never finish or submit it. Immediate invocation creates an
+ephemeral encoder, records once, finishes, and submits once. ExecutionGraph
+uses the same contract across all compiled scopes and submits once after the
+last scope. Encoder lookup uses an O(1) generation-checked registry and a
+per-encoder lock; backend submission and fence waits never hold the registry
+lock. Recording retains an O(1)-deduplicated set of RHI resources plus prepared
+pipeline and binding objects. Owned submissions release those references after
+the synchronous backend completion; borrowed native command targets retain
+them until encoder destruction, which is the owner's completion signal.
+Failed recordings are abandoned with the same cleanup path.
+
+ExecutionGraph render scopes own the first attachment load operations and the
+last attachment store operations. Providers consume those scope operations
+instead of per-draw values. Vulkan encodes them in dynamic rendering or a
+compatible fallback render pass; D3D12 and OpenGL apply final discard when the
+scope ends. Vulkan barriers map resource state plus explicit stage/access
+masks, OpenGL emits one merged destination barrier, and D3D12 emits UAV
+barriers for same-state write hazards.
+
 Runtime has no resource ownership API. GPU Tensor, image, sampler, index, and
 attachment bindings are `VernonRuntimeProviderResourceReference` values
 obtained from the same RHI device used to create Runtime. Host Tensor bindings
@@ -159,14 +181,15 @@ address duplicate static registries.
 D3D12 device selection, COM device/queue/allocator/list/fence ownership,
 resource creation, and resource destruction live in VernonRHI. RuntimeCore
 owns format and invocation planning; the D3D12 provider owns preparation and
-encoding. Three command frames rotate allocator/list ownership. Persistently
+encoding. Synchronous submission reuses one allocator/list command frame. Persistently
 mapped upload/readback rings and persistent RTV/resource/sampler descriptor
 rings grow geometrically and reuse storage after completed submissions. The
-RHI slot storage is address-stable because RuntimeCore resource references
-point directly at native resource state. The
-current C ABI submission remains synchronous, so ring wrap cannot overwrite
-in-flight GPU data; asynchronous submission will require fence-tagged ring
-segments.
+Provider references encode stable RHI slot-and-generation keys rather than slot
+addresses or COM pointers. Public destruction invalidates the owner handle
+immediately; an owned native resource remains in its logical record until all
+prepared bindings release it. The current C ABI submission remains synchronous,
+so ring wrap cannot overwrite in-flight GPU data; asynchronous submission will
+require fence-tagged ring segments.
 
 D3D12 graphics preparation is lazy because render-target formats, topology,
 and concrete vertex strides arrive with the first invocation. The resulting
@@ -195,19 +218,22 @@ delegating allocation, destruction, command recording, submission, and device
 completion to the RHI device state.
 
 Runtime-visible Vulkan buffers use device-local memory. Host transfers pass
-through persistent mapped upload/readback rings. Three command buffers and
-fences rotate from one RHI-owned command pool. RHI resource slots use
-address-stable storage because RuntimeCore opaque resource references point at
-their native buffer, image, view, or sampler state. Descriptor sets come from
-one device pool and remain valid with their cached RuntimeCore binding sets;
-the pool is not reset per submission, and each set is individually returned
-when its binding set is destroyed. Submission remains synchronous for
-compatibility, so completed submissions safely reset transient ring offsets.
+through persistent mapped upload/readback rings. One command buffer and fence
+are reused from the RHI-owned command pool. RuntimeCore opaque resource
+references resolve generation-checked logical records to native buffer, image,
+or sampler state when bindings are encoded. Each binding revision used by an
+encoder owns an immutable descriptor-set snapshot plus one combined aligned
+inline buffer; command completion returns the set and buffer. Binding updates
+therefore cannot mutate earlier commands in the same encoder. Submission
+remains synchronous, so completed submissions safely reset transient ring
+offsets.
 
 Vulkan graphics prefers dynamic rendering when Vulkan 1.3, or Vulkan 1.2 with
 `VK_KHR_dynamic_rendering`, exposes the feature. Older devices use cached render
-passes keyed by attachment-location formats; framebuffers remain invocation
-specific because they contain the concrete image views and extent.
+passes and framebuffers keyed by retained attachment generations, formats,
+color/depth/stencil load-store operations, and extent. The persistent cache is
+bounded; overflow objects belong to the active command and are released at
+completion.
 
 Rendering scopes carry explicit `Clear`, `Preserve`, or `Discard` load
 operations and `Preserve` or `Discard` store operations. Clear values belong to

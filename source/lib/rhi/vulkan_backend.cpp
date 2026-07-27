@@ -68,6 +68,8 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
     maxVertexInputAttributes = properties.limits.maxVertexInputAttributes;
     apiVersion = properties.apiVersion;
     maxComputeWorkGroupInvocations = properties.limits.maxComputeWorkGroupInvocations;
+    descriptorBufferOffsetAlignment = (std::max)(properties.limits.minUniformBufferOffsetAlignment,
+                                                 properties.limits.minStorageBufferOffsetAlignment);
     for (size_t index = 0; index < 3; ++index)
         maxComputeWorkGroupSize[index] = properties.limits.maxComputeWorkGroupSize[index];
     uint32_t queueCount = 0;
@@ -145,25 +147,21 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
         shutdown();
         return false;
     }
-    std::array<VkCommandBuffer, frameCount> commands{};
     VkCommandBufferAllocateInfo commandAllocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     commandAllocation.commandPool = commandPool;
     commandAllocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    commandAllocation.commandBufferCount = frameCount;
-    if (!check(api.allocateCommandBuffers(device, &commandAllocation, commands.data()), "vkAllocateCommandBuffers",
+    commandAllocation.commandBufferCount = 1;
+    if (!check(api.allocateCommandBuffers(device, &commandAllocation, &frame.command), "vkAllocateCommandBuffers",
                error)) {
         shutdown();
         return false;
     }
-    commandBufferAllocations += frameCount;
+    ++commandBufferAllocations;
     VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    for (uint32_t index = 0; index < frameCount; ++index) {
-        frames[index].command = commands[index];
-        if (!check(api.createFence(device, &fenceInfo, nullptr, &frames[index].fence), "vkCreateFence", error)) {
-            shutdown();
-            return false;
-        }
+    if (!check(api.createFence(device, &fenceInfo, nullptr, &frame.fence), "vkCreateFence", error)) {
+        shutdown();
+        return false;
     }
     const VkDescriptorPoolSize descriptorSizes[] = {
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1024},
@@ -221,6 +219,8 @@ bool DeviceState::initializeBorrowed(VkInstance borrowedInstance, VkPhysicalDevi
     maxVertexInputAttributes = properties.limits.maxVertexInputAttributes;
     apiVersion = properties.apiVersion;
     maxComputeWorkGroupInvocations = properties.limits.maxComputeWorkGroupInvocations;
+    descriptorBufferOffsetAlignment = (std::max)(properties.limits.minUniformBufferOffsetAlignment,
+                                                 properties.limits.minStorageBufferOffsetAlignment);
     for (size_t index = 0; index < 3; ++index)
         maxComputeWorkGroupSize[index] = properties.limits.maxComputeWorkGroupSize[index];
     api.getPhysicalDeviceMemoryProperties(physicalDevice, &memoryProperties);
@@ -243,11 +243,9 @@ void DeviceState::shutdown() {
         destroySampler(defaultImplicitSampler);
         if (descriptorPool && api.destroyDescriptorPool)
             api.destroyDescriptorPool(device, descriptorPool, nullptr);
-        for (CommandFrame &frame : frames) {
-            if (frame.fence && api.destroyFence)
-                api.destroyFence(device, frame.fence, nullptr);
-            frame = {};
-        }
+        if (frame.fence && api.destroyFence)
+            api.destroyFence(device, frame.fence, nullptr);
+        frame = {};
         if (commandPool && api.destroyCommandPool)
             api.destroyCommandPool(device, commandPool, nullptr);
         if (api.destroyDevice)
@@ -257,7 +255,6 @@ void DeviceState::shutdown() {
         api.destroyInstance(instance, nullptr);
     commandPool = VK_NULL_HANDLE;
     descriptorPool = VK_NULL_HANDLE;
-    currentFrame = frameCount - 1;
     queue = VK_NULL_HANDLE;
     device = VK_NULL_HANDLE;
     physicalDevice = VK_NULL_HANDLE;
@@ -267,6 +264,7 @@ void DeviceState::shutdown() {
     maxVertexInputAttributes = 0;
     apiVersion = 0;
     maxComputeWorkGroupInvocations = 0;
+    descriptorBufferOffsetAlignment = 1;
     dynamicRendering = false;
     nativeObjectsBorrowed = false;
     borrowedCommandBuffer = VK_NULL_HANDLE;
@@ -287,8 +285,6 @@ bool DeviceState::beginCommands(VkCommandBuffer &command, std::string &error) {
         return command != VK_NULL_HANDLE;
     }
     Driver &api = driver();
-    currentFrame = (currentFrame + 1) % frameCount;
-    CommandFrame &frame = frames[currentFrame];
     if (frame.submitted &&
         !check(api.waitForFences(device, 1, &frame.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences", error))
         return false;
@@ -306,7 +302,6 @@ bool DeviceState::submitCommands(VkCommandBuffer command, std::string &error) {
     if (nativeObjectsBorrowed)
         return command == borrowedCommandBuffer;
     Driver &api = driver();
-    CommandFrame &frame = frames[currentFrame];
     if (command != frame.command) {
         error = "Vulkan command buffer does not belong to the active frame";
         return false;

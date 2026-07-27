@@ -461,6 +461,7 @@ typedef struct VernonRhiBindingSetDescriptor {
 
 typedef struct VernonRhiColorAttachment {
     VernonRhiImageView view;
+    uint32_t location;
     VernonRhiResourceState initial_state;
     VernonRhiResourceState final_state;
     VernonRhiLoadOperation load_operation;
@@ -496,37 +497,6 @@ typedef struct VernonRhiRenderingDescriptor {
     uint32_t reserved[4];
 } VernonRhiRenderingDescriptor;
 
-typedef struct VernonRhiViewport {
-    float x;
-    float y;
-    float width;
-    float height;
-    float minimum_depth;
-    float maximum_depth;
-} VernonRhiViewport;
-
-typedef struct VernonRhiRectangle {
-    int32_t x;
-    int32_t y;
-    uint32_t width;
-    uint32_t height;
-} VernonRhiRectangle;
-
-typedef struct VernonRhiDrawDescriptor {
-    uint32_t vertex_count;
-    uint32_t instance_count;
-    uint32_t first_vertex;
-    uint32_t first_instance;
-} VernonRhiDrawDescriptor;
-
-typedef struct VernonRhiDrawIndexedDescriptor {
-    uint32_t index_count;
-    uint32_t instance_count;
-    uint32_t first_index;
-    int32_t vertex_offset;
-    uint32_t first_instance;
-} VernonRhiDrawIndexedDescriptor;
-
 typedef struct VernonRhiCommandEncoderDescriptor {
     uint32_t struct_size;
     VernonRhiQueue queue;
@@ -561,12 +531,9 @@ typedef struct VernonRhiCommandEncoderStats {
     uint32_t rendering_scope_count;
     uint32_t barrier_count;
     uint32_t clear_count;
-    uint32_t graphics_pipeline_bind_count;
-    uint32_t compute_pipeline_bind_count;
-    uint32_t viewport_change_count;
-    uint32_t scissor_change_count;
     uint32_t draw_count;
     uint32_t dispatch_count;
+    uint32_t submission_count;
 } VernonRhiCommandEncoderStats;
 
 typedef enum VernonRhiNativeDescriptorHeapType {
@@ -667,18 +634,6 @@ VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderBeginRendering(VernonRhiD
                                                                       const VernonRhiRenderingDescriptor *descriptor);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderEndRendering(VernonRhiDevice device,
                                                                     VernonRhiCommandEncoder encoder);
-VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderBindGraphicsPipeline(VernonRhiDevice device,
-                                                                            VernonRhiCommandEncoder encoder,
-                                                                            VernonRhiGraphicsPipeline pipeline);
-VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderBindComputePipeline(VernonRhiDevice device,
-                                                                           VernonRhiCommandEncoder encoder,
-                                                                           VernonRhiComputePipeline pipeline);
-VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderSetViewport(VernonRhiDevice device,
-                                                                   VernonRhiCommandEncoder encoder,
-                                                                   const VernonRhiViewport *viewport);
-VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderSetScissor(VernonRhiDevice device,
-                                                                  VernonRhiCommandEncoder encoder,
-                                                                  const VernonRhiRectangle *scissor);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderClearColorAttachment(VernonRhiDevice device,
                                                                             VernonRhiCommandEncoder encoder,
                                                                             uint32_t location,
@@ -688,13 +643,6 @@ VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderClearDepthStencilAttachme
                                                                                    float clear_depth,
                                                                                    uint32_t clear_stencil,
                                                                                    uint32_t aspects);
-VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderDraw(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
-                                                            const VernonRhiDrawDescriptor *descriptor);
-VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderDrawIndexed(VernonRhiDevice device,
-                                                                   VernonRhiCommandEncoder encoder,
-                                                                   const VernonRhiDrawIndexedDescriptor *descriptor);
-VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderDispatch(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
-                                                                uint32_t x, uint32_t y, uint32_t z);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderFinish(VernonRhiDevice device, VernonRhiCommandEncoder encoder);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceSubmit(VernonRhiDevice device, VernonRhiCommandEncoder encoder);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderGetStats(VernonRhiDevice device, VernonRhiCommandEncoder encoder,

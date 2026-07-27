@@ -1,6 +1,7 @@
 #include "runtime_pipeline_backend.h"
 
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+#include "../rhi/rhi_internal.h"
 #include "backend_directx12.h"
 #include "compute_launch_planner.h"
 #include "rhi_adapter/adapter_internal.h"
@@ -462,8 +463,10 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
         attachments[index].load_operation = source.load_operation;
         attachments[index].store_operation = source.store_operation;
         std::copy(std::begin(source.clear_color), std::end(source.clear_color), attachments[index].clear_color);
-        const auto *image =
-            reinterpret_cast<const rhi::directx12::Image *>(static_cast<uintptr_t>(source.resource.resource.value));
+        const auto *image = reinterpret_cast<const rhi::directx12::Image *>(vernon::rhi::resolveResource(
+            pipeline.context->rhiDevice, vernon::rhi::ResourceKind::Image, source.resource.resource.value));
+        if (!image)
+            return fail(*pipeline.context, "D3D12 RHI color attachment is stale");
         formats.push_back(static_cast<uint32_t>(image->format));
     }
     if (plan.depthAttachment) {

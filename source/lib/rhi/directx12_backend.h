@@ -9,10 +9,10 @@
 #include <windows.h>
 #endif
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace vernon::rhi::directx12 {
 
@@ -36,8 +36,6 @@ struct Sampler {
 };
 
 struct VERNON_RHI_CAPI DeviceState {
-    static constexpr uint32_t frameCount = 3;
-
     struct CommandFrame {
         ID3D12CommandAllocator *allocator{};
         ID3D12GraphicsCommandList *commands{};
@@ -55,6 +53,7 @@ struct VERNON_RHI_CAPI DeviceState {
         ID3D12DescriptorHeap *heap{};
         uint32_t capacity{};
         uint32_t cursor{};
+        std::vector<ID3D12DescriptorHeap *> retiredHeaps;
     };
 
     ~DeviceState();
@@ -66,6 +65,8 @@ struct VERNON_RHI_CAPI DeviceState {
     bool synchronize(std::string &error);
     bool beginCommands(std::string &error, ID3D12PipelineState *initialState = nullptr);
     bool submitCommands(std::string &error);
+    void recycleCommandStorage();
+    ID3D12GraphicsCommandList *commandList() const;
     bool createBuffer(Buffer &buffer, size_t size, bool unorderedAccess, D3D12_HEAP_TYPE heapType,
                       D3D12_RESOURCE_STATES initialState, std::string &error);
     void destroyBuffer(Buffer &buffer);
@@ -82,11 +83,8 @@ struct VERNON_RHI_CAPI DeviceState {
     IDXGIAdapter1 *adapter{};
     ID3D12Device *device{};
     ID3D12CommandQueue *queue{};
-    std::array<CommandFrame, frameCount> frames{};
-    uint32_t currentFrame{frameCount - 1};
-    // Compatibility aliases for the active frame while Runtime encoders migrate.
-    ID3D12CommandAllocator *allocator{};
-    ID3D12GraphicsCommandList *commands{};
+    CommandFrame frame;
+    ID3D12GraphicsCommandList *borrowedCommands{};
     ID3D12Fence *fence{};
     HANDLE fenceEvent{};
     uint64_t fenceValue{};

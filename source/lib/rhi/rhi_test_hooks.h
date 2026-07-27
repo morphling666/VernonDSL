@@ -16,6 +16,7 @@ struct VulkanCacheStats {
 };
 
 VERNON_RHI_CAPI VulkanCacheStats getVulkanCacheStats(VernonRhiDevice device);
+VERNON_RHI_CAPI uint64_t getTrackedBufferState(VernonRhiDevice device, VernonRhiBuffer buffer);
 
 } // namespace vernon::rhi
 

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
-import heapq
+import importlib
+import weakref
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable
 
-from .resources import RenderTarget, Texture
+from .resources import RawBuffer, RenderTarget, TensorStorage, TensorView, Texture
+
+
+def _session_state() -> Any:
+    return importlib.import_module("vernon_dsl._runtime.session")
 
 
 class LoadOperation(Enum):
@@ -24,6 +29,9 @@ class GraphResource:
     id: int
     value: Any
     exported: bool
+    _owner: object
+    _native: Any
+    _generation: int
 
 
 @dataclass(frozen=True)
@@ -47,20 +55,24 @@ class DepthStencilAttachmentUse:
     read_only_stencil: bool = False
 
 
-@dataclass(frozen=True)
-class _ResourceUse:
-    resource: GraphResource
-    access: str
-
-
 class PipelineInvocation:
     """Prepared graphics or compute work that encodes into a graph-provided encoder."""
 
-    def __init__(self, kind: str, callback: Callable[[GraphicsEncoder | ComputeEncoder], None]):
+    def __init__(
+        self,
+        kind: str,
+        callback: Callable[[GraphicsEncoder | ComputeEncoder], None],
+        declare_callback: Callable[[ExecutionPass], None] | None = None,
+    ):
         if kind not in {"graphics", "compute"}:
             raise ValueError("pipeline invocation kind must be graphics or compute")
         self.kind = kind
         self._callback = callback
+        self._declare_callback = declare_callback
+
+    def declare(self, execution_pass: ExecutionPass) -> None:
+        if self._declare_callback is not None:
+            self._declare_callback(execution_pass)
 
     def encode(
         self,
@@ -74,23 +86,26 @@ class PipelineInvocation:
 
 
 class ExecutionResources:
-    def __init__(self, resources: tuple[GraphResource, ...]):
-        self._resources = resources
+    def __init__(self, graph: ExecutionGraph):
+        self._graph = graph
 
     def resolve(self, resource: GraphResource) -> Any:
-        if not isinstance(resource, GraphResource) or resource.id >= len(self._resources):
-            raise ValueError("resource does not belong to this execution graph")
-        current = self._resources[resource.id]
-        if current is not resource:
-            raise ValueError("resource does not belong to this execution graph")
-        return current.value
+        return self._graph._resolve(resource)
 
 
 class GraphicsEncoder:
     kind = "graphics"
 
-    def __init__(self, render_pass: RenderPass, *, first_in_scope: bool, last_in_scope: bool):
+    def __init__(
+        self,
+        render_pass: RenderPass,
+        native: Any,
+        *,
+        first_in_scope: bool,
+        last_in_scope: bool,
+    ):
         self._pass = render_pass
+        self._native = native
         self._first_in_scope = first_in_scope
         self._last_in_scope = last_in_scope
         self.viewport: tuple[int, int, int, int] | None = None
@@ -121,6 +136,9 @@ class GraphicsEncoder:
 class ComputeEncoder:
     kind = "compute"
 
+    def __init__(self, native: Any):
+        self._native = native
+
 
 def _checked_rectangle(name: str, x: int, y: int, width: int, height: int) -> tuple[int, int, int, int]:
     values = (x, y, width, height)
@@ -134,12 +152,70 @@ class ExecutionPass:
         self.name = name or type(self).__name__
         if not isinstance(self.name, str) or not self.name:
             raise ValueError("execution pass name must be a non-empty string")
-        self.never_cull = False
-        self.side_effect = False
-        self.no_merge = False
+        self._never_cull = False
+        self._side_effect = False
+        self._no_merge = False
         self._dependencies: list[ExecutionPass] = []
-        self._uses: list[_ResourceUse] = []
-        self._graph: ExecutionGraph | None = None
+        self._graph_ref: weakref.ReferenceType[ExecutionGraph] | None = None
+        self._native_pass: Any | None = None
+        self._declaring = False
+        self._first_in_scope = False
+        self._last_in_scope = False
+
+    @property
+    def _graph(self) -> ExecutionGraph | None:
+        return self._graph_ref() if self._graph_ref is not None else None
+
+    @_graph.setter
+    def _graph(self, value: ExecutionGraph | None) -> None:
+        self._graph_ref = weakref.ref(value) if value is not None else None
+
+    @property
+    def never_cull(self) -> bool:
+        return self._never_cull
+
+    @never_cull.setter
+    def never_cull(self, value: bool) -> None:
+        self._set_flag("_never_cull", value)
+
+    @property
+    def side_effect(self) -> bool:
+        return self._side_effect
+
+    @side_effect.setter
+    def side_effect(self, value: bool) -> None:
+        self._set_flag("_side_effect", value)
+
+    @property
+    def no_merge(self) -> bool:
+        return self._no_merge
+
+    @no_merge.setter
+    def no_merge(self, value: bool) -> None:
+        self._set_flag("_no_merge", value)
+
+    def _set_flag(self, field: str, value: bool) -> None:
+        if not isinstance(value, bool):
+            raise TypeError("execution pass flags must be bool")
+        if getattr(self, field) == value:
+            return
+        setattr(self, field, value)
+        if self._graph is not None:
+            self._graph._dirty = True
+            self._sync_flags()
+
+    def _sync_flags(self) -> None:
+        if self._native_pass is None:
+            return
+        native = _session_state()._native
+        flags = 0
+        if self._never_cull:
+            flags |= native.GRAPH_PASS_NEVER_CULL
+        if self._no_merge:
+            flags |= native.GRAPH_PASS_NO_MERGE
+        if self._side_effect:
+            flags |= native.GRAPH_PASS_SIDE_EFFECT
+        self._native_pass.set_flags(flags)
 
     def declare(self) -> None:
         raise NotImplementedError
@@ -153,25 +229,40 @@ class ExecutionPass:
             self._dependencies.append(dependency)
             if self._graph is not None:
                 self._graph._dirty = True
+                self._graph._sync_dependencies()
         return self
 
     def read(self, resource: GraphResource | Any) -> None:
-        self._uses.append(_ResourceUse(self._resource(resource), "read"))
+        self._use(resource, "read")
 
     def write(self, resource: GraphResource | Any) -> None:
-        self._uses.append(_ResourceUse(self._resource(resource), "write"))
+        self._use(resource, "write")
 
     def read_write(self, resource: GraphResource | Any) -> None:
-        self._uses.append(_ResourceUse(self._resource(resource), "read_write"))
+        self._use(resource, "read_write")
 
-    def _resource(self, resource: GraphResource | Any) -> GraphResource:
-        if self._graph is None:
+    def _use(self, resource: GraphResource | Any, access: str) -> None:
+        if not self._declaring or self._graph is None or self._native_pass is None:
             raise RuntimeError("resource declarations are only valid while the pass is being declared")
-        return resource if isinstance(resource, GraphResource) else self._graph.import_resource(resource)
+        graph_resource = resource if isinstance(resource, GraphResource) else self._graph.import_resource(resource)
+        self._graph._validate_resource(graph_resource)
+        native = _session_state()._native
+        self._native_pass.use(
+            graph_resource._native,
+            {
+                "read": native.GRAPH_READ,
+                "write": native.GRAPH_WRITE,
+                "read_write": native.GRAPH_READ_WRITE,
+            }[access],
+            native.GRAPH_SHADER_READ if access == "read" else native.GRAPH_SHADER_WRITE,
+        )
 
-    def _reset_declaration(self, graph: ExecutionGraph) -> None:
-        self._graph = graph
-        self._uses.clear()
+    def _native_declare(self) -> None:
+        self._declaring = True
+        try:
+            self.declare()
+        finally:
+            self._declaring = False
 
 
 class RenderPass(ExecutionPass):
@@ -208,6 +299,8 @@ class RenderPass(ExecutionPass):
             self.depth(DepthStencilAttachmentUse(target, depth_load, depth_store, clear_depth))
 
     def color(self, location: int, attachment: ColorAttachmentUse) -> None:
+        if not self._declaring or self._graph is None or self._native_pass is None:
+            raise RuntimeError("attachments are only valid while the pass is being declared")
         if not isinstance(location, int) or isinstance(location, bool) or location < 0:
             raise ValueError("color attachment location must be a non-negative integer")
         if not isinstance(attachment, ColorAttachmentUse):
@@ -220,10 +313,19 @@ class RenderPass(ExecutionPass):
             raise ValueError("all render attachments must have matching dimensions")
         if location not in dict(self._target._color_attachments()):
             self._target.attach_color(location, attachment.texture)
+        resource = self._graph.import_resource(attachment.texture)
         self._colors[location] = attachment
-        self.write(attachment.texture)
+        self._native_pass.color(
+            location,
+            resource._native,
+            _native_load(attachment.load),
+            _native_store(attachment.store),
+            attachment.clear_value,
+        )
 
     def depth(self, attachment: DepthStencilAttachmentUse) -> None:
+        if not self._declaring or self._graph is None or self._native_pass is None:
+            raise RuntimeError("attachments are only valid while the pass is being declared")
         if not isinstance(attachment, DepthStencilAttachmentUse):
             raise TypeError("attachment must be a DepthStencilAttachmentUse")
         if self._depth is not None:
@@ -234,25 +336,57 @@ class RenderPass(ExecutionPass):
             raise ValueError("depth and color attachments must belong to one RenderTarget")
         self._target = attachment.target
         self._depth = attachment
-        if attachment.read_only_depth and attachment.read_only_stencil:
-            self.read(attachment.target)
-        else:
-            self.write(attachment.target)
+        resource = self._graph.import_resource(attachment.target)
+        self._native_pass.depth(
+            resource._native,
+            _native_load(attachment.depth_load),
+            _native_store(attachment.depth_store),
+            attachment.clear_depth,
+            _native_load(attachment.stencil_load),
+            _native_store(attachment.stencil_store),
+            attachment.clear_stencil,
+            attachment.read_only_depth,
+            attachment.read_only_stencil,
+        )
 
     def render_area(self, x: int, y: int, width: int, height: int) -> None:
+        if not self._declaring or self._native_pass is None:
+            raise RuntimeError("render area is only valid while the pass is being declared")
         self._render_area = _checked_rectangle("render area", x, y, width, height)
+        self._native_pass.render_area(*self._render_area)
 
-    def _reset_declaration(self, graph: ExecutionGraph) -> None:
-        super()._reset_declaration(graph)
+    def _native_declare(self) -> None:
         self._target = None
         self._colors.clear()
         self._depth = None
         self._render_area = None
+        super()._native_declare()
+
+    def _native_execute(self, native_encoder: Any) -> None:
+        assert self._graph is not None
+        encoder = GraphicsEncoder(
+            self,
+            native_encoder,
+            first_in_scope=self._first_in_scope,
+            last_in_scope=self._last_in_scope,
+        )
+        try:
+            self.execute(encoder, ExecutionResources(self._graph))
+        finally:
+            encoder._native = None
 
 
 class ComputePass(ExecutionPass):
     def execute(self, encoder: ComputeEncoder, resources: ExecutionResources) -> None:
         raise NotImplementedError
+
+    def _native_execute(self, native_encoder: Any) -> None:
+        assert self._graph is not None
+        encoder = ComputeEncoder(native_encoder)
+        try:
+            self.execute(encoder, ExecutionResources(self._graph))
+        finally:
+            encoder._native = None
 
 
 def _checked_clear_color(value: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
@@ -265,11 +399,32 @@ def _checked_clear_color(value: tuple[float, float, float, float]) -> tuple[floa
     return tuple(float(component) for component in value)  # type: ignore[return-value]
 
 
+def _native_load(operation: LoadOperation) -> int:
+    native = _session_state()._native
+    return {
+        LoadOperation.CLEAR: native.ATTACHMENT_CLEAR,
+        LoadOperation.PRESERVE: native.ATTACHMENT_PRESERVE,
+        LoadOperation.DISCARD: native.ATTACHMENT_DISCARD,
+    }[operation]
+
+
+def _native_store(operation: StoreOperation) -> int:
+    native = _session_state()._native
+    return {
+        StoreOperation.PRESERVE: native.ATTACHMENT_STORE,
+        StoreOperation.DISCARD: native.ATTACHMENT_DONT_CARE,
+    }[operation]
+
+
 @dataclass(frozen=True)
 class CompiledBarrier:
-    resource: GraphResource
-    before: str
-    after: str
+    source_stage_mask: int
+    destination_stage_mask: int
+    source_access: int
+    destination_access: int
+    old_state: int
+    new_state: int
+    is_image: bool
 
 
 @dataclass(frozen=True)
@@ -281,12 +436,22 @@ class CompiledScope:
 
 class ExecutionGraph:
     def __init__(self):
+        state = _session_state()
+        self._generation = state._runtime_generation
+        self._owner = object()
         self._passes: list[ExecutionPass] = []
         self._resources: list[GraphResource] = []
         self._resource_by_identity: dict[int, GraphResource] = {}
         self._schedule: tuple[ExecutionPass, ...] = ()
         self._scopes: tuple[CompiledScope, ...] = ()
         self._dirty = True
+        self._native_graph = state._rhi_host.create_execution_graph() if state._rhi_host is not None else None
+        state._runtime_children.add(self)
+
+    def _dispose_native(self) -> None:
+        for execution_pass in getattr(self, "_passes", ()):
+            execution_pass._native_pass = None
+        self._native_graph = None
 
     @property
     def schedule(self) -> tuple[ExecutionPass, ...]:
@@ -296,166 +461,135 @@ class ExecutionGraph:
     def scopes(self) -> tuple[CompiledScope, ...]:
         return self._scopes
 
+    def _ensure_current(self) -> Any:
+        state = _session_state()
+        if self._native_graph is None or self._generation != state._runtime_generation:
+            raise RuntimeError("ExecutionGraph requires the current initialized GPU runtime")
+        return self._native_graph
+
     def import_resource(self, value: Any, *, exported: bool = True) -> GraphResource:
+        native_graph = self._ensure_current()
         identity = id(value)
         existing = self._resource_by_identity.get(identity)
         if existing is not None:
             if existing.value is not value:
                 raise RuntimeError("Python resource identity collision")
             return existing
-        resource = GraphResource(len(self._resources), value, exported)
+        if isinstance(value, Texture):
+            native_resource = native_graph.import_image(value._resident_texture(), exported)
+        elif isinstance(value, RenderTarget):
+            image = value._resident_depth_attachment()
+            if image is None:
+                raise ValueError("RenderTarget graph resources require a depth attachment")
+            native_resource = native_graph.import_image(image, exported)
+        elif isinstance(value, (TensorStorage, TensorView, RawBuffer)):
+            native_resource = native_graph.import_buffer(value._resident_buffer(), exported)
+        else:
+            raise TypeError("execution graph resources must be Tensor, RawBuffer, Texture, or depth RenderTarget")
+        resource = GraphResource(native_resource.id, value, exported, self._owner, native_resource, self._generation)
         self._resources.append(resource)
         self._resource_by_identity[identity] = resource
         self._dirty = True
         return resource
 
     def add_pass(self, execution_pass: ExecutionPass) -> ExecutionPass:
+        native_graph = self._ensure_current()
         if not isinstance(execution_pass, ExecutionPass):
             raise TypeError("execution graph accepts only ExecutionPass instances")
         if execution_pass in self._passes or execution_pass._graph not in {None, self}:
             raise ValueError("execution pass already belongs to a graph")
-        self._passes.append(execution_pass)
         execution_pass._graph = self
+        if isinstance(execution_pass, RenderPass):
+            execution_pass._native_pass = native_graph.add_render_pass(execution_pass.name, execution_pass)
+        elif isinstance(execution_pass, ComputePass):
+            execution_pass._native_pass = native_graph.add_compute_pass(execution_pass.name, execution_pass)
+        else:
+            raise TypeError("execution graph accepts only RenderPass or ComputePass instances")
+        self._passes.append(execution_pass)
+        execution_pass._sync_flags()
+        self._sync_dependencies()
         self._dirty = True
         return execution_pass
 
+    def _sync_dependencies(self) -> None:
+        for execution_pass in self._passes:
+            if execution_pass._native_pass is None:
+                continue
+            for dependency in execution_pass._dependencies:
+                if dependency._graph is self and dependency._native_pass is not None:
+                    execution_pass._native_pass.depends_on(dependency._native_pass)
+
+    def _validate_resource(self, resource: GraphResource) -> None:
+        if (
+            not isinstance(resource, GraphResource)
+            or resource._owner is not self._owner
+            or resource._generation != self._generation
+            or resource.id >= len(self._resources)
+            or self._resources[resource.id] is not resource
+        ):
+            raise ValueError("resource does not belong to this execution graph")
+
+    def _resolve(self, resource: GraphResource) -> Any:
+        self._ensure_current()
+        self._validate_resource(resource)
+        return resource.value
+
     def validate(self) -> None:
+        native_graph = self._ensure_current()
         if len({execution_pass.name for execution_pass in self._passes}) != len(self._passes):
             raise ValueError("execution graph pass names must be unique")
-        owned = set(self._passes)
         for execution_pass in self._passes:
             for dependency in execution_pass._dependencies:
-                if dependency not in owned:
+                if dependency._graph is not self:
                     raise ValueError(f"pass {execution_pass.name!r} depends on a pass outside this graph")
-            for use in execution_pass._uses:
-                if use.resource.id >= len(self._resources) or self._resources[use.resource.id] is not use.resource:
-                    raise ValueError(f"pass {execution_pass.name!r} uses a resource outside this graph")
-        for scope in self._scopes:
-            if not scope.passes or any(execution_pass not in owned for execution_pass in scope.passes):
-                raise RuntimeError("compiled execution scope is invalid")
+        for resource in self._resources:
+            self._validate_resource(resource)
+        native_graph.validate()
 
     def compile(self) -> None:
+        native_graph = self._ensure_current()
+        self._sync_dependencies()
         for execution_pass in self._passes:
-            execution_pass._reset_declaration(self)
-            execution_pass.declare()
-            execution_pass._graph = self
-            if isinstance(execution_pass, RenderPass) and execution_pass._target is None:
-                raise ValueError(f"render pass {execution_pass.name!r} declares no attachments")
-        self.validate()
-        count = len(self._passes)
-        indices = {execution_pass: index for index, execution_pass in enumerate(self._passes)}
-        edges: list[set[int]] = [set() for _ in self._passes]
-        reverse: list[set[int]] = [set() for _ in self._passes]
-
-        def add_edge(before: int, after: int) -> None:
-            edges[before].add(after)
-            reverse[after].add(before)
-
-        for index, execution_pass in enumerate(self._passes):
-            for dependency in execution_pass._dependencies:
-                add_edge(indices[dependency], index)
-        for before in range(count):
-            for after in range(before + 1, count):
-                for left in self._passes[before]._uses:
-                    for right in self._passes[after]._uses:
-                        if left.resource is right.resource and (left.access != "read" or right.access != "read"):
-                            add_edge(before, after)
-
-        roots = {
-            index
-            for index, execution_pass in enumerate(self._passes)
-            if execution_pass.never_cull
-            or execution_pass.side_effect
-            or any(use.access != "read" and use.resource.exported for use in execution_pass._uses)
-        }
-        live = set(roots)
-        pending = list(roots)
-        while pending:
-            current = pending.pop()
-            for dependency in reverse[current] - live:
-                live.add(dependency)
-                pending.append(dependency)
-        indegree = {index: len(reverse[index] & live) for index in live}
-        ready = [index for index in live if indegree[index] == 0]
-        heapq.heapify(ready)
-        order: list[int] = []
-        while ready:
-            current = heapq.heappop(ready)
-            order.append(current)
-            for following in edges[current] & live:
-                indegree[following] -= 1
-                if indegree[following] == 0:
-                    heapq.heappush(ready, following)
-        if len(order) != len(live):
-            cyclic = ", ".join(self._passes[index].name for index in sorted(live) if indegree[index])
-            raise ValueError(f"execution graph contains a dependency cycle involving: {cyclic}")
-        self._schedule = tuple(self._passes[index] for index in order)
+            execution_pass._sync_flags()
+        native_graph.compile()
+        schedule_indices = tuple(native_graph.schedule)
+        self._schedule = tuple(self._passes[index] for index in schedule_indices)
         scopes: list[CompiledScope] = []
-        for execution_pass in self._schedule:
-            kind = "render" if isinstance(execution_pass, RenderPass) else "compute"
-            if (
-                kind == "render"
-                and scopes
-                and scopes[-1].kind == "render"
-                and _can_fuse(scopes[-1].passes[-1], execution_pass)
-            ):
-                scopes[-1] = CompiledScope("render", (*scopes[-1].passes, execution_pass))
-            else:
-                scopes.append(CompiledScope(kind, (execution_pass,)))
-        last_uses: dict[int, _ResourceUse] = {}
-        compiled_scopes: list[CompiledScope] = []
-        for scope in scopes:
-            first_uses: dict[int, _ResourceUse] = {}
-            final_uses: dict[int, _ResourceUse] = {}
-            for execution_pass in scope.passes:
-                for use in execution_pass._uses:
-                    first_uses.setdefault(use.resource.id, use)
-                    final_uses[use.resource.id] = use
-            barriers = tuple(
-                CompiledBarrier(use.resource, last_uses[resource_id].access, use.access)
-                for resource_id, use in first_uses.items()
-                if resource_id in last_uses and (last_uses[resource_id].access != "read" or use.access != "read")
+        for execution_pass in self._passes:
+            execution_pass._first_in_scope = False
+            execution_pass._last_in_scope = False
+        for native_scope in native_graph.scopes:
+            passes = tuple(self._passes[index] for index in native_scope.pass_indices)
+            if passes:
+                passes[0]._first_in_scope = True
+                passes[-1]._last_in_scope = True
+            scopes.append(
+                CompiledScope(
+                    "render" if native_scope.rendering else "compute",
+                    passes,
+                    tuple(
+                        CompiledBarrier(
+                            barrier.source_stage_mask,
+                            barrier.destination_stage_mask,
+                            barrier.source_access,
+                            barrier.destination_access,
+                            barrier.old_state,
+                            barrier.new_state,
+                            barrier.is_image,
+                        )
+                        for barrier in native_scope.barriers
+                    ),
+                )
             )
-            compiled_scopes.append(CompiledScope(scope.kind, scope.passes, barriers))
-            last_uses.update(final_uses)
-        self._scopes = tuple(compiled_scopes)
+        self._scopes = tuple(scopes)
         self._dirty = False
         self.validate()
 
     def execute(self) -> None:
+        native_graph = self._ensure_current()
         if self._dirty:
             self.compile()
-        resources = ExecutionResources(tuple(self._resources))
-        for scope in self._scopes:
-            if scope.kind == "compute":
-                compute_pass = scope.passes[0]
-                assert isinstance(compute_pass, ComputePass)
-                compute_pass.execute(ComputeEncoder(), resources)
-                continue
-            for index, execution_pass in enumerate(scope.passes):
-                assert isinstance(execution_pass, RenderPass)
-                encoder = GraphicsEncoder(
-                    execution_pass,
-                    first_in_scope=index == 0,
-                    last_in_scope=index == len(scope.passes) - 1,
-                )
-                execution_pass.execute(encoder, resources)
-
-
-def _can_fuse(left: ExecutionPass, right: ExecutionPass) -> bool:
-    if not isinstance(left, RenderPass) or not isinstance(right, RenderPass) or left.no_merge or right.no_merge:
-        return False
-    if left._target is None or right._target is None:
-        return False
-    left_colors = tuple((location, id(use.texture)) for location, use in sorted(left._colors.items()))
-    right_colors = tuple((location, id(use.texture)) for location, use in sorted(right._colors.items()))
-    return (
-        left_colors == right_colors
-        and bool(left._depth) == bool(right._depth)
-        and (left._depth is None or left._depth.target is right._depth.target)
-        and left._target.shape == right._target.shape
-        and left._render_area == right._render_area
-    )
+        native_graph.execute()
 
 
 __all__ = [

@@ -53,7 +53,7 @@ TEST(VulkanNativeInterop, BorrowsObjectsWithoutOwningTheirLifetime) {
     deviceDescriptor.physical_device = owner.physicalDevice;
     deviceDescriptor.device = owner.device;
     deviceDescriptor.queue = owner.queue;
-    deviceDescriptor.command_buffer = owner.frames[0].command;
+    deviceDescriptor.command_buffer = owner.frame.command;
     deviceDescriptor.queue_family_index = owner.queueFamily;
     deviceDescriptor.queue_capabilities = VERNON_RHI_QUEUE_COMPUTE | VERNON_RHI_QUEUE_GRAPHICS;
     const VernonRhiDevice device = vernonRhiCreateBorrowedVulkanDevice(&deviceDescriptor);
@@ -102,7 +102,7 @@ TEST(VulkanNativeInterop, BorrowsObjectsWithoutOwningTheirLifetime) {
     EXPECT_EQ(vernonRhiVulkanDeviceGetBorrowedQueue(device, &native), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(native, owner.queue);
     EXPECT_EQ(vernonRhiVulkanDeviceGetBorrowedCommandBuffer(device, &native), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(native, owner.frames[0].command);
+    EXPECT_EQ(native, owner.frame.command);
     uint64_t nativeBits = 0;
     EXPECT_EQ(vernonRhiVulkanDeviceGetBufferNativeHandle(device, importedBuffer, &nativeBits), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(nativeBits, handleBits(buffer.buffer));

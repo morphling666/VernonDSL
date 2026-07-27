@@ -117,6 +117,7 @@ bool Driver::loadDevice(VkDevice device) {
     VERNON_LOAD_VULKAN_DEVICE(cmdCopyImageToBuffer, "vkCmdCopyImageToBuffer");
     VERNON_LOAD_VULKAN_DEVICE(cmdBeginRenderPass, "vkCmdBeginRenderPass");
     VERNON_LOAD_VULKAN_DEVICE(cmdEndRenderPass, "vkCmdEndRenderPass");
+    VERNON_LOAD_VULKAN_DEVICE(cmdClearAttachments, "vkCmdClearAttachments");
     VERNON_LOAD_VULKAN_DEVICE(cmdSetViewport, "vkCmdSetViewport");
     VERNON_LOAD_VULKAN_DEVICE(cmdSetScissor, "vkCmdSetScissor");
     VERNON_LOAD_VULKAN_DEVICE(cmdBindVertexBuffers, "vkCmdBindVertexBuffers");

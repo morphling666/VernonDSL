@@ -77,11 +77,6 @@ VernonStatus invokeBackendComputePipeline(VernonLoadedPipeline &pipeline, const 
     return invokeOpenGLComputePipeline(pipeline, plan);
 }
 
-VernonStatus backendComputeToGraphicsBarrier(VernonRuntimeContext &context) {
-    return isOpenGLBackend(context.backend) ? openGLComputeToGraphicsBarrier(context)
-                                            : VERNON_STATUS_UNSUPPORTED_TARGET;
-}
-
 VernonStatus synchronizeBackend(VernonRuntimeContext &context) {
     if (context.backend == VERNON_RUNTIME_CPU)
         return VERNON_STATUS_OK;

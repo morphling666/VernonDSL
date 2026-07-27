@@ -1,13 +1,13 @@
 #ifndef VERNON_RUNTIME_RHI_ADAPTER_COMMON_H
 #define VERNON_RUNTIME_RHI_ADAPTER_COMMON_H
 
+#include "../../rhi/rhi_internal.h"
 #include "adapter_internal.h"
 #include "adapter_test_hooks.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -43,14 +43,7 @@ struct VernonRuntimeRhiAdapter {
     bool openGLViewportValid{};
     bool openGLScissorValid{};
 #if defined(VERNON_HAS_DIRECTX12_RHI)
-    struct RetainedDirectX12Resource {
-        // RHI slot addresses may be reused before RuntimeCore releases an old binding.
-        // Keep native COM references in retain order so release never dereferences that slot.
-        std::deque<ID3D12Resource *> resources;
-    };
     vernon::rhi::directx12::DeviceState *directX12Device{};
-    std::mutex directX12RetainedResourceMutex;
-    std::unordered_map<uint64_t, RetainedDirectX12Resource> directX12RetainedResources;
 #endif
 #if defined(VERNON_HAS_VULKAN_RHI)
     vernon::rhi::vulkan::DeviceState *vulkanDevice{};
@@ -81,6 +74,33 @@ template <typename Object> Object *fromHandle(VernonRuntimeProviderObject handle
 
 VernonStatus fail(VernonRuntimeRhiAdapter &adapter, std::string message,
                   VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT);
+bool retainRhiResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderResourceReference resource);
+void releaseRhiResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderResourceReference resource);
+uint64_t resolveRhiResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderResourceReference resource);
+uint64_t nativeCommandEncoder(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder);
+bool commandEncoderRendering(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder);
+bool commandEncoderHasRenderingDescriptor(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder);
+bool commandColorOperations(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder, size_t index,
+                            VernonRhiLoadOperation &load, VernonRhiStoreOperation &store, float clear[4]);
+bool commandDepthOperations(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                            VernonRhiLoadOperation &depthLoad, VernonRhiStoreOperation &depthStore,
+                            VernonRhiLoadOperation &stencilLoad, VernonRhiStoreOperation &stencilStore,
+                            float &clearDepth, uint32_t &clearStencil);
+int claimCommandRendering(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder, uint32_t backendKind);
+uint64_t commandRenderingObject(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                uint64_t candidate);
+bool recordProviderCommand(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder, bool draw);
+bool recordCommandWriteResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                VernonRuntimeProviderResourceReference resource);
+bool retainCommandResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                           VernonRuntimeProviderResourceReference resource);
+bool deferCommandCleanup(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder, void *context,
+                         uint64_t object, void (*cleanup)(void *, uint64_t));
+bool deferCommandRollback(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder, void *context,
+                          uint64_t object, void (*rollback)(void *, uint64_t));
+bool setCommandRenderingTargets(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                const uint64_t *colors, const uint64_t *resources, size_t colorCount, uint64_t depth,
+                                uint64_t depthResource);
 
 #if defined(VERNON_HAS_CUDA_RHI)
 void initializeCudaProvider(VernonRuntimeRhiAdapter &adapter);

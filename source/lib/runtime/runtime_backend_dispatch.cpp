@@ -166,6 +166,13 @@ VernonStatus referenceBackendRhiSampler(VernonRuntimeContext &context, VernonRhi
                    : VERNON_STATUS_INVALID_ARGUMENT;
 }
 
+VernonStatus referenceBackendCommandEncoder(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
+                                            VernonRuntimeProviderObject &output) {
+    VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context);
+    return adapter ? vernonRuntimeRhiAdapterReferenceCommandEncoder(adapter, encoder, &output)
+                   : VERNON_STATUS_INVALID_ARGUMENT;
+}
+
 bool probeBackend(VernonRuntimeBackend backend, std::string &diagnostic) {
     auto probeRhi = [&](VernonRhiBackend rhiBackend) {
         VernonRhiOwnedDeviceDescriptor descriptor{};

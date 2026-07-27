@@ -191,7 +191,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(firstStats.descriptorSetLayoutCreations, 1u);
     EXPECT_EQ(firstStats.pipelineLayoutCreations, 1u);
     EXPECT_EQ(firstStats.graphicsPipelineCreations, 1u);
-    EXPECT_EQ(firstStats.commandBufferAllocations, 3u);
+    EXPECT_EQ(firstStats.commandBufferAllocations, 1u);
     EXPECT_EQ(firstStats.descriptorPoolCreations, 1u);
     EXPECT_GT(firstStats.stagingBufferAllocations, 0u);
     EXPECT_EQ(firstStats.renderPassCreations, firstStats.dynamicRendering ? 0u : 1u);
@@ -285,10 +285,14 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     auto buffer =
         vernon::tests::createBuffer(context, sizeof(source), alignof(float), VERNON_RHI_BUFFER_STORAGE, source.data());
     ASSERT_NE(buffer.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    auto secondBuffer =
+        vernon::tests::createBuffer(context, sizeof(source), alignof(float), VERNON_RHI_BUFFER_STORAGE, source.data());
+    ASSERT_NE(secondBuffer.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     constexpr uint64_t shape[]{4};
     constexpr uint64_t scalarShape[]{1};
     constexpr int64_t strides[]{sizeof(float)};
     constexpr float factor = 3.0f;
+    constexpr float secondFactor = 5.0f;
     VernonPipelineArgument arguments[2]{};
     arguments[0].slot = valuesParameter.slot;
     arguments[0].kind = VERNON_PIPELINE_TENSOR;
@@ -318,13 +322,32 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     invocation.arguments = arguments;
     invocation.argument_count = std::size(arguments);
     invocation.compute_grid = {4, 1, 1};
-    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
+    VernonRhiCommandEncoderDescriptor encoderDescriptor{};
+    encoderDescriptor.struct_size = sizeof(encoderDescriptor);
+    encoderDescriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE;
+    VernonRhiCommandEncoder encoder{};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(context.device, &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
+    VernonRuntimeProviderObject providerEncoder{};
+    ASSERT_EQ(vernonRuntimeReferenceRhiCommandEncoder(runtime, encoder, &providerEncoder), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimePipelineEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
+    arguments[0].tensor.resource = secondBuffer.reference;
+    arguments[1].tensor.host_data = &secondFactor;
+    ASSERT_EQ(vernonRuntimePipelineEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_OK)
+        << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
+    ASSERT_EQ(vernonRhiCommandEncoderFinish(context.device, encoder), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceSubmit(context.device, encoder), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyCommandEncoder(context.device, encoder), VERNON_RHI_STATUS_OK);
     std::array<float, 4> output{};
     ASSERT_EQ(vernonRhiDeviceDownloadBuffer(context.device, buffer.handle, 0, output.data(), sizeof(output)),
               VERNON_RHI_STATUS_OK);
     for (size_t index = 0; index < output.size(); ++index)
         EXPECT_EQ(output[index], source[index] * factor);
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(context.device, secondBuffer.handle, 0, output.data(), sizeof(output)),
+              VERNON_RHI_STATUS_OK);
+    for (size_t index = 0; index < output.size(); ++index)
+        EXPECT_EQ(output[index], source[index] * secondFactor);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(context.device, secondBuffer.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(context.device, buffer.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     vernonRuntimePipelineBundleDestroy(loaded);

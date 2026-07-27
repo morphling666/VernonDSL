@@ -43,6 +43,7 @@ constexpr Enum kTexture0 = 0x84C0;
 constexpr Enum kFramebuffer = 0x8D40;
 constexpr Enum kColorAttachment0 = 0x8CE0;
 constexpr Enum kDepthAttachment = 0x8D00;
+constexpr Enum kStencilAttachment = 0x8D20;
 constexpr Enum kFramebufferComplete = 0x8CD5;
 constexpr Enum kColor = 0x1800;
 constexpr Enum kDepth = 0x1801;
@@ -55,6 +56,13 @@ constexpr Enum kPoints = 0x0000;
 constexpr Enum kNone = 0;
 constexpr unsigned kShaderStorageBarrierBit = 0x00002000;
 constexpr unsigned kVertexAttribArrayBarrierBit = 0x00000001;
+constexpr unsigned kElementArrayBarrierBit = 0x00000002;
+constexpr unsigned kUniformBarrierBit = 0x00000004;
+constexpr unsigned kTextureFetchBarrierBit = 0x00000008;
+constexpr unsigned kShaderImageAccessBarrierBit = 0x00000020;
+constexpr unsigned kTextureUpdateBarrierBit = 0x00000100;
+constexpr unsigned kBufferUpdateBarrierBit = 0x00000200;
+constexpr unsigned kFramebufferBarrierBit = 0x00000400;
 
 #if defined(_WIN32)
 #define VERNON_GL_CALL __stdcall

@@ -3,6 +3,7 @@
 #include "../../rhi/rhi_internal.h"
 
 #include <new>
+#include <optional>
 #include <utility>
 
 namespace vernon::runtime::rhi_adapter {
@@ -132,11 +133,11 @@ uint64_t resourceIdentity(const VernonRuntimeRhiAdapter &adapter, uint64_t direc
     switch (adapter.rhiBackend) {
 #if defined(VERNON_HAS_CUDA_RHI)
     case VERNON_RHI_BACKEND_CUDA:
-        return reinterpret_cast<uintptr_t>(adapter.device);
+        return reinterpret_cast<uintptr_t>(adapter.device) | directX12Kind;
 #endif
 #if defined(VERNON_HAS_VULKAN_RHI)
     case VERNON_RHI_BACKEND_VULKAN:
-        return reinterpret_cast<uintptr_t>(adapter.vulkanDevice);
+        return reinterpret_cast<uintptr_t>(adapter.vulkanDevice) | directX12Kind;
 #endif
 #if defined(VERNON_HAS_DIRECTX12_RHI)
     case VERNON_RHI_BACKEND_DIRECTX12:
@@ -144,12 +145,118 @@ uint64_t resourceIdentity(const VernonRuntimeRhiAdapter &adapter, uint64_t direc
 #endif
     case VERNON_RHI_BACKEND_OPENGL:
     case VERNON_RHI_BACKEND_OPENGL_ES:
-        return reinterpret_cast<uintptr_t>(adapter.openGLDevice);
+        return reinterpret_cast<uintptr_t>(adapter.openGLDevice) | directX12Kind;
     }
     return 0;
 }
 
 } // namespace
+
+namespace vernon::runtime::rhi_adapter {
+
+namespace {
+
+std::optional<vernon::rhi::ResourceKind> resourceKind(const VernonRuntimeRhiAdapter &adapter,
+                                                      VernonRuntimeProviderResourceReference resource) {
+    const uint64_t encodedKind = resource.identity & kDirectX12ResourceKindMask;
+    if (resource.identity != resourceIdentity(adapter, encodedKind) || resource.resource.value == 0)
+        return std::nullopt;
+    if (encodedKind == kDirectX12BufferResource)
+        return vernon::rhi::ResourceKind::Buffer;
+    if (encodedKind == kDirectX12ImageResource)
+        return vernon::rhi::ResourceKind::Image;
+    if (encodedKind == kDirectX12SamplerResource)
+        return vernon::rhi::ResourceKind::Sampler;
+    return std::nullopt;
+}
+
+} // namespace
+
+bool retainRhiResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderResourceReference resource) {
+    const auto kind = resourceKind(adapter, resource);
+    return kind && vernon::rhi::retainResource(adapter.rhiDevice, *kind, resource.resource.value);
+}
+
+void releaseRhiResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderResourceReference resource) {
+    const auto kind = resourceKind(adapter, resource);
+    if (kind)
+        vernon::rhi::releaseResource(adapter.rhiDevice, *kind, resource.resource.value);
+}
+
+uint64_t resolveRhiResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderResourceReference resource) {
+    const auto kind = resourceKind(adapter, resource);
+    return kind ? vernon::rhi::resolveResource(adapter.rhiDevice, *kind, resource.resource.value) : 0;
+}
+
+uint64_t nativeCommandEncoder(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder) {
+    return vernon::rhi::commandEncoderNative(adapter.rhiDevice, encoder.value, adapter.rhiBackend);
+}
+
+bool commandEncoderRendering(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder) {
+    return vernon::rhi::commandEncoderRendering(adapter.rhiDevice, encoder.value);
+}
+
+bool commandEncoderHasRenderingDescriptor(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder) {
+    return vernon::rhi::commandEncoderHasRenderingDescriptor(adapter.rhiDevice, encoder.value);
+}
+
+bool commandColorOperations(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder, size_t index,
+                            VernonRhiLoadOperation &load, VernonRhiStoreOperation &store, float clear[4]) {
+    return vernon::rhi::commandColorOperations(adapter.rhiDevice, encoder.value, index, load, store, clear);
+}
+
+bool commandDepthOperations(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                            VernonRhiLoadOperation &depthLoad, VernonRhiStoreOperation &depthStore,
+                            VernonRhiLoadOperation &stencilLoad, VernonRhiStoreOperation &stencilStore,
+                            float &clearDepth, uint32_t &clearStencil) {
+    return vernon::rhi::commandDepthOperations(adapter.rhiDevice, encoder.value, depthLoad, depthStore, stencilLoad,
+                                               stencilStore, clearDepth, clearStencil);
+}
+
+int claimCommandRendering(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder, uint32_t backendKind) {
+    return vernon::rhi::claimCommandRendering(adapter.rhiDevice, encoder.value, backendKind);
+}
+
+uint64_t commandRenderingObject(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                uint64_t candidate) {
+    return vernon::rhi::commandRenderingObject(adapter.rhiDevice, encoder.value, candidate);
+}
+
+bool recordProviderCommand(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder, bool draw) {
+    return vernon::rhi::recordProviderCommand(adapter.rhiDevice, encoder.value, draw);
+}
+
+bool recordCommandWriteResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                VernonRuntimeProviderResourceReference resource) {
+    const auto kind = resourceKind(adapter, resource);
+    return kind &&
+           vernon::rhi::recordCommandWriteResource(adapter.rhiDevice, encoder.value, *kind, resource.resource.value);
+}
+
+bool retainCommandResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                           VernonRuntimeProviderResourceReference resource) {
+    const auto kind = resourceKind(adapter, resource);
+    return kind && vernon::rhi::retainCommandResource(adapter.rhiDevice, encoder.value, *kind, resource.resource.value);
+}
+
+bool deferCommandCleanup(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder, void *context,
+                         uint64_t object, void (*cleanup)(void *, uint64_t)) {
+    return vernon::rhi::deferCommandCleanup(adapter.rhiDevice, encoder.value, context, object, cleanup);
+}
+
+bool deferCommandRollback(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder, void *context,
+                          uint64_t object, void (*rollback)(void *, uint64_t)) {
+    return vernon::rhi::deferCommandRollback(adapter.rhiDevice, encoder.value, context, object, rollback);
+}
+
+bool setCommandRenderingTargets(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                const uint64_t *colors, const uint64_t *resources, size_t colorCount, uint64_t depth,
+                                uint64_t depthResource) {
+    return vernon::rhi::setCommandRenderingTargets(adapter.rhiDevice, encoder.value, colors, resources, colorCount,
+                                                   depth, depthResource);
+}
+
+} // namespace vernon::runtime::rhi_adapter
 
 extern "C" VernonStatus vernonRuntimeRhiAdapterReferenceBuffer(const VernonRuntimeRhiAdapter *adapter,
                                                                VernonRhiBuffer buffer, uint64_t offset, uint64_t size,
@@ -188,6 +295,15 @@ extern "C" VernonStatus vernonRuntimeRhiAdapterReferenceSampler(const VernonRunt
         return VERNON_STATUS_INVALID_ARGUMENT;
     *output = {resourceIdentity(*adapter, kDirectX12SamplerResource), {resource}, 0, 0};
     return VERNON_STATUS_OK;
+}
+
+extern "C" VernonStatus vernonRuntimeRhiAdapterReferenceCommandEncoder(const VernonRuntimeRhiAdapter *adapter,
+                                                                       VernonRhiCommandEncoder encoder,
+                                                                       VernonRuntimeProviderObject *output) {
+    if (!adapter || !output)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    output->value = vernon::rhi::commandEncoderKey(adapter->rhiDevice, encoder);
+    return output->value ? VERNON_STATUS_OK : VERNON_STATUS_INVALID_ARGUMENT;
 }
 
 namespace vernon::runtime {

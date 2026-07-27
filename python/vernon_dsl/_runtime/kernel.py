@@ -28,6 +28,19 @@ def _session_state() -> Any:
     return importlib.import_module("vernon_dsl._runtime.session")
 
 
+class _ImmediateComputePass(ComputePass):
+    def __init__(self, name: str, invocation: PipelineInvocation):
+        super().__init__(name)
+        self._invocation = invocation
+
+    def declare(self) -> None:
+        self._invocation.declare(self)
+        self.side_effect = True
+
+    def execute(self, encoder: ComputeEncoder, resources: ExecutionResources) -> None:
+        self._invocation.encode(encoder, resources)
+
+
 @dataclass
 class _CompiledKernel:
     mlir: str
@@ -472,6 +485,7 @@ class Kernel:
         arguments: tuple[Any, ...],
         grid: tuple[int, int, int] | None,
         features: tuple[str, ...] = (),
+        encoder: ComputeEncoder | None = None,
     ) -> None:
         state = _session_state()
         compiled = self._compile(arguments, features)
@@ -515,7 +529,11 @@ class Kernel:
                     value,
                     host_value=user_name in static_tensor_names,
                 )
-            builder.grid(*grid).invoke()
+            builder.grid(*grid)
+            if encoder is None:
+                builder.invoke()
+            else:
+                builder.encode(encoder._native)
             for name, value in zip(user_parameters, arguments, strict=True):
                 if (
                     state._architecture != state.cpu
@@ -530,24 +548,36 @@ class Kernel:
         grid: tuple[int, int, int] | None = None,
         features: tuple[str, ...] = (),
     ) -> None:
+        state = _session_state()
+        if state._architecture == state.cpu:
+            self._invoke_direct(tuple(arguments), grid, features)
+            return
         invocation = self.invocation(*arguments, grid=grid, features=features)
 
-        class _ImmediateComputePass(ComputePass):
-            def declare(self) -> None:
-                for value in arguments:
-                    if isinstance(value, (TensorStorage, TensorView)):
-                        if getattr(value, "access", "read_write") == "read":
-                            self.read(value)
-                        else:
-                            self.read_write(value)
-                self.side_effect = True
-
-            def execute(self, encoder: ComputeEncoder, resources: ExecutionResources) -> None:
-                invocation.encode(encoder, resources)
-
         graph = ExecutionGraph()
-        graph.add_pass(_ImmediateComputePass(f"{self.__name__} immediate"))
-        graph.execute()
+        graph.add_pass(_ImmediateComputePass(f"{self.__name__} immediate", invocation))
+        try:
+            graph.execute()
+        finally:
+            graph._dispose_native()
+
+    def _declare_invocation(
+        self,
+        arguments: tuple[Any, ...],
+        features: tuple[str, ...],
+        execution_pass: ComputePass,
+    ) -> None:
+        state = _session_state()
+        compiled = self._compile(arguments, features)
+        for parameter, value in zip(compiled.native.parameters, arguments, strict=True):
+            if not isinstance(value, (TensorStorage, TensorView)):
+                continue
+            if parameter.access == state._native.ACCESS_READ:
+                execution_pass.read(value)
+            elif parameter.access == state._native.ACCESS_WRITE:
+                execution_pass.write(value)
+            else:
+                execution_pass.read_write(value)
 
     def invocation(
         self,
@@ -558,7 +588,8 @@ class Kernel:
         captured = tuple(arguments)
         return PipelineInvocation(
             "compute",
-            lambda encoder: self._invoke_direct(captured, grid, features),
+            lambda encoder: self._invoke_direct(captured, grid, features, encoder),
+            lambda execution_pass: self._declare_invocation(captured, features, execution_pass),
         )
 
 

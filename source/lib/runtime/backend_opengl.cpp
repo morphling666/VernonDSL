@@ -18,15 +18,6 @@ bool isOpenGL(const VernonRuntimeContext *context) {
 
 void makeCurrent(VernonRuntimeContext *context) { openGLState(*context).device.makeCurrent(); }
 
-VernonStatus openGLComputeToGraphicsBarrier(VernonRuntimeContext &context) {
-    rhi::opengl::Driver &gl = openGLState(context).driver;
-    if (!gl.memoryBarrier)
-        return VERNON_STATUS_UNSUPPORTED_TARGET;
-    makeCurrent(&context);
-    gl.memoryBarrier(rhi::opengl::kShaderStorageBarrierBit | rhi::opengl::kVertexAttribArrayBarrierBit);
-    return VERNON_STATUS_OK;
-}
-
 VernonStatus synchronizeOpenGL(VernonRuntimeContext &context) {
     makeCurrent(&context);
     openGLState(context).driver.finish();

@@ -6,6 +6,7 @@
 #include <cstring>
 #include <mutex>
 #include <new>
+#include <unordered_map>
 #include <vector>
 
 namespace vernon::runtime::rhi_adapter {
@@ -25,12 +26,14 @@ struct PreparedLayout {
 };
 
 struct PreparedPipeline {
+    std::atomic<uint32_t> references{1};
     PreparedFunction function;
     DeviceState *device{};
     uint32_t workgroup[3]{1, 1, 1};
 };
 
 struct PreparedBindingSet {
+    std::atomic<uint32_t> references{1};
     struct MemRefDescriptor {
         DevicePointer allocated{};
         DevicePointer aligned{};
@@ -43,12 +46,37 @@ struct PreparedBindingSet {
         size_t parameterOffset{};
         size_t descriptorOffset{};
         std::vector<uint8_t> inlineStorage;
+        VernonRuntimeProviderResourceReference resourceReference{};
     };
     std::vector<Slot> slots;
+    std::unordered_map<uint32_t, size_t> slotIndices;
+    std::vector<size_t> valueIndices;
+    std::vector<uint8_t> seenSlots;
+    std::vector<DevicePointer> resolvedValues;
     std::vector<MemRefDescriptor> descriptors;
     std::vector<void *> parameters;
     std::mutex mutex;
 };
+
+void releaseCommandBindings(void *context, uint64_t);
+void releaseCommandPipeline(void *context, uint64_t);
+
+bool retainCommandObjects(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                          PreparedPipeline &pipeline, PreparedBindingSet *bindings) {
+    pipeline.references.fetch_add(1, std::memory_order_relaxed);
+    if (!deferCommandCleanup(adapter, encoder, &pipeline, 0, releaseCommandPipeline)) {
+        releaseCommandPipeline(&pipeline, 0);
+        return false;
+    }
+    if (bindings) {
+        bindings->references.fetch_add(1, std::memory_order_relaxed);
+        if (!deferCommandCleanup(adapter, encoder, bindings, 0, releaseCommandBindings)) {
+            releaseCommandBindings(bindings, 0);
+            return false;
+        }
+    }
+    return true;
+}
 
 VernonStatus cudaStatus(VernonRuntimeRhiAdapter &adapter, rhi::cuda::Result result, const char *operation) {
     return result == rhi::cuda::kSuccess
@@ -144,33 +172,50 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
 
 VernonStatus retainResource(void *data, VernonRuntimeProviderResourceReference resource) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return resource.identity != 0 && resource.resource.value != 0
-               ? VERNON_STATUS_OK
-               : fail(adapter, "CUDA adapter received an invalid resource reference");
+    return retainRhiResource(adapter, resource) ? VERNON_STATUS_OK
+                                                : fail(adapter, "CUDA adapter received a stale resource");
 }
 
-void releaseResource(void *, VernonRuntimeProviderResourceReference) {}
+void releaseResource(void *data, VernonRuntimeProviderResourceReference resource) {
+    releaseRhiResource(*static_cast<VernonRuntimeRhiAdapter *>(data), resource);
+}
 
 VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindingSet &bindings,
                                 const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
     if (valueCount != bindings.slots.size() || (valueCount != 0 && !values))
         return fail(adapter, "CUDA binding values do not match the prepared layout");
-    for (PreparedBindingSet::Slot &slot : bindings.slots) {
-        const auto value = std::find_if(values, values + valueCount,
-                                        [&slot](const auto &candidate) { return candidate.slot == slot.layout.slot; });
-        if (value == values + valueCount || value->kind != slot.layout.kind)
+    std::fill(bindings.seenSlots.begin(), bindings.seenSlots.end(), uint8_t{0});
+    for (size_t index = 0; index < valueCount; ++index) {
+        const auto found = bindings.slotIndices.find(values[index].slot);
+        if (found == bindings.slotIndices.end() || bindings.seenSlots[found->second])
+            return fail(adapter, "CUDA binding slot is invalid or duplicated");
+        bindings.seenSlots[found->second] = 1;
+        bindings.valueIndices[found->second] = index;
+    }
+    for (size_t index = 0; index < bindings.slots.size(); ++index) {
+        const auto &slot = bindings.slots[index];
+        const auto *value = &values[bindings.valueIndices[index]];
+        if (value->kind != slot.layout.kind)
             return fail(adapter, "CUDA binding slot or kind does not match the prepared layout");
         if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            if (!value->resource.resource.value || value->resource.size == 0)
+            const DevicePointer resource = resolveRhiResource(adapter, value->resource);
+            if (!resource || value->resource.size == 0)
                 return fail(adapter, "CUDA storage-buffer binding is invalid");
-            const DevicePointer pointer = value->resource.resource.value + value->resource.offset;
+            bindings.resolvedValues[index] = resource + value->resource.offset;
+        } else if (!value->inline_data || value->inline_size != slot.inlineStorage.size())
+            return fail(adapter, "CUDA inline binding size changed after preparation");
+    }
+    for (size_t index = 0; index < bindings.slots.size(); ++index) {
+        auto &slot = bindings.slots[index];
+        const auto *value = &values[bindings.valueIndices[index]];
+        slot.resourceReference = {};
+        if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
+            const DevicePointer pointer = bindings.resolvedValues[index];
             bindings.descriptors[slot.descriptorOffset] = {pointer, pointer, 0,
                                                            value->resource.size / slot.layout.element_size, 1};
-        } else {
-            if (!value->inline_data || value->inline_size != slot.inlineStorage.size())
-                return fail(adapter, "CUDA inline binding size changed after preparation");
+            slot.resourceReference = value->resource;
+        } else
             std::memcpy(slot.inlineStorage.data(), value->inline_data, value->inline_size);
-        }
     }
     return VERNON_STATUS_OK;
 }
@@ -186,24 +231,42 @@ VernonStatus createBindingSet(void *data, const VernonRuntimeProviderBindingSetD
         size_t descriptorCount = 0;
         size_t parameterCount = 0;
         bindings->slots.reserve(layout->entries.size());
-        for (const auto &entry : layout->entries) {
+        bindings->slotIndices.reserve(layout->entries.size());
+        bindings->valueIndices.resize(layout->entries.size());
+        bindings->seenSlots.resize(layout->entries.size());
+        bindings->resolvedValues.resize(layout->entries.size());
+        for (size_t index = 0; index < layout->entries.size(); ++index) {
+            const auto &entry = layout->entries[index];
             PreparedBindingSet::Slot slot;
             slot.layout = entry;
+            if (!bindings->slotIndices.emplace(entry.slot, index).second)
+                return fail(adapter, "CUDA binding layout contains duplicate slots");
             slot.parameterOffset = parameterCount;
             if (entry.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
                 slot.descriptorOffset = descriptorCount++;
                 parameterCount += 5;
-            } else {
-                const auto value =
-                    std::find_if(descriptor->values, descriptor->values + descriptor->value_count,
-                                 [&entry](const auto &candidate) { return candidate.slot == entry.slot; });
-                if (value == descriptor->values + descriptor->value_count || !value->inline_data ||
-                    value->inline_size == 0)
-                    return fail(adapter, "CUDA inline binding requires initial storage");
-                slot.inlineStorage.resize(value->inline_size);
+            } else
                 ++parameterCount;
-            }
             bindings->slots.push_back(std::move(slot));
+        }
+        if (descriptor->value_count != bindings->slots.size() || (descriptor->value_count != 0 && !descriptor->values))
+            return fail(adapter, "CUDA binding values do not match the prepared layout");
+        std::fill(bindings->seenSlots.begin(), bindings->seenSlots.end(), uint8_t{0});
+        for (size_t index = 0; index < descriptor->value_count; ++index) {
+            const auto found = bindings->slotIndices.find(descriptor->values[index].slot);
+            if (found == bindings->slotIndices.end() || bindings->seenSlots[found->second])
+                return fail(adapter, "CUDA binding slot is invalid or duplicated");
+            bindings->seenSlots[found->second] = 1;
+            bindings->valueIndices[found->second] = index;
+        }
+        for (size_t index = 0; index < bindings->slots.size(); ++index) {
+            auto &slot = bindings->slots[index];
+            if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER)
+                continue;
+            const auto &value = descriptor->values[bindings->valueIndices[index]];
+            if (!value.inline_data || value.inline_size == 0)
+                return fail(adapter, "CUDA inline binding requires initial storage");
+            slot.inlineStorage.resize(value.inline_size);
         }
         bindings->descriptors.resize(descriptorCount);
         bindings->parameters.resize(parameterCount);
@@ -239,7 +302,7 @@ VernonStatus updateBindingSet(void *data, VernonRuntimeProviderObject handle,
     return updateBindingsImpl(adapter, *bindings, values, valueCount);
 }
 
-VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject,
+VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject commandEncoder,
                             const VernonRuntimeProviderDispatchDescriptor *descriptor) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     PreparedPipeline *pipeline = descriptor ? fromHandle<PreparedPipeline>(descriptor->pipeline) : nullptr;
@@ -247,14 +310,26 @@ VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject,
     if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !pipeline ||
         (!bindings && descriptor->bindings.value != 0))
         return fail(adapter, "CUDA adapter received an invalid dispatch");
+    if (nativeCommandEncoder(adapter, commandEncoder) != reinterpret_cast<uintptr_t>(pipeline->device) ||
+        commandEncoderRendering(adapter, commandEncoder))
+        return fail(adapter, "CUDA dispatch command encoder is invalid");
+    if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
+        return fail(adapter, "CUDA dispatch could not retain provider objects", VERNON_STATUS_INTERNAL_ERROR);
     std::unique_lock<std::mutex> guard;
     if (bindings)
         guard = std::unique_lock<std::mutex>(bindings->mutex);
+    if (bindings)
+        for (const auto &slot : bindings->slots)
+            if (slot.resourceReference.resource.value &&
+                !retainCommandResource(adapter, commandEncoder, slot.resourceReference))
+                return fail(adapter, "CUDA dispatch could not retain its resources", VERNON_STATUS_INTERNAL_ERROR);
     const VernonStatus status =
         cudaStatus(adapter,
                    pipeline->function.launch(*pipeline->device, descriptor->group_count, pipeline->workgroup,
                                              bindings ? bindings->parameters.data() : nullptr),
                    "cuLaunchKernel");
+    if (status == VERNON_STATUS_OK && !recordProviderCommand(adapter, commandEncoder, false))
+        return fail(adapter, "CUDA dispatch command encoder state changed");
     if (status == VERNON_STATUS_OK)
         adapter.dispatches.fetch_add(1, std::memory_order_relaxed);
     return status;
@@ -267,13 +342,23 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject, const VernonRun
 
 void destroyShader(void *, VernonRuntimeProviderObject handle) { delete fromHandle<PreparedShader>(handle); }
 void destroyLayout(void *, VernonRuntimeProviderObject handle) { delete fromHandle<PreparedLayout>(handle); }
-void destroyBindingSet(void *, VernonRuntimeProviderObject handle) { delete fromHandle<PreparedBindingSet>(handle); }
-void destroyPipeline(void *, VernonRuntimeProviderObject handle) {
-    auto *pipeline = fromHandle<PreparedPipeline>(handle);
-    if (!pipeline)
+void releaseCommandBindings(void *context, uint64_t) {
+    auto *bindings = static_cast<PreparedBindingSet *>(context);
+    if (bindings && bindings->references.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        delete bindings;
+}
+void destroyBindingSet(void *, VernonRuntimeProviderObject handle) {
+    releaseCommandBindings(fromHandle<PreparedBindingSet>(handle), 0);
+}
+void releaseCommandPipeline(void *context, uint64_t) {
+    auto *pipeline = static_cast<PreparedPipeline *>(context);
+    if (!pipeline || pipeline->references.fetch_sub(1, std::memory_order_acq_rel) != 1)
         return;
     pipeline->function.destroy(*pipeline->device);
     delete pipeline;
+}
+void destroyPipeline(void *, VernonRuntimeProviderObject handle) {
+    releaseCommandPipeline(fromHandle<PreparedPipeline>(handle), 0);
 }
 
 } // namespace

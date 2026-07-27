@@ -8,6 +8,7 @@
 #include <cstring>
 #include <mutex>
 #include <new>
+#include <unordered_map>
 #include <vector>
 
 namespace vernon::runtime::rhi_adapter {
@@ -27,6 +28,7 @@ struct PreparedPipeline {
         uint32_t rootParameter{};
         uint32_t destinationOffset{};
     };
+    std::atomic<uint32_t> references{1};
     rhi::directx12::DeviceState *device{};
     ID3D12RootSignature *rootSignature{};
     ID3D12PipelineState *pipeline{};
@@ -36,10 +38,12 @@ struct PreparedPipeline {
     std::vector<InlineRootParameter> inlineRootParameters;
 };
 struct PreparedBindingSet {
+    std::atomic<uint32_t> references{1};
     struct Slot {
         VernonRuntimeProviderBindingLayoutEntry layout{};
         ID3D12Resource *resource{};
         void *opaqueResource{};
+        VernonRuntimeProviderResourceReference resourceReference{};
         rhi::directx12::Buffer inlineResource;
         uint64_t offset{};
         uint64_t size{};
@@ -49,8 +53,67 @@ struct PreparedBindingSet {
     };
     rhi::directx12::DeviceState *device{};
     std::vector<Slot> slots;
+    std::unordered_map<uint32_t, size_t> slotIndices;
+    std::vector<size_t> valueIndices;
+    std::vector<uint8_t> seenSlots;
+    std::vector<uint64_t> resolvedValues;
+    uint64_t revision{1};
+    uint64_t descriptorEncoder{};
+    uint64_t descriptorRevision{};
+    ID3D12DescriptorHeap *resourceHeap{};
+    ID3D12DescriptorHeap *samplerHeap{};
+    D3D12_GPU_DESCRIPTOR_HANDLE resourceGpu{};
+    D3D12_GPU_DESCRIPTOR_HANDLE samplerGpu{};
+    uint64_t computeDescriptorEncoder{};
+    uint64_t computeDescriptorRevision{};
+    ID3D12DescriptorHeap *computeResourceHeap{};
+    D3D12_GPU_DESCRIPTOR_HANDLE computeResourceGpu{};
     std::mutex mutex;
 };
+
+void releaseCommandBindings(void *context, uint64_t);
+void releaseCommandPipeline(void *context, uint64_t);
+
+void restoreBufferState(void *context, uint64_t state) {
+    static_cast<rhi::directx12::Buffer *>(context)->state = static_cast<D3D12_RESOURCE_STATES>(state);
+}
+
+void restoreImageState(void *context, uint64_t state) {
+    static_cast<rhi::directx12::Image *>(context)->state = static_cast<D3D12_RESOURCE_STATES>(state);
+}
+
+bool transition(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                ID3D12GraphicsCommandList *commands, rhi::directx12::Buffer &buffer, D3D12_RESOURCE_STATES target) {
+    if (!deferCommandRollback(adapter, encoder, &buffer, static_cast<uint64_t>(buffer.state), restoreBufferState))
+        return false;
+    rhi::directx12::transition(commands, buffer.resource, buffer.state, target);
+    return true;
+}
+
+bool transition(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                ID3D12GraphicsCommandList *commands, rhi::directx12::Image &image, D3D12_RESOURCE_STATES target) {
+    if (!deferCommandRollback(adapter, encoder, &image, static_cast<uint64_t>(image.state), restoreImageState))
+        return false;
+    rhi::directx12::transition(commands, image.resource, image.state, target);
+    return true;
+}
+
+bool retainCommandObjects(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                          PreparedPipeline &pipeline, PreparedBindingSet *bindings) {
+    pipeline.references.fetch_add(1, std::memory_order_relaxed);
+    if (!deferCommandCleanup(adapter, encoder, &pipeline, 0, releaseCommandPipeline)) {
+        releaseCommandPipeline(&pipeline, 0);
+        return false;
+    }
+    if (bindings) {
+        bindings->references.fetch_add(1, std::memory_order_relaxed);
+        if (!deferCommandCleanup(adapter, encoder, bindings, 0, releaseCommandBindings)) {
+            releaseCommandBindings(bindings, 0);
+            return false;
+        }
+    }
+    return true;
+}
 
 template <typename Object> void releaseObject(Object *&object) {
     if (object)
@@ -388,111 +451,129 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
 
 VernonStatus retainResource(void *data, VernonRuntimeProviderResourceReference resource) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    const uint64_t deviceIdentity = reinterpret_cast<uintptr_t>(adapter.directX12Device);
-    const uint64_t kind = resource.identity & kDirectX12ResourceKindMask;
-    if ((resource.identity & ~kDirectX12ResourceKindMask) != deviceIdentity || resource.resource.value == 0)
-        return fail(adapter, "D3D12 adapter received a foreign or invalid resource");
-    ID3D12Resource *native = nullptr;
-    if (kind == kDirectX12ImageResource) {
-        auto *image = fromHandle<rhi::directx12::Image>(resource.resource);
-        if (!image->resource)
-            return fail(adapter, "D3D12 adapter received an invalid image");
-        native = image->resource;
-    } else if (kind == kDirectX12SamplerResource) {
-        if (!fromHandle<rhi::directx12::Sampler>(resource.resource))
-            return fail(adapter, "D3D12 adapter received an invalid sampler");
-        return VERNON_STATUS_OK;
-    } else if (kind == kDirectX12BufferResource) {
-        auto *buffer = fromHandle<rhi::directx12::Buffer>(resource.resource);
-        if (!buffer->resource)
-            return fail(adapter, "D3D12 adapter received an invalid buffer");
-        native = buffer->resource;
-    } else {
-        native = fromHandle<ID3D12Resource>(resource.resource);
-    }
-    std::lock_guard<std::mutex> guard(adapter.directX12RetainedResourceMutex);
-    native->AddRef();
-    try {
-        adapter.directX12RetainedResources[resource.resource.value].resources.push_back(native);
-    } catch (const std::bad_alloc &) {
-        native->Release();
-        auto retained = adapter.directX12RetainedResources.find(resource.resource.value);
-        if (retained != adapter.directX12RetainedResources.end() && retained->second.resources.empty())
-            adapter.directX12RetainedResources.erase(retained);
-        return fail(adapter, "D3D12 retained resource bookkeeping ran out of memory", VERNON_STATUS_INTERNAL_ERROR);
-    }
-    return VERNON_STATUS_OK;
+    return retainRhiResource(adapter, resource) ? VERNON_STATUS_OK
+                                                : fail(adapter, "D3D12 adapter received a stale resource");
 }
 
 void releaseResource(void *data, VernonRuntimeProviderResourceReference resource) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    const uint64_t kind = resource.identity & kDirectX12ResourceKindMask;
-    if (kind == kDirectX12SamplerResource)
-        return;
-    std::lock_guard<std::mutex> guard(adapter.directX12RetainedResourceMutex);
-    auto retained = adapter.directX12RetainedResources.find(resource.resource.value);
-    if (retained == adapter.directX12RetainedResources.end() || retained->second.resources.empty())
-        return;
-    retained->second.resources.front()->Release();
-    retained->second.resources.pop_front();
-    if (retained->second.resources.empty())
-        adapter.directX12RetainedResources.erase(retained);
+    releaseRhiResource(adapter, resource);
 }
 
 VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindingSet &bindings,
                                 const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
     if (valueCount != bindings.slots.size() || (valueCount != 0 && !values))
         return fail(adapter, "D3D12 binding values do not match the prepared layout");
-    for (auto &slot : bindings.slots) {
-        const auto value = std::find_if(values, values + valueCount,
-                                        [&slot](const auto &candidate) { return candidate.slot == slot.layout.slot; });
-        if (value == values + valueCount || value->kind != slot.layout.kind)
+    std::fill(bindings.seenSlots.begin(), bindings.seenSlots.end(), uint8_t{0});
+    for (size_t index = 0; index < valueCount; ++index) {
+        const auto found = bindings.slotIndices.find(values[index].slot);
+        if (found == bindings.slotIndices.end() || bindings.seenSlots[found->second])
+            return fail(adapter, "D3D12 binding slot is invalid or duplicated");
+        bindings.seenSlots[found->second] = 1;
+        bindings.valueIndices[found->second] = index;
+    }
+    for (size_t index = 0; index < bindings.slots.size(); ++index) {
+        auto &slot = bindings.slots[index];
+        const auto *value = &values[bindings.valueIndices[index]];
+        if (value->kind != slot.layout.kind)
             return fail(adapter, "D3D12 binding slot or kind is invalid");
-        slot.flags = value->flags;
         if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
             slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
             if (!value->inline_data || value->inline_size != slot.inlineStorage.size())
                 return fail(adapter, "D3D12 inline or uniform-buffer binding size is invalid");
-            std::memcpy(slot.inlineStorage.data(), value->inline_data, value->inline_size);
+            bindings.resolvedValues[index] = 0;
+        } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
+            const uint64_t native = resolveRhiResource(adapter, value->resource);
+            auto *buffer = reinterpret_cast<rhi::directx12::Buffer *>(native);
+            if ((value->resource.identity & kDirectX12ResourceKindMask) != kDirectX12BufferResource || !buffer ||
+                !buffer->resource || value->resource.offset > value->resource.size ||
+                slot.layout.element_size > value->resource.size - value->resource.offset)
+                return fail(adapter, "D3D12 storage binding is invalid");
+            bindings.resolvedValues[index] = native;
+        } else {
+            const bool defaultSampler = slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER &&
+                                        (value->flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) != 0;
+            if (defaultSampler)
+                bindings.resolvedValues[index] = 0;
+            else {
+                const uint64_t expectedKind =
+                    slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ? kDirectX12ImageResource
+                    : slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER     ? kDirectX12SamplerResource
+                                                                              : kDirectX12BufferResource;
+                const uint64_t native = resolveRhiResource(adapter, value->resource);
+                if ((value->resource.identity & kDirectX12ResourceKindMask) != expectedKind || native == 0 ||
+                    (slot.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && value->stride == 0))
+                    return fail(adapter, "D3D12 graphics resource binding is invalid");
+                bindings.resolvedValues[index] = native;
+            }
+        }
+    }
+    const auto sameResource = [](const VernonRuntimeProviderResourceReference &left,
+                                 const VernonRuntimeProviderResourceReference &right) {
+        return left.identity == right.identity && left.resource.value == right.resource.value &&
+               left.offset == right.offset && left.size == right.size;
+    };
+    bool changed = false;
+    for (size_t index = 0; index < bindings.slots.size(); ++index) {
+        const auto &slot = bindings.slots[index];
+        const auto &value = values[bindings.valueIndices[index]];
+        const bool defaultSampler = slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER &&
+                                    (value.flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) != 0;
+        const VernonRuntimeProviderResourceReference resource =
+            defaultSampler ? VernonRuntimeProviderResourceReference{} : value.resource;
+        changed |= slot.flags != value.flags || !sameResource(slot.resourceReference, resource) ||
+                   slot.stride != value.stride ||
+                   (value.inline_data && std::memcmp(slot.inlineStorage.data(), value.inline_data, value.inline_size));
+    }
+    for (size_t index = 0; index < bindings.slots.size(); ++index) {
+        auto &slot = bindings.slots[index];
+        const auto &value = values[bindings.valueIndices[index]];
+        slot.flags = value.flags;
+        slot.resourceReference = {};
+        if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
+            slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+            std::memcpy(slot.inlineStorage.data(), value.inline_data, value.inline_size);
             slot.resource = slot.inlineResource.resource;
             slot.offset = 0;
             slot.size = slot.inlineStorage.size();
         } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            auto *buffer = fromHandle<rhi::directx12::Buffer>(value->resource.resource);
-            const uint64_t expectedIdentity =
-                reinterpret_cast<uintptr_t>(adapter.directX12Device) | kDirectX12BufferResource;
-            if (value->resource.identity != expectedIdentity || !buffer || !buffer->resource ||
-                value->resource.offset > value->resource.size ||
-                slot.layout.element_size > value->resource.size - value->resource.offset)
-                return fail(adapter, "D3D12 storage binding is invalid");
+            auto *buffer = reinterpret_cast<rhi::directx12::Buffer *>(bindings.resolvedValues[index]);
             slot.resource = buffer->resource;
             slot.opaqueResource = buffer;
-            slot.offset = value->resource.offset;
-            slot.size = value->resource.size - value->resource.offset;
+            slot.resourceReference = value.resource;
+            slot.offset = value.resource.offset;
+            slot.size = value.resource.size - value.resource.offset;
         } else {
-            const bool defaultSampler = slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER &&
-                                        (value->flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) != 0;
-            if (defaultSampler) {
-                slot.opaqueResource = nullptr;
+            slot.opaqueResource = reinterpret_cast<void *>(bindings.resolvedValues[index]);
+            if (!slot.opaqueResource) {
+                slot.offset = 0;
+                slot.size = 0;
+                slot.stride = 0;
                 continue;
             }
-            const uint64_t expectedKind =
-                slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ? kDirectX12ImageResource
-                : slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER     ? kDirectX12SamplerResource
-                                                                          : kDirectX12BufferResource;
-            const uint64_t expectedIdentity = reinterpret_cast<uintptr_t>(adapter.directX12Device) | expectedKind;
-            if (value->resource.identity != expectedIdentity || value->resource.resource.value == 0 ||
-                (slot.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && value->stride == 0))
-                return fail(adapter, "D3D12 graphics resource binding is invalid");
-            slot.opaqueResource = fromHandle<void>(value->resource.resource);
-            slot.offset = value->resource.offset;
-            slot.size = value->resource.size;
-            slot.stride = value->stride;
+            slot.resourceReference = value.resource;
+            slot.offset = value.resource.offset;
+            slot.size = value.resource.size;
+            slot.stride = value.stride;
             if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
                 slot.resource = static_cast<rhi::directx12::Buffer *>(slot.opaqueResource)->resource;
         }
     }
+    if (changed) {
+        if (++bindings.revision == 0)
+            bindings.revision = 1;
+    }
     return VERNON_STATUS_OK;
+}
+
+bool retainBindingResources(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                            const PreparedBindingSet *bindings) {
+    if (!bindings)
+        return true;
+    for (const auto &slot : bindings->slots)
+        if (slot.resourceReference.resource.value && !retainCommandResource(adapter, encoder, slot.resourceReference))
+            return false;
+    return true;
 }
 
 void destroyBindingSetImpl(PreparedBindingSet &bindings) {
@@ -510,9 +591,17 @@ VernonStatus createBindings(void *data, const VernonRuntimeProviderBindingSetDes
         auto bindings = std::make_unique<PreparedBindingSet>();
         bindings->device = adapter.directX12Device;
         bindings->slots.resize(layout->entries.size());
+        bindings->slotIndices.reserve(layout->entries.size());
+        bindings->valueIndices.resize(layout->entries.size());
+        bindings->seenSlots.resize(layout->entries.size());
+        bindings->resolvedValues.resize(layout->entries.size());
         for (size_t index = 0; index < layout->entries.size(); ++index) {
             auto &slot = bindings->slots[index];
             slot.layout = layout->entries[index];
+            if (!bindings->slotIndices.emplace(slot.layout.slot, index).second) {
+                destroyBindingSetImpl(*bindings);
+                return fail(adapter, "D3D12 binding layout contains duplicate slots");
+            }
             if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
                 slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
                 slot.inlineStorage.resize(slot.layout.element_size);
@@ -550,7 +639,7 @@ VernonStatus updateBindings(void *data, VernonRuntimeProviderObject handle,
     return updateBindingsImpl(adapter, *bindings, values, valueCount);
 }
 
-VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject,
+VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject commandEncoder,
                             const VernonRuntimeProviderDispatchDescriptor *descriptor) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     auto *pipeline = descriptor ? fromHandle<PreparedPipeline>(descriptor->pipeline) : nullptr;
@@ -562,54 +651,77 @@ VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject,
     ID3D12DescriptorHeap *heap = nullptr;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
     D3D12_GPU_DESCRIPTOR_HANDLE gpu{};
+    auto *commands = reinterpret_cast<ID3D12GraphicsCommandList *>(nativeCommandEncoder(adapter, commandEncoder));
+    if (!commands || commandEncoderRendering(adapter, commandEncoder))
+        return fail(adapter, "D3D12 dispatch command encoder is invalid");
+    commands->SetPipelineState(pipeline->pipeline);
+    if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
+        return fail(adapter, "D3D12 dispatch could not retain provider objects", VERNON_STATUS_INTERNAL_ERROR);
+    std::unique_lock<std::mutex> bindingGuard;
+    if (bindings)
+        bindingGuard = std::unique_lock<std::mutex>(bindings->mutex);
     const size_t slotCount = bindings ? bindings->slots.size() : 0;
-    if (slotCount && !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, true,
-                                                static_cast<uint32_t>(slotCount), heap, cpu, gpu, adapter.error))
-        return VERNON_STATUS_INTERNAL_ERROR;
-    if (!device.beginCommands(adapter.error, pipeline->pipeline))
+    const bool reuseDescriptors = bindings && bindings->computeDescriptorEncoder == commandEncoder.value &&
+                                  bindings->computeDescriptorRevision == bindings->revision;
+    if (reuseDescriptors) {
+        heap = bindings->computeResourceHeap;
+        gpu = bindings->computeResourceGpu;
+    } else if (slotCount && !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, true,
+                                                       static_cast<uint32_t>(slotCount), heap, cpu, gpu, adapter.error))
         return VERNON_STATUS_INTERNAL_ERROR;
     const UINT increment = device.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     if (bindings) {
-        std::lock_guard<std::mutex> guard(bindings->mutex);
-        for (auto &slot : bindings->slots) {
-            if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE) {
-                ID3D12Resource *upload = nullptr;
-                size_t uploadOffset = 0;
-                uint8_t *mapped = nullptr;
-                if (!device.acquireStaging(true, slot.inlineStorage.size(), 256, upload, uploadOffset, mapped,
-                                           adapter.error))
-                    return VERNON_STATUS_INTERNAL_ERROR;
-                std::memcpy(mapped, slot.inlineStorage.data(), slot.inlineStorage.size());
-                rhi::directx12::transition(device.commands, slot.inlineResource.resource, slot.inlineResource.state,
-                                           D3D12_RESOURCE_STATE_COPY_DEST);
-                device.commands->CopyBufferRegion(slot.inlineResource.resource, 0, upload, uploadOffset,
-                                                  slot.inlineStorage.size());
-                rhi::directx12::transition(device.commands, slot.inlineResource.resource, slot.inlineResource.state,
-                                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (!retainBindingResources(adapter, commandEncoder, bindings))
+            return fail(adapter, "D3D12 dispatch could not retain its resources", VERNON_STATUS_INTERNAL_ERROR);
+        if (!reuseDescriptors) {
+            for (auto &slot : bindings->slots) {
+                if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE) {
+                    ID3D12Resource *upload = nullptr;
+                    size_t uploadOffset = 0;
+                    uint8_t *mapped = nullptr;
+                    if (!device.acquireStaging(true, slot.inlineStorage.size(), 256, upload, uploadOffset, mapped,
+                                               adapter.error))
+                        return VERNON_STATUS_INTERNAL_ERROR;
+                    std::memcpy(mapped, slot.inlineStorage.data(), slot.inlineStorage.size());
+                    if (!transition(adapter, commandEncoder, commands, slot.inlineResource,
+                                    D3D12_RESOURCE_STATE_COPY_DEST))
+                        return fail(adapter, "D3D12 dispatch could not track inline resource state",
+                                    VERNON_STATUS_INTERNAL_ERROR);
+                    commands->CopyBufferRegion(slot.inlineResource.resource, 0, upload, uploadOffset,
+                                               slot.inlineStorage.size());
+                    if (!transition(adapter, commandEncoder, commands, slot.inlineResource,
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+                        return fail(adapter, "D3D12 dispatch could not track inline resource state",
+                                    VERNON_STATUS_INTERNAL_ERROR);
+                }
+                D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+                view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+                view.Format = DXGI_FORMAT_R32_TYPELESS;
+                view.Buffer.FirstElement = slot.offset / 4;
+                view.Buffer.NumElements = static_cast<UINT>(std::max<uint64_t>(1, (slot.size + 3) / 4));
+                view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+                device.device->CreateUnorderedAccessView(slot.resource, nullptr, &view, cpu);
+                cpu.ptr += increment;
             }
-            D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
-            view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-            view.Format = DXGI_FORMAT_R32_TYPELESS;
-            view.Buffer.FirstElement = slot.offset / 4;
-            view.Buffer.NumElements = static_cast<UINT>(std::max<uint64_t>(1, (slot.size + 3) / 4));
-            view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-            device.device->CreateUnorderedAccessView(slot.resource, nullptr, &view, cpu);
-            cpu.ptr += increment;
+            bindings->computeDescriptorEncoder = commandEncoder.value;
+            bindings->computeDescriptorRevision = bindings->revision;
+            bindings->computeResourceHeap = heap;
+            bindings->computeResourceGpu = gpu;
         }
     }
-    device.commands->SetComputeRootSignature(pipeline->rootSignature);
+    commands->SetComputeRootSignature(pipeline->rootSignature);
     if (heap) {
-        device.commands->SetDescriptorHeaps(1, &heap);
-        device.commands->SetComputeRootDescriptorTable(0, gpu);
+        commands->SetDescriptorHeaps(1, &heap);
+        commands->SetComputeRootDescriptorTable(0, gpu);
     }
-    device.commands->Dispatch(descriptor->group_count[0], descriptor->group_count[1], descriptor->group_count[2]);
-    if (!device.submitCommands(adapter.error))
-        return VERNON_STATUS_INTERNAL_ERROR;
+    commands->Dispatch(descriptor->group_count[0], descriptor->group_count[1], descriptor->group_count[2]);
+    if (!recordProviderCommand(adapter, commandEncoder, false))
+        return fail(adapter, "D3D12 dispatch command encoder state changed");
     adapter.dispatches.fetch_add(1, std::memory_order_relaxed);
     return VERNON_STATUS_OK;
 }
 
-VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject,
+VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
                         const VernonRuntimeProviderDrawDescriptor *descriptor) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     auto *pipeline = descriptor ? fromHandle<PreparedPipeline>(descriptor->pipeline) : nullptr;
@@ -622,21 +734,26 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject,
     ID3D12DescriptorHeap *rtvHeap = nullptr;
     D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
     D3D12_GPU_DESCRIPTOR_HANDLE ignoredGpu{};
-    if (!device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, false,
-                                   static_cast<uint32_t>(descriptor->color_attachment_count), rtvHeap, rtv, ignoredGpu,
-                                   adapter.error))
-        return VERNON_STATUS_INTERNAL_ERROR;
     ID3D12DescriptorHeap *dsvHeap = nullptr;
     D3D12_CPU_DESCRIPTOR_HANDLE dsv{};
-    if (descriptor->depth_stencil_attachment.resource.value &&
-        !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, false, 1, dsvHeap, dsv, ignoredGpu, adapter.error))
-        return VERNON_STATUS_INTERNAL_ERROR;
     ID3D12DescriptorHeap *resourceHeap = nullptr;
     ID3D12DescriptorHeap *samplerHeap = nullptr;
     D3D12_CPU_DESCRIPTOR_HANDLE resourceCpu{};
     D3D12_GPU_DESCRIPTOR_HANDLE resourceGpu{};
     D3D12_CPU_DESCRIPTOR_HANDLE samplerCpu{};
     D3D12_GPU_DESCRIPTOR_HANDLE samplerGpu{};
+    auto *commands = reinterpret_cast<ID3D12GraphicsCommandList *>(nativeCommandEncoder(adapter, commandEncoder));
+    const int claim = claimCommandRendering(adapter, commandEncoder, vernon::rhi::CommandRenderingStateless);
+    if (!commands || claim < 0)
+        return fail(adapter, "D3D12 draw command encoder is invalid");
+    commands->SetPipelineState(pipeline->pipeline);
+    const bool firstDraw = claim != 0;
+    const bool standaloneRendering = !commandEncoderHasRenderingDescriptor(adapter, commandEncoder);
+    if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
+        return fail(adapter, "D3D12 draw could not retain provider objects", VERNON_STATUS_INTERNAL_ERROR);
+    std::unique_lock<std::mutex> bindingGuard;
+    if (bindings)
+        bindingGuard = std::unique_lock<std::mutex>(bindings->mutex);
     uint32_t resourceCount = 0;
     uint32_t samplerCount = 0;
     if (bindings)
@@ -646,43 +763,97 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject,
                              slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
             samplerCount += slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER;
         }
-    if (resourceCount && !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, true, resourceCount,
-                                                    resourceHeap, resourceCpu, resourceGpu, adapter.error))
+    const bool reuseDescriptors = bindings && bindings->descriptorEncoder == commandEncoder.value &&
+                                  bindings->descriptorRevision == bindings->revision;
+    if (reuseDescriptors) {
+        resourceHeap = bindings->resourceHeap;
+        samplerHeap = bindings->samplerHeap;
+        resourceGpu = bindings->resourceGpu;
+        samplerGpu = bindings->samplerGpu;
+    } else {
+        if (resourceCount && !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, true, resourceCount,
+                                                        resourceHeap, resourceCpu, resourceGpu, adapter.error))
+            return VERNON_STATUS_INTERNAL_ERROR;
+        if (samplerCount && !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, true, samplerCount,
+                                                       samplerHeap, samplerCpu, samplerGpu, adapter.error))
+            return VERNON_STATUS_INTERNAL_ERROR;
+    }
+    std::array<VernonRhiLoadOperation, 8> colorLoads{};
+    std::array<std::array<float, 4>, 8> colorClears{};
+    for (size_t index = 0; index < descriptor->color_attachment_count; ++index) {
+        colorLoads[index] = static_cast<VernonRhiLoadOperation>(descriptor->color_attachments[index].load_operation);
+        std::copy(std::begin(descriptor->color_attachments[index].clear_color),
+                  std::end(descriptor->color_attachments[index].clear_color), colorClears[index].begin());
+        VernonRhiStoreOperation ignoredStore =
+            static_cast<VernonRhiStoreOperation>(descriptor->color_attachments[index].store_operation);
+        (void)commandColorOperations(adapter, commandEncoder, index, colorLoads[index], ignoredStore,
+                                     colorClears[index].data());
+    }
+    VernonRhiLoadOperation depthLoad = static_cast<VernonRhiLoadOperation>(descriptor->depth_load_operation);
+    VernonRhiStoreOperation ignoredDepthStore = static_cast<VernonRhiStoreOperation>(descriptor->depth_store_operation);
+    VernonRhiLoadOperation ignoredStencilLoad = VERNON_RHI_LOAD_DISCARD;
+    VernonRhiStoreOperation ignoredStencilStore = VERNON_RHI_STORE_DISCARD;
+    float clearDepth = descriptor->clear_depth;
+    uint32_t ignoredClearStencil = 0;
+    (void)commandDepthOperations(adapter, commandEncoder, depthLoad, ignoredDepthStore, ignoredStencilLoad,
+                                 ignoredStencilStore, clearDepth, ignoredClearStencil);
+    if (firstDraw && !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, false,
+                                                static_cast<uint32_t>(descriptor->color_attachment_count), rtvHeap, rtv,
+                                                ignoredGpu, adapter.error))
         return VERNON_STATUS_INTERNAL_ERROR;
-    if (samplerCount && !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, true, samplerCount, samplerHeap,
-                                                   samplerCpu, samplerGpu, adapter.error))
-        return VERNON_STATUS_INTERNAL_ERROR;
-    if (!device.beginCommands(adapter.error, pipeline->pipeline))
+    if (firstDraw && descriptor->depth_stencil_attachment.resource.value &&
+        !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, false, 1, dsvHeap, dsv, ignoredGpu, adapter.error))
         return VERNON_STATUS_INTERNAL_ERROR;
     std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 8> renderTargets{};
-    const UINT rtvIncrement = device.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    for (size_t index = 0; index < descriptor->color_attachment_count; ++index) {
-        const auto &attachment = descriptor->color_attachments[index];
-        if ((attachment.image.identity & kDirectX12ResourceKindMask) != kDirectX12ImageResource)
-            return fail(adapter, "D3D12 draw contains an invalid color attachment");
-        auto *image = fromHandle<rhi::directx12::Image>(attachment.image.resource);
-        if (!image || !image->resource)
-            return fail(adapter, "D3D12 draw contains an empty color attachment");
-        rhi::directx12::transition(device.commands, image->resource, image->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        D3D12_RENDER_TARGET_VIEW_DESC view{};
-        view.Format = image->format;
-        view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-        renderTargets[index] = rtv;
-        device.device->CreateRenderTargetView(image->resource, &view, rtv);
-        rtv.ptr += rtvIncrement;
-    }
+    std::array<uint64_t, 8> renderTargetResources{};
     const bool hasDepth = descriptor->depth_stencil_attachment.resource.value != 0;
-    if (hasDepth) {
-        if ((descriptor->depth_stencil_attachment.identity & kDirectX12ResourceKindMask) != kDirectX12ImageResource)
-            return fail(adapter, "D3D12 draw contains an invalid depth attachment");
-        auto *image = fromHandle<rhi::directx12::Image>(descriptor->depth_stencil_attachment.resource);
-        if (!image || !image->resource || image->format != DXGI_FORMAT_D32_FLOAT)
-            return fail(adapter, "D3D12 draw contains an invalid depth attachment");
-        rhi::directx12::transition(device.commands, image->resource, image->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
-        D3D12_DEPTH_STENCIL_VIEW_DESC view{};
-        view.Format = DXGI_FORMAT_D32_FLOAT;
-        view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
-        device.device->CreateDepthStencilView(image->resource, &view, dsv);
+    const UINT rtvIncrement = device.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    if (firstDraw) {
+        for (size_t index = 0; index < descriptor->color_attachment_count; ++index) {
+            const auto &attachment = descriptor->color_attachments[index];
+            if (!retainCommandResource(adapter, commandEncoder, attachment.image))
+                return fail(adapter, "D3D12 draw could not retain its color attachment", VERNON_STATUS_INTERNAL_ERROR);
+            if ((attachment.image.identity & kDirectX12ResourceKindMask) != kDirectX12ImageResource)
+                return fail(adapter, "D3D12 draw contains an invalid color attachment");
+            auto *image = reinterpret_cast<rhi::directx12::Image *>(resolveRhiResource(adapter, attachment.image));
+            if (!image || !image->resource)
+                return fail(adapter, "D3D12 draw contains an empty color attachment");
+            renderTargetResources[attachment.location] = reinterpret_cast<uintptr_t>(image->resource);
+            if (!transition(adapter, commandEncoder, commands, *image, D3D12_RESOURCE_STATE_RENDER_TARGET))
+                return fail(adapter, "D3D12 draw could not track color attachment state", VERNON_STATUS_INTERNAL_ERROR);
+            D3D12_RENDER_TARGET_VIEW_DESC view{};
+            view.Format = image->format;
+            view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+            renderTargets[index] = rtv;
+            device.device->CreateRenderTargetView(image->resource, &view, rtv);
+            rtv.ptr += rtvIncrement;
+        }
+        if (hasDepth) {
+            if (!retainCommandResource(adapter, commandEncoder, descriptor->depth_stencil_attachment))
+                return fail(adapter, "D3D12 draw could not retain its depth attachment", VERNON_STATUS_INTERNAL_ERROR);
+            if ((descriptor->depth_stencil_attachment.identity & kDirectX12ResourceKindMask) != kDirectX12ImageResource)
+                return fail(adapter, "D3D12 draw contains an invalid depth attachment");
+            auto *image = reinterpret_cast<rhi::directx12::Image *>(
+                resolveRhiResource(adapter, descriptor->depth_stencil_attachment));
+            if (!image || !image->resource || image->format != DXGI_FORMAT_D32_FLOAT)
+                return fail(adapter, "D3D12 draw contains an invalid depth attachment");
+            if (!transition(adapter, commandEncoder, commands, *image, D3D12_RESOURCE_STATE_DEPTH_WRITE))
+                return fail(adapter, "D3D12 draw could not track depth attachment state", VERNON_STATUS_INTERNAL_ERROR);
+            D3D12_DEPTH_STENCIL_VIEW_DESC view{};
+            view.Format = DXGI_FORMAT_D32_FLOAT;
+            view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+            device.device->CreateDepthStencilView(image->resource, &view, dsv);
+        }
+        std::array<uint64_t, 8> colorTargets{};
+        for (size_t index = 0; index < descriptor->color_attachment_count; ++index)
+            colorTargets[descriptor->color_attachments[index].location] = renderTargets[index].ptr;
+        auto *depthImage = hasDepth ? reinterpret_cast<rhi::directx12::Image *>(
+                                          resolveRhiResource(adapter, descriptor->depth_stencil_attachment))
+                                    : nullptr;
+        if (!setCommandRenderingTargets(adapter, commandEncoder, colorTargets.data(), renderTargetResources.data(),
+                                        colorTargets.size(), hasDepth ? dsv.ptr : 0,
+                                        depthImage ? reinterpret_cast<uintptr_t>(depthImage->resource) : 0))
+            return fail(adapter, "D3D12 command render-target registration failed", VERNON_STATUS_INTERNAL_ERROR);
     }
     std::array<ID3D12DescriptorHeap *, 2> heaps{};
     UINT heapCount = 0;
@@ -691,23 +862,24 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject,
     if (samplerHeap)
         heaps[heapCount++] = samplerHeap;
     if (heapCount)
-        device.commands->SetDescriptorHeaps(heapCount, heaps.data());
-    device.commands->SetGraphicsRootSignature(pipeline->rootSignature);
+        commands->SetDescriptorHeaps(heapCount, heaps.data());
+    commands->SetGraphicsRootSignature(pipeline->rootSignature);
     UINT rootIndex = 0;
     if (pipeline->hasResourceTable)
-        device.commands->SetGraphicsRootDescriptorTable(rootIndex++, resourceGpu);
+        commands->SetGraphicsRootDescriptorTable(rootIndex++, resourceGpu);
     if (pipeline->hasSamplerTable)
-        device.commands->SetGraphicsRootDescriptorTable(rootIndex, samplerGpu);
+        commands->SetGraphicsRootDescriptorTable(rootIndex, samplerGpu);
     if (bindings) {
-        std::lock_guard<std::mutex> guard(bindings->mutex);
+        if (!retainBindingResources(adapter, commandEncoder, bindings))
+            return fail(adapter, "D3D12 draw could not retain its bindings", VERNON_STATUS_INTERNAL_ERROR);
         for (const auto &root : pipeline->inlineRootParameters) {
-            const auto slot = std::find_if(bindings->slots.begin(), bindings->slots.end(),
-                                           [&](const auto &candidate) { return candidate.layout.slot == root.slot; });
-            if (slot == bindings->slots.end() || slot->inlineStorage.empty())
+            const auto found = bindings->slotIndices.find(root.slot);
+            if (found == bindings->slotIndices.end() || bindings->slots[found->second].inlineStorage.empty())
                 return fail(adapter, "D3D12 draw contains an invalid inline uniform");
-            device.commands->SetGraphicsRoot32BitConstants(
-                root.rootParameter, static_cast<UINT>(slot->inlineStorage.size() / sizeof(uint32_t)),
-                slot->inlineStorage.data(), root.destinationOffset);
+            const auto &slot = bindings->slots[found->second];
+            commands->SetGraphicsRoot32BitConstants(root.rootParameter,
+                                                    static_cast<UINT>(slot.inlineStorage.size() / sizeof(uint32_t)),
+                                                    slot.inlineStorage.data(), root.destinationOffset);
         }
         const UINT resourceIncrement =
             device.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -715,50 +887,62 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject,
             device.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
         for (auto &slot : bindings->slots) {
             if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
-                ID3D12Resource *upload = nullptr;
-                size_t uploadOffset = 0;
-                uint8_t *mapped = nullptr;
-                if (!device.acquireStaging(true, slot.inlineStorage.size(), 256, upload, uploadOffset, mapped,
-                                           adapter.error))
-                    return VERNON_STATUS_INTERNAL_ERROR;
-                std::memcpy(mapped, slot.inlineStorage.data(), slot.inlineStorage.size());
-                rhi::directx12::transition(device.commands, slot.inlineResource.resource, slot.inlineResource.state,
-                                           D3D12_RESOURCE_STATE_COPY_DEST);
-                device.commands->CopyBufferRegion(slot.inlineResource.resource, 0, upload, uploadOffset,
-                                                  slot.inlineStorage.size());
-                rhi::directx12::transition(device.commands, slot.inlineResource.resource, slot.inlineResource.state,
-                                           D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-                D3D12_CONSTANT_BUFFER_VIEW_DESC view{};
-                view.BufferLocation = slot.inlineResource.resource->GetGPUVirtualAddress();
-                view.SizeInBytes = (static_cast<UINT>(slot.inlineStorage.size()) + 255u) & ~255u;
-                device.device->CreateConstantBufferView(&view, resourceCpu);
-                resourceCpu.ptr += resourceIncrement;
+                if (!reuseDescriptors) {
+                    ID3D12Resource *upload = nullptr;
+                    size_t uploadOffset = 0;
+                    uint8_t *mapped = nullptr;
+                    if (!device.acquireStaging(true, slot.inlineStorage.size(), 256, upload, uploadOffset, mapped,
+                                               adapter.error))
+                        return VERNON_STATUS_INTERNAL_ERROR;
+                    std::memcpy(mapped, slot.inlineStorage.data(), slot.inlineStorage.size());
+                    if (!transition(adapter, commandEncoder, commands, slot.inlineResource,
+                                    D3D12_RESOURCE_STATE_COPY_DEST))
+                        return fail(adapter, "D3D12 draw could not track inline resource state",
+                                    VERNON_STATUS_INTERNAL_ERROR);
+                    commands->CopyBufferRegion(slot.inlineResource.resource, 0, upload, uploadOffset,
+                                               slot.inlineStorage.size());
+                    if (!transition(adapter, commandEncoder, commands, slot.inlineResource,
+                                    D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER))
+                        return fail(adapter, "D3D12 draw could not track inline resource state",
+                                    VERNON_STATUS_INTERNAL_ERROR);
+                    D3D12_CONSTANT_BUFFER_VIEW_DESC view{};
+                    view.BufferLocation = slot.inlineResource.resource->GetGPUVirtualAddress();
+                    view.SizeInBytes = (static_cast<UINT>(slot.inlineStorage.size()) + 255u) & ~255u;
+                    device.device->CreateConstantBufferView(&view, resourceCpu);
+                    resourceCpu.ptr += resourceIncrement;
+                }
             } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
                 auto *buffer = static_cast<rhi::directx12::Buffer *>(slot.opaqueResource);
                 if (!buffer || !buffer->resource)
                     return fail(adapter, "D3D12 draw contains an invalid storage buffer");
-                rhi::directx12::transition(device.commands, buffer->resource, buffer->state,
-                                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
-                view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-                view.Format = DXGI_FORMAT_R32_TYPELESS;
-                view.Buffer.FirstElement = slot.offset / 4;
-                view.Buffer.NumElements = static_cast<UINT>(std::max<uint64_t>(1, (slot.size + 3) / 4));
-                view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-                device.device->CreateUnorderedAccessView(buffer->resource, nullptr, &view, resourceCpu);
-                resourceCpu.ptr += resourceIncrement;
+                if (!transition(adapter, commandEncoder, commands, *buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+                    return fail(adapter, "D3D12 draw could not track storage buffer state",
+                                VERNON_STATUS_INTERNAL_ERROR);
+                if (!reuseDescriptors) {
+                    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+                    view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+                    view.Format = DXGI_FORMAT_R32_TYPELESS;
+                    view.Buffer.FirstElement = slot.offset / 4;
+                    view.Buffer.NumElements = static_cast<UINT>(std::max<uint64_t>(1, (slot.size + 3) / 4));
+                    view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+                    device.device->CreateUnorderedAccessView(buffer->resource, nullptr, &view, resourceCpu);
+                    resourceCpu.ptr += resourceIncrement;
+                }
             } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
                 auto *image = static_cast<rhi::directx12::Image *>(slot.opaqueResource);
-                rhi::directx12::transition(device.commands, image->resource, image->state,
-                                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-                const D3D12_RESOURCE_DESC native = image->resource->GetDesc();
-                D3D12_SHADER_RESOURCE_VIEW_DESC view{};
-                view.Format = image->format;
-                view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                view.Texture2D.MipLevels = native.MipLevels;
-                device.device->CreateShaderResourceView(image->resource, &view, resourceCpu);
-                resourceCpu.ptr += resourceIncrement;
+                if (!transition(adapter, commandEncoder, commands, *image, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))
+                    return fail(adapter, "D3D12 draw could not track sampled image state",
+                                VERNON_STATUS_INTERNAL_ERROR);
+                if (!reuseDescriptors) {
+                    const D3D12_RESOURCE_DESC native = image->resource->GetDesc();
+                    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+                    view.Format = image->format;
+                    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                    view.Texture2D.MipLevels = native.MipLevels;
+                    device.device->CreateShaderResourceView(image->resource, &view, resourceCpu);
+                    resourceCpu.ptr += resourceIncrement;
+                }
             } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER) {
                 const auto *sampler = static_cast<const rhi::directx12::Sampler *>(slot.opaqueResource);
                 const D3D12_SAMPLER_DESC defaultSampler{D3D12_FILTER_MIN_MAG_MIP_LINEAR,
@@ -771,72 +955,40 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject,
                                                         {},
                                                         0,
                                                         D3D12_FLOAT32_MAX};
-                device.device->CreateSampler(sampler ? &sampler->descriptor : &defaultSampler, samplerCpu);
-                samplerCpu.ptr += samplerIncrement;
+                if (!reuseDescriptors) {
+                    device.device->CreateSampler(sampler ? &sampler->descriptor : &defaultSampler, samplerCpu);
+                    samplerCpu.ptr += samplerIncrement;
+                }
             } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER) {
                 auto *buffer = static_cast<rhi::directx12::Buffer *>(slot.opaqueResource);
                 if (!buffer || !buffer->resource)
                     return fail(adapter, "D3D12 draw contains an invalid vertex buffer");
-                rhi::directx12::transition(device.commands, buffer->resource, buffer->state,
-                                           D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+                if (!transition(adapter, commandEncoder, commands, *buffer,
+                                D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER))
+                    return fail(adapter, "D3D12 draw could not track vertex buffer state",
+                                VERNON_STATUS_INTERNAL_ERROR);
                 const D3D12_VERTEX_BUFFER_VIEW view{slot.resource->GetGPUVirtualAddress() + slot.offset,
                                                     static_cast<UINT>(slot.size), slot.stride};
-                device.commands->IASetVertexBuffers(slot.layout.binding, 1, &view);
+                commands->IASetVertexBuffers(slot.layout.binding, 1, &view);
             }
         }
+        if (!reuseDescriptors) {
+            bindings->descriptorEncoder = commandEncoder.value;
+            bindings->descriptorRevision = bindings->revision;
+            bindings->resourceHeap = resourceHeap;
+            bindings->samplerHeap = samplerHeap;
+            bindings->resourceGpu = resourceGpu;
+            bindings->samplerGpu = samplerGpu;
+        }
     }
-    ID3D12GraphicsCommandList4 *renderPassCommands = nullptr;
-    D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5{};
-    const bool supportsRenderPass =
-        SUCCEEDED(device.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options5, sizeof(options5))) &&
-        options5.RenderPassesTier != D3D12_RENDER_PASS_TIER_0 &&
-        SUCCEEDED(device.commands->QueryInterface(IID_PPV_ARGS(&renderPassCommands)));
-    std::array<D3D12_RENDER_PASS_RENDER_TARGET_DESC, 8> renderPassTargets{};
-    D3D12_RENDER_PASS_DEPTH_STENCIL_DESC renderPassDepth{};
-    if (supportsRenderPass) {
-        for (size_t index = 0; index < descriptor->color_attachment_count; ++index) {
-            const auto &source = descriptor->color_attachments[index];
-            auto *image = fromHandle<rhi::directx12::Image>(source.image.resource);
-            auto &target = renderPassTargets[index];
-            target.cpuDescriptor = renderTargets[index];
-            target.BeginningAccess.Type =
-                source.load_operation == VERNON_RHI_LOAD_CLEAR      ? D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR
-                : source.load_operation == VERNON_RHI_LOAD_PRESERVE ? D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE
-                                                                    : D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_DISCARD;
-            target.BeginningAccess.Clear.ClearValue.Format = image->format;
-            std::copy(std::begin(source.clear_color), std::end(source.clear_color),
-                      target.BeginningAccess.Clear.ClearValue.Color);
-            target.EndingAccess.Type = source.store_operation == VERNON_RHI_STORE_PRESERVE
-                                           ? D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE
-                                           : D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_DISCARD;
-        }
-        if (hasDepth) {
-            renderPassDepth.cpuDescriptor = dsv;
-            renderPassDepth.DepthBeginningAccess.Type = descriptor->depth_load_operation == VERNON_RHI_LOAD_CLEAR
-                                                            ? D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR
-                                                        : descriptor->depth_load_operation == VERNON_RHI_LOAD_PRESERVE
-                                                            ? D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE
-                                                            : D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_DISCARD;
-            renderPassDepth.DepthBeginningAccess.Clear.ClearValue.Format = DXGI_FORMAT_D32_FLOAT;
-            renderPassDepth.DepthBeginningAccess.Clear.ClearValue.DepthStencil.Depth = descriptor->clear_depth;
-            renderPassDepth.DepthEndingAccess.Type = descriptor->depth_store_operation == VERNON_RHI_STORE_PRESERVE
-                                                         ? D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE
-                                                         : D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_DISCARD;
-            renderPassDepth.StencilBeginningAccess.Type = D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_NO_ACCESS;
-            renderPassDepth.StencilEndingAccess.Type = D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_NO_ACCESS;
-        }
-        renderPassCommands->BeginRenderPass(static_cast<UINT>(descriptor->color_attachment_count),
-                                            renderPassTargets.data(), hasDepth ? &renderPassDepth : nullptr,
-                                            D3D12_RENDER_PASS_FLAG_NONE);
-    } else {
-        device.commands->OMSetRenderTargets(static_cast<UINT>(descriptor->color_attachment_count), renderTargets.data(),
-                                            FALSE, hasDepth ? &dsv : nullptr);
+    if (firstDraw) {
+        commands->OMSetRenderTargets(static_cast<UINT>(descriptor->color_attachment_count), renderTargets.data(), FALSE,
+                                     hasDepth ? &dsv : nullptr);
         for (size_t index = 0; index < descriptor->color_attachment_count; ++index)
-            if (descriptor->color_attachments[index].load_operation == VERNON_RHI_LOAD_CLEAR)
-                device.commands->ClearRenderTargetView(renderTargets[index],
-                                                       descriptor->color_attachments[index].clear_color, 0, nullptr);
-        if (hasDepth && descriptor->depth_load_operation == VERNON_RHI_LOAD_CLEAR)
-            device.commands->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, descriptor->clear_depth, 0, 0, nullptr);
+            if (colorLoads[index] == VERNON_RHI_LOAD_CLEAR)
+                commands->ClearRenderTargetView(renderTargets[index], colorClears[index].data(), 0, nullptr);
+        if (hasDepth && depthLoad == VERNON_RHI_LOAD_CLEAR)
+            commands->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, clearDepth, 0, 0, nullptr);
     }
     const D3D12_VIEWPORT viewport{static_cast<float>(descriptor->viewport[0]),
                                   static_cast<float>(descriptor->viewport[1]),
@@ -847,68 +999,72 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject,
     const D3D12_RECT scissor{static_cast<LONG>(descriptor->scissor[0]), static_cast<LONG>(descriptor->scissor[1]),
                              static_cast<LONG>(descriptor->scissor[0] + descriptor->scissor[2]),
                              static_cast<LONG>(descriptor->scissor[1] + descriptor->scissor[3])};
-    device.commands->RSSetViewports(1, &viewport);
-    device.commands->RSSetScissorRects(1, &scissor);
+    commands->RSSetViewports(1, &viewport);
+    commands->RSSetScissorRects(1, &scissor);
     const D3D_PRIMITIVE_TOPOLOGY topology = descriptor->topology == 1   ? D3D_PRIMITIVE_TOPOLOGY_LINELIST
                                             : descriptor->topology == 2 ? D3D_PRIMITIVE_TOPOLOGY_POINTLIST
                                                                         : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-    device.commands->IASetPrimitiveTopology(topology);
+    commands->IASetPrimitiveTopology(topology);
     if (descriptor->index_count != 0) {
-        auto *buffer = fromHandle<rhi::directx12::Buffer>(descriptor->index_buffer.resource);
+        if (!retainCommandResource(adapter, commandEncoder, descriptor->index_buffer))
+            return fail(adapter, "D3D12 draw could not retain its index buffer", VERNON_STATUS_INTERNAL_ERROR);
+        auto *buffer =
+            reinterpret_cast<rhi::directx12::Buffer *>(resolveRhiResource(adapter, descriptor->index_buffer));
         if (!buffer || !buffer->resource)
             return fail(adapter, "D3D12 draw contains an invalid index buffer");
-        rhi::directx12::transition(device.commands, buffer->resource, buffer->state, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+        if (!transition(adapter, commandEncoder, commands, *buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER))
+            return fail(adapter, "D3D12 draw could not track index buffer state", VERNON_STATUS_INTERNAL_ERROR);
         const D3D12_INDEX_BUFFER_VIEW indexView{buffer->resource->GetGPUVirtualAddress() +
                                                     descriptor->index_buffer.offset,
                                                 static_cast<UINT>(descriptor->index_buffer.size), DXGI_FORMAT_R32_UINT};
-        device.commands->IASetIndexBuffer(&indexView);
-        device.commands->DrawIndexedInstanced(descriptor->index_count, descriptor->instance_count, 0,
-                                              descriptor->first_vertex, descriptor->first_instance);
-    } else {
-        device.commands->DrawInstanced(descriptor->vertex_count, descriptor->instance_count, descriptor->first_vertex,
+        commands->IASetIndexBuffer(&indexView);
+        commands->DrawIndexedInstanced(descriptor->index_count, descriptor->instance_count, 0, descriptor->first_vertex,
                                        descriptor->first_instance);
+    } else {
+        commands->DrawInstanced(descriptor->vertex_count, descriptor->instance_count, descriptor->first_vertex,
+                                descriptor->first_instance);
     }
-    if (renderPassCommands) {
-        renderPassCommands->EndRenderPass();
-        renderPassCommands->Release();
-    }
-    if (!supportsRenderPass) {
+    if (standaloneRendering) {
         for (size_t index = 0; index < descriptor->color_attachment_count; ++index)
             if (descriptor->color_attachments[index].store_operation == VERNON_RHI_STORE_DISCARD) {
-                auto *image = fromHandle<rhi::directx12::Image>(descriptor->color_attachments[index].image.resource);
-                device.commands->DiscardResource(image->resource, nullptr);
+                auto *image = reinterpret_cast<rhi::directx12::Image *>(
+                    resolveRhiResource(adapter, descriptor->color_attachments[index].image));
+                commands->DiscardResource(image->resource, nullptr);
             }
         if (hasDepth && descriptor->depth_store_operation == VERNON_RHI_STORE_DISCARD) {
-            auto *image = fromHandle<rhi::directx12::Image>(descriptor->depth_stencil_attachment.resource);
-            device.commands->DiscardResource(image->resource, nullptr);
+            auto *image = reinterpret_cast<rhi::directx12::Image *>(
+                resolveRhiResource(adapter, descriptor->depth_stencil_attachment));
+            commands->DiscardResource(image->resource, nullptr);
         }
     }
-    if (!device.submitCommands(adapter.error))
-        return VERNON_STATUS_INTERNAL_ERROR;
+    if (!recordProviderCommand(adapter, commandEncoder, true))
+        return fail(adapter, "D3D12 draw command encoder state changed");
     adapter.dispatches.fetch_add(1, std::memory_order_relaxed);
     return VERNON_STATUS_OK;
 }
 
 void destroyShader(void *, VernonRuntimeProviderObject handle) { delete fromHandle<PreparedShader>(handle); }
 void destroyLayout(void *, VernonRuntimeProviderObject handle) { delete fromHandle<PreparedLayout>(handle); }
-void destroyPipeline(void *, VernonRuntimeProviderObject handle) {
-    auto *pipeline = fromHandle<PreparedPipeline>(handle);
-    if (!pipeline)
+void releaseCommandPipeline(void *context, uint64_t) {
+    auto *pipeline = static_cast<PreparedPipeline *>(context);
+    if (!pipeline || pipeline->references.fetch_sub(1, std::memory_order_acq_rel) != 1)
         return;
-    std::string ignored;
-    (void)pipeline->device->synchronize(ignored);
     releaseObject(pipeline->pipeline);
     releaseObject(pipeline->rootSignature);
     delete pipeline;
 }
-void destroyBindings(void *, VernonRuntimeProviderObject handle) {
-    auto *bindings = fromHandle<PreparedBindingSet>(handle);
-    if (!bindings)
+void destroyPipeline(void *, VernonRuntimeProviderObject handle) {
+    releaseCommandPipeline(fromHandle<PreparedPipeline>(handle), 0);
+}
+void releaseCommandBindings(void *context, uint64_t) {
+    auto *bindings = static_cast<PreparedBindingSet *>(context);
+    if (!bindings || bindings->references.fetch_sub(1, std::memory_order_acq_rel) != 1)
         return;
-    std::string ignored;
-    (void)bindings->device->synchronize(ignored);
     destroyBindingSetImpl(*bindings);
     delete bindings;
+}
+void destroyBindings(void *, VernonRuntimeProviderObject handle) {
+    releaseCommandBindings(fromHandle<PreparedBindingSet>(handle), 0);
 }
 
 } // namespace

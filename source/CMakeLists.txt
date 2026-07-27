@@ -62,7 +62,12 @@ if(TARGET VernonRuntime AND TARGET VernonDSLCompiler)
         if(nanobind_FOUND)
             nanobind_add_module(vernon-dsl-native python/native_module.cpp)
             vernon_set_python_module_output(vernon-dsl-native)
-            target_link_libraries(vernon-dsl-native PRIVATE VernonDSLCompiler Vernon::Runtime Vernon::RHI)
+            target_link_libraries(
+                vernon-dsl-native
+                PRIVATE VernonDSLCompiler
+                        Vernon::Runtime
+                        Vernon::RHI
+                        Vernon::ExecutionGraph)
             if(MSVC)
                 target_compile_options(vernon-dsl-native PRIVATE /EHsc)
             endif()
