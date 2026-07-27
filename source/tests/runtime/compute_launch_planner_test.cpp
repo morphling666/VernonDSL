@@ -9,18 +9,28 @@ namespace {
 
 using namespace vernon::runtime;
 
+void setScalarLayout(Parameter &parameter, const char *dtype, VernonDataType dataType) {
+    const VernonValueLayoutView view = vernonRuntimeGetScalarValueLayout(dataType);
+    parameter.elementLayout.logicalType = dtype;
+    parameter.elementLayout.layoutHash.assign(view.layout_hash.data, view.layout_hash.size);
+    parameter.elementLayout.byteSize = view.byte_size;
+    parameter.elementLayout.alignment = view.alignment;
+    parameter.elementLayout.leaves = {{dtype, 1, 0}};
+    parameter.elementLayout.abiLeaves.assign(view.leaves, view.leaves + view.leaf_count);
+}
+
 TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
     Variant variant;
     Parameter contiguous;
     contiguous.slot = 0;
     contiguous.kind = "tensor";
-    contiguous.dtype = "f32";
+    setScalarLayout(contiguous, "f32", VERNON_DATA_F32);
     contiguous.source = "direct";
     contiguous.uses.push_back({"compute", "buffer", "", "f32", {2}, 1, UINT32_MAX, 0, 0, 0, {}});
     Parameter strided;
     strided.slot = 1;
     strided.kind = "tensor";
-    strided.dtype = "f32";
+    setScalarLayout(strided, "f32", VERNON_DATA_F32);
     strided.source = "direct";
     strided.uses.push_back({"compute", "buffer", "", "f32", {2}, 0, UINT32_MAX, 0, 0, 1, {}});
     variant.parameters = {contiguous, strided};
@@ -36,7 +46,7 @@ TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
     supplied[0].tensor = {sizeof(VernonTensorView),
                           VERNON_TENSOR_HOST,
                           {contiguousValues.data()},
-                          VERNON_DATA_F32,
+                          vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32),
                           VERNON_ACCESS_READ,
                           1,
                           shape.data(),
@@ -48,7 +58,7 @@ TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
     supplied[1].tensor = {sizeof(VernonTensorView),
                           VERNON_TENSOR_HOST,
                           {stridedValues.data()},
-                          VERNON_DATA_F32,
+                          vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32),
                           VERNON_ACCESS_READ,
                           1,
                           shape.data(),
@@ -62,7 +72,7 @@ TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
 
     PlannedComputeLaunch plan;
     std::string error;
-    ASSERT_TRUE(planComputeInvocation(variant, invocation, nullptr, {}, plan, error)) << error;
+    ASSERT_TRUE(planComputeInvocation(variant, invocation, plan, error)) << error;
     ASSERT_EQ(plan.arguments.size(), 2u);
     ASSERT_EQ(plan.hostTensorStorage.size(), 1u);
     const std::array<float, 2> expectedPacked{1, 2};
@@ -73,46 +83,41 @@ TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
     EXPECT_EQ(plan.grid.z, 1u);
 }
 
-TEST(ComputeLaunchPlannerTest, AcceptsValidatedStridedDeviceTensorView) {
+TEST(ComputeLaunchPlannerTest, AcceptsValidatedStridedRhiTensorView) {
     Variant variant;
     Parameter parameter;
     parameter.slot = 0;
     parameter.kind = "tensor";
-    parameter.dtype = "f32";
+    setScalarLayout(parameter, "f32", VERNON_DATA_F32);
     parameter.source = "direct";
     parameter.uses.push_back({"compute", "buffer", "", "f32", {2, 3}, 0, UINT32_MAX, 0, 0, 0, {}});
     variant.parameters = {parameter};
 
     const std::array<uint64_t, 2> shape{2, 3};
     const std::array<int64_t, 2> strides{6 * sizeof(float), -static_cast<int64_t>(sizeof(float))};
-    auto *buffer = reinterpret_cast<VernonDeviceBuffer *>(uintptr_t{1});
+    const VernonRuntimeProviderResourceReference resource{1, {2}, 0, 12 * sizeof(float)};
     VernonPipelineArgument supplied{};
     supplied.slot = 0;
     supplied.kind = VERNON_PIPELINE_TENSOR;
-    supplied.tensor = {sizeof(VernonTensorView),
-                       VERNON_TENSOR_DEVICE,
-                       {buffer},
-                       VERNON_DATA_F32,
-                       VERNON_ACCESS_READ,
-                       2,
-                       shape.data(),
-                       strides.data(),
-                       2 * sizeof(float),
-                       12 * sizeof(float)};
+    supplied.tensor.struct_size = sizeof(VernonTensorView);
+    supplied.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    supplied.tensor.resource = resource;
+    supplied.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
+    supplied.tensor.access = VERNON_ACCESS_READ;
+    supplied.tensor.rank = 2;
+    supplied.tensor.shape = shape.data();
+    supplied.tensor.byte_strides = strides.data();
+    supplied.tensor.byte_offset = 2 * sizeof(float);
+    supplied.tensor.byte_size = 12 * sizeof(float);
     VernonPipelineInvocation invocation{};
     invocation.arguments = &supplied;
     invocation.argument_count = 1;
-    int context = 0;
-    ComputePlannerCallbacks callbacks{
-        &context,
-        [](const void *userData, const VernonDeviceBuffer *) -> const void * { return userData; },
-    };
-
     PlannedComputeLaunch plan;
     std::string error;
-    ASSERT_TRUE(planComputeInvocation(variant, invocation, &context, callbacks, plan, error)) << error;
+    ASSERT_TRUE(planComputeInvocation(variant, invocation, plan, error)) << error;
     ASSERT_EQ(plan.arguments.size(), 1u);
-    EXPECT_EQ(plan.arguments[0].buffer, buffer);
+    EXPECT_EQ(plan.arguments[0].resource.identity, resource.identity);
+    EXPECT_EQ(plan.arguments[0].resource.resource.value, resource.resource.value);
     EXPECT_EQ(plan.grid.x, 3u);
     EXPECT_EQ(plan.grid.y, 2u);
     EXPECT_EQ(plan.grid.z, 1u);

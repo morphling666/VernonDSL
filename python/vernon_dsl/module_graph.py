@@ -9,8 +9,10 @@ from pathlib import Path
 
 from .diagnostics import CompileError, SourceLocation
 from .frontend.abi import attribute_layout
+from .frontend.model import ConcreteType
 from .language.ast_utils import decorator_name as _decorator_name
 from .language.ast_utils import dotted_name as _dotted_name
+from .language.scalar_types import SCALAR_ALIASES, SCALAR_TYPES
 from .language.syntax import ENTRY_DECORATORS, FUNCTION_DECORATORS
 from .shader_contracts import DEVICE_ONLY_OPERATION_NAMES, DEVICE_ONLY_TYPE_NAMES
 from .struct_methods import normalize_struct_methods
@@ -222,31 +224,19 @@ class _FeatureSpecializer(ast.NodeTransformer):
     def _location_span(self, annotation: ast.expr) -> int:
         items = self._annotated_items(annotation)
         value = items[0] if items else annotation
-        if not isinstance(value, ast.Subscript):
-            return 1
-        constructor = (_dotted_name(value.value) or "").split(".")[-1]
-        arguments = list(value.slice.elts) if isinstance(value.slice, ast.Tuple) else [value.slice]
-        if not arguments:
-            return 1
-        dtype = (_dotted_name(arguments[0]) or "").split(".")[-1]
-        shape_nodes: list[ast.expr]
-        if constructor == "Vector" and len(arguments) == 2:
-            shape_nodes = [arguments[1]]
-        elif constructor == "Matrix" and len(arguments) == 3:
-            shape_nodes = arguments[1:]
-        elif constructor == "Tensor" and len(arguments) >= 2:
-            shape_nodes = list(arguments[1].elts) if isinstance(arguments[1], ast.Tuple) else arguments[1:]
-        else:
-            return 1
-        if not all(
-            isinstance(dimension, ast.Constant) and isinstance(dimension.value, int) for dimension in shape_nodes
-        ):
-            return 1
-        shape = tuple(dimension.value for dimension in shape_nodes if isinstance(dimension, ast.Constant))
         try:
-            return attribute_layout(dtype, shape).location_span
-        except ValueError:
-            return 1
+            value_type = self.graph._parse_abi_type(self.module, value)
+            return attribute_layout(value_type, self.graph._struct_abi_fields).location_span
+        except ValueError as error:
+            constructor_node = value.value if isinstance(value, ast.Subscript) else value
+            spelling = (_dotted_name(constructor_node) or "").split(".")[-1]
+            scalar = SCALAR_ALIASES.get(spelling, spelling)
+            if spelling in DEVICE_ONLY_TYPE_NAMES or scalar == "bool":
+                # These types need typed, stage-specific validation after
+                # feature specialization; they never expand recursively here.
+                return 1
+            self.graph._error(self.module, value, str(error))
+            raise AssertionError("unreachable") from None
 
     def visit_If(self, node: ast.If) -> ast.AST | list[ast.stmt]:
         condition = self._feature_condition(node.test)
@@ -418,6 +408,7 @@ class ModuleGraph:
         self.modules: dict[Path, _Module] = {}
         self.order: list[_Module] = []
         self.loading: list[Path] = []
+        self._abi_structs: dict[str, tuple[_Module, ast.ClassDef]] = {}
 
     def load(self) -> LoadedProject:
         root = self._load_module(self.input_path, self._module_name(self.input_path))
@@ -637,6 +628,105 @@ class ModuleGraph:
                 if dotted.startswith(prefix):
                     symbol = dotted.removeprefix(prefix)
                     return target.features.get(symbol)
+        return None
+
+    def _parse_abi_type(self, module: _Module, node: ast.AST) -> ConcreteType:
+        if isinstance(node, ast.Subscript) and (_dotted_name(node.value) or "").split(".")[-1] == "Annotated":
+            items = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
+            if not items:
+                raise ValueError("Annotated interface type is empty")
+            return self._parse_abi_type(module, items[0])
+
+        spelling = (_dotted_name(node) or "").split(".")[-1]
+        scalar = SCALAR_ALIASES.get(spelling, spelling)
+        if scalar in SCALAR_TYPES:
+            return ConcreteType("scalar", scalar)
+        structure = self._resolve_struct_type(module, node)
+        if structure is not None:
+            owner, declaration = structure
+            identity = f"{owner.path.as_posix()}::{declaration.name}"
+            self._abi_structs[identity] = structure
+            return ConcreteType("struct", identity)
+        if not isinstance(node, ast.Subscript):
+            raise ValueError(f"'{spelling or ast.dump(node)}' is not an ABI-stable interface Value")
+
+        constructor = (_dotted_name(node.value) or "").split(".")[-1]
+        arguments = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
+        if constructor == "Tuple":
+            if not arguments:
+                raise ValueError("Tuple interface Value requires at least one element")
+            return ConcreteType("tuple", "Tuple", tuple(self._parse_abi_type(module, item) for item in arguments))
+        if constructor not in {"Tensor", "Vector", "Matrix"}:
+            raise ValueError(f"'{constructor}' is not an ABI-stable interface Value")
+        rank = {"Vector": 1, "Matrix": 2}.get(constructor)
+        if not arguments:
+            raise ValueError(f"{constructor} requires an element type")
+        element = self._parse_abi_type(module, arguments[0])
+        if constructor == "Tensor" and len(arguments) == 2 and isinstance(arguments[1], ast.Tuple):
+            dimensions = list(arguments[1].elts)
+        else:
+            dimensions = arguments[1:]
+        if rank is not None and len(dimensions) != rank:
+            raise ValueError(f"{constructor} requires {rank} static dimension(s)")
+        if not dimensions:
+            raise ValueError(f"{constructor} interface Value requires a positive static shape")
+        shape: list[int] = []
+        for dimension in dimensions:
+            value = self._constant_int(module, dimension)
+            if value is None or value <= 0:
+                raise ValueError(f"{constructor} interface dimensions must be positive integer literals")
+            shape.append(value)
+        return ConcreteType("tensor", "Tensor", (element, *shape))
+
+    def _resolve_struct_type(self, module: _Module, node: ast.AST) -> tuple[_Module, ast.ClassDef] | None:
+        if isinstance(node, ast.Name):
+            local = module.definitions.get(node.id)
+            if isinstance(local, ast.ClassDef) and any(
+                _decorator_name(item) == "struct" for item in local.decorator_list
+            ):
+                return module, local
+            imported = module.symbol_imports.get(node.id)
+            if imported is not None:
+                owner, name = imported
+                declaration = owner.definitions.get(name)
+                if isinstance(declaration, ast.ClassDef) and any(
+                    _decorator_name(item) == "struct" for item in declaration.decorator_list
+                ):
+                    return owner, declaration
+            return None
+        if isinstance(node, ast.Attribute):
+            dotted = _dotted_name(node) or ""
+            for alias, owner in module.module_imports.items():
+                prefix = alias + "."
+                if not dotted.startswith(prefix):
+                    continue
+                name = dotted.removeprefix(prefix)
+                declaration = owner.definitions.get(name)
+                if isinstance(declaration, ast.ClassDef) and any(
+                    _decorator_name(item) == "struct" for item in declaration.decorator_list
+                ):
+                    return owner, declaration
+        return None
+
+    def _struct_abi_fields(self, identity: str) -> tuple[tuple[str, ConcreteType], ...]:
+        resolved = self._abi_structs.get(identity)
+        if resolved is None:
+            raise ValueError(f"unresolved Struct '{identity}'")
+        module, declaration = resolved
+        fields: list[tuple[str, ConcreteType]] = []
+        for statement in declaration.body:
+            if not isinstance(statement, ast.AnnAssign) or not isinstance(statement.target, ast.Name):
+                continue
+            fields.append((statement.target.id, self._parse_abi_type(module, statement.annotation)))
+        return tuple(fields)
+
+    @staticmethod
+    def _constant_int(module: _Module, node: ast.AST) -> int | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+            return node.value
+        if isinstance(node, ast.Name):
+            value = module.constants.get(node.id)
+            return value if isinstance(value, int) and not isinstance(value, bool) else None
         return None
 
     def _prune_to_entry(self, body: list[ast.stmt], entry: str, root: _Module) -> list[ast.stmt]:

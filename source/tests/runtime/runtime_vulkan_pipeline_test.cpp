@@ -1,6 +1,7 @@
 #include "VernonRuntime.h"
 #include "runtime/content_hash.h"
 #include "runtime/runtime_test_hooks.h"
+#include "runtime_rhi_test_utils.h"
 
 #include <nlohmann/json.hpp>
 
@@ -24,11 +25,30 @@
 
 namespace {
 
-VernonDeviceTexture *createTexture2D(VernonRuntimeContext *runtime, uint32_t width, uint32_t height,
-                                     VernonTextureFormat format) {
-    const VernonTextureDescriptor descriptor{
-        sizeof(VernonTextureDescriptor), VERNON_TEXTURE_2D, format, width, height, 1, 1, {0, 0, 0, 0}};
-    return vernonRuntimeTextureCreate(runtime, &descriptor);
+VernonRhiFormat rhiFormat(VernonTextureFormat format) {
+    switch (format) {
+    case VERNON_TEXTURE_R8_UNORM:
+        return VERNON_RHI_FORMAT_R8_UNORM;
+    case VERNON_TEXTURE_RG8_UNORM:
+        return VERNON_RHI_FORMAT_RG8_UNORM;
+    case VERNON_TEXTURE_RGB8_UNORM:
+        return VERNON_RHI_FORMAT_RGB8_UNORM;
+    case VERNON_TEXTURE_RGBA8_SRGB:
+        return VERNON_RHI_FORMAT_RGBA8_SRGB;
+    case VERNON_TEXTURE_RGBA16_FLOAT:
+        return VERNON_RHI_FORMAT_RGBA16_FLOAT;
+    case VERNON_TEXTURE_RGBA32_FLOAT:
+        return VERNON_RHI_FORMAT_RGBA32_FLOAT;
+    case VERNON_TEXTURE_R11G11B10_FLOAT:
+        return VERNON_RHI_FORMAT_R11G11B10_FLOAT;
+    default:
+        return VERNON_RHI_FORMAT_RGBA8_UNORM;
+    }
+}
+
+vernon::tests::RhiImage createTexture2D(vernon::tests::RhiRuntime &context, uint32_t width, uint32_t height,
+                                        VernonTextureFormat format, uint32_t usage) {
+    return vernon::tests::createImage(context, VERNON_RHI_IMAGE_2D, rhiFormat(format), width, height, 1, usage);
 }
 
 } // namespace
@@ -56,43 +76,31 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     document["content_hash"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
     bundle = document.dump(-1, ' ', false);
 
-    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_VULKAN, nullptr);
+    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_VULKAN);
+    VernonRuntimeContext *runtime = context.runtime;
     ASSERT_TRUE(runtime);
     size_t supportedFormatCount = 0;
     for (VernonTextureFormat format :
          {VERNON_TEXTURE_R8_UNORM, VERNON_TEXTURE_RG8_UNORM, VERNON_TEXTURE_RGB8_UNORM, VERNON_TEXTURE_RGBA8_UNORM,
           VERNON_TEXTURE_RGBA8_SRGB, VERNON_TEXTURE_RGBA16_FLOAT, VERNON_TEXTURE_RGBA32_FLOAT,
           VERNON_TEXTURE_R11G11B10_FLOAT}) {
-        VernonTextureDescriptor descriptor{};
-        descriptor.struct_size = sizeof(descriptor);
-        descriptor.dimension = VERNON_TEXTURE_2D;
-        descriptor.format = format;
-        descriptor.width = 4;
-        descriptor.height = 4;
-        descriptor.depth = 1;
-        descriptor.mip_levels = 1;
-        VernonDeviceTexture *texture = vernonRuntimeTextureCreate(runtime, &descriptor);
-        if (!texture) {
-            const VernonStringView error = vernonRuntimeGetLastError(runtime);
+        auto texture = createTexture2D(context, 4, 4, format, VERNON_RHI_IMAGE_SAMPLED);
+        if (texture.handle.index == VERNON_RHI_INVALID_HANDLE_INDEX) {
+            const VernonStringView error = vernonRhiDeviceGetLastError(context.device);
             ASSERT_TRUE(error.data && error.size);
             continue;
         }
         ++supportedFormatCount;
-        ASSERT_TRUE(vernonRuntimeTextureFree(texture) == VERNON_STATUS_OK);
+        ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, texture.handle), VERNON_RHI_STATUS_OK);
     }
     ASSERT_TRUE(supportedFormatCount >= 3);
     for (VernonTextureDimension dimension : {VERNON_TEXTURE_3D, VERNON_TEXTURE_CUBE}) {
-        VernonTextureDescriptor descriptor{};
-        descriptor.struct_size = sizeof(descriptor);
-        descriptor.dimension = dimension;
-        descriptor.format = VERNON_TEXTURE_RGBA8_UNORM;
-        descriptor.width = 4;
-        descriptor.height = 4;
-        descriptor.depth = dimension == VERNON_TEXTURE_3D ? 4 : 1;
-        descriptor.mip_levels = 1;
-        VernonDeviceTexture *texture = vernonRuntimeTextureCreate(runtime, &descriptor);
-        ASSERT_TRUE(texture);
-        ASSERT_TRUE(vernonRuntimeTextureFree(texture) == VERNON_STATUS_OK);
+        auto texture = vernon::tests::createImage(
+            context, dimension == VERNON_TEXTURE_3D ? VERNON_RHI_IMAGE_3D : VERNON_RHI_IMAGE_CUBE,
+            VERNON_RHI_FORMAT_RGBA8_UNORM, 4, 4, dimension == VERNON_TEXTURE_3D ? 4 : 1, VERNON_RHI_IMAGE_SAMPLED,
+            dimension == VERNON_TEXTURE_CUBE ? 6 : 1);
+        ASSERT_NE(texture.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+        ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, texture.handle), VERNON_RHI_STATUS_OK);
     }
     const std::string bundleDirectory = manifestPath.parent_path().u8string();
     VernonPipelineBundleLoadOptions options{};
@@ -125,54 +133,47 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     ASSERT_EQ(vernonRuntimeLoadedPipelineGetParameterCount(pipeline), 2u);
 
     constexpr float positions[] = {-0.8f, -0.8f, 0.8f, -0.8f, 0.0f, 0.8f};
-    VernonDeviceBuffer *vertices = vernonRuntimeBufferAllocate(runtime, sizeof(positions), alignof(float));
-    ASSERT_TRUE(vertices);
-    ASSERT_TRUE(vernonRuntimeCopyFromHost(vertices, 0, positions, sizeof(positions)) == VERNON_STATUS_OK);
-    VernonDeviceTexture *firstTarget = createTexture2D(runtime, 32, 32, VERNON_TEXTURE_RGBA8_UNORM);
-    ASSERT_TRUE(firstTarget);
-    VernonDeviceTexture *secondTarget = createTexture2D(runtime, 48, 24, VERNON_TEXTURE_RGBA8_UNORM);
-    ASSERT_TRUE(secondTarget);
-    VernonTextureDescriptor sampledDescriptor{};
-    sampledDescriptor.struct_size = sizeof(sampledDescriptor);
-    sampledDescriptor.dimension = VERNON_TEXTURE_2D;
-    sampledDescriptor.format = VERNON_TEXTURE_RGBA8_UNORM;
-    sampledDescriptor.width = 1;
-    sampledDescriptor.height = 1;
-    sampledDescriptor.depth = 1;
-    sampledDescriptor.mip_levels = 1;
-    VernonDeviceTexture *sampled = vernonRuntimeTextureCreate(runtime, &sampledDescriptor);
-    ASSERT_TRUE(sampled);
+    auto vertices =
+        vernon::tests::createBuffer(context, sizeof(positions), alignof(float), VERNON_RHI_BUFFER_VERTEX, positions);
+    ASSERT_NE(vertices.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    auto firstTarget = createTexture2D(context, 32, 32, VERNON_TEXTURE_RGBA8_UNORM, VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
+    ASSERT_NE(firstTarget.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    auto secondTarget = createTexture2D(context, 48, 24, VERNON_TEXTURE_RGBA8_UNORM, VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
+    ASSERT_NE(secondTarget.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    auto sampled = createTexture2D(context, 1, 1, VERNON_TEXTURE_RGBA8_UNORM, VERNON_RHI_IMAGE_SAMPLED);
+    ASSERT_NE(sampled.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     constexpr uint8_t sampledPixel[] = {64, 200, 100, 255};
-    ASSERT_TRUE(vernonRuntimeTextureCopyFromHost(sampled, sampledPixel, sizeof(sampledPixel)) == VERNON_STATUS_OK);
-    VernonSamplerDescriptor samplerDescriptor{};
-    samplerDescriptor.struct_size = sizeof(samplerDescriptor);
-    samplerDescriptor.wrap_u = VERNON_SAMPLER_CLAMP_TO_EDGE;
-    samplerDescriptor.wrap_v = VERNON_SAMPLER_CLAMP_TO_EDGE;
-    samplerDescriptor.wrap_w = VERNON_SAMPLER_CLAMP_TO_EDGE;
-    samplerDescriptor.min_filter = VERNON_SAMPLER_NEAREST;
-    samplerDescriptor.mag_filter = VERNON_SAMPLER_NEAREST;
-    samplerDescriptor.mip_filter = VERNON_SAMPLER_NEAREST;
-    VernonDeviceSampler *textureSampler = vernonRuntimeSamplerCreate(runtime, &samplerDescriptor);
-    ASSERT_TRUE(textureSampler);
+    VernonRhiImageUploadDescriptor upload{sizeof(VernonRhiImageUploadDescriptor),
+                                          0,
+                                          0,
+                                          1,
+                                          1,
+                                          1,
+                                          VERNON_RHI_IMAGE_DATA_RGBA,
+                                          VERNON_RHI_IMAGE_DATA_UINT8,
+                                          sampledPixel};
+    ASSERT_EQ(vernonRhiDeviceUploadImage(context.device, sampled.handle, &upload, 1), VERNON_RHI_STATUS_OK);
+    auto textureSampler = vernon::tests::createSampler(context);
+    ASSERT_NE(textureSampler.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     const uint64_t shape[] = {3, 2};
     const int64_t strides[] = {2 * sizeof(float), sizeof(float)};
     VernonPipelineArgument arguments[2]{};
     arguments[0].slot = 0; // Slots are stable and sorted by source name.
     arguments[0].kind = VERNON_PIPELINE_TEXTURE;
-    arguments[0].texture = {sampled,       VERNON_TEXTURE_RGBA8_UNORM, VERNON_ACCESS_READ, VERNON_TEXTURE_2D, 1, 1, 1,
-                            textureSampler};
+    arguments[0].texture = {VERNON_TEXTURE_RGBA8_UNORM, VERNON_ACCESS_READ,      VERNON_TEXTURE_2D, 1, 1, 1,
+                            sampled.reference,          textureSampler.reference};
     arguments[1].slot = 1;
     arguments[1].kind = VERNON_PIPELINE_TENSOR;
     arguments[1].tensor.struct_size = sizeof(VernonTensorView);
-    arguments[1].tensor.storage = VERNON_TENSOR_DEVICE;
-    arguments[1].tensor.buffer = vertices;
-    arguments[1].tensor.dtype = VERNON_DATA_F32;
+    arguments[1].tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    arguments[1].tensor.resource = vertices.reference;
+    arguments[1].tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
     arguments[1].tensor.access = VERNON_ACCESS_READ;
     arguments[1].tensor.rank = 2;
     arguments[1].tensor.shape = shape;
     arguments[1].tensor.byte_strides = strides;
     arguments[1].tensor.byte_size = sizeof(positions);
-    VernonColorAttachment attachment{0, firstTarget};
+    VernonColorAttachment attachment{0, firstTarget.reference, 32, 32, VERNON_TEXTURE_RGBA8_UNORM};
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
@@ -196,10 +197,12 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(firstStats.renderPassCreations, firstStats.dynamicRendering ? 0u : 1u);
 
     constexpr uint8_t secondSampledPixel[] = {180, 40, 220, 255};
-    ASSERT_TRUE(vernonRuntimeTextureCopyFromHost(sampled, secondSampledPixel, sizeof(secondSampledPixel)) ==
-                VERNON_STATUS_OK);
-    arguments[0].texture.sampler = nullptr;
-    attachment.texture = secondTarget;
+    upload.data = secondSampledPixel;
+    ASSERT_EQ(vernonRhiDeviceUploadImage(context.device, sampled.handle, &upload, 1), VERNON_RHI_STATUS_OK);
+    arguments[0].texture.sampler_resource = {};
+    attachment.resource = secondTarget.reference;
+    attachment.width = 48;
+    attachment.height = 24;
     invocation.viewport[0] = 4;
     invocation.viewport[1] = 3;
     invocation.viewport[2] = 24;
@@ -218,7 +221,8 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(secondStats.renderPassCreations, firstStats.renderPassCreations);
 
     std::vector<uint8_t> pixels(32 * 32 * 4);
-    ASSERT_TRUE(vernonRuntimeTextureCopyToHost(firstTarget, pixels.data(), pixels.size()) == VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, firstTarget.handle, pixels.data(), pixels.size()),
+              VERNON_RHI_STATUS_OK);
     bool rendered = false;
     for (size_t index = 0; index < pixels.size(); index += 4)
         rendered |= pixels[index] != 0 || pixels[index + 1] != 0 || pixels[index + 2] != 0;
@@ -229,8 +233,9 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     ASSERT_TRUE(pixels[center + 2] > 90 && pixels[center + 2] < 110);
 
     std::vector<uint8_t> secondPixels(48 * 24 * 4);
-    ASSERT_TRUE(vernonRuntimeTextureCopyToHost(secondTarget, secondPixels.data(), secondPixels.size()) ==
-                VERNON_STATUS_OK);
+    ASSERT_EQ(
+        vernonRhiDeviceDownloadImage(context.device, secondTarget.handle, secondPixels.data(), secondPixels.size()),
+        VERNON_RHI_STATUS_OK);
     const size_t secondCenter = (9 * 48 + 16) * 4;
     EXPECT_TRUE(secondPixels[secondCenter] > 170 && secondPixels[secondCenter] < 190);
     EXPECT_TRUE(secondPixels[secondCenter + 1] > 30 && secondPixels[secondCenter + 1] < 50);
@@ -240,14 +245,15 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(secondPixels[outsideViewport + 1], 0u);
     EXPECT_EQ(secondPixels[outsideViewport + 2], 0u);
 
-    ASSERT_TRUE(vernonRuntimeSamplerFree(textureSampler) == VERNON_STATUS_OK);
-    ASSERT_TRUE(vernonRuntimeTextureFree(sampled) == VERNON_STATUS_OK);
-    ASSERT_TRUE(vernonRuntimeTextureFree(secondTarget) == VERNON_STATUS_OK);
-    ASSERT_TRUE(vernonRuntimeTextureFree(firstTarget) == VERNON_STATUS_OK);
-    ASSERT_TRUE(vernonRuntimeBufferFree(vertices) == VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroySampler(context.device, textureSampler.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, sampled.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, secondTarget.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, firstTarget.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyBuffer(context.device, vertices.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     vernonRuntimePipelineBundleDestroy(loaded);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
+    vernonRhiDestroyDevice(context.device);
 }
 
 TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
@@ -257,7 +263,8 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     std::ifstream input(manifestPath, std::ios::binary);
     const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     ASSERT_FALSE(bundle.empty());
-    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_VULKAN, nullptr);
+    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_VULKAN);
+    VernonRuntimeContext *runtime = context.runtime;
     ASSERT_NE(runtime, nullptr);
     const std::string directory = manifestPath.parent_path().u8string();
     VernonPipelineBundleLoadOptions options{};
@@ -275,9 +282,9 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     ASSERT_EQ(vernonRuntimeLoadedPipelineFindParameter(pipeline, {"factor", 6}, &factorParameter), VERNON_STATUS_OK);
 
     constexpr std::array<float, 4> source{0, 1, 2, 3};
-    VernonDeviceBuffer *buffer = vernonRuntimeBufferAllocate(runtime, sizeof(source), alignof(float));
-    ASSERT_NE(buffer, nullptr);
-    ASSERT_EQ(vernonRuntimeCopyFromHost(buffer, 0, source.data(), sizeof(source)), VERNON_STATUS_OK);
+    auto buffer =
+        vernon::tests::createBuffer(context, sizeof(source), alignof(float), VERNON_RHI_BUFFER_STORAGE, source.data());
+    ASSERT_NE(buffer.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     constexpr uint64_t shape[]{4};
     constexpr uint64_t scalarShape[]{1};
     constexpr int64_t strides[]{sizeof(float)};
@@ -286,9 +293,9 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     arguments[0].slot = valuesParameter.slot;
     arguments[0].kind = VERNON_PIPELINE_TENSOR;
     arguments[0].tensor.struct_size = sizeof(VernonTensorView);
-    arguments[0].tensor.storage = VERNON_TENSOR_DEVICE;
-    arguments[0].tensor.buffer = buffer;
-    arguments[0].tensor.dtype = VERNON_DATA_F32;
+    arguments[0].tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    arguments[0].tensor.resource = buffer.reference;
+    arguments[0].tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
     arguments[0].tensor.access = VERNON_ACCESS_WRITE;
     arguments[0].tensor.rank = 1;
     arguments[0].tensor.shape = shape;
@@ -299,7 +306,7 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     arguments[1].tensor.struct_size = sizeof(VernonTensorView);
     arguments[1].tensor.storage = VERNON_TENSOR_HOST;
     arguments[1].tensor.host_data = &factor;
-    arguments[1].tensor.dtype = VERNON_DATA_F32;
+    arguments[1].tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
     arguments[1].tensor.access = VERNON_ACCESS_READ;
     arguments[1].tensor.rank = 1;
     arguments[1].tensor.shape = scalarShape;
@@ -314,11 +321,13 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     std::array<float, 4> output{};
-    ASSERT_EQ(vernonRuntimeCopyToHost(buffer, 0, output.data(), sizeof(output)), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(context.device, buffer.handle, 0, output.data(), sizeof(output)),
+              VERNON_RHI_STATUS_OK);
     for (size_t index = 0; index < output.size(); ++index)
         EXPECT_EQ(output[index], source[index] * factor);
-    EXPECT_EQ(vernonRuntimeBufferFree(buffer), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(context.device, buffer.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     vernonRuntimePipelineBundleDestroy(loaded);
     EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
+    vernonRhiDestroyDevice(context.device);
 }

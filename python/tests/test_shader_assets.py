@@ -531,9 +531,9 @@ asset = vd.pipeline_asset(
                     self.assertEqual(repeated_path, manifest_path)
                     self.assertEqual(manifest_path.read_bytes(), first_manifest)
                     document = json.loads(manifest_path.read_text(encoding="utf-8"))
-                    self.assertEqual(document["schema_version"], 3)
+                    self.assertEqual(document["schema_version"], 4)
                     self.assertEqual(document["type"], "pipeline")
-                    self.assertEqual(document["invocation_abi_version"], 4)
+                    self.assertEqual(document["invocation_abi_version"], 6)
                     self.assertEqual(document["target"], target)
                     self.assertEqual(
                         document["target_options"],
@@ -665,9 +665,9 @@ asset = vd.pipeline_asset(
             locations = [value["vernon.location"] for value in interface if "vernon.location" in value]
             self.assertEqual(locations, [0, 1, 5, 6])
             runtime_bundle = bundle
-            self.assertEqual(runtime_bundle["schema_version"], 3)
+            self.assertEqual(runtime_bundle["schema_version"], 4)
             self.assertEqual(runtime_bundle["type"], "pipeline")
-            self.assertEqual(runtime_bundle["invocation_abi_version"], 4)
+            self.assertEqual(runtime_bundle["invocation_abi_version"], 6)
             self.assertEqual(runtime_bundle["id"], "shaders/variant_mesh")
             self.assertEqual(len(runtime_bundle["variants"]), 4)
             combined_runtime = next(

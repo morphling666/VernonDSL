@@ -183,15 +183,14 @@ def main() -> None:
     )
 
     mesh = create_scene_mesh()
-    draw_vertex_count = mesh.triangles.size
     draw_order = np.ascontiguousarray(mesh.triangles.reshape(-1))
     positions = vd.storage.from_numpy(np.ascontiguousarray(mesh.positions[draw_order]))
     normals = vd.storage.from_numpy(np.ascontiguousarray(mesh.normals[draw_order]))
     colors = vd.storage.from_numpy(np.ascontiguousarray(mesh.colors[draw_order]))
     materials = vd.storage.from_numpy(np.ascontiguousarray(mesh.materials[draw_order]))
     light_value = np.array((3.0, 5.0, 4.0), dtype=np.float32)
-    target = vd.Texture.zeros(shape=(args.size, args.size))
-    depth = vd.DepthTexture.zeros(shape=(args.size, args.size))
+    color = vd.Texture.zeros(shape=(args.size, args.size))
+    target = vd.RenderTarget(shape=(args.size, args.size)).attach_color(0, color).attach_depth(format=vd.depth32)
     features = set()
     if not args.no_shadow:
         features.add("SHADOW")
@@ -230,9 +229,8 @@ def main() -> None:
                 light_position=light_value,
                 topology=vd.triangles,
                 target=target,
-                depth=depth,
             )
-            rgba = target.to_numpy()
+            rgba = color.to_numpy()
             if args.arch == "opengl":
                 rgba = np.flipud(rgba)
             image = cv2.cvtColor(np.ascontiguousarray(rgba), cv2.COLOR_RGBA2BGRA)

@@ -2,6 +2,7 @@
 
 #include "opengl_backend.h"
 #include "rhi_internal.h"
+#include "rhi_test_hooks.h"
 #if defined(VERNON_HAS_CUDA_RHI)
 #include "cuda_backend.h"
 #endif
@@ -628,6 +629,10 @@ VernonRhiStatus fail(OpenGLDevice &device, std::string message,
 VernonRhiDevice vernon::rhi::createDevice(const VernonRhiOwnedDeviceDescriptor *descriptor) {
     if (!descriptor || descriptor->struct_size < sizeof(*descriptor))
         return invalidDevice();
+    if (descriptor->flags & ~static_cast<uint32_t>(VERNON_RHI_OWNED_DEVICE_FORCE_SOFTWARE))
+        return invalidDevice();
+    if (descriptor->backend != VERNON_RHI_BACKEND_DIRECTX12 && descriptor->flags)
+        return invalidDevice();
     if (descriptor->backend == VERNON_RHI_BACKEND_OPENGL || descriptor->backend == VERNON_RHI_BACKEND_OPENGL_ES)
         return vernonRhiCreateOpenGLDevice(descriptor->opengl_callbacks,
                                            descriptor->backend == VERNON_RHI_BACKEND_OPENGL_ES);
@@ -654,7 +659,8 @@ VernonRhiDevice vernon::rhi::createDevice(const VernonRhiOwnedDeviceDescriptor *
 #if defined(VERNON_HAS_DIRECTX12_RHI)
     if (descriptor->backend == VERNON_RHI_BACKEND_DIRECTX12) {
         auto device = std::shared_ptr<DirectX12InteropDevice>(new (std::nothrow) DirectX12InteropDevice());
-        if (!device || !device->state.initialize(descriptor->device_index, false, device->error))
+        const bool forceSoftware = (descriptor->flags & VERNON_RHI_OWNED_DEVICE_FORCE_SOFTWARE) != 0;
+        if (!device || !device->state.initialize(descriptor->device_index, forceSoftware, device->error))
             return invalidDevice();
         device->owned = true;
         device->queueCapabilities = VERNON_RHI_QUEUE_TRANSFER | VERNON_RHI_QUEUE_COMPUTE | VERNON_RHI_QUEUE_GRAPHICS;
@@ -686,6 +692,23 @@ VernonRhiDevice vernon::rhi::createDevice(const VernonRhiOwnedDeviceDescriptor *
     }
 #endif
     return invalidDevice();
+}
+
+vernon::rhi::VulkanCacheStats vernon::rhi::getVulkanCacheStats(VernonRhiDevice handle) {
+    VulkanCacheStats result;
+#if defined(VERNON_HAS_VULKAN_RHI)
+    if (auto device = lookupVulkanDevice(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        result.defaultImplicitSamplerCreations = device->state.defaultImplicitSamplerCreations;
+        result.commandBufferAllocations = device->state.commandBufferAllocations;
+        result.descriptorPoolCreations = device->state.descriptorPoolCreations;
+        result.stagingBufferAllocations = device->state.stagingBufferAllocations;
+        result.dynamicRendering = device->state.dynamicRendering;
+    }
+#else
+    (void)handle;
+#endif
+    return result;
 }
 
 extern "C" VernonRhiDevice vernonRhiCreateOpenGLDevice(const VernonOpenGLContextCallbacks *callbacks,
@@ -1363,37 +1386,60 @@ extern "C" VernonRhiStatus vernonRhiDeviceUploadImage(VernonRhiDevice handle, Ve
 #endif
 #if defined(VERNON_HAS_VULKAN_RHI)
     if (auto device = lookupVulkanDevice(handle)) {
-        if (!uploads || uploadCount != 1)
+        if (!uploads || uploadCount == 0)
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
         std::lock_guard<std::mutex> guard(device->mutex);
         VulkanImageSlot *slot = lookupVulkanSlot(device->images, image);
         if (!slot || !slot->image.owned)
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
         const VernonRhiImageDescriptor &descriptor = slot->ownedDescriptor;
-        const auto expected = rgba8Size(descriptor);
-        const VernonRhiImageUploadDescriptor &upload = uploads[0];
-        if (!expected || upload.struct_size < sizeof(upload) || upload.mip_level != 0 || upload.array_layer != 0 ||
-            upload.width != descriptor.width || upload.height != descriptor.height || upload.depth != 1 ||
-            upload.source_format != VERNON_RHI_IMAGE_DATA_RGBA || upload.source_type != VERNON_RHI_IMAGE_DATA_UINT8 ||
-            !upload.data)
+        if ((descriptor.dimension != VERNON_RHI_IMAGE_2D && descriptor.dimension != VERNON_RHI_IMAGE_CUBE) ||
+            descriptor.format != VERNON_RHI_FORMAT_RGBA8_UNORM || descriptor.depth != 1 || descriptor.mip_levels != 1)
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        size_t totalSize = 0;
+        std::vector<size_t> uploadSizes(uploadCount);
+        for (size_t index = 0; index < uploadCount; ++index) {
+            const VernonRhiImageUploadDescriptor &upload = uploads[index];
+            const bool validLayer = descriptor.dimension == VERNON_RHI_IMAGE_CUBE
+                                        ? upload.array_layer < descriptor.array_layers
+                                        : upload.array_layer == 0;
+            if (upload.struct_size < sizeof(upload) || upload.mip_level != 0 || !validLayer ||
+                upload.width != descriptor.width || upload.height != descriptor.height || upload.depth != 1 ||
+                upload.source_format != VERNON_RHI_IMAGE_DATA_RGBA ||
+                upload.source_type != VERNON_RHI_IMAGE_DATA_UINT8 || !upload.data ||
+                upload.width > (std::numeric_limits<size_t>::max)() / upload.height)
+                return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+            const size_t pixels = static_cast<size_t>(upload.width) * upload.height;
+            if (pixels > (std::numeric_limits<size_t>::max)() / 4 ||
+                pixels * 4 > (std::numeric_limits<size_t>::max)() - totalSize)
+                return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+            uploadSizes[index] = pixels * 4;
+            totalSize += uploadSizes[index];
+        }
         VkBuffer staging = VK_NULL_HANDLE;
         VkDeviceSize stagingOffset = 0;
         uint8_t *mapped = nullptr;
-        if (!device->state.acquireStaging(true, *expected, 16, staging, stagingOffset, mapped, device->error))
+        if (!device->state.acquireStaging(true, totalSize, 16, staging, stagingOffset, mapped, device->error))
             return VERNON_RHI_STATUS_INTERNAL_ERROR;
-        std::memcpy(mapped, upload.data, *expected);
+        std::vector<VkBufferImageCopy> regions(uploadCount);
+        size_t byteOffset = 0;
+        for (size_t index = 0; index < uploadCount; ++index) {
+            std::memcpy(mapped + byteOffset, uploads[index].data, uploadSizes[index]);
+            VkBufferImageCopy &region = regions[index];
+            region.bufferOffset = stagingOffset + byteOffset;
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.baseArrayLayer = uploads[index].array_layer;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent = {uploads[index].width, uploads[index].height, 1};
+            byteOffset += uploadSizes[index];
+        }
         VkCommandBuffer command = VK_NULL_HANDLE;
         if (!device->state.beginCommands(command, device->error))
             return VERNON_RHI_STATUS_INTERNAL_ERROR;
         transitionVulkanImage(command, *slot, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        VkBufferImageCopy region{};
-        region.bufferOffset = stagingOffset;
-        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.imageSubresource.layerCount = 1;
-        region.imageExtent = {descriptor.width, descriptor.height, 1};
         vernon::rhi::vulkan::driver().cmdCopyBufferToImage(command, staging, slot->image.image,
-                                                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+                                                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                                           static_cast<uint32_t>(regions.size()), regions.data());
         transitionVulkanImage(command, *slot, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         return device->state.submitCommands(command, device->error) ? VERNON_RHI_STATUS_OK
                                                                     : VERNON_RHI_STATUS_INTERNAL_ERROR;
@@ -2112,9 +2158,15 @@ extern "C" VernonRhiStatus vernonRhiDeviceGetBufferNativeHandle(VernonRhiDevice 
         return VERNON_RHI_STATUS_OK;
     }
 #endif
-    (void)buffer;
-    (void)output;
-    return lookupDevice(handle) ? VERNON_RHI_STATUS_UNSUPPORTED : VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto device = lookupDevice(handle);
+    if (!device || !output)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    BufferSlot *slot = lookupBuffer(*device, buffer);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    *output = reinterpret_cast<void *>(static_cast<uintptr_t>(slot->buffer.name));
+    return VERNON_RHI_STATUS_OK;
 }
 
 extern "C" VernonRhiStatus

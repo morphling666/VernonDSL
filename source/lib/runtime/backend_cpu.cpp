@@ -149,10 +149,8 @@ VernonStatus prepareCpuPipeline(void *data, const VernonRuntimeProviderPipelineD
 
 VernonStatus retainCpuResource(void *data, VernonRuntimeProviderResourceReference resource) {
     auto &context = *static_cast<CpuContextState *>(data);
-    auto *buffer = reinterpret_cast<VernonDeviceBuffer *>(static_cast<uintptr_t>(resource.resource.value));
-    if (resource.identity != static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data)) || !buffer ||
-        buffer->context->backend != VERNON_RUNTIME_CPU || resource.offset > buffer->size ||
-        resource.size > buffer->size - resource.offset)
+    if (resource.identity != static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data)) || !resource.resource.value ||
+        !resource.size)
         return fail(context.error, "CPU provider resource reference is invalid");
     return VERNON_STATUS_OK;
 }
@@ -177,16 +175,20 @@ VernonStatus updateCpuBindingsImpl(CpuContextState &context, CpuPreparedBindings
             argument.cpuSize > bindings.packed.size() - argument.cpuOffset)
             return fail(context.error, "CPU provider binding does not match reflection");
         if (value.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            auto *buffer =
-                reinterpret_cast<VernonDeviceBuffer *>(static_cast<uintptr_t>(value.resource.resource.value));
-            if (!buffer || buffer->context->backend != VERNON_RUNTIME_CPU ||
+            if (!value.resource.resource.value ||
                 value.resource.identity != static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&context)) ||
-                value.resource.offset > buffer->size || value.resource.size > buffer->size - value.resource.offset ||
-                argument.cpuSize != sizeof(uintptr_t))
+                !value.resource.size)
                 return fail(context.error, "CPU provider storage binding is invalid");
-            const uintptr_t pointer = reinterpret_cast<uintptr_t>(cpuBufferState(*buffer).storage.data() +
-                                                                  static_cast<size_t>(value.resource.offset));
-            std::memcpy(bindings.packed.data() + argument.cpuOffset, &pointer, sizeof(pointer));
+            const auto *storage = reinterpret_cast<const uint8_t *>(
+                static_cast<uintptr_t>(value.resource.resource.value) + value.resource.offset);
+            if (argument.cpuSize == sizeof(uintptr_t)) {
+                const uintptr_t pointer = reinterpret_cast<uintptr_t>(storage);
+                std::memcpy(bindings.packed.data() + argument.cpuOffset, &pointer, sizeof(pointer));
+            } else {
+                if (value.resource.size < argument.cpuSize)
+                    return fail(context.error, "CPU provider storage binding is smaller than the inline argument");
+                std::memcpy(bindings.packed.data() + argument.cpuOffset, storage, argument.cpuSize);
+            }
         } else {
             if (!value.inline_data || value.inline_size != argument.cpuSize)
                 return fail(context.error, "CPU provider inline binding is invalid");
@@ -419,27 +421,6 @@ bool loadCpuNativeArtifact(const CpuNativeArtifact &artifact, CpuKernelState &st
                 ? "CPU AOT object symbol '" + artifact.symbol + "' was not statically registered"
                 : "CPU AOT library does not export symbol '" + artifact.symbol + "'";
     return false;
-}
-
-bool createCpuBuffer(VernonDeviceBuffer &buffer) {
-    auto *state = new CpuBufferState();
-    state->storage.resize(buffer.size);
-    installRuntimeBackendState(buffer, state);
-    return true;
-}
-
-VernonStatus copyToCpuBuffer(VernonDeviceBuffer &buffer, size_t offset, const void *source, size_t size) {
-    if (!source || offset > buffer.size || size > buffer.size - offset)
-        return fail(buffer.context->error, "invalid compute buffer upload");
-    std::memcpy(cpuBufferState(buffer).storage.data() + offset, source, size);
-    return VERNON_STATUS_OK;
-}
-
-VernonStatus copyFromCpuBuffer(const VernonDeviceBuffer &buffer, size_t offset, void *destination, size_t size) {
-    if (!destination || offset > buffer.size || size > buffer.size - offset)
-        return fail(buffer.context->error, "invalid compute buffer readback");
-    std::memcpy(destination, cpuBufferState(buffer).storage.data() + offset, size);
-    return VERNON_STATUS_OK;
 }
 
 } // namespace vernon::runtime

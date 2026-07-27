@@ -17,6 +17,8 @@ SCALAR_TYPES = {
     for scalar in (
         ScalarType("bool", "i1", "bool", "bool", 1),
         ScalarType("i32", "i32", "int32", "signed", 32),
+        # MLIR arith uses signless integers; unsigned semantics live in ops
+        # such as uitofp/divui and in Vernon's ABI dtype metadata.
         ScalarType("u32", "i32", "uint32", "unsigned", 32),
         ScalarType("f16", "f16", "float16", "float", 16),
         ScalarType("f32", "f32", "float32", "float", 32),

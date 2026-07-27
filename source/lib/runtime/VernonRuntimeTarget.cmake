@@ -60,7 +60,8 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_manifest.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_metadata.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_core.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/tensor_bridge.cpp)
+        ${_VERNON_RUNTIME_IMPL_DIR}/tensor_bridge.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/vertex_attribute_capabilities.cpp)
     add_library(Vernon::RuntimeCore ALIAS VernonRuntimeCore)
     add_library(VernonRuntimeInternals ALIAS VernonRuntimeCore)
     set_target_properties(VernonRuntimeCore PROPERTIES EXPORT_NAME RuntimeCore POSITION_INDEPENDENT_CODE ON)
@@ -116,11 +117,9 @@ function(vernon_add_runtime)
         target_compile_definitions(VernonRuntime PUBLIC VERNON_RUNTIME_STATIC)
     endif()
     if(VERNON_ENABLE_CUDA_RUNTIME)
-        target_sources(VernonRuntime PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/backend_cuda.cpp)
         target_compile_definitions(VernonRuntime PUBLIC VERNON_HAS_CUDA_RUNTIME=1)
     endif()
     if(VERNON_ENABLE_VULKAN_RUNTIME)
-        target_sources(VernonRuntime PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/backend_vulkan.cpp)
         target_compile_definitions(
             VernonRuntime
             PUBLIC VERNON_HAS_VULKAN_RUNTIME=1
@@ -131,7 +130,6 @@ function(vernon_add_runtime)
         if(NOT WIN32)
             message(FATAL_ERROR "VERNON_ENABLE_DIRECTX12_RUNTIME is supported only on Windows")
         endif()
-        target_sources(VernonRuntime PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/backend_directx12.cpp)
         target_compile_definitions(
             VernonRuntime
             PUBLIC VERNON_HAS_DIRECTX12_RUNTIME=1
@@ -176,6 +174,7 @@ function(vernon_add_runtime)
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.hpp
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntime.h
+              ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntime.hpp
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntimeCore.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntimeProvider.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntimeRHIAdapter.h

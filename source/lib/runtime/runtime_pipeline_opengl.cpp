@@ -158,10 +158,20 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
             candidate.layout.array_count = 1;
             candidate.binding.externalSlot = parameter.slot;
-            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" &&
-                (!use.uniformName.empty() || (use.uniformLayout && use.uniformLayout->storage == "uniform_buffer"))) {
+            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.uniformLayout &&
+                use.uniformLayout->storage == "storage_buffer" && parameter.elementLayout.byteSize &&
+                use.binding != UINT32_MAX) {
+                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
+                candidate.layout.element_size = parameter.elementLayout.byteSize;
+                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
+                candidate.layout.binding = use.binding;
+                candidate.layout.set = use.descriptorSet;
+                candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_STORAGE;
+            } else if (parameter.kind == "tensor" && use.interfaceKind == "uniform" &&
+                       (!use.uniformName.empty() ||
+                        (use.uniformLayout && use.uniformLayout->storage == "uniform_buffer"))) {
                 const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
-                const std::optional<VernonDataType> dtype = pipelineDataType(parameter.dtype);
+                const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
                 uint64_t valueCount = 1;
                 for (uint64_t dimension : shape) {
                     if (dimension == 0 || valueCount > UINT32_MAX / dimension) {
@@ -172,7 +182,7 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 }
                 const bool buffered = use.uniformLayout && use.uniformLayout->storage == "uniform_buffer";
                 const bool nativeInline =
-                    parameter.dtype == "f32" &&
+                    use.dtype == "f32" &&
                     (shape.empty() || (shape.size() == 1 && shape[0] <= 4) ||
                      (shape.size() == 2 && shape[0] >= 2 && shape[0] <= 4 && shape[1] >= 2 && shape[1] <= 4));
                 if (!dtype || valueCount == 0 || (!buffered && !nativeInline)) {
@@ -196,7 +206,7 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 candidate.layout.set = use.descriptorSet;
                 candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_UNIFORM;
                 candidate.name = use.uniformName;
-                candidate.binding.packing.dtype = *dtype;
+                candidate.binding.packing.elementSize = elementSize;
                 candidate.binding.packing.shape = shape;
                 candidate.binding.packing.byteSize = static_cast<size_t>(physicalSize);
                 if (use.uniformLayout && buffered) {
@@ -230,20 +240,23 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 }
             } else if (parameter.kind == "tensor" && use.interfaceKind == "input" && use.stage == "vertex" &&
                        use.location != UINT32_MAX && !use.attributeLeaves.empty()) {
-                const std::optional<VernonDataType> dtype = pipelineDataType(parameter.dtype);
-                if (!dtype || dataTypeSize(*dtype) == 0) {
-                    useRhiGraphics = false;
-                    break;
-                }
                 candidate.layout.kind = VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
-                candidate.layout.element_size = static_cast<uint32_t>(dataTypeSize(*dtype));
+                candidate.layout.element_size = parameter.elementLayout.byteSize;
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_VERTEX_INPUT;
                 candidate.layout.binding = parameter.slot;
                 candidate.layout.divisor = use.divisor;
-                for (const AttributeLeaf &leaf : use.attributeLeaves)
+                for (const AttributeLeaf &leaf : use.attributeLeaves) {
+                    const std::optional<VernonDataType> dtype = pipelineDataType(leaf.dtype);
+                    if (!dtype) {
+                        useRhiGraphics = false;
+                        break;
+                    }
                     candidate.attributes.push_back({candidate.layout.binding, use.location + leaf.locationOffset,
                                                     static_cast<uint32_t>(*dtype), leaf.componentCount,
                                                     leaf.byteOffset});
+                }
+                if (!useRhiGraphics)
+                    break;
                 candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_VERTEX;
             } else if (parameter.kind == "texture" && use.interfaceKind == "resource" && use.descriptorSet == 0 &&
                        use.binding != UINT32_MAX) {
@@ -409,8 +422,6 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
     OpenGLPipelineState &state = runtimeBackendState<OpenGLPipelineState>(pipeline);
     if (!state.rhiPipeline)
         return VERNON_STATUS_OK;
-    const auto &adapter = *openGLState(*pipeline.context).adapter;
-    const uint64_t identity = openGLRhiAdapterResourceIdentity(adapter);
     for (size_t bindingIndex = 0; bindingIndex < state.rhiLayout.size(); ++bindingIndex) {
         const auto &layout = state.rhiLayout[bindingIndex];
         auto &prepared = state.rhiInlineBindings[bindingIndex];
@@ -421,63 +432,51 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
         if (prepared.source == OpenGLPipelineState::InlineBinding::EXTERNAL_VERTEX) {
             const auto found = plan.arguments.find(prepared.externalSlot);
             if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
-                (found->second->tensor.storage != VERNON_TENSOR_DEVICE &&
-                 found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE) ||
-                (!found->second->tensor.buffer && !found->second->tensor.resource.resource.value))
+                found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
+                !found->second->tensor.resource.resource.value)
                 return fail(*pipeline.context, "OpenGL RHI vertex argument is missing");
             const VernonTensorView &tensor = found->second->tensor;
             if (!tensor.byte_strides || tensor.byte_strides[0] <= 0 ||
                 static_cast<uint64_t>(tensor.byte_strides[0]) > UINT32_MAX)
                 return fail(*pipeline.context, "OpenGL RHI vertex Tensor strides are invalid");
-            if (tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
-                value.resource = tensor.resource;
-                value.resource.offset += tensor.byte_offset;
-            } else {
-                value.resource.identity = identity;
-                value.resource.resource.value = openGLBufferState(*tensor.buffer).name;
-                value.resource.offset = tensor.byte_offset;
-                value.resource.size = tensor.buffer->size;
-            }
+            value.resource = tensor.resource;
+            value.resource.offset += tensor.byte_offset;
             value.stride = static_cast<uint32_t>(tensor.byte_strides[0]);
+            continue;
+        }
+        if (prepared.source == OpenGLPipelineState::InlineBinding::EXTERNAL_STORAGE) {
+            const auto found = plan.arguments.find(prepared.externalSlot);
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
+                found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
+                !found->second->tensor.resource.resource.value)
+                return fail(*pipeline.context, "OpenGL RHI storage argument is missing");
+            const VernonTensorView &tensor = found->second->tensor;
+            value.resource = tensor.resource;
+            value.resource.offset += tensor.byte_offset;
             continue;
         }
         if (prepared.source == OpenGLPipelineState::InlineBinding::EXTERNAL_TEXTURE) {
             const auto found = plan.arguments.find(prepared.externalSlot);
             if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TEXTURE ||
-                (!found->second->texture.texture && !found->second->texture.resource.resource.value))
+                !found->second->texture.resource.resource.value)
                 return fail(*pipeline.context, "OpenGL RHI texture argument is missing");
-            if (found->second->texture.resource.resource.value) {
-                value.resource = found->second->texture.resource;
-                value.stride = static_cast<uint32_t>(found->second->texture.dimension);
-            } else {
-                const VernonDeviceTexture &texture = *found->second->texture.texture;
-                value.resource.identity = identity;
-                value.resource.resource.value = openGLTextureState(texture).name;
-                value.stride = static_cast<uint32_t>(texture.dimension);
-            }
+            value.resource = found->second->texture.resource;
+            value.stride = static_cast<uint32_t>(found->second->texture.dimension);
             continue;
         }
         if (prepared.source == OpenGLPipelineState::InlineBinding::EXTERNAL_SAMPLER) {
             const auto found = plan.arguments.find(prepared.externalSlot);
             if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_SAMPLER ||
-                (!found->second->sampler && !found->second->resource.resource.value))
+                !found->second->resource.resource.value)
                 return fail(*pipeline.context, "OpenGL RHI sampler argument is missing");
-            if (found->second->resource.resource.value)
-                value.resource = found->second->resource;
-            else {
-                value.resource.identity = identity;
-                value.resource.resource.value = openGLSamplerState(*found->second->sampler).name;
-            }
+            value.resource = found->second->resource;
             continue;
         }
         if (prepared.source == OpenGLPipelineState::InlineBinding::IMPLICIT_SAMPLER) {
             const auto sampled = plan.sampledResources.find({layout.set, layout.binding});
             if (sampled == plan.sampledResources.end())
                 return fail(*pipeline.context, "OpenGL RHI implicit sampler binding is missing");
-            if (sampled->second.sampler) {
-                value.resource.identity = identity;
-                value.resource.resource.value = openGLSamplerState(*sampled->second.sampler).name;
-            } else if (sampled->second.samplerResource.resource.value) {
+            if (sampled->second.samplerResource.resource.value) {
                 value.resource = sampled->second.samplerResource;
             } else {
                 value.flags = VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE;
@@ -494,7 +493,7 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
         const VernonTensorView &tensor = found->second->tensor;
         TensorPackingLayout packing = prepared.packing;
         bool transpose = prepared.transpose;
-        const size_t elementSize = dataTypeSize(tensor.dtype);
+        const size_t elementSize = tensor.element_layout.byte_size;
         if (transpose && tensor.rank == 2 && tensor.byte_strides &&
             tensor.byte_strides[0] == static_cast<int64_t>(elementSize) &&
             tensor.byte_strides[1] == static_cast<int64_t>(tensor.shape[0] * elementSize)) {
@@ -528,20 +527,10 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
     for (size_t index = 0; index < plan.attachments.size(); ++index) {
         const VernonColorAttachment &source = *plan.attachments[index];
         attachments[index].location = source.location;
-        if (source.resource.resource.value)
-            attachments[index].image = source.resource;
-        else {
-            attachments[index].image.identity = identity;
-            attachments[index].image.resource.value = openGLTextureState(*source.texture).name;
-        }
+        attachments[index].image = source.resource;
     }
     if (plan.depthAttachment) {
-        if (plan.depthAttachment->resource.resource.value)
-            depthAttachment = plan.depthAttachment->resource;
-        else {
-            depthAttachment.identity = identity;
-            depthAttachment.resource.value = openGLTextureState(*plan.depthAttachment->texture).name;
-        }
+        depthAttachment = plan.depthAttachment->resource;
     }
     const bool hasViewport = invocation.viewport[2] && invocation.viewport[3];
     VernonRuntimeCoreDrawInvocation draw{};
@@ -557,14 +546,8 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
     draw.viewport[3] = hasViewport ? invocation.viewport[3] : plan.attachmentHeight;
     draw.topology = invocation.topology;
     if (plan.indexBinding) {
-        if (plan.indexBinding->resource.resource.value)
-            draw.index_buffer = plan.indexBinding->resource;
-        else {
-            draw.index_buffer.identity = identity;
-            draw.index_buffer.resource.value = openGLBufferState(*plan.indexBinding->buffer).name;
-            draw.index_buffer.offset = plan.indexBinding->offset;
-            draw.index_buffer.size = plan.indexBinding->buffer->size;
-        }
+        draw.index_buffer = plan.indexBinding->resource;
+        draw.index_buffer.offset += plan.indexBinding->offset;
         draw.index_count = plan.indexBinding->index_count;
         draw.index_type = plan.indexBinding->type;
     }
@@ -584,7 +567,6 @@ VernonStatus invokeOpenGLComputePipeline(VernonLoadedPipeline &pipeline, const P
     OpenGLPipelineState &state = runtimeBackendState<OpenGLPipelineState>(pipeline);
     if (!state.rhiPipeline)
         return fail(*pipeline.context, "OpenGL provider compute pipeline is not loaded");
-    const uint64_t identity = openGLRhiAdapterResourceIdentity(*openGLState(*pipeline.context).adapter);
     for (size_t index = 0; index < state.rhiLayout.size(); ++index) {
         const auto &layout = state.rhiLayout[index];
         if (layout.argument_index >= launch.arguments.size())
@@ -595,16 +577,9 @@ VernonStatus invokeOpenGLComputePipeline(VernonLoadedPipeline &pipeline, const P
         value.slot = layout.slot;
         value.kind = layout.kind;
         if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            if (argument.kind != ComputeLaunchArgumentKind::Tensor ||
-                (!argument.buffer && !argument.resource.resource.value))
-                return fail(*pipeline.context, "OpenGL prepared storage binding requires a device Tensor");
-            if (argument.resource.resource.value)
-                value.resource = argument.resource;
-            else {
-                value.resource.identity = identity;
-                value.resource.resource.value = openGLBufferState(*argument.buffer).name;
-                value.resource.size = argument.buffer->size;
-            }
+            if (argument.kind != ComputeLaunchArgumentKind::Tensor || !argument.resource.resource.value)
+                return fail(*pipeline.context, "OpenGL prepared storage binding requires an RHI Tensor");
+            value.resource = argument.resource;
         } else {
             if (argument.kind != ComputeLaunchArgumentKind::Scalar || !argument.scalarData || !argument.scalarSize)
                 return fail(*pipeline.context, "OpenGL prepared inline binding requires host data");

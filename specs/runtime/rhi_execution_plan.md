@@ -197,17 +197,17 @@ the old Runtime backend and RHI backend. Until a slice reaches parity, route
 production through the old path and test the RHI path explicitly; after parity,
 switch callers and delete the old implementation in the same phase.
 
-## Remaining legacy removal
+## Legacy resource removal
 
-Complete these steps after profiling and optimizing the shared RHI execution
-path:
-
-1. Migrate Vernon Engine to RHI handles.
-2. Migrate all C++ backend tests to owned RHI devices and resources.
-3. Change Python CPU invocation to use host tensors directly.
-4. Delete Runtime resource creation/import APIs, legacy resource structures,
-   and pipeline fallback branches.
-5. Delete legacy backend resource implementations and temporary Engine bridges.
+- [x] Vernon Engine and Python GPU callers use owned or borrowed VernonRHI
+  devices and provider resource references.
+- [x] CPU compute consumes contiguous host Tensor bytes directly.
+- [x] Runtime no longer exposes resource allocation, transfer, import, or
+  `VernonDevice*` APIs.
+- [x] Compute/graphics planners and backend pipelines accept only host values
+  or provider references; the `VERNON_TENSOR_DEVICE` fallback is removed.
+- [x] Parallel backend resource implementations and the temporary Engine
+  OpenGL texture bridge are removed.
 
 ## Performance gate before legacy removal
 

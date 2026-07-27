@@ -15,7 +15,7 @@ TEST(TensorBridgeTest, KeepsContiguousHostTensorAsSingleLogicalRange) {
     VernonTensorView tensor{sizeof(VernonTensorView),
                             VERNON_TENSOR_HOST,
                             {values.data()},
-                            VERNON_DATA_F32,
+                            vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32),
                             VERNON_ACCESS_READ,
                             2,
                             shape.data(),
@@ -38,7 +38,7 @@ TEST(TensorBridgeTest, PacksMaximalContiguousInnerRows) {
     VernonTensorView tensor{sizeof(VernonTensorView),
                             VERNON_TENSOR_HOST,
                             {padded.data()},
-                            VERNON_DATA_F32,
+                            vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32),
                             VERNON_ACCESS_READ,
                             2,
                             shape.data(),
@@ -61,7 +61,7 @@ TEST(TensorBridgeTest, PacksFullyStridedTensorByLogicalIndex) {
     VernonTensorView tensor{sizeof(VernonTensorView),
                             VERNON_TENSOR_HOST,
                             {source.data()},
-                            VERNON_DATA_F32,
+                            vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32),
                             VERNON_ACCESS_READ,
                             2,
                             shape.data(),
@@ -78,7 +78,7 @@ TEST(TensorBridgeTest, PacksFullyStridedTensorByLogicalIndex) {
 TEST(TensorBridgeTest, RejectsLogicalByteSizeOverflow) {
     const std::array<uint64_t, 1> shape{static_cast<uint64_t>(std::numeric_limits<size_t>::max())};
     VernonTensorView tensor{};
-    tensor.dtype = VERNON_DATA_F64;
+    tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F64);
     tensor.rank = 1;
     tensor.shape = shape.data();
 
@@ -93,7 +93,7 @@ TEST(TensorBridgeTest, PacksNegativeStrideFromLogicalFirstElement) {
     VernonTensorView tensor{sizeof(VernonTensorView),
                             VERNON_TENSOR_HOST,
                             {source.data()},
-                            VERNON_DATA_F32,
+                            vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32),
                             VERNON_ACCESS_READ,
                             1,
                             shape.data(),
@@ -116,7 +116,7 @@ TEST(TensorBridgeTest, PacksNonSquareMatrixIntoReflectedColumnMajorLayout) {
     VernonTensorView tensor{sizeof(VernonTensorView),
                             VERNON_TENSOR_HOST,
                             {source.data()},
-                            VERNON_DATA_F32,
+                            vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32),
                             VERNON_ACCESS_READ,
                             2,
                             shape.data(),
@@ -124,7 +124,7 @@ TEST(TensorBridgeTest, PacksNonSquareMatrixIntoReflectedColumnMajorLayout) {
                             0,
                             sizeof(source)};
     vernon::runtime::TensorPackingLayout layout{
-        VERNON_DATA_F32, {2, 3}, {sizeof(float), 2 * sizeof(float)}, sizeof(expected)};
+        sizeof(float), {2, 3}, {sizeof(float), 2 * sizeof(float)}, sizeof(expected)};
 
     const auto packed = vernon::runtime::packTensor(tensor, layout);
     ASSERT_TRUE(packed);
@@ -138,14 +138,14 @@ TEST(TensorBridgeTest, PacksRankThreeTensorWithReflectedPadding) {
     VernonTensorView tensor{sizeof(VernonTensorView),
                             VERNON_TENSOR_HOST,
                             {source.data()},
-                            VERNON_DATA_F32,
+                            vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32),
                             VERNON_ACCESS_READ,
                             3,
                             shape.data(),
                             strides.data(),
                             0,
                             sizeof(source)};
-    vernon::runtime::TensorPackingLayout layout{VERNON_DATA_F32, {2, 2, 2}, {32, 16, 4}, 56};
+    vernon::runtime::TensorPackingLayout layout{sizeof(float), {2, 2, 2}, {32, 16, 4}, 56};
 
     const auto packed = vernon::runtime::packTensor(tensor, layout);
     ASSERT_TRUE(packed);
@@ -157,6 +157,43 @@ TEST(TensorBridgeTest, PacksRankThreeTensorWithReflectedPadding) {
         std::memcpy(&value, packed->data() + outer * 32 + middle * 16 + inner * 4, sizeof(value));
         EXPECT_EQ(value, source[linear]);
     }
+}
+
+TEST(TensorBridgeTest, PacksCompleteAggregateElementsFromPaddedRecords) {
+    struct Record {
+        float position;
+        uint32_t padding;
+        int32_t id;
+        uint32_t recordPadding;
+    };
+    const std::array<Record, 2> source{{{1.5f, 0xaaaaaaaa, 7, 0xbbbbbbbb}, {2.5f, 0xcccccccc, 9, 0xdddddddd}}};
+    static constexpr VernonValueLeafView leaves[] = {
+        {VERNON_DATA_F32, 1, 0},
+        {VERNON_DATA_I32, 1, 8},
+    };
+    static constexpr char hash[] = "mixed-test-layout";
+    const VernonValueLayoutView layout{sizeof(VernonValueLayoutView), 12,     4,
+                                       {hash, sizeof(hash) - 1},      leaves, std::size(leaves)};
+    const std::array<uint64_t, 1> shape{2};
+    const std::array<int64_t, 1> strides{sizeof(Record)};
+    VernonTensorView tensor{sizeof(VernonTensorView),
+                            VERNON_TENSOR_HOST,
+                            {source.data()},
+                            layout,
+                            VERNON_ACCESS_READ,
+                            1,
+                            shape.data(),
+                            strides.data(),
+                            0,
+                            sizeof(source)};
+
+    EXPECT_TRUE(vernon::runtime::tensorFitsAllocation(tensor));
+    EXPECT_FALSE(vernon::runtime::isRowMajorContiguous(tensor));
+    const auto packed = vernon::runtime::packTensorRowMajor(tensor);
+    ASSERT_TRUE(packed);
+    ASSERT_EQ(packed->size(), 24u);
+    EXPECT_EQ(std::memcmp(packed->data(), source.data(), 12), 0);
+    EXPECT_EQ(std::memcmp(packed->data() + 12, source.data() + 1, 12), 0);
 }
 
 } // namespace

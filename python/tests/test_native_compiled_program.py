@@ -5,7 +5,10 @@ import json
 import struct
 import unittest
 
+import numpy as np
+import vernon_dsl as vd
 from vernon_dsl import _native as native
+from vernon_dsl._runtime.resources import _bind_native_argument
 from vernon_dsl.frontend.lowering import compile_source
 
 CPU_MODULE = r"""
@@ -112,6 +115,11 @@ module attributes {
       %value: tuple<f32, i32> {
         vernon.abi_alignment = 4 : i64,
         vernon.abi_field_offsets = array<i64: 0, 4>,
+        vernon.abi_layout_hash = "b5eb9ece18126ac79faf85eeb27a05a40f9d8001124b3ee648704050af420694",
+        vernon.abi_leaf_counts = array<i64: 1, 1>,
+        vernon.abi_leaf_dtypes = ["f32", "i32"],
+        vernon.abi_leaf_offsets = array<i64: 0, 4>,
+        vernon.abi_leaf_paths = ["[0]", "[1]"],
         vernon.abi_size = 8 : i64,
         vernon.interface = "input",
         vernon.location = 0 : i64
@@ -120,6 +128,11 @@ module attributes {
       tuple<f32, i32> {
         vernon.abi_alignment = 4 : i64,
         vernon.abi_field_offsets = array<i64: 0, 4>,
+        vernon.abi_layout_hash = "b5eb9ece18126ac79faf85eeb27a05a40f9d8001124b3ee648704050af420694",
+        vernon.abi_leaf_counts = array<i64: 1, 1>,
+        vernon.abi_leaf_dtypes = ["f32", "i32"],
+        vernon.abi_leaf_offsets = array<i64: 0, 4>,
+        vernon.abi_leaf_paths = ["[0]", "[1]"],
         vernon.abi_size = 8 : i64,
         vernon.interface = "output",
         vernon.location = 0 : i64
@@ -240,6 +253,7 @@ class CompiledProgramTests(unittest.TestCase):
             ],
         )
 
+        vd.init(arch=vd.cpu)
         runtime = native.Runtime(native.RuntimeBackend.CPU)
         with self.assertRaisesRegex(RuntimeError, "CPU entry 'missing' was not found"):
             runtime.load_cpu_entry(program, "missing")
@@ -247,10 +261,11 @@ class CompiledProgramTests(unittest.TestCase):
         del program
         gc.collect()
 
-        values = runtime.allocate(12, 4)
-        values.upload(struct.pack("=3f", 2.0, 4.0, 6.0))
-        pipeline.invoke(3, 1, 1, [values])
-        self.assertEqual(struct.unpack("=3f", values.download()), (3.0, 5.0, 7.0))
+        values = vd.storage.from_numpy(np.array([2.0, 4.0, 6.0], dtype=np.float32))
+        invocation = pipeline.invocation_builder()
+        _bind_native_argument(invocation, pipeline.parameters[0], values)
+        invocation.grid(3, 1, 1).invoke()
+        np.testing.assert_array_equal(values.to_numpy(), np.array([3.0, 5.0, 7.0], dtype=np.float32))
 
     def test_cpu_tuple_create_and_constant_extract_lowering(self) -> None:
         program = native.Compiler().compile_program_result(CPU_TUPLE_MODULE, native.Target.CPU)

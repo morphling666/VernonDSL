@@ -65,6 +65,10 @@ typedef enum VernonRhiBackend {
     VERNON_RHI_BACKEND_OPENGL_ES = 4
 } VernonRhiBackend;
 
+typedef enum VernonRhiOwnedDeviceFlagBits {
+    VERNON_RHI_OWNED_DEVICE_FORCE_SOFTWARE = 1u << 0
+} VernonRhiOwnedDeviceFlagBits;
+
 typedef enum VernonRhiQueueCapabilityBits {
     VERNON_RHI_QUEUE_TRANSFER = 1u << 0,
     VERNON_RHI_QUEUE_COMPUTE = 1u << 1,
@@ -211,7 +215,8 @@ typedef struct VernonRhiOwnedDeviceDescriptor {
     VernonRhiBackend backend;
     uint32_t device_index;
     const VernonOpenGLContextCallbacks *opengl_callbacks;
-    uint32_t reserved[4];
+    uint32_t flags;
+    uint32_t reserved[3];
 } VernonRhiOwnedDeviceDescriptor;
 
 typedef struct VernonRhiQueueDescriptor {

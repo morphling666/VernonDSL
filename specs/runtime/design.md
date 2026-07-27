@@ -15,11 +15,10 @@ formats.
 ## Backend loading
 
 `VernonRuntime` owns the Win32/POSIX library loader used by CPU native-library
-descriptors, CUDA, and Vulkan. CPU relocatable objects resolve through the
-static entry registry. CUDA Driver and Vulkan loader symbols are resolved at
-runtime; Vulkan headers are compile-only. This keeps LLVM, LLD, GLFW, CUDA
-Toolkit libraries, and the Vulkan loader import library outside the deployable
-runtime dependency closure.
+descriptors. CPU relocatable objects resolve through the static entry registry.
+VernonRHI owns CUDA Driver and Vulkan loader discovery; Vulkan headers are
+compile-only. This keeps LLVM, LLD, GLFW, CUDA Toolkit libraries, and the
+Vulkan loader import library outside the deployable runtime dependency closure.
 
 OpenGL function resolution is isolated in `backend_opengl_driver`; unlike CUDA
 and Vulkan it consumes context callbacks. OpenGL and OpenGL ES are distinct
@@ -28,11 +27,11 @@ GLSL profile. Cooked GLSL is an external content-addressed artifact;
 interactive GLSL remains inline.
 
 Context ownership is a separate layer: `Context Owner -> external callbacks ->
-AHI`. `VernonRuntime` is the GLFW-free AHI and always consumes the same
-external-context contract. Vernon Engine supplies callbacks for its existing
-context. The Python wheel's separate `_gl_context` extension links GLFW, owns a
-hidden window/context, and keeps that owner alive until after all AHI children
-and the runtime are destroyed. Runtime-only builds never discover GLFW.
+VernonRHI -> Runtime adapter`. Vernon Engine and Python each create one RHI
+device for their existing or hidden context, then create Runtime for that
+device. The Python wheel's separate `_gl_context` extension links GLFW and
+keeps the context owner alive until after Runtime and RHI children are
+destroyed. Runtime-only builds never discover GLFW.
 
 The OpenGL function table, external-context callbacks, buffers, images,
 samplers, shader compilation, programs, vertex arrays, and attachment
@@ -89,12 +88,29 @@ Execution is split across RuntimeCore and backend-specific providers:
   engine may instead implement the SPI with its own RHI and depend only on
   RuntimeCore.
 - `RuntimeCpuProvider` implements the Compute facet directly over CPU AOT/JIT
-  entries and host buffers. It does not link VernonRHI; dispatch is synchronous.
+  entries and contiguous host Tensor bytes. It does not link VernonRHI;
+  dispatch is synchronous.
 
 RuntimeCore never owns textures, framebuffers, render graphs, queues, or
 resource state. Provider-owned resource references are non-owning opaque
 handles with immutable metadata. The provider owns allocation, barriers,
 submission, completion, and transient descriptor/upload storage.
+
+## Reflection-driven structured Value binding
+
+The public C++ `PipelineInvocationBuilder` packs field trees, Tensor
+structure-of-arrays views, and per-element callbacks into runtime-owned
+canonical bytes. It resolves every leaf through the reflected field/index path
+under one source parameter name and validates dtype, static leaf shape, outer
+Tensor shape, duplicates, and completeness. Native C++ struct layout is never
+inferred or reinterpreted. Scalar static-Tensor leaves carry their shape in
+reflection because scalar count alone cannot distinguish layouts such as
+`Tensor[f32, (2, 2)]` and `Tensor[f32, (4,)]`.
+
+Backend adapters share one deterministic vertex-attribute capability check for
+expanded dtype/component/location leaves, then apply device-specific format
+feature queries. This keeps OpenGL, Vulkan, and D3D12 rejection policy aligned
+without moving hardware ownership into RuntimeCore.
 
 Pipeline loading prepares layouts and immutable pipelines once. Invocation
 uses pre-resolved slots and prepared bindings; it must not parse manifests,
@@ -110,7 +126,7 @@ because an optional sampler changes between a native object and the provider
 default.
 
 Runtime implementation is separated by responsibility:
-`runtime_backend_dispatch` handles contexts and resources,
+`runtime_backend_dispatch` handles CPU contexts and borrowed RHI adapters,
 `runtime_pipeline_direct` adapts direct compute artifacts and CPU entries into
 synthetic compute pipelines, and `runtime_pipeline_dispatch` routes
 PipelineAsset resolution plus compute/graphics invocation. Pipeline
@@ -120,6 +136,12 @@ routing and synchronization. There is no Runtime Kernel handle or kernel
 dispatch layer. RHI provider implementations are split into common, CUDA,
 D3D12, OpenGL, and Vulkan translation units; CPU provider preparation remains
 with RuntimeCpuProvider.
+
+Runtime has no resource ownership API. GPU Tensor, image, sampler, index, and
+attachment bindings are `VernonRuntimeProviderResourceReference` values
+obtained from the same RHI device used to create Runtime. Host Tensor bindings
+are accepted only by CPU or inline-value paths. Runtime allocation/import
+handles and backend resource fallback branches are intentionally absent.
 
 ## Distribution and Engine ownership
 
@@ -189,9 +211,10 @@ specific because they contain the concrete image views and extent.
 
 Graphics draw invocations clear every color attachment to transparent black.
 An optional D32 attachment is cleared to one and enables less-than depth
-testing and depth writes in Vulkan, D3D12, and OpenGL. Python exposes this
-render-only resource as `DepthTexture`; sampled depth remains a separate
-extension because it requires an explicit shader-readable format/view contract.
+testing and depth writes in Vulkan, D3D12, and OpenGL. Python groups external
+color textures and an optional target-owned render-only depth image in
+`RenderTarget`; sampled depth remains a generic texture format/usage extension
+because it requires an explicit shader-readable view contract.
 
 The deployable Runtime does not depend on LLVM, MLIR, GLFW, the CUDA Toolkit,
 or a statically linked Vulkan loader. Compiler and asset cooking remain host

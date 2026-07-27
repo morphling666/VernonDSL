@@ -72,6 +72,7 @@ bool initializeBackendForRhiDevice(VernonRuntimeContext &context, VernonRhiDevic
         state->maxComputeWorkGroupInvocations = deviceState->maxComputeWorkGroupInvocations;
         std::copy(std::begin(deviceState->maxComputeWorkGroupSize), std::end(deviceState->maxComputeWorkGroupSize),
                   std::begin(state->maxComputeWorkGroupSize));
+        state->dynamicRendering = deviceState->dynamicRendering;
         installRuntimeBackendState(context, state);
         break;
     }
@@ -110,6 +111,7 @@ bool initializeBackendForRhiDevice(VernonRuntimeContext &context, VernonRhiDevic
         return false;
     }
     context.borrowedRhiDevice = true;
+    context.rhiDevice = device;
     return true;
 }
 
@@ -165,26 +167,38 @@ VernonStatus referenceBackendRhiSampler(VernonRuntimeContext &context, VernonRhi
 }
 
 bool probeBackend(VernonRuntimeBackend backend, std::string &diagnostic) {
+    auto probeRhi = [&](VernonRhiBackend rhiBackend) {
+        VernonRhiOwnedDeviceDescriptor descriptor{};
+        descriptor.struct_size = sizeof(descriptor);
+        descriptor.backend = rhiBackend;
+        VernonRhiDevice device = vernonRhiCreateDevice(&descriptor);
+        if (device.index == static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX)) {
+            diagnostic = "no usable Vernon RHI device was found";
+            return false;
+        }
+        vernonRhiDestroyDevice(device);
+        return true;
+    };
     switch (backend) {
     case VERNON_RUNTIME_CPU:
         return true;
     case VERNON_RUNTIME_CUDA:
 #if defined(VERNON_HAS_CUDA_RUNTIME)
-        return probeCuda(diagnostic);
+        return probeRhi(VERNON_RHI_BACKEND_CUDA);
 #else
         diagnostic = "VernonRuntime was built without CUDA support";
         return false;
 #endif
     case VERNON_RUNTIME_VULKAN:
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-        return probeVulkan(diagnostic);
+        return probeRhi(VERNON_RHI_BACKEND_VULKAN);
 #else
         diagnostic = "VernonRuntime was built without Vulkan support";
         return false;
 #endif
     case VERNON_RUNTIME_DIRECTX12:
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-        return probeDirectX12(diagnostic);
+        return probeRhi(VERNON_RHI_BACKEND_DIRECTX12);
 #else
         diagnostic = "VernonRuntime was built without DirectX 12 support";
         return false;
@@ -200,61 +214,15 @@ bool probeBackend(VernonRuntimeBackend backend, std::string &diagnostic) {
 }
 
 bool initializeBackend(VernonRuntimeContext &context, uint32_t deviceIndex) {
-    switch (context.backend) {
-    case VERNON_RUNTIME_CPU:
+    if (context.backend == VERNON_RUNTIME_CPU)
         return initializeCpuContext(context, deviceIndex);
-    case VERNON_RUNTIME_CUDA:
-#if defined(VERNON_HAS_CUDA_RUNTIME)
-        return initializeCudaContext(context, deviceIndex);
-#else
-        return false;
-#endif
-    case VERNON_RUNTIME_VULKAN:
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-        return initializeVulkanContext(context, deviceIndex);
-#else
-        return false;
-#endif
-    case VERNON_RUNTIME_DIRECTX12:
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-        return initializeDirectX12Context(context, deviceIndex);
-#else
-        return false;
-#endif
-    default:
-        return false;
-    }
-}
-
-bool initializeOpenGLBackend(VernonRuntimeContext &context, const VernonOpenGLContextCallbacks &callbacks) {
-    return isOpenGLBackend(context.backend) && initializeOpenGLContext(context, callbacks);
+    context.error = "GPU Runtime contexts require a Vernon RHI device";
+    return false;
 }
 
 void destroyBackend(VernonRuntimeContext &context) {
-    switch (context.backend) {
-    case VERNON_RUNTIME_CUDA:
-#if defined(VERNON_HAS_CUDA_RUNTIME)
-        destroyCudaContext(context);
-#endif
-        break;
-    case VERNON_RUNTIME_OPENGL:
-    case VERNON_RUNTIME_OPENGL_ES:
-        vernonRuntimeRhiAdapterDestroy(openGLState(context).adapter);
-        openGLState(context).adapter = nullptr;
-        break;
-    case VERNON_RUNTIME_VULKAN:
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-        destroyVulkanContext(context);
-#endif
-        break;
-    case VERNON_RUNTIME_DIRECTX12:
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-        destroyDirectX12Context(context);
-#endif
-        break;
-    default:
-        break;
-    }
+    if (VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context))
+        vernonRuntimeRhiAdapterDestroy(adapter);
     destroyRuntimeBackendState(context);
 }
 
@@ -432,214 +400,6 @@ bool validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeReq
     }
     context.error = "runtime requirements cannot be validated by selected backend";
     return false;
-}
-
-bool createBackendBuffer(VernonDeviceBuffer &buffer) {
-    switch (buffer.context->backend) {
-    case VERNON_RUNTIME_CPU:
-        return createCpuBuffer(buffer);
-    case VERNON_RUNTIME_CUDA:
-#if defined(VERNON_HAS_CUDA_RUNTIME)
-        return createCudaBuffer(buffer);
-#else
-        return false;
-#endif
-    case VERNON_RUNTIME_OPENGL:
-    case VERNON_RUNTIME_OPENGL_ES:
-        return createOpenGLBuffer(buffer);
-    case VERNON_RUNTIME_VULKAN:
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-        return createVulkanBuffer(buffer);
-#else
-        return false;
-#endif
-    case VERNON_RUNTIME_DIRECTX12:
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-        return createDirectX12Buffer(buffer);
-#else
-        return false;
-#endif
-    default:
-        return false;
-    }
-}
-
-void importBackendOpenGLBuffer(VernonDeviceBuffer &buffer, uint32_t name) { importOpenGLBuffer(buffer, name); }
-
-VernonStatus destroyBackendBuffer(VernonDeviceBuffer &buffer) {
-    switch (buffer.context->backend) {
-    case VERNON_RUNTIME_CUDA:
-#if defined(VERNON_HAS_CUDA_RUNTIME)
-        return destroyCudaBuffer(buffer);
-#else
-        break;
-#endif
-    case VERNON_RUNTIME_OPENGL:
-    case VERNON_RUNTIME_OPENGL_ES:
-        destroyOpenGLBuffer(buffer);
-        break;
-    case VERNON_RUNTIME_VULKAN:
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-        destroyVulkanBuffer(buffer);
-#endif
-        break;
-    case VERNON_RUNTIME_DIRECTX12:
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-        destroyDirectX12Buffer(buffer);
-#endif
-        break;
-    default:
-        break;
-    }
-    return VERNON_STATUS_OK;
-}
-
-VernonStatus copyToBackendBuffer(VernonDeviceBuffer &buffer, size_t offset, const void *source, size_t size) {
-    switch (buffer.context->backend) {
-    case VERNON_RUNTIME_CPU:
-        return copyToCpuBuffer(buffer, offset, source, size);
-    case VERNON_RUNTIME_CUDA:
-#if defined(VERNON_HAS_CUDA_RUNTIME)
-        return copyToCudaBuffer(buffer, offset, source, size);
-#else
-        break;
-#endif
-    case VERNON_RUNTIME_OPENGL:
-    case VERNON_RUNTIME_OPENGL_ES:
-        return copyToOpenGLBuffer(buffer, offset, source, size);
-    case VERNON_RUNTIME_VULKAN:
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-        return copyToVulkanBuffer(buffer, offset, source, size);
-#else
-        break;
-#endif
-    case VERNON_RUNTIME_DIRECTX12:
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-        return copyToDirectX12Buffer(buffer, offset, source, size);
-#else
-        break;
-#endif
-    default:
-        break;
-    }
-    return VERNON_STATUS_UNSUPPORTED_TARGET;
-}
-
-VernonStatus copyFromBackendBuffer(const VernonDeviceBuffer &buffer, size_t offset, void *destination, size_t size) {
-    switch (buffer.context->backend) {
-    case VERNON_RUNTIME_CPU:
-        return copyFromCpuBuffer(buffer, offset, destination, size);
-    case VERNON_RUNTIME_CUDA:
-#if defined(VERNON_HAS_CUDA_RUNTIME)
-        return copyFromCudaBuffer(buffer, offset, destination, size);
-#else
-        break;
-#endif
-    case VERNON_RUNTIME_OPENGL:
-    case VERNON_RUNTIME_OPENGL_ES:
-        return copyFromOpenGLBuffer(buffer, offset, destination, size);
-    case VERNON_RUNTIME_VULKAN:
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-        return copyFromVulkanBuffer(buffer, offset, destination, size);
-#else
-        break;
-#endif
-    case VERNON_RUNTIME_DIRECTX12:
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-        return copyFromDirectX12Buffer(buffer, offset, destination, size);
-#else
-        break;
-#endif
-    default:
-        break;
-    }
-    return VERNON_STATUS_UNSUPPORTED_TARGET;
-}
-
-bool createBackendTexture(VernonDeviceTexture &texture) {
-    if (isOpenGLBackend(texture.context->backend))
-        return createOpenGLTexture(texture);
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-    if (texture.context->backend == VERNON_RUNTIME_VULKAN)
-        return createVulkanTexture(texture);
-#endif
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-    if (texture.context->backend == VERNON_RUNTIME_DIRECTX12)
-        return createDirectX12Texture(texture);
-#endif
-    return false;
-}
-
-void importBackendOpenGLTexture(VernonDeviceTexture &texture, uint32_t name) { importOpenGLTexture(texture, name); }
-
-void destroyBackendTexture(VernonDeviceTexture &texture) {
-    if (isOpenGLBackend(texture.context->backend))
-        destroyOpenGLTexture(texture);
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-    else if (texture.context->backend == VERNON_RUNTIME_VULKAN)
-        destroyVulkanTexture(texture);
-#endif
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-    else if (texture.context->backend == VERNON_RUNTIME_DIRECTX12)
-        destroyDirectX12Texture(texture);
-#endif
-}
-
-VernonStatus copyToBackendTexture(VernonDeviceTexture &texture, const void *source, size_t size) {
-    if (isOpenGLBackend(texture.context->backend))
-        return copyToOpenGLTexture(texture, source, size);
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-    if (texture.context->backend == VERNON_RUNTIME_VULKAN)
-        return copyToVulkanTexture(texture, source, size);
-#endif
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-    if (texture.context->backend == VERNON_RUNTIME_DIRECTX12)
-        return copyToDirectX12Texture(texture, source, size);
-#endif
-    return VERNON_STATUS_UNSUPPORTED_TARGET;
-}
-
-VernonStatus copyFromBackendTexture(const VernonDeviceTexture &texture, void *destination, size_t size) {
-    if (isOpenGLBackend(texture.context->backend))
-        return copyFromOpenGLTexture(texture, destination, size);
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-    if (texture.context->backend == VERNON_RUNTIME_VULKAN)
-        return copyFromVulkanTexture(texture, destination, size);
-#endif
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-    if (texture.context->backend == VERNON_RUNTIME_DIRECTX12)
-        return copyFromDirectX12Texture(texture, destination, size);
-#endif
-    return VERNON_STATUS_UNSUPPORTED_TARGET;
-}
-
-bool createBackendSampler(VernonDeviceSampler &sampler) {
-    if (isOpenGLBackend(sampler.context->backend))
-        return createOpenGLSampler(sampler);
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-    if (sampler.context->backend == VERNON_RUNTIME_VULKAN)
-        return createVulkanSampler(sampler);
-#endif
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-    if (sampler.context->backend == VERNON_RUNTIME_DIRECTX12)
-        return createDirectX12Sampler(sampler);
-#endif
-    return false;
-}
-
-void importBackendOpenGLSampler(VernonDeviceSampler &sampler, uint32_t name) { importOpenGLSampler(sampler, name); }
-
-void destroyBackendSampler(VernonDeviceSampler &sampler) {
-    if (isOpenGLBackend(sampler.context->backend))
-        destroyOpenGLSampler(sampler);
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-    else if (sampler.context->backend == VERNON_RUNTIME_VULKAN)
-        destroyVulkanSampler(sampler);
-#endif
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-    else if (sampler.context->backend == VERNON_RUNTIME_DIRECTX12)
-        destroyDirectX12Sampler(sampler);
-#endif
 }
 
 } // namespace vernon::runtime

@@ -8,7 +8,7 @@ from pathlib import Path
 import vernon_dsl as vd
 from vernon_dsl import CompileError, Compiler, compile_source
 from vernon_dsl.compiler import FrontendCompileRequest
-from vernon_dsl.frontend.abi import ValueAbiLayout, value_abi_layout
+from vernon_dsl.frontend.abi import attribute_layout, value_abi_layout
 from vernon_dsl.frontend.analysis import dump_typed_model, typed_effect_data, typed_model_data
 from vernon_dsl.frontend.model import (
     AccessMode,
@@ -55,25 +55,28 @@ class LanguageVersionTests(unittest.TestCase):
         vertex = ConcreteType("struct", "Vertex")
         fields = {
             "Vertex": (
-                ConcreteType("tensor", "Tensor", (f32, 3)),
-                f64,
+                ("position", ConcreteType("tensor", "Tensor", (f32, 3))),
+                ("weight", f64),
             )
         }
 
+        tuple_layout = value_abi_layout(tuple_type, fields.__getitem__)
         self.assertEqual(
-            value_abi_layout(tuple_type, fields.__getitem__),
-            ValueAbiLayout(24, 8, (0, 8, 16)),
+            (tuple_layout.size, tuple_layout.alignment, tuple_layout.field_offsets),
+            (24, 8, (0, 8, 16)),
+        )
+        vertex_layout = value_abi_layout(vertex, fields.__getitem__)
+        self.assertEqual(
+            (vertex_layout.size, vertex_layout.alignment, vertex_layout.field_offsets),
+            (24, 8, (0, 16)),
+        )
+        tensor_layout = value_abi_layout(
+            ConcreteType("tensor", "Tensor", (vertex, 2)),
+            fields.__getitem__,
         )
         self.assertEqual(
-            value_abi_layout(vertex, fields.__getitem__),
-            ValueAbiLayout(24, 8, (0, 16)),
-        )
-        self.assertEqual(
-            value_abi_layout(
-                ConcreteType("tensor", "Tensor", (vertex, 2)),
-                fields.__getitem__,
-            ),
-            ValueAbiLayout(48, 8, element_stride=24),
+            (tensor_layout.size, tensor_layout.alignment, tensor_layout.element_stride),
+            (48, 8, 24),
         )
 
         output = compile_source(
@@ -97,6 +100,68 @@ class LanguageVersionTests(unittest.TestCase):
         self.assertIn("vernon.abi_alignment = 4 : i64", shared_output)
         self.assertIn("vernon.abi_element_stride = 8 : i64", shared_output)
         self.assertIn("vernon.abi_size = 16 : i64", shared_output)
+
+    def test_aggregate_value_and_attribute_layout_share_recursive_leaves(self) -> None:
+        f16 = ConcreteType("scalar", "f16")
+        f32 = ConcreteType("scalar", "f32")
+        u32 = ConcreteType("scalar", "u32")
+        vertex = ConcreteType("struct", "Vertex")
+        fields = {
+            "Vertex": (
+                ("position", ConcreteType("tensor", "Tensor", (f32, 3))),
+                ("object_id", u32),
+                ("uv", ConcreteType("tensor", "Tensor", (f16, 2))),
+            )
+        }
+
+        value = value_abi_layout(vertex, fields.__getitem__)
+        attributes = attribute_layout(vertex, fields.__getitem__)
+
+        self.assertEqual((value.size, value.alignment, value.field_offsets), (20, 4, (0, 12, 16)))
+        self.assertEqual(
+            tuple((leaf.path, leaf.dtype, leaf.byte_offset, leaf.scalar_count) for leaf in value.leaves),
+            (
+                (("position",), "f32", 0, 3),
+                (("object_id",), "u32", 12, 1),
+                (("uv",), "f16", 16, 2),
+            ),
+        )
+        self.assertEqual(tuple(leaf.shape for leaf in value.leaves), ((3,), (), (2,)))
+        self.assertEqual(
+            tuple(
+                (leaf.location_offset, leaf.path, leaf.dtype, leaf.component_count, leaf.byte_offset)
+                for leaf in attributes.leaves
+            ),
+            (
+                (0, ("position",), "f32", 3, 0),
+                (1, ("object_id",), "u32", 1, 12),
+                (2, ("uv",), "f16", 2, 16),
+            ),
+        )
+        self.assertEqual(len(value.layout_hash), 64)
+
+    def test_aggregate_attribute_leaves_do_not_cross_tensor_element_or_field_boundaries(self) -> None:
+        f32 = ConcreteType("scalar", "f32")
+        i32 = ConcreteType("scalar", "i32")
+        element = ConcreteType(
+            "tuple",
+            "Tuple",
+            (ConcreteType("tensor", "Tensor", (f32, 4)), i32),
+        )
+        value_type = ConcreteType("tensor", "Tensor", (element, 2, 3))
+
+        layout = attribute_layout(value_type, lambda _: ())
+
+        self.assertEqual(layout.location_span, 12)
+        self.assertEqual(
+            tuple((leaf.path, leaf.dtype, leaf.byte_offset) for leaf in layout.leaves[:4]),
+            (
+                ((0, 0, 0), "f32", 0),
+                ((0, 0, 1), "i32", 16),
+                ((0, 1, 0), "f32", 20),
+                ((0, 1, 1), "i32", 36),
+            ),
+        )
 
     def test_frontend_and_semantic_identity_are_version_three(self) -> None:
         source = "from vernon_dsl import *\n@fragment\ndef main(value: float) -> float:\n    return value\n"

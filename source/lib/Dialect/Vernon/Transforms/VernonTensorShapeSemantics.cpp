@@ -72,28 +72,6 @@ FailureOr<MatmulCoordinates> getMatmulCoordinates(const StaticMatmulPlan &plan, 
 
 } // namespace
 
-FailureOr<StaticAttributePlan> getStaticAttributePlan(Type elementType, ArrayRef<int64_t> shape) {
-    const unsigned bitWidth = elementType.getIntOrFloatBitWidth();
-    if ((!elementType.isInteger(32) && !elementType.isF16() && !elementType.isF32() && !elementType.isF64()) ||
-        bitWidth == 0 || bitWidth % 8 != 0)
-        return failure();
-    FailureOr<int64_t> elementCount = getStaticShapeElementCount(shape);
-    if (failed(elementCount))
-        return failure();
-    StaticAttributePlan plan;
-    plan.elementSize = bitWidth / 8;
-    const uint64_t componentLimit = std::min<uint64_t>(4, 16 / plan.elementSize);
-    for (uint64_t index = 0; index < static_cast<uint64_t>(*elementCount); index += componentLimit) {
-        StaticAttributeLeaf leaf;
-        leaf.locationOffset = static_cast<uint32_t>(plan.leaves.size());
-        leaf.componentCount =
-            static_cast<uint32_t>(std::min<uint64_t>(componentLimit, static_cast<uint64_t>(*elementCount) - index));
-        leaf.byteOffset = index * plan.elementSize;
-        plan.leaves.push_back(leaf);
-    }
-    return plan;
-}
-
 FailureOr<int64_t> getStaticShapeElementCount(ArrayRef<int64_t> shape) {
     int64_t result = 1;
     for (int64_t extent : shape) {

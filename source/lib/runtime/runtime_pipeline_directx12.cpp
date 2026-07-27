@@ -157,9 +157,18 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                 use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
             candidate.layout.array_count = 1;
             candidate.binding.externalSlot = parameter.slot;
-            if (parameter.kind == "tensor" && use.interfaceKind == "uniform") {
+            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.uniformLayout &&
+                use.uniformLayout->storage == "storage_buffer" && parameter.elementLayout.byteSize &&
+                use.binding != UINT32_MAX) {
+                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
+                candidate.layout.element_size = parameter.elementLayout.byteSize;
+                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
+                candidate.layout.binding = use.binding;
+                candidate.layout.set = use.descriptorSet;
+                candidate.binding.source = DirectX12PipelineState::GraphicsBinding::EXTERNAL_STORAGE;
+            } else if (parameter.kind == "tensor" && use.interfaceKind == "uniform") {
                 const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
-                const std::optional<VernonDataType> dtype = pipelineDataType(parameter.dtype);
+                const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
                 uint64_t valueCount = 1;
                 for (uint64_t dimension : shape) {
                     if (!dimension || valueCount > UINT32_MAX / dimension) {
@@ -193,7 +202,7 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                 candidate.layout.binding = use.binding;
                 candidate.layout.set = use.descriptorSet;
                 candidate.binding.source = DirectX12PipelineState::GraphicsBinding::EXTERNAL_UNIFORM;
-                candidate.binding.packing.dtype = *dtype;
+                candidate.binding.packing.elementSize = elementSize;
                 candidate.binding.packing.shape = shape;
                 candidate.binding.packing.byteSize = static_cast<size_t>(physicalSize);
                 if (matrix) {
@@ -222,20 +231,23 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                 candidate.binding.storage.resize(candidate.layout.element_size);
             } else if (parameter.kind == "tensor" && use.interfaceKind == "input" && use.stage == "vertex" &&
                        use.location != UINT32_MAX && !use.attributeLeaves.empty()) {
-                const std::optional<VernonDataType> dtype = pipelineDataType(parameter.dtype);
-                if (!dtype || dataTypeSize(*dtype) == 0) {
-                    supported = false;
-                    break;
-                }
                 candidate.layout.kind = VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
-                candidate.layout.element_size = static_cast<uint32_t>(dataTypeSize(*dtype));
+                candidate.layout.element_size = parameter.elementLayout.byteSize;
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_VERTEX_INPUT;
                 candidate.layout.binding = vertexInputSlot++;
                 candidate.layout.divisor = use.divisor;
-                for (const AttributeLeaf &leaf : use.attributeLeaves)
+                for (const AttributeLeaf &leaf : use.attributeLeaves) {
+                    const std::optional<VernonDataType> dtype = pipelineDataType(leaf.dtype);
+                    if (!dtype) {
+                        supported = false;
+                        break;
+                    }
                     candidate.attributes.push_back({candidate.layout.binding, use.location + leaf.locationOffset,
                                                     static_cast<uint32_t>(*dtype), leaf.componentCount,
                                                     leaf.byteOffset});
+                }
+                if (!supported)
+                    break;
                 candidate.binding.source = DirectX12PipelineState::GraphicsBinding::EXTERNAL_VERTEX;
             } else if (parameter.kind == "texture" && use.interfaceKind == "resource" && use.descriptorSet == 0 &&
                        use.binding != UINT32_MAX) {
@@ -382,55 +394,40 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
         } else if (prepared.source == DirectX12PipelineState::GraphicsBinding::EXTERNAL_VERTEX) {
             const auto found = plan.arguments.find(prepared.externalSlot);
             if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
-                (found->second->tensor.storage != VERNON_TENSOR_DEVICE &&
-                 found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE) ||
-                (!found->second->tensor.buffer && !found->second->tensor.resource.resource.value) ||
-                !found->second->tensor.byte_strides || found->second->tensor.byte_strides[0] <= 0)
+                found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
+                !found->second->tensor.resource.resource.value || !found->second->tensor.byte_strides ||
+                found->second->tensor.byte_strides[0] <= 0)
                 return fail(*pipeline.context, "D3D12 RHI vertex argument is missing or invalid");
             const VernonTensorView &tensor = found->second->tensor;
-            if (tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
-                value.resource = tensor.resource;
-                value.resource.offset += tensor.byte_offset;
-            } else {
-                value.resource.identity = directX12RhiAdapterBufferIdentity(adapter);
-                value.resource.resource.value = reinterpret_cast<uintptr_t>(&directX12BufferState(*tensor.buffer));
-                value.resource.offset = tensor.byte_offset;
-                value.resource.size = tensor.buffer->size - tensor.byte_offset;
-            }
+            value.resource = tensor.resource;
+            value.resource.offset += tensor.byte_offset;
             value.stride = static_cast<uint32_t>(tensor.byte_strides[0]);
+        } else if (prepared.source == DirectX12PipelineState::GraphicsBinding::EXTERNAL_STORAGE) {
+            const auto found = plan.arguments.find(prepared.externalSlot);
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
+                found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
+                !found->second->tensor.resource.resource.value)
+                return fail(*pipeline.context, "D3D12 RHI storage argument is missing");
+            const VernonTensorView &tensor = found->second->tensor;
+            value.resource = tensor.resource;
+            value.resource.offset += tensor.byte_offset;
         } else if (prepared.source == DirectX12PipelineState::GraphicsBinding::EXTERNAL_TEXTURE) {
             const auto found = plan.arguments.find(prepared.externalSlot);
             if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TEXTURE ||
-                (!found->second->texture.texture && !found->second->texture.resource.resource.value))
+                !found->second->texture.resource.resource.value)
                 return fail(*pipeline.context, "D3D12 RHI texture argument is missing");
-            if (found->second->texture.resource.resource.value)
-                value.resource = found->second->texture.resource;
-            else {
-                auto &texture = directX12TextureState(*found->second->texture.texture);
-                value.resource.identity = directX12RhiAdapterImageIdentity(adapter);
-                value.resource.resource.value = reinterpret_cast<uintptr_t>(&texture);
-            }
+            value.resource = found->second->texture.resource;
         } else if (prepared.source == DirectX12PipelineState::GraphicsBinding::EXTERNAL_SAMPLER) {
             const auto found = plan.arguments.find(prepared.externalSlot);
             if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_SAMPLER ||
-                (!found->second->sampler && !found->second->resource.resource.value))
+                !found->second->resource.resource.value)
                 return fail(*pipeline.context, "D3D12 RHI sampler argument is missing");
-            if (found->second->resource.resource.value)
-                value.resource = found->second->resource;
-            else {
-                value.resource.identity = directX12RhiAdapterSamplerIdentity(adapter);
-                value.resource.resource.value =
-                    reinterpret_cast<uintptr_t>(&runtimeBackendState<DirectX12SamplerState>(*found->second->sampler));
-            }
+            value.resource = found->second->resource;
         } else {
             const auto sampled = plan.sampledResources.find({layout.set, layout.binding});
             if (sampled == plan.sampledResources.end())
                 return fail(*pipeline.context, "D3D12 RHI implicit sampler binding is missing");
-            if (sampled->second.sampler) {
-                value.resource.identity = directX12RhiAdapterSamplerIdentity(adapter);
-                value.resource.resource.value =
-                    reinterpret_cast<uintptr_t>(&runtimeBackendState<DirectX12SamplerState>(*sampled->second.sampler));
-            } else if (sampled->second.samplerResource.resource.value) {
+            if (sampled->second.samplerResource.resource.value) {
                 value.resource = sampled->second.samplerResource;
             } else {
                 value.flags = VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE;
@@ -461,26 +458,13 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
     for (size_t index = 0; index < plan.attachments.size(); ++index) {
         const VernonColorAttachment &source = *plan.attachments[index];
         attachments[index].location = source.location;
-        if (source.resource.resource.value) {
-            attachments[index].image = source.resource;
-            const auto *image =
-                reinterpret_cast<const rhi::directx12::Image *>(static_cast<uintptr_t>(source.resource.resource.value));
-            formats.push_back(static_cast<uint32_t>(image->format));
-        } else {
-            auto &texture = directX12TextureState(*source.texture);
-            attachments[index].image.identity = directX12RhiAdapterImageIdentity(adapter);
-            attachments[index].image.resource.value = reinterpret_cast<uintptr_t>(&texture);
-            formats.push_back(static_cast<uint32_t>(texture.format));
-        }
+        attachments[index].image = source.resource;
+        const auto *image =
+            reinterpret_cast<const rhi::directx12::Image *>(static_cast<uintptr_t>(source.resource.resource.value));
+        formats.push_back(static_cast<uint32_t>(image->format));
     }
     if (plan.depthAttachment) {
-        if (plan.depthAttachment->resource.resource.value)
-            depthAttachment = plan.depthAttachment->resource;
-        else {
-            auto &texture = directX12TextureState(*plan.depthAttachment->texture);
-            depthAttachment.identity = directX12RhiAdapterImageIdentity(adapter);
-            depthAttachment.resource.value = reinterpret_cast<uintptr_t>(&texture);
-        }
+        depthAttachment = plan.depthAttachment->resource;
     }
     uint64_t vertexLayoutIdentity = 1469598103934665603ull;
     std::vector<uint32_t> vertexStrides;
@@ -542,15 +526,8 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
     draw.viewport[3] = hasViewport ? invocation.viewport[3] : plan.attachmentHeight;
     draw.topology = invocation.topology;
     if (plan.indexBinding) {
-        if (plan.indexBinding->resource.resource.value)
-            draw.index_buffer = plan.indexBinding->resource;
-        else {
-            draw.index_buffer.identity = directX12RhiAdapterBufferIdentity(adapter);
-            draw.index_buffer.resource.value =
-                reinterpret_cast<uintptr_t>(&directX12BufferState(*plan.indexBinding->buffer));
-            draw.index_buffer.offset = plan.indexBinding->offset;
-            draw.index_buffer.size = plan.indexBinding->buffer->size - plan.indexBinding->offset;
-        }
+        draw.index_buffer = plan.indexBinding->resource;
+        draw.index_buffer.offset += plan.indexBinding->offset;
         draw.index_count = plan.indexBinding->index_count;
         draw.index_type = plan.indexBinding->type;
     }
@@ -587,18 +564,10 @@ VernonStatus invokeDirectX12ComputePipeline(VernonLoadedPipeline &pipeline, cons
         value.slot = layout.slot;
         value.kind = layout.kind;
         if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            if (argument.kind != ComputeLaunchArgumentKind::Tensor ||
-                (!argument.buffer && !argument.resource.resource.value))
-                return fail(*pipeline.context, "D3D12 prepared storage binding requires a device Tensor");
-            if (argument.resource.resource.value) {
-                value.resource = argument.resource;
-                value.resource.offset += state.rhiComputeResourceOffsets[index];
-            } else {
-                value.resource.identity = directX12RhiAdapterBufferIdentity(adapter);
-                value.resource.resource.value = reinterpret_cast<uintptr_t>(&directX12BufferState(*argument.buffer));
-                value.resource.offset = state.rhiComputeResourceOffsets[index];
-                value.resource.size = argument.buffer->size;
-            }
+            if (argument.kind != ComputeLaunchArgumentKind::Tensor || !argument.resource.resource.value)
+                return fail(*pipeline.context, "D3D12 prepared storage binding requires an RHI Tensor");
+            value.resource = argument.resource;
+            value.resource.offset += state.rhiComputeResourceOffsets[index];
         } else {
             if (argument.kind != ComputeLaunchArgumentKind::Scalar || !argument.scalarData || !argument.scalarSize)
                 return fail(*pipeline.context, "D3D12 prepared inline binding requires host data at argument " +

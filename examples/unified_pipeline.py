@@ -88,7 +88,8 @@ def main() -> None:
     positions = vd.storage.from_numpy(base_array)
     draw_offset = vd.storage.from_numpy(np.zeros((2,), dtype=np.float32))
     color = vd.storage.from_numpy(np.array((0.1, 0.65, 1.0, 1.0), dtype=np.float32))
-    target = vd.Texture.zeros(shape=(args.size, args.size))
+    output = vd.Texture.zeros(shape=(args.size, args.size))
+    target = vd.RenderTarget(shape=output.shape).attach_color(0, output)
     render = vd.pipeline(vertex_main, fragment_main)
 
     frame = 0
@@ -125,7 +126,7 @@ def main() -> None:
                 color=color,
                 target=target,
             )
-            rgba = target.to_numpy()
+            rgba = output.to_numpy()
             if args.arch in {"opengl", "opengles"}:
                 rgba = np.flipud(rgba)
             rgba = np.ascontiguousarray(rgba)

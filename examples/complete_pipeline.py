@@ -215,6 +215,7 @@ def main() -> None:
 
     color = vd.Texture.zeros(shape=(args.size, args.size))
     object_id = vd.Texture.zeros(shape=(args.size, args.size))
+    target = vd.RenderTarget(shape=color.shape).attach_color(0, color).attach_color(1, object_id)
     frame = 0
     color_image: np.ndarray | None = None
     id_image: np.ndarray | None = None
@@ -236,11 +237,7 @@ def main() -> None:
                 tint=tint_bindings[binding_index],
                 indices=index_bindings[binding_index],
                 topology=vd.triangles,
-                targets={
-                    # Names, not dictionary order, select MRT locations.
-                    "object_id": object_id,
-                    "color": color,
-                },
+                target=target,
             )
 
             color_rgba = color.to_numpy()

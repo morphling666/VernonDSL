@@ -1,7 +1,9 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonValidation.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonAttributeAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonTensorShapeSemantics.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "llvm/ADT/SmallVector.h"
@@ -88,6 +90,74 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
             std::set<std::pair<int64_t, int64_t>> bindings;
 
             auto validateInterface = [&](DictionaryAttr dictionary, Type type, unsigned index, bool isResult) {
+                Type abiType = type;
+                StringRef abiPrefix = "vernon.abi_";
+                if (auto view = dyn_cast<TensorViewType>(type)) {
+                    abiType = view.getElementType();
+                    abiPrefix = "vernon.element_abi_";
+                }
+                std::string sizeName = (abiPrefix + "size").str();
+                if (dictionary && dictionary.get(sizeName)) {
+                    auto dtypes = dictionary.getAs<ArrayAttr>((abiPrefix + "leaf_dtypes").str());
+                    SmallVector<StringRef> logicalDtypes;
+                    if (dtypes)
+                        for (Attribute dtype : dtypes) {
+                            auto value = dyn_cast<StringAttr>(dtype);
+                            logicalDtypes.push_back(value ? value.getValue() : StringRef());
+                        }
+                    FailureOr<ValueAbiLayout> layout = getValueAbiLayout(abiType, getOperation(), logicalDtypes);
+                    auto reportAbiError = [&](StringRef detail) {
+                        function.emitError() << (isResult ? "result #" : "argument #") << index
+                                             << " has invalid canonical Value ABI metadata: " << detail;
+                        invalid = true;
+                    };
+                    if (failed(layout)) {
+                        reportAbiError("type has no finite layout");
+                    } else {
+                        auto integerMatches = [&](StringRef suffix, uint64_t expected) {
+                            auto value = dictionary.getAs<IntegerAttr>((abiPrefix + suffix).str());
+                            return value && value.getValue().isNonNegative() &&
+                                   value.getValue().getZExtValue() == expected;
+                        };
+                        auto hash = dictionary.getAs<StringAttr>((abiPrefix + "layout_hash").str());
+                        if (!integerMatches("size", layout->size) || !integerMatches("alignment", layout->alignment))
+                            reportAbiError("size or alignment does not match the canonical layout");
+                        else if (!hash || hash.getValue() != layout->layoutHash)
+                            reportAbiError("layout hash does not match the canonical layout");
+
+                        auto offsets = dictionary.getAs<DenseI64ArrayAttr>((abiPrefix + "leaf_offsets").str());
+                        auto counts = dictionary.getAs<DenseI64ArrayAttr>((abiPrefix + "leaf_counts").str());
+                        auto paths = dictionary.getAs<ArrayAttr>((abiPrefix + "leaf_paths").str());
+                        if (!offsets || !counts || !dtypes || !paths || offsets.size() != layout->leaves.size() ||
+                            counts.size() != layout->leaves.size() || dtypes.size() != layout->leaves.size() ||
+                            paths.size() != layout->leaves.size()) {
+                            reportAbiError("leaf arrays do not match the canonical leaf count");
+                        } else {
+                            for (auto [leafIndex, leaf] : llvm::enumerate(layout->leaves)) {
+                                std::string path;
+                                llvm::raw_string_ostream pathStream(path);
+                                for (auto [componentIndex, component] : llvm::enumerate(leaf.path)) {
+                                    if (componentIndex != 0)
+                                        pathStream << '/';
+                                    if (component.field)
+                                        pathStream << *component.field;
+                                    else
+                                        pathStream << '[' << component.index << ']';
+                                }
+                                pathStream.flush();
+                                auto dtypeAttr = dyn_cast<StringAttr>(dtypes[leafIndex]);
+                                auto pathAttr = dyn_cast<StringAttr>(paths[leafIndex]);
+                                if (static_cast<uint64_t>(offsets[leafIndex]) != leaf.byteOffset ||
+                                    static_cast<uint64_t>(counts[leafIndex]) != leaf.scalarCount || !dtypeAttr ||
+                                    dtypeAttr.getValue() != leaf.dtype || !pathAttr || pathAttr.getValue() != path) {
+                                    reportAbiError("leaf contract does not match the canonical layout");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 InterfaceAttrs attrs = parseInterfaceAttrs(dictionary);
                 if (attrs.empty()) {
                     if (entryAttr) {
@@ -229,16 +299,19 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
                 auto &slots = kind == InterfaceKind::Input ? inputSlots : outputSlots;
                 int64_t locationSpan = 1;
                 if (location && !isResult && *stage == ShaderStage::Vertex && kind == InterfaceKind::Input) {
-                    if (auto tensor = dyn_cast<RankedTensorType>(type)) {
-                        FailureOr<StaticAttributePlan> plan =
-                            getStaticAttributePlan(tensor.getElementType(), tensor.getShape());
-                        if (failed(plan)) {
-                            function.emitError() << "argument #" << index << " has no numeric vertex attribute layout";
-                            invalid = true;
-                            return;
+                    SmallVector<StringRef> logicalDtypes;
+                    if (auto dtypes = dictionary.getAs<ArrayAttr>("vernon.abi_leaf_dtypes"))
+                        for (Attribute dtype : dtypes) {
+                            auto value = dyn_cast<StringAttr>(dtype);
+                            logicalDtypes.push_back(value ? value.getValue() : StringRef());
                         }
-                        locationSpan = static_cast<int64_t>(plan->leaves.size());
+                    FailureOr<AttributeAbiLayout> plan = getAttributeAbiLayout(type, getOperation(), logicalDtypes);
+                    if (failed(plan)) {
+                        function.emitError() << "argument #" << index << " has no numeric vertex attribute layout";
+                        invalid = true;
+                        return;
                     }
+                    locationSpan = static_cast<int64_t>(plan->getLocationSpan());
                 }
                 for (int64_t offset = 0; offset < locationSpan; ++offset) {
                     std::string slot = location ? ("location:" + std::to_string(*location + offset))

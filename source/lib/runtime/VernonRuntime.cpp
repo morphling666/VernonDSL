@@ -6,6 +6,7 @@
 #include "runtime/pipeline_metadata.h"
 #include "runtime/runtime_dispatch.h"
 #include "runtime/runtime_state.h"
+#include "runtime/tensor_bridge.h"
 #if defined(VERNON_RUNTIME_TESTING)
 #include "runtime/runtime_test_hooks.h"
 #endif
@@ -32,36 +33,6 @@ using namespace vernon::runtime;
 
 namespace {
 
-GraphicsResourceSnapshot plannerBufferSnapshot(const void *, const VernonDeviceBuffer *buffer) {
-    GraphicsResourceSnapshot snapshot;
-    if (buffer) {
-        snapshot.context = buffer->context;
-        snapshot.bufferSize = buffer->size;
-    }
-    return snapshot;
-}
-
-const void *plannerBufferContext(const void *, const VernonDeviceBuffer *buffer) {
-    return buffer ? buffer->context : nullptr;
-}
-
-GraphicsResourceSnapshot plannerTextureSnapshot(const void *, const VernonDeviceTexture *texture) {
-    GraphicsResourceSnapshot snapshot;
-    if (texture) {
-        snapshot.context = texture->context;
-        snapshot.textureDimension = texture->dimension;
-        snapshot.textureFormat = texture->format;
-        snapshot.textureWidth = texture->width;
-        snapshot.textureHeight = texture->height;
-        snapshot.textureDepth = texture->depth;
-    }
-    return snapshot;
-}
-
-const void *plannerSamplerContext(const void *, const VernonDeviceSampler *sampler) {
-    return sampler ? sampler->context : nullptr;
-}
-
 VernonStatus fail(VernonRuntimeContext *context, std::string error,
                   VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) {
     if (context)
@@ -72,6 +43,32 @@ VernonStatus fail(VernonRuntimeContext *context, std::string error,
 } // namespace
 
 extern "C" {
+
+VernonValueLayoutView vernonRuntimeGetScalarValueLayout(VernonDataType dtype) {
+    static constexpr VernonValueLeafView leaves[] = {
+        {VERNON_DATA_BOOL, 1, 0}, {VERNON_DATA_I32, 1, 0}, {VERNON_DATA_U32, 1, 0}, {VERNON_DATA_F16, 1, 0},
+        {VERNON_DATA_F32, 1, 0},  {VERNON_DATA_F64, 1, 0}, {VERNON_DATA_U8, 1, 0},
+    };
+    static constexpr const char *hashes[] = {
+        "3ca886485debde52d9dae8389b51daf52bf265e898ece94a57241849eea52fc7",
+        "5221c466df6b1fe9046f6d2e7597efdc98f5a3aa66bb176fe65d02de0c39607f",
+        "5d0250c80dab299ac915d5d0d21170d208e2f4d97216c89d0263a3c2d3bf5dc8",
+        "937b700417d47a346038256ddb7c3ed7062303c531efba4d6dfd5e21583deec4",
+        "cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",
+        "8f6e354f03614c96a53ba7e4ff053d14f7ce2c8f5066a5193d43f28db91268da",
+        "",
+    };
+    const size_t size = dataTypeSize(dtype);
+    const size_t index = static_cast<size_t>(dtype);
+    if (!size || index >= std::size(leaves) || !hashes[index][0])
+        return {};
+    return {sizeof(VernonValueLayoutView),
+            static_cast<uint32_t>(size),
+            static_cast<uint32_t>(size),
+            {hashes[index], std::strlen(hashes[index])},
+            &leaves[index],
+            1};
+}
 
 VernonRuntimeCapabilities vernonRuntimeGetCapabilities(VernonRuntimeBackend backend) {
     static thread_local std::string diagnostic;
@@ -114,24 +111,10 @@ VernonRuntimeContext *vernonRuntimeCreateForRhiDevice(VernonRuntimeBackend backe
     return context.release();
 }
 
-VernonRuntimeContext *vernonRuntimeCreateOpenGLWithCallbacks(VernonRuntimeBackend backend,
-                                                             const VernonOpenGLContextCallbacks *callbacks) {
-    if (!callbacks || callbacks->struct_size < sizeof(VernonOpenGLContextCallbacks) || !callbacks->make_current ||
-        !callbacks->get_proc_address || (backend != VERNON_RUNTIME_OPENGL && backend != VERNON_RUNTIME_OPENGL_ES) ||
-        callbacks->api_version_major < 2)
-        return nullptr;
-    auto context = std::make_unique<VernonRuntimeContext>();
-    context->backend = backend;
-    if (!initializeOpenGLBackend(*context, *callbacks))
-        return nullptr;
-    return context.release();
-}
-
 VernonStatus vernonRuntimeDestroy(VernonRuntimeContext *context) {
     if (!context)
         return VERNON_STATUS_OK;
-    if (context->liveBuffers || context->liveTextures || context->liveSamplers || context->liveBundles ||
-        context->livePipelines)
+    if (context->liveBundles || context->livePipelines)
         return fail(context, "runtime context still owns live handles");
     destroyBackend(*context);
     delete context;
@@ -149,200 +132,6 @@ VernonRuntimeCapabilities vernonRuntimeGetContextCapabilities(const VernonRuntim
     fillBackendCapabilities(*context, result);
     result.diagnostic = {context->error.data(), context->error.size()};
     return result;
-}
-
-VernonDeviceBuffer *vernonRuntimeBufferAllocate(VernonRuntimeContext *context, size_t size, size_t alignment) {
-    if (!context ||
-        (context->backend != VERNON_RUNTIME_CPU && context->backend != VERNON_RUNTIME_CUDA &&
-         context->backend != VERNON_RUNTIME_VULKAN && context->backend != VERNON_RUNTIME_DIRECTX12 &&
-         context->backend != VERNON_RUNTIME_OPENGL && context->backend != VERNON_RUNTIME_OPENGL_ES) ||
-        !size || !alignment || (alignment & (alignment - 1))) {
-        fail(context, "invalid compute buffer allocation");
-        return nullptr;
-    }
-    auto result = std::make_unique<VernonDeviceBuffer>();
-    result->context = context;
-    result->size = size;
-    result->alignment = alignment;
-    if (!createBackendBuffer(*result))
-        return nullptr;
-    ++context->liveBuffers;
-    return result.release();
-}
-
-VernonDeviceBuffer *vernonRuntimeImportOpenGLBuffer(VernonRuntimeContext *context, uint32_t buffer, size_t size,
-                                                    size_t alignment) {
-    if (!context || !buffer || !size || !alignment || (alignment & (alignment - 1)) ||
-        (context->backend != VERNON_RUNTIME_OPENGL && context->backend != VERNON_RUNTIME_OPENGL_ES))
-        return nullptr;
-    auto result = std::make_unique<VernonDeviceBuffer>();
-    result->context = context;
-    result->size = size;
-    result->alignment = alignment;
-    importBackendOpenGLBuffer(*result, buffer);
-    ++context->liveBuffers;
-    return result.release();
-}
-
-VernonStatus vernonRuntimeBufferFree(VernonDeviceBuffer *buffer) {
-    if (!buffer)
-        return VERNON_STATUS_OK;
-    const VernonStatus status = destroyBackendBuffer(*buffer);
-    if (status != VERNON_STATUS_OK)
-        return status;
-    destroyRuntimeBackendState(*buffer);
-    --buffer->context->liveBuffers;
-    delete buffer;
-    return VERNON_STATUS_OK;
-}
-
-VernonStatus vernonRuntimeCopyFromHost(VernonDeviceBuffer *buffer, size_t offset, const void *source, size_t size) {
-    if (buffer)
-        return copyToBackendBuffer(*buffer, offset, source, size);
-    return fail(buffer ? buffer->context : nullptr, "invalid compute buffer upload");
-}
-
-VernonStatus vernonRuntimeCopyToHost(const VernonDeviceBuffer *buffer, size_t offset, void *destination, size_t size) {
-    if (buffer)
-        return copyFromBackendBuffer(*buffer, offset, destination, size);
-    return fail(buffer ? buffer->context : nullptr, "invalid compute buffer readback");
-}
-
-VernonDeviceTexture *vernonRuntimeTextureCreate(VernonRuntimeContext *context,
-                                                const VernonTextureDescriptor *descriptor) {
-    if (!context || !descriptor || descriptor->struct_size < sizeof(VernonTextureDescriptor) || !descriptor->width ||
-        !descriptor->height || !descriptor->depth || !descriptor->mip_levels)
-        return nullptr;
-    if (isOpenGLBackend(context->backend)) {
-        auto texture = std::make_unique<VernonDeviceTexture>();
-        texture->context = context;
-        texture->width = descriptor->width;
-        texture->height = descriptor->height;
-        texture->depth = descriptor->depth;
-        texture->mipLevels = descriptor->mip_levels;
-        texture->dimension = descriptor->dimension;
-        texture->format = descriptor->format;
-        if (!createBackendTexture(*texture))
-            return nullptr;
-        ++context->liveTextures;
-        return texture.release();
-    }
-    if (context->backend != VERNON_RUNTIME_VULKAN && context->backend != VERNON_RUNTIME_DIRECTX12) {
-        fail(context, "owned sampled textures require Vulkan or DirectX 12", VERNON_STATUS_UNSUPPORTED_TARGET);
-        return nullptr;
-    }
-    if (descriptor->dimension > VERNON_TEXTURE_CUBE ||
-        (descriptor->dimension != VERNON_TEXTURE_3D && descriptor->depth != 1) ||
-        (descriptor->dimension == VERNON_TEXTURE_CUBE && descriptor->width != descriptor->height)) {
-        fail(context, "sampled texture descriptor dimensions are invalid");
-        return nullptr;
-    }
-    auto texture = std::make_unique<VernonDeviceTexture>();
-    texture->context = context;
-    texture->width = descriptor->width;
-    texture->height = descriptor->height;
-    texture->depth = descriptor->depth;
-    texture->mipLevels = descriptor->mip_levels;
-    texture->dimension = descriptor->dimension;
-    texture->format = descriptor->format;
-    if (!createBackendTexture(*texture))
-        return nullptr;
-    ++context->liveTextures;
-    return texture.release();
-}
-
-VernonDeviceTexture *vernonRuntimeImportOpenGLTexture(VernonRuntimeContext *context, uint32_t texture,
-                                                      const VernonTextureDescriptor *descriptor) {
-    if (!context || (context->backend != VERNON_RUNTIME_OPENGL && context->backend != VERNON_RUNTIME_OPENGL_ES) ||
-        !texture || !descriptor || descriptor->struct_size < sizeof(VernonTextureDescriptor) || !descriptor->width ||
-        !descriptor->height || !descriptor->depth || !descriptor->mip_levels ||
-        descriptor->format > VERNON_TEXTURE_R11G11B10_FLOAT || descriptor->dimension > VERNON_TEXTURE_CUBE ||
-        (descriptor->dimension != VERNON_TEXTURE_3D && descriptor->depth != 1) ||
-        (descriptor->dimension == VERNON_TEXTURE_CUBE && descriptor->width != descriptor->height))
-        return nullptr;
-    auto result = std::make_unique<VernonDeviceTexture>();
-    result->context = context;
-    result->width = descriptor->width;
-    result->height = descriptor->height;
-    result->depth = descriptor->depth;
-    result->mipLevels = descriptor->mip_levels;
-    result->dimension = descriptor->dimension;
-    result->format = descriptor->format;
-    importBackendOpenGLTexture(*result, texture);
-    ++context->liveTextures;
-    return result.release();
-}
-
-VernonStatus vernonRuntimeTextureFree(VernonDeviceTexture *texture) {
-    if (!texture)
-        return VERNON_STATUS_OK;
-    destroyBackendTexture(*texture);
-    destroyRuntimeBackendState(*texture);
-    --texture->context->liveTextures;
-    delete texture;
-    return VERNON_STATUS_OK;
-}
-
-VernonDeviceSampler *vernonRuntimeSamplerCreate(VernonRuntimeContext *context,
-                                                const VernonSamplerDescriptor *descriptor) {
-    if (!context || !descriptor || descriptor->struct_size < sizeof(VernonSamplerDescriptor))
-        return nullptr;
-    if (isOpenGLBackend(context->backend)) {
-        auto sampler = std::make_unique<VernonDeviceSampler>();
-        sampler->context = context;
-        sampler->descriptor = *descriptor;
-        if (!createBackendSampler(*sampler))
-            return nullptr;
-        ++context->liveSamplers;
-        return sampler.release();
-    }
-    if (context->backend != VERNON_RUNTIME_VULKAN && context->backend != VERNON_RUNTIME_DIRECTX12) {
-        fail(context, "owned sampler creation requires Vulkan or DirectX 12; import an OpenGL sampler",
-             VERNON_STATUS_UNSUPPORTED_TARGET);
-        return nullptr;
-    }
-    auto sampler = std::make_unique<VernonDeviceSampler>();
-    sampler->context = context;
-    sampler->descriptor = *descriptor;
-    if (!createBackendSampler(*sampler))
-        return nullptr;
-    ++context->liveSamplers;
-    return sampler.release();
-}
-
-VernonDeviceSampler *vernonRuntimeImportOpenGLSampler(VernonRuntimeContext *context, uint32_t sampler) {
-    if (!context || (context->backend != VERNON_RUNTIME_OPENGL && context->backend != VERNON_RUNTIME_OPENGL_ES) ||
-        !sampler)
-        return nullptr;
-    auto result = std::make_unique<VernonDeviceSampler>();
-    result->context = context;
-    importBackendOpenGLSampler(*result, sampler);
-    ++context->liveSamplers;
-    return result.release();
-}
-
-VernonStatus vernonRuntimeSamplerFree(VernonDeviceSampler *sampler) {
-    if (!sampler)
-        return VERNON_STATUS_OK;
-    destroyBackendSampler(*sampler);
-    destroyRuntimeBackendState(*sampler);
-    --sampler->context->liveSamplers;
-    delete sampler;
-    return VERNON_STATUS_OK;
-}
-
-VernonStatus vernonRuntimeTextureCopyFromHost(VernonDeviceTexture *texture, const void *source, size_t size) {
-    if (texture)
-        return copyToBackendTexture(*texture, source, size);
-    return fail(texture ? texture->context : nullptr, "texture upload backend is unsupported",
-                VERNON_STATUS_UNSUPPORTED_TARGET);
-}
-
-VernonStatus vernonRuntimeTextureCopyToHost(const VernonDeviceTexture *texture, void *destination, size_t size) {
-    if (texture)
-        return copyFromBackendTexture(*texture, destination, size);
-    return fail(texture ? texture->context : nullptr, "texture readback backend is unsupported",
-                VERNON_STATUS_UNSUPPORTED_TARGET);
 }
 
 VernonLoadedPipeline *vernonRuntimeLoadCpuEntry(VernonRuntimeContext *context, VernonCpuEntryPoint entryPoint,
@@ -397,9 +186,9 @@ VernonStatus vernonRuntimePipelineBundleInspectTarget(const void *bundleData, si
             static_cast<const char *>(bundleData), static_cast<const char *>(bundleData) + bundleSize, nullptr, false);
         if (root.is_discarded() || !root.is_object())
             return VERNON_STATUS_PARSE_ERROR;
-        const bool schema2 = root.value("schema_version", 0) == 3 && root.value("type", "") == "pipeline";
+        const bool pipelineSchema = root.value("schema_version", 0) == 4 && root.value("type", "") == "pipeline";
         std::string manifestError;
-        if (!schema2 || root.value("invocation_abi_version", 0) != VERNON_PIPELINE_INVOCATION_ABI_VERSION ||
+        if (!pipelineSchema || root.value("invocation_abi_version", 0) != VERNON_PIPELINE_INVOCATION_ABI_VERSION ||
             !validateManifestHash(root, true, manifestError))
             return VERNON_STATUS_PARSE_ERROR;
         const std::string name = root.value("target", "");
@@ -444,9 +233,9 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                                      : context->backend == VERNON_RUNTIME_DIRECTX12
                                          ? "directx"
                                          : (context->backend == VERNON_RUNTIME_OPENGL_ES ? "opengles" : "opengl");
-        const bool schema2 =
-            root.is_object() && root.value("schema_version", 0) == 3 && root.value("type", "") == "pipeline";
-        if (!schema2 || root.value("invocation_abi_version", 0) != VERNON_PIPELINE_INVOCATION_ABI_VERSION ||
+        const bool pipelineSchema =
+            root.is_object() && root.value("schema_version", 0) == 4 && root.value("type", "") == "pipeline";
+        if (!pipelineSchema || root.value("invocation_abi_version", 0) != VERNON_PIPELINE_INVOCATION_ABI_VERSION ||
             root.value("target", "") != expectedTarget || !root.contains("stage_artifacts") ||
             !root["stage_artifacts"].is_object() || !root.contains("variants") || !root["variants"].is_array()) {
             fail(context, "unsupported or invalid pipeline bundle");
@@ -463,9 +252,8 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
         bundle->id = root.value("id", "");
         for (const nlohmann::json &feature : root.value("features", nlohmann::json::array()))
             bundle->features.push_back(feature.get<std::string>());
-        if (schema2 &&
-            (!std::is_sorted(bundle->features.begin(), bundle->features.end()) ||
-             std::adjacent_find(bundle->features.begin(), bundle->features.end()) != bundle->features.end())) {
+        if (!std::is_sorted(bundle->features.begin(), bundle->features.end()) ||
+            std::adjacent_find(bundle->features.begin(), bundle->features.end()) != bundle->features.end()) {
             fail(context, "pipeline feature table is not canonical");
             return nullptr;
         }
@@ -494,43 +282,39 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                         }
                 }
             }
-            std::optional<ResolvedArtifact> resolved;
-            if (schema2) {
-                if (!value.contains("artifact")) {
-                    fail(context, "pipeline stage artifact descriptor is missing");
-                    return nullptr;
-                }
-                ResolvedArtifact artifact;
-                if (!resolveArtifact(value["artifact"], bundleDirectory, artifact, context->error))
-                    return nullptr;
-                const char *expectedFormat = context->backend == VERNON_RUNTIME_CUDA        ? "ptx"
-                                             : context->backend == VERNON_RUNTIME_VULKAN    ? "spirv"
-                                             : context->backend == VERNON_RUNTIME_DIRECTX12 ? "dxil"
-                                             : context->backend == VERNON_RUNTIME_OPENGL_ES ? "gles"
-                                                                                            : "glsl";
-                const std::string encoding = value["artifact"].value("encoding", "");
-                const bool validCpuFormat =
-                    context->backend == VERNON_RUNTIME_CPU &&
-                    (artifact.format == "native_library" || artifact.format == "relocatable_object");
-                const bool validFormat =
-                    context->backend == VERNON_RUNTIME_CPU ? validCpuFormat : artifact.format == expectedFormat;
-                if (context->backend == VERNON_RUNTIME_DIRECTX12 && artifact.format == "hlsl") {
-                    fail(context, "legacy DirectX HLSL bundles are unsupported; re-cook the pipeline to DXIL",
-                         VERNON_STATUS_UNSUPPORTED_TARGET);
-                    return nullptr;
-                }
-                if (!validFormat || (artifact.external && value["artifact"].contains("encoding")) ||
-                    (!artifact.external &&
-                     (((artifact.format == "spirv" || artifact.format == "dxil") && encoding != "base64") ||
-                      (artifact.format != "spirv" && artifact.format != "dxil" && encoding != "utf8"))) ||
-                    value.value("target", "") != expectedTarget) {
-                    fail(context, "pipeline stage artifact format is invalid for target");
-                    return nullptr;
-                }
-                resolved = std::move(artifact);
+            if (!value.contains("artifact")) {
+                fail(context, "pipeline stage artifact descriptor is missing");
+                return nullptr;
+            }
+            ResolvedArtifact resolved;
+            if (!resolveArtifact(value["artifact"], bundleDirectory, resolved, context->error))
+                return nullptr;
+            const char *expectedFormat = context->backend == VERNON_RUNTIME_CUDA        ? "ptx"
+                                         : context->backend == VERNON_RUNTIME_VULKAN    ? "spirv"
+                                         : context->backend == VERNON_RUNTIME_DIRECTX12 ? "dxil"
+                                         : context->backend == VERNON_RUNTIME_OPENGL_ES ? "gles"
+                                                                                        : "glsl";
+            const std::string encoding = value["artifact"].value("encoding", "");
+            const bool validCpuFormat =
+                context->backend == VERNON_RUNTIME_CPU &&
+                (resolved.format == "native_library" || resolved.format == "relocatable_object");
+            const bool validFormat =
+                context->backend == VERNON_RUNTIME_CPU ? validCpuFormat : resolved.format == expectedFormat;
+            if (context->backend == VERNON_RUNTIME_DIRECTX12 && resolved.format == "hlsl") {
+                fail(context, "legacy DirectX HLSL bundles are unsupported; re-cook the pipeline to DXIL",
+                     VERNON_STATUS_UNSUPPORTED_TARGET);
+                return nullptr;
+            }
+            if (!validFormat || (resolved.external && value["artifact"].contains("encoding")) ||
+                (!resolved.external &&
+                 (((resolved.format == "spirv" || resolved.format == "dxil") && encoding != "base64") ||
+                  (resolved.format != "spirv" && resolved.format != "dxil" && encoding != "utf8"))) ||
+                value.value("target", "") != expectedTarget) {
+                fail(context, "pipeline stage artifact format is invalid for target");
+                return nullptr;
             }
             if (context->backend == VERNON_RUNTIME_CPU) {
-                if (!bundleDirectory || (schema2 && (!resolved || !resolved->external))) {
+                if (!bundleDirectory || !resolved.external) {
                     fail(context, "CPU pipeline artifacts require an external bundle directory");
                     return nullptr;
                 }
@@ -541,7 +325,7 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                 artifact.relativeLibrary =
                     std::filesystem::u8path(nativeArtifact.value("path", value.value("native_library", "")));
                 artifact.entry = stage.entry;
-                artifact.format = schema2 ? resolved->format : value.value("format", "");
+                artifact.format = resolved.format;
                 artifact.symbol = value.value("symbol", "");
                 artifact.operatingSystem = value.value("operating_system", "");
                 artifact.architecture = value.value("architecture", "");
@@ -553,22 +337,21 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                 if (value.contains("reflection"))
                     artifact.reflection = value["reflection"];
                 std::filesystem::path validatedPath;
-                const std::string format = schema2 ? resolved->format : value.value("format", "");
+                const std::string format = resolved.format;
                 if ((format != "native_library" && format != "relocatable_object") ||
                     !resolveCpuNativeArtifact(artifact, validatedPath, nullptr, context->error))
                     return nullptr;
                 stage.cpuArtifact = std::move(artifact);
             }
-            if (schema2 && (context->backend == VERNON_RUNTIME_VULKAN || context->backend == VERNON_RUNTIME_DIRECTX12))
-                stage.binary = std::move(resolved->bytes);
-            else if (schema2 && context->backend != VERNON_RUNTIME_CPU)
-                stage.source.assign(resolved->bytes.begin(), resolved->bytes.end());
+            if (context->backend == VERNON_RUNTIME_VULKAN || context->backend == VERNON_RUNTIME_DIRECTX12)
+                stage.binary = std::move(resolved.bytes);
+            else if (context->backend != VERNON_RUNTIME_CPU)
+                stage.source.assign(resolved.bytes.begin(), resolved.bytes.end());
             const bool hasArtifact =
                 context->backend == VERNON_RUNTIME_CPU ? stage.cpuArtifact.has_value()
                 : (context->backend == VERNON_RUNTIME_VULKAN || context->backend == VERNON_RUNTIME_DIRECTX12)
                     ? !stage.binary.empty() && stage.binary.size() % sizeof(uint32_t) == 0 && !stage.reflection.empty()
-                : context->backend == VERNON_RUNTIME_CUDA ? (schema2 || value.value("format", "") == "ptx") &&
-                                                                !stage.source.empty() && !stage.reflection.empty()
+                : context->backend == VERNON_RUNTIME_CUDA ? !stage.source.empty() && !stage.reflection.empty()
                                                           : !stage.source.empty();
             if (stage.stage.empty() || stage.entry.empty() || !hasArtifact) {
                 fail(context, "pipeline stage artifact is invalid");
@@ -643,17 +426,24 @@ VernonStringView vernonRuntimePipelineBundleGetId(const VernonPipelineBundle *bu
 
 namespace {
 
+VernonValueLayoutView valueLayoutView(const ValueLayout &layout) {
+    return {sizeof(VernonValueLayoutView),
+            layout.byteSize,
+            layout.alignment,
+            {layout.layoutHash.data(), layout.layoutHash.size()},
+            layout.abiLeaves.empty() ? nullptr : layout.abiLeaves.data(),
+            layout.abiLeaves.size()};
+}
+
 bool fillParameterView(const Parameter &source, VernonPipelineParameterView &destination) {
     const auto kind = pipelineArgumentKind(source.kind);
-    const auto dtype =
-        source.kind == "sampler" ? std::optional<VernonDataType>(VERNON_DATA_F32) : pipelineDataType(source.dtype);
     const auto access = pipelineValueAccess(source.access);
-    if (!kind || !dtype || !access)
+    if (!kind || !access)
         return false;
     destination = {source.slot,
                    {source.name.data(), source.name.size()},
                    *kind,
-                   *dtype,
+                   source.kind == "tensor" ? valueLayoutView(source.elementLayout) : VernonValueLayoutView{},
                    *access,
                    static_cast<uint32_t>(source.shape.size()),
                    source.shape.empty() ? nullptr : source.shape.data()};
@@ -723,6 +513,8 @@ VernonLoadedPipeline *vernonRuntimeResolvePipeline(VernonPipelineBundle *bundle,
     auto pipeline = std::make_unique<VernonLoadedPipeline>();
     pipeline->context = bundle->context;
     pipeline->variant = *found;
+    for (Parameter &parameter : pipeline->variant.parameters)
+        rebuildValueLayoutPathViews(parameter.elementLayout);
     if (!resolveBackendPipeline(*bundle, *found, *pipeline))
         return nullptr;
     ++bundle->context->livePipelines;
@@ -750,6 +542,27 @@ VernonStatus vernonRuntimeLoadedPipelineFindParameter(const VernonLoadedPipeline
     if (found == pipeline->variant.parameters.end())
         return VERNON_STATUS_INVALID_ARGUMENT;
     return fillParameterView(*found, *parameter) ? VERNON_STATUS_OK : VERNON_STATUS_PARSE_ERROR;
+}
+
+VernonStatus vernonRuntimeLoadedPipelineGetParameterValueLeaf(const VernonLoadedPipeline *pipeline,
+                                                              VernonStringView parameterName, size_t leafIndex,
+                                                              VernonPipelineValueLeafView *leaf) {
+    if (!pipeline || !leaf || leaf->struct_size < sizeof(VernonPipelineValueLeafView) ||
+        (parameterName.size && !parameterName.data))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    const auto parameter =
+        std::find_if(pipeline->variant.parameters.begin(), pipeline->variant.parameters.end(),
+                     [&](const Parameter &candidate) { return stringViewEquals(parameterName, candidate.name); });
+    if (parameter == pipeline->variant.parameters.end() || parameter->kind != "tensor" ||
+        leafIndex >= parameter->elementLayout.leaves.size())
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    const ValueLeaf &source = parameter->elementLayout.leaves[leafIndex];
+    leaf->value = parameter->elementLayout.abiLeaves[leafIndex];
+    leaf->path = source.abiPath.empty() ? nullptr : source.abiPath.data();
+    leaf->path_count = source.abiPath.size();
+    leaf->static_shape = source.shape.empty() ? nullptr : source.shape.data();
+    leaf->static_rank = static_cast<uint32_t>(source.shape.size());
+    return VERNON_STATUS_OK;
 }
 
 VernonStatus vernonRuntimeLoadedPipelineGetTextureConstraintByParameterIndex(
@@ -812,22 +625,14 @@ VernonStatus vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline, const V
     if (!pipeline->variant.compute.empty()) {
         PlannedComputeLaunch plan;
         std::string planningError;
-        const ComputePlannerCallbacks plannerCallbacks{
-            nullptr, [](const void *, const VernonDeviceBuffer *buffer) -> const void * {
-                return buffer ? buffer->context : nullptr;
-            }};
-        if (!planComputeInvocation(pipeline->variant, *invocation, pipeline->context, plannerCallbacks, plan,
-                                   planningError))
+        if (!planComputeInvocation(pipeline->variant, *invocation, plan, planningError))
             return fail(pipeline->context, planningError);
         return invokeBackendComputePipeline(*pipeline, plan);
     }
 
     PlannedGraphicsInvocation plan;
     std::string planningError;
-    const GraphicsPlannerCallbacks plannerCallbacks{nullptr, &plannerBufferSnapshot, &plannerTextureSnapshot,
-                                                    &plannerSamplerContext};
-    if (!planGraphicsInvocation(pipeline->variant, *invocation, pipeline->context, plannerCallbacks, plan,
-                                planningError))
+    if (!planGraphicsInvocation(pipeline->variant, *invocation, plan, planningError))
         return fail(pipeline->context, planningError);
     return invokeBackendPipeline(*pipeline, *invocation, plan);
 }

@@ -14,7 +14,7 @@ import numpy as np
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
 from ..pipeline_compile import TargetOptions, canonical_json
 from ..types import TypeExpr, _Scalar
-from .resources import TensorStorage, TensorView, _dispatch_borrow_scope
+from .resources import TensorStorage, TensorView, _bind_native_argument, _dispatch_borrow_scope
 
 
 def _session_state() -> Any:
@@ -261,6 +261,17 @@ class Kernel:
         for name, value in zip(user_parameters, arguments, strict=True):
             parameter = typed_parameters[name]
             if parameter.type.kind != "tensor_view":
+                if parameter.type.kind == "tensor" and isinstance(value, (TensorStorage, TensorView)):
+                    element = parameter.type.arguments[0]
+                    expected_shape = tuple(parameter.type.arguments[1:])
+                    element_type = value.element_type if isinstance(value, TensorView) else value._element_type
+                    if tuple(value.shape) != expected_shape:
+                        raise TypeError(
+                            f"kernel Tensor argument {name!r} has shape {tuple(value.shape)}, expected {expected_shape}"
+                        )
+                    if runtime_signature(element_type) != dsl_signature(element):
+                        raise TypeError(f"kernel Tensor argument {name!r} element type does not match {element.name}")
+                    continue
                 if isinstance(value, (TensorStorage, TensorView)):
                     raise TypeError(f"kernel argument {name!r} is runtime storage but its annotation is not TensorView")
                 continue
@@ -483,32 +494,27 @@ class Kernel:
             if isinstance(value, (TensorStorage, TensorView))
         ]
         with _dispatch_borrow_scope(dispatch_borrows):
-            native_values: list[Any] = []
-            numpy_dtypes = {
-                state._native.DATA_BOOL: np.dtype(np.bool_),
-                state._native.DATA_I32: np.dtype(np.int32),
-                state._native.DATA_U32: np.dtype(np.uint32),
-                state._native.DATA_F16: np.dtype(np.float16),
-                state._native.DATA_F32: np.dtype(np.float32),
-                state._native.DATA_F64: np.dtype(np.float64),
+            builder = compiled.native.invocation_builder()
+            static_tensor_names = {
+                argument.arg
+                for argument in compiled.function.args.args
+                if isinstance(argument.annotation, ast.Subscript)
+                and self._annotation_name(argument.annotation.value) == "Tensor"
             }
-            for parameter, value in zip(compiled.native.parameters, arguments, strict=True):
-                if isinstance(value, (TensorStorage, TensorView)):
-                    native_values.append(value._resident_buffer())
-                else:
-                    dtype = numpy_dtypes.get(parameter.dtype)
-                    if dtype is None:
-                        raise TypeError(f"kernel parameter {parameter.name!r} has an unsupported dtype")
-                    host_value = np.asarray(value, dtype=dtype)
-                    if tuple(host_value.shape) != tuple(parameter.shape):
-                        raise ValueError(
-                            f"kernel parameter {parameter.name!r} expects shape {tuple(parameter.shape)}, "
-                            f"got {tuple(host_value.shape)}"
-                        )
-                    native_values.append(host_value.tobytes(order="C"))
-            compiled.native.invoke(*grid, native_values)
+            for user_name, parameter, value in zip(user_parameters, compiled.native.parameters, arguments, strict=True):
+                _bind_native_argument(
+                    builder,
+                    parameter,
+                    value,
+                    host_value=user_name in static_tensor_names,
+                )
+            builder.grid(*grid).invoke()
             for name, value in zip(user_parameters, arguments, strict=True):
-                if name in compiled.writable_names and isinstance(value, (TensorStorage, TensorView)):
+                if (
+                    state._architecture != state.cpu
+                    and name in compiled.writable_names
+                    and isinstance(value, (TensorStorage, TensorView))
+                ):
                     value._mark_device_dirty()
 
     def __call__(

@@ -12,7 +12,6 @@
 #include <string>
 #include <vector>
 
-struct VernonDeviceBuffer;
 struct VernonRuntimeContext;
 
 namespace vernon::runtime {
@@ -25,10 +24,6 @@ struct CpuKernelState {
 struct CpuContextState {
     VernonRuntimeDeviceProvider provider{};
     std::string error;
-};
-
-struct CpuBufferState {
-    std::vector<unsigned char> storage;
 };
 
 struct CpuPipelineState {
@@ -51,14 +46,6 @@ VernonStringView cpuProviderLastError(const VernonRuntimeContext &context);
 bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState kernel, ReflectedEntry reflection,
                                CpuPipelineState &state);
 
-inline CpuBufferState &cpuBufferState(VernonDeviceBuffer &buffer) {
-    return runtimeBackendState<CpuBufferState>(buffer);
-}
-
-inline const CpuBufferState &cpuBufferState(const VernonDeviceBuffer &buffer) {
-    return runtimeBackendState<CpuBufferState>(buffer);
-}
-
 VernonStatus registerStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint entry);
 
 bool loadCpuEntry(VernonCpuEntryPoint entry, const char *reflection, size_t reflectionSize, const char *entryName,
@@ -66,10 +53,6 @@ bool loadCpuEntry(VernonCpuEntryPoint entry, const char *reflection, size_t refl
 
 bool loadCpuNativeArtifact(const CpuNativeArtifact &artifact, CpuKernelState &state, ReflectedEntry &metadata,
                            std::string &error);
-
-bool createCpuBuffer(VernonDeviceBuffer &buffer);
-VernonStatus copyToCpuBuffer(VernonDeviceBuffer &buffer, size_t offset, const void *source, size_t size);
-VernonStatus copyFromCpuBuffer(const VernonDeviceBuffer &buffer, size_t offset, void *destination, size_t size);
 
 } // namespace vernon::runtime
 

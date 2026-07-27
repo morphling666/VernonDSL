@@ -26,9 +26,35 @@ from vernon_dsl.pipeline_compile import (
 )
 
 
+def _scalar_layout(dtype: str) -> dict[str, object]:
+    sizes = {"bool": 1, "i32": 4, "u32": 4, "f16": 2, "f32": 4, "f64": 8}
+    size = sizes[dtype]
+    physical = "i32" if dtype == "u32" else dtype
+    canonical = f"scalar({physical},{size},{size})|dtypes={dtype}"
+    return {
+        "logical_type": dtype,
+        "byte_size": size,
+        "alignment": size,
+        "layout_hash": hashlib.sha256(canonical.encode()).hexdigest(),
+        "leaves": [{"path": [], "dtype": dtype, "byte_offset": 0, "scalar_count": 1}],
+    }
+
+
 def _stage(stage: str, artifact: bytes, interface: dict[str, object]) -> CompiledStage:
     if not artifact.startswith(b"#version"):
         artifact = b"#version 330\n" + artifact
+    interface = json.loads(json.dumps(interface))
+    for argument in interface.get("arguments", []):
+        if (
+            argument.get("kind") not in {"texture", "sampler"}
+            and "vernon.builtin" not in argument
+            and not argument.get("vernon.varying", False)
+            and "element_layout" not in argument
+        ):
+            type_name = argument.get("type", "")
+            dtype = argument.get("dtype") or str(type_name).removesuffix(">").split("x")[-1]
+            if dtype in {"bool", "i32", "u32", "f16", "f32", "f64"}:
+                argument["element_layout"] = _scalar_layout(dtype)
     entry = f"{stage}_main"
     reflection = {
         "module_hash": "module-hash",
@@ -203,6 +229,7 @@ class PipelineCompileTests(unittest.TestCase):
                             "index": 2,
                             "kind": "scalar",
                             "type": "tensor<2xf32>",
+                            "element_layout": _scalar_layout("f32"),
                             "vernon.source_name": "__resolution",
                             "vernon.interface": "uniform",
                             "vernon.implicit": "resolution",
@@ -305,6 +332,7 @@ class PipelineCompileTests(unittest.TestCase):
                         {
                             "index": 0,
                             "type": "tensor<4x4xf32>",
+                            "element_layout": _scalar_layout("f32"),
                             "vernon.source_name": "material",
                             "vernon.interface": "uniform",
                             "vernon.set": 0,
@@ -346,6 +374,7 @@ class PipelineCompileTests(unittest.TestCase):
                             "type": "tensor<2x3x5xf32>",
                             "kind": "tensor_value",
                             "dtype": "f32",
+                            "element_layout": _scalar_layout("f32"),
                             "shape": [2, 3, 5],
                             "vernon.source_name": "weights",
                             "vernon.interface": "uniform",
@@ -371,6 +400,53 @@ class PipelineCompileTests(unittest.TestCase):
             },
         )
 
+    def test_reflected_aggregate_tensor_uses_explicit_storage_buffer_layout(self) -> None:
+        element_layout = {
+            "logical_type": "!vernon.struct<ComplexAggregateVertex>",
+            "layout_hash": "aggregate-layout",
+            "byte_size": 44,
+            "alignment": 4,
+            "leaves": [
+                {"path": ["position"], "dtype": "f32", "scalar_count": 2, "byte_offset": 0},
+                {"path": ["payload", "object_id"], "dtype": "i32", "scalar_count": 1, "byte_offset": 8},
+            ],
+        }
+        records = {
+            "vertex": {
+                "entry": "vertex_main",
+                "target": "vulkan",
+                "interface": {
+                    "arguments": [
+                        {
+                            "index": 1,
+                            "type": "!vernon.tensor<2x3x4x!vernon.struct<ComplexAggregateVertex>>",
+                            "kind": "tensor_value",
+                            "element_layout": element_layout,
+                            "shape": [2, 3, 4],
+                            "vernon.source_name": "aggregate",
+                            "vernon.interface": "uniform",
+                            "vernon.set": 0,
+                            "vernon.binding": 0,
+                            "physical_size": 1056,
+                            "physical_alignment": 4,
+                            "array_strides": [528, 176, 44],
+                            "proposed_storage_class": "StorageBuffer",
+                        }
+                    ],
+                },
+            }
+        }
+        use = external_parameters(records)["aggregate"][0]
+        self.assertEqual(
+            use["uniform_layout"],
+            {
+                "storage": "storage_buffer",
+                "size": 1056,
+                "alignment": 4,
+                "byte_strides": [528, 176, 44],
+            },
+        )
+
     def test_parameter_merge_and_slot_layout_are_exact(self) -> None:
         uses = [
             {
@@ -380,6 +456,7 @@ class PipelineCompileTests(unittest.TestCase):
                 "kind": "tensor",
                 "type": "tensor<4xf32>",
                 "dtype": "f32",
+                "element_layout": _scalar_layout("f32"),
                 "shape": [4],
                 "interface": "storage",
                 "access": "write",
@@ -391,6 +468,7 @@ class PipelineCompileTests(unittest.TestCase):
                 "kind": "tensor",
                 "type": "tensor<4xf32>",
                 "dtype": "f32",
+                "element_layout": _scalar_layout("f32"),
                 "shape": [4],
                 "interface": "input",
                 "access": "read",
@@ -402,10 +480,10 @@ class PipelineCompileTests(unittest.TestCase):
                 "name": "positions",
                 "kind": "tensor",
                 "type": "tensor<4xf32>",
-                "dtype": "f32",
+                "element_layout": _scalar_layout("f32"),
                 "shape": [4],
                 "access": "read_write",
-                "uses": uses,
+                "uses": [{key: value for key, value in use.items() if key != "element_layout"} for use in uses],
             },
         )
 
@@ -650,6 +728,7 @@ class PipelineCompileTests(unittest.TestCase):
                         "interface": "input",
                         "type": "f32",
                         "dtype": "f32",
+                        "element_layout": _scalar_layout("f32"),
                         "shape": [],
                     },
                     {
@@ -658,6 +737,7 @@ class PipelineCompileTests(unittest.TestCase):
                         "interface": "input",
                         "type": "i32",
                         "dtype": "i32",
+                        "element_layout": _scalar_layout("i32"),
                         "shape": [],
                     },
                 ],

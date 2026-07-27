@@ -38,23 +38,24 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
         Parameter parameter;
         parameter.slot = slot;
         parameter.name = argument.value("name", "argument" + std::to_string(slot));
-        parameter.kind = "tensor";
+        const std::string reflectedKind = argument.value("kind", std::string());
+        parameter.kind = reflectedKind == "texture" || reflectedKind == "sampler" ? reflectedKind : "tensor";
         parameter.source = "direct";
-        parameter.dtype = argument.value("dtype", std::string());
-        const bool opaqueValue = !pipelineDataType(parameter.dtype).has_value();
-        if (opaqueValue)
-            parameter.dtype = "u8";
+        if (parameter.kind == "tensor" &&
+            (!argument.contains("element_layout") ||
+             !parsePipelineValueLayout(argument["element_layout"], parameter.elementLayout, error)))
+            return false;
         parameter.access =
             argument.value("access", argument.value("kind", std::string()) == "tensor" ? "read_write" : "read");
         if (argument.contains("shape") && argument["shape"].is_array())
             parameter.shape = argument["shape"].get<std::vector<uint64_t>>();
-        else if (opaqueValue && argument.value("kind", std::string()) != "tensor")
-            parameter.shape = {argument.value("cpu_size", uint64_t{0})};
         ParameterUse use;
         use.stage = "compute";
         use.index = static_cast<uint32_t>(reflectedIndex);
-        use.interfaceKind = argument.value("kind", std::string()) == "tensor" ? "storage" : "value";
-        use.dtype = parameter.dtype;
+        use.interfaceKind = reflectedKind == "tensor"                                  ? "storage"
+                            : reflectedKind == "texture" || reflectedKind == "sampler" ? "resource"
+                                                                                       : "value";
+        use.dtype = argument.value("dtype", std::string());
         use.shape = parameter.shape;
         use.descriptorSet = argument.value("vernon.set", uint32_t{0});
         use.binding =
@@ -70,14 +71,14 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
                 argument["array_strides"].size() == parameter.shape.size())
                 layout.byteStrides = argument["array_strides"].get<std::vector<uint64_t>>();
             else if (parameter.shape.size() == 2 && argument.contains("matrix_stride")) {
-                const std::optional<VernonDataType> dtype = pipelineDataType(parameter.dtype);
+                const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
                 if (!dtype) {
                     error = "compute static Tensor reflection has an unsupported dtype";
                     return false;
                 }
                 layout.byteStrides = {dataTypeSize(*dtype), argument["matrix_stride"].get<uint64_t>()};
             } else if (parameter.shape.size() == 1) {
-                const std::optional<VernonDataType> dtype = pipelineDataType(parameter.dtype);
+                const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
                 if (!dtype) {
                     error = "compute static Tensor reflection has an unsupported dtype";
                     return false;

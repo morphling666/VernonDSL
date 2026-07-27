@@ -144,13 +144,14 @@ LogicalResult decomposeAggregateValue(Type sourceType, Value value, SmallVectorI
     return success();
 }
 
-Value storageLeafIndex(Value recordIndex, uint64_t recordSize, const StorageLeaf &leaf,
+Value storageLeafIndex(Value recordIndex, uint64_t recordSize, const StorageLeaf &leaf, uint64_t scalarIndex,
                        ConversionPatternRewriter &rewriter, Location location) {
     uint64_t leafSize = std::max<uint64_t>(leaf.type.getIntOrFloatBitWidth() / 8, 1);
     Value stride = arith::ConstantIndexOp::create(rewriter, location, recordSize / leafSize);
     Value result = arith::MulIOp::create(rewriter, location, recordIndex, stride);
-    if (leaf.byteOffset) {
-        Value offset = arith::ConstantIndexOp::create(rewriter, location, leaf.byteOffset / leafSize);
+    const uint64_t scalarOffset = leaf.byteOffset / leafSize + scalarIndex;
+    if (scalarOffset) {
+        Value offset = arith::ConstantIndexOp::create(rewriter, location, scalarOffset);
         result = arith::AddIOp::create(rewriter, location, result, offset);
     }
     return result;
@@ -179,9 +180,10 @@ struct AggregateViewIntrinsicPattern final : ConversionPattern {
         if (op.getName() == "tensor_view_load") {
             SmallVector<Value> leaves;
             for (auto [leaf, storage] : llvm::zip_equal(layout->leaves, storageOperands))
-                leaves.push_back(
-                    memref::LoadOp::create(rewriter, op.getLoc(), storage,
-                                           storageLeafIndex(recordIndex, layout->size, leaf, rewriter, op.getLoc())));
+                for (uint64_t scalarIndex = 0; scalarIndex < leaf.scalarCount; ++scalarIndex)
+                    leaves.push_back(memref::LoadOp::create(
+                        rewriter, op.getLoc(), storage,
+                        storageLeafIndex(recordIndex, layout->size, leaf, scalarIndex, rewriter, op.getLoc())));
             unsigned cursor = 0;
             FailureOr<Value> value = buildAggregateValue(view.getElementType(), leaves, cursor, *getTypeConverter(),
                                                          module, rewriter, op.getLoc());
@@ -194,12 +196,19 @@ struct AggregateViewIntrinsicPattern final : ConversionPattern {
         SmallVector<Value> leaves;
         if (operands[2].size() != 1 ||
             failed(decomposeAggregateValue(view.getElementType(), operands[2].front(), leaves, *getTypeConverter(),
-                                           module, rewriter, op.getLoc())) ||
-            leaves.size() != layout->leaves.size())
+                                           module, rewriter, op.getLoc())))
             return op.emitError("cannot decompose aggregate TensorView value");
-        for (auto [leaf, storage, value] : llvm::zip_equal(layout->leaves, storageOperands, leaves))
-            memref::StoreOp::create(rewriter, op.getLoc(), value, storage,
-                                    storageLeafIndex(recordIndex, layout->size, leaf, rewriter, op.getLoc()));
+        unsigned cursor = 0;
+        for (auto [leaf, storage] : llvm::zip_equal(layout->leaves, storageOperands))
+            for (uint64_t scalarIndex = 0; scalarIndex < leaf.scalarCount; ++scalarIndex) {
+                if (cursor >= leaves.size())
+                    return op.emitError("cannot decompose aggregate TensorView value");
+                memref::StoreOp::create(
+                    rewriter, op.getLoc(), leaves[cursor++], storage,
+                    storageLeafIndex(recordIndex, layout->size, leaf, scalarIndex, rewriter, op.getLoc()));
+            }
+        if (cursor != leaves.size())
+            return op.emitError("cannot decompose aggregate TensorView value");
         rewriter.eraseOp(op);
         return success();
     }
@@ -264,10 +273,10 @@ struct StructCreatePattern final : OpConversionPattern<StructCreateOp> {
 
     LogicalResult matchAndRewrite(StructCreateOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-        SmallVector<Type> fieldTypes;
-        llvm::transform(adaptor.getFields(), std::back_inserter(fieldTypes),
-                        [](Value field) { return field.getType(); });
-        auto structType = LLVM::LLVMStructType::getLiteral(op.getContext(), fieldTypes);
+        auto structType =
+            dyn_cast_if_present<LLVM::LLVMStructType>(getTypeConverter()->convertType(op.getResult().getType()));
+        if (!structType)
+            return failure();
         Value aggregate = LLVM::UndefOp::create(rewriter, op.getLoc(), structType);
         for (auto [index, field] : llvm::enumerate(adaptor.getFields()))
             aggregate = LLVM::InsertValueOp::create(rewriter, op.getLoc(), aggregate, field,
@@ -376,7 +385,7 @@ struct VernonLowerCPUTensorsPass final : PassWrapper<VernonLowerCPUTensorsPass, 
             SmallVector<Type> elements;
             if (failed(converter.convertTypes(tuple.getTypes(), elements)))
                 return std::nullopt;
-            return LLVM::LLVMStructType::getLiteral(tuple.getContext(), elements);
+            return LLVM::LLVMStructType::getLiteral(tuple.getContext(), elements, true);
         });
         converter.addConversion([&converter](TensorType tensor) -> std::optional<Type> {
             Type element = converter.convertType(tensor.getElementType());
@@ -394,7 +403,7 @@ struct VernonLowerCPUTensorsPass final : PassWrapper<VernonLowerCPUTensorsPass, 
             SmallVector<Type> converted;
             if (failed(converter.convertTypes(fields->second, converted)))
                 return std::nullopt;
-            return LLVM::LLVMStructType::getLiteral(structure.getContext(), converted);
+            return LLVM::LLVMStructType::getLiteral(structure.getContext(), converted, true);
         });
         converter.addConversion(
             [module](TensorViewType view, SmallVectorImpl<Type> &types) -> std::optional<LogicalResult> {

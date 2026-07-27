@@ -1,3 +1,4 @@
+#include "runtime_rhi_test_utils.h"
 #include "vernon-c/Runtime.h"
 
 #include <cstring>
@@ -7,14 +8,15 @@ TEST(RuntimeCuda, CopiesAndInvokesDirectComputePipeline) {
     VernonRuntimeCapabilities capabilities = vernonRuntimeGetCapabilities(VERNON_RUNTIME_CUDA);
     if (!capabilities.available)
         GTEST_SKIP() << "CUDA runtime backend is unavailable";
-    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CUDA, nullptr);
+    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_CUDA);
+    VernonRuntimeContext *runtime = context.runtime;
     ASSERT_TRUE(runtime);
-    VernonDeviceBuffer *buffer = vernonRuntimeBufferAllocate(runtime, 16, alignof(float));
-    ASSERT_TRUE(buffer);
     float input[4] = {1, 2, 3, 4};
     float output[4] = {};
-    ASSERT_TRUE(vernonRuntimeCopyFromHost(buffer, 0, input, sizeof(input)) == VERNON_STATUS_OK);
-    ASSERT_TRUE(vernonRuntimeCopyToHost(buffer, 0, output, sizeof(output)) == VERNON_STATUS_OK);
+    auto buffer = vernon::tests::createBuffer(context, sizeof(input), alignof(float), VERNON_RHI_BUFFER_STORAGE, input);
+    ASSERT_NE(buffer.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(context.device, buffer.handle, 0, output, sizeof(output)),
+              VERNON_RHI_STATUS_OK);
     for (int index = 0; index < 4; ++index)
         ASSERT_TRUE(input[index] == output[index]);
 
@@ -56,6 +58,9 @@ TEST(RuntimeCuda, CopiesAndInvokesDirectComputePipeline) {
           "kind": "tensor",
           "dtype": "f32",
           "shape": [4],
+          "element_layout": {"logical_type":"f32","byte_size":4,"alignment":4,
+            "layout_hash":"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",
+            "leaves":[{"path":[],"dtype":"f32","byte_offset":0,"scalar_count":1}]},
           "alignment": 4,
           "cpu_offset": 0,
           "cpu_size": 8
@@ -63,6 +68,9 @@ TEST(RuntimeCuda, CopiesAndInvokesDirectComputePipeline) {
         {
           "kind": "scalar",
           "dtype": "f32",
+          "element_layout": {"logical_type":"f32","byte_size":4,"alignment":4,
+            "layout_hash":"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",
+            "leaves":[{"path":[],"dtype":"f32","byte_offset":0,"scalar_count":1}]},
           "alignment": 4,
           "cpu_offset": 8,
           "cpu_size": 4
@@ -80,9 +88,9 @@ TEST(RuntimeCuda, CopiesAndInvokesDirectComputePipeline) {
     arguments[0].slot = 0;
     arguments[0].kind = VERNON_PIPELINE_TENSOR;
     arguments[0].tensor.struct_size = sizeof(VernonTensorView);
-    arguments[0].tensor.storage = VERNON_TENSOR_DEVICE;
-    arguments[0].tensor.buffer = buffer;
-    arguments[0].tensor.dtype = VERNON_DATA_F32;
+    arguments[0].tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    arguments[0].tensor.resource = buffer.reference;
+    arguments[0].tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
     arguments[0].tensor.access = VERNON_ACCESS_READ_WRITE;
     arguments[0].tensor.rank = 1;
     arguments[0].tensor.shape = shape;
@@ -93,7 +101,7 @@ TEST(RuntimeCuda, CopiesAndInvokesDirectComputePipeline) {
     arguments[1].tensor.struct_size = sizeof(VernonTensorView);
     arguments[1].tensor.storage = VERNON_TENSOR_HOST;
     arguments[1].tensor.host_data = &factor;
-    arguments[1].tensor.dtype = VERNON_DATA_F32;
+    arguments[1].tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
     arguments[1].tensor.access = VERNON_ACCESS_READ;
     arguments[1].tensor.byte_size = sizeof(factor);
     VernonPipelineInvocation invocation{};
@@ -104,11 +112,13 @@ TEST(RuntimeCuda, CopiesAndInvokesDirectComputePipeline) {
     invocation.compute_grid = {4, 1, 1};
     ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
     ASSERT_TRUE(vernonRuntimeSynchronize(runtime) == VERNON_STATUS_OK);
-    ASSERT_TRUE(vernonRuntimeCopyToHost(buffer, 0, output, sizeof(output)) == VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(context.device, buffer.handle, 0, output, sizeof(output)),
+              VERNON_RHI_STATUS_OK);
     for (int index = 0; index < 4; ++index)
         ASSERT_TRUE(output[index] == static_cast<float>(index) * factor);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
 
-    ASSERT_TRUE(vernonRuntimeBufferFree(buffer) == VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyBuffer(context.device, buffer.handle), VERNON_RHI_STATUS_OK);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
+    vernonRhiDestroyDevice(context.device);
 }

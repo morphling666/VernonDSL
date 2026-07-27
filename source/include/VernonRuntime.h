@@ -21,9 +21,6 @@ extern "C" {
 #endif
 
 typedef struct VernonRuntimeContext VernonRuntimeContext;
-typedef struct VernonDeviceBuffer VernonDeviceBuffer;
-typedef struct VernonDeviceTexture VernonDeviceTexture;
-typedef struct VernonDeviceSampler VernonDeviceSampler;
 typedef struct VernonPipelineBundle VernonPipelineBundle;
 typedef struct VernonLoadedPipeline VernonLoadedPipeline;
 
@@ -69,20 +66,8 @@ VERNON_RUNTIME_CAPI VernonRuntimeContext *vernonRuntimeCreateWithOptions(VernonR
                                                                          const VernonRuntimeCreateOptions *options);
 VERNON_RUNTIME_CAPI VernonRuntimeContext *vernonRuntimeCreateForRhiDevice(VernonRuntimeBackend backend,
                                                                           VernonRhiDevice device);
-VERNON_RUNTIME_CAPI VernonRuntimeContext *
-vernonRuntimeCreateOpenGLWithCallbacks(VernonRuntimeBackend backend, const VernonOpenGLContextCallbacks *callbacks);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeDestroy(VernonRuntimeContext *context);
 VERNON_RUNTIME_CAPI VernonStringView vernonRuntimeGetLastError(const VernonRuntimeContext *context);
-
-VERNON_RUNTIME_CAPI VernonDeviceBuffer *vernonRuntimeBufferAllocate(VernonRuntimeContext *context, size_t size,
-                                                                    size_t alignment);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeBufferFree(VernonDeviceBuffer *buffer);
-VERNON_RUNTIME_CAPI VernonDeviceBuffer *vernonRuntimeImportOpenGLBuffer(VernonRuntimeContext *context, uint32_t buffer,
-                                                                        size_t size, size_t alignment);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeCopyFromHost(VernonDeviceBuffer *buffer, size_t offset,
-                                                           const void *source, size_t size);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeCopyToHost(const VernonDeviceBuffer *buffer, size_t offset,
-                                                         void *destination, size_t size);
 
 typedef enum VernonTextureFormat {
     VERNON_TEXTURE_RGBA8_UNORM = 0,
@@ -103,58 +88,6 @@ typedef enum VernonTextureDimension {
     VERNON_TEXTURE_3D = 1,
     VERNON_TEXTURE_CUBE = 2
 } VernonTextureDimension;
-
-typedef struct VernonTextureDescriptor {
-    uint32_t struct_size;
-    VernonTextureDimension dimension;
-    VernonTextureFormat format;
-    uint32_t width;
-    uint32_t height;
-    /* 3D depth; must be one for 2D and Cube sampled textures. */
-    uint32_t depth;
-    uint32_t mip_levels;
-    uint32_t reserved[4];
-} VernonTextureDescriptor;
-
-typedef enum VernonSamplerWrapMode {
-    VERNON_SAMPLER_REPEAT = 0,
-    VERNON_SAMPLER_MIRRORED_REPEAT = 1,
-    VERNON_SAMPLER_CLAMP_TO_EDGE = 2,
-    VERNON_SAMPLER_CLAMP_TO_BORDER = 3
-} VernonSamplerWrapMode;
-
-typedef enum VernonSamplerFilter { VERNON_SAMPLER_NEAREST = 0, VERNON_SAMPLER_LINEAR = 1 } VernonSamplerFilter;
-
-typedef struct VernonSamplerDescriptor {
-    uint32_t struct_size;
-    VernonSamplerWrapMode wrap_u;
-    VernonSamplerWrapMode wrap_v;
-    VernonSamplerWrapMode wrap_w;
-    VernonSamplerFilter min_filter;
-    VernonSamplerFilter mag_filter;
-    VernonSamplerFilter mip_filter;
-    uint32_t reserved[4];
-} VernonSamplerDescriptor;
-
-VERNON_RUNTIME_CAPI VernonDeviceTexture *vernonRuntimeTextureCreate(VernonRuntimeContext *context,
-                                                                    const VernonTextureDescriptor *descriptor);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeTextureFree(VernonDeviceTexture *texture);
-VERNON_RUNTIME_CAPI VernonDeviceTexture *vernonRuntimeImportOpenGLTexture(VernonRuntimeContext *context,
-                                                                          uint32_t texture,
-                                                                          const VernonTextureDescriptor *descriptor);
-/*
- * Cube uploads contain six tightly packed faces in +X, -X, +Y, -Y, +Z, -Z
- * order. The current host upload path supports one-mip RGBA8 textures.
- */
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeTextureCopyFromHost(VernonDeviceTexture *texture, const void *source,
-                                                                  size_t size);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeTextureCopyToHost(const VernonDeviceTexture *texture, void *destination,
-                                                                size_t size);
-VERNON_RUNTIME_CAPI VernonDeviceSampler *vernonRuntimeSamplerCreate(VernonRuntimeContext *context,
-                                                                    const VernonSamplerDescriptor *descriptor);
-VERNON_RUNTIME_CAPI VernonDeviceSampler *vernonRuntimeImportOpenGLSampler(VernonRuntimeContext *context,
-                                                                          uint32_t sampler);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeSamplerFree(VernonDeviceSampler *sampler);
 
 VERNON_RUNTIME_CAPI VernonLoadedPipeline *vernonRuntimeLoadArtifact(VernonRuntimeContext *context, const void *artifact,
                                                                     size_t artifact_size, const char *reflection,
@@ -182,7 +115,6 @@ typedef enum VernonPrimitiveTopology {
 } VernonPrimitiveTopology;
 
 typedef struct VernonIndexBinding {
-    VernonDeviceBuffer *buffer;
     VernonIndexType type;
     size_t offset;
     uint32_t index_count;
@@ -191,7 +123,6 @@ typedef struct VernonIndexBinding {
 
 typedef struct VernonColorAttachment {
     uint32_t location;
-    VernonDeviceTexture *texture;
     VernonRuntimeProviderResourceReference resource;
     uint32_t width;
     uint32_t height;
@@ -199,7 +130,6 @@ typedef struct VernonColorAttachment {
 } VernonColorAttachment;
 
 typedef struct VernonDepthAttachment {
-    VernonDeviceTexture *texture;
     VernonRuntimeProviderResourceReference resource;
     uint32_t width;
     uint32_t height;
@@ -217,7 +147,7 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeReferenceRhiSampler(VernonRuntimeC
                                                                   VernonRhiSampler sampler,
                                                                   VernonRuntimeProviderResourceReference *output);
 
-enum { VERNON_PIPELINE_INVOCATION_ABI_VERSION = 4 };
+enum { VERNON_PIPELINE_INVOCATION_ABI_VERSION = 6 };
 
 typedef struct VernonFeatureSetView {
     const char *const *names;
@@ -240,21 +170,53 @@ typedef enum VernonValueAccess {
     VERNON_ACCESS_READ_WRITE = 2
 } VernonValueAccess;
 
-typedef enum VernonTensorStorage {
-    VERNON_TENSOR_HOST = 0,
-    VERNON_TENSOR_DEVICE = 1,
-    VERNON_TENSOR_RHI_RESOURCE = 2
-} VernonTensorStorage;
+typedef enum VernonTensorStorage { VERNON_TENSOR_HOST = 0, VERNON_TENSOR_RHI_RESOURCE = 1 } VernonTensorStorage;
+
+typedef struct VernonValueLeafView {
+    uint32_t dtype;
+    uint32_t scalar_count;
+    uint32_t byte_offset;
+} VernonValueLeafView;
+
+typedef enum VernonValuePathComponentKind {
+    VERNON_VALUE_PATH_FIELD = 0,
+    VERNON_VALUE_PATH_INDEX = 1
+} VernonValuePathComponentKind;
+
+typedef struct VernonValuePathComponentView {
+    VernonValuePathComponentKind kind;
+    VernonStringView field;
+    uint64_t index;
+} VernonValuePathComponentView;
+
+typedef struct VernonPipelineValueLeafView {
+    uint32_t struct_size;
+    VernonValueLeafView value;
+    const VernonValuePathComponentView *path;
+    size_t path_count;
+    const uint64_t *static_shape;
+    uint32_t static_rank;
+} VernonPipelineValueLeafView;
+
+typedef struct VernonValueLayoutView {
+    uint32_t struct_size;
+    uint32_t byte_size;
+    uint32_t alignment;
+    VernonStringView layout_hash;
+    const VernonValueLeafView *leaves;
+    size_t leaf_count;
+} VernonValueLayoutView;
+
+VERNON_RUNTIME_CAPI VernonValueLayoutView vernonRuntimeGetScalarValueLayout(VernonDataType dtype);
 
 typedef struct VernonTensorView {
     uint32_t struct_size;
     VernonTensorStorage storage;
     union {
         const void *host_data;
-        VernonDeviceBuffer *buffer;
         VernonRuntimeProviderResourceReference resource;
     };
-    VernonDataType dtype;
+    VernonValueLayoutView element_layout;
     VernonValueAccess access;
     uint32_t rank;
     const uint64_t *shape;
@@ -264,7 +226,6 @@ typedef struct VernonTensorView {
 } VernonTensorView;
 
 typedef struct VernonTextureView {
-    VernonDeviceTexture *texture;
     VernonTextureFormat format;
     VernonValueAccess access;
     VernonTextureDimension dimension;
@@ -276,7 +237,6 @@ typedef struct VernonTextureView {
      * parameters. Explicit sampler parameters take precedence and ignore this
      * field. The sampler must belong to the pipeline runtime context.
      */
-    VernonDeviceSampler *sampler;
     VernonRuntimeProviderResourceReference resource;
     VernonRuntimeProviderResourceReference sampler_resource;
 } VernonTextureView;
@@ -293,7 +253,6 @@ typedef struct VernonPipelineArgument {
     union {
         VernonTensorView tensor;
         VernonTextureView texture;
-        VernonDeviceSampler *sampler;
         VernonRuntimeProviderResourceReference resource;
     };
 } VernonPipelineArgument;
@@ -319,7 +278,7 @@ typedef struct VernonPipelineParameterView {
     uint32_t slot;
     VernonStringView name;
     VernonPipelineArgumentKind kind;
-    VernonDataType dtype;
+    VernonValueLayoutView element_layout;
     VernonValueAccess access;
     uint32_t rank;
     const uint64_t *static_shape;
@@ -372,6 +331,10 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetParameterByIndex(
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineFindParameter(const VernonLoadedPipeline *pipeline,
                                                                           VernonStringView name,
                                                                           VernonPipelineParameterView *parameter);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetParameterValueLeaf(const VernonLoadedPipeline *pipeline,
+                                                                                  VernonStringView parameter_name,
+                                                                                  size_t leaf_index,
+                                                                                  VernonPipelineValueLeafView *leaf);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetTextureConstraintByParameterIndex(
     const VernonLoadedPipeline *pipeline, size_t parameter_index, VernonPipelineTextureConstraintView *constraint);
 VERNON_RUNTIME_CAPI VernonStatus

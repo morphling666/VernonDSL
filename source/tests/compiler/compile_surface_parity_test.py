@@ -5,7 +5,6 @@ import base64
 import ctypes
 import hashlib
 import json
-import struct
 import subprocess
 import sys
 import tempfile
@@ -45,6 +44,7 @@ from pipeline_asset_fixture import (  # noqa: E402
     solid_fragment,
     triangle_vertex,
 )
+from vernon_dsl._runtime.resources import _bind_native_argument  # noqa: E402
 from vernon_dsl.compiler import compile_file  # noqa: E402
 from vernon_dsl.pipeline_asset_cli import main as pipeline_asset_main  # noqa: E402
 from vernon_dsl.pipeline_assets import cook_pipeline_asset  # noqa: E402
@@ -238,7 +238,7 @@ class CompileSurfaceParityTests(unittest.TestCase):
                         ]
                     self.assertEqual(cli_reflection, direct_reflection)
                     self.assertEqual(cli_artifacts, direct_artifacts)
-                    self.assertEqual(owning_reflection["schema_version"], 3)
+                    self.assertEqual(owning_reflection["schema_version"], 4)
                     self.assertEqual(owning_reflection["target"], target_name)
                     if glsl_version:
                         self.assertEqual(owning_reflection["target_options"]["glsl_version"], glsl_version)
@@ -386,17 +386,19 @@ class CompileSurfaceParityTests(unittest.TestCase):
         self.assertEqual(reflection["target"], "cpu")
         self.assertTrue(program.has_cpu_entry("scale"))
 
+        vd.init(arch=vd.cpu)
         direct_runtime = native.Runtime(native.RuntimeBackend.CPU)
-        direct_buffer = direct_runtime.allocate(source.nbytes, source.dtype.itemsize)
-        direct_buffer.upload(source.tobytes())
         direct_kernel = direct_runtime.load_cpu_entry(program, "scale")
-        direct_kernel.invoke(4, 1, 1, [direct_buffer, struct.pack("<f", 2.5)])
+        direct_values = vd.storage.from_numpy(source)
+        direct_builder = direct_kernel.invocation_builder()
+        _bind_native_argument(direct_builder, direct_kernel.parameters[0], direct_values)
+        _bind_native_argument(direct_builder, direct_kernel.parameters[1], 2.5)
+        direct_builder.grid(4, 1, 1).invoke()
         direct_runtime.synchronize()
-        direct_values = np.frombuffer(direct_buffer.download(), dtype=np.float32).copy()
+        direct_result = direct_values.to_numpy()
 
         runtime_module.Kernel.clear_cache()
         scale.compile_count = 0
-        vd.init(arch=vd.cpu)
         first = vd.storage.from_numpy(source)
         second = vd.storage.from_numpy(source)
         with mock.patch(
@@ -404,9 +406,9 @@ class CompileSurfaceParityTests(unittest.TestCase):
         ):
             scale(first, 2.5, grid=(4, 1, 1))
             scale(second, 2.5, grid=(4, 1, 1))
-        np.testing.assert_array_equal(first.to_numpy(), direct_values)
-        np.testing.assert_array_equal(second.to_numpy(), direct_values)
-        np.testing.assert_array_equal(direct_values, source * np.float32(2.5))
+        np.testing.assert_array_equal(first.to_numpy(), direct_result)
+        np.testing.assert_array_equal(second.to_numpy(), direct_result)
+        np.testing.assert_array_equal(direct_result, source * np.float32(2.5))
         self.assertEqual(scale.compile_count, 1)
 
 

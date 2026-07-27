@@ -51,6 +51,35 @@ size_t dataTypeSize(VernonDataType dtype) {
     return 0;
 }
 
+bool valueLayoutValid(const VernonValueLayoutView &layout) {
+    if (layout.struct_size < sizeof(VernonValueLayoutView) || !layout.byte_size || !layout.alignment ||
+        (layout.alignment & (layout.alignment - 1)) || !layout.layout_hash.data || !layout.layout_hash.size ||
+        !layout.leaves || !layout.leaf_count)
+        return false;
+    for (size_t index = 0; index < layout.leaf_count; ++index) {
+        const VernonValueLeafView &leaf = layout.leaves[index];
+        const size_t scalarSize = dataTypeSize(static_cast<VernonDataType>(leaf.dtype));
+        if (!scalarSize || !leaf.scalar_count || leaf.byte_offset >= layout.byte_size ||
+            leaf.scalar_count > (layout.byte_size - leaf.byte_offset) / scalarSize)
+            return false;
+    }
+    return true;
+}
+
+bool valueLayoutsEqual(const VernonValueLayoutView &left, const VernonValueLayoutView &right) {
+    if (!valueLayoutValid(left) || !valueLayoutValid(right) || left.byte_size != right.byte_size ||
+        left.alignment != right.alignment || left.layout_hash.size != right.layout_hash.size ||
+        std::memcmp(left.layout_hash.data, right.layout_hash.data, left.layout_hash.size) != 0 ||
+        left.leaf_count != right.leaf_count)
+        return false;
+    for (size_t index = 0; index < left.leaf_count; ++index)
+        if (left.leaves[index].dtype != right.leaves[index].dtype ||
+            left.leaves[index].scalar_count != right.leaves[index].scalar_count ||
+            left.leaves[index].byte_offset != right.leaves[index].byte_offset)
+            return false;
+    return true;
+}
+
 const uint8_t *hostTensorData(const VernonTensorView &tensor) {
     if (!tensor.host_data)
         return nullptr;
@@ -70,7 +99,7 @@ std::optional<size_t> tensorElementCount(const VernonTensorView &tensor) {
 }
 
 std::optional<size_t> tensorLogicalByteSize(const VernonTensorView &tensor) {
-    const size_t elementSize = dataTypeSize(tensor.dtype);
+    const size_t elementSize = valueLayoutValid(tensor.element_layout) ? tensor.element_layout.byte_size : 0;
     const std::optional<size_t> elementCount = tensorElementCount(tensor);
     if (!elementSize || !elementCount || *elementCount > std::numeric_limits<size_t>::max() / elementSize)
         return std::nullopt;
@@ -78,7 +107,7 @@ std::optional<size_t> tensorLogicalByteSize(const VernonTensorView &tensor) {
 }
 
 bool tensorRequiredSpan(const VernonTensorView &tensor, size_t &span) {
-    const size_t elementSize = dataTypeSize(tensor.dtype);
+    const size_t elementSize = valueLayoutValid(tensor.element_layout) ? tensor.element_layout.byte_size : 0;
     const std::optional<size_t> elementCount = tensorElementCount(tensor);
     if (!elementSize || !elementCount)
         return false;
@@ -107,12 +136,12 @@ bool tensorFitsAllocation(const VernonTensorView &tensor) {
     if (!tensorRelativeBounds(tensor, before, after) || before > tensor.byte_offset)
         return false;
     const size_t availableAfter = tensor.byte_size - tensor.byte_offset;
-    const size_t elementSize = dataTypeSize(tensor.dtype);
+    const size_t elementSize = tensor.element_layout.byte_size;
     return after <= availableAfter && elementSize <= availableAfter - after;
 }
 
 bool isRowMajorContiguous(const VernonTensorView &tensor) {
-    const size_t elementSize = dataTypeSize(tensor.dtype);
+    const size_t elementSize = valueLayoutValid(tensor.element_layout) ? tensor.element_layout.byte_size : 0;
     if (!elementSize || (tensor.rank && (!tensor.shape || !tensor.byte_strides)))
         return false;
     size_t stride = elementSize;
@@ -130,10 +159,11 @@ bool isRowMajorContiguous(const VernonTensorView &tensor) {
 }
 
 std::optional<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, const TensorPackingLayout &layout) {
-    if (tensor.storage != VERNON_TENSOR_HOST || tensor.dtype != layout.dtype || tensor.rank != layout.shape.size() ||
+    if (tensor.storage != VERNON_TENSOR_HOST || !valueLayoutValid(tensor.element_layout) ||
+        tensor.element_layout.byte_size != layout.elementSize || tensor.rank != layout.shape.size() ||
         layout.byteStrides.size() != layout.shape.size() || (tensor.rank && !tensor.shape))
         return std::nullopt;
-    const size_t elementSize = dataTypeSize(tensor.dtype);
+    const size_t elementSize = tensor.element_layout.byte_size;
     if (!elementSize || !tensorFitsAllocation(tensor))
         return std::nullopt;
     for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension)
@@ -180,12 +210,12 @@ std::optional<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, c
 }
 
 std::optional<std::vector<uint8_t>> packTensorRowMajor(const VernonTensorView &tensor) {
-    const size_t elementSize = dataTypeSize(tensor.dtype);
+    const size_t elementSize = valueLayoutValid(tensor.element_layout) ? tensor.element_layout.byte_size : 0;
     const std::optional<size_t> packedSize = tensorLogicalByteSize(tensor);
     if (!elementSize || !packedSize || (tensor.rank && !tensor.shape))
         return std::nullopt;
     TensorPackingLayout layout;
-    layout.dtype = tensor.dtype;
+    layout.elementSize = elementSize;
     if (tensor.rank)
         layout.shape.assign(tensor.shape, tensor.shape + tensor.rank);
     layout.byteStrides.resize(tensor.rank);

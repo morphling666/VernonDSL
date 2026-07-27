@@ -22,7 +22,14 @@ from ..pipeline_compile import (
     materialize_bundle,
     serialize_bundle,
 )
-from .resources import DepthTexture, TensorStorage, TensorView, Texture, _dispatch_borrow_scope
+from .resources import (
+    RenderTarget,
+    TensorStorage,
+    TensorView,
+    Texture,
+    _bind_native_argument,
+    _dispatch_borrow_scope,
+)
 
 
 def _session_state() -> Any:
@@ -219,12 +226,10 @@ class Pipeline:
     def _invoke_direct(self, arguments: dict[str, Any]) -> None:
         state = _session_state()
         target = arguments.pop("target", None)
-        targets = arguments.pop("targets", None)
-        depth = arguments.pop("depth", None)
         indices = arguments.pop("indices", None)
         topology = arguments.pop("topology", triangles)
-        if target is not None and targets is not None:
-            raise TypeError("pipeline call cannot use both target and targets")
+        if not isinstance(target, RenderTarget):
+            raise TypeError("target must be a RenderTarget")
         compiled = self._compile(arguments)
         parameters = tuple(compiled.native.parameters)
         expected = {parameter.name for parameter in parameters}
@@ -246,22 +251,6 @@ class Pipeline:
             and isinstance(arguments[parameter.name], (TensorStorage, TensorView))
         ]
         builder = compiled.native.invocation_builder()
-        dtype_codes = {
-            np.dtype(np.bool_): state._native.DATA_BOOL,
-            np.dtype(np.int32): state._native.DATA_I32,
-            np.dtype(np.uint32): state._native.DATA_U32,
-            np.dtype(np.float16): state._native.DATA_F16,
-            np.dtype(np.float32): state._native.DATA_F32,
-            np.dtype(np.float64): state._native.DATA_F64,
-        }
-        numpy_dtypes = {
-            state._native.DATA_BOOL: np.dtype(np.bool_),
-            state._native.DATA_I32: np.dtype(np.int32),
-            state._native.DATA_U32: np.dtype(np.uint32),
-            state._native.DATA_F16: np.dtype(np.float16),
-            state._native.DATA_F32: np.dtype(np.float32),
-            state._native.DATA_F64: np.dtype(np.float64),
-        }
         for parameter in parameters:
             value = arguments[parameter.name]
             if parameter.kind == state._native.PIPELINE_TEXTURE:
@@ -274,61 +263,22 @@ class Pipeline:
                 continue
             if parameter.kind != state._native.PIPELINE_TENSOR:
                 raise TypeError(f"pipeline parameter {parameter.name!r} has unsupported kind")
-            if not isinstance(value, (TensorStorage, TensorView)):
-                expected_dtype = numpy_dtypes.get(parameter.dtype)
-                if expected_dtype is None:
-                    raise TypeError(f"pipeline parameter {parameter.name!r} has unsupported dtype {parameter.dtype}")
-                scalar = np.asarray(value, dtype=expected_dtype)
-                builder.host_tensor(parameter.name, scalar)
-                continue
-            if tuple(value.shape) == tuple(parameter.shape):
-                builder.host_tensor(parameter.name, value._borrowed_array())
-                continue
-            dtype = dtype_codes.get(value.dtype)
-            if dtype is None:
-                raise TypeError(f"pipeline does not support dtype {value.dtype}")
-            layout = value.layout
-            if state._rhi_host is None:
-                raise RuntimeError("device pipeline Tensor arguments require a GPU RHI host")
-            builder.rhi_tensor(
-                parameter.name,
-                value._resident_buffer(),
-                dtype,
-                parameter.access,
-                list(value.shape),
-                list(layout.byte_strides),
-                layout.byte_offset,
+            leaves = tuple(parameter.element_leaves)
+            host_value = isinstance(value, (TensorStorage, TensorView)) and (
+                tuple(value.shape) == tuple(parameter.shape) and len(leaves) == 1 and leaves[0][1:] == (1, 0)
             )
-        rendered_targets: list[Texture] = []
+            _bind_native_argument(builder, parameter, value, host_value=host_value)
         outputs = tuple(compiled.native.outputs)
-        named_outputs = {output.name: output for output in outputs if output.name != f"output_{output.location}"}
-        if targets is not None:
-            if not isinstance(targets, Mapping):
-                raise TypeError("targets must be a mapping of output names")
-            if len(named_outputs) != len(outputs):
-                raise TypeError("targets= requires named fragment struct outputs")
-            if set(targets) != set(named_outputs):
-                raise ValueError("target keys must exactly match fragment output names")
-            for name, output in sorted(named_outputs.items(), key=lambda item: item[1].location):
-                texture = targets[name]
-                if not isinstance(texture, Texture):
-                    raise TypeError(f"target {name!r} must be a Texture")
-                builder.rhi_color_attachment(output.location, texture._resident_texture())
-                rendered_targets.append(texture)
-        else:
-            if (
-                not isinstance(target, Texture)
-                or len(outputs) != 1
-                or outputs[0].location != 0
-                or outputs[0].name != "output_0"
-            ):
-                raise TypeError("target=Texture requires one unnamed fragment output at location zero")
-            builder.rhi_color_attachment(0, target._resident_texture())
-            rendered_targets.append(target)
-        if depth is not None:
-            if not isinstance(depth, DepthTexture):
-                raise TypeError("depth must be a DepthTexture")
-            builder.rhi_depth_attachment(depth._resident_texture())
+        color_attachments = target._color_attachments()
+        output_locations = {output.location for output in outputs}
+        attachment_locations = {location for location, _ in color_attachments}
+        if attachment_locations != output_locations:
+            raise ValueError("RenderTarget color locations must exactly match fragment output locations")
+        for location, texture in color_attachments:
+            builder.rhi_color_attachment(location, texture._resident_texture())
+        depth_attachment = target._resident_depth_attachment()
+        if depth_attachment is not None:
+            builder.rhi_depth_attachment(depth_attachment)
         if indices is not None:
             if (
                 not isinstance(indices, TensorStorage)
@@ -350,7 +300,7 @@ class Pipeline:
         assert state._native_runtime is not None
         with _dispatch_borrow_scope(dispatch_borrows):
             compiled.native.invoke(builder)
-        for texture in rendered_targets:
+        for _, texture in color_attachments:
             texture._mark_device_dirty()
 
     def __call__(self, **arguments: Any) -> None:

@@ -140,16 +140,9 @@ VernonStatus invokeCudaComputePipeline(VernonLoadedPipeline &pipeline, const Pla
         value.slot = layout.slot;
         value.kind = layout.kind;
         if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            if (argument.kind != ComputeLaunchArgumentKind::Tensor ||
-                (!argument.buffer && !argument.resource.resource.value))
-                return fail(*pipeline.context, "CUDA prepared storage binding requires a device Tensor");
-            if (argument.resource.resource.value)
-                value.resource = argument.resource;
-            else {
-                value.resource.identity = reinterpret_cast<uintptr_t>(argument.buffer);
-                value.resource.resource.value = cudaBufferState(*argument.buffer).devicePointer;
-                value.resource.size = argument.buffer->size;
-            }
+            if (argument.kind != ComputeLaunchArgumentKind::Tensor || !argument.resource.resource.value)
+                return fail(*pipeline.context, "CUDA prepared storage binding requires an RHI Tensor");
+            value.resource = argument.resource;
         } else {
             if (argument.kind != ComputeLaunchArgumentKind::Scalar || !argument.scalarData || !argument.scalarSize)
                 return fail(*pipeline.context, "CUDA prepared inline binding requires host data");

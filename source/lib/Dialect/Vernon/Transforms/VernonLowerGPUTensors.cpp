@@ -244,6 +244,37 @@ struct GpuTensorShapeIntrinsicPattern final : OpConversionPattern<IntrinsicOp> {
     bool useSpirv;
 };
 
+struct GpuFlatTensorConstructPattern final : OpConversionPattern<IntrinsicOp> {
+    GpuFlatTensorConstructPattern(TypeConverter &converter, MLIRContext *context, bool useSpirv)
+        : OpConversionPattern(converter, context, PatternBenefit(3)), useSpirv(useSpirv) {}
+
+    LogicalResult matchAndRewrite(IntrinsicOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        if (op.getName() != "construct" || !isa<RankedTensorType>(op.getResult().getType()))
+            return failure();
+        Type resultType = getTypeConverter()->convertType(op.getResult().getType());
+        if (!resultType || isa<VectorType>(resultType))
+            return failure();
+        SmallVector<Value> elements;
+        for (Value operand : adaptor.getOperands()) {
+            auto vector = dyn_cast<VectorType>(operand.getType());
+            if (!vector) {
+                elements.push_back(operand);
+                continue;
+            }
+            for (int64_t index = 0; index < vector.getNumElements(); ++index)
+                elements.push_back(vector::ExtractOp::create(rewriter, op.getLoc(), operand, index));
+        }
+        FailureOr<Value> result = constructFlatTensor(op.getLoc(), resultType, elements, useSpirv, rewriter);
+        if (failed(result))
+            return failure();
+        rewriter.replaceOp(op, *result);
+        return success();
+    }
+
+    bool useSpirv;
+};
+
 struct GpuFlatTensorFromElementsPattern final : OpConversionPattern<tensor::FromElementsOp> {
     GpuFlatTensorFromElementsPattern(TypeConverter &converter, MLIRContext *context, bool useSpirv)
         : OpConversionPattern(converter, context, PatternBenefit(3)), useSpirv(useSpirv) {}
@@ -490,6 +521,23 @@ struct GpuAggregateTensorGetPattern final : OpConversionPattern<TensorGetOp> {
                                                          ArrayRef<int32_t>{static_cast<int32_t>(index)});
             return LLVM::ExtractValueOp::create(rewriter, location, adaptor.getInput(), ArrayRef<int64_t>{index});
         };
+        int64_t constantLinear = 0;
+        bool hasConstantIndices = true;
+        for (auto [dimension, index] : llvm::zip_equal(sourceType.getShape(), adaptor.getIndices())) {
+            if (auto cast = index.getDefiningOp<arith::IndexCastOp>())
+                index = cast.getIn();
+            auto constant = index.getDefiningOp<arith::ConstantOp>();
+            auto value = constant ? dyn_cast<IntegerAttr>(constant.getValue()) : IntegerAttr{};
+            if (!value || value.getInt() < 0 || value.getInt() >= dimension) {
+                hasConstantIndices = false;
+                break;
+            }
+            constantLinear = constantLinear * dimension + value.getInt();
+        }
+        if (hasConstantIndices) {
+            rewriter.replaceOp(op, extract(constantLinear));
+            return success();
+        }
         Value selected = extract(0);
         for (int64_t index = 1; index < elementCount; ++index) {
             Value candidate = extract(index);
@@ -658,8 +706,8 @@ struct VernonLowerGPUTensorsPass final : PassWrapper<VernonLowerGPUTensorsPass, 
         patterns.add<GpuAggregateTensorConstructPattern, GpuAggregateTensorGetPattern, GpuStructCreatePattern,
                      GpuStructGetPattern, GpuTupleCreatePattern, GpuTupleGetPattern>(converter, context,
                                                                                      useSpirvTupleAbi);
-        patterns.add<GpuTensorShapeIntrinsicPattern, GpuFlatTensorFromElementsPattern, GpuFlatTensorSplatPattern,
-                     GpuFlatTensorExtractPattern>(converter, context, useSpirvTupleAbi);
+        patterns.add<GpuTensorShapeIntrinsicPattern, GpuFlatTensorConstructPattern, GpuFlatTensorFromElementsPattern,
+                     GpuFlatTensorSplatPattern, GpuFlatTensorExtractPattern>(converter, context, useSpirvTupleAbi);
         patterns.add<GpuFlatTensorElementwisePattern<arith::AddFOp>, GpuFlatTensorElementwisePattern<arith::SubFOp>,
                      GpuFlatTensorElementwisePattern<arith::MulFOp>, GpuFlatTensorElementwisePattern<arith::DivFOp>,
                      GpuFlatTensorElementwisePattern<arith::AddIOp>, GpuFlatTensorElementwisePattern<arith::SubIOp>,

@@ -13,6 +13,8 @@
 
 namespace vernon::runtime {
 
+struct ValueLayout;
+
 struct ReflectedStorageLeaf {
     size_t elementSize{};
     size_t byteOffset{};
@@ -46,6 +48,8 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
 std::optional<VernonPipelineArgumentKind> pipelineArgumentKind(const std::string &kind);
 
 std::optional<VernonDataType> pipelineDataType(const std::string &dtype);
+
+VernonValueLayoutView pipelineValueLayout(const ValueLayout &layout);
 
 std::optional<VernonValueAccess> pipelineValueAccess(const std::string &access);
 

@@ -12,6 +12,9 @@ namespace vernon::runtime {
 
 size_t dataTypeSize(VernonDataType dtype);
 
+bool valueLayoutValid(const VernonValueLayoutView &layout);
+bool valueLayoutsEqual(const VernonValueLayoutView &left, const VernonValueLayoutView &right);
+
 const uint8_t *hostTensorData(const VernonTensorView &tensor);
 
 std::optional<size_t> tensorElementCount(const VernonTensorView &tensor);
@@ -23,7 +26,7 @@ bool tensorFitsAllocation(const VernonTensorView &tensor);
 bool isRowMajorContiguous(const VernonTensorView &tensor);
 
 struct TensorPackingLayout {
-    VernonDataType dtype{};
+    size_t elementSize{};
     std::vector<uint64_t> shape;
     std::vector<size_t> byteStrides;
     size_t byteSize{};

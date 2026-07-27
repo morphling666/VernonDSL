@@ -98,30 +98,59 @@ struct RhiBuffer {
     size_t size{};
 };
 
+VernonRhiFormat rhiFormat(VernonTextureFormat format) {
+    switch (format) {
+    case VERNON_TEXTURE_RGBA8_UNORM:
+        return VERNON_RHI_FORMAT_RGBA8_UNORM;
+    case VERNON_TEXTURE_RGBA8_SRGB:
+        return VERNON_RHI_FORMAT_RGBA8_SRGB;
+    case VERNON_TEXTURE_RGBA16_FLOAT:
+        return VERNON_RHI_FORMAT_RGBA16_FLOAT;
+    case VERNON_TEXTURE_RGBA32_FLOAT:
+        return VERNON_RHI_FORMAT_RGBA32_FLOAT;
+    case VERNON_TEXTURE_R8_UNORM:
+        return VERNON_RHI_FORMAT_R8_UNORM;
+    case VERNON_TEXTURE_R16_FLOAT:
+        return VERNON_RHI_FORMAT_R16_FLOAT;
+    case VERNON_TEXTURE_R32_FLOAT:
+        return VERNON_RHI_FORMAT_R32_FLOAT;
+    case VERNON_TEXTURE_RG8_UNORM:
+        return VERNON_RHI_FORMAT_RG8_UNORM;
+    case VERNON_TEXTURE_RGB8_UNORM:
+        return VERNON_RHI_FORMAT_RGB8_UNORM;
+    case VERNON_TEXTURE_R11G11B10_FLOAT:
+        return VERNON_RHI_FORMAT_R11G11B10_FLOAT;
+    case VERNON_TEXTURE_D32_FLOAT:
+        return VERNON_RHI_FORMAT_D32_FLOAT;
+    }
+    throw std::invalid_argument("unsupported attachment image format");
+}
+
 struct RhiImage {
-    RhiImage(std::shared_ptr<RhiHostState> host, uint32_t width, uint32_t height, bool depth)
-        : host(std::move(host)), width(width), height(height), depth(depth) {
+    RhiImage(std::shared_ptr<RhiHostState> host, uint32_t width, uint32_t height, VernonTextureFormat format,
+             uint32_t usage)
+        : host(std::move(host)), width(width), height(height), format(format), usage(usage) {
+        if (!width || !height || !usage)
+            throw std::invalid_argument("RHI image extent and usage must be non-zero");
         VernonRhiImageDescriptor descriptor{};
         descriptor.struct_size = sizeof(descriptor);
         descriptor.dimension = VERNON_RHI_IMAGE_2D;
-        descriptor.format = depth ? VERNON_RHI_FORMAT_D32_FLOAT : VERNON_RHI_FORMAT_RGBA8_UNORM;
+        descriptor.format = rhiFormat(format);
         descriptor.width = width;
         descriptor.height = height;
         descriptor.depth = 1;
         descriptor.mip_levels = 1;
         descriptor.array_layers = 1;
         descriptor.sample_count = 1;
-        descriptor.usage = depth ? VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT
-                                 : VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION |
-                                       VERNON_RHI_IMAGE_SAMPLED | VERNON_RHI_IMAGE_COLOR_ATTACHMENT;
+        descriptor.usage = usage;
         if (vernonRhiDeviceCreateImage(this->host->device, &descriptor, &handle) != VERNON_RHI_STATUS_OK)
             throw std::runtime_error("cannot create Vernon RHI image");
     }
     ~RhiImage() { vernonRhiDeviceDestroyImage(host->device, handle); }
 
     void upload(const nb::bytes &data) {
-        if (depth)
-            throw std::runtime_error("depth images cannot be uploaded");
+        if (format != VERNON_TEXTURE_RGBA8_UNORM || !(usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION))
+            throw std::runtime_error("image does not support RGBA8 upload");
         if (data.size() != static_cast<size_t>(width) * height * 4)
             throw std::runtime_error("RHI image upload size does not match RGBA8 extent");
         VernonRhiImageUploadDescriptor descriptor{};
@@ -136,8 +165,8 @@ struct RhiImage {
             throw std::runtime_error("RHI image upload failed");
     }
     nb::bytes download() const {
-        if (depth)
-            throw std::runtime_error("depth images cannot be downloaded");
+        if (format != VERNON_TEXTURE_RGBA8_UNORM || !(usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE))
+            throw std::runtime_error("image does not support RGBA8 download");
         std::string data(static_cast<size_t>(width) * height * 4, '\0');
         if (vernonRhiDeviceDownloadImage(host->device, handle, data.data(), data.size()) != VERNON_RHI_STATUS_OK)
             throw std::runtime_error("RHI image download failed: " +
@@ -149,7 +178,8 @@ struct RhiImage {
     VernonRhiImage handle{};
     uint32_t width{};
     uint32_t height{};
-    bool depth{};
+    VernonTextureFormat format{};
+    uint32_t usage{};
 };
 
 struct RhiSampler {
@@ -194,10 +224,21 @@ struct RhiHost {
 
     std::unique_ptr<RhiBuffer> createBuffer(size_t size) { return std::make_unique<RhiBuffer>(state, size); }
     std::unique_ptr<RhiImage> createImage(uint32_t width, uint32_t height) {
-        return std::make_unique<RhiImage>(state, width, height, false);
+        return std::make_unique<RhiImage>(state, width, height, VERNON_TEXTURE_RGBA8_UNORM,
+                                          VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION |
+                                              VERNON_RHI_IMAGE_SAMPLED | VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
     }
-    std::unique_ptr<RhiImage> createDepthImage(uint32_t width, uint32_t height) {
-        return std::make_unique<RhiImage>(state, width, height, true);
+    std::unique_ptr<RhiImage> createAttachmentImage(uint32_t width, uint32_t height, VernonTextureFormat format,
+                                                    uint32_t usage) {
+        constexpr uint32_t attachmentUsages =
+            VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT;
+        if (!usage || (usage & ~attachmentUsages))
+            throw std::invalid_argument("attachment image usage must contain only attachment roles");
+        const bool depthFormat = format == VERNON_TEXTURE_D32_FLOAT;
+        const bool depthUsage = (usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) != 0;
+        if (depthFormat != depthUsage || (depthUsage && (usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)))
+            throw std::invalid_argument("attachment image format does not match its usage");
+        return std::make_unique<RhiImage>(state, width, height, format, usage);
     }
     std::unique_ptr<RhiSampler> createSampler() { return std::make_unique<RhiSampler>(state); }
     std::unique_ptr<Runtime> createRuntime();
@@ -275,34 +316,14 @@ std::unique_ptr<CompiledProgram> compileProgramResult(Compiler &compiler, const 
         glslVersion, hlslShaderModel, targetTriple, cpu, cpuFeatures);
 }
 
-struct Buffer {
-    Buffer(Runtime *owner, size_t size, size_t alignment);
-    ~Buffer() { vernonRuntimeBufferFree(handle); }
-
-    void upload(const nb::bytes &data) {
-        if (data.size() != size)
-            throw std::runtime_error("upload size does not match buffer");
-        if (vernonRuntimeCopyFromHost(handle, 0, data.c_str(), data.size()) != VERNON_STATUS_OK)
-            throw std::runtime_error("runtime buffer upload failed");
-    }
-
-    nb::bytes download() const {
-        std::string data(size, '\0');
-        if (vernonRuntimeCopyToHost(handle, 0, data.data(), data.size()) != VERNON_STATUS_OK)
-            throw std::runtime_error("runtime buffer download failed");
-        return nb::bytes(data.data(), data.size());
-    }
-
-    Runtime *owner{};
-    VernonDeviceBuffer *handle{};
-    size_t size{};
-};
-
 struct PipelineParameterMetadata {
     uint32_t slot{};
     std::string name;
     VernonPipelineArgumentKind kind{};
-    VernonDataType dtype{};
+    uint32_t elementByteSize{};
+    uint32_t elementAlignment{};
+    std::string layoutHash;
+    std::vector<VernonValueLeafView> elementLeaves;
     VernonValueAccess access{};
     std::vector<uint64_t> shape;
 };
@@ -321,7 +342,12 @@ PipelineParameterMetadata parameterMetadata(const VernonPipelineParameterView &v
     result.slot = view.slot;
     result.name = stringView(view.name);
     result.kind = view.kind;
-    result.dtype = view.dtype;
+    result.elementByteSize = view.element_layout.byte_size;
+    result.elementAlignment = view.element_layout.alignment;
+    result.layoutHash = stringView(view.element_layout.layout_hash);
+    if (view.element_layout.leaf_count)
+        result.elementLeaves.assign(view.element_layout.leaves,
+                                    view.element_layout.leaves + view.element_layout.leaf_count);
     result.access = view.access;
     if (view.rank)
         result.shape.assign(view.static_shape, view.static_shape + view.rank);
@@ -369,6 +395,8 @@ struct PipelineInvocationBuilder {
         VernonPipelineArgument value{};
         std::vector<uint64_t> shape;
         std::vector<int64_t> strides;
+        std::string layoutHash;
+        std::vector<VernonValueLeafView> elementLeaves;
         nb::object hostOwner;
     };
 
@@ -381,6 +409,15 @@ struct PipelineInvocationBuilder {
         OwnedArgument &result = arguments.back();
         result.value.slot = parameter.slot;
         result.value.kind = kind;
+        if (kind == VERNON_PIPELINE_TENSOR) {
+            result.layoutHash = parameter.layoutHash;
+            result.elementLeaves = parameter.elementLeaves;
+            result.value.tensor.element_layout = {
+                sizeof(VernonValueLayoutView), parameter.elementByteSize,
+                parameter.elementAlignment,    {result.layoutHash.data(), result.layoutHash.size()},
+                result.elementLeaves.data(),   result.elementLeaves.size(),
+            };
+        }
         return result;
     }
 
@@ -408,18 +445,32 @@ struct PipelineInvocationBuilder {
             throw std::invalid_argument("host tensor must be a NumPy ndarray");
         const PipelineParameterMetadata parameter = resolveParameter(identifier);
         OwnedArgument &argument = addArgument(parameter, VERNON_PIPELINE_TENSOR);
-        argument.shape = nb::cast<std::vector<uint64_t>>(array.attr("shape"));
-        const std::vector<int64_t> signedStrides = nb::cast<std::vector<int64_t>>(array.attr("strides"));
-        if (signedStrides.size() != argument.shape.size())
+        const std::vector<uint64_t> arrayShape = nb::cast<std::vector<uint64_t>>(array.attr("shape"));
+        const std::vector<int64_t> arrayStrides = nb::cast<std::vector<int64_t>>(array.attr("strides"));
+        if (arrayStrides.size() != arrayShape.size())
             throw std::invalid_argument("NumPy Tensor shape/stride mismatch");
-        argument.strides.reserve(signedStrides.size());
         const size_t elementSize = nb::cast<size_t>(array.attr("dtype").attr("itemsize"));
+        size_t rank = arrayShape.size();
+        if (elementSize != parameter.elementByteSize) {
+            size_t trailingSize = elementSize;
+            while (rank && trailingSize < parameter.elementByteSize) {
+                const size_t dimension = --rank;
+                if (arrayStrides[dimension] != static_cast<int64_t>(trailingSize) ||
+                    arrayShape[dimension] > std::numeric_limits<size_t>::max() / trailingSize)
+                    throw std::invalid_argument("host tensor aggregate element storage must be contiguous");
+                trailingSize *= static_cast<size_t>(arrayShape[dimension]);
+            }
+            if (trailingSize != parameter.elementByteSize)
+                throw std::invalid_argument("host tensor element size does not match pipeline reflection");
+        }
+        argument.shape.assign(arrayShape.begin(), arrayShape.begin() + static_cast<std::ptrdiff_t>(rank));
+        argument.strides.assign(arrayStrides.begin(), arrayStrides.begin() + static_cast<std::ptrdiff_t>(rank));
         size_t before = 0;
         size_t after = 0;
-        for (size_t dimension = 0; dimension < signedStrides.size(); ++dimension) {
+        for (size_t dimension = 0; dimension < rank; ++dimension) {
             if (!argument.shape[dimension])
                 throw std::invalid_argument("NumPy Tensor dimensions must be positive");
-            const int64_t stride = signedStrides[dimension];
+            const int64_t stride = argument.strides[dimension];
             const uint64_t magnitude =
                 stride < 0 ? static_cast<uint64_t>(-(stride + 1)) + 1 : static_cast<uint64_t>(stride);
             const uint64_t steps = argument.shape[dimension] - 1;
@@ -431,33 +482,45 @@ struct PipelineInvocationBuilder {
             if (extent > std::numeric_limits<size_t>::max() - bound)
                 throw std::invalid_argument("NumPy Tensor byte span overflows");
             bound += extent;
-            argument.strides.push_back(stride);
         }
         if (after > std::numeric_limits<size_t>::max() - before ||
-            elementSize > std::numeric_limits<size_t>::max() - before - after)
+            parameter.elementByteSize > std::numeric_limits<size_t>::max() - before - after)
             throw std::invalid_argument("NumPy Tensor byte span overflows");
-        const size_t span = before + after + elementSize;
-        const VernonDataType dtype = numpyDataType(array);
-        if (dtype != parameter.dtype)
+        const size_t span = before + after + parameter.elementByteSize;
+        if (array.attr("dtype").attr("fields").is_none() && parameter.elementLeaves.size() == 1 &&
+            parameter.elementLeaves[0].scalar_count == 1 && parameter.elementLeaves[0].byte_offset == 0 &&
+            numpyDataType(array) != static_cast<VernonDataType>(parameter.elementLeaves[0].dtype))
             throw std::invalid_argument("host tensor dtype does not match pipeline reflection");
         argument.hostOwner = array;
+        const uintptr_t data = nb::cast<uintptr_t>(array.attr("ctypes").attr("data"));
+        uintptr_t allocation = data - before;
+        size_t allocationSize = span;
+        nb::object base = array.attr("base");
+        while (!base.is_none() && nb::isinstance(base, nb::module_::import_("numpy").attr("ndarray"))) {
+            const uintptr_t candidate = nb::cast<uintptr_t>(base.attr("ctypes").attr("data"));
+            const size_t candidateSize = nb::cast<size_t>(base.attr("nbytes"));
+            if (candidate > data || data - candidate > candidateSize || before > data - candidate ||
+                after + parameter.elementByteSize > candidateSize - (data - candidate))
+                break;
+            allocation = candidate;
+            allocationSize = candidateSize;
+            base = base.attr("base");
+        }
         argument.value.tensor.struct_size = sizeof(VernonTensorView);
         argument.value.tensor.storage = VERNON_TENSOR_HOST;
-        argument.value.tensor.host_data =
-            reinterpret_cast<const void *>(nb::cast<uintptr_t>(array.attr("ctypes").attr("data")) - before);
-        argument.value.tensor.dtype = dtype;
+        argument.value.tensor.host_data = reinterpret_cast<const void *>(allocation);
         argument.value.tensor.access = parameter.access;
         argument.value.tensor.rank = static_cast<uint32_t>(argument.shape.size());
         argument.value.tensor.shape = argument.shape.data();
         argument.value.tensor.byte_strides = argument.strides.data();
-        argument.value.tensor.byte_offset = before;
-        argument.value.tensor.byte_size = span;
+        argument.value.tensor.byte_offset = data - allocation;
+        argument.value.tensor.byte_size = allocationSize;
         return *this;
     }
 
-    PipelineInvocationBuilder &rhiTensor(const nb::object &identifier, RhiBuffer *buffer, uint32_t dtype,
-                                         uint32_t access, const std::vector<uint64_t> &shape,
-                                         const std::vector<int64_t> &strides, size_t offset) {
+    PipelineInvocationBuilder &rhiTensor(const nb::object &identifier, RhiBuffer *buffer, uint32_t access,
+                                         const std::vector<uint64_t> &shape, const std::vector<int64_t> &strides,
+                                         size_t offset) {
         if (!buffer || shape.size() != strides.size() || shape.empty())
             throw std::invalid_argument("RHI Tensor shape and strides must have equal non-zero rank");
         const PipelineParameterMetadata parameter = resolveParameter(identifier);
@@ -469,7 +532,6 @@ struct PipelineInvocationBuilder {
         if (vernonRuntimeReferenceRhiBuffer(runtime, buffer->handle, 0, buffer->size,
                                             &argument.value.tensor.resource) != VERNON_STATUS_OK)
             throw std::invalid_argument("RHI buffer belongs to another Runtime device");
-        argument.value.tensor.dtype = static_cast<VernonDataType>(dtype);
         argument.value.tensor.access = static_cast<VernonValueAccess>(access);
         argument.value.tensor.rank = static_cast<uint32_t>(shape.size());
         argument.value.tensor.shape = argument.shape.data();
@@ -480,7 +542,7 @@ struct PipelineInvocationBuilder {
     }
 
     PipelineInvocationBuilder &rhiTexture(const nb::object &identifier, RhiImage *texture, RhiSampler *sampler) {
-        if (!texture || texture->depth || (sampler && sampler->host != texture->host))
+        if (!texture || !(texture->usage & VERNON_RHI_IMAGE_SAMPLED) || (sampler && sampler->host != texture->host))
             throw std::invalid_argument("RHI texture and sampler belong to different devices");
         const PipelineParameterMetadata parameter = resolveParameter(identifier);
         OwnedArgument &argument = addArgument(parameter, VERNON_PIPELINE_TEXTURE);
@@ -490,7 +552,7 @@ struct PipelineInvocationBuilder {
         if (sampler && vernonRuntimeReferenceRhiSampler(runtime, sampler->handle,
                                                         &argument.value.texture.sampler_resource) != VERNON_STATUS_OK)
             throw std::invalid_argument("RHI sampler belongs to another Runtime device");
-        argument.value.texture.format = VERNON_TEXTURE_RGBA8_UNORM;
+        argument.value.texture.format = texture->format;
         argument.value.texture.access = parameter.access;
         argument.value.texture.dimension = VERNON_TEXTURE_2D;
         argument.value.texture.width = texture->width;
@@ -510,7 +572,8 @@ struct PipelineInvocationBuilder {
     }
 
     PipelineInvocationBuilder &rhiColorAttachment(uint32_t location, RhiImage *texture) {
-        if (!texture || texture->depth)
+        if (!texture || !(texture->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT) ||
+            texture->format == VERNON_TEXTURE_D32_FLOAT)
             throw std::invalid_argument("RHI color attachment is null");
         VernonColorAttachment attachment{};
         attachment.location = location;
@@ -518,20 +581,21 @@ struct PipelineInvocationBuilder {
             throw std::invalid_argument("RHI color attachment belongs to another Runtime device");
         attachment.width = texture->width;
         attachment.height = texture->height;
-        attachment.format = VERNON_TEXTURE_RGBA8_UNORM;
+        attachment.format = texture->format;
         attachments.push_back(attachment);
         return *this;
     }
 
     PipelineInvocationBuilder &rhiDepthAttachment(RhiImage *texture) {
-        if (!texture || !texture->depth)
+        if (!texture || !(texture->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) ||
+            texture->format != VERNON_TEXTURE_D32_FLOAT)
             throw std::invalid_argument("RHI depth attachment must use D32 format");
         depthAttachment = {};
         if (vernonRuntimeReferenceRhiImage(runtime, texture->handle, &depthAttachment.resource) != VERNON_STATUS_OK)
             throw std::invalid_argument("RHI depth attachment belongs to another Runtime device");
         depthAttachment.width = texture->width;
         depthAttachment.height = texture->height;
-        depthAttachment.format = VERNON_TEXTURE_D32_FLOAT;
+        depthAttachment.format = texture->format;
         hasDepthAttachment = true;
         return *this;
     }
@@ -678,7 +742,7 @@ struct LoadedPipeline {
                 throw std::invalid_argument("direct compute pipelines accept only Tensor/value parameters");
             shapes.push_back(parameter.shape);
             strides.emplace_back(parameter.shape.size());
-            size_t stride = dataTypeSize(parameter.dtype);
+            size_t stride = parameter.elementByteSize;
             for (size_t dimension = parameter.shape.size(); dimension-- != 0;) {
                 strides.back()[dimension] = static_cast<int64_t>(stride);
                 stride *= static_cast<size_t>(parameter.shape[dimension]);
@@ -687,20 +751,17 @@ struct LoadedPipeline {
             argument.slot = parameter.slot;
             argument.kind = VERNON_PIPELINE_TENSOR;
             argument.tensor.struct_size = sizeof(VernonTensorView);
-            argument.tensor.dtype = parameter.dtype;
+            argument.tensor.element_layout = {
+                sizeof(VernonValueLayoutView),  parameter.elementByteSize,
+                parameter.elementAlignment,     {parameter.layoutHash.data(), parameter.layoutHash.size()},
+                parameter.elementLeaves.data(), parameter.elementLeaves.size(),
+            };
             argument.tensor.access = parameter.access;
             argument.tensor.rank = static_cast<uint32_t>(shapes.back().size());
             argument.tensor.shape = shapes.back().empty() ? nullptr : shapes.back().data();
             argument.tensor.byte_strides = strides.back().empty() ? nullptr : strides.back().data();
             nb::handle value = values[index];
-            if (nb::isinstance<Buffer>(value)) {
-                Buffer *buffer = nb::cast<Buffer *>(value);
-                if (!buffer || buffer->owner != owner)
-                    throw std::invalid_argument("compute pipeline buffer belongs to another runtime");
-                argument.tensor.storage = VERNON_TENSOR_DEVICE;
-                argument.tensor.buffer = buffer->handle;
-                argument.tensor.byte_size = buffer->size;
-            } else if (nb::isinstance<RhiBuffer>(value)) {
+            if (nb::isinstance<RhiBuffer>(value)) {
                 RhiBuffer *buffer = nb::cast<RhiBuffer *>(value);
                 if (!buffer || runtimeRhiHost(owner) != buffer->host.get())
                     throw std::invalid_argument("compute pipeline RHI buffer belongs to another device");
@@ -716,7 +777,7 @@ struct LoadedPipeline {
                 argument.tensor.host_data = scalarStorage.back().data();
                 argument.tensor.byte_size = scalarStorage.back().size();
             } else {
-                throw std::invalid_argument("compute pipeline values must be Buffer or bytes");
+                throw std::invalid_argument("compute pipeline values must be RhiBuffer or bytes");
             }
             arguments.push_back(argument);
         }
@@ -777,26 +838,6 @@ struct Runtime {
             throw std::runtime_error("requested runtime backend is unavailable");
     }
     ~Runtime() { vernonRuntimeDestroy(handle); }
-
-    static std::unique_ptr<Runtime> createExternalOpenGL(VernonRuntimeBackend backend, uintptr_t userData,
-                                                         uintptr_t makeCurrent, uintptr_t getProcAddress,
-                                                         uint16_t apiMajor, uint16_t apiMinor) {
-        VernonOpenGLContextCallbacks callbacks{};
-        callbacks.struct_size = sizeof(callbacks);
-        callbacks.user_data = reinterpret_cast<void *>(userData);
-        callbacks.make_current = reinterpret_cast<VernonOpenGLMakeCurrentFn>(makeCurrent);
-        callbacks.get_proc_address = reinterpret_cast<VernonOpenGLGetProcAddressFn>(getProcAddress);
-        callbacks.api_version_major = apiMajor;
-        callbacks.api_version_minor = apiMinor;
-        VernonRuntimeContext *handle = vernonRuntimeCreateOpenGLWithCallbacks(backend, &callbacks);
-        if (!handle)
-            throw std::runtime_error("external OpenGL context is invalid");
-        return std::make_unique<Runtime>(handle);
-    }
-
-    std::unique_ptr<Buffer> allocate(size_t size, size_t alignment) {
-        return std::make_unique<Buffer>(this, size, alignment);
-    }
 
     std::unique_ptr<LoadedPipeline> load(const nb::bytes &artifact, const std::string &reflection,
                                          const std::string &entry) {
@@ -907,12 +948,6 @@ std::unique_ptr<Runtime> RhiHost::createRuntime() {
     return std::make_unique<Runtime>(runtime, state);
 }
 
-Buffer::Buffer(Runtime *owner, size_t size, size_t alignment) : owner(owner), size(size) {
-    handle = vernonRuntimeBufferAllocate(owner->handle, size, alignment);
-    if (!handle)
-        throw std::runtime_error("runtime buffer allocation failed");
-}
-
 } // namespace
 
 NB_MODULE(_native, module) {
@@ -949,6 +984,20 @@ NB_MODULE(_native, module) {
         .value("TRIANGLE_LIST", VERNON_TOPOLOGY_TRIANGLE_LIST)
         .value("LINE_LIST", VERNON_TOPOLOGY_LINE_LIST)
         .value("POINT_LIST", VERNON_TOPOLOGY_POINT_LIST);
+    nb::enum_<VernonTextureFormat>(module, "TextureFormat")
+        .value("RGBA8_UNORM", VERNON_TEXTURE_RGBA8_UNORM)
+        .value("RGBA8_SRGB", VERNON_TEXTURE_RGBA8_SRGB)
+        .value("RGBA16_FLOAT", VERNON_TEXTURE_RGBA16_FLOAT)
+        .value("RGBA32_FLOAT", VERNON_TEXTURE_RGBA32_FLOAT)
+        .value("R8_UNORM", VERNON_TEXTURE_R8_UNORM)
+        .value("R16_FLOAT", VERNON_TEXTURE_R16_FLOAT)
+        .value("R32_FLOAT", VERNON_TEXTURE_R32_FLOAT)
+        .value("RG8_UNORM", VERNON_TEXTURE_RG8_UNORM)
+        .value("RGB8_UNORM", VERNON_TEXTURE_RGB8_UNORM)
+        .value("R11G11B10_FLOAT", VERNON_TEXTURE_R11G11B10_FLOAT)
+        .value("D32_FLOAT", VERNON_TEXTURE_D32_FLOAT);
+    module.attr("IMAGE_COLOR_ATTACHMENT") = static_cast<uint32_t>(VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
+    module.attr("IMAGE_DEPTH_STENCIL_ATTACHMENT") = static_cast<uint32_t>(VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT);
     nb::class_<Compiler>(module, "Compiler")
         .def(nb::init<>())
         .def("compile_program_result", &compileProgramResult, nb::arg("mlir"), nb::arg("target"),
@@ -973,7 +1022,7 @@ NB_MODULE(_native, module) {
                     nb::arg("make_current"), nb::arg("get_proc_address"), nb::arg("api_major"), nb::arg("api_minor"))
         .def("create_buffer", &RhiHost::createBuffer)
         .def("create_image", &RhiHost::createImage)
-        .def("create_depth_image", &RhiHost::createDepthImage)
+        .def("create_attachment_image", &RhiHost::createAttachmentImage)
         .def("create_sampler", &RhiHost::createSampler)
         .def("create_runtime", &RhiHost::createRuntime, nb::keep_alive<0, 1>())
         .def("synchronize", &RhiHost::synchronize);
@@ -984,28 +1033,32 @@ NB_MODULE(_native, module) {
     nb::class_<RhiImage>(module, "RhiImage")
         .def_prop_ro("width", [](const RhiImage &value) { return value.width; })
         .def_prop_ro("height", [](const RhiImage &value) { return value.height; })
-        .def_prop_ro("depth", [](const RhiImage &value) { return value.depth; })
         .def("upload", &RhiImage::upload)
         .def("download", &RhiImage::download);
     nb::class_<RhiSampler>(module, "RhiSampler");
     nb::class_<Runtime>(module, "Runtime")
         .def(nb::init<VernonRuntimeBackend, uint16_t, uint16_t>(), nb::arg("backend"), nb::arg("api_major") = 0,
              nb::arg("api_minor") = 0)
-        .def_static("create_external_opengl", &Runtime::createExternalOpenGL, nb::arg("backend"), nb::arg("user_data"),
-                    nb::arg("make_current"), nb::arg("get_proc_address"), nb::arg("api_major"), nb::arg("api_minor"))
-        .def("allocate", &Runtime::allocate, nb::keep_alive<0, 1>())
         .def("load", &Runtime::load, nb::keep_alive<0, 1>())
         .def("load_cpu_entry", &Runtime::loadCpuEntry, nb::keep_alive<0, 1>())
         .def("load_compute_bundle", &Runtime::loadComputeBundle, nb::keep_alive<0, 1>())
         .def("load_pipeline", &Runtime::loadPipeline, nb::keep_alive<0, 1>())
         .def("load_pipeline_asset", &Runtime::loadPipelineAsset, nb::keep_alive<0, 1>())
         .def("synchronize", &Runtime::synchronize);
-    nb::class_<Buffer>(module, "Buffer").def("upload", &Buffer::upload).def("download", &Buffer::download);
     nb::class_<PipelineParameterMetadata>(module, "PipelineParameter")
         .def_ro("slot", &PipelineParameterMetadata::slot)
         .def_ro("name", &PipelineParameterMetadata::name)
         .def_prop_ro("kind", [](const PipelineParameterMetadata &value) { return static_cast<uint32_t>(value.kind); })
-        .def_prop_ro("dtype", [](const PipelineParameterMetadata &value) { return static_cast<uint32_t>(value.dtype); })
+        .def_ro("element_byte_size", &PipelineParameterMetadata::elementByteSize)
+        .def_ro("element_alignment", &PipelineParameterMetadata::elementAlignment)
+        .def_ro("layout_hash", &PipelineParameterMetadata::layoutHash)
+        .def_prop_ro("element_leaves",
+                     [](const PipelineParameterMetadata &value) {
+                         nb::list leaves;
+                         for (const VernonValueLeafView &leaf : value.elementLeaves)
+                             leaves.append(nb::make_tuple(leaf.dtype, leaf.scalar_count, leaf.byte_offset));
+                         return leaves;
+                     })
         .def_prop_ro("access",
                      [](const PipelineParameterMetadata &value) { return static_cast<uint32_t>(value.access); })
         .def_ro("shape", &PipelineParameterMetadata::shape);
@@ -1020,7 +1073,7 @@ NB_MODULE(_native, module) {
         .def("host_tensor", &PipelineInvocationBuilder::hostTensor, nb::arg("parameter"), nb::arg("array"),
              nb::rv_policy::reference_internal)
         .def("rhi_tensor", &PipelineInvocationBuilder::rhiTensor, nb::arg("parameter"), nb::arg("buffer"),
-             nb::arg("dtype"), nb::arg("access"), nb::arg("shape"), nb::arg("strides"), nb::arg("offset") = 0,
+             nb::arg("access"), nb::arg("shape"), nb::arg("strides"), nb::arg("offset") = 0,
              nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
         .def("rhi_texture", &PipelineInvocationBuilder::rhiTexture, nb::arg("parameter"), nb::arg("texture"),
              nb::arg("sampler") = nullptr, nb::rv_policy::reference_internal, nb::keep_alive<1, 3>(),

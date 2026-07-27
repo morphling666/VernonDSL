@@ -80,6 +80,7 @@ TEST(RuntimeCpuPipeline, ReflectsVersionedTextureConstraints) {
     nlohmann::json constrained = nlohmann::json::parse(bundle);
     nlohmann::json &parameter = constrained["variants"][0]["parameters"][0];
     parameter["kind"] = "texture";
+    parameter.erase("element_layout");
     parameter["access"] = "read";
     parameter["dimension"] = "3d";
     parameter["texture_format"] = "rgba16_float";
@@ -225,7 +226,9 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     ASSERT_TRUE(vernonRuntimeLoadedPipelineGetParameterCount(pipeline) == 1);
     VernonPipelineParameterView parameter{};
     ASSERT_TRUE(vernonRuntimeLoadedPipelineGetParameterByIndex(pipeline, 0, &parameter) == VERNON_STATUS_OK);
-    ASSERT_TRUE(parameter.slot == 0 && parameter.kind == VERNON_PIPELINE_TENSOR && parameter.dtype == VERNON_DATA_F32 &&
+    ASSERT_TRUE(parameter.slot == 0 && parameter.kind == VERNON_PIPELINE_TENSOR &&
+                parameter.element_layout.leaf_count == 1 &&
+                parameter.element_layout.leaves[0].dtype == VERNON_DATA_F32 &&
                 parameter.access == VERNON_ACCESS_WRITE && parameter.rank == 1 && parameter.static_shape[0] == 12);
     ASSERT_TRUE(vernonRuntimeLoadedPipelineFindParameter(pipeline, {"output", std::strlen("output")}, &parameter) ==
                 VERNON_STATUS_OK);
@@ -236,17 +239,16 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     ASSERT_TRUE(outputView.kind == VERNON_PIPELINE_TENSOR && outputView.dtype == VERNON_DATA_F32 &&
                 outputView.rank == 1 && outputView.static_shape[0] == 12 && outputView.location == 0);
 
-    VernonDeviceBuffer *buffer = vernonRuntimeBufferAllocate(runtime, 12 * sizeof(float), alignof(float));
-    ASSERT_TRUE(buffer);
+    float output[12]{};
     const uint64_t shape[] = {12};
     const int64_t strides[] = {sizeof(float)};
     VernonPipelineArgument argument{};
     argument.slot = 0;
     argument.kind = VERNON_PIPELINE_TENSOR;
     argument.tensor.struct_size = sizeof(VernonTensorView);
-    argument.tensor.storage = VERNON_TENSOR_DEVICE;
-    argument.tensor.buffer = buffer;
-    argument.tensor.dtype = VERNON_DATA_F32;
+    argument.tensor.storage = VERNON_TENSOR_HOST;
+    argument.tensor.host_data = output;
+    argument.tensor.element_layout = parameter.element_layout;
     argument.tensor.access = VERNON_ACCESS_WRITE;
     argument.tensor.rank = 1;
     argument.tensor.shape = shape;
@@ -260,12 +262,9 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     invocation.compute_grid = {3, 2, 2};
     ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
 
-    float output[12]{};
-    ASSERT_TRUE(vernonRuntimeCopyToHost(buffer, 0, output, sizeof(output)) == VERNON_STATUS_OK);
     ASSERT_TRUE(output[0] == 0.0f && output[2] == 2.0f);
     ASSERT_TRUE(output[3] == 10.0f && output[11] == 112.0f);
 
-    ASSERT_TRUE(vernonRuntimeBufferFree(buffer) == VERNON_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     vernonRuntimePipelineBundleDestroy(loaded);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);

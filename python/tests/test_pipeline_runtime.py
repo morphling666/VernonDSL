@@ -13,6 +13,14 @@ from advanced_pipeline_shader import (
     advanced_fragment,
     advanced_vertex,
 )
+from aggregate_vertex_shader import (
+    AggregateVertexPayload,
+    ComplexAggregateVertex,
+    SmallAggregateVertex,
+    aggregate_triangle_vertex,
+    oversized_aggregate_attribute_vertex,
+    small_multidimensional_aggregate_attribute_vertex,
+)
 from pipeline_shader import (
     colored_fragment,
     copy_static_tensor_value,
@@ -41,6 +49,33 @@ from pipeline_shader import (
 )
 
 
+def render_target(texture: vd.Texture) -> vd.RenderTarget:
+    return vd.RenderTarget(shape=texture.shape).attach_color(0, texture)
+
+
+def mrt_target(color: vd.Texture, object_id: vd.Texture) -> vd.RenderTarget:
+    return vd.RenderTarget(shape=color.shape).attach_color(0, color).attach_color(1, object_id)
+
+
+class RenderTargetTests(unittest.TestCase):
+    def test_attachment_validation(self) -> None:
+        color = vd.Texture.zeros(shape=(16, 16))
+        with self.assertRaisesRegex(ValueError, "two positive dimensions"):
+            vd.RenderTarget(shape=(16, 0))
+        with self.assertRaisesRegex(ValueError, "dimensions"):
+            vd.RenderTarget(shape=(16, 16)).attach_color(0, vd.Texture.zeros(shape=(8, 16)))
+
+        target = vd.RenderTarget(shape=(16, 16)).attach_color(0, color)
+        with self.assertRaisesRegex(ValueError, "already occupied"):
+            target.attach_color(0, color)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            target.attach_color(-1, color)
+
+        target.attach_depth(format=vd.depth32)
+        with self.assertRaisesRegex(ValueError, "already has"):
+            target.attach_depth(format=vd.depth32)
+
+
 def assert_depth_attachment_selects_nearest(test: unittest.TestCase) -> None:
     triangle = ((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75))
     positions = vd.storage.from_numpy(
@@ -53,9 +88,9 @@ def assert_depth_attachment_selects_nearest(test: unittest.TestCase) -> None:
         np.array(((1.0, 0.0, 0.0, 1.0),) * 3 + ((0.0, 1.0, 0.0, 1.0),) * 3, dtype=np.float32)
     )
     target = vd.Texture.zeros(shape=(32, 32))
-    depth = vd.DepthTexture.zeros(shape=(32, 32))
+    attachments = render_target(target).attach_depth(format=vd.depth32)
 
-    vd.pipeline(depth_vertex, depth_fragment)(position=positions, color=colors, target=target, depth=depth)
+    vd.pipeline(depth_vertex, depth_fragment)(position=positions, color=colors, target=attachments)
 
     pixel = target.to_numpy()[16, 16]
     test.assertGreater(int(pixel[0]), 240)
@@ -77,9 +112,95 @@ def assert_rank_three_tensor_attribute_renders(test: unittest.TestCase) -> None:
     vd.pipeline(rank_three_tensor_attribute_vertex, solid_fragment)(
         value=view,
         projection=vd.storage.from_numpy(projection),
-        target=target,
+        target=render_target(target),
     )
     test.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
+
+
+def assert_aggregate_attribute_renders(test: unittest.TestCase) -> None:
+    def vertex(position: tuple[float, float], object_id: int) -> ComplexAggregateVertex:
+        return ComplexAggregateVertex(
+            np.array(position, dtype=np.float32),
+            AggregateVertexPayload(
+                vd.i32(object_id),
+                np.array((0.25, 0.5), dtype=np.float32),
+                np.array((0.75, 1.0), dtype=np.float32),
+            ),
+            np.eye(2, dtype=np.float32),
+        )
+
+    vertices = vd.storage.from_values(
+        (
+            vertex((-0.75, -0.75), 11),
+            vertex((0.75, -0.75), 12),
+            vertex((0.0, 0.75), 13),
+        ),
+        dtype=ComplexAggregateVertex,
+    )
+    aggregate_values = tuple(
+        ComplexAggregateVertex(
+            np.array((float(index), float(index) + 0.5), dtype=np.float32),
+            AggregateVertexPayload(
+                vd.i32(index * 3),
+                np.array((index + 0.25, index + 0.75), dtype=np.float32),
+                np.array((index + 1.0, index + 2.0), dtype=np.float32),
+            ),
+            np.array(((index + 3.0, index + 4.0), (index + 5.0, index + 6.0)), dtype=np.float32),
+        )
+        for index in range(2 * 3 * 4)
+    )
+    aggregate = vd.storage.from_values(
+        tuple(
+            tuple(tuple(aggregate_values[plane * 12 + row * 4 + column] for column in range(4)) for row in range(3))
+            for plane in range(2)
+        ),
+        dtype=ComplexAggregateVertex,
+    )
+    target = vd.Texture.zeros(shape=(32, 32))
+    vd.pipeline(aggregate_triangle_vertex, solid_fragment)(
+        vertex=vertices, aggregate=aggregate, target=render_target(target)
+    )
+    test.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
+
+
+def assert_small_multidimensional_aggregate_attribute_renders(test: unittest.TestCase) -> None:
+    def tensor_value(position: tuple[float, float]) -> tuple[tuple[tuple[SmallAggregateVertex, ...], ...], ...]:
+        filler = SmallAggregateVertex(np.zeros(2, dtype=np.float32), vd.f32(0.0))
+        selected = SmallAggregateVertex(np.asarray(position, dtype=np.float32), vd.f32(2.0))
+        values = (filler,) * 7 + (selected,)
+        return tuple(
+            tuple(tuple(values[plane * 4 + row * 2 + column] for column in range(2)) for row in range(2))
+            for plane in range(2)
+        )
+
+    values = vd.storage.from_values(
+        (
+            tensor_value((-0.75, -0.75)),
+            tensor_value((0.75, -0.75)),
+            tensor_value((0.0, 0.75)),
+        ),
+        dtype=SmallAggregateVertex,
+    )
+    target = vd.Texture.zeros(shape=(32, 32))
+    vd.pipeline(small_multidimensional_aggregate_attribute_vertex, solid_fragment)(
+        values=values, target=render_target(target)
+    )
+    test.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
+
+
+def assert_oversized_aggregate_attribute_reports_location_limit(test: unittest.TestCase) -> None:
+    value = ComplexAggregateVertex(
+        np.zeros(2, dtype=np.float32),
+        AggregateVertexPayload(vd.i32(0), np.zeros(2, dtype=np.float32), np.zeros(2, dtype=np.float32)),
+        np.zeros((2, 2), dtype=np.float32),
+    )
+    values = vd.storage.from_values(
+        tuple(tuple(tuple(tuple(value for _ in range(2)) for _ in range(2)) for _ in range(2)) for _ in range(3)),
+        dtype=ComplexAggregateVertex,
+    )
+    target = vd.Texture.zeros(shape=(8, 8))
+    with test.assertRaisesRegex(RuntimeError, "location or format capabilities"):
+        vd.pipeline(oversized_aggregate_attribute_vertex, solid_fragment)(values=values, target=render_target(target))
 
 
 def assert_instanced_mat4_tensor_attribute_renders(test: unittest.TestCase) -> None:
@@ -90,7 +211,7 @@ def assert_instanced_mat4_tensor_attribute_renders(test: unittest.TestCase) -> N
     vd.pipeline(instanced_tensor_transform_vertex, solid_fragment)(
         position=positions,
         transform=vd.storage.from_numpy(transforms),
-        target=target,
+        target=render_target(target),
     )
     pixels = target.to_numpy()
     test.assertGreater(int(pixels[16, 25, 0]), 240)
@@ -117,9 +238,9 @@ def assert_formal_attribute_formats_render(
             render = vd.pipeline(vertex, solid_fragment)
             if name in unsupported:
                 with test.assertRaisesRegex((vd.CompileError, RuntimeError), "support|capabilit|format"):
-                    render(position=positions, value=values, target=target)
+                    render(position=positions, value=values, target=render_target(target))
                 continue
-            render(position=positions, value=values, target=target)
+            render(position=positions, value=values, target=render_target(target))
             test.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
 
 
@@ -130,7 +251,7 @@ def assert_non_square_and_divisor_two_attributes_render(test: unittest.TestCase)
     vd.pipeline(non_square_attribute_vertex, solid_fragment)(
         position=positions,
         value=non_square,
-        target=target,
+        target=render_target(target),
     )
     test.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
 
@@ -139,7 +260,7 @@ def assert_non_square_and_divisor_two_attributes_render(test: unittest.TestCase)
     vd.pipeline(divisor_two_attribute_vertex, solid_fragment)(
         position=positions,
         offset=offsets,
-        target=target,
+        target=render_target(target),
     )
     pixels = target.to_numpy()
     test.assertGreater(int(pixels[16, 8, 0]), 240)
@@ -155,7 +276,7 @@ def assert_matrix_uniform_transforms_vertices(test: unittest.TestCase) -> None:
     vd.pipeline(matrix_vertex, solid_fragment)(
         position=positions,
         transform=transform,
-        target=target,
+        target=render_target(target),
     )
 
     pixels = target.to_numpy()
@@ -168,7 +289,7 @@ def assert_mat2_uniform_transforms_vertices(test: unittest.TestCase) -> None:
     transform = np.array(((0.5, 0.0), (0.0, 1.0)), dtype=np.float32)
     target = vd.Texture.zeros(shape=(64, 64))
 
-    vd.pipeline(mat2_vertex, solid_fragment)(position=positions, transform=transform, target=target)
+    vd.pipeline(mat2_vertex, solid_fragment)(position=positions, transform=transform, target=render_target(target))
 
     pixels = target.to_numpy()
     test.assertGreater(int(pixels[32, 32, 0]), 240)
@@ -181,7 +302,9 @@ def assert_rank_three_uniform_renders(test: unittest.TestCase) -> None:
     weights[1, 0, 1] = 0.75
     target = vd.Texture.zeros(shape=(32, 32))
 
-    vd.pipeline(triangle_vertex, static_tensor_fragment)(position=positions, weights=weights, target=target)
+    vd.pipeline(triangle_vertex, static_tensor_fragment)(
+        position=positions, weights=weights, target=render_target(target)
+    )
 
     pixel = target.to_numpy()[16, 16]
     test.assertAlmostEqual(int(pixel[0]), 191, delta=2)
@@ -200,7 +323,7 @@ def assert_matrix_elementwise_multiply_renders(test: unittest.TestCase) -> None:
         position=positions,
         left=left,
         right=right,
-        target=target,
+        target=render_target(target),
     )
 
     np.testing.assert_allclose(
@@ -227,7 +350,7 @@ def assert_numpy_tensor_vertex_renders(test: unittest.TestCase) -> None:
         offset_left=offset_left,
         offset_right=offset_right,
         transform=transform,
-        target=target,
+        target=render_target(target),
     )
 
     pixels = target.to_numpy()
@@ -249,7 +372,7 @@ def assert_numpy_tensor_fragment_renders(test: unittest.TestCase) -> None:
         broadcast_right=broadcast_right,
         matmul_left=matmul_left,
         matmul_right=matmul_right,
-        target=target,
+        target=render_target(target),
     )
 
     broadcasted = broadcast_left + broadcast_right
@@ -356,14 +479,18 @@ class PipelineContractTests(unittest.TestCase):
                 self.get_proc_address = 13
                 created.append(self)
 
-        class FakeRuntime:
+        class FakeRhiHost:
+            def create_runtime(self) -> object:
+                return object()
+
             @staticmethod
             def create_external_opengl(*arguments: object) -> object:
                 runtime_calls.append(arguments)
-                return object()
+                return FakeRhiHost()
 
         fake_native = types.SimpleNamespace(
-            Runtime=FakeRuntime,
+            RhiHost=FakeRhiHost,
+            RhiBackend=types.SimpleNamespace(OPENGL=3, OPENGL_ES=4),
             RuntimeBackend=types.SimpleNamespace(CPU=0, CUDA=1, VULKAN=2, OPENGL=3, OPENGL_ES=4),
         )
         helper = types.SimpleNamespace(Context=FakeContext)
@@ -381,16 +508,20 @@ class PipelineContractTests(unittest.TestCase):
             runtime_module._release_runtime()
 
     def test_registered_context_takes_priority_over_owned_factory(self) -> None:
-        class FakeRuntime:
+        class FakeRhiHost:
             calls: list[tuple[object, ...]] = []
+
+            def create_runtime(self) -> object:
+                return object()
 
             @staticmethod
             def create_external_opengl(*arguments: object) -> object:
-                FakeRuntime.calls.append(arguments)
-                return object()
+                FakeRhiHost.calls.append(arguments)
+                return FakeRhiHost()
 
         fake_native = types.SimpleNamespace(
-            Runtime=FakeRuntime,
+            RhiHost=FakeRhiHost,
+            RhiBackend=types.SimpleNamespace(OPENGL=3, OPENGL_ES=4),
             RuntimeBackend=types.SimpleNamespace(CPU=0, CUDA=1, VULKAN=2, OPENGL=3, OPENGL_ES=4),
         )
         helper = mock.Mock()
@@ -409,7 +540,7 @@ class PipelineContractTests(unittest.TestCase):
             ):
                 vd.init(arch=vd.opengl)
                 helper.Context.assert_not_called()
-                self.assertEqual(FakeRuntime.calls[-1], (3, 21, 22, 23, 3, 3))
+                self.assertEqual(FakeRhiHost.calls[-1], (3, 21, 22, 23, 3, 3))
                 runtime_module._release_runtime()
         finally:
             runtime_module._external_opengl_contexts.pop(vd.opengl, None)
@@ -418,6 +549,15 @@ class PipelineContractTests(unittest.TestCase):
 
 
 class OpenGLPipelineTests(unittest.TestCase):
+    def test_aggregate_attribute_renders(self) -> None:
+        assert_aggregate_attribute_renders(self)
+
+    def test_small_multidimensional_aggregate_attribute_renders(self) -> None:
+        assert_small_multidimensional_aggregate_attribute_renders(self)
+
+    def test_oversized_aggregate_attribute_reports_device_location_limit(self) -> None:
+        assert_oversized_aggregate_attribute_reports_location_limit(self)
+
     def test_formal_attribute_numeric_formats_render_or_reject(self) -> None:
         assert_formal_attribute_formats_render(self, unsupported=frozenset({"f16", "f64"}))
 
@@ -434,7 +574,7 @@ class OpenGLPipelineTests(unittest.TestCase):
         values = vd.storage.from_numpy(np.zeros((3, 8, 8, 4), dtype=np.float32))
         target = vd.Texture.zeros(shape=(8, 8))
         with self.assertRaisesRegex(RuntimeError, "location or format capabilities"):
-            vd.pipeline(oversized_tensor_attribute_vertex, solid_fragment)(value=values, target=target)
+            vd.pipeline(oversized_tensor_attribute_vertex, solid_fragment)(value=values, target=render_target(target))
 
     def setUp(self) -> None:
         try:
@@ -456,7 +596,8 @@ class OpenGLPipelineTests(unittest.TestCase):
         )
         target = vd.Texture.zeros(shape=(64, 64))
 
-        render(position=positions, target=target)
+        attachments = render_target(target)
+        render(position=positions, target=attachments)
         pixels = target.to_numpy()
 
         self.assertEqual(tuple(pixels[0, 0]), (0, 0, 0, 0))
@@ -465,7 +606,7 @@ class OpenGLPipelineTests(unittest.TestCase):
         self.assertGreater(int(center[1]), 40)
         self.assertEqual(int(center[2]), 0)
         self.assertGreater(int(center[3]), 240)
-        render(position=positions, target=target)
+        render(position=positions, target=attachments)
         self.assertEqual(render.compile_count, 1)
 
     def test_depth_attachment_selects_nearest_fragment(self) -> None:
@@ -511,7 +652,7 @@ class OpenGLPipelineTests(unittest.TestCase):
         offset = vd.storage.from_numpy(np.array((2.0, 0.0), dtype=np.float32))
         target = vd.Texture.zeros(shape=(64, 64))
 
-        render(position=positions, offset=offset, target=target)
+        render(position=positions, offset=offset, target=render_target(target))
 
         self.assertEqual(tuple(target.to_numpy()[32, 32]), (0, 0, 0, 0))
 
@@ -523,7 +664,7 @@ class OpenGLPipelineTests(unittest.TestCase):
         render = vd.pipeline(triangle_vertex, solid_fragment)
         positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
         target = vd.Texture.zeros(shape=(16, 16))
-        render(position=positions, target=target)
+        render(position=positions, target=render_target(target))
         self.assertGreater(int(target.to_numpy()[8, 8, 0]), 240)
 
     @staticmethod
@@ -547,10 +688,7 @@ class OpenGLPipelineTests(unittest.TestCase):
             "position": positions,
             "offset": offsets,
             "indices": indices,
-            "targets": {
-                "object_id": object_id,
-                "color": color,
-            },
+            "target": mrt_target(color, object_id),
         }
         render(**arguments)
         color_pixels = color.to_numpy()
@@ -573,26 +711,15 @@ class OpenGLPipelineTests(unittest.TestCase):
         object_id = vd.Texture.zeros(shape=(32, 32))
         render = vd.pipeline(advanced_vertex, advanced_fragment, features=("PICKING", "PICKING"))
         with self.assertRaisesRegex(ValueError, "exactly match"):
-            render(position=positions, offset=offsets, indices=indices, targets={"color": color})
-        with self.assertRaisesRegex(RuntimeError, "extents differ"):
-            render(
-                position=positions,
-                offset=offsets,
-                indices=indices,
-                targets={
-                    "color": color,
-                    "object_id": vd.Texture.zeros(shape=(16, 16)),
-                },
-            )
+            render(position=positions, offset=offsets, indices=indices, target=render_target(color))
+        with self.assertRaisesRegex(ValueError, "dimensions"):
+            vd.RenderTarget(shape=color.shape).attach_color(0, color).attach_color(1, vd.Texture.zeros(shape=(16, 16)))
         with self.assertRaisesRegex(RuntimeError, "shape"):
             render(
                 position=positions,
                 offset=vd.storage.zeros(dtype=vd.f32, shape=(3, 3)),
                 indices=indices,
-                targets={
-                    "color": color,
-                    "object_id": object_id,
-                },
+                target=mrt_target(color, object_id),
             )
         unknown = vd.pipeline(advanced_vertex, advanced_fragment, features={"UNKNOWN"})
         with self.assertRaisesRegex(vd.CompileError, "undeclared feature"):
@@ -600,10 +727,7 @@ class OpenGLPipelineTests(unittest.TestCase):
                 position=positions,
                 offset=offsets,
                 indices=indices,
-                targets={
-                    "color": color,
-                    "object_id": object_id,
-                },
+                target=mrt_target(color, object_id),
             )
 
     def test_layout_view_and_topologies(self) -> None:
@@ -614,7 +738,7 @@ class OpenGLPipelineTests(unittest.TestCase):
             )
         )
         target = vd.Texture.zeros(shape=(32, 32))
-        vd.pipeline(triangle_vertex, solid_fragment)(position=interleaved.swizzle("yz"), target=target)
+        vd.pipeline(triangle_vertex, solid_fragment)(position=interleaved.swizzle("yz"), target=render_target(target))
         self.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
 
         vertices = vd.TensorStorage.zeros(dtype=InterleavedVertex, shape=(3,))
@@ -622,13 +746,17 @@ class OpenGLPipelineTests(unittest.TestCase):
             np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32)
         )
         target = vd.Texture.zeros(shape=(32, 32))
-        vd.pipeline(triangle_vertex, solid_fragment)(position=vertices.field("position"), target=target)
+        vd.pipeline(triangle_vertex, solid_fragment)(position=vertices.field("position"), target=render_target(target))
         self.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
 
         line_positions = vd.storage.from_numpy(np.array(((-0.5, 0.0), (0.5, 0.0)), dtype=np.float32))
-        vd.pipeline(triangle_vertex, solid_fragment)(position=line_positions, target=target, topology=vd.lines)
+        vd.pipeline(triangle_vertex, solid_fragment)(
+            position=line_positions, target=render_target(target), topology=vd.lines
+        )
         point_positions = vd.storage.from_numpy(np.array(((0.0, 0.0),), dtype=np.float32))
-        vd.pipeline(triangle_vertex, solid_fragment)(position=point_positions, target=target, topology=vd.points)
+        vd.pipeline(triangle_vertex, solid_fragment)(
+            position=point_positions, target=render_target(target), topology=vd.points
+        )
 
 
 class OpenGLESPipelineTests(unittest.TestCase):
@@ -641,6 +769,12 @@ class OpenGLESPipelineTests(unittest.TestCase):
     def test_rank_three_tensor_attribute_arithmetic_renders(self) -> None:
         assert_rank_three_tensor_attribute_renders(self)
 
+    def test_aggregate_attribute_renders(self) -> None:
+        assert_aggregate_attribute_renders(self)
+
+    def test_small_multidimensional_aggregate_attribute_renders(self) -> None:
+        assert_small_multidimensional_aggregate_attribute_renders(self)
+
     def test_formal_attribute_numeric_formats_render_or_reject(self) -> None:
         assert_formal_attribute_formats_render(self, unsupported=frozenset({"f16", "f64"}))
 
@@ -649,6 +783,12 @@ class OpenGLESPipelineTests(unittest.TestCase):
 
 
 class VulkanPipelineTests(unittest.TestCase):
+    def test_aggregate_attribute_renders(self) -> None:
+        assert_aggregate_attribute_renders(self)
+
+    def test_small_multidimensional_aggregate_attribute_renders(self) -> None:
+        assert_small_multidimensional_aggregate_attribute_renders(self)
+
     def test_formal_attribute_numeric_formats_render_or_reject(self) -> None:
         assert_formal_attribute_formats_render(self, unsupported=frozenset({"f16", "f64"}))
 
@@ -675,7 +815,7 @@ class VulkanPipelineTests(unittest.TestCase):
         positions = self._triangle()
         target = vd.Texture.zeros(shape=(64, 64))
         render = vd.pipeline(triangle_vertex, solid_fragment)
-        render(position=positions, target=target)
+        render(position=positions, target=render_target(target))
         pixels = target.to_numpy()
         self.assertGreater(int(pixels[32, 32, 0]), 240)
         np.testing.assert_allclose(positions.to_numpy()[:, 0], np.array((-0.75, 0.75, 0.0), dtype=np.float32))
@@ -711,7 +851,7 @@ class VulkanPipelineTests(unittest.TestCase):
         color = vd.storage.from_numpy(np.array((0.8, 0.7, 0.2, 1.0), dtype=np.float32))
 
         vd.pipeline(translated_vertex, colored_fragment)(
-            position=self._triangle(), offset=offset, color=color, target=target
+            position=self._triangle(), offset=offset, color=color, target=render_target(target)
         )
         pixels = target.to_numpy()
 
@@ -733,14 +873,15 @@ class VulkanPipelineTests(unittest.TestCase):
                 wraps=pipeline_module.build_bundle_plan,
             ) as planner,
         ):
-            render(position=positions, target=target)
+            render(position=positions, target=render_target(target))
         planner.assert_called_once()
 
     def test_bundle_parameter_output_layout_and_reinit_cache(self) -> None:
         render = vd.pipeline(triangle_vertex, solid_fragment)
         positions = self._triangle()
         target = vd.Texture.zeros(shape=(16, 16))
-        render(position=positions, target=target)
+        attachments = render_target(target)
+        render(position=positions, target=attachments)
         compiled = render._compiled
         self.assertIsNotNone(compiled)
         assert compiled is not None
@@ -767,7 +908,7 @@ class VulkanPipelineTests(unittest.TestCase):
         )
         self.assertEqual(render.compile_count, 1)
         vd.init(arch=vd.vulkan)
-        render(position=positions, target=target)
+        render(position=positions, target=attachments)
         self.assertEqual(render.compile_count, 1)
 
     def test_indexed_instanced_mrt(self) -> None:
@@ -779,10 +920,7 @@ class VulkanPipelineTests(unittest.TestCase):
             position=positions,
             offset=offsets,
             indices=indices,
-            targets={
-                "color": color,
-                "object_id": object_id,
-            },
+            target=mrt_target(color, object_id),
         )
         self.assertGreater(int(color.to_numpy()[32, 19, 2]), 240)
         self.assertGreater(int(object_id.to_numpy()[32, 19, 0]), 240)
@@ -791,11 +929,18 @@ class VulkanPipelineTests(unittest.TestCase):
         vd.init(arch=vd.cpu)
         with self.assertRaisesRegex(RuntimeError, "software rasterizer"):
             vd.pipeline(triangle_vertex, solid_fragment)(
-                position=self._triangle(), target=vd.Texture.zeros(shape=(8, 8))
+                position=self._triangle(),
+                target=render_target(vd.Texture.zeros(shape=(8, 8))),
             )
 
 
 class DirectXPipelineTests(unittest.TestCase):
+    def test_aggregate_attribute_renders(self) -> None:
+        assert_aggregate_attribute_renders(self)
+
+    def test_small_multidimensional_aggregate_attribute_renders(self) -> None:
+        assert_small_multidimensional_aggregate_attribute_renders(self)
+
     def test_formal_attribute_numeric_formats_render_or_reject(self) -> None:
         assert_formal_attribute_formats_render(self, unsupported=frozenset({"f16", "f64"}))
 

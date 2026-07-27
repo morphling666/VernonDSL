@@ -16,6 +16,7 @@
 #endif
 
 #if defined(VERNON_RUNTIME_TESTING)
+#include "rhi/rhi_test_hooks.h"
 #include "runtime_test_hooks.h"
 #endif
 
@@ -82,33 +83,19 @@ VernonStatus backendComputeToGraphicsBarrier(VernonRuntimeContext &context) {
 }
 
 VernonStatus synchronizeBackend(VernonRuntimeContext &context) {
-    switch (context.backend) {
-    case VERNON_RUNTIME_CPU:
+    if (context.backend == VERNON_RUNTIME_CPU)
         return VERNON_STATUS_OK;
-    case VERNON_RUNTIME_CUDA:
-#if defined(VERNON_HAS_CUDA_RUNTIME)
-        return synchronizeCuda(context);
-#else
+    switch (vernonRhiDeviceSynchronize(context.rhiDevice)) {
+    case VERNON_RHI_STATUS_OK:
+        return VERNON_STATUS_OK;
+    case VERNON_RHI_STATUS_INVALID_ARGUMENT:
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    case VERNON_RHI_STATUS_UNSUPPORTED:
         return VERNON_STATUS_UNSUPPORTED_TARGET;
-#endif
-    case VERNON_RUNTIME_VULKAN:
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-        return synchronizeVulkan(context);
-#else
-        return VERNON_STATUS_UNSUPPORTED_TARGET;
-#endif
-    case VERNON_RUNTIME_DIRECTX12:
-#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-        return synchronizeDirectX12(context);
-#else
-        return VERNON_STATUS_UNSUPPORTED_TARGET;
-#endif
-    case VERNON_RUNTIME_OPENGL:
-    case VERNON_RUNTIME_OPENGL_ES:
-        return synchronizeOpenGL(context);
-    default:
-        return VERNON_STATUS_UNSUPPORTED_TARGET;
+    case VERNON_RHI_STATUS_INTERNAL_ERROR:
+        return VERNON_STATUS_INTERNAL_ERROR;
     }
+    return VERNON_STATUS_INTERNAL_ERROR;
 }
 
 #if defined(VERNON_RUNTIME_TESTING)
@@ -118,16 +105,17 @@ VulkanGraphicsCacheStats getVulkanGraphicsCacheStats(const VernonRuntimeContext 
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     if (!context || !pipeline || pipeline->context != context || context->backend != VERNON_RUNTIME_VULKAN)
         return result;
-    result.defaultImplicitSamplerCreations = vulkanState(*context).defaultImplicitSamplerCreations;
+    const vernon::rhi::VulkanCacheStats rhiStats = vernon::rhi::getVulkanCacheStats(context->rhiDevice);
+    result.defaultImplicitSamplerCreations = rhiStats.defaultImplicitSamplerCreations;
     const VulkanPipelineState &state = runtimeBackendState<VulkanPipelineState>(*pipeline);
     result.descriptorSetLayoutCreations = state.rhiGraphicsPipeline ? 1 : 0;
     result.pipelineLayoutCreations = state.rhiGraphicsPipeline ? 1 : 0;
     result.graphicsPipelineCreations = state.rhiGraphicsVariant ? 1 : 0;
-    result.commandBufferAllocations = vulkanState(*context).commandBufferAllocations;
-    result.descriptorPoolCreations = vulkanState(*context).descriptorPoolCreations;
-    result.stagingBufferAllocations = vulkanState(*context).stagingBufferAllocations;
-    result.renderPassCreations = state.rhiGraphicsVariant && !vulkanState(*context).dynamicRendering ? 1 : 0;
-    result.dynamicRendering = vulkanState(*context).dynamicRendering;
+    result.commandBufferAllocations = rhiStats.commandBufferAllocations;
+    result.descriptorPoolCreations = rhiStats.descriptorPoolCreations;
+    result.stagingBufferAllocations = rhiStats.stagingBufferAllocations;
+    result.renderPassCreations = state.rhiGraphicsVariant && !rhiStats.dynamicRendering ? 1 : 0;
+    result.dynamicRendering = rhiStats.dynamicRendering;
 #else
     (void)context;
     (void)pipeline;

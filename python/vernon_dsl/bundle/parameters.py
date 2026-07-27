@@ -33,6 +33,26 @@ def _uniform_layout(row: Mapping[str, Any], dtype: str | None, shape: Sequence[i
     storage_class = row.get("proposed_storage_class")
     if not isinstance(size, int) or size <= 0 or not isinstance(alignment, int) or alignment <= 0:
         return None
+    if storage_class == "StorageBuffer":
+        element_layout = row.get("element_layout")
+        element_size = element_layout.get("byte_size") if isinstance(element_layout, Mapping) else None
+        if not isinstance(element_size, int) or element_size <= 0 or any(dimension <= 0 for dimension in shape):
+            return None
+        reflected_strides = row.get("array_strides")
+        if isinstance(reflected_strides, list) and len(reflected_strides) == len(shape):
+            byte_strides = reflected_strides
+        else:
+            byte_strides = [0] * len(shape)
+            stride = element_size
+            for dimension in range(len(shape) - 1, -1, -1):
+                byte_strides[dimension] = stride
+                stride *= shape[dimension]
+        return {
+            "storage": "storage_buffer",
+            "size": size,
+            "alignment": alignment,
+            "byte_strides": byte_strides,
+        }
     scalar_sizes = {"bool": 1, "f16": 2, "i32": 4, "u32": 4, "f32": 4, "f64": 8}
     element_size = scalar_sizes.get(dtype or "")
     if element_size is None:
@@ -111,16 +131,23 @@ def reflected_parameters(
                 "index": row.get("index"),
                 "kind": row.get("kind", "scalar"),
                 "type": row.get("type"),
-                "dtype": (row.get("dtype") or row.get("vernon.dtype") or inferred_dtype),
                 "shape": row.get("shape", inferred_shape),
                 "interface": interface_name,
                 "access": row.get("access", "read"),
                 "dimension": row.get("dimension"),
             }
+            dtype = row.get("dtype") or row.get("vernon.dtype") or inferred_dtype
+            if dtype is not None:
+                use["dtype"] = dtype
+            if row.get("kind") not in {"texture", "sampler"}:
+                element_layout = row.get("element_layout")
+                if not isinstance(element_layout, Mapping):
+                    raise PipelineCompileError(f"{stage} Tensor argument is missing canonical element_layout")
+                use["element_layout"] = dict(element_layout)
             if (
                 interface_name == "uniform" or (stage == "compute" and row.get("kind") == "tensor_value")
             ) and "uniform_layout" not in row:
-                layout = _uniform_layout(row, use["dtype"], use["shape"])
+                layout = _uniform_layout(row, use.get("dtype"), use["shape"])
                 if layout is not None:
                     use["uniform_layout"] = layout
             if internal_source is not None:
@@ -180,11 +207,20 @@ def merge_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[s
         incompatible_layout = kind != "tensor" and (
             use.get("type") != first.get("type") or use.get("shape", []) != first.get("shape", [])
         )
-        if classify_parameter_use(use) != kind or use.get("dtype") != first.get("dtype") or incompatible_layout:
+        incompatible_tensor_layout = kind == "tensor" and use.get("element_layout") != first.get("element_layout")
+        if (
+            classify_parameter_use(use) != kind
+            or (kind != "tensor" and use.get("dtype") != first.get("dtype"))
+            or incompatible_layout
+            or incompatible_tensor_layout
+        ):
             raise PipelineCompileError(f"incompatible pipeline parameter {name!r}")
     representative = (
         next((use for use in normalized if use.get("stage") != "compute"), first) if kind == "tensor" else first
     )
+    element_layout = representative.get("element_layout")
+    for use in normalized:
+        use.pop("element_layout", None)
     access_values = {str(use.get("access", "read")) for use in normalized}
     access = (
         "read_write"
@@ -195,12 +231,15 @@ def merge_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[s
         "name": name,
         "kind": kind,
         "type": representative.get("type"),
-        "dtype": representative.get("dtype"),
         "shape": representative.get("shape", []),
         "access": access,
         "dimension": first.get("dimension"),
         "uses": normalized,
     }
+    if kind == "tensor":
+        parameter["element_layout"] = element_layout
+    else:
+        parameter["dtype"] = representative.get("dtype")
     return {key: value for key, value in parameter.items() if value is not None}
 
 
@@ -216,7 +255,13 @@ def merge_internal_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) 
         if values != {"resolution"}:
             raise PipelineCompileError(f"inconsistent resolution system value {name!r}")
         parameter["system_value"] = "resolution"
-        if parameter.get("dtype") != "f32" or parameter.get("shape") != [2]:
+        leaves = parameter.get("element_layout", {}).get("leaves", [])
+        if (
+            parameter.get("shape") != [2]
+            or len(leaves) != 1
+            or leaves[0].get("dtype") != "f32"
+            or leaves[0].get("scalar_count") != 1
+        ):
             raise PipelineCompileError("resolution system value must have reflected type tensor<2xf32>")
         if any(use.get("sampled_texture_bindings") for use in uses):
             raise PipelineCompileError("resolution system value cannot pair sampled textures")

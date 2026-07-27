@@ -9,6 +9,12 @@ from unittest import mock
 
 import numpy as np
 import vernon_dsl as vd
+from aggregate_vertex_shader import (
+    AggregateVertexPayload,
+    ComplexAggregateVertex,
+    copy_complex_aggregate_tensor_view,
+    inspect_multidimensional_aggregate_tensor_value,
+)
 
 
 def _load_fractal() -> ModuleType:
@@ -293,15 +299,6 @@ def early_return_values(
     output[5] = record.vector[1]
 
 
-@vd.kernel(workgroup_size=(4, 1, 1))
-def copy_aggregate_tensor_view(
-    output: vd.TensorView[AggregateRecord, 1, vd.write],
-    source: vd.TensorView[AggregateRecord, 1, vd.read],
-    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
-) -> None:
-    output[gid[0]] = source[gid[0]]
-
-
 @vd.kernel(workgroup_size=(2, 1, 1))
 def copy_tuple_tensor_view(
     output: vd.TensorView[vd.Tuple[vd.i32, vd.f32], 1, vd.write],
@@ -370,6 +367,13 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             vd.init(arch=vd.cpu)
             return False
         return True
+
+    def _aggregate_compute_backends(self) -> list[object]:
+        backends: list[object] = [vd.cpu]
+        for architecture in (vd.cuda, vd.opengles, vd.opengl, vd.vulkan, vd.directx):
+            if self._runtime_available(architecture):
+                backends.append(architecture)
+        return backends
 
     def test_rank_three_tensor_operators(self) -> None:
         actual = self._run_tensor_operators(vd.cpu)
@@ -656,33 +660,33 @@ class KernelTensorRuntimeTests(unittest.TestCase):
 
     def test_aggregate_tensor_view_dispatch(self) -> None:
         values = tuple(
-            AggregateRecord(
-                np.array([float(index), float(index) + 0.5], dtype=np.float32),
-                (vd.i32(index * 3), vd.f32(index + 0.25)),
+            ComplexAggregateVertex(
+                np.array((float(index), float(index) + 0.5), dtype=np.float32),
+                AggregateVertexPayload(
+                    vd.i32(index * 3),
+                    np.array((index + 0.25, index + 0.75), dtype=np.float32),
+                    np.array((index + 1.0, index + 2.0), dtype=np.float32),
+                ),
+                np.array(((index + 3.0, index + 4.0), (index + 5.0, index + 6.0)), dtype=np.float32),
             )
             for index in range(4)
         )
-        backends = [vd.cpu]
-        if self._cuda_available():
-            backends.append(vd.cuda)
-        if self._vulkan_available():
-            backends.append(vd.vulkan)
-        for architecture in (vd.opengl, vd.opengles):
-            if self._runtime_available(architecture):
-                backends.append(architecture)
-        for backend in backends:
+        for backend in self._aggregate_compute_backends():
             with self.subTest(backend=backend.name):
                 vd.init(arch=backend)
-                source = vd.storage.from_values(values, dtype=AggregateRecord).view(
+                source = vd.storage.from_values(values, dtype=ComplexAggregateVertex).view(
                     shape=(4,), strides=(-1,), offset=3, access="read"
                 )
-                output_storage = vd.storage.zeros(dtype=AggregateRecord, shape=(4,))
+                output_storage = vd.storage.zeros(dtype=ComplexAggregateVertex, shape=(4,))
                 output = output_storage.view(access="write")
-                copy_aggregate_tensor_view(output, source, grid=(4, 1, 1))
+                copy_complex_aggregate_tensor_view(output, source, grid=(4, 1, 1))
                 actual = output_storage.to_values()
                 for result, expected in zip(actual, reversed(values), strict=True):
-                    np.testing.assert_array_equal(result.vector, expected.vector)
-                    self.assertEqual(result.pair, expected.pair)
+                    np.testing.assert_array_equal(result.position, expected.position)
+                    self.assertEqual(result.payload.object_id, expected.payload.object_id)
+                    np.testing.assert_array_equal(result.payload.uv, expected.payload.uv)
+                    np.testing.assert_array_equal(result.payload.weights, expected.payload.weights)
+                    np.testing.assert_array_equal(result.basis, expected.basis)
 
                 tuple_type = vd.Tuple[vd.i32, vd.f32]
                 tuple_values = ((vd.i32(2), vd.f32(3.5)), (vd.i32(5), vd.f32(7.5)))
@@ -722,6 +726,35 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                     np.frombuffer(tensor_output_bytes, dtype=np.float32).reshape(2, 2),
                     np.asarray(tensor_values),
                 )
+
+    def test_multidimensional_aggregate_tensor_dispatch(self) -> None:
+        values = tuple(
+            ComplexAggregateVertex(
+                np.array((float(index), float(index) + 0.5), dtype=np.float32),
+                AggregateVertexPayload(
+                    vd.i32(index * 3),
+                    np.array((index + 0.25, index + 0.75), dtype=np.float32),
+                    np.array((index + 1.0, index + 2.0), dtype=np.float32),
+                ),
+                np.array(((index + 3.0, index + 4.0), (index + 5.0, index + 6.0)), dtype=np.float32),
+            )
+            for index in range(2 * 4 * 3)
+        )
+        expected = np.array((23.0, 23.5, 69.0, 23.75, 24.0, 28.0), dtype=np.float32)
+
+        for backend in self._aggregate_compute_backends():
+            with self.subTest(backend=backend.name):
+                vd.init(arch=backend)
+                output = vd.storage.zeros(dtype=vd.f32, shape=(6,))
+                tensor = vd.storage.from_values(
+                    tuple(
+                        tuple(tuple(values[plane * 12 + row * 4 + column] for column in range(4)) for row in range(3))
+                        for plane in range(2)
+                    ),
+                    dtype=ComplexAggregateVertex,
+                )
+                inspect_multidimensional_aggregate_tensor_value(output, tensor, grid=(1, 1, 1))
+                np.testing.assert_array_equal(output.to_numpy(), expected)
 
     def test_cross_compiled_source_generation(self) -> None:
         output = vd.storage.zeros(dtype=vd.f32, shape=(16,))
@@ -831,15 +864,15 @@ class KernelTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             fill(output, 1.0, grid=(3, 0, 1))
 
-    def test_native_tensor_residency_and_lazy_download(self) -> None:
+    def test_cpu_host_tensor_avoids_device_residency(self) -> None:
         output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
         fill(output, 2.0)
         fill(output, 3.0)
-        self.assertEqual(output._allocation_count, 1)
-        self.assertEqual(output._upload_count, 1)
+        self.assertEqual(output._allocation_count, 0)
+        self.assertEqual(output._upload_count, 0)
         self.assertEqual(output._download_count, 0)
         output.to_numpy()
-        self.assertEqual(output._download_count, 1)
+        self.assertEqual(output._download_count, 0)
 
     def test_fractal_matches_vectorized_numpy_reference(self) -> None:
         width, height = 4, 3

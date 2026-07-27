@@ -29,7 +29,11 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     static const char reflection[] = "{\"gpu_launch_abi_version\":1,\"entries\":[{\"name\":\"fill\","
                                      "\"cpu_arguments_size\":20,\"workgroup_size\":[2,2,1],\"arguments\":["
                                      "{\"kind\":\"tensor\",\"dtype\":\"f32\",\"shape\":[12],"
-                                     "\"tensor_bytes\":48,\"tensor_element_size\":4,"
+                                     "\"element_layout\":{\"logical_type\":\"f32\",\"byte_size\":4,"
+                                     "\"alignment\":4,\"layout_hash\":"
+                                     "\"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b\","
+                                     "\"leaves\":[{\"path\":[],\"dtype\":\"f32\",\"byte_offset\":0,"
+                                     "\"scalar_count\":1}]},"
                                      "\"alignment\":4,\"cpu_offset\":0,\"cpu_size\":8},"
                                      "{\"kind\":\"builtin\",\"builtin\":\"global_invocation_id\","
                                      "\"cpu_offset\":8,\"cpu_size\":12}]}]}";
@@ -37,8 +41,6 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     ASSERT_TRUE(capabilities.available && capabilities.supports_compute);
     VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_TRUE(runtime);
-    VernonDeviceBuffer *buffer = vernonRuntimeBufferAllocate(runtime, 12 * sizeof(float), 4);
-    ASSERT_TRUE(buffer);
     static const char bad_reflection[] = "{\"gpu_launch_abi_version\":2,\"entries\":[]}";
     ASSERT_TRUE(!vernonRuntimeLoadCpuEntry(runtime, fill_grid, bad_reflection, sizeof(bad_reflection) - 1, "fill", 4));
     VernonLoadedPipeline *pipeline =
@@ -46,13 +48,14 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     ASSERT_TRUE(pipeline);
     uint64_t shape[] = {12};
     int64_t strides[] = {4};
+    float values[12] = {0};
     VernonPipelineArgument argument = {};
     argument.slot = 0;
     argument.kind = VERNON_PIPELINE_TENSOR;
     argument.tensor.struct_size = sizeof(VernonTensorView);
-    argument.tensor.storage = VERNON_TENSOR_DEVICE;
-    argument.tensor.buffer = buffer;
-    argument.tensor.dtype = VERNON_DATA_F32;
+    argument.tensor.storage = VERNON_TENSOR_HOST;
+    argument.tensor.host_data = values;
+    argument.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
     argument.tensor.access = VERNON_ACCESS_READ_WRITE;
     argument.tensor.rank = 1;
     argument.tensor.shape = shape;
@@ -66,15 +69,12 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     invocation.argument_count = 1;
     invocation.compute_grid = grid;
     ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
-    float values[12] = {0};
-    ASSERT_TRUE(vernonRuntimeCopyToHost(buffer, 0, values, sizeof(values)) == VERNON_STATUS_OK);
     ASSERT_TRUE(values[0] == 0.0f && values[2] == 2.0f);
     ASSERT_TRUE(values[3] == 10.0f && values[11] == 112.0f);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_INVALID_ARGUMENT);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
 
     memset(values, 0, sizeof(values));
-    ASSERT_TRUE(vernonRuntimeCopyFromHost(buffer, 0, values, sizeof(values)) == VERNON_STATUS_OK);
     pipeline = vernonRuntimeLoadComputeBundle(runtime, VERNON_CPU_BUNDLE_PATH);
     if (!pipeline) {
         VernonStringView error = vernonRuntimeGetLastError(runtime);
@@ -82,11 +82,9 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     }
     ASSERT_TRUE(pipeline);
     ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
-    ASSERT_TRUE(vernonRuntimeCopyToHost(buffer, 0, values, sizeof(values)) == VERNON_STATUS_OK);
     ASSERT_TRUE(values[0] == 0.0f && values[2] == 2.0f);
     ASSERT_TRUE(values[3] == 10.0f && values[11] == 112.0f);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
 
-    ASSERT_TRUE(vernonRuntimeBufferFree(buffer) == VERNON_STATUS_OK);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
 }

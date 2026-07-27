@@ -19,18 +19,6 @@ struct StaticMatmulPlan {
     bool rightVector{};
 };
 
-struct StaticAttributeLeaf {
-    uint32_t locationOffset{};
-    uint32_t componentCount{};
-    uint64_t byteOffset{};
-};
-
-struct StaticAttributePlan {
-    SmallVector<StaticAttributeLeaf> leaves;
-    uint64_t elementSize{};
-};
-
-FailureOr<StaticAttributePlan> getStaticAttributePlan(Type elementType, ArrayRef<int64_t> shape);
 FailureOr<SmallVector<int64_t>> getStaticBroadcastShape(ArrayRef<int64_t> left, ArrayRef<int64_t> right);
 FailureOr<int64_t> getStaticBroadcastLinearIndex(ArrayRef<int64_t> inputShape, ArrayRef<int64_t> resultShape,
                                                  int64_t resultLinearIndex);

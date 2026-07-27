@@ -185,6 +185,10 @@ class _FunctionEmitter:
         planned: list[tuple[str, AnnotatedType]] = []
         builtins: set[str] = set()
         next_location = 0
+
+        def struct_fields(name: str) -> tuple[tuple[str, ConcreteType], ...]:
+            return tuple((field_name, field.type) for field_name, field in self.context.structs[name])
+
         for field_name, annotation in fields:
             self._validate_builtin_annotation(annotation, "output", f"output field '{field_name}'")
             builtin_values = [str(item.arguments[0]) for item in annotation.metadata if item.kind == "builtin"]
@@ -197,20 +201,14 @@ class _FunctionEmitter:
                 builtins.add(builtin)
                 planned.append((field_name, annotation))
                 continue
-            value_type = annotation.type
-            if value_type.kind == "scalar":
-                dtype = value_type.name
-                shape: tuple[int, ...] = ()
-            elif value_type.kind == "tensor" and isinstance(value_type.arguments[0], ConcreteType):
-                dtype = value_type.arguments[0].name
-                shape = tuple(int(value) for value in value_type.arguments[1:])
-            else:
+            try:
+                span = attribute_layout(annotation.type, struct_fields).location_span
+            except ValueError as error:
                 raise self.context.error(
-                    self.node, f"output field '{field_name}' is not a numeric shader interface value"
-                )
-            span = attribute_layout(dtype, shape).location_span
+                    self.node, f"output field '{field_name}' is not a numeric shader interface value: {error}"
+                ) from None
             metadata = (*annotation.metadata, Metadata("attribute", (next_location, 0)))
-            planned.append((field_name, AnnotatedType(value_type, metadata)))
+            planned.append((field_name, AnnotatedType(annotation.type, metadata)))
             next_location += span
         return tuple(planned)
 
@@ -219,20 +217,18 @@ class _FunctionEmitter:
         argument_locations: dict[int, int] = {}
         if self.stage in {"vertex", "fragment"}:
             candidates: list[tuple[int, AnnotatedType, int, int | None]] = []
+
+            def struct_fields(name: str) -> tuple[tuple[str, ConcreteType], ...]:
+                return tuple((field_name, field.type) for field_name, field in self.context.structs[name])
+
             for index, annotation in enumerate(self.argument_annotations):
                 if any(item.kind in {"builtin", "uniform", "resource"} for item in annotation.metadata):
                     continue
                 value_type = annotation.type
-                if value_type.kind == "scalar":
-                    dtype = value_type.name
-                    shape: tuple[int, ...] = ()
-                elif value_type.kind == "tensor" and isinstance(value_type.arguments[0], ConcreteType):
-                    dtype = value_type.arguments[0].name
-                    shape = tuple(int(value) for value in value_type.arguments[1:])
-                else:
+                if value_type.kind not in {"scalar", "tensor", "tuple", "struct"}:
                     continue
                 try:
-                    span = attribute_layout(dtype, shape).location_span
+                    span = attribute_layout(value_type, struct_fields).location_span
                 except ValueError as error:
                     if self.stage == "fragment":
                         span = 1
@@ -303,7 +299,8 @@ class _FunctionEmitter:
             elif annotation.type.kind == "tensor":
                 element_type = annotation.type.arguments[0]
                 assert isinstance(element_type, DslType)
-                attributes.append(f'vernon.dtype = "{element_type.name}"')
+                if element_type.kind == "scalar":
+                    attributes.append(f'vernon.dtype = "{element_type.name}"')
             elif annotation.type.kind == "tensor_view":
                 element_type = annotation.type.arguments[0]
                 assert isinstance(element_type, DslType)
@@ -406,14 +403,32 @@ class _FunctionEmitter:
         if value_type.kind not in {"scalar", "tensor", "tuple", "struct"}:
             return []
 
-        def fields(name: str) -> tuple[DslType, ...]:
-            return tuple(annotation.type for _, annotation in self.context.structs[name])
+        def fields(name: str) -> tuple[tuple[str, DslType], ...]:
+            return tuple((field_name, annotation.type) for field_name, annotation in self.context.structs[name])
 
         layout = value_abi_layout(value_type, fields)
         attributes = [
             f"vernon.abi_alignment = {layout.alignment} : i64",
             f"vernon.abi_size = {layout.size} : i64",
+            f'vernon.abi_layout_hash = "{layout.layout_hash}"',
         ]
+        leaf_dtypes = ", ".join(f'"{leaf.dtype}"' for leaf in layout.leaves)
+        leaf_offsets = ", ".join(str(leaf.byte_offset) for leaf in layout.leaves)
+        leaf_counts = ", ".join(str(leaf.scalar_count) for leaf in layout.leaves)
+        leaf_paths = ", ".join(
+            '"'
+            + "/".join(str(component) if isinstance(component, str) else f"[{component}]" for component in leaf.path)
+            + '"'
+            for leaf in layout.leaves
+        )
+        attributes.extend(
+            (
+                f"vernon.abi_leaf_dtypes = [{leaf_dtypes}]",
+                f"vernon.abi_leaf_offsets = array<i64: {leaf_offsets}>",
+                f"vernon.abi_leaf_counts = array<i64: {leaf_counts}>",
+                f"vernon.abi_leaf_paths = [{leaf_paths}]",
+            )
+        )
         if layout.field_offsets:
             offsets = ", ".join(str(offset) for offset in layout.field_offsets)
             attributes.append(f"vernon.abi_field_offsets = array<i64: {offsets}>")
@@ -1732,6 +1747,8 @@ class _FunctionEmitter:
         if value.type.kind == "index":
             operation = "arith.index_cast"
         elif source_scalar.is_integer and target_scalar.is_float:
+            # Both i32 and u32 operands are signless i32 in MLIR; the selected
+            # conversion operation carries the source signedness semantics.
             operation = "arith.uitofp" if source_scalar.name == "u32" else "arith.sitofp"
         elif source_scalar.is_float and target_scalar.is_integer:
             operation = "arith.fptoui" if target_scalar.name == "u32" else "arith.fptosi"
@@ -2073,17 +2090,21 @@ class Compiler:
             module_attributes.append(f"vernon.variant_key = [{variant}]")
         body: list[str] = [f"module attributes {{{', '.join(module_attributes)}}} {{"]
 
-        def struct_field_types(name: str) -> tuple[ConcreteType, ...]:
-            return tuple(annotation.type for _, annotation in context.structs[name])
+        def struct_field_types(name: str) -> tuple[tuple[str, ConcreteType], ...]:
+            return tuple((field_name, annotation.type) for field_name, annotation in context.structs[name])
 
         for name in sorted(context.structs):
             fields = context.structs[name]
-            field_text = ", ".join(f'"{field_name}:{annotation.type.mlir}"' for field_name, annotation in fields)
+            field_text = ", ".join(
+                json.dumps(f"{field_name}:{annotation.type.mlir}") for field_name, annotation in fields
+            )
             layout = value_abi_layout(ConcreteType("struct", name), struct_field_types)
             offsets = ", ".join(str(offset) for offset in layout.field_offsets)
+            leaf_dtypes = ", ".join(f'"{leaf.dtype}"' for leaf in layout.leaves)
             body.append(
                 f'  "vernon.struct"() {{abi_alignment = {layout.alignment} : i64, '
-                f"abi_field_offsets = array<i64: {offsets}>, abi_size = {layout.size} : i64, "
+                f"abi_field_offsets = array<i64: {offsets}>, abi_leaf_dtypes = [{leaf_dtypes}], "
+                f"abi_size = {layout.size} : i64, "
                 f'fields = [{field_text}], sym_name = "{name}"}} : () -> ()'
             )
         for node in module.body:

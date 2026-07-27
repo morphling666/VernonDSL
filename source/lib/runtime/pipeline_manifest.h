@@ -9,6 +9,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace vernon::runtime {
@@ -28,8 +29,37 @@ struct UniformLayout {
 
 struct AttributeLeaf {
     uint32_t locationOffset{};
+    std::string dtype;
     uint32_t componentCount{};
     uint32_t byteOffset{};
+};
+
+struct ValuePathComponent {
+    std::optional<std::string> field;
+    uint64_t index{};
+};
+
+struct ValueLeaf {
+    ValueLeaf() = default;
+    ValueLeaf(std::string dtype, uint32_t scalarCount, uint32_t byteOffset)
+        : dtype(std::move(dtype)), scalarCount(scalarCount), byteOffset(byteOffset) {}
+
+    std::vector<ValuePathComponent> path;
+    std::vector<uint64_t> shape;
+    std::string dtype;
+    uint32_t scalarCount{};
+    uint32_t byteOffset{};
+    std::vector<VernonValuePathComponentView> abiPath;
+};
+
+struct ValueLayout {
+    std::string logicalType;
+    std::string structName;
+    std::string layoutHash;
+    uint32_t byteSize{};
+    uint32_t alignment{};
+    std::vector<ValueLeaf> leaves;
+    std::vector<VernonValueLeafView> abiLeaves;
 };
 
 struct ParameterUse {
@@ -54,7 +84,7 @@ struct Parameter {
     std::string kind;
     std::string source;
     std::string systemValue;
-    std::string dtype;
+    ValueLayout elementLayout;
     std::string access;
     std::string dimension;
     std::string textureFormat;
@@ -111,6 +141,8 @@ std::optional<VernonTextureDimension> pipelineTextureDimension(const std::string
 std::optional<VernonTextureFormat> pipelineTextureFormat(const std::string &format);
 
 bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &error);
+bool parsePipelineValueLayout(const nlohmann::json &value, ValueLayout &layout, std::string &error);
+void rebuildValueLayoutPathViews(ValueLayout &layout);
 bool parseRuntimeRequirements(const nlohmann::json &root, const std::string &target, RuntimeRequirements &requirements,
                               std::string &error);
 bool runtimeVersionAtLeast(RuntimeVersion actual, RuntimeVersion required);

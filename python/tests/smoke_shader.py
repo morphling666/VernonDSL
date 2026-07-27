@@ -1,12 +1,19 @@
 from vernon_dsl import *
 
 
+@struct
+class SmokeVertexOutput:
+    position: Annotated[Vector[f32, 4], builtin("position")]
+    color: Vector[f32, 4]
+
+
 @vertex
 def vertex_main(
     position: Annotated[Vector[f32, 4], attribute()],
     offset: Annotated[Vector[f32, 4], uniform()],
-) -> Vector[f32, 4]:
-    return position + offset
+) -> SmokeVertexOutput:
+    translated = position + offset
+    return SmokeVertexOutput(translated, translated)
 
 
 @fragment

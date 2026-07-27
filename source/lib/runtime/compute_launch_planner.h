@@ -14,15 +14,11 @@ enum class ComputeLaunchArgumentKind { Tensor, Scalar };
 
 struct ComputeLaunchArgument {
     ComputeLaunchArgumentKind kind{ComputeLaunchArgumentKind::Tensor};
-    VernonDeviceBuffer *buffer{};
     VernonRuntimeProviderResourceReference resource{};
+    const void *hostData{};
+    size_t hostSize{};
     const void *scalarData{};
     size_t scalarSize{};
-};
-
-struct ComputePlannerCallbacks {
-    const void *userData{};
-    const void *(*bufferContext)(const void *userData, const VernonDeviceBuffer *buffer){};
 };
 
 struct PlannedComputeLaunch {
@@ -32,7 +28,6 @@ struct PlannedComputeLaunch {
 };
 
 bool planComputeInvocation(const Variant &variant, const VernonPipelineInvocation &invocation,
-                           const void *expectedContext, const ComputePlannerCallbacks &callbacks,
                            PlannedComputeLaunch &plan, std::string &error);
 
 } // namespace vernon::runtime

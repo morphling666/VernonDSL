@@ -1,5 +1,6 @@
 #include "VernonCompiler.h"
 #include "VernonRuntime.h"
+#include "runtime_rhi_test_utils.h"
 
 #include <cstring>
 #include <gtest/gtest.h>
@@ -46,7 +47,8 @@ module {
     ASSERT_TRUE(vernonCompileResultGetStatus(compiled) == VERNON_STATUS_OK);
     ASSERT_TRUE(vernonCompileResultGetArtifactCount(compiled) == 1);
 
-    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_VULKAN, nullptr);
+    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_VULKAN);
+    VernonRuntimeContext *runtime = context.runtime;
     ASSERT_TRUE(runtime);
     VernonStringView artifact = vernonCompileResultGetArtifactData(compiled, 0);
     VernonStringView reflection = vernonCompileResultGetReflection(compiled);
@@ -56,18 +58,17 @@ module {
 
     float input[8] = {0, 1, 2, 3, 4, 5, 6, 7};
     float output[8] = {};
-    VernonDeviceBuffer *buffer = vernonRuntimeBufferAllocate(runtime, sizeof(input), alignof(float));
-    ASSERT_TRUE(buffer);
-    ASSERT_TRUE(vernonRuntimeCopyFromHost(buffer, 0, input, sizeof(input)) == VERNON_STATUS_OK);
+    auto buffer = vernon::tests::createBuffer(context, sizeof(input), alignof(float), VERNON_RHI_BUFFER_STORAGE, input);
+    ASSERT_NE(buffer.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     const uint64_t shape[]{8};
     const int64_t strides[]{sizeof(float)};
     VernonPipelineArgument argument{};
     argument.slot = 0;
     argument.kind = VERNON_PIPELINE_TENSOR;
     argument.tensor.struct_size = sizeof(VernonTensorView);
-    argument.tensor.storage = VERNON_TENSOR_DEVICE;
-    argument.tensor.buffer = buffer;
-    argument.tensor.dtype = VERNON_DATA_F32;
+    argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    argument.tensor.resource = buffer.reference;
+    argument.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
     argument.tensor.access = VERNON_ACCESS_READ_WRITE;
     argument.tensor.rank = 1;
     argument.tensor.shape = shape;
@@ -80,13 +81,15 @@ module {
     invocation.argument_count = 1;
     invocation.compute_grid = {8, 1, 1};
     ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
-    ASSERT_TRUE(vernonRuntimeCopyToHost(buffer, 0, output, sizeof(output)) == VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(context.device, buffer.handle, 0, output, sizeof(output)),
+              VERNON_RHI_STATUS_OK);
     for (int index = 0; index < 8; ++index)
         ASSERT_TRUE(output[index] == input[index] + 1.0f);
 
-    ASSERT_TRUE(vernonRuntimeBufferFree(buffer) == VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyBuffer(context.device, buffer.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
+    vernonRhiDestroyDevice(context.device);
     vernonCompileResultDestroy(compiled);
     vernonCompilerDestroy(compiler);
 }

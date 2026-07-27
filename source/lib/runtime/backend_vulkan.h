@@ -14,50 +14,27 @@
 #include <string>
 #include <vector>
 
-struct VernonDeviceBuffer;
-struct VernonDeviceSampler;
-struct VernonDeviceTexture;
 struct VernonRuntimeRhiAdapter;
 namespace vernon::runtime {
 
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-struct VulkanContextState : rhi::vulkan::DeviceState {
+struct VulkanContextState {
     VernonRuntimeRhiAdapter *adapter{};
+    uint32_t apiVersion{};
+    uint32_t maxComputeWorkGroupInvocations{};
+    uint32_t maxComputeWorkGroupSize[3]{};
+    uint32_t defaultImplicitSamplerCreations{};
+    uint32_t commandBufferAllocations{};
+    uint32_t descriptorPoolCreations{};
+    uint32_t stagingBufferAllocations{};
+    bool dynamicRendering{};
 };
-using VulkanBufferState = rhi::vulkan::Buffer;
-using VulkanTextureState = rhi::vulkan::Image;
-using VulkanSamplerState = rhi::vulkan::Sampler;
-
 inline VulkanContextState &vulkanState(VernonRuntimeContext &context) {
     return runtimeBackendState<VulkanContextState>(context);
 }
 
 inline const VulkanContextState &vulkanState(const VernonRuntimeContext &context) {
     return runtimeBackendState<VulkanContextState>(context);
-}
-
-inline VulkanBufferState &vulkanBufferState(VernonDeviceBuffer &buffer) {
-    return runtimeBackendState<VulkanBufferState>(buffer);
-}
-
-inline const VulkanBufferState &vulkanBufferState(const VernonDeviceBuffer &buffer) {
-    return runtimeBackendState<VulkanBufferState>(buffer);
-}
-
-inline VulkanTextureState &vulkanTextureState(VernonDeviceTexture &texture) {
-    return runtimeBackendState<VulkanTextureState>(texture);
-}
-
-inline const VulkanTextureState &vulkanTextureState(const VernonDeviceTexture &texture) {
-    return runtimeBackendState<VulkanTextureState>(texture);
-}
-
-inline VulkanSamplerState &vulkanSamplerState(VernonDeviceSampler &sampler) {
-    return runtimeBackendState<VulkanSamplerState>(sampler);
-}
-
-inline const VulkanSamplerState &vulkanSamplerState(const VernonDeviceSampler &sampler) {
-    return runtimeBackendState<VulkanSamplerState>(sampler);
 }
 
 struct VulkanPipelineState {
@@ -67,6 +44,7 @@ struct VulkanPipelineState {
             EXTERNAL_TEXTURE,
             EXTERNAL_SAMPLER,
             EXTERNAL_UNIFORM,
+            EXTERNAL_STORAGE,
             IMPLICIT_SAMPLER,
             RESOLUTION
         };
@@ -95,29 +73,6 @@ struct VulkanPipelineState {
     uint32_t rhiGraphicsTopology{};
 };
 #endif
-
-bool probeVulkan(std::string &diagnostic);
-bool initializeVulkanContext(VernonRuntimeContext &context, uint32_t deviceIndex);
-void destroyVulkanContext(VernonRuntimeContext &context);
-VernonStatus synchronizeVulkan(VernonRuntimeContext &context);
-
-#if defined(VERNON_HAS_VULKAN_RUNTIME)
-bool createVulkanBuffer(VernonRuntimeContext &context, VkDeviceSize size, VkBuffer &buffer, VkDeviceMemory &memory);
-void transitionVulkanImageLayout(VkCommandBuffer command, VernonDeviceTexture &texture, VkImageLayout newLayout);
-bool beginVulkanCommands(VernonRuntimeContext &context, VkCommandBuffer &command, std::string &error);
-bool submitVulkanCommands(VernonRuntimeContext &context, VkCommandBuffer command, std::string &error);
-#endif
-bool createVulkanBuffer(VernonDeviceBuffer &buffer);
-void destroyVulkanBuffer(VernonDeviceBuffer &buffer);
-VernonStatus copyToVulkanBuffer(VernonDeviceBuffer &buffer, size_t offset, const void *source, size_t size);
-VernonStatus copyFromVulkanBuffer(const VernonDeviceBuffer &buffer, size_t offset, void *destination, size_t size);
-
-bool createVulkanTexture(VernonDeviceTexture &texture);
-void destroyVulkanTexture(VernonDeviceTexture &texture);
-VernonStatus copyToVulkanTexture(VernonDeviceTexture &texture, const void *source, size_t size);
-VernonStatus copyFromVulkanTexture(const VernonDeviceTexture &texture, void *destination, size_t size);
-bool createVulkanSampler(VernonDeviceSampler &sampler);
-void destroyVulkanSampler(VernonDeviceSampler &sampler);
 
 } // namespace vernon::runtime
 

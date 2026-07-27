@@ -169,15 +169,31 @@ LogicalResult decomposeAggregateValue(Type type, Value value, SmallVectorImpl<Va
     return success();
 }
 
-Value storageLeafIndex(Value recordIndex, uint64_t recordSize, const StorageLeaf &leaf, OpBuilder &builder,
-                       Location location) {
+Value storageLeafIndex(Value recordIndex, uint64_t recordSize, const StorageLeaf &leaf, uint64_t scalarIndex,
+                       OpBuilder &builder, Location location) {
     uint64_t leafSize = std::max<uint64_t>(leaf.type.getIntOrFloatBitWidth() / 8, 1);
     Value stride = arith::ConstantIndexOp::create(builder, location, recordSize / leafSize);
     Value result = arith::MulIOp::create(builder, location, recordIndex, stride);
-    if (leaf.byteOffset) {
-        Value offset = arith::ConstantIndexOp::create(builder, location, leaf.byteOffset / leafSize);
+    const uint64_t scalarOffset = leaf.byteOffset / leafSize + scalarIndex;
+    if (scalarOffset) {
+        Value offset = arith::ConstantIndexOp::create(builder, location, scalarOffset);
         result = arith::AddIOp::create(builder, location, result, offset);
     }
+    return result;
+}
+
+FailureOr<Value> emitStorageLoad(const ViewExpansion &expansion, Value recordIndex, ModuleOp module, OpBuilder &builder,
+                                 Location location) {
+    SmallVector<Value> leaves;
+    for (auto [leaf, storage] : llvm::zip_equal(expansion.layout.leaves, expansion.storages))
+        for (uint64_t scalarIndex = 0; scalarIndex < leaf.scalarCount; ++scalarIndex)
+            leaves.push_back(memref::LoadOp::create(
+                builder, location, storage,
+                storageLeafIndex(recordIndex, expansion.layout.size, leaf, scalarIndex, builder, location)));
+    unsigned cursor = 0;
+    FailureOr<Value> result = buildAggregateValue(expansion.elementType, leaves, cursor, module, builder, location);
+    if (failed(result) || cursor != leaves.size())
+        return failure();
     return result;
 }
 
@@ -258,14 +274,28 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
             SmallVector<Type> kernelArgumentTypes;
             DenseMap<unsigned, std::pair<unsigned, unsigned>> sourceArgumentRanges;
             SmallVector<InlineTensorArgument> inlineTensorArguments;
+            DenseMap<unsigned, TensorType> aggregateTensorArguments;
             SmallVector<std::pair<unsigned, std::pair<unsigned, unsigned>>> resourceBindings;
             for (auto [index, type] : llvm::enumerate(source.getArgumentTypes())) {
                 InterfaceAttrs attrs = parseInterfaceAttrs(source.getArgAttrDict(index));
                 auto kind = dyn_cast_if_present<StringAttr>(attrs.kind);
-                if (!attrs.builtin && isa<TensorType>(type)) {
-                    source.emitError() << "aggregate-element Tensor-by-value compute argument #" << index
-                                       << " is not supported; use a scalar-element static Tensor";
-                    return signalPassFailure();
+                if (!attrs.builtin) {
+                    if (auto tensor = dyn_cast<TensorType>(type)) {
+                        FailureOr<StorageLayout> layout = resolveStorageLayout(tensor.getElementType(), module);
+                        if (failed(layout) || layout->leaves.empty()) {
+                            source.emitError() << "cannot lower aggregate Tensor-by-value argument #" << index;
+                            return signalPassFailure();
+                        }
+                        unsigned firstKernelIndex = kernelArgumentTypes.size();
+                        for (const StorageLeaf &leaf : layout->leaves) {
+                            unsigned kernelIndex = kernelArgumentTypes.size();
+                            kernelArgumentTypes.push_back(convertStorageLeaf(leaf.type, useSpirvStorage));
+                            resourceBindings.emplace_back(kernelIndex, std::make_pair(0u, kernelIndex));
+                        }
+                        sourceArgumentRanges[index] = {firstKernelIndex, layout->leaves.size()};
+                        aggregateTensorArguments[index] = tensor;
+                        continue;
+                    }
                 }
                 if (!attrs.builtin) {
                     if (auto tensor = dyn_cast<RankedTensorType>(type)) {
@@ -343,6 +373,34 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
             DenseMap<Value, ViewExpansion> kernelViewExpansions;
             for (auto [sourceIndex, range] : sourceArgumentRanges) {
                 Value first = entry->getArgument(range.first);
+                auto aggregateTensor = aggregateTensorArguments.find(sourceIndex);
+                if (aggregateTensor != aggregateTensorArguments.end()) {
+                    FailureOr<StorageLayout> layout =
+                        resolveStorageLayout(aggregateTensor->second.getElementType(), module);
+                    if (failed(layout))
+                        return signalPassFailure();
+                    ViewExpansion expansion{aggregateTensor->second.getElementType(), *layout, {}};
+                    expansion.storages.append(entry->getArguments().begin() + range.first,
+                                              entry->getArguments().begin() + range.first + range.second);
+                    int64_t elementCount = 1;
+                    for (int64_t dimension : aggregateTensor->second.getShape())
+                        elementCount *= dimension;
+                    SmallVector<Value> elements;
+                    for (int64_t index = 0; index < elementCount; ++index) {
+                        Value recordIndex = arith::ConstantIndexOp::create(bodyBuilder, source.getLoc(), index);
+                        FailureOr<Value> element =
+                            emitStorageLoad(expansion, recordIndex, module, bodyBuilder, source.getLoc());
+                        if (failed(element))
+                            return signalPassFailure();
+                        elements.push_back(*element);
+                    }
+                    OperationState state(source.getLoc(), IntrinsicOp::getOperationName());
+                    state.addOperands(elements);
+                    state.addTypes(aggregateTensor->second);
+                    state.addAttribute("name", bodyBuilder.getStringAttr("construct"));
+                    mapping.map(source.getArgument(sourceIndex), bodyBuilder.create(state)->getResult(0));
+                    continue;
+                }
                 mapping.map(source.getArgument(sourceIndex), first);
                 auto view = dyn_cast<TensorViewType>(source.getArgument(sourceIndex).getType());
                 if (!view)
@@ -418,9 +476,11 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                                     Location location) -> FailureOr<Value> {
                 SmallVector<Value> leaves;
                 for (auto [leaf, storage] : llvm::zip_equal(expansion.layout.leaves, expansion.storages))
-                    leaves.push_back(memref::LoadOp::create(
-                        builder, location, storage,
-                        storageLeafIndex(recordIndex, expansion.layout.size, leaf, builder, location)));
+                    for (uint64_t scalarIndex = 0; scalarIndex < leaf.scalarCount; ++scalarIndex)
+                        leaves.push_back(
+                            memref::LoadOp::create(builder, location, storage,
+                                                   storageLeafIndex(recordIndex, expansion.layout.size, leaf,
+                                                                    scalarIndex, builder, location)));
                 unsigned cursor = 0;
                 FailureOr<Value> result =
                     buildAggregateValue(expansion.elementType, leaves, cursor, module, builder, location);
@@ -431,15 +491,18 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
             auto emitViewStore = [&](const ViewExpansion &expansion, Value recordIndex, Value value, OpBuilder &builder,
                                      Location location) -> LogicalResult {
                 SmallVector<Value> leaves;
-                if (failed(decomposeAggregateValue(expansion.elementType, value, leaves, module, builder, location)) ||
-                    leaves.size() != expansion.layout.leaves.size())
+                if (failed(decomposeAggregateValue(expansion.elementType, value, leaves, module, builder, location)))
                     return failure();
-                for (auto [leaf, storage, stored] :
-                     llvm::zip_equal(expansion.layout.leaves, expansion.storages, leaves))
-                    memref::StoreOp::create(
-                        builder, location, stored, storage,
-                        storageLeafIndex(recordIndex, expansion.layout.size, leaf, builder, location));
-                return success();
+                unsigned cursor = 0;
+                for (auto [leaf, storage] : llvm::zip_equal(expansion.layout.leaves, expansion.storages))
+                    for (uint64_t scalarIndex = 0; scalarIndex < leaf.scalarCount; ++scalarIndex) {
+                        if (cursor >= leaves.size())
+                            return failure();
+                        memref::StoreOp::create(
+                            builder, location, leaves[cursor++], storage,
+                            storageLeafIndex(recordIndex, expansion.layout.size, leaf, scalarIndex, builder, location));
+                    }
+                return success(cursor == leaves.size());
             };
 
             for (Operation &operation : source.front()) {

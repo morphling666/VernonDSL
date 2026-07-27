@@ -303,7 +303,7 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     memcpy(&magic, spirv.data, sizeof(magic));
     ASSERT_TRUE(magic == 0x07230203u);
     VernonStringView vulkan_reflection = vernonCompileResultGetReflection(vulkan_compile);
-    ASSERT_TRUE(view_contains(vulkan_reflection, "\"schema_version\":3"));
+    ASSERT_TRUE(view_contains(vulkan_reflection, "\"schema_version\":4"));
     ASSERT_TRUE(view_contains(vulkan_reflection, "\"target\":\"vulkan\""));
     ASSERT_TRUE(view_contains(vulkan_reflection, "\"entry_point\":\"vertex_main\""));
     ASSERT_TRUE(view_contains(vulkan_reflection, "\"filename\":\"module.spv\""));

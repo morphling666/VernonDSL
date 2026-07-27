@@ -87,7 +87,9 @@ if(TARGET VernonRuntime)
         runtime/runtime_common_api_test.cpp
         runtime/runtime_cpu_pipeline_test.cpp
         runtime/runtime_external_gl_test.cpp
-        runtime/tensor_bridge_test.cpp)
+        runtime/structured_value_binding_test.cpp
+        runtime/tensor_bridge_test.cpp
+        runtime/vertex_attribute_capabilities_test.cpp)
     set_target_properties(VernonRuntimeTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/source")
     target_include_directories(VernonRuntimeTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
                                                           "${VERNON_TEST_ROOT}/support")

@@ -1,4 +1,5 @@
 #include "runtime/content_hash.h"
+#include "runtime_rhi_test_utils.h"
 #include "vernon-c/Runtime.h"
 
 #include <nlohmann/json.hpp>
@@ -70,24 +71,37 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
       "cpu_arguments_size": 12,
       "arguments": [
         {"kind": "tensor", "dtype": "f32", "shape": [4],
+         "element_layout": {"logical_type":"f32","byte_size":4,"alignment":4,
+          "layout_hash":"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",
+          "leaves":[{"path":[],"dtype":"f32","byte_offset":0,"scalar_count":1}]},
          "alignment": 4, "cpu_offset": 0, "cpu_size": 8},
-        {"kind": "scalar", "dtype": "f32", "alignment": 4,
+        {"kind": "scalar", "dtype": "f32",
+         "element_layout": {"logical_type":"f32","byte_size":4,"alignment":4,
+          "layout_hash":"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",
+          "leaves":[{"path":[],"dtype":"f32","byte_offset":0,"scalar_count":1}]},
+         "alignment": 4,
          "cpu_offset": 8, "cpu_size": 4}
       ]
     }]
   })";
     const std::string ptxHash = vernon::runtime::sha256Hex(ptx, sizeof(ptx) - 1);
-    std::string bundle = R"({"schema_version":3,"invocation_abi_version":4,)"
+    std::string bundle = R"({"schema_version":4,"invocation_abi_version":6,)"
                          R"("type":"pipeline","id":"cuda/scale","target":"cuda",)"
                          R"("features":[],"runtime_requirements":{"backend":"cuda",)"
                          R"("features":[],"ptx_version":[8,0],)"
                          R"("minimum_compute_capability":[8,0],"address_size":64},)"
                          R"("variants":[{"key":[],"parameters":[)"
-                         R"({"slot":0,"name":"output","kind":"tensor","dtype":"f32",)"
+                         R"({"slot":0,"name":"output","kind":"tensor","element_layout":)"
+                         R"({"logical_type":"f32","byte_size":4,"alignment":4,)"
+                         R"("layout_hash":"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",)"
+                         R"("leaves":[{"path":[],"dtype":"f32","byte_offset":0,"scalar_count":1}]},)"
                          R"("shape":[4],"access":"write","uses":[{"stage":"compute",)"
                          R"("entry":"scale","index":0,"kind":"tensor","dtype":"f32",)"
                          R"("shape":[4],"interface":"storage","access":"write"}]},)"
-                         R"({"slot":1,"name":"factor","kind":"tensor","dtype":"f32",)"
+                         R"({"slot":1,"name":"factor","kind":"tensor","element_layout":)"
+                         R"({"logical_type":"f32","byte_size":4,"alignment":4,)"
+                         R"("layout_hash":"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",)"
+                         R"("leaves":[{"path":[],"dtype":"f32","byte_offset":0,"scalar_count":1}]},)"
                          R"("shape":[],"access":"read","uses":[{"stage":"compute",)"
                          R"("entry":"scale","index":1,"kind":"scalar","dtype":"f32",)"
                          R"("shape":[],"interface":"value","access":"read"}]})"
@@ -109,7 +123,8 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
         GTEST_SKIP() << "CUDA runtime backend is unavailable";
     }
 
-    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CUDA, nullptr);
+    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_CUDA);
+    VernonRuntimeContext *runtime = context.runtime;
     ASSERT_TRUE(runtime);
     VernonPipelineBundleLoadOptions options{};
     options.struct_size = sizeof(options);
@@ -131,7 +146,9 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
     ASSERT_TRUE(vernonRuntimeLoadedPipelineGetParameterCount(pipeline) == 2);
     VernonPipelineParameterView parameter{};
     ASSERT_TRUE(vernonRuntimeLoadedPipelineGetParameterByIndex(pipeline, 0, &parameter) == VERNON_STATUS_OK);
-    ASSERT_TRUE(parameter.slot == 0 && parameter.kind == VERNON_PIPELINE_TENSOR && parameter.dtype == VERNON_DATA_F32 &&
+    ASSERT_TRUE(parameter.slot == 0 && parameter.kind == VERNON_PIPELINE_TENSOR &&
+                parameter.element_layout.leaf_count == 1 &&
+                parameter.element_layout.leaves[0].dtype == VERNON_DATA_F32 &&
                 parameter.access == VERNON_ACCESS_WRITE && parameter.rank == 1 && parameter.static_shape[0] == 4);
     ASSERT_TRUE(vernonRuntimeLoadedPipelineFindParameter(pipeline, {"factor", std::strlen("factor")}, &parameter) ==
                 VERNON_STATUS_OK);
@@ -144,8 +161,8 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
                 pipelineOutput.access == VERNON_ACCESS_WRITE && pipelineOutput.rank == 1 &&
                 pipelineOutput.static_shape[0] == 4 && pipelineOutput.location == 0);
 
-    VernonDeviceBuffer *buffer = vernonRuntimeBufferAllocate(runtime, 4 * sizeof(float), alignof(float));
-    ASSERT_TRUE(buffer);
+    auto buffer = vernon::tests::createBuffer(context, 4 * sizeof(float), alignof(float), VERNON_RHI_BUFFER_STORAGE);
+    ASSERT_NE(buffer.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     const uint64_t shape[] = {4};
     const int64_t strides[] = {sizeof(float)};
     const float factor = 3.0f;
@@ -153,9 +170,9 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
     arguments[0].slot = 0;
     arguments[0].kind = VERNON_PIPELINE_TENSOR;
     arguments[0].tensor.struct_size = sizeof(VernonTensorView);
-    arguments[0].tensor.storage = VERNON_TENSOR_DEVICE;
-    arguments[0].tensor.buffer = buffer;
-    arguments[0].tensor.dtype = VERNON_DATA_F32;
+    arguments[0].tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    arguments[0].tensor.resource = buffer.reference;
+    arguments[0].tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
     arguments[0].tensor.access = VERNON_ACCESS_WRITE;
     arguments[0].tensor.rank = 1;
     arguments[0].tensor.shape = shape;
@@ -166,7 +183,7 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
     arguments[1].tensor.struct_size = sizeof(VernonTensorView);
     arguments[1].tensor.storage = VERNON_TENSOR_HOST;
     arguments[1].tensor.host_data = &factor;
-    arguments[1].tensor.dtype = VERNON_DATA_F32;
+    arguments[1].tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
     arguments[1].tensor.access = VERNON_ACCESS_READ;
     arguments[1].tensor.byte_size = sizeof(factor);
     VernonPipelineInvocation invocation{};
@@ -179,12 +196,14 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
     ASSERT_TRUE(vernonRuntimeSynchronize(runtime) == VERNON_STATUS_OK);
 
     float output[4]{};
-    ASSERT_TRUE(vernonRuntimeCopyToHost(buffer, 0, output, sizeof(output)) == VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(context.device, buffer.handle, 0, output, sizeof(output)),
+              VERNON_RHI_STATUS_OK);
     for (int index = 0; index < 4; ++index)
         ASSERT_TRUE(output[index] == static_cast<float>(index) * factor);
 
-    ASSERT_TRUE(vernonRuntimeBufferFree(buffer) == VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyBuffer(context.device, buffer.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     vernonRuntimePipelineBundleDestroy(loaded);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
+    vernonRhiDestroyDevice(context.device);
 }

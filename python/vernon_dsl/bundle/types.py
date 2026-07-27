@@ -170,8 +170,8 @@ class BundlePlan:
         from .requirements import runtime_requirements
 
         result = {
-            "schema_version": 3,
-            "invocation_abi_version": 4,
+            "schema_version": 4,
+            "invocation_abi_version": 6,
             "type": "pipeline",
             "id": self.pipeline_id,
             "target": self.target.target,

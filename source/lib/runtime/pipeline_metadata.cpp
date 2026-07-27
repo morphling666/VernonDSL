@@ -1,4 +1,5 @@
 #include "pipeline_metadata.h"
+#include "pipeline_manifest.h"
 
 #include <nlohmann/json.hpp>
 
@@ -52,11 +53,20 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                                                       leaf["binding"].get<uint32_t>()});
                 }
             }
-            const std::string dtype = value.value("dtype", "");
-            const size_t elementSize = value.value("element_abi_size", dtype == "f64"    ? size_t{8}
-                                                                       : dtype == "f16"  ? size_t{2}
-                                                                       : dtype == "bool" ? size_t{1}
-                                                                                         : size_t{4});
+            size_t elementSize = 0;
+            if (argument.kind == "tensor") {
+                auto layout = value.find("element_layout");
+                if (layout == value.end() || !layout->is_object() || !layout->contains("byte_size") ||
+                    !(*layout)["byte_size"].is_number_unsigned()) {
+                    error = "Tensor reflection has no canonical element layout";
+                    return false;
+                }
+                elementSize = (*layout)["byte_size"].get<size_t>();
+                if (!elementSize) {
+                    error = "Tensor reflection has an empty canonical element layout";
+                    return false;
+                }
+            }
             argument.tensorElementSize = elementSize;
             if (value.contains("shape") && value["shape"].is_array()) {
                 size_t elements = 1;
@@ -110,6 +120,15 @@ std::optional<VernonDataType> pipelineDataType(const std::string &dtype) {
     if (dtype == "u8")
         return VERNON_DATA_U8;
     return std::nullopt;
+}
+
+VernonValueLayoutView pipelineValueLayout(const ValueLayout &layout) {
+    return {sizeof(VernonValueLayoutView),
+            layout.byteSize,
+            layout.alignment,
+            {layout.layoutHash.data(), layout.layoutHash.size()},
+            layout.abiLeaves.empty() ? nullptr : layout.abiLeaves.data(),
+            layout.abiLeaves.size()};
 }
 
 std::optional<VernonValueAccess> pipelineValueAccess(const std::string &access) {

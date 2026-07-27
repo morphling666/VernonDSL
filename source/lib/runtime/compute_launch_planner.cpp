@@ -21,8 +21,7 @@ bool fail(std::string &error, const char *message) {
 }
 
 bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &arguments,
-                          const VernonPipelineInvocation &invocation, const void *expectedContext,
-                          const ComputePlannerCallbacks &callbacks, PlannedComputeLaunch &plan, std::string &error) {
+                          const VernonPipelineInvocation &invocation, PlannedComputeLaunch &plan, std::string &error) {
     size_t computeArgumentCount = 0;
     for (const Parameter &parameter : variant.parameters)
         for (const ParameterUse &use : parameter.uses)
@@ -47,14 +46,7 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
             ComputeLaunchArgument &argument = plan.arguments[use.index];
             if (supplied.kind != VERNON_PIPELINE_TENSOR)
                 return fail(error, "compute argument kind is unsupported");
-            if (supplied.tensor.storage == VERNON_TENSOR_DEVICE) {
-                if (!supplied.tensor.buffer || !callbacks.bufferContext ||
-                    callbacks.bufferContext(callbacks.userData, supplied.tensor.buffer) != expectedContext ||
-                    !tensorFitsAllocation(supplied.tensor))
-                    return fail(error, "compute device Tensor view is invalid");
-                argument.kind = ComputeLaunchArgumentKind::Tensor;
-                argument.buffer = supplied.tensor.buffer;
-            } else if (supplied.tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
+            if (supplied.tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
                 if (!supplied.tensor.resource.identity || !supplied.tensor.resource.resource.value ||
                     supplied.tensor.byte_offset > supplied.tensor.resource.size ||
                     supplied.tensor.byte_size > supplied.tensor.resource.size)
@@ -62,12 +54,22 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
                 argument.kind = ComputeLaunchArgumentKind::Tensor;
                 argument.resource = supplied.tensor.resource;
             } else {
+                if (use.interfaceKind == "storage") {
+                    if (supplied.tensor.storage != VERNON_TENSOR_HOST || !supplied.tensor.host_data ||
+                        !tensorFitsAllocation(supplied.tensor))
+                        return fail(error, "compute host storage Tensor is invalid");
+                    argument.kind = ComputeLaunchArgumentKind::Tensor;
+                    argument.hostData = supplied.tensor.host_data;
+                    argument.hostSize = supplied.tensor.byte_size;
+                    assigned[use.index] = 1;
+                    continue;
+                }
                 argument.kind = ComputeLaunchArgumentKind::Scalar;
                 if (use.uniformLayout) {
                     if (use.uniformLayout->size > std::numeric_limits<size_t>::max())
                         return fail(error, "compute Tensor physical size exceeds the host size range");
                     TensorPackingLayout layout;
-                    layout.dtype = supplied.tensor.dtype;
+                    layout.elementSize = supplied.tensor.element_layout.byte_size;
                     layout.shape = use.shape.empty() ? parameter.shape : use.shape;
                     layout.byteSize = static_cast<size_t>(use.uniformLayout->size);
                     for (uint64_t stride : use.uniformLayout->byteStrides) {
@@ -108,9 +110,7 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
             if (argumentIt == arguments.end())
                 continue;
             const VernonPipelineArgument &argument = *argumentIt->second;
-            if (argument.kind != VERNON_PIPELINE_TENSOR ||
-                (argument.tensor.storage != VERNON_TENSOR_DEVICE &&
-                 argument.tensor.storage != VERNON_TENSOR_RHI_RESOURCE) ||
+            if (argument.kind != VERNON_PIPELINE_TENSOR || argument.tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
                 !argument.tensor.rank || !argument.tensor.shape)
                 continue;
             const uint32_t rank = argument.tensor.rank;
@@ -136,7 +136,6 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
 } // namespace
 
 bool planComputeInvocation(const Variant &variant, const VernonPipelineInvocation &invocation,
-                           const void *expectedContext, const ComputePlannerCallbacks &callbacks,
                            PlannedComputeLaunch &plan, std::string &error) {
     ComputeArgumentMap arguments;
     for (size_t index = 0; index < invocation.argument_count; ++index)
@@ -150,12 +149,11 @@ bool planComputeInvocation(const Variant &variant, const VernonPipelineInvocatio
         if (found == arguments.end() || parameter.kind != "tensor" || found->second->kind != VERNON_PIPELINE_TENSOR)
             return fail(error, "pipeline argument kind does not match layout");
         const VernonTensorView &tensor = found->second->tensor;
-        const std::optional<VernonDataType> dtype = pipelineDataType(parameter.dtype);
-        if (!dtype || tensor.struct_size < sizeof(VernonTensorView) || tensor.dtype != *dtype ||
+        if (tensor.struct_size < sizeof(VernonTensorView) ||
+            !valueLayoutsEqual(tensor.element_layout, pipelineValueLayout(parameter.elementLayout)) ||
             tensor.access > VERNON_ACCESS_READ_WRITE ||
-            (tensor.storage != VERNON_TENSOR_HOST && tensor.storage != VERNON_TENSOR_DEVICE &&
-             tensor.storage != VERNON_TENSOR_RHI_RESOURCE) ||
-            (tensor.storage != VERNON_TENSOR_RHI_RESOURCE && !tensorFitsAllocation(tensor)))
+            (tensor.storage != VERNON_TENSOR_HOST && tensor.storage != VERNON_TENSOR_RHI_RESOURCE) ||
+            (tensor.storage == VERNON_TENSOR_HOST && !tensorFitsAllocation(tensor)))
             return fail(error, "pipeline Tensor argument does not match layout");
         if (parameter.source != "direct") {
             const bool allowLeading = std::any_of(parameter.uses.begin(), parameter.uses.end(),
@@ -170,7 +168,7 @@ bool planComputeInvocation(const Variant &variant, const VernonPipelineInvocatio
         if (tensor.storage == VERNON_TENSOR_HOST && !tensor.host_data)
             return fail(error, "pipeline Tensor argument does not match layout");
     }
-    return planComputeArguments(variant, arguments, invocation, expectedContext, callbacks, plan, error);
+    return planComputeArguments(variant, arguments, invocation, plan, error);
 }
 
 } // namespace vernon::runtime

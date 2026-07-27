@@ -47,11 +47,11 @@ VernonStatus invokeCpuComputePipeline(VernonLoadedPipeline &pipeline, const Plan
         value.slot = layout.slot;
         value.kind = layout.kind;
         if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            if (argument.kind != ComputeLaunchArgumentKind::Tensor || !argument.buffer)
-                return fail(*pipeline.context, "CPU storage binding requires a device Tensor");
+            if (argument.kind != ComputeLaunchArgumentKind::Tensor || !argument.hostData || !argument.hostSize)
+                return fail(*pipeline.context, "CPU storage binding requires a host Tensor");
             value.resource.identity = cpuProviderResourceIdentity(*pipeline.context);
-            value.resource.resource.value = reinterpret_cast<uintptr_t>(argument.buffer);
-            value.resource.size = argument.buffer->size;
+            value.resource.resource.value = reinterpret_cast<uintptr_t>(argument.hostData);
+            value.resource.size = argument.hostSize;
         } else {
             if (argument.kind != ComputeLaunchArgumentKind::Scalar || !argument.scalarData || !argument.scalarSize)
                 return fail(*pipeline.context, "CPU inline binding requires host data");

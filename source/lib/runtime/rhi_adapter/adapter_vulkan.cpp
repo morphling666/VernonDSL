@@ -1,3 +1,4 @@
+#include "../vertex_attribute_capabilities.h"
 #include "adapter_common.h"
 
 #if defined(VERNON_HAS_VULKAN_RHI)
@@ -262,14 +263,19 @@ VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayout
                     return entry.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER &&
                            entry.layout.binding == attribute.binding;
                 });
+            std::string capabilityDiagnostic;
+            if (!bindingExists)
+                return fail(adapter, "Vulkan vertex attribute references an unknown binding");
+            if (!validateVertexAttributeCapability(VertexAttributeBackend::Vulkan, attribute,
+                                                   layout->device->maxVertexInputAttributes, true,
+                                                   capabilityDiagnostic))
+                return fail(adapter, std::move(capabilityDiagnostic));
             VkFormatProperties properties{};
             if (format != VK_FORMAT_UNDEFINED)
                 rhi::vulkan::driver().getPhysicalDeviceFormatProperties(layout->device->physicalDevice, format,
                                                                         &properties);
-            if (!bindingExists || format == VK_FORMAT_UNDEFINED ||
-                !(properties.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) ||
-                attribute.location >= layout->device->maxVertexInputAttributes)
-                return fail(adapter, "Vulkan vertex attribute exceeds device location or format capabilities");
+            if (format == VK_FORMAT_UNDEFINED || !(properties.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT))
+                return fail(adapter, "Vulkan vertex attribute format is unsupported by the selected device");
             layout->vertexAttributes.push_back(attribute);
         }
     } catch (const std::bad_alloc &) {

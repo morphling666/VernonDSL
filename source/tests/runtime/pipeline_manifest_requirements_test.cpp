@@ -150,7 +150,15 @@ TEST(PipelineManifestRequirements, ParsesReflectedUniformTensorLayout) {
          nlohmann::json::array({{{"slot", 0},
                                  {"name", "weights"},
                                  {"kind", "tensor"},
-                                 {"dtype", "f32"},
+                                 {"element_layout",
+                                  {{"logical_type", "f32"},
+                                   {"byte_size", 4},
+                                   {"alignment", 4},
+                                   {"layout_hash", "cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b"},
+                                   {"leaves", nlohmann::json::array({{{"path", nlohmann::json::array()},
+                                                                      {"dtype", "f32"},
+                                                                      {"byte_offset", 0},
+                                                                      {"scalar_count", 1}}})}}},
                                  {"shape", nlohmann::json::array({2, 3})},
                                  {"uses", nlohmann::json::array({{{"stage", "vertex"},
                                                                   {"interface", "uniform"},
@@ -176,6 +184,40 @@ TEST(PipelineManifestRequirements, ParsesReflectedUniformTensorLayout) {
     EXPECT_EQ(layout->alignment, 16u);
     EXPECT_EQ(layout->byteStrides, (std::vector<uint64_t>{16, 4}));
     EXPECT_EQ(layout->matrixOrder, "row_major");
+    ASSERT_EQ(variant.parameters[0].elementLayout.leaves.size(), 1u);
+    EXPECT_TRUE(variant.parameters[0].elementLayout.leaves[0].path.empty());
+}
+
+TEST(PipelineManifestRequirements, ParsesStructuredLeafPathsAndStaticShapes) {
+    const nlohmann::json layout = {
+        {"logical_type", "!vernon.struct<\"Payload\">"},
+        {"struct_name", "Payload"},
+        {"byte_size", 24},
+        {"alignment", 4},
+        {"layout_hash", "layout"},
+        {"leaves", nlohmann::json::array({{{"path", nlohmann::json::array({"nested", 1})},
+                                           {"dtype", "f32"},
+                                           {"byte_offset", 8},
+                                           {"scalar_count", 4},
+                                           {"shape", nlohmann::json::array({2, 2})}}})},
+    };
+    vernon::runtime::ValueLayout parsed;
+    std::string error;
+    ASSERT_TRUE(vernon::runtime::parsePipelineValueLayout(layout, parsed, error)) << error;
+    ASSERT_EQ(parsed.leaves.size(), 1u);
+    ASSERT_EQ(parsed.leaves[0].path.size(), 2u);
+    EXPECT_EQ(parsed.leaves[0].path[0].field, "nested");
+    EXPECT_FALSE(parsed.leaves[0].path[1].field);
+    EXPECT_EQ(parsed.leaves[0].path[1].index, 1u);
+    EXPECT_EQ(parsed.leaves[0].shape, (std::vector<uint64_t>{2, 2}));
+    ASSERT_EQ(parsed.leaves[0].abiPath.size(), 2u);
+    EXPECT_EQ(parsed.leaves[0].abiPath[0].kind, VERNON_VALUE_PATH_FIELD);
+    EXPECT_EQ(parsed.leaves[0].abiPath[1].kind, VERNON_VALUE_PATH_INDEX);
+
+    nlohmann::json invalid = layout;
+    invalid["leaves"][0]["shape"] = nlohmann::json::array({4, 2});
+    EXPECT_FALSE(vernon::runtime::parsePipelineValueLayout(invalid, parsed = {}, error));
+    EXPECT_NE(error.find("scalar_count"), std::string::npos);
 }
 
 } // namespace

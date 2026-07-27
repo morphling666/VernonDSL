@@ -730,3 +730,58 @@ module {
     vernonCompileResultDestroy(result);
     vernonCompilerDestroy(compiler);
 }
+
+TEST(CompilerGraphicsOutput, LowersAndReflectsMixedDtypeStructAttributes) {
+    constexpr std::string_view aggregateModule = R"mlir(
+module {
+  "vernon.struct"() {
+    sym_name = "Vertex",
+    fields = ["position:tensor<3xf32>", "object_id:i32", "uv:tensor<2xf32>"],
+    abi_leaf_dtypes = ["f32", "u32", "f32"],
+    abi_size = 24 : i64,
+    abi_alignment = 4 : i64,
+    abi_field_offsets = array<i64: 0, 12, 16>
+  } : () -> ()
+  func.func @aggregate_vertex(
+      %value: !vernon.struct<"Vertex"> {
+        vernon.interface = "input",
+        vernon.location = 0 : i64,
+        vernon.source_name = "value"
+      }) -> (tensor<4xf32> {
+        vernon.interface = "output",
+        vernon.builtin = "position"
+      }) attributes {vernon.entry, vernon.stage = "vertex"} {
+    %position = "vernon.struct_get"(%value) {
+      field = "position", index = 0 : i64
+    } : (!vernon.struct<"Vertex">) -> tensor<3xf32>
+    %one = arith.constant 1.0 : f32
+    %result = "vernon.intrinsic"(%position, %one) {
+      name = "construct"
+    } : (tensor<3xf32>, f32) -> tensor<4xf32>
+    return %result : tensor<4xf32>
+  }
+}
+)mlir";
+
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *result =
+        vernonCompilerCompileMlir(compiler, aggregateModule.data(), aggregateModule.size(), VERNON_TARGET_VULKAN);
+    ASSERT_TRUE(result);
+    if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
+        const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+        std::fprintf(stderr, "aggregate attribute compile failed: %.*s\n", static_cast<int>(diagnostics.size),
+                     diagnostics.data);
+    }
+    ASSERT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+    const VernonStringView reflection = vernonCompileResultGetReflection(result);
+    const std::string_view reflected(reflection.data, reflection.size);
+    EXPECT_NE(reflected.find("\"schema_version\":4"), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"struct_name\":\"Vertex\""), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"location_span\":3"), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"dtype\":\"u32\""), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"path\":[\"object_id\"]"), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"shape\":[3]"), std::string_view::npos);
+    vernonCompileResultDestroy(result);
+    vernonCompilerDestroy(compiler);
+}

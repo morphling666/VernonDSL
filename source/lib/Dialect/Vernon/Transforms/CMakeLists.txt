@@ -1,6 +1,7 @@
 add_mlir_library(
     MLIRVernonTransforms
     VernonCpuPipeline.cpp
+    VernonAttributeAbi.cpp
     VernonInlineHelpers.cpp
     VernonLowerCPUResources.cpp
     VernonLowerCPUTensors.cpp
@@ -8,6 +9,7 @@ add_mlir_library(
     VernonLowerGPUTensors.cpp
     VernonSharedValuePatterns.cpp
     VernonTensorShapeSemantics.cpp
+    VernonValueAbi.cpp
     VernonValidation.cpp
     VernonToGPU.cpp
     VernonToSpirv.cpp

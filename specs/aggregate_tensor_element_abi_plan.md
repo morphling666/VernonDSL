@@ -32,9 +32,61 @@ must not become public parameter names.
 - Vertex attributes already use explicit numeric leaves, and aggregate
   TensorView lowering already has scalar resource-leaf expansion.
 
-The missing work is to make these paths consume the same recursive layout,
-especially for public runtime Tensor descriptors, static Tensor arguments,
-graphics attributes, reflection, and C++ binding.
+## Current implementation status
+
+### Completed
+
+- Python and C++ now have matching recursive Value ABI and attribute planners
+  for scalars, static Tensors, Tuples, and nominal Structs. They emit canonical
+  sizes, alignments, field offsets, element strides, semantic leaves, paths,
+  logical dtypes, attribute leaves, and layout hashes.
+- The old scalar-only `StaticAttributePlan`, `element_abi_size`, unnamed Struct
+  field fallback, and obsolete schema compatibility branches have been
+  removed.
+- The Python frontend emits canonical ABI metadata, preserves logical aggregate
+  element types, allocates expanded attribute locations, and carries logical
+  integer signedness separately from MLIR's signless integer storage types.
+- Direct MLIR validation recomputes layouts and rejects inconsistent sizes,
+  offsets, leaves, paths, dtypes, and hashes.
+- CPU, CUDA/GPU, and SPIR-V lowering can construct, decompose, reconstruct,
+  load, and store aggregate Values. Storage projection preserves each
+  semantic leaf's scalar count, including nested static Tensor fields.
+- Graphics lowering expands mixed-dtype Struct attributes into hardware leaves,
+  reconstructs the source Value, and reflects one source-level parameter.
+- Compiler reflection schema 4 emits canonical `element_layout`,
+  `attribute_leaves`, Struct layouts, and logical dtypes. Multidimensional
+  Tensor layout hashes are identical between Python and C++.
+- Runtime reflection parsing requires `element_layout` instead of
+  `element_abi_size`. Python canonical Struct storage packing, field
+  projection, round-trip conversion, and aggregate TensorView dispatch work on
+  CPU, CUDA, Vulkan, OpenGL, OpenGL ES, and DirectX in the current test
+  environment.
+- Pipeline manifest schema 4 and invocation ABI 5 use canonical recursive
+  `element_layout` descriptors. `VernonTensorView`,
+  `VernonPipelineParameterView`, native Python bindings, launch planners, and
+  `tensor_bridge` no longer depend on a scalar Tensor dtype.
+- OpenGL, OpenGL ES, Vulkan, and DirectX render the same nested Struct vertex
+  attribute containing mixed scalar dtypes and static Tensor fields while
+  reading `Tensor[ComplexAggregateVertex, (2, 3, 4)]` through `vd.uniform()`.
+  Descriptor-backed aggregate uniforms use the canonical Value ABI as a
+  read-only graphics storage resource, avoiding backend-specific uniform
+  repacking. Language coverage includes multidimensional aggregate Tensor
+  indexing and field projection.
+- The public C++ `PipelineInvocationBuilder` resolves reflected field/index
+  paths under one source parameter name and packs structured Values, Tensor
+  structure-of-arrays payloads, and logical-element callbacks into
+  runtime-owned canonical storage. It validates dtypes, scalar static-Tensor
+  shapes, outer Tensor shapes, duplicate bindings, and completeness without
+  reinterpreting native C++ Struct padding.
+- OpenGL, OpenGL ES, Vulkan, and DirectX use one deterministic expanded
+  attribute capability policy before backend-specific device format checks.
+  The test matrix covers every supported aggregate leaf dtype/component
+  family, bool/u8 rejection, backend f16/f64 restrictions, invalid component
+  counts, and expanded location overflow.
+- Current verification passes:
+  - 289 Python tests and 297 subtests;
+  - all 86 configured CTest tests, including compiler, runtime, backend, and
+    integration coverage.
 
 ## Required semantics
 
@@ -242,18 +294,78 @@ Connect `TensorStorage`'s existing canonical packer and element type metadata to
 the native `VernonValueLayoutView`. Tuple/Struct storage must bind by the source
 parameter name exactly like scalar storage.
 
-### C++ ergonomics
+### C++ structured binding
 
-Provide generated or explicitly specialized `VernonValueAbi<T>` descriptors:
+Do not make direct native Struct binding the default C++ API. Even a
+standard-layout C++ type is not a portable declaration of the Vernon canonical
+ABI: compiler, target, packing pragmas, member types, and alignment rules may
+change its padding and offsets.
+
+Keep one public parameter name and pass a structured field tree as its payload:
 
 ```cpp
-builder.bindTensor("vertices", std::span<const Vertex>{vertices});
+builder.bindValue(
+    "value",
+    fields(
+        field("a", int32_t{2}),
+        field("b", 3.0f)
+    )
+);
 ```
 
-The specialization must validate `std::is_standard_layout_v<T>`, `sizeof`,
-`alignof`, and every `offsetof` against the reflected canonical layout. Do not
-accept an arbitrary native C++ Struct merely because its total size matches.
-The C API remains available for callers that provide an explicit layout view.
+The runtime matches `a` and `b` to reflection paths below `"value"` and writes
+them at canonical offsets. Field names are data inside one binding operation;
+`"value.a"` is not a separately registered public parameter.
+
+For Tensor parameters, support SoA field binding:
+
+```cpp
+builder.bindTensor(
+    "t",
+    shape{2, 2},
+    fields(
+        field("a", std::span<const int32_t>{a}),
+        field("b", std::span<const float>{b})
+    )
+);
+```
+
+Each field span covers the complete outer Tensor domain. Nested Struct fields,
+Tuples, and static Tensor fields use nested `fields(...)`, positional
+`elements(...)`, and shaped scalar views rather than one binding call per
+runtime Tensor element.
+
+Also support a packing callback when values are generated or must be gathered
+from an application-specific representation:
+
+```cpp
+builder.bindTensor("t", shape{2, 2}, [](auto element) {
+    element.field("a", /* scalar value for this logical element */);
+    element.field("b", /* scalar value for this logical element */);
+});
+```
+
+The callback iterates the logical Tensor domain and fills one structured
+element at a time into runtime-owned canonical storage. It does not create
+public names such as `"t[0, 0].a"` and does not register one binding per
+element.
+
+Both forms validate reflected field/tuple paths, scalar dtypes, static Tensor
+shapes, outer Tensor shape, duplicate fields, and completeness. The runtime
+packs canonical bytes and padding from reflection. Backend-generated names such
+as `"t.a"`, storage-leaf bindings, and shader variables remain internal
+implementation details.
+
+An explicitly specialized native `std::span<T>` overload may be offered as an
+optional zero-copy fast path. It is accepted only when its descriptor validates
+`std::is_standard_layout_v<T>`, `sizeof(T)`, `alignof(T)`, every reflected
+field's `offsetof`, nested member layout, and scalar dtype against the complete
+canonical layout. A total-size match alone is insufficient. If validation
+fails, callers use structured binding or explicit canonical packing; the
+runtime must not silently reinterpret the native Struct.
+
+The C API remains available for callers that already own canonical bytes and
+provide an explicit `VernonValueLayoutView`.
 
 ## Phase 5: Backend consumption
 
@@ -298,7 +410,8 @@ derive aggregate layout from rank or shape.
 ### Runtime tests
 
 - Python `TensorStorage` round-trip for Struct/Tuple elements.
-- C++ `VernonValueAbi<T>` layout validation and mismatch diagnostics.
+- C++ structured Value binding, Tensor SoA binding, callback packing, optional
+  validated native fast path, and field/type/shape mismatch diagnostics.
 - Binding continues to use source names in Python and C++ when generated
   uniforms/resources use internal names.
 - Ordinary, offset, interleaved, and padded record storage.
@@ -323,6 +436,9 @@ fixtures/assets to the new schemas in the same change.
 - Every accepted ABI-stable Tensor element has identical Python, compiler,
   reflection, and runtime layout.
 - No public API requires generated leaf or uniform names.
+- C++ aggregate binding keeps one public parameter name, resolves its
+  structured payload against reflection, and never assumes a native Struct has
+  the canonical Vernon layout.
 - No backend derives layout from Tensor rank, Matrix aliases, or a single
   parameter dtype.
 - Aggregate storage, static Values, and graphics attributes use the same

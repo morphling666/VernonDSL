@@ -1,8 +1,10 @@
 #include "pipeline_manifest.h"
+#include "pipeline_metadata.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <limits>
 #include <string_view>
 
 namespace vernon::runtime {
@@ -85,13 +87,15 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
             if (!leaf.is_object() || !leaf.contains("location_offset") ||
                 !parseUint64(leaf["location_offset"], locationOffset) || !leaf.contains("component_count") ||
                 !parseUint64(leaf["component_count"], componentCount) || !leaf.contains("byte_offset") ||
-                !parseUint64(leaf["byte_offset"], byteOffset) || locationOffset > UINT32_MAX ||
-                componentCount > UINT32_MAX || byteOffset > UINT32_MAX) {
-                error = "attribute leaf must contain unsigned location_offset, component_count, and byte_offset";
+                !parseUint64(leaf["byte_offset"], byteOffset) || !leaf.contains("dtype") ||
+                !leaf["dtype"].is_string() || locationOffset > UINT32_MAX || componentCount > UINT32_MAX ||
+                byteOffset > UINT32_MAX) {
+                error =
+                    "attribute leaf must contain dtype and unsigned location_offset, component_count, and byte_offset";
                 return false;
             }
-            use.attributeLeaves.push_back({static_cast<uint32_t>(locationOffset), static_cast<uint32_t>(componentCount),
-                                           static_cast<uint32_t>(byteOffset)});
+            use.attributeLeaves.push_back({static_cast<uint32_t>(locationOffset), leaf["dtype"].get<std::string>(),
+                                           static_cast<uint32_t>(componentCount), static_cast<uint32_t>(byteOffset)});
         }
     }
     if (value.contains("uniform_layout")) {
@@ -118,8 +122,8 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
             }
             parsed.byteStrides.push_back(byteStride);
         }
-        if ((parsed.storage != "inline" && parsed.storage != "uniform_buffer") || parsed.size == 0 ||
-            parsed.alignment == 0 ||
+        if ((parsed.storage != "inline" && parsed.storage != "uniform_buffer" && parsed.storage != "storage_buffer") ||
+            parsed.size == 0 || parsed.alignment == 0 ||
             (!parsed.matrixOrder.empty() && parsed.matrixOrder != "row_major" &&
              parsed.matrixOrder != "column_major")) {
             error = "uniform_layout contains unsupported physical layout metadata";
@@ -154,6 +158,96 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
         return false;
     }
     return true;
+}
+
+bool parseValueLayout(const nlohmann::json &value, ValueLayout &layout, std::string &error) {
+    uint64_t byteSize = 0;
+    uint64_t alignment = 0;
+    if (!value.is_object() || !value.contains("logical_type") || !value["logical_type"].is_string() ||
+        !value.contains("layout_hash") || !value["layout_hash"].is_string() || !value.contains("byte_size") ||
+        !parseUint64(value["byte_size"], byteSize) || !value.contains("alignment") ||
+        !parseUint64(value["alignment"], alignment) || !value.contains("leaves") || !value["leaves"].is_array() ||
+        !byteSize || !alignment || byteSize > UINT32_MAX || alignment > UINT32_MAX) {
+        error = "element_layout must contain logical_type, layout_hash, byte_size, alignment, and leaves";
+        return false;
+    }
+    layout.logicalType = value["logical_type"].get<std::string>();
+    layout.structName = value.value("struct_name", "");
+    layout.layoutHash = value["layout_hash"].get<std::string>();
+    layout.byteSize = static_cast<uint32_t>(byteSize);
+    layout.alignment = static_cast<uint32_t>(alignment);
+    if (layout.logicalType.empty() || layout.layoutHash.empty() || (layout.alignment & (layout.alignment - 1))) {
+        error = "element_layout contains invalid type, hash, or alignment";
+        return false;
+    }
+    for (const nlohmann::json &leaf : value["leaves"]) {
+        uint64_t scalarCount = 0;
+        uint64_t byteOffset = 0;
+        if (!leaf.is_object() || !leaf.contains("dtype") || !leaf["dtype"].is_string() ||
+            !leaf.contains("scalar_count") || !parseUint64(leaf["scalar_count"], scalarCount) ||
+            !leaf.contains("byte_offset") || !parseUint64(leaf["byte_offset"], byteOffset) || !leaf.contains("path") ||
+            !leaf["path"].is_array() || !scalarCount || scalarCount > UINT32_MAX || byteOffset > UINT32_MAX) {
+            error = "element_layout leaf must contain path, dtype, scalar_count, and byte_offset";
+            return false;
+        }
+        const std::string dtype = leaf["dtype"].get<std::string>();
+        const auto parsedDtype = pipelineDataType(dtype);
+        if (!parsedDtype || byteOffset >= byteSize) {
+            error = "element_layout leaf has unsupported dtype or byte offset";
+            return false;
+        }
+        ValueLeaf parsedLeaf;
+        parsedLeaf.dtype = dtype;
+        parsedLeaf.scalarCount = static_cast<uint32_t>(scalarCount);
+        parsedLeaf.byteOffset = static_cast<uint32_t>(byteOffset);
+        for (const nlohmann::json &component : leaf["path"]) {
+            if (component.is_string())
+                parsedLeaf.path.push_back({component.get<std::string>(), 0});
+            else {
+                uint64_t index = 0;
+                if (!parseUint64(component, index)) {
+                    error = "element_layout leaf path components must be field names or unsigned indices";
+                    return false;
+                }
+                parsedLeaf.path.push_back({std::nullopt, index});
+            }
+        }
+        if (leaf.contains("shape")) {
+            if (!leaf["shape"].is_array()) {
+                error = "element_layout leaf shape must be an array";
+                return false;
+            }
+            uint64_t shapeCount = 1;
+            for (const nlohmann::json &extentValue : leaf["shape"]) {
+                uint64_t extent = 0;
+                if (!parseUint64(extentValue, extent) || !extent ||
+                    shapeCount > std::numeric_limits<uint64_t>::max() / extent) {
+                    error = "element_layout leaf shape must contain positive non-overflowing extents";
+                    return false;
+                }
+                shapeCount *= extent;
+                parsedLeaf.shape.push_back(extent);
+            }
+            if (shapeCount != scalarCount) {
+                error = "element_layout leaf shape does not match scalar_count";
+                return false;
+            }
+        }
+        layout.leaves.push_back(std::move(parsedLeaf));
+        layout.abiLeaves.push_back({static_cast<uint32_t>(*parsedDtype), static_cast<uint32_t>(scalarCount),
+                                    static_cast<uint32_t>(byteOffset)});
+    }
+    if (layout.leaves.empty()) {
+        error = "element_layout must contain at least one semantic leaf";
+        return false;
+    }
+    rebuildValueLayoutPathViews(layout);
+    return true;
+}
+
+bool isScalarLayout(const ValueLayout &layout, const char *dtype) {
+    return layout.leaves.size() == 1 && layout.leaves[0].dtype == dtype && layout.leaves[0].scalarCount == 1 &&
+           layout.leaves[0].byteOffset == 0;
 }
 
 void parseStaticType(const std::string &type, std::string &dtype, std::vector<uint64_t> &shape) {
@@ -218,6 +312,24 @@ bool hasOnlyKeys(const nlohmann::json &value, std::initializer_list<std::string_
 
 } // namespace
 
+void rebuildValueLayoutPathViews(ValueLayout &layout) {
+    for (ValueLeaf &leaf : layout.leaves) {
+        leaf.abiPath.clear();
+        leaf.abiPath.reserve(leaf.path.size());
+        for (const ValuePathComponent &component : leaf.path) {
+            if (component.field)
+                leaf.abiPath.push_back(
+                    {VERNON_VALUE_PATH_FIELD, {component.field->data(), component.field->size()}, 0});
+            else
+                leaf.abiPath.push_back({VERNON_VALUE_PATH_INDEX, {nullptr, 0}, component.index});
+        }
+    }
+}
+
+bool parsePipelineValueLayout(const nlohmann::json &value, ValueLayout &layout, std::string &error) {
+    return parseValueLayout(value, layout, error);
+}
+
 bool Variant::validate(std::string &error) const {
     const auto validTextureDimension = [](const std::string &dimension) {
         return dimension == "2d" || dimension == "3d" || dimension == "cube";
@@ -266,7 +378,7 @@ bool Variant::validate(std::string &error) const {
         const bool implicitSampler =
             parameter.source == "implicit_sampler" && parameter.kind == "sampler" && parameter.systemValue.empty();
         const bool resolution = parameter.source == "system_value" && parameter.systemValue == "resolution" &&
-                                parameter.kind == "tensor" && parameter.dtype == "f32" &&
+                                parameter.kind == "tensor" && isScalarLayout(parameter.elementLayout, "f32") &&
                                 parameter.shape == std::vector<uint64_t>{2};
         if (parameter.name.empty() || parameter.uses.empty() || (!implicitSampler && !resolution)) {
             error = "internal pipeline parameter invariant failed";
@@ -473,7 +585,6 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
         parameter.kind = row.value("kind", "");
         parameter.source = row.value("source", "");
         parameter.systemValue = row.value("system_value", "");
-        parameter.dtype = row.value("dtype", "");
         parameter.access = row.value("access", "read");
         parameter.dimension = row.value("dimension", "");
         parameter.textureFormat = row.value("texture_format", "");
@@ -501,11 +612,19 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
             error = "non-texture parameter contains texture constraints";
             return false;
         }
+        if (parameter.kind == "tensor") {
+            if (row.contains("dtype") || !row.contains("element_layout") ||
+                !parseValueLayout(row["element_layout"], parameter.elementLayout, error))
+                return false;
+        } else if (row.contains("element_layout")) {
+            error = "non-Tensor parameter contains element_layout";
+            return false;
+        }
         if (internal) {
             const bool implicitSampler =
                 parameter.source == "implicit_sampler" && parameter.kind == "sampler" && parameter.systemValue.empty();
             const bool resolution = parameter.source == "system_value" && parameter.systemValue == "resolution" &&
-                                    parameter.kind == "tensor" && parameter.dtype == "f32" &&
+                                    parameter.kind == "tensor" && isScalarLayout(parameter.elementLayout, "f32") &&
                                     parameter.shape == std::vector<uint64_t>{2};
             if (!implicitSampler && !resolution) {
                 error = "internal pipeline parameter metadata is unsupported";

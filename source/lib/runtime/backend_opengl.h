@@ -14,9 +14,6 @@
 #include <unordered_map>
 #include <vector>
 
-struct VernonDeviceBuffer;
-struct VernonDeviceSampler;
-struct VernonDeviceTexture;
 struct VernonRuntimeRhiAdapter;
 namespace vernon::runtime {
 
@@ -25,10 +22,6 @@ struct OpenGLContextState {
     rhi::opengl::Driver &driver{device.driver};
     VernonRuntimeRhiAdapter *adapter{};
 };
-
-using OpenGLBufferState = rhi::opengl::Buffer;
-using OpenGLTextureState = rhi::opengl::Image;
-using OpenGLSamplerState = rhi::opengl::Sampler;
 
 struct OpenGLPipelineState {
     struct InlineBinding {
@@ -67,50 +60,8 @@ inline const OpenGLContextState &openGLState(const VernonRuntimeContext &context
     return runtimeBackendState<OpenGLContextState>(context);
 }
 
-inline OpenGLBufferState &openGLBufferState(VernonDeviceBuffer &buffer) {
-    return runtimeBackendState<OpenGLBufferState>(buffer);
-}
-
-inline const OpenGLBufferState &openGLBufferState(const VernonDeviceBuffer &buffer) {
-    return runtimeBackendState<OpenGLBufferState>(buffer);
-}
-
-inline OpenGLTextureState &openGLTextureState(VernonDeviceTexture &texture) {
-    return runtimeBackendState<OpenGLTextureState>(texture);
-}
-
-inline const OpenGLTextureState &openGLTextureState(const VernonDeviceTexture &texture) {
-    return runtimeBackendState<OpenGLTextureState>(texture);
-}
-
-inline OpenGLSamplerState &openGLSamplerState(VernonDeviceSampler &sampler) {
-    return runtimeBackendState<OpenGLSamplerState>(sampler);
-}
-
-inline const OpenGLSamplerState &openGLSamplerState(const VernonDeviceSampler &sampler) {
-    return runtimeBackendState<OpenGLSamplerState>(sampler);
-}
-
 bool isOpenGL(const VernonRuntimeContext *context);
 void makeCurrent(VernonRuntimeContext *context);
-
-bool initializeOpenGLContext(VernonRuntimeContext &context, const VernonOpenGLContextCallbacks &callbacks);
-
-bool createOpenGLBuffer(VernonDeviceBuffer &buffer);
-void importOpenGLBuffer(VernonDeviceBuffer &buffer, rhi::opengl::Uint name);
-void destroyOpenGLBuffer(VernonDeviceBuffer &buffer);
-VernonStatus copyToOpenGLBuffer(VernonDeviceBuffer &buffer, size_t offset, const void *source, size_t size);
-VernonStatus copyFromOpenGLBuffer(const VernonDeviceBuffer &buffer, size_t offset, void *destination, size_t size);
-
-bool createOpenGLTexture(VernonDeviceTexture &texture);
-void importOpenGLTexture(VernonDeviceTexture &texture, rhi::opengl::Uint name);
-void destroyOpenGLTexture(VernonDeviceTexture &texture);
-VernonStatus copyToOpenGLTexture(VernonDeviceTexture &texture, const void *source, size_t size);
-VernonStatus copyFromOpenGLTexture(const VernonDeviceTexture &texture, void *destination, size_t size);
-
-bool createOpenGLSampler(VernonDeviceSampler &sampler);
-void importOpenGLSampler(VernonDeviceSampler &sampler, rhi::opengl::Uint name);
-void destroyOpenGLSampler(VernonDeviceSampler &sampler);
 
 VernonStatus openGLComputeToGraphicsBarrier(VernonRuntimeContext &context);
 VernonStatus synchronizeOpenGL(VernonRuntimeContext &context);

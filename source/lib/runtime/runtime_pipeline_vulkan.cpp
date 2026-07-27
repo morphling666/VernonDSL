@@ -148,9 +148,18 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
             candidate.layout.array_count = 1;
             candidate.binding.externalSlot = parameter.slot;
-            if (parameter.kind == "tensor" && use.interfaceKind == "uniform") {
+            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.uniformLayout &&
+                use.uniformLayout->storage == "storage_buffer" && parameter.elementLayout.byteSize &&
+                use.binding != UINT32_MAX) {
+                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
+                candidate.layout.element_size = parameter.elementLayout.byteSize;
+                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
+                candidate.layout.binding = use.binding;
+                candidate.layout.set = use.descriptorSet;
+                candidate.binding.source = VulkanPipelineState::Binding::EXTERNAL_STORAGE;
+            } else if (parameter.kind == "tensor" && use.interfaceKind == "uniform") {
                 const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
-                const std::optional<VernonDataType> dtype = pipelineDataType(parameter.dtype);
+                const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
                 uint64_t count = 1;
                 for (uint64_t dimension : shape) {
                     if (!dimension || count > UINT32_MAX / dimension)
@@ -174,7 +183,7 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 candidate.layout.set = use.descriptorSet;
                 candidate.binding.source = internal ? VulkanPipelineState::Binding::RESOLUTION
                                                     : VulkanPipelineState::Binding::EXTERNAL_UNIFORM;
-                candidate.binding.packing.dtype = *dtype;
+                candidate.binding.packing.elementSize = elementSize;
                 candidate.binding.packing.shape = shape;
                 candidate.binding.packing.byteSize = static_cast<size_t>(physicalSize);
                 if (use.uniformLayout) {
@@ -204,18 +213,19 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 candidate.binding.storage.resize(candidate.layout.element_size);
             } else if (parameter.kind == "tensor" && use.interfaceKind == "input" && use.stage == "vertex" &&
                        use.location != UINT32_MAX && !use.attributeLeaves.empty()) {
-                const std::optional<VernonDataType> dtype = pipelineDataType(parameter.dtype);
-                if (!dtype || dataTypeSize(*dtype) == 0)
-                    return false;
                 candidate.layout.kind = VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
-                candidate.layout.element_size = static_cast<uint32_t>(dataTypeSize(*dtype));
+                candidate.layout.element_size = parameter.elementLayout.byteSize;
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_VERTEX_INPUT;
                 candidate.layout.binding = vertexBinding++;
                 candidate.layout.divisor = use.divisor;
-                for (const AttributeLeaf &leaf : use.attributeLeaves)
+                for (const AttributeLeaf &leaf : use.attributeLeaves) {
+                    const std::optional<VernonDataType> dtype = pipelineDataType(leaf.dtype);
+                    if (!dtype)
+                        return false;
                     candidate.attributes.push_back({candidate.layout.binding, use.location + leaf.locationOffset,
                                                     static_cast<uint32_t>(*dtype), leaf.componentCount,
                                                     leaf.byteOffset});
+                }
                 candidate.binding.source = VulkanPipelineState::Binding::EXTERNAL_VERTEX;
             } else if (parameter.kind == "texture" && use.interfaceKind == "resource") {
                 candidate.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE;
@@ -338,55 +348,40 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
         if (prepared.source == VulkanPipelineState::Binding::EXTERNAL_VERTEX) {
             const auto found = plan.arguments.find(prepared.externalSlot);
             if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
-                (found->second->tensor.storage != VERNON_TENSOR_DEVICE &&
-                 found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE) ||
-                (!found->second->tensor.buffer && !found->second->tensor.resource.resource.value) ||
-                !found->second->tensor.byte_strides || found->second->tensor.byte_strides[0] <= 0)
+                found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
+                !found->second->tensor.resource.resource.value || !found->second->tensor.byte_strides ||
+                found->second->tensor.byte_strides[0] <= 0)
                 return fail(*pipeline.context, "Vulkan RHI vertex argument is missing or invalid");
             const VernonTensorView &tensor = found->second->tensor;
-            if (tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
-                value.resource = tensor.resource;
-                value.resource.offset += tensor.byte_offset;
-            } else {
-                value.resource.identity = vulkanRhiAdapterResourceIdentity(adapter);
-                value.resource.resource.value = reinterpret_cast<uintptr_t>(&vulkanBufferState(*tensor.buffer));
-                value.resource.offset = tensor.byte_offset;
-                value.resource.size = tensor.buffer->size - tensor.byte_offset;
-            }
+            value.resource = tensor.resource;
+            value.resource.offset += tensor.byte_offset;
             value.stride = static_cast<uint32_t>(tensor.byte_strides[0]);
+        } else if (prepared.source == VulkanPipelineState::Binding::EXTERNAL_STORAGE) {
+            const auto found = plan.arguments.find(prepared.externalSlot);
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
+                found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
+                !found->second->tensor.resource.resource.value)
+                return fail(*pipeline.context, "Vulkan RHI storage argument is missing");
+            const VernonTensorView &tensor = found->second->tensor;
+            value.resource = tensor.resource;
+            value.resource.offset += tensor.byte_offset;
         } else if (prepared.source == VulkanPipelineState::Binding::EXTERNAL_TEXTURE) {
             const auto found = plan.arguments.find(prepared.externalSlot);
             if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TEXTURE ||
-                (!found->second->texture.texture && !found->second->texture.resource.resource.value))
+                !found->second->texture.resource.resource.value)
                 return fail(*pipeline.context, "Vulkan RHI texture argument is missing");
-            if (found->second->texture.resource.resource.value)
-                value.resource = found->second->texture.resource;
-            else {
-                value.resource.identity = vulkanRhiAdapterResourceIdentity(adapter);
-                value.resource.resource.value =
-                    reinterpret_cast<uintptr_t>(&vulkanTextureState(*found->second->texture.texture));
-            }
+            value.resource = found->second->texture.resource;
         } else if (prepared.source == VulkanPipelineState::Binding::EXTERNAL_SAMPLER) {
             const auto found = plan.arguments.find(prepared.externalSlot);
             if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_SAMPLER ||
-                (!found->second->sampler && !found->second->resource.resource.value))
+                !found->second->resource.resource.value)
                 return fail(*pipeline.context, "Vulkan RHI sampler argument is missing");
-            if (found->second->resource.resource.value)
-                value.resource = found->second->resource;
-            else {
-                value.resource.identity = vulkanRhiAdapterResourceIdentity(adapter);
-                value.resource.resource.value =
-                    reinterpret_cast<uintptr_t>(&vulkanSamplerState(*found->second->sampler));
-            }
+            value.resource = found->second->resource;
         } else if (prepared.source == VulkanPipelineState::Binding::IMPLICIT_SAMPLER) {
             const auto sampled = plan.sampledResources.find({layout.set, layout.binding});
             if (sampled == plan.sampledResources.end())
                 return fail(*pipeline.context, "Vulkan RHI implicit sampler binding is missing");
-            if (sampled->second.sampler) {
-                value.resource.identity = vulkanRhiAdapterResourceIdentity(adapter);
-                value.resource.resource.value =
-                    reinterpret_cast<uintptr_t>(&vulkanSamplerState(*sampled->second.sampler));
-            } else if (sampled->second.samplerResource.resource.value) {
+            if (sampled->second.samplerResource.resource.value) {
                 value.resource = sampled->second.samplerResource;
             } else {
                 value.flags = VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE;
@@ -430,26 +425,13 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
     std::vector<uint32_t> formats;
     for (size_t index = 0; index < plan.attachments.size(); ++index) {
         attachments[index].location = plan.attachments[index]->location;
-        if (plan.attachments[index]->resource.resource.value) {
-            attachments[index].image = plan.attachments[index]->resource;
-            const auto *image = reinterpret_cast<const rhi::vulkan::Image *>(
-                static_cast<uintptr_t>(plan.attachments[index]->resource.resource.value));
-            formats.push_back(static_cast<uint32_t>(image->format));
-        } else {
-            auto &texture = vulkanTextureState(*plan.attachments[index]->texture);
-            attachments[index].image.identity = vulkanRhiAdapterResourceIdentity(adapter);
-            attachments[index].image.resource.value = reinterpret_cast<uintptr_t>(&texture);
-            formats.push_back(static_cast<uint32_t>(texture.format));
-        }
+        attachments[index].image = plan.attachments[index]->resource;
+        const auto *image = reinterpret_cast<const rhi::vulkan::Image *>(
+            static_cast<uintptr_t>(plan.attachments[index]->resource.resource.value));
+        formats.push_back(static_cast<uint32_t>(image->format));
     }
     if (plan.depthAttachment) {
-        if (plan.depthAttachment->resource.resource.value)
-            depthAttachment = plan.depthAttachment->resource;
-        else {
-            auto &texture = vulkanTextureState(*plan.depthAttachment->texture);
-            depthAttachment.identity = vulkanRhiAdapterResourceIdentity(adapter);
-            depthAttachment.resource.value = reinterpret_cast<uintptr_t>(&texture);
-        }
+        depthAttachment = plan.depthAttachment->resource;
     }
     uint64_t vertexIdentity = 1469598103934665603ull;
     std::vector<uint32_t> vertexStrides;
@@ -528,7 +510,6 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
 VernonStatus invokeVulkanComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &launch) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     VulkanPipelineState &state = runtimeBackendState<VulkanPipelineState>(pipeline);
-    const uint64_t identity = vulkanRhiAdapterResourceIdentity(*vulkanState(*pipeline.context).adapter);
     for (size_t index = 0; index < state.rhiComputeLayout.size(); ++index) {
         const auto &layout = state.rhiComputeLayout[index];
         const ComputeLaunchArgument &argument = launch.arguments[layout.argument_index];
@@ -537,25 +518,14 @@ VernonStatus invokeVulkanComputePipeline(VernonLoadedPipeline &pipeline, const P
         value.slot = layout.slot;
         value.kind = layout.kind;
         if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            if (argument.kind != ComputeLaunchArgumentKind::Tensor ||
-                (!argument.buffer && !argument.resource.resource.value))
-                return fail(*pipeline.context, "Vulkan prepared storage binding requires a device Tensor");
-            if (argument.resource.resource.value) {
-                value.resource = argument.resource;
-                const uint64_t leafOffset = state.rhiComputeResourceOffsets[index];
-                if (leafOffset > value.resource.size)
-                    return fail(*pipeline.context, "Vulkan aggregate storage leaf exceeds its Tensor resource");
-                value.resource.offset += leafOffset;
-                value.resource.size -= leafOffset;
-            } else {
-                const uint64_t leafOffset = state.rhiComputeResourceOffsets[index];
-                if (leafOffset > argument.buffer->size)
-                    return fail(*pipeline.context, "Vulkan aggregate storage leaf exceeds its Tensor buffer");
-                value.resource.identity = identity;
-                value.resource.resource.value = reinterpret_cast<uintptr_t>(&vulkanBufferState(*argument.buffer));
-                value.resource.offset = leafOffset;
-                value.resource.size = argument.buffer->size - leafOffset;
-            }
+            if (argument.kind != ComputeLaunchArgumentKind::Tensor || !argument.resource.resource.value)
+                return fail(*pipeline.context, "Vulkan prepared storage binding requires an RHI Tensor");
+            value.resource = argument.resource;
+            const uint64_t leafOffset = state.rhiComputeResourceOffsets[index];
+            if (leafOffset > value.resource.size)
+                return fail(*pipeline.context, "Vulkan aggregate storage leaf exceeds its Tensor resource");
+            value.resource.offset += leafOffset;
+            value.resource.size -= leafOffset;
         } else {
             if (argument.kind != ComputeLaunchArgumentKind::Scalar || !argument.scalarData)
                 return fail(*pipeline.context, "Vulkan prepared inline binding requires host data");

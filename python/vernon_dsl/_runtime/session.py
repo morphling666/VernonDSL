@@ -88,6 +88,8 @@ def init(*, arch: _Architecture = cpu, api_version: tuple[int, int] | None = Non
     }[arch]
     backend = getattr(_native.RuntimeBackend, backend_name)
     use_rhi_host = arch != cpu and hasattr(_native, "RhiHost") and hasattr(_native, "RhiBackend")
+    if arch != cpu and not use_rhi_host:
+        raise RuntimeError(f"{arch.name} requires Vernon RHI support in vernon_dsl._native")
     rhi_backend = getattr(_native.RhiBackend, backend_name) if use_rhi_host else None
     if arch in {opengl, opengles}:
         external = _external_opengl_contexts.get(arch)
@@ -117,32 +119,13 @@ def init(*, arch: _Architecture = cpu, api_version: tuple[int, int] | None = Non
             )
             _native_runtime = _rhi_host.create_runtime()
             _owned_opengl_context = owned_context
-        elif external is not None:
-            user_data, make_current, get_proc_address, registered_version = external
-            requested = api_version or registered_version
-            _native_runtime = _native.Runtime.create_external_opengl(
-                backend, user_data, make_current, get_proc_address, *requested
-            )
-        else:
-            requested = api_version or default_version
-            owned_context = _gl_context.Context(arch.name, *requested)
-            _native_runtime = _native.Runtime.create_external_opengl(
-                backend,
-                owned_context.user_data,
-                owned_context.make_current,
-                owned_context.get_proc_address,
-                *requested,
-            )
-            _owned_opengl_context = owned_context
-    elif arch != cpu and not _native.runtime_available(backend):
+    elif arch == cpu:
+        _native_runtime = _native.Runtime(backend)
+    elif not _native.runtime_available(backend):
         raise RuntimeError(f"{arch.name} loader or a usable device is unavailable")
     else:
-        requested = api_version or (4, 3)
-        if not use_rhi_host:
-            _native_runtime = _native.Runtime(backend, *requested)
-        else:
-            _rhi_host = _native.RhiHost(rhi_backend)
-            _native_runtime = _rhi_host.create_runtime()
+        _rhi_host = _native.RhiHost(rhi_backend)
+        _native_runtime = _rhi_host.create_runtime()
     _architecture = arch
     _api_version = api_version or ((4, 3) if arch == opengl else (3, 1) if arch == opengles else None)
     _runtime_generation += 1

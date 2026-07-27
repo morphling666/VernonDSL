@@ -39,6 +39,43 @@ def _is_logical_collection(value: Any) -> bool:
     return isinstance(value, (list, tuple)) or (isinstance(value, np.ndarray) and value.ndim > 0)
 
 
+def _bind_native_argument(builder: Any, parameter: Any, value: Any, *, host_value: bool = False) -> Any:
+    state = _session_state()
+    if isinstance(value, (TensorStorage, TensorView)):
+        if state._architecture == state.cpu or host_value:
+            return builder.host_tensor(parameter.name, value._native_host_array())
+        if state._rhi_host is None:
+            raise RuntimeError("device Tensor arguments require a GPU RHI host")
+        layout = value.layout
+        return builder.rhi_tensor(
+            parameter.name,
+            value._resident_buffer(),
+            parameter.access,
+            list(value.shape),
+            list(layout.byte_strides),
+            layout.byte_offset,
+        )
+
+    numpy_dtypes = {
+        state._native.DATA_BOOL: np.dtype(np.bool_),
+        state._native.DATA_I32: np.dtype(np.int32),
+        state._native.DATA_U32: np.dtype(np.uint32),
+        state._native.DATA_F16: np.dtype(np.float16),
+        state._native.DATA_F32: np.dtype(np.float32),
+        state._native.DATA_F64: np.dtype(np.float64),
+    }
+    leaves = tuple(parameter.element_leaves)
+    dtype = numpy_dtypes.get(leaves[0][0]) if len(leaves) == 1 and leaves[0][1:] == (1, 0) else None
+    if dtype is None:
+        raise TypeError(f"aggregate parameter {parameter.name!r} requires canonical TensorStorage")
+    host_array = np.asarray(value, dtype=dtype)
+    if tuple(host_array.shape) != tuple(parameter.shape):
+        raise ValueError(
+            f"parameter {parameter.name!r} expects shape {tuple(parameter.shape)}, got {tuple(host_array.shape)}"
+        )
+    return builder.host_tensor(parameter.name, host_array)
+
+
 @dataclass(frozen=True)
 class TensorLayout:
     shape: tuple[int, ...]
@@ -371,6 +408,9 @@ class TensorStorage:
         self.synchronize()
         return self._array
 
+    def _native_host_array(self) -> np.ndarray:
+        return self._array
+
     def copy_from_numpy(self, array: np.ndarray) -> None:
         self._ensure_host_mutation_allowed()
         if (
@@ -424,14 +464,10 @@ class TensorStorage:
 
     def _resident_buffer(self) -> Any:
         state = _session_state()
-        if state._native_runtime is None:
-            raise RuntimeError("native TensorStorage residency requires a runtime")
+        if state._native_runtime is None or state._rhi_host is None:
+            raise RuntimeError("device TensorStorage residency requires a GPU RHI host")
         if self._native_buffer is None or self._native_generation != state._runtime_generation:
-            self._native_buffer = (
-                state._rhi_host.create_buffer(self._array.nbytes)
-                if state._rhi_host is not None
-                else state._native_runtime.allocate(self._array.nbytes, self._element_alignment)
-            )
+            self._native_buffer = state._rhi_host.create_buffer(self._array.nbytes)
             self._native_generation = state._runtime_generation
             self._uploaded_version = 0
             self._device_dirty = False
@@ -554,14 +590,10 @@ class RawBuffer:
 
     def _resident_buffer(self) -> Any:
         state = _session_state()
-        if state._native_runtime is None:
-            raise RuntimeError("native RawBuffer residency requires a runtime")
+        if state._native_runtime is None or state._rhi_host is None:
+            raise RuntimeError("device RawBuffer residency requires a GPU RHI host")
         if self._native_buffer is None or self._native_generation != state._runtime_generation:
-            self._native_buffer = (
-                state._rhi_host.create_buffer(self.byte_size)
-                if state._rhi_host is not None
-                else state._native_runtime.allocate(self.byte_size, self.alignment)
-            )
+            self._native_buffer = state._rhi_host.create_buffer(self.byte_size)
             self._native_generation = state._runtime_generation
             self._uploaded_version = 0
             self._device_dirty = False
@@ -679,6 +711,9 @@ class TensorView:
     def _borrowed_array(self) -> np.ndarray:
         self._owner._ensure_host_read_allowed()
         self._owner.synchronize()
+        return self._native_host_array()
+
+    def _native_host_array(self) -> np.ndarray:
         return np.ndarray(
             self.shape,
             dtype=self.dtype,
@@ -855,34 +890,85 @@ class Texture:
         self._host_dirty = False
 
 
-class DepthTexture:
-    """D32 two-dimensional depth attachment."""
+@dataclass(frozen=True)
+class _TextureFormat:
+    name: str
+    _native_name: str
+    _depth: bool = False
+
+
+depth32 = _TextureFormat("depth32", "D32_FLOAT", True)
+
+
+class RenderTarget:
+    """Backend-neutral collection of color and render-only depth attachments."""
 
     def __init__(self, *, shape: tuple[int, int]):
-        if len(shape) != 2 or any(not isinstance(value, int) or value <= 0 for value in shape):
-            raise ValueError("DepthTexture shape must contain two positive dimensions")
+        if (
+            not isinstance(shape, tuple)
+            or len(shape) != 2
+            or any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in shape)
+        ):
+            raise ValueError("RenderTarget shape must contain two positive dimensions")
         self._shape = shape
-        self._native_texture: Any | None = None
-        self._native_generation = -1
+        self._colors: dict[int, Texture] = {}
+        self._depth_format: _TextureFormat | None = None
+        self._native_depth: Any | None = None
+        self._native_depth_generation = -1
         _session_state()._runtime_children.add(self)
-
-    @classmethod
-    def zeros(cls, *, shape: tuple[int, int]) -> DepthTexture:
-        return cls(shape=shape)
 
     @property
     def shape(self) -> tuple[int, int]:
         return self._shape
 
-    def _resident_texture(self) -> Any:
+    def attach_color(self, location: int, texture: Texture) -> RenderTarget:
+        if not isinstance(location, int) or isinstance(location, bool) or not 0 <= location < 2**32:
+            raise ValueError("color attachment location must be a non-negative u32")
+        if location in self._colors:
+            raise ValueError(f"color attachment location {location} is already occupied")
+        if not isinstance(texture, Texture):
+            raise TypeError("color attachment must be a Texture")
+        if texture.shape != self.shape:
+            raise ValueError("color attachment dimensions must match RenderTarget shape")
+        self._colors[location] = texture
+        return self
+
+    def attach_depth(self, *, format: _TextureFormat) -> RenderTarget:
+        if self._depth_format is not None:
+            raise ValueError("RenderTarget already has a depth attachment")
+        if format is not depth32:
+            raise ValueError("depth attachment requires a depth format")
+        self._depth_format = format
+        return self
+
+    def _color_attachments(self) -> tuple[tuple[int, Texture], ...]:
+        return tuple(sorted(self._colors.items()))
+
+    def _resident_depth_attachment(self) -> Any | None:
+        if self._depth_format is None:
+            return None
         state = _session_state()
-        if state._native_runtime is None or state._rhi_host is None:
-            raise RuntimeError("DepthTexture requires an initialized GPU RHI runtime")
-        if self._native_texture is None or self._native_generation != state._runtime_generation:
+        if state._native_runtime is None or state._rhi_host is None or state._native is None:
+            raise RuntimeError("RenderTarget depth attachment requires an initialized GPU RHI runtime")
+        if self._native_depth is None or self._native_depth_generation != state._runtime_generation:
             height, width = self.shape
-            self._native_texture = state._rhi_host.create_depth_image(width, height)
-            self._native_generation = state._runtime_generation
-        return self._native_texture
+            native_format = getattr(state._native.TextureFormat, self._depth_format._native_name)
+            self._native_depth = state._rhi_host.create_attachment_image(
+                width,
+                height,
+                native_format,
+                state._native.IMAGE_DEPTH_STENCIL_ATTACHMENT,
+            )
+            self._native_depth_generation = state._runtime_generation
+        return self._native_depth
 
 
-__all__ = ["DepthTexture", "RawBuffer", "TensorLayout", "TensorStorage", "TensorView", "Texture"]
+__all__ = [
+    "RawBuffer",
+    "RenderTarget",
+    "TensorLayout",
+    "TensorStorage",
+    "TensorView",
+    "Texture",
+    "depth32",
+]
