@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <variant>
 
 namespace mlir::vernon {
 
@@ -37,6 +38,50 @@ struct ValueAbiLayout {
     std::string layoutHash;
 };
 
+enum class PhysicalAbiProfile {
+    HostValue,
+    CudaKernelParameter,
+    VulkanStd140UniformBuffer,
+    VulkanStd430StorageBuffer,
+    VulkanPushConstant,
+    OpenGLNativeUniform,
+    DirectXConstantBuffer,
+    MetalConstantBuffer,
+    Count,
+};
+
+struct PhysicalValueAbiLayout {
+    uint64_t size{};
+    uint64_t alignment{};
+    SmallVector<uint64_t> byteStrides;
+};
+
+enum class PhysicalResourceAbiKind {
+    HostPointer,
+    CudaStorageLeaves,
+    GraphicsStorageLeaves,
+    GraphicsTexture,
+    GraphicsSampler,
+};
+
+struct PhysicalResourceAbiLayout {
+    PhysicalResourceAbiKind kind;
+    uint64_t handleSize{};
+    uint64_t handleAlignment{};
+    std::optional<ValueAbiLayout> elementLayout;
+};
+
+struct UnsupportedPhysicalValueAbi {
+    std::string reason;
+};
+
+using PhysicalValueAbiPlan =
+    std::variant<PhysicalValueAbiLayout, PhysicalResourceAbiLayout, UnsupportedPhysicalValueAbi>;
+
 FailureOr<ValueAbiLayout> getValueAbiLayout(Type type, ModuleOp module, ArrayRef<StringRef> logicalLeafDtypes = {});
+
+FailureOr<PhysicalValueAbiPlan> getPhysicalValueAbiPlan(Type type, ModuleOp module, PhysicalAbiProfile profile);
+
+FailureOr<PhysicalValueAbiLayout> getPhysicalValueAbiLayout(Type type, ModuleOp module, PhysicalAbiProfile profile);
 
 } // namespace mlir::vernon

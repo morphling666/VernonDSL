@@ -8,20 +8,17 @@
 
 namespace mlir::vernon {
 
-struct StorageLeaf {
+struct ResolvedStructField {
+    std::string name;
     Type type;
-    uint64_t byteOffset{};
-    uint64_t scalarCount{};
 };
 
-struct StorageLayout {
-    uint64_t size{};
-    uint64_t alignment{};
-    SmallVector<StorageLeaf> leaves;
+struct ResolvedStructFields {
+    StructDeclOp declaration;
+    SmallVector<ResolvedStructField> fields;
 };
 
-inline FailureOr<std::pair<StructDeclOp, SmallVector<Type>>> resolveStructFields(StructType structure,
-                                                                                 ModuleOp module) {
+inline FailureOr<ResolvedStructFields> resolveNamedStructFields(StructType structure, ModuleOp module) {
     StructDeclOp declaration;
     for (StructDeclOp candidate : module.getOps<StructDeclOp>()) {
         if (candidate.getSymName() == structure.getName()) {
@@ -32,7 +29,7 @@ inline FailureOr<std::pair<StructDeclOp, SmallVector<Type>>> resolveStructFields
     }
     if (!declaration)
         return failure();
-    SmallVector<Type> fields;
+    SmallVector<ResolvedStructField> fields;
     for (Attribute attribute : declaration.getFields()) {
         StringRef spelling = cast<StringAttr>(attribute).getValue();
         size_t separator = spelling.find(':');
@@ -41,22 +38,21 @@ inline FailureOr<std::pair<StructDeclOp, SmallVector<Type>>> resolveStructFields
         Type field = parseType(spelling.drop_front(separator + 1), module.getContext());
         if (!field)
             return failure();
-        fields.push_back(field);
+        fields.push_back({spelling.take_front(separator).str(), field});
     }
-    return std::make_pair(declaration, std::move(fields));
+    return ResolvedStructFields{declaration, std::move(fields)};
 }
 
-inline FailureOr<StorageLayout> resolveStorageLayout(Type type, ModuleOp module) {
-    FailureOr<ValueAbiLayout> valueLayout = getValueAbiLayout(type, module);
-    if (failed(valueLayout))
+inline FailureOr<std::pair<StructDeclOp, SmallVector<Type>>> resolveStructFields(StructType structure,
+                                                                                 ModuleOp module) {
+    FailureOr<ResolvedStructFields> resolved = resolveNamedStructFields(structure, module);
+    if (failed(resolved))
         return failure();
-    StorageLayout result;
-    result.size = valueLayout->size;
-    result.alignment = valueLayout->alignment;
-    result.leaves.reserve(valueLayout->leaves.size());
-    for (const ValueAbiLeaf &leaf : valueLayout->leaves)
-        result.leaves.push_back({leaf.scalarType, leaf.byteOffset, leaf.scalarCount});
-    return result;
+    SmallVector<Type> fields;
+    fields.reserve(resolved->fields.size());
+    for (const ResolvedStructField &field : resolved->fields)
+        fields.push_back(field.type);
+    return std::make_pair(resolved->declaration, std::move(fields));
 }
 
 } // namespace mlir::vernon

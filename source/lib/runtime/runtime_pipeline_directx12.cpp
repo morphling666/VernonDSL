@@ -37,7 +37,8 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
         const Stage &stage = bundle.stages.at(variant.compute);
         ReflectedEntry reflection;
         const nlohmann::json parsed = nlohmann::json::parse(stage.reflection, nullptr, false);
-        if (parsed.is_discarded() || !parseReflection(parsed, stage.entry, reflection, bundle.context->error)) {
+        if (parsed.is_discarded() ||
+            !parseReflection(parsed, stage.entry, reflection, VERNON_RUNTIME_DIRECTX12, bundle.context->error)) {
             delete pipelineState;
             return false;
         }
@@ -84,7 +85,7 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                     candidate.layout.argument_index = use.index;
                     candidate.layout.element_size = static_cast<uint32_t>(
                         argument.storageLeaves.empty()
-                            ? (argument.kind == "tensor" ? argument.tensorElementSize : argument.physicalSize)
+                            ? (argument.kind == "tensor" ? argument.tensorElementSize : argument.physical.size)
                             : argument.storageLeaves[leafIndex].elementSize);
                     // Aggregate lowering already folds each leaf's byte offset into the shader index.
                     // Every leaf descriptor must therefore retain the base address of the original AoS buffer.
@@ -159,8 +160,8 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                 use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
             candidate.layout.array_count = 1;
             candidate.binding.externalSlot = parameter.slot;
-            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.uniformLayout &&
-                use.uniformLayout->storage == "storage_buffer" && parameter.elementLayout.byteSize &&
+            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.physicalValueLayout &&
+                use.physicalValueLayout->transport == "storage_buffer" && parameter.elementLayout.byteSize &&
                 use.binding != UINT32_MAX) {
                 candidate.layout.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
                 candidate.layout.element_size = parameter.elementLayout.byteSize;
@@ -184,15 +185,10 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                     break;
                 }
                 const size_t elementSize = dataTypeSize(*dtype);
-                candidate.layout.kind = use.uniformLayout && use.uniformLayout->storage == "uniform_buffer"
+                candidate.layout.kind = use.physicalValueLayout->transport == "uniform_buffer"
                                             ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
                                             : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-                uint64_t physicalSize = use.uniformLayout ? use.uniformLayout->size : valueCount * elementSize;
-                const bool matrix =
-                    shape.size() == 2 && shape[0] >= 2 && shape[0] <= 4 && shape[1] >= 2 && shape[1] <= 4;
-                if (matrix)
-                    physicalSize =
-                        std::max<uint64_t>(physicalSize, shape[0] * std::max<uint64_t>(shape[1] * elementSize, 16));
+                const uint64_t physicalSize = use.physicalValueLayout->size;
                 if (!physicalSize || physicalSize > UINT32_MAX ||
                     (candidate.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER && use.binding == UINT32_MAX)) {
                     supported = false;
@@ -202,7 +198,7 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
                 candidate.layout.element_count = static_cast<uint32_t>(valueCount);
                 candidate.layout.vector_count = shape.size() == 2 ? static_cast<uint32_t>(shape[0]) : 1;
-                const uint64_t physicalAlignment = use.uniformLayout ? use.uniformLayout->alignment : elementSize;
+                const uint64_t physicalAlignment = use.physicalValueLayout->alignment;
                 if (!physicalAlignment || physicalAlignment > UINT32_MAX) {
                     supported = false;
                     break;
@@ -214,24 +210,12 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                 candidate.binding.packing.elementSize = elementSize;
                 candidate.binding.packing.shape = shape;
                 candidate.binding.packing.byteSize = static_cast<size_t>(physicalSize);
-                if (matrix) {
-                    candidate.binding.packing.byteStrides = {
-                        static_cast<size_t>(std::max<uint64_t>(shape[1] * elementSize, 16)), elementSize};
-                } else if (use.uniformLayout) {
-                    for (uint64_t stride : use.uniformLayout->byteStrides) {
-                        if (stride > SIZE_MAX) {
-                            supported = false;
-                            break;
-                        }
-                        candidate.binding.packing.byteStrides.push_back(static_cast<size_t>(stride));
+                for (uint64_t stride : use.physicalValueLayout->byteStrides) {
+                    if (stride > SIZE_MAX) {
+                        supported = false;
+                        break;
                     }
-                } else {
-                    candidate.binding.packing.byteStrides.resize(shape.size());
-                    size_t stride = elementSize;
-                    for (size_t dimension = shape.size(); dimension-- > 0;) {
-                        candidate.binding.packing.byteStrides[dimension] = stride;
-                        stride *= static_cast<size_t>(shape[dimension]);
-                    }
+                    candidate.binding.packing.byteStrides.push_back(static_cast<size_t>(stride));
                 }
                 if (!supported || candidate.binding.packing.byteStrides.size() != shape.size()) {
                     supported = false;

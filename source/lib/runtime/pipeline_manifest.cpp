@@ -98,38 +98,45 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
                                            static_cast<uint32_t>(componentCount), static_cast<uint32_t>(byteOffset)});
         }
     }
-    if (value.contains("uniform_layout")) {
-        const nlohmann::json &layout = value["uniform_layout"];
+    if (value.contains("physical_value_layout")) {
+        const nlohmann::json &layout = value["physical_value_layout"];
         uint64_t size = 0;
         uint64_t alignment = 0;
-        if (!layout.is_object() || !layout.contains("storage") || !layout["storage"].is_string() ||
-            !layout.contains("size") || !parseUint64(layout["size"], size) || !layout.contains("alignment") ||
-            !parseUint64(layout["alignment"], alignment) || !layout.contains("byte_strides") ||
-            !layout["byte_strides"].is_array()) {
-            error = "uniform_layout must contain storage, size, alignment, and byte_strides";
+        const std::string profile = layout.value("profile", "");
+        const bool supportedProfile = profile == "host_value" || profile == "cuda_kernel_parameter" ||
+                                      profile == "vulkan_std140_uniform_buffer" ||
+                                      profile == "vulkan_std430_storage_buffer" || profile == "vulkan_push_constant" ||
+                                      profile == "opengl_native_uniform" || profile == "directx_constant_buffer" ||
+                                      profile == "metal_constant_buffer";
+        if (!layout.is_object() || !supportedProfile || !layout.contains("transport") ||
+            !layout["transport"].is_string() || !layout.contains("size") || !parseUint64(layout["size"], size) ||
+            !layout.contains("alignment") || !parseUint64(layout["alignment"], alignment) ||
+            !layout.contains("byte_strides") || !layout["byte_strides"].is_array()) {
+            error = "physical_value_layout must contain a supported profile, transport, size, alignment, and "
+                    "byte_strides";
             return false;
         }
-        UniformLayout parsed;
-        parsed.storage = layout["storage"].get<std::string>();
-        parsed.matrixOrder = layout.value("matrix_order", "");
+        PhysicalValueLayout parsed;
+        parsed.profile = profile;
+        parsed.transport = layout["transport"].get<std::string>();
         parsed.size = size;
         parsed.alignment = alignment;
         for (const nlohmann::json &stride : layout["byte_strides"]) {
             uint64_t byteStride = 0;
             if (!parseUint64(stride, byteStride)) {
-                error = "uniform_layout byte strides must be unsigned";
+                error = "physical_value_layout byte strides must be unsigned";
                 return false;
             }
             parsed.byteStrides.push_back(byteStride);
         }
-        if ((parsed.storage != "inline" && parsed.storage != "uniform_buffer" && parsed.storage != "storage_buffer") ||
-            parsed.size == 0 || parsed.alignment == 0 ||
-            (!parsed.matrixOrder.empty() && parsed.matrixOrder != "row_major" &&
-             parsed.matrixOrder != "column_major")) {
-            error = "uniform_layout contains unsupported physical layout metadata";
+        if ((parsed.transport != "host_value" && parsed.transport != "kernel_parameter" &&
+             parsed.transport != "push_constant" && parsed.transport != "native_uniform" &&
+             parsed.transport != "uniform_buffer" && parsed.transport != "storage_buffer") ||
+            parsed.size == 0 || parsed.alignment == 0 || (parsed.alignment & (parsed.alignment - 1))) {
+            error = "physical_value_layout contains unsupported physical layout metadata";
             return false;
         }
-        use.uniformLayout = std::move(parsed);
+        use.physicalValueLayout = std::move(parsed);
     }
     if (value.contains("sampled_texture_bindings")) {
         const nlohmann::json &bindings = value["sampled_texture_bindings"];
@@ -149,8 +156,8 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
     if (value.contains("shape") && value["shape"].is_array())
         for (const nlohmann::json &dimension : value["shape"])
             use.shape.push_back(dimension.is_number_unsigned() ? dimension.get<uint64_t>() : uint64_t{0});
-    if (use.uniformLayout && use.uniformLayout->byteStrides.size() != use.shape.size()) {
-        error = "uniform_layout byte-stride rank does not match the logical Tensor shape";
+    if (use.physicalValueLayout && use.physicalValueLayout->byteStrides.size() != use.shape.size()) {
+        error = "physical_value_layout byte-stride rank does not match the logical Tensor shape";
         return false;
     }
     if (use.stage.empty() || use.interfaceKind.empty()) {
@@ -373,6 +380,12 @@ bool Variant::validate(std::string &error) const {
             error = "pipeline parameter texture constraint invariant failed";
             return false;
         }
+        for (const ParameterUse &use : parameter.uses)
+            if (parameter.kind == "tensor" && (use.interfaceKind == "uniform" || use.interfaceKind == "value") &&
+                !use.physicalValueLayout) {
+                error = "packed Tensor value is missing its compiler-planned physical layout";
+                return false;
+            }
     }
     for (const Parameter &parameter : internalParameters) {
         const bool implicitSampler =
@@ -385,6 +398,11 @@ bool Variant::validate(std::string &error) const {
             return false;
         }
         for (const ParameterUse &use : parameter.uses) {
+            if (parameter.kind == "tensor" && (use.interfaceKind == "uniform" || use.interfaceKind == "value") &&
+                !use.physicalValueLayout) {
+                error = "packed Tensor value is missing its compiler-planned physical layout";
+                return false;
+            }
             if (implicitSampler && use.sampledTextureBindings.size() != 1) {
                 error = "implicit sampler must have exactly one sampled texture binding";
                 return false;

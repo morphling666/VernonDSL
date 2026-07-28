@@ -171,8 +171,9 @@ VernonStatus updateCpuBindingsImpl(CpuContextState &context, CpuPreparedBindings
             return fail(context.error, "CPU provider reflection exceeds its binding layout");
         const auto &layout = bindings.pipeline->layout->entries[reflectedIndex];
         const auto &value = values[reflectedIndex];
-        if (value.slot != layout.slot || value.kind != layout.kind || argument.cpuOffset > bindings.packed.size() ||
-            argument.cpuSize > bindings.packed.size() - argument.cpuOffset)
+        if (value.slot != layout.slot || value.kind != layout.kind ||
+            argument.physical.offset > bindings.packed.size() ||
+            argument.physical.size > bindings.packed.size() - argument.physical.offset)
             return fail(context.error, "CPU provider binding does not match reflection");
         if (value.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
             if (!value.resource.resource.value ||
@@ -181,18 +182,18 @@ VernonStatus updateCpuBindingsImpl(CpuContextState &context, CpuPreparedBindings
                 return fail(context.error, "CPU provider storage binding is invalid");
             const auto *storage = reinterpret_cast<const uint8_t *>(
                 static_cast<uintptr_t>(value.resource.resource.value) + value.resource.offset);
-            if (argument.cpuSize == sizeof(uintptr_t)) {
+            if (argument.physical.size == sizeof(uintptr_t)) {
                 const uintptr_t pointer = reinterpret_cast<uintptr_t>(storage);
-                std::memcpy(bindings.packed.data() + argument.cpuOffset, &pointer, sizeof(pointer));
+                std::memcpy(bindings.packed.data() + argument.physical.offset, &pointer, sizeof(pointer));
             } else {
-                if (value.resource.size < argument.cpuSize)
+                if (value.resource.size < argument.physical.size)
                     return fail(context.error, "CPU provider storage binding is smaller than the inline argument");
-                std::memcpy(bindings.packed.data() + argument.cpuOffset, storage, argument.cpuSize);
+                std::memcpy(bindings.packed.data() + argument.physical.offset, storage, argument.physical.size);
             }
         } else {
-            if (!value.inline_data || value.inline_size != argument.cpuSize)
+            if (!value.inline_data || value.inline_size != argument.physical.size)
                 return fail(context.error, "CPU provider inline binding is invalid");
-            std::memcpy(bindings.packed.data() + argument.cpuOffset, value.inline_data, value.inline_size);
+            std::memcpy(bindings.packed.data() + argument.physical.offset, value.inline_data, value.inline_size);
         }
         ++reflectedIndex;
     }
@@ -214,8 +215,10 @@ VernonStatus createCpuBindingSet(void *data, const VernonRuntimeProviderBindingS
     if (!bindings)
         return fail(context.error, "cannot allocate CPU provider binding set", VERNON_STATUS_INTERNAL_ERROR);
     bindings->pipeline = layout->pipeline;
+    if (!layout->pipeline->shader->reflection.packedArguments)
+        return fail(context.error, "CPU reflection has no packed argument layout");
     try {
-        bindings->packed.resize(layout->pipeline->shader->reflection.cpuArgumentsSize);
+        bindings->packed.resize(layout->pipeline->shader->reflection.packedArguments->size);
     } catch (const std::bad_alloc &) {
         return fail(context.error, "cannot allocate CPU invocation storage", VERNON_STATUS_INTERNAL_ERROR);
     }
@@ -256,11 +259,11 @@ VernonStatus encodeCpuDispatch(void *data, VernonRuntimeProviderObject,
             for (uint32_t x = 0; x < global[0]; ++x) {
                 const uint32_t id[3]{x, y, z};
                 for (const ReflectedArgument *builtin : pipeline->globalInvocationIds) {
-                    if (builtin->cpuOffset > bindings->packed.size() ||
-                        builtin->cpuSize > bindings->packed.size() - builtin->cpuOffset)
+                    if (builtin->physical.offset > bindings->packed.size() ||
+                        builtin->physical.size > bindings->packed.size() - builtin->physical.offset)
                         return fail(context.error, "CPU builtin reflection is out of bounds");
-                    std::memcpy(bindings->packed.data() + builtin->cpuOffset, id,
-                                std::min(builtin->cpuSize, sizeof(id)));
+                    std::memcpy(bindings->packed.data() + builtin->physical.offset, id,
+                                std::min(builtin->physical.size, sizeof(id)));
                 }
                 const VernonStatus status = pipeline->shader->kernel.entry(&invocation);
                 if (status != VERNON_STATUS_OK)
@@ -338,7 +341,7 @@ bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState ker
         binding.array_count = 1;
         binding.argument_index = argumentIndex;
         binding.element_size =
-            static_cast<uint32_t>(argument.kind == "tensor" ? argument.tensorElementSize : argument.cpuSize);
+            static_cast<uint32_t>(argument.kind == "tensor" ? argument.tensorElementSize : argument.physical.size);
         if (!binding.element_size) {
             context.error = "CPU compute reflection contains a zero-sized argument";
             return false;
@@ -389,7 +392,8 @@ bool loadCpuEntry(VernonCpuEntryPoint entry, const char *reflection, size_t refl
                   size_t entryNameSize, CpuKernelState &state, ReflectedEntry &metadata, std::string &error) {
     try {
         const nlohmann::json parsed = nlohmann::json::parse(reflection, reflection + reflectionSize, nullptr, false);
-        if (parsed.is_discarded() || !parseReflection(parsed, std::string(entryName, entryNameSize), metadata, error))
+        if (parsed.is_discarded() ||
+            !parseReflection(parsed, std::string(entryName, entryNameSize), metadata, VERNON_RUNTIME_CPU, error))
             return false;
         state.entry = entry;
         return true;

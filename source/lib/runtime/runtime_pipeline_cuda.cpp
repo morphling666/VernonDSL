@@ -33,7 +33,8 @@ bool resolveCudaPipeline(VernonPipelineBundle &bundle, const Variant &variant, V
     const Stage &stage = bundle.stages.at(variant.compute);
     ReflectedEntry reflection;
     const nlohmann::json parsed = nlohmann::json::parse(stage.reflection, nullptr, false);
-    if (parsed.is_discarded() || !parseReflection(parsed, stage.entry, reflection, bundle.context->error))
+    if (parsed.is_discarded() ||
+        !parseReflection(parsed, stage.entry, reflection, VERNON_RUNTIME_CUDA, bundle.context->error))
         return false;
     uint32_t internalSlot = 0;
     for (const Parameter &parameter : variant.parameters)
@@ -69,7 +70,7 @@ bool resolveCudaPipeline(VernonPipelineBundle &bundle, const Variant &variant, V
                 binding.element_size = static_cast<uint32_t>(
                     argument.storageLeaves.empty()
                         ? (binding.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ? argument.tensorElementSize
-                                                                                  : argument.cpuSize)
+                                                                                  : argument.physical.size)
                         : argument.storageLeaves[leafIndex].elementSize);
                 if (!binding.element_size) {
                     bundle.context->error = "CUDA reflected argument has zero element size";

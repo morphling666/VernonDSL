@@ -82,7 +82,7 @@ Progress (2026-07-28):
 
 ### Python frontend
 
-Status: **Complete (2026-07-28).**
+Status: **In progress (2026-07-28 audit reopened).**
 
 Split the large frontend implementation by semantic responsibility rather than
 by syntax convenience:
@@ -147,7 +147,7 @@ Progress (2026-07-28):
 
 ### Runtime, RHI, and backend adapters
 
-Status: **Complete (2026-07-28).**
+Status: **In progress — ABI-profile redesign is incomplete (2026-07-28).**
 
 Continue enforcing the dependency direction:
 
@@ -195,6 +195,8 @@ Progress (2026-07-28):
 
 ### Canonical ABI and reflection
 
+Status: **Complete (2026-07-28).**
+
 Use one canonical planner for Tensor, Tuple, Struct, TensorView leaf expansion,
 vertex attributes, and inline values. CPU, CUDA, SPIR-V, and Runtime packing
 must consume that plan rather than reimplementing layout decisions.
@@ -204,6 +206,32 @@ Acceptance:
 - the same source Value has one reflected logical ABI identity across targets;
 - backend-specific physical mappings are explicit and tested;
 - cross-backend numeric and byte-layout parity tests cover nested aggregates.
+
+Completion verification (2026-07-28):
+
+- Physical planning is keyed by semantic profiles:
+  `HostValue`, `CudaKernelParameter`, `VulkanStd140UniformBuffer`,
+  `VulkanStd430StorageBuffer`, `VulkanPushConstant`,
+  `OpenGLNativeUniform`, `DirectXConstantBuffer`, and
+  `MetalConstantBuffer`. Backend and transport jointly select the profile.
+- Reflection publishes only `physical_layouts` keyed by profile and records
+  each packed argument's `value_transport`. Manifests carry one selected
+  `physical_value_layout` with explicit `profile` and `transport`.
+- Packed compute values use the same path as graphics values. Cooked Vulkan
+  and DirectX compute bundles now include the scalar `factor` layout and pass
+  byte packing through the Runtime core provider.
+- The mixed backend/profile route table and the obsolete generic graphics and
+  uniform-only layout fields were removed. Compiler reflection, cooking,
+  manifest validation, direct artifact loading, and Runtime dispatch consume
+  the same schema without compatibility parsing.
+- Typed TensorView resource plans, consolidated Struct field resolution,
+  reflection-local caches, explicit std140/std430/push-constant planning, and
+  non-square/nested aggregate checks are active.
+- A clean Release build passed. The native suite completed 109 tests with 108
+  passes and one unsupported CUDA image/sampler parameterization skipped; the Python
+  suite passed 313 tests plus 308 subtests across CPU, CUDA, OpenGL, DirectX,
+  Vulkan, Metal source cooking, non-square matrices, and nested aggregate
+  parity.
 
 ## Priority 2: complete the core product path
 

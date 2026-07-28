@@ -44,7 +44,9 @@ file(
     \"gpu_launch_abi_version\": 1,
     \"entries\": [{
       \"name\": \"fill\",
-      \"cpu_arguments_size\": 20,
+      \"physical_layouts\": {
+        \"host_value\": {\"profile\":\"host_value\",\"packed_arguments_size\":20}
+      },
       \"workgroup_size\": [2, 2, 1],
       \"arguments\": [
         {
@@ -53,15 +55,14 @@ file(
           \"element_layout\": {\"logical_type\":\"f32\",\"byte_size\":4,\"alignment\":4,
             \"layout_hash\":\"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b\",
             \"leaves\":[{\"path\":[],\"dtype\":\"f32\",\"byte_offset\":0,\"scalar_count\":1}]},
-          \"alignment\": 4,
-          \"cpu_offset\": 0,
-          \"cpu_size\": 8
+          \"physical_layouts\":{\"host_value\":{\"profile\":\"host_value\",\"size\":8,\"alignment\":8,
+            \"byte_strides\":[],\"offset\":0}}
         },
         {
           \"kind\": \"builtin\",
           \"builtin\": \"global_invocation_id\",
-          \"cpu_offset\": 8,
-          \"cpu_size\": 12
+          \"physical_layouts\":{\"host_value\":{\"profile\":\"host_value\",\"size\":12,\"alignment\":4,
+            \"byte_strides\":[],\"offset\":8}}
         }
       ]
     }]
@@ -80,13 +81,16 @@ set(PIPELINE_CANONICAL
 \"cpu_invocation_abi_version\":1,\"entry\":\"fill\",\"format\":\"native_library\",\
 \"id\":\"fill\",\"operating_system\":\"${OPERATING_SYSTEM}\",\
 \"reflection\":{\"entries\":[{\"arguments\":[\
-{\"alignment\":4,\"cpu_offset\":0,\"cpu_size\":8,\"dtype\":\"f32\",\
-\"element_layout\":{\"alignment\":4,\"byte_size\":4,\
+{\"dtype\":\"f32\",\"element_layout\":{\"alignment\":4,\"byte_size\":4,\
 \"layout_hash\":\"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b\",\
 \"leaves\":[{\"byte_offset\":0,\"dtype\":\"f32\",\"path\":[],\"scalar_count\":1}],\
-\"logical_type\":\"f32\"},\"kind\":\"tensor\"},\
-{\"builtin\":\"global_invocation_id\",\"cpu_offset\":8,\"cpu_size\":12,\"kind\":\"builtin\"}],\
-\"cpu_arguments_size\":20,\"name\":\"fill\",\"workgroup_size\":[2,2,1]}],\
+\"logical_type\":\"f32\"},\"kind\":\"tensor\",\"physical_layouts\":{\"host_value\":{\
+\"alignment\":8,\"byte_strides\":[],\"offset\":0,\"profile\":\"host_value\",\"size\":8}}},\
+{\"builtin\":\"global_invocation_id\",\"kind\":\"builtin\",\
+\"physical_layouts\":{\"host_value\":{\"alignment\":4,\"byte_strides\":[],\"offset\":8,\
+\"profile\":\"host_value\",\"size\":12}}}],\
+\"name\":\"fill\",\"physical_layouts\":{\"host_value\":{\"packed_arguments_size\":20,\
+\"profile\":\"host_value\"}},\"workgroup_size\":[2,2,1]}],\
 \"gpu_launch_abi_version\":1},\"stage\":\"compute\",\"symbol\":\"vernon_test_fill\",\
 \"target\":\"cpu\"}},\"target\":\"cpu\",\"type\":\"pipeline\",\
 \"variants\":[{\"key\":[],\"outputs\":[{\"access\":\"write\",\"dtype\":\"f32\",\

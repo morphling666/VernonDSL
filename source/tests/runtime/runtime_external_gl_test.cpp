@@ -373,6 +373,14 @@ nlohmann::json scalarElementLayout(const std::string &dtype) {
                  {{{"path", nlohmann::json::array()}, {"dtype", dtype}, {"byte_offset", 0}, {"scalar_count", 1}}})}};
 }
 
+nlohmann::json physicalValueLayout(uint64_t size, uint64_t alignment, std::initializer_list<uint64_t> byteStrides) {
+    return {{"profile", "opengl_native_uniform"},
+            {"transport", "native_uniform"},
+            {"size", size},
+            {"alignment", alignment},
+            {"byte_strides", byteStrides}};
+}
+
 std::string pipelineBundle(const nlohmann::json &artifact) {
     nlohmann::json root = {
         {"schema_version", 4},
@@ -414,18 +422,19 @@ std::string matrixBundle(const char *target) {
         root["stage_artifacts"]["vs"]["artifact"]["format"] = "gles";
         root["stage_artifacts"]["fs"]["artifact"]["format"] = "gles";
     }
-    root["variants"][0]["parameters"] =
-        nlohmann::json::array({{{"slot", 0},
-                                {"name", "transform"},
-                                {"kind", "tensor"},
-                                {"element_layout", scalarElementLayout("f32")},
-                                {"access", "read"},
-                                {"shape", nlohmann::json::array({4, 4})},
-                                {"uses", nlohmann::json::array({{{"stage", "vertex"},
-                                                                 {"interface", "uniform"},
-                                                                 {"uniform_name", "transform"},
-                                                                 {"dtype", "f32"},
-                                                                 {"shape", nlohmann::json::array({4, 4})}}})}}});
+    root["variants"][0]["parameters"] = nlohmann::json::array(
+        {{{"slot", 0},
+          {"name", "transform"},
+          {"kind", "tensor"},
+          {"element_layout", scalarElementLayout("f32")},
+          {"access", "read"},
+          {"shape", nlohmann::json::array({4, 4})},
+          {"uses", nlohmann::json::array({{{"stage", "vertex"},
+                                           {"interface", "uniform"},
+                                           {"uniform_name", "transform"},
+                                           {"dtype", "f32"},
+                                           {"shape", nlohmann::json::array({4, 4})},
+                                           {"physical_value_layout", physicalValueLayout(64, 16, {4, 16})}}})}}});
     root.erase("content_hash");
     const std::string canonical = root.dump(-1, ' ', false);
     root["content_hash"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
@@ -496,7 +505,8 @@ std::string internalValueBundle() {
                                            {"index", 2},
                                            {"dtype", "f32"},
                                            {"shape", nlohmann::json::array({2})},
-                                           {"uniform_name", "__resolution"}}})}}});
+                                           {"uniform_name", "__resolution"},
+                                           {"physical_value_layout", physicalValueLayout(8, 8, {4})}}})}}});
     root.erase("content_hash");
     const std::string canonical = root.dump(-1, ' ', false);
     root["content_hash"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
@@ -606,16 +616,24 @@ TEST(RuntimeExternalGl, InvokesDirectComputePipelineThroughRuntimeCoreProvider) 
       "entries": [{
         "name": "main",
         "workgroup_size": [4, 1, 1],
-        "cpu_arguments_size": 12,
+        "physical_layouts": {
+          "vulkan_std430_storage_buffer": {
+            "profile":"vulkan_std430_storage_buffer","packing":"resource_bindings"
+          }
+        },
         "arguments": [
           {"kind":"tensor","dtype":"f32","shape":[4],"element_layout":{"logical_type":"f32","byte_size":4,
            "alignment":4,"layout_hash":"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",
            "leaves":[{"path":[],"dtype":"f32","byte_offset":0,"scalar_count":1}]},
-           "alignment":4,"cpu_offset":0,"cpu_size":8,"binding":0},
+           "physical_layouts":{"vulkan_std430_storage_buffer":{"profile":"vulkan_std430_storage_buffer",
+           "kind":"descriptor_storage_leaves"}},
+           "binding":0},
           {"kind":"scalar","dtype":"f32","element_layout":{"logical_type":"f32","byte_size":4,
            "alignment":4,"layout_hash":"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",
            "leaves":[{"path":[],"dtype":"f32","byte_offset":0,"scalar_count":1}]},
-           "alignment":4,"cpu_offset":8,"cpu_size":4,"binding":1}
+           "physical_layouts":{"vulkan_std430_storage_buffer":{"profile":"vulkan_std430_storage_buffer",
+           "size":4,"alignment":4,"byte_strides":[]}},
+           "binding":1}
         ]
       }]
     })";
@@ -706,12 +724,15 @@ TEST(RuntimeExternalGl, UploadsColumnMajorMatricesWithoutCopying) {
     expectMatrixUpload(VERNON_RUNTIME_OPENGL, "opengl", 4, 3, columnMajor, strides, 0, columnMajor);
 }
 
-TEST(RuntimeExternalGl, UploadsRowMajorMatricesWithDesktopTranspose) {
+TEST(RuntimeExternalGl, PacksRowMajorMatricesWithCanonicalStrides) {
     constexpr std::array<int64_t, 2> strides = {4 * sizeof(float), sizeof(float)};
     constexpr std::array<float, 16> rowMajor = {
         1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F, 9.0F, 10.0F, 11.0F, 12.0F, 13.0F, 14.0F, 15.0F, 16.0F,
     };
-    expectMatrixUpload(VERNON_RUNTIME_OPENGL, "opengl", 4, 3, rowMajor, strides, 1, rowMajor);
+    constexpr std::array<float, 16> columnMajor = {
+        1.0F, 5.0F, 9.0F, 13.0F, 2.0F, 6.0F, 10.0F, 14.0F, 3.0F, 7.0F, 11.0F, 15.0F, 4.0F, 8.0F, 12.0F, 16.0F,
+    };
+    expectMatrixUpload(VERNON_RUNTIME_OPENGL, "opengl", 4, 3, rowMajor, strides, 0, columnMajor);
 }
 
 TEST(RuntimeExternalGl, PacksRowMajorMatricesForOpenGlEs) {

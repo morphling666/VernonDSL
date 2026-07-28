@@ -110,7 +110,6 @@ TEST(TensorBridgeTest, PacksNegativeStrideFromLogicalFirstElement) {
 
 TEST(TensorBridgeTest, PacksNonSquareMatrixIntoReflectedColumnMajorLayout) {
     const std::array<float, 6> source{1, 2, 3, 4, 5, 6};
-    const std::array<float, 6> expected{1, 4, 2, 5, 3, 6};
     const std::array<uint64_t, 2> shape{2, 3};
     const std::array<int64_t, 2> strides{3 * sizeof(float), sizeof(float)};
     VernonTensorView tensor{sizeof(VernonTensorView),
@@ -123,12 +122,19 @@ TEST(TensorBridgeTest, PacksNonSquareMatrixIntoReflectedColumnMajorLayout) {
                             strides.data(),
                             0,
                             sizeof(source)};
-    vernon::runtime::TensorPackingLayout layout{
-        sizeof(float), {2, 3}, {sizeof(float), 2 * sizeof(float)}, sizeof(expected)};
+    vernon::runtime::TensorPackingLayout layout{sizeof(float), {2, 3}, {sizeof(float), 16}, 48};
 
     const auto packed = vernon::runtime::packTensor(tensor, layout);
     ASSERT_TRUE(packed);
-    EXPECT_EQ(std::memcmp(packed->data(), expected.data(), sizeof(expected)), 0);
+    ASSERT_EQ(packed->size(), 48u);
+    for (size_t row = 0; row < 2; ++row)
+        for (size_t column = 0; column < 3; ++column) {
+            float value = 0;
+            std::memcpy(&value, packed->data() + row * sizeof(float) + column * 16, sizeof(value));
+            EXPECT_EQ(value, source[row * 3 + column]);
+        }
+    for (size_t offset : {size_t{8}, size_t{12}, size_t{24}, size_t{28}, size_t{40}, size_t{44}})
+        EXPECT_EQ((*packed)[offset], 0);
 }
 
 TEST(TensorBridgeTest, PacksRankThreeTensorWithReflectedPadding) {

@@ -147,43 +147,44 @@ TEST(PipelineManifestRequirements, ParsesReflectedUniformTensorLayout) {
         {"key", nlohmann::json::array()},
         {"program", {{"vertex", "vertex.spv"}, {"fragment", "fragment.spv"}}},
         {"parameters",
-         nlohmann::json::array({{{"slot", 0},
-                                 {"name", "weights"},
-                                 {"kind", "tensor"},
-                                 {"element_layout",
-                                  {{"logical_type", "f32"},
-                                   {"byte_size", 4},
-                                   {"alignment", 4},
-                                   {"layout_hash", "cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b"},
-                                   {"leaves", nlohmann::json::array({{{"path", nlohmann::json::array()},
-                                                                      {"dtype", "f32"},
-                                                                      {"byte_offset", 0},
-                                                                      {"scalar_count", 1}}})}}},
-                                 {"shape", nlohmann::json::array({2, 3})},
-                                 {"uses", nlohmann::json::array({{{"stage", "vertex"},
-                                                                  {"interface", "uniform"},
-                                                                  {"index", 0},
-                                                                  {"shape", nlohmann::json::array({2, 3})},
-                                                                  {"vernon.set", 0},
-                                                                  {"vernon.binding", 2},
-                                                                  {"uniform_layout",
-                                                                   {{"storage", "uniform_buffer"},
-                                                                    {"size", 32},
-                                                                    {"alignment", 16},
-                                                                    {"byte_strides", nlohmann::json::array({16, 4})},
-                                                                    {"matrix_order", "row_major"}}}}})}}})}};
+         nlohmann::json::array(
+             {{{"slot", 0},
+               {"name", "weights"},
+               {"kind", "tensor"},
+               {"element_layout",
+                {{"logical_type", "f32"},
+                 {"byte_size", 4},
+                 {"alignment", 4},
+                 {"layout_hash", "cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b"},
+                 {"leaves", nlohmann::json::array({{{"path", nlohmann::json::array()},
+                                                    {"dtype", "f32"},
+                                                    {"byte_offset", 0},
+                                                    {"scalar_count", 1}}})}}},
+               {"shape", nlohmann::json::array({2, 3})},
+               {"uses", nlohmann::json::array({{{"stage", "vertex"},
+                                                {"interface", "uniform"},
+                                                {"index", 0},
+                                                {"shape", nlohmann::json::array({2, 3})},
+                                                {"vernon.set", 0},
+                                                {"vernon.binding", 2},
+                                                {"physical_value_layout",
+                                                 {{"profile", "vulkan_std140_uniform_buffer"},
+                                                  {"transport", "uniform_buffer"},
+                                                  {"size", 32},
+                                                  {"alignment", 16},
+                                                  {"byte_strides", nlohmann::json::array({16, 4})}}}}})}}})}};
     vernon::runtime::Variant variant;
     std::string error;
     ASSERT_TRUE(vernon::runtime::parseVariant(manifest, variant, error)) << error;
     ASSERT_EQ(variant.parameters.size(), 1u);
     ASSERT_EQ(variant.parameters[0].uses.size(), 1u);
-    const auto &layout = variant.parameters[0].uses[0].uniformLayout;
+    const auto &layout = variant.parameters[0].uses[0].physicalValueLayout;
     ASSERT_TRUE(layout);
-    EXPECT_EQ(layout->storage, "uniform_buffer");
+    EXPECT_EQ(layout->profile, "vulkan_std140_uniform_buffer");
+    EXPECT_EQ(layout->transport, "uniform_buffer");
     EXPECT_EQ(layout->size, 32u);
     EXPECT_EQ(layout->alignment, 16u);
     EXPECT_EQ(layout->byteStrides, (std::vector<uint64_t>{16, 4}));
-    EXPECT_EQ(layout->matrixOrder, "row_major");
     ASSERT_EQ(variant.parameters[0].elementLayout.leaves.size(), 1u);
     EXPECT_TRUE(variant.parameters[0].elementLayout.leaves[0].path.empty());
 }

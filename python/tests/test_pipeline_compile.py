@@ -40,6 +40,36 @@ def _scalar_layout(dtype: str) -> dict[str, object]:
     }
 
 
+def _physical_value_layout(
+    profile: str,
+    size: int,
+    alignment: int,
+    byte_strides: list[int],
+) -> dict[str, object]:
+    return {
+        "profile": profile,
+        "size": size,
+        "alignment": alignment,
+        "byte_strides": byte_strides,
+    }
+
+
+def _physical_layouts(size: int, alignment: int, byte_strides: list[int]) -> dict[str, object]:
+    return {
+        profile: _physical_value_layout(profile, size, alignment, byte_strides)
+        for profile in (
+            "host_value",
+            "cuda_kernel_parameter",
+            "vulkan_std140_uniform_buffer",
+            "vulkan_std430_storage_buffer",
+            "vulkan_push_constant",
+            "opengl_native_uniform",
+            "directx_constant_buffer",
+            "metal_constant_buffer",
+        )
+    }
+
+
 def _stage(stage: str, artifact: bytes, interface: dict[str, object]) -> CompiledStage:
     if not artifact.startswith(b"#version"):
         artifact = b"#version 330\n" + artifact
@@ -233,6 +263,8 @@ class PipelineCompileTests(unittest.TestCase):
                             "vernon.source_name": "__resolution",
                             "vernon.interface": "uniform",
                             "vernon.implicit": "resolution",
+                            "value_transport": "push_constant",
+                            "physical_layouts": _physical_layouts(8, 8, [4]),
                         },
                     ],
                 },
@@ -337,13 +369,8 @@ class PipelineCompileTests(unittest.TestCase):
                             "vernon.interface": "uniform",
                             "vernon.set": 0,
                             "vernon.binding": 2,
-                            "uniform_layout": {
-                                "storage": "uniform_buffer",
-                                "size": 64,
-                                "alignment": 16,
-                                "byte_strides": [16, 4],
-                                "matrix_order": "row_major",
-                            },
+                            "value_transport": "uniform_buffer",
+                            "physical_layouts": _physical_layouts(64, 16, [16, 4]),
                         }
                     ],
                 },
@@ -352,13 +379,13 @@ class PipelineCompileTests(unittest.TestCase):
         uses = external_parameters(records)["material"]
         self.assertEqual(uses[0]["uniform_name"], "material._m0")
         self.assertEqual(
-            uses[0]["uniform_layout"],
+            uses[0]["physical_value_layout"],
             {
-                "storage": "uniform_buffer",
+                "profile": "vulkan_std140_uniform_buffer",
+                "transport": "uniform_buffer",
                 "size": 64,
                 "alignment": 16,
                 "byte_strides": [16, 4],
-                "matrix_order": "row_major",
             },
         )
 
@@ -380,10 +407,8 @@ class PipelineCompileTests(unittest.TestCase):
                             "vernon.interface": "uniform",
                             "vernon.set": 0,
                             "vernon.binding": 3,
-                            "physical_size": 120,
-                            "physical_alignment": 4,
-                            "array_strides": [60, 20, 4],
-                            "proposed_storage_class": "Uniform",
+                            "value_transport": "uniform_buffer",
+                            "physical_layouts": _physical_layouts(120, 4, [60, 20, 4]),
                         }
                     ],
                 },
@@ -391,9 +416,10 @@ class PipelineCompileTests(unittest.TestCase):
         }
         use = external_parameters(records)["weights"][0]
         self.assertEqual(
-            use["uniform_layout"],
+            use["physical_value_layout"],
             {
-                "storage": "uniform_buffer",
+                "profile": "vulkan_std140_uniform_buffer",
+                "transport": "uniform_buffer",
                 "size": 120,
                 "alignment": 4,
                 "byte_strides": [60, 20, 4],
@@ -427,10 +453,8 @@ class PipelineCompileTests(unittest.TestCase):
                             "vernon.interface": "uniform",
                             "vernon.set": 0,
                             "vernon.binding": 0,
-                            "physical_size": 1056,
-                            "physical_alignment": 4,
-                            "array_strides": [528, 176, 44],
-                            "proposed_storage_class": "StorageBuffer",
+                            "value_transport": "storage_buffer",
+                            "physical_layouts": _physical_layouts(1056, 4, [528, 176, 44]),
                         }
                     ],
                 },
@@ -438,14 +462,41 @@ class PipelineCompileTests(unittest.TestCase):
         }
         use = external_parameters(records)["aggregate"][0]
         self.assertEqual(
-            use["uniform_layout"],
+            use["physical_value_layout"],
             {
-                "storage": "storage_buffer",
+                "profile": "vulkan_std430_storage_buffer",
+                "transport": "storage_buffer",
                 "size": 1056,
                 "alignment": 4,
                 "byte_strides": [528, 176, 44],
             },
         )
+
+    def test_compute_tensor_resource_is_normalized_to_storage(self) -> None:
+        records = {
+            "compute": {
+                "entry": "compute_main",
+                "target": "cpu",
+                "interface": {
+                    "arguments": [
+                        {
+                            "index": 0,
+                            "kind": "tensor",
+                            "type": "!vernon.tensor_view<f32, 1, write>",
+                            "element_layout": _scalar_layout("f32"),
+                            "shape": [0],
+                            "access": "write",
+                            "vernon.source_name": "output",
+                            "vernon.interface": "resource",
+                        }
+                    ]
+                },
+            }
+        }
+
+        use = external_parameters(records)["output"][0]
+        self.assertEqual(use["interface"], "storage")
+        self.assertNotIn("physical_value_layout", use)
 
     def test_parameter_merge_and_slot_layout_are_exact(self) -> None:
         uses = [
@@ -505,6 +556,8 @@ class PipelineCompileTests(unittest.TestCase):
                         "type": "f32",
                         "vernon.source_name": "alpha",
                         "vernon.interface": "uniform",
+                        "value_transport": "push_constant",
+                        "physical_layouts": _physical_layouts(4, 4, []),
                     },
                 ],
                 "results": [

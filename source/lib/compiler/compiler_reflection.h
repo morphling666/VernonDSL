@@ -4,13 +4,10 @@
 
 #include "mlir/IR/BuiltinOps.h"
 
-#include <cstdint>
 #include <string>
 #include <vector>
 
 namespace vernon::compiler {
-
-uint64_t sourceTypeSize(mlir::Type type);
 
 mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::ModuleOp sourceModule);
 

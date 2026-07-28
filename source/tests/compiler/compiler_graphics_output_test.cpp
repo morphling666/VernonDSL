@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -548,16 +549,15 @@ module {
     const std::string_view reflected(reflection.data, reflection.size);
     EXPECT_NE(reflected.find("\"kind\":\"tensor_value\""), std::string_view::npos);
     EXPECT_NE(reflected.find("\"shape\":[2,3,5]"), std::string_view::npos);
-    EXPECT_NE(reflected.find("\"array_strides\":[240,80,16]"), std::string_view::npos);
-    EXPECT_NE(reflected.find("\"physical_size\":480"), std::string_view::npos);
-    EXPECT_NE(reflected.find("\"physical_alignment\":16"), std::string_view::npos);
-    EXPECT_NE(reflected.find("\"proposed_storage_class\":\"Uniform\""), std::string_view::npos);
-    EXPECT_NE(reflected.find("\"proposed_storage_class\":\"PushConstant\""), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"profile\":\"vulkan_std140_uniform_buffer\""), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"byte_strides\":[240,80,16]"), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"size\":480"), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"alignment\":16"), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"value_transport\":\"uniform_buffer\""), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"value_transport\":\"push_constant\""), std::string_view::npos);
     EXPECT_NE(reflected.find("\"vernon.binding\":0"), std::string_view::npos);
     EXPECT_NE(reflected.find("\"vernon.binding\":1"), std::string_view::npos);
     EXPECT_NE(reflected.find("\"shape\":[3,4]"), std::string_view::npos);
-    EXPECT_NE(reflected.find("\"matrix_stride\":16"), std::string_view::npos);
-    EXPECT_NE(reflected.find("\"matrix_order\":\"column_major\""), std::string_view::npos);
 
     vernonCompileResultDestroy(result);
     for (VernonTarget target : {VERNON_TARGET_OPENGL, VERNON_TARGET_DIRECTX}) {
@@ -651,9 +651,10 @@ module {
         const std::string_view reflected(reflection.data, reflection.size);
         EXPECT_NE(reflected.find("\"kind\":\"tensor_value\""), std::string_view::npos);
         EXPECT_NE(reflected.find("\"shape\":[2,2,2]"), std::string_view::npos);
-        EXPECT_NE(reflected.find("\"array_strides\":[64,32,16]"), std::string_view::npos);
-        EXPECT_NE(reflected.find("\"physical_size\":128"), std::string_view::npos);
-        EXPECT_NE(reflected.find("\"proposed_storage_class\":\"StorageBuffer\""), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"profile\":\"vulkan_std430_storage_buffer\""), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"byte_strides\":[16,8,4]"), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"size\":32"), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"value_transport\":\"storage_buffer\""), std::string_view::npos);
         EXPECT_NE(reflected.find("\"vernon.binding\":0"), std::string_view::npos);
         EXPECT_NE(reflected.find("\"binding\":1"), std::string_view::npos);
         vernonCompileResultDestroy(result);
@@ -705,6 +706,8 @@ module {
     EXPECT_NE(reflected.find("\"component_count\":4"), std::string_view::npos);
     EXPECT_NE(reflected.find("\"component_count\":2"), std::string_view::npos);
     EXPECT_NE(reflected.find("\"byte_offset\":16"), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"byte_strides\":[4,16]"), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"size\":48"), std::string_view::npos);
     vernonCompileResultDestroy(result);
 
     constexpr std::string_view overlapModule = R"mlir(
@@ -782,6 +785,69 @@ module {
     EXPECT_NE(reflected.find("\"dtype\":\"u32\""), std::string_view::npos);
     EXPECT_NE(reflected.find("\"path\":[\"object_id\"]"), std::string_view::npos);
     EXPECT_NE(reflected.find("\"shape\":[3]"), std::string_view::npos);
+    vernonCompileResultDestroy(result);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerGraphicsOutput, ReflectsNestedLogicalAndPhysicalAbiRoutes) {
+    constexpr std::string_view nestedModule = R"mlir(
+module {
+  "vernon.struct"() {
+    sym_name = "Payload",
+    fields = ["id:i32", "weights:tensor<2xf32>"],
+    abi_leaf_dtypes = ["i32", "f32"],
+    abi_size = 12 : i64,
+    abi_alignment = 4 : i64,
+    abi_field_offsets = array<i64: 0, 4>
+  } : () -> ()
+  "vernon.struct"() {
+    sym_name = "Nested",
+    fields = ["payload:!vernon.struct<\"Payload\">", "pair:tuple<f32, i32>"],
+    abi_leaf_dtypes = ["i32", "f32", "f32", "u32"],
+    abi_size = 20 : i64,
+    abi_alignment = 4 : i64,
+    abi_field_offsets = array<i64: 0, 12>
+  } : () -> ()
+  func.func @nested(
+      %values: !vernon.tensor_view<!vernon.struct<"Nested">, 1, "read"> {
+        vernon.interface = "resource",
+        vernon.set = 0 : i64,
+        vernon.binding = 0 : i64,
+        vernon.tensor_shape = array<i64: 2>
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 1, 1, 1>
+      } {
+    return
+  }
+}
+)mlir";
+
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *result = vernonCompilerValidateMlir(compiler, nestedModule.data(), nestedModule.size());
+    ASSERT_TRUE(result);
+    ASSERT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+    const VernonStringView reflected = vernonCompileResultGetReflection(result);
+    const nlohmann::json root = nlohmann::json::parse(reflected.data, reflected.data + reflected.size);
+    const nlohmann::json &argument = root.at("entries").at(0).at("arguments").at(0);
+    EXPECT_FALSE(root.contains("backend_abi_routes"));
+    EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("kind"), "host_pointer");
+    EXPECT_EQ(argument.at("physical_layouts").at("cuda_kernel_parameter").at("kind"), "strided_memref_storage_leaves");
+    EXPECT_EQ(argument.at("physical_layouts").at("vulkan_std430_storage_buffer").at("kind"),
+              "descriptor_storage_leaves");
+    EXPECT_EQ(argument.at("physical_layouts").at("directx_constant_buffer").at("kind"), "descriptor_storage_leaves");
+    EXPECT_EQ(argument.at("physical_layouts").at("cuda_kernel_parameter").at("element_layout_hash"),
+              argument.at("physical_layouts").at("vulkan_std430_storage_buffer").at("element_layout_hash"));
+    EXPECT_EQ(argument.at("element_layout").at("byte_size"), 20);
+    EXPECT_EQ(argument.at("element_layout").at("alignment"), 4);
+    EXPECT_EQ(argument.at("element_layout").at("leaves").at(3).at("dtype"), "u32");
+    EXPECT_EQ(argument.at("element_layout").at("leaves").at(3).at("byte_offset"), 16);
+    EXPECT_EQ(argument.at("storage_leaves").at(0).at("byte_offset"), 0);
+    EXPECT_EQ(argument.at("storage_leaves").at(1).at("byte_offset"), 4);
+    EXPECT_EQ(argument.at("storage_leaves").at(2).at("byte_offset"), 12);
+    EXPECT_EQ(argument.at("storage_leaves").at(3).at("byte_offset"), 16);
     vernonCompileResultDestroy(result);
     vernonCompilerDestroy(compiler);
 }

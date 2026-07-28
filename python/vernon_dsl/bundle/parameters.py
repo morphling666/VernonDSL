@@ -27,57 +27,30 @@ def _backend_name(name: str) -> str:
     return f"_{result}" if not result or result[0].isdigit() else result
 
 
-def _uniform_layout(row: Mapping[str, Any], dtype: str | None, shape: Sequence[int]) -> dict[str, Any] | None:
-    size = row.get("physical_size")
-    alignment = row.get("physical_alignment")
-    storage_class = row.get("proposed_storage_class")
-    if not isinstance(size, int) or size <= 0 or not isinstance(alignment, int) or alignment <= 0:
-        return None
-    if storage_class == "StorageBuffer":
-        element_layout = row.get("element_layout")
-        element_size = element_layout.get("byte_size") if isinstance(element_layout, Mapping) else None
-        if not isinstance(element_size, int) or element_size <= 0 or any(dimension <= 0 for dimension in shape):
-            return None
-        reflected_strides = row.get("array_strides")
-        if isinstance(reflected_strides, list) and len(reflected_strides) == len(shape):
-            byte_strides = reflected_strides
-        else:
-            byte_strides = [0] * len(shape)
-            stride = element_size
-            for dimension in range(len(shape) - 1, -1, -1):
-                byte_strides[dimension] = stride
-                stride *= shape[dimension]
-        return {
-            "storage": "storage_buffer",
-            "size": size,
-            "alignment": alignment,
-            "byte_strides": byte_strides,
-        }
-    scalar_sizes = {"bool": 1, "f16": 2, "i32": 4, "u32": 4, "f32": 4, "f64": 8}
-    element_size = scalar_sizes.get(dtype or "")
-    if element_size is None:
-        return None
-    reflected_strides = row.get("array_strides")
-    if isinstance(reflected_strides, list) and len(reflected_strides) == len(shape):
-        byte_strides = reflected_strides
-    elif len(shape) == 2 and isinstance(row.get("matrix_stride"), int):
-        byte_strides = [element_size, row["matrix_stride"]]
-    elif len(shape) == 1:
-        byte_strides = [element_size]
-    elif not shape:
-        byte_strides = []
-    else:
-        return None
-    result = {
-        "storage": "uniform_buffer" if storage_class == "Uniform" else "inline",
-        "size": size,
-        "alignment": alignment,
-        "byte_strides": byte_strides,
-    }
-    matrix_order = row.get("matrix_order")
-    if isinstance(matrix_order, str):
-        result["matrix_order"] = matrix_order
-    return result
+def _physical_value_profile(target: object, transport: object) -> tuple[str, str]:
+    if target == "cpu":
+        return "host_value", "host_value"
+    if target == "cuda":
+        return "cuda_kernel_parameter", "kernel_parameter"
+    if not isinstance(transport, str):
+        raise PipelineCompileError("packed value argument is missing its reflected transport")
+    if transport == "storage_buffer":
+        return "vulkan_std430_storage_buffer", transport
+    if target == "vulkan":
+        if transport == "uniform_buffer":
+            return "vulkan_std140_uniform_buffer", transport
+        if transport == "push_constant":
+            return "vulkan_push_constant", transport
+    if target in {"opengl", "opengles"}:
+        if transport == "uniform_buffer":
+            return "vulkan_std140_uniform_buffer", transport
+        if transport == "push_constant":
+            return "opengl_native_uniform", "native_uniform"
+    if target == "directx" and transport in {"uniform_buffer", "push_constant"}:
+        return "directx_constant_buffer", transport
+    if target == "metal" and transport in {"uniform_buffer", "push_constant"}:
+        return "metal_constant_buffer", transport
+    raise PipelineCompileError(f"unsupported physical value transport {transport!r} for target {target!r}")
 
 
 def _internal_parameter_source(row: Mapping[str, Any]) -> str | None:
@@ -136,6 +109,13 @@ def reflected_parameters(
                 "access": row.get("access", "read"),
                 "dimension": row.get("dimension"),
             }
+            packed_value = interface_name == "uniform" or (
+                stage == "compute" and row.get("kind", "scalar") not in {"tensor", "texture", "sampler"}
+            )
+            if packed_value and stage == "compute":
+                use["interface"] = "value"
+            elif stage == "compute" and row.get("kind") == "tensor":
+                use["interface"] = "storage"
             dtype = row.get("dtype") or row.get("vernon.dtype") or inferred_dtype
             if dtype is not None:
                 use["dtype"] = dtype
@@ -144,12 +124,14 @@ def reflected_parameters(
                 if not isinstance(element_layout, Mapping):
                     raise PipelineCompileError(f"{stage} Tensor argument is missing canonical element_layout")
                 use["element_layout"] = dict(element_layout)
-            if (
-                interface_name == "uniform" or (stage == "compute" and row.get("kind") == "tensor_value")
-            ) and "uniform_layout" not in row:
-                layout = _uniform_layout(row, use.get("dtype"), use["shape"])
-                if layout is not None:
-                    use["uniform_layout"] = layout
+            if packed_value:
+                profile, transport = _physical_value_profile(record.get("target"), row.get("value_transport"))
+                physical_layouts = row.get("physical_layouts")
+                selected_layout = physical_layouts.get(profile) if isinstance(physical_layouts, Mapping) else None
+                if not isinstance(selected_layout, Mapping):
+                    raise PipelineCompileError(f"{stage} packed value argument is missing profile {profile!r}")
+                use["physical_value_layout"] = dict(selected_layout)
+                use["physical_value_layout"]["transport"] = transport
             if internal_source is not None:
                 use["internal_source"] = internal_source
                 if internal_source == "system_value":
@@ -160,7 +142,6 @@ def reflected_parameters(
                 "vernon.set",
                 "vernon.binding",
                 "sampled_texture_bindings",
-                "uniform_layout",
                 "location_span",
                 "attribute_leaves",
             ):

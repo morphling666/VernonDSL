@@ -19,9 +19,9 @@ struct SampledTextureBinding {
     uint32_t binding{UINT32_MAX};
 };
 
-struct UniformLayout {
-    std::string storage;
-    std::string matrixOrder;
+struct PhysicalValueLayout {
+    std::string profile;
+    std::string transport;
     uint64_t size{};
     uint64_t alignment{1};
     std::vector<uint64_t> byteStrides;
@@ -75,7 +75,7 @@ struct ParameterUse {
     uint32_t binding{UINT32_MAX};
     std::vector<SampledTextureBinding> sampledTextureBindings;
     std::vector<AttributeLeaf> attributeLeaves;
-    std::optional<UniformLayout> uniformLayout;
+    std::optional<PhysicalValueLayout> physicalValueLayout;
 };
 
 struct Parameter {

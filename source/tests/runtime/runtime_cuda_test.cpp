@@ -52,7 +52,9 @@ TEST(RuntimeCuda, CopiesAndInvokesDirectComputePipeline) {
     "entries": [{
       "name": "scale",
       "workgroup_size": [4, 1, 1],
-      "cpu_arguments_size": 12,
+      "physical_layouts": {
+        "cuda_kernel_parameter": {"profile":"cuda_kernel_parameter","packing":"kernel_parameters"}
+      },
       "arguments": [
         {
           "kind": "tensor",
@@ -61,9 +63,8 @@ TEST(RuntimeCuda, CopiesAndInvokesDirectComputePipeline) {
           "element_layout": {"logical_type":"f32","byte_size":4,"alignment":4,
             "layout_hash":"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",
             "leaves":[{"path":[],"dtype":"f32","byte_offset":0,"scalar_count":1}]},
-          "alignment": 4,
-          "cpu_offset": 0,
-          "cpu_size": 8
+          "physical_layouts":{"cuda_kernel_parameter":{"profile":"cuda_kernel_parameter",
+            "kind":"strided_memref_storage_leaves"}}
         },
         {
           "kind": "scalar",
@@ -71,9 +72,8 @@ TEST(RuntimeCuda, CopiesAndInvokesDirectComputePipeline) {
           "element_layout": {"logical_type":"f32","byte_size":4,"alignment":4,
             "layout_hash":"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",
             "leaves":[{"path":[],"dtype":"f32","byte_offset":0,"scalar_count":1}]},
-          "alignment": 4,
-          "cpu_offset": 8,
-          "cpu_size": 4
+          "physical_layouts":{"cuda_kernel_parameter":{"profile":"cuda_kernel_parameter",
+            "size":4,"alignment":4,"byte_strides":[]}}
         }
       ]
     }]

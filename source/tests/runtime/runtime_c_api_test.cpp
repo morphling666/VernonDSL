@@ -26,17 +26,23 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     ASSERT_TRUE(vernonRuntimeRegisterStaticCpuEntry({static_symbol, sizeof(static_symbol) - 1}, fill_grid) ==
                 VERNON_STATUS_OK);
     ASSERT_TRUE(vernonRuntimeRegisterStaticCpuEntry({nullptr, 0}, fill_grid) == VERNON_STATUS_INVALID_ARGUMENT);
-    static const char reflection[] = "{\"gpu_launch_abi_version\":1,\"entries\":[{\"name\":\"fill\","
-                                     "\"cpu_arguments_size\":20,\"workgroup_size\":[2,2,1],\"arguments\":["
-                                     "{\"kind\":\"tensor\",\"dtype\":\"f32\",\"shape\":[12],"
-                                     "\"element_layout\":{\"logical_type\":\"f32\",\"byte_size\":4,"
-                                     "\"alignment\":4,\"layout_hash\":"
-                                     "\"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b\","
-                                     "\"leaves\":[{\"path\":[],\"dtype\":\"f32\",\"byte_offset\":0,"
-                                     "\"scalar_count\":1}]},"
-                                     "\"alignment\":4,\"cpu_offset\":0,\"cpu_size\":8},"
-                                     "{\"kind\":\"builtin\",\"builtin\":\"global_invocation_id\","
-                                     "\"cpu_offset\":8,\"cpu_size\":12}]}]}";
+    static const char reflection[] =
+        "{\"gpu_launch_abi_version\":1,\"entries\":[{\"name\":\"fill\","
+        "\"physical_layouts\":{\"host_value\":{\"profile\":\"host_value\","
+        "\"packed_arguments_size\":20}},"
+        "\"workgroup_size\":[2,2,1],\"arguments\":["
+        "{\"kind\":\"tensor\",\"dtype\":\"f32\",\"shape\":[12],"
+        "\"element_layout\":{\"logical_type\":\"f32\",\"byte_size\":4,"
+        "\"alignment\":4,\"layout_hash\":"
+        "\"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b\","
+        "\"leaves\":[{\"path\":[],\"dtype\":\"f32\",\"byte_offset\":0,"
+        "\"scalar_count\":1}]},"
+        "\"physical_layouts\":{\"host_value\":{\"profile\":\"host_value\","
+        "\"size\":8,\"alignment\":8,\"byte_strides\":[],\"offset\":0}}},"
+        "{\"kind\":\"builtin\",\"builtin\":\"global_invocation_id\","
+        "\"physical_layouts\":{\"host_value\":{\"profile\":\"host_value\",\"size\":12,\"alignment\":4,"
+        "\"byte_strides\":[],\"offset\":8}},"
+        "\"index\":1}]}]}";
     VernonRuntimeCapabilities capabilities = vernonRuntimeGetCapabilities(VERNON_RUNTIME_CPU);
     ASSERT_TRUE(capabilities.available && capabilities.supports_compute);
     VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);

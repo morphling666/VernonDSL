@@ -27,12 +27,16 @@ TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
     setScalarLayout(contiguous, "f32", VERNON_DATA_F32);
     contiguous.source = "direct";
     contiguous.uses.push_back({"compute", "buffer", "", "f32", {2}, 1, UINT32_MAX, 0, 0, 0, {}});
+    contiguous.uses.back().physicalValueLayout =
+        PhysicalValueLayout{"vulkan_std430_storage_buffer", "storage_buffer", 8, 4, {4}};
     Parameter strided;
     strided.slot = 1;
     strided.kind = "tensor";
     setScalarLayout(strided, "f32", VERNON_DATA_F32);
     strided.source = "direct";
     strided.uses.push_back({"compute", "buffer", "", "f32", {2}, 0, UINT32_MAX, 0, 0, 1, {}});
+    strided.uses.back().physicalValueLayout =
+        PhysicalValueLayout{"vulkan_std430_storage_buffer", "storage_buffer", 8, 4, {4}};
     variant.parameters = {contiguous, strided};
 
     const std::array<float, 2> contiguousValues{3, 4};
@@ -74,10 +78,10 @@ TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
     std::string error;
     ASSERT_TRUE(planComputeInvocation(variant, invocation, plan, error)) << error;
     ASSERT_EQ(plan.arguments.size(), 2u);
-    ASSERT_EQ(plan.hostTensorStorage.size(), 1u);
+    ASSERT_EQ(plan.hostTensorStorage.size(), 2u);
     const std::array<float, 2> expectedPacked{1, 2};
     EXPECT_EQ(std::memcmp(plan.arguments[0].scalarData, expectedPacked.data(), sizeof(expectedPacked)), 0);
-    EXPECT_EQ(plan.arguments[1].scalarData, contiguousValues.data());
+    EXPECT_EQ(std::memcmp(plan.arguments[1].scalarData, contiguousValues.data(), sizeof(contiguousValues)), 0);
     EXPECT_EQ(plan.grid.x, 4u);
     EXPECT_EQ(plan.grid.y, 1u);
     EXPECT_EQ(plan.grid.z, 1u);

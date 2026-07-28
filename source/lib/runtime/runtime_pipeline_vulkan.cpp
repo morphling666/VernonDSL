@@ -37,7 +37,8 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         const Stage &stage = bundle.stages.at(variant.compute);
         ReflectedEntry reflection;
         const nlohmann::json parsed = nlohmann::json::parse(stage.reflection, nullptr, false);
-        if (parsed.is_discarded() || !parseReflection(parsed, stage.entry, reflection, bundle.context->error)) {
+        if (parsed.is_discarded() ||
+            !parseReflection(parsed, stage.entry, reflection, VERNON_RUNTIME_VULKAN, bundle.context->error)) {
             delete state;
             return false;
         }
@@ -82,7 +83,7 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     candidate.layout.argument_index = use.index;
                     candidate.layout.element_size = static_cast<uint32_t>(
                         argument.storageLeaves.empty()
-                            ? (argument.kind == "tensor" ? argument.tensorElementSize : argument.physicalSize)
+                            ? (argument.kind == "tensor" ? argument.tensorElementSize : argument.physical.size)
                             : argument.storageLeaves[leafIndex].elementSize);
                     // Aggregate lowering already folds each leaf's byte offset into the shader index.
                     // Every leaf descriptor must therefore retain the base address of the original AoS buffer.
@@ -150,8 +151,8 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
             candidate.layout.array_count = 1;
             candidate.binding.externalSlot = parameter.slot;
-            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.uniformLayout &&
-                use.uniformLayout->storage == "storage_buffer" && parameter.elementLayout.byteSize &&
+            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.physicalValueLayout &&
+                use.physicalValueLayout->transport == "storage_buffer" && parameter.elementLayout.byteSize &&
                 use.binding != UINT32_MAX) {
                 candidate.layout.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
                 candidate.layout.element_size = parameter.elementLayout.byteSize;
@@ -171,10 +172,10 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 if (!dtype)
                     return false;
                 const size_t elementSize = dataTypeSize(*dtype);
-                candidate.layout.kind = use.uniformLayout && use.uniformLayout->storage == "uniform_buffer"
+                candidate.layout.kind = use.physicalValueLayout->transport == "uniform_buffer"
                                             ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
                                             : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-                const uint64_t physicalSize = use.uniformLayout ? use.uniformLayout->size : count * elementSize;
+                const uint64_t physicalSize = use.physicalValueLayout->size;
                 if (!physicalSize || physicalSize > UINT32_MAX ||
                     (candidate.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER && use.binding == UINT32_MAX))
                     return false;
@@ -182,7 +183,7 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
                 candidate.layout.element_count = static_cast<uint32_t>(count);
                 candidate.layout.vector_count = shape.size() == 2 ? static_cast<uint32_t>(shape[0]) : 1;
-                const uint64_t physicalAlignment = use.uniformLayout ? use.uniformLayout->alignment : elementSize;
+                const uint64_t physicalAlignment = use.physicalValueLayout->alignment;
                 if (!physicalAlignment || physicalAlignment > UINT32_MAX)
                     return false;
                 candidate.layout.element_alignment = static_cast<uint32_t>(physicalAlignment);
@@ -193,27 +194,11 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 candidate.binding.packing.elementSize = elementSize;
                 candidate.binding.packing.shape = shape;
                 candidate.binding.packing.byteSize = static_cast<size_t>(physicalSize);
-                if (use.uniformLayout) {
-                    candidate.binding.packing.byteStrides.reserve(use.uniformLayout->byteStrides.size());
-                    for (uint64_t stride : use.uniformLayout->byteStrides) {
-                        if (stride > SIZE_MAX)
-                            return false;
-                        candidate.binding.packing.byteStrides.push_back(static_cast<size_t>(stride));
-                    }
-                } else {
-                    candidate.binding.packing.byteStrides.resize(shape.size());
-                    size_t stride = elementSize;
-                    const bool columnMajorMatrix =
-                        shape.size() == 2 && shape[0] == shape[1] && (shape[0] == 3 || shape[0] == 4);
-                    if (columnMajorMatrix) {
-                        candidate.binding.packing.byteStrides = {elementSize,
-                                                                 static_cast<size_t>(shape[0]) * elementSize};
-                    } else {
-                        for (size_t dimension = shape.size(); dimension-- > 0;) {
-                            candidate.binding.packing.byteStrides[dimension] = stride;
-                            stride *= static_cast<size_t>(shape[dimension]);
-                        }
-                    }
+                candidate.binding.packing.byteStrides.reserve(use.physicalValueLayout->byteStrides.size());
+                for (uint64_t stride : use.physicalValueLayout->byteStrides) {
+                    if (stride > SIZE_MAX)
+                        return false;
+                    candidate.binding.packing.byteStrides.push_back(static_cast<size_t>(stride));
                 }
                 if (candidate.binding.packing.byteStrides.size() != shape.size())
                     return false;

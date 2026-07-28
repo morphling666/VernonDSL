@@ -7,8 +7,35 @@
 
 namespace vernon::runtime {
 
+const char *physicalValueProfileName(VernonRuntimeBackend backend, const std::string &transport) {
+    switch (backend) {
+    case VERNON_RUNTIME_CPU:
+        return "host_value";
+    case VERNON_RUNTIME_CUDA:
+        return "cuda_kernel_parameter";
+    case VERNON_RUNTIME_VULKAN:
+        if (transport == "push_constant")
+            return "vulkan_push_constant";
+        if (transport == "uniform_buffer")
+            return "vulkan_std140_uniform_buffer";
+        return "vulkan_std430_storage_buffer";
+    case VERNON_RUNTIME_OPENGL:
+    case VERNON_RUNTIME_OPENGL_ES:
+        if (transport == "native_uniform" || transport == "push_constant")
+            return "opengl_native_uniform";
+        if (transport == "uniform_buffer")
+            return "vulkan_std140_uniform_buffer";
+        return "vulkan_std430_storage_buffer";
+    case VERNON_RUNTIME_DIRECTX12:
+        if (transport == "uniform_buffer" || transport == "push_constant")
+            return "directx_constant_buffer";
+        return "vulkan_std430_storage_buffer";
+    }
+    return "";
+}
+
 bool parseReflection(const nlohmann::json &root, const std::string &selected, ReflectedEntry &output,
-                     std::string &error) {
+                     VernonRuntimeBackend backend, std::string &error) {
     if (!root.is_object() || root.value("gpu_launch_abi_version", 0) != 1 || !root.contains("entries") ||
         !root["entries"].is_array()) {
         error = "unsupported or invalid compute reflection";
@@ -17,18 +44,41 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
     for (const nlohmann::json &entry : root["entries"]) {
         if (!entry.is_object() || entry.value("name", "") != selected)
             continue;
-        output.cpuArgumentsSize = entry.value("cpu_arguments_size", size_t{0});
+        const char *profileName = physicalValueProfileName(backend, "storage_buffer");
+        const auto entryLayouts = entry.find("physical_layouts");
+        if (entryLayouts == entry.end() || !entryLayouts->is_object()) {
+            error = "entry reflection has no physical layout table";
+            return false;
+        }
+        const auto entryLayout = entryLayouts->find(profileName);
+        if (entryLayout == entryLayouts->end() || !entryLayout->is_object() ||
+            entryLayout->value("profile", std::string()) != profileName) {
+            error = "entry reflection has no physical profile for the selected target";
+            return false;
+        }
+        if (entryLayout->contains("packed_arguments_size")) {
+            const size_t size = entryLayout->value("packed_arguments_size", size_t{0});
+            if (!size) {
+                error = "entry reflection has an invalid packed argument size";
+                return false;
+            }
+            output.packedArguments = PackedArgumentsLayout{size};
+        }
+        if (backend == VERNON_RUNTIME_CPU && !output.packedArguments) {
+            error = "CPU entry has no packed argument layout";
+            return false;
+        }
         if (entry.contains("workgroup_size") && entry["workgroup_size"].is_array() &&
             entry["workgroup_size"].size() == 3)
             for (size_t index = 0; index < 3; ++index)
                 output.workgroup[index] = entry["workgroup_size"][index].get<uint32_t>();
-        if (!output.cpuArgumentsSize || !entry.contains("arguments") || !entry["arguments"].is_array()) {
-            error = "CPU entry has no argument layout";
+        if (!entry.contains("arguments") || !entry["arguments"].is_array()) {
+            error = "entry has no argument layout";
             return false;
         }
         for (const nlohmann::json &value : entry["arguments"]) {
             if (!value.is_object()) {
-                error = "CPU entry contains invalid argument reflection";
+                error = "entry contains invalid argument reflection";
                 return false;
             }
             ReflectedArgument argument;
@@ -36,10 +86,25 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
             if (argument.kind == "tensor_value")
                 argument.kind = "scalar";
             argument.builtin = value.value("builtin", "");
-            argument.cpuOffset = value.value("cpu_offset", size_t{0});
-            argument.cpuSize = value.value("cpu_size", size_t{0});
-            argument.physicalSize = value.value("physical_size", argument.cpuSize);
-            argument.alignment = value.value("alignment", size_t{1});
+            const auto physicalLayouts = value.find("physical_layouts");
+            if (physicalLayouts == value.end() || !physicalLayouts->is_object()) {
+                error = "argument reflection has no physical layout table";
+                return false;
+            }
+            const auto physical = physicalLayouts->find(profileName);
+            if (physical == physicalLayouts->end() || !physical->is_object() ||
+                physical->value("profile", std::string()) != profileName) {
+                error = "argument reflection has no physical profile for the selected target";
+                return false;
+            }
+            argument.physical.offset = physical->value("offset", size_t{0});
+            argument.physical.size = physical->value("size", size_t{0});
+            argument.physical.alignment = physical->value("alignment", size_t{1});
+            if (!argument.physical.alignment || (argument.physical.alignment & (argument.physical.alignment - 1)) ||
+                argument.physical.offset % argument.physical.alignment) {
+                error = "argument reflection has an invalid physical alignment";
+                return false;
+            }
             argument.descriptorSet = value.value("vernon.set", uint32_t{0});
             argument.binding = value.value("vernon.binding", UINT32_MAX);
             if (value.contains("storage_leaves") && value["storage_leaves"].is_array()) {
@@ -80,17 +145,25 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                 argument.tensorElements = elements;
                 argument.tensorBytes = elements * elementSize;
             }
-            if (!argument.cpuSize || argument.cpuOffset > output.cpuArgumentsSize ||
-                argument.cpuSize > output.cpuArgumentsSize - argument.cpuOffset ||
-                (argument.kind != "tensor" && argument.kind != "scalar" && argument.kind != "builtin")) {
+            if (argument.kind != "tensor" && argument.kind != "scalar" && argument.kind != "builtin") {
+                error = "argument layout has an unsupported kind";
+                return false;
+            }
+            if (backend == VERNON_RUNTIME_CPU &&
+                (!argument.physical.size || argument.physical.offset > output.packedArguments->size ||
+                 argument.physical.size > output.packedArguments->size - argument.physical.offset)) {
                 error = "CPU argument layout is invalid";
+                return false;
+            }
+            if (backend != VERNON_RUNTIME_CPU && argument.kind == "scalar" && !argument.physical.size) {
+                error = "value argument has no physical size for the selected target";
                 return false;
             }
             output.arguments.push_back(std::move(argument));
         }
         return true;
     }
-    error = "selected CPU entry is absent from reflection";
+    error = "selected entry is absent from reflection";
     return false;
 }
 

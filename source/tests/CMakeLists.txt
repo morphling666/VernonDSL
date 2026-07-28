@@ -156,7 +156,9 @@ if(TARGET VernonRuntime)
                     vernon_dsl.pipeline_asset_cli
                     "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:sampled_asset" --target directx
                     --output "${directx_pipeline_test_dir}"
-                DEPENDS vernon-dsl-native "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py"
+                DEPENDS vernon-dsl-native
+                        "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py"
+                        "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/parameters.py"
                         "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/requirements.py"
                 VERBATIM)
             add_custom_target(vernon-directx-pipeline-test-bundle DEPENDS "${directx_pipeline_test_manifest}")
@@ -167,7 +169,9 @@ if(TARGET VernonRuntime)
                     vernon_dsl.pipeline_asset_cli
                     "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:scale_asset" --target directx
                     --output "${directx_compute_pipeline_test_dir}"
-                DEPENDS vernon-dsl-native "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py"
+                DEPENDS vernon-dsl-native
+                        "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py"
+                        "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/parameters.py"
                         "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/requirements.py"
                 VERBATIM)
             add_custom_target(vernon-directx-compute-pipeline-test-bundle
@@ -198,6 +202,7 @@ if(TARGET VernonRuntime)
                 --output "${vulkan_pipeline_test_dir}"
             DEPENDS vernon-dsl-native
                     "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py"
+                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/parameters.py"
                     "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/requirements.py"
                     "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/types.py"
                     "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/pipeline_assets.py"
@@ -214,6 +219,7 @@ if(TARGET VernonRuntime)
                 "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:scale_asset" --target vulkan --output
                 "${vulkan_compute_pipeline_test_dir}"
             DEPENDS vernon-dsl-native "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py"
+                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/parameters.py"
             VERBATIM)
         add_custom_target(vernon-vulkan-compute-pipeline-test-bundle DEPENDS "${vulkan_compute_pipeline_test_manifest}")
         set(vulkan_cube_map_test_dir "${VERNON_TEST_BINARY_ROOT}/vulkan_cube_map_bundle")
@@ -226,6 +232,7 @@ if(TARGET VernonRuntime)
                 --target vulkan --output "${vulkan_cube_map_test_dir}"
             DEPENDS vernon-dsl-native
                     "${VERNON_REPOSITORY_ROOT}/python/tests/cube_map_shader.py"
+                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/parameters.py"
                     "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/requirements.py"
                     "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/types.py"
                     "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/pipeline_assets.py"

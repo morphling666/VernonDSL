@@ -41,7 +41,8 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         const Stage &stage = bundle.stages.at(variant.compute);
         ReflectedEntry reflection;
         const nlohmann::json parsed = nlohmann::json::parse(stage.reflection, nullptr, false);
-        if (parsed.is_discarded() || !parseReflection(parsed, stage.entry, reflection, bundle.context->error)) {
+        if (parsed.is_discarded() ||
+            !parseReflection(parsed, stage.entry, reflection, bundle.context->backend, bundle.context->error)) {
             delete state;
             return false;
         }
@@ -69,7 +70,7 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     candidate.layout.argument_index = use.index;
                     candidate.layout.element_size = static_cast<uint32_t>(
                         argument.storageLeaves.empty()
-                            ? (argument.kind == "tensor" ? argument.tensorElementSize : argument.physicalSize)
+                            ? (argument.kind == "tensor" ? argument.tensorElementSize : argument.physical.size)
                             : argument.storageLeaves[leafIndex].elementSize);
                     candidate.binding.externalSlot = parameter.slot;
                     candidate.binding.source = argument.kind == "tensor"
@@ -158,8 +159,8 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
             candidate.layout.array_count = 1;
             candidate.binding.externalSlot = parameter.slot;
-            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.uniformLayout &&
-                use.uniformLayout->storage == "storage_buffer" && parameter.elementLayout.byteSize &&
+            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.physicalValueLayout &&
+                use.physicalValueLayout->transport == "storage_buffer" && parameter.elementLayout.byteSize &&
                 use.binding != UINT32_MAX) {
                 candidate.layout.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
                 candidate.layout.element_size = parameter.elementLayout.byteSize;
@@ -168,8 +169,7 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 candidate.layout.set = use.descriptorSet;
                 candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_STORAGE;
             } else if (parameter.kind == "tensor" && use.interfaceKind == "uniform" &&
-                       (!use.uniformName.empty() ||
-                        (use.uniformLayout && use.uniformLayout->storage == "uniform_buffer"))) {
+                       (!use.uniformName.empty() || use.physicalValueLayout->transport == "uniform_buffer")) {
                 const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
                 const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
                 uint64_t valueCount = 1;
@@ -180,7 +180,7 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     }
                     valueCount *= dimension;
                 }
-                const bool buffered = use.uniformLayout && use.uniformLayout->storage == "uniform_buffer";
+                const bool buffered = use.physicalValueLayout->transport == "uniform_buffer";
                 const bool nativeInline =
                     use.dtype == "f32" &&
                     (shape.empty() || (shape.size() == 1 && shape[0] <= 4) ||
@@ -192,8 +192,7 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 const size_t elementSize = dataTypeSize(*dtype);
                 candidate.layout.kind =
                     buffered ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-                const uint64_t physicalSize =
-                    buffered && use.uniformLayout ? use.uniformLayout->size : valueCount * elementSize;
+                const uint64_t physicalSize = use.physicalValueLayout->size;
                 if (!physicalSize || physicalSize > UINT32_MAX || (buffered && use.binding == UINT32_MAX)) {
                     useRhiGraphics = false;
                     break;
@@ -209,30 +208,12 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 candidate.binding.packing.elementSize = elementSize;
                 candidate.binding.packing.shape = shape;
                 candidate.binding.packing.byteSize = static_cast<size_t>(physicalSize);
-                if (use.uniformLayout && buffered) {
-                    for (uint64_t stride : use.uniformLayout->byteStrides) {
-                        if (stride > SIZE_MAX) {
-                            useRhiGraphics = false;
-                            break;
-                        }
-                        candidate.binding.packing.byteStrides.push_back(static_cast<size_t>(stride));
+                for (uint64_t stride : use.physicalValueLayout->byteStrides) {
+                    if (stride > SIZE_MAX) {
+                        useRhiGraphics = false;
+                        break;
                     }
-                } else if (shape.size() == 2) {
-                    if (bundle.context->backend == VERNON_RUNTIME_OPENGL_ES) {
-                        candidate.binding.packing.byteStrides = {elementSize,
-                                                                 static_cast<size_t>(shape[0]) * elementSize};
-                    } else {
-                        candidate.binding.packing.byteStrides = {static_cast<size_t>(shape[1]) * elementSize,
-                                                                 elementSize};
-                        candidate.binding.transpose = true;
-                    }
-                } else {
-                    candidate.binding.packing.byteStrides.resize(shape.size());
-                    size_t stride = elementSize;
-                    for (size_t dimension = shape.size(); dimension-- > 0;) {
-                        candidate.binding.packing.byteStrides[dimension] = stride;
-                        stride *= static_cast<size_t>(shape[dimension]);
-                    }
+                    candidate.binding.packing.byteStrides.push_back(static_cast<size_t>(stride));
                 }
                 if (!useRhiGraphics || candidate.binding.packing.byteStrides.size() != shape.size()) {
                     useRhiGraphics = false;
@@ -491,21 +472,10 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
         if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR)
             return fail(*pipeline.context, "OpenGL RHI uniform argument is missing");
         const VernonTensorView &tensor = found->second->tensor;
-        TensorPackingLayout packing = prepared.packing;
-        bool transpose = prepared.transpose;
-        const size_t elementSize = tensor.element_layout.byte_size;
-        if (transpose && tensor.rank == 2 && tensor.byte_strides &&
-            tensor.byte_strides[0] == static_cast<int64_t>(elementSize) &&
-            tensor.byte_strides[1] == static_cast<int64_t>(tensor.shape[0] * elementSize)) {
-            packing.byteStrides = {elementSize, static_cast<size_t>(tensor.shape[0]) * elementSize};
-            transpose = false;
-        }
-        const std::optional<std::vector<uint8_t>> packed = packTensor(tensor, packing);
+        const std::optional<std::vector<uint8_t>> packed = packTensor(tensor, prepared.packing);
         if (!packed || packed->size() != prepared.storage.size())
             return fail(*pipeline.context, "OpenGL RHI uniform Tensor is invalid");
         std::memcpy(prepared.storage.data(), packed->data(), packed->size());
-        if (transpose)
-            value.flags = VERNON_RUNTIME_PROVIDER_BINDING_TRANSPOSE;
     }
     if (state.rhiBindings) {
         const VernonStatus bindingStatus =

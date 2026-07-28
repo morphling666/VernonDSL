@@ -144,9 +144,9 @@ LogicalResult decomposeAggregateValue(Type sourceType, Value value, SmallVectorI
     return success();
 }
 
-Value storageLeafIndex(Value recordIndex, uint64_t recordSize, const StorageLeaf &leaf, uint64_t scalarIndex,
+Value storageLeafIndex(Value recordIndex, uint64_t recordSize, const ValueAbiLeaf &leaf, uint64_t scalarIndex,
                        ConversionPatternRewriter &rewriter, Location location) {
-    uint64_t leafSize = std::max<uint64_t>(leaf.type.getIntOrFloatBitWidth() / 8, 1);
+    uint64_t leafSize = std::max<uint64_t>(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1);
     Value stride = arith::ConstantIndexOp::create(rewriter, location, recordSize / leafSize);
     Value result = arith::MulIOp::create(rewriter, location, recordIndex, stride);
     const uint64_t scalarOffset = leaf.byteOffset / leafSize + scalarIndex;
@@ -169,7 +169,7 @@ struct AggregateViewIntrinsicPattern final : ConversionPattern {
         auto view = dyn_cast<TensorViewType>(op.getOperand(0).getType());
         if (!view || view.getElementType().isIntOrFloat())
             return failure();
-        FailureOr<StorageLayout> layout = resolveStorageLayout(view.getElementType(), module);
+        FailureOr<ValueAbiLayout> layout = getValueAbiLayout(view.getElementType(), module);
         if (failed(layout) || layout->leaves.empty())
             return op.emitError("cannot resolve aggregate TensorView storage layout");
         if (operands.size() != (op.getName() == "tensor_view_load" ? 2 : 3) ||
@@ -409,11 +409,11 @@ struct VernonLowerCPUTensorsPass final : PassWrapper<VernonLowerCPUTensorsPass, 
             [module](TensorViewType view, SmallVectorImpl<Type> &types) -> std::optional<LogicalResult> {
                 if (view.getElementType().isIntOrFloat())
                     return std::nullopt;
-                FailureOr<StorageLayout> layout = resolveStorageLayout(view.getElementType(), module);
+                FailureOr<ValueAbiLayout> layout = getValueAbiLayout(view.getElementType(), module);
                 if (failed(layout))
                     return failure();
-                for (const StorageLeaf &leaf : layout->leaves)
-                    types.push_back(MemRefType::get({ShapedType::kDynamic}, leaf.type));
+                for (const ValueAbiLeaf &leaf : layout->leaves)
+                    types.push_back(MemRefType::get({ShapedType::kDynamic}, leaf.scalarType));
                 return success();
             });
 

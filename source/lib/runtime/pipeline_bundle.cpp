@@ -275,7 +275,7 @@ bool resolveCpuNativeArtifact(const CpuNativeArtifact &artifact, std::filesystem
         return false;
     }
     ReflectedEntry parsed;
-    if (!parseReflection(artifact.reflection, artifact.entry, parsed, error))
+    if (!parseReflection(artifact.reflection, artifact.entry, parsed, VERNON_RUNTIME_CPU, error))
         return false;
     libraryPath = candidate;
     if (reflection)

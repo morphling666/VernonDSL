@@ -10,6 +10,7 @@
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonCpuPipeline.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonValueAbi.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Export.h"
@@ -84,25 +85,16 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
         for (unsigned index = 0; index < function.getNumArguments(); ++index) {
             mlir::Type type = function.getArgumentTypes()[index];
             mlir::DictionaryAttr attrs = function.getArgAttrDict(index);
-            mlir::IntegerAttr reflectedSize;
-            mlir::IntegerAttr reflectedAlignment;
-            if (attrs) {
-                reflectedSize = attrs.getAs<mlir::IntegerAttr>("vernon.abi_size");
-                reflectedAlignment = attrs.getAs<mlir::IntegerAttr>("vernon.abi_alignment");
-            }
-            uint64_t size = reflectedSize ? static_cast<uint64_t>(reflectedSize.getInt()) : sourceTypeSize(type);
-            if (size == 0) {
+            mlir::FailureOr<mlir::vernon::PhysicalValueAbiLayout> layout =
+                mlir::vernon::getPhysicalValueAbiLayout(type, module, mlir::vernon::PhysicalAbiProfile::HostValue);
+            if (mlir::failed(layout)) {
                 diagnostics = "unsupported CPU ABI argument type in entry '" + function.getSymName().str() + "'";
                 return false;
             }
-            uint64_t alignment = reflectedAlignment ? static_cast<uint64_t>(reflectedAlignment.getInt())
-                                 : size >= 16       ? 16
-                                 : size >= 8        ? 8
-                                                    : 4;
-            metadata.argumentsSize = llvm::alignTo(metadata.argumentsSize, alignment);
+            metadata.argumentsSize = llvm::alignTo(metadata.argumentsSize, layout->alignment);
 
             vernon::CpuAbiArgumentPacking packing{metadata.argumentsSize,
-                                                  size,
+                                                  layout->size,
                                                   mlir::isa<mlir::vernon::TensorViewType>(type)
                                                       ? vernon::CpuAbiArgumentKind::TensorView
                                                       : vernon::CpuAbiArgumentKind::Direct,
@@ -110,16 +102,16 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
                                                   {}};
             if (packing.kind == vernon::CpuAbiArgumentKind::TensorView) {
                 auto view = mlir::cast<mlir::vernon::TensorViewType>(type);
-                mlir::FailureOr<mlir::vernon::StorageLayout> layout =
-                    mlir::vernon::resolveStorageLayout(view.getElementType(), module);
+                mlir::FailureOr<mlir::vernon::ValueAbiLayout> layout =
+                    mlir::vernon::getValueAbiLayout(view.getElementType(), module);
                 if (mlir::failed(layout)) {
                     diagnostics =
                         "invalid aggregate TensorView layout in CPU entry '" + function.getSymName().str() + "'";
                     return false;
                 }
-                for (const mlir::vernon::StorageLeaf &leaf : layout->leaves)
+                for (const mlir::vernon::ValueAbiLeaf &leaf : layout->leaves)
                     packing.tensorLeafElementSizes.push_back(
-                        std::max<uint64_t>(leaf.type.getIntOrFloatBitWidth() / 8, 1));
+                        std::max<uint64_t>(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1));
                 if (auto shape = attrs.getAs<mlir::DenseI64ArrayAttr>("vernon.tensor_shape")) {
                     uint64_t extent = 1;
                     for (int64_t dimension : shape.asArrayRef()) {
@@ -136,7 +128,7 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
                 }
             }
             metadata.sourceArguments.push_back(packing);
-            metadata.argumentsSize += size;
+            metadata.argumentsSize += layout->size;
         }
 
         if (function.getNumResults() > 1) {
@@ -146,11 +138,9 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
         if (function.getNumResults() == 0) {
             metadata.resultsSize = 0;
         } else {
-            mlir::DictionaryAttr attrs = function.getResultAttrDict(0);
-            mlir::IntegerAttr reflectedSize =
-                attrs ? attrs.getAs<mlir::IntegerAttr>("vernon.abi_size") : mlir::IntegerAttr();
-            metadata.resultsSize = reflectedSize ? static_cast<uint64_t>(reflectedSize.getInt())
-                                                 : sourceTypeSize(function.getResultTypes()[0]);
+            mlir::FailureOr<mlir::vernon::PhysicalValueAbiLayout> layout = mlir::vernon::getPhysicalValueAbiLayout(
+                function.getResultTypes()[0], module, mlir::vernon::PhysicalAbiProfile::HostValue);
+            metadata.resultsSize = mlir::succeeded(layout) ? layout->size : 0;
         }
         if (function.getNumResults() != 0 && metadata.resultsSize == 0) {
             diagnostics = "unsupported CPU ABI result type in entry '" + function.getSymName().str() + "'";

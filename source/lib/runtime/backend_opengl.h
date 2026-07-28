@@ -38,7 +38,6 @@ struct OpenGLPipelineState {
 
         Source source{EXTERNAL_UNIFORM};
         uint32_t externalSlot{};
-        bool transpose{};
         TensorPackingLayout packing;
         std::vector<uint8_t> storage;
     };

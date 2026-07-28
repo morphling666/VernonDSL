@@ -2,6 +2,7 @@
 
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Alignment.h"
@@ -18,37 +19,6 @@ struct PlannedLayout {
     std::string canonical;
 };
 
-struct StructField {
-    std::string name;
-    Type type;
-};
-
-FailureOr<SmallVector<StructField>> resolveStructFields(StructType structure, ModuleOp module) {
-    StructDeclOp declaration;
-    for (StructDeclOp candidate : module.getOps<StructDeclOp>()) {
-        if (candidate.getSymName() == structure.getName()) {
-            if (declaration)
-                return failure();
-            declaration = candidate;
-        }
-    }
-    if (!declaration)
-        return failure();
-
-    SmallVector<StructField> fields;
-    for (Attribute attribute : declaration.getFields()) {
-        StringRef spelling = cast<StringAttr>(attribute).getValue();
-        size_t separator = spelling.find(':');
-        if (separator == StringRef::npos)
-            return failure();
-        Type type = parseType(spelling.drop_front(separator + 1), module.getContext());
-        if (!type)
-            return failure();
-        fields.push_back({spelling.take_front(separator).str(), type});
-    }
-    return fields;
-}
-
 FailureOr<uint64_t> checkedAlign(uint64_t value, uint64_t alignment) {
     if (alignment == 0 || value > std::numeric_limits<uint64_t>::max() - (alignment - 1))
         return failure();
@@ -59,6 +29,21 @@ FailureOr<uint64_t> checkedMultiply(uint64_t left, uint64_t right) {
     if (right != 0 && left > std::numeric_limits<uint64_t>::max() / right)
         return failure();
     return left * right;
+}
+
+FailureOr<SmallVector<uint64_t>> rowMajorStrides(ArrayRef<int64_t> shape, uint64_t elementStride) {
+    SmallVector<uint64_t> strides(shape.size());
+    uint64_t stride = elementStride;
+    for (size_t dimension = shape.size(); dimension-- > 0;) {
+        if (shape[dimension] <= 0)
+            return failure();
+        strides[dimension] = stride;
+        FailureOr<uint64_t> next = checkedMultiply(stride, static_cast<uint64_t>(shape[dimension]));
+        if (failed(next))
+            return failure();
+        stride = *next;
+    }
+    return strides;
 }
 
 bool isCompatibleLogicalDtype(Type scalar, StringRef dtype) {
@@ -83,7 +68,7 @@ void prependPath(ValueAbiLeaf &leaf, ArrayRef<ValueAbiPathComponent> prefix) {
 
 FailureOr<PlannedLayout> planValue(Type type, ModuleOp module, SmallVectorImpl<StringRef> &activeStructs);
 
-FailureOr<PlannedLayout> planProduct(ArrayRef<StructField> fields, StringRef kind, ModuleOp module,
+FailureOr<PlannedLayout> planProduct(ArrayRef<ResolvedStructField> fields, StringRef kind, ModuleOp module,
                                      SmallVectorImpl<StringRef> &activeStructs) {
     PlannedLayout result;
     result.layout.alignment = 1;
@@ -216,7 +201,7 @@ FailureOr<PlannedLayout> planValue(Type type, ModuleOp module, SmallVectorImpl<S
     if (auto tensor = dyn_cast<TensorType>(type))
         return planTensor(tensor.getElementType(), tensor.getShape(), module, activeStructs);
     if (auto tuple = dyn_cast<TupleType>(type)) {
-        SmallVector<StructField> fields;
+        SmallVector<ResolvedStructField> fields;
         for (auto [index, element] : llvm::enumerate(tuple.getTypes()))
             fields.push_back({std::to_string(index), element});
         return planProduct(fields, "tuple", module, activeStructs);
@@ -224,12 +209,12 @@ FailureOr<PlannedLayout> planValue(Type type, ModuleOp module, SmallVectorImpl<S
     auto structure = dyn_cast<StructType>(type);
     if (!structure || llvm::is_contained(activeStructs, structure.getName()))
         return failure();
-    FailureOr<SmallVector<StructField>> fields = resolveStructFields(structure, module);
+    FailureOr<ResolvedStructFields> fields = resolveNamedStructFields(structure, module);
     if (failed(fields))
         return failure();
     activeStructs.push_back(structure.getName());
     std::string kind = ("struct(" + structure.getName() + ")").str();
-    FailureOr<PlannedLayout> result = planProduct(*fields, kind, module, activeStructs);
+    FailureOr<PlannedLayout> result = planProduct(fields->fields, kind, module, activeStructs);
     activeStructs.pop_back();
     if (succeeded(result)) {
         for (StructDeclOp declaration : module.getOps<StructDeclOp>()) {
@@ -286,6 +271,206 @@ FailureOr<ValueAbiLayout> getValueAbiLayout(Type type, ModuleOp module, ArrayRef
     }
     planned->layout.layoutHash = llvm::toHex(hash.final(), true);
     return std::move(planned->layout);
+}
+
+FailureOr<PhysicalValueAbiLayout> planPhysicalBytes(Type type, ModuleOp module, PhysicalAbiProfile profile) {
+    if (profile == PhysicalAbiProfile::Count)
+        return failure();
+    if (profile == PhysicalAbiProfile::HostValue) {
+        if (type.isIndex())
+            return PhysicalValueAbiLayout{8, 8};
+        if (isa<TensorViewType, TextureType, SamplerType>(type))
+            return PhysicalValueAbiLayout{8, 8};
+
+        FailureOr<ValueAbiLayout> logical = getValueAbiLayout(type, module);
+        if (failed(logical))
+            return failure();
+        PhysicalValueAbiLayout result{logical->size, logical->alignment};
+        if (auto tensor = dyn_cast<RankedTensorType>(type)) {
+            // CPU tensor values lower to LLVM vectors/aggregates. Keep the
+            // wrapper packing alignment identical to that lowered ABI while
+            // retaining the target-independent logical Value layout above.
+            result.alignment = result.size >= 16 ? 16 : result.size >= 8 ? 8 : 4;
+            FailureOr<ValueAbiLayout> element = getValueAbiLayout(tensor.getElementType(), module);
+            if (failed(element))
+                return failure();
+            FailureOr<SmallVector<uint64_t>> strides =
+                rowMajorStrides(tensor.getShape(), llvm::alignTo(element->size, element->alignment));
+            if (failed(strides))
+                return failure();
+            result.byteStrides = std::move(*strides);
+        } else if (auto tensor = dyn_cast<TensorType>(type)) {
+            FailureOr<ValueAbiLayout> element = getValueAbiLayout(tensor.getElementType(), module);
+            if (failed(element))
+                return failure();
+            FailureOr<SmallVector<uint64_t>> strides =
+                rowMajorStrides(tensor.getShape(), llvm::alignTo(element->size, element->alignment));
+            if (failed(strides))
+                return failure();
+            result.byteStrides = std::move(*strides);
+        }
+        return result;
+    }
+
+    if (profile == PhysicalAbiProfile::CudaKernelParameter) {
+        if (type.isIndex())
+            return PhysicalValueAbiLayout{8, 8};
+        if (!type.isIntOrFloat())
+            return failure();
+        FailureOr<ValueAbiLayout> logical = getValueAbiLayout(type, module);
+        if (failed(logical))
+            return failure();
+        return PhysicalValueAbiLayout{logical->size, logical->alignment};
+    }
+
+    if (profile == PhysicalAbiProfile::OpenGLNativeUniform) {
+        if (type.isIntOrFloat()) {
+            const uint64_t size = std::max<uint64_t>(type.getIntOrFloatBitWidth() / 8, 1);
+            return PhysicalValueAbiLayout{size, size};
+        }
+        auto tensor = dyn_cast<RankedTensorType>(type);
+        if (!tensor || !tensor.hasStaticShape() || tensor.getRank() > 2 || !tensor.getElementType().isIntOrFloat())
+            return failure();
+        const uint64_t elementSize = std::max<uint64_t>(tensor.getElementType().getIntOrFloatBitWidth() / 8, 1);
+        if (tensor.getRank() == 0)
+            return PhysicalValueAbiLayout{elementSize, elementSize};
+        if (tensor.getRank() == 1) {
+            const uint64_t count = static_cast<uint64_t>(tensor.getDimSize(0));
+            return PhysicalValueAbiLayout{count * elementSize, elementSize, {elementSize}};
+        }
+        const uint64_t rows = static_cast<uint64_t>(tensor.getDimSize(0));
+        const uint64_t columns = static_cast<uint64_t>(tensor.getDimSize(1));
+        return PhysicalValueAbiLayout{rows * columns * elementSize, elementSize, {elementSize, rows * elementSize}};
+    }
+
+    if (profile == PhysicalAbiProfile::DirectXConstantBuffer) {
+        if (auto tensor = dyn_cast<RankedTensorType>(type);
+            tensor && tensor.hasStaticShape() && tensor.getRank() == 2 && tensor.getElementType().isIntOrFloat()) {
+            const uint64_t elementSize = std::max<uint64_t>(tensor.getElementType().getIntOrFloatBitWidth() / 8, 1);
+            const uint64_t rows = static_cast<uint64_t>(tensor.getDimSize(0));
+            const uint64_t columns = static_cast<uint64_t>(tensor.getDimSize(1));
+            const uint64_t rowStride = std::max<uint64_t>(columns * elementSize, 16);
+            return PhysicalValueAbiLayout{rows * rowStride, 16, {rowStride, elementSize}};
+        }
+    }
+
+    const bool std430 = profile == PhysicalAbiProfile::VulkanStd430StorageBuffer ||
+                        profile == PhysicalAbiProfile::VulkanPushConstant ||
+                        profile == PhysicalAbiProfile::MetalConstantBuffer;
+    if (type.isIndex())
+        return PhysicalValueAbiLayout{4, 4};
+    if (auto tensor = dyn_cast<RankedTensorType>(type)) {
+        if (!tensor.hasStaticShape() || llvm::any_of(tensor.getShape(), [](int64_t extent) { return extent <= 0; }) ||
+            !tensor.getElementType().isIntOrFloat())
+            return failure();
+        const uint64_t elementSize = std::max<uint64_t>(tensor.getElementType().getIntOrFloatBitWidth() / 8, 1);
+        if (tensor.getRank() == 0)
+            return PhysicalValueAbiLayout{elementSize, elementSize};
+        if (tensor.getRank() == 1 && tensor.getDimSize(0) >= 2 && tensor.getDimSize(0) <= 4) {
+            const uint64_t count = static_cast<uint64_t>(tensor.getDimSize(0));
+            const uint64_t alignment = (count == 2 ? 2 : 4) * elementSize;
+            return PhysicalValueAbiLayout{count * elementSize, alignment, {elementSize}};
+        }
+        if (tensor.getRank() == 2 && tensor.getDimSize(0) >= 2 && tensor.getDimSize(0) <= 4 &&
+            tensor.getDimSize(1) >= 2 && tensor.getDimSize(1) <= 4) {
+            const uint64_t rows = static_cast<uint64_t>(tensor.getDimSize(0));
+            const uint64_t columns = static_cast<uint64_t>(tensor.getDimSize(1));
+            const uint64_t vectorAlignment = (rows == 2 ? 2 : 4) * elementSize;
+            const uint64_t columnAlignment = std430 ? vectorAlignment : std::max<uint64_t>(vectorAlignment, 16);
+            const uint64_t stride = llvm::alignTo(rows * elementSize, columnAlignment);
+            return PhysicalValueAbiLayout{stride * columns, columnAlignment, {elementSize, stride}};
+        }
+
+        uint64_t size = elementSize;
+        uint64_t alignment = elementSize;
+        SmallVector<uint64_t> reversedStrides;
+        for (int64_t extent : llvm::reverse(tensor.getShape())) {
+            if (!std430)
+                alignment = std::max<uint64_t>(alignment, 16);
+            FailureOr<uint64_t> stride = checkedAlign(size, alignment);
+            FailureOr<uint64_t> next = succeeded(stride) ? checkedMultiply(*stride, static_cast<uint64_t>(extent))
+                                                         : FailureOr<uint64_t>(failure());
+            if (failed(next))
+                return failure();
+            reversedStrides.push_back(*stride);
+            size = *next;
+        }
+        return PhysicalValueAbiLayout{size, alignment,
+                                      SmallVector<uint64_t>(reversedStrides.rbegin(), reversedStrides.rend())};
+    }
+
+    FailureOr<ValueAbiLayout> logical = getValueAbiLayout(type, module);
+    if (failed(logical))
+        return failure();
+    PhysicalValueAbiLayout result{logical->size, logical->alignment};
+    if (auto tensor = dyn_cast<TensorType>(type)) {
+        FailureOr<ValueAbiLayout> element = getValueAbiLayout(tensor.getElementType(), module);
+        if (failed(element))
+            return failure();
+        FailureOr<SmallVector<uint64_t>> strides =
+            rowMajorStrides(tensor.getShape(), llvm::alignTo(element->size, element->alignment));
+        if (failed(strides))
+            return failure();
+        result.byteStrides = std::move(*strides);
+    }
+    return result;
+}
+
+FailureOr<PhysicalValueAbiPlan> getPhysicalValueAbiPlan(Type type, ModuleOp module, PhysicalAbiProfile profile) {
+    if (auto view = dyn_cast<TensorViewType>(type)) {
+        FailureOr<ValueAbiLayout> element = getValueAbiLayout(view.getElementType(), module);
+        if (failed(element))
+            return failure();
+        switch (profile) {
+        case PhysicalAbiProfile::HostValue:
+            return PhysicalValueAbiPlan{
+                PhysicalResourceAbiLayout{PhysicalResourceAbiKind::HostPointer, 8, 8, std::move(*element)}};
+        case PhysicalAbiProfile::CudaKernelParameter:
+            return PhysicalValueAbiPlan{
+                PhysicalResourceAbiLayout{PhysicalResourceAbiKind::CudaStorageLeaves, 0, 0, std::move(*element)}};
+        case PhysicalAbiProfile::VulkanStd140UniformBuffer:
+        case PhysicalAbiProfile::VulkanStd430StorageBuffer:
+        case PhysicalAbiProfile::VulkanPushConstant:
+        case PhysicalAbiProfile::OpenGLNativeUniform:
+        case PhysicalAbiProfile::DirectXConstantBuffer:
+        case PhysicalAbiProfile::MetalConstantBuffer:
+            return PhysicalValueAbiPlan{
+                PhysicalResourceAbiLayout{PhysicalResourceAbiKind::GraphicsStorageLeaves, 0, 0, std::move(*element)}};
+        case PhysicalAbiProfile::Count:
+            return failure();
+        }
+    }
+    if (isa<TextureType>(type)) {
+        if (profile == PhysicalAbiProfile::HostValue)
+            return PhysicalValueAbiPlan{PhysicalResourceAbiLayout{PhysicalResourceAbiKind::HostPointer, 8, 8}};
+        if (profile != PhysicalAbiProfile::CudaKernelParameter)
+            return PhysicalValueAbiPlan{PhysicalResourceAbiLayout{PhysicalResourceAbiKind::GraphicsTexture}};
+        return PhysicalValueAbiPlan{UnsupportedPhysicalValueAbi{"texture_argument"}};
+    }
+    if (isa<SamplerType>(type)) {
+        if (profile == PhysicalAbiProfile::HostValue)
+            return PhysicalValueAbiPlan{PhysicalResourceAbiLayout{PhysicalResourceAbiKind::HostPointer, 8, 8}};
+        if (profile != PhysicalAbiProfile::CudaKernelParameter)
+            return PhysicalValueAbiPlan{PhysicalResourceAbiLayout{PhysicalResourceAbiKind::GraphicsSampler}};
+        return PhysicalValueAbiPlan{UnsupportedPhysicalValueAbi{"sampler_argument"}};
+    }
+    if (profile == PhysicalAbiProfile::CudaKernelParameter && isa<RankedTensorType, TensorType>(type))
+        return PhysicalValueAbiPlan{UnsupportedPhysicalValueAbi{"static_tensor_by_value"}};
+    FailureOr<PhysicalValueAbiLayout> bytes = planPhysicalBytes(type, module, profile);
+    if (failed(bytes))
+        return failure();
+    return PhysicalValueAbiPlan{std::move(*bytes)};
+}
+
+FailureOr<PhysicalValueAbiLayout> getPhysicalValueAbiLayout(Type type, ModuleOp module, PhysicalAbiProfile profile) {
+    FailureOr<PhysicalValueAbiPlan> plan = getPhysicalValueAbiPlan(type, module, profile);
+    if (failed(plan))
+        return failure();
+    if (auto *bytes = std::get_if<PhysicalValueAbiLayout>(&*plan))
+        return *bytes;
+    if (auto *resource = std::get_if<PhysicalResourceAbiLayout>(&*plan); resource && resource->handleSize != 0)
+        return PhysicalValueAbiLayout{resource->handleSize, resource->handleAlignment};
+    return failure();
 }
 
 } // namespace mlir::vernon

@@ -13,8 +13,8 @@ namespace vernon::runtime {
 namespace {
 
 bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &entry, Variant &variant,
-                               ReflectedEntry &reflection, std::string &error) {
-    if (!parseReflection(root, entry, reflection, error))
+                               ReflectedEntry &reflection, VernonRuntimeBackend backend, std::string &error) {
+    if (!parseReflection(root, entry, reflection, backend, error))
         return false;
     const nlohmann::json *selected = nullptr;
     if (root.contains("entries") && root["entries"].is_array())
@@ -27,6 +27,10 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
         error = "compute reflection does not contain the selected entry arguments";
         return false;
     }
+    const std::string transport = backend == VERNON_RUNTIME_CPU    ? "host_value"
+                                  : backend == VERNON_RUNTIME_CUDA ? "kernel_parameter"
+                                                                   : "storage_buffer";
+    const std::string physicalProfile = physicalValueProfileName(backend, transport);
     variant.compute = entry;
     variant.program.emplace("compute", entry);
     uint32_t slot = 0;
@@ -60,35 +64,32 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
         use.descriptorSet = argument.value("vernon.set", uint32_t{0});
         use.binding =
             argument.value("vernon.binding", argument.value("binding", static_cast<uint32_t>(reflectedIndex)));
-        if (argument.value("kind", std::string()) == "tensor_value" && argument.contains("physical_size") &&
-            argument.contains("physical_alignment")) {
-            UniformLayout layout;
-            layout.storage = "inline";
-            layout.size = argument["physical_size"].get<uint64_t>();
-            layout.alignment = argument["physical_alignment"].get<uint64_t>();
-            layout.matrixOrder = argument.value("matrix_order", std::string());
-            if (argument.contains("array_strides") && argument["array_strides"].is_array() &&
-                argument["array_strides"].size() == parameter.shape.size())
-                layout.byteStrides = argument["array_strides"].get<std::vector<uint64_t>>();
-            else if (parameter.shape.size() == 2 && argument.contains("matrix_stride")) {
-                const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
-                if (!dtype) {
-                    error = "compute static Tensor reflection has an unsupported dtype";
-                    return false;
-                }
-                layout.byteStrides = {dataTypeSize(*dtype), argument["matrix_stride"].get<uint64_t>()};
-            } else if (parameter.shape.size() == 1) {
-                const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
-                if (!dtype) {
-                    error = "compute static Tensor reflection has an unsupported dtype";
-                    return false;
-                }
-                layout.byteStrides = {dataTypeSize(*dtype)};
-            } else if (!parameter.shape.empty()) {
-                error = "compute static Tensor reflection has incomplete physical strides";
+        if (use.interfaceKind == "value") {
+            const auto physicalLayouts = argument.find("physical_layouts");
+            if (physicalLayouts == argument.end() || !physicalLayouts->is_object()) {
+                error = "compute value reflection has no physical layout table";
                 return false;
             }
-            use.uniformLayout = std::move(layout);
+            const auto physical = physicalLayouts->find(physicalProfile);
+            if (physical == physicalLayouts->end() || !physical->is_object() ||
+                physical->value("profile", std::string()) != physicalProfile || !physical->contains("size") ||
+                !(*physical)["size"].is_number_unsigned() || !physical->contains("alignment") ||
+                !(*physical)["alignment"].is_number_unsigned() || !physical->contains("byte_strides") ||
+                !(*physical)["byte_strides"].is_array()) {
+                error = "compute value reflection has no physical profile for selected target";
+                return false;
+            }
+            PhysicalValueLayout layout;
+            layout.profile = physicalProfile;
+            layout.transport = transport;
+            layout.size = (*physical)["size"].get<uint64_t>();
+            layout.alignment = (*physical)["alignment"].get<uint64_t>();
+            layout.byteStrides = (*physical)["byte_strides"].get<std::vector<uint64_t>>();
+            if (layout.byteStrides.size() != parameter.shape.size()) {
+                error = "compute value physical stride rank does not match its logical shape";
+                return false;
+            }
+            use.physicalValueLayout = std::move(layout);
         }
         parameter.uses.push_back(std::move(use));
         variant.parameters.push_back(std::move(parameter));
@@ -114,7 +115,7 @@ VernonLoadedPipeline *loadBackendCpuEntryPipeline(VernonRuntimeContext &context,
     pipeline->context = &context;
     ReflectedEntry reflection;
     const std::string entry(entryData, entrySize);
-    if (!buildDirectComputeVariant(parsed, entry, pipeline->variant, reflection, context.error))
+    if (!buildDirectComputeVariant(parsed, entry, pipeline->variant, reflection, VERNON_RUNTIME_CPU, context.error))
         return nullptr;
     CpuKernelState kernel;
     ReflectedEntry loadedReflection;
@@ -133,7 +134,8 @@ VernonLoadedPipeline *loadBackendCpuNativePipeline(VernonRuntimeContext &context
     auto pipeline = std::make_unique<VernonLoadedPipeline>();
     pipeline->context = &context;
     ReflectedEntry reflected;
-    if (!buildDirectComputeVariant(artifact.reflection, artifact.entry, pipeline->variant, reflected, context.error))
+    if (!buildDirectComputeVariant(artifact.reflection, artifact.entry, pipeline->variant, reflected,
+                                   VERNON_RUNTIME_CPU, context.error))
         return nullptr;
     CpuKernelState kernel;
     ReflectedEntry loadedReflection;
@@ -160,7 +162,7 @@ VernonLoadedPipeline *loadBackendArtifactPipeline(VernonRuntimeContext &context,
     pipeline->context = &context;
     ReflectedEntry reflection;
     const std::string entry(entryData, entrySize);
-    if (!buildDirectComputeVariant(parsed, entry, pipeline->variant, reflection, context.error))
+    if (!buildDirectComputeVariant(parsed, entry, pipeline->variant, reflection, context.backend, context.error))
         return nullptr;
     VernonPipelineBundle bundle;
     bundle.context = &context;

@@ -300,8 +300,8 @@ class CompiledProgramTests(unittest.TestCase):
         program = native.Compiler().compile_program_result(CPU_TUPLE_ENTRY_MODULE, native.Target.CPU)
         self.assertTrue(program.ok, program.diagnostics)
         entry = json.loads(program.reflection)["entries"][0]
-        self.assertEqual(entry["cpu_arguments_size"], 8)
-        self.assertEqual(entry["cpu_results_size"], 8)
+        self.assertEqual(entry["physical_layouts"]["host_value"]["packed_arguments_size"], 8)
+        self.assertEqual(entry["physical_layouts"]["host_value"]["packed_results_size"], 8)
         self.assertEqual(entry["arguments"][0]["vernon.abi_field_offsets"], [0, 4])
         self.assertEqual(entry["results"][0]["vernon.abi_field_offsets"], [0, 4])
 

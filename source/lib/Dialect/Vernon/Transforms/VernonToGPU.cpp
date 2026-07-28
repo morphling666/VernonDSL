@@ -26,7 +26,7 @@ Type convertStorageLeaf(Type type, bool useSpirvStorage) {
 
 struct ViewExpansion {
     Type elementType;
-    StorageLayout layout;
+    ValueAbiLayout layout;
     SmallVector<Value> storages;
 };
 
@@ -169,9 +169,9 @@ LogicalResult decomposeAggregateValue(Type type, Value value, SmallVectorImpl<Va
     return success();
 }
 
-Value storageLeafIndex(Value recordIndex, uint64_t recordSize, const StorageLeaf &leaf, uint64_t scalarIndex,
+Value storageLeafIndex(Value recordIndex, uint64_t recordSize, const ValueAbiLeaf &leaf, uint64_t scalarIndex,
                        OpBuilder &builder, Location location) {
-    uint64_t leafSize = std::max<uint64_t>(leaf.type.getIntOrFloatBitWidth() / 8, 1);
+    uint64_t leafSize = std::max<uint64_t>(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1);
     Value stride = arith::ConstantIndexOp::create(builder, location, recordSize / leafSize);
     Value result = arith::MulIOp::create(builder, location, recordIndex, stride);
     const uint64_t scalarOffset = leaf.byteOffset / leafSize + scalarIndex;
@@ -195,35 +195,6 @@ FailureOr<Value> emitStorageLoad(const ViewExpansion &expansion, Value recordInd
     if (failed(result) || cursor != leaves.size())
         return failure();
     return result;
-}
-
-FailureOr<SmallVector<uint64_t>> staticTensorByteStrides(RankedTensorType tensor) {
-    if (!tensor.hasStaticShape() || !tensor.getElementType().isIntOrFloat() ||
-        llvm::any_of(tensor.getShape(), [](int64_t extent) { return extent <= 0; }))
-        return failure();
-    const uint64_t elementSize = std::max<uint64_t>(tensor.getElementType().getIntOrFloatBitWidth() / 8, 1);
-    SmallVector<uint64_t> strides(tensor.getRank());
-    if (tensor.getRank() == 2 && tensor.getDimSize(0) >= 2 && tensor.getDimSize(0) <= 4 && tensor.getDimSize(1) >= 2 &&
-        tensor.getDimSize(1) <= 4) {
-        const uint64_t rows = tensor.getDimSize(0);
-        const uint64_t alignment = std::max<uint64_t>((rows == 2 ? 2 : 4) * elementSize, 16);
-        strides[0] = elementSize;
-        strides[1] = llvm::alignTo(rows * elementSize, alignment);
-        return strides;
-    }
-    if (tensor.getRank() == 1 && tensor.getDimSize(0) >= 2 && tensor.getDimSize(0) <= 4) {
-        strides[0] = elementSize;
-        return strides;
-    }
-    uint64_t size = elementSize;
-    uint64_t alignment = elementSize;
-    for (int64_t dimension = tensor.getRank(); dimension-- > 0;) {
-        alignment = std::max<uint64_t>(alignment, 16);
-        const uint64_t stride = llvm::alignTo(size, alignment);
-        strides[dimension] = stride;
-        size = stride * static_cast<uint64_t>(tensor.getDimSize(dimension));
-    }
-    return strides;
 }
 
 struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<ModuleOp>> {
@@ -281,15 +252,15 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                 auto kind = dyn_cast_if_present<StringAttr>(attrs.kind);
                 if (!attrs.builtin) {
                     if (auto tensor = dyn_cast<TensorType>(type)) {
-                        FailureOr<StorageLayout> layout = resolveStorageLayout(tensor.getElementType(), module);
+                        FailureOr<ValueAbiLayout> layout = getValueAbiLayout(tensor.getElementType(), module);
                         if (failed(layout) || layout->leaves.empty()) {
                             source.emitError() << "cannot lower aggregate Tensor-by-value argument #" << index;
                             return signalPassFailure();
                         }
                         unsigned firstKernelIndex = kernelArgumentTypes.size();
-                        for (const StorageLeaf &leaf : layout->leaves) {
+                        for (const ValueAbiLeaf &leaf : layout->leaves) {
                             unsigned kernelIndex = kernelArgumentTypes.size();
-                            kernelArgumentTypes.push_back(convertStorageLeaf(leaf.type, useSpirvStorage));
+                            kernelArgumentTypes.push_back(convertStorageLeaf(leaf.scalarType, useSpirvStorage));
                             resourceBindings.emplace_back(kernelIndex, std::make_pair(0u, kernelIndex));
                         }
                         sourceArgumentRanges[index] = {firstKernelIndex, layout->leaves.size()};
@@ -299,8 +270,9 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                 }
                 if (!attrs.builtin) {
                     if (auto tensor = dyn_cast<RankedTensorType>(type)) {
-                        FailureOr<SmallVector<uint64_t>> strides = staticTensorByteStrides(tensor);
-                        if (failed(strides)) {
+                        FailureOr<PhysicalValueAbiLayout> layout =
+                            getPhysicalValueAbiLayout(tensor, module, PhysicalAbiProfile::VulkanStd430StorageBuffer);
+                        if (failed(layout) || layout->byteStrides.size() != static_cast<size_t>(tensor.getRank())) {
                             source.emitError() << "compute Tensor-by-value argument #" << index
                                                << " must have a positive static shape and scalar element type";
                             return signalPassFailure();
@@ -320,17 +292,17 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                 }
                 if (kind && kind.getValue() == "resource") {
                     auto view = dyn_cast<TensorViewType>(type);
-                    FailureOr<StorageLayout> layout = view ? resolveStorageLayout(view.getElementType(), module)
-                                                           : FailureOr<StorageLayout>(failure());
+                    FailureOr<ValueAbiLayout> layout =
+                        view ? getValueAbiLayout(view.getElementType(), module) : FailureOr<ValueAbiLayout>(failure());
                     if (!view || failed(layout) || layout->leaves.empty()) {
                         source.emitError() << "cannot lower compute resource argument #" << index << " type " << type;
                         return signalPassFailure();
                     }
                     unsigned firstKernelIndex = kernelArgumentTypes.size();
                     auto descriptorSet = cast<IntegerAttr>(attrs.descriptorSet);
-                    for (const StorageLeaf &leaf : layout->leaves) {
+                    for (const ValueAbiLeaf &leaf : layout->leaves) {
                         unsigned kernelIndex = kernelArgumentTypes.size();
-                        kernelArgumentTypes.push_back(convertStorageLeaf(leaf.type, useSpirvStorage));
+                        kernelArgumentTypes.push_back(convertStorageLeaf(leaf.scalarType, useSpirvStorage));
                         resourceBindings.emplace_back(kernelIndex, std::make_pair(descriptorSet.getInt(), kernelIndex));
                     }
                     sourceArgumentRanges[index] = {firstKernelIndex, layout->leaves.size()};
@@ -375,8 +347,8 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                 Value first = entry->getArgument(range.first);
                 auto aggregateTensor = aggregateTensorArguments.find(sourceIndex);
                 if (aggregateTensor != aggregateTensorArguments.end()) {
-                    FailureOr<StorageLayout> layout =
-                        resolveStorageLayout(aggregateTensor->second.getElementType(), module);
+                    FailureOr<ValueAbiLayout> layout =
+                        getValueAbiLayout(aggregateTensor->second.getElementType(), module);
                     if (failed(layout))
                         return signalPassFailure();
                     ViewExpansion expansion{aggregateTensor->second.getElementType(), *layout, {}};
@@ -405,7 +377,7 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                 auto view = dyn_cast<TensorViewType>(source.getArgument(sourceIndex).getType());
                 if (!view)
                     continue;
-                FailureOr<StorageLayout> layout = resolveStorageLayout(view.getElementType(), module);
+                FailureOr<ValueAbiLayout> layout = getValueAbiLayout(view.getElementType(), module);
                 if (failed(layout))
                     return signalPassFailure();
                 ViewExpansion expansion{view.getElementType(), *layout, {}};
@@ -416,8 +388,9 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
             }
             for (const InlineTensorArgument &inlineTensor : inlineTensorArguments) {
                 RankedTensorType tensor = inlineTensor.type;
-                FailureOr<SmallVector<uint64_t>> byteStrides = staticTensorByteStrides(tensor);
-                if (failed(byteStrides))
+                FailureOr<PhysicalValueAbiLayout> layout =
+                    getPhysicalValueAbiLayout(tensor, module, PhysicalAbiProfile::VulkanStd430StorageBuffer);
+                if (failed(layout) || layout->byteStrides.size() != static_cast<size_t>(tensor.getRank()))
                     return signalPassFailure();
                 const uint64_t elementSize = std::max<uint64_t>(tensor.getElementType().getIntOrFloatBitWidth() / 8, 1);
                 SmallVector<Value> elements;
@@ -428,7 +401,7 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                     for (int64_t dimension = tensor.getRank(); dimension-- > 0;) {
                         const uint64_t index = remaining % tensor.getDimSize(dimension);
                         remaining /= tensor.getDimSize(dimension);
-                        byteOffset += index * (*byteStrides)[dimension];
+                        byteOffset += index * layout->byteStrides[dimension];
                     }
                     Value elementIndex =
                         arith::ConstantIndexOp::create(bodyBuilder, source.getLoc(), byteOffset / elementSize);
