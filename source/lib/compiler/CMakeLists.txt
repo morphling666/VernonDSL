@@ -70,7 +70,9 @@ foreach(
                                                                          "${CMAKE_CURRENT_BINARY_DIR}/include")
 endforeach()
 
-if(BUILD_TESTING)
+# The combined build registers tests after Runtime and Python targets exist. Register here only when the compiler is
+# configured as a standalone project.
+if(BUILD_TESTING AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     include("${VERNON_REPOSITORY_ROOT}/cmake/VernonTests.cmake")
     vernon_add_tests()
 endif()

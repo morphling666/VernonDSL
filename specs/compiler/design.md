@@ -222,15 +222,14 @@ The legacy stage-specific
 `pipeline_asset(compute=..., vertex=..., fragment=..., targets=...)` signature
 is rejected.
 
-## Deferred host orchestration
+## Host orchestration boundary
 
 Multi-program orchestration, render passes, attachment load/store behavior,
-dynamic graphics state, framebuffer/renderbuffer abstraction, and
-compute/graphics backend pairing are intentionally unspecified. The previous
-Pass-graph proposal is archived in
-`specs/backup/execution_graph_design.md`; it is non-normative and does not
-constrain PipelineAsset design. This host orchestration problem is separate
-from the compiler-internal ProgramGraph proposed for autodiff.
+dynamic graphics state, and resource transitions belong to
+`VernonExecutionGraph` and are specified in `specs/runtime/design.md`. They do
+not change PipelineAsset syntax, compiler semantic identity, or artifact
+serialization. Runtime host orchestration remains separate from the
+compiler-internal ProgramGraph proposed for autodiff.
 
 Texture parameter constraints are queried through a separate `struct_size`-
 versioned runtime view so `VernonPipelineParameterView` remains ABI-stable.
@@ -421,9 +420,10 @@ before MLIR emission so lowering consumes concrete types and does not make
 call-site-dependent inference decisions.
 
 The typed semantic model records lvalues, branch merges, effects, and
-termination even though language v3 still rejects structured early return.
-This boundary prevents future control-flow support from changing expression
-typing or helper specialization.
+termination. Phase 5B early return, `break`, `continue`, and dynamic `range`
+are implemented while the frontend still reports version 3. This boundary
+keeps later autodiff control-flow rules from changing expression typing or
+helper specialization.
 
 ## Cross-stage GLSL interface names
 

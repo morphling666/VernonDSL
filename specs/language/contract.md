@@ -1,11 +1,12 @@
 # Vernon DSL language v4 draft
 
-> **Status: normative target, not implemented.**
+> **Status: normative target, partially implemented under frontend version 3.**
 >
-> The compiler and Python frontend remain language version 3. The implemented
-> v3 contract remains available in Git history. No syntax or behavior in this
-> document is available merely because it is specified here. Frontend version 4
-> may be selected only after the acceptance gates in this document pass.
+> The checked phases in `future_language_roadmap.md` are implemented and tested,
+> but unchecked sections of this document remain unavailable. The compiler and
+> Python frontend continue to emit language version 3 until every version-4
+> acceptance gate in this document passes. The historical version-3 contract is
+> available from Git history.
 
 Vernon is a statically typed GPU and graphics DSL embedded in Python syntax.
 The frontend parses source without importing or executing the shader module.
@@ -273,9 +274,9 @@ effects. Kernels and graphics entries may perform effects allowed by their
 stage and parameter access modes. Host runtime allocation, uploads, dispatch,
 downloads, and resource lifetime are not parsed device-language expressions.
 Multi-program ordering, render-pass state, resource transitions, and
-cross-backend synchronization require a future host orchestration contract.
-They are not language-v4 semantics. The archived proposal in
-`specs/backup/execution_graph_design.md` is non-normative.
+cross-backend synchronization are Runtime host-orchestration semantics,
+specified by `VernonExecutionGraph` in `specs/runtime/design.md`. They are not
+language-v4 semantics.
 
 ## 6. Functions, interfaces, and specialization
 
@@ -352,10 +353,12 @@ unary operations, one comparison, calls, supported attributes, indexing,
 Tensor/Tuple/Struct construction, and constant Tuple indexing.
 
 Tuple destructuring, short-circuit `and`/`or`, conditional expressions,
-dynamic `range`, `break`, `continue`, and nested/early return are added by v4.
-Chained comparisons, recursion, dynamic allocation, exceptions, generators,
-arbitrary classes, Python list/dict semantics, and Python object mutation
-remain deferred.
+dynamic `range`, `break`, `continue`, and nested/early return are implemented
+v4-core phases while the frontend still reports version 3. Autodiff coverage
+for Phase 5B control flow remains deferred until derivative and tape policies
+land. Chained comparisons, recursion, dynamic allocation, exceptions,
+generators, arbitrary classes, Python list/dict semantics, and Python object
+mutation remain deferred.
 
 `range(start, stop, step)` evaluates its arguments once before entering the
 loop. Integer literals and dynamic `i32` bounds are accepted; `u32` values
@@ -453,7 +456,7 @@ cache identity.
 
 ## 10. Feature status
 
-| Area | V3 implementation | V4 normative target | Deferred |
+| Area | Current frontend-version-3 implementation | V4 normative target | Deferred |
 | --- | --- | --- | --- |
 | Tensor | Fixed numeric aggregate; entry addressability metadata | Immutable Value with recursively ABI-stable Value elements and logical shape only | Dynamic-shape Value |
 | Ownership | Runtime `Tensor`; removed `Buffer` | `TensorStorage`, borrowed `TensorView`, runtime-only `vd.interop.RawBuffer` escape hatch | General allocator model |
@@ -461,7 +464,7 @@ cache identity.
 | Aggregates | Nominal immutable Struct; Vector/Matrix constructors | Tensor, structural Tuple, nominal Struct; no Array | Enums and tagged unions |
 | Effects | Typed read/write records | Region-aware read/write boundary; reserved atomic/barrier effects | Full memory-order model |
 | Autodiff | Not implemented | First-order pure typed-IR JVP/VJP/grad | Higher-order and stateful-kernel AD |
-| Control flow | Restricted structured subset | V3 subset plus Tuple destructuring and AD-covered flow | Early return, dynamic range, break/continue, unrestricted recursion |
+| Control flow | Tuple destructuring, short-circuit expressions, early return, dynamic range, break, and continue | Current subset plus explicitly AD-covered flow | Unrestricted recursion and Python-only control flow |
 | Rendering | Typed graphics stages, textures, samplers | Same model with explicit Resource and derivative boundaries | General differentiable rasterization |
 
 ## 11. Workload expressiveness

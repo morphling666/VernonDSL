@@ -12,7 +12,7 @@ set(VERNON_TEST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 set(VERNON_TEST_BINARY_ROOT "${CMAKE_CURRENT_BINARY_DIR}")
 
 function(vernon_discover_gtests target)
-    gtest_discover_tests(${target} DISCOVERY_MODE PRE_TEST WORKING_DIRECTORY "${VERNON_TEST_BINARY_ROOT}")
+    gtest_discover_tests(${target} DISCOVERY_MODE POST_BUILD WORKING_DIRECTORY "${VERNON_TEST_BINARY_ROOT}")
 endfunction()
 
 if(TARGET VernonRuntime)

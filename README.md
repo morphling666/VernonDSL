@@ -23,6 +23,10 @@ and integer true division are deterministic across targets. Use
 The active specifications and reading order are in
 [`specs/README.md`](specs/README.md). The language contract, including
 migration rules, is [`specs/language/contract.md`](specs/language/contract.md).
+Checked phases in the
+[`language-v4 roadmap`](specs/language/future_language_roadmap.md) are already
+implemented, but the frontend remains version 3 until every v4 acceptance gate
+passes.
 
 ## Current status
 
@@ -41,6 +45,26 @@ The native compiler library currently provides:
 - SPIRV-Cross source artifacts for OpenGL, OpenGL ES, and Metal, plus
   Shader Model 6 DXIL for DirectX;
 - `vernon-opt`, the Vernon MLIR pass driver.
+
+### Target support matrix
+
+Compiler capability means that the complete artifact pipeline is linked.
+Runtime availability additionally depends on the operating system, driver,
+device, and requested feature set.
+
+| Target | Compiler artifact | Compiler stages | VernonRuntime execution | Required environment |
+| --- | --- | --- | --- | --- |
+| CPU | LLVM IR and relocatable object; in-process reference entry | Compute and numeric stage reference | Compute only | Host or supported cross-target toolchain |
+| Vulkan | SPIR-V | Compute and graphics | Compute and offscreen graphics | Vulkan 1.1 loader and compatible device |
+| OpenGL | Desktop GLSL | Compute and graphics | Compute and graphics | External or Python-owned context; compute requires 4.3 |
+| OpenGL ES | ESSL | Compute and graphics | Compute and graphics | External context; compute requires 3.1 |
+| CUDA | PTX | Compute only | Compute only | Compatible NVIDIA driver |
+| DirectX | Shader Model 6 DXIL | Compute and graphics | Compute and offscreen graphics | Windows D3D12; DXC is required only while cooking |
+| Metal | MSL source | Compute and graphics | Not implemented | External Metal integration |
+
+AMD/ROCDL is not a public compiler target. Unsupported stages, target options,
+and runtime/device combinations fail explicitly rather than falling back to a
+different backend.
 
 CUDA/NVPTX and CPU/LLVM are distinct branches; they are never routed through
 SPIR-V. The CPU backend JIT-compiles the current graphics and compute numeric
@@ -116,6 +140,33 @@ to `python/vernon_dsl/`, which is the sole development import location.
 `uv build` explicitly when producing a release wheel. Run Python commands
 through `uv run --frozen` with `python/` on `PYTHONPATH` when they are not
 launched by CTest.
+
+### Baseline benchmarks
+
+The baseline runner emits JSON and uses fixed repository fixtures. Record the
+commit, build configuration, target, driver/device, and command with every
+result. CPU scenarios are the portable baseline:
+
+```powershell
+$env:PYTHONPATH = "$PWD/python"
+uv run --frozen --no-sync python scripts/benchmark_baseline.py frontend --iterations 10
+uv run --frozen --no-sync python scripts/benchmark_baseline.py cook --target cpu --iterations 5
+uv run --frozen --no-sync python scripts/benchmark_baseline.py kernel --arch cpu --iterations 20
+```
+
+Run the same kernel scenario with `--arch cuda`, `vulkan`, `opengl`,
+`opengles`, or `directx` on an available device. It reports cold
+compile-and-dispatch, warm dispatch, and upload/dispatch/readback separately.
+The multi-pass GPU baseline uses a fixed headless ocean workload:
+
+```powershell
+uv sync --extra build --extra examples --frozen
+uv run --frozen --no-sync python scripts/benchmark_baseline.py showcase `
+  --arch vulkan --frames 60 --grid 64 --size 256
+```
+
+Showcase time includes startup and compilation by design. Use an external GPU
+timeline profiler when separating queue wait and device execution.
 
 ### Windows CI
 
@@ -250,6 +301,28 @@ uv run python examples/advanced_pipeline.py --arch vulkan --frames 2 --headless 
   --output build/advanced-color.png `
   --id-output build/advanced-object-id.png
 ```
+
+Run the compute-driven showcase demos. Both record simulation, dynamic mesh
+generation, shadow rendering, and the PBR main pass into one `ExecutionGraph`,
+so buffer and depth-image barriers are inferred automatically:
+
+```powershell
+uv sync --extra examples
+
+# Conservative hydraulic erosion, triplanar rock, wet runoff, and sunset PBR.
+uv run python examples/dynamic_terrain_erosion.py --arch vulkan --frames 180 `
+  --grid 224 --extent 13 --output build/dynamic-terrain-erosion.png
+
+# Ping-pong finite-difference waves and compute-generated PBR mesh data.
+uv run python examples/dynamic_ocean.py --arch vulkan --frames 180 `
+  --grid 192 --extent 14 --output build/dynamic-ocean.png
+```
+
+Use `--headless` for automated screenshots. `--arch directx` and
+`--arch opengl` exercise the same graph on their available Windows backends.
+The simulations use one writer per vertex/cell and do not require atomics or
+workgroup barriers. The erosion demo reconstructs neighboring runoff from the
+previous state before rebuilding terrain normals and material channels.
 
 The end-to-end example invokes separate compute and graphics programs while
 sharing three feature variants, indexed instancing, named MRT outputs, and

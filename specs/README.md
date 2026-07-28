@@ -1,8 +1,8 @@
 # VernonDSL specifications
 
-`specs` contains current contracts and implementation direction. Deferred
-non-normative proposals that remain useful for future redesign live under
-`backup/`; other historical plans are available from Git history.
+`specs` contains only current contracts, implementation direction, and active
+deferred work. Completed and superseded plans are removed; Git history is the
+archive.
 
 ## Canonical documents
 
@@ -14,6 +14,10 @@ non-normative proposals that remain useful for future redesign live under
   lowering invariants, reflection, and asset cooking.
 - [`runtime/design.md`](runtime/design.md) records deployment ABI, backend
   ownership, resource behavior, and execution semantics.
+- [`examples/design.md`](examples/design.md) records non-obvious algorithm and
+  synchronization choices used by the GPU showcase programs.
+- [`completion_roadmap.md`](completion_roadmap.md) prioritizes completion,
+  refactoring, performance, backend consistency, and production engineering.
 
 An implementation must update the applicable canonical document when it adds a
 non-obvious invariant or changes an accepted contract. Temporary investigation
@@ -36,12 +40,10 @@ The shared contract is:
 - `variants=` enumerates accepted feature keys;
 - target architecture and options are cooker inputs, not source fields.
 
-`VernonExecutionGraph` is the active host-orchestration direction. The
-remaining work required to connect its public API to real backend command
-recording is tracked in
-[`execution_graph_completion_plan.md`](execution_graph_completion_plan.md).
-The previous persistent-asset proposal remains non-normative history in
-[`backup/execution_graph_design.md`](backup/execution_graph_design.md).
+`VernonExecutionGraph` is the active host-orchestration API. Its ownership,
+hazard, scheduling, render-scope, and command-recording contract is maintained
+in [`runtime/design.md`](runtime/design.md#pipeline-runtime-boundary), not in a
+separate completion plan.
 The separate low-priority `ProgramGraph` roadmap item is compiler IR inside one
 program for autodiff; it is not a deployment graph.
 

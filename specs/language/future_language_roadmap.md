@@ -1,10 +1,10 @@
 # Language v4 implementation roadmap
 
-This roadmap implements the unimplemented normative target in `contract.md`.
-The current compiler and frontend remain language version 3; its historical
-contract remains available in Git history. A phase may not silently broaden
-Python semantics or publish frontend version 4 before all contract acceptance
-gates pass.
+This roadmap tracks the remaining gates for the normative target in
+`contract.md`. Checked phases are implemented while the current compiler and
+frontend continue to report language version 3. A phase may not silently
+broaden Python semantics or publish frontend version 4 before all contract
+acceptance gates pass.
 
 ## Design position
 
@@ -140,9 +140,9 @@ transitions.
       serialize ProgramGraph as a deployment or orchestration asset.
 
 This work is post-v4 and lower priority than the accepted language,
-PipelineAsset target coverage, and first-order pure-function autodiff. The
-former host Pass-graph proposal is unrelated and remains archived in
-`specs/backup/execution_graph_design.md`.
+PipelineAsset target coverage, and first-order pure-function autodiff.
+Runtime host orchestration is unrelated and is specified independently in
+`specs/runtime/design.md`.
 
 A public graph-level execution model may become useful for neural-network
 workloads that compose many kernels, parameters, and differentiable operators.

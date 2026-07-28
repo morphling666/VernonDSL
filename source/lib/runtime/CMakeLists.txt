@@ -98,7 +98,9 @@ endif()
 include("${_vernon_runtime_target_file}")
 vernon_add_runtime()
 
-if(BUILD_TESTING)
+# The combined build registers tests after compiler and Python targets exist. Register here only when Runtime is
+# configured as a standalone project.
+if(BUILD_TESTING AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     include("${VERNON_REPOSITORY_ROOT}/cmake/VernonTests.cmake")
     vernon_add_tests()
 endif()
