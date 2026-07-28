@@ -1,16 +1,9 @@
 #ifndef VERNON_RHI_INTERNAL_H
 #define VERNON_RHI_INTERNAL_H
 
-#include "VernonRHI.h"
+#include "backend_dispatch.h"
 
 namespace vernon::rhi {
-
-enum class ResourceKind : uint32_t { Buffer = 1, Image = 2, Sampler = 3 };
-enum CommandRenderingKind : uint32_t {
-    CommandRenderingDynamic = 1,
-    CommandRenderingRenderPass = 2,
-    CommandRenderingStateless = 3
-};
 
 VERNON_RHI_CAPI VernonRhiDevice createDevice(const VernonRhiOwnedDeviceDescriptor *descriptor);
 VERNON_RHI_CAPI void destroyDevice(VernonRhiDevice device);

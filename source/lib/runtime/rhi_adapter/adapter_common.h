@@ -54,6 +54,7 @@ struct VernonRuntimeRhiAdapter {
     std::atomic<size_t> layoutPreparations{};
     std::atomic<size_t> pipelinePreparations{};
     std::atomic<size_t> bindingCreations{};
+    std::atomic<size_t> bindingSnapshotCreations{};
     std::atomic<size_t> dispatches{};
 };
 

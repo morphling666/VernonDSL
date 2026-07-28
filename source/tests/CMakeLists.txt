@@ -78,10 +78,11 @@ if(TARGET VernonRuntime)
     add_executable(
         VernonRuntimeTests
         runtime/compute_launch_planner_test.cpp
-        runtime/directx_resource_retention_test.cpp
+        runtime/directx_command_state_test.cpp
         runtime/execution_graph_test.cpp
         runtime/graphics_invocation_planner_test.cpp
         runtime/pipeline_manifest_requirements_test.cpp
+        runtime/rhi_resource_lifetime_test.cpp
         runtime/runtime_c_api_test.cpp
         runtime/runtime_common_api_test.cpp
         runtime/runtime_cpu_pipeline_test.cpp
@@ -199,7 +200,6 @@ if(TARGET VernonRuntime)
                     "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py"
                     "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/requirements.py"
                     "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/types.py"
-                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/pipeline_compile.py"
                     "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/pipeline_assets.py"
             VERBATIM)
         add_custom_target(vernon-vulkan-pipeline-test-bundle DEPENDS "${vulkan_pipeline_test_manifest}")
@@ -228,7 +228,6 @@ if(TARGET VernonRuntime)
                     "${VERNON_REPOSITORY_ROOT}/python/tests/cube_map_shader.py"
                     "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/requirements.py"
                     "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/types.py"
-                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/pipeline_compile.py"
                     "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/pipeline_assets.py"
             VERBATIM)
         add_custom_target(vernon-vulkan-cube-map-test-bundle DEPENDS "${vulkan_cube_map_test_manifest}")

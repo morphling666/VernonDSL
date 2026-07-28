@@ -386,6 +386,7 @@ RhiAdapterPreparationStats getRhiAdapterPreparationStats(const VernonRuntimeRhiA
             adapter.layoutPreparations.load(std::memory_order_relaxed),
             adapter.pipelinePreparations.load(std::memory_order_relaxed),
             adapter.bindingCreations.load(std::memory_order_relaxed),
+            adapter.bindingSnapshotCreations.load(std::memory_order_relaxed),
             adapter.dispatches.load(std::memory_order_relaxed)};
 }
 

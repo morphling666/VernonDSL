@@ -24,7 +24,8 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/opengl_driver.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/rhi_command.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/rhi_device.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/rhi.cpp)
+        ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/rhi.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/rhi_opengl.cpp)
     add_library(Vernon::RHI ALIAS VernonRHI)
     set_target_properties(VernonRHI PROPERTIES EXPORT_NAME RHI POSITION_INDEPENDENT_CODE ON)
     if(VERNON_RUNTIME_LIBRARY_TYPE STREQUAL "STATIC")
@@ -39,18 +40,24 @@ function(vernon_add_runtime)
                                                 $<INSTALL_INTERFACE:include>)
     target_link_libraries(VernonRHI PRIVATE VernonPlatform ${CMAKE_DL_LIBS})
     if(VERNON_ENABLE_CUDA_RUNTIME)
-        target_sources(VernonRHI PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/cuda_backend.cpp
-                                         ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/cuda_driver.cpp)
+        target_sources(
+            VernonRHI
+            PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/cuda_backend.cpp
+                    ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/cuda_driver.cpp ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/rhi_cuda.cpp)
         target_compile_definitions(VernonRHI PRIVATE VERNON_HAS_CUDA_RHI=1)
     endif()
     if(VERNON_ENABLE_DIRECTX12_RUNTIME)
-        target_sources(VernonRHI PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/directx12_backend.cpp)
+        target_sources(VernonRHI PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/directx12_backend.cpp
+                                         ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/rhi_directx12.cpp)
         target_compile_definitions(VernonRHI PRIVATE VERNON_HAS_DIRECTX12_RHI=1)
         target_link_libraries(VernonRHI PRIVATE d3d12 dxgi dxguid)
     endif()
     if(VERNON_ENABLE_VULKAN_RUNTIME)
-        target_sources(VernonRHI PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/vulkan_backend.cpp
-                                         ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/vulkan_driver.cpp)
+        target_sources(
+            VernonRHI
+            PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/vulkan_backend.cpp
+                    ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/vulkan_driver.cpp
+                    ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/rhi_vulkan.cpp)
         target_compile_definitions(VernonRHI PRIVATE VERNON_HAS_VULKAN_RHI=1 VK_NO_PROTOTYPES=1)
         target_link_libraries(VernonRHI PRIVATE $<BUILD_INTERFACE:Vulkan::Headers>)
     endif()

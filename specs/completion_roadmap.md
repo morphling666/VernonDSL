@@ -147,6 +147,8 @@ Progress (2026-07-28):
 
 ### Runtime, RHI, and backend adapters
 
+Status: **Complete (2026-07-28).**
+
 Continue enforcing the dependency direction:
 
 ```text
@@ -169,6 +171,27 @@ Acceptance:
 - generation and slot-reuse tests cover buffers, images, and samplers;
 - warm invocation performs no allocation solely because bindings are unchanged;
 - RuntimeCore remains independent of VernonRHI and native graphics SDK types.
+
+Progress (2026-07-28):
+
+- `LogicalResourceRecord` is the single generation, public-owner, prepared-
+  binding retention, and slot-reuse contract used by CUDA, Vulkan, DirectX 12,
+  OpenGL, and OpenGL ES resources;
+- the RHI entry layer now dispatches through a backend-neutral function table;
+  OpenGL, CUDA, Vulkan, and DirectX 12 each own their device registry, resource
+  records, command encoding, submission, barriers, and native interop;
+- public owner destruction invalidates the public handle immediately while the
+  logical record keeps the native object alive until its final prepared binding
+  is released;
+- backend-parameterized tests cover buffer reuse on CUDA, Vulkan, and DirectX
+  12, and image/sampler reuse on the backends that expose them; external-context
+  tests cover the same three resource kinds on OpenGL;
+- unchanged Vulkan graphics invocation reuses binding snapshots, command
+  buffers, descriptor pools, staging allocations, layouts, pipelines, and
+  implicit samplers;
+- RuntimeCore links only the provider SPI and JSON support; configure-time and
+  C-header checks reject a VernonRHI dependency, while native SDK command
+  encoding remains in the RHI adapter target.
 
 ### Canonical ABI and reflection
 

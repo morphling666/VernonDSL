@@ -12,6 +12,7 @@ struct RhiAdapterPreparationStats {
     size_t layoutPreparations{};
     size_t pipelinePreparations{};
     size_t bindingCreations{};
+    size_t bindingSnapshotCreations{};
     size_t dispatches{};
 };
 

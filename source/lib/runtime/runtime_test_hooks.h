@@ -14,6 +14,7 @@ struct VulkanGraphicsCacheStats {
     size_t descriptorSetLayoutCreations{};
     size_t pipelineLayoutCreations{};
     size_t graphicsPipelineCreations{};
+    size_t bindingSnapshotCreations{};
     size_t commandBufferAllocations{};
     size_t descriptorPoolCreations{};
     size_t stagingBufferAllocations{};

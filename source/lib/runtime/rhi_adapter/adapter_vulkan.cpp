@@ -977,6 +977,7 @@ PreparedBindingSet::Snapshot *snapshotBindings(VernonRuntimeRhiAdapter &adapter,
         fail(adapter, "Vulkan binding snapshot allocation failed", VERNON_STATUS_INTERNAL_ERROR);
         return nullptr;
     }
+    adapter.bindingSnapshotCreations.fetch_add(1, std::memory_order_relaxed);
     if (!retainBindingSnapshot(adapter, encoder, bindings, *result)) {
         auto owned = std::move(bindings.snapshots.find(key)->second);
         bindings.snapshots.erase(key);

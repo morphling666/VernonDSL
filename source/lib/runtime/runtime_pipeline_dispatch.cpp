@@ -107,6 +107,8 @@ VulkanGraphicsCacheStats getVulkanGraphicsCacheStats(const VernonRuntimeContext 
     result.descriptorSetLayoutCreations = state.rhiGraphicsPipeline ? 1 : 0;
     result.pipelineLayoutCreations = state.rhiGraphicsPipeline ? 1 : 0;
     result.graphicsPipelineCreations = state.rhiGraphicsVariant ? 1 : 0;
+    result.bindingSnapshotCreations =
+        getRhiAdapterPreparationStats(*vulkanState(*context).adapter).bindingSnapshotCreations;
     result.commandBufferAllocations = rhiStats.commandBufferAllocations;
     result.descriptorPoolCreations = rhiStats.descriptorPoolCreations;
     result.stagingBufferAllocations = rhiStats.stagingBufferAllocations;

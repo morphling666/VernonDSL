@@ -191,6 +191,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(firstStats.descriptorSetLayoutCreations, 1u);
     EXPECT_EQ(firstStats.pipelineLayoutCreations, 1u);
     EXPECT_EQ(firstStats.graphicsPipelineCreations, 1u);
+    EXPECT_EQ(firstStats.bindingSnapshotCreations, 1u);
     EXPECT_EQ(firstStats.commandBufferAllocations, 1u);
     EXPECT_EQ(firstStats.descriptorPoolCreations, 1u);
     EXPECT_GT(firstStats.stagingBufferAllocations, 0u);
@@ -215,10 +216,25 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(secondStats.descriptorSetLayoutCreations, firstStats.descriptorSetLayoutCreations);
     EXPECT_EQ(secondStats.pipelineLayoutCreations, firstStats.pipelineLayoutCreations);
     EXPECT_EQ(secondStats.graphicsPipelineCreations, firstStats.graphicsPipelineCreations);
+    EXPECT_EQ(secondStats.bindingSnapshotCreations, firstStats.bindingSnapshotCreations + 1);
     EXPECT_EQ(secondStats.commandBufferAllocations, firstStats.commandBufferAllocations);
     EXPECT_EQ(secondStats.descriptorPoolCreations, firstStats.descriptorPoolCreations);
     EXPECT_EQ(secondStats.stagingBufferAllocations, firstStats.stagingBufferAllocations);
     EXPECT_EQ(secondStats.renderPassCreations, firstStats.renderPassCreations);
+
+    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
+        << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
+    const vernon::runtime::VulkanGraphicsCacheStats warmStats =
+        vernon::runtime::getVulkanGraphicsCacheStats(runtime, pipeline);
+    EXPECT_EQ(warmStats.defaultImplicitSamplerCreations, secondStats.defaultImplicitSamplerCreations);
+    EXPECT_EQ(warmStats.descriptorSetLayoutCreations, secondStats.descriptorSetLayoutCreations);
+    EXPECT_EQ(warmStats.pipelineLayoutCreations, secondStats.pipelineLayoutCreations);
+    EXPECT_EQ(warmStats.graphicsPipelineCreations, secondStats.graphicsPipelineCreations);
+    EXPECT_EQ(warmStats.bindingSnapshotCreations, secondStats.bindingSnapshotCreations);
+    EXPECT_EQ(warmStats.commandBufferAllocations, secondStats.commandBufferAllocations);
+    EXPECT_EQ(warmStats.descriptorPoolCreations, secondStats.descriptorPoolCreations);
+    EXPECT_EQ(warmStats.stagingBufferAllocations, secondStats.stagingBufferAllocations);
+    EXPECT_EQ(warmStats.renderPassCreations, secondStats.renderPassCreations);
 
     std::vector<uint8_t> pixels(32 * 32 * 4);
     ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, firstTarget.handle, pixels.data(), pixels.size()),

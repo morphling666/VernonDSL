@@ -1,0 +1,5 @@
+uv run --frozen python .\examples\fractal.py --arch opengles
+Traceback (most recent call last):
+  File "C:\Users\12825\VernonDSL\examples\fractal.py", line 7, in <module>
+    import vernon_dsl as vd
+ModuleNotFoundError: No module named 'vernon_dsl'
