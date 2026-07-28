@@ -13,12 +13,14 @@ from .model import (
     BranchMerge,
     ConcreteType,
     LValue,
+    ResourceEffect,
     StorageEffect,
     StorageEffectKind,
     StorageOwner,
     StorageRegion,
     StorageRegionKind,
     Termination,
+    TypedEffect,
     TypedExpression,
     TypedFunctionInstance,
     TypedParameter,
@@ -305,7 +307,7 @@ class _Inference:
             active.append(symbol)
             body = tuple(resolve_statement(statement, function) for statement in function.body)
             active.pop()
-            effects = self._function_storage_effects(body)
+            effects = self._function_effects(body)
             result = replace(function, body=body, effects=effects)
             resolved[symbol] = result
             return result
@@ -325,6 +327,8 @@ class _Inference:
                 formal_indices = {parameter.name: index for index, parameter in enumerate(callee.parameters)}
                 mapped: list[tuple[str, StorageEffect]] = []
                 for effect in callee.effects:
+                    if not isinstance(effect, StorageEffect):
+                        continue
                     formal_index = formal_indices.get(effect.owner.parameter)
                     if formal_index is None or formal_index >= len(call.args):
                         raise self.error(call, f"cannot bind effect owner '{effect.owner.parameter}'")
@@ -369,12 +373,12 @@ class _Inference:
         return typed_functions
 
     @staticmethod
-    def _function_storage_effects(body: tuple[TypedStatement, ...]) -> tuple[StorageEffect, ...]:
-        effects: list[StorageEffect] = []
+    def _function_effects(body: tuple[TypedStatement, ...]) -> tuple[TypedEffect, ...]:
+        effects: list[TypedEffect] = []
 
         def collect(statement: TypedStatement) -> None:
             for effect in statement.effects:
-                if isinstance(effect, StorageEffect) and effect not in effects:
+                if effect not in effects:
                     effects.append(effect)
             for child in statement.children:
                 collect(child)
@@ -443,7 +447,10 @@ class _Inference:
         elif isinstance(statement, (ast.For, ast.While)):
             children.extend(self._typed_block(statement.body, parameters, loop_depth + 1))
             children.extend(self._typed_block(statement.orelse, parameters, loop_depth))
-        effects = self._storage_effects(statement, typed_expressions, parameters)
+        effects = (
+            *self._storage_effects(statement, typed_expressions, parameters),
+            *self._resource_effects(typed_expressions, parameters),
+        )
         termination = (
             Termination.RETURN
             if isinstance(statement, ast.Return)
@@ -536,6 +543,26 @@ class _Inference:
             if effect is not None and effect not in effects:
                 effects.append(effect)
 
+        return tuple(effects)
+
+    @staticmethod
+    def _resource_effects(
+        expressions: list[TypedExpression],
+        parameters: dict[str, TypedParameter],
+    ) -> tuple[ResourceEffect, ...]:
+        effects: list[ResourceEffect] = []
+        for expression in expressions:
+            if expression.operation not in {"texture_sample", "texture_size"}:
+                continue
+            call = expression.source
+            if not isinstance(call, ast.Call) or not call.args or not isinstance(call.args[0], ast.Name):
+                continue
+            parameter = parameters.get(call.args[0].id)
+            if parameter is None or parameter.type.kind != "texture":
+                continue
+            effect = ResourceEffect(expression.operation, parameter.name)
+            if effect not in effects:
+                effects.append(effect)
         return tuple(effects)
 
     def _typed_operand_types(

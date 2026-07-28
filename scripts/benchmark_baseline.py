@@ -20,6 +20,7 @@ from vernon_dsl.pipeline_assets import cook_pipeline_asset  # type: ignore[impor
 
 ROOT = Path(__file__).resolve().parents[1]
 FRONTEND_FIXTURE = ROOT / "python" / "tests" / "pipeline_asset_fixture.py"
+NATIVE_FIXTURE = ROOT / "python" / "tests" / "advanced_pipeline_shader.py"
 
 
 def _load_scale_kernel() -> Any:
@@ -70,6 +71,37 @@ def benchmark_frontend(iterations: int) -> dict[str, object]:
         "scenario": "frontend",
         "source": FRONTEND_FIXTURE.relative_to(ROOT).as_posix(),
         "entry": "scale",
+        "first_ms": round(samples[0], 4),
+        "subsequent": _summary(samples[1:] or samples),
+    }
+
+
+def benchmark_native(iterations: int, target: str) -> dict[str, object]:
+    from vernon_dsl import _native  # type: ignore[attr-defined,import-not-found]
+
+    mlir = compile_file(NATIVE_FIXTURE, entry="advanced_fragment")
+    native_target = {
+        "cpu": _native.Target.CPU,
+        "cuda": _native.Target.CUDA,
+        "vulkan": _native.Target.VULKAN,
+        "opengl": _native.Target.OPENGL,
+        "opengles": _native.Target.OPENGL_ES,
+        "directx": _native.Target.DIRECTX,
+        "metal": _native.Target.METAL,
+    }[target]
+    compiler = _native.Compiler()
+
+    def compile_once() -> None:
+        program = compiler.compile_program_result(mlir, native_target)
+        if not program.ok:
+            raise RuntimeError(program.diagnostics)
+
+    samples = [_milliseconds(compile_once) for _ in range(iterations)]
+    return {
+        "scenario": "native",
+        "source": NATIVE_FIXTURE.relative_to(ROOT).as_posix(),
+        "entry": "advanced_fragment",
+        "target": target,
         "first_ms": round(samples[0], 4),
         "subsequent": _summary(samples[1:] or samples),
     }
@@ -182,7 +214,7 @@ def benchmark_showcase(architecture: str, frames: int, grid: int, size: int) -> 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run reproducible VernonDSL baseline benchmarks.")
-    parser.add_argument("scenario", choices=("frontend", "cook", "kernel", "showcase"))
+    parser.add_argument("scenario", choices=("frontend", "native", "cook", "kernel", "showcase"))
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--arch", choices=("cpu", "cuda", "vulkan", "opengl", "opengles", "directx"), default="cpu")
     parser.add_argument(
@@ -204,6 +236,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("iterations, elements, frames, grid, and size must be positive")
     if arguments.scenario == "frontend":
         result = benchmark_frontend(arguments.iterations)
+    elif arguments.scenario == "native":
+        result = benchmark_native(arguments.iterations, arguments.target)
     elif arguments.scenario == "cook":
         result = benchmark_cook(arguments.iterations, arguments.target)
     elif arguments.scenario == "kernel":

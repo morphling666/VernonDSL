@@ -25,15 +25,19 @@ namespace {
 
 VernonStringView viewOf(const std::string &value) { return VernonStringView{value.data(), value.size()}; }
 
-std::unique_ptr<VernonCompileResult> validate(VernonCompilerContext *context, const char *source, size_t sourceSize) {
+std::unique_ptr<VernonCompileResult> validate(VernonCompilerContext *context, const char *source, size_t sourceSize,
+                                              vernon::compiler::PreparedModulePtr *prepared = nullptr) {
     auto result = std::make_unique<VernonCompileResult>();
     if (!context || (!source && sourceSize != 0)) {
         result->status = VERNON_STATUS_INVALID_ARGUMENT;
         result->diagnostics = "context and source must be valid";
         return result;
     }
-    result->status = vernon::compiler::validateMlir(*context->frontend, source, sourceSize, result->artifacts,
-                                                    result->reflection, result->diagnostics);
+    vernon::compiler::PreparedModulePtr ownedPrepared;
+    result->status = vernon::compiler::prepareMlir(*context->frontend, source, sourceSize, ownedPrepared,
+                                                   result->artifacts, result->reflection, result->diagnostics);
+    if (prepared)
+        *prepared = std::move(ownedPrepared);
     return result;
 }
 
@@ -75,7 +79,8 @@ VernonCompileResult *vernonCompilerCompileMlir(VernonCompilerContext *context, c
 VernonCompileResult *vernonCompilerCompileMlirWithOptions(VernonCompilerContext *context, const char *source,
                                                           size_t sourceSize, VernonTarget target,
                                                           const VernonCompileOptions *options) {
-    auto result = validate(context, source, sourceSize);
+    vernon::compiler::PreparedModulePtr prepared;
+    auto result = validate(context, source, sourceSize, &prepared);
     if (result->status != VERNON_STATUS_OK)
         return result.release();
 
@@ -92,9 +97,8 @@ VernonCompileResult *vernonCompilerCompileMlirWithOptions(VernonCompilerContext 
         result->artifacts.clear();
         return result.release();
     }
-    result->status = vernon::compiler::compileTarget(*context->frontend, source, sourceSize, target, parsedOptions,
-                                                     result->artifacts, result->reflection, result->diagnostics,
-                                                     result->cpuExecution);
+    result->status = vernon::compiler::compileTarget(*prepared, target, parsedOptions, result->artifacts,
+                                                     result->reflection, result->diagnostics, result->cpuExecution);
     return result.release();
 }
 

@@ -1,5 +1,7 @@
 #include "compiler_spirv.h"
 
+#include "compiler_frontend.h"
+
 #include "mlir/Conversion/GPUToSPIRV/GPUToSPIRVPass.h"
 #include "mlir/Conversion/MathToSPIRV/MathToSPIRVPass.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -8,14 +10,11 @@
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
 #include "mlir/Dialect/SPIRV/Transforms/Passes.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
-#include "mlir/Dialect/Vernon/Transforms/VernonInlineHelpers.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUTensors.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonSpirvMarkers.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonToGPU.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonToSpirv.h"
-#include "mlir/Dialect/Vernon/Transforms/VernonValidation.h"
 #include "mlir/IR/Diagnostics.h"
-#include "mlir/Parser/Parser.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/SPIRV/Serialization.h"
@@ -216,14 +215,12 @@ struct AttachSpirvTargetPass
 
 } // namespace
 
-bool compileSpirv(mlir::MLIRContext &context, const char *source, size_t sourceSize, VernonTarget target,
-                  std::vector<Artifact> &artifacts, std::string &diagnostics) {
+bool compileSpirv(PreparedModule &prepared, VernonTarget target, std::vector<Artifact> &artifacts,
+                  std::string &diagnostics) {
+    mlir::MLIRContext &context = prepared.context();
     mlir::ScopedDiagnosticHandler handler(
         &context, [&](mlir::Diagnostic &diagnostic) { appendDiagnostic(diagnostics, diagnostic); });
-    llvm::StringRef text(source ? source : "", sourceSize);
-    mlir::OwningOpRef<mlir::ModuleOp> module = mlir::parseSourceString<mlir::ModuleOp>(text, &context);
-    if (!module)
-        return false;
+    mlir::OwningOpRef<mlir::ModuleOp> module = prepared.clone();
     bool requiresRuntimeContractViolation = false;
     module->walk([&](mlir::cf::AssertOp) { requiresRuntimeContractViolation = true; });
     if (requiresRuntimeContractViolation) {
@@ -237,11 +234,6 @@ bool compileSpirv(mlir::MLIRContext &context, const char *source, size_t sourceS
     }
 
     mlir::PassManager passManager(&context);
-    passManager.addPass(mlir::vernon::createVernonValidatePass());
-    // Backend lowerings intentionally only handle entry bodies. Inline shared
-    // helpers while the module is still in common typed MLIR so every target
-    // sees the same implementation.
-    passManager.addPass(mlir::vernon::createVernonInlineHelpersPass());
     passManager.addPass(mlir::vernon::createVernonToGPUPass(true));
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerGPUTensorsPass(true));
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::createConvertMathToSPIRVPass());

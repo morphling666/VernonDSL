@@ -15,6 +15,10 @@ static int view_contains(VernonStringView value, const char *needle) {
     return 0;
 }
 
+static int views_equal(VernonStringView left, VernonStringView right) {
+    return left.size == right.size && (left.size == 0 || memcmp(left.data, right.data, left.size) == 0);
+}
+
 static void sample_texture(void *user_data, uintptr_t texture, float u, float v, float out_rgba[4]) {
     const float bias = *(const float *)user_data;
     out_rgba[0] = u;
@@ -307,6 +311,16 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     ASSERT_TRUE(view_contains(vulkan_reflection, "\"target\":\"vulkan\""));
     ASSERT_TRUE(view_contains(vulkan_reflection, "\"entry_point\":\"vertex_main\""));
     ASSERT_TRUE(view_contains(vulkan_reflection, "\"filename\":\"module.spv\""));
+
+    VernonCompileResult *repeated_vulkan_compile =
+        vernonCompilerCompileMlir(context, module, strlen(module), VERNON_TARGET_VULKAN);
+    ASSERT_TRUE(repeated_vulkan_compile != NULL);
+    ASSERT_TRUE(vernonCompileResultGetStatus(repeated_vulkan_compile) == VERNON_STATUS_OK);
+    ASSERT_TRUE(vernonCompileResultGetArtifactCount(repeated_vulkan_compile) == 1);
+    ASSERT_TRUE(views_equal(name, vernonCompileResultGetArtifactName(repeated_vulkan_compile, 0)));
+    ASSERT_TRUE(views_equal(spirv, vernonCompileResultGetArtifactData(repeated_vulkan_compile, 0)));
+    ASSERT_TRUE(views_equal(vulkan_reflection, vernonCompileResultGetReflection(repeated_vulkan_compile)));
+    vernonCompileResultDestroy(repeated_vulkan_compile);
     vernonCompileResultDestroy(vulkan_compile);
 
     if (opengl.available) {

@@ -33,6 +33,15 @@ files. Shared Vernon-to-standard-dialect conversions may be reused, but a
 backend must not call another backend's lowering as an accidental dependency.
 Compiler and Runtime remain independently buildable projects.
 
+## Prepared module boundary
+
+Each C API compile request parses source once, verifies it once, runs common
+Vernon validation and deterministic helper inlining once, and retains the
+result in an owned `PreparedModule`. Reflection is built from that prepared IR
+and the original validated module so canonical module hashes remain unchanged.
+Target backends receive independent clones because their pass pipelines mutate
+IR destructively; no backend reparses source or repeats common preparation.
+
 CUDA kernel values retain canonical Tensor types through `VernonToGPU`.
 Inside the resulting isolated `gpu.module`, static value Tensors of at most 16
 elements are flattened in row-major order to MLIR vectors before structured
@@ -126,6 +135,67 @@ The restricted Python frontend is an AOT tool. It parses source without
 executing user code and emits textual MLIR. The C API accepts that MLIR,
 validates it, emits reflection, and invokes an available target pipeline. It
 does not embed CPython.
+
+### Frontend cache
+
+Completed frontend requests are cached by the immutable
+`FrontendCompileRequest`, including source path, entry, features, captured
+constants, Tensor shapes, TensorView layouts, and workgroup size. Each hit
+rehashes every previously discovered source dependency before returning the
+immutable semantic result. This keeps the hit path independent of Python AST
+objects while invalidating changes to any transitive module; failed requests
+are not cached. The cache applies to entry-specialized `compile_request`
+operations used by runtime and pipeline compilation. Raw-source compilation
+and whole-module `compile_file(entry=None)` are uncached validation/emission
+surfaces because they do not have a complete `FrontendCompileRequest`.
+
+Project module graphs have a separate source-syntax cache keyed by the resolved
+root path. It retains parsed modules, resolved imports, and dependency identity
+only; every stage still deep-copies its reachable definitions before feature
+specialization and semantic analysis. Dependency digests guard reuse, so
+different graphics stages share discovery without sharing mutable specialized
+AST or typed records.
+
+Runtime shape and captured-constant substitution lives in
+`frontend.specialization`. It consumes only the immutable compile request and
+project source, before inference, and does not select operations or result
+types. Typed analysis remains the sole source of those semantic decisions.
+
+Module-level MLIR serialization lives in `frontend.emission`. It owns module
+attributes, Struct ABI declarations, deterministic function ordering, and
+syntax rejection at the module boundary. Function body lowering is supplied as
+a callback over already typed functions, keeping project orchestration and
+module text assembly independent.
+
+Lowering-only records (`Value`, `ViewLayout`, function signatures, and module
+context) live in `frontend.lowering_types`; they are not semantic types or
+cache identity. TensorView physical index/store emission lives in
+`frontend.storage_lowering`, while texture sampling and size-query emission
+lives in `frontend.resource_lowering`. Both consume typed Values through a
+narrow emitter protocol and do not redo inference.
+
+Numeric operations and literals, aggregate construction, and expression-level
+structured control flow live in `frontend.numeric_lowering`,
+`frontend.aggregate_lowering`, and `frontend.control_flow_lowering`. These
+modules consume the typed-expression model through narrow emitter protocols;
+they own operation selection and serialization, not inference.
+
+Statement-level branch and termination lowering is also owned by
+`frontend.control_flow_lowering`; `frontend.loop_lowering` owns range and while
+loop serialization, including carried break, continue, and nested-return
+state. Loop lowering consumes the analyzed branch merges and loop depth rather
+than rediscovering assignments from syntax.
+
+`frontend.compiler` owns project preparation, declaration collection, request
+caching, and module orchestration. `frontend.lowering` contains function-body
+coordination only. Runtime workgroup size is applied to the selected compute
+entry during that orchestration, so every `FrontendCompileRequest` field that
+participates in cache identity also participates in emitted semantics.
+
+Resource reads are represented by structured `ResourceEffect` records carrying
+the operation and resource parameter owner. They remain distinct from Storage
+regions while contributing to the coarse read/pure summary; lowering and
+diagnostics do not infer Resource effects from operation-name fallbacks.
 
 ### Unified compilation surfaces
 

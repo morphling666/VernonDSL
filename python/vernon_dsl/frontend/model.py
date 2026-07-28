@@ -201,6 +201,12 @@ class StorageEffect:
     region: StorageRegion
 
 
+@dataclass(frozen=True)
+class ResourceEffect:
+    operation: str
+    owner: str
+
+
 class MemoryOrdering(Enum):
     RELAXED = "relaxed"
     ACQUIRE = "acquire"
@@ -230,7 +236,7 @@ class BarrierEffect:
     scope: EffectScope
 
 
-TypedEffect = StorageEffect | AtomicEffect | BarrierEffect
+TypedEffect = StorageEffect | ResourceEffect | AtomicEffect | BarrierEffect
 
 
 class Termination(Enum):
@@ -276,11 +282,7 @@ class TypedStatement:
             return Effect.WRITE
         if any(effect.kind is StorageEffectKind.READ for effect in storage_effects):
             return Effect.READ
-        # Resource operations remain separate from Storage effects while
-        # retaining the legacy coarse diagnostic until resource summaries land.
-        if any(expression.operation in {"texture_sample", "texture_size"} for expression in self.expressions) or any(
-            child.effect is Effect.READ for child in self.children
-        ):
+        if any(isinstance(effect, ResourceEffect) for effect in nested_effects):
             return Effect.READ
         return Effect.PURE
 

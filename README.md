@@ -150,11 +150,14 @@ result. CPU scenarios are the portable baseline:
 ```powershell
 $env:PYTHONPATH = "$PWD/python"
 uv run --frozen --no-sync python scripts/benchmark_baseline.py frontend --iterations 10
+uv run --frozen --no-sync python scripts/benchmark_baseline.py native --target vulkan --iterations 10
 uv run --frozen --no-sync python scripts/benchmark_baseline.py cook --target cpu --iterations 5
 uv run --frozen --no-sync python scripts/benchmark_baseline.py kernel --arch cpu --iterations 20
 ```
 
-Run the same kernel scenario with `--arch cuda`, `vulkan`, `opengl`,
+The native scenario repeatedly compiles a fixed medium fragment shader and
+isolates the owned MLIR compiler/artifact path from Python frontend time. Run
+the same kernel scenario with `--arch cuda`, `vulkan`, `opengl`,
 `opengles`, or `directx` on an available device. It reports cold
 compile-and-dispatch, warm dispatch, and upload/dispatch/readback separately.
 The multi-pass GPU baseline uses a fixed headless ocean workload:

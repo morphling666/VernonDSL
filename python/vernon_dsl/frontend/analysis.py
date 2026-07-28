@@ -11,6 +11,7 @@ from .model import (
     EffectScope,
     LValue,
     MemoryOrdering,
+    ResourceEffect,
     StorageEffect,
     StorageEffectKind,
     StorageOwner,
@@ -26,6 +27,12 @@ from .model import (
 
 
 def typed_effect_data(effect: TypedEffect) -> dict[str, Any]:
+    if isinstance(effect, ResourceEffect):
+        return {
+            "kind": "resource_read",
+            "operation": effect.operation,
+            "owner": effect.owner,
+        }
     if isinstance(effect, StorageEffect):
         return {
             "kind": effect.kind.value,
@@ -122,6 +129,7 @@ __all__ = [
     "EffectScope",
     "LValue",
     "MemoryOrdering",
+    "ResourceEffect",
     "StorageEffect",
     "StorageEffectKind",
     "StorageOwner",

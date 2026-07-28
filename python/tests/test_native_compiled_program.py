@@ -9,7 +9,7 @@ import numpy as np
 import vernon_dsl as vd
 from vernon_dsl import _native as native
 from vernon_dsl._runtime.resources import _bind_native_argument
-from vernon_dsl.frontend.lowering import compile_source
+from vernon_dsl.frontend.compiler import compile_source
 
 CPU_MODULE = r"""
 module {

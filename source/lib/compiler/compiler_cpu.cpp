@@ -1,6 +1,7 @@
 #include "compiler_cpu.h"
 
 #include "VernonCpuAbiWrapper.h"
+#include "compiler_frontend.h"
 #include "compiler_reflection.h"
 
 #include "lld/Common/Driver.h"
@@ -10,7 +11,6 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonCpuPipeline.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
 #include "mlir/IR/Diagnostics.h"
-#include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Export.h"
 #include "llvm/ADT/SmallString.h"
@@ -285,20 +285,12 @@ bool linkHostObjectBytes(llvm::StringRef object, std::string &library, std::stri
 
 } // namespace
 
-bool compileCpu(mlir::MLIRContext &context, const char *source, size_t sourceSize, const CpuCodegenOptions &options,
-                std::vector<Artifact> &artifacts, std::string &reflection, std::string &diagnostics,
-                CpuExecutionStatePtr &execution) {
+bool compileCpu(PreparedModule &prepared, const CpuCodegenOptions &options, std::vector<Artifact> &artifacts,
+                std::string &reflection, std::string &diagnostics, CpuExecutionStatePtr &execution) {
+    mlir::MLIRContext &context = prepared.context();
     mlir::ScopedDiagnosticHandler handler(
         &context, [&](mlir::Diagnostic &diagnostic) { appendDiagnostic(diagnostics, diagnostic); });
-    llvm::StringRef text(source ? source : "", sourceSize);
-    mlir::OwningOpRef<mlir::ModuleOp> sourceModule = mlir::parseSourceString<mlir::ModuleOp>(text, &context);
-    if (!sourceModule)
-        return false;
-
-    mlir::PassManager metadataPassManager(&context);
-    mlir::vernon::buildVernonCpuPreparationPipeline(metadataPassManager);
-    if (mlir::failed(metadataPassManager.run(*sourceModule)))
-        return false;
+    mlir::OwningOpRef<mlir::ModuleOp> sourceModule = prepared.clone();
 
     llvm::Expected<llvm::json::Value> parsedReflection = llvm::json::parse(reflection);
     llvm::json::Object *reflectionRoot = parsedReflection ? parsedReflection->getAsObject() : nullptr;

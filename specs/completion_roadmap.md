@@ -65,7 +65,24 @@ Acceptance:
 - medium shader cold compilation improves by at least 40%, or profiling
   explains why the target was not reached.
 
+Progress (2026-07-28):
+
+- `PreparedModule` now owns the validated, deterministically inlined common IR;
+- CPU, CUDA, and SPIR-V target pipelines clone that IR and no longer reparse
+  source or repeat common validation/inlining;
+- repeated Vulkan compilation now checks byte-identical artifacts and
+  reflection, and all 103 native and integration CTest entries pass;
+- on the fixed Blinn-Phong Vulkan fixture, 15 independent cold-process samples
+  improved from a 5.2142 ms median to 4.8276 ms (7.4%); 100 same-context
+  samples improved from 1.2519 ms to 1.0785 ms (13.9%);
+- differential profiling shows duplicate preparation was only 0.3866 ms of
+  the old cold median. The remaining 92.6% is context/dialect initialization,
+  canonical reflection, target lowering, and artifact serialization, so this
+  refactor cannot reach 40% without optimizing those shared costs.
+
 ### Python frontend
+
+Status: **Complete (2026-07-28).**
 
 Split the large frontend implementation by semantic responsibility rather than
 by syntax convenience:
@@ -89,8 +106,44 @@ Acceptance:
 - warm compilation does not repeat project parsing, inference, or lowering
   when semantic inputs are unchanged;
 - changing a transitive dependency invalidates every affected entry;
-- cache hits preserve diagnostics, generated symbols, and MLIR bytes;
+- successful cache hits preserve generated symbols and MLIR bytes; failed
+  requests are not cached and reproduce diagnostics from current sources;
 - frontend and language coverage gates do not regress.
+
+Progress (2026-07-28):
+
+- immutable frontend results are cached by complete
+  `FrontendCompileRequest` semantic inputs;
+- cache hits rehash all discovered source dependencies and transitive changes
+  invalidate the affected specialization;
+- graphics stages rooted at the same source now share parsed modules, resolved
+  imports, and dependency discovery while retaining independent specialization
+  and typed semantic records;
+- runtime shape and captured-constant source specialization is isolated from
+  semantic analysis and MLIR emission in `frontend.specialization`;
+- module attributes, Struct ABI declarations, deterministic function assembly,
+  and module-level syntax checks are isolated in `frontend.emission`;
+- lowering-only Value/context records, TensorView physical storage lowering,
+  and texture Resource lowering are separated into `lowering_types`,
+  `storage_lowering`, and `resource_lowering` without introducing a second
+  semantic model;
+- literal and numeric operation lowering, aggregate construction, and
+  expression-level structured control-flow emission are separated into
+  `numeric_lowering`, `aggregate_lowering`, and `control_flow_lowering`;
+- range/while serialization and break, continue, and nested-return state
+  propagation are delegated to `loop_lowering` and `control_flow_lowering`
+  using typed branch merges and loop-depth records;
+- dead pre-extraction loop implementations are removed, active guarded-block
+  state emission is centralized in `control_flow_lowering`, and compiler
+  orchestration lives in `frontend.compiler`;
+- runtime workgroup size now affects emitted compute-entry MLIR as well as cache
+  identity, while raw-source and whole-module validation APIs are explicitly
+  uncached;
+- Resource reads have structured `ResourceEffect` records instead of the
+  legacy expression-name fallback, and source digest/type helpers have one
+  shared implementation;
+- the fixed frontend benchmark improved from a 2.4447 ms warm median to
+  0.1232 ms, or 4.3% of its 2.8895 ms cold compile.
 
 ### Runtime, RHI, and backend adapters
 

@@ -1,17 +1,16 @@
 #include "compiler_cuda.h"
 
+#include "compiler_frontend.h"
+
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/GPU/Pipelines/Passes.h"
 #include "mlir/Dialect/Linalg/Passes.h"
-#include "mlir/Dialect/Vernon/Transforms/VernonInlineHelpers.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCUDAMath.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUTensors.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonToGPU.h"
-#include "mlir/Dialect/Vernon/Transforms/VernonValidation.h"
 #include "mlir/IR/Diagnostics.h"
-#include "mlir/Parser/Parser.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "llvm/ADT/STLExtras.h"
@@ -38,18 +37,13 @@ struct KeepGpuModulesPass : public mlir::PassWrapper<KeepGpuModulesPass, mlir::O
 
 } // namespace
 
-bool compileCuda(mlir::MLIRContext &context, const char *source, size_t sourceSize, std::vector<Artifact> &artifacts,
-                 std::string &diagnostics) {
+bool compileCuda(PreparedModule &prepared, std::vector<Artifact> &artifacts, std::string &diagnostics) {
+    mlir::MLIRContext &context = prepared.context();
     mlir::ScopedDiagnosticHandler handler(
         &context, [&](mlir::Diagnostic &diagnostic) { appendDiagnostic(diagnostics, diagnostic); });
-    llvm::StringRef text(source ? source : "", sourceSize);
-    mlir::OwningOpRef<mlir::ModuleOp> module = mlir::parseSourceString<mlir::ModuleOp>(text, &context);
-    if (!module)
-        return false;
+    mlir::OwningOpRef<mlir::ModuleOp> module = prepared.clone();
 
     mlir::PassManager passManager(&context);
-    passManager.addPass(mlir::vernon::createVernonValidatePass());
-    passManager.addPass(mlir::vernon::createVernonInlineHelpersPass());
     passManager.addPass(mlir::vernon::createVernonToGPUPass());
     passManager.addPass(std::make_unique<KeepGpuModulesPass>());
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerGPUTensorsPass());

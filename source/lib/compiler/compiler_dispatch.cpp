@@ -94,13 +94,12 @@ VernonStatus parseCompileOptions(const VernonCompileOptions *source, VernonTarge
     return VERNON_STATUS_OK;
 }
 
-VernonStatus compileTarget(CompilerFrontend &frontend, const char *source, size_t sourceSize, VernonTarget target,
-                           const CompileOptions &options, std::vector<Artifact> &artifacts, std::string &reflection,
-                           std::string &diagnostics, CpuExecutionStatePtr &cpuExecution) {
+VernonStatus compileTarget(PreparedModule &module, VernonTarget target, const CompileOptions &options,
+                           std::vector<Artifact> &artifacts, std::string &reflection, std::string &diagnostics,
+                           CpuExecutionStatePtr &cpuExecution) {
     diagnostics.clear();
-    mlir::MLIRContext &context = compilerMlirContext(frontend);
     if (target == VERNON_TARGET_CPU) {
-        if (!compileCpu(context, source, sourceSize, options.cpu, artifacts, reflection, diagnostics, cpuExecution)) {
+        if (!compileCpu(module, options.cpu, artifacts, reflection, diagnostics, cpuExecution)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }
@@ -110,7 +109,7 @@ VernonStatus compileTarget(CompilerFrontend &frontend, const char *source, size_
     }
     if (target == VERNON_TARGET_VULKAN || target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES ||
         target == VERNON_TARGET_METAL || target == VERNON_TARGET_DIRECTX) {
-        if (!compileSpirv(context, source, sourceSize, target, artifacts, diagnostics)) {
+        if (!compileSpirv(module, target, artifacts, diagnostics)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }
@@ -131,7 +130,7 @@ VernonStatus compileTarget(CompilerFrontend &frontend, const char *source, size_
         return VERNON_STATUS_OK;
     }
     if (target == VERNON_TARGET_CUDA) {
-        if (!compileCuda(context, source, sourceSize, artifacts, diagnostics)) {
+        if (!compileCuda(module, artifacts, diagnostics)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }

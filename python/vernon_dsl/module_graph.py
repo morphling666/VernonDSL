@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import ast
 import copy
-import hashlib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import RLock
 
 from .diagnostics import CompileError, SourceLocation
 from .frontend.abi import attribute_layout
@@ -15,6 +15,7 @@ from .language.ast_utils import dotted_name as _dotted_name
 from .language.scalar_types import SCALAR_ALIASES, SCALAR_TYPES
 from .language.syntax import ENTRY_DECORATORS, FUNCTION_DECORATORS
 from .shader_contracts import DEVICE_ONLY_OPERATION_NAMES, DEVICE_ONLY_TYPE_NAMES
+from .source_identity import source_file_digest, source_text_digest
 from .struct_methods import normalize_struct_methods
 
 _HOST_MODULES = {
@@ -54,6 +55,54 @@ class LoadedProject:
     source: str
     dependencies: tuple[tuple[str, str], ...]
     features: tuple[str, ...]
+    dependency_files: tuple[tuple[Path, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class _ModuleGraphSnapshot:
+    modules: dict[Path, _Module]
+    order: tuple[_Module, ...]
+    abi_structs: dict[str, tuple[_Module, ast.ClassDef]]
+    dependencies: tuple[tuple[Path, str], ...]
+
+
+class _ModuleGraphCache:
+    def __init__(self) -> None:
+        self._entries: dict[Path, _ModuleGraphSnapshot] = {}
+        self._lock = RLock()
+
+    def restore(self, graph: "ModuleGraph") -> bool:
+        with self._lock:
+            snapshot = self._entries.get(graph.input_path)
+        if snapshot is None:
+            return False
+        if not all(source_file_digest(path) == digest for path, digest in snapshot.dependencies):
+            with self._lock:
+                if self._entries.get(graph.input_path) is snapshot:
+                    self._entries.pop(graph.input_path)
+            return False
+        graph.modules = snapshot.modules.copy()
+        graph.order = list(snapshot.order)
+        graph._abi_structs = snapshot.abi_structs.copy()
+        return True
+
+    def store(self, graph: "ModuleGraph") -> None:
+        dependencies = tuple((module.path, source_text_digest(module.source)) for module in graph.modules.values())
+        snapshot = _ModuleGraphSnapshot(
+            graph.modules.copy(),
+            tuple(graph.order),
+            graph._abi_structs.copy(),
+            dependencies,
+        )
+        with self._lock:
+            self._entries[graph.input_path] = snapshot
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+_module_graph_cache = _ModuleGraphCache()
 
 
 class _FeatureSpecializer(ast.NodeTransformer):
@@ -410,8 +459,11 @@ class ModuleGraph:
         self.loading: list[Path] = []
         self._abi_structs: dict[str, tuple[_Module, ast.ClassDef]] = {}
 
+    def discover(self) -> _Module:
+        return self._load_module(self.input_path, self._module_name(self.input_path))
+
     def load(self) -> LoadedProject:
-        root = self._load_module(self.input_path, self._module_name(self.input_path))
+        root = self.discover()
         declared_features = {feature for module in self.modules.values() for feature in module.features.values()}
         unknown_features = self.enabled_features - declared_features
         if unknown_features:
@@ -464,11 +516,20 @@ class ModuleGraph:
             body = self._prune_to_entry(body, self.entry, root)
         self._validate_call_graph(body, function_sources, entry_names, host_function_names)
         combined = ast.fix_missing_locations(ast.Module(body=body, type_ignores=[]))
-        dependencies = tuple(
-            (self._display_path(module.path), hashlib.sha256(module.source.encode("utf-8")).hexdigest())
+        dependency_records = tuple(
+            (
+                module.path,
+                self._display_path(module.path),
+                source_text_digest(module.source),
+            )
             for module in sorted(self.modules.values(), key=lambda value: self._display_path(value.path))
         )
-        return LoadedProject(ast.unparse(combined) + "\n", dependencies, tuple(sorted(declared_features)))
+        return LoadedProject(
+            ast.unparse(combined) + "\n",
+            tuple((display_path, digest) for _, display_path, digest in dependency_records),
+            tuple(sorted(declared_features)),
+            tuple((path, digest) for path, _, digest in dependency_records),
+        )
 
     def _load_module(self, path: Path, name: str) -> _Module:
         path = path.resolve()
@@ -885,4 +946,12 @@ class ModuleGraph:
 def load_project(
     input_path: str | Path, enabled_features: tuple[str, ...] = (), entry: str | None = None
 ) -> LoadedProject:
-    return ModuleGraph(input_path, enabled_features, entry).load()
+    graph = ModuleGraph(input_path, enabled_features, entry)
+    if not _module_graph_cache.restore(graph):
+        graph.discover()
+        _module_graph_cache.store(graph)
+    return graph.load()
+
+
+def clear_project_cache() -> None:
+    _module_graph_cache.clear()

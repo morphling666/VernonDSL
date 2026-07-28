@@ -53,10 +53,16 @@ CompilerFrontend *createCompilerFrontend() { return new (std::nothrow) CompilerF
 
 void destroyCompilerFrontend(CompilerFrontend *frontend) { delete frontend; }
 
-mlir::MLIRContext &compilerMlirContext(CompilerFrontend &frontend) { return frontend.context; }
+PreparedModule::PreparedModule(mlir::OwningOpRef<mlir::ModuleOp> module) : module_(std::move(module)) {}
 
-VernonStatus validateMlir(CompilerFrontend &frontend, const char *source, size_t sourceSize,
-                          std::vector<Artifact> &artifacts, std::string &reflection, std::string &diagnostics) {
+mlir::MLIRContext &PreparedModule::context() { return *module_->getContext(); }
+
+mlir::OwningOpRef<mlir::ModuleOp> PreparedModule::clone() {
+    return mlir::OwningOpRef<mlir::ModuleOp>(mlir::cast<mlir::ModuleOp>(module_->clone()));
+}
+
+VernonStatus prepareMlir(CompilerFrontend &frontend, const char *source, size_t sourceSize, PreparedModulePtr &prepared,
+                         std::vector<Artifact> &artifacts, std::string &reflection, std::string &diagnostics) {
     mlir::ScopedDiagnosticHandler handler(
         &frontend.context, [&](mlir::Diagnostic &diagnostic) { appendDiagnostic(diagnostics, diagnostic); });
 
@@ -86,6 +92,11 @@ VernonStatus validateMlir(CompilerFrontend &frontend, const char *source, size_t
     if (mlir::failed(builtReflection))
         return VERNON_STATUS_VERIFICATION_ERROR;
     reflection = std::move(*builtReflection);
+    prepared.reset(new (std::nothrow) PreparedModule(std::move(reflectionModule)));
+    if (!prepared) {
+        diagnostics = "failed to allocate prepared compiler module";
+        return VERNON_STATUS_INTERNAL_ERROR;
+    }
     return VERNON_STATUS_OK;
 }
 

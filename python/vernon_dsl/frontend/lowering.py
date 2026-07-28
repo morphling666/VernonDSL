@@ -1,37 +1,35 @@
 from __future__ import annotations
 
 import ast
-import json
-from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Iterable
 
-from ..diagnostics import CompileError, SourceLocation
-from ..language.ast_utils import dotted_name as _name
-from ..language.ast_utils import rectangular_literal
-from ..language.syntax import FRONTEND_VERSION, INTRINSIC_METHODS
-from ..module_graph import load_project
-from ..shader_contracts import BUILTIN_CONTRACTS, GENERATED_INTERFACE_CONTRACTS, TypeContract, texture_sampling_contract
-from ..struct_methods import normalize_struct_methods
+from ..language.syntax import INTRINSIC_METHODS
+from ..shader_contracts import BUILTIN_CONTRACTS, GENERATED_INTERFACE_CONTRACTS, TypeContract
 from .abi import attribute_layout, value_abi_layout
+from .aggregate_lowering import lower_aggregate_constructor, lower_tuple
+from .control_flow_lowering import (
+    emit_source_block,
+    lower_bool_op,
+    lower_conditional_expression,
+    lower_if,
+    lower_termination,
+)
 from .interfaces import plan_generated_interface
+from .loop_lowering import lower_for, lower_while
+from .lowering_types import DslType, FunctionSignature, ModuleContext, Value, element_type
 from .model import (
-    AccessMode,
     ConcreteType,
     StorageEffect,
     StorageRegionKind,
-    Termination,
     TypedExpression,
     TypedFunctionInstance,
     TypedStatement,
-    is_abi_stable_value,
 )
-from .monomorphize import infer_and_monomorphize_helpers
-from .request import FrontendCompileRequest, FrontendCompileResult
-from .type_parser import AnnotatedType, Metadata, TypeParser
+from .numeric_lowering import lower_binary, lower_compare, lower_constant, lower_unary
+from .resource_lowering import lower_texture_sample, lower_texture_size
+from .storage_lowering import lower_tensor_view_index, lower_tensor_view_store
+from .type_parser import AnnotatedType, Metadata
 from .type_solver import can_convert
-
-DslType = ConcreteType
 
 _SWIZZLES = set("xyzwrgba")
 
@@ -43,62 +41,10 @@ def _dsl_type_from_contract(contract: TypeContract) -> DslType:
     return DslType(contract.kind, contract.name)
 
 
-@dataclass(frozen=True)
-class FunctionSignature:
-    arguments: tuple[DslType, ...]
-    result: DslType | None
-
-
-@dataclass(frozen=True)
-class _ViewLayout:
-    shape: tuple[int, ...]
-    strides: tuple[int, ...]
-    offset: int
-
-
-@dataclass(frozen=True)
-class Value:
-    name: str
-    type: DslType
-    fields: tuple["Value", ...] | None = None
-    access: AccessMode = AccessMode.READ
-    view_layout: _ViewLayout | None = None
-
-    @property
-    def abi_type(self) -> DslType:
-        if self.type.kind == "tensor_view":
-            element, rank, _ = self.type.arguments
-            assert isinstance(element, DslType)
-            return DslType("tensor_view_abi", "TensorViewAbi", (element, rank, self.access.value))
-        return self.type
-
-
-@dataclass
-class _ModuleContext:
-    filename: str
-    runtime_entry: str | None = None
-    tensor_view_layouts: dict[str, _ViewLayout] = field(default_factory=dict)
-    structs: dict[str, tuple[tuple[str, AnnotatedType], ...]] = field(default_factory=dict)
-    signatures: dict[str, FunctionSignature] = field(default_factory=dict)
-    result_annotations: dict[str, AnnotatedType | None] = field(default_factory=dict)
-    shared_functions: set[str] = field(default_factory=set)
-    typed_functions: dict[str, TypedFunctionInstance] = field(default_factory=dict)
-
-    def error(self, node: ast.AST, message: str) -> CompileError:
-        return CompileError(
-            message,
-            SourceLocation(
-                self.filename,
-                getattr(node, "lineno", 1),
-                getattr(node, "col_offset", 0) + 1,
-            ),
-        )
-
-
 class _FunctionEmitter:
     def __init__(
         self,
-        context: _ModuleContext,
+        context: ModuleContext,
         signature: FunctionSignature,
         argument_annotations: list[AnnotatedType],
         result_annotation: AnnotatedType | None,
@@ -387,7 +333,7 @@ class _FunctionEmitter:
             if self.return_value_name is not None:
                 assert self.signature.result is not None
                 self.environment[self.return_value_name] = self._default_value(self.node, self.signature.result)
-        self._emit_source_block(self.node.body)
+        emit_source_block(self, self.node.body)
         if self.use_return_state:
             value = self.environment[self.return_value_name] if self.return_value_name is not None else None
             self._emit_function_return(self.node, value)
@@ -545,7 +491,7 @@ class _FunctionEmitter:
             return
         if isinstance(node, ast.Assign):
             if len(node.targets) == 1 and isinstance(node.targets[0], ast.Subscript):
-                self._store_index(node.targets[0], self._expression(node.value))
+                lower_tensor_view_store(self, node.targets[0], self._expression(node.value))
                 return
             if len(node.targets) == 1 and isinstance(node.targets[0], (ast.Tuple, ast.List)):
                 self._destructure(node.targets[0], self._expression(node.value))
@@ -589,7 +535,7 @@ class _FunctionEmitter:
                 self.environment[node.target.id] = value
                 return
             if isinstance(node.target, ast.Subscript):
-                self._store_index(node.target, value)
+                lower_tensor_view_store(self, node.target, value)
                 return
             raise self.context.error(node, "augmented assignment requires a local name or indexed value")
         if isinstance(node, ast.AnnAssign):
@@ -600,44 +546,16 @@ class _FunctionEmitter:
             value = self._coerce_implicit(node.value, self._expression(node.value, expected), expected)
             self.environment[node.target.id] = value
             return
-        if isinstance(node, ast.Return):
-            if node.value is None:
-                if self.signature.result is not None:
-                    raise self.context.error(node, "return value is required")
-                value = None
-            else:
-                if self.signature.result is None:
-                    raise self.context.error(node, "void function cannot return a value")
-                value = self._expression(node.value, self.signature.result)
-                value = self._coerce_implicit(node.value, value, self.signature.result)
-            if self.use_return_state:
-                assert self.return_flag_name is not None
-                self.environment[self.return_flag_name] = self._bool_constant(True)
-                if self.return_value_name is not None:
-                    assert value is not None
-                    self.environment[self.return_value_name] = value
-                return
-            self._emit_function_return(node, value)
-            self.returned = True
-            return
-        if isinstance(node, ast.Break):
-            if not self.loop_controls:
-                raise self.context.error(node, "break is only valid inside a loop")
-            self.environment[self.loop_controls[-1]] = self._control_constant(1)
-            return
-        if isinstance(node, ast.Continue):
-            if not self.loop_controls:
-                raise self.context.error(node, "continue is only valid inside a loop")
-            self.environment[self.loop_controls[-1]] = self._control_constant(2)
+        if lower_termination(self, node):
             return
         if isinstance(node, ast.If):
-            self._if(node)
+            lower_if(self, node)
             return
         if isinstance(node, ast.For):
-            self._for(node)
+            lower_for(self, node)
             return
         if isinstance(node, ast.While):
-            self._while(node)
+            lower_while(self, node)
             return
         raise self.context.error(node, f"unsupported statement syntax: {type(node).__name__}")
 
@@ -702,95 +620,6 @@ class _FunctionEmitter:
             else:
                 raise self.context.error(item, "Tuple destructuring targets must be local names")
 
-    def _statement_from_source(self, statement: ast.stmt) -> None:
-        typed = self.typed_statements.get(id(statement))
-        if typed is None:
-            raise self.context.error(statement, "internal error: statement is missing from the typed semantic model")
-        self._statement(typed)
-
-    def _if(self, node: ast.If) -> None:
-        condition = self._expression(node.test)
-        self._require_same_type(node.test, DslType("scalar", "bool"), condition.type)
-        typed_statement = self.typed_statements[id(node)]
-        merged_names = [merge.name for merge in typed_statement.branch_merges]
-        merged_types = [merge.type for merge in typed_statement.branch_merges]
-        for control_name in self.loop_controls:
-            if control_name not in merged_names:
-                merged_names.append(control_name)
-                merged_types.append(DslType("scalar", "i32"))
-        for return_name, return_type in self._return_state_items():
-            if return_name not in merged_names:
-                merged_names.append(return_name)
-                merged_types.append(return_type)
-        outer = self.environment.copy()
-        outer_lines = self.lines
-        outer_indent = self.indent
-
-        self.lines = []
-        self.indent = outer_indent + 1
-        self.environment = outer.copy()
-        self._emit_source_block(node.body)
-        then_lines = self.lines
-        then_environment = self.environment.copy()
-
-        self.lines = []
-        self.environment = outer.copy()
-        self._emit_source_block(node.orelse)
-        else_lines = self.lines
-        else_environment = self.environment.copy()
-
-        self.lines = then_lines
-        self.environment = then_environment
-        self._yield_merged(node, merged_names, merged_types)
-        self.lines = else_lines
-        self.environment = else_environment
-        self._yield_merged(node, merged_names, merged_types)
-
-        results = [self._fresh() for _ in merged_names]
-        lhs = f"{', '.join(results)} = " if results else ""
-        result_types = f" -> ({', '.join(value.mlir for value in merged_types)})" if results else ""
-        self.lines = outer_lines
-        self.indent = outer_indent
-        self.environment = outer
-        self._line(f"{lhs}scf.if {condition.name}{result_types} {{")
-        self.lines.extend(then_lines)
-        self._line("} else {")
-        self.lines.extend(else_lines)
-        self._line("}")
-        for name, result, result_type in zip(merged_names, results, merged_types, strict=True):
-            self.environment[name] = Value(result, result_type)
-
-    def _emit_source_block(self, statements: list[ast.stmt]) -> None:
-        needs_guard = False
-        for statement in statements:
-            typed = self.typed_statements.get(id(statement))
-            if typed is None:
-                break
-            if needs_guard:
-                control_name = self.loop_controls[-1] if self.loop_controls else None
-                self._emit_guarded_statement(typed, control_name)
-            else:
-                self._statement(typed)
-            if self._contains_return(typed) or (
-                self.loop_controls and self._contains_loop_exit(typed, typed.loop_depth)
-            ):
-                needs_guard = True
-            if typed.termination is not Termination.FALLTHROUGH:
-                break
-
-    def _yield_merged(self, node: ast.If, names: list[str], types: list[DslType]) -> None:
-        values: list[Value] = []
-        for name, expected in zip(names, types, strict=True):
-            value = self._coerce_implicit(node, self.environment[name], expected)
-            values.append(value)
-        if values:
-            self._line(
-                f"scf.yield {', '.join(value.name for value in values)} : "
-                f"{', '.join(value.type.mlir for value in values)}"
-            )
-        else:
-            self._line("scf.yield")
-
     def _default_value(self, node: ast.AST, value_type: DslType) -> Value:
         if value_type.kind in {"scalar", "index"}:
             result = self._fresh()
@@ -838,407 +667,6 @@ class _FunctionEmitter:
             return Value(result, value_type, tuple(values))
         raise self.context.error(node, f"cannot create a control-flow payload for {value_type.mlir}")
 
-    def _contains_loop_exit(self, statement: TypedStatement, target_depth: int) -> bool:
-        if statement.termination in {Termination.BREAK, Termination.CONTINUE} and statement.loop_depth == target_depth:
-            return True
-        if isinstance(statement.source, (ast.For, ast.While)):
-            return False
-        return any(self._contains_loop_exit(child, target_depth) for child in statement.children)
-
-    @classmethod
-    def _contains_return(cls, statement: TypedStatement) -> bool:
-        if statement.termination is Termination.RETURN:
-            return True
-        return any(cls._contains_return(child) for child in statement.children)
-
-    def _return_state_items(self) -> list[tuple[str, DslType]]:
-        items: list[tuple[str, DslType]] = []
-        if self.return_flag_name is not None:
-            items.append((self.return_flag_name, DslType("scalar", "bool")))
-        if self.return_value_name is not None:
-            assert self.signature.result is not None
-            items.append((self.return_value_name, self.signature.result))
-        return items
-
-    def _emit_guarded_statement(self, typed: TypedStatement, control_name: str | None) -> None:
-        outer = self.environment.copy()
-        assigned = self._assigned_names([typed.source])
-        lvalue_types = {value.name: value.type for value in typed.lvalues if value.kind == "local"}
-        for name in sorted(assigned - outer.keys()):
-            value_type = lvalue_types.get(name)
-            if value_type is not None:
-                outer[name] = self._default_value(typed.source, value_type)
-        carried_names = [
-            name
-            for name in sorted(assigned & outer.keys())
-            if outer[name].type.kind not in {"sampler", "tensor_storage", "tensor_view", "texture"}
-        ]
-        for name in self.loop_controls:
-            if name in outer and name not in carried_names:
-                carried_names.append(name)
-        for name, _ in self._return_state_items():
-            if name in outer and name not in carried_names:
-                carried_names.append(name)
-        carried_types = [outer[name].type for name in carried_names]
-        active: Value | None = None
-        if control_name is not None:
-            zero = self._control_constant(0)
-            control_active = self._fresh()
-            self._line(f"{control_active} = arith.cmpi eq, {outer[control_name].name}, {zero.name} : i32")
-            active = Value(control_active, DslType("scalar", "bool"))
-        if self.return_flag_name is not None:
-            false_value = self._bool_constant(False)
-            not_returned = self._fresh()
-            self._line(f"{not_returned} = arith.cmpi eq, {outer[self.return_flag_name].name}, {false_value.name} : i1")
-            if active is None:
-                active = Value(not_returned, DslType("scalar", "bool"))
-            else:
-                combined = self._fresh()
-                self._line(f"{combined} = arith.andi {active.name}, {not_returned} : i1")
-                active = Value(combined, DslType("scalar", "bool"))
-        if active is None:
-            self._statement(typed)
-            return
-
-        outer_lines = self.lines
-        outer_indent = self.indent
-        self.lines = []
-        self.indent = outer_indent + 1
-        self.environment = outer.copy()
-        self._statement(typed)
-        self._yield_values(typed.source, carried_names, carried_types)
-        then_lines = self.lines
-
-        self.lines = []
-        self.environment = outer.copy()
-        self._yield_values(typed.source, carried_names, carried_types)
-        else_lines = self.lines
-
-        results = [self._fresh() for _ in carried_names]
-        result_prefix = f"{', '.join(results)} = " if results else ""
-        result_types = f" -> ({', '.join(value.mlir for value in carried_types)})" if results else ""
-        self.lines = outer_lines
-        self.indent = outer_indent
-        self.environment = outer
-        self._line(f"{result_prefix}scf.if {active.name}{result_types} {{")
-        self.lines.extend(then_lines)
-        self._line("} else {")
-        self.lines.extend(else_lines)
-        self._line("}")
-        for name, result, value_type in zip(carried_names, results, carried_types, strict=True):
-            self.environment[name] = Value(result, value_type)
-
-    def _yield_values(self, node: ast.AST, names: list[str], types: list[DslType]) -> None:
-        values = [
-            self._coerce_implicit(node, self.environment[name], value_type)
-            for name, value_type in zip(names, types, strict=True)
-        ]
-        if values:
-            self._line(
-                f"scf.yield {', '.join(value.name for value in values)} : "
-                f"{', '.join(value.type.mlir for value in values)}"
-            )
-        else:
-            self._line("scf.yield")
-
-    def _emit_loop_body(self, statements: list[ast.stmt], control_name: str, target_depth: int) -> None:
-        needs_guard = False
-        for source in statements:
-            typed = self.typed_statements.get(id(source))
-            if typed is None:
-                break
-            if needs_guard:
-                self._emit_guarded_statement(typed, control_name)
-            else:
-                self._statement(typed)
-            if self._contains_loop_exit(typed, target_depth) or self._contains_return(typed):
-                needs_guard = True
-            if typed.termination is not Termination.FALLTHROUGH:
-                break
-
-    def _for(self, node: ast.For) -> None:
-        if (
-            not isinstance(node.target, ast.Name)
-            or not isinstance(node.iter, ast.Call)
-            or _name(node.iter.func) != "range"
-        ):
-            raise self.context.error(node, "for loops must have the form 'for name in range(...)'")
-        if node.orelse:
-            raise self.context.error(node, "for-else is not supported")
-        if not 1 <= len(node.iter.args) <= 3 or node.iter.keywords:
-            raise self.context.error(node.iter, "range requires one to three positional i32 arguments")
-        integer_type = DslType("scalar", "i32")
-        arguments = [
-            self._coerce_implicit(argument, self._expression(argument, integer_type), integer_type)
-            for argument in node.iter.args
-        ]
-        zero = self._control_constant(0)
-        one = self._control_constant(1)
-        if len(arguments) == 1:
-            start, stop, step = zero, arguments[0], one
-        elif len(arguments) == 2:
-            start, stop = arguments
-            step = one
-        else:
-            start, stop, step = arguments
-        if len(node.iter.args) == 3 and self._literal_integer(node.iter.args[2]) == 0:
-            raise self.context.error(node.iter.args[2], "range step must not be zero")
-        if len(node.iter.args) == 3 and self._literal_integer(node.iter.args[2]) is None:
-            nonzero = self._fresh()
-            self._line(f"{nonzero} = arith.cmpi ne, {step.name}, {zero.name} : i32")
-            self._line(f'cf.assert {nonzero}, "range step must not be zero"')
-
-        outer = self.environment.copy()
-        typed_statement = self.typed_statements[id(node)]
-        control_name = self._hidden_name("loop_control")
-        current_name = self._hidden_name("range_current")
-        active_name = self._hidden_name("range_active")
-        outer[control_name] = self._control_constant(0)
-        outer[current_name] = start
-        outer[active_name] = self._bool_constant(True)
-        carried_names = [merge.name for merge in typed_statement.branch_merges]
-        carried_types = [merge.type for merge in typed_statement.branch_merges]
-        carried_names.extend((current_name, active_name, control_name))
-        carried_types.extend((integer_type, DslType("scalar", "bool"), integer_type))
-        for return_name, return_type in self._return_state_items():
-            if return_name not in carried_names:
-                carried_names.append(return_name)
-                carried_types.append(return_type)
-        for name, value_type in zip(carried_names, carried_types, strict=True):
-            outer[name] = self._coerce_implicit(node, outer[name], value_type)
-
-        results = [self._fresh() for _ in carried_names]
-        before_arguments = [self._fresh() for _ in carried_names]
-        operand_types = ", ".join(value_type.mlir for value_type in carried_types)
-        assignments = ", ".join(
-            f"{argument} = {outer[name].name}" for argument, name in zip(before_arguments, carried_names, strict=True)
-        )
-        self._line(f"{', '.join(results)} = scf.while ({assignments}) : ({operand_types}) -> ({operand_types}) {{")
-        self.indent += 1
-        self.environment = outer.copy()
-        for name, value_type, argument in zip(carried_names, carried_types, before_arguments, strict=True):
-            self.environment[name] = Value(argument, value_type)
-        step_positive = self._fresh()
-        self._line(f"{step_positive} = arith.cmpi sgt, {step.name}, {zero.name} : i32")
-        forward = self._fresh()
-        self._line(f"{forward} = arith.cmpi slt, {self.environment[current_name].name}, {stop.name} : i32")
-        backward = self._fresh()
-        self._line(f"{backward} = arith.cmpi sgt, {self.environment[current_name].name}, {stop.name} : i32")
-        range_condition = self._fresh()
-        self._line(f"{range_condition} = arith.select {step_positive}, {forward}, {backward} : i1")
-        break_value = self._control_constant(1)
-        control_active = self._fresh()
-        self._line(f"{control_active} = arith.cmpi ne, {self.environment[control_name].name}, {break_value.name} : i32")
-        condition = self._fresh()
-        self._line(f"{condition} = arith.andi {range_condition}, {self.environment[active_name].name} : i1")
-        combined = self._fresh()
-        self._line(f"{combined} = arith.andi {condition}, {control_active} : i1")
-        condition = combined
-        if self.return_flag_name is not None:
-            false_value = self._bool_constant(False)
-            not_returned = self._fresh()
-            self._line(
-                f"{not_returned} = arith.cmpi eq, {self.environment[self.return_flag_name].name}, "
-                f"{false_value.name} : i1"
-            )
-            combined = self._fresh()
-            self._line(f"{combined} = arith.andi {condition}, {not_returned} : i1")
-            condition = combined
-        forwarded = ", ".join(self.environment[name].name for name in carried_names)
-        self._line(f"scf.condition({condition}) {forwarded} : {operand_types}")
-        self.indent -= 1
-        self._line("} do {")
-        self.indent += 1
-        self.environment = outer.copy()
-        after_arguments = [self._fresh() for _ in carried_names]
-        block_arguments = ", ".join(
-            f"{argument}: {value_type.mlir}"
-            for argument, value_type in zip(after_arguments, carried_types, strict=True)
-        )
-        self._line(f"^bb0({block_arguments}):")
-        for name, value_type, argument in zip(carried_names, carried_types, after_arguments, strict=True):
-            self.environment[name] = Value(argument, value_type)
-        induction = self._fresh()
-        self._line(f"{induction} = arith.index_cast {self.environment[current_name].name} : i32 to index")
-        self.environment[node.target.id] = Value(induction, DslType("index", "index"))
-        self.loop_controls.append(control_name)
-        self._emit_loop_body(node.body, control_name, typed_statement.loop_depth + 1)
-        self.loop_controls.pop()
-
-        next_value = self._fresh()
-        self._line(f"{next_value} = arith.addi {self.environment[current_name].name}, {step.name} : i32")
-        positive_overflow = self._fresh()
-        self._line(f"{positive_overflow} = arith.cmpi slt, {next_value}, {self.environment[current_name].name} : i32")
-        negative_overflow = self._fresh()
-        self._line(f"{negative_overflow} = arith.cmpi sgt, {next_value}, {self.environment[current_name].name} : i32")
-        body_step_positive = self._fresh()
-        self._line(f"{body_step_positive} = arith.cmpi sgt, {step.name}, {zero.name} : i32")
-        overflow = self._fresh()
-        self._line(f"{overflow} = arith.select {body_step_positive}, {positive_overflow}, {negative_overflow} : i1")
-        false_value = self._bool_constant(False)
-        no_overflow = self._fresh()
-        self._line(f"{no_overflow} = arith.cmpi eq, {overflow}, {false_value.name} : i1")
-        continue_value = self._control_constant(2)
-        normal_value = self._control_constant(0)
-        is_continue = self._fresh()
-        self._line(f"{is_continue} = arith.cmpi eq, {self.environment[control_name].name}, {continue_value.name} : i32")
-        normalized_control = self._fresh()
-        self._line(
-            f"{normalized_control} = arith.select {is_continue}, {normal_value.name}, "
-            f"{self.environment[control_name].name} : i32"
-        )
-        self.environment[control_name] = Value(normalized_control, integer_type)
-        self.environment[current_name] = Value(next_value, integer_type)
-        self.environment[active_name] = Value(no_overflow, DslType("scalar", "bool"))
-        yielded = ", ".join(self.environment[name].name for name in carried_names)
-        self._line(f"scf.yield {yielded} : {operand_types}")
-        self.indent -= 1
-        self._line("}")
-        self.environment = outer
-        internal_names = {current_name, active_name, control_name}
-        for name, result, value_type in zip(carried_names, results, carried_types, strict=True):
-            if name not in internal_names:
-                self.environment[name] = Value(result, value_type)
-        for name in internal_names:
-            self.environment.pop(name, None)
-
-    @staticmethod
-    def _literal_integer(node: ast.expr) -> int | None:
-        if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
-            return node.value
-        if (
-            isinstance(node, ast.UnaryOp)
-            and isinstance(node.op, (ast.UAdd, ast.USub))
-            and isinstance(node.operand, ast.Constant)
-            and isinstance(node.operand.value, int)
-            and not isinstance(node.operand.value, bool)
-        ):
-            return node.operand.value if isinstance(node.op, ast.UAdd) else -node.operand.value
-        return None
-
-    def _while(self, node: ast.While) -> None:
-        if node.orelse:
-            raise self.context.error(node, "while-else is not supported")
-        outer = self.environment.copy()
-        typed_statement = self.typed_statements[id(node)]
-        control_name = self._hidden_name("loop_control")
-        outer[control_name] = self._control_constant(0)
-        carried_names = [merge.name for merge in typed_statement.branch_merges]
-        carried_types = [merge.type for merge in typed_statement.branch_merges]
-        carried_names.append(control_name)
-        carried_types.append(DslType("scalar", "i32"))
-        for return_name, return_type in self._return_state_items():
-            if return_name not in carried_names:
-                carried_names.append(return_name)
-                carried_types.append(return_type)
-        for name, value_type in zip(carried_names, carried_types, strict=True):
-            outer[name] = self._coerce_implicit(node, outer[name], value_type)
-        results = [self._fresh() for _ in carried_names]
-        operand_types = ", ".join(value.mlir for value in carried_types)
-        before_arguments = [self._fresh() for _ in carried_names]
-        assignments = ", ".join(
-            f"{argument} = {outer[name].name}" for argument, name in zip(before_arguments, carried_names, strict=True)
-        )
-        result_prefix = f"{', '.join(results)} = " if results else ""
-        signature = f" ({assignments}) : ({operand_types}) -> ({operand_types})" if carried_names else ""
-        self._line(f"{result_prefix}scf.while{signature} {{")
-        self.indent += 1
-        self.environment = outer.copy()
-        for name, value_type, argument in zip(carried_names, carried_types, before_arguments, strict=True):
-            self.environment[name] = Value(argument, value_type)
-        break_value = self._control_constant(1)
-        active = self._fresh()
-        self._line(f"{active} = arith.cmpi ne, {self.environment[control_name].name}, {break_value.name} : i32")
-        if self.return_flag_name is not None:
-            false_value = self._bool_constant(False)
-            not_returned = self._fresh()
-            self._line(
-                f"{not_returned} = arith.cmpi eq, {self.environment[self.return_flag_name].name}, "
-                f"{false_value.name} : i1"
-            )
-            combined = self._fresh()
-            self._line(f"{combined} = arith.andi {active}, {not_returned} : i1")
-            active = combined
-        condition_result = self._fresh()
-        self._line(f"{condition_result} = scf.if {active} -> (i1) {{")
-        self.indent += 1
-        condition = self._expression(node.test)
-        self._require_same_type(node.test, DslType("scalar", "bool"), condition.type)
-        self._line(f"scf.yield {condition.name} : i1")
-        self.indent -= 1
-        self._line("} else {")
-        self.indent += 1
-        false_value = self._fresh()
-        self._line(f"{false_value} = arith.constant false")
-        self._line(f"scf.yield {false_value} : i1")
-        self.indent -= 1
-        self._line("}")
-        forwarded = ", ".join(self.environment[name].name for name in carried_names)
-        suffix = f" : {operand_types}" if carried_names else ""
-        self._line(f"scf.condition({condition_result}) {forwarded}{suffix}")
-        self.indent -= 1
-        self._line("} do {")
-        self.indent += 1
-        self.environment = outer.copy()
-        after_arguments = []
-        for name, value_type in zip(carried_names, carried_types, strict=True):
-            argument = self._fresh()
-            after_arguments.append(argument)
-            self.environment[name] = Value(argument, value_type)
-        if after_arguments:
-            block_arguments = ", ".join(
-                f"{name}: {value_type.mlir}" for name, value_type in zip(after_arguments, carried_types, strict=True)
-            )
-            self._line(f"^bb0({block_arguments}):")
-        self.loop_controls.append(control_name)
-        self._emit_loop_body(node.body, control_name, typed_statement.loop_depth + 1)
-        self.loop_controls.pop()
-        continue_value = self._control_constant(2)
-        normal_value = self._control_constant(0)
-        is_continue = self._fresh()
-        self._line(f"{is_continue} = arith.cmpi eq, {self.environment[control_name].name}, {continue_value.name} : i32")
-        normalized_control = self._fresh()
-        self._line(
-            f"{normalized_control} = arith.select {is_continue}, {normal_value.name}, "
-            f"{self.environment[control_name].name} : i32"
-        )
-        self.environment[control_name] = Value(normalized_control, DslType("scalar", "i32"))
-        yielded = ", ".join(self.environment[name].name for name in carried_names)
-        self._line(f"scf.yield {yielded}{suffix}")
-        self.indent -= 1
-        self._line("}")
-        self.environment = outer
-        for name, result, result_type in zip(carried_names, results, carried_types, strict=True):
-            if name != control_name:
-                self.environment[name] = Value(result, result_type)
-        self.environment.pop(control_name, None)
-
-    def _reject_nested_returns(self, node: ast.If | ast.For | ast.While) -> None:
-        nested = next((value for value in ast.walk(node) if isinstance(value, ast.Return)), None)
-        if nested is not None:
-            raise self.context.error(nested, "nested return is not supported")
-
-    @staticmethod
-    def _assigned_names(statements: Iterable[ast.stmt]) -> set[str]:
-        result: set[str] = set()
-
-        def target_names(target: ast.expr) -> set[str]:
-            if isinstance(target, ast.Name):
-                return {target.id}
-            if isinstance(target, (ast.Tuple, ast.List)):
-                return set().union(*(target_names(item) for item in target.elts))
-            return set()
-
-        for statement in statements:
-            if isinstance(statement, ast.Assign):
-                for target in statement.targets:
-                    result.update(target_names(target))
-            elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
-                result.add(statement.target.id)
-            elif isinstance(statement, ast.AugAssign) and isinstance(statement.target, ast.Name):
-                result.add(statement.target.id)
-        return result
-
     def _expression(self, node: ast.expr, expected: DslType | None = None) -> Value:
         typed = self._typed_expression(node)
         if expected is not None and not can_convert(typed.type, expected):
@@ -1251,17 +679,17 @@ class _FunctionEmitter:
                 raise self.context.error(node, f"unknown local value '{node.id}'")
             return self.environment[node.id]
         if isinstance(node, ast.Constant):
-            return self._constant(node, typed.type)
+            return lower_constant(self, node, typed.type)
         if isinstance(node, ast.BinOp):
-            return self._binary(node)
+            return lower_binary(self, node)
         if isinstance(node, ast.UnaryOp):
-            return self._unary(node)
+            return lower_unary(self, node)
         if isinstance(node, ast.BoolOp):
-            return self._bool_op(node)
+            return lower_bool_op(self, node)
         if isinstance(node, ast.Compare):
-            return self._compare(node)
+            return lower_compare(self, node)
         if isinstance(node, ast.Tuple):
-            return self._tuple(node)
+            return lower_tuple(self, node, node.elts)
         if isinstance(node, ast.Call):
             return self._call(node)
         if isinstance(node, ast.Attribute):
@@ -1269,127 +697,8 @@ class _FunctionEmitter:
         if isinstance(node, ast.Subscript):
             return self._index(node)
         if isinstance(node, ast.IfExp):
-            return self._conditional_expression(node)
+            return lower_conditional_expression(self, node)
         raise self.context.error(node, f"unsupported expression syntax: {type(node).__name__}")
-
-    def _conditional_expression(self, node: ast.IfExp) -> Value:
-        typed = self._typed_expression(node)
-        condition = self._expression(node.test, DslType("scalar", "bool"))
-        self._require_same_type(node.test, DslType("scalar", "bool"), condition.type)
-        result = self._fresh()
-        self._line(f"{result} = scf.if {condition.name} -> ({typed.type.mlir}) {{")
-        self.indent += 1
-        then_value = self._coerce_implicit(node.body, self._expression(node.body, typed.type), typed.type)
-        self._line(f"scf.yield {then_value.name} : {typed.type.mlir}")
-        self.indent -= 1
-        self._line("} else {")
-        self.indent += 1
-        else_value = self._coerce_implicit(node.orelse, self._expression(node.orelse, typed.type), typed.type)
-        self._line(f"scf.yield {else_value.name} : {typed.type.mlir}")
-        self.indent -= 1
-        self._line("}")
-        return Value(result, typed.type)
-
-    def _bool_op(self, node: ast.BoolOp) -> Value:
-        result_type = self._typed_expression(node).type
-        self._require_same_type(node, DslType("scalar", "bool"), result_type)
-        current = self._expression(node.values[0], result_type)
-        self._require_same_type(node.values[0], result_type, current.type)
-        for source in node.values[1:]:
-            result = self._fresh()
-            self._line(f"{result} = scf.if {current.name} -> ({result_type.mlir}) {{")
-            self.indent += 1
-            if isinstance(node.op, ast.And):
-                alternative = self._expression(source, result_type)
-                self._line(f"scf.yield {alternative.name} : {result_type.mlir}")
-            else:
-                self._line(f"scf.yield {current.name} : {result_type.mlir}")
-            self.indent -= 1
-            self._line("} else {")
-            self.indent += 1
-            if isinstance(node.op, ast.And):
-                self._line(f"scf.yield {current.name} : {result_type.mlir}")
-            else:
-                alternative = self._expression(source, result_type)
-                self._line(f"scf.yield {alternative.name} : {result_type.mlir}")
-            self.indent -= 1
-            self._line("}")
-            current = Value(result, result_type)
-        return current
-
-    def _tuple(self, node: ast.Tuple) -> Value:
-        return self._tuple_values(node, node.elts)
-
-    def _tuple_values(self, node: ast.expr, sources: list[ast.expr]) -> Value:
-        result_type = self._typed_expression(node).type
-        elements = [element for element in result_type.arguments if isinstance(element, DslType)]
-        values = [
-            self._coerce_implicit(source, self._expression(source, expected), expected)
-            for source, expected in zip(sources, elements, strict=True)
-        ]
-        result = self._fresh()
-        self._line(
-            f'{result} = "vernon.tuple_create"({", ".join(value.name for value in values)}) : '
-            f"({', '.join(value.type.mlir for value in values)}) -> {result_type.mlir}"
-        )
-        return Value(result, result_type, tuple(values))
-
-    def _constant(self, node: ast.Constant, expected: DslType | None) -> Value:
-        if isinstance(node.value, bool):
-            value_type = DslType("scalar", "bool")
-            literal = "1" if node.value else "0"
-        elif isinstance(node.value, int):
-            value_type = (
-                expected
-                if expected and expected.kind == "scalar" and (expected.is_float or expected.name in {"i32", "u32"})
-                else DslType("scalar", "i32")
-            )
-            literal = f"{node.value}.0" if value_type.is_float else str(node.value)
-        elif isinstance(node.value, float):
-            value_type = (
-                expected if expected and expected.kind == "scalar" and expected.is_float else DslType("scalar", "f32")
-            )
-            literal = f"{node.value:.17g}"
-            if "." not in literal and "e" not in literal.lower():
-                literal += ".0"
-        else:
-            raise self.context.error(node, "only bool, integer, and float constants are supported")
-        result = self._fresh()
-        self._line(f"{result} = arith.constant {literal} : {value_type.mlir}")
-        return Value(result, value_type)
-
-    def _binary(self, node: ast.BinOp) -> Value:
-        result_type = self._typed_expression(node).type
-        left = self._coerce_numeric(node.left, self._expression(node.left), result_type)
-        right = self._coerce_numeric(node.right, self._expression(node.right), result_type)
-        floating = left.type.is_float
-        if isinstance(node.op, ast.Pow):
-            if not floating:
-                raise self.context.error(node, "power requires floating-point operands")
-            return self._intrinsic(node, "pow", [left, right], result_type)
-        operations = {
-            ast.Add: "arith.addf" if floating else "arith.addi",
-            ast.Sub: "arith.subf" if floating else "arith.subi",
-            ast.Mult: "arith.mulf" if floating else "arith.muli",
-            ast.Div: "arith.divf" if floating else ("arith.divui" if left.type.name == "u32" else "arith.divsi"),
-            ast.Mod: "arith.remf" if floating else ("arith.remui" if left.type.name == "u32" else "arith.remsi"),
-        }
-        operation = operations.get(type(node.op))
-        if operation is None or not (floating or left.type.is_integer):
-            raise self.context.error(node, f"unsupported binary operation for {left.type.name}")
-        result = self._fresh()
-        self._line(f"{result} = {operation} {left.name}, {right.name} : {left.type.mlir}")
-        return Value(result, result_type)
-
-    @staticmethod
-    def _element_type(value_type: DslType) -> DslType | None:
-        if value_type.kind == "scalar":
-            return value_type
-        if value_type.kind == "tensor":
-            element = value_type.arguments[0]
-            assert isinstance(element, DslType)
-            return element
-        return None
 
     def _splat(self, node: ast.AST, value: Value, tensor_type: DslType) -> Value:
         element = tensor_type.arguments[0]
@@ -1399,65 +708,15 @@ class _FunctionEmitter:
         self._line(f"{result} = tensor.splat {value.name} : {tensor_type.mlir}")
         return Value(result, tensor_type)
 
-    def _unary(self, node: ast.UnaryOp) -> Value:
-        operand = self._expression(node.operand)
-        result_type = self._typed_expression(node).type
-        result = self._fresh()
-        if isinstance(node.op, ast.Not):
-            self._require_same_type(node, DslType("scalar", "bool"), operand.type)
-            self._line(f"{result} = arith.xori {operand.name}, true : i1")
-            return Value(result, result_type)
-        if isinstance(node.op, ast.USub) and (operand.type.is_float or operand.type.is_integer):
-            zero = self._default_value(node, operand.type)
-            operation = "arith.subf" if operand.type.is_float else "arith.subi"
-            self._line(f"{result} = {operation} {zero.name}, {operand.name} : {operand.type.mlir}")
-            return Value(result, result_type)
-        if isinstance(node.op, ast.UAdd):
-            return Value(operand.name, result_type, operand.fields, operand.access)
-        raise self.context.error(node, "unsupported unary operation")
-
-    def _compare(self, node: ast.Compare) -> Value:
-        if len(node.ops) != 1:
-            raise self.context.error(node, "chained comparisons are not supported")
-        typed = self._typed_expression(node)
-        if len(typed.operand_types) != 2:
-            raise self.context.error(node, "internal error: comparison has no typed operands")
-        common = typed.operand_types[0]
-        left = self._expression(node.left)
-        right = self._expression(node.comparators[0])
-        left = self._coerce_numeric(node.left, left, common)
-        right = self._coerce_numeric(node.comparators[0], right, common)
-        predicates = {
-            ast.Eq: ("oeq", "eq"),
-            ast.NotEq: ("one", "ne"),
-            ast.Lt: ("olt", "slt"),
-            ast.LtE: ("ole", "sle"),
-            ast.Gt: ("ogt", "sgt"),
-            ast.GtE: ("oge", "sge"),
-        }
-        predicates_for_operation = predicates.get(type(node.ops[0]))
-        if predicates_for_operation is None:
-            raise self.context.error(node, f"unsupported comparison: {type(node.ops[0]).__name__}")
-        floating_predicate, integer_predicate = predicates_for_operation
-        if left.type.is_float:
-            operation, predicate = "arith.cmpf", floating_predicate
-        elif left.type.is_integer or left.type.name == "bool":
-            operation, predicate = "arith.cmpi", integer_predicate
-        else:
-            raise self.context.error(node, "comparison requires scalar or tensor numeric operands")
-        result = self._fresh()
-        self._line(f"{result} = {operation} {predicate}, {left.name}, {right.name} : {left.type.mlir}")
-        return Value(result, typed.type)
-
     def _call(self, node: ast.Call) -> Value:
         if node.keywords:
             raise self.context.error(node, "function calls do not support keyword arguments")
         typed_call = self._typed_expression(node)
         name = typed_call.operation or ""
         if name in {"Tensor", "Vector", "Matrix"}:
-            return self._aggregate_constructor(node, name)
+            return lower_aggregate_constructor(self, node, name)
         if name == "Tuple":
-            return self._tuple_values(node, node.args)
+            return lower_tuple(self, node, node.args)
         known_signature = self.context.signatures.get(name)
         struct_fields = self.context.structs.get(name)
         if struct_fields is not None and len(node.args) == len(struct_fields):
@@ -1575,7 +834,7 @@ class _FunctionEmitter:
             if len(arguments) != 2:
                 raise self.context.error(node, "matmul requires two arguments")
             result_type = self._typed_expression(node).type
-            element = self._element_type(result_type)
+            element = element_type(result_type)
             coerced: list[Value] = []
             for source, argument in zip(node.args, arguments, strict=True):
                 if argument.type.kind != "tensor":
@@ -1584,76 +843,9 @@ class _FunctionEmitter:
                 coerced.append(self._coerce_implicit(source, argument, operand_type))
             return self._intrinsic(node, name, coerced, result_type)
         if name == "texture_sample":
-            if self.node.name in self.context.shared_functions:
-                raise self.context.error(
-                    node, f"shared function '{self.node.name}' uses device-only operation 'texture_sample'"
-                )
-            sampling = texture_sampling_contract(tuple(argument.type.kind for argument in arguments))
-            if sampling is None:
-                if len(arguments) == 4:
-                    raise self.context.error(node, "the four-argument texture_sample form requires an explicit sampler")
-                raise self.context.error(
-                    node, "texture_sample requires texture, optional sampler, coordinates, and optional lod"
-                )
-            texture = arguments[0]
-            texture_source = node.args[0].id if isinstance(node.args[0], ast.Name) else None
-            planned_mode = (
-                self.interface_plan.texture_sampler_modes.get(texture_source) if texture_source is not None else None
-            )
-            if planned_mode is not None and planned_mode != sampling.sampler_mode:
-                raise self.context.error(node, "texture sampling overload differs from its interface plan")
-            if self.stage not in sampling.stages:
-                requirement = "fragment shaders" if not sampling.has_lod else "graphics stages"
-                raise self.context.error(
-                    node,
-                    f"texture_sample {'without' if not sampling.has_lod else 'with'} "
-                    f"lod is supported only in {requirement}",
-                )
-            if sampling.explicit_sampler:
-                sampler = arguments[1]
-                coordinates = arguments[2]
-                lod = arguments[3] if sampling.has_lod else None
-            else:
-                sampler = self.implicit_samplers.get(texture.name)
-                if sampler is None:
-                    raise self.context.error(
-                        node.args[0], "implicitly sampled texture must be a texture entry parameter"
-                    )
-                coordinates = arguments[1]
-                lod = arguments[2] if sampling.has_lod else None
-            if lod is not None:
-                if lod.type.kind != "scalar" or not lod.type.is_float:
-                    raise self.context.error(node.args[-1], "texture_sample lod must be a floating-point scalar")
-            element = texture.type.arguments[1]
-            assert isinstance(element, DslType)
-            dimension = texture.type.arguments[0]
-            coordinate_rank = {"2d": 2, "3d": 3, "cube": 3}[dimension]
-            if (
-                coordinates.type.kind != "tensor"
-                or coordinates.type.arguments != (element, coordinate_rank)
-                or not coordinates.type.is_float
-            ):
-                raise self.context.error(
-                    node.args[2] if sampling.explicit_sampler else node.args[1],
-                    f"texture_sample coordinates for a {dimension} texture "
-                    f"must be a {coordinate_rank}-component floating-point vector",
-                )
-            operands = [texture, sampler, coordinates]
-            if lod is not None:
-                operands.append(lod)
-            return self._intrinsic(node, name, operands, typed_call.type)
+            return lower_texture_sample(self, node, arguments, typed_call.type)
         if name == "texture_size":
-            if self.node.name in self.context.shared_functions:
-                raise self.context.error(
-                    node, f"shared function '{self.node.name}' uses device-only operation 'texture_size'"
-                )
-            if len(arguments) not in {1, 2} or arguments[0].type.kind != "texture":
-                raise self.context.error(node, "texture_size requires texture and optional lod")
-            if self.stage not in {"vertex", "fragment"}:
-                raise self.context.error(node, "texture_size is supported only in graphics stages")
-            if len(arguments) == 2 and (arguments[1].type.kind != "scalar" or not arguments[1].type.is_integer):
-                raise self.context.error(node.args[1], "texture_size lod must be an integer scalar")
-            return self._intrinsic(node, name, arguments, typed_call.type)
+            return lower_texture_size(self, node, arguments, typed_call.type)
         if name in self.context.structs:
             fields = self.context.structs[name]
             if len(arguments) != len(fields):
@@ -1701,49 +893,11 @@ class _FunctionEmitter:
         )
         return Value(result, signature.result)
 
-    def _aggregate_constructor(self, node: ast.Call, name: str) -> Value:
-        if len(node.args) != 1:
-            raise self.context.error(node, f"{name} requires one sequence literal")
-        if name == "Vector":
-            sequence = node.args[0]
-            if not isinstance(sequence, (ast.List, ast.Tuple)) or not sequence.elts:
-                raise self.context.error(node, "Vector requires a non-empty sequence literal")
-            result_type = self._typed_expression(node).type
-            element_type = self._element_type(result_type)
-            values = [
-                self._coerce_constructor_argument(value, self._expression(value), element_type)
-                for value in sequence.elts
-            ]
-            return self._intrinsic(node, "construct", values, result_type)
-        literal = rectangular_literal(node.args[0])
-        if literal is None:
-            raise self.context.error(node, f"{name} requires a non-empty rectangular sequence literal")
-        elements, shape = literal
-        expected_rank = {"Vector": 1, "Matrix": 2}.get(name)
-        if expected_rank is not None and len(shape) != expected_rank:
-            raise self.context.error(node, f"{name} requires a rank-{expected_rank} sequence literal")
-        values = [self._expression(value) for value in elements]
-        result_type = self._typed_expression(node).type
-        element_type = self._element_type(result_type)
-        values = [
-            self._coerce_implicit(source, value, element_type) for source, value in zip(elements, values, strict=True)
-        ]
-        return self._intrinsic(node, "construct", values, result_type)
-
-    def _coerce_constructor_argument(self, node: ast.AST, value: Value, element: DslType) -> Value:
-        if value.type.kind == "tensor":
-            return self._coerce_implicit(
-                node,
-                value,
-                DslType("tensor", "Tensor", (element, *value.type.arguments[1:])),
-            )
-        return self._coerce_implicit(node, value, element)
-
     def _cast(self, node: ast.AST, value: Value, target: DslType) -> Value:
         if value.type == target:
             return value
-        source_scalar = self._element_type(value.type)
-        target_scalar = self._element_type(target)
+        source_scalar = element_type(value.type)
+        target_scalar = element_type(target)
         if value.type.kind == "index":
             operation = "arith.index_cast"
         elif source_scalar.is_integer and target_scalar.is_float:
@@ -1764,18 +918,10 @@ class _FunctionEmitter:
         self._line(f"{result} = {operation} {value.name} : {value.type.mlir} to {target.mlir}")
         return Value(result, target)
 
-    @staticmethod
-    def _element_type(value_type: DslType) -> DslType:
-        if value_type.kind == "tensor":
-            element = value_type.arguments[0]
-            assert isinstance(element, DslType)
-            return element
-        return value_type
-
     def _coerce_numeric(self, node: ast.AST, value: Value, target: DslType) -> Value:
         if value.type == target:
             return value
-        target_element = self._element_type(target)
+        target_element = element_type(target)
         if value.type.kind == "scalar" and target.kind == "tensor":
             value = self._coerce_implicit(node, value, target_element)
             return self._splat(node, value, target)
@@ -1853,7 +999,7 @@ class _FunctionEmitter:
             fields = self._tuple_fields(node, value)
             return fields[index]
         if value.type.kind == "tensor_view":
-            index = self._tensor_view_index(node, value)
+            index = lower_tensor_view_index(self, node, value)
             element = value.type.arguments[0]
             assert isinstance(element, DslType)
             result = self._fresh()
@@ -1906,463 +1052,6 @@ class _FunctionEmitter:
             fields.append(Value(result, element))
         return tuple(fields)
 
-    def _buffer_index(self, node: ast.AST) -> Value:
-        if isinstance(node, ast.Tuple):
-            raise self.context.error(node, "buffers require exactly one index")
-        index = self._expression(node)
-        if not index.type.is_integer:
-            raise self.context.error(node, "buffer index must be an integer")
-        if index.type.mlir == "index":
-            return index
-        cast = self._fresh()
-        self._line(f"{cast} = arith.index_cast {index.name} : {index.type.mlir} to index")
-        return Value(cast, DslType("index", "index"))
-
-    def _tensor_view_index(self, node: ast.Subscript, value: Value) -> Value:
-        rank = value.type.arguments[1]
-        index_nodes = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
-        if len(index_nodes) != rank:
-            raise self.context.error(node, "TensorView indexing requires one index per dimension")
-        if value.view_layout is None:
-            if rank == 1:
-                return self._buffer_index(index_nodes[0])
-            raise self.context.error(
-                node,
-                "multi-dimensional TensorView lowering requires runtime stride descriptors and is not implemented",
-            )
-        layout = value.view_layout
-        if len(layout.shape) != rank or len(layout.strides) != rank:
-            raise self.context.error(node, "runtime TensorView layout rank does not match its annotation")
-
-        physical: Value | None = None
-        if layout.offset:
-            offset = self._fresh()
-            self._line(f"{offset} = arith.constant {layout.offset} : index")
-            physical = Value(offset, DslType("index", "index"))
-        for index_node, stride in zip(index_nodes, layout.strides, strict=True):
-            term = self._buffer_index(index_node)
-            if stride != 1:
-                stride_value = self._fresh()
-                self._line(f"{stride_value} = arith.constant {stride} : index")
-                multiplied = self._fresh()
-                self._line(f"{multiplied} = arith.muli {term.name}, {stride_value} : index")
-                term = Value(multiplied, DslType("index", "index"))
-            if physical is None:
-                physical = term
-            else:
-                added = self._fresh()
-                self._line(f"{added} = arith.addi {physical.name}, {term.name} : index")
-                physical = Value(added, DslType("index", "index"))
-        assert physical is not None
-        return physical
-
-    def _store_index(self, target: ast.Subscript, value: Value) -> None:
-        buffer = self._expression(target.value)
-        if buffer.type.kind != "tensor_view":
-            raise self.context.error(target, "indexed assignment is supported only for TensorView values")
-        element = buffer.type.arguments[0]
-        assert isinstance(element, DslType)
-        if buffer.access is AccessMode.READ:
-            raise self.context.error(target, "cannot assign through a read-only TensorView")
-        value = self._coerce_implicit(target, value, element)
-        index = self._tensor_view_index(target, buffer)
-        self._line(
-            f'"vernon.intrinsic"({buffer.name}, {index.name}, {value.name}) '
-            f'{{name = "tensor_view_store"}} : ({buffer.abi_type.mlir}, index, {element.mlir}) -> ()'
-        )
-
     def _require_same_type(self, node: ast.AST, expected: DslType, actual: DslType) -> None:
         if expected != actual:
             raise self.context.error(node, f"type mismatch: expected {expected.mlir}, got {actual.mlir}")
-
-
-def _specialize_frontend_source(source: str, request: FrontendCompileRequest) -> str:
-    tree = ast.parse(source, filename=str(request.source_path))
-    function = next(
-        (node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == request.entry),
-        None,
-    )
-    if function is None:
-        raise CompileError(
-            f"entry function '{request.entry}' was not found",
-            SourceLocation(str(request.source_path), 1, 1),
-        )
-    shapes = {name: shape for name, _, shape in request.tensor_shapes}
-    for argument in function.args.args:
-        shape = shapes.get(argument.arg)
-        if shape is None or argument.annotation is None:
-            continue
-        annotation = argument.annotation
-        if isinstance(annotation, ast.Subscript) and (_name(annotation.value) or "").split(".")[-1] == "Annotated":
-            values = list(annotation.slice.elts) if isinstance(annotation.slice, ast.Tuple) else [annotation.slice]
-            annotation = values[0]
-        if not (isinstance(annotation, ast.Subscript) and (_name(annotation.value) or "").split(".")[-1] == "Tensor"):
-            continue
-        items = list(annotation.slice.elts) if isinstance(annotation.slice, ast.Tuple) else [annotation.slice]
-        if len(items) < 2:
-            continue
-        shape_node = items[1]
-        shape_nodes = list(shape_node.elts) if isinstance(shape_node, ast.Tuple) else items[1:]
-        if len(shape_nodes) != len(shape):
-            raise CompileError(
-                f"Tensor argument '{argument.arg}' rank does not match annotation",
-                SourceLocation(str(request.source_path), argument.lineno, argument.col_offset + 1),
-            )
-        for index, (declared, concrete) in enumerate(zip(shape_nodes, shape, strict=True)):
-            if isinstance(declared, ast.Constant) and declared.value is None:
-                shape_nodes[index] = ast.copy_location(ast.Constant(value=concrete), declared)
-            elif not (isinstance(declared, ast.Constant) and declared.value == concrete):
-                raise CompileError(
-                    f"Tensor argument '{argument.arg}' shape does not match annotation",
-                    SourceLocation(str(request.source_path), argument.lineno, argument.col_offset + 1),
-                )
-        items[1] = ast.Tuple(elts=shape_nodes, ctx=ast.Load())
-        annotation.slice = ast.Tuple(elts=items, ctx=ast.Load())
-
-    constants = dict(request.captured_constants)
-
-    class ConstantSpecializer(ast.NodeTransformer):
-        def visit_Name(self, node: ast.Name) -> ast.expr:
-            if isinstance(node.ctx, ast.Load) and node.id in constants:
-                return ast.copy_location(ast.Constant(constants[node.id]), node)
-            return node
-
-    specialized = ConstantSpecializer().visit(tree)
-    assert isinstance(specialized, ast.Module)
-    ast.fix_missing_locations(specialized)
-    return ast.unparse(specialized)
-
-
-class Compiler:
-    """Compiles a restricted Python source string without importing or executing it."""
-
-    def compile(
-        self,
-        source: str,
-        filename: str = "<string>",
-        dependencies: tuple[tuple[str, str], ...] = (),
-        declared_features: tuple[str, ...] = (),
-        enabled_features: tuple[str, ...] = (),
-        runtime_entry: str | None = None,
-        tensor_view_layouts: dict[str, _ViewLayout] | None = None,
-    ) -> str:
-        try:
-            module = ast.parse(source, filename=filename, type_comments=False)
-        except SyntaxError as error:
-            raise CompileError(
-                error.msg,
-                SourceLocation(filename, error.lineno or 1, error.offset or 1),
-            ) from None
-        module = normalize_struct_methods(module, filename)
-        context = _ModuleContext(
-            filename,
-            runtime_entry=runtime_entry,
-            tensor_view_layouts=tensor_view_layouts or {},
-        )
-        self._collect_struct_names(module, context)
-        type_parser = TypeParser(context)
-        self._collect_structs(module, context, type_parser)
-        self._validate_entry_annotations(module, context)
-        module = infer_and_monomorphize_helpers(
-            module,
-            lambda annotation: type_parser.parse(annotation).type,
-            context.error,
-            tuple(sorted(enabled_features)),
-        )
-        self._helper_specializations = tuple(getattr(module, "_vernon_helper_specializations", ()))
-        self._typed_functions = tuple(getattr(module, "_vernon_typed_functions", ()))
-        context.typed_functions = {function.symbol: function for function in self._typed_functions}
-        self._collect_signatures(module, context, type_parser)
-
-        module_attributes = [
-            'vernon.frontend = "python"',
-            f"vernon.frontend_version = {FRONTEND_VERSION} : i64",
-            "vernon.value_abi_version = 1 : i64",
-        ]
-        if dependencies:
-            encoded = ", ".join(json.dumps(f"{path}={digest}") for path, digest in dependencies)
-            module_attributes.append(f"vernon.source_dependencies = [{encoded}]")
-        if declared_features:
-            declarations = ", ".join(json.dumps(name) for name in sorted(declared_features))
-            module_attributes.append(f"vernon.feature_declarations = [{declarations}]")
-        if enabled_features:
-            variant = ", ".join(json.dumps(name) for name in sorted(enabled_features))
-            module_attributes.append(f"vernon.variant_key = [{variant}]")
-        body: list[str] = [f"module attributes {{{', '.join(module_attributes)}}} {{"]
-
-        def struct_field_types(name: str) -> tuple[tuple[str, ConcreteType], ...]:
-            return tuple((field_name, annotation.type) for field_name, annotation in context.structs[name])
-
-        for name in sorted(context.structs):
-            fields = context.structs[name]
-            field_text = ", ".join(
-                json.dumps(f"{field_name}:{annotation.type.mlir}") for field_name, annotation in fields
-            )
-            layout = value_abi_layout(ConcreteType("struct", name), struct_field_types)
-            offsets = ", ".join(str(offset) for offset in layout.field_offsets)
-            leaf_dtypes = ", ".join(f'"{leaf.dtype}"' for leaf in layout.leaves)
-            body.append(
-                f'  "vernon.struct"() {{abi_alignment = {layout.alignment} : i64, '
-                f"abi_field_offsets = array<i64: {offsets}>, abi_leaf_dtypes = [{leaf_dtypes}], "
-                f"abi_size = {layout.size} : i64, "
-                f'fields = [{field_text}], sym_name = "{name}"}} : () -> ()'
-            )
-        for node in module.body:
-            if isinstance(node, ast.FunctionDef):
-                stage, workgroup_size = self._decorator(node, context)
-                annotations = [type_parser.parse(argument.annotation) for argument in node.args.args]
-                body.extend(
-                    _FunctionEmitter(
-                        context,
-                        context.signatures[node.name],
-                        annotations,
-                        context.result_annotations[node.name],
-                        context.typed_functions[node.name],
-                        stage,
-                        workgroup_size,
-                    ).emit()
-                )
-            elif isinstance(node, (ast.Import, ast.ImportFrom, ast.ClassDef)):
-                continue
-            elif (
-                isinstance(node, ast.Expr)
-                and isinstance(node.value, ast.Constant)
-                and isinstance(node.value.value, str)
-            ):
-                continue
-            else:
-                raise context.error(node, f"unsupported module-level syntax: {type(node).__name__}")
-        body.append("}")
-        return "\n".join(body) + "\n"
-
-    def compile_file(self, input_path: str | Path, *, features: Iterable[str] = (), entry: str | None = None) -> str:
-        path = Path(input_path)
-        enabled_features = tuple(sorted(set(features)))
-        if entry is None:
-            project = load_project(path, enabled_features, entry)
-            return self.compile(project.source, str(path), project.dependencies, project.features, enabled_features)
-        return self.compile_request(FrontendCompileRequest(path, entry, enabled_features)).mlir
-
-    def compile_request(self, request: FrontendCompileRequest) -> FrontendCompileResult:
-        project = load_project(request.source_path, request.enabled_features, request.entry)
-        specialized_source = _specialize_frontend_source(project.source, request)
-        mlir = self.compile(
-            specialized_source,
-            str(request.source_path),
-            project.dependencies,
-            project.features,
-            request.enabled_features,
-            request.entry,
-            {
-                name: _ViewLayout(shape, strides, offset)
-                for name, _, shape, strides, offset in request.tensor_view_layouts
-            },
-        )
-        return FrontendCompileResult(
-            mlir,
-            specialized_source,
-            project.dependencies,
-            project.features,
-            request,
-            self._helper_specializations,
-            self._typed_functions,
-        )
-
-    @staticmethod
-    def _validate_entry_annotations(module: ast.Module, context: _ModuleContext) -> None:
-        for node in module.body:
-            if not isinstance(node, ast.FunctionDef):
-                continue
-            decorators = {
-                (_name(item.func if isinstance(item, ast.Call) else item) or "").split(".")[-1]
-                for item in node.decorator_list
-            }
-            if not decorators & {"kernel", "vertex", "fragment"}:
-                continue
-            if node.returns is None:
-                raise context.error(
-                    node,
-                    f"entry function '{node.name}' requires a result annotation",
-                )
-            for argument in node.args.args:
-                if argument.annotation is None:
-                    raise context.error(
-                        argument,
-                        f"entry argument '{argument.arg}' requires a type annotation",
-                    )
-
-    @staticmethod
-    def _collect_struct_names(module: ast.Module, context: _ModuleContext) -> None:
-        for node in module.body:
-            if isinstance(node, ast.ClassDef):
-                decorators = {
-                    (_name(decorator.func) if isinstance(decorator, ast.Call) else _name(decorator) or "").split(".")[
-                        -1
-                    ]
-                    for decorator in node.decorator_list
-                }
-                if "struct" not in decorators:
-                    raise context.error(node, "DSL classes must use @struct")
-                context.structs[node.name] = ()
-
-    @staticmethod
-    def _collect_structs(module: ast.Module, context: _ModuleContext, parser: TypeParser) -> None:
-        for node in module.body:
-            if not isinstance(node, ast.ClassDef):
-                continue
-            fields: list[tuple[str, AnnotatedType]] = []
-            for statement in node.body:
-                if isinstance(statement, ast.Pass) or (
-                    isinstance(statement, ast.Expr)
-                    and isinstance(statement.value, ast.Constant)
-                    and isinstance(statement.value.value, str)
-                ):
-                    continue
-                if (
-                    not isinstance(statement, ast.AnnAssign)
-                    or not isinstance(statement.target, ast.Name)
-                    or statement.value is not None
-                ):
-                    raise context.error(statement, "@struct bodies may contain only annotation-only fields")
-                fields.append((statement.target.id, parser.parse(statement.annotation)))
-            context.structs[node.name] = tuple(fields)
-
-        def field_types(name: str) -> tuple[ConcreteType, ...]:
-            return tuple(annotation.type for _, annotation in context.structs[name])
-
-        for node in module.body:
-            if not isinstance(node, ast.ClassDef):
-                continue
-            for statement, (field_name, annotation) in zip(
-                (item for item in node.body if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name)),
-                context.structs[node.name],
-                strict=True,
-            ):
-                if not is_abi_stable_value(annotation.type, field_types):
-                    raise context.error(
-                        statement.annotation,
-                        f"Struct field '{node.name}.{field_name}' must be an ABI-stable Value",
-                    )
-
-    @staticmethod
-    def _collect_signatures(module: ast.Module, context: _ModuleContext, parser: TypeParser) -> None:
-        for node in module.body:
-            if not isinstance(node, ast.FunctionDef):
-                continue
-            shared = Compiler._is_shared_function(node)
-            if shared:
-                context.shared_functions.add(node.name)
-            if (
-                node.args.posonlyargs
-                or node.args.kwonlyargs
-                or node.args.vararg
-                or node.args.kwarg
-                or node.args.defaults
-            ):
-                raise context.error(node, "DSL functions support only required positional arguments")
-            arguments: list[DslType] = []
-            for argument in node.args.args:
-                if argument.annotation is None:
-                    raise context.error(argument, f"argument '{argument.arg}' requires a type annotation")
-                annotation = parser.parse(argument.annotation)
-                if annotation.type.kind == "tensor_storage":
-                    raise context.error(
-                        argument,
-                        "TensorStorage is a host-runtime owner; device parameters must use TensorView",
-                    )
-                if shared and (
-                    annotation.metadata
-                    or annotation.type.kind in {"sampler", "tensor_storage", "tensor_view", "texture"}
-                ):
-                    raise context.error(argument, f"shared function '{node.name}' uses a device-only argument")
-                arguments.append(annotation.type)
-            result = None
-            result_annotation = None
-            if node.returns is not None and not (isinstance(node.returns, ast.Constant) and node.returns.value is None):
-                result_annotation = parser.parse(node.returns)
-                result = result_annotation.type
-                if shared and (
-                    result_annotation.metadata or result.kind in {"sampler", "tensor_storage", "tensor_view", "texture"}
-                ):
-                    raise context.error(node.returns, f"shared function '{node.name}' uses a device-only result")
-            context.signatures[node.name] = FunctionSignature(tuple(arguments), result)
-            context.result_annotations[node.name] = result_annotation
-
-    @staticmethod
-    def _is_shared_function(node: ast.FunctionDef) -> bool:
-        if len(node.decorator_list) != 1:
-            return False
-        decorator = node.decorator_list[0]
-        if not isinstance(decorator, ast.Call) or (_name(decorator.func) or "").split(".")[-1] != "func":
-            return False
-        return any(
-            keyword.arg == "shared" and isinstance(keyword.value, ast.Constant) and keyword.value.value is True
-            for keyword in decorator.keywords
-        )
-
-    @staticmethod
-    def _decorator(node: ast.FunctionDef, context: _ModuleContext) -> tuple[str | None, tuple[int, int, int] | None]:
-        stage = None
-        workgroup_size = None
-        function_kind = None
-        for decorator in node.decorator_list:
-            if isinstance(decorator, ast.Name) or isinstance(decorator, ast.Attribute):
-                name = (_name(decorator) or "").split(".")[-1]
-                if name in {"vertex", "fragment"}:
-                    function_kind = name
-                    stage = name
-                elif name == "kernel":
-                    function_kind = "compute"
-                    stage = "compute"
-                    workgroup_size = (1, 1, 1)
-                elif name == "func":
-                    function_kind = "func"
-                else:
-                    raise context.error(decorator, f"unknown DSL decorator '{name}'")
-            elif isinstance(decorator, ast.Call) and (_name(decorator.func) or "").split(".")[-1] == "kernel":
-                if function_kind is not None:
-                    raise context.error(decorator, "DSL functions require exactly one function decorator")
-                function_kind = "compute"
-                stage = "compute"
-                values = None
-                for keyword in decorator.keywords:
-                    if keyword.arg == "workgroup_size":
-                        values = keyword.value
-                    else:
-                        raise context.error(keyword, f"unknown kernel option '{keyword.arg}'")
-                if decorator.args or not isinstance(values, ast.Tuple) or len(values.elts) != 3:
-                    raise context.error(decorator, "kernel requires workgroup_size=(x, y, z)")
-                parsed: list[int] = []
-                for value in values.elts:
-                    if not isinstance(value, ast.Constant) or not isinstance(value.value, int) or value.value <= 0:
-                        raise context.error(value, "workgroup dimensions must be positive integer literals")
-                    parsed.append(value.value)
-                workgroup_size = tuple(parsed)  # type: ignore[assignment]
-            elif isinstance(decorator, ast.Call) and (_name(decorator.func) or "").split(".")[-1] == "func":
-                if function_kind is not None:
-                    raise context.error(decorator, "DSL functions require exactly one function decorator")
-                function_kind = "func"
-                if decorator.args or len(decorator.keywords) != 1:
-                    raise context.error(decorator, "@func accepts only shared=True")
-                keyword = decorator.keywords[0]
-                if (
-                    keyword.arg != "shared"
-                    or not isinstance(keyword.value, ast.Constant)
-                    or keyword.value.value is not True
-                ):
-                    raise context.error(decorator, "@func accepts only shared=True")
-            else:
-                raise context.error(decorator, "unsupported decorator syntax")
-            if len(node.decorator_list) > 1:
-                raise context.error(decorator, "DSL functions require exactly one function decorator")
-        if function_kind is None:
-            raise context.error(node, "DSL functions require @func, @vertex, @fragment, or @kernel")
-        return stage, workgroup_size
-
-
-def compile_source(source: str, filename: str = "<string>") -> str:
-    return Compiler().compile(source, filename)
-
-
-def compile_file(input_path: str | Path, *, features: Iterable[str] = (), entry: str | None = None) -> str:
-    return Compiler().compile_file(input_path, features=features, entry=entry)

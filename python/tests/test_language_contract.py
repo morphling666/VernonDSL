@@ -4,6 +4,7 @@ import ast
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import vernon_dsl as vd
 from vernon_dsl import CompileError, Compiler, compile_source
@@ -18,6 +19,7 @@ from vernon_dsl.frontend.model import (
     Effect,
     EffectScope,
     MemoryOrdering,
+    ResourceEffect,
     StorageEffect,
     StorageEffectKind,
     StorageOwner,
@@ -201,6 +203,118 @@ class LanguageVersionTests(unittest.TestCase):
         self.assertEqual(second.semantic_inputs["helper_specializations"], expected)
         self.assertEqual(dump_typed_model(first.typed_functions), dump_typed_model(second.typed_functions))
 
+    def test_frontend_cache_hits_and_invalidates_transitive_dependencies(self) -> None:
+        Compiler.clear_cache()
+        self.addCleanup(Compiler.clear_cache)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = root / "helper.py"
+            shader = root / "shader.py"
+            helper.write_text(
+                "from vernon_dsl import *\n@func\ndef scale(value: f32) -> f32:\n    return value * 2.0\n",
+                encoding="utf-8",
+            )
+            shader.write_text(
+                "from vernon_dsl import *\n"
+                "from helper import scale\n"
+                "@fragment\n"
+                "def main(value: f32) -> f32:\n"
+                "    return scale(value)\n",
+                encoding="utf-8",
+            )
+            request = FrontendCompileRequest(shader, "main")
+            first = Compiler().compile_request(request)
+            second = Compiler().compile_request(request)
+            self.assertIs(first, second)
+
+            helper.write_text(
+                "from vernon_dsl import *\n@func\ndef scale(value: f32) -> f32:\n    return value * 3.0\n",
+                encoding="utf-8",
+            )
+            third = Compiler().compile_request(request)
+
+        self.assertIsNot(first, third)
+        self.assertNotEqual(first.dependencies, third.dependencies)
+        self.assertNotEqual(first.mlir, third.mlir)
+
+    def test_failed_frontend_requests_reproduce_current_diagnostics(self) -> None:
+        Compiler.clear_cache()
+        self.addCleanup(Compiler.clear_cache)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "diagnostics.py"
+            path.write_text(
+                "from vernon_dsl import *\n@fragment\ndef main(value: f32):\n    return value\n",
+                encoding="utf-8",
+            )
+            request = FrontendCompileRequest(path, "main")
+            with self.assertRaisesRegex(CompileError, "requires a result annotation"):
+                Compiler().compile_request(request)
+
+            path.write_text(
+                "from vernon_dsl import *\n@fragment\ndef main(value: f32) -> f32:\n    return missing\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(CompileError, "cannot infer unknown value 'missing'"):
+                Compiler().compile_request(request)
+
+            path.write_text(
+                "from vernon_dsl import *\n@fragment\ndef main(value: f32) -> f32:\n    return value\n",
+                encoding="utf-8",
+            )
+            result = Compiler().compile_request(request)
+
+        self.assertIn("func.func @main", result.mlir)
+
+    def test_runtime_workgroup_size_is_a_semantic_compile_input(self) -> None:
+        Compiler.clear_cache()
+        self.addCleanup(Compiler.clear_cache)
+        source = "from vernon_dsl import *\n@kernel\ndef main() -> None:\n    pass\n"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "workgroup.py"
+            path.write_text(source, encoding="utf-8")
+            first = Compiler().compile_request(FrontendCompileRequest(path, "main", workgroup_size=(2, 3, 1)))
+            second = Compiler().compile_request(FrontendCompileRequest(path, "main", workgroup_size=(4, 1, 1)))
+
+        self.assertIn("vernon.workgroup_size = array<i32: 2, 3, 1>", first.mlir)
+        self.assertIn("vernon.workgroup_size = array<i32: 4, 1, 1>", second.mlir)
+        self.assertNotEqual(first.mlir, second.mlir)
+
+    def test_graphics_stages_share_project_parsing_and_dependency_discovery(self) -> None:
+        Compiler.clear_cache()
+        self.addCleanup(Compiler.clear_cache)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper_source = "from vernon_dsl import *\n@func\ndef tint(value):\n    return value * 2.0\n"
+            shader_source = (
+                "from vernon_dsl import *\n"
+                "from helper import tint\n"
+                "@vertex\n"
+                "def vertex_main(value: Vector[f32, 4]) -> Vector[f32, 4]:\n"
+                "    return tint(value)\n"
+                "@fragment\n"
+                "def fragment_main(value: f32) -> f32:\n"
+                "    return tint(value)\n"
+            )
+            helper = root / "helper.py"
+            shader = root / "shader.py"
+            helper.write_text(helper_source, encoding="utf-8")
+            shader.write_text(shader_source, encoding="utf-8")
+
+            parsed_sources: list[str] = []
+            original_parse = ast.parse
+
+            def record_parse(source: str, *args: object, **kwargs: object) -> ast.AST:
+                parsed_sources.append(source)
+                return original_parse(source, *args, **kwargs)
+
+            with mock.patch("vernon_dsl.module_graph.ast.parse", side_effect=record_parse):
+                vertex = Compiler().compile_request(FrontendCompileRequest(shader, "vertex_main"))
+                fragment = Compiler().compile_request(FrontendCompileRequest(shader, "fragment_main"))
+
+        self.assertEqual(parsed_sources.count(shader_source), 1)
+        self.assertEqual(parsed_sources.count(helper_source), 1)
+        self.assertEqual(vertex.dependencies, fragment.dependencies)
+
     def test_typed_model_records_effects_lvalues_and_branch_merges(self) -> None:
         source = (
             "from vernon_dsl import *\n"
@@ -338,8 +452,12 @@ class LanguageVersionTests(unittest.TestCase):
         resource_statement = resource_result.typed_functions[0].body[0]
         self.assertEqual(value_statement.effects, ())
         self.assertEqual(value_statement.effect, Effect.PURE)
-        self.assertEqual(resource_statement.effects, ())
+        self.assertEqual(resource_statement.effects, (ResourceEffect("texture_sample", "image"),))
         self.assertEqual(resource_statement.effect, Effect.READ)
+        self.assertEqual(
+            typed_effect_data(resource_statement.effects[0]),
+            {"kind": "resource_read", "operation": "texture_sample", "owner": "image"},
+        )
 
     def test_atomic_and_barrier_effect_records_are_reserved_and_deterministic(self) -> None:
         function_source = ast.parse("@kernel\ndef main() -> None:\n    pass\n").body[0]
