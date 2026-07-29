@@ -1,3 +1,5 @@
+include_guard(GLOBAL)
+
 set(GTEST_ARCHIVE_URL
     "https://github.com/google/googletest/archive/refs/tags/v1.17.0.tar.gz"
     CACHE STRING "GoogleTest archive to fetch")

@@ -20,6 +20,40 @@ function(vernon_discover_gtests target)
     gtest_discover_tests(${target} DISCOVERY_MODE POST_BUILD WORKING_DIRECTORY "${VERNON_TEST_BINARY_ROOT}")
 endfunction()
 
+function(
+    vernon_add_pipeline_test_bundle
+    name
+    architecture
+    asset_reference
+    output_stem
+    output_variable)
+    set(_vernon_bundle_directory "${VERNON_TEST_BINARY_ROOT}/${output_stem}")
+    set(_vernon_bundle_manifest "${_vernon_bundle_directory}/${output_stem}.pipeline.json")
+    string(
+        REGEX
+        REPLACE ":[^:]+$"
+                ""
+                _vernon_asset_source
+                "${asset_reference}")
+    add_custom_command(
+        OUTPUT "${_vernon_bundle_manifest}"
+        COMMAND
+            ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${Python_EXECUTABLE} -m
+            vernon_dsl.pipeline_asset_cli "${asset_reference}" --target "${architecture}" --output
+            "${_vernon_bundle_directory}"
+        DEPENDS vernon-dsl-native
+                "${_vernon_asset_source}"
+                "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/parameters.py"
+                "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/requirements.py"
+                "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/types.py"
+                "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/pipeline_assets.py"
+        VERBATIM)
+    add_custom_target("vernon-${name}-test-bundle" DEPENDS "${_vernon_bundle_manifest}")
+    set(${output_variable}
+        "${_vernon_bundle_manifest}"
+        PARENT_SCOPE)
+endfunction()
+
 if(TARGET VernonRuntime)
     add_library(VernonRuntimePublicCHeaderCheck OBJECT runtime/runtime_public_header_compile.c)
     target_link_libraries(VernonRuntimePublicCHeaderCheck PRIVATE Vernon::Runtime)
@@ -154,45 +188,24 @@ if(TARGET VernonRuntime)
                                                   rhi/directx12_native_interop_test.cpp)
         target_link_libraries(VernonRuntimeTests PRIVATE Vernon::RHI d3d12 dxgi)
         if(TARGET vernon-dsl-native AND Python_FOUND)
-            set(directx_pipeline_test_dir "${VERNON_TEST_BINARY_ROOT}/directx_pipeline_bundle")
-            set(directx_pipeline_test_manifest "${directx_pipeline_test_dir}/directx_pipeline_bundle.pipeline.json")
-            set(directx_compute_pipeline_test_dir "${VERNON_TEST_BINARY_ROOT}/directx_compute_pipeline_bundle")
-            set(directx_compute_pipeline_test_manifest
-                "${directx_compute_pipeline_test_dir}/directx_compute_pipeline_bundle.pipeline.json")
-            add_custom_command(
-                OUTPUT "${directx_pipeline_test_manifest}"
-                COMMAND
-                    ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${Python_EXECUTABLE} -m
-                    vernon_dsl.pipeline_asset_cli
-                    "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:sampled_asset" --target directx
-                    --output "${directx_pipeline_test_dir}"
-                DEPENDS vernon-dsl-native
-                        "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py"
-                        "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/parameters.py"
-                        "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/requirements.py"
-                VERBATIM)
-            add_custom_target(vernon-directx-pipeline-test-bundle DEPENDS "${directx_pipeline_test_manifest}")
-            add_custom_command(
-                OUTPUT "${directx_compute_pipeline_test_manifest}"
-                COMMAND
-                    ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${Python_EXECUTABLE} -m
-                    vernon_dsl.pipeline_asset_cli
-                    "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:scale_asset" --target directx
-                    --output "${directx_compute_pipeline_test_dir}"
-                DEPENDS vernon-dsl-native
-                        "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py"
-                        "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/parameters.py"
-                        "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/requirements.py"
-                VERBATIM)
-            add_custom_target(vernon-directx-compute-pipeline-test-bundle
-                              DEPENDS "${directx_compute_pipeline_test_manifest}")
+            vernon_add_pipeline_test_bundle(
+                directx-pipeline
+                directx
+                "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:sampled_asset"
+                directx_pipeline_bundle
+                directx_pipeline_test_manifest)
+            vernon_add_pipeline_test_bundle(
+                directx-compute-pipeline
+                directx
+                "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:scale_asset"
+                directx_compute_pipeline_bundle
+                directx_compute_pipeline_test_manifest)
             target_sources(VernonRuntimeTests PRIVATE runtime/runtime_directx12_pipeline_test.cpp)
             target_compile_definitions(
                 VernonRuntimeTests
                 PRIVATE VERNON_DIRECTX_PIPELINE_BUNDLE="${directx_pipeline_test_manifest}"
                         VERNON_DIRECTX_COMPUTE_PIPELINE_BUNDLE="${directx_compute_pipeline_test_manifest}")
             target_link_libraries(VernonRuntimeTests PRIVATE VernonDSLCompiler)
-            vernon_stage_target_files(VernonRuntimeTests VernonDSLCompiler)
             add_dependencies(VernonRuntimeTests vernon-directx-pipeline-test-bundle
                              vernon-directx-compute-pipeline-test-bundle)
         endif()
@@ -201,53 +214,24 @@ if(TARGET VernonRuntime)
     if(VERNON_ENABLE_VULKAN_RUNTIME
        AND TARGET vernon-dsl-native
        AND Python_FOUND)
-        set(vulkan_pipeline_test_dir "${VERNON_TEST_BINARY_ROOT}/vulkan_pipeline_bundle")
-        set(vulkan_pipeline_test_manifest "${vulkan_pipeline_test_dir}/vulkan_pipeline_bundle.pipeline.json")
-        add_custom_command(
-            OUTPUT "${vulkan_pipeline_test_manifest}"
-            COMMAND
-                ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${Python_EXECUTABLE} -m
-                vernon_dsl.pipeline_asset_cli
-                "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:sampled_asset" --target vulkan
-                --output "${vulkan_pipeline_test_dir}"
-            DEPENDS vernon-dsl-native
-                    "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py"
-                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/parameters.py"
-                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/requirements.py"
-                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/types.py"
-                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/pipeline_assets.py"
-            VERBATIM)
-        add_custom_target(vernon-vulkan-pipeline-test-bundle DEPENDS "${vulkan_pipeline_test_manifest}")
-        set(vulkan_compute_pipeline_test_dir "${VERNON_TEST_BINARY_ROOT}/vulkan_compute_pipeline_bundle")
-        set(vulkan_compute_pipeline_test_manifest
-            "${vulkan_compute_pipeline_test_dir}/vulkan_compute_pipeline_bundle.pipeline.json")
-        add_custom_command(
-            OUTPUT "${vulkan_compute_pipeline_test_manifest}"
-            COMMAND
-                ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${Python_EXECUTABLE} -m
-                vernon_dsl.pipeline_asset_cli
-                "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:scale_asset" --target vulkan --output
-                "${vulkan_compute_pipeline_test_dir}"
-            DEPENDS vernon-dsl-native "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py"
-                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/parameters.py"
-            VERBATIM)
-        add_custom_target(vernon-vulkan-compute-pipeline-test-bundle DEPENDS "${vulkan_compute_pipeline_test_manifest}")
-        set(vulkan_cube_map_test_dir "${VERNON_TEST_BINARY_ROOT}/vulkan_cube_map_bundle")
-        set(vulkan_cube_map_test_manifest "${vulkan_cube_map_test_dir}/vulkan_cube_map_bundle.pipeline.json")
-        add_custom_command(
-            OUTPUT "${vulkan_cube_map_test_manifest}"
-            COMMAND
-                ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${Python_EXECUTABLE} -m
-                vernon_dsl.pipeline_asset_cli "${VERNON_REPOSITORY_ROOT}/python/tests/cube_map_shader.py:cube_map_asset"
-                --target vulkan --output "${vulkan_cube_map_test_dir}"
-            DEPENDS vernon-dsl-native
-                    "${VERNON_REPOSITORY_ROOT}/python/tests/cube_map_shader.py"
-                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/parameters.py"
-                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/requirements.py"
-                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/types.py"
-                    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/pipeline_assets.py"
-            VERBATIM)
-        add_custom_target(vernon-vulkan-cube-map-test-bundle DEPENDS "${vulkan_cube_map_test_manifest}")
+        vernon_add_pipeline_test_bundle(
+            vulkan-pipeline
+            vulkan
+            "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:sampled_asset"
+            vulkan_pipeline_bundle
+            vulkan_pipeline_test_manifest)
+        vernon_add_pipeline_test_bundle(
+            vulkan-compute-pipeline
+            vulkan
+            "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:scale_asset"
+            vulkan_compute_pipeline_bundle
+            vulkan_compute_pipeline_test_manifest)
+        vernon_add_pipeline_test_bundle(
+            vulkan-cube-map
+            vulkan
+            "${VERNON_REPOSITORY_ROOT}/python/tests/cube_map_shader.py:cube_map_asset"
+            vulkan_cube_map_bundle
+            vulkan_cube_map_test_manifest)
         target_sources(VernonRuntimeTests PRIVATE runtime/runtime_vulkan_pipeline_test.cpp
                                                   runtime/runtime_vulkan_cube_map_test.cpp)
         target_compile_definitions(

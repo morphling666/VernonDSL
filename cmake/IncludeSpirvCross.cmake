@@ -1,3 +1,5 @@
+include_guard(GLOBAL)
+
 set(SPIRV_CROSS_REPOSITORY
     "https://github.com/KhronosGroup/SPIRV-Cross.git"
     CACHE STRING "SPIRV-Cross repository to fetch")

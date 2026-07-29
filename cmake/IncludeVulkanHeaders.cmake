@@ -1,3 +1,5 @@
+include_guard(GLOBAL)
+
 set(VULKAN_HEADERS_REPOSITORY
     "https://github.com/KhronosGroup/Vulkan-Headers.git"
     CACHE STRING "Vulkan-Headers repository to fetch")

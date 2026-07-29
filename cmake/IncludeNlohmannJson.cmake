@@ -1,3 +1,5 @@
+include_guard(GLOBAL)
+
 set(NLOHMANN_JSON_REPOSITORY
     "https://github.com/nlohmann/json.git"
     CACHE STRING "nlohmann/json repository to fetch")

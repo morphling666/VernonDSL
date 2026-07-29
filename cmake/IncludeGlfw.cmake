@@ -1,3 +1,5 @@
+include_guard(GLOBAL)
+
 set(GLFW_REPOSITORY
     "https://github.com/glfw/glfw.git"
     CACHE STRING "GLFW repository to fetch")
