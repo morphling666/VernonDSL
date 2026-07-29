@@ -1196,7 +1196,10 @@ class _Inference:
                 ):
                     raise self.error(extent, "workgroup_storage dimensions must be positive compile-time integers")
                 shape.append(extent.value)
-            struct_fields = lambda struct: self.structs[struct]
+
+            def struct_fields(struct: str) -> tuple[tuple[str, ConcreteType], ...]:
+                return self.structs[struct]
+
             shape_tuple = tuple(shape)
             if workgroup_physical_bytes(element, shape_tuple, struct_fields) > 16 * 1024:
                 raise self.error(node, "workgroup_storage exceeds the portable 16 KiB allocation limit")
