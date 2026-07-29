@@ -21,11 +21,15 @@ $runtimeShaderPath = Join-Path $ProjectRoot "examples\runtime_shader.py"
 $runtimeMlirPath = Join-Path $BinaryDir "runtime-shader.mlir"
 $openGlOutput = Join-Path $BinaryDir "runtime-shader-opengl"
 $env:PYTHONPATH = Join-Path $ProjectRoot "python"
-$versions = & python -c "from vernon_dsl._versions import *; print(f'{COMPILER_CONTRACT_VERSION},{PIPELINE_VERSION}')"
-$compilerContractVersion, $pipelineVersion = $versions.Trim().Split(",")
 
 Push-Location $ProjectRoot
 try {
+  $versions = & uv run --frozen python -c "from vernon_dsl._versions import *; print(f'{COMPILER_CONTRACT_VERSION},{PIPELINE_VERSION}')"
+  if ($LASTEXITCODE -ne 0) {
+    throw "Reading Python frontend versions failed"
+  }
+  $compilerContractVersion, $pipelineVersion = $versions.Trim().Split(",")
+
   & uv run --frozen python -m vernon_dsl.cli $inputPath -o $outputPath
   if ($LASTEXITCODE -ne 0) {
     throw "Python frontend compilation failed"
