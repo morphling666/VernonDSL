@@ -53,7 +53,7 @@ def plan_variant(
             validate_graphics_topology(graphics)
         except ValueError as error:
             raise PipelineCompileError(str(error)) from None
-        for producer, consumer in zip(graphics, graphics[1:]):
+        for producer, consumer in zip(graphics, graphics[1:], strict=False):
             validate_graphics_interfaces(producer, records[producer], consumer, records[consumer])
     external = external_parameters(records)
     internal = internal_parameters(records)
