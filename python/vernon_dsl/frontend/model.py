@@ -213,6 +213,8 @@ class StorageEffect:
 class ResourceEffect:
     operation: str
     owner: str
+    stages: frozenset[str] = frozenset()
+    has_lod: bool = False
 
 
 class MemoryOrdering(Enum):

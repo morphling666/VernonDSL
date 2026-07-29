@@ -210,9 +210,11 @@ entry during that orchestration, so every `FrontendCompileRequest` field that
 participates in cache identity also participates in emitted semantics.
 
 Resource reads are represented by structured `ResourceEffect` records carrying
-the operation and resource parameter owner. They remain distinct from Storage
-regions while contributing to the coarse read/pure summary; lowering and
-diagnostics do not infer Resource effects from operation-name fallbacks.
+the operation, resource parameter owner, and legal entry stages. They remain
+distinct from Storage regions while contributing to the coarse read/pure
+summary, propagate through ordinary helper calls, and are validated once a
+concrete entry stage is known; lowering and diagnostics do not infer Resource
+effects from operation-name fallbacks.
 
 ### Unified compilation surfaces
 
@@ -408,7 +410,10 @@ texture provenance, and Runtime validates duplicate descriptors, stage
 visibility, and sampler resolution before preparing provider state. OpenGL
 accepts descriptor set zero and rejects other sets before provider mutation;
 its Provider path binds textures, samplers, UBOs, SSBOs, vertex buffers, and
-native uniforms exclusively from reflected records.
+native uniforms exclusively from reflected records. OpenGL native uniforms
+accept f32 scalar/vector/matrix values and i32/u32 scalar/vector values; the
+reflected dtype is preserved in the Provider layout so upload selects the
+matching `glUniform*` family.
 
 Numeric Tensor elementwise arithmetic follows NumPy trailing-dimension
 broadcasting while retaining Vernon's safe dtype-promotion rules and positive

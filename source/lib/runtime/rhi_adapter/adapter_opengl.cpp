@@ -36,6 +36,7 @@ struct PreparedPipeline {
         uint32_t binding{};
         uint32_t access{};
         uint32_t divisor{};
+        uint32_t numericType{};
         bool active{};
     };
     struct VertexAttribute {
@@ -68,8 +69,9 @@ struct PreparedBindingSet {
         uint32_t resourceStride{};
         uint32_t binding{};
         uint32_t stageMask{};
+        uint32_t numericType{};
         size_t byteSize{};
-        std::vector<float> storage;
+        std::vector<uint8_t> storage;
         rhi::opengl::Buffer inlineBuffer;
     };
     rhi::opengl::DeviceState *device{};
@@ -157,18 +159,22 @@ VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayout
         layout->entries.reserve(descriptor->binding_count);
         for (size_t index = 0; index < descriptor->binding_count; ++index) {
             const auto &source = descriptor->bindings[index];
+            const bool nativeNumericType = source.numeric_type == VERNON_RUNTIME_PROVIDER_F32 ||
+                                           source.numeric_type == VERNON_RUNTIME_PROVIDER_I32 ||
+                                           source.numeric_type == VERNON_RUNTIME_PROVIDER_U32;
+            const bool nativeUniformShape =
+                source.vector_count != 0 &&
+                ((source.vector_count == 1 && source.element_count >= 1 && source.element_count <= 4) ||
+                 (source.numeric_type == VERNON_RUNTIME_PROVIDER_F32 && source.vector_count >= 2 &&
+                  source.vector_count <= 4 && source.element_count % source.vector_count == 0 &&
+                  source.element_count / source.vector_count >= 2 && source.element_count / source.vector_count <= 4));
             const bool inlineValue =
                 source.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
                 ((source.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE && source.binding != UINT32_MAX &&
                   source.element_size != 0) ||
                  (source.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM && source.name.data &&
-                  source.name.size != 0 && source.vector_count != 0 &&
-                  ((source.vector_count == 1 && source.element_count >= 1 && source.element_count <= 4) ||
-                   (source.vector_count >= 2 && source.vector_count <= 4 &&
-                    source.element_count % source.vector_count == 0 &&
-                    source.element_count / source.vector_count >= 2 &&
-                    source.element_count / source.vector_count <= 4)) &&
-                  source.element_size == source.element_count * sizeof(float)));
+                  source.name.size != 0 && nativeNumericType && nativeUniformShape &&
+                  source.element_size == source.element_count * sizeof(uint32_t)));
             const bool storageBuffer = source.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
                                        (source.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE ||
                                         source.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_VERTEX ||
@@ -311,7 +317,7 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
                     : (entry.layout.element_count ? entry.layout.element_count : entry.layout.element_size / 4);
             pipeline->bindings.push_back({entry.layout.slot, entry.layout.kind, location, valueCount,
                                           entry.layout.vector_count, entry.layout.binding, entry.layout.access,
-                                          entry.layout.divisor, active});
+                                          entry.layout.divisor, entry.layout.numeric_type, active});
         }
         for (const VernonRuntimeProviderVertexAttribute &attribute : layout->vertexAttributes) {
             auto binding = std::find_if(layout->entries.begin(), layout->entries.end(), [&](const auto &entry) {
@@ -449,10 +455,11 @@ VernonStatus createBindings(void *data, const VernonRuntimeProviderBindingSetDes
             slot.columnCount = entry.layout.vector_count;
             slot.binding = entry.layout.binding;
             slot.stageMask = entry.layout.stage_mask;
+            slot.numericType = entry.layout.numeric_type;
             slot.byteSize = entry.layout.element_size;
             if (entry.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
                 entry.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
-                slot.storage.resize((entry.layout.element_size + sizeof(float) - 1) / sizeof(float));
+                slot.storage.resize(entry.layout.element_size);
                 if (entry.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
                     entry.layout.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE) {
                     if (!bindings->device->createBuffer(slot.inlineBuffer, entry.layout.element_size, adapter.error))
@@ -603,7 +610,7 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
         const auto &binding = pipeline->bindings[index];
         const auto &slot = bindings->slots[index];
         if (slot.slot != binding.slot || slot.kind != binding.kind || slot.valueCount != binding.valueCount ||
-            slot.columnCount != binding.columnCount)
+            slot.columnCount != binding.columnCount || slot.numericType != binding.numericType)
             return fail(adapter, "OpenGL draw binding order does not match its pipeline");
         if (!binding.active)
             continue;
@@ -625,41 +632,65 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
         } else if (binding.kind == VERNON_RUNTIME_PROVIDER_SAMPLER) {
             driver.bindSampler(binding.binding, static_cast<rhi::opengl::Uint>(slot.resource));
         } else if (binding.columnCount <= 1) {
-            const float *value = slot.storage.data();
-            if (binding.valueCount == 1)
-                driver.uniform1fv(binding.location, 1, value);
-            else if (binding.valueCount == 2)
-                driver.uniform2fv(binding.location, 1, value);
-            else if (binding.valueCount == 3)
-                driver.uniform3fv(binding.location, 1, value);
-            else if (binding.valueCount == 4)
-                driver.uniform4fv(binding.location, 1, value);
-            else
-                driver.uniform4fv(binding.location, 1, value);
+            if (binding.numericType == VERNON_RUNTIME_PROVIDER_I32) {
+                std::array<rhi::opengl::Int, 4> value{};
+                std::memcpy(value.data(), slot.storage.data(), binding.valueCount * sizeof(value[0]));
+                if (binding.valueCount == 1)
+                    driver.uniform1iv(binding.location, 1, value.data());
+                else if (binding.valueCount == 2)
+                    driver.uniform2iv(binding.location, 1, value.data());
+                else if (binding.valueCount == 3)
+                    driver.uniform3iv(binding.location, 1, value.data());
+                else
+                    driver.uniform4iv(binding.location, 1, value.data());
+            } else if (binding.numericType == VERNON_RUNTIME_PROVIDER_U32) {
+                std::array<rhi::opengl::Uint, 4> value{};
+                std::memcpy(value.data(), slot.storage.data(), binding.valueCount * sizeof(value[0]));
+                if (binding.valueCount == 1)
+                    driver.uniform1uiv(binding.location, 1, value.data());
+                else if (binding.valueCount == 2)
+                    driver.uniform2uiv(binding.location, 1, value.data());
+                else if (binding.valueCount == 3)
+                    driver.uniform3uiv(binding.location, 1, value.data());
+                else
+                    driver.uniform4uiv(binding.location, 1, value.data());
+            } else {
+                std::array<float, 4> value{};
+                std::memcpy(value.data(), slot.storage.data(), binding.valueCount * sizeof(value[0]));
+                if (binding.valueCount == 1)
+                    driver.uniform1fv(binding.location, 1, value.data());
+                else if (binding.valueCount == 2)
+                    driver.uniform2fv(binding.location, 1, value.data());
+                else if (binding.valueCount == 3)
+                    driver.uniform3fv(binding.location, 1, value.data());
+                else
+                    driver.uniform4fv(binding.location, 1, value.data());
+            }
         } else {
-            const float *value = slot.storage.data();
+            std::array<float, 16> value{};
+            std::memcpy(value.data(), slot.storage.data(), binding.valueCount * sizeof(value[0]));
             const auto transpose =
                 static_cast<rhi::opengl::Boolean>((slot.flags & VERNON_RUNTIME_PROVIDER_BINDING_TRANSPOSE) != 0);
             const uint32_t columns = binding.columnCount;
             const uint32_t rows = binding.valueCount / columns;
             if (columns == 2 && rows == 2)
-                driver.uniformMatrix2fv(binding.location, 1, transpose, value);
+                driver.uniformMatrix2fv(binding.location, 1, transpose, value.data());
             else if (columns == 2 && rows == 3)
-                driver.uniformMatrix2x3fv(binding.location, 1, transpose, value);
+                driver.uniformMatrix2x3fv(binding.location, 1, transpose, value.data());
             else if (columns == 2 && rows == 4)
-                driver.uniformMatrix2x4fv(binding.location, 1, transpose, value);
+                driver.uniformMatrix2x4fv(binding.location, 1, transpose, value.data());
             else if (columns == 3 && rows == 2)
-                driver.uniformMatrix3x2fv(binding.location, 1, transpose, value);
+                driver.uniformMatrix3x2fv(binding.location, 1, transpose, value.data());
             else if (columns == 3 && rows == 3)
-                driver.uniformMatrix3fv(binding.location, 1, transpose, value);
+                driver.uniformMatrix3fv(binding.location, 1, transpose, value.data());
             else if (columns == 3 && rows == 4)
-                driver.uniformMatrix3x4fv(binding.location, 1, transpose, value);
+                driver.uniformMatrix3x4fv(binding.location, 1, transpose, value.data());
             else if (columns == 4 && rows == 2)
-                driver.uniformMatrix4x2fv(binding.location, 1, transpose, value);
+                driver.uniformMatrix4x2fv(binding.location, 1, transpose, value.data());
             else if (columns == 4 && rows == 3)
-                driver.uniformMatrix4x3fv(binding.location, 1, transpose, value);
+                driver.uniformMatrix4x3fv(binding.location, 1, transpose, value.data());
             else
-                driver.uniformMatrix4fv(binding.location, 1, transpose, value);
+                driver.uniformMatrix4fv(binding.location, 1, transpose, value.data());
         }
     }
     for (const PreparedPipeline::VertexAttribute &attribute : pipeline->vertexAttributes) {

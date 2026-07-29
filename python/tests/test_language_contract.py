@@ -482,12 +482,58 @@ class LanguageVersionTests(unittest.TestCase):
         resource_statement = resource_result.typed_functions[0].body[0]
         self.assertEqual(value_statement.effects, ())
         self.assertEqual(value_statement.effect, Effect.PURE)
-        self.assertEqual(resource_statement.effects, (ResourceEffect("texture_sample", "image"),))
+        self.assertEqual(
+            resource_statement.effects,
+            (ResourceEffect("texture_sample", "image", frozenset({"fragment"})),),
+        )
         self.assertEqual(resource_statement.effect, Effect.READ)
         self.assertEqual(
             typed_effect_data(resource_statement.effects[0]),
-            {"kind": "resource_read", "operation": "texture_sample", "owner": "image"},
+            {
+                "kind": "resource_read",
+                "operation": "texture_sample",
+                "owner": "image",
+                "stages": ["fragment"],
+                "has_lod": False,
+            },
         )
+
+    def test_resource_reads_are_allowed_and_propagated_through_helpers(self) -> None:
+        source = (
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def sample(image: Texture['2d', f32], sampler: Sampler, uv: Vector[f32, 2]) "
+            "-> Vector[f32, 4]:\n"
+            "    return texture_sample(image, sampler, uv)\n"
+            "@fragment\n"
+            "def main(image: Texture['2d', f32], sampler: Sampler, uv: Vector[f32, 2]) "
+            "-> Vector[f32, 4]:\n"
+            "    return sample(image, sampler, uv)\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "resource_helper.py"
+            path.write_text(source, encoding="utf-8")
+            result = Compiler().compile_request(FrontendCompileRequest(path, "main"))
+
+        helper = next(function for function in result.typed_functions if function.qualified_name == "sample")
+        entry = next(function for function in result.typed_functions if function.symbol == "main")
+        effect = ResourceEffect("texture_sample", "image", frozenset({"fragment"}))
+        self.assertEqual(helper.effects, (effect,))
+        self.assertEqual(entry.effects, (effect,))
+        self.assertIn('name = "texture_sample"', result.mlir)
+        self.assertIn("func.call @sample(", result.mlir)
+
+        with self.assertRaisesRegex(CompileError, "texture_sample.*fragment shaders"):
+            compile_source(
+                source.replace("@fragment", "@vertex"),
+                "vertex_resource_helper.py",
+            )
+
+        with self.assertRaisesRegex(CompileError, r"resolution\(\) is available only in fragment shaders"):
+            compile_source(
+                "from vernon_dsl import *\n@func\ndef helper() -> Vector[f32, 2]:\n    return resolution()\n",
+                "generated_interface_helper.py",
+            )
 
     def test_atomic_and_barrier_effect_records_are_deterministic(self) -> None:
         function_source = ast.parse("@kernel\ndef main() -> None:\n    pass\n").body[0]
@@ -874,6 +920,29 @@ class LanguageVersionTests(unittest.TestCase):
                 "numeric_short_circuit.py",
             )
 
+    def test_unary_not_is_typed_in_statement_control_flow(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def negate(flag: bool) -> bool:\n"
+            "    result = False\n"
+            "    if not flag:\n"
+            "        result = True\n"
+            "    while not result:\n"
+            "        result = True\n"
+            "    return result\n",
+            "unary_not.py",
+        )
+        self.assertEqual(output.count("arith.xori"), 2)
+
+        with self.assertRaisesRegex(CompileError, "not operand must be a bool Value"):
+            compile_source(
+                "from vernon_dsl import *\n@func\ndef bad(value: f32) -> bool:\n"
+                "    if not value:\n        return True\n"
+                "    return False\n",
+                "numeric_not.py",
+            )
+
     def test_nested_return_uses_structured_payload_state(self) -> None:
         output = compile_source(
             "from vernon_dsl import *\n@func\ndef stop(a: bool) -> f32:\n"
@@ -1000,6 +1069,20 @@ class LanguageVersionTests(unittest.TestCase):
         self.assertIn("cf.assert", output)
         self.assertIn("scf.while", output)
         self.assertNotIn("scf.for", output)
+
+        float_output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def total() -> f32:\n"
+            "    result = 0.0\n"
+            "    for index in range(4):\n"
+            "        result += f32(index)\n"
+            "    return result\n",
+            "float_range.py",
+        )
+        self.assertIn("arith.index_cast", float_output)
+        self.assertIn("arith.sitofp", float_output)
+        self.assertNotIn("index to f32", float_output)
 
         with self.assertRaisesRegex(CompileError, "range step must not be zero"):
             compile_source(
@@ -1487,6 +1570,24 @@ class NumericInferenceTests(unittest.TestCase):
         )
         self.assertEqual(output.count('name = "pow"'), 2)
         self.assertNotIn("arith.truncf", output)
+
+    def test_inverse_trigonometry_and_floor_lower_to_math_dialect(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@fragment\n"
+            "def main(y: f32, x: f32) -> f32:\n"
+            "    return acos(clamp(x, -1.0, 1.0)) + atan2(y, x) + floor(y)\n",
+            "showcase_math.py",
+        )
+        self.assertIn("math.acos", output)
+        self.assertIn("math.atan2", output)
+        self.assertIn("math.floor", output)
+
+        with self.assertRaisesRegex(CompileError, "atan2 requires two floating-point arguments"):
+            compile_source(
+                "from vernon_dsl import *\n@fragment\ndef main(value: f32) -> f32:\n    return atan2(value)\n",
+                "bad_atan2.py",
+            )
 
     def test_branch_and_loop_carried_values_widen_safely(self) -> None:
         output = compile_source(

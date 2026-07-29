@@ -298,9 +298,12 @@ Read/write effects include projected regions where statically known, and an
 atomic read-modify-write also marks its owner writable for runtime
 synchronization. Unknown overlap is conservatively aliasing.
 
-Pure `@func` code consumes and produces Values and has no Storage or Resource
-effects. Kernels and graphics entries may perform effects allowed by their
-stage and parameter access modes. Host runtime allocation, uploads, dispatch,
+Ordinary `@func` code has no Storage, atomic, or barrier effects. It may read
+Resources passed explicitly as parameters; those effects propagate through the
+call graph and are checked against the concrete entry stage. Shared
+`@func(shared=True)` code remains host/device-pure and cannot use device-only
+Resource operations. Kernels and graphics entries may perform effects allowed
+by their stage and parameter access modes. Host runtime allocation, uploads, dispatch,
 downloads, and resource lifetime are not parsed device-language expressions.
 Multi-program ordering, render-pass state, resource transitions, and
 cross-backend synchronization are Runtime host-orchestration semantics,
@@ -393,6 +396,11 @@ nested structured region; break and continue target the nearest enclosing loop.
 The expression subset includes names, numeric and Boolean literals, arithmetic,
 unary operations, one comparison, calls, supported attributes, indexing,
 Tensor/Tuple/Struct construction, and constant Tuple indexing.
+
+The portable floating-point math surface includes `sin`, `cos`, `acos`,
+`atan2`, `exp`, `log`, `sqrt`, `floor`, `abs`, `min`, `max`, `pow`, and
+`clamp`, plus vector `dot`, `cross`, `norm`, `normalize`, and `reflect`.
+`atan2(y, x)` follows the conventional quadrant-aware argument order.
 
 Tuple destructuring, short-circuit `and`/`or`, conditional expressions,
 dynamic `range`, `break`, `continue`, and nested/early return are implemented

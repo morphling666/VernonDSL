@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
@@ -267,21 +268,48 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                 break;
             }
             const ParameterUse &use = parameter.uses[0];
-            if (parameter.source != "implicit_sampler" || parameter.kind != "sampler" ||
-                use.sampledTextureBindings.size() != 1 || use.sampledTextureBindings[0].descriptorSet != 0) {
-                supported = false;
-                break;
-            }
             GraphicsCandidate candidate;
             candidate.layout.slot = ++internalSlot;
             candidate.layout.argument_index = use.index;
             candidate.layout.stage_mask =
                 use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
             candidate.layout.array_count = 1;
-            candidate.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLER;
-            candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
-            candidate.layout.binding = use.sampledTextureBindings[0].binding;
-            candidate.binding.source = DirectX12PipelineState::GraphicsBinding::IMPLICIT_SAMPLER;
+            if (parameter.source == "implicit_sampler" && parameter.kind == "sampler" &&
+                use.sampledTextureBindings.size() == 1 && use.sampledTextureBindings[0].descriptorSet == 0) {
+                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLER;
+                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
+                candidate.layout.binding = use.sampledTextureBindings[0].binding;
+                candidate.binding.source = DirectX12PipelineState::GraphicsBinding::IMPLICIT_SAMPLER;
+            } else if (parameter.source == "system_value" && parameter.systemValue == "resolution" &&
+                       parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.physicalValueLayout) {
+                const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
+                const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
+                const uint64_t physicalSize = use.physicalValueLayout->size;
+                const uint64_t physicalAlignment = use.physicalValueLayout->alignment;
+                if (shape != std::vector<uint64_t>{2} || dtype != VERNON_DATA_F32 ||
+                    physicalSize != sizeof(float) * 2 || !physicalAlignment || physicalAlignment > UINT32_MAX ||
+                    (use.physicalValueLayout->transport != "push_constant" &&
+                     use.physicalValueLayout->transport != "uniform_buffer") ||
+                    (use.physicalValueLayout->transport == "uniform_buffer" && use.binding == UINT32_MAX)) {
+                    supported = false;
+                    break;
+                }
+                candidate.layout.kind = use.physicalValueLayout->transport == "uniform_buffer"
+                                            ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
+                                            : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                candidate.layout.element_size = static_cast<uint32_t>(physicalSize);
+                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
+                candidate.layout.element_count = 2;
+                candidate.layout.vector_count = 1;
+                candidate.layout.element_alignment = static_cast<uint32_t>(physicalAlignment);
+                candidate.layout.binding = use.binding;
+                candidate.layout.set = use.descriptorSet;
+                candidate.binding.source = DirectX12PipelineState::GraphicsBinding::RESOLUTION;
+                candidate.binding.storage.resize(candidate.layout.element_size);
+            } else {
+                supported = false;
+                break;
+            }
             candidates.push_back(candidate);
         }
         if (!supported) {
@@ -417,7 +445,7 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
                 !found->second->resource.resource.value)
                 return fail(*pipeline.context, "D3D12 RHI sampler argument is missing");
             value.resource = found->second->resource;
-        } else {
+        } else if (prepared.source == DirectX12PipelineState::GraphicsBinding::IMPLICIT_SAMPLER) {
             const auto sampled = plan.sampledResources.find({layout.set, layout.binding});
             if (sampled == plan.sampledResources.end())
                 return fail(*pipeline.context, "D3D12 RHI implicit sampler binding is missing");
@@ -426,6 +454,13 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
             } else {
                 value.flags = VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE;
             }
+        } else if (prepared.source == DirectX12PipelineState::GraphicsBinding::RESOLUTION) {
+            std::memcpy(prepared.storage.data(), plan.resolution.data(),
+                        std::min(prepared.storage.size(), sizeof(plan.resolution)));
+            value.inline_data = prepared.storage.data();
+            value.inline_size = prepared.storage.size();
+        } else {
+            return fail(*pipeline.context, "D3D12 RHI graphics binding source is invalid");
         }
     }
     VernonStatus status =

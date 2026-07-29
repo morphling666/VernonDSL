@@ -406,7 +406,7 @@ class _FunctionEmitter:
             self.generated_values[api] = value
             attributes = [
                 f'vernon.interface = "{contract.interface}"',
-                f'vernon.source_name = "__vernon_{api}"',
+                f'vernon.source_name = "_vernon_{api}"',
                 f'vernon.implicit = "{api}"',
             ]
             if contract.builtin is not None:
@@ -794,9 +794,11 @@ class _FunctionEmitter:
                 raise self.context.error(node, f"{name} requires one scalar argument")
             return self._cast(node, arguments[0], scalar_casts[name])
         math_operations = {
+            "acos": "math.acos",
             "sin": "math.sin",
             "cos": "math.cos",
             "exp": "math.exp",
+            "floor": "math.floor",
             "log": "math.log",
             "sqrt": "math.sqrt",
             "abs": "math.absf",
@@ -807,6 +809,19 @@ class _FunctionEmitter:
             result = self._fresh()
             self._line(f"{result} = {math_operations[name]} {arguments[0].name} : {arguments[0].type.mlir}")
             return Value(result, typed_call.type)
+        if name == "atan2":
+            if len(arguments) != 2:
+                raise self.context.error(node, "atan2 requires two floating-point arguments")
+            result_type = self._typed_expression(node).type
+            arguments = [
+                self._coerce_numeric(source, argument, result_type)
+                for source, argument in zip(node.args, arguments, strict=True)
+            ]
+            if not result_type.is_float:
+                raise self.context.error(node, "atan2 requires two floating-point arguments")
+            result = self._fresh()
+            self._line(f"{result} = math.atan2 {arguments[0].name}, {arguments[1].name} : {result_type.mlir}")
+            return Value(result, result_type)
         if name in {
             "resolution",
             "fragment_coord",
@@ -938,7 +953,14 @@ class _FunctionEmitter:
             return value
         source_scalar = element_type(value.type)
         target_scalar = element_type(target)
-        if value.type.kind == "index":
+        if value.type.kind == "index" and target_scalar.is_float:
+            integer = DslType("scalar", "i32")
+            intermediate = self._fresh()
+            self._line(f"{intermediate} = arith.index_cast {value.name} : {value.type.mlir} to {integer.mlir}")
+            value = Value(intermediate, integer)
+            source_scalar = integer
+            operation = "arith.sitofp"
+        elif value.type.kind == "index":
             operation = "arith.index_cast"
         elif source_scalar.is_integer and target_scalar.is_float:
             # Both i32 and u32 operands are signless i32 in MLIR; the selected

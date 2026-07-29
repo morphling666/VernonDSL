@@ -20,6 +20,14 @@ def cos(value: Any) -> Any:
     return np.cos(value)
 
 
+def acos(value: Any) -> Any:
+    return np.arccos(value)
+
+
+def atan2(y: Any, x: Any) -> Any:
+    return np.arctan2(y, x)
+
+
 def exp(value: Any) -> Any:
     return np.exp(value)
 
@@ -30,6 +38,10 @@ def log(value: Any) -> Any:
 
 def sqrt(value: Any) -> Any:
     return np.sqrt(value)
+
+
+def floor(value: Any) -> Any:
+    return np.floor(value)
 
 
 def abs(value: Any) -> Any:

@@ -160,12 +160,14 @@ isolates the owned MLIR compiler/artifact path from Python frontend time. Run
 the same kernel scenario with `--arch cuda`, `vulkan`, `opengl`,
 `opengles`, or `directx` on an available device. It reports cold
 compile-and-dispatch, warm dispatch, and upload/dispatch/readback separately.
-The multi-pass GPU baseline uses a fixed headless ocean workload:
+The visual GPU baseline can measure either official showcase:
 
 ```powershell
 uv sync --extra build --extra examples --frozen
 uv run --frozen --no-sync python scripts/benchmark_baseline.py showcase `
-  --arch vulkan --frames 60 --grid 64 --size 256
+  --showcase aurora --arch vulkan --frames 60 --size 256
+uv run --frozen --no-sync python scripts/benchmark_baseline.py showcase `
+  --showcase mandelbulb --arch vulkan --frames 60 --size 256
 ```
 
 Showcase time includes startup and compilation by design. Use an external GPU
@@ -305,27 +307,30 @@ uv run python examples/advanced_pipeline.py --arch vulkan --frames 2 --headless 
   --id-output build/advanced-object-id.png
 ```
 
-Run the compute-driven showcase demos. Both record simulation, dynamic mesh
-generation, shadow rendering, and the PBR main pass into one `ExecutionGraph`,
-so buffer and depth-image barriers are inferred automatically:
+Run the two full-screen visual showcases. Aurora uses a generated curtain field
+followed by a texture-sampling blur/dither pass; Mandelbulb ray marches a
+distance estimator with soft shadows, ambient occlusion, fog, and orbit-trap
+coloring. Both use deterministic presets and emit a machine-readable summary:
 
 ```powershell
 uv sync --extra examples
 
-# Conservative hydraulic erosion, triplanar rock, wet runoff, and sunset PBR.
-uv run python examples/dynamic_terrain_erosion.py --arch vulkan --frames 180 `
-  --grid 224 --extent 13 --output build/dynamic-terrain-erosion.png
+# Two-pass procedural northern lights.
+uv run python examples/aurora_showcase.py --arch vulkan --preset showoff `
+  --headless --output build/aurora.png --result-json build/aurora.json
 
-# Ping-pong finite-difference waves and compute-generated PBR mesh data.
-uv run python examples/dynamic_ocean.py --arch vulkan --frames 180 `
-  --grid 192 --extent 14 --output build/dynamic-ocean.png
+# Ray-marched animated 3D fractal.
+uv run python examples/mandelbulb_showcase.py --arch vulkan --preset showoff `
+  --headless --output build/mandelbulb.png --result-json build/mandelbulb.json
 ```
 
-Use `--headless` for automated screenshots. `--arch directx` and
-`--arch opengl` exercise the same graph on their available Windows backends.
-The simulations use one writer per vertex/cell and do not require atomics or
-workgroup barriers. The erosion demo reconstructs neighboring runoff from the
-previous state before rebuilding terrain normals and material channels.
+Use `--preset smoke` for a fast backend check. Omit `--headless` for the OpenCV
+window, and use `--arch directx` or `--arch opengl` on supported Windows
+systems. The effects are adapted from the MIT-licensed
+[coaurora](https://github.com/jagajaga/coaurora) and
+[WebGL-Mandelbulb](https://github.com/matt-k-wong/WebGL-Mandelbulb) projects;
+the source modules retain their notices. The former Dynamic Ocean and Terrain
+Erosion showcases remain available as advanced compute/PBR examples.
 
 The end-to-end example invokes separate compute and graphics programs while
 sharing three feature variants, indexed instancing, named MRT outputs, and

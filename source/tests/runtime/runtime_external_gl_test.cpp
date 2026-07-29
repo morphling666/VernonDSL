@@ -166,6 +166,8 @@ std::vector<GlUint> deletedSamplers;
 std::vector<GlEnum> shaderKinds;
 std::vector<unsigned char> bufferStorage;
 std::vector<unsigned char> textureStorage;
+std::array<GlInt, 4> signedUniformUpload{};
+std::array<GlUint, 4> unsignedUniformUpload{};
 
 void makeCurrent(void *) { ++makeCurrentCount; }
 void GL_CALL placeholder() {}
@@ -273,6 +275,14 @@ void GL_CALL uniformMatrix4fv(GlInt, GlSize, GlBoolean transpose, const float *d
 void GL_CALL uniform2fv(GlInt, GlSize, const float *data) {
     std::copy_n(data, resolutionUpload.size(), resolutionUpload.begin());
 }
+void GL_CALL uniform1iv(GlInt, GlSize, const GlInt *data) { signedUniformUpload[0] = data[0]; }
+void GL_CALL uniform2iv(GlInt, GlSize, const GlInt *data) { std::copy_n(data, 2, signedUniformUpload.begin()); }
+void GL_CALL uniform3iv(GlInt, GlSize, const GlInt *data) { std::copy_n(data, 3, signedUniformUpload.begin()); }
+void GL_CALL uniform4iv(GlInt, GlSize, const GlInt *data) { std::copy_n(data, 4, signedUniformUpload.begin()); }
+void GL_CALL uniform1uiv(GlInt, GlSize, const GlUint *data) { unsignedUniformUpload[0] = data[0]; }
+void GL_CALL uniform2uiv(GlInt, GlSize, const GlUint *data) { std::copy_n(data, 2, unsignedUniformUpload.begin()); }
+void GL_CALL uniform3uiv(GlInt, GlSize, const GlUint *data) { std::copy_n(data, 3, unsignedUniformUpload.begin()); }
+void GL_CALL uniform4uiv(GlInt, GlSize, const GlUint *data) { std::copy_n(data, 4, unsignedUniformUpload.begin()); }
 void GL_CALL bindSampler(GlUint unit, GlUint sampler) {
     boundSamplerUnit = unit;
     boundSamplerName = sampler;
@@ -323,6 +333,14 @@ void *getProcAddress(void *, const char *name) {
     PROC("glInvalidateFramebuffer", invalidateFramebuffer);
     PROC("glGetUniformLocation", getUniformLocation);
     PROC("glUniform2fv", uniform2fv);
+    PROC("glUniform1iv", uniform1iv);
+    PROC("glUniform2iv", uniform2iv);
+    PROC("glUniform3iv", uniform3iv);
+    PROC("glUniform4iv", uniform4iv);
+    PROC("glUniform1uiv", uniform1uiv);
+    PROC("glUniform2uiv", uniform2uiv);
+    PROC("glUniform3uiv", uniform3uiv);
+    PROC("glUniform4uiv", uniform4uiv);
     PROC("glUniformMatrix4fv", uniformMatrix4fv);
     PROC("glBindSampler", bindSampler);
     PROC("glViewport", viewport);
@@ -441,6 +459,41 @@ std::string matrixBundle(const char *target) {
                                            {"dtype", "f32"},
                                            {"shape", nlohmann::json::array({4, 4})},
                                            {"physical_value_layout", physicalValueLayout(64, 16, {4, 16})}}})}}});
+    root.erase("content_hash");
+    const std::string canonical = root.dump(-1, ' ', false);
+    root["content_hash"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
+    return root.dump(-1, ' ', false);
+}
+
+std::string integerUniformBundle(const char *dtype, uint32_t components) {
+    const std::string scalarType = std::strcmp(dtype, "u32") == 0 ? "uint" : "int";
+    const std::string uniformType =
+        components == 1 ? scalarType : (std::strcmp(dtype, "u32") == 0 ? "uvec" : "ivec") + std::to_string(components);
+    const std::string value = components == 1 ? "budget" : "budget.x";
+    const std::string source =
+        "#version 330\nuniform " + uniformType + " budget;void main(){gl_Position=vec4(float(" + value + "));}";
+    nlohmann::json root = nlohmann::json::parse(pipelineBundle(inlineArtifact(source)));
+    const std::string shapeType =
+        components == 1 ? dtype : std::string("tensor<") + std::to_string(components) + "x" + dtype + ">";
+    const nlohmann::json shape = components == 1 ? nlohmann::json::array() : nlohmann::json::array({components});
+    root["variants"][0]["parameters"] = nlohmann::json::array(
+        {{{"slot", 0},
+          {"name", "budget"},
+          {"kind", "tensor"},
+          {"type", shapeType},
+          {"element_layout", scalarElementLayout(dtype)},
+          {"access", "read"},
+          {"shape", shape},
+          {"uses",
+           nlohmann::json::array({{{"stage", "vertex"},
+                                   {"interface", "uniform"},
+                                   {"uniform_name", "budget"},
+                                   {"dtype", dtype},
+                                   {"shape", shape},
+                                   {"physical_value_layout",
+                                    physicalValueLayout(components * sizeof(uint32_t), sizeof(uint32_t),
+                                                        components == 1 ? std::initializer_list<uint64_t>{}
+                                                                        : std::initializer_list<uint64_t>{4})}}})}}});
     root.erase("content_hash");
     const std::string canonical = root.dump(-1, ' ', false);
     root["content_hash"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
@@ -600,6 +653,51 @@ void expectMatrixUpload(VernonRuntimeBackend backend, const char *target, uint16
     ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
 }
 
+void expectIntegerUniformUpload(const char *dtype, VernonDataType dataType, const void *data, uint32_t components) {
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    ASSERT_TRUE(gl);
+    const std::string bundleData = integerUniformBundle(dtype, components);
+    VernonPipelineBundle *bundle =
+        vernonRuntimeLoadPipelineBundleWithOptions(gl, bundleData.data(), bundleData.size(), nullptr);
+    ASSERT_TRUE(bundle) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+    RhiImage renderTarget = importOpenGLTexture2D(gl, 7, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
+    ASSERT_NE(renderTarget.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+
+    const uint64_t shape = components;
+    const int64_t stride = sizeof(uint32_t);
+    VernonPipelineArgument argument{};
+    argument.slot = 0;
+    argument.kind = VERNON_PIPELINE_TENSOR;
+    argument.tensor.struct_size = sizeof(VernonTensorView);
+    argument.tensor.storage = VERNON_TENSOR_HOST;
+    argument.tensor.host_data = data;
+    argument.tensor.element_layout = vernonRuntimeGetScalarValueLayout(dataType);
+    argument.tensor.access = VERNON_ACCESS_READ;
+    argument.tensor.rank = components == 1 ? 0 : 1;
+    argument.tensor.shape = components == 1 ? nullptr : &shape;
+    argument.tensor.byte_strides = components == 1 ? nullptr : &stride;
+    argument.tensor.byte_size = components * sizeof(uint32_t);
+    VernonColorAttachment attachment{0, renderTarget.reference, 16, 16, VERNON_TEXTURE_RGBA8_UNORM};
+    VernonPipelineInvocation invocation{};
+    invocation.struct_size = sizeof(invocation);
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.arguments = &argument;
+    invocation.argument_count = 1;
+    invocation.color_attachments = &attachment;
+    invocation.color_attachment_count = 1;
+    invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
+    invocation.vertex_count = 3;
+    invocation.instance_count = 1;
+    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK);
+
+    ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, renderTarget.handle), VERNON_RHI_STATUS_OK);
+    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    vernonRuntimePipelineBundleDestroy(bundle);
+    ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+
 nlohmann::json inlineArtifact(const std::string &source) {
     return {{"format", "glsl"},      {"storage", "inline"},
             {"encoding", "utf8"},    {"data", source},
@@ -733,6 +831,103 @@ TEST(RuntimeExternalGl, UploadsColumnMajorMatricesWithoutCopying) {
     };
     expectMatrixUpload(VERNON_RUNTIME_OPENGL, "opengl", 4, 3, columnMajor, strides, 0, columnMajor);
 }
+
+TEST(RuntimeExternalGl, UploadsSignedAndUnsignedIntegerUniforms) {
+    signedUniformUpload.fill(0);
+    unsignedUniformUpload.fill(0);
+    constexpr GlInt signedValue = -17;
+    expectIntegerUniformUpload("i32", VERNON_DATA_I32, &signedValue, 1);
+    EXPECT_EQ(signedUniformUpload[0], signedValue);
+
+    constexpr std::array<GlUint, 3> unsignedValue = {3, 5, 8};
+    expectIntegerUniformUpload("u32", VERNON_DATA_U32, unsignedValue.data(), unsignedValue.size());
+    EXPECT_EQ(unsignedUniformUpload[0], unsignedValue[0]);
+    EXPECT_EQ(unsignedUniformUpload[1], unsignedValue[1]);
+    EXPECT_EQ(unsignedUniformUpload[2], unsignedValue[2]);
+}
+
+#if defined(VERNON_OPENGL_RUNTIME_ACCEPTANCE_BUNDLE)
+TEST(RuntimeExternalGl, InvokesGeneratedResolutionAndSignedUniformPipeline) {
+    const std::filesystem::path manifestPath = VERNON_OPENGL_RUNTIME_ACCEPTANCE_BUNDLE;
+    std::ifstream manifestInput(manifestPath, std::ios::binary);
+    const std::string bundleData((std::istreambuf_iterator<char>(manifestInput)), std::istreambuf_iterator<char>());
+    ASSERT_FALSE(bundleData.empty());
+    const nlohmann::json manifest = nlohmann::json::parse(bundleData);
+    const std::string fragmentId = manifest["variants"][0]["program"]["fragment"];
+    const std::filesystem::path fragmentPath =
+        manifestPath.parent_path() / manifest["stage_artifacts"][fragmentId]["artifact"]["path"].get<std::string>();
+    std::ifstream fragmentInput(fragmentPath, std::ios::binary);
+    const std::string fragmentSource((std::istreambuf_iterator<char>(fragmentInput)), std::istreambuf_iterator<char>());
+    EXPECT_NE(fragmentSource.find("uniform int max_steps;"), std::string::npos);
+    EXPECT_NE(fragmentSource.find("uniform vec2 _vernon_resolution;"), std::string::npos);
+
+    resolutionUpload.fill(0.0F);
+    signedUniformUpload.fill(0);
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    ASSERT_TRUE(gl);
+    const std::string directory = manifestPath.parent_path().u8string();
+    VernonPipelineBundleLoadOptions options{};
+    options.struct_size = sizeof(options);
+    options.bundle_directory = directory.c_str();
+    VernonPipelineBundle *bundle =
+        vernonRuntimeLoadPipelineBundleWithOptions(gl, bundleData.data(), bundleData.size(), &options);
+    ASSERT_TRUE(bundle) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+
+    constexpr std::array<float, 6> positions{-1.0F, -1.0F, 3.0F, -1.0F, -1.0F, 3.0F};
+    auto vertices = vernon::tests::createBuffer(rhiRuntime(gl), sizeof(positions), alignof(float),
+                                                VERNON_RHI_BUFFER_VERTEX, positions.data());
+    ASSERT_NE(vertices.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    RhiImage renderTarget = importOpenGLTexture2D(gl, 7, 37, 23, VERNON_TEXTURE_RGBA8_UNORM);
+    ASSERT_NE(renderTarget.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+
+    constexpr GlInt maxSteps = 19;
+    constexpr std::array<uint64_t, 2> positionShape{3, 2};
+    constexpr std::array<int64_t, 2> positionStrides{2 * sizeof(float), sizeof(float)};
+    std::array<VernonPipelineArgument, 2> arguments{};
+    arguments[0].slot = 0;
+    arguments[0].kind = VERNON_PIPELINE_TENSOR;
+    arguments[0].tensor.struct_size = sizeof(VernonTensorView);
+    arguments[0].tensor.storage = VERNON_TENSOR_HOST;
+    arguments[0].tensor.host_data = &maxSteps;
+    arguments[0].tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_I32);
+    arguments[0].tensor.access = VERNON_ACCESS_READ;
+    arguments[0].tensor.byte_size = sizeof(maxSteps);
+    arguments[1].slot = 1;
+    arguments[1].kind = VERNON_PIPELINE_TENSOR;
+    arguments[1].tensor.struct_size = sizeof(VernonTensorView);
+    arguments[1].tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    arguments[1].tensor.resource = vertices.reference;
+    arguments[1].tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
+    arguments[1].tensor.access = VERNON_ACCESS_READ;
+    arguments[1].tensor.rank = positionShape.size();
+    arguments[1].tensor.shape = positionShape.data();
+    arguments[1].tensor.byte_strides = positionStrides.data();
+    arguments[1].tensor.byte_size = sizeof(positions);
+    VernonColorAttachment attachment{0, renderTarget.reference, 37, 23, VERNON_TEXTURE_RGBA8_UNORM};
+    VernonPipelineInvocation invocation{};
+    invocation.struct_size = sizeof(invocation);
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.arguments = arguments.data();
+    invocation.argument_count = arguments.size();
+    invocation.color_attachments = &attachment;
+    invocation.color_attachment_count = 1;
+    invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
+    invocation.vertex_count = 3;
+    invocation.instance_count = 1;
+    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
+        << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+    EXPECT_EQ(resolutionUpload, (std::array<float, 2>{37.0F, 23.0F}));
+    EXPECT_EQ(signedUniformUpload[0], maxSteps);
+
+    ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, renderTarget.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyBuffer(rhiRuntime(gl).device, vertices.handle), VERNON_RHI_STATUS_OK);
+    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    vernonRuntimePipelineBundleDestroy(bundle);
+    ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+#endif
 
 TEST(RuntimeExternalGl, PacksRowMajorMatricesWithCanonicalStrides) {
     constexpr std::array<int64_t, 2> strides = {4 * sizeof(float), sizeof(float)};

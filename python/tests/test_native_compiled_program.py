@@ -208,6 +208,41 @@ class CompiledProgramTests(unittest.TestCase):
                 program = native.Compiler().compile_program_result(module, target, **options)
                 self.assertTrue(program.ok, program.diagnostics)
 
+    def test_spirv_struct_carried_structured_loop_compiles(self) -> None:
+        module = compile_source(
+            "from vernon_dsl import *\n"
+            "@struct\n"
+            "class State:\n"
+            "    value: f32\n"
+            "    active: bool\n"
+            "@fragment\n"
+            "def main() -> f32:\n"
+            "    state = State(0.0, True)\n"
+            "    for index in range(4):\n"
+            "        state = State(state.value + f32(index), not state.active)\n"
+            "    return state.value\n",
+            "graphics_struct_loop.py",
+        )
+        program = native.Compiler().compile_program_result(module, native.Target.VULKAN)
+        self.assertTrue(program.ok, program.diagnostics)
+
+    def test_showcase_math_compiles_for_graphics_backends(self) -> None:
+        module = compile_source(
+            "from vernon_dsl import *\n"
+            "@fragment\n"
+            "def main(y: f32, x: f32) -> f32:\n"
+            "    return floor(y) + acos(clamp(x, -1.0, 1.0)) + atan2(y, x)\n",
+            "showcase_math_backends.py",
+        )
+        for target, options in (
+            (native.Target.VULKAN, {}),
+            (native.Target.DIRECTX, {}),
+            (native.Target.OPENGL, {"glsl_version": 430}),
+        ):
+            with self.subTest(target=target):
+                program = native.Compiler().compile_program_result(module, target, **options)
+                self.assertTrue(program.ok, program.diagnostics)
+
     def test_spirv_dynamic_step_reports_contract_capability(self) -> None:
         module = compile_source(
             "from vernon_dsl import *\n"

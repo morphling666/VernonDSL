@@ -12,6 +12,8 @@ from .decorators import fragment, func, kernel, struct, vertex
 from .diagnostics import CompileError
 from .intrinsics import (
     abs,
+    acos,
+    atan2,
     atomic_add,
     atomic_exchange,
     atomic_max,
@@ -21,6 +23,7 @@ from .intrinsics import (
     cross,
     dot,
     exp,
+    floor,
     fragment_coord,
     front_facing,
     instance_id,
@@ -111,6 +114,8 @@ from .types import (
 __all__ = [
     "Annotated",
     "abs",
+    "acos",
+    "atan2",
     "atomic_add",
     "atomic_exchange",
     "atomic_max",
@@ -167,6 +172,7 @@ __all__ = [
     "f32",
     "f64",
     "feature",
+    "floor",
     "fragment",
     "fragment_coord",
     "front_facing",

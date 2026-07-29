@@ -20,6 +20,9 @@
 #ifndef VERNON_DIRECTX_COMPUTE_PIPELINE_BUNDLE
 #error VERNON_DIRECTX_COMPUTE_PIPELINE_BUNDLE must name the cooked compute pipeline bundle
 #endif
+#ifndef VERNON_DIRECTX_RESOLUTION_PIPELINE_BUNDLE
+#error VERNON_DIRECTX_RESOLUTION_PIPELINE_BUNDLE must name the cooked resolution pipeline bundle
+#endif
 
 namespace {
 
@@ -140,6 +143,93 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     EXPECT_EQ(vernonRhiDeviceDestroySampler(context.device, sampler.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(context.device, target.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(context.device, sampled.handle), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(context.device, vertices.handle), VERNON_RHI_STATUS_OK);
+    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    vernonRuntimePipelineBundleDestroy(loaded);
+    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
+    vernonRhiDestroyDevice(context.device);
+}
+
+TEST(RuntimeDirectX12Pipeline, SuppliesEffectiveResolutionWithWarp) {
+    const std::filesystem::path manifestPath = VERNON_DIRECTX_RESOLUTION_PIPELINE_BUNDLE;
+    std::ifstream input(manifestPath, std::ios::binary);
+    const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    ASSERT_FALSE(bundle.empty());
+
+    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_DIRECTX12, nullptr, true);
+    VernonRuntimeContext *runtime = context.runtime;
+    ASSERT_NE(runtime, nullptr);
+    const std::string directory = manifestPath.parent_path().u8string();
+    VernonPipelineBundleLoadOptions options{};
+    options.struct_size = sizeof(options);
+    options.bundle_directory = directory.c_str();
+    VernonPipelineBundle *loaded =
+        vernonRuntimeLoadPipelineBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+    ASSERT_NE(loaded, nullptr) << std::string(vernonRuntimeGetLastError(runtime).data,
+                                              vernonRuntimeGetLastError(runtime).size);
+    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
+    ASSERT_NE(pipeline, nullptr) << std::string(vernonRuntimeGetLastError(runtime).data,
+                                                vernonRuntimeGetLastError(runtime).size);
+
+    constexpr std::array<float, 6> positions{-0.8f, -0.8f, 0.8f, -0.8f, 0.0f, 0.8f};
+    auto vertices = vernon::tests::createBuffer(context, sizeof(positions), alignof(float), VERNON_RHI_BUFFER_VERTEX,
+                                                positions.data());
+    auto target = createTexture2D(context, 32, 32);
+    ASSERT_NE(vertices.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+
+    VernonPipelineParameterView positionParameter{};
+    ASSERT_EQ(vernonRuntimeLoadedPipelineFindParameter(pipeline, {"position", 8}, &positionParameter),
+              VERNON_STATUS_OK);
+    constexpr uint64_t shape[] = {3, 2};
+    constexpr int64_t strides[] = {2 * sizeof(float), sizeof(float)};
+    VernonPipelineArgument argument{};
+    argument.slot = positionParameter.slot;
+    argument.kind = VERNON_PIPELINE_TENSOR;
+    argument.tensor.struct_size = sizeof(VernonTensorView);
+    argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    argument.tensor.resource = vertices.reference;
+    argument.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
+    argument.tensor.access = VERNON_ACCESS_READ;
+    argument.tensor.rank = 2;
+    argument.tensor.shape = shape;
+    argument.tensor.byte_strides = strides;
+    argument.tensor.byte_size = sizeof(positions);
+    VernonColorAttachment attachment{0, target.reference, 32, 32, VERNON_TEXTURE_RGBA8_UNORM};
+    VernonPipelineInvocation invocation{};
+    invocation.struct_size = sizeof(invocation);
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.arguments = &argument;
+    invocation.argument_count = 1;
+    invocation.color_attachments = &attachment;
+    invocation.color_attachment_count = 1;
+    invocation.viewport[2] = 8;
+    invocation.viewport[3] = 16;
+    invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
+    invocation.instance_count = 1;
+    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
+        << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
+
+    std::vector<uint8_t> pixels(32 * 32 * 4);
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, target.handle, pixels.data(), pixels.size()),
+              VERNON_RHI_STATUS_OK);
+    const size_t center = (8 * 32 + 4) * 4;
+    EXPECT_NEAR(pixels[center], 64, 2);
+    EXPECT_NEAR(pixels[center + 1], 128, 2);
+    EXPECT_NEAR(pixels[center + 2], 0, 2);
+
+    invocation.viewport[2] = 0;
+    invocation.viewport[3] = 0;
+    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
+        << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, target.handle, pixels.data(), pixels.size()),
+              VERNON_RHI_STATUS_OK);
+    const size_t attachmentCenter = (16 * 32 + 16) * 4;
+    EXPECT_NEAR(pixels[attachmentCenter], 255, 2);
+    EXPECT_NEAR(pixels[attachmentCenter + 1], 255, 2);
+    EXPECT_NEAR(pixels[attachmentCenter + 2], 0, 2);
+
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(context.device, target.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(context.device, vertices.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     vernonRuntimePipelineBundleDestroy(loaded);

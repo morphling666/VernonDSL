@@ -123,6 +123,14 @@ struct Driver {
     void(VERNON_GL_CALL *uniform2fv)(Int, Size, const float *){};
     void(VERNON_GL_CALL *uniform3fv)(Int, Size, const float *){};
     void(VERNON_GL_CALL *uniform4fv)(Int, Size, const float *){};
+    void(VERNON_GL_CALL *uniform1iv)(Int, Size, const Int *){};
+    void(VERNON_GL_CALL *uniform2iv)(Int, Size, const Int *){};
+    void(VERNON_GL_CALL *uniform3iv)(Int, Size, const Int *){};
+    void(VERNON_GL_CALL *uniform4iv)(Int, Size, const Int *){};
+    void(VERNON_GL_CALL *uniform1uiv)(Int, Size, const Uint *){};
+    void(VERNON_GL_CALL *uniform2uiv)(Int, Size, const Uint *){};
+    void(VERNON_GL_CALL *uniform3uiv)(Int, Size, const Uint *){};
+    void(VERNON_GL_CALL *uniform4uiv)(Int, Size, const Uint *){};
     void(VERNON_GL_CALL *uniformMatrix2fv)(Int, Size, Boolean, const float *){};
     void(VERNON_GL_CALL *uniformMatrix2x3fv)(Int, Size, Boolean, const float *){};
     void(VERNON_GL_CALL *uniformMatrix2x4fv)(Int, Size, Boolean, const float *){};

@@ -15,4 +15,5 @@ htmlcov/
 *.obj
 *.lib
 *.exp
+*.exe
 secret/

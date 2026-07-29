@@ -36,7 +36,8 @@ struct DirectX12PipelineState {
             EXTERNAL_TEXTURE,
             EXTERNAL_SAMPLER,
             EXTERNAL_STORAGE,
-            IMPLICIT_SAMPLER
+            IMPLICIT_SAMPLER,
+            RESOLUTION
         };
         Source source{};
         uint32_t externalSlot{};

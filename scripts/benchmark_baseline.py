@@ -164,10 +164,15 @@ def benchmark_kernel(iterations: int, architecture: str, elements: int) -> dict[
     }
 
 
-def benchmark_showcase(architecture: str, frames: int, grid: int, size: int) -> dict[str, object]:
-    script = ROOT / "examples" / "dynamic_ocean.py"
+def benchmark_showcase(architecture: str, showcase: str, frames: int, size: int) -> dict[str, object]:
+    scripts = {
+        "aurora": ROOT / "examples" / "aurora_showcase.py",
+        "mandelbulb": ROOT / "examples" / "mandelbulb_showcase.py",
+    }
+    script = scripts[showcase]
     with tempfile.TemporaryDirectory(prefix="vernon-showcase-baseline-") as directory:
-        output = Path(directory) / "ocean.png"
+        output = Path(directory) / f"{showcase}.png"
+        summary = Path(directory) / f"{showcase}.json"
         command = [
             sys.executable,
             str(script),
@@ -175,13 +180,13 @@ def benchmark_showcase(architecture: str, frames: int, grid: int, size: int) -> 
             architecture,
             "--frames",
             str(frames),
-            "--grid",
-            str(grid),
             "--size",
             str(size),
             "--headless",
             "--output",
             str(output),
+            "--result-json",
+            str(summary),
         ]
         environment = os.environ.copy()
         python_paths = [str(ROOT / "python"), str(ROOT / "examples")]
@@ -200,15 +205,16 @@ def benchmark_showcase(architecture: str, frames: int, grid: int, size: int) -> 
         elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000.0
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "showcase benchmark failed")
+        program_summary = json.loads(summary.read_text(encoding="utf-8"))
     return {
         "scenario": "showcase",
+        "showcase": showcase,
         "architecture": architecture,
         "frames": frames,
-        "grid": grid,
         "size": size,
         "total_ms": round(elapsed_ms, 4),
         "average_ms_per_frame_including_startup": round(elapsed_ms / frames, 4),
-        "program_summary": result.stdout.strip().splitlines()[-1] if result.stdout.strip() else "",
+        "program_summary": program_summary,
     }
 
 
@@ -226,6 +232,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--frames", type=int, default=60)
     parser.add_argument("--grid", type=int, default=64)
     parser.add_argument("--size", type=int, default=256)
+    parser.add_argument("--showcase", choices=("aurora", "mandelbulb"), default="aurora")
     return parser
 
 
@@ -244,8 +251,8 @@ def main(argv: list[str] | None = None) -> int:
         result = benchmark_kernel(arguments.iterations, arguments.arch, arguments.elements)
     else:
         if arguments.arch not in {"vulkan", "opengl", "directx"}:
-            raise ValueError("the dynamic ocean showcase supports vulkan, opengl, and directx")
-        result = benchmark_showcase(arguments.arch, arguments.frames, arguments.grid, arguments.size)
+            raise ValueError("the visual showcases support vulkan, opengl, and directx")
+        result = benchmark_showcase(arguments.arch, arguments.showcase, arguments.frames, arguments.size)
     document = {
         "schema_version": 1,
         "environment": {

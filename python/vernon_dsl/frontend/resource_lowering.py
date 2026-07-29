@@ -4,7 +4,7 @@ import ast
 from typing import Protocol
 
 from ..language.stage_registry import GRAPHICS_STAGES
-from ..shader_contracts import texture_sampling_contract
+from ..shader_contracts import resource_stage_error, texture_sampling_contract
 from .interfaces import GeneratedInterfacePlan
 from .lowering_types import DslType, ModuleContext, Value
 
@@ -43,11 +43,10 @@ def lower_texture_sample(
     planned_mode = emitter.interface_plan.texture_sampler_modes.get(texture_source) if texture_source else None
     if planned_mode is not None and planned_mode != sampling.sampler_mode:
         raise emitter.context.error(node, "texture sampling overload differs from its interface plan")
-    if emitter.stage not in sampling.stages:
-        requirement = "fragment shaders" if not sampling.has_lod else "graphics stages"
+    if emitter.stage is not None and emitter.stage not in sampling.stages:
         raise emitter.context.error(
             node,
-            f"texture_sample {'without' if not sampling.has_lod else 'with'} lod is supported only in {requirement}",
+            resource_stage_error("texture_sample", sampling.stages, has_lod=sampling.has_lod),
         )
     if sampling.explicit_sampler:
         sampler = arguments[1]
@@ -95,8 +94,8 @@ def lower_texture_size(
         )
     if len(arguments) not in {1, 2} or arguments[0].type.kind != "texture":
         raise emitter.context.error(node, "texture_size requires texture and optional lod")
-    if emitter.stage not in GRAPHICS_STAGES:
-        raise emitter.context.error(node, "texture_size is supported only in graphics stages")
+    if emitter.stage is not None and emitter.stage not in GRAPHICS_STAGES:
+        raise emitter.context.error(node, resource_stage_error("texture_size", GRAPHICS_STAGES))
     if len(arguments) == 2 and (arguments[1].type.kind != "scalar" or not arguments[1].type.is_integer):
         raise emitter.context.error(node.args[1], "texture_size lod must be an integer scalar")
     return emitter._intrinsic(node, "texture_size", arguments, result_type)

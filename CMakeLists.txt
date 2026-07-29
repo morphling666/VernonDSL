@@ -20,7 +20,7 @@ option(VERNON_ENABLE_SANITIZERS "Build Vernon targets with AddressSanitizer" OFF
 if(VERNON_ENABLE_SANITIZERS)
     if(MSVC)
         add_compile_options(/fsanitize=address /Zi)
-        add_link_options(/INCREMENTAL:NO)
+        add_link_options(/INCREMENTAL:NO /DEBUG)
     else()
         add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
         add_link_options(-fsanitize=address)

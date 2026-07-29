@@ -396,6 +396,9 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     %log = math.log %exp : f32
     %sqrt = math.sqrt %log : f32
     %abs = math.absf %sqrt : f32
+    %floor = math.floor %abs : f32
+    %acos = math.acos %x : f32
+    %atan2 = math.atan2 %floor, %acos : f32
     return %explicit, %size2d0, %size2d1, %size3d0, %size3d1,
         %sizeCube0, %sizeCube1 :
         tensor<4xf32>, tensor<2xi32>, tensor<2xi32>, tensor<3xi32>,
@@ -782,6 +785,63 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     EXPECT_NE(reflected.find("\"dtype\":\"u32\""), std::string_view::npos);
     EXPECT_NE(reflected.find("\"path\":[\"object_id\"]"), std::string_view::npos);
     EXPECT_NE(reflected.find("\"shape\":[3]"), std::string_view::npos);
+    vernonCompileResultDestroy(result);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerGraphicsOutput, LowersStructCarryingStructuredLoopToSpirv) {
+    constexpr std::string_view aggregateLoopModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  "vernon.struct"() {
+    sym_name = "State",
+    fields = ["value:f32"],
+    abi_leaf_dtypes = ["f32"]
+  } : () -> ()
+  func.func @struct_loop_fragment() -> (f32 {
+      vernon.interface = "output", vernon.location = 0 : i64
+    }) attributes {vernon.entry, vernon.stage = "fragment"} {
+    %zero = arith.constant 0.0 : f32
+    %initial = "vernon.struct_create"(%zero) {
+      type_name = "State"
+    } : (f32) -> !vernon.struct<"State">
+    %zero_index = arith.constant 0 : i32
+    %result, %iterations = scf.while (%state = %initial, %index = %zero_index)
+        : (!vernon.struct<"State">, i32) -> (!vernon.struct<"State">, i32) {
+      %limit = arith.constant 2 : i32
+      %continue = arith.cmpi slt, %index, %limit : i32
+      scf.condition(%continue) %state, %index : !vernon.struct<"State">, i32
+    } do {
+    ^bb0(%state: !vernon.struct<"State">, %index: i32):
+      %value = "vernon.struct_get"(%state) {
+        field = "value", index = 0 : i64
+      } : (!vernon.struct<"State">) -> f32
+      %one = arith.constant 1.0 : f32
+      %next_value = arith.addf %value, %one : f32
+      %next_state = "vernon.struct_create"(%next_value) {
+        type_name = "State"
+      } : (f32) -> !vernon.struct<"State">
+      %one_index = arith.constant 1 : i32
+      %next_index = arith.addi %index, %one_index : i32
+      scf.yield %next_state, %next_index : !vernon.struct<"State">, i32
+    }
+    %value = "vernon.struct_get"(%result) {
+      field = "value", index = 0 : i64
+    } : (!vernon.struct<"State">) -> f32
+    return %value : f32
+  }
+}
+)mlir";
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *result = vernonCompilerCompileMlir(compiler, aggregateLoopModule.data(),
+                                                            aggregateLoopModule.size(), VERNON_TARGET_VULKAN);
+    ASSERT_TRUE(result);
+    if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
+        const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+        std::fprintf(stderr, "struct loop compile failed: %.*s\n", static_cast<int>(diagnostics.size),
+                     diagnostics.data);
+    }
+    EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
     vernonCompileResultDestroy(result);
     vernonCompilerDestroy(compiler);
 }

@@ -200,14 +200,24 @@ if(TARGET VernonRuntime)
                 "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:scale_asset"
                 directx_compute_pipeline_bundle
                 directx_compute_pipeline_test_manifest)
+            vernon_add_pipeline_test_bundle(
+                directx-resolution-pipeline
+                directx
+                "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:resolution_asset"
+                directx_resolution_pipeline_bundle
+                directx_resolution_pipeline_test_manifest)
             target_sources(VernonRuntimeTests PRIVATE runtime/runtime_directx12_pipeline_test.cpp)
             target_compile_definitions(
                 VernonRuntimeTests
                 PRIVATE VERNON_DIRECTX_PIPELINE_BUNDLE="${directx_pipeline_test_manifest}"
-                        VERNON_DIRECTX_COMPUTE_PIPELINE_BUNDLE="${directx_compute_pipeline_test_manifest}")
+                        VERNON_DIRECTX_COMPUTE_PIPELINE_BUNDLE="${directx_compute_pipeline_test_manifest}"
+                        VERNON_DIRECTX_RESOLUTION_PIPELINE_BUNDLE="${directx_resolution_pipeline_test_manifest}")
             target_link_libraries(VernonRuntimeTests PRIVATE VernonDSLCompiler)
-            add_dependencies(VernonRuntimeTests vernon-directx-pipeline-test-bundle
-                             vernon-directx-compute-pipeline-test-bundle)
+            add_dependencies(
+                VernonRuntimeTests
+                vernon-directx-pipeline-test-bundle
+                vernon-directx-compute-pipeline-test-bundle
+                vernon-directx-resolution-pipeline-test-bundle)
         endif()
     endif()
 
@@ -244,6 +254,18 @@ if(TARGET VernonRuntime)
             vernon-vulkan-pipeline-test-bundle
             vernon-vulkan-cube-map-test-bundle
             vernon-vulkan-compute-pipeline-test-bundle)
+    endif()
+
+    if(TARGET vernon-dsl-native AND Python_FOUND)
+        vernon_add_pipeline_test_bundle(
+            opengl-runtime-acceptance
+            opengl
+            "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:opengl_runtime_acceptance_asset"
+            opengl_runtime_acceptance_bundle
+            opengl_runtime_acceptance_manifest)
+        target_compile_definitions(
+            VernonRuntimeTests PRIVATE VERNON_OPENGL_RUNTIME_ACCEPTANCE_BUNDLE="${opengl_runtime_acceptance_manifest}")
+        add_dependencies(VernonRuntimeTests vernon-opengl-runtime-acceptance-test-bundle)
     endif()
 
     vernon_discover_gtests(VernonRuntimeTests)

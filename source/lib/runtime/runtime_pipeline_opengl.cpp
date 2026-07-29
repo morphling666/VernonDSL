@@ -214,10 +214,12 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                         valueCount *= dimension;
                     }
                     const bool buffered = use.physicalValueLayout->transport == "uniform_buffer";
+                    const bool scalarOrVector = shape.empty() || (shape.size() == 1 && shape[0] <= 4);
+                    const bool floatingMatrix = use.dtype == "f32" && shape.size() == 2 && shape[0] >= 2 &&
+                                                shape[0] <= 4 && shape[1] >= 2 && shape[1] <= 4;
                     const bool nativeInline =
-                        use.dtype == "f32" &&
-                        (shape.empty() || (shape.size() == 1 && shape[0] <= 4) ||
-                         (shape.size() == 2 && shape[0] >= 2 && shape[0] <= 4 && shape[1] >= 2 && shape[1] <= 4));
+                        ((use.dtype == "f32" || use.dtype == "i32" || use.dtype == "u32") && scalarOrVector) ||
+                        floatingMatrix;
                     if (!dtype || valueCount == 0 || (!buffered && !nativeInline)) {
                         representationError = "OpenGL uniform layout is unsupported";
                         useRhiGraphics = false;
@@ -236,6 +238,7 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
                     candidate.layout.element_count = static_cast<uint32_t>(valueCount);
                     candidate.layout.vector_count = shape.size() == 2 ? static_cast<uint32_t>(shape[1]) : 1;
+                    candidate.layout.numeric_type = static_cast<uint32_t>(*dtype);
                     candidate.layout.binding = use.binding;
                     candidate.layout.set = use.descriptorSet;
                     candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_UNIFORM;
@@ -335,6 +338,7 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
                     candidate.layout.element_count = 2;
                     candidate.layout.vector_count = 1;
+                    candidate.layout.numeric_type = VERNON_RUNTIME_PROVIDER_F32;
                     candidate.binding.source = OpenGLPipelineState::InlineBinding::RESOLUTION;
                     candidate.name = use.uniformName;
                     candidates.push_back(std::move(candidate));

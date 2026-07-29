@@ -132,3 +132,10 @@ def texture_sampling_contract(argument_kinds: Sequence[str]) -> TextureSamplingC
     if len(argument_kinds) == 4 and argument_kinds[1] == "sampler":
         return TextureSamplingContract(True, True, _EXPLICIT_LOD_STAGES)
     return None
+
+
+def resource_stage_error(operation: str, stages: frozenset[str], *, has_lod: bool = False) -> str:
+    requirement = "fragment shaders" if stages == _FRAGMENT_ONLY else "graphics stages"
+    if operation == "texture_sample":
+        return f"texture_sample {'with' if has_lod else 'without'} lod is supported only in {requirement}"
+    return f"{operation} is supported only in {requirement}"

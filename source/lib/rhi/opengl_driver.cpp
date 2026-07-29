@@ -78,6 +78,14 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
     LOAD(uniform2fv, "glUniform2fv");
     LOAD(uniform3fv, "glUniform3fv");
     LOAD(uniform4fv, "glUniform4fv");
+    LOAD(uniform1iv, "glUniform1iv");
+    LOAD(uniform2iv, "glUniform2iv");
+    LOAD(uniform3iv, "glUniform3iv");
+    LOAD(uniform4iv, "glUniform4iv");
+    LOAD(uniform1uiv, "glUniform1uiv");
+    LOAD(uniform2uiv, "glUniform2uiv");
+    LOAD(uniform3uiv, "glUniform3uiv");
+    LOAD(uniform4uiv, "glUniform4uiv");
     LOAD(uniformMatrix2fv, "glUniformMatrix2fv");
     LOAD(uniformMatrix2x3fv, "glUniformMatrix2x3fv");
     LOAD(uniformMatrix2x4fv, "glUniformMatrix2x4fv");

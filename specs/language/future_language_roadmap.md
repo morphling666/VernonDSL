@@ -125,6 +125,46 @@ functions or local structured control flow.
 These ergonomics are accepted as part of the stable v4 core. Autodiff support
 for Phase 5B requires separate derivative and tape policies.
 
+## Showcase porting findings (2026-07-29)
+
+Porting the Aurora and Mandelbulb fragment shaders exposed the following
+language and backend gaps. These are not Python-style requests; each item is a
+failure inside syntax that the frontend currently accepts.
+
+Resolved correctness gaps:
+
+- [x] Lower floating-point casts of `range` induction values through a legal
+      intermediate integer cast.
+- [x] Allow explicitly sampled Texture reads in ordinary `@func` helpers,
+      propagate their Resource effects, and validate them at the entry stage.
+- [x] Resolve nominal Struct layouts from the source module when SPIR-V
+      structured control flow converts carried values.
+- [x] Record and type-check unary Boolean `not` operands in statement control
+      flow.
+
+Resolved during the port:
+
+- [x] Add public `acos`, `atan2`, and `floor` intrinsics with frontend type
+      inference and MLIR Math lowering.
+- [x] Teach the custom SPIR-V structured-control-flow translator to lower
+      `math.acos` and `math.floor`, and lower `math.atan2` through a
+      quadrant-aware `acos` construction. Vulkan, DirectX, and OpenGL artifact
+      tests cover the resulting shader math.
+
+Resolved runtime acceptance gaps:
+
+- [x] Keep the generated OpenGL `resolution()` uniform name consistent between
+      SPIR-V/GLSL emission and PipelineAsset reflection. Aurora and Mandelbulb
+      now use `resolution()` without an explicit `viewport_size` uniform.
+- [x] Preserve logical `i32`/`u32` signedness on SPIR-V interface variables so
+      generated GLSL uniform declarations match the Provider ABI's
+      `glUniform*i` upload path. Mandelbulb now uses native `i32` loop budgets.
+
+A generated OpenGL PipelineAsset acceptance test covers `resolution()` and a
+signed integer uniform through compilation, reflection, loading, and provider
+upload. The generated resolution value now works in Vulkan, DirectX 12, and
+OpenGL showcases.
+
 ## Low priority: program-internal autodiff graph
 
 The graph used by autodiff is compiler IR inside one specialized program. It is

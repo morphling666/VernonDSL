@@ -1,6 +1,35 @@
 # Example Design Notes
 
-## Dynamic terrain erosion
+## Aurora showcase
+
+The aurora is a full-screen, two-pass graphics workload. The first fragment
+stage builds twelve animated Gaussian light curtains over a lifted night-sky
+floor. The second samples the intermediate texture over a 3x3 neighborhood,
+adds sparse procedural stars and temporal TPDF dithering, then applies a simple
+display curve. `ExecutionGraph` observes the first pass attachment write and
+the second pass texture read, so the image barrier is inferred.
+
+The implementation is adapted from the MIT-licensed
+[jagajaga/coaurora](https://github.com/jagajaga/coaurora), Copyright (c) 2026
+Arseniy Seroka. It keeps the original layered-curtain and blur/dither ideas
+while using Vernon's generated `fragment_coord()` input and an explicit
+viewport-size uniform shared by all three runtime graphics backends.
+
+## Mandelbulb showcase
+
+The Mandelbulb is a full-screen ray marcher using the power-eight spherical
+distance estimator. Surface shading combines finite-difference normals, soft
+ray-marched shadows, an iteration-derived ambient-occlusion term, orbit-trap
+coloring, specular highlights, and distance fog. A host-driven orbit gives
+deterministic headless frames and a continuous interactive view. The smoke and
+showoff presets vary ray, fractal, and shadow iteration budgets without
+changing shader topology.
+
+The implementation is adapted from the MIT-licensed
+[matt-k-wong/WebGL-Mandelbulb](https://github.com/matt-k-wong/WebGL-Mandelbulb),
+Copyright (c) 2026.
+
+## Advanced example: dynamic terrain erosion
 
 - Algorithm: Eulerian height-field hydraulic erosion with ping-pong height,
   water, and sediment grids.
@@ -17,7 +46,7 @@
   layers. A CC0 rock normal map and diffuse luminance are packed into one RGBA
   texture and sampled triplanarly to fit the four-resource graphics layout.
 
-## Dynamic ocean
+## Advanced example: dynamic ocean
 
 The ocean showcase uses a damped finite-difference wave equation over a dense
 height/velocity grid. Two half-step dispatches, A-to-B and B-to-A, run every

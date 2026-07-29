@@ -7,8 +7,14 @@ from collections.abc import Callable
 from dataclasses import replace
 
 from ..language.ast_utils import decorator_name, dotted_name, rectangular_literal
-from ..language.stage_registry import ENTRY_DECORATORS
-from ..shader_contracts import ATOMIC_OPERATION_NAMES, GENERATED_INTERFACE_CONTRACTS, TypeContract
+from ..language.stage_registry import ENTRY_DECORATOR_STAGES, ENTRY_DECORATORS, GRAPHICS_STAGES
+from ..shader_contracts import (
+    ATOMIC_OPERATION_NAMES,
+    GENERATED_INTERFACE_CONTRACTS,
+    TypeContract,
+    resource_stage_error,
+    texture_sampling_contract,
+)
 from .abi import workgroup_physical_bytes
 from .model import (
     AccessMode,
@@ -345,6 +351,20 @@ class _Inference:
                 formal_indices = {parameter.name: index for index, parameter in enumerate(callee.parameters)}
                 mapped: list[tuple[str, StorageEffect]] = []
                 for effect in callee.effects:
+                    if isinstance(effect, ResourceEffect):
+                        formal_index = formal_indices.get(effect.owner)
+                        if formal_index is None or formal_index >= len(call.args):
+                            raise self.error(call, f"cannot bind resource effect owner '{effect.owner}'")
+                        actual = call.args[formal_index]
+                        if not isinstance(actual, ast.Name) or actual.id not in caller_parameters:
+                            raise self.error(actual, "resource helper arguments must be Resource parameters")
+                        parameter = caller_parameters[actual.id]
+                        if parameter.type.kind != "texture":
+                            raise self.error(actual, "resource helper owner must bind to a Texture parameter")
+                        mapped_effect = replace(effect, owner=parameter.name)
+                        if mapped_effect not in effects:
+                            effects.append(mapped_effect)
+                        continue
                     if not isinstance(effect, StorageEffect):
                         continue
                     if effect.owner.kind is not StorageOwnerKind.PARAMETER:
@@ -400,7 +420,27 @@ class _Inference:
                 isinstance(effect, (AtomicEffect, BarrierEffect)) for effect in function.effects
             ):
                 raise self.error(function.source, "workgroup synchronization is supported only in compute kernels")
-            if function_kind == "func" and function.effects:
+            invalid_resource = next(
+                (
+                    effect
+                    for effect in function.effects
+                    if isinstance(effect, ResourceEffect)
+                    and effect.stages
+                    and function_kind in ENTRY_DECORATORS
+                    and ENTRY_DECORATOR_STAGES[function_kind] not in effect.stages
+                ),
+                None,
+            )
+            if invalid_resource is not None:
+                raise self.error(
+                    function.source,
+                    resource_stage_error(
+                        invalid_resource.operation,
+                        invalid_resource.stages,
+                        has_lod=invalid_resource.has_lod,
+                    ),
+                )
+            if function_kind == "func" and any(isinstance(effect, StorageEffect) for effect in function.effects):
                 raise self.error(
                     function.source,
                     f"pure helper '{function.qualified_name}' has Storage effects",
@@ -600,8 +640,8 @@ class _Inference:
 
         return tuple(effects)
 
-    @staticmethod
     def _resource_effects(
+        self,
         expressions: list[TypedExpression],
         parameters: dict[str, TypedParameter],
     ) -> tuple[ResourceEffect, ...]:
@@ -612,10 +652,23 @@ class _Inference:
             call = expression.source
             if not isinstance(call, ast.Call) or not call.args or not isinstance(call.args[0], ast.Name):
                 continue
-            parameter = parameters.get(call.args[0].id)
-            if parameter is None or parameter.type.kind != "texture":
+            texture_parameter = parameters.get(call.args[0].id)
+            if texture_parameter is None or texture_parameter.type.kind != "texture":
                 continue
-            effect = ResourceEffect(expression.operation, parameter.name)
+            if expression.operation == "texture_size":
+                stages = GRAPHICS_STAGES
+                has_lod = len(call.args) == 2
+            else:
+                argument_kinds = ["texture"]
+                for argument in call.args[1:]:
+                    parameter = parameters.get(argument.id) if isinstance(argument, ast.Name) else None
+                    argument_kinds.append(parameter.type.kind if parameter is not None else "value")
+                sampling = texture_sampling_contract(argument_kinds)
+                if sampling is None:
+                    continue
+                stages = sampling.stages
+                has_lod = sampling.has_lod
+            effect = ResourceEffect(expression.operation, texture_parameter.name, stages, has_lod)
             if effect not in effects:
                 effects.append(effect)
         return tuple(effects)
@@ -693,6 +746,8 @@ class _Inference:
             return (result_type, result_type)
         if isinstance(expression, ast.BoolOp):
             return tuple(result_type for _ in expression.values)
+        if isinstance(expression, ast.UnaryOp) and isinstance(expression.op, ast.Not):
+            return (_scalar("bool"),)
         if isinstance(expression, ast.IfExp):
             return (_scalar("bool"), result_type, result_type)
         if isinstance(expression, ast.Compare) and expression.comparators:
@@ -1021,7 +1076,13 @@ class _Inference:
                 raise self.error(node, f"no safe common type for {describe(left)} and {describe(right)}")
             return common
         if isinstance(node, ast.UnaryOp):
-            return _scalar("bool") if isinstance(node.op, ast.Not) else self._expression(node.operand, environment)
+            operand = self._expression(node.operand, environment)
+            if isinstance(node.op, ast.Not):
+                boolean = _scalar("bool")
+                if default_type(operand) != boolean:
+                    raise self.error(node.operand, "not operand must be a bool Value")
+                return boolean
+            return operand
         if isinstance(node, ast.BoolOp):
             boolean = _scalar("bool")
             for value in node.values:
@@ -1354,7 +1415,23 @@ class _Inference:
             dimension = arguments[0].arguments[0]
             rank = 3 if dimension == "3d" else 2
             return ConcreteType("tensor", "Tensor", (_scalar("u32"), rank))
-        if name in {"sin", "cos", "exp", "log", "sqrt", "abs", "normalize", "reflect", "min", "max", "pow", "clamp"}:
+        if name in {
+            "sin",
+            "cos",
+            "acos",
+            "atan2",
+            "exp",
+            "log",
+            "sqrt",
+            "floor",
+            "abs",
+            "normalize",
+            "reflect",
+            "min",
+            "max",
+            "pow",
+            "clamp",
+        }:
             if not arguments:
                 raise self.error(node, f"{name} requires arguments")
             result = arguments[0]

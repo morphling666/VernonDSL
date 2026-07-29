@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import argparse
+import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import cv2  # type: ignore[import-not-found]
 import numpy as np
@@ -295,3 +298,117 @@ def architecture_from_name(name: str) -> object:
         return architectures[name]
     except KeyError as error:
         raise ValueError(f"unsupported graphics architecture: {name}") from error
+
+
+@dataclass(frozen=True)
+class ShowcasePreset:
+    size: int
+    frames: int
+    fps: int = 60
+
+
+@dataclass(frozen=True)
+class ResolvedShowcaseOptions:
+    architecture: str
+    size: int
+    frames: int
+    fps: int
+    headless: bool
+    output: Path | None
+    result_json: Path | None
+    preset: str
+
+
+def configure_showcase_parser(
+    parser: argparse.ArgumentParser,
+    presets: dict[str, ShowcasePreset],
+) -> None:
+    if set(presets) != {"smoke", "showoff"}:
+        raise ValueError("showcase presets must define exactly smoke and showoff")
+    parser.add_argument("--arch", choices=("vulkan", "directx", "opengl"), default="vulkan")
+    parser.add_argument("--preset", choices=tuple(presets), default="showoff")
+    parser.add_argument("--size", type=int)
+    parser.add_argument("--frames", type=int, help="zero runs until Escape or Q")
+    parser.add_argument("--fps", type=int)
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--result-json", type=Path)
+
+
+def resolve_showcase_options(
+    arguments: argparse.Namespace,
+    presets: dict[str, ShowcasePreset],
+) -> ResolvedShowcaseOptions:
+    preset = presets[arguments.preset]
+    size = preset.size if arguments.size is None else arguments.size
+    fps = preset.fps if arguments.fps is None else arguments.fps
+    frames = (preset.frames if arguments.headless else 0) if arguments.frames is None else arguments.frames
+    if size <= 0 or fps <= 0 or frames < 0:
+        raise ValueError("size and fps must be positive and frames cannot be negative")
+    if arguments.headless and frames == 0:
+        frames = 1
+    return ResolvedShowcaseOptions(
+        architecture=arguments.arch,
+        size=size,
+        frames=frames,
+        fps=fps,
+        headless=arguments.headless,
+        output=arguments.output,
+        result_json=arguments.result_json,
+        preset=arguments.preset,
+    )
+
+
+def create_fullscreen_triangle() -> vd.TensorStorage:
+    positions = np.array(((-1.0, -1.0), (3.0, -1.0), (-1.0, 3.0)), dtype=np.float32)
+    return vd.storage.from_numpy(positions)
+
+
+def image_statistics(image: np.ndarray) -> dict[str, float | int | list[int]]:
+    if image.ndim != 3 or image.shape[2] != 4 or image.size == 0:
+        raise ValueError("showcase image must be a non-empty four-channel image")
+    rgb = image[..., :3].astype(np.float32)
+    alpha = image[..., 3]
+    statistics: dict[str, float | int | list[int]] = {
+        "shape": [int(value) for value in image.shape],
+        "mean": float(np.mean(rgb)),
+        "stddev": float(np.std(rgb)),
+        "minimum": int(np.min(rgb)),
+        "maximum": int(np.max(rgb)),
+        "nonzero_alpha": int(np.count_nonzero(alpha)),
+    }
+    if statistics["nonzero_alpha"] == 0:
+        raise RuntimeError("showcase produced an image with empty alpha")
+    if statistics["maximum"] == 0 or statistics["stddev"] < 0.25:
+        raise RuntimeError("showcase produced an empty or effectively uniform image")
+    return statistics
+
+
+def emit_showcase_result(
+    *,
+    name: str,
+    options: ResolvedShowcaseOptions,
+    image: np.ndarray,
+    rendered_frames: int,
+    elapsed_seconds: float,
+    passes: int,
+    barriers: int,
+) -> dict[str, Any]:
+    result = {
+        "showcase": name,
+        "backend": options.architecture,
+        "preset": options.preset,
+        "frames": rendered_frames,
+        "size": options.size,
+        "fps": options.fps,
+        "elapsed_seconds": elapsed_seconds,
+        "passes": passes,
+        "barriers": barriers,
+        "image": image_statistics(image),
+    }
+    encoded = json.dumps(result, sort_keys=True)
+    print(encoded)
+    if options.result_json is not None:
+        options.result_json.parent.mkdir(parents=True, exist_ok=True)
+        options.result_json.write_text(encoded + "\n", encoding="utf-8")
+    return result

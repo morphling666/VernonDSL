@@ -33,6 +33,8 @@ def typed_effect_data(effect: TypedEffect) -> dict[str, Any]:
             "kind": "resource_read",
             "operation": effect.operation,
             "owner": effect.owner,
+            "stages": sorted(effect.stages),
+            "has_lod": effect.has_lod,
         }
     if isinstance(effect, StorageEffect):
         return {

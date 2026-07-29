@@ -20,6 +20,20 @@ def solid_fragment() -> vd.Vector[vd.f32, 4]:
 
 
 @vd.fragment
+def resolution_fragment() -> vd.Vector[vd.f32, 4]:
+    size = vd.resolution() / 32.0
+    return vd.Vector([size, 0.0, 1.0])
+
+
+@vd.fragment
+def opengl_runtime_acceptance_fragment(
+    max_steps: Annotated[vd.i32, vd.uniform()],
+) -> vd.Vector[vd.f32, 4]:
+    size = vd.resolution()
+    return vd.Vector([vd.f32(max_steps) / size.x, size.y / size.x, 0.0, 1.0])
+
+
+@vd.fragment
 def sampled_fragment(
     image: Annotated[vd.Texture["2d", vd.f32], vd.resource(set=0, binding=0)],
     sampler: Annotated[vd.Sampler, vd.resource(set=0, binding=1)],
@@ -46,6 +60,18 @@ triangle_asset = vd.pipeline_asset(
 sampled_asset = vd.pipeline_asset(
     id="pipelines/sampled_triangle",
     program=(triangle_vertex, sampled_fragment),
+    variants=((),),
+)
+
+resolution_asset = vd.pipeline_asset(
+    id="pipelines/resolution_triangle",
+    program=(triangle_vertex, resolution_fragment),
+    variants=((),),
+)
+
+opengl_runtime_acceptance_asset = vd.pipeline_asset(
+    id="pipelines/opengl_runtime_acceptance",
+    program=(triangle_vertex, opengl_runtime_acceptance_fragment),
     variants=((),),
 )
 

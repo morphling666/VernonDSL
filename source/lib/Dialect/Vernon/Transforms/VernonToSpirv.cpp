@@ -144,6 +144,21 @@ FailureOr<Type> convertValueType(Type type, ModuleOp module = {}) {
     return failure();
 }
 
+Type applyInterfaceIntegerSignedness(Type type, DictionaryAttr attributes) {
+    auto dtype = attributes.getAs<StringAttr>("vernon.dtype");
+    if (!dtype || (dtype.getValue() != "i32" && dtype.getValue() != "u32"))
+        return type;
+    const auto signedness = dtype.getValue() == "i32" ? IntegerType::SignednessSemantics::Signed
+                                                      : IntegerType::SignednessSemantics::Unsigned;
+    if (auto integer = dyn_cast<IntegerType>(type))
+        return IntegerType::get(type.getContext(), integer.getWidth(), signedness);
+    if (auto vector = dyn_cast<VectorType>(type))
+        if (auto integer = dyn_cast<IntegerType>(vector.getElementType()))
+            return VectorType::get(vector.getShape(),
+                                   IntegerType::get(type.getContext(), integer.getWidth(), signedness));
+    return type;
+}
+
 FailureOr<Type> convertAggregateTensorStorageType(TensorType tensor, ModuleOp module) {
     FailureOr<ValueAbiLayout> elementLayout = getValueAbiLayout(tensor.getElementType(), module);
     FailureOr<PhysicalValueAbiLayout> physicalLayout =
@@ -837,9 +852,11 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
         if (!operand || failed(resultType))
             return failure();
         StringRef operationName = llvm::StringSwitch<StringRef>(operation.getName().getStringRef())
+                                      .Case(math::AcosOp::getOperationName(), "spirv.GL.Acos")
                                       .Case(math::SinOp::getOperationName(), "spirv.GL.Sin")
                                       .Case(math::CosOp::getOperationName(), "spirv.GL.Cos")
                                       .Case(math::ExpOp::getOperationName(), "spirv.GL.Exp")
+                                      .Case(math::FloorOp::getOperationName(), "spirv.GL.Floor")
                                       .Case(math::LogOp::getOperationName(), "spirv.GL.Log")
                                       .Case(math::SqrtOp::getOperationName(), "spirv.GL.Sqrt")
                                       .Case(math::AbsFOp::getOperationName(), "spirv.GL.FAbs")
@@ -850,6 +867,43 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
             state.addTypes(*resultType);
             return builder.create(state)->getResult(0);
         }
+    }
+
+    if (auto atan2 = dyn_cast<math::Atan2Op>(operation)) {
+        Value y = mapped(atan2.getLhs());
+        Value x = mapped(atan2.getRhs());
+        FailureOr<Type> resultType = convertValueType(atan2.getType());
+        if (!y || !x || failed(resultType))
+            return failure();
+        return lowerCompositeElementwise(
+            location, *resultType, ArrayRef<Value>{y, x}, builder,
+            [&](Type type, ArrayRef<Value> values) -> FailureOr<Value> {
+                auto floatType = dyn_cast<FloatType>(type);
+                if (!floatType)
+                    return failure();
+                Value zero = spirv::ConstantOp::create(builder, location, type, builder.getFloatAttr(type, 0.0));
+                Value minusOne = spirv::ConstantOp::create(builder, location, type, builder.getFloatAttr(type, -1.0));
+                Value one = spirv::ConstantOp::create(builder, location, type, builder.getFloatAttr(type, 1.0));
+                Value xx = spirv::FMulOp::create(builder, location, values[1], values[1]);
+                Value yy = spirv::FMulOp::create(builder, location, values[0], values[0]);
+                Value radiusSquared = spirv::FAddOp::create(builder, location, xx, yy);
+                OperationState sqrtState(location, "spirv.GL.Sqrt");
+                sqrtState.addOperands(radiusSquared);
+                sqrtState.addTypes(type);
+                Value radius = builder.create(sqrtState)->getResult(0);
+                Value cosine = spirv::FDivOp::create(builder, location, values[1], radius);
+                OperationState clampState(location, "spirv.GL.FClamp");
+                clampState.addOperands({cosine, minusOne, one});
+                clampState.addTypes(type);
+                Value clamped = builder.create(clampState)->getResult(0);
+                OperationState acosState(location, "spirv.GL.Acos");
+                acosState.addOperands(clamped);
+                acosState.addTypes(type);
+                Value angle = builder.create(acosState)->getResult(0);
+                Value negativeAngle = spirv::FSubOp::create(builder, location, zero, angle);
+                Value negativeY = spirv::FOrdLessThanOp::create(builder, location, values[0], zero);
+                return spirv::SelectOp::create(builder, location, type, negativeY, negativeAngle, angle).getResult();
+            });
     }
 
     if (auto compare = dyn_cast<arith::CmpFOp>(operation)) {
@@ -986,8 +1040,11 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
                 return spirv::LogicalOrOp::create(builder, location, lhs, rhs).getResult();
             return spirv::BitwiseOrOp::create(builder, location, lhs, rhs).getResult();
         }
-        if (name == arith::XOrIOp::getOperationName())
+        if (name == arith::XOrIOp::getOperationName()) {
+            if (operation.getResult(0).getType().isInteger(1))
+                return spirv::LogicalNotEqualOp::create(builder, location, lhs, rhs).getResult();
             return spirv::BitwiseXorOp::create(builder, location, lhs, rhs).getResult();
+        }
     }
 
     return failure();
@@ -1002,6 +1059,7 @@ LogicalResult lowerWhile(scf::WhileOp whileOp, OpBuilder &builder, Block *functi
 LogicalResult lowerIf(scf::IfOp ifOp, OpBuilder &builder, Block *functionEntry, IRMapping &mapping,
                       SmallVectorImpl<Value> &results) {
     Value condition = mapping.lookupOrNull(ifOp.getCondition());
+    ModuleOp sourceModule = ifOp->getParentOfType<ModuleOp>();
     if (!condition || !ifOp.getThenRegion().hasOneBlock() ||
         (!ifOp.getElseRegion().empty() && !ifOp.getElseRegion().hasOneBlock()))
         return failure();
@@ -1009,7 +1067,7 @@ LogicalResult lowerIf(scf::IfOp ifOp, OpBuilder &builder, Block *functionEntry, 
     SmallVector<Value> resultVariables;
     OpBuilder variableBuilder = OpBuilder::atBlockBegin(functionEntry);
     for (Type sourceType : ifOp.getResultTypes()) {
-        FailureOr<Type> type = convertValueType(sourceType);
+        FailureOr<Type> type = convertValueType(sourceType, sourceModule);
         if (failed(type))
             return failure();
         auto pointerType = spirv::PointerType::get(*type, spirv::StorageClass::Function);
@@ -1122,10 +1180,11 @@ LogicalResult lowerWhile(scf::WhileOp whileOp, OpBuilder &builder, Block *functi
     if (!whileOp.getBefore().hasOneBlock() || !whileOp.getAfter().hasOneBlock())
         return whileOp.emitError("structured loop regions must contain one block");
 
+    ModuleOp sourceModule = whileOp->getParentOfType<ModuleOp>();
     SmallVector<Value> resultVariables;
     OpBuilder variableBuilder = OpBuilder::atBlockBegin(functionEntry);
     for (Type sourceType : whileOp.getResultTypes()) {
-        FailureOr<Type> type = convertValueType(sourceType);
+        FailureOr<Type> type = convertValueType(sourceType, sourceModule);
         if (failed(type))
             return whileOp.emitError("cannot convert a structured loop result type");
         auto pointerType = spirv::PointerType::get(*type, spirv::StorageClass::Function);
@@ -1151,7 +1210,7 @@ LogicalResult lowerWhile(scf::WhileOp whileOp, OpBuilder &builder, Block *functi
             initialValues.push_back(mapped);
         }
         for (auto [argument, value] : llvm::zip_equal(whileOp.getBefore().front().getArguments(), initialValues)) {
-            FailureOr<Type> type = convertValueType(argument.getType());
+            FailureOr<Type> type = convertValueType(argument.getType(), sourceModule);
             if (failed(type))
                 return whileOp.emitError("cannot convert a structured loop before argument type");
             BlockArgument targetArgument = beforeBlock->addArgument(*type, argument.getLoc());
@@ -1166,7 +1225,7 @@ LogicalResult lowerWhile(scf::WhileOp whileOp, OpBuilder &builder, Block *functi
             conditionValues.size() != whileOp.getAfter().front().getNumArguments())
             return whileOp.emitError("cannot translate a structured loop condition region");
         for (auto [argument, value] : llvm::zip_equal(whileOp.getAfter().front().getArguments(), conditionValues)) {
-            FailureOr<Type> type = convertValueType(argument.getType());
+            FailureOr<Type> type = convertValueType(argument.getType(), sourceModule);
             if (failed(type) || value.getType() != *type)
                 return whileOp.emitError("structured loop condition value type does not match its body argument");
             BlockArgument targetArgument = afterBlock->addArgument(*type, argument.getLoc());
@@ -1278,6 +1337,7 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
         }
         DictionaryAttr argumentAttrs = effectiveAttrs.getDictionary(source.getContext());
         InterfaceAttrs attrs = parseInterfaceAttrs(argumentAttrs);
+        convertedType = applyInterfaceIntegerSignedness(convertedType, argumentAttrs);
         auto kind = dyn_cast_if_present<StringAttr>(attrs.kind);
         if (!kind)
             return source.emitError() << "argument #" << index << " has no Vernon interface kind";
@@ -1397,7 +1457,11 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             pointer = spirv::AccessChainOp::create(bodyBuilder, source.getLoc(), pointer, memberIndex);
         }
         if (!attribute) {
-            mapping.map(argument, spirv::LoadOp::create(bodyBuilder, source.getLoc(), pointer));
+            Value loaded = spirv::LoadOp::create(bodyBuilder, source.getLoc(), pointer);
+            FailureOr<Type> logicalType = convertValueType(argument.getType(), sourceModule);
+            if (succeeded(logicalType) && loaded.getType() != *logicalType)
+                loaded = spirv::BitcastOp::create(bodyBuilder, source.getLoc(), *logicalType, loaded);
+            mapping.map(argument, loaded);
             continue;
         }
         SmallVector<Value> leaves;

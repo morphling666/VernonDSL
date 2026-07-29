@@ -537,8 +537,10 @@ runtime-context-owned cached Vulkan linear/repeat sampler. Explicit sampler
 parameters ignore the texture-view field.
 The runtime supplies resolution as `(width, height)` from a non-empty
 invocation viewport, falling back to the common color-attachment extent.
-Generated resolution is an OpenGL uniform or a Vulkan push constant according
-to its reflected stage use.
+Generated resolution is an OpenGL uniform, Vulkan push constant, or DirectX 12
+root constant according to its reflected stage use. All three graphics runtime
+paths represent `source: "system_value"` in their binding plans and upload the
+effective resolution before each draw.
 
 ## Shared definitions and struct methods
 

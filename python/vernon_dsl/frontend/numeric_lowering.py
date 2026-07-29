@@ -82,7 +82,9 @@ def lower_unary(emitter: NumericEmitter, node: ast.UnaryOp) -> Value:
     result = emitter._fresh()
     if isinstance(node.op, ast.Not):
         emitter._require_same_type(node, DslType("scalar", "bool"), operand.type)
-        emitter._line(f"{result} = arith.xori {operand.name}, true : i1")
+        truth = emitter._fresh()
+        emitter._line(f"{truth} = arith.constant true")
+        emitter._line(f"{result} = arith.xori {operand.name}, {truth} : i1")
         return Value(result, result_type)
     if isinstance(node.op, ast.USub) and (operand.type.is_float or operand.type.is_integer):
         zero = emitter._default_value(node, operand.type)

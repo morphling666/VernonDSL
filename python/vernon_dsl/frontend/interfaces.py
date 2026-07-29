@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Mapping, Protocol
 
 from ..language.ast_utils import dotted_name
-from ..shader_contracts import GENERATED_INTERFACE_CONTRACTS, texture_sampling_contract
+from ..shader_contracts import GENERATED_INTERFACE_CONTRACTS, resource_stage_error, texture_sampling_contract
 from .model import ConcreteType
 from .type_parser import AnnotatedType
 
@@ -72,12 +72,10 @@ def plan_generated_interface(
         sampling = texture_sampling_contract(argument_kinds)
         if sampling is None:
             continue
-        if stage not in sampling.stages:
-            requirement = "fragment shaders" if not sampling.has_lod else "graphics stages"
+        if stage is not None and stage not in sampling.stages:
             raise context.error(
                 value,
-                f"texture_sample {'without' if not sampling.has_lod else 'with'} "
-                f"lod is supported only in {requirement}",
+                resource_stage_error("texture_sample", sampling.stages, has_lod=sampling.has_lod),
             )
         previous_mode = sampler_modes.get(texture_name)
         if previous_mode is not None and previous_mode != sampling.sampler_mode:
