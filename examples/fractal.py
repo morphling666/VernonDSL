@@ -22,7 +22,7 @@ def complex_square(z: vd.Vector[vd.f32, 2]) -> vd.Vector[vd.f32, 2]:
 
 @vd.kernel(workgroup_size=(16, 16, 1))
 def paint(
-    pixels: vd.TensorView[vd.f32, 2, vd.write],
+    pixels: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write],
     time: vd.f32,
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:

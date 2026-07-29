@@ -23,6 +23,7 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUResources.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUTensors.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerSynchronization.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonValidation.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
@@ -31,6 +32,18 @@
 
 namespace mlir::vernon {
 namespace {
+
+struct MaterializeStorageProjectionPass final : PassWrapper<MaterializeStorageProjectionPass, OperationPass<ModuleOp>> {
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MaterializeStorageProjectionPass)
+
+    StringRef getArgument() const final { return "vernon-materialize-storage-projections"; }
+    StringRef getDescription() const final { return "Materialize canonical TensorView physical indices"; }
+
+    void runOnOperation() override {
+        if (failed(materializeTensorViewProjections(getOperation())))
+            signalPassFailure();
+    }
+};
 
 struct VerifyVernonCpuLLVMConversionPass final
     : PassWrapper<VerifyVernonCpuLLVMConversionPass, OperationPass<ModuleOp>> {
@@ -75,6 +88,7 @@ void registerVernonCpuPipelineDialects(DialectRegistry &registry) {
 void buildVernonCpuPreparationPipeline(OpPassManager &passManager) {
     passManager.addPass(createVernonValidatePass());
     passManager.addPass(createVernonInlineHelpersPass());
+    passManager.addPass(std::make_unique<MaterializeStorageProjectionPass>());
 }
 
 void buildVernonCpuLoweringPipeline(OpPassManager &passManager) {
@@ -92,6 +106,7 @@ void buildVernonCpuPassPipeline(OpPassManager &passManager) {
 }
 
 void registerVernonCpuPassPipeline() {
+    PassRegistration<MaterializeStorageProjectionPass>();
     PassPipelineRegistration<>("vernon-cpu-pipeline",
                                "Lower a validated Vernon CPU module through standard MLIR to LLVM",
                                [](OpPassManager &passManager) { buildVernonCpuPassPipeline(passManager); });

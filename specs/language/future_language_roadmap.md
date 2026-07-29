@@ -1,10 +1,11 @@
 # Language v4 implementation roadmap
 
 This roadmap tracks the remaining gates for the normative target in
-`contract.md`. Checked phases are implemented while the current compiler and
-frontend continue to report language version 3. A phase may not silently
-broaden Python semantics or publish frontend version 4 before all contract
-acceptance gates pass.
+`contract.md`. The Python frontend reports language version 4
+(`FRONTEND_VERSION`). Checked phases below are implemented in source and
+covered by frontend or runtime tests where noted. Unchecked gates, compile-only
+coverage, and open correctness findings in `specs/compiler/root_cause_audit.md`
+are not treated as complete end-to-end acceptance.
 
 ## Design position
 
@@ -151,12 +152,26 @@ IR and must not implicitly become that public execution API.
 
 ## Phase 6: GPU memory and synchronization
 
-- [ ] Model private, function-local, workgroup/shared, storage, uniform, and
-      host-visible address spaces.
-- [ ] Add workgroup storage with backend-validated alignment and layout.
-- [ ] Add atomic operations for explicitly supported leaf types.
-- [ ] Add barriers and shared CUDA/SPIR-V/CPU ordering and scope semantics.
-- [ ] Extend effect analysis to atomics, barriers, races, and
+Source syntax, typed IR, and compile-time effect metadata for device/workgroup
+address spaces, `workgroup_storage`, atomics, and compute barriers are
+implemented and covered by frontend tests. End-to-end runtime correctness for
+aggregate workgroup storage, the runtime TensorView layout ABI, and cross-backend
+parity remain open; see `specs/compiler/root_cause_audit.md`.
+
+- [x] Model device and workgroup address spaces on unified TensorView Storage.
+- [ ] Model private, function-local, storage, uniform, and host-visible address
+      spaces beyond the current TensorView surface.
+- [x] Add workgroup storage source syntax, IR allocation, and compile-time size
+      validation (`workgroup_storage`).
+- [ ] Validate workgroup physical allocation, nested control flow, and backend
+      limits at runtime on every supported GPU backend.
+- [x] Add atomic operations for explicitly supported leaf types in source and IR.
+- [ ] Prove atomic semantics end-to-end on every available GPU runtime.
+- [x] Add barriers with typed effect records in compute kernels.
+- [ ] Prove barrier and shared-memory ordering semantics end-to-end on every
+      available GPU runtime.
+- [x] Extend effect analysis to atomics and barriers at compile time.
+- [ ] Extend runtime validation for atomics, barriers, races, and
       differentiability-relevant reads and overwrites.
 
 ### Phase 6 unified TensorView Storage
@@ -166,11 +181,9 @@ The accepted source, IR, binding, ABI, and migration contract is maintained in
 roadmap boundary; the dedicated contract is authoritative where details
 overlap.
 
-The current `workgroup_array(T, N)` implementation proves the backend
-mechanism, but a one-dimensional operation-specific type is not the intended
-long-term type-system boundary. The candidate model is one Storage category
-whose views carry an address space in addition to element, rank, layout, and
-access information:
+`workgroup_storage(element, shape=(...))` replaces the removed
+`workgroup_array(T, N)` spelling. Workgroup memory is modeled as TensorView
+Storage with `address_space = workgroup` rather than a separate workgroup type:
 
 ```text
 TensorView[

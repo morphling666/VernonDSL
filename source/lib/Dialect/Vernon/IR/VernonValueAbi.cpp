@@ -1,8 +1,7 @@
-#include "mlir/Dialect/Vernon/Transforms/VernonValueAbi.h"
+#include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
-#include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Alignment.h"
@@ -12,6 +11,46 @@
 #include <limits>
 
 namespace mlir::vernon {
+
+FailureOr<ResolvedStructFields> resolveNamedStructFields(StructType structure, ModuleOp module) {
+    StructDeclOp declaration;
+    for (StructDeclOp candidate : module.getOps<StructDeclOp>()) {
+        if (candidate.getSymName() == structure.getName()) {
+            if (declaration)
+                return failure();
+            declaration = candidate;
+        }
+    }
+    if (!declaration)
+        return failure();
+    SmallVector<ResolvedStructField> fields;
+    for (Attribute attribute : declaration.getFields()) {
+        auto spellingAttribute = dyn_cast<StringAttr>(attribute);
+        if (!spellingAttribute)
+            return failure();
+        StringRef spelling = spellingAttribute.getValue();
+        size_t separator = spelling.find(':');
+        if (separator == StringRef::npos)
+            return failure();
+        Type field = parseType(spelling.drop_front(separator + 1), module.getContext());
+        if (!field)
+            return failure();
+        fields.push_back({spelling.take_front(separator).str(), field});
+    }
+    return ResolvedStructFields{declaration, std::move(fields)};
+}
+
+FailureOr<std::pair<StructDeclOp, SmallVector<Type>>> resolveStructFields(StructType structure, ModuleOp module) {
+    FailureOr<ResolvedStructFields> resolved = resolveNamedStructFields(structure, module);
+    if (failed(resolved))
+        return failure();
+    SmallVector<Type> fields;
+    fields.reserve(resolved->fields.size());
+    for (const ResolvedStructField &field : resolved->fields)
+        fields.push_back(field.type);
+    return std::make_pair(resolved->declaration, std::move(fields));
+}
+
 namespace {
 
 struct PlannedLayout {
@@ -272,6 +311,8 @@ FailureOr<PlannedLayout> planTensor(Type element, ArrayRef<int64_t> shape, Modul
 
 FailureOr<PlannedLayout> planValue(Type type, ModuleOp module, SmallVectorImpl<StringRef> &activeStructs) {
     if (type.isIntOrFloat()) {
+        if (!(type.isInteger(1) || type.isInteger(32) || type.isF16() || type.isF32() || type.isF64()))
+            return failure();
         uint64_t size = std::max<uint64_t>(type.getIntOrFloatBitWidth() / 8, 1);
         StringRef name;
         if (type.isInteger(1))
@@ -373,6 +414,10 @@ FailureOr<ValueAbiLayout> getValueAbiLayout(Type type, ModuleOp module, ArrayRef
     }
     planned->layout.layoutHash = llvm::toHex(hash.final(), true);
     return std::move(planned->layout);
+}
+
+LogicalResult verifyValueAbiType(Type type, ModuleOp module) {
+    return success(succeeded(getValueAbiLayout(type, module)));
 }
 
 FailureOr<PhysicalValueAbiLayout> planPhysicalBytes(Type type, ModuleOp module, PhysicalAbiProfile profile) {
@@ -565,6 +610,57 @@ FailureOr<PhysicalValueAbiLayout> getPhysicalValueAbiLayout(Type type, ModuleOp 
     if (auto *resource = std::get_if<PhysicalResourceAbiLayout>(&*plan); resource && resource->handleSize != 0)
         return PhysicalValueAbiLayout{resource->handleSize, resource->handleAlignment};
     return failure();
+}
+
+FailureOr<WorkgroupPhysicalStoragePlan> getWorkgroupPhysicalStoragePlan(TensorViewType view, ModuleOp module) {
+    if (view.getAddressSpace() != "workgroup")
+        return failure();
+    if (view.getShape().empty() || llvm::any_of(view.getShape(), [](int64_t extent) { return extent <= 0; }))
+        return failure();
+
+    FailureOr<ValueAbiLayout> layout = getValueAbiLayout(view.getElementType(), module);
+    if (failed(layout))
+        return failure();
+
+    uint64_t records = 1;
+    for (int64_t extent : view.getShape()) {
+        const uint64_t dimension = static_cast<uint64_t>(extent);
+        if (records > std::numeric_limits<uint64_t>::max() / dimension)
+            return failure();
+        records *= dimension;
+    }
+
+    WorkgroupPhysicalStoragePlan plan;
+    plan.elementType = view.getElementType();
+    plan.layout = *layout;
+    plan.recordCount = records;
+
+    if (view.getElementType().isIntOrFloat()) {
+        const uint64_t leafSize = std::max<uint64_t>(view.getElementType().getIntOrFloatBitWidth() / 8, 1);
+        if (records > std::numeric_limits<uint64_t>::max() / leafSize)
+            return failure();
+        plan.leaves.push_back({view.getElementType(), records, records * leafSize, 0});
+        plan.totalPhysicalBytes = records * leafSize;
+        return plan;
+    }
+
+    if (layout->leaves.empty())
+        return failure();
+
+    for (auto [index, abiLeaf] : llvm::enumerate(layout->leaves)) {
+        const uint64_t leafSize = std::max<uint64_t>(abiLeaf.scalarType.getIntOrFloatBitWidth() / 8, 1);
+        if (abiLeaf.scalarCount != 0 && records > std::numeric_limits<uint64_t>::max() / abiLeaf.scalarCount)
+            return failure();
+        const uint64_t scalarCount = records * abiLeaf.scalarCount;
+        if (scalarCount != 0 && leafSize > std::numeric_limits<uint64_t>::max() / scalarCount)
+            return failure();
+        const uint64_t byteSize = scalarCount * leafSize;
+        if (plan.totalPhysicalBytes > std::numeric_limits<uint64_t>::max() - byteSize)
+            return failure();
+        plan.leaves.push_back({abiLeaf.scalarType, scalarCount, byteSize, index});
+        plan.totalPhysicalBytes += byteSize;
+    }
+    return plan;
 }
 
 } // namespace mlir::vernon

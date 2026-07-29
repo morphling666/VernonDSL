@@ -1,12 +1,11 @@
 # Vernon DSL language v4 draft
 
-> **Status: normative target, partially implemented under frontend version 3.**
+> **Status: normative target, partially implemented under frontend version 4.**
 >
-> The checked phases in `future_language_roadmap.md` are implemented and tested,
-> but unchecked sections of this document remain unavailable. The compiler and
-> Python frontend continue to emit language version 3 until every version-4
-> acceptance gate in this document passes. The historical version-3 contract is
-> available from Git history.
+> The checked phases in `future_language_roadmap.md` are implemented in source
+> and tested where noted, but unchecked sections and open correctness findings
+> in `specs/compiler/root_cause_audit.md` remain unavailable as end-to-end
+> guarantees. The historical version-3 contract is available from Git history.
 
 Vernon is a statically typed GPU and graphics DSL embedded in Python syntax.
 The frontend parses source without importing or executing the shader module.
@@ -397,7 +396,7 @@ Tensor/Tuple/Struct construction, and constant Tuple indexing.
 
 Tuple destructuring, short-circuit `and`/`or`, conditional expressions,
 dynamic `range`, `break`, `continue`, and nested/early return are implemented
-v4-core phases while the frontend still reports version 3. Autodiff coverage
+v4-core phases under frontend version 4. Autodiff coverage
 for Phase 5B control flow remains deferred until derivative and tape policies
 land. Chained comparisons, recursion, dynamic allocation, exceptions,
 generators, arbitrary classes, Python list/dict semantics, and Python object
@@ -547,5 +546,5 @@ Frontend version 4 may be declared implemented only when:
 - fluid simulation, PBR/SSR, and first-order autodiff examples compile within
   their stated boundaries.
 
-Until every gate passes, tools and artifacts must identify the frontend as
-language version 3.
+Until every gate in this document passes, unchecked sections remain unavailable
+as end-to-end guarantees even though the frontend reports language version 4.

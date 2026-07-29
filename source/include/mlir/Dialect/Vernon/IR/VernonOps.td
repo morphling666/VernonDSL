@@ -70,28 +70,31 @@ def Vernon_IntrinsicOp : Vernon_Op<"intrinsic"> {
 }
 
 def Vernon_WorkgroupAllocOp : Vernon_Op<"workgroup_alloc"> {
-  let summary = "Allocate statically sized workgroup storage";
-  let results = (outs Vernon_WorkgroupType:$result);
+  let summary = "Allocate a statically shaped workgroup TensorView";
+  let results = (outs Vernon_TensorViewType:$result);
   let hasVerifier = 1;
 }
 
-def Vernon_WorkgroupLoadOp : Vernon_Op<"workgroup_load"> {
-  let summary = "Load one workgroup storage element";
-  let arguments = (ins Vernon_WorkgroupType:$storage, Index:$index);
+def Vernon_LoadOp : Vernon_Op<"load"> {
+  let summary = "Load one element through a ranked TensorView index";
+  let arguments = (ins Vernon_TensorViewType:$storage, Variadic<Index>:$indices,
+                       OptionalAttr<UnitAttr>:$physical_index);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
-def Vernon_WorkgroupStoreOp : Vernon_Op<"workgroup_store"> {
-  let summary = "Store one workgroup storage element";
-  let arguments = (ins AnyType:$value, Vernon_WorkgroupType:$storage, Index:$index);
+def Vernon_StoreOp : Vernon_Op<"store"> {
+  let summary = "Store one element through a ranked TensorView index";
+  let arguments = (ins AnyType:$value, Vernon_TensorViewType:$storage, Variadic<Index>:$indices,
+                       OptionalAttr<UnitAttr>:$physical_index);
   let hasVerifier = 1;
 }
 
 def Vernon_AtomicOp : Vernon_Op<"atomic"> {
-  let summary = "Atomic read-modify-write on workgroup or device storage";
-  let arguments = (ins AnyType:$storage, Index:$index, AnyType:$value,
-                       StrAttr:$atomic_kind, StrAttr:$ordering, StrAttr:$scope);
+  let summary = "Atomic read-modify-write with scope inferred from TensorView";
+  let arguments = (ins Vernon_TensorViewType:$storage, Variadic<Index>:$indices, AnyType:$value,
+                       StrAttr:$atomic_kind, StrAttr:$ordering,
+                       OptionalAttr<UnitAttr>:$physical_index);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }

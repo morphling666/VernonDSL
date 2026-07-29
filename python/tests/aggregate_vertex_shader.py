@@ -25,8 +25,8 @@ class SmallAggregateVertex:
 
 @vd.kernel(workgroup_size=(4, 1, 1))
 def copy_complex_aggregate_tensor_view(
-    output: vd.TensorView[ComplexAggregateVertex, 1, vd.write],
-    source: vd.TensorView[ComplexAggregateVertex, 1, vd.read],
+    output: vd.TensorView[ComplexAggregateVertex, (vd.dyn,), vd.write],
+    source: vd.TensorView[ComplexAggregateVertex, (vd.dyn,), vd.read],
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     output[gid[0]] = source[gid[0]]
@@ -51,7 +51,7 @@ def inspect_multidimensional_aggregate_tensor(
 
 @vd.kernel
 def inspect_multidimensional_aggregate_tensor_value(
-    output: vd.TensorView[vd.f32, 1, vd.write],
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
     values: vd.Tensor[ComplexAggregateVertex, (2, 3, 4)],
 ) -> None:
     inspected = inspect_multidimensional_aggregate_tensor(values)

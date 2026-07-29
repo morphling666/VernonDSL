@@ -21,7 +21,7 @@ class GBuffer:
 
 @vd.kernel(workgroup_size=(2, 1, 1))
 def feature_compute(
-    offset: vd.TensorView[vd.f32, 2, vd.read_write],
+    offset: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.read_write],
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     if PICKING:

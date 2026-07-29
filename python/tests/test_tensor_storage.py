@@ -305,27 +305,61 @@ class TensorViewFrontendTests(unittest.TestCase):
         "from vernon_dsl import *\n"
         "@kernel\n"
         "def copy(\n"
-        "    output: TensorView[f32, 1, write],\n"
-        "    source: TensorView[f32, 1, read],\n"
+        "    output: TensorView[f32, (dyn,), write],\n"
+        "    source: TensorView[f32, (dyn,), read],\n"
         "    gid: Annotated[Tensor[u32, (3,)], builtin('global_invocation_id')],\n"
         ") -> None:\n"
         "    output[gid[0]] = source[gid[0]]\n"
     )
 
-    def test_typed_model_preserves_tensor_view_rank_and_access(self) -> None:
+    def test_typed_model_preserves_tensor_view_shape_and_access(self) -> None:
         with self.subTest("lowering"):
             output = compile_source(self.SOURCE, "tensor_view.py")
-            self.assertIn('!vernon.tensor_view<f32, 1, "write">', output)
-            self.assertIn('!vernon.tensor_view<f32, 1, "read">', output)
+            self.assertIn(
+                '!vernon.tensor_view<f32, [-1], "write", "device">',
+                output,
+            )
+            self.assertIn(
+                '!vernon.tensor_view<f32, [-1], "read", "device">',
+                output,
+            )
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "tensor_view.py"
             path.write_text(self.SOURCE, encoding="utf-8")
             result = Compiler().compile_request(FrontendCompileRequest(path, "copy"))
         parameters = typed_model_data(result.typed_functions)[0]["parameters"]
-        self.assertEqual(parameters[0]["type"], '!vernon.tensor_view<f32, 1, "write">')
+        self.assertEqual(
+            parameters[0]["type"],
+            '!vernon.tensor_view<f32, [-1], "write", "device">',
+        )
+        self.assertEqual(result.typed_functions[0].parameters[0].type.arguments[1], ("?",))
         self.assertNotIn("storage", parameters[0])
         self.assertEqual(parameters[1]["access"], "read")
+
+    def test_tensor_view_accepts_static_dynamic_and_mixed_shapes(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@kernel\n"
+            "def shapes(\n"
+            "    static: TensorView[f32, (4, 8), read],\n"
+            "    dynamic: TensorView[f32, (dyn,), read],\n"
+            "    mixed: TensorView[f32, (dyn, 4), read],\n"
+            ") -> None:\n"
+            "    pass\n",
+            "tensor_view_shapes.py",
+        )
+
+        self.assertIn(
+            '!vernon.tensor_view<f32, [4, 8], "read", "device">',
+            output,
+        )
+        self.assertFalse(callable(vd.dyn))
+        with self.assertRaisesRegex(CompileError, "shape must be a non-empty tuple"):
+            compile_source(
+                "from vernon_dsl import *\n@kernel\ndef removed(value: TensorView[f32, 1, read]) -> None:\n    pass\n",
+                "removed_tensor_view_rank.py",
+            )
 
     def test_storage_diagnostics_are_explicit(self) -> None:
         with self.assertRaisesRegex(CompileError, "host-runtime owner"):
@@ -337,24 +371,24 @@ class TensorViewFrontendTests(unittest.TestCase):
             compile_source(
                 "from vernon_dsl import *\n"
                 "@kernel\n"
-                "def bad(value: TensorView[f32, 1, write]) -> f32:\n"
+                "def bad(value: TensorView[f32, (dyn,), write]) -> f32:\n"
                 "    return value[0]\n",
                 "write_only_load.py",
             )
-        with self.assertRaisesRegex(CompileError, "runtime stride descriptors"):
-            compile_source(
-                "from vernon_dsl import *\n"
-                "@kernel\n"
-                "def bad(value: TensorView[f32, 2, read]) -> f32:\n"
-                "    return value[0, 0]\n",
-                "rank_two_view.py",
-            )
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@kernel\n"
+            "def read(value: TensorView[f32, (dyn, dyn), read]) -> f32:\n"
+            "    return value[0, 0]\n",
+            "rank_two_view.py",
+        )
+        self.assertIn('"vernon.load"', output)
 
     def test_runtime_layout_specializes_multidimensional_tensor_view_indices(self) -> None:
         source = (
             "from vernon_dsl import *\n"
             "@kernel\n"
-            "def read(output: TensorView[f32, 1, write], value: TensorView[f32, 2, read]) -> None:\n"
+            "def read(output: TensorView[f32, (1,), write], value: TensorView[f32, (2, dyn), read]) -> None:\n"
             "    output[0] = value[1, 2]\n"
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -371,10 +405,7 @@ class TensorViewFrontendTests(unittest.TestCase):
                 )
             )
 
-        self.assertIn("arith.constant 2 : index", result.mlir)
-        self.assertIn("arith.constant 6 : index", result.mlir)
-        self.assertIn("arith.constant -1 : index", result.mlir)
-        self.assertIn('"tensor_view_load"', result.mlir)
+        self.assertIn('"vernon.load"', result.mlir)
         self.assertIn("vernon.tensor_shape = array<i64: 2, 3>", result.mlir)
         self.assertIn("vernon.tensor_strides = array<i64: 6, -1>", result.mlir)
         self.assertIn("vernon.tensor_offset = 2 : i64", result.mlir)
@@ -387,7 +418,9 @@ class TensorViewFrontendTests(unittest.TestCase):
         )
 
     def test_tensor_view_specialization_rejects_invalid_layouts(self) -> None:
-        source = "from vernon_dsl import *\n@kernel\ndef read(value: TensorView[f32, 2, read]) -> None:\n    pass\n"
+        source = (
+            "from vernon_dsl import *\n@kernel\ndef read(value: TensorView[f32, (2, dyn), read]) -> None:\n    pass\n"
+        )
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "invalid_view.py"
             path.write_text(source, encoding="utf-8")
@@ -405,6 +438,14 @@ class TensorViewFrontendTests(unittest.TestCase):
                         path,
                         "read",
                         tensor_view_layouts=(("value", "<f4", (2, 3), (3, 1), -1),),
+                    )
+                )
+            with self.assertRaisesRegex(ValueError, "dimension 0 is 3, expected 2"):
+                Compiler().compile_request(
+                    FrontendCompileRequest(
+                        path,
+                        "read",
+                        tensor_view_layouts=(("value", "<f4", (3, 4), (4, 1), 0),),
                     )
                 )
 

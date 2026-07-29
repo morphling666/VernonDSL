@@ -5,10 +5,10 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
+#include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAttributeAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonTensorShapeSemantics.h"
-#include "mlir/Dialect/Vernon/Transforms/VernonValueAbi.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -741,13 +741,17 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
                     }
                 } else if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(argumentType)) {
                     argument["kind"] = "tensor";
-                    argument["cuda_abi"] = "strided_memref_1d";
                     const std::string dtype =
                         sourceDtype ? sourceDtype.getValue().str() : scalarDtype(view.getElementType());
                     if (!dtype.empty())
                         argument["dtype"] = dtype;
                     argument["access"] = view.getAccess().str();
-                    argument["rank"] = static_cast<int64_t>(view.getRank());
+                    argument["address_space"] = view.getAddressSpace().str();
+                    argument["rank"] = static_cast<int64_t>(view.getShape().size());
+                    llvm::json::Array sourceShape;
+                    for (int64_t extent : view.getShape())
+                        sourceShape.emplace_back(extent);
+                    argument["source_shape"] = std::move(sourceShape);
                     mlir::FailureOr<mlir::vernon::ValueAbiLayout> storageLayout =
                         mlir::vernon::getValueAbiLayout(view.getElementType(), module);
                     if (mlir::failed(storageLayout)) {
@@ -774,24 +778,26 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
                         storageLeaves.emplace_back(std::move(reflectedLeaf));
                     }
                     argument["storage_leaves"] = std::move(storageLeaves);
-                    if (auto shape = attrs.getAs<mlir::DenseI64ArrayAttr>(mlir::vernon::kTensorShapeAttrName)) {
-                        auto strides = attrs.getAs<mlir::DenseI64ArrayAttr>(mlir::vernon::kTensorStridesAttrName);
-                        auto offset = attrs.getAs<mlir::IntegerAttr>(mlir::vernon::kTensorOffsetAttrName);
-                        if (!strides || strides.size() != shape.size() || !offset || offset.getInt() < 0) {
-                            function.emitError("TensorView specialization requires matching shape, signed strides, "
-                                               "and a non-negative offset");
+                    auto shape = attrs.getAs<mlir::DenseI64ArrayAttr>(mlir::vernon::kTensorShapeAttrName);
+                    auto strides = attrs.getAs<mlir::DenseI64ArrayAttr>(mlir::vernon::kTensorStridesAttrName);
+                    auto offset = attrs.getAs<mlir::IntegerAttr>(mlir::vernon::kTensorOffsetAttrName);
+                    if (strides || offset) {
+                        if (!strides || !offset || strides.size() != view.getShape().size() || offset.getInt() < 0 ||
+                            (shape && shape.size() != strides.size())) {
+                            function.emitError("TensorView layout requires rank-matched signed strides and a "
+                                               "non-negative offset");
                             invalid = true;
                             return;
                         }
-                        llvm::json::Array dimensions;
                         llvm::json::Array elementStrides;
-                        for (auto [dimension, tensorStride] :
-                             llvm::zip_equal(shape.asArrayRef(), strides.asArrayRef())) {
-                            dimensions.emplace_back(dimension);
+                        for (int64_t tensorStride : strides.asArrayRef())
                             elementStrides.emplace_back(tensorStride);
+                        if (shape) {
+                            llvm::json::Array dimensions;
+                            for (int64_t dimension : shape.asArrayRef())
+                                dimensions.emplace_back(dimension);
+                            argument["shape"] = std::move(dimensions);
                         }
-                        argument["rank"] = static_cast<int64_t>(shape.size());
-                        argument["shape"] = std::move(dimensions);
                         argument["element_strides"] = std::move(elementStrides);
                         argument["element_offset"] = offset.getInt();
                     }
@@ -949,26 +955,32 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
         return mlir::failure();
 
     llvm::json::Object root;
-    root["schema_version"] = int64_t{4};
+    root["schema_version"] = int64_t{5};
     root["gpu_launch_abi_version"] = int64_t{1};
-    int64_t valueAbiVersion = 0;
-    if (auto version = sourceModule->getAttrOfType<mlir::IntegerAttr>("vernon.value_abi_version"))
-        valueAbiVersion = version.getInt();
-    root["value_abi_version"] = valueAbiVersion;
+    auto valueAbiVersion = sourceModule->getAttrOfType<mlir::IntegerAttr>("vernon.value_abi_version");
+    if (!valueAbiVersion || valueAbiVersion.getInt() != mlir::vernon::kCurrentValueAbiVersion) {
+        sourceModule.emitError("cannot reflect a module with a missing or unsupported Value ABI version");
+        return mlir::failure();
+    }
+    root["value_abi_version"] = valueAbiVersion.getInt();
     root["entries"] = std::move(entries);
     root["artifacts"] = llvm::json::Array();
     std::map<std::string, llvm::json::Object> structLayouts;
     for (mlir::vernon::StructDeclOp declaration : sourceModule.getOps<mlir::vernon::StructDeclOp>()) {
+        auto structure = mlir::vernon::StructType::get(sourceModule.getContext(), declaration.getSymName());
+        mlir::FailureOr<mlir::vernon::ValueAbiLayout> planned =
+            mlir::vernon::getValueAbiLayout(structure, sourceModule);
+        if (mlir::failed(planned)) {
+            declaration.emitError("cannot derive canonical struct Value ABI layout");
+            return mlir::failure();
+        }
         llvm::json::Object layout;
         layout["name"] = declaration.getSymName().str();
-        if (auto size = declaration->getAttrOfType<mlir::IntegerAttr>("abi_size"))
-            layout["size"] = size.getInt();
-        if (auto alignment = declaration->getAttrOfType<mlir::IntegerAttr>("abi_alignment"))
-            layout["alignment"] = alignment.getInt();
+        layout["size"] = static_cast<int64_t>(planned->size);
+        layout["alignment"] = static_cast<int64_t>(planned->alignment);
         llvm::json::Array offsets;
-        if (auto values = declaration->getAttrOfType<mlir::DenseI64ArrayAttr>("abi_field_offsets"))
-            for (int64_t offset : values.asArrayRef())
-                offsets.emplace_back(offset);
+        for (uint64_t offset : planned->fieldOffsets)
+            offsets.emplace_back(static_cast<int64_t>(offset));
         layout["field_offsets"] = std::move(offsets);
         llvm::json::Array fields;
         if (auto values = declaration->getAttrOfType<mlir::ArrayAttr>("fields"))

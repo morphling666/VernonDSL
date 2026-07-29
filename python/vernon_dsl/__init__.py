@@ -39,8 +39,8 @@ from .intrinsics import (
     texture_sample,
     texture_size,
     vertex_id,
-    workgroup_array,
     workgroup_barrier,
+    workgroup_storage,
 )
 from .pipeline_assets import PipelineAssetDeclaration, pipeline_asset
 from .runtime import (
@@ -93,6 +93,7 @@ from .types import (
     attribute,
     bool,
     builtin,
+    dyn,
     f16,
     f32,
     f64,
@@ -160,6 +161,7 @@ __all__ = [
     "directx",
     "depth32",
     "dot",
+    "dyn",
     "exp",
     "f16",
     "f32",
@@ -209,6 +211,6 @@ __all__ = [
     "vulkan",
     "Vector",
     "write",
-    "workgroup_array",
+    "workgroup_storage",
     "workgroup_barrier",
 ]

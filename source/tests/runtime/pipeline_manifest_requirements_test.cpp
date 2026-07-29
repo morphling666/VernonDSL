@@ -9,6 +9,37 @@ namespace {
 using vernon::runtime::parseRuntimeRequirements;
 using vernon::runtime::RuntimeRequirements;
 
+nlohmann::json validTensorVariant() {
+    return {{"key", nlohmann::json::array()},
+            {"program", {{"compute", "compute.spv"}}},
+            {"parameters", nlohmann::json::array(
+                               {{{"slot", 0},
+                                 {"name", "values"},
+                                 {"kind", "tensor"},
+                                 {"type", "!vernon.tensor_view<f32, [1], \"read_write\", \"device\">"},
+                                 {"access", "read_write"},
+                                 {"address_space", "device"},
+                                 {"shape", nlohmann::json::array({1})},
+                                 {"element_layout",
+                                  {{"logical_type", "f32"},
+                                   {"layout_hash", "cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b"},
+                                   {"byte_size", 4},
+                                   {"alignment", 4},
+                                   {"leaves", nlohmann::json::array({{{"path", nlohmann::json::array()},
+                                                                      {"dtype", "f32"},
+                                                                      {"scalar_count", 1},
+                                                                      {"byte_offset", 0}}})}}},
+                                 {"uses", nlohmann::json::array({{{"stage", "compute"},
+                                                                  {"interface", "resource"},
+                                                                  {"vernon.set", 0},
+                                                                  {"vernon.binding", 0},
+                                                                  {"shape", nlohmann::json::array({1})},
+                                                                  {"element_strides", nlohmann::json::array({1})},
+                                                                  {"element_offset", 0}}})}}})},
+            {"internal_parameters", nlohmann::json::array()},
+            {"outputs", nlohmann::json::array()}};
+}
+
 TEST(PipelineManifestRequirements, RejectsMissingRuntimeRequirements) {
     RuntimeRequirements requirements;
     std::string error;
@@ -151,6 +182,8 @@ TEST(PipelineManifestRequirements, ParsesReflectedUniformTensorLayout) {
              {{{"slot", 0},
                {"name", "weights"},
                {"kind", "tensor"},
+               {"type", "tensor<2x3xf32>"},
+               {"access", "read"},
                {"element_layout",
                 {{"logical_type", "f32"},
                  {"byte_size", 4},
@@ -172,7 +205,8 @@ TEST(PipelineManifestRequirements, ParsesReflectedUniformTensorLayout) {
                                                   {"transport", "uniform_buffer"},
                                                   {"size", 32},
                                                   {"alignment", 16},
-                                                  {"byte_strides", nlohmann::json::array({16, 4})}}}}})}}})}};
+                                                  {"byte_strides", nlohmann::json::array({16, 4})}}}}})}}})},
+        {"outputs", nlohmann::json::array()}};
     vernon::runtime::Variant variant;
     std::string error;
     ASSERT_TRUE(vernon::runtime::parseVariant(manifest, variant, error)) << error;
@@ -189,12 +223,55 @@ TEST(PipelineManifestRequirements, ParsesReflectedUniformTensorLayout) {
     EXPECT_TRUE(variant.parameters[0].elementLayout.leaves[0].path.empty());
 }
 
+TEST(PipelineManifestRequirements, RejectsUnknownAndLegacyVariantRecords) {
+    vernon::runtime::Variant variant;
+    std::string error;
+    nlohmann::json manifest = validTensorVariant();
+    manifest["unknown"] = true;
+    EXPECT_FALSE(vernon::runtime::parseVariant(manifest, variant, error));
+
+    manifest = validTensorVariant();
+    manifest["parameters"][0]["unknown"] = true;
+    EXPECT_FALSE(vernon::runtime::parseVariant(manifest, variant, error));
+
+    manifest = validTensorVariant();
+    manifest["parameters"][0]["uses"][0]["unknown"] = true;
+    EXPECT_FALSE(vernon::runtime::parseVariant(manifest, variant, error));
+
+    manifest = validTensorVariant();
+    manifest["parameters"][0]["vernon.compiler_generated"] = true;
+    EXPECT_FALSE(vernon::runtime::parseVariant(manifest, variant, error));
+
+    manifest = validTensorVariant();
+    manifest["outputs"].push_back(
+        {{"name", "color"}, {"kind", "tensor"}, {"dtype", "f32"}, {"shape", {4}}, {"location", 0}, {"unknown", true}});
+    EXPECT_FALSE(vernon::runtime::parseVariant(manifest, variant, error));
+}
+
+TEST(PipelineManifestRequirements, RejectsParameterKindTypeAndAddressSpaceMismatch) {
+    vernon::runtime::Variant variant;
+    std::string error;
+    nlohmann::json manifest = validTensorVariant();
+    manifest["parameters"][0]["kind"] = "texture";
+    EXPECT_FALSE(vernon::runtime::parseVariant(manifest, variant, error));
+
+    manifest = validTensorVariant();
+    manifest["parameters"][0]["address_space"] = "workgroup";
+    EXPECT_FALSE(vernon::runtime::parseVariant(manifest, variant, error));
+
+    manifest = validTensorVariant();
+    manifest["parameters"][0]["type"] = "!vernon.sampler";
+    EXPECT_FALSE(vernon::runtime::parseVariant(manifest, variant, error));
+}
+
 TEST(PipelineManifestRequirements, RejectsAmbiguousOrUnresolvedResourceBindings) {
     const auto texture = [](uint32_t slot, const char *name, uint32_t binding) {
         return nlohmann::json{{"slot", slot},
                               {"name", name},
                               {"kind", "texture"},
+                              {"type", "!vernon.texture<\"2d\", f32>"},
                               {"access", "read"},
+                              {"shape", nlohmann::json::array()},
                               {"dimension", "2d"},
                               {"uses", nlohmann::json::array({{{"stage", "fragment"},
                                                                {"interface", "resource"},
@@ -203,7 +280,8 @@ TEST(PipelineManifestRequirements, RejectsAmbiguousOrUnresolvedResourceBindings)
     };
     nlohmann::json manifest = {{"key", nlohmann::json::array()},
                                {"program", {{"vertex", "vertex"}, {"fragment", "fragment"}}},
-                               {"parameters", nlohmann::json::array({texture(0, "left", 3), texture(1, "right", 3)})}};
+                               {"parameters", nlohmann::json::array({texture(0, "left", 3), texture(1, "right", 3)})},
+                               {"outputs", nlohmann::json::array()}};
     vernon::runtime::Variant variant;
     std::string error;
     EXPECT_FALSE(vernon::runtime::parseVariant(manifest, variant, error));
@@ -213,7 +291,9 @@ TEST(PipelineManifestRequirements, RejectsAmbiguousOrUnresolvedResourceBindings)
         {{{"slot", 0},
           {"name", "sampler"},
           {"kind", "sampler"},
+          {"type", "!vernon.sampler"},
           {"access", "read"},
+          {"shape", nlohmann::json::array()},
           {"uses", nlohmann::json::array(
                        {{{"stage", "fragment"},
                          {"interface", "resource"},

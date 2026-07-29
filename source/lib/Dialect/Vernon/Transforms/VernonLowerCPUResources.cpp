@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
@@ -22,32 +23,32 @@ namespace {
 
 constexpr StringLiteral kTextureHelperName = "__vernon_cpu_texture_sample";
 
-struct BufferLoadPattern final : OpConversionPattern<IntrinsicOp> {
+FailureOr<Value> physicalIndex(Operation *operation, ValueRange indices) {
+    if (!operation->hasAttr(kPhysicalIndexAttrName) || indices.empty())
+        return failure();
+    return indices.front();
+}
+
+struct BufferLoadPattern final : OpConversionPattern<LoadOp> {
     using OpConversionPattern::OpConversionPattern;
 
-    LogicalResult matchAndRewrite(IntrinsicOp op, OpAdaptor adaptor,
-                                  ConversionPatternRewriter &rewriter) const override {
-        if (classifyCpuIntrinsic(op.getName()) != CpuIntrinsicKind::TensorViewLoad)
-            return failure();
-        if (adaptor.getOperands().size() != 2 || op.getNumResults() != 1)
-            return rewriter.notifyMatchFailure(op, "tensor_view_load expects a TensorView, index, and one result");
-        rewriter.replaceOpWithNewOp<memref::LoadOp>(op, adaptor.getOperands()[0], adaptor.getOperands()[1]);
+    LogicalResult matchAndRewrite(LoadOp op, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
+        FailureOr<Value> index = physicalIndex(op, adaptor.getIndices());
+        if (failed(index))
+            return rewriter.notifyMatchFailure(op, "cannot project TensorView indices");
+        rewriter.replaceOpWithNewOp<memref::LoadOp>(op, adaptor.getStorage(), *index);
         return success();
     }
 };
 
-struct BufferStorePattern final : OpConversionPattern<IntrinsicOp> {
+struct BufferStorePattern final : OpConversionPattern<StoreOp> {
     using OpConversionPattern::OpConversionPattern;
 
-    LogicalResult matchAndRewrite(IntrinsicOp op, OpAdaptor adaptor,
-                                  ConversionPatternRewriter &rewriter) const override {
-        if (classifyCpuIntrinsic(op.getName()) != CpuIntrinsicKind::TensorViewStore)
-            return failure();
-        if (adaptor.getOperands().size() != 3 || op.getNumResults() != 0)
-            return rewriter.notifyMatchFailure(op,
-                                               "tensor_view_store expects a TensorView, index, value, and no result");
-        rewriter.replaceOpWithNewOp<memref::StoreOp>(op, adaptor.getOperands()[2], adaptor.getOperands()[0],
-                                                     adaptor.getOperands()[1]);
+    LogicalResult matchAndRewrite(StoreOp op, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
+        FailureOr<Value> index = physicalIndex(op, adaptor.getIndices());
+        if (failed(index))
+            return rewriter.notifyMatchFailure(op, "cannot project TensorView indices");
+        rewriter.replaceOpWithNewOp<memref::StoreOp>(op, adaptor.getValue(), adaptor.getStorage(), *index);
         return success();
     }
 };
@@ -65,8 +66,10 @@ struct AtomicPattern final : OpConversionPattern<AtomicOp> {
                                     : op.getAtomicKind() == "umin" ? arith::AtomicRMWKind::minu
                                     : op.getAtomicKind() == "umax" ? arith::AtomicRMWKind::maxu
                                                                    : arith::AtomicRMWKind::assign;
-        rewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(op, kind, adaptor.getValue(), adaptor.getStorage(),
-                                                         ValueRange{adaptor.getIndex()});
+        FailureOr<Value> index = physicalIndex(op, adaptor.getIndices());
+        if (failed(index))
+            return rewriter.notifyMatchFailure(op, "cannot project TensorView atomic indices");
+        rewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(op, kind, adaptor.getValue(), adaptor.getStorage(), *index);
         return success();
     }
 };

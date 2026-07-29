@@ -12,10 +12,10 @@ def grid_row(index: vd.u32, width: vd.u32) -> vd.u32:
 
 @vd.kernel(workgroup_size=(64, 1, 1))
 def step_ocean(
-    height: vd.TensorView[vd.f32, 1, vd.read],
-    velocity: vd.TensorView[vd.f32, 1, vd.read],
-    next_height: vd.TensorView[vd.f32, 1, vd.write],
-    next_velocity: vd.TensorView[vd.f32, 1, vd.write],
+    height: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+    velocity: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+    next_height: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    next_velocity: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
     width: vd.u32,
     delta_time: vd.f32,
     phase: vd.f32,
@@ -60,11 +60,11 @@ def step_ocean(
 
 @vd.kernel(workgroup_size=(64, 1, 1))
 def build_ocean_mesh(
-    height: vd.TensorView[vd.f32, 1, vd.read],
-    positions: vd.TensorView[vd.f32, 2, vd.write],
-    normals: vd.TensorView[vd.f32, 2, vd.write],
-    colors: vd.TensorView[vd.f32, 2, vd.write],
-    materials: vd.TensorView[vd.f32, 2, vd.write],
+    height: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+    positions: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write],
+    normals: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write],
+    colors: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write],
+    materials: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write],
     width: vd.u32,
     extent: vd.f32,
     phase: vd.f32,

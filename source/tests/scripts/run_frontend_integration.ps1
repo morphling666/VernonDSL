@@ -89,7 +89,7 @@ try {
   }
   $openGlReflection = Get-Content (Join-Path $openGlOutput "reflection.json") -Raw |
     ConvertFrom-Json
-  if ($openGlReflection.schema_version -ne 4 -or
+  if ($openGlReflection.schema_version -ne 5 -or
       $openGlReflection.target -ne "opengl" -or
       $openGlReflection.target_options.glsl_version -ne 330 -or
       $openGlReflection.artifacts.Count -ne 2 -or

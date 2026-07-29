@@ -61,6 +61,7 @@ class Compiler:
         self._helper_specializations = tuple(getattr(module, "_vernon_helper_specializations", ()))
         self._typed_functions = tuple(getattr(module, "_vernon_typed_functions", ()))
         context.typed_functions = {function.symbol: function for function in self._typed_functions}
+        self._validate_tensor_view_layouts(context)
         self._collect_signatures(module, context, type_parser)
 
         def emit_function(node: ast.FunctionDef) -> list[str]:
@@ -257,6 +258,31 @@ class Compiler:
                     raise context.error(node.returns, f"shared function '{node.name}' uses a device-only result")
             context.signatures[node.name] = FunctionSignature(tuple(arguments), result)
             context.result_annotations[node.name] = result_annotation
+
+    @staticmethod
+    def _validate_tensor_view_layouts(context: ModuleContext) -> None:
+        if not context.tensor_view_layouts:
+            return
+        entry = context.typed_functions.get(context.runtime_entry or "")
+        if entry is None:
+            raise ValueError("TensorView specialization requires a runtime entry")
+        parameters = {parameter.name: parameter for parameter in entry.parameters}
+        for name, layout in context.tensor_view_layouts.items():
+            parameter = parameters.get(name)
+            if parameter is None or parameter.type.kind != "tensor_view":
+                raise ValueError(f"TensorView specialization {name!r} does not name a TensorView entry parameter")
+            shape = parameter.type.arguments[1]
+            if not isinstance(shape, tuple):
+                raise RuntimeError(f"TensorView entry parameter {name!r} has an unresolved shape")
+            if len(layout.shape) != len(shape):
+                raise ValueError(
+                    f"TensorView specialization {name!r} has rank {len(layout.shape)}, expected {len(shape)}"
+                )
+            for dimension, (actual, expected) in enumerate(zip(layout.shape, shape, strict=True)):
+                if expected != "?" and actual != expected:
+                    raise ValueError(
+                        f"TensorView specialization {name!r} dimension {dimension} is {actual}, expected {expected}"
+                    )
 
     @staticmethod
     def _is_shared_function(node: ast.FunctionDef) -> bool:

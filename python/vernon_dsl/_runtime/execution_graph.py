@@ -369,7 +369,8 @@ class RenderPass(ExecutionPass):
         super()._native_declare()
 
     def _native_execute(self, native_encoder: Any) -> None:
-        assert self._graph is not None
+        if self._graph is None:
+            raise RuntimeError("render pass execution requires a declared execution graph")
         encoder = GraphicsEncoder(
             self,
             native_encoder,
@@ -387,7 +388,8 @@ class ComputePass(ExecutionPass):
         raise NotImplementedError
 
     def _native_execute(self, native_encoder: Any) -> None:
-        assert self._graph is not None
+        if self._graph is None:
+            raise RuntimeError("compute pass execution requires a declared execution graph")
         encoder = ComputeEncoder(native_encoder)
         try:
             self.execute(encoder, ExecutionResources(self._graph))

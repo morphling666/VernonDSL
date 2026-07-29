@@ -9,6 +9,9 @@
 
 namespace mlir::vernon {
 
+inline constexpr int64_t kCurrentFrontendVersion = 4;
+inline constexpr int64_t kCurrentValueAbiVersion = 1;
+
 /// Stable textual schema for shader entry points:
 ///
 ///   func.func @main(...) -> (...) attributes {
@@ -43,6 +46,7 @@ inline constexpr llvm::StringLiteral kInstanceDivisorAttrName = "vernon.instance
 inline constexpr llvm::StringLiteral kTensorShapeAttrName = "vernon.tensor_shape";
 inline constexpr llvm::StringLiteral kTensorStridesAttrName = "vernon.tensor_strides";
 inline constexpr llvm::StringLiteral kTensorOffsetAttrName = "vernon.tensor_offset";
+inline constexpr llvm::StringLiteral kPhysicalIndexAttrName = "physical_index";
 
 enum class ShaderStage { Vertex, Fragment, Compute };
 enum class InterfaceKind { Input, Output, Uniform, Resource };

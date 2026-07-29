@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mlir/Dialect/Vernon/Transforms/VernonValueAbi.h"
+#include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 
 namespace mlir::vernon {
 

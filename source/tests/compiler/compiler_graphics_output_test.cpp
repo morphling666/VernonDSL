@@ -15,7 +15,7 @@
 namespace {
 
 constexpr std::string_view module = R"mlir(
-module {
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
   func.func @cube_map_vertex(
       %aPos: tensor<3xf32> {
         vernon.interface = "input",
@@ -313,7 +313,7 @@ TEST(CompilerGraphicsOutput, PreservesInterfacesTexturesAndSwizzles) {
 
 TEST(CompilerGraphicsOutput, LowersSamplingBuiltinsTextureSizeAndMath) {
     constexpr std::string_view samplingModule = R"mlir(
-module {
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
   func.func @sampling_fragment(
       %texture: !vernon.texture<"2d", f32> {
         vernon.interface = "resource", vernon.set = 0 : i64,
@@ -467,7 +467,7 @@ module {
 
 TEST(CompilerGraphicsOutput, LowersRecursiveStaticTensorValuesAndReflectsPhysicalLayout) {
     constexpr std::string_view tensorModule = R"mlir(
-module {
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
   func.func @static_tensor_fragment(
       %value: tensor<2x3x5xf32> {
         vernon.interface = "uniform",
@@ -587,14 +587,14 @@ module {
 
 TEST(CompilerGraphicsOutput, LowersStaticTensorByValueComputeAbi) {
     constexpr std::string_view tensorModule = R"mlir(
-module {
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
   func.func @static_tensor_compute(
       %value: tensor<2x2x2xf32> {
         vernon.interface = "input",
         vernon.location = 0 : i64,
         vernon.dtype = "f32"
       },
-      %output: !vernon.tensor_view<f32, 1, "write"> {
+      %output: !vernon.tensor_view<f32, [1], "write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
         vernon.binding = 0 : i64,
@@ -611,9 +611,8 @@ module {
     %ones = arith.constant dense<1.0> : tensor<2x2x2xf32>
     %sum = arith.addf %value, %ones : tensor<2x2x2xf32>
     %value_at_index = tensor.extract %sum[%one, %zero, %one] : tensor<2x2x2xf32>
-    "vernon.intrinsic"(%output, %zero, %value_at_index) {
-      name = "tensor_view_store"
-    } : (!vernon.tensor_view<f32, 1, "write">, index, f32) -> ()
+    "vernon.store"(%value_at_index, %output, %zero) :
+      (f32, !vernon.tensor_view<f32, [1], "write", "device">, index) -> ()
     return
   }
 }
@@ -670,7 +669,7 @@ module {
 
 TEST(CompilerGraphicsOutput, ReflectsAndValidatesCanonicalTensorAttributeLeaves) {
     constexpr std::string_view validModule = R"mlir(
-module {
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
   func.func @tensor_attribute(
       %value: tensor<2x3xf32> {
         vernon.interface = "input",
@@ -708,7 +707,7 @@ module {
     vernonCompileResultDestroy(result);
 
     constexpr std::string_view overlapModule = R"mlir(
-module {
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
   func.func @overlap(
       %value: tensor<2x3xf32> {
         vernon.interface = "input", vernon.location = 0 : i64, vernon.dtype = "f32"
@@ -733,14 +732,11 @@ module {
 
 TEST(CompilerGraphicsOutput, LowersAndReflectsMixedDtypeStructAttributes) {
     constexpr std::string_view aggregateModule = R"mlir(
-module {
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
   "vernon.struct"() {
     sym_name = "Vertex",
     fields = ["position:tensor<3xf32>", "object_id:i32", "uv:tensor<2xf32>"],
-    abi_leaf_dtypes = ["f32", "u32", "f32"],
-    abi_size = 24 : i64,
-    abi_alignment = 4 : i64,
-    abi_field_offsets = array<i64: 0, 12, 16>
+    abi_leaf_dtypes = ["f32", "u32", "f32"]
   } : () -> ()
   func.func @aggregate_vertex(
       %value: !vernon.struct<"Vertex"> {
@@ -776,7 +772,7 @@ module {
     ASSERT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
     const VernonStringView reflection = vernonCompileResultGetReflection(result);
     const std::string_view reflected(reflection.data, reflection.size);
-    EXPECT_NE(reflected.find("\"schema_version\":4"), std::string_view::npos);
+    EXPECT_NE(reflected.find("\"schema_version\":5"), std::string_view::npos);
     EXPECT_NE(reflected.find("\"struct_name\":\"Vertex\""), std::string_view::npos);
     EXPECT_NE(reflected.find("\"location_span\":3"), std::string_view::npos);
     EXPECT_NE(reflected.find("\"dtype\":\"u32\""), std::string_view::npos);
@@ -788,25 +784,19 @@ module {
 
 TEST(CompilerGraphicsOutput, ReflectsNestedLogicalAndPhysicalAbiRoutes) {
     constexpr std::string_view nestedModule = R"mlir(
-module {
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
   "vernon.struct"() {
     sym_name = "Payload",
     fields = ["id:i32", "weights:tensor<2xf32>"],
-    abi_leaf_dtypes = ["i32", "f32"],
-    abi_size = 12 : i64,
-    abi_alignment = 4 : i64,
-    abi_field_offsets = array<i64: 0, 4>
+    abi_leaf_dtypes = ["i32", "f32"]
   } : () -> ()
   "vernon.struct"() {
     sym_name = "Nested",
     fields = ["payload:!vernon.struct<\"Payload\">", "pair:tuple<f32, i32>"],
-    abi_leaf_dtypes = ["i32", "f32", "f32", "u32"],
-    abi_size = 20 : i64,
-    abi_alignment = 4 : i64,
-    abi_field_offsets = array<i64: 0, 12>
+    abi_leaf_dtypes = ["i32", "f32", "f32", "u32"]
   } : () -> ()
   func.func @nested(
-      %values: !vernon.tensor_view<!vernon.struct<"Nested">, 1, "read"> {
+      %values: !vernon.tensor_view<!vernon.struct<"Nested">, [2], "read", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
         vernon.binding = 0 : i64,

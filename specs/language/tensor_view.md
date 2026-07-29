@@ -2,17 +2,19 @@
 
 ## Status
 
-This document records the accepted Tensor-family design for the next
-implementation session. It is a coordinated breaking migration of the current
-TensorView shape model and workgroup storage model. The old `workgroup_array`
-and `!vernon.workgroup` forms are removed directly; no aliases, parser
-fallbacks, IR translations, reflection readers, or runtime compatibility paths
-are added.
+This document records the accepted Tensor-family design and the in-progress v4
+migration of the TensorView shape model and workgroup storage model. The old
+`workgroup_array` and `!vernon.workgroup` forms are removed directly; no
+aliases, parser fallbacks, IR translations, reflection readers, or runtime
+compatibility paths are added.
 
-The frontend continues to identify as language version 3 until every v4
-acceptance gate in `contract.md` is complete. Serialized reflection, pipeline,
-and invocation ABI versions must still be bumped wherever this migration
-changes their records.
+The Python frontend reports language version 4. Source syntax, typed IR, and
+compile-time tests cover unified TensorView load/store/atomic operations,
+workgroup address space, and `workgroup_storage`. End-to-end runtime parity,
+the final runtime TensorView layout ABI, and several compiler validation gates
+described in `specs/compiler/root_cause_audit.md` remain open. Serialized
+reflection, pipeline, and invocation ABI versions are bumped wherever this
+migration changes their records.
 
 ## 1. Tensor family and semantic categories
 
@@ -261,9 +263,9 @@ Dynamic dimensions use the canonical MLIR dynamic extent. Workgroup dimensions
 must be static. Device argument layout remains in validated shape/stride/offset
 attributes when concrete specialization data is required.
 
-IR has unified typed TensorView allocation, load, store, and atomic operations
-with ranked indices. Workgroup-specific load/store operations and stringly
-`tensor_view_load`/`tensor_view_store` intrinsics are removed. Load, store, and
+IR has unified typed TensorView allocation, `vernon.load`, `vernon.store`, and
+atomic operations with ranked indices. Workgroup-specific load/store operations
+and the previous stringly intrinsic spellings are removed. Load, store, and
 atomic use one checked index projection. Atomic scope is derived from the
 TensorView type and is not stored independently. Barrier scope remains an
 operation attribute.

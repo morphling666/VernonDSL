@@ -10,6 +10,8 @@
 
 namespace vernon::runtime {
 
+struct ParameterUse;
+
 size_t dataTypeSize(VernonDataType dtype);
 
 bool valueLayoutValid(const VernonValueLayoutView &layout);
@@ -22,6 +24,7 @@ std::optional<size_t> tensorLogicalByteSize(const VernonTensorView &tensor);
 
 bool tensorRequiredSpan(const VernonTensorView &tensor, size_t &span);
 bool tensorFitsAllocation(const VernonTensorView &tensor);
+bool tensorMatchesSpecialization(const VernonTensorView &tensor, const ParameterUse &use);
 
 bool isRowMajorContiguous(const VernonTensorView &tensor);
 

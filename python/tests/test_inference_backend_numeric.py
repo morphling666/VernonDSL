@@ -25,8 +25,8 @@ def transform(value):
 
 @vd.kernel(workgroup_size=(8, 1, 1))
 def inferred_numeric(
-    output: vd.TensorView[vd.f32, 1, vd.write],
-    values: vd.TensorView[vd.f32, 1, vd.read],
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    values: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     x = gid[0]
@@ -39,8 +39,8 @@ def inferred_numeric(
 
 @vd.kernel(workgroup_size=(8, 1, 1))
 def scale_f16(
-    output: vd.TensorView[vd.f16, 1, vd.write],
-    values: vd.TensorView[vd.f16, 1, vd.read],
+    output: vd.TensorView[vd.f16, (vd.dyn,), vd.write],
+    values: vd.TensorView[vd.f16, (vd.dyn,), vd.read],
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     x = gid[0]
@@ -49,8 +49,8 @@ def scale_f16(
 
 @vd.kernel(workgroup_size=(8, 1, 1))
 def scale_f64(
-    output: vd.TensorView[vd.f64, 1, vd.write],
-    values: vd.TensorView[vd.f64, 1, vd.read],
+    output: vd.TensorView[vd.f64, (vd.dyn,), vd.write],
+    values: vd.TensorView[vd.f64, (vd.dyn,), vd.read],
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     x = gid[0]

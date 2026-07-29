@@ -10,7 +10,7 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
-#include "mlir/Dialect/Vernon/Transforms/VernonValueAbi.h"
+#include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 
 #include <cstring>
 #include <string>
@@ -25,7 +25,10 @@ std::string copyStringView(VernonStringView value) {
 bool validateTargetCapabilities(PreparedModule &prepared, VernonTarget target, std::string &diagnostics) {
     mlir::OwningOpRef<mlir::ModuleOp> module = prepared.clone();
     bool usesDeviceAtomics = false;
-    module->walk([&](mlir::vernon::AtomicOp atomic) { usesDeviceAtomics |= atomic.getScope() == "device"; });
+    module->walk([&](mlir::vernon::AtomicOp atomic) {
+        auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(atomic.getStorage().getType());
+        usesDeviceAtomics |= view && view.getAddressSpace() == "device";
+    });
     if (usesDeviceAtomics && target != VERNON_TARGET_CPU && target != VERNON_TARGET_CUDA &&
         target != VERNON_TARGET_VULKAN) {
         diagnostics = "device-scope storage TensorView atomics are supported only by CPU, CUDA, and Vulkan targets";
@@ -39,9 +42,16 @@ bool validateTargetCapabilities(PreparedModule &prepared, VernonTarget target, s
             if (invalid ||
                 !mlir::isa<mlir::vernon::WorkgroupAllocOp, mlir::vernon::AtomicOp, mlir::vernon::BarrierOp>(operation))
                 return;
-            if (auto atomic = mlir::dyn_cast<mlir::vernon::AtomicOp>(operation);
-                atomic && atomic.getScope() == "device")
-                return;
+            if (auto atomic = mlir::dyn_cast<mlir::vernon::AtomicOp>(operation); atomic) {
+                auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(atomic.getStorage().getType());
+                if (!view) {
+                    diagnostics = "atomic storage operand is not a TensorView";
+                    invalid = true;
+                    return;
+                }
+                if (view.getAddressSpace() == "device")
+                    return;
+            }
             mlir::func::FuncOp function = operation->getParentOfType<mlir::func::FuncOp>();
             auto size = function ? function->getAttrOfType<mlir::DenseI32ArrayAttr>("vernon.workgroup_size") : nullptr;
             if (!size || size.size() != 3 || size[0] != 1 || size[1] != 1 || size[2] != 1)

@@ -9,6 +9,7 @@ from dataclasses import replace
 from ..language.ast_utils import decorator_name, dotted_name, rectangular_literal
 from ..language.stage_registry import ENTRY_DECORATORS
 from ..shader_contracts import ATOMIC_OPERATION_NAMES, GENERATED_INTERFACE_CONTRACTS, TypeContract
+from .abi import workgroup_physical_bytes
 from .model import (
     AccessMode,
     AtomicEffect,
@@ -93,12 +94,23 @@ def _annotation(value_type: ConcreteType) -> ast.expr:
             ctx=ast.Load(),
         )
     if value_type.kind == "tensor_view":
-        element, rank, access = value_type.arguments
+        element, shape, access, _ = value_type.arguments
         assert isinstance(element, ConcreteType)
+        assert isinstance(shape, tuple)
         return ast.Subscript(
             value=ast.Name(id="TensorView", ctx=ast.Load()),
             slice=ast.Tuple(
-                elts=[_annotation(element), ast.Constant(value=rank), ast.Name(id=str(access), ctx=ast.Load())],
+                elts=[
+                    _annotation(element),
+                    ast.Tuple(
+                        elts=[
+                            ast.Name(id="dyn", ctx=ast.Load()) if extent == "?" else ast.Constant(value=extent)
+                            for extent in shape
+                        ],
+                        ctx=ast.Load(),
+                    ),
+                    ast.Name(id=str(access), ctx=ast.Load()),
+                ],
                 ctx=ast.Load(),
             ),
             ctx=ast.Load(),
@@ -543,7 +555,8 @@ class _Inference:
             for expression in expressions
             if isinstance(expression.source, ast.Subscript)
             and expression.operand_types
-            and expression.operand_types[0].kind == "workgroup"
+            and expression.operand_types[0].kind == "tensor_view"
+            and expression.operand_types[0].arguments[3] == "workgroup"
         }
 
         def effect_for(node: ast.Subscript, kind: StorageEffectKind) -> StorageEffect | None:
@@ -626,23 +639,29 @@ class _Inference:
                 if not isinstance(call.args[0], ast.Name):
                     raise self.error(call.args[0], "internal compiler error: typed atomic owner is not a name")
                 index = call.args[1]
+                index_nodes = list(index.elts) if isinstance(index, ast.Tuple) else [index]
+                constant_indices = tuple(
+                    item.value
+                    for item in index_nodes
+                    if isinstance(item, ast.Constant)
+                    and isinstance(item.value, int)
+                    and not isinstance(item.value, bool)
+                )
                 region = (
-                    StorageRegion(StorageRegionKind.ELEMENT, (index.value,))
-                    if isinstance(index, ast.Constant)
-                    and isinstance(index.value, int)
-                    and not isinstance(index.value, bool)
+                    StorageRegion(StorageRegionKind.ELEMENT, constant_indices)
+                    if len(constant_indices) == len(index_nodes)
                     else StorageRegion(StorageRegionKind.UNKNOWN)
                 )
                 owner_record = self.expression_records.get(id(call.args[0]))
                 if owner_record is None or not isinstance(owner_record[1], ConcreteType):
                     raise self.error(call.args[0], "internal compiler error: atomic storage owner has no type")
                 owner_type = owner_record[1]
-                if owner_type.kind == "tensor_view":
-                    scope = EffectScope.DEVICE
-                    owner_kind = StorageOwnerKind.PARAMETER
-                elif owner_type.kind == "workgroup":
+                if owner_type.kind == "tensor_view" and owner_type.arguments[3] == "workgroup":
                     scope = EffectScope.WORKGROUP
                     owner_kind = StorageOwnerKind.WORKGROUP_LOCAL
+                elif owner_type.kind == "tensor_view":
+                    scope = EffectScope.DEVICE
+                    owner_kind = StorageOwnerKind.PARAMETER
                 else:
                     raise self.error(
                         call.args[0],
@@ -783,7 +802,6 @@ class _Inference:
                     if not isinstance(target_type, ConcreteType) or target_type.kind not in {
                         "tensor",
                         "tensor_view",
-                        "workgroup",
                     }:
                         raise self.error(statement.targets[0], "indexed assignment requires writable Storage")
                     if target_type.kind == "tensor_view" and target_type.arguments[2] == "read":
@@ -1068,7 +1086,7 @@ class _Inference:
                 and value_type.arguments[2] == "write"
             ):
                 raise self.error(node, "cannot load through a write-only TensorView")
-            if isinstance(value_type, ConcreteType) and value_type.kind in {"tensor", "tensor_view", "workgroup"}:
+            if isinstance(value_type, ConcreteType) and value_type.kind in {"tensor", "tensor_view"}:
                 element = value_type.arguments[0]
                 assert isinstance(element, ConcreteType)
                 return element
@@ -1159,21 +1177,30 @@ class _Inference:
         name = getattr(node, "_vernon_generic_name", resolved_name)
         if name in {"Tensor", "Vector", "Matrix"}:
             return self._aggregate(node, environment, name)
-        if name == "workgroup_array":
-            if (
-                len(node.args) != 2
-                or node.keywords
-                or not isinstance(node.args[0], (ast.Name, ast.Attribute))
-                or not isinstance(node.args[1], ast.Constant)
-                or not isinstance(node.args[1].value, int)
-                or isinstance(node.args[1].value, bool)
-                or node.args[1].value <= 0
-            ):
-                raise self.error(node, "workgroup_array requires an integer scalar type and positive literal size")
-            element_name = (dotted_name(node.args[0]) or "").split(".")[-1]
-            if element_name not in {"i32", "u32"}:
-                raise self.error(node.args[0], "workgroup_array currently supports i32 and u32 elements")
-            return ConcreteType("workgroup", "Workgroup", (_scalar(element_name), node.args[1].value))
+        if name == "workgroup_storage":
+            if len(node.args) != 1 or len(node.keywords) != 1 or node.keywords[0].arg != "shape":
+                raise self.error(node, "workgroup_storage requires an element type and shape=(...)")
+            element = self.parse_type(node.args[0])
+            if not is_abi_stable_value(element, lambda struct: tuple(value for _, value in self.structs[struct])):
+                raise self.error(node.args[0], "workgroup_storage element must be an ABI-stable Value")
+            shape_node = node.keywords[0].value
+            if not isinstance(shape_node, ast.Tuple) or not shape_node.elts:
+                raise self.error(shape_node, "workgroup_storage shape must be a non-empty tuple")
+            shape: list[int] = []
+            for extent in shape_node.elts:
+                if (
+                    not isinstance(extent, ast.Constant)
+                    or not isinstance(extent.value, int)
+                    or isinstance(extent.value, bool)
+                    or extent.value <= 0
+                ):
+                    raise self.error(extent, "workgroup_storage dimensions must be positive compile-time integers")
+                shape.append(extent.value)
+            struct_fields = lambda struct: self.structs[struct]
+            shape_tuple = tuple(shape)
+            if workgroup_physical_bytes(element, shape_tuple, struct_fields) > 16 * 1024:
+                raise self.error(node, "workgroup_storage exceeds the portable 16 KiB allocation limit")
+            return ConcreteType("tensor_view", "TensorView", (element, shape_tuple, "read_write", "workgroup"))
         if name in ATOMIC_OPERATION_NAMES:
             if len(node.args) != 3 or node.keywords:
                 raise self.error(node, f"{name} requires storage, index, and value")
@@ -1182,16 +1209,25 @@ class _Inference:
             storage = self._expression(node.args[0], environment)
             index = default_type(self._expression(node.args[1], environment))
             value = self._expression(node.args[2], environment)
-            if not isinstance(storage, ConcreteType) or storage.kind not in {"workgroup", "tensor_view"}:
-                raise self.error(node.args[0], f"{name} requires workgroup storage or a writable TensorView")
-            element = storage.arguments[0]
+            if not isinstance(storage, ConcreteType) or storage.kind != "tensor_view":
+                raise self.error(node.args[0], f"{name} requires a writable TensorView")
+            element, shape, _, _ = storage.arguments
             assert isinstance(element, ConcreteType)
-            if storage.kind == "tensor_view" and storage.arguments[2] == "read":
+            assert isinstance(shape, tuple)
+            if storage.arguments[2] == "read":
                 raise self.error(node.args[0], f"{name} requires a writable TensorView")
             if element.kind != "scalar" or element.name not in {"i32", "u32"}:
                 raise self.error(node.args[0], f"{name} requires i32 or u32 storage elements")
-            if not index.is_integer:
-                raise self.error(node.args[1], f"{name} index must be an integer")
+            index_nodes = list(node.args[1].elts) if isinstance(node.args[1], ast.Tuple) else [node.args[1]]
+            if len(shape) == 1:
+                if len(index_nodes) != 1 or not index.is_integer:
+                    raise self.error(node.args[1], f"{name} rank-one index must be an integer")
+            elif not isinstance(node.args[1], ast.Tuple) or len(index_nodes) != len(shape):
+                raise self.error(node.args[1], f"{name} requires one tuple index per TensorView dimension")
+            else:
+                for index_node in index_nodes:
+                    if not default_type(self._expression(index_node, environment)).is_integer:
+                        raise self.error(index_node, f"{name} indices must be integers")
             if not can_convert(value, element):
                 raise self.error(node.args[2], f"{name} value must be {element.mlir}")
             self._constrain_literal(node.args[2], element)
@@ -1232,7 +1268,10 @@ class _Inference:
             if len(arguments) != len(function.args.args):
                 raise self.error(node, f"function '{name}' expects {len(function.args.args)} arguments")
             for source, argument, parameter in zip(node.args, arguments, function.args.args, strict=True):
-                assert parameter.annotation is not None
+                if parameter.annotation is None:
+                    raise self.error(
+                        parameter, f"function '{name}' parameter {parameter.arg!r} requires a type annotation"
+                    )
                 expected = self.parse_type(parameter.annotation)
                 if not can_convert(argument, expected):
                     raise self.error(node, f"cannot pass {describe(argument)} as {expected.mlir}")

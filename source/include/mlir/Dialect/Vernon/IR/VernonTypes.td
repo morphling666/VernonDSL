@@ -52,20 +52,12 @@ def Vernon_TensorViewType : TypeDef<Vernon_Dialect, "TensorView"> {
   let summary = "Borrowed shaped storage with runtime layout";
   let parameters = (ins
     TypeParameter<"::mlir::Type", "element type">:$elementType,
-    AttrOrTypeParameter<"unsigned", "logical rank">:$rank,
-    StringRefParameter<"read, write, or read_write access">:$access
+    ArrayRefParameter<"int64_t", "logical shape">:$shape,
+    StringRefParameter<"read, write, or read_write access">:$access,
+    StringRefParameter<"device, workgroup, or private address space">:$addressSpace
   );
-  let assemblyFormat = "`<` $elementType `,` $rank `,` $access `>`";
-}
-
-def Vernon_WorkgroupType : TypeDef<Vernon_Dialect, "Workgroup"> {
-  let mnemonic = "workgroup";
-  let summary = "Statically sized compute workgroup storage";
-  let parameters = (ins
-    TypeParameter<"::mlir::Type", "element type">:$elementType,
-    AttrOrTypeParameter<"uint64_t", "element count">:$size
-  );
-  let assemblyFormat = "`<` $elementType `,` $size `>`";
+  let genVerifyDecl = 1;
+  let assemblyFormat = "`<` $elementType `,` `[` $shape `]` `,` $access `,` $addressSpace `>`";
 }
 
 def Vernon_TextureType : TypeDef<Vernon_Dialect, "Texture"> {

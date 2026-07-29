@@ -12,9 +12,9 @@ from vernon_dsl._runtime.resources import _bind_native_argument
 from vernon_dsl.frontend.compiler import compile_source
 
 CPU_MODULE = r"""
-module {
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
   func.func @increment(
-      %values: !vernon.tensor_view<f32, 1, "read_write"> {
+      %values: !vernon.tensor_view<f32, [3], "read_write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
         vernon.binding = 0 : i64,
@@ -34,19 +34,19 @@ module {
           {kind = "write", owner = "values", region = "unknown"}
         ]
       } {
-    %value = "vernon.intrinsic"(%values, %id) {name = "tensor_view_load"} :
-        (!vernon.tensor_view<f32, 1, "read_write">, index) -> f32
+    %value = "vernon.load"(%values, %id) :
+        (!vernon.tensor_view<f32, [3], "read_write", "device">, index) -> f32
     %one = arith.constant 1.0 : f32
     %sum = arith.addf %value, %one : f32
-    "vernon.intrinsic"(%values, %id, %sum) {name = "tensor_view_store"} :
-        (!vernon.tensor_view<f32, 1, "read_write">, index, f32) -> ()
+    "vernon.store"(%sum, %values, %id) :
+        (f32, !vernon.tensor_view<f32, [3], "read_write", "device">, index) -> ()
     return
   }
 }
 """
 
 MULTI_ENTRY_MODULE = r"""
-module {
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
   func.func @vertex_main(
       %position: tensor<4xf32> {
         vernon.interface = "input", vernon.location = 0 : i64
@@ -76,13 +76,10 @@ module {
 CPU_TUPLE_MODULE = r"""
 module attributes {
   vernon.frontend = "python",
-  vernon.frontend_version = 3 : i64,
+  vernon.frontend_version = 4 : i64,
   vernon.value_abi_version = 1 : i64
 } {
   "vernon.struct"() {
-    abi_alignment = 8 : i64,
-    abi_field_offsets = array<i64: 0, 8>,
-    abi_size = 16 : i64,
     fields = ["value:f32", "weight:f64"],
     sym_name = "ReflectedRecord"
   } : () -> ()

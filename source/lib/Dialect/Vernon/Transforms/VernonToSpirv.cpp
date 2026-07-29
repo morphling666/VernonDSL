@@ -1,7 +1,6 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonToSpirv.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAttributeAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonSpirvMarkers.h"
-#include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonTensorShapeSemantics.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"

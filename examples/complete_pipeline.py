@@ -50,8 +50,8 @@ class GBuffer:
 
 @vd.kernel(workgroup_size=(2, 1, 1))
 def animate_instances(
-    offset: vd.TensorView[vd.f32, 2, vd.write],
-    base_offset: vd.TensorView[vd.f32, 2, vd.read],
+    offset: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write],
+    base_offset: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.read],
     phase: vd.f32,
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:

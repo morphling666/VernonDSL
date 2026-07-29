@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonCpuPipeline.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonInlineHelpers.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonValidation.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -67,7 +68,8 @@ VernonStatus prepareMlir(CompilerFrontend &frontend, const char *source, size_t 
         &frontend.context, [&](mlir::Diagnostic &diagnostic) { appendDiagnostic(diagnostics, diagnostic); });
 
     llvm::StringRef text(source ? source : "", sourceSize);
-    mlir::OwningOpRef<mlir::ModuleOp> module = mlir::parseSourceString<mlir::ModuleOp>(text, &frontend.context);
+    mlir::ParserConfig parserConfig(&frontend.context, /*verifyAfterParse=*/false);
+    mlir::OwningOpRef<mlir::ModuleOp> module = mlir::parseSourceString<mlir::ModuleOp>(text, parserConfig);
     if (!module)
         return VERNON_STATUS_PARSE_ERROR;
     if (mlir::failed(mlir::verify(*module)))
@@ -92,6 +94,8 @@ VernonStatus prepareMlir(CompilerFrontend &frontend, const char *source, size_t 
     if (mlir::failed(builtReflection))
         return VERNON_STATUS_VERIFICATION_ERROR;
     reflection = std::move(*builtReflection);
+    if (mlir::failed(mlir::vernon::materializeTensorViewProjections(*reflectionModule)))
+        return VERNON_STATUS_VERIFICATION_ERROR;
     prepared.reset(new (std::nothrow) PreparedModule(std::move(reflectionModule)));
     if (!prepared) {
         diagnostics = "failed to allocate prepared compiler module";

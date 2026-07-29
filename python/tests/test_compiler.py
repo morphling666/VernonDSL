@@ -22,7 +22,7 @@ class Vertex:
 def resources(
     a: Vector[f32, 3],
     b: Matrix[f32, 2, 3],
-    data: Annotated[TensorView[Vertex, 1, read], resource(set=1, binding=2)],
+    data: Annotated[TensorView[Vertex, (dyn,), read], resource(set=1, binding=2)],
     image: Texture["2d", f32],
     sampler: Sampler,
     flag: bool,
@@ -38,7 +38,10 @@ def resources(
         self.assertIn("tensor<3xf32>", output)
         self.assertIn("tensor<2x3xf32>", output)
         self.assertEqual(output.count("tensor<4xf32>"), 1)
-        self.assertIn('!vernon.tensor_view<!vernon.struct<"Vertex">, 1, "read">', output)
+        self.assertIn(
+            '!vernon.tensor_view<!vernon.struct<"Vertex">, [-1], "read", "device">',
+            output,
+        )
         self.assertIn('!vernon.texture<"2d", f32>', output)
         self.assertIn('vernon.interface = "resource"', output)
         self.assertIn("vernon.set = 1 : i64", output)
@@ -453,7 +456,7 @@ def shade(color: Annotated[Vector[f32, 4], varying()]) -> f32:
 
 @kernel(workgroup_size=(8, 4, 1))
 def update(
-    values: Annotated[TensorView[f32, 1, read_write], resource(set=0, binding=3)],
+    values: Annotated[TensorView[f32, (dyn,), read_write], resource(set=0, binding=3)],
     invocation: Annotated[Vector[u32, 3], builtin("global_invocation_id")],
 ) -> None:
     current = values[invocation[0]]
@@ -467,8 +470,8 @@ def update(
         self.assertIn('vernon.stage = "compute"', output)
         self.assertIn("vernon.workgroup_size = array<i32: 8, 4, 1>", output)
         self.assertIn('"vernon.swizzle"', output)
-        self.assertIn('name = "tensor_view_load"', output)
-        self.assertIn('name = "tensor_view_store"', output)
+        self.assertIn('"vernon.load"', output)
+        self.assertIn('"vernon.store"', output)
         self.assertIn("scf.while", output)
 
     def test_if_merges_existing_values(self) -> None:

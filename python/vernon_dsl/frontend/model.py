@@ -24,7 +24,7 @@ class LiteralType:
 class ConcreteType:
     kind: str
     name: str
-    arguments: tuple["ConcreteType | int | str", ...] = ()
+    arguments: tuple["ConcreteType | tuple[int | str, ...] | int | str", ...] = ()
 
     def __post_init__(self) -> None:
         if self.kind != "tensor" or not self.arguments:
@@ -63,19 +63,19 @@ class ConcreteType:
         if self.kind == "struct":
             return f'!vernon.struct<"{self.name}">'
         if self.kind == "tensor_view_abi":
-            element, rank, access = self.arguments
+            element, shape, access, address_space = self.arguments
             assert isinstance(element, ConcreteType)
-            return f'!vernon.tensor_view<{element.mlir}, {rank}, "{access}">'
+            assert isinstance(shape, tuple)
+            dimensions = ", ".join(str(-1 if extent == "?" else extent) for extent in shape)
+            return f'!vernon.tensor_view<{element.mlir}, [{dimensions}], "{access}", "{address_space}">'
         if self.kind == "tensor_storage":
             raise ValueError("TensorStorage is host-runtime only and has no device IR type")
         if self.kind == "tensor_view":
-            element, rank, access = self.arguments
+            element, shape, access, address_space = self.arguments
             assert isinstance(element, ConcreteType)
-            return f'!vernon.tensor_view<{element.mlir}, {rank}, "{access}">'
-        if self.kind == "workgroup":
-            element, size = self.arguments
-            assert isinstance(element, ConcreteType)
-            return f"!vernon.workgroup<{element.mlir}, {size}>"
+            assert isinstance(shape, tuple)
+            dimensions = ", ".join(str(-1 if extent == "?" else extent) for extent in shape)
+            return f'!vernon.tensor_view<{element.mlir}, [{dimensions}], "{access}", "{address_space}">'
         if self.kind == "texture":
             dimension, element = self.arguments
             assert isinstance(element, ConcreteType)
@@ -108,7 +108,7 @@ class SemanticCategory(Enum):
 def semantic_category(value_type: ConcreteType) -> SemanticCategory | None:
     if value_type.kind in {"scalar", "tensor", "tuple", "struct"}:
         return SemanticCategory.VALUE
-    if value_type.kind in {"tensor_storage", "tensor_view", "workgroup"}:
+    if value_type.kind in {"tensor_storage", "tensor_view"}:
         return SemanticCategory.STORAGE
     if value_type.kind in {"texture", "sampler"}:
         return SemanticCategory.RESOURCE

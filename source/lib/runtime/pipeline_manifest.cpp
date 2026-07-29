@@ -47,6 +47,58 @@ std::optional<VernonTextureFormat> pipelineTextureFormat(const std::string &form
 
 namespace {
 
+bool parseUint32(const nlohmann::json &value, uint32_t &result);
+bool hasLegacyManifestKey(const nlohmann::json &value);
+
+template <size_t N> bool hasOnlyKeys(const nlohmann::json &value, const std::string_view (&allowed)[N]) {
+    for (auto row = value.begin(); row != value.end(); ++row)
+        if (std::find(std::begin(allowed), std::end(allowed), row.key()) == std::end(allowed))
+            return false;
+    return true;
+}
+
+constexpr std::string_view kVariantKeys[] = {"key", "program", "parameters", "internal_parameters", "outputs"};
+constexpr std::string_view kExternalParameterKeys[] = {
+    "slot",  "name",           "kind",  "type",          "uses",      "access",
+    "shape", "element_layout", "dtype", "address_space", "dimension", "texture_format",
+};
+constexpr std::string_view kInternalParameterKeys[] = {
+    "name",  "kind",          "type",      "uses",           "access", "shape",        "element_layout",
+    "dtype", "address_space", "dimension", "texture_format", "source", "system_value",
+};
+constexpr std::string_view kParameterUseKeys[] = {
+    "stage",
+    "interface",
+    "index",
+    "entry",
+    "kind",
+    "type",
+    "shape",
+    "access",
+    "address_space",
+    "dimension",
+    "dtype",
+    "uniform_name",
+    "vernon.location",
+    "vernon.instance_divisor",
+    "vernon.set",
+    "vernon.binding",
+    "physical_value_layout",
+    "attribute_leaves",
+    "sampled_texture_bindings",
+    "location_span",
+    "element_strides",
+    "element_offset",
+    "internal_source",
+    "system_value",
+};
+constexpr std::string_view kOutputKeys[] = {"name", "kind", "dtype", "shape", "access", "location", "type"};
+constexpr std::string_view kAttributeLeafKeys[] = {"path",  "location",        "location_offset",
+                                                   "dtype", "component_count", "byte_offset"};
+constexpr std::string_view kSampledTextureBindingKeys[] = {"set", "binding"};
+constexpr std::string_view kPhysicalValueLayoutKeys[] = {"profile",   "transport",    "size",
+                                                         "alignment", "byte_strides", "element_leaf_offsets"};
+
 bool parseUint64(const nlohmann::json &value, uint64_t &result) {
     if (!value.is_number_integer())
         return false;
@@ -80,16 +132,66 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
         error = "pipeline parameter use must be an object";
         return false;
     }
-    use.stage = value.value("stage", "");
-    use.interfaceKind = value.value("interface", "");
-    use.uniformName = value.value("uniform_name", "");
-    if (value.contains("dtype") && value["dtype"].is_string())
+    if (hasLegacyManifestKey(value)) {
+        error = "legacy compiler-generated parameter metadata is unsupported";
+        return false;
+    }
+    if (!hasOnlyKeys(value, kParameterUseKeys)) {
+        error = "pipeline parameter use contains an unknown field";
+        return false;
+    }
+    if (!value.contains("stage") || !value["stage"].is_string() || value["stage"].get<std::string>().empty() ||
+        !value.contains("interface") || !value["interface"].is_string() ||
+        value["interface"].get<std::string>().empty()) {
+        error = "pipeline parameter use is missing stage/interface metadata";
+        return false;
+    }
+    use.stage = value["stage"].get<std::string>();
+    use.interfaceKind = value["interface"].get<std::string>();
+    if (value.contains("uniform_name")) {
+        if (!value["uniform_name"].is_string()) {
+            error = "pipeline parameter use uniform_name must be a string";
+            return false;
+        }
+        use.uniformName = value["uniform_name"].get<std::string>();
+    }
+    if (value.contains("dtype")) {
+        if (!value["dtype"].is_string()) {
+            error = "pipeline parameter use dtype must be a string";
+            return false;
+        }
         use.dtype = value["dtype"].get<std::string>();
-    use.index = value.value("index", 0u);
-    use.location = value.value("vernon.location", UINT32_MAX);
-    use.divisor = value.value("vernon.instance_divisor", 0u);
-    use.descriptorSet = value.value("vernon.set", 0u);
-    use.binding = value.value("vernon.binding", UINT32_MAX);
+    }
+    if (value.contains("index")) {
+        if (!parseUint32(value["index"], use.index)) {
+            error = "pipeline parameter use index must be a non-negative integer";
+            return false;
+        }
+    }
+    if (value.contains("vernon.location")) {
+        if (!parseUint32(value["vernon.location"], use.location)) {
+            error = "pipeline parameter use vernon.location must be a non-negative integer";
+            return false;
+        }
+    }
+    if (value.contains("vernon.instance_divisor")) {
+        if (!parseUint32(value["vernon.instance_divisor"], use.divisor) || use.divisor == 0) {
+            error = "pipeline parameter use vernon.instance_divisor must be a positive integer";
+            return false;
+        }
+    }
+    if (value.contains("vernon.set")) {
+        if (!parseUint32(value["vernon.set"], use.descriptorSet)) {
+            error = "pipeline parameter use vernon.set must be a non-negative integer";
+            return false;
+        }
+    }
+    if (value.contains("vernon.binding")) {
+        if (!parseUint32(value["vernon.binding"], use.binding)) {
+            error = "pipeline parameter use vernon.binding must be a non-negative integer";
+            return false;
+        }
+    }
     if (value.contains("attribute_leaves")) {
         const nlohmann::json &leaves = value["attribute_leaves"];
         if (!leaves.is_array()) {
@@ -97,15 +199,19 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
             return false;
         }
         for (const nlohmann::json &leaf : leaves) {
+            if (!leaf.is_object() || hasLegacyManifestKey(leaf) || !hasOnlyKeys(leaf, kAttributeLeafKeys)) {
+                error =
+                    "attribute leaf must contain dtype and unsigned location_offset, component_count, and byte_offset";
+                return false;
+            }
             uint64_t locationOffset = 0;
             uint64_t componentCount = 0;
             uint64_t byteOffset = 0;
-            if (!leaf.is_object() || !leaf.contains("location_offset") ||
-                !parseUint64(leaf["location_offset"], locationOffset) || !leaf.contains("component_count") ||
-                !parseUint64(leaf["component_count"], componentCount) || !leaf.contains("byte_offset") ||
-                !parseUint64(leaf["byte_offset"], byteOffset) || !leaf.contains("dtype") ||
-                !leaf["dtype"].is_string() || locationOffset > UINT32_MAX || componentCount > UINT32_MAX ||
-                byteOffset > UINT32_MAX) {
+            if (!leaf.contains("location_offset") || !parseUint64(leaf["location_offset"], locationOffset) ||
+                !leaf.contains("component_count") || !parseUint64(leaf["component_count"], componentCount) ||
+                !leaf.contains("byte_offset") || !parseUint64(leaf["byte_offset"], byteOffset) ||
+                !leaf.contains("dtype") || !leaf["dtype"].is_string() || locationOffset > UINT32_MAX ||
+                componentCount > UINT32_MAX || byteOffset > UINT32_MAX) {
                 error =
                     "attribute leaf must contain dtype and unsigned location_offset, component_count, and byte_offset";
                 return false;
@@ -118,16 +224,22 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
         const nlohmann::json &layout = value["physical_value_layout"];
         uint64_t size = 0;
         uint64_t alignment = 0;
-        const std::string profile = layout.value("profile", "");
+        if (!layout.is_object() || hasLegacyManifestKey(layout) || !hasOnlyKeys(layout, kPhysicalValueLayoutKeys)) {
+            error = "physical_value_layout must contain a supported profile, transport, size, alignment, and "
+                    "byte_strides";
+            return false;
+        }
+        const std::string profile = layout["profile"].get<std::string>();
         const bool supportedProfile = profile == "host_value" || profile == "cuda_kernel_parameter" ||
                                       profile == "vulkan_std140_uniform_buffer" ||
                                       profile == "vulkan_std430_storage_buffer" || profile == "vulkan_push_constant" ||
                                       profile == "opengl_native_uniform" || profile == "directx_constant_buffer" ||
                                       profile == "metal_constant_buffer";
-        if (!layout.is_object() || !supportedProfile || !layout.contains("transport") ||
-            !layout["transport"].is_string() || !layout.contains("size") || !parseUint64(layout["size"], size) ||
-            !layout.contains("alignment") || !parseUint64(layout["alignment"], alignment) ||
-            !layout.contains("byte_strides") || !layout["byte_strides"].is_array()) {
+        if (!layout.contains("profile") || !layout["profile"].is_string() || !supportedProfile ||
+            !layout.contains("transport") || !layout["transport"].is_string() || !layout.contains("size") ||
+            !parseUint64(layout["size"], size) || !layout.contains("alignment") ||
+            !parseUint64(layout["alignment"], alignment) || !layout.contains("byte_strides") ||
+            !layout["byte_strides"].is_array()) {
             error = "physical_value_layout must contain a supported profile, transport, size, alignment, and "
                     "byte_strides";
             return false;
@@ -186,17 +298,30 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
             };
             uint32_t descriptorSet = 0;
             uint32_t descriptorBinding = 0;
-            if (!binding.is_object() || !binding.contains("set") || !parseBindingIndex(binding["set"], descriptorSet) ||
-                !binding.contains("binding") || !parseBindingIndex(binding["binding"], descriptorBinding)) {
+            if (!binding.is_object() || hasLegacyManifestKey(binding) ||
+                !hasOnlyKeys(binding, kSampledTextureBindingKeys) || !binding.contains("set") ||
+                !parseBindingIndex(binding["set"], descriptorSet) || !binding.contains("binding") ||
+                !parseBindingIndex(binding["binding"], descriptorBinding)) {
                 error = "sampled texture binding must contain unsigned set/binding";
                 return false;
             }
             use.sampledTextureBindings.push_back({descriptorSet, descriptorBinding});
         }
     }
-    if (value.contains("shape") && value["shape"].is_array())
-        for (const nlohmann::json &dimension : value["shape"])
-            use.shape.push_back(dimension.is_number_unsigned() ? dimension.get<uint64_t>() : uint64_t{0});
+    if (value.contains("shape")) {
+        if (!value["shape"].is_array()) {
+            error = "pipeline parameter use shape must be an array";
+            return false;
+        }
+        for (const nlohmann::json &dimension : value["shape"]) {
+            uint64_t extent = 0;
+            if (!parseUint64(dimension, extent)) {
+                error = "pipeline parameter use shape must contain unsigned extents";
+                return false;
+            }
+            use.shape.push_back(extent);
+        }
+    }
     if (value.contains("element_strides") || value.contains("element_offset")) {
         if (!value.contains("element_strides") || !value["element_strides"].is_array() ||
             !value.contains("element_offset")) {
@@ -217,17 +342,13 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
             return false;
         }
         use.elementOffset = offset;
-        if (use.elementStrides.size() != use.shape.size()) {
+        if (!use.shape.empty() && use.elementStrides.size() != use.shape.size()) {
             error = "TensorView specialization stride rank does not match shape";
             return false;
         }
     }
     if (use.physicalValueLayout && use.physicalValueLayout->byteStrides.size() != use.shape.size()) {
         error = "physical_value_layout byte-stride rank does not match the logical Tensor shape";
-        return false;
-    }
-    if (use.stage.empty() || use.interfaceKind.empty()) {
-        error = "pipeline parameter use is missing stage/interface metadata";
         return false;
     }
     return true;
@@ -380,6 +501,169 @@ bool hasOnlyKeys(const nlohmann::json &value, std::initializer_list<std::string_
     for (auto row = value.begin(); row != value.end(); ++row)
         if (std::find(allowed.begin(), allowed.end(), row.key()) == allowed.end())
             return false;
+    return true;
+}
+
+bool hasLegacyManifestKey(const nlohmann::json &value) {
+    static constexpr std::string_view legacyKeys[] = {"vernon.compiler_generated", "vernon.implicit_sampler",
+                                                      "vernon.system_value"};
+    for (std::string_view key : legacyKeys)
+        if (value.contains(std::string(key)))
+            return true;
+    return false;
+}
+
+enum class LogicalParameterTypeKind { TensorView, Texture, Sampler, Tensor, Struct, Scalar, Invalid };
+
+struct ParsedLogicalParameterType {
+    LogicalParameterTypeKind kind{LogicalParameterTypeKind::Invalid};
+    std::string addressSpace;
+    std::string textureDimension;
+};
+
+bool parseQuotedManifestToken(std::string_view text, size_t &cursor, std::string &token) {
+    if (cursor >= text.size() || text[cursor] != '"')
+        return false;
+    ++cursor;
+    token.clear();
+    while (cursor < text.size()) {
+        if (text[cursor] == '"') {
+            ++cursor;
+            return !token.empty();
+        }
+        token.push_back(text[cursor++]);
+    }
+    return false;
+}
+
+bool parseTensorViewLogicalType(const std::string &type, ParsedLogicalParameterType &parsed) {
+    constexpr std::string_view prefix = "!vernon.tensor_view<";
+    if (type.rfind(prefix, 0) != 0 || type.back() != '>' || type.size() <= prefix.size() + 1)
+        return false;
+    std::string_view body(type.data() + prefix.size(), type.size() - prefix.size() - 1);
+    const size_t shapeOpen = body.find('[');
+    const size_t shapeClose = shapeOpen == std::string_view::npos ? std::string_view::npos : body.find(']', shapeOpen);
+    if (shapeOpen == std::string_view::npos || shapeClose == std::string_view::npos || shapeClose <= shapeOpen + 1)
+        return false;
+    size_t cursor = shapeClose + 1;
+    while (cursor < body.size() && body[cursor] == ' ')
+        ++cursor;
+    if (cursor >= body.size() || body[cursor] != ',')
+        return false;
+    ++cursor;
+    while (cursor < body.size() && body[cursor] == ' ')
+        ++cursor;
+    std::string access;
+    if (!parseQuotedManifestToken(body, cursor, access))
+        return false;
+    if (access != "read" && access != "write" && access != "read_write")
+        return false;
+    while (cursor < body.size() && body[cursor] == ' ')
+        ++cursor;
+    if (cursor >= body.size() || body[cursor] != ',')
+        return false;
+    ++cursor;
+    while (cursor < body.size() && body[cursor] == ' ')
+        ++cursor;
+    if (!parseQuotedManifestToken(body, cursor, parsed.addressSpace))
+        return false;
+    while (cursor < body.size() && body[cursor] == ' ')
+        ++cursor;
+    if (cursor != body.size())
+        return false;
+    if (parsed.addressSpace != "device" && parsed.addressSpace != "workgroup" && parsed.addressSpace != "private")
+        return false;
+    parsed.kind = LogicalParameterTypeKind::TensorView;
+    return true;
+}
+
+bool parseTextureLogicalType(const std::string &type, ParsedLogicalParameterType &parsed) {
+    constexpr std::string_view prefix = "!vernon.texture<";
+    if (type.rfind(prefix, 0) != 0 || type.back() != '>' || type.size() <= prefix.size() + 1)
+        return false;
+    size_t cursor = prefix.size();
+    if (!parseQuotedManifestToken(type, cursor, parsed.textureDimension))
+        return false;
+    while (cursor < type.size() && type[cursor] == ' ')
+        ++cursor;
+    if (cursor >= type.size() || type[cursor] != ',')
+        return false;
+    parsed.kind = LogicalParameterTypeKind::Texture;
+    return true;
+}
+
+ParsedLogicalParameterType parseLogicalParameterType(const std::string &type) {
+    ParsedLogicalParameterType parsed;
+    if (parseTensorViewLogicalType(type, parsed))
+        return parsed;
+    if (parseTextureLogicalType(type, parsed))
+        return parsed;
+    if (type == "!vernon.sampler") {
+        parsed.kind = LogicalParameterTypeKind::Sampler;
+        return parsed;
+    }
+    if ((type.rfind("tensor<", 0) == 0 || type.rfind("vector<", 0) == 0 || type.rfind("!vernon.tensor<", 0) == 0) &&
+        type.back() == '>') {
+        parsed.kind = LogicalParameterTypeKind::Tensor;
+        return parsed;
+    }
+    if ((type.rfind("!vernon.struct<", 0) == 0 || type.rfind("tuple<", 0) == 0) && type.back() == '>') {
+        parsed.kind = LogicalParameterTypeKind::Struct;
+        return parsed;
+    }
+    if (!type.empty() && type.find('<') == std::string::npos)
+        parsed.kind = LogicalParameterTypeKind::Scalar;
+    return parsed;
+}
+
+bool validateParameterKindTypeCoherence(const std::string &kind, const ParsedLogicalParameterType &logicalType,
+                                        std::string &error) {
+    if (logicalType.kind == LogicalParameterTypeKind::Invalid) {
+        error = "pipeline parameter type is not a recognized schema-v5 logical type";
+        return false;
+    }
+    if (kind == "texture") {
+        if (logicalType.kind != LogicalParameterTypeKind::Texture) {
+            error = "texture parameter kind does not match its logical type";
+            return false;
+        }
+        return true;
+    }
+    if (kind == "sampler") {
+        if (logicalType.kind != LogicalParameterTypeKind::Sampler) {
+            error = "sampler parameter kind does not match its logical type";
+            return false;
+        }
+        return true;
+    }
+    if (kind == "tensor") {
+        if (logicalType.kind == LogicalParameterTypeKind::Texture ||
+            logicalType.kind == LogicalParameterTypeKind::Sampler) {
+            error = "tensor parameter kind does not match its logical type";
+            return false;
+        }
+        return true;
+    }
+    error = "pipeline parameter kind must be tensor, texture, or sampler";
+    return false;
+}
+
+bool validateParameterAddressSpace(const std::string &kind, const ParsedLogicalParameterType &logicalType,
+                                   const std::string &addressSpace, std::string &error) {
+    if (logicalType.kind == LogicalParameterTypeKind::TensorView) {
+        if (addressSpace != "device" || logicalType.addressSpace != "device") {
+            error = "pipeline TensorView parameter must use device address space";
+            return false;
+        }
+        return true;
+    }
+    if (!addressSpace.empty()) {
+        error = "non-TensorView parameter contains address_space";
+        return false;
+    }
+    if (kind == "texture" && !logicalType.textureDimension.empty()) {
+        // Dimension is validated separately against the reflected parameter.dimension field.
+    }
     return true;
 }
 
@@ -696,9 +980,14 @@ bool runtimeVersionAtLeast(RuntimeVersion actual, RuntimeVersion required) {
 uint32_t glslVersionForApi(RuntimeVersion apiVersion) { return apiVersion.major * 100 + apiVersion.minor * 10; }
 
 bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &error) {
-    if (!value.is_object() || !value.contains("key") || !value.contains("program") || !value.contains("parameters") ||
-        !value["key"].is_array() || !value["program"].is_object() || !value["parameters"].is_array()) {
+    if (!value.is_object() || !value.contains("key") || !value["key"].is_array() || !value.contains("program") ||
+        !value["program"].is_object() || !value.contains("parameters") || !value["parameters"].is_array() ||
+        !value.contains("outputs") || !value["outputs"].is_array()) {
         error = "pipeline variant tables are invalid";
+        return false;
+    }
+    if (hasLegacyManifestKey(value) || !hasOnlyKeys(value, kVariantKeys)) {
+        error = "pipeline variant contains an unknown or legacy field";
         return false;
     }
     for (const nlohmann::json &feature : value["key"]) {
@@ -714,23 +1003,47 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
         return false;
     }
     auto parseParameter = [&](const nlohmann::json &row, bool internal, Parameter &parameter) {
-        if (!row.is_object() || (!internal && !row.contains("slot")) || !row.contains("uses") ||
-            !row["uses"].is_array()) {
+        if (!row.is_object() || (!internal && !row.contains("slot")) || !row.contains("name") ||
+            !row["name"].is_string() || row["name"].get_ref<const std::string &>().empty() || !row.contains("kind") ||
+            !row["kind"].is_string() || row["kind"].get_ref<const std::string &>().empty() || !row.contains("type") ||
+            !row["type"].is_string() || row["type"].get_ref<const std::string &>().empty() || !row.contains("access") ||
+            !row["access"].is_string() || !row.contains("shape") || !row["shape"].is_array() || !row.contains("uses") ||
+            !row["uses"].is_array() || (internal && (!row.contains("source") || !row["source"].is_string()))) {
             error = internal ? "internal pipeline parameter record is invalid" : "pipeline parameter record is invalid";
             return false;
         }
-        if (!internal)
-            parameter.slot = row["slot"].get<uint32_t>();
-        parameter.name = row.value("name", "");
-        parameter.kind = row.value("kind", "");
+        if (hasLegacyManifestKey(row) ||
+            !(internal ? hasOnlyKeys(row, kInternalParameterKeys) : hasOnlyKeys(row, kExternalParameterKeys))) {
+            error = internal ? "internal pipeline parameter contains an unknown or legacy field"
+                             : "pipeline parameter contains an unknown or legacy field";
+            return false;
+        }
+        if (!internal && !parseUint32(row["slot"], parameter.slot)) {
+            error = "pipeline parameter slot must be a non-negative uint32";
+            return false;
+        }
+        for (std::string_view field : {"name", "kind", "access", "dtype", "address_space", "dimension",
+                                       "texture_format", "source", "system_value"})
+            if (row.contains(std::string(field)) && !row[std::string(field)].is_string()) {
+                error = "pipeline parameter string metadata has an invalid type";
+                return false;
+            }
+        parameter.name = row["name"].get<std::string>();
+        parameter.kind = row["kind"].get<std::string>();
         parameter.source = row.value("source", "");
         parameter.systemValue = row.value("system_value", "");
-        parameter.access = row.value("access", "read");
+        parameter.access = row["access"].get<std::string>();
+        parameter.addressSpace = row.value("address_space", "");
         parameter.dimension = row.value("dimension", "");
         parameter.textureFormat = row.value("texture_format", "");
-        if (row.contains("shape") && row["shape"].is_array())
-            for (const nlohmann::json &dimension : row["shape"])
-                parameter.shape.push_back(dimension.is_number_unsigned() ? dimension.get<uint64_t>() : uint64_t{0});
+        for (const nlohmann::json &dimension : row["shape"]) {
+            uint64_t extent = 0;
+            if (!parseUint64(dimension, extent)) {
+                error = "pipeline parameter shape must contain unsigned extents";
+                return false;
+            }
+            parameter.shape.push_back(extent);
+        }
         for (const nlohmann::json &useValue : row["uses"]) {
             ParameterUse use;
             if (!parseUse(useValue, use, error))
@@ -740,6 +1053,16 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
         if (parameter.name.empty() || parameter.uses.empty()) {
             error =
                 internal ? "internal pipeline parameter has no name or uses" : "pipeline parameter has no name or uses";
+            return false;
+        }
+        const std::string logicalType = row["type"].get<std::string>();
+        const ParsedLogicalParameterType parsedType = parseLogicalParameterType(logicalType);
+        if (!validateParameterKindTypeCoherence(parameter.kind, parsedType, error) ||
+            !validateParameterAddressSpace(parameter.kind, parsedType, parameter.addressSpace, error))
+            return false;
+        if (parsedType.kind == LogicalParameterTypeKind::Texture && !parsedType.textureDimension.empty() &&
+            parsedType.textureDimension != parameter.dimension) {
+            error = "texture parameter dimension does not match its logical type";
             return false;
         }
         if (parameter.kind == "texture") {
@@ -818,22 +1141,37 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
                 return false;
             }
     }
-    for (const nlohmann::json &row : value.value("outputs", nlohmann::json::array())) {
-        if (!row.is_object()) {
+    for (const nlohmann::json &row : value["outputs"]) {
+        if (!row.is_object() || hasLegacyManifestKey(row) || !hasOnlyKeys(row, kOutputKeys) || !row.contains("name") ||
+            !row["name"].is_string() || row["name"].get_ref<const std::string &>().empty() || !row.contains("kind") ||
+            !row["kind"].is_string() || !row.contains("access") || !row["access"].is_string() ||
+            !row.contains("location")) {
             error = "pipeline output record is invalid";
             return false;
         }
         Output output;
-        output.name = row.value("name", "");
-        output.kind = row.value("kind", "texture");
+        output.name = row["name"].get<std::string>();
+        output.kind = row["kind"].get<std::string>();
         output.dtype = row.value("dtype", "");
-        output.access = row.value("access", "write");
-        output.location = row.value("location", UINT32_MAX);
-        if (output.name.empty() && output.location != UINT32_MAX)
-            output.name = "output_" + std::to_string(output.location);
-        if (row.contains("shape") && row["shape"].is_array())
-            for (const nlohmann::json &dimension : row["shape"])
-                output.shape.push_back(dimension.is_number_unsigned() ? dimension.get<uint64_t>() : uint64_t{0});
+        output.access = row["access"].get<std::string>();
+        if (!parseUint32(row["location"], output.location)) {
+            error = "pipeline output location must be a non-negative uint32";
+            return false;
+        }
+        if (row.contains("shape")) {
+            if (!row["shape"].is_array()) {
+                error = "pipeline output shape must be an array";
+                return false;
+            }
+            for (const nlohmann::json &dimension : row["shape"]) {
+                uint64_t extent = 0;
+                if (!parseUint64(dimension, extent)) {
+                    error = "pipeline output shape must contain unsigned extents";
+                    return false;
+                }
+                output.shape.push_back(extent);
+            }
+        }
         if (output.dtype.empty())
             parseStaticType(row.value("type", ""), output.dtype, output.shape);
         if (output.name.empty() || output.dtype.empty() || output.location == UINT32_MAX) {

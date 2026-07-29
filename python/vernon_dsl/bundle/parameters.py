@@ -108,6 +108,7 @@ def reflected_parameters(
                 "shape": row.get("shape", inferred_shape),
                 "interface": interface_name,
                 "access": row.get("access", "read"),
+                "address_space": row.get("address_space"),
                 "dimension": row.get("dimension"),
             }
             element_strides = row.get("element_strides")
@@ -221,6 +222,8 @@ def merge_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[s
     normalized = [dict(use) for use in uses]
     first = normalized[0]
     kind = classify_parameter_use(first)
+    if any(not isinstance(use.get("type"), str) or not use["type"] for use in normalized):
+        raise PipelineCompileError(f"pipeline parameter {name!r} is missing its logical type")
     for use in normalized[1:]:
         incompatible_layout = kind != "tensor" and (
             use.get("type") != first.get("type") or use.get("shape", []) != first.get("shape", [])
@@ -240,6 +243,12 @@ def merge_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[s
     for use in normalized:
         use.pop("element_layout", None)
     access_values = {str(use.get("access", "read")) for use in normalized}
+    tensor_view = kind == "tensor" and any(
+        str(use.get("type", "")).startswith("!vernon.tensor_view<") for use in normalized
+    )
+    address_spaces = {use.get("address_space") for use in normalized}
+    if tensor_view and address_spaces != {"device"}:
+        raise PipelineCompileError(f"pipeline TensorView parameter {name!r} must use device address space")
     access = (
         "read_write"
         if "read_write" in access_values or access_values == {"read", "write"}
@@ -251,6 +260,7 @@ def merge_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[s
         "type": representative.get("type"),
         "shape": representative.get("shape", []),
         "access": access,
+        "address_space": "device" if tensor_view else None,
         "dimension": first.get("dimension"),
         "uses": normalized,
     }

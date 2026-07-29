@@ -33,9 +33,9 @@ def rain_source(
 
 @vd.kernel(workgroup_size=(64, 1, 1))
 def compute_erosion_flow(
-    height: vd.TensorView[vd.f32, 1, vd.read],
-    water: vd.TensorView[vd.f32, 1, vd.read],
-    flow: vd.TensorView[vd.f32, 2, vd.write],
+    height: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+    water: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+    flow: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write],
     width: vd.u32,
     delta_time: vd.f32,
     phase: vd.f32,
@@ -90,13 +90,13 @@ def compute_erosion_flow(
 
 @vd.kernel(workgroup_size=(64, 1, 1))
 def apply_erosion_flow(
-    height: vd.TensorView[vd.f32, 1, vd.read],
-    water: vd.TensorView[vd.f32, 1, vd.read],
-    sediment: vd.TensorView[vd.f32, 1, vd.read],
-    flow: vd.TensorView[vd.f32, 2, vd.read],
-    next_height: vd.TensorView[vd.f32, 1, vd.write],
-    next_water: vd.TensorView[vd.f32, 1, vd.write],
-    next_sediment: vd.TensorView[vd.f32, 1, vd.write],
+    height: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+    water: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+    sediment: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+    flow: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.read],
+    next_height: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    next_water: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    next_sediment: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
     width: vd.u32,
     delta_time: vd.f32,
     phase: vd.f32,
@@ -185,14 +185,14 @@ def apply_erosion_flow(
 
 @vd.kernel(workgroup_size=(64, 1, 1))
 def build_terrain_mesh(
-    height: vd.TensorView[vd.f32, 1, vd.read],
-    water: vd.TensorView[vd.f32, 1, vd.read],
-    sediment: vd.TensorView[vd.f32, 1, vd.read],
-    rock_detail: vd.TensorView[vd.f32, 1, vd.read],
-    positions: vd.TensorView[vd.f32, 2, vd.write],
-    normals: vd.TensorView[vd.f32, 2, vd.write],
-    colors: vd.TensorView[vd.f32, 2, vd.write],
-    materials: vd.TensorView[vd.f32, 2, vd.write],
+    height: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+    water: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+    sediment: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+    rock_detail: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+    positions: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write],
+    normals: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write],
+    colors: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write],
+    materials: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write],
     width: vd.u32,
     extent: vd.f32,
     phase: vd.f32,

@@ -1,4 +1,5 @@
 #include "tensor_bridge.h"
+#include "pipeline_manifest.h"
 
 #include <cstring>
 #include <limits>
@@ -77,6 +78,30 @@ bool valueLayoutsEqual(const VernonValueLayoutView &left, const VernonValueLayou
             left.leaves[index].scalar_count != right.leaves[index].scalar_count ||
             left.leaves[index].byte_offset != right.leaves[index].byte_offset)
             return false;
+    return true;
+}
+
+bool tensorMatchesSpecialization(const VernonTensorView &tensor, const ParameterUse &use) {
+    if (use.elementStrides.empty())
+        return true;
+    if (!use.elementOffset || tensor.rank != use.elementStrides.size() ||
+        (!use.shape.empty() && tensor.rank != use.shape.size()) ||
+        (tensor.rank && (!tensor.shape || !tensor.byte_strides)) || !valueLayoutValid(tensor.element_layout))
+        return false;
+    const uint64_t elementSize = tensor.element_layout.byte_size;
+    if (*use.elementOffset > std::numeric_limits<size_t>::max() / elementSize ||
+        tensor.byte_offset != *use.elementOffset * elementSize)
+        return false;
+    for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension) {
+        if (!use.shape.empty() && tensor.shape[dimension] != use.shape[dimension])
+            return false;
+        const int64_t elementStride = use.elementStrides[dimension];
+        const uint64_t magnitude = strideMagnitude(elementStride);
+        if (magnitude > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / elementSize)
+            return false;
+        if (tensor.byte_strides[dimension] != elementStride * static_cast<int64_t>(elementSize))
+            return false;
+    }
     return true;
 }
 

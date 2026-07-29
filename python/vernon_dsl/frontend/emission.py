@@ -44,12 +44,9 @@ def emit_mlir_module(
         fields = structs[name]
         field_text = ", ".join(json.dumps(f"{field_name}:{annotation.type.mlir}") for field_name, annotation in fields)
         layout = value_abi_layout(ConcreteType("struct", name), struct_field_types)
-        offsets = ", ".join(str(offset) for offset in layout.field_offsets)
         leaf_dtypes = ", ".join(f'"{leaf.dtype}"' for leaf in layout.leaves)
         body.append(
-            f'  "vernon.struct"() {{abi_alignment = {layout.alignment} : i64, '
-            f"abi_field_offsets = array<i64: {offsets}>, abi_leaf_dtypes = [{leaf_dtypes}], "
-            f"abi_size = {layout.size} : i64, "
+            f'  "vernon.struct"() {{abi_leaf_dtypes = [{leaf_dtypes}], '
             f'fields = [{field_text}], sym_name = "{name}"}} : () -> ()'
         )
 

@@ -8,9 +8,9 @@
 namespace {
 
 constexpr std::string_view synchronizationModule = R"mlir(
-module {
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
   func.func @synchronize(
-      %output: !vernon.tensor_view<i32, 1, "write"> {
+      %output: !vernon.tensor_view<i32, [1], "write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
         vernon.binding = 0 : i64,
@@ -22,26 +22,59 @@ module {
         vernon.stage = "compute",
         vernon.workgroup_size = array<i32: 1, 1, 1>
       } {
-    %storage = "vernon.workgroup_alloc"() : () -> !vernon.workgroup<i32, 8>
+    %storage = "vernon.workgroup_alloc"() : () ->
+      !vernon.tensor_view<i32, [8], "read_write", "workgroup">
     %index = arith.constant 0 : index
     %one = arith.constant 1 : i32
-    "vernon.workgroup_store"(%one, %storage, %index) :
-      (i32, !vernon.workgroup<i32, 8>, index) -> ()
+    "vernon.store"(%one, %storage, %index) :
+      (i32, !vernon.tensor_view<i32, [8], "read_write", "workgroup">, index) -> ()
     "vernon.barrier"() {ordering = "acquire_release", scope = "workgroup"} : () -> ()
     %previous = "vernon.atomic"(%storage, %index, %one) {
-      atomic_kind = "add", ordering = "relaxed", scope = "workgroup"
-    } : (!vernon.workgroup<i32, 8>, index, i32) -> i32
-    "vernon.intrinsic"(%output, %index, %previous) {name = "tensor_view_store"} :
-      (!vernon.tensor_view<i32, 1, "write">, index, i32) -> ()
+      atomic_kind = "add", ordering = "relaxed"
+    } : (!vernon.tensor_view<i32, [8], "read_write", "workgroup">, index, i32) -> i32
+    "vernon.store"(%previous, %output, %index) :
+      (i32, !vernon.tensor_view<i32, [1], "write", "device">, index) -> ()
+    return
+  }
+}
+)mlir";
+
+constexpr std::string_view aggregateWorkgroupModule = R"mlir(
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+  "vernon.struct"() {
+    sym_name = "Pair",
+    fields = ["left:i32", "right:f32"],
+    abi_leaf_dtypes = ["i32", "f32"]
+  } : () -> ()
+  func.func @aggregate_workgroup() attributes {
+      vernon.entry,
+      vernon.stage = "compute",
+      vernon.workgroup_size = array<i32: 1, 1, 1>
+    } {
+    %storage = "vernon.workgroup_alloc"() : () ->
+      !vernon.tensor_view<!vernon.struct<"Pair">, [2, 3], "read_write", "workgroup">
+    %row = arith.constant 1 : index
+    %column = arith.constant 2 : index
+    %left = arith.constant 7 : i32
+    %right = arith.constant 2.5 : f32
+    %pair = "vernon.struct_create"(%left, %right) {type_name = "Pair"} :
+      (i32, f32) -> !vernon.struct<"Pair">
+    "vernon.store"(%pair, %storage, %row, %column) :
+      (!vernon.struct<"Pair">,
+       !vernon.tensor_view<!vernon.struct<"Pair">, [2, 3], "read_write", "workgroup">,
+       index, index) -> ()
+    %loaded = "vernon.load"(%storage, %row, %column) :
+      (!vernon.tensor_view<!vernon.struct<"Pair">, [2, 3], "read_write", "workgroup">,
+       index, index) -> !vernon.struct<"Pair">
     return
   }
 }
 )mlir";
 
 constexpr std::string_view storageAtomicModule = R"mlir(
-module {
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
   func.func @storage_atomic(
-      %values: !vernon.tensor_view<i32, 1, "read_write"> {
+      %values: !vernon.tensor_view<i32, [64], "read_write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
         vernon.binding = 0 : i64,
@@ -57,29 +90,29 @@ module {
     %index = arith.constant 0 : index
     %one = arith.constant 1 : i32
     %previous = "vernon.atomic"(%values, %index, %one) {
-      atomic_kind = "add", ordering = "relaxed", scope = "device"
-    } : (!vernon.tensor_view<i32, 1, "read_write">, index, i32) -> i32
+      atomic_kind = "add", ordering = "relaxed"
+    } : (!vernon.tensor_view<i32, [64], "read_write", "device">, index, i32) -> i32
     return
   }
 }
 )mlir";
 
 constexpr std::string_view invalidMemrefScopeModule = R"mlir(
-module {
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
   func.func @invalid_scope(
-      %storage: memref<8xi32, #gpu.address_space<workgroup>>) {
+      %storage: !vernon.tensor_view<i32, [8], "read_write", "private">) {
     %index = arith.constant 0 : index
     %one = arith.constant 1 : i32
     %previous = "vernon.atomic"(%storage, %index, %one) {
-      atomic_kind = "add", ordering = "relaxed", scope = "device"
-    } : (memref<8xi32, #gpu.address_space<workgroup>>, index, i32) -> i32
+      atomic_kind = "add", ordering = "relaxed"
+    } : (!vernon.tensor_view<i32, [8], "read_write", "private">, index, i32) -> i32
     return
   }
 }
 )mlir";
 
 constexpr std::string_view workgroupBuiltinModule = R"mlir(
-module {
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
   func.func @builtin_probe(
       %local_id: tensor<3xi32> {
         vernon.interface = "input",
@@ -102,8 +135,77 @@ module {
 }
 )mlir";
 
+constexpr std::string_view nestedAggregateWorkgroupModule = R"mlir(
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+  "vernon.struct"() {
+    sym_name = "Pair",
+    fields = ["left:i32", "right:f32"],
+    abi_leaf_dtypes = ["i32", "f32"]
+  } : () -> ()
+  func.func @nested_aggregate_workgroup(
+      %lane: index {
+        vernon.interface = "input",
+        vernon.builtin = "local_invocation_id"
+      }) attributes {
+      vernon.entry,
+      vernon.stage = "compute",
+      vernon.workgroup_size = array<i32: 1, 1, 1>
+    } {
+    %storage = "vernon.workgroup_alloc"() : () ->
+      !vernon.tensor_view<!vernon.struct<"Pair">, [2, 3], "read_write", "workgroup">
+    %zero = arith.constant 0 : index
+    %one = arith.constant 1 : index
+    %left = arith.constant 7 : i32
+    %right = arith.constant 2.5 : f32
+    %pair = "vernon.struct_create"(%left, %right) {type_name = "Pair"} :
+      (i32, f32) -> !vernon.struct<"Pair">
+    %condition = arith.cmpi eq, %lane, %zero : index
+    scf.if %condition {
+      "vernon.store"(%pair, %storage, %zero, %one) :
+        (!vernon.struct<"Pair">,
+         !vernon.tensor_view<!vernon.struct<"Pair">, [2, 3], "read_write", "workgroup">,
+         index, index) -> ()
+      %loaded = "vernon.load"(%storage, %zero, %one) :
+        (!vernon.tensor_view<!vernon.struct<"Pair">, [2, 3], "read_write", "workgroup">,
+         index, index) -> !vernon.struct<"Pair">
+    }
+    scf.for %iteration = %zero to %one step %one {
+      "vernon.store"(%pair, %storage, %iteration, %zero) :
+        (!vernon.struct<"Pair">,
+         !vernon.tensor_view<!vernon.struct<"Pair">, [2, 3], "read_write", "workgroup">,
+         index, index) -> ()
+      %loop_loaded = "vernon.load"(%storage, %iteration, %zero) :
+        (!vernon.tensor_view<!vernon.struct<"Pair">, [2, 3], "read_write", "workgroup">,
+         index, index) -> !vernon.struct<"Pair">
+    }
+    return
+  }
+}
+)mlir";
+
+constexpr std::string_view combinedAggregateWorkgroupModule = R"mlir(
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+  "vernon.struct"() {
+    sym_name = "Pair",
+    fields = ["left:i32", "right:f32"],
+    abi_leaf_dtypes = ["i32", "f32"]
+  } : () -> ()
+  func.func @combined_aggregate_workgroup() attributes {
+      vernon.entry,
+      vernon.stage = "compute",
+      vernon.workgroup_size = array<i32: 1, 1, 1>
+    } {
+    %first = "vernon.workgroup_alloc"() : () ->
+      !vernon.tensor_view<!vernon.struct<"Pair">, [1025], "read_write", "workgroup">
+    %second = "vernon.workgroup_alloc"() : () ->
+      !vernon.tensor_view<!vernon.struct<"Pair">, [1025], "read_write", "workgroup">
+    return
+  }
+}
+)mlir";
+
 constexpr std::string_view noResultConditionalModule = R"mlir(
-module {
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
   func.func @conditional(
       %lane: index {
         vernon.interface = "input",
@@ -145,6 +247,95 @@ TEST(CompilerSynchronization, LowersPortableWorkgroupOperations) {
             EXPECT_NE(reflected.find("\"workgroup_storage\""), std::string_view::npos);
             vernonCompileResultDestroy(result);
         }
+    }
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, LowersAggregateRankTwoWorkgroupStorageThroughValueAbiLeaves) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    for (VernonTarget target : {VERNON_TARGET_CPU, VERNON_TARGET_CUDA, VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL,
+                                VERNON_TARGET_OPENGL_ES, VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
+        VernonCompileResult *result = vernonCompilerCompileMlir(compiler, aggregateWorkgroupModule.data(),
+                                                                aggregateWorkgroupModule.size(), target);
+        ASSERT_TRUE(result);
+        const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+        EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK)
+            << std::string_view(diagnostics.data ? diagnostics.data : "", diagnostics.size);
+        vernonCompileResultDestroy(result);
+    }
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, RejectsAggregateWorkgroupStorageAboveCanonicalLimit) {
+    std::string module(aggregateWorkgroupModule);
+    size_t shape = 0;
+    while ((shape = module.find("[2, 3]", shape)) != std::string::npos)
+        module.replace(shape, sizeof("[2, 3]") - 1, "[2049]");
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *result = vernonCompilerValidateMlir(compiler, module.data(), module.size());
+    ASSERT_TRUE(result);
+    EXPECT_NE(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+    const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+    EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("16 KiB"), std::string_view::npos);
+    vernonCompileResultDestroy(result);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, RejectsOverflowingWorkgroupPhysicalStorage) {
+    constexpr std::string_view module = R"mlir(
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+  func.func @overflow() attributes {
+      vernon.entry,
+      vernon.stage = "compute",
+      vernon.workgroup_size = array<i32: 1, 1, 1>
+    } {
+    %storage = "vernon.workgroup_alloc"() : () ->
+      !vernon.tensor_view<i32, [4194304, 4194304, 262144], "read_write", "workgroup">
+    return
+  }
+}
+)mlir";
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *result = vernonCompilerValidateMlir(compiler, module.data(), module.size());
+    ASSERT_TRUE(result);
+    const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+    EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_VERIFICATION_ERROR)
+        << std::string_view(diagnostics.data ? diagnostics.data : "", diagnostics.size);
+    EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("finite canonical physical storage plan"),
+              std::string_view::npos);
+    vernonCompileResultDestroy(result);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, RejectsCombinedWorkgroupStorageAbovePhysicalLimit) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *result = vernonCompilerValidateMlir(compiler, combinedAggregateWorkgroupModule.data(),
+                                                             combinedAggregateWorkgroupModule.size());
+    ASSERT_TRUE(result);
+    EXPECT_NE(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+    const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+    EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("combined workgroup storage"),
+              std::string_view::npos);
+    vernonCompileResultDestroy(result);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, LowersNestedAggregateWorkgroupStorageUnderStructuredControlFlow) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    for (VernonTarget target : {VERNON_TARGET_CPU, VERNON_TARGET_CUDA, VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL,
+                                VERNON_TARGET_OPENGL_ES, VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
+        VernonCompileResult *result = vernonCompilerCompileMlir(compiler, nestedAggregateWorkgroupModule.data(),
+                                                                nestedAggregateWorkgroupModule.size(), target);
+        ASSERT_TRUE(result);
+        const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+        EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK)
+            << std::string_view(diagnostics.data ? diagnostics.data : "", diagnostics.size);
+        vernonCompileResultDestroy(result);
     }
     vernonCompilerDestroy(compiler);
 }
@@ -226,7 +417,7 @@ TEST(CompilerSynchronization, RejectsAtomicOrderingsNotImplementedByLowering) {
     vernonCompilerDestroy(compiler);
 }
 
-TEST(CompilerSynchronization, InfersMemrefAtomicScopeFromMemorySpace) {
+TEST(CompilerSynchronization, RejectsPrivateTensorViewAtomics) {
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
     VernonCompileResult *result =
@@ -234,7 +425,7 @@ TEST(CompilerSynchronization, InfersMemrefAtomicScopeFromMemorySpace) {
     ASSERT_TRUE(result);
     EXPECT_NE(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
     const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
-    EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("scope must be workgroup"),
+    EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("requires device or workgroup"),
               std::string_view::npos);
     vernonCompileResultDestroy(result);
     vernonCompilerDestroy(compiler);

@@ -29,9 +29,9 @@ TEST_P(RuntimeSynchronization, ExecutesIndependentWorkgroupBarrierAndAtomic) {
         GTEST_SKIP() << backend.name << " runtime backend is unavailable";
 
     static constexpr char module[] = R"mlir(
-module {
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
   func.func @synchronize(
-      %output: !vernon.tensor_view<i32, 1, "write"> {
+      %output: !vernon.tensor_view<i32, [10], "write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
         vernon.binding = 0 : i64,
@@ -51,7 +51,8 @@ module {
         vernon.stage = "compute",
         vernon.workgroup_size = array<i32: 4, 1, 1>
       } {
-    %shared = "vernon.workgroup_alloc"() : () -> !vernon.workgroup<i32, 1>
+    %shared = "vernon.workgroup_alloc"() : () ->
+      !vernon.tensor_view<i32, [1], "read_write", "workgroup">
     %zero_index = arith.constant 0 : index
     %one = arith.constant 1 : i32
     %hundred = arith.constant 100 : i32
@@ -59,26 +60,26 @@ module {
     scf.if %lane_is_zero {
       %group_i32 = arith.index_cast %group : index to i32
       %group_base = arith.muli %group_i32, %hundred : i32
-      "vernon.workgroup_store"(%group_base, %shared, %zero_index) :
-        (i32, !vernon.workgroup<i32, 1>, index) -> ()
+      "vernon.store"(%group_base, %shared, %zero_index) :
+        (i32, !vernon.tensor_view<i32, [1], "read_write", "workgroup">, index) -> ()
     }
     "vernon.barrier"() {ordering = "acquire_release", scope = "workgroup"} : () -> ()
     %previous = "vernon.atomic"(%shared, %zero_index, %one) {
-      atomic_kind = "add", ordering = "relaxed", scope = "workgroup"
-    } : (!vernon.workgroup<i32, 1>, index, i32) -> i32
+      atomic_kind = "add", ordering = "relaxed"
+    } : (!vernon.tensor_view<i32, [1], "read_write", "workgroup">, index, i32) -> i32
     %four = arith.constant 4 : index
     %group_offset = arith.muli %group, %four : index
     %previous_index = arith.addi %group_offset, %lane : index
-    "vernon.intrinsic"(%output, %previous_index, %previous) {name = "tensor_view_store"} :
-      (!vernon.tensor_view<i32, 1, "write">, index, i32) -> ()
+    "vernon.store"(%previous, %output, %previous_index) :
+      (i32, !vernon.tensor_view<i32, [10], "write", "device">, index) -> ()
     "vernon.barrier"() {ordering = "acquire_release", scope = "workgroup"} : () -> ()
     scf.if %lane_is_zero {
-      %final = "vernon.workgroup_load"(%shared, %zero_index) :
-        (!vernon.workgroup<i32, 1>, index) -> i32
+      %final = "vernon.load"(%shared, %zero_index) :
+        (!vernon.tensor_view<i32, [1], "read_write", "workgroup">, index) -> i32
       %eight = arith.constant 8 : index
       %final_index = arith.addi %eight, %group : index
-      "vernon.intrinsic"(%output, %final_index, %final) {name = "tensor_view_store"} :
-        (!vernon.tensor_view<i32, 1, "write">, index, i32) -> ()
+      "vernon.store"(%final, %output, %final_index) :
+        (i32, !vernon.tensor_view<i32, [10], "write", "device">, index) -> ()
     }
     return
   }

@@ -148,12 +148,14 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
 
 TEST(RuntimeDirectX12Pipeline, CompilesAndDispatchesComputeDxil) {
     static constexpr char module[] = R"(
-module {
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
   func.func @increment(
-      %values: !vernon.tensor_view<f32, 1, "read_write"> {
+      %values: !vernon.tensor_view<f32, [-1], "read_write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64
+        vernon.binding = 0 : i64,
+        vernon.tensor_strides = array<i64: 1>,
+        vernon.tensor_offset = 0 : i64
       },
       %id: index {
         vernon.interface = "input",
@@ -163,14 +165,12 @@ module {
         vernon.stage = "compute",
         vernon.workgroup_size = array<i32: 8, 1, 1>
       } {
-    %value = "vernon.intrinsic"(%values, %id) {
-      name = "tensor_view_load"
-    } : (!vernon.tensor_view<f32, 1, "read_write">, index) -> f32
+    %value = "vernon.load"(%values, %id) :
+      (!vernon.tensor_view<f32, [-1], "read_write", "device">, index) -> f32
     %one = arith.constant 1.0 : f32
     %sum = arith.addf %value, %one : f32
-    "vernon.intrinsic"(%values, %id, %sum) {
-      name = "tensor_view_store"
-    } : (!vernon.tensor_view<f32, 1, "read_write">, index, f32) -> ()
+    "vernon.store"(%sum, %values, %id) :
+      (f32, !vernon.tensor_view<f32, [-1], "read_write", "device">, index) -> ()
     return
   }
 }

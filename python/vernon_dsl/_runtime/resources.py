@@ -210,7 +210,8 @@ def _views_overlap(left: TensorView, right: TensorView) -> bool:
         return False
     left_range = _address_range(left.shape, left._strides, left._offset)
     right_range = _address_range(right.shape, right._strides, right._offset)
-    assert left_range is not None and right_range is not None
+    if left_range is None or right_range is None:
+        raise ValueError("TensorView overlap analysis requires non-empty views with defined address ranges")
     if left_range[1] < right_range[0] or right_range[1] < left_range[0]:
         return False
     left_addresses = _view_addresses(left)
@@ -640,7 +641,8 @@ class TensorView:
                 element_type = owner._element_type
         elif dtype is None:
             raise TypeError("RawBuffer TensorView requires an explicit dtype")
-        assert dtype is not None
+        if dtype is None:
+            raise TypeError("TensorView requires a resolved element dtype")
         shape = _checked_shape(shape)
         if (
             not isinstance(strides, tuple)

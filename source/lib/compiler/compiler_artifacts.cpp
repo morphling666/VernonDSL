@@ -71,7 +71,7 @@ void addArtifactTable(std::string &reflection, const std::vector<Artifact> &arti
     if (!root)
         return;
 
-    (*root)["schema_version"] = int64_t{4};
+    (*root)["schema_version"] = int64_t{5};
     (*root)["target"] = targetName(target).str();
     llvm::json::Object targetOptions;
     if (target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES)

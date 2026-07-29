@@ -28,149 +28,157 @@ static void sample_texture(void *user_data, uintptr_t texture, float u, float v,
 }
 
 TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
-    static const char module[] = "module {\n"
-                                 "  func.func @vertex_main("
-                                 "%position: vector<3xf32> {vernon.interface = \"input\", "
-                                 "vernon.location = 0 : i64}) attributes {vernon.entry, "
-                                 "vernon.stage = \"vertex\"} {\n"
-                                 "    return\n"
-                                 "  }\n"
-                                 "}\n";
-    static const char invalid_module[] = "module {\n"
-                                         "  func.func @compute_main() attributes {vernon.entry, "
-                                         "vernon.stage = \"compute\"} {\n"
-                                         "    return\n"
-                                         "  }\n"
-                                         "}\n";
-    static const char cpu_module[] = "module {\n"
-                                     "  func.func @add_vectors("
-                                     "%left: tensor<4xf32> {vernon.interface = \"input\", "
-                                     "vernon.location = 0 : i64}, "
-                                     "%right: tensor<4xf32> {vernon.interface = \"input\", "
-                                     "vernon.location = 1 : i64}) -> "
-                                     "(tensor<4xf32> {vernon.interface = \"output\", "
-                                     "vernon.location = 0 : i64}) attributes {vernon.entry, "
-                                     "vernon.stage = \"fragment\"} {\n"
-                                     "    %sum = arith.addf %left, %right : tensor<4xf32>\n"
-                                     "    return %sum : tensor<4xf32>\n"
-                                     "  }\n"
-                                     "}\n";
-    static const char cpu_intrinsic_module[] = "module {\n"
-                                               "  func.func @normal_score("
-                                               "%normal: tensor<3xf32> {vernon.interface = \"input\", "
-                                               "vernon.location = 0 : i64}, "
-                                               "%light: tensor<3xf32> {vernon.interface = \"input\", "
-                                               "vernon.location = 1 : i64}) -> "
-                                               "(f32 {vernon.interface = \"output\", vernon.location = 0 : i64}) "
-                                               "attributes {vernon.entry, vernon.stage = \"fragment\"} {\n"
-                                               "    %unit = \"vernon.intrinsic\"(%normal) "
-                                               "{name = \"normalize\"} : (tensor<3xf32>) -> tensor<3xf32>\n"
-                                               "    %score = \"vernon.intrinsic\"(%unit, %light) "
-                                               "{name = \"dot\"} : (tensor<3xf32>, tensor<3xf32>) -> f32\n"
-                                               "    return %score : f32\n"
-                                               "  }\n"
-                                               "}\n";
-    static const char cpu_large_vector_module[] = "module {\n"
-                                                  "  func.func @add_large(%left: tensor<20xf32> "
-                                                  "{vernon.interface = \"input\", vernon.location = 0 : i64}, "
-                                                  "%right: tensor<20xf32> "
-                                                  "{vernon.interface = \"input\", vernon.location = 1 : i64}) -> "
-                                                  "(tensor<20xf32> {vernon.interface = \"output\", "
-                                                  "vernon.location = 0 : i64}) attributes "
-                                                  "{vernon.entry, vernon.stage = \"fragment\"} {\n"
-                                                  "    %sum = arith.addf %left, %right : tensor<20xf32>\n"
-                                                  "    return %sum : tensor<20xf32>\n"
-                                                  "  }\n"
-                                                  "}\n";
-    static const char cpu_unknown_intrinsic_module[] = "module {\n"
-                                                       "  func.func @unknown_cpu(%value: f32 "
-                                                       "{vernon.interface = \"input\", vernon.location = 0 : i64}) -> "
-                                                       "(f32 {vernon.interface = \"output\", "
-                                                       "vernon.location = 0 : i64}) attributes "
-                                                       "{vernon.entry, vernon.stage = \"fragment\"} {\n"
-                                                       "    %result = \"vernon.intrinsic\"(%value) "
-                                                       "{name = \"not_a_cpu_intrinsic\"} : (f32) -> f32\n"
-                                                       "    return %result : f32\n"
-                                                       "  }\n"
-                                                       "}\n";
-    static const char cpu_compute_module[] = "module {\n"
-                                             "  func.func @increment("
-                                             "%values: !vernon.tensor_view<f32, 1, \"read_write\"> "
-                                             "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
-                                             "vernon.binding = 0 : i64, vernon.tensor_shape = array<i64: 3>, "
-                                             "vernon.tensor_strides = array<i64: 1>, "
-                                             "vernon.tensor_offset = 0 : i64}, "
-                                             "%id: index {vernon.interface = \"input\", "
-                                             "vernon.builtin = \"global_invocation_id\"}) attributes {vernon.entry, "
-                                             "vernon.stage = \"compute\", "
-                                             "vernon.workgroup_size = array<i32: 8, 1, 1>} {\n"
-                                             "    %value = \"vernon.intrinsic\"(%values, %id) "
-                                             "{name = \"tensor_view_load\"} : "
-                                             "(!vernon.tensor_view<f32, 1, \"read_write\">, index) -> f32\n"
-                                             "    %one = arith.constant 1.0 : f32\n"
-                                             "    %sum = arith.addf %value, %one : f32\n"
-                                             "    \"vernon.intrinsic\"(%values, %id, %sum) "
-                                             "{name = \"tensor_view_store\"} : "
-                                             "(!vernon.tensor_view<f32, 1, \"read_write\">, index, f32) -> ()\n"
-                                             "    return\n"
-                                             "  }\n"
-                                             "}\n";
-    static const char cuda_while_module[] = "module {\n"
-                                            "  func.func @loop(%values: !vernon.tensor_view<f32, 1, \"read_write\"> "
-                                            "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
-                                            "vernon.binding = 0 : i64}, %phase: f32 "
-                                            "{vernon.interface = \"input\", vernon.location = 1 : i64}) "
-                                            "attributes {vernon.entry, "
-                                            "vernon.stage = \"compute\", "
-                                            "vernon.workgroup_size = array<i32: 1, 1, 1>} {\n"
-                                            "    %true = arith.constant true\n"
-                                            "    scf.if %true {\n"
-                                            "      %minus_point_eight = arith.constant -8.000000e-01 : f32\n"
-                                            "      %cosine = math.cos %phase : f32\n"
-                                            "      %point_two = arith.constant 2.000000e-01 : f32\n"
-                                            "      %imaginary = arith.mulf %cosine, %point_two : f32\n"
-                                            "      %c = \"vernon.intrinsic\"(%minus_point_eight, %imaginary) "
-                                            "{name = \"construct\"} : (f32, f32) -> tensor<2xf32>\n"
-                                            "      %point_one = arith.constant 1.000000e-01 : f32\n"
-                                            "      %z = \"vernon.intrinsic\"(%point_one, %point_two) "
-                                            "{name = \"construct\"} : (f32, f32) -> tensor<2xf32>\n"
-                                            "      %initial = arith.constant 0 : i32\n"
-                                            "      %result, %final = scf.while "
-                                            "(%iteration = %initial, %value = %z) : "
-                                            "(i32, tensor<2xf32>) -> (i32, tensor<2xf32>) {\n"
-                                            "        %squared = \"vernon.intrinsic\"(%value, %value) "
-                                            "{name = \"dot\"} : (tensor<2xf32>, tensor<2xf32>) -> f32\n"
-                                            "        %length = math.sqrt %squared : f32\n"
-                                            "        %radius = arith.constant 2.000000e+01 : f32\n"
-                                            "        %inside = arith.cmpf olt, %length, %radius : f32\n"
-                                            "        %limit = arith.constant 4 : i32\n"
-                                            "        %below_limit = arith.cmpi slt, %iteration, %limit : i32\n"
-                                            "        %condition = arith.andi %inside, %below_limit : i1\n"
-                                            "        scf.condition(%condition) %iteration, %value "
-                                            ": i32, tensor<2xf32>\n"
-                                            "      } do {\n"
-                                            "        ^bb0(%iteration: i32, %value: tensor<2xf32>):\n"
-                                            "        %one = arith.constant 1 : i32\n"
-                                            "        %next = arith.addi %iteration, %one : i32\n"
-                                            "        scf.yield %next, %c : i32, tensor<2xf32>\n"
-                                            "      }\n"
-                                            "      %index = arith.constant 0 : index\n"
-                                            "      %value = arith.sitofp %result : i32 to f32\n"
-                                            "      \"vernon.intrinsic\"(%values, %index, %value) "
-                                            "{name = \"tensor_view_store\"} : "
-                                            "(!vernon.tensor_view<f32, 1, \"read_write\">, index, f32) -> ()\n"
-                                            "      scf.yield\n"
-                                            "    } else {\n"
-                                            "      scf.yield\n"
-                                            "    }\n"
-                                            "    return\n"
-                                            "  }\n"
-                                            "}\n";
-    static const char cuda_rank_three_tensor_module[] =
-        "module {\n"
-        "  func.func @tensor3(%values: !vernon.tensor_view<f32, 1, \"read_write\"> "
+    static const char module[] =
+        "module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {\n"
+        "  func.func @vertex_main("
+        "%position: vector<3xf32> {vernon.interface = \"input\", "
+        "vernon.location = 0 : i64}) attributes {vernon.entry, "
+        "vernon.stage = \"vertex\"} {\n"
+        "    return\n"
+        "  }\n"
+        "}\n";
+    static const char invalid_module[] =
+        "module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {\n"
+        "  func.func @compute_main() attributes {vernon.entry, "
+        "vernon.stage = \"compute\"} {\n"
+        "    return\n"
+        "  }\n"
+        "}\n";
+    static const char cpu_module[] =
+        "module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {\n"
+        "  func.func @add_vectors("
+        "%left: tensor<4xf32> {vernon.interface = \"input\", "
+        "vernon.location = 0 : i64}, "
+        "%right: tensor<4xf32> {vernon.interface = \"input\", "
+        "vernon.location = 1 : i64}) -> "
+        "(tensor<4xf32> {vernon.interface = \"output\", "
+        "vernon.location = 0 : i64}) attributes {vernon.entry, "
+        "vernon.stage = \"fragment\"} {\n"
+        "    %sum = arith.addf %left, %right : tensor<4xf32>\n"
+        "    return %sum : tensor<4xf32>\n"
+        "  }\n"
+        "}\n";
+    static const char cpu_intrinsic_module[] =
+        "module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {\n"
+        "  func.func @normal_score("
+        "%normal: tensor<3xf32> {vernon.interface = \"input\", "
+        "vernon.location = 0 : i64}, "
+        "%light: tensor<3xf32> {vernon.interface = \"input\", "
+        "vernon.location = 1 : i64}) -> "
+        "(f32 {vernon.interface = \"output\", vernon.location = 0 : i64}) "
+        "attributes {vernon.entry, vernon.stage = \"fragment\"} {\n"
+        "    %unit = \"vernon.intrinsic\"(%normal) "
+        "{name = \"normalize\"} : (tensor<3xf32>) -> tensor<3xf32>\n"
+        "    %score = \"vernon.intrinsic\"(%unit, %light) "
+        "{name = \"dot\"} : (tensor<3xf32>, tensor<3xf32>) -> f32\n"
+        "    return %score : f32\n"
+        "  }\n"
+        "}\n";
+    static const char cpu_large_vector_module[] =
+        "module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {\n"
+        "  func.func @add_large(%left: tensor<20xf32> "
+        "{vernon.interface = \"input\", vernon.location = 0 : i64}, "
+        "%right: tensor<20xf32> "
+        "{vernon.interface = \"input\", vernon.location = 1 : i64}) -> "
+        "(tensor<20xf32> {vernon.interface = \"output\", "
+        "vernon.location = 0 : i64}) attributes "
+        "{vernon.entry, vernon.stage = \"fragment\"} {\n"
+        "    %sum = arith.addf %left, %right : tensor<20xf32>\n"
+        "    return %sum : tensor<20xf32>\n"
+        "  }\n"
+        "}\n";
+    static const char cpu_unknown_intrinsic_module[] =
+        "module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {\n"
+        "  func.func @unknown_cpu(%value: f32 "
+        "{vernon.interface = \"input\", vernon.location = 0 : i64}) -> "
+        "(f32 {vernon.interface = \"output\", "
+        "vernon.location = 0 : i64}) attributes "
+        "{vernon.entry, vernon.stage = \"fragment\"} {\n"
+        "    %result = \"vernon.intrinsic\"(%value) "
+        "{name = \"not_a_cpu_intrinsic\"} : (f32) -> f32\n"
+        "    return %result : f32\n"
+        "  }\n"
+        "}\n";
+    static const char cpu_compute_module[] =
+        "module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {\n"
+        "  func.func @increment("
+        "%values: !vernon.tensor_view<f32, [3], \"read_write\", \"device\"> "
         "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
-        "vernon.binding = 0 : i64}) attributes {vernon.entry, "
+        "vernon.binding = 0 : i64, vernon.tensor_shape = array<i64: 3>, "
+        "vernon.tensor_strides = array<i64: 1>, "
+        "vernon.tensor_offset = 0 : i64}, "
+        "%id: index {vernon.interface = \"input\", "
+        "vernon.builtin = \"global_invocation_id\"}) attributes {vernon.entry, "
+        "vernon.stage = \"compute\", "
+        "vernon.workgroup_size = array<i32: 8, 1, 1>} {\n"
+        "    %value = \"vernon.load\"(%values, %id) : "
+        "(!vernon.tensor_view<f32, [3], \"read_write\", \"device\">, index) -> f32\n"
+        "    %one = arith.constant 1.0 : f32\n"
+        "    %sum = arith.addf %value, %one : f32\n"
+        "    \"vernon.store\"(%sum, %values, %id) : "
+        "(f32, !vernon.tensor_view<f32, [3], \"read_write\", \"device\">, index) -> ()\n"
+        "    return\n"
+        "  }\n"
+        "}\n";
+    static const char cuda_while_module[] =
+        "module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {\n"
+        "  func.func @loop(%values: !vernon.tensor_view<f32, [1], \"read_write\", \"device\"> "
+        "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
+        "vernon.binding = 0 : i64, vernon.tensor_shape = array<i64: 1>, "
+        "vernon.tensor_strides = array<i64: 1>, vernon.tensor_offset = 0 : i64}, "
+        "%phase: f32 "
+        "{vernon.interface = \"input\", vernon.location = 1 : i64}) "
+        "attributes {vernon.entry, "
+        "vernon.stage = \"compute\", "
+        "vernon.workgroup_size = array<i32: 1, 1, 1>} {\n"
+        "    %true = arith.constant true\n"
+        "    scf.if %true {\n"
+        "      %minus_point_eight = arith.constant -8.000000e-01 : f32\n"
+        "      %cosine = math.cos %phase : f32\n"
+        "      %point_two = arith.constant 2.000000e-01 : f32\n"
+        "      %imaginary = arith.mulf %cosine, %point_two : f32\n"
+        "      %c = \"vernon.intrinsic\"(%minus_point_eight, %imaginary) "
+        "{name = \"construct\"} : (f32, f32) -> tensor<2xf32>\n"
+        "      %point_one = arith.constant 1.000000e-01 : f32\n"
+        "      %z = \"vernon.intrinsic\"(%point_one, %point_two) "
+        "{name = \"construct\"} : (f32, f32) -> tensor<2xf32>\n"
+        "      %initial = arith.constant 0 : i32\n"
+        "      %result, %final = scf.while "
+        "(%iteration = %initial, %value = %z) : "
+        "(i32, tensor<2xf32>) -> (i32, tensor<2xf32>) {\n"
+        "        %squared = \"vernon.intrinsic\"(%value, %value) "
+        "{name = \"dot\"} : (tensor<2xf32>, tensor<2xf32>) -> f32\n"
+        "        %length = math.sqrt %squared : f32\n"
+        "        %radius = arith.constant 2.000000e+01 : f32\n"
+        "        %inside = arith.cmpf olt, %length, %radius : f32\n"
+        "        %limit = arith.constant 4 : i32\n"
+        "        %below_limit = arith.cmpi slt, %iteration, %limit : i32\n"
+        "        %condition = arith.andi %inside, %below_limit : i1\n"
+        "        scf.condition(%condition) %iteration, %value "
+        ": i32, tensor<2xf32>\n"
+        "      } do {\n"
+        "        ^bb0(%iteration: i32, %value: tensor<2xf32>):\n"
+        "        %one = arith.constant 1 : i32\n"
+        "        %next = arith.addi %iteration, %one : i32\n"
+        "        scf.yield %next, %c : i32, tensor<2xf32>\n"
+        "      }\n"
+        "      %index = arith.constant 0 : index\n"
+        "      %value = arith.sitofp %result : i32 to f32\n"
+        "      \"vernon.store\"(%value, %values, %index) : "
+        "(f32, !vernon.tensor_view<f32, [1], \"read_write\", \"device\">, index) -> ()\n"
+        "      scf.yield\n"
+        "    } else {\n"
+        "      scf.yield\n"
+        "    }\n"
+        "    return\n"
+        "  }\n"
+        "}\n";
+    static const char cuda_rank_three_tensor_module[] =
+        "module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {\n"
+        "  func.func @tensor3(%values: !vernon.tensor_view<f32, [1], \"read_write\", \"device\"> "
+        "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
+        "vernon.binding = 0 : i64, vernon.tensor_shape = array<i64: 1>, "
+        "vernon.tensor_strides = array<i64: 1>, vernon.tensor_offset = 0 : i64}) attributes {vernon.entry, "
         "vernon.stage = \"compute\", "
         "vernon.workgroup_size = array<i32: 1, 1, 1>} {\n"
         "    %ones = arith.constant dense<1.0> : tensor<2x3x4xf32>\n"
@@ -183,49 +191,49 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
         "    %value = tensor.extract %sum[%i, %j, %k] "
         ": tensor<2x3x4xf32>\n"
         "    %index = arith.constant 0 : index\n"
-        "    \"vernon.intrinsic\"(%values, %index, %value) "
-        "{name = \"tensor_view_store\"} : "
-        "(!vernon.tensor_view<f32, 1, \"read_write\">, index, f32) -> ()\n"
+        "    \"vernon.store\"(%value, %values, %index) : "
+        "(f32, !vernon.tensor_view<f32, [1], \"read_write\", \"device\">, index) -> ()\n"
         "    return\n"
         "  }\n"
         "}\n";
     static const char cuda_dynamic_local_tensor_module[] =
-        "module {\n"
+        "module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {\n"
         "  func.func @dynamic_local("
-        "%values: !vernon.tensor_view<f32, 1, \"read_write\"> "
+        "%values: !vernon.tensor_view<f32, [1], \"read_write\", \"device\"> "
         "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
-        "vernon.binding = 0 : i64}) attributes {vernon.entry, "
+        "vernon.binding = 0 : i64, vernon.tensor_shape = array<i64: 1>, "
+        "vernon.tensor_strides = array<i64: 1>, vernon.tensor_offset = 0 : i64}) attributes {vernon.entry, "
         "vernon.stage = \"compute\", "
         "vernon.workgroup_size = array<i32: 1, 1, 1>} {\n"
         "    %size = arith.constant 4 : index\n"
         "    %value = tensor.empty(%size) : tensor<?xf32>\n"
         "    %index = arith.constant 0 : index\n"
         "    %element = tensor.extract %value[%index] : tensor<?xf32>\n"
-        "    \"vernon.intrinsic\"(%values, %index, %element) "
-        "{name = \"tensor_view_store\"} : "
-        "(!vernon.tensor_view<f32, 1, \"read_write\">, index, f32) -> ()\n"
+        "    \"vernon.store\"(%element, %values, %index) : "
+        "(f32, !vernon.tensor_view<f32, [1], \"read_write\", \"device\">, index) -> ()\n"
         "    return\n"
         "  }\n"
         "}\n";
-    static const char cpu_texture_module[] = "module {\n"
-                                             "  func.func @sample_color("
-                                             "%texture: !vernon.texture<\"2d\", f32> "
-                                             "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
-                                             "vernon.binding = 0 : i64}, "
-                                             "%sampler: !vernon.sampler {vernon.interface = \"resource\", "
-                                             "vernon.set = 0 : i64, vernon.binding = 1 : i64}, "
-                                             "%uv: tensor<2xf32> {vernon.interface = \"input\", "
-                                             "vernon.location = 0 : i64}) -> "
-                                             "(tensor<4xf32> {vernon.interface = \"output\", "
-                                             "vernon.location = 0 : i64}) attributes {vernon.entry, "
-                                             "vernon.stage = \"fragment\"} {\n"
-                                             "    %color = \"vernon.intrinsic\"(%texture, %sampler, %uv) "
-                                             "{name = \"texture_sample\"} : "
-                                             "(!vernon.texture<\"2d\", f32>, !vernon.sampler, tensor<2xf32>) "
-                                             "-> tensor<4xf32>\n"
-                                             "    return %color : tensor<4xf32>\n"
-                                             "  }\n"
-                                             "}\n";
+    static const char cpu_texture_module[] =
+        "module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {\n"
+        "  func.func @sample_color("
+        "%texture: !vernon.texture<\"2d\", f32> "
+        "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
+        "vernon.binding = 0 : i64}, "
+        "%sampler: !vernon.sampler {vernon.interface = \"resource\", "
+        "vernon.set = 0 : i64, vernon.binding = 1 : i64}, "
+        "%uv: tensor<2xf32> {vernon.interface = \"input\", "
+        "vernon.location = 0 : i64}) -> "
+        "(tensor<4xf32> {vernon.interface = \"output\", "
+        "vernon.location = 0 : i64}) attributes {vernon.entry, "
+        "vernon.stage = \"fragment\"} {\n"
+        "    %color = \"vernon.intrinsic\"(%texture, %sampler, %uv) "
+        "{name = \"texture_sample\"} : "
+        "(!vernon.texture<\"2d\", f32>, !vernon.sampler, tensor<2xf32>) "
+        "-> tensor<4xf32>\n"
+        "    return %color : tensor<4xf32>\n"
+        "  }\n"
+        "}\n";
 
     VernonCompilerContext *context = vernonCompilerCreate();
     ASSERT_TRUE(context != NULL);
@@ -309,7 +317,7 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     memcpy(&magic, spirv.data, sizeof(magic));
     ASSERT_TRUE(magic == 0x07230203u);
     VernonStringView vulkan_reflection = vernonCompileResultGetReflection(vulkan_compile);
-    ASSERT_TRUE(view_contains(vulkan_reflection, "\"schema_version\":4"));
+    ASSERT_TRUE(view_contains(vulkan_reflection, "\"schema_version\":5"));
     ASSERT_TRUE(view_contains(vulkan_reflection, "\"target\":\"vulkan\""));
     ASSERT_TRUE(view_contains(vulkan_reflection, "\"entry_point\":\"vertex_main\""));
     ASSERT_TRUE(view_contains(vulkan_reflection, "\"filename\":\"module.spv\""));
@@ -595,5 +603,38 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     ASSERT_TRUE(sample_color(&texture_invocation) == VERNON_STATUS_INVALID_ARGUMENT);
     vernonCompileResultDestroy(cpu_texture_compile);
 
+    vernonCompilerDestroy(context);
+}
+
+TEST(CompilerCApi, RejectsMissingOrUnsupportedContractVersions) {
+    VernonCompilerContext *context = vernonCompilerCreate();
+    ASSERT_TRUE(context);
+    const char missing[] = "module { func.func @empty() { return } }";
+    VernonCompileResult *result = vernonCompilerValidateMlir(context, missing, strlen(missing));
+    ASSERT_TRUE(result);
+    EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_VERIFICATION_ERROR);
+    EXPECT_TRUE(view_contains(vernonCompileResultGetDiagnostics(result), "vernon.frontend_version"));
+    EXPECT_TRUE(view_contains(vernonCompileResultGetDiagnostics(result), "vernon.value_abi_version"));
+    vernonCompileResultDestroy(result);
+
+    const char unsupported[] =
+        "module attributes {vernon.frontend_version = 3 : i64, vernon.value_abi_version = 2 : i64} "
+        "{ func.func @empty() { return } }";
+    result = vernonCompilerValidateMlir(context, unsupported, strlen(unsupported));
+    ASSERT_TRUE(result);
+    EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_VERIFICATION_ERROR);
+    EXPECT_TRUE(view_contains(vernonCompileResultGetDiagnostics(result), "requires vernon.frontend_version = 4"));
+    EXPECT_TRUE(view_contains(vernonCompileResultGetDiagnostics(result), "requires vernon.value_abi_version = 1"));
+    vernonCompileResultDestroy(result);
+
+    const char obsoleteAbi[] =
+        "module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} { "
+        "\"vernon.struct\"() {sym_name = \"Old\", fields = [\"value:i32\"], abi_size = 4 : i64} : () -> () "
+        "}";
+    result = vernonCompilerValidateMlir(context, obsoleteAbi, strlen(obsoleteAbi));
+    ASSERT_TRUE(result);
+    EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_VERIFICATION_ERROR);
+    EXPECT_TRUE(view_contains(vernonCompileResultGetDiagnostics(result), "obsolete frontend-authored Value ABI"));
+    vernonCompileResultDestroy(result);
     vernonCompilerDestroy(context);
 }

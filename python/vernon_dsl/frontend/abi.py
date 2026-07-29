@@ -73,6 +73,23 @@ _SCALAR_LAYOUTS = {
 _ATTRIBUTE_DTYPES = {"i32", "u32", "f16", "f32", "f64"}
 
 
+def workgroup_physical_bytes(
+    element: ConcreteType,
+    shape: tuple[int, ...],
+    struct_fields: Callable[[str], StructFields],
+) -> int:
+    layout = value_abi_layout(element, struct_fields)
+    records = 1
+    for extent in shape:
+        records *= extent
+    if element.kind == "scalar":
+        return records * layout.size
+    total = 0
+    for leaf in layout.leaves:
+        total += records * leaf.scalar_count * _SCALAR_LAYOUTS[leaf.dtype].size
+    return total
+
+
 def attribute_layout(
     value_type: ConcreteType,
     struct_fields: Callable[[str], StructFields],

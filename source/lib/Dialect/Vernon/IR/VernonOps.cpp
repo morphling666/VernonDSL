@@ -9,6 +9,7 @@
 #include "mlir/Dialect/SPIRV/IR/SPIRVAttributes.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/OpImplementation.h"
@@ -17,6 +18,8 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/ErrorHandling.h"
+
+#include <limits>
 
 using namespace mlir;
 using namespace mlir::vernon;
@@ -174,66 +177,59 @@ LogicalResult IntrinsicOp::verify() {
 }
 
 LogicalResult WorkgroupAllocOp::verify() {
-    WorkgroupType type = cast<WorkgroupType>(getResult().getType());
-    if (!type.getSize())
-        return emitOpError("requires a positive element count");
-    if (type.getSize() > 4096)
+    TensorViewType type = getResult().getType();
+    if (type.getAddressSpace() != "workgroup")
+        return emitOpError("result must use the workgroup address space");
+    if (type.getAccess() != "read_write")
+        return emitOpError("result must be a read_write TensorView");
+    if (type.getShape().empty() || llvm::any_of(type.getShape(), [](int64_t extent) { return extent <= 0; }))
+        return emitOpError("requires a positive static shape");
+    ModuleOp module = (*this)->getParentOfType<ModuleOp>();
+    if (!module)
+        return emitOpError("must be nested in a module");
+    FailureOr<WorkgroupPhysicalStoragePlan> plan = getWorkgroupPhysicalStoragePlan(type, module);
+    if (failed(plan))
+        return emitOpError("cannot derive a finite canonical physical storage plan");
+    if (plan->totalPhysicalBytes > kPortableWorkgroupStorageLimit)
         return emitOpError("exceeds the portable 16 KiB workgroup storage limit");
-    if (!type.getElementType().isSignlessInteger(32))
-        return emitOpError("currently requires i32 or u32 elements");
     return success();
 }
 
-LogicalResult WorkgroupLoadOp::verify() {
-    WorkgroupType type = cast<WorkgroupType>(getStorage().getType());
-    return getResult().getType() == type.getElementType()
-               ? success()
-               : emitOpError("result type must match the workgroup element type");
+LogicalResult LoadOp::verify() {
+    auto type = dyn_cast<TensorViewType>(getStorage().getType());
+    if (!type)
+        return emitOpError("storage must be a TensorView");
+    if (type.getAccess() == "write")
+        return emitOpError("cannot load through a write-only TensorView");
+    if (getIndices().size() != type.getShape().size())
+        return emitOpError("requires one index per TensorView dimension");
+    return getResult().getType() == type.getElementType() ? success()
+                                                          : emitOpError("result type must match the element type");
 }
 
-LogicalResult WorkgroupStoreOp::verify() {
-    WorkgroupType type = cast<WorkgroupType>(getStorage().getType());
-    return getValue().getType() == type.getElementType()
-               ? success()
-               : emitOpError("value type must match the workgroup element type");
+LogicalResult StoreOp::verify() {
+    auto type = dyn_cast<TensorViewType>(getStorage().getType());
+    if (!type)
+        return emitOpError("storage must be a TensorView");
+    if (type.getAccess() == "read")
+        return emitOpError("cannot store through a read-only TensorView");
+    if (getIndices().size() != type.getShape().size())
+        return emitOpError("requires one index per TensorView dimension");
+    return getValue().getType() == type.getElementType() ? success()
+                                                         : emitOpError("value type must match the element type");
 }
 
 LogicalResult AtomicOp::verify() {
-    Type elementType;
-    StringRef requiredScope;
-    if (auto workgroup = dyn_cast<WorkgroupType>(getStorage().getType())) {
-        elementType = workgroup.getElementType();
-        requiredScope = "workgroup";
-    } else if (auto view = dyn_cast<TensorViewType>(getStorage().getType())) {
-        if (view.getAccess() == "read")
-            return emitOpError("requires writable TensorView storage");
-        elementType = view.getElementType();
-        requiredScope = "device";
-    } else if (auto memref = dyn_cast<MemRefType>(getStorage().getType())) {
-        elementType = memref.getElementType();
-        Attribute memorySpace = memref.getMemorySpace();
-        if (!memorySpace) {
-            requiredScope = "device";
-        } else if (auto addressSpace = dyn_cast<gpu::AddressSpaceAttr>(memorySpace)) {
-            if (addressSpace.getValue() == gpu::AddressSpace::Workgroup)
-                requiredScope = "workgroup";
-            else if (addressSpace.getValue() == gpu::AddressSpace::Global)
-                requiredScope = "device";
-            else
-                return emitOpError("memref storage must use GPU global or workgroup memory space");
-        } else if (auto storageClass = dyn_cast<spirv::StorageClassAttr>(memorySpace)) {
-            if (storageClass.getValue() == spirv::StorageClass::Workgroup)
-                requiredScope = "workgroup";
-            else if (storageClass.getValue() == spirv::StorageClass::StorageBuffer)
-                requiredScope = "device";
-            else
-                return emitOpError("memref storage must use SPIR-V StorageBuffer or Workgroup storage class");
-        } else {
-            return emitOpError("cannot infer atomic scope from memref memory space");
-        }
-    } else {
-        return emitOpError("storage must be workgroup storage or a writable TensorView");
-    }
+    auto view = dyn_cast<TensorViewType>(getStorage().getType());
+    if (!view)
+        return emitOpError("storage must be a TensorView");
+    if (view.getAccess() == "read")
+        return emitOpError("requires writable TensorView storage");
+    if (view.getAddressSpace() != "device" && view.getAddressSpace() != "workgroup")
+        return emitOpError("requires device or workgroup TensorView storage");
+    if (getIndices().size() != view.getShape().size())
+        return emitOpError("requires one index per TensorView dimension");
+    Type elementType = view.getElementType();
     if (!elementType.isSignlessInteger(32) || getValue().getType() != elementType ||
         getResult().getType() != elementType)
         return emitOpError("requires matching 32-bit integer value and result types");
@@ -242,8 +238,6 @@ LogicalResult AtomicOp::verify() {
         return emitOpError("operation must be add, min, max, umin, umax, or exchange");
     if (getOrdering() != "relaxed")
         return emitOpError("currently supports only relaxed memory ordering");
-    if (getScope() != requiredScope)
-        return emitOpError() << "scope must be " << requiredScope << " for this storage owner";
     return success();
 }
 

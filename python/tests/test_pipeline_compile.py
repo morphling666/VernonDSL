@@ -482,7 +482,7 @@ class PipelineCompileTests(unittest.TestCase):
                         {
                             "index": 0,
                             "kind": "tensor",
-                            "type": "!vernon.tensor_view<f32, 2, write>",
+                            "type": '!vernon.tensor_view<f32, [-1, -1], "write", "device">',
                             "element_layout": _scalar_layout("f32"),
                             "shape": [2, 3],
                             "element_strides": [4, -1],
@@ -546,6 +546,25 @@ class PipelineCompileTests(unittest.TestCase):
                 "access": "read_write",
                 "uses": [{key: value for key, value in use.items() if key != "element_layout"} for use in uses],
             },
+        )
+
+        tensor_view_use = {
+            "stage": "compute",
+            "entry": "compute_main",
+            "index": 0,
+            "kind": "tensor",
+            "type": '!vernon.tensor_view<f32, [4], "read", "device">',
+            "element_layout": _scalar_layout("f32"),
+            "shape": [4],
+            "interface": "storage",
+            "access": "read",
+        }
+        with self.assertRaisesRegex(PipelineCompileError, "must use device address space"):
+            merge_parameter_uses("missing_address_space", [tensor_view_use])
+        tensor_view_use["address_space"] = "device"
+        self.assertEqual(
+            merge_parameter_uses("values", [tensor_view_use])["address_space"],
+            "device",
         )
 
         vertex = _stage(

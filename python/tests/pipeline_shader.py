@@ -7,7 +7,7 @@ OPTIONAL_IMAGE = vd.feature("OPTIONAL_IMAGE")
 
 @vd.kernel(workgroup_size=(2, 1, 1))
 def translate_vertices(
-    position: vd.TensorView[vd.f32, 2, vd.read_write],
+    position: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.read_write],
     offset: vd.f32,
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
@@ -19,7 +19,7 @@ def translate_vertices(
 
 @vd.kernel(workgroup_size=(4, 1, 1))
 def copy_static_tensor_value(
-    output: vd.TensorView[vd.f32, 1, vd.write],
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
     singleton: vd.Tensor[vd.f32, (1,)],
     quad: vd.Tensor[vd.f32, (4,)],
     weights: vd.Tensor[vd.f32, (2, 2, 2)],

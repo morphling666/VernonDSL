@@ -26,7 +26,7 @@ std::string readFile(const std::filesystem::path &path) {
 
 TEST(CompilePackaging, WritesBundlesAndArtifacts) {
     constexpr std::string_view computeModule = R"mlir(
-module {
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
   func.func @scale() attributes {
     vernon.entry,
     vernon.stage = "compute",

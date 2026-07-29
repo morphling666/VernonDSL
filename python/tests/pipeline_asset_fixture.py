@@ -29,7 +29,7 @@ def sampled_fragment(
 
 @vd.kernel(workgroup_size=(1, 1, 1))
 def scale(
-    values: vd.TensorView[vd.f32, 1, vd.read_write],
+    values: vd.TensorView[vd.f32, (vd.dyn,), vd.read_write],
     factor: vd.f32,
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:

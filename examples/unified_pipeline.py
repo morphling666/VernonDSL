@@ -11,8 +11,8 @@ import vernon_dsl as vd
 
 @vd.kernel(workgroup_size=(2, 1, 1))
 def animate_vertices(
-    positions: vd.TensorView[vd.f32, 2, vd.write],
-    base_positions: vd.TensorView[vd.f32, 2, vd.read],
+    positions: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write],
+    base_positions: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.read],
     phase: vd.f32,
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:

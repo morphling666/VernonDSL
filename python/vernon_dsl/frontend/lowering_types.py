@@ -54,9 +54,14 @@ class Value:
     @property
     def abi_type(self) -> DslType:
         if self.type.kind == "tensor_view":
-            element, rank, _ = self.type.arguments
+            element, shape, _, address_space = self.type.arguments
             assert isinstance(element, DslType)
-            return DslType("tensor_view_abi", "TensorViewAbi", (element, rank, self.access.value))
+            assert isinstance(shape, tuple)
+            return DslType(
+                "tensor_view_abi",
+                "TensorViewAbi",
+                (element, shape, self.access.value, address_space),
+            )
         return self.type
 
 

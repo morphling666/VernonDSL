@@ -74,7 +74,7 @@ set(PIPELINE_CANONICAL
     "{\"features\":[],\"id\":\"cpu/fill\",\"invocation_abi_version\":6,\
 \"runtime_requirements\":{\"backend\":\"cpu\",\"features\":[\"compute\",\"tensor_views\"],\
 \"invocation_abi_version\":1,\"object_format\":\"${OBJECT_FORMAT}\",\"target_triple\":\"${TARGET_TRIPLE}\"},\
-\"schema_version\":4,\
+\"schema_version\":5,\
 \"stage_artifacts\":{\"fill\":{\"architecture\":\"${ARCHITECTURE}\",\
 \"artifact\":{\"format\":\"native_library\",\"path\":\"${ARTIFACT_NAME}\",\
 \"sha256\":\"${ARTIFACT_SHA256}\",\"size\":${ARTIFACT_SIZE},\"storage\":\"external\"},\
@@ -95,11 +95,13 @@ set(PIPELINE_CANONICAL
 \"target\":\"cpu\"}},\"target\":\"cpu\",\"type\":\"pipeline\",\
 \"variants\":[{\"key\":[],\"outputs\":[{\"access\":\"write\",\"dtype\":\"f32\",\
 \"kind\":\"tensor\",\"location\":0,\"name\":\"result\",\"shape\":[12]}],\
-\"parameters\":[{\"access\":\"write\",\"element_layout\":{\"alignment\":4,\"byte_size\":4,\
+\"parameters\":[{\"access\":\"write\",\"address_space\":\"device\",\
+\"element_layout\":{\"alignment\":4,\"byte_size\":4,\
 \"layout_hash\":\"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b\",\
 \"leaves\":[{\"byte_offset\":0,\"dtype\":\"f32\",\"path\":[],\"scalar_count\":1}],\
-\"logical_type\":\"f32\"},\"kind\":\"tensor\",\
-\"name\":\"output\",\"shape\":[12],\"slot\":0,\"uses\":[{\"access\":\"write\",\
+\"logical_type\":\"f32\"},\"kind\":\"tensor\",\"name\":\"output\",\"shape\":[12],\"slot\":0,\
+\"type\":\"!vernon.tensor_view<f32, [12], \\\"write\\\", \\\"device\\\">\",\
+\"uses\":[{\"access\":\"write\",\
 \"dtype\":\"f32\",\"entry\":\"fill\",\"index\":0,\"interface\":\"storage\",\
 \"kind\":\"tensor\",\"shape\":[12],\"stage\":\"compute\"}]}],\
 \"program\":{\"compute\":\"fill\"}}]}")

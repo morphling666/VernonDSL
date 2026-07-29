@@ -64,11 +64,14 @@ class LanguageVersionTests(unittest.TestCase):
     def test_tensor_values_and_tensor_view_resources_are_distinct(self) -> None:
         element = ConcreteType("scalar", "f32")
         tensor = ConcreteType("tensor", "Tensor", (element, 4))
-        view = ConcreteType("tensor_view", "TensorView", (element, 1, "write"))
+        view = ConcreteType("tensor_view", "TensorView", (element, (4,), "write", "device"))
         parameter = TypedParameter("output", view, AccessMode.WRITE)
 
         self.assertEqual(tensor.mlir, "tensor<4xf32>")
-        self.assertEqual(parameter.type.mlir, '!vernon.tensor_view<f32, 1, "write">')
+        self.assertEqual(
+            parameter.type.mlir,
+            '!vernon.tensor_view<f32, [4], "write", "device">',
+        )
         self.assertEqual(parameter.access, AccessMode.WRITE)
 
     def test_portable_value_abi_layout_is_deterministic(self) -> None:
@@ -109,9 +112,10 @@ class LanguageVersionTests(unittest.TestCase):
             "abi_layout.py",
         )
         self.assertIn("vernon.value_abi_version = 1 : i64", output)
-        self.assertIn("abi_alignment = 8 : i64", output)
-        self.assertIn("abi_field_offsets = array<i64: 0, 16>", output)
-        self.assertIn("abi_size = 24 : i64", output)
+        self.assertIn('abi_leaf_dtypes = ["f32", "f64"]', output)
+        self.assertNotIn("abi_alignment", output)
+        self.assertNotIn("abi_field_offsets", output)
+        self.assertNotIn("abi_size", output)
 
         shared_output = compile_source(
             "from vernon_dsl import *\n"
@@ -121,10 +125,11 @@ class LanguageVersionTests(unittest.TestCase):
             "    return values\n",
             "shared_abi_layout.py",
         )
-        self.assertIn("attributes {vernon.shared}", shared_output)
-        self.assertIn("vernon.abi_alignment = 4 : i64", shared_output)
-        self.assertIn("vernon.abi_element_stride = 8 : i64", shared_output)
-        self.assertIn("vernon.abi_size = 16 : i64", shared_output)
+        self.assertIn("vernon.shared", shared_output)
+        self.assertIn('vernon.abi_leaf_dtypes = ["f32", "i32", "f32", "i32"]', shared_output)
+        self.assertNotIn("vernon.abi_alignment", shared_output)
+        self.assertNotIn("vernon.abi_element_stride", shared_output)
+        self.assertNotIn("vernon.abi_size", shared_output)
 
     def test_aggregate_value_and_attribute_layout_share_recursive_leaves(self) -> None:
         f16 = ConcreteType("scalar", "f16")
@@ -191,7 +196,7 @@ class LanguageVersionTests(unittest.TestCase):
     def test_frontend_and_semantic_identity_are_version_three(self) -> None:
         source = "from vernon_dsl import *\n@fragment\ndef main(value: float) -> float:\n    return value\n"
         output = compile_source(source, "version.py")
-        self.assertIn("vernon.frontend_version = 3 : i64", output)
+        self.assertIn("vernon.frontend_version = 4 : i64", output)
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "shader.py"
@@ -203,7 +208,7 @@ class LanguageVersionTests(unittest.TestCase):
                     captured_constants=(("LIMIT", 3),),
                 )
             )
-            self.assertEqual(result.semantic_inputs["frontend_version"], 3)
+            self.assertEqual(result.semantic_inputs["frontend_version"], 4)
             self.assertEqual(result.semantic_inputs["captured_constants"], [["LIMIT", "int", 3]])
 
     def test_semantic_identity_contains_concrete_helper_specializations(self) -> None:
@@ -369,8 +374,8 @@ class LanguageVersionTests(unittest.TestCase):
             "from vernon_dsl import *\n"
             "@kernel\n"
             "def main(\n"
-            "    output: TensorView[f32, 1, write],\n"
-            "    source: TensorView[f32, 1, read],\n"
+            "    output: TensorView[f32, (dyn,), write],\n"
+            "    source: TensorView[f32, (dyn,), read],\n"
             "    gid: Annotated[Tensor[u32, (3,)], builtin('global_invocation_id')],\n"
             ") -> None:\n"
             "    local = source[2]\n"
@@ -536,7 +541,7 @@ class LanguageVersionTests(unittest.TestCase):
     def test_synchronization_registry_matches_public_device_only_api(self) -> None:
         synchronization_operations = ATOMIC_OPERATION_NAMES | {
             "storage_barrier",
-            "workgroup_array",
+            "workgroup_storage",
             "workgroup_barrier",
         }
         self.assertEqual(
@@ -548,20 +553,24 @@ class LanguageVersionTests(unittest.TestCase):
         calls = {
             **{name: (None, 0, 1) for name in ATOMIC_OPERATION_NAMES},
             "storage_barrier": (),
-            "workgroup_array": (vd.i32, 4),
+            "workgroup_storage": (vd.i32,),
             "workgroup_barrier": (),
         }
         for name, arguments in calls.items():
             with self.subTest(name=name), self.assertRaisesRegex(TypeError, rf"^{name} is device-only"):
-                getattr(vd, name)(*arguments)
+                (
+                    getattr(vd, name)(*arguments, shape=(4,))
+                    if name == "workgroup_storage"
+                    else getattr(vd, name)(*arguments)
+                )
 
     def test_workgroup_storage_atomics_and_barriers_have_typed_effects(self) -> None:
         source = (
             "from vernon_dsl import *\n"
             "@kernel\n"
-            "def main(output: TensorView[i32, 1, write]) -> None:\n"
-            "    signed = workgroup_array(i32, 4)\n"
-            "    unsigned = workgroup_array(u32, 2)\n"
+            "def main(output: TensorView[i32, (dyn,), write]) -> None:\n"
+            "    signed = workgroup_storage(i32, shape=(4,))\n"
+            "    unsigned = workgroup_storage(u32, shape=(2,))\n"
             "    signed[0] = 4\n"
             "    unsigned[0] = u32(4)\n"
             "    workgroup_barrier()\n"
@@ -580,7 +589,7 @@ class LanguageVersionTests(unittest.TestCase):
             result = Compiler().compile_request(FrontendCompileRequest(path, "main"))
 
         self.assertEqual(result.mlir.count('"vernon.workgroup_alloc"'), 2)
-        self.assertEqual(result.mlir.count('"vernon.workgroup_store"'), 2)
+        self.assertEqual(result.mlir.count('"vernon.store"'), 3)
         self.assertEqual(result.mlir.count('"vernon.atomic"'), 6)
         for atomic_kind in ("add", "min", "max", "exchange", "umin", "umax"):
             with self.subTest(atomic_kind=atomic_kind):
@@ -607,13 +616,33 @@ class LanguageVersionTests(unittest.TestCase):
             ],
         )
 
+    def test_rank_two_aggregate_workgroup_storage_uses_typed_tensor_view_ops(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@struct\n"
+            "class Pair:\n"
+            "    left: i32\n"
+            "    right: f32\n"
+            "@kernel\n"
+            "def main() -> None:\n"
+            "    values = workgroup_storage(Pair, shape=(2, 3))\n"
+            "    values[1, 2] = Pair(7, 2.5)\n"
+            "    loaded = values[1, 2]\n",
+            "aggregate_workgroup.py",
+        )
+        view = '!vernon.tensor_view<!vernon.struct<"Pair">, [2, 3], "read_write", "workgroup">'
+        self.assertIn(view, output)
+        self.assertIn('"vernon.store"', output)
+        self.assertIn('"vernon.load"', output)
+        self.assertNotIn("strides = array", output)
+
     def test_all_storage_tensor_view_atomics_use_device_scope(self) -> None:
         source = (
             "from vernon_dsl import *\n"
             "@kernel\n"
             "def main(\n"
-            "    signed: TensorView[i32, 1, read_write],\n"
-            "    unsigned: TensorView[u32, 1, read_write],\n"
+            "    signed: TensorView[i32, (dyn,), read_write],\n"
+            "    unsigned: TensorView[u32, (dyn,), read_write],\n"
             ") -> None:\n"
             "    added = atomic_add(signed, 0, 1)\n"
             "    minimum = atomic_min(signed, 1, 2)\n"
@@ -653,7 +682,7 @@ class LanguageVersionTests(unittest.TestCase):
                 compile_source(
                     "from vernon_dsl import *\n"
                     "@kernel\n"
-                    "def bad(values: TensorView[i32, 1, read]) -> None:\n"
+                    "def bad(values: TensorView[i32, (dyn,), read]) -> None:\n"
                     f"    {operation}(values, 0, 1)\n",
                     f"readonly_{operation}.py",
                 )
@@ -665,7 +694,7 @@ class LanguageVersionTests(unittest.TestCase):
             "def atomic_decoy(value: i32) -> i32:\n"
             "    return value\n"
             "@kernel\n"
-            "def main(destination: TensorView[i32, 1, write]) -> None:\n"
+            "def main(destination: TensorView[i32, (dyn,), write]) -> None:\n"
             "    destination[0] = atomic_decoy(7)\n",
             "atomic_prefix_helper.py",
         )
@@ -676,7 +705,7 @@ class LanguageVersionTests(unittest.TestCase):
             compile_source(
                 "from vernon_dsl import *\n"
                 "@kernel\n"
-                "def bad(values: TensorView[i32, 1, read_write]) -> None:\n"
+                "def bad(values: TensorView[i32, (dyn,), read_write]) -> None:\n"
                 "    atomic_add(values if True else values, 0, 1)\n",
                 "atomic_owner_expression.py",
             )
@@ -687,10 +716,13 @@ class LanguageVersionTests(unittest.TestCase):
                 "from vernon_dsl import *\n@fragment\ndef bad() -> None:\n    workgroup_barrier()\n",
                 "fragment_barrier.py",
             )
-        with self.assertRaisesRegex(CompileError, "supports i32 and u32"):
+        with self.assertRaisesRegex(CompileError, "positive compile-time integers"):
             compile_source(
-                "from vernon_dsl import *\n@kernel\ndef bad() -> None:\n    values = workgroup_array(f32, 4)\n",
-                "float_workgroup.py",
+                "from vernon_dsl import *\n"
+                "@kernel\n"
+                "def bad() -> None:\n"
+                "    values = workgroup_storage(f32, shape=(0,))\n",
+                "invalid_workgroup.py",
             )
 
     def test_pure_helper_rejects_propagated_storage_effects(self) -> None:
@@ -698,10 +730,10 @@ class LanguageVersionTests(unittest.TestCase):
             compile_source(
                 "from vernon_dsl import *\n"
                 "@func\n"
-                "def copy(output: TensorView[f32, 1, write], source: TensorView[f32, 1, read]) -> None:\n"
+                "def copy(output: TensorView[f32, (dyn,), write], source: TensorView[f32, (dyn,), read]) -> None:\n"
                 "    output[0] = source[0]\n"
                 "@kernel\n"
-                "def main(output: TensorView[f32, 1, write], source: TensorView[f32, 1, read]) -> None:\n"
+                "def main(output: TensorView[f32, (dyn,), write], source: TensorView[f32, (dyn,), read]) -> None:\n"
                 "    copy(output, source)\n",
                 "effectful_helper.py",
             )
@@ -712,12 +744,12 @@ class LanguageVersionTests(unittest.TestCase):
                 "from vernon_dsl import *\n"
                 "@func\n"
                 "def combine(\n"
-                "    left: TensorView[f32, 1, read_write],\n"
-                "    right: TensorView[f32, 1, read_write],\n"
+                "    left: TensorView[f32, (dyn,), read_write],\n"
+                "    right: TensorView[f32, (dyn,), read_write],\n"
                 ") -> None:\n"
                 "    left[0] = right[0]\n"
                 "@kernel\n"
-                "def main(data: TensorView[f32, 1, read_write]) -> None:\n"
+                "def main(data: TensorView[f32, (dyn,), read_write]) -> None:\n"
                 "    combine(data, data)\n",
                 "aliased_helper.py",
             )
@@ -772,7 +804,7 @@ class LanguageVersionTests(unittest.TestCase):
 
     def test_tensor_rejects_storage_and_resource_elements(self) -> None:
         cases = (
-            ("TensorView[f32, 1, read]", "Storage 'TensorView'"),
+            ("TensorView[f32, (dyn,), read]", "Storage 'TensorView'"),
             ('Texture["2d", f32]', "Resource 'Texture'"),
             ("Sampler", "Resource 'Sampler'"),
         )
@@ -786,7 +818,7 @@ class LanguageVersionTests(unittest.TestCase):
     def test_struct_fields_must_be_finite_abi_stable_values(self) -> None:
         cases = (
             (
-                "@struct\nclass Bad:\n    data: TensorView[f32, 1, read]\n",
+                "@struct\nclass Bad:\n    data: TensorView[f32, (dyn,), read]\n",
                 "Struct field 'Bad.data' must be an ABI-stable Value",
             ),
             (
@@ -809,8 +841,8 @@ class LanguageVersionTests(unittest.TestCase):
             "    return a and b and c\n"
             "@kernel\n"
             "def main(\n"
-            "    output: TensorView[i32, 1, write],\n"
-            "    source: TensorView[i32, 1, read],\n"
+            "    output: TensorView[i32, (dyn,), write],\n"
+            "    source: TensorView[i32, (dyn,), read],\n"
             "    enabled: bool,\n"
             ") -> None:\n"
             "    if enabled and source[0] > 0:\n"
@@ -820,7 +852,7 @@ class LanguageVersionTests(unittest.TestCase):
         self.assertGreaterEqual(output.count("scf.if"), 3)
         self.assertNotIn("arith.andi", output)
         expression_if = output.index("scf.if", output.index("@main"))
-        load = output.index('name = "tensor_view_load"', expression_if)
+        load = output.index('"vernon.load"', expression_if)
         outer_if = output.index("scf.if", load)
         self.assertLess(expression_if, load)
         self.assertLess(load, outer_if)
@@ -864,9 +896,9 @@ class LanguageVersionTests(unittest.TestCase):
             "    return narrow if condition else wide\n"
             "@kernel\n"
             "def main(\n"
-            "    output: TensorView[f32, 1, write],\n"
-            "    left: TensorView[f32, 1, read],\n"
-            "    right: TensorView[f32, 1, read],\n"
+            "    output: TensorView[f32, (dyn,), write],\n"
+            "    left: TensorView[f32, (dyn,), read],\n"
+            "    right: TensorView[f32, (dyn,), read],\n"
             "    condition: bool,\n"
             ") -> None:\n"
             "    output[0] = left[0] if condition else right[0]\n"
@@ -1307,24 +1339,27 @@ class NumericInferenceTests(unittest.TestCase):
         self.assertIn('!vernon.struct<"Pair">', output)
         self.assertIn("vernon.struct_get", output)
 
-    def test_kernel_tensor_view_store_infers_resource_and_widens_value(self) -> None:
+    def test_kernel_store_infers_resource_and_widens_value(self) -> None:
         output = compile_source(
             "from typing import Annotated\n"
             "from vernon_dsl import *\n"
             "@kernel\n"
             "def main(\n"
-            "    output: Annotated[TensorView[f32, 1, read_write], resource(set=0, binding=0)],\n"
+            "    output: Annotated[TensorView[f32, (dyn,), read_write], resource(set=0, binding=0)],\n"
             "    index: u32,\n"
             "    value: f16,\n"
             ") -> None:\n"
             "    output[index] = value\n",
             "kernel_tensor_view.py",
         )
-        self.assertIn('!vernon.tensor_view<f32, 1, "read_write">', output)
+        self.assertIn(
+            '!vernon.tensor_view<f32, [-1], "read_write", "device">',
+            output,
+        )
         self.assertIn("arith.extf", output)
-        self.assertIn('name = "tensor_view_store"', output)
+        self.assertIn('"vernon.store"', output)
 
-    def test_generic_tensor_view_store_rejects_read_only_resource(self) -> None:
+    def test_store_rejects_read_only_resource(self) -> None:
         with self.assertRaisesRegex(CompileError, "cannot assign through a read-only TensorView"):
             compile_source(
                 "from typing import Annotated\n"
@@ -1334,7 +1369,7 @@ class NumericInferenceTests(unittest.TestCase):
                 "    output[0] = value\n"
                 "@kernel\n"
                 "def main(\n"
-                "    output: Annotated[TensorView[f32, 1, read], resource(set=0, binding=0)],\n"
+                "    output: Annotated[TensorView[f32, (dyn,), read], resource(set=0, binding=0)],\n"
                 "    value: f32,\n"
                 ") -> None:\n"
                 "    store(output, value)\n",

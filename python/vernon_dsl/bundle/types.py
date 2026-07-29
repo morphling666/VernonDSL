@@ -172,7 +172,7 @@ class BundlePlan:
         from .requirements import runtime_requirements
 
         result = {
-            "schema_version": 4,
+            "schema_version": 5,
             "invocation_abi_version": 6,
             "stage_registry_version": STAGE_REGISTRY_VERSION,
             "type": "pipeline",

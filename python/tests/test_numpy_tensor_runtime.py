@@ -8,7 +8,7 @@ import vernon_dsl as vd
 
 @vd.kernel(workgroup_size=(1, 1, 1))
 def numpy_tensor_semantics(
-    output: vd.TensorView[vd.f32, 1, vd.write],
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
     broadcast_left: vd.Tensor[vd.f32, (2, 1, 3)],
     broadcast_right: vd.Tensor[vd.f32, (1, 4, 1)],
     matmul_left: vd.Tensor[vd.f32, (4, 4, 4)],
@@ -26,8 +26,8 @@ def numpy_tensor_semantics(
 
 @vd.kernel(workgroup_size=(1, 1, 1))
 def cpu_numpy_tensor_semantics(
-    output: vd.TensorView[vd.f32, 1, vd.write],
-    values: vd.TensorView[vd.f32, 1, vd.read],
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    values: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
 ) -> None:
     broadcast_left = vd.Tensor([[[values[0], values[1]]], [[values[2], values[3]]]])
     broadcast_right = vd.Tensor([[[values[4]], [values[5]]]])
@@ -50,8 +50,8 @@ def cpu_numpy_tensor_semantics(
 
 @vd.kernel(workgroup_size=(1, 1, 1))
 def cpu_matmul_rank_categories(
-    output: vd.TensorView[vd.f32, 1, vd.write],
-    values: vd.TensorView[vd.f32, 1, vd.read],
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    values: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
 ) -> None:
     left_vector = vd.Vector([values[0], values[1]])
     right_vector = vd.Vector([values[2], values[3]])
@@ -74,8 +74,8 @@ def cpu_matmul_rank_categories(
 
 @vd.kernel(workgroup_size=(1, 1, 1))
 def rank_three_tensor_arithmetic(
-    output: vd.TensorView[vd.f32, 1, vd.write],
-    values: vd.TensorView[vd.f32, 1, vd.read],
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    values: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
 ) -> None:
     left = vd.Tensor(
         [
@@ -100,7 +100,7 @@ def rank_three_tensor_arithmetic(
 
 @vd.kernel(workgroup_size=(1, 1, 1))
 def static_rank_three_tensor_arithmetic(
-    output: vd.TensorView[vd.f32, 1, vd.write],
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
     left: vd.Tensor[vd.f32, (2, 2, 3)],
     elementwise_right: vd.Tensor[vd.f32, (2, 2, 3)],
     projection: vd.Tensor[vd.f32, (1, 3, 2)],

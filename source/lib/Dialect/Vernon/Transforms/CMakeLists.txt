@@ -9,9 +9,9 @@ add_mlir_library(
     VernonLowerCUDAMath.cpp
     VernonLowerGPUTensors.cpp
     VernonLowerSynchronization.cpp
+    VernonAggregateStorage.cpp
     VernonSharedValuePatterns.cpp
     VernonTensorShapeSemantics.cpp
-    VernonValueAbi.cpp
     VernonValidation.cpp
     VernonToGPU.cpp
     VernonToSpirv.cpp

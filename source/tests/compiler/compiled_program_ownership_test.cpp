@@ -7,7 +7,7 @@
 namespace {
 
 constexpr std::string_view module = R"mlir(
-module {
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
   func.func @add_vectors(
       %left: tensor<4xf32> {
         vernon.interface = "input", vernon.location = 0 : i64

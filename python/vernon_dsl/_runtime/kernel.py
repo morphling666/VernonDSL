@@ -13,7 +13,7 @@ import numpy as np
 
 from ..bundle import TargetOptions, canonical_json
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
-from ..frontend.model import AccessMode, StorageEffect, StorageEffectKind
+from ..frontend.model import AccessMode, ConcreteType, StorageEffect, StorageEffectKind
 from ..types import TypeExpr, _Scalar
 from .execution_graph import (
     ComputeEncoder,
@@ -299,6 +299,8 @@ class Kernel:
                         raise TypeError(
                             f"kernel Tensor argument {name!r} has shape {tuple(value.shape)}, expected {expected_shape}"
                         )
+                    if not isinstance(element, ConcreteType):
+                        raise RuntimeError(f"kernel Tensor argument {name!r} has an unresolved element type")
                     if runtime_signature(element_type) != dsl_signature(element):
                         raise TypeError(f"kernel Tensor argument {name!r} element type does not match {element.name}")
                     continue
@@ -307,9 +309,22 @@ class Kernel:
                 continue
             if not isinstance(value, TensorView):
                 raise TypeError(f"kernel argument {name!r} must be a TensorView")
-            element, rank, declared_access = parameter.type.arguments
-            if len(value.shape) != rank:
-                raise TypeError(f"kernel TensorView argument {name!r} has rank {len(value.shape)}, expected {rank}")
+            element, shape, declared_access, address_space = parameter.type.arguments
+            if not isinstance(element, ConcreteType):
+                raise RuntimeError(f"kernel TensorView argument {name!r} has an unresolved element type")
+            if not isinstance(shape, tuple):
+                raise RuntimeError(f"kernel TensorView argument {name!r} has an unresolved shape")
+            if address_space != "device":
+                raise RuntimeError(f"kernel parameter {name!r} has non-device TensorView address space")
+            if len(value.shape) != len(shape):
+                raise TypeError(
+                    f"kernel TensorView argument {name!r} has rank {len(value.shape)}, expected {len(shape)}"
+                )
+            for dimension, (actual, expected) in enumerate(zip(value.shape, shape, strict=True)):
+                if expected != "?" and actual != expected:
+                    raise TypeError(
+                        f"kernel TensorView argument {name!r} dimension {dimension} is {actual}, expected {expected}"
+                    )
             if element.kind == "scalar":
                 matches_element = value.dtype == scalar_dtypes[element.name]
             else:
@@ -470,7 +485,8 @@ class Kernel:
         ).hexdigest()
         cached = self._cache.get(key)
         if cached is None:
-            assert target is not None
+            if target is None:
+                raise RuntimeError(f"unsupported kernel architecture {state._architecture.name!r}")
             program = state._native.Compiler().compile_program_result(frontend.mlir, target, **options.native_options)
             if not program.ok:
                 raise RuntimeError(program.diagnostics)
@@ -518,7 +534,10 @@ class Kernel:
             grid = tuple(reversed(shape)) + (1,) * (3 - len(shape))
         if len(grid) != 3 or any(not isinstance(value, int) or value <= 0 for value in grid):
             raise ValueError("grid must contain three positive integers")
-        assert state._native_runtime is not None and compiled.native is not None
+        if state._native_runtime is None:
+            raise RuntimeError(f"{state._architecture.name} kernel execution requires the native runtime")
+        if compiled.native is None:
+            raise RuntimeError("kernel native program is not loaded")
         dispatch_borrows = [
             (name, value, "write" if name in compiled.writable_names else "read")
             for name, value in zip(user_parameters, arguments, strict=True)

@@ -237,7 +237,8 @@ class Pipeline:
                 }
             )
             if self._compiled is not None and self._compiled.target_identity == target_identity:
-                assert state._native_runtime is not None
+                if state._native_runtime is None:
+                    raise RuntimeError(f"{state._architecture.name} pipeline execution requires the native runtime")
                 self._compiled.native = state._native_runtime.load_pipeline(
                     self._compiled.bundle,
                     list(self._features),
@@ -332,7 +333,8 @@ class Pipeline:
         depth_attachment = target._resident_depth_attachment()
         if depth_attachment is not None:
             attachment = operations["depth"]
-            assert attachment is not None
+            if attachment is None:
+                raise RuntimeError("depth attachment operations are missing while a depth target is bound")
             load = (
                 attachment.depth_load
                 if first_in_scope or attachment.depth_load is LoadOperation.CLEAR
@@ -367,7 +369,8 @@ class Pipeline:
             builder.viewport(*encoder.viewport)
         if encoder.scissor is not None:
             builder.scissor(*encoder.scissor)
-        assert state._native_runtime is not None
+        if state._native_runtime is None:
+            raise RuntimeError(f"{state._architecture.name} pipeline execution requires the native runtime")
         with _dispatch_borrow_scope(dispatch_borrows):
             builder.encode(encoder._native)
         for _, texture in color_attachments:

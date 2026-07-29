@@ -238,7 +238,7 @@ class CompileSurfaceParityTests(unittest.TestCase):
                         ]
                     self.assertEqual(cli_reflection, direct_reflection)
                     self.assertEqual(cli_artifacts, direct_artifacts)
-                    self.assertEqual(owning_reflection["schema_version"], 4)
+                    self.assertEqual(owning_reflection["schema_version"], 5)
                     self.assertEqual(owning_reflection["target"], target_name)
                     if glsl_version:
                         self.assertEqual(owning_reflection["target_options"]["glsl_version"], glsl_version)

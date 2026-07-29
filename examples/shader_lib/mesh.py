@@ -5,15 +5,15 @@ import vernon_dsl as vd
 
 @vd.kernel(workgroup_size=(64, 1, 1))
 def expand_indexed_mesh(
-    positions: vd.TensorView[vd.f32, 2, vd.read],
-    normals: vd.TensorView[vd.f32, 2, vd.read],
-    colors: vd.TensorView[vd.f32, 2, vd.read],
-    materials: vd.TensorView[vd.f32, 2, vd.read],
-    indices: vd.TensorView[vd.u32, 1, vd.read],
-    draw_positions: vd.TensorView[vd.f32, 2, vd.write],
-    draw_normals: vd.TensorView[vd.f32, 2, vd.write],
-    draw_colors: vd.TensorView[vd.f32, 2, vd.write],
-    draw_materials: vd.TensorView[vd.f32, 2, vd.write],
+    positions: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.read],
+    normals: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.read],
+    colors: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.read],
+    materials: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.read],
+    indices: vd.TensorView[vd.u32, (vd.dyn,), vd.read],
+    draw_positions: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write],
+    draw_normals: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write],
+    draw_colors: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write],
+    draw_materials: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write],
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     draw_index = gid[0]

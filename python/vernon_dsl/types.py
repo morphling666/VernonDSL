@@ -60,6 +60,15 @@ write = _Access("write")
 read_write = _Access("read_write")
 
 
+@dataclass(frozen=True)
+class _DynamicExtent:
+    def __repr__(self) -> str:
+        return "dyn"
+
+
+dyn = _DynamicExtent()
+
+
 class When(_TypeConstructor):
     pass
 

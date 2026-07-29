@@ -1,5 +1,6 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonToGPU.h"
 
+#include "mlir/AsmParser/AsmParser.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -9,9 +10,10 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
-#include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonAggregateStorage.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 
 namespace mlir::vernon {
@@ -22,179 +24,6 @@ Type convertStorageLeaf(Type type, bool useSpirvStorage) {
         return MemRefType::get({ShapedType::kDynamic}, type);
     return MemRefType::get({ShapedType::kDynamic}, type, AffineMap(),
                            spirv::StorageClassAttr::get(type.getContext(), spirv::StorageClass::StorageBuffer));
-}
-
-struct ViewExpansion {
-    Type elementType;
-    ValueAbiLayout layout;
-    SmallVector<Value> storages;
-};
-
-FailureOr<Value> buildAggregateValue(Type type, ValueRange leaves, unsigned &cursor, ModuleOp module,
-                                     OpBuilder &builder, Location location) {
-    if (type.isIntOrFloat()) {
-        if (cursor >= leaves.size())
-            return failure();
-        return leaves[cursor++];
-    }
-    auto create = [&](StringRef name, Type resultType, ValueRange operands,
-                      ArrayRef<NamedAttribute> attributes = {}) -> Value {
-        OperationState state(location, name);
-        state.addOperands(operands);
-        state.addTypes(resultType);
-        state.addAttributes(attributes);
-        return builder.create(state)->getResult(0);
-    };
-    auto buildProduct = [&](TypeRange fields, bool structure) -> FailureOr<Value> {
-        SmallVector<Value> values;
-        for (Type field : fields) {
-            FailureOr<Value> value = buildAggregateValue(field, leaves, cursor, module, builder, location);
-            if (failed(value))
-                return failure();
-            values.push_back(*value);
-        }
-        if (structure) {
-            auto structType = cast<StructType>(type);
-            NamedAttribute name(builder.getStringAttr("type_name"), builder.getStringAttr(structType.getName()));
-            return create(StructCreateOp::getOperationName(), type, values, name);
-        }
-        return create(TupleCreateOp::getOperationName(), type, values);
-    };
-    if (auto tuple = dyn_cast<TupleType>(type))
-        return buildProduct(tuple.getTypes(), false);
-    if (auto structure = dyn_cast<StructType>(type)) {
-        FailureOr<std::pair<StructDeclOp, SmallVector<Type>>> fields = resolveStructFields(structure, module);
-        if (failed(fields))
-            return failure();
-        return buildProduct(fields->second, true);
-    }
-
-    Type element;
-    ArrayRef<int64_t> shape;
-    if (auto tensor = dyn_cast<RankedTensorType>(type)) {
-        element = tensor.getElementType();
-        shape = tensor.getShape();
-    } else if (auto tensor = dyn_cast<TensorType>(type)) {
-        element = tensor.getElementType();
-        shape = tensor.getShape();
-    } else {
-        return failure();
-    }
-    int64_t count = 1;
-    for (int64_t dimension : shape)
-        count *= dimension;
-    SmallVector<Value> values;
-    for (int64_t index = 0; index < count; ++index) {
-        FailureOr<Value> value = buildAggregateValue(element, leaves, cursor, module, builder, location);
-        if (failed(value))
-            return failure();
-        values.push_back(*value);
-    }
-    if (isa<RankedTensorType>(type))
-        return tensor::FromElementsOp::create(builder, location, cast<RankedTensorType>(type), values).getResult();
-    NamedAttribute name(builder.getStringAttr("name"), builder.getStringAttr("construct"));
-    return create(IntrinsicOp::getOperationName(), type, values, name);
-}
-
-LogicalResult decomposeAggregateValue(Type type, Value value, SmallVectorImpl<Value> &leaves, ModuleOp module,
-                                      OpBuilder &builder, Location location) {
-    if (type.isIntOrFloat()) {
-        leaves.push_back(value);
-        return success();
-    }
-    auto extract = [&](StringRef name, Type resultType, ValueRange operands,
-                       ArrayRef<NamedAttribute> attributes) -> Value {
-        OperationState state(location, name);
-        state.addOperands(operands);
-        state.addTypes(resultType);
-        state.addAttributes(attributes);
-        return builder.create(state)->getResult(0);
-    };
-    auto decomposeProduct = [&](TypeRange fields, bool structure) -> LogicalResult {
-        for (auto [index, field] : llvm::enumerate(fields)) {
-            SmallVector<NamedAttribute> attributes;
-            attributes.emplace_back(builder.getStringAttr("index"), builder.getI64IntegerAttr(index));
-            StringRef operationName = TupleGetOp::getOperationName();
-            if (structure) {
-                attributes.emplace_back(builder.getStringAttr("field"), builder.getStringAttr(""));
-                operationName = StructGetOp::getOperationName();
-            }
-            Value fieldValue = extract(operationName, field, value, attributes);
-            if (failed(decomposeAggregateValue(field, fieldValue, leaves, module, builder, location)))
-                return failure();
-        }
-        return success();
-    };
-    if (auto tuple = dyn_cast<TupleType>(type))
-        return decomposeProduct(tuple.getTypes(), false);
-    if (auto structure = dyn_cast<StructType>(type)) {
-        FailureOr<std::pair<StructDeclOp, SmallVector<Type>>> fields = resolveStructFields(structure, module);
-        return failed(fields) ? failure() : decomposeProduct(fields->second, true);
-    }
-
-    Type element;
-    ArrayRef<int64_t> shape;
-    bool builtinTensor = false;
-    if (auto tensor = dyn_cast<RankedTensorType>(type)) {
-        element = tensor.getElementType();
-        shape = tensor.getShape();
-        builtinTensor = true;
-    } else if (auto tensor = dyn_cast<TensorType>(type)) {
-        element = tensor.getElementType();
-        shape = tensor.getShape();
-    } else {
-        return failure();
-    }
-    int64_t count = 1;
-    for (int64_t dimension : shape)
-        count *= dimension;
-    for (int64_t linear = 0; linear < count; ++linear) {
-        int64_t remaining = linear;
-        SmallVector<Value> indices(shape.size());
-        for (int64_t dimension = shape.size() - 1; dimension >= 0; --dimension) {
-            indices[dimension] = arith::ConstantIndexOp::create(builder, location, remaining % shape[dimension]);
-            remaining /= shape[dimension];
-        }
-        Value elementValue;
-        if (builtinTensor) {
-            elementValue = tensor::ExtractOp::create(builder, location, value, indices);
-        } else {
-            SmallVector<Value> operands{value};
-            operands.append(indices);
-            elementValue = extract(TensorGetOp::getOperationName(), element, operands, {});
-        }
-        if (failed(decomposeAggregateValue(element, elementValue, leaves, module, builder, location)))
-            return failure();
-    }
-    return success();
-}
-
-Value storageLeafIndex(Value recordIndex, uint64_t recordSize, const ValueAbiLeaf &leaf, uint64_t scalarIndex,
-                       OpBuilder &builder, Location location) {
-    uint64_t leafSize = std::max<uint64_t>(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1);
-    Value stride = arith::ConstantIndexOp::create(builder, location, recordSize / leafSize);
-    Value result = arith::MulIOp::create(builder, location, recordIndex, stride);
-    const uint64_t scalarOffset = leaf.byteOffset / leafSize + scalarIndex;
-    if (scalarOffset) {
-        Value offset = arith::ConstantIndexOp::create(builder, location, scalarOffset);
-        result = arith::AddIOp::create(builder, location, result, offset);
-    }
-    return result;
-}
-
-FailureOr<Value> emitStorageLoad(const ViewExpansion &expansion, Value recordIndex, ModuleOp module, OpBuilder &builder,
-                                 Location location) {
-    SmallVector<Value> leaves;
-    for (auto [leaf, storage] : llvm::zip_equal(expansion.layout.leaves, expansion.storages))
-        for (uint64_t scalarIndex = 0; scalarIndex < leaf.scalarCount; ++scalarIndex)
-            leaves.push_back(memref::LoadOp::create(
-                builder, location, storage,
-                storageLeafIndex(recordIndex, expansion.layout.size, leaf, scalarIndex, builder, location)));
-    unsigned cursor = 0;
-    FailureOr<Value> result = buildAggregateValue(expansion.elementType, leaves, cursor, module, builder, location);
-    if (failed(result) || cursor != leaves.size())
-        return failure();
-    return result;
 }
 
 struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<ModuleOp>> {
@@ -367,8 +196,14 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
             Block *entry = &kernel.front();
             OpBuilder bodyBuilder = OpBuilder::atBlockBegin(entry);
             IRMapping mapping;
-            DenseMap<Value, ViewExpansion> sourceViewExpansions;
-            DenseMap<Value, ViewExpansion> kernelViewExpansions;
+            SmallVector<UnrealizedConversionCastOp> viewBridges;
+            DenseMap<Value, Value> scalarViewStorages;
+            struct AggregateViewExpansion {
+                TensorViewType view;
+                ValueAbiLayout layout;
+                SmallVector<Value> storages;
+            };
+            DenseMap<Value, AggregateViewExpansion> aggregateViewStorages;
             for (auto [sourceIndex, range] : sourceArgumentRanges) {
                 Value first = entry->getArgument(range.first);
                 auto aggregateTensor = aggregateTensorArguments.find(sourceIndex);
@@ -377,17 +212,19 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                         getValueAbiLayout(aggregateTensor->second.getElementType(), module);
                     if (failed(layout))
                         return signalPassFailure();
-                    ViewExpansion expansion{aggregateTensor->second.getElementType(), *layout, {}};
-                    expansion.storages.append(entry->getArguments().begin() + range.first,
-                                              entry->getArguments().begin() + range.first + range.second);
+                    SmallVector<Value> storages;
+                    storages.reserve(range.second);
+                    for (unsigned offset = 0; offset < range.second; ++offset)
+                        storages.push_back(entry->getArgument(range.first + offset));
                     int64_t elementCount = 1;
                     for (int64_t dimension : aggregateTensor->second.getShape())
                         elementCount *= dimension;
                     SmallVector<Value> elements;
                     for (int64_t index = 0; index < elementCount; ++index) {
                         Value recordIndex = arith::ConstantIndexOp::create(bodyBuilder, source.getLoc(), index);
-                        FailureOr<Value> element =
-                            emitStorageLoad(expansion, recordIndex, module, bodyBuilder, source.getLoc());
+                        FailureOr<Value> element = loadAggregateRecordFromStorages(
+                            aggregateTensor->second.getElementType(), storages, recordIndex, *layout, module,
+                            bodyBuilder, source.getLoc(), AggregateStorageBackend::MemRef);
                         if (failed(element))
                             return signalPassFailure();
                         elements.push_back(*element);
@@ -399,18 +236,26 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                     mapping.map(source.getArgument(sourceIndex), bodyBuilder.create(state)->getResult(0));
                     continue;
                 }
-                mapping.map(source.getArgument(sourceIndex), first);
                 auto view = dyn_cast<TensorViewType>(source.getArgument(sourceIndex).getType());
-                if (!view)
+                if (!view) {
+                    mapping.map(source.getArgument(sourceIndex), first);
                     continue;
+                }
                 FailureOr<ValueAbiLayout> layout = getValueAbiLayout(view.getElementType(), module);
                 if (failed(layout))
                     return signalPassFailure();
-                ViewExpansion expansion{view.getElementType(), *layout, {}};
-                expansion.storages.append(entry->getArguments().begin() + range.first,
-                                          entry->getArguments().begin() + range.first + range.second);
-                sourceViewExpansions[source.getArgument(sourceIndex)] = expansion;
-                kernelViewExpansions[first] = std::move(expansion);
+                SmallVector<Value> storages;
+                storages.reserve(range.second);
+                for (unsigned offset = 0; offset < range.second; ++offset)
+                    storages.push_back(entry->getArgument(range.first + offset));
+                auto bridge = UnrealizedConversionCastOp::create(bodyBuilder, source.getLoc(), TypeRange{view},
+                                                                 ValueRange(storages));
+                mapping.map(source.getArgument(sourceIndex), bridge.getResult(0));
+                viewBridges.push_back(bridge);
+                if (view.getElementType().isIntOrFloat())
+                    scalarViewStorages[bridge.getResult(0)] = storages.front();
+                else
+                    aggregateViewStorages[bridge.getResult(0)] = {view, *layout, std::move(storages)};
             }
             for (const InlineTensorArgument &inlineTensor : inlineTensorArguments) {
                 RankedTensorType tensor = inlineTensor.type;
@@ -479,96 +324,108 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                 }
             }
 
-            auto emitViewLoad = [&](const ViewExpansion &expansion, Value recordIndex, OpBuilder &builder,
-                                    Location location) -> FailureOr<Value> {
-                SmallVector<Value> leaves;
-                for (auto [leaf, storage] : llvm::zip_equal(expansion.layout.leaves, expansion.storages))
-                    for (uint64_t scalarIndex = 0; scalarIndex < leaf.scalarCount; ++scalarIndex)
-                        leaves.push_back(
-                            memref::LoadOp::create(builder, location, storage,
-                                                   storageLeafIndex(recordIndex, expansion.layout.size, leaf,
-                                                                    scalarIndex, builder, location)));
-                unsigned cursor = 0;
-                FailureOr<Value> result =
-                    buildAggregateValue(expansion.elementType, leaves, cursor, module, builder, location);
-                if (failed(result) || cursor != leaves.size())
-                    return failure();
-                return result;
-            };
-            auto emitViewStore = [&](const ViewExpansion &expansion, Value recordIndex, Value value, OpBuilder &builder,
-                                     Location location) -> LogicalResult {
-                SmallVector<Value> leaves;
-                if (failed(decomposeAggregateValue(expansion.elementType, value, leaves, module, builder, location)))
-                    return failure();
-                unsigned cursor = 0;
-                for (auto [leaf, storage] : llvm::zip_equal(expansion.layout.leaves, expansion.storages))
-                    for (uint64_t scalarIndex = 0; scalarIndex < leaf.scalarCount; ++scalarIndex) {
-                        if (cursor >= leaves.size())
-                            return failure();
-                        memref::StoreOp::create(
-                            builder, location, leaves[cursor++], storage,
-                            storageLeafIndex(recordIndex, expansion.layout.size, leaf, scalarIndex, builder, location));
-                    }
-                return success(cursor == leaves.size());
-            };
-
             for (Operation &operation : source.front()) {
                 if (isa<func::ReturnOp>(operation)) {
                     gpu::ReturnOp::create(bodyBuilder, operation.getLoc());
                     continue;
                 }
-                if (auto intrinsic = dyn_cast<IntrinsicOp>(operation)) {
-                    if (intrinsic.getName() == "tensor_view_load") {
-                        auto expansion = sourceViewExpansions.find(intrinsic.getOperand(0));
-                        if (expansion == sourceViewExpansions.end())
-                            return signalPassFailure();
-                        FailureOr<Value> loaded =
-                            emitViewLoad(expansion->second, mapping.lookup(intrinsic.getOperand(1)), bodyBuilder,
-                                         intrinsic.getLoc());
-                        if (failed(loaded))
-                            return signalPassFailure();
-                        mapping.map(intrinsic.getResult(), *loaded);
-                        continue;
-                    }
-                    if (intrinsic.getName() == "tensor_view_store") {
-                        auto expansion = sourceViewExpansions.find(intrinsic.getOperand(0));
-                        if (expansion == sourceViewExpansions.end() ||
-                            failed(emitViewStore(expansion->second, mapping.lookup(intrinsic.getOperand(1)),
-                                                 mapping.lookup(intrinsic.getOperand(2)), bodyBuilder,
-                                                 intrinsic.getLoc())))
-                            return signalPassFailure();
-                        continue;
-                    }
-                }
                 bodyBuilder.clone(operation, mapping);
             }
 
-            // Intrinsics nested under structured control flow are cloned recursively,
-            // so lower them after the complete kernel body has been materialized.
-            SmallVector<IntrinsicOp> nestedIntrinsics;
-            kernel.walk([&](IntrinsicOp intrinsic) { nestedIntrinsics.push_back(intrinsic); });
-            for (IntrinsicOp intrinsic : nestedIntrinsics) {
-                OpBuilder builder(intrinsic);
-                if (intrinsic.getName() == "tensor_view_load") {
-                    auto expansion = kernelViewExpansions.find(intrinsic.getOperand(0));
-                    if (expansion == kernelViewExpansions.end())
-                        return signalPassFailure();
-                    FailureOr<Value> loaded =
-                        emitViewLoad(expansion->second, intrinsic.getOperand(1), builder, intrinsic.getLoc());
-                    if (failed(loaded))
-                        return signalPassFailure();
-                    intrinsic.getResult().replaceAllUsesWith(*loaded);
-                    intrinsic.erase();
+            SmallVector<Operation *> aggregateStorageOperations;
+            kernel.walk([&](Operation *operation) {
+                if (isa<LoadOp, StoreOp>(operation))
+                    aggregateStorageOperations.push_back(operation);
+            });
+            IRRewriter aggregateRewriter(kernel.getContext());
+            for (Operation *operation : aggregateStorageOperations) {
+                Value logicalStorage =
+                    isa<StoreOp>(operation) ? cast<StoreOp>(operation).getStorage() : operation->getOperand(0);
+                auto found = aggregateViewStorages.find(logicalStorage);
+                if (found == aggregateViewStorages.end())
                     continue;
+                ValueRange indices = isa<StoreOp>(operation) ? cast<StoreOp>(operation).getIndices()
+                                                             : cast<LoadOp>(operation).getIndices();
+                if (!operation->hasAttr(kPhysicalIndexAttrName) || indices.empty()) {
+                    operation->emitError("aggregate device TensorView operation has no materialized physical index");
+                    return signalPassFailure();
                 }
-                if (intrinsic.getName() == "tensor_view_store") {
-                    auto expansion = kernelViewExpansions.find(intrinsic.getOperand(0));
-                    if (expansion == kernelViewExpansions.end() ||
-                        failed(emitViewStore(expansion->second, intrinsic.getOperand(1), intrinsic.getOperand(2),
-                                             builder, intrinsic.getLoc())))
+                aggregateRewriter.setInsertionPoint(operation);
+                if (auto load = dyn_cast<LoadOp>(operation)) {
+                    FailureOr<Value> value = loadAggregateRecordFromStorages(
+                        found->second.view.getElementType(), found->second.storages, indices.front(),
+                        found->second.layout, module, aggregateRewriter, load.getLoc(),
+                        AggregateStorageBackend::MemRef);
+                    if (failed(value)) {
+                        load.emitError("cannot reconstruct aggregate device TensorView value");
                         return signalPassFailure();
-                    intrinsic.erase();
+                    }
+                    aggregateRewriter.replaceOp(load, *value);
+                } else {
+                    auto store = cast<StoreOp>(operation);
+                    if (failed(storeAggregateRecordToStorages(found->second.view.getElementType(),
+                                                              found->second.storages, indices.front(), store.getValue(),
+                                                              found->second.layout, module, aggregateRewriter,
+                                                              store.getLoc(), AggregateStorageBackend::MemRef))) {
+                        store.emitError("cannot decompose aggregate device TensorView value");
+                        return signalPassFailure();
+                    }
+                    aggregateRewriter.eraseOp(store);
                 }
+            }
+
+            SmallVector<Operation *> scalarStorageOperations;
+            kernel.walk([&](Operation *operation) {
+                if (isa<LoadOp, StoreOp, AtomicOp>(operation))
+                    scalarStorageOperations.push_back(operation);
+            });
+            IRRewriter storageRewriter(kernel.getContext());
+            for (Operation *operation : scalarStorageOperations) {
+                Value logicalStorage =
+                    isa<StoreOp>(operation) ? cast<StoreOp>(operation).getStorage() : operation->getOperand(0);
+                auto found = scalarViewStorages.find(logicalStorage);
+                if (found == scalarViewStorages.end())
+                    continue;
+                if (!operation->hasAttr(kPhysicalIndexAttrName)) {
+                    operation->emitError("device TensorView operation is missing its materialized physical index");
+                    return signalPassFailure();
+                }
+                ValueRange indices = isa<LoadOp>(operation)    ? cast<LoadOp>(operation).getIndices()
+                                     : isa<StoreOp>(operation) ? cast<StoreOp>(operation).getIndices()
+                                                               : cast<AtomicOp>(operation).getIndices();
+                if (indices.empty()) {
+                    operation->emitError("device TensorView operation has no physical index");
+                    return signalPassFailure();
+                }
+                storageRewriter.setInsertionPoint(operation);
+                if (auto load = dyn_cast<LoadOp>(operation)) {
+                    storageRewriter.replaceOpWithNewOp<memref::LoadOp>(load, found->second, indices.front());
+                } else if (auto store = dyn_cast<StoreOp>(operation)) {
+                    memref::StoreOp::create(storageRewriter, store.getLoc(), store.getValue(), found->second,
+                                            indices.front());
+                    storageRewriter.eraseOp(store);
+                } else {
+                    auto atomic = cast<AtomicOp>(operation);
+                    arith::AtomicRMWKind kind = atomic.getAtomicKind() == "add"    ? arith::AtomicRMWKind::addi
+                                                : atomic.getAtomicKind() == "min"  ? arith::AtomicRMWKind::mins
+                                                : atomic.getAtomicKind() == "max"  ? arith::AtomicRMWKind::maxs
+                                                : atomic.getAtomicKind() == "umin" ? arith::AtomicRMWKind::minu
+                                                : atomic.getAtomicKind() == "umax" ? arith::AtomicRMWKind::maxu
+                                                                                   : arith::AtomicRMWKind::assign;
+                    storageRewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(atomic, kind, atomic.getValue(),
+                                                                            found->second, indices.front());
+                }
+            }
+
+            if (failed(lowerGpuAggregateWorkgroupStorage(kernel, module)))
+                return signalPassFailure();
+
+            for (UnrealizedConversionCastOp bridge : viewBridges) {
+                if (!bridge->use_empty()) {
+                    bridge.emitError("TensorView conversion bridge still has uses after GPU storage lowering");
+                    return signalPassFailure();
+                }
+                bridge.erase();
             }
         }
     }

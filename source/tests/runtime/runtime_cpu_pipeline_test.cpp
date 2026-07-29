@@ -80,6 +80,8 @@ TEST(RuntimeCpuPipeline, ReflectsVersionedTextureConstraints) {
     nlohmann::json constrained = nlohmann::json::parse(bundle);
     nlohmann::json &parameter = constrained["variants"][0]["parameters"][0];
     parameter["kind"] = "texture";
+    parameter["type"] = "!vernon.texture<\"3d\", f32>";
+    parameter.erase("address_space");
     parameter.erase("element_layout");
     parameter["access"] = "read";
     parameter["dimension"] = "3d";

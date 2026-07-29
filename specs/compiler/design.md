@@ -504,7 +504,7 @@ call-site-dependent inference decisions.
 
 The typed semantic model records lvalues, branch merges, effects, and
 termination. Phase 5B early return, `break`, `continue`, and dynamic `range`
-are implemented while the frontend still reports version 3. This boundary
+are implemented under frontend version 4. This boundary
 keeps later autodiff control-flow rules from changing expression typing or
 helper specialization.
 
@@ -661,8 +661,9 @@ is reserved for legacy schema-2 bundles and the cook-only Metal target.
 ## Language v4 representation boundary
 
 The normative source-language model is specified in
-`specs/language/contract.md`. It is implemented phase by phase while the
-frontend continues to report version 3 until all v4 acceptance gates pass.
+`specs/language/contract.md`. It is implemented phase by phase under frontend
+version 4; unchecked contract gates and open correctness findings in
+`specs/compiler/root_cause_audit.md` remain incomplete.
 
 Typed IR must classify each entity as Value, Storage, or Resource. Value
 `Tensor` identity contains recursively ABI-stable element type and logical

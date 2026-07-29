@@ -88,14 +88,16 @@ class TypeParser:
             return ConcreteType("tensor_storage", "TensorStorage", (element,))
         if constructor == "TensorView":
             if len(items) != 3:
-                raise self.context.error(node, "TensorView requires an element type, rank, and access mode")
+                raise self.context.error(node, "TensorView requires an element type, shape, and access mode")
             element = self.parse_type(items[0])
             self._require_storage_element(items[0], element, "TensorView")
-            rank = self._positive_int(items[1], "TensorView rank")
+            if not isinstance(items[1], ast.Tuple) or not items[1].elts:
+                raise self.context.error(items[1], "TensorView shape must be a non-empty tuple")
+            shape = tuple(self._tensor_view_extent(item) for item in items[1].elts)
             access = self._string_or_name(items[2], "TensorView access")
             if access not in {"read", "write", "read_write"}:
                 raise self.context.error(items[2], "TensorView access must be read, write, or read_write")
-            return ConcreteType("tensor_view", "TensorView", (element, rank, access))
+            return ConcreteType("tensor_view", "TensorView", (element, shape, access, "device"))
         if constructor == "Texture":
             if len(items) != 2:
                 raise self.context.error(node, "Texture requires a dimension and element type")
@@ -136,9 +138,7 @@ class TypeParser:
             )
         return ConcreteType("tensor", "Tensor", (element, *shape))
 
-    def _positive_int(self, node: ast.AST, description: str) -> int | str:
-        if description == "tensor dimension" and isinstance(node, ast.Constant) and node.value is None:
-            return "?"
+    def _positive_int(self, node: ast.AST, description: str) -> int:
         if (
             not isinstance(node, ast.Constant)
             or not isinstance(node.value, int)
@@ -147,6 +147,11 @@ class TypeParser:
         ):
             raise self.context.error(node, f"{description} must be a positive integer literal")
         return node.value
+
+    def _tensor_view_extent(self, node: ast.AST) -> int | str:
+        if (dotted_name(node) or "").split(".")[-1] == "dyn":
+            return "?"
+        return self._positive_int(node, "TensorView dimension")
 
     def _string_or_name(self, node: ast.AST, description: str) -> str:
         if isinstance(node, ast.Constant) and isinstance(node.value, str):

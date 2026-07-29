@@ -109,7 +109,7 @@ DEVICE_ONLY_OPERATION_NAMES = frozenset(
         "storage_barrier",
         "texture_sample",
         "texture_size",
-        "workgroup_array",
+        "workgroup_storage",
         "workgroup_barrier",
     }
 )

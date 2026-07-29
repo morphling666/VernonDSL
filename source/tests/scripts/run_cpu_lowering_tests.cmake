@@ -95,7 +95,7 @@ reject_text("swizzle aliases" "${SWIZZLE_OUTPUT}" "vernon.swizzle")
 run_case(
     BUFFER
     "cpu-buffer-memref.mlir"
-    "--vernon-lower-cpu-resources"
+    "--pass-pipeline=builtin.module(vernon-materialize-storage-projections,vernon-lower-cpu-resources)"
     FALSE)
 require_text("buffer/memref" "${BUFFER_OUTPUT}" "memref<?xf32>")
 require_text("buffer/memref" "${BUFFER_OUTPUT}" "memref.load")

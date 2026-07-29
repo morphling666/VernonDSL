@@ -19,6 +19,7 @@ from .interfaces import plan_generated_interface
 from .loop_lowering import lower_for, lower_while
 from .lowering_types import DslType, FunctionSignature, ModuleContext, Value, element_type
 from .model import (
+    AccessMode,
     ConcreteType,
     StorageEffect,
     StorageOwnerKind,
@@ -29,7 +30,11 @@ from .model import (
 )
 from .numeric_lowering import lower_binary, lower_compare, lower_constant, lower_unary
 from .resource_lowering import lower_texture_sample, lower_texture_size
-from .storage_lowering import lower_buffer_index, lower_storage_store, lower_tensor_view_index
+from .storage_lowering import (
+    lower_buffer_index,
+    lower_storage_store,
+    lower_tensor_view_indices,
+)
 from .type_parser import AnnotatedType, Metadata
 from .type_solver import can_convert
 
@@ -280,6 +285,13 @@ class _FunctionEmitter:
                             f"vernon.tensor_offset = {view_layout.offset} : i64",
                         )
                     )
+                elif len(value_type.arguments[1]) == 1:
+                    attributes.extend(
+                        (
+                            "vernon.tensor_strides = array<i64: 1>",
+                            "vernon.tensor_offset = 0 : i64",
+                        )
+                    )
             suffix = f" {{{', '.join(attributes)}}}" if attributes else ""
             arguments.append(f"{value.name}: {value.abi_type.mlir}{suffix}")
         self._append_generated_arguments(arguments)
@@ -365,34 +377,8 @@ class _FunctionEmitter:
             return tuple((field_name, annotation.type) for field_name, annotation in self.context.structs[name])
 
         layout = value_abi_layout(value_type, fields)
-        attributes = [
-            f"vernon.abi_alignment = {layout.alignment} : i64",
-            f"vernon.abi_size = {layout.size} : i64",
-            f'vernon.abi_layout_hash = "{layout.layout_hash}"',
-        ]
         leaf_dtypes = ", ".join(f'"{leaf.dtype}"' for leaf in layout.leaves)
-        leaf_offsets = ", ".join(str(leaf.byte_offset) for leaf in layout.leaves)
-        leaf_counts = ", ".join(str(leaf.scalar_count) for leaf in layout.leaves)
-        leaf_paths = ", ".join(
-            '"'
-            + "/".join(str(component) if isinstance(component, str) else f"[{component}]" for component in leaf.path)
-            + '"'
-            for leaf in layout.leaves
-        )
-        attributes.extend(
-            (
-                f"vernon.abi_leaf_dtypes = [{leaf_dtypes}]",
-                f"vernon.abi_leaf_offsets = array<i64: {leaf_offsets}>",
-                f"vernon.abi_leaf_counts = array<i64: {leaf_counts}>",
-                f"vernon.abi_leaf_paths = [{leaf_paths}]",
-            )
-        )
-        if layout.field_offsets:
-            offsets = ", ".join(str(offset) for offset in layout.field_offsets)
-            attributes.append(f"vernon.abi_field_offsets = array<i64: {offsets}>")
-        if layout.element_stride is not None:
-            attributes.append(f"vernon.abi_element_stride = {layout.element_stride} : i64")
-        return attributes
+        return [f"vernon.abi_leaf_dtypes = [{leaf_dtypes}]"]
 
     def _append_generated_arguments(self, arguments: list[str]) -> None:
         for sampler_plan in self.interface_plan.implicit_samplers:
@@ -721,16 +707,16 @@ class _FunctionEmitter:
         return Value(result, tensor_type)
 
     def _call(self, node: ast.Call) -> Value:
-        if node.keywords:
-            raise self.context.error(node, "function calls do not support keyword arguments")
         typed_call = self._typed_expression(node)
         name = typed_call.operation or ""
-        if name == "workgroup_array":
+        if node.keywords and name != "workgroup_storage":
+            raise self.context.error(node, "function calls do not support keyword arguments")
+        if name == "workgroup_storage":
             if self.stage != "compute":
                 raise self.context.error(node, "workgroup storage is supported only in compute kernels")
             result = self._fresh()
             self._line(f'{result} = "vernon.workgroup_alloc"() : () -> {typed_call.type.mlir}')
-            return Value(result, typed_call.type)
+            return Value(result, typed_call.type, access=AccessMode.READ_WRITE)
         if name in {"workgroup_barrier", "storage_barrier"}:
             if self.stage != "compute":
                 raise self.context.error(node, "barriers are supported only in compute kernels")
@@ -741,6 +727,36 @@ class _FunctionEmitter:
             return lower_aggregate_constructor(self, node, name)
         if name == "Tuple":
             return lower_tuple(self, node, node.args)
+        if name in ATOMIC_OPERATION_NAMES:
+            if self.stage != "compute" or len(node.args) != 3:
+                raise self.context.error(node, f"{name} requires compute storage, index, and value")
+            storage = self._expression(node.args[0])
+            if storage.type.kind != "tensor_view":
+                raise self.context.error(node.args[0], f"{name} requires a writable TensorView")
+            if storage.type.arguments[2] == "read":
+                raise self.context.error(node.args[0], f"{name} requires a writable TensorView")
+            shape = storage.type.arguments[1]
+            assert isinstance(shape, tuple)
+            index_nodes = list(node.args[1].elts) if isinstance(node.args[1], ast.Tuple) else [node.args[1]]
+            if len(index_nodes) != len(shape):
+                raise self.context.error(node.args[1], f"{name} requires one index per TensorView dimension")
+            indices = [lower_buffer_index(self, index_node) for index_node in index_nodes]
+            element = storage.type.arguments[0]
+            assert isinstance(element, DslType)
+            value = self._coerce_implicit(node.args[2], self._expression(node.args[2]), element)
+            result = self._fresh()
+            atomic_kind = name.removeprefix("atomic_")
+            if atomic_kind in {"min", "max"} and element.name == "u32":
+                atomic_kind = f"u{atomic_kind}"
+            operands = ", ".join((storage.name, *(index.name for index in indices), value.name))
+            operand_types = ", ".join((storage.type.mlir, *(["index"] * len(indices)), element.mlir))
+            attributes = [f'atomic_kind = "{atomic_kind}"', 'ordering = "relaxed"']
+            self._line(
+                f'{result} = "vernon.atomic"({operands}) '
+                f"{{{', '.join(attributes)}}} "
+                f": ({operand_types}) -> {element.mlir}"
+            )
+            return Value(result, element)
         known_signature = self.context.signatures.get(name)
         struct_fields = self.context.structs.get(name)
         if struct_fields is not None and len(node.args) == len(struct_fields):
@@ -755,29 +771,6 @@ class _FunctionEmitter:
             ]
         else:
             arguments = [self._expression(argument) for argument in node.args]
-        if name in ATOMIC_OPERATION_NAMES:
-            if self.stage != "compute" or len(arguments) != 3:
-                raise self.context.error(node, f"{name} requires compute storage, index, and value")
-            storage, index, value = arguments
-            if storage.type.kind not in {"workgroup", "tensor_view"}:
-                raise self.context.error(node.args[0], f"{name} requires workgroup storage or a writable TensorView")
-            if storage.type.kind == "tensor_view" and storage.type.arguments[2] == "read":
-                raise self.context.error(node.args[0], f"{name} requires a writable TensorView")
-            index = lower_buffer_index(self, node.args[1])
-            element = storage.type.arguments[0]
-            assert isinstance(element, DslType)
-            value = self._coerce_implicit(node.args[2], value, element)
-            result = self._fresh()
-            atomic_kind = name.removeprefix("atomic_")
-            if atomic_kind in {"min", "max"} and element.name == "u32":
-                atomic_kind = f"u{atomic_kind}"
-            scope = "device" if storage.type.kind == "tensor_view" else "workgroup"
-            self._line(
-                f'{result} = "vernon.atomic"({storage.name}, {index.name}, {value.name}) '
-                f'{{atomic_kind = "{atomic_kind}", ordering = "relaxed", scope = "{scope}"}} '
-                f": ({storage.type.mlir}, index, {element.mlir}) -> {element.mlir}"
-            )
-            return Value(result, element)
         if (
             isinstance(node.func, ast.Attribute)
             and name in INTRINSIC_METHODS
@@ -1046,24 +1039,13 @@ class _FunctionEmitter:
             fields = self._tuple_fields(node, value)
             return fields[index]
         if value.type.kind == "tensor_view":
-            index = lower_tensor_view_index(self, node, value)
+            indices = lower_tensor_view_indices(self, node, value)
             element = value.type.arguments[0]
             assert isinstance(element, DslType)
             result = self._fresh()
-            self._line(
-                f'{result} = "vernon.intrinsic"({value.name}, {index.name}) '
-                f'{{name = "tensor_view_load"}} : ({value.abi_type.mlir}, index) -> {element.mlir}'
-            )
-            return Value(result, element)
-        if value.type.kind == "workgroup":
-            index = lower_buffer_index(self, node.slice)
-            element = value.type.arguments[0]
-            assert isinstance(element, DslType)
-            result = self._fresh()
-            self._line(
-                f'{result} = "vernon.workgroup_load"({value.name}, {index.name}) '
-                f": ({value.type.mlir}, index) -> {element.mlir}"
-            )
+            operands = ", ".join((value.name, *(index.name for index in indices)))
+            operand_types = ", ".join((value.abi_type.mlir, *(["index"] * len(indices))))
+            self._line(f'{result} = "vernon.load"({operands}) : ({operand_types}) -> {element.mlir}')
             return Value(result, element)
         if value.type.kind != "tensor":
             raise self.context.error(node, "indexing requires a Tensor or Storage value")

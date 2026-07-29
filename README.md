@@ -233,11 +233,11 @@ from typing import Annotated
 import vernon_dsl as vd
 
 vd.init(arch=vd.cpu)  # vd.cuda and vd.vulkan use the same LoadedPipeline API
-output = vd.Tensor.zeros(dtype=vd.f32, shape=(8,))
+output = vd.TensorStorage.zeros(dtype=vd.f32, shape=(8,))
 
 @vd.kernel(workgroup_size=(8, 1, 1))
 def scale(
-    output: vd.Tensor[vd.f32, (None,)],
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
     factor: vd.f32,
     gid: Annotated[
         vd.Tensor[vd.u32, (3,)],

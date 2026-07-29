@@ -1,4 +1,4 @@
-module {
+module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
   "vernon.struct"() <{
     fields = ["value"],
     sym_name = "LoweringOnlyMetadata"

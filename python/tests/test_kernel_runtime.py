@@ -32,9 +32,9 @@ fractal = _load_fractal()
 
 @vd.kernel(workgroup_size=(4, 2, 1))
 def tensor_operators(
-    output: vd.TensorView[vd.f32, 3, vd.write],
-    left: vd.TensorView[vd.f32, 3, vd.read],
-    right: vd.TensorView[vd.f32, 3, vd.read],
+    output: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn), vd.write],
+    left: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn), vd.read],
+    right: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn), vd.read],
     scale: vd.f32,
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
@@ -46,7 +46,7 @@ def tensor_operators(
 
 @vd.kernel(workgroup_size=(8, 1, 1))
 def vector_while(
-    output: vd.TensorView[vd.f32, 1, vd.write],
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
     phase: vd.f32,
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
@@ -74,7 +74,7 @@ def vector_while(
 
 @vd.kernel(workgroup_size=(2, 1, 1))
 def matrix_vector(
-    output: vd.TensorView[vd.f32, 1, vd.write],
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     x = gid[0]
@@ -85,8 +85,8 @@ def matrix_vector(
 
 @vd.kernel(workgroup_size=(8, 1, 1))
 def floating_power(
-    output: vd.TensorView[vd.f32, 1, vd.write],
-    values: vd.TensorView[vd.f32, 1, vd.read],
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    values: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
     exponent: vd.f32,
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
@@ -96,8 +96,8 @@ def floating_power(
 
 @vd.kernel(workgroup_size=(4, 2, 1))
 def copy_tensor_view(
-    output: vd.TensorView[vd.f32, 2, vd.read_write],
-    source: vd.TensorView[vd.f32, 2, vd.read],
+    output: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.read_write],
+    source: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.read],
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     output[gid[1], gid[0]] = source[gid[1], gid[0]]
@@ -105,9 +105,9 @@ def copy_tensor_view(
 
 @vd.kernel(workgroup_size=(4, 1, 1))
 def short_circuit_boolean(
-    output: vd.TensorView[vd.i32, 1, vd.write],
-    left: vd.TensorView[vd.i32, 1, vd.read],
-    right: vd.TensorView[vd.i32, 1, vd.read],
+    output: vd.TensorView[vd.i32, (vd.dyn,), vd.write],
+    left: vd.TensorView[vd.i32, (vd.dyn,), vd.read],
+    right: vd.TensorView[vd.i32, (vd.dyn,), vd.read],
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     x = gid[0]
@@ -119,9 +119,9 @@ def short_circuit_boolean(
 
 @vd.kernel(workgroup_size=(4, 1, 1))
 def conditional_select(
-    output: vd.TensorView[vd.i32, 1, vd.write],
-    left: vd.TensorView[vd.i32, 1, vd.read],
-    right: vd.TensorView[vd.i32, 1, vd.read],
+    output: vd.TensorView[vd.i32, (vd.dyn,), vd.write],
+    left: vd.TensorView[vd.i32, (vd.dyn,), vd.read],
+    right: vd.TensorView[vd.i32, (vd.dyn,), vd.read],
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     x = gid[0]
@@ -144,7 +144,7 @@ def sum_odds_until_break(limit: vd.i32) -> vd.i32:
 
 @vd.kernel
 def loop_control(
-    output: vd.TensorView[vd.i32, 1, vd.write],
+    output: vd.TensorView[vd.i32, (vd.dyn,), vd.write],
     limit: vd.i32,
 ) -> None:
     output[0] = sum_odds_until_break(limit)
@@ -170,7 +170,7 @@ def nested_loop_control_value() -> vd.i32:
 
 @vd.kernel
 def nested_loop_control(
-    output: vd.TensorView[vd.i32, 1, vd.write],
+    output: vd.TensorView[vd.i32, (vd.dyn,), vd.write],
 ) -> None:
     output[0] = nested_loop_control_value()
 
@@ -187,8 +187,8 @@ def early_return_from_loop(limit: vd.i32) -> vd.i32:
 
 @vd.kernel
 def loop_early_return(
-    output: vd.TensorView[vd.i32, 1, vd.write],
-    source: vd.TensorView[vd.i32, 1, vd.read],
+    output: vd.TensorView[vd.i32, (vd.dyn,), vd.write],
+    source: vd.TensorView[vd.i32, (vd.dyn,), vd.read],
 ) -> None:
     output[0] = early_return_from_loop(source[0])
 
@@ -203,8 +203,8 @@ def dynamic_range_sum(start: vd.i32, stop: vd.i32, step: vd.i32) -> vd.i32:
 
 @vd.kernel
 def dynamic_range(
-    output: vd.TensorView[vd.i32, 1, vd.write],
-    controls: vd.TensorView[vd.i32, 1, vd.read],
+    output: vd.TensorView[vd.i32, (vd.dyn,), vd.write],
+    controls: vd.TensorView[vd.i32, (vd.dyn,), vd.read],
 ) -> None:
     output[0] = dynamic_range_sum(controls[0], controls[1], controls[2])
 
@@ -227,8 +227,8 @@ def signed_literal_step_range_sum(
 
 @vd.kernel
 def signed_literal_step_range(
-    output: vd.TensorView[vd.i32, 1, vd.write],
-    controls: vd.TensorView[vd.i32, 1, vd.read],
+    output: vd.TensorView[vd.i32, (vd.dyn,), vd.write],
+    controls: vd.TensorView[vd.i32, (vd.dyn,), vd.read],
 ) -> None:
     output[0] = signed_literal_step_range_sum(controls[0], controls[1], controls[2])
 
@@ -257,8 +257,8 @@ def range_early_return_value(stop: vd.i32) -> vd.i32:
 
 @vd.kernel
 def range_control_flow(
-    output: vd.TensorView[vd.i32, 1, vd.write],
-    controls: vd.TensorView[vd.i32, 1, vd.read],
+    output: vd.TensorView[vd.i32, (vd.dyn,), vd.write],
+    controls: vd.TensorView[vd.i32, (vd.dyn,), vd.read],
 ) -> None:
     output[0] = range_loop_control_value(controls[0])
     output[1] = range_early_return_value(controls[0])
@@ -286,7 +286,7 @@ def early_tuple(flag: vd.bool) -> vd.Tuple[vd.i32, vd.f32]:
 
 @vd.kernel
 def early_return_values(
-    output: vd.TensorView[vd.f32, 1, vd.write],
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
     flag: vd.i32,
 ) -> None:
     record = early_record(flag != 0)
@@ -301,8 +301,8 @@ def early_return_values(
 
 @vd.kernel(workgroup_size=(2, 1, 1))
 def copy_tuple_tensor_view(
-    output: vd.TensorView[vd.Tuple[vd.i32, vd.f32], 1, vd.write],
-    source: vd.TensorView[vd.Tuple[vd.i32, vd.f32], 1, vd.read],
+    output: vd.TensorView[vd.Tuple[vd.i32, vd.f32], (vd.dyn,), vd.write],
+    source: vd.TensorView[vd.Tuple[vd.i32, vd.f32], (vd.dyn,), vd.read],
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     output[gid[0]] = source[gid[0]]
@@ -310,8 +310,8 @@ def copy_tuple_tensor_view(
 
 @vd.kernel(workgroup_size=(2, 1, 1))
 def copy_value_tensor_view(
-    output: vd.TensorView[vd.Tensor[vd.f32, (2,)], 1, vd.write],
-    source: vd.TensorView[vd.Tensor[vd.f32, (2,)], 1, vd.read],
+    output: vd.TensorView[vd.Tensor[vd.f32, (2,)], (vd.dyn,), vd.write],
+    source: vd.TensorView[vd.Tensor[vd.f32, (2,)], (vd.dyn,), vd.read],
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     output[gid[0]] = source[gid[0]]
@@ -319,7 +319,7 @@ def copy_value_tensor_view(
 
 @vd.kernel(workgroup_size=(64, 1, 1))
 def global_atomic_increment(
-    values: vd.TensorView[vd.i32, 1, vd.read_write],
+    values: vd.TensorView[vd.i32, (vd.dyn,), vd.read_write],
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     vd.atomic_add(values, 0, 1)
@@ -327,14 +327,14 @@ def global_atomic_increment(
 
 @vd.kernel(workgroup_size=(1, 1, 1))
 def atomic_fill(
-    values: vd.TensorView[vd.i32, 1, vd.read_write],
+    values: vd.TensorView[vd.i32, (vd.dyn,), vd.read_write],
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     vd.atomic_add(values, gid[0], 1)
 
 
 @vd.kernel(workgroup_size=(1, 1, 1))
-def global_atomic_operations(values: vd.TensorView[vd.i32, 1, vd.read_write]) -> None:
+def global_atomic_operations(values: vd.TensorView[vd.i32, (vd.dyn,), vd.read_write]) -> None:
     vd.atomic_exchange(values, 0, 5)
     vd.atomic_add(values, 1, 3)
     vd.atomic_min(values, 2, 7)
@@ -343,11 +343,11 @@ def global_atomic_operations(values: vd.TensorView[vd.i32, 1, vd.read_write]) ->
 
 @vd.kernel(workgroup_size=(4, 1, 1))
 def workgroup_atomic_lanes(
-    output: vd.TensorView[vd.i32, 1, vd.write],
+    output: vd.TensorView[vd.i32, (vd.dyn,), vd.write],
     lane_id: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("local_invocation_id")],
     group_id: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("workgroup_id")],
 ) -> None:
-    shared = vd.workgroup_array(vd.i32, 1)
+    shared = vd.workgroup_storage(vd.i32, shape=(1,))
     lane = lane_id[0]
     group = group_id[0]
     if lane == 0:
@@ -856,7 +856,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
 
 @vd.kernel(workgroup_size=(4, 2, 1))
 def fill(
-    output: vd.TensorView[vd.f32, 2, vd.write],
+    output: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write],
     scale: vd.f32,
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:

@@ -102,27 +102,27 @@ def texture_size(texture: Any, lod: Any | None = None) -> Any:
     return _raise_device_only("texture_size")
 
 
-def workgroup_array(element_type: Any, size: int) -> Any:
-    del element_type, size
-    return _raise_device_only("workgroup_array")
+def workgroup_storage(element_type: Any, *, shape: tuple[int, ...]) -> Any:
+    del element_type, shape
+    return _raise_device_only("workgroup_storage")
 
 
-def atomic_add(storage: Any, index: int, value: Any) -> Any:
+def atomic_add(storage: Any, index: int | tuple[int, ...], value: Any) -> Any:
     del storage, index, value
     return _raise_device_only("atomic_add")
 
 
-def atomic_min(storage: Any, index: int, value: Any) -> Any:
+def atomic_min(storage: Any, index: int | tuple[int, ...], value: Any) -> Any:
     del storage, index, value
     return _raise_device_only("atomic_min")
 
 
-def atomic_max(storage: Any, index: int, value: Any) -> Any:
+def atomic_max(storage: Any, index: int | tuple[int, ...], value: Any) -> Any:
     del storage, index, value
     return _raise_device_only("atomic_max")
 
 
-def atomic_exchange(storage: Any, index: int, value: Any) -> Any:
+def atomic_exchange(storage: Any, index: int | tuple[int, ...], value: Any) -> Any:
     del storage, index, value
     return _raise_device_only("atomic_exchange")
 

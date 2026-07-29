@@ -28,7 +28,8 @@ Priority 0 was completed on 2026-07-28:
 - that baseline executes CPU, CUDA, Vulkan compute/graphics, and D3D12 WARP
   paths; OpenGL is covered through the external-provider contract tests;
 - README, the language contract, and the language roadmap consistently state
-  that checked v4 phases are implemented under frontend version 3;
+  that checked v4 phases are implemented under frontend version 4 while open
+  correctness gates remain tracked in `specs/compiler/root_cause_audit.md`;
 - the compiler/Runtime support matrix is recorded in README;
 - stale completion-plan and archived-proposal references were removed;
 - `scripts/benchmark_baseline.py` provides reproducible frontend, cooking,

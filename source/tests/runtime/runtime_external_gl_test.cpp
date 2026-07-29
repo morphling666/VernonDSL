@@ -388,7 +388,7 @@ nlohmann::json physicalValueLayout(uint64_t size, uint64_t alignment, std::initi
 
 std::string pipelineBundle(const nlohmann::json &artifact) {
     nlohmann::json root = {
-        {"schema_version", 4},
+        {"schema_version", 5},
         {"type", "pipeline"},
         {"id", "pipeline/gl"},
         {"target", "opengl"},
@@ -402,6 +402,7 @@ std::string pipelineBundle(const nlohmann::json &artifact) {
           {"api_version", nlohmann::json::array({3, 3})}}},
         {"variants", nlohmann::json::array({{{"key", nlohmann::json::array()},
                                              {"parameters", nlohmann::json::array()},
+                                             {"outputs", nlohmann::json::array()},
                                              {"program", {{"vertex", "vs"}, {"fragment", "fs"}}}}})},
         {"stage_artifacts",
          {{"vs", {{"id", "vs"}, {"stage", "vertex"}, {"entry", "main"}, {"target", "opengl"}, {"artifact", artifact}}},
@@ -431,6 +432,7 @@ std::string matrixBundle(const char *target) {
         {{{"slot", 0},
           {"name", "transform"},
           {"kind", "tensor"},
+          {"type", "tensor<4x4xf32>"},
           {"element_layout", scalarElementLayout("f32")},
           {"access", "read"},
           {"shape", nlohmann::json::array({4, 4})},
@@ -453,6 +455,7 @@ std::string vertexInputBundle(const char *dtype = "f32", uint32_t components = 3
         {{{"slot", 0},
           {"name", "position"},
           {"kind", "tensor"},
+          {"type", std::string("tensor<") + std::to_string(components) + "x" + dtype + ">"},
           {"element_layout", scalarElementLayout(dtype)},
           {"access", "read"},
           {"shape", nlohmann::json::array({components})},
@@ -478,6 +481,7 @@ std::string internalValueBundle() {
         nlohmann::json::array({{{"slot", 0},
                                 {"name", "image"},
                                 {"kind", "texture"},
+                                {"type", "!vernon.texture<\"2d\", f32>"},
                                 {"dtype", "f32"},
                                 {"access", "read"},
                                 {"dimension", "2d"},
@@ -491,7 +495,9 @@ std::string internalValueBundle() {
     root["variants"][0]["internal_parameters"] = nlohmann::json::array(
         {{{"name", "__image_sampler"},
           {"kind", "sampler"},
+          {"type", "!vernon.sampler"},
           {"access", "read"},
+          {"shape", nlohmann::json::array()},
           {"source", "implicit_sampler"},
           {"uses", nlohmann::json::array(
                        {{{"stage", "fragment"},
@@ -500,6 +506,7 @@ std::string internalValueBundle() {
                          {"sampled_texture_bindings", nlohmann::json::array({{{"set", 0}, {"binding", 3}}})}}})}},
          {{"name", "__resolution"},
           {"kind", "tensor"},
+          {"type", "tensor<2xf32>"},
           {"element_layout", scalarElementLayout("f32")},
           {"shape", nlohmann::json::array({2})},
           {"access", "read"},

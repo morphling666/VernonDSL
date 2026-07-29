@@ -89,6 +89,7 @@ struct Parameter {
     std::string systemValue;
     ValueLayout elementLayout;
     std::string access;
+    std::string addressSpace;
     std::string dimension;
     std::string textureFormat;
     std::vector<uint64_t> shape;

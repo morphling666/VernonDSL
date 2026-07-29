@@ -75,7 +75,7 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
                 }
                 use.elementStrides.push_back(stride.get<int64_t>());
             }
-            if (use.elementStrides.size() != use.shape.size()) {
+            if (!use.shape.empty() && use.elementStrides.size() != use.shape.size()) {
                 error = "TensorView reflection specialization rank does not match shape";
                 return false;
             }

@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
+#include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -31,9 +32,35 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
 
     void runOnOperation() override {
         bool invalid = false;
+        ModuleOp module = getOperation();
+        auto frontendVersion = module->getAttrOfType<IntegerAttr>("vernon.frontend_version");
+        auto valueAbiVersion = module->getAttrOfType<IntegerAttr>("vernon.value_abi_version");
+        if (!frontendVersion || frontendVersion.getInt() != kCurrentFrontendVersion) {
+            module.emitError() << "requires vernon.frontend_version = " << kCurrentFrontendVersion;
+            invalid = true;
+        }
+        if (!valueAbiVersion || valueAbiVersion.getInt() != kCurrentValueAbiVersion) {
+            module.emitError() << "requires vernon.value_abi_version = " << kCurrentValueAbiVersion;
+            invalid = true;
+        }
         std::map<ShaderStage, SmallVector<LocationEndpoint>> stageInputs;
         std::map<ShaderStage, SmallVector<LocationEndpoint>> stageOutputs;
         std::set<ShaderStage> entryStages;
+
+        for (StructDeclOp declaration : module.getOps<StructDeclOp>()) {
+            auto structure = StructType::get(module.getContext(), declaration.getSymName());
+            FailureOr<ValueAbiLayout> layout = getValueAbiLayout(structure, module);
+            if (failed(layout)) {
+                declaration.emitError("does not define a finite canonical Value ABI layout");
+                invalid = true;
+                continue;
+            }
+            if (declaration->hasAttr("abi_size") || declaration->hasAttr("abi_alignment") ||
+                declaration->hasAttr("abi_field_offsets") || declaration->hasAttr("abi_element_stride")) {
+                declaration.emitError("contains obsolete frontend-authored Value ABI layout metadata");
+                invalid = true;
+            }
+        }
 
         for (func::FuncOp function : getOperation().getOps<func::FuncOp>()) {
             Attribute entryAttr = function->getAttr(kEntryAttrName);
@@ -92,6 +119,13 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
                 if (auto view = dyn_cast<TensorViewType>(type)) {
                     abiType = view.getElementType();
                     abiPrefix = "vernon.element_abi_";
+                }
+                const bool abiBearing = abiType.isIntOrFloat() ||
+                                        isa<TensorType, RankedTensorType, VectorType, StructType, TupleType>(abiType);
+                if (abiBearing && failed(verifyValueAbiType(abiType, getOperation()))) {
+                    function.emitError() << (isResult ? "result #" : "argument #") << index
+                                         << " has no finite canonical Value ABI layout";
+                    invalid = true;
                 }
                 std::string sizeName = (abiPrefix + "size").str();
                 if (dictionary && dictionary.get(sizeName)) {
@@ -160,13 +194,26 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
                     auto strides = dictionary ? dictionary.getAs<DenseI64ArrayAttr>(kTensorStridesAttrName) : nullptr;
                     auto offset = dictionary ? dictionary.getAs<IntegerAttr>(kTensorOffsetAttrName) : nullptr;
                     if (shape || strides || offset) {
-                        if (!shape || !strides || !offset || shape.size() != view.getRank() ||
-                            strides.size() != view.getRank() || offset.getInt() < 0 ||
-                            llvm::any_of(shape.asArrayRef(), [](int64_t extent) { return extent < 0; })) {
-                            function.emitError()
-                                << (isResult ? "result #" : "argument #") << index
-                                << " has invalid TensorView specialization; expected rank-matched non-negative "
-                                   "shape, signed element strides, and non-negative element offset";
+                        bool malformed =
+                            !strides || !offset || strides.size() != view.getShape().size() || offset.getInt() < 0;
+                        if (shape) {
+                            malformed = malformed || shape.size() != view.getShape().size() ||
+                                        llvm::any_of(shape.asArrayRef(), [](int64_t extent) { return extent < 0; });
+                            if (!malformed) {
+                                for (auto [declared, specialized] :
+                                     llvm::zip_equal(view.getShape(), shape.asArrayRef())) {
+                                    if (declared >= 0 && declared != specialized) {
+                                        malformed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (malformed) {
+                            function.emitError() << (isResult ? "result #" : "argument #") << index
+                                                 << " has invalid TensorView layout; strides and offset must be paired "
+                                                    "and rank-matched, "
+                                                    "and any specialization shape must match static type extents";
                             invalid = true;
                         }
                     }
@@ -353,8 +400,44 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
                                   /*isResult=*/true);
         }
 
+        for (func::FuncOp function : module.getOps<func::FuncOp>()) {
+            if (!function->hasAttr(kEntryAttrName))
+                continue;
+            auto stage = function->getAttrOfType<StringAttr>(kStageAttrName);
+            if (!stage || stage.getValue() != "compute")
+                continue;
+            uint64_t totalPhysical = 0;
+            for (Operation &operation : function.front()) {
+                auto allocation = dyn_cast<WorkgroupAllocOp>(operation);
+                if (!allocation)
+                    continue;
+                TensorViewType view = allocation.getResult().getType();
+                FailureOr<WorkgroupPhysicalStoragePlan> plan = getWorkgroupPhysicalStoragePlan(view, module);
+                if (failed(plan)) {
+                    allocation.emitError("workgroup allocation has an invalid physical storage plan");
+                    invalid = true;
+                    continue;
+                }
+                if (plan->totalPhysicalBytes > kPortableWorkgroupStorageLimit - totalPhysical) {
+                    allocation.emitError(
+                        "combined workgroup storage exceeds the portable 16 KiB workgroup storage limit");
+                    invalid = true;
+                }
+                totalPhysical += plan->totalPhysicalBytes;
+            }
+        }
+
         getOperation().walk([&](Operation *operation) {
-            if (!isa<WorkgroupAllocOp, WorkgroupLoadOp, WorkgroupStoreOp, AtomicOp, BarrierOp>(operation))
+            if (operation->hasAttr(kPhysicalIndexAttrName)) {
+                operation->emitError("'physical_index' is reserved for internal lowering and is invalid in source IR");
+                invalid = true;
+            }
+            bool workgroupStorage = isa<WorkgroupAllocOp>(operation);
+            if (isa<LoadOp, StoreOp>(operation)) {
+                auto view = dyn_cast<TensorViewType>(operation->getOperand(isa<StoreOp>(operation) ? 1 : 0).getType());
+                workgroupStorage = view && view.getAddressSpace() == "workgroup";
+            }
+            if (!workgroupStorage && !isa<AtomicOp, BarrierOp>(operation))
                 return;
             func::FuncOp function = operation->getParentOfType<func::FuncOp>();
             auto stage = function ? function->getAttrOfType<StringAttr>(kStageAttrName) : nullptr;

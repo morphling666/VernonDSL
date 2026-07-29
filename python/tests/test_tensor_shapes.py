@@ -90,7 +90,7 @@ def invalid(
 
 @kernel(workgroup_size=(1, 1, 1))
 def invalid_entry(
-    output: TensorView[f32, 1, write],
+    output: TensorView[f32, (dyn,), write],
     left: Tensor[f32, (4, 4, 4)],
     right: Tensor[f32, (4, 2, 2)],
 ) -> None:
