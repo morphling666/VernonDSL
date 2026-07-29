@@ -1,12 +1,12 @@
 # Third-party shader notices
 
-## coaurora
+## webglshaders
 
-Source: <https://github.com/jagajaga/coaurora>
+Source: <https://github.com/kevinroast/webglshaders>
 
-MIT License
+The MIT License (MIT)
 
-Copyright (c) 2026 Arseniy Seroka (jagajaga)
+Copyright (c) 2015 Kevin Roast
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

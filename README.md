@@ -28,6 +28,14 @@ Checked phases in the
 implemented, but the frontend remains version 3 until every v4 acceptance gate
 passes.
 
+## Visual showcases
+
+![VernonDSL ray-marched terrain](examples/assets/terrain-showcase.webp)
+
+![VernonDSL animated Mandelbulb](examples/assets/mandelbulb-showcase.webp)
+
+![VernonDSL animated Julia set](examples/assets/fractal-showcase.webp)
+
 ## Current status
 
 The compiler is under active development. A target is reported as available
@@ -165,7 +173,7 @@ The visual GPU baseline can measure either official showcase:
 ```powershell
 uv sync --extra build --extra examples --frozen
 uv run --frozen --no-sync python scripts/benchmark_baseline.py showcase `
-  --showcase aurora --arch vulkan --frames 60 --size 256
+  --showcase terrain --arch vulkan --frames 60 --size 256
 uv run --frozen --no-sync python scripts/benchmark_baseline.py showcase `
   --showcase mandelbulb --arch vulkan --frames 60 --size 256
 ```
@@ -292,9 +300,11 @@ Run the fractal directly on either GPU backend, or emit Metal source for use on
 macOS:
 
 ```powershell
-uv run python fractal.py --arch cuda
-uv run python fractal.py --arch vulkan
-uv run python fractal.py --emit-metal build/fractal.metal
+uv run python examples/fractal.py --arch cuda
+uv run python examples/fractal.py --arch vulkan
+uv run python examples/fractal.py --emit-metal build/fractal.metal
+uv run python examples/fractal.py --arch directx --frames 96 --fps 24 `
+  --time-step 0.06544985 --headless --animation-output build/fractal.webp
 ```
 
 Run the advanced graphics example with an indexed quad, instance attributes,
@@ -307,27 +317,30 @@ uv run python examples/advanced_pipeline.py --arch vulkan --frames 2 --headless 
   --id-output build/advanced-object-id.png
 ```
 
-Run the two full-screen visual showcases. Aurora uses a generated curtain field
-followed by a texture-sampling blur/dither pass; Mandelbulb ray marches a
-distance estimator with soft shadows, ambient occlusion, fog, and orbit-trap
-coloring. Both use deterministic presets and emit a machine-readable summary:
+Run the two full-screen visual showcases. Terrain ray marches a texture-driven
+fractal height field with layered materials, soft shadows, ambient occlusion,
+and fog; Mandelbulb ray marches a distance estimator with soft shadows, ambient
+occlusion, fog, and orbit-trap coloring. Both use deterministic presets and emit
+a machine-readable summary:
 
 ```powershell
 uv sync --extra examples
 
-# Two-pass procedural northern lights.
-uv run python examples/aurora_showcase.py --arch vulkan --preset showoff `
-  --headless --output build/aurora.png --result-json build/aurora.json
+# Ray-marched procedural mountain landscape.
+uv run python examples/terrain_showcase.py --arch vulkan --preset showoff `
+  --headless --output build/terrain.png --result-json build/terrain.json `
+  --animation-output build/terrain.webp
 
 # Ray-marched animated 3D fractal.
 uv run python examples/mandelbulb_showcase.py --arch vulkan --preset showoff `
-  --headless --output build/mandelbulb.png --result-json build/mandelbulb.json
+  --headless --output build/mandelbulb.png --result-json build/mandelbulb.json `
+  --animation-output build/mandelbulb.webp
 ```
 
 Use `--preset smoke` for a fast backend check. Omit `--headless` for the OpenCV
 window, and use `--arch directx` or `--arch opengl` on supported Windows
 systems. The effects are adapted from the MIT-licensed
-[coaurora](https://github.com/jagajaga/coaurora) and
+[webglshaders](https://github.com/kevinroast/webglshaders) and
 [WebGL-Mandelbulb](https://github.com/matt-k-wong/WebGL-Mandelbulb) projects;
 the source modules retain their notices. The former Dynamic Ocean and Terrain
 Erosion showcases remain available as advanced compute/PBR examples.

@@ -315,6 +315,7 @@ class ResolvedShowcaseOptions:
     fps: int
     headless: bool
     output: Path | None
+    animation_output: Path | None
     result_json: Path | None
     preset: str
 
@@ -332,6 +333,7 @@ def configure_showcase_parser(
     parser.add_argument("--fps", type=int)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--animation-output", type=Path, help="write all rendered frames as a looping WebP")
     parser.add_argument("--result-json", type=Path)
 
 
@@ -354,9 +356,24 @@ def resolve_showcase_options(
         fps=fps,
         headless=arguments.headless,
         output=arguments.output,
+        animation_output=getattr(arguments, "animation_output", None),
         result_json=arguments.result_json,
         preset=arguments.preset,
     )
+
+
+def write_animation(path: Path, frames: list[np.ndarray], fps: int) -> None:
+    if path.suffix.lower() != ".webp":
+        raise ValueError("--animation-output must use a .webp extension")
+    if not frames:
+        raise RuntimeError("cannot write an animation without rendered frames")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    animation = cv2.Animation()
+    animation.frames = frames
+    animation.durations = [max(1, round(1000 / fps))] * len(frames)
+    animation.loop_count = 0
+    if not cv2.imwriteanimation(str(path), animation):
+        raise RuntimeError(f"cannot write animation: {path}")
 
 
 def create_fullscreen_triangle() -> vd.TensorStorage:

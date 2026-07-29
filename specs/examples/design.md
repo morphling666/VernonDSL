@@ -1,19 +1,19 @@
 # Example Design Notes
 
-## Aurora showcase
+## Terrain showcase
 
-The aurora is a full-screen, two-pass graphics workload. The first fragment
-stage builds twelve animated Gaussian light curtains over a lifted night-sky
-floor. The second samples the intermediate texture over a 3x3 neighborhood,
-adds sparse procedural stars and temporal TPDF dithering, then applies a simple
-display curve. `ExecutionGraph` observes the first pass attachment write and
-the second pass texture read, so the image barrier is inferred.
+The terrain is a full-screen ray-marched graphics workload. A repeat-wrapped
+512x512 noise texture drives a seven-octave ridged height field. Finite-
+difference normals feed snow, rock, and grass material bands, while secondary
+marches provide soft shadows and ambient occlusion. Atmospheric fog, sky and
+sun shading, display mapping, and a host-driven camera complete the image.
+Smoke and showoff presets vary primary, shadow, and AO iteration budgets.
 
 The implementation is adapted from the MIT-licensed
-[jagajaga/coaurora](https://github.com/jagajaga/coaurora), Copyright (c) 2026
-Arseniy Seroka. It keeps the original layered-curtain and blur/dither ideas
-while using Vernon's generated `fragment_coord()` input and an explicit
-viewport-size uniform shared by all three runtime graphics backends.
+[kevinroast/webglshaders](https://github.com/kevinroast/webglshaders),
+Copyright (c) 2015 Kevin Roast. It preserves the original terrain, lighting,
+fog, and post-processing structure while expressing texture sampling and
+bounded control flow through VernonDSL.
 
 ## Mandelbulb showcase
 

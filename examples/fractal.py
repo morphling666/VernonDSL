@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Annotated
 
+import numpy as np
 import vernon_dsl as vd
 
 WIDTH = 640
@@ -60,6 +61,9 @@ def main() -> None:
     parser.add_argument("--time", type=float, default=0.0)
     parser.add_argument("--frames", type=int, default=1_000_000)
     parser.add_argument("--time-step", type=float, default=0.03)
+    parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--animation-output", type=Path)
     parser.add_argument("--emit-metal", type=Path)
     arguments = parser.parse_args()
     if arguments.emit_metal is not None:
@@ -71,8 +75,11 @@ def main() -> None:
 
     try:
         import cv2  # pyright: ignore[reportMissingImports]
+        from showcase_common import write_animation
     except ImportError as error:
         raise SystemExit("Install the optional example dependencies with 'uv sync --extra examples'.") from error
+    if arguments.frames <= 0 or arguments.fps <= 0:
+        raise ValueError("frames and fps must be positive")
     architectures = {
         "cpu": vd.cpu,
         "cuda": vd.cuda,
@@ -84,7 +91,9 @@ def main() -> None:
     vd.init(arch=architectures[arguments.arch])
     pixels = vd.storage.zeros(dtype=vd.f32, shape=(HEIGHT, WIDTH))
     window = "VernonDSL Julia Set"
-    cv2.namedWindow(window)
+    if not arguments.headless:
+        cv2.namedWindow(window)
+    animation_frames = []
     try:
         for frame in range(arguments.frames):
             paint(
@@ -92,11 +101,19 @@ def main() -> None:
                 arguments.time + frame * arguments.time_step,
                 grid=(WIDTH, HEIGHT, 1),
             )
-            cv2.imshow(window, pixels.to_numpy())
-            if cv2.waitKey(1) & 0xFF in (27, ord("q")):
-                break
+            image = pixels.to_numpy()
+            if arguments.animation_output is not None:
+                gray = np.clip(image * 255.0, 0.0, 255.0).astype(np.uint8)
+                animation_frames.append(cv2.cvtColor(gray, cv2.COLOR_GRAY2BGRA))
+            if not arguments.headless:
+                cv2.imshow(window, image)
+                if cv2.waitKey(1) & 0xFF in (27, ord("q")):
+                    break
     finally:
-        cv2.destroyWindow(window)
+        if not arguments.headless:
+            cv2.destroyWindow(window)
+    if arguments.animation_output is not None:
+        write_animation(arguments.animation_output, animation_frames, arguments.fps)
 
 
 if __name__ == "__main__":

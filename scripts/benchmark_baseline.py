@@ -166,7 +166,7 @@ def benchmark_kernel(iterations: int, architecture: str, elements: int) -> dict[
 
 def benchmark_showcase(architecture: str, showcase: str, frames: int, size: int) -> dict[str, object]:
     scripts = {
-        "aurora": ROOT / "examples" / "aurora_showcase.py",
+        "terrain": ROOT / "examples" / "terrain_showcase.py",
         "mandelbulb": ROOT / "examples" / "mandelbulb_showcase.py",
     }
     script = scripts[showcase]
@@ -232,7 +232,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--frames", type=int, default=60)
     parser.add_argument("--grid", type=int, default=64)
     parser.add_argument("--size", type=int, default=256)
-    parser.add_argument("--showcase", choices=("aurora", "mandelbulb"), default="aurora")
+    parser.add_argument("--showcase", choices=("terrain", "mandelbulb"), default="terrain")
     return parser
 
 

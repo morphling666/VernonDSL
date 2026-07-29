@@ -2,7 +2,7 @@
 
 ## 目标
 
-将当前代码收口为可信的 `0.1.0` alpha 开发者预览，并把 Aurora 与
+将当前代码收口为可信的 `0.1.0` alpha 开发者预览，并把 Terrain 与
 Mandelbulb 打磨成两项正式 showcase。
 
 本轮不宣称稳定 GA。Linux CI、完整 v4 acceptance gates 与生产级资源
@@ -27,11 +27,11 @@ Mandelbulb 打磨成两项正式 showcase。
 
 正式 showcase：
 
-- `examples/aurora_showcase.py`
+- `examples/terrain_showcase.py`
 - `examples/mandelbulb_showcase.py`
 
-两者采用全屏 fragment 路径：Aurora 展示多 pass、纹理采样和自动资源
-barrier，Mandelbulb 展示复杂控制流、数学 intrinsic 和 ray marching。
+两者采用全屏 fragment 路径：Terrain 展示纹理采样、复杂控制流、分形
+地形和 ray marching，Mandelbulb 展示复杂控制流、数学 intrinsic 和 ray marching。
 原 Dynamic Ocean 与 Terrain Erosion 保留为高级 compute/PBR 示例。
 
 实施内容：
@@ -54,7 +54,7 @@ barrier，Mandelbulb 展示复杂控制流、数学 intrinsic 和 ray marching�
   - 依次启动两个 demo 的小尺寸、少帧 headless preset。
   - 校验退出码、结构化统计、PNG 尺寸、alpha 和像素方差。
   - backend 不可用时输出明确 skip 原因；显式 required 模式下应失败。
-- 扩展 `scripts/benchmark_baseline.py`，使 aurora 与 mandelbulb 均可独立测量，
+- 扩展 `scripts/benchmark_baseline.py`，使 terrain 与 mandelbulb 均可独立测量，
   并复用同一结果契约。
 - 增加 fresh-venv wheel 功能冒烟：
   - 安装新构建的 wheel。

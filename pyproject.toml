@@ -12,7 +12,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-examples = ["opencv-python>=4.10"]
+examples = [
+    "opencv-python>=4.11",
+]
 build = [
     "nanobind>=2.7.0",
     "clang-format==20.1.8",
