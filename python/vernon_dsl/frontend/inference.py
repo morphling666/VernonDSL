@@ -7,16 +7,22 @@ from collections.abc import Callable
 from dataclasses import replace
 
 from ..language.ast_utils import decorator_name, dotted_name, rectangular_literal
-from ..shader_contracts import GENERATED_INTERFACE_CONTRACTS, TypeContract
+from ..language.stage_registry import ENTRY_DECORATORS
+from ..shader_contracts import ATOMIC_OPERATION_NAMES, GENERATED_INTERFACE_CONTRACTS, TypeContract
 from .model import (
     AccessMode,
+    AtomicEffect,
+    BarrierEffect,
     BranchMerge,
     ConcreteType,
+    EffectScope,
     LValue,
+    MemoryOrdering,
     ResourceEffect,
     StorageEffect,
     StorageEffectKind,
     StorageOwner,
+    StorageOwnerKind,
     StorageRegion,
     StorageRegionKind,
     Termination,
@@ -329,9 +335,14 @@ class _Inference:
                 for effect in callee.effects:
                     if not isinstance(effect, StorageEffect):
                         continue
-                    formal_index = formal_indices.get(effect.owner.parameter)
+                    if effect.owner.kind is not StorageOwnerKind.PARAMETER:
+                        raise self.error(
+                            call,
+                            f"cannot propagate {effect.owner.kind.value} effect owner '{effect.owner.name}'",
+                        )
+                    formal_index = formal_indices.get(effect.owner.name)
                     if formal_index is None or formal_index >= len(call.args):
-                        raise self.error(call, f"cannot bind effect owner '{effect.owner.parameter}'")
+                        raise self.error(call, f"cannot bind effect owner '{effect.owner.name}'")
                     actual = call.args[formal_index]
                     if not isinstance(actual, ast.Name) or actual.id not in caller_parameters:
                         raise self.error(actual, "effectful helper arguments must be TensorView parameters")
@@ -339,8 +350,11 @@ class _Inference:
                     if parameter.type.kind != "tensor_view":
                         raise self.error(actual, "effectful helper owner must bind to a TensorView parameter")
                     self._validate_effect_access(effect, parameter, actual)
-                    mapped_effect = replace(effect, owner=StorageOwner(parameter.name))
-                    mapped.append((effect.owner.parameter, mapped_effect))
+                    mapped_effect = replace(
+                        effect,
+                        owner=StorageOwner(StorageOwnerKind.PARAMETER, parameter.name),
+                    )
+                    mapped.append((effect.owner.name, mapped_effect))
                 self._validate_call_aliases(call, mapped)
                 for _, effect in mapped:
                     if effect not in effects:
@@ -352,20 +366,34 @@ class _Inference:
             for effect in function.effects:
                 if not isinstance(effect, StorageEffect):
                     continue
+                if effect.owner.kind is StorageOwnerKind.WORKGROUP_LOCAL:
+                    if decorator_name(function.source.decorator_list[0]) != "kernel":
+                        raise self.error(
+                            function.source,
+                            f"workgroup-local effect owner '{effect.owner.name}' is valid only in compute kernels",
+                        )
+                    continue
                 parameter = next(
-                    (parameter for parameter in function.parameters if parameter.name == effect.owner.parameter),
+                    (parameter for parameter in function.parameters if parameter.name == effect.owner.name),
                     None,
                 )
                 if parameter is None:
-                    raise self.error(function.source, f"effect owner '{effect.owner.parameter}' is not a parameter")
+                    raise self.error(
+                        function.source,
+                        f"parameter effect owner '{effect.owner.name}' does not name a function parameter",
+                    )
                 self._validate_effect_access(effect, parameter, function.source)
             function_kind = decorator_name(function.source.decorator_list[0])
+            if function_kind != "kernel" and any(
+                isinstance(effect, (AtomicEffect, BarrierEffect)) for effect in function.effects
+            ):
+                raise self.error(function.source, "workgroup synchronization is supported only in compute kernels")
             if function_kind == "func" and function.effects:
                 raise self.error(
                     function.source,
                     f"pure helper '{function.qualified_name}' has Storage effects",
                 )
-            if function_kind not in {"func", "kernel", "vertex", "fragment"} and function.effects:
+            if function_kind not in ENTRY_DECORATORS | {"func"} and function.effects:
                 raise self.error(
                     function.source,
                     f"function stage '{function_kind}' does not allow Storage effects",
@@ -450,6 +478,7 @@ class _Inference:
         effects = (
             *self._storage_effects(statement, typed_expressions, parameters),
             *self._resource_effects(typed_expressions, parameters),
+            *self._synchronization_effects(typed_expressions),
         )
         termination = (
             Termination.RETURN
@@ -509,16 +538,29 @@ class _Inference:
         parameters: dict[str, TypedParameter],
     ) -> tuple[StorageEffect, ...]:
         effects: list[StorageEffect] = []
+        workgroup_subscripts = {
+            id(expression.source)
+            for expression in expressions
+            if isinstance(expression.source, ast.Subscript)
+            and expression.operand_types
+            and expression.operand_types[0].kind == "workgroup"
+        }
 
         def effect_for(node: ast.Subscript, kind: StorageEffectKind) -> StorageEffect | None:
             if not isinstance(node.value, ast.Name):
                 return None
             parameter = parameters.get(node.value.id)
+            if parameter is None and id(node) in workgroup_subscripts:
+                return StorageEffect(
+                    kind,
+                    StorageOwner(StorageOwnerKind.WORKGROUP_LOCAL, node.value.id),
+                    cls._storage_region(node),
+                )
             if parameter is None or parameter.type.kind != "tensor_view":
                 return None
             return StorageEffect(
                 kind,
-                StorageOwner(parameter.name),
+                StorageOwner(StorageOwnerKind.PARAMETER, parameter.name),
                 cls._storage_region(node),
             )
 
@@ -565,6 +607,64 @@ class _Inference:
                 effects.append(effect)
         return tuple(effects)
 
+    def _synchronization_effects(
+        self, expressions: list[TypedExpression]
+    ) -> tuple[AtomicEffect | BarrierEffect | StorageEffect, ...]:
+        effects: list[AtomicEffect | BarrierEffect | StorageEffect] = []
+        for expression in expressions:
+            call = expression.source
+            if not isinstance(call, ast.Call):
+                continue
+            if expression.operation in {"workgroup_barrier", "storage_barrier"}:
+                effect = BarrierEffect(
+                    MemoryOrdering.ACQUIRE_RELEASE,
+                    EffectScope.WORKGROUP if expression.operation == "workgroup_barrier" else EffectScope.DEVICE,
+                )
+            elif expression.operation in ATOMIC_OPERATION_NAMES:
+                if len(call.args) != 3:
+                    raise self.error(call, "internal compiler error: typed atomic call has invalid arity")
+                if not isinstance(call.args[0], ast.Name):
+                    raise self.error(call.args[0], "internal compiler error: typed atomic owner is not a name")
+                index = call.args[1]
+                region = (
+                    StorageRegion(StorageRegionKind.ELEMENT, (index.value,))
+                    if isinstance(index, ast.Constant)
+                    and isinstance(index.value, int)
+                    and not isinstance(index.value, bool)
+                    else StorageRegion(StorageRegionKind.UNKNOWN)
+                )
+                owner_record = self.expression_records.get(id(call.args[0]))
+                if owner_record is None or not isinstance(owner_record[1], ConcreteType):
+                    raise self.error(call.args[0], "internal compiler error: atomic storage owner has no type")
+                owner_type = owner_record[1]
+                if owner_type.kind == "tensor_view":
+                    scope = EffectScope.DEVICE
+                    owner_kind = StorageOwnerKind.PARAMETER
+                elif owner_type.kind == "workgroup":
+                    scope = EffectScope.WORKGROUP
+                    owner_kind = StorageOwnerKind.WORKGROUP_LOCAL
+                else:
+                    raise self.error(
+                        call.args[0],
+                        f"internal compiler error: atomic storage owner has unexpected type '{owner_type.kind}'",
+                    )
+                owner = StorageOwner(owner_kind, call.args[0].id)
+                effect = AtomicEffect(
+                    expression.operation.removeprefix("atomic_"),
+                    owner,
+                    region,
+                    MemoryOrdering.RELAXED,
+                    scope,
+                )
+                storage_effect = StorageEffect(StorageEffectKind.WRITE, owner, region)
+                if scope is EffectScope.DEVICE and storage_effect not in effects:
+                    effects.append(storage_effect)
+            else:
+                continue
+            if effect not in effects:
+                effects.append(effect)
+        return tuple(effects)
+
     def _typed_operand_types(
         self,
         expression: ast.expr,
@@ -584,6 +684,10 @@ class _Inference:
                 if common is not None:
                     concrete = default_type(common)
                     return (concrete, concrete)
+        if isinstance(expression, ast.Subscript):
+            value = self.expression_records.get(id(expression.value))
+            if value is not None:
+                return (default_type(value[1]),)
         return ()
 
     @staticmethod
@@ -679,6 +783,7 @@ class _Inference:
                     if not isinstance(target_type, ConcreteType) or target_type.kind not in {
                         "tensor",
                         "tensor_view",
+                        "workgroup",
                     }:
                         raise self.error(statement.targets[0], "indexed assignment requires writable Storage")
                     if target_type.kind == "tensor_view" and target_type.arguments[2] == "read":
@@ -963,7 +1068,7 @@ class _Inference:
                 and value_type.arguments[2] == "write"
             ):
                 raise self.error(node, "cannot load through a write-only TensorView")
-            if isinstance(value_type, ConcreteType) and value_type.kind in {"tensor", "tensor_view"}:
+            if isinstance(value_type, ConcreteType) and value_type.kind in {"tensor", "tensor_view", "workgroup"}:
                 element = value_type.arguments[0]
                 assert isinstance(element, ConcreteType)
                 return element
@@ -1054,6 +1159,47 @@ class _Inference:
         name = getattr(node, "_vernon_generic_name", resolved_name)
         if name in {"Tensor", "Vector", "Matrix"}:
             return self._aggregate(node, environment, name)
+        if name == "workgroup_array":
+            if (
+                len(node.args) != 2
+                or node.keywords
+                or not isinstance(node.args[0], (ast.Name, ast.Attribute))
+                or not isinstance(node.args[1], ast.Constant)
+                or not isinstance(node.args[1].value, int)
+                or isinstance(node.args[1].value, bool)
+                or node.args[1].value <= 0
+            ):
+                raise self.error(node, "workgroup_array requires an integer scalar type and positive literal size")
+            element_name = (dotted_name(node.args[0]) or "").split(".")[-1]
+            if element_name not in {"i32", "u32"}:
+                raise self.error(node.args[0], "workgroup_array currently supports i32 and u32 elements")
+            return ConcreteType("workgroup", "Workgroup", (_scalar(element_name), node.args[1].value))
+        if name in ATOMIC_OPERATION_NAMES:
+            if len(node.args) != 3 or node.keywords:
+                raise self.error(node, f"{name} requires storage, index, and value")
+            if not isinstance(node.args[0], ast.Name):
+                raise self.error(node.args[0], f"{name} requires a named storage owner")
+            storage = self._expression(node.args[0], environment)
+            index = default_type(self._expression(node.args[1], environment))
+            value = self._expression(node.args[2], environment)
+            if not isinstance(storage, ConcreteType) or storage.kind not in {"workgroup", "tensor_view"}:
+                raise self.error(node.args[0], f"{name} requires workgroup storage or a writable TensorView")
+            element = storage.arguments[0]
+            assert isinstance(element, ConcreteType)
+            if storage.kind == "tensor_view" and storage.arguments[2] == "read":
+                raise self.error(node.args[0], f"{name} requires a writable TensorView")
+            if element.kind != "scalar" or element.name not in {"i32", "u32"}:
+                raise self.error(node.args[0], f"{name} requires i32 or u32 storage elements")
+            if not index.is_integer:
+                raise self.error(node.args[1], f"{name} index must be an integer")
+            if not can_convert(value, element):
+                raise self.error(node.args[2], f"{name} value must be {element.mlir}")
+            self._constrain_literal(node.args[2], element)
+            return element
+        if name in {"workgroup_barrier", "storage_barrier"}:
+            if node.args or node.keywords:
+                raise self.error(node, f"{name} does not accept arguments")
+            return ConcreteType("void", "void")
         arguments = [self._expression(argument, environment) for argument in node.args]
         if name == "Tuple":
             if not arguments:
@@ -1097,10 +1243,6 @@ class _Inference:
                 if result is None or (isinstance(result, ast.Constant) and result.value is None)
                 else self.parse_type(result)
             )
-        if name == "atomic" or name.startswith("atomic_"):
-            raise self.error(node, "atomic operations are reserved for Phase 6 and are not supported")
-        if name in {"barrier", "workgroup_barrier", "storage_barrier"}:
-            raise self.error(node, "barrier operations are reserved for Phase 6 and are not supported")
         if name in {"int", "i32"}:
             return _scalar("i32")
         if name == "u32":

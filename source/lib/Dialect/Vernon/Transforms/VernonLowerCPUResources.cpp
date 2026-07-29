@@ -52,6 +52,25 @@ struct BufferStorePattern final : OpConversionPattern<IntrinsicOp> {
     }
 };
 
+struct AtomicPattern final : OpConversionPattern<AtomicOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(AtomicOp op, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
+        auto storage = dyn_cast<MemRefType>(adaptor.getStorage().getType());
+        if (!storage)
+            return rewriter.notifyMatchFailure(op, "atomic TensorView did not lower to a memref");
+        arith::AtomicRMWKind kind = op.getAtomicKind() == "add"    ? arith::AtomicRMWKind::addi
+                                    : op.getAtomicKind() == "min"  ? arith::AtomicRMWKind::mins
+                                    : op.getAtomicKind() == "max"  ? arith::AtomicRMWKind::maxs
+                                    : op.getAtomicKind() == "umin" ? arith::AtomicRMWKind::minu
+                                    : op.getAtomicKind() == "umax" ? arith::AtomicRMWKind::maxu
+                                                                   : arith::AtomicRMWKind::assign;
+        rewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(op, kind, adaptor.getValue(), adaptor.getStorage(),
+                                                         ValueRange{adaptor.getIndex()});
+        return success();
+    }
+};
+
 struct TextureSamplePattern final : OpConversionPattern<IntrinsicOp> {
     using OpConversionPattern::OpConversionPattern;
 
@@ -128,7 +147,7 @@ struct VernonLowerCPUResourcesPass final : PassWrapper<VernonLowerCPUResourcesPa
         converter.addConversion([&](SamplerType) -> Type { return IntegerType::get(context, 64); });
 
         RewritePatternSet patterns(context);
-        patterns.add<BufferLoadPattern, BufferStorePattern, TextureSamplePattern>(converter, context);
+        patterns.add<BufferLoadPattern, BufferStorePattern, AtomicPattern, TextureSamplePattern>(converter, context);
         populateFunctionOpInterfaceTypeConversionPattern(func::FuncOp::getOperationName(), patterns, converter);
 
         ConversionTarget target(*context);

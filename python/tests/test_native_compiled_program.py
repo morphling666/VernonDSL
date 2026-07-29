@@ -18,7 +18,9 @@ module {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
         vernon.binding = 0 : i64,
-        vernon.tensor_shape = array<i64: 3>
+        vernon.tensor_shape = array<i64: 3>,
+        vernon.tensor_strides = array<i64: 1>,
+        vernon.tensor_offset = 0 : i64
       },
       %id: index {
         vernon.interface = "input",

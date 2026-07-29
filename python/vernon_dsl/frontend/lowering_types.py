@@ -30,6 +30,18 @@ class ViewLayout:
     strides: tuple[int, ...]
     offset: int
 
+    def __post_init__(self) -> None:
+        if not self.shape or any(
+            not isinstance(extent, int) or isinstance(extent, bool) or extent < 0 for extent in self.shape
+        ):
+            raise ValueError("TensorView specialization shape must contain non-negative integer extents")
+        if len(self.strides) != len(self.shape) or any(
+            not isinstance(stride, int) or isinstance(stride, bool) for stride in self.strides
+        ):
+            raise ValueError("TensorView specialization requires one signed integer stride per dimension")
+        if not isinstance(self.offset, int) or isinstance(self.offset, bool) or self.offset < 0:
+            raise ValueError("TensorView specialization offset must be a non-negative integer")
+
 
 @dataclass(frozen=True)
 class Value:

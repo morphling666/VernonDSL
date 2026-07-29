@@ -12,6 +12,10 @@ from .decorators import fragment, func, kernel, struct, vertex
 from .diagnostics import CompileError
 from .intrinsics import (
     abs,
+    atomic_add,
+    atomic_exchange,
+    atomic_max,
+    atomic_min,
     clamp,
     cos,
     cross,
@@ -31,9 +35,12 @@ from .intrinsics import (
     resolution,
     sin,
     sqrt,
+    storage_barrier,
     texture_sample,
     texture_size,
     vertex_id,
+    workgroup_array,
+    workgroup_barrier,
 )
 from .pipeline_assets import PipelineAssetDeclaration, pipeline_asset
 from .runtime import (
@@ -103,6 +110,10 @@ from .types import (
 __all__ = [
     "Annotated",
     "abs",
+    "atomic_add",
+    "atomic_exchange",
+    "atomic_max",
+    "atomic_min",
     "CompileError",
     "Compiler",
     "ColorAttachmentUse",
@@ -133,6 +144,7 @@ __all__ = [
     "TensorView",
     "Texture",
     "StoreOperation",
+    "storage_barrier",
     "Tuple",
     "When",
     "attribute",
@@ -197,4 +209,6 @@ __all__ = [
     "vulkan",
     "Vector",
     "write",
+    "workgroup_array",
+    "workgroup_barrier",
 ]

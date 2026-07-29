@@ -8,6 +8,7 @@
 #define VERNON_OPS
 
 include "mlir/Dialect/Vernon/IR/VernonDialect.td"
+include "mlir/Dialect/Vernon/IR/VernonTypes.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
 class Vernon_Op<string mnemonic, list<Trait> traits = []>
@@ -65,6 +66,39 @@ def Vernon_IntrinsicOp : Vernon_Op<"intrinsic"> {
   }];
   let arguments = (ins Variadic<AnyType>:$operands, StrAttr:$name);
   let results = (outs Optional<AnyType>:$result);
+  let hasVerifier = 1;
+}
+
+def Vernon_WorkgroupAllocOp : Vernon_Op<"workgroup_alloc"> {
+  let summary = "Allocate statically sized workgroup storage";
+  let results = (outs Vernon_WorkgroupType:$result);
+  let hasVerifier = 1;
+}
+
+def Vernon_WorkgroupLoadOp : Vernon_Op<"workgroup_load"> {
+  let summary = "Load one workgroup storage element";
+  let arguments = (ins Vernon_WorkgroupType:$storage, Index:$index);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def Vernon_WorkgroupStoreOp : Vernon_Op<"workgroup_store"> {
+  let summary = "Store one workgroup storage element";
+  let arguments = (ins AnyType:$value, Vernon_WorkgroupType:$storage, Index:$index);
+  let hasVerifier = 1;
+}
+
+def Vernon_AtomicOp : Vernon_Op<"atomic"> {
+  let summary = "Atomic read-modify-write on workgroup or device storage";
+  let arguments = (ins AnyType:$storage, Index:$index, AnyType:$value,
+                       StrAttr:$atomic_kind, StrAttr:$ordering, StrAttr:$scope);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def Vernon_BarrierOp : Vernon_Op<"barrier"> {
+  let summary = "Memory and execution barrier";
+  let arguments = (ins StrAttr:$ordering, StrAttr:$scope);
   let hasVerifier = 1;
 }
 

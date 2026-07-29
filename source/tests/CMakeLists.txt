@@ -107,6 +107,11 @@ if(TARGET VernonRuntime)
     add_dependencies(VernonRuntimeTests vernon-cpu-aot-test-bundle)
     add_dependencies(VernonRuntimeTests VernonRuntimePublicCHeaderCheck)
     vernon_stage_target_files(VernonRuntimeTests VernonRuntime VernonRHI)
+    if(TARGET VernonDSLCompiler)
+        target_sources(VernonRuntimeTests PRIVATE runtime/runtime_synchronization_test.cpp)
+        target_link_libraries(VernonRuntimeTests PRIVATE VernonDSLCompiler)
+        vernon_stage_target_files(VernonRuntimeTests VernonDSLCompiler)
+    endif()
     if(MSVC)
         target_compile_options(VernonRuntimeTests PRIVATE /EHsc)
     endif()
@@ -273,6 +278,7 @@ if(TARGET VernonDSLCompiler)
         compiler/compiler_c_api_test.cpp
         compiler/compiler_cpp_api_test.cpp
         compiler/compiler_graphics_output_test.cpp
+        compiler/compiler_synchronization_test.cpp
         compiler/spirv_image_query_size_lod_materialization_test.cpp
         compiler/vernon_compile_packaging_test.cpp)
     set_target_properties(VernonCompilerTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/source")
@@ -326,6 +332,12 @@ if(TARGET VernonDSLCompiler)
         NAME vernon-cpu-lowering-integration
         COMMAND ${CMAKE_COMMAND} "-DVERNON_OPT=$<TARGET_FILE:vernon-opt>" "-DTEST_ROOT=${VERNON_TEST_ROOT}/integration"
                 -P "${VERNON_TEST_ROOT}/scripts/run_cpu_lowering_tests.cmake")
+    add_test(
+        NAME vernon-gpu-atomic-exchange-to-spirv
+        COMMAND
+            ${CMAKE_COMMAND} "-DVERNON_OPT=$<TARGET_FILE:vernon-opt>"
+            "-DINPUT=${VERNON_TEST_ROOT}/integration/gpu-atomic-exchange-to-spirv.mlir" -P
+            "${VERNON_TEST_ROOT}/scripts/run_gpu_to_spirv_atomic_exchange_test.cmake")
 
     if(WIN32)
         add_test(NAME vernon-validation-integration

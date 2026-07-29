@@ -5,6 +5,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/SPIRV/IR/SPIRVAttributes.h"
+#include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -167,5 +170,88 @@ LogicalResult IntrinsicOp::verify() {
         return emitOpError() << "texture_sample result must be a statically sized rank-one "
                                 "4-component "
                              << texture.getElementType() << " tensor or vector";
+    return success();
+}
+
+LogicalResult WorkgroupAllocOp::verify() {
+    WorkgroupType type = cast<WorkgroupType>(getResult().getType());
+    if (!type.getSize())
+        return emitOpError("requires a positive element count");
+    if (type.getSize() > 4096)
+        return emitOpError("exceeds the portable 16 KiB workgroup storage limit");
+    if (!type.getElementType().isSignlessInteger(32))
+        return emitOpError("currently requires i32 or u32 elements");
+    return success();
+}
+
+LogicalResult WorkgroupLoadOp::verify() {
+    WorkgroupType type = cast<WorkgroupType>(getStorage().getType());
+    return getResult().getType() == type.getElementType()
+               ? success()
+               : emitOpError("result type must match the workgroup element type");
+}
+
+LogicalResult WorkgroupStoreOp::verify() {
+    WorkgroupType type = cast<WorkgroupType>(getStorage().getType());
+    return getValue().getType() == type.getElementType()
+               ? success()
+               : emitOpError("value type must match the workgroup element type");
+}
+
+LogicalResult AtomicOp::verify() {
+    Type elementType;
+    StringRef requiredScope;
+    if (auto workgroup = dyn_cast<WorkgroupType>(getStorage().getType())) {
+        elementType = workgroup.getElementType();
+        requiredScope = "workgroup";
+    } else if (auto view = dyn_cast<TensorViewType>(getStorage().getType())) {
+        if (view.getAccess() == "read")
+            return emitOpError("requires writable TensorView storage");
+        elementType = view.getElementType();
+        requiredScope = "device";
+    } else if (auto memref = dyn_cast<MemRefType>(getStorage().getType())) {
+        elementType = memref.getElementType();
+        Attribute memorySpace = memref.getMemorySpace();
+        if (!memorySpace) {
+            requiredScope = "device";
+        } else if (auto addressSpace = dyn_cast<gpu::AddressSpaceAttr>(memorySpace)) {
+            if (addressSpace.getValue() == gpu::AddressSpace::Workgroup)
+                requiredScope = "workgroup";
+            else if (addressSpace.getValue() == gpu::AddressSpace::Global)
+                requiredScope = "device";
+            else
+                return emitOpError("memref storage must use GPU global or workgroup memory space");
+        } else if (auto storageClass = dyn_cast<spirv::StorageClassAttr>(memorySpace)) {
+            if (storageClass.getValue() == spirv::StorageClass::Workgroup)
+                requiredScope = "workgroup";
+            else if (storageClass.getValue() == spirv::StorageClass::StorageBuffer)
+                requiredScope = "device";
+            else
+                return emitOpError("memref storage must use SPIR-V StorageBuffer or Workgroup storage class");
+        } else {
+            return emitOpError("cannot infer atomic scope from memref memory space");
+        }
+    } else {
+        return emitOpError("storage must be workgroup storage or a writable TensorView");
+    }
+    if (!elementType.isSignlessInteger(32) || getValue().getType() != elementType ||
+        getResult().getType() != elementType)
+        return emitOpError("requires matching 32-bit integer value and result types");
+    if (getAtomicKind() != "add" && getAtomicKind() != "min" && getAtomicKind() != "max" && getAtomicKind() != "umin" &&
+        getAtomicKind() != "umax" && getAtomicKind() != "exchange")
+        return emitOpError("operation must be add, min, max, umin, umax, or exchange");
+    if (getOrdering() != "relaxed")
+        return emitOpError("currently supports only relaxed memory ordering");
+    if (getScope() != requiredScope)
+        return emitOpError() << "scope must be " << requiredScope << " for this storage owner";
+    return success();
+}
+
+LogicalResult BarrierOp::verify() {
+    if (getOrdering() != "acquire" && getOrdering() != "release" && getOrdering() != "acquire_release" &&
+        getOrdering() != "sequential")
+        return emitOpError("barrier ordering must be acquire, release, acquire_release, or sequential");
+    if (getScope() != "workgroup" && getScope() != "device")
+        return emitOpError("barrier scope must be workgroup or device");
     return success();
 }

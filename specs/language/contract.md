@@ -173,10 +173,13 @@ element index before backend lowering. Specialization must not expose those
 values as source type arguments.
 
 Language-level typed shape, strides, and offset use units of the recursively
-resolved leaf element. Runtime descriptors and reflection additionally record
-byte strides and byte offsets after Tensor and Struct layout is resolved.
-External APIs must state whether supplied layout values are element or byte
-units; implicit unit conversion is forbidden.
+resolved leaf element. Specialized compiler reflection and schema-4 manifests
+record `shape`, `element_strides`, and `element_offset`; Runtime descriptors
+record byte strides and byte offsets after Tensor and Struct layout is
+resolved. Runtime validation performs the one checked element-to-byte
+conversion and requires an exact match. External APIs must state whether
+supplied layout values are element or byte units; implicit unit conversion is
+forbidden.
 
 A view is legal when every in-bounds logical index maps within its owner.
 Writable views must be internally injective: distinct logical indices cannot
@@ -265,9 +268,16 @@ Typed semantic nodes record effects independently from types:
 - `barrier(ordering, scope)`;
 - Resource-specific query/sample effects.
 
-V4 initially may reject atomics and barriers, but accepted programs and typed
-IR reserve these effect categories. Read/write effects include projected
-regions where statically known. Unknown overlap is conservatively aliasing.
+`atomic_add`, `atomic_min`, `atomic_max`, and `atomic_exchange` accept i32/u32
+`workgroup_array` storage at workgroup scope and writable scalar `TensorView`
+storage at device scope. Device-scope TensorView atomics are supported by CPU,
+CUDA, and Vulkan; other targets reject them during capability validation.
+The source ordering is `relaxed`: a backend may emit a stronger ordering when
+its legal lowering cannot represent relaxed ordering, but must never weaken a
+requested ordering.
+Read/write effects include projected regions where statically known, and an
+atomic read-modify-write also marks its owner writable for runtime
+synchronization. Unknown overlap is conservatively aliasing.
 
 Pure `@func` code consumes and produces Values and has no Storage or Resource
 effects. Kernels and graphics entries may perform effects allowed by their
@@ -305,10 +315,11 @@ pipeline.
 
 Each graphics entry carries an explicit stage kind. A versioned,
 target-independent stage registry validates tuple topology and ordering.
-Vertex-plus-fragment is the currently implemented topology, not a permanent
-language limit. Future registered graphics stages do not require a new
-PipelineAsset shape. A language-valid topology may still fail target capability
-validation when a backend has not implemented it.
+The registered graphics topology is `vertex -> fragment`. The registry remains
+versioned so future stage additions can extend topology validation without
+changing `PipelineAsset` syntax. The registry version is part of frontend
+semantic identity and schema-4 pipeline manifests; provider ABI remains
+version 4.
 
 Generated builtin functions are the preferred authoring API.
 `builtin("...")` remains a low-level entry-interface annotation and uses the

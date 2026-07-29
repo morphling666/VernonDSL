@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
+from .language.stage_registry import GRAPHICS_STAGES
+
 
 @dataclass(frozen=True)
 class TypeContract:
@@ -15,9 +17,11 @@ class TypeContract:
 
 @dataclass(frozen=True)
 class BuiltinContract:
-    stage: str
-    direction: str
+    uses: frozenset[tuple[str, str]]
     type: TypeContract
+
+    def supports(self, stage: str, direction: str) -> bool:
+        return (stage, direction) in self.uses
 
 
 @dataclass(frozen=True)
@@ -44,14 +48,29 @@ U32 = TypeContract("scalar", "u32")
 BOOL = TypeContract("scalar", "bool")
 
 BUILTIN_CONTRACTS = {
-    "position": BuiltinContract("vertex", "output", TypeContract("tensor", "f32", (4,))),
-    "vertex_index": BuiltinContract("vertex", "input", U32),
-    "instance_index": BuiltinContract("vertex", "input", U32),
-    "frag_coord": BuiltinContract("fragment", "input", TypeContract("tensor", "f32", (4,))),
-    "front_facing": BuiltinContract("fragment", "input", BOOL),
-    "global_invocation_id": BuiltinContract("compute", "input", TypeContract("tensor", "u32", (3,))),
-    "local_invocation_id": BuiltinContract("compute", "input", TypeContract("tensor", "u32", (3,))),
-    "workgroup_id": BuiltinContract("compute", "input", TypeContract("tensor", "u32", (3,))),
+    "position": BuiltinContract(
+        frozenset({("vertex", "output")}),
+        TypeContract("tensor", "f32", (4,)),
+    ),
+    "vertex_index": BuiltinContract(frozenset({("vertex", "input")}), U32),
+    "instance_index": BuiltinContract(frozenset({("vertex", "input")}), U32),
+    "frag_coord": BuiltinContract(
+        frozenset({("fragment", "input")}),
+        TypeContract("tensor", "f32", (4,)),
+    ),
+    "front_facing": BuiltinContract(frozenset({("fragment", "input")}), BOOL),
+    "global_invocation_id": BuiltinContract(
+        frozenset({("compute", "input")}),
+        TypeContract("tensor", "u32", (3,)),
+    ),
+    "local_invocation_id": BuiltinContract(
+        frozenset({("compute", "input")}),
+        TypeContract("tensor", "u32", (3,)),
+    ),
+    "workgroup_id": BuiltinContract(
+        frozenset({("compute", "input")}),
+        TypeContract("tensor", "u32", (3,)),
+    ),
 }
 
 GENERATED_INTERFACE_CONTRACTS = {
@@ -63,6 +82,15 @@ GENERATED_INTERFACE_CONTRACTS = {
     "vertex_id": GeneratedInterfaceContract("vertex", U32, "input", "vertex_index"),
     "instance_id": GeneratedInterfaceContract("vertex", U32, "input", "instance_index"),
 }
+
+ATOMIC_OPERATION_NAMES = frozenset(
+    {
+        "atomic_add",
+        "atomic_exchange",
+        "atomic_max",
+        "atomic_min",
+    }
+)
 
 DEVICE_ONLY_TYPE_NAMES = frozenset(
     {
@@ -77,14 +105,17 @@ DEVICE_ONLY_TYPE_NAMES = frozenset(
 DEVICE_ONLY_OPERATION_NAMES = frozenset(
     {
         *GENERATED_INTERFACE_CONTRACTS,
+        *ATOMIC_OPERATION_NAMES,
+        "storage_barrier",
         "texture_sample",
         "texture_size",
+        "workgroup_array",
+        "workgroup_barrier",
     }
 )
 
 _FRAGMENT_ONLY = frozenset({"fragment"})
-_GRAPHICS_STAGES = frozenset({"vertex", "fragment"})
-_EXPLICIT_LOD_STAGES = frozenset({"vertex", "fragment", "compute"})
+_EXPLICIT_LOD_STAGES = GRAPHICS_STAGES | {"compute"}
 
 
 def texture_sampling_contract(argument_kinds: Sequence[str]) -> TextureSamplingContract | None:
@@ -96,7 +127,7 @@ def texture_sampling_contract(argument_kinds: Sequence[str]) -> TextureSamplingC
     if len(argument_kinds) == 3:
         explicit_sampler = argument_kinds[1] == "sampler"
         return TextureSamplingContract(
-            explicit_sampler, not explicit_sampler, _FRAGMENT_ONLY if explicit_sampler else _GRAPHICS_STAGES
+            explicit_sampler, not explicit_sampler, _FRAGMENT_ONLY if explicit_sampler else GRAPHICS_STAGES
         )
     if len(argument_kinds) == 4 and argument_kinds[1] == "sampler":
         return TextureSamplingContract(True, True, _EXPLICIT_LOD_STAGES)

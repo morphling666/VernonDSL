@@ -30,6 +30,7 @@ struct TensorPackingLayout {
     std::vector<uint64_t> shape;
     std::vector<size_t> byteStrides;
     size_t byteSize{};
+    std::vector<size_t> elementLeafOffsets;
 };
 
 std::optional<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, const TensorPackingLayout &layout);

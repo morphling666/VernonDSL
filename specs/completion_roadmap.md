@@ -259,6 +259,58 @@ Acceptance:
 - unsupported combinations fail before artifact or Runtime state mutation;
 - race and synchronization semantics have positive and negative tests.
 
+### Priority 2 implementation handoff (2026-07-29)
+
+Do not weaken backend coverage or remove a backend from a parity test merely to
+make the suite pass. In particular, restore CUDA in
+`KernelTensorRuntimeTests._aggregate_compute_backends`; its temporary removal
+was an invalid test workaround.
+
+Priority 2 is now implemented:
+
+- CUDA static aggregate Tensor-by-value dispatch uses a reflected physical
+  kernel-parameter ABI with matching host packing; CUDA remains in aggregate
+  backend parity coverage.
+- CPU/CUDA storage uses no longer require descriptor bindings, ordinary
+  non-negative JSON integers parse as sampled texture bindings, and stable
+  builtin/topology diagnostics are restored.
+- `atomic_*` accepts writable scalar i32/u32 `TensorView` owners with device
+  scope and lowers to CPU atomics, CUDA global atomics, and SPIR-V
+  `StorageBuffer` atomics. Runtime dirty tracking treats atomic-only kernels as
+  writers. OpenGL and DirectX reject this capability before artifact emission.
+- The unfinished Geometry Shader feature has been removed from the frontend,
+  Vernon/MLIR and SPIR-V lowering, schema-4 program handling, provider/RHI
+  stage bits, Vulkan/OpenGL runtime paths, tests, and product documentation.
+  The versioned registry now exposes only `vertex -> fragment`.
+- Mesh/Task shaders remain out of scope until a concrete GPU-driven rendering
+  requirement exists.
+
+Final validation completed all 122 CTest entries successfully; the unavailable
+CUDA image/sampler lifetime and OpenGL synchronization cases were explicitly
+skipped. The Python suite passed all 321 tests, including CUDA aggregate
+dispatch and CPU/CUDA/Vulkan global atomic race coverage.
+
+#### Post-implementation audit follow-up
+
+The synchronization audit is complete. Runtime writability and dispatch borrows
+now use the frontend's typed storage effects and declared `TensorView` access
+contract, atomic scope classification fails on missing or unexpected owner
+types, and the IR verifier rejects every atomic ordering except the only
+currently implemented ordering, `relaxed`. The obsolete CUDA
+`static_tensor_by_value` diagnostic has also been removed.
+
+本轮同步收口：
+
+1. `StorageOwner` 显式区分 parameter 与 workgroup-local；参数 owner 缺失、
+   local owner 越界传播以及非 compute local effect 均 fail-closed。
+2. `AtomicOp::verify()` 从 GPU address space 或 SPIR-V storage class 推导
+   workgroup/device scope，并拒绝未知 memory space。
+3. 多 workgroup 运行测试覆盖独立共享存储、barrier 可见性和多 lane atomic
+   结果；后端可用时执行，不可用时明确 skip。
+4. 语言契约明确允许后端在保持语义的前提下加强 atomic ordering。
+5. atomic exchange 的 GPU→SPIR-V conversion 已移入独立 Vernon transform，
+   compiler pipeline 只组合该 pass，并由 pass-level 测试覆盖。
+
 ## Priority 3: structural performance work
 
 Optimize measured structural costs in this order:

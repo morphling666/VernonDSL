@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from ..bundle import PipelineCompileError, canonical_json
-from ..decorators import ENTRY_DECORATOR_STAGES, GRAPHICS_STAGE_ORDER
 from ..language.ast_utils import decorator_name, dotted_name
+from ..language.stage_registry import ENTRY_DECORATOR_STAGES, validate_graphics_topology
 from ..module_graph import load_project
 from .descriptors import ShaderModuleDescriptor, ShaderPipelineDescriptor, ShaderStageReference
 
@@ -142,9 +142,11 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
                 raise PipelineCompileError(f"graphics pipeline_asset program contains duplicate '{stage}' stage")
             stage_functions[stage] = entry
             declared_stages.append(stage)
-        order = {stage: index for index, stage in enumerate(GRAPHICS_STAGE_ORDER)}
-        if declared_stages != sorted(declared_stages, key=lambda stage: order.get(stage, len(order))):
-            raise PipelineCompileError("graphics pipeline_asset program stages are not in topology order")
+        try:
+            validate_graphics_topology(declared_stages)
+        except ValueError as error:
+            message = str(error).replace("graphics pipeline", "graphics pipeline_asset program")
+            raise PipelineCompileError(message) from None
     else:
         raise PipelineCompileError(
             "pipeline_asset program must be one compute Kernel or a tuple of graphics entry functions"

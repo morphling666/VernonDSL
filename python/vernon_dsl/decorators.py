@@ -6,13 +6,6 @@ from typing import Any, TypeVar
 
 _T = TypeVar("_T")
 
-ENTRY_DECORATOR_STAGES = {
-    "kernel": "compute",
-    "vertex": "vertex",
-    "fragment": "fragment",
-}
-GRAPHICS_STAGE_ORDER = ("vertex", "fragment")
-
 
 def _mark(value: _T, kind: str, **options: Any) -> _T:
     value.__vernon_dsl__ = kind, options

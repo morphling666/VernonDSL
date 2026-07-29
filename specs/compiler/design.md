@@ -262,14 +262,15 @@ compute-plus-vertex-plus-fragment Pipeline form is invalid.
 
 Every graphics tuple member carries its stage kind through its decorator.
 Tuple position does not infer stage kind. A target-independent stage registry
-and topology rules validate the set and ordering. Vertex plus fragment is the
-currently implemented minimum, not an asset-schema limit. The registry may add
-tessellation, geometry, task, mesh, or other graphics stages without changing
-`PipelineAsset` syntax or manifest structure. Unknown stages, duplicate
-singleton stages, invalid ordering, and incompatible stage families are
-program-validation errors. A topology may be valid in the language while still
-being unsupported by a target; that case fails target capability validation
-rather than source parsing.
+and topology rules validate the set and ordering. The current registry accepts
+`vertex -> fragment`; future tessellation, task, mesh, or other graphics stages
+can use the same mechanism without changing `PipelineAsset` syntax or manifest
+structure. Unknown stages, duplicate singleton stages, invalid ordering, and
+incompatible stage families are program-validation errors. The registry version
+participates in frontend semantic identity and is serialized in pipeline schema
+4. Stage additions use the existing manifest `program` map and provider shader
+descriptor array; they do not require a manifest-schema or provider-ABI version
+increase.
 
 `variants=` explicitly enumerates every accepted canonical feature
 combination, preventing implicit powerset growth. It contains at least one
@@ -385,6 +386,14 @@ uniform blocks; native values within the budget remain push constants or
 target-native inline uniforms. Elementwise operations on native matrices lower
 per column vector and reconstruct the matrix; they are distinct from `matmul`.
 
+Compiler reflection is the only source of descriptor `(set, binding)` records.
+Cooking never invents missing bindings. Schema-4 manifests retain sampler-to-
+texture provenance, and Runtime validates duplicate descriptors, stage
+visibility, and sampler resolution before preparing provider state. OpenGL
+accepts descriptor set zero and rejects other sets before provider mutation;
+its Provider path binds textures, samplers, UBOs, SSBOs, vertex buffers, and
+native uniforms exclusively from reflected records.
+
 Numeric Tensor elementwise arithmetic follows NumPy trailing-dimension
 broadcasting while retaining Vernon's safe dtype-promotion rules and positive
 static extents. `matmul` follows NumPy's 1D promotion/removal rules and
@@ -402,8 +411,12 @@ order used by Runtime. The kernel prologue reconstructs the logical Tensor
 using reflected physical byte strides, including the conservative 16-byte
 matrix-column stride used by host packing. Vulkan, DirectX, OpenGL, OpenGL ES, and
 Metal therefore share one binding and packing contract. CUDA does not use
-SPIR-V and continues to reject static Tensor-by-value entry arguments until it
-has a separately specified launch-parameter ABI.
+SPIR-V: it lowers each static Tensor-by-value argument to one NVVM kernel
+parameter. Ranked numeric fields use LLVM arrays rather than target-native
+vectors so the recursive struct/tuple/Tensor layout remains identical to the
+canonical host bytes. Reflection records the CUDA parameter size, alignment,
+and row-major byte strides, and Runtime packs host Tensor storage against that
+profile before `cuLaunchKernel`.
 
 Resolved integration issue (2026-07-26): `VernonLowerGPUTensors` previously
 reused the 16-element register-tensor limit when selecting an MLIR vector for
@@ -468,12 +481,12 @@ Every DSL function has exactly one explicit kind. The currently implemented
 entry decorators are `@kernel`, `@vertex`, and `@fragment`; `@func` declares a
 private, stage-polymorphic helper. Future graphics entry decorators register a
 stage kind and topology constraints through the same versioned registry rather
-than changing PipelineAsset syntax. The module graph preserves helper dependency
-hashes, rejects recursion and calls to entries, and the normal per-stage
-compiler validation checks an inlined helper's operations against each
-reachable stage. Requiring `@func` avoids silently treating unrelated host
-utilities as shader code and gives interactive and cooked compilation the same
-call-graph rules.
+than changing PipelineAsset syntax. The module graph preserves helper
+dependency hashes, rejects recursion and calls to entries, and the normal
+per-stage compiler validation checks an inlined helper's operations against
+each reachable stage. Requiring `@func` avoids silently treating unrelated
+host utilities as shader code and gives interactive and cooked compilation the
+same call-graph rules.
 
 ## Language-v3 type inference
 
@@ -497,7 +510,7 @@ helper specialization.
 
 ## Cross-stage GLSL interface names
 
-SPIR-V locations are the canonical vertex-output/fragment-input linkage.
+SPIR-V locations are the canonical linkage between adjacent graphics stages.
 SPIRV-Cross normally derives GLSL identifiers from each entry point, but Vernon
 compiles interactive pipeline stages separately and GLSL 3.30 links varyings
 by identifier. Vernon therefore uses the sanitized source-derived vertex

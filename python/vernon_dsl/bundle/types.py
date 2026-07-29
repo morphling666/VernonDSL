@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from ..language.stage_registry import STAGE_REGISTRY_VERSION
+
 
 class PipelineCompileError(ValueError):
     pass
@@ -172,6 +174,7 @@ class BundlePlan:
         result = {
             "schema_version": 4,
             "invocation_abi_version": 6,
+            "stage_registry_version": STAGE_REGISTRY_VERSION,
             "type": "pipeline",
             "id": self.pipeline_id,
             "target": self.target.target,

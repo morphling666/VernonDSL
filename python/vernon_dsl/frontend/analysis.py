@@ -15,6 +15,7 @@ from .model import (
     StorageEffect,
     StorageEffectKind,
     StorageOwner,
+    StorageOwnerKind,
     StorageRegion,
     StorageRegionKind,
     Termination,
@@ -36,7 +37,8 @@ def typed_effect_data(effect: TypedEffect) -> dict[str, Any]:
     if isinstance(effect, StorageEffect):
         return {
             "kind": effect.kind.value,
-            "owner": effect.owner.parameter,
+            "owner": effect.owner.name,
+            "owner_kind": effect.owner.kind.value,
             "region": {
                 "kind": effect.region.kind.value,
                 "indices": list(effect.region.indices),
@@ -46,7 +48,8 @@ def typed_effect_data(effect: TypedEffect) -> dict[str, Any]:
         return {
             "kind": "atomic",
             "operation": effect.operation,
-            "owner": effect.owner.parameter,
+            "owner": effect.owner.name,
+            "owner_kind": effect.owner.kind.value,
             "region": {
                 "kind": effect.region.kind.value,
                 "indices": list(effect.region.indices),
@@ -133,6 +136,7 @@ __all__ = [
     "StorageEffect",
     "StorageEffectKind",
     "StorageOwner",
+    "StorageOwnerKind",
     "StorageRegion",
     "StorageRegionKind",
     "Termination",

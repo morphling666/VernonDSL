@@ -15,6 +15,7 @@ from ..bundle import (
     materialize_bundle,
 )
 from ..compiler import compile_file
+from ..language.stage_registry import validate_stage_target
 from ..module_graph import load_project
 from .artifact_io import write_external_artifact
 from .descriptors import ShaderModuleDescriptor, ShaderStageReference
@@ -158,6 +159,11 @@ def cook_pipeline_asset(
     target = "directx" if target == "dx" else target
     if target == "cpu" and set(pipeline.stages) != {"compute"}:
         raise PipelineCompileError("CPU pipeline bundles support one compute stage and no graphics or barrier steps")
+    for stage in pipeline.stages:
+        try:
+            validate_stage_target(stage, target)
+        except ValueError as error:
+            raise PipelineCompileError(str(error)) from None
     resolved_target = TargetOptions(target, target_options or {})
     native = _native_module()
     native_target = _native_target(native, target)

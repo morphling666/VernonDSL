@@ -22,6 +22,7 @@ from ..bundle import (
     serialize_bundle,
 )
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
+from ..language.stage_registry import validate_graphics_topology, validate_stage_target
 from .execution_graph import (
     ExecutionGraph,
     ExecutionResources,
@@ -97,14 +98,14 @@ class Pipeline:
 
     def __init__(self, *stages: Any, features: Iterable[str] = ()):
         kinds = tuple(getattr(stage, "__vernon_dsl__", (None,))[0] for stage in stages)
-        if kinds != ("vertex", "fragment"):
-            raise ValueError("pipeline stages must be (vertex, fragment)")
+        validate_graphics_topology(kinds)
         feature_values = tuple(features)
         if any(not isinstance(value, str) or not value for value in feature_values):
             raise TypeError("pipeline features must be non-empty strings")
         self._features = tuple(sorted(set(feature_values)))
         self._stages = stages
-        self._vertex, self._fragment = stages
+        self._vertex = stages[0]
+        self._fragment = stages[-1]
         self._compiled: _CompiledPipeline | None = None
         self._compiled_generation = -1
         self.compile_count = 0
@@ -147,6 +148,11 @@ class Pipeline:
             if state._architecture in {state.opengl, state.opengles}
             else {},
         )
+        for stage in (getattr(value, "__vernon_dsl__", (None,))[0] for value in self._stages):
+            try:
+                validate_stage_target(stage, target_name)
+            except ValueError as error:
+                raise RuntimeError(str(error)) from None
         requests = [self._stage_request(stage, options, native_target) for stage in self._stages]
         compiled_stages: list[CompiledStage] = []
         compiler = state._native.Compiler()

@@ -54,6 +54,7 @@ struct PhysicalValueAbiLayout {
     uint64_t size{};
     uint64_t alignment{};
     SmallVector<uint64_t> byteStrides;
+    SmallVector<uint64_t> elementLeafOffsets;
 };
 
 enum class PhysicalResourceAbiKind {

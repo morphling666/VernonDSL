@@ -154,12 +154,14 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES};
     const bool canUseDynamicRendering =
         dynamicRenderingIsCore || (dynamicRenderingDependenciesAreCore && hasDynamicRenderingExtension);
-    if (canUseDynamicRendering) {
-        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    if (canUseDynamicRendering)
         features.pNext = &dynamicRenderingFeatures;
-        api.getPhysicalDeviceFeatures2(physicalDevice, &features);
+    api.getPhysicalDeviceFeatures2(physicalDevice, &features);
+    if (canUseDynamicRendering)
         dynamicRendering = dynamicRenderingFeatures.dynamicRendering == VK_TRUE;
-    }
+    VkPhysicalDeviceFeatures enabledFeatures{};
+    deviceInfo.pEnabledFeatures = &enabledFeatures;
     const char *deviceExtensions[] = {VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME};
     if (dynamicRendering) {
         deviceInfo.pNext = &dynamicRenderingFeatures;

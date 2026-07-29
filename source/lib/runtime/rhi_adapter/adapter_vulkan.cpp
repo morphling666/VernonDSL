@@ -524,11 +524,11 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
             status = specializeShader(*fragment, stageOffset(VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT), fragmentModule);
         if (status != VERNON_STATUS_OK)
             return status;
-        const VkPipelineShaderStageCreateInfo shaderStages[2]{
-            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vertexModule,
-             vertex->entry.c_str(), nullptr},
-            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT,
-             fragmentModule, fragment->entry.c_str(), nullptr}};
+        std::vector<VkPipelineShaderStageCreateInfo> shaderStages{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                                   nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vertexModule,
+                                                                   vertex->entry.c_str(), nullptr}};
+        shaderStages.push_back({VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                                VK_SHADER_STAGE_FRAGMENT_BIT, fragmentModule, fragment->entry.c_str(), nullptr});
         std::vector<VkVertexInputBindingDescription> vertexBindings;
         std::vector<VkVertexInputAttributeDescription> vertexAttributes;
         for (const auto &entry : layout->entries)
@@ -680,8 +680,8 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
         const VkGraphicsPipelineCreateInfo createInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
                                                       pipeline->device->dynamicRendering ? &rendering : nullptr,
                                                       0,
-                                                      2,
-                                                      shaderStages,
+                                                      static_cast<uint32_t>(shaderStages.size()),
+                                                      shaderStages.data(),
                                                       &vertexInput,
                                                       &assembly,
                                                       nullptr,

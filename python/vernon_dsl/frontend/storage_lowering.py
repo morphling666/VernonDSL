@@ -71,15 +71,22 @@ def lower_tensor_view_index(emitter: StorageEmitter, node: ast.Subscript, value:
     return physical
 
 
-def lower_tensor_view_store(emitter: StorageEmitter, target: ast.Subscript, value: Value) -> None:
+def lower_storage_store(emitter: StorageEmitter, target: ast.Subscript, value: Value) -> None:
     buffer = emitter._expression(target.value)
-    if buffer.type.kind != "tensor_view":
-        raise emitter.context.error(target, "indexed assignment is supported only for TensorView values")
+    if buffer.type.kind not in {"tensor_view", "workgroup"}:
+        raise emitter.context.error(target, "indexed assignment requires TensorView or workgroup storage")
     element = buffer.type.arguments[0]
     assert isinstance(element, DslType)
-    if buffer.access is AccessMode.READ:
+    if buffer.type.kind == "tensor_view" and buffer.access is AccessMode.READ:
         raise emitter.context.error(target, "cannot assign through a read-only TensorView")
     value = emitter._coerce_implicit(target, value, element)
+    if buffer.type.kind == "workgroup":
+        index = lower_buffer_index(emitter, target.slice)
+        emitter._line(
+            f'"vernon.workgroup_store"({value.name}, {buffer.name}, {index.name}) '
+            f": ({element.mlir}, {buffer.type.mlir}, index) -> ()"
+        )
+        return
     index = lower_tensor_view_index(emitter, target, buffer)
     emitter._line(
         f'"vernon.intrinsic"({buffer.name}, {index.name}, {value.name}) '

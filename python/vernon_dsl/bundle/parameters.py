@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
+from ..language.stage_registry import STAGES
 from .types import PipelineCompileError
 
 
@@ -74,7 +75,7 @@ def reflected_parameters(
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
     external: dict[str, list[dict[str, Any]]] = {}
     internal: dict[str, list[dict[str, Any]]] = {}
-    for stage in ("compute", "vertex", "fragment"):
+    for stage in (definition.kind for definition in STAGES):
         record = records.get(stage)
         if record is None:
             continue
@@ -109,8 +110,36 @@ def reflected_parameters(
                 "access": row.get("access", "read"),
                 "dimension": row.get("dimension"),
             }
+            element_strides = row.get("element_strides")
+            element_offset = row.get("element_offset")
+            if element_strides is not None or element_offset is not None:
+                if (
+                    not isinstance(element_strides, list)
+                    or len(element_strides) != len(use["shape"])
+                    or any(not isinstance(stride, int) or isinstance(stride, bool) for stride in element_strides)
+                    or not isinstance(element_offset, int)
+                    or isinstance(element_offset, bool)
+                    or element_offset < 0
+                ):
+                    raise PipelineCompileError(f"{stage} TensorView specialization metadata is invalid")
+                use["element_strides"] = list(element_strides)
+                use["element_offset"] = element_offset
+            physical_layouts = row.get("physical_layouts")
+            cuda_layout = (
+                physical_layouts.get("cuda_kernel_parameter") if isinstance(physical_layouts, Mapping) else None
+            )
+            cuda_static_tensor_value = (
+                stage == "compute"
+                and record.get("target") == "cuda"
+                and row.get("kind") == "tensor"
+                and isinstance(cuda_layout, Mapping)
+                and isinstance(cuda_layout.get("size"), int)
+                and cuda_layout["size"] > 0
+                and "unsupported" not in cuda_layout
+            )
             packed_value = interface_name == "uniform" or (
-                stage == "compute" and row.get("kind", "scalar") not in {"tensor", "texture", "sampler"}
+                stage == "compute"
+                and (row.get("kind", "scalar") not in {"tensor", "texture", "sampler"} or cuda_static_tensor_value)
             )
             if packed_value and stage == "compute":
                 use["interface"] = "value"
@@ -126,7 +155,6 @@ def reflected_parameters(
                 use["element_layout"] = dict(element_layout)
             if packed_value:
                 profile, transport = _physical_value_profile(record.get("target"), row.get("value_transport"))
-                physical_layouts = row.get("physical_layouts")
                 selected_layout = physical_layouts.get(profile) if isinstance(physical_layouts, Mapping) else None
                 if not isinstance(selected_layout, Mapping):
                     raise PipelineCompileError(f"{stage} packed value argument is missing profile {profile!r}")
@@ -147,9 +175,18 @@ def reflected_parameters(
             ):
                 if key in row:
                     use[key] = row[key]
-            if stage == "compute" and record.get("target") in {"opengl", "opengles"} and "vernon.binding" not in use:
-                use["vernon.set"] = 0
-                use["vernon.binding"] = int(row.get("index", 0))
+            descriptor_required = (
+                use["interface"] == "storage"
+                or (interface_name == "resource" and row.get("kind") in {"tensor", "texture"})
+                or (
+                    interface_name == "uniform"
+                    and use.get("physical_value_layout", {}).get("transport") in {"uniform_buffer", "storage_buffer"}
+                )
+            )
+            if descriptor_required and ("vernon.set" not in use or "vernon.binding" not in use):
+                raise PipelineCompileError(f"{stage} descriptor-backed argument is missing reflected set/binding")
+            if row.get("kind") == "sampler" and not use.get("sampled_texture_bindings"):
+                raise PipelineCompileError(f"{stage} sampler argument has no reflected sampled texture binding")
             backend_name = _backend_name(name)
             if interface_name == "uniform":
                 if record.get("target") in {"opengl", "opengles", "metal", "directx"} and "vernon.binding" not in row:
@@ -253,12 +290,19 @@ def merge_internal_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) 
             bindings = use.get("sampled_texture_bindings")
             if (
                 not isinstance(bindings, list)
-                or len(bindings) != 1
-                or not isinstance(bindings[0], Mapping)
-                or not isinstance(bindings[0].get("set"), int)
-                or not isinstance(bindings[0].get("binding"), int)
+                or not bindings
+                or any(
+                    not isinstance(binding, Mapping)
+                    or not isinstance(binding.get("set"), int)
+                    or isinstance(binding.get("set"), bool)
+                    or binding["set"] < 0
+                    or not isinstance(binding.get("binding"), int)
+                    or isinstance(binding.get("binding"), bool)
+                    or binding["binding"] < 0
+                    for binding in bindings
+                )
             ):
-                raise PipelineCompileError("implicit sampler must have exactly one sampled texture binding")
+                raise PipelineCompileError("implicit sampler requires reflected sampled texture bindings")
     return parameter
 
 
@@ -279,14 +323,19 @@ def interface_by_location(values: Sequence[Mapping[str, Any]], interface: str) -
     return result
 
 
-def validate_graphics_interfaces(vertex: Mapping[str, Any], fragment: Mapping[str, Any]) -> None:
-    vertex_interface = vertex.get("interface", {})
-    fragment_interface = fragment.get("interface", {})
-    outputs = interface_by_location(vertex_interface.get("results", []), "output")
-    inputs = interface_by_location(fragment_interface.get("arguments", []), "input")
+def validate_graphics_interfaces(
+    producer_stage: str,
+    producer: Mapping[str, Any],
+    consumer_stage: str,
+    consumer: Mapping[str, Any],
+) -> None:
+    producer_interface = producer.get("interface", {})
+    consumer_interface = consumer.get("interface", {})
+    outputs = interface_by_location(producer_interface.get("results", []), "output")
+    inputs = interface_by_location(consumer_interface.get("arguments", []), "input")
     for location, value_type in inputs.items():
         if outputs.get(location) != value_type:
-            raise PipelineCompileError(f"vertex/fragment interface mismatch at location {location}")
+            raise PipelineCompileError(f"{producer_stage}/{consumer_stage} interface mismatch at location {location}")
 
 
 def fragment_outputs(records: Mapping[str, Mapping[str, Any]]) -> list[dict[str, Any]]:

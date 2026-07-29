@@ -95,12 +95,14 @@ bool shaderStagesAreValid(const VernonRuntimeCorePipelineDescriptor &descriptor)
         descriptor.shader_count > VERNON_RUNTIME_PROVIDER_MAX_SHADER_STAGES)
         return false;
     uint32_t stages = 0;
+    constexpr uint32_t knownStages = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE | VERNON_RUNTIME_PROVIDER_STAGE_VERTEX |
+                                     VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
     for (size_t index = 0; index < descriptor.shader_count; ++index) {
         const auto &shader = descriptor.shaders[index];
         if (shader.struct_size < sizeof(VernonRuntimeProviderShaderDescriptor) || shader.stage == 0 ||
-            (shader.stage & (shader.stage - 1)) != 0 || (stages & shader.stage) != 0 || !shader.data ||
-            shader.size == 0 || !shader.format.data || shader.format.size == 0 || !shader.entry.data ||
-            shader.entry.size == 0) {
+            (shader.stage & ~knownStages) != 0 || (shader.stage & (shader.stage - 1)) != 0 ||
+            (stages & shader.stage) != 0 || !shader.data || shader.size == 0 || !shader.format.data ||
+            shader.format.size == 0 || !shader.entry.data || shader.entry.size == 0) {
             return false;
         }
         stages |= shader.stage;

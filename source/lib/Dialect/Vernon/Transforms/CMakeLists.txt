@@ -2,11 +2,13 @@ add_mlir_library(
     MLIRVernonTransforms
     VernonCpuPipeline.cpp
     VernonAttributeAbi.cpp
+    VernonConvertGPUToSPIRV.cpp
     VernonInlineHelpers.cpp
     VernonLowerCPUResources.cpp
     VernonLowerCPUTensors.cpp
     VernonLowerCUDAMath.cpp
     VernonLowerGPUTensors.cpp
+    VernonLowerSynchronization.cpp
     VernonSharedValuePatterns.cpp
     VernonTensorShapeSemantics.cpp
     VernonValueAbi.cpp
@@ -16,6 +18,7 @@ add_mlir_library(
     DEPENDS
     MLIRVernonDialect
     MLIRGPUDialect
+    MLIRGPUToSPIRV
     MLIRSPIRVDialect
     MLIRSPIRVUtils
     LINK_LIBS

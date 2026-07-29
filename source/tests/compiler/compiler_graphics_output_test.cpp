@@ -598,7 +598,9 @@ module {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
         vernon.binding = 0 : i64,
-        vernon.tensor_shape = array<i64: 1>
+        vernon.tensor_shape = array<i64: 1>,
+        vernon.tensor_strides = array<i64: 1>,
+        vernon.tensor_offset = 0 : i64
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",
@@ -619,7 +621,8 @@ module {
 
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
-    for (VernonTarget target : {VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL, VERNON_TARGET_DIRECTX}) {
+    for (VernonTarget target :
+         {VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL, VERNON_TARGET_DIRECTX, VERNON_TARGET_CUDA}) {
         VernonCompileResult *result =
             vernonCompilerCompileMlir(compiler, tensorModule.data(), tensorModule.size(), target);
         ASSERT_TRUE(result);
@@ -652,22 +655,16 @@ module {
         EXPECT_NE(reflected.find("\"kind\":\"tensor_value\""), std::string_view::npos);
         EXPECT_NE(reflected.find("\"shape\":[2,2,2]"), std::string_view::npos);
         EXPECT_NE(reflected.find("\"profile\":\"vulkan_std430_storage_buffer\""), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"profile\":\"cuda_kernel_parameter\""), std::string_view::npos);
         EXPECT_NE(reflected.find("\"byte_strides\":[16,8,4]"), std::string_view::npos);
         EXPECT_NE(reflected.find("\"size\":32"), std::string_view::npos);
         EXPECT_NE(reflected.find("\"value_transport\":\"storage_buffer\""), std::string_view::npos);
         EXPECT_NE(reflected.find("\"vernon.binding\":0"), std::string_view::npos);
         EXPECT_NE(reflected.find("\"binding\":1"), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"element_strides\":[1]"), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"element_offset\":0"), std::string_view::npos);
         vernonCompileResultDestroy(result);
     }
-
-    VernonCompileResult *cudaResult =
-        vernonCompilerCompileMlir(compiler, tensorModule.data(), tensorModule.size(), VERNON_TARGET_CUDA);
-    ASSERT_TRUE(cudaResult);
-    EXPECT_NE(vernonCompileResultGetStatus(cudaResult), VERNON_STATUS_OK);
-    const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(cudaResult);
-    EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("descriptor-backed SPIR-V compute targets"),
-              std::string_view::npos);
-    vernonCompileResultDestroy(cudaResult);
     vernonCompilerDestroy(compiler);
 }
 
@@ -813,7 +810,9 @@ module {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
         vernon.binding = 0 : i64,
-        vernon.tensor_shape = array<i64: 2>
+        vernon.tensor_shape = array<i64: 2>,
+        vernon.tensor_strides = array<i64: 1>,
+        vernon.tensor_offset = 0 : i64
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",

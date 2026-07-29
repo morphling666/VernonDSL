@@ -95,6 +95,8 @@ TEST(ComputeLaunchPlannerTest, AcceptsValidatedStridedRhiTensorView) {
     setScalarLayout(parameter, "f32", VERNON_DATA_F32);
     parameter.source = "direct";
     parameter.uses.push_back({"compute", "buffer", "", "f32", {2, 3}, 0, UINT32_MAX, 0, 0, 0, {}});
+    parameter.uses.back().elementStrides = {6, -1};
+    parameter.uses.back().elementOffset = 2;
     variant.parameters = {parameter};
 
     const std::array<uint64_t, 2> shape{2, 3};
@@ -125,6 +127,16 @@ TEST(ComputeLaunchPlannerTest, AcceptsValidatedStridedRhiTensorView) {
     EXPECT_EQ(plan.grid.x, 3u);
     EXPECT_EQ(plan.grid.y, 2u);
     EXPECT_EQ(plan.grid.z, 1u);
+
+    const std::array<int64_t, 2> incompatibleStrides{6 * sizeof(float), sizeof(float)};
+    supplied.tensor.byte_strides = incompatibleStrides.data();
+    ASSERT_FALSE(planComputeInvocation(variant, invocation, plan, error));
+    EXPECT_EQ(error, "pipeline TensorView layout does not match specialization");
+
+    supplied.tensor.byte_strides = strides.data();
+    supplied.tensor.byte_size = 6 * sizeof(float);
+    ASSERT_FALSE(planComputeInvocation(variant, invocation, plan, error));
+    EXPECT_EQ(error, "pipeline Tensor argument does not match layout");
 }
 
 } // namespace

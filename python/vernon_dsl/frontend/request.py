@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..language.stage_registry import STAGE_REGISTRY_VERSION
 from ..language.syntax import FRONTEND_VERSION
 from .analysis import typed_effect_data
 from .model import TypedFunctionInstance
@@ -70,6 +71,7 @@ class FrontendCompileResult:
         )
         return {
             "frontend_version": FRONTEND_VERSION,
+            "stage_registry_version": STAGE_REGISTRY_VERSION,
             "entry": self.request.entry,
             "enabled_features": list(self.request.enabled_features),
             "tensor_shapes": [[name, dtype, list(shape)] for name, dtype, shape in self.request.tensor_shapes],

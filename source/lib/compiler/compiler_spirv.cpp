@@ -2,7 +2,6 @@
 
 #include "compiler_frontend.h"
 
-#include "mlir/Conversion/GPUToSPIRV/GPUToSPIRVPass.h"
 #include "mlir/Conversion/MathToSPIRV/MathToSPIRVPass.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -10,7 +9,9 @@
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
 #include "mlir/Dialect/SPIRV/Transforms/Passes.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonConvertGPUToSPIRV.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUTensors.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerSynchronization.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonSpirvMarkers.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonToGPU.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonToSpirv.h"
@@ -235,9 +236,10 @@ bool compileSpirv(PreparedModule &prepared, VernonTarget target, std::vector<Art
 
     mlir::PassManager passManager(&context);
     passManager.addPass(mlir::vernon::createVernonToGPUPass(true));
+    passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerSynchronizationPass(true, true));
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerGPUTensorsPass(true));
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::createConvertMathToSPIRVPass());
-    passManager.addPass(mlir::createConvertGPUToSPIRVPass());
+    passManager.addPass(mlir::vernon::createVernonConvertGPUToSPIRVPass());
     passManager.addPass(mlir::vernon::createVernonToSPIRVPass(target == VERNON_TARGET_VULKAN));
     passManager.addNestedPass<mlir::spirv::ModuleOp>(mlir::spirv::createSPIRVLowerABIAttributesPass());
     passManager.addNestedPass<mlir::spirv::ModuleOp>(std::make_unique<AttachSpirvTargetPass>());

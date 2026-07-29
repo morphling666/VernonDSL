@@ -317,6 +317,30 @@ def copy_value_tensor_view(
     output[gid[0]] = source[gid[0]]
 
 
+@vd.kernel(workgroup_size=(64, 1, 1))
+def global_atomic_increment(
+    values: vd.TensorView[vd.i32, 1, vd.read_write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    vd.atomic_add(values, 0, 1)
+
+
+@vd.kernel(workgroup_size=(1, 1, 1))
+def atomic_fill(
+    values: vd.TensorView[vd.i32, 1, vd.read_write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    vd.atomic_add(values, gid[0], 1)
+
+
+@vd.kernel(workgroup_size=(1, 1, 1))
+def global_atomic_operations(values: vd.TensorView[vd.i32, 1, vd.read_write]) -> None:
+    vd.atomic_exchange(values, 0, 5)
+    vd.atomic_add(values, 1, 3)
+    vd.atomic_min(values, 2, 7)
+    vd.atomic_max(values, 3, 9)
+
+
 class KernelTensorRuntimeTests(unittest.TestCase):
     @staticmethod
     def _run_tensor_operators(arch: object) -> np.ndarray:
@@ -374,6 +398,26 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             if self._runtime_available(architecture):
                 backends.append(architecture)
         return backends
+
+    def test_global_tensor_view_atomic_backend_parity(self) -> None:
+        backends: list[object] = [vd.cpu]
+        for architecture in (vd.cuda, vd.vulkan):
+            if self._runtime_available(architecture):
+                backends.append(architecture)
+        for backend in backends:
+            with self.subTest(backend=backend.name):
+                vd.init(arch=backend)  # type: ignore[arg-type]
+                values = vd.storage.zeros(dtype=vd.i32, shape=(1,))
+                global_atomic_increment(values, grid=(256, 1, 1))
+                self.assertEqual(values.to_numpy()[0], 256)
+
+                inferred = vd.storage.zeros(dtype=vd.i32, shape=(8,))
+                atomic_fill(inferred)
+                np.testing.assert_array_equal(inferred.to_numpy(), np.ones(8, dtype=np.int32))
+
+                operations = vd.storage.from_numpy(np.array([0, 10, 10, 1], dtype=np.int32))
+                global_atomic_operations(operations)
+                np.testing.assert_array_equal(operations.to_numpy(), np.array([5, 22, 7, 9], dtype=np.int32))
 
     def test_rank_three_tensor_operators(self) -> None:
         actual = self._run_tensor_operators(vd.cpu)

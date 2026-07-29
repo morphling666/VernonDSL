@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <limits>
+#include <set>
 #include <string_view>
+#include <tuple>
 
 namespace vernon::runtime {
 
@@ -56,6 +58,20 @@ bool parseUint64(const nlohmann::json &value, uint64_t &result) {
     if (parsed < 0)
         return false;
     result = static_cast<uint64_t>(parsed);
+    return true;
+}
+
+bool parseInt64(const nlohmann::json &value, int64_t &result) {
+    if (value.is_number_unsigned()) {
+        const uint64_t parsed = value.get<uint64_t>();
+        if (parsed > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+            return false;
+        result = static_cast<int64_t>(parsed);
+        return true;
+    }
+    if (!value.is_number_integer())
+        return false;
+    result = value.get<int64_t>();
     return true;
 }
 
@@ -129,6 +145,20 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
             }
             parsed.byteStrides.push_back(byteStride);
         }
+        if (layout.contains("element_leaf_offsets")) {
+            if (!layout["element_leaf_offsets"].is_array()) {
+                error = "physical_value_layout element leaf offsets must be an array";
+                return false;
+            }
+            for (const nlohmann::json &offset : layout["element_leaf_offsets"]) {
+                uint64_t byteOffset = 0;
+                if (!parseUint64(offset, byteOffset)) {
+                    error = "physical_value_layout element leaf offsets must be unsigned";
+                    return false;
+                }
+                parsed.elementLeafOffsets.push_back(byteOffset);
+            }
+        }
         if ((parsed.transport != "host_value" && parsed.transport != "kernel_parameter" &&
              parsed.transport != "push_constant" && parsed.transport != "native_uniform" &&
              parsed.transport != "uniform_buffer" && parsed.transport != "storage_buffer") ||
@@ -145,17 +175,53 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
             return false;
         }
         for (const nlohmann::json &binding : bindings) {
-            if (!binding.is_object() || !binding.contains("set") || !binding["set"].is_number_unsigned() ||
-                !binding.contains("binding") || !binding["binding"].is_number_unsigned()) {
+            const auto parseBindingIndex = [](const nlohmann::json &field, uint32_t &result) {
+                if (!field.is_number_integer())
+                    return false;
+                const int64_t value = field.get<int64_t>();
+                if (value < 0 || static_cast<uint64_t>(value) > UINT32_MAX)
+                    return false;
+                result = static_cast<uint32_t>(value);
+                return true;
+            };
+            uint32_t descriptorSet = 0;
+            uint32_t descriptorBinding = 0;
+            if (!binding.is_object() || !binding.contains("set") || !parseBindingIndex(binding["set"], descriptorSet) ||
+                !binding.contains("binding") || !parseBindingIndex(binding["binding"], descriptorBinding)) {
                 error = "sampled texture binding must contain unsigned set/binding";
                 return false;
             }
-            use.sampledTextureBindings.push_back({binding["set"].get<uint32_t>(), binding["binding"].get<uint32_t>()});
+            use.sampledTextureBindings.push_back({descriptorSet, descriptorBinding});
         }
     }
     if (value.contains("shape") && value["shape"].is_array())
         for (const nlohmann::json &dimension : value["shape"])
             use.shape.push_back(dimension.is_number_unsigned() ? dimension.get<uint64_t>() : uint64_t{0});
+    if (value.contains("element_strides") || value.contains("element_offset")) {
+        if (!value.contains("element_strides") || !value["element_strides"].is_array() ||
+            !value.contains("element_offset")) {
+            error = "TensorView specialization requires element_strides and element_offset";
+            return false;
+        }
+        for (const nlohmann::json &strideValue : value["element_strides"]) {
+            int64_t stride = 0;
+            if (!parseInt64(strideValue, stride)) {
+                error = "TensorView element strides must be signed integers";
+                return false;
+            }
+            use.elementStrides.push_back(stride);
+        }
+        uint64_t offset = 0;
+        if (!parseUint64(value["element_offset"], offset)) {
+            error = "TensorView element offset must be a non-negative integer";
+            return false;
+        }
+        use.elementOffset = offset;
+        if (use.elementStrides.size() != use.shape.size()) {
+            error = "TensorView specialization stride rank does not match shape";
+            return false;
+        }
+    }
     if (use.physicalValueLayout && use.physicalValueLayout->byteStrides.size() != use.shape.size()) {
         error = "physical_value_layout byte-stride rank does not match the logical Tensor shape";
         return false;
@@ -403,8 +469,8 @@ bool Variant::validate(std::string &error) const {
                 error = "packed Tensor value is missing its compiler-planned physical layout";
                 return false;
             }
-            if (implicitSampler && use.sampledTextureBindings.size() != 1) {
-                error = "implicit sampler must have exactly one sampled texture binding";
+            if (implicitSampler && use.sampledTextureBindings.empty()) {
+                error = "implicit sampler requires reflected sampled texture bindings";
                 return false;
             }
             if (resolution && !use.sampledTextureBindings.empty()) {
@@ -413,7 +479,63 @@ bool Variant::validate(std::string &error) const {
             }
         }
     }
-    if (program.empty() || (!compute.empty() && program.size() != 1)) {
+    using BindingKey = std::tuple<std::string, uint32_t, uint32_t>;
+    std::map<BindingKey, std::pair<std::string, std::string>> descriptorOwners;
+    std::set<BindingKey> textureBindings;
+    std::vector<BindingKey> samplerBindings;
+    const auto validateBindings = [&](const Parameter &parameter) {
+        for (const ParameterUse &use : parameter.uses) {
+            if (program.find(use.stage) == program.end()) {
+                error = "pipeline parameter use references a stage outside its program";
+                return false;
+            }
+            const bool descriptorRequired =
+                (use.interfaceKind == "resource" && (parameter.kind == "tensor" || parameter.kind == "texture")) ||
+                ((use.interfaceKind == "uniform" || use.interfaceKind == "value") && use.physicalValueLayout &&
+                 (use.physicalValueLayout->transport == "uniform_buffer" ||
+                  use.physicalValueLayout->transport == "storage_buffer"));
+            if (descriptorRequired && use.binding == UINT32_MAX) {
+                error = "descriptor-backed pipeline parameter is missing set/binding";
+                return false;
+            }
+            if (use.binding != UINT32_MAX && parameter.kind != "sampler") {
+                BindingKey key{use.stage, use.descriptorSet, use.binding};
+                const auto [found, inserted] = descriptorOwners.emplace(key, std::pair{parameter.name, parameter.kind});
+                if (!inserted && found->second.first != parameter.name) {
+                    error = "pipeline descriptor binding is assigned to multiple parameters";
+                    return false;
+                }
+                if (parameter.kind == "texture")
+                    textureBindings.insert(std::move(key));
+            }
+            if (parameter.kind == "sampler") {
+                if (use.sampledTextureBindings.empty()) {
+                    error = "sampler parameter has no paired sampled texture binding";
+                    return false;
+                }
+                for (const SampledTextureBinding &binding : use.sampledTextureBindings)
+                    samplerBindings.emplace_back(use.stage, binding.descriptorSet, binding.binding);
+            } else if (!use.sampledTextureBindings.empty()) {
+                error = "non-sampler parameter contains sampled texture bindings";
+                return false;
+            }
+        }
+        return true;
+    };
+    for (const Parameter &parameter : parameters)
+        if (!validateBindings(parameter))
+            return false;
+    for (const Parameter &parameter : internalParameters)
+        if (!validateBindings(parameter))
+            return false;
+    for (const BindingKey &binding : samplerBindings)
+        if (textureBindings.find(binding) == textureBindings.end()) {
+            error = "sampler references an unknown sampled texture binding";
+            return false;
+        }
+    const bool computeTopology = !compute.empty() && program.size() == 1;
+    const bool graphicsTopology = compute.empty() && !vertex.empty() && !fragment.empty() && program.size() == 2;
+    if (!computeTopology && !graphicsTopology) {
         error = "pipeline variant must contain either one compute program or one graphics program";
         return false;
     }
@@ -444,8 +566,8 @@ bool parseRuntimeRequirements(const nlohmann::json &root, const std::string &tar
         }
         requirements.features.push_back(feature.get<std::string>());
     }
-    static constexpr std::string_view knownFeatures[] = {"compute", "instancing", "samplers", "tensor_views",
-                                                         "textures"};
+    static constexpr std::string_view knownFeatures[] = {"atomics",  "barriers",     "compute",  "instancing",
+                                                         "samplers", "tensor_views", "textures", "workgroup_storage"};
     if (!std::is_sorted(requirements.features.begin(), requirements.features.end()) ||
         std::adjacent_find(requirements.features.begin(), requirements.features.end()) != requirements.features.end() ||
         std::any_of(requirements.features.begin(), requirements.features.end(), [](const std::string &feature) {
@@ -732,6 +854,10 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
             variant.vertex = artifact.get<std::string>();
         else if (stage == "fragment")
             variant.fragment = artifact.get<std::string>();
+        else {
+            error = "pipeline program contains an unknown shader stage";
+            return false;
+        }
     }
     if (variant.vertex.empty() != variant.fragment.empty()) {
         error = "graphics pipeline requires both vertex and fragment stages";

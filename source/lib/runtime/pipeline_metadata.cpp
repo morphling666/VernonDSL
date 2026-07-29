@@ -105,6 +105,10 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                 error = "argument reflection has an invalid physical alignment";
                 return false;
             }
+            const bool cudaStaticTensorValue =
+                backend == VERNON_RUNTIME_CUDA && argument.kind == "tensor" && argument.physical.size != 0;
+            if (cudaStaticTensorValue)
+                argument.kind = "scalar";
             argument.descriptorSet = value.value("vernon.set", uint32_t{0});
             argument.binding = value.value("vernon.binding", UINT32_MAX);
             if (value.contains("storage_leaves") && value["storage_leaves"].is_array()) {
@@ -118,6 +122,8 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                                                       leaf["binding"].get<uint32_t>()});
                 }
             }
+            if (cudaStaticTensorValue)
+                argument.storageLeaves.clear();
             size_t elementSize = 0;
             if (argument.kind == "tensor") {
                 auto layout = value.find("element_layout");

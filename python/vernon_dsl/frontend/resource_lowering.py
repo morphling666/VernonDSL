@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from typing import Protocol
 
+from ..language.stage_registry import GRAPHICS_STAGES
 from ..shader_contracts import texture_sampling_contract
 from .interfaces import GeneratedInterfacePlan
 from .lowering_types import DslType, ModuleContext, Value
@@ -94,7 +95,7 @@ def lower_texture_size(
         )
     if len(arguments) not in {1, 2} or arguments[0].type.kind != "texture":
         raise emitter.context.error(node, "texture_size requires texture and optional lod")
-    if emitter.stage not in {"vertex", "fragment"}:
+    if emitter.stage not in GRAPHICS_STAGES:
         raise emitter.context.error(node, "texture_size is supported only in graphics stages")
     if len(arguments) == 2 and (arguments[1].type.kind != "scalar" or not arguments[1].type.is_integer):
         raise emitter.context.error(node.args[1], "texture_size lod must be an integer scalar")

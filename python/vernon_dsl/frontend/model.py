@@ -72,6 +72,10 @@ class ConcreteType:
             element, rank, access = self.arguments
             assert isinstance(element, ConcreteType)
             return f'!vernon.tensor_view<{element.mlir}, {rank}, "{access}">'
+        if self.kind == "workgroup":
+            element, size = self.arguments
+            assert isinstance(element, ConcreteType)
+            return f"!vernon.workgroup<{element.mlir}, {size}>"
         if self.kind == "texture":
             dimension, element = self.arguments
             assert isinstance(element, ConcreteType)
@@ -104,7 +108,7 @@ class SemanticCategory(Enum):
 def semantic_category(value_type: ConcreteType) -> SemanticCategory | None:
     if value_type.kind in {"scalar", "tensor", "tuple", "struct"}:
         return SemanticCategory.VALUE
-    if value_type.kind in {"tensor_storage", "tensor_view"}:
+    if value_type.kind in {"tensor_storage", "tensor_view", "workgroup"}:
         return SemanticCategory.STORAGE
     if value_type.kind in {"texture", "sampler"}:
         return SemanticCategory.RESOURCE
@@ -176,11 +180,15 @@ class StorageRegionKind(Enum):
     UNKNOWN = "unknown"
 
 
+class StorageOwnerKind(Enum):
+    PARAMETER = "parameter"
+    WORKGROUP_LOCAL = "workgroup_local"
+
+
 @dataclass(frozen=True)
 class StorageOwner:
-    # Frontend effects name symbolic parameter owners; runtime binding resolves
-    # them to allocations and performs concrete alias/lifetime validation.
-    parameter: str
+    kind: StorageOwnerKind
+    name: str
 
 
 @dataclass(frozen=True)
@@ -323,6 +331,7 @@ SemanticValue = (
     | TypedExpression
     | TypedParameter
     | StorageOwner
+    | StorageOwnerKind
     | StorageRegion
     | StorageEffect
     | TypedEffect

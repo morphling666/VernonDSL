@@ -4,6 +4,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAttributeAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonTensorShapeSemantics.h"
@@ -111,12 +112,14 @@ analyzeSampledTextureBindings(mlir::func::FuncOp function) {
                    operation->getNumResults() == 1) {
             addEdge(operation->getOperand(0), operation->getResult(0));
         } else if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(operation)) {
-            auto thenYield = mlir::cast<mlir::scf::YieldOp>(ifOp.thenBlock()->getTerminator());
-            auto elseYield = mlir::cast<mlir::scf::YieldOp>(ifOp.elseBlock()->getTerminator());
-            for (auto [result, thenValue, elseValue] :
-                 llvm::zip_equal(ifOp.getResults(), thenYield.getOperands(), elseYield.getOperands())) {
-                addEdge(thenValue, result);
-                addEdge(elseValue, result);
+            if (!ifOp.getResults().empty()) {
+                auto thenYield = mlir::cast<mlir::scf::YieldOp>(ifOp.thenBlock()->getTerminator());
+                auto elseYield = mlir::cast<mlir::scf::YieldOp>(ifOp.elseBlock()->getTerminator());
+                for (auto [result, thenValue, elseValue] :
+                     llvm::zip_equal(ifOp.getResults(), thenYield.getOperands(), elseYield.getOperands())) {
+                    addEdge(thenValue, result);
+                    addEdge(elseValue, result);
+                }
             }
         } else if (auto forOp = mlir::dyn_cast<mlir::scf::ForOp>(operation)) {
             for (auto [init, iterArgument, yielded, result] : llvm::zip_equal(
@@ -317,6 +320,10 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
         for (uint64_t stride : physical.byteStrides)
             byteStrides.emplace_back(static_cast<int64_t>(stride));
         layout["byte_strides"] = std::move(byteStrides);
+        llvm::json::Array elementLeafOffsets;
+        for (uint64_t offset : physical.elementLeafOffsets)
+            elementLeafOffsets.emplace_back(static_cast<int64_t>(offset));
+        layout["element_leaf_offsets"] = std::move(elementLeafOffsets);
         return layout;
     };
     auto reflectPhysicalPlan = [&](const mlir::vernon::PhysicalValueAbiPlan &plan,
@@ -767,23 +774,26 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
                         storageLeaves.emplace_back(std::move(reflectedLeaf));
                     }
                     argument["storage_leaves"] = std::move(storageLeaves);
-                    if (auto shape = attrs.getAs<mlir::DenseI64ArrayAttr>("vernon.tensor_shape")) {
-                        llvm::json::Array dimensions;
-                        llvm::json::Array strides;
-                        int64_t stride = 1;
-                        llvm::SmallVector<int64_t> reversedStrides(shape.size());
-                        for (int64_t dimensionIndex = static_cast<int64_t>(shape.size()) - 1; dimensionIndex >= 0;
-                             --dimensionIndex) {
-                            reversedStrides[dimensionIndex] = stride;
-                            stride *= shape[dimensionIndex];
+                    if (auto shape = attrs.getAs<mlir::DenseI64ArrayAttr>(mlir::vernon::kTensorShapeAttrName)) {
+                        auto strides = attrs.getAs<mlir::DenseI64ArrayAttr>(mlir::vernon::kTensorStridesAttrName);
+                        auto offset = attrs.getAs<mlir::IntegerAttr>(mlir::vernon::kTensorOffsetAttrName);
+                        if (!strides || strides.size() != shape.size() || !offset || offset.getInt() < 0) {
+                            function.emitError("TensorView specialization requires matching shape, signed strides, "
+                                               "and a non-negative offset");
+                            invalid = true;
+                            return;
                         }
-                        for (auto [dimension, tensorStride] : llvm::zip_equal(shape.asArrayRef(), reversedStrides)) {
+                        llvm::json::Array dimensions;
+                        llvm::json::Array elementStrides;
+                        for (auto [dimension, tensorStride] :
+                             llvm::zip_equal(shape.asArrayRef(), strides.asArrayRef())) {
                             dimensions.emplace_back(dimension);
-                            strides.emplace_back(tensorStride);
+                            elementStrides.emplace_back(tensorStride);
                         }
                         argument["rank"] = static_cast<int64_t>(shape.size());
                         argument["shape"] = std::move(dimensions);
-                        argument["strides"] = std::move(strides);
+                        argument["element_strides"] = std::move(elementStrides);
+                        argument["element_offset"] = offset.getInt();
                     }
                 } else if (!mlir::isa<mlir::RankedTensorType>(argumentType)) {
                     argument["kind"] = "scalar";
@@ -988,6 +998,14 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
         }
     }
     root["dependencies"] = std::move(dependencies);
+    sourceModule.walk([&](mlir::Operation *operation) {
+        if (mlir::isa<mlir::vernon::WorkgroupAllocOp>(operation))
+            requiredFeatures.insert("workgroup_storage");
+        if (mlir::isa<mlir::vernon::AtomicOp>(operation))
+            requiredFeatures.insert("atomics");
+        if (mlir::isa<mlir::vernon::BarrierOp>(operation))
+            requiredFeatures.insert("barriers");
+    });
     llvm::json::Array features;
     for (const std::string &feature : requiredFeatures)
         features.emplace_back(feature);

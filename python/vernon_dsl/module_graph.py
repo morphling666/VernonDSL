@@ -585,7 +585,9 @@ class ModuleGraph:
                     module.host_functions.add(node.name)
                 elif len(decorators) != 1 or decorators[0] not in _FUNCTION_DECORATORS:
                     self._error(
-                        module, node, "DSL functions require exactly one of @func, @vertex, @fragment, or @kernel"
+                        module,
+                        node,
+                        "DSL functions require exactly one of @func, @vertex, @fragment, or @kernel",
                     )
             module.definitions[node.name] = node
 

@@ -143,203 +143,255 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         return true;
     }
     bool useRhiGraphics = variant.compute.empty() && !variant.vertex.empty() && !variant.fragment.empty();
-    uint32_t maximumExternalSlot = 0;
+    std::string representationError;
+    const auto graphicsStageMask = [](const std::string &stage) {
+        return stage == "vertex"     ? uint32_t{VERNON_RUNTIME_PROVIDER_STAGE_VERTEX}
+               : stage == "fragment" ? uint32_t{VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT}
+                                     : uint32_t{0};
+    };
     if (useRhiGraphics) {
         for (const Parameter &parameter : variant.parameters) {
-            maximumExternalSlot = std::max(maximumExternalSlot, parameter.slot);
-            if (parameter.uses.size() != 1 ||
-                (parameter.uses[0].stage != "vertex" && parameter.uses[0].stage != "fragment")) {
-                useRhiGraphics = false;
-                break;
-            }
-            const ParameterUse &use = parameter.uses[0];
-            OpenGLBindingCandidate candidate;
-            candidate.layout.slot = parameter.slot;
-            candidate.layout.stage_mask =
-                use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
-            candidate.layout.array_count = 1;
-            candidate.binding.externalSlot = parameter.slot;
-            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.physicalValueLayout &&
-                use.physicalValueLayout->transport == "storage_buffer" && parameter.elementLayout.byteSize &&
-                use.binding != UINT32_MAX) {
-                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
-                candidate.layout.element_size = parameter.elementLayout.byteSize;
-                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
-                candidate.layout.binding = use.binding;
-                candidate.layout.set = use.descriptorSet;
-                candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_STORAGE;
-            } else if (parameter.kind == "tensor" && use.interfaceKind == "uniform" &&
-                       (!use.uniformName.empty() || use.physicalValueLayout->transport == "uniform_buffer")) {
-                const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
-                const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
-                uint64_t valueCount = 1;
-                for (uint64_t dimension : shape) {
-                    if (dimension == 0 || valueCount > UINT32_MAX / dimension) {
-                        valueCount = 0;
-                        break;
-                    }
-                    valueCount *= dimension;
-                }
-                const bool buffered = use.physicalValueLayout->transport == "uniform_buffer";
-                const bool nativeInline =
-                    use.dtype == "f32" &&
-                    (shape.empty() || (shape.size() == 1 && shape[0] <= 4) ||
-                     (shape.size() == 2 && shape[0] >= 2 && shape[0] <= 4 && shape[1] >= 2 && shape[1] <= 4));
-                if (!dtype || valueCount == 0 || (!buffered && !nativeInline)) {
+            for (const ParameterUse &use : parameter.uses) {
+                if (graphicsStageMask(use.stage) == 0) {
+                    representationError = "OpenGL graphics parameter references an unsupported stage";
                     useRhiGraphics = false;
                     break;
                 }
-                const size_t elementSize = dataTypeSize(*dtype);
-                candidate.layout.kind =
-                    buffered ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-                const uint64_t physicalSize = use.physicalValueLayout->size;
-                if (!physicalSize || physicalSize > UINT32_MAX || (buffered && use.binding == UINT32_MAX)) {
+                if ((use.binding != UINT32_MAX && use.descriptorSet != 0) ||
+                    std::any_of(use.sampledTextureBindings.begin(), use.sampledTextureBindings.end(),
+                                [](const SampledTextureBinding &binding) { return binding.descriptorSet != 0; })) {
+                    representationError = "OpenGL supports reflected resources only in descriptor set 0";
                     useRhiGraphics = false;
                     break;
                 }
-                candidate.layout.element_size = static_cast<uint32_t>(physicalSize);
-                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
-                candidate.layout.element_count = static_cast<uint32_t>(valueCount);
-                candidate.layout.vector_count = shape.size() == 2 ? static_cast<uint32_t>(shape[1]) : 1;
-                candidate.layout.binding = use.binding;
-                candidate.layout.set = use.descriptorSet;
-                candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_UNIFORM;
-                candidate.name = use.uniformName;
-                candidate.binding.packing.elementSize = elementSize;
-                candidate.binding.packing.shape = shape;
-                candidate.binding.packing.byteSize = static_cast<size_t>(physicalSize);
-                for (uint64_t stride : use.physicalValueLayout->byteStrides) {
-                    if (stride > SIZE_MAX) {
+                OpenGLBindingCandidate candidate;
+                candidate.layout.stage_mask = graphicsStageMask(use.stage);
+                candidate.layout.array_count = 1;
+                candidate.binding.externalSlot = parameter.slot;
+                if (parameter.kind == "sampler") {
+                    if (use.sampledTextureBindings.empty()) {
+                        representationError = "OpenGL sampler has no reflected texture binding";
                         useRhiGraphics = false;
                         break;
                     }
-                    candidate.binding.packing.byteStrides.push_back(static_cast<size_t>(stride));
+                    for (const SampledTextureBinding &binding : use.sampledTextureBindings) {
+                        if (binding.binding == UINT32_MAX) {
+                            representationError = "OpenGL sampler reflection is incomplete";
+                            useRhiGraphics = false;
+                            break;
+                        }
+                        OpenGLBindingCandidate sampler = candidate;
+                        sampler.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLER;
+                        sampler.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
+                        sampler.layout.set = binding.descriptorSet;
+                        sampler.layout.binding = binding.binding;
+                        sampler.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_SAMPLER;
+                        candidates.push_back(std::move(sampler));
+                    }
+                    if (!useRhiGraphics)
+                        break;
+                    continue;
                 }
-                if (!useRhiGraphics || candidate.binding.packing.byteStrides.size() != shape.size()) {
-                    useRhiGraphics = false;
-                    break;
-                }
-            } else if (parameter.kind == "tensor" && use.interfaceKind == "input" && use.stage == "vertex" &&
-                       use.location != UINT32_MAX && !use.attributeLeaves.empty()) {
-                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
-                candidate.layout.element_size = parameter.elementLayout.byteSize;
-                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_VERTEX_INPUT;
-                candidate.layout.binding = parameter.slot;
-                candidate.layout.divisor = use.divisor;
-                for (const AttributeLeaf &leaf : use.attributeLeaves) {
-                    const std::optional<VernonDataType> dtype = pipelineDataType(leaf.dtype);
-                    if (!dtype) {
+                if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.physicalValueLayout &&
+                    use.physicalValueLayout->transport == "storage_buffer" && parameter.elementLayout.byteSize &&
+                    use.binding != UINT32_MAX) {
+                    candidate.layout.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
+                    candidate.layout.element_size = parameter.elementLayout.byteSize;
+                    candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
+                    candidate.layout.binding = use.binding;
+                    candidate.layout.set = use.descriptorSet;
+                    candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_STORAGE;
+                } else if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.physicalValueLayout &&
+                           (!use.uniformName.empty() || use.physicalValueLayout->transport == "uniform_buffer")) {
+                    const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
+                    const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
+                    uint64_t valueCount = 1;
+                    for (uint64_t dimension : shape) {
+                        if (dimension == 0 || valueCount > UINT32_MAX / dimension) {
+                            valueCount = 0;
+                            break;
+                        }
+                        valueCount *= dimension;
+                    }
+                    const bool buffered = use.physicalValueLayout->transport == "uniform_buffer";
+                    const bool nativeInline =
+                        use.dtype == "f32" &&
+                        (shape.empty() || (shape.size() == 1 && shape[0] <= 4) ||
+                         (shape.size() == 2 && shape[0] >= 2 && shape[0] <= 4 && shape[1] >= 2 && shape[1] <= 4));
+                    if (!dtype || valueCount == 0 || (!buffered && !nativeInline)) {
+                        representationError = "OpenGL uniform layout is unsupported";
                         useRhiGraphics = false;
                         break;
                     }
-                    candidate.attributes.push_back({candidate.layout.binding, use.location + leaf.locationOffset,
-                                                    static_cast<uint32_t>(*dtype), leaf.componentCount,
-                                                    leaf.byteOffset});
-                }
-                if (!useRhiGraphics)
+                    const size_t elementSize = dataTypeSize(*dtype);
+                    candidate.layout.kind =
+                        buffered ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                    const uint64_t physicalSize = use.physicalValueLayout->size;
+                    if (!physicalSize || physicalSize > UINT32_MAX || (buffered && use.binding == UINT32_MAX)) {
+                        representationError = "OpenGL uniform reflection is incomplete";
+                        useRhiGraphics = false;
+                        break;
+                    }
+                    candidate.layout.element_size = static_cast<uint32_t>(physicalSize);
+                    candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
+                    candidate.layout.element_count = static_cast<uint32_t>(valueCount);
+                    candidate.layout.vector_count = shape.size() == 2 ? static_cast<uint32_t>(shape[1]) : 1;
+                    candidate.layout.binding = use.binding;
+                    candidate.layout.set = use.descriptorSet;
+                    candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_UNIFORM;
+                    candidate.name = use.uniformName;
+                    candidate.binding.packing.elementSize = elementSize;
+                    candidate.binding.packing.shape = shape;
+                    candidate.binding.packing.byteSize = static_cast<size_t>(physicalSize);
+                    for (uint64_t stride : use.physicalValueLayout->byteStrides) {
+                        if (stride > SIZE_MAX) {
+                            representationError = "OpenGL uniform stride exceeds the host size range";
+                            useRhiGraphics = false;
+                            break;
+                        }
+                        candidate.binding.packing.byteStrides.push_back(static_cast<size_t>(stride));
+                    }
+                    if (!useRhiGraphics || candidate.binding.packing.byteStrides.size() != shape.size()) {
+                        if (representationError.empty())
+                            representationError = "OpenGL uniform stride rank does not match its shape";
+                        useRhiGraphics = false;
+                        break;
+                    }
+                } else if (parameter.kind == "tensor" && use.interfaceKind == "input" && use.stage == "vertex" &&
+                           use.location != UINT32_MAX && !use.attributeLeaves.empty()) {
+                    candidate.layout.kind = VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
+                    candidate.layout.element_size = parameter.elementLayout.byteSize;
+                    candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_VERTEX_INPUT;
+                    candidate.layout.binding = parameter.slot;
+                    candidate.layout.divisor = use.divisor;
+                    for (const AttributeLeaf &leaf : use.attributeLeaves) {
+                        const std::optional<VernonDataType> dtype = pipelineDataType(leaf.dtype);
+                        if (!dtype) {
+                            representationError = "OpenGL vertex attribute dtype is unsupported";
+                            useRhiGraphics = false;
+                            break;
+                        }
+                        candidate.attributes.push_back({candidate.layout.binding, use.location + leaf.locationOffset,
+                                                        static_cast<uint32_t>(*dtype), leaf.componentCount,
+                                                        leaf.byteOffset});
+                    }
+                    if (!useRhiGraphics)
+                        break;
+                    candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_VERTEX;
+                } else if (parameter.kind == "texture" && use.interfaceKind == "resource" &&
+                           use.binding != UINT32_MAX) {
+                    candidate.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE;
+                    candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
+                    candidate.layout.set = use.descriptorSet;
+                    candidate.layout.binding = use.binding;
+                    candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_TEXTURE;
+                    candidate.name =
+                        use.uniformName.empty() ? "main_arg_" + std::to_string(use.index) : use.uniformName;
+                } else {
+                    representationError = "OpenGL graphics parameter layout is unsupported";
+                    useRhiGraphics = false;
                     break;
-                candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_VERTEX;
-            } else if (parameter.kind == "texture" && use.interfaceKind == "resource" && use.descriptorSet == 0 &&
-                       use.binding != UINT32_MAX) {
-                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE;
-                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
-                candidate.layout.binding = use.binding;
-                candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_TEXTURE;
-                candidate.name = use.uniformName.empty() ? "main_arg_" + std::to_string(use.index) : use.uniformName;
-            } else if (parameter.kind == "sampler" && use.sampledTextureBindings.size() == 1 &&
-                       use.sampledTextureBindings[0].descriptorSet == 0 &&
-                       use.sampledTextureBindings[0].binding != UINT32_MAX) {
-                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLER;
-                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
-                candidate.layout.binding = use.sampledTextureBindings[0].binding;
-                candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_SAMPLER;
-            } else {
-                useRhiGraphics = false;
-                break;
+                }
+                candidates.push_back(std::move(candidate));
             }
-            candidates.push_back(std::move(candidate));
+            if (!useRhiGraphics)
+                break;
         }
     }
-    uint32_t internalSlot = maximumExternalSlot;
-    if (useRhiGraphics && !variant.internalParameters.empty() && internalSlot == UINT32_MAX)
-        useRhiGraphics = false;
     if (useRhiGraphics) {
         for (const Parameter &parameter : variant.internalParameters) {
-            if (parameter.uses.size() != 1 || internalSlot == UINT32_MAX ||
-                (parameter.uses[0].stage != "vertex" && parameter.uses[0].stage != "fragment")) {
-                useRhiGraphics = false;
-                break;
+            for (const ParameterUse &use : parameter.uses) {
+                if (graphicsStageMask(use.stage) == 0) {
+                    representationError = "OpenGL internal parameter references an unsupported stage";
+                    useRhiGraphics = false;
+                    break;
+                }
+                const uint32_t stageMask = graphicsStageMask(use.stage);
+                if (parameter.source == "implicit_sampler" && parameter.kind == "sampler" &&
+                    !use.sampledTextureBindings.empty()) {
+                    for (const SampledTextureBinding &binding : use.sampledTextureBindings) {
+                        if (binding.descriptorSet != 0 || binding.binding == UINT32_MAX) {
+                            representationError = "OpenGL supports reflected resources only in descriptor set 0";
+                            useRhiGraphics = false;
+                            break;
+                        }
+                        OpenGLBindingCandidate candidate;
+                        candidate.layout.stage_mask = stageMask;
+                        candidate.layout.array_count = 1;
+                        candidate.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLER;
+                        candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
+                        candidate.layout.set = binding.descriptorSet;
+                        candidate.layout.binding = binding.binding;
+                        candidate.binding.source = OpenGLPipelineState::InlineBinding::IMPLICIT_SAMPLER;
+                        candidates.push_back(std::move(candidate));
+                    }
+                } else if (parameter.source == "system_value" && parameter.systemValue == "resolution" &&
+                           use.interfaceKind == "uniform" && !use.uniformName.empty()) {
+                    OpenGLBindingCandidate candidate;
+                    candidate.layout.stage_mask = stageMask;
+                    candidate.layout.array_count = 1;
+                    candidate.layout.kind = VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                    candidate.layout.element_size = 2 * sizeof(float);
+                    candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
+                    candidate.layout.element_count = 2;
+                    candidate.layout.vector_count = 1;
+                    candidate.binding.source = OpenGLPipelineState::InlineBinding::RESOLUTION;
+                    candidate.name = use.uniformName;
+                    candidates.push_back(std::move(candidate));
+                } else {
+                    representationError = "OpenGL internal parameter layout is unsupported";
+                    useRhiGraphics = false;
+                    break;
+                }
             }
-            const ParameterUse &use = parameter.uses[0];
-            OpenGLBindingCandidate candidate;
-            candidate.layout.slot = ++internalSlot;
-            candidate.layout.stage_mask =
-                use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
-            candidate.layout.array_count = 1;
-            if (parameter.source == "implicit_sampler" && parameter.kind == "sampler" &&
-                use.sampledTextureBindings.size() == 1 && use.sampledTextureBindings[0].descriptorSet == 0 &&
-                use.sampledTextureBindings[0].binding != UINT32_MAX) {
-                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLER;
-                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
-                candidate.layout.binding = use.sampledTextureBindings[0].binding;
-                candidate.binding.source = OpenGLPipelineState::InlineBinding::IMPLICIT_SAMPLER;
-            } else if (parameter.source == "system_value" && parameter.systemValue == "resolution" &&
-                       use.interfaceKind == "uniform" && !use.uniformName.empty()) {
-                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-                candidate.layout.element_size = 2 * sizeof(float);
-                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
-                candidate.layout.element_count = 2;
-                candidate.layout.vector_count = 1;
-                candidate.binding.source = OpenGLPipelineState::InlineBinding::RESOLUTION;
-                candidate.name = use.uniformName;
-            } else {
-                useRhiGraphics = false;
+            if (!useRhiGraphics)
                 break;
-            }
-            candidates.push_back(std::move(candidate));
         }
     }
     if (useRhiGraphics) {
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const auto &left, const auto &right) { return left.layout.slot < right.layout.slot; });
-        for (size_t index = 1; index < candidates.size(); ++index)
-            if (candidates[index - 1].layout.slot == candidates[index].layout.slot)
-                useRhiGraphics = false;
-        state->rhiLayout.reserve(candidates.size());
-        state->rhiInlineBindings.reserve(candidates.size());
-        for (auto &candidate : candidates) {
-            candidate.layout.name = {candidate.name.data(), candidate.name.size()};
-            state->rhiLayout.push_back(candidate.layout);
-            state->rhiVertexAttributes.insert(state->rhiVertexAttributes.end(), candidate.attributes.begin(),
-                                              candidate.attributes.end());
-            state->rhiInlineBindings.push_back(std::move(candidate.binding));
+        if (candidates.size() > UINT32_MAX) {
+            representationError = "OpenGL binding layout exceeds the provider slot range";
+            useRhiGraphics = false;
+        }
+        if (useRhiGraphics) {
+            state->rhiLayout.reserve(candidates.size());
+            state->rhiInlineBindings.reserve(candidates.size());
+            for (size_t index = 0; index < candidates.size(); ++index) {
+                auto &candidate = candidates[index];
+                candidate.layout.slot = static_cast<uint32_t>(index);
+                candidate.layout.name = {candidate.name.data(), candidate.name.size()};
+                state->rhiLayout.push_back(candidate.layout);
+                state->rhiVertexAttributes.insert(state->rhiVertexAttributes.end(), candidate.attributes.begin(),
+                                                  candidate.attributes.end());
+                state->rhiInlineBindings.push_back(std::move(candidate.binding));
+            }
         }
     }
     if (useRhiGraphics) {
         const Stage &vertex = bundle.stages.at(variant.vertex);
         const Stage &fragment = bundle.stages.at(variant.fragment);
-        const VernonRuntimeProviderShaderDescriptor shaders[2]{{sizeof(VernonRuntimeProviderShaderDescriptor),
-                                                                VERNON_RUNTIME_PROVIDER_STAGE_VERTEX,
-                                                                {"glsl", 4},
-                                                                vertex.source.data(),
-                                                                vertex.source.size(),
-                                                                {vertex.entry.data(), vertex.entry.size()},
-                                                                {nullptr, 0},
-                                                                {0, 0, 0, 0}},
-                                                               {sizeof(VernonRuntimeProviderShaderDescriptor),
-                                                                VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT,
-                                                                {"glsl", 4},
-                                                                fragment.source.data(),
-                                                                fragment.source.size(),
-                                                                {fragment.entry.data(), fragment.entry.size()},
-                                                                {nullptr, 0},
-                                                                {0, 0, 0, 0}}};
+        std::vector<VernonRuntimeProviderShaderDescriptor> shaders{{sizeof(VernonRuntimeProviderShaderDescriptor),
+                                                                    VERNON_RUNTIME_PROVIDER_STAGE_VERTEX,
+                                                                    {"glsl", 4},
+                                                                    vertex.source.data(),
+                                                                    vertex.source.size(),
+                                                                    {vertex.entry.data(), vertex.entry.size()},
+                                                                    {nullptr, 0},
+                                                                    {0, 0, 0, 0}}};
+        shaders.push_back({sizeof(VernonRuntimeProviderShaderDescriptor),
+                           VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT,
+                           {"glsl", 4},
+                           fragment.source.data(),
+                           fragment.source.size(),
+                           {fragment.entry.data(), fragment.entry.size()},
+                           {nullptr, 0},
+                           {0, 0, 0, 0}});
         VernonRuntimeCorePipelineDescriptor descriptor{};
         descriptor.struct_size = sizeof(descriptor);
         descriptor.kind = VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE;
         descriptor.required_capabilities = VERNON_RUNTIME_PROVIDER_GRAPHICS;
-        descriptor.shaders = shaders;
-        descriptor.shader_count = 2;
+        descriptor.shaders = shaders.data();
+        descriptor.shader_count = shaders.size();
         descriptor.bindings = state->rhiLayout.data();
         descriptor.binding_count = state->rhiLayout.size();
         descriptor.vertex_attributes = state->rhiVertexAttributes.data();
@@ -387,7 +439,9 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         installRuntimeBackendState(pipeline, state);
         return true;
     }
-    bundle.context->error = "OpenGL PipelineAsset is not representable by the RuntimeCore provider";
+    bundle.context->error = representationError.empty()
+                                ? "OpenGL PipelineAsset is not representable by the RuntimeCore provider"
+                                : std::move(representationError);
     delete state;
     return false;
 }

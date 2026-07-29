@@ -58,6 +58,16 @@ def Vernon_TensorViewType : TypeDef<Vernon_Dialect, "TensorView"> {
   let assemblyFormat = "`<` $elementType `,` $rank `,` $access `>`";
 }
 
+def Vernon_WorkgroupType : TypeDef<Vernon_Dialect, "Workgroup"> {
+  let mnemonic = "workgroup";
+  let summary = "Statically sized compute workgroup storage";
+  let parameters = (ins
+    TypeParameter<"::mlir::Type", "element type">:$elementType,
+    AttrOrTypeParameter<"uint64_t", "element count">:$size
+  );
+  let assemblyFormat = "`<` $elementType `,` $size `>`";
+}
+
 def Vernon_TextureType : TypeDef<Vernon_Dialect, "Texture"> {
   let mnemonic = "texture";
   let summary = "Sampled or storage texture resource";

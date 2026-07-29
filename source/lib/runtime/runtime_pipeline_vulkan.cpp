@@ -137,20 +137,42 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
             VulkanPipelineState::Binding binding;
         };
         std::vector<Candidate> candidates;
-        uint32_t maximumExternalSlot = 0;
+        uint32_t nextProviderSlot = 0;
         uint32_t vertexBinding = 0;
         bool supported = true;
-        const auto addParameter = [&](const Parameter &parameter, uint32_t slot, bool internal) {
-            if (parameter.uses.size() != 1)
+        const auto addUse = [&](const Parameter &parameter, const ParameterUse &use, bool internal) {
+            if (use.stage != "vertex" && use.stage != "fragment")
                 return false;
-            const ParameterUse &use = parameter.uses[0];
             Candidate candidate;
-            candidate.layout.slot = slot;
+            if (nextProviderSlot == UINT32_MAX)
+                return false;
+            candidate.layout.slot = nextProviderSlot++;
             candidate.layout.argument_index = use.index;
             candidate.layout.stage_mask =
                 use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
             candidate.layout.array_count = 1;
             candidate.binding.externalSlot = parameter.slot;
+            if (parameter.kind == "sampler") {
+                if (use.sampledTextureBindings.empty())
+                    return false;
+                for (size_t index = 0; index < use.sampledTextureBindings.size(); ++index) {
+                    const SampledTextureBinding &binding = use.sampledTextureBindings[index];
+                    Candidate sampler = candidate;
+                    if (index != 0) {
+                        if (nextProviderSlot == UINT32_MAX)
+                            return false;
+                        sampler.layout.slot = nextProviderSlot++;
+                    }
+                    sampler.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLER;
+                    sampler.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
+                    sampler.layout.set = binding.descriptorSet;
+                    sampler.layout.binding = binding.binding;
+                    sampler.binding.source = internal ? VulkanPipelineState::Binding::IMPLICIT_SAMPLER
+                                                      : VulkanPipelineState::Binding::EXTERNAL_SAMPLER;
+                    candidates.push_back(std::move(sampler));
+                }
+                return true;
+            }
             if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.physicalValueLayout &&
                 use.physicalValueLayout->transport == "storage_buffer" && parameter.elementLayout.byteSize &&
                 use.binding != UINT32_MAX) {
@@ -222,14 +244,9 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
             } else if (parameter.kind == "texture" && use.interfaceKind == "resource") {
                 candidate.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE;
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
+                candidate.layout.set = use.descriptorSet;
                 candidate.layout.binding = use.binding;
                 candidate.binding.source = VulkanPipelineState::Binding::EXTERNAL_TEXTURE;
-            } else if (parameter.kind == "sampler" && use.sampledTextureBindings.size() == 1) {
-                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLER;
-                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
-                candidate.layout.binding = use.sampledTextureBindings[0].binding;
-                candidate.binding.source = internal ? VulkanPipelineState::Binding::IMPLICIT_SAMPLER
-                                                    : VulkanPipelineState::Binding::EXTERNAL_SAMPLER;
             } else {
                 return false;
             }
@@ -237,18 +254,20 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
             return true;
         };
         for (const Parameter &parameter : variant.parameters) {
-            maximumExternalSlot = std::max(maximumExternalSlot, parameter.slot);
-            if (!addParameter(parameter, parameter.slot, false)) {
-                supported = false;
+            for (const ParameterUse &use : parameter.uses)
+                if (!addUse(parameter, use, false)) {
+                    supported = false;
+                    break;
+                }
+            if (!supported)
                 break;
-            }
         }
-        uint32_t internalSlot = maximumExternalSlot;
         for (const Parameter &parameter : variant.internalParameters)
-            if (!supported || !addParameter(parameter, ++internalSlot, true)) {
-                supported = false;
-                break;
-            }
+            for (const ParameterUse &use : parameter.uses)
+                if (!supported || !addUse(parameter, use, true)) {
+                    supported = false;
+                    break;
+                }
         if (!supported) {
             bundle.context->error = "Vulkan RuntimeCore graphics path does not support this parameter layout";
             delete state;
@@ -263,28 +282,28 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
             state->rhiGraphicsBindingPlan.push_back(std::move(candidate.binding));
         }
         state->rhiGraphicsValues.resize(candidates.size());
-        const VernonRuntimeProviderShaderDescriptor shaders[2]{{sizeof(VernonRuntimeProviderShaderDescriptor),
-                                                                VERNON_RUNTIME_PROVIDER_STAGE_VERTEX,
-                                                                {"spirv", 5},
-                                                                vertex.binary.data(),
-                                                                vertex.binary.size(),
-                                                                {vertex.entry.data(), vertex.entry.size()},
-                                                                {},
-                                                                {0, 0, 0, 0}},
-                                                               {sizeof(VernonRuntimeProviderShaderDescriptor),
-                                                                VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT,
-                                                                {"spirv", 5},
-                                                                fragment.binary.data(),
-                                                                fragment.binary.size(),
-                                                                {fragment.entry.data(), fragment.entry.size()},
-                                                                {},
-                                                                {0, 0, 0, 0}}};
+        std::vector<VernonRuntimeProviderShaderDescriptor> shaders{{sizeof(VernonRuntimeProviderShaderDescriptor),
+                                                                    VERNON_RUNTIME_PROVIDER_STAGE_VERTEX,
+                                                                    {"spirv", 5},
+                                                                    vertex.binary.data(),
+                                                                    vertex.binary.size(),
+                                                                    {vertex.entry.data(), vertex.entry.size()},
+                                                                    {},
+                                                                    {0, 0, 0, 0}}};
+        shaders.push_back({sizeof(VernonRuntimeProviderShaderDescriptor),
+                           VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT,
+                           {"spirv", 5},
+                           fragment.binary.data(),
+                           fragment.binary.size(),
+                           {fragment.entry.data(), fragment.entry.size()},
+                           {},
+                           {0, 0, 0, 0}});
         VernonRuntimeCorePipelineDescriptor descriptor{};
         descriptor.struct_size = sizeof(descriptor);
         descriptor.kind = VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE;
         descriptor.required_capabilities = VERNON_RUNTIME_PROVIDER_GRAPHICS;
-        descriptor.shaders = shaders;
-        descriptor.shader_count = 2;
+        descriptor.shaders = shaders.data();
+        descriptor.shader_count = shaders.size();
         descriptor.bindings = state->rhiGraphicsLayout.data();
         descriptor.binding_count = state->rhiGraphicsLayout.size();
         descriptor.vertex_attributes = state->rhiGraphicsVertexAttributes.data();

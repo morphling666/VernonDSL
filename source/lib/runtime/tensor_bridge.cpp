@@ -161,7 +161,8 @@ bool isRowMajorContiguous(const VernonTensorView &tensor) {
 std::optional<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, const TensorPackingLayout &layout) {
     if (tensor.storage != VERNON_TENSOR_HOST || !valueLayoutValid(tensor.element_layout) ||
         tensor.element_layout.byte_size != layout.elementSize || tensor.rank != layout.shape.size() ||
-        layout.byteStrides.size() != layout.shape.size() || (tensor.rank && !tensor.shape))
+        layout.byteStrides.size() != layout.shape.size() || (tensor.rank && !tensor.shape) ||
+        (!layout.elementLeafOffsets.empty() && layout.elementLeafOffsets.size() != tensor.element_layout.leaf_count))
         return std::nullopt;
     const size_t elementSize = tensor.element_layout.byte_size;
     if (!elementSize || !tensorFitsAllocation(tensor))
@@ -204,7 +205,23 @@ std::optional<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, c
             (tensor.byte_strides[dimension] < 0 ? negativeOffset : positiveOffset) += offset;
             destinationOffset += index * layout.byteStrides[dimension];
         }
-        std::memcpy(packed.data() + destinationOffset, source + positiveOffset - negativeOffset, elementSize);
+        const uint8_t *sourceElement = source + positiveOffset - negativeOffset;
+        if (layout.elementLeafOffsets.empty()) {
+            std::memcpy(packed.data() + destinationOffset, sourceElement, elementSize);
+            continue;
+        }
+        for (size_t leafIndex = 0; leafIndex < tensor.element_layout.leaf_count; ++leafIndex) {
+            const VernonValueLeafView &leaf = tensor.element_layout.leaves[leafIndex];
+            const size_t scalarSize = dataTypeSize(static_cast<VernonDataType>(leaf.dtype));
+            if (!scalarSize || leaf.scalar_count > std::numeric_limits<size_t>::max() / scalarSize)
+                return std::nullopt;
+            const size_t leafSize = leaf.scalar_count * scalarSize;
+            const size_t physicalOffset = layout.elementLeafOffsets[leafIndex];
+            if (destinationOffset > packed.size() || physicalOffset > packed.size() - destinationOffset ||
+                leafSize > packed.size() - destinationOffset - physicalOffset)
+                return std::nullopt;
+            std::memcpy(packed.data() + destinationOffset + physicalOffset, sourceElement + leaf.byte_offset, leafSize);
+        }
     }
     return packed;
 }

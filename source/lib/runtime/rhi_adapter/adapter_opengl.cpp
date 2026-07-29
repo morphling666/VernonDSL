@@ -233,7 +233,7 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
                  : descriptor->kind != VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE || descriptor->shader_count != 2) ||
         !descriptor->shaders || !layout)
         return fail(adapter, "OpenGL adapter received an invalid pipeline");
-    std::array<rhi::opengl::Uint, 2> compiled{};
+    std::array<rhi::opengl::Uint, 3> compiled{};
     bool hasVertex = false;
     bool hasFragment = false;
     bool hasCompute = false;

@@ -25,6 +25,7 @@ struct PhysicalValueLayout {
     uint64_t size{};
     uint64_t alignment{1};
     std::vector<uint64_t> byteStrides;
+    std::vector<uint64_t> elementLeafOffsets;
 };
 
 struct AttributeLeaf {
@@ -76,6 +77,8 @@ struct ParameterUse {
     std::vector<SampledTextureBinding> sampledTextureBindings;
     std::vector<AttributeLeaf> attributeLeaves;
     std::optional<PhysicalValueLayout> physicalValueLayout;
+    std::vector<int64_t> elementStrides;
+    std::optional<uint64_t> elementOffset;
 };
 
 struct Parameter {

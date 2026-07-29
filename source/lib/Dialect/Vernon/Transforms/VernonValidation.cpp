@@ -31,10 +31,9 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
 
     void runOnOperation() override {
         bool invalid = false;
-        SmallVector<LocationEndpoint> vertexOutputs;
-        SmallVector<LocationEndpoint> fragmentInputs;
-        bool hasVertexEntry = false;
-        bool hasFragmentEntry = false;
+        std::map<ShaderStage, SmallVector<LocationEndpoint>> stageInputs;
+        std::map<ShaderStage, SmallVector<LocationEndpoint>> stageOutputs;
+        std::set<ShaderStage> entryStages;
 
         for (func::FuncOp function : getOperation().getOps<func::FuncOp>()) {
             Attribute entryAttr = function->getAttr(kEntryAttrName);
@@ -67,10 +66,8 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
                 }
             }
 
-            if (entryAttr && stage == ShaderStage::Vertex)
-                hasVertexEntry = true;
-            if (entryAttr && stage == ShaderStage::Fragment)
-                hasFragmentEntry = true;
+            if (entryAttr && stage)
+                entryStages.insert(*stage);
 
             if (stage == ShaderStage::Compute) {
                 auto workgroup = dyn_cast_if_present<DenseI32ArrayAttr>(workgroupAttr);
@@ -154,6 +151,23 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
                                     break;
                                 }
                             }
+                        }
+                    }
+                }
+
+                if (auto view = dyn_cast<TensorViewType>(type)) {
+                    auto shape = dictionary ? dictionary.getAs<DenseI64ArrayAttr>(kTensorShapeAttrName) : nullptr;
+                    auto strides = dictionary ? dictionary.getAs<DenseI64ArrayAttr>(kTensorStridesAttrName) : nullptr;
+                    auto offset = dictionary ? dictionary.getAs<IntegerAttr>(kTensorOffsetAttrName) : nullptr;
+                    if (shape || strides || offset) {
+                        if (!shape || !strides || !offset || shape.size() != view.getRank() ||
+                            strides.size() != view.getRank() || offset.getInt() < 0 ||
+                            llvm::any_of(shape.asArrayRef(), [](int64_t extent) { return extent < 0; })) {
+                            function.emitError()
+                                << (isResult ? "result #" : "argument #") << index
+                                << " has invalid TensorView specialization; expected rank-matched non-negative "
+                                   "shape, signed element strides, and non-negative element offset";
+                            invalid = true;
                         }
                     }
                 }
@@ -327,11 +341,8 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
 
                 if (!location)
                     return;
-                if (*stage == ShaderStage::Vertex && kind == InterfaceKind::Output) {
-                    vertexOutputs.push_back({function, index, type, *location});
-                } else if (*stage == ShaderStage::Fragment && kind == InterfaceKind::Input) {
-                    fragmentInputs.push_back({function, index, type, *location});
-                }
+                auto &endpoints = kind == InterfaceKind::Input ? stageInputs[*stage] : stageOutputs[*stage];
+                endpoints.push_back({function, index, type, *location});
             };
 
             for (unsigned index = 0; index < function.getNumArguments(); ++index)
@@ -342,24 +353,42 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
                                   /*isResult=*/true);
         }
 
-        if (hasVertexEntry && hasFragmentEntry) {
-            for (const LocationEndpoint &fragmentInput : fragmentInputs) {
-                func::FuncOp fragmentFunction = fragmentInput.function;
-                auto matchingLocation = llvm::find_if(vertexOutputs, [&](const LocationEndpoint &output) {
-                    return output.location == fragmentInput.location;
+        getOperation().walk([&](Operation *operation) {
+            if (!isa<WorkgroupAllocOp, WorkgroupLoadOp, WorkgroupStoreOp, AtomicOp, BarrierOp>(operation))
+                return;
+            func::FuncOp function = operation->getParentOfType<func::FuncOp>();
+            auto stage = function ? function->getAttrOfType<StringAttr>(kStageAttrName) : nullptr;
+            if (!stage || stage.getValue() != "compute") {
+                operation->emitError("workgroup storage, atomics, and barriers require a compute entry");
+                invalid = true;
+            }
+            if (isa<WorkgroupAllocOp>(operation) && (!function || operation->getBlock() != &function.front())) {
+                operation->emitError("workgroup storage must be allocated in the compute entry block");
+                invalid = true;
+            }
+        });
+
+        const auto validateStageInterface = [&](ShaderStage producer, ShaderStage consumer) {
+            for (LocationEndpoint &input : stageInputs[consumer]) {
+                auto matchingLocation = llvm::find_if(stageOutputs[producer], [&](const LocationEndpoint &output) {
+                    return output.location == input.location;
                 });
-                if (matchingLocation == vertexOutputs.end()) {
-                    fragmentFunction.emitError() << "fragment input #" << fragmentInput.index << " at location "
-                                                 << fragmentInput.location << " has no vertex output";
+                if (matchingLocation == stageOutputs[producer].end()) {
+                    input.function.emitError()
+                        << stringifyShaderStage(consumer) << " input #" << input.index << " at location "
+                        << input.location << " has no " << stringifyShaderStage(producer) << " output";
                     invalid = true;
-                } else if (matchingLocation->type != fragmentInput.type) {
-                    fragmentFunction.emitError() << "fragment input #" << fragmentInput.index << " at location "
-                                                 << fragmentInput.location << " has type " << fragmentInput.type
-                                                 << ", but the vertex output has type " << matchingLocation->type;
+                } else if (matchingLocation->type != input.type) {
+                    input.function.emitError()
+                        << stringifyShaderStage(consumer) << " input #" << input.index << " at location "
+                        << input.location << " has type " << input.type << ", but the "
+                        << stringifyShaderStage(producer) << " output has type " << matchingLocation->type;
                     invalid = true;
                 }
             }
-        }
+        };
+        if (entryStages.count(ShaderStage::Vertex) && entryStages.count(ShaderStage::Fragment))
+            validateStageInterface(ShaderStage::Vertex, ShaderStage::Fragment);
 
         if (invalid)
             signalPassFailure();

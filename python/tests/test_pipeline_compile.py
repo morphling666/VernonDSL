@@ -305,7 +305,7 @@ class PipelineCompileTests(unittest.TestCase):
         unpaired = json.loads(json.dumps(records))
         del unpaired["fragment"]["interface"]["arguments"][1]["sampled_texture_bindings"]
         unpaired_fragment = _stage("fragment", b"fragment", unpaired["fragment"]["interface"])
-        with self.assertRaisesRegex(PipelineCompileError, "exactly one sampled texture binding"):
+        with self.assertRaisesRegex(PipelineCompileError, "no reflected sampled texture binding"):
             build_bundle_plan(
                 "pipeline",
                 fragment.target,
@@ -482,12 +482,16 @@ class PipelineCompileTests(unittest.TestCase):
                         {
                             "index": 0,
                             "kind": "tensor",
-                            "type": "!vernon.tensor_view<f32, 1, write>",
+                            "type": "!vernon.tensor_view<f32, 2, write>",
                             "element_layout": _scalar_layout("f32"),
-                            "shape": [0],
+                            "shape": [2, 3],
+                            "element_strides": [4, -1],
+                            "element_offset": 2,
                             "access": "write",
                             "vernon.source_name": "output",
                             "vernon.interface": "resource",
+                            "vernon.set": 0,
+                            "vernon.binding": 0,
                         }
                     ]
                 },
@@ -496,7 +500,13 @@ class PipelineCompileTests(unittest.TestCase):
 
         use = external_parameters(records)["output"][0]
         self.assertEqual(use["interface"], "storage")
+        self.assertEqual(use["element_strides"], [4, -1])
+        self.assertEqual(use["element_offset"], 2)
         self.assertNotIn("physical_value_layout", use)
+
+        del records["compute"]["interface"]["arguments"][0]["vernon.binding"]
+        with self.assertRaisesRegex(PipelineCompileError, "missing reflected set/binding"):
+            external_parameters(records)
 
     def test_parameter_merge_and_slot_layout_are_exact(self) -> None:
         uses = [
@@ -797,6 +807,7 @@ class PipelineCompileTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(PipelineCompileError, "mismatch"):
             validate_graphics_interfaces(
+                "vertex",
                 {
                     "interface": {
                         "results": [
@@ -808,6 +819,7 @@ class PipelineCompileTests(unittest.TestCase):
                         ]
                     }
                 },
+                "fragment",
                 {
                     "interface": {
                         "arguments": [

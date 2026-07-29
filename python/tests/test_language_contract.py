@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 from unittest import mock
 
@@ -23,6 +24,7 @@ from vernon_dsl.frontend.model import (
     StorageEffect,
     StorageEffectKind,
     StorageOwner,
+    StorageOwnerKind,
     StorageRegion,
     StorageRegionKind,
     Termination,
@@ -30,9 +32,30 @@ from vernon_dsl.frontend.model import (
     TypedParameter,
     TypedStatement,
 )
+from vernon_dsl.language.stage_registry import (
+    ENTRY_DECORATOR_STAGES,
+    GRAPHICS_STAGE_ORDER,
+    STAGE_REGISTRY_VERSION,
+    validate_graphics_topology,
+)
+from vernon_dsl.shader_contracts import ATOMIC_OPERATION_NAMES, DEVICE_ONLY_OPERATION_NAMES
 
 
 class LanguageVersionTests(unittest.TestCase):
+    def test_stage_registry_is_versioned_and_canonical(self) -> None:
+        self.assertEqual(STAGE_REGISTRY_VERSION, 2)
+        self.assertEqual(
+            ENTRY_DECORATOR_STAGES,
+            {"kernel": "compute", "vertex": "vertex", "fragment": "fragment"},
+        )
+        self.assertEqual(
+            validate_graphics_topology(GRAPHICS_STAGE_ORDER),
+            ("vertex", "fragment"),
+        )
+        self.assertEqual(validate_graphics_topology(("vertex", "fragment")), ("vertex", "fragment"))
+        with self.assertRaisesRegex(ValueError, "topology order"):
+            validate_graphics_topology(reversed(GRAPHICS_STAGE_ORDER))
+
     def test_v3_vector_and_matrix_aliases_are_removed(self) -> None:
         for name in ("vec", "mat", "vec2", "vec3", "vec4", "mat2", "mat3", "mat4"):
             with self.subTest(name=name):
@@ -368,7 +391,7 @@ class LanguageVersionTests(unittest.TestCase):
             (
                 StorageEffect(
                     StorageEffectKind.READ,
-                    StorageOwner("source"),
+                    StorageOwner(StorageOwnerKind.PARAMETER, "source"),
                     StorageRegion(StorageRegionKind.ELEMENT, (2,)),
                 ),
             ),
@@ -378,7 +401,7 @@ class LanguageVersionTests(unittest.TestCase):
             (
                 StorageEffect(
                     StorageEffectKind.WRITE,
-                    StorageOwner("output"),
+                    StorageOwner(StorageOwnerKind.PARAMETER, "output"),
                     StorageRegion(StorageRegionKind.UNKNOWN),
                 ),
             ),
@@ -388,12 +411,12 @@ class LanguageVersionTests(unittest.TestCase):
             (
                 StorageEffect(
                     StorageEffectKind.READ,
-                    StorageOwner("source"),
+                    StorageOwner(StorageOwnerKind.PARAMETER, "source"),
                     StorageRegion(StorageRegionKind.UNKNOWN),
                 ),
                 StorageEffect(
                     StorageEffectKind.WRITE,
-                    StorageOwner("output"),
+                    StorageOwner(StorageOwnerKind.PARAMETER, "output"),
                     StorageRegion(StorageRegionKind.ELEMENT, (1,)),
                 ),
             ),
@@ -425,6 +448,7 @@ class LanguageVersionTests(unittest.TestCase):
                 {
                     "kind": "read",
                     "owner": "source",
+                    "owner_kind": "parameter",
                     "region": {"kind": "element", "indices": [2]},
                 }
             ],
@@ -459,12 +483,12 @@ class LanguageVersionTests(unittest.TestCase):
             {"kind": "resource_read", "operation": "texture_sample", "owner": "image"},
         )
 
-    def test_atomic_and_barrier_effect_records_are_reserved_and_deterministic(self) -> None:
+    def test_atomic_and_barrier_effect_records_are_deterministic(self) -> None:
         function_source = ast.parse("@kernel\ndef main() -> None:\n    pass\n").body[0]
         assert isinstance(function_source, ast.FunctionDef)
         atomic = AtomicEffect(
             "add",
-            StorageOwner("values"),
+            StorageOwner(StorageOwnerKind.PARAMETER, "values"),
             StorageRegion(StorageRegionKind.ELEMENT, (3,)),
             MemoryOrdering.RELAXED,
             EffectScope.DEVICE,
@@ -495,6 +519,7 @@ class LanguageVersionTests(unittest.TestCase):
                     "kind": "atomic",
                     "operation": "add",
                     "owner": "values",
+                    "owner_kind": "parameter",
                     "region": {"kind": "element", "indices": [3]},
                     "ordering": "relaxed",
                     "scope": "device",
@@ -508,20 +533,165 @@ class LanguageVersionTests(unittest.TestCase):
         )
         self.assertEqual(dump_typed_model((function,)), dump_typed_model((function,)))
 
-    def test_atomic_and_barrier_language_operations_are_explicitly_unsupported(self) -> None:
-        cases = (
-            (
-                "@kernel\ndef bad(values: TensorView[i32, 1, read_write]) -> None:\n    atomic_add(values, 0, 1)\n",
-                "atomic operations are reserved for Phase 6 and are not supported",
-            ),
-            (
-                "@kernel\ndef bad() -> None:\n    barrier()\n",
-                "barrier operations are reserved for Phase 6 and are not supported",
+    def test_synchronization_registry_matches_public_device_only_api(self) -> None:
+        synchronization_operations = ATOMIC_OPERATION_NAMES | {
+            "storage_barrier",
+            "workgroup_array",
+            "workgroup_barrier",
+        }
+        self.assertEqual(
+            ATOMIC_OPERATION_NAMES,
+            {"atomic_add", "atomic_exchange", "atomic_max", "atomic_min"},
+        )
+        self.assertTrue(synchronization_operations <= DEVICE_ONLY_OPERATION_NAMES)
+
+        calls = {
+            **{name: (None, 0, 1) for name in ATOMIC_OPERATION_NAMES},
+            "storage_barrier": (),
+            "workgroup_array": (vd.i32, 4),
+            "workgroup_barrier": (),
+        }
+        for name, arguments in calls.items():
+            with self.subTest(name=name), self.assertRaisesRegex(TypeError, rf"^{name} is device-only"):
+                getattr(vd, name)(*arguments)
+
+    def test_workgroup_storage_atomics_and_barriers_have_typed_effects(self) -> None:
+        source = (
+            "from vernon_dsl import *\n"
+            "@kernel\n"
+            "def main(output: TensorView[i32, 1, write]) -> None:\n"
+            "    signed = workgroup_array(i32, 4)\n"
+            "    unsigned = workgroup_array(u32, 2)\n"
+            "    signed[0] = 4\n"
+            "    unsigned[0] = u32(4)\n"
+            "    workgroup_barrier()\n"
+            "    added = atomic_add(signed, 0, 1)\n"
+            "    minimum = atomic_min(signed, 1, 2)\n"
+            "    maximum = atomic_max(signed, 2, 3)\n"
+            "    exchanged = atomic_exchange(signed, 3, 4)\n"
+            "    unsigned_minimum = atomic_min(unsigned, 0, 2)\n"
+            "    unsigned_maximum = atomic_max(unsigned, 1, 3)\n"
+            "    output[0] = added + minimum + maximum + exchanged\n"
+            "    storage_barrier()\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "synchronization.py"
+            path.write_text(source, encoding="utf-8")
+            result = Compiler().compile_request(FrontendCompileRequest(path, "main"))
+
+        self.assertEqual(result.mlir.count('"vernon.workgroup_alloc"'), 2)
+        self.assertEqual(result.mlir.count('"vernon.workgroup_store"'), 2)
+        self.assertEqual(result.mlir.count('"vernon.atomic"'), 6)
+        for atomic_kind in ("add", "min", "max", "exchange", "umin", "umax"):
+            with self.subTest(atomic_kind=atomic_kind):
+                self.assertEqual(result.mlir.count(f'atomic_kind = "{atomic_kind}"'), 1)
+        atomic_effects = [effect for effect in result.typed_functions[0].effects if isinstance(effect, AtomicEffect)]
+        self.assertTrue(all(effect.owner.kind is StorageOwnerKind.WORKGROUP_LOCAL for effect in atomic_effects))
+        self.assertEqual(
+            Counter((effect.operation, effect.scope) for effect in atomic_effects),
+            Counter(
+                {
+                    ("add", EffectScope.WORKGROUP): 1,
+                    ("min", EffectScope.WORKGROUP): 2,
+                    ("max", EffectScope.WORKGROUP): 2,
+                    ("exchange", EffectScope.WORKGROUP): 1,
+                }
             ),
         )
-        for body, message in cases:
-            with self.subTest(message=message), self.assertRaisesRegex(CompileError, message):
-                compile_source("from vernon_dsl import *\n" + body, "reserved_effect.py")
+        barriers = [effect for effect in result.typed_functions[0].effects if isinstance(effect, BarrierEffect)]
+        self.assertEqual(
+            barriers,
+            [
+                BarrierEffect(MemoryOrdering.ACQUIRE_RELEASE, EffectScope.WORKGROUP),
+                BarrierEffect(MemoryOrdering.ACQUIRE_RELEASE, EffectScope.DEVICE),
+            ],
+        )
+
+    def test_all_storage_tensor_view_atomics_use_device_scope(self) -> None:
+        source = (
+            "from vernon_dsl import *\n"
+            "@kernel\n"
+            "def main(\n"
+            "    signed: TensorView[i32, 1, read_write],\n"
+            "    unsigned: TensorView[u32, 1, read_write],\n"
+            ") -> None:\n"
+            "    added = atomic_add(signed, 0, 1)\n"
+            "    minimum = atomic_min(signed, 1, 2)\n"
+            "    maximum = atomic_max(signed, 2, 3)\n"
+            "    exchanged = atomic_exchange(signed, 3, 4)\n"
+            "    unsigned_minimum = atomic_min(unsigned, 0, 2)\n"
+            "    unsigned_maximum = atomic_max(unsigned, 1, 3)\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "storage_atomic.py"
+            path.write_text(source, encoding="utf-8")
+            result = Compiler().compile_request(FrontendCompileRequest(path, "main"))
+
+        self.assertEqual(result.mlir.count('"vernon.atomic"'), 6)
+        for atomic_kind in ("add", "min", "max", "exchange", "umin", "umax"):
+            with self.subTest(atomic_kind=atomic_kind):
+                self.assertEqual(result.mlir.count(f'atomic_kind = "{atomic_kind}"'), 1)
+        atomic_effects = [effect for effect in result.typed_functions[0].effects if isinstance(effect, AtomicEffect)]
+        self.assertTrue(all(effect.owner.kind is StorageOwnerKind.PARAMETER for effect in atomic_effects))
+        self.assertEqual(
+            Counter((effect.operation, effect.scope) for effect in atomic_effects),
+            Counter(
+                {
+                    ("add", EffectScope.DEVICE): 1,
+                    ("min", EffectScope.DEVICE): 2,
+                    ("max", EffectScope.DEVICE): 2,
+                    ("exchange", EffectScope.DEVICE): 1,
+                }
+            ),
+        )
+
+        for operation in sorted(ATOMIC_OPERATION_NAMES):
+            with (
+                self.subTest(readonly_operation=operation),
+                self.assertRaisesRegex(CompileError, "requires a writable TensorView"),
+            ):
+                compile_source(
+                    "from vernon_dsl import *\n"
+                    "@kernel\n"
+                    "def bad(values: TensorView[i32, 1, read]) -> None:\n"
+                    f"    {operation}(values, 0, 1)\n",
+                    f"readonly_{operation}.py",
+                )
+
+    def test_atomic_prefix_does_not_reserve_helper_names(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def atomic_decoy(value: i32) -> i32:\n"
+            "    return value\n"
+            "@kernel\n"
+            "def main(destination: TensorView[i32, 1, write]) -> None:\n"
+            "    destination[0] = atomic_decoy(7)\n",
+            "atomic_prefix_helper.py",
+        )
+        self.assertIn("func.call @atomic_decoy(", output)
+
+    def test_atomic_owner_must_be_a_named_storage_value(self) -> None:
+        with self.assertRaisesRegex(CompileError, "requires a named storage owner"):
+            compile_source(
+                "from vernon_dsl import *\n"
+                "@kernel\n"
+                "def bad(values: TensorView[i32, 1, read_write]) -> None:\n"
+                "    atomic_add(values if True else values, 0, 1)\n",
+                "atomic_owner_expression.py",
+            )
+
+    def test_workgroup_synchronization_rejects_non_compute_and_invalid_types(self) -> None:
+        with self.assertRaisesRegex(CompileError, "only in compute kernels"):
+            compile_source(
+                "from vernon_dsl import *\n@fragment\ndef bad() -> None:\n    workgroup_barrier()\n",
+                "fragment_barrier.py",
+            )
+        with self.assertRaisesRegex(CompileError, "supports i32 and u32"):
+            compile_source(
+                "from vernon_dsl import *\n@kernel\ndef bad() -> None:\n    values = workgroup_array(f32, 4)\n",
+                "float_workgroup.py",
+            )
 
     def test_pure_helper_rejects_propagated_storage_effects(self) -> None:
         with self.assertRaisesRegex(CompileError, "pure helper 'copy' has Storage effects"):
@@ -715,7 +885,7 @@ class LanguageVersionTests(unittest.TestCase):
         )
         self.assertEqual([value.mlir for value in conditional.operand_types], ["i1", "f32", "f32"])
         self.assertEqual(
-            [(effect.kind.value, effect.owner.parameter) for effect in main.effects],
+            [(effect.kind.value, effect.owner.name) for effect in main.effects],
             [("read", "left"), ("read", "right"), ("write", "output")],
         )
         self.assertEqual(

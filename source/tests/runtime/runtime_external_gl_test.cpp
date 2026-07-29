@@ -6,6 +6,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <filesystem>
@@ -162,12 +163,16 @@ uint32_t makeCurrentCount = 0;
 std::vector<GlUint> deletedBuffers;
 std::vector<GlUint> deletedTextures;
 std::vector<GlUint> deletedSamplers;
+std::vector<GlEnum> shaderKinds;
 std::vector<unsigned char> bufferStorage;
 std::vector<unsigned char> textureStorage;
 
 void makeCurrent(void *) { ++makeCurrentCount; }
 void GL_CALL placeholder() {}
-GlUint GL_CALL createName(GlEnum) { return nextName++; }
+GlUint GL_CALL createName(GlEnum kind) {
+    shaderKinds.push_back(kind);
+    return nextName++;
+}
 GlUint GL_CALL createProgram() { return nextName++; }
 void GL_CALL shaderSource(GlUint, GlSize, const char *const *, const GlInt *) {}
 void GL_CALL getShaderiv(GlUint, GlEnum name, GlInt *value) { *value = name == kCompileStatus ? 1 : 0; }
@@ -775,6 +780,18 @@ TEST(RuntimeExternalGl, RejectsNonCanonicalInternalParameterContracts) {
         nlohmann::json::array({{{"set", 0}, {"binding", 3}}});
     bundleData = serialize(std::move(invalidResolution));
     EXPECT_FALSE(vernonRuntimeLoadPipelineBundleWithOptions(gl, bundleData.data(), bundleData.size(), nullptr));
+
+    nlohmann::json nonzeroSet = nlohmann::json::parse(internalValueBundle());
+    nonzeroSet["variants"][0]["parameters"][0]["uses"][0]["vernon.set"] = 1;
+    nonzeroSet["variants"][0]["internal_parameters"][0]["uses"][0]["sampled_texture_bindings"][0]["set"] = 1;
+    bundleData = serialize(std::move(nonzeroSet));
+    VernonPipelineBundle *bundle =
+        vernonRuntimeLoadPipelineBundleWithOptions(gl, bundleData.data(), bundleData.size(), nullptr);
+    ASSERT_TRUE(bundle);
+    EXPECT_FALSE(vernonRuntimeResolvePipeline(bundle, {nullptr, 0}));
+    const VernonStringView error = vernonRuntimeGetLastError(gl);
+    EXPECT_NE(std::string_view(error.data, error.size).find("descriptor set 0"), std::string_view::npos);
+    vernonRuntimePipelineBundleDestroy(bundle);
 
     ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
 }

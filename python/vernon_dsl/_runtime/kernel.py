@@ -13,6 +13,7 @@ import numpy as np
 
 from ..bundle import TargetOptions, canonical_json
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
+from ..frontend.model import AccessMode, StorageEffect, StorageEffectKind
 from ..types import TypeExpr, _Scalar
 from .execution_graph import (
     ComputeEncoder,
@@ -192,22 +193,26 @@ class Kernel:
         )
 
     @staticmethod
-    def _writable_parameters(function: ast.FunctionDef) -> tuple[str, ...]:
-        parameters = {argument.arg for argument in function.args.args}
-        writable: set[str] = set()
-        for node in ast.walk(function):
-            targets: list[ast.expr] = []
-            if isinstance(node, ast.Assign):
-                targets = list(node.targets)
-            elif isinstance(node, ast.AnnAssign):
-                targets = [node.target]
-            elif isinstance(node, ast.AugAssign):
-                targets = [node.target]
-            for target in targets:
-                while isinstance(target, ast.Subscript):
-                    target = target.value
-                if isinstance(target, ast.Name) and target.id in parameters:
-                    writable.add(target.id)
+    def _writable_parameters(frontend: FrontendCompileResult) -> tuple[str, ...]:
+        entry = next(
+            (function for function in frontend.typed_functions if function.symbol == frontend.request.entry),
+            None,
+        )
+        if entry is None:
+            raise RuntimeError("compiled kernel has no typed entry function")
+        parameter_names = {parameter.name for parameter in entry.parameters}
+        writable = {
+            parameter.name
+            for parameter in entry.parameters
+            if parameter.type.kind == "tensor_view" and parameter.access is not AccessMode.READ
+        }
+        writable.update(
+            effect.owner.name
+            for effect in entry.effects
+            if isinstance(effect, StorageEffect)
+            and effect.kind is StorageEffectKind.WRITE
+            and effect.owner.name in parameter_names
+        )
         return tuple(sorted(writable))
 
     @classmethod
@@ -219,6 +224,12 @@ class Kernel:
             return None
         access = cls._annotation_name(arguments[2])
         return access if access in {"read", "write", "read_write"} else None
+
+    @classmethod
+    def _is_static_tensor_annotation(cls, annotation: ast.expr | None) -> bool:
+        if isinstance(annotation, ast.Subscript) and cls._annotation_name(annotation.value) == "Annotated":
+            annotation = annotation.slice.elts[0] if isinstance(annotation.slice, ast.Tuple) else annotation.slice
+        return isinstance(annotation, ast.Subscript) and cls._annotation_name(annotation.value) == "Tensor"
 
     def _validate_tensor_view_arguments(
         self,
@@ -468,7 +479,7 @@ class Kernel:
                 frontend.mlir,
                 function,
                 builtins,
-                self._writable_parameters(function),
+                self._writable_parameters(frontend),
                 program,
                 self._dependency_hashes(frontend),
             )
@@ -519,15 +530,14 @@ class Kernel:
             static_tensor_names = {
                 argument.arg
                 for argument in compiled.function.args.args
-                if isinstance(argument.annotation, ast.Subscript)
-                and self._annotation_name(argument.annotation.value) == "Tensor"
+                if self._is_static_tensor_annotation(argument.annotation)
             }
             for user_name, parameter, value in zip(user_parameters, compiled.native.parameters, arguments, strict=True):
                 _bind_native_argument(
                     builder,
                     parameter,
                     value,
-                    host_value=user_name in static_tensor_names,
+                    host_value=state._architecture == state.cuda and user_name in static_tensor_names,
                 )
             builder.grid(*grid)
             if encoder is None:

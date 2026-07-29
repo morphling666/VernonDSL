@@ -1,6 +1,6 @@
-FRONTEND_VERSION = 3
+from .stage_registry import ENTRY_DECORATORS
 
-ENTRY_DECORATORS = frozenset({"kernel", "vertex", "fragment"})
+FRONTEND_VERSION = 3
 FUNCTION_DECORATORS = ENTRY_DECORATORS | {"func"}
 INTRINSIC_METHODS = frozenset(
     {

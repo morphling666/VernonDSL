@@ -22,6 +22,7 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonInlineHelpers.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUResources.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUTensors.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerSynchronization.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonValidation.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
@@ -33,75 +34,67 @@ namespace {
 
 struct VerifyVernonCpuLLVMConversionPass final
     : PassWrapper<VerifyVernonCpuLLVMConversionPass, OperationPass<ModuleOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
-      VerifyVernonCpuLLVMConversionPass)
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VerifyVernonCpuLLVMConversionPass)
 
-  StringRef getArgument() const final {
-    return "vernon-verify-cpu-llvm-conversion";
-  }
-  StringRef getDescription() const final {
-    return "Require a fully converted builtin module containing only LLVM IR";
-  }
+    StringRef getArgument() const final { return "vernon-verify-cpu-llvm-conversion"; }
+    StringRef getDescription() const final {
+        return "Require a fully converted builtin module containing only LLVM IR";
+    }
 
-  void runOnOperation() override {
-    WalkResult result = getOperation().walk([&](Operation *operation) {
-      if (isa<ModuleOp>(operation) ||
-          operation->getDialect() ==
-              getContext().getLoadedDialect<LLVM::LLVMDialect>())
-        return WalkResult::advance();
-      operation->emitError()
-          << "CPU pipeline left illegal operation '"
-          << operation->getName().getStringRef() << "' after LLVM conversion";
-      return WalkResult::interrupt();
-    });
-    if (result.wasInterrupted())
-      signalPassFailure();
-  }
+    void runOnOperation() override {
+        WalkResult result = getOperation().walk([&](Operation *operation) {
+            if (isa<ModuleOp>(operation) ||
+                operation->getDialect() == getContext().getLoadedDialect<LLVM::LLVMDialect>())
+                return WalkResult::advance();
+            operation->emitError() << "CPU pipeline left illegal operation '" << operation->getName().getStringRef()
+                                   << "' after LLVM conversion";
+            return WalkResult::interrupt();
+        });
+        if (result.wasInterrupted())
+            signalPassFailure();
+    }
 };
 
 } // namespace
 
 void registerVernonCpuPipelineDialects(DialectRegistry &registry) {
-  registry
-      .insert<arith::ArithDialect, cf::ControlFlowDialect, func::FuncDialect,
-              index::IndexDialect, LLVM::LLVMDialect, math::MathDialect,
-              memref::MemRefDialect, scf::SCFDialect, vector::VectorDialect>();
-  arith::registerConvertArithToLLVMInterface(registry);
-  cf::registerConvertControlFlowToLLVMInterface(registry);
-  registerConvertFuncToLLVMInterface(registry);
-  index::registerConvertIndexToLLVMInterface(registry);
-  registerConvertMathToLLVMInterface(registry);
-  registerConvertMemRefToLLVMInterface(registry);
-  ub::registerConvertUBToLLVMInterface(registry);
-  vector::registerConvertVectorToLLVMInterface(registry);
-  registerConvertToLLVMDependentDialectLoading(registry);
+    registry
+        .insert<arith::ArithDialect, cf::ControlFlowDialect, func::FuncDialect, index::IndexDialect, LLVM::LLVMDialect,
+                math::MathDialect, memref::MemRefDialect, scf::SCFDialect, vector::VectorDialect>();
+    arith::registerConvertArithToLLVMInterface(registry);
+    cf::registerConvertControlFlowToLLVMInterface(registry);
+    registerConvertFuncToLLVMInterface(registry);
+    index::registerConvertIndexToLLVMInterface(registry);
+    registerConvertMathToLLVMInterface(registry);
+    registerConvertMemRefToLLVMInterface(registry);
+    ub::registerConvertUBToLLVMInterface(registry);
+    vector::registerConvertVectorToLLVMInterface(registry);
+    registerConvertToLLVMDependentDialectLoading(registry);
 }
 
 void buildVernonCpuPreparationPipeline(OpPassManager &passManager) {
-  passManager.addPass(createVernonValidatePass());
-  passManager.addPass(createVernonInlineHelpersPass());
+    passManager.addPass(createVernonValidatePass());
+    passManager.addPass(createVernonInlineHelpersPass());
 }
 
 void buildVernonCpuLoweringPipeline(OpPassManager &passManager) {
-  passManager.addPass(createVernonLowerCPUTensorsPass());
-  passManager.addPass(createVernonLowerCPUResourcesPass());
-  passManager.addPass(createSCFToControlFlowPass());
-  passManager.addPass(createConvertToLLVMPass());
-  passManager.addPass(std::make_unique<VerifyVernonCpuLLVMConversionPass>());
+    passManager.addPass(createVernonLowerCPUTensorsPass());
+    passManager.addPass(createVernonLowerSynchronizationPass());
+    passManager.addPass(createVernonLowerCPUResourcesPass());
+    passManager.addPass(createSCFToControlFlowPass());
+    passManager.addPass(createConvertToLLVMPass());
+    passManager.addPass(std::make_unique<VerifyVernonCpuLLVMConversionPass>());
 }
 
 void buildVernonCpuPassPipeline(OpPassManager &passManager) {
-  buildVernonCpuPreparationPipeline(passManager);
-  buildVernonCpuLoweringPipeline(passManager);
+    buildVernonCpuPreparationPipeline(passManager);
+    buildVernonCpuLoweringPipeline(passManager);
 }
 
 void registerVernonCpuPassPipeline() {
-  PassPipelineRegistration<>(
-      "vernon-cpu-pipeline",
-      "Lower a validated Vernon CPU module through standard MLIR to LLVM",
-      [](OpPassManager &passManager) {
-        buildVernonCpuPassPipeline(passManager);
-      });
+    PassPipelineRegistration<>("vernon-cpu-pipeline",
+                               "Lower a validated Vernon CPU module through standard MLIR to LLVM",
+                               [](OpPassManager &passManager) { buildVernonCpuPassPipeline(passManager); });
 }
 
 } // namespace mlir::vernon

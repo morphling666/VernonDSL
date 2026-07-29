@@ -372,7 +372,7 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                 }
             const bool computeProgram = variant.program.size() == 1 && !variant.compute.empty();
             const bool graphicsProgram =
-                variant.program.size() == 2 && !variant.vertex.empty() && !variant.fragment.empty();
+                !variant.vertex.empty() && !variant.fragment.empty() && variant.program.size() == 2;
             if (!computeProgram && !graphicsProgram) {
                 fail(context, "pipeline program stage topology is not supported by this runtime",
                      VERNON_STATUS_UNSUPPORTED_TARGET);

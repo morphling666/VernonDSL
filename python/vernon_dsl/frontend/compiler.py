@@ -6,6 +6,7 @@ from typing import Iterable
 
 from ..diagnostics import CompileError, SourceLocation
 from ..language.ast_utils import dotted_name
+from ..language.stage_registry import ENTRY_DECORATORS, GRAPHICS_STAGES, STAGE_BY_DECORATOR
 from ..module_graph import clear_project_cache, load_project
 from ..struct_methods import normalize_struct_methods
 from .cache import frontend_cache
@@ -146,7 +147,7 @@ class Compiler:
                 (dotted_name(item.func if isinstance(item, ast.Call) else item) or "").split(".")[-1]
                 for item in node.decorator_list
             }
-            if not decorators & {"kernel", "vertex", "fragment"}:
+            if not decorators & ENTRY_DECORATORS:
                 continue
             if node.returns is None:
                 raise context.error(
@@ -277,9 +278,10 @@ class Compiler:
         for decorator in node.decorator_list:
             if isinstance(decorator, (ast.Name, ast.Attribute)):
                 name = (dotted_name(decorator) or "").split(".")[-1]
-                if name in {"vertex", "fragment"}:
+                definition = STAGE_BY_DECORATOR.get(name)
+                if definition is not None and definition.kind in GRAPHICS_STAGES:
                     function_kind = name
-                    stage = name
+                    stage = definition.kind
                 elif name == "kernel":
                     function_kind = "compute"
                     stage = "compute"
@@ -325,7 +327,8 @@ class Compiler:
             if len(node.decorator_list) > 1:
                 raise context.error(decorator, "DSL functions require exactly one function decorator")
         if function_kind is None:
-            raise context.error(node, "DSL functions require @func, @vertex, @fragment, or @kernel")
+            expected = ", ".join(f"@{name}" for name in sorted(ENTRY_DECORATORS))
+            raise context.error(node, f"DSL functions require @func or one of {expected}")
         return stage, workgroup_size
 
 

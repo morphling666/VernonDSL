@@ -145,8 +145,13 @@ VernonStatus invokeCudaComputePipeline(VernonLoadedPipeline &pipeline, const Pla
                 return fail(*pipeline.context, "CUDA prepared storage binding requires an RHI Tensor");
             value.resource = argument.resource;
         } else {
-            if (argument.kind != ComputeLaunchArgumentKind::Scalar || !argument.scalarData || !argument.scalarSize)
-                return fail(*pipeline.context, "CUDA prepared inline binding requires host data");
+            if (argument.kind != ComputeLaunchArgumentKind::Scalar)
+                return fail(*pipeline.context, "CUDA prepared inline binding for argument #" +
+                                                   std::to_string(layout.argument_index) +
+                                                   " received a resource value");
+            if (!argument.scalarData || !argument.scalarSize)
+                return fail(*pipeline.context, "CUDA prepared inline binding for argument #" +
+                                                   std::to_string(layout.argument_index) + " has no packed host data");
             value.inline_data = argument.scalarData;
             value.inline_size = argument.scalarSize;
         }

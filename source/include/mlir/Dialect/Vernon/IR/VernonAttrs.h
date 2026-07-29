@@ -33,15 +33,16 @@ namespace mlir::vernon {
 /// schema introduces no Vernon-specific vector or matrix type.
 inline constexpr llvm::StringLiteral kEntryAttrName = "vernon.entry";
 inline constexpr llvm::StringLiteral kStageAttrName = "vernon.stage";
-inline constexpr llvm::StringLiteral kWorkgroupSizeAttrName =
-    "vernon.workgroup_size";
+inline constexpr llvm::StringLiteral kWorkgroupSizeAttrName = "vernon.workgroup_size";
 inline constexpr llvm::StringLiteral kInterfaceAttrName = "vernon.interface";
 inline constexpr llvm::StringLiteral kLocationAttrName = "vernon.location";
 inline constexpr llvm::StringLiteral kBuiltinAttrName = "vernon.builtin";
 inline constexpr llvm::StringLiteral kDescriptorSetAttrName = "vernon.set";
 inline constexpr llvm::StringLiteral kBindingAttrName = "vernon.binding";
-inline constexpr llvm::StringLiteral kInstanceDivisorAttrName =
-    "vernon.instance_divisor";
+inline constexpr llvm::StringLiteral kInstanceDivisorAttrName = "vernon.instance_divisor";
+inline constexpr llvm::StringLiteral kTensorShapeAttrName = "vernon.tensor_shape";
+inline constexpr llvm::StringLiteral kTensorStridesAttrName = "vernon.tensor_strides";
+inline constexpr llvm::StringLiteral kTensorOffsetAttrName = "vernon.tensor_offset";
 
 enum class ShaderStage { Vertex, Fragment, Compute };
 enum class InterfaceKind { Input, Output, Uniform, Resource };
@@ -54,14 +55,14 @@ FailureOr<InterfaceKind> parseInterfaceKind(Attribute attr);
 /// Parsed views keep the original attributes so validation can distinguish a
 /// missing attribute from an attribute with the wrong storage type.
 struct InterfaceAttrs {
-  Attribute kind;
-  Attribute location;
-  Attribute builtin;
-  Attribute descriptorSet;
-  Attribute binding;
-  Attribute instanceDivisor;
+    Attribute kind;
+    Attribute location;
+    Attribute builtin;
+    Attribute descriptorSet;
+    Attribute binding;
+    Attribute instanceDivisor;
 
-  bool empty() const;
+    bool empty() const;
 };
 
 InterfaceAttrs parseInterfaceAttrs(DictionaryAttr attrs);

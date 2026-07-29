@@ -189,6 +189,41 @@ TEST(PipelineManifestRequirements, ParsesReflectedUniformTensorLayout) {
     EXPECT_TRUE(variant.parameters[0].elementLayout.leaves[0].path.empty());
 }
 
+TEST(PipelineManifestRequirements, RejectsAmbiguousOrUnresolvedResourceBindings) {
+    const auto texture = [](uint32_t slot, const char *name, uint32_t binding) {
+        return nlohmann::json{{"slot", slot},
+                              {"name", name},
+                              {"kind", "texture"},
+                              {"access", "read"},
+                              {"dimension", "2d"},
+                              {"uses", nlohmann::json::array({{{"stage", "fragment"},
+                                                               {"interface", "resource"},
+                                                               {"vernon.set", 0},
+                                                               {"vernon.binding", binding}}})}};
+    };
+    nlohmann::json manifest = {{"key", nlohmann::json::array()},
+                               {"program", {{"vertex", "vertex"}, {"fragment", "fragment"}}},
+                               {"parameters", nlohmann::json::array({texture(0, "left", 3), texture(1, "right", 3)})}};
+    vernon::runtime::Variant variant;
+    std::string error;
+    EXPECT_FALSE(vernon::runtime::parseVariant(manifest, variant, error));
+    EXPECT_EQ(error, "pipeline descriptor binding is assigned to multiple parameters");
+
+    manifest["parameters"] = nlohmann::json::array(
+        {{{"slot", 0},
+          {"name", "sampler"},
+          {"kind", "sampler"},
+          {"access", "read"},
+          {"uses", nlohmann::json::array(
+                       {{{"stage", "fragment"},
+                         {"interface", "resource"},
+                         {"sampled_texture_bindings", nlohmann::json::array({{{"set", 0}, {"binding", 3}}})}}})}}});
+    variant = {};
+    error.clear();
+    EXPECT_FALSE(vernon::runtime::parseVariant(manifest, variant, error));
+    EXPECT_EQ(error, "sampler references an unknown sampled texture binding");
+}
+
 TEST(PipelineManifestRequirements, ParsesStructuredLeafPathsAndStaticShapes) {
     const nlohmann::json layout = {
         {"logical_type", "!vernon.struct<\"Payload\">"},

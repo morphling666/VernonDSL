@@ -9,6 +9,7 @@
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCUDAMath.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUTensors.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerSynchronization.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonToGPU.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Pass/Pass.h"
@@ -46,6 +47,7 @@ bool compileCuda(PreparedModule &prepared, std::vector<Artifact> &artifacts, std
     mlir::PassManager passManager(&context);
     passManager.addPass(mlir::vernon::createVernonToGPUPass());
     passManager.addPass(std::make_unique<KeepGpuModulesPass>());
+    passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerSynchronizationPass(true));
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerGPUTensorsPass());
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::createConvertElementwiseToLinalgPass());
     mlir::bufferization::OneShotBufferizePassOptions bufferizationOptions;

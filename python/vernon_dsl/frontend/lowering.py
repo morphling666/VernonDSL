@@ -3,8 +3,9 @@ from __future__ import annotations
 import ast
 from typing import Iterable
 
+from ..language.stage_registry import GRAPHICS_STAGES
 from ..language.syntax import INTRINSIC_METHODS
-from ..shader_contracts import BUILTIN_CONTRACTS, GENERATED_INTERFACE_CONTRACTS, TypeContract
+from ..shader_contracts import ATOMIC_OPERATION_NAMES, BUILTIN_CONTRACTS, GENERATED_INTERFACE_CONTRACTS, TypeContract
 from .abi import attribute_layout, value_abi_layout
 from .aggregate_lowering import lower_aggregate_constructor, lower_tuple
 from .control_flow_lowering import (
@@ -20,6 +21,7 @@ from .lowering_types import DslType, FunctionSignature, ModuleContext, Value, el
 from .model import (
     ConcreteType,
     StorageEffect,
+    StorageOwnerKind,
     StorageRegionKind,
     TypedExpression,
     TypedFunctionInstance,
@@ -27,7 +29,7 @@ from .model import (
 )
 from .numeric_lowering import lower_binary, lower_compare, lower_constant, lower_unary
 from .resource_lowering import lower_texture_sample, lower_texture_size
-from .storage_lowering import lower_tensor_view_index, lower_tensor_view_store
+from .storage_lowering import lower_buffer_index, lower_storage_store, lower_tensor_view_index
 from .type_parser import AnnotatedType, Metadata
 from .type_solver import can_convert
 
@@ -100,12 +102,16 @@ class _FunctionEmitter:
         if contract is None:
             raise self.context.error(self.node, f"{label} uses unknown builtin '{builtin}'")
         expected_type = _dsl_type_from_contract(contract.type)
-        if self.stage != contract.stage or direction != contract.direction:
+        if not contract.supports(self.stage or "", direction):
+            allowed = sorted(contract.uses)
+            requirement = (
+                f"a {allowed[0][0]} {allowed[0][1]}"
+                if len(allowed) == 1
+                else "one of [" + ", ".join(f"{stage} {use_direction}" for stage, use_direction in allowed) + "]"
+            )
             raise self.context.error(
                 self.node,
-                f"builtin '{builtin}' requires a {contract.stage} "
-                f"{contract.direction}, but {label} is a "
-                f"{self.stage or 'non-entry'} {direction}",
+                f"builtin '{builtin}' requires {requirement}, but {label} is a {self.stage or 'non-entry'} {direction}",
             )
         if value_type != expected_type:
             raise self.context.error(
@@ -121,11 +127,7 @@ class _FunctionEmitter:
             self._validate_builtin_contract(builtins[0], annotation.type, direction, label)
 
     def _entry_result_fields(self) -> tuple[tuple[str, AnnotatedType], ...] | None:
-        if (
-            self.stage not in {"vertex", "fragment"}
-            or self.signature.result is None
-            or self.signature.result.kind != "struct"
-        ):
+        if self.stage not in GRAPHICS_STAGES or self.signature.result is None or self.signature.result.kind != "struct":
             return None
         fields = self.context.structs[self.signature.result.name]
         planned: list[tuple[str, AnnotatedType]] = []
@@ -143,7 +145,7 @@ class _FunctionEmitter:
             if builtin_values:
                 builtin = builtin_values[0]
                 if builtin in builtins:
-                    raise self.context.error(self.node, f"vertex output builtin '{builtin}' is used more than once")
+                    raise self.context.error(self.node, f"shader output builtin '{builtin}' is used more than once")
                 builtins.add(builtin)
                 planned.append((field_name, annotation))
                 continue
@@ -161,7 +163,7 @@ class _FunctionEmitter:
     def emit(self) -> list[str]:
         emit_value_abi_metadata = self.stage is not None or self.node.name in self.context.shared_functions
         argument_locations: dict[int, int] = {}
-        if self.stage in {"vertex", "fragment"}:
+        if self.stage in GRAPHICS_STAGES:
             candidates: list[tuple[int, AnnotatedType, int, int | None]] = []
 
             def struct_fields(name: str) -> tuple[tuple[str, ConcreteType], ...]:
@@ -268,6 +270,16 @@ class _FunctionEmitter:
                 attributes.append('vernon.interface = "resource"')
                 if not has_explicit_binding:
                     attributes.extend(("vernon.set = 0 : i64", f"vernon.binding = {index} : i64"))
+                if view_layout is not None:
+                    shape = ", ".join(str(extent) for extent in view_layout.shape)
+                    strides = ", ".join(str(stride) for stride in view_layout.strides)
+                    attributes.extend(
+                        (
+                            f"vernon.tensor_shape = array<i64: {shape}>",
+                            f"vernon.tensor_strides = array<i64: {strides}>",
+                            f"vernon.tensor_offset = {view_layout.offset} : i64",
+                        )
+                    )
             suffix = f" {{{', '.join(attributes)}}}" if attributes else ""
             arguments.append(f"{value.name}: {value.abi_type.mlir}{suffix}")
         self._append_generated_arguments(arguments)
@@ -307,11 +319,11 @@ class _FunctionEmitter:
             function_attributes.append(f'vernon.stage = "{self.stage}"')
             reflected_effects: list[str] = []
             for effect in self.typed_function.effects:
-                if not isinstance(effect, StorageEffect):
+                if not isinstance(effect, StorageEffect) or effect.owner.kind is not StorageOwnerKind.PARAMETER:
                     continue
                 fields = [
                     f'kind = "{effect.kind.value}"',
-                    f'owner = "{effect.owner.parameter}"',
+                    f'owner = "{effect.owner.name}"',
                     f'region = "{effect.region.kind.value}"',
                 ]
                 if effect.region.kind is StorageRegionKind.ELEMENT:
@@ -491,7 +503,7 @@ class _FunctionEmitter:
             return
         if isinstance(node, ast.Assign):
             if len(node.targets) == 1 and isinstance(node.targets[0], ast.Subscript):
-                lower_tensor_view_store(self, node.targets[0], self._expression(node.value))
+                lower_storage_store(self, node.targets[0], self._expression(node.value))
                 return
             if len(node.targets) == 1 and isinstance(node.targets[0], (ast.Tuple, ast.List)):
                 self._destructure(node.targets[0], self._expression(node.value))
@@ -535,7 +547,7 @@ class _FunctionEmitter:
                 self.environment[node.target.id] = value
                 return
             if isinstance(node.target, ast.Subscript):
-                lower_tensor_view_store(self, node.target, value)
+                lower_storage_store(self, node.target, value)
                 return
             raise self.context.error(node, "augmented assignment requires a local name or indexed value")
         if isinstance(node, ast.AnnAssign):
@@ -713,6 +725,18 @@ class _FunctionEmitter:
             raise self.context.error(node, "function calls do not support keyword arguments")
         typed_call = self._typed_expression(node)
         name = typed_call.operation or ""
+        if name == "workgroup_array":
+            if self.stage != "compute":
+                raise self.context.error(node, "workgroup storage is supported only in compute kernels")
+            result = self._fresh()
+            self._line(f'{result} = "vernon.workgroup_alloc"() : () -> {typed_call.type.mlir}')
+            return Value(result, typed_call.type)
+        if name in {"workgroup_barrier", "storage_barrier"}:
+            if self.stage != "compute":
+                raise self.context.error(node, "barriers are supported only in compute kernels")
+            scope = "workgroup" if name == "workgroup_barrier" else "device"
+            self._line(f'"vernon.barrier"() {{ordering = "acquire_release", scope = "{scope}"}} : () -> ()')
+            return Value("", typed_call.type)
         if name in {"Tensor", "Vector", "Matrix"}:
             return lower_aggregate_constructor(self, node, name)
         if name == "Tuple":
@@ -731,6 +755,29 @@ class _FunctionEmitter:
             ]
         else:
             arguments = [self._expression(argument) for argument in node.args]
+        if name in ATOMIC_OPERATION_NAMES:
+            if self.stage != "compute" or len(arguments) != 3:
+                raise self.context.error(node, f"{name} requires compute storage, index, and value")
+            storage, index, value = arguments
+            if storage.type.kind not in {"workgroup", "tensor_view"}:
+                raise self.context.error(node.args[0], f"{name} requires workgroup storage or a writable TensorView")
+            if storage.type.kind == "tensor_view" and storage.type.arguments[2] == "read":
+                raise self.context.error(node.args[0], f"{name} requires a writable TensorView")
+            index = lower_buffer_index(self, node.args[1])
+            element = storage.type.arguments[0]
+            assert isinstance(element, DslType)
+            value = self._coerce_implicit(node.args[2], value, element)
+            result = self._fresh()
+            atomic_kind = name.removeprefix("atomic_")
+            if atomic_kind in {"min", "max"} and element.name == "u32":
+                atomic_kind = f"u{atomic_kind}"
+            scope = "device" if storage.type.kind == "tensor_view" else "workgroup"
+            self._line(
+                f'{result} = "vernon.atomic"({storage.name}, {index.name}, {value.name}) '
+                f'{{atomic_kind = "{atomic_kind}", ordering = "relaxed", scope = "{scope}"}} '
+                f": ({storage.type.mlir}, index, {element.mlir}) -> {element.mlir}"
+            )
+            return Value(result, element)
         if (
             isinstance(node.func, ast.Attribute)
             and name in INTRINSIC_METHODS
@@ -1008,8 +1055,18 @@ class _FunctionEmitter:
                 f'{{name = "tensor_view_load"}} : ({value.abi_type.mlir}, index) -> {element.mlir}'
             )
             return Value(result, element)
+        if value.type.kind == "workgroup":
+            index = lower_buffer_index(self, node.slice)
+            element = value.type.arguments[0]
+            assert isinstance(element, DslType)
+            result = self._fresh()
+            self._line(
+                f'{result} = "vernon.workgroup_load"({value.name}, {index.name}) '
+                f": ({value.type.mlir}, index) -> {element.mlir}"
+            )
+            return Value(result, element)
         if value.type.kind != "tensor":
-            raise self.context.error(node, "indexing requires a Tensor or TensorView value")
+            raise self.context.error(node, "indexing requires a Tensor or Storage value")
         indices = list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
         if len(indices) != len(value.type.arguments) - 1:
             raise self.context.error(node, "tensor.extract requires one index per tensor dimension")

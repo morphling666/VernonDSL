@@ -8,6 +8,10 @@
 #include "compiler_spirv.h"
 #include "compiler_spirv_cross.h"
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonValueAbi.h"
+
 #include <cstring>
 #include <string>
 
@@ -16,6 +20,72 @@ namespace {
 
 std::string copyStringView(VernonStringView value) {
     return value.data && value.size ? std::string(value.data, value.size) : std::string();
+}
+
+bool validateTargetCapabilities(PreparedModule &prepared, VernonTarget target, std::string &diagnostics) {
+    mlir::OwningOpRef<mlir::ModuleOp> module = prepared.clone();
+    bool usesDeviceAtomics = false;
+    module->walk([&](mlir::vernon::AtomicOp atomic) { usesDeviceAtomics |= atomic.getScope() == "device"; });
+    if (usesDeviceAtomics && target != VERNON_TARGET_CPU && target != VERNON_TARGET_CUDA &&
+        target != VERNON_TARGET_VULKAN) {
+        diagnostics = "device-scope storage TensorView atomics are supported only by CPU, CUDA, and Vulkan targets";
+        return false;
+    }
+    if (target != VERNON_TARGET_CPU && target != VERNON_TARGET_CUDA)
+        return true;
+    if (target == VERNON_TARGET_CPU) {
+        bool invalid = false;
+        module->walk([&](mlir::Operation *operation) {
+            if (invalid ||
+                !mlir::isa<mlir::vernon::WorkgroupAllocOp, mlir::vernon::AtomicOp, mlir::vernon::BarrierOp>(operation))
+                return;
+            if (auto atomic = mlir::dyn_cast<mlir::vernon::AtomicOp>(operation);
+                atomic && atomic.getScope() == "device")
+                return;
+            mlir::func::FuncOp function = operation->getParentOfType<mlir::func::FuncOp>();
+            auto size = function ? function->getAttrOfType<mlir::DenseI32ArrayAttr>("vernon.workgroup_size") : nullptr;
+            if (!size || size.size() != 3 || size[0] != 1 || size[1] != 1 || size[2] != 1)
+                invalid = true;
+        });
+        if (invalid)
+            diagnostics =
+                "CPU reference synchronization requires workgroup_size=(1, 1, 1); use a GPU target for cooperative "
+                "workgroups";
+        return !invalid;
+    }
+    for (mlir::func::FuncOp function : module->getOps<mlir::func::FuncOp>()) {
+        auto entry = function->getAttrOfType<mlir::UnitAttr>("vernon.entry");
+        if (!entry)
+            continue;
+        auto stage = function->getAttrOfType<mlir::StringAttr>("vernon.stage");
+        if (!stage || stage.getValue() != "compute") {
+            diagnostics = "CUDA target capability rejects non-compute entry '" + function.getSymName().str() + "'";
+            return false;
+        }
+        for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+            if (function.getArgAttrDict(index).get("vernon.builtin"))
+                continue;
+            mlir::FailureOr<mlir::vernon::PhysicalValueAbiPlan> plan = mlir::vernon::getPhysicalValueAbiPlan(
+                function.getArgumentTypes()[index], *module, mlir::vernon::PhysicalAbiProfile::CudaKernelParameter);
+            if (mlir::failed(plan)) {
+                diagnostics = "CUDA target capability cannot plan compute argument #" + std::to_string(index);
+                return false;
+            }
+            const auto *unsupported = std::get_if<mlir::vernon::UnsupportedPhysicalValueAbi>(&*plan);
+            if (!unsupported)
+                continue;
+            diagnostics = "CUDA target capability '" + unsupported->reason + "' rejects compute argument #" +
+                          std::to_string(index);
+            return false;
+        }
+    }
+    bool deviceBarrier = false;
+    module->walk([&](mlir::vernon::BarrierOp barrier) { deviceBarrier |= barrier.getScope() == "device"; });
+    if (deviceBarrier) {
+        diagnostics = "CUDA target capability rejects device-scope barriers; use workgroup_barrier";
+        return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -98,6 +168,10 @@ VernonStatus compileTarget(PreparedModule &module, VernonTarget target, const Co
                            std::vector<Artifact> &artifacts, std::string &reflection, std::string &diagnostics,
                            CpuExecutionStatePtr &cpuExecution) {
     diagnostics.clear();
+    if (!validateTargetCapabilities(module, target, diagnostics)) {
+        artifacts.clear();
+        return VERNON_STATUS_UNSUPPORTED_TARGET;
+    }
     if (target == VERNON_TARGET_CPU) {
         if (!compileCpu(module, options.cpu, artifacts, reflection, diagnostics, cpuExecution)) {
             artifacts.clear();

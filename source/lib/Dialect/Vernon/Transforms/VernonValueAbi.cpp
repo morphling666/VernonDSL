@@ -68,6 +68,108 @@ void prependPath(ValueAbiLeaf &leaf, ArrayRef<ValueAbiPathComponent> prefix) {
 
 FailureOr<PlannedLayout> planValue(Type type, ModuleOp module, SmallVectorImpl<StringRef> &activeStructs);
 
+FailureOr<PhysicalValueAbiLayout> planCudaValue(Type type, ModuleOp module, SmallVectorImpl<StringRef> &activeStructs) {
+    if (type.isIndex())
+        return PhysicalValueAbiLayout{8, 8, {}, {0}};
+    if (type.isIntOrFloat()) {
+        const uint64_t size = std::max<uint64_t>(type.getIntOrFloatBitWidth() / 8, 1);
+        return PhysicalValueAbiLayout{size, size, {}, {0}};
+    }
+
+    Type tensorElement;
+    ArrayRef<int64_t> tensorShape;
+    bool registerTensor = false;
+    if (auto tensor = dyn_cast<RankedTensorType>(type)) {
+        if (!tensor.hasStaticShape() || !tensor.getElementType().isIntOrFloat())
+            return failure();
+        tensorElement = tensor.getElementType();
+        tensorShape = tensor.getShape();
+        registerTensor = tensor.getNumElements() <= 16;
+    } else if (auto tensor = dyn_cast<TensorType>(type)) {
+        tensorElement = tensor.getElementType();
+        tensorShape = tensor.getShape();
+    } else if (auto vector = dyn_cast<VectorType>(type)) {
+        tensorElement = vector.getElementType();
+        tensorShape = vector.getShape();
+        registerTensor = true;
+    }
+    if (tensorElement) {
+        FailureOr<PhysicalValueAbiLayout> element = planCudaValue(tensorElement, module, activeStructs);
+        if (failed(element))
+            return failure();
+        FailureOr<SmallVector<uint64_t>> strides =
+            rowMajorStrides(tensorShape, llvm::alignTo(element->size, element->alignment));
+        if (failed(strides))
+            return failure();
+        uint64_t count = 1;
+        for (int64_t extent : tensorShape) {
+            if (extent <= 0)
+                return failure();
+            FailureOr<uint64_t> next = checkedMultiply(count, static_cast<uint64_t>(extent));
+            if (failed(next))
+                return failure();
+            count = *next;
+        }
+        FailureOr<uint64_t> size = checkedMultiply(llvm::alignTo(element->size, element->alignment), count);
+        if (failed(size))
+            return failure();
+        uint64_t alignment = element->alignment;
+        if (registerTensor && count > 1) {
+            alignment = element->size;
+            while (alignment < *size && alignment < 16)
+                alignment *= 2;
+            alignment = std::min<uint64_t>(alignment, 16);
+        }
+        return PhysicalValueAbiLayout{*size, alignment, std::move(*strides), std::move(element->elementLeafOffsets)};
+    }
+
+    SmallVector<Type> fields;
+    std::optional<StringRef> activeName;
+    if (auto tuple = dyn_cast<TupleType>(type)) {
+        fields.append(tuple.getTypes().begin(), tuple.getTypes().end());
+    } else if (auto structure = dyn_cast<StructType>(type)) {
+        if (llvm::is_contained(activeStructs, structure.getName()))
+            return failure();
+        FailureOr<ResolvedStructFields> resolved = resolveNamedStructFields(structure, module);
+        if (failed(resolved))
+            return failure();
+        activeStructs.push_back(structure.getName());
+        activeName = structure.getName();
+        for (const ResolvedStructField &field : resolved->fields)
+            fields.push_back(field.type);
+    } else {
+        return failure();
+    }
+
+    uint64_t size = 0;
+    uint64_t alignment = 1;
+    SmallVector<uint64_t> leafOffsets;
+    for (Type field : fields) {
+        FailureOr<PhysicalValueAbiLayout> child = planCudaValue(field, module, activeStructs);
+        if (failed(child)) {
+            if (activeName)
+                activeStructs.pop_back();
+            return failure();
+        }
+        FailureOr<uint64_t> offset = checkedAlign(size, child->alignment);
+        if (failed(offset) || child->size > std::numeric_limits<uint64_t>::max() - *offset) {
+            if (activeName)
+                activeStructs.pop_back();
+            return failure();
+        }
+        for (uint64_t leafOffset : child->elementLeafOffsets)
+            leafOffsets.push_back(*offset + leafOffset);
+        size = *offset + child->size;
+        alignment = std::max(alignment, child->alignment);
+    }
+    if (activeName)
+        activeStructs.pop_back();
+    FailureOr<uint64_t> finalSize = checkedAlign(size, alignment);
+    if (failed(finalSize))
+        return failure();
+    return PhysicalValueAbiLayout{*finalSize, alignment, {}, std::move(leafOffsets)};
+}
+
 FailureOr<PlannedLayout> planProduct(ArrayRef<ResolvedStructField> fields, StringRef kind, ModuleOp module,
                                      SmallVectorImpl<StringRef> &activeStructs) {
     PlannedLayout result;
@@ -313,14 +415,8 @@ FailureOr<PhysicalValueAbiLayout> planPhysicalBytes(Type type, ModuleOp module, 
     }
 
     if (profile == PhysicalAbiProfile::CudaKernelParameter) {
-        if (type.isIndex())
-            return PhysicalValueAbiLayout{8, 8};
-        if (!type.isIntOrFloat())
-            return failure();
-        FailureOr<ValueAbiLayout> logical = getValueAbiLayout(type, module);
-        if (failed(logical))
-            return failure();
-        return PhysicalValueAbiLayout{logical->size, logical->alignment};
+        SmallVector<StringRef> activeStructs;
+        return planCudaValue(type, module, activeStructs);
     }
 
     if (profile == PhysicalAbiProfile::OpenGLNativeUniform) {
@@ -454,8 +550,6 @@ FailureOr<PhysicalValueAbiPlan> getPhysicalValueAbiPlan(Type type, ModuleOp modu
             return PhysicalValueAbiPlan{PhysicalResourceAbiLayout{PhysicalResourceAbiKind::GraphicsSampler}};
         return PhysicalValueAbiPlan{UnsupportedPhysicalValueAbi{"sampler_argument"}};
     }
-    if (profile == PhysicalAbiProfile::CudaKernelParameter && isa<RankedTensorType, TensorType>(type))
-        return PhysicalValueAbiPlan{UnsupportedPhysicalValueAbi{"static_tensor_by_value"}};
     FailureOr<PhysicalValueAbiLayout> bytes = planPhysicalBytes(type, module, profile);
     if (failed(bytes))
         return failure();

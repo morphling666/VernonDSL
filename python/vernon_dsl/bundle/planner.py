@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
+from ..language.stage_registry import (
+    GRAPHICS_STAGES,
+    STAGE_BY_KIND,
+    validate_graphics_topology,
+    validate_stage_target,
+)
 from .parameters import (
     assign_parameter_slots,
     external_parameters,
@@ -34,12 +40,21 @@ def plan_variant(
     records: Mapping[str, Mapping[str, Any]],
     slots: Mapping[str, int],
 ) -> VariantPlan:
-    if ("compute" in records) == ("vertex" in records or "fragment" in records):
+    graphics = tuple(
+        sorted(
+            (stage for stage in records if stage in GRAPHICS_STAGES),
+            key=lambda stage: STAGE_BY_KIND[stage].graphics_order,
+        )
+    )
+    if ("compute" in records) == bool(graphics):
         raise PipelineCompileError("pipeline variant must contain either one compute program or one graphics program")
-    if "vertex" in records or "fragment" in records:
-        if not {"vertex", "fragment"}.issubset(records):
-            raise PipelineCompileError("graphics variants require vertex and fragment stages")
-        validate_graphics_interfaces(records["vertex"], records["fragment"])
+    if graphics:
+        try:
+            validate_graphics_topology(graphics)
+        except ValueError as error:
+            raise PipelineCompileError(str(error)) from None
+        for producer, consumer in zip(graphics, graphics[1:]):
+            validate_graphics_interfaces(producer, records[producer], consumer, records[consumer])
     external = external_parameters(records)
     internal = internal_parameters(records)
     parameters = []
@@ -70,6 +85,11 @@ def build_bundle_plan(
         plan_variant(key, records, slots) for (key, _), records in zip(variants, records_by_variant, strict=True)
     )
     unique_stages = {stage.id: stage for _, stages in variants for stage in stages.values()}
+    for stage in unique_stages.values():
+        try:
+            validate_stage_target(stage.stage, target.target)
+        except ValueError as error:
+            raise PipelineCompileError(str(error)) from None
     return BundlePlan(
         pipeline_id,
         target,

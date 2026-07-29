@@ -56,11 +56,31 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
         ParameterUse use;
         use.stage = "compute";
         use.index = static_cast<uint32_t>(reflectedIndex);
-        use.interfaceKind = reflectedKind == "tensor"                                  ? "storage"
-                            : reflectedKind == "texture" || reflectedKind == "sampler" ? "resource"
-                                                                                       : "value";
+        const std::string &physicalKind = reflection.arguments[reflectedIndex].kind;
+        use.interfaceKind = physicalKind == "tensor"                                 ? "storage"
+                            : physicalKind == "texture" || physicalKind == "sampler" ? "resource"
+                                                                                     : "value";
         use.dtype = argument.value("dtype", std::string());
         use.shape = parameter.shape;
+        if (argument.contains("element_strides") || argument.contains("element_offset")) {
+            if (!argument.contains("element_strides") || !argument["element_strides"].is_array() ||
+                !argument.contains("element_offset") || !argument["element_offset"].is_number_unsigned()) {
+                error = "TensorView reflection has invalid specialization metadata";
+                return false;
+            }
+            for (const auto &stride : argument["element_strides"]) {
+                if (!stride.is_number_integer()) {
+                    error = "TensorView reflection element strides must be signed integers";
+                    return false;
+                }
+                use.elementStrides.push_back(stride.get<int64_t>());
+            }
+            if (use.elementStrides.size() != use.shape.size()) {
+                error = "TensorView reflection specialization rank does not match shape";
+                return false;
+            }
+            use.elementOffset = argument["element_offset"].get<uint64_t>();
+        }
         use.descriptorSet = argument.value("vernon.set", uint32_t{0});
         use.binding =
             argument.value("vernon.binding", argument.value("binding", static_cast<uint32_t>(reflectedIndex)));
@@ -85,6 +105,13 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
             layout.size = (*physical)["size"].get<uint64_t>();
             layout.alignment = (*physical)["alignment"].get<uint64_t>();
             layout.byteStrides = (*physical)["byte_strides"].get<std::vector<uint64_t>>();
+            if (physical->contains("element_leaf_offsets")) {
+                if (!(*physical)["element_leaf_offsets"].is_array()) {
+                    error = "compute value reflection has invalid element leaf offsets";
+                    return false;
+                }
+                layout.elementLeafOffsets = (*physical)["element_leaf_offsets"].get<std::vector<uint64_t>>();
+            }
             if (layout.byteStrides.size() != parameter.shape.size()) {
                 error = "compute value physical stride rank does not match its logical shape";
                 return false;

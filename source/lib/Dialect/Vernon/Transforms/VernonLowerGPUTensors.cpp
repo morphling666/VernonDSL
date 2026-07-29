@@ -630,6 +630,25 @@ struct VernonLowerGPUTensorsPass final : PassWrapper<VernonLowerGPUTensorsPass, 
 
         TypeConverter converter;
         llvm::StringMap<SmallVector<Type>> structFields;
+        if (auto definitions = getOperation()->getAttrOfType<ArrayAttr>("vernon.struct_definitions"))
+            for (Attribute definitionAttribute : definitions) {
+                auto definition = dyn_cast<DictionaryAttr>(definitionAttribute);
+                auto name = definition ? definition.getAs<StringAttr>("name") : nullptr;
+                auto fields = definition ? definition.getAs<ArrayAttr>("fields") : nullptr;
+                if (!name || !fields)
+                    continue;
+                SmallVector<Type> fieldTypes;
+                for (Attribute fieldAttribute : fields) {
+                    auto field = dyn_cast<TypeAttr>(fieldAttribute);
+                    if (!field) {
+                        fieldTypes.clear();
+                        break;
+                    }
+                    fieldTypes.push_back(field.getValue());
+                }
+                if (fieldTypes.size() == fields.size())
+                    structFields[name.getValue()] = std::move(fieldTypes);
+            }
         getOperation().walk([&](StructCreateOp create) {
             auto structure = dyn_cast<StructType>(create.getResult().getType());
             if (!structure)

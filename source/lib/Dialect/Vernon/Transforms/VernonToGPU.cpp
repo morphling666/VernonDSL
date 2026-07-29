@@ -225,6 +225,27 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
         OpBuilder topBuilder(module.getContext());
         topBuilder.setInsertionPointToEnd(module.getBody());
         auto gpuModule = gpu::GPUModuleOp::create(topBuilder, module.getLoc(), "vernon_kernels");
+        SmallVector<Attribute> reflectedStructs;
+        for (StructDeclOp declaration : module.getOps<StructDeclOp>()) {
+            SmallVector<Attribute> fields;
+            for (Attribute fieldAttribute : declaration.getFields()) {
+                StringRef spelling = cast<StringAttr>(fieldAttribute).getValue();
+                const size_t separator = spelling.find(':');
+                Type fieldType = separator == StringRef::npos
+                                     ? Type{}
+                                     : parseType(spelling.drop_front(separator + 1), module.getContext());
+                if (!fieldType) {
+                    declaration.emitError("cannot preserve struct field types for GPU lowering");
+                    return signalPassFailure();
+                }
+                fields.push_back(TypeAttr::get(fieldType));
+            }
+            reflectedStructs.push_back(DictionaryAttr::get(
+                module.getContext(),
+                {topBuilder.getNamedAttr("name", topBuilder.getStringAttr(declaration.getSymName())),
+                 topBuilder.getNamedAttr("fields", topBuilder.getArrayAttr(fields))}));
+        }
+        gpuModule->setAttr("vernon.struct_definitions", topBuilder.getArrayAttr(reflectedStructs));
         if (useSpirvStorage) {
             auto targetTriple = spirv::VerCapExtAttr::get(spirv::Version::V_1_3, {spirv::Capability::Shader},
                                                           llvm::ArrayRef<spirv::Extension>(), module.getContext());
@@ -252,6 +273,12 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                 auto kind = dyn_cast_if_present<StringAttr>(attrs.kind);
                 if (!attrs.builtin) {
                     if (auto tensor = dyn_cast<TensorType>(type)) {
+                        if (!useSpirvStorage) {
+                            unsigned kernelIndex = kernelArgumentTypes.size();
+                            kernelArgumentTypes.push_back(type);
+                            sourceArgumentRanges[index] = {kernelIndex, 1};
+                            continue;
+                        }
                         FailureOr<ValueAbiLayout> layout = getValueAbiLayout(tensor.getElementType(), module);
                         if (failed(layout) || layout->leaves.empty()) {
                             source.emitError() << "cannot lower aggregate Tensor-by-value argument #" << index;
@@ -278,10 +305,10 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                             return signalPassFailure();
                         }
                         if (!useSpirvStorage) {
-                            source.emitError()
-                                << "static Tensor-by-value compute argument #" << index
-                                << " is currently supported only by descriptor-backed SPIR-V compute targets";
-                            return signalPassFailure();
+                            unsigned kernelIndex = kernelArgumentTypes.size();
+                            kernelArgumentTypes.push_back(type);
+                            sourceArgumentRanges[index] = {kernelIndex, 1};
+                            continue;
                         }
                         unsigned kernelIndex = kernelArgumentTypes.size();
                         kernelArgumentTypes.push_back(convertStorageLeaf(tensor.getElementType(), true));
@@ -312,7 +339,6 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                     sourceArgumentRanges[index] = {kernelIndex, 1};
                 }
             }
-
             auto functionType = moduleBuilder.getFunctionType(kernelArgumentTypes, TypeRange{});
             auto kernel = gpu::GPUFuncOp::create(moduleBuilder, source.getLoc(), source.getSymName(), functionType);
             kernel->setAttr(gpu::GPUDialect::getKernelFuncAttrName(), moduleBuilder.getUnitAttr());
@@ -417,27 +443,35 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                     continue;
                 InterfaceAttrs attrs = parseInterfaceAttrs(source.getArgAttrDict(index));
                 auto builtin = dyn_cast_if_present<StringAttr>(attrs.builtin);
-                if (!builtin || builtin.getValue() != "global_invocation_id") {
+                if (!builtin || (builtin.getValue() != "global_invocation_id" &&
+                                 builtin.getValue() != "local_invocation_id" && builtin.getValue() != "workgroup_id")) {
                     source.emitError() << "compute argument #" << index
                                        << " is neither a resource nor a supported builtin";
                     return signalPassFailure();
                 }
+                auto createId = [&](gpu::Dimension dimension) -> Value {
+                    if (builtin.getValue() == "local_invocation_id")
+                        return gpu::ThreadIdOp::create(bodyBuilder, source.getLoc(), dimension);
+                    if (builtin.getValue() == "workgroup_id")
+                        return gpu::BlockIdOp::create(bodyBuilder, source.getLoc(), dimension);
+                    return gpu::GlobalIdOp::create(bodyBuilder, source.getLoc(), dimension);
+                };
                 if (auto tensorType = dyn_cast<RankedTensorType>(argument.getType())) {
                     if (tensorType.getRank() != 1 || tensorType.getDimSize(0) != 3 ||
                         !tensorType.getElementType().isInteger(32)) {
-                        source.emitError() << "global_invocation_id Tensor must have type tensor<3xi32>";
+                        source.emitError() << builtin.getValue() << " Tensor must have type tensor<3xi32>";
                         return signalPassFailure();
                     }
                     SmallVector<Value> components;
                     for (gpu::Dimension dimension : {gpu::Dimension::x, gpu::Dimension::y, gpu::Dimension::z}) {
-                        Value id = gpu::GlobalIdOp::create(bodyBuilder, source.getLoc(), dimension);
+                        Value id = createId(dimension);
                         components.push_back(arith::IndexCastUIOp::create(bodyBuilder, source.getLoc(),
                                                                           tensorType.getElementType(), id));
                     }
                     mapping.map(argument,
                                 tensor::FromElementsOp::create(bodyBuilder, source.getLoc(), tensorType, components));
                 } else {
-                    Value globalId = gpu::GlobalIdOp::create(bodyBuilder, source.getLoc(), gpu::Dimension::x);
+                    Value globalId = createId(gpu::Dimension::x);
                     if (!argument.getType().isIndex())
                         globalId =
                             arith::IndexCastUIOp::create(bodyBuilder, source.getLoc(), argument.getType(), globalId);
