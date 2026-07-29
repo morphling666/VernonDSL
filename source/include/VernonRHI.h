@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-enum { VERNON_RHI_API_VERSION = 4, VERNON_RHI_INVALID_HANDLE_INDEX = UINT32_MAX };
+enum { VERNON_RHI_INVALID_HANDLE_INDEX = UINT32_MAX };
 
 typedef enum VernonRhiStatus {
     VERNON_RHI_STATUS_OK = 0,

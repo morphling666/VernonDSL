@@ -47,8 +47,7 @@ TEST(RuntimeCuda, CopiesAndInvokesDirectComputePipeline) {
   ret;
 }
 )";
-    static constexpr char reflection[] = R"({
-    "gpu_launch_abi_version": 1,
+    static constexpr char reflection[] = "{" VERNON_JSON_VERSION_FIELDS R"(,
     "entries": [{
       "name": "scale",
       "workgroup_size": [4, 1, 1],
@@ -106,7 +105,7 @@ TEST(RuntimeCuda, CopiesAndInvokesDirectComputePipeline) {
     arguments[1].tensor.byte_size = sizeof(factor);
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments;
     invocation.argument_count = 2;
     invocation.compute_grid = {4, 1, 1};

@@ -179,12 +179,12 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     vernonRuntimeLoadedPipelineDestroy(objectPipeline);
     vernonRuntimePipelineBundleDestroy(objectLoaded);
 
-    nlohmann::json invalidSchema2 = nlohmann::json::parse(bundle);
-    invalidSchema2["stage_artifacts"]["fill"]["cpu_invocation_abi_version"] = 2;
-    invalidSchema2.erase("content_hash");
-    std::string canonical = invalidSchema2.dump(-1, ' ', false);
-    invalidSchema2["content_hash"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
-    canonical = invalidSchema2.dump(-1, ' ', false);
+    nlohmann::json invalidVersion = nlohmann::json::parse(bundle);
+    invalidVersion["pipeline_version"] = VERNON_PIPELINE_VERSION + 1;
+    invalidVersion.erase("content_hash");
+    std::string canonical = invalidVersion.dump(-1, ' ', false);
+    invalidVersion["content_hash"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
+    canonical = invalidVersion.dump(-1, ' ', false);
     ASSERT_TRUE(!loadWithDirectory(runtime, canonical, directoryUtf8));
 
     VernonPipelineBundleLoadOptions shortOptions{};
@@ -258,7 +258,7 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     argument.tensor.byte_size = 12 * sizeof(float);
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.compute_grid = {3, 2, 2};

@@ -290,7 +290,7 @@ bool initializeCpuContext(VernonRuntimeContext &context, uint32_t deviceIndex) {
     if (!state)
         return false;
     state->provider.struct_size = sizeof(VernonRuntimeDeviceProvider);
-    state->provider.abi_version = VERNON_RUNTIME_DEVICE_PROVIDER_ABI_VERSION;
+    state->provider.abi_version = VERNON_PIPELINE_VERSION;
     state->provider.user_data = state.get();
     state->provider.get_capabilities = cpuCapabilities;
     state->provider.get_device_identity = cpuDeviceIdentity;

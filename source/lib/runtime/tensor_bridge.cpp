@@ -93,7 +93,7 @@ bool tensorMatchesSpecialization(const VernonTensorView &tensor, const Parameter
         tensor.byte_offset != *use.elementOffset * elementSize)
         return false;
     for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension) {
-        if (!use.shape.empty() && tensor.shape[dimension] != use.shape[dimension])
+        if (!use.shape.empty() && use.shape[dimension] && tensor.shape[dimension] != use.shape[dimension])
             return false;
         const int64_t elementStride = use.elementStrides[dimension];
         const uint64_t magnitude = strideMagnitude(elementStride);

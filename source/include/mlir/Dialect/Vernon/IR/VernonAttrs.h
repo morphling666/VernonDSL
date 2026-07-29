@@ -3,14 +3,12 @@
 #ifndef MLIR_DIALECT_VERNON_IR_VERNONATTRS_H_
 #define MLIR_DIALECT_VERNON_IR_VERNONATTRS_H_
 
+#include "VernonVersions.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Support/LLVM.h"
 #include "llvm/ADT/StringRef.h"
 
 namespace mlir::vernon {
-
-inline constexpr int64_t kCurrentFrontendVersion = 4;
-inline constexpr int64_t kCurrentValueAbiVersion = 1;
 
 /// Stable textual schema for shader entry points:
 ///

@@ -33,14 +33,14 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
     void runOnOperation() override {
         bool invalid = false;
         ModuleOp module = getOperation();
-        auto frontendVersion = module->getAttrOfType<IntegerAttr>("vernon.frontend_version");
-        auto valueAbiVersion = module->getAttrOfType<IntegerAttr>("vernon.value_abi_version");
-        if (!frontendVersion || frontendVersion.getInt() != kCurrentFrontendVersion) {
-            module.emitError() << "requires vernon.frontend_version = " << kCurrentFrontendVersion;
+        auto compilerContractVersion = module->getAttrOfType<IntegerAttr>("vernon.compiler_contract_version");
+        auto pipelineVersion = module->getAttrOfType<IntegerAttr>("vernon.pipeline_version");
+        if (!compilerContractVersion || compilerContractVersion.getInt() != VERNON_COMPILER_CONTRACT_VERSION) {
+            module.emitError() << "requires vernon.compiler_contract_version = " << VERNON_COMPILER_CONTRACT_VERSION;
             invalid = true;
         }
-        if (!valueAbiVersion || valueAbiVersion.getInt() != kCurrentValueAbiVersion) {
-            module.emitError() << "requires vernon.value_abi_version = " << kCurrentValueAbiVersion;
+        if (!pipelineVersion || pipelineVersion.getInt() != VERNON_PIPELINE_VERSION) {
+            module.emitError() << "requires vernon.pipeline_version = " << VERNON_PIPELINE_VERSION;
             invalid = true;
         }
         std::map<ShaderStage, SmallVector<LocationEndpoint>> stageInputs;

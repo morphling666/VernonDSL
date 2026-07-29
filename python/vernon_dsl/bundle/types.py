@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from ..language.stage_registry import STAGE_REGISTRY_VERSION
+from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
 
 
 class PipelineCompileError(ValueError):
@@ -97,8 +97,8 @@ class CompiledStage:
     @property
     def identity(self) -> dict[str, Any]:
         return {
-            "cache_version": 2,
-            "compiler_version": 1,
+            "compiler_contract_version": COMPILER_CONTRACT_VERSION,
+            "pipeline_version": PIPELINE_VERSION,
             "module": self.module,
             "entry": self.entry,
             "stage": self.stage,
@@ -172,9 +172,7 @@ class BundlePlan:
         from .requirements import runtime_requirements
 
         result = {
-            "schema_version": 5,
-            "invocation_abi_version": 6,
-            "stage_registry_version": STAGE_REGISTRY_VERSION,
+            "pipeline_version": PIPELINE_VERSION,
             "type": "pipeline",
             "id": self.pipeline_id,
             "target": self.target.target,

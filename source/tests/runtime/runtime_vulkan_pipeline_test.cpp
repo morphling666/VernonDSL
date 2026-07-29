@@ -176,7 +176,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     VernonColorAttachment attachment{0, firstTarget.reference, 32, 32, VERNON_TEXTURE_RGBA8_UNORM};
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments;
     invocation.argument_count = std::size(arguments);
     invocation.color_attachments = &attachment;
@@ -355,7 +355,7 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     arguments[1].tensor.byte_size = sizeof(factor);
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments;
     invocation.argument_count = std::size(arguments);
     invocation.compute_grid = {4, 1, 1};

@@ -1,5 +1,22 @@
 # Compiler design
 
+## Version policy
+
+`versions.toml` is the only manually edited version source. Vernon has three
+version axes:
+
+- `RELEASE_VERSION` identifies a packaged release and does not determine
+  compatibility.
+- `COMPILER_CONTRACT_VERSION` covers Python semantics, MLIR module attributes,
+  canonical Value layout, stage topology, and compiler reflection.
+- `PIPELINE_VERSION` covers pipeline manifests and invocation, CPU/GPU
+  artifacts, graphics draw data, device providers, and the RHI API.
+
+Generated Python, C/C++, and CMake constants are consumed directly. Caches use
+the compiler-contract and pipeline versions instead of private cache epochs.
+Changing `PIPELINE_VERSION` requires rebuilding every Runtime, Provider, and RHI
+component; third-party precompiled Provider/RHI plugins are not supported.
+
 ## Tensor-first type system
 
 The Python language has one compound numeric type,
@@ -79,7 +96,7 @@ covered by execution tests.
 ## Pure bundle planning boundary
 
 Bundle value types, compiler-reflection normalization, parameter merging,
-variant planning, and schema-2 serialization live in separate pure modules.
+variant planning, and `PIPELINE_VERSION` serialization live in separate pure modules.
 The planner composes those modules and owns no duplicate implementation.
 Neither bundle planning nor serialization imports the Python frontend or
 Runtime, allowing cooked-manifest identity to be tested independently of
@@ -94,7 +111,7 @@ runtime handle.
 
 Shader artifact encoding, extension selection, and content-addressed file writes
 live in `_shader_assets.artifact_io`. Cooking consumes that implementation
-through the public facade, preserving schema-2 bytes while keeping filesystem
+through the public facade, preserving canonical pipeline bytes while keeping filesystem
 artifact policy independent of descriptor parsing and native compilation.
 Python pipeline descriptor parsing lives in `_shader_assets.parsing`; it reads
 source AST and project feature declarations without importing or executing the
@@ -266,11 +283,10 @@ and topology rules validate the set and ordering. The current registry accepts
 `vertex -> fragment`; future tessellation, task, mesh, or other graphics stages
 can use the same mechanism without changing `PipelineAsset` syntax or manifest
 structure. Unknown stages, duplicate singleton stages, invalid ordering, and
-incompatible stage families are program-validation errors. The registry version
-participates in frontend semantic identity and is serialized in pipeline schema
-4. Stage additions use the existing manifest `program` map and provider shader
-descriptor array; they do not require a manifest-schema or provider-ABI version
-increase.
+incompatible stage families are program-validation errors. Stage topology is
+part of `COMPILER_CONTRACT_VERSION` and frontend semantic identity. Stage
+additions use the existing manifest `program` map and provider shader descriptor
+array; incompatible changes bump the compiler contract.
 
 `variants=` explicitly enumerates every accepted canonical feature
 combination, preventing implicit powerset growth. It contains at least one
@@ -464,15 +480,15 @@ DXIL, while `VernonRuntime` never links or loads DXC.
 8. Vernon can compile paired generated GLSL source and publish it through
    `ShaderProvider`. This is source loading only; reflected resources are not
    yet bound.
-9. Compiler reflection schema 3 includes target options and an explicit
+9. Compiler reflection under `COMPILER_CONTRACT_VERSION` includes target options and an explicit
    entry-point/stage/format/filename artifact table. The cooker emits one
    `<name>.pipeline.json` plus content-addressed external artifacts; it no
    longer emits the retired `shader.json` compatibility manifest.
 10. The Python frontend specializes `feature`, `When`, and compile-time feature
     branches, prunes compilation to a selected stage entry, and infers stable
     interface locations from the unspecialized signature. The implemented
-    legacy Pipeline asset declarations cook explicit variant sets into the
-    schema-2 pipeline manifest; unchanged stages are content-deduplicated.
+   legacy Pipeline asset declarations cook explicit variant sets into the
+   current `PIPELINE_VERSION` manifest; unchanged stages are content-deduplicated.
     Vernon resolves exact canonical feature sets without fallback.
 
 ## Shader function kinds
@@ -480,7 +496,7 @@ DXIL, while `VernonRuntime` never links or loads DXC.
 Every DSL function has exactly one explicit kind. The currently implemented
 entry decorators are `@kernel`, `@vertex`, and `@fragment`; `@func` declares a
 private, stage-polymorphic helper. Future graphics entry decorators register a
-stage kind and topology constraints through the same versioned registry rather
+stage kind and topology constraints under `COMPILER_CONTRACT_VERSION` rather
 than changing PipelineAsset syntax. The module graph preserves helper
 dependency hashes, rejects recursion and calls to entries, and the normal
 per-stage compiler validation checks an inlined helper's operations against
@@ -488,7 +504,7 @@ each reachable stage. Requiring `@func` avoids silently treating unrelated
 host utilities as shader code and gives interactive and cooked compilation the
 same call-graph rules.
 
-## Language-v3 type inference
+## Type inference
 
 Scalar promotion is a small lattice with `f16 < f32 < f64`; signed and
 unsigned 32-bit integers may promote to a floating type but have no implicit
@@ -504,7 +520,7 @@ call-site-dependent inference decisions.
 
 The typed semantic model records lvalues, branch merges, effects, and
 termination. Phase 5B early return, `break`, `continue`, and dynamic `range`
-are implemented under frontend version 4. This boundary
+are implemented under the current `COMPILER_CONTRACT_VERSION`. This boundary
 keeps later autodiff control-flow rules from changing expression typing or
 helper specialization.
 
@@ -656,9 +672,9 @@ Requirements do not participate in stage artifact identity, so content
 addressing and cross-variant artifact deduplication remain stable.
 `target_options` describe compilation inputs; `runtime_requirements` describe
 the resulting artifact's minimum execution environment. Omitting requirements
-is reserved for legacy schema-2 bundles and the cook-only Metal target.
+is reserved for the cook-only Metal target.
 
-## Language v4 representation boundary
+## Language representation boundary
 
 The normative source-language model is specified in
 `specs/language/contract.md`. It is implemented phase by phase under frontend

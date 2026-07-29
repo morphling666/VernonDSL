@@ -1,5 +1,6 @@
 #include "VernonCompiler.h"
 #include "VernonRuntime.h"
+#include "VernonVersions.h"
 #include "runtime_rhi_test_utils.h"
 
 #include <cstring>
@@ -11,7 +12,7 @@ TEST(RuntimeVulkan, CompilesAndInvokesDirectComputePipeline) {
         GTEST_SKIP() << "Vulkan runtime backend is unavailable";
 
     static constexpr char module[] = R"(
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
   func.func @increment(
       %values: !vernon.tensor_view<f32, [-1], "read_write", "device"> {
         vernon.interface = "resource",
@@ -76,7 +77,7 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
     argument.tensor.byte_size = sizeof(input);
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.compute_grid = {8, 1, 1};

@@ -11,6 +11,7 @@ from typing import Any, ClassVar
 
 import numpy as np
 
+from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
 from ..bundle import TargetOptions, canonical_json
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
 from ..frontend.model import AccessMode, ConcreteType, StorageEffect, StorageEffectKind
@@ -476,7 +477,8 @@ class Kernel:
         key = hashlib.sha256(
             canonical_json(
                 {
-                    "version": 3,
+                    "compiler_contract_version": COMPILER_CONTRACT_VERSION,
+                    "pipeline_version": PIPELINE_VERSION,
                     "frontend": frontend.semantic_inputs,
                     "target": options.target,
                     "target_options": dict(options.options),

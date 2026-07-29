@@ -1,8 +1,9 @@
 cmake_minimum_required(VERSION 3.20.0)
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VernonVersions.cmake")
 project(
     VernonDSL
-    VERSION 0.1.0
+    VERSION ${VERNON_RELEASE_VERSION}
     LANGUAGES CXX C)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

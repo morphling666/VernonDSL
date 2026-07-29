@@ -355,7 +355,7 @@ public:
         }
         VernonPipelineInvocation result{};
         result.struct_size = sizeof(VernonPipelineInvocation);
-        result.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+        result.abi_version = VERNON_PIPELINE_VERSION;
         result.arguments = arguments_.empty() ? nullptr : arguments_.data();
         result.argument_count = arguments_.size();
         result.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;

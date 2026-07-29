@@ -94,10 +94,6 @@ def runtime_requirements(target: str, stages: Iterable[Any]) -> dict[str, Any] |
                 "object_format": _single(
                     (stage.metadata.get("object_format") for stage in stage_values), "CPU object formats"
                 ),
-                "invocation_abi_version": _single(
-                    (stage.metadata.get("cpu_invocation_abi_version") for stage in stage_values),
-                    "CPU invocation ABI versions",
-                ),
             }
         )
     elif target in {"opengl", "opengles"}:

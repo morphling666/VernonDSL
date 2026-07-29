@@ -1,6 +1,7 @@
-# Vernon DSL language v4 draft
+# Vernon DSL language contract
 
-> **Status: normative target, partially implemented under frontend version 4.**
+> **Status: normative target, partially implemented under the current
+> `COMPILER_CONTRACT_VERSION` in `versions.toml`.**
 >
 > The checked phases in `future_language_roadmap.md` are implemented in source
 > and tested where noted, but unchecked sections and open correctness findings
@@ -179,7 +180,7 @@ element index before backend lowering. Specialization must not expose those
 values as source type arguments.
 
 Language-level typed shape, strides, and offset use units of the recursively
-resolved leaf element. Specialized compiler reflection and schema-4 manifests
+resolved leaf element. Specialized compiler reflection and `PIPELINE_VERSION` manifests
 record `shape`, `element_strides`, and `element_offset`; Runtime descriptors
 record byte strides and byte offsets after Tensor and Struct layout is
 resolved. Runtime validation performs the one checked element-to-byte
@@ -246,14 +247,14 @@ The public `Buffer` spelling is removed. A shaped kernel storage parameter uses
 `!vernon.tensor_view<element, shape, access, address_space>`; only opaque runtime
 allocation handles retain device-buffer terminology.
 
-The v4 baseline does not claim byte-address device operations, unsized
+The current baseline does not claim byte-address device operations, unsized
 trailing-array layouts, or CUDA/Vulkan external-memory import. Those require
 separate ownership, synchronization, bounds, and lifetime contracts before
 they become supported interop features.
 
 ### 3.5 Dense-only core
 
-Core v4 Storage is dense. V4 has no SNode/layout tree, transparent sparse
+Core Storage is dense. The current contract has no SNode/layout tree, transparent sparse
 Tensor layout, or sparse Value type. CSR, COO, blocked-grid, hash-grid, and
 other sparse structures are library data structures composed from dense
 `TensorStorage` and, where necessary, `RawBuffer`. Their capacity, indexing,
@@ -304,7 +305,7 @@ downloads, and resource lifetime are not parsed device-language expressions.
 Multi-program ordering, render-pass state, resource transitions, and
 cross-backend synchronization are Runtime host-orchestration semantics,
 specified by `VernonExecutionGraph` in `specs/runtime/design.md`. They are not
-language-v4 semantics.
+current language semantics.
 
 ## 6. Functions, interfaces, and specialization
 
@@ -344,13 +345,11 @@ graphics entries. Kernel programs are compute-only; graphics stage tuples form
 graphics-only Pipelines. Compute and graphics entries cannot be mixed in one
 pipeline.
 
-Each graphics entry carries an explicit stage kind. A versioned,
-target-independent stage registry validates tuple topology and ordering.
-The registered graphics topology is `vertex -> fragment`. The registry remains
-versioned so future stage additions can extend topology validation without
-changing `PipelineAsset` syntax. The registry version is part of frontend
-semantic identity and schema-4 pipeline manifests; provider ABI remains
-version 4.
+Each graphics entry carries an explicit stage kind. A target-independent stage
+registry validates tuple topology and ordering. The registered graphics
+topology is `vertex -> fragment`. Future stage additions can extend topology
+validation without changing `PipelineAsset` syntax; such changes are covered by
+`COMPILER_CONTRACT_VERSION`.
 
 Generated builtin functions are the preferred authoring API.
 `builtin("...")` remains a low-level entry-interface annotation and uses the
@@ -377,7 +376,8 @@ Project processing order is:
 6. lower typed nodes;
 7. validate target capabilities and materialize artifacts.
 
-Semantic cache identity includes frontend version, all source dependency
+Semantic cache identity includes `COMPILER_CONTRACT_VERSION`,
+`PIPELINE_VERSION`, all source dependency
 digests, entry, enabled features, concrete shapes and interfaces, captured
 constants, workgroup size, helper specializations, and derivative-transform
 identity. Diagnostics include source path, one-based line and column, and a
@@ -385,7 +385,7 @@ stable reason string.
 
 ## 7. Stable syntax target and deferred ergonomics
 
-The v4 core statement subset is `pass`, expression statements, simple local or
+The current core statement subset is `pass`, expression statements, simple local or
 indexed assignment, annotated assignment, augmented assignment, `return`,
 `if`, `range` loops, `while`, `break`, and `continue`. Return may terminate a
 nested structured region; break and continue target the nearest enclosing loop.
@@ -396,7 +396,7 @@ Tensor/Tuple/Struct construction, and constant Tuple indexing.
 
 Tuple destructuring, short-circuit `and`/`or`, conditional expressions,
 dynamic `range`, `break`, `continue`, and nested/early return are implemented
-v4-core phases under frontend version 4. Autodiff coverage
+current phases under `COMPILER_CONTRACT_VERSION`. Autodiff coverage
 for Phase 5B control flow remains deferred until derivative and tape policies
 land. Chained comparisons, recursion, dynamic allocation, exceptions,
 generators, arbitrary classes, Python list/dict semantics, and Python object
@@ -455,12 +455,12 @@ supported math intrinsics must define behavior at non-differentiable points.
 Analytical results are checked against finite differences and supported
 backends are compared with CPU reference behavior.
 
-Nested or higher-order transforms are rejected in v4. This includes
+Nested or higher-order transforms are rejected by the current contract. This includes
 `grad(grad(f))`, Hessians, Hessian-vector products, and differentiating a
 generated pullback. Generated derivative IR remains typed so a future language
 version may lift this restriction without changing the Value/Storage model.
 
-Stateful-kernel autodiff is not part of the initial v4 implementation. It
+Stateful-kernel autodiff is not part of the initial implementation. It
 requires all of the following before acceptance:
 
 - functionalization of local mutation and Storage writes;
@@ -479,7 +479,7 @@ branches are non-differentiable unless explicit custom primitives define their
 derivatives. Differentiating fragment arithmetic alone does not imply
 differentiable rendering.
 
-## 9. V3 to v4 migration
+## 9. Legacy migration
 
 - Host runtime `Tensor` ownership becomes `TensorStorage`.
 - Kernel storage parameters become `TensorView[T, shape, access]`.
@@ -499,7 +499,7 @@ cache identity.
 
 ## 10. Feature status
 
-| Area | Current frontend-version-3 implementation | V4 normative target | Deferred |
+| Area | Legacy implementation | Current normative target | Deferred |
 | --- | --- | --- | --- |
 | Tensor | Fixed numeric aggregate; entry addressability metadata | Immutable Value with recursively ABI-stable Value elements and logical shape only | Dynamic-shape Value |
 | Ownership | Runtime `Tensor`; removed `Buffer` | `TensorStorage`, borrowed `TensorView`, runtime-only `vd.interop.RawBuffer` escape hatch | General allocator model |
@@ -525,9 +525,9 @@ require arbitrary Python objects. First-order derivatives apply only to the
 pure typed arithmetic or explicitly differentiable primitives, not visibility
 or raster decisions.
 
-## 12. V4 acceptance gates
+## 12. Current contract acceptance gates
 
-Frontend version 4 may be declared implemented only when:
+The current `COMPILER_CONTRACT_VERSION` may be declared implemented only when:
 
 - every public term in this document maps to one typed semantic category;
 - Tensor element legality, nested normalization, and Struct boundaries have
@@ -547,4 +547,5 @@ Frontend version 4 may be declared implemented only when:
   their stated boundaries.
 
 Until every gate in this document passes, unchecked sections remain unavailable
-as end-to-end guarantees even though the frontend reports language version 4.
+as end-to-end guarantees even though the frontend reports the current compiler
+contract version.

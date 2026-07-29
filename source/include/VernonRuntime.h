@@ -152,8 +152,6 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeReferenceRhiCommandEncoder(VernonR
                                                                          VernonRhiCommandEncoder encoder,
                                                                          VernonRuntimeProviderObject *output);
 
-enum { VERNON_PIPELINE_INVOCATION_ABI_VERSION = 6 };
-
 typedef struct VernonFeatureSetView {
     const char *const *names;
     size_t count;

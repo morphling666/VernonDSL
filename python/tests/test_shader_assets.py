@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
 from vernon_dsl.bundle import build_bundle_plan
 from vernon_dsl.pipeline_assets import (
     PipelineCompileError,
@@ -229,7 +230,8 @@ class ShaderAssetCookTests(unittest.TestCase):
 
     def test_interactive_cuda_stage_uses_inline_ptx_descriptor(self) -> None:
         reflection = {
-            "gpu_launch_abi_version": 1,
+            "compiler_contract_version": COMPILER_CONTRACT_VERSION,
+            "pipeline_version": PIPELINE_VERSION,
             "entries": [{"name": "scale", "stage": "compute"}],
         }
         record = {
@@ -256,7 +258,8 @@ class ShaderAssetCookTests(unittest.TestCase):
         relocatable_object = b"mock relocatable object"
         digest = hashlib.sha256(relocatable_object).hexdigest()
         reflection = {
-            "schema_version": 3,
+            "compiler_contract_version": COMPILER_CONTRACT_VERSION,
+            "pipeline_version": PIPELINE_VERSION,
             "module_hash": "module",
             "dependencies": [],
             "entries": [
@@ -373,7 +376,6 @@ asset = vd.pipeline_asset(
                     "features": [],
                     "target_triple": "x86_64-pc-windows-msvc",
                     "object_format": "coff",
-                    "invocation_abi_version": 1,
                 },
             )
             logical = json.loads(json.dumps(bundle))
@@ -386,7 +388,7 @@ asset = vd.pipeline_asset(
             self.assertEqual(stage["symbol"], "__vernon_cpu_module_scale")
             self.assertEqual(stage["target_triple"], "x86_64-pc-windows-msvc")
             self.assertEqual(stage["object_format"], "coff")
-            self.assertEqual(stage["cpu_invocation_abi_version"], 1)
+            self.assertEqual(stage["pipeline_version"], PIPELINE_VERSION)
             self.assertEqual(stage["cpu"], "generic")
             self.assertEqual(stage["cpu_features"], "+sse2")
             self.assertEqual(stage["artifact"]["sha256"], digest)
@@ -531,9 +533,8 @@ asset = vd.pipeline_asset(
                     self.assertEqual(repeated_path, manifest_path)
                     self.assertEqual(manifest_path.read_bytes(), first_manifest)
                     document = json.loads(manifest_path.read_text(encoding="utf-8"))
-                    self.assertEqual(document["schema_version"], 5)
+                    self.assertEqual(document["pipeline_version"], PIPELINE_VERSION)
                     self.assertEqual(document["type"], "pipeline")
-                    self.assertEqual(document["invocation_abi_version"], 6)
                     self.assertEqual(document["target"], target)
                     self.assertEqual(
                         document["target_options"],
@@ -665,9 +666,8 @@ asset = vd.pipeline_asset(
             locations = [value["vernon.location"] for value in interface if "vernon.location" in value]
             self.assertEqual(locations, [0, 1, 5, 6])
             runtime_bundle = bundle
-            self.assertEqual(runtime_bundle["schema_version"], 5)
+            self.assertEqual(runtime_bundle["pipeline_version"], PIPELINE_VERSION)
             self.assertEqual(runtime_bundle["type"], "pipeline")
-            self.assertEqual(runtime_bundle["invocation_abi_version"], 6)
             self.assertEqual(runtime_bundle["id"], "shaders/variant_mesh")
             self.assertEqual(len(runtime_bundle["variants"]), 4)
             combined_runtime = next(

@@ -168,14 +168,13 @@ class PipelineCompileTests(unittest.TestCase):
                     metadata={
                         "target_triple": "x86_64-pc-windows-msvc",
                         "object_format": "coff",
-                        "cpu_invocation_abi_version": 3,
                     },
                 )
             ],
         )
         self.assertEqual(cpu["target_triple"], "x86_64-pc-windows-msvc")
         self.assertEqual(cpu["object_format"], "coff")
-        self.assertEqual(cpu["invocation_abi_version"], 3)
+        self.assertNotIn("invocation_abi_version", cpu)
         self.assertIsNone(runtime_requirements("metal", []))
 
     def test_runtime_requirement_parsers_reject_incomplete_artifacts(self) -> None:

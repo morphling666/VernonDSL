@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+from .._versions import PIPELINE_VERSION
 from ..bundle import (
     CompiledStage,
     PipelineCompileError,
@@ -84,7 +85,7 @@ def _cpu_stage_metadata(stage: CompiledStage) -> dict[str, Any]:
         raise PipelineCompileError("CPU compiler reflection has no normalized target triple")
     metadata: dict[str, Any] = {
         "symbol": symbol,
-        "cpu_invocation_abi_version": 1,
+        "pipeline_version": PIPELINE_VERSION,
         "target_triple": target_triple,
         "object_format": _cpu_object_format(stage.artifact.filename, target_triple),
     }

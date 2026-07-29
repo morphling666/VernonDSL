@@ -63,8 +63,7 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
   ret;
 }
 )";
-    static constexpr char reflection[] = R"({
-    "gpu_launch_abi_version": 1,
+    static constexpr char reflection[] = "{" VERNON_JSON_VERSION_FIELDS R"(,
     "entries": [{
       "name": "scale",
       "workgroup_size": [4, 1, 1],
@@ -88,7 +87,7 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
     }]
   })";
     const std::string ptxHash = vernon::runtime::sha256Hex(ptx, sizeof(ptx) - 1);
-    std::string bundle = R"({"schema_version":5,"invocation_abi_version":6,)"
+    std::string bundle = "{" VERNON_PIPELINE_JSON_FIELD R"(,)"
                          R"("type":"pipeline","id":"cuda/scale","target":"cuda",)"
                          R"("features":[],"runtime_requirements":{"backend":"cuda",)"
                          R"("features":[],"ptx_version":[8,0],)"
@@ -196,7 +195,7 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
     arguments[1].tensor.byte_size = sizeof(factor);
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments;
     invocation.argument_count = 2;
     invocation.compute_grid = {4, 1, 1};

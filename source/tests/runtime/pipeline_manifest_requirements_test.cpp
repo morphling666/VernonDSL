@@ -53,8 +53,7 @@ TEST(PipelineManifestRequirements, ParsesEveryRuntimeBackendShape) {
          {{"backend", "cpu"},
           {"features", nlohmann::json::array({"compute", "tensor_views"})},
           {"target_triple", "x86_64-pc-windows-msvc"},
-          {"object_format", "coff"},
-          {"invocation_abi_version", 1}}},
+          {"object_format", "coff"}}},
         {"opengl",
          {{"backend", "opengl"},
           {"features", nlohmann::json::array({"textures"})},
@@ -168,8 +167,8 @@ TEST(PipelineManifestRequirements, ComparesApiAndCpuHostRequirements) {
 #endif
 #undef VERNON_TEST_TRIPLE_ARCH
     std::string error;
-    EXPECT_TRUE(validateCpuRuntimeRequirements(triple, format, VERNON_CPU_INVOCATION_ABI_VERSION, error)) << error;
-    EXPECT_FALSE(validateCpuRuntimeRequirements(triple, "wasm", VERNON_CPU_INVOCATION_ABI_VERSION, error));
+    EXPECT_TRUE(validateCpuRuntimeRequirements(triple, format, error)) << error;
+    EXPECT_FALSE(validateCpuRuntimeRequirements(triple, "wasm", error));
     EXPECT_NE(error.find("runtime provides"), std::string::npos);
 }
 

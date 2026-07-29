@@ -1,3 +1,4 @@
+#include "VernonVersions.h"
 #include "vernon-c/Compiler.h"
 
 #include <nlohmann/json.hpp>
@@ -64,7 +65,7 @@ void expectDiagnostic(VernonCompilerContext *context, std::string_view module, s
 
 TEST(CompilerReflection, TracksTextureSamplerAndSwizzleSemantics) {
     constexpr std::string_view module = R"mlir(
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @fragment_main(
       %color: tensor<4xf32> {
         vernon.interface = "input",
@@ -125,7 +126,7 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
 
     std::fprintf(stderr, "relation\n");
     constexpr std::string_view relationModule = R"mlir(
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @relation(
       %uv: tensor<2xf32> {
         vernon.interface = "input", vernon.location = 0 : i64
@@ -188,7 +189,7 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
 
     std::fprintf(stderr, "forwarding\n");
     constexpr std::string_view forwardingModule = R"mlir(
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @forwarding(
       %condition: i1 {
         vernon.interface = "input", vernon.location = 0 : i64
@@ -263,7 +264,7 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
 
     std::fprintf(stderr, "helper\n");
     constexpr std::string_view helperModule = R"mlir(
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func private @sample_helper(
       %texture: !vernon.texture<"2d", f32>, %sampler: !vernon.sampler,
       %uv: tensor<2xf32>) -> tensor<4xf32> {
@@ -302,7 +303,7 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
 
     std::fprintf(stderr, "ambiguity\n");
     constexpr std::string_view ambiguousSamplerModule = R"mlir(
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @ambiguous(
       %condition: i1 {
         vernon.interface = "input", vernon.location = 0 : i64
@@ -338,7 +339,7 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
 
     std::fprintf(stderr, "unknown\n");
     constexpr std::string_view unknownProvenanceModule = R"mlir(
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @unknown(
       %raw: i64 {
         vernon.interface = "uniform"
@@ -365,8 +366,7 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
     expectDiagnostic(context, unknownProvenanceModule, "argument #0 has no finite canonical Value ABI layout");
 
     std::fprintf(stderr, "intrinsic\n");
-    expectDiagnostic(context,
-                     R"mlir(module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+    expectDiagnostic(context, R"mlir(module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         func.func @bad(%texture: !vernon.texture<"2d", f32>,
                        %coordinates: tensor<2xf32>) -> tensor<4xf32> {
           %sample = "vernon.intrinsic"(%texture, %coordinates)
@@ -383,53 +383,47 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
         std::string_view diagnostic;
     };
     for (const InvalidSwizzleCase &test : {
-             InvalidSwizzleCase{
-                 R"mlir(module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+             InvalidSwizzleCase{R"mlir(module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
                  func.func @empty(%input: tensor<4xf32>) -> f32 {
                    %result = "vernon.swizzle"(%input) {mask = ""} :
                        (tensor<4xf32>) -> f32
                    return %result : f32
                  }
                })mlir",
-                 "requires a non-empty component mask"},
-             InvalidSwizzleCase{
-                 R"mlir(module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+                                "requires a non-empty component mask"},
+             InvalidSwizzleCase{R"mlir(module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
                  func.func @invalid(%input: tensor<4xf32>) -> f32 {
                    %result = "vernon.swizzle"(%input) {mask = "q"} :
                        (tensor<4xf32>) -> f32
                    return %result : f32
                  }
                })mlir",
-                 "contains invalid component 'q'"},
-             InvalidSwizzleCase{
-                 R"mlir(module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+                                "contains invalid component 'q'"},
+             InvalidSwizzleCase{R"mlir(module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
                  func.func @bounds(%input: tensor<3xf32>) -> f32 {
                    %result = "vernon.swizzle"(%input) {mask = "a"} :
                        (tensor<3xf32>) -> f32
                    return %result : f32
                  }
                })mlir",
-                 "component 'a' is out of bounds for input width 3"},
-             InvalidSwizzleCase{
-                 R"mlir(module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+                                "component 'a' is out of bounds for input width 3"},
+             InvalidSwizzleCase{R"mlir(module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
                  func.func @rank(%input: tensor<2x2xf32>) -> f32 {
                    %result = "vernon.swizzle"(%input) {mask = "x"} :
                        (tensor<2x2xf32>) -> f32
                    return %result : f32
                  }
                })mlir",
-                 "requires a rank-one tensor or vector input"},
-             InvalidSwizzleCase{
-                 R"mlir(module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+                                "requires a rank-one tensor or vector input"},
+             InvalidSwizzleCase{R"mlir(module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
                  func.func @scalar_result_type(%input: tensor<4xf32>) -> i32 {
                    %result = "vernon.swizzle"(%input) {mask = "r"} :
                        (tensor<4xf32>) -> i32
                    return %result : i32
                  }
                })mlir",
-                 "single-component result must have input element type 'f32'"},
-             InvalidSwizzleCase{
-                 R"mlir(module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+                                "single-component result must have input element type 'f32'"},
+             InvalidSwizzleCase{R"mlir(module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
                  func.func @result_shape(%input: tensor<4xf32>)
                      -> tensor<2xf32> {
                    %result = "vernon.swizzle"(%input) {mask = "rgb"} :
@@ -437,9 +431,8 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
                    return %result : tensor<2xf32>
                  }
                })mlir",
-                 "result width 2 does not match mask length 3"},
-             InvalidSwizzleCase{
-                 R"mlir(module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+                                "result width 2 does not match mask length 3"},
+             InvalidSwizzleCase{R"mlir(module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
                  func.func @result_type(%input: tensor<4xf32>)
                      -> tensor<3xi32> {
                    %result = "vernon.swizzle"(%input) {mask = "rgb"} :
@@ -447,8 +440,8 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
                    return %result : tensor<3xi32>
                  }
                })mlir",
-                 "result element type 'i32' does not match input element type "
-                 "'f32'"},
+                                "result element type 'i32' does not match input element type "
+                                "'f32'"},
          }) {
         result = vernonCompilerValidateMlir(context, test.module.data(), test.module.size());
         ASSERT_TRUE(result);

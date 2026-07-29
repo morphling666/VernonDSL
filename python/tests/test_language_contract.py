@@ -9,6 +9,7 @@ from unittest import mock
 
 import vernon_dsl as vd
 from vernon_dsl import CompileError, Compiler, compile_source
+from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
 from vernon_dsl.compiler import FrontendCompileRequest
 from vernon_dsl.frontend.abi import attribute_layout, value_abi_layout
 from vernon_dsl.frontend.analysis import dump_typed_model, typed_effect_data, typed_model_data
@@ -35,15 +36,13 @@ from vernon_dsl.frontend.model import (
 from vernon_dsl.language.stage_registry import (
     ENTRY_DECORATOR_STAGES,
     GRAPHICS_STAGE_ORDER,
-    STAGE_REGISTRY_VERSION,
     validate_graphics_topology,
 )
 from vernon_dsl.shader_contracts import ATOMIC_OPERATION_NAMES, DEVICE_ONLY_OPERATION_NAMES
 
 
 class LanguageVersionTests(unittest.TestCase):
-    def test_stage_registry_is_versioned_and_canonical(self) -> None:
-        self.assertEqual(STAGE_REGISTRY_VERSION, 2)
+    def test_stage_registry_is_canonical(self) -> None:
         self.assertEqual(
             ENTRY_DECORATOR_STAGES,
             {"kernel": "compute", "vertex": "vertex", "fragment": "fragment"},
@@ -111,7 +110,8 @@ class LanguageVersionTests(unittest.TestCase):
             "from vernon_dsl import *\n@struct\nclass Vertex:\n    position: Tensor[f32, (3,)]\n    weight: f64\n",
             "abi_layout.py",
         )
-        self.assertIn("vernon.value_abi_version = 1 : i64", output)
+        self.assertIn(f"vernon.compiler_contract_version = {COMPILER_CONTRACT_VERSION} : i64", output)
+        self.assertIn(f"vernon.pipeline_version = {PIPELINE_VERSION} : i64", output)
         self.assertIn('abi_leaf_dtypes = ["f32", "f64"]', output)
         self.assertNotIn("abi_alignment", output)
         self.assertNotIn("abi_field_offsets", output)
@@ -193,10 +193,10 @@ class LanguageVersionTests(unittest.TestCase):
             ),
         )
 
-    def test_frontend_and_semantic_identity_are_version_three(self) -> None:
+    def test_frontend_and_semantic_identity_include_contract_versions(self) -> None:
         source = "from vernon_dsl import *\n@fragment\ndef main(value: float) -> float:\n    return value\n"
         output = compile_source(source, "version.py")
-        self.assertIn("vernon.frontend_version = 4 : i64", output)
+        self.assertIn(f"vernon.compiler_contract_version = {COMPILER_CONTRACT_VERSION} : i64", output)
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "shader.py"
@@ -208,7 +208,8 @@ class LanguageVersionTests(unittest.TestCase):
                     captured_constants=(("LIMIT", 3),),
                 )
             )
-            self.assertEqual(result.semantic_inputs["frontend_version"], 4)
+            self.assertEqual(result.semantic_inputs["compiler_contract_version"], COMPILER_CONTRACT_VERSION)
+            self.assertEqual(result.semantic_inputs["pipeline_version"], PIPELINE_VERSION)
             self.assertEqual(result.semantic_inputs["captured_constants"], [["LIMIT", "int", 3]])
 
     def test_semantic_identity_contains_concrete_helper_specializations(self) -> None:

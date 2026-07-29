@@ -1,5 +1,6 @@
 #include "vernon_compile_packaging.h"
 
+#include "VernonVersions.h"
 #include "vernon-c/Compiler.h"
 
 #include <nlohmann/json.hpp>
@@ -26,7 +27,7 @@ std::string readFile(const std::filesystem::path &path) {
 
 TEST(CompilePackaging, WritesBundlesAndArtifacts) {
     constexpr std::string_view computeModule = R"mlir(
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @scale() attributes {
     vernon.entry,
     vernon.stage = "compute",
@@ -61,12 +62,12 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
     ASSERT_TRUE(vernon::tools::packageCompileResult(context, cpuResult, VERNON_TARGET_CPU, computePackaging, output,
                                                     error) == VERNON_STATUS_OK);
     nlohmann::json computeManifest = nlohmann::json::parse(readFile(root / "compute" / "compute.json"));
-    ASSERT_TRUE(computeManifest.at("schema_version") == 3);
+    ASSERT_TRUE(computeManifest.at("pipeline_version") == VERNON_PIPELINE_VERSION);
     ASSERT_TRUE(computeManifest.at("target") == "cpu");
     ASSERT_TRUE(computeManifest.at("artifact_format") == "relocatable_object");
     ASSERT_TRUE(computeManifest.at("target_triple").get<std::string>() == triple);
     ASSERT_TRUE(computeManifest.at("object_format") == "coff");
-    ASSERT_TRUE(computeManifest.at("cpu_invocation_abi_version") == 1);
+    ASSERT_TRUE(computeManifest.at("release_version") == VERNON_RELEASE_VERSION);
     ASSERT_TRUE(std::filesystem::is_regular_file(root / "compute" / computeManifest.at("artifact").get<std::string>()));
 
     vernon::tools::PackagingOptions outputPackaging;

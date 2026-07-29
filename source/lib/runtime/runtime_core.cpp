@@ -49,12 +49,11 @@ namespace {
 constexpr bool present(VernonRuntimeProviderObject object) { return object.value != 0; }
 
 bool providerIsValid(const VernonRuntimeDeviceProvider &provider, VernonRuntimeProviderPipelineKind kind) {
-    if (provider.struct_size < sizeof(VernonRuntimeDeviceProvider) ||
-        provider.abi_version != VERNON_RUNTIME_DEVICE_PROVIDER_ABI_VERSION || !provider.get_capabilities ||
-        !provider.get_device_identity || !provider.prepare_shader || !provider.prepare_pipeline_layout ||
-        !provider.prepare_pipeline || !provider.create_binding_set || !provider.update_binding_set ||
-        !provider.destroy_shader || !provider.destroy_pipeline_layout || !provider.destroy_pipeline ||
-        !provider.destroy_binding_set)
+    if (provider.struct_size < sizeof(VernonRuntimeDeviceProvider) || provider.abi_version != VERNON_PIPELINE_VERSION ||
+        !provider.get_capabilities || !provider.get_device_identity || !provider.prepare_shader ||
+        !provider.prepare_pipeline_layout || !provider.prepare_pipeline || !provider.create_binding_set ||
+        !provider.update_binding_set || !provider.destroy_shader || !provider.destroy_pipeline_layout ||
+        !provider.destroy_pipeline || !provider.destroy_binding_set)
         return false;
     return kind == VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE ? provider.encode_dispatch != nullptr
                                                             : provider.encode_draw != nullptr;

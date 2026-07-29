@@ -3,8 +3,8 @@
 ## CPU compute bundles
 
 Persistent CPU bundles contain a target relocatable object with stable,
-module-hashed C entry wrappers. The manifest records the target triple, object
-format, CPU invocation ABI, exported symbol, artifact size, and SHA-256.
+module-hashed C entry wrappers. The manifest records `PIPELINE_VERSION`, the
+target triple, object format, exported symbol, artifact size, and SHA-256.
 Applications link the object at build time and register its wrapper with
 VernonRuntime; Runtime validates the external descriptor but never parses or
 relocates object files. Python immediate execution may use a host-native
@@ -44,7 +44,7 @@ Engine owners; backend behavior never branches on context origin.
 
 ## Vulkan graphics bundles
 
-Cooked pipeline schema 2 stores each SPIR-V stage as a content-addressed
+The current `PIPELINE_VERSION` format stores each SPIR-V stage as a content-addressed
 external `.spv` artifact. The manifest records its relative path, byte size,
 and SHA-256, all of which the common artifact resolver validates before Vulkan
 sees the bytes. Non-persistent interactive execution uses the same descriptor
@@ -82,8 +82,8 @@ formats.
 Python exposes compiler services and all runtime backends through one `_native`
 module. The module links the compiler DLL and `VernonRuntime`; the runtime DLL
 itself retains its dependency boundary. Interactive GPU pipelines serialize
-pipeline schema 2 with inline artifact descriptors; the cooker emits the same
-schema with external descriptors only. CPU execution uses native AOT bundles
+the current `PIPELINE_VERSION` format with inline artifact descriptors; the
+cooker emits the same format with external descriptors only. CPU execution uses native AOT bundles
 and remains compute-only because Vernon does not provide a software rasterizer.
 
 ## Target execution architecture
@@ -389,9 +389,9 @@ creation skips software adapters.
 
 ### Pipeline runtime requirements
 
-Schema-2 PipelineAssets may contain a hash-covered `runtime_requirements`
+PipelineAssets may contain a hash-covered `runtime_requirements`
 object. Its target-discriminated values are derived from the emitted artifact:
-CPU target triple/object format/invocation ABI, GLSL profile and API version,
+CPU target triple/object format, GLSL profile and API version,
 SPIR-V version plus Vulkan 1.1 and compute workgroup limits, or PTX version,
 address size, and minimum compute capability. Required reflection features are
 stored once in sorted order. DirectX additionally records D3D12, minimum
@@ -498,7 +498,7 @@ iteration order. Feature specialization runs before the vertex/fragment
 interfaces are merged and validated, making the specialized reflection the
 only runtime binding contract.
 
-Pipeline invocation ABI version 6 carries index bindings, attachment
+`PIPELINE_VERSION` covers the invocation carrying index bindings, attachment
 operations, topology, viewport, scissor, compute grid, an optional active
 encoder, and reflected argument slots.
 Backend-specific command encoding consumes this common invocation without
@@ -519,7 +519,7 @@ its existing `sampled_texture_bindings` relation identifies every concrete
 texture descriptor it samples. A generated resolution argument carries
 `vernon.implicit = "resolution"` and has type `tensor<2xf32>`.
 
-The schema-2 cooker removes these arguments from the external `parameters`
+The cooker removes these arguments from the external `parameters`
 table and records them in `internal_parameters`. Each internal record has
 `source: "implicit_sampler"` or `source: "system_value"`; resolution also has
 `system_value: "resolution"`. Stage uses retain concrete uniform names,
@@ -560,7 +560,8 @@ device-only methods may coexist on a shared struct; duplicate names are
 rejected rather than treated as host/device overloads. Device compilation
 continues to forbid recursion and mutable `self`.
 
-Graphics manifest schema 3 carries explicit vertex-attribute leaves. A bound
+The current `PIPELINE_VERSION` graphics manifest carries explicit
+vertex-attribute leaves. A bound
 Tensor has shape `(record_count, *logical_shape)`, contiguous row-major inner
 dimensions, an arbitrary positive record stride, and an independent base
 offset. Leaves select locations, dtype formats, component counts, and relative

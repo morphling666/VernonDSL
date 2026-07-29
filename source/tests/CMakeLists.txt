@@ -11,6 +11,11 @@ endif()
 set(VERNON_TEST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 set(VERNON_TEST_BINARY_ROOT "${CMAKE_CURRENT_BINARY_DIR}")
 
+if(Python_EXECUTABLE)
+    add_test(NAME VernonGeneratedVersionsCheck COMMAND "${Python_EXECUTABLE}"
+                                                       "${VERNON_REPOSITORY_ROOT}/tools/generate_versions.py" --check)
+endif()
+
 function(vernon_discover_gtests target)
     gtest_discover_tests(${target} DISCOVERY_MODE POST_BUILD WORKING_DIRECTORY "${VERNON_TEST_BINARY_ROOT}")
 endfunction()

@@ -28,7 +28,8 @@ Priority 0 was completed on 2026-07-28:
 - that baseline executes CPU, CUDA, Vulkan compute/graphics, and D3D12 WARP
   paths; OpenGL is covered through the external-provider contract tests;
 - README, the language contract, and the language roadmap consistently state
-  that checked v4 phases are implemented under frontend version 4 while open
+  that checked phases are implemented under the current
+  `COMPILER_CONTRACT_VERSION` while open
   correctness gates remain tracked in `specs/compiler/root_cause_audit.md`;
 - the compiler/Runtime support matrix is recorded in README;
 - stale completion-plan and archived-proposal references were removed;
@@ -248,7 +249,7 @@ boundary. Do not wait for unrelated refactoring to finish.
 4. Connect reflected resources to the OpenGL `ShaderProvider` path.
 5. Add workgroup storage, barriers, and atomics with typed effects, address
    spaces, ordering, scope, and backend capability validation.
-6. Extend graphics stage topology only through the existing versioned registry
+6. Extend graphics stage topology only through `COMPILER_CONTRACT_VERSION`
    and target capability checks.
 
 Acceptance:
@@ -280,9 +281,9 @@ Priority 2 is now implemented:
   `StorageBuffer` atomics. Runtime dirty tracking treats atomic-only kernels as
   writers. OpenGL and DirectX reject this capability before artifact emission.
 - The unfinished Geometry Shader feature has been removed from the frontend,
-  Vernon/MLIR and SPIR-V lowering, schema-4 program handling, provider/RHI
+  Vernon/MLIR and SPIR-V lowering, `PIPELINE_VERSION` program handling, provider/RHI
   stage bits, Vulkan/OpenGL runtime paths, tests, and product documentation.
-  The versioned registry now exposes only `vertex -> fragment`.
+  The compiler contract now exposes only `vertex -> fragment`.
 - Mesh/Task shaders remain out of scope until a concrete GPU-driven rendering
   requirement exists.
 

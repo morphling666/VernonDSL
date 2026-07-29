@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-enum { VERNON_RUNTIME_DEVICE_PROVIDER_ABI_VERSION = 4, VERNON_RUNTIME_PROVIDER_MAX_SHADER_STAGES = 8 };
+enum { VERNON_RUNTIME_PROVIDER_MAX_SHADER_STAGES = 8 };
 
 typedef enum VernonRuntimeProviderCapabilityBits {
     VERNON_RUNTIME_PROVIDER_COMPUTE = 1u << 0,

@@ -244,7 +244,7 @@ void fillBackendCapabilities(const VernonRuntimeContext &context, VernonRuntimeC
         result.supports_compute = 1;
         result.supports_storage_buffers = 1;
         result.supports_graphics = 1;
-        result.graphics_draw_abi_version = 2;
+        result.graphics_draw_abi_version = VERNON_PIPELINE_VERSION;
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
         if (context.backend == VERNON_RUNTIME_DIRECTX12) {
             result.api_version_major = 12;
@@ -262,7 +262,7 @@ void fillBackendCapabilities(const VernonRuntimeContext &context, VernonRuntimeC
             ? (result.api_version_major > 3 || (result.api_version_major == 3 && result.api_version_minor >= 1))
             : (result.api_version_major > 4 || (result.api_version_major == 4 && result.api_version_minor >= 3));
     result.supports_storage_buffers = result.supports_compute;
-    result.graphics_draw_abi_version = 2;
+    result.graphics_draw_abi_version = VERNON_PIPELINE_VERSION;
 }
 
 bool validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeRequirements &requirements) {
@@ -280,8 +280,7 @@ bool validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeReq
         }
     }
     if (context.backend == VERNON_RUNTIME_CPU)
-        return validateCpuRuntimeRequirements(requirements.targetTriple, requirements.objectFormat,
-                                              requirements.invocationAbiVersion, context.error);
+        return validateCpuRuntimeRequirements(requirements.targetTriple, requirements.objectFormat, context.error);
     if (isOpenGLBackend(context.backend)) {
         const VernonOpenGLContextCallbacks &actual = openGLState(context).device.callbacks;
         const RuntimeVersion actualApi{actual.api_version_major, actual.api_version_minor};

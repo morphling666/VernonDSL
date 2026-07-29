@@ -1,3 +1,5 @@
+include("${CMAKE_CURRENT_LIST_DIR}/../../../cmake/VernonVersions.cmake")
+
 if(NOT DEFINED ARTIFACT
    OR NOT DEFINED OUTPUT
    OR NOT DEFINED OPERATING_SYSTEM
@@ -29,8 +31,7 @@ endif()
 file(
     WRITE "${OUTPUT}/compute.json"
     "{
-  \"schema_version\": 3,
-  \"cpu_invocation_abi_version\": 1,
+  \"pipeline_version\": ${VERNON_PIPELINE_VERSION},
   \"target\": \"cpu\",
   \"operating_system\": \"${OPERATING_SYSTEM}\",
   \"architecture\": \"${ARCHITECTURE}\",
@@ -41,7 +42,8 @@ file(
   \"artifact_size\": ${ARTIFACT_SIZE},
   \"artifact_sha256\": \"${ARTIFACT_SHA256}\",
   \"reflection\": {
-    \"gpu_launch_abi_version\": 1,
+    \"compiler_contract_version\": ${VERNON_COMPILER_CONTRACT_VERSION},
+    \"pipeline_version\": ${VERNON_PIPELINE_VERSION},
     \"entries\": [{
       \"name\": \"fill\",
       \"physical_layouts\": {
@@ -71,16 +73,16 @@ file(
 ")
 
 set(PIPELINE_CANONICAL
-    "{\"features\":[],\"id\":\"cpu/fill\",\"invocation_abi_version\":6,\
+    "{\"features\":[],\"id\":\"cpu/fill\",\"pipeline_version\":${VERNON_PIPELINE_VERSION},\
 \"runtime_requirements\":{\"backend\":\"cpu\",\"features\":[\"compute\",\"tensor_views\"],\
-\"invocation_abi_version\":1,\"object_format\":\"${OBJECT_FORMAT}\",\"target_triple\":\"${TARGET_TRIPLE}\"},\
-\"schema_version\":5,\
+\"object_format\":\"${OBJECT_FORMAT}\",\"target_triple\":\"${TARGET_TRIPLE}\"},\
 \"stage_artifacts\":{\"fill\":{\"architecture\":\"${ARCHITECTURE}\",\
 \"artifact\":{\"format\":\"native_library\",\"path\":\"${ARTIFACT_NAME}\",\
 \"sha256\":\"${ARTIFACT_SHA256}\",\"size\":${ARTIFACT_SIZE},\"storage\":\"external\"},\
-\"cpu_invocation_abi_version\":1,\"entry\":\"fill\",\"format\":\"native_library\",\
+\"entry\":\"fill\",\"format\":\"native_library\",\
 \"id\":\"fill\",\"operating_system\":\"${OPERATING_SYSTEM}\",\
-\"reflection\":{\"entries\":[{\"arguments\":[\
+\"reflection\":{\"compiler_contract_version\":${VERNON_COMPILER_CONTRACT_VERSION},\
+\"entries\":[{\"arguments\":[\
 {\"dtype\":\"f32\",\"element_layout\":{\"alignment\":4,\"byte_size\":4,\
 \"layout_hash\":\"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b\",\
 \"leaves\":[{\"byte_offset\":0,\"dtype\":\"f32\",\"path\":[],\"scalar_count\":1}],\
@@ -91,7 +93,7 @@ set(PIPELINE_CANONICAL
 \"profile\":\"host_value\",\"size\":12}}}],\
 \"name\":\"fill\",\"physical_layouts\":{\"host_value\":{\"packed_arguments_size\":20,\
 \"profile\":\"host_value\"}},\"workgroup_size\":[2,2,1]}],\
-\"gpu_launch_abi_version\":1},\"stage\":\"compute\",\"symbol\":\"vernon_test_fill\",\
+\"pipeline_version\":${VERNON_PIPELINE_VERSION}},\"stage\":\"compute\",\"symbol\":\"vernon_test_fill\",\
 \"target\":\"cpu\"}},\"target\":\"cpu\",\"type\":\"pipeline\",\
 \"variants\":[{\"key\":[],\"outputs\":[{\"access\":\"write\",\"dtype\":\"f32\",\
 \"kind\":\"tensor\",\"location\":0,\"name\":\"result\",\"shape\":[12]}],\

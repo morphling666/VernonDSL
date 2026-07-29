@@ -9,10 +9,20 @@ import numpy as np
 import vernon_dsl as vd
 from vernon_dsl import _native as native
 from vernon_dsl._runtime.resources import _bind_native_argument
+from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
 from vernon_dsl.frontend.compiler import compile_source
 
-CPU_MODULE = r"""
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+
+def _versioned(module: str) -> str:
+    attributes = (
+        f"vernon.compiler_contract_version = {COMPILER_CONTRACT_VERSION} : i64, "
+        f"vernon.pipeline_version = {PIPELINE_VERSION} : i64"
+    )
+    return module.replace("$VERNON_VERSION_ATTRIBUTES", attributes)
+
+
+CPU_MODULE = _versioned(r"""
+module attributes {$VERNON_VERSION_ATTRIBUTES} {
   func.func @increment(
       %values: !vernon.tensor_view<f32, [3], "read_write", "device"> {
         vernon.interface = "resource",
@@ -43,10 +53,10 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
     return
   }
 }
-"""
+""")
 
-MULTI_ENTRY_MODULE = r"""
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+MULTI_ENTRY_MODULE = _versioned(r"""
+module attributes {$VERNON_VERSION_ATTRIBUTES} {
   func.func @vertex_main(
       %position: tensor<4xf32> {
         vernon.interface = "input", vernon.location = 0 : i64
@@ -71,13 +81,12 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
     return %color : tensor<3xf32>
   }
 }
-"""
+""")
 
-CPU_TUPLE_MODULE = r"""
+CPU_TUPLE_MODULE = _versioned(r"""
 module attributes {
   vernon.frontend = "python",
-  vernon.frontend_version = 4 : i64,
-  vernon.value_abi_version = 1 : i64
+  $VERNON_VERSION_ATTRIBUTES
 } {
   "vernon.struct"() {
     fields = ["value:f32", "weight:f64"],
@@ -102,13 +111,12 @@ module attributes {
     return %first : f32
   }
 }
-"""
+""")
 
-CPU_TUPLE_ENTRY_MODULE = r"""
+CPU_TUPLE_ENTRY_MODULE = _versioned(r"""
 module attributes {
   vernon.frontend = "python",
-  vernon.frontend_version = 4 : i64,
-  vernon.value_abi_version = 1 : i64
+  $VERNON_VERSION_ATTRIBUTES
 } {
   func.func @tuple_passthrough(
       %value: tuple<f32, i32> {
@@ -144,7 +152,7 @@ module attributes {
     return %value : tuple<f32, i32>
   }
 }
-"""
+""")
 
 
 class CompiledProgramTests(unittest.TestCase):
@@ -271,7 +279,8 @@ class CompiledProgramTests(unittest.TestCase):
         self.assertTrue(program.ok, program.diagnostics)
         self.assertTrue(program.has_cpu_entry("tuple_first"))
         reflection = json.loads(program.reflection)
-        self.assertEqual(reflection["value_abi_version"], 1)
+        self.assertEqual(reflection["compiler_contract_version"], COMPILER_CONTRACT_VERSION)
+        self.assertEqual(reflection["pipeline_version"], PIPELINE_VERSION)
         self.assertEqual(
             reflection["struct_layouts"],
             [

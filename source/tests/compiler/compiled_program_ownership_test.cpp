@@ -1,3 +1,4 @@
+#include "VernonVersions.h"
 #include "vernon-c/Compiler.h"
 #include "vernon_test_support.h"
 
@@ -7,7 +8,7 @@
 namespace {
 
 constexpr std::string_view module = R"mlir(
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @add_vectors(
       %left: tensor<4xf32> {
         vernon.interface = "input", vernon.location = 0 : i64

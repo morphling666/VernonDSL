@@ -1,5 +1,6 @@
 #include "compiler_artifacts.h"
 
+#include "VernonVersions.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/JSON.h"
@@ -71,7 +72,8 @@ void addArtifactTable(std::string &reflection, const std::vector<Artifact> &arti
     if (!root)
         return;
 
-    (*root)["schema_version"] = int64_t{5};
+    (*root)["compiler_contract_version"] = int64_t{VERNON_COMPILER_CONTRACT_VERSION};
+    (*root)["pipeline_version"] = int64_t{VERNON_PIPELINE_VERSION};
     (*root)["target"] = targetName(target).str();
     llvm::json::Object targetOptions;
     if (target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES)

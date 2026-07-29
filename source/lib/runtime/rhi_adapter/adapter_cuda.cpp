@@ -365,7 +365,7 @@ void destroyPipeline(void *, VernonRuntimeProviderObject handle) {
 
 void initializeCudaProvider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.struct_size = sizeof(adapter.provider);
-    adapter.provider.abi_version = VERNON_RUNTIME_DEVICE_PROVIDER_ABI_VERSION;
+    adapter.provider.abi_version = VERNON_PIPELINE_VERSION;
     adapter.provider.user_data = &adapter;
     adapter.provider.get_capabilities = getCapabilities;
     adapter.provider.get_device_identity = getDeviceIdentity;

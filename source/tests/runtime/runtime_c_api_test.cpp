@@ -27,7 +27,7 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
                 VERNON_STATUS_OK);
     ASSERT_TRUE(vernonRuntimeRegisterStaticCpuEntry({nullptr, 0}, fill_grid) == VERNON_STATUS_INVALID_ARGUMENT);
     static const char reflection[] =
-        "{\"gpu_launch_abi_version\":1,\"entries\":[{\"name\":\"fill\","
+        "{" VERNON_JSON_VERSION_FIELDS ",\"entries\":[{\"name\":\"fill\","
         "\"physical_layouts\":{\"host_value\":{\"profile\":\"host_value\","
         "\"packed_arguments_size\":20}},"
         "\"workgroup_size\":[2,2,1],\"arguments\":["
@@ -47,7 +47,8 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     ASSERT_TRUE(capabilities.available && capabilities.supports_compute);
     VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_TRUE(runtime);
-    static const char bad_reflection[] = "{\"gpu_launch_abi_version\":2,\"entries\":[]}";
+    static const char bad_reflection[] = "{\"compiler_contract_version\":" VERNON_COMPILER_CONTRACT_VERSION_STRING
+                                         ",\"pipeline_version\":0,\"entries\":[]}";
     ASSERT_TRUE(!vernonRuntimeLoadCpuEntry(runtime, fill_grid, bad_reflection, sizeof(bad_reflection) - 1, "fill", 4));
     VernonLoadedPipeline *pipeline =
         vernonRuntimeLoadCpuEntry(runtime, fill_grid, reflection, sizeof(reflection) - 1, "fill", 4);
@@ -70,7 +71,7 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     VernonLaunchSize grid = {3, 2, 2};
     VernonPipelineInvocation invocation = {};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.compute_grid = grid;

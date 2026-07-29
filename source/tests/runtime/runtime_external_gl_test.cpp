@@ -388,11 +388,10 @@ nlohmann::json physicalValueLayout(uint64_t size, uint64_t alignment, std::initi
 
 std::string pipelineBundle(const nlohmann::json &artifact) {
     nlohmann::json root = {
-        {"schema_version", 5},
+        {"pipeline_version", VERNON_PIPELINE_VERSION},
         {"type", "pipeline"},
         {"id", "pipeline/gl"},
         {"target", "opengl"},
-        {"invocation_abi_version", VERNON_PIPELINE_INVOCATION_ABI_VERSION},
         {"features", nlohmann::json::array()},
         {"runtime_requirements",
          {{"backend", "opengl"},
@@ -577,7 +576,7 @@ void expectMatrixUpload(VernonRuntimeBackend backend, const char *target, uint16
     VernonColorAttachment attachment{0, renderTarget.reference, 16, 16, VERNON_TEXTURE_RGBA8_UNORM};
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.color_attachments = &attachment;
@@ -623,8 +622,7 @@ TEST(RuntimeExternalGl, InvokesDirectComputePipelineThroughRuntimeCoreProvider) 
                                      "layout(std430,binding=0) buffer Output{float value[];} outputData;"
                                      "layout(std430,binding=1) readonly buffer Factor{float value;} factor;"
                                      "void main(){outputData.value[gl_LocalInvocationID.x]=factor.value;}";
-    static constexpr char reflection[] = R"({
-      "gpu_launch_abi_version": 1,
+    static constexpr char reflection[] = "{" VERNON_JSON_VERSION_FIELDS R"(,
       "entries": [{
         "name": "main",
         "workgroup_size": [4, 1, 1],
@@ -677,7 +675,7 @@ TEST(RuntimeExternalGl, InvokesDirectComputePipelineThroughRuntimeCoreProvider) 
     arguments[1].tensor.byte_size = sizeof(factor);
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments;
     invocation.argument_count = 2;
     invocation.compute_grid = {4, 1, 1};
@@ -832,7 +830,7 @@ TEST(RuntimeExternalGl, SuppliesImplicitSamplerAndEffectiveResolution) {
     VernonColorAttachment attachment{0, target.reference, 16, 12, VERNON_TEXTURE_RGBA8_UNORM};
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.color_attachments = &attachment;
@@ -947,7 +945,7 @@ TEST(RuntimeExternalGl, ExecutionGraphFusesDrawsAndSubmitsOnce) {
     VernonColorAttachment attachment{0, target.reference, 16, 12, VERNON_TEXTURE_RGBA8_UNORM};
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.color_attachments = &attachment;
@@ -1028,7 +1026,7 @@ TEST(RuntimeExternalGl, ExplicitSamplerOverridesTextureViewSampler) {
     VernonColorAttachment attachment{0, target.reference, 16, 12, VERNON_TEXTURE_RGBA8_UNORM};
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments;
     invocation.argument_count = std::size(arguments);
     invocation.color_attachments = &attachment;
@@ -1090,7 +1088,7 @@ TEST(RuntimeExternalGl, BindsVertexAndIndexBuffersThroughRhi) {
     const VernonColorAttachment attachment{0, target.reference, 16, 16, VERNON_TEXTURE_RGBA8_UNORM};
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.index_binding = &indexBinding;
@@ -1174,7 +1172,7 @@ TEST(RuntimeExternalGl, BindsAllFormalVertexNumericFormatsAndRejectsUnsupportedF
         const VernonColorAttachment attachment{0, target.reference, 16, 16, VERNON_TEXTURE_RGBA8_UNORM};
         VernonPipelineInvocation invocation{};
         invocation.struct_size = sizeof(invocation);
-        invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+        invocation.abi_version = VERNON_PIPELINE_VERSION;
         invocation.arguments = &argument;
         invocation.argument_count = 1;
         invocation.color_attachments = &attachment;
@@ -1245,7 +1243,7 @@ TEST(RuntimeExternalGl, LoadsAssetsAndInvokesPipeline) {
     attachment.clear_color[1] = 0.5f;
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.color_attachments = &attachment;
     invocation.color_attachment_count = 1;
     invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;

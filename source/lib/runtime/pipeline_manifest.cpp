@@ -861,19 +861,17 @@ bool parseRuntimeRequirements(const nlohmann::json &root, const std::string &tar
         return false;
     }
     if (target == "cpu") {
-        if (!hasOnlyKeys(value, {"backend", "features", "target_triple", "object_format", "invocation_abi_version"}) ||
+        if (!hasOnlyKeys(value, {"backend", "features", "target_triple", "object_format"}) ||
             !value.contains("target_triple") || !value["target_triple"].is_string() ||
             value["target_triple"].get_ref<const std::string &>().empty() || !value.contains("object_format") ||
-            !value["object_format"].is_string() || !value.contains("invocation_abi_version") ||
-            !parseUint32(value["invocation_abi_version"], requirements.invocationAbiVersion)) {
+            !value["object_format"].is_string()) {
             error = "CPU runtime requirements are invalid";
             return false;
         }
         requirements.targetTriple = value["target_triple"].get<std::string>();
         requirements.objectFormat = value["object_format"].get<std::string>();
         if ((requirements.objectFormat != "coff" && requirements.objectFormat != "elf" &&
-             requirements.objectFormat != "macho" && requirements.objectFormat != "wasm") ||
-            requirements.invocationAbiVersion == 0) {
+             requirements.objectFormat != "macho" && requirements.objectFormat != "wasm")) {
             error = "CPU runtime requirements are invalid";
             return false;
         }

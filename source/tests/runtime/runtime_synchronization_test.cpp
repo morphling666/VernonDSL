@@ -1,5 +1,6 @@
 #include "VernonCompiler.h"
 #include "VernonRuntime.h"
+#include "VernonVersions.h"
 #include "runtime_rhi_test_utils.h"
 
 #include <algorithm>
@@ -29,7 +30,7 @@ TEST_P(RuntimeSynchronization, ExecutesIndependentWorkgroupBarrierAndAtomic) {
         GTEST_SKIP() << backend.name << " runtime backend is unavailable";
 
     static constexpr char module[] = R"mlir(
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @synchronize(
       %output: !vernon.tensor_view<i32, [10], "write", "device"> {
         vernon.interface = "resource",
@@ -124,7 +125,7 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
     argument.tensor.byte_size = sizeof(initial);
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.compute_grid = {8, 1, 1};

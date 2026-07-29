@@ -1,9 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../cmake/VernonVersions.cmake")
+    include("${CMAKE_CURRENT_SOURCE_DIR}/../../../cmake/VernonVersions.cmake")
+else()
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VernonVersions.cmake")
+endif()
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     project(
         VernonRuntime
-        VERSION 0.1.0
+        VERSION ${VERNON_RELEASE_VERSION}
         LANGUAGES C CXX)
     set(CMAKE_CXX_STANDARD
         17
@@ -126,11 +131,12 @@ if(SKBUILD)
         DESTINATION vernon_dsl/runtime_src
         COMPONENT VernonWheel)
     install(
-        FILES "${_vernon_runtime_target_file}"
+        FILES "${_vernon_runtime_target_file}" "${_vernon_repository_root}/cmake/VernonVersions.cmake"
         DESTINATION vernon_dsl/runtime_src/cmake
         COMPONENT VernonWheel)
     install(
-        FILES "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonCommon.h"
+        FILES "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonVersions.h"
+              "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonCommon.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonOpenGLContext.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.hpp"

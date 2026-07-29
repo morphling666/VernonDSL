@@ -20,6 +20,7 @@ PYTHON_TEST_ROOT = PROJECT_ROOT / "python" / "tests"
 sys.path.insert(0, str(PYTHON_TEST_ROOT))
 
 from vernon_dsl import _native as native  # noqa: E402
+from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION  # noqa: E402
 
 NATIVE_PATH = Path(native.__file__).resolve()
 if len(sys.argv) >= 3:
@@ -238,7 +239,8 @@ class CompileSurfaceParityTests(unittest.TestCase):
                         ]
                     self.assertEqual(cli_reflection, direct_reflection)
                     self.assertEqual(cli_artifacts, direct_artifacts)
-                    self.assertEqual(owning_reflection["schema_version"], 5)
+                    self.assertEqual(owning_reflection["compiler_contract_version"], COMPILER_CONTRACT_VERSION)
+                    self.assertEqual(owning_reflection["pipeline_version"], PIPELINE_VERSION)
                     self.assertEqual(owning_reflection["target"], target_name)
                     if glsl_version:
                         self.assertEqual(owning_reflection["target_options"]["glsl_version"], glsl_version)

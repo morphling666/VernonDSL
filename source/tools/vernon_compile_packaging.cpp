@@ -1,5 +1,6 @@
 #include "vernon_compile_packaging.h"
 
+#include "VernonVersions.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/JSON.h"
@@ -190,10 +191,9 @@ VernonStatus packageCompileResult(VernonCompilerContext *context, const VernonCo
                                       packagedArtifact.size());
         std::string digest = llvm::toHex(llvm::SHA256::hash(bytes), true);
         llvm::json::Object manifest;
-        manifest["schema_version"] = target == VERNON_TARGET_CPU ? int64_t{3} : int64_t{1};
-        manifest["compiler_version"] = "0.1.0";
+        manifest["pipeline_version"] = int64_t{VERNON_PIPELINE_VERSION};
+        manifest["release_version"] = VERNON_RELEASE_VERSION;
         if (target == VERNON_TARGET_CPU) {
-            manifest["cpu_invocation_abi_version"] = int64_t{1};
             if (options.hostRuntimeBundle) {
                 manifest["operating_system"] = std::string(hostOperatingSystem());
                 manifest["architecture"] = std::string(hostArchitecture());
@@ -203,8 +203,6 @@ VernonStatus packageCompileResult(VernonCompilerContext *context, const VernonCo
                 manifest["target_triple"] = triple.str();
                 manifest["object_format"] = objectFormat(triple);
             }
-        } else {
-            manifest["gpu_launch_abi_version"] = int64_t{1};
         }
         manifest["target"] = std::string(targetName(target));
         manifest["entry"] = computeEntry->getString("name").value_or("").str();

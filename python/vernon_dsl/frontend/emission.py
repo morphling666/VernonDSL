@@ -4,8 +4,8 @@ import ast
 import json
 from collections.abc import Callable, Mapping
 
+from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
 from ..diagnostics import CompileError
-from ..language.syntax import FRONTEND_VERSION
 from .abi import value_abi_layout
 from .model import ConcreteType
 from .type_parser import AnnotatedType
@@ -23,8 +23,8 @@ def emit_mlir_module(
 ) -> str:
     attributes = [
         'vernon.frontend = "python"',
-        f"vernon.frontend_version = {FRONTEND_VERSION} : i64",
-        "vernon.value_abi_version = 1 : i64",
+        f"vernon.compiler_contract_version = {COMPILER_CONTRACT_VERSION} : i64",
+        f"vernon.pipeline_version = {PIPELINE_VERSION} : i64",
     ]
     if dependencies:
         encoded = ", ".join(json.dumps(f"{path}={digest}") for path, digest in dependencies)

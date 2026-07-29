@@ -58,7 +58,7 @@ bool planVertexTensor(const char *dtype, VernonDataType dataType, const std::vec
     attachment.height = 16;
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.color_attachments = &attachment;
@@ -131,7 +131,7 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     const VernonIndexBinding index{VERNON_INDEX_U32, 0, 6, indexBuffer};
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments;
     invocation.argument_count = std::size(arguments);
     invocation.index_binding = &index;

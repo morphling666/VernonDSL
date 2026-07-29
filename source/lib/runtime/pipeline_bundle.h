@@ -24,7 +24,6 @@ struct CpuNativeArtifact {
     std::string architecture;
     std::string targetTriple;
     std::string objectFormat;
-    uint32_t invocationAbiVersion{};
     uint64_t size{};
     std::string sha256;
     nlohmann::json reflection;
@@ -49,7 +48,7 @@ struct Stage {
 
 bool validateManifestHash(const nlohmann::json &root, bool required, std::string &error);
 bool validateCpuRuntimeRequirements(const std::string &targetTriple, const std::string &objectFormat,
-                                    uint32_t invocationAbiVersion, std::string &error);
+                                    std::string &error);
 
 bool resolveArtifact(const nlohmann::json &descriptor, const std::optional<std::filesystem::path> &directory,
                      ResolvedArtifact &output, std::string &error);

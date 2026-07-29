@@ -187,10 +187,10 @@ VernonStatus vernonRuntimePipelineBundleInspectTarget(const void *bundleData, si
             static_cast<const char *>(bundleData), static_cast<const char *>(bundleData) + bundleSize, nullptr, false);
         if (root.is_discarded() || !root.is_object())
             return VERNON_STATUS_PARSE_ERROR;
-        const bool pipelineSchema = root.value("schema_version", 0) == 5 && root.value("type", "") == "pipeline";
+        const bool pipelineSchema =
+            root.value("pipeline_version", 0) == VERNON_PIPELINE_VERSION && root.value("type", "") == "pipeline";
         std::string manifestError;
-        if (!pipelineSchema || root.value("invocation_abi_version", 0) != VERNON_PIPELINE_INVOCATION_ABI_VERSION ||
-            !validateManifestHash(root, true, manifestError))
+        if (!pipelineSchema || !validateManifestHash(root, true, manifestError))
             return VERNON_STATUS_PARSE_ERROR;
         const std::string name = root.value("target", "");
         if (name == "cpu")
@@ -234,10 +234,9 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                                      : context->backend == VERNON_RUNTIME_DIRECTX12
                                          ? "directx"
                                          : (context->backend == VERNON_RUNTIME_OPENGL_ES ? "opengles" : "opengl");
-        const bool pipelineSchema =
-            root.is_object() && root.value("schema_version", 0) == 5 && root.value("type", "") == "pipeline";
-        if (!pipelineSchema || root.value("invocation_abi_version", 0) != VERNON_PIPELINE_INVOCATION_ABI_VERSION ||
-            root.value("target", "") != expectedTarget || !root.contains("stage_artifacts") ||
+        const bool pipelineSchema = root.is_object() && root.value("pipeline_version", 0) == VERNON_PIPELINE_VERSION &&
+                                    root.value("type", "") == "pipeline";
+        if (!pipelineSchema || root.value("target", "") != expectedTarget || !root.contains("stage_artifacts") ||
             !root["stage_artifacts"].is_object() || !root.contains("variants") || !root["variants"].is_array()) {
             fail(context, "unsupported or invalid pipeline bundle");
             return nullptr;
@@ -327,7 +326,6 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                 artifact.architecture = value.value("architecture", "");
                 artifact.targetTriple = value.value("target_triple", "");
                 artifact.objectFormat = value.value("object_format", "");
-                artifact.invocationAbiVersion = value.value("cpu_invocation_abi_version", 0u);
                 artifact.size = nativeArtifact.value("size", uint64_t{0});
                 artifact.sha256 = nativeArtifact.value("sha256", "");
                 if (value.contains("reflection"))
@@ -615,8 +613,7 @@ void vernonRuntimeLoadedPipelineDestroy(VernonLoadedPipeline *pipeline) {
 
 VernonStatus vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline, const VernonPipelineInvocation *invocation) {
     if (!pipeline || !invocation || invocation->struct_size < sizeof(VernonPipelineInvocation) ||
-        invocation->abi_version != VERNON_PIPELINE_INVOCATION_ABI_VERSION ||
-        (invocation->argument_count && !invocation->arguments))
+        invocation->abi_version != VERNON_PIPELINE_VERSION || (invocation->argument_count && !invocation->arguments))
         return fail(pipeline ? pipeline->context : nullptr, "invalid pipeline invocation");
     auto encode = [&](const VernonPipelineInvocation &encoded) {
         if (!pipeline->variant.compute.empty()) {

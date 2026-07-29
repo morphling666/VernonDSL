@@ -121,7 +121,6 @@ struct RuntimeRequirements {
     uint32_t computeWorkgroupSize[3]{1, 1, 1};
     uint32_t glslVersion{};
     uint32_t addressSize{};
-    uint32_t invocationAbiVersion{};
     std::string targetTriple;
     std::string objectFormat;
     std::string profile;

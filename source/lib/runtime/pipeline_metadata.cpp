@@ -1,6 +1,7 @@
 #include "pipeline_metadata.h"
 #include "pipeline_manifest.h"
 
+#include "VernonVersions.h"
 #include <nlohmann/json.hpp>
 
 #include <utility>
@@ -36,7 +37,8 @@ const char *physicalValueProfileName(VernonRuntimeBackend backend, const std::st
 
 bool parseReflection(const nlohmann::json &root, const std::string &selected, ReflectedEntry &output,
                      VernonRuntimeBackend backend, std::string &error) {
-    if (!root.is_object() || root.value("gpu_launch_abi_version", 0) != 1 || !root.contains("entries") ||
+    if (!root.is_object() || root.value("compiler_contract_version", 0) != VERNON_COMPILER_CONTRACT_VERSION ||
+        root.value("pipeline_version", 0) != VERNON_PIPELINE_VERSION || !root.contains("entries") ||
         !root["entries"].is_array()) {
         error = "unsupported or invalid compute reflection";
         return false;

@@ -124,7 +124,7 @@ bool validateManifestHash(const nlohmann::json &root, bool required, std::string
 }
 
 bool validateCpuRuntimeRequirements(const std::string &targetTriple, const std::string &objectFormat,
-                                    uint32_t invocationAbiVersion, std::string &error) {
+                                    std::string &error) {
 #if defined(_WIN32)
     constexpr const char *hostFormat = "coff";
     constexpr const char *hostOsToken = "windows";
@@ -138,11 +138,9 @@ bool validateCpuRuntimeRequirements(const std::string &targetTriple, const std::
     const std::string architecture = hostArchitecture();
     const bool architectureMatches =
         targetTriple.rfind(architecture, 0) == 0 || (architecture == "x86_64" && targetTriple.rfind("amd64", 0) == 0);
-    if (!architectureMatches || targetTriple.find(hostOsToken) == std::string::npos || objectFormat != hostFormat ||
-        invocationAbiVersion != VERNON_CPU_INVOCATION_ABI_VERSION) {
-        error = "pipeline requires CPU target " + targetTriple + " / " + objectFormat + " / ABI " +
-                std::to_string(invocationAbiVersion) + ", runtime provides " + architecture + "-" + hostOsToken +
-                " / " + hostFormat + " / ABI " + std::to_string(VERNON_CPU_INVOCATION_ABI_VERSION);
+    if (!architectureMatches || targetTriple.find(hostOsToken) == std::string::npos || objectFormat != hostFormat) {
+        error = "pipeline requires CPU target " + targetTriple + " / " + objectFormat + ", runtime provides " +
+                architecture + "-" + hostOsToken + " / " + hostFormat;
         return false;
     }
     return true;
@@ -239,8 +237,7 @@ bool resolveCpuNativeArtifact(const CpuNativeArtifact &artifact, std::filesystem
          (artifact.operatingSystem != hostOperatingSystem() || artifact.architecture != hostArchitecture())) ||
         (relocatableObject &&
          (artifact.targetTriple.empty() || (artifact.objectFormat != "coff" && artifact.objectFormat != "elf" &&
-                                            artifact.objectFormat != "macho" && artifact.objectFormat != "wasm"))) ||
-        artifact.invocationAbiVersion != VERNON_CPU_INVOCATION_ABI_VERSION) {
+                                            artifact.objectFormat != "macho" && artifact.objectFormat != "wasm")))) {
         error = "unsupported or invalid CPU AOT artifact";
         return false;
     }
@@ -286,9 +283,9 @@ bool resolveCpuNativeArtifact(const CpuNativeArtifact &artifact, std::filesystem
 bool parseCpuComputeBundle(const std::filesystem::path &root, CpuNativeArtifact &artifact, std::string &error) {
     const std::vector<uint8_t> manifestBytes = readFile(root / "compute.json");
     const nlohmann::json manifest = nlohmann::json::parse(manifestBytes.begin(), manifestBytes.end(), nullptr, false);
-    if (manifest.is_discarded() || !manifest.is_object() || manifest.value("schema_version", 0) != 3 ||
-        manifest.value("target", "") != "cpu" || manifest.value("artifact_format", "") != "native_library" ||
-        !manifest.contains("reflection")) {
+    if (manifest.is_discarded() || !manifest.is_object() ||
+        manifest.value("pipeline_version", 0) != VERNON_PIPELINE_VERSION || manifest.value("target", "") != "cpu" ||
+        manifest.value("artifact_format", "") != "native_library" || !manifest.contains("reflection")) {
         error = "unsupported or invalid CPU AOT bundle";
         return false;
     }
@@ -299,7 +296,6 @@ bool parseCpuComputeBundle(const std::filesystem::path &root, CpuNativeArtifact 
     artifact.symbol = manifest.value("symbol", "");
     artifact.operatingSystem = manifest.value("operating_system", "");
     artifact.architecture = manifest.value("architecture", "");
-    artifact.invocationAbiVersion = manifest.value("cpu_invocation_abi_version", 0u);
     artifact.size = manifest.value("artifact_size", uint64_t{0});
     artifact.sha256 = manifest.value("artifact_sha256", "");
     artifact.reflection = manifest["reflection"];

@@ -913,7 +913,7 @@ struct PipelineInvocationBuilder {
             values.push_back(argument.value);
         VernonPipelineInvocation invocation{};
         invocation.struct_size = sizeof(invocation);
-        invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+        invocation.abi_version = VERNON_PIPELINE_VERSION;
         invocation.arguments = values.empty() ? nullptr : values.data();
         invocation.argument_count = values.size();
         invocation.index_binding = hasIndex ? &index : nullptr;
@@ -1054,7 +1054,7 @@ struct LoadedPipeline {
         }
         VernonPipelineInvocation invocation{};
         invocation.struct_size = sizeof(invocation);
-        invocation.abi_version = VERNON_PIPELINE_INVOCATION_ABI_VERSION;
+        invocation.abi_version = VERNON_PIPELINE_VERSION;
         invocation.arguments = arguments.data();
         invocation.argument_count = arguments.size();
         invocation.compute_grid = {x, y, z};

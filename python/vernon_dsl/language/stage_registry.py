@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
-STAGE_REGISTRY_VERSION = 2
-
 
 @dataclass(frozen=True)
 class StageDefinition:
@@ -83,7 +81,6 @@ __all__ = [
     "STAGES",
     "STAGE_BY_DECORATOR",
     "STAGE_BY_KIND",
-    "STAGE_REGISTRY_VERSION",
     "StageDefinition",
     "validate_graphics_topology",
     "validate_stage_target",

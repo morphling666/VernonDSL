@@ -1,4 +1,4 @@
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+module attributes {vernon.compiler_contract_version = 5 : i64, vernon.pipeline_version = 7 : i64} {
   func.func @tensor_view_round_trip(
       %view: !vernon.tensor_view<f32, [-1], "read_write", "device"> {
         vernon.tensor_strides = array<i64: 1>,

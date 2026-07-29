@@ -1,4 +1,5 @@
 #include "VernonCompiler.h"
+#include "VernonVersions.h"
 
 #include <gtest/gtest.h>
 
@@ -8,7 +9,7 @@
 namespace {
 
 constexpr std::string_view synchronizationModule = R"mlir(
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @synchronize(
       %output: !vernon.tensor_view<i32, [1], "write", "device"> {
         vernon.interface = "resource",
@@ -40,7 +41,7 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
 )mlir";
 
 constexpr std::string_view aggregateWorkgroupModule = R"mlir(
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   "vernon.struct"() {
     sym_name = "Pair",
     fields = ["left:i32", "right:f32"],
@@ -72,7 +73,7 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
 )mlir";
 
 constexpr std::string_view storageAtomicModule = R"mlir(
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @storage_atomic(
       %values: !vernon.tensor_view<i32, [64], "read_write", "device"> {
         vernon.interface = "resource",
@@ -98,7 +99,7 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
 )mlir";
 
 constexpr std::string_view invalidMemrefScopeModule = R"mlir(
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @invalid_scope(
       %storage: !vernon.tensor_view<i32, [8], "read_write", "private">) {
     %index = arith.constant 0 : index
@@ -112,7 +113,7 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
 )mlir";
 
 constexpr std::string_view workgroupBuiltinModule = R"mlir(
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @builtin_probe(
       %local_id: tensor<3xi32> {
         vernon.interface = "input",
@@ -136,7 +137,7 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
 )mlir";
 
 constexpr std::string_view nestedAggregateWorkgroupModule = R"mlir(
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   "vernon.struct"() {
     sym_name = "Pair",
     fields = ["left:i32", "right:f32"],
@@ -184,7 +185,7 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
 )mlir";
 
 constexpr std::string_view combinedAggregateWorkgroupModule = R"mlir(
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   "vernon.struct"() {
     sym_name = "Pair",
     fields = ["left:i32", "right:f32"],
@@ -205,7 +206,7 @@ module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version =
 )mlir";
 
 constexpr std::string_view noResultConditionalModule = R"mlir(
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @conditional(
       %lane: index {
         vernon.interface = "input",
@@ -285,7 +286,7 @@ TEST(CompilerSynchronization, RejectsAggregateWorkgroupStorageAboveCanonicalLimi
 
 TEST(CompilerSynchronization, RejectsOverflowingWorkgroupPhysicalStorage) {
     constexpr std::string_view module = R"mlir(
-module attributes {vernon.frontend_version = 4 : i64, vernon.value_abi_version = 1 : i64} {
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @overflow() attributes {
       vernon.entry,
       vernon.stage = "compute",

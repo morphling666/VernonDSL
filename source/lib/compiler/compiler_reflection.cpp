@@ -955,14 +955,13 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
         return mlir::failure();
 
     llvm::json::Object root;
-    root["schema_version"] = int64_t{5};
-    root["gpu_launch_abi_version"] = int64_t{1};
-    auto valueAbiVersion = sourceModule->getAttrOfType<mlir::IntegerAttr>("vernon.value_abi_version");
-    if (!valueAbiVersion || valueAbiVersion.getInt() != mlir::vernon::kCurrentValueAbiVersion) {
-        sourceModule.emitError("cannot reflect a module with a missing or unsupported Value ABI version");
+    root["compiler_contract_version"] = int64_t{VERNON_COMPILER_CONTRACT_VERSION};
+    root["pipeline_version"] = int64_t{VERNON_PIPELINE_VERSION};
+    auto compilerContractVersion = sourceModule->getAttrOfType<mlir::IntegerAttr>("vernon.compiler_contract_version");
+    if (!compilerContractVersion || compilerContractVersion.getInt() != VERNON_COMPILER_CONTRACT_VERSION) {
+        sourceModule.emitError("cannot reflect a module with a missing or unsupported compiler contract version");
         return mlir::failure();
     }
-    root["value_abi_version"] = valueAbiVersion.getInt();
     root["entries"] = std::move(entries);
     root["artifacts"] = llvm::json::Array();
     std::map<std::string, llvm::json::Object> structLayouts;

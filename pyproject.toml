@@ -1,6 +1,6 @@
 [project]
 name = "vernon-lang"
-version = "0.1.0"
+dynamic = ["version"]
 description = "General parallel compiler"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -42,6 +42,11 @@ wheel.packages = ["python/vernon_dsl"]
 cmake.build-type = "Release"
 cmake.args = ["-DBUILD_TESTING=OFF"]
 install.components = ["VernonWheel"]
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "python/vernon_dsl/_versions.py"
+regex = 'RELEASE_VERSION = "(?P<value>[^"]+)"'
 
 [tool.ruff]
 line-length = 120
