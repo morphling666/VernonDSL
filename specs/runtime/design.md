@@ -422,12 +422,14 @@ imported host buffer, texture, and sampler names without deleting them. It also
 creates owned child resources for standalone execution; all GL allocation,
 transfer, deletion, and invocation operations first make the associated
 context current.
-Pipeline ABI v3 represents every numeric argument as one `VernonTensorView`.
-The storage discriminator selects borrowed host memory or a runtime-owned
-device buffer; shape and positive byte strides describe logical indexing, and
-byte offset/size bound every reachable element. Host pointers are borrowed only
-for the synchronous invocation. Device compute views remain contiguous
-whole-buffer views because the compute launch ABI has no offset/stride fields.
+Pipeline ABI v4 represents every numeric argument as one `VernonTensorView`.
+The storage discriminator selects immutable host Value transport, borrowed
+TensorStorage memory, or a runtime-owned device allocation. TensorView records
+carry shape, signed byte strides, and byte offset/size so full-owner and
+explicit subview dispatch preserve identical logical addressing. A host pointer
+used for an asynchronous dispatch remains borrowed, and its TensorStorage owner
+is retained, until backend completion. Schema-v3 readers are removed rather
+than translated.
 
 OpenGL uploads native column-major matrices directly with `transpose=false`.
 Desktop OpenGL also uploads native row-major matrices directly with
@@ -437,10 +439,11 @@ push constants are packed by logical indices and Tensor strides.
 
 ## Tensor indexing
 
-Addressable Tensor and explicit TensorView parameters lower from
-`!vernon.tensor_view` to backend memrefs or storage resources. Multidimensional
-indices are flattened in NumPy-compatible row-major order:
-`linear = ((i0 * d1 + i1) * d2 + i2) ...`.
+Explicit TensorView parameters and `workgroup_storage` results lower from the
+same address-space-parameterized `!vernon.tensor_view` family to backend
+memrefs or storage resources. Owned workgroup views are flattened in
+row-major order. External views use their validated projection:
+`linear = offset + sum(index[d] * stride[d])`.
 Strided host packing identifies the maximal row-major contiguous suffix and
 copies one block per outer index. This preserves arbitrary positive-stride
 views while avoiding per-element index division and tiny copies for common

@@ -287,7 +287,7 @@ Priority 2 is now implemented:
 
 Final validation completed all 122 CTest entries successfully; the unavailable
 CUDA image/sampler lifetime and OpenGL synchronization cases were explicitly
-skipped. The Python suite passed all 321 tests, including CUDA aggregate
+skipped. The Python suite passed all 322 tests, including CUDA aggregate
 dispatch and CPU/CUDA/Vulkan global atomic race coverage.
 
 #### Post-implementation audit follow-up

@@ -159,6 +159,165 @@ IR and must not implicitly become that public execution API.
 - [ ] Extend effect analysis to atomics, barriers, races, and
       differentiability-relevant reads and overwrites.
 
+### Phase 6 unified TensorView Storage
+
+The accepted source, IR, binding, ABI, and migration contract is maintained in
+[`tensor_view.md`](tensor_view.md). This section records the motivation and
+roadmap boundary; the dedicated contract is authoritative where details
+overlap.
+
+The current `workgroup_array(T, N)` implementation proves the backend
+mechanism, but a one-dimensional operation-specific type is not the intended
+long-term type-system boundary. The candidate model is one Storage category
+whose views carry an address space in addition to element, rank, layout, and
+access information:
+
+```text
+TensorView[
+    element = i32,
+    shape = (8, 8),
+    strides = (8, 1),
+    offset = 0,
+    address_space = workgroup,
+    access = read_write,
+]
+```
+
+This is Storage, not a `Tensor` Value. Shape and strides describe indexing;
+`address_space` determines ownership, visibility, lifetime, legal operations,
+and synchronization scope. In particular:
+
+- `private` storage belongs to one invocation;
+- `workgroup` storage is shared only by invocations in one workgroup and each
+  workgroup receives an independent allocation;
+- `device` storage is visible through an externally owned allocation such as a
+  kernel `TensorView`;
+- uniform and host-visible spaces require separate mutability and interface
+  rules rather than aliases for device storage.
+
+Address space is part of the compiler's concrete semantic Storage type, but is
+not written in an ordinary source annotation. It is inferred from origin:
+
+- a kernel `TensorView` parameter is device storage;
+- `workgroup_storage` produces workgroup storage;
+- future private-storage constructors produce invocation-private storage.
+
+The source API constructs a legal storage class rather than accepting an
+arbitrary address-space string:
+
+```python
+input: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.read]
+output: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write]
+shared = vd.workgroup_storage(vd.i32, shape=(8, 8))
+shared[y, x] = value
+value = shared[y, x]
+previous = vd.atomic_add(shared, (y, x), 1)
+```
+
+`vd.dyn` is an immutable type-level marker for one runtime-resolved dimension,
+so annotation rank remains explicit. Static and dynamic dimensions may be
+mixed. Shape is part of the source Storage contract; strides and offset are
+layout metadata rather than core type identity.
+
+At an external entry boundary, a host `TensorStorage` owner is accepted as its
+canonical full `TensorView`; an explicitly constructed subview is accepted
+without losing its layout. For example, one row-major `TensorStorage` with
+shape `(4, 4)` may provide two disjoint `(2, 2)` inputs:
+
+```python
+upper_left = storage.view(
+    shape=(2, 2),
+    strides=(4, 1),
+    offset=0,
+    access="read",
+)
+lower_right = storage.view(
+    shape=(2, 2),
+    strides=(4, 1),
+    offset=10,
+    access="read",
+)
+kernel(upper_left, lower_right)
+```
+
+The concrete descriptors have the same owner and device address space but
+different offsets. Their logical indices are projected through
+`offset + y * 4 + x`. Region analysis therefore proves these two views
+disjoint even though they borrow one owner. Passing the owner itself instead
+means `shape=(4, 4)`, canonical `strides=(4, 1)`, and `offset=0`.
+
+Dynamic dimensions are valid for externally owned device `TensorView`
+parameters. Every `workgroup_storage` extent must be a positive compile-time
+integer after specialization. Literal constants and captured host constants
+may determine those extents, with captured constants participating in cache
+identity and causing recompilation when changed. Kernel arguments and other
+device-runtime values may not determine workgroup allocation size. The core
+language does not expose CUDA-only dynamic shared memory.
+
+Owned `workgroup_storage` uses contiguous row-major layout. Its strides are
+derived canonically from shape and are not exposed as constructor arguments.
+Strided workgroup projections are deferred until a concrete algorithm
+requires them. The multi-dimensional atomic index is lowered through the same
+checked linearization as an ordinary load or store:
+
+```text
+linear_index = offset + sum(index[d] * stride[d])
+```
+
+Atomic scope is inferred from the storage address space and is not an
+independent source argument:
+
+```text
+workgroup storage -> workgroup scope
+device storage    -> device scope
+```
+
+An explicit scope that contradicts the address space must fail verification.
+Barrier scope remains explicit because a barrier is not tied to one storage
+operand. Atomic ordering remains explicit in the semantic effect even when the
+initial public operation supports only `relaxed`.
+
+The design must not introduce a fourth semantic category. A rank-one
+workgroup allocation and a rank-two workgroup allocation are both
+`TensorView`; `workgroup_array` must not remain as a parallel semantic model.
+Whether it is removed directly or replaced by the canonical constructor is a
+language-version migration decision, not a backend compatibility path.
+
+The accepted source-level direction is therefore:
+
+- `Tensor` is an immutable Value;
+- `TensorView` is the only non-owning shaped Storage type;
+- `TensorStorage` remains the host owner and is not a device-language type;
+- address space is inferred and cannot be forged in ordinary source;
+- `workgroup_storage` replaces `workgroup_array` directly, without a
+  compatibility alias;
+- shape uses static integer extents and `vd.dyn` dimensions, while
+  strides and offset remain layout metadata;
+- workgroup allocation shape is fully static after specialization, while
+  device `TensorView` parameters may use dynamic dimensions;
+- owned workgroup layout is contiguous row-major and does not expose stride or
+  offset controls.
+
+The remaining design choices are resolved as follows:
+
+1. **Atomic indexing:** rank one accepts a scalar index; higher ranks require a
+   tuple with exactly one index per dimension.
+2. **Atomic element types:** the initial set remains i32/u32. Wider integers
+   and floating-point atomics require explicit capability contracts and are not
+   emulated implicitly.
+3. **IR representation:** Vernon IR uses one address-space-parameterized
+   Storage type with unified ranked load, store, and atomic operations.
+4. **Workgroup elements:** every recursively ABI-stable Value element is legal
+   and lowers through canonical ABI leaves.
+5. **Portable allocation:** workgroup storage is fully static after
+   specialization and initially limited to 16 KiB after ABI layout.
+
+Acceptance requires frontend inference, effect ownership, MLIR verification,
+CPU reference behavior, backend lowering, reflection where externally
+visible, and multi-workgroup runtime tests for every accepted shape/index
+form. Tests must demonstrate independent allocations between workgroups and
+barrier-visible writes within one workgroup.
+
 ## Phase 7: stateful kernel autodiff
 
 - [ ] Functionalize local mutation and TensorView writes before reverse-mode

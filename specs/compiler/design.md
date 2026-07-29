@@ -85,7 +85,7 @@ Neither bundle planning nor serialization imports the Python frontend or
 Runtime, allowing cooked-manifest identity to be tested independently of
 compiler and device availability.
 
-Runtime Tensor, TensorView, TensorLayout, and Texture implementations live in
+Runtime TensorStorage, TensorView, TensorLayout, and Texture implementations live in
 `_runtime.resources`. They resolve the owning session only when allocating or
 registering a resource, so importing annotation/resource types does not create
 a session import cycle. Runtime generation, native context ownership, and child
@@ -140,7 +140,7 @@ does not embed CPython.
 
 Completed frontend requests are cached by the immutable
 `FrontendCompileRequest`, including source path, entry, features, captured
-constants, Tensor shapes, TensorView layouts, and workgroup size. Each hit
+constants, Tensor shapes, TensorView constraints/layouts, and workgroup size. Each hit
 rehashes every previously discovered source dependency before returning the
 immutable semantic result. This keeps the hit path independent of Python AST
 objects while invalidating changes to any transitive module; failed requests
@@ -623,13 +623,14 @@ function, including entry functions, before MLIR emission. Concrete reachable
 helper specialization keys are copied into frontend semantic cache inputs;
 transient fixed-point probe instances are excluded by the reachability pass.
 
-Tensor addressability is a typed-value storage property, not a source or
-semantic type. Compute entry Tensor parameters retain their Tensor element and
-shape type while carrying `ADDRESSABLE` plus read/write access; ABI lowering
-maps that combination to `!vernon.tensor_view`. Public `Buffer` source syntax
-and `!vernon.buffer` IR have been removed; explicit storage parameters use
-`TensorView`, while untyped external bytes use `RawBuffer`. Backend conversion
-lowers TensorView to target memrefs or storage resources.
+Tensor Values and TensorView Storage are distinct semantic categories within
+one public Tensor family. Compute entry
+`TensorView[T, shape, access]` parameters infer device address space;
+`workgroup_storage` results infer workgroup address space. Lowering maps both
+to one address-space-parameterized `!vernon.tensor_view` type. Public `Buffer`,
+`workgroup_array`, `!vernon.buffer`, and `!vernon.workgroup` spellings are
+removed. Untyped external bytes remain `RawBuffer`. Backend conversion lowers
+TensorView to target memrefs or storage resources.
 
 Inference produces deterministic typed function, statement, expression,
 lvalue, effect, termination, and branch/loop-merge records. Each expression
@@ -678,7 +679,8 @@ boundaries still use the backend-independent product layout from the language
 contract, independent of these internal representations.
 
 `TensorStorage` owns dense runtime allocation and `TensorView` carries owner,
-runtime shape, element strides, offset, address space, and access mode.
+source shape constraints, concrete shape, element strides, offset, inferred
+address space, and access mode.
 Struct-field projections preserve a shared owner and explicit projected
 region. Semantic analysis proves bounds, injectivity, borrow lifetime, and
 read/write alias legality before lowering. Reflection converts typed

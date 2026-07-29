@@ -134,18 +134,23 @@ record stride are deterministic and reflected for every backend ABI.
 
 ### 3.2 TensorView
 
-`TensorView[T, rank, access]` is a non-owning Storage handle used by kernel
-parameters, slices, and field projections. `access` is `read`, `write`, or
-`read_write`. A view descriptor has:
+`TensorView[T, shape, access]` is the only non-owning shaped Storage type used
+by kernel parameters, slices, field projections, and local allocations.
+`access` is `read`, `write`, or `read_write`. Shape contains positive static
+integer extents and `vd.dyn` markers for runtime-resolved extents:
 
-- a logical shape of `rank` runtime extents;
-- one signed stride per dimension;
-- an offset into its owner;
-- an owner and lifetime;
-- an address space and access mode.
+```python
+TensorView[f32, (4, 4), read]
+TensorView[f32, (vd.dyn, 4), read_write]
+```
 
-The source annotation carries rank and access, while layout is runtime
-metadata. A host-side view is constructed explicitly, for example:
+Address space is inferred from origin and cannot be written in ordinary source:
+kernel parameters are device storage and `workgroup_storage` results are
+workgroup storage. The concrete semantic descriptor also carries one signed
+element stride per dimension, an element offset, owner and lifetime, and the
+inferred address space.
+
+A host-side subview is constructed explicitly, for example:
 
 ```python
 positions = storage.view(
@@ -157,8 +162,10 @@ positions = storage.view(
 ```
 
 The corresponding kernel parameter is annotated
-`TensorView[f32, 2, read]`. Shape, strides, and offset are not generic type
-arguments and therefore do not create distinct source types.
+`TensorView[f32, (vd.dyn, 3), read]`. Shape constraints are source type
+arguments. Concrete strides and offset are layout metadata, not core source
+type identity. Runtime binding verifies static extents and resolves every
+`vd.dyn` extent from the supplied descriptor.
 
 `T` may be any recursively ABI-stable Value element: Scalar, fixed Tensor,
 Tuple, or Struct. Aggregate elements retain their canonical product layout.
@@ -194,16 +201,24 @@ writable projections, or a writable projection aliasing an active reader,
 require rejection unless an explicit synchronization/effect rule proves the
 access safe.
 
-Loading through a view materializes the logical Value type independent of
-physical layout. Storing performs the inverse projection:
+Loading through a view materializes a Value independent of physical layout.
+Storing performs the inverse projection:
 
 ```text
-TensorView load  : TensorView[T, rank, read] -> Tensor[T, logical_shape]
-TensorView store : TensorView[T, rank, write] x Tensor[T, logical_shape] -> ()
+TensorView load  : TensorView[T, shape, read] x indices -> T
+TensorView store : TensorView[T, shape, write] x indices x T -> ()
 ```
 
 The notation describes semantics, not a promise that a whole dynamic view is
 copied at once; scalar and sub-Tensor indexing obey the same rule.
+
+`vd.workgroup_storage(T, shape=(...))` creates a workgroup-address-space
+`TensorView` with read-write access and contiguous row-major layout. Every
+extent must be a positive compile-time integer after specialization. Literal
+and captured host constants are legal; device-runtime values are not. The
+initial portable limit is 16 KiB after canonical ABI layout. Every recursively
+ABI-stable Value element is legal. There is no dynamic shared-memory form,
+stride argument, offset argument, or `workgroup_array` compatibility spelling.
 
 ### 3.3 Interleaved attributes
 
@@ -228,8 +243,9 @@ implicit element type, shape, or safe aliasing guarantee.
 
 The public `Buffer` spelling is removed. A shaped kernel storage parameter uses
 `TensorView`; ownership uses `TensorStorage`; untyped host bytes use
-`vd.interop.RawBuffer`. Typed backend-facing IR uses `!vernon.tensor_view`;
-only opaque runtime allocation handles retain device-buffer terminology.
+`vd.interop.RawBuffer`. Typed backend-facing IR uses
+`!vernon.tensor_view<element, shape, access, address_space>`; only opaque runtime
+allocation handles retain device-buffer terminology.
 
 The v4 baseline does not claim byte-address device operations, unsized
 trailing-array layouts, or CUDA/Vulkan external-memory import. Those require
@@ -268,10 +284,13 @@ Typed semantic nodes record effects independently from types:
 - `barrier(ordering, scope)`;
 - Resource-specific query/sample effects.
 
-`atomic_add`, `atomic_min`, `atomic_max`, and `atomic_exchange` accept i32/u32
-`workgroup_array` storage at workgroup scope and writable scalar `TensorView`
-storage at device scope. Device-scope TensorView atomics are supported by CPU,
-CUDA, and Vulkan; other targets reject them during capability validation.
+`atomic_add`, `atomic_min`, `atomic_max`, and `atomic_exchange` initially
+accept i32/u32 writable `TensorView` elements. A rank-one atomic accepts one
+scalar index; a higher-rank atomic requires a tuple containing exactly one
+index per dimension. Scope is inferred from the Storage address space:
+workgroup storage uses workgroup scope and device storage uses device scope.
+Device-scope TensorView atomics are supported by CPU, CUDA, and Vulkan; other
+targets reject them during capability validation.
 The source ordering is `relaxed`: a backend may emit a stronger ordering when
 its legal lowering cannot represent relaxed ordering, but must never weaken a
 requested ordering.
@@ -306,6 +325,19 @@ language-v4 semantics.
   are deterministic.
 - Unreachable helpers are pruned. Unreachable generic bodies have no
   diagnostic obligation.
+
+At a direct compute boundary, a `Tensor` parameter is a snapshotted immutable
+Value and accepts a compatible NumPy array or immutable host Tensor Value. It
+does not accept `TensorStorage` or `TensorView`. A `TensorView` parameter
+accepts a compatible `TensorStorage` owner as its canonical full view or an
+explicit subview; a raw NumPy array is not implicitly allocated as Storage.
+Every asynchronous dispatch retains borrowed owners until completion.
+
+Graphics transport does not change semantic category. A
+`Tensor[..., attribute()]` is one immutable per-invocation Value sourced from
+a host-bound vertex stream, and a `Tensor[..., uniform()]` is an immutable
+Value even if a backend uses a buffer physically. Direct shader addressing,
+stores, and atomics require `TensorView[..., resource()]`.
 
 A persistent `PipelineAsset` wraps exactly one executable pipeline. Its
 `program=` is either one `@kernel` entry or a non-empty tuple containing only
@@ -451,7 +483,7 @@ differentiable rendering.
 ## 9. V3 to v4 migration
 
 - Host runtime `Tensor` ownership becomes `TensorStorage`.
-- Kernel storage parameters become `TensorView[T, rank, access]`.
+- Kernel storage parameters become `TensorView[T, shape, access]`.
 - Pure fixed-shape computation values remain `Tensor[T, static_shape]`.
 - Removed `Buffer` becomes a typed `TensorView` or runtime-only
   `vd.interop.RawBuffer`.
@@ -461,6 +493,7 @@ differentiable rendering.
 - V3 addressability metadata becomes explicit Storage typing and access mode.
 - Physical shape/stride/offset metadata moves from Tensor Value concepts to
   TensorView descriptors.
+- `workgroup_array` becomes `workgroup_storage` directly; no alias remains.
 
 Removed v3 aliases must not create a fourth semantic category or distinct
 cache identity.
@@ -500,7 +533,7 @@ Frontend version 4 may be declared implemented only when:
 - every public term in this document maps to one typed semantic category;
 - Tensor element legality, nested normalization, and Struct boundaries have
   parser, inference, ABI, cache-identity, and backend tests;
-- TensorStorage ownership, TensorView layout units, lifetime, projection,
+- TensorStorage ownership, TensorView shape constraints, layout units, lifetime, projection,
   injectivity, and alias diagnostics have CPU reference tests and backend
   parity tests where supported;
 - rank-1 Tensor replacement of Array is consistent across constructors,

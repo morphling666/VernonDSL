@@ -187,7 +187,6 @@ class Kernel:
                 and cls._annotation_name(node.func) == "builtin"
                 and node.args
                 and isinstance(node.args[0], ast.Constant)
-                and node.args[0].value == "global_invocation_id"
                 for node in ast.walk(argument.annotation)
             )
         )

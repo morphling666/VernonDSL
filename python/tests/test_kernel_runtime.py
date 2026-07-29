@@ -341,6 +341,25 @@ def global_atomic_operations(values: vd.TensorView[vd.i32, 1, vd.read_write]) ->
     vd.atomic_max(values, 3, 9)
 
 
+@vd.kernel(workgroup_size=(4, 1, 1))
+def workgroup_atomic_lanes(
+    output: vd.TensorView[vd.i32, 1, vd.write],
+    lane_id: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("local_invocation_id")],
+    group_id: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("workgroup_id")],
+) -> None:
+    shared = vd.workgroup_array(vd.i32, 1)
+    lane = lane_id[0]
+    group = group_id[0]
+    if lane == 0:
+        shared[0] = vd.i32(group) * 100
+    vd.workgroup_barrier()
+    previous = vd.atomic_add(shared, 0, 1)
+    output[group * 4 + lane] = previous
+    vd.workgroup_barrier()
+    if lane == 0:
+        output[8 + group] = shared[0]
+
+
 class KernelTensorRuntimeTests(unittest.TestCase):
     @staticmethod
     def _run_tensor_operators(arch: object) -> np.ndarray:
@@ -418,6 +437,27 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                 operations = vd.storage.from_numpy(np.array([0, 10, 10, 1], dtype=np.int32))
                 global_atomic_operations(operations)
                 np.testing.assert_array_equal(operations.to_numpy(), np.array([5, 22, 7, 9], dtype=np.int32))
+
+    def test_workgroup_atomic_lane_backend_parity(self) -> None:
+        backends = [
+            architecture
+            for architecture in (vd.cuda, vd.vulkan, vd.opengl, vd.directx)
+            if self._runtime_available(architecture)
+        ]
+        if not backends:
+            self.skipTest("no workgroup synchronization backend is available")
+
+        for backend in backends:
+            with self.subTest(backend=backend.name):
+                vd.init(arch=backend)  # type: ignore[arg-type]
+                output = vd.storage.zeros(dtype=vd.i32, shape=(10,))
+                workgroup_atomic_lanes(output, grid=(8, 1, 1))
+                result = output.to_numpy()
+                for group in range(2):
+                    base = group * 100
+                    previous = np.sort(result[group * 4 : group * 4 + 4])
+                    np.testing.assert_array_equal(previous, np.arange(base, base + 4, dtype=np.int32))
+                    self.assertEqual(result[8 + group], base + 4)
 
     def test_rank_three_tensor_operators(self) -> None:
         actual = self._run_tensor_operators(vd.cpu)

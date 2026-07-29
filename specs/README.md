@@ -8,6 +8,8 @@ archive.
 
 - [`language/contract.md`](language/contract.md) is the normative language and
   host-semantic contract.
+- [`language/tensor_view.md`](language/tensor_view.md) is the accepted
+  Tensor/TensorView source, IR, binding, ABI, and migration contract.
 - [`language/future_language_roadmap.md`](language/future_language_roadmap.md)
   records incomplete language/runtime phases and acceptance gates.
 - [`compiler/design.md`](compiler/design.md) records compiler boundaries,
