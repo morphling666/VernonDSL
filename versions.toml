@@ -1,4 +1,4 @@
 [vernon]
-release = "0.1.0"
+release = "0.1.1a1"
 compiler_contract = 5
 pipeline = 8

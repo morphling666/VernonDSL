@@ -52,7 +52,7 @@ jobs:
           cache-dependency-glob: uv.lock
 
       - name: Install style tools
-        run: uv sync --extra build --no-install-project --frozen
+        run: uv sync --extra build --extra examples --no-install-project --frozen
 
       - name: Check formatting
         shell: pwsh
@@ -299,6 +299,26 @@ jobs:
       - name: Run VernonDSL tests
         run: ctest --test-dir build-ci -C Release --output-on-failure
 
+      - name: Run GPU-optional showcase acceptance
+        if: matrix.python-version == '3.11'
+        shell: pwsh
+        env:
+          PYTHONPATH: python
+        run: |
+          uv sync --extra build --extra examples --frozen
+          uv run --frozen --no-sync python scripts/run_showcase_smoke.py `
+            --output-dir build-ci/showcase-smoke `
+            --summary build-ci/showcase-smoke/summary.json
+
+      - name: Upload showcase acceptance results
+        if: always() && matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-showcase-smoke
+          path: build-ci/showcase-smoke
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Build clean wheel
         run: uv build --wheel --no-cache
 
@@ -312,15 +332,7 @@ jobs:
           $venv = Join-Path $env:RUNNER_TEMP "vernon-wheel"
           uv venv $venv --python "${{ matrix.python-version }}"
           uv pip install --python "$venv/Scripts/python.exe" --no-cache $wheel
-          & "$venv/Scripts/python.exe" -c @'
-          import vernon_dsl._gl_context
-          import vernon_dsl._native
-          from vernon_dsl.runtime_source import cmake_source_dir, version
-
-          assert cmake_source_dir().is_dir()
-          assert version() == "0.1.0"
-          print("Fresh wheel import and Runtime source checks passed.")
-          '@
+          & "$venv/Scripts/python.exe" scripts/verify_installed_wheel.py
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4

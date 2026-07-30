@@ -8,11 +8,13 @@ migration of the TensorView shape model and workgroup storage model. The old
 aliases, parser fallbacks, IR translations, reflection readers, or runtime
 compatibility paths are added.
 
-The Python frontend reports language version 4. Source syntax, typed IR, and
-compile-time tests cover unified TensorView load/store/atomic operations,
-workgroup address space, and `workgroup_storage`. End-to-end runtime parity,
-the final runtime TensorView layout ABI, and several compiler validation gates
-described in `specs/compiler/root_cause_audit.md` remain open. Serialized
+The released Python frontend remains language version 3 while this v4 design is
+implemented and validated; the current code has no numeric `FRONTEND_VERSION`
+constant. Source syntax, typed IR, and compile-time tests cover unified
+TensorView load/store/atomic operations, workgroup address space, and
+`workgroup_storage`. End-to-end runtime parity, the final runtime TensorView
+layout ABI, and several compiler validation gates described in
+`specs/completion_roadmap.md` remain open. Serialized
 reflection, pipeline, and invocation ABI versions are bumped wherever this
 migration changes their records.
 
@@ -297,21 +299,7 @@ Workgroup TensorViews are compile-time kernel state, not host-bound arguments.
 Required workgroup bytes and synchronization features are reflected only where
 backend/device capability validation needs them.
 
-## 10. Implementation order
-
-1. Update the canonical language/compiler/runtime specifications.
-2. Change TensorView to shape constraints, add `vd.dyn`, infer address spaces,
-   implement strict Tensor/TensorView binding, and remove old workgroup names.
-3. Unify Vernon TensorView types and operations across device/workgroup space.
-4. Centralize multidimensional load/store/atomic projection.
-5. Migrate CPU, CUDA, SPIR-V, graphics, aggregate ABI, synchronization, and
-   validation passes.
-6. Bump changed reflection, pipeline, invocation, and Python binding schemas.
-7. Migrate every example, fixture, and test in one breaking change.
-8. Run complete Python and C++ suites and audit the tree for old symbols and
-   compatibility branches.
-
-## 11. Acceptance tests
+## 10. Acceptance tests
 
 Acceptance requires:
 

@@ -405,8 +405,8 @@ target-native inline uniforms. Elementwise operations on native matrices lower
 per column vector and reconstruct the matrix; they are distinct from `matmul`.
 
 Compiler reflection is the only source of descriptor `(set, binding)` records.
-Cooking never invents missing bindings. Schema-4 manifests retain sampler-to-
-texture provenance, and Runtime validates duplicate descriptors, stage
+Cooking never invents missing bindings. Current `PIPELINE_VERSION` manifests
+retain sampler-to-texture provenance, and Runtime validates duplicate descriptors, stage
 visibility, and sampler resolution before preparing provider state. OpenGL
 accepts descriptor set zero and rejects other sets before provider mutation;
 its Provider path binds textures, samplers, UBOs, SSBOs, vertex buffers, and
@@ -439,17 +439,10 @@ canonical host bytes. Reflection records the CUDA parameter size, alignment,
 and row-major byte strides, and Runtime packs host Tensor storage against that
 profile before `cuLaunchKernel`.
 
-Resolved integration issue (2026-07-26): `VernonLowerGPUTensors` previously
-reused the 16-element register-tensor limit when selecting an MLIR vector for
-SPIR-V. That produced illegal Shader vectors such as `vector<8xf32>` before
-GPU-to-SPIR-V conversion. The SPIR-V path now uses vectors only for 2-4
-components and reconstructs larger or one-element Values as SPIR-V composites.
-The Vulkan adapter also maps compute inline values to storage-buffer
-descriptors consistently during both layout creation and descriptor updates;
-the previous fallback to a sampler descriptor caused invalid descriptor writes.
-`python/tests/test_pipeline_runtime.py *PipelineTests.test_static_tensor_compute_argument`
-covers the complete frontend, compiler, descriptor-packing, and runtime
-boundary on OpenGL, Vulkan, and DirectX.
+The SPIR-V path uses vectors only for 2-4 components and reconstructs larger or
+one-element Values as SPIR-V composites. The Vulkan adapter maps compute inline
+values to storage-buffer descriptors consistently during layout creation and
+descriptor updates.
 
 GLSL language versions are compile options, not backend constants. A zero
 version selects the target default; OpenGL and OpenGL ES callers may request a
@@ -465,36 +458,6 @@ redistributable so developer and CI artifacts share the same compiler.
 `VERNON_DXC_EXECUTABLE` remains an explicit override for offline and managed
 toolchains. The cooker strips debug/reflection data for deterministic runtime
 DXIL, while `VernonRuntime` never links or loads DXC.
-
-## Completed module and artifact work
-
-1. Project-local absolute and relative imports are resolved from source without
-   executing imported Python.
-2. Transitive symbols are namespaced, with diagnostics for missing or duplicate
-   symbols and import cycles.
-3. The function call graph is validated and recursion is rejected.
-4. Non-entry helpers are deterministically inlined before Vulkan, CUDA, and CPU
-   backend routing.
-5. Transitive SHA-256 source dependencies are emitted into MLIR and reflection,
-   so the canonical module hash changes with imported source.
-6. A shared branchless shadow helper is compiled through Vulkan SPIR-V, CPU
-   LLVM, and OpenGL GLSL integration tests. CUDA helper coverage remains pending
-   until a compute shader uses the shared module.
-7. OpenGL and OpenGL ES GLSL versions are selectable through the stable C API
-   and `--glsl-version`; zero retains the target default.
-8. Vernon can compile paired generated GLSL source and publish it through
-   `ShaderProvider`. This is source loading only; reflected resources are not
-   yet bound.
-9. Compiler reflection under `COMPILER_CONTRACT_VERSION` includes target options and an explicit
-   entry-point/stage/format/filename artifact table. The cooker emits one
-   `<name>.pipeline.json` plus content-addressed external artifacts; it no
-   longer emits the retired `shader.json` compatibility manifest.
-10. The Python frontend specializes `feature`, `When`, and compile-time feature
-    branches, prunes compilation to a selected stage entry, and infers stable
-    interface locations from the unspecialized signature. The implemented
-   legacy Pipeline asset declarations cook explicit variant sets into the
-   current `PIPELINE_VERSION` manifest; unchanged stages are content-deduplicated.
-    Vernon resolves exact canonical feature sets without fallback.
 
 ## Shader function kinds
 
@@ -682,9 +645,11 @@ is reserved for the cook-only Metal target.
 ## Language representation boundary
 
 The normative source-language model is specified in
-`specs/language/contract.md`. It is implemented phase by phase under frontend
-version 4; unchecked contract gates and open correctness findings in
-`specs/compiler/root_cause_audit.md` remain incomplete.
+`specs/language/contract.md`. It is implemented phase by phase toward frontend
+version 4, while released builds remain frontend version 3 until all required
+v4 acceptance gates pass. There is currently no numeric `FRONTEND_VERSION`
+constant. Unchecked contract gates and active compiler architecture work in
+`specs/completion_roadmap.md` remain incomplete.
 
 Typed IR must classify each entity as Value, Storage, or Resource. Value
 `Tensor` identity contains recursively ABI-stable element type and logical

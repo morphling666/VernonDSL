@@ -51,6 +51,8 @@ class TypeParserCoverageTests(unittest.TestCase):
         for source, mlir in expected.items():
             with self.subTest(source=source):
                 self.assertEqual(self.parser.parse_type(expression(source)).mlir, mlir)
+        storage = self.parser.parse_type(expression("TensorStorage[f32]"))
+        self.assertEqual((storage.kind, storage.arguments), ("tensor_storage", (ConcreteType("scalar", "f32"),)))
 
     def test_type_constructor_diagnostics(self) -> None:
         cases = {
@@ -66,6 +68,10 @@ class TypeParserCoverageTests(unittest.TestCase):
             "vec2[f32]": "unknown DSL type constructor",
             "mat4[f32]": "unknown DSL type constructor",
             "Vector[f32, f64, 2]": "Vector requires",
+            "Tuple[Sampler]": "Tuple elements must be ABI-stable",
+            "Tensor[Sampler, 2]": "Tensor element type must be an ABI-stable",
+            "TensorStorage[f32, f32]": "TensorStorage requires one",
+            "TensorStorage[Sampler]": "TensorStorage element type must be an ABI-stable",
             "Buffer[f32]": "unknown DSL type constructor 'Buffer'",
             "TensorView[f32, read]": "TensorView requires",
             "TensorView[f32, 1, read]": "TensorView shape",
@@ -87,6 +93,7 @@ class TypeParserCoverageTests(unittest.TestCase):
     def test_metadata_success_paths(self) -> None:
         expected = {
             "Annotated[f32, attribute()]": ("attribute", (-1, 0)),
+            "Annotated[f32, attribute(3)]": ("attribute", (3, 0)),
             "Annotated[f32, attribute(divisor=2)]": ("attribute", (-1, 2)),
             "Annotated[f32, attribute(location=3, divisor=2)]": ("attribute", (3, 2)),
             'Annotated[f32, builtin("position")]': ("builtin", ("position",)),
@@ -110,6 +117,9 @@ class TypeParserCoverageTests(unittest.TestCase):
             "Annotated[f32, attribute(divisor=-1)]": "integer or string",
             "Annotated[f32, resource(**opts)]": r"\*\*kwargs",
             "Annotated[f32, resource(set=1)]": "wrong number",
+            "Annotated[f32, builtin(value=0)]": "does not accept keyword",
+            "Annotated[f32, attribute('position')]": "location must be non-negative",
+            "Annotated[f32, attribute(0, 'instance')]": "divisor must be non-negative",
         }
         for source, message in cases.items():
             with self.subTest(source=source):
@@ -149,6 +159,7 @@ class TypeSolverCoverageTests(unittest.TestCase):
         self.assertEqual(common_type(LiteralType("floating", 1.0), f64), f64)
         self.assertEqual(common_type(i32, LiteralType("floating", 1.0)), scalar("f32"))
         self.assertEqual(common_type(tensor2, i32), tensor2)
+        self.assertEqual(common_type(i32, tensor2), tensor2)
         self.assertEqual(common_type(struct, struct), struct)
         self.assertIsNone(common_type(struct, ConcreteType("struct", "T")))
         self.assertIsNone(common_type(tensor2, tensor3))
@@ -161,8 +172,12 @@ class TypeSolverCoverageTests(unittest.TestCase):
         tensor2f32 = ConcreteType("tensor", "Tensor", (f32, 2))
         tensor2f64 = ConcreteType("tensor", "Tensor", (f64, 2))
         tensor3f64 = ConcreteType("tensor", "Tensor", (f64, 3))
+        tuple_f32 = ConcreteType("tuple", "Tuple", (f32,))
+        tuple_f64 = ConcreteType("tuple", "Tuple", (f64,))
         self.assertTrue(can_convert(LiteralType("integer", 1), f32))
         self.assertTrue(can_convert(f32, f64))
+        self.assertTrue(can_convert(tuple_f32, tuple_f64))
+        self.assertFalse(can_convert(tuple_f32, ConcreteType("tuple", "Tuple", (f64, f64))))
         self.assertTrue(can_convert(tensor2f32, tensor2f64))
         self.assertFalse(can_convert(f32, tensor2f32))
         self.assertFalse(can_convert(tensor2f32, tensor3f64))
@@ -202,6 +217,19 @@ class TypeSolverCoverageTests(unittest.TestCase):
             "resource_specialization.py",
         )
         self.assertEqual(output.count("func.func private @touch__"), 2)
+
+    def test_inferred_tuple_helper_annotation(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def pair(value):\n"
+            "    return (value, value)\n"
+            "@fragment\n"
+            "def main(value: f32) -> f32:\n"
+            "    return pair(value)[0]\n",
+            "tuple_specialization.py",
+        )
+        self.assertIn("func.func private @pair__", output)
 
 
 class InferenceDiagnosticCoverageTests(unittest.TestCase):

@@ -1,12 +1,14 @@
 # Vernon DSL language contract
 
-> **Status: normative target, partially implemented under the current
-> `COMPILER_CONTRACT_VERSION` in `versions.toml`.**
+> **Status: language-v4 normative target, partially implemented under the
+> current `COMPILER_CONTRACT_VERSION` in `versions.toml`. Released builds remain
+> frontend version 3 until every required v4 acceptance gate passes. There is
+> no independent numeric `FRONTEND_VERSION` axis.**
 >
 > The checked phases in `future_language_roadmap.md` are implemented in source
-> and tested where noted, but unchecked sections and open correctness findings
-> in `specs/compiler/root_cause_audit.md` remain unavailable as end-to-end
-> guarantees. The historical version-3 contract is available from Git history.
+> and tested where noted, but unchecked sections and active work in
+> `specs/completion_roadmap.md` remain unavailable as end-to-end guarantees.
+> Git history is the archive for superseded contract text.
 
 Vernon is a statically typed GPU and graphics DSL embedded in Python syntax.
 The frontend parses source without importing or executing the shader module.
@@ -513,7 +515,7 @@ cache identity.
 | Ownership | Runtime `Tensor`; removed `Buffer` | `TensorStorage`, borrowed `TensorView`, runtime-only `vd.interop.RawBuffer` escape hatch | General allocator model |
 | Layout | Backend/runtime details | Dense strided views, AoS field projections, explicit alias rules | Transparent sparse layouts and SNode trees |
 | Aggregates | Nominal immutable Struct; Vector/Matrix constructors | Tensor, structural Tuple, nominal Struct; no Array | Enums and tagged unions |
-| Effects | Typed read/write records | Region-aware read/write boundary; reserved atomic/barrier effects | Full memory-order model |
+| Effects | Typed read/write records | Region-aware reads/writes, relaxed i32/u32 atomics, and typed barriers | Additional atomic types/orderings and full race model |
 | Autodiff | Not implemented | First-order pure typed-IR JVP/VJP/grad | Higher-order and stateful-kernel AD |
 | Control flow | Tuple destructuring, short-circuit expressions, early return, dynamic range, break, and continue | Current subset plus explicitly AD-covered flow | Unrestricted recursion and Python-only control flow |
 | Rendering | Typed graphics stages, textures, samplers | Same model with explicit Resource and derivative boundaries | General differentiable rasterization |

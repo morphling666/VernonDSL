@@ -422,14 +422,13 @@ imported host buffer, texture, and sampler names without deleting them. It also
 creates owned child resources for standalone execution; all GL allocation,
 transfer, deletion, and invocation operations first make the associated
 context current.
-Pipeline ABI v4 represents every numeric argument as one `VernonTensorView`.
-The storage discriminator selects immutable host Value transport, borrowed
-TensorStorage memory, or a runtime-owned device allocation. TensorView records
-carry shape, signed byte strides, and byte offset/size so full-owner and
-explicit subview dispatch preserve identical logical addressing. A host pointer
-used for an asynchronous dispatch remains borrowed, and its TensorStorage owner
-is retained, until backend completion. Schema-v3 readers are removed rather
-than translated.
+The current `PIPELINE_VERSION` invocation ABI represents every numeric argument
+as one `VernonTensorView`. The storage discriminator selects immutable host
+Value transport, borrowed TensorStorage memory, or a runtime-owned device
+allocation. TensorView records carry shape, signed byte strides, and byte
+offset/size so full-owner and explicit subview dispatch preserve identical
+logical addressing. A host pointer used for an asynchronous dispatch remains
+borrowed, and its TensorStorage owner is retained until backend completion.
 
 OpenGL uploads native column-major matrices directly with `transpose=false`.
 Desktop OpenGL also uploads native row-major matrices directly with
@@ -468,9 +467,10 @@ stage topology with an explicit unsupported-target result when that backend
 does not implement it. Manifest parsing must not hard-code vertex-plus-fragment
 as the only representable topology.
 
-Schema-2 binds each variant directly through its `program` stage-to-artifact
-map. It contains either one compute program or one graphics-stage tuple; it has
-no dispatch/barrier/draw step list and cannot encode host orchestration.
+The current `PIPELINE_VERSION` manifest binds each variant directly through its
+`program` stage-to-artifact map. It contains either one compute program or one
+graphics-stage tuple; it has no dispatch/barrier/draw step list and cannot
+encode host orchestration.
 
 `VernonExecutionGraph` owns multi-program orchestration above VernonRHI.
 Class-based render and compute passes declare resource uses separately from

@@ -1,54 +1,54 @@
 # VernonDSL specifications
 
-`specs` contains only current contracts, implementation direction, and active
-deferred work. Completed and superseded plans are removed; Git history is the
+`specs/` contains current contracts, architecture decisions, and active future
+work. Completed plans and superseded proposals are deleted; Git history is the
 archive.
 
-## Canonical documents
+## Reading order
 
-- [`language/contract.md`](language/contract.md) is the normative language and
-  host-semantic contract.
-- [`language/tensor_view.md`](language/tensor_view.md) is the accepted
-  Tensor/TensorView source, IR, binding, ABI, and migration contract.
-- [`language/future_language_roadmap.md`](language/future_language_roadmap.md)
-  records incomplete language/runtime phases and acceptance gates.
-- [`compiler/design.md`](compiler/design.md) records compiler boundaries,
-  lowering invariants, reflection, and asset cooking.
-- [`runtime/design.md`](runtime/design.md) records deployment ABI, backend
-  ownership, resource behavior, and execution semantics.
-- [`examples/design.md`](examples/design.md) records non-obvious algorithm and
-  synchronization choices used by the GPU showcase programs.
-- [`completion_roadmap.md`](completion_roadmap.md) prioritizes completion,
-  refactoring, performance, backend consistency, and production engineering.
+1. [`language/contract.md`](language/contract.md) defines the normative
+   language-v4 target and host semantics. Released builds remain frontend
+   version 3 until all required v4 gates pass.
+2. [`language/tensor_view.md`](language/tensor_view.md) defines the accepted
+   Tensor, TensorStorage, TensorView, workgroup, projection, and ABI contract.
+3. [`compiler/design.md`](compiler/design.md) defines compiler boundaries,
+   lowering invariants, reflection, target routing, and artifact cooking.
+4. [`runtime/design.md`](runtime/design.md) defines deployment ABI, backend
+   ownership, resource behavior, and execution semantics.
+5. [`language/future_language_roadmap.md`](language/future_language_roadmap.md)
+   lists incomplete language-v4 acceptance gates.
+6. [`completion_roadmap.md`](completion_roadmap.md) lists active work required
+   for beta and stable releases.
 
-An implementation must update the applicable canonical document when it adds a
-non-obvious invariant or changes an accepted contract. Temporary investigation
-notes should be tracked as issues or plans outside `specs` and removed after
-their conclusions are merged here.
+Supporting active documents:
 
-## Pipeline asset reading order
+- [`deferred_gpu_resource_lifetime_plan.md`](deferred_gpu_resource_lifetime_plan.md)
+  defines deferred in-flight resource reclamation and multi-frame execution.
+- [`examples/design.md`](examples/design.md) records non-obvious showcase
+  algorithms and third-party design provenance.
 
-The active persistent-pipeline contract is specified in:
+## Version policy
 
-1. [`language/contract.md` — functions, interfaces, and specialization](language/contract.md#6-functions-interfaces-and-specialization)
-2. [`compiler/design.md` — Pipeline asset declarations](compiler/design.md#pipeline-asset-declarations)
-3. [`runtime/design.md` — Pipeline runtime boundary](runtime/design.md#pipeline-runtime-boundary)
+`versions.toml` is the only manually edited version source:
 
-The shared contract is:
+- `RELEASE_VERSION` identifies a package release;
+- `COMPILER_CONTRACT_VERSION` versions source semantics and compiler contracts;
+- `PIPELINE_VERSION` versions manifests, artifacts, Runtime/provider ABI, and
+  RHI compatibility.
 
-- `PipelineAsset` wraps either one compute Kernel or one graphics stage tuple;
-- Kernel is compute-only and Pipeline is graphics-only;
-- graphics stage topology is extensible independently from backend support;
-- `variants=` enumerates accepted feature keys;
-- target architecture and options are cooker inputs, not source fields.
+There is no independent numeric `FRONTEND_VERSION`. Documents should refer to
+the released frontend-v3 position or the language-v4 target, not invent another
+version axis. Historical schema numbers must not be used as names for the
+current `PIPELINE_VERSION` contract.
 
-`VernonExecutionGraph` is the active host-orchestration API. Its ownership,
-hazard, scheduling, render-scope, and command-recording contract is maintained
-in [`runtime/design.md`](runtime/design.md#pipeline-runtime-boundary), not in a
-separate completion plan.
-The separate low-priority `ProgramGraph` roadmap item is compiler IR inside one
-program for autodiff; it is not a deployment graph.
+## Pipeline boundary
 
-Stable logical resource records are active phase-1 work. Multi-frame resource
-ownership and reclamation remain deferred in
-[`deferred_gpu_resource_lifetime_plan.md`](deferred_gpu_resource_lifetime_plan.md).
+`PipelineAsset` wraps either one compute Kernel or one graphics stage tuple.
+The cooker selects the target and emits one current-version manifest plus
+content-addressed artifacts. `VernonExecutionGraph` owns host orchestration,
+hazards, scheduling, and render scopes. The low-priority `ProgramGraph` roadmap
+item is private compiler IR for autodiff and is not a deployment graph.
+
+When implementation changes a non-obvious invariant, update the applicable
+canonical document in the same change. Temporary investigations belong in
+issues and should not become permanent specifications.

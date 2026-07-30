@@ -5,27 +5,32 @@
 Install the optional presenter dependency before running either showcase:
 
 ```powershell
-uv sync --extra examples
+$env:PYTHONPATH = "$PWD/python"
+uv sync --extra examples --frozen
 ```
 
 Vulkan is the preferred backend:
 
 ```powershell
-uv run python examples/terrain_showcase.py --arch vulkan --preset showoff `
+uv run --frozen --no-sync python examples/terrain_showcase.py --arch vulkan --preset showoff `
   --headless --output build/terrain.png --result-json build/terrain.json `
   --animation-output build/terrain.webp
 
-uv run python examples/mandelbulb_showcase.py --arch vulkan --preset showoff `
+uv run --frozen --no-sync python examples/mandelbulb_showcase.py --arch vulkan --preset showoff `
   --headless --output build/mandelbulb.png --result-json build/mandelbulb.json `
   --animation-output build/mandelbulb.webp
 ```
 
-Use `--preset smoke` for a small, quick backend check. Omit `--headless` to
-display frames in an OpenCV window; Escape and Q close it. On Windows,
-`--arch directx` and `--arch opengl` are fallback paths. Rendering is offscreen
-on every backend, and each displayed frame is read back to the host. The
-optional `--animation-output` records showcase frames as a looping animated
-WebP. `fractal.py` accepts the same option for its compute-rendered Julia set.
+For an interactive presentation targeting 60 FPS, omit `--headless`,
+`--output`, and `--result-json`, then add `--fps 60`. Escape and Q close the
+window. Actual throughput depends on GPU, driver, image size, and readback cost.
+Use `--preset smoke` for a small, quick backend check. On Windows,
+`--arch directx` and `--arch opengl` are fallback paths.
+
+Rendering is offscreen on every backend, and each displayed frame is read back
+to the host. The optional `--animation-output` records showcase frames as a
+looping animated WebP. `fractal.py` accepts the same option for its
+compute-rendered Julia set.
 
 Terrain demonstrates texture-driven fractal noise, ray marching, finite-
 difference normals, soft shadows, ambient occlusion, fog, and host-driven

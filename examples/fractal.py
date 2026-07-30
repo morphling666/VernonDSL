@@ -77,7 +77,9 @@ def main() -> None:
         import cv2  # pyright: ignore[reportMissingImports]
         from showcase_common import write_animation
     except ImportError as error:
-        raise SystemExit("Install the optional example dependencies with 'uv sync --extra examples'.") from error
+        raise SystemExit(
+            "Install the optional example dependencies with 'uv sync --extra examples --frozen'."
+        ) from error
     if arguments.frames <= 0 or arguments.fps <= 0:
         raise ValueError("frames and fps must be positive")
     architectures = {
