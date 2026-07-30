@@ -8,7 +8,7 @@ endif()
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     project(
         VernonRuntime
-        VERSION ${VERNON_RELEASE_VERSION}
+        VERSION ${VERNON_PROJECT_VERSION}
         LANGUAGES C CXX)
     set(CMAKE_CXX_STANDARD
         17
@@ -20,10 +20,10 @@ file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" _vernon_runtime_version)
 string(STRIP "${_vernon_runtime_version}" _vernon_runtime_version)
 if(NOT
    _vernon_runtime_version
-   VERSION_EQUAL
-   PROJECT_VERSION)
+   STREQUAL
+   VERNON_RELEASE_VERSION)
     message(FATAL_ERROR "Runtime VERSION (${_vernon_runtime_version}) must match "
-                        "VernonRuntime project version (${PROJECT_VERSION})")
+                        "Vernon release version (${VERNON_RELEASE_VERSION})")
 endif()
 
 set(VERNON_RUNTIME_PROFILE
