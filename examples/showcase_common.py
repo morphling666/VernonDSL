@@ -372,7 +372,11 @@ def write_animation(path: Path, frames: list[np.ndarray], fps: int) -> None:
     animation.frames = frames
     animation.durations = [max(1, round(1000 / fps))] * len(frames)
     animation.loop_count = 0
-    if not cv2.imwriteanimation(str(path), animation):
+    if not cv2.imwriteanimation(
+        str(path),
+        animation,
+        [cv2.IMWRITE_WEBP_QUALITY, 95],
+    ):
         raise RuntimeError(f"cannot write animation: {path}")
 
 
