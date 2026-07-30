@@ -675,14 +675,13 @@ element-based layout to byte offsets and strides only after leaf and Struct
 ABI layout is fixed. `RawBuffer` bypasses typed ownership/layout guarantees and
 therefore requires explicit view validation.
 
-Direct compute specializes `TensorView` physical addressing into the
-compiled entry: logical indices become `offset + sum(index[i] * stride[i])`.
-The specialization cache identity includes shape, signed element strides, and
-element offset. Backends still receive the owner's whole allocation as a
-rank-one storage resource, so CPU, CUDA, and SPIR-V use identical addressing
-without a backend-specific public descriptor ABI. A different view layout
-therefore recompiles the entry; layout metadata remains runtime state and does
-not become part of the source `TensorView` type.
+Direct compute projects `TensorView` indices from the per-dispatch descriptor:
+logical indices become `offset + sum(index[i] * stride[i])`. Rank, static
+extent constraints, element type, and access are artifact state; extents,
+signed element strides, and element offset are invocation state and are
+excluded from artifact cache identity. Backends receive the owner's whole
+allocation plus the canonical descriptor sequence, so CPU, CUDA, and SPIR-V
+use identical addressing without layout-specific recompilation.
 
 Aggregate TensorView elements use canonical ABI leaf expansion during backend
 lowering because MLIR memrefs cannot contain LLVM/SPIR-V aggregate element

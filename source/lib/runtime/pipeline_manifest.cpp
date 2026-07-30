@@ -87,8 +87,7 @@ constexpr std::string_view kParameterUseKeys[] = {
     "attribute_leaves",
     "sampled_texture_bindings",
     "location_span",
-    "element_strides",
-    "element_offset",
+    "tensor_view_descriptor",
     "internal_source",
     "system_value",
 };
@@ -98,6 +97,8 @@ constexpr std::string_view kAttributeLeafKeys[] = {"path",  "location",        "
 constexpr std::string_view kSampledTextureBindingKeys[] = {"set", "binding"};
 constexpr std::string_view kPhysicalValueLayoutKeys[] = {"profile",   "transport",    "size",
                                                          "alignment", "byte_strides", "element_leaf_offsets"};
+constexpr std::string_view kTensorViewDescriptorKeys[] = {"rank", "offset_binding", "extent_bindings",
+                                                          "stride_bindings"};
 
 bool parseUint64(const nlohmann::json &value, uint64_t &result) {
     if (!value.is_number_integer())
@@ -322,30 +323,40 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
             use.shape.push_back(extent);
         }
     }
-    if (value.contains("element_strides") || value.contains("element_offset")) {
-        if (!value.contains("element_strides") || !value["element_strides"].is_array() ||
-            !value.contains("element_offset")) {
-            error = "TensorView specialization requires element_strides and element_offset";
+    if (value.contains("tensor_view_descriptor")) {
+        const nlohmann::json &descriptor = value["tensor_view_descriptor"];
+        TensorViewDescriptorUse parsed;
+        if (!descriptor.is_object() || !hasOnlyKeys(descriptor, kTensorViewDescriptorKeys) ||
+            !descriptor.contains("rank") || !parseUint32(descriptor["rank"], parsed.rank) ||
+            !descriptor.contains("offset_binding") ||
+            !parseUint32(descriptor["offset_binding"], parsed.offsetBinding) ||
+            !descriptor.contains("extent_bindings") || !descriptor["extent_bindings"].is_array() ||
+            !descriptor.contains("stride_bindings") || !descriptor["stride_bindings"].is_array()) {
+            error = "TensorView descriptor use is invalid";
             return false;
         }
-        for (const nlohmann::json &strideValue : value["element_strides"]) {
-            int64_t stride = 0;
-            if (!parseInt64(strideValue, stride)) {
-                error = "TensorView element strides must be signed integers";
+        for (const nlohmann::json &binding : descriptor["extent_bindings"]) {
+            uint32_t parsedBinding = 0;
+            if (!parseUint32(binding, parsedBinding)) {
+                error = "TensorView extent binding must be unsigned";
                 return false;
             }
-            use.elementStrides.push_back(stride);
+            parsed.extentBindings.push_back(parsedBinding);
         }
-        uint64_t offset = 0;
-        if (!parseUint64(value["element_offset"], offset)) {
-            error = "TensorView element offset must be a non-negative integer";
+        for (const nlohmann::json &binding : descriptor["stride_bindings"]) {
+            uint32_t parsedBinding = 0;
+            if (!parseUint32(binding, parsedBinding)) {
+                error = "TensorView stride binding must be unsigned";
+                return false;
+            }
+            parsed.strideBindings.push_back(parsedBinding);
+        }
+        if (!parsed.rank || parsed.extentBindings.size() != parsed.rank ||
+            parsed.strideBindings.size() != parsed.rank || (!use.shape.empty() && use.shape.size() != parsed.rank)) {
+            error = "TensorView descriptor rank does not match shape";
             return false;
         }
-        use.elementOffset = offset;
-        if (!use.shape.empty() && use.elementStrides.size() != use.shape.size()) {
-            error = "TensorView specialization stride rank does not match shape";
-            return false;
-        }
+        use.tensorViewDescriptor = std::move(parsed);
     }
     if (use.physicalValueLayout && use.physicalValueLayout->byteStrides.size() != use.shape.size()) {
         error = "physical_value_layout byte-stride rank does not match the logical Tensor shape";

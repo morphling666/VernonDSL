@@ -100,9 +100,7 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
         "  func.func @increment("
         "%values: !vernon.tensor_view<f32, [3], \"read_write\", \"device\"> "
         "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
-        "vernon.binding = 0 : i64, vernon.tensor_shape = array<i64: 3>, "
-        "vernon.tensor_strides = array<i64: 1>, "
-        "vernon.tensor_offset = 0 : i64}, "
+        "vernon.binding = 0 : i64}, "
         "%id: index {vernon.interface = \"input\", "
         "vernon.builtin = \"global_invocation_id\"}) attributes {vernon.entry, "
         "vernon.stage = \"compute\", "
@@ -120,8 +118,7 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
         "module attributes {" VERNON_MLIR_VERSION_ATTRIBUTES "} {\n"
         "  func.func @loop(%values: !vernon.tensor_view<f32, [1], \"read_write\", \"device\"> "
         "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
-        "vernon.binding = 0 : i64, vernon.tensor_shape = array<i64: 1>, "
-        "vernon.tensor_strides = array<i64: 1>, vernon.tensor_offset = 0 : i64}, "
+        "vernon.binding = 0 : i64}, "
         "%phase: f32 "
         "{vernon.interface = \"input\", vernon.location = 1 : i64}) "
         "attributes {vernon.entry, "
@@ -173,8 +170,7 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
         "module attributes {" VERNON_MLIR_VERSION_ATTRIBUTES "} {\n"
         "  func.func @tensor3(%values: !vernon.tensor_view<f32, [1], \"read_write\", \"device\"> "
         "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
-        "vernon.binding = 0 : i64, vernon.tensor_shape = array<i64: 1>, "
-        "vernon.tensor_strides = array<i64: 1>, vernon.tensor_offset = 0 : i64}) attributes {vernon.entry, "
+        "vernon.binding = 0 : i64}) attributes {vernon.entry, "
         "vernon.stage = \"compute\", "
         "vernon.workgroup_size = array<i32: 1, 1, 1>} {\n"
         "    %ones = arith.constant dense<1.0> : tensor<2x3x4xf32>\n"
@@ -197,8 +193,7 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
         "  func.func @dynamic_local("
         "%values: !vernon.tensor_view<f32, [1], \"read_write\", \"device\"> "
         "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
-        "vernon.binding = 0 : i64, vernon.tensor_shape = array<i64: 1>, "
-        "vernon.tensor_strides = array<i64: 1>, vernon.tensor_offset = 0 : i64}) attributes {vernon.entry, "
+        "vernon.binding = 0 : i64}) attributes {vernon.entry, "
         "vernon.stage = \"compute\", "
         "vernon.workgroup_size = array<i32: 1, 1, 1>} {\n"
         "    %size = arith.constant 4 : index\n"
@@ -554,10 +549,16 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     VernonCpuEntryPoint increment = vernonCompileResultGetCpuEntry(cpu_compute_compile, "increment", 9);
     ASSERT_TRUE(increment != NULL);
     float compute_values[3] = {2.0f, 4.0f, 6.0f};
-    struct {
+    struct RankOneTensorViewDescriptor {
         float *values;
+        int64_t offset;
+        uint64_t extent;
+        int64_t stride;
+    };
+    struct {
+        RankOneTensorViewDescriptor values;
         size_t id;
-    } compute_arguments = {compute_values, 1};
+    } compute_arguments = {{compute_values, 0, 3, 1}, 1};
     VernonCpuInvocation compute_invocation = {&compute_arguments, sizeof(compute_arguments), NULL, 0, NULL};
     ASSERT_TRUE(increment(&compute_invocation) == VERNON_STATUS_OK);
     ASSERT_TRUE(compute_values[0] == 2.0f && compute_values[1] == 5.0f && compute_values[2] == 6.0f);
@@ -571,9 +572,9 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     ASSERT_TRUE(loop != NULL);
     float loop_values[1] = {0.0f};
     struct {
-        float *values;
+        RankOneTensorViewDescriptor values;
         float phase;
-    } loop_arguments = {loop_values, 0.0f};
+    } loop_arguments = {{loop_values, 0, 1, 1}, 0.0f};
     VernonCpuInvocation loop_invocation = {&loop_arguments, sizeof(loop_arguments), NULL, 0, NULL};
     ASSERT_TRUE(loop(&loop_invocation) == VERNON_STATUS_OK);
     ASSERT_TRUE(loop_values[0] == 4.0f);

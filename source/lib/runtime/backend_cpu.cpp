@@ -334,8 +334,9 @@ bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState ker
         binding.slot = argumentIndex;
         binding.set = argument.descriptorSet;
         binding.binding = argument.binding == UINT32_MAX ? argumentIndex : argument.binding;
-        binding.kind =
-            argument.kind == "tensor" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+        binding.kind = argument.kind == "tensor" && !argument.tensorViewDescriptor
+                           ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
+                           : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
         binding.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
         binding.access = 3;
         binding.array_count = 1;

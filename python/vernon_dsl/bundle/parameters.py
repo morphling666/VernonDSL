@@ -95,7 +95,12 @@ def reflected_parameters(
             if not isinstance(name, str) or not name or not isinstance(interface_name, str):
                 raise PipelineCompileError(f"{stage} external argument is missing source metadata")
             inferred_dtype, inferred_shape = dtype_and_shape(row.get("type"))
-            if row.get("kind") == "tensor" and "shape" not in row:
+            reflected_shape = row.get("shape")
+            if row.get("kind") == "tensor" and isinstance(row.get("source_shape"), list):
+                reflected_shape = [
+                    0 if isinstance(extent, int) and extent < 0 else extent for extent in row["source_shape"]
+                ]
+            if row.get("kind") == "tensor" and reflected_shape is None:
                 rank = row.get("rank")
                 if isinstance(rank, int) and rank >= 0:
                     inferred_shape = [0] * rank
@@ -105,26 +110,14 @@ def reflected_parameters(
                 "index": row.get("index"),
                 "kind": row.get("kind", "scalar"),
                 "type": row.get("type"),
-                "shape": row.get("shape", inferred_shape),
+                "shape": reflected_shape if reflected_shape is not None else inferred_shape,
                 "interface": interface_name,
                 "access": row.get("access", "read"),
                 "address_space": row.get("address_space"),
                 "dimension": row.get("dimension"),
             }
-            element_strides = row.get("element_strides")
-            element_offset = row.get("element_offset")
-            if element_strides is not None or element_offset is not None:
-                if (
-                    not isinstance(element_strides, list)
-                    or len(element_strides) != len(use["shape"])
-                    or any(not isinstance(stride, int) or isinstance(stride, bool) for stride in element_strides)
-                    or not isinstance(element_offset, int)
-                    or isinstance(element_offset, bool)
-                    or element_offset < 0
-                ):
-                    raise PipelineCompileError(f"{stage} TensorView specialization metadata is invalid")
-                use["element_strides"] = list(element_strides)
-                use["element_offset"] = element_offset
+            if "tensor_view_descriptor" in row:
+                use["tensor_view_descriptor"] = row["tensor_view_descriptor"]
             physical_layouts = row.get("physical_layouts")
             cuda_layout = (
                 physical_layouts.get("cuda_kernel_parameter") if isinstance(physical_layouts, Mapping) else None

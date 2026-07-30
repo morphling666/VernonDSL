@@ -27,10 +27,7 @@ module attributes {$VERNON_VERSION_ATTRIBUTES} {
       %values: !vernon.tensor_view<f32, [3], "read_write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64,
-        vernon.tensor_shape = array<i64: 3>,
-        vernon.tensor_strides = array<i64: 1>,
-        vernon.tensor_offset = 0 : i64
+        vernon.binding = 0 : i64
       },
       %id: index {
         vernon.interface = "input",
@@ -54,6 +51,8 @@ module attributes {$VERNON_VERSION_ATTRIBUTES} {
   }
 }
 """)
+
+DYNAMIC_CPU_MODULE = CPU_MODULE.replace("[3]", "[-1]")
 
 MULTI_ENTRY_MODULE = _versioned(r"""
 module attributes {$VERNON_VERSION_ATTRIBUTES} {
@@ -308,6 +307,23 @@ class CompiledProgramTests(unittest.TestCase):
         _bind_native_argument(invocation, pipeline.parameters[0], values)
         invocation.grid(3, 1, 1).invoke()
         np.testing.assert_array_equal(values.to_numpy(), np.array([3.0, 5.0, 7.0], dtype=np.float32))
+
+    def test_cpu_artifact_reuses_dynamic_tensor_view_descriptor(self) -> None:
+        program = native.Compiler().compile_program_result(DYNAMIC_CPU_MODULE, native.Target.CPU)
+        self.assertTrue(program.ok, program.diagnostics)
+        runtime = native.Runtime(native.RuntimeBackend.CPU)
+        pipeline = runtime.load_cpu_entry(program, "increment")
+        values = vd.storage.from_numpy(np.arange(5, dtype=np.float32))
+
+        invocation = pipeline.invocation_builder()
+        _bind_native_argument(invocation, pipeline.parameters[0], values)
+        invocation.grid(5, 1, 1).invoke()
+
+        reverse = values.view(shape=(3,), strides=(-1,), offset=4, access="read_write")
+        invocation = pipeline.invocation_builder()
+        _bind_native_argument(invocation, pipeline.parameters[0], reverse)
+        invocation.grid(3, 1, 1).invoke()
+        np.testing.assert_array_equal(values.to_numpy(), np.array([1.0, 2.0, 4.0, 5.0, 6.0], dtype=np.float32))
 
     def test_cpu_tuple_create_and_constant_extract_lowering(self) -> None:
         program = native.Compiler().compile_program_result(CPU_TUPLE_MODULE, native.Target.CPU)

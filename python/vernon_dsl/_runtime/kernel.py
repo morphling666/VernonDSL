@@ -47,6 +47,7 @@ class _ImmediateComputePass(ComputePass):
 class _CompiledKernel:
     mlir: str
     function: ast.FunctionDef
+    frontend: FrontendCompileResult
     builtin_names: tuple[str, ...]
     writable_names: tuple[str, ...]
     program: Any
@@ -112,18 +113,8 @@ class Kernel:
 
     @staticmethod
     def _argument_signature(value: Any) -> tuple[Any, ...]:
-        if isinstance(value, TensorStorage):
-            return ("storage", value.dtype.str, value.shape)
-        if isinstance(value, TensorView):
-            layout = value.layout
-            return (
-                "view",
-                value.dtype.str,
-                value.shape,
-                layout.element_strides,
-                layout.element_offset,
-                value.access,
-            )
+        if isinstance(value, (TensorStorage, TensorView)):
+            return ("tensor",)
         return ("value", type(value).__module__, type(value).__qualname__)
 
     def _dispatch_key(
@@ -230,6 +221,28 @@ class Kernel:
         if isinstance(annotation, ast.Subscript) and cls._annotation_name(annotation.value) == "Annotated":
             annotation = annotation.slice.elts[0] if isinstance(annotation.slice, ast.Tuple) else annotation.slice
         return isinstance(annotation, ast.Subscript) and cls._annotation_name(annotation.value) == "Tensor"
+
+    def _normalize_arguments(
+        self,
+        function: ast.FunctionDef,
+        builtins: tuple[str, ...],
+        arguments: tuple[Any, ...],
+    ) -> tuple[list[str], tuple[Any, ...]]:
+        user_parameters = [argument.arg for argument in function.args.args if argument.arg not in builtins]
+        if len(arguments) != len(user_parameters):
+            raise TypeError(f"{self._entry} expects {len(user_parameters)} launch arguments")
+        declared_access = {
+            argument.arg: self._tensor_view_access(argument.annotation)
+            for argument in function.args.args
+            if argument.arg in user_parameters
+        }
+        normalized = tuple(
+            value._full_view(declared_access[name])
+            if isinstance(value, TensorStorage) and declared_access[name] is not None
+            else value
+            for name, value in zip(user_parameters, arguments, strict=True)
+        )
+        return user_parameters, normalized
 
     def _validate_tensor_view_arguments(
         self,
@@ -358,20 +371,7 @@ class Kernel:
         if function is None:
             raise RuntimeError("kernel functions must be top-level definitions in files")
         builtins = self._builtin_parameters(function)
-        user_parameters = [argument.arg for argument in function.args.args if argument.arg not in builtins]
-        if len(arguments) != len(user_parameters):
-            raise TypeError(f"{self._entry} expects {len(user_parameters)} launch arguments")
-        declared_access = {
-            argument.arg: self._tensor_view_access(argument.annotation)
-            for argument in function.args.args
-            if argument.arg in user_parameters
-        }
-        normalized_arguments = tuple(
-            value._full_view(declared_access[name])
-            if isinstance(value, TensorStorage) and declared_access[name] is not None
-            else value
-            for name, value in zip(user_parameters, arguments, strict=True)
-        )
+        user_parameters, normalized_arguments = self._normalize_arguments(function, builtins, arguments)
         tensors = {
             name: value
             for name, value in zip(user_parameters, normalized_arguments, strict=True)
@@ -393,17 +393,6 @@ class Kernel:
                 (name, value.dtype.str, value.shape)
                 for name, value in tensors.items()
                 if isinstance(value, TensorStorage)
-            ),
-            tuple(
-                (
-                    name,
-                    value.dtype.str,
-                    value.shape,
-                    value.layout.element_strides,
-                    value.layout.element_offset,
-                )
-                for name, value in tensors.items()
-                if isinstance(value, TensorView)
             ),
             constants,
             self._workgroup_size,
@@ -470,6 +459,25 @@ class Kernel:
         dispatch_key = self._dispatch_key(arguments, features, options.target, tuple(sorted(options.options.items())))
         cached = self._dispatch_cache.get(dispatch_key)
         if cached is not None and self._dependencies_current(cached):
+            entry = next(
+                (function for function in cached.frontend.typed_functions if function.source.name == self._entry),
+                None,
+            )
+            if entry is None:
+                raise RuntimeError("compiled kernel has no typed entry function")
+            typed_parameters = {parameter.name: parameter for parameter in entry.parameters}
+            user_parameters = [
+                parameter.name for parameter in entry.parameters if parameter.name not in cached.builtin_names
+            ]
+            if len(arguments) != len(user_parameters):
+                raise TypeError(f"{self._entry} expects {len(user_parameters)} launch arguments")
+            normalized_arguments = tuple(
+                value._full_view(typed_parameters[name].type.arguments[2])
+                if isinstance(value, TensorStorage) and typed_parameters[name].type.kind == "tensor_view"
+                else value
+                for name, value in zip(user_parameters, arguments, strict=True)
+            )
+            self._validate_tensor_view_arguments(cached.frontend, user_parameters, normalized_arguments)
             self._load_native(cached, state, self._entry)
             return cached
 
@@ -495,6 +503,7 @@ class Kernel:
             cached = _CompiledKernel(
                 frontend.mlir,
                 function,
+                frontend,
                 builtins,
                 self._writable_parameters(frontend),
                 program,

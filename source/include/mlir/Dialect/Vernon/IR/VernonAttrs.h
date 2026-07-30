@@ -41,10 +41,9 @@ inline constexpr llvm::StringLiteral kBuiltinAttrName = "vernon.builtin";
 inline constexpr llvm::StringLiteral kDescriptorSetAttrName = "vernon.set";
 inline constexpr llvm::StringLiteral kBindingAttrName = "vernon.binding";
 inline constexpr llvm::StringLiteral kInstanceDivisorAttrName = "vernon.instance_divisor";
-inline constexpr llvm::StringLiteral kTensorShapeAttrName = "vernon.tensor_shape";
-inline constexpr llvm::StringLiteral kTensorStridesAttrName = "vernon.tensor_strides";
-inline constexpr llvm::StringLiteral kTensorOffsetAttrName = "vernon.tensor_offset";
-inline constexpr llvm::StringLiteral kPhysicalIndexAttrName = "physical_index";
+inline constexpr llvm::StringLiteral kTensorDescriptorOwnerAttrName = "vernon.tensor_descriptor_owner";
+inline constexpr llvm::StringLiteral kTensorDescriptorComponentAttrName = "vernon.tensor_descriptor_component";
+inline constexpr llvm::StringLiteral kTensorDescriptorDimensionAttrName = "vernon.tensor_descriptor_dimension";
 
 enum class ShaderStage { Vertex, Fragment, Compute };
 enum class InterfaceKind { Input, Output, Uniform, Resource };

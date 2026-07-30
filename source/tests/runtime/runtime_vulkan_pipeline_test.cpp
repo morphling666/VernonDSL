@@ -366,10 +366,18 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(context.device, &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
     VernonRuntimeProviderObject providerEncoder{};
     ASSERT_EQ(vernonRuntimeReferenceRhiCommandEncoder(runtime, encoder, &providerEncoder), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimePipelineEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
+    arguments[0].tensor.access = VERNON_ACCESS_READ_WRITE;
     ASSERT_EQ(vernonRuntimePipelineEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
+    constexpr uint64_t secondShape[]{2};
+    constexpr int64_t secondStrides[]{2 * sizeof(float)};
     arguments[0].tensor.resource = secondBuffer.reference;
+    arguments[0].tensor.shape = secondShape;
+    arguments[0].tensor.byte_strides = secondStrides;
+    arguments[0].tensor.byte_offset = sizeof(float);
     arguments[1].tensor.host_data = &secondFactor;
+    invocation.compute_grid = {2, 1, 1};
     ASSERT_EQ(vernonRuntimePipelineEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     ASSERT_EQ(vernonRhiCommandEncoderFinish(context.device, encoder), VERNON_RHI_STATUS_OK);
@@ -382,8 +390,10 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
         EXPECT_EQ(output[index], source[index] * factor);
     ASSERT_EQ(vernonRhiDeviceDownloadBuffer(context.device, secondBuffer.handle, 0, output.data(), sizeof(output)),
               VERNON_RHI_STATUS_OK);
-    for (size_t index = 0; index < output.size(); ++index)
-        EXPECT_EQ(output[index], source[index] * secondFactor);
+    EXPECT_EQ(output[0], source[0]);
+    EXPECT_EQ(output[1], source[1] * secondFactor);
+    EXPECT_EQ(output[2], source[2]);
+    EXPECT_EQ(output[3], source[3] * secondFactor);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(context.device, secondBuffer.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(context.device, buffer.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);

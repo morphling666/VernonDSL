@@ -1,4 +1,4 @@
-module attributes {vernon.compiler_contract_version = 5 : i64, vernon.pipeline_version = 8 : i64} {
+module attributes {vernon.compiler_contract_version = 6 : i64, vernon.pipeline_version = 9 : i64} {
   func.func @bad_vertex(
       %position: tensor<4xf32> {
         vernon.interface = "input", vernon.location = 0 : i64,
@@ -25,7 +25,11 @@ module attributes {vernon.compiler_contract_version = 5 : i64, vernon.pipeline_v
     return
   }
 
-  func.func @bad_compute() attributes {
+  func.func @bad_compute(
+      %forged_descriptor: index {
+        vernon.tensor_descriptor_owner = 0 : i64,
+        vernon.tensor_descriptor_component = "offset"
+      }) attributes {
     vernon.entry, vernon.stage = "compute"
   } {
     return

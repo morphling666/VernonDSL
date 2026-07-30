@@ -27,6 +27,13 @@ struct PhysicalArgumentLayout {
     size_t alignment{1};
 };
 
+struct TensorViewDescriptorLayout {
+    uint32_t rank{};
+    uint32_t offsetBinding{UINT32_MAX};
+    std::vector<uint32_t> extentBindings;
+    std::vector<uint32_t> strideBindings;
+};
+
 struct ReflectedArgument {
     std::string kind;
     std::string builtin;
@@ -37,6 +44,7 @@ struct ReflectedArgument {
     uint32_t descriptorSet{};
     uint32_t binding{UINT32_MAX};
     std::vector<ReflectedStorageLeaf> storageLeaves;
+    std::optional<TensorViewDescriptorLayout> tensorViewDescriptor;
 };
 
 struct PackedArgumentsLayout {

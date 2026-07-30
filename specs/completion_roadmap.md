@@ -3,7 +3,7 @@
 ## Current position
 
 VernonDSL 0.1.1a1 is a Windows-first alpha developer preview. The supported
-near-term product matrix is:
+near-term product range is:
 
 - CPU compute reference execution;
 - CUDA compute;
@@ -17,22 +17,22 @@ not a released compatibility claim.
 
 ## Priority 1: compiler architecture debt
 
-1. Replace pass-state `physical_index` attributes with internal physical
-   load/store/atomic operations. Source IR must not spell pass state, and no
-   backend-local projection fallback may remain.
-2. Replace the ToGPU unrealized-cast/manual clone bridge with MLIR one-to-many
-   conversion. Final target IR must contain no unrealized conversion casts,
-   while symbols, reflection, and diagnostics remain deterministic.
-3. Decide and implement the general runtime-layout ABI for unspecialized
-   dynamic multi-rank TensorViews, or retain the AOT-only limitation with
-   consistent diagnostics and documentation.
-4. Remove cross-language Value ABI algorithm duplication. One declarative
+1. Implement the general runtime TensorView descriptor ABI and storage
+   lowering contract defined in
+   [`stable_release_plan.md`](stable_release_plan.md). Runtime shape, signed
+   strides, and offset must reach one precompiled artifact through the ABI
+   without layout specialization. Replace pass-state `physical_index`
+   attributes with internal physical load/store/atomic operations, and replace
+   the ToGPU unrealized-cast/manual clone bridge with MLIR one-to-many
+   conversion. No backend-local projection or layout-specialization fallback
+   may remain.
+2. Remove cross-language Value ABI algorithm duplication. One declarative
    source or native planner must define sizes, alignment, offsets, leaves, and
    hashes consumed by Python and host packing.
-5. Add executable aggregate workgroup coverage on available GPU runtimes,
+3. Add executable aggregate workgroup coverage on available GPU runtimes,
    including nested values, non-zero indices, padding, branches, loops,
    independent workgroups, and barrier-visible writes.
-6. Minimize derivable interface ABI metadata in one deliberate
+4. Minimize derivable interface ABI metadata in one deliberate
    compiler-contract bump. Retired fields must be rejected rather than
    accepted through compatibility parsing.
 
@@ -40,10 +40,12 @@ Acceptance requires one production path per invariant, deterministic artifacts
 and diagnostics, complete Python/native Release suites, relevant available GPU
 execution, and no compatibility fallback for retired internal forms.
 
-## Priority 2: language-v4 acceptance
+## Priority 2: post-0.1.1 language-v4 acceptance
 
 The detailed gates live in
 [`language/future_language_roadmap.md`](language/future_language_roadmap.md).
+Autodiff is not a `0.1.1` feature or stable-release gate. The following work
+applies to the later frontend-v4 declaration.
 Before declaring frontend version 4:
 
 - complete first-order JVP/VJP for specialized pure `@func` code and compare
@@ -108,6 +110,7 @@ Optional product tracks require independent justification and acceptance:
 
 Stable release requires:
 
+- satisfaction of [`stable_release_plan.md`](stable_release_plan.md);
 - repeatable release CI on every supported platform;
 - production-ready installation and binary distribution;
 - proven resource lifetime and synchronization across supported runtimes;

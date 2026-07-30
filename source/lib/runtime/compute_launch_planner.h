@@ -5,6 +5,7 @@
 #include "pipeline_manifest.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,15 @@ struct ComputeLaunchArgument {
     size_t hostSize{};
     const void *scalarData{};
     size_t scalarSize{};
+    const VernonTensorView *tensorView{};
+};
+
+enum class ComputeBindingSourceKind { Argument, TensorOffset, TensorExtent, TensorStride };
+
+struct ComputeBindingSource {
+    ComputeBindingSourceKind kind{ComputeBindingSourceKind::Argument};
+    uint32_t argumentIndex{};
+    uint32_t dimension{};
 };
 
 struct PlannedComputeLaunch {
@@ -27,6 +37,9 @@ struct PlannedComputeLaunch {
     VernonLaunchSize grid{};
     VernonRuntimeProviderObject commandEncoder{};
 };
+
+std::optional<int64_t> computeBindingDescriptorValue(const ComputeLaunchArgument &argument,
+                                                     const ComputeBindingSource &source);
 
 bool planComputeInvocation(const Variant &variant, const VernonPipelineInvocation &invocation,
                            PlannedComputeLaunch &plan, std::string &error);

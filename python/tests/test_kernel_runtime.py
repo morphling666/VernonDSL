@@ -385,24 +385,6 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         return output.to_numpy()
 
     @staticmethod
-    def _cuda_available() -> bool:
-        try:
-            vd.init(arch=vd.cuda)
-        except RuntimeError:
-            vd.init(arch=vd.cpu)
-            return False
-        return True
-
-    @staticmethod
-    def _vulkan_available() -> bool:
-        try:
-            vd.init(arch=vd.vulkan)
-        except RuntimeError:
-            vd.init(arch=vd.cpu)
-            return False
-        return True
-
-    @staticmethod
     def _runtime_available(arch: object) -> bool:
         try:
             vd.init(arch=arch)  # type: ignore[arg-type]
@@ -411,9 +393,9 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             return False
         return True
 
-    def _aggregate_compute_backends(self) -> list[object]:
-        backends: list[object] = [vd.cpu]
-        for architecture in (vd.cuda, vd.opengles, vd.opengl, vd.vulkan, vd.directx):
+    def _available_compute_backends(self, *, include_cpu: bool = True) -> list[object]:
+        backends: list[object] = [vd.cpu] if include_cpu else []
+        for architecture in (vd.cuda, vd.vulkan, vd.directx, vd.opengl, vd.opengles):
             if self._runtime_available(architecture):
                 backends.append(architecture)
         return backends
@@ -467,14 +449,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         expected = ((left + right) * 2.0 - right) / 2.0
         np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
 
-        backends = []
-        if self._cuda_available():
-            backends.append(vd.cuda)
-        if self._vulkan_available():
-            backends.append(vd.vulkan)
-        for architecture in (vd.opengl, vd.opengles):
-            if self._runtime_available(architecture):
-                backends.append(architecture)
+        backends = self._available_compute_backends(include_cpu=False)
         for backend in backends:
             with self.subTest(backend=backend.name):
                 backend_actual = self._run_tensor_operators(backend)
@@ -484,11 +459,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         left_values = np.array((1, 0, -1, 2), dtype=np.int32)
         right_values = np.array((1, 1, 1, -2), dtype=np.int32)
         expected = np.array((1, 0, 0, 0), dtype=np.int32)
-        backends = [vd.cpu]
-        if self._cuda_available():
-            backends.append(vd.cuda)
-        if self._vulkan_available():
-            backends.append(vd.vulkan)
+        backends = self._available_compute_backends()
         for backend in backends:
             with self.subTest(backend=backend.name):
                 vd.init(arch=backend)
@@ -505,11 +476,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         left_values = np.array((10, 20, 30, 40), dtype=np.int32)
         right_values = np.array((1, 2, 3, 4), dtype=np.int32)
         expected = np.array((10, 2, 30, 4), dtype=np.int32)
-        backends = [vd.cpu]
-        if self._cuda_available():
-            backends.append(vd.cuda)
-        if self._vulkan_available():
-            backends.append(vd.vulkan)
+        backends = self._available_compute_backends()
         for backend in backends:
             with self.subTest(backend=backend.name):
                 vd.init(arch=backend)
@@ -523,11 +490,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                 np.testing.assert_array_equal(output.to_numpy(), expected)
 
     def test_break_continue_backend_parity(self) -> None:
-        backends = [vd.cpu]
-        if self._cuda_available():
-            backends.append(vd.cuda)
-        if self._vulkan_available():
-            backends.append(vd.vulkan)
+        backends = self._available_compute_backends()
         for backend in backends:
             with self.subTest(backend=backend.name):
                 vd.init(arch=backend)
@@ -536,11 +499,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                 np.testing.assert_array_equal(output.to_numpy(), np.array((16,), dtype=np.int32))
 
     def test_nested_loop_control_targets_nearest_loop(self) -> None:
-        backends = [vd.cpu]
-        if self._cuda_available():
-            backends.append(vd.cuda)
-        if self._vulkan_available():
-            backends.append(vd.vulkan)
+        backends = self._available_compute_backends()
         for backend in backends:
             with self.subTest(backend=backend.name):
                 vd.init(arch=backend)
@@ -549,11 +508,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                 np.testing.assert_array_equal(output.to_numpy(), np.array((32,), dtype=np.int32))
 
     def test_early_return_aggregate_payload_backend_parity(self) -> None:
-        backends = [vd.cpu]
-        if self._cuda_available():
-            backends.append(vd.cuda)
-        if self._vulkan_available():
-            backends.append(vd.vulkan)
+        backends = self._available_compute_backends()
         for backend in backends:
             for flag, expected in (
                 (True, np.array((7.0, 2.5, 3.0, 4.5, 5.0, 6.0), dtype=np.float32)),
@@ -566,11 +521,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                     np.testing.assert_array_equal(output.to_numpy(), expected)
 
     def test_loop_early_return_backend_parity(self) -> None:
-        backends = [vd.cpu]
-        if self._cuda_available():
-            backends.append(vd.cuda)
-        if self._vulkan_available():
-            backends.append(vd.vulkan)
+        backends = self._available_compute_backends()
         for backend in backends:
             for limit, expected in ((2, -1), (8, 30)):
                 with self.subTest(backend=backend.name, limit=limit):
@@ -590,7 +541,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             ((-2_147_483_647, -2_147_483_648, -2), -2_147_483_647),
         )
         backends = [vd.cpu]
-        if self._cuda_available():
+        if self._runtime_available(vd.cuda):
             backends.append(vd.cuda)
         for backend in backends:
             for controls, expected in cases:
@@ -628,11 +579,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
 
     def test_dynamic_range_bounds_all_backend_parity(self) -> None:
         cases = (((0, 10, 1), 20), ((10, 0, -1), 22), ((5, 5, 1), 0))
-        backends = [vd.cpu]
-        if self._cuda_available():
-            backends.append(vd.cuda)
-        if self._vulkan_available():
-            backends.append(vd.vulkan)
+        backends = self._available_compute_backends()
         for backend in backends:
             for controls, expected in cases:
                 with self.subTest(backend=backend.name, controls=controls):
@@ -643,11 +590,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                     np.testing.assert_array_equal(output.to_numpy(), np.array((expected,), dtype=np.int32))
 
     def test_range_break_continue_and_early_return_backend_parity(self) -> None:
-        backends = [vd.cpu]
-        if self._cuda_available():
-            backends.append(vd.cuda)
-        if self._vulkan_available():
-            backends.append(vd.vulkan)
+        backends = self._available_compute_backends()
         for backend in backends:
             with self.subTest(backend=backend.name):
                 vd.init(arch=backend)
@@ -658,22 +601,14 @@ class KernelTensorRuntimeTests(unittest.TestCase):
 
     def test_loop_carried_vector_norm(self) -> None:
         expected = self._run_vector_while(vd.cpu)
-        backends = []
-        if self._cuda_available():
-            backends.append(vd.cuda)
-        if self._vulkan_available():
-            backends.append(vd.vulkan)
+        backends = self._available_compute_backends(include_cpu=False)
         for backend in backends:
             with self.subTest(backend=backend.name):
                 actual = self._run_vector_while(backend)
                 np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
 
     def test_matrix_specialization(self) -> None:
-        backends = []
-        if self._cuda_available():
-            backends.append(vd.cuda)
-        if self._vulkan_available():
-            backends.append(vd.vulkan)
+        backends = self._available_compute_backends(include_cpu=False)
         for backend in backends:
             with self.subTest(backend=backend.name):
                 vd.init(arch=backend)
@@ -687,11 +622,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         values = np.linspace(0.25, 2.0, 16, dtype=np.float32)
         exponent = 1.75
         expected = values ** np.float32(2.5) + values ** np.float32(exponent)
-        backends = [vd.cpu]
-        if self._cuda_available():
-            backends.append(vd.cuda)
-        if self._vulkan_available():
-            backends.append(vd.vulkan)
+        backends = self._available_compute_backends()
         for backend in backends:
             with self.subTest(backend=backend.name):
                 vd.init(arch=backend)
@@ -705,11 +636,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                 np.testing.assert_allclose(output.to_numpy(), expected, rtol=2e-6, atol=2e-6)
 
     def test_strided_tensor_view_dispatch(self) -> None:
-        backends = [vd.cpu]
-        if self._cuda_available():
-            backends.append(vd.cuda)
-        if self._vulkan_available():
-            backends.append(vd.vulkan)
+        backends = self._available_compute_backends()
         expected = np.array([[2.0, 1.0, 0.0], [8.0, 7.0, 6.0]], dtype=np.float32)
         for backend in backends:
             with self.subTest(backend=backend.name):
@@ -742,6 +669,52 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                 self.assertTrue(artifact)
                 self.assertIn('"tensor_views"', reflection)
 
+    def test_dynamic_tensor_view_artifact_reuses_transposed_dispatch(self) -> None:
+        backends = self._available_compute_backends()
+        for backend in backends:
+            with self.subTest(backend=backend.name):
+                vd.init(arch=backend)
+                copy_tensor_view.compile_count = 0
+                type(copy_tensor_view).clear_cache()
+
+                first_source = vd.storage.from_numpy(np.arange(4, dtype=np.float32).reshape(2, 2))
+                first_output = vd.storage.zeros(dtype=vd.f32, shape=(2, 2))
+                copy_tensor_view(first_output, first_source)
+                np.testing.assert_array_equal(first_output.to_numpy(), first_source.to_numpy())
+
+                owner = vd.storage.from_numpy(np.arange(6, dtype=np.float32).reshape(3, 2))
+                transposed_reversed = owner.view(shape=(2, 3), strides=(-1, 2), offset=1, access="read")
+                second_output = vd.storage.zeros(dtype=vd.f32, shape=(8,)).view(
+                    shape=(2, 3), strides=(4, 1), offset=1, access="read_write"
+                )
+                copy_tensor_view(second_output, transposed_reversed)
+                np.testing.assert_array_equal(second_output.to_numpy(), owner.to_numpy().T[::-1])
+                self.assertEqual(copy_tensor_view.compile_count, 1)
+                self.assertEqual(len(type(copy_tensor_view)._dispatch_cache), 1)
+
+    def test_cached_tensor_view_dispatch_revalidates_abi(self) -> None:
+        vd.init(arch=vd.cpu)
+        copy_tensor_view.compile_count = 0
+        type(copy_tensor_view).clear_cache()
+        output = vd.storage.zeros(dtype=vd.f32, shape=(2, 2))
+        source = vd.storage.zeros(dtype=vd.f32, shape=(2, 2))
+        copy_tensor_view(output, source)
+
+        invalid_rank = vd.storage.zeros(dtype=vd.f32, shape=(4,))
+        with self.assertRaisesRegex(TypeError, "rank 1, expected 2"):
+            copy_tensor_view(output, invalid_rank)
+
+        invalid_dtype = vd.storage.zeros(dtype=vd.i32, shape=(2, 2))
+        with self.assertRaisesRegex(TypeError, "dtype int32 does not match f32"):
+            copy_tensor_view(output, invalid_dtype)
+
+        invalid_access = vd.storage.zeros(dtype=vd.f32, shape=(2, 2)).view(access="write")
+        with self.assertRaisesRegex(TypeError, "access 'write' does not satisfy 'read'"):
+            copy_tensor_view(output, invalid_access)
+
+        self.assertEqual(copy_tensor_view.compile_count, 1)
+        self.assertEqual(len(type(copy_tensor_view)._dispatch_cache), 1)
+
     def test_aggregate_tensor_view_dispatch(self) -> None:
         values = tuple(
             ComplexAggregateVertex(
@@ -755,7 +728,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             )
             for index in range(4)
         )
-        for backend in self._aggregate_compute_backends():
+        for backend in self._available_compute_backends():
             with self.subTest(backend=backend.name):
                 vd.init(arch=backend)
                 source = vd.storage.from_values(values, dtype=ComplexAggregateVertex).view(
@@ -826,7 +799,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         )
         expected = np.array((23.0, 23.5, 69.0, 23.75, 24.0, 28.0), dtype=np.float32)
 
-        for backend in self._aggregate_compute_backends():
+        for backend in self._available_compute_backends():
             with self.subTest(backend=backend.name):
                 vd.init(arch=backend)
                 output = vd.storage.zeros(dtype=vd.f32, shape=(6,))
@@ -931,12 +904,12 @@ class KernelTests(unittest.TestCase):
         fill(output, 2.0)
         self.assertEqual(fill.compile_count, 1)
 
-    def test_specialized_shape_invalidates_cache(self) -> None:
+    def test_dynamic_tensor_view_shape_reuses_cache(self) -> None:
         first = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
         second = vd.storage.zeros(dtype=vd.f32, shape=(3, 3))
         fill(first, 1.0, grid=(3, 2, 1))
         fill(second, 1.0, grid=(3, 2, 1))
-        self.assertEqual(fill.compile_count, 2)
+        self.assertEqual(fill.compile_count, 1)
 
     def test_grid_is_inferred_and_validated(self) -> None:
         output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))

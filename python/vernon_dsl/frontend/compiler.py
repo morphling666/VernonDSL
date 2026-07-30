@@ -12,7 +12,7 @@ from ..struct_methods import normalize_struct_methods
 from .cache import frontend_cache
 from .emission import emit_mlir_module
 from .lowering import _FunctionEmitter
-from .lowering_types import DslType, FunctionSignature, ModuleContext, ViewLayout
+from .lowering_types import DslType, FunctionSignature, ModuleContext
 from .model import ConcreteType, is_abi_stable_value
 from .monomorphize import infer_and_monomorphize_helpers
 from .request import FrontendCompileRequest, FrontendCompileResult
@@ -31,7 +31,6 @@ class Compiler:
         declared_features: tuple[str, ...] = (),
         enabled_features: tuple[str, ...] = (),
         runtime_entry: str | None = None,
-        tensor_view_layouts: dict[str, ViewLayout] | None = None,
         runtime_workgroup_size: tuple[int, int, int] | None = None,
     ) -> str:
         """Compile an already loaded module without entry-specialization caching."""
@@ -43,11 +42,7 @@ class Compiler:
                 SourceLocation(filename, error.lineno or 1, error.offset or 1),
             ) from None
         module = normalize_struct_methods(module, filename)
-        context = ModuleContext(
-            filename,
-            runtime_entry=runtime_entry,
-            tensor_view_layouts=tensor_view_layouts or {},
-        )
+        context = ModuleContext(filename, runtime_entry=runtime_entry)
         self._collect_struct_names(module, context)
         type_parser = TypeParser(context)
         self._collect_structs(module, context, type_parser)
@@ -61,7 +56,6 @@ class Compiler:
         self._helper_specializations = tuple(getattr(module, "_vernon_helper_specializations", ()))
         self._typed_functions = tuple(getattr(module, "_vernon_typed_functions", ()))
         context.typed_functions = {function.symbol: function for function in self._typed_functions}
-        self._validate_tensor_view_layouts(context)
         self._collect_signatures(module, context, type_parser)
 
         def emit_function(node: ast.FunctionDef) -> list[str]:
@@ -116,10 +110,6 @@ class Compiler:
             declared_features=project.features,
             enabled_features=request.enabled_features,
             runtime_entry=request.entry,
-            tensor_view_layouts={
-                name: ViewLayout(shape, strides, offset)
-                for name, _, shape, strides, offset in request.tensor_view_layouts
-            },
             runtime_workgroup_size=request.workgroup_size,
         )
         result = FrontendCompileResult(
@@ -258,31 +248,6 @@ class Compiler:
                     raise context.error(node.returns, f"shared function '{node.name}' uses a device-only result")
             context.signatures[node.name] = FunctionSignature(tuple(arguments), result)
             context.result_annotations[node.name] = result_annotation
-
-    @staticmethod
-    def _validate_tensor_view_layouts(context: ModuleContext) -> None:
-        if not context.tensor_view_layouts:
-            return
-        entry = context.typed_functions.get(context.runtime_entry or "")
-        if entry is None:
-            raise ValueError("TensorView specialization requires a runtime entry")
-        parameters = {parameter.name: parameter for parameter in entry.parameters}
-        for name, layout in context.tensor_view_layouts.items():
-            parameter = parameters.get(name)
-            if parameter is None or parameter.type.kind != "tensor_view":
-                raise ValueError(f"TensorView specialization {name!r} does not name a TensorView entry parameter")
-            shape = parameter.type.arguments[1]
-            if not isinstance(shape, tuple):
-                raise RuntimeError(f"TensorView entry parameter {name!r} has an unresolved shape")
-            if len(layout.shape) != len(shape):
-                raise ValueError(
-                    f"TensorView specialization {name!r} has rank {len(layout.shape)}, expected {len(shape)}"
-                )
-            for dimension, (actual, expected) in enumerate(zip(layout.shape, shape, strict=True)):
-                if expected != "?" and actual != expected:
-                    raise ValueError(
-                        f"TensorView specialization {name!r} dimension {dimension} is {actual}, expected {expected}"
-                    )
 
     @staticmethod
     def _is_shared_function(node: ast.FunctionDef) -> bool:

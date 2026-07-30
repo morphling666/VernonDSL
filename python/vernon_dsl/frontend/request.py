@@ -17,7 +17,6 @@ class FrontendCompileRequest:
     entry: str
     enabled_features: tuple[str, ...] = ()
     tensor_shapes: tuple[tuple[str, str, tuple[int, ...]], ...] = ()
-    tensor_view_layouts: tuple[tuple[str, str, tuple[int, ...], tuple[int, ...], int], ...] = ()
     captured_constants: tuple[tuple[str, int | float | bool], ...] = ()
     workgroup_size: tuple[int, int, int] | None = None
 
@@ -28,22 +27,6 @@ class FrontendCompileRequest:
             self,
             "tensor_shapes",
             tuple(sorted((name, dtype, tuple(shape)) for name, dtype, shape in self.tensor_shapes)),
-        )
-        object.__setattr__(
-            self,
-            "tensor_view_layouts",
-            tuple(
-                sorted(
-                    (
-                        name,
-                        dtype,
-                        tuple(shape),
-                        tuple(strides),
-                        offset,
-                    )
-                    for name, dtype, shape, strides, offset in self.tensor_view_layouts
-                )
-            ),
         )
         object.__setattr__(
             self,
@@ -74,10 +57,6 @@ class FrontendCompileResult:
             "entry": self.request.entry,
             "enabled_features": list(self.request.enabled_features),
             "tensor_shapes": [[name, dtype, list(shape)] for name, dtype, shape in self.request.tensor_shapes],
-            "tensor_view_layouts": [
-                [name, dtype, list(shape), list(strides), offset]
-                for name, dtype, shape, strides, offset in self.request.tensor_view_layouts
-            ],
             "captured_constants": [
                 [name, type(value).__name__, value] for name, value in self.request.captured_constants
             ],

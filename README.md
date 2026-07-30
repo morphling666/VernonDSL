@@ -72,7 +72,7 @@ Prebuilt wheels are currently provided for Windows and supported CPython 3.11
 through 3.14:
 
 ```powershell
-py -m pip install vernon-lang
+py -m pip install vernon-lang==0.1.1
 ```
 
 Verify the installation:

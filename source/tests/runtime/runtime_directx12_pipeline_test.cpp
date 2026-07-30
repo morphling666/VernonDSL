@@ -244,9 +244,7 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
       %values: !vernon.tensor_view<f32, [-1], "read_write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64,
-        vernon.tensor_strides = array<i64: 1>,
-        vernon.tensor_offset = 0 : i64
+        vernon.binding = 0 : i64
       },
       %id: index {
         vernon.interface = "input",
@@ -363,6 +361,7 @@ TEST(RuntimeDirectX12Pipeline, DispatchesComputeBundleThroughRuntimeCoreProvider
     constexpr uint64_t scalarShape[] = {1};
     constexpr int64_t strides[] = {sizeof(float)};
     constexpr float factor = 3.0f;
+    constexpr float secondFactor = 5.0f;
     VernonPipelineArgument arguments[2]{};
     arguments[0].slot = valuesParameter.slot;
     arguments[0].kind = VERNON_PIPELINE_TENSOR;
@@ -392,6 +391,8 @@ TEST(RuntimeDirectX12Pipeline, DispatchesComputeBundleThroughRuntimeCoreProvider
     invocation.arguments = arguments;
     invocation.argument_count = std::size(arguments);
     invocation.compute_grid = {4, 1, 1};
+    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
+    arguments[0].tensor.access = VERNON_ACCESS_READ_WRITE;
     ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
 
@@ -400,6 +401,22 @@ TEST(RuntimeDirectX12Pipeline, DispatchesComputeBundleThroughRuntimeCoreProvider
               VERNON_RHI_STATUS_OK);
     for (size_t index = 0; index < output.size(); ++index)
         EXPECT_EQ(output[index], source[index] * factor);
+
+    constexpr uint64_t secondShape[] = {2};
+    constexpr int64_t secondStrides[] = {2 * sizeof(float)};
+    arguments[0].tensor.shape = secondShape;
+    arguments[0].tensor.byte_strides = secondStrides;
+    arguments[0].tensor.byte_offset = sizeof(float);
+    arguments[1].tensor.host_data = &secondFactor;
+    invocation.compute_grid = {2, 1, 1};
+    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
+        << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(context.device, buffer.handle, 0, output.data(), sizeof(output)),
+              VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(output[0], source[0] * factor);
+    EXPECT_EQ(output[1], source[1] * factor * secondFactor);
+    EXPECT_EQ(output[2], source[2] * factor);
+    EXPECT_EQ(output[3], source[3] * factor * secondFactor);
 
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(context.device, buffer.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);

@@ -4,6 +4,7 @@
 #include "tensor_bridge.h"
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <unordered_map>
@@ -18,6 +19,28 @@ using ComputeArgumentMap = std::unordered_map<uint32_t, const VernonPipelineArgu
 bool fail(std::string &error, const char *message) {
     error = message;
     return false;
+}
+
+bool packTensorViewDescriptor(const VernonTensorView &tensor, std::vector<uint8_t> &storage) {
+    if (!valueLayoutValid(tensor.element_layout) || !tensor.element_layout.byte_size || !tensor.rank || !tensor.shape ||
+        !tensor.byte_strides || tensor.byte_offset % tensor.element_layout.byte_size)
+        return false;
+    storage.assign(8 * (2 + 2 * tensor.rank), 0);
+    const uint64_t pointer = tensor.storage == VERNON_TENSOR_HOST
+                                 ? static_cast<uint64_t>(reinterpret_cast<uintptr_t>(tensor.host_data))
+                                 : static_cast<uint64_t>(tensor.resource.resource.value + tensor.resource.offset);
+    const uint64_t elementOffset = tensor.byte_offset / tensor.element_layout.byte_size;
+    std::memcpy(storage.data(), &pointer, sizeof(pointer));
+    std::memcpy(storage.data() + 8, &elementOffset, sizeof(elementOffset));
+    for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension) {
+        if (tensor.byte_strides[dimension] % static_cast<int64_t>(tensor.element_layout.byte_size))
+            return false;
+        const int64_t elementStride =
+            tensor.byte_strides[dimension] / static_cast<int64_t>(tensor.element_layout.byte_size);
+        std::memcpy(storage.data() + 16 + 8 * dimension, &tensor.shape[dimension], sizeof(uint64_t));
+        std::memcpy(storage.data() + 16 + 8 * (tensor.rank + dimension), &elementStride, sizeof(elementStride));
+    }
+    return true;
 }
 
 bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &arguments,
@@ -61,41 +84,48 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
                     argument.kind = ComputeLaunchArgumentKind::Tensor;
                     argument.hostData = supplied.tensor.host_data;
                     argument.hostSize = supplied.tensor.byte_size;
-                    assigned[use.index] = 1;
-                    continue;
+                } else {
+                    argument.kind = ComputeLaunchArgumentKind::Scalar;
+                    if (!use.physicalValueLayout)
+                        return fail(error, "compute value Tensor is missing its compiler-planned physical layout");
+                    if (use.physicalValueLayout->size > std::numeric_limits<size_t>::max())
+                        return fail(error, "compute Tensor physical size exceeds the host size range");
+                    TensorPackingLayout layout;
+                    layout.elementSize = supplied.tensor.element_layout.byte_size;
+                    layout.shape = use.shape.empty() ? parameter.shape : use.shape;
+                    layout.byteSize = static_cast<size_t>(use.physicalValueLayout->size);
+                    for (uint64_t stride : use.physicalValueLayout->byteStrides) {
+                        if (stride > std::numeric_limits<size_t>::max())
+                            return fail(error, "compute Tensor physical stride exceeds the host size range");
+                        layout.byteStrides.push_back(static_cast<size_t>(stride));
+                    }
+                    for (uint64_t offset : use.physicalValueLayout->elementLeafOffsets) {
+                        if (offset > std::numeric_limits<size_t>::max())
+                            return fail(error, "compute Tensor physical leaf offset exceeds the host size range");
+                        layout.elementLeafOffsets.push_back(static_cast<size_t>(offset));
+                    }
+                    VernonTensorView packedTensor = supplied.tensor;
+                    if (packedTensor.rank == layout.shape.size() + 1 && packedTensor.shape &&
+                        packedTensor.byte_strides && packedTensor.shape[0] == 1) {
+                        --packedTensor.rank;
+                        ++packedTensor.shape;
+                        ++packedTensor.byte_strides;
+                    }
+                    auto packed = packTensor(packedTensor, layout);
+                    if (!packed)
+                        return fail(error, "failed to pack reflected compute Tensor layout");
+                    plan.hostTensorStorage.push_back(std::move(*packed));
+                    argument.scalarData = plan.hostTensorStorage.back().data();
+                    argument.scalarSize = plan.hostTensorStorage.back().size();
                 }
-                argument.kind = ComputeLaunchArgumentKind::Scalar;
-                if (!use.physicalValueLayout)
-                    return fail(error, "compute value Tensor is missing its compiler-planned physical layout");
-                if (use.physicalValueLayout->size > std::numeric_limits<size_t>::max())
-                    return fail(error, "compute Tensor physical size exceeds the host size range");
-                TensorPackingLayout layout;
-                layout.elementSize = supplied.tensor.element_layout.byte_size;
-                layout.shape = use.shape.empty() ? parameter.shape : use.shape;
-                layout.byteSize = static_cast<size_t>(use.physicalValueLayout->size);
-                for (uint64_t stride : use.physicalValueLayout->byteStrides) {
-                    if (stride > std::numeric_limits<size_t>::max())
-                        return fail(error, "compute Tensor physical stride exceeds the host size range");
-                    layout.byteStrides.push_back(static_cast<size_t>(stride));
-                }
-                for (uint64_t offset : use.physicalValueLayout->elementLeafOffsets) {
-                    if (offset > std::numeric_limits<size_t>::max())
-                        return fail(error, "compute Tensor physical leaf offset exceeds the host size range");
-                    layout.elementLeafOffsets.push_back(static_cast<size_t>(offset));
-                }
-                VernonTensorView packedTensor = supplied.tensor;
-                if (packedTensor.rank == layout.shape.size() + 1 && packedTensor.shape && packedTensor.byte_strides &&
-                    packedTensor.shape[0] == 1) {
-                    --packedTensor.rank;
-                    ++packedTensor.shape;
-                    ++packedTensor.byte_strides;
-                }
-                auto packed = packTensor(packedTensor, layout);
-                if (!packed)
-                    return fail(error, "failed to pack reflected compute Tensor layout");
-                plan.hostTensorStorage.push_back(std::move(*packed));
+            }
+            if (use.tensorViewDescriptor) {
+                plan.hostTensorStorage.emplace_back();
+                if (!packTensorViewDescriptor(supplied.tensor, plan.hostTensorStorage.back()))
+                    return fail(error, "failed to pack TensorView dispatch descriptor");
                 argument.scalarData = plan.hostTensorStorage.back().data();
                 argument.scalarSize = plan.hostTensorStorage.back().size();
+                argument.tensorView = &supplied.tensor;
             }
             assigned[use.index] = 1;
         }
@@ -134,6 +164,35 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
 
 } // namespace
 
+std::optional<int64_t> computeBindingDescriptorValue(const ComputeLaunchArgument &argument,
+                                                     const ComputeBindingSource &source) {
+    const VernonTensorView *tensor = argument.tensorView;
+    if (!tensor || !valueLayoutValid(tensor->element_layout))
+        return std::nullopt;
+    const int64_t elementSize = static_cast<int64_t>(tensor->element_layout.byte_size);
+    switch (source.kind) {
+    case ComputeBindingSourceKind::Argument:
+        return std::nullopt;
+    case ComputeBindingSourceKind::TensorOffset:
+        if (tensor->byte_offset % tensor->element_layout.byte_size ||
+            tensor->byte_offset / tensor->element_layout.byte_size >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+            return std::nullopt;
+        return static_cast<int64_t>(tensor->byte_offset / tensor->element_layout.byte_size);
+    case ComputeBindingSourceKind::TensorExtent:
+        if (source.dimension >= tensor->rank || !tensor->shape ||
+            tensor->shape[source.dimension] > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+            return std::nullopt;
+        return static_cast<int64_t>(tensor->shape[source.dimension]);
+    case ComputeBindingSourceKind::TensorStride:
+        if (source.dimension >= tensor->rank || !tensor->byte_strides ||
+            tensor->byte_strides[source.dimension] % elementSize)
+            return std::nullopt;
+        return tensor->byte_strides[source.dimension] / elementSize;
+    }
+    return std::nullopt;
+}
+
 bool planComputeInvocation(const Variant &variant, const VernonPipelineInvocation &invocation,
                            PlannedComputeLaunch &plan, std::string &error) {
     ComputeArgumentMap arguments;
@@ -148,15 +207,31 @@ bool planComputeInvocation(const Variant &variant, const VernonPipelineInvocatio
         if (found == arguments.end() || parameter.kind != "tensor" || found->second->kind != VERNON_PIPELINE_TENSOR)
             return fail(error, "pipeline argument kind does not match layout");
         const VernonTensorView &tensor = found->second->tensor;
+        const bool accessCompatible = parameter.access.empty()      ? true
+                                      : parameter.access == "read"  ? tensor.access != VERNON_ACCESS_WRITE
+                                      : parameter.access == "write" ? tensor.access != VERNON_ACCESS_READ
+                                                                    : tensor.access == VERNON_ACCESS_READ_WRITE;
         if (tensor.struct_size < sizeof(VernonTensorView) ||
             !valueLayoutsEqual(tensor.element_layout, pipelineValueLayout(parameter.elementLayout)) ||
-            tensor.access > VERNON_ACCESS_READ_WRITE ||
+            tensor.access > VERNON_ACCESS_READ_WRITE || !accessCompatible ||
             (tensor.storage != VERNON_TENSOR_HOST && tensor.storage != VERNON_TENSOR_RHI_RESOURCE) ||
             !tensorFitsAllocation(tensor))
             return fail(error, "pipeline Tensor argument does not match layout");
-        for (const ParameterUse &use : parameter.uses)
-            if ((use.stage == "compute" || use.stage == variant.compute) && !tensorMatchesSpecialization(tensor, use))
-                return fail(error, "pipeline TensorView layout does not match specialization");
+        for (const ParameterUse &use : parameter.uses) {
+            if (use.stage != "compute" && use.stage != variant.compute)
+                continue;
+            if (!use.tensorViewDescriptor)
+                continue;
+            if (tensor.rank != use.tensorViewDescriptor->rank || tensor.rank != use.shape.size() ||
+                (tensor.rank && (!tensor.shape || !tensor.byte_strides)) || !tensor.element_layout.byte_size ||
+                tensor.byte_offset % tensor.element_layout.byte_size)
+                return fail(error, "pipeline TensorView descriptor does not match its declared rank");
+            for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension) {
+                if ((use.shape[dimension] && use.shape[dimension] != tensor.shape[dimension]) ||
+                    tensor.byte_strides[dimension] % static_cast<int64_t>(tensor.element_layout.byte_size))
+                    return fail(error, "pipeline TensorView descriptor violates static shape or element stride");
+            }
+        }
         if (parameter.source != "direct") {
             const bool allowLeading =
                 std::any_of(parameter.uses.begin(), parameter.uses.end(), [](const ParameterUse &use) {

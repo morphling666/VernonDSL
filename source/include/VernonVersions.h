@@ -3,12 +3,12 @@
 #define VERNON_VERSIONS_H
 
 #define VERNON_RELEASE_VERSION "0.1.1a1"
-#define VERNON_COMPILER_CONTRACT_VERSION 5
-#define VERNON_PIPELINE_VERSION 8
-#define VERNON_COMPILER_CONTRACT_VERSION_STRING "5"
-#define VERNON_PIPELINE_VERSION_STRING "8"
-#define VERNON_MLIR_VERSION_ATTRIBUTES "vernon.compiler_contract_version = 5 : i64, vernon.pipeline_version = 8 : i64"
-#define VERNON_JSON_VERSION_FIELDS "\"compiler_contract_version\":5,\"pipeline_version\":8"
-#define VERNON_PIPELINE_JSON_FIELD "\"pipeline_version\":8"
+#define VERNON_COMPILER_CONTRACT_VERSION 6
+#define VERNON_PIPELINE_VERSION 9
+#define VERNON_COMPILER_CONTRACT_VERSION_STRING "6"
+#define VERNON_PIPELINE_VERSION_STRING "9"
+#define VERNON_MLIR_VERSION_ATTRIBUTES "vernon.compiler_contract_version = 6 : i64, vernon.pipeline_version = 9 : i64"
+#define VERNON_JSON_VERSION_FIELDS "\"compiler_contract_version\":6,\"pipeline_version\":9"
+#define VERNON_PIPELINE_JSON_FIELD "\"pipeline_version\":9"
 
 #endif // VERNON_VERSIONS_H

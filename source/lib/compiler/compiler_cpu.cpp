@@ -85,6 +85,8 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
         for (unsigned index = 0; index < function.getNumArguments(); ++index) {
             mlir::Type type = function.getArgumentTypes()[index];
             mlir::DictionaryAttr attrs = function.getArgAttrDict(index);
+            if (attrs.get(mlir::vernon::kTensorDescriptorComponentAttrName))
+                continue;
             mlir::FailureOr<mlir::vernon::PhysicalValueAbiLayout> layout =
                 mlir::vernon::getPhysicalValueAbiLayout(type, module, mlir::vernon::PhysicalAbiProfile::HostValue);
             if (mlir::failed(layout)) {
@@ -102,6 +104,7 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
                                                   {}};
             if (packing.kind == vernon::CpuAbiArgumentKind::TensorView) {
                 auto view = mlir::cast<mlir::vernon::TensorViewType>(type);
+                packing.tensorRank = static_cast<uint32_t>(view.getShape().size());
                 mlir::FailureOr<mlir::vernon::ValueAbiLayout> layout =
                     mlir::vernon::getValueAbiLayout(view.getElementType(), module);
                 if (mlir::failed(layout)) {
@@ -112,20 +115,6 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
                 for (const mlir::vernon::ValueAbiLeaf &leaf : layout->leaves)
                     packing.tensorLeafElementSizes.push_back(
                         std::max<uint64_t>(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1));
-                if (auto shape = attrs.getAs<mlir::DenseI64ArrayAttr>("vernon.tensor_shape")) {
-                    uint64_t extent = 1;
-                    for (int64_t dimension : shape.asArrayRef()) {
-                        if (dimension < 0 || (dimension != 0 && extent > std::numeric_limits<uint64_t>::max() /
-                                                                             static_cast<uint64_t>(dimension))) {
-                            diagnostics = "invalid vernon.tensor_shape on CPU TensorView in "
-                                          "entry '" +
-                                          function.getSymName().str() + "'";
-                            return false;
-                        }
-                        extent *= static_cast<uint64_t>(dimension);
-                    }
-                    packing.staticExtent = extent;
-                }
             }
             metadata.sourceArguments.push_back(packing);
             metadata.argumentsSize += layout->size;

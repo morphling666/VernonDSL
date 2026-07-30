@@ -15,6 +15,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/DialectConversion.h"
 
 namespace mlir::vernon {
 namespace {
@@ -25,6 +26,67 @@ Type convertStorageLeaf(Type type, bool useSpirvStorage) {
     return MemRefType::get({ShapedType::kDynamic}, type, AffineMap(),
                            spirv::StorageClassAttr::get(type.getContext(), spirv::StorageClass::StorageBuffer));
 }
+
+struct PhysicalLoadConversion final : OpConversionPattern<PhysicalLoadOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(PhysicalLoadOp op, OneToNOpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        if (!llvm::hasSingleElement(adaptor.getIndex()))
+            return rewriter.notifyMatchFailure(op, "expected one converted physical index");
+        auto module = op->getParentOfType<ModuleOp>();
+        FailureOr<ValueAbiLayout> layout = getValueAbiLayout(op.getResult().getType(), module);
+        if (failed(layout) || adaptor.getStorage().size() != layout->leaves.size())
+            return rewriter.notifyMatchFailure(op, "TensorView storage expansion does not match its value ABI");
+        FailureOr<Value> value =
+            loadAggregateRecordFromStorages(op.getResult().getType(), adaptor.getStorage(), adaptor.getIndex().front(),
+                                            *layout, module, rewriter, op.getLoc(), AggregateStorageBackend::MemRef);
+        if (failed(value))
+            return failure();
+        rewriter.replaceOp(op, *value);
+        return success();
+    }
+};
+
+struct PhysicalStoreConversion final : OpConversionPattern<PhysicalStoreOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(PhysicalStoreOp op, OneToNOpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        if (!llvm::hasSingleElement(adaptor.getIndex()) || !llvm::hasSingleElement(adaptor.getValue()))
+            return rewriter.notifyMatchFailure(op, "expected scalar converted store index and value");
+        auto module = op->getParentOfType<ModuleOp>();
+        FailureOr<ValueAbiLayout> layout = getValueAbiLayout(op.getValue().getType(), module);
+        if (failed(layout) || adaptor.getStorage().size() != layout->leaves.size())
+            return rewriter.notifyMatchFailure(op, "TensorView storage expansion does not match its value ABI");
+        if (failed(storeAggregateRecordToStorages(op.getValue().getType(), adaptor.getStorage(),
+                                                  adaptor.getIndex().front(), adaptor.getValue().front(), *layout,
+                                                  module, rewriter, op.getLoc(), AggregateStorageBackend::MemRef)))
+            return failure();
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+struct PhysicalAtomicConversion final : OpConversionPattern<PhysicalAtomicOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(PhysicalAtomicOp op, OneToNOpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        if (!llvm::hasSingleElement(adaptor.getStorage()) || !llvm::hasSingleElement(adaptor.getIndex()) ||
+            !llvm::hasSingleElement(adaptor.getValue()))
+            return rewriter.notifyMatchFailure(op, "atomic TensorView storage must lower to one scalar memref");
+        arith::AtomicRMWKind kind = op.getAtomicKind() == "add"    ? arith::AtomicRMWKind::addi
+                                    : op.getAtomicKind() == "min"  ? arith::AtomicRMWKind::mins
+                                    : op.getAtomicKind() == "max"  ? arith::AtomicRMWKind::maxs
+                                    : op.getAtomicKind() == "umin" ? arith::AtomicRMWKind::minu
+                                    : op.getAtomicKind() == "umax" ? arith::AtomicRMWKind::maxu
+                                                                   : arith::AtomicRMWKind::assign;
+        rewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(op, kind, adaptor.getValue().front(),
+                                                         adaptor.getStorage().front(), adaptor.getIndex().front());
+        return success();
+    }
+};
 
 struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<ModuleOp>> {
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VernonToGPUPass)
@@ -154,14 +216,11 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                         source.emitError() << "cannot lower compute resource argument #" << index << " type " << type;
                         return signalPassFailure();
                     }
-                    unsigned firstKernelIndex = kernelArgumentTypes.size();
+                    unsigned kernelIndex = kernelArgumentTypes.size();
                     auto descriptorSet = cast<IntegerAttr>(attrs.descriptorSet);
-                    for (const ValueAbiLeaf &leaf : layout->leaves) {
-                        unsigned kernelIndex = kernelArgumentTypes.size();
-                        kernelArgumentTypes.push_back(convertStorageLeaf(leaf.scalarType, useSpirvStorage));
-                        resourceBindings.emplace_back(kernelIndex, std::make_pair(descriptorSet.getInt(), kernelIndex));
-                    }
-                    sourceArgumentRanges[index] = {firstKernelIndex, layout->leaves.size()};
+                    kernelArgumentTypes.push_back(view);
+                    resourceBindings.emplace_back(kernelIndex, std::make_pair(descriptorSet.getInt(), kernelIndex));
+                    sourceArgumentRanges[index] = {kernelIndex, 1};
                 } else if (!attrs.builtin && (type.isIntOrIndexOrFloat() || isa<VectorType>(type))) {
                     unsigned kernelIndex = kernelArgumentTypes.size();
                     kernelArgumentTypes.push_back(type);
@@ -176,34 +235,9 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                 kernel->setAttr(spirv::getEntryPointABIAttrName(),
                                 spirv::getEntryPointABIAttr(source.getContext(), workgroup.asArrayRef()));
             }
-            for (auto [index, binding] : resourceBindings) {
-                kernel.setArgAttr(
-                    index, spirv::getInterfaceVarABIAttrName(),
-                    spirv::getInterfaceVarABIAttr(binding.first, binding.second, std::nullopt, source.getContext()));
-            }
-            if (useSpirvStorage) {
-                for (unsigned index = 0; index < kernel.getNumArguments(); ++index) {
-                    if (kernel.getArgAttr(index, spirv::getInterfaceVarABIAttrName()))
-                        continue;
-                    std::optional<spirv::StorageClass> storageClass;
-                    if (kernel.getArgument(index).getType().isIntOrIndexOrFloat())
-                        storageClass = spirv::StorageClass::StorageBuffer;
-                    kernel.setArgAttr(index, spirv::getInterfaceVarABIAttrName(),
-                                      spirv::getInterfaceVarABIAttr(0, index, storageClass, source.getContext()));
-                }
-            }
-
             Block *entry = &kernel.front();
             OpBuilder bodyBuilder = OpBuilder::atBlockBegin(entry);
             IRMapping mapping;
-            SmallVector<UnrealizedConversionCastOp> viewBridges;
-            DenseMap<Value, Value> scalarViewStorages;
-            struct AggregateViewExpansion {
-                TensorViewType view;
-                ValueAbiLayout layout;
-                SmallVector<Value> storages;
-            };
-            DenseMap<Value, AggregateViewExpansion> aggregateViewStorages;
             for (auto [sourceIndex, range] : sourceArgumentRanges) {
                 Value first = entry->getArgument(range.first);
                 auto aggregateTensor = aggregateTensorArguments.find(sourceIndex);
@@ -241,21 +275,7 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                     mapping.map(source.getArgument(sourceIndex), first);
                     continue;
                 }
-                FailureOr<ValueAbiLayout> layout = getValueAbiLayout(view.getElementType(), module);
-                if (failed(layout))
-                    return signalPassFailure();
-                SmallVector<Value> storages;
-                storages.reserve(range.second);
-                for (unsigned offset = 0; offset < range.second; ++offset)
-                    storages.push_back(entry->getArgument(range.first + offset));
-                auto bridge = UnrealizedConversionCastOp::create(bodyBuilder, source.getLoc(), TypeRange{view},
-                                                                 ValueRange(storages));
-                mapping.map(source.getArgument(sourceIndex), bridge.getResult(0));
-                viewBridges.push_back(bridge);
-                if (view.getElementType().isIntOrFloat())
-                    scalarViewStorages[bridge.getResult(0)] = storages.front();
-                else
-                    aggregateViewStorages[bridge.getResult(0)] = {view, *layout, std::move(storages)};
+                mapping.map(source.getArgument(sourceIndex), first);
             }
             for (const InlineTensorArgument &inlineTensor : inlineTensorArguments) {
                 RankedTensorType tensor = inlineTensor.type;
@@ -332,101 +352,68 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                 bodyBuilder.clone(operation, mapping);
             }
 
-            SmallVector<Operation *> aggregateStorageOperations;
-            kernel.walk([&](Operation *operation) {
-                if (isa<LoadOp, StoreOp>(operation))
-                    aggregateStorageOperations.push_back(operation);
+            TypeConverter storageConverter;
+            storageConverter.addConversion([](Type type) { return type; });
+            storageConverter.addConversion([&](TensorViewType view, SmallVectorImpl<Type> &converted) {
+                FailureOr<ValueAbiLayout> layout = getValueAbiLayout(view.getElementType(), module);
+                if (failed(layout) || layout->leaves.empty())
+                    return failure();
+                for (const ValueAbiLeaf &leaf : layout->leaves)
+                    converted.push_back(convertStorageLeaf(leaf.scalarType, useSpirvStorage));
+                return success();
             });
-            IRRewriter aggregateRewriter(kernel.getContext());
-            for (Operation *operation : aggregateStorageOperations) {
-                Value logicalStorage =
-                    isa<StoreOp>(operation) ? cast<StoreOp>(operation).getStorage() : operation->getOperand(0);
-                auto found = aggregateViewStorages.find(logicalStorage);
-                if (found == aggregateViewStorages.end())
-                    continue;
-                ValueRange indices = isa<StoreOp>(operation) ? cast<StoreOp>(operation).getIndices()
-                                                             : cast<LoadOp>(operation).getIndices();
-                if (!operation->hasAttr(kPhysicalIndexAttrName) || indices.empty()) {
-                    operation->emitError("aggregate device TensorView operation has no materialized physical index");
+
+            RewritePatternSet storagePatterns(module.getContext());
+            storagePatterns.add<PhysicalLoadConversion, PhysicalStoreConversion, PhysicalAtomicConversion>(
+                storageConverter, module.getContext());
+            populateFunctionOpInterfaceTypeConversionPattern<gpu::GPUFuncOp>(storagePatterns, storageConverter);
+
+            ConversionTarget storageTarget(*module.getContext());
+            auto isNonResourceStorage = [](Value storage) { return !isa<BlockArgument>(storage); };
+            storageTarget.addDynamicallyLegalOp<PhysicalLoadOp>(
+                [&](PhysicalLoadOp op) { return isNonResourceStorage(op.getStorage()); });
+            storageTarget.addDynamicallyLegalOp<PhysicalStoreOp>(
+                [&](PhysicalStoreOp op) { return isNonResourceStorage(op.getStorage()); });
+            storageTarget.addDynamicallyLegalOp<PhysicalAtomicOp>(
+                [&](PhysicalAtomicOp op) { return isNonResourceStorage(op.getStorage()); });
+            storageTarget.addDynamicallyLegalOp<gpu::GPUFuncOp>(
+                [&](gpu::GPUFuncOp function) { return storageConverter.isSignatureLegal(function.getFunctionType()); });
+            storageTarget.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
+            if (failed(applyPartialConversion(kernel, storageTarget, std::move(storagePatterns))))
+                return signalPassFailure();
+
+            SmallVector<std::pair<unsigned, unsigned>> convertedArgumentRanges;
+            unsigned convertedIndex = 0;
+            for (Type type : kernelArgumentTypes) {
+                SmallVector<Type> convertedTypes;
+                if (failed(storageConverter.convertTypes(type, convertedTypes)))
                     return signalPassFailure();
-                }
-                aggregateRewriter.setInsertionPoint(operation);
-                if (auto load = dyn_cast<LoadOp>(operation)) {
-                    FailureOr<Value> value = loadAggregateRecordFromStorages(
-                        found->second.view.getElementType(), found->second.storages, indices.front(),
-                        found->second.layout, module, aggregateRewriter, load.getLoc(),
-                        AggregateStorageBackend::MemRef);
-                    if (failed(value)) {
-                        load.emitError("cannot reconstruct aggregate device TensorView value");
-                        return signalPassFailure();
-                    }
-                    aggregateRewriter.replaceOp(load, *value);
-                } else {
-                    auto store = cast<StoreOp>(operation);
-                    if (failed(storeAggregateRecordToStorages(found->second.view.getElementType(),
-                                                              found->second.storages, indices.front(), store.getValue(),
-                                                              found->second.layout, module, aggregateRewriter,
-                                                              store.getLoc(), AggregateStorageBackend::MemRef))) {
-                        store.emitError("cannot decompose aggregate device TensorView value");
-                        return signalPassFailure();
-                    }
-                    aggregateRewriter.eraseOp(store);
+                convertedArgumentRanges.emplace_back(convertedIndex, convertedTypes.size());
+                convertedIndex += convertedTypes.size();
+            }
+            for (auto [originalIndex, binding] : resourceBindings) {
+                auto [first, count] = convertedArgumentRanges[originalIndex];
+                for (unsigned offset = 0; offset < count; ++offset) {
+                    const unsigned index = first + offset;
+                    kernel.setArgAttr(
+                        index, spirv::getInterfaceVarABIAttrName(),
+                        spirv::getInterfaceVarABIAttr(binding.first, index, std::nullopt, source.getContext()));
                 }
             }
-
-            SmallVector<Operation *> scalarStorageOperations;
-            kernel.walk([&](Operation *operation) {
-                if (isa<LoadOp, StoreOp, AtomicOp>(operation))
-                    scalarStorageOperations.push_back(operation);
-            });
-            IRRewriter storageRewriter(kernel.getContext());
-            for (Operation *operation : scalarStorageOperations) {
-                Value logicalStorage =
-                    isa<StoreOp>(operation) ? cast<StoreOp>(operation).getStorage() : operation->getOperand(0);
-                auto found = scalarViewStorages.find(logicalStorage);
-                if (found == scalarViewStorages.end())
-                    continue;
-                if (!operation->hasAttr(kPhysicalIndexAttrName)) {
-                    operation->emitError("device TensorView operation is missing its materialized physical index");
-                    return signalPassFailure();
-                }
-                ValueRange indices = isa<LoadOp>(operation)    ? cast<LoadOp>(operation).getIndices()
-                                     : isa<StoreOp>(operation) ? cast<StoreOp>(operation).getIndices()
-                                                               : cast<AtomicOp>(operation).getIndices();
-                if (indices.empty()) {
-                    operation->emitError("device TensorView operation has no physical index");
-                    return signalPassFailure();
-                }
-                storageRewriter.setInsertionPoint(operation);
-                if (auto load = dyn_cast<LoadOp>(operation)) {
-                    storageRewriter.replaceOpWithNewOp<memref::LoadOp>(load, found->second, indices.front());
-                } else if (auto store = dyn_cast<StoreOp>(operation)) {
-                    memref::StoreOp::create(storageRewriter, store.getLoc(), store.getValue(), found->second,
-                                            indices.front());
-                    storageRewriter.eraseOp(store);
-                } else {
-                    auto atomic = cast<AtomicOp>(operation);
-                    arith::AtomicRMWKind kind = atomic.getAtomicKind() == "add"    ? arith::AtomicRMWKind::addi
-                                                : atomic.getAtomicKind() == "min"  ? arith::AtomicRMWKind::mins
-                                                : atomic.getAtomicKind() == "max"  ? arith::AtomicRMWKind::maxs
-                                                : atomic.getAtomicKind() == "umin" ? arith::AtomicRMWKind::minu
-                                                : atomic.getAtomicKind() == "umax" ? arith::AtomicRMWKind::maxu
-                                                                                   : arith::AtomicRMWKind::assign;
-                    storageRewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(atomic, kind, atomic.getValue(),
-                                                                            found->second, indices.front());
+            if (useSpirvStorage) {
+                for (unsigned index = 0; index < kernel.getNumArguments(); ++index) {
+                    if (kernel.getArgAttr(index, spirv::getInterfaceVarABIAttrName()))
+                        continue;
+                    std::optional<spirv::StorageClass> storageClass;
+                    if (kernel.getArgument(index).getType().isIntOrIndexOrFloat())
+                        storageClass = spirv::StorageClass::StorageBuffer;
+                    kernel.setArgAttr(index, spirv::getInterfaceVarABIAttrName(),
+                                      spirv::getInterfaceVarABIAttr(0, index, storageClass, source.getContext()));
                 }
             }
 
             if (failed(lowerGpuAggregateWorkgroupStorage(kernel, module)))
                 return signalPassFailure();
-
-            for (UnrealizedConversionCastOp bridge : viewBridges) {
-                if (!bridge->use_empty()) {
-                    bridge.emitError("TensorView conversion bridge still has uses after GPU storage lowering");
-                    return signalPassFailure();
-                }
-                bridge.erase();
-            }
         }
     }
 

@@ -1,4 +1,4 @@
-module attributes {vernon.compiler_contract_version = 5 : i64, vernon.pipeline_version = 8 : i64} {
+module attributes {vernon.compiler_contract_version = 6 : i64, vernon.pipeline_version = 9 : i64} {
   func.func @vertex_main(
       %position: tensor<4xf32> {
         vernon.interface = "input", vernon.location = 0 : i64

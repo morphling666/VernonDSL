@@ -601,10 +601,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %output: !vernon.tensor_view<f32, [1], "write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64,
-        vernon.tensor_shape = array<i64: 1>,
-        vernon.tensor_strides = array<i64: 1>,
-        vernon.tensor_offset = 0 : i64
+        vernon.binding = 0 : i64
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",
@@ -664,8 +661,10 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         EXPECT_NE(reflected.find("\"value_transport\":\"storage_buffer\""), std::string_view::npos);
         EXPECT_NE(reflected.find("\"vernon.binding\":0"), std::string_view::npos);
         EXPECT_NE(reflected.find("\"binding\":1"), std::string_view::npos);
-        EXPECT_NE(reflected.find("\"element_strides\":[1]"), std::string_view::npos);
-        EXPECT_NE(reflected.find("\"element_offset\":0"), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"tensor_view_descriptor\":"), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"offset_binding\":2"), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"extent_bindings\":[3]"), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"stride_bindings\":[4]"), std::string_view::npos);
         vernonCompileResultDestroy(result);
     }
     vernonCompilerDestroy(compiler);
@@ -863,10 +862,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %values: !vernon.tensor_view<!vernon.struct<"Nested">, [2], "read", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64,
-        vernon.tensor_shape = array<i64: 2>,
-        vernon.tensor_strides = array<i64: 1>,
-        vernon.tensor_offset = 0 : i64
+        vernon.binding = 0 : i64
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",
@@ -886,7 +882,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     const nlohmann::json root = nlohmann::json::parse(reflected.data, reflected.data + reflected.size);
     const nlohmann::json &argument = root.at("entries").at(0).at("arguments").at(0);
     EXPECT_FALSE(root.contains("backend_abi_routes"));
-    EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("kind"), "host_pointer");
+    EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("kind"), "tensor_view_descriptor");
+    EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("size"), 32);
     EXPECT_EQ(argument.at("physical_layouts").at("cuda_kernel_parameter").at("kind"), "strided_memref_storage_leaves");
     EXPECT_EQ(argument.at("physical_layouts").at("vulkan_std430_storage_buffer").at("kind"),
               "descriptor_storage_leaves");

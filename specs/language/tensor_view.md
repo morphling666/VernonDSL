@@ -184,10 +184,11 @@ Their indices project as:
 physical_index = offset + sum(index[d] * stride[d])
 ```
 
-Shape, signed element strides, and element offset participate in
-specialization and cache identity. Bounds, internal injectivity, owner
-lifetime, and overlapping read/write borrows are validated. Multiple views can
-share an owner when their accessed regions are compatible.
+Shape, signed element strides, and element offset are dispatch descriptor
+data. They do not participate in artifact specialization or cache identity.
+Static source extents, bounds, internal injectivity, owner lifetime, and
+overlapping read/write borrows are validated. Multiple views can share an
+owner when their accessed regions are compatible.
 
 ## 6. Workgroup storage
 
@@ -200,7 +201,7 @@ shared = vd.workgroup_storage(T, shape=(d0, d1, ...))
 It returns a read-write TensorView whose address space is inferred as
 workgroup. Rules:
 
-- every extent is a positive compile-time integer after specialization;
+- every extent is a positive compile-time integer in the source type;
 - literals and captured host constants are allowed, and captured constants
   participate in cache identity;
 - kernel arguments and other device-runtime values cannot determine allocation
@@ -262,8 +263,9 @@ address-space-parameterized Storage type:
 ```
 
 Dynamic dimensions use the canonical MLIR dynamic extent. Workgroup dimensions
-must be static. Device argument layout remains in validated shape/stride/offset
-attributes when concrete specialization data is required.
+must be static. Device shape, signed element strides, and element offset never
+appear as concrete layout attributes; internal descriptor arguments carry them
+to physical index projection.
 
 IR has unified typed TensorView allocation, `vernon.load`, `vernon.store`, and
 atomic operations with ranked indices. Workgroup-specific load/store operations
@@ -287,8 +289,9 @@ HLSL workgroup   -> groupshared
 ## 9. Reflection and runtime ABI
 
 Reflection describes canonical TensorView records with element layout, source
-shape constraints, concrete specialized shape/element strides/element offset,
-access, and externally visible address space. The capability name remains
+shape constraints, rank, access, externally visible address space, storage-leaf
+bindings, and the offset/extent/stride descriptor binding sequence. Concrete
+dispatch values are never reflected. The capability name remains
 `tensor_views`.
 
 Native runtime records use `VernonTensorView`; the invocation ABI version is

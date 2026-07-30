@@ -45,6 +45,7 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         struct Candidate {
             VernonRuntimeProviderBindingLayoutEntry layout{};
             uint64_t resourceOffset{};
+            ComputeBindingSource source;
         };
         std::vector<Candidate> candidates;
         uint32_t internalSlot = 0;
@@ -88,7 +89,31 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     // Aggregate lowering already folds each leaf's byte offset into the shader index.
                     // Every leaf descriptor must therefore retain the base address of the original AoS buffer.
                     candidate.resourceOffset = 0;
+                    candidate.source = {ComputeBindingSourceKind::Argument, use.index, 0};
                     candidates.push_back(candidate);
+                }
+                if (use.tensorViewDescriptor) {
+                    const auto addDescriptor = [&](ComputeBindingSourceKind kind, uint32_t dimension,
+                                                   uint32_t binding) {
+                        Candidate candidate;
+                        candidate.layout.slot = ++internalSlot;
+                        candidate.layout.set = argument.descriptorSet;
+                        candidate.layout.binding = binding;
+                        candidate.layout.kind = VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                        candidate.layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
+                        candidate.layout.array_count = 1;
+                        candidate.layout.argument_index = use.index;
+                        candidate.layout.element_size = 4;
+                        candidate.source = {kind, use.index, dimension};
+                        candidates.push_back(candidate);
+                    };
+                    addDescriptor(ComputeBindingSourceKind::TensorOffset, 0, use.tensorViewDescriptor->offsetBinding);
+                    for (uint32_t dimension = 0; dimension < use.tensorViewDescriptor->rank; ++dimension)
+                        addDescriptor(ComputeBindingSourceKind::TensorExtent, dimension,
+                                      use.tensorViewDescriptor->extentBindings[dimension]);
+                    for (uint32_t dimension = 0; dimension < use.tensorViewDescriptor->rank; ++dimension)
+                        addDescriptor(ComputeBindingSourceKind::TensorStride, dimension,
+                                      use.tensorViewDescriptor->strideBindings[dimension]);
                 }
             }
         std::sort(candidates.begin(), candidates.end(),
@@ -96,8 +121,10 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         for (const auto &candidate : candidates) {
             state->rhiComputeLayout.push_back(candidate.layout);
             state->rhiComputeResourceOffsets.push_back(candidate.resourceOffset);
+            state->rhiComputeBindingSources.push_back(candidate.source);
         }
         state->rhiComputeValues.resize(candidates.size());
+        state->rhiComputeDescriptorValues.resize(candidates.size());
         std::copy_n(stage.workgroup, 3, state->rhiComputeWorkgroup);
         const VernonRuntimeProviderShaderDescriptor shader{sizeof(VernonRuntimeProviderShaderDescriptor),
                                                            VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE,
@@ -544,6 +571,16 @@ VernonStatus invokeVulkanComputePipeline(VernonLoadedPipeline &pipeline, const P
         value = {};
         value.slot = layout.slot;
         value.kind = layout.kind;
+        const ComputeBindingSource &source = state.rhiComputeBindingSources[index];
+        if (source.kind != ComputeBindingSourceKind::Argument) {
+            std::optional<int64_t> descriptor = computeBindingDescriptorValue(argument, source);
+            if (!descriptor || *descriptor < INT32_MIN || *descriptor > INT32_MAX)
+                return fail(*pipeline.context, "Vulkan TensorView descriptor exceeds the shader index range");
+            state.rhiComputeDescriptorValues[index] = static_cast<int32_t>(*descriptor);
+            value.inline_data = &state.rhiComputeDescriptorValues[index];
+            value.inline_size = sizeof(int32_t);
+            continue;
+        }
         if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
             if (argument.kind != ComputeLaunchArgumentKind::Tensor || !argument.resource.resource.value)
                 return fail(*pipeline.context, "Vulkan prepared storage binding requires an RHI Tensor");

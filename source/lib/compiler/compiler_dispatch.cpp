@@ -25,7 +25,7 @@ std::string copyStringView(VernonStringView value) {
 bool validateTargetCapabilities(PreparedModule &prepared, VernonTarget target, std::string &diagnostics) {
     mlir::OwningOpRef<mlir::ModuleOp> module = prepared.clone();
     bool usesDeviceAtomics = false;
-    module->walk([&](mlir::vernon::AtomicOp atomic) {
+    module->walk([&](mlir::vernon::PhysicalAtomicOp atomic) {
         auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(atomic.getStorage().getType());
         usesDeviceAtomics |= view && view.getAddressSpace() == "device";
     });
@@ -40,12 +40,13 @@ bool validateTargetCapabilities(PreparedModule &prepared, VernonTarget target, s
         bool invalid = false;
         module->walk([&](mlir::Operation *operation) {
             if (invalid ||
-                !mlir::isa<mlir::vernon::WorkgroupAllocOp, mlir::vernon::AtomicOp, mlir::vernon::BarrierOp>(operation))
+                !mlir::isa<mlir::vernon::WorkgroupAllocOp, mlir::vernon::PhysicalAtomicOp, mlir::vernon::BarrierOp>(
+                    operation))
                 return;
-            if (auto atomic = mlir::dyn_cast<mlir::vernon::AtomicOp>(operation); atomic) {
+            if (auto atomic = mlir::dyn_cast<mlir::vernon::PhysicalAtomicOp>(operation); atomic) {
                 auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(atomic.getStorage().getType());
                 if (!view) {
-                    diagnostics = "atomic storage operand is not a TensorView";
+                    diagnostics = "physical atomic storage operand is not a TensorView";
                     invalid = true;
                     return;
                 }

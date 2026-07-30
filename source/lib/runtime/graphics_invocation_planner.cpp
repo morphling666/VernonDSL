@@ -60,11 +60,6 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
             if (!valueLayoutsEqual(argument.tensor.element_layout, pipelineValueLayout(parameter.elementLayout)) ||
                 !validTensor(argument.tensor))
                 return fail(error, "pipeline Tensor argument does not match layout");
-            for (const ParameterUse &use : parameter.uses)
-                if ((use.stage == variant.vertex || use.stage == variant.fragment || use.stage == "vertex" ||
-                     use.stage == "fragment") &&
-                    !tensorMatchesSpecialization(argument.tensor, use))
-                    return fail(error, "pipeline TensorView layout does not match specialization");
             if (parameter.source != "direct") {
                 const bool allowLeading =
                     std::any_of(parameter.uses.begin(), parameter.uses.end(),

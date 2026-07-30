@@ -483,9 +483,13 @@ class PipelineCompileTests(unittest.TestCase):
                             "kind": "tensor",
                             "type": '!vernon.tensor_view<f32, [-1, -1], "write", "device">',
                             "element_layout": _scalar_layout("f32"),
-                            "shape": [2, 3],
-                            "element_strides": [4, -1],
-                            "element_offset": 2,
+                            "source_shape": [-1, -1],
+                            "tensor_view_descriptor": {
+                                "rank": 2,
+                                "offset_binding": 1,
+                                "extent_bindings": [2, 3],
+                                "stride_bindings": [4, 5],
+                            },
                             "access": "write",
                             "vernon.source_name": "output",
                             "vernon.interface": "resource",
@@ -499,8 +503,11 @@ class PipelineCompileTests(unittest.TestCase):
 
         use = external_parameters(records)["output"][0]
         self.assertEqual(use["interface"], "storage")
-        self.assertEqual(use["element_strides"], [4, -1])
-        self.assertEqual(use["element_offset"], 2)
+        self.assertEqual(use["shape"], [0, 0])
+        self.assertEqual(
+            use["tensor_view_descriptor"],
+            {"rank": 2, "offset_binding": 1, "extent_bindings": [2, 3], "stride_bindings": [4, 5]},
+        )
         self.assertNotIn("physical_value_layout", use)
 
         del records["compute"]["interface"]["arguments"][0]["vernon.binding"]

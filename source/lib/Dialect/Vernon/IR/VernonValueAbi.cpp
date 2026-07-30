@@ -564,8 +564,9 @@ FailureOr<PhysicalValueAbiPlan> getPhysicalValueAbiPlan(Type type, ModuleOp modu
             return failure();
         switch (profile) {
         case PhysicalAbiProfile::HostValue:
-            return PhysicalValueAbiPlan{
-                PhysicalResourceAbiLayout{PhysicalResourceAbiKind::HostPointer, 8, 8, std::move(*element)}};
+            return PhysicalValueAbiPlan{PhysicalResourceAbiLayout{
+                PhysicalResourceAbiKind::TensorViewDescriptor,
+                8 * (2 + 2 * static_cast<uint64_t>(view.getShape().size())), 8, std::move(*element)}};
         case PhysicalAbiProfile::CudaKernelParameter:
             return PhysicalValueAbiPlan{
                 PhysicalResourceAbiLayout{PhysicalResourceAbiKind::CudaStorageLeaves, 0, 0, std::move(*element)}};

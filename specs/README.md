@@ -17,7 +17,10 @@ archive.
    ownership, resource behavior, and execution semantics.
 5. [`language/future_language_roadmap.md`](language/future_language_roadmap.md)
    lists incomplete language-v4 acceptance gates.
-6. [`completion_roadmap.md`](completion_roadmap.md) lists active work required
+6. [`stable_release_plan.md`](stable_release_plan.md) defines the production
+   contracts, TensorView ABI, release engineering, and promotion gates for the
+   first stable release.
+7. [`completion_roadmap.md`](completion_roadmap.md) lists active work required
    for beta and stable releases.
 
 Supporting active documents:

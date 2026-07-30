@@ -12,7 +12,6 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
-#include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
@@ -23,40 +22,31 @@ namespace {
 
 constexpr StringLiteral kTextureHelperName = "__vernon_cpu_texture_sample";
 
-FailureOr<Value> physicalIndex(Operation *operation, ValueRange indices) {
-    if (!operation->hasAttr(kPhysicalIndexAttrName) || indices.empty())
-        return failure();
-    return indices.front();
-}
-
-struct BufferLoadPattern final : OpConversionPattern<LoadOp> {
+struct BufferLoadPattern final : OpConversionPattern<PhysicalLoadOp> {
     using OpConversionPattern::OpConversionPattern;
 
-    LogicalResult matchAndRewrite(LoadOp op, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
-        FailureOr<Value> index = physicalIndex(op, adaptor.getIndices());
-        if (failed(index))
-            return rewriter.notifyMatchFailure(op, "cannot project TensorView indices");
-        rewriter.replaceOpWithNewOp<memref::LoadOp>(op, adaptor.getStorage(), *index);
+    LogicalResult matchAndRewrite(PhysicalLoadOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        rewriter.replaceOpWithNewOp<memref::LoadOp>(op, adaptor.getStorage(), adaptor.getIndex());
         return success();
     }
 };
 
-struct BufferStorePattern final : OpConversionPattern<StoreOp> {
+struct BufferStorePattern final : OpConversionPattern<PhysicalStoreOp> {
     using OpConversionPattern::OpConversionPattern;
 
-    LogicalResult matchAndRewrite(StoreOp op, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
-        FailureOr<Value> index = physicalIndex(op, adaptor.getIndices());
-        if (failed(index))
-            return rewriter.notifyMatchFailure(op, "cannot project TensorView indices");
-        rewriter.replaceOpWithNewOp<memref::StoreOp>(op, adaptor.getValue(), adaptor.getStorage(), *index);
+    LogicalResult matchAndRewrite(PhysicalStoreOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        rewriter.replaceOpWithNewOp<memref::StoreOp>(op, adaptor.getValue(), adaptor.getStorage(), adaptor.getIndex());
         return success();
     }
 };
 
-struct AtomicPattern final : OpConversionPattern<AtomicOp> {
+struct AtomicPattern final : OpConversionPattern<PhysicalAtomicOp> {
     using OpConversionPattern::OpConversionPattern;
 
-    LogicalResult matchAndRewrite(AtomicOp op, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
+    LogicalResult matchAndRewrite(PhysicalAtomicOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
         auto storage = dyn_cast<MemRefType>(adaptor.getStorage().getType());
         if (!storage)
             return rewriter.notifyMatchFailure(op, "atomic TensorView did not lower to a memref");
@@ -66,10 +56,8 @@ struct AtomicPattern final : OpConversionPattern<AtomicOp> {
                                     : op.getAtomicKind() == "umin" ? arith::AtomicRMWKind::minu
                                     : op.getAtomicKind() == "umax" ? arith::AtomicRMWKind::maxu
                                                                    : arith::AtomicRMWKind::assign;
-        FailureOr<Value> index = physicalIndex(op, adaptor.getIndices());
-        if (failed(index))
-            return rewriter.notifyMatchFailure(op, "cannot project TensorView atomic indices");
-        rewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(op, kind, adaptor.getValue(), adaptor.getStorage(), *index);
+        rewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(op, kind, adaptor.getValue(), adaptor.getStorage(),
+                                                         adaptor.getIndex());
         return success();
     }
 };

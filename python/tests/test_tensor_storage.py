@@ -384,7 +384,7 @@ class TensorViewFrontendTests(unittest.TestCase):
         )
         self.assertIn('"vernon.load"', output)
 
-    def test_runtime_layout_specializes_multidimensional_tensor_view_indices(self) -> None:
+    def test_tensor_view_layout_is_not_frontend_specialization_data(self) -> None:
         source = (
             "from vernon_dsl import *\n"
             "@kernel\n"
@@ -394,60 +394,13 @@ class TensorViewFrontendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rank_two_view.py"
             path.write_text(source, encoding="utf-8")
-            result = Compiler().compile_request(
-                FrontendCompileRequest(
-                    path,
-                    "read",
-                    tensor_view_layouts=(
-                        ("output", "<f4", (1,), (1,), 0),
-                        ("value", "<f4", (2, 3), (6, -1), 2),
-                    ),
-                )
-            )
+            result = Compiler().compile_request(FrontendCompileRequest(path, "read"))
 
         self.assertIn('"vernon.load"', result.mlir)
-        self.assertIn("vernon.tensor_shape = array<i64: 2, 3>", result.mlir)
-        self.assertIn("vernon.tensor_strides = array<i64: 6, -1>", result.mlir)
-        self.assertIn("vernon.tensor_offset = 2 : i64", result.mlir)
-        self.assertEqual(
-            result.semantic_inputs["tensor_view_layouts"],
-            [
-                ["output", "<f4", [1], [1], 0],
-                ["value", "<f4", [2, 3], [6, -1], 2],
-            ],
-        )
-
-    def test_tensor_view_specialization_rejects_invalid_layouts(self) -> None:
-        source = (
-            "from vernon_dsl import *\n@kernel\ndef read(value: TensorView[f32, (2, dyn), read]) -> None:\n    pass\n"
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "invalid_view.py"
-            path.write_text(source, encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "one signed integer stride"):
-                Compiler().compile_request(
-                    FrontendCompileRequest(
-                        path,
-                        "read",
-                        tensor_view_layouts=(("value", "<f4", (2, 3), (1,), 0),),
-                    )
-                )
-            with self.assertRaisesRegex(ValueError, "non-negative integer"):
-                Compiler().compile_request(
-                    FrontendCompileRequest(
-                        path,
-                        "read",
-                        tensor_view_layouts=(("value", "<f4", (2, 3), (3, 1), -1),),
-                    )
-                )
-            with self.assertRaisesRegex(ValueError, "dimension 0 is 3, expected 2"):
-                Compiler().compile_request(
-                    FrontendCompileRequest(
-                        path,
-                        "read",
-                        tensor_view_layouts=(("value", "<f4", (3, 4), (4, 1), 0),),
-                    )
-                )
+        self.assertNotIn("vernon.tensor_shape", result.mlir)
+        self.assertNotIn("vernon.tensor_strides", result.mlir)
+        self.assertNotIn("vernon.tensor_offset", result.mlir)
+        self.assertNotIn("tensor_view_layouts", result.semantic_inputs)
 
     def test_v3_buffer_public_spelling_is_removed(self) -> None:
         self.assertFalse(hasattr(vd, "Buffer"))

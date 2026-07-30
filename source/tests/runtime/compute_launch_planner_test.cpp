@@ -87,16 +87,16 @@ TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
     EXPECT_EQ(plan.grid.z, 1u);
 }
 
-TEST(ComputeLaunchPlannerTest, AcceptsValidatedStridedRhiTensorView) {
+TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
     Variant variant;
     Parameter parameter;
     parameter.slot = 0;
     parameter.kind = "tensor";
     setScalarLayout(parameter, "f32", VERNON_DATA_F32);
     parameter.source = "direct";
-    parameter.uses.push_back({"compute", "buffer", "", "f32", {2, 3}, 0, UINT32_MAX, 0, 0, 0, {}});
-    parameter.uses.back().elementStrides = {6, -1};
-    parameter.uses.back().elementOffset = 2;
+    parameter.access = "read";
+    parameter.uses.push_back({"compute", "buffer", "", "f32", {2, 0}, 0, UINT32_MAX, 0, 0, 0, {}});
+    parameter.uses.back().tensorViewDescriptor = TensorViewDescriptorUse{2, 1, {2, 3}, {4, 5}};
     variant.parameters = {parameter};
 
     const std::array<uint64_t, 2> shape{2, 3};
@@ -128,13 +128,61 @@ TEST(ComputeLaunchPlannerTest, AcceptsValidatedStridedRhiTensorView) {
     EXPECT_EQ(plan.grid.y, 2u);
     EXPECT_EQ(plan.grid.z, 1u);
 
-    const std::array<int64_t, 2> incompatibleStrides{6 * sizeof(float), sizeof(float)};
-    supplied.tensor.byte_strides = incompatibleStrides.data();
-    ASSERT_FALSE(planComputeInvocation(variant, invocation, plan, error));
-    EXPECT_EQ(error, "pipeline TensorView layout does not match specialization");
+    const std::array<uint64_t, 2> secondShape{2, 4};
+    const std::array<int64_t, 2> secondStrides{4 * sizeof(float), sizeof(float)};
+    supplied.tensor.shape = secondShape.data();
+    supplied.tensor.byte_strides = secondStrides.data();
+    supplied.tensor.byte_offset = 0;
+    ASSERT_TRUE(planComputeInvocation(variant, invocation, plan, error)) << error;
+    ASSERT_TRUE(plan.arguments[0].tensorView);
+    EXPECT_EQ(*computeBindingDescriptorValue(plan.arguments[0], {ComputeBindingSourceKind::TensorExtent, 0, 1}), 4);
+    EXPECT_EQ(*computeBindingDescriptorValue(plan.arguments[0], {ComputeBindingSourceKind::TensorStride, 0, 0}), 4);
 
+    const std::array<uint64_t, 2> invalidStaticShape{3, 4};
+    supplied.tensor.shape = invalidStaticShape.data();
+    ASSERT_FALSE(planComputeInvocation(variant, invocation, plan, error));
+    EXPECT_EQ(error, "pipeline TensorView descriptor violates static shape or element stride");
+
+    supplied.tensor.shape = shape.data();
     supplied.tensor.byte_strides = strides.data();
+    supplied.tensor.byte_offset = 2 * sizeof(float);
     supplied.tensor.byte_size = 6 * sizeof(float);
+    ASSERT_FALSE(planComputeInvocation(variant, invocation, plan, error));
+    EXPECT_EQ(error, "pipeline Tensor argument does not match layout");
+}
+
+TEST(ComputeLaunchPlannerTest, RejectsTensorViewAccessMismatchBeforeDispatch) {
+    Variant variant;
+    Parameter parameter;
+    parameter.slot = 0;
+    parameter.kind = "tensor";
+    parameter.source = "direct";
+    parameter.access = "read";
+    setScalarLayout(parameter, "f32", VERNON_DATA_F32);
+    parameter.uses.push_back({"compute", "buffer", "", "f32", {2}, 0, UINT32_MAX, 0, 0, 0, {}});
+    parameter.uses.back().tensorViewDescriptor = TensorViewDescriptorUse{1, 1, {2}, {3}};
+    variant.parameters = {parameter};
+
+    const std::array<uint64_t, 1> shape{2};
+    const std::array<int64_t, 1> strides{sizeof(float)};
+    VernonPipelineArgument supplied{};
+    supplied.slot = 0;
+    supplied.kind = VERNON_PIPELINE_TENSOR;
+    supplied.tensor.struct_size = sizeof(VernonTensorView);
+    supplied.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    supplied.tensor.resource = {1, {2}, 0, 2 * sizeof(float)};
+    supplied.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
+    supplied.tensor.access = VERNON_ACCESS_WRITE;
+    supplied.tensor.rank = 1;
+    supplied.tensor.shape = shape.data();
+    supplied.tensor.byte_strides = strides.data();
+    supplied.tensor.byte_size = 2 * sizeof(float);
+    VernonPipelineInvocation invocation{};
+    invocation.arguments = &supplied;
+    invocation.argument_count = 1;
+
+    PlannedComputeLaunch plan;
+    std::string error;
     ASSERT_FALSE(planComputeInvocation(variant, invocation, plan, error));
     EXPECT_EQ(error, "pipeline Tensor argument does not match layout");
 }

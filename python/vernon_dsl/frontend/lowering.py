@@ -229,16 +229,10 @@ class _FunctionEmitter:
             value_type = annotation.type
             typed_parameter = self.typed_function.parameters[index]
             access = typed_parameter.access
-            view_layout = (
-                self.context.tensor_view_layouts.get(argument.arg)
-                if self.node.name == self.context.runtime_entry and value_type.kind == "tensor_view"
-                else None
-            )
             value = Value(
                 f"%arg{index}",
                 value_type,
                 access=access,
-                view_layout=view_layout,
             )
             self.environment[argument.arg] = value
             attributes = self._metadata_attributes(annotation.metadata, stage=self.stage, is_result=False)
@@ -275,23 +269,6 @@ class _FunctionEmitter:
                 attributes.append('vernon.interface = "resource"')
                 if not has_explicit_binding:
                     attributes.extend(("vernon.set = 0 : i64", f"vernon.binding = {index} : i64"))
-                if view_layout is not None:
-                    shape = ", ".join(str(extent) for extent in view_layout.shape)
-                    strides = ", ".join(str(stride) for stride in view_layout.strides)
-                    attributes.extend(
-                        (
-                            f"vernon.tensor_shape = array<i64: {shape}>",
-                            f"vernon.tensor_strides = array<i64: {strides}>",
-                            f"vernon.tensor_offset = {view_layout.offset} : i64",
-                        )
-                    )
-                elif len(value_type.arguments[1]) == 1:
-                    attributes.extend(
-                        (
-                            "vernon.tensor_strides = array<i64: 1>",
-                            "vernon.tensor_offset = 0 : i64",
-                        )
-                    )
             suffix = f" {{{', '.join(attributes)}}}" if attributes else ""
             arguments.append(f"{value.name}: {value.abi_type.mlir}{suffix}")
         self._append_generated_arguments(arguments)

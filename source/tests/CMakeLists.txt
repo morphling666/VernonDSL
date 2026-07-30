@@ -349,6 +349,12 @@ if(TARGET VernonDSLCompiler)
             ${CMAKE_COMMAND} "-DVERNON_OPT=$<TARGET_FILE:vernon-opt>"
             "-DINPUT=${VERNON_TEST_ROOT}/integration/gpu-atomic-exchange-to-spirv.mlir" -P
             "${VERNON_TEST_ROOT}/scripts/run_gpu_to_spirv_atomic_exchange_test.cmake")
+    add_test(
+        NAME vernon-to-gpu-tensor-view-1-to-n
+        COMMAND
+            ${CMAKE_COMMAND} "-DVERNON_OPT=$<TARGET_FILE:vernon-opt>"
+            "-DINPUT=${VERNON_TEST_ROOT}/integration/vernon-to-gpu-tensor-view-1-to-n.mlir" -P
+            "${VERNON_TEST_ROOT}/scripts/run_vernon_to_gpu_tensor_view_test.cmake")
 
     if(WIN32)
         add_test(NAME vernon-validation-integration

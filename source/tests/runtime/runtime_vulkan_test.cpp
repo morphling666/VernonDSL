@@ -17,9 +17,7 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
       %values: !vernon.tensor_view<f32, [-1], "read_write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64,
-        vernon.tensor_strides = array<i64: 1>,
-        vernon.tensor_offset = 0 : i64
+        vernon.binding = 0 : i64
       },
       %id: index {
         vernon.interface = "input",

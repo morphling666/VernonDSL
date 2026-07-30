@@ -241,6 +241,46 @@ LogicalResult AtomicOp::verify() {
     return success();
 }
 
+LogicalResult PhysicalLoadOp::verify() {
+    auto type = dyn_cast<TensorViewType>(getStorage().getType());
+    if (!type)
+        return emitOpError("storage must be a TensorView");
+    if (type.getAccess() == "write")
+        return emitOpError("cannot load through a write-only TensorView");
+    return getResult().getType() == type.getElementType() ? success()
+                                                          : emitOpError("result type must match the element type");
+}
+
+LogicalResult PhysicalStoreOp::verify() {
+    auto type = dyn_cast<TensorViewType>(getStorage().getType());
+    if (!type)
+        return emitOpError("storage must be a TensorView");
+    if (type.getAccess() == "read")
+        return emitOpError("cannot store through a read-only TensorView");
+    return getValue().getType() == type.getElementType() ? success()
+                                                         : emitOpError("value type must match the element type");
+}
+
+LogicalResult PhysicalAtomicOp::verify() {
+    auto view = dyn_cast<TensorViewType>(getStorage().getType());
+    if (!view)
+        return emitOpError("storage must be a TensorView");
+    if (view.getAccess() == "read")
+        return emitOpError("requires writable TensorView storage");
+    if (view.getAddressSpace() != "device" && view.getAddressSpace() != "workgroup")
+        return emitOpError("requires device or workgroup TensorView storage");
+    Type elementType = view.getElementType();
+    if (!elementType.isSignlessInteger(32) || getValue().getType() != elementType ||
+        getResult().getType() != elementType)
+        return emitOpError("requires matching 32-bit integer value and result types");
+    if (getAtomicKind() != "add" && getAtomicKind() != "min" && getAtomicKind() != "max" && getAtomicKind() != "umin" &&
+        getAtomicKind() != "umax" && getAtomicKind() != "exchange")
+        return emitOpError("operation must be add, min, max, umin, umax, or exchange");
+    if (getOrdering() != "relaxed")
+        return emitOpError("currently supports only relaxed memory ordering");
+    return success();
+}
+
 LogicalResult BarrierOp::verify() {
     if (getOrdering() != "acquire" && getOrdering() != "release" && getOrdering() != "acquire_release" &&
         getOrdering() != "sequential")

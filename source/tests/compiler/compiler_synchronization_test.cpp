@@ -14,10 +14,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %output: !vernon.tensor_view<i32, [1], "write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64,
-        vernon.tensor_shape = array<i64: 1>,
-        vernon.tensor_strides = array<i64: 1>,
-        vernon.tensor_offset = 0 : i64
+        vernon.binding = 0 : i64
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",
@@ -78,10 +75,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %values: !vernon.tensor_view<i32, [64], "read_write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64,
-        vernon.tensor_shape = array<i64: 64>,
-        vernon.tensor_strides = array<i64: 1>,
-        vernon.tensor_offset = 0 : i64
+        vernon.binding = 0 : i64
       })
       attributes {
         vernon.entry,
