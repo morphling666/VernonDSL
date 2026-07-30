@@ -1,26 +1,33 @@
 from vernon_dsl import *
 
 
+@struct
+class SmokeVertexOutput:
+    position: Annotated[Vector[f32, 4], builtin("position")]
+    color: Vector[f32, 4]
+
+
 @vertex
 def vertex_main(
-    position: Annotated[vec4[f32], location(0)],
-    offset: Annotated[vec4[f32], uniform()],
-) -> Annotated[vec4[f32], location(0)]:
-    return position + offset
+    position: Annotated[Vector[f32, 4], attribute()],
+    offset: Annotated[Vector[f32, 4], uniform()],
+) -> SmokeVertexOutput:
+    translated = position + offset
+    return SmokeVertexOutput(translated, translated)
 
 
 @fragment
 def fragment_main(
-    color: Annotated[vec4[f32], varying()],
-) -> Annotated[vec4[f32], location(0)]:
+    color: Annotated[Vector[f32, 4], varying()],
+) -> Vector[f32, 4]:
     return color
 
 
-@compute(workgroup_size=(8, 4, 1))
+@kernel(workgroup_size=(8, 4, 1))
 def compute_main(
-    values: Annotated[Buffer[f32], resource(set=0, binding=0)],
-    invocation: Annotated[u32, builtin("global_invocation_id")],
+    values: Annotated[TensorView[f32, (dyn,), read_write], resource(set=0, binding=0)],
+    invocation: Annotated[Vector[u32, 3], builtin("global_invocation_id")],
 ) -> None:
-    values[invocation] = values[invocation] + 1.0
+    values[invocation[0]] = values[invocation[0]] + 1.0
     for index in range(4):
         current = index

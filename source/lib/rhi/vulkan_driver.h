@@ -1,0 +1,111 @@
+#ifndef VERNON_RHI_VULKAN_DRIVER_H
+#define VERNON_RHI_VULKAN_DRIVER_H
+
+#include "../platform/platform_library.h"
+#include "VernonRHI.h"
+
+#include <vulkan/vulkan.h>
+
+#include <mutex>
+#include <string>
+
+namespace vernon::rhi::vulkan {
+
+struct VERNON_RHI_CAPI Driver {
+    bool load();
+    bool loadInstance(VkInstance instance);
+    bool loadDevice(VkDevice device);
+
+    platform::PlatformLibrary library;
+    std::mutex mutex;
+    std::string error;
+    bool attempted{};
+    bool available{};
+    PFN_vkGetInstanceProcAddr getInstanceProcAddr{};
+    PFN_vkCreateInstance createInstance{};
+    PFN_vkDestroyInstance destroyInstance{};
+    PFN_vkEnumeratePhysicalDevices enumeratePhysicalDevices{};
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties getPhysicalDeviceQueueFamilyProperties{};
+    PFN_vkGetPhysicalDeviceProperties getPhysicalDeviceProperties{};
+    PFN_vkGetPhysicalDeviceMemoryProperties getPhysicalDeviceMemoryProperties{};
+    PFN_vkGetPhysicalDeviceFormatProperties getPhysicalDeviceFormatProperties{};
+    PFN_vkGetPhysicalDeviceFeatures2 getPhysicalDeviceFeatures2{};
+    PFN_vkEnumerateDeviceExtensionProperties enumerateDeviceExtensionProperties{};
+    PFN_vkCreateDevice createDevice{};
+    PFN_vkGetDeviceProcAddr getDeviceProcAddr{};
+    PFN_vkDestroyDevice destroyDevice{};
+    PFN_vkDeviceWaitIdle deviceWaitIdle{};
+    PFN_vkGetDeviceQueue getDeviceQueue{};
+    PFN_vkCreateCommandPool createCommandPool{};
+    PFN_vkDestroyCommandPool destroyCommandPool{};
+    PFN_vkAllocateCommandBuffers allocateCommandBuffers{};
+    PFN_vkFreeCommandBuffers freeCommandBuffers{};
+    PFN_vkResetCommandBuffer resetCommandBuffer{};
+    PFN_vkBeginCommandBuffer beginCommandBuffer{};
+    PFN_vkEndCommandBuffer endCommandBuffer{};
+    PFN_vkQueueSubmit queueSubmit{};
+    PFN_vkQueueWaitIdle queueWaitIdle{};
+    PFN_vkCreateFence createFence{};
+    PFN_vkDestroyFence destroyFence{};
+    PFN_vkWaitForFences waitForFences{};
+    PFN_vkResetFences resetFences{};
+    PFN_vkCreateBuffer createBuffer{};
+    PFN_vkDestroyBuffer destroyBuffer{};
+    PFN_vkGetBufferMemoryRequirements getBufferMemoryRequirements{};
+    PFN_vkAllocateMemory allocateMemory{};
+    PFN_vkFreeMemory freeMemory{};
+    PFN_vkBindBufferMemory bindBufferMemory{};
+    PFN_vkMapMemory mapMemory{};
+    PFN_vkUnmapMemory unmapMemory{};
+    PFN_vkCmdCopyBuffer cmdCopyBuffer{};
+    PFN_vkCreateShaderModule createShaderModule{};
+    PFN_vkDestroyShaderModule destroyShaderModule{};
+    PFN_vkCreateDescriptorSetLayout createDescriptorSetLayout{};
+    PFN_vkDestroyDescriptorSetLayout destroyDescriptorSetLayout{};
+    PFN_vkCreatePipelineLayout createPipelineLayout{};
+    PFN_vkDestroyPipelineLayout destroyPipelineLayout{};
+    PFN_vkCreateComputePipelines createComputePipelines{};
+    PFN_vkDestroyPipeline destroyPipeline{};
+    PFN_vkCreateDescriptorPool createDescriptorPool{};
+    PFN_vkDestroyDescriptorPool destroyDescriptorPool{};
+    PFN_vkAllocateDescriptorSets allocateDescriptorSets{};
+    PFN_vkFreeDescriptorSets freeDescriptorSets{};
+    PFN_vkUpdateDescriptorSets updateDescriptorSets{};
+    PFN_vkCmdBindPipeline cmdBindPipeline{};
+    PFN_vkCmdBindDescriptorSets cmdBindDescriptorSets{};
+    PFN_vkCmdDispatch cmdDispatch{};
+    PFN_vkCreateImage createImage{};
+    PFN_vkDestroyImage destroyImage{};
+    PFN_vkGetImageMemoryRequirements getImageMemoryRequirements{};
+    PFN_vkBindImageMemory bindImageMemory{};
+    PFN_vkCreateImageView createImageView{};
+    PFN_vkDestroyImageView destroyImageView{};
+    PFN_vkCreateSampler createSampler{};
+    PFN_vkDestroySampler destroySampler{};
+    PFN_vkCreateRenderPass createRenderPass{};
+    PFN_vkDestroyRenderPass destroyRenderPass{};
+    PFN_vkCreateFramebuffer createFramebuffer{};
+    PFN_vkDestroyFramebuffer destroyFramebuffer{};
+    PFN_vkCreateGraphicsPipelines createGraphicsPipelines{};
+    PFN_vkCmdPipelineBarrier cmdPipelineBarrier{};
+    PFN_vkCmdCopyBufferToImage cmdCopyBufferToImage{};
+    PFN_vkCmdCopyImageToBuffer cmdCopyImageToBuffer{};
+    PFN_vkCmdBeginRenderPass cmdBeginRenderPass{};
+    PFN_vkCmdEndRenderPass cmdEndRenderPass{};
+    PFN_vkCmdClearAttachments cmdClearAttachments{};
+    PFN_vkCmdBeginRendering cmdBeginRendering{};
+    PFN_vkCmdEndRendering cmdEndRendering{};
+    PFN_vkCmdSetViewport cmdSetViewport{};
+    PFN_vkCmdSetScissor cmdSetScissor{};
+    PFN_vkCmdBindVertexBuffers cmdBindVertexBuffers{};
+    PFN_vkCmdBindIndexBuffer cmdBindIndexBuffer{};
+    PFN_vkCmdDraw cmdDraw{};
+    PFN_vkCmdDrawIndexed cmdDrawIndexed{};
+    PFN_vkCmdPushConstants cmdPushConstants{};
+};
+
+VERNON_RHI_CAPI Driver &driver();
+
+} // namespace vernon::rhi::vulkan
+
+#endif

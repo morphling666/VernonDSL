@@ -12,9 +12,7 @@ def cmake_source_dir() -> Path:
     """Return the read-only CMake source directory for VernonRuntime."""
     cmake_file = _RUNTIME_SOURCE_DIR / "CMakeLists.txt"
     if not cmake_file.is_file():
-        raise RuntimeError(
-            "VernonRuntime sources are missing from this VernonDSL installation"
-        )
+        raise RuntimeError("VernonRuntime sources are missing from this VernonDSL installation")
     return _RUNTIME_SOURCE_DIR
 
 
@@ -25,9 +23,7 @@ def version() -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Inspect the VernonRuntime sources bundled with VernonDSL"
-    )
+    parser = argparse.ArgumentParser(description="Inspect the VernonRuntime sources bundled with VernonDSL")
     output = parser.add_mutually_exclusive_group(required=True)
     output.add_argument(
         "--cmake-dir",

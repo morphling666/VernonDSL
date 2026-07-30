@@ -1,0 +1,1426 @@
+#include "backend_dispatch.h"
+#include "logical_resource_record.h"
+#include "rhi_test_hooks.h"
+#include "vulkan_backend.h"
+
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cstring>
+#include <deque>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <optional>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+namespace {
+struct VulkanBufferSlot : vernon::rhi::LogicalResourceRecord {
+    vernon::rhi::vulkan::Buffer buffer;
+    VernonRhiVulkanBorrowedBufferDescriptor descriptor{};
+    VernonRhiBufferDescriptor ownedDescriptor{};
+};
+
+struct VulkanImageSlot : vernon::rhi::LogicalResourceRecord {
+    vernon::rhi::vulkan::Image image;
+    VernonRhiVulkanBorrowedImageDescriptor descriptor{};
+    VernonRhiImageDescriptor ownedDescriptor{};
+};
+
+struct VulkanImageViewSlot {
+    VkImageView view{};
+    VernonRhiVulkanBorrowedImageViewDescriptor descriptor{};
+    uint32_t generation{1};
+    bool occupied{};
+};
+
+struct VulkanSamplerSlot : vernon::rhi::LogicalResourceRecord {
+    vernon::rhi::vulkan::Sampler sampler;
+};
+
+struct VulkanInteropDevice {
+    vernon::rhi::vulkan::DeviceState state;
+    std::deque<VulkanBufferSlot> buffers;
+    std::deque<VulkanImageSlot> images;
+    std::deque<VulkanSamplerSlot> samplers;
+    std::deque<VulkanImageViewSlot> imageViews;
+    uint32_t queueCapabilities{};
+    bool owned{};
+    std::string error;
+    std::mutex mutex;
+};
+
+struct VulkanDeviceSlot {
+    std::shared_ptr<VulkanInteropDevice> device;
+    uint32_t generation{1};
+};
+
+constexpr uint32_t vulkanDeviceBit = uint32_t{1} << 30;
+std::vector<VulkanDeviceSlot> vulkanDevices;
+std::mutex deviceMutex;
+
+VernonRhiDevice invalidDevice() { return {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0}; }
+
+template <typename Handle> uint64_t resourceKey(Handle handle) {
+    return (static_cast<uint64_t>(handle.generation) << 32) | (static_cast<uint64_t>(handle.index) + 1);
+}
+
+bool decodeResourceKey(uint64_t key, uint32_t &index, uint32_t &generation) {
+    const uint64_t encodedIndex = key & UINT32_MAX;
+    generation = static_cast<uint32_t>(key >> 32);
+    if (!encodedIndex || !generation)
+        return false;
+    index = static_cast<uint32_t>(encodedIndex - 1);
+    return true;
+}
+
+template <typename Slots> auto *lookupResourceRecord(Slots &slots, uint64_t key) {
+    uint32_t index = 0;
+    uint32_t generation = 0;
+    if (!decodeResourceKey(key, index, generation) || index >= slots.size())
+        return static_cast<typename Slots::value_type *>(nullptr);
+    auto &slot = slots[index];
+    return slot.isRetained(generation) ? &slot : nullptr;
+}
+
+std::optional<size_t> rgba8Size(const VernonRhiImageDescriptor &descriptor) {
+    if (descriptor.dimension != VERNON_RHI_IMAGE_2D || descriptor.format != VERNON_RHI_FORMAT_RGBA8_UNORM ||
+        descriptor.depth != 1 || descriptor.mip_levels != 1 || descriptor.array_layers != 1 ||
+        descriptor.width > (std::numeric_limits<size_t>::max)() / descriptor.height)
+        return std::nullopt;
+    const size_t pixels = static_cast<size_t>(descriptor.width) * descriptor.height;
+    return pixels <= (std::numeric_limits<size_t>::max)() / 4 ? std::optional<size_t>{pixels * 4} : std::nullopt;
+}
+
+std::shared_ptr<VulkanInteropDevice> lookupVulkanDevice(VernonRhiDevice handle) {
+    if ((handle.index & vulkanDeviceBit) == 0)
+        return {};
+    const uint32_t index = handle.index & ~vulkanDeviceBit;
+    std::lock_guard<std::mutex> guard(deviceMutex);
+    if (index >= vulkanDevices.size())
+        return {};
+    VulkanDeviceSlot &slot = vulkanDevices[index];
+    return slot.device && slot.generation == handle.generation ? slot.device : std::shared_ptr<VulkanInteropDevice>{};
+}
+
+template <typename Slots, typename Handle> typename Slots::value_type *lookupVulkanSlot(Slots &slots, Handle handle) {
+    if (handle.index >= slots.size())
+        return nullptr;
+    auto &slot = slots[handle.index];
+    return slot.isPublic(handle.generation) ? &slot : nullptr;
+}
+
+template <typename Slots, typename Handle>
+typename Slots::value_type &allocateVulkanSlot(Slots &slots, Handle &output) {
+    uint32_t index = 0;
+    while (index < slots.size() && slots[index].occupied)
+        ++index;
+    if (index == slots.size())
+        slots.emplace_back();
+    auto &slot = slots[index];
+    slot.publish();
+    output = {index, slot.generation};
+    return slot;
+}
+
+template <typename Slot> void releaseVulkanSlot(Slot &slot) {
+    if (slot.publicAlive)
+        slot.destroyPublicOwner();
+    slot.recycle();
+}
+
+VulkanImageViewSlot *lookupVulkanImageView(std::deque<VulkanImageViewSlot> &slots, VernonRhiImageView handle) {
+    if (handle.index >= slots.size())
+        return nullptr;
+    VulkanImageViewSlot &slot = slots[handle.index];
+    return slot.occupied && slot.generation == handle.generation ? &slot : nullptr;
+}
+
+VulkanImageViewSlot &allocateVulkanImageView(std::deque<VulkanImageViewSlot> &slots, VernonRhiImageView &output) {
+    uint32_t index = 0;
+    while (index < slots.size() && slots[index].occupied)
+        ++index;
+    if (index == slots.size())
+        slots.emplace_back();
+    VulkanImageViewSlot &slot = slots[index];
+    slot.occupied = true;
+    output = {index, slot.generation};
+    return slot;
+}
+
+void releaseVulkanImageView(VulkanImageViewSlot &slot) {
+    slot.occupied = false;
+    if (++slot.generation == 0)
+        slot.generation = 1;
+}
+
+template <typename Handle> Handle vulkanHandle(uint64_t bits) {
+    if constexpr (std::is_pointer_v<Handle>)
+        return reinterpret_cast<Handle>(bits);
+    else
+        return static_cast<Handle>(bits);
+}
+
+template <typename Handle> uint64_t vulkanHandleBits(Handle handle) {
+    if constexpr (std::is_pointer_v<Handle>)
+        return reinterpret_cast<uint64_t>(handle);
+    else
+        return static_cast<uint64_t>(handle);
+}
+
+void restoreVulkanImageLayout(void *context, uint64_t layout) {
+    static_cast<vernon::rhi::vulkan::Image *>(context)->layout = static_cast<VkImageLayout>(layout);
+}
+
+VkFormat vulkanFormat(VernonRhiFormat format) {
+    constexpr VkFormat formats[] = {
+        VK_FORMAT_UNDEFINED,           VK_FORMAT_R8_UNORM,
+        VK_FORMAT_R8G8_UNORM,          VK_FORMAT_R8G8B8A8_UNORM,
+        VK_FORMAT_R8G8B8A8_SRGB,       VK_FORMAT_R16_SFLOAT,
+        VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R32_SFLOAT,
+        VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_D32_SFLOAT,
+        VK_FORMAT_R8G8B8_UNORM,        VK_FORMAT_R32G32_SFLOAT,
+        VK_FORMAT_R32G32B32_SFLOAT,    VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+    };
+    const uint32_t index = static_cast<uint32_t>(format);
+    return index < sizeof(formats) / sizeof(formats[0]) ? formats[index] : VK_FORMAT_UNDEFINED;
+}
+
+VkImageLayout vulkanImageLayout(VernonRhiResourceState state) {
+    switch (state) {
+    case VERNON_RHI_STATE_UNDEFINED:
+        return VK_IMAGE_LAYOUT_UNDEFINED;
+    case VERNON_RHI_STATE_COMMON:
+        return VK_IMAGE_LAYOUT_GENERAL;
+    case VERNON_RHI_STATE_TRANSFER_SOURCE:
+        return VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    case VERNON_RHI_STATE_TRANSFER_DESTINATION:
+        return VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    case VERNON_RHI_STATE_SHADER_READ:
+        return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    case VERNON_RHI_STATE_SHADER_WRITE:
+        return VK_IMAGE_LAYOUT_GENERAL;
+    case VERNON_RHI_STATE_COLOR_ATTACHMENT:
+        return VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    case VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT:
+        return VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    case VERNON_RHI_STATE_PRESENT:
+        return VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    }
+    return VK_IMAGE_LAYOUT_UNDEFINED;
+}
+
+void vulkanBufferDependency(VernonRhiResourceState state, VkPipelineStageFlags &stages, VkAccessFlags &access) {
+    switch (state) {
+    case VERNON_RHI_STATE_TRANSFER_SOURCE:
+        stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        access = VK_ACCESS_TRANSFER_READ_BIT;
+        return;
+    case VERNON_RHI_STATE_TRANSFER_DESTINATION:
+        stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        access = VK_ACCESS_TRANSFER_WRITE_BIT;
+        return;
+    case VERNON_RHI_STATE_SHADER_READ:
+        stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+        access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT |
+                 VK_ACCESS_INDEX_READ_BIT;
+        return;
+    case VERNON_RHI_STATE_SHADER_WRITE:
+        stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        return;
+    case VERNON_RHI_STATE_COLOR_ATTACHMENT:
+        stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        return;
+    case VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT:
+        stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        return;
+    case VERNON_RHI_STATE_PRESENT:
+        stages = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+        access = VK_ACCESS_MEMORY_READ_BIT;
+        return;
+    case VERNON_RHI_STATE_UNDEFINED:
+        stages = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        access = 0;
+        return;
+    default:
+        stages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        return;
+    }
+}
+
+VkPipelineStageFlags vulkanShaderStages(uint32_t stages) {
+    VkPipelineStageFlags result = 0;
+    if (stages & VERNON_RHI_STAGE_COMPUTE)
+        result |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    if (stages & VERNON_RHI_STAGE_VERTEX)
+        result |= VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+    if (stages & VERNON_RHI_STAGE_FRAGMENT)
+        result |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    return result;
+}
+
+VkAccessFlags vulkanAccess(uint32_t access) {
+    VkAccessFlags result = 0;
+    if (access & VERNON_RHI_ACCESS_TRANSFER_READ)
+        result |= VK_ACCESS_TRANSFER_READ_BIT;
+    if (access & VERNON_RHI_ACCESS_TRANSFER_WRITE)
+        result |= VK_ACCESS_TRANSFER_WRITE_BIT;
+    if (access & VERNON_RHI_ACCESS_SHADER_READ)
+        result |= VK_ACCESS_SHADER_READ_BIT;
+    if (access & VERNON_RHI_ACCESS_SHADER_WRITE)
+        result |= VK_ACCESS_SHADER_WRITE_BIT;
+    if (access & VERNON_RHI_ACCESS_COLOR_READ)
+        result |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+    if (access & VERNON_RHI_ACCESS_COLOR_WRITE)
+        result |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    if (access & VERNON_RHI_ACCESS_DEPTH_STENCIL_READ)
+        result |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+    if (access & VERNON_RHI_ACCESS_DEPTH_STENCIL_WRITE)
+        result |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    if (access & VERNON_RHI_ACCESS_VERTEX_READ)
+        result |= VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+    if (access & VERNON_RHI_ACCESS_INDEX_READ)
+        result |= VK_ACCESS_INDEX_READ_BIT;
+    if (access & VERNON_RHI_ACCESS_INDIRECT_READ)
+        result |= VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+    if (access & VERNON_RHI_ACCESS_HOST_READ)
+        result |= VK_ACCESS_HOST_READ_BIT;
+    if (access & VERNON_RHI_ACCESS_HOST_WRITE)
+        result |= VK_ACCESS_HOST_WRITE_BIT;
+    return result;
+}
+
+void vulkanBarrierDependency(VernonRhiResourceState state, uint32_t stageMask, uint32_t accessMask,
+                             VkPipelineStageFlags &stages, VkAccessFlags &access) {
+    vulkanBufferDependency(state, stages, access);
+    if ((state == VERNON_RHI_STATE_SHADER_READ || state == VERNON_RHI_STATE_SHADER_WRITE) && stageMask) {
+        const VkPipelineStageFlags explicitStages = vulkanShaderStages(stageMask);
+        if (explicitStages)
+            stages = explicitStages;
+    }
+    if (accessMask)
+        access = vulkanAccess(accessMask);
+}
+
+void vulkanImageDependency(VkImageLayout layout, VkPipelineStageFlags &stages, VkAccessFlags &access) {
+    switch (layout) {
+    case VK_IMAGE_LAYOUT_UNDEFINED:
+        stages = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        access = 0;
+        return;
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+        stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        access = VK_ACCESS_TRANSFER_READ_BIT;
+        return;
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+        stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        access = VK_ACCESS_TRANSFER_WRITE_BIT;
+        return;
+    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+        stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        access = VK_ACCESS_SHADER_READ_BIT;
+        return;
+    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+        stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        return;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+        stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        return;
+    case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+        stages = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+        access = VK_ACCESS_MEMORY_READ_BIT;
+        return;
+    default:
+        stages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        return;
+    }
+}
+
+void transitionVulkanImage(VkCommandBuffer command, VulkanImageSlot &slot, VkImageLayout target,
+                           bool forceMemoryDependency = false, const VernonRhiBarrier *dependency = nullptr) {
+    auto &image = slot.image;
+    if (image.layout == target && !forceMemoryDependency)
+        return;
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.oldLayout = image.layout;
+    barrier.newLayout = target;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image.image;
+    barrier.subresourceRange.aspectMask =
+        image.format == VK_FORMAT_D32_SFLOAT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.layerCount = 1;
+    VkPipelineStageFlags sourceStage{};
+    VkPipelineStageFlags destinationStage{};
+    vulkanImageDependency(image.layout, sourceStage, barrier.srcAccessMask);
+    vulkanImageDependency(target, destinationStage, barrier.dstAccessMask);
+    if (dependency) {
+        vulkanBarrierDependency(static_cast<VernonRhiResourceState>(dependency->old_state),
+                                dependency->source_stage_mask, dependency->source_access, sourceStage,
+                                barrier.srcAccessMask);
+        vulkanBarrierDependency(static_cast<VernonRhiResourceState>(dependency->new_state),
+                                dependency->destination_stage_mask, dependency->destination_access, destinationStage,
+                                barrier.dstAccessMask);
+    }
+    vernon::rhi::vulkan::driver().cmdPipelineBarrier(command, sourceStage, destinationStage, 0, 0, nullptr, 0, nullptr,
+                                                     1, &barrier);
+    image.layout = target;
+}
+
+void validate(const VulkanInteropDevice &device) {
+    for (const VulkanBufferSlot &buffer : device.buffers)
+        buffer.validate();
+    for (const VulkanImageSlot &image : device.images)
+        image.validate();
+    for (const VulkanSamplerSlot &sampler : device.samplers)
+        sampler.validate();
+    for (const VulkanImageViewSlot &view : device.imageViews) {
+        assert(view.generation != 0);
+        if (!view.occupied)
+            continue;
+        assert(view.descriptor.descriptor.image.index < device.images.size());
+        const VulkanImageSlot &image = device.images[view.descriptor.descriptor.image.index];
+        assert(image.occupied && image.generation == view.descriptor.descriptor.image.generation);
+    }
+}
+} // namespace
+
+namespace vernon::rhi::vulkan_api {
+
+extern "C" VERNON_RHI_CAPI VernonRhiDevice
+vernonRhiCreateBorrowedVulkanDevice(const VernonRhiVulkanBorrowedDeviceDescriptor *descriptor) {
+    constexpr uint32_t allQueueCapabilities =
+        VERNON_RHI_QUEUE_TRANSFER | VERNON_RHI_QUEUE_COMPUTE | VERNON_RHI_QUEUE_GRAPHICS;
+    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !descriptor->instance ||
+        !descriptor->physical_device || !descriptor->device || !descriptor->queue || !descriptor->command_buffer ||
+        (descriptor->queue_capabilities & ~allQueueCapabilities) != 0)
+        return invalidDevice();
+    auto device = std::shared_ptr<VulkanInteropDevice>(new (std::nothrow) VulkanInteropDevice());
+    if (!device ||
+        !device->state.initializeBorrowed(
+            static_cast<VkInstance>(descriptor->instance), static_cast<VkPhysicalDevice>(descriptor->physical_device),
+            static_cast<VkDevice>(descriptor->device), static_cast<VkQueue>(descriptor->queue),
+            descriptor->queue_family_index, static_cast<VkCommandBuffer>(descriptor->command_buffer), device->error))
+        return invalidDevice();
+    uint32_t queueFamilyCount = 0;
+    vernon::rhi::vulkan::driver().getPhysicalDeviceQueueFamilyProperties(device->state.physicalDevice,
+                                                                         &queueFamilyCount, nullptr);
+    if (descriptor->queue_family_index >= queueFamilyCount) {
+        device->state.shutdown();
+        return invalidDevice();
+    }
+    std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+    vernon::rhi::vulkan::driver().getPhysicalDeviceQueueFamilyProperties(device->state.physicalDevice,
+                                                                         &queueFamilyCount, queueFamilies.data());
+    VkQueueFlags required = 0;
+    if ((descriptor->queue_capabilities & VERNON_RHI_QUEUE_TRANSFER) != 0)
+        required |= VK_QUEUE_TRANSFER_BIT;
+    if ((descriptor->queue_capabilities & VERNON_RHI_QUEUE_COMPUTE) != 0)
+        required |= VK_QUEUE_COMPUTE_BIT;
+    if ((descriptor->queue_capabilities & VERNON_RHI_QUEUE_GRAPHICS) != 0)
+        required |= VK_QUEUE_GRAPHICS_BIT;
+    if ((queueFamilies[descriptor->queue_family_index].queueFlags & required) != required) {
+        device->state.shutdown();
+        return invalidDevice();
+    }
+    device->queueCapabilities = descriptor->queue_capabilities;
+    std::lock_guard<std::mutex> guard(deviceMutex);
+    uint32_t index = 0;
+    while (index < vulkanDevices.size() && vulkanDevices[index].device)
+        ++index;
+    if (index == vulkanDevices.size()) {
+        if (index >= vulkanDeviceBit)
+            return invalidDevice();
+        vulkanDevices.emplace_back();
+    }
+    vulkanDevices[index].device = std::move(device);
+    return {index | vulkanDeviceBit, vulkanDevices[index].generation};
+}
+
+extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiVulkanDeviceGetBorrowedQueue(VernonRhiDevice handle,
+                                                                                 void **output) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device || !output)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    *output = device->state.queue;
+    return VERNON_RHI_STATUS_OK;
+}
+
+extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiVulkanDeviceGetBorrowedCommandBuffer(VernonRhiDevice handle,
+                                                                                         void **output) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device || !output)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    *output = device->state.borrowedCommandBuffer;
+    return VERNON_RHI_STATUS_OK;
+}
+
+extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiVulkanDeviceImportBorrowedBuffer(
+    VernonRhiDevice handle, const VernonRhiVulkanBorrowedBufferDescriptor *descriptor, VernonRhiBuffer *output) {
+    constexpr uint32_t allUsages = VERNON_RHI_BUFFER_TRANSFER_SOURCE | VERNON_RHI_BUFFER_TRANSFER_DESTINATION |
+                                   VERNON_RHI_BUFFER_UNIFORM | VERNON_RHI_BUFFER_STORAGE | VERNON_RHI_BUFFER_VERTEX |
+                                   VERNON_RHI_BUFFER_INDEX | VERNON_RHI_BUFFER_INDIRECT;
+    auto device = lookupVulkanDevice(handle);
+    if (!device || !descriptor || descriptor->struct_size < sizeof(*descriptor) || !descriptor->buffer ||
+        !descriptor->size || (descriptor->usage & ~allUsages) != 0 || descriptor->state == VERNON_RHI_STATE_UNDEFINED ||
+        !output)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VulkanBufferSlot &slot = allocateVulkanSlot(device->buffers, *output);
+    slot.buffer.buffer = vulkanHandle<VkBuffer>(descriptor->buffer);
+    slot.buffer.owned = false;
+    slot.descriptor = *descriptor;
+    return VERNON_RHI_STATUS_OK;
+}
+
+extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiVulkanDeviceImportBorrowedImage(
+    VernonRhiDevice handle, const VernonRhiVulkanBorrowedImageDescriptor *descriptor, VernonRhiImage *output) {
+    constexpr uint32_t allUsages = VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION |
+                                   VERNON_RHI_IMAGE_SAMPLED | VERNON_RHI_IMAGE_STORAGE |
+                                   VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT;
+    auto device = lookupVulkanDevice(handle);
+    const bool validCube =
+        descriptor && (descriptor->descriptor.dimension != VERNON_RHI_IMAGE_CUBE ||
+                       (descriptor->descriptor.width == descriptor->descriptor.height &&
+                        descriptor->descriptor.depth == 1 && descriptor->descriptor.array_layers == 6));
+    if (!device || !descriptor || descriptor->struct_size < sizeof(*descriptor) || !descriptor->image ||
+        descriptor->descriptor.struct_size < sizeof(descriptor->descriptor) ||
+        vulkanFormat(descriptor->descriptor.format) == VK_FORMAT_UNDEFINED || !descriptor->descriptor.width ||
+        !descriptor->descriptor.height || !descriptor->descriptor.depth || !descriptor->descriptor.mip_levels ||
+        !descriptor->descriptor.array_layers || !descriptor->descriptor.sample_count ||
+        (descriptor->descriptor.usage & ~allUsages) != 0 || !validCube || !output)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VulkanImageSlot &slot = allocateVulkanSlot(device->images, *output);
+    slot.image.image = vulkanHandle<VkImage>(descriptor->image);
+    slot.image.format = vulkanFormat(descriptor->descriptor.format);
+    slot.image.layout = vulkanImageLayout(descriptor->state);
+    slot.image.colorAttachment = (descriptor->descriptor.usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT) != 0;
+    slot.image.owned = false;
+    slot.descriptor = *descriptor;
+    validate(*device);
+    return VERNON_RHI_STATUS_OK;
+}
+
+extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiVulkanDeviceImportBorrowedImageView(
+    VernonRhiDevice handle, const VernonRhiVulkanBorrowedImageViewDescriptor *descriptor, VernonRhiImageView *output) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device || !descriptor || descriptor->struct_size < sizeof(*descriptor) || !descriptor->image_view ||
+        descriptor->descriptor.struct_size < sizeof(descriptor->descriptor) || !output)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VulkanImageSlot *image = lookupVulkanSlot(device->images, descriptor->descriptor.image);
+    if (!image || descriptor->descriptor.format != image->descriptor.descriptor.format ||
+        !descriptor->descriptor.mip_level_count || !descriptor->descriptor.array_layer_count ||
+        descriptor->descriptor.base_mip_level + descriptor->descriptor.mip_level_count >
+            image->descriptor.descriptor.mip_levels ||
+        descriptor->descriptor.base_array_layer + descriptor->descriptor.array_layer_count >
+            image->descriptor.descriptor.array_layers)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    VulkanImageViewSlot &slot = allocateVulkanImageView(device->imageViews, *output);
+    slot.view = vulkanHandle<VkImageView>(descriptor->image_view);
+    slot.descriptor = *descriptor;
+    validate(*device);
+    return VERNON_RHI_STATUS_OK;
+}
+
+extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiVulkanDeviceGetBufferNativeHandle(VernonRhiDevice handle,
+                                                                                      VernonRhiBuffer buffer,
+                                                                                      uint64_t *output) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device || !output)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VulkanBufferSlot *slot = lookupVulkanSlot(device->buffers, buffer);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    *output = vulkanHandleBits(slot->buffer.buffer);
+    return VERNON_RHI_STATUS_OK;
+}
+
+extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceDestroyImageView(VernonRhiDevice handle,
+                                                                           VernonRhiImageView imageView) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VulkanImageViewSlot *slot = lookupVulkanImageView(device->imageViews, imageView);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    releaseVulkanImageView(*slot);
+    validate(*device);
+    return VERNON_RHI_STATUS_OK;
+}
+
+extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceGetImageViewNativeHandle(VernonRhiDevice handle,
+                                                                                   VernonRhiImageView imageView,
+                                                                                   uint64_t *output) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device || !output)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VulkanImageViewSlot *slot = lookupVulkanImageView(device->imageViews, imageView);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    *output = vulkanHandleBits(slot->view);
+    return VERNON_RHI_STATUS_OK;
+}
+
+VernonRhiDevice createOwnedDevice(const VernonRhiOwnedDeviceDescriptor *descriptor) {
+
+    auto device = std::shared_ptr<VulkanInteropDevice>(new (std::nothrow) VulkanInteropDevice());
+    if (!device || !device->state.initialize(descriptor->device_index, device->error))
+        return invalidDevice();
+    device->owned = true;
+    device->queueCapabilities = VERNON_RHI_QUEUE_TRANSFER | VERNON_RHI_QUEUE_COMPUTE | VERNON_RHI_QUEUE_GRAPHICS;
+    std::lock_guard<std::mutex> guard(deviceMutex);
+    uint32_t index = 0;
+    while (index < vulkanDevices.size() && vulkanDevices[index].device)
+        ++index;
+    if (index == vulkanDevices.size())
+        vulkanDevices.emplace_back();
+    vulkanDevices[index].device = std::move(device);
+    return {index | vulkanDeviceBit, vulkanDevices[index].generation};
+}
+
+void destroyDevice(VernonRhiDevice handle) {
+
+    std::shared_ptr<VulkanInteropDevice> device;
+    {
+        const uint32_t index = handle.index & ~vulkanDeviceBit;
+        std::lock_guard<std::mutex> guard(deviceMutex);
+        if (index >= vulkanDevices.size() || vulkanDevices[index].generation != handle.generation)
+            return;
+        VulkanDeviceSlot &slot = vulkanDevices[index];
+        device = std::move(slot.device);
+        ++slot.generation;
+        if (slot.generation == 0)
+            slot.generation = 1;
+    }
+    if (device) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        for (VulkanBufferSlot &buffer : device->buffers)
+            if (buffer.occupied)
+                device->state.destroyBuffer(buffer.buffer);
+        for (VulkanImageSlot &image : device->images)
+            if (image.occupied)
+                device->state.destroyImage(image.image);
+        for (VulkanSamplerSlot &sampler : device->samplers)
+            if (sampler.occupied)
+                device->state.destroySampler(sampler.sampler);
+        device->state.shutdown();
+    }
+    return;
+}
+
+VernonStringView lastError(VernonRhiDevice handle) {
+    auto device = lookupVulkanDevice(handle);
+    return device ? VernonStringView{device->error.data(), device->error.size()} : VernonStringView{};
+}
+
+VernonRhiStatus synchronize(VernonRhiDevice handle) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    }
+
+    std::lock_guard<std::mutex> guard(device->mutex);
+    return device->state.synchronize(device->error) ? VERNON_RHI_STATUS_OK : VERNON_RHI_STATUS_INTERNAL_ERROR;
+}
+
+VernonRhiStatus createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescriptor *descriptor,
+                             VernonRhiBuffer *output) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    }
+
+    if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || descriptor->size == 0)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VulkanBufferSlot &slot = allocateVulkanSlot(device->buffers, *output);
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if ((descriptor->usage & VERNON_RHI_BUFFER_STORAGE) != 0)
+        usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    if ((descriptor->usage & VERNON_RHI_BUFFER_VERTEX) != 0)
+        usage |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    if ((descriptor->usage & VERNON_RHI_BUFFER_INDEX) != 0)
+        usage |= VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+    if ((descriptor->usage & VERNON_RHI_BUFFER_UNIFORM) != 0)
+        usage |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    if (!device->state.createBuffer(slot.buffer, descriptor->size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                    device->error)) {
+        releaseVulkanSlot(slot);
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    }
+    slot.ownedDescriptor = *descriptor;
+    return VERNON_RHI_STATUS_OK;
+}
+
+VernonRhiStatus uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset, const void *source,
+                             uint64_t size) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    }
+
+    if (!source)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VulkanBufferSlot *slot = lookupVulkanSlot(device->buffers, buffer);
+    if (!slot || offset > slot->ownedDescriptor.size || size > slot->ownedDescriptor.size - offset)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    VkBuffer staging{};
+    VkDeviceSize stagingOffset{};
+    uint8_t *mapped = nullptr;
+    if (!device->state.acquireStaging(true, size, 16, staging, stagingOffset, mapped, device->error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    std::memcpy(mapped, source, static_cast<size_t>(size));
+    VkCommandBuffer command{};
+    if (!device->state.beginCommands(command, device->error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    const VkBufferCopy copy{stagingOffset, offset, size};
+    auto &driver = vernon::rhi::vulkan::driver();
+    driver.cmdCopyBuffer(command, staging, slot->buffer.buffer, 1, &copy);
+    VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
+                            VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = slot->buffer.buffer;
+    barrier.offset = offset;
+    barrier.size = size;
+    driver.cmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
+                              nullptr, 1, &barrier, 0, nullptr);
+    return device->state.submitCommands(command, device->error) ? VERNON_RHI_STATUS_OK
+                                                                : VERNON_RHI_STATUS_INTERNAL_ERROR;
+}
+
+VernonRhiStatus downloadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset, void *destination,
+                               uint64_t size) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    }
+
+    if (!destination)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VulkanBufferSlot *slot = lookupVulkanSlot(device->buffers, buffer);
+    if (!slot || offset > slot->ownedDescriptor.size || size > slot->ownedDescriptor.size - offset)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    VkBuffer staging{};
+    VkDeviceSize stagingOffset{};
+    uint8_t *mapped = nullptr;
+    if (!device->state.acquireStaging(false, size, 16, staging, stagingOffset, mapped, device->error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    VkCommandBuffer command{};
+    if (!device->state.beginCommands(command, device->error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    const VkBufferCopy copy{offset, stagingOffset, size};
+    vernon::rhi::vulkan::driver().cmdCopyBuffer(command, slot->buffer.buffer, staging, 1, &copy);
+    if (!device->state.submitCommands(command, device->error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    std::memcpy(destination, mapped, static_cast<size_t>(size));
+    return VERNON_RHI_STATUS_OK;
+}
+
+uint32_t isBufferValid(VernonRhiDevice handle, VernonRhiBuffer buffer) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> guard(device->mutex);
+    return lookupVulkanSlot(device->buffers, buffer) != nullptr;
+}
+
+VernonRhiStatus createImage(VernonRhiDevice handle, const VernonRhiImageDescriptor *descriptor,
+                            VernonRhiImage *output) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    }
+
+    const VkFormat format = descriptor ? vulkanFormat(descriptor->format) : VK_FORMAT_UNDEFINED;
+    if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || format == VK_FORMAT_UNDEFINED ||
+        descriptor->width == 0 || descriptor->height == 0 || descriptor->depth == 0 || descriptor->mip_levels == 0 ||
+        descriptor->sample_count != 1)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VkFormatFeatureFlags requiredFeatures = VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    if ((descriptor->usage & VERNON_RHI_IMAGE_SAMPLED) != 0)
+        requiredFeatures |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    if ((descriptor->usage & VERNON_RHI_IMAGE_STORAGE) != 0)
+        requiredFeatures |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+    if ((descriptor->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT) != 0)
+        requiredFeatures |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+    if ((descriptor->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) != 0)
+        requiredFeatures |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    VkFormatProperties formatProperties{};
+    vernon::rhi::vulkan::driver().getPhysicalDeviceFormatProperties(device->state.physicalDevice, format,
+                                                                    &formatProperties);
+    if ((formatProperties.optimalTilingFeatures & requiredFeatures) != requiredFeatures) {
+        device->error = "Vulkan image format does not support the requested optimal-tiling usage";
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    }
+    VulkanImageSlot &slot = allocateVulkanSlot(device->images, *output);
+    VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    imageInfo.flags = descriptor->dimension == VERNON_RHI_IMAGE_CUBE ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+    imageInfo.imageType = descriptor->dimension == VERNON_RHI_IMAGE_3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+    imageInfo.format = format;
+    imageInfo.extent = {descriptor->width, descriptor->height, descriptor->depth};
+    imageInfo.mipLevels = descriptor->mip_levels;
+    imageInfo.arrayLayers = descriptor->dimension == VERNON_RHI_IMAGE_3D ? 1 : descriptor->array_layers;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if ((descriptor->usage & VERNON_RHI_IMAGE_SAMPLED) != 0)
+        imageInfo.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+    if ((descriptor->usage & VERNON_RHI_IMAGE_STORAGE) != 0)
+        imageInfo.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    if ((descriptor->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT) != 0)
+        imageInfo.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if ((descriptor->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) != 0)
+        imageInfo.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    viewInfo.viewType = descriptor->dimension == VERNON_RHI_IMAGE_3D     ? VK_IMAGE_VIEW_TYPE_3D
+                        : descriptor->dimension == VERNON_RHI_IMAGE_CUBE ? VK_IMAGE_VIEW_TYPE_CUBE
+                                                                         : VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = format;
+    viewInfo.subresourceRange.aspectMask =
+        descriptor->format == VERNON_RHI_FORMAT_D32_FLOAT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.levelCount = descriptor->mip_levels;
+    viewInfo.subresourceRange.layerCount = imageInfo.arrayLayers;
+    if (!device->state.createImage(slot.image, imageInfo, viewInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                   device->error)) {
+        releaseVulkanSlot(slot);
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    }
+    slot.ownedDescriptor = *descriptor;
+    return VERNON_RHI_STATUS_OK;
+}
+
+VernonRhiStatus setImageSampler(VernonRhiDevice handle, VernonRhiImage image,
+                                const VernonRhiSamplerDescriptor *descriptor) {
+    return VERNON_RHI_STATUS_UNSUPPORTED;
+}
+
+VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const VernonRhiImageUploadDescriptor *uploads,
+                            size_t uploadCount) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    }
+
+    if (!uploads || uploadCount == 0)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VulkanImageSlot *slot = lookupVulkanSlot(device->images, image);
+    if (!slot || !slot->image.owned)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    const VernonRhiImageDescriptor &descriptor = slot->ownedDescriptor;
+    if ((descriptor.dimension != VERNON_RHI_IMAGE_2D && descriptor.dimension != VERNON_RHI_IMAGE_CUBE) ||
+        descriptor.format != VERNON_RHI_FORMAT_RGBA8_UNORM || descriptor.depth != 1 || descriptor.mip_levels != 1)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    size_t totalSize = 0;
+    std::vector<size_t> uploadSizes(uploadCount);
+    for (size_t index = 0; index < uploadCount; ++index) {
+        const VernonRhiImageUploadDescriptor &upload = uploads[index];
+        const bool validLayer = descriptor.dimension == VERNON_RHI_IMAGE_CUBE
+                                    ? upload.array_layer < descriptor.array_layers
+                                    : upload.array_layer == 0;
+        if (upload.struct_size < sizeof(upload) || upload.mip_level != 0 || !validLayer ||
+            upload.width != descriptor.width || upload.height != descriptor.height || upload.depth != 1 ||
+            upload.source_format != VERNON_RHI_IMAGE_DATA_RGBA || upload.source_type != VERNON_RHI_IMAGE_DATA_UINT8 ||
+            !upload.data || upload.width > (std::numeric_limits<size_t>::max)() / upload.height)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        const size_t pixels = static_cast<size_t>(upload.width) * upload.height;
+        if (pixels > (std::numeric_limits<size_t>::max)() / 4 ||
+            pixels * 4 > (std::numeric_limits<size_t>::max)() - totalSize)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        uploadSizes[index] = pixels * 4;
+        totalSize += uploadSizes[index];
+    }
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceSize stagingOffset = 0;
+    uint8_t *mapped = nullptr;
+    if (!device->state.acquireStaging(true, totalSize, 16, staging, stagingOffset, mapped, device->error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    std::vector<VkBufferImageCopy> regions(uploadCount);
+    size_t byteOffset = 0;
+    for (size_t index = 0; index < uploadCount; ++index) {
+        std::memcpy(mapped + byteOffset, uploads[index].data, uploadSizes[index]);
+        VkBufferImageCopy &region = regions[index];
+        region.bufferOffset = stagingOffset + byteOffset;
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.baseArrayLayer = uploads[index].array_layer;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent = {uploads[index].width, uploads[index].height, 1};
+        byteOffset += uploadSizes[index];
+    }
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    if (!device->state.beginCommands(command, device->error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    transitionVulkanImage(command, *slot, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vernon::rhi::vulkan::driver().cmdCopyBufferToImage(command, staging, slot->image.image,
+                                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                                       static_cast<uint32_t>(regions.size()), regions.data());
+    transitionVulkanImage(command, *slot, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    return device->state.submitCommands(command, device->error) ? VERNON_RHI_STATUS_OK
+                                                                : VERNON_RHI_STATUS_INTERNAL_ERROR;
+}
+
+VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image, void *destination, size_t size) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    }
+
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VulkanImageSlot *slot = lookupVulkanSlot(device->images, image);
+    if (!slot || !slot->image.owned)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    const auto expected = rgba8Size(slot->ownedDescriptor);
+    if (!expected || size != *expected)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceSize stagingOffset = 0;
+    uint8_t *mapped = nullptr;
+    if (!device->state.acquireStaging(false, size, 16, staging, stagingOffset, mapped, device->error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    const VkImageLayout restore =
+        slot->image.layout == VK_IMAGE_LAYOUT_UNDEFINED ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : slot->image.layout;
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    if (!device->state.beginCommands(command, device->error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    transitionVulkanImage(command, *slot, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy region{};
+    region.bufferOffset = stagingOffset;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = {slot->ownedDescriptor.width, slot->ownedDescriptor.height, 1};
+    vernon::rhi::vulkan::driver().cmdCopyImageToBuffer(command, slot->image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                                       staging, 1, &region);
+    transitionVulkanImage(command, *slot, restore);
+    if (!device->state.submitCommands(command, device->error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    std::memcpy(destination, mapped, size);
+    return VERNON_RHI_STATUS_OK;
+}
+
+VernonRhiStatus generateImageMipmaps(VernonRhiDevice handle, VernonRhiImage image) {
+    return VERNON_RHI_STATUS_UNSUPPORTED;
+}
+
+VernonRhiStatus bindImage(VernonRhiDevice handle, VernonRhiImage image, uint32_t textureUnit) {
+    return VERNON_RHI_STATUS_UNSUPPORTED;
+}
+
+VernonRhiStatus destroyImage(VernonRhiDevice handle, VernonRhiImage image) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    }
+
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VulkanImageSlot *slot = lookupVulkanSlot(device->images, image);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (std::any_of(device->imageViews.begin(), device->imageViews.end(), [image](const VulkanImageViewSlot &view) {
+            return view.occupied && view.descriptor.descriptor.image.index == image.index &&
+                   view.descriptor.descriptor.image.generation == image.generation;
+        }))
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    slot->destroyPublicOwner();
+    if (slot->bindingReferences == 0) {
+        device->state.destroyImage(slot->image);
+        releaseVulkanSlot(*slot);
+    }
+    validate(*device);
+    return VERNON_RHI_STATUS_OK;
+}
+
+uint32_t isImageValid(VernonRhiDevice handle, VernonRhiImage image) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> guard(device->mutex);
+    return lookupVulkanSlot(device->images, image) != nullptr;
+}
+
+VernonRhiStatus createSampler(VernonRhiDevice handle, const VernonRhiSamplerDescriptor *descriptor,
+                              VernonRhiSampler *output) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    }
+
+    if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
+        descriptor->mag_filter > VERNON_RHI_FILTER_LINEAR ||
+        descriptor->address_u > VERNON_RHI_ADDRESS_MIRRORED_REPEAT ||
+        descriptor->address_v > VERNON_RHI_ADDRESS_MIRRORED_REPEAT ||
+        descriptor->address_w > VERNON_RHI_ADDRESS_MIRRORED_REPEAT)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VulkanSamplerSlot &slot = allocateVulkanSlot(device->samplers, *output);
+    auto address = [](uint32_t mode) {
+        constexpr VkSamplerAddressMode values[] = {VK_SAMPLER_ADDRESS_MODE_REPEAT,
+                                                   VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                                   VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT};
+        return values[mode];
+    };
+    VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    info.minFilter = descriptor->min_filter == VERNON_RHI_FILTER_NEAREST ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+    info.magFilter = descriptor->mag_filter == VERNON_RHI_FILTER_NEAREST ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+    info.mipmapMode = descriptor->mip_filter == VERNON_RHI_FILTER_NEAREST ? VK_SAMPLER_MIPMAP_MODE_NEAREST
+                                                                          : VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    info.addressModeU = address(descriptor->address_u);
+    info.addressModeV = address(descriptor->address_v);
+    info.addressModeW = address(descriptor->address_w);
+    info.maxLod = VK_LOD_CLAMP_NONE;
+    if (!device->state.createSampler(slot.sampler, info, device->error)) {
+        releaseVulkanSlot(slot);
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    }
+    return VERNON_RHI_STATUS_OK;
+}
+
+VernonRhiStatus destroySampler(VernonRhiDevice handle, VernonRhiSampler sampler) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    }
+
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VulkanSamplerSlot *slot = lookupVulkanSlot(device->samplers, sampler);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    slot->destroyPublicOwner();
+    if (slot->bindingReferences == 0) {
+        device->state.destroySampler(slot->sampler);
+        releaseVulkanSlot(*slot);
+    }
+    return VERNON_RHI_STATUS_OK;
+}
+
+uint32_t isSamplerValid(VernonRhiDevice handle, VernonRhiSampler sampler) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> guard(device->mutex);
+    return lookupVulkanSlot(device->samplers, sampler) != nullptr;
+}
+
+VernonRhiStatus getImageNativeHandle(VernonRhiDevice handle, VernonRhiImage image, uint64_t *output) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    }
+
+    if (!output)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VulkanImageSlot *slot = lookupVulkanSlot(device->images, image);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    *output = vulkanHandleBits(slot->image.image);
+    return VERNON_RHI_STATUS_OK;
+}
+
+VernonRhiStatus destroyBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    }
+
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VulkanBufferSlot *slot = lookupVulkanSlot(device->buffers, buffer);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    slot->destroyPublicOwner();
+    if (slot->bindingReferences == 0) {
+        device->state.destroyBuffer(slot->buffer);
+        releaseVulkanSlot(*slot);
+    }
+    return VERNON_RHI_STATUS_OK;
+}
+
+VernonRhiStatus getBufferNativeHandle(VernonRhiDevice handle, VernonRhiBuffer buffer, void **output) {
+    return VERNON_RHI_STATUS_UNSUPPORTED;
+}
+
+bool ownsDevice(VernonRhiDevice handle) { return static_cast<bool>(lookupVulkanDevice(handle)); }
+
+void *deviceStateForBackend(VernonRhiDevice handle) {
+    auto device = lookupVulkanDevice(handle);
+    return device ? &device->state : nullptr;
+}
+
+bool beginCommands(VernonRhiDevice handle, uint64_t &native, VernonRhiBackend &backend) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VkCommandBuffer command{};
+    if (!device->state.beginCommands(command, device->error))
+        return false;
+    backend = VERNON_RHI_BACKEND_VULKAN;
+    native = vulkanHandleBits(command);
+    return true;
+}
+
+bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites, bool &completed) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> guard(device->mutex);
+    const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
+    const bool submitted = command && device->state.submitCommands(command, device->error);
+    completed = submitted && !device->state.nativeObjectsBorrowed;
+    return submitted;
+}
+
+void completeBorrowedCommands(VernonRhiDevice handle, uint64_t native) {}
+
+void abandonCommands(VernonRhiDevice handle, uint64_t native) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device)
+        return;
+
+    std::lock_guard<std::mutex> guard(device->mutex);
+    if (!device->state.nativeObjectsBorrowed) {
+        const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
+        if (command)
+            vernon::rhi::vulkan::driver().endCommandBuffer(command);
+    }
+    return;
+}
+
+bool recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native, const VernonRhiBarrier *barriers,
+                    size_t barrierCount) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> guard(device->mutex);
+    const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
+    if (!command)
+        return false;
+    std::vector<VkBufferMemoryBarrier> bufferBarriers;
+    std::vector<VkImageMemoryBarrier> imageBarriers;
+    try {
+        bufferBarriers.reserve(barrierCount);
+        imageBarriers.reserve(barrierCount);
+    } catch (const std::bad_alloc &) {
+        return false;
+    }
+    VkPipelineStageFlags sourceStages = 0;
+    VkPipelineStageFlags destinationStages = 0;
+    for (size_t index = 0; index < barrierCount; ++index) {
+        if (barriers[index].is_image) {
+            auto *slot = lookupResourceRecord(device->images, resourceKey(barriers[index].image));
+            if (!slot)
+                return false;
+            if (!deferCommandRollback(handle, encoderKey, &slot->image, static_cast<uint64_t>(slot->image.layout),
+                                      restoreVulkanImageLayout))
+                return false;
+            const VkImageLayout target = vulkanImageLayout(barriers[index].new_state);
+            VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            barrier.oldLayout = slot->image.layout;
+            barrier.newLayout = target;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = slot->image.image;
+            barrier.subresourceRange.aspectMask =
+                slot->image.format == VK_FORMAT_D32_SFLOAT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.levelCount = 1;
+            barrier.subresourceRange.layerCount = 1;
+            VkPipelineStageFlags source{};
+            VkPipelineStageFlags destination{};
+            vulkanBarrierDependency(static_cast<VernonRhiResourceState>(barriers[index].old_state),
+                                    barriers[index].source_stage_mask, barriers[index].source_access, source,
+                                    barrier.srcAccessMask);
+            vulkanBarrierDependency(static_cast<VernonRhiResourceState>(barriers[index].new_state),
+                                    barriers[index].destination_stage_mask, barriers[index].destination_access,
+                                    destination, barrier.dstAccessMask);
+            sourceStages |= source;
+            destinationStages |= destination;
+            imageBarriers.push_back(barrier);
+            slot->image.layout = target;
+        } else {
+            auto *slot = lookupResourceRecord(device->buffers, resourceKey(barriers[index].buffer));
+            if (!slot)
+                return false;
+            VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+            VkPipelineStageFlags source{};
+            VkPipelineStageFlags destination{};
+            vulkanBarrierDependency(static_cast<VernonRhiResourceState>(barriers[index].old_state),
+                                    barriers[index].source_stage_mask, barriers[index].source_access, source,
+                                    barrier.srcAccessMask);
+            vulkanBarrierDependency(static_cast<VernonRhiResourceState>(barriers[index].new_state),
+                                    barriers[index].destination_stage_mask, barriers[index].destination_access,
+                                    destination, barrier.dstAccessMask);
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.buffer = slot->buffer.buffer;
+            barrier.offset = 0;
+            barrier.size = VK_WHOLE_SIZE;
+            sourceStages |= source;
+            destinationStages |= destination;
+            bufferBarriers.push_back(barrier);
+        }
+    }
+    if (!bufferBarriers.empty() || !imageBarriers.empty())
+        vernon::rhi::vulkan::driver().cmdPipelineBarrier(
+            command, sourceStages ? sourceStages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            destinationStages ? destinationStages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr,
+            static_cast<uint32_t>(bufferBarriers.size()), bufferBarriers.data(),
+            static_cast<uint32_t>(imageBarriers.size()), imageBarriers.data());
+    return true;
+}
+
+bool endRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
+                  uint32_t colorDiscardMask, uint32_t depthStencilDiscard, const uint64_t *colorResources,
+                  size_t colorCount, uint64_t depthResource) {
+    auto device = lookupVulkanDevice(handle);
+    const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
+    if (!device || !command || backend != VERNON_RHI_BACKEND_VULKAN)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    if (backendKind == CommandRenderingDynamic)
+        vernon::rhi::vulkan::driver().cmdEndRendering(command);
+    else if (backendKind == CommandRenderingRenderPass)
+        vernon::rhi::vulkan::driver().cmdEndRenderPass(command);
+    else
+        return false;
+    return true;
+}
+
+bool clearColor(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind, int32_t x,
+                int32_t y, uint32_t width, uint32_t height, uint32_t layers, uint64_t target, uint32_t location,
+                const float color[4]) {
+    auto device = lookupVulkanDevice(handle);
+    const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
+    if (!device || !command || backend != VERNON_RHI_BACKEND_VULKAN ||
+        (backendKind != CommandRenderingDynamic && backendKind != CommandRenderingRenderPass))
+        return false;
+    VkClearAttachment clear{};
+    clear.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    clear.colorAttachment = location;
+    std::copy(color, color + 4, clear.clearValue.color.float32);
+    const VkClearRect rectangle{{{x, y}, {width, height}}, 0, layers};
+    std::lock_guard<std::mutex> guard(device->mutex);
+    vernon::rhi::vulkan::driver().cmdClearAttachments(command, 1, &clear, 1, &rectangle);
+    return true;
+}
+
+bool clearDepthStencil(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
+                       int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t layers, uint64_t target,
+                       float depth, uint32_t stencil, uint32_t aspects) {
+    auto device = lookupVulkanDevice(handle);
+    const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
+    if (!device || !command || backend != VERNON_RHI_BACKEND_VULKAN ||
+        (backendKind != CommandRenderingDynamic && backendKind != CommandRenderingRenderPass))
+        return false;
+    VkClearAttachment clear{};
+    clear.aspectMask = ((aspects & VERNON_RHI_ATTACHMENT_DEPTH) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) |
+                       ((aspects & VERNON_RHI_ATTACHMENT_STENCIL) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+    clear.clearValue.depthStencil = {depth, stencil};
+    const VkClearRect rectangle{{{x, y}, {width, height}}, 0, layers};
+    std::lock_guard<std::mutex> guard(device->mutex);
+    vernon::rhi::vulkan::driver().cmdClearAttachments(command, 1, &clear, 1, &rectangle);
+    return true;
+}
+
+uint64_t bufferResource(VernonRhiDevice handle, VernonRhiBuffer buffer) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> guard(device->mutex);
+    if (VulkanBufferSlot *slot = lookupVulkanSlot(device->buffers, buffer))
+        return resourceKey(buffer);
+    return 0;
+}
+
+uint64_t imageResource(VernonRhiDevice handle, VernonRhiImage image) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> guard(device->mutex);
+    if (VulkanImageSlot *slot = lookupVulkanSlot(device->images, image))
+        return resourceKey(image);
+    return 0;
+}
+
+uint64_t samplerResource(VernonRhiDevice handle, VernonRhiSampler sampler) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> guard(device->mutex);
+    if (VulkanSamplerSlot *slot = lookupVulkanSlot(device->samplers, sampler))
+        return resourceKey(sampler);
+    return 0;
+}
+
+bool retainResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> guard(device->mutex);
+    if (kind == ResourceKind::Buffer) {
+        VulkanBufferSlot *slot = lookupResourceRecord(device->buffers, key);
+        return slot && slot->retain();
+    }
+    if (kind == ResourceKind::Image) {
+        VulkanImageSlot *slot = lookupResourceRecord(device->images, key);
+        return slot && slot->retain();
+    }
+    VulkanSamplerSlot *slot = lookupResourceRecord(device->samplers, key);
+    return slot && slot->retain();
+}
+
+uint64_t resolveResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device) {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> guard(device->mutex);
+    if (kind == ResourceKind::Buffer) {
+        auto *slot = lookupResourceRecord(device->buffers, key);
+        return slot && slot->occupied ? reinterpret_cast<uintptr_t>(&slot->buffer) : 0;
+    }
+    if (kind == ResourceKind::Image) {
+        auto *slot = lookupResourceRecord(device->images, key);
+        return slot && slot->occupied ? reinterpret_cast<uintptr_t>(&slot->image) : 0;
+    }
+    auto *slot = lookupResourceRecord(device->samplers, key);
+    return slot && slot->occupied ? reinterpret_cast<uintptr_t>(&slot->sampler) : 0;
+}
+
+void releaseResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device)
+        return;
+
+    std::lock_guard<std::mutex> guard(device->mutex);
+    if (kind == ResourceKind::Buffer) {
+        auto *slot = lookupResourceRecord(device->buffers, key);
+        if (!slot || !slot->release())
+            return;
+        device->state.destroyBuffer(slot->buffer);
+        releaseVulkanSlot(*slot);
+        return;
+    }
+    if (kind == ResourceKind::Image) {
+        auto *slot = lookupResourceRecord(device->images, key);
+        if (!slot || !slot->release())
+            return;
+        device->state.destroyImage(slot->image);
+        releaseVulkanSlot(*slot);
+        return;
+    }
+    auto *slot = lookupResourceRecord(device->samplers, key);
+    if (!slot || !slot->release())
+        return;
+    device->state.destroySampler(slot->sampler);
+    releaseVulkanSlot(*slot);
+    return;
+}
+
+} // namespace vernon::rhi::vulkan_api
+
+const vernon::rhi::BackendDispatch &vernon::rhi::vulkanBackendDispatch() {
+    using namespace vulkan_api;
+    static const BackendDispatch dispatch{
+        VERNON_RHI_BACKEND_VULKAN,
+        ownsDevice,
+        createOwnedDevice,
+        destroyDevice,
+        lastError,
+        synchronize,
+        deviceStateForBackend,
+        createBuffer,
+        uploadBuffer,
+        downloadBuffer,
+        destroyBuffer,
+        isBufferValid,
+        getBufferNativeHandle,
+        createImage,
+        setImageSampler,
+        uploadImage,
+        downloadImage,
+        generateImageMipmaps,
+        bindImage,
+        destroyImage,
+        isImageValid,
+        getImageNativeHandle,
+        createSampler,
+        destroySampler,
+        isSamplerValid,
+        bufferResource,
+        imageResource,
+        samplerResource,
+        retainResource,
+        resolveResource,
+        releaseResource,
+        beginCommands,
+        submitCommands,
+        completeBorrowedCommands,
+        abandonCommands,
+        recordBarriers,
+        endRendering,
+        clearColor,
+        clearDepthStencil,
+        nullptr,
+    };
+    return dispatch;
+}
+
+vernon::rhi::VulkanCacheStats vernon::rhi::getVulkanCacheStats(VernonRhiDevice handle) {
+    VulkanCacheStats result;
+    if (auto device = lookupVulkanDevice(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        result.defaultImplicitSamplerCreations = device->state.defaultImplicitSamplerCreations;
+        result.commandBufferAllocations = device->state.commandBufferAllocations;
+        result.descriptorPoolCreations = device->state.descriptorPoolCreations;
+        result.stagingBufferAllocations = device->state.stagingBufferAllocations;
+        result.dynamicRendering = device->state.dynamicRendering;
+    }
+    return result;
+}

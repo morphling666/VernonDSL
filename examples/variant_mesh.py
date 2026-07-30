@@ -8,13 +8,12 @@ SKIN = vd.feature("SKIN")
 
 @vd.vertex
 def mesh_vertex(
-    position: vd.vec3[vd.f32],
-    instance_transform: vd.When[INSTANCE, Annotated[vd.mat4[vd.f32],
-                                                    vd.instance()]],
-    joints: vd.When[SKIN, vd.vec4[vd.u32]],
-    weights: vd.When[SKIN, vd.vec4[vd.f32]],
-) -> Annotated[vd.vec4[vd.f32], vd.builtin("position")]:
-    result = vd.vec4(position, 1.0)
+    position: vd.Vector[vd.f32, 3],
+    instance_transform: vd.When[INSTANCE, Annotated[vd.Matrix[vd.f32, 4, 4], vd.attribute(divisor=1)]],
+    joints: vd.When[SKIN, vd.Vector[vd.u32, 4]],
+    weights: vd.When[SKIN, vd.Vector[vd.f32, 4]],
+) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
+    result = vd.Vector([position, 1.0])
     if INSTANCE:
         result = vd.matmul(instance_transform, result)
     if SKIN:
@@ -24,20 +23,13 @@ def mesh_vertex(
 
 @vd.fragment
 def mesh_fragment(
-    tint: Annotated[vd.vec4[vd.f32], vd.uniform()],
-) -> Annotated[vd.vec4[vd.f32], vd.location(0)]:
+    tint: Annotated[vd.Vector[vd.f32, 4], vd.uniform()],
+) -> vd.Vector[vd.f32, 4]:
     return tint
 
 
 mesh_asset = vd.pipeline_asset(
     id="shaders/variant_mesh",
-    vertex=mesh_vertex,
-    fragment=mesh_fragment,
-    variants=((), (INSTANCE, ), (SKIN, ), (INSTANCE, SKIN)),
-    targets={
-        "opengl": {
-            "glsl_version": 330
-        },
-        "vulkan": {},
-    },
+    program=(mesh_vertex, mesh_fragment),
+    variants=((), (INSTANCE,), (SKIN,), (INSTANCE, SKIN)),
 )

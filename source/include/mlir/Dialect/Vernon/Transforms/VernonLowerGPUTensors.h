@@ -8,7 +8,7 @@ class Pass;
 
 namespace vernon {
 
-std::unique_ptr<Pass> createVernonLowerGPUTensorsPass();
+std::unique_ptr<Pass> createVernonLowerGPUTensorsPass(bool useSpirvTupleAbi = false);
 void registerVernonLowerGPUTensorsPass();
 
 } // namespace vernon

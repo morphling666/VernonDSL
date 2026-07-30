@@ -1,8 +1,15 @@
 """Editor-visible declarations for compiler-recognized DSL intrinsics."""
 
-from typing import Any
+from typing import Any, overload
 
 import numpy as np
+
+from .shader_contracts import DEVICE_ONLY_OPERATION_NAMES
+
+
+def _raise_device_only(name: str) -> Any:
+    assert name in DEVICE_ONLY_OPERATION_NAMES
+    raise TypeError(f"{name} is device-only and cannot execute on host")
 
 
 def sin(value: Any) -> Any:
@@ -11,6 +18,14 @@ def sin(value: Any) -> Any:
 
 def cos(value: Any) -> Any:
     return np.cos(value)
+
+
+def acos(value: Any) -> Any:
+    return np.arccos(value)
+
+
+def atan2(y: Any, x: Any) -> Any:
+    return np.arctan2(y, x)
 
 
 def exp(value: Any) -> Any:
@@ -23,6 +38,10 @@ def log(value: Any) -> Any:
 
 def sqrt(value: Any) -> Any:
     return np.sqrt(value)
+
+
+def floor(value: Any) -> Any:
+    return np.floor(value)
 
 
 def abs(value: Any) -> Any:
@@ -46,8 +65,7 @@ def norm(value: Any) -> Any:
 
 
 def reflect(direction: Any, normal: Any) -> Any:
-    return np.asarray(direction) - 2 * np.dot(direction,
-                                              normal) * np.asarray(normal)
+    return np.asarray(direction) - 2 * np.dot(direction, normal) * np.asarray(normal)
 
 
 def min(left: Any, right: Any) -> Any:
@@ -70,6 +88,80 @@ def matmul(left: Any, right: Any) -> Any:
     return np.matmul(left, right)
 
 
-def texture_sample(texture: Any, sampler: Any, coordinates: Any) -> Any:
-    del texture, sampler, coordinates
-    raise TypeError("texture_sample is device-only and cannot execute on host")
+@overload
+def texture_sample(texture: Any, coordinates: Any) -> Any: ...
+
+
+@overload
+def texture_sample(texture: Any, coordinates: Any, lod: Any) -> Any: ...
+
+
+@overload
+def texture_sample(texture: Any, sampler: Any, coordinates: Any) -> Any: ...
+
+
+@overload
+def texture_sample(texture: Any, sampler: Any, coordinates: Any, lod: Any) -> Any: ...
+
+
+def texture_sample(texture: Any, *arguments: Any) -> Any:
+    del texture, arguments
+    return _raise_device_only("texture_sample")
+
+
+def texture_size(texture: Any, lod: Any | None = None) -> Any:
+    del texture, lod
+    return _raise_device_only("texture_size")
+
+
+def workgroup_storage(element_type: Any, *, shape: tuple[int, ...]) -> Any:
+    del element_type, shape
+    return _raise_device_only("workgroup_storage")
+
+
+def atomic_add(storage: Any, index: int | tuple[int, ...], value: Any) -> Any:
+    del storage, index, value
+    return _raise_device_only("atomic_add")
+
+
+def atomic_min(storage: Any, index: int | tuple[int, ...], value: Any) -> Any:
+    del storage, index, value
+    return _raise_device_only("atomic_min")
+
+
+def atomic_max(storage: Any, index: int | tuple[int, ...], value: Any) -> Any:
+    del storage, index, value
+    return _raise_device_only("atomic_max")
+
+
+def atomic_exchange(storage: Any, index: int | tuple[int, ...], value: Any) -> Any:
+    del storage, index, value
+    return _raise_device_only("atomic_exchange")
+
+
+def workgroup_barrier() -> None:
+    _raise_device_only("workgroup_barrier")
+
+
+def storage_barrier() -> None:
+    _raise_device_only("storage_barrier")
+
+
+def resolution() -> Any:
+    return _raise_device_only("resolution")
+
+
+def fragment_coord() -> Any:
+    return _raise_device_only("fragment_coord")
+
+
+def front_facing() -> Any:
+    return _raise_device_only("front_facing")
+
+
+def vertex_id() -> Any:
+    return _raise_device_only("vertex_id")
+
+
+def instance_id() -> Any:
+    return _raise_device_only("instance_id")

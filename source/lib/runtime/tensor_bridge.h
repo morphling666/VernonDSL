@@ -1,0 +1,45 @@
+#ifndef VERNON_RUNTIME_TENSOR_BRIDGE_H
+#define VERNON_RUNTIME_TENSOR_BRIDGE_H
+
+#include "VernonRuntime.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <vector>
+
+namespace vernon::runtime {
+
+struct ParameterUse;
+
+size_t dataTypeSize(VernonDataType dtype);
+
+bool valueLayoutValid(const VernonValueLayoutView &layout);
+bool valueLayoutsEqual(const VernonValueLayoutView &left, const VernonValueLayoutView &right);
+
+const uint8_t *hostTensorData(const VernonTensorView &tensor);
+
+std::optional<size_t> tensorElementCount(const VernonTensorView &tensor);
+std::optional<size_t> tensorLogicalByteSize(const VernonTensorView &tensor);
+
+bool tensorRequiredSpan(const VernonTensorView &tensor, size_t &span);
+bool tensorFitsAllocation(const VernonTensorView &tensor);
+bool tensorMatchesSpecialization(const VernonTensorView &tensor, const ParameterUse &use);
+
+bool isRowMajorContiguous(const VernonTensorView &tensor);
+
+struct TensorPackingLayout {
+    size_t elementSize{};
+    std::vector<uint64_t> shape;
+    std::vector<size_t> byteStrides;
+    size_t byteSize{};
+    std::vector<size_t> elementLeafOffsets;
+};
+
+std::optional<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, const TensorPackingLayout &layout);
+
+std::optional<std::vector<uint8_t>> packTensorRowMajor(const VernonTensorView &tensor);
+
+} // namespace vernon::runtime
+
+#endif

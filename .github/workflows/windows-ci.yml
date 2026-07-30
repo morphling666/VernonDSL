@@ -1,0 +1,352 @@
+name: Windows CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.9.7"
+  PYTHON_VERSION: "3.11.9"
+  CMAKE_GENERATOR: Visual Studio 17 2022
+
+jobs:
+  style:
+    name: Style
+    runs-on: windows-2022
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Visual Studio Build Tools
+        uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: "[17.0,18.0)"
+          msbuild-architecture: x64
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install style tools
+        run: uv sync --extra build --extra examples --no-install-project --frozen
+
+      - name: Check formatting
+        shell: pwsh
+        run: |
+          $base = "${{ github.event.pull_request.base.sha }}"
+          if (-not $base) {
+            $base = "${{ github.event.before }}"
+          }
+          if (-not $base -or $base -match "^0+$") {
+            $base = "HEAD^"
+          }
+          uv run --frozen --no-sync python scripts/fix_code_style.py --since $base --check
+
+      - name: Run Ruff
+        shell: pwsh
+        run: |
+          uv run --frozen --no-sync ruff check --no-fix examples python scripts
+          uv run --frozen --no-sync ruff format --check examples python scripts
+
+      - name: Measure Python coverage
+        env:
+          PYTHONPATH: python
+        run: |
+          uv run --frozen --no-sync coverage run -m pytest python/tests -q
+          uv run --frozen --no-sync coverage json -o coverage.json
+          uv run --frozen --no-sync python scripts/check_python_coverage.py coverage.json
+          uv run --frozen --no-sync coverage xml -o coverage.xml
+
+      - name: Upload Python coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-python-coverage
+          path: coverage.xml
+          if-no-files-found: error
+          retention-days: 14
+
+  runtime:
+    name: Runtime
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Visual Studio Build Tools
+        uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: "[17.0,18.0)"
+          msbuild-architecture: x64
+
+      - name: Configure Runtime
+        run: >
+          cmake -S source/lib/runtime -B runtime-build
+          -G "${{ env.CMAKE_GENERATOR }}" -A x64
+          -DBUILD_TESTING=ON
+
+      - name: Build Runtime tests
+        run: >
+          cmake --build runtime-build --config Release
+          --target VernonRuntimeTests VernonRuntimeCoreProviderTests VernonRuntimeRHIAdapterTests
+          --parallel 4
+
+      - name: Run Runtime tests
+        run: ctest --test-dir runtime-build -C Release --output-on-failure
+
+      - name: Upload Runtime test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-runtime-test-logs
+          path: runtime-build/Testing/Temporary/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  asan-runtime:
+    name: Runtime (AddressSanitizer)
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Visual Studio Build Tools
+        uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: "[17.0,18.0)"
+          msbuild-architecture: x64
+
+      - name: Configure ASan Runtime
+        run: >
+          cmake -S . -B asan-build
+          -G "${{ env.CMAKE_GENERATOR }}" -A x64
+          -DBUILD_TESTING=ON
+          -DVERNON_BUILD_COMPILER=OFF
+          -DVERNON_ENABLE_PYTHON_BINDINGS=OFF
+          -DVERNON_ENABLE_SANITIZERS=ON
+          -DVERNON_INSTALL_GIT_HOOK=OFF
+
+      - name: Build ASan Runtime tests
+        run: cmake --build asan-build --config Release --parallel 4
+
+      - name: Set up ASan Runtime
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsInstall = & $vswhere -latest -products * -property installationPath
+          $asanRuntime = Get-ChildItem `
+            "$vsInstall\VC\Tools\MSVC\*\bin\Hostx64\x64\clang_rt.asan_dynamic-x86_64.dll" |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $asanRuntime) {
+            throw "MSVC AddressSanitizer runtime DLL was not found"
+          }
+          $asanRuntime.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:detect_leaks=0" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Run ASan Runtime tests
+        run: ctest --test-dir asan-build -C Release --output-on-failure
+
+      - name: Upload ASan test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-asan-test-logs
+          path: asan-build/Testing/Temporary/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  compiler-wheel:
+    name: Compiler and wheel (Python ${{ matrix.python-version }})
+    runs-on: windows-2022
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check out pinned LLVM
+        shell: pwsh
+        run: git submodule update --init --depth 1 llvm-project
+
+      - name: Set up Visual Studio Build Tools
+        uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: "[17.0,18.0)"
+          msbuild-architecture: x64
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Read LLVM revision
+        id: llvm-revision
+        shell: pwsh
+        run: |
+          $revision = git rev-parse HEAD:llvm-project
+          "sha=$revision" >> $env:GITHUB_OUTPUT
+
+      - name: Restore LLVM installation
+        id: llvm-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: llvm-project/install
+          key: windows-x64-llvm-${{ steps.llvm-revision.outputs.sha }}-vs17-libdevice-cu12.9.86-v2
+
+      - name: Install NVIDIA libdevice
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          uv pip install --target llvm-project/nvidia-nvcc `
+            --no-cache nvidia-cuda-nvcc-cu12==12.9.86
+          $libdevice = Resolve-Path `
+            "llvm-project/nvidia-nvcc/nvidia/cuda_nvcc/nvvm/libdevice/libdevice.10.bc"
+          "LIBDEVICE_PATH=$libdevice" >> $env:GITHUB_ENV
+
+      - name: Configure LLVM
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          cmake -S llvm-project/llvm -B llvm-project/build-ci `
+            -G "${{ env.CMAKE_GENERATOR }}" -A x64 `
+            -DLLVM_ENABLE_PROJECTS="mlir;lld" `
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64;NVPTX" `
+            -DLLVM_ENABLE_ASSERTIONS=OFF `
+            -DLLVM_INCLUDE_TESTS=OFF `
+            -DMLIR_INCLUDE_TESTS=OFF `
+            -DLLVM_INCLUDE_EXAMPLES=OFF `
+            -DLLVM_INCLUDE_BENCHMARKS=OFF `
+            -DLLVM_INCLUDE_DOCS=OFF `
+            -DLLVM_INSTALL_UTILS=ON `
+            -DMLIR_NVVM_EMBED_LIBDEVICE=ON `
+            -DMLIR_NVVM_LIBDEVICE_PATH="$env:LIBDEVICE_PATH" `
+            -DCMAKE_INSTALL_PREFIX="$env:GITHUB_WORKSPACE/llvm-project/install"
+
+      - name: Build and install LLVM
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: >
+          cmake --build llvm-project/build-ci
+          --config Release --target install --parallel 4
+
+      - name: Save LLVM installation
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: llvm-project/install
+          key: windows-x64-llvm-${{ steps.llvm-revision.outputs.sha }}-vs17-libdevice-cu12.9.86-v2
+
+      - name: Install Python build environment
+        run: uv sync --extra build --frozen
+
+      - name: Configure VernonDSL
+        shell: pwsh
+        run: |
+          uv run --frozen cmake -S . -B build-ci `
+            -G "${{ env.CMAKE_GENERATOR }}" -A x64 `
+            -DMLIR_DIR="$env:GITHUB_WORKSPACE/llvm-project/install/lib/cmake/mlir" `
+            -DLLD_DIR="$env:GITHUB_WORKSPACE/llvm-project/install/lib/cmake/lld" `
+            -DPython_EXECUTABLE="$env:GITHUB_WORKSPACE/.venv/Scripts/python.exe" `
+            -DVERNON_INSTALL_GIT_HOOK=OFF `
+            -DBUILD_TESTING=ON
+
+      - name: Build VernonDSL tests
+        run: cmake --build build-ci --config Release --parallel 4
+
+      - name: Run VernonDSL tests
+        run: ctest --test-dir build-ci -C Release --output-on-failure
+
+      - name: Run GPU-optional showcase acceptance
+        if: matrix.python-version == '3.11'
+        shell: pwsh
+        env:
+          PYTHONPATH: python
+        run: |
+          uv sync --extra build --extra examples --frozen
+          uv run --frozen --no-sync python scripts/run_showcase_smoke.py `
+            --output-dir build-ci/showcase-smoke `
+            --summary build-ci/showcase-smoke/summary.json
+
+      - name: Upload showcase acceptance results
+        if: always() && matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-showcase-smoke
+          path: build-ci/showcase-smoke
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build clean wheel
+        run: uv build --wheel --no-cache
+
+      - name: Validate wheel metadata
+        run: uvx --from twine twine check dist/*.whl
+
+      - name: Test wheel in a fresh environment
+        shell: pwsh
+        run: |
+          $wheel = (Get-ChildItem dist/*.whl | Select-Object -First 1).FullName
+          $venv = Join-Path $env:RUNNER_TEMP "vernon-wheel"
+          uv venv $venv --python "${{ matrix.python-version }}"
+          uv pip install --python "$venv/Scripts/python.exe" --no-cache $wheel
+          & "$venv/Scripts/python.exe" scripts/verify_installed_wheel.py
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: vernon-lang-windows-python-${{ matrix.python-version }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Compiler test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-compiler-test-logs-python-${{ matrix.python-version }}
+          path: build-ci/Testing/Temporary/*.log
+          if-no-files-found: ignore
+          retention-days: 14

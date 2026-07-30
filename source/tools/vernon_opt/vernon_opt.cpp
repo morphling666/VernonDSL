@@ -7,6 +7,7 @@
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
 
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonConvertGPUToSPIRV.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonCpuPipeline.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonInlineHelpers.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUResources.h"
@@ -37,46 +38,47 @@
 using namespace mlir;
 
 int main(int argc, char **argv) {
-  DialectRegistry registry;
+    DialectRegistry registry;
 
-  // Core
-  registry.insert<func::FuncDialect>();
-  registry.insert<gpu::GPUDialect>();
-  // Standard computation and bufferization dialects used by Vernon programs.
-  registry.insert<arith::ArithDialect>();
-  registry.insert<tensor::TensorDialect>();
-  registry.insert<vector::VectorDialect>();
-  registry.insert<linalg::LinalgDialect>();
-  registry.insert<math::MathDialect>();
-  registry.insert<memref::MemRefDialect>();
-  registry.insert<scf::SCFDialect>();
-  registry.insert<bufferization::BufferizationDialect>();
+    // Core
+    registry.insert<func::FuncDialect>();
+    registry.insert<gpu::GPUDialect>();
+    // Standard computation and bufferization dialects used by Vernon programs.
+    registry.insert<arith::ArithDialect>();
+    registry.insert<tensor::TensorDialect>();
+    registry.insert<vector::VectorDialect>();
+    registry.insert<linalg::LinalgDialect>();
+    registry.insert<math::MathDialect>();
+    registry.insert<memref::MemRefDialect>();
+    registry.insert<scf::SCFDialect>();
+    registry.insert<bufferization::BufferizationDialect>();
 
-  // Your dialect
-  registry.insert<vernon::VernonDialect>();
-  registerAllExtensions(registry);
-  vernon::registerVernonCpuPipelineDialects(registry);
+    // Your dialect
+    registry.insert<vernon::VernonDialect>();
+    registerAllExtensions(registry);
+    vernon::registerVernonCpuPipelineDialects(registry);
 
-  // Target dialect
-  registry.insert<spirv::SPIRVDialect>();
-  func::registerInlinerExtension(registry);
+    // Target dialect
+    registry.insert<spirv::SPIRVDialect>();
+    func::registerInlinerExtension(registry);
 
-  // mlir::registerAllPasses();
-  registerTransformsPasses();
-  mlir::bufferization::registerBufferizationPasses();
-  registerLinalgPasses();
-  memref::registerMemRefPasses();
-  spirv::registerSPIRVPasses();
-  // Register passes
-  vernon::registerVernonValidatePass();
-  vernon::registerVernonInlineHelpersPass();
-  vernon::registerVernonLowerCPUTensorsPass();
-  vernon::registerVernonLowerCPUResourcesPass();
-  vernon::registerVernonCpuPassPipeline();
-  vernon::registerVernonLowerCUDAMathPass();
-  vernon::registerVernonLowerGPUTensorsPass();
-  vernon::registerVernonToGPUPass();
-  vernon::registerVernonToSPIRVPass();
+    // mlir::registerAllPasses();
+    registerTransformsPasses();
+    mlir::bufferization::registerBufferizationPasses();
+    registerLinalgPasses();
+    memref::registerMemRefPasses();
+    spirv::registerSPIRVPasses();
+    // Register passes
+    vernon::registerVernonValidatePass();
+    vernon::registerVernonInlineHelpersPass();
+    vernon::registerVernonLowerCPUTensorsPass();
+    vernon::registerVernonLowerCPUResourcesPass();
+    vernon::registerVernonCpuPassPipeline();
+    vernon::registerVernonConvertGPUToSPIRVPass();
+    vernon::registerVernonLowerCUDAMathPass();
+    vernon::registerVernonLowerGPUTensorsPass();
+    vernon::registerVernonToGPUPass();
+    vernon::registerVernonToSPIRVPass();
 
-  return failed(MlirOptMain(argc, argv, "Vernon optimizer\n", registry));
+    return failed(MlirOptMain(argc, argv, "Vernon optimizer\n", registry));
 }

@@ -1,0 +1,1205 @@
+#include "pipeline_manifest.h"
+#include "pipeline_metadata.h"
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <limits>
+#include <set>
+#include <string_view>
+#include <tuple>
+
+namespace vernon::runtime {
+
+std::optional<VernonTextureDimension> pipelineTextureDimension(const std::string &dimension) {
+    if (dimension == "2d")
+        return VERNON_TEXTURE_2D;
+    if (dimension == "3d")
+        return VERNON_TEXTURE_3D;
+    if (dimension == "cube")
+        return VERNON_TEXTURE_CUBE;
+    return std::nullopt;
+}
+
+std::optional<VernonTextureFormat> pipelineTextureFormat(const std::string &format) {
+    if (format == "rgba8_unorm")
+        return VERNON_TEXTURE_RGBA8_UNORM;
+    if (format == "rgba8_srgb")
+        return VERNON_TEXTURE_RGBA8_SRGB;
+    if (format == "rgba16_float")
+        return VERNON_TEXTURE_RGBA16_FLOAT;
+    if (format == "rgba32_float")
+        return VERNON_TEXTURE_RGBA32_FLOAT;
+    if (format == "r8_unorm")
+        return VERNON_TEXTURE_R8_UNORM;
+    if (format == "r16_float")
+        return VERNON_TEXTURE_R16_FLOAT;
+    if (format == "r32_float")
+        return VERNON_TEXTURE_R32_FLOAT;
+    if (format == "rg8_unorm")
+        return VERNON_TEXTURE_RG8_UNORM;
+    if (format == "rgb8_unorm")
+        return VERNON_TEXTURE_RGB8_UNORM;
+    if (format == "r11g11b10_float")
+        return VERNON_TEXTURE_R11G11B10_FLOAT;
+    return std::nullopt;
+}
+
+namespace {
+
+bool parseUint32(const nlohmann::json &value, uint32_t &result);
+bool hasLegacyManifestKey(const nlohmann::json &value);
+
+template <size_t N> bool hasOnlyKeys(const nlohmann::json &value, const std::string_view (&allowed)[N]) {
+    for (auto row = value.begin(); row != value.end(); ++row)
+        if (std::find(std::begin(allowed), std::end(allowed), row.key()) == std::end(allowed))
+            return false;
+    return true;
+}
+
+constexpr std::string_view kVariantKeys[] = {"key", "program", "parameters", "internal_parameters", "outputs"};
+constexpr std::string_view kExternalParameterKeys[] = {
+    "slot",  "name",           "kind",  "type",          "uses",      "access",
+    "shape", "element_layout", "dtype", "address_space", "dimension", "texture_format",
+};
+constexpr std::string_view kInternalParameterKeys[] = {
+    "name",  "kind",          "type",      "uses",           "access", "shape",        "element_layout",
+    "dtype", "address_space", "dimension", "texture_format", "source", "system_value",
+};
+constexpr std::string_view kParameterUseKeys[] = {
+    "stage",
+    "interface",
+    "index",
+    "entry",
+    "kind",
+    "type",
+    "shape",
+    "access",
+    "address_space",
+    "dimension",
+    "dtype",
+    "uniform_name",
+    "vernon.location",
+    "vernon.instance_divisor",
+    "vernon.set",
+    "vernon.binding",
+    "physical_value_layout",
+    "attribute_leaves",
+    "sampled_texture_bindings",
+    "location_span",
+    "element_strides",
+    "element_offset",
+    "internal_source",
+    "system_value",
+};
+constexpr std::string_view kOutputKeys[] = {"name", "kind", "dtype", "shape", "access", "location", "type"};
+constexpr std::string_view kAttributeLeafKeys[] = {"path",  "location",        "location_offset",
+                                                   "dtype", "component_count", "byte_offset"};
+constexpr std::string_view kSampledTextureBindingKeys[] = {"set", "binding"};
+constexpr std::string_view kPhysicalValueLayoutKeys[] = {"profile",   "transport",    "size",
+                                                         "alignment", "byte_strides", "element_leaf_offsets"};
+
+bool parseUint64(const nlohmann::json &value, uint64_t &result) {
+    if (!value.is_number_integer())
+        return false;
+    if (value.is_number_unsigned()) {
+        result = value.get<uint64_t>();
+        return true;
+    }
+    const int64_t parsed = value.get<int64_t>();
+    if (parsed < 0)
+        return false;
+    result = static_cast<uint64_t>(parsed);
+    return true;
+}
+
+bool parseInt64(const nlohmann::json &value, int64_t &result) {
+    if (value.is_number_unsigned()) {
+        const uint64_t parsed = value.get<uint64_t>();
+        if (parsed > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+            return false;
+        result = static_cast<int64_t>(parsed);
+        return true;
+    }
+    if (!value.is_number_integer())
+        return false;
+    result = value.get<int64_t>();
+    return true;
+}
+
+bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error) {
+    if (!value.is_object()) {
+        error = "pipeline parameter use must be an object";
+        return false;
+    }
+    if (hasLegacyManifestKey(value)) {
+        error = "legacy compiler-generated parameter metadata is unsupported";
+        return false;
+    }
+    if (!hasOnlyKeys(value, kParameterUseKeys)) {
+        error = "pipeline parameter use contains an unknown field";
+        return false;
+    }
+    if (!value.contains("stage") || !value["stage"].is_string() || value["stage"].get<std::string>().empty() ||
+        !value.contains("interface") || !value["interface"].is_string() ||
+        value["interface"].get<std::string>().empty()) {
+        error = "pipeline parameter use is missing stage/interface metadata";
+        return false;
+    }
+    use.stage = value["stage"].get<std::string>();
+    use.interfaceKind = value["interface"].get<std::string>();
+    if (value.contains("uniform_name")) {
+        if (!value["uniform_name"].is_string()) {
+            error = "pipeline parameter use uniform_name must be a string";
+            return false;
+        }
+        use.uniformName = value["uniform_name"].get<std::string>();
+    }
+    if (value.contains("dtype")) {
+        if (!value["dtype"].is_string()) {
+            error = "pipeline parameter use dtype must be a string";
+            return false;
+        }
+        use.dtype = value["dtype"].get<std::string>();
+    }
+    if (value.contains("index")) {
+        if (!parseUint32(value["index"], use.index)) {
+            error = "pipeline parameter use index must be a non-negative integer";
+            return false;
+        }
+    }
+    if (value.contains("vernon.location")) {
+        if (!parseUint32(value["vernon.location"], use.location)) {
+            error = "pipeline parameter use vernon.location must be a non-negative integer";
+            return false;
+        }
+    }
+    if (value.contains("vernon.instance_divisor")) {
+        if (!parseUint32(value["vernon.instance_divisor"], use.divisor) || use.divisor == 0) {
+            error = "pipeline parameter use vernon.instance_divisor must be a positive integer";
+            return false;
+        }
+    }
+    if (value.contains("vernon.set")) {
+        if (!parseUint32(value["vernon.set"], use.descriptorSet)) {
+            error = "pipeline parameter use vernon.set must be a non-negative integer";
+            return false;
+        }
+    }
+    if (value.contains("vernon.binding")) {
+        if (!parseUint32(value["vernon.binding"], use.binding)) {
+            error = "pipeline parameter use vernon.binding must be a non-negative integer";
+            return false;
+        }
+    }
+    if (value.contains("attribute_leaves")) {
+        const nlohmann::json &leaves = value["attribute_leaves"];
+        if (!leaves.is_array()) {
+            error = "attribute_leaves must be an array";
+            return false;
+        }
+        for (const nlohmann::json &leaf : leaves) {
+            if (!leaf.is_object() || hasLegacyManifestKey(leaf) || !hasOnlyKeys(leaf, kAttributeLeafKeys)) {
+                error =
+                    "attribute leaf must contain dtype and unsigned location_offset, component_count, and byte_offset";
+                return false;
+            }
+            uint64_t locationOffset = 0;
+            uint64_t componentCount = 0;
+            uint64_t byteOffset = 0;
+            if (!leaf.contains("location_offset") || !parseUint64(leaf["location_offset"], locationOffset) ||
+                !leaf.contains("component_count") || !parseUint64(leaf["component_count"], componentCount) ||
+                !leaf.contains("byte_offset") || !parseUint64(leaf["byte_offset"], byteOffset) ||
+                !leaf.contains("dtype") || !leaf["dtype"].is_string() || locationOffset > UINT32_MAX ||
+                componentCount > UINT32_MAX || byteOffset > UINT32_MAX) {
+                error =
+                    "attribute leaf must contain dtype and unsigned location_offset, component_count, and byte_offset";
+                return false;
+            }
+            use.attributeLeaves.push_back({static_cast<uint32_t>(locationOffset), leaf["dtype"].get<std::string>(),
+                                           static_cast<uint32_t>(componentCount), static_cast<uint32_t>(byteOffset)});
+        }
+    }
+    if (value.contains("physical_value_layout")) {
+        const nlohmann::json &layout = value["physical_value_layout"];
+        uint64_t size = 0;
+        uint64_t alignment = 0;
+        if (!layout.is_object() || hasLegacyManifestKey(layout) || !hasOnlyKeys(layout, kPhysicalValueLayoutKeys)) {
+            error = "physical_value_layout must contain a supported profile, transport, size, alignment, and "
+                    "byte_strides";
+            return false;
+        }
+        const std::string profile = layout["profile"].get<std::string>();
+        const bool supportedProfile = profile == "host_value" || profile == "cuda_kernel_parameter" ||
+                                      profile == "vulkan_std140_uniform_buffer" ||
+                                      profile == "vulkan_std430_storage_buffer" || profile == "vulkan_push_constant" ||
+                                      profile == "opengl_native_uniform" || profile == "directx_constant_buffer" ||
+                                      profile == "metal_constant_buffer";
+        if (!layout.contains("profile") || !layout["profile"].is_string() || !supportedProfile ||
+            !layout.contains("transport") || !layout["transport"].is_string() || !layout.contains("size") ||
+            !parseUint64(layout["size"], size) || !layout.contains("alignment") ||
+            !parseUint64(layout["alignment"], alignment) || !layout.contains("byte_strides") ||
+            !layout["byte_strides"].is_array()) {
+            error = "physical_value_layout must contain a supported profile, transport, size, alignment, and "
+                    "byte_strides";
+            return false;
+        }
+        PhysicalValueLayout parsed;
+        parsed.profile = profile;
+        parsed.transport = layout["transport"].get<std::string>();
+        parsed.size = size;
+        parsed.alignment = alignment;
+        for (const nlohmann::json &stride : layout["byte_strides"]) {
+            uint64_t byteStride = 0;
+            if (!parseUint64(stride, byteStride)) {
+                error = "physical_value_layout byte strides must be unsigned";
+                return false;
+            }
+            parsed.byteStrides.push_back(byteStride);
+        }
+        if (layout.contains("element_leaf_offsets")) {
+            if (!layout["element_leaf_offsets"].is_array()) {
+                error = "physical_value_layout element leaf offsets must be an array";
+                return false;
+            }
+            for (const nlohmann::json &offset : layout["element_leaf_offsets"]) {
+                uint64_t byteOffset = 0;
+                if (!parseUint64(offset, byteOffset)) {
+                    error = "physical_value_layout element leaf offsets must be unsigned";
+                    return false;
+                }
+                parsed.elementLeafOffsets.push_back(byteOffset);
+            }
+        }
+        if ((parsed.transport != "host_value" && parsed.transport != "kernel_parameter" &&
+             parsed.transport != "push_constant" && parsed.transport != "native_uniform" &&
+             parsed.transport != "uniform_buffer" && parsed.transport != "storage_buffer") ||
+            parsed.size == 0 || parsed.alignment == 0 || (parsed.alignment & (parsed.alignment - 1))) {
+            error = "physical_value_layout contains unsupported physical layout metadata";
+            return false;
+        }
+        use.physicalValueLayout = std::move(parsed);
+    }
+    if (value.contains("sampled_texture_bindings")) {
+        const nlohmann::json &bindings = value["sampled_texture_bindings"];
+        if (!bindings.is_array()) {
+            error = "sampled_texture_bindings must be an array";
+            return false;
+        }
+        for (const nlohmann::json &binding : bindings) {
+            const auto parseBindingIndex = [](const nlohmann::json &field, uint32_t &result) {
+                if (!field.is_number_integer())
+                    return false;
+                const int64_t value = field.get<int64_t>();
+                if (value < 0 || static_cast<uint64_t>(value) > UINT32_MAX)
+                    return false;
+                result = static_cast<uint32_t>(value);
+                return true;
+            };
+            uint32_t descriptorSet = 0;
+            uint32_t descriptorBinding = 0;
+            if (!binding.is_object() || hasLegacyManifestKey(binding) ||
+                !hasOnlyKeys(binding, kSampledTextureBindingKeys) || !binding.contains("set") ||
+                !parseBindingIndex(binding["set"], descriptorSet) || !binding.contains("binding") ||
+                !parseBindingIndex(binding["binding"], descriptorBinding)) {
+                error = "sampled texture binding must contain unsigned set/binding";
+                return false;
+            }
+            use.sampledTextureBindings.push_back({descriptorSet, descriptorBinding});
+        }
+    }
+    if (value.contains("shape")) {
+        if (!value["shape"].is_array()) {
+            error = "pipeline parameter use shape must be an array";
+            return false;
+        }
+        for (const nlohmann::json &dimension : value["shape"]) {
+            uint64_t extent = 0;
+            if (!parseUint64(dimension, extent)) {
+                error = "pipeline parameter use shape must contain unsigned extents";
+                return false;
+            }
+            use.shape.push_back(extent);
+        }
+    }
+    if (value.contains("element_strides") || value.contains("element_offset")) {
+        if (!value.contains("element_strides") || !value["element_strides"].is_array() ||
+            !value.contains("element_offset")) {
+            error = "TensorView specialization requires element_strides and element_offset";
+            return false;
+        }
+        for (const nlohmann::json &strideValue : value["element_strides"]) {
+            int64_t stride = 0;
+            if (!parseInt64(strideValue, stride)) {
+                error = "TensorView element strides must be signed integers";
+                return false;
+            }
+            use.elementStrides.push_back(stride);
+        }
+        uint64_t offset = 0;
+        if (!parseUint64(value["element_offset"], offset)) {
+            error = "TensorView element offset must be a non-negative integer";
+            return false;
+        }
+        use.elementOffset = offset;
+        if (!use.shape.empty() && use.elementStrides.size() != use.shape.size()) {
+            error = "TensorView specialization stride rank does not match shape";
+            return false;
+        }
+    }
+    if (use.physicalValueLayout && use.physicalValueLayout->byteStrides.size() != use.shape.size()) {
+        error = "physical_value_layout byte-stride rank does not match the logical Tensor shape";
+        return false;
+    }
+    return true;
+}
+
+bool parseValueLayout(const nlohmann::json &value, ValueLayout &layout, std::string &error) {
+    uint64_t byteSize = 0;
+    uint64_t alignment = 0;
+    if (!value.is_object() || !value.contains("logical_type") || !value["logical_type"].is_string() ||
+        !value.contains("layout_hash") || !value["layout_hash"].is_string() || !value.contains("byte_size") ||
+        !parseUint64(value["byte_size"], byteSize) || !value.contains("alignment") ||
+        !parseUint64(value["alignment"], alignment) || !value.contains("leaves") || !value["leaves"].is_array() ||
+        !byteSize || !alignment || byteSize > UINT32_MAX || alignment > UINT32_MAX) {
+        error = "element_layout must contain logical_type, layout_hash, byte_size, alignment, and leaves";
+        return false;
+    }
+    layout.logicalType = value["logical_type"].get<std::string>();
+    layout.structName = value.value("struct_name", "");
+    layout.layoutHash = value["layout_hash"].get<std::string>();
+    layout.byteSize = static_cast<uint32_t>(byteSize);
+    layout.alignment = static_cast<uint32_t>(alignment);
+    if (layout.logicalType.empty() || layout.layoutHash.empty() || (layout.alignment & (layout.alignment - 1))) {
+        error = "element_layout contains invalid type, hash, or alignment";
+        return false;
+    }
+    for (const nlohmann::json &leaf : value["leaves"]) {
+        uint64_t scalarCount = 0;
+        uint64_t byteOffset = 0;
+        if (!leaf.is_object() || !leaf.contains("dtype") || !leaf["dtype"].is_string() ||
+            !leaf.contains("scalar_count") || !parseUint64(leaf["scalar_count"], scalarCount) ||
+            !leaf.contains("byte_offset") || !parseUint64(leaf["byte_offset"], byteOffset) || !leaf.contains("path") ||
+            !leaf["path"].is_array() || !scalarCount || scalarCount > UINT32_MAX || byteOffset > UINT32_MAX) {
+            error = "element_layout leaf must contain path, dtype, scalar_count, and byte_offset";
+            return false;
+        }
+        const std::string dtype = leaf["dtype"].get<std::string>();
+        const auto parsedDtype = pipelineDataType(dtype);
+        if (!parsedDtype || byteOffset >= byteSize) {
+            error = "element_layout leaf has unsupported dtype or byte offset";
+            return false;
+        }
+        ValueLeaf parsedLeaf;
+        parsedLeaf.dtype = dtype;
+        parsedLeaf.scalarCount = static_cast<uint32_t>(scalarCount);
+        parsedLeaf.byteOffset = static_cast<uint32_t>(byteOffset);
+        for (const nlohmann::json &component : leaf["path"]) {
+            if (component.is_string())
+                parsedLeaf.path.push_back({component.get<std::string>(), 0});
+            else {
+                uint64_t index = 0;
+                if (!parseUint64(component, index)) {
+                    error = "element_layout leaf path components must be field names or unsigned indices";
+                    return false;
+                }
+                parsedLeaf.path.push_back({std::nullopt, index});
+            }
+        }
+        if (leaf.contains("shape")) {
+            if (!leaf["shape"].is_array()) {
+                error = "element_layout leaf shape must be an array";
+                return false;
+            }
+            uint64_t shapeCount = 1;
+            for (const nlohmann::json &extentValue : leaf["shape"]) {
+                uint64_t extent = 0;
+                if (!parseUint64(extentValue, extent) || !extent ||
+                    shapeCount > std::numeric_limits<uint64_t>::max() / extent) {
+                    error = "element_layout leaf shape must contain positive non-overflowing extents";
+                    return false;
+                }
+                shapeCount *= extent;
+                parsedLeaf.shape.push_back(extent);
+            }
+            if (shapeCount != scalarCount) {
+                error = "element_layout leaf shape does not match scalar_count";
+                return false;
+            }
+        }
+        layout.leaves.push_back(std::move(parsedLeaf));
+        layout.abiLeaves.push_back({static_cast<uint32_t>(*parsedDtype), static_cast<uint32_t>(scalarCount),
+                                    static_cast<uint32_t>(byteOffset)});
+    }
+    if (layout.leaves.empty()) {
+        error = "element_layout must contain at least one semantic leaf";
+        return false;
+    }
+    rebuildValueLayoutPathViews(layout);
+    return true;
+}
+
+bool isScalarLayout(const ValueLayout &layout, const char *dtype) {
+    return layout.leaves.size() == 1 && layout.leaves[0].dtype == dtype && layout.leaves[0].scalarCount == 1 &&
+           layout.leaves[0].byteOffset == 0;
+}
+
+void parseStaticType(const std::string &type, std::string &dtype, std::vector<uint64_t> &shape) {
+    if (type.rfind("tensor<", 0) != 0 || type.size() < 9 || type.back() != '>') {
+        dtype = type;
+        return;
+    }
+    const std::string body = type.substr(7, type.size() - 8);
+    size_t begin = 0;
+    while (true) {
+        const size_t separator = body.find('x', begin);
+        if (separator == std::string::npos) {
+            dtype = body.substr(begin);
+            return;
+        }
+        const std::string dimension = body.substr(begin, separator - begin);
+        if (dimension == "?")
+            shape.push_back(0);
+        else {
+            try {
+                shape.push_back(std::stoull(dimension));
+            } catch (...) {
+                dtype.clear();
+                shape.clear();
+                return;
+            }
+        }
+        begin = separator + 1;
+    }
+}
+
+bool parseUint32(const nlohmann::json &value, uint32_t &result) {
+    if (!value.is_number_integer())
+        return false;
+    if (value.is_number_unsigned()) {
+        const uint64_t parsed = value.get<uint64_t>();
+        if (parsed > UINT32_MAX)
+            return false;
+        result = static_cast<uint32_t>(parsed);
+    } else {
+        const int64_t parsed = value.get<int64_t>();
+        if (parsed < 0 || static_cast<uint64_t>(parsed) > UINT32_MAX)
+            return false;
+        result = static_cast<uint32_t>(parsed);
+    }
+    return true;
+}
+
+bool parseVersion(const nlohmann::json &value, RuntimeVersion &version) {
+    if (!value.is_array() || value.size() != 2 || !parseUint32(value[0], version.major) ||
+        !parseUint32(value[1], version.minor))
+        return false;
+    return version.major != 0;
+}
+
+bool hasOnlyKeys(const nlohmann::json &value, std::initializer_list<std::string_view> allowed) {
+    for (auto row = value.begin(); row != value.end(); ++row)
+        if (std::find(allowed.begin(), allowed.end(), row.key()) == allowed.end())
+            return false;
+    return true;
+}
+
+bool hasLegacyManifestKey(const nlohmann::json &value) {
+    static constexpr std::string_view legacyKeys[] = {"vernon.compiler_generated", "vernon.implicit_sampler",
+                                                      "vernon.system_value"};
+    for (std::string_view key : legacyKeys)
+        if (value.contains(std::string(key)))
+            return true;
+    return false;
+}
+
+enum class LogicalParameterTypeKind { TensorView, Texture, Sampler, Tensor, Struct, Scalar, Invalid };
+
+struct ParsedLogicalParameterType {
+    LogicalParameterTypeKind kind{LogicalParameterTypeKind::Invalid};
+    std::string addressSpace;
+    std::string textureDimension;
+};
+
+bool parseQuotedManifestToken(std::string_view text, size_t &cursor, std::string &token) {
+    if (cursor >= text.size() || text[cursor] != '"')
+        return false;
+    ++cursor;
+    token.clear();
+    while (cursor < text.size()) {
+        if (text[cursor] == '"') {
+            ++cursor;
+            return !token.empty();
+        }
+        token.push_back(text[cursor++]);
+    }
+    return false;
+}
+
+bool parseTensorViewLogicalType(const std::string &type, ParsedLogicalParameterType &parsed) {
+    constexpr std::string_view prefix = "!vernon.tensor_view<";
+    if (type.rfind(prefix, 0) != 0 || type.back() != '>' || type.size() <= prefix.size() + 1)
+        return false;
+    std::string_view body(type.data() + prefix.size(), type.size() - prefix.size() - 1);
+    const size_t shapeOpen = body.find('[');
+    const size_t shapeClose = shapeOpen == std::string_view::npos ? std::string_view::npos : body.find(']', shapeOpen);
+    if (shapeOpen == std::string_view::npos || shapeClose == std::string_view::npos || shapeClose <= shapeOpen + 1)
+        return false;
+    size_t cursor = shapeClose + 1;
+    while (cursor < body.size() && body[cursor] == ' ')
+        ++cursor;
+    if (cursor >= body.size() || body[cursor] != ',')
+        return false;
+    ++cursor;
+    while (cursor < body.size() && body[cursor] == ' ')
+        ++cursor;
+    std::string access;
+    if (!parseQuotedManifestToken(body, cursor, access))
+        return false;
+    if (access != "read" && access != "write" && access != "read_write")
+        return false;
+    while (cursor < body.size() && body[cursor] == ' ')
+        ++cursor;
+    if (cursor >= body.size() || body[cursor] != ',')
+        return false;
+    ++cursor;
+    while (cursor < body.size() && body[cursor] == ' ')
+        ++cursor;
+    if (!parseQuotedManifestToken(body, cursor, parsed.addressSpace))
+        return false;
+    while (cursor < body.size() && body[cursor] == ' ')
+        ++cursor;
+    if (cursor != body.size())
+        return false;
+    if (parsed.addressSpace != "device" && parsed.addressSpace != "workgroup" && parsed.addressSpace != "private")
+        return false;
+    parsed.kind = LogicalParameterTypeKind::TensorView;
+    return true;
+}
+
+bool parseTextureLogicalType(const std::string &type, ParsedLogicalParameterType &parsed) {
+    constexpr std::string_view prefix = "!vernon.texture<";
+    if (type.rfind(prefix, 0) != 0 || type.back() != '>' || type.size() <= prefix.size() + 1)
+        return false;
+    size_t cursor = prefix.size();
+    if (!parseQuotedManifestToken(type, cursor, parsed.textureDimension))
+        return false;
+    while (cursor < type.size() && type[cursor] == ' ')
+        ++cursor;
+    if (cursor >= type.size() || type[cursor] != ',')
+        return false;
+    parsed.kind = LogicalParameterTypeKind::Texture;
+    return true;
+}
+
+ParsedLogicalParameterType parseLogicalParameterType(const std::string &type) {
+    ParsedLogicalParameterType parsed;
+    if (parseTensorViewLogicalType(type, parsed))
+        return parsed;
+    if (parseTextureLogicalType(type, parsed))
+        return parsed;
+    if (type == "!vernon.sampler") {
+        parsed.kind = LogicalParameterTypeKind::Sampler;
+        return parsed;
+    }
+    if ((type.rfind("tensor<", 0) == 0 || type.rfind("vector<", 0) == 0 || type.rfind("!vernon.tensor<", 0) == 0) &&
+        type.back() == '>') {
+        parsed.kind = LogicalParameterTypeKind::Tensor;
+        return parsed;
+    }
+    if ((type.rfind("!vernon.struct<", 0) == 0 || type.rfind("tuple<", 0) == 0) && type.back() == '>') {
+        parsed.kind = LogicalParameterTypeKind::Struct;
+        return parsed;
+    }
+    if (!type.empty() && type.find('<') == std::string::npos)
+        parsed.kind = LogicalParameterTypeKind::Scalar;
+    return parsed;
+}
+
+bool validateParameterKindTypeCoherence(const std::string &kind, const ParsedLogicalParameterType &logicalType,
+                                        std::string &error) {
+    if (logicalType.kind == LogicalParameterTypeKind::Invalid) {
+        error = "pipeline parameter type is not a recognized schema-v5 logical type";
+        return false;
+    }
+    if (kind == "texture") {
+        if (logicalType.kind != LogicalParameterTypeKind::Texture) {
+            error = "texture parameter kind does not match its logical type";
+            return false;
+        }
+        return true;
+    }
+    if (kind == "sampler") {
+        if (logicalType.kind != LogicalParameterTypeKind::Sampler) {
+            error = "sampler parameter kind does not match its logical type";
+            return false;
+        }
+        return true;
+    }
+    if (kind == "tensor") {
+        if (logicalType.kind == LogicalParameterTypeKind::Texture ||
+            logicalType.kind == LogicalParameterTypeKind::Sampler) {
+            error = "tensor parameter kind does not match its logical type";
+            return false;
+        }
+        return true;
+    }
+    error = "pipeline parameter kind must be tensor, texture, or sampler";
+    return false;
+}
+
+bool validateParameterAddressSpace(const std::string &kind, const ParsedLogicalParameterType &logicalType,
+                                   const std::string &addressSpace, std::string &error) {
+    if (logicalType.kind == LogicalParameterTypeKind::TensorView) {
+        if (addressSpace != "device" || logicalType.addressSpace != "device") {
+            error = "pipeline TensorView parameter must use device address space";
+            return false;
+        }
+        return true;
+    }
+    if (!addressSpace.empty()) {
+        error = "non-TensorView parameter contains address_space";
+        return false;
+    }
+    if (kind == "texture" && !logicalType.textureDimension.empty()) {
+        // Dimension is validated separately against the reflected parameter.dimension field.
+    }
+    return true;
+}
+
+} // namespace
+
+void rebuildValueLayoutPathViews(ValueLayout &layout) {
+    for (ValueLeaf &leaf : layout.leaves) {
+        leaf.abiPath.clear();
+        leaf.abiPath.reserve(leaf.path.size());
+        for (const ValuePathComponent &component : leaf.path) {
+            if (component.field)
+                leaf.abiPath.push_back(
+                    {VERNON_VALUE_PATH_FIELD, {component.field->data(), component.field->size()}, 0});
+            else
+                leaf.abiPath.push_back({VERNON_VALUE_PATH_INDEX, {nullptr, 0}, component.index});
+        }
+    }
+}
+
+bool parsePipelineValueLayout(const nlohmann::json &value, ValueLayout &layout, std::string &error) {
+    return parseValueLayout(value, layout, error);
+}
+
+bool Variant::validate(std::string &error) const {
+    const auto validTextureDimension = [](const std::string &dimension) {
+        return dimension == "2d" || dimension == "3d" || dimension == "cube";
+    };
+    const auto validTextureFormat = [](const std::string &format) {
+        return format.empty() || format == "rgba8_unorm" || format == "rgba8_srgb" || format == "rgba16_float" ||
+               format == "rgba32_float" || format == "r8_unorm" || format == "r16_float" || format == "r32_float" ||
+               format == "rg8_unorm" || format == "rgb8_unorm" || format == "r11g11b10_float";
+    };
+    if (!std::is_sorted(key.begin(), key.end()) || std::adjacent_find(key.begin(), key.end()) != key.end()) {
+        error = "pipeline variant feature key is not canonical";
+        return false;
+    }
+    if (!std::is_sorted(parameters.begin(), parameters.end(),
+                        [](const Parameter &left, const Parameter &right) { return left.slot < right.slot; }) ||
+        std::adjacent_find(parameters.begin(), parameters.end(), [](const Parameter &left, const Parameter &right) {
+            return left.slot == right.slot;
+        }) != parameters.end()) {
+        error = "pipeline variant parameter slots are not unique and sorted";
+        return false;
+    }
+    if (!std::is_sorted(internalParameters.begin(), internalParameters.end(),
+                        [](const Parameter &left, const Parameter &right) { return left.name < right.name; }) ||
+        std::adjacent_find(internalParameters.begin(), internalParameters.end(),
+                           [](const Parameter &left, const Parameter &right) { return left.name == right.name; }) !=
+            internalParameters.end()) {
+        error = "pipeline variant internal parameters are not unique and sorted";
+        return false;
+    }
+    for (const Parameter &parameter : parameters) {
+        if (parameter.name.empty() || parameter.uses.empty() || !parameter.source.empty() ||
+            !parameter.systemValue.empty()) {
+            error = "external pipeline parameter invariant failed";
+            return false;
+        }
+        const bool textureConstraintsValid =
+            parameter.kind == "texture"
+                ? validTextureDimension(parameter.dimension) && validTextureFormat(parameter.textureFormat)
+                : parameter.dimension.empty() && parameter.textureFormat.empty();
+        if (!textureConstraintsValid) {
+            error = "pipeline parameter texture constraint invariant failed";
+            return false;
+        }
+        for (const ParameterUse &use : parameter.uses)
+            if (parameter.kind == "tensor" && (use.interfaceKind == "uniform" || use.interfaceKind == "value") &&
+                !use.physicalValueLayout) {
+                error = "packed Tensor value is missing its compiler-planned physical layout";
+                return false;
+            }
+    }
+    for (const Parameter &parameter : internalParameters) {
+        const bool implicitSampler =
+            parameter.source == "implicit_sampler" && parameter.kind == "sampler" && parameter.systemValue.empty();
+        const bool resolution = parameter.source == "system_value" && parameter.systemValue == "resolution" &&
+                                parameter.kind == "tensor" && isScalarLayout(parameter.elementLayout, "f32") &&
+                                parameter.shape == std::vector<uint64_t>{2};
+        if (parameter.name.empty() || parameter.uses.empty() || (!implicitSampler && !resolution)) {
+            error = "internal pipeline parameter invariant failed";
+            return false;
+        }
+        for (const ParameterUse &use : parameter.uses) {
+            if (parameter.kind == "tensor" && (use.interfaceKind == "uniform" || use.interfaceKind == "value") &&
+                !use.physicalValueLayout) {
+                error = "packed Tensor value is missing its compiler-planned physical layout";
+                return false;
+            }
+            if (implicitSampler && use.sampledTextureBindings.empty()) {
+                error = "implicit sampler requires reflected sampled texture bindings";
+                return false;
+            }
+            if (resolution && !use.sampledTextureBindings.empty()) {
+                error = "resolution cannot have sampled texture bindings";
+                return false;
+            }
+        }
+    }
+    using BindingKey = std::tuple<std::string, uint32_t, uint32_t>;
+    std::map<BindingKey, std::pair<std::string, std::string>> descriptorOwners;
+    std::set<BindingKey> textureBindings;
+    std::vector<BindingKey> samplerBindings;
+    const auto validateBindings = [&](const Parameter &parameter) {
+        for (const ParameterUse &use : parameter.uses) {
+            if (program.find(use.stage) == program.end()) {
+                error = "pipeline parameter use references a stage outside its program";
+                return false;
+            }
+            const bool descriptorRequired =
+                (use.interfaceKind == "resource" && (parameter.kind == "tensor" || parameter.kind == "texture")) ||
+                ((use.interfaceKind == "uniform" || use.interfaceKind == "value") && use.physicalValueLayout &&
+                 (use.physicalValueLayout->transport == "uniform_buffer" ||
+                  use.physicalValueLayout->transport == "storage_buffer"));
+            if (descriptorRequired && use.binding == UINT32_MAX) {
+                error = "descriptor-backed pipeline parameter is missing set/binding";
+                return false;
+            }
+            if (use.binding != UINT32_MAX && parameter.kind != "sampler") {
+                BindingKey key{use.stage, use.descriptorSet, use.binding};
+                const auto [found, inserted] = descriptorOwners.emplace(key, std::pair{parameter.name, parameter.kind});
+                if (!inserted && found->second.first != parameter.name) {
+                    error = "pipeline descriptor binding is assigned to multiple parameters";
+                    return false;
+                }
+                if (parameter.kind == "texture")
+                    textureBindings.insert(std::move(key));
+            }
+            if (parameter.kind == "sampler") {
+                if (use.sampledTextureBindings.empty()) {
+                    error = "sampler parameter has no paired sampled texture binding";
+                    return false;
+                }
+                for (const SampledTextureBinding &binding : use.sampledTextureBindings)
+                    samplerBindings.emplace_back(use.stage, binding.descriptorSet, binding.binding);
+            } else if (!use.sampledTextureBindings.empty()) {
+                error = "non-sampler parameter contains sampled texture bindings";
+                return false;
+            }
+        }
+        return true;
+    };
+    for (const Parameter &parameter : parameters)
+        if (!validateBindings(parameter))
+            return false;
+    for (const Parameter &parameter : internalParameters)
+        if (!validateBindings(parameter))
+            return false;
+    for (const BindingKey &binding : samplerBindings)
+        if (textureBindings.find(binding) == textureBindings.end()) {
+            error = "sampler references an unknown sampled texture binding";
+            return false;
+        }
+    const bool computeTopology = !compute.empty() && program.size() == 1;
+    const bool graphicsTopology = compute.empty() && !vertex.empty() && !fragment.empty() && program.size() == 2;
+    if (!computeTopology && !graphicsTopology) {
+        error = "pipeline variant must contain either one compute program or one graphics program";
+        return false;
+    }
+    return true;
+}
+
+bool parseRuntimeRequirements(const nlohmann::json &root, const std::string &target, RuntimeRequirements &requirements,
+                              std::string &error) {
+    if (!root.contains("runtime_requirements")) {
+        error = "pipeline manifest requires runtime_requirements";
+        return false;
+    }
+    const nlohmann::json &value = root["runtime_requirements"];
+    if (!value.is_object() || !value.contains("backend") || !value["backend"].is_string() ||
+        !value.contains("features") || !value["features"].is_array()) {
+        error = "runtime_requirements must contain backend and features";
+        return false;
+    }
+    requirements.backend = value["backend"].get<std::string>();
+    if (requirements.backend != target) {
+        error = "runtime_requirements backend does not match pipeline target";
+        return false;
+    }
+    for (const nlohmann::json &feature : value["features"]) {
+        if (!feature.is_string()) {
+            error = "runtime requirement feature must be a string";
+            return false;
+        }
+        requirements.features.push_back(feature.get<std::string>());
+    }
+    static constexpr std::string_view knownFeatures[] = {"atomics",  "barriers",     "compute",  "instancing",
+                                                         "samplers", "tensor_views", "textures", "workgroup_storage"};
+    if (!std::is_sorted(requirements.features.begin(), requirements.features.end()) ||
+        std::adjacent_find(requirements.features.begin(), requirements.features.end()) != requirements.features.end() ||
+        std::any_of(requirements.features.begin(), requirements.features.end(), [](const std::string &feature) {
+            return std::find(std::begin(knownFeatures), std::end(knownFeatures), feature) == std::end(knownFeatures);
+        })) {
+        error = "runtime requirement features must be known, unique, and sorted";
+        return false;
+    }
+    if (target == "cpu") {
+        if (!hasOnlyKeys(value, {"backend", "features", "target_triple", "object_format"}) ||
+            !value.contains("target_triple") || !value["target_triple"].is_string() ||
+            value["target_triple"].get_ref<const std::string &>().empty() || !value.contains("object_format") ||
+            !value["object_format"].is_string()) {
+            error = "CPU runtime requirements are invalid";
+            return false;
+        }
+        requirements.targetTriple = value["target_triple"].get<std::string>();
+        requirements.objectFormat = value["object_format"].get<std::string>();
+        if ((requirements.objectFormat != "coff" && requirements.objectFormat != "elf" &&
+             requirements.objectFormat != "macho" && requirements.objectFormat != "wasm")) {
+            error = "CPU runtime requirements are invalid";
+            return false;
+        }
+        return true;
+    }
+    if (target == "opengl" || target == "opengles") {
+        if (!hasOnlyKeys(value, {"backend", "features", "glsl_version", "profile", "api_version"}) ||
+            !value.contains("glsl_version") || !parseUint32(value["glsl_version"], requirements.glslVersion) ||
+            !value.contains("profile") || !value["profile"].is_string() || !value.contains("api_version") ||
+            !parseVersion(value["api_version"], requirements.apiVersion)) {
+            error = "OpenGL runtime requirements are invalid";
+            return false;
+        }
+        requirements.profile = value["profile"].get<std::string>();
+        if ((target == "opengles" && requirements.profile != "es") ||
+            (target == "opengl" && requirements.profile != "core" && requirements.profile != "compatibility")) {
+            error = "OpenGL runtime requirement profile does not match target";
+            return false;
+        }
+        if (requirements.glslVersion != glslVersionForApi(requirements.apiVersion)) {
+            error = "OpenGL GLSL and API versions are inconsistent";
+            return false;
+        }
+        return true;
+    }
+    if (target == "vulkan") {
+        if (!hasOnlyKeys(value, {"backend", "features", "api_version", "spirv_version", "compute_workgroup_size"}) ||
+            !value.contains("api_version") || !parseVersion(value["api_version"], requirements.apiVersion) ||
+            !value.contains("spirv_version") || !parseVersion(value["spirv_version"], requirements.shaderVersion)) {
+            error = "Vulkan runtime requirements are invalid";
+            return false;
+        }
+        if (value.contains("compute_workgroup_size")) {
+            const nlohmann::json &workgroup = value["compute_workgroup_size"];
+            if (!workgroup.is_array() || workgroup.size() != 3) {
+                error = "Vulkan compute workgroup requirement must have three dimensions";
+                return false;
+            }
+            for (size_t index = 0; index < 3; ++index) {
+                if (!parseUint32(workgroup[index], requirements.computeWorkgroupSize[index]) ||
+                    requirements.computeWorkgroupSize[index] == 0) {
+                    error = "Vulkan compute workgroup dimensions must be positive";
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    if (target == "directx") {
+        if (!hasOnlyKeys(value, {"backend", "features", "api_version", "minimum_feature_level", "shader_model",
+                                 "root_signature_version", "compute_workgroup_size"}) ||
+            !value.contains("api_version") || !parseVersion(value["api_version"], requirements.apiVersion) ||
+            !value.contains("minimum_feature_level") ||
+            !parseVersion(value["minimum_feature_level"], requirements.minimumFeatureLevel) ||
+            !value.contains("shader_model") || !parseVersion(value["shader_model"], requirements.shaderVersion) ||
+            !value.contains("root_signature_version") ||
+            !parseVersion(value["root_signature_version"], requirements.rootSignatureVersion)) {
+            error = "DirectX runtime requirements are invalid";
+            return false;
+        }
+        if (requirements.apiVersion.major != 12 || requirements.shaderVersion.major < 6 ||
+            requirements.rootSignatureVersion.major != 1) {
+            error = "DirectX runtime requires D3D12, Shader Model 6+, and root signature 1.x";
+            return false;
+        }
+        if (value.contains("compute_workgroup_size")) {
+            const nlohmann::json &workgroup = value["compute_workgroup_size"];
+            if (!workgroup.is_array() || workgroup.size() != 3) {
+                error = "DirectX compute workgroup requirement must have three dimensions";
+                return false;
+            }
+            for (size_t index = 0; index < 3; ++index)
+                if (!parseUint32(workgroup[index], requirements.computeWorkgroupSize[index]) ||
+                    requirements.computeWorkgroupSize[index] == 0) {
+                    error = "DirectX compute workgroup dimensions must be positive";
+                    return false;
+                }
+        }
+        return true;
+    }
+    if (target == "cuda") {
+        if (!hasOnlyKeys(value, {"backend", "features", "ptx_version", "minimum_compute_capability", "address_size"}) ||
+            !value.contains("ptx_version") || !parseVersion(value["ptx_version"], requirements.shaderVersion) ||
+            !value.contains("minimum_compute_capability") ||
+            !parseVersion(value["minimum_compute_capability"], requirements.minimumComputeCapability) ||
+            !value.contains("address_size") || !parseUint32(value["address_size"], requirements.addressSize)) {
+            error = "CUDA runtime requirements are invalid";
+            return false;
+        }
+        if (requirements.addressSize != 32 && requirements.addressSize != 64) {
+            error = "CUDA PTX address size must be 32 or 64";
+            return false;
+        }
+        return true;
+    }
+    error = "runtime requirements are unsupported for pipeline target";
+    return false;
+}
+
+bool runtimeVersionAtLeast(RuntimeVersion actual, RuntimeVersion required) {
+    return actual.major > required.major || (actual.major == required.major && actual.minor >= required.minor);
+}
+
+uint32_t glslVersionForApi(RuntimeVersion apiVersion) { return apiVersion.major * 100 + apiVersion.minor * 10; }
+
+bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &error) {
+    if (!value.is_object() || !value.contains("key") || !value["key"].is_array() || !value.contains("program") ||
+        !value["program"].is_object() || !value.contains("parameters") || !value["parameters"].is_array() ||
+        !value.contains("outputs") || !value["outputs"].is_array()) {
+        error = "pipeline variant tables are invalid";
+        return false;
+    }
+    if (hasLegacyManifestKey(value) || !hasOnlyKeys(value, kVariantKeys)) {
+        error = "pipeline variant contains an unknown or legacy field";
+        return false;
+    }
+    for (const nlohmann::json &feature : value["key"]) {
+        if (!feature.is_string()) {
+            error = "pipeline variant feature is not a string";
+            return false;
+        }
+        variant.key.push_back(feature.get<std::string>());
+    }
+    if (!std::is_sorted(variant.key.begin(), variant.key.end()) ||
+        std::adjacent_find(variant.key.begin(), variant.key.end()) != variant.key.end()) {
+        error = "pipeline variant feature key is not canonical";
+        return false;
+    }
+    auto parseParameter = [&](const nlohmann::json &row, bool internal, Parameter &parameter) {
+        if (!row.is_object() || (!internal && !row.contains("slot")) || !row.contains("name") ||
+            !row["name"].is_string() || row["name"].get_ref<const std::string &>().empty() || !row.contains("kind") ||
+            !row["kind"].is_string() || row["kind"].get_ref<const std::string &>().empty() || !row.contains("type") ||
+            !row["type"].is_string() || row["type"].get_ref<const std::string &>().empty() || !row.contains("access") ||
+            !row["access"].is_string() || !row.contains("shape") || !row["shape"].is_array() || !row.contains("uses") ||
+            !row["uses"].is_array() || (internal && (!row.contains("source") || !row["source"].is_string()))) {
+            error = internal ? "internal pipeline parameter record is invalid" : "pipeline parameter record is invalid";
+            return false;
+        }
+        if (hasLegacyManifestKey(row) ||
+            !(internal ? hasOnlyKeys(row, kInternalParameterKeys) : hasOnlyKeys(row, kExternalParameterKeys))) {
+            error = internal ? "internal pipeline parameter contains an unknown or legacy field"
+                             : "pipeline parameter contains an unknown or legacy field";
+            return false;
+        }
+        if (!internal && !parseUint32(row["slot"], parameter.slot)) {
+            error = "pipeline parameter slot must be a non-negative uint32";
+            return false;
+        }
+        for (std::string_view field : {"name", "kind", "access", "dtype", "address_space", "dimension",
+                                       "texture_format", "source", "system_value"})
+            if (row.contains(std::string(field)) && !row[std::string(field)].is_string()) {
+                error = "pipeline parameter string metadata has an invalid type";
+                return false;
+            }
+        parameter.name = row["name"].get<std::string>();
+        parameter.kind = row["kind"].get<std::string>();
+        parameter.source = row.value("source", "");
+        parameter.systemValue = row.value("system_value", "");
+        parameter.access = row["access"].get<std::string>();
+        parameter.addressSpace = row.value("address_space", "");
+        parameter.dimension = row.value("dimension", "");
+        parameter.textureFormat = row.value("texture_format", "");
+        for (const nlohmann::json &dimension : row["shape"]) {
+            uint64_t extent = 0;
+            if (!parseUint64(dimension, extent)) {
+                error = "pipeline parameter shape must contain unsigned extents";
+                return false;
+            }
+            parameter.shape.push_back(extent);
+        }
+        for (const nlohmann::json &useValue : row["uses"]) {
+            ParameterUse use;
+            if (!parseUse(useValue, use, error))
+                return false;
+            parameter.uses.push_back(std::move(use));
+        }
+        if (parameter.name.empty() || parameter.uses.empty()) {
+            error =
+                internal ? "internal pipeline parameter has no name or uses" : "pipeline parameter has no name or uses";
+            return false;
+        }
+        const std::string logicalType = row["type"].get<std::string>();
+        const ParsedLogicalParameterType parsedType = parseLogicalParameterType(logicalType);
+        if (!validateParameterKindTypeCoherence(parameter.kind, parsedType, error) ||
+            !validateParameterAddressSpace(parameter.kind, parsedType, parameter.addressSpace, error))
+            return false;
+        if (parsedType.kind == LogicalParameterTypeKind::Texture && !parsedType.textureDimension.empty() &&
+            parsedType.textureDimension != parameter.dimension) {
+            error = "texture parameter dimension does not match its logical type";
+            return false;
+        }
+        if (parameter.kind == "texture") {
+            if (!pipelineTextureDimension(parameter.dimension) ||
+                (!parameter.textureFormat.empty() && !pipelineTextureFormat(parameter.textureFormat))) {
+                error = "texture parameter has an invalid dimension or texture_format";
+                return false;
+            }
+        } else if (!parameter.dimension.empty() || !parameter.textureFormat.empty()) {
+            error = "non-texture parameter contains texture constraints";
+            return false;
+        }
+        if (parameter.kind == "tensor") {
+            if (row.contains("dtype") || !row.contains("element_layout") ||
+                !parseValueLayout(row["element_layout"], parameter.elementLayout, error))
+                return false;
+        } else if (row.contains("element_layout")) {
+            error = "non-Tensor parameter contains element_layout";
+            return false;
+        }
+        if (internal) {
+            const bool implicitSampler =
+                parameter.source == "implicit_sampler" && parameter.kind == "sampler" && parameter.systemValue.empty();
+            const bool resolution = parameter.source == "system_value" && parameter.systemValue == "resolution" &&
+                                    parameter.kind == "tensor" && isScalarLayout(parameter.elementLayout, "f32") &&
+                                    parameter.shape == std::vector<uint64_t>{2};
+            if (!implicitSampler && !resolution) {
+                error = "internal pipeline parameter metadata is unsupported";
+                return false;
+            }
+        } else if (!parameter.source.empty() || !parameter.systemValue.empty()) {
+            error = "external pipeline parameter contains internal metadata";
+            return false;
+        }
+        return true;
+    };
+    for (const nlohmann::json &row : value["parameters"]) {
+        Parameter parameter;
+        if (!parseParameter(row, false, parameter))
+            return false;
+        variant.parameters.push_back(std::move(parameter));
+    }
+    const nlohmann::json internalRows = value.value("internal_parameters", nlohmann::json::array());
+    if (!internalRows.is_array()) {
+        error = "internal_parameters must be an array";
+        return false;
+    }
+    for (const nlohmann::json &row : internalRows) {
+        Parameter parameter;
+        if (!parseParameter(row, true, parameter))
+            return false;
+        variant.internalParameters.push_back(std::move(parameter));
+    }
+    std::sort(variant.parameters.begin(), variant.parameters.end(),
+              [](const Parameter &left, const Parameter &right) { return left.slot < right.slot; });
+    if (std::adjacent_find(variant.parameters.begin(), variant.parameters.end(),
+                           [](const Parameter &left, const Parameter &right) { return left.slot == right.slot; }) !=
+        variant.parameters.end()) {
+        error = "pipeline variant contains duplicate parameter slots";
+        return false;
+    }
+    std::sort(variant.internalParameters.begin(), variant.internalParameters.end(),
+              [](const Parameter &left, const Parameter &right) { return left.name < right.name; });
+    if (std::adjacent_find(variant.internalParameters.begin(), variant.internalParameters.end(),
+                           [](const Parameter &left, const Parameter &right) { return left.name == right.name; }) !=
+        variant.internalParameters.end()) {
+        error = "pipeline variant contains duplicate internal parameters";
+        return false;
+    }
+    for (const Parameter &parameter : variant.internalParameters) {
+        if (parameter.source != "implicit_sampler")
+            continue;
+        for (const ParameterUse &use : parameter.uses)
+            if (use.sampledTextureBindings.empty()) {
+                error = "implicit sampler has no paired sampled texture binding";
+                return false;
+            }
+    }
+    for (const nlohmann::json &row : value["outputs"]) {
+        if (!row.is_object() || hasLegacyManifestKey(row) || !hasOnlyKeys(row, kOutputKeys) || !row.contains("name") ||
+            !row["name"].is_string() || row["name"].get_ref<const std::string &>().empty() || !row.contains("kind") ||
+            !row["kind"].is_string() || !row.contains("access") || !row["access"].is_string() ||
+            !row.contains("location")) {
+            error = "pipeline output record is invalid";
+            return false;
+        }
+        Output output;
+        output.name = row["name"].get<std::string>();
+        output.kind = row["kind"].get<std::string>();
+        output.dtype = row.value("dtype", "");
+        output.access = row["access"].get<std::string>();
+        if (!parseUint32(row["location"], output.location)) {
+            error = "pipeline output location must be a non-negative uint32";
+            return false;
+        }
+        if (row.contains("shape")) {
+            if (!row["shape"].is_array()) {
+                error = "pipeline output shape must be an array";
+                return false;
+            }
+            for (const nlohmann::json &dimension : row["shape"]) {
+                uint64_t extent = 0;
+                if (!parseUint64(dimension, extent)) {
+                    error = "pipeline output shape must contain unsigned extents";
+                    return false;
+                }
+                output.shape.push_back(extent);
+            }
+        }
+        if (output.dtype.empty())
+            parseStaticType(row.value("type", ""), output.dtype, output.shape);
+        if (output.name.empty() || output.dtype.empty() || output.location == UINT32_MAX) {
+            error = "pipeline output metadata is incomplete";
+            return false;
+        }
+        variant.outputs.push_back(std::move(output));
+    }
+    for (const auto &[stage, artifact] : value["program"].items()) {
+        if (!artifact.is_string() || artifact.get_ref<const std::string &>().empty()) {
+            error = "pipeline program stage artifact id is invalid";
+            return false;
+        }
+        variant.program.emplace(stage, artifact.get<std::string>());
+        if (stage == "compute")
+            variant.compute = artifact.get<std::string>();
+        else if (stage == "vertex")
+            variant.vertex = artifact.get<std::string>();
+        else if (stage == "fragment")
+            variant.fragment = artifact.get<std::string>();
+        else {
+            error = "pipeline program contains an unknown shader stage";
+            return false;
+        }
+    }
+    if (variant.vertex.empty() != variant.fragment.empty()) {
+        error = "graphics pipeline requires both vertex and fragment stages";
+        return false;
+    }
+    return variant.validate(error);
+}
+
+} // namespace vernon::runtime

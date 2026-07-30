@@ -1,0 +1,65 @@
+"""Pure pipeline bundle planning and serialization."""
+
+from .parameters import (
+    assign_parameter_slots,
+    classify_parameter_use,
+    dtype_and_shape,
+    external_parameters,
+    fragment_outputs,
+    interface_by_location,
+    internal_parameters,
+    merge_internal_parameter_uses,
+    merge_parameter_uses,
+    reflected_parameters,
+    validate_graphics_interfaces,
+)
+from .planner import build_bundle_plan, plan_variant
+from .reflection import (
+    compiled_stage_from_program,
+    parse_reflection_json,
+    select_artifact,
+    select_artifact_bytes,
+    select_entry,
+)
+from .serialize import (
+    canonical_json,
+    content_hash,
+    inline_artifact_descriptor,
+    materialize_bundle,
+    serialize_bundle,
+    with_content_hash,
+)
+from .types import BundlePlan, CompiledArtifact, CompiledStage, PipelineCompileError, TargetOptions, VariantPlan
+
+__all__ = [
+    "BundlePlan",
+    "CompiledArtifact",
+    "CompiledStage",
+    "PipelineCompileError",
+    "TargetOptions",
+    "VariantPlan",
+    "assign_parameter_slots",
+    "build_bundle_plan",
+    "canonical_json",
+    "classify_parameter_use",
+    "compiled_stage_from_program",
+    "content_hash",
+    "dtype_and_shape",
+    "external_parameters",
+    "fragment_outputs",
+    "inline_artifact_descriptor",
+    "interface_by_location",
+    "internal_parameters",
+    "materialize_bundle",
+    "merge_internal_parameter_uses",
+    "merge_parameter_uses",
+    "parse_reflection_json",
+    "plan_variant",
+    "reflected_parameters",
+    "select_artifact",
+    "select_artifact_bytes",
+    "select_entry",
+    "serialize_bundle",
+    "validate_graphics_interfaces",
+    "with_content_hash",
+]

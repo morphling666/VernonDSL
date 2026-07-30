@@ -1,0 +1,3 @@
+CMakeLists.txt text eol=lf
+*.cmake text eol=lf
+.cmake-format text eol=lf

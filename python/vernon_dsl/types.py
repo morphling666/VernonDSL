@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,19 +20,15 @@ def _host_dtype(values: tuple[Any, ...]) -> np.dtype[Any]:
     return np.result_type(*dtypes) if dtypes else np.dtype(np.float32)
 
 
-def _host_tensor(name: str, values: tuple[Any, ...],
-                 shape: tuple[int, ...]) -> np.ndarray[Any, Any]:
+def _host_tensor(name: str, values: tuple[Any, ...], shape: tuple[int, ...]) -> np.ndarray[Any, Any]:
     if not values:
         raise TypeError(f"{name} requires component arguments")
     dtype = _host_dtype(values)
-    components = [
-        np.asarray(value, dtype=dtype).reshape(-1) for value in values
-    ]
+    components = [np.asarray(value, dtype=dtype).reshape(-1) for value in values]
     result = np.concatenate(components)
     expected = int(np.prod(shape))
     if result.size != expected:
-        raise TypeError(
-            f"{name} requires exactly {expected} scalar components")
+        raise TypeError(f"{name} requires exactly {expected} scalar components")
     result = result.reshape(shape)
     result.setflags(write=False)
     return result
@@ -44,78 +41,105 @@ class TypeExpr:
 
 
 class _TypeConstructor:
-
     def __init__(self, name: str):
         self.name = name
 
     def __class_getitem__(cls, arguments: Any) -> TypeExpr:
         if not isinstance(arguments, tuple):
-            arguments = (arguments, )
+            arguments = (arguments,)
         return TypeExpr(cls.__name__, arguments)
 
 
-class Tensor(_TypeConstructor):
-    pass
+@dataclass(frozen=True)
+class _Access:
+    name: str
 
 
-class Array(_TypeConstructor):
-    pass
+read = _Access("read")
+write = _Access("write")
+read_write = _Access("read_write")
 
 
-class Buffer(_TypeConstructor):
-    pass
+@dataclass(frozen=True)
+class _DynamicExtent:
+    def __repr__(self) -> str:
+        return "dyn"
 
 
-class Texture(_TypeConstructor):
-    pass
+dyn = _DynamicExtent()
 
 
 class When(_TypeConstructor):
     pass
 
 
-class vec(_TypeConstructor):
-    pass
+class Tuple(_TypeConstructor):
+    def __new__(cls, *values: Any) -> builtins.tuple[Any, ...]:
+        return builtins.tuple(values)
 
 
-class mat(_TypeConstructor):
-    pass
+class Tensor:
+    """Construct an immutable rectangular host Tensor Value."""
+
+    @classmethod
+    def __class_getitem__(cls, arguments: Any) -> TypeExpr:
+        if not isinstance(arguments, tuple):
+            arguments = (arguments,)
+        return TypeExpr("Tensor", arguments)
+
+    def __new__(cls, values: Any) -> np.ndarray[Any, Any]:
+        def shape_and_values(current: Any) -> tuple[tuple[int, ...], tuple[Any, ...]]:
+            if isinstance(current, np.ndarray):
+                if current.ndim == 0:
+                    return (), (current[()],)
+                return current.shape, tuple(current.reshape(-1))
+            if not isinstance(current, (list, builtins.tuple)):
+                return (), (current,)
+            if not current:
+                raise TypeError("Tensor requires a non-empty rectangular sequence")
+            children = tuple(shape_and_values(value) for value in current)
+            child_shape = children[0][0]
+            if any(shape != child_shape for shape, _ in children[1:]):
+                raise TypeError("Tensor requires a non-empty rectangular sequence")
+            return (len(current), *child_shape), tuple(
+                component for _, components in children for component in components
+            )
+
+        shape, components = shape_and_values(values)
+        if not shape:
+            raise TypeError("Tensor requires a non-empty rectangular sequence")
+        return _host_tensor("Tensor", components, shape)
 
 
-class vec2(_TypeConstructor):
+class Vector:
+    """Construct an immutable rank-one host value from an iterable."""
 
-    def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
-        return _host_tensor("vec2", values, (2, ))
+    @classmethod
+    def __class_getitem__(cls, arguments: Any) -> TypeExpr:
+        if not isinstance(arguments, tuple):
+            arguments = (arguments,)
+        return TypeExpr("Vector", arguments)
 
-
-class vec3(_TypeConstructor):
-
-    def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
-        return _host_tensor("vec3", values, (3, ))
-
-
-class vec4(_TypeConstructor):
-
-    def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
-        return _host_tensor("vec4", values, (4, ))
+    def __new__(cls, values: Any) -> np.ndarray[Any, Any]:
+        components = tuple(values)
+        size = sum(np.asarray(component).size for component in components)
+        return _host_tensor("Vector", components, (size,))
 
 
-class mat2(_TypeConstructor):
+class Matrix:
+    """Construct an immutable rank-two host value from nested iterables."""
 
-    def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
-        return _host_tensor("mat2", values, (2, 2))
+    @classmethod
+    def __class_getitem__(cls, arguments: Any) -> TypeExpr:
+        if not isinstance(arguments, tuple):
+            arguments = (arguments,)
+        return TypeExpr("Matrix", arguments)
 
-
-class mat3(_TypeConstructor):
-
-    def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
-        return _host_tensor("mat3", values, (3, 3))
-
-
-class mat4(_TypeConstructor):
-
-    def __new__(cls, *values: Any) -> np.ndarray[Any, Any]:
-        return _host_tensor("mat4", values, (4, 4))
+    def __new__(cls, values: Any) -> np.ndarray[Any, Any]:
+        rows = tuple(tuple(row) for row in values)
+        if not rows or not rows[0] or any(len(row) != len(rows[0]) for row in rows):
+            raise TypeError("Matrix requires a non-empty rectangular sequence")
+        return _host_tensor("Matrix", tuple(value for row in rows for value in row), (len(rows), len(rows[0])))
 
 
 @dataclass(frozen=True)
@@ -165,8 +189,8 @@ def _annotation(kind: str, *arguments: Any) -> Annotation:
     return Annotation(kind, arguments)
 
 
-def location(index: int) -> Annotation:
-    return _annotation("location", index)
+def attribute(location: int | None = None, divisor: int = 0) -> Annotation:
+    return _annotation("attribute", -1 if location is None else location, divisor)
 
 
 def builtin(name: str) -> Annotation:
@@ -185,8 +209,3 @@ def varying() -> Annotation:
 
 def resource(set: int, binding: int) -> Annotation:
     return _annotation("resource", set, binding)
-
-
-def instance(location: int | None = None, divisor: int = 1) -> Annotation:
-    return _annotation("instance",
-                       *((location, divisor) if location is not None else ()))

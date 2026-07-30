@@ -1,318 +1,39 @@
-if(VERNON_ENABLE_RUNTIME)
-  include(VernonRuntimeTarget.cmake)
-  vernon_add_runtime()
+option(VERNON_ENABLE_PYTHON_BINDINGS "Build the nanobind Python module" ON)
+set(_vernon_gl_context_default OFF)
+if(VERNON_BUILD_RUNTIME
+   AND VERNON_BUILD_COMPILER
+   AND VERNON_ENABLE_PYTHON_BINDINGS)
+    set(_vernon_gl_context_default ON)
+endif()
+option(VERNON_ENABLE_GLFW_CONTEXT_OWNER "Build the Python GLFW OpenGL context-owner module"
+       ${_vernon_gl_context_default})
 
-  if(SKBUILD)
-    install(DIRECTORY "${CMAKE_SOURCE_DIR}/runtime_src/"
-      DESTINATION vernon_dsl/runtime_src
-      COMPONENT VernonWheel)
-    install(FILES
-      "${CMAKE_CURRENT_SOURCE_DIR}/VernonRuntimeTarget.cmake"
-      DESTINATION vernon_dsl/runtime_src/cmake
-      COMPONENT VernonWheel)
-    install(FILES
-      "${CMAKE_CURRENT_SOURCE_DIR}/include/VernonCommon.h"
-      "${CMAKE_CURRENT_SOURCE_DIR}/include/VernonRuntime.h"
-      DESTINATION vernon_dsl/runtime_src/include
-      COMPONENT VernonWheel)
-    install(FILES
-      "${CMAKE_CURRENT_SOURCE_DIR}/include/vernon-c/Common.h"
-      "${CMAKE_CURRENT_SOURCE_DIR}/include/vernon-c/Runtime.h"
-      DESTINATION vernon_dsl/runtime_src/include/vernon-c
-      COMPONENT VernonWheel)
-    install(FILES
-      "${CMAKE_CURRENT_SOURCE_DIR}/lib/VernonRuntime.cpp"
-      DESTINATION vernon_dsl/runtime_src/lib
-      COMPONENT VernonWheel)
-    install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/lib/runtime/"
-      DESTINATION vernon_dsl/runtime_src/lib/runtime
-      COMPONENT VernonWheel
-      FILES_MATCHING PATTERN "*.cpp" PATTERN "*.h")
-  endif()
+set(VERNON_PYTHON_PACKAGE_DIR "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl")
+
+if(VERNON_ENABLE_GLFW_CONTEXT_OWNER)
+    include("${VERNON_REPOSITORY_ROOT}/cmake/IncludeGlfw.cmake")
+    include_glfw()
 endif()
 
-if(NOT VERNON_ENABLE_COMPILER)
-  if(BUILD_TESTING AND VERNON_ENABLE_RUNTIME)
-    include(VernonRuntimeTests.cmake)
-    vernon_add_runtime_tests()
-  endif()
-  return()
+if(VERNON_BUILD_RUNTIME)
+    add_subdirectory(lib/runtime)
+endif()
+if(VERNON_BUILD_COMPILER)
+    add_subdirectory(lib/compiler)
 endif()
 
-add_subdirectory(include/mlir/Dialect/Vernon)
-add_subdirectory(lib/Dialect/Vernon)
-
-if(VERNON_ENABLE_PYTHON_BINDINGS OR BUILD_TESTING)
-  set(vernon_python_components Interpreter)
-  if(VERNON_ENABLE_PYTHON_BINDINGS)
-    list(APPEND vernon_python_components Development.Module)
-  endif()
-  find_package(Python 3.11.9...<3.12
-    COMPONENTS ${vernon_python_components} QUIET)
-endif()
-
-add_library(VernonDSLCompiler SHARED
-  lib/VernonCpuAbiWrapper.cpp
-  lib/VernonCompiler.cpp
-)
-llvm_map_components_to_libnames(VERNON_LLVM_JIT_LIBS
-  AllTargetsAsmParsers
-  AllTargetsCodeGens
-  AllTargetsDescs
-  AllTargetsInfos
-  AsmParser
-  Core
-  OrcJIT
-  Target
-  native
-)
-target_compile_definitions(VernonDSLCompiler PRIVATE
-  VERNON_DSL_COMPILER_BUILD
-)
-if(VERNON_ENABLE_SPIRV_CROSS)
-  target_compile_definitions(VernonDSLCompiler PRIVATE
-    VERNON_HAS_SPIRV_CROSS=1
-  )
-  if(MSVC)
-    target_compile_options(VernonDSLCompiler PRIVATE /EHsc)
-  else()
-    target_compile_options(VernonDSLCompiler PRIVATE -fexceptions)
-  endif()
-endif()
-target_include_directories(VernonDSLCompiler
-  PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
-)
-target_link_libraries(VernonDSLCompiler PRIVATE
-  MLIRArithToLLVM
-  MLIRBufferizationTransforms
-  MLIRControlFlowToLLVM
-  MLIRConvertToLLVMPass
-  MLIRVernonDialect
-  MLIRVernonTransforms
-  MLIRFuncDialect
-  MLIRFuncToLLVM
-  MLIRGPUToSPIRV
-  MLIRGPUPipelines
-  MLIRIR
-  MLIRIndexToLLVM
-  MLIRLinalgTransforms
-  MLIRMathToLLVM
-  MLIRMathToSPIRV
-  MLIRMemRefToLLVM
-  MLIRParser
-  MLIRPass
-  MLIRRegisterAllDialects
-  MLIRRegisterAllExtensions
-  MLIRSCFToControlFlow
-  MLIRSPIRVDialect
-  MLIRSPIRVSerialization
-  MLIRSPIRVTransforms
-  MLIRSupport
-  MLIRToLLVMIRTranslationRegistration
-  MLIRUBToLLVM
-  MLIRVectorToLLVM
-  ${VERNON_LLVM_JIT_LIBS}
-)
-if(WIN32)
-  target_link_libraries(VernonDSLCompiler PRIVATE lldCommon lldCOFF)
-elseif(APPLE)
-  target_link_libraries(VernonDSLCompiler PRIVATE lldCommon lldMachO)
-else()
-  target_link_libraries(VernonDSLCompiler PRIVATE lldCommon lldELF)
-endif()
-if(VERNON_ENABLE_SPIRV_CROSS)
-  target_link_libraries(VernonDSLCompiler PRIVATE
-    spirv-cross-glsl
-    spirv-cross-hlsl
-    spirv-cross-msl
-  )
-endif()
-
-if(SKBUILD)
-  set(_vernon_compiler_runtime_destination vernon_dsl)
-  set(_vernon_compiler_library_destination vernon_dsl)
-else()
-  set(_vernon_compiler_runtime_destination bin)
-  set(_vernon_compiler_library_destination lib)
-endif()
-install(TARGETS VernonDSLCompiler
-  RUNTIME DESTINATION ${_vernon_compiler_runtime_destination}
-    COMPONENT VernonWheel
-  LIBRARY DESTINATION ${_vernon_compiler_library_destination}
-    COMPONENT VernonWheel
-  ARCHIVE DESTINATION lib
-    COMPONENT VernonDevelopment
-)
-install(FILES
-  include/VernonCommon.h
-  include/VernonCompiler.h
-  DESTINATION include)
-install(FILES
-  include/vernon-c/Common.h
-  include/vernon-c/Compiler.h
-  DESTINATION include/vernon-c)
-
-if(VERNON_ENABLE_RUNTIME)
-  if(VERNON_ENABLE_PYTHON_BINDINGS)
-    if(Python_FOUND)
-      execute_process(
-        COMMAND ${Python_EXECUTABLE} -m nanobind --cmake_dir
-        OUTPUT_VARIABLE VERNON_NANOBIND_CMAKE_DIR
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        RESULT_VARIABLE VERNON_NANOBIND_RESULT
-      )
-      if(VERNON_NANOBIND_RESULT EQUAL 0)
-        list(APPEND CMAKE_PREFIX_PATH "${VERNON_NANOBIND_CMAKE_DIR}")
-        find_package(nanobind CONFIG QUIET)
-      endif()
-    endif()
-    if(nanobind_FOUND)
-      nanobind_add_module(vernon-dsl-native python/native_module.cpp)
-      target_link_libraries(vernon-dsl-native PRIVATE
-        VernonDSLCompiler Vernon::Runtime)
-      if(MSVC)
-        target_compile_options(vernon-dsl-native PRIVATE /EHsc)
-      endif()
-      set_target_properties(vernon-dsl-native PROPERTIES OUTPUT_NAME "_native")
-      if(APPLE)
-        set_target_properties(vernon-dsl-native PROPERTIES
-          INSTALL_RPATH "@loader_path")
-      elseif(UNIX)
-        set_target_properties(vernon-dsl-native PROPERTIES
-          INSTALL_RPATH "$ORIGIN")
-      endif()
-      install(TARGETS vernon-dsl-native
-        RUNTIME DESTINATION vernon_dsl COMPONENT VernonWheel
-        LIBRARY DESTINATION vernon_dsl COMPONENT VernonWheel
-      )
-    else()
-      message(STATUS "nanobind not found; skipping vernon_dsl._native")
-    endif()
-  endif()
-endif()
-
-if(BUILD_TESTING AND Python_Interpreter_FOUND)
-  foreach(test_module IN ITEMS test_compiler.py test_shared_definitions.py
-                               test_blinn_phong_numeric.py)
-    string(REPLACE ".py" "" test_name "${test_module}")
-    add_test(NAME "vernon-python-${test_name}"
-      COMMAND ${Python_EXECUTABLE} -m unittest discover
-        -s ${CMAKE_SOURCE_DIR}/python/tests -p ${test_module})
-    set_tests_properties("vernon-python-${test_name}" PROPERTIES
-      ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python")
-  endforeach()
-endif()
-
-add_executable(vernon-compile
-  tools/vernon_compile.cpp
-)
-target_link_libraries(vernon-compile PRIVATE
-  VernonDSLCompiler
-  LLVMSupport
-  LLVMTargetParser
-)
-if(MSVC)
-  target_compile_options(vernon-compile PRIVATE /EHsc)
-endif()
-if(SKBUILD)
-  install(TARGETS vernon-compile
-    RUNTIME DESTINATION vernon_dsl COMPONENT VernonWheel)
-else()
-  install(TARGETS vernon-compile RUNTIME DESTINATION bin)
+if(VERNON_ENABLE_PYTHON_BINDINGS
+   AND TARGET VernonRuntime
+   AND TARGET VernonDSLCompiler)
+    include("${VERNON_REPOSITORY_ROOT}/cmake/VernonPythonBindings.cmake")
+    vernon_add_python_bindings("${VERNON_PYTHON_PACKAGE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
 if(BUILD_TESTING)
-  if(VERNON_ENABLE_RUNTIME)
-    include(VernonRuntimeTests.cmake)
-    vernon_add_runtime_tests()
-  endif()
-  add_executable(vernon-compiler-c-api-test
-    tests/compiler_c_api_test.c
-  )
-  target_link_libraries(vernon-compiler-c-api-test PRIVATE VernonDSLCompiler)
-  add_test(NAME vernon-compiler-c-api-test
-    COMMAND vernon-compiler-c-api-test
-  )
-
-  add_executable(vernon-compiler-cpp-api-test
-    tests/compiler_cpp_api_test.cpp
-  )
-  target_link_libraries(vernon-compiler-cpp-api-test PRIVATE VernonDSLCompiler)
-  add_test(NAME vernon-compiler-cpp-api-test
-    COMMAND vernon-compiler-cpp-api-test
-  )
-  if(VERNON_ENABLE_RUNTIME AND VERNON_ENABLE_VULKAN_RUNTIME)
-    find_package(Python 3.11 EXACT COMPONENTS Interpreter QUIET)
-    if(Python_FOUND)
-      set(VERNON_VULKAN_PIPELINE_TEST_DIR
-        ${CMAKE_CURRENT_BINARY_DIR}/vulkan_pipeline_bundle)
-      set(VERNON_VULKAN_PIPELINE_TEST_MANIFEST
-        ${VERNON_VULKAN_PIPELINE_TEST_DIR}/vulkan_pipeline_bundle.pipeline.json)
-      add_custom_command(
-        OUTPUT ${VERNON_VULKAN_PIPELINE_TEST_MANIFEST}
-        COMMAND ${CMAKE_COMMAND} -E env
-          "PYTHONPATH=${CMAKE_SOURCE_DIR}/python"
-          ${Python_EXECUTABLE} -m vernon_dsl.shader_asset_cli
-          ${CMAKE_SOURCE_DIR}/examples/variant_mesh.shader-pipeline.json
-          --asset-root ${CMAKE_SOURCE_DIR}/examples
-          --compiler $<TARGET_FILE:vernon-compile>
-          --target vulkan
-          --output ${VERNON_VULKAN_PIPELINE_TEST_DIR}
-        DEPENDS vernon-compile
-          ${CMAKE_SOURCE_DIR}/examples/variant_mesh.shader-pipeline.json
-          ${CMAKE_SOURCE_DIR}/examples/variant_mesh.shader-module.json
-          ${CMAKE_SOURCE_DIR}/examples/variant_mesh.py
-          ${CMAKE_SOURCE_DIR}/python/vernon_dsl/shader_assets.py
-        VERBATIM)
-      add_custom_target(vernon-vulkan-pipeline-test-bundle
-        DEPENDS ${VERNON_VULKAN_PIPELINE_TEST_MANIFEST})
-      add_executable(vernon-runtime-vulkan-pipeline-test
-        tests/runtime_vulkan_pipeline_test.cpp)
-      target_link_libraries(vernon-runtime-vulkan-pipeline-test PRIVATE
-        Vernon::Runtime)
-      target_compile_definitions(vernon-runtime-vulkan-pipeline-test
-        PRIVATE
-          VERNON_VULKAN_PIPELINE_BUNDLE="${VERNON_VULKAN_PIPELINE_TEST_MANIFEST}")
-      add_dependencies(vernon-runtime-vulkan-pipeline-test
-        vernon-vulkan-pipeline-test-bundle)
-      add_test(NAME vernon-runtime-vulkan-pipeline-test
-        COMMAND vernon-runtime-vulkan-pipeline-test)
-    endif()
-  endif()
-  if(VERNON_ENABLE_RUNTIME)
-    if(VERNON_ENABLE_VULKAN_RUNTIME)
-      add_executable(vernon-runtime-vulkan-test tests/runtime_vulkan_test.cpp)
-      target_link_libraries(vernon-runtime-vulkan-test PRIVATE
-        VernonDSLCompiler Vernon::Runtime)
-      add_test(NAME vernon-runtime-vulkan-test
-        COMMAND vernon-runtime-vulkan-test)
-    endif()
-  endif()
-endif()
-
-add_subdirectory(tools/vernon_opt)
-
-if(BUILD_TESTING)
-  add_test(NAME vernon-cpu-lowering-integration
-    COMMAND ${CMAKE_COMMAND}
-      "-DVERNON_OPT=$<TARGET_FILE:vernon-opt>"
-      "-DTEST_ROOT=${CMAKE_CURRENT_SOURCE_DIR}/tests/integration"
-      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_cpu_lowering_tests.cmake)
-endif()
-
-if(BUILD_TESTING AND WIN32)
-  add_test(NAME vernon-validation-integration
-    COMMAND powershell -ExecutionPolicy Bypass
-      -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_validation_tests.ps1
-      -VernonOpt $<TARGET_FILE:vernon-opt>)
-  add_test(NAME vernon-python-native-integration
-    COMMAND powershell -ExecutionPolicy Bypass
-      -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_frontend_integration.ps1
-      -ProjectRoot ${CMAKE_SOURCE_DIR}
-      -BinaryDir ${CMAKE_CURRENT_BINARY_DIR}
-      -VernonOpt $<TARGET_FILE:vernon-opt>
-      -VernonCompiler $<TARGET_FILE:vernon-compile>
-  )
+    find_package(
+        Python 3.11...<3.15
+        COMPONENTS Interpreter
+        QUIET)
+    include("${VERNON_REPOSITORY_ROOT}/cmake/VernonTests.cmake")
+    vernon_add_tests()
 endif()

@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
@@ -22,165 +23,156 @@ namespace {
 
 constexpr StringLiteral kTextureHelperName = "__vernon_cpu_texture_sample";
 
-struct BufferLoadPattern final : OpConversionPattern<IntrinsicOp> {
-  using OpConversionPattern::OpConversionPattern;
+FailureOr<Value> physicalIndex(Operation *operation, ValueRange indices) {
+    if (!operation->hasAttr(kPhysicalIndexAttrName) || indices.empty())
+        return failure();
+    return indices.front();
+}
 
-  LogicalResult
-  matchAndRewrite(IntrinsicOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    if (classifyCpuIntrinsic(op.getName()) != CpuIntrinsicKind::BufferLoad)
-      return failure();
-    if (adaptor.getOperands().size() != 2 || op.getNumResults() != 1)
-      return rewriter.notifyMatchFailure(
-          op, "buffer_load expects a buffer, index, and one result");
-    rewriter.replaceOpWithNewOp<memref::LoadOp>(op, adaptor.getOperands()[0],
-                                                adaptor.getOperands()[1]);
-    return success();
-  }
+struct BufferLoadPattern final : OpConversionPattern<LoadOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(LoadOp op, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
+        FailureOr<Value> index = physicalIndex(op, adaptor.getIndices());
+        if (failed(index))
+            return rewriter.notifyMatchFailure(op, "cannot project TensorView indices");
+        rewriter.replaceOpWithNewOp<memref::LoadOp>(op, adaptor.getStorage(), *index);
+        return success();
+    }
 };
 
-struct BufferStorePattern final : OpConversionPattern<IntrinsicOp> {
-  using OpConversionPattern::OpConversionPattern;
+struct BufferStorePattern final : OpConversionPattern<StoreOp> {
+    using OpConversionPattern::OpConversionPattern;
 
-  LogicalResult
-  matchAndRewrite(IntrinsicOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    if (classifyCpuIntrinsic(op.getName()) != CpuIntrinsicKind::BufferStore)
-      return failure();
-    if (adaptor.getOperands().size() != 3 || op.getNumResults() != 0)
-      return rewriter.notifyMatchFailure(
-          op, "buffer_store expects a buffer, index, value, and no result");
-    rewriter.replaceOpWithNewOp<memref::StoreOp>(op, adaptor.getOperands()[2],
-                                                 adaptor.getOperands()[0],
-                                                 adaptor.getOperands()[1]);
-    return success();
-  }
+    LogicalResult matchAndRewrite(StoreOp op, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
+        FailureOr<Value> index = physicalIndex(op, adaptor.getIndices());
+        if (failed(index))
+            return rewriter.notifyMatchFailure(op, "cannot project TensorView indices");
+        rewriter.replaceOpWithNewOp<memref::StoreOp>(op, adaptor.getValue(), adaptor.getStorage(), *index);
+        return success();
+    }
+};
+
+struct AtomicPattern final : OpConversionPattern<AtomicOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(AtomicOp op, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
+        auto storage = dyn_cast<MemRefType>(adaptor.getStorage().getType());
+        if (!storage)
+            return rewriter.notifyMatchFailure(op, "atomic TensorView did not lower to a memref");
+        arith::AtomicRMWKind kind = op.getAtomicKind() == "add"    ? arith::AtomicRMWKind::addi
+                                    : op.getAtomicKind() == "min"  ? arith::AtomicRMWKind::mins
+                                    : op.getAtomicKind() == "max"  ? arith::AtomicRMWKind::maxs
+                                    : op.getAtomicKind() == "umin" ? arith::AtomicRMWKind::minu
+                                    : op.getAtomicKind() == "umax" ? arith::AtomicRMWKind::maxu
+                                                                   : arith::AtomicRMWKind::assign;
+        FailureOr<Value> index = physicalIndex(op, adaptor.getIndices());
+        if (failed(index))
+            return rewriter.notifyMatchFailure(op, "cannot project TensorView atomic indices");
+        rewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(op, kind, adaptor.getValue(), adaptor.getStorage(), *index);
+        return success();
+    }
 };
 
 struct TextureSamplePattern final : OpConversionPattern<IntrinsicOp> {
-  using OpConversionPattern::OpConversionPattern;
+    using OpConversionPattern::OpConversionPattern;
 
-  LogicalResult
-  matchAndRewrite(IntrinsicOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    if (classifyCpuIntrinsic(op.getName()) != CpuIntrinsicKind::TextureSample)
-      return failure();
-    if (op.getNumResults() != 1)
-      return rewriter.notifyMatchFailure(
-          op, "texture_sample expects exactly one result");
+    LogicalResult matchAndRewrite(IntrinsicOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        if (classifyCpuIntrinsic(op.getName()) != CpuIntrinsicKind::TextureSample)
+            return failure();
+        if (op.getNumResults() != 1)
+            return rewriter.notifyMatchFailure(op, "texture_sample expects exactly one result");
 
-    Type resultType = getTypeConverter()->convertType(op.getResult().getType());
-    if (!resultType)
-      return rewriter.notifyMatchFailure(op,
-                                         "texture_sample result is not legal");
-    auto module = op->getParentOfType<ModuleOp>();
-    auto function = op->getParentOfType<func::FuncOp>();
-    if (!module || !function)
-      return rewriter.notifyMatchFailure(
-          op, "texture_sample must be nested in a function and module");
+        Type resultType = getTypeConverter()->convertType(op.getResult().getType());
+        if (!resultType)
+            return rewriter.notifyMatchFailure(op, "texture_sample result is not legal");
+        auto module = op->getParentOfType<ModuleOp>();
+        auto function = op->getParentOfType<func::FuncOp>();
+        if (!module || !function)
+            return rewriter.notifyMatchFailure(op, "texture_sample must be nested in a function and module");
 
-    SmallVector<Type> inputTypes;
-    for (Value operand : adaptor.getOperands())
-      inputTypes.push_back(operand.getType());
-    Value callbacks = function.getArguments().back();
-    inputTypes.push_back(callbacks.getType());
-    FunctionType helperType =
-        FunctionType::get(op.getContext(), inputTypes, {resultType});
+        SmallVector<Type> inputTypes;
+        for (Value operand : adaptor.getOperands())
+            inputTypes.push_back(operand.getType());
+        Value callbacks = function.getArguments().back();
+        inputTypes.push_back(callbacks.getType());
+        FunctionType helperType = FunctionType::get(op.getContext(), inputTypes, {resultType});
 
-    func::FuncOp helper = module.lookupSymbol<func::FuncOp>(kTextureHelperName);
-    if (!helper) {
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToStart(module.getBody());
-      helper = func::FuncOp::create(rewriter, op.getLoc(), kTextureHelperName,
-                                    helperType);
-      helper.setPrivate();
-    } else if (helper.getFunctionType() != helperType) {
-      return op.emitError()
-             << "CPU texture helper has incompatible type "
-             << helper.getFunctionType() << "; expected " << helperType;
+        func::FuncOp helper = module.lookupSymbol<func::FuncOp>(kTextureHelperName);
+        if (!helper) {
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(module.getBody());
+            helper = func::FuncOp::create(rewriter, op.getLoc(), kTextureHelperName, helperType);
+            helper.setPrivate();
+        } else if (helper.getFunctionType() != helperType) {
+            return op.emitError() << "CPU texture helper has incompatible type " << helper.getFunctionType()
+                                  << "; expected " << helperType;
+        }
+
+        SmallVector<Value> helperOperands(adaptor.getOperands());
+        helperOperands.push_back(callbacks);
+        rewriter.replaceOpWithNewOp<func::CallOp>(op, helper.getSymName(), TypeRange{resultType}, helperOperands);
+        return success();
     }
-
-    SmallVector<Value> helperOperands(adaptor.getOperands());
-    helperOperands.push_back(callbacks);
-    rewriter.replaceOpWithNewOp<func::CallOp>(
-        op, helper.getSymName(), TypeRange{resultType}, helperOperands);
-    return success();
-  }
 };
 
-struct VernonLowerCPUResourcesPass final
-    : PassWrapper<VernonLowerCPUResourcesPass, OperationPass<ModuleOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VernonLowerCPUResourcesPass)
+struct VernonLowerCPUResourcesPass final : PassWrapper<VernonLowerCPUResourcesPass, OperationPass<ModuleOp>> {
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VernonLowerCPUResourcesPass)
 
-  StringRef getArgument() const final { return "vernon-lower-cpu-resources"; }
-  StringRef getDescription() const final {
-    return "Lower Vernon CPU resources to memrefs and integer handles";
-  }
+    StringRef getArgument() const final { return "vernon-lower-cpu-resources"; }
+    StringRef getDescription() const final { return "Lower Vernon CPU resources to memrefs and integer handles"; }
 
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<arith::ArithDialect, cf::ControlFlowDialect,
-                    func::FuncDialect, index::IndexDialect, LLVM::LLVMDialect,
-                    math::MathDialect, memref::MemRefDialect, scf::SCFDialect,
-                    tensor::TensorDialect, vector::VectorDialect>();
-  }
-
-  void runOnOperation() override {
-    MLIRContext *context = &getContext();
-    Type callbackType = LLVM::LLVMPointerType::get(context);
-    for (func::FuncOp function : getOperation().getOps<func::FuncOp>()) {
-      if (!function->hasAttr("vernon.entry"))
-        continue;
-      SmallVector<Type> inputs(function.getArgumentTypes());
-      inputs.push_back(callbackType);
-      function.setType(
-          FunctionType::get(context, inputs, function.getResultTypes()));
-      function.getBody().front().addArgument(callbackType, function.getLoc());
-      function.setPrivate();
+    void getDependentDialects(DialectRegistry &registry) const override {
+        registry.insert<arith::ArithDialect, cf::ControlFlowDialect, func::FuncDialect, index::IndexDialect,
+                        LLVM::LLVMDialect, math::MathDialect, memref::MemRefDialect, scf::SCFDialect,
+                        tensor::TensorDialect, vector::VectorDialect>();
     }
 
-    TypeConverter converter;
-    converter.addConversion([](Type type) { return type; });
-    converter.addConversion([](BufferType type) -> Type {
-      return MemRefType::get({ShapedType::kDynamic}, type.getElementType());
-    });
-    converter.addConversion(
-        [&](TextureType) -> Type { return IntegerType::get(context, 64); });
-    converter.addConversion(
-        [&](SamplerType) -> Type { return IntegerType::get(context, 64); });
+    void runOnOperation() override {
+        MLIRContext *context = &getContext();
+        Type callbackType = LLVM::LLVMPointerType::get(context);
+        for (func::FuncOp function : getOperation().getOps<func::FuncOp>()) {
+            if (!function->hasAttr("vernon.entry"))
+                continue;
+            SmallVector<Type> inputs(function.getArgumentTypes());
+            inputs.push_back(callbackType);
+            function.setType(FunctionType::get(context, inputs, function.getResultTypes()));
+            function.getBody().front().addArgument(callbackType, function.getLoc());
+            function.setPrivate();
+        }
 
-    RewritePatternSet patterns(context);
-    patterns.add<BufferLoadPattern, BufferStorePattern, TextureSamplePattern>(
-        converter, context);
-    populateFunctionOpInterfaceTypeConversionPattern(
-        func::FuncOp::getOperationName(), patterns, converter);
+        TypeConverter converter;
+        converter.addConversion([](Type type) { return type; });
+        converter.addConversion(
+            [](TensorViewType type) -> Type { return MemRefType::get({ShapedType::kDynamic}, type.getElementType()); });
+        converter.addConversion([&](TextureType) -> Type { return IntegerType::get(context, 64); });
+        converter.addConversion([&](SamplerType) -> Type { return IntegerType::get(context, 64); });
 
-    ConversionTarget target(*context);
-    target.addLegalOp<ModuleOp>();
-    target.addLegalDialect<arith::ArithDialect, cf::ControlFlowDialect,
-                           index::IndexDialect, math::MathDialect,
-                           memref::MemRefDialect, scf::SCFDialect,
-                           tensor::TensorDialect, vector::VectorDialect>();
-    target.addDynamicallyLegalDialect<func::FuncDialect>(
-        [&](Operation *operation) { return converter.isLegal(operation); });
-    target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp function) {
-      return converter.isSignatureLegal(function.getFunctionType());
-    });
-    target.addIllegalDialect<VernonDialect>();
+        RewritePatternSet patterns(context);
+        patterns.add<BufferLoadPattern, BufferStorePattern, AtomicPattern, TextureSamplePattern>(converter, context);
+        populateFunctionOpInterfaceTypeConversionPattern(func::FuncOp::getOperationName(), patterns, converter);
 
-    if (failed(
-            applyFullConversion(getOperation(), target, std::move(patterns))))
-      signalPassFailure();
-  }
+        ConversionTarget target(*context);
+        target.addLegalOp<ModuleOp>();
+        target.addLegalDialect<arith::ArithDialect, cf::ControlFlowDialect, index::IndexDialect, math::MathDialect,
+                               LLVM::LLVMDialect, memref::MemRefDialect, scf::SCFDialect, tensor::TensorDialect,
+                               vector::VectorDialect>();
+        target.addDynamicallyLegalDialect<func::FuncDialect>(
+            [&](Operation *operation) { return converter.isLegal(operation); });
+        target.addDynamicallyLegalOp<func::FuncOp>(
+            [&](func::FuncOp function) { return converter.isSignatureLegal(function.getFunctionType()); });
+        target.addIllegalDialect<VernonDialect>();
+
+        if (failed(applyFullConversion(getOperation(), target, std::move(patterns))))
+            signalPassFailure();
+    }
 };
 
 } // namespace
 
-std::unique_ptr<Pass> createVernonLowerCPUResourcesPass() {
-  return std::make_unique<VernonLowerCPUResourcesPass>();
-}
+std::unique_ptr<Pass> createVernonLowerCPUResourcesPass() { return std::make_unique<VernonLowerCPUResourcesPass>(); }
 
-void registerVernonLowerCPUResourcesPass() {
-  PassRegistration<VernonLowerCPUResourcesPass>();
-}
+void registerVernonLowerCPUResourcesPass() { PassRegistration<VernonLowerCPUResourcesPass>(); }
 
 } // namespace mlir::vernon

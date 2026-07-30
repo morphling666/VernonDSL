@@ -1,4 +1,4 @@
-module {
+module attributes {vernon.compiler_contract_version = 5 : i64, vernon.pipeline_version = 8 : i64} {
   func.func @noop(
       %value: f32 {
         vernon.interface = "input",
