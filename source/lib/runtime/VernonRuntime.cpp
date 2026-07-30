@@ -659,8 +659,13 @@ VernonStatus vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline, const V
         vernonRhiCommandEncoderFinish(pipeline->context->rhiDevice, native) != VERNON_RHI_STATUS_OK)
         status = fail(pipeline->context, "failed to finish the immediate command encoder");
     if (status == VERNON_STATUS_OK &&
-        vernonRhiDeviceSubmit(pipeline->context->rhiDevice, native) != VERNON_RHI_STATUS_OK)
-        status = fail(pipeline->context, "failed to submit the immediate command encoder");
+        vernonRhiDeviceSubmit(pipeline->context->rhiDevice, native) != VERNON_RHI_STATUS_OK) {
+        const VernonStringView detail = vernonRhiDeviceGetLastError(pipeline->context->rhiDevice);
+        std::string error = "failed to submit the immediate command encoder";
+        if (detail.data && detail.size)
+            error.append(": ").append(detail.data, detail.size);
+        status = fail(pipeline->context, std::move(error));
+    }
     vernonRhiDeviceDestroyCommandEncoder(pipeline->context->rhiDevice, native);
     return status;
 }

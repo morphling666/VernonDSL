@@ -396,24 +396,23 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
             if (!stage || stage.getValue() != "compute")
                 continue;
             uint64_t totalPhysical = 0;
-            for (Operation &operation : function.front()) {
-                auto allocation = dyn_cast<WorkgroupAllocOp>(operation);
-                if (!allocation)
-                    continue;
+            function.walk([&](WorkgroupAllocOp allocation) {
                 TensorViewType view = allocation.getResult().getType();
                 FailureOr<WorkgroupPhysicalStoragePlan> plan = getWorkgroupPhysicalStoragePlan(view, module);
                 if (failed(plan)) {
                     allocation.emitError("workgroup allocation has an invalid physical storage plan");
                     invalid = true;
-                    continue;
+                    return;
                 }
-                if (plan->totalPhysicalBytes > kPortableWorkgroupStorageLimit - totalPhysical) {
+                if (totalPhysical > kPortableWorkgroupStorageLimit ||
+                    plan->totalPhysicalBytes > kPortableWorkgroupStorageLimit - totalPhysical) {
                     allocation.emitError(
                         "combined workgroup storage exceeds the portable 16 KiB workgroup storage limit");
                     invalid = true;
+                    return;
                 }
                 totalPhysical += plan->totalPhysicalBytes;
-            }
+            });
         }
 
         getOperation().walk([&](Operation *operation) {

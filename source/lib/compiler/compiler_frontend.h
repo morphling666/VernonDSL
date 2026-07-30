@@ -33,6 +33,7 @@ using PreparedModulePtr = std::unique_ptr<PreparedModule>;
 
 CompilerFrontend *createCompilerFrontend();
 void destroyCompilerFrontend(CompilerFrontend *frontend);
+mlir::MLIRContext &compilerMlirContext(CompilerFrontend &frontend);
 
 VernonStatus prepareMlir(CompilerFrontend &frontend, const char *source, size_t sourceSize, PreparedModulePtr &prepared,
                          std::vector<Artifact> &artifacts, std::string &reflection, std::string &diagnostics);

@@ -1,4 +1,4 @@
-module attributes {vernon.compiler_contract_version = 6 : i64, vernon.pipeline_version = 9 : i64} {
+module attributes {vernon.compiler_contract_version = 7 : i64, vernon.pipeline_version = 10 : i64} {
   func.func @sample_2d(
       %texture: !vernon.texture<"2d", f32> {
         vernon.interface = "resource",

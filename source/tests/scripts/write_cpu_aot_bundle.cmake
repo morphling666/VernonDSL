@@ -103,9 +103,8 @@ set(PIPELINE_CANONICAL
 \"leaves\":[{\"byte_offset\":0,\"dtype\":\"f32\",\"path\":[],\"scalar_count\":1}],\
 \"logical_type\":\"f32\"},\"kind\":\"tensor\",\"name\":\"output\",\"shape\":[12],\"slot\":0,\
 \"type\":\"!vernon.tensor_view<f32, [12], \\\"write\\\", \\\"device\\\">\",\
-\"uses\":[{\"access\":\"write\",\
-\"dtype\":\"f32\",\"entry\":\"fill\",\"index\":0,\"interface\":\"storage\",\
-\"kind\":\"tensor\",\"shape\":[12],\"stage\":\"compute\"}]}],\
+\"uses\":[{\"dtype\":\"f32\",\"index\":0,\"interface\":\"storage\",\
+\"shape\":[12],\"stage\":\"compute\"}]}],\
 \"program\":{\"compute\":\"fill\"}}]}")
 string(SHA256 PIPELINE_HASH "${PIPELINE_CANONICAL}")
 string(

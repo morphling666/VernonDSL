@@ -2,6 +2,7 @@
 #include "VernonExecutionGraph.h"
 #include "VernonRHI.h"
 #include "VernonRuntime.h"
+#include "compiler_python_bridge.h"
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/array.h>
@@ -39,6 +40,36 @@ struct Compiler {
 
     VernonCompilerContext *context{};
 };
+
+nb::list planValueAbi(const std::string &moduleText, const std::vector<std::string> &logicalDtypes) {
+    std::vector<VernonStringView> dtypes;
+    dtypes.reserve(logicalDtypes.size());
+    for (const std::string &dtype : logicalDtypes)
+        dtypes.push_back({dtype.data(), dtype.size()});
+    std::unique_ptr<VernonPythonValueAbiPlan, decltype(&vernonCompilerDestroyPythonValueAbiPlan)> plan(
+        vernonCompilerPlanPythonValueAbi({moduleText.data(), moduleText.size()}, dtypes.data(), dtypes.size()),
+        &vernonCompilerDestroyPythonValueAbiPlan);
+    if (!plan)
+        throw std::bad_alloc();
+    const VernonPythonValueAbiPlanView view = vernonCompilerGetPythonValueAbiPlanView(plan.get());
+    if (view.status != VERNON_STATUS_OK) {
+        const std::string diagnostics = stringView(view.diagnostics);
+        throw std::invalid_argument(diagnostics.empty() ? "native Value ABI planning failed" : diagnostics);
+    }
+
+    nb::list nodes;
+    for (size_t index = 0; index < view.node_count; ++index) {
+        const VernonPythonValueAbiNodeView &node = view.nodes[index];
+        std::vector<uint64_t> offsets;
+        if (node.field_count)
+            offsets.assign(node.field_offsets, node.field_offsets + node.field_count);
+        nb::object elementStride = nb::none();
+        if (node.has_element_stride)
+            elementStride = nb::int_(node.element_stride);
+        nodes.append(nb::make_tuple(node.byte_size, node.alignment, std::move(offsets), std::move(elementStride)));
+    }
+    return nodes;
+}
 
 struct RhiHostState;
 struct Runtime;
@@ -1275,6 +1306,7 @@ NB_MODULE(_native, module) {
         .value("MIRRORED_REPEAT", VERNON_RHI_ADDRESS_MIRRORED_REPEAT);
     module.attr("IMAGE_COLOR_ATTACHMENT") = static_cast<uint32_t>(VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
     module.attr("IMAGE_DEPTH_STENCIL_ATTACHMENT") = static_cast<uint32_t>(VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT);
+    module.def("_plan_value_abi", &planValueAbi, nb::arg("module"), nb::arg("logical_dtypes"));
     nb::class_<Compiler>(module, "Compiler")
         .def(nb::init<>())
         .def("compile_program_result", &compileProgramResult, nb::arg("mlir"), nb::arg("target"),

@@ -550,7 +550,10 @@ class PipelineCompileTests(unittest.TestCase):
                 "element_layout": _scalar_layout("f32"),
                 "shape": [4],
                 "access": "read_write",
-                "uses": [{key: value for key, value in use.items() if key != "element_layout"} for use in uses],
+                "uses": [
+                    {"stage": "compute", "index": 0, "dtype": "f32", "shape": [4], "interface": "storage"},
+                    {"stage": "vertex", "index": 1, "dtype": "f32", "shape": [4], "interface": "input"},
+                ],
             },
         )
 

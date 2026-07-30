@@ -5,9 +5,11 @@ import tempfile
 import unittest
 import weakref
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import vernon_dsl as vd
+import vernon_dsl._native as native
 from vernon_dsl import CompileError, Compiler, compile_source
 from vernon_dsl._runtime.resources import (
     _dispatch_borrow_scope,
@@ -16,6 +18,7 @@ from vernon_dsl._runtime.resources import (
 )
 from vernon_dsl.compiler import FrontendCompileRequest
 from vernon_dsl.frontend.analysis import typed_model_data
+from vernon_dsl.host_values import host_abi_layout
 
 
 @vd.struct(shared=True)
@@ -32,6 +35,13 @@ class NestedRecord:
 
 
 class TensorStorageRuntimeTests(unittest.TestCase):
+    def test_nested_host_layout_uses_one_complete_native_plan(self) -> None:
+        with mock.patch.object(native, "_plan_value_abi", wraps=native._plan_value_abi) as planner:
+            layout = host_abi_layout(NestedRecord)
+
+        self.assertEqual(planner.call_count, 1)
+        self.assertEqual(layout.size, 40)
+
     def test_logical_collection_shape_uses_value_structure(self) -> None:
         tuple_type = vd.Tuple[vd.i32, vd.f32]
         first = (vd.i32(1), vd.f32(2.0))

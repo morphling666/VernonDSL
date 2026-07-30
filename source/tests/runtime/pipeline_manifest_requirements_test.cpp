@@ -4,6 +4,8 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
+#include <string_view>
+
 namespace {
 
 using vernon::runtime::parseRuntimeRequirements;
@@ -240,6 +242,13 @@ TEST(PipelineManifestRequirements, RejectsUnknownAndLegacyVariantRecords) {
     manifest = validTensorVariant();
     manifest["parameters"][0]["uses"][0]["unknown"] = true;
     EXPECT_FALSE(vernon::runtime::parseVariant(manifest, variant, error));
+
+    for (std::string_view retired : {"entry", "kind", "type", "access", "address_space", "dimension", "location_span",
+                                     "internal_source", "system_value"}) {
+        manifest = validTensorVariant();
+        manifest["parameters"][0]["uses"][0][retired] = "retired";
+        EXPECT_FALSE(vernon::runtime::parseVariant(manifest, variant, error)) << retired;
+    }
 
     manifest = validTensorVariant();
     manifest["parameters"][0]["vernon.compiler_generated"] = true;

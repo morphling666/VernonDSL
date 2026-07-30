@@ -6,7 +6,7 @@ from typing import Iterable
 from ..language.stage_registry import GRAPHICS_STAGES
 from ..language.syntax import INTRINSIC_METHODS
 from ..shader_contracts import ATOMIC_OPERATION_NAMES, BUILTIN_CONTRACTS, GENERATED_INTERFACE_CONTRACTS, TypeContract
-from .abi import attribute_layout, value_abi_layout
+from .abi import attribute_layout, value_leaves
 from .aggregate_lowering import lower_aggregate_constructor, lower_tuple
 from .control_flow_lowering import (
     emit_source_block,
@@ -353,8 +353,8 @@ class _FunctionEmitter:
         def fields(name: str) -> tuple[tuple[str, DslType], ...]:
             return tuple((field_name, annotation.type) for field_name, annotation in self.context.structs[name])
 
-        layout = value_abi_layout(value_type, fields)
-        leaf_dtypes = ", ".join(f'"{leaf.dtype}"' for leaf in layout.leaves)
+        leaves = value_leaves(value_type, fields)
+        leaf_dtypes = ", ".join(f'"{leaf.dtype}"' for leaf in leaves)
         return [f"vernon.abi_leaf_dtypes = [{leaf_dtypes}]"]
 
     def _append_generated_arguments(self, arguments: list[str]) -> None:

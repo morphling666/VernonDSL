@@ -2,6 +2,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
@@ -88,7 +89,14 @@ struct LowerSynchronizationPass final : PassWrapper<LowerSynchronizationPass, Op
                     op.emitError("workgroup allocation must be inside a GPU function");
                     return signalPassFailure();
                 }
+                const unsigned attributionIndex = function.getNumWorkgroupAttributions();
                 replacement = function.addWorkgroupAttribution(memref, op.getLoc());
+                // Aggregate leaves can be vectorized after this pass.  Give
+                // shared globals the maximum portable vector alignment so an
+                // adjacent byte-sized leaf cannot leave a vector load based
+                // at only scalar alignment on NVPTX.
+                function.setWorkgroupAttributionAttr(attributionIndex, LLVM::LLVMDialect::getAlignAttrName(),
+                                                     rewriter.getI64IntegerAttr(16));
             } else {
                 rewriter.setInsertionPoint(op);
                 replacement = memref::AllocaOp::create(rewriter, op.getLoc(), memref);

@@ -270,6 +270,45 @@ class AggregateRecord:
     pair: vd.Tuple[vd.i32, vd.f32]
 
 
+@vd.struct
+class PaddedWorkgroupRecord:
+    valid: vd.bool
+    payload: AggregateRecord
+
+
+@vd.kernel(workgroup_size=(4, 1, 1))
+def aggregate_workgroup_values(
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    lane_id: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("local_invocation_id")],
+    group_id: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("workgroup_id")],
+) -> None:
+    shared = vd.workgroup_storage(PaddedWorkgroupRecord, shape=(2, 3))
+    lane = lane_id[0]
+    group = group_id[0]
+    if lane == 0:
+        for column in range(0, 3):
+            value = vd.i32(group) * 100 + vd.i32(column)
+            shared[1, column] = PaddedWorkgroupRecord(
+                True,
+                AggregateRecord(
+                    vd.Vector([vd.f32(value), vd.f32(value) + 0.5]),
+                    (value + 10, vd.f32(value) + 0.25),
+                ),
+            )
+    vd.workgroup_barrier()
+    column = lane
+    if lane == 3:
+        column = vd.u32(0)
+    loaded = shared[1, column]
+    payload = loaded.payload
+    offset = (group * 4 + lane) * 4
+    if loaded.valid:
+        output[offset] = payload.vector[0]
+        output[offset + 1] = payload.vector[1]
+        output[offset + 2] = vd.f32(payload.pair[0])
+        output[offset + 3] = payload.pair[1]
+
+
 @vd.func
 def early_record(flag: vd.bool) -> AggregateRecord:
     if flag:
@@ -440,6 +479,30 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                     previous = np.sort(result[group * 4 : group * 4 + 4])
                     np.testing.assert_array_equal(previous, np.arange(base, base + 4, dtype=np.int32))
                     self.assertEqual(result[8 + group], base + 4)
+
+    def test_aggregate_workgroup_backend_parity(self) -> None:
+        backends = [
+            architecture
+            for architecture in (vd.cuda, vd.vulkan, vd.opengl, vd.directx)
+            if self._runtime_available(architecture)
+        ]
+        if not backends:
+            self.skipTest("no aggregate workgroup backend is available")
+
+        expected = np.empty(32, dtype=np.float32)
+        for group in range(2):
+            for lane in range(4):
+                column = lane if lane < 3 else 0
+                value = group * 100 + column
+                offset = (group * 4 + lane) * 4
+                expected[offset : offset + 4] = (value, value + 0.5, value + 10, value + 0.25)
+
+        for backend in backends:
+            with self.subTest(backend=backend.name):
+                vd.init(arch=backend)  # type: ignore[arg-type]
+                output = vd.storage.zeros(dtype=vd.f32, shape=(32,))
+                aggregate_workgroup_values(output, grid=(8, 1, 1))
+                np.testing.assert_allclose(output.to_numpy(), expected, rtol=0.0, atol=0.0)
 
     def test_rank_three_tensor_operators(self) -> None:
         actual = self._run_tensor_operators(vd.cpu)

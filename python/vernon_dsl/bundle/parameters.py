@@ -261,6 +261,19 @@ def merge_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[s
         parameter["element_layout"] = element_layout
     else:
         parameter["dtype"] = representative.get("dtype")
+    for use in normalized:
+        for key in (
+            "entry",
+            "kind",
+            "type",
+            "access",
+            "address_space",
+            "dimension",
+            "internal_source",
+            "system_value",
+            "location_span",
+        ):
+            use.pop(key, None)
     return {key: value for key, value in parameter.items() if value is not None}
 
 
