@@ -2,6 +2,7 @@
 #include "VernonVersions.h"
 #include "compiler_target_test_utils.h"
 
+#include <cstring>
 #include <gtest/gtest.h>
 #include <stdio.h>
 #include <string.h>
