@@ -150,12 +150,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--cuda",
         choices=("auto", "on", "off"),
         default="auto",
-        help="enable NVPTX when libdevice is found, require it, or disable it (default: auto)",
+        help="discover libdevice and add NVPTX automatically, require libdevice, or disable discovery (default: auto)",
     )
     parser.add_argument("--libdevice", type=Path, help="explicit path to libdevice.10.bc")
     parser.add_argument(
         "--targets",
-        help="override LLVM targets (comma- or semicolon-separated); NVPTX is still controlled by --cuda",
+        help="override LLVM targets (comma- or semicolon-separated); Native resolves to the host target",
     )
     parser.add_argument("--build", action="store_true", help="build and install LLVM after configuring")
     parser.add_argument("--parallel", type=int, default=os.cpu_count() or 1, help="parallel build jobs")
@@ -185,14 +185,20 @@ def main(argv: list[str] | None = None) -> int:
             "CUDA was requested, but libdevice.10.bc was not found; pass --libdevice PATH or set CUDA_PATH/CUDA_HOME"
         )
 
-    if args.targets:
-        targets = [item for item in args.targets.replace(",", ";").split(";") if item]
+    explicit_targets = bool(args.targets)
+    if explicit_targets:
+        targets = [
+            llvm_host_target if item.lower() == "native" else item
+            for item in args.targets.replace(",", ";").split(";")
+            if item
+        ]
     else:
         targets = [llvm_host_target]
     if libdevice and "NVPTX" not in targets:
         targets.append("NVPTX")
-    if not libdevice:
+    if not libdevice and not explicit_targets:
         targets = [target for target in targets if target != "NVPTX"]
+    targets = list(dict.fromkeys(targets))
 
     command = [
         "cmake",

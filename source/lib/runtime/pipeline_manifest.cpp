@@ -922,6 +922,26 @@ bool parseRuntimeRequirements(const nlohmann::json &root, const std::string &tar
         }
         return true;
     }
+    if (target == "metal") {
+        if (!hasOnlyKeys(value, {"backend", "features", "apple_platform", "msl_version", "minimum_os_version"}) ||
+            !value.contains("apple_platform") || !value["apple_platform"].is_string() ||
+            !value.contains("msl_version") || !parseVersion(value["msl_version"], requirements.shaderVersion) ||
+            !value.contains("minimum_os_version") ||
+            !parseVersion(value["minimum_os_version"], requirements.minimumOsVersion)) {
+            error = "Metal runtime requirements are invalid";
+            return false;
+        }
+        requirements.applePlatform = value["apple_platform"].get<std::string>();
+        const RuntimeVersion minimumSupported =
+            requirements.applePlatform == "ios" ? RuntimeVersion{15, 0} : RuntimeVersion{11, 0};
+        if ((requirements.applePlatform != "macos" && requirements.applePlatform != "ios") ||
+            requirements.shaderVersion.major != 2 || requirements.shaderVersion.minor != 4 ||
+            !runtimeVersionAtLeast(requirements.minimumOsVersion, minimumSupported)) {
+            error = "Metal runtime requirements contain an unsupported Apple platform or version";
+            return false;
+        }
+        return true;
+    }
     if (target == "directx") {
         if (!hasOnlyKeys(value, {"backend", "features", "api_version", "minimum_feature_level", "shader_model",
                                  "root_signature_version", "compute_workgroup_size"}) ||

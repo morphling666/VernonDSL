@@ -54,6 +54,11 @@ def _parser() -> argparse.ArgumentParser:
         help="HLSL Shader Model for directx only (default: 60), encoded as major*10+minor",
     )
     parser.add_argument(
+        "--apple-platform",
+        choices=("macos", "ios"),
+        help="Apple platform for cooked Metal MSL only (default: macos); this does not cross-build the Runtime",
+    )
+    parser.add_argument(
         "--target-triple",
         metavar="TRIPLE",
         help=(
@@ -86,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         for name, value in (
             ("glsl_version", arguments.glsl_version),
             ("hlsl_shader_model", arguments.hlsl_shader_model),
+            ("apple_platform", arguments.apple_platform),
             ("target_triple", arguments.target_triple),
             ("cpu", arguments.cpu),
             ("cpu_features", arguments.cpu_features),

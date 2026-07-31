@@ -189,6 +189,10 @@ if(TARGET VernonRuntime)
         target_link_libraries(VernonRuntimeTests PRIVATE Vernon::RHI Vulkan::Headers)
     endif()
 
+    if(VERNON_ENABLE_METAL_RUNTIME)
+        target_sources(VernonRuntimeTests PRIVATE runtime/runtime_metal_test.cpp)
+    endif()
+
     if(VERNON_ENABLE_DIRECTX12_RUNTIME)
         target_sources(VernonRuntimeTests PRIVATE runtime/runtime_directx12_test.cpp
                                                   rhi/directx12_native_interop_test.cpp)

@@ -5,11 +5,34 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../cmake/VernonVersions.cmake")
 else()
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VernonVersions.cmake")
 endif()
+set(_vernon_is_ios OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_OSX_SYSROOT MATCHES "(^|/)(iphoneos|iphonesimulator)(\\.sdk)?$")
+    set(_vernon_is_ios ON)
+endif()
+if(APPLE OR _vernon_is_ios)
+    set(_vernon_preproject_metal_default ON)
+    if(DEFINED VERNON_RUNTIME_PROFILE
+       AND NOT
+           VERNON_RUNTIME_PROFILE
+           STREQUAL
+           "desktop"
+       AND NOT (_vernon_is_ios AND VERNON_RUNTIME_PROFILE STREQUAL "mobile"))
+        set(_vernon_preproject_metal_default OFF)
+    endif()
+    option(VERNON_ENABLE_METAL_RUNTIME "Enable the Metal backend" ${_vernon_preproject_metal_default})
+endif()
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    project(
-        VernonRuntime
-        VERSION ${VERNON_PROJECT_VERSION}
-        LANGUAGES C CXX)
+    if((APPLE OR _vernon_is_ios) AND VERNON_ENABLE_METAL_RUNTIME)
+        project(
+            VernonRuntime
+            VERSION ${VERNON_PROJECT_VERSION}
+            LANGUAGES C CXX OBJCXX)
+    else()
+        project(
+            VernonRuntime
+            VERSION ${VERNON_PROJECT_VERSION}
+            LANGUAGES C CXX)
+    endif()
     set(CMAKE_CXX_STANDARD
         17
         CACHE STRING "C++ standard to conform to")
@@ -26,8 +49,12 @@ if(NOT
                         "Vernon release version (${VERNON_RELEASE_VERSION})")
 endif()
 
+set(_vernon_default_runtime_profile desktop)
+if(_vernon_is_ios)
+    set(_vernon_default_runtime_profile mobile)
+endif()
 set(VERNON_RUNTIME_PROFILE
-    "desktop"
+    "${_vernon_default_runtime_profile}"
     CACHE STRING "Runtime platform profile: desktop, mobile, or web")
 set_property(
     CACHE VERNON_RUNTIME_PROFILE
@@ -40,6 +67,20 @@ if(NOT
    MATCHES
    "^(desktop|mobile|web)$")
     message(FATAL_ERROR "VERNON_RUNTIME_PROFILE must be desktop, mobile, or web")
+endif()
+if(_vernon_is_ios
+   AND NOT
+       CMAKE_SOURCE_DIR
+       STREQUAL
+       CMAKE_CURRENT_SOURCE_DIR)
+    message(FATAL_ERROR "iOS is supported only when VernonRuntime is configured as the standalone project")
+endif()
+if(_vernon_is_ios
+   AND NOT
+       VERNON_RUNTIME_PROFILE
+       STREQUAL
+       "mobile")
+    message(FATAL_ERROR "iOS requires VERNON_RUNTIME_PROFILE=mobile")
 endif()
 
 set(_vernon_default_library_type SHARED)
@@ -55,6 +96,22 @@ if(NOT
    MATCHES
    "^(SHARED|STATIC)$")
     message(FATAL_ERROR "VERNON_RUNTIME_LIBRARY_TYPE must be SHARED or STATIC")
+endif()
+if(_vernon_is_ios
+   AND NOT
+       VERNON_RUNTIME_LIBRARY_TYPE
+       STREQUAL
+       "STATIC")
+    message(FATAL_ERROR "iOS requires VERNON_RUNTIME_LIBRARY_TYPE=STATIC")
+endif()
+if(_vernon_is_ios)
+    if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+        set(CMAKE_OSX_DEPLOYMENT_TARGET
+            "15.0"
+            CACHE STRING "Minimum iOS deployment target" FORCE)
+    elseif(CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS "15.0")
+        message(FATAL_ERROR "The Vernon iOS Runtime requires CMAKE_OSX_DEPLOYMENT_TARGET=15.0 or newer")
+    endif()
 endif()
 
 set(_vernon_default_desktop_backend OFF)
@@ -78,6 +135,11 @@ else()
         CACHE BOOL "Enable the CUDA Driver backend" FORCE)
 endif()
 option(VERNON_ENABLE_VULKAN_RUNTIME "Enable the Vulkan backend" ${_vernon_default_desktop_backend})
+if(NOT APPLE AND NOT _vernon_is_ios)
+    set(VERNON_ENABLE_METAL_RUNTIME
+        OFF
+        CACHE BOOL "Enable the Metal backend" FORCE)
+endif()
 if(WIN32)
     option(VERNON_ENABLE_DIRECTX12_RUNTIME "Enable the DirectX 12 backend" ${_vernon_default_desktop_backend})
 else()
@@ -92,9 +154,15 @@ if(VERNON_RUNTIME_PROFILE STREQUAL "web")
     set(VERNON_ENABLE_VULKAN_RUNTIME
         OFF
         CACHE BOOL "" FORCE)
+    set(VERNON_ENABLE_METAL_RUNTIME
+        OFF
+        CACHE BOOL "" FORCE)
     set(VERNON_ENABLE_DIRECTX12_RUNTIME
         OFF
         CACHE BOOL "" FORCE)
+endif()
+if(_vernon_is_ios AND NOT VERNON_ENABLE_METAL_RUNTIME)
+    message(FATAL_ERROR "The packaged iOS Runtime requires VERNON_ENABLE_METAL_RUNTIME=ON")
 endif()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../include/VernonRuntime.h")
@@ -118,9 +186,31 @@ endif()
 include("${_vernon_runtime_target_file}")
 vernon_add_runtime()
 
+option(VERNON_BUILD_IOS_METAL_SMOKE_HOST "Build the iOS Metal RHI smoke-test application" OFF)
+if(VERNON_BUILD_IOS_METAL_SMOKE_HOST)
+    if(NOT _vernon_is_ios
+       OR NOT
+          CMAKE_SOURCE_DIR
+          STREQUAL
+          CMAKE_CURRENT_SOURCE_DIR)
+        message(FATAL_ERROR "VERNON_BUILD_IOS_METAL_SMOKE_HOST is available only in standalone iOS Runtime builds")
+    endif()
+    add_executable(VernonIosMetalSmoke MACOSX_BUNDLE "${_VERNON_RUNTIME_IMPL_DIR}/tests/ios_metal_smoke.mm")
+    target_link_libraries(VernonIosMetalSmoke PRIVATE Vernon::RHI)
+    set_target_properties(
+        VernonIosMetalSmoke
+        PROPERTIES MACOSX_BUNDLE_BUNDLE_NAME "Vernon Metal Smoke"
+                   MACOSX_BUNDLE_GUI_IDENTIFIER "dev.vernon.runtime.metal-smoke"
+                   XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "dev.vernon.runtime.metal-smoke"
+                   XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"
+                   XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED "NO")
+endif()
+
 # The combined build registers tests after compiler and Python targets exist. Register here only when Runtime is
 # configured as a standalone project.
-if(BUILD_TESTING AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+if(BUILD_TESTING
+   AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR
+   AND NOT _vernon_is_ios)
     include("${VERNON_REPOSITORY_ROOT}/cmake/VernonTests.cmake")
     vernon_add_tests()
 endif()
@@ -173,6 +263,7 @@ if(SKBUILD)
         COMPONENT VernonWheel
         FILES_MATCHING
         PATTERN "*.cpp"
+        PATTERN "*.mm"
         PATTERN "*.h")
     install(
         DIRECTORY "${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/"
@@ -187,6 +278,7 @@ if(SKBUILD)
         COMPONENT VernonWheel
         FILES_MATCHING
         PATTERN "*.cpp"
+        PATTERN "*.mm"
         PATTERN "*.h")
     install(
         DIRECTORY "${_VERNON_RUNTIME_IMPL_DIR}/../platform/"

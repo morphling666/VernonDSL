@@ -7,6 +7,16 @@ from typing import Any, Mapping, Sequence
 from .types import CompiledArtifact, CompiledStage, PipelineCompileError, TargetOptions
 
 
+def _normalized_target_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    result = dict(options)
+    if result.get("glsl_version") == 0:
+        result.pop("glsl_version")
+    for name in ("target_triple", "cpu", "cpu_features"):
+        if result.get(name) == "":
+            result.pop(name)
+    return result
+
+
 def parse_reflection_json(reflection: str | bytes | Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(reflection, Mapping):
         return dict(reflection)
@@ -74,6 +84,9 @@ def compiled_stage_from_program(
     artifact_format = artifact_row.get("format")
     if not isinstance(artifact_format, str) or not artifact_format:
         raise PipelineCompileError("compiler artifact format is invalid")
+    reflected_options = reflection.get("target_options")
+    if isinstance(reflected_options, Mapping):
+        target = TargetOptions(target.target, _normalized_target_options(reflected_options))
     return CompiledStage(
         module,
         module_manifest,

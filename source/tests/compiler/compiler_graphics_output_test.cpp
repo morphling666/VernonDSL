@@ -281,6 +281,26 @@ TEST(CompilerGraphicsOutput, PreservesInterfacesTexturesAndSwizzles) {
         } else {
             output = artifacts(result);
         }
+        if (target == VERNON_TARGET_METAL) {
+            const VernonStringView reflection = vernonCompileResultGetReflection(result);
+            const auto reflected = nlohmann::json::parse(reflection.data, reflection.data + reflection.size);
+            ASSERT_TRUE(reflected.contains("metal_resource_slots"));
+            const auto &slots = reflected["metal_resource_slots"];
+            auto hasSlot = [&](std::string_view entry, std::string_view kind, uint32_t set, uint32_t binding,
+                               uint32_t index) {
+                return std::any_of(slots.begin(), slots.end(), [&](const nlohmann::json &slot) {
+                    return slot.value("entry_point", "") == entry && slot.value("kind", "") == kind &&
+                           slot.value("set", UINT32_MAX) == set && slot.value("binding", UINT32_MAX) == binding &&
+                           slot.value("index", UINT32_MAX) == index && slot.value("count", 0u) == 1;
+                });
+            };
+            EXPECT_TRUE(hasSlot("cube_map_fragment", "sampled_image", 0, 0, 0)) << slots.dump();
+            EXPECT_TRUE(hasSlot("cube_map_fragment", "sampler", 0, 0, 0)) << slots.dump();
+            EXPECT_NE(output.find("[[texture(0)]]"), std::string::npos);
+            EXPECT_NE(output.find("[[sampler(0)]]"), std::string::npos);
+            for (uint32_t index = 0; index < 3; ++index)
+                EXPECT_NE(output.find("[[buffer(" + std::to_string(index) + ")]]"), std::string::npos) << output;
+        }
         for (std::string_view name : {"aPos", "TexCoord", "cubeMap", "color", "bloom_color"}) {
             if (output.find(name) == std::string::npos) {
                 std::fprintf(stderr, "target %d missing %.*s\n", static_cast<int>(target),

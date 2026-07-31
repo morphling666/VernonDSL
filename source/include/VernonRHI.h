@@ -62,7 +62,8 @@ typedef enum VernonRhiBackend {
     VERNON_RHI_BACKEND_VULKAN = 1,
     VERNON_RHI_BACKEND_DIRECTX12 = 2,
     VERNON_RHI_BACKEND_OPENGL = 3,
-    VERNON_RHI_BACKEND_OPENGL_ES = 4
+    VERNON_RHI_BACKEND_OPENGL_ES = 4,
+    VERNON_RHI_BACKEND_METAL = 5
 } VernonRhiBackend;
 
 typedef enum VernonRhiOwnedDeviceFlagBits {

@@ -24,8 +24,8 @@ VERNON_RHI_CAPI bool submitCommandRecording(VernonRhiDevice device, uint64_t nat
                                             bool &completed);
 VERNON_RHI_CAPI void completeBorrowedCommandRecording(VernonRhiDevice device, uint64_t native);
 VERNON_RHI_CAPI void abandonCommandRecording(VernonRhiDevice device, uint64_t native);
-VERNON_RHI_CAPI bool recordBarriers(VernonRhiDevice device, uint64_t encoder_key, uint64_t native,
-                                    const VernonRhiBarrier *barriers, size_t barrier_count);
+VERNON_RHI_CAPI VernonRhiStatus recordBarriers(VernonRhiDevice device, uint64_t encoder_key, uint64_t native,
+                                               const VernonRhiBarrier *barriers, size_t barrier_count);
 VERNON_RHI_CAPI uint64_t commandEncoderKey(VernonRhiDevice device, VernonRhiCommandEncoder encoder);
 VERNON_RHI_CAPI uint64_t commandEncoderNative(VernonRhiDevice device, uint64_t key, VernonRhiBackend backend);
 VERNON_RHI_CAPI bool commandEncoderRendering(VernonRhiDevice device, uint64_t key);

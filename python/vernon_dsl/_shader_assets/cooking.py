@@ -63,16 +63,6 @@ def _cpu_object_format(filename: str, target_triple: str) -> str:
     return "elf"
 
 
-def _manifest_target_options(options: Mapping[str, Any]) -> dict[str, Any]:
-    result = dict(options)
-    if result.get("glsl_version") == 0:
-        result.pop("glsl_version")
-    for name in ("target_triple", "cpu", "cpu_features"):
-        if result.get(name) == "":
-            result.pop(name)
-    return result
-
-
 def _cpu_stage_metadata(stage: CompiledStage) -> dict[str, Any]:
     symbol = stage.interface.get("symbol")
     reflected_options = stage.reflection.get("target_options")
@@ -114,21 +104,6 @@ def _compile_stage(
         entry=reference.entry,
         target=target,
     )
-    reflected_options = compiled.reflection.get("target_options")
-    if isinstance(reflected_options, Mapping):
-        # Persist the compiler's normalized options (notably the default CPU
-        # target triple), so the manifest describes the artifact that was built.
-        compiled = CompiledStage(
-            compiled.module,
-            compiled.module_manifest,
-            compiled.entry,
-            compiled.stage,
-            TargetOptions(target.target, _manifest_target_options(reflected_options)),
-            compiled.reflection,
-            compiled.interface,
-            compiled.artifact,
-            compiled.metadata,
-        )
     if compiled.stage != stage:
         raise PipelineCompileError(f"compiler reflected {reference.entry} as {compiled.stage}, expected {stage}")
     if target.target == "cpu":

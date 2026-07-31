@@ -80,6 +80,9 @@ const BackendDispatch &directX12BackendDispatch();
 #if defined(VERNON_HAS_VULKAN_RHI)
 const BackendDispatch &vulkanBackendDispatch();
 #endif
+#if defined(VERNON_HAS_METAL_RHI)
+const BackendDispatch &metalBackendDispatch();
+#endif
 
 } // namespace vernon::rhi
 

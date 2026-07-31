@@ -37,6 +37,24 @@ class TargetOptions:
                 raise PipelineCompileError("hlsl_shader_model is valid only for the DirectX target")
             if not isinstance(hlsl_shader_model, int) or isinstance(hlsl_shader_model, bool) or hlsl_shader_model < 60:
                 raise PipelineCompileError("hlsl_shader_model must be Shader Model 6.0 or newer")
+        apple_platform = options.get("apple_platform")
+        if apple_platform is not None:
+            if self.target != "metal":
+                raise PipelineCompileError("apple_platform is valid only for the Metal target")
+            if apple_platform not in {"macos", "ios"}:
+                raise PipelineCompileError("apple_platform must be 'macos' or 'ios'")
+        for name in ("msl_version", "minimum_os_version"):
+            value = options.get(name)
+            if value is not None:
+                if self.target != "metal":
+                    raise PipelineCompileError(f"{name} is valid only for the Metal target")
+                if (
+                    not isinstance(value, (list, tuple))
+                    or len(value) != 2
+                    or any(not isinstance(part, int) or isinstance(part, bool) or part < 0 for part in value)
+                ):
+                    raise PipelineCompileError(f"{name} must be a two-component non-negative integer version")
+                options[name] = tuple(value)
         cpu_option_names = ("target_triple", "cpu", "cpu_features")
         for name in cpu_option_names:
             value = options.get(name)
@@ -56,6 +74,8 @@ class TargetOptions:
             }
         if self.target == "directx":
             return {"hlsl_shader_model": self.options.get("hlsl_shader_model", 60)}
+        if self.target == "metal":
+            return {"apple_platform": self.options.get("apple_platform", "macos")}
         return {}
 
 

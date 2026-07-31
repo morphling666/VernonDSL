@@ -454,8 +454,25 @@ asset = vd.pipeline_asset(
                     ) -> SimpleNamespace:
                         nonlocal compile_index
                         self.assertEqual(native_target, _target)
-                        expected_options = {"hlsl_shader_model": 60} if _target == "directx" else {}
-                        self.assertEqual(options, expected_options)
+                        expected_native_options = (
+                            {"hlsl_shader_model": 60}
+                            if _target == "directx"
+                            else {"apple_platform": "macos"}
+                            if _target == "metal"
+                            else {}
+                        )
+                        self.assertEqual(options, expected_native_options)
+                        expected_options = (
+                            {"hlsl_shader_model": 60}
+                            if _target == "directx"
+                            else {
+                                "apple_platform": "macos",
+                                "msl_version": [2, 4],
+                                "minimum_os_version": [11, 0],
+                            }
+                            if _target == "metal"
+                            else {}
+                        )
                         stage = _stages[compile_index % len(_stages)]
                         compile_index += 1
                         extension = {
@@ -498,6 +515,19 @@ asset = vd.pipeline_asset(
                                 }
                             ],
                         }
+                        if _target == "metal":
+                            reflection["metal_resource_slots"] = [
+                                {
+                                    "entry_point": f"{stage}_main",
+                                    "stage": stage,
+                                    "kind": "uniform_buffer",
+                                    "name": f"{stage}_uniforms",
+                                    "set": 0,
+                                    "binding": 0,
+                                    "index": 0,
+                                    "count": 1,
+                                }
+                            ]
                         return SimpleNamespace(
                             ok=True,
                             diagnostics="",
@@ -538,7 +568,15 @@ asset = vd.pipeline_asset(
                     self.assertEqual(document["target"], target)
                     self.assertEqual(
                         document["target_options"],
-                        {"hlsl_shader_model": 60} if target == "directx" else {},
+                        {"hlsl_shader_model": 60}
+                        if target == "directx"
+                        else {
+                            "apple_platform": "macos",
+                            "msl_version": [2, 4],
+                            "minimum_os_version": [11, 0],
+                        }
+                        if target == "metal"
+                        else {},
                     )
                     expected_requirements = {
                         "cuda": {
@@ -576,6 +614,13 @@ asset = vd.pipeline_asset(
                             "shader_model": [6, 0],
                             "root_signature_version": [1, 0],
                         },
+                        "metal": {
+                            "backend": "metal",
+                            "features": [],
+                            "apple_platform": "macos",
+                            "msl_version": [2, 4],
+                            "minimum_os_version": [11, 0],
+                        },
                     }.get(target)
                     if expected_requirements is None:
                         self.assertNotIn("runtime_requirements", document)
@@ -583,6 +628,11 @@ asset = vd.pipeline_asset(
                         self.assertEqual(document["runtime_requirements"], expected_requirements)
                     self.assertFalse((output / "pipeline.bundle").exists())
                     descriptors = [value["artifact"] for value in document["stage_artifacts"].values()]
+                    if target == "metal":
+                        for stage_record in document["stage_artifacts"].values():
+                            slots = stage_record["reflection"]["metal_resource_slots"]
+                            self.assertEqual(len(slots), 1)
+                            self.assertEqual(slots[0]["index"], 0)
                     self.assertEqual(len(descriptors), len(stages))
                     self.assertEqual(
                         len(list((output / "artifacts").iterdir())),
@@ -759,7 +809,16 @@ asset = vd.pipeline_asset(
                         )
                         document = json.loads(manifest.read_text(encoding="utf-8"))
                         self.assertEqual(document["target"], target)
-                        self.assertEqual(document["target_options"], target_options)
+                        expected_target_options = (
+                            {
+                                "apple_platform": "macos",
+                                "msl_version": [2, 4],
+                                "minimum_os_version": [11, 0],
+                            }
+                            if target == "metal"
+                            else target_options
+                        )
+                        self.assertEqual(document["target_options"], expected_target_options)
                         self.assertEqual(
                             {stage["stage"] for stage in document["stage_artifacts"].values()},
                             stages,
@@ -778,6 +837,10 @@ asset = vd.pipeline_asset(
                             self.assertTrue(all(use["uniform_name"] for _, use in uniform_parameters))
                             self.assertTrue(all(not name.endswith("._m0") for name, _ in uniform_parameters))
                         for stage in document["stage_artifacts"].values():
+                            if target == "metal":
+                                slots = stage["reflection"]["metal_resource_slots"]
+                                self.assertTrue(slots)
+                                self.assertTrue(all(slot["entry_point"] == stage["entry"] for slot in slots))
                             artifact = stage["artifact"]
                             self.assertEqual(artifact["format"], artifact_format)
                             self.assertTrue(artifact["path"].endswith(extension))

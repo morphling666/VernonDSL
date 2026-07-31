@@ -70,6 +70,8 @@ extern "C" VernonRuntimeRhiAdapter *vernonRuntimeRhiAdapterCreateForDevice(Verno
         adapter =
             vernon::runtime::createBorrowedOpenGLRhiAdapter(*static_cast<vernon::rhi::opengl::DeviceState *>(state));
         break;
+    default:
+        break;
     }
     if (adapter) {
         adapter->rhiDevice = device;
@@ -146,8 +148,9 @@ uint64_t resourceIdentity(const VernonRuntimeRhiAdapter &adapter, uint64_t direc
     case VERNON_RHI_BACKEND_OPENGL:
     case VERNON_RHI_BACKEND_OPENGL_ES:
         return reinterpret_cast<uintptr_t>(adapter.openGLDevice) | directX12Kind;
+    default:
+        return 0;
     }
-    return 0;
 }
 
 } // namespace

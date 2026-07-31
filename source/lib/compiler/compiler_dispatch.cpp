@@ -151,6 +151,19 @@ VernonStatus parseCompileOptions(const VernonCompileOptions *source, VernonTarge
         diagnostics = "DirectX runtime artifacts require HLSL Shader Model 6.0 or newer";
         return VERNON_STATUS_INVALID_ARGUMENT;
     }
+    const VernonMetalPlatform requestedMetalPlatform =
+        source->struct_size >= offsetof(VernonCompileOptions, metal_platform) + sizeof(VernonMetalPlatform)
+            ? source->metal_platform
+            : VERNON_METAL_PLATFORM_MACOS;
+    if (requestedMetalPlatform != VERNON_METAL_PLATFORM_MACOS && requestedMetalPlatform != VERNON_METAL_PLATFORM_IOS) {
+        diagnostics = "Metal platform must be macOS or iOS";
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    }
+    if (requestedMetalPlatform != VERNON_METAL_PLATFORM_MACOS && target != VERNON_TARGET_METAL) {
+        diagnostics = "Metal platform is valid only for the Metal target";
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    }
+    options.metalPlatform = requestedMetalPlatform;
     auto readCpuOption = [&](size_t offset, std::string &destination) {
         if (source->struct_size < offset + sizeof(VernonStringView))
             return true;
@@ -188,18 +201,23 @@ VernonStatus compileTarget(PreparedModule &module, VernonTarget target, const Co
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }
-        addArtifactTable(reflection, artifacts, target, options.glslVersion, options.cpu.targetTriple, options.cpu.cpu,
-                         options.cpu.features);
+        if (!addArtifactTable(reflection, diagnostics, artifacts, target, options.glslVersion, options.cpu.targetTriple,
+                              options.cpu.cpu, options.cpu.features)) {
+            artifacts.clear();
+            return VERNON_STATUS_INTERNAL_ERROR;
+        }
         return VERNON_STATUS_OK;
     }
     if (target == VERNON_TARGET_VULKAN || target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES ||
         target == VERNON_TARGET_METAL || target == VERNON_TARGET_DIRECTX) {
+        std::vector<TargetResourceSlot> targetResourceSlots;
         if (!compileSpirv(module, target, artifacts, diagnostics)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }
         if (target != VERNON_TARGET_VULKAN &&
-            !crossCompileSpirv(artifacts, diagnostics, target, options.glslVersion, options.hlslShaderModel)) {
+            !crossCompileSpirv(artifacts, diagnostics, target, options.glslVersion, options.hlslShaderModel,
+                               options.metalPlatform, target == VERNON_TARGET_METAL ? &targetResourceSlots : nullptr)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }
@@ -211,7 +229,11 @@ VernonStatus compileTarget(PreparedModule &module, VernonTarget target, const Co
             }
             artifacts = std::move(dxilArtifacts);
         }
-        addArtifactTable(reflection, artifacts, target, options.glslVersion, {}, {}, {}, options.hlslShaderModel);
+        if (!addArtifactTable(reflection, diagnostics, artifacts, target, options.glslVersion, {}, {}, {},
+                              options.hlslShaderModel, options.metalPlatform, targetResourceSlots)) {
+            artifacts.clear();
+            return VERNON_STATUS_INTERNAL_ERROR;
+        }
         return VERNON_STATUS_OK;
     }
     if (target == VERNON_TARGET_CUDA) {
@@ -219,7 +241,10 @@ VernonStatus compileTarget(PreparedModule &module, VernonTarget target, const Co
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }
-        addArtifactTable(reflection, artifacts, target, options.glslVersion);
+        if (!addArtifactTable(reflection, diagnostics, artifacts, target, options.glslVersion)) {
+            artifacts.clear();
+            return VERNON_STATUS_INTERNAL_ERROR;
+        }
         return VERNON_STATUS_OK;
     }
     artifacts.clear();

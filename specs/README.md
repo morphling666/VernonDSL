@@ -27,6 +27,8 @@ Supporting active documents:
 
 - [`deferred_gpu_resource_lifetime_plan.md`](deferred_gpu_resource_lifetime_plan.md)
   defines deferred in-flight resource reclamation and multi-frame execution.
+- [`metal_runtime_implementation_plan.md`](metal_runtime_implementation_plan.md)
+  defines the native macOS Metal RHI and runtime implementation gates.
 - [`examples/design.md`](examples/design.md) records non-obvious showcase
   algorithms and third-party design provenance.
 

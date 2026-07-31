@@ -538,10 +538,10 @@ using SharedCompileResult = std::shared_ptr<VernonCompileResult>;
 
 struct CompiledProgram {
     CompiledProgram(VernonCompileResult *result, VernonTarget target, uint32_t glslVersion, uint32_t hlslShaderModel,
-                    std::string targetTriple, std::string cpu, std::string cpuFeatures)
+                    std::string applePlatform, std::string targetTriple, std::string cpu, std::string cpuFeatures)
         : result(result, &vernonCompileResultDestroy), target(target), glslVersion(glslVersion),
-          hlslShaderModel(hlslShaderModel), targetTriple(std::move(targetTriple)), cpu(std::move(cpu)),
-          cpuFeatures(std::move(cpuFeatures)) {
+          hlslShaderModel(hlslShaderModel), applePlatform(std::move(applePlatform)),
+          targetTriple(std::move(targetTriple)), cpu(std::move(cpu)), cpuFeatures(std::move(cpuFeatures)) {
         if (!this->result)
             throw std::runtime_error("compiler returned no result");
     }
@@ -579,6 +579,7 @@ struct CompiledProgram {
     VernonTarget target;
     uint32_t glslVersion{};
     uint32_t hlslShaderModel{};
+    std::string applePlatform;
     std::string targetTriple;
     std::string cpu;
     std::string cpuFeatures;
@@ -587,17 +588,22 @@ struct CompiledProgram {
 std::unique_ptr<CompiledProgram> compileProgramResult(Compiler &compiler, const std::string &mlir, VernonTarget target,
                                                       uint32_t glslVersion, uint32_t hlslShaderModel,
                                                       const std::string &targetTriple, const std::string &cpu,
-                                                      const std::string &cpuFeatures) {
+                                                      const std::string &cpuFeatures,
+                                                      const std::string &applePlatform) {
+    const VernonMetalPlatform metalPlatform = applePlatform == "ios"     ? VERNON_METAL_PLATFORM_IOS
+                                              : applePlatform == "macos" ? VERNON_METAL_PLATFORM_MACOS
+                                                                         : static_cast<VernonMetalPlatform>(UINT32_MAX);
     VernonCompileOptions options{};
     options.struct_size = sizeof(options);
     options.glsl_version = glslVersion;
     options.hlsl_shader_model = hlslShaderModel;
+    options.metal_platform = metalPlatform;
     options.cpu_target_triple = VernonStringView{targetTriple.data(), targetTriple.size()};
     options.cpu_name = VernonStringView{cpu.data(), cpu.size()};
     options.cpu_features = VernonStringView{cpuFeatures.data(), cpuFeatures.size()};
     return std::make_unique<CompiledProgram>(
         vernonCompilerCompileMlirWithOptions(compiler.context, mlir.data(), mlir.size(), target, &options), target,
-        glslVersion, hlslShaderModel, targetTriple, cpu, cpuFeatures);
+        glslVersion, hlslShaderModel, applePlatform, targetTriple, cpu, cpuFeatures);
 }
 
 struct PipelineParameterMetadata {
@@ -1246,6 +1252,8 @@ std::unique_ptr<Runtime> RhiHost::createRuntime() {
     case VERNON_RHI_BACKEND_OPENGL_ES:
         backend = VERNON_RUNTIME_OPENGL_ES;
         break;
+    case VERNON_RHI_BACKEND_METAL:
+        throw std::runtime_error("Metal Runtime provider is not implemented");
     }
     VernonRuntimeContext *runtime = vernonRuntimeCreateForRhiDevice(backend, state->device);
     if (!runtime)
@@ -1285,7 +1293,8 @@ NB_MODULE(_native, module) {
         .value("VULKAN", VERNON_RHI_BACKEND_VULKAN)
         .value("DIRECTX12", VERNON_RHI_BACKEND_DIRECTX12)
         .value("OPENGL", VERNON_RHI_BACKEND_OPENGL)
-        .value("OPENGL_ES", VERNON_RHI_BACKEND_OPENGL_ES);
+        .value("OPENGL_ES", VERNON_RHI_BACKEND_OPENGL_ES)
+        .value("METAL", VERNON_RHI_BACKEND_METAL);
     nb::enum_<VernonPrimitiveTopology>(module, "PrimitiveTopology")
         .value("TRIANGLE_LIST", VERNON_TOPOLOGY_TRIANGLE_LIST)
         .value("LINE_LIST", VERNON_TOPOLOGY_LINE_LIST)
@@ -1317,7 +1326,7 @@ NB_MODULE(_native, module) {
         .def(nb::init<>())
         .def("compile_program_result", &compileProgramResult, nb::arg("mlir"), nb::arg("target"),
              nb::arg("glsl_version") = 0, nb::arg("hlsl_shader_model") = 0, nb::arg("target_triple") = "",
-             nb::arg("cpu") = "", nb::arg("cpu_features") = "");
+             nb::arg("cpu") = "", nb::arg("cpu_features") = "", nb::arg("apple_platform") = "macos");
     nb::class_<CompiledProgram>(module, "CompiledProgram")
         .def_prop_ro("ok", &CompiledProgram::ok)
         .def_prop_ro("status", &CompiledProgram::status)
@@ -1327,6 +1336,7 @@ NB_MODULE(_native, module) {
         .def_prop_ro("target", [](const CompiledProgram &value) { return value.target; })
         .def_prop_ro("glsl_version", [](const CompiledProgram &value) { return value.glslVersion; })
         .def_prop_ro("hlsl_shader_model", [](const CompiledProgram &value) { return value.hlslShaderModel; })
+        .def_prop_ro("apple_platform", [](const CompiledProgram &value) { return value.applePlatform; })
         .def_prop_ro("target_triple", [](const CompiledProgram &value) { return value.targetTriple; })
         .def_prop_ro("cpu", [](const CompiledProgram &value) { return value.cpu; })
         .def_prop_ro("cpu_features", [](const CompiledProgram &value) { return value.cpuFeatures; })

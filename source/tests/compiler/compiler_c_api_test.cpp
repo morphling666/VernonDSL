@@ -1,5 +1,6 @@
 #include "VernonCompiler.h"
 #include "VernonVersions.h"
+#include "compiler_artifacts.h"
 #include "compiler_target_test_utils.h"
 
 #include <cstring>
@@ -7,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <string>
+#include <vector>
 
 static int view_contains(VernonStringView value, const char *needle) {
     const size_t needle_size = strlen(needle);
@@ -17,6 +19,14 @@ static int view_contains(VernonStringView value, const char *needle) {
             return 1;
     }
     return 0;
+}
+
+TEST(CompilerArtifacts, RejectsInvalidReflectionBeforePublishingArtifacts) {
+    std::string reflection = "not-json";
+    std::string diagnostics;
+    const std::vector<vernon::compiler::Artifact> artifacts;
+    EXPECT_FALSE(vernon::compiler::addArtifactTable(reflection, diagnostics, artifacts, VERNON_TARGET_METAL, 0));
+    EXPECT_NE(diagnostics.find("not valid JSON"), std::string::npos);
 }
 
 static int views_equal(VernonStringView left, VernonStringView right) {
@@ -417,7 +427,23 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
         VernonStringView metal_source = vernonCompileResultGetArtifactData(metal_compute, 0);
         ASSERT_TRUE(view_contains(metal_source, "kernel void loop"));
         ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(metal_compute), "\"target\":\"metal\""));
+        ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(metal_compute), "\"apple_platform\":\"macos\""));
+        ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(metal_compute), "\"msl_version\":[2,4]"));
+        ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(metal_compute), "\"minimum_os_version\":[11,0]"));
         vernonCompileResultDestroy(metal_compute);
+
+        VernonCompileOptions ios_options{};
+        ios_options.struct_size = sizeof(ios_options);
+        ios_options.metal_platform = VERNON_METAL_PLATFORM_IOS;
+        VernonCompileResult *ios_metal_compute = vernonCompilerCompileMlirWithOptions(
+            context, cuda_while_module, strlen(cuda_while_module), VERNON_TARGET_METAL, &ios_options);
+        ASSERT_TRUE(ios_metal_compute != NULL);
+        ASSERT_TRUE(vernonCompileResultGetStatus(ios_metal_compute) == VERNON_STATUS_OK);
+        ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(ios_metal_compute), "\"apple_platform\":\"ios\""));
+        ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(ios_metal_compute), "\"msl_version\":[2,4]"));
+        ASSERT_TRUE(
+            view_contains(vernonCompileResultGetReflection(ios_metal_compute), "\"minimum_os_version\":[15,0]"));
+        vernonCompileResultDestroy(ios_metal_compute);
     }
 
     VernonCompileResult *cuda_rank_three_compile = vernonCompilerCompileMlir(

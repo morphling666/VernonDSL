@@ -66,7 +66,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: llvm-project/install
-          key: macos-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-v1
+          key: macos-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-nvptx-v1
 
       - name: Build and install LLVM
         if: steps.llvm-cache.outputs.cache-hit != 'true'
@@ -74,6 +74,7 @@ jobs:
           python scripts/configure_llvm.py
           --generator Ninja
           --cuda off
+          --targets Native,NVPTX
           --build
           --parallel 3
 
@@ -102,11 +103,179 @@ jobs:
           PYTHONPATH: python
         run: uv run --frozen --no-sync pytest python/tests -q
 
+      - name: Verify top-level DSL rejects iOS cross-builds
+        run: |
+          if output=$(cmake -S . -B build-ios-invalid -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphonesimulator 2>&1); then
+            echo "top-level VernonDSL unexpectedly accepted an iOS cross-build" >&2
+            exit 1
+          fi
+          echo "$output" | grep -q "standalone Runtime source project"
+
+      - name: Stage released Runtime source package
+        run: |
+          cmake -S source/lib/runtime -B build-runtime-source-package \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSKBUILD=ON \
+            -DBUILD_TESTING=OFF \
+            -DVERNON_ENABLE_VULKAN_RUNTIME=OFF \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/vernon-runtime-package"
+          cmake --build build-runtime-source-package --parallel 3 --target VernonRuntime
+          cmake --install build-runtime-source-package --component VernonWheel
+
+      - name: Build packaged Runtime for iOS simulator
+        run: |
+          cmake -S "$RUNNER_TEMP/vernon-runtime-package/vernon_dsl/runtime_src" \
+            -B build-ios-simulator -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphonesimulator \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DVERNON_RUNTIME_PROFILE=mobile \
+            -DVERNON_RUNTIME_LIBRARY_TYPE=STATIC \
+            -DVERNON_ENABLE_METAL_RUNTIME=ON \
+            -DVERNON_BUILD_IOS_METAL_SMOKE_HOST=ON \
+            -DVERNON_ENABLE_VULKAN_RUNTIME=OFF \
+            -DBUILD_TESTING=OFF
+          cmake --build build-ios-simulator --config Release --target VernonRuntime VernonIosMetalSmoke \
+            -- -parallelizeTargets CODE_SIGNING_ALLOWED=NO
+
+      - name: Run Metal smoke host in iOS simulator
+        run: |
+          udid=$(xcrun simctl list devices available -j | python -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          available = [device for devices in data["devices"].values()
+                       for device in devices if device.get("isAvailable")]
+          preferred = [device for device in available if device["name"].startswith("iPhone")]
+          candidates = preferred or available
+          if not candidates:
+              raise SystemExit("No available iOS simulator device")
+          print(candidates[0]["udid"])
+          ')
+          trap 'xcrun simctl shutdown "$udid" >/dev/null 2>&1 || true' EXIT
+          xcrun simctl boot "$udid"
+          xcrun simctl bootstatus "$udid" -b
+          xcrun simctl install "$udid" \
+            build-ios-simulator/Release-iphonesimulator/VernonIosMetalSmoke.app
+          output=$(xcrun simctl launch --console "$udid" dev.vernon.runtime.metal-smoke 2>&1)
+          echo "$output"
+          echo "$output" | grep -q "Vernon iOS Metal smoke test passed"
+
+      - name: Build packaged Runtime for iOS device
+        run: |
+          cmake -S "$RUNNER_TEMP/vernon-runtime-package/vernon_dsl/runtime_src" \
+            -B build-ios-device -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DVERNON_RUNTIME_PROFILE=mobile \
+            -DVERNON_RUNTIME_LIBRARY_TYPE=STATIC \
+            -DVERNON_ENABLE_METAL_RUNTIME=ON \
+            -DVERNON_BUILD_IOS_METAL_SMOKE_HOST=ON \
+            -DVERNON_ENABLE_VULKAN_RUNTIME=OFF \
+            -DBUILD_TESTING=OFF
+          cmake --build build-ios-device --config Release --target VernonRuntime VernonIosMetalSmoke \
+            -- -parallelizeTargets CODE_SIGNING_ALLOWED=NO
+
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: macos-test-logs
           path: build-ci/Testing/Temporary/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  compiler-wheel:
+    name: Compiler and wheel (Python ${{ matrix.python-version }})
+    needs: build-test
+    runs-on: macos-14
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check out pinned LLVM
+        run: git submodule update --init --depth 1 llvm-project
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Ninja
+        run: brew install ninja
+
+      - name: Read LLVM revision
+        id: llvm-revision
+        run: echo "sha=$(git rev-parse HEAD:llvm-project)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore LLVM installation
+        id: llvm-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: llvm-project/install
+          key: macos-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-nvptx-v1
+
+      - name: Build and install LLVM
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: >
+          python scripts/configure_llvm.py
+          --generator Ninja
+          --cuda off
+          --targets Native,NVPTX
+          --build
+          --parallel 3
+
+      - name: Install Python build environment
+        run: uv sync --extra build --frozen
+
+      - name: Build clean wheel
+        run: uv build --wheel --no-cache
+
+      - name: Validate wheel metadata
+        run: uvx --from twine twine check dist/*.whl
+
+      - name: Test wheel in a fresh environment
+        run: |
+          wheels=(dist/*.whl)
+          wheel="${wheels[0]}"
+          venv="$RUNNER_TEMP/vernon-wheel"
+          uv venv "$venv" --python "${{ matrix.python-version }}"
+          uv pip install --python "$venv/bin/python" --no-cache "$wheel"
+          "$venv/bin/python" scripts/verify_installed_wheel.py
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: vernon-lang-macos-${{ runner.arch }}-python-${{ matrix.python-version }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Compiler test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-compiler-wheel-logs-python-${{ matrix.python-version }}
+          path: _skbuild/Testing/Temporary/*.log
           if-no-files-found: ignore
           retention-days: 14

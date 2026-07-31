@@ -1,10 +1,24 @@
 cmake_minimum_required(VERSION 3.20.0)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VernonVersions.cmake")
-project(
-    VernonDSL
-    VERSION ${VERNON_PROJECT_VERSION}
-    LANGUAGES CXX C)
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_OSX_SYSROOT MATCHES "(^|/)(iphoneos|iphonesimulator)(\\.sdk)?$")
+    message(FATAL_ERROR "The top-level VernonDSL project does not support iOS cross-builds. "
+                        "Build the packaged standalone Runtime source project instead.")
+endif()
+if(APPLE)
+    option(VERNON_ENABLE_METAL_RUNTIME "Enable the Metal backend" ON)
+endif()
+if(APPLE AND VERNON_ENABLE_METAL_RUNTIME)
+    project(
+        VernonDSL
+        VERSION ${VERNON_PROJECT_VERSION}
+        LANGUAGES CXX C OBJCXX)
+else()
+    project(
+        VernonDSL
+        VERSION ${VERNON_PROJECT_VERSION}
+        LANGUAGES CXX C)
+endif()
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE
@@ -21,6 +35,7 @@ include(CTest)
 
 option(VERNON_BUILD_RUNTIME "Build the Vernon Runtime subproject" ON)
 option(VERNON_BUILD_COMPILER "Build the Vernon Compiler subproject" ON)
+option(VERNON_ENABLE_PYTHON_BINDINGS "Build the nanobind Python module" ON)
 option(VERNON_INSTALL_GIT_HOOK "Install the staged-file formatting hook" ON)
 option(VERNON_ENABLE_SANITIZERS "Build Vernon targets with AddressSanitizer" OFF)
 
@@ -37,7 +52,11 @@ endif()
 set(VERNON_REPOSITORY_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 
 include(cmake/VernonPythonEnvironment.cmake)
-vernon_prepare_python_environment("${VERNON_REPOSITORY_ROOT}")
+if(VERNON_BUILD_RUNTIME
+   AND VERNON_BUILD_COMPILER
+   AND VERNON_ENABLE_PYTHON_BINDINGS)
+    vernon_prepare_python_environment("${VERNON_REPOSITORY_ROOT}")
+endif()
 
 if(VERNON_INSTALL_GIT_HOOK AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
     include(cmake/GitHook.cmake)

@@ -15,6 +15,7 @@ class PreparedModule;
 struct CompileOptions {
     uint32_t glslVersion{};
     uint32_t hlslShaderModel{60};
+    VernonMetalPlatform metalPlatform{VERNON_METAL_PLATFORM_MACOS};
     CpuCodegenOptions cpu;
 };
 

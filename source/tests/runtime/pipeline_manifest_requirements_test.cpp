@@ -78,6 +78,12 @@ TEST(PipelineManifestRequirements, ParsesEveryRuntimeBackendShape) {
           {"api_version", nlohmann::json::array({1, 1})},
           {"spirv_version", nlohmann::json::array({1, 3})},
           {"compute_workgroup_size", nlohmann::json::array({8, 4, 1})}}},
+        {"metal",
+         {{"backend", "metal"},
+          {"features", nlohmann::json::array({"compute"})},
+          {"apple_platform", "ios"},
+          {"msl_version", nlohmann::json::array({2, 4})},
+          {"minimum_os_version", nlohmann::json::array({15, 0})}}},
         {"cuda",
          {{"backend", "cuda"},
           {"features", nlohmann::json::array({"compute"})},
@@ -143,6 +149,33 @@ TEST(PipelineManifestRequirements, RejectsTargetMismatchAndMalformedVersions) {
     requirements = {};
     EXPECT_FALSE(parseRuntimeRequirements(root, "opengles", requirements, error));
     EXPECT_NE(error.find("does not match"), std::string::npos);
+}
+
+TEST(PipelineManifestRequirements, RejectsUnsupportedMetalRequirements) {
+    RuntimeRequirements requirements;
+    std::string error;
+    nlohmann::json root = {{"runtime_requirements",
+                            {{"backend", "metal"},
+                             {"features", nlohmann::json::array()},
+                             {"apple_platform", "ios"},
+                             {"msl_version", nlohmann::json::array({2, 3})},
+                             {"minimum_os_version", nlohmann::json::array({15, 0})}}}};
+    EXPECT_FALSE(parseRuntimeRequirements(root, "metal", requirements, error));
+    EXPECT_NE(error.find("unsupported"), std::string::npos);
+
+    root["runtime_requirements"]["msl_version"] = nlohmann::json::array({2, 4});
+    root["runtime_requirements"]["minimum_os_version"] = nlohmann::json::array({14, 9});
+    error.clear();
+    requirements = {};
+    EXPECT_FALSE(parseRuntimeRequirements(root, "metal", requirements, error));
+    EXPECT_NE(error.find("unsupported"), std::string::npos);
+
+    root["runtime_requirements"]["minimum_os_version"] = nlohmann::json::array({15, 0});
+    root["runtime_requirements"]["apple_platform"] = "tvos";
+    error.clear();
+    requirements = {};
+    EXPECT_FALSE(parseRuntimeRequirements(root, "metal", requirements, error));
+    EXPECT_NE(error.find("unsupported"), std::string::npos);
 }
 
 TEST(PipelineManifestRequirements, ComparesApiAndCpuHostRequirements) {

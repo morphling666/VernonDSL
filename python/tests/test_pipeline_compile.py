@@ -13,6 +13,7 @@ from vernon_dsl.bundle import (
     TargetOptions,
     build_bundle_plan,
     canonical_json,
+    compiled_stage_from_program,
     external_parameters,
     inline_artifact_descriptor,
     materialize_bundle,
@@ -128,7 +129,7 @@ class PipelineCompileTests(unittest.TestCase):
             interface: dict[str, object] | None = None,
         ) -> SimpleNamespace:
             return SimpleNamespace(
-                target=SimpleNamespace(target=target),
+                target=SimpleNamespace(target=target, options={}),
                 stage="compute",
                 artifact=SimpleNamespace(data=data),
                 reflection={"required_features": required_features or []},
@@ -175,7 +176,16 @@ class PipelineCompileTests(unittest.TestCase):
         self.assertEqual(cpu["target_triple"], "x86_64-pc-windows-msvc")
         self.assertEqual(cpu["object_format"], "coff")
         self.assertNotIn("invocation_abi_version", cpu)
-        self.assertIsNone(runtime_requirements("metal", []))
+        metal_stage = stage("metal", b"MSL")
+        metal_stage.target.options = {
+            "apple_platform": "ios",
+            "msl_version": [2, 4],
+            "minimum_os_version": [15, 0],
+        }
+        metal = runtime_requirements("metal", [metal_stage])
+        self.assertEqual(metal["apple_platform"], "ios")
+        self.assertEqual(metal["msl_version"], [2, 4])
+        self.assertEqual(metal["minimum_os_version"], [15, 0])
 
     def test_runtime_requirement_parsers_reject_incomplete_artifacts(self) -> None:
         stage = SimpleNamespace(
@@ -188,6 +198,59 @@ class PipelineCompileTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(PipelineCompileError, "incomplete PTX header"):
             runtime_requirements("cuda", [stage])
+
+        metal_stage = SimpleNamespace(
+            target=SimpleNamespace(target="metal", options={"apple_platform": "macos"}),
+            stage="compute",
+            artifact=SimpleNamespace(data=b"MSL"),
+            reflection={},
+            metadata={},
+            interface={},
+        )
+        with self.assertRaisesRegex(PipelineCompileError, "no valid msl_version"):
+            runtime_requirements("metal", [metal_stage])
+        metal_stage.target.options = {
+            "msl_version": [2, 4],
+            "minimum_os_version": [11, 0],
+        }
+        with self.assertRaisesRegex(PipelineCompileError, "requires apple_platform"):
+            runtime_requirements("metal", [metal_stage])
+
+    def test_compiled_stage_uses_reflected_target_options(self) -> None:
+        program = SimpleNamespace(
+            ok=True,
+            diagnostics="",
+            reflection=json.dumps(
+                {
+                    "target_options": {
+                        "apple_platform": "ios",
+                        "msl_version": [2, 4],
+                        "minimum_os_version": [15, 0],
+                    },
+                    "entries": [{"name": "main", "stage": "compute"}],
+                    "artifacts": [
+                        {
+                            "entry_point": "main",
+                            "stage": "compute",
+                            "filename": "main.metal",
+                            "format": "msl",
+                        }
+                    ],
+                }
+            ),
+            artifacts=[("main.metal", b"kernel void main() {}")],
+        )
+        compiled = compiled_stage_from_program(
+            program,
+            module="module",
+            module_manifest="manifest",
+            entry="main",
+            target=TargetOptions("metal"),
+        )
+        self.assertEqual(compiled.target.options["apple_platform"], "ios")
+        self.assertEqual(compiled.target.options["msl_version"], (2, 4))
+        requirements = runtime_requirements("metal", [compiled])
+        self.assertEqual(requirements["minimum_os_version"], [15, 0])
 
     def test_runtime_requirements_change_content_hash_but_not_stage_identity(self) -> None:
         stage = _stage("compute", b"#version 430\nvoid main() {}", {"workgroup_size": [1, 1, 1]})
@@ -214,12 +277,19 @@ class PipelineCompileTests(unittest.TestCase):
             {"hlsl_shader_model": 60},
         )
         self.assertEqual(TargetOptions("cuda").native_options, {})
+        self.assertEqual(TargetOptions("metal").native_options, {"apple_platform": "macos"})
+        self.assertEqual(
+            TargetOptions("metal", {"apple_platform": "ios"}).native_options,
+            {"apple_platform": "ios"},
+        )
         with self.assertRaisesRegex(PipelineCompileError, "valid only for the CPU target"):
             TargetOptions("vulkan", {"cpu": "generic"})
         with self.assertRaisesRegex(PipelineCompileError, "valid only for the DirectX target"):
             TargetOptions("metal", {"hlsl_shader_model": 50})
         with self.assertRaisesRegex(PipelineCompileError, "Shader Model 6.0 or newer"):
             TargetOptions("directx", {"hlsl_shader_model": 55})
+        with self.assertRaisesRegex(PipelineCompileError, "macos.*ios"):
+            TargetOptions("metal", {"apple_platform": "tvos"})
 
     def test_generated_sampler_and_resolution_are_internal(self) -> None:
         records = {

@@ -130,6 +130,8 @@ struct RuntimeRequirements {
     std::string targetTriple;
     std::string objectFormat;
     std::string profile;
+    std::string applePlatform;
+    RuntimeVersion minimumOsVersion;
 };
 
 struct Variant {

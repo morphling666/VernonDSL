@@ -2,6 +2,7 @@
 #include "directx12_backend.h"
 #include "logical_resource_record.h"
 #include "rhi_test_hooks.h"
+#include "sampler_filter.h"
 
 #include <algorithm>
 #include <array>
@@ -773,12 +774,12 @@ VernonRhiStatus createSampler(VernonRhiDevice handle, const VernonRhiSamplerDesc
         return VERNON_RHI_STATUS_UNSUPPORTED;
     }
 
+    SamplerFilter filter;
     if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
-        descriptor->mag_filter > VERNON_RHI_FILTER_LINEAR ||
-        descriptor->address_u > VERNON_RHI_ADDRESS_MIRRORED_REPEAT ||
-        descriptor->address_v > VERNON_RHI_ADDRESS_MIRRORED_REPEAT ||
-        descriptor->address_w > VERNON_RHI_ADDRESS_MIRRORED_REPEAT)
+        !decodeSamplerFilter(*descriptor, filter))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (filter.maxAnisotropy > 1.0f)
+        return VERNON_RHI_STATUS_UNSUPPORTED;
     std::lock_guard<std::mutex> guard(device->mutex);
     DirectX12SamplerSlot &slot = allocateDirectX12Slot(device->samplers, *output);
     auto address = [](uint32_t mode) {
@@ -786,9 +787,10 @@ VernonRhiStatus createSampler(VernonRhiDevice handle, const VernonRhiSamplerDesc
             D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_MIRROR};
         return values[mode];
     };
-    slot.sampler.descriptor.Filter = descriptor->mag_filter == VERNON_RHI_FILTER_NEAREST
-                                         ? D3D12_FILTER_MIN_MAG_MIP_POINT
-                                         : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    slot.sampler.descriptor.Filter = D3D12_ENCODE_BASIC_FILTER(
+        filter.minLinear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT,
+        filter.magLinear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT,
+        filter.mipLinear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT, D3D12_FILTER_REDUCTION_TYPE_STANDARD);
     slot.sampler.descriptor.AddressU = address(descriptor->address_u);
     slot.sampler.descriptor.AddressV = address(descriptor->address_v);
     slot.sampler.descriptor.AddressW = address(descriptor->address_w);

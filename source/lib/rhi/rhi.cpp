@@ -22,6 +22,9 @@ auto backends() {
 #if defined(VERNON_HAS_DIRECTX12_RHI)
         &vernon::rhi::directX12BackendDispatch(),
 #endif
+#if defined(VERNON_HAS_METAL_RHI)
+        &vernon::rhi::metalBackendDispatch(),
+#endif
     };
 }
 
@@ -51,7 +54,11 @@ VernonRhiDevice vernon::rhi::createDevice(const VernonRhiOwnedDeviceDescriptor *
         (descriptor->backend != VERNON_RHI_BACKEND_DIRECTX12 && descriptor->flags))
         return invalidDevice();
     const BackendDispatch *backend = dispatch(descriptor->backend);
-    return backend ? backend->createOwnedDevice(descriptor) : invalidDevice();
+    if (!backend) {
+        setDeviceCreationError("requested RHI backend is unavailable in this build");
+        return invalidDevice();
+    }
+    return backend->createOwnedDevice(descriptor);
 }
 
 void vernon::rhi::setDeviceCreationError(std::string error) { creationError = std::move(error); }
@@ -242,11 +249,16 @@ void vernon::rhi::abandonCommandRecording(VernonRhiDevice device, uint64_t nativ
             backend->abandonCommands(device, native);
 }
 
-bool vernon::rhi::recordBarriers(VernonRhiDevice device, uint64_t encoderKey, uint64_t native,
-                                 const VernonRhiBarrier *barriers, size_t barrierCount) {
+VernonRhiStatus vernon::rhi::recordBarriers(VernonRhiDevice device, uint64_t encoderKey, uint64_t native,
+                                            const VernonRhiBarrier *barriers, size_t barrierCount) {
     const BackendDispatch *backend = dispatch(device);
-    return backend && backend->recordBarriers &&
-           backend->recordBarriers(device, encoderKey, native, barriers, barrierCount);
+    if (!backend)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!backend->recordBarriers)
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    return backend->recordBarriers(device, encoderKey, native, barriers, barrierCount)
+               ? VERNON_RHI_STATUS_OK
+               : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
 bool vernon::rhi::endCommandRendering(VernonRhiDevice device, uint64_t native, VernonRhiBackend backendKind,

@@ -35,6 +35,8 @@ typedef struct VernonTargetCapabilities {
     uint8_t reserved;
 } VernonTargetCapabilities;
 
+typedef enum VernonMetalPlatform { VERNON_METAL_PLATFORM_MACOS = 0, VERNON_METAL_PLATFORM_IOS = 1 } VernonMetalPlatform;
+
 typedef struct VernonCompileOptions {
     // Set to sizeof(VernonCompileOptions). This permits ABI-compatible extension.
     uint32_t struct_size;
@@ -45,7 +47,9 @@ typedef struct VernonCompileOptions {
      * Zero selects Shader Model 6.0. DirectX runtime artifacts require 6.0+.
      */
     uint32_t hlsl_shader_model;
-    uint32_t reserved[5];
+    /* Selects the Apple shader platform. Used only by the Metal target. */
+    VernonMetalPlatform metal_platform;
+    uint32_t reserved[4];
     /*
      * CPU object target. Empty selects the compiler host triple. Examples:
      * "x86_64-pc-windows-msvc" and "arm64-apple-ios17.0".

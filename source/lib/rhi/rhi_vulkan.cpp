@@ -1,6 +1,7 @@
 #include "backend_dispatch.h"
 #include "logical_resource_record.h"
 #include "rhi_test_hooks.h"
+#include "sampler_filter.h"
 #include "vulkan_backend.h"
 
 #include <algorithm>
@@ -981,12 +982,12 @@ VernonRhiStatus createSampler(VernonRhiDevice handle, const VernonRhiSamplerDesc
         return VERNON_RHI_STATUS_UNSUPPORTED;
     }
 
+    SamplerFilter filter;
     if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
-        descriptor->mag_filter > VERNON_RHI_FILTER_LINEAR ||
-        descriptor->address_u > VERNON_RHI_ADDRESS_MIRRORED_REPEAT ||
-        descriptor->address_v > VERNON_RHI_ADDRESS_MIRRORED_REPEAT ||
-        descriptor->address_w > VERNON_RHI_ADDRESS_MIRRORED_REPEAT)
+        !decodeSamplerFilter(*descriptor, filter))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (filter.maxAnisotropy > 1.0f)
+        return VERNON_RHI_STATUS_UNSUPPORTED;
     std::lock_guard<std::mutex> guard(device->mutex);
     VulkanSamplerSlot &slot = allocateVulkanSlot(device->samplers, *output);
     auto address = [](uint32_t mode) {
@@ -996,10 +997,9 @@ VernonRhiStatus createSampler(VernonRhiDevice handle, const VernonRhiSamplerDesc
         return values[mode];
     };
     VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    info.minFilter = descriptor->min_filter == VERNON_RHI_FILTER_NEAREST ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-    info.magFilter = descriptor->mag_filter == VERNON_RHI_FILTER_NEAREST ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-    info.mipmapMode = descriptor->mip_filter == VERNON_RHI_FILTER_NEAREST ? VK_SAMPLER_MIPMAP_MODE_NEAREST
-                                                                          : VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    info.minFilter = filter.minLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    info.magFilter = filter.magLinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    info.mipmapMode = filter.mipLinear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
     info.addressModeU = address(descriptor->address_u);
     info.addressModeV = address(descriptor->address_v);
     info.addressModeW = address(descriptor->address_w);

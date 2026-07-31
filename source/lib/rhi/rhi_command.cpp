@@ -338,11 +338,12 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderBarrier(VernonRhiDevice device
         slot->busy = true;
         native = slot->native;
     }
-    const bool recorded = !barrierCount || vernon::rhi::recordBarriers(device, key, native, barriers, barrierCount);
+    const VernonRhiStatus recordStatus =
+        barrierCount ? vernon::rhi::recordBarriers(device, key, native, barriers, barrierCount) : VERNON_RHI_STATUS_OK;
     {
         std::lock_guard<std::mutex> guard(slot->mutex);
         slot->busy = false;
-        if (recorded) {
+        if (recordStatus == VERNON_RHI_STATUS_OK) {
             slot->stats.barrier_count += static_cast<uint32_t>(barrierCount);
             for (size_t index = 0; index < barrierCount; ++index) {
                 const vernon::rhi::ResourceKind kind =
@@ -354,9 +355,7 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderBarrier(VernonRhiDevice device
         } else
             slot->failed = true;
     }
-    if (!recorded)
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    return VERNON_RHI_STATUS_OK;
+    return recordStatus;
 }
 
 extern "C" VernonRhiStatus vernonRhiCommandEncoderBeginRendering(VernonRhiDevice device,
@@ -497,7 +496,7 @@ extern "C" VernonRhiStatus vernonRhiDeviceSubmit(VernonRhiDevice device, VernonR
     std::unordered_set<EncoderSlot::RetainedResource, EncoderSlot::RetainedResourceHash> resources;
     {
         std::lock_guard<std::mutex> guard(slot->mutex);
-        if (!slot->alive || slot->initializing || slot->busy || !slot->finished || slot->submitted)
+        if (!slot->alive || slot->initializing || slot->busy || !slot->finished || slot->submitted || slot->failed)
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
         slot->busy = true;
         native = slot->native;
@@ -512,7 +511,8 @@ extern "C" VernonRhiStatus vernonRhiDeviceSubmit(VernonRhiDevice device, VernonR
             slot->submissionCompleted = completed;
             slot->rollbacks.clear();
             ++slot->stats.submission_count;
-        }
+        } else
+            slot->failed = true;
         if (submitted && completed) {
             cleanups = std::move(slot->cleanups);
             resources = std::move(slot->retainedResources);
