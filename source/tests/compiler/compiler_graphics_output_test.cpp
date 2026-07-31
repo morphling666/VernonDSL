@@ -1,5 +1,6 @@
 #include "VernonCompiler.h"
 #include "VernonVersions.h"
+#include "compiler_target_test_utils.h"
 
 #include <algorithm>
 #include <array>
@@ -254,6 +255,8 @@ TEST(CompilerGraphicsOutput, PreservesInterfacesTexturesAndSwizzles) {
     ASSERT_TRUE(compiler);
     for (VernonTarget target : {VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL, VERNON_TARGET_OPENGL_ES,
                                 VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
+        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+            continue;
         VernonCompileResult *result = vernonCompilerCompileMlir(compiler, module.data(), module.size(), target);
         ASSERT_TRUE(result);
         if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
@@ -565,6 +568,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 
     vernonCompileResultDestroy(result);
     for (VernonTarget target : {VERNON_TARGET_OPENGL, VERNON_TARGET_DIRECTX}) {
+        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+            continue;
         result = vernonCompilerCompileMlir(compiler, tensorModule.data(), tensorModule.size(), target);
         ASSERT_TRUE(result);
         if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
@@ -584,6 +589,75 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
             EXPECT_NE(output.find("value"), std::string::npos);
             EXPECT_NE(output.find("matrix3"), std::string::npos);
         }
+        vernonCompileResultDestroy(result);
+    }
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerGraphicsOutput, PreservesStd140ScalarArrayStrideInSpirvInterfaces) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    for (uint32_t tailWidth : {1u, 2u, 3u}) {
+        const std::string tensorModule = std::string(R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @std140_tail_width(
+      %tail: tensor<2x2x)mlir") + std::to_string(tailWidth) +
+                                         R"mlir(xf32> {
+        vernon.interface = "uniform",
+        vernon.source_name = "tail",
+        vernon.dtype = "f32"
+      }) -> (f32 {
+        vernon.interface = "output",
+        vernon.location = 0 : i64
+      }) attributes {vernon.entry, vernon.stage = "fragment"} {
+    %one = arith.constant 1 : index
+    %tail_index = arith.constant )mlir" + std::to_string(tailWidth - 1) +
+                                         R"mlir( : index
+    %value = tensor.extract %tail[%one, %one, %tail_index] : tensor<2x2x)mlir" +
+                                         std::to_string(tailWidth) + R"mlir(xf32>
+    return %value : f32
+  }
+}
+)mlir";
+
+        SCOPED_TRACE("tail width " + std::to_string(tailWidth));
+        VernonCompileResult *result =
+            vernonCompilerCompileMlir(compiler, tensorModule.data(), tensorModule.size(), VERNON_TARGET_VULKAN);
+        ASSERT_TRUE(result);
+        if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
+            const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+            std::fprintf(stderr, "std140 tail-width Vulkan compile failed: %.*s\n", static_cast<int>(diagnostics.size),
+                         diagnostics.data);
+        }
+        ASSERT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+        const std::string spirv = artifacts(result);
+        ASSERT_EQ(spirv.size() % sizeof(uint32_t), 0u);
+        std::vector<uint32_t> words(spirv.size() / sizeof(uint32_t));
+        std::memcpy(words.data(), spirv.data(), spirv.size());
+        bool hasFourComponentCarrier = false;
+        std::vector<uint32_t> arrayStrides;
+        for (size_t cursor = 5; cursor < words.size();) {
+            const uint16_t wordCount = static_cast<uint16_t>(words[cursor] >> 16);
+            ASSERT_GT(wordCount, 0u);
+            ASSERT_LE(cursor + wordCount, words.size());
+            const uint16_t opcode = static_cast<uint16_t>(words[cursor]);
+            if (opcode == 23 && wordCount == 4 && words[cursor + 3] == 4)
+                hasFourComponentCarrier = true;
+            if (opcode == 71 && wordCount == 4 && words[cursor + 2] == 6)
+                arrayStrides.push_back(words[cursor + 3]);
+            cursor += wordCount;
+        }
+        EXPECT_TRUE(hasFourComponentCarrier);
+        for (uint32_t stride : {16u, tailWidth * 16u, tailWidth * 32u})
+            EXPECT_NE(std::find(arrayStrides.begin(), arrayStrides.end(), stride), arrayStrides.end());
+
+        const VernonStringView reflected = vernonCompileResultGetReflection(result);
+        const nlohmann::json root = nlohmann::json::parse(reflected.data, reflected.data + reflected.size);
+        const nlohmann::json &argument = root.at("entries").at(0).at("arguments").at(0);
+        const nlohmann::json &layout = argument.at("physical_layouts").at("vulkan_std140_uniform_buffer");
+        EXPECT_EQ(argument.at("shape"), nlohmann::json::array({2, 2, tailWidth}));
+        EXPECT_EQ(layout.at("byte_strides"), nlohmann::json::array({tailWidth * 32u, tailWidth * 16u, 16u}));
+        EXPECT_EQ(layout.at("size"), tailWidth * 64u);
         vernonCompileResultDestroy(result);
     }
     vernonCompilerDestroy(compiler);
@@ -623,6 +697,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     ASSERT_TRUE(compiler);
     for (VernonTarget target :
          {VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL, VERNON_TARGET_DIRECTX, VERNON_TARGET_CUDA}) {
+        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+            continue;
         VernonCompileResult *result =
             vernonCompilerCompileMlir(compiler, tensorModule.data(), tensorModule.size(), target);
         ASSERT_TRUE(result);

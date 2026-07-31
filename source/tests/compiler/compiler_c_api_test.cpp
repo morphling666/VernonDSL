@@ -1,5 +1,6 @@
 #include "VernonCompiler.h"
 #include "VernonVersions.h"
+#include "compiler_target_test_utils.h"
 
 #include <gtest/gtest.h>
 #include <stdio.h>
@@ -237,7 +238,8 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     VernonTargetCapabilities opengles = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_OPENGL_ES);
     VernonTargetCapabilities metal = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_METAL);
     VernonTargetCapabilities directx = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_DIRECTX);
-    ASSERT_TRUE(directx.available && directx.supports_graphics && directx.supports_compute);
+    if (directx.available)
+        ASSERT_TRUE(directx.supports_graphics && directx.supports_compute);
 
     VernonCompileResult *validation = vernonCompilerValidateMlir(context, module, strlen(module));
     ASSERT_TRUE(validation != NULL);
@@ -261,31 +263,33 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     ASSERT_TRUE(vernonCompileResultGetDiagnostics(parse_error).size != 0);
     vernonCompileResultDestroy(parse_error);
 
-    VernonCompileResult *compile = vernonCompilerCompileMlir(context, module, strlen(module), VERNON_TARGET_DIRECTX);
-    ASSERT_TRUE(compile != NULL);
-    ASSERT_TRUE(vernonCompileResultGetStatus(compile) == VERNON_STATUS_OK);
-    ASSERT_TRUE(vernonCompileResultGetArtifactCount(compile) == 1);
-    VernonStringView directx_name = vernonCompileResultGetArtifactName(compile, 0);
-    ASSERT_TRUE(view_contains(directx_name, "vertex_main.vert.dxil"));
-    VernonStringView dxil = vernonCompileResultGetArtifactData(compile, 0);
-    ASSERT_TRUE(dxil.size >= 4);
-    ASSERT_TRUE(std::memcmp(dxil.data, "DXBC", 4) == 0);
-    VernonStringView directx_reflection = vernonCompileResultGetReflection(compile);
-    ASSERT_TRUE(view_contains(directx_reflection, "\"target\":\"directx\""));
-    ASSERT_TRUE(view_contains(directx_reflection, "\"format\":\"dxil\""));
-    ASSERT_TRUE(view_contains(directx_reflection, "\"hlsl_shader_model\":60"));
-    vernonCompileResultDestroy(compile);
-
     VernonCompileOptions directx_options{};
     directx_options.struct_size = sizeof(directx_options);
-    directx_options.hlsl_shader_model = 60;
-    VernonCompileResult *directx_sm60 =
-        vernonCompilerCompileMlirWithOptions(context, module, strlen(module), VERNON_TARGET_DIRECTX, &directx_options);
-    ASSERT_TRUE(directx_sm60 != NULL);
-    ASSERT_TRUE(vernonCompileResultGetStatus(directx_sm60) == VERNON_STATUS_OK);
-    ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(directx_sm60), "\"hlsl_shader_model\":60"));
-    vernonCompileResultDestroy(directx_sm60);
+    if (!vernon::tests::unavailableDirectXTarget(context, VERNON_TARGET_DIRECTX)) {
+        VernonCompileResult *compile =
+            vernonCompilerCompileMlir(context, module, strlen(module), VERNON_TARGET_DIRECTX);
+        ASSERT_TRUE(compile != NULL);
+        ASSERT_TRUE(vernonCompileResultGetStatus(compile) == VERNON_STATUS_OK);
+        ASSERT_TRUE(vernonCompileResultGetArtifactCount(compile) == 1);
+        VernonStringView directx_name = vernonCompileResultGetArtifactName(compile, 0);
+        ASSERT_TRUE(view_contains(directx_name, "vertex_main.vert.dxil"));
+        VernonStringView dxil = vernonCompileResultGetArtifactData(compile, 0);
+        ASSERT_TRUE(dxil.size >= 4);
+        ASSERT_TRUE(std::memcmp(dxil.data, "DXBC", 4) == 0);
+        VernonStringView directx_reflection = vernonCompileResultGetReflection(compile);
+        ASSERT_TRUE(view_contains(directx_reflection, "\"target\":\"directx\""));
+        ASSERT_TRUE(view_contains(directx_reflection, "\"format\":\"dxil\""));
+        ASSERT_TRUE(view_contains(directx_reflection, "\"hlsl_shader_model\":60"));
+        vernonCompileResultDestroy(compile);
 
+        directx_options.hlsl_shader_model = 60;
+        VernonCompileResult *directx_sm60 = vernonCompilerCompileMlirWithOptions(
+            context, module, strlen(module), VERNON_TARGET_DIRECTX, &directx_options);
+        ASSERT_TRUE(directx_sm60 != NULL);
+        ASSERT_TRUE(vernonCompileResultGetStatus(directx_sm60) == VERNON_STATUS_OK);
+        ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(directx_sm60), "\"hlsl_shader_model\":60"));
+        vernonCompileResultDestroy(directx_sm60);
+    }
     directx_options.hlsl_shader_model = 55;
     VernonCompileResult *invalid_directx_options =
         vernonCompilerCompileMlirWithOptions(context, module, strlen(module), VERNON_TARGET_DIRECTX, &directx_options);

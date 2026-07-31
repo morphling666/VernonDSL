@@ -195,6 +195,8 @@ class CompileSurfaceParityTests(unittest.TestCase):
             ("directx", native.Target.DIRECTX, 5, 0, 60),
         )
         for target_name, native_target, c_target, glsl_version, hlsl_shader_model in cases:
+            if target_name == "directx" and not native.target_available(native_target):
+                continue
             for entry in ("triangle_vertex", "solid_fragment"):
                 with self.subTest(target=target_name, entry=entry):
                     mlir = compile_file(FIXTURE, features=("OFFSET",), entry=entry)

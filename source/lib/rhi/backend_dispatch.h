@@ -3,6 +3,8 @@
 
 #include "VernonRHI.h"
 
+#include <string>
+
 namespace vernon::rhi {
 
 enum class ResourceKind : uint32_t { Buffer = 1, Image = 2, Sampler = 3 };
@@ -65,6 +67,7 @@ struct BackendDispatch {
     uint64_t (*trackedBufferState)(VernonRhiDevice, VernonRhiBuffer);
 };
 
+void setDeviceCreationError(std::string error);
 const BackendDispatch &openGLBackendDispatch();
 VERNON_RHI_CAPI bool deferCommandRollback(VernonRhiDevice device, uint64_t encoderKey, void *context, uint64_t object,
                                           void (*rollback)(void *, uint64_t));

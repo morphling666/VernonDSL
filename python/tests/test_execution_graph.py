@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 import vernon_dsl as vd
+from vernon_dsl._runtime.session import RuntimeUnavailableError
 
 
 class RecordingComputePass(vd.ComputePass):
@@ -54,7 +55,10 @@ class RecordingRenderPass(vd.RenderPass):
 class ExecutionGraphTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        vd.init(arch=vd.opengl)
+        try:
+            vd.init(arch=vd.opengl, api_version=(4, 3))
+        except RuntimeUnavailableError as error:
+            raise unittest.SkipTest("OpenGL 4.3 compute runtime is unavailable") from error
 
     @classmethod
     def tearDownClass(cls) -> None:

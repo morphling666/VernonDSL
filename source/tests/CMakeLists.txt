@@ -113,6 +113,12 @@ if(TARGET VernonRuntime)
         VERBATIM)
     add_custom_target(vernon-cpu-aot-test-bundle DEPENDS "${cpu_bundle}/compute.json"
                                                          "${cpu_bundle}/cpu_fill.pipeline.json")
+    add_test(
+        NAME vernon-cpu-aot-bundle-platform-mapping
+        COMMAND
+            ${CMAKE_COMMAND} "-DGENERATOR=${VERNON_TEST_ROOT}/scripts/write_cpu_aot_bundle.cmake"
+            "-DTEST_OUTPUT_DIRECTORY=${VERNON_TEST_BINARY_ROOT}/cpu_aot_bundle_platform_mapping" -P
+            "${VERNON_TEST_ROOT}/scripts/test_cpu_aot_bundle_platform_mapping.cmake")
 
     add_executable(
         VernonRuntimeTests

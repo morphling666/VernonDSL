@@ -32,7 +32,7 @@ bool isStructurallyAbiStableValue(Type type) {
         return llvm::all_of(tuple.getTypes(), isStructurallyAbiStableValue);
     Type element;
     ArrayRef<int64_t> shape;
-    if (auto tensor = dyn_cast<TensorType>(type)) {
+    if (auto tensor = dyn_cast<mlir::vernon::TensorType>(type)) {
         element = tensor.getElementType();
         shape = tensor.getShape();
     } else if (auto tensor = dyn_cast<RankedTensorType>(type)) {

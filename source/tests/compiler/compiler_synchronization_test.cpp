@@ -1,5 +1,6 @@
 #include "VernonCompiler.h"
 #include "VernonVersions.h"
+#include "compiler_target_test_utils.h"
 
 #include <gtest/gtest.h>
 
@@ -322,6 +323,8 @@ TEST(CompilerSynchronization, LowersPortableWorkgroupOperations) {
                        "atomic_kind = \"" + std::string(atomicKind) + "\"");
         for (VernonTarget target : {VERNON_TARGET_CPU, VERNON_TARGET_CUDA, VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL,
                                     VERNON_TARGET_OPENGL_ES, VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
+            if (vernon::tests::unavailableDirectXTarget(compiler, target))
+                continue;
             VernonCompileResult *result = vernonCompilerCompileMlir(compiler, module.data(), module.size(), target);
             ASSERT_TRUE(result);
             const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
@@ -343,6 +346,8 @@ TEST(CompilerSynchronization, LowersAggregateRankTwoWorkgroupStorageThroughValue
     ASSERT_TRUE(compiler);
     for (VernonTarget target : {VERNON_TARGET_CPU, VERNON_TARGET_CUDA, VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL,
                                 VERNON_TARGET_OPENGL_ES, VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
+        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+            continue;
         VernonCompileResult *result = vernonCompilerCompileMlir(compiler, aggregateWorkgroupModule.data(),
                                                                 aggregateWorkgroupModule.size(), target);
         ASSERT_TRUE(result);
@@ -461,6 +466,8 @@ TEST(CompilerSynchronization, LowersNestedAggregateWorkgroupStorageUnderStructur
     ASSERT_TRUE(compiler);
     for (VernonTarget target : {VERNON_TARGET_CPU, VERNON_TARGET_CUDA, VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL,
                                 VERNON_TARGET_OPENGL_ES, VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
+        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+            continue;
         VernonCompileResult *result = vernonCompilerCompileMlir(compiler, nestedAggregateWorkgroupModule.data(),
                                                                 nestedAggregateWorkgroupModule.size(), target);
         ASSERT_TRUE(result);
@@ -497,6 +504,8 @@ TEST(CompilerSynchronization, LowersStorageTensorViewAtomicsOnlyForVerifiedTarge
     }
     for (VernonTarget target :
          {VERNON_TARGET_OPENGL, VERNON_TARGET_OPENGL_ES, VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
+        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+            continue;
         VernonCompileResult *result =
             vernonCompilerCompileMlir(compiler, storageAtomicModule.data(), storageAtomicModule.size(), target);
         ASSERT_TRUE(result);
@@ -581,6 +590,8 @@ TEST(CompilerSynchronization, LowersLocalAndWorkgroupBuiltins) {
     ASSERT_TRUE(compiler);
     for (VernonTarget target : {VERNON_TARGET_CUDA, VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL, VERNON_TARGET_OPENGL_ES,
                                 VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
+        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+            continue;
         VernonCompileResult *result =
             vernonCompilerCompileMlir(compiler, workgroupBuiltinModule.data(), workgroupBuiltinModule.size(), target);
         ASSERT_TRUE(result);

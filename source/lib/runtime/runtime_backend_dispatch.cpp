@@ -180,7 +180,9 @@ bool probeBackend(VernonRuntimeBackend backend, std::string &diagnostic) {
         descriptor.backend = rhiBackend;
         VernonRhiDevice device = vernonRhiCreateDevice(&descriptor);
         if (device.index == static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX)) {
-            diagnostic = "no usable Vernon RHI device was found";
+            const VernonStringView detail = rhi::deviceCreationError();
+            diagnostic = detail.data && detail.size ? std::string(detail.data, detail.size)
+                                                    : "no usable Vernon RHI device was found";
             return false;
         }
         vernonRhiDestroyDevice(device);

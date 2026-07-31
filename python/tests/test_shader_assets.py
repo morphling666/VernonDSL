@@ -733,6 +733,9 @@ asset = vd.pipeline_asset(
         root = Path(__file__).parents[2]
         if not _native_available():
             self.skipTest("native Vernon extension is not built")
+        from vernon_dsl._shader_assets.cooking import _native_module
+
+        native = _native_module()
         assets = (
             (root / "python" / "tests" / "cube_map_shader.py", "cube_map_asset", {"vertex", "fragment"}),
             (root / "python" / "tests" / "pipeline_asset_fixture.py", "scale_asset", {"compute"}),
@@ -745,6 +748,8 @@ asset = vd.pipeline_asset(
             for source, name, stages in assets:
                 for target, (artifact_format, extension, target_options) in targets.items():
                     with self.subTest(asset=name, target=target):
+                        if target == "directx" and not native.target_available(native.Target.DIRECTX):
+                            continue
                         output = Path(directory) / f"{name}_{target}"
                         manifest = cook_pipeline_asset(
                             pipeline_asset=f"{source}:{name}",

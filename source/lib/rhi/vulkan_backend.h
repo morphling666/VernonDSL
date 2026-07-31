@@ -84,6 +84,8 @@ struct VERNON_RHI_CAPI DeviceState {
     uint32_t maxComputeWorkGroupSize[3]{};
     VkDeviceSize descriptorBufferOffsetAlignment{1};
     bool dynamicRendering{};
+    bool portabilityEnumeration{};
+    bool portabilitySubset{};
     bool nativeObjectsBorrowed{};
     VkCommandBuffer borrowedCommandBuffer{};
     VkCommandPool commandPool{};

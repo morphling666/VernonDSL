@@ -1448,6 +1448,7 @@ TEST(RuntimeExternalGl, LoadsAssetsAndInvokesPipeline) {
     ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
     attachment.load_operation = VERNON_RHI_LOAD_PRESERVE;
     attachment.store_operation = VERNON_RHI_STORE_DISCARD;
+    // The host may change OpenGL state between command encoders, so each invocation must restore its bindings.
     ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
     ASSERT_TRUE(drawCount == 2);
     ASSERT_EQ(clearCount, 1u);
@@ -1455,10 +1456,10 @@ TEST(RuntimeExternalGl, LoadsAssetsAndInvokesPipeline) {
     EXPECT_FLOAT_EQ(clearColor[1], 0.5f);
     EXPECT_EQ(invalidateCount, 1u);
     EXPECT_EQ(scissorUpload, (std::array<GlInt, 4>{0, 0, 16, 16}));
-    EXPECT_EQ(programBindCount, 1u);
-    EXPECT_EQ(framebufferBindCount, 1u);
-    EXPECT_EQ(viewportCount, 1u);
-    EXPECT_EQ(scissorCount, 1u);
+    EXPECT_EQ(programBindCount, 2u);
+    EXPECT_EQ(framebufferBindCount, 2u);
+    EXPECT_EQ(viewportCount, 2u);
+    EXPECT_EQ(scissorCount, 2u);
     ASSERT_TRUE(nextName == nextNameAfterPreparation);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, target.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, cube.handle), VERNON_RHI_STATUS_OK);

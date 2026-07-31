@@ -6,6 +6,7 @@
 namespace vernon::rhi {
 
 VERNON_RHI_CAPI VernonRhiDevice createDevice(const VernonRhiOwnedDeviceDescriptor *descriptor);
+VERNON_RHI_CAPI VernonStringView deviceCreationError();
 VERNON_RHI_CAPI void destroyDevice(VernonRhiDevice device);
 VERNON_RHI_CAPI VernonStringView deviceLastError(VernonRhiDevice device);
 VERNON_RHI_CAPI VernonRhiStatus synchronizeDevice(VernonRhiDevice device);

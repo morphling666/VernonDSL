@@ -22,6 +22,7 @@ struct VERNON_RHI_CAPI Driver {
     bool attempted{};
     bool available{};
     PFN_vkGetInstanceProcAddr getInstanceProcAddr{};
+    PFN_vkEnumerateInstanceExtensionProperties enumerateInstanceExtensionProperties{};
     PFN_vkCreateInstance createInstance{};
     PFN_vkDestroyInstance destroyInstance{};
     PFN_vkEnumeratePhysicalDevices enumeratePhysicalDevices{};

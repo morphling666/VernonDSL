@@ -19,6 +19,20 @@ descriptors. CPU relocatable objects resolve through the static entry registry.
 VernonRHI owns CUDA Driver and Vulkan loader discovery; Vulkan headers are
 compile-only. This keeps LLVM, LLD, GLFW, CUDA Toolkit libraries, and the
 Vulkan loader import library outside the deployable runtime dependency closure.
+Vulkan loader discovery is runtime-only and ordered: `VERNON_VULKAN_LOADER`, a
+loader under `VULKAN_SDK`, the normal OS loader name, then Homebrew fallbacks on
+macOS. Failure diagnostics retain every attempted location. Vernon always loads
+the Khronos loader rather than an ICD such as MoltenVK directly, so standard ICD
+discovery remains intact. Build-time `VERNON_ENABLE_VULKAN_RUNTIME` only
+includes the backend; runtime availability still depends on a loader, ICD, and
+usable device.
+
+Before creating an instance, Vernon enumerates advertised instance extensions
+and enables `VK_KHR_portability_enumeration` plus its instance flag only when
+present. It similarly enumerates the selected device's extensions, enables
+`VK_KHR_portability_subset` only when advertised, and queries its supported
+feature structure in the device feature chain. Portability behavior is therefore
+capability-driven rather than selected by the host platform.
 
 OpenGL function resolution is isolated in `backend_opengl_driver`; unlike CUDA
 and Vulkan it consumes context callbacks. OpenGL and OpenGL ES are distinct

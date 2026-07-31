@@ -40,6 +40,10 @@ _external_opengl_contexts: dict[_Architecture, tuple[int, int, int, tuple[int, i
 _runtime_children: weakref.WeakSet[Any] = weakref.WeakSet()
 
 
+class RuntimeUnavailableError(RuntimeError):
+    """Raised when the requested runtime cannot be created on this host."""
+
+
 def _release_runtime() -> None:
     global _native_runtime, _rhi_host, _owned_opengl_context
     Kernel.invalidate_loaded()
@@ -78,7 +82,7 @@ def init(*, arch: _Architecture = cpu, api_version: tuple[int, int] | None = Non
         raise ValueError("api_version is a (major, minor) pair for OpenGL runtimes")
     _release_runtime()
     if _native is None:
-        raise RuntimeError(
+        raise RuntimeUnavailableError(
             f"{arch.name} requires vernon_dsl._native; build the Release native "
             "targets or install a wheel containing the native module"
         )
@@ -93,7 +97,7 @@ def init(*, arch: _Architecture = cpu, api_version: tuple[int, int] | None = Non
     backend = getattr(_native.RuntimeBackend, backend_name)
     use_rhi_host = arch != cpu and hasattr(_native, "RhiHost") and hasattr(_native, "RhiBackend")
     if arch != cpu and not use_rhi_host:
-        raise RuntimeError(f"{arch.name} requires Vernon RHI support in vernon_dsl._native")
+        raise RuntimeUnavailableError(f"{arch.name} requires Vernon RHI support in vernon_dsl._native")
     rhi_backend = getattr(_native.RhiBackend, backend_name) if use_rhi_host else None
     if arch in {opengl, opengles}:
         external = _external_opengl_contexts.get(arch)
@@ -111,9 +115,16 @@ def init(*, arch: _Architecture = cpu, api_version: tuple[int, int] | None = Non
             _native_runtime = _rhi_host.create_runtime()
         elif external is None and use_rhi_host:
             if _gl_context is None:
-                raise RuntimeError(f"{arch.name} requires vernon_dsl._gl_context or a registered external context")
+                raise RuntimeUnavailableError(
+                    f"{arch.name} requires vernon_dsl._gl_context or a registered external context"
+                )
             requested = api_version or default_version
-            owned_context = _gl_context.Context(arch.name, *requested)
+            try:
+                owned_context = _gl_context.Context(arch.name, *requested)
+            except RuntimeError as error:
+                raise RuntimeUnavailableError(
+                    f"{arch.name} {requested[0]}.{requested[1]} context is unavailable"
+                ) from error
             _rhi_host = _native.RhiHost.create_external_opengl(
                 rhi_backend,
                 owned_context.user_data,
@@ -126,7 +137,7 @@ def init(*, arch: _Architecture = cpu, api_version: tuple[int, int] | None = Non
     elif arch == cpu:
         _native_runtime = _native.Runtime(backend)
     elif not _native.runtime_available(backend):
-        raise RuntimeError(f"{arch.name} loader or a usable device is unavailable")
+        raise RuntimeUnavailableError(f"{arch.name} loader or a usable device is unavailable")
     else:
         _rhi_host = _native.RhiHost(rhi_backend)
         _native_runtime = _rhi_host.create_runtime()

@@ -584,8 +584,14 @@ extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceGetImageViewNativeHand
 VernonRhiDevice createOwnedDevice(const VernonRhiOwnedDeviceDescriptor *descriptor) {
 
     auto device = std::shared_ptr<VulkanInteropDevice>(new (std::nothrow) VulkanInteropDevice());
-    if (!device || !device->state.initialize(descriptor->device_index, device->error))
+    if (!device) {
+        vernon::rhi::setDeviceCreationError("cannot allocate Vulkan RHI device state");
         return invalidDevice();
+    }
+    if (!device->state.initialize(descriptor->device_index, device->error)) {
+        vernon::rhi::setDeviceCreationError(std::move(device->error));
+        return invalidDevice();
+    }
     device->owned = true;
     device->queueCapabilities = VERNON_RHI_QUEUE_TRANSFER | VERNON_RHI_QUEUE_COMPUTE | VERNON_RHI_QUEUE_GRAPHICS;
     std::lock_guard<std::mutex> guard(deviceMutex);
@@ -1371,7 +1377,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::vulkanBackendDispatch() {
         VERNON_RHI_BACKEND_VULKAN,
         ownsDevice,
         createOwnedDevice,
-        destroyDevice,
+        vulkan_api::destroyDevice,
         lastError,
         synchronize,
         deviceStateForBackend,

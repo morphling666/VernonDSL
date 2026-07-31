@@ -155,6 +155,20 @@ module attributes {
 
 
 class CompiledProgramTests(unittest.TestCase):
+    def test_target_available_reports_compiler_capabilities(self) -> None:
+        self.assertTrue(native.target_available(native.Target.CPU))
+        for target in (
+            native.Target.CPU,
+            native.Target.CUDA,
+            native.Target.VULKAN,
+            native.Target.METAL,
+            native.Target.DIRECTX,
+            native.Target.OPENGL,
+            native.Target.OPENGL_ES,
+        ):
+            with self.subTest(target=target):
+                self.assertIsInstance(native.target_available(target), bool)
+
     def test_context_owned_python_gpu_resource_api_is_removed(self) -> None:
         self.assertFalse(hasattr(native.Runtime, "create_texture"))
         self.assertFalse(hasattr(native.Runtime, "import_opengl_sampler"))
@@ -239,6 +253,8 @@ class CompiledProgramTests(unittest.TestCase):
             (native.Target.OPENGL, {"glsl_version": 430}),
         ):
             with self.subTest(target=target):
+                if target == native.Target.DIRECTX and not native.target_available(target):
+                    continue
                 program = native.Compiler().compile_program_result(module, target, **options)
                 self.assertTrue(program.ok, program.diagnostics)
 

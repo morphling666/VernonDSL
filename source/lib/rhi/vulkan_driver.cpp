@@ -1,24 +1,85 @@
 #include "vulkan_driver.h"
 
+#include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <vector>
+
 namespace vernon::rhi::vulkan {
+namespace {
+
+void appendCandidate(std::vector<std::string> &candidates, std::filesystem::path candidate) {
+    if (candidate.empty())
+        return;
+    const std::string path = candidate.u8string();
+    if (std::find(candidates.begin(), candidates.end(), path) == candidates.end())
+        candidates.push_back(path);
+}
+
+std::vector<std::string> loaderCandidates() {
+    std::vector<std::string> candidates;
+    if (const char *overridePath = std::getenv("VERNON_VULKAN_LOADER"))
+        appendCandidate(candidates, overridePath);
+
+    if (const char *sdk = std::getenv("VULKAN_SDK")) {
+#if defined(_WIN32)
+        appendCandidate(candidates, std::filesystem::path(sdk) / "Bin" / "vulkan-1.dll");
+#elif defined(__APPLE__)
+        appendCandidate(candidates, std::filesystem::path(sdk) / "lib" / "libvulkan.1.dylib");
+        appendCandidate(candidates, std::filesystem::path(sdk) / "macOS" / "lib" / "libvulkan.1.dylib");
+#else
+        appendCandidate(candidates, std::filesystem::path(sdk) / "lib" / "libvulkan.so.1");
+#endif
+    }
+
+#if defined(_WIN32)
+    appendCandidate(candidates, "vulkan-1.dll");
+#elif defined(__APPLE__)
+    appendCandidate(candidates, "libvulkan.1.dylib");
+    if (const char *homebrew = std::getenv("HOMEBREW_PREFIX"))
+        appendCandidate(candidates,
+                        std::filesystem::path(homebrew) / "opt" / "vulkan-loader" / "lib" / "libvulkan.1.dylib");
+    appendCandidate(candidates, "/opt/homebrew/opt/vulkan-loader/lib/libvulkan.1.dylib");
+    appendCandidate(candidates, "/usr/local/opt/vulkan-loader/lib/libvulkan.1.dylib");
+    appendCandidate(candidates, "/usr/local/lib/libvulkan.1.dylib");
+#else
+    appendCandidate(candidates, "libvulkan.so.1");
+#endif
+    return candidates;
+}
+
+bool openLoader(platform::PlatformLibrary &library, std::string &error) {
+    std::string failures;
+    for (const std::string &candidate : loaderCandidates()) {
+        std::string candidateError;
+        if (library.open(candidate.c_str(), candidateError))
+            return true;
+        if (!failures.empty())
+            failures += "; ";
+        failures += candidate + ": " + candidateError;
+    }
+    error = "Vulkan loader was not found; attempted " + failures;
+    return false;
+}
+
+} // namespace
 
 bool Driver::load() {
     std::lock_guard<std::mutex> guard(mutex);
     if (attempted)
         return available;
     attempted = true;
-#if defined(_WIN32)
-    constexpr const char *libraryName = "vulkan-1.dll";
-#elif defined(__APPLE__)
-    constexpr const char *libraryName = "libvulkan.1.dylib";
-#else
-    constexpr const char *libraryName = "libvulkan.so.1";
-#endif
-    if (!library.open(libraryName, error))
+    if (!openLoader(library, error))
         return false;
     getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(library.symbol("vkGetInstanceProcAddr"));
     if (!getInstanceProcAddr) {
         error = "Vulkan loader is missing vkGetInstanceProcAddr";
+        return false;
+    }
+    enumerateInstanceExtensionProperties = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+        getInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties"));
+    if (!enumerateInstanceExtensionProperties) {
+        error = "Vulkan loader is missing vkEnumerateInstanceExtensionProperties";
         return false;
     }
     createInstance = reinterpret_cast<PFN_vkCreateInstance>(getInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance"));

@@ -41,6 +41,11 @@ struct Compiler {
     VernonCompilerContext *context{};
 };
 
+bool targetAvailable(VernonTarget target) {
+    Compiler compiler;
+    return vernonCompilerGetTargetCapabilities(compiler.context, target).available != 0;
+}
+
 nb::list planValueAbi(const std::string &moduleText, const std::vector<std::string> &logicalDtypes) {
     std::vector<VernonStringView> dtypes;
     dtypes.reserve(logicalDtypes.size());
@@ -1260,6 +1265,7 @@ NB_MODULE(_native, module) {
         .value("DIRECTX", VERNON_TARGET_DIRECTX)
         .value("OPENGL", VERNON_TARGET_OPENGL)
         .value("OPENGL_ES", VERNON_TARGET_OPENGL_ES);
+    module.def("target_available", &targetAvailable, nb::arg("target"));
     nb::enum_<VernonStatus>(module, "Status")
         .value("OK", VERNON_STATUS_OK)
         .value("INVALID_ARGUMENT", VERNON_STATUS_INVALID_ARGUMENT)

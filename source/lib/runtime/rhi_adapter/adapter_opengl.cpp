@@ -596,12 +596,12 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
         adapter.openGLFramebufferSignatures.clear();
         adapter.openGLFramebufferGeneration = device.framebufferGeneration;
     }
-    if (!adapter.openGLProgramValid || adapter.openGLProgram != pipeline->program) {
+    if (firstDraw || !adapter.openGLProgramValid || adapter.openGLProgram != pipeline->program) {
         driver.useProgram(pipeline->program);
         adapter.openGLProgram = pipeline->program;
         adapter.openGLProgramValid = true;
     }
-    if (!adapter.openGLVertexArrayValid || adapter.openGLVertexArray != pipeline->vertexArray) {
+    if (firstDraw || !adapter.openGLVertexArrayValid || adapter.openGLVertexArray != pipeline->vertexArray) {
         driver.bindVertexArray(pipeline->vertexArray);
         adapter.openGLVertexArray = pipeline->vertexArray;
         adapter.openGLVertexArrayValid = true;
@@ -742,7 +742,7 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
         return fail(adapter, "OpenGL depth attachment is stale");
     framebufferSignature.values[framebufferSignature.count++] = hasDepth;
     framebufferSignature.values[framebufferSignature.count++] = descriptor->depth_stencil_attachment.resource.value;
-    if (!adapter.openGLFramebufferValid || adapter.openGLFramebuffer != renderingFramebuffer) {
+    if (firstDraw || !adapter.openGLFramebufferValid || adapter.openGLFramebuffer != renderingFramebuffer) {
         driver.bindFramebuffer(rhi::opengl::kFramebuffer, static_cast<rhi::opengl::Uint>(renderingFramebuffer));
         adapter.openGLFramebuffer = static_cast<rhi::opengl::Uint>(renderingFramebuffer);
         adapter.openGLFramebufferValid = true;
@@ -764,7 +764,7 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
         adapter.openGLFramebufferSignatures.insert_or_assign(static_cast<rhi::opengl::Uint>(renderingFramebuffer),
                                                              framebufferSignature);
     }
-    if (!adapter.openGLViewportValid ||
+    if (firstDraw || !adapter.openGLViewportValid ||
         !std::equal(std::begin(descriptor->viewport), std::end(descriptor->viewport), adapter.openGLViewport.begin())) {
         driver.viewport(static_cast<rhi::opengl::Int>(descriptor->viewport[0]),
                         static_cast<rhi::opengl::Int>(descriptor->viewport[1]),
@@ -787,8 +787,9 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
         driver.disable(rhi::opengl::kDepthTest);
     }
     if (driver.scissor) {
-        if (!adapter.openGLScissorValid || !std::equal(std::begin(descriptor->scissor), std::end(descriptor->scissor),
-                                                       adapter.openGLScissor.begin())) {
+        if (firstDraw || !adapter.openGLScissorValid ||
+            !std::equal(std::begin(descriptor->scissor), std::end(descriptor->scissor),
+                        adapter.openGLScissor.begin())) {
             driver.enable(rhi::opengl::kScissorTest);
             driver.scissor(static_cast<rhi::opengl::Int>(descriptor->scissor[0]),
                            static_cast<rhi::opengl::Int>(descriptor->scissor[1]),

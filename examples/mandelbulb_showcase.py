@@ -37,7 +37,7 @@ def main() -> None:
     options = resolve_showcase_options(parse_args(), PRESETS)
     vd.init(
         arch=architecture_from_name(options.architecture),
-        api_version=(4, 3) if options.architecture == "opengl" else None,
+        api_version=(3, 3) if options.architecture == "opengl" else None,
     )
     positions = create_fullscreen_triangle()
     output = vd.Texture.zeros(shape=(options.size, options.size))

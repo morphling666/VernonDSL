@@ -5,6 +5,10 @@ and compute. A restricted, statically typed Python frontend lowers through
 shared semantic IR into target-specific CPU, CUDA, Vulkan, OpenGL, DirectX, and
 Metal artifacts.
 
+For an end-to-end explanation of the language, compiler backends, Runtime/RHI,
+ExecutionGraph, and offline cooking model, see
+[`ARCHITECTURE.md`](ARCHITECTURE.md).
+
 ```python
 from typing import Annotated
 
@@ -92,6 +96,22 @@ Runtime availability depends on installed drivers and hardware:
 - OpenGL: compute and graphics through a Python-owned or external context;
 - Metal: source artifact generation only; no Vernon runtime.
 
+Vulkan is discovered when the runtime creates a device. Vernon tries
+`VERNON_VULKAN_LOADER`, a loader under `VULKAN_SDK`, the platform loader name,
+and, on macOS, Homebrew locations under `/opt/homebrew` and `/usr/local`.
+`VERNON_VULKAN_LOADER` may name a specific Khronos loader DLL, shared object, or
+dylib; do not point it at MoltenVK directly. macOS users can install the loader
+and MoltenVK ICD with:
+
+```bash
+brew install molten-vk vulkan-loader
+```
+
+`VERNON_ENABLE_VULKAN_RUNTIME` controls whether Vulkan support is included in
+the build. It does not indicate that a loader, ICD, or usable device is present
+on the machine running Vernon. Device creation reports the attempted loader
+locations and Vulkan initialization error when runtime discovery fails.
+
 ## Cook deployable artifacts
 
 Declare a persistent asset beside its shader stages:
@@ -139,52 +159,68 @@ uv run --frozen --no-sync python -m vernon_dsl.pipeline_asset_cli `
 
 ## Build from source
 
-The alpha build is supported and continuously tested on Windows with Visual
-Studio 2022. Required tools:
+The alpha build is continuously tested on Windows with Visual Studio 2022.
+The LLVM configuration helper also supports Linux and macOS. Required tools:
 
-- Git, CMake, Visual Studio 2022 C++ tools, and Windows SDK;
+- Git, CMake, and a platform C++ toolchain;
+- Visual Studio 2022 C++ tools and the Windows SDK on Windows;
 - Python 3.11 or newer and [uv](https://docs.astral.sh/uv/);
 - the repository's pinned `llvm-project` submodule.
 
 Initialize the repository and build the pinned LLVM/MLIR installation once:
 
-```powershell
+```shell
 git submodule update --init --depth 1 llvm-project
-
-uv pip install --target llvm-project/nvidia-nvcc `
-  nvidia-cuda-nvcc-cu12==12.9.86
-$libdevice = Resolve-Path `
-  llvm-project/nvidia-nvcc/nvidia/cuda_nvcc/nvvm/libdevice/libdevice.10.bc
-
-cmake -S llvm-project/llvm -B llvm-project/build `
-  -G "Visual Studio 17 2022" -A x64 `
-  -DLLVM_ENABLE_PROJECTS="mlir;lld" `
-  -DLLVM_TARGETS_TO_BUILD="X86;AArch64;NVPTX" `
-  -DLLVM_ENABLE_ASSERTIONS=OFF `
-  -DLLVM_INCLUDE_TESTS=OFF `
-  -DMLIR_INCLUDE_TESTS=OFF `
-  -DMLIR_NVVM_EMBED_LIBDEVICE=ON `
-  -DMLIR_NVVM_LIBDEVICE_PATH="$libdevice" `
-  -DCMAKE_INSTALL_PREFIX="$PWD/llvm-project/install"
-
-cmake --build llvm-project/build --config Release --target install --parallel 4
+python scripts/configure_llvm.py --build
 ```
+
+The helper selects the LLVM target for the host architecture and reuses the
+generator recorded in an existing build directory. Otherwise it selects Visual
+Studio 2022 on Windows, Ninja when available, or Unix Makefiles. CUDA/NVPTX is
+enabled when `libdevice.10.bc` is found through `CUDA_PATH`, `CUDA_HOME`,
+`CUDAToolkit_ROOT`, `CONDA_PREFIX`, `nvcc`, or the vendored
+`llvm-project/nvidia-nvcc` directory. Use `--cuda off` to disable CUDA or
+`--cuda on --libdevice PATH` to require it. Omit `--build` to configure only;
+run `python scripts/configure_llvm.py --help` for all overrides.
 
 Build VernonDSL:
 
-```powershell
-uv sync --extra build --extra examples --frozen
-$env:PYTHONPATH = "$PWD/python"
+On macOS:
 
-uv run --frozen --no-sync cmake -S . -B build `
-  -G "Visual Studio 17 2022" -A x64 `
-  -DMLIR_DIR="$PWD/llvm-project/install/lib/cmake/mlir" `
-  -DLLD_DIR="$PWD/llvm-project/install/lib/cmake/lld" `
-  -DVERNON_INSTALL_GIT_HOOK=OFF `
-  -DBUILD_TESTING=ON
-
-cmake --build build --config Release --parallel 4
+```bash
+mkdir osx_build
+cd osx_build
+cmake ..
+cmake --build . --parallel
+ctest --output-on-failure
 ```
+
+On Linux:
+
+```bash
+mkdir linux_build
+cd linux_build
+cmake ..
+cmake --build . --parallel
+ctest --output-on-failure
+```
+
+On Windows PowerShell:
+
+```powershell
+mkdir windows_build
+cd windows_build
+cmake ..
+cmake --build . --config Release --parallel
+ctest -C Release --output-on-failure
+```
+
+CMake runs the frozen `uv sync`, uses MLIR and LLD from
+`llvm-project/install`, selects the synchronized Python interpreter and host
+compiler architecture, and disables runtime backends unsupported by the target
+platform and architecture. Single-configuration generators default to Release.
+Tests and the staged-file formatting Git hook are enabled by default. Each
+setting remains available as a `-D` override.
 
 CMake places the development `_native` and `_gl_context` modules in
 `python/vernon_dsl/`. Source-checkout Python commands therefore use

@@ -2,10 +2,13 @@
 #include "rhi_test_hooks.h"
 
 #include <array>
+#include <string>
+#include <utility>
 
 namespace {
 
 VernonRhiDevice invalidDevice() { return {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0}; }
+thread_local std::string creationError;
 
 auto backends() {
     return std::array{
@@ -42,6 +45,7 @@ const vernon::rhi::BackendDispatch *dispatch(VernonRhiBackend backend) {
 } // namespace
 
 VernonRhiDevice vernon::rhi::createDevice(const VernonRhiOwnedDeviceDescriptor *descriptor) {
+    creationError.clear();
     if (!descriptor || descriptor->struct_size < sizeof(*descriptor) ||
         (descriptor->flags & ~static_cast<uint32_t>(VERNON_RHI_OWNED_DEVICE_FORCE_SOFTWARE)) ||
         (descriptor->backend != VERNON_RHI_BACKEND_DIRECTX12 && descriptor->flags))
@@ -49,6 +53,10 @@ VernonRhiDevice vernon::rhi::createDevice(const VernonRhiOwnedDeviceDescriptor *
     const BackendDispatch *backend = dispatch(descriptor->backend);
     return backend ? backend->createOwnedDevice(descriptor) : invalidDevice();
 }
+
+void vernon::rhi::setDeviceCreationError(std::string error) { creationError = std::move(error); }
+
+VernonStringView vernon::rhi::deviceCreationError() { return {creationError.data(), creationError.size()}; }
 
 void vernon::rhi::destroyDevice(VernonRhiDevice device) {
     if (deviceHasActiveCommandEncoder(device))

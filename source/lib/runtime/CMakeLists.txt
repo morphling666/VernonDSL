@@ -61,7 +61,22 @@ set(_vernon_default_desktop_backend OFF)
 if(VERNON_RUNTIME_PROFILE STREQUAL "desktop")
     set(_vernon_default_desktop_backend ON)
 endif()
-option(VERNON_ENABLE_CUDA_RUNTIME "Enable the CUDA Driver backend" ${_vernon_default_desktop_backend})
+
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _vernon_target_processor)
+set(_vernon_cuda_runtime_supported OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND _vernon_target_processor MATCHES "^(aarch64|amd64|arm64|x86_64)$")
+    set(_vernon_cuda_runtime_supported ON)
+elseif(WIN32 AND _vernon_target_processor MATCHES "^(amd64|x64|x86_64)$")
+    set(_vernon_cuda_runtime_supported ON)
+endif()
+
+if(_vernon_cuda_runtime_supported)
+    option(VERNON_ENABLE_CUDA_RUNTIME "Enable the CUDA Driver backend" ${_vernon_default_desktop_backend})
+else()
+    set(VERNON_ENABLE_CUDA_RUNTIME
+        OFF
+        CACHE BOOL "Enable the CUDA Driver backend" FORCE)
+endif()
 option(VERNON_ENABLE_VULKAN_RUNTIME "Enable the Vulkan backend" ${_vernon_default_desktop_backend})
 if(WIN32)
     option(VERNON_ENABLE_DIRECTX12_RUNTIME "Enable the DirectX 12 backend" ${_vernon_default_desktop_backend})

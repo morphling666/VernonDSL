@@ -58,7 +58,8 @@ function(vernon_add_runtime)
             PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/vulkan_backend.cpp
                     ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/vulkan_driver.cpp
                     ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/rhi_vulkan.cpp)
-        target_compile_definitions(VernonRHI PRIVATE VERNON_HAS_VULKAN_RHI=1 VK_NO_PROTOTYPES=1)
+        target_compile_definitions(VernonRHI PRIVATE VERNON_HAS_VULKAN_RHI=1 VK_ENABLE_BETA_EXTENSIONS=1
+                                                     VK_NO_PROTOTYPES=1)
         target_link_libraries(VernonRHI PRIVATE $<BUILD_INTERFACE:Vulkan::Headers>)
     endif()
 

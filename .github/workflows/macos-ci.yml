@@ -1,0 +1,112 @@
+name: macOS CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.9.7"
+  PYTHON_VERSION: "3.11.9"
+  CMAKE_GENERATOR: Ninja
+
+jobs:
+  build-test:
+    name: Build and test
+    runs-on: macos-14
+    timeout-minutes: 240
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check out pinned LLVM
+        run: git submodule update --init --depth 1 llvm-project
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install system dependencies
+        run: brew install ninja molten-vk vulkan-loader
+
+      - name: Configure Vulkan environment
+        run: |
+          echo "HOMEBREW_PREFIX=$(brew --prefix)" >> "$GITHUB_ENV"
+          echo "VERNON_VULKAN_LOADER=$(brew --prefix vulkan-loader)/lib/libvulkan.1.dylib" >> "$GITHUB_ENV"
+          echo "VK_DRIVER_FILES=$(brew --prefix molten-vk)/etc/vulkan/icd.d/MoltenVK_icd.json" >> "$GITHUB_ENV"
+
+      - name: Read LLVM revision
+        id: llvm-revision
+        run: echo "sha=$(git rev-parse HEAD:llvm-project)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore LLVM installation
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: llvm-project/install
+          key: macos-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-v1
+
+      - name: Build and install LLVM
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: >
+          python scripts/configure_llvm.py
+          --generator Ninja
+          --cuda off
+          --build
+          --parallel 3
+
+      - name: Install Python build environment
+        run: uv sync --extra build --frozen
+
+      - name: Configure VernonDSL
+        run: >
+          uv run --frozen cmake -S . -B build-ci
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DMLIR_DIR="$GITHUB_WORKSPACE/llvm-project/install/lib/cmake/mlir"
+          -DLLD_DIR="$GITHUB_WORKSPACE/llvm-project/install/lib/cmake/lld"
+          -DPython_EXECUTABLE="$GITHUB_WORKSPACE/.venv/bin/python"
+          -DVERNON_INSTALL_GIT_HOOK=OFF
+          -DBUILD_TESTING=ON
+
+      - name: Build VernonDSL tests
+        run: cmake --build build-ci --parallel 3
+
+      - name: Run C++ and integration tests
+        run: ctest --test-dir build-ci --output-on-failure
+
+      - name: Run Python tests
+        env:
+          PYTHONPATH: python
+        run: uv run --frozen --no-sync pytest python/tests -q
+
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-test-logs
+          path: build-ci/Testing/Temporary/*.log
+          if-no-files-found: ignore
+          retention-days: 14

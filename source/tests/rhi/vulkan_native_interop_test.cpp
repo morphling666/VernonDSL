@@ -4,7 +4,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -15,6 +17,12 @@ template <typename Handle> uint64_t handleBits(Handle handle) {
         return reinterpret_cast<uint64_t>(handle);
     else
         return static_cast<uint64_t>(handle);
+}
+
+bool hasExtension(const std::vector<VkExtensionProperties> &extensions, std::string_view name) {
+    return std::any_of(extensions.begin(), extensions.end(), [name](const VkExtensionProperties &extension) {
+        return std::string_view(extension.extensionName) == name;
+    });
 }
 
 TEST(VulkanDeviceSelection, RanksHighPerformanceHardwareFirst) {
@@ -39,6 +47,33 @@ TEST(VulkanMemorySelection, PrefersCachedCoherentReadbackMemoryAndFallsBack) {
     EXPECT_EQ(state.findMemoryType(0b11, required, VK_MEMORY_PROPERTY_HOST_CACHED_BIT), 1u);
     EXPECT_EQ(state.findMemoryType(0b01, required, VK_MEMORY_PROPERTY_HOST_CACHED_BIT), 0u);
     EXPECT_FALSE(state.findMemoryType(0b00, required, VK_MEMORY_PROPERTY_HOST_CACHED_BIT).has_value());
+}
+
+TEST(VulkanOwnedDevice, CreatesDeviceAndNegotiatesPortabilityWhenAdvertised) {
+    auto &driver = vernon::rhi::vulkan::driver();
+    if (!driver.load())
+        GTEST_SKIP() << driver.error;
+
+    std::string error;
+    vernon::rhi::vulkan::DeviceState state;
+    ASSERT_TRUE(state.initialize(0, error)) << error;
+
+    uint32_t instanceExtensionCount = 0;
+    ASSERT_EQ(driver.enumerateInstanceExtensionProperties(nullptr, &instanceExtensionCount, nullptr), VK_SUCCESS);
+    std::vector<VkExtensionProperties> instanceExtensions(instanceExtensionCount);
+    ASSERT_EQ(driver.enumerateInstanceExtensionProperties(
+                  nullptr, &instanceExtensionCount, instanceExtensions.empty() ? nullptr : instanceExtensions.data()),
+              VK_SUCCESS);
+    EXPECT_EQ(state.portabilityEnumeration, hasExtension(instanceExtensions, "VK_KHR_portability_enumeration"));
+
+    uint32_t deviceExtensionCount = 0;
+    ASSERT_EQ(driver.enumerateDeviceExtensionProperties(state.physicalDevice, nullptr, &deviceExtensionCount, nullptr),
+              VK_SUCCESS);
+    std::vector<VkExtensionProperties> deviceExtensions(deviceExtensionCount);
+    ASSERT_EQ(driver.enumerateDeviceExtensionProperties(state.physicalDevice, nullptr, &deviceExtensionCount,
+                                                        deviceExtensions.empty() ? nullptr : deviceExtensions.data()),
+              VK_SUCCESS);
+    EXPECT_EQ(state.portabilitySubset, hasExtension(deviceExtensions, "VK_KHR_portability_subset"));
 }
 
 TEST(VulkanNativeInterop, BorrowsObjectsWithoutOwningTheirLifetime) {
