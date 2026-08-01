@@ -409,7 +409,7 @@ void destroyDirectX12Pipeline(VernonLoadedPipeline &pipeline) {
     vernonRuntimeCoreBindingsDestroy(state.rhiComputeBindings);
     vernonRuntimeCorePipelineDestroy(state.rhiComputePipeline);
     vernonRuntimeCoreBindingsDestroy(state.rhiGraphicsBindings);
-    vernonRuntimeCoreGraphicsVariantDestroy(state.rhiGraphicsVariant);
+    destroyGraphicsVariant(state.rhiGraphicsVariant);
     vernonRuntimeCorePipelineDestroy(state.rhiGraphicsPipeline);
 #else
     (void)pipeline;
@@ -528,14 +528,7 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
     if (plan.depthAttachment) {
         depthAttachment = plan.depthAttachment->resource;
     }
-    uint64_t vertexLayoutIdentity = 1469598103934665603ull;
     std::vector<uint32_t> vertexStrides;
-    for (const auto &value : state.rhiGraphicsValues) {
-        vertexLayoutIdentity ^= value.kind;
-        vertexLayoutIdentity *= 1099511628211ull;
-        vertexLayoutIdentity ^= value.stride;
-        vertexLayoutIdentity *= 1099511628211ull;
-    }
     for (size_t index = 0; index < state.rhiGraphicsLayout.size(); ++index)
         if (state.rhiGraphicsLayout[index].kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER) {
             const uint32_t binding = state.rhiGraphicsLayout[index].binding;
@@ -543,36 +536,32 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
                 vertexStrides.resize(binding + 1);
             vertexStrides[binding] = state.rhiGraphicsValues[index].stride;
         }
-    const uint32_t depthFormat = plan.depthAttachment ? static_cast<uint32_t>(DXGI_FORMAT_D32_FLOAT) : 0;
-    if (!state.rhiGraphicsVariant || state.rhiGraphicsFormats != formats ||
-        state.rhiGraphicsDepthFormat != depthFormat || state.rhiGraphicsTopology != invocation.topology ||
-        state.rhiGraphicsVertexLayoutIdentity != vertexLayoutIdentity) {
-        vernonRuntimeCoreGraphicsVariantDestroy(state.rhiGraphicsVariant);
-        state.rhiGraphicsVariant = nullptr;
-        const VernonRuntimeCoreGraphicsCompatibility compatibility{sizeof(VernonRuntimeCoreGraphicsCompatibility),
-                                                                   static_cast<uint32_t>(invocation.topology),
-                                                                   formats.data(),
-                                                                   formats.size(),
-                                                                   depthFormat,
-                                                                   1,
-                                                                   vertexStrides.data(),
-                                                                   vertexStrides.size(),
-                                                                   vertexLayoutIdentity,
-                                                                   {0, 0, 0, 0}};
-        status = vernonRuntimeCorePrepareGraphicsVariant(state.rhiGraphicsPipeline, &compatibility,
-                                                         &state.rhiGraphicsVariant);
-        if (status != VERNON_STATUS_OK) {
-            const VernonStringView providerError =
-                vernonRuntimeRhiAdapterGetLastError(directX12State(*pipeline.context).adapter);
-            return fail(*pipeline.context,
-                        providerError.data ? std::string(providerError.data, providerError.size)
-                                           : "failed to prepare D3D12 RHI graphics variant",
-                        status);
-        }
-        state.rhiGraphicsFormats = std::move(formats);
-        state.rhiGraphicsDepthFormat = depthFormat;
-        state.rhiGraphicsTopology = invocation.topology;
-        state.rhiGraphicsVertexLayoutIdentity = vertexLayoutIdentity;
+    const uint32_t depthFormat =
+        !plan.depthAttachment ? 0
+                              : static_cast<uint32_t>(plan.depthAttachment->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT
+                                                          ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                                                          : DXGI_FORMAT_D32_FLOAT);
+    PlannedGraphicsState graphicsState;
+    const bool hasStencil = plan.depthAttachment && plan.depthAttachment->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT;
+    if (!planGraphicsState(invocation, formats.size(), plan.depthAttachment != nullptr, hasStencil, graphicsState,
+                           pipeline.context->error))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    GraphicsVariantKey variantKey{static_cast<uint32_t>(invocation.topology),
+                                  formats,
+                                  depthFormat,
+                                  1,
+                                  vertexStrides,
+                                  graphicsState.rasterization,
+                                  graphicsState.depthStencil,
+                                  graphicsState.colorBlends};
+    status = ensureGraphicsVariant(state.rhiGraphicsPipeline, variantKey, state.rhiGraphicsVariant);
+    if (status != VERNON_STATUS_OK) {
+        const VernonStringView providerError =
+            vernonRuntimeRhiAdapterGetLastError(directX12State(*pipeline.context).adapter);
+        return fail(*pipeline.context,
+                    providerError.data ? std::string(providerError.data, providerError.size)
+                                       : "failed to prepare D3D12 RHI graphics variant",
+                    status);
     }
     const bool hasViewport = invocation.viewport[2] && invocation.viewport[3];
     VernonRuntimeCoreDrawInvocation draw{};
@@ -588,6 +577,11 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
     draw.depth_store_operation =
         plan.depthAttachment ? static_cast<uint32_t>(plan.depthAttachment->store_operation) : VERNON_RHI_STORE_DISCARD;
     draw.clear_depth = plan.depthAttachment ? plan.depthAttachment->clear_depth : 1.0f;
+    draw.stencil_load_operation = hasStencil ? plan.depthAttachment->stencil_load_operation : VERNON_RHI_LOAD_DISCARD;
+    draw.stencil_store_operation =
+        hasStencil ? plan.depthAttachment->stencil_store_operation : VERNON_RHI_STORE_DISCARD;
+    draw.clear_stencil = hasStencil ? plan.depthAttachment->clear_stencil : 0;
+    draw.stencil_reference = graphicsState.stencilReference;
     draw.viewport[0] = hasViewport ? invocation.viewport[0] : 0;
     draw.viewport[1] = hasViewport ? invocation.viewport[1] : 0;
     draw.viewport[2] = hasViewport ? invocation.viewport[2] : plan.attachmentWidth;
@@ -602,8 +596,8 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
         draw.index_count = plan.indexBinding->index_count;
         draw.index_type = plan.indexBinding->type;
     }
-    status = vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(state.rhiGraphicsVariant, state.rhiGraphicsBindings,
-                                                                  &draw);
+    status = vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(state.rhiGraphicsVariant.handle,
+                                                                  state.rhiGraphicsBindings, &draw);
     if (status != VERNON_STATUS_OK) {
         const VernonStringView providerError =
             vernonRuntimeRhiAdapterGetLastError(directX12State(*pipeline.context).adapter);

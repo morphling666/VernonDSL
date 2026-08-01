@@ -258,6 +258,7 @@ if(SKBUILD)
     install(
         FILES "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonVersions.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonCommon.h"
+              "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonGraphicsState.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonOpenGLContext.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.hpp"

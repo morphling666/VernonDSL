@@ -58,14 +58,15 @@ struct VernonRuntimeRhiAdapter {
     std::atomic<size_t> bindingCreations{};
     std::atomic<size_t> bindingSnapshotCreations{};
     std::atomic<size_t> dispatches{};
+    std::atomic<uint32_t> lastStencilReference{};
 };
 
 namespace vernon::runtime::rhi_adapter {
 
-inline constexpr uint64_t kDirectX12ResourceKindMask = 3;
-inline constexpr uint64_t kDirectX12ImageResource = 1;
-inline constexpr uint64_t kDirectX12SamplerResource = 2;
-inline constexpr uint64_t kDirectX12BufferResource = 3;
+inline constexpr uint64_t kRhiResourceKindMask = 3;
+inline constexpr uint64_t kRhiImageResource = 1;
+inline constexpr uint64_t kRhiSamplerResource = 2;
+inline constexpr uint64_t kRhiBufferResource = 3;
 
 template <typename Object> VernonRuntimeProviderObject toHandle(Object *object) {
     return {static_cast<uint64_t>(reinterpret_cast<uintptr_t>(object))};

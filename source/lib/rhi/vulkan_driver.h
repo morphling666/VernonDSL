@@ -98,6 +98,7 @@ struct VERNON_RHI_CAPI Driver {
     PFN_vkCmdEndRendering cmdEndRendering{};
     PFN_vkCmdSetViewport cmdSetViewport{};
     PFN_vkCmdSetScissor cmdSetScissor{};
+    PFN_vkCmdSetStencilReference cmdSetStencilReference{};
     PFN_vkCmdBindVertexBuffers cmdBindVertexBuffers{};
     PFN_vkCmdBindIndexBuffer cmdBindIndexBuffer{};
     PFN_vkCmdDraw cmdDraw{};

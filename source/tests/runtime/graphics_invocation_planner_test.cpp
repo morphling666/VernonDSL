@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <limits>
 namespace {
 
 using namespace vernon::runtime;
@@ -124,7 +125,7 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     arguments[1].kind = VERNON_PIPELINE_TEXTURE;
     arguments[1].texture = {
         VERNON_TEXTURE_RGBA8_UNORM, VERNON_ACCESS_READ, VERNON_TEXTURE_2D, 16, 8, 1, sampledTexture, sampler};
-    const VernonColorAttachment attachments[] = {
+    VernonColorAttachment attachments[] = {
         {1, secondTarget, 64, 32, VERNON_TEXTURE_RGBA8_UNORM},
         {0, firstTarget, 64, 32, VERNON_TEXTURE_RGBA8_UNORM},
     };
@@ -161,6 +162,10 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     EXPECT_TRUE(sampled->second.implicitSampler);
     EXPECT_EQ(sampled->second.stages, PLANNED_STAGE_FRAGMENT);
 
+    attachments[0].location = 2;
+    EXPECT_FALSE(planGraphicsInvocation(variant, invocation, plan, error));
+    EXPECT_EQ(error, "render target locations must be contiguous from zero");
+    attachments[0].location = 1;
     vertexStrides[0] = -12;
     arguments[0].tensor.byte_offset = 36;
     EXPECT_FALSE(planGraphicsInvocation(variant, invocation, plan, error));
@@ -224,6 +229,109 @@ TEST(GraphicsInvocationPlanner, AppliesInstanceDivisorsToInferredAndExplicitCoun
     EXPECT_EQ(plan.instanceCount, 5u);
     EXPECT_FALSE(planVertexTensor("f32", VERNON_DATA_F32, {4}, {{0, "f32", 4, 0}}, shape, strides, 3, 7, plan, error));
     EXPECT_EQ(error, "graphics Tensor leading dimensions conflict");
+}
+
+TEST(GraphicsInvocationPlanner, NormalizesGraphicsStateForEveryProvider) {
+    VernonRhiColorBlendState blends[2]{};
+    blends[0].blend_enabled = 1;
+    blends[0].source_color_factor = VERNON_RHI_BLEND_SOURCE_ALPHA;
+    blends[0].destination_color_factor = VERNON_RHI_BLEND_ONE_MINUS_SOURCE_ALPHA;
+    blends[0].color_operation = VERNON_RHI_BLEND_ADD;
+    blends[0].source_alpha_factor = VERNON_RHI_BLEND_ONE;
+    blends[0].destination_alpha_factor = VERNON_RHI_BLEND_ZERO;
+    blends[0].alpha_operation = VERNON_RHI_BLEND_ADD;
+    blends[0].write_mask = VERNON_RHI_COLOR_WRITE_RED | VERNON_RHI_COLOR_WRITE_GREEN;
+    blends[1].write_mask = VERNON_RHI_COLOR_WRITE_ALL;
+    VernonGraphicsState source{};
+    source.struct_size = sizeof(source);
+    source.rasterization.cull_mode = VERNON_RHI_CULL_BACK;
+    source.rasterization.front_face = VERNON_RHI_FRONT_FACE_CLOCKWISE;
+    source.depth_stencil.depth_test = 1;
+    source.depth_stencil.depth_write = 1;
+    source.depth_stencil.depth_compare = VERNON_RHI_COMPARE_GREATER_EQUAL;
+    source.depth_stencil.stencil_test = 1;
+    source.depth_stencil.front.compare = VERNON_RHI_COMPARE_ALWAYS;
+    source.depth_stencil.front.pass = VERNON_RHI_STENCIL_REPLACE;
+    source.depth_stencil.stencil_read_mask = 0xff;
+    source.depth_stencil.stencil_write_mask = 0xff;
+    source.depth_stencil.back = source.depth_stencil.front;
+    source.color_blends = blends;
+    source.color_blend_count = std::size(blends);
+    VernonPipelineInvocation invocation{};
+    invocation.graphics_state = &source;
+    invocation.stencil_reference = 3;
+
+    PlannedGraphicsState planned;
+    std::string error;
+    ASSERT_TRUE(planGraphicsState(invocation, std::size(blends), true, true, planned, error)) << error;
+    EXPECT_EQ(planned.rasterization.cull_mode, VERNON_RHI_CULL_BACK);
+    EXPECT_EQ(planned.depthStencil.depth_compare, VERNON_RHI_COMPARE_GREATER_EQUAL);
+    EXPECT_EQ(planned.stencilReference, 3u);
+    ASSERT_EQ(planned.colorBlends.size(), std::size(blends));
+    EXPECT_EQ(planned.colorBlends[0].write_mask, VERNON_RHI_COLOR_WRITE_RED | VERNON_RHI_COLOR_WRITE_GREEN);
+
+    source.color_blend_count = 1;
+    EXPECT_FALSE(planGraphicsState(invocation, std::size(blends), true, true, planned, error));
+    EXPECT_EQ(error, "graphics state does not match the render-target layout");
+}
+
+TEST(GraphicsInvocationPlanner, NormalizesInactiveGraphicsState) {
+    VernonRhiColorBlendState blend{};
+    blend.source_color_factor = VERNON_RHI_BLEND_DESTINATION_COLOR;
+    blend.destination_color_factor = VERNON_RHI_BLEND_SOURCE_ALPHA;
+    blend.write_mask = VERNON_RHI_COLOR_WRITE_ALL;
+    VernonGraphicsState source{};
+    source.struct_size = sizeof(source);
+    source.rasterization.depth_bias_constant = 42;
+    source.rasterization.depth_bias_slope = 7;
+    source.depth_stencil.depth_compare = VERNON_RHI_COMPARE_GREATER;
+    source.depth_stencil.front.pass = VERNON_RHI_STENCIL_REPLACE;
+    source.depth_stencil.stencil_read_mask = 0xff;
+    source.depth_stencil.stencil_write_mask = 0xff;
+    source.color_blends = &blend;
+    source.color_blend_count = 1;
+    VernonPipelineInvocation invocation{};
+    invocation.graphics_state = &source;
+    PlannedGraphicsState planned;
+    std::string error;
+    ASSERT_TRUE(planGraphicsState(invocation, 1, true, false, planned, error)) << error;
+    EXPECT_EQ(planned.rasterization.depth_bias_constant, 0);
+    EXPECT_EQ(planned.depthStencil.depth_compare, VERNON_RHI_COMPARE_ALWAYS);
+    EXPECT_EQ(planned.depthStencil.stencil_read_mask, 0u);
+    EXPECT_EQ(planned.depthStencil.front.pass, VERNON_RHI_STENCIL_KEEP);
+    EXPECT_EQ(planned.colorBlends[0].source_color_factor, VERNON_RHI_BLEND_ONE);
+    EXPECT_EQ(planned.colorBlends[0].destination_color_factor, VERNON_RHI_BLEND_ZERO);
+}
+
+TEST(GraphicsInvocationPlanner, RejectsNonFiniteAndOutOfRangeState) {
+    VernonGraphicsState source{};
+    source.struct_size = sizeof(source);
+    source.rasterization.depth_bias_constant = std::numeric_limits<float>::infinity();
+    VernonPipelineInvocation invocation{};
+    invocation.graphics_state = &source;
+    PlannedGraphicsState planned;
+    std::string error;
+    EXPECT_FALSE(planGraphicsState(invocation, 0, false, false, planned, error));
+    source.rasterization.depth_bias_constant = 0;
+    source.depth_stencil.stencil_read_mask = 0x100;
+    EXPECT_FALSE(planGraphicsState(invocation, 0, false, false, planned, error));
+    source.depth_stencil.stencil_read_mask = 0;
+    invocation.stencil_reference = 0x100;
+    EXPECT_FALSE(planGraphicsState(invocation, 0, false, false, planned, error));
+}
+
+TEST(GraphicsInvocationPlanner, VariantKeyUsesOnlyCanonicalStaticFields) {
+    GraphicsVariantKey first{};
+    first.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
+    first.colorFormats = {3};
+    first.vertexStrides = {8};
+    first.colorBlends.resize(1);
+    first.colorBlends[0].write_mask = VERNON_RHI_COLOR_WRITE_ALL;
+    GraphicsVariantKey same = first;
+    EXPECT_TRUE(graphicsVariantKeysEqual(first, same));
+    EXPECT_EQ(graphicsVariantKeyHash(first), graphicsVariantKeyHash(same));
+    same.colorBlends[0].write_mask = VERNON_RHI_COLOR_WRITE_RED;
+    EXPECT_FALSE(graphicsVariantKeysEqual(first, same));
 }
 
 } // namespace

@@ -2,6 +2,7 @@
 #define VERNON_RHI_H
 
 #include "VernonCommon.h"
+#include "VernonGraphicsState.h"
 #include "VernonOpenGLContext.h"
 
 #if defined(VERNON_RHI_STATIC)
@@ -150,7 +151,8 @@ typedef enum VernonRhiFormat {
     VERNON_RHI_FORMAT_RGB8_UNORM = 10,
     VERNON_RHI_FORMAT_RG32_FLOAT = 11,
     VERNON_RHI_FORMAT_RGB32_FLOAT = 12,
-    VERNON_RHI_FORMAT_R11G11B10_FLOAT = 13
+    VERNON_RHI_FORMAT_R11G11B10_FLOAT = 13,
+    VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT = 14
 } VernonRhiFormat;
 
 typedef enum VernonRhiImageDimension {
@@ -200,57 +202,6 @@ typedef enum VernonRhiStoreOperation {
     VERNON_RHI_STORE_PRESERVE = 0,
     VERNON_RHI_STORE_DISCARD = 1
 } VernonRhiStoreOperation;
-
-typedef enum VernonRhiCompareOperation {
-    VERNON_RHI_COMPARE_NEVER = 0,
-    VERNON_RHI_COMPARE_LESS = 1,
-    VERNON_RHI_COMPARE_EQUAL = 2,
-    VERNON_RHI_COMPARE_LESS_EQUAL = 3,
-    VERNON_RHI_COMPARE_GREATER = 4,
-    VERNON_RHI_COMPARE_NOT_EQUAL = 5,
-    VERNON_RHI_COMPARE_GREATER_EQUAL = 6,
-    VERNON_RHI_COMPARE_ALWAYS = 7
-} VernonRhiCompareOperation;
-
-typedef enum VernonRhiCullMode {
-    VERNON_RHI_CULL_NONE = 0,
-    VERNON_RHI_CULL_FRONT = 1,
-    VERNON_RHI_CULL_BACK = 2
-} VernonRhiCullMode;
-
-typedef enum VernonRhiFrontFace {
-    VERNON_RHI_FRONT_FACE_COUNTER_CLOCKWISE = 0,
-    VERNON_RHI_FRONT_FACE_CLOCKWISE = 1
-} VernonRhiFrontFace;
-
-typedef enum VernonRhiBlendFactor {
-    VERNON_RHI_BLEND_ZERO = 0,
-    VERNON_RHI_BLEND_ONE = 1,
-    VERNON_RHI_BLEND_SOURCE_COLOR = 2,
-    VERNON_RHI_BLEND_ONE_MINUS_SOURCE_COLOR = 3,
-    VERNON_RHI_BLEND_DESTINATION_COLOR = 4,
-    VERNON_RHI_BLEND_ONE_MINUS_DESTINATION_COLOR = 5,
-    VERNON_RHI_BLEND_SOURCE_ALPHA = 6,
-    VERNON_RHI_BLEND_ONE_MINUS_SOURCE_ALPHA = 7,
-    VERNON_RHI_BLEND_DESTINATION_ALPHA = 8,
-    VERNON_RHI_BLEND_ONE_MINUS_DESTINATION_ALPHA = 9
-} VernonRhiBlendFactor;
-
-typedef enum VernonRhiBlendOperation {
-    VERNON_RHI_BLEND_ADD = 0,
-    VERNON_RHI_BLEND_SUBTRACT = 1,
-    VERNON_RHI_BLEND_REVERSE_SUBTRACT = 2,
-    VERNON_RHI_BLEND_MINIMUM = 3,
-    VERNON_RHI_BLEND_MAXIMUM = 4
-} VernonRhiBlendOperation;
-
-typedef enum VernonRhiColorWriteBits {
-    VERNON_RHI_COLOR_WRITE_RED = 1u << 0,
-    VERNON_RHI_COLOR_WRITE_GREEN = 1u << 1,
-    VERNON_RHI_COLOR_WRITE_BLUE = 1u << 2,
-    VERNON_RHI_COLOR_WRITE_ALPHA = 1u << 3,
-    VERNON_RHI_COLOR_WRITE_ALL = (1u << 4) - 1
-} VernonRhiColorWriteBits;
 
 typedef enum VernonRhiAttachmentAspectBits {
     VERNON_RHI_ATTACHMENT_DEPTH = 1u << 0,
@@ -394,33 +345,6 @@ typedef struct VernonRhiComputePipelineDescriptor {
     VernonRhiShaderModule shader;
     uint32_t reserved[4];
 } VernonRhiComputePipelineDescriptor;
-
-typedef struct VernonRhiRasterizationState {
-    VernonRhiCullMode cull_mode;
-    VernonRhiFrontFace front_face;
-    uint32_t depth_clamp;
-    uint32_t depth_bias_enabled;
-    float depth_bias_constant;
-    float depth_bias_slope;
-} VernonRhiRasterizationState;
-
-typedef struct VernonRhiDepthStencilState {
-    uint32_t depth_test;
-    uint32_t depth_write;
-    VernonRhiCompareOperation depth_compare;
-    uint32_t stencil_test;
-} VernonRhiDepthStencilState;
-
-typedef struct VernonRhiColorBlendState {
-    uint32_t blend_enabled;
-    VernonRhiBlendFactor source_color_factor;
-    VernonRhiBlendFactor destination_color_factor;
-    VernonRhiBlendOperation color_operation;
-    VernonRhiBlendFactor source_alpha_factor;
-    VernonRhiBlendFactor destination_alpha_factor;
-    VernonRhiBlendOperation alpha_operation;
-    uint32_t write_mask;
-} VernonRhiColorBlendState;
 
 typedef struct VernonRhiGraphicsPipelineDescriptor {
     uint32_t struct_size;

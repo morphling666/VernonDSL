@@ -204,7 +204,9 @@ bool planComputeInvocation(const Variant &variant, const VernonPipelineInvocatio
 
     for (const Parameter &parameter : variant.parameters) {
         const auto found = arguments.find(parameter.slot);
-        if (found == arguments.end() || parameter.kind != "tensor" || found->second->kind != VERNON_PIPELINE_TENSOR)
+        if (found == arguments.end())
+            return fail(error, "pipeline argument kind does not match layout");
+        if (parameter.kind != "tensor" || found->second->kind != VERNON_PIPELINE_TENSOR)
             return fail(error, "pipeline argument kind does not match layout");
         const VernonTensorView &tensor = found->second->tensor;
         const bool accessCompatible = parameter.access.empty()      ? true

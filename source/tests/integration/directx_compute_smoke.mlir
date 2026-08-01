@@ -1,4 +1,4 @@
-module attributes {vernon.compiler_contract_version = 8 : i64, vernon.pipeline_version = 10 : i64} {
+module attributes {vernon.compiler_contract_version = 8 : i64, vernon.pipeline_version = 11 : i64} {
   func.func @increment(
       %values: !vernon.tensor_view<f32, [1], "read_write", "device"> {
         vernon.interface = "resource",

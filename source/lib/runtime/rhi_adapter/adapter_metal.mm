@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -55,6 +56,11 @@ struct PreparedPipeline {
     PreparedLayout *layout{};
     uint32_t workgroup[3]{1, 1, 1};
     uint32_t pushConstantSize{};
+    MTLCullMode cullMode{MTLCullModeNone};
+    MTLWinding frontFace{MTLWindingCounterClockwise};
+    float depthBiasConstant{};
+    float depthBiasSlope{};
+    bool depthBiasEnabled{};
     bool graphics{};
 };
 
@@ -88,6 +94,15 @@ void setNativeError(VernonRuntimeRhiAdapter &adapter, const char *operation, NSE
         adapter.error += ": ";
         adapter.error += error.localizedDescription.UTF8String;
     }
+}
+
+VernonStatus failNativeException(VernonRuntimeRhiAdapter &adapter, const char *operation, NSException *exception) {
+    adapter.error = operation;
+    if (exception.reason.length != 0) {
+        adapter.error += ": ";
+        adapter.error += exception.reason.UTF8String;
+    }
+    return VERNON_STATUS_INVALID_ARGUMENT;
 }
 
 bool stringEquals(VernonStringView value, const char *expected) {
@@ -297,32 +312,100 @@ MTLVertexFormat vertexFormat(uint32_t dtype, uint32_t components) {
     return MTLVertexFormatInvalid;
 }
 
+bool compareFunction(uint32_t operation, MTLCompareFunction &output) {
+    constexpr MTLCompareFunction functions[]{
+        MTLCompareFunctionNever,        MTLCompareFunctionLess,    MTLCompareFunctionEqual,
+        MTLCompareFunctionLessEqual,    MTLCompareFunctionGreater, MTLCompareFunctionNotEqual,
+        MTLCompareFunctionGreaterEqual, MTLCompareFunctionAlways};
+    if (operation >= std::size(functions))
+        return false;
+    output = functions[operation];
+    return true;
+}
+
+bool stencilOperation(uint32_t operation, MTLStencilOperation &output) {
+    constexpr MTLStencilOperation operations[]{
+        MTLStencilOperationKeep,           MTLStencilOperationZero,           MTLStencilOperationReplace,
+        MTLStencilOperationIncrementClamp, MTLStencilOperationDecrementClamp, MTLStencilOperationInvert,
+        MTLStencilOperationIncrementWrap,  MTLStencilOperationDecrementWrap};
+    if (operation >= std::size(operations))
+        return false;
+    output = operations[operation];
+    return true;
+}
+
+bool blendFactor(uint32_t factor, MTLBlendFactor &output) {
+    constexpr MTLBlendFactor factors[]{
+        MTLBlendFactorZero,
+        MTLBlendFactorOne,
+        MTLBlendFactorSourceColor,
+        MTLBlendFactorOneMinusSourceColor,
+        MTLBlendFactorDestinationColor,
+        MTLBlendFactorOneMinusDestinationColor,
+        MTLBlendFactorSourceAlpha,
+        MTLBlendFactorOneMinusSourceAlpha,
+        MTLBlendFactorDestinationAlpha,
+        MTLBlendFactorOneMinusDestinationAlpha};
+    if (factor >= std::size(factors))
+        return false;
+    output = factors[factor];
+    return true;
+}
+
+bool blendOperation(uint32_t operation, MTLBlendOperation &output) {
+    constexpr MTLBlendOperation operations[]{MTLBlendOperationAdd, MTLBlendOperationSubtract,
+                                             MTLBlendOperationReverseSubtract, MTLBlendOperationMin,
+                                             MTLBlendOperationMax};
+    if (operation >= std::size(operations))
+        return false;
+    output = operations[operation];
+    return true;
+}
+
+bool configureStencilFace(const VernonRuntimeProviderStencilFaceState &source,
+                          MTLStencilDescriptor *destination) {
+    MTLCompareFunction compare{};
+    MTLStencilOperation stencilFail{}, depthFail{}, pass{};
+    if (!compareFunction(source.compare, compare) || !stencilOperation(source.stencil_fail, stencilFail) ||
+        !stencilOperation(source.depth_fail, depthFail) || !stencilOperation(source.pass, pass))
+        return false;
+    destination.stencilCompareFunction = compare;
+    destination.stencilFailureOperation = stencilFail;
+    destination.depthFailureOperation = depthFail;
+    destination.depthStencilPassOperation = pass;
+    return true;
+}
+
 VernonStatus initializeArgumentGroups(VernonRuntimeRhiAdapter &adapter, PreparedLayout &layout,
                                       const std::vector<PreparedShader *> &shaders) {
-    std::lock_guard<std::mutex> guard(layout.mutex);
-    if (!layout.argumentGroups.empty())
+    @try {
+        std::lock_guard<std::mutex> guard(layout.mutex);
+        if (!layout.argumentGroups.empty())
+            return VERNON_STATUS_OK;
+        std::vector<PreparedLayout::ArgumentGroup> argumentGroups;
+        for (const auto &entry : layout.entries) {
+            if (!isArgumentResource(entry))
+                continue;
+            const bool exists = std::any_of(argumentGroups.begin(), argumentGroups.end(), [&](const auto &group) {
+                return group.stage == entry.stage_mask && group.index == entry.set;
+            });
+            if (exists)
+                continue;
+            const auto shader = std::find_if(shaders.begin(), shaders.end(), [&](const PreparedShader *candidate) {
+                return candidate && candidate->stage == entry.stage_mask;
+            });
+            if (shader == shaders.end())
+                return fail(adapter, "Metal argument-buffer layout references a missing shader stage");
+            id<MTLArgumentEncoder> encoder = [(*shader)->function newArgumentEncoderWithBufferIndex:entry.set];
+            if (!encoder || encoder.encodedLength == 0)
+                return fail(adapter, "Metal shader has no argument buffer at the reflected buffer index");
+            argumentGroups.push_back({entry.stage_mask, entry.set, (*shader)->function});
+        }
+        layout.argumentGroups = std::move(argumentGroups);
         return VERNON_STATUS_OK;
-    std::vector<PreparedLayout::ArgumentGroup> argumentGroups;
-    for (const auto &entry : layout.entries) {
-        if (!isArgumentResource(entry))
-            continue;
-        const bool exists = std::any_of(argumentGroups.begin(), argumentGroups.end(), [&](const auto &group) {
-            return group.stage == entry.stage_mask && group.index == entry.set;
-        });
-        if (exists)
-            continue;
-        const auto shader = std::find_if(shaders.begin(), shaders.end(), [&](const PreparedShader *candidate) {
-            return candidate && candidate->stage == entry.stage_mask;
-        });
-        if (shader == shaders.end())
-            return fail(adapter, "Metal argument-buffer layout references a missing shader stage");
-        id<MTLArgumentEncoder> encoder = [(*shader)->function newArgumentEncoderWithBufferIndex:entry.set];
-        if (!encoder || encoder.encodedLength == 0)
-            return fail(adapter, "Metal shader has no argument buffer at the reflected buffer index");
-        argumentGroups.push_back({entry.stage_mask, entry.set, (*shader)->function});
+    } @catch (NSException *exception) {
+        return failNativeException(adapter, "Metal argument-buffer layout encoding raised an exception", exception);
     }
-    layout.argumentGroups = std::move(argumentGroups);
-    return VERNON_STATUS_OK;
 }
 
 VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDescriptor *descriptor,
@@ -383,7 +466,15 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
             }
             if (descriptor->color_format_count > 8 || (descriptor->color_format_count && !descriptor->color_formats) ||
                 descriptor->sample_count != 1 ||
-                (descriptor->depth_stencil_format && descriptor->depth_stencil_format != MTLPixelFormatDepth32Float))
+                (descriptor->depth_stencil_format && descriptor->depth_stencil_format != MTLPixelFormatDepth32Float &&
+                 descriptor->depth_stencil_format != MTLPixelFormatDepth32Float_Stencil8) ||
+                descriptor->rasterization.cull_mode > VERNON_RHI_CULL_BACK ||
+                descriptor->rasterization.front_face > VERNON_RHI_FRONT_FACE_CLOCKWISE ||
+                descriptor->rasterization.depth_clamp || descriptor->rasterization.depth_bias_enabled > 1 ||
+                !std::isfinite(descriptor->rasterization.depth_bias_constant) ||
+                !std::isfinite(descriptor->rasterization.depth_bias_slope) ||
+                descriptor->color_blend_count != descriptor->color_format_count ||
+                (descriptor->color_blend_count && !descriptor->color_blends))
                 return fail(adapter, "Metal graphics pipeline uses an unsupported attachment configuration");
             MTLRenderPipelineDescriptor *nativeDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
             nativeDescriptor.vertexFunction = vertex->function;
@@ -418,9 +509,31 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
                 const MTLPixelFormat format = static_cast<MTLPixelFormat>(descriptor->color_formats[index]);
                 if (format == MTLPixelFormatInvalid)
                     return fail(adapter, "Metal graphics pipeline contains an invalid color format");
-                nativeDescriptor.colorAttachments[index].pixelFormat = format;
+                auto *attachment = nativeDescriptor.colorAttachments[index];
+                attachment.pixelFormat = format;
+                const auto &blend = descriptor->color_blends[index];
+                MTLBlendFactor sourceColor{}, destinationColor{}, sourceAlpha{}, destinationAlpha{};
+                MTLBlendOperation colorOperation{}, alphaOperation{};
+                if (blend.blend_enabled > 1 || (blend.write_mask & ~VERNON_RHI_COLOR_WRITE_ALL) ||
+                    !blendFactor(blend.source_color_factor, sourceColor) ||
+                    !blendFactor(blend.destination_color_factor, destinationColor) ||
+                    !blendFactor(blend.source_alpha_factor, sourceAlpha) ||
+                    !blendFactor(blend.destination_alpha_factor, destinationAlpha) ||
+                    !blendOperation(blend.color_operation, colorOperation) ||
+                    !blendOperation(blend.alpha_operation, alphaOperation))
+                    return fail(adapter, "Metal graphics pipeline contains an invalid blend state");
+                attachment.blendingEnabled = blend.blend_enabled;
+                attachment.sourceRGBBlendFactor = sourceColor;
+                attachment.destinationRGBBlendFactor = destinationColor;
+                attachment.rgbBlendOperation = colorOperation;
+                attachment.sourceAlphaBlendFactor = sourceAlpha;
+                attachment.destinationAlphaBlendFactor = destinationAlpha;
+                attachment.alphaBlendOperation = alphaOperation;
+                attachment.writeMask = static_cast<MTLColorWriteMask>(blend.write_mask);
             }
             nativeDescriptor.depthAttachmentPixelFormat = static_cast<MTLPixelFormat>(descriptor->depth_stencil_format);
+            if (descriptor->depth_stencil_format == MTLPixelFormatDepth32Float_Stencil8)
+                nativeDescriptor.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
             pipeline->render =
                 [metalDevice(adapter).device newRenderPipelineStateWithDescriptor:nativeDescriptor error:&error];
             if (!pipeline->render) {
@@ -429,8 +542,29 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
             }
             if (descriptor->depth_stencil_format) {
                 MTLDepthStencilDescriptor *depthDescriptor = [[MTLDepthStencilDescriptor alloc] init];
-                depthDescriptor.depthCompareFunction = MTLCompareFunctionLess;
-                depthDescriptor.depthWriteEnabled = YES;
+                auto state = descriptor->depth_stencil;
+                MTLCompareFunction depthCompare{};
+                if (state.depth_test > 1 || state.depth_write > 1 || state.stencil_test > 1 ||
+                    !compareFunction(state.depth_test ? state.depth_compare : VERNON_RHI_COMPARE_ALWAYS,
+                                     depthCompare) ||
+                    (state.stencil_test &&
+                     descriptor->depth_stencil_format != MTLPixelFormatDepth32Float_Stencil8))
+                    return fail(adapter, "Metal graphics pipeline contains an invalid depth/stencil state");
+                depthDescriptor.depthCompareFunction = depthCompare;
+                depthDescriptor.depthWriteEnabled = state.depth_write;
+                if (state.stencil_test) {
+                    MTLStencilDescriptor *front = [[MTLStencilDescriptor alloc] init];
+                    MTLStencilDescriptor *back = [[MTLStencilDescriptor alloc] init];
+                    if (!configureStencilFace(state.front, front) || !configureStencilFace(state.back, back) ||
+                        state.stencil_read_mask > UINT8_MAX || state.stencil_write_mask > UINT8_MAX)
+                        return fail(adapter, "Metal graphics pipeline contains an unsupported stencil state");
+                    front.readMask = state.stencil_read_mask;
+                    front.writeMask = state.stencil_write_mask;
+                    back.readMask = state.stencil_read_mask;
+                    back.writeMask = state.stencil_write_mask;
+                    depthDescriptor.frontFaceStencil = front;
+                    depthDescriptor.backFaceStencil = back;
+                }
                 pipeline->depthStencil =
                     [metalDevice(adapter).device newDepthStencilStateWithDescriptor:depthDescriptor];
                 if (!pipeline->depthStencil)
@@ -441,6 +575,13 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
                 pipeline->colorFormats[index] = static_cast<MTLPixelFormat>(descriptor->color_formats[index]);
             pipeline->depthFormat = static_cast<MTLPixelFormat>(descriptor->depth_stencil_format);
             pipeline->sampleCount = std::max(1u, descriptor->sample_count);
+            pipeline->cullMode = static_cast<MTLCullMode>(descriptor->rasterization.cull_mode);
+            pipeline->frontFace = descriptor->rasterization.front_face == VERNON_RHI_FRONT_FACE_CLOCKWISE
+                                      ? MTLWindingClockwise
+                                      : MTLWindingCounterClockwise;
+            pipeline->depthBiasEnabled = descriptor->rasterization.depth_bias_enabled != 0;
+            pipeline->depthBiasConstant = descriptor->rasterization.depth_bias_constant;
+            pipeline->depthBiasSlope = descriptor->rasterization.depth_bias_slope;
             pipeline->graphics = true;
         } else {
             return fail(adapter, "Metal adapter received an unknown pipeline kind");
@@ -463,65 +604,74 @@ void releaseResource(void *data, VernonRuntimeProviderResourceReference resource
 
 VernonStatus createArgumentBuffers(VernonRuntimeRhiAdapter &adapter, PreparedLayout &layout,
                                    std::vector<PreparedBindingSet::ArgumentBuffer> &output, bool required) {
-    std::lock_guard<std::mutex> guard(layout.mutex);
-    if (layout.argumentGroups.empty()) {
-        if (required && std::any_of(layout.entries.begin(), layout.entries.end(), isArgumentResource))
-            return fail(adapter, "Metal argument-buffer layout has no prepared pipeline");
+    @try {
+        std::lock_guard<std::mutex> guard(layout.mutex);
+        if (layout.argumentGroups.empty()) {
+            if (required && std::any_of(layout.entries.begin(), layout.entries.end(), isArgumentResource))
+                return fail(adapter, "Metal argument-buffer layout has no prepared pipeline");
+            return VERNON_STATUS_OK;
+        }
+        std::vector<PreparedBindingSet::ArgumentBuffer> argumentBuffers;
+        argumentBuffers.reserve(layout.argumentGroups.size());
+        for (const auto &group : layout.argumentGroups) {
+            id<MTLArgumentEncoder> encoder = [group.function newArgumentEncoderWithBufferIndex:group.index];
+            if (!encoder || encoder.encodedLength == 0)
+                return fail(adapter, "Metal could not create an argument encoder for the binding set");
+            argumentBuffers.push_back({group.stage, group.index, encoder, nil});
+        }
+        output = std::move(argumentBuffers);
         return VERNON_STATUS_OK;
+    } @catch (NSException *exception) {
+        return failNativeException(adapter, "Metal argument-buffer creation raised an exception", exception);
     }
-    std::vector<PreparedBindingSet::ArgumentBuffer> argumentBuffers;
-    argumentBuffers.reserve(layout.argumentGroups.size());
-    for (const auto &group : layout.argumentGroups) {
-        id<MTLArgumentEncoder> encoder = [group.function newArgumentEncoderWithBufferIndex:group.index];
-        if (!encoder || encoder.encodedLength == 0)
-            return fail(adapter, "Metal could not create an argument encoder for the binding set");
-        argumentBuffers.push_back({group.stage, group.index, encoder, nil});
-    }
-    output = std::move(argumentBuffers);
-    return VERNON_STATUS_OK;
 }
 
 VernonStatus encodeArgumentBuffers(VernonRuntimeRhiAdapter &adapter, const std::vector<PreparedBindingSet::Slot> &slots,
                                    std::vector<PreparedBindingSet::ArgumentBuffer> &argumentBuffers) {
-    auto encodedArgumentBuffers = argumentBuffers;
-    for (auto &argumentBuffer : encodedArgumentBuffers) {
-        argumentBuffer.buffer = [metalDevice(adapter).device newBufferWithLength:argumentBuffer.encoder.encodedLength
-                                                                         options:MTLResourceStorageModeShared];
-        if (!argumentBuffer.buffer)
-            return fail(adapter, "Metal argument-buffer snapshot allocation failed", VERNON_STATUS_INTERNAL_ERROR);
-        [argumentBuffer.encoder setArgumentBuffer:argumentBuffer.buffer offset:0];
-        for (const auto &slot : slots) {
-            if (!isArgumentResource(slot.layout) || slot.layout.stage_mask != argumentBuffer.stage ||
-                slot.layout.set != argumentBuffer.index)
-                continue;
-            const uint32_t member = slot.layout.binding;
-            if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-                slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
-                [argumentBuffer.encoder setBuffer:slot.inlineBuffer offset:0 atIndex:member];
-                continue;
-            }
-            if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER && slot.defaultSampler) {
-                [argumentBuffer.encoder setSamplerState:slot.defaultSampler atIndex:member];
-                continue;
-            }
-            const uint64_t resolved = resolveRhiResource(adapter, slot.resource);
-            if (!resolved)
-                return fail(adapter, "Metal argument-buffer resource became stale during update");
-            if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-                id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)(reinterpret_cast<void *>(resolved));
-                [argumentBuffer.encoder setBuffer:buffer offset:slot.resource.offset atIndex:member];
-            } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
-                       slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE) {
-                id<MTLTexture> texture = (__bridge id<MTLTexture>)(reinterpret_cast<void *>(resolved));
-                [argumentBuffer.encoder setTexture:texture atIndex:member];
-            } else {
-                id<MTLSamplerState> sampler = (__bridge id<MTLSamplerState>)(reinterpret_cast<void *>(resolved));
-                [argumentBuffer.encoder setSamplerState:sampler atIndex:member];
+    @try {
+        auto encodedArgumentBuffers = argumentBuffers;
+        for (auto &argumentBuffer : encodedArgumentBuffers) {
+            argumentBuffer.buffer =
+                [metalDevice(adapter).device newBufferWithLength:argumentBuffer.encoder.encodedLength
+                                                        options:MTLResourceStorageModeShared];
+            if (!argumentBuffer.buffer)
+                return fail(adapter, "Metal argument-buffer snapshot allocation failed", VERNON_STATUS_INTERNAL_ERROR);
+            [argumentBuffer.encoder setArgumentBuffer:argumentBuffer.buffer offset:0];
+            for (const auto &slot : slots) {
+                if (!isArgumentResource(slot.layout) || slot.layout.stage_mask != argumentBuffer.stage ||
+                    slot.layout.set != argumentBuffer.index)
+                    continue;
+                const uint32_t member = slot.layout.binding;
+                if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
+                    slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+                    [argumentBuffer.encoder setBuffer:slot.inlineBuffer offset:0 atIndex:member];
+                    continue;
+                }
+                if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER && slot.defaultSampler) {
+                    [argumentBuffer.encoder setSamplerState:slot.defaultSampler atIndex:member];
+                    continue;
+                }
+                const uint64_t resolved = resolveRhiResource(adapter, slot.resource);
+                if (!resolved)
+                    return fail(adapter, "Metal argument-buffer resource became stale during update");
+                if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
+                    id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)(reinterpret_cast<void *>(resolved));
+                    [argumentBuffer.encoder setBuffer:buffer offset:slot.resource.offset atIndex:member];
+                } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
+                           slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE) {
+                    id<MTLTexture> texture = (__bridge id<MTLTexture>)(reinterpret_cast<void *>(resolved));
+                    [argumentBuffer.encoder setTexture:texture atIndex:member];
+                } else {
+                    id<MTLSamplerState> sampler = (__bridge id<MTLSamplerState>)(reinterpret_cast<void *>(resolved));
+                    [argumentBuffer.encoder setSamplerState:sampler atIndex:member];
+                }
             }
         }
+        argumentBuffers = std::move(encodedArgumentBuffers);
+        return VERNON_STATUS_OK;
+    } @catch (NSException *exception) {
+        return failNativeException(adapter, "Metal argument-buffer resource encoding raised an exception", exception);
     }
-    argumentBuffers = std::move(encodedArgumentBuffers);
-    return VERNON_STATUS_OK;
 }
 
 VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindingSet &bindings,
@@ -553,11 +703,11 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
         } else {
             const uint64_t expectedKind = slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
                                                   slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE
-                                              ? kDirectX12ImageResource
+                                              ? kRhiImageResource
                                           : slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER
-                                              ? kDirectX12SamplerResource
-                                              : kDirectX12BufferResource;
-            if ((value.resource.identity & kDirectX12ResourceKindMask) != expectedKind ||
+                                              ? kRhiSamplerResource
+                                              : kRhiBufferResource;
+            if ((value.resource.identity & kRhiResourceKindMask) != expectedKind ||
                 !resolveRhiResource(adapter, value.resource))
                 return fail(adapter,
                             "Metal resource binding has the wrong type, is stale, or belongs to another device");
@@ -850,6 +1000,7 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
                                              static_cast<uint32_t>(load),
                                              static_cast<uint32_t>(store),
                                              static_cast<uint32_t>(texture.sampleCount)};
+        requested.colorTextures[source.location] = texture;
         renderTargets[source.location] = resolved;
         renderResources[source.location] = resolved;
     }
@@ -864,10 +1015,12 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
             return fail(adapter, "Metal draw contains an incompatible depth attachment");
         VernonRhiLoadOperation depthLoad = static_cast<VernonRhiLoadOperation>(descriptor->depth_load_operation);
         VernonRhiStoreOperation depthStore = static_cast<VernonRhiStoreOperation>(descriptor->depth_store_operation);
-        VernonRhiLoadOperation stencilLoad = VERNON_RHI_LOAD_DISCARD;
-        VernonRhiStoreOperation stencilStore = VERNON_RHI_STORE_DISCARD;
+        VernonRhiLoadOperation stencilLoad =
+            static_cast<VernonRhiLoadOperation>(descriptor->stencil_load_operation);
+        VernonRhiStoreOperation stencilStore =
+            static_cast<VernonRhiStoreOperation>(descriptor->stencil_store_operation);
         float clearDepth = descriptor->clear_depth;
-        uint32_t clearStencil = 0;
+        uint32_t clearStencil = descriptor->clear_stencil;
         if (commandEncoderHasRenderingDescriptor(adapter, commandEncoder) &&
             !commandDepthOperations(adapter, commandEncoder, depthLoad, depthStore, stencilLoad, stencilStore,
                                     clearDepth, clearStencil))
@@ -876,6 +1029,15 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
         pass.depthAttachment.loadAction = loadAction(depthLoad);
         pass.depthAttachment.storeAction = storeAction(depthStore);
         pass.depthAttachment.clearDepth = clearDepth;
+        if (texture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
+            pass.stencilAttachment.texture = texture;
+            pass.stencilAttachment.loadAction = loadAction(stencilLoad);
+            pass.stencilAttachment.storeAction = storeAction(stencilStore);
+            pass.stencilAttachment.clearStencil = clearStencil;
+        } else if (stencilLoad != VERNON_RHI_LOAD_DISCARD || stencilStore != VERNON_RHI_STORE_DISCARD ||
+                   clearStencil != 0) {
+            return fail(adapter, "Metal draw requests stencil operations for a depth-only attachment");
+        }
         requested.depth = {descriptor->depth_stencil_attachment.identity,
                            descriptor->depth_stencil_attachment.resource.value,
                            0,
@@ -883,6 +1045,7 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
                            static_cast<uint32_t>(depthLoad),
                            static_cast<uint32_t>(depthStore),
                            static_cast<uint32_t>(texture.sampleCount)};
+        requested.depthStencilTexture = texture;
         depthTarget = depthResource = resolved;
     }
     if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
@@ -903,6 +1066,7 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
             [encoder endEncoding];
             return fail(adapter, "Metal command render-target registration failed", VERNON_STATUS_INTERNAL_ERROR);
         }
+        rhi::metal::registerRenderingState(native, rendering.get());
         [[maybe_unused]] auto *ownedRendering = rendering.release();
     } else {
         const uint64_t renderingValue = commandRenderingObject(adapter, commandEncoder, 1);
@@ -916,6 +1080,11 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     [encoder setRenderPipelineState:pipeline->render];
     if (pipeline->depthStencil)
         [encoder setDepthStencilState:pipeline->depthStencil];
+    [encoder setCullMode:pipeline->cullMode];
+    [encoder setFrontFacingWinding:pipeline->frontFace];
+    [encoder setStencilReferenceValue:descriptor->stencil_reference];
+    if (pipeline->depthBiasEnabled)
+        [encoder setDepthBias:pipeline->depthBiasConstant slopeScale:pipeline->depthBiasSlope clamp:0.0f];
     std::unique_lock<std::mutex> bindingsGuard;
     if (bindings)
         bindingsGuard = std::unique_lock<std::mutex>(bindings->mutex);

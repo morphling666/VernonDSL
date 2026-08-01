@@ -114,13 +114,13 @@ VulkanGraphicsCacheStats getVulkanGraphicsCacheStats(const VernonRuntimeContext 
     const VulkanPipelineState &state = runtimeBackendState<VulkanPipelineState>(*pipeline);
     result.descriptorSetLayoutCreations = state.rhiGraphicsPipeline ? 1 : 0;
     result.pipelineLayoutCreations = state.rhiGraphicsPipeline ? 1 : 0;
-    result.graphicsPipelineCreations = state.rhiGraphicsVariant ? 1 : 0;
+    result.graphicsPipelineCreations = state.rhiGraphicsVariant.handle ? 1 : 0;
     result.bindingSnapshotCreations =
         getRhiAdapterPreparationStats(*vulkanState(*context).adapter).bindingSnapshotCreations;
     result.commandBufferAllocations = rhiStats.commandBufferAllocations;
     result.descriptorPoolCreations = rhiStats.descriptorPoolCreations;
     result.stagingBufferAllocations = rhiStats.stagingBufferAllocations;
-    result.renderPassCreations = state.rhiGraphicsVariant && !rhiStats.dynamicRendering ? 1 : 0;
+    result.renderPassCreations = state.rhiGraphicsVariant.handle && !rhiStats.dynamicRendering ? 1 : 0;
     result.dynamicRendering = rhiStats.dynamicRendering;
 #else
     (void)context;
@@ -132,7 +132,7 @@ VulkanGraphicsCacheStats getVulkanGraphicsCacheStats(const VernonRuntimeContext 
 size_t getDirectX12GraphicsPipelineCreationCount(const VernonLoadedPipeline *pipeline) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     if (pipeline && pipeline->context && pipeline->context->backend == VERNON_RUNTIME_DIRECTX12)
-        return runtimeBackendState<DirectX12PipelineState>(*pipeline).rhiGraphicsVariant ? 1 : 0;
+        return runtimeBackendState<DirectX12PipelineState>(*pipeline).rhiGraphicsVariant.handle ? 1 : 0;
 #else
     (void)pipeline;
 #endif
@@ -142,9 +142,21 @@ size_t getDirectX12GraphicsPipelineCreationCount(const VernonLoadedPipeline *pip
 size_t getDirectX12GraphicsRootSignatureCreationCount(const VernonLoadedPipeline *pipeline) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     if (pipeline && pipeline->context && pipeline->context->backend == VERNON_RUNTIME_DIRECTX12)
-        return runtimeBackendState<DirectX12PipelineState>(*pipeline).rhiGraphicsVariant ? 1 : 0;
+        return runtimeBackendState<DirectX12PipelineState>(*pipeline).rhiGraphicsVariant.handle ? 1 : 0;
 #else
     (void)pipeline;
+#endif
+    return 0;
+}
+
+uint32_t getDirectX12LastStencilReference(const VernonRuntimeContext *context) {
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+    if (context && context->backend == VERNON_RUNTIME_DIRECTX12) {
+        const VernonRuntimeRhiAdapter *adapter = runtimeBackendState<DirectX12ContextState>(*context).adapter;
+        return adapter ? getRhiAdapterPreparationStats(*adapter).lastStencilReference : 0;
+    }
+#else
+    (void)context;
 #endif
     return 0;
 }

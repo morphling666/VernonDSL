@@ -45,6 +45,7 @@ struct OpenGLPipelineState {
 
     VernonRuntimeCorePipeline *rhiPipeline{};
     VernonRuntimeCoreBindings *rhiBindings{};
+    PreparedGraphicsVariant rhiGraphicsVariant;
     std::vector<VernonRuntimeProviderBindingLayoutEntry> rhiLayout;
     std::vector<VernonRuntimeProviderVertexAttribute> rhiVertexAttributes;
     std::vector<VernonRuntimeProviderBindingValue> rhiValues;

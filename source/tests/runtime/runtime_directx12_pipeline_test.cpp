@@ -6,6 +6,8 @@
 
 #include <gtest/gtest.h>
 
+#include <d3d12.h>
+
 #include <array>
 #include <cstring>
 #include <filesystem>
@@ -32,6 +34,34 @@ vernon::tests::RhiImage createTexture2D(vernon::tests::RhiRuntime &context, uint
 }
 
 } // namespace
+
+TEST(RuntimeDirectX12Pipeline, MapsEveryGraphicsStateEnumerationExplicitly) {
+    constexpr D3D12_BLEND blendFactors[]{D3D12_BLEND_ZERO,       D3D12_BLEND_ONE,
+                                         D3D12_BLEND_SRC_COLOR,  D3D12_BLEND_INV_SRC_COLOR,
+                                         D3D12_BLEND_DEST_COLOR, D3D12_BLEND_INV_DEST_COLOR,
+                                         D3D12_BLEND_SRC_ALPHA,  D3D12_BLEND_INV_SRC_ALPHA,
+                                         D3D12_BLEND_DEST_ALPHA, D3D12_BLEND_INV_DEST_ALPHA};
+    for (uint32_t index = 0; index < std::size(blendFactors); ++index)
+        EXPECT_EQ(vernon::runtime::getDirectX12BlendFactorMapping(index), blendFactors[index]);
+    constexpr D3D12_BLEND_OP blendOperations[]{D3D12_BLEND_OP_ADD, D3D12_BLEND_OP_SUBTRACT, D3D12_BLEND_OP_REV_SUBTRACT,
+                                               D3D12_BLEND_OP_MIN, D3D12_BLEND_OP_MAX};
+    for (uint32_t index = 0; index < std::size(blendOperations); ++index)
+        EXPECT_EQ(vernon::runtime::getDirectX12BlendOperationMapping(index), blendOperations[index]);
+    constexpr D3D12_COMPARISON_FUNC compareOperations[]{
+        D3D12_COMPARISON_FUNC_NEVER,         D3D12_COMPARISON_FUNC_LESS,    D3D12_COMPARISON_FUNC_EQUAL,
+        D3D12_COMPARISON_FUNC_LESS_EQUAL,    D3D12_COMPARISON_FUNC_GREATER, D3D12_COMPARISON_FUNC_NOT_EQUAL,
+        D3D12_COMPARISON_FUNC_GREATER_EQUAL, D3D12_COMPARISON_FUNC_ALWAYS};
+    for (uint32_t index = 0; index < std::size(compareOperations); ++index)
+        EXPECT_EQ(vernon::runtime::getDirectX12CompareOperationMapping(index), compareOperations[index]);
+    constexpr D3D12_STENCIL_OP stencilOperations[]{
+        D3D12_STENCIL_OP_KEEP,     D3D12_STENCIL_OP_ZERO,   D3D12_STENCIL_OP_REPLACE, D3D12_STENCIL_OP_INCR_SAT,
+        D3D12_STENCIL_OP_DECR_SAT, D3D12_STENCIL_OP_INVERT, D3D12_STENCIL_OP_INCR,    D3D12_STENCIL_OP_DECR};
+    for (uint32_t index = 0; index < std::size(stencilOperations); ++index)
+        EXPECT_EQ(vernon::runtime::getDirectX12StencilOperationMapping(index), stencilOperations[index]);
+    constexpr D3D12_CULL_MODE cullModes[]{D3D12_CULL_MODE_NONE, D3D12_CULL_MODE_FRONT, D3D12_CULL_MODE_BACK};
+    for (uint32_t index = 0; index < std::size(cullModes); ++index)
+        EXPECT_EQ(vernon::runtime::getDirectX12CullModeMapping(index), cullModes[index]);
+}
 
 TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     const std::filesystem::path manifestPath = VERNON_DIRECTX_PIPELINE_BUNDLE;
@@ -111,10 +141,12 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     EXPECT_EQ(vernon::runtime::getDirectX12GraphicsPipelineCreationCount(pipeline), 1u);
     EXPECT_EQ(vernon::runtime::getDirectX12GraphicsRootSignatureCreationCount(pipeline), 1u);
+    invocation.stencil_reference = 123;
     ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     EXPECT_EQ(vernon::runtime::getDirectX12GraphicsPipelineCreationCount(pipeline), 1u);
     EXPECT_EQ(vernon::runtime::getDirectX12GraphicsRootSignatureCreationCount(pipeline), 1u);
+    EXPECT_EQ(vernon::runtime::getDirectX12LastStencilReference(runtime), 123u);
 
     std::vector<uint8_t> pixels(32 * 32 * 4);
     ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, target.handle, pixels.data(), pixels.size()),

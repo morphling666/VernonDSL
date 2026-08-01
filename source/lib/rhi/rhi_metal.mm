@@ -8,6 +8,7 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -54,6 +55,8 @@ struct MetalDeviceSlot {
 constexpr uint32_t metalDeviceBit = uint32_t{1} << 28;
 std::vector<MetalDeviceSlot> metalDevices;
 std::mutex deviceMutex;
+std::unordered_map<uint64_t, vernon::rhi::metal::RenderingState *> renderingStates;
+std::mutex renderingStateMutex;
 
 VernonRhiDevice invalidDevice() { return {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0}; }
 
@@ -159,6 +162,24 @@ std::shared_ptr<MetalDevice> lookupMetalDevice(VernonRhiDevice handle) {
 }
 
 } // namespace
+
+void vernon::rhi::metal::registerRenderingState(uint64_t commandBuffer, RenderingState *rendering) {
+    std::lock_guard<std::mutex> guard(renderingStateMutex);
+    renderingStates[commandBuffer] = rendering;
+}
+
+vernon::rhi::metal::RenderingState *vernon::rhi::metal::findRenderingState(uint64_t commandBuffer) {
+    std::lock_guard<std::mutex> guard(renderingStateMutex);
+    const auto found = renderingStates.find(commandBuffer);
+    return found == renderingStates.end() ? nullptr : found->second;
+}
+
+void vernon::rhi::metal::unregisterRenderingState(uint64_t commandBuffer, RenderingState *rendering) {
+    std::lock_guard<std::mutex> guard(renderingStateMutex);
+    const auto found = renderingStates.find(commandBuffer);
+    if (found != renderingStates.end() && found->second == rendering)
+        renderingStates.erase(found);
+}
 
 namespace vernon::rhi::metal_api {
 
@@ -349,6 +370,13 @@ VernonRhiStatus createImage(VernonRhiDevice handle, const VernonRhiImageDescript
         (descriptor->dimension == VERNON_RHI_IMAGE_3D && descriptor->array_layers != 1) ||
         (descriptor->dimension == VERNON_RHI_IMAGE_CUBE && !validCube))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    const bool depthFormat = descriptor->format == VERNON_RHI_FORMAT_D32_FLOAT ||
+                             descriptor->format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT;
+    if ((depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)) ||
+        (!depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT)) ||
+        (descriptor->format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT &&
+         (descriptor->usage & VERNON_RHI_IMAGE_STORAGE)))
+        return VERNON_RHI_STATUS_UNSUPPORTED;
     if (vernon::rhi::metal::pixelFormat(descriptor->format) == MTLPixelFormatInvalid)
         return VERNON_RHI_STATUS_UNSUPPORTED;
     std::lock_guard<std::mutex> guard(device->mutex);
@@ -712,16 +740,115 @@ bool recordBarriers(VernonRhiDevice handle, uint64_t, uint64_t native, const Ver
     return true;
 }
 
-bool endRendering(VernonRhiDevice handle, uint64_t, VernonRhiBackend backend, uint32_t backendKind, uint32_t,
-                  uint32_t, const uint64_t *, size_t, uint64_t, uint64_t renderingObject) {
+bool restartRendering(uint64_t native, vernon::rhi::metal::RenderingState &rendering, int32_t x, int32_t y,
+                      uint32_t width, uint32_t height, uint32_t layers, int32_t colorLocation,
+                      const float *clearColor, float clearDepth, uint32_t clearStencil, uint32_t aspects) {
+    if (!native || !rendering.encoder || x != 0 || y != 0 || layers != 1)
+        return false;
+    id<MTLTexture> target = colorLocation >= 0 ? rendering.colorTextures[colorLocation]
+                                               : rendering.depthStencilTexture;
+    if (!target || width != target.width || height != target.height)
+        return false;
+    if ((aspects & VERNON_RHI_ATTACHMENT_STENCIL) &&
+        target.pixelFormat != MTLPixelFormatDepth32Float_Stencil8)
+        return false;
+    for (size_t index = 0; index < rendering.colorTextures.size(); ++index)
+        if (rendering.colorTextures[index])
+            [rendering.encoder setColorStoreAction:MTLStoreActionStore atIndex:index];
+    if (rendering.depthStencilTexture) {
+        [rendering.encoder setDepthStoreAction:MTLStoreActionStore];
+        if (rendering.depthStencilTexture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8)
+            [rendering.encoder setStencilStoreAction:MTLStoreActionStore];
+    }
+    [rendering.encoder endEncoding];
+
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    for (size_t index = 0; index < rendering.colorTextures.size(); ++index) {
+        id<MTLTexture> texture = rendering.colorTextures[index];
+        if (!texture)
+            continue;
+        auto *attachment = pass.colorAttachments[index];
+        attachment.texture = texture;
+        attachment.loadAction = static_cast<int32_t>(index) == colorLocation ? MTLLoadActionClear
+                                                                             : MTLLoadActionLoad;
+        attachment.storeAction = MTLStoreActionStore;
+        if (static_cast<int32_t>(index) == colorLocation)
+            attachment.clearColor =
+                MTLClearColorMake(clearColor[0], clearColor[1], clearColor[2], clearColor[3]);
+    }
+    if (rendering.depthStencilTexture) {
+        pass.depthAttachment.texture = rendering.depthStencilTexture;
+        pass.depthAttachment.loadAction = aspects & VERNON_RHI_ATTACHMENT_DEPTH ? MTLLoadActionClear
+                                                                                : MTLLoadActionLoad;
+        pass.depthAttachment.storeAction = MTLStoreActionStore;
+        pass.depthAttachment.clearDepth = clearDepth;
+        if (rendering.depthStencilTexture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
+            pass.stencilAttachment.texture = rendering.depthStencilTexture;
+            pass.stencilAttachment.loadAction = aspects & VERNON_RHI_ATTACHMENT_STENCIL ? MTLLoadActionClear
+                                                                                        : MTLLoadActionLoad;
+            pass.stencilAttachment.storeAction = MTLStoreActionStore;
+            pass.stencilAttachment.clearStencil = clearStencil;
+        }
+    }
+    id<MTLCommandBuffer> commandBuffer =
+        (__bridge id<MTLCommandBuffer>)(reinterpret_cast<void *>(static_cast<uintptr_t>(native)));
+    rendering.encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+    return rendering.encoder != nil;
+}
+
+bool endRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
+                  uint32_t colorDiscardMask, uint32_t depthStencilDiscard, const uint64_t *, size_t, uint64_t,
+                  uint64_t renderingObject) {
     if (!lookupMetalDevice(handle) || backend != VERNON_RHI_BACKEND_METAL ||
         backendKind != vernon::rhi::CommandRenderingDynamic || !renderingObject)
         return false;
     auto *rendering = reinterpret_cast<vernon::rhi::metal::RenderingState *>(
         static_cast<uintptr_t>(renderingObject));
+    vernon::rhi::metal::unregisterRenderingState(native, rendering);
+    for (size_t index = 0; index < rendering->colorTextures.size(); ++index)
+        if (rendering->colorTextures[index])
+            [rendering->encoder setColorStoreAction:(colorDiscardMask & (uint32_t{1} << index))
+                                                        ? MTLStoreActionDontCare
+                                                        : MTLStoreActionStore
+                                            atIndex:index];
+    if (rendering->depthStencilTexture) {
+        [rendering->encoder setDepthStoreAction:(depthStencilDiscard & VERNON_RHI_ATTACHMENT_DEPTH)
+                                                    ? MTLStoreActionDontCare
+                                                    : MTLStoreActionStore];
+        if (rendering->depthStencilTexture.pixelFormat == MTLPixelFormatDepth32Float_Stencil8)
+            [rendering->encoder setStencilStoreAction:(depthStencilDiscard & VERNON_RHI_ATTACHMENT_STENCIL)
+                                                          ? MTLStoreActionDontCare
+                                                          : MTLStoreActionStore];
+    }
     [rendering->encoder endEncoding];
     delete rendering;
     return true;
+}
+
+bool clearColor(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind, int32_t x,
+                int32_t y, uint32_t width, uint32_t height, uint32_t layers, uint64_t target, uint32_t location,
+                const float color[4]) {
+    if (!lookupMetalDevice(handle) || backend != VERNON_RHI_BACKEND_METAL ||
+        backendKind != vernon::rhi::CommandRenderingDynamic || !target || location >= 8 || !color)
+        return false;
+    id<MTLTexture> texture = (__bridge id<MTLTexture>)(reinterpret_cast<void *>(static_cast<uintptr_t>(target)));
+    auto *rendering = vernon::rhi::metal::findRenderingState(native);
+    return rendering && rendering->colorTextures[location] == texture &&
+           restartRendering(native, *rendering, x, y, width, height, layers, static_cast<int32_t>(location), color,
+                            1.0f, 0, 0);
+}
+
+bool clearDepthStencil(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
+                       int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t layers, uint64_t target,
+                       float depth, uint32_t stencil, uint32_t aspects) {
+    if (!lookupMetalDevice(handle) || backend != VERNON_RHI_BACKEND_METAL ||
+        backendKind != vernon::rhi::CommandRenderingDynamic || !target ||
+        (aspects & ~(VERNON_RHI_ATTACHMENT_DEPTH | VERNON_RHI_ATTACHMENT_STENCIL)) || !aspects)
+        return false;
+    id<MTLTexture> texture = (__bridge id<MTLTexture>)(reinterpret_cast<void *>(static_cast<uintptr_t>(target)));
+    auto *rendering = vernon::rhi::metal::findRenderingState(native);
+    return rendering && rendering->depthStencilTexture == texture &&
+           restartRendering(native, *rendering, x, y, width, height, layers, -1, nullptr, depth, stencil, aspects);
 }
 
 } // namespace vernon::rhi::metal_api
@@ -775,8 +902,8 @@ const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
         abandonCommands,
         recordBarriers,
         endRendering,
-        nullptr,
-        nullptr,
+        clearColor,
+        clearDepthStencil,
         nullptr,
         createImageView,
         destroyImageView,

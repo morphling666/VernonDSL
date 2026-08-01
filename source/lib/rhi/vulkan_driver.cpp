@@ -181,6 +181,7 @@ bool Driver::loadDevice(VkDevice device) {
     VERNON_LOAD_VULKAN_DEVICE(cmdClearAttachments, "vkCmdClearAttachments");
     VERNON_LOAD_VULKAN_DEVICE(cmdSetViewport, "vkCmdSetViewport");
     VERNON_LOAD_VULKAN_DEVICE(cmdSetScissor, "vkCmdSetScissor");
+    VERNON_LOAD_VULKAN_DEVICE(cmdSetStencilReference, "vkCmdSetStencilReference");
     VERNON_LOAD_VULKAN_DEVICE(cmdBindVertexBuffers, "vkCmdBindVertexBuffers");
     VERNON_LOAD_VULKAN_DEVICE(cmdBindIndexBuffer, "vkCmdBindIndexBuffer");
     VERNON_LOAD_VULKAN_DEVICE(cmdDraw, "vkCmdDraw");

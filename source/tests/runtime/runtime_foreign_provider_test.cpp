@@ -12,12 +12,15 @@ struct MockProvider {
     uint32_t shaderPreparations{};
     uint32_t layoutPreparations{};
     uint32_t pipelinePreparations{};
+    uint32_t failedPipelinePreparation{};
+    uint32_t destroyedPipelines{};
     uint32_t bindingCreations{};
     uint32_t dispatches{};
     uint32_t retainedResources{};
     uint32_t releasedResources{};
     VernonRuntimeProviderObject lastEncoder{};
     VernonRuntimeProviderDispatchDescriptor lastDispatch{};
+    VernonRuntimeProviderDrawDescriptor lastDraw{};
 };
 
 VernonRuntimeProviderObject next(MockProvider &mock) { return {mock.nextObject++}; }
@@ -49,7 +52,8 @@ VernonRuntimeDeviceProvider makeProvider(MockProvider &mock, uint32_t capabiliti
         auto &state = *static_cast<MockProvider *>(data);
         ++state.pipelinePreparations;
         *pipeline = next(state);
-        return VERNON_STATUS_OK;
+        return state.pipelinePreparations == state.failedPipelinePreparation ? VERNON_STATUS_INTERNAL_ERROR
+                                                                             : VERNON_STATUS_OK;
     };
     provider.retain_resource = [](void *data, VernonRuntimeProviderResourceReference) {
         ++static_cast<MockProvider *>(data)->retainedResources;
@@ -75,12 +79,16 @@ VernonRuntimeDeviceProvider makeProvider(MockProvider &mock, uint32_t capabiliti
         state.lastDispatch = *descriptor;
         return VERNON_STATUS_OK;
     };
-    provider.encode_draw = [](void *, VernonRuntimeProviderObject, const VernonRuntimeProviderDrawDescriptor *) {
+    provider.encode_draw = [](void *data, VernonRuntimeProviderObject,
+                              const VernonRuntimeProviderDrawDescriptor *draw) {
+        static_cast<MockProvider *>(data)->lastDraw = *draw;
         return VERNON_STATUS_OK;
     };
     provider.destroy_shader = [](void *, VernonRuntimeProviderObject) {};
     provider.destroy_pipeline_layout = [](void *, VernonRuntimeProviderObject) {};
-    provider.destroy_pipeline = [](void *, VernonRuntimeProviderObject) {};
+    provider.destroy_pipeline = [](void *data, VernonRuntimeProviderObject) {
+        ++static_cast<MockProvider *>(data)->destroyedPipelines;
+    };
     provider.destroy_binding_set = [](void *, VernonRuntimeProviderObject) {};
     return provider;
 }
@@ -188,16 +196,50 @@ TEST(RuntimeForeignProvider, CachesGraphicsVariantsByCompatibility) {
     EXPECT_EQ(mock.pipelinePreparations, 1u);
 
     const uint32_t formats[]{3};
-    const VernonRuntimeCoreGraphicsCompatibility compatibility{
-        sizeof(VernonRuntimeCoreGraphicsCompatibility), 0, formats, 1, 0, 1, nullptr, 0, 42, {0, 0, 0, 0}};
+    const uint32_t strides[]{12};
+    VernonRuntimeProviderColorBlendState blend{};
+    blend.write_mask = VERNON_RHI_COLOR_WRITE_ALL;
+    VernonRuntimeCoreGraphicsCompatibility compatibility{};
+    compatibility.struct_size = sizeof(compatibility);
+    compatibility.color_formats = formats;
+    compatibility.color_format_count = std::size(formats);
+    compatibility.sample_count = 1;
+    compatibility.vertex_strides = strides;
+    compatibility.vertex_stride_count = std::size(strides);
+    compatibility.color_blends = &blend;
+    compatibility.color_blend_count = 1;
     VernonRuntimeCoreGraphicsVariant *first = nullptr;
     VernonRuntimeCoreGraphicsVariant *second = nullptr;
     ASSERT_EQ(vernonRuntimeCorePrepareGraphicsVariant(pipeline, &compatibility, &first), VERNON_STATUS_OK);
     ASSERT_EQ(vernonRuntimeCorePrepareGraphicsVariant(pipeline, &compatibility, &second), VERNON_STATUS_OK);
     EXPECT_EQ(mock.pipelinePreparations, 2u);
+    VernonRuntimeCoreDrawInvocation draw{};
+    draw.struct_size = sizeof(draw);
+    draw.vertex_count = 3;
+    draw.instance_count = 1;
+    draw.stencil_reference = 0x100;
+    EXPECT_EQ(vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(first, nullptr, &draw),
+              VERNON_STATUS_INVALID_ARGUMENT);
+    draw.stencil_reference = 0;
+    draw.clear_stencil = 0x100;
+    EXPECT_EQ(vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(first, nullptr, &draw),
+              VERNON_STATUS_INVALID_ARGUMENT);
+    draw.clear_stencil = 0;
+    VernonRuntimeProviderColorAttachment colorAttachment{};
+    colorAttachment.location = 1;
+    draw.color_attachments = &colorAttachment;
+    draw.color_attachment_count = 1;
+    EXPECT_EQ(vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(first, nullptr, &draw),
+              VERNON_STATUS_INVALID_ARGUMENT);
+    draw.color_attachments = nullptr;
+    draw.color_attachment_count = 0;
+    draw.stencil_reference = 17;
+    ASSERT_EQ(vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(first, nullptr, &draw), VERNON_STATUS_OK);
+    EXPECT_EQ(mock.lastDraw.stencil_reference, 17u);
 
     VernonRuntimeCoreGraphicsCompatibility changed = compatibility;
-    changed.vertex_layout_identity = 43;
+    const uint32_t changedStrides[]{16};
+    changed.vertex_strides = changedStrides;
     VernonRuntimeCoreGraphicsVariant *third = nullptr;
     ASSERT_EQ(vernonRuntimeCorePrepareGraphicsVariant(pipeline, &changed, &third), VERNON_STATUS_OK);
     EXPECT_EQ(mock.pipelinePreparations, 3u);
@@ -206,6 +248,32 @@ TEST(RuntimeForeignProvider, CachesGraphicsVariantsByCompatibility) {
     vernonRuntimeCoreGraphicsVariantDestroy(second);
     vernonRuntimeCoreGraphicsVariantDestroy(first);
     vernonRuntimeCorePipelineDestroy(pipeline);
+}
+
+TEST(RuntimeForeignProvider, ReleasesPartiallyPreparedGraphicsVariant) {
+    MockProvider mock;
+    mock.failedPipelinePreparation = 2;
+    VernonRuntimeDeviceProvider provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_GRAPHICS);
+    VernonRuntimeCorePipelineDescriptor descriptor = graphicsPipelineDescriptor();
+    VernonRuntimeCorePipeline *pipeline = nullptr;
+    ASSERT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_OK);
+    const uint32_t format[]{3};
+    VernonRuntimeProviderColorBlendState blend{};
+    blend.write_mask = VERNON_RHI_COLOR_WRITE_ALL;
+    VernonRuntimeCoreGraphicsCompatibility compatibility{};
+    compatibility.struct_size = sizeof(compatibility);
+    compatibility.color_formats = format;
+    compatibility.color_format_count = 1;
+    compatibility.sample_count = 1;
+    compatibility.color_blends = &blend;
+    compatibility.color_blend_count = 1;
+    VernonRuntimeCoreGraphicsVariant *variant = nullptr;
+    EXPECT_EQ(vernonRuntimeCorePrepareGraphicsVariant(pipeline, &compatibility, &variant),
+              VERNON_STATUS_INTERNAL_ERROR);
+    EXPECT_EQ(variant, nullptr);
+    EXPECT_EQ(mock.destroyedPipelines, 1u);
+    vernonRuntimeCorePipelineDestroy(pipeline);
+    EXPECT_EQ(mock.destroyedPipelines, 2u);
 }
 
 } // namespace

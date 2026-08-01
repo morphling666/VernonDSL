@@ -14,6 +14,7 @@ struct RhiAdapterPreparationStats {
     size_t bindingCreations{};
     size_t bindingSnapshotCreations{};
     size_t dispatches{};
+    uint32_t lastStencilReference{};
 };
 
 RhiAdapterPreparationStats getRhiAdapterPreparationStats(const VernonRuntimeRhiAdapter &adapter);

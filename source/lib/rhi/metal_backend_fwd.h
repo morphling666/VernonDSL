@@ -1,9 +1,13 @@
 #ifndef VERNON_RHI_METAL_BACKEND_FWD_H
 #define VERNON_RHI_METAL_BACKEND_FWD_H
 
+#include "VernonRHI.h"
+
 #include <cstdint>
 
 namespace vernon::rhi::metal {
+
+uint32_t pixelFormat(VernonRhiFormat format);
 
 struct DeviceState;
 struct DeviceCapabilities {

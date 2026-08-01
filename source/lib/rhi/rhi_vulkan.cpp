@@ -1,4 +1,5 @@
 #include "backend_dispatch.h"
+#include "image_data_layout.h"
 #include "logical_resource_record.h"
 #include "rhi_test_hooks.h"
 #include "sampler_filter.h"
@@ -88,13 +89,8 @@ template <typename Slots> auto *lookupResourceRecord(Slots &slots, uint64_t key)
     return slot.isRetained(generation) ? &slot : nullptr;
 }
 
-std::optional<size_t> rgba8Size(const VernonRhiImageDescriptor &descriptor) {
-    if (descriptor.dimension != VERNON_RHI_IMAGE_2D || descriptor.format != VERNON_RHI_FORMAT_RGBA8_UNORM ||
-        descriptor.depth != 1 || descriptor.mip_levels != 1 || descriptor.array_layers != 1 ||
-        descriptor.width > (std::numeric_limits<size_t>::max)() / descriptor.height)
-        return std::nullopt;
-    const size_t pixels = static_cast<size_t>(descriptor.width) * descriptor.height;
-    return pixels <= (std::numeric_limits<size_t>::max)() / 4 ? std::optional<size_t>{pixels * 4} : std::nullopt;
+std::optional<size_t> downloadSize(const VernonRhiImageDescriptor &descriptor) {
+    return vernon::rhi::simpleImageDownloadSize(descriptor);
 }
 
 std::shared_ptr<VulkanInteropDevice> lookupVulkanDevice(VernonRhiDevice handle) {
@@ -186,6 +182,7 @@ VkFormat vulkanFormat(VernonRhiFormat format) {
         VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_D32_SFLOAT,
         VK_FORMAT_R8G8B8_UNORM,        VK_FORMAT_R32G32_SFLOAT,
         VK_FORMAT_R32G32B32_SFLOAT,    VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+        VK_FORMAT_D32_SFLOAT_S8_UINT,
     };
     const uint32_t index = static_cast<uint32_t>(format);
     return index < sizeof(formats) / sizeof(formats[0]) ? formats[index] : VK_FORMAT_UNDEFINED;
@@ -362,8 +359,7 @@ void transitionVulkanImage(VkCommandBuffer command, VulkanImageSlot &slot, VkIma
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = image.image;
-    barrier.subresourceRange.aspectMask =
-        image.format == VK_FORMAT_D32_SFLOAT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.aspectMask = vernon::rhi::vulkan::imageAspectMask(image.format);
     barrier.subresourceRange.levelCount = 1;
     barrier.subresourceRange.layerCount = 1;
     VkPipelineStageFlags sourceStage{};
@@ -552,6 +548,14 @@ extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiVulkanDeviceGetBufferNativeH
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     *output = vulkanHandleBits(slot->buffer.buffer);
     return VERNON_RHI_STATUS_OK;
+}
+
+VernonRhiStatus createImageView(VernonRhiDevice handle, const VernonRhiImageViewDescriptor *descriptor,
+                                VernonRhiImageView *output) {
+    if (!lookupVulkanDevice(handle) || !descriptor || descriptor->struct_size < sizeof(*descriptor) || !output)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    *output = {VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    return VERNON_RHI_STATUS_UNSUPPORTED;
 }
 
 VernonRhiStatus destroyImageView(VernonRhiDevice handle, VernonRhiImageView imageView) {
@@ -763,9 +767,12 @@ VernonRhiStatus createImage(VernonRhiDevice handle, const VernonRhiImageDescript
     }
 
     const VkFormat format = descriptor ? vulkanFormat(descriptor->format) : VK_FORMAT_UNDEFINED;
+    const bool depthFormat = descriptor && (descriptor->format == VERNON_RHI_FORMAT_D32_FLOAT ||
+                                            descriptor->format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT);
     if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || format == VK_FORMAT_UNDEFINED ||
         descriptor->width == 0 || descriptor->height == 0 || descriptor->depth == 0 || descriptor->mip_levels == 0 ||
-        descriptor->sample_count != 1)
+        descriptor->sample_count != 1 || (depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)) ||
+        (!depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT)))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(device->mutex);
     VkFormatFeatureFlags requiredFeatures = VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
@@ -809,8 +816,7 @@ VernonRhiStatus createImage(VernonRhiDevice handle, const VernonRhiImageDescript
                         : descriptor->dimension == VERNON_RHI_IMAGE_CUBE ? VK_IMAGE_VIEW_TYPE_CUBE
                                                                          : VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format = format;
-    viewInfo.subresourceRange.aspectMask =
-        descriptor->format == VERNON_RHI_FORMAT_D32_FLOAT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.aspectMask = vernon::rhi::vulkan::imageAspectMask(format);
     viewInfo.subresourceRange.levelCount = descriptor->mip_levels;
     viewInfo.subresourceRange.layerCount = imageInfo.arrayLayers;
     if (!device->state.createImage(slot.image, imageInfo, viewInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -902,7 +908,7 @@ VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image, void
     VulkanImageSlot *slot = lookupVulkanSlot(device->images, image);
     if (!slot || !slot->image.owned)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    const auto expected = rgba8Size(slot->ownedDescriptor);
+    const auto expected = downloadSize(slot->ownedDescriptor);
     if (!expected || size != *expected)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     VkBuffer staging = VK_NULL_HANDLE;
@@ -916,17 +922,37 @@ VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image, void
     if (!device->state.beginCommands(command, device->error))
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
     transitionVulkanImage(command, *slot, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    VkBufferImageCopy region{};
-    region.bufferOffset = stagingOffset;
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.layerCount = 1;
-    region.imageExtent = {slot->ownedDescriptor.width, slot->ownedDescriptor.height, 1};
+    const bool depthStencil = slot->ownedDescriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT;
+    const size_t pixels = static_cast<size_t>(slot->ownedDescriptor.width) * slot->ownedDescriptor.height;
+    std::array<VkBufferImageCopy, 2> regions{};
+    regions[0].bufferOffset = stagingOffset;
+    regions[0].imageSubresource.aspectMask = vernon::rhi::vulkan::imagePrimaryCopyAspectMask(slot->image.format);
+    regions[0].imageSubresource.layerCount = 1;
+    regions[0].imageExtent = {slot->ownedDescriptor.width, slot->ownedDescriptor.height, 1};
+    uint32_t regionCount = 1;
+    if (depthStencil) {
+        regions[1] = regions[0];
+        regions[1].bufferOffset = stagingOffset + pixels * sizeof(float);
+        regions[1].imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+        regionCount = 2;
+    }
     vernon::rhi::vulkan::driver().cmdCopyImageToBuffer(command, slot->image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                                       staging, 1, &region);
+                                                       staging, regionCount, regions.data());
     transitionVulkanImage(command, *slot, restore);
     if (!device->state.submitCommands(command, device->error))
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    std::memcpy(destination, mapped, size);
+    if (!depthStencil) {
+        std::memcpy(destination, mapped, size);
+    } else {
+        auto *output = static_cast<uint8_t *>(destination);
+        const uint8_t *stencil = mapped + pixels * sizeof(float);
+        for (size_t index = 0; index < pixels; ++index) {
+            float depth{};
+            std::memcpy(&depth, mapped + index * sizeof(depth), sizeof(depth));
+            vernon::rhi::storePackedDepthStencil(output + index * vernon::rhi::packedDepthStencilPixelSize, depth,
+                                                 stencil[index]);
+        }
+    }
     return VERNON_RHI_STATUS_OK;
 }
 
@@ -1161,8 +1187,7 @@ bool recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native
             barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barrier.image = slot->image.image;
-            barrier.subresourceRange.aspectMask =
-                slot->image.format == VK_FORMAT_D32_SFLOAT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.aspectMask = vernon::rhi::vulkan::imageAspectMask(slot->image.format);
             barrier.subresourceRange.levelCount = 1;
             barrier.subresourceRange.layerCount = 1;
             VkPipelineStageFlags source{};
@@ -1411,7 +1436,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::vulkanBackendDispatch() {
         clearColor,
         clearDepthStencil,
         nullptr,
-        nullptr,
+        createImageView,
         destroyImageView,
         getImageViewNativeHandle,
     };

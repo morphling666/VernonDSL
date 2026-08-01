@@ -1,3 +1,4 @@
+#include "../../lib/rhi/metal_backend_fwd.h"
 #include "../../lib/rhi/rhi_internal.h"
 #include "../../lib/rhi/sampler_filter.h"
 #include "../../lib/runtime/runtime_dispatch.h"
@@ -873,7 +874,7 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     layoutDescriptor.struct_size = sizeof(layoutDescriptor);
     VernonRuntimeProviderObject layout{};
     ASSERT_EQ(provider->prepare_pipeline_layout(provider->user_data, &layoutDescriptor, &layout), VERNON_STATUS_OK);
-    constexpr uint32_t colorFormat = 70; // MTLPixelFormatRGBA8Unorm
+    const uint32_t colorFormat = vernon::rhi::metal::pixelFormat(VERNON_RHI_FORMAT_RGBA8_UNORM);
     VernonRuntimeProviderPipelineDescriptor pipelineDescriptor{};
     pipelineDescriptor.struct_size = sizeof(pipelineDescriptor);
     pipelineDescriptor.kind = VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE;
@@ -883,8 +884,37 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     pipelineDescriptor.layout = layout;
     pipelineDescriptor.color_formats = &colorFormat;
     pipelineDescriptor.color_format_count = 1;
-    pipelineDescriptor.depth_stencil_format = 252; // MTLPixelFormatDepth32Float
+    pipelineDescriptor.depth_stencil_format = vernon::rhi::metal::pixelFormat(VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT);
     pipelineDescriptor.sample_count = 1;
+    pipelineDescriptor.rasterization.cull_mode = VERNON_RHI_CULL_NONE;
+    pipelineDescriptor.rasterization.front_face = VERNON_RHI_FRONT_FACE_COUNTER_CLOCKWISE;
+    pipelineDescriptor.depth_stencil.depth_test = 1;
+    pipelineDescriptor.depth_stencil.depth_write = 1;
+    pipelineDescriptor.depth_stencil.depth_compare = VERNON_RHI_COMPARE_LESS;
+    pipelineDescriptor.depth_stencil.stencil_test = 1;
+    pipelineDescriptor.depth_stencil.front.compare = VERNON_RHI_COMPARE_ALWAYS;
+    pipelineDescriptor.depth_stencil.front.stencil_fail = VERNON_RHI_STENCIL_KEEP;
+    pipelineDescriptor.depth_stencil.front.depth_fail = VERNON_RHI_STENCIL_KEEP;
+    pipelineDescriptor.depth_stencil.front.pass = VERNON_RHI_STENCIL_REPLACE;
+    pipelineDescriptor.depth_stencil.stencil_read_mask = 0xff;
+    pipelineDescriptor.depth_stencil.stencil_write_mask = 0xff;
+    pipelineDescriptor.depth_stencil.back = pipelineDescriptor.depth_stencil.front;
+    VernonRuntimeProviderColorBlendState blend{};
+    blend.source_color_factor = VERNON_RHI_BLEND_ONE;
+    blend.destination_color_factor = VERNON_RHI_BLEND_ZERO;
+    blend.source_alpha_factor = VERNON_RHI_BLEND_ONE;
+    blend.destination_alpha_factor = VERNON_RHI_BLEND_ZERO;
+    blend.color_operation = VERNON_RHI_BLEND_ADD;
+    blend.alpha_operation = VERNON_RHI_BLEND_ADD;
+    blend.write_mask = VERNON_RHI_COLOR_WRITE_ALL;
+    pipelineDescriptor.color_blends = &blend;
+    pipelineDescriptor.color_blend_count = 1;
+    pipelineDescriptor.depth_stencil.depth_compare = UINT32_MAX;
+    VernonRuntimeProviderObject rejectedPipeline{};
+    EXPECT_EQ(provider->prepare_pipeline(provider->user_data, &pipelineDescriptor, &rejectedPipeline),
+              VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(rejectedPipeline.value, 0u);
+    pipelineDescriptor.depth_stencil.depth_compare = VERNON_RHI_COMPARE_LESS;
     VernonRuntimeProviderObject pipeline{};
     ASSERT_EQ(provider->prepare_pipeline(provider->user_data, &pipelineDescriptor, &pipeline), VERNON_STATUS_OK);
 
@@ -916,8 +946,8 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     VernonRuntimeProviderResourceReference secondImageReference{};
     ASSERT_EQ(vernonRuntimeRhiAdapterReferenceImage(adapter, secondImage, &secondImageReference), VERNON_STATUS_OK);
     VernonRhiImageDescriptor depthDescriptor = imageDescriptor;
-    depthDescriptor.format = VERNON_RHI_FORMAT_D32_FLOAT;
-    depthDescriptor.usage = VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT;
+    depthDescriptor.format = VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT;
+    depthDescriptor.usage = VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE;
     VernonRhiImage depthImage{};
     ASSERT_EQ(vernonRhiDeviceCreateImage(device, &depthDescriptor, &depthImage), VERNON_RHI_STATUS_OK);
     viewDescriptor.image = depthImage;
@@ -943,10 +973,11 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     rhiDepth.initial_state = VERNON_RHI_STATE_UNDEFINED;
     rhiDepth.final_state = VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT;
     rhiDepth.depth_load_operation = VERNON_RHI_LOAD_CLEAR;
-    rhiDepth.depth_store_operation = VERNON_RHI_STORE_DISCARD;
+    rhiDepth.depth_store_operation = VERNON_RHI_STORE_PRESERVE;
     rhiDepth.clear_depth = 1.0f;
-    rhiDepth.stencil_load_operation = VERNON_RHI_LOAD_DISCARD;
-    rhiDepth.stencil_store_operation = VERNON_RHI_STORE_DISCARD;
+    rhiDepth.stencil_load_operation = VERNON_RHI_LOAD_CLEAR;
+    rhiDepth.stencil_store_operation = VERNON_RHI_STORE_PRESERVE;
+    rhiDepth.clear_stencil = 7;
     VernonRhiRenderingDescriptor rendering{};
     rendering.struct_size = sizeof(rendering);
     rendering.color_attachments = &rhiAttachment;
@@ -977,8 +1008,12 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     draw.color_attachment_count = 1;
     draw.depth_stencil_attachment = depthReference;
     draw.depth_load_operation = VERNON_RHI_LOAD_CLEAR;
-    draw.depth_store_operation = VERNON_RHI_STORE_DISCARD;
+    draw.depth_store_operation = VERNON_RHI_STORE_PRESERVE;
     draw.clear_depth = 1.0f;
+    draw.stencil_load_operation = VERNON_RHI_LOAD_CLEAR;
+    draw.stencil_store_operation = VERNON_RHI_STORE_PRESERVE;
+    draw.clear_stencil = 7;
+    draw.stencil_reference = 7;
     draw.viewport[2] = imageDescriptor.width;
     draw.viewport[3] = imageDescriptor.height;
     draw.scissor[2] = imageDescriptor.width;
@@ -988,18 +1023,29 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     EXPECT_EQ(provider->encode_draw(provider->user_data, providerCommand, &draw), VERNON_STATUS_INVALID_ARGUMENT);
     attachment.image = imageReference;
     constexpr float explicitClear[]{0, 0, 0, 1};
-    EXPECT_EQ(vernonRhiCommandEncoderClearColorAttachment(device, command, 0, explicitClear),
-              VERNON_RHI_STATUS_UNSUPPORTED);
+    EXPECT_EQ(vernonRhiCommandEncoderClearColorAttachment(device, command, 0, explicitClear), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiCommandEncoderClearDepthStencilAttachment(
+                  device, command, 0.5f, 3, VERNON_RHI_ATTACHMENT_DEPTH | VERNON_RHI_ATTACHMENT_STENCIL),
+              VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiCommandEncoderEndRendering(device, command), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiCommandEncoderFinish(device, command), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceSubmit(device, command), VERNON_RHI_STATUS_OK);
     std::array<uint8_t, 4 * 4 * 4> pixels{};
     ASSERT_EQ(vernonRhiDeviceDownloadImage(device, image, pixels.data(), pixels.size()), VERNON_RHI_STATUS_OK);
     for (size_t index = 0; index < pixels.size(); index += 4) {
-        EXPECT_EQ(pixels[index], 255);
-        EXPECT_NEAR(pixels[index + 1], 64, 1);
+        EXPECT_EQ(pixels[index], 0);
+        EXPECT_EQ(pixels[index + 1], 0);
         EXPECT_EQ(pixels[index + 2], 0);
         EXPECT_EQ(pixels[index + 3], 255);
+    }
+    std::array<uint8_t, 4 * 4 * 8> depthStencil{};
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(device, depthImage, depthStencil.data(), depthStencil.size()),
+              VERNON_RHI_STATUS_OK);
+    for (size_t index = 0; index < depthStencil.size(); index += 8) {
+        float depth = 0.0f;
+        std::memcpy(&depth, depthStencil.data() + index, sizeof(depth));
+        EXPECT_FLOAT_EQ(depth, 0.5f);
+        EXPECT_EQ(depthStencil[index + 4], 3);
     }
 
     EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, command), VERNON_RHI_STATUS_OK);

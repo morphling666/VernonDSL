@@ -1,3 +1,4 @@
+#include "../runtime_test_hooks.h"
 #include "../vertex_attribute_capabilities.h"
 #include "adapter_common.h"
 
@@ -5,7 +6,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <new>
 #include <unordered_map>
@@ -41,6 +44,13 @@ struct PreparedPipeline {
     bool hasResourceTable{};
     bool hasSamplerTable{};
     std::vector<InlineRootBlock> inlineRootBlocks;
+
+    ~PreparedPipeline() {
+        if (pipeline)
+            pipeline->Release();
+        if (rootSignature)
+            rootSignature->Release();
+    }
 };
 struct PreparedBindingSet {
     std::atomic<uint32_t> references{1};
@@ -126,6 +136,40 @@ template <typename Object> void releaseObject(Object *&object) {
     if (object)
         object->Release();
     object = nullptr;
+}
+
+D3D12_BLEND blendFactor(uint32_t value) {
+    constexpr D3D12_BLEND values[]{D3D12_BLEND_ZERO,          D3D12_BLEND_ONE,           D3D12_BLEND_SRC_COLOR,
+                                   D3D12_BLEND_INV_SRC_COLOR, D3D12_BLEND_DEST_COLOR,    D3D12_BLEND_INV_DEST_COLOR,
+                                   D3D12_BLEND_SRC_ALPHA,     D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_DEST_ALPHA,
+                                   D3D12_BLEND_INV_DEST_ALPHA};
+    return value < std::size(values) ? values[value] : D3D12_BLEND_ZERO;
+}
+
+D3D12_BLEND_OP blendOperation(uint32_t value) {
+    constexpr D3D12_BLEND_OP values[]{D3D12_BLEND_OP_ADD, D3D12_BLEND_OP_SUBTRACT, D3D12_BLEND_OP_REV_SUBTRACT,
+                                      D3D12_BLEND_OP_MIN, D3D12_BLEND_OP_MAX};
+    return value < std::size(values) ? values[value] : D3D12_BLEND_OP_ADD;
+}
+
+D3D12_COMPARISON_FUNC compareOperation(uint32_t value) {
+    constexpr D3D12_COMPARISON_FUNC values[]{D3D12_COMPARISON_FUNC_NEVER,         D3D12_COMPARISON_FUNC_LESS,
+                                             D3D12_COMPARISON_FUNC_EQUAL,         D3D12_COMPARISON_FUNC_LESS_EQUAL,
+                                             D3D12_COMPARISON_FUNC_GREATER,       D3D12_COMPARISON_FUNC_NOT_EQUAL,
+                                             D3D12_COMPARISON_FUNC_GREATER_EQUAL, D3D12_COMPARISON_FUNC_ALWAYS};
+    return value < std::size(values) ? values[value] : D3D12_COMPARISON_FUNC_NEVER;
+}
+
+D3D12_STENCIL_OP stencilOperation(uint32_t value) {
+    constexpr D3D12_STENCIL_OP values[]{D3D12_STENCIL_OP_KEEP,     D3D12_STENCIL_OP_ZERO,     D3D12_STENCIL_OP_REPLACE,
+                                        D3D12_STENCIL_OP_INCR_SAT, D3D12_STENCIL_OP_DECR_SAT, D3D12_STENCIL_OP_INVERT,
+                                        D3D12_STENCIL_OP_INCR,     D3D12_STENCIL_OP_DECR};
+    return value < std::size(values) ? values[value] : D3D12_STENCIL_OP_KEEP;
+}
+
+D3D12_CULL_MODE cullMode(uint32_t value) {
+    constexpr D3D12_CULL_MODE values[]{D3D12_CULL_MODE_NONE, D3D12_CULL_MODE_FRONT, D3D12_CULL_MODE_BACK};
+    return value < std::size(values) ? values[value] : D3D12_CULL_MODE_NONE;
 }
 
 uint32_t getCapabilities(void *) {
@@ -235,9 +279,9 @@ DXGI_FORMAT vertexFormat(uint32_t dtype, uint32_t components) {
     return row < 0 || components == 0 || components > 4 ? DXGI_FORMAT_UNKNOWN : formats[row][components - 1];
 }
 
-VernonStatus prepareGraphicsPipeline(VernonRuntimeRhiAdapter &adapter,
-                                     const VernonRuntimeProviderPipelineDescriptor &descriptor, PreparedLayout &layout,
-                                     VernonRuntimeProviderObject *output) {
+VernonStatus prepareGraphicsPipelineImpl(VernonRuntimeRhiAdapter &adapter,
+                                         const VernonRuntimeProviderPipelineDescriptor &descriptor,
+                                         PreparedLayout &layout, VernonRuntimeProviderObject *output) {
     auto pipeline = std::unique_ptr<PreparedPipeline>(new (std::nothrow) PreparedPipeline());
     if (!pipeline)
         return fail(adapter, "D3D12 graphics pipeline preparation ran out of memory", VERNON_STATUS_INTERNAL_ERROR);
@@ -248,6 +292,10 @@ VernonStatus prepareGraphicsPipeline(VernonRuntimeRhiAdapter &adapter,
         adapter.pipelinePreparations.fetch_add(1, std::memory_order_relaxed);
         return VERNON_STATUS_OK;
     }
+    if (descriptor.color_format_count > 8 || descriptor.sample_count != 1 ||
+        (descriptor.depth_stencil_format && descriptor.depth_stencil_format != DXGI_FORMAT_D32_FLOAT &&
+         descriptor.depth_stencil_format != DXGI_FORMAT_D32_FLOAT_S8X24_UINT))
+        return fail(adapter, "D3D12 graphics pipeline uses an unsupported attachment configuration");
     PreparedShader *vertex = nullptr;
     PreparedShader *fragment = nullptr;
     for (size_t index = 0; index < descriptor.shader_count; ++index) {
@@ -379,19 +427,77 @@ VernonStatus prepareGraphicsPipeline(VernonRuntimeRhiAdapter &adapter,
     native.pRootSignature = pipeline->rootSignature;
     native.VS = {vertex->artifact.data(), vertex->artifact.size()};
     native.PS = {fragment->artifact.data(), fragment->artifact.size()};
+    if (descriptor.color_blend_count != descriptor.color_format_count ||
+        (descriptor.color_blend_count && !descriptor.color_blends))
+        return fail(adapter, "D3D12 graphics pipeline blend state does not match its attachments");
     native.BlendState.AlphaToCoverageEnable = FALSE;
-    native.BlendState.IndependentBlendEnable = FALSE;
-    for (auto &target : native.BlendState.RenderTarget)
-        target.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    native.BlendState.IndependentBlendEnable = descriptor.color_format_count > 1;
+    for (size_t index = 0; index < descriptor.color_format_count; ++index) {
+        const auto &source = descriptor.color_blends[index];
+        if (source.blend_enabled > 1 || source.source_color_factor > VERNON_RHI_BLEND_ONE_MINUS_DESTINATION_ALPHA ||
+            source.destination_color_factor > VERNON_RHI_BLEND_ONE_MINUS_DESTINATION_ALPHA ||
+            source.source_alpha_factor > VERNON_RHI_BLEND_ONE_MINUS_DESTINATION_ALPHA ||
+            source.destination_alpha_factor > VERNON_RHI_BLEND_ONE_MINUS_DESTINATION_ALPHA ||
+            source.color_operation > VERNON_RHI_BLEND_MAXIMUM || source.alpha_operation > VERNON_RHI_BLEND_MAXIMUM ||
+            (source.write_mask & ~VERNON_RHI_COLOR_WRITE_ALL))
+            return fail(adapter, "D3D12 graphics pipeline contains an invalid blend state");
+        auto &target = native.BlendState.RenderTarget[index];
+        target.BlendEnable = source.blend_enabled;
+        target.SrcBlend = blendFactor(source.source_color_factor);
+        target.DestBlend = blendFactor(source.destination_color_factor);
+        target.BlendOp = blendOperation(source.color_operation);
+        target.SrcBlendAlpha = blendFactor(source.source_alpha_factor);
+        target.DestBlendAlpha = blendFactor(source.destination_alpha_factor);
+        target.BlendOpAlpha = blendOperation(source.alpha_operation);
+        target.RenderTargetWriteMask = static_cast<UINT8>(source.write_mask);
+    }
     native.SampleMask = UINT_MAX;
+    const auto &rasterization = descriptor.rasterization;
+    if (rasterization.cull_mode > VERNON_RHI_CULL_BACK || rasterization.front_face > VERNON_RHI_FRONT_FACE_CLOCKWISE ||
+        rasterization.depth_clamp || rasterization.depth_bias_enabled > 1 ||
+        !std::isfinite(rasterization.depth_bias_constant) || !std::isfinite(rasterization.depth_bias_slope) ||
+        static_cast<double>(rasterization.depth_bias_constant) < (std::numeric_limits<INT>::min)() ||
+        static_cast<double>(rasterization.depth_bias_constant) > (std::numeric_limits<INT>::max)())
+        return fail(adapter, "D3D12 graphics pipeline contains an unsupported rasterization state");
     native.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    native.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    native.RasterizerState.CullMode = cullMode(rasterization.cull_mode);
+    native.RasterizerState.FrontCounterClockwise = rasterization.front_face == VERNON_RHI_FRONT_FACE_COUNTER_CLOCKWISE;
+    native.RasterizerState.DepthBias =
+        rasterization.depth_bias_enabled ? static_cast<INT>(rasterization.depth_bias_constant) : 0;
+    native.RasterizerState.SlopeScaledDepthBias =
+        rasterization.depth_bias_enabled ? rasterization.depth_bias_slope : 0.0f;
     native.RasterizerState.DepthClipEnable = TRUE;
-    native.DepthStencilState.DepthEnable = descriptor.depth_stencil_format ? TRUE : FALSE;
+    const auto &depthStencil = descriptor.depth_stencil;
+    const bool hasDepth = descriptor.depth_stencil_format != DXGI_FORMAT_UNKNOWN;
+    const bool hasStencil = descriptor.depth_stencil_format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    if (depthStencil.depth_test > 1 || depthStencil.depth_write > 1 || depthStencil.stencil_test > 1 ||
+        depthStencil.depth_compare > VERNON_RHI_COMPARE_ALWAYS ||
+        (!hasDepth && (depthStencil.depth_test || depthStencil.depth_write)) ||
+        (!hasStencil && depthStencil.stencil_test) ||
+        depthStencil.front.stencil_fail > VERNON_RHI_STENCIL_DECREMENT_WRAP ||
+        depthStencil.front.depth_fail > VERNON_RHI_STENCIL_DECREMENT_WRAP ||
+        depthStencil.front.pass > VERNON_RHI_STENCIL_DECREMENT_WRAP ||
+        depthStencil.front.compare > VERNON_RHI_COMPARE_ALWAYS ||
+        depthStencil.back.stencil_fail > VERNON_RHI_STENCIL_DECREMENT_WRAP ||
+        depthStencil.back.depth_fail > VERNON_RHI_STENCIL_DECREMENT_WRAP ||
+        depthStencil.back.pass > VERNON_RHI_STENCIL_DECREMENT_WRAP ||
+        depthStencil.back.compare > VERNON_RHI_COMPARE_ALWAYS || depthStencil.stencil_read_mask > UINT8_MAX ||
+        depthStencil.stencil_write_mask > UINT8_MAX)
+        return fail(adapter, "D3D12 graphics pipeline contains an invalid depth/stencil state");
+    native.DepthStencilState.DepthEnable = depthStencil.depth_test;
     native.DepthStencilState.DepthWriteMask =
-        descriptor.depth_stencil_format ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-    native.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
-    native.DepthStencilState.StencilEnable = FALSE;
+        depthStencil.depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+    native.DepthStencilState.DepthFunc =
+        compareOperation(depthStencil.depth_test ? depthStencil.depth_compare : VERNON_RHI_COMPARE_ALWAYS);
+    native.DepthStencilState.StencilEnable = depthStencil.stencil_test;
+    native.DepthStencilState.StencilReadMask = static_cast<UINT8>(depthStencil.stencil_read_mask);
+    native.DepthStencilState.StencilWriteMask = static_cast<UINT8>(depthStencil.stencil_write_mask);
+    const auto stencilFace = [](const VernonRuntimeProviderStencilFaceState &source) {
+        return D3D12_DEPTH_STENCILOP_DESC{stencilOperation(source.stencil_fail), stencilOperation(source.depth_fail),
+                                          stencilOperation(source.pass), compareOperation(source.compare)};
+    };
+    native.DepthStencilState.FrontFace = stencilFace(depthStencil.front);
+    native.DepthStencilState.BackFace = stencilFace(depthStencil.back);
     native.InputLayout = {inputElements.data(), static_cast<UINT>(inputElements.size())};
     native.PrimitiveTopologyType = descriptor.topology == 1   ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE
                                    : descriptor.topology == 2 ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT
@@ -402,13 +508,21 @@ VernonStatus prepareGraphicsPipeline(VernonRuntimeRhiAdapter &adapter,
     native.DSVFormat = static_cast<DXGI_FORMAT>(descriptor.depth_stencil_format);
     native.SampleDesc.Count = std::max(1u, descriptor.sample_count);
     result = pipeline->device->device->CreateGraphicsPipelineState(&native, IID_PPV_ARGS(&pipeline->pipeline));
-    if (FAILED(result)) {
-        releaseObject(pipeline->rootSignature);
+    if (FAILED(result))
         return fail(adapter, "ID3D12Device::CreateGraphicsPipelineState failed", VERNON_STATUS_INTERNAL_ERROR);
-    }
     *output = toHandle(pipeline.release());
     adapter.pipelinePreparations.fetch_add(1, std::memory_order_relaxed);
     return VERNON_STATUS_OK;
+}
+
+VernonStatus prepareGraphicsPipeline(VernonRuntimeRhiAdapter &adapter,
+                                     const VernonRuntimeProviderPipelineDescriptor &descriptor, PreparedLayout &layout,
+                                     VernonRuntimeProviderObject *output) {
+    try {
+        return prepareGraphicsPipelineImpl(adapter, descriptor, layout, output);
+    } catch (const std::bad_alloc &) {
+        return fail(adapter, "D3D12 graphics pipeline preparation ran out of memory", VERNON_STATUS_INTERNAL_ERROR);
+    }
 }
 
 VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDescriptor *descriptor,
@@ -467,10 +581,8 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
     native.pRootSignature = pipeline->rootSignature;
     native.CS = {shader->artifact.data(), shader->artifact.size()};
     result = pipeline->device->device->CreateComputePipelineState(&native, IID_PPV_ARGS(&pipeline->pipeline));
-    if (FAILED(result)) {
-        releaseObject(pipeline->rootSignature);
+    if (FAILED(result))
         return fail(adapter, "ID3D12Device::CreateComputePipelineState failed", VERNON_STATUS_INTERNAL_ERROR);
-    }
     *output = toHandle(pipeline.release());
     adapter.pipelinePreparations.fetch_add(1, std::memory_order_relaxed);
     return VERNON_STATUS_OK;
@@ -512,7 +624,7 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
         } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
             const uint64_t native = resolveRhiResource(adapter, value->resource);
             auto *buffer = reinterpret_cast<rhi::directx12::Buffer *>(native);
-            if ((value->resource.identity & kDirectX12ResourceKindMask) != kDirectX12BufferResource || !buffer ||
+            if ((value->resource.identity & kRhiResourceKindMask) != kRhiBufferResource || !buffer ||
                 !buffer->resource || value->resource.offset > value->resource.size ||
                 slot.layout.element_size > value->resource.size - value->resource.offset)
                 return fail(adapter, "D3D12 storage binding is invalid");
@@ -524,11 +636,11 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
                 bindings.resolvedValues[index] = 0;
             else {
                 const uint64_t expectedKind =
-                    slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ? kDirectX12ImageResource
-                    : slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER     ? kDirectX12SamplerResource
-                                                                              : kDirectX12BufferResource;
+                    slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ? kRhiImageResource
+                    : slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER     ? kRhiSamplerResource
+                                                                              : kRhiBufferResource;
                 const uint64_t native = resolveRhiResource(adapter, value->resource);
-                if ((value->resource.identity & kDirectX12ResourceKindMask) != expectedKind || native == 0 ||
+                if ((value->resource.identity & kRhiResourceKindMask) != expectedKind || native == 0 ||
                     (slot.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && value->stride == 0))
                     return fail(adapter, "D3D12 graphics resource binding is invalid");
                 bindings.resolvedValues[index] = native;
@@ -790,6 +902,8 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     if (!commands || claim < 0)
         return fail(adapter, "D3D12 draw command encoder is invalid");
     commands->SetPipelineState(pipeline->pipeline);
+    commands->OMSetStencilRef(descriptor->stencil_reference);
+    adapter.lastStencilReference.store(descriptor->stencil_reference, std::memory_order_relaxed);
     const bool firstDraw = claim != 0;
     const bool standaloneRendering = !commandEncoderHasRenderingDescriptor(adapter, commandEncoder);
     if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
@@ -826,13 +940,13 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
                                      colorClears[index].data());
     }
     VernonRhiLoadOperation depthLoad = static_cast<VernonRhiLoadOperation>(descriptor->depth_load_operation);
-    VernonRhiStoreOperation ignoredDepthStore = static_cast<VernonRhiStoreOperation>(descriptor->depth_store_operation);
-    VernonRhiLoadOperation ignoredStencilLoad = VERNON_RHI_LOAD_DISCARD;
-    VernonRhiStoreOperation ignoredStencilStore = VERNON_RHI_STORE_DISCARD;
+    VernonRhiStoreOperation depthStore = static_cast<VernonRhiStoreOperation>(descriptor->depth_store_operation);
+    VernonRhiLoadOperation stencilLoad = static_cast<VernonRhiLoadOperation>(descriptor->stencil_load_operation);
+    VernonRhiStoreOperation stencilStore = static_cast<VernonRhiStoreOperation>(descriptor->stencil_store_operation);
     float clearDepth = descriptor->clear_depth;
-    uint32_t ignoredClearStencil = 0;
-    (void)commandDepthOperations(adapter, commandEncoder, depthLoad, ignoredDepthStore, ignoredStencilLoad,
-                                 ignoredStencilStore, clearDepth, ignoredClearStencil);
+    uint32_t clearStencil = descriptor->clear_stencil;
+    (void)commandDepthOperations(adapter, commandEncoder, depthLoad, depthStore, stencilLoad, stencilStore, clearDepth,
+                                 clearStencil);
     if (firstDraw && !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, false,
                                                 static_cast<uint32_t>(descriptor->color_attachment_count), rtvHeap, rtv,
                                                 ignoredGpu, adapter.error))
@@ -849,7 +963,7 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
             const auto &attachment = descriptor->color_attachments[index];
             if (!retainCommandResource(adapter, commandEncoder, attachment.image))
                 return fail(adapter, "D3D12 draw could not retain its color attachment", VERNON_STATUS_INTERNAL_ERROR);
-            if ((attachment.image.identity & kDirectX12ResourceKindMask) != kDirectX12ImageResource)
+            if ((attachment.image.identity & kRhiResourceKindMask) != kRhiImageResource)
                 return fail(adapter, "D3D12 draw contains an invalid color attachment");
             auto *image = reinterpret_cast<rhi::directx12::Image *>(resolveRhiResource(adapter, attachment.image));
             if (!image || !image->resource)
@@ -867,16 +981,20 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
         if (hasDepth) {
             if (!retainCommandResource(adapter, commandEncoder, descriptor->depth_stencil_attachment))
                 return fail(adapter, "D3D12 draw could not retain its depth attachment", VERNON_STATUS_INTERNAL_ERROR);
-            if ((descriptor->depth_stencil_attachment.identity & kDirectX12ResourceKindMask) != kDirectX12ImageResource)
+            if ((descriptor->depth_stencil_attachment.identity & kRhiResourceKindMask) != kRhiImageResource)
                 return fail(adapter, "D3D12 draw contains an invalid depth attachment");
             auto *image = reinterpret_cast<rhi::directx12::Image *>(
                 resolveRhiResource(adapter, descriptor->depth_stencil_attachment));
-            if (!image || !image->resource || image->format != DXGI_FORMAT_D32_FLOAT)
+            if (!image || !image->resource ||
+                (image->format != DXGI_FORMAT_D32_FLOAT && image->format != DXGI_FORMAT_D32_FLOAT_S8X24_UINT))
                 return fail(adapter, "D3D12 draw contains an invalid depth attachment");
+            if (image->format != DXGI_FORMAT_D32_FLOAT_S8X24_UINT &&
+                (stencilLoad != VERNON_RHI_LOAD_DISCARD || stencilStore != VERNON_RHI_STORE_DISCARD || clearStencil))
+                return fail(adapter, "D3D12 draw requests stencil operations for a depth-only attachment");
             if (!transition(adapter, commandEncoder, commands, *image, D3D12_RESOURCE_STATE_DEPTH_WRITE))
                 return fail(adapter, "D3D12 draw could not track depth attachment state", VERNON_STATUS_INTERNAL_ERROR);
             D3D12_DEPTH_STENCIL_VIEW_DESC view{};
-            view.Format = DXGI_FORMAT_D32_FLOAT;
+            view.Format = image->format;
             view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
             device.device->CreateDepthStencilView(image->resource, &view, dsv);
         }
@@ -1033,8 +1151,15 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
         for (size_t index = 0; index < descriptor->color_attachment_count; ++index)
             if (colorLoads[index] == VERNON_RHI_LOAD_CLEAR)
                 commands->ClearRenderTargetView(renderTargets[index], colorClears[index].data(), 0, nullptr);
-        if (hasDepth && depthLoad == VERNON_RHI_LOAD_CLEAR)
-            commands->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, clearDepth, 0, 0, nullptr);
+        if (hasDepth && (depthLoad == VERNON_RHI_LOAD_CLEAR || stencilLoad == VERNON_RHI_LOAD_CLEAR)) {
+            UINT flags = 0;
+            if (depthLoad == VERNON_RHI_LOAD_CLEAR)
+                flags |= D3D12_CLEAR_FLAG_DEPTH;
+            if (stencilLoad == VERNON_RHI_LOAD_CLEAR)
+                flags |= D3D12_CLEAR_FLAG_STENCIL;
+            commands->ClearDepthStencilView(dsv, static_cast<D3D12_CLEAR_FLAGS>(flags), clearDepth,
+                                            static_cast<UINT8>(clearStencil), 0, nullptr);
+        }
     }
     const D3D12_VIEWPORT viewport{static_cast<float>(descriptor->viewport[0]),
                                   static_cast<float>(descriptor->viewport[1]),
@@ -1077,7 +1202,8 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
                     resolveRhiResource(adapter, descriptor->color_attachments[index].image));
                 commands->DiscardResource(image->resource, nullptr);
             }
-        if (hasDepth && descriptor->depth_store_operation == VERNON_RHI_STORE_DISCARD) {
+        if (hasDepth && descriptor->depth_store_operation == VERNON_RHI_STORE_DISCARD &&
+            descriptor->stencil_store_operation == VERNON_RHI_STORE_DISCARD) {
             auto *image = reinterpret_cast<rhi::directx12::Image *>(
                 resolveRhiResource(adapter, descriptor->depth_stencil_attachment));
             commands->DiscardResource(image->resource, nullptr);
@@ -1095,8 +1221,6 @@ void releaseCommandPipeline(void *context, uint64_t) {
     auto *pipeline = static_cast<PreparedPipeline *>(context);
     if (!pipeline || pipeline->references.fetch_sub(1, std::memory_order_acq_rel) != 1)
         return;
-    releaseObject(pipeline->pipeline);
-    releaseObject(pipeline->rootSignature);
     delete pipeline;
 }
 void destroyPipeline(void *, VernonRuntimeProviderObject handle) {
@@ -1137,5 +1261,23 @@ void initializeDirectX12Provider(VernonRuntimeRhiAdapter &adapter) {
 }
 
 } // namespace vernon::runtime::rhi_adapter
+
+namespace vernon::runtime {
+
+uint32_t getDirectX12BlendFactorMapping(uint32_t value) {
+    return static_cast<uint32_t>(rhi_adapter::blendFactor(value));
+}
+uint32_t getDirectX12BlendOperationMapping(uint32_t value) {
+    return static_cast<uint32_t>(rhi_adapter::blendOperation(value));
+}
+uint32_t getDirectX12CompareOperationMapping(uint32_t value) {
+    return static_cast<uint32_t>(rhi_adapter::compareOperation(value));
+}
+uint32_t getDirectX12StencilOperationMapping(uint32_t value) {
+    return static_cast<uint32_t>(rhi_adapter::stencilOperation(value));
+}
+uint32_t getDirectX12CullModeMapping(uint32_t value) { return static_cast<uint32_t>(rhi_adapter::cullMode(value)); }
+
+} // namespace vernon::runtime
 
 #endif

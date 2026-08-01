@@ -136,10 +136,22 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     auto vertices =
         vernon::tests::createBuffer(context, sizeof(positions), alignof(float), VERNON_RHI_BUFFER_VERTEX, positions);
     ASSERT_NE(vertices.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    constexpr uint32_t indices[]{0, 1, 2};
+    auto indexBuffer =
+        vernon::tests::createBuffer(context, sizeof(indices), alignof(uint32_t), VERNON_RHI_BUFFER_INDEX, indices);
+    ASSERT_NE(indexBuffer.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     auto firstTarget = createTexture2D(context, 32, 32, VERNON_TEXTURE_RGBA8_UNORM, VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
     ASSERT_NE(firstTarget.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     auto secondTarget = createTexture2D(context, 48, 24, VERNON_TEXTURE_RGBA8_UNORM, VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
     ASSERT_NE(secondTarget.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    auto firstDepth =
+        vernon::tests::createImage(context, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, 32, 32, 1,
+                                   VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE);
+    ASSERT_NE(firstDepth.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    auto secondDepth =
+        vernon::tests::createImage(context, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, 48, 24, 1,
+                                   VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE);
+    ASSERT_NE(secondDepth.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     auto sampled = createTexture2D(context, 1, 1, VERNON_TEXTURE_RGBA8_UNORM, VERNON_RHI_IMAGE_SAMPLED);
     ASSERT_NE(sampled.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     constexpr uint8_t sampledPixel[] = {64, 200, 100, 255};
@@ -174,6 +186,38 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     arguments[1].tensor.byte_strides = strides;
     arguments[1].tensor.byte_size = sizeof(positions);
     VernonColorAttachment attachment{0, firstTarget.reference, 32, 32, VERNON_TEXTURE_RGBA8_UNORM};
+    VernonDepthAttachment depthAttachment{firstDepth.reference,
+                                          32,
+                                          32,
+                                          VERNON_TEXTURE_D32_FLOAT_S8_UINT,
+                                          VERNON_RHI_LOAD_CLEAR,
+                                          VERNON_RHI_STORE_PRESERVE,
+                                          1.0f,
+                                          VERNON_RHI_LOAD_CLEAR,
+                                          VERNON_RHI_STORE_PRESERVE,
+                                          7};
+    VernonRhiColorBlendState blend{};
+    blend.source_color_factor = VERNON_RHI_BLEND_ONE;
+    blend.destination_color_factor = VERNON_RHI_BLEND_ZERO;
+    blend.source_alpha_factor = VERNON_RHI_BLEND_ONE;
+    blend.destination_alpha_factor = VERNON_RHI_BLEND_ZERO;
+    blend.color_operation = VERNON_RHI_BLEND_ADD;
+    blend.alpha_operation = VERNON_RHI_BLEND_ADD;
+    blend.write_mask = VERNON_RHI_COLOR_WRITE_ALL;
+    VernonGraphicsState graphicsState{};
+    graphicsState.struct_size = sizeof(graphicsState);
+    graphicsState.rasterization.front_face = VERNON_RHI_FRONT_FACE_CLOCKWISE;
+    graphicsState.depth_stencil.depth_test = 1;
+    graphicsState.depth_stencil.depth_write = 1;
+    graphicsState.depth_stencil.depth_compare = VERNON_RHI_COMPARE_LESS;
+    graphicsState.depth_stencil.stencil_test = 1;
+    graphicsState.depth_stencil.front.compare = VERNON_RHI_COMPARE_ALWAYS;
+    graphicsState.depth_stencil.front.pass = VERNON_RHI_STENCIL_REPLACE;
+    graphicsState.depth_stencil.stencil_read_mask = 0xff;
+    graphicsState.depth_stencil.stencil_write_mask = 0xff;
+    graphicsState.depth_stencil.back = graphicsState.depth_stencil.front;
+    graphicsState.color_blends = &blend;
+    graphicsState.color_blend_count = 1;
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
@@ -181,6 +225,11 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     invocation.argument_count = std::size(arguments);
     invocation.color_attachments = &attachment;
     invocation.color_attachment_count = 1;
+    invocation.depth_attachment = &depthAttachment;
+    invocation.graphics_state = &graphicsState;
+    invocation.stencil_reference = 3;
+    VernonIndexBinding indexBinding{VERNON_INDEX_U32, 0, std::size(indices), indexBuffer.reference};
+    invocation.index_binding = &indexBinding;
     invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
     invocation.instance_count = 1;
     ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
@@ -204,6 +253,9 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     attachment.resource = secondTarget.reference;
     attachment.width = 48;
     attachment.height = 24;
+    depthAttachment.resource = secondDepth.reference;
+    depthAttachment.width = 48;
+    depthAttachment.height = 24;
     invocation.viewport[0] = 4;
     invocation.viewport[1] = 3;
     invocation.viewport[2] = 24;
@@ -222,6 +274,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(secondStats.stagingBufferAllocations, firstStats.stagingBufferAllocations);
     EXPECT_EQ(secondStats.renderPassCreations, firstStats.renderPassCreations);
 
+    invocation.stencil_reference = 9;
     ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     const vernon::runtime::VulkanGraphicsCacheStats warmStats =
@@ -261,9 +314,19 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(secondPixels[outsideViewport + 1], 0u);
     EXPECT_EQ(secondPixels[outsideViewport + 2], 0u);
 
+    std::vector<uint8_t> depthStencilPixels(32 * 32 * 8);
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, firstDepth.handle, depthStencilPixels.data(),
+                                           depthStencilPixels.size()),
+              VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(depthStencilPixels[(16 * 32 + 16) * 8 + sizeof(float)], 3u);
+    EXPECT_EQ(depthStencilPixels[(1 * 32 + 1) * 8 + sizeof(float)], 7u);
+
     attachment.resource = firstTarget.reference;
     attachment.width = 32;
     attachment.height = 32;
+    depthAttachment.resource = firstDepth.reference;
+    depthAttachment.width = 32;
+    depthAttachment.height = 32;
     std::fill(std::begin(invocation.viewport), std::end(invocation.viewport), 0);
     const size_t commandsBeforeGraph = vernon::runtime::getRhiAdapterRecordedCommandCount(runtime);
     {
@@ -284,8 +347,11 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
 
     ASSERT_EQ(vernonRhiDeviceDestroySampler(context.device, textureSampler.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, sampled.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, secondDepth.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, firstDepth.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, secondTarget.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, firstTarget.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyBuffer(context.device, indexBuffer.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyBuffer(context.device, vertices.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     vernonRuntimePipelineBundleDestroy(loaded);

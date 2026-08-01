@@ -42,6 +42,10 @@ std::optional<VernonTextureFormat> pipelineTextureFormat(const std::string &form
         return VERNON_TEXTURE_RGB8_UNORM;
     if (format == "r11g11b10_float")
         return VERNON_TEXTURE_R11G11B10_FLOAT;
+    if (format == "d32_float")
+        return VERNON_TEXTURE_D32_FLOAT;
+    if (format == "d32_float_s8_uint")
+        return VERNON_TEXTURE_D32_FLOAT_S8_UINT;
     return std::nullopt;
 }
 

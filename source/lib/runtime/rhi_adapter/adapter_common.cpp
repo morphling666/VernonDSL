@@ -176,14 +176,14 @@ namespace {
 
 std::optional<vernon::rhi::ResourceKind> resourceKind(const VernonRuntimeRhiAdapter &adapter,
                                                       VernonRuntimeProviderResourceReference resource) {
-    const uint64_t encodedKind = resource.identity & kDirectX12ResourceKindMask;
+    const uint64_t encodedKind = resource.identity & kRhiResourceKindMask;
     if (resource.identity != resourceIdentity(adapter, encodedKind) || resource.resource.value == 0)
         return std::nullopt;
-    if (encodedKind == kDirectX12BufferResource)
+    if (encodedKind == kRhiBufferResource)
         return vernon::rhi::ResourceKind::Buffer;
-    if (encodedKind == kDirectX12ImageResource)
+    if (encodedKind == kRhiImageResource)
         return vernon::rhi::ResourceKind::Image;
-    if (encodedKind == kDirectX12SamplerResource)
+    if (encodedKind == kRhiSamplerResource)
         return vernon::rhi::ResourceKind::Sampler;
     return std::nullopt;
 }
@@ -284,7 +284,7 @@ extern "C" VernonStatus vernonRuntimeRhiAdapterReferenceBuffer(const VernonRunti
     const uint64_t resource = vernon::rhi::bufferResource(adapter->rhiDevice, buffer);
     if (!resource)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    output->identity = resourceIdentity(*adapter, kDirectX12BufferResource);
+    output->identity = resourceIdentity(*adapter, kRhiBufferResource);
     output->resource = {resource};
     output->offset = offset;
     output->size = size;
@@ -299,7 +299,7 @@ extern "C" VernonStatus vernonRuntimeRhiAdapterReferenceImage(const VernonRuntim
     const uint64_t resource = vernon::rhi::imageResource(adapter->rhiDevice, image);
     if (!resource)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    *output = {resourceIdentity(*adapter, kDirectX12ImageResource), {resource}, 0, 0};
+    *output = {resourceIdentity(*adapter, kRhiImageResource), {resource}, 0, 0};
     return VERNON_STATUS_OK;
 }
 
@@ -311,7 +311,7 @@ extern "C" VernonStatus vernonRuntimeRhiAdapterReferenceSampler(const VernonRunt
     const uint64_t resource = vernon::rhi::samplerResource(adapter->rhiDevice, sampler);
     if (!resource)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    *output = {resourceIdentity(*adapter, kDirectX12SamplerResource), {resource}, 0, 0};
+    *output = {resourceIdentity(*adapter, kRhiSamplerResource), {resource}, 0, 0};
     return VERNON_STATUS_OK;
 }
 
@@ -368,15 +368,15 @@ uint64_t directX12RhiAdapterResourceIdentity(const VernonRuntimeRhiAdapter &adap
 }
 
 uint64_t directX12RhiAdapterImageIdentity(const VernonRuntimeRhiAdapter &adapter) {
-    return directX12RhiAdapterResourceIdentity(adapter) | rhi_adapter::kDirectX12ImageResource;
+    return directX12RhiAdapterResourceIdentity(adapter) | rhi_adapter::kRhiImageResource;
 }
 
 uint64_t directX12RhiAdapterSamplerIdentity(const VernonRuntimeRhiAdapter &adapter) {
-    return directX12RhiAdapterResourceIdentity(adapter) | rhi_adapter::kDirectX12SamplerResource;
+    return directX12RhiAdapterResourceIdentity(adapter) | rhi_adapter::kRhiSamplerResource;
 }
 
 uint64_t directX12RhiAdapterBufferIdentity(const VernonRuntimeRhiAdapter &adapter) {
-    return directX12RhiAdapterResourceIdentity(adapter) | rhi_adapter::kDirectX12BufferResource;
+    return directX12RhiAdapterResourceIdentity(adapter) | rhi_adapter::kRhiBufferResource;
 }
 #endif
 
@@ -416,7 +416,8 @@ RhiAdapterPreparationStats getRhiAdapterPreparationStats(const VernonRuntimeRhiA
             adapter.pipelinePreparations.load(std::memory_order_relaxed),
             adapter.bindingCreations.load(std::memory_order_relaxed),
             adapter.bindingSnapshotCreations.load(std::memory_order_relaxed),
-            adapter.dispatches.load(std::memory_order_relaxed)};
+            adapter.dispatches.load(std::memory_order_relaxed),
+            adapter.lastStencilReference.load(std::memory_order_relaxed)};
 }
 
 } // namespace vernon::runtime

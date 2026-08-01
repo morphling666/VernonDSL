@@ -2,6 +2,7 @@
 #define VERNON_RUNTIME_GRAPHICS_INVOCATION_PLANNER_H
 
 #include "VernonRuntime.h"
+#include "VernonRuntimeCore.h"
 #include "pipeline_manifest.h"
 
 #include <array>
@@ -23,6 +24,7 @@ struct PlannedSampledResource {
     VernonRuntimeProviderResourceReference imageResource{};
     VernonRuntimeProviderResourceReference samplerResource{};
     bool implicitSampler{};
+    bool explicitSampler{};
     uint32_t stages{};
 };
 
@@ -41,14 +43,51 @@ struct PlannedGraphicsInvocation {
     std::array<float, 2> resolution{};
     uint32_t attachmentWidth{};
     uint32_t attachmentHeight{};
-    uint32_t maximumAttachmentLocation{};
     uint32_t vertexCount{};
     uint32_t instanceCount{};
     const VernonIndexBinding *indexBinding{};
 };
 
+struct PlannedGraphicsState {
+    VernonRasterizationState rasterization{};
+    VernonDepthStencilState depthStencil{};
+    std::vector<VernonColorBlendState> colorBlends;
+    uint32_t stencilReference{};
+};
+
+struct GraphicsVariantKey {
+    uint32_t topology{};
+    std::vector<uint32_t> colorFormats;
+    uint32_t depthStencilFormat{};
+    uint32_t sampleCount{1};
+    std::vector<uint32_t> vertexStrides;
+    VernonRasterizationState rasterization{};
+    VernonDepthStencilState depthStencil{};
+    std::vector<VernonColorBlendState> colorBlends;
+};
+
+struct PreparedGraphicsVariant {
+    GraphicsVariantKey key;
+    VernonRuntimeCoreGraphicsVariant *handle{};
+};
+
 bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocation &invocation,
                             PlannedGraphicsInvocation &plan, std::string &error);
+bool planGraphicsState(const VernonPipelineInvocation &invocation, size_t colorCount, bool hasDepth, bool hasStencil,
+                       PlannedGraphicsState &state, std::string &error);
+bool graphicsVariantKeysEqual(const GraphicsVariantKey &left, const GraphicsVariantKey &right);
+size_t graphicsVariantKeyHash(const GraphicsVariantKey &key);
+struct GraphicsVariantKeyHash {
+    size_t operator()(const GraphicsVariantKey &key) const { return graphicsVariantKeyHash(key); }
+};
+struct GraphicsVariantKeyEqual {
+    bool operator()(const GraphicsVariantKey &left, const GraphicsVariantKey &right) const {
+        return graphicsVariantKeysEqual(left, right);
+    }
+};
+VernonStatus ensureGraphicsVariant(VernonRuntimeCorePipeline *pipeline, const GraphicsVariantKey &key,
+                                   PreparedGraphicsVariant &prepared);
+void destroyGraphicsVariant(PreparedGraphicsVariant &prepared);
 
 } // namespace vernon::runtime
 

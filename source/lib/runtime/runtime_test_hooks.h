@@ -26,7 +26,13 @@ VERNON_RUNTIME_CAPI VulkanGraphicsCacheStats getVulkanGraphicsCacheStats(const V
                                                                          const VernonLoadedPipeline *pipeline);
 VERNON_RUNTIME_CAPI size_t getDirectX12GraphicsPipelineCreationCount(const VernonLoadedPipeline *pipeline);
 VERNON_RUNTIME_CAPI size_t getDirectX12GraphicsRootSignatureCreationCount(const VernonLoadedPipeline *pipeline);
+VERNON_RUNTIME_CAPI uint32_t getDirectX12LastStencilReference(const VernonRuntimeContext *context);
 VERNON_RUNTIME_CAPI size_t getRhiAdapterRecordedCommandCount(const VernonRuntimeContext *context);
+VERNON_RUNTIME_CAPI uint32_t getDirectX12BlendFactorMapping(uint32_t value);
+VERNON_RUNTIME_CAPI uint32_t getDirectX12BlendOperationMapping(uint32_t value);
+VERNON_RUNTIME_CAPI uint32_t getDirectX12CompareOperationMapping(uint32_t value);
+VERNON_RUNTIME_CAPI uint32_t getDirectX12StencilOperationMapping(uint32_t value);
+VERNON_RUNTIME_CAPI uint32_t getDirectX12CullModeMapping(uint32_t value);
 
 } // namespace vernon::runtime
 

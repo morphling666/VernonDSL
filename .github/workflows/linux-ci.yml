@@ -52,7 +52,19 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes ninja-build libvulkan1 mesa-vulkan-drivers patchelf
+          sudo apt-get install --yes \
+            ninja-build \
+            patchelf \
+            pkg-config \
+            libvulkan1 \
+            mesa-vulkan-drivers \
+            libgl1-mesa-dev \
+            libegl1-mesa-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            wayland-protocols \
+            xorg-dev \
+            xvfb
 
       - name: Read LLVM revision
         id: llvm-revision
@@ -63,7 +75,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: llvm-project/install
-          key: linux-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-libdevice-${{ env.NVIDIA_NVCC_VERSION }}-v1
+          key: linux-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-aarch64-nvptx-libdevice-${{ env.NVIDIA_NVCC_VERSION }}-v1
 
       - name: Install NVIDIA libdevice
         if: steps.llvm-cache.outputs.cache-hit != 'true'
@@ -80,6 +92,7 @@ jobs:
           --generator Ninja
           --cuda on
           --libdevice "$MLIR_NVVM_LIBDEVICE_PATH"
+          --targets X86,AArch64,NVPTX
           --build
           --parallel 3
 
@@ -153,7 +166,16 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes ninja-build patchelf
+          sudo apt-get install --yes \
+            ninja-build \
+            patchelf \
+            pkg-config \
+            libgl1-mesa-dev \
+            libegl1-mesa-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            wayland-protocols \
+            xorg-dev
 
       - name: Read LLVM revision
         id: llvm-revision
@@ -164,7 +186,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: llvm-project/install
-          key: linux-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-libdevice-${{ env.NVIDIA_NVCC_VERSION }}-v1
+          key: linux-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-aarch64-nvptx-libdevice-${{ env.NVIDIA_NVCC_VERSION }}-v1
 
       - name: Install NVIDIA libdevice
         if: steps.llvm-cache.outputs.cache-hit != 'true'
@@ -181,6 +203,7 @@ jobs:
           --generator Ninja
           --cuda on
           --libdevice "$MLIR_NVVM_LIBDEVICE_PATH"
+          --targets X86,AArch64,NVPTX
           --build
           --parallel 3
 

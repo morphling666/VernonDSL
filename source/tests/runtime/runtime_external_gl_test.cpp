@@ -40,6 +40,14 @@ constexpr GlEnum kUnsignedInt = 0x1405;
 constexpr GlEnum kFloat = 0x1406;
 constexpr GlEnum kDouble = 0x140A;
 constexpr GlEnum kHalfFloat = 0x140B;
+constexpr GlEnum kBack = 0x0405;
+constexpr GlEnum kClockwise = 0x0900;
+constexpr GlEnum kLess = 0x0201;
+constexpr GlEnum kSourceAlpha = 0x0302;
+constexpr GlEnum kOneMinusSourceAlpha = 0x0303;
+constexpr GlEnum kAdd = 0x8006;
+constexpr GlEnum kColorAttachment0 = 0x8CE0;
+constexpr GlEnum kStencilAttachment = 0x8D20;
 
 GlUint nextName = 1;
 uint32_t drawCount = 0;
@@ -53,6 +61,17 @@ uint32_t programBindCount = 0;
 uint32_t framebufferBindCount = 0;
 uint32_t viewportCount = 0;
 uint32_t scissorCount = 0;
+uint32_t stencilFuncCount = 0;
+GlInt stencilReference = 0;
+GlUint stencilReadMask = 0;
+GlBoolean depthWrite = 0;
+GlEnum depthComparison = 0;
+GlEnum cullMode = 0;
+GlEnum frontWinding = 0;
+std::array<float, 2> depthBias{};
+std::array<GlEnum, 4> blendFactors{};
+std::array<GlEnum, 2> blendOperations{};
+std::array<GlBoolean, 4> colorWriteMask{};
 GlInt clearedDrawBuffer = -1;
 std::array<float, 4> clearColor{};
 GlBoolean matrixTranspose = 1;
@@ -164,13 +183,40 @@ std::vector<GlUint> deletedBuffers;
 std::vector<GlUint> deletedTextures;
 std::vector<GlUint> deletedSamplers;
 std::vector<GlEnum> shaderKinds;
+std::vector<GlEnum> invalidatedAttachments;
 std::vector<unsigned char> bufferStorage;
 std::vector<unsigned char> textureStorage;
 std::array<GlInt, 4> signedUniformUpload{};
 std::array<GlUint, 4> unsignedUniformUpload{};
 
 void makeCurrent(void *) { ++makeCurrentCount; }
-void GL_CALL placeholder() {}
+void GL_CALL objectNoop(GlUint) {}
+void GL_CALL noArgsNoop() {}
+void GL_CALL objectPairNoop(GlUint, GlUint) {}
+void GL_CALL infoLogNoop(GlUint, GlSize, GlSize *length, char *) {
+    if (length)
+        *length = 0;
+}
+void GL_CALL enumNoop(GlEnum) {}
+void GL_CALL enumIntNoop(GlEnum, GlInt) {}
+void GL_CALL deleteNamesNoop(GlSize, const GlUint *) {}
+void GL_CALL framebufferTexture2DNoop(GlEnum, GlEnum, GlEnum, GlUint, GlInt) {}
+void GL_CALL drawBuffersNoop(GlSize, const GlEnum *) {}
+void GL_CALL drawArraysInstanced(GlEnum, GlInt, GlSize, GlSize) { ++drawCount; }
+void GL_CALL uniformFvNoop(GlInt, GlSize, const float *) {}
+void GL_CALL uniformMatrixNoop(GlInt, GlSize, GlBoolean, const float *) {}
+void GL_CALL uniform1iNoop(GlInt, GlInt) {}
+void GL_CALL texImage3DNoop(GlEnum, GlInt, GlInt, GlSize, GlSize, GlSize, GlInt, GlEnum, GlEnum, const void *) {}
+void GL_CALL texSubImage3DNoop(GlEnum, GlInt, GlInt, GlInt, GlInt, GlSize, GlSize, GlSize, GlEnum, GlEnum,
+                               const void *) {}
+void GL_CALL blendFuncSeparate(GlEnum sourceColor, GlEnum destinationColor, GlEnum sourceAlpha,
+                               GlEnum destinationAlpha) {
+    blendFactors = {sourceColor, destinationColor, sourceAlpha, destinationAlpha};
+}
+void GL_CALL blendEquationSeparate(GlEnum color, GlEnum alpha) { blendOperations = {color, alpha}; }
+void GL_CALL colorMask(GlBoolean red, GlBoolean green, GlBoolean blue, GlBoolean alpha) {
+    colorWriteMask = {red, green, blue, alpha};
+}
 GlUint GL_CALL createName(GlEnum kind) {
     shaderKinds.push_back(kind);
     return nextName++;
@@ -241,8 +287,15 @@ void *GL_CALL mapBufferRange(GlEnum, std::intptr_t offset, std::intptr_t, unsign
     return bufferStorage.data() + offset;
 }
 GlBoolean GL_CALL unmapBuffer(GlEnum) { return 1; }
-void GL_CALL texImage2D(GlEnum, GlInt, GlInt, GlSize width, GlSize height, GlInt, GlEnum, GlEnum, const void *) {
-    textureStorage.resize(static_cast<size_t>(width) * height * 4);
+void GL_CALL texImage2D(GlEnum, GlInt, GlInt, GlSize width, GlSize height, GlInt, GlEnum, GlEnum type, const void *) {
+    textureStorage.resize(static_cast<size_t>(width) * height * (type == 0x8DAD ? 8 : 4));
+    if (type == 0x8DAD)
+        for (size_t offset = 0; offset < textureStorage.size(); offset += 8) {
+            constexpr float depth = 0.25f;
+            constexpr uint32_t stencil = 7;
+            std::memcpy(textureStorage.data() + offset, &depth, sizeof(depth));
+            std::memcpy(textureStorage.data() + offset + sizeof(depth), &stencil, sizeof(stencil));
+        }
 }
 void GL_CALL texSubImage2D(GlEnum, GlInt, GlInt, GlInt, GlSize width, GlSize height, GlEnum, GlEnum,
                            const void *source) {
@@ -250,8 +303,8 @@ void GL_CALL texSubImage2D(GlEnum, GlInt, GlInt, GlInt, GlSize width, GlSize hei
     textureStorage.assign(static_cast<const unsigned char *>(source),
                           static_cast<const unsigned char *>(source) + size);
 }
-void GL_CALL readPixels(GlInt, GlInt, GlSize width, GlSize height, GlEnum, GlEnum, void *destination) {
-    std::memcpy(destination, textureStorage.data(), static_cast<size_t>(width) * height * 4);
+void GL_CALL readPixels(GlInt, GlInt, GlSize width, GlSize height, GlEnum, GlEnum type, void *destination) {
+    std::memcpy(destination, textureStorage.data(), static_cast<size_t>(width) * height * (type == 0x8DAD ? 8 : 4));
 }
 GlEnum GL_CALL framebufferStatus(GlEnum) { return kFramebufferComplete; }
 void GL_CALL drawArrays(GlEnum, GlInt, GlSize) { ++drawCount; }
@@ -260,8 +313,29 @@ void GL_CALL clearBufferfv(GlEnum, GlInt drawBuffer, const float *value) {
     clearedDrawBuffer = drawBuffer;
     std::copy_n(value, clearColor.size(), clearColor.begin());
 }
-void GL_CALL invalidateFramebuffer(GlEnum, GlSize count, const GlEnum *) {
+void GL_CALL clearBufferiv(GlEnum, GlInt, const GlInt *) {}
+void GL_CALL clearBufferfi(GlEnum, GlInt, float, GlInt) {}
+void GL_CALL readBuffer(GlEnum) {}
+void GL_CALL depthMask(GlBoolean value) { depthWrite = value; }
+void GL_CALL depthFunc(GlEnum value) { depthComparison = value; }
+void GL_CALL cullFace(GlEnum value) { cullMode = value; }
+void GL_CALL frontFace(GlEnum value) { frontWinding = value; }
+void GL_CALL polygonOffset(float slope, float constant) { depthBias = {slope, constant}; }
+void GL_CALL enablei(GlEnum, GlUint) {}
+void GL_CALL disablei(GlEnum, GlUint) {}
+void GL_CALL blendFuncSeparatei(GlUint, GlEnum, GlEnum, GlEnum, GlEnum) {}
+void GL_CALL blendEquationSeparatei(GlUint, GlEnum, GlEnum) {}
+void GL_CALL colorMaski(GlUint, GlBoolean, GlBoolean, GlBoolean, GlBoolean) {}
+void GL_CALL stencilFuncSeparate(GlEnum, GlEnum, GlInt reference, GlUint mask) {
+    ++stencilFuncCount;
+    stencilReference = reference;
+    stencilReadMask = mask;
+}
+void GL_CALL stencilOpSeparate(GlEnum, GlEnum, GlEnum, GlEnum) {}
+void GL_CALL stencilMaskSeparate(GlEnum, GlUint) {}
+void GL_CALL invalidateFramebuffer(GlEnum, GlSize count, const GlEnum *attachments) {
     invalidateCount += static_cast<uint32_t>(count);
+    invalidatedAttachments.insert(invalidatedAttachments.end(), attachments, attachments + count);
 }
 void GL_CALL scissor(GlInt x, GlInt y, GlSize width, GlSize height) {
     ++scissorCount;
@@ -298,14 +372,24 @@ void *getProcAddress(void *, const char *name) {
     return reinterpret_cast<void *>(&function)
     PROC("glCreateShader", createName);
     PROC("glShaderSource", shaderSource);
+    PROC("glCompileShader", objectNoop);
     PROC("glGetShaderiv", getShaderiv);
+    PROC("glGetShaderInfoLog", infoLogNoop);
+    PROC("glDeleteShader", objectNoop);
     PROC("glCreateProgram", createProgram);
+    PROC("glAttachShader", objectPairNoop);
+    PROC("glLinkProgram", objectNoop);
     PROC("glGetProgramiv", getProgramiv);
+    PROC("glGetProgramInfoLog", infoLogNoop);
+    PROC("glDeleteProgram", objectNoop);
     PROC("glGetIntegerv", getIntegerv);
     PROC("glGenVertexArrays", genNames);
+    PROC("glDeleteVertexArrays", deleteNamesNoop);
     PROC("glBindVertexArray", bindVertexArray);
+    PROC("glEnableVertexAttribArray", objectNoop);
     PROC("glUseProgram", useProgram);
     PROC("glGenFramebuffers", genNames);
+    PROC("glDeleteFramebuffers", deleteNamesNoop);
     PROC("glGenBuffers", genNames);
     PROC("glBindBuffer", bindBuffer);
     PROC("glBindBufferBase", bindBufferBase);
@@ -316,23 +400,57 @@ void *getProcAddress(void *, const char *name) {
     PROC("glUnmapBuffer", unmapBuffer);
     PROC("glGenTextures", genNames);
     PROC("glDeleteTextures", deleteTextureNames);
+    PROC("glBindTexture", objectPairNoop);
     PROC("glTexImage2D", texImage2D);
+    PROC("glTexImage3D", texImage3DNoop);
     PROC("glTexSubImage2D", texSubImage2D);
+    PROC("glTexSubImage3D", texSubImage3DNoop);
+    PROC("glTexParameteri", enumIntNoop);
+    PROC("glGenerateMipmap", enumNoop);
+    PROC("glPixelStorei", enumIntNoop);
     PROC("glReadPixels", readPixels);
     PROC("glGenSamplers", genNames);
     PROC("glDeleteSamplers", deleteSamplerNames);
+    PROC("glSamplerParameteri", enumIntNoop);
     PROC("glCheckFramebufferStatus", framebufferStatus);
     PROC("glBindFramebuffer", bindFramebuffer);
+    PROC("glFramebufferTexture2D", framebufferTexture2DNoop);
+    PROC("glDrawBuffers", drawBuffersNoop);
     PROC("glDrawArrays", drawArrays);
+    PROC("glDrawArraysInstanced", drawArraysInstanced);
     PROC("glVertexAttribPointer", vertexAttribPointer);
     PROC("glVertexAttribIPointer", vertexAttribIPointer);
     PROC("glVertexAttribLPointer", vertexAttribLPointer);
     PROC("glVertexAttribDivisor", vertexAttribDivisor);
     PROC("glDrawElementsInstanced", drawElementsInstanced);
     PROC("glClearBufferfv", clearBufferfv);
+    PROC("glClearBufferiv", clearBufferiv);
+    PROC("glClearBufferfi", clearBufferfi);
+    PROC("glReadBuffer", readBuffer);
+    PROC("glDepthMask", depthMask);
+    PROC("glDepthFunc", depthFunc);
+    PROC("glEnable", enumNoop);
+    PROC("glDisable", enumNoop);
+    PROC("glCullFace", cullFace);
+    PROC("glFrontFace", frontFace);
+    PROC("glPolygonOffset", polygonOffset);
+    PROC("glBlendFuncSeparate", blendFuncSeparate);
+    PROC("glBlendEquationSeparate", blendEquationSeparate);
+    PROC("glColorMask", colorMask);
+    PROC("glEnablei", enablei);
+    PROC("glDisablei", disablei);
+    PROC("glBlendFuncSeparatei", blendFuncSeparatei);
+    PROC("glBlendEquationSeparatei", blendEquationSeparatei);
+    PROC("glColorMaski", colorMaski);
+    PROC("glStencilFuncSeparate", stencilFuncSeparate);
+    PROC("glStencilOpSeparate", stencilOpSeparate);
+    PROC("glStencilMaskSeparate", stencilMaskSeparate);
     PROC("glInvalidateFramebuffer", invalidateFramebuffer);
     PROC("glGetUniformLocation", getUniformLocation);
+    PROC("glUniform1fv", uniformFvNoop);
     PROC("glUniform2fv", uniform2fv);
+    PROC("glUniform3fv", uniformFvNoop);
+    PROC("glUniform4fv", uniformFvNoop);
     PROC("glUniform1iv", uniform1iv);
     PROC("glUniform2iv", uniform2iv);
     PROC("glUniform3iv", uniform3iv);
@@ -341,14 +459,25 @@ void *getProcAddress(void *, const char *name) {
     PROC("glUniform2uiv", uniform2uiv);
     PROC("glUniform3uiv", uniform3uiv);
     PROC("glUniform4uiv", uniform4uiv);
+    PROC("glUniformMatrix2fv", uniformMatrixNoop);
+    PROC("glUniformMatrix2x3fv", uniformMatrixNoop);
+    PROC("glUniformMatrix2x4fv", uniformMatrixNoop);
+    PROC("glUniformMatrix3x2fv", uniformMatrixNoop);
+    PROC("glUniformMatrix3fv", uniformMatrixNoop);
+    PROC("glUniformMatrix3x4fv", uniformMatrixNoop);
+    PROC("glUniformMatrix4x2fv", uniformMatrixNoop);
+    PROC("glUniformMatrix4x3fv", uniformMatrixNoop);
     PROC("glUniformMatrix4fv", uniformMatrix4fv);
+    PROC("glUniform1i", uniform1iNoop);
+    PROC("glActiveTexture", enumNoop);
     PROC("glBindSampler", bindSampler);
+    PROC("glFinish", noArgsNoop);
     PROC("glViewport", viewport);
     PROC("glScissor", scissor);
     PROC("glDispatchCompute", dispatchCompute);
     PROC("glMemoryBarrier", memoryBarrier);
 #undef PROC
-    return reinterpret_cast<void *>(&placeholder);
+    return nullptr;
 }
 
 VernonRuntimeContext *create(VernonRuntimeBackend backend, uint16_t major, uint16_t minor) {
@@ -705,6 +834,42 @@ nlohmann::json inlineArtifact(const std::string &source) {
 }
 
 } // namespace
+
+TEST(RuntimeExternalGl, CreatesAndReadsBackD32S8Image) {
+    VernonOpenGLContextCallbacks callbacks{};
+    callbacks.struct_size = sizeof(callbacks);
+    callbacks.make_current = &makeCurrent;
+    callbacks.get_proc_address = &getProcAddress;
+    callbacks.api_version_major = 4;
+    callbacks.api_version_minor = 3;
+    vernon::tests::RhiRuntime context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_OPENGL, &callbacks);
+    ASSERT_NE(context.runtime, nullptr);
+
+    VernonRhiImageDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.dimension = VERNON_RHI_IMAGE_2D;
+    descriptor.width = 2;
+    descriptor.height = 2;
+    descriptor.depth = 1;
+    descriptor.mip_levels = 1;
+    descriptor.array_layers = 1;
+    descriptor.sample_count = 1;
+    descriptor.format = VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT;
+    descriptor.usage = VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE;
+    VernonRhiImage image{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(context.device, &descriptor, &image), VERNON_RHI_STATUS_OK);
+    std::array<uint8_t, 2 * 2 * 8> data{};
+    EXPECT_EQ(vernonRhiDeviceDownloadImage(context.device, image, data.data(), data.size()), VERNON_RHI_STATUS_OK);
+    for (size_t offset = 0; offset < data.size(); offset += 8) {
+        float depth{};
+        std::memcpy(&depth, data.data() + offset, sizeof(depth));
+        EXPECT_FLOAT_EQ(depth, 0.25f);
+        EXPECT_EQ(data[offset + sizeof(depth)], 7);
+    }
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(context.device, image), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeDestroy(context.runtime), VERNON_STATUS_OK);
+    vernonRhiDestroyDevice(context.device);
+}
 
 TEST(RuntimeExternalGl, InvokesDirectComputePipelineThroughRuntimeCoreProvider) {
     dispatchCount = 0;
@@ -1411,6 +1576,16 @@ TEST(RuntimeExternalGl, LoadsAssetsAndInvokesPipeline) {
     framebufferBindCount = 0;
     viewportCount = 0;
     scissorCount = 0;
+    stencilFuncCount = 0;
+    depthWrite = 0;
+    depthComparison = 0;
+    cullMode = 0;
+    frontWinding = 0;
+    depthBias = {};
+    blendFactors = {};
+    blendOperations = {};
+    colorWriteMask = {};
+    invalidatedAttachments.clear();
     VernonRuntimeCapabilities global = vernonRuntimeGetCapabilities(VERNON_RUNTIME_OPENGL_ES);
     ASSERT_TRUE(!global.available);
     ASSERT_TRUE(global.supports_graphics);
@@ -1428,6 +1603,10 @@ TEST(RuntimeExternalGl, LoadsAssetsAndInvokesPipeline) {
     ASSERT_TRUE(pipeline);
     RhiImage target = importOpenGLTexture2D(gl, 7, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
     ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    RhiImage depthStencil =
+        vernon::tests::createImage(rhiRuntime(gl), VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, 16, 16, 1,
+                                   VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT);
+    ASSERT_NE(depthStencil.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     RhiImage cube = vernon::tests::createImage(rhiRuntime(gl), VERNON_RHI_IMAGE_CUBE, VERNON_RHI_FORMAT_RGBA16_FLOAT,
                                                32, 32, 1, VERNON_RHI_IMAGE_SAMPLED, 6);
     ASSERT_NE(cube.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
@@ -1436,11 +1615,46 @@ TEST(RuntimeExternalGl, LoadsAssetsAndInvokesPipeline) {
     VernonColorAttachment attachment{0, target.reference, 16, 16, VERNON_TEXTURE_RGBA8_UNORM};
     attachment.clear_color[0] = 0.25f;
     attachment.clear_color[1] = 0.5f;
+    VernonDepthAttachment depthAttachment{};
+    depthAttachment.resource = depthStencil.reference;
+    depthAttachment.width = 16;
+    depthAttachment.height = 16;
+    depthAttachment.format = VERNON_TEXTURE_D32_FLOAT_S8_UINT;
+    depthAttachment.clear_depth = 1.0f;
+    VernonColorBlendState blend{};
+    blend.blend_enabled = 1;
+    blend.source_color_factor = VERNON_RHI_BLEND_SOURCE_ALPHA;
+    blend.destination_color_factor = VERNON_RHI_BLEND_ONE_MINUS_SOURCE_ALPHA;
+    blend.color_operation = VERNON_RHI_BLEND_ADD;
+    blend.source_alpha_factor = VERNON_RHI_BLEND_SOURCE_ALPHA;
+    blend.destination_alpha_factor = VERNON_RHI_BLEND_ONE_MINUS_SOURCE_ALPHA;
+    blend.alpha_operation = VERNON_RHI_BLEND_ADD;
+    blend.write_mask = VERNON_RHI_COLOR_WRITE_RED | VERNON_RHI_COLOR_WRITE_GREEN;
+    VernonGraphicsState graphicsState{};
+    graphicsState.struct_size = sizeof(graphicsState);
+    graphicsState.rasterization.cull_mode = VERNON_RHI_CULL_BACK;
+    graphicsState.rasterization.front_face = VERNON_RHI_FRONT_FACE_CLOCKWISE;
+    graphicsState.rasterization.depth_bias_enabled = 1;
+    graphicsState.rasterization.depth_bias_constant = 2.0f;
+    graphicsState.rasterization.depth_bias_slope = 3.0f;
+    graphicsState.depth_stencil.depth_test = 1;
+    graphicsState.depth_stencil.depth_write = 1;
+    graphicsState.depth_stencil.depth_compare = VERNON_RHI_COMPARE_LESS;
+    graphicsState.depth_stencil.stencil_test = 1;
+    graphicsState.depth_stencil.front.compare = VERNON_RHI_COMPARE_ALWAYS;
+    graphicsState.depth_stencil.back.compare = VERNON_RHI_COMPARE_ALWAYS;
+    graphicsState.depth_stencil.stencil_read_mask = 0x5a;
+    graphicsState.depth_stencil.stencil_write_mask = 0xa5;
+    graphicsState.color_blends = &blend;
+    graphicsState.color_blend_count = 1;
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.color_attachments = &attachment;
     invocation.color_attachment_count = 1;
+    invocation.depth_attachment = &depthAttachment;
+    invocation.graphics_state = &graphicsState;
+    invocation.stencil_reference = 23;
     invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
     invocation.vertex_count = 3;
     invocation.instance_count = 1;
@@ -1448,20 +1662,37 @@ TEST(RuntimeExternalGl, LoadsAssetsAndInvokesPipeline) {
     ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
     attachment.load_operation = VERNON_RHI_LOAD_PRESERVE;
     attachment.store_operation = VERNON_RHI_STORE_DISCARD;
+    depthAttachment.load_operation = VERNON_RHI_LOAD_PRESERVE;
+    depthAttachment.stencil_load_operation = VERNON_RHI_LOAD_PRESERVE;
+    depthAttachment.stencil_store_operation = VERNON_RHI_STORE_DISCARD;
     // The host may change OpenGL state between command encoders, so each invocation must restore its bindings.
     ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
     ASSERT_TRUE(drawCount == 2);
     ASSERT_EQ(clearCount, 1u);
     EXPECT_FLOAT_EQ(clearColor[0], 0.25f);
     EXPECT_FLOAT_EQ(clearColor[1], 0.5f);
-    EXPECT_EQ(invalidateCount, 1u);
+    EXPECT_EQ(invalidateCount, 2u);
+    EXPECT_EQ(invalidatedAttachments, (std::vector<GlEnum>{kColorAttachment0, kStencilAttachment}));
     EXPECT_EQ(scissorUpload, (std::array<GlInt, 4>{0, 0, 16, 16}));
     EXPECT_EQ(programBindCount, 2u);
     EXPECT_EQ(framebufferBindCount, 2u);
     EXPECT_EQ(viewportCount, 2u);
     EXPECT_EQ(scissorCount, 2u);
+    EXPECT_EQ(stencilFuncCount, 4u);
+    EXPECT_EQ(stencilReference, 23);
+    EXPECT_EQ(stencilReadMask, 0x5au);
+    EXPECT_EQ(depthWrite, 1);
+    EXPECT_EQ(depthComparison, kLess);
+    EXPECT_EQ(cullMode, kBack);
+    EXPECT_EQ(frontWinding, kClockwise);
+    EXPECT_EQ(depthBias, (std::array<float, 2>{3.0f, 2.0f}));
+    EXPECT_EQ(blendFactors,
+              (std::array<GlEnum, 4>{kSourceAlpha, kOneMinusSourceAlpha, kSourceAlpha, kOneMinusSourceAlpha}));
+    EXPECT_EQ(blendOperations, (std::array<GlEnum, 2>{kAdd, kAdd}));
+    EXPECT_EQ(colorWriteMask, (std::array<GlBoolean, 4>{1, 1, 0, 0}));
     ASSERT_TRUE(nextName == nextNameAfterPreparation);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, target.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, depthStencil.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, cube.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroySampler(rhiRuntime(gl).device, sampler.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);

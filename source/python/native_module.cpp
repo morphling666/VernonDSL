@@ -164,6 +164,8 @@ VernonRhiFormat rhiFormat(VernonTextureFormat format) {
         return VERNON_RHI_FORMAT_R11G11B10_FLOAT;
     case VERNON_TEXTURE_D32_FLOAT:
         return VERNON_RHI_FORMAT_D32_FLOAT;
+    case VERNON_TEXTURE_D32_FLOAT_S8_UINT:
+        return VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT;
     }
     throw std::invalid_argument("unsupported attachment image format");
 }
@@ -230,10 +232,12 @@ struct RhiImage {
             throw std::runtime_error("RHI image upload failed");
     }
     nb::bytes download() const {
-        if ((format != VERNON_TEXTURE_RGBA8_UNORM && format != VERNON_TEXTURE_D32_FLOAT) ||
+        if ((format != VERNON_TEXTURE_RGBA8_UNORM && format != VERNON_TEXTURE_D32_FLOAT &&
+             format != VERNON_TEXTURE_D32_FLOAT_S8_UINT) ||
             !(usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE))
             throw std::runtime_error("image format does not support download");
-        std::string data(static_cast<size_t>(width) * height * layers * 4, '\0');
+        const size_t pixelSize = format == VERNON_TEXTURE_D32_FLOAT_S8_UINT ? 8 : 4;
+        std::string data(static_cast<size_t>(width) * height * layers * pixelSize, '\0');
         if (vernonRhiDeviceDownloadImage(host->device, handle, data.data(), data.size()) != VERNON_RHI_STATUS_OK)
             throw std::runtime_error("RHI image download failed: " +
                                      stringView(vernonRhiDeviceGetLastError(host->device)));
@@ -299,8 +303,9 @@ struct RhiHost {
             throw std::invalid_argument("cube textures currently require RGBA8 format");
         uint32_t usage =
             VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION | VERNON_RHI_IMAGE_SAMPLED;
-        usage |= format == VERNON_TEXTURE_D32_FLOAT ? VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT
-                                                    : VERNON_RHI_IMAGE_COLOR_ATTACHMENT;
+        usage |= format == VERNON_TEXTURE_D32_FLOAT || format == VERNON_TEXTURE_D32_FLOAT_S8_UINT
+                     ? VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT
+                     : VERNON_RHI_IMAGE_COLOR_ATTACHMENT;
         return std::make_unique<RhiImage>(state, width, height, format, dimension, usage);
     }
     std::unique_ptr<RhiImage> createAttachmentImage(uint32_t width, uint32_t height, VernonTextureFormat format,
@@ -309,7 +314,7 @@ struct RhiHost {
             VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT;
         if (!usage || (usage & ~attachmentUsages))
             throw std::invalid_argument("attachment image usage must contain only attachment roles");
-        const bool depthFormat = format == VERNON_TEXTURE_D32_FLOAT;
+        const bool depthFormat = format == VERNON_TEXTURE_D32_FLOAT || format == VERNON_TEXTURE_D32_FLOAT_S8_UINT;
         const bool depthUsage = (usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) != 0;
         if (depthFormat != depthUsage || (depthUsage && (usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)))
             throw std::invalid_argument("attachment image format does not match its usage");
@@ -864,8 +869,8 @@ struct PipelineInvocationBuilder {
     PipelineInvocationBuilder &rhiColorAttachment(uint32_t location, RhiImage *texture, uint32_t loadOperation,
                                                   uint32_t storeOperation, const std::array<float, 4> &clearColor) {
         if (!texture || !(texture->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT) ||
-            texture->format == VERNON_TEXTURE_D32_FLOAT || loadOperation > VERNON_RHI_LOAD_DISCARD ||
-            storeOperation > VERNON_RHI_STORE_DISCARD)
+            (texture->format == VERNON_TEXTURE_D32_FLOAT || texture->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT) ||
+            loadOperation > VERNON_RHI_LOAD_DISCARD || storeOperation > VERNON_RHI_STORE_DISCARD)
             throw std::invalid_argument("RHI color attachment is null");
         VernonColorAttachment attachment{};
         attachment.location = location;
@@ -884,8 +889,9 @@ struct PipelineInvocationBuilder {
     PipelineInvocationBuilder &rhiDepthAttachment(RhiImage *texture, uint32_t loadOperation, uint32_t storeOperation,
                                                   float clearDepth) {
         if (!texture || !(texture->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) ||
-            texture->format != VERNON_TEXTURE_D32_FLOAT || loadOperation > VERNON_RHI_LOAD_DISCARD ||
-            storeOperation > VERNON_RHI_STORE_DISCARD || clearDepth < 0.0f || clearDepth > 1.0f)
+            (texture->format != VERNON_TEXTURE_D32_FLOAT && texture->format != VERNON_TEXTURE_D32_FLOAT_S8_UINT) ||
+            loadOperation > VERNON_RHI_LOAD_DISCARD || storeOperation > VERNON_RHI_STORE_DISCARD || clearDepth < 0.0f ||
+            clearDepth > 1.0f)
             throw std::invalid_argument("RHI depth attachment must use D32 format");
         depthAttachment = {};
         if (vernonRuntimeReferenceRhiImage(runtime, texture->handle, &depthAttachment.resource) != VERNON_STATUS_OK)
@@ -1312,7 +1318,8 @@ NB_MODULE(_native, module) {
         .value("RG8_UNORM", VERNON_TEXTURE_RG8_UNORM)
         .value("RGB8_UNORM", VERNON_TEXTURE_RGB8_UNORM)
         .value("R11G11B10_FLOAT", VERNON_TEXTURE_R11G11B10_FLOAT)
-        .value("D32_FLOAT", VERNON_TEXTURE_D32_FLOAT);
+        .value("D32_FLOAT", VERNON_TEXTURE_D32_FLOAT)
+        .value("D32_FLOAT_S8_UINT", VERNON_TEXTURE_D32_FLOAT_S8_UINT);
     nb::enum_<VernonTextureDimension>(module, "TextureDimension")
         .value("TEXTURE_2D", VERNON_TEXTURE_2D)
         .value("TEXTURE_3D", VERNON_TEXTURE_3D)

@@ -56,11 +56,7 @@ struct DirectX12PipelineState {
     uint32_t rhiComputeWorkgroup[3]{1, 1, 1};
     VernonRuntimeCorePipeline *rhiGraphicsPipeline{};
     VernonRuntimeCoreBindings *rhiGraphicsBindings{};
-    VernonRuntimeCoreGraphicsVariant *rhiGraphicsVariant{};
-    std::vector<uint32_t> rhiGraphicsFormats;
-    uint32_t rhiGraphicsDepthFormat{};
-    uint64_t rhiGraphicsVertexLayoutIdentity{};
-    uint32_t rhiGraphicsTopology{};
+    PreparedGraphicsVariant rhiGraphicsVariant;
     std::vector<VernonRuntimeProviderBindingLayoutEntry> rhiGraphicsLayout;
     std::vector<VernonRuntimeProviderVertexAttribute> rhiGraphicsVertexAttributes;
     std::vector<VernonRuntimeProviderBindingValue> rhiGraphicsValues;

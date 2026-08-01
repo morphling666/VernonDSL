@@ -1,4 +1,5 @@
 #include "metal_backend.h"
+#include "image_data_layout.h"
 #include "sampler_filter.h"
 
 #import <Foundation/Foundation.h>
@@ -46,7 +47,7 @@ size_t alignedTextureRowSize(size_t size) { return (size + 255u) & ~size_t{255u}
 
 } // namespace
 
-MTLPixelFormat pixelFormat(VernonRhiFormat format) {
+uint32_t pixelFormat(VernonRhiFormat format) {
     switch (format) {
     case VERNON_RHI_FORMAT_R8_UNORM:
         return MTLPixelFormatR8Unorm;
@@ -70,6 +71,8 @@ MTLPixelFormat pixelFormat(VernonRhiFormat format) {
         return MTLPixelFormatRG11B10Float;
     case VERNON_RHI_FORMAT_D32_FLOAT:
         return MTLPixelFormatDepth32Float;
+    case VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT:
+        return MTLPixelFormatDepth32Float_Stencil8;
     default:
         return MTLPixelFormatInvalid;
     }
@@ -88,6 +91,8 @@ size_t bytesPerPixel(VernonRhiFormat format) {
     case VERNON_RHI_FORMAT_R11G11B10_FLOAT:
     case VERNON_RHI_FORMAT_D32_FLOAT:
         return 4;
+    case VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT:
+        return packedDepthStencilPixelSize;
     case VERNON_RHI_FORMAT_RGBA16_FLOAT:
     case VERNON_RHI_FORMAT_RG32_FLOAT:
         return 8;
@@ -222,7 +227,7 @@ bool DeviceState::downloadBuffer(const Buffer &buffer, uint64_t offset, void *de
 }
 
 bool DeviceState::createImage(Image &image, const VernonRhiImageDescriptor &descriptor, std::string &error) {
-    const MTLPixelFormat format = pixelFormat(descriptor.format);
+    const MTLPixelFormat format = static_cast<MTLPixelFormat>(pixelFormat(descriptor.format));
     if (format == MTLPixelFormatInvalid) {
         error = "Metal image format is unsupported";
         return false;
@@ -345,6 +350,75 @@ bool DeviceState::downloadImage(const Image &image, const VernonRhiImageDescript
         error = "Metal image readback destination is too small";
         return false;
     }
+    if (descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT) {
+        if (descriptor.dimension != VERNON_RHI_IMAGE_2D || descriptor.depth != 1) {
+            error = "Metal depth/stencil readback only supports 2D images";
+            return false;
+        }
+        const size_t depthRowSize = sizeof(float) * descriptor.width;
+        const size_t depthRowPitch = alignedTextureRowSize(depthRowSize);
+        const size_t stencilRowSize = descriptor.width;
+        const size_t stencilRowPitch = alignedTextureRowSize(stencilRowSize);
+        const size_t depthLayerSize = depthRowPitch * descriptor.height;
+        const size_t stencilLayerSize = stencilRowPitch * descriptor.height;
+        id<MTLBuffer> depthStaging =
+            [device newBufferWithLength:depthLayerSize * descriptor.array_layers
+                                options:MTLResourceStorageModeShared];
+        id<MTLBuffer> stencilStaging =
+            [device newBufferWithLength:stencilLayerSize * descriptor.array_layers
+                                options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+        id<MTLBlitCommandEncoder> encoder = [commandBuffer blitCommandEncoder];
+        if (!depthStaging || !stencilStaging || !commandBuffer || !encoder) {
+            error = "Metal depth/stencil readback staging or view creation failed";
+            return false;
+        }
+        for (uint32_t layer = 0; layer < descriptor.array_layers; ++layer) {
+            [encoder copyFromTexture:image.texture
+                        sourceSlice:layer
+                        sourceLevel:0
+                       sourceOrigin:MTLOriginMake(0, 0, 0)
+                         sourceSize:MTLSizeMake(descriptor.width, descriptor.height, 1)
+                           toBuffer:depthStaging
+                  destinationOffset:layer * depthLayerSize
+             destinationBytesPerRow:depthRowPitch
+           destinationBytesPerImage:depthLayerSize];
+            [encoder copyFromTexture:image.texture
+                        sourceSlice:layer
+                        sourceLevel:0
+                       sourceOrigin:MTLOriginMake(0, 0, 0)
+                         sourceSize:MTLSizeMake(descriptor.width, descriptor.height, 1)
+                           toBuffer:stencilStaging
+                  destinationOffset:layer * stencilLayerSize
+             destinationBytesPerRow:stencilRowPitch
+           destinationBytesPerImage:stencilLayerSize
+                          options:MTLBlitOptionStencilFromDepthStencil];
+        }
+        [encoder endEncoding];
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+        if (commandBuffer.status != MTLCommandBufferStatusCompleted) {
+            setCommandError(error, commandBuffer, "Metal depth/stencil image readback failed");
+            return false;
+        }
+        auto *output = static_cast<uint8_t *>(destination);
+        const auto *depthSource = static_cast<const uint8_t *>(depthStaging.contents);
+        const auto *stencilSource = static_cast<const uint8_t *>(stencilStaging.contents);
+        for (uint32_t layer = 0; layer < descriptor.array_layers; ++layer)
+            for (uint32_t y = 0; y < descriptor.height; ++y)
+                for (uint32_t x = 0; x < descriptor.width; ++x) {
+                    const size_t outputOffset =
+                        (static_cast<size_t>(layer) * descriptor.width * descriptor.height +
+                         static_cast<size_t>(y) * descriptor.width + x) *
+                        packedDepthStencilPixelSize;
+                    const size_t depthOffset = layer * depthLayerSize + y * depthRowPitch + x * sizeof(float);
+                    const size_t stencilOffset = layer * stencilLayerSize + y * stencilRowPitch + x;
+                    float depthValue{};
+                    std::memcpy(&depthValue, depthSource + depthOffset, sizeof(depthValue));
+                    storePackedDepthStencil(output + outputOffset, depthValue, stencilSource[stencilOffset]);
+                }
+        return true;
+    }
     const size_t rowSize = pixelSize * descriptor.width;
     const size_t rowPitch = alignedTextureRowSize(rowSize);
     if (descriptor.height > (std::numeric_limits<size_t>::max)() / rowPitch) {
@@ -417,7 +491,7 @@ bool DeviceState::generateImageMipmaps(const Image &image, uint32_t mipLevels, s
 
 bool DeviceState::createImageView(ImageView &view, const Image &image,
                                   const VernonRhiImageViewDescriptor &descriptor, std::string &error) {
-    const MTLPixelFormat format = pixelFormat(descriptor.format);
+    const MTLPixelFormat format = static_cast<MTLPixelFormat>(pixelFormat(descriptor.format));
     view.texture = [image.texture newTextureViewWithPixelFormat:format
                                                    textureType:image.texture.textureType
                                                         levels:NSMakeRange(descriptor.base_mip_level,

@@ -13,7 +13,6 @@
 
 namespace vernon::rhi::metal {
 
-MTLPixelFormat pixelFormat(VernonRhiFormat format);
 size_t bytesPerPixel(VernonRhiFormat format);
 bool uploadLayoutMatches(VernonRhiFormat destination, VernonRhiImageDataFormat sourceFormat,
                          VernonRhiImageDataType sourceType);
@@ -51,11 +50,17 @@ struct RenderAttachmentSignature {
 
 struct RenderingState {
     id<MTLRenderCommandEncoder> encoder;
+    std::array<id<MTLTexture>, 8> colorTextures{};
+    id<MTLTexture> depthStencilTexture;
     std::array<RenderAttachmentSignature, 8> colors{};
     RenderAttachmentSignature depth{};
     size_t colorCount{};
     bool hasDepth{};
 };
+
+void registerRenderingState(uint64_t commandBuffer, RenderingState *rendering);
+RenderingState *findRenderingState(uint64_t commandBuffer);
+void unregisterRenderingState(uint64_t commandBuffer, RenderingState *rendering);
 
 struct VERNON_RHI_CAPI DeviceState {
     bool initialize(uint32_t deviceIndex, std::string &error);

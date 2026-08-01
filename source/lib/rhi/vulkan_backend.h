@@ -11,6 +11,18 @@ namespace vernon::rhi::vulkan {
 
 VERNON_RHI_CAPI uint32_t physicalDeviceTypeRank(VkPhysicalDeviceType type);
 
+inline VkImageAspectFlags imageAspectMask(VkFormat format) {
+    if (format == VK_FORMAT_D32_SFLOAT_S8_UINT)
+        return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+    if (format == VK_FORMAT_D32_SFLOAT)
+        return VK_IMAGE_ASPECT_DEPTH_BIT;
+    return VK_IMAGE_ASPECT_COLOR_BIT;
+}
+
+inline VkImageAspectFlags imagePrimaryCopyAspectMask(VkFormat format) {
+    return imageAspectMask(format) & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+}
+
 struct Buffer {
     VkBuffer buffer{};
     VkDeviceMemory memory{};

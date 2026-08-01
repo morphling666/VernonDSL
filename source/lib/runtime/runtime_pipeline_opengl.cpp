@@ -481,6 +481,7 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
 
 void destroyOpenGLPipeline(VernonLoadedPipeline &pipeline) {
     OpenGLPipelineState &state = runtimeBackendState<OpenGLPipelineState>(pipeline);
+    destroyGraphicsVariant(state.rhiGraphicsVariant);
     vernonRuntimeCoreBindingsDestroy(state.rhiBindings);
     vernonRuntimeCorePipelineDestroy(state.rhiPipeline);
 }
@@ -592,6 +593,45 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
     if (plan.depthAttachment) {
         depthAttachment = plan.depthAttachment->resource;
     }
+    std::vector<uint32_t> formats;
+    formats.reserve(plan.attachments.size());
+    for (const VernonColorAttachment *attachment : plan.attachments)
+        formats.push_back(static_cast<uint32_t>(attachment->format));
+    const uint32_t depthFormat = !plan.depthAttachment ? 0
+                                 : plan.depthAttachment->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT
+                                     ? rhi::opengl::kDepth32fStencil8
+                                     : rhi::opengl::kDepthComponent32f;
+    PlannedGraphicsState graphicsState;
+    const bool hasStencil = plan.depthAttachment && plan.depthAttachment->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT;
+    if (!planGraphicsState(invocation, formats.size(), plan.depthAttachment != nullptr, hasStencil, graphicsState,
+                           pipeline.context->error))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    std::vector<uint32_t> vertexStrides;
+    for (size_t index = 0; index < state.rhiLayout.size(); ++index) {
+        if (state.rhiLayout[index].kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
+            continue;
+        const uint32_t binding = state.rhiLayout[index].binding;
+        if (vertexStrides.size() <= binding)
+            vertexStrides.resize(binding + 1);
+        vertexStrides[binding] = state.rhiValues[index].stride;
+    }
+    GraphicsVariantKey variantKey{static_cast<uint32_t>(invocation.topology),
+                                  formats,
+                                  depthFormat,
+                                  1,
+                                  vertexStrides,
+                                  graphicsState.rasterization,
+                                  graphicsState.depthStencil,
+                                  graphicsState.colorBlends};
+    const VernonStatus variantStatus = ensureGraphicsVariant(state.rhiPipeline, variantKey, state.rhiGraphicsVariant);
+    if (variantStatus != VERNON_STATUS_OK) {
+        const VernonStringView providerError =
+            vernonRuntimeRhiAdapterGetLastError(openGLState(*pipeline.context).adapter);
+        return fail(*pipeline.context,
+                    providerError.data ? std::string(providerError.data, providerError.size)
+                                       : "failed to prepare OpenGL RHI graphics variant",
+                    variantStatus);
+    }
     const bool hasViewport = invocation.viewport[2] && invocation.viewport[3];
     VernonRuntimeCoreDrawInvocation draw{};
     draw.struct_size = sizeof(draw);
@@ -606,6 +646,11 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
     draw.depth_store_operation =
         plan.depthAttachment ? static_cast<uint32_t>(plan.depthAttachment->store_operation) : VERNON_RHI_STORE_DISCARD;
     draw.clear_depth = plan.depthAttachment ? plan.depthAttachment->clear_depth : 1.0f;
+    draw.stencil_load_operation = hasStencil ? plan.depthAttachment->stencil_load_operation : VERNON_RHI_LOAD_DISCARD;
+    draw.stencil_store_operation =
+        hasStencil ? plan.depthAttachment->stencil_store_operation : VERNON_RHI_STORE_DISCARD;
+    draw.clear_stencil = hasStencil ? plan.depthAttachment->clear_stencil : 0;
+    draw.stencil_reference = graphicsState.stencilReference;
     draw.viewport[0] = hasViewport ? invocation.viewport[0] : 0;
     draw.viewport[1] = hasViewport ? invocation.viewport[1] : 0;
     draw.viewport[2] = hasViewport ? invocation.viewport[2] : plan.attachmentWidth;
@@ -620,7 +665,8 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
         draw.index_count = plan.indexBinding->index_count;
         draw.index_type = plan.indexBinding->type;
     }
-    const VernonStatus status = vernonRuntimeCoreEncodeDrawInvocation(state.rhiPipeline, state.rhiBindings, &draw);
+    const VernonStatus status =
+        vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(state.rhiGraphicsVariant.handle, state.rhiBindings, &draw);
     if (status != VERNON_STATUS_OK) {
         const VernonStringView providerError =
             vernonRuntimeRhiAdapterGetLastError(openGLState(*pipeline.context).adapter);

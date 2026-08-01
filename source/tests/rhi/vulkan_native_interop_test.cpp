@@ -34,6 +34,16 @@ TEST(VulkanDeviceSelection, RanksHighPerformanceHardwareFirst) {
               vernon::rhi::vulkan::physicalDeviceTypeRank(VK_PHYSICAL_DEVICE_TYPE_CPU));
 }
 
+TEST(VulkanImageAspect, DistinguishesColorDepthAndPackedDepthStencilFormats) {
+    EXPECT_EQ(vernon::rhi::vulkan::imageAspectMask(VK_FORMAT_R8G8B8A8_UNORM), VK_IMAGE_ASPECT_COLOR_BIT);
+    EXPECT_EQ(vernon::rhi::vulkan::imageAspectMask(VK_FORMAT_D32_SFLOAT), VK_IMAGE_ASPECT_DEPTH_BIT);
+    EXPECT_EQ(vernon::rhi::vulkan::imageAspectMask(VK_FORMAT_D32_SFLOAT_S8_UINT),
+              VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+    EXPECT_EQ(vernon::rhi::vulkan::imagePrimaryCopyAspectMask(VK_FORMAT_R8G8B8A8_UNORM), VK_IMAGE_ASPECT_COLOR_BIT);
+    EXPECT_EQ(vernon::rhi::vulkan::imagePrimaryCopyAspectMask(VK_FORMAT_D32_SFLOAT), VK_IMAGE_ASPECT_DEPTH_BIT);
+    EXPECT_EQ(vernon::rhi::vulkan::imagePrimaryCopyAspectMask(VK_FORMAT_D32_SFLOAT_S8_UINT), VK_IMAGE_ASPECT_DEPTH_BIT);
+}
+
 TEST(VulkanMemorySelection, PrefersCachedCoherentReadbackMemoryAndFallsBack) {
     vernon::rhi::vulkan::DeviceState state;
     state.memoryProperties.memoryTypeCount = 2;
@@ -74,6 +84,33 @@ TEST(VulkanOwnedDevice, CreatesDeviceAndNegotiatesPortabilityWhenAdvertised) {
                                                         deviceExtensions.empty() ? nullptr : deviceExtensions.data()),
               VK_SUCCESS);
     EXPECT_EQ(state.portabilitySubset, hasExtension(deviceExtensions, "VK_KHR_portability_subset"));
+}
+
+TEST(VulkanOwnedDevice, DownloadsDepthOnlyImageThroughDepthAspect) {
+    VernonRhiOwnedDeviceDescriptor deviceDescriptor{};
+    deviceDescriptor.struct_size = sizeof(deviceDescriptor);
+    deviceDescriptor.backend = VERNON_RHI_BACKEND_VULKAN;
+    VernonRhiDevice device = vernonRhiCreateDevice(&deviceDescriptor);
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        GTEST_SKIP() << "Vulkan device is unavailable";
+
+    VernonRhiImageDescriptor imageDescriptor{};
+    imageDescriptor.struct_size = sizeof(imageDescriptor);
+    imageDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    imageDescriptor.format = VERNON_RHI_FORMAT_D32_FLOAT;
+    imageDescriptor.width = 1;
+    imageDescriptor.height = 1;
+    imageDescriptor.depth = 1;
+    imageDescriptor.mip_levels = 1;
+    imageDescriptor.array_layers = 1;
+    imageDescriptor.sample_count = 1;
+    imageDescriptor.usage = VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE;
+    VernonRhiImage image{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &image), VERNON_RHI_STATUS_OK);
+    float depth{};
+    EXPECT_EQ(vernonRhiDeviceDownloadImage(device, image, &depth, sizeof(depth)), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
 }
 
 TEST(VulkanNativeInterop, BorrowsObjectsWithoutOwningTheirLifetime) {
