@@ -21,6 +21,11 @@ struct DirectX12AdapterDepthStencilStats {
 };
 
 DirectX12AdapterDepthStencilStats getDirectX12AdapterDepthStencilStats(const VernonRuntimeRhiAdapter &adapter) noexcept;
+uint32_t getDirectX12BlendFactorMapping(uint32_t value);
+uint32_t getDirectX12BlendOperationMapping(uint32_t value);
+uint32_t getDirectX12CompareOperationMapping(uint32_t value);
+uint32_t getDirectX12StencilOperationMapping(uint32_t value);
+uint32_t getDirectX12CullModeMapping(uint32_t value);
 
 } // namespace vernon::runtime
 

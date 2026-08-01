@@ -1,6 +1,7 @@
 #include "VernonCompiler.h"
 #include "VernonRuntime.h"
 #include "VernonVersions.h"
+#include "runtime/rhi_adapter/adapter_directx12_test_hooks.h"
 #include "runtime/runtime_test_hooks.h"
 #include "runtime_rhi_test_utils.h"
 

@@ -88,7 +88,7 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
   })";
     const std::string ptxHash = vernon::runtime::sha256Hex(ptx, sizeof(ptx) - 1);
     std::string bundle = "{" VERNON_PIPELINE_JSON_FIELD R"(,)"
-                         R"("type":"pipeline","id":"cuda/scale","target":"cuda",)"
+                         R"("type":"pipeline","id":"cuda/scale","target":{"kind":"cuda","options":{}},)"
                          R"("features":[],"runtime_requirements":{"backend":"cuda",)"
                          R"("features":[],"ptx_version":[8,0],)"
                          R"("minimum_compute_capability":[8,0],"address_size":64},)"

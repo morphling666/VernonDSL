@@ -97,7 +97,6 @@ try {
     ConvertFrom-Json
   if ($openGlReflection.compiler_contract_version -ne [int]$compilerContractVersion -or
       $openGlReflection.pipeline_version -ne [int]$pipelineVersion -or
-      $openGlReflection.target -ne "opengl" -or
       $openGlReflection.target.kind -ne "opengl" -or
       $openGlReflection.target.options.version -ne 330 -or
       $openGlReflection.artifacts.Count -ne 2 -or

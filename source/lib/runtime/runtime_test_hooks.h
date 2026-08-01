@@ -49,11 +49,6 @@ VERNON_RUNTIME_CAPI size_t getRhiAdapterRecordedCommandCount(const VernonRuntime
 VERNON_RUNTIME_CAPI bool validateMetalArgumentBufferLimitsForTesting(uint64_t buffers, uint64_t textures,
                                                                      uint64_t samplers, bool writableTexture,
                                                                      uint32_t deviceTier);
-VERNON_RUNTIME_CAPI uint32_t getDirectX12BlendFactorMapping(uint32_t value);
-VERNON_RUNTIME_CAPI uint32_t getDirectX12BlendOperationMapping(uint32_t value);
-VERNON_RUNTIME_CAPI uint32_t getDirectX12CompareOperationMapping(uint32_t value);
-VERNON_RUNTIME_CAPI uint32_t getDirectX12StencilOperationMapping(uint32_t value);
-VERNON_RUNTIME_CAPI uint32_t getDirectX12CullModeMapping(uint32_t value);
 
 } // namespace vernon::runtime
 
