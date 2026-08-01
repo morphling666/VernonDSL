@@ -143,6 +143,14 @@ function(vernon_add_runtime)
         target_compile_definitions(VernonRuntimeRHIAdapter PRIVATE VERNON_HAS_VULKAN_RHI=1 VK_NO_PROTOTYPES=1)
         target_link_libraries(VernonRuntimeRHIAdapter PRIVATE $<BUILD_INTERFACE:Vulkan::Headers>)
     endif()
+    if(VERNON_ENABLE_METAL_RUNTIME)
+        target_sources(VernonRuntimeRHIAdapter PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/rhi_adapter/adapter_metal.mm)
+        set_target_properties(VernonRuntimeRHIAdapter PROPERTIES OBJCXX_STANDARD 17 OBJCXX_STANDARD_REQUIRED ON)
+        target_compile_definitions(VernonRuntimeRHIAdapter PRIVATE VERNON_HAS_METAL_RHI=1)
+        target_compile_options(VernonRuntimeRHIAdapter PRIVATE "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
+        target_link_libraries(VernonRuntimeRHIAdapter PRIVATE ${_vernon_metal_framework}
+                                                              ${_vernon_foundation_framework})
+    endif()
     target_link_libraries(VernonRuntimeRHIAdapter PUBLIC Vernon::RuntimeCore Vernon::RHI)
 
     add_library(
@@ -184,6 +192,10 @@ function(vernon_add_runtime)
         endif()
         target_compile_definitions(VernonRuntime PUBLIC VERNON_HAS_DIRECTX12_RUNTIME=1)
         target_link_libraries(VernonRuntime PRIVATE d3d12 dxgi dxguid)
+    endif()
+    if(VERNON_ENABLE_METAL_RUNTIME)
+        target_sources(VernonRuntime PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_metal.cpp)
+        target_compile_definitions(VernonRuntime PUBLIC VERNON_HAS_METAL_RUNTIME=1)
     endif()
     target_include_directories(
         VernonRuntime

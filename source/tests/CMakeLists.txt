@@ -191,6 +191,36 @@ if(TARGET VernonRuntime)
 
     if(VERNON_ENABLE_METAL_RUNTIME)
         target_sources(VernonRuntimeTests PRIVATE runtime/runtime_metal_test.cpp)
+        if(TARGET vernon-dsl-native AND Python_FOUND)
+            vernon_add_pipeline_test_bundle(
+                metal-compute-pipeline
+                metal
+                "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:scale_asset"
+                metal_compute_pipeline_bundle
+                metal_compute_pipeline_test_manifest)
+            vernon_add_pipeline_test_bundle(
+                metal-graphics-pipeline
+                metal
+                "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:sampled_asset"
+                metal_graphics_pipeline_bundle
+                metal_graphics_pipeline_test_manifest)
+            vernon_add_pipeline_test_bundle(
+                metal-resolution-pipeline
+                metal
+                "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:resolution_asset"
+                metal_resolution_pipeline_bundle
+                metal_resolution_pipeline_test_manifest)
+            target_compile_definitions(
+                VernonRuntimeTests
+                PRIVATE VERNON_METAL_COMPUTE_PIPELINE_BUNDLE="${metal_compute_pipeline_test_manifest}"
+                        VERNON_METAL_GRAPHICS_PIPELINE_BUNDLE="${metal_graphics_pipeline_test_manifest}"
+                        VERNON_METAL_RESOLUTION_PIPELINE_BUNDLE="${metal_resolution_pipeline_test_manifest}")
+            add_dependencies(
+                VernonRuntimeTests
+                vernon-metal-compute-pipeline-test-bundle
+                vernon-metal-graphics-pipeline-test-bundle
+                vernon-metal-resolution-pipeline-test-bundle)
+        endif()
     endif()
 
     if(VERNON_ENABLE_DIRECTX12_RUNTIME)

@@ -31,6 +31,8 @@ const char *physicalValueProfileName(VernonRuntimeBackend backend, const std::st
         if (transport == "uniform_buffer" || transport == "push_constant")
             return "directx_constant_buffer";
         return "vulkan_std430_storage_buffer";
+    case VERNON_RUNTIME_METAL:
+        return "metal_constant_buffer";
     }
     return "";
 }

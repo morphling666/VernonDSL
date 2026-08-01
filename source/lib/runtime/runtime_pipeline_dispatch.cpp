@@ -32,6 +32,8 @@ bool resolveBackendPipeline(VernonPipelineBundle &bundle, const Variant &variant
         return resolveVulkanPipeline(bundle, variant, pipeline);
     if (bundle.context->backend == VERNON_RUNTIME_DIRECTX12)
         return resolveDirectX12Pipeline(bundle, variant, pipeline);
+    if (bundle.context->backend == VERNON_RUNTIME_METAL)
+        return resolveMetalPipeline(bundle, variant, pipeline);
     if (isOpenGLBackend(bundle.context->backend))
         return resolveOpenGLPipeline(bundle, variant, pipeline);
     bundle.context->error = "unsupported runtime pipeline backend";
@@ -47,6 +49,8 @@ void destroyBackendPipeline(VernonLoadedPipeline &pipeline) {
         destroyDirectX12Pipeline(pipeline);
     } else if (pipeline.context->backend == VERNON_RUNTIME_VULKAN) {
         destroyVulkanPipeline(pipeline);
+    } else if (pipeline.context->backend == VERNON_RUNTIME_METAL) {
+        destroyMetalPipeline(pipeline);
     } else {
         destroyOpenGLPipeline(pipeline);
     }
@@ -61,6 +65,8 @@ VernonStatus invokeBackendPipeline(VernonLoadedPipeline &pipeline, const VernonP
         return invokeVulkanGraphicsPipeline(pipeline, invocation, plan);
     if (pipeline.context->backend == VERNON_RUNTIME_DIRECTX12)
         return invokeDirectX12GraphicsPipeline(pipeline, invocation, plan);
+    if (pipeline.context->backend == VERNON_RUNTIME_METAL)
+        return invokeMetalGraphicsPipeline(pipeline, invocation, plan);
     return invokeOpenGLGraphicsPipeline(pipeline, invocation, plan);
 }
 
@@ -73,6 +79,8 @@ VernonStatus invokeBackendComputePipeline(VernonLoadedPipeline &pipeline, const 
         return invokeVulkanComputePipeline(pipeline, plan);
     if (pipeline.context->backend == VERNON_RUNTIME_DIRECTX12)
         return invokeDirectX12ComputePipeline(pipeline, plan);
+    if (pipeline.context->backend == VERNON_RUNTIME_METAL)
+        return invokeMetalComputePipeline(pipeline, plan);
     if (!isOpenGLBackend(pipeline.context->backend))
         return VERNON_STATUS_UNSUPPORTED_TARGET;
     return invokeOpenGLComputePipeline(pipeline, plan);

@@ -11,6 +11,10 @@
 #include <utility>
 #include <vector>
 
+namespace vernon::rhi {
+uint32_t metalImagePixelFormat(VernonRhiDevice device, uint64_t resourceKey);
+}
+
 namespace {
 
 template <typename Native> struct MetalResourceSlot : vernon::rhi::LogicalResourceRecord {
@@ -25,12 +29,18 @@ struct MetalImageSlot : MetalResourceSlot<vernon::rhi::metal::Image> {
     VernonRhiImageDescriptor descriptor{};
 };
 
+struct MetalImageViewSlot : MetalResourceSlot<vernon::rhi::metal::ImageView> {
+    VernonRhiImageViewDescriptor descriptor{};
+    uint64_t imageResource{};
+};
+
 using MetalSamplerSlot = MetalResourceSlot<vernon::rhi::metal::Sampler>;
 
 struct MetalDevice {
     vernon::rhi::metal::DeviceState state;
     std::vector<MetalBufferSlot> buffers;
     std::vector<MetalImageSlot> images;
+    std::vector<MetalImageViewSlot> imageViews;
     std::vector<MetalSamplerSlot> samplers;
     std::string error;
     std::mutex mutex;
@@ -58,6 +68,58 @@ bool decodeResourceKey(uint64_t key, uint32_t &index, uint32_t &generation) {
         return false;
     index = static_cast<uint32_t>(encodedIndex - 1);
     return true;
+}
+
+uint32_t maximumMipLevels(const VernonRhiImageDescriptor &descriptor) {
+    uint32_t extent = descriptor.width > descriptor.height ? descriptor.width : descriptor.height;
+    if (descriptor.dimension == VERNON_RHI_IMAGE_3D && descriptor.depth > extent)
+        extent = descriptor.depth;
+    uint32_t levels = 1;
+    while (extent > 1) {
+        extent >>= 1;
+        ++levels;
+    }
+    return levels;
+}
+
+bool supportsBufferState(const VernonRhiBufferDescriptor &descriptor, VernonRhiResourceState state) {
+    switch (state) {
+    case VERNON_RHI_STATE_UNDEFINED:
+    case VERNON_RHI_STATE_COMMON:
+        return true;
+    case VERNON_RHI_STATE_TRANSFER_SOURCE:
+        return (descriptor.usage & VERNON_RHI_BUFFER_TRANSFER_SOURCE) != 0;
+    case VERNON_RHI_STATE_TRANSFER_DESTINATION:
+        return (descriptor.usage & VERNON_RHI_BUFFER_TRANSFER_DESTINATION) != 0;
+    case VERNON_RHI_STATE_SHADER_READ:
+        return (descriptor.usage & (VERNON_RHI_BUFFER_UNIFORM | VERNON_RHI_BUFFER_STORAGE)) != 0;
+    case VERNON_RHI_STATE_SHADER_WRITE:
+        return (descriptor.usage & VERNON_RHI_BUFFER_STORAGE) != 0;
+    default:
+        return false;
+    }
+}
+
+bool supportsImageState(const VernonRhiImageDescriptor &descriptor, VernonRhiResourceState state) {
+    switch (state) {
+    case VERNON_RHI_STATE_UNDEFINED:
+    case VERNON_RHI_STATE_COMMON:
+        return true;
+    case VERNON_RHI_STATE_TRANSFER_SOURCE:
+        return (descriptor.usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE) != 0;
+    case VERNON_RHI_STATE_TRANSFER_DESTINATION:
+        return (descriptor.usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION) != 0;
+    case VERNON_RHI_STATE_SHADER_READ:
+        return (descriptor.usage & (VERNON_RHI_IMAGE_SAMPLED | VERNON_RHI_IMAGE_STORAGE)) != 0;
+    case VERNON_RHI_STATE_SHADER_WRITE:
+        return (descriptor.usage & VERNON_RHI_IMAGE_STORAGE) != 0;
+    case VERNON_RHI_STATE_COLOR_ATTACHMENT:
+        return (descriptor.usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT) != 0;
+    case VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT:
+        return (descriptor.usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) != 0;
+    default:
+        return false;
+    }
 }
 
 template <typename Slots> auto *lookupResourceRecord(Slots &slots, uint64_t key) {
@@ -140,6 +202,9 @@ void destroyDevice(VernonRhiDevice handle) {
     if (!device)
         return;
     std::lock_guard<std::mutex> guard(device->mutex);
+    for (MetalImageViewSlot &slot : device->imageViews)
+        if (slot.occupied)
+            device->state.destroyImageView(slot.native);
     for (MetalBufferSlot &slot : device->buffers)
         if (slot.occupied)
             device->state.destroyBuffer(slot.native);
@@ -177,9 +242,12 @@ VernonRhiStatus createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescri
     auto device = lookupMetalDevice(handle);
     if (!device)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    constexpr uint32_t allUsages =
+        VERNON_RHI_BUFFER_TRANSFER_SOURCE | VERNON_RHI_BUFFER_TRANSFER_DESTINATION | VERNON_RHI_BUFFER_UNIFORM |
+        VERNON_RHI_BUFFER_STORAGE | VERNON_RHI_BUFFER_VERTEX | VERNON_RHI_BUFFER_INDEX | VERNON_RHI_BUFFER_INDIRECT;
     if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || descriptor->size == 0 ||
         descriptor->size > (std::numeric_limits<size_t>::max)() ||
-        descriptor->memory_class > VERNON_RHI_MEMORY_READBACK)
+        descriptor->memory_class > VERNON_RHI_MEMORY_READBACK || (descriptor->usage & ~allUsages) != 0)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(device->mutex);
     const uint32_t index = allocateSlot(device->buffers);
@@ -268,10 +336,16 @@ VernonRhiStatus createImage(VernonRhiDevice handle, const VernonRhiImageDescript
     const bool validCube = descriptor && descriptor->dimension == VERNON_RHI_IMAGE_CUBE &&
                            descriptor->width == descriptor->height && descriptor->depth == 1 &&
                            descriptor->array_layers == 6;
+    constexpr uint32_t allUsages =
+        VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION | VERNON_RHI_IMAGE_SAMPLED |
+        VERNON_RHI_IMAGE_STORAGE | VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT;
     if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || descriptor->width == 0 ||
         descriptor->height == 0 || descriptor->depth == 0 || descriptor->mip_levels == 0 ||
         descriptor->array_layers == 0 || descriptor->sample_count != 1 ||
         descriptor->dimension > VERNON_RHI_IMAGE_CUBE ||
+        (descriptor->usage & ~allUsages) != 0 ||
+        descriptor->mip_levels > maximumMipLevels(*descriptor) ||
+        (descriptor->dimension == VERNON_RHI_IMAGE_2D && descriptor->depth != 1) ||
         (descriptor->dimension == VERNON_RHI_IMAGE_3D && descriptor->array_layers != 1) ||
         (descriptor->dimension == VERNON_RHI_IMAGE_CUBE && !validCube))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
@@ -285,6 +359,73 @@ VernonRhiStatus createImage(VernonRhiDevice handle, const VernonRhiImageDescript
     slot.descriptor = *descriptor;
     slot.publish();
     *output = {index, slot.generation};
+    return VERNON_RHI_STATUS_OK;
+}
+
+VernonRhiStatus createImageView(VernonRhiDevice handle, const VernonRhiImageViewDescriptor *descriptor,
+                                VernonRhiImageView *output) {
+    auto device = lookupMetalDevice(handle);
+    if (!device)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
+        vernon::rhi::metal::pixelFormat(descriptor->format) == MTLPixelFormatInvalid ||
+        descriptor->mip_level_count == 0 || descriptor->array_layer_count == 0)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    MetalImageSlot *image = lookupPublicResource(device->images, descriptor->image);
+    if (!image || descriptor->base_mip_level > image->descriptor.mip_levels ||
+        descriptor->mip_level_count > image->descriptor.mip_levels - descriptor->base_mip_level ||
+        descriptor->base_array_layer > image->descriptor.array_layers ||
+        descriptor->array_layer_count > image->descriptor.array_layers - descriptor->base_array_layer ||
+        (image->descriptor.dimension == VERNON_RHI_IMAGE_3D &&
+         (descriptor->base_array_layer != 0 || descriptor->array_layer_count != 1)) ||
+        (image->descriptor.dimension == VERNON_RHI_IMAGE_CUBE &&
+         (descriptor->base_array_layer != 0 || descriptor->array_layer_count != 6)))
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!image->retain())
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    const uint32_t index = allocateSlot(device->imageViews);
+    MetalImageViewSlot &slot = device->imageViews[index];
+    if (!device->state.createImageView(slot.native, image->native, *descriptor, device->error)) {
+        image->release();
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    }
+    slot.descriptor = *descriptor;
+    slot.imageResource = resourceKey(descriptor->image);
+    slot.publish();
+    *output = {index, slot.generation};
+    return VERNON_RHI_STATUS_OK;
+}
+
+VernonRhiStatus destroyImageView(VernonRhiDevice handle, VernonRhiImageView imageView) {
+    auto device = lookupMetalDevice(handle);
+    if (!device)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    MetalImageViewSlot *slot = lookupPublicResource(device->imageViews, imageView);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    const uint64_t imageResource = slot->imageResource;
+    slot->destroyPublicOwner();
+    device->state.destroyImageView(slot->native);
+    slot->recycle();
+    MetalImageSlot *image = lookupResourceRecord(device->images, imageResource);
+    if (image && image->release()) {
+        device->state.destroyImage(image->native);
+        image->recycle();
+    }
+    return VERNON_RHI_STATUS_OK;
+}
+
+VernonRhiStatus getImageViewNativeHandle(VernonRhiDevice handle, VernonRhiImageView imageView, uint64_t *output) {
+    auto device = lookupMetalDevice(handle);
+    if (!device || !output)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    MetalImageViewSlot *slot = lookupPublicResource(device->imageViews, imageView);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    *output = reinterpret_cast<uintptr_t>((__bridge void *)slot->native.texture);
     return VERNON_RHI_STATUS_OK;
 }
 
@@ -529,6 +670,14 @@ bool submitCommands(VernonRhiDevice handle, uint64_t native, bool, bool &complet
     return completed;
 }
 
+void completeBorrowedCommands(VernonRhiDevice handle, uint64_t native) {
+    auto device = lookupMetalDevice(handle);
+    if (device) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        device->state.completeCommands(native);
+    }
+}
+
 void abandonCommands(VernonRhiDevice handle, uint64_t native) {
     auto device = lookupMetalDevice(handle);
     if (device) {
@@ -537,7 +686,54 @@ void abandonCommands(VernonRhiDevice handle, uint64_t native) {
     }
 }
 
+bool recordBarriers(VernonRhiDevice handle, uint64_t, uint64_t native, const VernonRhiBarrier *barriers,
+                    size_t barrierCount) {
+    auto device = lookupMetalDevice(handle);
+    if (!device || !native || (barrierCount && !barriers))
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    for (size_t index = 0; index < barrierCount; ++index) {
+        const VernonRhiBarrier &barrier = barriers[index];
+        if (barrier.is_image) {
+            MetalImageSlot *slot = lookupResourceRecord(device->images, resourceKey(barrier.image));
+            if (!slot || !supportsImageState(slot->descriptor, barrier.old_state) ||
+                !supportsImageState(slot->descriptor, barrier.new_state))
+                return false;
+        } else {
+            MetalBufferSlot *slot = lookupResourceRecord(device->buffers, resourceKey(barrier.buffer));
+            if (!slot || !supportsBufferState(slot->descriptor, barrier.old_state) ||
+                !supportsBufferState(slot->descriptor, barrier.new_state))
+                return false;
+        }
+    }
+    // Vernon barriers occur between provider encoders. All owned Metal resources use
+    // hazard-tracked storage, so Metal orders their reads and writes without an
+    // explicit fence or resource-state transition.
+    return true;
+}
+
+bool endRendering(VernonRhiDevice handle, uint64_t, VernonRhiBackend backend, uint32_t backendKind, uint32_t,
+                  uint32_t, const uint64_t *, size_t, uint64_t, uint64_t renderingObject) {
+    if (!lookupMetalDevice(handle) || backend != VERNON_RHI_BACKEND_METAL ||
+        backendKind != vernon::rhi::CommandRenderingDynamic || !renderingObject)
+        return false;
+    auto *rendering = reinterpret_cast<vernon::rhi::metal::RenderingState *>(
+        static_cast<uintptr_t>(renderingObject));
+    [rendering->encoder endEncoding];
+    delete rendering;
+    return true;
+}
+
 } // namespace vernon::rhi::metal_api
+
+uint32_t vernon::rhi::metalImagePixelFormat(VernonRhiDevice handle, uint64_t resourceKey) {
+    auto device = lookupMetalDevice(handle);
+    if (!device)
+        return 0;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    MetalImageSlot *slot = lookupResourceRecord(device->images, resourceKey);
+    return slot ? static_cast<uint32_t>(slot->native.texture.pixelFormat) : 0;
+}
 
 const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
     using namespace metal_api;
@@ -575,13 +771,16 @@ const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
         releaseResource,
         beginCommands,
         submitCommands,
-        nullptr,
+        completeBorrowedCommands,
         abandonCommands,
+        recordBarriers,
+        endRendering,
         nullptr,
         nullptr,
         nullptr,
-        nullptr,
-        nullptr,
+        createImageView,
+        destroyImageView,
+        getImageViewNativeHandle,
     };
     return dispatch;
 }

@@ -444,6 +444,7 @@ class Kernel:
                 state.cuda: state._native.Target.CUDA,
                 state.vulkan: state._native.Target.VULKAN,
                 state.directx: state._native.Target.DIRECTX,
+                state.metal: state._native.Target.METAL,
                 state.opengl: state._native.Target.OPENGL,
                 state.opengles: state._native.Target.OPENGL_ES,
             }.get(state._architecture)

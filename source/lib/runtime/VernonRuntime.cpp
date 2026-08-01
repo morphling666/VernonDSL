@@ -80,7 +80,7 @@ VernonRuntimeCapabilities vernonRuntimeGetCapabilities(VernonRuntimeBackend back
         result.supports_compute = 1;
         result.supports_storage_buffers = 1;
     } else if ((backend == VERNON_RUNTIME_CUDA || backend == VERNON_RUNTIME_VULKAN ||
-                backend == VERNON_RUNTIME_DIRECTX12) &&
+                backend == VERNON_RUNTIME_DIRECTX12 || backend == VERNON_RUNTIME_METAL) &&
                result.available) {
         result.supports_compute = result.available;
         result.supports_storage_buffers = result.available;
@@ -205,6 +205,8 @@ VernonStatus vernonRuntimePipelineBundleInspectTarget(const void *bundleData, si
             *target = VERNON_RUNTIME_OPENGL_ES;
         else if (name == "directx")
             *target = VERNON_RUNTIME_DIRECTX12;
+        else if (name == "metal")
+            *target = VERNON_RUNTIME_METAL;
         else
             return VERNON_STATUS_UNSUPPORTED_TARGET;
         return VERNON_STATUS_OK;
@@ -219,7 +221,8 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
     if (!context ||
         (context->backend != VERNON_RUNTIME_CPU && context->backend != VERNON_RUNTIME_OPENGL &&
          context->backend != VERNON_RUNTIME_OPENGL_ES && context->backend != VERNON_RUNTIME_VULKAN &&
-         context->backend != VERNON_RUNTIME_CUDA && context->backend != VERNON_RUNTIME_DIRECTX12) ||
+         context->backend != VERNON_RUNTIME_CUDA && context->backend != VERNON_RUNTIME_DIRECTX12 &&
+         context->backend != VERNON_RUNTIME_METAL) ||
         !bundleData || !bundleSize || (options && options->struct_size < sizeof(VernonPipelineBundleLoadOptions)))
         return nullptr;
     try {
@@ -228,11 +231,12 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
             bundleDirectory = std::filesystem::u8path(options->bundle_directory);
         const nlohmann::json root = nlohmann::json::parse(static_cast<const char *>(bundleData),
                                                           static_cast<const char *>(bundleData) + bundleSize);
-        const char *expectedTarget = context->backend == VERNON_RUNTIME_CPU      ? "cpu"
-                                     : context->backend == VERNON_RUNTIME_CUDA   ? "cuda"
-                                     : context->backend == VERNON_RUNTIME_VULKAN ? "vulkan"
-                                     : context->backend == VERNON_RUNTIME_DIRECTX12
-                                         ? "directx"
+        const char *expectedTarget = context->backend == VERNON_RUNTIME_CPU         ? "cpu"
+                                     : context->backend == VERNON_RUNTIME_CUDA      ? "cuda"
+                                     : context->backend == VERNON_RUNTIME_VULKAN    ? "vulkan"
+                                     : context->backend == VERNON_RUNTIME_DIRECTX12 ? "directx"
+                                     : context->backend == VERNON_RUNTIME_METAL
+                                         ? "metal"
                                          : (context->backend == VERNON_RUNTIME_OPENGL_ES ? "opengles" : "opengl");
         const bool pipelineSchema = root.is_object() && root.value("pipeline_version", 0) == VERNON_PIPELINE_VERSION &&
                                     root.value("type", "") == "pipeline";
@@ -292,6 +296,7 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
             const char *expectedFormat = context->backend == VERNON_RUNTIME_CUDA        ? "ptx"
                                          : context->backend == VERNON_RUNTIME_VULKAN    ? "spirv"
                                          : context->backend == VERNON_RUNTIME_DIRECTX12 ? "dxil"
+                                         : context->backend == VERNON_RUNTIME_METAL     ? "msl"
                                          : context->backend == VERNON_RUNTIME_OPENGL_ES ? "gles"
                                                                                         : "glsl";
             const std::string encoding = value["artifact"].value("encoding", "");
@@ -345,8 +350,9 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                 context->backend == VERNON_RUNTIME_CPU ? stage.cpuArtifact.has_value()
                 : (context->backend == VERNON_RUNTIME_VULKAN || context->backend == VERNON_RUNTIME_DIRECTX12)
                     ? !stage.binary.empty() && stage.binary.size() % sizeof(uint32_t) == 0 && !stage.reflection.empty()
-                : context->backend == VERNON_RUNTIME_CUDA ? !stage.source.empty() && !stage.reflection.empty()
-                                                          : !stage.source.empty();
+                : (context->backend == VERNON_RUNTIME_CUDA || context->backend == VERNON_RUNTIME_METAL)
+                    ? !stage.source.empty() && !stage.reflection.empty()
+                    : !stage.source.empty();
             if (stage.stage.empty() || stage.entry.empty() || !hasArtifact) {
                 fail(context, "pipeline stage artifact is invalid");
                 return nullptr;

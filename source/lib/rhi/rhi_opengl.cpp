@@ -822,7 +822,7 @@ bool recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native
 
 bool endRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
                   uint32_t colorDiscardMask, uint32_t depthStencilDiscard, const uint64_t *colorResources,
-                  size_t colorCount, uint64_t depthResource) {
+                  size_t colorCount, uint64_t depthResource, uint64_t) {
 
     if ((backend == VERNON_RHI_BACKEND_OPENGL || backend == VERNON_RHI_BACKEND_OPENGL_ES) &&
         backendKind == CommandRenderingStateless) {

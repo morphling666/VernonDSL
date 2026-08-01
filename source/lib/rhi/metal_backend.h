@@ -2,9 +2,11 @@
 #define VERNON_RHI_METAL_BACKEND_H
 
 #include "VernonRHI.h"
+#include "metal_backend_fwd.h"
 
 #import <Metal/Metal.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -24,8 +26,35 @@ struct Image {
     id<MTLTexture> texture;
 };
 
+struct ImageView {
+    id<MTLTexture> texture;
+};
+
 struct Sampler {
     id<MTLSamplerState> sampler;
+};
+
+struct RenderAttachmentSignature {
+    uint64_t identity{};
+    uint64_t resource{};
+    uint32_t location{};
+    uint32_t format{};
+    uint32_t load{};
+    uint32_t store{};
+    uint32_t sampleCount{};
+
+    bool operator==(const RenderAttachmentSignature &other) const {
+        return identity == other.identity && resource == other.resource && location == other.location &&
+               format == other.format && load == other.load && store == other.store && sampleCount == other.sampleCount;
+    }
+};
+
+struct RenderingState {
+    id<MTLRenderCommandEncoder> encoder;
+    std::array<RenderAttachmentSignature, 8> colors{};
+    RenderAttachmentSignature depth{};
+    size_t colorCount{};
+    bool hasDepth{};
 };
 
 struct VERNON_RHI_CAPI DeviceState {
@@ -45,16 +74,23 @@ struct VERNON_RHI_CAPI DeviceState {
     bool downloadImage(const Image &image, const VernonRhiImageDescriptor &descriptor, void *destination, size_t size,
                        std::string &error);
     bool generateImageMipmaps(const Image &image, uint32_t mipLevels, std::string &error);
+    bool createImageView(ImageView &view, const Image &image, const VernonRhiImageViewDescriptor &descriptor,
+                         std::string &error);
+    void destroyImageView(ImageView &view);
 
     bool createSampler(Sampler &sampler, const VernonRhiSamplerDescriptor &descriptor, std::string &error);
     void destroySampler(Sampler &sampler);
 
     bool beginCommands(uint64_t &native, std::string &error);
     bool submitCommands(uint64_t native, std::string &error);
+    void completeCommands(uint64_t native);
     void abandonCommands(uint64_t native);
 
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
+    uint32_t maxComputeInvocations{};
+    uint32_t maxComputeWorkGroupSize[3]{};
+    uint32_t operatingSystemVersion[2]{};
 };
 
 } // namespace vernon::rhi::metal

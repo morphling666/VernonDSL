@@ -42,6 +42,8 @@ bool runCopy(DeviceState &device, id<MTLBuffer> source, NSUInteger sourceOffset,
     return false;
 }
 
+size_t alignedTextureRowSize(size_t size) { return (size + 255u) & ~size_t{255u}; }
+
 } // namespace
 
 MTLPixelFormat pixelFormat(VernonRhiFormat format) {
@@ -128,8 +130,19 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
     device = MTLCreateSystemDefaultDevice();
 #endif
     queue = [device newCommandQueue];
-    if (device && queue)
+    if (device && queue) {
+        const MTLSize maximum = device.maxThreadsPerThreadgroup;
+        maxComputeWorkGroupSize[0] = static_cast<uint32_t>(maximum.width);
+        maxComputeWorkGroupSize[1] = static_cast<uint32_t>(maximum.height);
+        maxComputeWorkGroupSize[2] = static_cast<uint32_t>(maximum.depth);
+        // Metal exposes the dimensional device limit and a pipeline-specific
+        // total. Apple GPU families use the X limit as the device-wide total.
+        maxComputeInvocations = maxComputeWorkGroupSize[0];
+        const NSOperatingSystemVersion version = NSProcessInfo.processInfo.operatingSystemVersion;
+        operatingSystemVersion[0] = static_cast<uint32_t>(version.majorVersion);
+        operatingSystemVersion[1] = static_cast<uint32_t>(version.minorVersion);
         return true;
+    }
     error = "Metal default device or command queue creation failed";
     shutdown();
     return false;
@@ -138,6 +151,9 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
 void DeviceState::shutdown() {
     queue = nil;
     device = nil;
+    maxComputeInvocations = 0;
+    std::fill(std::begin(maxComputeWorkGroupSize), std::end(maxComputeWorkGroupSize), 0);
+    std::fill(std::begin(operatingSystemVersion), std::end(operatingSystemVersion), 0);
 }
 
 bool DeviceState::synchronize(std::string &error) {
@@ -216,8 +232,8 @@ bool DeviceState::createImage(Image &image, const VernonRhiImageDescriptor &desc
     native.depth = descriptor.dimension == VERNON_RHI_IMAGE_3D ? descriptor.depth : 1;
     native.mipmapLevelCount = descriptor.mip_levels;
     native.sampleCount = 1;
-    native.storageMode = MTLStorageModeShared;
-    native.usage = MTLTextureUsageUnknown;
+    native.storageMode = MTLStorageModePrivate;
+    native.usage = MTLTextureUsagePixelFormatView;
     if (descriptor.usage & VERNON_RHI_IMAGE_SAMPLED)
         native.usage |= MTLTextureUsageShaderRead;
     if (descriptor.usage & VERNON_RHI_IMAGE_STORAGE)
@@ -264,13 +280,51 @@ bool DeviceState::uploadImage(const Image &image, const VernonRhiImageDescriptor
             error = "Metal image upload layout is unsupported";
             return false;
         }
-        const MTLRegion region = MTLRegionMake3D(0, 0, 0, upload.width, upload.height, upload.depth);
-        [image.texture replaceRegion:region
-                         mipmapLevel:upload.mip_level
-                               slice:descriptor.dimension == VERNON_RHI_IMAGE_3D ? 0 : upload.array_layer
-                           withBytes:upload.data
-                         bytesPerRow:pixelSize * upload.width
-                       bytesPerImage:pixelSize * upload.width * upload.height];
+        const size_t rowSize = pixelSize * upload.width;
+        const size_t rowPitch = alignedTextureRowSize(rowSize);
+        if (upload.height > (std::numeric_limits<size_t>::max)() / rowPitch) {
+            error = "Metal image upload staging size overflows the host address range";
+            return false;
+        }
+        const size_t imagePitch = rowPitch * upload.height;
+        if (upload.depth > (std::numeric_limits<size_t>::max)() / imagePitch) {
+            error = "Metal image upload staging size overflows the host address range";
+            return false;
+        }
+        id<MTLBuffer> staging =
+            [device newBufferWithLength:imagePitch * upload.depth options:MTLResourceStorageModeShared];
+        if (!staging) {
+            error = "Metal image upload staging allocation failed";
+            return false;
+        }
+        const auto *source = static_cast<const uint8_t *>(upload.data);
+        auto *destination = static_cast<uint8_t *>(staging.contents);
+        for (uint32_t z = 0; z < upload.depth; ++z)
+            for (uint32_t y = 0; y < upload.height; ++y)
+                std::memcpy(destination + z * imagePitch + y * rowPitch,
+                            source + (static_cast<size_t>(z) * upload.height + y) * rowSize, rowSize);
+        id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+        id<MTLBlitCommandEncoder> encoder = [commandBuffer blitCommandEncoder];
+        if (!commandBuffer || !encoder) {
+            error = "Metal image upload blit encoder creation failed";
+            return false;
+        }
+        [encoder copyFromBuffer:staging
+                  sourceOffset:0
+             sourceBytesPerRow:rowPitch
+           sourceBytesPerImage:imagePitch
+                    sourceSize:MTLSizeMake(upload.width, upload.height, upload.depth)
+                     toTexture:image.texture
+              destinationSlice:descriptor.dimension == VERNON_RHI_IMAGE_3D ? 0 : upload.array_layer
+              destinationLevel:upload.mip_level
+             destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [encoder endEncoding];
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+        if (commandBuffer.status != MTLCommandBufferStatusCompleted) {
+            setCommandError(error, commandBuffer, "Metal image upload failed");
+            return false;
+        }
     }
     return true;
 }
@@ -289,17 +343,54 @@ bool DeviceState::downloadImage(const Image &image, const VernonRhiImageDescript
         error = "Metal image readback destination is too small";
         return false;
     }
-    unsigned char *output = static_cast<unsigned char *>(destination);
-    for (uint32_t layer = 0; layer < descriptor.array_layers; ++layer) {
-        const MTLRegion region =
-            MTLRegionMake3D(0, 0, 0, descriptor.width, descriptor.height, descriptor.depth);
-        [image.texture getBytes:output + layer * layerSize
-                    bytesPerRow:pixelSize * descriptor.width
-                  bytesPerImage:pixelSize * descriptor.width * descriptor.height
-                     fromRegion:region
-                    mipmapLevel:0
-                          slice:descriptor.dimension == VERNON_RHI_IMAGE_3D ? 0 : layer];
+    const size_t rowSize = pixelSize * descriptor.width;
+    const size_t rowPitch = alignedTextureRowSize(rowSize);
+    if (descriptor.height > (std::numeric_limits<size_t>::max)() / rowPitch) {
+        error = "Metal image readback staging size overflows the host address range";
+        return false;
     }
+    const size_t imagePitch = rowPitch * descriptor.height;
+    if (descriptor.depth > (std::numeric_limits<size_t>::max)() / imagePitch ||
+        descriptor.array_layers > (std::numeric_limits<size_t>::max)() / (imagePitch * descriptor.depth)) {
+        error = "Metal image readback staging size overflows the host address range";
+        return false;
+    }
+    const size_t stagingLayerSize = imagePitch * descriptor.depth;
+    id<MTLBuffer> staging =
+        [device newBufferWithLength:stagingLayerSize * descriptor.array_layers
+                            options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> encoder = [commandBuffer blitCommandEncoder];
+    if (!staging || !commandBuffer || !encoder) {
+        error = "Metal image readback staging or encoder creation failed";
+        return false;
+    }
+    for (uint32_t layer = 0; layer < descriptor.array_layers; ++layer) {
+        [encoder copyFromTexture:image.texture
+                    sourceSlice:descriptor.dimension == VERNON_RHI_IMAGE_3D ? 0 : layer
+                    sourceLevel:0
+                   sourceOrigin:MTLOriginMake(0, 0, 0)
+                     sourceSize:MTLSizeMake(descriptor.width, descriptor.height, descriptor.depth)
+                       toBuffer:staging
+              destinationOffset:layer * stagingLayerSize
+         destinationBytesPerRow:rowPitch
+       destinationBytesPerImage:imagePitch];
+    }
+    [encoder endEncoding];
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+    if (commandBuffer.status != MTLCommandBufferStatusCompleted) {
+        setCommandError(error, commandBuffer, "Metal image readback failed");
+        return false;
+    }
+    auto *output = static_cast<uint8_t *>(destination);
+    const auto *source = static_cast<const uint8_t *>(staging.contents);
+    for (uint32_t layer = 0; layer < descriptor.array_layers; ++layer)
+        for (uint32_t z = 0; z < descriptor.depth; ++z)
+            for (uint32_t y = 0; y < descriptor.height; ++y)
+                std::memcpy(output + layer * layerSize +
+                                (static_cast<size_t>(z) * descriptor.height + y) * rowSize,
+                            source + layer * stagingLayerSize + z * imagePitch + y * rowPitch, rowSize);
     return true;
 }
 
@@ -321,6 +412,23 @@ bool DeviceState::generateImageMipmaps(const Image &image, uint32_t mipLevels, s
     setCommandError(error, commandBuffer, "Metal mipmap generation failed");
     return false;
 }
+
+bool DeviceState::createImageView(ImageView &view, const Image &image,
+                                  const VernonRhiImageViewDescriptor &descriptor, std::string &error) {
+    const MTLPixelFormat format = pixelFormat(descriptor.format);
+    view.texture = [image.texture newTextureViewWithPixelFormat:format
+                                                   textureType:image.texture.textureType
+                                                        levels:NSMakeRange(descriptor.base_mip_level,
+                                                                           descriptor.mip_level_count)
+                                                        slices:NSMakeRange(descriptor.base_array_layer,
+                                                                           descriptor.array_layer_count)];
+    if (view.texture)
+        return true;
+    error = "Metal image view format or subresource range is unsupported";
+    return false;
+}
+
+void DeviceState::destroyImageView(ImageView &view) { view.texture = nil; }
 
 bool DeviceState::createSampler(Sampler &sampler, const VernonRhiSamplerDescriptor &descriptor, std::string &error) {
     SamplerFilter filter;
@@ -378,7 +486,16 @@ bool DeviceState::submitCommands(uint64_t native, std::string &error) {
         return true;
     }
     setCommandError(error, commandBuffer, "Metal command buffer failed");
+    CFBridgingRelease(reinterpret_cast<void *>(native));
     return false;
+}
+
+void DeviceState::completeCommands(uint64_t native) {
+    if (!native)
+        return;
+    id<MTLCommandBuffer> commandBuffer = (__bridge id<MTLCommandBuffer>)(reinterpret_cast<void *>(native));
+    [commandBuffer waitUntilCompleted];
+    CFBridgingRelease(reinterpret_cast<void *>(native));
 }
 
 void DeviceState::abandonCommands(uint64_t native) {

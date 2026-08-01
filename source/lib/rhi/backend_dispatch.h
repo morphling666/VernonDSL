@@ -59,12 +59,16 @@ struct BackendDispatch {
     void (*abandonCommands)(VernonRhiDevice, uint64_t);
     bool (*recordBarriers)(VernonRhiDevice, uint64_t, uint64_t, const VernonRhiBarrier *, size_t);
     bool (*endRendering)(VernonRhiDevice, uint64_t, VernonRhiBackend, uint32_t, uint32_t, uint32_t, const uint64_t *,
-                         size_t, uint64_t);
+                         size_t, uint64_t, uint64_t);
     bool (*clearColor)(VernonRhiDevice, uint64_t, VernonRhiBackend, uint32_t, int32_t, int32_t, uint32_t, uint32_t,
                        uint32_t, uint64_t, uint32_t, const float[4]);
     bool (*clearDepthStencil)(VernonRhiDevice, uint64_t, VernonRhiBackend, uint32_t, int32_t, int32_t, uint32_t,
                               uint32_t, uint32_t, uint64_t, float, uint32_t, uint32_t);
     uint64_t (*trackedBufferState)(VernonRhiDevice, VernonRhiBuffer);
+
+    VernonRhiStatus (*createImageView)(VernonRhiDevice, const VernonRhiImageViewDescriptor *, VernonRhiImageView *);
+    VernonRhiStatus (*destroyImageView)(VernonRhiDevice, VernonRhiImageView);
+    VernonRhiStatus (*getImageViewNativeHandle)(VernonRhiDevice, VernonRhiImageView, uint64_t *);
 };
 
 void setDeviceCreationError(std::string error);

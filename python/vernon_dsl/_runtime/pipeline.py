@@ -139,6 +139,7 @@ class Pipeline:
         native_target, target_name = {
             state.vulkan: (state._native.Target.VULKAN, "vulkan"),
             state.directx: (state._native.Target.DIRECTX, "directx"),
+            state.metal: (state._native.Target.METAL, "metal"),
             state.opengl: (state._native.Target.OPENGL, "opengl"),
             state.opengles: (state._native.Target.OPENGL_ES, "opengles"),
         }[state._architecture]
@@ -225,7 +226,7 @@ class Pipeline:
         state = _session_state()
         if self._compiled is not None and self._compiled_generation == state._runtime_generation:
             return self._compiled
-        if state._architecture in {state.vulkan, state.directx, state.opengl, state.opengles}:
+        if state._architecture in {state.vulkan, state.directx, state.metal, state.opengl, state.opengles}:
             target_identity = canonical_json(
                 {
                     "target": state._architecture.name,

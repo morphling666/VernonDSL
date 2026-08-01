@@ -3,7 +3,6 @@
 
 #include "../../rhi/rhi_internal.h"
 #include "adapter_internal.h"
-#include "adapter_test_hooks.h"
 
 #include <algorithm>
 #include <array>
@@ -47,6 +46,9 @@ struct VernonRuntimeRhiAdapter {
 #endif
 #if defined(VERNON_HAS_VULKAN_RHI)
     vernon::rhi::vulkan::DeviceState *vulkanDevice{};
+#endif
+#if defined(VERNON_HAS_METAL_RHI)
+    vernon::rhi::metal::DeviceState *metalDevice{};
 #endif
     VernonRuntimeDeviceProvider provider{};
     std::string error;
@@ -112,6 +114,10 @@ void initializeDirectX12Provider(VernonRuntimeRhiAdapter &adapter);
 #endif
 #if defined(VERNON_HAS_VULKAN_RHI)
 void initializeVulkanProvider(VernonRuntimeRhiAdapter &adapter);
+#endif
+#if defined(VERNON_HAS_METAL_RHI)
+void initializeMetalProvider(VernonRuntimeRhiAdapter &adapter);
+VernonStatus synchronizeMetalProvider(VernonRuntimeRhiAdapter &adapter);
 #endif
 
 } // namespace vernon::runtime::rhi_adapter

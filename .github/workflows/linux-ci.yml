@@ -110,7 +110,7 @@ jobs:
 
       - name: Upload test logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: linux-test-logs
           path: build-ci/Testing/Temporary/*.log
@@ -208,7 +208,7 @@ jobs:
           "$venv/bin/python" scripts/verify_installed_wheel.py
 
       - name: Upload wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: vernon-lang-linux-${{ runner.arch }}-python-${{ matrix.python-version }}
           path: wheelhouse/*.whl
@@ -217,7 +217,7 @@ jobs:
 
       - name: Upload Compiler test logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: linux-compiler-wheel-logs-python-${{ matrix.python-version }}
           path: build/Testing/Temporary/*.log

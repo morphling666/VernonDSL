@@ -554,8 +554,7 @@ extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiVulkanDeviceGetBufferNativeH
     return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceDestroyImageView(VernonRhiDevice handle,
-                                                                           VernonRhiImageView imageView) {
+VernonRhiStatus destroyImageView(VernonRhiDevice handle, VernonRhiImageView imageView) {
     auto device = lookupVulkanDevice(handle);
     if (!device)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
@@ -568,9 +567,7 @@ extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceDestroyImageView(Verno
     return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceGetImageViewNativeHandle(VernonRhiDevice handle,
-                                                                                   VernonRhiImageView imageView,
-                                                                                   uint64_t *output) {
+VernonRhiStatus getImageViewNativeHandle(VernonRhiDevice handle, VernonRhiImageView imageView, uint64_t *output) {
     auto device = lookupVulkanDevice(handle);
     if (!device || !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
@@ -1214,7 +1211,7 @@ bool recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native
 
 bool endRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
                   uint32_t colorDiscardMask, uint32_t depthStencilDiscard, const uint64_t *colorResources,
-                  size_t colorCount, uint64_t depthResource) {
+                  size_t colorCount, uint64_t depthResource, uint64_t) {
     auto device = lookupVulkanDevice(handle);
     const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
     if (!device || !command || backend != VERNON_RHI_BACKEND_VULKAN)
@@ -1414,6 +1411,9 @@ const vernon::rhi::BackendDispatch &vernon::rhi::vulkanBackendDispatch() {
         clearColor,
         clearDepthStencil,
         nullptr,
+        nullptr,
+        destroyImageView,
+        getImageViewNativeHandle,
     };
     return dispatch;
 }

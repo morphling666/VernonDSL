@@ -28,6 +28,7 @@ cpu = _Architecture("cpu")
 cuda = _Architecture("cuda")
 vulkan = _Architecture("vulkan")
 directx = _Architecture("directx")
+metal = _Architecture("metal")
 opengl = _Architecture("opengl")
 opengles = _Architecture("opengles")
 _architecture = cpu
@@ -72,7 +73,7 @@ atexit.register(_release_runtime)
 def init(*, arch: _Architecture = cpu, api_version: tuple[int, int] | None = None) -> None:
     global _architecture, _native_runtime, _rhi_host, _owned_opengl_context
     global _runtime_generation, _api_version
-    if arch not in {cpu, cuda, vulkan, directx, opengl, opengles}:
+    if arch not in {cpu, cuda, vulkan, directx, metal, opengl, opengles}:
         raise ValueError("unsupported VernonDSL runtime architecture")
     if api_version is not None and (
         arch not in {opengl, opengles}
@@ -91,6 +92,7 @@ def init(*, arch: _Architecture = cpu, api_version: tuple[int, int] | None = Non
         cuda: "CUDA",
         vulkan: "VULKAN",
         directx: "DIRECTX12",
+        metal: "METAL",
         opengl: "OPENGL",
         opengles: "OPENGL_ES",
     }[arch]
@@ -184,8 +186,10 @@ __all__ = [
     "Texture",
     "cpu",
     "cuda",
+    "directx",
     "init",
     "lines",
+    "metal",
     "opengl",
     "opengles",
     "pipeline",

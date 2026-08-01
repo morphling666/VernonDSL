@@ -12,7 +12,10 @@ if(APPLE AND VERNON_ENABLE_METAL_RUNTIME)
     project(
         VernonDSL
         VERSION ${VERNON_PROJECT_VERSION}
-        LANGUAGES CXX C OBJCXX)
+        LANGUAGES CXX
+                  C
+                  OBJC
+                  OBJCXX)
 else()
     project(
         VernonDSL

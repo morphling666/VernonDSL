@@ -9,6 +9,9 @@
 #if defined(VERNON_HAS_VULKAN_RUNTIME) || defined(VERNON_HAS_VULKAN_RHI)
 #include "../../rhi/vulkan_backend.h"
 #endif
+#if defined(VERNON_HAS_METAL_RHI) || defined(VERNON_HAS_METAL_RUNTIME)
+#include "../../rhi/metal_backend_fwd.h"
+#endif
 #include "VernonRuntimeRHIAdapter.h"
 
 namespace vernon::runtime {
@@ -27,6 +30,10 @@ uint64_t directX12RhiAdapterResourceIdentity(const VernonRuntimeRhiAdapter &adap
 uint64_t directX12RhiAdapterImageIdentity(const VernonRuntimeRhiAdapter &adapter);
 uint64_t directX12RhiAdapterSamplerIdentity(const VernonRuntimeRhiAdapter &adapter);
 uint64_t directX12RhiAdapterBufferIdentity(const VernonRuntimeRhiAdapter &adapter);
+#endif
+#if defined(VERNON_HAS_METAL_RHI) || defined(VERNON_HAS_METAL_RUNTIME)
+VernonRuntimeRhiAdapter *createBorrowedMetalRhiAdapter(rhi::metal::DeviceState &device);
+rhi::metal::DeviceCapabilities metalRhiAdapterDeviceCapabilities(const VernonRuntimeRhiAdapter &adapter);
 #endif
 
 } // namespace vernon::runtime

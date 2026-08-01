@@ -1246,14 +1246,15 @@ std::unique_ptr<Runtime> RhiHost::createRuntime() {
     case VERNON_RHI_BACKEND_DIRECTX12:
         backend = VERNON_RUNTIME_DIRECTX12;
         break;
+    case VERNON_RHI_BACKEND_METAL:
+        backend = VERNON_RUNTIME_METAL;
+        break;
     case VERNON_RHI_BACKEND_OPENGL:
         backend = VERNON_RUNTIME_OPENGL;
         break;
     case VERNON_RHI_BACKEND_OPENGL_ES:
         backend = VERNON_RUNTIME_OPENGL_ES;
         break;
-    case VERNON_RHI_BACKEND_METAL:
-        throw std::runtime_error("Metal Runtime provider is not implemented");
     }
     VernonRuntimeContext *runtime = vernonRuntimeCreateForRhiDevice(backend, state->device);
     if (!runtime)
@@ -1287,7 +1288,8 @@ NB_MODULE(_native, module) {
         .value("VULKAN", VERNON_RUNTIME_VULKAN)
         .value("OPENGL", VERNON_RUNTIME_OPENGL)
         .value("OPENGL_ES", VERNON_RUNTIME_OPENGL_ES)
-        .value("DIRECTX12", VERNON_RUNTIME_DIRECTX12);
+        .value("DIRECTX12", VERNON_RUNTIME_DIRECTX12)
+        .value("METAL", VERNON_RUNTIME_METAL);
     nb::enum_<VernonRhiBackend>(module, "RhiBackend")
         .value("CUDA", VERNON_RHI_BACKEND_CUDA)
         .value("VULKAN", VERNON_RHI_BACKEND_VULKAN)

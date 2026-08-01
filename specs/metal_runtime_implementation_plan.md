@@ -4,22 +4,30 @@
 
 This document defines the active implementation plan for adding a native
 Apple Metal runtime for macOS and packaged iOS 15+ device/simulator builds.
-Metal remains a cook-only compiler target until the
-acceptance gates in this document pass.
+Metal is available as an experimental compute and graphics Runtime backend on
+macOS. Graphics support covers the acceptance-tested cooked-bundle path;
+stencil attachments, explicit in-scope clears, and several advanced draw features
+remain pending.
 
 Implementation progress:
 
 - Step 1 is complete: platform-explicit macOS/iOS MSL 2.4 options, deterministic per-entry resource
   slots, and the `metal_resource_slots` manifest sidecar are compiler-tested.
-- Step 2 is in progress: native device/queue ownership, command submission,
+- Step 2 is complete on macOS: native device/queue ownership, command submission,
   buffer memory classes, base 2D/3D/cube/depth texture round-trips and mipmap
-  generation, sampler filter mapping, native handles, and retained logical
-  resources are implemented and covered by macOS tests. Failed submission
-  ownership is explicit and leaves the retained command buffer for abandonment.
-- Image views, render attachment encoding, full barrier handling, and the
-  provider/runtime layers remain pending. Metal must not yet be advertised as a
-  runtime architecture. Nonempty barriers return an explicit unsupported status
-  until their encoding semantics are implemented.
+  generation, compatible-format image views, sampler filter mapping, native
+  handles, and retained logical resources are implemented and covered by macOS
+  tests. Failed submission ownership is explicit and leaves the retained command
+  buffer for abandonment.
+- The provider and public Runtime compute and graphics paths consume cooked
+  resource slots, compile MSL, bind resources, dispatch or draw, synchronize,
+  and read back through the existing APIs. Acceptance-tested capabilities are
+  advertised through the public Runtime and Python surfaces.
+- Basic color/depth attachment load/store encoding, depth testing, and color
+  readback pass through a native render encoder with render-scope validation.
+  Stencil attachments, explicit in-scope clears, storage-texture compute
+  coverage, and several advanced draw features remain pending. Barriers validate
+  resource states and rely on Metal's hazard tracking between provider encoders.
 
 ## Goals
 
@@ -71,9 +79,9 @@ submission, synchronization, and native object lifetimes.
 - [x] Emit and compiler-test the `metal_resource_slots` sidecar.
 - [x] Emit and validate cooked `apple_platform`, MSL version, and minimum OS
   requirements from structured compiler reflection.
-- [ ] Consume the resource-slot sidecar in the pending Metal provider adapter.
-- [ ] Reject a cross-platform cooked bundle in the pending Metal Runtime
-  provider before pipeline creation.
+- [x] Consume the resource-slot sidecar in the Metal compute provider path.
+- [x] Reject a cross-platform cooked bundle in the Metal Runtime before pipeline
+  creation.
 
 Update `source/lib/compiler/compiler_spirv_cross.cpp` to configure explicit
 macOS or iOS MSL 2.4 options and a deterministic mapping from Vernon descriptor
@@ -109,12 +117,14 @@ platform must be rejected by the other before pipeline creation.
   validity checks.
 - [x] Implement base 2D/3D/cube/mipmapped color/depth texture allocation,
   upload/download, and mipmap generation.
-- [ ] Implement image views and any required texture format conversion.
+- [x] Implement image views and compatible Metal texture format reinterpretation.
 - [x] Implement sampler creation and filter/address modes.
 - [x] Retain logical buffer, image, and sampler resources.
 - [x] Implement command-buffer creation, submission, waiting, abandonment, and
   error capture.
-- [ ] Implement render attachment encoding and complete barrier semantics.
+- [x] Implement barrier semantics for owned hazard-tracked resources.
+- [x] Implement color and D32 depth attachment load/store encoding and readback.
+- [ ] Implement stencil attachments and explicit in-scope attachment clears.
 
 Extend `source/include/VernonRHI.h`,
 `source/lib/rhi/backend_dispatch.h`, and `source/lib/rhi/rhi.cpp` with
@@ -139,9 +149,9 @@ draw time.
 
 ## 3. Implement the Metal provider adapter
 
-- [ ] Add `adapter_metal.mm` and connect it to common adapter ownership.
+- [x] Add `adapter_metal.mm` and connect it to common adapter ownership.
 - [ ] Implement Metal shader libraries/functions and compute/render pipeline
-  states.
+  states (compute and a basic color-only render pipeline are implemented).
 - [ ] Implement provider layouts, immutable slot mappings, binding sets, and
   render-target variants.
 - [ ] Implement reflected constant-buffer packing and in-flight binding-set
@@ -168,7 +178,7 @@ must remain alive until their command buffer completes.
 - [ ] Bind reflected buffers, textures, samplers, and inline values.
 - [ ] Plan and dispatch legal Metal threadgroups.
 - [ ] Support owned and borrowed command encoders.
-- [ ] Pass public Runtime bundle load/dispatch/synchronize/readback coverage.
+- [x] Pass public Runtime bundle load/dispatch/synchronize/readback coverage.
 
 Use the existing compute launch planner and tensor bridge. The Metal adapter
 must:
@@ -211,11 +221,12 @@ Metal backend.
 
 ## 6. Integrate the public runtime
 
-- [ ] Add and dispatch `VERNON_RUNTIME_METAL`.
-- [ ] Add Metal Runtime backend and pipeline resolve/invoke implementations.
-- [ ] Advertise only acceptance-tested Metal capabilities.
-- [ ] Expose Metal as a Python runtime architecture.
-- [ ] Enable Python kernel and pipeline resolution through the Metal Runtime.
+- [x] Add and dispatch `VERNON_RUNTIME_METAL`.
+- [x] Add Metal Runtime backend and pipeline resolve/invoke implementations for
+  acceptance-tested compute and graphics bundles.
+- [x] Advertise only acceptance-tested Metal capabilities.
+- [x] Expose Metal as a Python runtime architecture.
+- [x] Enable Python kernel and pipeline resolution through the Metal Runtime.
 - [x] Emit and schema-validate Metal bundle runtime requirements.
 - [x] Preserve compile-only Metal artifact APIs.
 
@@ -243,8 +254,7 @@ Update the Python runtime and bundle path:
 
 - [x] Enable Objective-C++ and Metal sources only for Apple Metal builds.
 - [x] Gate the Metal RHI with `VERNON_HAS_METAL_RHI`.
-- [ ] Add the provider adapter and `VERNON_HAS_METAL_RUNTIME` once the provider
-  exists.
+- [x] Add the provider adapter and `VERNON_HAS_METAL_RUNTIME`.
 - [x] Discover and link Metal and Foundation frameworks through CMake.
 - [x] Keep Windows/Linux build source graphs free of Apple languages, sources,
   headers, and frameworks.
@@ -274,8 +284,8 @@ Add Metal-gated native and Python tests in this order:
 - [ ] Device creation, capability query, and error reporting (device creation
   is covered; capability/error coverage remains).
 - [x] Buffer and image upload/download round trips.
-- [ ] Compute pipeline creation, binding, dispatch, and readback.
-- [ ] Basic vertex/fragment rendering to a color texture.
+- [x] Compute pipeline creation, storage-buffer binding, dispatch, and readback.
+- [x] Basic vertex/fragment rendering to a color texture through the provider.
 - [ ] Texture sampling, storage textures, mipmaps, and samplers (resource,
   mipmap, and sampler creation is covered; pipeline binding remains).
 - [ ] Depth testing, blending, culling, indexing, and instancing.
@@ -284,7 +294,7 @@ Add Metal-gated native and Python tests in this order:
 - [ ] Pipeline bundle selection and runtime-requirements rejection (manifest
   schema/platform validation is covered; Runtime rejection remains).
 - [ ] Mandelbulb smoke render with nonempty, finite output.
-- [x] macOS native Metal resource, retention, and unsupported-barrier regression
+- [x] macOS native Metal resource, retention, and barrier-validation regression
   tests.
 - [x] Packaged iOS simulator build, launch, and Metal buffer/image/sampler
   round-trip smoke.
@@ -313,3 +323,110 @@ Metal can be advertised as an experimental complete runtime when:
 If compute passes while graphics remains incomplete, expose only the validated
 compute capability and retain explicit unsupported results for graphics.
 Do not claim graphics parity until the graphics and Mandelbulb gates pass.
+
+## Architecture audit follow-up
+
+The July 2026 cross-backend review found the following work that must be
+resolved before Metal graphics is advertised. These items compare Metal with
+the Vulkan, DirectX 12, OpenGL, and CUDA adapter/runtime paths.
+
+### Correctness and capability consistency
+
+- [x] Reject graphics pipeline objects in Metal `encodeDispatch`.
+  `adapter_metal.mm` currently checks that the pipeline handle exists but does
+  not require a non-graphics pipeline with a valid `MTLComputePipelineState`.
+  Invalid direct-provider usage must fail before creating a compute encoder.
+- [x] Establish one graphics capability contract across
+  `adapter_metal.mm`, `runtime_backend_dispatch.cpp`,
+  `runtime_pipeline_metal.cpp`, and `runtime_pipeline_dispatch.cpp`.
+  The provider currently reports graphics support while the public Runtime is
+  compute-only and the public graphics resolve/invoke path is unsupported.
+  Until the complete graphics path is connected, do not advertise provider
+  graphics merely because the adapter-level color/depth smoke test passes.
+- [x] Record and validate an active Metal render-scope signature.
+  The first draw creates the native render encoder, but later draws currently
+  reuse it without checking whether attachment identities, locations, formats,
+  load/store operations, sample count, or depth target changed. A mismatch must
+  fail rather than silently draw into the first attachment set.
+- [x] Set a specific Runtime error when a Metal bundle's MSL version is
+  rejected. The current version-mismatch branch returns false without updating
+  `context.error`.
+- [x] Validate the cooked `minimum_os_version` against the host macOS/iOS
+  version during Runtime requirement validation.
+- [x] Cache Metal device compute limits in `MetalContextState` and reject
+  reflected workgroup sizes that exceed per-dimension or total-thread limits,
+  matching Vulkan and DirectX 12's early validation.
+
+### Type safety and layering
+
+- [x] Replace `void *VernonRuntimeRhiAdapter::metalDevice` and
+  `createBorrowedMetalRhiAdapter(void *)` with a forward-declared
+  `vernon::rhi::metal::DeviceState *` and typed reference.
+  The opaque pointer was introduced to avoid including `metal_backend.h` from
+  ordinary C++, because that header imports Metal and contains Objective-C
+  object types. A C++ forward declaration preserves that isolation without
+  discarding type safety. Include the full backend header only in Objective-C++
+  implementation files.
+- [x] Separate the portable Metal device forward declaration from the
+  Objective-C++ native resource declarations in `metal_backend.h`.
+- [x] Review Runtime source-package install globs. Generic packages currently
+  include private `lib/rhi/*.h` files, including a header that imports
+  `<Metal/Metal.h>`. Exclude Apple-only private headers from non-Apple packages
+  or split them so unpacked Windows/Linux source graphs remain Apple-header
+  free.
+- [x] Replace the current use of generic command color/depth resource arrays as
+  storage for a retained `MTLRenderCommandEncoder`. Add a distinct typed opaque
+  backend rendering object and cleanup/end mechanism so attachment resource
+  slots retain their documented meaning.
+
+### Incomplete public execution surface
+
+- [ ] Extend `runtime_pipeline_metal.cpp` resource-slot resolution beyond
+  compute `storage_buffer` entries. Consume and test uniform buffers, sampled
+  images, storage images, and samplers through cooked public Runtime bundles.
+  Uniform buffers, inline constants, vertex buffers, sampled images, and
+  samplers are wired and covered by native tests; storage-texture compute
+  binding remains open.
+- [x] Connect the adapter-level graphics implementation to a Metal graphics
+  `MetalPipelineState` resolve/invoke path, or keep that implementation
+  explicitly experimental and unreachable until vertex attributes, graphics
+  bindings, render variants, and state are implemented.
+- [x] Add native interop parity tests and an end-to-end cooked graphics bundle
+  test. The existing graphics test exercises the provider directly and does not
+  prove public Runtime graphics support.
+- [x] Implement Metal explicit in-scope color/depth clear semantics or return a
+  public unsupported status. Load-action clears alone do not cover the explicit
+  RHI clear operations.
+
+### Lifetime, synchronization, and performance debt
+
+- [x] Keep the current barrier behavior documented as conditional on one Metal
+  command queue and hazard-tracked resources. Validation-only barriers are
+  correct for that model; introducing untracked resources, multiple queues,
+  fences, or asynchronous overlap requires real synchronization or explicit
+  rejection. Do not classify the current implementation as a confirmed no-op
+  bug without a failing ordering case.
+- [x] Implement `completeBorrowedCommands` before making Metal submission
+  asynchronous. It is currently null and safe only because owned submission
+  waits for completion.
+- [ ] Reduce device-wide mutex scope and synchronous `waitUntilCompleted` use
+  when asynchronous execution is introduced. The current behavior is correct
+  but serializes CPU callers and GPU work.
+- [x] Decide whether device-local Metal images should use private storage with
+  staging blits. All textures currently use `MTLStorageModeShared`, unlike
+  device-memory buffers and the Vulkan/DirectX 12 image policy.
+
+### Cleanup
+
+- [x] Remove the unused `PreparedPipeline::device` field in
+  `adapter_metal.mm`.
+- [x] Remove stale direct includes such as `<optional>` where no longer used.
+- [ ] Replace backend definitions pulled transitively through
+  `adapter_internal.h` with forward declarations and explicit implementation
+  includes. Move `adapter_test_hooks.h` and other implementation-only includes
+  out of `adapter_common.h`. Metal now uses `metal_backend_fwd.h` and
+  `adapter_test_hooks.h` moved to `adapter_common.cpp`; CUDA/OpenGL/Vulkan full
+  backend headers remain transitively included.
+- [ ] Consider moving unconditional OpenGL cache state out of
+  `VernonRuntimeRhiAdapter` into backend-specific state. This is low-priority
+  structural cleanup rather than a Metal correctness issue.

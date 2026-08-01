@@ -1,6 +1,7 @@
 #include "adapter_common.h"
 
 #include "../../rhi/rhi_internal.h"
+#include "adapter_test_hooks.h"
 
 #include <new>
 #include <optional>
@@ -65,6 +66,12 @@ extern "C" VernonRuntimeRhiAdapter *vernonRuntimeRhiAdapterCreateForDevice(Verno
             *static_cast<vernon::rhi::directx12::DeviceState *>(state));
         break;
 #endif
+#if defined(VERNON_HAS_METAL_RHI)
+    case VERNON_RHI_BACKEND_METAL:
+        adapter =
+            vernon::runtime::createBorrowedMetalRhiAdapter(*static_cast<vernon::rhi::metal::DeviceState *>(state));
+        break;
+#endif
     case VERNON_RHI_BACKEND_OPENGL:
     case VERNON_RHI_BACKEND_OPENGL_ES:
         adapter =
@@ -101,6 +108,10 @@ extern "C" VernonStatus vernonRuntimeRhiAdapterSynchronize(VernonRuntimeRhiAdapt
 #if defined(VERNON_HAS_VULKAN_RHI)
     if (adapter->vulkanDevice)
         return adapter->vulkanDevice->synchronize(adapter->error) ? VERNON_STATUS_OK : VERNON_STATUS_INTERNAL_ERROR;
+#endif
+#if defined(VERNON_HAS_METAL_RHI)
+    if (adapter->metalDevice)
+        return synchronizeMetalProvider(*adapter);
 #endif
 #if defined(VERNON_HAS_CUDA_RHI)
     if (adapter->device) {
@@ -144,6 +155,10 @@ uint64_t resourceIdentity(const VernonRuntimeRhiAdapter &adapter, uint64_t direc
 #if defined(VERNON_HAS_DIRECTX12_RHI)
     case VERNON_RHI_BACKEND_DIRECTX12:
         return reinterpret_cast<uintptr_t>(adapter.directX12Device) | directX12Kind;
+#endif
+#if defined(VERNON_HAS_METAL_RHI)
+    case VERNON_RHI_BACKEND_METAL:
+        return reinterpret_cast<uintptr_t>(adapter.metalDevice) | directX12Kind;
 #endif
     case VERNON_RHI_BACKEND_OPENGL:
     case VERNON_RHI_BACKEND_OPENGL_ES:
@@ -377,6 +392,17 @@ VernonRuntimeRhiAdapter *createBorrowedVulkanRhiAdapter(rhi::vulkan::DeviceState
 
 uint64_t vulkanRhiAdapterResourceIdentity(const VernonRuntimeRhiAdapter &adapter) {
     return reinterpret_cast<uintptr_t>(adapter.vulkanDevice);
+}
+#endif
+
+#if defined(VERNON_HAS_METAL_RHI)
+VernonRuntimeRhiAdapter *createBorrowedMetalRhiAdapter(rhi::metal::DeviceState &device) {
+    auto adapter = std::unique_ptr<VernonRuntimeRhiAdapter>(new (std::nothrow) VernonRuntimeRhiAdapter());
+    if (!adapter)
+        return nullptr;
+    adapter->metalDevice = &device;
+    rhi_adapter::initializeMetalProvider(*adapter);
+    return adapter.release();
 }
 #endif
 

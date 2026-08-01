@@ -230,6 +230,22 @@ install(
     COMPONENT VernonDevelopment)
 
 if(SKBUILD)
+    set(_vernon_apple_private_source_patterns)
+    if(NOT APPLE
+       AND NOT
+           CMAKE_SYSTEM_NAME
+           STREQUAL
+           "iOS")
+        list(
+            APPEND
+            _vernon_apple_private_source_patterns
+            PATTERN
+            "*metal*.mm"
+            EXCLUDE
+            PATTERN
+            "metal_backend.h"
+            EXCLUDE)
+    endif()
     install(
         FILES "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt" "${CMAKE_CURRENT_SOURCE_DIR}/VERSION"
               "${CMAKE_CURRENT_SOURCE_DIR}/VernonRuntimeConfig.cmake.in"
@@ -264,7 +280,7 @@ if(SKBUILD)
         FILES_MATCHING
         PATTERN "*.cpp"
         PATTERN "*.mm"
-        PATTERN "*.h")
+        PATTERN "*.h" ${_vernon_apple_private_source_patterns})
     install(
         DIRECTORY "${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/"
         DESTINATION vernon_dsl/runtime_src/lib/execution_graph
@@ -279,7 +295,7 @@ if(SKBUILD)
         FILES_MATCHING
         PATTERN "*.cpp"
         PATTERN "*.mm"
-        PATTERN "*.h")
+        PATTERN "*.h" ${_vernon_apple_private_source_patterns})
     install(
         DIRECTORY "${_VERNON_RUNTIME_IMPL_DIR}/../platform/"
         DESTINATION vernon_dsl/runtime_src/lib/platform

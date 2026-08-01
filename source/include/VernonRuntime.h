@@ -30,7 +30,8 @@ typedef enum VernonRuntimeBackend {
     VERNON_RUNTIME_VULKAN = 2,
     VERNON_RUNTIME_OPENGL = 3,
     VERNON_RUNTIME_OPENGL_ES = 4,
-    VERNON_RUNTIME_DIRECTX12 = 5
+    VERNON_RUNTIME_DIRECTX12 = 5,
+    VERNON_RUNTIME_METAL = 6
 } VernonRuntimeBackend;
 
 typedef struct VernonRuntimeCapabilities {

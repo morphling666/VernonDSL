@@ -316,10 +316,19 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderBarrier(VernonRhiDevice device
     auto slot = lookup(device, encoder);
     if (!slot || (barrierCount && !barriers))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    constexpr uint32_t allStages = VERNON_RHI_STAGE_COMPUTE | VERNON_RHI_STAGE_VERTEX | VERNON_RHI_STAGE_FRAGMENT;
+    constexpr uint32_t allAccess =
+        VERNON_RHI_ACCESS_TRANSFER_READ | VERNON_RHI_ACCESS_TRANSFER_WRITE | VERNON_RHI_ACCESS_SHADER_READ |
+        VERNON_RHI_ACCESS_SHADER_WRITE | VERNON_RHI_ACCESS_COLOR_READ | VERNON_RHI_ACCESS_COLOR_WRITE |
+        VERNON_RHI_ACCESS_DEPTH_STENCIL_READ | VERNON_RHI_ACCESS_DEPTH_STENCIL_WRITE | VERNON_RHI_ACCESS_VERTEX_READ |
+        VERNON_RHI_ACCESS_INDEX_READ | VERNON_RHI_ACCESS_INDIRECT_READ | VERNON_RHI_ACCESS_HOST_READ |
+        VERNON_RHI_ACCESS_HOST_WRITE;
     for (size_t index = 0; index < barrierCount; ++index)
         if (barriers[index].struct_size < sizeof(VernonRhiBarrier) ||
             barriers[index].old_state > VERNON_RHI_STATE_PRESENT ||
-            barriers[index].new_state > VERNON_RHI_STATE_PRESENT)
+            barriers[index].new_state > VERNON_RHI_STATE_PRESENT || barriers[index].is_image > 1 ||
+            (barriers[index].source_stage_mask & ~allStages) || (barriers[index].destination_stage_mask & ~allStages) ||
+            (barriers[index].source_access & ~allAccess) || (barriers[index].destination_access & ~allAccess))
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     const uint64_t key = (static_cast<uint64_t>(encoder.generation) << 32) | (static_cast<uint64_t>(encoder.index) + 1);
     for (size_t index = 0; index < barrierCount; ++index) {
@@ -426,7 +435,7 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderEndRendering(VernonRhiDevice d
     if (slot->backendRendering &&
         !vernon::rhi::endCommandRendering(device, slot->native, slot->backend, slot->backendRendering, colorDiscardMask,
                                           depthStencilDiscard, slot->colorResources.data(), slot->colorResources.size(),
-                                          slot->depthResource))
+                                          slot->depthResource, slot->backendRenderingObject))
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
     slot->backendRendering = 0;
     slot->backendRenderingObject = 0;
@@ -446,10 +455,11 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderClearColorAttachment(VernonRhi
     std::lock_guard<std::mutex> guard(slot->mutex);
     if (!slot->alive || slot->busy || !slot->rendering || slot->finished || !slot->backendRendering || location >= 8)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    if (!vernon::rhi::clearCommandColor(device, slot->native, slot->backend, slot->backendRendering, slot->renderX,
-                                        slot->renderY, slot->renderWidth, slot->renderHeight, slot->renderLayers,
-                                        slot->colorTargets[location], location, clearColor))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    const VernonRhiStatus status = vernon::rhi::clearCommandColor(
+        device, slot->native, slot->backend, slot->backendRendering, slot->renderX, slot->renderY, slot->renderWidth,
+        slot->renderHeight, slot->renderLayers, slot->colorTargets[location], location, clearColor);
+    if (status != VERNON_RHI_STATUS_OK)
+        return status;
     ++slot->stats.clear_count;
     return VERNON_RHI_STATUS_OK;
 }
@@ -465,11 +475,11 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderClearDepthStencilAttachment(Ve
     std::lock_guard<std::mutex> guard(slot->mutex);
     if (!slot->alive || slot->busy || !slot->rendering || slot->finished || !slot->backendRendering)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    if (!vernon::rhi::clearCommandDepthStencil(device, slot->native, slot->backend, slot->backendRendering,
-                                               slot->renderX, slot->renderY, slot->renderWidth, slot->renderHeight,
-                                               slot->renderLayers, slot->depthTarget, clearDepth, clearStencil,
-                                               aspects))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    const VernonRhiStatus status = vernon::rhi::clearCommandDepthStencil(
+        device, slot->native, slot->backend, slot->backendRendering, slot->renderX, slot->renderY, slot->renderWidth,
+        slot->renderHeight, slot->renderLayers, slot->depthTarget, clearDepth, clearStencil, aspects);
+    if (status != VERNON_RHI_STATUS_OK)
+        return status;
     ++slot->stats.clear_count;
     return VERNON_RHI_STATUS_OK;
 }

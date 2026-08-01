@@ -659,6 +659,9 @@ VERNON_RHI_CAPI uint32_t vernonRhiDeviceIsBufferValid(VernonRhiDevice device, Ve
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceCreateImage(VernonRhiDevice device,
                                                            const VernonRhiImageDescriptor *descriptor,
                                                            VernonRhiImage *output);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceCreateImageView(VernonRhiDevice device,
+                                                               const VernonRhiImageViewDescriptor *descriptor,
+                                                               VernonRhiImageView *output);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceSetImageSampler(VernonRhiDevice device, VernonRhiImage image,
                                                                const VernonRhiSamplerDescriptor *descriptor);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceUploadImage(VernonRhiDevice device, VernonRhiImage image,
