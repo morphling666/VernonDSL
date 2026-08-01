@@ -30,6 +30,10 @@ llvm_map_components_to_libnames(
 target_compile_definitions(VernonDSLCompiler PRIVATE VERNON_DSL_COMPILER_BUILD)
 if(MSVC)
     target_compile_options(VernonDSLCompiler PRIVATE /EHsc)
+elseif(NOT APPLE)
+    # Keep LLVM/MLIR symbols pulled from static archives private to the compiler library. Exporting them lets Mesa's
+    # Vulkan driver bind against Vernon's LLVM copy and causes duplicate command-line option registration at load.
+    target_link_options(VernonDSLCompiler PRIVATE "LINKER:--exclude-libs,ALL")
 endif()
 target_sources(VernonDSLCompiler PRIVATE compiler_spirv_cross.cpp)
 if(NOT MSVC)
