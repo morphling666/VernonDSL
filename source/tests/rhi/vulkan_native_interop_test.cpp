@@ -1,6 +1,7 @@
 #include "VernonRHI.h"
 #include "rhi/rhi_internal.h"
 #include "rhi/vulkan_backend.h"
+#include "vernon_test_support.h"
 
 #include <gtest/gtest.h>
 
@@ -108,7 +109,8 @@ TEST(VulkanOwnedDevice, DownloadsDepthOnlyImageThroughDepthAspect) {
     VernonRhiImage image{};
     ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &image), VERNON_RHI_STATUS_OK);
     float depth{};
-    EXPECT_EQ(vernonRhiDeviceDownloadImage(device, image, &depth, sizeof(depth)), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDownloadImage(device, image, &depth, sizeof(depth)), VERNON_RHI_STATUS_OK)
+        << vernon::test::text(vernonRhiDeviceGetLastError(device));
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
     vernonRhiDestroyDevice(device);
 }

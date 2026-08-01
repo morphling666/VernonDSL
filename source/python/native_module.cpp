@@ -17,10 +17,12 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -229,7 +231,8 @@ struct RhiImage {
         }
         if (vernonRhiDeviceUploadImage(host->device, handle, descriptors.data(), descriptors.size()) !=
             VERNON_RHI_STATUS_OK)
-            throw std::runtime_error("RHI image upload failed");
+            throw std::runtime_error("RHI image upload failed: " +
+                                     stringView(vernonRhiDeviceGetLastError(host->device)));
     }
     nb::bytes download() const {
         if ((format != VERNON_TEXTURE_RGBA8_UNORM && format != VERNON_TEXTURE_D32_FLOAT &&
@@ -542,11 +545,8 @@ std::unique_ptr<PythonExecutionGraph> RhiHost::createExecutionGraph() {
 using SharedCompileResult = std::shared_ptr<VernonCompileResult>;
 
 struct CompiledProgram {
-    CompiledProgram(VernonCompileResult *result, VernonTarget target, uint32_t glslVersion, uint32_t hlslShaderModel,
-                    std::string applePlatform, std::string targetTriple, std::string cpu, std::string cpuFeatures)
-        : result(result, &vernonCompileResultDestroy), target(target), glslVersion(glslVersion),
-          hlslShaderModel(hlslShaderModel), applePlatform(std::move(applePlatform)),
-          targetTriple(std::move(targetTriple)), cpu(std::move(cpu)), cpuFeatures(std::move(cpuFeatures)) {
+    CompiledProgram(VernonCompileResult *result, VernonTarget target)
+        : result(result, &vernonCompileResultDestroy), target(target) {
         if (!this->result)
             throw std::runtime_error("compiler returned no result");
     }
@@ -582,33 +582,53 @@ struct CompiledProgram {
 
     SharedCompileResult result;
     VernonTarget target;
-    uint32_t glslVersion{};
-    uint32_t hlslShaderModel{};
-    std::string applePlatform;
-    std::string targetTriple;
-    std::string cpu;
-    std::string cpuFeatures;
 };
 
 std::unique_ptr<CompiledProgram> compileProgramResult(Compiler &compiler, const std::string &mlir, VernonTarget target,
-                                                      uint32_t glslVersion, uint32_t hlslShaderModel,
-                                                      const std::string &targetTriple, const std::string &cpu,
-                                                      const std::string &cpuFeatures,
-                                                      const std::string &applePlatform) {
-    const VernonMetalPlatform metalPlatform = applePlatform == "ios"     ? VERNON_METAL_PLATFORM_IOS
-                                              : applePlatform == "macos" ? VERNON_METAL_PLATFORM_MACOS
-                                                                         : static_cast<VernonMetalPlatform>(UINT32_MAX);
+                                                      const nb::dict &targetOptions) {
+    auto readString = [&](const char *name) {
+        return targetOptions.contains(name) ? nb::cast<std::string>(targetOptions[name]) : std::string();
+    };
+    auto rejectUnknown = [&](std::initializer_list<std::string_view> allowed) {
+        for (auto item : targetOptions) {
+            const std::string key = nb::cast<std::string>(item.first);
+            if (std::find(allowed.begin(), allowed.end(), key) == allowed.end())
+                throw std::invalid_argument("unknown option '" + key + "' for selected target");
+        }
+    };
     VernonCompileOptions options{};
     options.struct_size = sizeof(options);
-    options.glsl_version = glslVersion;
-    options.hlsl_shader_model = hlslShaderModel;
-    options.metal_platform = metalPlatform;
-    options.cpu_target_triple = VernonStringView{targetTriple.data(), targetTriple.size()};
-    options.cpu_name = VernonStringView{cpu.data(), cpu.size()};
-    options.cpu_features = VernonStringView{cpuFeatures.data(), cpuFeatures.size()};
+    options.target = target;
+    std::string triple;
+    std::string processor;
+    std::string features;
+    if (target == VERNON_TARGET_CPU) {
+        rejectUnknown({"triple", "processor", "features"});
+        triple = readString("triple");
+        processor = readString("processor");
+        features = readString("features");
+        options.as.cpu.triple = VernonStringView{triple.data(), triple.size()};
+        options.as.cpu.processor = VernonStringView{processor.data(), processor.size()};
+        options.as.cpu.features = VernonStringView{features.data(), features.size()};
+    } else if (target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES) {
+        rejectUnknown({"version"});
+        options.as.opengl.version =
+            targetOptions.contains("version") ? nb::cast<uint32_t>(targetOptions["version"]) : 0;
+    } else if (target == VERNON_TARGET_METAL) {
+        rejectUnknown({"platform"});
+        const std::string platform = readString("platform");
+        options.as.metal.platform = platform.empty() || platform == "macos" ? VERNON_METAL_PLATFORM_MACOS
+                                    : platform == "ios"                     ? VERNON_METAL_PLATFORM_IOS
+                                                        : static_cast<VernonMetalPlatform>(UINT32_MAX);
+    } else if (target == VERNON_TARGET_DIRECTX) {
+        rejectUnknown({"shader_model"});
+        options.as.directx.shader_model =
+            targetOptions.contains("shader_model") ? nb::cast<uint32_t>(targetOptions["shader_model"]) : 0;
+    } else {
+        rejectUnknown({});
+    }
     return std::make_unique<CompiledProgram>(
-        vernonCompilerCompileMlirWithOptions(compiler.context, mlir.data(), mlir.size(), target, &options), target,
-        glslVersion, hlslShaderModel, applePlatform, targetTriple, cpu, cpuFeatures);
+        vernonCompilerCompileMlirWithOptions(compiler.context, mlir.data(), mlir.size(), &options), target);
 }
 
 struct PipelineParameterMetadata {
@@ -1334,8 +1354,7 @@ NB_MODULE(_native, module) {
     nb::class_<Compiler>(module, "Compiler")
         .def(nb::init<>())
         .def("compile_program_result", &compileProgramResult, nb::arg("mlir"), nb::arg("target"),
-             nb::arg("glsl_version") = 0, nb::arg("hlsl_shader_model") = 0, nb::arg("target_triple") = "",
-             nb::arg("cpu") = "", nb::arg("cpu_features") = "", nb::arg("apple_platform") = "macos");
+             nb::arg("options") = nb::dict());
     nb::class_<CompiledProgram>(module, "CompiledProgram")
         .def_prop_ro("ok", &CompiledProgram::ok)
         .def_prop_ro("status", &CompiledProgram::status)
@@ -1343,12 +1362,6 @@ NB_MODULE(_native, module) {
         .def_prop_ro("artifacts", &CompiledProgram::artifacts)
         .def_prop_ro("reflection", &CompiledProgram::reflection)
         .def_prop_ro("target", [](const CompiledProgram &value) { return value.target; })
-        .def_prop_ro("glsl_version", [](const CompiledProgram &value) { return value.glslVersion; })
-        .def_prop_ro("hlsl_shader_model", [](const CompiledProgram &value) { return value.hlslShaderModel; })
-        .def_prop_ro("apple_platform", [](const CompiledProgram &value) { return value.applePlatform; })
-        .def_prop_ro("target_triple", [](const CompiledProgram &value) { return value.targetTriple; })
-        .def_prop_ro("cpu", [](const CompiledProgram &value) { return value.cpu; })
-        .def_prop_ro("cpu_features", [](const CompiledProgram &value) { return value.cpuFeatures; })
         .def("has_cpu_entry", &CompiledProgram::hasCpuEntry);
     nb::class_<RhiHost>(module, "RhiHost")
         .def(nb::init<VernonRhiBackend, uint32_t>(), nb::arg("backend"), nb::arg("device_index") = 0)

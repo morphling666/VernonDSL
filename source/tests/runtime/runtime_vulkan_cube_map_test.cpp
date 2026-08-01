@@ -1,5 +1,6 @@
 #include "VernonRuntime.h"
 #include "runtime_rhi_test_utils.h"
+#include "vernon_test_support.h"
 
 #include <array>
 #include <cstdint>
@@ -89,7 +90,8 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
                           VERNON_RHI_IMAGE_DATA_UINT8,
                           cubePixels.data() + index * 4};
     ASSERT_EQ(vernonRhiDeviceUploadImage(context.device, cube.handle, uploads.data(), uploads.size()),
-              VERNON_RHI_STATUS_OK);
+              VERNON_RHI_STATUS_OK)
+        << vernon::test::text(vernonRhiDeviceGetLastError(context.device));
     auto sampler = vernon::tests::createSampler(context);
     ASSERT_NE(sampler.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
 

@@ -127,7 +127,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     invocation.argument_count = 1;
     invocation.compute_grid = {8, 1, 1};
     ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
-        << stringValue(vernonRuntimeGetLastError(context.runtime));
+        << "RHI: " << stringValue(vernonRhiDeviceGetLastError(context.device))
+        << "; runtime: " << stringValue(vernonRuntimeGetLastError(context.runtime));
     ASSERT_EQ(vernonRuntimeSynchronize(context.runtime), VERNON_STATUS_OK);
 
     std::array<int32_t, 10> result{};

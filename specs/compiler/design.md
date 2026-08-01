@@ -447,16 +447,30 @@ one-element Values as SPIR-V composites. The Vulkan adapter maps compute inline
 values to storage-buffer descriptors consistently during layout creation and
 descriptor updates.
 
-GLSL language versions are compile options, not backend constants. A zero
-version selects the target default; OpenGL and OpenGL ES callers may request a
-specific version through the stable C API or CLI. Other targets reject this
-option rather than silently ignoring it.
+GLSL language versions belong to the OpenGL target options, not to a shared
+compile-options bag or backend constants. An omitted version selects the target
+default; OpenGL and OpenGL ES callers may request a specific version through
+their typed C API union member or `--opengl-version`.
+
+Every compile surface uses the same target-discriminated vocabulary:
+
+- CPU: `triple`, `processor`, and ordered `features`
+- OpenGL/OpenGL ES: `version`
+- Metal: `platform`
+- DirectX: `shader_model`
+- Vulkan/CUDA: no configurable target options
+
+The C API represents these as `VernonCompileOptions.target` plus the matching
+`as.*` union member. Python exposes one frozen dataclass per target. Reflection
+and PipelineAssets serialize the same model as
+`{"kind": <target>, "options": {...}}`; emitted language and minimum-OS
+metadata are output facts, not compile options.
 
 HLSL Shader Model is likewise a compile option and is valid only for DirectX.
-The stable C API and cooker encode it as major times ten plus minor (`60` for
+The C API DirectX union member and cooker encode it as major times ten plus minor (`60` for
 Shader Model 6.0), defaulting to `60` and rejecting older models. It
 participates in artifact identity and is recorded in compiler reflection and
-PipelineAsset `target_options`. Builds use a pinned, hash-verified official DXC
+the PipelineAsset target spec. Builds use a pinned, hash-verified official DXC
 redistributable so developer and CI artifacts share the same compiler.
 `VERNON_DXC_EXECUTABLE` remains an explicit override for offline and managed
 toolchains. The cooker strips debug/reflection data for deterministic runtime
@@ -643,8 +657,9 @@ GLSL, SPIR-V, PTX, MSL, or DXIL artifact and aggregates sorted reflection
 features.
 Requirements do not participate in stage artifact identity, so content
 addressing and cross-variant artifact deduplication remain stable.
-`target_options` describe compilation inputs; `runtime_requirements` describe
-the resulting artifact's minimum execution environment. Metal requirements
+The canonical `target` object is a tagged union with `kind` and one
+backend-specific `options` object; it describes compilation inputs.
+`runtime_requirements` describe the resulting artifact's minimum execution environment. Metal requirements
 record the Apple platform, MSL version, minimum OS version, and required
 features.
 

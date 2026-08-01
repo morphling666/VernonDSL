@@ -423,11 +423,11 @@ feature level, Shader Model, root-signature version, and compute workgroup
 limits. Metal records the Apple platform, MSL version, minimum OS version, and
 required features for early Runtime validation.
 
-`target_options` records how compilation was requested; it is not a runtime
-capability contract. `runtime_requirements` records the minimum capabilities
-needed by the resulting artifact. Runtime validates the latter after the
-manifest hash and target, but before resolving or loading artifacts. The field
-is mandatory. CUDA intentionally does not infer a driver version from PTX;
+The canonical `target` object records a `kind` and that backend's typed
+`options`; it is not a runtime capability contract. `runtime_requirements`
+records the minimum capabilities needed by the resulting artifact. Runtime
+validates the latter after the manifest hash and target, but before resolving
+or loading artifacts. The field is mandatory. CUDA intentionally does not infer a driver version from PTX;
 compute capability is checked early, and the CUDA driver JIT remains
 authoritative for PTX compatibility.
 

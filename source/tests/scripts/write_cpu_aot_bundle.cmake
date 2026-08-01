@@ -94,7 +94,7 @@ set(PIPELINE_CANONICAL
 \"name\":\"fill\",\"physical_layouts\":{\"host_value\":{\"packed_arguments_size\":20,\
 \"profile\":\"host_value\"}},\"workgroup_size\":[2,2,1]}],\
 \"pipeline_version\":${VERNON_PIPELINE_VERSION}},\"stage\":\"compute\",\"symbol\":\"vernon_test_fill\",\
-\"target\":\"cpu\"}},\"target\":\"cpu\",\"type\":\"pipeline\",\
+\"target\":\"cpu\"}},\"target\":{\"kind\":\"cpu\",\"options\":{\"triple\":\"${TARGET_TRIPLE}\"}},\"type\":\"pipeline\",\
 \"variants\":[{\"key\":[],\"outputs\":[{\"access\":\"write\",\"dtype\":\"f32\",\
 \"kind\":\"tensor\",\"location\":0,\"name\":\"result\",\"shape\":[12]}],\
 \"parameters\":[{\"access\":\"write\",\"address_space\":\"device\",\

@@ -538,7 +538,7 @@ std::string pipelineBundle(const nlohmann::json &artifact) {
         {"pipeline_version", VERNON_PIPELINE_VERSION},
         {"type", "pipeline"},
         {"id", "pipeline/gl"},
-        {"target", "opengl"},
+        {"target", {{"kind", "opengl"}, {"options", nlohmann::json::object()}}},
         {"features", nlohmann::json::array()},
         {"runtime_requirements",
          {{"backend", "opengl"},
@@ -563,7 +563,7 @@ std::string matrixBundle(const char *target) {
     const std::string source = "#version 330\nuniform mat4 transform;void main(){gl_Position=transform*"
                                "vec4(0.0,0.0,0.0,1.0);}";
     nlohmann::json root = nlohmann::json::parse(pipelineBundle(inlineArtifact(source)));
-    root["target"] = target;
+    root["target"] = {{"kind", target}, {"options", nlohmann::json::object()}};
     root["runtime_requirements"]["backend"] = target;
     root["stage_artifacts"]["vs"]["target"] = target;
     root["stage_artifacts"]["fs"]["target"] = target;

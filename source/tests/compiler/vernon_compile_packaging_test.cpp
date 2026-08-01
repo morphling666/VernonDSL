@@ -49,10 +49,11 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 
     VernonCompileOptions cpuOptions{};
     cpuOptions.struct_size = sizeof(cpuOptions);
+    cpuOptions.target = VERNON_TARGET_CPU;
     constexpr std::string_view triple = "x86_64-pc-windows-msvc";
-    cpuOptions.cpu_target_triple = {triple.data(), triple.size()};
-    VernonCompileResult *cpuResult = vernonCompilerCompileMlirWithOptions(
-        context, computeModule.data(), computeModule.size(), VERNON_TARGET_CPU, &cpuOptions);
+    cpuOptions.as.cpu.triple = {triple.data(), triple.size()};
+    VernonCompileResult *cpuResult =
+        vernonCompilerCompileMlirWithOptions(context, computeModule.data(), computeModule.size(), &cpuOptions);
     ASSERT_TRUE(cpuResult);
     ASSERT_TRUE(vernonCompileResultGetStatus(cpuResult) == VERNON_STATUS_OK);
 

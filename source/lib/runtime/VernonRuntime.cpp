@@ -41,6 +41,57 @@ VernonStatus fail(VernonRuntimeContext *context, std::string error,
     return status;
 }
 
+std::string pipelineTargetKind(const nlohmann::json &root) {
+    if (!root.contains("target") || !root["target"].is_object())
+        return {};
+    const nlohmann::json &target = root["target"];
+    if (!target.contains("kind") || !target["kind"].is_string() || !target.contains("options") ||
+        !target["options"].is_object() || target.size() != 2)
+        return {};
+    const std::string kind = target["kind"].get<std::string>();
+    const nlohmann::json &options = target["options"];
+    auto hasOnly = [&](std::initializer_list<std::string_view> allowed) {
+        for (const auto &[key, value] : options.items())
+            if (std::find(allowed.begin(), allowed.end(), key) == allowed.end())
+                return false;
+        return true;
+    };
+    if (kind == "cpu") {
+        if (!hasOnly({"triple", "processor", "features"}) || !options.contains("triple") ||
+            !options["triple"].is_string() || options["triple"].get_ref<const std::string &>().empty())
+            return {};
+        if (options.contains("processor") && !options["processor"].is_string())
+            return {};
+        if (options.contains("features") &&
+            (!options["features"].is_array() ||
+             !std::all_of(options["features"].begin(), options["features"].end(), [](const nlohmann::json &feature) {
+                 return feature.is_string() && !feature.get_ref<const std::string &>().empty();
+             })))
+            return {};
+    } else if (kind == "opengl" || kind == "opengles") {
+        if (!hasOnly({"version"}))
+            return {};
+        if (options.contains("version") &&
+            (!options["version"].is_number_unsigned() || options["version"].get<uint64_t>() < 100 ||
+             options["version"].get<uint64_t>() > 999))
+            return {};
+    } else if (kind == "metal") {
+        if (!hasOnly({"platform"}) || !options.contains("platform") || !options["platform"].is_string() ||
+            (options["platform"] != "macos" && options["platform"] != "ios"))
+            return {};
+    } else if (kind == "directx") {
+        if (!hasOnly({"shader_model"}) || !options.contains("shader_model") ||
+            !options["shader_model"].is_number_unsigned() || options["shader_model"].get<uint64_t>() < 60)
+            return {};
+    } else if (kind == "vulkan" || kind == "cuda") {
+        if (!options.empty())
+            return {};
+    } else {
+        return {};
+    }
+    return kind;
+}
+
 } // namespace
 
 extern "C" {
@@ -192,7 +243,9 @@ VernonStatus vernonRuntimePipelineBundleInspectTarget(const void *bundleData, si
         std::string manifestError;
         if (!pipelineSchema || !validateManifestHash(root, true, manifestError))
             return VERNON_STATUS_PARSE_ERROR;
-        const std::string name = root.value("target", "");
+        const std::string name = pipelineTargetKind(root);
+        if (name.empty())
+            return VERNON_STATUS_PARSE_ERROR;
         if (name == "cpu")
             *target = VERNON_RUNTIME_CPU;
         else if (name == "cuda")
@@ -240,7 +293,7 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                                          : (context->backend == VERNON_RUNTIME_OPENGL_ES ? "opengles" : "opengl");
         const bool pipelineSchema = root.is_object() && root.value("pipeline_version", 0) == VERNON_PIPELINE_VERSION &&
                                     root.value("type", "") == "pipeline";
-        if (!pipelineSchema || root.value("target", "") != expectedTarget || !root.contains("stage_artifacts") ||
+        if (!pipelineSchema || pipelineTargetKind(root) != expectedTarget || !root.contains("stage_artifacts") ||
             !root["stage_artifacts"].is_object() || !root.contains("variants") || !root["variants"].is_array()) {
             fail(context, "unsupported or invalid pipeline bundle");
             return nullptr;

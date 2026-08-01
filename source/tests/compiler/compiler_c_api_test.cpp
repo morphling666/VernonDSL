@@ -25,7 +25,8 @@ TEST(CompilerArtifacts, RejectsInvalidReflectionBeforePublishingArtifacts) {
     std::string reflection = "not-json";
     std::string diagnostics;
     const std::vector<vernon::compiler::Artifact> artifacts;
-    EXPECT_FALSE(vernon::compiler::addArtifactTable(reflection, diagnostics, artifacts, VERNON_TARGET_METAL, 0));
+    EXPECT_FALSE(vernon::compiler::addArtifactTable(reflection, diagnostics, artifacts,
+                                                    vernon::compiler::MetalCompileOptions{}));
     EXPECT_NE(diagnostics.find("not valid JSON"), std::string::npos);
 }
 
@@ -276,6 +277,7 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
 
     VernonCompileOptions directx_options{};
     directx_options.struct_size = sizeof(directx_options);
+    directx_options.target = VERNON_TARGET_DIRECTX;
     if (!vernon::tests::unavailableDirectXTarget(context, VERNON_TARGET_DIRECTX)) {
         VernonCompileResult *compile =
             vernonCompilerCompileMlir(context, module, strlen(module), VERNON_TARGET_DIRECTX);
@@ -288,22 +290,22 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
         ASSERT_TRUE(dxil.size >= 4);
         ASSERT_TRUE(std::memcmp(dxil.data, "DXBC", 4) == 0);
         VernonStringView directx_reflection = vernonCompileResultGetReflection(compile);
-        ASSERT_TRUE(view_contains(directx_reflection, "\"target\":\"directx\""));
+        ASSERT_TRUE(view_contains(directx_reflection, "\"kind\":\"directx\""));
         ASSERT_TRUE(view_contains(directx_reflection, "\"format\":\"dxil\""));
-        ASSERT_TRUE(view_contains(directx_reflection, "\"hlsl_shader_model\":60"));
+        ASSERT_TRUE(view_contains(directx_reflection, "\"shader_model\":60"));
         vernonCompileResultDestroy(compile);
 
-        directx_options.hlsl_shader_model = 60;
-        VernonCompileResult *directx_sm60 = vernonCompilerCompileMlirWithOptions(
-            context, module, strlen(module), VERNON_TARGET_DIRECTX, &directx_options);
+        directx_options.as.directx.shader_model = 60;
+        VernonCompileResult *directx_sm60 =
+            vernonCompilerCompileMlirWithOptions(context, module, strlen(module), &directx_options);
         ASSERT_TRUE(directx_sm60 != NULL);
         ASSERT_TRUE(vernonCompileResultGetStatus(directx_sm60) == VERNON_STATUS_OK);
-        ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(directx_sm60), "\"hlsl_shader_model\":60"));
+        ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(directx_sm60), "\"shader_model\":60"));
         vernonCompileResultDestroy(directx_sm60);
     }
-    directx_options.hlsl_shader_model = 55;
+    directx_options.as.directx.shader_model = 55;
     VernonCompileResult *invalid_directx_options =
-        vernonCompilerCompileMlirWithOptions(context, module, strlen(module), VERNON_TARGET_DIRECTX, &directx_options);
+        vernonCompilerCompileMlirWithOptions(context, module, strlen(module), &directx_options);
     ASSERT_TRUE(invalid_directx_options != NULL);
     ASSERT_TRUE(vernonCompileResultGetStatus(invalid_directx_options) == VERNON_STATUS_INVALID_ARGUMENT);
     vernonCompileResultDestroy(invalid_directx_options);
@@ -327,7 +329,7 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     const std::string pipelineVersion = "\"pipeline_version\":" + std::to_string(VERNON_PIPELINE_VERSION);
     ASSERT_TRUE(view_contains(vulkan_reflection, compilerVersion.c_str()));
     ASSERT_TRUE(view_contains(vulkan_reflection, pipelineVersion.c_str()));
-    ASSERT_TRUE(view_contains(vulkan_reflection, "\"target\":\"vulkan\""));
+    ASSERT_TRUE(view_contains(vulkan_reflection, "\"kind\":\"vulkan\""));
     ASSERT_TRUE(view_contains(vulkan_reflection, "\"entry_point\":\"vertex_main\""));
     ASSERT_TRUE(view_contains(vulkan_reflection, "\"filename\":\"module.spv\""));
 
@@ -345,23 +347,24 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     if (opengl.available) {
         VernonCompileOptions options{};
         options.struct_size = sizeof(options);
-        options.glsl_version = 450;
-        VernonCompileResult *opengl_compile = vernonCompilerCompileMlirWithOptions(
-            context, cpu_module, strlen(cpu_module), VERNON_TARGET_OPENGL, &options);
+        options.target = VERNON_TARGET_OPENGL;
+        options.as.opengl.version = 450;
+        VernonCompileResult *opengl_compile =
+            vernonCompilerCompileMlirWithOptions(context, cpu_module, strlen(cpu_module), &options);
         ASSERT_TRUE(opengl_compile != NULL);
         ASSERT_TRUE(vernonCompileResultGetStatus(opengl_compile) == VERNON_STATUS_OK);
         VernonStringView glsl = vernonCompileResultGetArtifactData(opengl_compile, 0);
         ASSERT_TRUE(glsl.size >= strlen("#version 450"));
         ASSERT_TRUE(memcmp(glsl.data, "#version 450", strlen("#version 450")) == 0);
         VernonStringView opengl_reflection = vernonCompileResultGetReflection(opengl_compile);
-        ASSERT_TRUE(view_contains(opengl_reflection, "\"target\":\"opengl\""));
-        ASSERT_TRUE(view_contains(opengl_reflection, "\"glsl_version\":450"));
+        ASSERT_TRUE(view_contains(opengl_reflection, "\"kind\":\"opengl\""));
+        ASSERT_TRUE(view_contains(opengl_reflection, "\"version\":450"));
         ASSERT_TRUE(view_contains(opengl_reflection, "\"format\":\"glsl\""));
         vernonCompileResultDestroy(opengl_compile);
 
-        options.glsl_version = 330;
+        options.target = static_cast<VernonTarget>(UINT32_MAX);
         VernonCompileResult *invalid_options =
-            vernonCompilerCompileMlirWithOptions(context, module, strlen(module), VERNON_TARGET_VULKAN, &options);
+            vernonCompilerCompileMlirWithOptions(context, module, strlen(module), &options);
         ASSERT_TRUE(invalid_options != NULL);
         ASSERT_TRUE(vernonCompileResultGetStatus(invalid_options) == VERNON_STATUS_INVALID_ARGUMENT);
         vernonCompileResultDestroy(invalid_options);
@@ -370,9 +373,10 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     if (opengles.available) {
         VernonCompileOptions options{};
         options.struct_size = sizeof(options);
-        options.glsl_version = 310;
-        VernonCompileResult *opengles_compile = vernonCompilerCompileMlirWithOptions(
-            context, cpu_module, strlen(cpu_module), VERNON_TARGET_OPENGL_ES, &options);
+        options.target = VERNON_TARGET_OPENGL_ES;
+        options.as.opengl.version = 310;
+        VernonCompileResult *opengles_compile =
+            vernonCompilerCompileMlirWithOptions(context, cpu_module, strlen(cpu_module), &options);
         ASSERT_TRUE(opengles_compile != NULL);
         ASSERT_TRUE(vernonCompileResultGetStatus(opengles_compile) == VERNON_STATUS_OK);
         VernonStringView glsl = vernonCompileResultGetArtifactData(opengles_compile, 0);
@@ -426,21 +430,22 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
         ASSERT_TRUE(vernonCompileResultGetStatus(metal_compute) == VERNON_STATUS_OK);
         VernonStringView metal_source = vernonCompileResultGetArtifactData(metal_compute, 0);
         ASSERT_TRUE(view_contains(metal_source, "kernel void loop"));
-        ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(metal_compute), "\"target\":\"metal\""));
-        ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(metal_compute), "\"apple_platform\":\"macos\""));
-        ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(metal_compute), "\"msl_version\":[2,4]"));
+        ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(metal_compute), "\"kind\":\"metal\""));
+        ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(metal_compute), "\"platform\":\"macos\""));
+        ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(metal_compute), "\"version\":[2,4]"));
         ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(metal_compute), "\"minimum_os_version\":[11,0]"));
         vernonCompileResultDestroy(metal_compute);
 
         VernonCompileOptions ios_options{};
         ios_options.struct_size = sizeof(ios_options);
-        ios_options.metal_platform = VERNON_METAL_PLATFORM_IOS;
-        VernonCompileResult *ios_metal_compute = vernonCompilerCompileMlirWithOptions(
-            context, cuda_while_module, strlen(cuda_while_module), VERNON_TARGET_METAL, &ios_options);
+        ios_options.target = VERNON_TARGET_METAL;
+        ios_options.as.metal.platform = VERNON_METAL_PLATFORM_IOS;
+        VernonCompileResult *ios_metal_compute =
+            vernonCompilerCompileMlirWithOptions(context, cuda_while_module, strlen(cuda_while_module), &ios_options);
         ASSERT_TRUE(ios_metal_compute != NULL);
         ASSERT_TRUE(vernonCompileResultGetStatus(ios_metal_compute) == VERNON_STATUS_OK);
-        ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(ios_metal_compute), "\"apple_platform\":\"ios\""));
-        ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(ios_metal_compute), "\"msl_version\":[2,4]"));
+        ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(ios_metal_compute), "\"platform\":\"ios\""));
+        ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(ios_metal_compute), "\"version\":[2,4]"));
         ASSERT_TRUE(
             view_contains(vernonCompileResultGetReflection(ios_metal_compute), "\"minimum_os_version\":[15,0]"));
         vernonCompileResultDestroy(ios_metal_compute);
@@ -514,10 +519,11 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     const char *ios_triple = "arm64-apple-ios17.0";
     VernonCompileOptions ios_options = {0};
     ios_options.struct_size = sizeof(ios_options);
-    ios_options.cpu_target_triple.data = ios_triple;
-    ios_options.cpu_target_triple.size = strlen(ios_triple);
+    ios_options.target = VERNON_TARGET_CPU;
+    ios_options.as.cpu.triple.data = ios_triple;
+    ios_options.as.cpu.triple.size = strlen(ios_triple);
     VernonCompileResult *ios_cpu_compile =
-        vernonCompilerCompileMlirWithOptions(context, cpu_module, strlen(cpu_module), VERNON_TARGET_CPU, &ios_options);
+        vernonCompilerCompileMlirWithOptions(context, cpu_module, strlen(cpu_module), &ios_options);
     ASSERT_TRUE(ios_cpu_compile != NULL);
     ASSERT_TRUE(vernonCompileResultGetStatus(ios_cpu_compile) == VERNON_STATUS_OK);
     VernonStringView ios_object = vernonCompileResultGetArtifactData(ios_cpu_compile, 0);

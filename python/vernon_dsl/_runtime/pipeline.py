@@ -18,6 +18,7 @@ from ..bundle import (
     canonical_json,
     compiled_stage_from_program,
     inline_artifact_descriptor,
+    make_target_options,
     materialize_bundle,
     serialize_bundle,
 )
@@ -143,9 +144,9 @@ class Pipeline:
             state.opengl: (state._native.Target.OPENGL, "opengl"),
             state.opengles: (state._native.Target.OPENGL_ES, "opengles"),
         }[state._architecture]
-        options = TargetOptions(
+        options = make_target_options(
             target_name,
-            {"glsl_version": state._interactive_glsl_version()}
+            {"version": state._interactive_glsl_version()}
             if state._architecture in {state.opengl, state.opengles}
             else {},
         )
@@ -182,8 +183,7 @@ class Pipeline:
                     {
                         "stages": [stage.id for stage in compiled_stages],
                         "features": self._features,
-                        "target": target_name,
-                        "target_options": dict(options.options),
+                        "target": options.spec,
                     }
                 ).encode()
             ).hexdigest()
@@ -209,7 +209,7 @@ class Pipeline:
                 state._native_runtime.load_pipeline(bundle_bytes, list(self._features)),
                 key,
                 bundle_bytes,
-                canonical_json({"target": target_name, "target_options": dict(options.options)}),
+                canonical_json(options.spec),
                 state._runtime_generation,
             )
             self._cache[key] = cached
@@ -227,16 +227,13 @@ class Pipeline:
         if self._compiled is not None and self._compiled_generation == state._runtime_generation:
             return self._compiled
         if state._architecture in {state.vulkan, state.directx, state.metal, state.opengl, state.opengles}:
-            target_identity = canonical_json(
-                {
-                    "target": state._architecture.name,
-                    "target_options": (
-                        {"glsl_version": state._interactive_glsl_version()}
-                        if state._architecture in {state.opengl, state.opengles}
-                        else {}
-                    ),
-                }
+            identity_options = make_target_options(
+                state._architecture.name,
+                {"version": state._interactive_glsl_version()}
+                if state._architecture in {state.opengl, state.opengles}
+                else {},
             )
+            target_identity = canonical_json(identity_options.spec)
             if self._compiled is not None and self._compiled.target_identity == target_identity:
                 if state._native_runtime is None:
                     raise RuntimeError(f"{state._architecture.name} pipeline execution requires the native runtime")

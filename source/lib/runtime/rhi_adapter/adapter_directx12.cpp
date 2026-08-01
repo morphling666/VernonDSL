@@ -577,16 +577,16 @@ VernonStatus prepareGraphicsPipelineImpl(VernonRuntimeRhiAdapter &adapter,
     if (FAILED(result))
         return fail(adapter, "ID3D12Device::CreateGraphicsPipelineState failed", VERNON_STATUS_INTERNAL_ERROR);
     directX12State(adapter).lastDepthStencilState = {
-        native.DepthStencilState.DepthEnable,
-        native.DepthStencilState.DepthWriteMask,
-        native.DepthStencilState.DepthFunc,
-        native.DepthStencilState.StencilEnable,
-        native.DepthStencilState.StencilReadMask,
-        native.DepthStencilState.StencilWriteMask,
-        native.DepthStencilState.FrontFace.StencilFunc,
-        native.DepthStencilState.FrontFace.StencilPassOp,
-        native.DepthStencilState.BackFace.StencilFunc,
-        native.DepthStencilState.BackFace.StencilPassOp,
+        static_cast<uint32_t>(native.DepthStencilState.DepthEnable),
+        static_cast<uint32_t>(native.DepthStencilState.DepthWriteMask),
+        static_cast<uint32_t>(native.DepthStencilState.DepthFunc),
+        static_cast<uint32_t>(native.DepthStencilState.StencilEnable),
+        static_cast<uint32_t>(native.DepthStencilState.StencilReadMask),
+        static_cast<uint32_t>(native.DepthStencilState.StencilWriteMask),
+        static_cast<uint32_t>(native.DepthStencilState.FrontFace.StencilFunc),
+        static_cast<uint32_t>(native.DepthStencilState.FrontFace.StencilPassOp),
+        static_cast<uint32_t>(native.DepthStencilState.BackFace.StencilFunc),
+        static_cast<uint32_t>(native.DepthStencilState.BackFace.StencilPassOp),
     };
     *output = toHandle(pipeline.release());
     adapter.pipelinePreparations.fetch_add(1, std::memory_order_relaxed);

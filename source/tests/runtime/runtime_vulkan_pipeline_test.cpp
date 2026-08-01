@@ -2,6 +2,7 @@
 #include "runtime/content_hash.h"
 #include "runtime/runtime_test_hooks.h"
 #include "runtime_rhi_test_utils.h"
+#include "vernon_test_support.h"
 
 #include <nlohmann/json.hpp>
 
@@ -164,7 +165,8 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
                                           VERNON_RHI_IMAGE_DATA_RGBA,
                                           VERNON_RHI_IMAGE_DATA_UINT8,
                                           sampledPixel};
-    ASSERT_EQ(vernonRhiDeviceUploadImage(context.device, sampled.handle, &upload, 1), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceUploadImage(context.device, sampled.handle, &upload, 1), VERNON_RHI_STATUS_OK)
+        << vernon::test::text(vernonRhiDeviceGetLastError(context.device));
     auto textureSampler = vernon::tests::createSampler(context);
     ASSERT_NE(textureSampler.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     const uint64_t shape[] = {3, 2};
@@ -440,7 +442,8 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     ASSERT_EQ(vernonRuntimePipelineEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
     arguments[0].tensor.access = VERNON_ACCESS_READ_WRITE;
     ASSERT_EQ(vernonRuntimePipelineEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_OK)
-        << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
+        << "RHI: " << vernon::test::text(vernonRhiDeviceGetLastError(context.device))
+        << "; runtime: " << vernon::test::text(vernonRuntimeGetLastError(runtime));
     constexpr uint64_t secondShape[]{2};
     constexpr int64_t secondStrides[]{2 * sizeof(float)};
     arguments[0].tensor.resource = secondBuffer.reference;

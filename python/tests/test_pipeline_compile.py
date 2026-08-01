@@ -9,13 +9,15 @@ from types import SimpleNamespace
 from vernon_dsl.bundle import (
     CompiledArtifact,
     CompiledStage,
+    MetalTargetOptions,
+    OpenGLTargetOptions,
     PipelineCompileError,
-    TargetOptions,
     build_bundle_plan,
     canonical_json,
     compiled_stage_from_program,
     external_parameters,
     inline_artifact_descriptor,
+    make_target_options,
     materialize_bundle,
     merge_parameter_uses,
     parse_reflection_json,
@@ -111,7 +113,7 @@ def _stage(stage: str, artifact: bytes, interface: dict[str, object]) -> Compile
         '{"id":"module"}',
         entry,
         stage,
-        TargetOptions("opengl", {"glsl_version": 330}),
+        OpenGLTargetOptions(version=330),
         reflection,
         reflection["entries"][0],
         CompiledArtifact("glsl", artifact, f"{stage}.glsl"),
@@ -177,10 +179,13 @@ class PipelineCompileTests(unittest.TestCase):
         self.assertEqual(cpu["object_format"], "coff")
         self.assertNotIn("invocation_abi_version", cpu)
         metal_stage = stage("metal", b"MSL")
-        metal_stage.target.options = {
-            "apple_platform": "ios",
-            "msl_version": [2, 4],
-            "minimum_os_version": [15, 0],
+        metal_stage.target.options = {"platform": "ios"}
+        metal_stage.reflection = {
+            "target": {
+                "kind": "metal",
+                "options": {"platform": "ios"},
+                "output": {"language": "msl", "version": [2, 4], "minimum_os_version": [15, 0]},
+            }
         }
         metal = runtime_requirements("metal", [metal_stage])
         self.assertEqual(metal["apple_platform"], "ios")
@@ -200,7 +205,7 @@ class PipelineCompileTests(unittest.TestCase):
             runtime_requirements("cuda", [stage])
 
         metal_stage = SimpleNamespace(
-            target=SimpleNamespace(target="metal", options={"apple_platform": "macos"}),
+            target=SimpleNamespace(target="metal", options={"platform": "macos"}),
             stage="compute",
             artifact=SimpleNamespace(data=b"MSL"),
             reflection={},
@@ -209,9 +214,13 @@ class PipelineCompileTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(PipelineCompileError, "no valid msl_version"):
             runtime_requirements("metal", [metal_stage])
-        metal_stage.target.options = {
-            "msl_version": [2, 4],
-            "minimum_os_version": [11, 0],
+        metal_stage.target.options = {}
+        metal_stage.reflection = {
+            "target": {
+                "kind": "metal",
+                "options": {},
+                "output": {"language": "msl", "version": [2, 4], "minimum_os_version": [11, 0]},
+            }
         }
         with self.assertRaisesRegex(PipelineCompileError, "requires apple_platform"):
             runtime_requirements("metal", [metal_stage])
@@ -222,10 +231,14 @@ class PipelineCompileTests(unittest.TestCase):
             diagnostics="",
             reflection=json.dumps(
                 {
-                    "target_options": {
-                        "apple_platform": "ios",
-                        "msl_version": [2, 4],
-                        "minimum_os_version": [15, 0],
+                    "target": {
+                        "kind": "metal",
+                        "options": {"platform": "ios"},
+                        "output": {
+                            "language": "msl",
+                            "version": [2, 4],
+                            "minimum_os_version": [15, 0],
+                        },
                     },
                     "entries": [{"name": "main", "stage": "compute"}],
                     "artifacts": [
@@ -245,10 +258,9 @@ class PipelineCompileTests(unittest.TestCase):
             module="module",
             module_manifest="manifest",
             entry="main",
-            target=TargetOptions("metal"),
+            target=MetalTargetOptions(),
         )
-        self.assertEqual(compiled.target.options["apple_platform"], "ios")
-        self.assertEqual(compiled.target.options["msl_version"], (2, 4))
+        self.assertEqual(compiled.target.options["platform"], "ios")
         requirements = runtime_requirements("metal", [compiled])
         self.assertEqual(requirements["minimum_os_version"], [15, 0])
 
@@ -266,30 +278,30 @@ class PipelineCompileTests(unittest.TestCase):
         self.assertEqual(set(changed["stage_artifacts"]), {stage.id})
 
     def test_native_options_are_scoped_to_the_selected_target(self) -> None:
-        self.assertEqual(TargetOptions("opengl", {"glsl_version": 330}).native_options, {"glsl_version": 330})
+        self.assertEqual(OpenGLTargetOptions(version=330).native_options, {"options": {"version": 330}})
         self.assertEqual(
-            TargetOptions("cpu", {"cpu": "generic", "cpu_features": "+sse2"}).native_options,
-            {"cpu": "generic", "cpu_features": "+sse2"},
+            make_target_options("cpu", {"processor": "generic", "features": ["+sse2"]}).native_options,
+            {"options": {"processor": "generic", "features": "+sse2"}},
         )
-        self.assertEqual(TargetOptions("directx").native_options, {"hlsl_shader_model": 60})
+        self.assertEqual(make_target_options("directx").native_options, {"options": {"shader_model": 60}})
         self.assertEqual(
-            TargetOptions("directx", {"hlsl_shader_model": 60}).native_options,
-            {"hlsl_shader_model": 60},
+            make_target_options("directx", {"shader_model": 60}).native_options,
+            {"options": {"shader_model": 60}},
         )
-        self.assertEqual(TargetOptions("cuda").native_options, {})
-        self.assertEqual(TargetOptions("metal").native_options, {"apple_platform": "macos"})
+        self.assertEqual(make_target_options("cuda").native_options, {"options": {}})
+        self.assertEqual(MetalTargetOptions().native_options, {"options": {"platform": "macos"}})
         self.assertEqual(
-            TargetOptions("metal", {"apple_platform": "ios"}).native_options,
-            {"apple_platform": "ios"},
+            MetalTargetOptions(platform="ios").native_options,
+            {"options": {"platform": "ios"}},
         )
-        with self.assertRaisesRegex(PipelineCompileError, "valid only for the CPU target"):
-            TargetOptions("vulkan", {"cpu": "generic"})
-        with self.assertRaisesRegex(PipelineCompileError, "valid only for the DirectX target"):
-            TargetOptions("metal", {"hlsl_shader_model": 50})
-        with self.assertRaisesRegex(PipelineCompileError, "Shader Model 6.0 or newer"):
-            TargetOptions("directx", {"hlsl_shader_model": 55})
+        with self.assertRaisesRegex(PipelineCompileError, "invalid vulkan target options"):
+            make_target_options("vulkan", {"processor": "generic"})
+        with self.assertRaisesRegex(PipelineCompileError, "invalid metal target options"):
+            make_target_options("metal", {"shader_model": 60})
+        with self.assertRaisesRegex(PipelineCompileError, "shader model must be 6.0 or newer"):
+            make_target_options("directx", {"shader_model": 55})
         with self.assertRaisesRegex(PipelineCompileError, "macos.*ios"):
-            TargetOptions("metal", {"apple_platform": "tvos"})
+            MetalTargetOptions(platform="tvos")
 
     def test_generated_sampler_and_resolution_are_internal(self) -> None:
         records = {

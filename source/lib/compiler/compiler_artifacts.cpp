@@ -17,6 +17,18 @@ namespace {
 
 llvm::StringRef asStringRef(std::string_view value) { return llvm::StringRef(value.data(), value.size()); }
 
+llvm::json::Array cpuFeatures(std::string_view features) {
+    llvm::json::Array result;
+    llvm::StringRef remaining = asStringRef(features);
+    while (!remaining.empty()) {
+        auto [feature, rest] = remaining.split(',');
+        if (!feature.empty())
+            result.emplace_back(feature.str());
+        remaining = rest;
+    }
+    return result;
+}
+
 llvm::StringRef targetName(VernonTarget target) {
     switch (target) {
     case VERNON_TARGET_CPU:
@@ -63,8 +75,7 @@ llvm::StringRef artifactFormat(llvm::StringRef filename) {
 } // namespace
 
 bool addArtifactTable(std::string &reflection, std::string &diagnostics, const std::vector<Artifact> &artifacts,
-                      VernonTarget target, uint32_t glslVersion, std::string_view cpuTargetTriple, std::string_view cpu,
-                      std::string_view cpuFeatures, uint32_t hlslShaderModel, VernonMetalPlatform metalPlatform,
+                      const CompileOptions &compileOptions,
                       const std::vector<TargetResourceSlot> &targetResourceSlots) {
     llvm::Expected<llvm::json::Value> parsed = llvm::json::parse(reflection);
     if (!parsed) {
@@ -77,32 +88,37 @@ bool addArtifactTable(std::string &reflection, std::string &diagnostics, const s
         return false;
     }
 
+    const VernonTarget target = compileTargetKind(compileOptions);
     (*root)["compiler_contract_version"] = int64_t{VERNON_COMPILER_CONTRACT_VERSION};
     (*root)["pipeline_version"] = int64_t{VERNON_PIPELINE_VERSION};
-    (*root)["target"] = targetName(target).str();
-    llvm::json::Object targetOptions;
-    if (target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES)
-        targetOptions["glsl_version"] = static_cast<int64_t>(glslVersion);
-    if (target == VERNON_TARGET_DIRECTX)
-        targetOptions["hlsl_shader_model"] = static_cast<int64_t>(hlslShaderModel);
-    if (target == VERNON_TARGET_METAL) {
-        targetOptions["apple_platform"] =
-            metalPlatform == VERNON_METAL_PLATFORM_IOS ? std::string("ios") : std::string("macos");
-        targetOptions["msl_version"] = llvm::json::Array{int64_t{2}, int64_t{4}};
-        targetOptions["minimum_os_version"] = metalPlatform == VERNON_METAL_PLATFORM_IOS
-                                                  ? llvm::json::Array{int64_t{15}, int64_t{0}}
-                                                  : llvm::json::Array{int64_t{11}, int64_t{0}};
+    llvm::json::Object options;
+    llvm::json::Object output;
+    if (const auto *cpu = std::get_if<CpuCodegenOptions>(&compileOptions)) {
+        const llvm::StringRef triple = asStringRef(cpu->targetTriple);
+        options["triple"] = llvm::Triple::normalize(triple.empty() ? llvm::sys::getDefaultTargetTriple() : triple);
+        if (!cpu->cpu.empty())
+            options["processor"] = cpu->cpu;
+        if (!cpu->features.empty())
+            options["features"] = cpuFeatures(cpu->features);
+    } else if (const auto *opengl = std::get_if<OpenGLCompileOptions>(&compileOptions)) {
+        if (opengl->version != 0)
+            options["version"] = static_cast<int64_t>(opengl->version);
+    } else if (const auto *metal = std::get_if<MetalCompileOptions>(&compileOptions)) {
+        const bool ios = metal->platform == VERNON_METAL_PLATFORM_IOS;
+        options["platform"] = ios ? std::string("ios") : std::string("macos");
+        output["language"] = "msl";
+        output["version"] = llvm::json::Array{int64_t{2}, int64_t{4}};
+        output["minimum_os_version"] =
+            ios ? llvm::json::Array{int64_t{15}, int64_t{0}} : llvm::json::Array{int64_t{11}, int64_t{0}};
+    } else if (const auto *directx = std::get_if<DirectXCompileOptions>(&compileOptions)) {
+        options["shader_model"] = static_cast<int64_t>(directx->shaderModel);
     }
-    if (target == VERNON_TARGET_CPU) {
-        const llvm::StringRef triple = asStringRef(cpuTargetTriple);
-        targetOptions["target_triple"] =
-            llvm::Triple::normalize(triple.empty() ? llvm::sys::getDefaultTargetTriple() : triple);
-        if (!cpu.empty())
-            targetOptions["cpu"] = std::string(cpu);
-        if (!cpuFeatures.empty())
-            targetOptions["cpu_features"] = std::string(cpuFeatures);
-    }
-    (*root)["target_options"] = std::move(targetOptions);
+    llvm::json::Object targetSpec;
+    targetSpec["kind"] = targetName(target).str();
+    targetSpec["options"] = std::move(options);
+    if (!output.empty())
+        targetSpec["output"] = std::move(output);
+    (*root)["target"] = std::move(targetSpec);
 
     llvm::json::Array table;
     llvm::json::Array *entries = root->getArray("entries");

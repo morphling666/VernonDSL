@@ -12,7 +12,7 @@ from typing import Any, ClassVar
 import numpy as np
 
 from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
-from ..bundle import TargetOptions, canonical_json
+from ..bundle import canonical_json, make_target_options
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
 from ..frontend.model import AccessMode, ConcreteType, StorageEffect, StorageEffectKind
 from ..types import TypeExpr, _Scalar
@@ -421,9 +421,9 @@ class Kernel:
         if target not in targets:
             raise ValueError("target must be cpu, cuda, vulkan, directx, metal, opengl, or opengles")
         frontend, _, _, _ = self._lower(arguments)
-        options = TargetOptions(
+        options = make_target_options(
             target,
-            {"glsl_version": 430} if target == "opengl" else {"glsl_version": 310} if target == "opengles" else {},
+            {"version": 430} if target == "opengl" else {"version": 310} if target == "opengles" else {},
         )
         program = state._native.Compiler().compile_program_result(
             frontend.mlir, targets[target], **options.native_options
@@ -451,9 +451,9 @@ class Kernel:
             if state._native is not None
             else None
         )
-        options = TargetOptions(
+        options = make_target_options(
             state._architecture.name,
-            {"glsl_version": state._interactive_glsl_version()}
+            {"version": state._interactive_glsl_version()}
             if state._architecture in {state.opengl, state.opengles}
             else {},
         )
@@ -489,8 +489,7 @@ class Kernel:
                     "compiler_contract_version": COMPILER_CONTRACT_VERSION,
                     "pipeline_version": PIPELINE_VERSION,
                     "frontend": frontend.semantic_inputs,
-                    "target": options.target,
-                    "target_options": dict(options.options),
+                    "target": options.spec,
                 }
             ).encode()
         ).hexdigest()

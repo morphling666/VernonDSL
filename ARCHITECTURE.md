@@ -524,7 +524,7 @@ Cook 的具体步骤：
 2. 从 AST 提取 PipelineAsset 和 feature declaration；
 3. 验证 stage topology、target compatibility 和 variant canonical form；
 4. 为每个 variant/entry 生成 specialized MLIR；
-5. 按 module、entry、MLIR digest、target/options 缓存重复 stage compilation；
+5. 按 module、entry、MLIR digest、canonical target spec 缓存重复 stage compilation；
 6. 将 compiler reflection 归一化为 CompiledStage；
 7. 跨 stage 合并参数，分配所有 variant 共用的 stable slots；
 8. 验证 vertex/fragment interface 和 fragment outputs；
@@ -542,7 +542,7 @@ feature 被该 target 支持。Metal 当前没有 Vernon Runtime。
 Cooked output 包含：
 
 - 当前 `PIPELINE_VERSION`；
-- pipeline id、target 和 normalized target options；
+- pipeline id 和按 backend 标记的 canonical `target.kind` / `target.options`；
 - feature universe 和显式 variant keys；
 - 每个 variant 的 stage map、parameter slots、internal parameters 和 outputs；
 - 去重后的 stage reflection；

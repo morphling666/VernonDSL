@@ -32,15 +32,16 @@ TEST(CompiledProgramOwnership, OutlivesCompilerContext) {
 
     VernonCompileOptions options{};
     options.struct_size = sizeof(options);
+    options.target = VERNON_TARGET_CPU;
     constexpr std::string_view cpu = "generic";
-    options.cpu_name = {cpu.data(), cpu.size()};
+    options.as.cpu.processor = {cpu.data(), cpu.size()};
     VernonCompileResult *program =
-        vernonCompilerCompileMlirWithOptions(compiler, module.data(), module.size(), VERNON_TARGET_CPU, &options);
+        vernonCompilerCompileMlirWithOptions(compiler, module.data(), module.size(), &options);
     ASSERT_TRUE(program);
     ASSERT_TRUE(vernonCompileResultGetStatus(program) == VERNON_STATUS_OK);
-    ASSERT_TRUE(vernon::test::contains(vernonCompileResultGetReflection(program), R"json("target":"cpu")json"));
-    ASSERT_TRUE(vernon::test::contains(vernonCompileResultGetReflection(program), R"json("cpu":"generic")json"));
-    ASSERT_TRUE(vernon::test::contains(vernonCompileResultGetReflection(program), R"json("target_triple":)json"));
+    ASSERT_TRUE(vernon::test::contains(vernonCompileResultGetReflection(program), R"json("kind":"cpu")json"));
+    ASSERT_TRUE(vernon::test::contains(vernonCompileResultGetReflection(program), R"json("processor":"generic")json"));
+    ASSERT_TRUE(vernon::test::contains(vernonCompileResultGetReflection(program), R"json("triple":)json"));
 
     VernonCpuEntryPoint entry = vernonCompileResultGetCpuEntry(program, "add_vectors", 11);
     ASSERT_TRUE(entry);

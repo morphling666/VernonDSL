@@ -81,7 +81,10 @@ def _ptx_requirements(stage: Any) -> tuple[tuple[int, int], tuple[int, int], int
 
 
 def _metal_version(stage: Any, name: str) -> tuple[int, int]:
-    value = stage.target.options.get(name)
+    reflected_target = stage.reflection.get("target", {})
+    output = reflected_target.get("output", {}) if isinstance(reflected_target, dict) else {}
+    output_name = "version" if name == "msl_version" else name
+    value = output.get(output_name) if isinstance(output, dict) else None
     if (
         not isinstance(value, (list, tuple))
         or len(value) != 2
@@ -133,7 +136,7 @@ def runtime_requirements(target: str, stages: Iterable[Any]) -> dict[str, Any] |
 
                 raise PipelineCompileError("DirectX runtime artifact is not a DXIL container")
         shader_model = _single(
-            (stage.target.options.get("hlsl_shader_model", 60) for stage in stage_values), "HLSL Shader Models"
+            (stage.target.options.get("shader_model", 60) for stage in stage_values), "HLSL Shader Models"
         )
         if not isinstance(shader_model, int) or shader_model < 60:
             from .types import PipelineCompileError
@@ -151,9 +154,7 @@ def runtime_requirements(target: str, stages: Iterable[Any]) -> dict[str, Any] |
         if workgroups:
             result["compute_workgroup_size"] = [max(value[index] for value in workgroups) for index in range(3)]
     elif target == "metal":
-        platform = _single(
-            (stage.target.options.get("apple_platform") for stage in stage_values), "Apple Metal platforms"
-        )
+        platform = _single((stage.target.options.get("platform") for stage in stage_values), "Apple Metal platforms")
         if platform not in {"macos", "ios"}:
             from .types import PipelineCompileError
 
