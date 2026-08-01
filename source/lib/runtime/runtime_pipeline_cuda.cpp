@@ -3,8 +3,8 @@
 #include "compute_launch_planner.h"
 
 #if defined(VERNON_HAS_CUDA_RUNTIME)
+#include "VernonRuntimeRHIAdapter.h"
 #include "backend_cuda.h"
-#include "rhi_adapter/adapter_internal.h"
 
 #include <nlohmann/json.hpp>
 

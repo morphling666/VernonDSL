@@ -18,7 +18,9 @@ artifacts, and backend coverage may change before beta.
 
 - Windows is the only CI platform and the only platform with prebuilt wheels.
 - Wheels target supported CPython 3.11 through 3.14 versions.
-- Metal produces source artifacts but has no Vernon runtime.
+- macOS source builds and CI provide an experimental Metal compute and
+  offscreen graphics Runtime. It consumes cooked MSL bundles on Apple, but is
+  not a stable wheel or GA capability.
 - Graphics rendering is offscreen with host readback; VernonRuntime does not
   provide swapchain or window presentation.
 - GPU tests and showcases may skip when the required hardware, loader, context,

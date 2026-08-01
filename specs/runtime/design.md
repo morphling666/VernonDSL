@@ -397,14 +397,19 @@ normalization. CUDA's LLVM math pass is never used: Vulkan retains standard
 math operations for SPIR-V lowering, and Metal source is cross-compiled from
 the same SPIR-V module.
 
-Metal MSL remains a cook-only compiler product. DirectX cooking emits
-Shader Model 6 DXIL containers and `VernonRuntime` exposes a Windows-only
-D3D12 backend. The backend owns its device, direct queue, command allocator,
-fence, buffers, textures, samplers, descriptor heaps, and offscreen render
-targets. Deployments load pre-cooked DXIL and do not load DXC. Synchronous
-submission keeps transient upload/readback and descriptor storage alive until
-the fence completes. Tests select WARP through an internal hook; normal device
-creation skips software adapters.
+On Apple platforms, cooked MSL bundles are consumed by the Metal Runtime.
+macOS source builds and CI expose this as an experimental compute and offscreen
+graphics backend; it is not a stable wheel or GA capability. The Runtime
+compiles the cooked MSL for the selected device, prepares reflection-driven
+resource layouts and pipeline state, and executes through VernonRHI.
+
+DirectX cooking emits Shader Model 6 DXIL containers and `VernonRuntime`
+exposes a Windows-only D3D12 backend. The backend owns its device, direct queue,
+command allocator, fence, buffers, textures, samplers, descriptor heaps, and
+offscreen render targets. Deployments load pre-cooked DXIL and do not load DXC.
+Synchronous submission keeps transient upload/readback and descriptor storage
+alive until the fence completes. Tests select WARP through an internal hook;
+normal device creation skips software adapters.
 
 ### Pipeline runtime requirements
 
@@ -415,7 +420,8 @@ SPIR-V version plus Vulkan 1.1 and compute workgroup limits, or PTX version,
 address size, and minimum compute capability. Required reflection features are
 stored once in sorted order. DirectX additionally records D3D12, minimum
 feature level, Shader Model, root-signature version, and compute workgroup
-limits. Metal omits this field because it has no Runtime backend.
+limits. Metal records the Apple platform, MSL version, minimum OS version, and
+required features for early Runtime validation.
 
 `target_options` records how compilation was requested; it is not a runtime
 capability contract. `runtime_requirements` records the minimum capabilities

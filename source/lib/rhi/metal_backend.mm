@@ -43,6 +43,22 @@ bool runCopy(DeviceState &device, id<MTLBuffer> source, NSUInteger sourceOffset,
     return false;
 }
 
+bool supportsArgumentBufferEncoding(id<MTLDevice> device) {
+    @autoreleasepool {
+        @try {
+            MTLArgumentDescriptor *argument = [MTLArgumentDescriptor argumentDescriptor];
+            argument.dataType = MTLDataTypePointer;
+            argument.index = 0;
+            argument.arrayLength = 1;
+            argument.access = MTLBindingAccessReadOnly;
+            id<MTLArgumentEncoder> encoder = [device newArgumentEncoderWithArguments:@[ argument ]];
+            return encoder && encoder.encodedLength != 0;
+        } @catch (NSException *) {
+            return false;
+        }
+    }
+}
+
 size_t alignedTextureRowSize(size_t size) { return (size + 255u) & ~size_t{255u}; }
 
 } // namespace
@@ -147,6 +163,7 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
         operatingSystemVersion[0] = static_cast<uint32_t>(version.majorVersion);
         operatingSystemVersion[1] = static_cast<uint32_t>(version.minorVersion);
         argumentBuffersTier = static_cast<uint32_t>(device.argumentBuffersSupport);
+        argumentBufferEncodingSupported = supportsArgumentBufferEncoding(device);
         return true;
     }
     error = "Metal default device or command queue creation failed";
@@ -161,6 +178,7 @@ void DeviceState::shutdown() {
     std::fill(std::begin(maxComputeWorkGroupSize), std::end(maxComputeWorkGroupSize), 0);
     std::fill(std::begin(operatingSystemVersion), std::end(operatingSystemVersion), 0);
     argumentBuffersTier = 0;
+    argumentBufferEncodingSupported = false;
 }
 
 bool DeviceState::synchronize(std::string &error) {

@@ -778,6 +778,7 @@ void expectMatrixUpload(VernonRuntimeBackend backend, const char *target, uint16
 
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, renderTarget.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
+    EXPECT_EQ(vernon::runtime::getRhiAdapterLivePreparedPipelineCount(gl), 0u);
     vernonRuntimePipelineBundleDestroy(bundle);
     ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
 }

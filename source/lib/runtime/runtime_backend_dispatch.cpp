@@ -1,6 +1,16 @@
 #include "runtime_dispatch.h"
 
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+#include "../rhi/cuda_backend.h"
+#endif
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+#include "../rhi/directx12_backend.h"
+#endif
+#include "../rhi/opengl_backend.h"
 #include "../rhi/rhi_internal.h"
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+#include "../rhi/vulkan_backend.h"
+#endif
 #include "backend_cpu.h"
 #include "backend_opengl.h"
 #include "rhi_adapter/adapter_internal.h"
@@ -105,12 +115,13 @@ bool initializeBackendForRhiDevice(VernonRuntimeContext &context, VernonRhiDevic
     case VERNON_RUNTIME_METAL: {
         auto *state = new MetalContextState();
         state->adapter = adapter;
-        const rhi::metal::DeviceCapabilities capabilities = metalRhiAdapterDeviceCapabilities(*adapter);
+        const MetalRuntimeDeviceCapabilities capabilities = metalRhiAdapterDeviceCapabilities(*adapter);
         state->maxComputeInvocations = capabilities.maxComputeInvocations;
         std::copy_n(capabilities.maxComputeWorkGroupSize, 3, state->maxComputeWorkGroupSize);
         state->operatingSystemVersion = {capabilities.operatingSystemVersion[0],
                                          capabilities.operatingSystemVersion[1]};
         state->argumentBuffersTier = capabilities.argumentBuffersTier;
+        state->argumentBufferEncodingSupported = capabilities.argumentBufferEncodingSupported;
         installRuntimeBackendState(context, state);
         break;
     }

@@ -330,7 +330,10 @@ artifact generation pipeline is registered. An IR-only prototype must return
 `VERNON_STATUS_UNSUPPORTED_TARGET`. Source artifacts are valid terminal
 compiler products: Metal availability means MSL generation works. DirectX
 availability means SPIRV-Cross HLSL generation and pinned DXC compilation both
-work, producing a validated DXIL container.
+work, producing a validated DXIL container. Compiler target availability is
+distinct from Runtime stability: cooked MSL is consumed by the experimental
+Metal compute and offscreen graphics Runtime in macOS source builds and CI, but
+Metal is not a stable wheel or GA capability.
 
 ## CPU resource ABI
 
@@ -630,17 +633,20 @@ content-addressed external artifacts. It compiles in process through
 `vernon_dsl._native`; there is no compiler-executable argument or compatibility
 manifest. For runtime-backed targets, Runtime validates manifest structure,
 content hashes, artifact paths, sizes, digests, reflection, and exact feature
-keys. Metal MSL manifests remain cook-only. DirectX DXIL manifests use the
-Windows D3D12 runtime backend.
+keys. Metal MSL manifests are consumed by the Metal Runtime on Apple; that path
+is experimental in macOS source builds and CI rather than a stable wheel or GA
+capability. DirectX DXIL manifests use the Windows D3D12 runtime backend.
 
-Runtime-backed PipelineAssets also carry optional, hash-covered
-`runtime_requirements`. The cooker derives these from the emitted object,
-GLSL, SPIR-V, PTX, or DXIL artifact and aggregates sorted reflection features.
+Runtime-backed PipelineAssets also carry hash-covered `runtime_requirements`.
+The cooker derives these from the emitted object,
+GLSL, SPIR-V, PTX, MSL, or DXIL artifact and aggregates sorted reflection
+features.
 Requirements do not participate in stage artifact identity, so content
 addressing and cross-variant artifact deduplication remain stable.
 `target_options` describe compilation inputs; `runtime_requirements` describe
-the resulting artifact's minimum execution environment. Omitting requirements
-is reserved for the cook-only Metal target.
+the resulting artifact's minimum execution environment. Metal requirements
+record the Apple platform, MSL version, minimum OS version, and required
+features.
 
 ## Language representation boundary
 

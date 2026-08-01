@@ -94,7 +94,12 @@ Runtime availability depends on installed drivers and hardware:
 - Vulkan: compute and offscreen graphics;
 - DirectX 12: compute and offscreen graphics on Windows;
 - OpenGL: compute and graphics through a Python-owned or external context;
-- Metal: source artifact generation only; no Vernon runtime.
+- Metal: experimental compute and offscreen graphics Runtime in macOS source
+  builds and CI.
+
+Cooked MSL bundles are consumed by the Runtime on Apple. Metal Runtime support
+is not a stable wheel or GA capability; the published release remains
+Windows-first.
 
 Vulkan is discovered when the runtime creates a device. Vernon tries
 `VERNON_VULKAN_LOADER`, a loader under `VULKAN_SDK`, the platform loader name,
@@ -144,9 +149,10 @@ vernon-cook-pipeline python/tests/pipeline_asset_fixture.py:scale_asset `
 The output contains a versioned `*.pipeline.json` manifest and
 content-addressed files under `artifacts/`. Depending on the target, artifacts
 are SPIR-V, GLSL/ESSL, DXIL, PTX, Metal source, LLVM IR, or relocatable CPU
-objects. Metal bundles are compiler outputs only. Missing variants and
-unsupported target combinations fail explicitly rather than silently falling
-back.
+objects. Cooked Metal bundles contain MSL consumed by the experimental Runtime
+on Apple. This source-build and CI capability is not a stable wheel or GA
+contract. Missing variants and unsupported target combinations fail explicitly
+rather than silently falling back.
 
 When working from a source checkout where `tool.uv.package = false`, invoke the
 cooker as a module:

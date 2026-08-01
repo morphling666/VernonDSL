@@ -1,12 +1,17 @@
+#include "../../rhi/rhi_internal.h"
 #include "../vertex_attribute_capabilities.h"
 #include "adapter_common.h"
 
 #if defined(VERNON_HAS_VULKAN_RHI)
 
+#include "../../rhi/vulkan_backend.h"
+
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <type_traits>
@@ -15,6 +20,44 @@
 
 namespace vernon::runtime::rhi_adapter {
 namespace {
+
+struct VulkanAdapterState {
+    rhi::vulkan::DeviceState *device{};
+};
+
+VulkanAdapterState &vulkanState(VernonRuntimeRhiAdapter &adapter) {
+    assert(adapter.rhiBackend == VERNON_RHI_BACKEND_VULKAN);
+    assert(adapter.backend.state);
+    return *static_cast<VulkanAdapterState *>(adapter.backend.state);
+}
+
+const VulkanAdapterState &vulkanState(const VernonRuntimeRhiAdapter &adapter) {
+    assert(adapter.rhiBackend == VERNON_RHI_BACKEND_VULKAN);
+    assert(adapter.backend.state);
+    return *static_cast<const VulkanAdapterState *>(adapter.backend.state);
+}
+
+rhi::vulkan::DeviceState &vulkanDevice(VernonRuntimeRhiAdapter &adapter) { return *vulkanState(adapter).device; }
+const rhi::vulkan::DeviceState &vulkanDevice(const VernonRuntimeRhiAdapter &adapter) {
+    return *vulkanState(adapter).device;
+}
+
+void destroyBackend(void *state) noexcept { delete static_cast<VulkanAdapterState *>(state); }
+VernonStatus synchronizeBackend(void *state, std::string &error) noexcept {
+    try {
+        return static_cast<VulkanAdapterState *>(state)->device->synchronize(error) ? VERNON_STATUS_OK
+                                                                                    : VERNON_STATUS_INTERNAL_ERROR;
+    } catch (...) {
+        setBackendError(error, "Vulkan synchronization threw an exception");
+        return VERNON_STATUS_INTERNAL_ERROR;
+    }
+}
+uint64_t resourceIdentity(const void *state) noexcept {
+    return reinterpret_cast<uintptr_t>(static_cast<const VulkanAdapterState *>(state)->device);
+}
+void invalidateBackend(void *) noexcept {}
+
+const RhiAdapterBackendOps backendOps{destroyBackend, synchronizeBackend, resourceIdentity, invalidateBackend};
 
 template <typename Handle> Handle nativeHandle(uint64_t value) {
     if constexpr (std::is_pointer_v<Handle>)
@@ -295,8 +338,8 @@ uint32_t getCapabilities(void *) {
 
 VernonRuntimeProviderDeviceIdentity getDeviceIdentity(void *data) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return {0x56554c4b414eu, reinterpret_cast<uintptr_t>(adapter.vulkanDevice->physicalDevice),
-            adapter.vulkanDevice->apiVersion};
+    const auto &device = vulkanDevice(adapter);
+    return {0x56554c4b414eu, reinterpret_cast<uintptr_t>(device.physicalDevice), device.apiVersion};
 }
 
 VernonStatus prepareShader(void *data, const VernonRuntimeProviderShaderDescriptor *descriptor,
@@ -310,7 +353,7 @@ VernonStatus prepareShader(void *data, const VernonRuntimeProviderShaderDescript
     auto shader = std::unique_ptr<PreparedShader>(new (std::nothrow) PreparedShader());
     if (!shader)
         return fail(adapter, "Vulkan shader preparation ran out of memory", VERNON_STATUS_INTERNAL_ERROR);
-    shader->device = adapter.vulkanDevice;
+    shader->device = &vulkanDevice(adapter);
     shader->stage = descriptor->stage;
     shader->entry.assign(descriptor->entry.data, descriptor->entry.size);
     shader->words.assign(static_cast<const uint32_t *>(descriptor->data),
@@ -336,7 +379,7 @@ VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayout
     auto layout = std::unique_ptr<PreparedLayout>(new (std::nothrow) PreparedLayout());
     if (!layout)
         return fail(adapter, "Vulkan layout preparation ran out of memory", VERNON_STATUS_INTERNAL_ERROR);
-    layout->device = adapter.vulkanDevice;
+    layout->device = &vulkanDevice(adapter);
     std::vector<VkDescriptorSetLayoutBinding> nativeBindings;
     try {
         layout->entries.reserve(descriptor->binding_count);
@@ -470,7 +513,8 @@ VernonStatus preparePipelineImpl(void *data, const VernonRuntimeProviderPipeline
     if (!pipeline)
         return fail(adapter, "Vulkan pipeline preparation ran out of memory", VERNON_STATUS_INTERNAL_ERROR);
     pipeline->adapter = &adapter;
-    pipeline->device = adapter.vulkanDevice;
+    adapter.livePreparedPipelines.fetch_add(1, std::memory_order_relaxed);
+    pipeline->device = &vulkanDevice(adapter);
     pipeline->layout = layout;
     pipeline->graphics = descriptor->kind == VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE;
     pipeline->specializedShaderModules.reserve(2);
@@ -1084,7 +1128,7 @@ VernonStatus createBindings(void *data, const VernonRuntimeProviderBindingSetDes
     auto bindings = std::unique_ptr<PreparedBindingSet>(new (std::nothrow) PreparedBindingSet());
     if (!bindings)
         return fail(adapter, "Vulkan binding preparation ran out of memory", VERNON_STATUS_INTERNAL_ERROR);
-    bindings->device = adapter.vulkanDevice;
+    bindings->device = &vulkanDevice(adapter);
     bindings->layout = layout;
     bindings->slots.reserve(layout->entries.size());
     bindings->slotIndices.reserve(layout->entries.size());
@@ -1531,6 +1575,8 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     driver.cmdSetViewport(command, 0, 1, &viewport);
     driver.cmdSetScissor(command, 0, 1, &scissor);
     driver.cmdSetStencilReference(command, VK_STENCIL_FACE_FRONT_AND_BACK, descriptor->stencil_reference);
+    adapter.lastStencilReference.store(descriptor->stencil_reference, std::memory_order_relaxed);
+    adapter.lastDrawIndexed.store(descriptor->index_count != 0, std::memory_order_relaxed);
     if (descriptor->index_count) {
         if (!retainCommandResource(adapter, commandEncoder, descriptor->index_buffer))
             return fail(adapter, "Vulkan draw could not retain its index buffer", VERNON_STATUS_INTERNAL_ERROR);
@@ -1564,6 +1610,8 @@ void destroyLayout(void *, VernonRuntimeProviderObject handle) {
     delete layout;
 }
 PreparedPipeline::~PreparedPipeline() {
+    if (adapter)
+        adapter->livePreparedPipelines.fetch_sub(1, std::memory_order_relaxed);
     if (!device)
         return;
     for (auto &entry : renderingCache) {
@@ -1625,5 +1673,28 @@ void initializeVulkanProvider(VernonRuntimeRhiAdapter &adapter) {
 }
 
 } // namespace vernon::runtime::rhi_adapter
+
+namespace vernon::runtime {
+
+VernonRuntimeRhiAdapter *createVulkanRhiAdapter(VernonRhiDevice device, VernonRhiBackend backend) {
+    if (backend != VERNON_RHI_BACKEND_VULKAN)
+        return nullptr;
+    auto *deviceState = static_cast<rhi::vulkan::DeviceState *>(rhi::deviceState(device, backend));
+    if (!deviceState)
+        return nullptr;
+    auto state = std::unique_ptr<rhi_adapter::VulkanAdapterState>(new (std::nothrow) rhi_adapter::VulkanAdapterState());
+    auto adapter = std::unique_ptr<VernonRuntimeRhiAdapter>(new (std::nothrow) VernonRuntimeRhiAdapter());
+    if (!state || !adapter)
+        return nullptr;
+    state->device = deviceState;
+    adapter->rhiBackend = backend;
+    if (!adapter->backend.adopt(state.get(), &rhi_adapter::backendOps))
+        return nullptr;
+    (void)state.release();
+    rhi_adapter::initializeVulkanProvider(*adapter);
+    return adapter.release();
+}
+
+} // namespace vernon::runtime
 
 #endif

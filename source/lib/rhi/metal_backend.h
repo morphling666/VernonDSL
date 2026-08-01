@@ -2,7 +2,6 @@
 #define VERNON_RHI_METAL_BACKEND_H
 
 #include "VernonRHI.h"
-#include "metal_backend_fwd.h"
 
 #import <Metal/Metal.h>
 
@@ -13,6 +12,7 @@
 
 namespace vernon::rhi::metal {
 
+uint32_t pixelFormat(VernonRhiFormat format);
 size_t bytesPerPixel(VernonRhiFormat format);
 bool uploadLayoutMatches(VernonRhiFormat destination, VernonRhiImageDataFormat sourceFormat,
                          VernonRhiImageDataType sourceType);
@@ -97,6 +97,7 @@ struct VERNON_RHI_CAPI DeviceState {
     uint32_t maxComputeWorkGroupSize[3]{};
     uint32_t operatingSystemVersion[2]{};
     uint32_t argumentBuffersTier{};
+    bool argumentBufferEncodingSupported{};
 };
 
 } // namespace vernon::rhi::metal

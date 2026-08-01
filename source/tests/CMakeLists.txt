@@ -127,6 +127,7 @@ if(TARGET VernonRuntime)
         runtime/execution_graph_test.cpp
         runtime/graphics_invocation_planner_test.cpp
         runtime/pipeline_manifest_requirements_test.cpp
+        runtime/rhi_adapter_backend_storage_test.cpp
         runtime/rhi_resource_lifetime_test.cpp
         runtime/runtime_c_api_test.cpp
         runtime/runtime_common_api_test.cpp
@@ -191,6 +192,7 @@ if(TARGET VernonRuntime)
 
     if(VERNON_ENABLE_METAL_RUNTIME)
         target_sources(VernonRuntimeTests PRIVATE runtime/runtime_metal_test.cpp)
+        set_source_files_properties(runtime/runtime_metal_test.cpp PROPERTIES LANGUAGE OBJCXX)
         if(TARGET vernon-dsl-native AND Python_FOUND)
             vernon_add_pipeline_test_bundle(
                 metal-compute-pipeline
@@ -256,7 +258,10 @@ if(TARGET VernonRuntime)
                 vernon-metal-complete-pipeline-example
                 vernon-metal-dynamic-ocean-example
                 vernon-metal-dynamic-terrain-erosion-example
-                PROPERTIES ENVIRONMENT "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python")
+                PROPERTIES ENVIRONMENT
+                           "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python"
+                           SKIP_REGULAR_EXPRESSION
+                           "Metal argument-buffer encoding is unavailable on this device")
         endif()
     endif()
 

@@ -1,8 +1,8 @@
 #include "runtime_pipeline_backend.h"
 
+#include "VernonRuntimeRHIAdapter.h"
 #include "backend_opengl.h"
 #include "compute_launch_planner.h"
-#include "rhi_adapter/adapter_internal.h"
 #include "tensor_bridge.h"
 
 #include <nlohmann/json.hpp>

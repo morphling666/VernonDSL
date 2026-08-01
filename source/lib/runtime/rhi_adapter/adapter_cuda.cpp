@@ -2,8 +2,13 @@
 
 #if defined(VERNON_HAS_CUDA_RHI)
 
+#include "../../rhi/cuda_backend.h"
+#include "../../rhi/rhi_internal.h"
+
 #include <algorithm>
+#include <cassert>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <unordered_map>
@@ -15,6 +20,49 @@ namespace {
 using rhi::cuda::DevicePointer;
 using rhi::cuda::DeviceState;
 using rhi::cuda::PreparedFunction;
+
+struct CudaAdapterState {
+    std::unique_ptr<DeviceState> ownedDevice;
+    DeviceState *device{};
+};
+
+CudaAdapterState &cudaState(VernonRuntimeRhiAdapter &adapter) {
+    assert(adapter.rhiBackend == VERNON_RHI_BACKEND_CUDA);
+    assert(adapter.backend.state);
+    return *static_cast<CudaAdapterState *>(adapter.backend.state);
+}
+
+const CudaAdapterState &cudaState(const VernonRuntimeRhiAdapter &adapter) {
+    assert(adapter.rhiBackend == VERNON_RHI_BACKEND_CUDA);
+    assert(adapter.backend.state);
+    return *static_cast<const CudaAdapterState *>(adapter.backend.state);
+}
+
+DeviceState &cudaDevice(VernonRuntimeRhiAdapter &adapter) { return *cudaState(adapter).device; }
+const DeviceState &cudaDevice(const VernonRuntimeRhiAdapter &adapter) { return *cudaState(adapter).device; }
+
+void destroyBackend(void *state) noexcept { delete static_cast<CudaAdapterState *>(state); }
+
+VernonStatus synchronizeBackend(void *state, std::string &error) noexcept {
+    try {
+        const auto result = static_cast<CudaAdapterState *>(state)->device->synchronize();
+        if (result == rhi::cuda::kSuccess)
+            return VERNON_STATUS_OK;
+        error = rhi::cuda::describeResult(result, "cuStreamSynchronize");
+        return VERNON_STATUS_INTERNAL_ERROR;
+    } catch (...) {
+        setBackendError(error, "CUDA synchronization threw an exception");
+        return VERNON_STATUS_INTERNAL_ERROR;
+    }
+}
+
+uint64_t resourceIdentity(const void *state) noexcept {
+    return reinterpret_cast<uintptr_t>(static_cast<const CudaAdapterState *>(state)->device);
+}
+
+void invalidateBackend(void *) noexcept {}
+
+const RhiAdapterBackendOps backendOps{destroyBackend, synchronizeBackend, resourceIdentity, invalidateBackend};
 
 struct PreparedShader {
     std::vector<uint8_t> artifact;
@@ -88,10 +136,9 @@ uint32_t getCapabilities(void *) { return VERNON_RUNTIME_PROVIDER_COMPUTE; }
 
 VernonRuntimeProviderDeviceIdentity getDeviceIdentity(void *data) {
     const auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return {0x43554441u,
-            static_cast<uint64_t>(adapter.device->computeCapabilityMajor) << 32 |
-                adapter.device->computeCapabilityMinor,
-            adapter.device->driverVersion};
+    const auto &device = cudaDevice(adapter);
+    return {0x43554441u, static_cast<uint64_t>(device.computeCapabilityMajor) << 32 | device.computeCapabilityMinor,
+            device.driverVersion};
 }
 
 VernonStatus prepareShader(void *data, const VernonRuntimeProviderShaderDescriptor *descriptor,
@@ -154,13 +201,14 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
     try {
         auto pipeline = std::make_unique<PreparedPipeline>();
         PreparedShader &shader = *fromHandle<PreparedShader>(descriptor->shaders[0]);
-        const VernonStatus status = cudaStatus(adapter,
-                                               pipeline->function.create(*adapter.device, shader.artifact.data(),
-                                                                         shader.artifact.size(), shader.entry.c_str()),
-                                               "CUDA pipeline preparation");
+        auto &device = cudaDevice(adapter);
+        const VernonStatus status = cudaStatus(
+            adapter,
+            pipeline->function.create(device, shader.artifact.data(), shader.artifact.size(), shader.entry.c_str()),
+            "CUDA pipeline preparation");
         if (status != VERNON_STATUS_OK)
             return status;
-        pipeline->device = adapter.device;
+        pipeline->device = &device;
         std::copy_n(descriptor->workgroup_size, 3, pipeline->workgroup);
         *output = toHandle(pipeline.release());
         adapter.pipelinePreparations.fetch_add(1, std::memory_order_relaxed);
@@ -385,5 +433,51 @@ void initializeCudaProvider(VernonRuntimeRhiAdapter &adapter) {
 }
 
 } // namespace vernon::runtime::rhi_adapter
+
+namespace vernon::runtime {
+
+namespace {
+
+VernonRuntimeRhiAdapter *createCudaAdapter(std::unique_ptr<rhi_adapter::CudaAdapterState> state) {
+    auto adapter = std::unique_ptr<VernonRuntimeRhiAdapter>(new (std::nothrow) VernonRuntimeRhiAdapter());
+    if (!adapter || !state || !state->device)
+        return nullptr;
+    adapter->rhiBackend = VERNON_RHI_BACKEND_CUDA;
+    if (!adapter->backend.adopt(state.get(), &rhi_adapter::backendOps))
+        return nullptr;
+    (void)state.release();
+    rhi_adapter::initializeCudaProvider(*adapter);
+    return adapter.release();
+}
+
+} // namespace
+
+VernonRuntimeRhiAdapter *createOwnedCudaRhiAdapter(uint32_t deviceIndex) {
+    auto state = std::unique_ptr<rhi_adapter::CudaAdapterState>(new (std::nothrow) rhi_adapter::CudaAdapterState());
+    if (!state)
+        return nullptr;
+    state->ownedDevice = std::unique_ptr<rhi::cuda::DeviceState>(new (std::nothrow) rhi::cuda::DeviceState());
+    if (!state->ownedDevice)
+        return nullptr;
+    state->device = state->ownedDevice.get();
+    if (state->device->initialize(deviceIndex) != rhi::cuda::kSuccess)
+        return nullptr;
+    return createCudaAdapter(std::move(state));
+}
+
+VernonRuntimeRhiAdapter *createCudaRhiAdapter(VernonRhiDevice device, VernonRhiBackend backend) {
+    if (backend != VERNON_RHI_BACKEND_CUDA)
+        return nullptr;
+    auto *deviceState = static_cast<rhi::cuda::DeviceState *>(rhi::deviceState(device, backend));
+    if (!deviceState)
+        return nullptr;
+    auto state = std::unique_ptr<rhi_adapter::CudaAdapterState>(new (std::nothrow) rhi_adapter::CudaAdapterState());
+    if (!state)
+        return nullptr;
+    state->device = deviceState;
+    return createCudaAdapter(std::move(state));
+}
+
+} // namespace vernon::runtime
 
 #endif

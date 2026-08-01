@@ -554,7 +554,7 @@ VernonRhiStatus createImageView(VernonRhiDevice handle, const VernonRhiImageView
                                 VernonRhiImageView *output) {
     if (!lookupVulkanDevice(handle) || !descriptor || descriptor->struct_size < sizeof(*descriptor) || !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    *output = {VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    *output = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     return VERNON_RHI_STATUS_UNSUPPORTED;
 }
 

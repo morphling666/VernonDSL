@@ -1,11 +1,15 @@
+#include "../../rhi/rhi_internal.h"
 #include "adapter_common.h"
+#include "adapter_internal.h"
 
 #if defined(VERNON_HAS_METAL_RHI)
 
 #include "../../rhi/metal_backend.h"
+#include "../metal_runtime_capabilities.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -19,9 +23,49 @@
 namespace vernon::runtime::rhi_adapter {
 namespace {
 
-rhi::metal::DeviceState &metalDevice(VernonRuntimeRhiAdapter &adapter) { return *adapter.metalDevice; }
+struct MetalAdapterState {
+    rhi::metal::DeviceState *device{};
+};
 
-const rhi::metal::DeviceState &metalDevice(const VernonRuntimeRhiAdapter &adapter) { return *adapter.metalDevice; }
+MetalAdapterState &metalState(VernonRuntimeRhiAdapter &adapter) {
+    assert(adapter.rhiBackend == VERNON_RHI_BACKEND_METAL);
+    assert(adapter.backend.state);
+    return *static_cast<MetalAdapterState *>(adapter.backend.state);
+}
+
+const MetalAdapterState &metalState(const VernonRuntimeRhiAdapter &adapter) {
+    assert(adapter.rhiBackend == VERNON_RHI_BACKEND_METAL);
+    assert(adapter.backend.state);
+    return *static_cast<const MetalAdapterState *>(adapter.backend.state);
+}
+
+rhi::metal::DeviceState &metalDevice(VernonRuntimeRhiAdapter &adapter) { return *metalState(adapter).device; }
+const rhi::metal::DeviceState &metalDevice(const VernonRuntimeRhiAdapter &adapter) {
+    return *metalState(adapter).device;
+}
+
+void destroyBackend(void *state) noexcept { delete static_cast<MetalAdapterState *>(state); }
+VernonStatus synchronizeBackend(void *state, std::string &error) noexcept {
+    @try {
+        try {
+            return static_cast<MetalAdapterState *>(state)->device->synchronize(error)
+                       ? VERNON_STATUS_OK
+                       : VERNON_STATUS_INTERNAL_ERROR;
+        } catch (...) {
+            setBackendError(error, "Metal synchronization threw a C++ exception");
+            return VERNON_STATUS_INTERNAL_ERROR;
+        }
+    } @catch (NSException *) {
+        setBackendError(error, "Metal synchronization raised an Objective-C exception");
+        return VERNON_STATUS_INTERNAL_ERROR;
+    }
+}
+uint64_t resourceIdentity(const void *state) noexcept {
+    return reinterpret_cast<uintptr_t>(static_cast<const MetalAdapterState *>(state)->device);
+}
+void invalidateBackend(void *) noexcept {}
+
+const RhiAdapterBackendOps backendOps{destroyBackend, synchronizeBackend, resourceIdentity, invalidateBackend};
 
 struct PreparedShader {
     id<MTLLibrary> library;
@@ -46,6 +90,7 @@ struct PreparedLayout {
 
 struct PreparedPipeline {
     std::atomic<uint32_t> references{1};
+    VernonRuntimeRhiAdapter *owner{};
     id<MTLComputePipelineState> compute;
     id<MTLRenderPipelineState> render;
     id<MTLDepthStencilState> depthStencil;
@@ -62,6 +107,11 @@ struct PreparedPipeline {
     float depthBiasSlope{};
     bool depthBiasEnabled{};
     bool graphics{};
+
+    ~PreparedPipeline() {
+        if (owner)
+            owner->livePreparedPipelines.fetch_sub(1, std::memory_order_relaxed);
+    }
 };
 
 struct PreparedBindingSet {
@@ -264,6 +314,10 @@ VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayout
                 writableTexture |= entry.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE && (entry.access & 2u);
             }
         }
+        if ((argumentBuffers || argumentTextures || argumentSamplers) &&
+            !metalDevice(adapter).argumentBufferEncodingSupported)
+            return fail(adapter, "Metal argument-buffer encoding is unavailable on this device",
+                        VERNON_STATUS_UNSUPPORTED_TARGET);
         if (metalDevice(adapter).device.argumentBuffersSupport < MTLArgumentBuffersTier2 &&
             (argumentBuffers > 31 || argumentTextures > 31 || argumentSamplers > 16 || writableTexture))
             return fail(adapter, "Metal layout requires Argument Buffers Tier 2");
@@ -362,6 +416,19 @@ bool blendOperation(uint32_t operation, MTLBlendOperation &output) {
     return true;
 }
 
+MTLColorWriteMask colorWriteMask(uint32_t mask) {
+    MTLColorWriteMask result = MTLColorWriteMaskNone;
+    if (mask & VERNON_RHI_COLOR_WRITE_RED)
+        result |= MTLColorWriteMaskRed;
+    if (mask & VERNON_RHI_COLOR_WRITE_GREEN)
+        result |= MTLColorWriteMaskGreen;
+    if (mask & VERNON_RHI_COLOR_WRITE_BLUE)
+        result |= MTLColorWriteMaskBlue;
+    if (mask & VERNON_RHI_COLOR_WRITE_ALPHA)
+        result |= MTLColorWriteMaskAlpha;
+    return result;
+}
+
 bool configureStencilFace(const VernonRuntimeProviderStencilFaceState &source,
                           MTLStencilDescriptor *destination) {
     MTLCompareFunction compare{};
@@ -419,6 +486,8 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
         auto pipeline = std::unique_ptr<PreparedPipeline>(new (std::nothrow) PreparedPipeline());
         if (!pipeline)
             return fail(adapter, "Metal pipeline preparation ran out of memory", VERNON_STATUS_INTERNAL_ERROR);
+        pipeline->owner = &adapter;
+        adapter.livePreparedPipelines.fetch_add(1, std::memory_order_relaxed);
         pipeline->pushConstantSize = layout->pushConstantSize;
         pipeline->layout = layout;
         NSError *error = nil;
@@ -529,7 +598,7 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
                 attachment.sourceAlphaBlendFactor = sourceAlpha;
                 attachment.destinationAlphaBlendFactor = destinationAlpha;
                 attachment.alphaBlendOperation = alphaOperation;
-                attachment.writeMask = static_cast<MTLColorWriteMask>(blend.write_mask);
+                attachment.writeMask = colorWriteMask(blend.write_mask);
             }
             nativeDescriptor.depthAttachmentPixelFormat = static_cast<MTLPixelFormat>(descriptor->depth_stencil_format);
             if (descriptor->depth_stencil_format == MTLPixelFormatDepth32Float_Stencil8)
@@ -1083,6 +1152,7 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     [encoder setCullMode:pipeline->cullMode];
     [encoder setFrontFacingWinding:pipeline->frontFace];
     [encoder setStencilReferenceValue:descriptor->stencil_reference];
+    adapter.lastStencilReference.store(descriptor->stencil_reference, std::memory_order_relaxed);
     if (pipeline->depthBiasEnabled)
         [encoder setDepthBias:pipeline->depthBiasConstant slopeScale:pipeline->depthBiasSlope clamp:0.0f];
     std::unique_lock<std::mutex> bindingsGuard;
@@ -1164,6 +1234,7 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
                           0.0, 1.0}];
     [encoder setScissorRect:{descriptor->scissor[0], descriptor->scissor[1], descriptor->scissor[2],
                              descriptor->scissor[3]}];
+    adapter.lastDrawIndexed.store(descriptor->index_count != 0, std::memory_order_relaxed);
     if (descriptor->index_count) {
         if (descriptor->index_type != 0 || !retainCommandResource(adapter, commandEncoder, descriptor->index_buffer))
             return fail(adapter, "Metal draw contains an unsupported index buffer");
@@ -1212,10 +1283,6 @@ void destroyPipeline(void *, VernonRuntimeProviderObject handle) {
 
 } // namespace
 
-VernonStatus synchronizeMetalProvider(VernonRuntimeRhiAdapter &adapter) {
-    return metalDevice(adapter).synchronize(adapter.error) ? VERNON_STATUS_OK : VERNON_STATUS_INTERNAL_ERROR;
-}
-
 void initializeMetalProvider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.struct_size = sizeof(adapter.provider);
     adapter.provider.abi_version = VERNON_PIPELINE_VERSION;
@@ -1239,15 +1306,35 @@ void initializeMetalProvider(VernonRuntimeRhiAdapter &adapter) {
 
 } // namespace vernon::runtime::rhi_adapter
 
-vernon::rhi::metal::DeviceCapabilities
+vernon::runtime::MetalRuntimeDeviceCapabilities
 vernon::runtime::metalRhiAdapterDeviceCapabilities(const VernonRuntimeRhiAdapter &adapter) {
-    const auto &device = *adapter.metalDevice;
-    rhi::metal::DeviceCapabilities capabilities;
+    const auto &device = rhi_adapter::metalDevice(adapter);
+    MetalRuntimeDeviceCapabilities capabilities;
     capabilities.maxComputeInvocations = device.maxComputeInvocations;
     std::copy_n(device.maxComputeWorkGroupSize, 3, capabilities.maxComputeWorkGroupSize);
     std::copy_n(device.operatingSystemVersion, 2, capabilities.operatingSystemVersion);
     capabilities.argumentBuffersTier = device.argumentBuffersTier;
+    capabilities.argumentBufferEncodingSupported = device.argumentBufferEncodingSupported;
     return capabilities;
+}
+
+VernonRuntimeRhiAdapter *vernon::runtime::createMetalRhiAdapter(VernonRhiDevice device, VernonRhiBackend backend) {
+    if (backend != VERNON_RHI_BACKEND_METAL)
+        return nullptr;
+    auto *deviceState = static_cast<rhi::metal::DeviceState *>(rhi::deviceState(device, backend));
+    if (!deviceState)
+        return nullptr;
+    auto state = std::unique_ptr<rhi_adapter::MetalAdapterState>(new (std::nothrow) rhi_adapter::MetalAdapterState());
+    auto adapter = std::unique_ptr<VernonRuntimeRhiAdapter>(new (std::nothrow) VernonRuntimeRhiAdapter());
+    if (!state || !adapter)
+        return nullptr;
+    state->device = deviceState;
+    adapter->rhiBackend = backend;
+    if (!adapter->backend.adopt(state.get(), &rhi_adapter::backendOps))
+        return nullptr;
+    (void)state.release();
+    rhi_adapter::initializeMetalProvider(*adapter);
+    return adapter.release();
 }
 
 #endif

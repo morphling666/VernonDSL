@@ -15,9 +15,16 @@
 #include "backend_vulkan.h"
 #endif
 
+#if defined(VERNON_HAS_METAL_RUNTIME)
+#include "backend_metal.h"
+#endif
+
 #if defined(VERNON_RUNTIME_TESTING)
 #include "rhi/rhi_test_hooks.h"
 #include "rhi_adapter/adapter_test_hooks.h"
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+#include "rhi_adapter/adapter_directx12_test_hooks.h"
+#endif
 #include "runtime_test_hooks.h"
 #endif
 
@@ -115,12 +122,14 @@ VulkanGraphicsCacheStats getVulkanGraphicsCacheStats(const VernonRuntimeContext 
     result.descriptorSetLayoutCreations = state.rhiGraphicsPipeline ? 1 : 0;
     result.pipelineLayoutCreations = state.rhiGraphicsPipeline ? 1 : 0;
     result.graphicsPipelineCreations = state.rhiGraphicsVariant.handle ? 1 : 0;
-    result.bindingSnapshotCreations =
-        getRhiAdapterPreparationStats(*vulkanState(*context).adapter).bindingSnapshotCreations;
+    const RhiAdapterPreparationStats adapterStats = getRhiAdapterPreparationStats(*vulkanState(*context).adapter);
+    result.bindingSnapshotCreations = adapterStats.bindingSnapshotCreations;
     result.commandBufferAllocations = rhiStats.commandBufferAllocations;
     result.descriptorPoolCreations = rhiStats.descriptorPoolCreations;
     result.stagingBufferAllocations = rhiStats.stagingBufferAllocations;
     result.renderPassCreations = state.rhiGraphicsVariant.handle && !rhiStats.dynamicRendering ? 1 : 0;
+    result.lastStencilReference = adapterStats.lastStencilReference;
+    result.lastDrawIndexed = adapterStats.lastDrawIndexed;
     result.dynamicRendering = rhiStats.dynamicRendering;
 #else
     (void)context;
@@ -159,6 +168,47 @@ uint32_t getDirectX12LastStencilReference(const VernonRuntimeContext *context) {
     (void)context;
 #endif
     return 0;
+}
+
+DirectX12DepthStencilStateStats getDirectX12DepthStencilStateStats(const VernonRuntimeContext *context) {
+    DirectX12DepthStencilStateStats result;
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+    if (context && context->backend == VERNON_RUNTIME_DIRECTX12) {
+        const VernonRuntimeRhiAdapter *adapter = runtimeBackendState<DirectX12ContextState>(*context).adapter;
+        if (adapter) {
+            const DirectX12AdapterDepthStencilStats stats = getDirectX12AdapterDepthStencilStats(*adapter);
+            result = {stats.depthEnable,          stats.depthWriteMask,
+                      stats.depthFunction,        stats.stencilEnable,
+                      stats.stencilReadMask,      stats.stencilWriteMask,
+                      stats.frontStencilFunction, stats.frontStencilPassOperation,
+                      stats.backStencilFunction,  stats.backStencilPassOperation};
+        }
+    }
+#else
+    (void)context;
+#endif
+    return result;
+}
+
+size_t getRhiAdapterLivePreparedPipelineCount(const VernonRuntimeContext *context) {
+    if (!context)
+        return 0;
+    const VernonRuntimeRhiAdapter *adapter = nullptr;
+    if (context->backend == VERNON_RUNTIME_OPENGL || context->backend == VERNON_RUNTIME_OPENGL_ES)
+        adapter = runtimeBackendState<OpenGLContextState>(*context).adapter;
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+    else if (context->backend == VERNON_RUNTIME_VULKAN)
+        adapter = runtimeBackendState<VulkanContextState>(*context).adapter;
+#endif
+#if defined(VERNON_HAS_METAL_RUNTIME)
+    else if (context->backend == VERNON_RUNTIME_METAL)
+        adapter = runtimeBackendState<MetalContextState>(*context).adapter;
+#endif
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+    else if (context->backend == VERNON_RUNTIME_DIRECTX12)
+        adapter = runtimeBackendState<DirectX12ContextState>(*context).adapter;
+#endif
+    return adapter ? getRhiAdapterPreparationStats(*adapter).livePreparedPipelines : 0;
 }
 
 size_t getRhiAdapterRecordedCommandCount(const VernonRuntimeContext *context) {

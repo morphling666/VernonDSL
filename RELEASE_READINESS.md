@@ -10,7 +10,9 @@ CI matrix.
 
 - Go: GitHub pre-release and Windows wheels after final CI.
 - No-go: beta or stable release.
-- Do not publish Linux/macOS wheels or claim a Metal runtime.
+- Do not publish Linux/macOS wheels or claim Metal as a stable/GA capability;
+  its compute and offscreen graphics Runtime is experimental in macOS source
+  builds and CI.
 
 `0.1.0` already exists on PyPI, so `0.1.1a1` is the next valid PEP 440 preview
 version. `versions.toml` is the single manually edited version source.
@@ -47,7 +49,9 @@ The alpha contract is published in [`RELEASE_NOTES.md`](RELEASE_NOTES.md):
 
 - Windows is the only CI and prebuilt-wheel platform.
 - Supported wheels target CPython 3.11 through 3.14.
-- Metal produces source artifacts but has no Vernon runtime.
+- Cooked MSL bundles are consumed by the experimental Metal compute and
+  offscreen graphics Runtime on Apple through macOS source builds and CI; this
+  is not a stable wheel or GA capability.
 - Graphics is offscreen with host readback, not swapchain presentation.
 - GPU tests may skip when hardware, loaders, contexts, or drivers are absent.
 - Dynamic multi-rank TensorView layouts require AOT specialization.

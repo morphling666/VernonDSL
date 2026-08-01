@@ -14,7 +14,9 @@ struct RhiAdapterPreparationStats {
     size_t bindingCreations{};
     size_t bindingSnapshotCreations{};
     size_t dispatches{};
+    size_t livePreparedPipelines{};
     uint32_t lastStencilReference{};
+    bool lastDrawIndexed{};
 };
 
 RhiAdapterPreparationStats getRhiAdapterPreparationStats(const VernonRuntimeRhiAdapter &adapter);

@@ -245,6 +245,8 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(firstStats.descriptorPoolCreations, 1u);
     EXPECT_GT(firstStats.stagingBufferAllocations, 0u);
     EXPECT_EQ(firstStats.renderPassCreations, firstStats.dynamicRendering ? 0u : 1u);
+    EXPECT_EQ(firstStats.lastStencilReference, 3u);
+    EXPECT_TRUE(firstStats.lastDrawIndexed);
 
     constexpr uint8_t secondSampledPixel[] = {180, 40, 220, 255};
     upload.data = secondSampledPixel;
@@ -288,6 +290,8 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(warmStats.descriptorPoolCreations, secondStats.descriptorPoolCreations);
     EXPECT_EQ(warmStats.stagingBufferAllocations, secondStats.stagingBufferAllocations);
     EXPECT_EQ(warmStats.renderPassCreations, secondStats.renderPassCreations);
+    EXPECT_EQ(warmStats.lastStencilReference, 9u);
+    EXPECT_TRUE(warmStats.lastDrawIndexed);
 
     std::vector<uint8_t> pixels(32 * 32 * 4);
     ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, firstTarget.handle, pixels.data(), pixels.size()),
@@ -354,6 +358,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     ASSERT_EQ(vernonRhiDeviceDestroyBuffer(context.device, indexBuffer.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyBuffer(context.device, vertices.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
+    EXPECT_EQ(vernon::runtime::getRhiAdapterLivePreparedPipelineCount(runtime), 0u);
     vernonRuntimePipelineBundleDestroy(loaded);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
     vernonRhiDestroyDevice(context.device);

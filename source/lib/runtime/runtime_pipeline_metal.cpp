@@ -78,17 +78,20 @@ bool resolveMetalResourceLocation(const nlohmann::json &reflection, const std::s
     return found;
 }
 
-bool validateMetalArgumentBufferRequirements(const nlohmann::json &reflection, const std::string &entry,
-                                             const char *stage, uint32_t deviceTier, std::string &error) {
+struct MetalArgumentBufferUsage {
+    uint64_t buffers{};
+    uint64_t textures{};
+    uint64_t samplers{};
+    bool writableTexture{};
+};
+
+bool collectMetalArgumentBufferUsage(const nlohmann::json &reflection, const std::string &entry, const char *stage,
+                                     MetalArgumentBufferUsage &usage, std::string &error) {
     const auto slots = reflection.find("metal_resource_slots");
     if (slots == reflection.end() || !slots->is_array()) {
         error = "Metal reflection has no argument-buffer resource sidecar";
         return false;
     }
-    uint64_t buffers = 0;
-    uint64_t textures = 0;
-    uint64_t samplers = 0;
-    bool writableTexture = false;
     for (const auto &slot : *slots) {
         if (!slot.is_object() || slot.value("entry_point", std::string()) != entry ||
             slot.value("stage", std::string()) != stage)
@@ -105,17 +108,26 @@ bool validateMetalArgumentBufferRequirements(const nlohmann::json &reflection, c
         }
         const std::string kind = slot.value("kind", std::string());
         if (kind == "uniform_buffer" || kind == "storage_buffer")
-            buffers += count;
+            usage.buffers += count;
         else if (kind == "sampled_image" || kind == "storage_image") {
-            textures += count;
-            writableTexture |= kind == "storage_image";
+            usage.textures += count;
+            usage.writableTexture |= kind == "storage_image";
         } else if (kind == "sampler")
-            samplers += count;
+            usage.samplers += count;
     }
-    if (deviceTier < 1 && (buffers > 31 || textures > 31 || samplers > 16 || writableTexture)) {
-        error = "Metal pipeline requires Argument Buffers Tier 2 (resources: " + std::to_string(buffers) +
-                " buffers, " + std::to_string(textures) + " textures, " + std::to_string(samplers) + " samplers" +
-                (writableTexture ? ", writable texture" : "") + ")";
+    return true;
+}
+
+bool validateMetalArgumentBufferUsage(const MetalArgumentBufferUsage &usage, uint32_t deviceTier,
+                                      bool encodingSupported, std::string &error) {
+    if ((usage.buffers || usage.textures || usage.samplers) && !encodingSupported) {
+        error = "Metal argument-buffer encoding is unavailable on this device";
+        return false;
+    }
+    if (deviceTier < 1 && (usage.buffers > 31 || usage.textures > 31 || usage.samplers > 16 || usage.writableTexture)) {
+        error = "Metal pipeline requires Argument Buffers Tier 2 (resources: " + std::to_string(usage.buffers) +
+                " buffers, " + std::to_string(usage.textures) + " textures, " + std::to_string(usage.samplers) +
+                " samplers" + (usage.writableTexture ? ", writable texture" : "") + ")";
         return false;
     }
     return true;
@@ -123,6 +135,22 @@ bool validateMetalArgumentBufferRequirements(const nlohmann::json &reflection, c
 
 } // namespace
 #endif
+
+bool validateMetalArgumentBufferLimitsForTesting(uint64_t buffers, uint64_t textures, uint64_t samplers,
+                                                 bool writableTexture, uint32_t deviceTier) {
+#if defined(VERNON_HAS_METAL_RUNTIME)
+    const MetalArgumentBufferUsage usage{buffers, textures, samplers, writableTexture};
+    std::string error;
+    return validateMetalArgumentBufferUsage(usage, deviceTier, true, error);
+#else
+    (void)buffers;
+    (void)textures;
+    (void)samplers;
+    (void)writableTexture;
+    (void)deviceTier;
+    return false;
+#endif
+}
 
 bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
@@ -135,12 +163,14 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
             bundle.context->error = "Metal graphics reflection is invalid";
             return false;
         }
-        if (!validateMetalArgumentBufferRequirements(vertexReflection, vertex.entry, "vertex",
-                                                     metalState(*bundle.context).argumentBuffersTier,
-                                                     bundle.context->error) ||
-            !validateMetalArgumentBufferRequirements(fragmentReflection, fragment.entry, "fragment",
-                                                     metalState(*bundle.context).argumentBuffersTier,
-                                                     bundle.context->error))
+        MetalArgumentBufferUsage argumentBufferUsage;
+        if (!collectMetalArgumentBufferUsage(vertexReflection, vertex.entry, "vertex", argumentBufferUsage,
+                                             bundle.context->error) ||
+            !collectMetalArgumentBufferUsage(fragmentReflection, fragment.entry, "fragment", argumentBufferUsage,
+                                             bundle.context->error) ||
+            !validateMetalArgumentBufferUsage(argumentBufferUsage, metalState(*bundle.context).argumentBuffersTier,
+                                              metalState(*bundle.context).argumentBufferEncodingSupported,
+                                              bundle.context->error))
             return false;
         struct Candidate {
             VernonRuntimeProviderBindingLayoutEntry layout{};
@@ -373,8 +403,11 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
     if (parsed.is_discarded() ||
         !parseReflection(parsed, stage.entry, reflection, VERNON_RUNTIME_METAL, bundle.context->error))
         return false;
-    if (!validateMetalArgumentBufferRequirements(
-            parsed, stage.entry, "compute", metalState(*bundle.context).argumentBuffersTier, bundle.context->error))
+    MetalArgumentBufferUsage argumentBufferUsage;
+    if (!collectMetalArgumentBufferUsage(parsed, stage.entry, "compute", argumentBufferUsage, bundle.context->error) ||
+        !validateMetalArgumentBufferUsage(argumentBufferUsage, metalState(*bundle.context).argumentBuffersTier,
+                                          metalState(*bundle.context).argumentBufferEncodingSupported,
+                                          bundle.context->error))
         return false;
 
     struct Candidate {

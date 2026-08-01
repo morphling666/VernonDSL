@@ -1,14 +1,20 @@
+#include "../../rhi/rhi_internal.h"
 #include "../runtime_test_hooks.h"
 #include "../vertex_attribute_capabilities.h"
 #include "adapter_common.h"
+#include "adapter_directx12_test_hooks.h"
 
 #if defined(VERNON_HAS_DIRECTX12_RHI)
 
+#include "../../rhi/directx12_backend.h"
+
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <unordered_map>
@@ -16,6 +22,61 @@
 
 namespace vernon::runtime::rhi_adapter {
 namespace {
+
+struct DirectX12DepthStencilSnapshot {
+    uint32_t depthEnable{};
+    uint32_t depthWriteMask{};
+    uint32_t depthFunction{};
+    uint32_t stencilEnable{};
+    uint32_t stencilReadMask{};
+    uint32_t stencilWriteMask{};
+    uint32_t frontStencilFunction{};
+    uint32_t frontStencilPassOperation{};
+    uint32_t backStencilFunction{};
+    uint32_t backStencilPassOperation{};
+};
+
+struct DirectX12AdapterState {
+    rhi::directx12::DeviceState *device{};
+    DirectX12DepthStencilSnapshot lastDepthStencilState{};
+};
+
+DirectX12AdapterState &directX12State(VernonRuntimeRhiAdapter &adapter) {
+    assert(adapter.rhiBackend == VERNON_RHI_BACKEND_DIRECTX12);
+    assert(adapter.backend.state);
+    return *static_cast<DirectX12AdapterState *>(adapter.backend.state);
+}
+
+const DirectX12AdapterState &directX12State(const VernonRuntimeRhiAdapter &adapter) {
+    assert(adapter.rhiBackend == VERNON_RHI_BACKEND_DIRECTX12);
+    assert(adapter.backend.state);
+    return *static_cast<const DirectX12AdapterState *>(adapter.backend.state);
+}
+
+rhi::directx12::DeviceState &directX12Device(VernonRuntimeRhiAdapter &adapter) {
+    return *directX12State(adapter).device;
+}
+
+const rhi::directx12::DeviceState &directX12Device(const VernonRuntimeRhiAdapter &adapter) {
+    return *directX12State(adapter).device;
+}
+
+void destroyBackend(void *state) noexcept { delete static_cast<DirectX12AdapterState *>(state); }
+VernonStatus synchronizeBackend(void *state, std::string &error) noexcept {
+    try {
+        return static_cast<DirectX12AdapterState *>(state)->device->synchronize(error) ? VERNON_STATUS_OK
+                                                                                       : VERNON_STATUS_INTERNAL_ERROR;
+    } catch (...) {
+        setBackendError(error, "DirectX 12 synchronization threw an exception");
+        return VERNON_STATUS_INTERNAL_ERROR;
+    }
+}
+uint64_t resourceIdentity(const void *state) noexcept {
+    return reinterpret_cast<uintptr_t>(static_cast<const DirectX12AdapterState *>(state)->device);
+}
+void invalidateBackend(void *) noexcept {}
+
+const RhiAdapterBackendOps backendOps{destroyBackend, synchronizeBackend, resourceIdentity, invalidateBackend};
 
 struct PreparedShader {
     uint32_t stage{};
@@ -37,6 +98,7 @@ struct PreparedPipeline {
         std::vector<InlineRootMember> members;
     };
     std::atomic<uint32_t> references{1};
+    VernonRuntimeRhiAdapter *owner{};
     rhi::directx12::DeviceState *device{};
     ID3D12RootSignature *rootSignature{};
     ID3D12PipelineState *pipeline{};
@@ -50,6 +112,8 @@ struct PreparedPipeline {
             pipeline->Release();
         if (rootSignature)
             rootSignature->Release();
+        if (owner)
+            owner->livePreparedPipelines.fetch_sub(1, std::memory_order_relaxed);
     }
 };
 struct PreparedBindingSet {
@@ -178,8 +242,8 @@ uint32_t getCapabilities(void *) {
 
 VernonRuntimeProviderDeviceIdentity getDeviceIdentity(void *data) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return {0x4433443132u, reinterpret_cast<uintptr_t>(adapter.directX12Device->device),
-            static_cast<uint64_t>(adapter.directX12Device->shaderModel)};
+    const auto &device = directX12Device(adapter);
+    return {0x4433443132u, reinterpret_cast<uintptr_t>(device.device), static_cast<uint64_t>(device.shaderModel)};
 }
 
 VernonStatus prepareShader(void *data, const VernonRuntimeProviderShaderDescriptor *descriptor,
@@ -285,7 +349,9 @@ VernonStatus prepareGraphicsPipelineImpl(VernonRuntimeRhiAdapter &adapter,
     auto pipeline = std::unique_ptr<PreparedPipeline>(new (std::nothrow) PreparedPipeline());
     if (!pipeline)
         return fail(adapter, "D3D12 graphics pipeline preparation ran out of memory", VERNON_STATUS_INTERNAL_ERROR);
-    pipeline->device = adapter.directX12Device;
+    pipeline->owner = &adapter;
+    adapter.livePreparedPipelines.fetch_add(1, std::memory_order_relaxed);
+    pipeline->device = &directX12Device(adapter);
     pipeline->graphics = true;
     if (descriptor.color_format_count == 0) {
         *output = toHandle(pipeline.release());
@@ -510,6 +576,18 @@ VernonStatus prepareGraphicsPipelineImpl(VernonRuntimeRhiAdapter &adapter,
     result = pipeline->device->device->CreateGraphicsPipelineState(&native, IID_PPV_ARGS(&pipeline->pipeline));
     if (FAILED(result))
         return fail(adapter, "ID3D12Device::CreateGraphicsPipelineState failed", VERNON_STATUS_INTERNAL_ERROR);
+    directX12State(adapter).lastDepthStencilState = {
+        native.DepthStencilState.DepthEnable,
+        native.DepthStencilState.DepthWriteMask,
+        native.DepthStencilState.DepthFunc,
+        native.DepthStencilState.StencilEnable,
+        native.DepthStencilState.StencilReadMask,
+        native.DepthStencilState.StencilWriteMask,
+        native.DepthStencilState.FrontFace.StencilFunc,
+        native.DepthStencilState.FrontFace.StencilPassOp,
+        native.DepthStencilState.BackFace.StencilFunc,
+        native.DepthStencilState.BackFace.StencilPassOp,
+    };
     *output = toHandle(pipeline.release());
     adapter.pipelinePreparations.fetch_add(1, std::memory_order_relaxed);
     return VERNON_STATUS_OK;
@@ -571,7 +649,9 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
         releaseObject(serialized);
         return fail(adapter, "D3D12 pipeline preparation ran out of memory", VERNON_STATUS_INTERNAL_ERROR);
     }
-    pipeline->device = adapter.directX12Device;
+    pipeline->owner = &adapter;
+    adapter.livePreparedPipelines.fetch_add(1, std::memory_order_relaxed);
+    pipeline->device = &directX12Device(adapter);
     result = pipeline->device->device->CreateRootSignature(
         0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&pipeline->rootSignature));
     releaseObject(serialized);
@@ -735,7 +815,7 @@ VernonStatus createBindings(void *data, const VernonRuntimeProviderBindingSetDes
         return fail(adapter, "D3D12 adapter received an invalid binding-set descriptor");
     try {
         auto bindings = std::make_unique<PreparedBindingSet>();
-        bindings->device = adapter.directX12Device;
+        bindings->device = &directX12Device(adapter);
         bindings->slots.resize(layout->entries.size());
         bindings->slotIndices.reserve(layout->entries.size());
         bindings->valueIndices.resize(layout->entries.size());
@@ -904,6 +984,7 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     commands->SetPipelineState(pipeline->pipeline);
     commands->OMSetStencilRef(descriptor->stencil_reference);
     adapter.lastStencilReference.store(descriptor->stencil_reference, std::memory_order_relaxed);
+    adapter.lastDrawIndexed.store(descriptor->index_count != 0, std::memory_order_relaxed);
     const bool firstDraw = claim != 0;
     const bool standaloneRendering = !commandEncoderHasRenderingDescriptor(adapter, commandEncoder);
     if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
@@ -1263,6 +1344,36 @@ void initializeDirectX12Provider(VernonRuntimeRhiAdapter &adapter) {
 } // namespace vernon::runtime::rhi_adapter
 
 namespace vernon::runtime {
+
+DirectX12AdapterDepthStencilStats
+getDirectX12AdapterDepthStencilStats(const VernonRuntimeRhiAdapter &adapter) noexcept {
+    const auto &state = rhi_adapter::directX12State(adapter).lastDepthStencilState;
+    return {state.depthEnable,          state.depthWriteMask,
+            state.depthFunction,        state.stencilEnable,
+            state.stencilReadMask,      state.stencilWriteMask,
+            state.frontStencilFunction, state.frontStencilPassOperation,
+            state.backStencilFunction,  state.backStencilPassOperation};
+}
+
+VernonRuntimeRhiAdapter *createDirectX12RhiAdapter(VernonRhiDevice device, VernonRhiBackend backend) {
+    if (backend != VERNON_RHI_BACKEND_DIRECTX12)
+        return nullptr;
+    auto *deviceState = static_cast<rhi::directx12::DeviceState *>(rhi::deviceState(device, backend));
+    if (!deviceState)
+        return nullptr;
+    auto state =
+        std::unique_ptr<rhi_adapter::DirectX12AdapterState>(new (std::nothrow) rhi_adapter::DirectX12AdapterState());
+    auto adapter = std::unique_ptr<VernonRuntimeRhiAdapter>(new (std::nothrow) VernonRuntimeRhiAdapter());
+    if (!state || !adapter)
+        return nullptr;
+    state->device = deviceState;
+    adapter->rhiBackend = backend;
+    if (!adapter->backend.adopt(state.get(), &rhi_adapter::backendOps))
+        return nullptr;
+    (void)state.release();
+    rhi_adapter::initializeDirectX12Provider(*adapter);
+    return adapter.release();
+}
 
 uint32_t getDirectX12BlendFactorMapping(uint32_t value) {
     return static_cast<uint32_t>(rhi_adapter::blendFactor(value));

@@ -127,8 +127,9 @@ bool planGraphicsState(const VernonPipelineInvocation &invocation, size_t colorC
         state.depthStencil.depth_write = 0;
     if (!hasStencil || !state.depthStencil.stencil_test) {
         state.depthStencil.stencil_test = 0;
-        state.depthStencil.front = {};
-        state.depthStencil.back = {};
+        state.depthStencil.front = {VERNON_RHI_STENCIL_ZERO, VERNON_RHI_STENCIL_ZERO, VERNON_RHI_STENCIL_ZERO,
+                                    VERNON_RHI_COMPARE_NEVER};
+        state.depthStencil.back = state.depthStencil.front;
         state.depthStencil.stencil_read_mask = 0;
         state.depthStencil.stencil_write_mask = 0;
     }

@@ -1,22 +1,81 @@
-# VernonDSL stable release plan
+# VernonDSL 0.1.1 stable release plan
 
 ## Scope
 
-This plan promotes the Windows-first `0.1.1a1` alpha to a production-grade
-stable release. Removing the prerelease suffix is the final step, not the
-definition of readiness.
+This plan promotes the current `0.1.1a1` development line to the production
+`0.1.1` release. The next public candidate should be `0.1.1rc1`; removing the
+prerelease suffix is the final promotion step, not the definition of readiness.
 
-The initial stable support range must be explicit:
+The intended stable support range is:
 
 - Windows x64 and Linux x64 are the baseline supported platforms;
 - CPython 3.11 through 3.14 are the baseline Python versions;
 - every advertised compiler and Runtime backend must have repeatable CI or
   hardware-backed acceptance evidence;
-- macOS execution and a Metal Runtime remain unsupported unless they acquire
-  their own implementation, packaging, and CI gates.
+- macOS supports Metal compute and offscreen graphics with cooked MSL bundles;
+- macOS packaging must explicitly cover Apple Silicon, define the minimum
+  deployment target, and pass clean-wheel installation and execution tests;
+- Metal does not include swapchain or window presentation in `0.1.1`;
+- a hosted virtual Metal device that skips Argument Buffer coverage is useful
+  CI evidence for the supported subset, but it is not a substitute for the
+  physical Apple Silicon acceptance gate.
 
 Autodiff is not a `0.1.1` feature or release gate. It remains future
 language-v4 work.
+
+## Current readiness
+
+Completed foundations:
+
+- [x] unified runtime TensorView ABI and storage lowering;
+- [x] compiler contract 8 and pipeline contract 11 migration;
+- [x] synchronous resource lifetime and synchronization contract;
+- [x] Windows, Linux, and macOS CI definitions;
+- [x] Metal compute and offscreen graphics Runtime implementation;
+- [x] explicit Metal Argument Buffer capability probing and deterministic
+      unsupported-target handling;
+- [x] Vulkan-on-MoltenVK CI configuration for virtual Apple hardware.
+
+Release blockers:
+
+- [ ] update `versions.toml` to `0.1.1rc1` and regenerate every derived version
+      file;
+- [ ] replace the obsolete Windows-first alpha statements in `README.md`,
+      `RELEASE_NOTES.md`, `RELEASE_READINESS.md`, and active specifications;
+- [ ] define the shipped Windows, Linux, macOS x64, and macOS arm64 wheel
+      matrix, including whether macOS uses separate architecture wheels or
+      `universal2`;
+- [ ] define and test the minimum supported macOS deployment target;
+- [ ] run Metal compute, graphics, Argument Buffer, dispatch, and readback
+      acceptance on a physical Apple Silicon Mac;
+- [ ] verify each supported CPython 3.11-3.14 wheel in a clean environment;
+- [ ] add a trusted release workflow that promotes the exact tested artifacts
+      to GitHub Releases and PyPI;
+- [ ] publish the stable API, ABI, compatibility, support, and security
+      contracts;
+- [ ] obtain a fully green release-candidate commit on every required CI job.
+
+No blocker may be converted into an undocumented skip. A platform, wheel, or
+backend that cannot satisfy its gate must be removed from the stable support
+claim before release.
+
+## Supported backend declaration
+
+The `0.1.1` release notes must describe backends by tested capability rather
+than only listing their names:
+
+- CPU: compute reference execution;
+- CUDA: compute and buffers only;
+- Vulkan: compute and offscreen graphics on supported drivers;
+- OpenGL/OpenGL ES: compute and graphics with a supplied compatible context;
+- DirectX 12: compute and offscreen graphics on Windows;
+- Metal: compute and offscreen graphics on supported Apple devices, with
+  Argument Buffer pipelines rejected as unsupported when the device cannot
+  create the required encoders.
+
+Unavailable hardware may cause optional development tests to skip. A stable
+backend claim, however, requires at least one repeatable hardware-backed
+release gate that executes rather than skips its advertised capabilities.
 
 ## Stable contracts
 
@@ -108,8 +167,8 @@ Status (2026-07-31):
 
 - [x] remove cross-language Value ABI duplication and use one declarative
       layout source or native planner;
-- [x] minimize derivable interface metadata in compiler contract 7 / pipeline
-      10 and reject the retired per-use fields;
+- [x] minimize derivable interface metadata, reject the retired per-use fields,
+      and converge the candidate on compiler contract 8 / pipeline 11;
 - [x] execute aggregate workgroup tests on available CUDA, Vulkan, OpenGL, and
       DirectX runtimes, including nested values, padding, control flow,
       independent workgroups, and barrier-visible writes;
@@ -127,10 +186,15 @@ Autodiff and the remaining language-v4 expansion are tracked separately.
 
 ## Cross-platform release engineering
 
-- add Linux compiler, Runtime, CTest, Python, source-build, wheel, and
-  fresh-install CI alongside Windows CI;
+- require Windows, Linux, and macOS compiler, Runtime, CTest, Python,
+  source-build, wheel, and fresh-install CI;
 - build and verify a wheel for every supported platform and CPython version;
-- define and test the source-distribution policy;
+- define and test the source-distribution policy and minimum deployment
+  targets;
+- audit Linux wheels for manylinux portability and macOS wheels for architecture
+  and deployment-target correctness;
+- execute installed-wheel compile, dispatch, readback, CLI, and bundled
+  Runtime-source smoke tests;
 - add scheduled or self-hosted GPU validation with validation/debug layers;
 - add fuzzing for source, manifest, reflection, TensorView, and ExecutionGraph
   inputs;
@@ -160,13 +224,21 @@ version rather than moving an existing public tag.
 
 ## Promotion sequence
 
-1. Publish a beta after the contracts, TensorView ABI, cross-platform CI, and
-   backend correctness gates pass.
-2. Use beta feedback to close API, installation, and compatibility defects.
-3. Publish a release candidate and freeze public API and native ABI.
-4. Permit only release-blocking fixes during the release-candidate period.
-5. Publish stable only after the candidate passes every supported platform,
-   backend, upgrade, cache, and artifact-compatibility gate.
+1. Change the version source to `0.1.1rc1`, regenerate version files, and update
+   all release-facing documentation.
+2. Freeze the public Python, C, and C++ API and the native ABI.
+3. Merge the release candidate and require the exact merged commit to pass all
+   platform, wheel, backend, compatibility, and packaging gates.
+4. Build release artifacts once from that commit and publish `v0.1.1rc1` as a
+   GitHub pre-release and PyPI prerelease.
+5. Permit only release-blocking fixes. Any code change produces a new release
+   candidate and a complete rerun of the gates.
+6. After candidate validation, change only the release version and final
+   release notes, then run the complete matrix again.
+7. Tag the exact green commit as immutable `v0.1.1` and promote the verified
+   artifacts through the trusted release workflow.
+8. Verify the files exposed by GitHub Releases and PyPI through a clean
+   post-publication installation.
 
 Stable completion means that the tag, GitHub Release, PyPI files, provenance,
 and post-publication verification all identify the same exact green commit.

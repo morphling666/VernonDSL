@@ -1,10 +1,13 @@
-#include "../../lib/rhi/metal_backend_fwd.h"
+#include "../../lib/rhi/metal_backend.h"
 #include "../../lib/rhi/rhi_internal.h"
 #include "../../lib/rhi/sampler_filter.h"
+#include "../../lib/runtime/rhi_adapter/adapter_test_hooks.h"
 #include "../../lib/runtime/runtime_dispatch.h"
+#include "../../lib/runtime/runtime_test_hooks.h"
 #include "VernonRHI.h"
 #include "VernonRuntime.h"
 #include "VernonRuntimeRHIAdapter.h"
+#include "runtime_rhi_test_utils.h"
 
 #include <array>
 #include <cstdint>
@@ -25,7 +28,32 @@ VernonRhiDevice createMetalDevice() {
     return vernonRhiCreateDevice(&descriptor);
 }
 
+const vernon::rhi::metal::DeviceState *metalDeviceState(VernonRhiDevice device) {
+    return static_cast<const vernon::rhi::metal::DeviceState *>(
+        vernon::rhi::deviceState(device, VERNON_RHI_BACKEND_METAL));
+}
+
+bool supportsMetalArgumentBufferEncoding(VernonRhiDevice device) {
+    const auto *state = metalDeviceState(device);
+    return state && state->argumentBufferEncodingSupported;
+}
+
+bool supportsMetalArgumentBuffersTier2(VernonRhiDevice device) {
+    const auto *state = metalDeviceState(device);
+    return state && state->argumentBufferEncodingSupported && state->argumentBuffersTier >= MTLArgumentBuffersTier2;
+}
+
 } // namespace
+
+TEST(RuntimeMetal, RequiresTier2BeforePreparingOverLimitArgumentBuffers) {
+    using vernon::runtime::validateMetalArgumentBufferLimitsForTesting;
+    EXPECT_TRUE(validateMetalArgumentBufferLimitsForTesting(31, 31, 16, false, 0));
+    EXPECT_FALSE(validateMetalArgumentBufferLimitsForTesting(32, 0, 0, false, 0));
+    EXPECT_FALSE(validateMetalArgumentBufferLimitsForTesting(0, 32, 0, false, 0));
+    EXPECT_FALSE(validateMetalArgumentBufferLimitsForTesting(0, 0, 17, false, 0));
+    EXPECT_FALSE(validateMetalArgumentBufferLimitsForTesting(0, 1, 0, true, 0));
+    EXPECT_TRUE(validateMetalArgumentBufferLimitsForTesting(32, 32, 17, true, 1));
+}
 
 TEST(RuntimeMetal, CreatesDeviceAndRoundTripsAllBufferMemoryClasses) {
     VernonRhiDevice device = createMetalDevice();
@@ -436,6 +464,10 @@ TEST(RuntimeMetal, ProviderRejectsDuplicateArgumentBufferMembers) {
 TEST(RuntimeMetal, ProviderCompilesBindsAndDispatchesCompute) {
     VernonRhiDevice device = createMetalDevice();
     ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    if (!supportsMetalArgumentBufferEncoding(device)) {
+        vernonRhiDestroyDevice(device);
+        GTEST_SKIP() << "Metal argument-buffer encoding is unavailable on this device";
+    }
     VernonRuntimeRhiAdapter *adapter = vernonRuntimeRhiAdapterCreateForDevice(device, VERNON_RHI_BACKEND_METAL);
     ASSERT_NE(adapter, nullptr);
     const VernonRuntimeDeviceProvider *provider = vernonRuntimeRhiAdapterGetProvider(adapter);
@@ -570,6 +602,10 @@ kernel void add_value(constant AddArguments &arguments [[buffer(0)]],
 TEST(RuntimeMetal, ProviderBindsMoreThanThirtyBuffersAcrossDescriptorSetsAndRetainsResources) {
     VernonRhiDevice device = createMetalDevice();
     ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    if (!supportsMetalArgumentBuffersTier2(device)) {
+        vernonRhiDestroyDevice(device);
+        GTEST_SKIP() << "Metal Argument Buffers Tier 2 encoding is unavailable on this device";
+    }
     VernonRuntimeRhiAdapter *adapter = vernonRuntimeRhiAdapterCreateForDevice(device, VERNON_RHI_BACKEND_METAL);
     ASSERT_NE(adapter, nullptr);
     const VernonRuntimeDeviceProvider *provider = vernonRuntimeRhiAdapterGetProvider(adapter);
@@ -704,6 +740,10 @@ TEST(RuntimeMetal, ProviderBindsMoreThanThirtyBuffersAcrossDescriptorSetsAndReta
 TEST(RuntimeMetal, ProviderEncodesSampledStorageTexturesAndSamplerInArgumentBuffer) {
     VernonRhiDevice device = createMetalDevice();
     ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    if (!supportsMetalArgumentBuffersTier2(device)) {
+        vernonRhiDestroyDevice(device);
+        GTEST_SKIP() << "Metal Argument Buffers Tier 2 encoding is unavailable on this device";
+    }
     VernonRuntimeRhiAdapter *adapter = vernonRuntimeRhiAdapterCreateForDevice(device, VERNON_RHI_BACKEND_METAL);
     ASSERT_NE(adapter, nullptr);
     const VernonRuntimeDeviceProvider *provider = vernonRuntimeRhiAdapterGetProvider(adapter);
@@ -909,14 +949,17 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     blend.write_mask = VERNON_RHI_COLOR_WRITE_ALL;
     pipelineDescriptor.color_blends = &blend;
     pipelineDescriptor.color_blend_count = 1;
+    EXPECT_EQ(vernon::runtime::getRhiAdapterPreparationStats(*adapter).livePreparedPipelines, 0u);
     pipelineDescriptor.depth_stencil.depth_compare = UINT32_MAX;
     VernonRuntimeProviderObject rejectedPipeline{};
     EXPECT_EQ(provider->prepare_pipeline(provider->user_data, &pipelineDescriptor, &rejectedPipeline),
               VERNON_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(rejectedPipeline.value, 0u);
+    EXPECT_EQ(vernon::runtime::getRhiAdapterPreparationStats(*adapter).livePreparedPipelines, 0u);
     pipelineDescriptor.depth_stencil.depth_compare = VERNON_RHI_COMPARE_LESS;
     VernonRuntimeProviderObject pipeline{};
     ASSERT_EQ(provider->prepare_pipeline(provider->user_data, &pipelineDescriptor, &pipeline), VERNON_STATUS_OK);
+    EXPECT_EQ(vernon::runtime::getRhiAdapterPreparationStats(*adapter).livePreparedPipelines, 1u);
 
     VernonRhiImageDescriptor imageDescriptor{};
     imageDescriptor.struct_size = sizeof(imageDescriptor);
@@ -988,6 +1031,19 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     rendering.layers = 1;
     VernonRuntimeProviderObject providerCommand{};
     ASSERT_EQ(vernonRuntimeRhiAdapterReferenceCommandEncoder(adapter, command, &providerCommand), VERNON_STATUS_OK);
+    constexpr std::array<uint32_t, 3> indices{0, 1, 2};
+    VernonRhiBufferDescriptor indexDescriptor{};
+    indexDescriptor.struct_size = sizeof(indexDescriptor);
+    indexDescriptor.size = sizeof(indices);
+    indexDescriptor.usage = VERNON_RHI_BUFFER_INDEX;
+    indexDescriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
+    VernonRhiBuffer indexBuffer{};
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &indexDescriptor, &indexBuffer), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceUploadBuffer(device, indexBuffer, 0, indices.data(), sizeof(indices)),
+              VERNON_RHI_STATUS_OK);
+    VernonRuntimeProviderResourceReference indexReference{};
+    ASSERT_EQ(vernonRuntimeRhiAdapterReferenceBuffer(adapter, indexBuffer, 0, sizeof(indices), &indexReference),
+              VERNON_STATUS_OK);
     VernonRuntimeProviderDispatchDescriptor invalidDispatch{};
     invalidDispatch.struct_size = sizeof(invalidDispatch);
     invalidDispatch.pipeline = pipeline;
@@ -1018,7 +1074,17 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     draw.viewport[3] = imageDescriptor.height;
     draw.scissor[2] = imageDescriptor.width;
     draw.scissor[3] = imageDescriptor.height;
+    draw.index_buffer = indexReference;
+    draw.index_count = indices.size();
+    draw.index_type = 1;
+    EXPECT_EQ(provider->encode_draw(provider->user_data, providerCommand, &draw), VERNON_STATUS_INVALID_ARGUMENT);
+    draw.index_buffer = {};
+    draw.index_count = 0;
+    draw.index_type = 0;
     ASSERT_EQ(provider->encode_draw(provider->user_data, providerCommand, &draw), VERNON_STATUS_OK);
+    const auto drawStats = vernon::runtime::getRhiAdapterPreparationStats(*adapter);
+    EXPECT_EQ(drawStats.lastStencilReference, 7u);
+    EXPECT_FALSE(drawStats.lastDrawIndexed);
     attachment.image = secondImageReference;
     EXPECT_EQ(provider->encode_draw(provider->user_data, providerCommand, &draw), VERNON_STATUS_INVALID_ARGUMENT);
     attachment.image = imageReference;
@@ -1054,7 +1120,9 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     EXPECT_EQ(vernonRhiDeviceDestroyImageView(device, view), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, secondImage), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, indexBuffer), VERNON_RHI_STATUS_OK);
     provider->destroy_pipeline(provider->user_data, pipeline);
+    EXPECT_EQ(vernon::runtime::getRhiAdapterPreparationStats(*adapter).livePreparedPipelines, 0u);
     provider->destroy_pipeline_layout(provider->user_data, layout);
     for (const auto shader : shaders)
         provider->destroy_shader(provider->user_data, shader);
@@ -1071,6 +1139,10 @@ TEST(RuntimeMetal, PublicRuntimeLoadsDispatchesAndReadsBackCookedBundle) {
 
     VernonRhiDevice device = createMetalDevice();
     ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    if (!supportsMetalArgumentBufferEncoding(device)) {
+        vernonRhiDestroyDevice(device);
+        GTEST_SKIP() << "Metal argument-buffer encoding is unavailable on this device";
+    }
     VernonRuntimeContext *runtime = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_METAL, device);
     ASSERT_NE(runtime, nullptr);
     VernonRuntimeCapabilities capabilities = vernonRuntimeGetContextCapabilities(runtime);
@@ -1142,22 +1214,20 @@ TEST(RuntimeMetal, PublicRuntimeLoadsDispatchesAndReadsBackCookedBundle) {
     invocation.argument_count = std::size(arguments);
     invocation.compute_grid = {4, 1, 1};
 
-    VernonRhiCommandEncoderDescriptor encoderDescriptor{};
-    encoderDescriptor.struct_size = sizeof(encoderDescriptor);
-    encoderDescriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE;
-    VernonRhiCommandEncoder encoder{};
-    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
-    VernonRuntimeProviderObject providerEncoder{};
-    ASSERT_EQ(vernonRuntimeReferenceRhiCommandEncoder(runtime, encoder, &providerEncoder), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimePipelineEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_OK)
-        << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
-    ASSERT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceSubmit(device, encoder), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, encoder), VERNON_RHI_STATUS_OK);
+    vernon::execution::ExecutionGraph graph(device);
+    const auto graphBuffer = graph.importBuffer(buffer, true);
+    graph.emplacePass<vernon::tests::RuntimeGraphComputePass>("first scale", graphBuffer, runtime, pipeline,
+                                                              &invocation);
+    graph.emplacePass<vernon::tests::RuntimeGraphComputePass>("second scale", graphBuffer, runtime, pipeline,
+                                                              &invocation);
+    ASSERT_EQ(graph.execute(), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(graph.lastStats().dispatch_count, 2u);
+    EXPECT_EQ(graph.lastStats().barrier_count, 1u);
+    EXPECT_EQ(graph.lastStats().submission_count, 1u);
     std::array<float, source.size()> output{};
     ASSERT_EQ(vernonRhiDeviceDownloadBuffer(device, buffer, 0, output.data(), sizeof(output)), VERNON_RHI_STATUS_OK);
     for (size_t index = 0; index < output.size(); ++index)
-        EXPECT_EQ(output[index], source[index] * factor);
+        EXPECT_EQ(output[index], source[index] * factor * factor);
 
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, buffer), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
@@ -1271,6 +1341,10 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
 
     VernonRhiDevice device = createMetalDevice();
     ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    if (!supportsMetalArgumentBufferEncoding(device)) {
+        vernonRhiDestroyDevice(device);
+        GTEST_SKIP() << "Metal argument-buffer encoding is unavailable on this device";
+    }
     VernonRuntimeContext *runtime = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_METAL, device);
     ASSERT_NE(runtime, nullptr);
     const std::string directory = manifestPath.parent_path().u8string();
@@ -1319,7 +1393,7 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
     imageDescriptor.usage = VERNON_RHI_IMAGE_SAMPLED | VERNON_RHI_IMAGE_TRANSFER_DESTINATION;
     VernonRhiImage sampled{};
     ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &sampled), VERNON_RHI_STATUS_OK);
-    constexpr uint8_t sampledPixel[]{64, 200, 100, 255};
+    constexpr uint8_t sampledPixel[]{64, 200, 100, 128};
     VernonRhiImageUploadDescriptor upload{sizeof(VernonRhiImageUploadDescriptor),
                                           0,
                                           0,
@@ -1346,7 +1420,8 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
 
     imageDescriptor.width = 32;
     imageDescriptor.height = 32;
-    imageDescriptor.usage = VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE;
+    imageDescriptor.usage =
+        VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION;
     VernonRhiImage target{};
     ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &target), VERNON_RHI_STATUS_OK);
     VernonRuntimeProviderResourceReference targetReference{};
@@ -1373,6 +1448,17 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
     arguments[2].tensor.shape = shape;
     arguments[2].tensor.byte_strides = strides;
     arguments[2].tensor.byte_size = sizeof(positions);
+    constexpr std::array<uint32_t, 3> indices{0, 1, 2};
+    bufferDescriptor.size = sizeof(indices);
+    bufferDescriptor.alignment = alignof(uint32_t);
+    bufferDescriptor.usage = VERNON_RHI_BUFFER_INDEX;
+    VernonRhiBuffer indexBuffer{};
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &indexBuffer), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceUploadBuffer(device, indexBuffer, 0, indices.data(), sizeof(indices)),
+              VERNON_RHI_STATUS_OK);
+    VernonRuntimeProviderResourceReference indexReference{};
+    ASSERT_EQ(vernonRuntimeReferenceRhiBuffer(runtime, indexBuffer, 0, sizeof(indices), &indexReference),
+              VERNON_STATUS_OK);
     VernonColorAttachment attachment{0, targetReference, 32, 32, VERNON_TEXTURE_RGBA8_UNORM};
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
@@ -1383,6 +1469,12 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
     invocation.color_attachment_count = 1;
     invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
     invocation.instance_count = 1;
+    VernonIndexBinding invalidIndex{static_cast<VernonIndexType>(1), 0, indices.size(), indexReference};
+    invocation.index_binding = &invalidIndex;
+    EXPECT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
+    const VernonStringView indexError = vernonRuntimeGetLastError(runtime);
+    EXPECT_NE(std::string(indexError.data, indexError.size).find("index binding is invalid"), std::string::npos);
+    invocation.index_binding = nullptr;
     ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
 
@@ -1393,9 +1485,95 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
     EXPECT_NEAR(pixels[center + 1], sampledPixel[1], 2);
     EXPECT_NEAR(pixels[center + 2], sampledPixel[2], 2);
 
+    VernonRhiImageUploadDescriptor targetUpload{};
+    targetUpload.struct_size = sizeof(targetUpload);
+    targetUpload.width = targetUpload.height = 32;
+    targetUpload.depth = 1;
+    targetUpload.source_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    targetUpload.source_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    auto uploadTarget = [&](const std::array<uint8_t, 4> &color) {
+        std::vector<uint8_t> background(32 * 32 * 4);
+        for (size_t offset = 0; offset < background.size(); offset += 4)
+            std::copy(color.begin(), color.end(), background.begin() + offset);
+        targetUpload.data = background.data();
+        ASSERT_EQ(vernonRhiDeviceUploadImage(device, target, &targetUpload, 1), VERNON_RHI_STATUS_OK);
+    };
+    auto centerPixel = [&] {
+        std::vector<uint8_t> result(32 * 32 * 4);
+        EXPECT_EQ(vernonRhiDeviceDownloadImage(device, target, result.data(), result.size()), VERNON_RHI_STATUS_OK);
+        std::array<uint8_t, 4> pixel{};
+        std::copy_n(result.begin() + center, pixel.size(), pixel.begin());
+        return pixel;
+    };
+    auto executeGraph = [&](uint32_t passCount) {
+        vernon::execution::ExecutionGraph graph(device);
+        const auto graphTarget = graph.importImage(target, {target.index, target.generation},
+                                                   VERNON_RHI_FORMAT_RGBA8_UNORM, 32, 32, 1, 1, true);
+        for (uint32_t pass = 0; pass < passCount; ++pass)
+            graph.emplacePass<vernon::tests::RuntimeGraphRenderPass>(pass ? "second draw" : "first draw", graphTarget,
+                                                                     runtime, pipeline, &invocation,
+                                                                     VERNON_RHI_LOAD_PRESERVE);
+        EXPECT_EQ(graph.execute(), VERNON_RHI_STATUS_OK);
+        return graph.lastStats();
+    };
+
+    VernonColorBlendState blend{};
+    blend.blend_enabled = 1;
+    blend.source_color_factor = VERNON_RHI_BLEND_SOURCE_ALPHA;
+    blend.destination_color_factor = VERNON_RHI_BLEND_ONE_MINUS_SOURCE_ALPHA;
+    blend.color_operation = VERNON_RHI_BLEND_ADD;
+    blend.source_alpha_factor = VERNON_RHI_BLEND_ONE;
+    blend.destination_alpha_factor = VERNON_RHI_BLEND_ZERO;
+    blend.alpha_operation = VERNON_RHI_BLEND_ADD;
+    blend.write_mask = VERNON_RHI_COLOR_WRITE_ALL;
+    VernonGraphicsState graphicsState{};
+    graphicsState.struct_size = sizeof(graphicsState);
+    graphicsState.color_blends = &blend;
+    graphicsState.color_blend_count = 1;
+    invocation.graphics_state = &graphicsState;
+
+    const std::array<uint8_t, 4> blendBackground{20, 40, 220, 255};
+    uploadTarget(blendBackground);
+    const VernonRhiCommandEncoderStats graphStats = executeGraph(2);
+    EXPECT_EQ(graphStats.rendering_scope_count, 1u);
+    EXPECT_EQ(graphStats.draw_count, 2u);
+    EXPECT_EQ(graphStats.submission_count, 1u);
+    const auto blended = centerPixel();
+    for (size_t channel = 0; channel < 3; ++channel)
+        EXPECT_NEAR(blended[channel], sampledPixel[channel] * 0.75 + blendBackground[channel] * 0.25, 3);
+
+    const std::array<uint8_t, 4> maskBackground{11, 73, 149, 255};
+    uploadTarget(maskBackground);
+    blend.blend_enabled = 0;
+    blend.write_mask = VERNON_RHI_COLOR_WRITE_RED;
+    executeGraph(1);
+    const auto masked = centerPixel();
+    EXPECT_NEAR(masked[0], sampledPixel[0], 2);
+    EXPECT_EQ(masked[1], maskBackground[1]);
+    EXPECT_EQ(masked[2], maskBackground[2]);
+    EXPECT_EQ(masked[3], maskBackground[3]);
+
+    blend.write_mask = VERNON_RHI_COLOR_WRITE_ALL;
+    graphicsState.rasterization.front_face = VERNON_RHI_FRONT_FACE_COUNTER_CLOCKWISE;
+    const std::array<uint8_t, 4> cullBackground{7, 13, 19, 255};
+    uploadTarget(cullBackground);
+    graphicsState.rasterization.cull_mode = VERNON_RHI_CULL_FRONT;
+    executeGraph(1);
+    const auto frontCulled = centerPixel();
+    uploadTarget(cullBackground);
+    graphicsState.rasterization.cull_mode = VERNON_RHI_CULL_BACK;
+    executeGraph(1);
+    const auto backCulled = centerPixel();
+    const bool frontRendered = frontCulled[0] != cullBackground[0] || frontCulled[1] != cullBackground[1] ||
+                               frontCulled[2] != cullBackground[2];
+    const bool backRendered =
+        backCulled[0] != cullBackground[0] || backCulled[1] != cullBackground[1] || backCulled[2] != cullBackground[2];
+    EXPECT_NE(frontRendered, backRendered);
+
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, target), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroySampler(device, sampler), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, sampled), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, indexBuffer), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, vertices), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     vernonRuntimePipelineBundleDestroy(loaded);

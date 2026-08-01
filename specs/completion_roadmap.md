@@ -10,7 +10,9 @@ near-term product range is:
 - Vulkan compute and offscreen graphics;
 - OpenGL/OpenGL ES compute and graphics with a supplied context;
 - DirectX 12 compute and offscreen graphics on Windows;
-- Metal source cooking without a Vernon runtime.
+- experimental Metal compute and offscreen graphics Runtime in macOS source
+  builds and CI, consuming cooked MSL bundles on Apple but not offered as a
+  stable wheel or GA capability.
 
 The released frontend remains version 3. Language v4 is the normative target,
 not a released compatibility claim.
@@ -101,7 +103,8 @@ Required before beta:
 
 Optional product tracks require independent justification and acceptance:
 
-- Metal Runtime and macOS execution;
+- promotion of the experimental Metal Runtime beyond macOS source builds and
+  CI into a stable wheel or GA capability;
 - AMD/ROCDL compiler and Runtime support;
 - explicit constrained and const generics;
 - enums, `Option[T]`, exhaustive `match`, and compile-time data structures.

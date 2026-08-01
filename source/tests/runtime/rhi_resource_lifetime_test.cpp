@@ -159,7 +159,8 @@ TEST_P(RhiResourceLifetime, RetainedImageAndSamplerDelaySlotReuse) {
 INSTANTIATE_TEST_SUITE_P(GpuBackends, RhiResourceLifetime,
                          testing::Values(BackendCase{VERNON_RHI_BACKEND_CUDA, "CUDA", false},
                                          BackendCase{VERNON_RHI_BACKEND_VULKAN, "Vulkan", true},
-                                         BackendCase{VERNON_RHI_BACKEND_DIRECTX12, "DirectX12", true}),
+                                         BackendCase{VERNON_RHI_BACKEND_DIRECTX12, "DirectX12", true},
+                                         BackendCase{VERNON_RHI_BACKEND_METAL, "Metal", true}),
                          [](const testing::TestParamInfo<BackendCase> &info) { return info.param.name; });
 
 } // namespace

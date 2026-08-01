@@ -4,6 +4,7 @@
 #include "VernonRuntime.h"
 #include "VernonRuntimeCore.h"
 #include "compute_launch_planner.h"
+#include "metal_runtime_capabilities.h"
 #include "runtime_state.h"
 #include "tensor_bridge.h"
 
@@ -20,6 +21,7 @@ struct MetalContextState {
     uint32_t maxComputeWorkGroupSize[3]{};
     RuntimeVersion operatingSystemVersion;
     uint32_t argumentBuffersTier{};
+    bool argumentBufferEncodingSupported{};
 };
 
 inline MetalContextState &metalState(VernonRuntimeContext &context) {

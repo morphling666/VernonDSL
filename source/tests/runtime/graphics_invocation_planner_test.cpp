@@ -129,7 +129,7 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
         {1, secondTarget, 64, 32, VERNON_TEXTURE_RGBA8_UNORM},
         {0, firstTarget, 64, 32, VERNON_TEXTURE_RGBA8_UNORM},
     };
-    const VernonIndexBinding index{VERNON_INDEX_U32, 0, 6, indexBuffer};
+    VernonIndexBinding index{VERNON_INDEX_U32, 0, 6, indexBuffer};
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
@@ -162,6 +162,10 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     EXPECT_TRUE(sampled->second.implicitSampler);
     EXPECT_EQ(sampled->second.stages, PLANNED_STAGE_FRAGMENT);
 
+    index.type = static_cast<VernonIndexType>(1);
+    EXPECT_FALSE(planGraphicsInvocation(variant, invocation, plan, error));
+    EXPECT_EQ(error, "index binding is invalid");
+    index.type = VERNON_INDEX_U32;
     attachments[0].location = 2;
     EXPECT_FALSE(planGraphicsInvocation(variant, invocation, plan, error));
     EXPECT_EQ(error, "render target locations must be contiguous from zero");
@@ -298,7 +302,11 @@ TEST(GraphicsInvocationPlanner, NormalizesInactiveGraphicsState) {
     EXPECT_EQ(planned.rasterization.depth_bias_constant, 0);
     EXPECT_EQ(planned.depthStencil.depth_compare, VERNON_RHI_COMPARE_ALWAYS);
     EXPECT_EQ(planned.depthStencil.stencil_read_mask, 0u);
-    EXPECT_EQ(planned.depthStencil.front.pass, VERNON_RHI_STENCIL_KEEP);
+    EXPECT_EQ(planned.depthStencil.front.stencil_fail, VERNON_RHI_STENCIL_ZERO);
+    EXPECT_EQ(planned.depthStencil.front.depth_fail, VERNON_RHI_STENCIL_ZERO);
+    EXPECT_EQ(planned.depthStencil.front.pass, VERNON_RHI_STENCIL_ZERO);
+    EXPECT_EQ(planned.depthStencil.front.compare, VERNON_RHI_COMPARE_NEVER);
+    EXPECT_EQ(planned.depthStencil.back.pass, VERNON_RHI_STENCIL_ZERO);
     EXPECT_EQ(planned.colorBlends[0].source_color_factor, VERNON_RHI_BLEND_ONE);
     EXPECT_EQ(planned.colorBlends[0].destination_color_factor, VERNON_RHI_BLEND_ZERO);
 }

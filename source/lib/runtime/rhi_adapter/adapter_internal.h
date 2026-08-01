@@ -1,39 +1,21 @@
 #ifndef VERNON_RUNTIME_RHI_ADAPTER_INTERNAL_H
 #define VERNON_RUNTIME_RHI_ADAPTER_INTERNAL_H
 
-#include "../../rhi/cuda_backend.h"
-#if defined(_WIN32)
-#include "../../rhi/directx12_backend.h"
-#endif
-#include "../../rhi/opengl_backend.h"
-#if defined(VERNON_HAS_VULKAN_RUNTIME) || defined(VERNON_HAS_VULKAN_RHI)
-#include "../../rhi/vulkan_backend.h"
-#endif
-#if defined(VERNON_HAS_METAL_RHI) || defined(VERNON_HAS_METAL_RUNTIME)
-#include "../../rhi/metal_backend_fwd.h"
-#endif
 #include "VernonRuntimeRHIAdapter.h"
 
 namespace vernon::runtime {
 
-VernonRuntimeRhiAdapter *createBorrowedCudaRhiAdapter(rhi::cuda::DeviceState &device);
-rhi::cuda::DeviceState &cudaRhiAdapterDevice(VernonRuntimeRhiAdapter &adapter);
-VernonRuntimeRhiAdapter *createBorrowedOpenGLRhiAdapter(rhi::opengl::DeviceState &device);
-uint64_t openGLRhiAdapterResourceIdentity(const VernonRuntimeRhiAdapter &adapter);
-#if defined(VERNON_HAS_VULKAN_RUNTIME) || defined(VERNON_HAS_VULKAN_RHI)
-VernonRuntimeRhiAdapter *createBorrowedVulkanRhiAdapter(rhi::vulkan::DeviceState &device);
-uint64_t vulkanRhiAdapterResourceIdentity(const VernonRuntimeRhiAdapter &adapter);
+VernonRuntimeRhiAdapter *createOwnedCudaRhiAdapter(uint32_t deviceIndex);
+VernonRuntimeRhiAdapter *createCudaRhiAdapter(VernonRhiDevice device, VernonRhiBackend backend);
+VernonRuntimeRhiAdapter *createOpenGLRhiAdapter(VernonRhiDevice device, VernonRhiBackend backend);
+#if defined(VERNON_HAS_VULKAN_RHI)
+VernonRuntimeRhiAdapter *createVulkanRhiAdapter(VernonRhiDevice device, VernonRhiBackend backend);
 #endif
-#if defined(_WIN32)
-VernonRuntimeRhiAdapter *createBorrowedDirectX12RhiAdapter(rhi::directx12::DeviceState &device);
-uint64_t directX12RhiAdapterResourceIdentity(const VernonRuntimeRhiAdapter &adapter);
-uint64_t directX12RhiAdapterImageIdentity(const VernonRuntimeRhiAdapter &adapter);
-uint64_t directX12RhiAdapterSamplerIdentity(const VernonRuntimeRhiAdapter &adapter);
-uint64_t directX12RhiAdapterBufferIdentity(const VernonRuntimeRhiAdapter &adapter);
+#if defined(VERNON_HAS_DIRECTX12_RHI)
+VernonRuntimeRhiAdapter *createDirectX12RhiAdapter(VernonRhiDevice device, VernonRhiBackend backend);
 #endif
-#if defined(VERNON_HAS_METAL_RHI) || defined(VERNON_HAS_METAL_RUNTIME)
-VernonRuntimeRhiAdapter *createBorrowedMetalRhiAdapter(rhi::metal::DeviceState &device);
-rhi::metal::DeviceCapabilities metalRhiAdapterDeviceCapabilities(const VernonRuntimeRhiAdapter &adapter);
+#if defined(VERNON_HAS_METAL_RHI)
+VernonRuntimeRhiAdapter *createMetalRhiAdapter(VernonRhiDevice device, VernonRhiBackend backend);
 #endif
 
 } // namespace vernon::runtime

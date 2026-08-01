@@ -10,7 +10,7 @@ namespace vernon::rhi {
 
 template <typename Handle> constexpr Handle invalidHandle() noexcept {
     static_assert(std::is_trivially_copyable_v<Handle>);
-    return {VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    return {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
 }
 
 template <typename Handle> constexpr bool isValid(Handle handle) noexcept {

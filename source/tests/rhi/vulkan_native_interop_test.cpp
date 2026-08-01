@@ -113,6 +113,50 @@ TEST(VulkanOwnedDevice, DownloadsDepthOnlyImageThroughDepthAspect) {
     vernonRhiDestroyDevice(device);
 }
 
+TEST(VulkanOwnedDevice, TransitionsPackedDepthStencilImageWithBothAspects) {
+    VernonRhiOwnedDeviceDescriptor deviceDescriptor{};
+    deviceDescriptor.struct_size = sizeof(deviceDescriptor);
+    deviceDescriptor.backend = VERNON_RHI_BACKEND_VULKAN;
+    VernonRhiDevice device = vernonRhiCreateDevice(&deviceDescriptor);
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        GTEST_SKIP() << "Vulkan device is unavailable";
+
+    VernonRhiImageDescriptor imageDescriptor{};
+    imageDescriptor.struct_size = sizeof(imageDescriptor);
+    imageDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    imageDescriptor.format = VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT;
+    imageDescriptor.width = 1;
+    imageDescriptor.height = 1;
+    imageDescriptor.depth = 1;
+    imageDescriptor.mip_levels = 1;
+    imageDescriptor.array_layers = 1;
+    imageDescriptor.sample_count = 1;
+    imageDescriptor.usage = VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE;
+    VernonRhiImage image{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &image), VERNON_RHI_STATUS_OK);
+
+    VernonRhiCommandEncoderDescriptor encoderDescriptor{};
+    encoderDescriptor.struct_size = sizeof(encoderDescriptor);
+    encoderDescriptor.required_capabilities = VERNON_RHI_QUEUE_GRAPHICS;
+    VernonRhiCommandEncoder encoder{};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
+    VernonRhiBarrier barrier{};
+    barrier.struct_size = sizeof(barrier);
+    barrier.source_stage_mask = VERNON_RHI_STAGE_FRAGMENT;
+    barrier.destination_stage_mask = VERNON_RHI_STAGE_FRAGMENT;
+    barrier.destination_access = VERNON_RHI_ACCESS_DEPTH_STENCIL_WRITE;
+    barrier.old_state = VERNON_RHI_STATE_UNDEFINED;
+    barrier.new_state = VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT;
+    barrier.image = image;
+    barrier.is_image = 1;
+    EXPECT_EQ(vernonRhiCommandEncoderBarrier(device, encoder, &barrier, 1), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceSubmit(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
+}
+
 TEST(VulkanNativeInterop, BorrowsObjectsWithoutOwningTheirLifetime) {
     std::string error;
     vernon::rhi::vulkan::DeviceState owner;
