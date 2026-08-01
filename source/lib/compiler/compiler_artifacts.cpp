@@ -149,7 +149,9 @@ bool addArtifactTable(std::string &reflection, std::string &diagnostics, const s
             row["name"] = slot.name;
             row["set"] = static_cast<int64_t>(slot.descriptorSet);
             row["binding"] = static_cast<int64_t>(slot.binding);
-            row["index"] = static_cast<int64_t>(slot.index);
+            row["argument_buffer_index"] = static_cast<int64_t>(slot.argumentBufferIndex);
+            row["member_id"] = static_cast<int64_t>(slot.memberId);
+            row["direct_buffer_index"] = static_cast<int64_t>(slot.directBufferIndex);
             row["count"] = static_cast<int64_t>(slot.count);
             slots.emplace_back(std::move(row));
         }

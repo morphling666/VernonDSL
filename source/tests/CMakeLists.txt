@@ -220,6 +220,43 @@ if(TARGET VernonRuntime)
                 vernon-metal-compute-pipeline-test-bundle
                 vernon-metal-graphics-pipeline-test-bundle
                 vernon-metal-resolution-pipeline-test-bundle)
+            add_test(
+                NAME vernon-metal-mandelbulb-showcase
+                COMMAND
+                    ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/examples/mandelbulb_showcase.py" --architecture
+                    metal --headless --preset smoke --output "${VERNON_TEST_BINARY_ROOT}/metal_mandelbulb_showcase.png")
+            add_test(NAME vernon-metal-fractal-example
+                     COMMAND ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/examples/fractal.py" --architecture metal
+                             --headless --frames 1)
+            add_test(
+                NAME vernon-metal-pbr-example
+                COMMAND ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/examples/pbr.py" --architecture metal
+                        --headless --frames 1 --size 128 --output "${VERNON_TEST_BINARY_ROOT}/metal_pbr_example.png")
+            add_test(
+                NAME vernon-metal-complete-pipeline-example
+                COMMAND
+                    ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/examples/complete_pipeline.py" --architecture metal
+                    --headless --frames 1 --size 64 --instances 2 --output
+                    "${VERNON_TEST_BINARY_ROOT}/metal_complete_pipeline_example.png")
+            add_test(
+                NAME vernon-metal-dynamic-ocean-example
+                COMMAND
+                    ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/examples/dynamic_ocean.py" --arch metal --headless
+                    --frames 1 --size 64 --grid 16 --output "${VERNON_TEST_BINARY_ROOT}/metal_dynamic_ocean.png")
+            add_test(
+                NAME vernon-metal-dynamic-terrain-erosion-example
+                COMMAND
+                    ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/examples/dynamic_terrain_erosion.py" --arch metal
+                    --headless --frames 1 --size 64 --grid 16 --output
+                    "${VERNON_TEST_BINARY_ROOT}/metal_dynamic_terrain_erosion.png")
+            set_tests_properties(
+                vernon-metal-mandelbulb-showcase
+                vernon-metal-fractal-example
+                vernon-metal-pbr-example
+                vernon-metal-complete-pipeline-example
+                vernon-metal-dynamic-ocean-example
+                vernon-metal-dynamic-terrain-erosion-example
+                PROPERTIES ENVIRONMENT "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python")
         endif()
     endif()
 

@@ -524,7 +524,9 @@ asset = vd.pipeline_asset(
                                     "name": f"{stage}_uniforms",
                                     "set": 0,
                                     "binding": 0,
-                                    "index": 0,
+                                    "argument_buffer_index": 0,
+                                    "member_id": 0,
+                                    "direct_buffer_index": 4294967295,
                                     "count": 1,
                                 }
                             ]
@@ -632,7 +634,8 @@ asset = vd.pipeline_asset(
                         for stage_record in document["stage_artifacts"].values():
                             slots = stage_record["reflection"]["metal_resource_slots"]
                             self.assertEqual(len(slots), 1)
-                            self.assertEqual(slots[0]["index"], 0)
+                            self.assertEqual(slots[0]["argument_buffer_index"], 0)
+                            self.assertEqual(slots[0]["member_id"], 0)
                     self.assertEqual(len(descriptors), len(stages))
                     self.assertEqual(
                         len(list((output / "artifacts").iterdir())),

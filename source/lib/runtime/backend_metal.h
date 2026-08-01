@@ -7,6 +7,7 @@
 #include "runtime_state.h"
 #include "tensor_bridge.h"
 
+#include <cstdint>
 #include <vector>
 
 struct VernonRuntimeRhiAdapter;
@@ -18,6 +19,7 @@ struct MetalContextState {
     uint32_t maxComputeInvocations{};
     uint32_t maxComputeWorkGroupSize[3]{};
     RuntimeVersion operatingSystemVersion;
+    uint32_t argumentBuffersTier{};
 };
 
 inline MetalContextState &metalState(VernonRuntimeContext &context) {
@@ -41,6 +43,8 @@ struct MetalPipelineState {
         };
         Source source{};
         uint32_t externalSlot{};
+        uint32_t descriptorSet{UINT32_MAX};
+        uint32_t descriptorBinding{UINT32_MAX};
         TensorPackingLayout packing;
         std::vector<uint8_t> storage;
     };

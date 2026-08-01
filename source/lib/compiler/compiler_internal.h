@@ -22,7 +22,9 @@ struct TargetResourceSlot {
     std::string name;
     uint32_t descriptorSet{};
     uint32_t binding{};
-    uint32_t index{};
+    uint32_t argumentBufferIndex{UINT32_MAX};
+    uint32_t memberId{UINT32_MAX};
+    uint32_t directBufferIndex{UINT32_MAX};
     uint32_t count{1};
 };
 

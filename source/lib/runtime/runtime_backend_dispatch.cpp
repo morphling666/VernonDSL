@@ -110,6 +110,7 @@ bool initializeBackendForRhiDevice(VernonRuntimeContext &context, VernonRhiDevic
         std::copy_n(capabilities.maxComputeWorkGroupSize, 3, state->maxComputeWorkGroupSize);
         state->operatingSystemVersion = {capabilities.operatingSystemVersion[0],
                                          capabilities.operatingSystemVersion[1]};
+        state->argumentBuffersTier = capabilities.argumentBuffersTier;
         installRuntimeBackendState(context, state);
         break;
     }

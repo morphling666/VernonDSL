@@ -9,6 +9,7 @@
 #include <exception>
 #include <map>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -54,17 +55,30 @@ struct MetalBinding {
     uint32_t binding{};
     MetalResourceClass resourceClass{};
     std::string kind;
-    uint32_t index{};
+    uint32_t argumentBufferIndex{UINT32_MAX};
+    uint32_t memberId{UINT32_MAX};
+    uint32_t directBufferIndex{UINT32_MAX};
+    uint32_t count{1};
     bool pushConstant{};
 };
 
-using MetalBindingKey = std::tuple<MetalResourceClass, uint32_t, uint32_t, std::string, std::string>;
-using MetalBindingBaseKey = std::tuple<MetalResourceClass, uint32_t, uint32_t, std::string>;
-
 constexpr uint32_t metalPushConstantBufferIndex = 15;
-constexpr uint32_t metalMaxDescriptorBufferCount = metalPushConstantBufferIndex;
-constexpr uint32_t metalMaxTextureCount = 128;
-constexpr uint32_t metalMaxSamplerCount = 16;
+constexpr uint32_t metalMaxBufferCount = 31;
+constexpr uint32_t metalMaxArgumentBuffers = spirv_cross::kMaxArgumentBuffers;
+
+uint32_t metalResourceCount(const spirv_cross::CompilerMSL &compiler, const spirv_cross::Resource &resource,
+                            std::string &diagnostics) {
+    const auto &type = compiler.get_type(resource.type_id);
+    uint64_t count = 1;
+    for (uint32_t dimension : type.array) {
+        if (dimension == 0 || count > UINT32_MAX / dimension) {
+            diagnostics = "Metal resource '" + resource.name + "' has an unsupported descriptor array";
+            return 0;
+        }
+        count *= dimension;
+    }
+    return static_cast<uint32_t>(count);
+}
 
 bool collectMetalBindings(const std::vector<uint32_t> &words, const spirv_cross::EntryPoint &entry,
                           std::vector<MetalBinding> &bindings, std::string &diagnostics) {
@@ -79,11 +93,14 @@ bool collectMetalBindings(const std::vector<uint32_t> &words, const spirv_cross:
             diagnostics = "Metal resource '" + resource.name + "' has no descriptor set and binding";
             return false;
         }
+        const uint32_t count = metalResourceCount(compiler, resource, diagnostics);
+        if (!count)
+            return false;
         bindings.push_back(
             {entry.name, resource.name, resource.id, entry.execution_model,
              requiresDescriptor ? compiler.get_decoration(resource.id, spv::DecorationDescriptorSet) : UINT32_MAX,
              requiresDescriptor ? compiler.get_decoration(resource.id, spv::DecorationBinding) : UINT32_MAX,
-             resourceClass, std::move(kind)});
+             resourceClass, std::move(kind), UINT32_MAX, UINT32_MAX, UINT32_MAX, count});
         return true;
     };
     for (const auto &resource : resources.uniform_buffers)
@@ -119,67 +136,79 @@ bool collectMetalBindings(const std::vector<uint32_t> &words, const spirv_cross:
     if (!resources.push_constant_buffers.empty())
         bindings.push_back({entry.name, resources.push_constant_buffers.front().name,
                             resources.push_constant_buffers.front().id, entry.execution_model, 0, 0,
-                            MetalResourceClass::Buffer, "inline_constant", metalPushConstantBufferIndex, true});
+                            MetalResourceClass::Buffer, "inline_constant", UINT32_MAX, UINT32_MAX,
+                            metalPushConstantBufferIndex, 1, true});
     return true;
 }
 
-bool assignMetalBindingIndices(std::vector<MetalBinding> &bindings, std::string &diagnostics) {
-    using EntryBindingKey =
-        std::tuple<std::string, spv::ExecutionModel, MetalResourceClass, uint32_t, uint32_t, std::string>;
-    std::map<EntryBindingKey, size_t> entryBindingCounts;
-    std::set<MetalBindingBaseKey> ambiguousBindings;
-    for (const MetalBinding &binding : bindings) {
-        if (binding.pushConstant)
+bool assignMetalArgumentBindings(std::vector<MetalBinding> &bindings, std::string &diagnostics) {
+    using EntryKey = std::pair<std::string, spv::ExecutionModel>;
+    using SetKey = std::tuple<std::string, spv::ExecutionModel, uint32_t>;
+    using MemberKey =
+        std::tuple<std::string, spv::ExecutionModel, uint32_t, uint32_t, MetalResourceClass, std::string, std::string>;
+    std::map<EntryKey, std::set<uint32_t>> entrySets;
+    std::map<MemberKey, uint32_t> memberCounts;
+    for (const auto &binding : bindings) {
+        if (binding.pushConstant || binding.descriptorSet == UINT32_MAX)
             continue;
-        const EntryBindingKey entryKey{binding.entryPoint,    binding.stage,   binding.resourceClass,
-                                       binding.descriptorSet, binding.binding, binding.kind};
-        if (++entryBindingCounts[entryKey] > 1)
-            ambiguousBindings.emplace(binding.resourceClass, binding.descriptorSet, binding.binding, binding.kind);
-    }
-    auto key = [&](const MetalBinding &binding) {
-        const MetalBindingBaseKey base{binding.resourceClass, binding.descriptorSet, binding.binding, binding.kind};
-        return MetalBindingKey{binding.resourceClass, binding.descriptorSet, binding.binding, binding.kind,
-                               ambiguousBindings.count(base) ? binding.name : std::string{}};
-    };
-
-    std::map<MetalBindingKey, uint32_t> indices;
-    uint32_t nextBuffer = 0;
-    uint32_t nextTexture = 0;
-    uint32_t nextSampler = 0;
-    for (const MetalBinding &binding : bindings) {
-        if (binding.pushConstant)
-            continue;
-        indices.try_emplace(key(binding), 0);
-    }
-    for (auto &[key, index] : indices) {
-        switch (std::get<0>(key)) {
-        case MetalResourceClass::Buffer:
-            if (nextBuffer >= metalMaxDescriptorBufferCount) {
-                diagnostics = "Metal target supports at most 15 shader buffer bindings; slots 15-30 are reserved "
-                              "for inline constants and vertex buffers";
-                return false;
-            }
-            index = nextBuffer++;
-            break;
-        case MetalResourceClass::Texture:
-            if (nextTexture >= metalMaxTextureCount) {
-                diagnostics = "Metal target supports at most 128 texture bindings";
-                return false;
-            }
-            index = nextTexture++;
-            break;
-        case MetalResourceClass::Sampler:
-            if (nextSampler >= metalMaxSamplerCount) {
-                diagnostics = "Metal target supports at most 16 sampler bindings";
-                return false;
-            }
-            index = nextSampler++;
-            break;
+        if (binding.descriptorSet >= metalMaxArgumentBuffers) {
+            diagnostics = "Metal argument buffers support descriptor set indices 0-7";
+            return false;
+        }
+        entrySets[{binding.entryPoint, binding.stage}].insert(binding.descriptorSet);
+        const MemberKey key{binding.entryPoint,    binding.stage, binding.descriptorSet, binding.binding,
+                            binding.resourceClass, binding.kind,  binding.name};
+        const auto [iterator, inserted] = memberCounts.emplace(key, binding.count);
+        if (!inserted && iterator->second != binding.count) {
+            diagnostics = "Metal descriptor binding has inconsistent array counts";
+            return false;
         }
     }
-    for (MetalBinding &binding : bindings)
-        if (!binding.pushConstant)
-            binding.index = indices.at(key(binding));
+
+    std::map<SetKey, uint32_t> argumentBufferIndices;
+    for (const auto &[entry, sets] : entrySets) {
+        uint32_t index = 0;
+        for (uint32_t set : sets)
+            argumentBufferIndices[{entry.first, entry.second, set}] = index++;
+    }
+    std::map<MemberKey, uint32_t> memberIds;
+    std::map<SetKey, uint32_t> nextMemberId;
+    for (const auto &[key, count] : memberCounts) {
+        const SetKey setKey{std::get<0>(key), std::get<1>(key), std::get<2>(key)};
+        uint32_t &next = nextMemberId[setKey];
+        if (next > UINT32_MAX - count) {
+            diagnostics = "Metal argument-buffer member IDs overflow";
+            return false;
+        }
+        memberIds[key] = next;
+        next += count;
+    }
+
+    std::map<EntryKey, uint32_t> nextDirectBuffer;
+    for (const auto &[entry, sets] : entrySets)
+        nextDirectBuffer[entry] = static_cast<uint32_t>(sets.size());
+    for (auto &binding : bindings) {
+        if (binding.pushConstant)
+            continue;
+        const EntryKey entry{binding.entryPoint, binding.stage};
+        if (binding.descriptorSet != UINT32_MAX) {
+            const SetKey setKey{binding.entryPoint, binding.stage, binding.descriptorSet};
+            const MemberKey memberKey{binding.entryPoint,    binding.stage, binding.descriptorSet, binding.binding,
+                                      binding.resourceClass, binding.kind,  binding.name};
+            binding.argumentBufferIndex = argumentBufferIndices.at(setKey);
+            binding.memberId = memberIds.at(memberKey);
+            continue;
+        }
+        uint32_t &index = nextDirectBuffer[entry];
+        if (index == metalPushConstantBufferIndex)
+            ++index;
+        if ((binding.stage != spv::ExecutionModelGLCompute && index >= metalPushConstantBufferIndex) ||
+            index >= metalMaxBufferCount) {
+            diagnostics = "Metal stage has too many direct inline buffer bindings after argument-buffer allocation";
+            return false;
+        }
+        binding.directBufferIndex = index++;
+    }
     return true;
 }
 
@@ -188,13 +217,16 @@ void configureMetalCompiler(spirv_cross::CompilerMSL &compiler, VernonMetalPlatf
     options.platform = platform == VERNON_METAL_PLATFORM_IOS ? spirv_cross::CompilerMSL::Options::iOS
                                                              : spirv_cross::CompilerMSL::Options::macOS;
     options.msl_version = spirv_cross::CompilerMSL::Options::make_msl_version(2, 4);
-    options.argument_buffers = false;
+    options.argument_buffers = true;
+    options.argument_buffers_tier = spirv_cross::CompilerMSL::Options::ArgumentBuffersTier::Tier2;
     compiler.set_msl_options(options);
 }
 
 void applyMetalBindings(spirv_cross::CompilerMSL &compiler, llvm::StringRef entryPoint, spv::ExecutionModel stage,
                         const std::vector<MetalBinding> &bindings) {
-    std::map<uint32_t, spirv_cross::MSLResourceBinding> resources;
+    using ResourceKey = std::pair<uint32_t, uint32_t>;
+    std::map<ResourceKey, spirv_cross::MSLResourceBinding> resources;
+    std::map<uint32_t, uint32_t> argumentBuffers;
     for (const MetalBinding &binding : bindings) {
         if (binding.entryPoint != entryPoint || binding.stage != stage)
             continue;
@@ -204,24 +236,48 @@ void applyMetalBindings(spirv_cross::CompilerMSL &compiler, llvm::StringRef entr
             resource.desc_set = spirv_cross::ResourceBindingPushConstantDescriptorSet;
             resource.binding = spirv_cross::ResourceBindingPushConstantBinding;
             resource.count = 1;
-            resource.msl_buffer = binding.index;
+            resource.msl_buffer = binding.directBufferIndex;
             compiler.add_msl_resource_binding(resource);
             continue;
         }
-        compiler.set_decoration(binding.resourceId, spv::DecorationDescriptorSet, 31);
-        compiler.set_decoration(binding.resourceId, spv::DecorationBinding, binding.resourceId);
-        auto iterator = resources.try_emplace(binding.resourceId).first;
-        spirv_cross::MSLResourceBinding &resource = iterator->second;
+        if (binding.descriptorSet == UINT32_MAX) {
+            compiler.set_decoration(binding.resourceId, spv::DecorationDescriptorSet, 31);
+            compiler.set_decoration(binding.resourceId, spv::DecorationBinding, binding.resourceId);
+            auto iterator = resources.try_emplace({31, binding.resourceId}).first;
+            auto &resource = iterator->second;
+            resource.stage = stage;
+            resource.desc_set = 31;
+            resource.binding = binding.resourceId;
+            resource.count = binding.count;
+            resource.msl_buffer = binding.directBufferIndex;
+            continue;
+        }
+        const auto [setIterator, inserted] =
+            argumentBuffers.emplace(binding.descriptorSet, binding.argumentBufferIndex);
+        if (!inserted && setIterator->second != binding.argumentBufferIndex) {
+            throw std::runtime_error("Metal descriptor set has inconsistent argument-buffer indices");
+        }
+        auto iterator = resources.try_emplace({binding.descriptorSet, binding.binding}).first;
+        auto &resource = iterator->second;
         resource.stage = stage;
-        resource.desc_set = 31;
-        resource.binding = binding.resourceId;
-        resource.count = 1;
+        resource.desc_set = binding.descriptorSet;
+        resource.binding = binding.binding;
+        resource.count = binding.count;
         if (binding.resourceClass == MetalResourceClass::Buffer)
-            resource.msl_buffer = binding.index;
+            resource.msl_buffer = binding.memberId;
         else if (binding.resourceClass == MetalResourceClass::Texture)
-            resource.msl_texture = binding.index;
+            resource.msl_texture = binding.memberId;
         else
-            resource.msl_sampler = binding.index;
+            resource.msl_sampler = binding.memberId;
+    }
+    for (const auto &[set, index] : argumentBuffers) {
+        spirv_cross::MSLResourceBinding resource;
+        resource.stage = stage;
+        resource.desc_set = set;
+        resource.binding = spirv_cross::kArgumentBufferBinding;
+        resource.count = 1;
+        resource.msl_buffer = index;
+        compiler.add_msl_resource_binding(resource);
     }
     for (const auto &resource : resources)
         compiler.add_msl_resource_binding(resource.second);
@@ -248,7 +304,7 @@ bool crossCompileSpirv(std::vector<Artifact> &artifacts, std::string &diagnostic
                     if (!collectMetalBindings(words, entry, metalBindings, diagnostics))
                         return false;
             }
-            if (!assignMetalBindingIndices(metalBindings, diagnostics))
+            if (!assignMetalArgumentBindings(metalBindings, diagnostics))
                 return false;
         }
         for (const Artifact &artifact : artifacts) {
@@ -363,9 +419,10 @@ bool crossCompileSpirv(std::vector<Artifact> &artifacts, std::string &diagnostic
         if (target == VERNON_TARGET_METAL && targetResourceSlots) {
             targetResourceSlots->clear();
             for (const MetalBinding &binding : metalBindings)
-                targetResourceSlots->push_back({binding.entryPoint, stageName(binding.stage).str(), binding.kind,
-                                                binding.name, binding.descriptorSet, binding.binding, binding.index,
-                                                1});
+                targetResourceSlots->push_back(
+                    TargetResourceSlot{binding.entryPoint, stageName(binding.stage).str(), binding.kind, binding.name,
+                                       binding.descriptorSet, binding.binding, binding.argumentBufferIndex,
+                                       binding.memberId, binding.directBufferIndex, binding.count});
         }
     } catch (const std::exception &exception) {
         diagnostics = exception.what();

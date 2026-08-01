@@ -166,7 +166,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render a procedural metallic-roughness PBR cube and plane.")
     parser.add_argument(
         "--arch",
-        choices=("vulkan", "directx", "opengl"),
+        "--architecture",
+        dest="arch",
+        choices=("vulkan", "directx", "opengl", "metal"),
         default="vulkan",
     )
     parser.add_argument("--headless", action="store_true")
@@ -190,6 +192,7 @@ def main() -> None:
         "vulkan": vd.vulkan,
         "directx": vd.directx,
         "opengl": vd.opengl,
+        "metal": vd.metal,
     }[args.arch]
     window_name = "VernonDSL PBR"
     vd.init(

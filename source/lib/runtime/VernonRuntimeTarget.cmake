@@ -165,6 +165,7 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_direct.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_directx12.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_dispatch.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_metal.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_opengl.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_vulkan.cpp)
     add_library(Vernon::Runtime ALIAS VernonRuntime)
@@ -194,7 +195,6 @@ function(vernon_add_runtime)
         target_link_libraries(VernonRuntime PRIVATE d3d12 dxgi dxguid)
     endif()
     if(VERNON_ENABLE_METAL_RUNTIME)
-        target_sources(VernonRuntime PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_metal.cpp)
         target_compile_definitions(VernonRuntime PUBLIC VERNON_HAS_METAL_RUNTIME=1)
     endif()
     target_include_directories(

@@ -72,7 +72,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--arch",
-        choices=("cpu", "cuda", "vulkan", "directx"),
+        "--architecture",
+        dest="arch",
+        choices=("cpu", "cuda", "vulkan", "directx", "metal"),
         default="cpu",
         help="compute backend; DirectX requires Windows",
     )
@@ -104,7 +106,15 @@ def main() -> None:
     except TypeError as error:
         print("expected host domain error:", error)
 
-    vd.init(arch={"cpu": vd.cpu, "cuda": vd.cuda, "vulkan": vd.vulkan, "directx": vd.directx}[args.arch])
+    vd.init(
+        arch={
+            "cpu": vd.cpu,
+            "cuda": vd.cuda,
+            "vulkan": vd.vulkan,
+            "directx": vd.directx,
+            "metal": vd.metal,
+        }[args.arch]
+    )
     output = vd.storage.zeros(dtype=vd.f32, shape=(4,))
     evaluate_falloff(output, 1.0, grid=(4, 1, 1))
     device_values = output.to_numpy()

@@ -107,7 +107,7 @@ def create_seabed(extent: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compute-driven holographic ocean with PBR, shadows, and cubemap IBL.")
-    parser.add_argument("--arch", choices=("vulkan", "directx", "opengl"), default="vulkan")
+    parser.add_argument("--arch", choices=("vulkan", "directx", "metal", "opengl"), default="vulkan")
     parser.add_argument("--size", type=int, default=640)
     parser.add_argument("--grid", type=int, default=192)
     parser.add_argument("--extent", type=float, default=14.0)

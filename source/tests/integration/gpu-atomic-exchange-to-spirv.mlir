@@ -1,4 +1,4 @@
-module attributes {vernon.compiler_contract_version = 7 : i64, vernon.pipeline_version = 10 : i64} {
+module attributes {vernon.compiler_contract_version = 8 : i64, vernon.pipeline_version = 10 : i64} {
   gpu.module @kernels {
     gpu.func @exchange(%storage: memref<1xi32, #spirv.storage_class<Workgroup>>) kernel
         attributes {spirv.entry_point_abi = #spirv.entry_point_abi<workgroup_size = [1, 1, 1]>} {

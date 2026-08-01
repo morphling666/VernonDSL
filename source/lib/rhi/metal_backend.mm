@@ -141,6 +141,7 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
         const NSOperatingSystemVersion version = NSProcessInfo.processInfo.operatingSystemVersion;
         operatingSystemVersion[0] = static_cast<uint32_t>(version.majorVersion);
         operatingSystemVersion[1] = static_cast<uint32_t>(version.minorVersion);
+        argumentBuffersTier = static_cast<uint32_t>(device.argumentBuffersSupport);
         return true;
     }
     error = "Metal default device or command queue creation failed";
@@ -154,6 +155,7 @@ void DeviceState::shutdown() {
     maxComputeInvocations = 0;
     std::fill(std::begin(maxComputeWorkGroupSize), std::end(maxComputeWorkGroupSize), 0);
     std::fill(std::begin(operatingSystemVersion), std::end(operatingSystemVersion), 0);
+    argumentBuffersTier = 0;
 }
 
 bool DeviceState::synchronize(std::string &error) {
@@ -454,6 +456,7 @@ bool DeviceState::createSampler(Sampler &sampler, const VernonRhiSamplerDescript
     native.tAddressMode = addressMode(descriptor.address_v);
     native.rAddressMode = addressMode(descriptor.address_w);
     native.maxAnisotropy = static_cast<NSUInteger>(filter.maxAnisotropy);
+    native.supportArgumentBuffers = YES;
     sampler.sampler = [device newSamplerStateWithDescriptor:native];
     if (sampler.sampler)
         return true;

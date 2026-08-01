@@ -10,6 +10,7 @@ struct DeviceCapabilities {
     uint32_t maxComputeInvocations{};
     uint32_t maxComputeWorkGroupSize[3]{};
     uint32_t operatingSystemVersion[2]{};
+    uint32_t argumentBuffersTier{};
 };
 
 } // namespace vernon::rhi::metal

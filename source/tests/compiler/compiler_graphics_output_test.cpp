@@ -287,19 +287,23 @@ TEST(CompilerGraphicsOutput, PreservesInterfacesTexturesAndSwizzles) {
             ASSERT_TRUE(reflected.contains("metal_resource_slots"));
             const auto &slots = reflected["metal_resource_slots"];
             auto hasSlot = [&](std::string_view entry, std::string_view kind, uint32_t set, uint32_t binding,
-                               uint32_t index) {
+                               uint32_t argumentBuffer, uint32_t memberId) {
                 return std::any_of(slots.begin(), slots.end(), [&](const nlohmann::json &slot) {
                     return slot.value("entry_point", "") == entry && slot.value("kind", "") == kind &&
                            slot.value("set", UINT32_MAX) == set && slot.value("binding", UINT32_MAX) == binding &&
-                           slot.value("index", UINT32_MAX) == index && slot.value("count", 0u) == 1;
+                           slot.value("argument_buffer_index", UINT32_MAX) == argumentBuffer &&
+                           slot.value("member_id", UINT32_MAX) == memberId &&
+                           slot.value("direct_buffer_index", 0u) == UINT32_MAX && slot.value("count", 0u) == 1;
                 });
             };
-            EXPECT_TRUE(hasSlot("cube_map_fragment", "sampled_image", 0, 0, 0)) << slots.dump();
-            EXPECT_TRUE(hasSlot("cube_map_fragment", "sampler", 0, 0, 0)) << slots.dump();
-            EXPECT_NE(output.find("[[texture(0)]]"), std::string::npos);
-            EXPECT_NE(output.find("[[sampler(0)]]"), std::string::npos);
-            for (uint32_t index = 0; index < 3; ++index)
-                EXPECT_NE(output.find("[[buffer(" + std::to_string(index) + ")]]"), std::string::npos) << output;
+            EXPECT_TRUE(hasSlot("cube_map_fragment", "sampled_image", 0, 0, 0, 0)) << slots.dump();
+            EXPECT_TRUE(hasSlot("cube_map_fragment", "sampler", 0, 0, 0, 1)) << slots.dump();
+            EXPECT_NE(output.find("[[id(0)]]"), std::string::npos);
+            EXPECT_NE(output.find("[[id(1)]]"), std::string::npos);
+            EXPECT_NE(output.find("spvDescriptorSetBuffer0"), std::string::npos);
+            EXPECT_NE(output.find("[[buffer(0)]]"), std::string::npos);
+            EXPECT_EQ(output.find("[[texture(0)]]"), std::string::npos);
+            EXPECT_EQ(output.find("[[sampler(0)]]"), std::string::npos);
         }
         for (std::string_view name : {"aPos", "TexCoord", "cubeMap", "color", "bloom_color"}) {
             if (output.find(name) == std::string::npos) {
@@ -332,6 +336,66 @@ TEST(CompilerGraphicsOutput, PreservesInterfacesTexturesAndSwizzles) {
         }
         vernonCompileResultDestroy(result);
     }
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerGraphicsOutput, LowersEachMetalDescriptorSetToOneArgumentBuffer) {
+    static constexpr char multiSetModule[] = R"(
+module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
+  func.func @multi_set_compute(
+      %left: !vernon.tensor_view<f32, [1], "read_write", "device"> {
+        vernon.interface = "resource",
+        vernon.set = 0 : i64,
+        vernon.binding = 0 : i64
+      },
+      %right: !vernon.tensor_view<f32, [1], "read", "device"> {
+        vernon.interface = "resource",
+        vernon.set = 1 : i64,
+        vernon.binding = 0 : i64
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 1, 1, 1>
+      } {
+    %zero = arith.constant 0 : index
+    %left_value = "vernon.load"(%left, %zero) :
+      (!vernon.tensor_view<f32, [1], "read_write", "device">, index) -> f32
+    %right_value = "vernon.load"(%right, %zero) :
+      (!vernon.tensor_view<f32, [1], "read", "device">, index) -> f32
+    %sum = arith.addf %left_value, %right_value : f32
+    "vernon.store"(%sum, %left, %zero) :
+      (f32, !vernon.tensor_view<f32, [1], "read_write", "device">, index) -> ()
+    return
+  }
+}
+)";
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_NE(compiler, nullptr);
+    VernonCompileResult *result =
+        vernonCompilerCompileMlir(compiler, multiSetModule, sizeof(multiSetModule) - 1, VERNON_TARGET_METAL);
+    ASSERT_NE(result, nullptr);
+    if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
+        const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+        std::fprintf(stderr, "multi-set Metal compile failed: %.*s\n", static_cast<int>(diagnostics.size),
+                     diagnostics.data);
+    }
+    ASSERT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+    const std::string output = artifacts(result);
+    EXPECT_NE(output.find("spvDescriptorSetBuffer0"), std::string::npos);
+    EXPECT_NE(output.find("spvDescriptorSetBuffer1"), std::string::npos);
+    EXPECT_NE(output.find("[[buffer(0)]]"), std::string::npos);
+    EXPECT_NE(output.find("[[buffer(1)]]"), std::string::npos);
+    const VernonStringView reflection = vernonCompileResultGetReflection(result);
+    const auto reflected = nlohmann::json::parse(reflection.data, reflection.data + reflection.size);
+    const auto &slots = reflected.at("metal_resource_slots");
+    for (uint32_t set = 0; set < 2; ++set) {
+        EXPECT_TRUE(std::any_of(slots.begin(), slots.end(), [&](const nlohmann::json &slot) {
+            return slot.value("entry_point", "") == "multi_set_compute" && slot.value("kind", "") == "storage_buffer" &&
+                   slot.value("set", UINT32_MAX) == set && slot.value("argument_buffer_index", UINT32_MAX) == set &&
+                   slot.value("member_id", UINT32_MAX) == 0;
+        })) << slots.dump();
+    }
+    vernonCompileResultDestroy(result);
     vernonCompilerDestroy(compiler);
 }
 

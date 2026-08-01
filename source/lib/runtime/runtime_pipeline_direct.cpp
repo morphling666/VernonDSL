@@ -1,7 +1,6 @@
 #include "runtime_dispatch.h"
 
 #include "backend_cpu.h"
-#include "tensor_bridge.h"
 
 #include <nlohmann/json.hpp>
 
@@ -209,7 +208,8 @@ VernonLoadedPipeline *loadBackendArtifactPipeline(VernonRuntimeContext &context,
     stage.entry = entry;
     stage.reflection.assign(reflectionData, reflectionSize);
     std::copy_n(reflection.workgroup, 3, stage.workgroup);
-    if (context.backend == VERNON_RUNTIME_CUDA || isOpenGLBackend(context.backend))
+    if (context.backend == VERNON_RUNTIME_CUDA || context.backend == VERNON_RUNTIME_METAL ||
+        isOpenGLBackend(context.backend))
         stage.source.assign(static_cast<const char *>(artifact), artifactSize);
     else
         stage.binary.assign(static_cast<const uint8_t *>(artifact),
