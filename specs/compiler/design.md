@@ -37,8 +37,8 @@ SPIR-V is not the universal backend IR. Target lowering branches from typed
 Vernon and standard MLIR:
 
 - Graphics stages lower through Vernon interface semantics to SPIR-V.
-- Compute kernels lower to `gpu.module`/`gpu.func`, then to SPIR-V, NVVM, or
-  ROCDL according to the target.
+- Compute kernels lower to `gpu.module`/`gpu.func`, then to SPIR-V or NVVM
+  according to the current target.
 - CPU reference execution lowers directly to LLVM.
 
 CUDA therefore uses GPU to NVVM to NVPTX and never depends on SPIR-V.
@@ -330,7 +330,9 @@ artifact generation pipeline is registered. An IR-only prototype must return
 `VERNON_STATUS_UNSUPPORTED_TARGET`. Source artifacts are valid terminal
 compiler products: Metal availability means MSL generation works. DirectX
 availability means SPIRV-Cross HLSL generation and pinned DXC compilation both
-work, producing a validated DXIL container.
+work, producing a validated DXIL container. Compiler target availability is
+distinct from Runtime availability: cooked MSL is consumed by the stable Metal
+compute and offscreen graphics Runtime on supported Apple Silicon Macs.
 
 ## CPU resource ABI
 
@@ -378,11 +380,14 @@ Graphics DSL -> Vernon graphics IR -> SPIR-V
 Compute DSL -> MLIR GPU dialect
                             |-> SPIR-V for Vulkan compute
                             |-> NVVM -> NVPTX/PTX for CUDA
-                            |-> ROCDL for AMD GPU
                             `-> standard MLIR -> LLVM for CPU reference
 ```
 
-SPIR-V is canonical for graphics and Vulkan compute, but it is not the universal compute backend. CUDA must not be routed through SPIR-V. The project must not maintain independent GLSL, MSL, or HLSL emitters; those languages are produced through SPIRV-Cross, with target capability validation before translation.
+SPIR-V is canonical for graphics and Vulkan compute, but it is not the
+universal compute backend. CUDA must not be routed through SPIR-V. The project
+must not maintain independent GLSL, MSL, or HLSL emitters; those languages are
+produced through SPIRV-Cross, with target capability validation before
+translation. AMD/ROCDL remains future work rather than a registered target.
 
 ### Static Tensor GPU value ABI
 
@@ -444,16 +449,30 @@ one-element Values as SPIR-V composites. The Vulkan adapter maps compute inline
 values to storage-buffer descriptors consistently during layout creation and
 descriptor updates.
 
-GLSL language versions are compile options, not backend constants. A zero
-version selects the target default; OpenGL and OpenGL ES callers may request a
-specific version through the stable C API or CLI. Other targets reject this
-option rather than silently ignoring it.
+GLSL language versions belong to the OpenGL target options, not to a shared
+compile-options bag or backend constants. An omitted version selects the target
+default; OpenGL and OpenGL ES callers may request a specific version through
+their typed C API union member or `--opengl-version`.
+
+Every compile surface uses the same target-discriminated vocabulary:
+
+- CPU: `triple`, `processor`, and ordered `features`
+- OpenGL/OpenGL ES: `version`
+- Metal: `platform`
+- DirectX: `shader_model`
+- Vulkan/CUDA: no configurable target options
+
+The C API represents these as `VernonCompileOptions.target` plus the matching
+`as.*` union member. Python exposes one frozen dataclass per target. Reflection
+and PipelineAssets serialize the same model as
+`{"kind": <target>, "options": {...}}`; emitted language and minimum-OS
+metadata are output facts, not compile options.
 
 HLSL Shader Model is likewise a compile option and is valid only for DirectX.
-The stable C API and cooker encode it as major times ten plus minor (`60` for
+The C API DirectX union member and cooker encode it as major times ten plus minor (`60` for
 Shader Model 6.0), defaulting to `60` and rejecting older models. It
 participates in artifact identity and is recorded in compiler reflection and
-PipelineAsset `target_options`. Builds use a pinned, hash-verified official DXC
+the PipelineAsset target spec. Builds use a pinned, hash-verified official DXC
 redistributable so developer and CI artifacts share the same compiler.
 `VERNON_DXC_EXECUTABLE` remains an explicit override for offline and managed
 toolchains. The cooker strips debug/reflection data for deterministic runtime
@@ -630,17 +649,21 @@ content-addressed external artifacts. It compiles in process through
 `vernon_dsl._native`; there is no compiler-executable argument or compatibility
 manifest. For runtime-backed targets, Runtime validates manifest structure,
 content hashes, artifact paths, sizes, digests, reflection, and exact feature
-keys. Metal MSL manifests remain cook-only. DirectX DXIL manifests use the
-Windows D3D12 runtime backend.
+keys. Metal MSL manifests are consumed by the Metal Runtime on Apple; that path
+is part of the stable Apple Silicon macOS compute and offscreen graphics
+subset. DirectX DXIL manifests use the Windows D3D12 runtime backend.
 
-Runtime-backed PipelineAssets also carry optional, hash-covered
-`runtime_requirements`. The cooker derives these from the emitted object,
-GLSL, SPIR-V, PTX, or DXIL artifact and aggregates sorted reflection features.
+Runtime-backed PipelineAssets also carry hash-covered `runtime_requirements`.
+The cooker derives these from the emitted object,
+GLSL, SPIR-V, PTX, MSL, or DXIL artifact and aggregates sorted reflection
+features.
 Requirements do not participate in stage artifact identity, so content
 addressing and cross-variant artifact deduplication remain stable.
-`target_options` describe compilation inputs; `runtime_requirements` describe
-the resulting artifact's minimum execution environment. Omitting requirements
-is reserved for the cook-only Metal target.
+The canonical `target` object is a tagged union with `kind` and one
+backend-specific `options` object; it describes compilation inputs.
+`runtime_requirements` describe the resulting artifact's minimum execution environment. Metal requirements
+record the Apple platform, MSL version, minimum OS version, and required
+features.
 
 ## Language representation boundary
 
@@ -648,8 +671,8 @@ The normative source-language model is specified in
 `specs/language/contract.md`. It is implemented phase by phase toward frontend
 version 4, while released builds remain frontend version 3 until all required
 v4 acceptance gates pass. There is currently no numeric `FRONTEND_VERSION`
-constant. Unchecked contract gates and active compiler architecture work in
-`specs/completion_roadmap.md` remain incomplete.
+constant. Unchecked language-v4 contract gates remain future work. Historical
+planning documents do not redefine this current compiler contract.
 
 Typed IR must classify each entity as Value, Storage, or Resource. Value
 `Tensor` identity contains recursively ABI-stable element type and logical
@@ -675,14 +698,13 @@ element-based layout to byte offsets and strides only after leaf and Struct
 ABI layout is fixed. `RawBuffer` bypasses typed ownership/layout guarantees and
 therefore requires explicit view validation.
 
-Direct compute specializes `TensorView` physical addressing into the
-compiled entry: logical indices become `offset + sum(index[i] * stride[i])`.
-The specialization cache identity includes shape, signed element strides, and
-element offset. Backends still receive the owner's whole allocation as a
-rank-one storage resource, so CPU, CUDA, and SPIR-V use identical addressing
-without a backend-specific public descriptor ABI. A different view layout
-therefore recompiles the entry; layout metadata remains runtime state and does
-not become part of the source `TensorView` type.
+Direct compute projects `TensorView` indices from the per-dispatch descriptor:
+logical indices become `offset + sum(index[i] * stride[i])`. Rank, static
+extent constraints, element type, and access are artifact state; extents,
+signed element strides, and element offset are invocation state and are
+excluded from artifact cache identity. Backends receive the owner's whole
+allocation plus the canonical descriptor sequence, so CPU, CUDA, and SPIR-V
+use identical addressing without layout-specific recompilation.
 
 Aggregate TensorView elements use canonical ABI leaf expansion during backend
 lowering because MLIR memrefs cannot contain LLVM/SPIR-V aggregate element

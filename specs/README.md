@@ -1,8 +1,8 @@
 # VernonDSL specifications
 
-`specs/` contains current contracts, architecture decisions, and active future
-work. Completed plans and superseded proposals are deleted; Git history is the
-archive.
+`specs/` contains current contracts, architecture decisions, and the active
+project roadmap. Git history is the archive for superseded implementation plans
+and milestone checklists.
 
 ## Reading order
 
@@ -15,17 +15,15 @@ archive.
    lowering invariants, reflection, target routing, and artifact cooking.
 4. [`runtime/design.md`](runtime/design.md) defines deployment ABI, backend
    ownership, resource behavior, and execution semantics.
-5. [`language/future_language_roadmap.md`](language/future_language_roadmap.md)
-   lists incomplete language-v4 acceptance gates.
-6. [`completion_roadmap.md`](completion_roadmap.md) lists active work required
-   for beta and stable releases.
+5. [`roadmap.md`](roadmap.md) summarizes completed milestones and current future
+   work across language, compiler, Runtime, backends, and release engineering.
+6. [`examples/design.md`](examples/design.md) records non-obvious showcase
+   algorithms and third-party design provenance.
 
-Supporting active documents:
+Supporting future-language detail:
 
-- [`deferred_gpu_resource_lifetime_plan.md`](deferred_gpu_resource_lifetime_plan.md)
-  defines deferred in-flight resource reclamation and multi-frame execution.
-- [`examples/design.md`](examples/design.md) records non-obvious showcase
-  algorithms and third-party design provenance.
+- [`language/future_language_roadmap.md`](language/future_language_roadmap.md)
+  lists incomplete language-v4 acceptance gates.
 
 ## Version policy
 

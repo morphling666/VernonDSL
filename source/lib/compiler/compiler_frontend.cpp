@@ -54,6 +54,8 @@ CompilerFrontend *createCompilerFrontend() { return new (std::nothrow) CompilerF
 
 void destroyCompilerFrontend(CompilerFrontend *frontend) { delete frontend; }
 
+mlir::MLIRContext &compilerMlirContext(CompilerFrontend &frontend) { return frontend.context; }
+
 PreparedModule::PreparedModule(mlir::OwningOpRef<mlir::ModuleOp> module) : module_(std::move(module)) {}
 
 mlir::MLIRContext &PreparedModule::context() { return *module_->getContext(); }

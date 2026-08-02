@@ -12,7 +12,7 @@ from typing import Any, ClassVar
 import numpy as np
 
 from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
-from ..bundle import TargetOptions, canonical_json
+from ..bundle import canonical_json, make_target_options
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
 from ..frontend.model import AccessMode, ConcreteType, StorageEffect, StorageEffectKind
 from ..types import TypeExpr, _Scalar
@@ -47,6 +47,7 @@ class _ImmediateComputePass(ComputePass):
 class _CompiledKernel:
     mlir: str
     function: ast.FunctionDef
+    frontend: FrontendCompileResult
     builtin_names: tuple[str, ...]
     writable_names: tuple[str, ...]
     program: Any
@@ -112,18 +113,8 @@ class Kernel:
 
     @staticmethod
     def _argument_signature(value: Any) -> tuple[Any, ...]:
-        if isinstance(value, TensorStorage):
-            return ("storage", value.dtype.str, value.shape)
-        if isinstance(value, TensorView):
-            layout = value.layout
-            return (
-                "view",
-                value.dtype.str,
-                value.shape,
-                layout.element_strides,
-                layout.element_offset,
-                value.access,
-            )
+        if isinstance(value, (TensorStorage, TensorView)):
+            return ("tensor",)
         return ("value", type(value).__module__, type(value).__qualname__)
 
     def _dispatch_key(
@@ -230,6 +221,28 @@ class Kernel:
         if isinstance(annotation, ast.Subscript) and cls._annotation_name(annotation.value) == "Annotated":
             annotation = annotation.slice.elts[0] if isinstance(annotation.slice, ast.Tuple) else annotation.slice
         return isinstance(annotation, ast.Subscript) and cls._annotation_name(annotation.value) == "Tensor"
+
+    def _normalize_arguments(
+        self,
+        function: ast.FunctionDef,
+        builtins: tuple[str, ...],
+        arguments: tuple[Any, ...],
+    ) -> tuple[list[str], tuple[Any, ...]]:
+        user_parameters = [argument.arg for argument in function.args.args if argument.arg not in builtins]
+        if len(arguments) != len(user_parameters):
+            raise TypeError(f"{self._entry} expects {len(user_parameters)} launch arguments")
+        declared_access = {
+            argument.arg: self._tensor_view_access(argument.annotation)
+            for argument in function.args.args
+            if argument.arg in user_parameters
+        }
+        normalized = tuple(
+            value._full_view(declared_access[name])
+            if isinstance(value, TensorStorage) and declared_access[name] is not None
+            else value
+            for name, value in zip(user_parameters, arguments, strict=True)
+        )
+        return user_parameters, normalized
 
     def _validate_tensor_view_arguments(
         self,
@@ -358,20 +371,7 @@ class Kernel:
         if function is None:
             raise RuntimeError("kernel functions must be top-level definitions in files")
         builtins = self._builtin_parameters(function)
-        user_parameters = [argument.arg for argument in function.args.args if argument.arg not in builtins]
-        if len(arguments) != len(user_parameters):
-            raise TypeError(f"{self._entry} expects {len(user_parameters)} launch arguments")
-        declared_access = {
-            argument.arg: self._tensor_view_access(argument.annotation)
-            for argument in function.args.args
-            if argument.arg in user_parameters
-        }
-        normalized_arguments = tuple(
-            value._full_view(declared_access[name])
-            if isinstance(value, TensorStorage) and declared_access[name] is not None
-            else value
-            for name, value in zip(user_parameters, arguments, strict=True)
-        )
+        user_parameters, normalized_arguments = self._normalize_arguments(function, builtins, arguments)
         tensors = {
             name: value
             for name, value in zip(user_parameters, normalized_arguments, strict=True)
@@ -393,17 +393,6 @@ class Kernel:
                 (name, value.dtype.str, value.shape)
                 for name, value in tensors.items()
                 if isinstance(value, TensorStorage)
-            ),
-            tuple(
-                (
-                    name,
-                    value.dtype.str,
-                    value.shape,
-                    value.layout.element_strides,
-                    value.layout.element_offset,
-                )
-                for name, value in tensors.items()
-                if isinstance(value, TensorView)
             ),
             constants,
             self._workgroup_size,
@@ -432,9 +421,9 @@ class Kernel:
         if target not in targets:
             raise ValueError("target must be cpu, cuda, vulkan, directx, metal, opengl, or opengles")
         frontend, _, _, _ = self._lower(arguments)
-        options = TargetOptions(
+        options = make_target_options(
             target,
-            {"glsl_version": 430} if target == "opengl" else {"glsl_version": 310} if target == "opengles" else {},
+            {"version": 430} if target == "opengl" else {"version": 310} if target == "opengles" else {},
         )
         program = state._native.Compiler().compile_program_result(
             frontend.mlir, targets[target], **options.native_options
@@ -455,21 +444,41 @@ class Kernel:
                 state.cuda: state._native.Target.CUDA,
                 state.vulkan: state._native.Target.VULKAN,
                 state.directx: state._native.Target.DIRECTX,
+                state.metal: state._native.Target.METAL,
                 state.opengl: state._native.Target.OPENGL,
                 state.opengles: state._native.Target.OPENGL_ES,
             }.get(state._architecture)
             if state._native is not None
             else None
         )
-        options = TargetOptions(
+        options = make_target_options(
             state._architecture.name,
-            {"glsl_version": state._interactive_glsl_version()}
+            {"version": state._interactive_glsl_version()}
             if state._architecture in {state.opengl, state.opengles}
             else {},
         )
         dispatch_key = self._dispatch_key(arguments, features, options.target, tuple(sorted(options.options.items())))
         cached = self._dispatch_cache.get(dispatch_key)
         if cached is not None and self._dependencies_current(cached):
+            entry = next(
+                (function for function in cached.frontend.typed_functions if function.source.name == self._entry),
+                None,
+            )
+            if entry is None:
+                raise RuntimeError("compiled kernel has no typed entry function")
+            typed_parameters = {parameter.name: parameter for parameter in entry.parameters}
+            user_parameters = [
+                parameter.name for parameter in entry.parameters if parameter.name not in cached.builtin_names
+            ]
+            if len(arguments) != len(user_parameters):
+                raise TypeError(f"{self._entry} expects {len(user_parameters)} launch arguments")
+            normalized_arguments = tuple(
+                value._full_view(typed_parameters[name].type.arguments[2])
+                if isinstance(value, TensorStorage) and typed_parameters[name].type.kind == "tensor_view"
+                else value
+                for name, value in zip(user_parameters, arguments, strict=True)
+            )
+            self._validate_tensor_view_arguments(cached.frontend, user_parameters, normalized_arguments)
             self._load_native(cached, state, self._entry)
             return cached
 
@@ -480,8 +489,7 @@ class Kernel:
                     "compiler_contract_version": COMPILER_CONTRACT_VERSION,
                     "pipeline_version": PIPELINE_VERSION,
                     "frontend": frontend.semantic_inputs,
-                    "target": options.target,
-                    "target_options": dict(options.options),
+                    "target": options.spec,
                 }
             ).encode()
         ).hexdigest()
@@ -495,6 +503,7 @@ class Kernel:
             cached = _CompiledKernel(
                 frontend.mlir,
                 function,
+                frontend,
                 builtins,
                 self._writable_parameters(frontend),
                 program,

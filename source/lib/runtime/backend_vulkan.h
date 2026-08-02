@@ -3,6 +3,7 @@
 
 #include "VernonRuntime.h"
 #include "VernonRuntimeCore.h"
+#include "compute_launch_planner.h"
 #include "pipeline_metadata.h"
 #include "runtime_state.h"
 #include "tensor_bridge.h"
@@ -59,18 +60,16 @@ struct VulkanPipelineState {
     std::vector<VernonRuntimeProviderBindingLayoutEntry> rhiComputeLayout;
     std::vector<VernonRuntimeProviderBindingValue> rhiComputeValues;
     std::vector<uint64_t> rhiComputeResourceOffsets;
+    std::vector<ComputeBindingSource> rhiComputeBindingSources;
+    std::vector<int64_t> rhiComputeDescriptorValues;
     uint32_t rhiComputeWorkgroup[3]{1, 1, 1};
     VernonRuntimeCorePipeline *rhiGraphicsPipeline{};
     VernonRuntimeCoreBindings *rhiGraphicsBindings{};
-    VernonRuntimeCoreGraphicsVariant *rhiGraphicsVariant{};
+    PreparedGraphicsVariant rhiGraphicsVariant;
     std::vector<VernonRuntimeProviderBindingLayoutEntry> rhiGraphicsLayout;
     std::vector<VernonRuntimeProviderVertexAttribute> rhiGraphicsVertexAttributes;
     std::vector<VernonRuntimeProviderBindingValue> rhiGraphicsValues;
     std::vector<Binding> rhiGraphicsBindingPlan;
-    std::vector<uint32_t> rhiGraphicsFormats;
-    uint32_t rhiGraphicsDepthFormat{};
-    uint64_t rhiGraphicsVertexLayoutIdentity{};
-    uint32_t rhiGraphicsTopology{};
 };
 #endif
 

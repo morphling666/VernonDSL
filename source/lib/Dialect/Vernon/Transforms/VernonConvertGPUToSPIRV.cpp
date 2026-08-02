@@ -15,6 +15,8 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
+#include <optional>
+
 namespace mlir::vernon {
 namespace {
 

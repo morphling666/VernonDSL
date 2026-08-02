@@ -126,7 +126,9 @@ void RenderPass::color(uint32_t location, const ColorAttachmentUse &attachment) 
 
 void RenderPass::depth(const DepthStencilAttachmentUse &attachment) {
     depth_ = std::make_unique<DepthStencilAttachmentUse>(attachment);
-    if ((attachment.image.format == VERNON_RHI_FORMAT_D32_FLOAT && attachment.readOnlyDepth) ||
+    if (((attachment.image.format == VERNON_RHI_FORMAT_D32_FLOAT ||
+          attachment.image.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT) &&
+         attachment.readOnlyDepth) ||
         (attachment.readOnlyDepth && attachment.readOnlyStencil))
         read(attachment.image, VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT);
     else
@@ -502,7 +504,8 @@ bool ExecutionGraph::validate(std::string &error) const {
         for (const ColorAttachmentUse &color : render->colors_) {
             if (!validateImage(pass->name(), color.image))
                 return false;
-            if (color.image.format == VERNON_RHI_FORMAT_D32_FLOAT || color.location >= 8 ||
+            if (color.image.format == VERNON_RHI_FORMAT_D32_FLOAT ||
+                color.image.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT || color.location >= 8 ||
                 !locations.insert(color.location).second || !attachmentResources.insert(color.image.id).second ||
                 !validLoad(color.load) || !validStore(color.store)) {
                 error = "render pass '" + pass->name() + "' contains invalid color attachment resource " +
@@ -525,10 +528,14 @@ bool ExecutionGraph::validate(std::string &error) const {
             const DepthStencilAttachmentUse &depth = *render->depth_;
             if (!validateImage(pass->name(), depth.image))
                 return false;
-            if (depth.image.format != VERNON_RHI_FORMAT_D32_FLOAT ||
+            if ((depth.image.format != VERNON_RHI_FORMAT_D32_FLOAT &&
+                 depth.image.format != VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT) ||
                 !attachmentResources.insert(depth.image.id).second || !validLoad(depth.depthLoad) ||
                 !validStore(depth.depthStore) || !validLoad(depth.stencilLoad) || !validStore(depth.stencilStore) ||
                 depth.clearDepth < 0.0f || depth.clearDepth > 1.0f ||
+                (depth.image.format == VERNON_RHI_FORMAT_D32_FLOAT &&
+                 (depth.stencilLoad != VERNON_RHI_LOAD_DISCARD || depth.stencilStore != VERNON_RHI_STORE_DISCARD ||
+                  depth.clearStencil != 0)) ||
                 (depth.readOnlyDepth &&
                  (depth.depthLoad == VERNON_RHI_LOAD_CLEAR || depth.depthStore == VERNON_RHI_STORE_DISCARD))) {
                 error = "render pass '" + pass->name() + "' contains invalid depth attachment resource " +

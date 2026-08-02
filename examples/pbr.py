@@ -166,7 +166,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render a procedural metallic-roughness PBR cube and plane.")
     parser.add_argument(
         "--arch",
-        choices=("vulkan", "directx", "opengl"),
+        "--architecture",
+        dest="arch",
+        choices=("vulkan", "directx", "opengl", "metal"),
         default="vulkan",
     )
     parser.add_argument("--headless", action="store_true")
@@ -190,11 +192,12 @@ def main() -> None:
         "vulkan": vd.vulkan,
         "directx": vd.directx,
         "opengl": vd.opengl,
+        "metal": vd.metal,
     }[args.arch]
     window_name = "VernonDSL PBR"
     vd.init(
         arch=architecture,
-        api_version=(4, 3) if args.arch == "opengl" else None,
+        api_version=(3, 3) if args.arch == "opengl" else None,
     )
 
     mesh = create_scene_mesh()
@@ -209,7 +212,12 @@ def main() -> None:
     shadow_enabled = not args.no_shadow
     environment_enabled = not args.no_cubemap
     features = {
-        feature for feature, enabled in (("SHADOW", shadow_enabled), ("ENVIRONMENT", environment_enabled)) if enabled
+        feature
+        for feature, enabled in (
+            ("SHADOW", shadow_enabled),
+            ("ENVIRONMENT", environment_enabled),
+        )
+        if enabled
     }
     if shadow_enabled:
         shadow_map = vd.Texture.zeros(shape=(args.size, args.size), format=vd.depth32)

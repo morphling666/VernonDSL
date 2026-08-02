@@ -31,6 +31,8 @@ const char *physicalValueProfileName(VernonRuntimeBackend backend, const std::st
         if (transport == "uniform_buffer" || transport == "push_constant")
             return "directx_constant_buffer";
         return "vulkan_std430_storage_buffer";
+    case VERNON_RUNTIME_METAL:
+        return "metal_constant_buffer";
     }
     return "";
 }
@@ -126,6 +128,28 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
             }
             if (cudaStaticTensorValue)
                 argument.storageLeaves.clear();
+            if (value.contains("tensor_view_descriptor")) {
+                const auto &descriptor = value["tensor_view_descriptor"];
+                if (!descriptor.is_object() || !descriptor.contains("rank") ||
+                    !descriptor["rank"].is_number_unsigned() || !descriptor.contains("offset_binding") ||
+                    !descriptor["offset_binding"].is_number_unsigned() || !descriptor.contains("extent_bindings") ||
+                    !descriptor["extent_bindings"].is_array() || !descriptor.contains("stride_bindings") ||
+                    !descriptor["stride_bindings"].is_array()) {
+                    error = "TensorView reflection has an invalid descriptor layout";
+                    return false;
+                }
+                TensorViewDescriptorLayout layout;
+                layout.rank = descriptor["rank"].get<uint32_t>();
+                layout.offsetBinding = descriptor["offset_binding"].get<uint32_t>();
+                layout.extentBindings = descriptor["extent_bindings"].get<std::vector<uint32_t>>();
+                layout.strideBindings = descriptor["stride_bindings"].get<std::vector<uint32_t>>();
+                if (!layout.rank || layout.extentBindings.size() != layout.rank ||
+                    layout.strideBindings.size() != layout.rank) {
+                    error = "TensorView descriptor rank does not match its binding sequence";
+                    return false;
+                }
+                argument.tensorViewDescriptor = std::move(layout);
+            }
             size_t elementSize = 0;
             if (argument.kind == "tensor") {
                 auto layout = value.find("element_layout");

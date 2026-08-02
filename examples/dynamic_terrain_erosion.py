@@ -224,7 +224,7 @@ def create_basalt_stage(extent: float) -> tuple[np.ndarray, np.ndarray, np.ndarr
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compute-driven hydraulic terrain erosion with opaque PBR runoff.")
-    parser.add_argument("--arch", choices=("vulkan", "directx", "opengl"), default="vulkan")
+    parser.add_argument("--arch", choices=("vulkan", "directx", "metal", "opengl"), default="vulkan")
     parser.add_argument("--size", type=int, default=720)
     parser.add_argument("--grid", type=int, default=224)
     parser.add_argument("--extent", type=float, default=13.0)

@@ -77,24 +77,42 @@ def Vernon_WorkgroupAllocOp : Vernon_Op<"workgroup_alloc"> {
 
 def Vernon_LoadOp : Vernon_Op<"load"> {
   let summary = "Load one element through a ranked TensorView index";
-  let arguments = (ins Vernon_TensorViewType:$storage, Variadic<Index>:$indices,
-                       OptionalAttr<UnitAttr>:$physical_index);
+  let arguments = (ins Vernon_TensorViewType:$storage, Variadic<Index>:$indices);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }
 
 def Vernon_StoreOp : Vernon_Op<"store"> {
   let summary = "Store one element through a ranked TensorView index";
-  let arguments = (ins AnyType:$value, Vernon_TensorViewType:$storage, Variadic<Index>:$indices,
-                       OptionalAttr<UnitAttr>:$physical_index);
+  let arguments = (ins AnyType:$value, Vernon_TensorViewType:$storage, Variadic<Index>:$indices);
   let hasVerifier = 1;
 }
 
 def Vernon_AtomicOp : Vernon_Op<"atomic"> {
   let summary = "Atomic read-modify-write with scope inferred from TensorView";
   let arguments = (ins Vernon_TensorViewType:$storage, Variadic<Index>:$indices, AnyType:$value,
-                       StrAttr:$atomic_kind, StrAttr:$ordering,
-                       OptionalAttr<UnitAttr>:$physical_index);
+                       StrAttr:$atomic_kind, StrAttr:$ordering);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def Vernon_PhysicalLoadOp : Vernon_Op<"physical_load"> {
+  let summary = "Internal load after TensorView index projection";
+  let arguments = (ins Vernon_TensorViewType:$storage, Index:$index);
+  let results = (outs AnyType:$result);
+  let hasVerifier = 1;
+}
+
+def Vernon_PhysicalStoreOp : Vernon_Op<"physical_store"> {
+  let summary = "Internal store after TensorView index projection";
+  let arguments = (ins AnyType:$value, Vernon_TensorViewType:$storage, Index:$index);
+  let hasVerifier = 1;
+}
+
+def Vernon_PhysicalAtomicOp : Vernon_Op<"physical_atomic"> {
+  let summary = "Internal atomic after TensorView index projection";
+  let arguments = (ins Vernon_TensorViewType:$storage, Index:$index, AnyType:$value,
+                       StrAttr:$atomic_kind, StrAttr:$ordering);
   let results = (outs AnyType:$result);
   let hasVerifier = 1;
 }

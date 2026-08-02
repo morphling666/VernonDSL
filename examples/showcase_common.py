@@ -293,6 +293,7 @@ def architecture_from_name(name: str) -> object:
         "vulkan": vd.vulkan,
         "directx": vd.directx,
         "opengl": vd.opengl,
+        "metal": vd.metal,
     }
     try:
         return architectures[name]
@@ -326,7 +327,13 @@ def configure_showcase_parser(
 ) -> None:
     if set(presets) != {"smoke", "showoff"}:
         raise ValueError("showcase presets must define exactly smoke and showoff")
-    parser.add_argument("--arch", choices=("vulkan", "directx", "opengl"), default="vulkan")
+    parser.add_argument(
+        "--arch",
+        "--architecture",
+        dest="arch",
+        choices=("vulkan", "directx", "opengl", "metal"),
+        default="vulkan",
+    )
     parser.add_argument("--preset", choices=tuple(presets), default="showoff")
     parser.add_argument("--size", type=int)
     parser.add_argument("--frames", type=int, help="zero runs until Escape or Q")

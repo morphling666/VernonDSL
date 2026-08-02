@@ -53,7 +53,7 @@ VernonStatus invokeCpuComputePipeline(VernonLoadedPipeline &pipeline, const Plan
             value.resource.resource.value = reinterpret_cast<uintptr_t>(argument.hostData);
             value.resource.size = argument.hostSize;
         } else {
-            if (argument.kind != ComputeLaunchArgumentKind::Scalar || !argument.scalarData || !argument.scalarSize)
+            if (!argument.scalarData || !argument.scalarSize)
                 return fail(*pipeline.context, "CPU inline binding requires host data");
             value.inline_data = argument.scalarData;
             value.inline_size = argument.scalarSize;

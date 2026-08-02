@@ -106,7 +106,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--arch",
-        choices=("opengl", "opengles", "vulkan", "directx"),
+        "--architecture",
+        dest="arch",
+        choices=("opengl", "opengles", "vulkan", "directx", "metal"),
         default="vulkan",
         help=("graphics backend; OpenGL profiles require host context registration; DirectX requires Windows"),
     )
@@ -143,6 +145,7 @@ def main() -> None:
         "opengles": vd.opengles,
         "vulkan": vd.vulkan,
         "directx": vd.directx,
+        "metal": vd.metal,
     }[args.arch]
     vd.init(
         arch=architecture,

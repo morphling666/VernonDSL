@@ -19,6 +19,20 @@ descriptors. CPU relocatable objects resolve through the static entry registry.
 VernonRHI owns CUDA Driver and Vulkan loader discovery; Vulkan headers are
 compile-only. This keeps LLVM, LLD, GLFW, CUDA Toolkit libraries, and the
 Vulkan loader import library outside the deployable runtime dependency closure.
+Vulkan loader discovery is runtime-only and ordered: `VERNON_VULKAN_LOADER`, a
+loader under `VULKAN_SDK`, the normal OS loader name, then Homebrew fallbacks on
+macOS. Failure diagnostics retain every attempted location. Vernon always loads
+the Khronos loader rather than an ICD such as MoltenVK directly, so standard ICD
+discovery remains intact. Build-time `VERNON_ENABLE_VULKAN_RUNTIME` only
+includes the backend; runtime availability still depends on a loader, ICD, and
+usable device.
+
+Before creating an instance, Vernon enumerates advertised instance extensions
+and enables `VK_KHR_portability_enumeration` plus its instance flag only when
+present. It similarly enumerates the selected device's extensions, enables
+`VK_KHR_portability_subset` only when advertised, and queries its supported
+feature structure in the device feature chain. Portability behavior is therefore
+capability-driven rather than selected by the host platform.
 
 OpenGL function resolution is isolated in `backend_opengl_driver`; unlike CUDA
 and Vulkan it consumes context callbacks. OpenGL and OpenGL ES are distinct
@@ -166,6 +180,13 @@ pipeline and binding objects. Owned submissions release those references after
 the synchronous backend completion; borrowed native command targets retain
 them until encoder destruction, which is the owner's completion signal.
 Failed recordings are abandoned with the same cleanup path.
+The stable `0.1.1` API does not expose asynchronous submission, deferred graph
+execution, or multiple frames in flight. Callers must not infer those
+capabilities from backend-native queues or streams. Adding them requires
+completion-serial tracking and deferred reclamation for every enabled backend,
+as defined by the
+[`asynchronous GPU resource lifetime`](../roadmap.md#asynchronous-gpu-resource-lifetime)
+roadmap.
 
 ExecutionGraph render scopes own the first attachment load operations and the
 last attachment store operations. Providers consume those scope operations
@@ -351,8 +372,9 @@ are flattened in row-major order to register vectors. The limit covers
 and bounds the register pressure from scalarized operations. Larger static
 values use elementwise-to-Linalg, one-shot bufferization to private memrefs,
 and Linalg-to-SCF loops. Dynamic local value Tensors are rejected; addressable
-runtime N-D Tensor parameters are specialized and remain memrefs. The SCF
-structural conversion updates loop-carried values and region arguments
+runtime N-D Tensor parameters remain memrefs. Their dynamic shape, stride, and
+offset are invocation data and do not require AOT shape specialization. The
+SCF structural conversion updates loop-carried values and region arguments
 consistently. Buffer intrinsics cloned below `scf.if` or `scf.while` are
 rewritten after the complete kernel body is cloned, so nested loads and stores
 do not remain illegal Vernon operations.
@@ -378,14 +400,19 @@ normalization. CUDA's LLVM math pass is never used: Vulkan retains standard
 math operations for SPIR-V lowering, and Metal source is cross-compiled from
 the same SPIR-V module.
 
-Metal MSL remains a cook-only compiler product. DirectX cooking emits
-Shader Model 6 DXIL containers and `VernonRuntime` exposes a Windows-only
-D3D12 backend. The backend owns its device, direct queue, command allocator,
-fence, buffers, textures, samplers, descriptor heaps, and offscreen render
-targets. Deployments load pre-cooked DXIL and do not load DXC. Synchronous
-submission keeps transient upload/readback and descriptor storage alive until
-the fence completes. Tests select WARP through an internal hook; normal device
-creation skips software adapters.
+On Apple platforms, cooked MSL bundles are consumed by the Metal Runtime.
+Apple Silicon macOS wheels expose the stable compute and offscreen graphics
+subset. The Runtime compiles the cooked MSL for the selected device, prepares
+reflection-driven resource layouts and pipeline state, and executes through
+VernonRHI.
+
+DirectX cooking emits Shader Model 6 DXIL containers and `VernonRuntime`
+exposes a Windows-only D3D12 backend. The backend owns its device, direct queue,
+command allocator, fence, buffers, textures, samplers, descriptor heaps, and
+offscreen render targets. Deployments load pre-cooked DXIL and do not load DXC.
+Synchronous submission keeps transient upload/readback and descriptor storage
+alive until the fence completes. Tests select WARP through an internal hook;
+normal device creation skips software adapters.
 
 ### Pipeline runtime requirements
 
@@ -396,13 +423,14 @@ SPIR-V version plus Vulkan 1.1 and compute workgroup limits, or PTX version,
 address size, and minimum compute capability. Required reflection features are
 stored once in sorted order. DirectX additionally records D3D12, minimum
 feature level, Shader Model, root-signature version, and compute workgroup
-limits. Metal omits this field because it has no Runtime backend.
+limits. Metal records the Apple platform, MSL version, minimum OS version, and
+required features for early Runtime validation.
 
-`target_options` records how compilation was requested; it is not a runtime
-capability contract. `runtime_requirements` records the minimum capabilities
-needed by the resulting artifact. Runtime validates the latter after the
-manifest hash and target, but before resolving or loading artifacts. The field
-is mandatory. CUDA intentionally does not infer a driver version from PTX;
+The canonical `target` object records a `kind` and that backend's typed
+`options`; it is not a runtime capability contract. `runtime_requirements`
+records the minimum capabilities needed by the resulting artifact. Runtime
+validates the latter after the manifest hash and target, but before resolving
+or loading artifacts. The field is mandatory. CUDA intentionally does not infer a driver version from PTX;
 compute capability is checked early, and the CUDA driver JIT remains
 authoritative for PTX compatibility.
 

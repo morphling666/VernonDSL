@@ -286,7 +286,10 @@ bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites,
     if (!native)
         return false;
     std::lock_guard<std::mutex> guard(device->mutex);
-    completed = device->state.synchronize() == vernon::rhi::cuda::kSuccess;
+    const auto status = device->state.synchronize();
+    completed = status == vernon::rhi::cuda::kSuccess;
+    if (!completed)
+        device->error = vernon::rhi::cuda::describeResult(status, "cuStreamSynchronize");
     return completed;
 }
 

@@ -31,6 +31,7 @@ $expected = @(
   "uniform must provide both 'vernon.set' and 'vernon.binding', or neither",
   "'vernon.instance_divisor' is only valid on vertex inputs",
   "compute entry requires 'vernon.workgroup_size'",
+  "contains internal TensorView descriptor metadata",
   "but the vertex output has type"
 )
 foreach ($message in $expected) {

@@ -30,7 +30,10 @@ typedef struct VernonRuntimeCoreGraphicsCompatibility {
     uint32_t sample_count;
     const uint32_t *vertex_strides;
     size_t vertex_stride_count;
-    uint64_t vertex_layout_identity;
+    VernonRuntimeProviderRasterizationState rasterization;
+    VernonRuntimeProviderDepthStencilState depth_stencil;
+    const VernonRuntimeProviderColorBlendState *color_blends;
+    size_t color_blend_count;
     uint32_t reserved[4];
 } VernonRuntimeCoreGraphicsCompatibility;
 
@@ -53,7 +56,11 @@ typedef struct VernonRuntimeCoreDrawInvocation {
     VernonRuntimeProviderResourceReference index_buffer;
     uint32_t index_count;
     uint32_t index_type;
-    uint32_t reserved[4];
+    uint32_t stencil_load_operation;
+    uint32_t stencil_store_operation;
+    uint32_t clear_stencil;
+    uint32_t stencil_reference;
+    uint32_t render_area[4];
 } VernonRuntimeCoreDrawInvocation;
 
 typedef struct VernonRuntimeCorePipelineDescriptor {
@@ -73,6 +80,10 @@ typedef struct VernonRuntimeCorePipelineDescriptor {
     uint32_t depth_stencil_format;
     uint32_t sample_count;
     uint32_t workgroup_size[3];
+    VernonRuntimeProviderRasterizationState rasterization;
+    VernonRuntimeProviderDepthStencilState depth_stencil;
+    const VernonRuntimeProviderColorBlendState *color_blends;
+    size_t color_blend_count;
     uint32_t reserved[4];
 } VernonRuntimeCorePipelineDescriptor;
 

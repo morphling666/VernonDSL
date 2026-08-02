@@ -2,6 +2,7 @@
 #include "VernonExecutionGraph.h"
 #include "VernonRHI.h"
 #include "VernonRuntime.h"
+#include "compiler_python_bridge.h"
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/array.h>
@@ -16,10 +17,12 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -39,6 +42,41 @@ struct Compiler {
 
     VernonCompilerContext *context{};
 };
+
+bool targetAvailable(VernonTarget target) {
+    Compiler compiler;
+    return vernonCompilerGetTargetCapabilities(compiler.context, target).available != 0;
+}
+
+nb::list planValueAbi(const std::string &moduleText, const std::vector<std::string> &logicalDtypes) {
+    std::vector<VernonStringView> dtypes;
+    dtypes.reserve(logicalDtypes.size());
+    for (const std::string &dtype : logicalDtypes)
+        dtypes.push_back({dtype.data(), dtype.size()});
+    std::unique_ptr<VernonPythonValueAbiPlan, decltype(&vernonCompilerDestroyPythonValueAbiPlan)> plan(
+        vernonCompilerPlanPythonValueAbi({moduleText.data(), moduleText.size()}, dtypes.data(), dtypes.size()),
+        &vernonCompilerDestroyPythonValueAbiPlan);
+    if (!plan)
+        throw std::bad_alloc();
+    const VernonPythonValueAbiPlanView view = vernonCompilerGetPythonValueAbiPlanView(plan.get());
+    if (view.status != VERNON_STATUS_OK) {
+        const std::string diagnostics = stringView(view.diagnostics);
+        throw std::invalid_argument(diagnostics.empty() ? "native Value ABI planning failed" : diagnostics);
+    }
+
+    nb::list nodes;
+    for (size_t index = 0; index < view.node_count; ++index) {
+        const VernonPythonValueAbiNodeView &node = view.nodes[index];
+        std::vector<uint64_t> offsets;
+        if (node.field_count)
+            offsets.assign(node.field_offsets, node.field_offsets + node.field_count);
+        nb::object elementStride = nb::none();
+        if (node.has_element_stride)
+            elementStride = nb::int_(node.element_stride);
+        nodes.append(nb::make_tuple(node.byte_size, node.alignment, std::move(offsets), std::move(elementStride)));
+    }
+    return nodes;
+}
 
 struct RhiHostState;
 struct Runtime;
@@ -128,6 +166,8 @@ VernonRhiFormat rhiFormat(VernonTextureFormat format) {
         return VERNON_RHI_FORMAT_R11G11B10_FLOAT;
     case VERNON_TEXTURE_D32_FLOAT:
         return VERNON_RHI_FORMAT_D32_FLOAT;
+    case VERNON_TEXTURE_D32_FLOAT_S8_UINT:
+        return VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT;
     }
     throw std::invalid_argument("unsupported attachment image format");
 }
@@ -191,13 +231,16 @@ struct RhiImage {
         }
         if (vernonRhiDeviceUploadImage(host->device, handle, descriptors.data(), descriptors.size()) !=
             VERNON_RHI_STATUS_OK)
-            throw std::runtime_error("RHI image upload failed");
+            throw std::runtime_error("RHI image upload failed: " +
+                                     stringView(vernonRhiDeviceGetLastError(host->device)));
     }
     nb::bytes download() const {
-        if ((format != VERNON_TEXTURE_RGBA8_UNORM && format != VERNON_TEXTURE_D32_FLOAT) ||
+        if ((format != VERNON_TEXTURE_RGBA8_UNORM && format != VERNON_TEXTURE_D32_FLOAT &&
+             format != VERNON_TEXTURE_D32_FLOAT_S8_UINT) ||
             !(usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE))
             throw std::runtime_error("image format does not support download");
-        std::string data(static_cast<size_t>(width) * height * layers * 4, '\0');
+        const size_t pixelSize = format == VERNON_TEXTURE_D32_FLOAT_S8_UINT ? 8 : 4;
+        std::string data(static_cast<size_t>(width) * height * layers * pixelSize, '\0');
         if (vernonRhiDeviceDownloadImage(host->device, handle, data.data(), data.size()) != VERNON_RHI_STATUS_OK)
             throw std::runtime_error("RHI image download failed: " +
                                      stringView(vernonRhiDeviceGetLastError(host->device)));
@@ -263,8 +306,9 @@ struct RhiHost {
             throw std::invalid_argument("cube textures currently require RGBA8 format");
         uint32_t usage =
             VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION | VERNON_RHI_IMAGE_SAMPLED;
-        usage |= format == VERNON_TEXTURE_D32_FLOAT ? VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT
-                                                    : VERNON_RHI_IMAGE_COLOR_ATTACHMENT;
+        usage |= format == VERNON_TEXTURE_D32_FLOAT || format == VERNON_TEXTURE_D32_FLOAT_S8_UINT
+                     ? VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT
+                     : VERNON_RHI_IMAGE_COLOR_ATTACHMENT;
         return std::make_unique<RhiImage>(state, width, height, format, dimension, usage);
     }
     std::unique_ptr<RhiImage> createAttachmentImage(uint32_t width, uint32_t height, VernonTextureFormat format,
@@ -273,7 +317,7 @@ struct RhiHost {
             VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT;
         if (!usage || (usage & ~attachmentUsages))
             throw std::invalid_argument("attachment image usage must contain only attachment roles");
-        const bool depthFormat = format == VERNON_TEXTURE_D32_FLOAT;
+        const bool depthFormat = format == VERNON_TEXTURE_D32_FLOAT || format == VERNON_TEXTURE_D32_FLOAT_S8_UINT;
         const bool depthUsage = (usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) != 0;
         if (depthFormat != depthUsage || (depthUsage && (usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)))
             throw std::invalid_argument("attachment image format does not match its usage");
@@ -501,11 +545,8 @@ std::unique_ptr<PythonExecutionGraph> RhiHost::createExecutionGraph() {
 using SharedCompileResult = std::shared_ptr<VernonCompileResult>;
 
 struct CompiledProgram {
-    CompiledProgram(VernonCompileResult *result, VernonTarget target, uint32_t glslVersion, uint32_t hlslShaderModel,
-                    std::string targetTriple, std::string cpu, std::string cpuFeatures)
-        : result(result, &vernonCompileResultDestroy), target(target), glslVersion(glslVersion),
-          hlslShaderModel(hlslShaderModel), targetTriple(std::move(targetTriple)), cpu(std::move(cpu)),
-          cpuFeatures(std::move(cpuFeatures)) {
+    CompiledProgram(VernonCompileResult *result, VernonTarget target)
+        : result(result, &vernonCompileResultDestroy), target(target) {
         if (!this->result)
             throw std::runtime_error("compiler returned no result");
     }
@@ -541,27 +582,53 @@ struct CompiledProgram {
 
     SharedCompileResult result;
     VernonTarget target;
-    uint32_t glslVersion{};
-    uint32_t hlslShaderModel{};
-    std::string targetTriple;
-    std::string cpu;
-    std::string cpuFeatures;
 };
 
 std::unique_ptr<CompiledProgram> compileProgramResult(Compiler &compiler, const std::string &mlir, VernonTarget target,
-                                                      uint32_t glslVersion, uint32_t hlslShaderModel,
-                                                      const std::string &targetTriple, const std::string &cpu,
-                                                      const std::string &cpuFeatures) {
+                                                      const nb::dict &targetOptions) {
+    auto readString = [&](const char *name) {
+        return targetOptions.contains(name) ? nb::cast<std::string>(targetOptions[name]) : std::string();
+    };
+    auto rejectUnknown = [&](std::initializer_list<std::string_view> allowed) {
+        for (auto item : targetOptions) {
+            const std::string key = nb::cast<std::string>(item.first);
+            if (std::find(allowed.begin(), allowed.end(), key) == allowed.end())
+                throw std::invalid_argument("unknown option '" + key + "' for selected target");
+        }
+    };
     VernonCompileOptions options{};
     options.struct_size = sizeof(options);
-    options.glsl_version = glslVersion;
-    options.hlsl_shader_model = hlslShaderModel;
-    options.cpu_target_triple = VernonStringView{targetTriple.data(), targetTriple.size()};
-    options.cpu_name = VernonStringView{cpu.data(), cpu.size()};
-    options.cpu_features = VernonStringView{cpuFeatures.data(), cpuFeatures.size()};
+    options.target = target;
+    std::string triple;
+    std::string processor;
+    std::string features;
+    if (target == VERNON_TARGET_CPU) {
+        rejectUnknown({"triple", "processor", "features"});
+        triple = readString("triple");
+        processor = readString("processor");
+        features = readString("features");
+        options.as.cpu.triple = VernonStringView{triple.data(), triple.size()};
+        options.as.cpu.processor = VernonStringView{processor.data(), processor.size()};
+        options.as.cpu.features = VernonStringView{features.data(), features.size()};
+    } else if (target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES) {
+        rejectUnknown({"version"});
+        options.as.opengl.version =
+            targetOptions.contains("version") ? nb::cast<uint32_t>(targetOptions["version"]) : 0;
+    } else if (target == VERNON_TARGET_METAL) {
+        rejectUnknown({"platform"});
+        const std::string platform = readString("platform");
+        options.as.metal.platform = platform.empty() || platform == "macos" ? VERNON_METAL_PLATFORM_MACOS
+                                    : platform == "ios"                     ? VERNON_METAL_PLATFORM_IOS
+                                                        : static_cast<VernonMetalPlatform>(UINT32_MAX);
+    } else if (target == VERNON_TARGET_DIRECTX) {
+        rejectUnknown({"shader_model"});
+        options.as.directx.shader_model =
+            targetOptions.contains("shader_model") ? nb::cast<uint32_t>(targetOptions["shader_model"]) : 0;
+    } else {
+        rejectUnknown({});
+    }
     return std::make_unique<CompiledProgram>(
-        vernonCompilerCompileMlirWithOptions(compiler.context, mlir.data(), mlir.size(), target, &options), target,
-        glslVersion, hlslShaderModel, targetTriple, cpu, cpuFeatures);
+        vernonCompilerCompileMlirWithOptions(compiler.context, mlir.data(), mlir.size(), &options), target);
 }
 
 struct PipelineParameterMetadata {
@@ -822,8 +889,8 @@ struct PipelineInvocationBuilder {
     PipelineInvocationBuilder &rhiColorAttachment(uint32_t location, RhiImage *texture, uint32_t loadOperation,
                                                   uint32_t storeOperation, const std::array<float, 4> &clearColor) {
         if (!texture || !(texture->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT) ||
-            texture->format == VERNON_TEXTURE_D32_FLOAT || loadOperation > VERNON_RHI_LOAD_DISCARD ||
-            storeOperation > VERNON_RHI_STORE_DISCARD)
+            (texture->format == VERNON_TEXTURE_D32_FLOAT || texture->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT) ||
+            loadOperation > VERNON_RHI_LOAD_DISCARD || storeOperation > VERNON_RHI_STORE_DISCARD)
             throw std::invalid_argument("RHI color attachment is null");
         VernonColorAttachment attachment{};
         attachment.location = location;
@@ -842,8 +909,9 @@ struct PipelineInvocationBuilder {
     PipelineInvocationBuilder &rhiDepthAttachment(RhiImage *texture, uint32_t loadOperation, uint32_t storeOperation,
                                                   float clearDepth) {
         if (!texture || !(texture->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) ||
-            texture->format != VERNON_TEXTURE_D32_FLOAT || loadOperation > VERNON_RHI_LOAD_DISCARD ||
-            storeOperation > VERNON_RHI_STORE_DISCARD || clearDepth < 0.0f || clearDepth > 1.0f)
+            (texture->format != VERNON_TEXTURE_D32_FLOAT && texture->format != VERNON_TEXTURE_D32_FLOAT_S8_UINT) ||
+            loadOperation > VERNON_RHI_LOAD_DISCARD || storeOperation > VERNON_RHI_STORE_DISCARD || clearDepth < 0.0f ||
+            clearDepth > 1.0f)
             throw std::invalid_argument("RHI depth attachment must use D32 format");
         depthAttachment = {};
         if (vernonRuntimeReferenceRhiImage(runtime, texture->handle, &depthAttachment.resource) != VERNON_STATUS_OK)
@@ -1204,6 +1272,9 @@ std::unique_ptr<Runtime> RhiHost::createRuntime() {
     case VERNON_RHI_BACKEND_DIRECTX12:
         backend = VERNON_RUNTIME_DIRECTX12;
         break;
+    case VERNON_RHI_BACKEND_METAL:
+        backend = VERNON_RUNTIME_METAL;
+        break;
     case VERNON_RHI_BACKEND_OPENGL:
         backend = VERNON_RUNTIME_OPENGL;
         break;
@@ -1229,6 +1300,7 @@ NB_MODULE(_native, module) {
         .value("DIRECTX", VERNON_TARGET_DIRECTX)
         .value("OPENGL", VERNON_TARGET_OPENGL)
         .value("OPENGL_ES", VERNON_TARGET_OPENGL_ES);
+    module.def("target_available", &targetAvailable, nb::arg("target"));
     nb::enum_<VernonStatus>(module, "Status")
         .value("OK", VERNON_STATUS_OK)
         .value("INVALID_ARGUMENT", VERNON_STATUS_INVALID_ARGUMENT)
@@ -1242,13 +1314,15 @@ NB_MODULE(_native, module) {
         .value("VULKAN", VERNON_RUNTIME_VULKAN)
         .value("OPENGL", VERNON_RUNTIME_OPENGL)
         .value("OPENGL_ES", VERNON_RUNTIME_OPENGL_ES)
-        .value("DIRECTX12", VERNON_RUNTIME_DIRECTX12);
+        .value("DIRECTX12", VERNON_RUNTIME_DIRECTX12)
+        .value("METAL", VERNON_RUNTIME_METAL);
     nb::enum_<VernonRhiBackend>(module, "RhiBackend")
         .value("CUDA", VERNON_RHI_BACKEND_CUDA)
         .value("VULKAN", VERNON_RHI_BACKEND_VULKAN)
         .value("DIRECTX12", VERNON_RHI_BACKEND_DIRECTX12)
         .value("OPENGL", VERNON_RHI_BACKEND_OPENGL)
-        .value("OPENGL_ES", VERNON_RHI_BACKEND_OPENGL_ES);
+        .value("OPENGL_ES", VERNON_RHI_BACKEND_OPENGL_ES)
+        .value("METAL", VERNON_RHI_BACKEND_METAL);
     nb::enum_<VernonPrimitiveTopology>(module, "PrimitiveTopology")
         .value("TRIANGLE_LIST", VERNON_TOPOLOGY_TRIANGLE_LIST)
         .value("LINE_LIST", VERNON_TOPOLOGY_LINE_LIST)
@@ -1264,7 +1338,8 @@ NB_MODULE(_native, module) {
         .value("RG8_UNORM", VERNON_TEXTURE_RG8_UNORM)
         .value("RGB8_UNORM", VERNON_TEXTURE_RGB8_UNORM)
         .value("R11G11B10_FLOAT", VERNON_TEXTURE_R11G11B10_FLOAT)
-        .value("D32_FLOAT", VERNON_TEXTURE_D32_FLOAT);
+        .value("D32_FLOAT", VERNON_TEXTURE_D32_FLOAT)
+        .value("D32_FLOAT_S8_UINT", VERNON_TEXTURE_D32_FLOAT_S8_UINT);
     nb::enum_<VernonTextureDimension>(module, "TextureDimension")
         .value("TEXTURE_2D", VERNON_TEXTURE_2D)
         .value("TEXTURE_3D", VERNON_TEXTURE_3D)
@@ -1275,11 +1350,11 @@ NB_MODULE(_native, module) {
         .value("MIRRORED_REPEAT", VERNON_RHI_ADDRESS_MIRRORED_REPEAT);
     module.attr("IMAGE_COLOR_ATTACHMENT") = static_cast<uint32_t>(VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
     module.attr("IMAGE_DEPTH_STENCIL_ATTACHMENT") = static_cast<uint32_t>(VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT);
+    module.def("_plan_value_abi", &planValueAbi, nb::arg("module"), nb::arg("logical_dtypes"));
     nb::class_<Compiler>(module, "Compiler")
         .def(nb::init<>())
         .def("compile_program_result", &compileProgramResult, nb::arg("mlir"), nb::arg("target"),
-             nb::arg("glsl_version") = 0, nb::arg("hlsl_shader_model") = 0, nb::arg("target_triple") = "",
-             nb::arg("cpu") = "", nb::arg("cpu_features") = "");
+             nb::arg("options") = nb::dict());
     nb::class_<CompiledProgram>(module, "CompiledProgram")
         .def_prop_ro("ok", &CompiledProgram::ok)
         .def_prop_ro("status", &CompiledProgram::status)
@@ -1287,11 +1362,6 @@ NB_MODULE(_native, module) {
         .def_prop_ro("artifacts", &CompiledProgram::artifacts)
         .def_prop_ro("reflection", &CompiledProgram::reflection)
         .def_prop_ro("target", [](const CompiledProgram &value) { return value.target; })
-        .def_prop_ro("glsl_version", [](const CompiledProgram &value) { return value.glslVersion; })
-        .def_prop_ro("hlsl_shader_model", [](const CompiledProgram &value) { return value.hlslShaderModel; })
-        .def_prop_ro("target_triple", [](const CompiledProgram &value) { return value.targetTriple; })
-        .def_prop_ro("cpu", [](const CompiledProgram &value) { return value.cpu; })
-        .def_prop_ro("cpu_features", [](const CompiledProgram &value) { return value.cpuFeatures; })
         .def("has_cpu_entry", &CompiledProgram::hasCpuEntry);
     nb::class_<RhiHost>(module, "RhiHost")
         .def(nb::init<VernonRhiBackend, uint32_t>(), nb::arg("backend"), nb::arg("device_index") = 0)

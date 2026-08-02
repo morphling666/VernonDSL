@@ -21,22 +21,29 @@ function(vernon_stage_target_files destination_target)
         if(NOT TARGET ${dependency_target})
             message(FATAL_ERROR "Cannot stage unknown dependency target '${dependency_target}'")
         endif()
+
+        string(MAKE_C_IDENTIFIER "${destination_target}_${dependency_target}_runtime_files" _vernon_stage_target)
+        set(_vernon_stage_files "$<TARGET_FILE:${dependency_target}>")
+        get_target_property(_vernon_runtime_files ${dependency_target} VERNON_RUNTIME_FILES)
+        if(_vernon_runtime_files)
+            list(APPEND _vernon_stage_files ${_vernon_runtime_files})
+        endif()
+        add_custom_target(
+            ${_vernon_stage_target} ALL
+            COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:${destination_target}>
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_vernon_stage_files}
+                    $<TARGET_FILE_DIR:${destination_target}>
+            DEPENDS ${_vernon_stage_files}
+            VERBATIM)
+        add_dependencies(${destination_target} ${_vernon_stage_target})
+
+        # Retain the post-build copy for generators that build only the destination target and do not revisit already
+        # up-to-date ALL targets.
         add_custom_command(
             TARGET ${destination_target}
             POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:${dependency_target}>
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_vernon_stage_files}
                     $<TARGET_FILE_DIR:${destination_target}>
             VERBATIM)
-        get_target_property(_vernon_runtime_files ${dependency_target} VERNON_RUNTIME_FILES)
-        if(_vernon_runtime_files)
-            foreach(_vernon_runtime_file IN LISTS _vernon_runtime_files)
-                add_custom_command(
-                    TARGET ${destination_target}
-                    POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_vernon_runtime_file}"
-                            $<TARGET_FILE_DIR:${destination_target}>
-                    VERBATIM)
-            endforeach()
-        endif()
     endforeach()
 endfunction()

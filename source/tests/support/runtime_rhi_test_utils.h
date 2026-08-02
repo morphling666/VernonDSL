@@ -67,6 +67,31 @@ private:
     VernonRhiStoreOperation store_{};
 };
 
+class RuntimeGraphComputePass final : public execution::ComputePass {
+public:
+    RuntimeGraphComputePass(std::string name, execution::GraphBuffer buffer, VernonRuntimeContext *runtime,
+                            VernonLoadedPipeline *pipeline, const VernonPipelineInvocation *invocation)
+        : ComputePass(std::move(name)), buffer_(buffer), runtime_(runtime), pipeline_(pipeline),
+          invocation_(invocation) {}
+
+    void declare() override { readWrite(buffer_, VERNON_RHI_STATE_SHADER_WRITE, VERNON_RHI_STAGE_COMPUTE); }
+
+    VernonRhiStatus execute(execution::ComputeEncoder &encoder, const execution::ExecutionResources &) override {
+        VernonRuntimeProviderObject providerEncoder{};
+        if (vernonRuntimeReferenceRhiCommandEncoder(runtime_, encoder.native(), &providerEncoder) != VERNON_STATUS_OK)
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        return vernonRuntimePipelineEncode(providerEncoder, pipeline_, invocation_) == VERNON_STATUS_OK
+                   ? VERNON_RHI_STATUS_OK
+                   : VERNON_RHI_STATUS_INTERNAL_ERROR;
+    }
+
+private:
+    execution::GraphBuffer buffer_;
+    VernonRuntimeContext *runtime_{};
+    VernonLoadedPipeline *pipeline_{};
+    const VernonPipelineInvocation *invocation_{};
+};
+
 inline VernonRhiBackend rhiBackend(VernonRuntimeBackend backend) {
     switch (backend) {
     case VERNON_RUNTIME_CUDA:
@@ -79,6 +104,8 @@ inline VernonRhiBackend rhiBackend(VernonRuntimeBackend backend) {
         return VERNON_RHI_BACKEND_OPENGL;
     case VERNON_RUNTIME_OPENGL_ES:
         return VERNON_RHI_BACKEND_OPENGL_ES;
+    case VERNON_RUNTIME_METAL:
+        return VERNON_RHI_BACKEND_METAL;
     default:
         return VERNON_RHI_BACKEND_CUDA;
     }

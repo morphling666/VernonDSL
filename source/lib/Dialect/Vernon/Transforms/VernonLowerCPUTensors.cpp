@@ -253,7 +253,7 @@ struct VernonLowerCPUTensorsPass final : PassWrapper<VernonLowerCPUTensorsPass, 
             return isCpuResourceIntrinsic(classifyCpuIntrinsic(intrinsic.getName())) &&
                    converter.isLegal(intrinsic.getOperation());
         });
-        target.addDynamicallyLegalOp<LoadOp, StoreOp>(
+        target.addDynamicallyLegalOp<LoadOp, StoreOp, PhysicalLoadOp, PhysicalStoreOp, PhysicalAtomicOp>(
             [&](Operation *operation) { return converter.isLegal(operation); });
         target.addIllegalOp<SwizzleOp, StructCreateOp, StructGetOp, TupleCreateOp, TupleGetOp>();
         populateVernonSharedValueStructuralTypeConversions(converter, patterns, target);

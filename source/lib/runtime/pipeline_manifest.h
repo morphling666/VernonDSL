@@ -63,6 +63,13 @@ struct ValueLayout {
     std::vector<VernonValueLeafView> abiLeaves;
 };
 
+struct TensorViewDescriptorUse {
+    uint32_t rank{};
+    uint32_t offsetBinding{UINT32_MAX};
+    std::vector<uint32_t> extentBindings;
+    std::vector<uint32_t> strideBindings;
+};
+
 struct ParameterUse {
     std::string stage;
     std::string interfaceKind;
@@ -77,8 +84,7 @@ struct ParameterUse {
     std::vector<SampledTextureBinding> sampledTextureBindings;
     std::vector<AttributeLeaf> attributeLeaves;
     std::optional<PhysicalValueLayout> physicalValueLayout;
-    std::vector<int64_t> elementStrides;
-    std::optional<uint64_t> elementOffset;
+    std::optional<TensorViewDescriptorUse> tensorViewDescriptor;
 };
 
 struct Parameter {
@@ -124,6 +130,8 @@ struct RuntimeRequirements {
     std::string targetTriple;
     std::string objectFormat;
     std::string profile;
+    std::string applePlatform;
+    RuntimeVersion minimumOsVersion;
 };
 
 struct Variant {

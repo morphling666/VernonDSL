@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 
 from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
 from ..diagnostics import CompileError
-from .abi import value_abi_layout
+from .abi import value_leaves
 from .model import ConcreteType
 from .type_parser import AnnotatedType
 
@@ -43,8 +43,8 @@ def emit_mlir_module(
     for name in sorted(structs):
         fields = structs[name]
         field_text = ", ".join(json.dumps(f"{field_name}:{annotation.type.mlir}") for field_name, annotation in fields)
-        layout = value_abi_layout(ConcreteType("struct", name), struct_field_types)
-        leaf_dtypes = ", ".join(f'"{leaf.dtype}"' for leaf in layout.leaves)
+        leaves = value_leaves(ConcreteType("struct", name), struct_field_types)
+        leaf_dtypes = ", ".join(f'"{leaf.dtype}"' for leaf in leaves)
         body.append(
             f'  "vernon.struct"() {{abi_leaf_dtypes = [{leaf_dtypes}], '
             f'fields = [{field_text}], sym_name = "{name}"}} : () -> ()'

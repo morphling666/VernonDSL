@@ -21,18 +21,18 @@ class AttributeAbiTests(unittest.TestCase):
         ranked = self._layout("f32", (2, 5))
         self.assertEqual(flat.leaves, ranked.leaves)
         self.assertEqual(
-            tuple((leaf.component_count, leaf.byte_offset) for leaf in ranked.leaves),
-            ((4, 0), (4, 16), (2, 32)),
+            tuple(leaf.component_count for leaf in ranked.leaves),
+            (4, 4, 2),
         )
 
     def test_dtype_controls_components_per_location(self) -> None:
         self.assertEqual(
-            tuple((leaf.component_count, leaf.byte_offset) for leaf in self._layout("f64", (5,)).leaves),
-            ((2, 0), (2, 16), (1, 32)),
+            tuple(leaf.component_count for leaf in self._layout("f64", (5,)).leaves),
+            (2, 2, 1),
         )
         self.assertEqual(
-            tuple((leaf.component_count, leaf.byte_offset) for leaf in self._layout("f16", (9,)).leaves),
-            ((4, 0), (4, 8), (1, 16)),
+            tuple(leaf.component_count for leaf in self._layout("f16", (9,)).leaves),
+            (4, 4, 1),
         )
 
     def test_all_numeric_attribute_dtypes_are_planned(self) -> None:

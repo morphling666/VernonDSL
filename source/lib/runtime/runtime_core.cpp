@@ -1,24 +1,17 @@
 #include "VernonRuntimeCore.h"
+#include "graphics_invocation_planner.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <memory>
 #include <mutex>
 #include <new>
+#include <unordered_map>
 #include <vector>
 
 struct VernonRuntimeCorePipeline {
-    struct GraphicsCacheEntry {
-        uint32_t topology{};
-        std::vector<uint32_t> colorFormats;
-        uint32_t depthStencilFormat{};
-        uint32_t sampleCount{1};
-        std::vector<uint32_t> vertexStrides;
-        uint64_t vertexLayoutIdentity{};
-        VernonRuntimeProviderObject pipeline{};
-    };
-
     VernonRuntimeDeviceProvider provider{};
     VernonRuntimeProviderDeviceIdentity identity{};
     VernonRuntimeProviderPipelineKind kind{};
@@ -27,7 +20,9 @@ struct VernonRuntimeCorePipeline {
     std::array<VernonRuntimeProviderObject, VERNON_RUNTIME_PROVIDER_MAX_SHADER_STAGES> shaders{};
     size_t shaderCount{};
     uint32_t pushConstantSize{};
-    std::vector<GraphicsCacheEntry> graphicsCache;
+    std::unordered_map<vernon::runtime::GraphicsVariantKey, VernonRuntimeProviderObject,
+                       vernon::runtime::GraphicsVariantKeyHash, vernon::runtime::GraphicsVariantKeyEqual>
+        graphicsCache;
     std::mutex graphicsCacheMutex;
     std::atomic<uint32_t> references{1};
 };
@@ -63,8 +58,8 @@ void releasePipeline(VernonRuntimeCorePipeline *pipeline) {
     if (!pipeline || pipeline->references.fetch_sub(1, std::memory_order_acq_rel) != 1)
         return;
     for (auto &entry : pipeline->graphicsCache)
-        if (present(entry.pipeline))
-            pipeline->provider.destroy_pipeline(pipeline->provider.user_data, entry.pipeline);
+        if (present(entry.second))
+            pipeline->provider.destroy_pipeline(pipeline->provider.user_data, entry.second);
     if (present(pipeline->pipeline))
         pipeline->provider.destroy_pipeline(pipeline->provider.user_data, pipeline->pipeline);
     if (present(pipeline->layout))
@@ -165,6 +160,31 @@ VernonStatus retainResources(const VernonRuntimeDeviceProvider &provider,
     return VERNON_STATUS_OK;
 }
 
+bool drawInvocationIsValid(const VernonRuntimeCorePipeline *pipeline, const VernonRuntimeCoreBindings *bindings,
+                           const VernonRuntimeCoreDrawInvocation *invocation) {
+    if (!pipeline || pipeline->kind != VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE || !invocation ||
+        invocation->struct_size < sizeof(VernonRuntimeCoreDrawInvocation) || invocation->vertex_count == 0 ||
+        invocation->instance_count == 0 || (bindings && bindings->pipeline != pipeline) ||
+        (invocation->color_attachment_count != 0 && !invocation->color_attachments) ||
+        ((invocation->index_count != 0) != (invocation->index_buffer.resource.value != 0)) ||
+        invocation->depth_load_operation > VERNON_RHI_LOAD_DISCARD ||
+        invocation->depth_store_operation > VERNON_RHI_STORE_DISCARD ||
+        invocation->stencil_load_operation > VERNON_RHI_LOAD_DISCARD ||
+        invocation->stencil_store_operation > VERNON_RHI_STORE_DISCARD || !std::isfinite(invocation->clear_depth) ||
+        invocation->clear_depth < 0.0f || invocation->clear_depth > 1.0f || invocation->clear_stencil > 0xff ||
+        invocation->stencil_reference > 0xff)
+        return false;
+    for (size_t index = 0; index < invocation->color_attachment_count; ++index) {
+        const auto &attachment = invocation->color_attachments[index];
+        if (attachment.location != index || attachment.load_operation > VERNON_RHI_LOAD_DISCARD ||
+            attachment.store_operation > VERNON_RHI_STORE_DISCARD ||
+            !std::all_of(std::begin(attachment.clear_color), std::end(attachment.clear_color),
+                         [](float value) { return std::isfinite(value); }))
+            return false;
+    }
+    return true;
+}
+
 } // namespace
 
 extern "C" VernonStatus vernonRuntimeCorePreparePipeline(const VernonRuntimeDeviceProvider *provider,
@@ -233,6 +253,10 @@ extern "C" VernonStatus vernonRuntimeCorePreparePipeline(const VernonRuntimeDevi
         {descriptor->workgroup_size[0], descriptor->workgroup_size[1], descriptor->workgroup_size[2]},
         nullptr,
         0,
+        descriptor->rasterization,
+        descriptor->depth_stencil,
+        descriptor->color_blends,
+        descriptor->color_blend_count,
         {0, 0, 0, 0}};
     status = provider->prepare_pipeline(provider->user_data, &providerDescriptor, &pipeline->pipeline);
     if (status != VERNON_STATUS_OK || !present(pipeline->pipeline)) {
@@ -330,33 +354,44 @@ vernonRuntimeCorePrepareGraphicsVariant(VernonRuntimeCorePipeline *pipeline,
     if (!pipeline || pipeline->kind != VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE || !compatibility || !output ||
         compatibility->struct_size < sizeof(*compatibility) || compatibility->sample_count == 0 ||
         (compatibility->color_format_count != 0 && !compatibility->color_formats) ||
-        (compatibility->vertex_stride_count != 0 && !compatibility->vertex_strides))
+        (compatibility->vertex_stride_count != 0 && !compatibility->vertex_strides) ||
+        (compatibility->color_blend_count != 0 && !compatibility->color_blends) ||
+        compatibility->color_blend_count != compatibility->color_format_count)
         return VERNON_STATUS_INVALID_ARGUMENT;
 
     auto variant =
         std::unique_ptr<VernonRuntimeCoreGraphicsVariant>(new (std::nothrow) VernonRuntimeCoreGraphicsVariant());
     if (!variant)
         return VERNON_STATUS_INTERNAL_ERROR;
-    std::lock_guard<std::mutex> guard(pipeline->graphicsCacheMutex);
-    const auto cached =
-        std::find_if(pipeline->graphicsCache.begin(), pipeline->graphicsCache.end(), [&](const auto &entry) {
-            return entry.topology == compatibility->topology &&
-                   entry.depthStencilFormat == compatibility->depth_stencil_format &&
-                   entry.sampleCount == compatibility->sample_count &&
-                   entry.vertexLayoutIdentity == compatibility->vertex_layout_identity &&
-                   entry.vertexStrides.size() == compatibility->vertex_stride_count &&
-                   (entry.vertexStrides.empty() || std::equal(entry.vertexStrides.begin(), entry.vertexStrides.end(),
-                                                              compatibility->vertex_strides)) &&
-                   entry.colorFormats.size() == compatibility->color_format_count &&
-                   (entry.colorFormats.empty() ||
-                    std::equal(entry.colorFormats.begin(), entry.colorFormats.end(), compatibility->color_formats));
-        });
-    if (cached != pipeline->graphicsCache.end()) {
-        variant->pipeline = pipeline;
-        variant->handle = cached->pipeline;
-        pipeline->references.fetch_add(1, std::memory_order_relaxed);
-        *output = variant.release();
-        return VERNON_STATUS_OK;
+    vernon::runtime::GraphicsVariantKey key;
+    try {
+        key.topology = compatibility->topology;
+        if (compatibility->color_format_count)
+            key.colorFormats.assign(compatibility->color_formats,
+                                    compatibility->color_formats + compatibility->color_format_count);
+        key.depthStencilFormat = compatibility->depth_stencil_format;
+        key.sampleCount = compatibility->sample_count;
+        if (compatibility->vertex_stride_count)
+            key.vertexStrides.assign(compatibility->vertex_strides,
+                                     compatibility->vertex_strides + compatibility->vertex_stride_count);
+        key.rasterization = compatibility->rasterization;
+        key.depthStencil = compatibility->depth_stencil;
+        if (compatibility->color_blend_count)
+            key.colorBlends.assign(compatibility->color_blends,
+                                   compatibility->color_blends + compatibility->color_blend_count);
+    } catch (const std::bad_alloc &) {
+        return VERNON_STATUS_INTERNAL_ERROR;
+    }
+    {
+        std::lock_guard<std::mutex> guard(pipeline->graphicsCacheMutex);
+        const auto cached = pipeline->graphicsCache.find(key);
+        if (cached != pipeline->graphicsCache.end()) {
+            variant->pipeline = pipeline;
+            variant->handle = cached->second;
+            pipeline->references.fetch_add(1, std::memory_order_relaxed);
+            *output = variant.release();
+            return VERNON_STATUS_OK;
+        }
     }
 
     const VernonRuntimeProviderPipelineDescriptor descriptor{sizeof(VernonRuntimeProviderPipelineDescriptor),
@@ -373,29 +408,31 @@ vernonRuntimeCorePrepareGraphicsVariant(VernonRuntimeCorePipeline *pipeline,
                                                              {1, 1, 1},
                                                              compatibility->vertex_strides,
                                                              compatibility->vertex_stride_count,
+                                                             compatibility->rasterization,
+                                                             compatibility->depth_stencil,
+                                                             compatibility->color_blends,
+                                                             compatibility->color_blend_count,
                                                              {0, 0, 0, 0}};
     VernonRuntimeProviderObject prepared{};
     const VernonStatus status =
         pipeline->provider.prepare_pipeline(pipeline->provider.user_data, &descriptor, &prepared);
-    if (status != VERNON_STATUS_OK || !present(prepared))
+    if (status != VERNON_STATUS_OK || !present(prepared)) {
+        if (present(prepared))
+            pipeline->provider.destroy_pipeline(pipeline->provider.user_data, prepared);
         return status == VERNON_STATUS_OK ? VERNON_STATUS_INTERNAL_ERROR : status;
-    try {
-        VernonRuntimeCorePipeline::GraphicsCacheEntry entry;
-        entry.topology = compatibility->topology;
-        if (compatibility->color_format_count != 0)
-            entry.colorFormats.assign(compatibility->color_formats,
-                                      compatibility->color_formats + compatibility->color_format_count);
-        entry.depthStencilFormat = compatibility->depth_stencil_format;
-        entry.sampleCount = compatibility->sample_count;
-        if (compatibility->vertex_stride_count != 0)
-            entry.vertexStrides.assign(compatibility->vertex_strides,
-                                       compatibility->vertex_strides + compatibility->vertex_stride_count);
-        entry.vertexLayoutIdentity = compatibility->vertex_layout_identity;
-        entry.pipeline = prepared;
-        pipeline->graphicsCache.push_back(std::move(entry));
-    } catch (const std::bad_alloc &) {
-        pipeline->provider.destroy_pipeline(pipeline->provider.user_data, prepared);
-        return VERNON_STATUS_INTERNAL_ERROR;
+    }
+    {
+        std::lock_guard<std::mutex> guard(pipeline->graphicsCacheMutex);
+        try {
+            const auto [cached, inserted] = pipeline->graphicsCache.emplace(std::move(key), prepared);
+            if (!inserted) {
+                pipeline->provider.destroy_pipeline(pipeline->provider.user_data, prepared);
+                prepared = cached->second;
+            }
+        } catch (const std::bad_alloc &) {
+            pipeline->provider.destroy_pipeline(pipeline->provider.user_data, prepared);
+            return VERNON_STATUS_INTERNAL_ERROR;
+        }
     }
     variant->pipeline = pipeline;
     variant->handle = prepared;
@@ -450,11 +487,7 @@ extern "C" VernonStatus vernonRuntimeCoreEncodeDraw(const VernonRuntimeCorePipel
 extern "C" VernonStatus vernonRuntimeCoreEncodeDrawInvocation(const VernonRuntimeCorePipeline *pipeline,
                                                               const VernonRuntimeCoreBindings *bindings,
                                                               const VernonRuntimeCoreDrawInvocation *invocation) {
-    if (!pipeline || pipeline->kind != VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE || !invocation ||
-        invocation->struct_size < sizeof(VernonRuntimeCoreDrawInvocation) || invocation->vertex_count == 0 ||
-        invocation->instance_count == 0 || (bindings && bindings->pipeline != pipeline) ||
-        (invocation->color_attachment_count != 0 && !invocation->color_attachments) ||
-        ((invocation->index_count != 0) != (invocation->index_buffer.resource.value != 0)))
+    if (!drawInvocationIsValid(pipeline, bindings, invocation))
         return VERNON_STATUS_INVALID_ARGUMENT;
     const VernonRuntimeProviderDrawDescriptor descriptor{
         sizeof(VernonRuntimeProviderDrawDescriptor),
@@ -476,7 +509,12 @@ extern "C" VernonStatus vernonRuntimeCoreEncodeDrawInvocation(const VernonRuntim
         invocation->index_buffer,
         invocation->index_count,
         invocation->index_type,
-        {0, 0, 0, 0}};
+        invocation->stencil_load_operation,
+        invocation->stencil_store_operation,
+        invocation->clear_stencil,
+        invocation->stencil_reference,
+        {invocation->render_area[0], invocation->render_area[1], invocation->render_area[2],
+         invocation->render_area[3]}};
     return pipeline->provider.encode_draw(pipeline->provider.user_data, invocation->command_encoder, &descriptor);
 }
 
@@ -485,11 +523,7 @@ vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(const VernonRuntimeCoreGrap
                                                      const VernonRuntimeCoreBindings *bindings,
                                                      const VernonRuntimeCoreDrawInvocation *invocation) {
     const VernonRuntimeCorePipeline *pipeline = variant ? variant->pipeline : nullptr;
-    if (!variant || !pipeline || pipeline->kind != VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE || !invocation ||
-        invocation->struct_size < sizeof(VernonRuntimeCoreDrawInvocation) || invocation->vertex_count == 0 ||
-        invocation->instance_count == 0 || (bindings && bindings->pipeline != pipeline) ||
-        (invocation->color_attachment_count != 0 && !invocation->color_attachments) ||
-        ((invocation->index_count != 0) != (invocation->index_buffer.resource.value != 0)))
+    if (!variant || !drawInvocationIsValid(pipeline, bindings, invocation))
         return VERNON_STATUS_INVALID_ARGUMENT;
     const VernonRuntimeProviderDrawDescriptor descriptor{
         sizeof(VernonRuntimeProviderDrawDescriptor),
@@ -511,6 +545,11 @@ vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(const VernonRuntimeCoreGrap
         invocation->index_buffer,
         invocation->index_count,
         invocation->index_type,
-        {0, 0, 0, 0}};
+        invocation->stencil_load_operation,
+        invocation->stencil_store_operation,
+        invocation->clear_stencil,
+        invocation->stencil_reference,
+        {invocation->render_area[0], invocation->render_area[1], invocation->render_area[2],
+         invocation->render_area[3]}};
     return pipeline->provider.encode_draw(pipeline->provider.user_data, invocation->command_encoder, &descriptor);
 }

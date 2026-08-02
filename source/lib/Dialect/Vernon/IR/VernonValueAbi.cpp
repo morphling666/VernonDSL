@@ -564,8 +564,9 @@ FailureOr<PhysicalValueAbiPlan> getPhysicalValueAbiPlan(Type type, ModuleOp modu
             return failure();
         switch (profile) {
         case PhysicalAbiProfile::HostValue:
-            return PhysicalValueAbiPlan{
-                PhysicalResourceAbiLayout{PhysicalResourceAbiKind::HostPointer, 8, 8, std::move(*element)}};
+            return PhysicalValueAbiPlan{PhysicalResourceAbiLayout{
+                PhysicalResourceAbiKind::TensorViewDescriptor,
+                8 * (2 + 2 * static_cast<uint64_t>(view.getShape().size())), 8, std::move(*element)}};
         case PhysicalAbiProfile::CudaKernelParameter:
             return PhysicalValueAbiPlan{
                 PhysicalResourceAbiLayout{PhysicalResourceAbiKind::CudaStorageLeaves, 0, 0, std::move(*element)}};
@@ -613,6 +614,7 @@ FailureOr<PhysicalValueAbiLayout> getPhysicalValueAbiLayout(Type type, ModuleOp 
 }
 
 FailureOr<WorkgroupPhysicalStoragePlan> getWorkgroupPhysicalStoragePlan(TensorViewType view, ModuleOp module) {
+    constexpr uint64_t allocationAlignment = 16;
     if (view.getAddressSpace() != "workgroup")
         return failure();
     if (view.getShape().empty() || llvm::any_of(view.getShape(), [](int64_t extent) { return extent <= 0; }))
@@ -634,13 +636,24 @@ FailureOr<WorkgroupPhysicalStoragePlan> getWorkgroupPhysicalStoragePlan(TensorVi
     plan.elementType = view.getElementType();
     plan.layout = *layout;
     plan.recordCount = records;
+    auto addAllocationFootprint = [&](uint64_t byteSize) {
+        if (byteSize > std::numeric_limits<uint64_t>::max() - (allocationAlignment - 1))
+            return failure();
+        const uint64_t footprint = ((byteSize + allocationAlignment - 1) / allocationAlignment) * allocationAlignment;
+        if (plan.totalPhysicalBytes > std::numeric_limits<uint64_t>::max() - footprint)
+            return failure();
+        plan.totalPhysicalBytes += footprint;
+        return success();
+    };
 
     if (view.getElementType().isIntOrFloat()) {
         const uint64_t leafSize = std::max<uint64_t>(view.getElementType().getIntOrFloatBitWidth() / 8, 1);
         if (records > std::numeric_limits<uint64_t>::max() / leafSize)
             return failure();
-        plan.leaves.push_back({view.getElementType(), records, records * leafSize, 0});
-        plan.totalPhysicalBytes = records * leafSize;
+        const uint64_t byteSize = records * leafSize;
+        plan.leaves.push_back({view.getElementType(), records, byteSize, 0});
+        if (failed(addAllocationFootprint(byteSize)))
+            return failure();
         return plan;
     }
 
@@ -655,10 +668,9 @@ FailureOr<WorkgroupPhysicalStoragePlan> getWorkgroupPhysicalStoragePlan(TensorVi
         if (scalarCount != 0 && leafSize > std::numeric_limits<uint64_t>::max() / scalarCount)
             return failure();
         const uint64_t byteSize = scalarCount * leafSize;
-        if (plan.totalPhysicalBytes > std::numeric_limits<uint64_t>::max() - byteSize)
-            return failure();
         plan.leaves.push_back({abiLeaf.scalarType, scalarCount, byteSize, index});
-        plan.totalPhysicalBytes += byteSize;
+        if (failed(addAllocationFootprint(byteSize)))
+            return failure();
     }
     return plan;
 }

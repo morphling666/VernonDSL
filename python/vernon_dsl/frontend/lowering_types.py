@@ -25,31 +25,11 @@ class FunctionSignature:
 
 
 @dataclass(frozen=True)
-class ViewLayout:
-    shape: tuple[int, ...]
-    strides: tuple[int, ...]
-    offset: int
-
-    def __post_init__(self) -> None:
-        if not self.shape or any(
-            not isinstance(extent, int) or isinstance(extent, bool) or extent < 0 for extent in self.shape
-        ):
-            raise ValueError("TensorView specialization shape must contain non-negative integer extents")
-        if len(self.strides) != len(self.shape) or any(
-            not isinstance(stride, int) or isinstance(stride, bool) for stride in self.strides
-        ):
-            raise ValueError("TensorView specialization requires one signed integer stride per dimension")
-        if not isinstance(self.offset, int) or isinstance(self.offset, bool) or self.offset < 0:
-            raise ValueError("TensorView specialization offset must be a non-negative integer")
-
-
-@dataclass(frozen=True)
 class Value:
     name: str
     type: DslType
     fields: tuple["Value", ...] | None = None
     access: AccessMode = AccessMode.READ
-    view_layout: ViewLayout | None = None
 
     @property
     def abi_type(self) -> DslType:
@@ -69,7 +49,6 @@ class Value:
 class ModuleContext:
     filename: str
     runtime_entry: str | None = None
-    tensor_view_layouts: dict[str, ViewLayout] = field(default_factory=dict)
     structs: dict[str, tuple[tuple[str, AnnotatedType], ...]] = field(default_factory=dict)
     signatures: dict[str, FunctionSignature] = field(default_factory=dict)
     result_annotations: dict[str, AnnotatedType | None] = field(default_factory=dict)

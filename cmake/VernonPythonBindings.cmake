@@ -51,6 +51,7 @@ function(vernon_add_python_bindings package_directory source_directory)
         return()
     endif()
 
+    target_sources(VernonDSLCompiler PRIVATE "${source_directory}/lib/compiler/compiler_python_bridge.cpp")
     nanobind_add_module(vernon-dsl-native "${source_directory}/python/native_module.cpp")
     _vernon_set_python_module_output(vernon-dsl-native "${package_directory}")
     target_link_libraries(
@@ -59,6 +60,7 @@ function(vernon_add_python_bindings package_directory source_directory)
                 Vernon::Runtime
                 Vernon::RHI
                 Vernon::ExecutionGraph)
+    target_include_directories(vernon-dsl-native PRIVATE "${source_directory}/lib/compiler")
     if(MSVC)
         target_compile_options(vernon-dsl-native PRIVATE /EHsc)
     endif()
@@ -68,11 +70,6 @@ function(vernon_add_python_bindings package_directory source_directory)
         VernonRuntime
         VernonRHI)
     set_target_properties(vernon-dsl-native PROPERTIES OUTPUT_NAME "_native")
-    if(APPLE)
-        set_target_properties(vernon-dsl-native PROPERTIES INSTALL_RPATH "@loader_path")
-    elseif(UNIX)
-        set_target_properties(vernon-dsl-native PROPERTIES INSTALL_RPATH "$ORIGIN")
-    endif()
     install(
         TARGETS vernon-dsl-native
         RUNTIME DESTINATION vernon_dsl COMPONENT VernonWheel

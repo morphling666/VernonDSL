@@ -143,6 +143,12 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     ASSERT_TRUE(vernonRuntimePipelineBundleInspectTarget(bundle.data(), bundle.size(), &target) == VERNON_STATUS_OK);
     ASSERT_TRUE(target == VERNON_RUNTIME_CPU);
 
+    nlohmann::json mixedTargetOptions = nlohmann::json::parse(bundle);
+    mixedTargetOptions["target"]["options"]["version"] = 330;
+    const std::string mixedTargetBundle = withContentHash(mixedTargetOptions);
+    EXPECT_EQ(vernonRuntimePipelineBundleInspectTarget(mixedTargetBundle.data(), mixedTargetBundle.size(), &target),
+              VERNON_STATUS_PARSE_ERROR);
+
     VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_TRUE(runtime);
 

@@ -27,10 +27,7 @@ module attributes {$VERNON_VERSION_ATTRIBUTES} {
       %values: !vernon.tensor_view<f32, [3], "read_write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64,
-        vernon.tensor_shape = array<i64: 3>,
-        vernon.tensor_strides = array<i64: 1>,
-        vernon.tensor_offset = 0 : i64
+        vernon.binding = 0 : i64
       },
       %id: index {
         vernon.interface = "input",
@@ -54,6 +51,8 @@ module attributes {$VERNON_VERSION_ATTRIBUTES} {
   }
 }
 """)
+
+DYNAMIC_CPU_MODULE = CPU_MODULE.replace("[3]", "[-1]")
 
 MULTI_ENTRY_MODULE = _versioned(r"""
 module attributes {$VERNON_VERSION_ATTRIBUTES} {
@@ -156,6 +155,20 @@ module attributes {
 
 
 class CompiledProgramTests(unittest.TestCase):
+    def test_target_available_reports_compiler_capabilities(self) -> None:
+        self.assertTrue(native.target_available(native.Target.CPU))
+        for target in (
+            native.Target.CPU,
+            native.Target.CUDA,
+            native.Target.VULKAN,
+            native.Target.METAL,
+            native.Target.DIRECTX,
+            native.Target.OPENGL,
+            native.Target.OPENGL_ES,
+        ):
+            with self.subTest(target=target):
+                self.assertIsInstance(native.target_available(target), bool)
+
     def test_context_owned_python_gpu_resource_api_is_removed(self) -> None:
         self.assertFalse(hasattr(native.Runtime, "create_texture"))
         self.assertFalse(hasattr(native.Runtime, "import_opengl_sampler"))
@@ -201,11 +214,11 @@ class CompiledProgramTests(unittest.TestCase):
         )
         for target, options in (
             (native.Target.VULKAN, {}),
-            (native.Target.OPENGL, {"glsl_version": 330}),
-            (native.Target.OPENGL_ES, {"glsl_version": 310}),
+            (native.Target.OPENGL, {"version": 330}),
+            (native.Target.OPENGL_ES, {"version": 310}),
         ):
             with self.subTest(target=target):
-                program = native.Compiler().compile_program_result(module, target, **options)
+                program = native.Compiler().compile_program_result(module, target, options)
                 self.assertTrue(program.ok, program.diagnostics)
 
     def test_spirv_struct_carried_structured_loop_compiles(self) -> None:
@@ -237,10 +250,12 @@ class CompiledProgramTests(unittest.TestCase):
         for target, options in (
             (native.Target.VULKAN, {}),
             (native.Target.DIRECTX, {}),
-            (native.Target.OPENGL, {"glsl_version": 430}),
+            (native.Target.OPENGL, {"version": 430}),
         ):
             with self.subTest(target=target):
-                program = native.Compiler().compile_program_result(module, target, **options)
+                if target == native.Target.DIRECTX and not native.target_available(target):
+                    continue
+                program = native.Compiler().compile_program_result(module, target, options)
                 self.assertTrue(program.ok, program.diagnostics)
 
     def test_spirv_dynamic_step_reports_contract_capability(self) -> None:
@@ -264,10 +279,10 @@ class CompiledProgramTests(unittest.TestCase):
 
     def test_named_artifacts_and_reflection(self) -> None:
         compiler = native.Compiler()
-        program = compiler.compile_program_result(MULTI_ENTRY_MODULE, native.Target.OPENGL, glsl_version=330)
+        program = compiler.compile_program_result(MULTI_ENTRY_MODULE, native.Target.OPENGL, {"version": 330})
         self.assertTrue(program.ok, program.diagnostics)
         self.assertEqual(program.target, native.Target.OPENGL)
-        self.assertEqual(program.glsl_version, 330)
+        self.assertEqual(json.loads(program.reflection)["target"]["options"]["version"], 330)
         self.assertEqual(len(program.artifacts), 2)
         self.assertEqual(len({name for name, _ in program.artifacts}), 2)
         self.assertTrue(all(name.endswith(".glsl") for name, _ in program.artifacts))
@@ -285,8 +300,8 @@ class CompiledProgramTests(unittest.TestCase):
         self.assertTrue(program.has_cpu_entry("increment"))
         self.assertFalse(program.has_cpu_entry("missing"))
         reflection = json.loads(program.reflection)
-        self.assertEqual(reflection["target"], "cpu")
-        self.assertTrue(reflection["target_options"]["target_triple"])
+        self.assertEqual(reflection["target"]["kind"], "cpu")
+        self.assertTrue(reflection["target"]["options"]["triple"])
         self.assertEqual(
             reflection["entries"][0]["effects"],
             [
@@ -308,6 +323,23 @@ class CompiledProgramTests(unittest.TestCase):
         _bind_native_argument(invocation, pipeline.parameters[0], values)
         invocation.grid(3, 1, 1).invoke()
         np.testing.assert_array_equal(values.to_numpy(), np.array([3.0, 5.0, 7.0], dtype=np.float32))
+
+    def test_cpu_artifact_reuses_dynamic_tensor_view_descriptor(self) -> None:
+        program = native.Compiler().compile_program_result(DYNAMIC_CPU_MODULE, native.Target.CPU)
+        self.assertTrue(program.ok, program.diagnostics)
+        runtime = native.Runtime(native.RuntimeBackend.CPU)
+        pipeline = runtime.load_cpu_entry(program, "increment")
+        values = vd.storage.from_numpy(np.arange(5, dtype=np.float32))
+
+        invocation = pipeline.invocation_builder()
+        _bind_native_argument(invocation, pipeline.parameters[0], values)
+        invocation.grid(5, 1, 1).invoke()
+
+        reverse = values.view(shape=(3,), strides=(-1,), offset=4, access="read_write")
+        invocation = pipeline.invocation_builder()
+        _bind_native_argument(invocation, pipeline.parameters[0], reverse)
+        invocation.grid(3, 1, 1).invoke()
+        np.testing.assert_array_equal(values.to_numpy(), np.array([1.0, 2.0, 4.0, 5.0, 6.0], dtype=np.float32))
 
     def test_cpu_tuple_create_and_constant_extract_lowering(self) -> None:
         program = native.Compiler().compile_program_result(CPU_TUPLE_MODULE, native.Target.CPU)
@@ -334,7 +366,7 @@ class CompiledProgramTests(unittest.TestCase):
         opengl = native.Compiler().compile_program_result(
             CPU_TUPLE_MODULE,
             native.Target.OPENGL,
-            glsl_version=450,
+            {"version": 450},
         )
         self.assertTrue(opengl.ok, opengl.diagnostics)
         self.assertEqual(json.loads(opengl.reflection)["struct_layouts"], reflection["struct_layouts"])
@@ -380,23 +412,18 @@ class CompiledProgramTests(unittest.TestCase):
 
     def test_diagnostics_and_target_options(self) -> None:
         compiler = native.Compiler()
-        invalid = compiler.compile_program_result(
-            CPU_MODULE,
-            native.Target.CPU,
-            glsl_version=450,
-        )
-        self.assertFalse(invalid.ok)
-        self.assertEqual(invalid.status, native.Status.INVALID_ARGUMENT)
-        self.assertIn("valid only for OpenGL", invalid.diagnostics)
-        self.assertEqual(invalid.glsl_version, 450)
+        with self.assertRaisesRegex(ValueError, "unknown option 'version'"):
+            compiler.compile_program_result(CPU_MODULE, native.Target.CPU, {"version": 450})
 
-        program = compiler.compile_program_result(CPU_MODULE, native.Target.CPU, cpu="generic", cpu_features="")
+        program = compiler.compile_program_result(CPU_MODULE, native.Target.CPU, {"processor": "generic"})
         self.assertTrue(program.ok, program.diagnostics)
-        self.assertEqual(program.cpu, "generic")
-        self.assertEqual(program.cpu_features, "")
+        self.assertEqual(json.loads(program.reflection)["target"]["options"]["processor"], "generic")
+        positional = compiler.compile_program_result(CPU_MODULE, native.Target.CPU, {"processor": "generic"})
+        self.assertTrue(positional.ok, positional.diagnostics)
+        self.assertEqual(json.loads(positional.reflection)["target"]["options"]["processor"], "generic")
         default_program = compiler.compile_program_result(CPU_MODULE, native.Target.CPU)
         self.assertTrue(default_program.ok, default_program.diagnostics)
-        self.assertEqual(json.loads(default_program.reflection)["target"], "cpu")
+        self.assertEqual(json.loads(default_program.reflection)["target"]["kind"], "cpu")
 
 
 if __name__ == "__main__":

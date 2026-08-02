@@ -73,32 +73,34 @@ VernonCompileResult *vernonCompilerValidateMlir(VernonCompilerContext *context, 
 
 VernonCompileResult *vernonCompilerCompileMlir(VernonCompilerContext *context, const char *source, size_t sourceSize,
                                                VernonTarget target) {
-    return vernonCompilerCompileMlirWithOptions(context, source, sourceSize, target, nullptr);
+    VernonCompileOptions options{};
+    options.struct_size = sizeof(options);
+    options.target = target;
+    return vernonCompilerCompileMlirWithOptions(context, source, sourceSize, &options);
 }
 
 VernonCompileResult *vernonCompilerCompileMlirWithOptions(VernonCompilerContext *context, const char *source,
-                                                          size_t sourceSize, VernonTarget target,
-                                                          const VernonCompileOptions *options) {
+                                                          size_t sourceSize, const VernonCompileOptions *options) {
     vernon::compiler::PreparedModulePtr prepared;
     auto result = validate(context, source, sourceSize, &prepared);
     if (result->status != VERNON_STATUS_OK)
         return result.release();
 
-    if (target < VERNON_TARGET_CPU || target > VERNON_TARGET_CUDA) {
+    if (!options) {
         result->status = VERNON_STATUS_INVALID_ARGUMENT;
-        result->diagnostics = "unknown compilation target";
+        result->diagnostics = "compile options must select a target";
         result->artifacts.clear();
         return result.release();
     }
 
-    vernon::compiler::CompileOptions parsedOptions;
-    result->status = vernon::compiler::parseCompileOptions(options, target, parsedOptions, result->diagnostics);
+    vernon::compiler::CompileOptions parsedOptions = vernon::compiler::defaultCompileOptions(options->target);
+    result->status = vernon::compiler::parseCompileOptions(*options, parsedOptions, result->diagnostics);
     if (result->status != VERNON_STATUS_OK) {
         result->artifacts.clear();
         return result.release();
     }
-    result->status = vernon::compiler::compileTarget(*prepared, target, parsedOptions, result->artifacts,
-                                                     result->reflection, result->diagnostics, result->cpuExecution);
+    result->status = vernon::compiler::compileTarget(*prepared, parsedOptions, result->artifacts, result->reflection,
+                                                     result->diagnostics, result->cpuExecution);
     return result.release();
 }
 

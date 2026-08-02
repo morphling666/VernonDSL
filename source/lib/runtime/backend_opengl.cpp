@@ -1,6 +1,5 @@
 #include "backend_opengl.h"
 
-#include "rhi_adapter/adapter_internal.h"
 #include "runtime_state.h"
 #include "tensor_bridge.h"
 

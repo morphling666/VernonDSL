@@ -70,9 +70,12 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
         return invalidAbi("CPU ABI wrapper internal function '" + metadata.internalFunctionSymbol + "' does not exist");
 
     size_t loweredArgumentCount = 1;
-    for (const CpuAbiArgumentPacking &argument : metadata.sourceArguments)
+    for (const CpuAbiArgumentPacking &argument : metadata.sourceArguments) {
         loweredArgumentCount +=
             argument.kind == CpuAbiArgumentKind::TensorView ? 5 * argument.tensorLeafElementSizes.size() : 1;
+        if (argument.kind == CpuAbiArgumentKind::TensorView)
+            loweredArgumentCount += 1 + 2 * argument.tensorRank;
+    }
     if (function->arg_size() != loweredArgumentCount)
         return invalidAbi("lowered CPU entry '" + metadata.internalFunctionSymbol +
                           "' has an incompatible argument count");
@@ -159,8 +162,9 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
             continue;
         }
 
-        if (packing.size != module.getDataLayout().getPointerSize())
-            return invalidAbi("CPU buffer ABI packing size is not one pointer");
+        const uint64_t descriptorSize = 8 * (2 + 2 * static_cast<uint64_t>(packing.tensorRank));
+        if (packing.size != descriptorSize || module.getDataLayout().getPointerSize() != 8)
+            return invalidAbi("CPU TensorView descriptor has an incompatible size");
         llvm::LoadInst *rawPointer = builder.CreateLoad(pointerType, address, "buffer");
         rawPointer->setAlignment(llvm::Align(1));
         for (size_t leafIndex = 0; leafIndex < packing.tensorLeafElementSizes.size(); ++leafIndex) {
@@ -173,12 +177,31 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
                 return invalidAbi("lowered CPU buffer descriptor pointer types are "
                                   "incompatible");
             llvm::Constant *offset = integerConstant(offsetType, 0);
-            llvm::Constant *extent = integerConstant(sizeType, packing.staticExtent);
+            llvm::Constant *extent = integerConstant(sizeType, 0);
             llvm::Constant *stride = integerConstant(strideType, 1);
             if (!offset || !extent || !stride)
                 return invalidAbi("lowered CPU buffer descriptor index types are "
                                   "incompatible");
             argumentsToCall.append({rawPointer, rawPointer, offset, extent, stride});
+        }
+    }
+    for (const CpuAbiArgumentPacking &packing : metadata.sourceArguments) {
+        if (packing.kind != CpuAbiArgumentKind::TensorView)
+            continue;
+        llvm::Value *descriptor =
+            builder.CreateGEP(llvm::Type::getInt8Ty(context), arguments,
+                              llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), packing.offset));
+        const uint32_t fieldCount = 1 + 2 * packing.tensorRank;
+        for (uint32_t field = 0; field < fieldCount; ++field) {
+            llvm::Type *fieldType = function->getArg(loweredIndex++)->getType();
+            if (!llvm::isa<llvm::IntegerType>(fieldType))
+                return invalidAbi("CPU TensorView descriptor field type is not an integer");
+            llvm::Value *fieldAddress = builder.CreateGEP(
+                llvm::Type::getInt8Ty(context), descriptor,
+                llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8 * (1 + static_cast<uint64_t>(field))));
+            llvm::LoadInst *fieldValue = builder.CreateLoad(fieldType, fieldAddress);
+            fieldValue->setAlignment(llvm::Align(1));
+            argumentsToCall.push_back(fieldValue);
         }
     }
     argumentsToCall.push_back(textures);

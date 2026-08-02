@@ -1,10 +1,13 @@
 #include "VernonCompiler.h"
 #include "VernonRuntime.h"
 #include "VernonVersions.h"
+#include "runtime/rhi_adapter/adapter_directx12_test_hooks.h"
 #include "runtime/runtime_test_hooks.h"
 #include "runtime_rhi_test_utils.h"
 
 #include <gtest/gtest.h>
+
+#include <d3d12.h>
 
 #include <array>
 #include <cstring>
@@ -33,6 +36,34 @@ vernon::tests::RhiImage createTexture2D(vernon::tests::RhiRuntime &context, uint
 
 } // namespace
 
+TEST(RuntimeDirectX12Pipeline, MapsEveryGraphicsStateEnumerationExplicitly) {
+    constexpr D3D12_BLEND blendFactors[]{D3D12_BLEND_ZERO,       D3D12_BLEND_ONE,
+                                         D3D12_BLEND_SRC_COLOR,  D3D12_BLEND_INV_SRC_COLOR,
+                                         D3D12_BLEND_DEST_COLOR, D3D12_BLEND_INV_DEST_COLOR,
+                                         D3D12_BLEND_SRC_ALPHA,  D3D12_BLEND_INV_SRC_ALPHA,
+                                         D3D12_BLEND_DEST_ALPHA, D3D12_BLEND_INV_DEST_ALPHA};
+    for (uint32_t index = 0; index < std::size(blendFactors); ++index)
+        EXPECT_EQ(vernon::runtime::getDirectX12BlendFactorMapping(index), blendFactors[index]);
+    constexpr D3D12_BLEND_OP blendOperations[]{D3D12_BLEND_OP_ADD, D3D12_BLEND_OP_SUBTRACT, D3D12_BLEND_OP_REV_SUBTRACT,
+                                               D3D12_BLEND_OP_MIN, D3D12_BLEND_OP_MAX};
+    for (uint32_t index = 0; index < std::size(blendOperations); ++index)
+        EXPECT_EQ(vernon::runtime::getDirectX12BlendOperationMapping(index), blendOperations[index]);
+    constexpr D3D12_COMPARISON_FUNC compareOperations[]{
+        D3D12_COMPARISON_FUNC_NEVER,         D3D12_COMPARISON_FUNC_LESS,    D3D12_COMPARISON_FUNC_EQUAL,
+        D3D12_COMPARISON_FUNC_LESS_EQUAL,    D3D12_COMPARISON_FUNC_GREATER, D3D12_COMPARISON_FUNC_NOT_EQUAL,
+        D3D12_COMPARISON_FUNC_GREATER_EQUAL, D3D12_COMPARISON_FUNC_ALWAYS};
+    for (uint32_t index = 0; index < std::size(compareOperations); ++index)
+        EXPECT_EQ(vernon::runtime::getDirectX12CompareOperationMapping(index), compareOperations[index]);
+    constexpr D3D12_STENCIL_OP stencilOperations[]{
+        D3D12_STENCIL_OP_KEEP,     D3D12_STENCIL_OP_ZERO,   D3D12_STENCIL_OP_REPLACE, D3D12_STENCIL_OP_INCR_SAT,
+        D3D12_STENCIL_OP_DECR_SAT, D3D12_STENCIL_OP_INVERT, D3D12_STENCIL_OP_INCR,    D3D12_STENCIL_OP_DECR};
+    for (uint32_t index = 0; index < std::size(stencilOperations); ++index)
+        EXPECT_EQ(vernon::runtime::getDirectX12StencilOperationMapping(index), stencilOperations[index]);
+    constexpr D3D12_CULL_MODE cullModes[]{D3D12_CULL_MODE_NONE, D3D12_CULL_MODE_FRONT, D3D12_CULL_MODE_BACK};
+    for (uint32_t index = 0; index < std::size(cullModes); ++index)
+        EXPECT_EQ(vernon::runtime::getDirectX12CullModeMapping(index), cullModes[index]);
+}
+
 TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     const std::filesystem::path manifestPath = VERNON_DIRECTX_PIPELINE_BUNDLE;
     std::ifstream input(manifestPath, std::ios::binary);
@@ -60,8 +91,12 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     ASSERT_NE(vertices.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     auto sampled = createTexture2D(context, 1, 1);
     auto target = createTexture2D(context, 32, 32);
+    auto depth =
+        vernon::tests::createImage(context, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, 32, 32, 1,
+                                   VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE);
     ASSERT_NE(sampled.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    ASSERT_NE(depth.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     constexpr std::array<uint8_t, 4> color{64, 200, 100, 255};
     VernonRhiImageUploadDescriptor upload{sizeof(VernonRhiImageUploadDescriptor),
                                           0,
@@ -98,6 +133,37 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     arguments[2].kind = VERNON_PIPELINE_SAMPLER;
     arguments[2].resource = sampler.reference;
     VernonColorAttachment attachment{0, target.reference, 32, 32, VERNON_TEXTURE_RGBA8_UNORM};
+    VernonDepthAttachment depthAttachment{};
+    depthAttachment.resource = depth.reference;
+    depthAttachment.width = 32;
+    depthAttachment.height = 32;
+    depthAttachment.format = VERNON_TEXTURE_D32_FLOAT_S8_UINT;
+    depthAttachment.load_operation = VERNON_RHI_LOAD_CLEAR;
+    depthAttachment.store_operation = VERNON_RHI_STORE_PRESERVE;
+    depthAttachment.clear_depth = 1.0f;
+    depthAttachment.stencil_load_operation = VERNON_RHI_LOAD_CLEAR;
+    depthAttachment.stencil_store_operation = VERNON_RHI_STORE_PRESERVE;
+    VernonColorBlendState blend{};
+    blend.source_color_factor = VERNON_RHI_BLEND_ONE;
+    blend.destination_color_factor = VERNON_RHI_BLEND_ZERO;
+    blend.source_alpha_factor = VERNON_RHI_BLEND_ONE;
+    blend.destination_alpha_factor = VERNON_RHI_BLEND_ZERO;
+    blend.color_operation = VERNON_RHI_BLEND_ADD;
+    blend.alpha_operation = VERNON_RHI_BLEND_ADD;
+    blend.write_mask = VERNON_RHI_COLOR_WRITE_ALL;
+    VernonGraphicsState graphicsState{};
+    graphicsState.struct_size = sizeof(graphicsState);
+    graphicsState.depth_stencil.depth_test = 1;
+    graphicsState.depth_stencil.depth_write = 1;
+    graphicsState.depth_stencil.depth_compare = VERNON_RHI_COMPARE_LESS;
+    graphicsState.depth_stencil.stencil_test = 1;
+    graphicsState.depth_stencil.front.compare = VERNON_RHI_COMPARE_ALWAYS;
+    graphicsState.depth_stencil.front.pass = VERNON_RHI_STENCIL_REPLACE;
+    graphicsState.depth_stencil.back = graphicsState.depth_stencil.front;
+    graphicsState.depth_stencil.stencil_read_mask = 0x5a;
+    graphicsState.depth_stencil.stencil_write_mask = 0xa5;
+    graphicsState.color_blends = &blend;
+    graphicsState.color_blend_count = 1;
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
@@ -105,16 +171,33 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     invocation.argument_count = std::size(arguments);
     invocation.color_attachments = &attachment;
     invocation.color_attachment_count = 1;
+    invocation.depth_attachment = &depthAttachment;
+    invocation.graphics_state = &graphicsState;
+    invocation.stencil_reference = 17;
     invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
     invocation.instance_count = 1;
     ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     EXPECT_EQ(vernon::runtime::getDirectX12GraphicsPipelineCreationCount(pipeline), 1u);
     EXPECT_EQ(vernon::runtime::getDirectX12GraphicsRootSignatureCreationCount(pipeline), 1u);
+    const vernon::runtime::DirectX12DepthStencilStateStats depthStencilStats =
+        vernon::runtime::getDirectX12DepthStencilStateStats(runtime);
+    EXPECT_TRUE(depthStencilStats.depthEnable);
+    EXPECT_EQ(depthStencilStats.depthWriteMask, D3D12_DEPTH_WRITE_MASK_ALL);
+    EXPECT_EQ(depthStencilStats.depthFunction, D3D12_COMPARISON_FUNC_LESS);
+    EXPECT_TRUE(depthStencilStats.stencilEnable);
+    EXPECT_EQ(depthStencilStats.stencilReadMask, 0x5au);
+    EXPECT_EQ(depthStencilStats.stencilWriteMask, 0xa5u);
+    EXPECT_EQ(depthStencilStats.frontStencilFunction, D3D12_COMPARISON_FUNC_ALWAYS);
+    EXPECT_EQ(depthStencilStats.frontStencilPassOperation, D3D12_STENCIL_OP_REPLACE);
+    EXPECT_EQ(depthStencilStats.backStencilFunction, D3D12_COMPARISON_FUNC_ALWAYS);
+    EXPECT_EQ(depthStencilStats.backStencilPassOperation, D3D12_STENCIL_OP_REPLACE);
+    invocation.stencil_reference = 123;
     ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     EXPECT_EQ(vernon::runtime::getDirectX12GraphicsPipelineCreationCount(pipeline), 1u);
     EXPECT_EQ(vernon::runtime::getDirectX12GraphicsRootSignatureCreationCount(pipeline), 1u);
+    EXPECT_EQ(vernon::runtime::getDirectX12LastStencilReference(runtime), 123u);
 
     std::vector<uint8_t> pixels(32 * 32 * 4);
     ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, target.handle, pixels.data(), pixels.size()),
@@ -124,6 +207,8 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     EXPECT_NEAR(pixels[center + 1], color[1], 2);
     EXPECT_NEAR(pixels[center + 2], color[2], 2);
 
+    invocation.depth_attachment = nullptr;
+    invocation.graphics_state = nullptr;
     const size_t commandsBeforeGraph = vernon::runtime::getRhiAdapterRecordedCommandCount(runtime);
     {
         vernon::execution::ExecutionGraph graph(context.device);
@@ -141,10 +226,12 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     EXPECT_EQ(vernon::runtime::getRhiAdapterRecordedCommandCount(runtime) - commandsBeforeGraph, 2u);
 
     EXPECT_EQ(vernonRhiDeviceDestroySampler(context.device, sampler.handle), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(context.device, depth.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(context.device, target.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(context.device, sampled.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(context.device, vertices.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
+    EXPECT_EQ(vernon::runtime::getRhiAdapterLivePreparedPipelineCount(runtime), 0u);
     vernonRuntimePipelineBundleDestroy(loaded);
     EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
     vernonRhiDestroyDevice(context.device);
@@ -244,9 +331,7 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
       %values: !vernon.tensor_view<f32, [-1], "read_write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64,
-        vernon.tensor_strides = array<i64: 1>,
-        vernon.tensor_offset = 0 : i64
+        vernon.binding = 0 : i64
       },
       %id: index {
         vernon.interface = "input",
@@ -363,6 +448,7 @@ TEST(RuntimeDirectX12Pipeline, DispatchesComputeBundleThroughRuntimeCoreProvider
     constexpr uint64_t scalarShape[] = {1};
     constexpr int64_t strides[] = {sizeof(float)};
     constexpr float factor = 3.0f;
+    constexpr float secondFactor = 5.0f;
     VernonPipelineArgument arguments[2]{};
     arguments[0].slot = valuesParameter.slot;
     arguments[0].kind = VERNON_PIPELINE_TENSOR;
@@ -392,6 +478,8 @@ TEST(RuntimeDirectX12Pipeline, DispatchesComputeBundleThroughRuntimeCoreProvider
     invocation.arguments = arguments;
     invocation.argument_count = std::size(arguments);
     invocation.compute_grid = {4, 1, 1};
+    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
+    arguments[0].tensor.access = VERNON_ACCESS_READ_WRITE;
     ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
 
@@ -400,6 +488,22 @@ TEST(RuntimeDirectX12Pipeline, DispatchesComputeBundleThroughRuntimeCoreProvider
               VERNON_RHI_STATUS_OK);
     for (size_t index = 0; index < output.size(); ++index)
         EXPECT_EQ(output[index], source[index] * factor);
+
+    constexpr uint64_t secondShape[] = {2};
+    constexpr int64_t secondStrides[] = {2 * sizeof(float)};
+    arguments[0].tensor.shape = secondShape;
+    arguments[0].tensor.byte_strides = secondStrides;
+    arguments[0].tensor.byte_offset = sizeof(float);
+    arguments[1].tensor.host_data = &secondFactor;
+    invocation.compute_grid = {2, 1, 1};
+    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
+        << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(context.device, buffer.handle, 0, output.data(), sizeof(output)),
+              VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(output[0], source[0] * factor);
+    EXPECT_EQ(output[1], source[1] * factor * secondFactor);
+    EXPECT_EQ(output[2], source[2] * factor);
+    EXPECT_EQ(output[3], source[3] * factor * secondFactor);
 
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(context.device, buffer.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);

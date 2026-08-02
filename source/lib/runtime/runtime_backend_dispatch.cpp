@@ -1,6 +1,16 @@
 #include "runtime_dispatch.h"
 
+#if defined(VERNON_HAS_CUDA_RUNTIME)
+#include "../rhi/cuda_backend.h"
+#endif
+#if defined(VERNON_HAS_DIRECTX12_RUNTIME)
+#include "../rhi/directx12_backend.h"
+#endif
+#include "../rhi/opengl_backend.h"
 #include "../rhi/rhi_internal.h"
+#if defined(VERNON_HAS_VULKAN_RUNTIME)
+#include "../rhi/vulkan_backend.h"
+#endif
 #include "backend_cpu.h"
 #include "backend_opengl.h"
 #include "rhi_adapter/adapter_internal.h"
@@ -13,6 +23,10 @@
 #endif
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
 #include "backend_directx12.h"
+#endif
+#if defined(VERNON_HAS_METAL_RUNTIME)
+#include "backend_metal.h"
+#include <TargetConditionals.h>
 #endif
 
 namespace vernon::runtime {
@@ -32,6 +46,9 @@ bool initializeBackendForRhiDevice(VernonRuntimeContext &context, VernonRhiDevic
         break;
     case VERNON_RUNTIME_DIRECTX12:
         backend = VERNON_RHI_BACKEND_DIRECTX12;
+        break;
+    case VERNON_RUNTIME_METAL:
+        backend = VERNON_RHI_BACKEND_METAL;
         break;
     case VERNON_RUNTIME_OPENGL:
         backend = VERNON_RHI_BACKEND_OPENGL;
@@ -94,6 +111,21 @@ bool initializeBackendForRhiDevice(VernonRuntimeContext &context, VernonRhiDevic
         break;
     }
 #endif
+#if defined(VERNON_HAS_METAL_RUNTIME)
+    case VERNON_RUNTIME_METAL: {
+        auto *state = new MetalContextState();
+        state->adapter = adapter;
+        const MetalRuntimeDeviceCapabilities capabilities = metalRhiAdapterDeviceCapabilities(*adapter);
+        state->maxComputeInvocations = capabilities.maxComputeInvocations;
+        std::copy_n(capabilities.maxComputeWorkGroupSize, 3, state->maxComputeWorkGroupSize);
+        state->operatingSystemVersion = {capabilities.operatingSystemVersion[0],
+                                         capabilities.operatingSystemVersion[1]};
+        state->argumentBuffersTier = capabilities.argumentBuffersTier;
+        state->argumentBufferEncodingSupported = capabilities.argumentBufferEncodingSupported;
+        installRuntimeBackendState(context, state);
+        break;
+    }
+#endif
     case VERNON_RUNTIME_OPENGL:
     case VERNON_RUNTIME_OPENGL_ES: {
         auto *state = new OpenGLContextState();
@@ -133,6 +165,11 @@ VernonRuntimeRhiAdapter *borrowedRhiAdapter(VernonRuntimeContext &context) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     case VERNON_RUNTIME_DIRECTX12:
         adapter = directX12State(context).adapter;
+        break;
+#endif
+#if defined(VERNON_HAS_METAL_RUNTIME)
+    case VERNON_RUNTIME_METAL:
+        adapter = metalState(context).adapter;
         break;
 #endif
     case VERNON_RUNTIME_OPENGL:
@@ -180,7 +217,9 @@ bool probeBackend(VernonRuntimeBackend backend, std::string &diagnostic) {
         descriptor.backend = rhiBackend;
         VernonRhiDevice device = vernonRhiCreateDevice(&descriptor);
         if (device.index == static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX)) {
-            diagnostic = "no usable Vernon RHI device was found";
+            const VernonStringView detail = rhi::deviceCreationError();
+            diagnostic = detail.data && detail.size ? std::string(detail.data, detail.size)
+                                                    : "no usable Vernon RHI device was found";
             return false;
         }
         vernonRhiDestroyDevice(device);
@@ -208,6 +247,13 @@ bool probeBackend(VernonRuntimeBackend backend, std::string &diagnostic) {
         return probeRhi(VERNON_RHI_BACKEND_DIRECTX12);
 #else
         diagnostic = "VernonRuntime was built without DirectX 12 support";
+        return false;
+#endif
+    case VERNON_RUNTIME_METAL:
+#if defined(VERNON_HAS_METAL_RUNTIME)
+        return probeRhi(VERNON_RHI_BACKEND_METAL);
+#else
+        diagnostic = "VernonRuntime was built without Metal support";
         return false;
 #endif
     case VERNON_RUNTIME_OPENGL:
@@ -240,7 +286,8 @@ void fillBackendCapabilities(const VernonRuntimeContext &context, VernonRuntimeC
         result.supports_storage_buffers = 1;
         return;
     }
-    if (context.backend == VERNON_RUNTIME_VULKAN || context.backend == VERNON_RUNTIME_DIRECTX12) {
+    if (context.backend == VERNON_RUNTIME_VULKAN || context.backend == VERNON_RUNTIME_DIRECTX12 ||
+        context.backend == VERNON_RUNTIME_METAL) {
         result.supports_compute = 1;
         result.supports_storage_buffers = 1;
         result.supports_graphics = 1;
@@ -378,6 +425,48 @@ bool validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeReq
         }
         if (invocations > actual.maxComputeInvocations) {
             context.error = "pipeline compute workgroup exceeds D3D12 thread-group limit";
+            return false;
+        }
+        return true;
+#endif
+    }
+    if (context.backend == VERNON_RUNTIME_METAL) {
+#if defined(VERNON_HAS_METAL_RUNTIME)
+#if TARGET_OS_OSX
+        constexpr const char *platform = "macos";
+#else
+        constexpr const char *platform = "ios";
+#endif
+        if (requirements.applePlatform != platform) {
+            context.error = "pipeline targets Apple platform '" + requirements.applePlatform +
+                            "', but this Runtime targets '" + platform + "'";
+            return false;
+        }
+        if (requirements.shaderVersion.major != 2 || requirements.shaderVersion.minor != 4) {
+            context.error = "pipeline requires unsupported MSL " + std::to_string(requirements.shaderVersion.major) +
+                            "." + std::to_string(requirements.shaderVersion.minor) + "; Runtime supports MSL 2.4";
+            return false;
+        }
+        const MetalContextState &actual = metalState(context);
+        if (!runtimeVersionAtLeast(actual.operatingSystemVersion, requirements.minimumOsVersion)) {
+            context.error = "pipeline requires " + requirements.applePlatform + " " +
+                            std::to_string(requirements.minimumOsVersion.major) + "." +
+                            std::to_string(requirements.minimumOsVersion.minor) + ", host provides " +
+                            std::to_string(actual.operatingSystemVersion.major) + "." +
+                            std::to_string(actual.operatingSystemVersion.minor);
+            return false;
+        }
+        uint64_t invocations = 1;
+        for (size_t index = 0; index < 3; ++index) {
+            if (requirements.computeWorkgroupSize[index] > actual.maxComputeWorkGroupSize[index]) {
+                context.error =
+                    "pipeline compute workgroup dimension " + std::to_string(index) + " exceeds Metal device limit";
+                return false;
+            }
+            invocations *= requirements.computeWorkgroupSize[index];
+        }
+        if (invocations > actual.maxComputeInvocations) {
+            context.error = "pipeline compute workgroup exceeds Metal threadgroup limit";
             return false;
         }
         return true;

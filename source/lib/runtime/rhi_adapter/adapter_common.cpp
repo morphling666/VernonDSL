@@ -1,6 +1,8 @@
 #include "adapter_common.h"
 
 #include "../../rhi/rhi_internal.h"
+#include "adapter_internal.h"
+#include "adapter_test_hooks.h"
 
 #include <new>
 #include <optional>
@@ -13,28 +15,49 @@ VernonStatus fail(VernonRuntimeRhiAdapter &adapter, std::string message, VernonS
     return status;
 }
 
+void setBackendError(std::string &error, const char *message) noexcept {
+    try {
+        error = message;
+    } catch (...) {
+        error.clear();
+    }
+}
+
 } // namespace vernon::runtime::rhi_adapter
 
 using namespace vernon::runtime::rhi_adapter;
 
+RhiAdapterBackendStorage::~RhiAdapterBackendStorage() {
+    if (state)
+        ops->destroy(state);
+}
+
+RhiAdapterBackendStorage::RhiAdapterBackendStorage(RhiAdapterBackendStorage &&other) noexcept
+    : state(std::exchange(other.state, nullptr)), ops(std::exchange(other.ops, nullptr)) {}
+
+RhiAdapterBackendStorage &RhiAdapterBackendStorage::operator=(RhiAdapterBackendStorage &&other) noexcept {
+    if (this == &other)
+        return *this;
+    if (state)
+        ops->destroy(state);
+    state = std::exchange(other.state, nullptr);
+    ops = std::exchange(other.ops, nullptr);
+    return *this;
+}
+
+bool RhiAdapterBackendStorage::adopt(void *newState, const RhiAdapterBackendOps *newOps) noexcept {
+    if (!newState || !newOps || state || ops)
+        return false;
+    state = newState;
+    ops = newOps;
+    return true;
+}
+
+VernonRuntimeRhiAdapter::~VernonRuntimeRhiAdapter() = default;
+
 extern "C" VernonRuntimeRhiAdapter *vernonRuntimeRhiAdapterCreateCuda(uint32_t deviceIndex) {
 #if defined(VERNON_HAS_CUDA_RHI)
-    auto adapter = std::unique_ptr<VernonRuntimeRhiAdapter>(new (std::nothrow) VernonRuntimeRhiAdapter());
-    if (!adapter)
-        return nullptr;
-    try {
-        adapter->ownedDevice = std::make_unique<vernon::rhi::cuda::DeviceState>();
-    } catch (const std::bad_alloc &) {
-        return nullptr;
-    }
-    adapter->device = adapter->ownedDevice.get();
-    const vernon::rhi::cuda::Result result = adapter->device->initialize(deviceIndex);
-    if (result != vernon::rhi::cuda::kSuccess) {
-        adapter->error = vernon::rhi::cuda::describeResult(result, "CUDA RHI adapter initialization");
-        return nullptr;
-    }
-    initializeCudaProvider(*adapter);
-    return adapter.release();
+    return vernon::runtime::createOwnedCudaRhiAdapter(deviceIndex);
 #else
     (void)deviceIndex;
     return nullptr;
@@ -43,32 +66,33 @@ extern "C" VernonRuntimeRhiAdapter *vernonRuntimeRhiAdapterCreateCuda(uint32_t d
 
 extern "C" VernonRuntimeRhiAdapter *vernonRuntimeRhiAdapterCreateForDevice(VernonRhiDevice device,
                                                                            VernonRhiBackend backend) {
-    void *state = vernon::rhi::deviceState(device, backend);
-    if (!state)
-        return nullptr;
     VernonRuntimeRhiAdapter *adapter = nullptr;
     switch (backend) {
 #if defined(VERNON_HAS_CUDA_RHI)
     case VERNON_RHI_BACKEND_CUDA:
-        adapter = vernon::runtime::createBorrowedCudaRhiAdapter(*static_cast<vernon::rhi::cuda::DeviceState *>(state));
+        adapter = vernon::runtime::createCudaRhiAdapter(device, backend);
         break;
 #endif
 #if defined(VERNON_HAS_VULKAN_RHI)
     case VERNON_RHI_BACKEND_VULKAN:
-        adapter =
-            vernon::runtime::createBorrowedVulkanRhiAdapter(*static_cast<vernon::rhi::vulkan::DeviceState *>(state));
+        adapter = vernon::runtime::createVulkanRhiAdapter(device, backend);
         break;
 #endif
 #if defined(VERNON_HAS_DIRECTX12_RHI)
     case VERNON_RHI_BACKEND_DIRECTX12:
-        adapter = vernon::runtime::createBorrowedDirectX12RhiAdapter(
-            *static_cast<vernon::rhi::directx12::DeviceState *>(state));
+        adapter = vernon::runtime::createDirectX12RhiAdapter(device, backend);
+        break;
+#endif
+#if defined(VERNON_HAS_METAL_RHI)
+    case VERNON_RHI_BACKEND_METAL:
+        adapter = vernon::runtime::createMetalRhiAdapter(device, backend);
         break;
 #endif
     case VERNON_RHI_BACKEND_OPENGL:
     case VERNON_RHI_BACKEND_OPENGL_ES:
-        adapter =
-            vernon::runtime::createBorrowedOpenGLRhiAdapter(*static_cast<vernon::rhi::opengl::DeviceState *>(state));
+        adapter = vernon::runtime::createOpenGLRhiAdapter(device, backend);
+        break;
+    default:
         break;
     }
     if (adapter) {
@@ -85,42 +109,15 @@ extern "C" const VernonRuntimeDeviceProvider *vernonRuntimeRhiAdapterGetProvider
 }
 
 extern "C" VernonStatus vernonRuntimeRhiAdapterSynchronize(VernonRuntimeRhiAdapter *adapter) {
-    if (!adapter)
+    if (!adapter || !adapter->backend.state || !adapter->backend.ops)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    if (adapter->openGLDevice) {
-        adapter->openGLDevice->makeCurrent();
-        adapter->openGLDevice->driver.finish();
-        return VERNON_STATUS_OK;
-    }
-#if defined(VERNON_HAS_DIRECTX12_RHI)
-    if (adapter->directX12Device)
-        return adapter->directX12Device->synchronize(adapter->error) ? VERNON_STATUS_OK : VERNON_STATUS_INTERNAL_ERROR;
-#endif
-#if defined(VERNON_HAS_VULKAN_RHI)
-    if (adapter->vulkanDevice)
-        return adapter->vulkanDevice->synchronize(adapter->error) ? VERNON_STATUS_OK : VERNON_STATUS_INTERNAL_ERROR;
-#endif
-#if defined(VERNON_HAS_CUDA_RHI)
-    if (adapter->device) {
-        const auto result = adapter->device->synchronize();
-        return result == vernon::rhi::cuda::kSuccess
-                   ? VERNON_STATUS_OK
-                   : fail(*adapter, vernon::rhi::cuda::describeResult(result, "cuStreamSynchronize"),
-                          VERNON_STATUS_INTERNAL_ERROR);
-    }
-#endif
-    return fail(*adapter, "adapter has no device", VERNON_STATUS_UNSUPPORTED_TARGET);
+    return adapter->backend.ops->synchronize(adapter->backend.state, adapter->error);
 }
 
 extern "C" void vernonRuntimeRhiAdapterInvalidateState(VernonRuntimeRhiAdapter *adapter) {
-    if (!adapter)
+    if (!adapter || !adapter->backend.state || !adapter->backend.ops)
         return;
-    adapter->openGLProgramValid = false;
-    adapter->openGLVertexArrayValid = false;
-    adapter->openGLFramebufferValid = false;
-    adapter->openGLViewportValid = false;
-    adapter->openGLScissorValid = false;
-    adapter->openGLFramebufferSignatures.clear();
+    adapter->backend.ops->invalidate(adapter->backend.state);
 }
 
 extern "C" VernonStringView vernonRuntimeRhiAdapterGetLastError(const VernonRuntimeRhiAdapter *adapter) {
@@ -129,25 +126,10 @@ extern "C" VernonStringView vernonRuntimeRhiAdapterGetLastError(const VernonRunt
 
 namespace {
 
-uint64_t resourceIdentity(const VernonRuntimeRhiAdapter &adapter, uint64_t directX12Kind) {
-    switch (adapter.rhiBackend) {
-#if defined(VERNON_HAS_CUDA_RHI)
-    case VERNON_RHI_BACKEND_CUDA:
-        return reinterpret_cast<uintptr_t>(adapter.device) | directX12Kind;
-#endif
-#if defined(VERNON_HAS_VULKAN_RHI)
-    case VERNON_RHI_BACKEND_VULKAN:
-        return reinterpret_cast<uintptr_t>(adapter.vulkanDevice) | directX12Kind;
-#endif
-#if defined(VERNON_HAS_DIRECTX12_RHI)
-    case VERNON_RHI_BACKEND_DIRECTX12:
-        return reinterpret_cast<uintptr_t>(adapter.directX12Device) | directX12Kind;
-#endif
-    case VERNON_RHI_BACKEND_OPENGL:
-    case VERNON_RHI_BACKEND_OPENGL_ES:
-        return reinterpret_cast<uintptr_t>(adapter.openGLDevice) | directX12Kind;
-    }
-    return 0;
+uint64_t resourceIdentity(const VernonRuntimeRhiAdapter &adapter, uint64_t resourceKind) {
+    if (!adapter.backend.state || !adapter.backend.ops)
+        return 0;
+    return adapter.backend.ops->resourceIdentity(adapter.backend.state) | resourceKind;
 }
 
 } // namespace
@@ -158,14 +140,14 @@ namespace {
 
 std::optional<vernon::rhi::ResourceKind> resourceKind(const VernonRuntimeRhiAdapter &adapter,
                                                       VernonRuntimeProviderResourceReference resource) {
-    const uint64_t encodedKind = resource.identity & kDirectX12ResourceKindMask;
+    const uint64_t encodedKind = resource.identity & kRhiResourceKindMask;
     if (resource.identity != resourceIdentity(adapter, encodedKind) || resource.resource.value == 0)
         return std::nullopt;
-    if (encodedKind == kDirectX12BufferResource)
+    if (encodedKind == kRhiBufferResource)
         return vernon::rhi::ResourceKind::Buffer;
-    if (encodedKind == kDirectX12ImageResource)
+    if (encodedKind == kRhiImageResource)
         return vernon::rhi::ResourceKind::Image;
-    if (encodedKind == kDirectX12SamplerResource)
+    if (encodedKind == kRhiSamplerResource)
         return vernon::rhi::ResourceKind::Sampler;
     return std::nullopt;
 }
@@ -266,7 +248,7 @@ extern "C" VernonStatus vernonRuntimeRhiAdapterReferenceBuffer(const VernonRunti
     const uint64_t resource = vernon::rhi::bufferResource(adapter->rhiDevice, buffer);
     if (!resource)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    output->identity = resourceIdentity(*adapter, kDirectX12BufferResource);
+    output->identity = resourceIdentity(*adapter, kRhiBufferResource);
     output->resource = {resource};
     output->offset = offset;
     output->size = size;
@@ -281,7 +263,7 @@ extern "C" VernonStatus vernonRuntimeRhiAdapterReferenceImage(const VernonRuntim
     const uint64_t resource = vernon::rhi::imageResource(adapter->rhiDevice, image);
     if (!resource)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    *output = {resourceIdentity(*adapter, kDirectX12ImageResource), {resource}, 0, 0};
+    *output = {resourceIdentity(*adapter, kRhiImageResource), {resource}, 0, 0};
     return VERNON_STATUS_OK;
 }
 
@@ -293,7 +275,7 @@ extern "C" VernonStatus vernonRuntimeRhiAdapterReferenceSampler(const VernonRunt
     const uint64_t resource = vernon::rhi::samplerResource(adapter->rhiDevice, sampler);
     if (!resource)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    *output = {resourceIdentity(*adapter, kDirectX12SamplerResource), {resource}, 0, 0};
+    *output = {resourceIdentity(*adapter, kRhiSamplerResource), {resource}, 0, 0};
     return VERNON_STATUS_OK;
 }
 
@@ -308,86 +290,17 @@ extern "C" VernonStatus vernonRuntimeRhiAdapterReferenceCommandEncoder(const Ver
 
 namespace vernon::runtime {
 
-VernonRuntimeRhiAdapter *createBorrowedCudaRhiAdapter(rhi::cuda::DeviceState &device) {
-#if defined(VERNON_HAS_CUDA_RHI)
-    auto adapter = std::unique_ptr<VernonRuntimeRhiAdapter>(new (std::nothrow) VernonRuntimeRhiAdapter());
-    if (!adapter)
-        return nullptr;
-    adapter->device = &device;
-    rhi_adapter::initializeCudaProvider(*adapter);
-    return adapter.release();
-#else
-    (void)device;
-    return nullptr;
-#endif
-}
-
-#if defined(VERNON_HAS_CUDA_RHI)
-rhi::cuda::DeviceState &cudaRhiAdapterDevice(VernonRuntimeRhiAdapter &adapter) { return *adapter.device; }
-#endif
-
-VernonRuntimeRhiAdapter *createBorrowedOpenGLRhiAdapter(rhi::opengl::DeviceState &device) {
-    auto adapter = std::unique_ptr<VernonRuntimeRhiAdapter>(new (std::nothrow) VernonRuntimeRhiAdapter());
-    if (!adapter)
-        return nullptr;
-    adapter->openGLDevice = &device;
-    rhi_adapter::initializeOpenGLProvider(*adapter);
-    return adapter.release();
-}
-
-#if defined(VERNON_HAS_DIRECTX12_RHI)
-VernonRuntimeRhiAdapter *createBorrowedDirectX12RhiAdapter(rhi::directx12::DeviceState &device) {
-    auto adapter = std::unique_ptr<VernonRuntimeRhiAdapter>(new (std::nothrow) VernonRuntimeRhiAdapter());
-    if (!adapter)
-        return nullptr;
-    adapter->directX12Device = &device;
-    rhi_adapter::initializeDirectX12Provider(*adapter);
-    return adapter.release();
-}
-
-uint64_t directX12RhiAdapterResourceIdentity(const VernonRuntimeRhiAdapter &adapter) {
-    return reinterpret_cast<uintptr_t>(adapter.directX12Device);
-}
-
-uint64_t directX12RhiAdapterImageIdentity(const VernonRuntimeRhiAdapter &adapter) {
-    return directX12RhiAdapterResourceIdentity(adapter) | rhi_adapter::kDirectX12ImageResource;
-}
-
-uint64_t directX12RhiAdapterSamplerIdentity(const VernonRuntimeRhiAdapter &adapter) {
-    return directX12RhiAdapterResourceIdentity(adapter) | rhi_adapter::kDirectX12SamplerResource;
-}
-
-uint64_t directX12RhiAdapterBufferIdentity(const VernonRuntimeRhiAdapter &adapter) {
-    return directX12RhiAdapterResourceIdentity(adapter) | rhi_adapter::kDirectX12BufferResource;
-}
-#endif
-
-#if defined(VERNON_HAS_VULKAN_RHI)
-VernonRuntimeRhiAdapter *createBorrowedVulkanRhiAdapter(rhi::vulkan::DeviceState &device) {
-    auto adapter = std::unique_ptr<VernonRuntimeRhiAdapter>(new (std::nothrow) VernonRuntimeRhiAdapter());
-    if (!adapter)
-        return nullptr;
-    adapter->vulkanDevice = &device;
-    rhi_adapter::initializeVulkanProvider(*adapter);
-    return adapter.release();
-}
-
-uint64_t vulkanRhiAdapterResourceIdentity(const VernonRuntimeRhiAdapter &adapter) {
-    return reinterpret_cast<uintptr_t>(adapter.vulkanDevice);
-}
-#endif
-
-uint64_t openGLRhiAdapterResourceIdentity(const VernonRuntimeRhiAdapter &adapter) {
-    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(adapter.openGLDevice));
-}
-
 RhiAdapterPreparationStats getRhiAdapterPreparationStats(const VernonRuntimeRhiAdapter &adapter) {
-    return {adapter.shaderPreparations.load(std::memory_order_relaxed),
-            adapter.layoutPreparations.load(std::memory_order_relaxed),
-            adapter.pipelinePreparations.load(std::memory_order_relaxed),
-            adapter.bindingCreations.load(std::memory_order_relaxed),
-            adapter.bindingSnapshotCreations.load(std::memory_order_relaxed),
-            adapter.dispatches.load(std::memory_order_relaxed)};
+    RhiAdapterPreparationStats result{adapter.shaderPreparations.load(std::memory_order_relaxed),
+                                      adapter.layoutPreparations.load(std::memory_order_relaxed),
+                                      adapter.pipelinePreparations.load(std::memory_order_relaxed),
+                                      adapter.bindingCreations.load(std::memory_order_relaxed),
+                                      adapter.bindingSnapshotCreations.load(std::memory_order_relaxed),
+                                      adapter.dispatches.load(std::memory_order_relaxed),
+                                      adapter.livePreparedPipelines.load(std::memory_order_relaxed),
+                                      adapter.lastStencilReference.load(std::memory_order_relaxed),
+                                      adapter.lastDrawIndexed.load(std::memory_order_relaxed)};
+    return result;
 }
 
 } // namespace vernon::runtime

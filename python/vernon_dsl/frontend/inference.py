@@ -171,6 +171,7 @@ class _Inference:
         self.active: list[tuple[str, tuple[ConcreteType, ...], tuple[str, ...]]] = []
         self.expression_records: dict[int, tuple[ast.expr, InferenceType, str | None]] = {}
         self.statement_merges: dict[int, tuple[BranchMerge, ...]] = {}
+        self.workgroup_storage_bytes = 0
 
     def run(self) -> ast.Module:
         retained: list[ast.stmt] = []
@@ -182,6 +183,7 @@ class _Inference:
             if isinstance(statement, ast.FunctionDef):
                 roots.append(statement)
         for function in roots:
+            self.workgroup_storage_bytes = 0
             environment = {
                 argument.arg: self.parse_type(argument.annotation)
                 for argument in function.args.args
@@ -1262,8 +1264,12 @@ class _Inference:
                 return self.structs[struct]
 
             shape_tuple = tuple(shape)
-            if workgroup_physical_bytes(element, shape_tuple, struct_fields) > 16 * 1024:
+            footprint = workgroup_physical_bytes(element, shape_tuple, struct_fields)
+            if footprint > 16 * 1024:
                 raise self.error(node, "workgroup_storage exceeds the portable 16 KiB allocation limit")
+            if self.workgroup_storage_bytes > 16 * 1024 - footprint:
+                raise self.error(node, "combined workgroup_storage exceeds the portable 16 KiB allocation limit")
+            self.workgroup_storage_bytes += footprint
             return ConcreteType("tensor_view", "TensorView", (element, shape_tuple, "read_write", "workgroup"))
         if name in ATOMIC_OPERATION_NAMES:
             if len(node.args) != 3 or node.keywords:

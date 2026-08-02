@@ -2,9 +2,9 @@
 
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
 #include "../rhi/rhi_internal.h"
+#include "VernonRuntimeRHIAdapter.h"
 #include "backend_vulkan.h"
 #include "compute_launch_planner.h"
-#include "rhi_adapter/adapter_internal.h"
 #include "tensor_bridge.h"
 
 #include <nlohmann/json.hpp>
@@ -45,6 +45,7 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         struct Candidate {
             VernonRuntimeProviderBindingLayoutEntry layout{};
             uint64_t resourceOffset{};
+            ComputeBindingSource source;
         };
         std::vector<Candidate> candidates;
         uint32_t internalSlot = 0;
@@ -88,7 +89,31 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     // Aggregate lowering already folds each leaf's byte offset into the shader index.
                     // Every leaf descriptor must therefore retain the base address of the original AoS buffer.
                     candidate.resourceOffset = 0;
+                    candidate.source = {ComputeBindingSourceKind::Argument, use.index, 0};
                     candidates.push_back(candidate);
+                }
+                if (use.tensorViewDescriptor) {
+                    const auto addDescriptor = [&](ComputeBindingSourceKind kind, uint32_t dimension,
+                                                   uint32_t binding) {
+                        Candidate candidate;
+                        candidate.layout.slot = ++internalSlot;
+                        candidate.layout.set = argument.descriptorSet;
+                        candidate.layout.binding = binding;
+                        candidate.layout.kind = VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                        candidate.layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
+                        candidate.layout.array_count = 1;
+                        candidate.layout.argument_index = use.index;
+                        candidate.layout.element_size = 4;
+                        candidate.source = {kind, use.index, dimension};
+                        candidates.push_back(candidate);
+                    };
+                    addDescriptor(ComputeBindingSourceKind::TensorOffset, 0, use.tensorViewDescriptor->offsetBinding);
+                    for (uint32_t dimension = 0; dimension < use.tensorViewDescriptor->rank; ++dimension)
+                        addDescriptor(ComputeBindingSourceKind::TensorExtent, dimension,
+                                      use.tensorViewDescriptor->extentBindings[dimension]);
+                    for (uint32_t dimension = 0; dimension < use.tensorViewDescriptor->rank; ++dimension)
+                        addDescriptor(ComputeBindingSourceKind::TensorStride, dimension,
+                                      use.tensorViewDescriptor->strideBindings[dimension]);
                 }
             }
         std::sort(candidates.begin(), candidates.end(),
@@ -96,8 +121,10 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         for (const auto &candidate : candidates) {
             state->rhiComputeLayout.push_back(candidate.layout);
             state->rhiComputeResourceOffsets.push_back(candidate.resourceOffset);
+            state->rhiComputeBindingSources.push_back(candidate.source);
         }
         state->rhiComputeValues.resize(candidates.size());
+        state->rhiComputeDescriptorValues.resize(candidates.size());
         std::copy_n(stage.workgroup, 3, state->rhiComputeWorkgroup);
         const VernonRuntimeProviderShaderDescriptor shader{sizeof(VernonRuntimeProviderShaderDescriptor),
                                                            VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE,
@@ -335,7 +362,7 @@ void destroyVulkanPipeline(VernonLoadedPipeline &pipeline) {
     vernonRuntimeCoreBindingsDestroy(state.rhiComputeBindings);
     vernonRuntimeCorePipelineDestroy(state.rhiComputePipeline);
     vernonRuntimeCoreBindingsDestroy(state.rhiGraphicsBindings);
-    vernonRuntimeCoreGraphicsVariantDestroy(state.rhiGraphicsVariant);
+    destroyGraphicsVariant(state.rhiGraphicsVariant);
     vernonRuntimeCorePipelineDestroy(state.rhiGraphicsPipeline);
 #else
     (void)pipeline;
@@ -451,7 +478,6 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
     if (plan.depthAttachment) {
         depthAttachment = plan.depthAttachment->resource;
     }
-    uint64_t vertexIdentity = 1469598103934665603ull;
     std::vector<uint32_t> vertexStrides;
     for (size_t index = 0; index < state.rhiGraphicsLayout.size(); ++index) {
         if (state.rhiGraphicsLayout[index].kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
@@ -460,38 +486,33 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
         if (vertexStrides.size() <= binding)
             vertexStrides.resize(binding + 1);
         vertexStrides[binding] = state.rhiGraphicsValues[index].stride;
-        vertexIdentity = (vertexIdentity ^ state.rhiGraphicsValues[index].stride) * 1099511628211ull;
     }
-    const uint32_t depthFormat = plan.depthAttachment ? static_cast<uint32_t>(VK_FORMAT_D32_SFLOAT) : 0;
-    if (!state.rhiGraphicsVariant || state.rhiGraphicsFormats != formats ||
-        state.rhiGraphicsDepthFormat != depthFormat || state.rhiGraphicsTopology != invocation.topology ||
-        state.rhiGraphicsVertexLayoutIdentity != vertexIdentity) {
-        vernonRuntimeCoreGraphicsVariantDestroy(state.rhiGraphicsVariant);
-        state.rhiGraphicsVariant = nullptr;
-        const VernonRuntimeCoreGraphicsCompatibility compatibility{sizeof(VernonRuntimeCoreGraphicsCompatibility),
-                                                                   static_cast<uint32_t>(invocation.topology),
-                                                                   formats.data(),
-                                                                   formats.size(),
-                                                                   depthFormat,
-                                                                   1,
-                                                                   vertexStrides.data(),
-                                                                   vertexStrides.size(),
-                                                                   vertexIdentity,
-                                                                   {0, 0, 0, 0}};
-        status = vernonRuntimeCorePrepareGraphicsVariant(state.rhiGraphicsPipeline, &compatibility,
-                                                         &state.rhiGraphicsVariant);
-        if (status != VERNON_STATUS_OK) {
-            const VernonStringView providerError =
-                vernonRuntimeRhiAdapterGetLastError(vulkanState(*pipeline.context).adapter);
-            return fail(*pipeline.context,
-                        providerError.data ? std::string(providerError.data, providerError.size)
-                                           : "failed to prepare Vulkan RHI graphics variant",
-                        status);
-        }
-        state.rhiGraphicsFormats = std::move(formats);
-        state.rhiGraphicsDepthFormat = depthFormat;
-        state.rhiGraphicsTopology = invocation.topology;
-        state.rhiGraphicsVertexLayoutIdentity = vertexIdentity;
+    const uint32_t depthFormat =
+        !plan.depthAttachment ? 0
+                              : static_cast<uint32_t>(plan.depthAttachment->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT
+                                                          ? VK_FORMAT_D32_SFLOAT_S8_UINT
+                                                          : VK_FORMAT_D32_SFLOAT);
+    PlannedGraphicsState graphicsState;
+    const bool hasStencil = plan.depthAttachment && plan.depthAttachment->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT;
+    if (!planGraphicsState(invocation, formats.size(), plan.depthAttachment != nullptr, hasStencil, graphicsState,
+                           pipeline.context->error))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    GraphicsVariantKey variantKey{static_cast<uint32_t>(invocation.topology),
+                                  formats,
+                                  depthFormat,
+                                  1,
+                                  vertexStrides,
+                                  graphicsState.rasterization,
+                                  graphicsState.depthStencil,
+                                  graphicsState.colorBlends};
+    status = ensureGraphicsVariant(state.rhiGraphicsPipeline, variantKey, state.rhiGraphicsVariant);
+    if (status != VERNON_STATUS_OK) {
+        const VernonStringView providerError =
+            vernonRuntimeRhiAdapterGetLastError(vulkanState(*pipeline.context).adapter);
+        return fail(*pipeline.context,
+                    providerError.data ? std::string(providerError.data, providerError.size)
+                                       : "failed to prepare Vulkan RHI graphics variant",
+                    status);
     }
     const bool hasViewport = invocation.viewport[2] && invocation.viewport[3];
     VernonRuntimeCoreDrawInvocation draw{};
@@ -507,6 +528,11 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
     draw.depth_store_operation =
         plan.depthAttachment ? static_cast<uint32_t>(plan.depthAttachment->store_operation) : VERNON_RHI_STORE_DISCARD;
     draw.clear_depth = plan.depthAttachment ? plan.depthAttachment->clear_depth : 1.0f;
+    draw.stencil_load_operation = hasStencil ? plan.depthAttachment->stencil_load_operation : VERNON_RHI_LOAD_DISCARD;
+    draw.stencil_store_operation =
+        hasStencil ? plan.depthAttachment->stencil_store_operation : VERNON_RHI_STORE_DISCARD;
+    draw.clear_stencil = hasStencil ? plan.depthAttachment->clear_stencil : 0;
+    draw.stencil_reference = graphicsState.stencilReference;
     draw.viewport[0] = hasViewport ? invocation.viewport[0] : 0;
     draw.viewport[1] = hasViewport ? invocation.viewport[1] : 0;
     draw.viewport[2] = hasViewport ? invocation.viewport[2] : plan.attachmentWidth;
@@ -514,9 +540,17 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
     const bool hasScissor = invocation.scissor[2] && invocation.scissor[3];
     for (size_t index = 0; index < 4; ++index)
         draw.scissor[index] = hasScissor ? invocation.scissor[index] : draw.viewport[index];
+    draw.render_area[2] = plan.attachmentWidth;
+    draw.render_area[3] = plan.attachmentHeight;
     draw.topology = invocation.topology;
-    status = vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(state.rhiGraphicsVariant, state.rhiGraphicsBindings,
-                                                                  &draw);
+    if (plan.indexBinding) {
+        draw.index_buffer = plan.indexBinding->resource;
+        draw.index_buffer.offset += plan.indexBinding->offset;
+        draw.index_count = plan.indexBinding->index_count;
+        draw.index_type = plan.indexBinding->type;
+    }
+    status = vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(state.rhiGraphicsVariant.handle,
+                                                                  state.rhiGraphicsBindings, &draw);
     if (status != VERNON_STATUS_OK) {
         const VernonStringView providerError =
             vernonRuntimeRhiAdapterGetLastError(vulkanState(*pipeline.context).adapter);
@@ -544,6 +578,16 @@ VernonStatus invokeVulkanComputePipeline(VernonLoadedPipeline &pipeline, const P
         value = {};
         value.slot = layout.slot;
         value.kind = layout.kind;
+        const ComputeBindingSource &source = state.rhiComputeBindingSources[index];
+        if (source.kind != ComputeBindingSourceKind::Argument) {
+            std::optional<int64_t> descriptor = computeBindingDescriptorValue(argument, source);
+            if (!descriptor || *descriptor < INT32_MIN || *descriptor > INT32_MAX)
+                return fail(*pipeline.context, "Vulkan TensorView descriptor exceeds the shader index range");
+            state.rhiComputeDescriptorValues[index] = static_cast<int32_t>(*descriptor);
+            value.inline_data = &state.rhiComputeDescriptorValues[index];
+            value.inline_size = sizeof(int32_t);
+            continue;
+        }
         if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
             if (argument.kind != ComputeLaunchArgumentKind::Tensor || !argument.resource.resource.value)
                 return fail(*pipeline.context, "Vulkan prepared storage binding requires an RHI Tensor");

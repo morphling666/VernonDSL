@@ -1,53 +1,43 @@
 #ifndef VERNON_RUNTIME_RHI_ADAPTER_COMMON_H
 #define VERNON_RUNTIME_RHI_ADAPTER_COMMON_H
 
-#include "../../rhi/rhi_internal.h"
-#include "adapter_internal.h"
-#include "adapter_test_hooks.h"
+#include "VernonRuntimeRHIAdapter.h"
 
-#include <algorithm>
-#include <array>
 #include <atomic>
-#include <memory>
-#include <mutex>
+#include <cstddef>
+#include <cstdint>
 #include <string>
-#include <unordered_map>
 
-struct OpenGLFramebufferSignature {
-    std::array<uint64_t, 18> values{};
-    size_t count{};
+struct RhiAdapterBackendOps {
+    void (*destroy)(void *) noexcept;
+    VernonStatus (*synchronize)(void *, std::string &) noexcept;
+    uint64_t (*resourceIdentity)(const void *) noexcept;
+    void (*invalidate)(void *) noexcept;
+};
 
-    bool operator==(const OpenGLFramebufferSignature &other) const {
-        return count == other.count && std::equal(values.begin(), values.begin() + count, other.values.begin());
-    }
+struct RhiAdapterBackendStorage {
+    RhiAdapterBackendStorage() = default;
+    ~RhiAdapterBackendStorage();
+    RhiAdapterBackendStorage(const RhiAdapterBackendStorage &) = delete;
+    RhiAdapterBackendStorage &operator=(const RhiAdapterBackendStorage &) = delete;
+    RhiAdapterBackendStorage(RhiAdapterBackendStorage &&other) noexcept;
+    RhiAdapterBackendStorage &operator=(RhiAdapterBackendStorage &&other) noexcept;
+
+    bool adopt(void *newState, const RhiAdapterBackendOps *newOps) noexcept;
+
+    void *state{};
+    const RhiAdapterBackendOps *ops{};
 };
 
 struct VernonRuntimeRhiAdapter {
+    VernonRuntimeRhiAdapter() = default;
+    ~VernonRuntimeRhiAdapter();
+    VernonRuntimeRhiAdapter(const VernonRuntimeRhiAdapter &) = delete;
+    VernonRuntimeRhiAdapter &operator=(const VernonRuntimeRhiAdapter &) = delete;
+
     VernonRhiDevice rhiDevice{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
-    VernonRhiBackend rhiBackend{VERNON_RHI_BACKEND_CUDA};
-#if defined(VERNON_HAS_CUDA_RHI)
-    std::unique_ptr<vernon::rhi::cuda::DeviceState> ownedDevice;
-    vernon::rhi::cuda::DeviceState *device{};
-#endif
-    vernon::rhi::opengl::DeviceState *openGLDevice{};
-    uint64_t openGLProgram{};
-    uint64_t openGLVertexArray{};
-    uint64_t openGLFramebuffer{};
-    uint64_t openGLFramebufferGeneration{};
-    std::array<uint32_t, 4> openGLViewport{};
-    std::array<uint32_t, 4> openGLScissor{};
-    std::unordered_map<uint64_t, OpenGLFramebufferSignature> openGLFramebufferSignatures;
-    bool openGLProgramValid{};
-    bool openGLVertexArrayValid{};
-    bool openGLFramebufferValid{};
-    bool openGLViewportValid{};
-    bool openGLScissorValid{};
-#if defined(VERNON_HAS_DIRECTX12_RHI)
-    vernon::rhi::directx12::DeviceState *directX12Device{};
-#endif
-#if defined(VERNON_HAS_VULKAN_RHI)
-    vernon::rhi::vulkan::DeviceState *vulkanDevice{};
-#endif
+    VernonRhiBackend rhiBackend{};
+    RhiAdapterBackendStorage backend;
     VernonRuntimeDeviceProvider provider{};
     std::string error;
     std::atomic<size_t> shaderPreparations{};
@@ -56,14 +46,17 @@ struct VernonRuntimeRhiAdapter {
     std::atomic<size_t> bindingCreations{};
     std::atomic<size_t> bindingSnapshotCreations{};
     std::atomic<size_t> dispatches{};
+    std::atomic<size_t> livePreparedPipelines{};
+    std::atomic<uint32_t> lastStencilReference{};
+    std::atomic<bool> lastDrawIndexed{};
 };
 
 namespace vernon::runtime::rhi_adapter {
 
-inline constexpr uint64_t kDirectX12ResourceKindMask = 3;
-inline constexpr uint64_t kDirectX12ImageResource = 1;
-inline constexpr uint64_t kDirectX12SamplerResource = 2;
-inline constexpr uint64_t kDirectX12BufferResource = 3;
+inline constexpr uint64_t kRhiResourceKindMask = 3;
+inline constexpr uint64_t kRhiImageResource = 1;
+inline constexpr uint64_t kRhiSamplerResource = 2;
+inline constexpr uint64_t kRhiBufferResource = 3;
 
 template <typename Object> VernonRuntimeProviderObject toHandle(Object *object) {
     return {static_cast<uint64_t>(reinterpret_cast<uintptr_t>(object))};
@@ -75,6 +68,7 @@ template <typename Object> Object *fromHandle(VernonRuntimeProviderObject handle
 
 VernonStatus fail(VernonRuntimeRhiAdapter &adapter, std::string message,
                   VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT);
+void setBackendError(std::string &error, const char *message) noexcept;
 bool retainRhiResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderResourceReference resource);
 void releaseRhiResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderResourceReference resource);
 uint64_t resolveRhiResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderResourceReference resource);
@@ -102,17 +96,6 @@ bool deferCommandRollback(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProvide
 bool setCommandRenderingTargets(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
                                 const uint64_t *colors, const uint64_t *resources, size_t colorCount, uint64_t depth,
                                 uint64_t depthResource);
-
-#if defined(VERNON_HAS_CUDA_RHI)
-void initializeCudaProvider(VernonRuntimeRhiAdapter &adapter);
-#endif
-void initializeOpenGLProvider(VernonRuntimeRhiAdapter &adapter);
-#if defined(VERNON_HAS_DIRECTX12_RHI)
-void initializeDirectX12Provider(VernonRuntimeRhiAdapter &adapter);
-#endif
-#if defined(VERNON_HAS_VULKAN_RHI)
-void initializeVulkanProvider(VernonRuntimeRhiAdapter &adapter);
-#endif
 
 } // namespace vernon::runtime::rhi_adapter
 

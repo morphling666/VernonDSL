@@ -340,6 +340,9 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
         case mlir::vernon::PhysicalResourceAbiKind::HostPointer:
             reflected["kind"] = "host_pointer";
             break;
+        case mlir::vernon::PhysicalResourceAbiKind::TensorViewDescriptor:
+            reflected["kind"] = "tensor_view_descriptor";
+            break;
         case mlir::vernon::PhysicalResourceAbiKind::CudaStorageLeaves:
             reflected["kind"] = "strided_memref_storage_leaves";
             break;
@@ -475,6 +478,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
             physicalValueLayouts.emplace(index, std::move(*layout));
         }
         llvm::SmallVector<std::optional<uint32_t>> computeBindings(function.getNumArguments());
+        llvm::SmallVector<std::optional<uint32_t>> tensorDescriptorBindings(function.getNumArguments());
         if (stage.getValue() == "compute") {
             uint32_t flattenedBinding = 0;
             for (unsigned index = 0; index < function.getNumArguments(); ++index) {
@@ -483,9 +487,14 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
                     continue;
                 computeBindings[index] = flattenedBinding;
                 size_t leafCount = 1;
-                if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(function.getArgumentTypes()[index])) {
+                mlir::Type storageElement;
+                if (auto tensor = mlir::dyn_cast<mlir::vernon::TensorType>(function.getArgumentTypes()[index]))
+                    storageElement = tensor.getElementType();
+                else if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(function.getArgumentTypes()[index]))
+                    storageElement = view.getElementType();
+                if (storageElement) {
                     mlir::FailureOr<mlir::vernon::ValueAbiLayout> layout =
-                        mlir::vernon::getValueAbiLayout(view.getElementType(), module);
+                        mlir::vernon::getValueAbiLayout(storageElement, module);
                     if (mlir::failed(layout)) {
                         function.emitError("cannot assign flattened compute bindings");
                         invalid = true;
@@ -494,6 +503,13 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
                     leafCount = layout->leaves.size();
                 }
                 flattenedBinding += static_cast<uint32_t>(std::max<size_t>(leafCount, 1));
+            }
+            for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+                auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(function.getArgumentTypes()[index]);
+                if (!view || function.getArgAttrDict(index).get("vernon.builtin"))
+                    continue;
+                tensorDescriptorBindings[index] = flattenedBinding;
+                flattenedBinding += 1 + 2 * static_cast<uint32_t>(view.getShape().size());
             }
         }
         uint32_t nextBinding = 0;
@@ -778,29 +794,25 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
                         storageLeaves.emplace_back(std::move(reflectedLeaf));
                     }
                     argument["storage_leaves"] = std::move(storageLeaves);
-                    auto shape = attrs.getAs<mlir::DenseI64ArrayAttr>(mlir::vernon::kTensorShapeAttrName);
-                    auto strides = attrs.getAs<mlir::DenseI64ArrayAttr>(mlir::vernon::kTensorStridesAttrName);
-                    auto offset = attrs.getAs<mlir::IntegerAttr>(mlir::vernon::kTensorOffsetAttrName);
-                    if (strides || offset) {
-                        if (!strides || !offset || strides.size() != view.getShape().size() || offset.getInt() < 0 ||
-                            (shape && shape.size() != strides.size())) {
-                            function.emitError("TensorView layout requires rank-matched signed strides and a "
-                                               "non-negative offset");
-                            invalid = true;
-                            return;
-                        }
-                        llvm::json::Array elementStrides;
-                        for (int64_t tensorStride : strides.asArrayRef())
-                            elementStrides.emplace_back(tensorStride);
-                        if (shape) {
-                            llvm::json::Array dimensions;
-                            for (int64_t dimension : shape.asArrayRef())
-                                dimensions.emplace_back(dimension);
-                            argument["shape"] = std::move(dimensions);
-                        }
-                        argument["element_strides"] = std::move(elementStrides);
-                        argument["element_offset"] = offset.getInt();
+                    if (!tensorDescriptorBindings[index]) {
+                        function.emitError("TensorView has no dispatch descriptor binding sequence");
+                        invalid = true;
+                        return;
                     }
+                    const uint32_t descriptorBase = *tensorDescriptorBindings[index];
+                    llvm::json::Object descriptor;
+                    descriptor["rank"] = static_cast<int64_t>(view.getShape().size());
+                    descriptor["offset_binding"] = static_cast<int64_t>(descriptorBase);
+                    llvm::json::Array extentBindings;
+                    llvm::json::Array strideBindings;
+                    for (uint32_t dimension = 0; dimension < view.getShape().size(); ++dimension) {
+                        extentBindings.emplace_back(static_cast<int64_t>(descriptorBase + 1 + dimension));
+                        strideBindings.emplace_back(
+                            static_cast<int64_t>(descriptorBase + 1 + view.getShape().size() + dimension));
+                    }
+                    descriptor["extent_bindings"] = std::move(extentBindings);
+                    descriptor["stride_bindings"] = std::move(strideBindings);
+                    argument["tensor_view_descriptor"] = std::move(descriptor);
                 } else if (!mlir::isa<mlir::RankedTensorType>(argumentType)) {
                     argument["kind"] = "scalar";
                     argument["dtype"] = sourceDtype ? sourceDtype.getValue().str() : scalarDtype(argumentType);

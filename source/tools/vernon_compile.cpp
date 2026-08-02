@@ -42,10 +42,10 @@ int main(int argc, char **argv) {
         std::cerr << "usage: vernon-compile <module.mlir>\n"
                      "       vernon-compile --target <target> <module.mlir> "
                      "[--output-dir <directory>] [--reflection <file>] "
-                     "[--glsl-version <version>] "
-                     "[--hlsl-shader-model <model>] "
+                     "[--opengl-version <version>] "
+                     "[--directx-shader-model <model>] [--metal-platform <macos|ios>] "
                      "[--compute-bundle <directory>] [--host-runtime-bundle] "
-                     "[--target-triple <triple>] [--cpu <name>] "
+                     "[--cpu-triple <triple>] [--cpu-name <name>] "
                      "[--cpu-features <features>]\n"
                      "  --compute-bundle writes a relocatable CPU object bundle.\n"
                      "  --host-runtime-bundle finalizes that object with embedded "
@@ -59,6 +59,7 @@ int main(int argc, char **argv) {
     vernon::tools::PackagingOptions packaging;
     std::optional<uint32_t> glslVersion;
     std::optional<uint32_t> hlslShaderModel;
+    std::optional<VernonMetalPlatform> metalPlatform;
     std::optional<std::string> cpuName;
     std::optional<std::string> cpuFeatures;
     if (!validateOnly) {
@@ -84,13 +85,13 @@ int main(int argc, char **argv) {
                 packaging.reflectionPath = argv[index + 1];
             else if (option == "--compute-bundle")
                 packaging.computeBundlePath = argv[index + 1];
-            else if (option == "--target-triple")
+            else if (option == "--cpu-triple")
                 packaging.targetTriple = argv[index + 1];
-            else if (option == "--cpu")
+            else if (option == "--cpu-name")
                 cpuName = argv[index + 1];
             else if (option == "--cpu-features")
                 cpuFeatures = argv[index + 1];
-            else if (option == "--glsl-version") {
+            else if (option == "--opengl-version") {
                 std::string_view value = argv[index + 1];
                 uint32_t parsed = 0;
                 auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), parsed);
@@ -99,7 +100,7 @@ int main(int argc, char **argv) {
                     return 2;
                 }
                 glslVersion = parsed;
-            } else if (option == "--hlsl-shader-model") {
+            } else if (option == "--directx-shader-model") {
                 std::string_view value = argv[index + 1];
                 uint32_t parsed = 0;
                 auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), parsed);
@@ -108,6 +109,16 @@ int main(int argc, char **argv) {
                     return 2;
                 }
                 hlslShaderModel = parsed;
+            } else if (option == "--metal-platform") {
+                const std::string_view value = argv[index + 1];
+                if (value == "macos")
+                    metalPlatform = VERNON_METAL_PLATFORM_MACOS;
+                else if (value == "ios")
+                    metalPlatform = VERNON_METAL_PLATFORM_IOS;
+                else {
+                    std::cerr << "invalid Metal platform " << value << '\n';
+                    return 2;
+                }
             } else {
                 std::cerr << "unknown option " << option << '\n';
                 return 2;
@@ -127,7 +138,15 @@ int main(int argc, char **argv) {
             return 2;
         }
         if (hlslShaderModel && *target != VERNON_TARGET_DIRECTX) {
-            std::cerr << "--hlsl-shader-model requires --target directx\n";
+            std::cerr << "--directx-shader-model requires --target directx\n";
+            return 2;
+        }
+        if (glslVersion && *target != VERNON_TARGET_OPENGL && *target != VERNON_TARGET_OPENGL_ES) {
+            std::cerr << "--opengl-version requires --target opengl or opengles\n";
+            return 2;
+        }
+        if (metalPlatform && *target != VERNON_TARGET_METAL) {
+            std::cerr << "--metal-platform requires --target metal\n";
             return 2;
         }
         if (packaging.hostRuntimeBundle && packaging.targetTriple) {
@@ -155,18 +174,25 @@ int main(int argc, char **argv) {
     VernonCompileResult *result = nullptr;
     if (validateOnly) {
         result = vernonCompilerValidateMlir(context, source.data(), source.size());
-    } else if (glslVersion || hlslShaderModel || packaging.targetTriple || cpuName || cpuFeatures) {
+    } else if (glslVersion || hlslShaderModel || metalPlatform || packaging.targetTriple || cpuName || cpuFeatures) {
         VernonCompileOptions options = {};
         options.struct_size = sizeof(options);
-        options.glsl_version = glslVersion.value_or(0);
-        options.hlsl_shader_model = hlslShaderModel.value_or(0);
+        options.target = *target;
         auto view = [](const std::optional<std::string> &value) {
             return value ? VernonStringView{value->data(), value->size()} : VernonStringView{};
         };
-        options.cpu_target_triple = view(packaging.targetTriple);
-        options.cpu_name = view(cpuName);
-        options.cpu_features = view(cpuFeatures);
-        result = vernonCompilerCompileMlirWithOptions(context, source.data(), source.size(), *target, &options);
+        if (*target == VERNON_TARGET_CPU) {
+            options.as.cpu.triple = view(packaging.targetTriple);
+            options.as.cpu.processor = view(cpuName);
+            options.as.cpu.features = view(cpuFeatures);
+        } else if (*target == VERNON_TARGET_OPENGL || *target == VERNON_TARGET_OPENGL_ES) {
+            options.as.opengl.version = glslVersion.value_or(0);
+        } else if (*target == VERNON_TARGET_METAL) {
+            options.as.metal.platform = metalPlatform.value_or(VERNON_METAL_PLATFORM_MACOS);
+        } else if (*target == VERNON_TARGET_DIRECTX) {
+            options.as.directx.shader_model = hlslShaderModel.value_or(0);
+        }
+        result = vernonCompilerCompileMlirWithOptions(context, source.data(), source.size(), &options);
     } else {
         result = vernonCompilerCompileMlir(context, source.data(), source.size(), *target);
     }

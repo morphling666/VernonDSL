@@ -4,7 +4,7 @@ import json
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
-from .types import CompiledArtifact, CompiledStage, PipelineCompileError, TargetOptions
+from .types import CompiledArtifact, CompiledStage, PipelineCompileError, TargetOptions, make_target_options
 
 
 def parse_reflection_json(reflection: str | bytes | Mapping[str, Any]) -> dict[str, Any]:
@@ -74,6 +74,13 @@ def compiled_stage_from_program(
     artifact_format = artifact_row.get("format")
     if not isinstance(artifact_format, str) or not artifact_format:
         raise PipelineCompileError("compiler artifact format is invalid")
+    reflected_target = reflection.get("target")
+    if isinstance(reflected_target, Mapping):
+        kind = reflected_target.get("kind")
+        options = reflected_target.get("options")
+        if kind != target.target or not isinstance(options, Mapping):
+            raise PipelineCompileError("compiler reflection target does not match the requested target")
+        target = make_target_options(kind, options)
     return CompiledStage(
         module,
         module_manifest,

@@ -1,4 +1,3 @@
-option(VERNON_ENABLE_PYTHON_BINDINGS "Build the nanobind Python module" ON)
 set(_vernon_gl_context_default OFF)
 if(VERNON_BUILD_RUNTIME
    AND VERNON_BUILD_COMPILER

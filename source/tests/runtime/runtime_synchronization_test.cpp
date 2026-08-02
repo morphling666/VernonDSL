@@ -35,10 +35,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %output: !vernon.tensor_view<i32, [10], "write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64,
-        vernon.tensor_shape = array<i64: 10>,
-        vernon.tensor_strides = array<i64: 1>,
-        vernon.tensor_offset = 0 : i64
+        vernon.binding = 0 : i64
       },
       %lane: index {
         vernon.interface = "input",
@@ -130,7 +127,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     invocation.argument_count = 1;
     invocation.compute_grid = {8, 1, 1};
     ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
-        << stringValue(vernonRuntimeGetLastError(context.runtime));
+        << "RHI: " << stringValue(vernonRhiDeviceGetLastError(context.device))
+        << "; runtime: " << stringValue(vernonRuntimeGetLastError(context.runtime));
     ASSERT_EQ(vernonRuntimeSynchronize(context.runtime), VERNON_STATUS_OK);
 
     std::array<int32_t, 10> result{};

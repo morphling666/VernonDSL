@@ -4,6 +4,8 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
+#include <string_view>
+
 namespace {
 
 using vernon::runtime::parseRuntimeRequirements;
@@ -12,30 +14,34 @@ using vernon::runtime::RuntimeRequirements;
 nlohmann::json validTensorVariant() {
     return {{"key", nlohmann::json::array()},
             {"program", {{"compute", "compute.spv"}}},
-            {"parameters", nlohmann::json::array(
-                               {{{"slot", 0},
-                                 {"name", "values"},
-                                 {"kind", "tensor"},
-                                 {"type", "!vernon.tensor_view<f32, [1], \"read_write\", \"device\">"},
-                                 {"access", "read_write"},
-                                 {"address_space", "device"},
-                                 {"shape", nlohmann::json::array({1})},
-                                 {"element_layout",
-                                  {{"logical_type", "f32"},
-                                   {"layout_hash", "cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b"},
-                                   {"byte_size", 4},
-                                   {"alignment", 4},
-                                   {"leaves", nlohmann::json::array({{{"path", nlohmann::json::array()},
-                                                                      {"dtype", "f32"},
-                                                                      {"scalar_count", 1},
-                                                                      {"byte_offset", 0}}})}}},
-                                 {"uses", nlohmann::json::array({{{"stage", "compute"},
-                                                                  {"interface", "resource"},
-                                                                  {"vernon.set", 0},
-                                                                  {"vernon.binding", 0},
-                                                                  {"shape", nlohmann::json::array({1})},
-                                                                  {"element_strides", nlohmann::json::array({1})},
-                                                                  {"element_offset", 0}}})}}})},
+            {"parameters",
+             nlohmann::json::array(
+                 {{{"slot", 0},
+                   {"name", "values"},
+                   {"kind", "tensor"},
+                   {"type", "!vernon.tensor_view<f32, [1], \"read_write\", \"device\">"},
+                   {"access", "read_write"},
+                   {"address_space", "device"},
+                   {"shape", nlohmann::json::array({1})},
+                   {"element_layout",
+                    {{"logical_type", "f32"},
+                     {"layout_hash", "cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b"},
+                     {"byte_size", 4},
+                     {"alignment", 4},
+                     {"leaves", nlohmann::json::array({{{"path", nlohmann::json::array()},
+                                                        {"dtype", "f32"},
+                                                        {"scalar_count", 1},
+                                                        {"byte_offset", 0}}})}}},
+                   {"uses", nlohmann::json::array({{{"stage", "compute"},
+                                                    {"interface", "resource"},
+                                                    {"vernon.set", 0},
+                                                    {"vernon.binding", 0},
+                                                    {"shape", nlohmann::json::array({1})},
+                                                    {"tensor_view_descriptor",
+                                                     {{"rank", 1},
+                                                      {"offset_binding", 1},
+                                                      {"extent_bindings", nlohmann::json::array({2})},
+                                                      {"stride_bindings", nlohmann::json::array({3})}}}}})}}})},
             {"internal_parameters", nlohmann::json::array()},
             {"outputs", nlohmann::json::array()}};
 }
@@ -72,6 +78,12 @@ TEST(PipelineManifestRequirements, ParsesEveryRuntimeBackendShape) {
           {"api_version", nlohmann::json::array({1, 1})},
           {"spirv_version", nlohmann::json::array({1, 3})},
           {"compute_workgroup_size", nlohmann::json::array({8, 4, 1})}}},
+        {"metal",
+         {{"backend", "metal"},
+          {"features", nlohmann::json::array({"compute"})},
+          {"apple_platform", "ios"},
+          {"msl_version", nlohmann::json::array({2, 4})},
+          {"minimum_os_version", nlohmann::json::array({15, 0})}}},
         {"cuda",
          {{"backend", "cuda"},
           {"features", nlohmann::json::array({"compute"})},
@@ -137,6 +149,33 @@ TEST(PipelineManifestRequirements, RejectsTargetMismatchAndMalformedVersions) {
     requirements = {};
     EXPECT_FALSE(parseRuntimeRequirements(root, "opengles", requirements, error));
     EXPECT_NE(error.find("does not match"), std::string::npos);
+}
+
+TEST(PipelineManifestRequirements, RejectsUnsupportedMetalRequirements) {
+    RuntimeRequirements requirements;
+    std::string error;
+    nlohmann::json root = {{"runtime_requirements",
+                            {{"backend", "metal"},
+                             {"features", nlohmann::json::array()},
+                             {"apple_platform", "ios"},
+                             {"msl_version", nlohmann::json::array({2, 3})},
+                             {"minimum_os_version", nlohmann::json::array({15, 0})}}}};
+    EXPECT_FALSE(parseRuntimeRequirements(root, "metal", requirements, error));
+    EXPECT_NE(error.find("unsupported"), std::string::npos);
+
+    root["runtime_requirements"]["msl_version"] = nlohmann::json::array({2, 4});
+    root["runtime_requirements"]["minimum_os_version"] = nlohmann::json::array({14, 9});
+    error.clear();
+    requirements = {};
+    EXPECT_FALSE(parseRuntimeRequirements(root, "metal", requirements, error));
+    EXPECT_NE(error.find("unsupported"), std::string::npos);
+
+    root["runtime_requirements"]["minimum_os_version"] = nlohmann::json::array({15, 0});
+    root["runtime_requirements"]["apple_platform"] = "tvos";
+    error.clear();
+    requirements = {};
+    EXPECT_FALSE(parseRuntimeRequirements(root, "metal", requirements, error));
+    EXPECT_NE(error.find("unsupported"), std::string::npos);
 }
 
 TEST(PipelineManifestRequirements, ComparesApiAndCpuHostRequirements) {
@@ -236,6 +275,13 @@ TEST(PipelineManifestRequirements, RejectsUnknownAndLegacyVariantRecords) {
     manifest = validTensorVariant();
     manifest["parameters"][0]["uses"][0]["unknown"] = true;
     EXPECT_FALSE(vernon::runtime::parseVariant(manifest, variant, error));
+
+    for (std::string_view retired : {"entry", "kind", "type", "access", "address_space", "dimension", "location_span",
+                                     "internal_source", "system_value"}) {
+        manifest = validTensorVariant();
+        manifest["parameters"][0]["uses"][0][retired] = "retired";
+        EXPECT_FALSE(vernon::runtime::parseVariant(manifest, variant, error)) << retired;
+    }
 
     manifest = validTensorVariant();
     manifest["parameters"][0]["vernon.compiler_generated"] = true;

@@ -1,5 +1,6 @@
 #include "VernonCompiler.h"
 #include "VernonVersions.h"
+#include "compiler_target_test_utils.h"
 
 #include <algorithm>
 #include <array>
@@ -254,6 +255,8 @@ TEST(CompilerGraphicsOutput, PreservesInterfacesTexturesAndSwizzles) {
     ASSERT_TRUE(compiler);
     for (VernonTarget target : {VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL, VERNON_TARGET_OPENGL_ES,
                                 VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
+        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+            continue;
         VernonCompileResult *result = vernonCompilerCompileMlir(compiler, module.data(), module.size(), target);
         ASSERT_TRUE(result);
         if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
@@ -277,6 +280,30 @@ TEST(CompilerGraphicsOutput, PreservesInterfacesTexturesAndSwizzles) {
             continue;
         } else {
             output = artifacts(result);
+        }
+        if (target == VERNON_TARGET_METAL) {
+            const VernonStringView reflection = vernonCompileResultGetReflection(result);
+            const auto reflected = nlohmann::json::parse(reflection.data, reflection.data + reflection.size);
+            ASSERT_TRUE(reflected.contains("metal_resource_slots"));
+            const auto &slots = reflected["metal_resource_slots"];
+            auto hasSlot = [&](std::string_view entry, std::string_view kind, uint32_t set, uint32_t binding,
+                               uint32_t argumentBuffer, uint32_t memberId) {
+                return std::any_of(slots.begin(), slots.end(), [&](const nlohmann::json &slot) {
+                    return slot.value("entry_point", "") == entry && slot.value("kind", "") == kind &&
+                           slot.value("set", UINT32_MAX) == set && slot.value("binding", UINT32_MAX) == binding &&
+                           slot.value("argument_buffer_index", UINT32_MAX) == argumentBuffer &&
+                           slot.value("member_id", UINT32_MAX) == memberId &&
+                           slot.value("direct_buffer_index", 0u) == UINT32_MAX && slot.value("count", 0u) == 1;
+                });
+            };
+            EXPECT_TRUE(hasSlot("cube_map_fragment", "sampled_image", 0, 0, 0, 0)) << slots.dump();
+            EXPECT_TRUE(hasSlot("cube_map_fragment", "sampler", 0, 0, 0, 1)) << slots.dump();
+            EXPECT_NE(output.find("[[id(0)]]"), std::string::npos);
+            EXPECT_NE(output.find("[[id(1)]]"), std::string::npos);
+            EXPECT_NE(output.find("spvDescriptorSetBuffer0"), std::string::npos);
+            EXPECT_NE(output.find("[[buffer(0)]]"), std::string::npos);
+            EXPECT_EQ(output.find("[[texture(0)]]"), std::string::npos);
+            EXPECT_EQ(output.find("[[sampler(0)]]"), std::string::npos);
         }
         for (std::string_view name : {"aPos", "TexCoord", "cubeMap", "color", "bloom_color"}) {
             if (output.find(name) == std::string::npos) {
@@ -309,6 +336,66 @@ TEST(CompilerGraphicsOutput, PreservesInterfacesTexturesAndSwizzles) {
         }
         vernonCompileResultDestroy(result);
     }
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerGraphicsOutput, LowersEachMetalDescriptorSetToOneArgumentBuffer) {
+    static constexpr char multiSetModule[] = R"(
+module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
+  func.func @multi_set_compute(
+      %left: !vernon.tensor_view<f32, [1], "read_write", "device"> {
+        vernon.interface = "resource",
+        vernon.set = 0 : i64,
+        vernon.binding = 0 : i64
+      },
+      %right: !vernon.tensor_view<f32, [1], "read", "device"> {
+        vernon.interface = "resource",
+        vernon.set = 1 : i64,
+        vernon.binding = 0 : i64
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 1, 1, 1>
+      } {
+    %zero = arith.constant 0 : index
+    %left_value = "vernon.load"(%left, %zero) :
+      (!vernon.tensor_view<f32, [1], "read_write", "device">, index) -> f32
+    %right_value = "vernon.load"(%right, %zero) :
+      (!vernon.tensor_view<f32, [1], "read", "device">, index) -> f32
+    %sum = arith.addf %left_value, %right_value : f32
+    "vernon.store"(%sum, %left, %zero) :
+      (f32, !vernon.tensor_view<f32, [1], "read_write", "device">, index) -> ()
+    return
+  }
+}
+)";
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_NE(compiler, nullptr);
+    VernonCompileResult *result =
+        vernonCompilerCompileMlir(compiler, multiSetModule, sizeof(multiSetModule) - 1, VERNON_TARGET_METAL);
+    ASSERT_NE(result, nullptr);
+    if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
+        const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+        std::fprintf(stderr, "multi-set Metal compile failed: %.*s\n", static_cast<int>(diagnostics.size),
+                     diagnostics.data);
+    }
+    ASSERT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+    const std::string output = artifacts(result);
+    EXPECT_NE(output.find("spvDescriptorSetBuffer0"), std::string::npos);
+    EXPECT_NE(output.find("spvDescriptorSetBuffer1"), std::string::npos);
+    EXPECT_NE(output.find("[[buffer(0)]]"), std::string::npos);
+    EXPECT_NE(output.find("[[buffer(1)]]"), std::string::npos);
+    const VernonStringView reflection = vernonCompileResultGetReflection(result);
+    const auto reflected = nlohmann::json::parse(reflection.data, reflection.data + reflection.size);
+    const auto &slots = reflected.at("metal_resource_slots");
+    for (uint32_t set = 0; set < 2; ++set) {
+        EXPECT_TRUE(std::any_of(slots.begin(), slots.end(), [&](const nlohmann::json &slot) {
+            return slot.value("entry_point", "") == "multi_set_compute" && slot.value("kind", "") == "storage_buffer" &&
+                   slot.value("set", UINT32_MAX) == set && slot.value("argument_buffer_index", UINT32_MAX) == set &&
+                   slot.value("member_id", UINT32_MAX) == 0;
+        })) << slots.dump();
+    }
+    vernonCompileResultDestroy(result);
     vernonCompilerDestroy(compiler);
 }
 
@@ -565,6 +652,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 
     vernonCompileResultDestroy(result);
     for (VernonTarget target : {VERNON_TARGET_OPENGL, VERNON_TARGET_DIRECTX}) {
+        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+            continue;
         result = vernonCompilerCompileMlir(compiler, tensorModule.data(), tensorModule.size(), target);
         ASSERT_TRUE(result);
         if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
@@ -589,6 +678,75 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     vernonCompilerDestroy(compiler);
 }
 
+TEST(CompilerGraphicsOutput, PreservesStd140ScalarArrayStrideInSpirvInterfaces) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    for (uint32_t tailWidth : {1u, 2u, 3u}) {
+        const std::string tensorModule = std::string(R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @std140_tail_width(
+      %tail: tensor<2x2x)mlir") + std::to_string(tailWidth) +
+                                         R"mlir(xf32> {
+        vernon.interface = "uniform",
+        vernon.source_name = "tail",
+        vernon.dtype = "f32"
+      }) -> (f32 {
+        vernon.interface = "output",
+        vernon.location = 0 : i64
+      }) attributes {vernon.entry, vernon.stage = "fragment"} {
+    %one = arith.constant 1 : index
+    %tail_index = arith.constant )mlir" + std::to_string(tailWidth - 1) +
+                                         R"mlir( : index
+    %value = tensor.extract %tail[%one, %one, %tail_index] : tensor<2x2x)mlir" +
+                                         std::to_string(tailWidth) + R"mlir(xf32>
+    return %value : f32
+  }
+}
+)mlir";
+
+        SCOPED_TRACE("tail width " + std::to_string(tailWidth));
+        VernonCompileResult *result =
+            vernonCompilerCompileMlir(compiler, tensorModule.data(), tensorModule.size(), VERNON_TARGET_VULKAN);
+        ASSERT_TRUE(result);
+        if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
+            const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+            std::fprintf(stderr, "std140 tail-width Vulkan compile failed: %.*s\n", static_cast<int>(diagnostics.size),
+                         diagnostics.data);
+        }
+        ASSERT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+        const std::string spirv = artifacts(result);
+        ASSERT_EQ(spirv.size() % sizeof(uint32_t), 0u);
+        std::vector<uint32_t> words(spirv.size() / sizeof(uint32_t));
+        std::memcpy(words.data(), spirv.data(), spirv.size());
+        bool hasFourComponentCarrier = false;
+        std::vector<uint32_t> arrayStrides;
+        for (size_t cursor = 5; cursor < words.size();) {
+            const uint16_t wordCount = static_cast<uint16_t>(words[cursor] >> 16);
+            ASSERT_GT(wordCount, 0u);
+            ASSERT_LE(cursor + wordCount, words.size());
+            const uint16_t opcode = static_cast<uint16_t>(words[cursor]);
+            if (opcode == 23 && wordCount == 4 && words[cursor + 3] == 4)
+                hasFourComponentCarrier = true;
+            if (opcode == 71 && wordCount == 4 && words[cursor + 2] == 6)
+                arrayStrides.push_back(words[cursor + 3]);
+            cursor += wordCount;
+        }
+        EXPECT_TRUE(hasFourComponentCarrier);
+        for (uint32_t stride : {16u, tailWidth * 16u, tailWidth * 32u})
+            EXPECT_NE(std::find(arrayStrides.begin(), arrayStrides.end(), stride), arrayStrides.end());
+
+        const VernonStringView reflected = vernonCompileResultGetReflection(result);
+        const nlohmann::json root = nlohmann::json::parse(reflected.data, reflected.data + reflected.size);
+        const nlohmann::json &argument = root.at("entries").at(0).at("arguments").at(0);
+        const nlohmann::json &layout = argument.at("physical_layouts").at("vulkan_std140_uniform_buffer");
+        EXPECT_EQ(argument.at("shape"), nlohmann::json::array({2, 2, tailWidth}));
+        EXPECT_EQ(layout.at("byte_strides"), nlohmann::json::array({tailWidth * 32u, tailWidth * 16u, 16u}));
+        EXPECT_EQ(layout.at("size"), tailWidth * 64u);
+        vernonCompileResultDestroy(result);
+    }
+    vernonCompilerDestroy(compiler);
+}
+
 TEST(CompilerGraphicsOutput, LowersStaticTensorByValueComputeAbi) {
     constexpr std::string_view tensorModule = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
@@ -601,10 +759,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %output: !vernon.tensor_view<f32, [1], "write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64,
-        vernon.tensor_shape = array<i64: 1>,
-        vernon.tensor_strides = array<i64: 1>,
-        vernon.tensor_offset = 0 : i64
+        vernon.binding = 0 : i64
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",
@@ -626,6 +781,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     ASSERT_TRUE(compiler);
     for (VernonTarget target :
          {VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL, VERNON_TARGET_DIRECTX, VERNON_TARGET_CUDA}) {
+        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+            continue;
         VernonCompileResult *result =
             vernonCompilerCompileMlir(compiler, tensorModule.data(), tensorModule.size(), target);
         ASSERT_TRUE(result);
@@ -664,8 +821,10 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         EXPECT_NE(reflected.find("\"value_transport\":\"storage_buffer\""), std::string_view::npos);
         EXPECT_NE(reflected.find("\"vernon.binding\":0"), std::string_view::npos);
         EXPECT_NE(reflected.find("\"binding\":1"), std::string_view::npos);
-        EXPECT_NE(reflected.find("\"element_strides\":[1]"), std::string_view::npos);
-        EXPECT_NE(reflected.find("\"element_offset\":0"), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"tensor_view_descriptor\":"), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"offset_binding\":2"), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"extent_bindings\":[3]"), std::string_view::npos);
+        EXPECT_NE(reflected.find("\"stride_bindings\":[4]"), std::string_view::npos);
         vernonCompileResultDestroy(result);
     }
     vernonCompilerDestroy(compiler);
@@ -863,10 +1022,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %values: !vernon.tensor_view<!vernon.struct<"Nested">, [2], "read", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64,
-        vernon.tensor_shape = array<i64: 2>,
-        vernon.tensor_strides = array<i64: 1>,
-        vernon.tensor_offset = 0 : i64
+        vernon.binding = 0 : i64
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",
@@ -886,7 +1042,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     const nlohmann::json root = nlohmann::json::parse(reflected.data, reflected.data + reflected.size);
     const nlohmann::json &argument = root.at("entries").at(0).at("arguments").at(0);
     EXPECT_FALSE(root.contains("backend_abi_routes"));
-    EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("kind"), "host_pointer");
+    EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("kind"), "tensor_view_descriptor");
+    EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("size"), 32);
     EXPECT_EQ(argument.at("physical_layouts").at("cuda_kernel_parameter").at("kind"), "strided_memref_storage_leaves");
     EXPECT_EQ(argument.at("physical_layouts").at("vulkan_std430_storage_buffer").at("kind"),
               "descriptor_storage_leaves");

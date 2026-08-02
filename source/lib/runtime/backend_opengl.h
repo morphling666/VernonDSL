@@ -4,6 +4,7 @@
 #include "../rhi/opengl_backend.h"
 #include "VernonRuntime.h"
 #include "VernonRuntimeCore.h"
+#include "compute_launch_planner.h"
 #include "graphics_invocation_planner.h"
 #include "pipeline_bundle.h"
 #include "pipeline_metadata.h"
@@ -44,10 +45,13 @@ struct OpenGLPipelineState {
 
     VernonRuntimeCorePipeline *rhiPipeline{};
     VernonRuntimeCoreBindings *rhiBindings{};
+    PreparedGraphicsVariant rhiGraphicsVariant;
     std::vector<VernonRuntimeProviderBindingLayoutEntry> rhiLayout;
     std::vector<VernonRuntimeProviderVertexAttribute> rhiVertexAttributes;
     std::vector<VernonRuntimeProviderBindingValue> rhiValues;
     std::vector<InlineBinding> rhiInlineBindings;
+    std::vector<ComputeBindingSource> rhiComputeBindingSources;
+    std::vector<int64_t> rhiComputeDescriptorValues;
     uint32_t workgroup[3]{1, 1, 1};
 };
 

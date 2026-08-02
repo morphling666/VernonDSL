@@ -1,5 +1,6 @@
 #include "VernonCompiler.h"
 #include "VernonVersions.h"
+#include "compiler_target_test_utils.h"
 
 #include <gtest/gtest.h>
 
@@ -14,10 +15,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %output: !vernon.tensor_view<i32, [1], "write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64,
-        vernon.tensor_shape = array<i64: 1>,
-        vernon.tensor_strides = array<i64: 1>,
-        vernon.tensor_offset = 0 : i64
+        vernon.binding = 0 : i64
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",
@@ -72,16 +70,105 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 }
 )mlir";
 
+constexpr std::string_view observableAlignedAggregateWorkgroupModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  "vernon.struct"() {
+    sym_name = "AlignedValue",
+    fields = ["valid:i1", "vector:tensor<2xf32>"],
+    abi_leaf_dtypes = ["bool", "f32"]
+  } : () -> ()
+  func.func @observable_aligned_aggregate_workgroup(
+      %output: !vernon.tensor_view<f32, [2], "write", "device"> {
+        vernon.interface = "resource",
+        vernon.set = 0 : i64,
+        vernon.binding = 0 : i64
+      },
+      %lane: index {
+        vernon.interface = "input",
+        vernon.builtin = "local_invocation_id"
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 2, 1, 1>
+      } {
+    %storage = "vernon.workgroup_alloc"() : () ->
+      !vernon.tensor_view<!vernon.struct<"AlignedValue">, [1], "read_write", "workgroup">
+    %zero = arith.constant 0 : index
+    %is_writer = arith.cmpi eq, %lane, %zero : index
+    scf.if %is_writer {
+      %valid = arith.constant true
+      %vector = arith.constant dense<[1.0, 2.0]> : tensor<2xf32>
+      %value = "vernon.struct_create"(%valid, %vector) {type_name = "AlignedValue"} :
+        (i1, tensor<2xf32>) -> !vernon.struct<"AlignedValue">
+      "vernon.store"(%value, %storage, %zero) :
+        (!vernon.struct<"AlignedValue">,
+         !vernon.tensor_view<!vernon.struct<"AlignedValue">, [1], "read_write", "workgroup">,
+         index) -> ()
+    }
+    "vernon.barrier"() {ordering = "acquire_release", scope = "workgroup"} : () -> ()
+    %loaded = "vernon.load"(%storage, %zero) :
+      (!vernon.tensor_view<!vernon.struct<"AlignedValue">, [1], "read_write", "workgroup">,
+       index) -> !vernon.struct<"AlignedValue">
+    %vector = "vernon.struct_get"(%loaded) {
+      field = "vector", index = 1 : i64
+    } : (!vernon.struct<"AlignedValue">) -> tensor<2xf32>
+    %first = tensor.extract %vector[%zero] : tensor<2xf32>
+    "vernon.store"(%first, %output, %lane) :
+      (f32, !vernon.tensor_view<f32, [2], "write", "device">, index) -> ()
+    return
+  }
+}
+)mlir";
+
+constexpr std::string_view alignmentPaddedWorkgroupModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  "vernon.struct"() {
+    sym_name = "Tiny",
+    fields = ["left:i1", "right:i1"],
+    abi_leaf_dtypes = ["bool", "bool"]
+  } : () -> ()
+  func.func @alignment_padded_workgroup() attributes {
+      vernon.entry,
+      vernon.stage = "compute",
+      vernon.workgroup_size = array<i32: 1, 1, 1>
+    } {
+    %first = "vernon.workgroup_alloc"() : () ->
+      !vernon.tensor_view<!vernon.struct<"Tiny">, [2730], "read_write", "workgroup">
+    %second = "vernon.workgroup_alloc"() : () ->
+      !vernon.tensor_view<!vernon.struct<"Tiny">, [2730], "read_write", "workgroup">
+    %third = "vernon.workgroup_alloc"() : () ->
+      !vernon.tensor_view<!vernon.struct<"Tiny">, [2730], "read_write", "workgroup">
+    return
+  }
+}
+)mlir";
+
+constexpr std::string_view nestedCombinedWorkgroupModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @nested_combined_workgroup() attributes {
+      vernon.entry,
+      vernon.stage = "compute",
+      vernon.workgroup_size = array<i32: 1, 1, 1>
+    } {
+    %first = "vernon.workgroup_alloc"() : () ->
+      !vernon.tensor_view<i32, [2049], "read_write", "workgroup">
+    %condition = arith.constant true
+    scf.if %condition {
+      %second = "vernon.workgroup_alloc"() : () ->
+        !vernon.tensor_view<i32, [2049], "read_write", "workgroup">
+    }
+    return
+  }
+}
+)mlir";
+
 constexpr std::string_view storageAtomicModule = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @storage_atomic(
       %values: !vernon.tensor_view<i32, [64], "read_write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64,
-        vernon.tensor_shape = array<i64: 64>,
-        vernon.tensor_strides = array<i64: 1>,
-        vernon.tensor_offset = 0 : i64
+        vernon.binding = 0 : i64
       })
       attributes {
         vernon.entry,
@@ -236,6 +323,8 @@ TEST(CompilerSynchronization, LowersPortableWorkgroupOperations) {
                        "atomic_kind = \"" + std::string(atomicKind) + "\"");
         for (VernonTarget target : {VERNON_TARGET_CPU, VERNON_TARGET_CUDA, VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL,
                                     VERNON_TARGET_OPENGL_ES, VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
+            if (vernon::tests::unavailableDirectXTarget(compiler, target))
+                continue;
             VernonCompileResult *result = vernonCompilerCompileMlir(compiler, module.data(), module.size(), target);
             ASSERT_TRUE(result);
             const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
@@ -257,6 +346,8 @@ TEST(CompilerSynchronization, LowersAggregateRankTwoWorkgroupStorageThroughValue
     ASSERT_TRUE(compiler);
     for (VernonTarget target : {VERNON_TARGET_CPU, VERNON_TARGET_CUDA, VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL,
                                 VERNON_TARGET_OPENGL_ES, VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
+        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+            continue;
         VernonCompileResult *result = vernonCompilerCompileMlir(compiler, aggregateWorkgroupModule.data(),
                                                                 aggregateWorkgroupModule.size(), target);
         ASSERT_TRUE(result);
@@ -265,6 +356,23 @@ TEST(CompilerSynchronization, LowersAggregateRankTwoWorkgroupStorageThroughValue
             << std::string_view(diagnostics.data ? diagnostics.data : "", diagnostics.size);
         vernonCompileResultDestroy(result);
     }
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, PreservesAlignedObservableAggregateWorkgroupStorageInCudaArtifact) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *result =
+        vernonCompilerCompileMlir(compiler, observableAlignedAggregateWorkgroupModule.data(),
+                                  observableAlignedAggregateWorkgroupModule.size(), VERNON_TARGET_CUDA);
+    ASSERT_TRUE(result);
+    const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+    ASSERT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK)
+        << std::string_view(diagnostics.data ? diagnostics.data : "", diagnostics.size);
+    ASSERT_EQ(vernonCompileResultGetArtifactCount(result), 1u);
+    const VernonStringView artifact = vernonCompileResultGetArtifactData(result, 0);
+    EXPECT_NE(std::string_view(artifact.data, artifact.size).find(".shared .align 16"), std::string_view::npos);
+    vernonCompileResultDestroy(result);
     vernonCompilerDestroy(compiler);
 }
 
@@ -325,11 +433,41 @@ TEST(CompilerSynchronization, RejectsCombinedWorkgroupStorageAbovePhysicalLimit)
     vernonCompilerDestroy(compiler);
 }
 
+TEST(CompilerSynchronization, RejectsWorkgroupStorageWhoseAlignmentPaddingExceedsPhysicalLimit) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *result = vernonCompilerValidateMlir(compiler, alignmentPaddedWorkgroupModule.data(),
+                                                             alignmentPaddedWorkgroupModule.size());
+    ASSERT_TRUE(result);
+    EXPECT_NE(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+    const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+    EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("combined workgroup storage"),
+              std::string_view::npos);
+    vernonCompileResultDestroy(result);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, RejectsCombinedWorkgroupStorageNestedInControlFlow) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *result = vernonCompilerValidateMlir(compiler, nestedCombinedWorkgroupModule.data(),
+                                                             nestedCombinedWorkgroupModule.size());
+    ASSERT_TRUE(result);
+    EXPECT_NE(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+    const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+    EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("combined workgroup storage"),
+              std::string_view::npos);
+    vernonCompileResultDestroy(result);
+    vernonCompilerDestroy(compiler);
+}
+
 TEST(CompilerSynchronization, LowersNestedAggregateWorkgroupStorageUnderStructuredControlFlow) {
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
     for (VernonTarget target : {VERNON_TARGET_CPU, VERNON_TARGET_CUDA, VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL,
                                 VERNON_TARGET_OPENGL_ES, VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
+        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+            continue;
         VernonCompileResult *result = vernonCompilerCompileMlir(compiler, nestedAggregateWorkgroupModule.data(),
                                                                 nestedAggregateWorkgroupModule.size(), target);
         ASSERT_TRUE(result);
@@ -366,6 +504,8 @@ TEST(CompilerSynchronization, LowersStorageTensorViewAtomicsOnlyForVerifiedTarge
     }
     for (VernonTarget target :
          {VERNON_TARGET_OPENGL, VERNON_TARGET_OPENGL_ES, VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
+        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+            continue;
         VernonCompileResult *result =
             vernonCompilerCompileMlir(compiler, storageAtomicModule.data(), storageAtomicModule.size(), target);
         ASSERT_TRUE(result);
@@ -450,6 +590,8 @@ TEST(CompilerSynchronization, LowersLocalAndWorkgroupBuiltins) {
     ASSERT_TRUE(compiler);
     for (VernonTarget target : {VERNON_TARGET_CUDA, VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL, VERNON_TARGET_OPENGL_ES,
                                 VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
+        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+            continue;
         VernonCompileResult *result =
             vernonCompilerCompileMlir(compiler, workgroupBuiltinModule.data(), workgroupBuiltinModule.size(), target);
         ASSERT_TRUE(result);

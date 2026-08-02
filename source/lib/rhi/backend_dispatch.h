@@ -3,6 +3,8 @@
 
 #include "VernonRHI.h"
 
+#include <string>
+
 namespace vernon::rhi {
 
 enum class ResourceKind : uint32_t { Buffer = 1, Image = 2, Sampler = 3 };
@@ -57,14 +59,19 @@ struct BackendDispatch {
     void (*abandonCommands)(VernonRhiDevice, uint64_t);
     bool (*recordBarriers)(VernonRhiDevice, uint64_t, uint64_t, const VernonRhiBarrier *, size_t);
     bool (*endRendering)(VernonRhiDevice, uint64_t, VernonRhiBackend, uint32_t, uint32_t, uint32_t, const uint64_t *,
-                         size_t, uint64_t);
+                         size_t, uint64_t, uint64_t);
     bool (*clearColor)(VernonRhiDevice, uint64_t, VernonRhiBackend, uint32_t, int32_t, int32_t, uint32_t, uint32_t,
                        uint32_t, uint64_t, uint32_t, const float[4]);
     bool (*clearDepthStencil)(VernonRhiDevice, uint64_t, VernonRhiBackend, uint32_t, int32_t, int32_t, uint32_t,
                               uint32_t, uint32_t, uint64_t, float, uint32_t, uint32_t);
     uint64_t (*trackedBufferState)(VernonRhiDevice, VernonRhiBuffer);
+
+    VernonRhiStatus (*createImageView)(VernonRhiDevice, const VernonRhiImageViewDescriptor *, VernonRhiImageView *);
+    VernonRhiStatus (*destroyImageView)(VernonRhiDevice, VernonRhiImageView);
+    VernonRhiStatus (*getImageViewNativeHandle)(VernonRhiDevice, VernonRhiImageView, uint64_t *);
 };
 
+void setDeviceCreationError(std::string error);
 const BackendDispatch &openGLBackendDispatch();
 VERNON_RHI_CAPI bool deferCommandRollback(VernonRhiDevice device, uint64_t encoderKey, void *context, uint64_t object,
                                           void (*rollback)(void *, uint64_t));
@@ -76,6 +83,9 @@ const BackendDispatch &directX12BackendDispatch();
 #endif
 #if defined(VERNON_HAS_VULKAN_RHI)
 const BackendDispatch &vulkanBackendDispatch();
+#endif
+#if defined(VERNON_HAS_METAL_RHI)
+const BackendDispatch &metalBackendDispatch();
 #endif
 
 } // namespace vernon::rhi

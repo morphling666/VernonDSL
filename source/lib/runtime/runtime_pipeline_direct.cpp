@@ -1,7 +1,6 @@
 #include "runtime_dispatch.h"
 
 #include "backend_cpu.h"
-#include "tensor_bridge.h"
 
 #include <nlohmann/json.hpp>
 
@@ -53,6 +52,14 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
             argument.value("access", argument.value("kind", std::string()) == "tensor" ? "read_write" : "read");
         if (argument.contains("shape") && argument["shape"].is_array())
             parameter.shape = argument["shape"].get<std::vector<uint64_t>>();
+        else if (argument.contains("source_shape") && argument["source_shape"].is_array())
+            for (const auto &extent : argument["source_shape"]) {
+                if (!extent.is_number_integer() || extent.get<int64_t>() < -1) {
+                    error = "TensorView source shape contains an invalid extent";
+                    return false;
+                }
+                parameter.shape.push_back(extent.get<int64_t>() < 0 ? 0 : static_cast<uint64_t>(extent.get<int64_t>()));
+            }
         ParameterUse use;
         use.stage = "compute";
         use.index = static_cast<uint32_t>(reflectedIndex);
@@ -62,24 +69,27 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
                                                                                      : "value";
         use.dtype = argument.value("dtype", std::string());
         use.shape = parameter.shape;
-        if (argument.contains("element_strides") || argument.contains("element_offset")) {
-            if (!argument.contains("element_strides") || !argument["element_strides"].is_array() ||
-                !argument.contains("element_offset") || !argument["element_offset"].is_number_unsigned()) {
-                error = "TensorView reflection has invalid specialization metadata";
+        if (argument.contains("tensor_view_descriptor")) {
+            const auto &descriptor = argument["tensor_view_descriptor"];
+            TensorViewDescriptorUse parsedDescriptor;
+            if (!descriptor.is_object() || !descriptor.contains("rank") || !descriptor["rank"].is_number_unsigned() ||
+                !descriptor.contains("offset_binding") || !descriptor["offset_binding"].is_number_unsigned() ||
+                !descriptor.contains("extent_bindings") || !descriptor["extent_bindings"].is_array() ||
+                !descriptor.contains("stride_bindings") || !descriptor["stride_bindings"].is_array()) {
+                error = "TensorView reflection has invalid descriptor metadata";
                 return false;
             }
-            for (const auto &stride : argument["element_strides"]) {
-                if (!stride.is_number_integer()) {
-                    error = "TensorView reflection element strides must be signed integers";
-                    return false;
-                }
-                use.elementStrides.push_back(stride.get<int64_t>());
-            }
-            if (!use.shape.empty() && use.elementStrides.size() != use.shape.size()) {
-                error = "TensorView reflection specialization rank does not match shape";
+            parsedDescriptor.rank = descriptor["rank"].get<uint32_t>();
+            parsedDescriptor.offsetBinding = descriptor["offset_binding"].get<uint32_t>();
+            parsedDescriptor.extentBindings = descriptor["extent_bindings"].get<std::vector<uint32_t>>();
+            parsedDescriptor.strideBindings = descriptor["stride_bindings"].get<std::vector<uint32_t>>();
+            if (!parsedDescriptor.rank || parsedDescriptor.extentBindings.size() != parsedDescriptor.rank ||
+                parsedDescriptor.strideBindings.size() != parsedDescriptor.rank ||
+                (!use.shape.empty() && use.shape.size() != parsedDescriptor.rank)) {
+                error = "TensorView descriptor rank does not match shape";
                 return false;
             }
-            use.elementOffset = argument["element_offset"].get<uint64_t>();
+            use.tensorViewDescriptor = std::move(parsedDescriptor);
         }
         use.descriptorSet = argument.value("vernon.set", uint32_t{0});
         use.binding =
@@ -198,7 +208,8 @@ VernonLoadedPipeline *loadBackendArtifactPipeline(VernonRuntimeContext &context,
     stage.entry = entry;
     stage.reflection.assign(reflectionData, reflectionSize);
     std::copy_n(reflection.workgroup, 3, stage.workgroup);
-    if (context.backend == VERNON_RUNTIME_CUDA || isOpenGLBackend(context.backend))
+    if (context.backend == VERNON_RUNTIME_CUDA || context.backend == VERNON_RUNTIME_METAL ||
+        isOpenGLBackend(context.backend))
         stage.source.assign(static_cast<const char *>(artifact), artifactSize);
     else
         stage.binary.assign(static_cast<const uint8_t *>(artifact),

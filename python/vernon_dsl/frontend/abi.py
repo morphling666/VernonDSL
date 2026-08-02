@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass
-from dataclasses import field as dataclass_field
 from typing import TypeAlias
 
+from ..language.scalar_types import SCALAR_TYPES
 from .model import ConcreteType
 
 AbiPathComponent: TypeAlias = str | int
@@ -16,24 +15,8 @@ StructFields: TypeAlias = tuple[tuple[str, ConcreteType], ...]
 class ValueLeaf:
     path: tuple[AbiPathComponent, ...]
     dtype: str
-    byte_offset: int
     scalar_count: int
     shape: tuple[int, ...] = ()
-
-
-@dataclass(frozen=True)
-class ValueAbiLayout:
-    size: int
-    alignment: int
-    field_offsets: tuple[int, ...] = ()
-    element_stride: int | None = None
-    leaves: tuple[ValueLeaf, ...] = dataclass_field(default=())
-    _canonical: str = dataclass_field(default="", repr=False, compare=False)
-
-    @property
-    def layout_hash(self) -> str:
-        dtypes = ",".join(leaf.dtype for leaf in self.leaves)
-        return hashlib.sha256(f"{self._canonical}|dtypes={dtypes}".encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -42,12 +25,10 @@ class AttributeLeaf:
     path: tuple[AbiPathComponent, ...]
     dtype: str
     component_count: int
-    byte_offset: int
 
 
 @dataclass(frozen=True)
 class AttributeLayout:
-    value_layout: ValueAbiLayout
     leaves: tuple[AttributeLeaf, ...]
 
     @property
@@ -55,22 +36,20 @@ class AttributeLayout:
         return len(self.leaves)
 
 
-@dataclass(frozen=True)
-class _ScalarLayout:
-    size: int
-    alignment: int
-
-
-_SCALAR_LAYOUTS = {
-    "bool": _ScalarLayout(1, 1),
-    "i32": _ScalarLayout(4, 4),
-    "u32": _ScalarLayout(4, 4),
-    "f16": _ScalarLayout(2, 2),
-    "f32": _ScalarLayout(4, 4),
-    "f64": _ScalarLayout(8, 8),
-}
-
 _ATTRIBUTE_DTYPES = {"i32", "u32", "f16", "f32", "f64"}
+_WORKGROUP_ALLOCATION_ALIGNMENT = 16
+
+
+def _scalar_bytes(dtype: str) -> int:
+    scalar = SCALAR_TYPES.get(dtype)
+    if scalar is None:
+        raise ValueError(f"{dtype} is not an ABI-stable scalar Value")
+    return max(scalar.width // 8, 1)
+
+
+def _workgroup_allocation_footprint(byte_size: int) -> int:
+    alignment = _WORKGROUP_ALLOCATION_ALIGNMENT
+    return ((byte_size + alignment - 1) // alignment) * alignment
 
 
 def workgroup_physical_bytes(
@@ -78,15 +57,15 @@ def workgroup_physical_bytes(
     shape: tuple[int, ...],
     struct_fields: Callable[[str], StructFields],
 ) -> int:
-    layout = value_abi_layout(element, struct_fields)
     records = 1
     for extent in shape:
         records *= extent
     if element.kind == "scalar":
-        return records * layout.size
+        return _workgroup_allocation_footprint(records * _scalar_bytes(element.name))
     total = 0
-    for leaf in layout.leaves:
-        total += records * leaf.scalar_count * _SCALAR_LAYOUTS[leaf.dtype].size
+    for leaf in value_leaves(element, struct_fields):
+        byte_size = records * leaf.scalar_count * _scalar_bytes(leaf.dtype)
+        total += _workgroup_allocation_footprint(byte_size)
     return total
 
 
@@ -94,13 +73,12 @@ def attribute_layout(
     value_type: ConcreteType,
     struct_fields: Callable[[str], StructFields],
 ) -> AttributeLayout:
-    value_layout = value_abi_layout(value_type, struct_fields)
     leaves: list[AttributeLeaf] = []
-    for value_leaf in value_layout.leaves:
+    for value_leaf in value_leaves(value_type, struct_fields):
         if value_leaf.dtype not in _ATTRIBUTE_DTYPES:
             path = _format_path(value_leaf.path)
             raise ValueError(f"{value_leaf.dtype} Value leaf '{path}' is not a numeric vertex attribute dtype")
-        scalar_size = _SCALAR_LAYOUTS[value_leaf.dtype].size
+        scalar_size = _scalar_bytes(value_leaf.dtype)
         component_limit = min(4, 16 // scalar_size)
         for scalar_index in range(0, value_leaf.scalar_count, component_limit):
             leaves.append(
@@ -109,44 +87,29 @@ def attribute_layout(
                     path=value_leaf.path,
                     dtype=value_leaf.dtype,
                     component_count=min(component_limit, value_leaf.scalar_count - scalar_index),
-                    byte_offset=value_leaf.byte_offset + scalar_index * scalar_size,
                 )
             )
-    return AttributeLayout(value_layout, tuple(leaves))
+    return AttributeLayout(tuple(leaves))
 
 
-def _align_to(value: int, alignment: int) -> int:
-    return (value + alignment - 1) // alignment * alignment
-
-
-def value_abi_layout(
+def value_leaves(
     value_type: ConcreteType,
     struct_fields: Callable[[str], StructFields],
     active_structs: frozenset[str] = frozenset(),
-) -> ValueAbiLayout:
-    return _value_abi_layout(value_type, struct_fields, active_structs, ())
+) -> tuple[ValueLeaf, ...]:
+    """Return logical leaves only; native code exclusively plans Value ABI bytes."""
+    return _value_leaves(value_type, struct_fields, active_structs, ())
 
 
-def _value_abi_layout(
+def _value_leaves(
     value_type: ConcreteType,
     struct_fields: Callable[[str], StructFields],
     active_structs: frozenset[str],
     path: tuple[AbiPathComponent, ...],
-) -> ValueAbiLayout:
+) -> tuple[ValueLeaf, ...]:
     if value_type.kind == "scalar":
-        scalar = _SCALAR_LAYOUTS.get(value_type.name)
-        if scalar is None:
-            raise ValueError(f"{value_type.name} is not an ABI-stable scalar Value")
-        # i32 and u32 share signless MLIR storage. Keep the physical spelling
-        # canonical here and include the logical leaf dtype separately below.
-        physical_name = "i32" if value_type.name == "u32" else value_type.name
-        canonical = f"scalar({physical_name},{scalar.size},{scalar.alignment})"
-        return ValueAbiLayout(
-            scalar.size,
-            scalar.alignment,
-            leaves=(ValueLeaf(path, value_type.name, 0, 1),),
-            _canonical=canonical,
-        )
+        _scalar_bytes(value_type.name)
+        return (ValueLeaf(path, value_type.name, 1),)
     if value_type.kind == "tensor":
         element = value_type.arguments[0]
         if not isinstance(element, ConcreteType):
@@ -154,49 +117,35 @@ def _value_abi_layout(
         dimensions = value_type.arguments[1:]
         if not dimensions or any(not isinstance(extent, int) or extent <= 0 for extent in dimensions):
             raise ValueError("Tensor ABI layout requires a positive static shape")
-        element_layout = _value_abi_layout(element, struct_fields, active_structs, path)
-        stride = _align_to(element_layout.size, element_layout.alignment)
         count = 1
         for dimension in dimensions:
             assert isinstance(dimension, int)
             count *= dimension
         if element.kind == "scalar":
-            leaves = (ValueLeaf(path, element.name, 0, count, tuple(dimensions)),)
-        else:
-            leaves = tuple(
-                ValueLeaf(
-                    (
-                        *path,
-                        *_linear_index_path(index, dimensions),
-                        *leaf.path[len(path) :],
-                    ),
-                    leaf.dtype,
-                    index * stride + leaf.byte_offset,
-                    leaf.scalar_count,
-                    leaf.shape,
-                )
-                for index in range(count)
-                for leaf in element_layout.leaves
+            return (ValueLeaf(path, element.name, count, tuple(dimensions)),)
+        element_leaves = _value_leaves(element, struct_fields, active_structs, path)
+        return tuple(
+            ValueLeaf(
+                (
+                    *path,
+                    *_linear_index_path(index, dimensions),
+                    *leaf.path[len(path) :],
+                ),
+                leaf.dtype,
+                leaf.scalar_count,
+                leaf.shape,
             )
-        shape_text = ",".join(str(extent) for extent in dimensions)
-        canonical = f"tensor([{shape_text}],stride={stride},size={stride * count},element={element_layout._canonical})"
-        return ValueAbiLayout(
-            stride * count,
-            element_layout.alignment,
-            element_stride=stride,
-            leaves=leaves,
-            _canonical=canonical,
+            for index in range(count)
+            for leaf in element_leaves
         )
     if value_type.kind == "tuple":
         elements = tuple(element for element in value_type.arguments if isinstance(element, ConcreteType))
         if len(elements) != len(value_type.arguments):
             raise ValueError("Tuple element type is not concrete")
-        return _product_layout(
-            tuple((index, element) for index, element in enumerate(elements)),
-            struct_fields,
-            active_structs,
-            path,
-            "tuple",
+        return tuple(
+            leaf
+            for index, element in enumerate(elements)
+            for leaf in _value_leaves(element, struct_fields, active_structs, (*path, index))
         )
     if value_type.kind == "struct":
         if value_type.name in active_structs:
@@ -204,48 +153,17 @@ def _value_abi_layout(
         fields = struct_fields(value_type.name)
         if any(not isinstance(name, str) or not isinstance(field, ConcreteType) for name, field in fields):
             raise ValueError(f"Struct '{value_type.name}' has unresolved fields")
-        return _product_layout(
-            fields,
-            struct_fields,
-            active_structs | {value_type.name},
-            path,
-            f"struct({value_type.name})",
+        return tuple(
+            leaf
+            for name, field in fields
+            for leaf in _value_leaves(
+                field,
+                struct_fields,
+                active_structs | {value_type.name},
+                (*path, name),
+            )
         )
     raise ValueError(f"{value_type.name} is not an ABI-stable Value")
-
-
-def _product_layout(
-    fields: tuple[tuple[AbiPathComponent, ConcreteType], ...],
-    struct_fields: Callable[[str], StructFields],
-    active_structs: frozenset[str],
-    path: tuple[AbiPathComponent, ...],
-    kind: str,
-) -> ValueAbiLayout:
-    offset = 0
-    alignment = 1
-    offsets: list[int] = []
-    leaves: list[ValueLeaf] = []
-    canonical_fields: list[str] = []
-    for component, field in fields:
-        layout = _value_abi_layout(field, struct_fields, active_structs, (*path, component))
-        offset = _align_to(offset, layout.alignment)
-        offsets.append(offset)
-        leaves.extend(
-            ValueLeaf(leaf.path, leaf.dtype, offset + leaf.byte_offset, leaf.scalar_count, leaf.shape)
-            for leaf in layout.leaves
-        )
-        canonical_fields.append(f"{component}@{offset}:{layout._canonical}")
-        offset += layout.size
-        alignment = max(alignment, layout.alignment)
-    size = _align_to(offset, alignment)
-    canonical = f"{kind}(align={alignment},size={size};{';'.join(canonical_fields)})"
-    return ValueAbiLayout(
-        size,
-        alignment,
-        tuple(offsets),
-        leaves=tuple(leaves),
-        _canonical=canonical,
-    )
 
 
 def _linear_index_path(index: int, dimensions: tuple[ConcreteType | int | str, ...]) -> tuple[int, ...]:

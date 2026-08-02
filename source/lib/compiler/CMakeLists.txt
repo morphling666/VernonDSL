@@ -18,12 +18,16 @@ set(VERNON_SOURCE_DIR "${VERNON_REPOSITORY_ROOT}/source")
 include("${VERNON_REPOSITORY_ROOT}/cmake/IncludeSpirvCross.cmake")
 include_spirv_cross()
 
-set(MLIR_DIR
-    "${VERNON_REPOSITORY_ROOT}/llvm-project/install/lib/cmake/mlir"
-    CACHE PATH "Directory containing MLIRConfig.cmake")
-set(LLD_DIR
-    "${VERNON_REPOSITORY_ROOT}/llvm-project/install/lib/cmake/lld"
-    CACHE PATH "Directory containing LLDConfig.cmake")
+if(NOT MLIR_DIR)
+    set(MLIR_DIR
+        "${VERNON_REPOSITORY_ROOT}/llvm-project/install/lib/cmake/mlir"
+        CACHE PATH "Directory containing MLIRConfig.cmake" FORCE)
+endif()
+if(NOT LLD_DIR)
+    set(LLD_DIR
+        "${VERNON_REPOSITORY_ROOT}/llvm-project/install/lib/cmake/lld"
+        CACHE PATH "Directory containing LLDConfig.cmake" FORCE)
+endif()
 find_package(MLIR REQUIRED CONFIG)
 find_package(LLD REQUIRED CONFIG)
 
@@ -56,6 +60,13 @@ target_include_directories(
               ${LLVM_INCLUDE_DIRS}
               ${MLIR_INCLUDE_DIRS}
               ${LLD_INCLUDE_DIRS})
+if(NOT LLVM_ENABLE_RTTI)
+    if(MSVC)
+        target_compile_options(VernonCompilerBuildHeaders INTERFACE /GR-)
+    else()
+        target_compile_options(VernonCompilerBuildHeaders INTERFACE -fno-rtti)
+    endif()
+endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/CompilerTargets.cmake")
 foreach(

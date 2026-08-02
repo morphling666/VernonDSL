@@ -113,6 +113,12 @@ if(TARGET VernonRuntime)
         VERBATIM)
     add_custom_target(vernon-cpu-aot-test-bundle DEPENDS "${cpu_bundle}/compute.json"
                                                          "${cpu_bundle}/cpu_fill.pipeline.json")
+    add_test(
+        NAME vernon-cpu-aot-bundle-platform-mapping
+        COMMAND
+            ${CMAKE_COMMAND} "-DGENERATOR=${VERNON_TEST_ROOT}/scripts/write_cpu_aot_bundle.cmake"
+            "-DTEST_OUTPUT_DIRECTORY=${VERNON_TEST_BINARY_ROOT}/cpu_aot_bundle_platform_mapping" -P
+            "${VERNON_TEST_ROOT}/scripts/test_cpu_aot_bundle_platform_mapping.cmake")
 
     add_executable(
         VernonRuntimeTests
@@ -121,6 +127,7 @@ if(TARGET VernonRuntime)
         runtime/execution_graph_test.cpp
         runtime/graphics_invocation_planner_test.cpp
         runtime/pipeline_manifest_requirements_test.cpp
+        runtime/rhi_adapter_backend_storage_test.cpp
         runtime/rhi_resource_lifetime_test.cpp
         runtime/runtime_c_api_test.cpp
         runtime/runtime_common_api_test.cpp
@@ -181,6 +188,81 @@ if(TARGET VernonRuntime)
     if(VERNON_ENABLE_VULKAN_RUNTIME)
         target_sources(VernonRuntimeTests PRIVATE rhi/vulkan_native_interop_test.cpp)
         target_link_libraries(VernonRuntimeTests PRIVATE Vernon::RHI Vulkan::Headers)
+    endif()
+
+    if(VERNON_ENABLE_METAL_RUNTIME)
+        target_sources(VernonRuntimeTests PRIVATE runtime/runtime_metal_test.cpp)
+        set_source_files_properties(runtime/runtime_metal_test.cpp PROPERTIES LANGUAGE OBJCXX)
+        if(TARGET vernon-dsl-native AND Python_FOUND)
+            vernon_add_pipeline_test_bundle(
+                metal-compute-pipeline
+                metal
+                "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:scale_asset"
+                metal_compute_pipeline_bundle
+                metal_compute_pipeline_test_manifest)
+            vernon_add_pipeline_test_bundle(
+                metal-graphics-pipeline
+                metal
+                "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:sampled_asset"
+                metal_graphics_pipeline_bundle
+                metal_graphics_pipeline_test_manifest)
+            vernon_add_pipeline_test_bundle(
+                metal-resolution-pipeline
+                metal
+                "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:resolution_asset"
+                metal_resolution_pipeline_bundle
+                metal_resolution_pipeline_test_manifest)
+            target_compile_definitions(
+                VernonRuntimeTests
+                PRIVATE VERNON_METAL_COMPUTE_PIPELINE_BUNDLE="${metal_compute_pipeline_test_manifest}"
+                        VERNON_METAL_GRAPHICS_PIPELINE_BUNDLE="${metal_graphics_pipeline_test_manifest}"
+                        VERNON_METAL_RESOLUTION_PIPELINE_BUNDLE="${metal_resolution_pipeline_test_manifest}")
+            add_dependencies(
+                VernonRuntimeTests
+                vernon-metal-compute-pipeline-test-bundle
+                vernon-metal-graphics-pipeline-test-bundle
+                vernon-metal-resolution-pipeline-test-bundle)
+            add_test(
+                NAME vernon-metal-mandelbulb-showcase
+                COMMAND
+                    ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/examples/mandelbulb_showcase.py" --architecture
+                    metal --headless --preset smoke --output "${VERNON_TEST_BINARY_ROOT}/metal_mandelbulb_showcase.png")
+            add_test(NAME vernon-metal-fractal-example
+                     COMMAND ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/examples/fractal.py" --architecture metal
+                             --headless --frames 1)
+            add_test(
+                NAME vernon-metal-pbr-example
+                COMMAND ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/examples/pbr.py" --architecture metal
+                        --headless --frames 1 --size 128 --output "${VERNON_TEST_BINARY_ROOT}/metal_pbr_example.png")
+            add_test(
+                NAME vernon-metal-complete-pipeline-example
+                COMMAND
+                    ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/examples/complete_pipeline.py" --architecture metal
+                    --headless --frames 1 --size 64 --instances 2 --output
+                    "${VERNON_TEST_BINARY_ROOT}/metal_complete_pipeline_example.png")
+            add_test(
+                NAME vernon-metal-dynamic-ocean-example
+                COMMAND
+                    ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/examples/dynamic_ocean.py" --arch metal --headless
+                    --frames 1 --size 64 --grid 16 --output "${VERNON_TEST_BINARY_ROOT}/metal_dynamic_ocean.png")
+            add_test(
+                NAME vernon-metal-dynamic-terrain-erosion-example
+                COMMAND
+                    ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/examples/dynamic_terrain_erosion.py" --arch metal
+                    --headless --frames 1 --size 64 --grid 16 --output
+                    "${VERNON_TEST_BINARY_ROOT}/metal_dynamic_terrain_erosion.png")
+            set_tests_properties(
+                vernon-metal-mandelbulb-showcase
+                vernon-metal-fractal-example
+                vernon-metal-pbr-example
+                vernon-metal-complete-pipeline-example
+                vernon-metal-dynamic-ocean-example
+                vernon-metal-dynamic-terrain-erosion-example
+                PROPERTIES ENVIRONMENT
+                           "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python"
+                           SKIP_REGULAR_EXPRESSION
+                           "Metal argument-buffer encoding is unavailable on this device")
+        endif()
     endif()
 
     if(VERNON_ENABLE_DIRECTX12_RUNTIME)
@@ -349,6 +431,12 @@ if(TARGET VernonDSLCompiler)
             ${CMAKE_COMMAND} "-DVERNON_OPT=$<TARGET_FILE:vernon-opt>"
             "-DINPUT=${VERNON_TEST_ROOT}/integration/gpu-atomic-exchange-to-spirv.mlir" -P
             "${VERNON_TEST_ROOT}/scripts/run_gpu_to_spirv_atomic_exchange_test.cmake")
+    add_test(
+        NAME vernon-to-gpu-tensor-view-1-to-n
+        COMMAND
+            ${CMAKE_COMMAND} "-DVERNON_OPT=$<TARGET_FILE:vernon-opt>"
+            "-DINPUT=${VERNON_TEST_ROOT}/integration/vernon-to-gpu-tensor-view-1-to-n.mlir" -P
+            "${VERNON_TEST_ROOT}/scripts/run_vernon_to_gpu_tensor_view_test.cmake")
 
     if(WIN32)
         add_test(NAME vernon-validation-integration

@@ -67,6 +67,16 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
             Attribute stageAttr = function->getAttr(kStageAttrName);
             Attribute workgroupAttr = function->getAttr(kWorkgroupSizeAttrName);
 
+            for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+                if (function.getArgAttr(index, kTensorDescriptorOwnerAttrName) ||
+                    function.getArgAttr(index, kTensorDescriptorComponentAttrName) ||
+                    function.getArgAttr(index, kTensorDescriptorDimensionAttrName)) {
+                    function.emitError() << "argument #" << index
+                                         << " contains internal TensorView descriptor metadata";
+                    invalid = true;
+                }
+            }
+
             if (entryAttr && !isa<UnitAttr>(entryAttr)) {
                 function.emitError() << "'" << kEntryAttrName << "' must be a unit attribute";
                 invalid = true;
@@ -189,34 +199,13 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
                     }
                 }
 
-                if (auto view = dyn_cast<TensorViewType>(type)) {
-                    auto shape = dictionary ? dictionary.getAs<DenseI64ArrayAttr>(kTensorShapeAttrName) : nullptr;
-                    auto strides = dictionary ? dictionary.getAs<DenseI64ArrayAttr>(kTensorStridesAttrName) : nullptr;
-                    auto offset = dictionary ? dictionary.getAs<IntegerAttr>(kTensorOffsetAttrName) : nullptr;
-                    if (shape || strides || offset) {
-                        bool malformed =
-                            !strides || !offset || strides.size() != view.getShape().size() || offset.getInt() < 0;
-                        if (shape) {
-                            malformed = malformed || shape.size() != view.getShape().size() ||
-                                        llvm::any_of(shape.asArrayRef(), [](int64_t extent) { return extent < 0; });
-                            if (!malformed) {
-                                for (auto [declared, specialized] :
-                                     llvm::zip_equal(view.getShape(), shape.asArrayRef())) {
-                                    if (declared >= 0 && declared != specialized) {
-                                        malformed = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if (malformed) {
-                            function.emitError() << (isResult ? "result #" : "argument #") << index
-                                                 << " has invalid TensorView layout; strides and offset must be paired "
-                                                    "and rank-matched, "
-                                                    "and any specialization shape must match static type extents";
-                            invalid = true;
-                        }
-                    }
+                if (isa<TensorViewType>(type) && dictionary &&
+                    (dictionary.get("vernon.tensor_shape") || dictionary.get("vernon.tensor_strides") ||
+                     dictionary.get("vernon.tensor_offset"))) {
+                    function.emitError() << (isResult ? "result #" : "argument #") << index
+                                         << " uses retired TensorView layout attributes; shape, strides, and offset "
+                                            "are supplied by the dispatch descriptor";
+                    invalid = true;
                 }
 
                 InterfaceAttrs attrs = parseInterfaceAttrs(dictionary);
@@ -407,29 +396,32 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
             if (!stage || stage.getValue() != "compute")
                 continue;
             uint64_t totalPhysical = 0;
-            for (Operation &operation : function.front()) {
-                auto allocation = dyn_cast<WorkgroupAllocOp>(operation);
-                if (!allocation)
-                    continue;
+            function.walk([&](WorkgroupAllocOp allocation) {
                 TensorViewType view = allocation.getResult().getType();
                 FailureOr<WorkgroupPhysicalStoragePlan> plan = getWorkgroupPhysicalStoragePlan(view, module);
                 if (failed(plan)) {
                     allocation.emitError("workgroup allocation has an invalid physical storage plan");
                     invalid = true;
-                    continue;
+                    return;
                 }
-                if (plan->totalPhysicalBytes > kPortableWorkgroupStorageLimit - totalPhysical) {
+                if (totalPhysical > kPortableWorkgroupStorageLimit ||
+                    plan->totalPhysicalBytes > kPortableWorkgroupStorageLimit - totalPhysical) {
                     allocation.emitError(
                         "combined workgroup storage exceeds the portable 16 KiB workgroup storage limit");
                     invalid = true;
+                    return;
                 }
                 totalPhysical += plan->totalPhysicalBytes;
-            }
+            });
         }
 
         getOperation().walk([&](Operation *operation) {
-            if (operation->hasAttr(kPhysicalIndexAttrName)) {
-                operation->emitError("'physical_index' is reserved for internal lowering and is invalid in source IR");
+            if (operation->hasAttr("physical_index")) {
+                operation->emitError("retired 'physical_index' attribute is not part of the Vernon IR contract");
+                invalid = true;
+            }
+            if (isa<PhysicalLoadOp, PhysicalStoreOp, PhysicalAtomicOp>(operation)) {
+                operation->emitError("physical TensorView operations are reserved for internal lowering");
                 invalid = true;
             }
             bool workgroupStorage = isa<WorkgroupAllocOp>(operation);

@@ -2,10 +2,13 @@
 #include "rhi_test_hooks.h"
 
 #include <array>
+#include <string>
+#include <utility>
 
 namespace {
 
 VernonRhiDevice invalidDevice() { return {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0}; }
+thread_local std::string creationError;
 
 auto backends() {
     return std::array{
@@ -18,6 +21,9 @@ auto backends() {
 #endif
 #if defined(VERNON_HAS_DIRECTX12_RHI)
         &vernon::rhi::directX12BackendDispatch(),
+#endif
+#if defined(VERNON_HAS_METAL_RHI)
+        &vernon::rhi::metalBackendDispatch(),
 #endif
     };
 }
@@ -42,13 +48,22 @@ const vernon::rhi::BackendDispatch *dispatch(VernonRhiBackend backend) {
 } // namespace
 
 VernonRhiDevice vernon::rhi::createDevice(const VernonRhiOwnedDeviceDescriptor *descriptor) {
+    creationError.clear();
     if (!descriptor || descriptor->struct_size < sizeof(*descriptor) ||
         (descriptor->flags & ~static_cast<uint32_t>(VERNON_RHI_OWNED_DEVICE_FORCE_SOFTWARE)) ||
         (descriptor->backend != VERNON_RHI_BACKEND_DIRECTX12 && descriptor->flags))
         return invalidDevice();
     const BackendDispatch *backend = dispatch(descriptor->backend);
-    return backend ? backend->createOwnedDevice(descriptor) : invalidDevice();
+    if (!backend) {
+        setDeviceCreationError("requested RHI backend is unavailable in this build");
+        return invalidDevice();
+    }
+    return backend->createOwnedDevice(descriptor);
 }
+
+void vernon::rhi::setDeviceCreationError(std::string error) { creationError = std::move(error); }
+
+VernonStringView vernon::rhi::deviceCreationError() { return {creationError.data(), creationError.size()}; }
 
 void vernon::rhi::destroyDevice(VernonRhiDevice device) {
     if (deviceHasActiveCommandEncoder(device))
@@ -123,6 +138,21 @@ extern "C" VernonRhiStatus vernonRhiDeviceGetBufferNativeHandle(VernonRhiDevice 
 extern "C" VernonRhiStatus
 vernonRhiDeviceCreateImage(VernonRhiDevice device, const VernonRhiImageDescriptor *descriptor, VernonRhiImage *output) {
     VERNON_DISPATCH_STATUS(device, createImage, descriptor, output);
+}
+
+extern "C" VernonRhiStatus vernonRhiDeviceCreateImageView(VernonRhiDevice device,
+                                                          const VernonRhiImageViewDescriptor *descriptor,
+                                                          VernonRhiImageView *output) {
+    VERNON_DISPATCH_STATUS(device, createImageView, descriptor, output);
+}
+
+extern "C" VernonRhiStatus vernonRhiDeviceDestroyImageView(VernonRhiDevice device, VernonRhiImageView imageView) {
+    VERNON_DISPATCH_STATUS(device, destroyImageView, imageView);
+}
+
+extern "C" VernonRhiStatus vernonRhiDeviceGetImageViewNativeHandle(VernonRhiDevice device, VernonRhiImageView imageView,
+                                                                   uint64_t *output) {
+    VERNON_DISPATCH_STATUS(device, getImageViewNativeHandle, imageView, output);
 }
 
 extern "C" VernonRhiStatus vernonRhiDeviceSetImageSampler(VernonRhiDevice device, VernonRhiImage image,
@@ -234,37 +264,55 @@ void vernon::rhi::abandonCommandRecording(VernonRhiDevice device, uint64_t nativ
             backend->abandonCommands(device, native);
 }
 
-bool vernon::rhi::recordBarriers(VernonRhiDevice device, uint64_t encoderKey, uint64_t native,
-                                 const VernonRhiBarrier *barriers, size_t barrierCount) {
+VernonRhiStatus vernon::rhi::recordBarriers(VernonRhiDevice device, uint64_t encoderKey, uint64_t native,
+                                            const VernonRhiBarrier *barriers, size_t barrierCount) {
     const BackendDispatch *backend = dispatch(device);
-    return backend && backend->recordBarriers &&
-           backend->recordBarriers(device, encoderKey, native, barriers, barrierCount);
+    if (!backend)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!backend->recordBarriers)
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    return backend->recordBarriers(device, encoderKey, native, barriers, barrierCount)
+               ? VERNON_RHI_STATUS_OK
+               : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
 bool vernon::rhi::endCommandRendering(VernonRhiDevice device, uint64_t native, VernonRhiBackend backendKind,
                                       uint32_t renderingKind, uint32_t colorDiscardMask, uint32_t depthStencilDiscard,
-                                      const uint64_t *colorResources, size_t colorCount, uint64_t depthResource) {
+                                      const uint64_t *colorResources, size_t colorCount, uint64_t depthResource,
+                                      uint64_t renderingObject) {
     const BackendDispatch *backend = dispatch(device);
     return backend && backend->endRendering &&
            backend->endRendering(device, native, backendKind, renderingKind, colorDiscardMask, depthStencilDiscard,
-                                 colorResources, colorCount, depthResource);
+                                 colorResources, colorCount, depthResource, renderingObject);
 }
 
-bool vernon::rhi::clearCommandColor(VernonRhiDevice device, uint64_t native, VernonRhiBackend backendKind,
-                                    uint32_t renderingKind, int32_t x, int32_t y, uint32_t width, uint32_t height,
-                                    uint32_t layers, uint64_t target, uint32_t location, const float color[4]) {
+VernonRhiStatus vernon::rhi::clearCommandColor(VernonRhiDevice device, uint64_t native, VernonRhiBackend backendKind,
+                                               uint32_t renderingKind, int32_t x, int32_t y, uint32_t width,
+                                               uint32_t height, uint32_t layers, uint64_t target, uint32_t location,
+                                               const float color[4]) {
     const BackendDispatch *backend = dispatch(device);
-    return backend && backend->clearColor &&
-           backend->clearColor(device, native, backendKind, renderingKind, x, y, width, height, layers, target,
-                               location, color);
+    if (!backend)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!backend->clearColor)
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    return backend->clearColor(device, native, backendKind, renderingKind, x, y, width, height, layers, target,
+                               location, color)
+               ? VERNON_RHI_STATUS_OK
+               : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
-bool vernon::rhi::clearCommandDepthStencil(VernonRhiDevice device, uint64_t native, VernonRhiBackend backendKind,
-                                           uint32_t renderingKind, int32_t x, int32_t y, uint32_t width,
-                                           uint32_t height, uint32_t layers, uint64_t target, float depth,
-                                           uint32_t stencil, uint32_t aspects) {
+VernonRhiStatus vernon::rhi::clearCommandDepthStencil(VernonRhiDevice device, uint64_t native,
+                                                      VernonRhiBackend backendKind, uint32_t renderingKind, int32_t x,
+                                                      int32_t y, uint32_t width, uint32_t height, uint32_t layers,
+                                                      uint64_t target, float depth, uint32_t stencil,
+                                                      uint32_t aspects) {
     const BackendDispatch *backend = dispatch(device);
-    return backend && backend->clearDepthStencil &&
-           backend->clearDepthStencil(device, native, backendKind, renderingKind, x, y, width, height, layers, target,
-                                      depth, stencil, aspects);
+    if (!backend)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!backend->clearDepthStencil)
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    return backend->clearDepthStencil(device, native, backendKind, renderingKind, x, y, width, height, layers, target,
+                                      depth, stencil, aspects)
+               ? VERNON_RHI_STATUS_OK
+               : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }

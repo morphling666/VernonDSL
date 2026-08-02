@@ -41,6 +41,57 @@ VernonStatus fail(VernonRuntimeContext *context, std::string error,
     return status;
 }
 
+std::string pipelineTargetKind(const nlohmann::json &root) {
+    if (!root.contains("target") || !root["target"].is_object())
+        return {};
+    const nlohmann::json &target = root["target"];
+    if (!target.contains("kind") || !target["kind"].is_string() || !target.contains("options") ||
+        !target["options"].is_object() || target.size() != 2)
+        return {};
+    const std::string kind = target["kind"].get<std::string>();
+    const nlohmann::json &options = target["options"];
+    auto hasOnly = [&](std::initializer_list<std::string_view> allowed) {
+        for (const auto &[key, value] : options.items())
+            if (std::find(allowed.begin(), allowed.end(), key) == allowed.end())
+                return false;
+        return true;
+    };
+    if (kind == "cpu") {
+        if (!hasOnly({"triple", "processor", "features"}) || !options.contains("triple") ||
+            !options["triple"].is_string() || options["triple"].get_ref<const std::string &>().empty())
+            return {};
+        if (options.contains("processor") && !options["processor"].is_string())
+            return {};
+        if (options.contains("features") &&
+            (!options["features"].is_array() ||
+             !std::all_of(options["features"].begin(), options["features"].end(), [](const nlohmann::json &feature) {
+                 return feature.is_string() && !feature.get_ref<const std::string &>().empty();
+             })))
+            return {};
+    } else if (kind == "opengl" || kind == "opengles") {
+        if (!hasOnly({"version"}))
+            return {};
+        if (options.contains("version") &&
+            (!options["version"].is_number_unsigned() || options["version"].get<uint64_t>() < 100 ||
+             options["version"].get<uint64_t>() > 999))
+            return {};
+    } else if (kind == "metal") {
+        if (!hasOnly({"platform"}) || !options.contains("platform") || !options["platform"].is_string() ||
+            (options["platform"] != "macos" && options["platform"] != "ios"))
+            return {};
+    } else if (kind == "directx") {
+        if (!hasOnly({"shader_model"}) || !options.contains("shader_model") ||
+            !options["shader_model"].is_number_unsigned() || options["shader_model"].get<uint64_t>() < 60)
+            return {};
+    } else if (kind == "vulkan" || kind == "cuda") {
+        if (!options.empty())
+            return {};
+    } else {
+        return {};
+    }
+    return kind;
+}
+
 } // namespace
 
 extern "C" {
@@ -80,7 +131,7 @@ VernonRuntimeCapabilities vernonRuntimeGetCapabilities(VernonRuntimeBackend back
         result.supports_compute = 1;
         result.supports_storage_buffers = 1;
     } else if ((backend == VERNON_RUNTIME_CUDA || backend == VERNON_RUNTIME_VULKAN ||
-                backend == VERNON_RUNTIME_DIRECTX12) &&
+                backend == VERNON_RUNTIME_DIRECTX12 || backend == VERNON_RUNTIME_METAL) &&
                result.available) {
         result.supports_compute = result.available;
         result.supports_storage_buffers = result.available;
@@ -192,7 +243,9 @@ VernonStatus vernonRuntimePipelineBundleInspectTarget(const void *bundleData, si
         std::string manifestError;
         if (!pipelineSchema || !validateManifestHash(root, true, manifestError))
             return VERNON_STATUS_PARSE_ERROR;
-        const std::string name = root.value("target", "");
+        const std::string name = pipelineTargetKind(root);
+        if (name.empty())
+            return VERNON_STATUS_PARSE_ERROR;
         if (name == "cpu")
             *target = VERNON_RUNTIME_CPU;
         else if (name == "cuda")
@@ -205,6 +258,8 @@ VernonStatus vernonRuntimePipelineBundleInspectTarget(const void *bundleData, si
             *target = VERNON_RUNTIME_OPENGL_ES;
         else if (name == "directx")
             *target = VERNON_RUNTIME_DIRECTX12;
+        else if (name == "metal")
+            *target = VERNON_RUNTIME_METAL;
         else
             return VERNON_STATUS_UNSUPPORTED_TARGET;
         return VERNON_STATUS_OK;
@@ -219,7 +274,8 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
     if (!context ||
         (context->backend != VERNON_RUNTIME_CPU && context->backend != VERNON_RUNTIME_OPENGL &&
          context->backend != VERNON_RUNTIME_OPENGL_ES && context->backend != VERNON_RUNTIME_VULKAN &&
-         context->backend != VERNON_RUNTIME_CUDA && context->backend != VERNON_RUNTIME_DIRECTX12) ||
+         context->backend != VERNON_RUNTIME_CUDA && context->backend != VERNON_RUNTIME_DIRECTX12 &&
+         context->backend != VERNON_RUNTIME_METAL) ||
         !bundleData || !bundleSize || (options && options->struct_size < sizeof(VernonPipelineBundleLoadOptions)))
         return nullptr;
     try {
@@ -228,15 +284,16 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
             bundleDirectory = std::filesystem::u8path(options->bundle_directory);
         const nlohmann::json root = nlohmann::json::parse(static_cast<const char *>(bundleData),
                                                           static_cast<const char *>(bundleData) + bundleSize);
-        const char *expectedTarget = context->backend == VERNON_RUNTIME_CPU      ? "cpu"
-                                     : context->backend == VERNON_RUNTIME_CUDA   ? "cuda"
-                                     : context->backend == VERNON_RUNTIME_VULKAN ? "vulkan"
-                                     : context->backend == VERNON_RUNTIME_DIRECTX12
-                                         ? "directx"
+        const char *expectedTarget = context->backend == VERNON_RUNTIME_CPU         ? "cpu"
+                                     : context->backend == VERNON_RUNTIME_CUDA      ? "cuda"
+                                     : context->backend == VERNON_RUNTIME_VULKAN    ? "vulkan"
+                                     : context->backend == VERNON_RUNTIME_DIRECTX12 ? "directx"
+                                     : context->backend == VERNON_RUNTIME_METAL
+                                         ? "metal"
                                          : (context->backend == VERNON_RUNTIME_OPENGL_ES ? "opengles" : "opengl");
         const bool pipelineSchema = root.is_object() && root.value("pipeline_version", 0) == VERNON_PIPELINE_VERSION &&
                                     root.value("type", "") == "pipeline";
-        if (!pipelineSchema || root.value("target", "") != expectedTarget || !root.contains("stage_artifacts") ||
+        if (!pipelineSchema || pipelineTargetKind(root) != expectedTarget || !root.contains("stage_artifacts") ||
             !root["stage_artifacts"].is_object() || !root.contains("variants") || !root["variants"].is_array()) {
             fail(context, "unsupported or invalid pipeline bundle");
             return nullptr;
@@ -292,6 +349,7 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
             const char *expectedFormat = context->backend == VERNON_RUNTIME_CUDA        ? "ptx"
                                          : context->backend == VERNON_RUNTIME_VULKAN    ? "spirv"
                                          : context->backend == VERNON_RUNTIME_DIRECTX12 ? "dxil"
+                                         : context->backend == VERNON_RUNTIME_METAL     ? "msl"
                                          : context->backend == VERNON_RUNTIME_OPENGL_ES ? "gles"
                                                                                         : "glsl";
             const std::string encoding = value["artifact"].value("encoding", "");
@@ -345,8 +403,9 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                 context->backend == VERNON_RUNTIME_CPU ? stage.cpuArtifact.has_value()
                 : (context->backend == VERNON_RUNTIME_VULKAN || context->backend == VERNON_RUNTIME_DIRECTX12)
                     ? !stage.binary.empty() && stage.binary.size() % sizeof(uint32_t) == 0 && !stage.reflection.empty()
-                : context->backend == VERNON_RUNTIME_CUDA ? !stage.source.empty() && !stage.reflection.empty()
-                                                          : !stage.source.empty();
+                : (context->backend == VERNON_RUNTIME_CUDA || context->backend == VERNON_RUNTIME_METAL)
+                    ? !stage.source.empty() && !stage.reflection.empty()
+                    : !stage.source.empty();
             if (stage.stage.empty() || stage.entry.empty() || !hasArtifact) {
                 fail(context, "pipeline stage artifact is invalid");
                 return nullptr;
@@ -659,8 +718,13 @@ VernonStatus vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline, const V
         vernonRhiCommandEncoderFinish(pipeline->context->rhiDevice, native) != VERNON_RHI_STATUS_OK)
         status = fail(pipeline->context, "failed to finish the immediate command encoder");
     if (status == VERNON_STATUS_OK &&
-        vernonRhiDeviceSubmit(pipeline->context->rhiDevice, native) != VERNON_RHI_STATUS_OK)
-        status = fail(pipeline->context, "failed to submit the immediate command encoder");
+        vernonRhiDeviceSubmit(pipeline->context->rhiDevice, native) != VERNON_RHI_STATUS_OK) {
+        const VernonStringView detail = vernonRhiDeviceGetLastError(pipeline->context->rhiDevice);
+        std::string error = "failed to submit the immediate command encoder";
+        if (detail.data && detail.size)
+            error.append(": ").append(detail.data, detail.size);
+        status = fail(pipeline->context, std::move(error));
+    }
     vernonRhiDeviceDestroyCommandEncoder(pipeline->context->rhiDevice, native);
     return status;
 }

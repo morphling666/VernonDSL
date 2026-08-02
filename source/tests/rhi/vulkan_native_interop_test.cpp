@@ -1,10 +1,13 @@
 #include "VernonRHI.h"
 #include "rhi/rhi_internal.h"
 #include "rhi/vulkan_backend.h"
+#include "vernon_test_support.h"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -17,6 +20,12 @@ template <typename Handle> uint64_t handleBits(Handle handle) {
         return static_cast<uint64_t>(handle);
 }
 
+bool hasExtension(const std::vector<VkExtensionProperties> &extensions, std::string_view name) {
+    return std::any_of(extensions.begin(), extensions.end(), [name](const VkExtensionProperties &extension) {
+        return std::string_view(extension.extensionName) == name;
+    });
+}
+
 TEST(VulkanDeviceSelection, RanksHighPerformanceHardwareFirst) {
     EXPECT_LT(vernon::rhi::vulkan::physicalDeviceTypeRank(VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU),
               vernon::rhi::vulkan::physicalDeviceTypeRank(VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU));
@@ -24,6 +33,16 @@ TEST(VulkanDeviceSelection, RanksHighPerformanceHardwareFirst) {
               vernon::rhi::vulkan::physicalDeviceTypeRank(VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU));
     EXPECT_LT(vernon::rhi::vulkan::physicalDeviceTypeRank(VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU),
               vernon::rhi::vulkan::physicalDeviceTypeRank(VK_PHYSICAL_DEVICE_TYPE_CPU));
+}
+
+TEST(VulkanImageAspect, DistinguishesColorDepthAndPackedDepthStencilFormats) {
+    EXPECT_EQ(vernon::rhi::vulkan::imageAspectMask(VK_FORMAT_R8G8B8A8_UNORM), VK_IMAGE_ASPECT_COLOR_BIT);
+    EXPECT_EQ(vernon::rhi::vulkan::imageAspectMask(VK_FORMAT_D32_SFLOAT), VK_IMAGE_ASPECT_DEPTH_BIT);
+    EXPECT_EQ(vernon::rhi::vulkan::imageAspectMask(VK_FORMAT_D32_SFLOAT_S8_UINT),
+              VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+    EXPECT_EQ(vernon::rhi::vulkan::imagePrimaryCopyAspectMask(VK_FORMAT_R8G8B8A8_UNORM), VK_IMAGE_ASPECT_COLOR_BIT);
+    EXPECT_EQ(vernon::rhi::vulkan::imagePrimaryCopyAspectMask(VK_FORMAT_D32_SFLOAT), VK_IMAGE_ASPECT_DEPTH_BIT);
+    EXPECT_EQ(vernon::rhi::vulkan::imagePrimaryCopyAspectMask(VK_FORMAT_D32_SFLOAT_S8_UINT), VK_IMAGE_ASPECT_DEPTH_BIT);
 }
 
 TEST(VulkanMemorySelection, PrefersCachedCoherentReadbackMemoryAndFallsBack) {
@@ -39,6 +58,105 @@ TEST(VulkanMemorySelection, PrefersCachedCoherentReadbackMemoryAndFallsBack) {
     EXPECT_EQ(state.findMemoryType(0b11, required, VK_MEMORY_PROPERTY_HOST_CACHED_BIT), 1u);
     EXPECT_EQ(state.findMemoryType(0b01, required, VK_MEMORY_PROPERTY_HOST_CACHED_BIT), 0u);
     EXPECT_FALSE(state.findMemoryType(0b00, required, VK_MEMORY_PROPERTY_HOST_CACHED_BIT).has_value());
+}
+
+TEST(VulkanOwnedDevice, CreatesDeviceAndNegotiatesPortabilityWhenAdvertised) {
+    auto &driver = vernon::rhi::vulkan::driver();
+    if (!driver.load())
+        GTEST_SKIP() << driver.error;
+
+    std::string error;
+    vernon::rhi::vulkan::DeviceState state;
+    ASSERT_TRUE(state.initialize(0, error)) << error;
+
+    uint32_t instanceExtensionCount = 0;
+    ASSERT_EQ(driver.enumerateInstanceExtensionProperties(nullptr, &instanceExtensionCount, nullptr), VK_SUCCESS);
+    std::vector<VkExtensionProperties> instanceExtensions(instanceExtensionCount);
+    ASSERT_EQ(driver.enumerateInstanceExtensionProperties(
+                  nullptr, &instanceExtensionCount, instanceExtensions.empty() ? nullptr : instanceExtensions.data()),
+              VK_SUCCESS);
+    EXPECT_EQ(state.portabilityEnumeration, hasExtension(instanceExtensions, "VK_KHR_portability_enumeration"));
+
+    uint32_t deviceExtensionCount = 0;
+    ASSERT_EQ(driver.enumerateDeviceExtensionProperties(state.physicalDevice, nullptr, &deviceExtensionCount, nullptr),
+              VK_SUCCESS);
+    std::vector<VkExtensionProperties> deviceExtensions(deviceExtensionCount);
+    ASSERT_EQ(driver.enumerateDeviceExtensionProperties(state.physicalDevice, nullptr, &deviceExtensionCount,
+                                                        deviceExtensions.empty() ? nullptr : deviceExtensions.data()),
+              VK_SUCCESS);
+    EXPECT_EQ(state.portabilitySubset, hasExtension(deviceExtensions, "VK_KHR_portability_subset"));
+}
+
+TEST(VulkanOwnedDevice, DownloadsDepthOnlyImageThroughDepthAspect) {
+    VernonRhiOwnedDeviceDescriptor deviceDescriptor{};
+    deviceDescriptor.struct_size = sizeof(deviceDescriptor);
+    deviceDescriptor.backend = VERNON_RHI_BACKEND_VULKAN;
+    VernonRhiDevice device = vernonRhiCreateDevice(&deviceDescriptor);
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        GTEST_SKIP() << "Vulkan device is unavailable";
+
+    VernonRhiImageDescriptor imageDescriptor{};
+    imageDescriptor.struct_size = sizeof(imageDescriptor);
+    imageDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    imageDescriptor.format = VERNON_RHI_FORMAT_D32_FLOAT;
+    imageDescriptor.width = 1;
+    imageDescriptor.height = 1;
+    imageDescriptor.depth = 1;
+    imageDescriptor.mip_levels = 1;
+    imageDescriptor.array_layers = 1;
+    imageDescriptor.sample_count = 1;
+    imageDescriptor.usage = VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE;
+    VernonRhiImage image{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &image), VERNON_RHI_STATUS_OK);
+    float depth{};
+    EXPECT_EQ(vernonRhiDeviceDownloadImage(device, image, &depth, sizeof(depth)), VERNON_RHI_STATUS_OK)
+        << vernon::test::text(vernonRhiDeviceGetLastError(device));
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
+}
+
+TEST(VulkanOwnedDevice, TransitionsPackedDepthStencilImageWithBothAspects) {
+    VernonRhiOwnedDeviceDescriptor deviceDescriptor{};
+    deviceDescriptor.struct_size = sizeof(deviceDescriptor);
+    deviceDescriptor.backend = VERNON_RHI_BACKEND_VULKAN;
+    VernonRhiDevice device = vernonRhiCreateDevice(&deviceDescriptor);
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        GTEST_SKIP() << "Vulkan device is unavailable";
+
+    VernonRhiImageDescriptor imageDescriptor{};
+    imageDescriptor.struct_size = sizeof(imageDescriptor);
+    imageDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    imageDescriptor.format = VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT;
+    imageDescriptor.width = 1;
+    imageDescriptor.height = 1;
+    imageDescriptor.depth = 1;
+    imageDescriptor.mip_levels = 1;
+    imageDescriptor.array_layers = 1;
+    imageDescriptor.sample_count = 1;
+    imageDescriptor.usage = VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE;
+    VernonRhiImage image{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &image), VERNON_RHI_STATUS_OK);
+
+    VernonRhiCommandEncoderDescriptor encoderDescriptor{};
+    encoderDescriptor.struct_size = sizeof(encoderDescriptor);
+    encoderDescriptor.required_capabilities = VERNON_RHI_QUEUE_GRAPHICS;
+    VernonRhiCommandEncoder encoder{};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
+    VernonRhiBarrier barrier{};
+    barrier.struct_size = sizeof(barrier);
+    barrier.source_stage_mask = VERNON_RHI_STAGE_FRAGMENT;
+    barrier.destination_stage_mask = VERNON_RHI_STAGE_FRAGMENT;
+    barrier.destination_access = VERNON_RHI_ACCESS_DEPTH_STENCIL_WRITE;
+    barrier.old_state = VERNON_RHI_STATE_UNDEFINED;
+    barrier.new_state = VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT;
+    barrier.image = image;
+    barrier.is_image = 1;
+    EXPECT_EQ(vernonRhiCommandEncoderBarrier(device, encoder, &barrier, 1), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceSubmit(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
 }
 
 TEST(VulkanNativeInterop, BorrowsObjectsWithoutOwningTheirLifetime) {

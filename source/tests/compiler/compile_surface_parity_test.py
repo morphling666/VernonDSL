@@ -46,7 +46,7 @@ from pipeline_asset_fixture import (  # noqa: E402
     triangle_vertex,
 )
 from vernon_dsl._runtime.resources import _bind_native_argument  # noqa: E402
-from vernon_dsl.bundle import canonical_json  # noqa: E402
+from vernon_dsl.bundle import OpenGLTargetOptions, VulkanTargetOptions, canonical_json  # noqa: E402
 from vernon_dsl.compiler import compile_file  # noqa: E402
 from vernon_dsl.pipeline_asset_cli import main as pipeline_asset_main  # noqa: E402
 from vernon_dsl.pipeline_assets import cook_pipeline_asset  # noqa: E402
@@ -61,16 +61,37 @@ class _StringView(ctypes.Structure):
     _fields_ = [("data", ctypes.c_void_p), ("size", ctypes.c_size_t)]
 
 
-class _CompileOptions(ctypes.Structure):
+class _CpuOptions(ctypes.Structure):
     _fields_ = [
-        ("struct_size", ctypes.c_uint32),
-        ("glsl_version", ctypes.c_uint32),
-        ("hlsl_shader_model", ctypes.c_uint32),
-        ("reserved", ctypes.c_uint32 * 5),
-        ("cpu_target_triple", _StringView),
-        ("cpu_name", _StringView),
-        ("cpu_features", _StringView),
+        ("triple", _StringView),
+        ("processor", _StringView),
+        ("features", _StringView),
     ]
+
+
+class _OpenGLOptions(ctypes.Structure):
+    _fields_ = [("version", ctypes.c_uint32)]
+
+
+class _MetalOptions(ctypes.Structure):
+    _fields_ = [("platform", ctypes.c_uint32)]
+
+
+class _DirectXOptions(ctypes.Structure):
+    _fields_ = [("shader_model", ctypes.c_uint32)]
+
+
+class _TargetOptions(ctypes.Union):
+    _fields_ = [
+        ("cpu", _CpuOptions),
+        ("opengl", _OpenGLOptions),
+        ("metal", _MetalOptions),
+        ("directx", _DirectXOptions),
+    ]
+
+
+class _CompileOptions(ctypes.Structure):
+    _fields_ = [("struct_size", ctypes.c_uint32), ("target", ctypes.c_int), ("as_", _TargetOptions)]
 
 
 def _view_bytes(view: _StringView) -> bytes:
@@ -86,7 +107,6 @@ class _DirectCompiler:
             ctypes.c_void_p,
             ctypes.c_void_p,
             ctypes.c_size_t,
-            ctypes.c_int,
             ctypes.POINTER(_CompileOptions),
         ]
         self.library.vernonCompilerCompileMlirWithOptions.restype = ctypes.c_void_p
@@ -119,13 +139,15 @@ class _DirectCompiler:
         source_buffer = ctypes.create_string_buffer(source)
         options = _CompileOptions()
         options.struct_size = ctypes.sizeof(options)
-        options.glsl_version = glsl_version
-        options.hlsl_shader_model = hlsl_shader_model
+        options.target = target
+        if target in {1, 2}:
+            options.as_.opengl.version = glsl_version
+        elif target == 5:
+            options.as_.directx.shader_model = hlsl_shader_model
         result = self.library.vernonCompilerCompileMlirWithOptions(
             self.context,
             ctypes.cast(source_buffer, ctypes.c_void_p),
             len(source),
-            target,
             ctypes.byref(options),
         )
         if not result:
@@ -195,6 +217,8 @@ class CompileSurfaceParityTests(unittest.TestCase):
             ("directx", native.Target.DIRECTX, 5, 0, 60),
         )
         for target_name, native_target, c_target, glsl_version, hlsl_shader_model in cases:
+            if target_name == "directx" and not native.target_available(native_target):
+                continue
             for entry in ("triangle_vertex", "solid_fragment"):
                 with self.subTest(target=target_name, entry=entry):
                     mlir = compile_file(FIXTURE, features=("OFFSET",), entry=entry)
@@ -204,8 +228,13 @@ class CompileSurfaceParityTests(unittest.TestCase):
                     program = native.Compiler().compile_program_result(
                         mlir,
                         native_target,
-                        glsl_version=glsl_version,
-                        hlsl_shader_model=hlsl_shader_model,
+                        (
+                            {"version": glsl_version}
+                            if glsl_version
+                            else {"shader_model": hlsl_shader_model}
+                            if hlsl_shader_model
+                            else {}
+                        ),
                     )
                     self.assertTrue(program.ok, program.diagnostics)
                     owning_reflection = json.loads(program.reflection)
@@ -227,9 +256,9 @@ class CompileSurfaceParityTests(unittest.TestCase):
                             str(reflection_path),
                         ]
                         if glsl_version:
-                            command.extend(["--glsl-version", str(glsl_version)])
+                            command.extend(["--opengl-version", str(glsl_version)])
                         if hlsl_shader_model:
-                            command.extend(["--hlsl-shader-model", str(hlsl_shader_model)])
+                            command.extend(["--directx-shader-model", str(hlsl_shader_model)])
                         (output / "fixture.mlir").write_text(mlir, encoding="utf-8")
                         completed = subprocess.run(command, capture_output=True, text=True, check=False)
                         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -241,14 +270,14 @@ class CompileSurfaceParityTests(unittest.TestCase):
                     self.assertEqual(cli_artifacts, direct_artifacts)
                     self.assertEqual(owning_reflection["compiler_contract_version"], COMPILER_CONTRACT_VERSION)
                     self.assertEqual(owning_reflection["pipeline_version"], PIPELINE_VERSION)
-                    self.assertEqual(owning_reflection["target"], target_name)
+                    self.assertEqual(owning_reflection["target"]["kind"], target_name)
                     if glsl_version:
-                        self.assertEqual(owning_reflection["target_options"]["glsl_version"], glsl_version)
+                        self.assertEqual(owning_reflection["target"]["options"]["version"], glsl_version)
                     else:
-                        self.assertNotIn("glsl_version", owning_reflection["target_options"])
+                        self.assertNotIn("version", owning_reflection["target"]["options"])
                     if hlsl_shader_model:
                         self.assertEqual(
-                            owning_reflection["target_options"]["hlsl_shader_model"],
+                            owning_reflection["target"]["options"]["shader_model"],
                             hlsl_shader_model,
                         )
                     self.assertTrue(owning_reflection["module_hash"])
@@ -315,7 +344,7 @@ class CompileSurfaceParityTests(unittest.TestCase):
                 )
                 cooked_dir = root / "cooked"
                 cli_dir = root / "cli"
-                target_options = {"glsl_version": 330} if target_name == "opengl" else {}
+                target_options = {"version": 330} if target_name == "opengl" else {}
                 cli_arguments = [
                     f"{FIXTURE}:triangle_asset",
                     "--target",
@@ -324,7 +353,7 @@ class CompileSurfaceParityTests(unittest.TestCase):
                     str(cli_dir),
                 ]
                 if target_name == "opengl":
-                    cli_arguments.extend(["--glsl-version", "330"])
+                    cli_arguments.extend(["--opengl-version", "330"])
                 with (
                     mock.patch.object(shader_assets_module, "_native_module", return_value=proxy),
                     mock.patch("subprocess.run", side_effect=AssertionError("offline cooking spawned a subprocess")),
@@ -332,8 +361,7 @@ class CompileSurfaceParityTests(unittest.TestCase):
                     manifest_path = cook_pipeline_asset(
                         pipeline_asset=f"{FIXTURE}:triangle_asset",
                         output=cooked_dir,
-                        target=target_name,
-                        target_options=target_options,
+                        target=(OpenGLTargetOptions(version=330) if target_name == "opengl" else VulkanTargetOptions()),
                     )
                     cli_status = pipeline_asset_main(cli_arguments)
                 self.assertEqual(cli_status, 0)
@@ -343,11 +371,10 @@ class CompileSurfaceParityTests(unittest.TestCase):
                 cooked = json.loads(manifest_path.read_text(encoding="utf-8"))
                 cli_cooked = json.loads((cli_dir / "cli.pipeline.json").read_text(encoding="utf-8"))
                 self.assertEqual(cooked, cli_cooked)
-                self.assertEqual(cooked["target"], target_name)
+                self.assertEqual(cooked["target"], {"kind": target_name, "options": target_options})
                 self.assertNotIn("targets", cooked)
                 self.assertEqual([variant["key"] for variant in cooked["variants"]], GOLDEN["graphics"]["variants"])
                 self.assertEqual(cooked["features"], GOLDEN["graphics"]["features"])
-                self.assertEqual(cooked["target_options"], target_options)
                 selected = next(variant for variant in cooked["variants"] if variant["key"] == ["OFFSET"])
                 interactive_variant = interactive["variants"][0]
                 self.assertEqual(interactive_variant["key"], ["OFFSET"])
@@ -385,7 +412,8 @@ class CompileSurfaceParityTests(unittest.TestCase):
         program = native.Compiler().compile_program_result(frontend.mlir, native.Target.CPU)
         self.assertTrue(program.ok, program.diagnostics)
         reflection = json.loads(program.reflection)
-        self.assertEqual(reflection["target"], "cpu")
+        self.assertEqual(reflection["target"]["kind"], "cpu")
+        self.assertTrue(reflection["target"]["options"]["triple"])
         self.assertTrue(program.has_cpu_entry("scale"))
 
         vd.init(arch=vd.cpu)

@@ -54,7 +54,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Render the VernonDSL Julia set")
     parser.add_argument(
         "--arch",
-        choices=("cpu", "cuda", "vulkan", "directx", "opengl", "opengles"),
+        "--architecture",
+        dest="arch",
+        choices=("cpu", "cuda", "vulkan", "directx", "opengl", "opengles", "metal"),
         default="cuda",
         help=("execution backend; OpenGL profiles require a host context; DirectX requires Windows"),
     )
@@ -89,6 +91,7 @@ def main() -> None:
         "directx": vd.directx,
         "opengl": vd.opengl,
         "opengles": vd.opengles,
+        "metal": vd.metal,
     }
     vd.init(arch=architectures[arguments.arch])
     pixels = vd.storage.zeros(dtype=vd.f32, shape=(HEIGHT, WIDTH))

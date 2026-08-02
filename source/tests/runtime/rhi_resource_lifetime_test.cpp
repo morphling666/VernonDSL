@@ -12,6 +12,39 @@ struct BackendCase {
 
 class RhiResourceLifetime : public testing::TestWithParam<BackendCase> {};
 
+TEST_P(RhiResourceLifetime, UnsupportedResourceKindsAreRejected) {
+    const BackendCase test = GetParam();
+    if (test.supportsImages)
+        GTEST_SKIP() << test.name << " exposes images and samplers";
+
+    VernonRhiOwnedDeviceDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.backend = test.backend;
+    const VernonRhiDevice device = vernonRhiCreateDevice(&descriptor);
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        GTEST_SKIP() << test.name << " is unavailable";
+
+    VernonRhiImageDescriptor imageDescriptor{};
+    imageDescriptor.struct_size = sizeof(imageDescriptor);
+    imageDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    imageDescriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    imageDescriptor.width = 1;
+    imageDescriptor.height = 1;
+    imageDescriptor.depth = 1;
+    imageDescriptor.mip_levels = 1;
+    imageDescriptor.array_layers = 1;
+    imageDescriptor.sample_count = 1;
+    imageDescriptor.usage = VERNON_RHI_IMAGE_SAMPLED;
+    VernonRhiImage image{};
+    EXPECT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &image), VERNON_RHI_STATUS_UNSUPPORTED);
+
+    VernonRhiSamplerDescriptor samplerDescriptor{};
+    samplerDescriptor.struct_size = sizeof(samplerDescriptor);
+    VernonRhiSampler sampler{};
+    EXPECT_EQ(vernonRhiDeviceCreateSampler(device, &samplerDescriptor, &sampler), VERNON_RHI_STATUS_UNSUPPORTED);
+    vernonRhiDestroyDevice(device);
+}
+
 TEST_P(RhiResourceLifetime, RetainedBufferDelaysSlotReuse) {
     const BackendCase test = GetParam();
     VernonRhiOwnedDeviceDescriptor descriptor{};
@@ -126,7 +159,8 @@ TEST_P(RhiResourceLifetime, RetainedImageAndSamplerDelaySlotReuse) {
 INSTANTIATE_TEST_SUITE_P(GpuBackends, RhiResourceLifetime,
                          testing::Values(BackendCase{VERNON_RHI_BACKEND_CUDA, "CUDA", false},
                                          BackendCase{VERNON_RHI_BACKEND_VULKAN, "Vulkan", true},
-                                         BackendCase{VERNON_RHI_BACKEND_DIRECTX12, "DirectX12", true}),
+                                         BackendCase{VERNON_RHI_BACKEND_DIRECTX12, "DirectX12", true},
+                                         BackendCase{VERNON_RHI_BACKEND_METAL, "Metal", true}),
                          [](const testing::TestParamInfo<BackendCase> &info) { return info.param.name; });
 
 } // namespace

@@ -58,8 +58,33 @@ function(vernon_add_runtime)
             PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/vulkan_backend.cpp
                     ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/vulkan_driver.cpp
                     ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/rhi_vulkan.cpp)
-        target_compile_definitions(VernonRHI PRIVATE VERNON_HAS_VULKAN_RHI=1 VK_NO_PROTOTYPES=1)
+        target_compile_definitions(VernonRHI PRIVATE VERNON_HAS_VULKAN_RHI=1 VK_ENABLE_BETA_EXTENSIONS=1
+                                                     VK_NO_PROTOTYPES=1)
         target_link_libraries(VernonRHI PRIVATE $<BUILD_INTERFACE:Vulkan::Headers>)
+    endif()
+    if(VERNON_ENABLE_METAL_RUNTIME)
+        if(NOT APPLE
+           AND NOT
+               CMAKE_SYSTEM_NAME
+               STREQUAL
+               "iOS")
+            message(FATAL_ERROR "VERNON_ENABLE_METAL_RUNTIME is supported only on Apple platforms")
+        endif()
+        if(CMAKE_SYSTEM_NAME STREQUAL "iOS"
+           AND NOT
+               VERNON_RUNTIME_LIBRARY_TYPE
+               STREQUAL
+               "STATIC")
+            message(FATAL_ERROR "The Metal Runtime must be static on iOS")
+        endif()
+        target_sources(VernonRHI PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/metal_backend.mm
+                                         ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/rhi_metal.mm)
+        set_target_properties(VernonRHI PROPERTIES OBJCXX_STANDARD 17 OBJCXX_STANDARD_REQUIRED ON)
+        target_compile_definitions(VernonRHI PRIVATE VERNON_HAS_METAL_RHI=1)
+        target_compile_options(VernonRHI PRIVATE "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
+        find_library(_vernon_metal_framework Metal REQUIRED)
+        find_library(_vernon_foundation_framework Foundation REQUIRED)
+        target_link_libraries(VernonRHI PRIVATE ${_vernon_metal_framework} ${_vernon_foundation_framework})
     endif()
 
     add_library(VernonExecutionGraph STATIC ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph.cpp)
@@ -118,6 +143,14 @@ function(vernon_add_runtime)
         target_compile_definitions(VernonRuntimeRHIAdapter PRIVATE VERNON_HAS_VULKAN_RHI=1 VK_NO_PROTOTYPES=1)
         target_link_libraries(VernonRuntimeRHIAdapter PRIVATE $<BUILD_INTERFACE:Vulkan::Headers>)
     endif()
+    if(VERNON_ENABLE_METAL_RUNTIME)
+        target_sources(VernonRuntimeRHIAdapter PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/rhi_adapter/adapter_metal.mm)
+        set_target_properties(VernonRuntimeRHIAdapter PROPERTIES OBJCXX_STANDARD 17 OBJCXX_STANDARD_REQUIRED ON)
+        target_compile_definitions(VernonRuntimeRHIAdapter PRIVATE VERNON_HAS_METAL_RHI=1)
+        target_compile_options(VernonRuntimeRHIAdapter PRIVATE "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
+        target_link_libraries(VernonRuntimeRHIAdapter PRIVATE ${_vernon_metal_framework}
+                                                              ${_vernon_foundation_framework})
+    endif()
     target_link_libraries(VernonRuntimeRHIAdapter PUBLIC Vernon::RuntimeCore Vernon::RHI)
 
     add_library(
@@ -132,6 +165,7 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_direct.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_directx12.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_dispatch.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_metal.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_opengl.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_vulkan.cpp)
     add_library(Vernon::Runtime ALIAS VernonRuntime)
@@ -159,6 +193,9 @@ function(vernon_add_runtime)
         endif()
         target_compile_definitions(VernonRuntime PUBLIC VERNON_HAS_DIRECTX12_RUNTIME=1)
         target_link_libraries(VernonRuntime PRIVATE d3d12 dxgi dxguid)
+    endif()
+    if(VERNON_ENABLE_METAL_RUNTIME)
+        target_compile_definitions(VernonRuntime PUBLIC VERNON_HAS_METAL_RUNTIME=1)
     endif()
     target_include_directories(
         VernonRuntime
@@ -204,6 +241,7 @@ function(vernon_add_runtime)
     install(
         FILES ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonVersions.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonCommon.h
+              ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonGraphicsState.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonOpenGLContext.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.hpp

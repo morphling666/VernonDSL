@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, ClassVar, Mapping, TypeAlias
 
 from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
 
@@ -16,47 +16,158 @@ def frozen_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
     return MappingProxyType({key: value[key] for key in sorted(value)})
 
 
-@dataclass(frozen=True)
-class TargetOptions:
-    target: str
-    options: Mapping[str, Any] = field(default_factory=dict)
+class _TargetOptionsBase:
+    target: ClassVar[str]
 
-    def __post_init__(self) -> None:
-        if not self.target:
-            raise PipelineCompileError("target must be a non-empty string")
-        options = dict(self.options)
-        glsl_version = options.get("glsl_version")
-        if glsl_version is not None:
-            if self.target not in {"opengl", "opengles"}:
-                raise PipelineCompileError("glsl_version is valid only for OpenGL targets")
-            if not isinstance(glsl_version, int) or isinstance(glsl_version, bool) or glsl_version <= 0:
-                raise PipelineCompileError("glsl_version must be a positive integer")
-        hlsl_shader_model = options.get("hlsl_shader_model")
-        if hlsl_shader_model is not None:
-            if self.target != "directx":
-                raise PipelineCompileError("hlsl_shader_model is valid only for the DirectX target")
-            if not isinstance(hlsl_shader_model, int) or isinstance(hlsl_shader_model, bool) or hlsl_shader_model < 60:
-                raise PipelineCompileError("hlsl_shader_model must be Shader Model 6.0 or newer")
-        cpu_option_names = ("target_triple", "cpu", "cpu_features")
-        for name in cpu_option_names:
-            value = options.get(name)
-            if value is not None and not isinstance(value, str):
-                raise PipelineCompileError(f"{name} must be a string")
-        if self.target != "cpu" and any(name in options for name in cpu_option_names):
-            raise PipelineCompileError("target_triple, cpu, and cpu_features are valid only for the CPU target")
-        object.__setattr__(self, "options", frozen_mapping(options))
+    @property
+    def options(self) -> Mapping[str, Any]:
+        raise NotImplementedError
+
+    @property
+    def spec(self) -> dict[str, Any]:
+        return {"kind": self.target, "options": dict(self.options)}
 
     @property
     def native_options(self) -> dict[str, Any]:
-        if self.target in {"opengl", "opengles"}:
-            return {"glsl_version": self.options["glsl_version"]} if "glsl_version" in self.options else {}
-        if self.target == "cpu":
-            return {
-                name: self.options[name] for name in ("target_triple", "cpu", "cpu_features") if name in self.options
+        return {"options": dict(self.options)}
+
+
+@dataclass(frozen=True)
+class CpuTargetOptions(_TargetOptionsBase):
+    target: ClassVar[str] = "cpu"
+    triple: str = ""
+    processor: str = ""
+    features: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.triple, str) or not isinstance(self.processor, str):
+            raise PipelineCompileError("CPU triple and processor must be strings")
+        if not isinstance(self.features, (list, tuple)) or any(
+            not isinstance(value, str) or not value for value in self.features
+        ):
+            raise PipelineCompileError("CPU features must be a sequence of non-empty strings")
+        object.__setattr__(self, "features", tuple(self.features))
+
+    @property
+    def options(self) -> Mapping[str, Any]:
+        return frozen_mapping(
+            {
+                name: value
+                for name, value in (
+                    ("triple", self.triple),
+                    ("processor", self.processor),
+                    ("features", list(self.features)),
+                )
+                if value
             }
-        if self.target == "directx":
-            return {"hlsl_shader_model": self.options.get("hlsl_shader_model", 60)}
-        return {}
+        )
+
+    @property
+    def native_options(self) -> dict[str, Any]:
+        options = dict(self.options)
+        if self.features:
+            options["features"] = ",".join(self.features)
+        return {"options": options}
+
+
+@dataclass(frozen=True)
+class OpenGLTargetOptions(_TargetOptionsBase):
+    target: ClassVar[str] = "opengl"
+    version: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.version is not None and (
+            not isinstance(self.version, int) or isinstance(self.version, bool) or not 100 <= self.version <= 999
+        ):
+            raise PipelineCompileError("OpenGL version must be a three-digit GLSL version number")
+
+    @property
+    def options(self) -> Mapping[str, Any]:
+        return frozen_mapping({"version": self.version} if self.version is not None else {})
+
+
+@dataclass(frozen=True)
+class OpenGLESTargetOptions(OpenGLTargetOptions):
+    target: ClassVar[str] = "opengles"
+
+
+@dataclass(frozen=True)
+class VulkanTargetOptions(_TargetOptionsBase):
+    target: ClassVar[str] = "vulkan"
+
+    @property
+    def options(self) -> Mapping[str, Any]:
+        return frozen_mapping({})
+
+
+@dataclass(frozen=True)
+class MetalTargetOptions(_TargetOptionsBase):
+    target: ClassVar[str] = "metal"
+    platform: str = "macos"
+
+    def __post_init__(self) -> None:
+        if self.platform not in {"macos", "ios"}:
+            raise PipelineCompileError("Metal platform must be 'macos' or 'ios'")
+
+    @property
+    def options(self) -> Mapping[str, Any]:
+        return frozen_mapping({"platform": self.platform})
+
+
+@dataclass(frozen=True)
+class DirectXTargetOptions(_TargetOptionsBase):
+    target: ClassVar[str] = "directx"
+    shader_model: int = 60
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.shader_model, int) or isinstance(self.shader_model, bool) or self.shader_model < 60:
+            raise PipelineCompileError("DirectX shader model must be 6.0 or newer")
+
+    @property
+    def options(self) -> Mapping[str, Any]:
+        return frozen_mapping({"shader_model": self.shader_model})
+
+
+@dataclass(frozen=True)
+class CudaTargetOptions(_TargetOptionsBase):
+    target: ClassVar[str] = "cuda"
+
+    @property
+    def options(self) -> Mapping[str, Any]:
+        return frozen_mapping({})
+
+
+TargetOptions: TypeAlias = (
+    CpuTargetOptions
+    | OpenGLTargetOptions
+    | OpenGLESTargetOptions
+    | VulkanTargetOptions
+    | MetalTargetOptions
+    | DirectXTargetOptions
+    | CudaTargetOptions
+)
+
+
+def make_target_options(target: str, options: Mapping[str, Any] | None = None) -> TargetOptions:
+    values = dict(options or {})
+    target = "directx" if target == "dx" else target
+    constructors = {
+        "cpu": CpuTargetOptions,
+        "opengl": OpenGLTargetOptions,
+        "opengles": OpenGLESTargetOptions,
+        "vulkan": VulkanTargetOptions,
+        "metal": MetalTargetOptions,
+        "directx": DirectXTargetOptions,
+        "cuda": CudaTargetOptions,
+    }
+    try:
+        constructor = constructors[target]
+    except KeyError:
+        raise PipelineCompileError(f"unknown compiler target '{target}'") from None
+    try:
+        return constructor(**values)
+    except TypeError as error:
+        raise PipelineCompileError(f"invalid {target} target options: {error}") from None
 
 
 @dataclass(frozen=True)
@@ -102,8 +213,7 @@ class CompiledStage:
             "module": self.module,
             "entry": self.entry,
             "stage": self.stage,
-            "target": self.target.target,
-            "target_options": dict(self.target.options),
+            "target": self.target.spec,
             "dependencies": self.reflection.get("dependencies", []),
             "interface": dict(self.interface),
             "artifact_sha256": self.artifact.sha256,
@@ -175,8 +285,7 @@ class BundlePlan:
             "pipeline_version": PIPELINE_VERSION,
             "type": "pipeline",
             "id": self.pipeline_id,
-            "target": self.target.target,
-            "target_options": dict(self.target.options),
+            "target": self.target.spec,
             "features": list(self.features),
             "variants": [variant.to_dict() for variant in self.variants],
             "stage_artifacts": {
@@ -193,7 +302,15 @@ __all__ = [
     "BundlePlan",
     "CompiledArtifact",
     "CompiledStage",
+    "CpuTargetOptions",
+    "CudaTargetOptions",
+    "DirectXTargetOptions",
+    "MetalTargetOptions",
+    "OpenGLESTargetOptions",
+    "OpenGLTargetOptions",
     "PipelineCompileError",
     "TargetOptions",
+    "VulkanTargetOptions",
     "VariantPlan",
+    "make_target_options",
 ]

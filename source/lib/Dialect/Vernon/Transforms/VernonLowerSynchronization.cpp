@@ -2,6 +2,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
@@ -28,32 +29,39 @@ struct LowerSynchronizationPass final : PassWrapper<LowerSynchronizationPass, Op
     void runOnOperation() override {
         Operation *root = getOperation();
         IRRewriter rewriter(root->getContext());
+        WalkResult projectionCheck = root->walk([&](Operation *operation) {
+            if (!isa<LoadOp, StoreOp, AtomicOp>(operation))
+                return WalkResult::advance();
+            Value storage = isa<StoreOp>(operation) ? operation->getOperand(1) : operation->getOperand(0);
+            auto view = dyn_cast<TensorViewType>(storage.getType());
+            if (!view || view.getAddressSpace() != "workgroup")
+                return WalkResult::advance();
+            operation->emitError("workgroup storage operation reached synchronization lowering before projection");
+            return WalkResult::interrupt();
+        });
+        if (projectionCheck.wasInterrupted())
+            return signalPassFailure();
+
         SmallVector<WorkgroupAllocOp> allocations;
-        SmallVector<LoadOp> loads;
-        SmallVector<StoreOp> stores;
-        SmallVector<AtomicOp> atomics;
+        SmallVector<PhysicalLoadOp> physicalLoads;
+        SmallVector<PhysicalStoreOp> physicalStores;
+        SmallVector<PhysicalAtomicOp> physicalAtomics;
         SmallVector<BarrierOp> barriers;
         root->walk([&](WorkgroupAllocOp op) { allocations.push_back(op); });
-        root->walk([&](LoadOp op) {
-            auto view = dyn_cast<TensorViewType>(op.getStorage().getType());
-            if (view && view.getAddressSpace() == "workgroup")
-                loads.push_back(op);
+        root->walk([&](PhysicalLoadOp op) {
+            if (cast<TensorViewType>(op.getStorage().getType()).getAddressSpace() == "workgroup")
+                physicalLoads.push_back(op);
         });
-        root->walk([&](StoreOp op) {
-            auto view = dyn_cast<TensorViewType>(op.getStorage().getType());
-            if (view && view.getAddressSpace() == "workgroup")
-                stores.push_back(op);
+        root->walk([&](PhysicalStoreOp op) {
+            if (cast<TensorViewType>(op.getStorage().getType()).getAddressSpace() == "workgroup")
+                physicalStores.push_back(op);
         });
-        root->walk([&](AtomicOp op) { atomics.push_back(op); });
+        root->walk([&](PhysicalAtomicOp op) {
+            if (cast<TensorViewType>(op.getStorage().getType()).getAddressSpace() == "workgroup")
+                physicalAtomics.push_back(op);
+        });
         root->walk([&](BarrierOp op) { barriers.push_back(op); });
 
-        DenseMap<Operation *, Value> sourceStorage;
-        for (LoadOp op : loads)
-            sourceStorage.insert({op, op.getStorage()});
-        for (StoreOp op : stores)
-            sourceStorage.insert({op, op.getStorage()});
-        for (AtomicOp op : atomics)
-            sourceStorage.insert({op, op.getStorage()});
         DenseMap<Value, Value> loweredStorage;
         for (WorkgroupAllocOp op : allocations) {
             TensorViewType type = op.getResult().getType();
@@ -66,8 +74,11 @@ struct LowerSynchronizationPass final : PassWrapper<LowerSynchronizationPass, Op
                 memorySpace = spirv::StorageClassAttr::get(root->getContext(), spirv::StorageClass::Workgroup);
             else if (gpuTarget)
                 memorySpace = gpu::AddressSpaceAttr::get(root->getContext(), gpu::AddressSpace::Workgroup);
+            int64_t elementCount = 1;
+            for (int64_t extent : type.getShape())
+                elementCount *= extent;
             MemRefType memref =
-                MemRefType::get(type.getShape(), type.getElementType(), MemRefLayoutAttrInterface{}, memorySpace);
+                MemRefType::get({elementCount}, type.getElementType(), MemRefLayoutAttrInterface{}, memorySpace);
             Value replacement;
             if (spirvTarget) {
                 rewriter.setInsertionPoint(op);
@@ -78,7 +89,14 @@ struct LowerSynchronizationPass final : PassWrapper<LowerSynchronizationPass, Op
                     op.emitError("workgroup allocation must be inside a GPU function");
                     return signalPassFailure();
                 }
+                const unsigned attributionIndex = function.getNumWorkgroupAttributions();
                 replacement = function.addWorkgroupAttribution(memref, op.getLoc());
+                // Aggregate leaves can be vectorized after this pass.  Give
+                // shared globals the maximum portable vector alignment so an
+                // adjacent byte-sized leaf cannot leave a vector load based
+                // at only scalar alignment on NVPTX.
+                function.setWorkgroupAttributionAttr(attributionIndex, LLVM::LLVMDialect::getAlignAttrName(),
+                                                     rewriter.getI64IntegerAttr(16));
             } else {
                 rewriter.setInsertionPoint(op);
                 replacement = memref::AllocaOp::create(rewriter, op.getLoc(), memref);
@@ -92,37 +110,26 @@ struct LowerSynchronizationPass final : PassWrapper<LowerSynchronizationPass, Op
             signalPassFailure();
             return false;
         };
-        for (LoadOp op : loads)
-            if (!requireAllocation(op, sourceStorage.lookup(op)))
+        for (PhysicalLoadOp op : physicalLoads)
+            if (!requireAllocation(op, op.getStorage()))
                 return;
-        for (StoreOp op : stores)
-            if (!requireAllocation(op, sourceStorage.lookup(op)))
+        for (PhysicalStoreOp op : physicalStores)
+            if (!requireAllocation(op, op.getStorage()))
                 return;
-        for (AtomicOp op : atomics)
-            if (auto view = dyn_cast<TensorViewType>(sourceStorage.lookup(op).getType());
-                view && view.getAddressSpace() == "workgroup" && !requireAllocation(op, sourceStorage.lookup(op)))
+        for (PhysicalAtomicOp op : physicalAtomics)
+            if (!requireAllocation(op, op.getStorage()))
                 return;
-        for (LoadOp op : loads) {
+        for (PhysicalLoadOp op : physicalLoads) {
             rewriter.setInsertionPoint(op);
-            rewriter.replaceOpWithNewOp<memref::LoadOp>(op, loweredStorage.lookup(sourceStorage.lookup(op)),
-                                                        op.getIndices());
+            rewriter.replaceOpWithNewOp<memref::LoadOp>(op, loweredStorage.lookup(op.getStorage()), op.getIndex());
         }
-        for (StoreOp op : stores) {
+        for (PhysicalStoreOp op : physicalStores) {
             rewriter.setInsertionPoint(op);
-            memref::StoreOp::create(rewriter, op.getLoc(), op.getValue(),
-                                    loweredStorage.lookup(sourceStorage.lookup(op)), op.getIndices());
+            memref::StoreOp::create(rewriter, op.getLoc(), op.getValue(), loweredStorage.lookup(op.getStorage()),
+                                    op.getIndex());
             rewriter.eraseOp(op);
         }
-        for (AtomicOp op : atomics) {
-            Value source = sourceStorage.lookup(op);
-            auto sourceView = dyn_cast<TensorViewType>(source.getType());
-            if (!sourceView || sourceView.getAddressSpace() != "workgroup")
-                continue;
-            Value storage = loweredStorage.lookup(source);
-            if (!isa<MemRefType>(storage.getType())) {
-                op.emitError("device atomic TensorView storage was not lowered to an addressable buffer");
-                return signalPassFailure();
-            }
+        for (PhysicalAtomicOp op : physicalAtomics) {
             arith::AtomicRMWKind kind = op.getAtomicKind() == "add"    ? arith::AtomicRMWKind::addi
                                         : op.getAtomicKind() == "min"  ? arith::AtomicRMWKind::mins
                                         : op.getAtomicKind() == "max"  ? arith::AtomicRMWKind::maxs
@@ -130,7 +137,8 @@ struct LowerSynchronizationPass final : PassWrapper<LowerSynchronizationPass, Op
                                         : op.getAtomicKind() == "umax" ? arith::AtomicRMWKind::maxu
                                                                        : arith::AtomicRMWKind::assign;
             rewriter.setInsertionPoint(op);
-            rewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(op, kind, op.getValue(), storage, op.getIndices());
+            rewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(op, kind, op.getValue(),
+                                                             loweredStorage.lookup(op.getStorage()), op.getIndex());
         }
         for (WorkgroupAllocOp op : allocations)
             rewriter.eraseOp(op);

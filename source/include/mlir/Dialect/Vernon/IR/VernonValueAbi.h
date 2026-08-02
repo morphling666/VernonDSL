@@ -75,6 +75,7 @@ struct PhysicalValueAbiLayout {
 
 enum class PhysicalResourceAbiKind {
     HostPointer,
+    TensorViewDescriptor,
     CudaStorageLeaves,
     GraphicsStorageLeaves,
     GraphicsTexture,

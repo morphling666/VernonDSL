@@ -1,6 +1,7 @@
 name: Windows CI
 
 on:
+  workflow_call:
   workflow_dispatch:
   pull_request:
     branches:
@@ -82,7 +83,7 @@ jobs:
           uv run --frozen --no-sync coverage xml -o coverage.xml
 
       - name: Upload Python coverage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: windows-python-coverage
           path: coverage.xml
@@ -121,7 +122,7 @@ jobs:
 
       - name: Upload Runtime test logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: windows-runtime-test-logs
           path: runtime-build/Testing/Temporary/*.log
@@ -177,7 +178,7 @@ jobs:
 
       - name: Upload ASan test logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: windows-asan-test-logs
           path: asan-build/Testing/Temporary/*.log
@@ -312,7 +313,7 @@ jobs:
 
       - name: Upload showcase acceptance results
         if: always() && matrix.python-version == '3.11'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: windows-showcase-smoke
           path: build-ci/showcase-smoke
@@ -335,7 +336,7 @@ jobs:
           & "$venv/Scripts/python.exe" scripts/verify_installed_wheel.py
 
       - name: Upload wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: vernon-lang-windows-python-${{ matrix.python-version }}
           path: dist/*.whl
@@ -344,7 +345,7 @@ jobs:
 
       - name: Upload Compiler test logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: windows-compiler-test-logs-python-${{ matrix.python-version }}
           path: build-ci/Testing/Temporary/*.log

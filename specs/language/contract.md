@@ -6,9 +6,9 @@
 > no independent numeric `FRONTEND_VERSION` axis.**
 >
 > The checked phases in `future_language_roadmap.md` are implemented in source
-> and tested where noted, but unchecked sections and active work in
-> `specs/completion_roadmap.md` remain unavailable as end-to-end guarantees.
-> Git history is the archive for superseded contract text.
+> and tested where noted. Unchecked sections and the language-v4 work in
+> the [project roadmap](../roadmap.md#language-v4) remain unavailable as end-to-end
+> guarantees. Git history is the archive for superseded contract text.
 
 Vernon is a statically typed GPU and graphics DSL embedded in Python syntax.
 The frontend parses source without importing or executing the shader module.
@@ -175,18 +175,17 @@ Backend lowering may expand them into Scalar leaf descriptors over the same
 owner allocation, but that expansion is not observable in source typing,
 ownership, access, or dispatch semantics.
 
-An implementation may specialize a compute artifact for a concrete runtime
-layout. In that case shape, signed element strides, and offset are semantic
-cache inputs, and every logical index is projected to the owner's physical
-element index before backend lowering. Specialization must not expose those
-values as source type arguments.
+Compute artifacts must not specialize for a concrete runtime layout. Shape,
+signed element strides, and offset are dispatch descriptor values, and every
+logical index is projected to the owner's physical element index before
+backend lowering.
 
 Language-level typed shape, strides, and offset use units of the recursively
-resolved leaf element. Specialized compiler reflection and `PIPELINE_VERSION` manifests
-record `shape`, `element_strides`, and `element_offset`; Runtime descriptors
-record byte strides and byte offsets after Tensor and Struct layout is
-resolved. Runtime validation performs the one checked element-to-byte
-conversion and requires an exact match. External APIs must state whether
+resolved leaf element. Compiler reflection and `PIPELINE_VERSION` manifests
+record static shape constraints and descriptor binding positions, never
+concrete dispatch values. Runtime descriptors record byte strides and byte
+offsets after Tensor and Struct layout is resolved. Runtime validation performs
+one checked byte-to-element conversion. External APIs must state whether
 supplied layout values are element or byte units; implicit unit conversion is
 forbidden.
 

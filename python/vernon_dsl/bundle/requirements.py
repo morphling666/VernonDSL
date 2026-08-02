@@ -80,9 +80,25 @@ def _ptx_requirements(stage: Any) -> tuple[tuple[int, int], tuple[int, int], int
     )
 
 
+def _metal_version(stage: Any, name: str) -> tuple[int, int]:
+    reflected_target = stage.reflection.get("target", {})
+    output = reflected_target.get("output", {}) if isinstance(reflected_target, dict) else {}
+    output_name = "version" if name == "msl_version" else name
+    value = output.get(output_name) if isinstance(output, dict) else None
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) != 2
+        or any(not isinstance(part, int) or isinstance(part, bool) or part < 0 for part in value)
+    ):
+        from .types import PipelineCompileError
+
+        raise PipelineCompileError(f"Metal compiler reflection has no valid {name}")
+    return (value[0], value[1])
+
+
 def runtime_requirements(target: str, stages: Iterable[Any]) -> dict[str, Any] | None:
     stage_values = tuple(stages)
-    if target not in {"cpu", "cuda", "vulkan", "opengl", "opengles", "directx"}:
+    if target not in {"cpu", "cuda", "vulkan", "opengl", "opengles", "directx", "metal"}:
         return None
     result: dict[str, Any] = {"backend": target, "features": _features(stage_values)}
     if target == "cpu":
@@ -120,7 +136,7 @@ def runtime_requirements(target: str, stages: Iterable[Any]) -> dict[str, Any] |
 
                 raise PipelineCompileError("DirectX runtime artifact is not a DXIL container")
         shader_model = _single(
-            (stage.target.options.get("hlsl_shader_model", 60) for stage in stage_values), "HLSL Shader Models"
+            (stage.target.options.get("shader_model", 60) for stage in stage_values), "HLSL Shader Models"
         )
         if not isinstance(shader_model, int) or shader_model < 60:
             from .types import PipelineCompileError
@@ -137,6 +153,24 @@ def runtime_requirements(target: str, stages: Iterable[Any]) -> dict[str, Any] |
         ]
         if workgroups:
             result["compute_workgroup_size"] = [max(value[index] for value in workgroups) for index in range(3)]
+    elif target == "metal":
+        platform = _single((stage.target.options.get("platform") for stage in stage_values), "Apple Metal platforms")
+        if platform not in {"macos", "ios"}:
+            from .types import PipelineCompileError
+
+            raise PipelineCompileError("Metal runtime requires apple_platform 'macos' or 'ios'")
+        msl_version = _single((_metal_version(stage, "msl_version") for stage in stage_values), "MSL versions")
+        minimum_os_version = _single(
+            (_metal_version(stage, "minimum_os_version") for stage in stage_values), "Metal minimum OS versions"
+        )
+        required_os = (15, 0) if platform == "ios" else (11, 0)
+        if msl_version != (2, 4) or minimum_os_version < required_os:
+            from .types import PipelineCompileError
+
+            raise PipelineCompileError("Metal compiler reflection contains unsupported runtime requirements")
+        result["apple_platform"] = platform
+        result["msl_version"] = list(msl_version)
+        result["minimum_os_version"] = list(minimum_os_version)
     else:
         ptx = [_ptx_requirements(stage) for stage in stage_values]
         result["ptx_version"] = list(max(value[0] for value in ptx))

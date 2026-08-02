@@ -21,7 +21,7 @@ struct CpuAbiArgumentPacking {
     uint64_t offset;
     uint64_t size;
     CpuAbiArgumentKind kind;
-    uint64_t staticExtent;
+    uint32_t tensorRank;
     std::vector<uint64_t> tensorLeafElementSizes;
 };
 

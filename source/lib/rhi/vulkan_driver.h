@@ -22,6 +22,7 @@ struct VERNON_RHI_CAPI Driver {
     bool attempted{};
     bool available{};
     PFN_vkGetInstanceProcAddr getInstanceProcAddr{};
+    PFN_vkEnumerateInstanceExtensionProperties enumerateInstanceExtensionProperties{};
     PFN_vkCreateInstance createInstance{};
     PFN_vkDestroyInstance destroyInstance{};
     PFN_vkEnumeratePhysicalDevices enumeratePhysicalDevices{};
@@ -97,6 +98,7 @@ struct VERNON_RHI_CAPI Driver {
     PFN_vkCmdEndRendering cmdEndRendering{};
     PFN_vkCmdSetViewport cmdSetViewport{};
     PFN_vkCmdSetScissor cmdSetScissor{};
+    PFN_vkCmdSetStencilReference cmdSetStencilReference{};
     PFN_vkCmdBindVertexBuffers cmdBindVertexBuffers{};
     PFN_vkCmdBindIndexBuffer cmdBindIndexBuffer{};
     PFN_vkCmdDraw cmdDraw{};

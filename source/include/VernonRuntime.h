@@ -30,7 +30,8 @@ typedef enum VernonRuntimeBackend {
     VERNON_RUNTIME_VULKAN = 2,
     VERNON_RUNTIME_OPENGL = 3,
     VERNON_RUNTIME_OPENGL_ES = 4,
-    VERNON_RUNTIME_DIRECTX12 = 5
+    VERNON_RUNTIME_DIRECTX12 = 5,
+    VERNON_RUNTIME_METAL = 6
 } VernonRuntimeBackend;
 
 typedef struct VernonRuntimeCapabilities {
@@ -77,7 +78,8 @@ typedef enum VernonTextureFormat {
     VERNON_TEXTURE_RG8_UNORM = 7,
     VERNON_TEXTURE_RGB8_UNORM = 8,
     VERNON_TEXTURE_R11G11B10_FLOAT = 9,
-    VERNON_TEXTURE_D32_FLOAT = 10
+    VERNON_TEXTURE_D32_FLOAT = 10,
+    VERNON_TEXTURE_D32_FLOAT_S8_UINT = 11
 } VernonTextureFormat;
 
 typedef enum VernonTextureDimension {
@@ -137,7 +139,19 @@ typedef struct VernonDepthAttachment {
     VernonRhiLoadOperation load_operation;
     VernonRhiStoreOperation store_operation;
     float clear_depth;
+    VernonRhiLoadOperation stencil_load_operation;
+    VernonRhiStoreOperation stencil_store_operation;
+    uint32_t clear_stencil;
 } VernonDepthAttachment;
+
+typedef struct VernonGraphicsState {
+    uint32_t struct_size;
+    VernonRasterizationState rasterization;
+    VernonDepthStencilState depth_stencil;
+    const VernonColorBlendState *color_blends;
+    size_t color_blend_count;
+    uint32_t reserved[4];
+} VernonGraphicsState;
 
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeSynchronize(VernonRuntimeContext *context);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeReferenceRhiBuffer(VernonRuntimeContext *context, VernonRhiBuffer buffer,
@@ -276,6 +290,8 @@ typedef struct VernonPipelineInvocation {
     uint32_t viewport[4];
     uint32_t scissor[4];
     VernonRuntimeProviderObject command_encoder;
+    const VernonGraphicsState *graphics_state;
+    uint32_t stencil_reference;
 } VernonPipelineInvocation;
 
 typedef struct VernonPipelineParameterView {

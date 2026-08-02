@@ -1,8 +1,8 @@
 #include "runtime_pipeline_backend.h"
 
+#include "VernonRuntimeRHIAdapter.h"
 #include "backend_opengl.h"
 #include "compute_launch_planner.h"
-#include "rhi_adapter/adapter_internal.h"
 #include "tensor_bridge.h"
 
 #include <nlohmann/json.hpp>
@@ -31,6 +31,7 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         VernonRuntimeProviderBindingLayoutEntry layout{};
         std::vector<VernonRuntimeProviderVertexAttribute> attributes;
         OpenGLPipelineState::InlineBinding binding;
+        ComputeBindingSource source;
         std::string name;
     };
     std::vector<OpenGLBindingCandidate> candidates;
@@ -76,12 +77,38 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     candidate.binding.source = argument.kind == "tensor"
                                                    ? OpenGLPipelineState::InlineBinding::EXTERNAL_STORAGE
                                                    : OpenGLPipelineState::InlineBinding::COMPUTE_INLINE;
+                    candidate.source = {ComputeBindingSourceKind::Argument, use.index, 0};
                     if (candidate.layout.element_size == 0) {
                         bundle.context->error = "OpenGL compute parameter has zero element size";
                         delete state;
                         return false;
                     }
                     candidates.push_back(std::move(candidate));
+                }
+                if (use.tensorViewDescriptor) {
+                    const auto addDescriptor = [&](ComputeBindingSourceKind kind, uint32_t dimension,
+                                                   uint32_t binding) {
+                        OpenGLBindingCandidate candidate;
+                        candidate.layout.slot = ++computeInternalSlot;
+                        candidate.layout.binding = binding;
+                        candidate.layout.kind = VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                        candidate.layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
+                        candidate.layout.access = 1;
+                        candidate.layout.array_count = 1;
+                        candidate.layout.argument_index = use.index;
+                        candidate.layout.element_size = 4;
+                        candidate.binding.externalSlot = parameter.slot;
+                        candidate.binding.source = OpenGLPipelineState::InlineBinding::COMPUTE_INLINE;
+                        candidate.source = {kind, use.index, dimension};
+                        candidates.push_back(std::move(candidate));
+                    };
+                    addDescriptor(ComputeBindingSourceKind::TensorOffset, 0, use.tensorViewDescriptor->offsetBinding);
+                    for (uint32_t dimension = 0; dimension < use.tensorViewDescriptor->rank; ++dimension)
+                        addDescriptor(ComputeBindingSourceKind::TensorExtent, dimension,
+                                      use.tensorViewDescriptor->extentBindings[dimension]);
+                    for (uint32_t dimension = 0; dimension < use.tensorViewDescriptor->rank; ++dimension)
+                        addDescriptor(ComputeBindingSourceKind::TensorStride, dimension,
+                                      use.tensorViewDescriptor->strideBindings[dimension]);
                 }
             }
         std::sort(candidates.begin(), candidates.end(),
@@ -92,6 +119,7 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         for (size_t index = 0; index < candidates.size(); ++index) {
             state->rhiLayout.push_back(candidates[index].layout);
             state->rhiInlineBindings.push_back(std::move(candidates[index].binding));
+            state->rhiComputeBindingSources.push_back(candidates[index].source);
             state->rhiValues[index].slot = state->rhiLayout[index].slot;
             state->rhiValues[index].kind = state->rhiLayout[index].kind;
             if (state->rhiLayout[index].kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE) {
@@ -102,6 +130,7 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 state->rhiValues[index].flags = VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE;
             }
         }
+        state->rhiComputeDescriptorValues.resize(candidates.size());
         const VernonRuntimeProviderShaderDescriptor shader{sizeof(VernonRuntimeProviderShaderDescriptor),
                                                            VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE,
                                                            {"glsl", 4},
@@ -452,6 +481,7 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
 
 void destroyOpenGLPipeline(VernonLoadedPipeline &pipeline) {
     OpenGLPipelineState &state = runtimeBackendState<OpenGLPipelineState>(pipeline);
+    destroyGraphicsVariant(state.rhiGraphicsVariant);
     vernonRuntimeCoreBindingsDestroy(state.rhiBindings);
     vernonRuntimeCorePipelineDestroy(state.rhiPipeline);
 }
@@ -563,6 +593,45 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
     if (plan.depthAttachment) {
         depthAttachment = plan.depthAttachment->resource;
     }
+    std::vector<uint32_t> formats;
+    formats.reserve(plan.attachments.size());
+    for (const VernonColorAttachment *attachment : plan.attachments)
+        formats.push_back(static_cast<uint32_t>(attachment->format));
+    const uint32_t depthFormat = !plan.depthAttachment ? 0
+                                 : plan.depthAttachment->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT
+                                     ? rhi::opengl::kDepth32fStencil8
+                                     : rhi::opengl::kDepthComponent32f;
+    PlannedGraphicsState graphicsState;
+    const bool hasStencil = plan.depthAttachment && plan.depthAttachment->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT;
+    if (!planGraphicsState(invocation, formats.size(), plan.depthAttachment != nullptr, hasStencil, graphicsState,
+                           pipeline.context->error))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    std::vector<uint32_t> vertexStrides;
+    for (size_t index = 0; index < state.rhiLayout.size(); ++index) {
+        if (state.rhiLayout[index].kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
+            continue;
+        const uint32_t binding = state.rhiLayout[index].binding;
+        if (vertexStrides.size() <= binding)
+            vertexStrides.resize(binding + 1);
+        vertexStrides[binding] = state.rhiValues[index].stride;
+    }
+    GraphicsVariantKey variantKey{static_cast<uint32_t>(invocation.topology),
+                                  formats,
+                                  depthFormat,
+                                  1,
+                                  vertexStrides,
+                                  graphicsState.rasterization,
+                                  graphicsState.depthStencil,
+                                  graphicsState.colorBlends};
+    const VernonStatus variantStatus = ensureGraphicsVariant(state.rhiPipeline, variantKey, state.rhiGraphicsVariant);
+    if (variantStatus != VERNON_STATUS_OK) {
+        const VernonStringView providerError =
+            vernonRuntimeRhiAdapterGetLastError(openGLState(*pipeline.context).adapter);
+        return fail(*pipeline.context,
+                    providerError.data ? std::string(providerError.data, providerError.size)
+                                       : "failed to prepare OpenGL RHI graphics variant",
+                    variantStatus);
+    }
     const bool hasViewport = invocation.viewport[2] && invocation.viewport[3];
     VernonRuntimeCoreDrawInvocation draw{};
     draw.struct_size = sizeof(draw);
@@ -577,6 +646,11 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
     draw.depth_store_operation =
         plan.depthAttachment ? static_cast<uint32_t>(plan.depthAttachment->store_operation) : VERNON_RHI_STORE_DISCARD;
     draw.clear_depth = plan.depthAttachment ? plan.depthAttachment->clear_depth : 1.0f;
+    draw.stencil_load_operation = hasStencil ? plan.depthAttachment->stencil_load_operation : VERNON_RHI_LOAD_DISCARD;
+    draw.stencil_store_operation =
+        hasStencil ? plan.depthAttachment->stencil_store_operation : VERNON_RHI_STORE_DISCARD;
+    draw.clear_stencil = hasStencil ? plan.depthAttachment->clear_stencil : 0;
+    draw.stencil_reference = graphicsState.stencilReference;
     draw.viewport[0] = hasViewport ? invocation.viewport[0] : 0;
     draw.viewport[1] = hasViewport ? invocation.viewport[1] : 0;
     draw.viewport[2] = hasViewport ? invocation.viewport[2] : plan.attachmentWidth;
@@ -591,7 +665,8 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
         draw.index_count = plan.indexBinding->index_count;
         draw.index_type = plan.indexBinding->type;
     }
-    const VernonStatus status = vernonRuntimeCoreEncodeDrawInvocation(state.rhiPipeline, state.rhiBindings, &draw);
+    const VernonStatus status =
+        vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(state.rhiGraphicsVariant.handle, state.rhiBindings, &draw);
     if (status != VERNON_STATUS_OK) {
         const VernonStringView providerError =
             vernonRuntimeRhiAdapterGetLastError(openGLState(*pipeline.context).adapter);
@@ -616,6 +691,16 @@ VernonStatus invokeOpenGLComputePipeline(VernonLoadedPipeline &pipeline, const P
         value = {};
         value.slot = layout.slot;
         value.kind = layout.kind;
+        const ComputeBindingSource &source = state.rhiComputeBindingSources[index];
+        if (source.kind != ComputeBindingSourceKind::Argument) {
+            std::optional<int64_t> descriptor = computeBindingDescriptorValue(argument, source);
+            if (!descriptor || *descriptor < INT32_MIN || *descriptor > INT32_MAX)
+                return fail(*pipeline.context, "OpenGL TensorView descriptor exceeds the shader index range");
+            state.rhiComputeDescriptorValues[index] = static_cast<int32_t>(*descriptor);
+            value.inline_data = &state.rhiComputeDescriptorValues[index];
+            value.inline_size = sizeof(int32_t);
+            continue;
+        }
         if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
             if (argument.kind != ComputeLaunchArgumentKind::Tensor || !argument.resource.resource.value)
                 return fail(*pipeline.context, "OpenGL prepared storage binding requires an RHI Tensor");

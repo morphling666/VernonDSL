@@ -9,12 +9,15 @@ from types import SimpleNamespace
 from vernon_dsl.bundle import (
     CompiledArtifact,
     CompiledStage,
+    MetalTargetOptions,
+    OpenGLTargetOptions,
     PipelineCompileError,
-    TargetOptions,
     build_bundle_plan,
     canonical_json,
+    compiled_stage_from_program,
     external_parameters,
     inline_artifact_descriptor,
+    make_target_options,
     materialize_bundle,
     merge_parameter_uses,
     parse_reflection_json,
@@ -110,7 +113,7 @@ def _stage(stage: str, artifact: bytes, interface: dict[str, object]) -> Compile
         '{"id":"module"}',
         entry,
         stage,
-        TargetOptions("opengl", {"glsl_version": 330}),
+        OpenGLTargetOptions(version=330),
         reflection,
         reflection["entries"][0],
         CompiledArtifact("glsl", artifact, f"{stage}.glsl"),
@@ -128,7 +131,7 @@ class PipelineCompileTests(unittest.TestCase):
             interface: dict[str, object] | None = None,
         ) -> SimpleNamespace:
             return SimpleNamespace(
-                target=SimpleNamespace(target=target),
+                target=SimpleNamespace(target=target, options={}),
                 stage="compute",
                 artifact=SimpleNamespace(data=data),
                 reflection={"required_features": required_features or []},
@@ -175,7 +178,19 @@ class PipelineCompileTests(unittest.TestCase):
         self.assertEqual(cpu["target_triple"], "x86_64-pc-windows-msvc")
         self.assertEqual(cpu["object_format"], "coff")
         self.assertNotIn("invocation_abi_version", cpu)
-        self.assertIsNone(runtime_requirements("metal", []))
+        metal_stage = stage("metal", b"MSL")
+        metal_stage.target.options = {"platform": "ios"}
+        metal_stage.reflection = {
+            "target": {
+                "kind": "metal",
+                "options": {"platform": "ios"},
+                "output": {"language": "msl", "version": [2, 4], "minimum_os_version": [15, 0]},
+            }
+        }
+        metal = runtime_requirements("metal", [metal_stage])
+        self.assertEqual(metal["apple_platform"], "ios")
+        self.assertEqual(metal["msl_version"], [2, 4])
+        self.assertEqual(metal["minimum_os_version"], [15, 0])
 
     def test_runtime_requirement_parsers_reject_incomplete_artifacts(self) -> None:
         stage = SimpleNamespace(
@@ -188,6 +203,66 @@ class PipelineCompileTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(PipelineCompileError, "incomplete PTX header"):
             runtime_requirements("cuda", [stage])
+
+        metal_stage = SimpleNamespace(
+            target=SimpleNamespace(target="metal", options={"platform": "macos"}),
+            stage="compute",
+            artifact=SimpleNamespace(data=b"MSL"),
+            reflection={},
+            metadata={},
+            interface={},
+        )
+        with self.assertRaisesRegex(PipelineCompileError, "no valid msl_version"):
+            runtime_requirements("metal", [metal_stage])
+        metal_stage.target.options = {}
+        metal_stage.reflection = {
+            "target": {
+                "kind": "metal",
+                "options": {},
+                "output": {"language": "msl", "version": [2, 4], "minimum_os_version": [11, 0]},
+            }
+        }
+        with self.assertRaisesRegex(PipelineCompileError, "requires apple_platform"):
+            runtime_requirements("metal", [metal_stage])
+
+    def test_compiled_stage_uses_reflected_target_options(self) -> None:
+        program = SimpleNamespace(
+            ok=True,
+            diagnostics="",
+            reflection=json.dumps(
+                {
+                    "target": {
+                        "kind": "metal",
+                        "options": {"platform": "ios"},
+                        "output": {
+                            "language": "msl",
+                            "version": [2, 4],
+                            "minimum_os_version": [15, 0],
+                        },
+                    },
+                    "entries": [{"name": "main", "stage": "compute"}],
+                    "artifacts": [
+                        {
+                            "entry_point": "main",
+                            "stage": "compute",
+                            "filename": "main.metal",
+                            "format": "msl",
+                        }
+                    ],
+                }
+            ),
+            artifacts=[("main.metal", b"kernel void main() {}")],
+        )
+        compiled = compiled_stage_from_program(
+            program,
+            module="module",
+            module_manifest="manifest",
+            entry="main",
+            target=MetalTargetOptions(),
+        )
+        self.assertEqual(compiled.target.options["platform"], "ios")
+        requirements = runtime_requirements("metal", [compiled])
+        self.assertEqual(requirements["minimum_os_version"], [15, 0])
 
     def test_runtime_requirements_change_content_hash_but_not_stage_identity(self) -> None:
         stage = _stage("compute", b"#version 430\nvoid main() {}", {"workgroup_size": [1, 1, 1]})
@@ -203,23 +278,30 @@ class PipelineCompileTests(unittest.TestCase):
         self.assertEqual(set(changed["stage_artifacts"]), {stage.id})
 
     def test_native_options_are_scoped_to_the_selected_target(self) -> None:
-        self.assertEqual(TargetOptions("opengl", {"glsl_version": 330}).native_options, {"glsl_version": 330})
+        self.assertEqual(OpenGLTargetOptions(version=330).native_options, {"options": {"version": 330}})
         self.assertEqual(
-            TargetOptions("cpu", {"cpu": "generic", "cpu_features": "+sse2"}).native_options,
-            {"cpu": "generic", "cpu_features": "+sse2"},
+            make_target_options("cpu", {"processor": "generic", "features": ["+sse2"]}).native_options,
+            {"options": {"processor": "generic", "features": "+sse2"}},
         )
-        self.assertEqual(TargetOptions("directx").native_options, {"hlsl_shader_model": 60})
+        self.assertEqual(make_target_options("directx").native_options, {"options": {"shader_model": 60}})
         self.assertEqual(
-            TargetOptions("directx", {"hlsl_shader_model": 60}).native_options,
-            {"hlsl_shader_model": 60},
+            make_target_options("directx", {"shader_model": 60}).native_options,
+            {"options": {"shader_model": 60}},
         )
-        self.assertEqual(TargetOptions("cuda").native_options, {})
-        with self.assertRaisesRegex(PipelineCompileError, "valid only for the CPU target"):
-            TargetOptions("vulkan", {"cpu": "generic"})
-        with self.assertRaisesRegex(PipelineCompileError, "valid only for the DirectX target"):
-            TargetOptions("metal", {"hlsl_shader_model": 50})
-        with self.assertRaisesRegex(PipelineCompileError, "Shader Model 6.0 or newer"):
-            TargetOptions("directx", {"hlsl_shader_model": 55})
+        self.assertEqual(make_target_options("cuda").native_options, {"options": {}})
+        self.assertEqual(MetalTargetOptions().native_options, {"options": {"platform": "macos"}})
+        self.assertEqual(
+            MetalTargetOptions(platform="ios").native_options,
+            {"options": {"platform": "ios"}},
+        )
+        with self.assertRaisesRegex(PipelineCompileError, "invalid vulkan target options"):
+            make_target_options("vulkan", {"processor": "generic"})
+        with self.assertRaisesRegex(PipelineCompileError, "invalid metal target options"):
+            make_target_options("metal", {"shader_model": 60})
+        with self.assertRaisesRegex(PipelineCompileError, "shader model must be 6.0 or newer"):
+            make_target_options("directx", {"shader_model": 55})
+        with self.assertRaisesRegex(PipelineCompileError, "macos.*ios"):
+            MetalTargetOptions(platform="tvos")
 
     def test_generated_sampler_and_resolution_are_internal(self) -> None:
         records = {
@@ -483,9 +565,13 @@ class PipelineCompileTests(unittest.TestCase):
                             "kind": "tensor",
                             "type": '!vernon.tensor_view<f32, [-1, -1], "write", "device">',
                             "element_layout": _scalar_layout("f32"),
-                            "shape": [2, 3],
-                            "element_strides": [4, -1],
-                            "element_offset": 2,
+                            "source_shape": [-1, -1],
+                            "tensor_view_descriptor": {
+                                "rank": 2,
+                                "offset_binding": 1,
+                                "extent_bindings": [2, 3],
+                                "stride_bindings": [4, 5],
+                            },
                             "access": "write",
                             "vernon.source_name": "output",
                             "vernon.interface": "resource",
@@ -499,8 +585,11 @@ class PipelineCompileTests(unittest.TestCase):
 
         use = external_parameters(records)["output"][0]
         self.assertEqual(use["interface"], "storage")
-        self.assertEqual(use["element_strides"], [4, -1])
-        self.assertEqual(use["element_offset"], 2)
+        self.assertEqual(use["shape"], [0, 0])
+        self.assertEqual(
+            use["tensor_view_descriptor"],
+            {"rank": 2, "offset_binding": 1, "extent_bindings": [2, 3], "stride_bindings": [4, 5]},
+        )
         self.assertNotIn("physical_value_layout", use)
 
         del records["compute"]["interface"]["arguments"][0]["vernon.binding"]
@@ -543,7 +632,10 @@ class PipelineCompileTests(unittest.TestCase):
                 "element_layout": _scalar_layout("f32"),
                 "shape": [4],
                 "access": "read_write",
-                "uses": [{key: value for key, value in use.items() if key != "element_layout"} for use in uses],
+                "uses": [
+                    {"stage": "compute", "index": 0, "dtype": "f32", "shape": [4], "interface": "storage"},
+                    {"stage": "vertex", "index": 1, "dtype": "f32", "shape": [4], "interface": "input"},
+                ],
             },
         )
 

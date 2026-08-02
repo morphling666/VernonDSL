@@ -274,7 +274,7 @@ Value loadStorageLeaf(Value storage, Value index, AggregateStorageBackend backen
                       Location location, Type leafType) {
     if (backend == AggregateStorageBackend::MemRef || isa<MemRefType>(storage.getType()))
         return memref::LoadOp::create(builder, location, storage, index);
-    OperationState state(location, LoadOp::getOperationName());
+    OperationState state(location, PhysicalLoadOp::getOperationName());
     state.addOperands({storage, index});
     state.addTypes(leafType);
     return builder.create(state)->getResult(0);
@@ -286,7 +286,7 @@ void storeStorageLeaf(Value value, Value storage, Value index, AggregateStorageB
         memref::StoreOp::create(builder, location, value, storage, index);
         return;
     }
-    OperationState state(location, StoreOp::getOperationName());
+    OperationState state(location, PhysicalStoreOp::getOperationName());
     state.addOperands({value, storage, index});
     builder.create(state);
 }
@@ -326,8 +326,8 @@ struct AggregateViewPattern final : ConversionPattern {
 
     LogicalResult matchAndRewrite(Operation *operation, ArrayRef<ValueRange> operands,
                                   ConversionPatternRewriter &rewriter) const override {
-        auto load = dyn_cast<LoadOp>(operation);
-        auto store = dyn_cast<StoreOp>(operation);
+        auto load = dyn_cast<PhysicalLoadOp>(operation);
+        auto store = dyn_cast<PhysicalStoreOp>(operation);
         Value sourceStorage = load ? load.getStorage() : store.getStorage();
         auto view = dyn_cast<TensorViewType>(sourceStorage.getType());
         if (!view)
@@ -339,19 +339,12 @@ struct AggregateViewPattern final : ConversionPattern {
             return operation->emitError("cannot resolve aggregate TensorView storage layout");
         const unsigned storagePosition = load ? 0 : 1;
         const unsigned indicesPosition = storagePosition + 1;
-        if (operands.size() != indicesPosition + view.getShape().size() ||
-            operands[storagePosition].size() != layout->leaves.size())
+        if (operands.size() != indicesPosition + 1 || operands[storagePosition].size() != layout->leaves.size())
             return operation->emitError("aggregate TensorView conversion received an invalid operand mapping");
         ValueRange storageOperands = operands[storagePosition];
-        SmallVector<Value> indices;
-        for (unsigned position = 0; position < view.getShape().size(); ++position) {
-            if (operands[indicesPosition + position].size() != 1)
-                return operation->emitError("aggregate TensorView index conversion is invalid");
-            indices.push_back(operands[indicesPosition + position].front());
-        }
-        if (!operation->hasAttr(kPhysicalIndexAttrName) || indices.empty())
-            return operation->emitError("aggregate TensorView is missing its materialized physical index");
-        Value recordIndex = indices.front();
+        if (operands[indicesPosition].size() != 1)
+            return operation->emitError("aggregate TensorView physical index conversion is invalid");
+        Value recordIndex = operands[indicesPosition].front();
         Location loc = operation->getLoc();
         if (load) {
             SmallVector<Value> leaves;
@@ -464,8 +457,8 @@ LogicalResult storeAggregateRecordToStorages(Type elementType, ValueRange storag
 
 void populateCpuAggregateTensorViewPatterns(TypeConverter &converter, RewritePatternSet &patterns, ModuleOp module) {
     MLIRContext *context = patterns.getContext();
-    patterns.add<AggregateViewPattern>(converter, context, module, LoadOp::getOperationName());
-    patterns.add<AggregateViewPattern>(converter, context, module, StoreOp::getOperationName());
+    patterns.add<AggregateViewPattern>(converter, context, module, PhysicalLoadOp::getOperationName());
+    patterns.add<AggregateViewPattern>(converter, context, module, PhysicalStoreOp::getOperationName());
     patterns.add<AggregateWorkgroupAllocPattern>(converter, context, module);
 }
 
@@ -494,23 +487,19 @@ LogicalResult lowerGpuAggregateWorkgroupStorage(gpu::GPUFuncOp kernel, ModuleOp 
             users.push_back(user);
         for (Operation *user : users) {
             storageRewriter.setInsertionPoint(user);
-            if (auto load = dyn_cast<LoadOp>(user)) {
-                if (!load->hasAttr(kPhysicalIndexAttrName) || load.getIndices().empty())
-                    return load.emitError("aggregate workgroup load is missing its materialized physical index");
+            if (auto load = dyn_cast<PhysicalLoadOp>(user)) {
                 FailureOr<Value> value = loadAggregateRecordFromStorages(
-                    view.getElementType(), storages, load.getIndices().front(), plan->layout, module, storageRewriter,
+                    view.getElementType(), storages, load.getIndex(), plan->layout, module, storageRewriter,
                     load.getLoc(), AggregateStorageBackend::WorkgroupTensorView);
                 if (failed(value))
                     return load.emitError("cannot reconstruct aggregate workgroup value");
                 storageRewriter.replaceOp(load, *value);
                 continue;
             }
-            if (auto store = dyn_cast<StoreOp>(user)) {
-                if (!store->hasAttr(kPhysicalIndexAttrName) || store.getIndices().empty())
-                    return store.emitError("aggregate workgroup store is missing its materialized physical index");
+            if (auto store = dyn_cast<PhysicalStoreOp>(user)) {
                 if (failed(storeAggregateRecordToStorages(
-                        view.getElementType(), storages, store.getIndices().front(), store.getValue(), plan->layout,
-                        module, storageRewriter, store.getLoc(), AggregateStorageBackend::WorkgroupTensorView)))
+                        view.getElementType(), storages, store.getIndex(), store.getValue(), plan->layout, module,
+                        storageRewriter, store.getLoc(), AggregateStorageBackend::WorkgroupTensorView)))
                     return store.emitError("cannot decompose aggregate workgroup value");
                 storageRewriter.eraseOp(store);
                 continue;

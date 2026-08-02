@@ -180,7 +180,14 @@ bool DeviceState::downloadImage2D(const Image &image, Size width, Size height, E
     }
     driver.bindFramebuffer(kFramebuffer, framebuffer);
     ++framebufferGeneration;
-    driver.framebufferTexture2D(kFramebuffer, kColorAttachment0, kTexture2D, image.name, 0);
+    const bool depthStencil = externalFormat == 0x84F9;
+    driver.framebufferTexture2D(kFramebuffer, depthStencil ? kDepthStencilAttachment : kColorAttachment0, kTexture2D,
+                                image.name, 0);
+    if (depthStencil) {
+        const Enum none = kNone;
+        driver.drawBuffers(1, &none);
+        driver.readBuffer(kNone);
+    }
     if (driver.checkFramebufferStatus(kFramebuffer) != kFramebufferComplete) {
         driver.deleteFramebuffers(1, &framebuffer);
         error = "OpenGL image is not readable as an attachment";

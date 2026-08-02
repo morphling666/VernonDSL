@@ -2,6 +2,7 @@
 #include "VernonRuntime.h"
 #include "VernonVersions.h"
 #include "runtime_rhi_test_utils.h"
+#include "vernon_test_support.h"
 
 #include <cstring>
 #include <gtest/gtest.h>
@@ -17,9 +18,7 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
       %values: !vernon.tensor_view<f32, [-1], "read_write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64,
-        vernon.tensor_strides = array<i64: 1>,
-        vernon.tensor_offset = 0 : i64
+        vernon.binding = 0 : i64
       },
       %id: index {
         vernon.interface = "input",
@@ -81,7 +80,9 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.compute_grid = {8, 1, 1};
-    ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
+    ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK)
+        << "RHI: " << vernon::test::text(vernonRhiDeviceGetLastError(context.device))
+        << "; runtime: " << vernon::test::text(vernonRuntimeGetLastError(runtime));
     ASSERT_EQ(vernonRhiDeviceDownloadBuffer(context.device, buffer.handle, 0, output, sizeof(output)),
               VERNON_RHI_STATUS_OK);
     for (int index = 0; index < 8; ++index)

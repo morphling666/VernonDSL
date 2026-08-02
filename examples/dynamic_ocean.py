@@ -92,10 +92,17 @@ def create_ocean_grid(grid: int, extent: float) -> OceanGrid:
     )
 
 
-def create_seabed(extent: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def create_seabed(
+    extent: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     half = extent * 0.49
     positions = np.array(
-        ((-half, -0.62, -half), (-half, -0.62, half), (half, -0.62, half), (half, -0.62, -half)),
+        (
+            (-half, -0.62, -half),
+            (-half, -0.62, half),
+            (half, -0.62, half),
+            (half, -0.62, -half),
+        ),
         dtype=np.float32,
     )
     normals = np.tile(np.array((0.0, 1.0, 0.0), dtype=np.float32), (4, 1))
@@ -107,7 +114,7 @@ def create_seabed(extent: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compute-driven holographic ocean with PBR, shadows, and cubemap IBL.")
-    parser.add_argument("--arch", choices=("vulkan", "directx", "opengl"), default="vulkan")
+    parser.add_argument("--arch", choices=("vulkan", "directx", "metal", "opengl"), default="vulkan")
     parser.add_argument("--size", type=int, default=640)
     parser.add_argument("--grid", type=int, default=192)
     parser.add_argument("--extent", type=float, default=14.0)

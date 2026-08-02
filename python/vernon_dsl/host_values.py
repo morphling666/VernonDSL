@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import importlib
+import json
+from collections.abc import Iterator
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Annotated, Any, get_args, get_origin, get_type_hints
@@ -27,8 +30,12 @@ class HostAbiLayout:
     field_offsets: tuple[int, ...] = ()
 
 
-def _align_to(value: int, alignment: int) -> int:
-    return (value + alignment - 1) // alignment * alignment
+@dataclass(frozen=True)
+class _NativeLayoutNode:
+    size: int
+    alignment: int
+    field_offsets: tuple[int, ...]
+    element_stride: int | None
 
 
 def _struct_fields(cls: type[Any]) -> MappingProxyType[str, Any]:
@@ -47,33 +54,46 @@ def _struct_fields(cls: type[Any]) -> MappingProxyType[str, Any]:
 
 
 def _product_abi_layout(
+    node: _NativeLayoutNode,
     fields: tuple[tuple[str, Any], ...],
     active_structs: frozenset[type[Any]],
+    nodes: Iterator[_NativeLayoutNode],
 ) -> HostAbiLayout:
-    layouts = tuple(host_abi_layout(annotation, active_structs) for _, annotation in fields)
-    offset = 0
-    alignment = 1
-    offsets: list[int] = []
-    for layout in layouts:
-        offset = _align_to(offset, layout.alignment)
-        offsets.append(offset)
-        offset += layout.size
-        alignment = max(alignment, layout.alignment)
-    size = _align_to(offset, alignment)
+    layouts: list[HostAbiLayout] = []
+    for _, field in fields:
+        layouts.append(_consume_native_layout(field, nodes, active_structs))
     names = tuple(name for name, _ in fields)
+    if len(node.field_offsets) != len(fields):
+        raise RuntimeError("native Value ABI product field count does not match its host type")
     dtype = np.dtype(
         {
             "names": names,
             "formats": [layout.dtype for layout in layouts],
-            "offsets": offsets,
-            "itemsize": size,
+            "offsets": node.field_offsets,
+            "itemsize": node.size,
         }
     )
-    return HostAbiLayout(dtype, size, alignment, names, tuple(offsets))
+    return HostAbiLayout(dtype, node.size, node.alignment, names, node.field_offsets)
 
 
-def host_abi_layout(annotation: Any, active_structs: frozenset[type[Any]] = frozenset()) -> HostAbiLayout:
-    """Resolve the canonical Value ABI into an exact NumPy storage dtype."""
+def host_abi_layout(annotation: Any) -> HostAbiLayout:
+    """Build an exact NumPy dtype from the native canonical Value ABI plan."""
+    nodes = iter(_native_value_abi_plan(annotation))
+    layout = _consume_native_layout(annotation, nodes, frozenset())
+    if next(nodes, None) is not None:
+        raise RuntimeError("native Value ABI plan contains unconsumed layout nodes")
+    return layout
+
+
+def _consume_native_layout(
+    annotation: Any,
+    nodes: Iterator[_NativeLayoutNode],
+    active_structs: frozenset[type[Any]],
+) -> HostAbiLayout:
+    try:
+        node = next(nodes)
+    except StopIteration:
+        raise RuntimeError("native Value ABI plan ended before its host type") from None
     annotation = _base_annotation(annotation)
     if annotation is int:
         annotation = _Scalar("i32")
@@ -81,12 +101,16 @@ def host_abi_layout(annotation: Any, active_structs: frozenset[type[Any]] = froz
         annotation = _Scalar("f32")
     if isinstance(annotation, _Scalar):
         dtype = np.dtype(_DTYPES[annotation.name])
-        return HostAbiLayout(dtype, dtype.itemsize, dtype.itemsize)
+        if dtype.itemsize != node.size:
+            raise RuntimeError("NumPy scalar size does not match the native canonical Value ABI")
+        return HostAbiLayout(dtype, node.size, node.alignment)
     if isinstance(annotation, TypeExpr):
         if annotation.name == "Tuple":
             return _product_abi_layout(
+                node,
                 tuple((str(index), element) for index, element in enumerate(annotation.arguments)),
                 active_structs,
+                nodes,
             )
         if annotation.name == "Tensor" and len(annotation.arguments) == 2:
             element, shape = annotation.arguments
@@ -100,18 +124,107 @@ def host_abi_layout(annotation: Any, active_structs: frozenset[type[Any]] = froz
             raise TypeError(f"{annotation.name} has no canonical host ABI")
         if not shape or any(not isinstance(extent, int) or extent <= 0 for extent in shape):
             raise TypeError("Tensor host ABI requires a positive static shape")
-        element_layout = host_abi_layout(element, active_structs)
-        count = int(np.prod(shape, dtype=np.int64))
+        element_layout = _consume_native_layout(element, nodes, active_structs)
+        if node.element_stride != element_layout.size:
+            raise RuntimeError("NumPy cannot represent the native canonical Tensor element stride")
         dtype = np.dtype((element_layout.dtype, shape))
-        return HostAbiLayout(dtype, element_layout.size * count, element_layout.alignment)
+        if dtype.itemsize != node.size:
+            raise RuntimeError("NumPy cannot represent the native canonical Tensor Value ABI")
+        return HostAbiLayout(dtype, node.size, node.alignment)
     if isinstance(annotation, type) and getattr(annotation, "__vernon_dsl__", (None, {}))[0] == "struct":
         if annotation in active_structs:
             raise TypeError(f"recursive Struct '{annotation.__name__}' has no finite host ABI")
         return _product_abi_layout(
+            node,
             tuple(_struct_fields(annotation).items()),
             active_structs | {annotation},
+            nodes,
         )
     raise TypeError(f"{annotation!r} is not an ABI-stable host Value")
+
+
+def _native_value_abi_plan(annotation: Any) -> tuple[_NativeLayoutNode, ...]:
+    declarations: dict[str, tuple[tuple[str, str], ...]] = {}
+
+    def describe(value: Any, active: frozenset[type[Any]] = frozenset()) -> tuple[str, tuple[str, ...]]:
+        value = _base_annotation(value)
+        if value is int:
+            value = _Scalar("i32")
+        elif value is float:
+            value = _Scalar("f32")
+        if isinstance(value, _Scalar):
+            spelling = "i1" if value.name == "bool" else "i32" if value.name in {"i32", "u32"} else value.name
+            return spelling, (value.name,)
+        if isinstance(value, TypeExpr):
+            if value.name == "Tuple":
+                elements = tuple(describe(element, active) for element in value.arguments)
+                spelling = f"tuple<{', '.join(element[0] for element in elements)}>"
+                return spelling, tuple(dtype for _, dtypes in elements for dtype in dtypes)
+            if value.name == "Tensor" and len(value.arguments) == 2:
+                element, shape = value.arguments
+                if not isinstance(shape, tuple):
+                    raise TypeError("Tensor host ABI shape must be a tuple")
+            elif value.name in {"Vector", "Matrix"}:
+                rank = 1 if value.name == "Vector" else 2
+                element = value.arguments[0]
+                shape = tuple(value.arguments[1 : rank + 1])
+            else:
+                raise TypeError(f"{value.name} has no canonical host ABI")
+            if not shape or any(not isinstance(extent, int) or extent <= 0 for extent in shape):
+                raise TypeError("Tensor host ABI requires a positive static shape")
+            element_spelling, element_dtypes = describe(element, active)
+            dimensions = "x".join(str(extent) for extent in shape)
+            element_base = _base_annotation(element)
+            if element_base is int or element_base is float or isinstance(element_base, _Scalar):
+                return f"tensor<{dimensions}x{element_spelling}>", element_dtypes
+            shape_text = ", ".join(str(extent) for extent in shape)
+            return (
+                f"!vernon.tensor<{element_spelling}, [{shape_text}]>",
+                element_dtypes * int(np.prod(shape, dtype=np.int64)),
+            )
+        if isinstance(value, type) and getattr(value, "__vernon_dsl__", (None, {}))[0] == "struct":
+            if value in active:
+                raise TypeError(f"recursive Struct '{value.__name__}' has no finite host ABI")
+            field_descriptions = tuple(
+                (name, *describe(field, active | {value})) for name, field in _struct_fields(value).items()
+            )
+            fields = tuple((name, field_spelling) for name, field_spelling, _ in field_descriptions)
+            previous = declarations.setdefault(value.__name__, fields)
+            if previous != fields:
+                raise TypeError(f"conflicting Struct declarations named '{value.__name__}'")
+            dtypes = tuple(dtype for _, _, field_dtypes in field_descriptions for dtype in field_dtypes)
+            return f'!vernon.struct<"{value.__name__}">', dtypes
+        raise TypeError(f"{value!r} is not an ABI-stable host Value")
+
+    type_spelling, logical_dtypes = describe(annotation)
+    declaration_lines = []
+    for name, fields in sorted(declarations.items()):
+        field_text = ", ".join(json.dumps(f"{field_name}:{field_type}") for field_name, field_type in fields)
+        declaration_lines.append(
+            f'  "vernon.struct"() {{fields = [{field_text}], sym_name = {json.dumps(name)}}} : () -> ()'
+        )
+    module = "\n".join(
+        [
+            "module {",
+            *declaration_lines,
+            f"  func.func private @__vernon_plan_value_abi(%value: {type_spelling})",
+            "}",
+        ]
+    )
+    native = importlib.import_module("vernon_dsl._native")
+    raw_nodes = native._plan_value_abi(module, logical_dtypes)
+    nodes = tuple(
+        _NativeLayoutNode(
+            int(size),
+            int(alignment),
+            tuple(int(offset) for offset in offsets),
+            None if element_stride is None else int(element_stride),
+        )
+        for size, alignment, offsets, element_stride in raw_nodes
+    )
+    if not nodes:
+        raise RuntimeError("native Value ABI planner returned no layout nodes")
+    return nodes
 
 
 def host_scalar_shape(annotation: Any) -> tuple[_Scalar, tuple[int, ...]]:

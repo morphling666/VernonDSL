@@ -27,43 +27,6 @@ class ProductionChecksUnderOptimizationTests(unittest.TestCase):
         result = _run_optimized("import sys; sys.exit(0 if not __debug__ else 2)")
         self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
 
-    def test_tensor_view_layout_validation_raises_under_optimization(self) -> None:
-        script = textwrap.dedent(
-            """
-            import sys
-            import tempfile
-            from pathlib import Path
-
-            from vernon_dsl import Compiler
-            from vernon_dsl.compiler import FrontendCompileRequest
-
-            source = (
-                "from vernon_dsl import *\\n"
-                "@kernel\\n"
-                "def read(value: TensorView[f32, (2, dyn), read]) -> None:\\n"
-                "    pass\\n"
-            )
-            with tempfile.TemporaryDirectory() as directory:
-                path = Path(directory) / "invalid_view.py"
-                path.write_text(source, encoding="utf-8")
-                try:
-                    Compiler().compile_request(
-                        FrontendCompileRequest(
-                            path,
-                            "read",
-                            tensor_view_layouts=(("value", "<f4", (3, 4), (4, 1), 0),),
-                        )
-                    )
-                except ValueError as error:
-                    if "dimension 0 is 3, expected 2" in str(error):
-                        sys.exit(0)
-                    raise
-            sys.exit("expected ValueError for invalid TensorView specialization")
-            """
-        )
-        result = _run_optimized(script)
-        self.assertEqual(result.returncode, 0, msg=result.stderr or result.stdout)
-
     def test_execution_graph_requires_declared_graph_under_optimization(self) -> None:
         script = textwrap.dedent(
             """

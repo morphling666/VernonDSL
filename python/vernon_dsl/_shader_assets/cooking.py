@@ -8,11 +8,13 @@ from typing import Any, Mapping
 from .._versions import PIPELINE_VERSION
 from ..bundle import (
     CompiledStage,
+    OpenGLTargetOptions,
     PipelineCompileError,
     TargetOptions,
     build_bundle_plan,
     canonical_json,
     compiled_stage_from_program,
+    make_target_options,
     materialize_bundle,
 )
 from ..compiler import compile_file
@@ -63,24 +65,15 @@ def _cpu_object_format(filename: str, target_triple: str) -> str:
     return "elf"
 
 
-def _manifest_target_options(options: Mapping[str, Any]) -> dict[str, Any]:
-    result = dict(options)
-    if result.get("glsl_version") == 0:
-        result.pop("glsl_version")
-    for name in ("target_triple", "cpu", "cpu_features"):
-        if result.get(name) == "":
-            result.pop(name)
-    return result
-
-
 def _cpu_stage_metadata(stage: CompiledStage) -> dict[str, Any]:
     symbol = stage.interface.get("symbol")
-    reflected_options = stage.reflection.get("target_options")
+    reflected_target = stage.reflection.get("target")
+    reflected_options = reflected_target.get("options") if isinstance(reflected_target, Mapping) else None
     if not isinstance(symbol, str) or not symbol:
         raise PipelineCompileError(f"CPU compiler reflection has no exported symbol for {stage.entry}")
     if not isinstance(reflected_options, Mapping):
         raise PipelineCompileError("CPU compiler reflection has no target options")
-    target_triple = reflected_options.get("target_triple")
+    target_triple = reflected_options.get("triple")
     if not isinstance(target_triple, str) or not target_triple:
         raise PipelineCompileError("CPU compiler reflection has no normalized target triple")
     metadata: dict[str, Any] = {
@@ -89,10 +82,12 @@ def _cpu_stage_metadata(stage: CompiledStage) -> dict[str, Any]:
         "target_triple": target_triple,
         "object_format": _cpu_object_format(stage.artifact.filename, target_triple),
     }
-    for name in ("cpu", "cpu_features"):
-        value = reflected_options.get(name)
+    for source_name, metadata_name in (("processor", "cpu"), ("features", "cpu_features")):
+        value = reflected_options.get(source_name)
         if isinstance(value, str):
-            metadata[name] = value
+            metadata[metadata_name] = value
+        elif source_name == "features" and isinstance(value, list) and all(isinstance(item, str) for item in value):
+            metadata[metadata_name] = ",".join(value)
     return metadata
 
 
@@ -114,21 +109,6 @@ def _compile_stage(
         entry=reference.entry,
         target=target,
     )
-    reflected_options = compiled.reflection.get("target_options")
-    if isinstance(reflected_options, Mapping):
-        # Persist the compiler's normalized options (notably the default CPU
-        # target triple), so the manifest describes the artifact that was built.
-        compiled = CompiledStage(
-            compiled.module,
-            compiled.module_manifest,
-            compiled.entry,
-            compiled.stage,
-            TargetOptions(target.target, _manifest_target_options(reflected_options)),
-            compiled.reflection,
-            compiled.interface,
-            compiled.artifact,
-            compiled.metadata,
-        )
     if compiled.stage != stage:
         raise PipelineCompileError(f"compiler reflected {reference.entry} as {compiled.stage}, expected {stage}")
     if target.target == "cpu":
@@ -152,22 +132,25 @@ def cook_pipeline_asset(
     *,
     pipeline_asset: str | Path,
     output: str | Path,
-    target: str = "opengl",
-    target_options: Mapping[str, Any] | None = None,
+    target: TargetOptions | str | None = None,
 ) -> Path:
     source, descriptor_name = pipeline_asset_reference(pipeline_asset)
     pipeline = parse_python_pipeline_asset(source, descriptor_name)
-    target = "directx" if target == "dx" else target
-    if target == "cpu" and set(pipeline.stages) != {"compute"}:
+    if target is None:
+        target = OpenGLTargetOptions()
+    elif isinstance(target, str):
+        target = make_target_options(target)
+    target_name = target.target
+    if target_name == "cpu" and set(pipeline.stages) != {"compute"}:
         raise PipelineCompileError("CPU pipeline bundles support one compute stage and no graphics or barrier steps")
     for stage in pipeline.stages:
         try:
-            validate_stage_target(stage, target)
+            validate_stage_target(stage, target_name)
         except ValueError as error:
             raise PipelineCompileError(str(error)) from None
-    resolved_target = TargetOptions(target, target_options or {})
+    resolved_target = target
     native = _native_module()
-    native_target = _native_target(native, target)
+    native_target = _native_target(native, target_name)
     selected_modules: dict[str, ShaderModuleDescriptor] = {}
     declared_features: set[str] = set()
     for stage, reference in pipeline.stages.items():
@@ -195,7 +178,7 @@ def cook_pipeline_asset(
                 reference.module,
                 reference.entry,
                 hashlib.sha256(mlir.encode()).hexdigest(),
-                canonical_json({"target": resolved_target.target, "options": dict(resolved_target.options)}),
+                canonical_json(resolved_target.spec),
             )
             compiled = compile_cache.get(key)
             if compiled is None:
@@ -207,9 +190,7 @@ def cook_pipeline_asset(
         planned_variants.append((variant, stages))
 
     compiled_targets = {
-        canonical_json({"target": stage.target.target, "options": dict(stage.target.options)}): stage.target
-        for _, stages in planned_variants
-        for stage in stages.values()
+        canonical_json(stage.target.spec): stage.target for _, stages in planned_variants for stage in stages.values()
     }
     if len(compiled_targets) != 1:
         raise PipelineCompileError("compiler returned inconsistent target options across pipeline stages")

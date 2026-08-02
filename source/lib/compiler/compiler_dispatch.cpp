@@ -25,7 +25,7 @@ std::string copyStringView(VernonStringView value) {
 bool validateTargetCapabilities(PreparedModule &prepared, VernonTarget target, std::string &diagnostics) {
     mlir::OwningOpRef<mlir::ModuleOp> module = prepared.clone();
     bool usesDeviceAtomics = false;
-    module->walk([&](mlir::vernon::AtomicOp atomic) {
+    module->walk([&](mlir::vernon::PhysicalAtomicOp atomic) {
         auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(atomic.getStorage().getType());
         usesDeviceAtomics |= view && view.getAddressSpace() == "device";
     });
@@ -40,12 +40,13 @@ bool validateTargetCapabilities(PreparedModule &prepared, VernonTarget target, s
         bool invalid = false;
         module->walk([&](mlir::Operation *operation) {
             if (invalid ||
-                !mlir::isa<mlir::vernon::WorkgroupAllocOp, mlir::vernon::AtomicOp, mlir::vernon::BarrierOp>(operation))
+                !mlir::isa<mlir::vernon::WorkgroupAllocOp, mlir::vernon::PhysicalAtomicOp, mlir::vernon::BarrierOp>(
+                    operation))
                 return;
-            if (auto atomic = mlir::dyn_cast<mlir::vernon::AtomicOp>(operation); atomic) {
+            if (auto atomic = mlir::dyn_cast<mlir::vernon::PhysicalAtomicOp>(operation); atomic) {
                 auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(atomic.getStorage().getType());
                 if (!view) {
-                    diagnostics = "atomic storage operand is not a TensorView";
+                    diagnostics = "physical atomic storage operand is not a TensorView";
                     invalid = true;
                     return;
                 }
@@ -117,100 +118,143 @@ VernonTargetCapabilities targetCapabilities(VernonTarget target) {
     return VernonTargetCapabilities{0, 0, 0, 0};
 }
 
-VernonStatus parseCompileOptions(const VernonCompileOptions *source, VernonTarget target, CompileOptions &options,
+CompileOptions defaultCompileOptions(VernonTarget target) {
+    switch (target) {
+    case VERNON_TARGET_CPU:
+        return CpuCodegenOptions{};
+    case VERNON_TARGET_OPENGL:
+    case VERNON_TARGET_OPENGL_ES:
+        return OpenGLCompileOptions{target, 0};
+    case VERNON_TARGET_VULKAN:
+        return VulkanCompileOptions{};
+    case VERNON_TARGET_METAL:
+        return MetalCompileOptions{};
+    case VERNON_TARGET_DIRECTX:
+        return DirectXCompileOptions{};
+    case VERNON_TARGET_CUDA:
+        return CudaCompileOptions{};
+    }
+    return VulkanCompileOptions{};
+}
+
+VernonTarget compileTargetKind(const CompileOptions &options) {
+    if (std::holds_alternative<CpuCodegenOptions>(options))
+        return VERNON_TARGET_CPU;
+    if (const auto *opengl = std::get_if<OpenGLCompileOptions>(&options))
+        return opengl->target;
+    if (std::holds_alternative<VulkanCompileOptions>(options))
+        return VERNON_TARGET_VULKAN;
+    if (std::holds_alternative<MetalCompileOptions>(options))
+        return VERNON_TARGET_METAL;
+    if (std::holds_alternative<DirectXCompileOptions>(options))
+        return VERNON_TARGET_DIRECTX;
+    return VERNON_TARGET_CUDA;
+}
+
+VernonStatus parseCompileOptions(const VernonCompileOptions &source, CompileOptions &options,
                                  std::string &diagnostics) {
-    if (!source)
-        return VERNON_STATUS_OK;
-    constexpr size_t requiredSize = offsetof(VernonCompileOptions, glsl_version) + sizeof(uint32_t);
-    if (source->struct_size < requiredSize) {
+    if (source.struct_size < sizeof(VernonCompileOptions)) {
         diagnostics = "compile options structure is too small";
         return VERNON_STATUS_INVALID_ARGUMENT;
     }
-    options.glslVersion = source->glsl_version;
-    if (options.glslVersion != 0 && target != VERNON_TARGET_OPENGL && target != VERNON_TARGET_OPENGL_ES) {
-        diagnostics = "GLSL version is valid only for OpenGL and OpenGL ES targets";
+    if (source.target < VERNON_TARGET_CPU || source.target > VERNON_TARGET_CUDA) {
+        diagnostics = "unknown compilation target";
         return VERNON_STATUS_INVALID_ARGUMENT;
     }
-    if (options.glslVersion != 0 && (options.glslVersion < 100 || options.glslVersion > 999)) {
-        diagnostics = "GLSL version must be a three-digit version number";
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    }
-    const uint32_t requestedHlslShaderModel =
-        source->struct_size >= offsetof(VernonCompileOptions, hlsl_shader_model) + sizeof(uint32_t)
-            ? source->hlsl_shader_model
-            : 0;
-    if (requestedHlslShaderModel != 0)
-        options.hlslShaderModel = requestedHlslShaderModel;
-    const bool validHlslShaderModel = options.hlslShaderModel >= 60;
-    if (requestedHlslShaderModel != 0 && target != VERNON_TARGET_DIRECTX) {
-        diagnostics = "HLSL Shader Model is valid only for the DirectX target";
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    }
-    if (target == VERNON_TARGET_DIRECTX && !validHlslShaderModel) {
-        diagnostics = "DirectX runtime artifacts require HLSL Shader Model 6.0 or newer";
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    }
-    auto readCpuOption = [&](size_t offset, std::string &destination) {
-        if (source->struct_size < offset + sizeof(VernonStringView))
+    if (source.target == VERNON_TARGET_CPU) {
+        CpuCodegenOptions cpu;
+        auto readCpuOption = [&](VernonStringView value, std::string &destination) {
+            if (value.size != 0 && !value.data) {
+                diagnostics = "CPU compile option has null data";
+                return false;
+            }
+            destination = copyStringView(value);
             return true;
-        VernonStringView value{};
-        std::memcpy(&value, reinterpret_cast<const char *>(source) + offset, sizeof(value));
-        if (value.size != 0 && !value.data) {
-            diagnostics = "CPU compile option has null data";
-            return false;
+        };
+        if (!readCpuOption(source.as.cpu.triple, cpu.targetTriple) ||
+            !readCpuOption(source.as.cpu.processor, cpu.cpu) || !readCpuOption(source.as.cpu.features, cpu.features))
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        options = std::move(cpu);
+    } else if (source.target == VERNON_TARGET_OPENGL || source.target == VERNON_TARGET_OPENGL_ES) {
+        const uint32_t version = source.as.opengl.version;
+        if (version != 0 && (version < 100 || version > 999)) {
+            diagnostics = "OpenGL version must be a three-digit GLSL version number";
+            return VERNON_STATUS_INVALID_ARGUMENT;
         }
-        destination = copyStringView(value);
-        return true;
-    };
-    if (!readCpuOption(offsetof(VernonCompileOptions, cpu_target_triple), options.cpu.targetTriple) ||
-        !readCpuOption(offsetof(VernonCompileOptions, cpu_name), options.cpu.cpu) ||
-        !readCpuOption(offsetof(VernonCompileOptions, cpu_features), options.cpu.features))
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    if (target != VERNON_TARGET_CPU &&
-        (!options.cpu.targetTriple.empty() || !options.cpu.cpu.empty() || !options.cpu.features.empty())) {
-        diagnostics = "CPU code generation options are valid only for the CPU target";
-        return VERNON_STATUS_INVALID_ARGUMENT;
+        options = OpenGLCompileOptions{source.target, version};
+    } else if (source.target == VERNON_TARGET_METAL) {
+        if (source.as.metal.platform != VERNON_METAL_PLATFORM_MACOS &&
+            source.as.metal.platform != VERNON_METAL_PLATFORM_IOS) {
+            diagnostics = "Metal platform must be macOS or iOS";
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        }
+        options = MetalCompileOptions{source.as.metal.platform};
+    } else if (source.target == VERNON_TARGET_DIRECTX) {
+        const uint32_t shaderModel = source.as.directx.shader_model == 0 ? 60 : source.as.directx.shader_model;
+        if (shaderModel < 60) {
+            diagnostics = "DirectX runtime artifacts require HLSL Shader Model 6.0 or newer";
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        }
+        options = DirectXCompileOptions{shaderModel};
+    } else {
+        options = defaultCompileOptions(source.target);
     }
     return VERNON_STATUS_OK;
 }
 
-VernonStatus compileTarget(PreparedModule &module, VernonTarget target, const CompileOptions &options,
-                           std::vector<Artifact> &artifacts, std::string &reflection, std::string &diagnostics,
-                           CpuExecutionStatePtr &cpuExecution) {
+VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options, std::vector<Artifact> &artifacts,
+                           std::string &reflection, std::string &diagnostics, CpuExecutionStatePtr &cpuExecution) {
+    const VernonTarget target = compileTargetKind(options);
     diagnostics.clear();
     if (!validateTargetCapabilities(module, target, diagnostics)) {
         artifacts.clear();
         return VERNON_STATUS_UNSUPPORTED_TARGET;
     }
     if (target == VERNON_TARGET_CPU) {
-        if (!compileCpu(module, options.cpu, artifacts, reflection, diagnostics, cpuExecution)) {
+        const auto &cpu = std::get<CpuCodegenOptions>(options);
+        if (!compileCpu(module, cpu, artifacts, reflection, diagnostics, cpuExecution)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }
-        addArtifactTable(reflection, artifacts, target, options.glslVersion, options.cpu.targetTriple, options.cpu.cpu,
-                         options.cpu.features);
+        if (!addArtifactTable(reflection, diagnostics, artifacts, options)) {
+            artifacts.clear();
+            return VERNON_STATUS_INTERNAL_ERROR;
+        }
         return VERNON_STATUS_OK;
     }
     if (target == VERNON_TARGET_VULKAN || target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES ||
         target == VERNON_TARGET_METAL || target == VERNON_TARGET_DIRECTX) {
+        const uint32_t glslVersion = target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES
+                                         ? std::get<OpenGLCompileOptions>(options).version
+                                         : 0;
+        const uint32_t hlslShaderModel =
+            target == VERNON_TARGET_DIRECTX ? std::get<DirectXCompileOptions>(options).shaderModel : 60;
+        const VernonMetalPlatform metalPlatform = target == VERNON_TARGET_METAL
+                                                      ? std::get<MetalCompileOptions>(options).platform
+                                                      : VERNON_METAL_PLATFORM_MACOS;
+        std::vector<TargetResourceSlot> targetResourceSlots;
         if (!compileSpirv(module, target, artifacts, diagnostics)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }
         if (target != VERNON_TARGET_VULKAN &&
-            !crossCompileSpirv(artifacts, diagnostics, target, options.glslVersion, options.hlslShaderModel)) {
+            !crossCompileSpirv(artifacts, diagnostics, target, glslVersion, hlslShaderModel, metalPlatform,
+                               target == VERNON_TARGET_METAL ? &targetResourceSlots : nullptr)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }
         if (target == VERNON_TARGET_DIRECTX) {
             std::vector<Artifact> dxilArtifacts;
-            if (!compileHlslToDxil(artifacts, options.hlslShaderModel, dxilArtifacts, diagnostics)) {
+            if (!compileHlslToDxil(artifacts, hlslShaderModel, dxilArtifacts, diagnostics)) {
                 artifacts.clear();
                 return VERNON_STATUS_INTERNAL_ERROR;
             }
             artifacts = std::move(dxilArtifacts);
         }
-        addArtifactTable(reflection, artifacts, target, options.glslVersion, {}, {}, {}, options.hlslShaderModel);
+        if (!addArtifactTable(reflection, diagnostics, artifacts, options, targetResourceSlots)) {
+            artifacts.clear();
+            return VERNON_STATUS_INTERNAL_ERROR;
+        }
         return VERNON_STATUS_OK;
     }
     if (target == VERNON_TARGET_CUDA) {
@@ -218,7 +262,10 @@ VernonStatus compileTarget(PreparedModule &module, VernonTarget target, const Co
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }
-        addArtifactTable(reflection, artifacts, target, options.glslVersion);
+        if (!addArtifactTable(reflection, diagnostics, artifacts, options)) {
+            artifacts.clear();
+            return VERNON_STATUS_INTERNAL_ERROR;
+        }
         return VERNON_STATUS_OK;
     }
     artifacts.clear();

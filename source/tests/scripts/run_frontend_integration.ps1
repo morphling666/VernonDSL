@@ -83,7 +83,7 @@ try {
   }
   Remove-Item -Recurse -Force $openGlOutput -ErrorAction SilentlyContinue
   & $VernonCompiler --target opengl $runtimeMlirPath --output-dir $openGlOutput `
-    --glsl-version 330
+    --opengl-version 330
   if ($LASTEXITCODE -ne 0) {
     throw "OpenGL runtime shader compilation failed"
   }
@@ -97,8 +97,8 @@ try {
     ConvertFrom-Json
   if ($openGlReflection.compiler_contract_version -ne [int]$compilerContractVersion -or
       $openGlReflection.pipeline_version -ne [int]$pipelineVersion -or
-      $openGlReflection.target -ne "opengl" -or
-      $openGlReflection.target_options.glsl_version -ne 330 -or
+      $openGlReflection.target.kind -ne "opengl" -or
+      $openGlReflection.target.options.version -ne 330 -or
       $openGlReflection.artifacts.Count -ne 2 -or
       -not ($openGlReflection.artifacts.filename -contains "runtime_vertex.vert.glsl") -or
       -not ($openGlReflection.artifacts.filename -contains "runtime_fragment.frag.glsl")) {

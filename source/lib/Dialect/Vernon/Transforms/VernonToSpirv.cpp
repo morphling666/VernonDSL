@@ -61,6 +61,57 @@ FailureOr<Type> convertTensorType(RankedTensorType tensor, ModuleOp module) {
     return result;
 }
 
+FailureOr<Type> convertStd140TensorInterfaceType(RankedTensorType tensor, ModuleOp module) {
+    if (!tensor.hasStaticShape() || tensor.getRank() <= 2 ||
+        llvm::any_of(tensor.getShape(), [](int64_t extent) { return extent <= 0; }) ||
+        !tensor.getElementType().isIntOrFloat())
+        return failure();
+    FailureOr<PhysicalValueAbiLayout> layout =
+        getPhysicalValueAbiLayout(tensor, module, PhysicalAbiProfile::VulkanStd140UniformBuffer);
+    if (failed(layout) || layout->byteStrides.size() != static_cast<size_t>(tensor.getRank()))
+        return failure();
+    Type elementType = tensor.getElementType();
+    if (auto integer = dyn_cast<IntegerType>(elementType))
+        elementType = IntegerType::get(tensor.getContext(), integer.getWidth());
+    const unsigned bitWidth = elementType.getIntOrFloatBitWidth();
+    if (!bitWidth || bitWidth % 8 != 0)
+        return failure();
+    const uint64_t elementSize = bitWidth / 8;
+    const uint64_t scalarStride = layout->byteStrides.back();
+    if (scalarStride < elementSize || scalarStride % elementSize != 0)
+        return failure();
+    const uint64_t carrierComponents = scalarStride / elementSize;
+    if (carrierComponents < 2 || carrierComponents > std::numeric_limits<uint32_t>::max())
+        return failure();
+
+    Type result;
+    if (carrierComponents <= 4) {
+        result = VectorType::get({static_cast<int64_t>(carrierComponents)}, elementType);
+    } else {
+        SmallVector<Type> fields;
+        SmallVector<uint32_t> offsets;
+        uint64_t remaining = carrierComponents;
+        uint64_t offset = 0;
+        while (remaining) {
+            const uint64_t components = std::min<uint64_t>(remaining, 4);
+            fields.push_back(components == 1 ? elementType
+                                             : Type(VectorType::get({static_cast<int64_t>(components)}, elementType)));
+            offsets.push_back(static_cast<uint32_t>(offset));
+            offset += components * elementSize;
+            remaining -= components;
+        }
+        result = spirv::StructType::get(fields, offsets);
+    }
+    for (size_t dimension = tensor.getRank(); dimension-- > 0;) {
+        const uint64_t stride = layout->byteStrides[dimension];
+        if (stride > std::numeric_limits<unsigned>::max())
+            return failure();
+        result = spirv::ArrayType::get(result, static_cast<unsigned>(tensor.getDimSize(dimension)),
+                                       static_cast<unsigned>(stride));
+    }
+    return result;
+}
+
 FailureOr<Type> convertValueType(Type type, ModuleOp module = {}) {
     if (auto texture = dyn_cast<TextureType>(type)) {
         std::optional<spirv::Dim> dimension = llvm::StringSwitch<std::optional<spirv::Dim>>(texture.getDimension())
@@ -373,6 +424,48 @@ FailureOr<Value> constructComposite(Location location, Type type, ArrayRef<Value
     unsigned cursor = 0;
     FailureOr<Value> result = constructComposite(location, type, leaves, cursor, builder);
     return succeeded(result) && cursor == leaves.size() ? result : FailureOr<Value>(failure());
+}
+
+FailureOr<Value> unpackStd140TensorInterface(Location location, Value value, RankedTensorType sourceType,
+                                             Type logicalType, OpBuilder &builder) {
+    Type carrierType = value.getType();
+    for (int64_t dimension = 0; dimension < sourceType.getRank(); ++dimension) {
+        auto array = dyn_cast<spirv::ArrayType>(carrierType);
+        if (!array)
+            return failure();
+        carrierType = array.getElementType();
+    }
+    SmallVector<int32_t> carrierIndices;
+    while (carrierType != sourceType.getElementType()) {
+        if (auto structure = dyn_cast<spirv::StructType>(carrierType)) {
+            if (structure.getNumElements() == 0)
+                return failure();
+            carrierIndices.push_back(0);
+            carrierType = structure.getElementType(0);
+            continue;
+        }
+        if (auto vector = dyn_cast<VectorType>(carrierType)) {
+            carrierIndices.push_back(0);
+            carrierType = vector.getElementType();
+            continue;
+        }
+        return failure();
+    }
+
+    SmallVector<Value> leaves;
+    leaves.reserve(sourceType.getNumElements());
+    for (int64_t linearIndex = 0; linearIndex < sourceType.getNumElements(); ++linearIndex) {
+        SmallVector<int32_t> indices;
+        int64_t remaining = linearIndex;
+        for (int64_t dimension = sourceType.getRank() - 1; dimension >= 0; --dimension) {
+            indices.push_back(static_cast<int32_t>(remaining % sourceType.getDimSize(dimension)));
+            remaining /= sourceType.getDimSize(dimension);
+        }
+        std::reverse(indices.begin(), indices.end());
+        indices.append(carrierIndices);
+        leaves.push_back(spirv::CompositeExtractOp::create(builder, location, value, indices));
+    }
+    return constructComposite(location, logicalType, leaves, builder);
 }
 
 Value extractStaticTensorElement(Location location, Value value, RankedTensorType sourceType, int64_t linearIndex,
@@ -1254,7 +1347,7 @@ LogicalResult lowerWhile(scf::WhileOp whileOp, OpBuilder &builder, Block *functi
 }
 
 LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder &moduleBuilder,
-                         llvm::StringSet<> &usedInterfaceNames, bool aggregatePushConstants,
+                         llvm::StringSet<> &usedInterfaceNames, bool useVulkanInterfaceAbi,
                          const DenseMap<Value, std::pair<uint32_t, uint32_t>> &generatedBindings) {
     ModuleOp sourceModule = source->getParentOfType<ModuleOp>();
     auto stage = source->getAttrOfType<StringAttr>(kStageAttrName);
@@ -1278,7 +1371,7 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
     SmallVector<PushConstantMember> pushConstantMembers;
     uint32_t pushConstantSize = 0;
     for (auto [index, type] : llvm::enumerate(source.getArgumentTypes())) {
-        if (!aggregatePushConstants)
+        if (!useVulkanInterfaceAbi)
             break;
         InterfaceAttrs attrs = parseInterfaceAttrs(source.getArgAttrDict(index));
         auto kind = dyn_cast_if_present<StringAttr>(attrs.kind);
@@ -1343,17 +1436,17 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             return source.emitError() << "argument #" << index << " has no Vernon interface kind";
         PhysicalAbiProfile profile = kind.getValue() == "uniform" && isa<TensorType>(type)
                                          ? PhysicalAbiProfile::VulkanStd430StorageBuffer
-                                     : kind.getValue() == "uniform" && aggregatePushConstants && !attrs.binding
+                                     : kind.getValue() == "uniform" && useVulkanInterfaceAbi && !attrs.binding
                                          ? PhysicalAbiProfile::VulkanPushConstant
                                          : PhysicalAbiProfile::VulkanStd140UniformBuffer;
         FailureOr<PhysicalValueAbiLayout> physicalLayout = getPhysicalValueAbiLayout(type, sourceModule, profile);
         spirv::StorageClass storageClass = isa<TextureType>(type)         ? spirv::StorageClass::UniformConstant
                                            : kind.getValue() == "input"   ? spirv::StorageClass::Input
-                                           : kind.getValue() == "uniform" ? (attrs.binding || aggregatePushConstants
+                                           : kind.getValue() == "uniform" ? (attrs.binding || useVulkanInterfaceAbi
                                                                                  ? spirv::StorageClass::Uniform
                                                                                  : spirv::StorageClass::UniformConstant)
                                                                           : spirv::StorageClass::StorageBuffer;
-        if (aggregatePushConstants && kind.getValue() == "uniform" && !attrs.binding) {
+        if (useVulkanInterfaceAbi && kind.getValue() == "uniform" && !attrs.binding) {
             auto member = llvm::find_if(pushConstantMembers,
                                         [&](const PushConstantMember &value) { return value.argumentIndex == index; });
             if (member == pushConstantMembers.end())
@@ -1400,6 +1493,12 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
                 FailureOr<Type> scalarType = convertValueType(leaf.scalarType, sourceModule);
                 if (failed(scalarType))
                     return source.emitError() << "vertex input #" << index << " has an unsupported scalar leaf";
+                if (auto integer = dyn_cast<IntegerType>(*scalarType);
+                    integer && (leaf.dtype == "i32" || leaf.dtype == "u32")) {
+                    const auto signedness = leaf.dtype == "i32" ? IntegerType::SignednessSemantics::Signed
+                                                                : IntegerType::SignednessSemantics::Unsigned;
+                    scalarType = IntegerType::get(source.getContext(), integer.getWidth(), signedness);
+                }
                 Type leafType =
                     leaf.componentCount == 1 ? *scalarType : Type(VectorType::get({leaf.componentCount}, *scalarType));
                 NamedAttrList leafAttrs(argumentAttrs);
@@ -1410,7 +1509,17 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
                                                           storageClass, leafAttrs.getDictionary(source.getContext())));
             }
         } else {
-            globals.push_back(createInterfaceVariable(moduleBuilder, source.getLoc(), name, convertedType, storageClass,
+            Type interfaceType = convertedType;
+            if (auto tensor = dyn_cast<RankedTensorType>(type); tensor && tensor.getRank() > 2 &&
+                                                                kind.getValue() == "uniform" && attrs.binding &&
+                                                                useVulkanInterfaceAbi) {
+                FailureOr<Type> physicalType = convertStd140TensorInterfaceType(tensor, sourceModule);
+                if (failed(physicalType))
+                    return source.emitError() << "cannot lower rank-" << tensor.getRank()
+                                              << " std140 Tensor interface argument #" << index;
+                interfaceType = *physicalType;
+            }
+            globals.push_back(createInterfaceVariable(moduleBuilder, source.getLoc(), name, interfaceType, storageClass,
                                                       argumentAttrs,
                                                       succeeded(physicalLayout) ? &*physicalLayout : nullptr));
         }
@@ -1459,8 +1568,19 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
         if (!attribute) {
             Value loaded = spirv::LoadOp::create(bodyBuilder, source.getLoc(), pointer);
             FailureOr<Type> logicalType = convertValueType(argument.getType(), sourceModule);
-            if (succeeded(logicalType) && loaded.getType() != *logicalType)
-                loaded = spirv::BitcastOp::create(bodyBuilder, source.getLoc(), *logicalType, loaded);
+            if (failed(logicalType))
+                return source.emitError("cannot reconstruct logical interface value");
+            if (loaded.getType() != *logicalType) {
+                if (auto tensor = dyn_cast<RankedTensorType>(argument.getType()); tensor && tensor.getRank() > 2) {
+                    FailureOr<Value> unpacked =
+                        unpackStd140TensorInterface(source.getLoc(), loaded, tensor, *logicalType, bodyBuilder);
+                    if (failed(unpacked))
+                        return source.emitError("cannot unpack rank-three-or-higher std140 Tensor interface");
+                    loaded = *unpacked;
+                } else {
+                    loaded = spirv::BitcastOp::create(bodyBuilder, source.getLoc(), *logicalType, loaded);
+                }
+            }
             mapping.map(argument, loaded);
             continue;
         }
@@ -1469,6 +1589,13 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             Value leafPointer = spirv::AddressOfOp::create(bodyBuilder, source.getLoc(), global);
             Value leaf = spirv::LoadOp::create(bodyBuilder, source.getLoc(), leafPointer);
             flattenComposite(source.getLoc(), leaf, bodyBuilder, leaves);
+        }
+        for (Value &leaf : leaves) {
+            auto integer = dyn_cast<IntegerType>(leaf.getType());
+            if (!integer || integer.isSignless())
+                continue;
+            Type logicalInteger = IntegerType::get(source.getContext(), integer.getWidth());
+            leaf = spirv::BitcastOp::create(bodyBuilder, source.getLoc(), logicalInteger, leaf);
         }
         FailureOr<Type> converted = convertValueType(argument.getType(), sourceModule);
         FailureOr<Value> value = failed(converted)
@@ -1547,7 +1674,7 @@ struct VernonToSPIRVPass : public PassWrapper<VernonToSPIRVPass, OperationPass<M
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VernonToSPIRVPass)
 
     VernonToSPIRVPass() = default;
-    explicit VernonToSPIRVPass(bool aggregatePushConstants) : aggregatePushConstants(aggregatePushConstants) {}
+    explicit VernonToSPIRVPass(bool useVulkanInterfaceAbi) : useVulkanInterfaceAbi(useVulkanInterfaceAbi) {}
 
     StringRef getArgument() const final { return "vernon-to-spirv"; }
     StringRef getDescription() const final { return "Lower Vernon graphics and Vulkan compute entries to SPIR-V"; }
@@ -1617,7 +1744,7 @@ struct VernonToSPIRVPass : public PassWrapper<VernonToSPIRVPass, OperationPass<M
                 if (intrinsic.getName() == "texture_size")
                     ++expectedImageQueryCount;
             });
-            if (failed(lowerEntry(function, target, moduleBuilder, usedInterfaceNames, aggregatePushConstants,
+            if (failed(lowerEntry(function, target, moduleBuilder, usedInterfaceNames, useVulkanInterfaceAbi,
                                   generatedBindings))) {
                 target.erase();
                 return signalPassFailure();
@@ -1626,13 +1753,13 @@ struct VernonToSPIRVPass : public PassWrapper<VernonToSPIRVPass, OperationPass<M
         target->setAttr(kImageQueryExpectedCountAttr, builder.getI64IntegerAttr(expectedImageQueryCount));
     }
 
-    bool aggregatePushConstants = true;
+    bool useVulkanInterfaceAbi = true;
 };
 
 } // namespace
 
-std::unique_ptr<Pass> createVernonToSPIRVPass(bool aggregatePushConstants) {
-    return std::make_unique<VernonToSPIRVPass>(aggregatePushConstants);
+std::unique_ptr<Pass> createVernonToSPIRVPass(bool useVulkanInterfaceAbi) {
+    return std::make_unique<VernonToSPIRVPass>(useVulkanInterfaceAbi);
 }
 
 void registerVernonToSPIRVPass() { PassRegistration<VernonToSPIRVPass>(); }

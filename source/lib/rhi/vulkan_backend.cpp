@@ -16,6 +16,12 @@ bool check(VkResult result, const char *operation, std::string &error) {
     return false;
 }
 
+bool hasExtension(const std::vector<VkExtensionProperties> &extensions, std::string_view name) {
+    return std::any_of(extensions.begin(), extensions.end(), [name](const VkExtensionProperties &extension) {
+        return std::string_view(extension.extensionName) == name;
+    });
+}
+
 } // namespace
 
 uint32_t physicalDeviceTypeRank(VkPhysicalDeviceType type) {
@@ -53,8 +59,25 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
     application.pEngineName = "Vernon";
     application.engineVersion = VK_MAKE_API_VERSION(0, 0, 1, 0);
     application.apiVersion = VK_API_VERSION_1_1;
+    uint32_t instanceExtensionCount = 0;
+    if (!check(api.enumerateInstanceExtensionProperties(nullptr, &instanceExtensionCount, nullptr),
+               "vkEnumerateInstanceExtensionProperties", error))
+        return false;
+    std::vector<VkExtensionProperties> instanceExtensionProperties(instanceExtensionCount);
+    if (instanceExtensionCount && !check(api.enumerateInstanceExtensionProperties(nullptr, &instanceExtensionCount,
+                                                                                  instanceExtensionProperties.data()),
+                                         "vkEnumerateInstanceExtensionProperties", error))
+        return false;
+    std::vector<const char *> instanceExtensions;
+    portabilityEnumeration = hasExtension(instanceExtensionProperties, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+    if (portabilityEnumeration)
+        instanceExtensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
     VkInstanceCreateInfo instanceInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     instanceInfo.pApplicationInfo = &application;
+    instanceInfo.enabledExtensionCount = static_cast<uint32_t>(instanceExtensions.size());
+    instanceInfo.ppEnabledExtensionNames = instanceExtensions.empty() ? nullptr : instanceExtensions.data();
+    if (portabilityEnumeration)
+        instanceInfo.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
     if (!check(api.createInstance(&instanceInfo, nullptr, &instance), "vkCreateInstance", error))
         return false;
     if (!api.loadInstance(instance)) {
@@ -64,6 +87,11 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
     }
     uint32_t deviceCount = 0;
     if (!check(api.enumeratePhysicalDevices(instance, &deviceCount, nullptr), "vkEnumeratePhysicalDevices", error)) {
+        shutdown();
+        return false;
+    }
+    if (!deviceCount) {
+        error = "Vulkan loader found no physical devices";
         shutdown();
         return false;
     }
@@ -135,10 +163,17 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
     uint32_t extensionCount = 0;
-    std::vector<VkExtensionProperties> extensions;
-    if (api.enumerateDeviceExtensionProperties(physicalDevice, nullptr, &extensionCount, nullptr) == VK_SUCCESS) {
-        extensions.resize(extensionCount);
-        (void)api.enumerateDeviceExtensionProperties(physicalDevice, nullptr, &extensionCount, extensions.data());
+    if (!check(api.enumerateDeviceExtensionProperties(physicalDevice, nullptr, &extensionCount, nullptr),
+               "vkEnumerateDeviceExtensionProperties", error)) {
+        shutdown();
+        return false;
+    }
+    std::vector<VkExtensionProperties> extensions(extensionCount);
+    if (extensionCount &&
+        !check(api.enumerateDeviceExtensionProperties(physicalDevice, nullptr, &extensionCount, extensions.data()),
+               "vkEnumerateDeviceExtensionProperties", error)) {
+        shutdown();
+        return false;
     }
     const bool dynamicRenderingIsCore =
         VK_API_VERSION_MAJOR(apiVersion) > 1 ||
@@ -146,30 +181,46 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
     const bool dynamicRenderingDependenciesAreCore =
         VK_API_VERSION_MAJOR(apiVersion) > 1 ||
         (VK_API_VERSION_MAJOR(apiVersion) == 1 && VK_API_VERSION_MINOR(apiVersion) >= 2);
-    const bool hasDynamicRenderingExtension =
-        std::any_of(extensions.begin(), extensions.end(), [](const VkExtensionProperties &extension) {
-            return std::string_view(extension.extensionName) == VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME;
-        });
+    const bool hasDynamicRenderingExtension = hasExtension(extensions, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+    portabilitySubset = hasExtension(extensions, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
     VkPhysicalDeviceDynamicRenderingFeatures dynamicRenderingFeatures{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES};
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR portabilitySubsetFeatures{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR};
     const bool canUseDynamicRendering =
         dynamicRenderingIsCore || (dynamicRenderingDependenciesAreCore && hasDynamicRenderingExtension);
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    if (canUseDynamicRendering)
-        features.pNext = &dynamicRenderingFeatures;
+    void *queriedFeatureChain = nullptr;
+    if (portabilitySubset) {
+        portabilitySubsetFeatures.pNext = queriedFeatureChain;
+        queriedFeatureChain = &portabilitySubsetFeatures;
+    }
+    if (canUseDynamicRendering) {
+        dynamicRenderingFeatures.pNext = queriedFeatureChain;
+        queriedFeatureChain = &dynamicRenderingFeatures;
+    }
+    features.pNext = queriedFeatureChain;
     api.getPhysicalDeviceFeatures2(physicalDevice, &features);
     if (canUseDynamicRendering)
         dynamicRendering = dynamicRenderingFeatures.dynamicRendering == VK_TRUE;
     VkPhysicalDeviceFeatures enabledFeatures{};
     deviceInfo.pEnabledFeatures = &enabledFeatures;
-    const char *deviceExtensions[] = {VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME};
-    if (dynamicRendering) {
-        deviceInfo.pNext = &dynamicRenderingFeatures;
-        if (!dynamicRenderingIsCore) {
-            deviceInfo.enabledExtensionCount = 1;
-            deviceInfo.ppEnabledExtensionNames = deviceExtensions;
-        }
+    std::vector<const char *> deviceExtensions;
+    void *enabledFeatureChain = nullptr;
+    if (portabilitySubset) {
+        portabilitySubsetFeatures.pNext = enabledFeatureChain;
+        enabledFeatureChain = &portabilitySubsetFeatures;
+        deviceExtensions.push_back(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
     }
+    if (dynamicRendering) {
+        dynamicRenderingFeatures.pNext = enabledFeatureChain;
+        enabledFeatureChain = &dynamicRenderingFeatures;
+        if (!dynamicRenderingIsCore)
+            deviceExtensions.push_back(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+    }
+    deviceInfo.pNext = enabledFeatureChain;
+    deviceInfo.enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size());
+    deviceInfo.ppEnabledExtensionNames = deviceExtensions.empty() ? nullptr : deviceExtensions.data();
     if (!check(api.createDevice(physicalDevice, &deviceInfo, nullptr, &device), "vkCreateDevice", error)) {
         shutdown();
         return false;
@@ -308,6 +359,8 @@ void DeviceState::shutdown() {
     maxComputeWorkGroupInvocations = 0;
     descriptorBufferOffsetAlignment = 1;
     dynamicRendering = false;
+    portabilityEnumeration = false;
+    portabilitySubset = false;
     nativeObjectsBorrowed = false;
     borrowedCommandBuffer = VK_NULL_HANDLE;
     std::fill(std::begin(maxComputeWorkGroupSize), std::end(maxComputeWorkGroupSize), 0);
@@ -498,7 +551,10 @@ bool DeviceState::acquireStaging(bool upload, VkDeviceSize size, VkDeviceSize al
             ring.mapped = nullptr;
             destroyBuffer(ring.buffer);
         }
-        VkDeviceSize capacity = 1024 * 1024;
+        // Keep the first allocation modest. MoltenVK maps host-visible Vulkan
+        // memory to Metal buffers, and CI's virtualized devices can reject the
+        // old 1 MiB minimum even for uploads that are only a few bytes.
+        VkDeviceSize capacity = 64 * 1024;
         while (capacity < size) {
             if (capacity > (std::numeric_limits<VkDeviceSize>::max)() / 2) {
                 error = "Vulkan staging ring capacity overflow";

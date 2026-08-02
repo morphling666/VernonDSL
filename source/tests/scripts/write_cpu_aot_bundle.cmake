@@ -20,7 +20,7 @@ file(SHA256 "${ARTIFACT}" ARTIFACT_SHA256)
 if(OPERATING_SYSTEM STREQUAL "windows")
     set(TARGET_TRIPLE "${ARCHITECTURE}-pc-windows-msvc")
     set(OBJECT_FORMAT "coff")
-elseif(OPERATING_SYSTEM STREQUAL "darwin")
+elseif(OPERATING_SYSTEM STREQUAL "macos" OR OPERATING_SYSTEM STREQUAL "darwin")
     set(TARGET_TRIPLE "${ARCHITECTURE}-apple-darwin")
     set(OBJECT_FORMAT "macho")
 else()
@@ -94,7 +94,7 @@ set(PIPELINE_CANONICAL
 \"name\":\"fill\",\"physical_layouts\":{\"host_value\":{\"packed_arguments_size\":20,\
 \"profile\":\"host_value\"}},\"workgroup_size\":[2,2,1]}],\
 \"pipeline_version\":${VERNON_PIPELINE_VERSION}},\"stage\":\"compute\",\"symbol\":\"vernon_test_fill\",\
-\"target\":\"cpu\"}},\"target\":\"cpu\",\"type\":\"pipeline\",\
+\"target\":\"cpu\"}},\"target\":{\"kind\":\"cpu\",\"options\":{\"triple\":\"${TARGET_TRIPLE}\"}},\"type\":\"pipeline\",\
 \"variants\":[{\"key\":[],\"outputs\":[{\"access\":\"write\",\"dtype\":\"f32\",\
 \"kind\":\"tensor\",\"location\":0,\"name\":\"result\",\"shape\":[12]}],\
 \"parameters\":[{\"access\":\"write\",\"address_space\":\"device\",\
@@ -103,9 +103,8 @@ set(PIPELINE_CANONICAL
 \"leaves\":[{\"byte_offset\":0,\"dtype\":\"f32\",\"path\":[],\"scalar_count\":1}],\
 \"logical_type\":\"f32\"},\"kind\":\"tensor\",\"name\":\"output\",\"shape\":[12],\"slot\":0,\
 \"type\":\"!vernon.tensor_view<f32, [12], \\\"write\\\", \\\"device\\\">\",\
-\"uses\":[{\"access\":\"write\",\
-\"dtype\":\"f32\",\"entry\":\"fill\",\"index\":0,\"interface\":\"storage\",\
-\"kind\":\"tensor\",\"shape\":[12],\"stage\":\"compute\"}]}],\
+\"uses\":[{\"dtype\":\"f32\",\"index\":0,\"interface\":\"storage\",\
+\"shape\":[12],\"stage\":\"compute\"}]}],\
 \"program\":{\"compute\":\"fill\"}}]}")
 string(SHA256 PIPELINE_HASH "${PIPELINE_CANONICAL}")
 string(

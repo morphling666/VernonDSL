@@ -61,12 +61,35 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
     LOAD(framebufferTexture2D, "glFramebufferTexture2D");
     LOAD(checkFramebufferStatus, "glCheckFramebufferStatus");
     LOAD(drawBuffers, "glDrawBuffers");
+    LOAD(readBuffer, "glReadBuffer");
     driver.invalidateFramebuffer = reinterpret_cast<decltype(driver.invalidateFramebuffer)>(
         callbacks.get_proc_address(callbacks.user_data, "glInvalidateFramebuffer"));
     LOAD(clearBufferfv, "glClearBufferfv");
+    LOAD(clearBufferiv, "glClearBufferiv");
+    LOAD(clearBufferfi, "glClearBufferfi");
     LOAD(enable, "glEnable");
     LOAD(disable, "glDisable");
     LOAD(depthFunc, "glDepthFunc");
+    LOAD(depthMask, "glDepthMask");
+    LOAD(cullFace, "glCullFace");
+    LOAD(frontFace, "glFrontFace");
+    LOAD(polygonOffset, "glPolygonOffset");
+    LOAD(stencilFuncSeparate, "glStencilFuncSeparate");
+    LOAD(stencilOpSeparate, "glStencilOpSeparate");
+    LOAD(stencilMaskSeparate, "glStencilMaskSeparate");
+    LOAD(blendFuncSeparate, "glBlendFuncSeparate");
+    LOAD(blendEquationSeparate, "glBlendEquationSeparate");
+    LOAD(colorMask, "glColorMask");
+    driver.enablei =
+        reinterpret_cast<decltype(driver.enablei)>(callbacks.get_proc_address(callbacks.user_data, "glEnablei"));
+    driver.disablei =
+        reinterpret_cast<decltype(driver.disablei)>(callbacks.get_proc_address(callbacks.user_data, "glDisablei"));
+    driver.blendFuncSeparatei = reinterpret_cast<decltype(driver.blendFuncSeparatei)>(
+        callbacks.get_proc_address(callbacks.user_data, "glBlendFuncSeparatei"));
+    driver.blendEquationSeparatei = reinterpret_cast<decltype(driver.blendEquationSeparatei)>(
+        callbacks.get_proc_address(callbacks.user_data, "glBlendEquationSeparatei"));
+    driver.colorMaski =
+        reinterpret_cast<decltype(driver.colorMaski)>(callbacks.get_proc_address(callbacks.user_data, "glColorMaski"));
     LOAD(viewport, "glViewport");
     driver.scissor =
         reinterpret_cast<decltype(driver.scissor)>(callbacks.get_proc_address(callbacks.user_data, "glScissor"));

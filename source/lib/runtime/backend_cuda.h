@@ -4,6 +4,7 @@
 #include "../rhi/cuda_backend.h"
 #include "VernonRuntime.h"
 #include "VernonRuntimeCore.h"
+#include "compute_launch_planner.h"
 #include "pipeline_metadata.h"
 #include "runtime_state.h"
 
@@ -28,6 +29,8 @@ struct CudaPipelineState {
     VernonRuntimeCoreBindings *bindings{};
     std::vector<VernonRuntimeProviderBindingLayoutEntry> layout;
     std::vector<VernonRuntimeProviderBindingValue> values;
+    std::vector<ComputeBindingSource> bindingSources;
+    std::vector<int64_t> descriptorValues;
     uint32_t workgroup[3]{1, 1, 1};
 };
 

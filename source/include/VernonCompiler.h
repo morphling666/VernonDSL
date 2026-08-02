@@ -35,26 +35,49 @@ typedef struct VernonTargetCapabilities {
     uint8_t reserved;
 } VernonTargetCapabilities;
 
-typedef struct VernonCompileOptions {
-    // Set to sizeof(VernonCompileOptions). This permits ABI-compatible extension.
-    uint32_t struct_size;
-    // Zero selects the target default. Used only by OpenGL and OpenGL ES.
-    uint32_t glsl_version;
+typedef enum VernonMetalPlatform { VERNON_METAL_PLATFORM_MACOS = 0, VERNON_METAL_PLATFORM_IOS = 1 } VernonMetalPlatform;
+
+typedef struct VernonCpuCompileOptions {
     /*
-     * HLSL Shader Model encoded as major * 10 + minor (for example 50 or 60).
-     * Zero selects Shader Model 6.0. DirectX runtime artifacts require 6.0+.
-     */
-    uint32_t hlsl_shader_model;
-    uint32_t reserved[5];
-    /*
-     * CPU object target. Empty selects the compiler host triple. Examples:
+     * LLVM target triple. Empty selects the compiler host triple. Examples:
      * "x86_64-pc-windows-msvc" and "arm64-apple-ios17.0".
      */
-    VernonStringView cpu_target_triple;
-    /* Empty selects the target's generic CPU. */
-    VernonStringView cpu_name;
+    VernonStringView triple;
+    /* Empty selects the target's generic processor. */
+    VernonStringView processor;
     /* Comma-separated LLVM target features, for example "+neon". */
-    VernonStringView cpu_features;
+    VernonStringView features;
+} VernonCpuCompileOptions;
+
+typedef struct VernonOpenGLCompileOptions {
+    /* Zero selects the target default. Encoded as a three-digit GLSL version. */
+    uint32_t version;
+} VernonOpenGLCompileOptions;
+
+typedef struct VernonMetalCompileOptions {
+    VernonMetalPlatform platform;
+} VernonMetalCompileOptions;
+
+typedef struct VernonDirectXCompileOptions {
+    /*
+     * HLSL Shader Model encoded as major * 10 + minor. Zero selects Shader
+     * Model 6.0. DirectX runtime artifacts require 6.0+.
+     */
+    uint32_t shader_model;
+} VernonDirectXCompileOptions;
+
+typedef union VernonTargetCompileOptions {
+    VernonCpuCompileOptions cpu;
+    VernonOpenGLCompileOptions opengl;
+    VernonMetalCompileOptions metal;
+    VernonDirectXCompileOptions directx;
+} VernonTargetCompileOptions;
+
+typedef struct VernonCompileOptions {
+    /* Set to sizeof(VernonCompileOptions). */
+    uint32_t struct_size;
+    VernonTarget target;
+    VernonTargetCompileOptions as;
 } VernonCompileOptions;
 
 VERNON_DSL_CAPI VernonCompilerContext *vernonCompilerCreate(void);
@@ -72,7 +95,6 @@ VERNON_DSL_CAPI VernonCompileResult *vernonCompilerCompileMlir(VernonCompilerCon
                                                                size_t source_size, VernonTarget target);
 VERNON_DSL_CAPI VernonCompileResult *vernonCompilerCompileMlirWithOptions(VernonCompilerContext *context,
                                                                           const char *source, size_t source_size,
-                                                                          VernonTarget target,
                                                                           const VernonCompileOptions *options);
 /*
  * Finalizes a host relocatable object into a temporary-loadable native
