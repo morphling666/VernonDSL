@@ -28,12 +28,22 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.9"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.7"
+
       - name: Validate generated versions and release ref
         id: version
         shell: bash
         run: |
-          python tools/generate_versions.py --check
-          version="$(python -c 'import tomllib; print(tomllib.load(open("versions.toml", "rb"))["vernon"]["release"])')"
+          uv run --python 3.11.9 --no-project python tools/generate_versions.py --check
+          version="$(uv run --python 3.11.9 --no-project python -c 'import tomllib; print(tomllib.load(open("versions.toml", "rb"))["vernon"]["release"])')"
           publish=false
           if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
             publish=true
