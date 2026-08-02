@@ -161,16 +161,53 @@ non-relaxed atomics, asynchronous dispatch, and multiple frames in flight are
 outside the supported `0.1.1` subset. See
 [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for the complete release contract.
 
-Vulkan is discovered when the runtime creates a device. Vernon tries
-`VERNON_VULKAN_LOADER`, a loader under `VULKAN_SDK`, the platform loader name,
-and, on macOS, Homebrew locations under `/opt/homebrew` and `/usr/local`.
-`VERNON_VULKAN_LOADER` may name a specific Khronos loader DLL, shared object, or
-dylib; do not point it at MoltenVK directly. macOS users can install the loader
-and MoltenVK ICD with:
+### Platform prerequisites
+
+Native GPU backends require the corresponding system drivers, loaders, and
+window-system libraries.
+
+#### macOS
+
+Metal uses the system framework and requires no separate loader. macOS does not
+provide native Vulkan; to use it, install the Khronos loader and MoltenVK ICD
+with Homebrew:
 
 ```bash
 brew install molten-vk vulkan-loader
 ```
+
+Vernon also searches Homebrew locations under `/opt/homebrew` and `/usr/local`.
+`VERNON_VULKAN_LOADER` may name the installed Khronos loader dylib; do not point
+it directly at MoltenVK.
+
+#### Linux
+
+On Ubuntu or Debian, Vulkan Runtime execution requires a loader and a usable
+vendor ICD. Mesa provides Intel, AMD, and software Vulkan drivers:
+
+```bash
+sudo apt-get update
+sudo apt-get install --yes libvulkan1 mesa-vulkan-drivers
+```
+
+NVIDIA systems should install the matching proprietary driver instead of
+relying on Mesa for the device ICD. Source builds and OpenGL/EGL graphics tests
+also require the compiler-side and window-system development packages used by
+the Ubuntu CI environment:
+
+```bash
+sudo apt-get install --yes \
+  ninja-build patchelf pkg-config \
+  libgl1-mesa-dev libegl1-mesa-dev \
+  libwayland-dev libxkbcommon-dev wayland-protocols \
+  xorg-dev xvfb
+```
+
+### Vulkan discovery
+
+Vulkan is discovered when the Runtime creates a device. Vernon tries
+`VERNON_VULKAN_LOADER`, a loader under `VULKAN_SDK`, and the platform loader
+name.
 
 `VERNON_ENABLE_VULKAN_RUNTIME` controls whether Vulkan support is included in
 the build. It does not indicate that a loader, ICD, or usable device is present
