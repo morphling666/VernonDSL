@@ -551,7 +551,10 @@ bool DeviceState::acquireStaging(bool upload, VkDeviceSize size, VkDeviceSize al
             ring.mapped = nullptr;
             destroyBuffer(ring.buffer);
         }
-        VkDeviceSize capacity = 1024 * 1024;
+        // Keep the first allocation modest. MoltenVK maps host-visible Vulkan
+        // memory to Metal buffers, and CI's virtualized devices can reject the
+        // old 1 MiB minimum even for uploads that are only a few bytes.
+        VkDeviceSize capacity = 64 * 1024;
         while (capacity < size) {
             if (capacity > (std::numeric_limits<VkDeviceSize>::max)() / 2) {
                 error = "Vulkan staging ring capacity overflow";

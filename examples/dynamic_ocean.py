@@ -92,10 +92,17 @@ def create_ocean_grid(grid: int, extent: float) -> OceanGrid:
     )
 
 
-def create_seabed(extent: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def create_seabed(
+    extent: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     half = extent * 0.49
     positions = np.array(
-        ((-half, -0.62, -half), (-half, -0.62, half), (half, -0.62, half), (half, -0.62, -half)),
+        (
+            (-half, -0.62, -half),
+            (-half, -0.62, half),
+            (half, -0.62, half),
+            (half, -0.62, -half),
+        ),
         dtype=np.float32,
     )
     normals = np.tile(np.array((0.0, 1.0, 0.0), dtype=np.float32), (4, 1))

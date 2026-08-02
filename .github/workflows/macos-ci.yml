@@ -24,7 +24,7 @@ env:
 jobs:
   build-test:
     name: Build and test
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 240
     env:
       MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS: "0"
@@ -193,7 +193,7 @@ jobs:
   compiler-wheel:
     name: Compiler and wheel (Python ${{ matrix.python-version }})
     needs: build-test
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 360
     strategy:
       fail-fast: false

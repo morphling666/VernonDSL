@@ -758,10 +758,14 @@ bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites,
             return false;
         std::lock_guard<std::mutex> guard(device->mutex);
         device->state.makeCurrent();
-        if (computeWrites)
-            device->state.driver.memoryBarrier(
-                vernon::rhi::opengl::kShaderStorageBarrierBit | vernon::rhi::opengl::kVertexAttribArrayBarrierBit |
-                vernon::rhi::opengl::kTextureFetchBarrierBit | vernon::rhi::opengl::kBufferUpdateBarrierBit);
+        if (computeWrites) {
+            if (device->state.driver.memoryBarrier)
+                device->state.driver.memoryBarrier(
+                    vernon::rhi::opengl::kShaderStorageBarrierBit | vernon::rhi::opengl::kVertexAttribArrayBarrierBit |
+                    vernon::rhi::opengl::kTextureFetchBarrierBit | vernon::rhi::opengl::kBufferUpdateBarrierBit);
+            else
+                device->state.driver.finish();
+        }
         completed = true;
         return true;
     }
@@ -833,8 +837,15 @@ bool recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native
             }
         }
         device->state.makeCurrent();
-        if (bits)
-            device->state.driver.memoryBarrier(bits);
+        if (bits) {
+            if (device->state.driver.memoryBarrier)
+                device->state.driver.memoryBarrier(bits);
+            else
+                // glMemoryBarrier is core only in OpenGL 4.2. Earlier
+                // contexts still need a synchronization point between graph
+                // scopes, for example when sampling a depth attachment.
+                device->state.driver.finish();
+        }
         return true;
     }
     return false;

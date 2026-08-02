@@ -14,7 +14,7 @@ class PbrVertexOutput:
     world_position: vd.Vector[vd.f32, 3]
     base_color: vd.Vector[vd.f32, 3]
     material: vd.Vector[vd.f32, 3]
-    light_position: vd.Vector[vd.f32, 4]
+    shadow_position: vd.Vector[vd.f32, 4]
 
 
 @vd.vertex
