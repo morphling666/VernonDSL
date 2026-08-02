@@ -203,7 +203,7 @@ typedef struct VernonRuntimeProviderDrawDescriptor {
     uint32_t stencil_store_operation;
     uint32_t clear_stencil;
     uint32_t stencil_reference;
-    uint32_t reserved[4];
+    uint32_t render_area[4];
 } VernonRuntimeProviderDrawDescriptor;
 
 /*

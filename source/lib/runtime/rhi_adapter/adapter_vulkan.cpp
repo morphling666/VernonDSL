@@ -1276,6 +1276,14 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     uint32_t clearStencil = descriptor->clear_stencil;
     (void)commandDepthOperations(adapter, commandEncoder, depthLoad, depthStore, stencilLoad, stencilStore, clearDepth,
                                  clearStencil);
+    const bool hasRenderArea = descriptor->render_area[2] && descriptor->render_area[3];
+    const VkRect2D renderArea{
+        {static_cast<int32_t>(hasRenderArea ? descriptor->render_area[0] : descriptor->viewport[0]),
+         static_cast<int32_t>(hasRenderArea ? descriptor->render_area[1] : descriptor->viewport[1])},
+        {hasRenderArea ? descriptor->render_area[2] : descriptor->viewport[2],
+         hasRenderArea ? descriptor->render_area[3] : descriptor->viewport[3]}};
+    const uint32_t framebufferWidth = static_cast<uint32_t>(renderArea.offset.x) + renderArea.extent.width;
+    const uint32_t framebufferHeight = static_cast<uint32_t>(renderArea.offset.y) + renderArea.extent.height;
     std::array<VkRenderingAttachmentInfo, 8> attachments{};
     std::array<VkImageView, 9> imageViews{};
     std::array<VkFormat, 9> attachmentFormats{};
@@ -1339,18 +1347,16 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
             stencilAttachment.storeOp = attachmentStore(stencilStore);
         }
     }
-    const VkRenderingInfo rendering{
-        VK_STRUCTURE_TYPE_RENDERING_INFO,
-        nullptr,
-        0,
-        {{static_cast<int32_t>(descriptor->viewport[0]), static_cast<int32_t>(descriptor->viewport[1])},
-         {descriptor->viewport[2], descriptor->viewport[3]}},
-        1,
-        0,
-        static_cast<uint32_t>(descriptor->color_attachment_count),
-        attachments.data(),
-        descriptor->depth_stencil_attachment.resource.value ? &depthAttachment : nullptr,
-        hasStencilAttachment ? &stencilAttachment : nullptr};
+    const VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO,
+                                    nullptr,
+                                    0,
+                                    renderArea,
+                                    1,
+                                    0,
+                                    static_cast<uint32_t>(descriptor->color_attachment_count),
+                                    attachments.data(),
+                                    descriptor->depth_stencil_attachment.resource.value ? &depthAttachment : nullptr,
+                                    hasStencilAttachment ? &stencilAttachment : nullptr};
     auto &driver = rhi::vulkan::driver();
     if (bindingSnapshot && beginRendering)
         for (const auto &slot : bindingSnapshot->slots)
@@ -1370,8 +1376,8 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     else if (!pipeline->device->dynamicRendering && beginRendering) {
         PreparedPipeline::RenderingCacheEntry cacheKey{};
         cacheKey.colorCount = static_cast<uint32_t>(descriptor->color_attachment_count);
-        cacheKey.width = descriptor->viewport[2];
-        cacheKey.height = descriptor->viewport[3];
+        cacheKey.width = framebufferWidth;
+        cacheKey.height = framebufferHeight;
         cacheKey.hasDepth = descriptor->depth_stencil_attachment.resource.value != 0;
         for (size_t index = 0; index < descriptor->color_attachment_count; ++index) {
             cacheKey.resources[index] = descriptor->color_attachments[index].image;
@@ -1480,8 +1486,8 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
             static_cast<uint32_t>(descriptor->color_attachment_count +
                                   (descriptor->depth_stencil_attachment.resource.value ? 1 : 0)),
             imageViews.data(),
-            descriptor->viewport[2],
-            descriptor->viewport[3],
+            framebufferWidth,
+            framebufferHeight,
             1};
         if (!cacheHit)
             result = driver.createFramebuffer(pipeline->device->device, &framebufferInfo, nullptr, &framebuffer);
@@ -1540,8 +1546,7 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
             nullptr,
             scopeRenderPass,
             framebuffer,
-            {{static_cast<int32_t>(descriptor->viewport[0]), static_cast<int32_t>(descriptor->viewport[1])},
-             {descriptor->viewport[2], descriptor->viewport[3]}},
+            renderArea,
             static_cast<uint32_t>(descriptor->color_attachment_count +
                                   (descriptor->depth_stencil_attachment.resource.value ? 1 : 0)),
             clearValues.data()};

@@ -513,7 +513,8 @@ extern "C" VernonStatus vernonRuntimeCoreEncodeDrawInvocation(const VernonRuntim
         invocation->stencil_store_operation,
         invocation->clear_stencil,
         invocation->stencil_reference,
-        {0, 0, 0, 0}};
+        {invocation->render_area[0], invocation->render_area[1], invocation->render_area[2],
+         invocation->render_area[3]}};
     return pipeline->provider.encode_draw(pipeline->provider.user_data, invocation->command_encoder, &descriptor);
 }
 
@@ -548,6 +549,7 @@ vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(const VernonRuntimeCoreGrap
         invocation->stencil_store_operation,
         invocation->clear_stencil,
         invocation->stencil_reference,
-        {0, 0, 0, 0}};
+        {invocation->render_area[0], invocation->render_area[1], invocation->render_area[2],
+         invocation->render_area[3]}};
     return pipeline->provider.encode_draw(pipeline->provider.user_data, invocation->command_encoder, &descriptor);
 }

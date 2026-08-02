@@ -540,6 +540,8 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
     const bool hasScissor = invocation.scissor[2] && invocation.scissor[3];
     for (size_t index = 0; index < 4; ++index)
         draw.scissor[index] = hasScissor ? invocation.scissor[index] : draw.viewport[index];
+    draw.render_area[2] = plan.attachmentWidth;
+    draw.render_area[3] = plan.attachmentHeight;
     draw.topology = invocation.topology;
     if (plan.indexBinding) {
         draw.index_buffer = plan.indexBinding->resource;
