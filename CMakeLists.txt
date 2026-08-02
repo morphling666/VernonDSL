@@ -42,6 +42,18 @@ option(VERNON_ENABLE_PYTHON_BINDINGS "Build the nanobind Python module" ON)
 option(VERNON_INSTALL_GIT_HOOK "Install the staged-file formatting hook" ON)
 option(VERNON_ENABLE_SANITIZERS "Build Vernon targets with AddressSanitizer" OFF)
 
+# Every native artifact in a wheel is installed into vernon_dsl. Make that layout relocatable by default instead of
+# configuring each target separately.
+if(SKBUILD)
+    set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
+    set(CMAKE_INSTALL_RPATH_USE_LINK_PATH OFF)
+    if(APPLE)
+        set(CMAKE_INSTALL_RPATH "@loader_path")
+    elseif(UNIX)
+        set(CMAKE_INSTALL_RPATH "$ORIGIN")
+    endif()
+endif()
+
 if(VERNON_ENABLE_SANITIZERS)
     if(MSVC)
         add_compile_options(/fsanitize=address /Zi)

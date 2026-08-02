@@ -70,11 +70,6 @@ function(vernon_add_python_bindings package_directory source_directory)
         VernonRuntime
         VernonRHI)
     set_target_properties(vernon-dsl-native PROPERTIES OUTPUT_NAME "_native")
-    if(APPLE)
-        set_target_properties(vernon-dsl-native PROPERTIES INSTALL_RPATH "@loader_path")
-    elseif(UNIX)
-        set_target_properties(vernon-dsl-native PROPERTIES INSTALL_RPATH "$ORIGIN")
-    endif()
     install(
         TARGETS vernon-dsl-native
         RUNTIME DESTINATION vernon_dsl COMPONENT VernonWheel
