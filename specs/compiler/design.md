@@ -37,8 +37,8 @@ SPIR-V is not the universal backend IR. Target lowering branches from typed
 Vernon and standard MLIR:
 
 - Graphics stages lower through Vernon interface semantics to SPIR-V.
-- Compute kernels lower to `gpu.module`/`gpu.func`, then to SPIR-V, NVVM, or
-  ROCDL according to the target.
+- Compute kernels lower to `gpu.module`/`gpu.func`, then to SPIR-V or NVVM
+  according to the current target.
 - CPU reference execution lowers directly to LLVM.
 
 CUDA therefore uses GPU to NVVM to NVPTX and never depends on SPIR-V.
@@ -331,9 +331,8 @@ artifact generation pipeline is registered. An IR-only prototype must return
 compiler products: Metal availability means MSL generation works. DirectX
 availability means SPIRV-Cross HLSL generation and pinned DXC compilation both
 work, producing a validated DXIL container. Compiler target availability is
-distinct from Runtime stability: cooked MSL is consumed by the experimental
-Metal compute and offscreen graphics Runtime in macOS source builds and CI, but
-Metal is not a stable wheel or GA capability.
+distinct from Runtime availability: cooked MSL is consumed by the stable Metal
+compute and offscreen graphics Runtime on supported Apple Silicon Macs.
 
 ## CPU resource ABI
 
@@ -381,11 +380,14 @@ Graphics DSL -> Vernon graphics IR -> SPIR-V
 Compute DSL -> MLIR GPU dialect
                             |-> SPIR-V for Vulkan compute
                             |-> NVVM -> NVPTX/PTX for CUDA
-                            |-> ROCDL for AMD GPU
                             `-> standard MLIR -> LLVM for CPU reference
 ```
 
-SPIR-V is canonical for graphics and Vulkan compute, but it is not the universal compute backend. CUDA must not be routed through SPIR-V. The project must not maintain independent GLSL, MSL, or HLSL emitters; those languages are produced through SPIRV-Cross, with target capability validation before translation.
+SPIR-V is canonical for graphics and Vulkan compute, but it is not the
+universal compute backend. CUDA must not be routed through SPIR-V. The project
+must not maintain independent GLSL, MSL, or HLSL emitters; those languages are
+produced through SPIRV-Cross, with target capability validation before
+translation. AMD/ROCDL remains future work rather than a registered target.
 
 ### Static Tensor GPU value ABI
 
@@ -648,8 +650,8 @@ content-addressed external artifacts. It compiles in process through
 manifest. For runtime-backed targets, Runtime validates manifest structure,
 content hashes, artifact paths, sizes, digests, reflection, and exact feature
 keys. Metal MSL manifests are consumed by the Metal Runtime on Apple; that path
-is experimental in macOS source builds and CI rather than a stable wheel or GA
-capability. DirectX DXIL manifests use the Windows D3D12 runtime backend.
+is part of the stable Apple Silicon macOS compute and offscreen graphics
+subset. DirectX DXIL manifests use the Windows D3D12 runtime backend.
 
 Runtime-backed PipelineAssets also carry hash-covered `runtime_requirements`.
 The cooker derives these from the emitted object,
@@ -669,8 +671,8 @@ The normative source-language model is specified in
 `specs/language/contract.md`. It is implemented phase by phase toward frontend
 version 4, while released builds remain frontend version 3 until all required
 v4 acceptance gates pass. There is currently no numeric `FRONTEND_VERSION`
-constant. Unchecked contract gates and active compiler architecture work in
-`specs/completion_roadmap.md` remain incomplete.
+constant. Unchecked language-v4 contract gates remain future work. Historical
+planning documents do not redefine this current compiler contract.
 
 Typed IR must classify each entity as Value, Storage, or Resource. Value
 `Tensor` identity contains recursively ABI-stable element type and logical

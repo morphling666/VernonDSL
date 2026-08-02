@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -17,22 +18,40 @@ jobs:
     name: Validate release version
     runs-on: ubuntu-22.04
     timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
 
     steps:
       - name: Check out code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Match tag to package version
+      - name: Validate generated versions and release ref
+        id: version
         shell: bash
         run: |
-          tag_version="${GITHUB_REF_NAME#v}"
-          package_version="$(
-            python -c 'namespace = {}; exec(open("python/vernon_dsl/_versions.py", encoding="utf-8").read(), namespace); print(namespace["RELEASE_VERSION"])'
-          )"
-          if [[ "$tag_version" != "$package_version" ]]; then
-            echo "::error::Tag version $tag_version does not match package version $package_version"
+          python tools/generate_versions.py --check
+          version="$(python -c 'import tomllib; print(tomllib.load(open("versions.toml", "rb"))["vernon"]["release"])')"
+          publish=false
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            publish=true
+            if [[ "$GITHUB_REF_TYPE" != "tag" || "$GITHUB_REF_NAME" != "v$version" ]]; then
+              echo "::error::Publishing requires immutable tag v$version, got $GITHUB_REF"
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor HEAD origin/master; then
+              echo "::error::Release tag must identify a commit merged into origin/master"
+              exit 1
+            fi
+          fi
+          if [[ "$version" == *a* || "$version" == *b* || "$version" == *rc* ]]; then
+            echo "::error::Stable release workflow received prerelease version $version"
             exit 1
           fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
 
   linux:
     name: Build Linux wheels
@@ -49,9 +68,98 @@ jobs:
     needs: validate-version
     uses: ./.github/workflows/windows-ci.yml
 
-  publish:
+  prepare:
+    name: Validate release artifacts
+    needs: [validate-version, linux, macos, windows]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Download wheels
+        uses: actions/download-artifact@v6
+        with:
+          pattern: vernon-lang-*
+          path: dist
+          merge-multiple: true
+
+      - name: Validate wheel matrix
+        run: python scripts/validate_release_artifacts.py dist "${{ needs.validate-version.outputs.version }}"
+
+      - name: Generate wheel checksums
+        working-directory: dist
+        run: sha256sum *.whl > SHA256SUMS
+
+      - name: Generate release SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: dist
+          format: spdx-json
+          output-file: dist/vernon-lang-${{ needs.validate-version.outputs.version }}.spdx.json
+          upload-artifact: false
+
+      - name: Upload validated release payload
+        uses: actions/upload-artifact@v6
+        with:
+          name: vernon-lang-${{ needs.validate-version.outputs.version }}-release
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  attest:
+    name: Attest release artifacts
+    if: needs.validate-version.outputs.publish == 'true'
+    needs: [validate-version, prepare]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download validated release payload
+        uses: actions/download-artifact@v6
+        with:
+          name: vernon-lang-${{ needs.validate-version.outputs.version }}-release
+          path: dist
+
+      - name: Generate build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/SHA256SUMS
+            dist/*.spdx.json
+
+  github-release:
+    name: Stage GitHub Release
+    if: needs.validate-version.outputs.publish == 'true'
+    needs: [validate-version, prepare, attest]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out release notes
+        uses: actions/checkout@v4
+
+      - name: Download validated release payload
+        uses: actions/download-artifact@v6
+        with:
+          name: vernon-lang-${{ needs.validate-version.outputs.version }}-release
+          path: dist
+
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --draft --title "VernonDSL ${{ needs.validate-version.outputs.version }}" --notes-file RELEASE_NOTES.md
+
+  publish-pypi:
     name: Publish to PyPI
-    needs: [linux, macos, windows]
+    if: needs.validate-version.outputs.publish == 'true'
+    needs: [validate-version, prepare, github-release]
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     environment:
@@ -62,14 +170,80 @@ jobs:
       id-token: write
 
     steps:
-      - name: Download wheels
+      - name: Download validated release payload
         uses: actions/download-artifact@v6
         with:
-          pattern: vernon-lang-*
+          name: vernon-lang-${{ needs.validate-version.outputs.version }}-release
           path: dist
-          merge-multiple: true
+
+      - name: Stage wheels for PyPI
+        run: |
+          mkdir upload-dist
+          cp dist/*.whl upload-dist/
 
       - name: Publish wheels
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: dist
+          packages-dir: upload-dist
+
+  verify-published:
+    name: Verify published wheel (${{ matrix.os }})
+    if: needs.validate-version.outputs.publish == 'true'
+    needs: [validate-version, publish-pypi]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out verification script
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.7"
+
+      - name: Install from PyPI and run smoke test
+        shell: bash
+        run: |
+          uv venv "$RUNNER_TEMP/vernon-release-verify"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            python_path="$RUNNER_TEMP/vernon-release-verify/Scripts/python.exe"
+          else
+            python_path="$RUNNER_TEMP/vernon-release-verify/bin/python"
+          fi
+          for attempt in 1 2 3 4 5; do
+            if uv pip install --python "$python_path" --no-cache --index-url https://pypi.org/simple \
+              "vernon-lang==${{ needs.validate-version.outputs.version }}"; then
+              break
+            fi
+            if [[ "$attempt" == "5" ]]; then
+              echo "::error::Published wheel was not available from PyPI after $attempt attempts"
+              exit 1
+            fi
+            sleep "$((attempt * 15))"
+          done
+          "$python_path" scripts/verify_installed_wheel.py
+
+  finalize-release:
+    name: Publish GitHub Release
+    if: needs.validate-version.outputs.publish == 'true'
+    needs: [validate-version, verify-published]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Publish the verified release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest

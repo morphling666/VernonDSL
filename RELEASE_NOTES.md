@@ -1,8 +1,7 @@
-# VernonDSL 0.1.1a1 release notes
+# VernonDSL 0.1.1 release notes
 
-VernonDSL 0.1.1a1 is a Windows-first alpha developer preview. It is suitable
-for evaluation and experimentation, not production deployment. APIs,
-artifacts, and backend coverage may change before beta.
+VernonDSL 0.1.1 is the first cross-platform stable release of the language,
+compiler, offline cooker, synchronous Runtime/RHI, and ExecutionGraph APIs.
 
 ## Highlights
 
@@ -16,23 +15,29 @@ artifacts, and backend coverage may change before beta.
 
 ## Distribution and support contract
 
-- Windows is the only CI platform and the only platform with prebuilt wheels.
-- Wheels target supported CPython 3.11 through 3.14 versions.
-- macOS source builds and CI provide an experimental Metal compute and
-  offscreen graphics Runtime. It consumes cooked MSL bundles on Apple, but is
-  not a stable wheel or GA capability.
+- Wheels target CPython 3.11 through 3.14 on Windows x64, Linux x64, and
+  Apple Silicon macOS. Intel macOS and source distributions are not shipped.
+- CPU provides reference compute execution.
+- CUDA provides compute and buffers on compatible NVIDIA drivers.
+- Vulkan provides compute and offscreen graphics on supported drivers.
+- DirectX 12 provides compute and offscreen graphics on Windows.
+- OpenGL and OpenGL ES provide compute and graphics when a compatible owned or
+  external context is available.
+- Metal provides compute and offscreen graphics on supported Apple Silicon
+  devices. Argument-buffer pipelines are rejected when the device cannot
+  provide the required argument-buffer tier or encoder.
 - Graphics rendering is offscreen with host readback; VernonRuntime does not
   provide swapchain or window presentation.
-- GPU tests and showcases may skip when the required hardware, loader, context,
-  or driver is unavailable. Release results distinguish executed, skipped, and
-  failed backends.
-- Dynamic multi-rank `TensorView` layouts require AOT specialization.
+- Runtime invocation, owned RHI submission, and `ExecutionGraph.execute()` are
+  synchronous and permit at most one owned submission in flight per device.
+- Dynamic TensorView shape, stride, and offset are invocation data and do not
+  require recompilation.
 - CPU graphics, CUDA image/sampler resources, f16/f64 vertex attributes, and
-  non-relaxed atomic orderings are outside the supported alpha subset.
-- Production-grade multi-frame GPU resource lifetime management is not
-  provided.
+  non-relaxed atomic orderings are outside the supported `0.1.1` subset.
+- Asynchronous dispatch, deferred graph execution, and multiple frames in
+  flight are outside the `0.1.1` contract.
 - The released frontend remains language version 3. Language v4 is a roadmap
-  target and will not be declared until all required acceptance gates pass.
+  target.
 
 ## Development and installation
 
@@ -41,29 +46,19 @@ repository's `python` directory and run commands with
 `uv run --frozen --no-sync`. Built wheels install the package and the
 `vernon-compile-python` and `vernon-cook-pipeline` console scripts normally.
 
-## Acceptance evidence
+## Compatibility and lifecycle
 
-The release commit must pass Ruff, Python tests and coverage gates, native
-CTest, ASan, wheel build, `twine check`, installed-wheel CPU dispatch and
-frontend compilation, and GPU-optional dual-showcase acceptance.
+This release uses compiler contract 9 and pipeline contract 12. Incompatible
+artifacts are rejected rather than silently loaded. The stable API, ABI,
+deprecation, cache, support, and security policies are documented in
+[`PUBLIC_API.md`](PUBLIC_API.md), [`COMPATIBILITY.md`](COMPATIBILITY.md),
+[`SUPPORT.md`](SUPPORT.md), and [`SECURITY.md`](SECURITY.md).
 
-Local acceptance on 2026-07-30 produced the following results:
-
-- 340 Python tests and 349 subtests passed.
-- Language/frontend line coverage was 91.81%; inference/type-parser branch
-  coverage was 85.04%.
-- Native CTest passed 135/135, with CUDA image/sampler lifetime and OpenGL
-  synchronization recorded as environment-dependent skips.
-- AddressSanitizer CTest passed 83/83, with CUDA image/sampler lifetime skipped.
-- Terrain and Mandelbulb executed successfully at 64x64 on Vulkan, DirectX 12,
-  and OpenGL; no showcase backend was skipped.
-- The CPython 3.11 Windows wheel passed `twine check`, installation into a
-  clean virtual environment, CPU kernel dispatch and readback, frontend CLI
-  compilation, bundled Runtime source lookup, and release-version comparison.
-
-## Known limitations before beta
-
-Linux and macOS CI, stable public API and deprecation policies, compatibility
-guarantees for all version axes, broad GPU runtime coverage, and the remaining
-compiler and language-v4 work are beta prerequisites. See
-[`RELEASE_READINESS.md`](RELEASE_READINESS.md) for the detailed boundary.
+The exact release commit must pass native and Python tests plus CPython
+3.11–3.14 wheel build, metadata, and clean-install gates on Linux, macOS, and
+Windows. Windows CI additionally enforces formatting, Ruff, Python coverage,
+and Runtime AddressSanitizer gates. The release workflow validates one
+12-wheel payload, generates checksums and an SBOM, and binds provenance to the
+tagged commit before publication. After PyPI publication, CPython 3.11 on each
+supported operating system repeats the installed-wheel CPU dispatch/readback,
+frontend, cooker, and Runtime-source layout smoke test.

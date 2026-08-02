@@ -184,7 +184,9 @@ The stable `0.1.1` API does not expose asynchronous submission, deferred graph
 execution, or multiple frames in flight. Callers must not infer those
 capabilities from backend-native queues or streams. Adding them requires
 completion-serial tracking and deferred reclamation for every enabled backend,
-as defined by `deferred_gpu_resource_lifetime_plan.md`.
+as defined by the
+[`asynchronous GPU resource lifetime`](../roadmap.md#asynchronous-gpu-resource-lifetime)
+roadmap.
 
 ExecutionGraph render scopes own the first attachment load operations and the
 last attachment store operations. Providers consume those scope operations
@@ -370,8 +372,9 @@ are flattened in row-major order to register vectors. The limit covers
 and bounds the register pressure from scalarized operations. Larger static
 values use elementwise-to-Linalg, one-shot bufferization to private memrefs,
 and Linalg-to-SCF loops. Dynamic local value Tensors are rejected; addressable
-runtime N-D Tensor parameters are specialized and remain memrefs. The SCF
-structural conversion updates loop-carried values and region arguments
+runtime N-D Tensor parameters remain memrefs. Their dynamic shape, stride, and
+offset are invocation data and do not require AOT shape specialization. The
+SCF structural conversion updates loop-carried values and region arguments
 consistently. Buffer intrinsics cloned below `scf.if` or `scf.while` are
 rewritten after the complete kernel body is cloned, so nested loads and stores
 do not remain illegal Vernon operations.
@@ -398,10 +401,10 @@ math operations for SPIR-V lowering, and Metal source is cross-compiled from
 the same SPIR-V module.
 
 On Apple platforms, cooked MSL bundles are consumed by the Metal Runtime.
-macOS source builds and CI expose this as an experimental compute and offscreen
-graphics backend; it is not a stable wheel or GA capability. The Runtime
-compiles the cooked MSL for the selected device, prepares reflection-driven
-resource layouts and pipeline state, and executes through VernonRHI.
+Apple Silicon macOS wheels expose the stable compute and offscreen graphics
+subset. The Runtime compiles the cooked MSL for the selected device, prepares
+reflection-driven resource layouts and pipeline state, and executes through
+VernonRHI.
 
 DirectX cooking emits Shader Model 6 DXIL containers and `VernonRuntime`
 exposes a Windows-only D3D12 backend. The backend owns its device, direct queue,

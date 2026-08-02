@@ -252,10 +252,22 @@ jobs:
         run: uv sync --extra build --frozen
 
       - name: Build clean wheel
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "15.0"
         run: uv build --wheel --no-cache
 
       - name: Validate wheel metadata
         run: uvx --from twine twine check dist/*.whl
+
+      - name: Validate wheel platform tag
+        run: |
+          wheels=(dist/*.whl)
+          if [[ "${#wheels[@]}" -ne 1 ||
+                "$(basename "${wheels[0]}")" != *-macosx_15_0_arm64.whl ]]; then
+            printf 'expected one macosx_15_0_arm64 wheel, found:\n' >&2
+            printf '  %s\n' "${wheels[@]}" >&2
+            exit 1
+          fi
 
       - name: Test wheel in a fresh environment
         run: |

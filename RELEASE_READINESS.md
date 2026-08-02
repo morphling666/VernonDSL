@@ -1,93 +1,56 @@
-# VernonDSL 0.1.1a1 release readiness
+# VernonDSL 0.1.1 release readiness
 
-Assessment date: 2026-07-30
+Assessment date: 2026-08-02
 
-## Recommendation
+## Release decision
 
-`0.1.1a1` is ready as a local Windows-first alpha release candidate. Tag and
-publish only after the exact merged `master` commit passes the complete Windows
-CI matrix.
+`0.1.1` is publishable only from an exact commit for which every required gate
+below is green. `versions.toml` is the single manually edited version source.
 
-- Go: GitHub pre-release and Windows wheels after final CI.
-- No-go: beta or stable release.
-- Do not publish Linux/macOS wheels or claim Metal as a stable/GA capability;
-  its compute and offscreen graphics Runtime is experimental in macOS source
-  builds and CI.
+## Supported distribution
 
-`0.1.0` already exists on PyPI, so `0.1.1a1` is the next valid PEP 440 preview
-version. `versions.toml` is the single manually edited version source.
+- Windows x64, Linux x64, and Apple Silicon macOS wheels;
+- CPython 3.11 through 3.14;
+- wheel-only distribution for `0.1.1`; no sdist or Intel macOS wheel;
+- compiler contract 9 and pipeline contract 12.
 
-## Local acceptance evidence
+Backend capabilities and limitations are defined in
+[`RELEASE_NOTES.md`](RELEASE_NOTES.md) and [`SUPPORT.md`](SUPPORT.md). Public
+surface and compatibility guarantees are defined in
+[`PUBLIC_API.md`](PUBLIC_API.md) and [`COMPATIBILITY.md`](COMPATIBILITY.md).
 
-- Ruff lint and formatting passed.
-- Python: 340 tests and 349 subtests passed.
-- Language/frontend line coverage: 91.81%.
-- Inference/type-parser branch coverage: 85.04%, above the 85% gate.
-- Native Release CTest: 135/135 passed.
-- AddressSanitizer CTest: 83/83 passed.
-- Generated-version drift check passed.
-- CPython 3.11 Windows wheel built and passed `twine check`.
-- A fresh environment installed the wheel, compiled and dispatched a CPU
-  kernel, read results back, compiled through the installed frontend CLI, and
-  validated bundled Runtime sources and release version.
-- Terrain and Mandelbulb smoke acceptance executed on Vulkan, DirectX 12, and
-  OpenGL at 64x64.
+## Required gates
 
-Environment-dependent native skips:
+- [ ] `versions.toml` and all generated version files report `0.1.1`.
+- [ ] Native CTest and Python tests pass on Linux, macOS, and Windows on the
+      exact release commit.
+- [ ] Windows formatting, Ruff, Python coverage, and Runtime AddressSanitizer
+      gates pass on that commit; generated-version validation passes in the
+      release workflow.
+- [ ] Windows x64, manylinux x64, and macOS arm64 wheels build for CPython
+      3.11–3.14, pass metadata/platform auditing, and install in clean
+      environments.
+- [ ] Every installed wheel passes CPU dispatch/readback, frontend and cooker
+      module CLI, and bundled Runtime-source presence/version checks.
+- [ ] A physical Apple Silicon Mac executes Metal compute, graphics, Argument
+      Buffer, dispatch, and readback acceptance. Hosted virtual Metal skips are
+      not sufficient for this gate.
+- [ ] The release workflow produces one immutable set of wheels, SHA256 sums,
+      SBOM, and provenance, stages those files in a GitHub Release, and
+      publishes the wheels to PyPI through Trusted Publishing.
+- [ ] Clean CPython 3.11 environments on Windows, Linux, and macOS install
+      `vernon-lang==0.1.1` from PyPI and repeat the installed-wheel smoke test
+      before the GitHub Release leaves draft state.
 
-- CUDA image/sampler lifetime;
-- OpenGL synchronization.
+## Publication procedure
 
-The latest referenced remote CI for commit `962ab1d` passed:
-<https://github.com/morphling666/VernonDSL/actions/runs/30472583146>. It is
-evidence for that commit only; the final merged release commit requires its own
-green run.
+1. Merge the release changes through review.
+2. Require all platform and wheel checks on that exact merged commit.
+3. Verify the PyPI `pypi` environment and Trusted Publisher configuration.
+4. Create the immutable `v0.1.1` tag on that commit.
+5. Let the release workflow build, verify, attest, stage, publish, verify from
+   PyPI, and then finalize the GitHub Release.
+6. Verify GitHub Release and PyPI filenames, hashes, version, and clean install.
 
-## Release contract
-
-The alpha contract is published in [`RELEASE_NOTES.md`](RELEASE_NOTES.md):
-
-- Windows is the only CI and prebuilt-wheel platform.
-- Supported wheels target CPython 3.11 through 3.14.
-- Cooked MSL bundles are consumed by the experimental Metal compute and
-  offscreen graphics Runtime on Apple through macOS source builds and CI; this
-  is not a stable wheel or GA capability.
-- Graphics is offscreen with host readback, not swapchain presentation.
-- GPU tests may skip when hardware, loaders, contexts, or drivers are absent.
-- Dynamic multi-rank TensorView layouts require AOT specialization.
-- CPU graphics, CUDA image/sampler resources, f16/f64 vertex attributes, and
-  non-relaxed atomics are outside the supported alpha subset.
-- Production-grade asynchronous multi-frame resource reclamation is deferred.
-- Released builds remain frontend version 3; language v4 is a roadmap target.
-
-## Final release steps
-
-1. Commit and push the release candidate.
-2. Merge through a reviewed PR into `master`.
-3. Require the Windows style, Runtime, ASan, compiler, Python 3.11-3.14 wheel,
-   fresh-wheel, and showcase jobs to pass on the merged commit.
-4. Tag that exact commit as `v0.1.1a1`.
-5. Create a GitHub pre-release using `RELEASE_NOTES.md`.
-6. Attach only CI-produced wheels that passed fresh-environment verification.
-7. Publish the same verified artifacts to PyPI.
-
-## Before beta
-
-- add Linux CI and verify compiler, Runtime, install, and source builds outside
-  Windows;
-- define a stable public API and deprecation policy;
-- publish release, compiler-contract, pipeline, ABI, and cache compatibility
-  guarantees;
-- close the high-priority compiler architecture work in
-  [`specs/completion_roadmap.md`](specs/completion_roadmap.md);
-- execute aggregate workgroup storage tests on available GPU runtimes;
-- decide the language-v4 autodiff and synchronization gates;
-- improve repeatable hardware-backed GPU acceptance reporting.
-
-## Before stable / GA
-
-- continuously test every supported platform and distribution path;
-- prove resource lifetime and synchronization across supported runtimes;
-- publish security reporting, support, ABI, and cache policies;
-- implement or explicitly remove major deferred promises;
-- automate release creation and artifact publication from an exact green tag.
+Do not move or reuse a failed tag. Any source or packaging change requires a
+new version and a complete rerun of the release gates.

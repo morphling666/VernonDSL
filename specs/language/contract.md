@@ -6,9 +6,9 @@
 > no independent numeric `FRONTEND_VERSION` axis.**
 >
 > The checked phases in `future_language_roadmap.md` are implemented in source
-> and tested where noted, but unchecked sections and active work in
-> `specs/completion_roadmap.md` remain unavailable as end-to-end guarantees.
-> Git history is the archive for superseded contract text.
+> and tested where noted. Unchecked sections and the language-v4 work in
+> the [project roadmap](../roadmap.md#language-v4) remain unavailable as end-to-end
+> guarantees. Git history is the archive for superseded contract text.
 
 Vernon is a statically typed GPU and graphics DSL embedded in Python syntax.
 The frontend parses source without importing or executing the shader module.

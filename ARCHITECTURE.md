@@ -4,7 +4,8 @@
 Python DSL 到各后端产物的完整路径，以及语言、编译器、Runtime、RHI、
 ExecutionGraph 和离线 Cook 机制之间的边界。
 
-> 当前发布线是 Windows-first alpha。发布版 frontend 仍处于 language v3；
+> 当前稳定发布线支持 Windows x64、Linux x64 和 Apple Silicon macOS。
+> 发布版 frontend 仍处于 language v3；
 > `specs/language/contract.md` 描述的是逐步落地的 language-v4 规范目标。
 > 本文以当前实现架构为主，不把 roadmap 中尚未验收的能力描述为稳定功能。
 
@@ -269,7 +270,9 @@ Vernon portable GPU program
   -> MSL source
 ```
 
-当前 Metal 只生成 source artifact，没有 Vernon Metal Runtime。
+Metal target 生成由 Apple Silicon macOS Runtime 消费的 MSL source
+artifact；Runtime 支持 compute 和离屏 graphics，但不提供 swapchain
+presentation。
 
 **DirectX**
 
@@ -534,8 +537,8 @@ Cook 的具体步骤：
 
 Target 是 cooker 输入而不是 source declaration。一个 backend-independent
 PipelineAsset 可以分别 Cook 为 Vulkan、OpenGL、DirectX、CUDA 或 CPU 部署物，
-也可以生成供外部 Metal 工具链使用的 MSL source artifact，只要其 stage 和
-feature 被该 target 支持。Metal 当前没有 Vernon Runtime。
+也可以生成由 Vernon Metal Runtime 或外部 Metal 工具链使用的 MSL source
+artifact，只要其 stage 和 feature 被该 target 支持。
 
 ### 9.3 Manifest 与内容寻址
 
@@ -656,7 +659,7 @@ PipelineAssets or interactive Pipelines
   artifact IO；
 - `source/lib/runtime/`：RuntimeCore、backend pipeline implementations 和
   RHI Adapter；
-- `source/lib/rhi/`：统一 RHI 与 CUDA/Vulkan/D3D12/OpenGL backend；
+- `source/lib/rhi/`：统一 RHI 与 CUDA/Vulkan/D3D12/OpenGL/Metal backend；
 - `source/lib/execution_graph/`：native graph validation、schedule、hazard、
   scope 和 barrier planning；
 - `python/vernon_dsl/_runtime/`：Python session、resources、Kernel/Pipeline
@@ -672,7 +675,8 @@ PipelineAssets or interactive Pipelines
   device 和 API version 决定；
 - DirectX Runtime 仅支持 Windows，DXIL 编译需要 DXC；
 - macOS 原生没有 Vulkan，通常通过 Khronos loader + MoltenVK；
-- Metal 当前只生成 MSL artifact，没有 Runtime；
+- Metal 可在所有 wheel 上离线 Cook MSL；Apple Silicon macOS wheel 还提供
+  compute 与离屏 graphics Runtime，但不提供 swapchain presentation；
 - Runtime 当前采用同步 submission，不公开多帧 in-flight；
 - sparse layout、任意动态分配、递归和完整 autodiff 仍不属于当前稳定能力；
 - 合法的 frontend program 仍可能因目标 capability 不足而在 target validation

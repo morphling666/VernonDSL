@@ -34,7 +34,6 @@ def main() -> int:
         grid=(expected.size, 1, 1),
     )
     np.testing.assert_array_equal(output.to_numpy(), expected)
-
     with tempfile.TemporaryDirectory(prefix="vernon-wheel-") as directory:
         root = Path(directory)
         source = root / "smoke_shader.py"
@@ -49,7 +48,33 @@ def main() -> int:
         )
         assert result.stat().st_size > 0
 
-    print(f"Installed VernonDSL {RELEASE_VERSION} CPU dispatch and frontend CLI checks passed.")
+        asset_source = root / "smoke_asset.py"
+        asset_source.write_text(
+            "from typing import Annotated\n"
+            "import vernon_dsl as vd\n"
+            "@vd.kernel(workgroup_size=(1, 1, 1))\n"
+            "def fill(output: vd.TensorView[vd.f32, (vd.dyn,), vd.write], "
+            "gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin('global_invocation_id')]) -> None:\n"
+            "    output[gid[0]] = 1.0\n"
+            "asset = vd.pipeline_asset(id='release/smoke', program=fill)\n",
+            encoding="utf-8",
+        )
+        cooked = root / "cooked"
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "vernon_dsl.pipeline_asset_cli",
+                f"{asset_source}:asset",
+                "--target",
+                "cpu",
+                "-o",
+                str(cooked),
+            ],
+            check=True,
+        )
+        assert (cooked / "cooked.pipeline.json").stat().st_size > 0
+    print(f"Installed VernonDSL {RELEASE_VERSION} CPU dispatch, frontend, cooker, and package checks passed.")
     return 0
 
 
