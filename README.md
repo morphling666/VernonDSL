@@ -61,25 +61,26 @@ for the supported surface and compatibility contract.
 
 ## Demos
 
-<p align="center">
-  <img
-    src="https://raw.githubusercontent.com/morphling666/VernonDSL/master/examples/assets/fractal-showcase.webp"
-    alt="VernonDSL CUDA Julia set"
-    width="640"
-  >
-  <br>
-  <strong>Julia Set</strong>
-  <br>
-  <sub>Tensor compute, structured control flow, and device readback</sub>
-</p>
-
-<table>
+<table align="center" width="640">
+  <tr>
+    <td colspan="2" align="center">
+      <img
+        src="https://raw.githubusercontent.com/morphling666/VernonDSL/master/examples/assets/fractal-showcase.webp"
+        alt="VernonDSL Julia set"
+        width="620"
+      >
+      <br>
+      <strong>Julia Set</strong>
+      <br>
+      <sub>Tensor compute, structured control flow, and device readback</sub>
+    </td>
+  </tr>
   <tr>
     <td width="50%" align="center">
       <img
         src="https://raw.githubusercontent.com/morphling666/VernonDSL/master/examples/assets/terrain-showcase.webp"
         alt="VernonDSL ray-marched terrain"
-        width="320"
+        width="300"
       >
       <br>
       <strong>Ray-marched Terrain</strong>
@@ -88,7 +89,7 @@ for the supported surface and compatibility contract.
       <img
         src="https://raw.githubusercontent.com/morphling666/VernonDSL/master/examples/assets/mandelbulb-showcase.webp"
         alt="VernonDSL animated Mandelbulb"
-        width="320"
+        width="300"
       >
       <br>
       <strong>Animated Mandelbulb</strong>

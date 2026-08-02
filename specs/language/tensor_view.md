@@ -12,11 +12,12 @@ The released Python frontend remains language version 3 while this v4 design is
 implemented and validated; the current code has no numeric `FRONTEND_VERSION`
 constant. Source syntax, typed IR, and compile-time tests cover unified
 TensorView load/store/atomic operations, workgroup address space, and
-`workgroup_storage`. End-to-end runtime parity, the final runtime TensorView
-layout ABI, and several compiler validation gates described in
-`specs/completion_roadmap.md` remain open. Serialized
-reflection, pipeline, and invocation ABI versions are bumped wherever this
-migration changes their records.
+`workgroup_storage`. The 0.1.1 Runtime descriptor ABI accepts dynamic shape,
+signed stride, and offset as invocation data without layout-specific
+recompilation. Broader language-v4 parity and validation remain tracked in
+the [project roadmap](../roadmap.md#language-v4). Serialized reflection,
+pipeline, and invocation ABI versions are bumped wherever this migration
+changes their records.
 
 ## 1. Tensor family and semantic categories
 
