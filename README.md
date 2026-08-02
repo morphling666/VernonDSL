@@ -140,16 +140,19 @@ vernon-compile-python --help
 vernon-cook-pipeline --help
 ```
 
-Runtime availability depends on installed drivers and hardware:
+The wheel contains the Vernon compiler, CPU Runtime, and the native backend
+implementations supported by its platform. It does not bundle GPU drivers.
+Runtime availability therefore depends on the selected backend:
 
-- CPU: compute reference execution;
-- CUDA: compute on a compatible NVIDIA driver;
-- Vulkan: compute and offscreen graphics;
-- DirectX 12: compute and offscreen graphics on Windows;
-- OpenGL: compute and graphics through a Python-owned or external context;
+- CPU: compute reference execution with no additional system dependency;
+- CUDA: compute with a compatible NVIDIA driver;
+- Vulkan: compute and offscreen graphics with a loader and vendor ICD;
+- DirectX 12: compute and offscreen graphics using Windows and its GPU driver;
+- OpenGL: compute and graphics through a compatible system context;
 - OpenGL ES: compute and graphics through a compatible owned or external
   context;
-- Metal: compute and offscreen graphics on supported Apple Silicon Macs.
+- Metal: compute and offscreen graphics through the system framework on
+  supported Apple Silicon Macs, with no additional loader.
 
 Cooked MSL bundles are consumed by the Runtime on Apple. Metal presentation and
 swapchain management are outside the `0.1.1` contract. Argument-buffer
@@ -161,16 +164,13 @@ non-relaxed atomics, asynchronous dispatch, and multiple frames in flight are
 outside the supported `0.1.1` subset. See
 [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for the complete release contract.
 
-### Platform prerequisites
-
-Native GPU backends require the corresponding system drivers, loaders, and
-window-system libraries.
+### Optional Vulkan setup
 
 #### macOS
 
-Metal uses the system framework and requires no separate loader. macOS does not
-provide native Vulkan; to use it, install the Khronos loader and MoltenVK ICD
-with Homebrew:
+Metal is the zero-install GPU backend on macOS. Vulkan is optional because
+macOS does not provide it natively. To use Vulkan, install the Khronos loader
+and MoltenVK ICD with Homebrew:
 
 ```bash
 brew install molten-vk vulkan-loader
@@ -182,8 +182,9 @@ it directly at MoltenVK.
 
 #### Linux
 
-On Ubuntu or Debian, Vulkan Runtime execution requires a loader and a usable
-vendor ICD. Mesa provides Intel, AMD, and software Vulkan drivers:
+Linux users need only the driver stack for the backend they select. For Vulkan
+on Ubuntu or Debian, install the loader and an appropriate vendor ICD. Mesa
+provides Intel, AMD, and software Vulkan drivers:
 
 ```bash
 sudo apt-get update
@@ -191,19 +192,9 @@ sudo apt-get install --yes libvulkan1 mesa-vulkan-drivers
 ```
 
 NVIDIA systems should install the matching proprietary driver instead of
-relying on Mesa for the device ICD. Source builds and OpenGL/EGL graphics tests
-also require the compiler-side and window-system development packages used by
-the Ubuntu CI environment:
+relying on Mesa for the device ICD.
 
-```bash
-sudo apt-get install --yes \
-  ninja-build patchelf pkg-config \
-  libgl1-mesa-dev libegl1-mesa-dev \
-  libwayland-dev libxkbcommon-dev wayland-protocols \
-  xorg-dev xvfb
-```
-
-### Vulkan discovery
+#### Loader discovery
 
 Vulkan is discovered when the Runtime creates a device. Vernon tries
 `VERNON_VULKAN_LOADER`, a loader under `VULKAN_SDK`, and the platform loader
@@ -272,6 +263,19 @@ Required tools:
 - Visual Studio 2022 C++ tools and the Windows SDK on Windows;
 - Python 3.11 through 3.14 and [uv](https://docs.astral.sh/uv/);
 - the repository's pinned `llvm-project` submodule.
+
+For a full Ubuntu or Debian source-build and graphics-test environment, install
+the same native packages used by Linux CI:
+
+```bash
+sudo apt-get update
+sudo apt-get install --yes \
+  ninja-build patchelf pkg-config \
+  libvulkan1 mesa-vulkan-drivers \
+  libgl1-mesa-dev libegl1-mesa-dev \
+  libwayland-dev libxkbcommon-dev wayland-protocols \
+  xorg-dev xvfb
+```
 
 Initialize the repository and build the pinned LLVM/MLIR installation once:
 
