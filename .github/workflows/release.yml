@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-version:
+    name: Validate release version
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Match tag to package version
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          package_version="$(
+            python -c 'namespace = {}; exec(open("python/vernon_dsl/_versions.py", encoding="utf-8").read(), namespace); print(namespace["RELEASE_VERSION"])'
+          )"
+          if [[ "$tag_version" != "$package_version" ]]; then
+            echo "::error::Tag version $tag_version does not match package version $package_version"
+            exit 1
+          fi
+
+  linux:
+    name: Build Linux wheels
+    needs: validate-version
+    uses: ./.github/workflows/linux-ci.yml
+
+  macos:
+    name: Build macOS wheels
+    needs: validate-version
+    uses: ./.github/workflows/macos-ci.yml
+
+  windows:
+    name: Build Windows wheels
+    needs: validate-version
+    uses: ./.github/workflows/windows-ci.yml
+
+  publish:
+    name: Publish to PyPI
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/project/vernon-lang/
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@v6
+        with:
+          pattern: vernon-lang-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish wheels
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
