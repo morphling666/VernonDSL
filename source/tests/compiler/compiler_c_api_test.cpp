@@ -3,11 +3,14 @@
 #include "compiler_artifacts.h"
 #include "compiler_target_test_utils.h"
 
+#include <cstdint>
 #include <cstring>
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 #include <stdio.h>
 #include <string.h>
 #include <string>
+#include <string_view>
 #include <vector>
 
 static int view_contains(VernonStringView value, const char *needle) {
@@ -40,6 +43,83 @@ static void sample_texture(void *user_data, uintptr_t texture, float u, float v,
     out_rgba[1] = v;
     out_rgba[2] = (float)texture;
     out_rgba[3] = bias;
+}
+
+TEST(CompilerCApi, CpuCanonicalAbiRoundTripsNestedVectorThreeAggregateTensor) {
+    static const char module[] = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  "vernon.struct"() {
+    abi_leaf_dtypes = ["f32", "i32"],
+    fields = ["direction:tensor<3xf32>", "id:i32"],
+    sym_name = "Payload"
+  } : () -> ()
+  func.func @roundtrip(
+      %value: !vernon.tensor<!vernon.struct<"Payload">, [2]> {
+        vernon.abi_leaf_dtypes = ["f32", "i32", "f32", "i32"],
+        vernon.element_abi_leaf_dtypes = ["f32", "i32"],
+        vernon.interface = "input",
+        vernon.location = 0 : i64
+      }) -> (!vernon.tensor<!vernon.struct<"Payload">, [2]> {
+        vernon.abi_leaf_dtypes = ["f32", "i32", "f32", "i32"],
+        vernon.element_abi_leaf_dtypes = ["f32", "i32"],
+        vernon.interface = "output",
+        vernon.location = 0 : i64
+      }) attributes {vernon.entry, vernon.stage = "fragment"} {
+    return %value : !vernon.tensor<!vernon.struct<"Payload">, [2]>
+  }
+}
+)mlir";
+    struct Payload {
+        float direction[3];
+        int32_t id;
+    };
+    static_assert(sizeof(Payload) == 16);
+
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *compiled = vernonCompilerCompileMlir(compiler, module, strlen(module), VERNON_TARGET_CPU);
+    ASSERT_TRUE(compiled);
+    if (vernonCompileResultGetStatus(compiled) != VERNON_STATUS_OK) {
+        VernonStringView diagnostics = vernonCompileResultGetDiagnostics(compiled);
+        fprintf(stderr, "%.*s\n", static_cast<int>(diagnostics.size), diagnostics.data);
+    }
+    ASSERT_EQ(vernonCompileResultGetStatus(compiled), VERNON_STATUS_OK);
+    const VernonStringView reflected = vernonCompileResultGetReflection(compiled);
+    const nlohmann::json reflection = nlohmann::json::parse(reflected.data, reflected.data + reflected.size);
+    const nlohmann::json &entry = reflection.at("entries").at(0);
+    const nlohmann::json &entryHost = entry.at("physical_layouts").at("host_value");
+    const nlohmann::json &argumentHost = entry.at("arguments").at(0).at("physical_layouts").at("host_value");
+    const nlohmann::json &resultHost = entry.at("results").at(0).at("physical_layouts").at("host_value");
+    EXPECT_EQ(entryHost.at("packed_arguments_size"), 32);
+    EXPECT_EQ(entryHost.at("packed_results_size"), 32);
+    EXPECT_EQ(argumentHost.at("kind"), "cpu_call");
+    EXPECT_EQ(resultHost.at("kind"), "cpu_call");
+    EXPECT_TRUE(argumentHost.contains("canonical_layout_hash"));
+    EXPECT_TRUE(resultHost.contains("canonical_layout_hash"));
+    EXPECT_TRUE(entry.at("arguments").at(0).contains("value_layout"));
+    EXPECT_TRUE(entry.at("arguments").at(0).contains("element_layout"));
+
+    VernonCpuEntryPoint roundtrip = vernonCompileResultGetCpuEntry(compiled, "roundtrip", 9);
+    ASSERT_TRUE(roundtrip);
+    const Payload input[2] = {{{1.0f, 2.0f, 3.0f}, 7}, {{4.0f, 5.0f, 6.0f}, 11}};
+    Payload output[2]{};
+    VernonCpuInvocation invocation = {input, sizeof(input), output, sizeof(output), nullptr};
+    ASSERT_EQ(roundtrip(&invocation), VERNON_STATUS_OK);
+    EXPECT_EQ(memcmp(input, output, sizeof(input)), 0);
+
+    for (std::string_view triple : {"x86_64-pc-windows-msvc", "arm64-apple-ios17.0"}) {
+        VernonCompileOptions options{};
+        options.struct_size = sizeof(options);
+        options.target = VERNON_TARGET_CPU;
+        options.as.cpu.triple = {triple.data(), triple.size()};
+        VernonCompileResult *cross = vernonCompilerCompileMlirWithOptions(compiler, module, strlen(module), &options);
+        ASSERT_TRUE(cross);
+        EXPECT_EQ(vernonCompileResultGetStatus(cross), VERNON_STATUS_OK);
+        vernonCompileResultDestroy(cross);
+    }
+
+    vernonCompileResultDestroy(compiled);
+    vernonCompilerDestroy(compiler);
 }
 
 TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
@@ -574,9 +654,10 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
         vernonCompilerCompileMlir(context, cpu_intrinsic_module, strlen(cpu_intrinsic_module), VERNON_TARGET_CPU);
     ASSERT_TRUE(cpu_intrinsic_compile != NULL);
     ASSERT_TRUE(vernonCompileResultGetStatus(cpu_intrinsic_compile) == VERNON_STATUS_OK);
+    ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(cpu_intrinsic_compile), "\"packed_arguments_size\":24"));
     VernonCpuEntryPoint normal_score = vernonCompileResultGetCpuEntry(cpu_intrinsic_compile, "normal_score", 12);
     ASSERT_TRUE(normal_score != NULL);
-    float intrinsic_arguments[7] = {0.0f, 0.0f, 2.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+    float intrinsic_arguments[6] = {0.0f, 0.0f, 2.0f, 0.0f, 0.0f, 1.0f};
     float intrinsic_result = 0.0f;
     VernonCpuInvocation intrinsic_invocation = {intrinsic_arguments, sizeof(intrinsic_arguments), &intrinsic_result,
                                                 sizeof(intrinsic_result), NULL};
@@ -678,6 +759,19 @@ TEST(CompilerCApi, RejectsMissingOrUnsupportedContractVersions) {
     ASSERT_TRUE(result);
     EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_VERIFICATION_ERROR);
     EXPECT_TRUE(view_contains(vernonCompileResultGetDiagnostics(result), "obsolete frontend-authored Value ABI"));
+    vernonCompileResultDestroy(result);
+
+    const char obsoleteTensorViewAbi[] =
+        "module attributes {" VERNON_MLIR_VERSION_ATTRIBUTES "} { "
+        "func.func @main(%value: !vernon.tensor_view<f32, [1], \"read\", \"device\"> "
+        "{vernon.abi_size = 4 : i64, vernon.interface = \"resource\", vernon.set = 0 : i64, "
+        "vernon.binding = 0 : i64}) attributes {vernon.entry, vernon.stage = \"compute\", "
+        "vernon.workgroup_size = array<i32: 1, 1, 1>} { return } "
+        "}";
+    result = vernonCompilerValidateMlir(context, obsoleteTensorViewAbi, strlen(obsoleteTensorViewAbi));
+    ASSERT_TRUE(result);
+    EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_VERIFICATION_ERROR);
+    EXPECT_TRUE(view_contains(vernonCompileResultGetDiagnostics(result), "retired duplicated Value ABI metadata"));
     vernonCompileResultDestroy(result);
     vernonCompilerDestroy(context);
 }

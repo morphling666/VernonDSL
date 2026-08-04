@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TypeAlias
@@ -37,7 +39,6 @@ class AttributeLayout:
 
 
 _ATTRIBUTE_DTYPES = {"i32", "u32", "f16", "f32", "f64"}
-_WORKGROUP_ALLOCATION_ALIGNMENT = 16
 
 
 def _scalar_bytes(dtype: str) -> int:
@@ -47,9 +48,65 @@ def _scalar_bytes(dtype: str) -> int:
     return max(scalar.width // 8, 1)
 
 
-def _workgroup_allocation_footprint(byte_size: int) -> int:
-    alignment = _WORKGROUP_ALLOCATION_ALIGNMENT
-    return ((byte_size + alignment - 1) // alignment) * alignment
+def _native_value_abi_nodes(
+    value_type: ConcreteType,
+    struct_fields: Callable[[str], StructFields],
+) -> tuple[tuple[int, int, tuple[int, ...], int | None], ...]:
+    declarations: dict[str, StructFields] = {}
+
+    def collect(current: ConcreteType, active: frozenset[str] = frozenset()) -> None:
+        if current.kind == "struct":
+            if current.name in active:
+                raise ValueError(f"recursive Struct '{current.name}' has no finite Value ABI")
+            fields = struct_fields(current.name)
+            previous = declarations.setdefault(current.name, fields)
+            if previous != fields:
+                raise ValueError(f"conflicting Struct declarations named '{current.name}'")
+            for _, field in fields:
+                collect(field, active | {current.name})
+            return
+        for argument in current.arguments:
+            if isinstance(argument, ConcreteType):
+                collect(argument, active)
+
+    collect(value_type)
+    declaration_lines = []
+    for name, fields in sorted(declarations.items()):
+        field_text = ", ".join(json.dumps(f"{field_name}:{field_type.mlir}") for field_name, field_type in fields)
+        declaration_lines.append(
+            f'  "vernon.struct"() {{fields = [{field_text}], sym_name = {json.dumps(name)}}} : () -> ()'
+        )
+    module = "\n".join(
+        [
+            "module {",
+            *declaration_lines,
+            f"  func.func private @__vernon_plan_value_abi(%value: {value_type.mlir})",
+            "}",
+        ]
+    )
+    logical_dtypes = tuple(leaf.dtype for leaf in value_leaves(value_type, struct_fields))
+    native = importlib.import_module("vernon_dsl._native")
+    nodes = tuple(
+        (
+            int(size),
+            int(alignment),
+            tuple(int(offset) for offset in offsets),
+            None if element_stride is None else int(element_stride),
+        )
+        for size, alignment, offsets, element_stride in native._plan_value_abi(module, logical_dtypes)
+    )
+    if not nodes:
+        raise ValueError(f"{value_type.mlir} has no finite canonical Value ABI")
+    return nodes
+
+
+def value_abi_extent(
+    value_type: ConcreteType,
+    struct_fields: Callable[[str], StructFields],
+) -> tuple[int, int]:
+    nodes = _native_value_abi_nodes(value_type, struct_fields)
+    size, alignment, _, _ = nodes[0]
+    return size, alignment
 
 
 def workgroup_physical_bytes(
@@ -57,16 +114,30 @@ def workgroup_physical_bytes(
     shape: tuple[int, ...],
     struct_fields: Callable[[str], StructFields],
 ) -> int:
+    nodes = _native_value_abi_nodes(element, struct_fields)
+
+    def scalar_lanes(index: int) -> tuple[tuple[tuple[int, int], ...], int]:
+        size, _, child_offsets, element_stride = nodes[index]
+        if element_stride is not None:
+            lanes, next_index = scalar_lanes(index + 1)
+            count = size // element_stride
+            return tuple((scalar_size, scalar_count * count) for scalar_size, scalar_count in lanes), next_index
+        if child_offsets:
+            lanes: list[tuple[int, int]] = []
+            next_index = index + 1
+            for _ in child_offsets:
+                child_lanes, next_index = scalar_lanes(next_index)
+                lanes.extend(child_lanes)
+            return tuple(lanes), next_index
+        return ((size, 1),), index + 1
+
+    lanes, next_index = scalar_lanes(0)
+    if next_index != len(nodes):
+        raise ValueError(f"{element.mlir} produced an invalid canonical Value ABI tree")
     records = 1
     for extent in shape:
         records *= extent
-    if element.kind == "scalar":
-        return _workgroup_allocation_footprint(records * _scalar_bytes(element.name))
-    total = 0
-    for leaf in value_leaves(element, struct_fields):
-        byte_size = records * leaf.scalar_count * _scalar_bytes(leaf.dtype)
-        total += _workgroup_allocation_footprint(byte_size)
-    return total
+    return sum(((records * count * size + 15) // 16) * 16 for size, count in lanes)
 
 
 def attribute_layout(

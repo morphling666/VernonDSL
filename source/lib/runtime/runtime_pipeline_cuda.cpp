@@ -20,7 +20,7 @@ namespace {
 
 VernonStatus fail(VernonRuntimeContext &context, std::string error,
                   VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) {
-    context.error = std::move(error);
+    invocationDiagnostic(context) = std::move(error);
     return status;
 }
 
@@ -34,7 +34,7 @@ bool resolveCudaPipeline(VernonPipelineBundle &bundle, const Variant &variant, V
     ReflectedEntry reflection;
     const nlohmann::json parsed = nlohmann::json::parse(stage.reflection, nullptr, false);
     if (parsed.is_discarded() ||
-        !parseReflection(parsed, stage.entry, reflection, VERNON_RUNTIME_CUDA, bundle.context->error))
+        !parseReflection(parsed, stage.entry, reflection, VERNON_RUNTIME_CUDA, invocationDiagnostic(*bundle.context)))
         return false;
     uint32_t internalSlot = 0;
     for (const Parameter &parameter : variant.parameters)
@@ -63,7 +63,7 @@ bool resolveCudaPipeline(VernonPipelineBundle &bundle, const Variant &variant, V
             if (use.stage != "compute" && use.stage != variant.compute)
                 continue;
             if (use.index >= reflection.arguments.size()) {
-                bundle.context->error = "CUDA parameter use exceeds reflected argument table";
+                invocationDiagnostic(*bundle.context) = "CUDA parameter use exceeds reflected argument table";
                 return false;
             }
             const ReflectedArgument &argument = reflection.arguments[use.index];
@@ -85,7 +85,7 @@ bool resolveCudaPipeline(VernonPipelineBundle &bundle, const Variant &variant, V
                                                                                   : argument.physical.size)
                         : argument.storageLeaves[leafIndex].elementSize);
                 if (!binding.element_size) {
-                    bundle.context->error = "CUDA reflected argument has zero element size";
+                    invocationDiagnostic(*bundle.context) = "CUDA reflected argument has zero element size";
                     return false;
                 }
                 candidate.source = {ComputeBindingSourceKind::Argument, use.index, 0};
@@ -142,7 +142,7 @@ bool resolveCudaPipeline(VernonPipelineBundle &bundle, const Variant &variant, V
         vernonRuntimeRhiAdapterGetProvider(cudaState(*bundle.context).adapter), &descriptor, &state->pipeline);
     if (status != VERNON_STATUS_OK) {
         const VernonStringView error = vernonRuntimeRhiAdapterGetLastError(cudaState(*bundle.context).adapter);
-        bundle.context->error =
+        invocationDiagnostic(*bundle.context) =
             error.data ? std::string(error.data, error.size) : "failed to prepare CUDA provider pipeline";
         return false;
     }

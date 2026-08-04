@@ -508,13 +508,15 @@ TEST(RuntimeVulkanPipeline, ExecutesReusableCookedGpuPullbackAfterPipelineDestru
     float selector = -1.0f;
     int32_t count = 2;
     std::array<float, 2> output{};
+    const uint64_t tensorShape[]{2};
     VernonAdValue inputValues[]{
-        {sizeof(VernonAdValue), {"value", 5}, VERNON_DATA_F32, value.data(), sizeof(value), {}},
+        {sizeof(VernonAdValue), {"value", 5}, VERNON_DATA_F32, value.data(), sizeof(value), 1, tensorShape},
         {sizeof(VernonAdValue), {"factor", 6}, VERNON_DATA_F32, &factor, sizeof(factor), {}},
         {sizeof(VernonAdValue), {"selector", 8}, VERNON_DATA_F32, &selector, sizeof(selector), {}},
         {sizeof(VernonAdValue), {"count", 5}, VERNON_DATA_I32, &count, sizeof(count), {}},
     };
-    VernonAdValue outputValue{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, output.data(), sizeof(output), {}};
+    VernonAdValue outputValue{
+        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, output.data(), sizeof(output), 1, tensorShape};
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), &outputValue, 1, {}};
     VernonPullback *pullback = nullptr;
@@ -539,11 +541,18 @@ TEST(RuntimeVulkanPipeline, ExecutesReusableCookedGpuPullbackAfterPipelineDestru
     std::array<float, 2> valueGradient{};
     float factorGradient = 1.0f;
     float selectorGradient = 1.0f;
-    VernonAdValue seedValue{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seed.data(), sizeof(seed), {}};
+    VernonAdValue seedValue{
+        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seed.data(), sizeof(seed), 1, tensorShape};
     VernonAdValue gradientValues[]{
         {sizeof(VernonAdValue), {"factor", 6}, VERNON_DATA_F32, &factorGradient, sizeof(factorGradient), {}},
         {sizeof(VernonAdValue), {"selector", 8}, VERNON_DATA_F32, &selectorGradient, sizeof(selectorGradient), {}},
-        {sizeof(VernonAdValue), {"value", 5}, VERNON_DATA_F32, valueGradient.data(), sizeof(valueGradient), {}},
+        {sizeof(VernonAdValue),
+         {"value", 5},
+         VERNON_DATA_F32,
+         valueGradient.data(),
+         sizeof(valueGradient),
+         1,
+         tensorShape},
     };
     VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seedValue, 1, {}};
     VernonAdValueSet gradients{sizeof(VernonAdValueSet), gradientValues, std::size(gradientValues), {}};
@@ -573,14 +582,25 @@ TEST(RuntimeVulkanPipeline, ExecutesReusableCookedGpuPullbackAfterPipelineDestru
         float factor{};
         float selector{};
     };
-    auto applyConcurrently = [](VernonPullback *target, std::array<float, 2> concurrentSeed) {
+    auto applyConcurrently = [&](VernonPullback *target, std::array<float, 2> concurrentSeed) {
         ConcurrentResult result;
-        VernonAdValue concurrentSeedValue{sizeof(VernonAdValue), {"output", 6},          VERNON_DATA_F32,
-                                          concurrentSeed.data(), sizeof(concurrentSeed), {}};
+        VernonAdValue concurrentSeedValue{sizeof(VernonAdValue),
+                                          {"output", 6},
+                                          VERNON_DATA_F32,
+                                          concurrentSeed.data(),
+                                          sizeof(concurrentSeed),
+                                          1,
+                                          tensorShape};
         VernonAdValue concurrentGradientValues[]{
             {sizeof(VernonAdValue), {"factor", 6}, VERNON_DATA_F32, &result.factor, sizeof(result.factor), {}},
             {sizeof(VernonAdValue), {"selector", 8}, VERNON_DATA_F32, &result.selector, sizeof(result.selector), {}},
-            {sizeof(VernonAdValue), {"value", 5}, VERNON_DATA_F32, result.value.data(), sizeof(result.value), {}},
+            {sizeof(VernonAdValue),
+             {"value", 5},
+             VERNON_DATA_F32,
+             result.value.data(),
+             sizeof(result.value),
+             1,
+             tensorShape},
         };
         VernonAdValueSet concurrentSeeds{sizeof(VernonAdValueSet), &concurrentSeedValue, 1, {}};
         VernonAdValueSet concurrentGradients{
@@ -606,16 +626,20 @@ TEST(RuntimeVulkanPipeline, ExecutesReusableCookedGpuPullbackAfterPipelineDestru
         VernonStatus status{};
         std::string diagnostic;
     };
-    auto failConcurrently = [runtime](VernonPullback *target, bool invalidCotangent) {
+    auto failConcurrently = [runtime, &tensorShape](VernonPullback *target, bool invalidCotangent) {
         ConcurrentFailure result;
         std::array<float, 2> concurrentSeed{1.0f, 1.0f};
         std::array<float, 2> concurrentValueGradient{};
         float concurrentFactorGradient{};
         float concurrentSelectorGradient{};
         const char *seedPath = invalidCotangent ? "invalid" : "output";
-        VernonAdValue concurrentSeedValue{sizeof(VernonAdValue),  {seedPath, std::strlen(seedPath)},
-                                          VERNON_DATA_F32,        concurrentSeed.data(),
-                                          sizeof(concurrentSeed), {}};
+        VernonAdValue concurrentSeedValue{sizeof(VernonAdValue),
+                                          {seedPath, std::strlen(seedPath)},
+                                          VERNON_DATA_F32,
+                                          concurrentSeed.data(),
+                                          sizeof(concurrentSeed),
+                                          1,
+                                          tensorShape};
         VernonAdValue concurrentGradientValues[]{
             {sizeof(VernonAdValue),
              {"factor", 6},
@@ -634,7 +658,8 @@ TEST(RuntimeVulkanPipeline, ExecutesReusableCookedGpuPullbackAfterPipelineDestru
              VERNON_DATA_F32,
              concurrentValueGradient.data(),
              sizeof(concurrentValueGradient),
-             {}},
+             1,
+             tensorShape},
         };
         VernonAdValueSet concurrentSeeds{sizeof(VernonAdValueSet), &concurrentSeedValue, 1, {}};
         VernonAdValueSet concurrentGradients{sizeof(VernonAdValueSet),
@@ -682,8 +707,9 @@ TEST(RuntimeVulkanPipeline, ExecutesCookedStoragePullbackWithFreshGradient) {
     std::array<float, 3> values{2.0f, 3.0f, 4.0f};
     float scale = 2.0f;
     float output{};
+    const uint64_t valuesShape[]{3};
     VernonAdValue inputValues[]{
-        {sizeof(VernonAdValue), {"values", 6}, VERNON_DATA_F32, values.data(), sizeof(values), {}},
+        {sizeof(VernonAdValue), {"values", 6}, VERNON_DATA_F32, values.data(), sizeof(values), 1, valuesShape},
         {sizeof(VernonAdValue), {"scale", 5}, VERNON_DATA_F32, &scale, sizeof(scale), {}},
     };
     VernonAdValue outputValue{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &output, sizeof(output), {}};
@@ -723,7 +749,13 @@ TEST(RuntimeVulkanPipeline, ExecutesCookedStoragePullbackWithFreshGradient) {
     VernonAdValue seedValue{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &seed, sizeof(seed), {}};
     VernonAdValue gradientValues[]{
         {sizeof(VernonAdValue), {"scale", 5}, VERNON_DATA_F32, &scaleGradient, sizeof(scaleGradient), {}},
-        {sizeof(VernonAdValue), {"values", 6}, VERNON_DATA_F32, valuesGradient.data(), sizeof(valuesGradient), {}},
+        {sizeof(VernonAdValue),
+         {"values", 6},
+         VERNON_DATA_F32,
+         valuesGradient.data(),
+         sizeof(valuesGradient),
+         1,
+         valuesShape},
     };
     VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seedValue, 1, {}};
     VernonAdValueSet gradients{sizeof(VernonAdValueSet), gradientValues, std::size(gradientValues), {}};
@@ -768,8 +800,12 @@ TEST(RuntimeVulkanPipeline, ExecutesRuntimeGridScatterPullback) {
 
     std::array<float, 3> values{1.0f, 2.0f, 4.0f};
     std::array<float, 3> output{};
-    VernonAdValue inputValue{sizeof(VernonAdValue), {"values", 6}, VERNON_DATA_F32, values.data(), sizeof(values), {}};
-    VernonAdValue outputValue{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, output.data(), sizeof(output), {}};
+    const uint64_t valuesShape[]{3};
+    const uint64_t carrierShape[]{1, 1, 3};
+    VernonAdValue inputValue{
+        sizeof(VernonAdValue), {"values", 6}, VERNON_DATA_F32, values.data(), sizeof(values), 1, valuesShape};
+    VernonAdValue outputValue{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, output.data(), sizeof(output), 3,
+                              carrierShape};
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), &inputValue, 1, {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), &outputValue, 1, {}};
     VernonPullback *pullback = nullptr;
@@ -779,9 +815,10 @@ TEST(RuntimeVulkanPipeline, ExecutesRuntimeGridScatterPullback) {
 
     std::array<float, 3> seed{1.0f, 2.0f, 3.0f};
     std::array<float, 3> gradient{};
-    VernonAdValue seedValue{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seed.data(), sizeof(seed), {}};
-    VernonAdValue gradientValue{sizeof(VernonAdValue), {"values", 6},    VERNON_DATA_F32,
-                                gradient.data(),       sizeof(gradient), {}};
+    VernonAdValue seedValue{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seed.data(), sizeof(seed), 3,
+                            carrierShape};
+    VernonAdValue gradientValue{
+        sizeof(VernonAdValue), {"values", 6}, VERNON_DATA_F32, gradient.data(), sizeof(gradient), 1, valuesShape};
     VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seedValue, 1, {}};
     VernonAdValueSet gradients{sizeof(VernonAdValueSet), &gradientValue, 1, {}};
     ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK)
@@ -824,8 +861,11 @@ TEST(RuntimeVulkanPipeline, ExecutesMultiNodeAutodiffExecutionGraph) {
     float secondFactor = 3.0f;
     float secondSelector = 1.0f;
     int32_t secondCount = 2;
-    auto adValue = [](const char *path, size_t pathSize, VernonDataType dtype, void *data, size_t size) {
-        return VernonAdValue{sizeof(VernonAdValue), {path, pathSize}, dtype, data, size, {}};
+    const uint64_t tensorShape[]{2};
+    auto adValue = [&](const char *path, size_t pathSize, VernonDataType dtype, void *data, size_t size,
+                       bool tensor = false) {
+        return VernonAdValue{sizeof(VernonAdValue),         {path, pathSize}, dtype, data, size, tensor ? 1u : 0u,
+                             tensor ? tensorShape : nullptr};
     };
 
     vernon::runtime::AutodiffGraph graph(context.runtime);
@@ -839,7 +879,7 @@ TEST(RuntimeVulkanPipeline, ExecutesMultiNodeAutodiffExecutionGraph) {
         EXPECT_EQ(foreignGraph.setOutput(first), VERNON_STATUS_INVALID_ARGUMENT);
     }
     ASSERT_EQ(graph.addNode("second", secondPipeline, second), VERNON_STATUS_OK);
-    VernonAdValue firstValue = adValue("value", 5, VERNON_DATA_F32, value.data(), sizeof(value));
+    VernonAdValue firstValue = adValue("value", 5, VERNON_DATA_F32, value.data(), sizeof(value), true);
     VernonAdValue firstFactorValue = adValue("factor.first", 12, VERNON_DATA_F32, &firstFactor, sizeof(firstFactor));
     VernonAdValue firstSelectorValue =
         adValue("selector.first", 14, VERNON_DATA_F32, &firstSelector, sizeof(firstSelector));
@@ -869,7 +909,7 @@ TEST(RuntimeVulkanPipeline, ExecutesMultiNodeAutodiffExecutionGraph) {
     vernonRuntimePipelineBundleDestroy(loaded);
 
     std::array<float, 2> output{};
-    VernonAdValue outputValue = adValue("output", 6, VERNON_DATA_F32, output.data(), sizeof(output));
+    VernonAdValue outputValue = adValue("output", 6, VERNON_DATA_F32, output.data(), sizeof(output), true);
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), &outputValue, 1, {}};
     std::unique_ptr<vernon::runtime::AutodiffGraphPullback> pullback;
     float invalidOutput{};
@@ -888,9 +928,9 @@ TEST(RuntimeVulkanPipeline, ExecutesMultiNodeAutodiffExecutionGraph) {
     float factorGradient{};
     float firstSelectorGradient{};
     float secondSelectorGradient{};
-    VernonAdValue seedValue = adValue("output", 6, VERNON_DATA_F32, seed.data(), sizeof(seed));
+    VernonAdValue seedValue = adValue("output", 6, VERNON_DATA_F32, seed.data(), sizeof(seed), true);
     VernonAdValue gradientValues[]{
-        adValue("value", 5, VERNON_DATA_F32, valueGradient.data(), sizeof(valueGradient)),
+        adValue("value", 5, VERNON_DATA_F32, valueGradient.data(), sizeof(valueGradient), true),
         adValue("factor", 6, VERNON_DATA_F32, &factorGradient, sizeof(factorGradient)),
         adValue("selector.first", 14, VERNON_DATA_F32, &firstSelectorGradient, sizeof(firstSelectorGradient)),
         adValue("selector.second", 15, VERNON_DATA_F32, &secondSelectorGradient, sizeof(secondSelectorGradient)),

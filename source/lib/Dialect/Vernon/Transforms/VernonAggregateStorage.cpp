@@ -443,6 +443,23 @@ struct AggregateWorkgroupAllocPattern final : OpConversionPattern<WorkgroupAlloc
 
 } // namespace
 
+FailureOr<Value> buildAggregateValueFromScalars(Type type, ValueRange scalars, ModuleOp module, OpBuilder &builder,
+                                                Location location) {
+    unsigned cursor = 0;
+    FailureOr<Value> result = buildAggregateValueVernon(type, scalars, cursor, module, builder, location);
+    if (failed(result) || cursor != scalars.size())
+        return failure();
+    return result;
+}
+
+FailureOr<SmallVector<Value>> decomposeAggregateValueToScalars(Type type, Value value, ModuleOp module,
+                                                               OpBuilder &builder, Location location) {
+    SmallVector<Value> scalars;
+    if (failed(decomposeAggregateValueVernon(type, value, scalars, module, builder, location)))
+        return failure();
+    return scalars;
+}
+
 FailureOr<Value> loadAggregateRecordFromStorages(Type elementType, ValueRange storages, Value recordIndex,
                                                  const ValueAbiLayout &layout, ModuleOp module, OpBuilder &builder,
                                                  Location location, AggregateStorageBackend backend) {

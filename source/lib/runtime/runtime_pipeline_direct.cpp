@@ -70,10 +70,20 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
         parameter.source = "direct";
         if (!parseAutodiffResourceRole(argument, parameter.autodiffRole, error))
             return false;
-        if (parameter.kind == "tensor" &&
-            (!argument.contains("element_layout") ||
-             !parsePipelineValueLayout(argument["element_layout"], parameter.elementLayout, error)))
-            return false;
+        if (parameter.kind == "tensor") {
+            if (argument.contains("element_layout")) {
+                if (!parsePipelineValueLayout(argument["element_layout"], parameter.elementLayout, error))
+                    return false;
+            } else if (argument.contains("value_layout")) {
+                ValueLayout layout;
+                if (!parsePipelineValueLayout(argument["value_layout"], layout, error))
+                    return false;
+                parameter.valueLayout = std::move(layout);
+            } else {
+                error = "compute value reflection has no canonical layout";
+                return false;
+            }
+        }
         parameter.access =
             argument.value("access", argument.value("kind", std::string()) == "tensor" ? "read_write" : "read");
         if (argument.contains("shape") && argument["shape"].is_array())
@@ -95,6 +105,13 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
                                                                                      : "value";
         use.dtype = argument.value("dtype", std::string());
         use.shape = parameter.shape;
+        use.transport = transport;
+        if (argument.contains("value_layout")) {
+            ValueLayout layout;
+            if (!parsePipelineValueLayout(argument["value_layout"], layout, error))
+                return false;
+            use.valueLayout = std::move(layout);
+        }
         if (argument.contains("tensor_view_descriptor")) {
             const auto &descriptor = argument["tensor_view_descriptor"];
             TensorViewDescriptorUse parsedDescriptor;
@@ -128,31 +145,22 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
             }
             const auto physical = physicalLayouts->find(physicalProfile);
             if (physical == physicalLayouts->end() || !physical->is_object() ||
-                physical->value("profile", std::string()) != physicalProfile || !physical->contains("size") ||
-                !(*physical)["size"].is_number_unsigned() || !physical->contains("alignment") ||
-                !(*physical)["alignment"].is_number_unsigned() || !physical->contains("byte_strides") ||
-                !(*physical)["byte_strides"].is_array()) {
+                physical->value("profile", std::string()) != physicalProfile) {
                 error = "compute value reflection has no physical profile for selected target";
                 return false;
             }
-            PhysicalValueLayout layout;
-            layout.profile = physicalProfile;
-            layout.transport = transport;
-            layout.size = (*physical)["size"].get<uint64_t>();
-            layout.alignment = (*physical)["alignment"].get<uint64_t>();
-            layout.byteStrides = (*physical)["byte_strides"].get<std::vector<uint64_t>>();
-            if (physical->contains("element_leaf_offsets")) {
-                if (!(*physical)["element_leaf_offsets"].is_array()) {
-                    error = "compute value reflection has invalid element leaf offsets";
-                    return false;
-                }
-                layout.elementLeafOffsets = (*physical)["element_leaf_offsets"].get<std::vector<uint64_t>>();
-            }
-            if (layout.byteStrides.size() != parameter.shape.size()) {
-                error = "compute value physical stride rank does not match its logical shape";
+            InterfacePlan plan;
+            if (!parsePipelineInterfacePlan(*physical, plan, error))
+                return false;
+            if (plan.root && !plan.root->byteStrides.empty() && plan.root->byteStrides.size() != use.shape.size()) {
+                error = "compute value interface plan rank does not match its reflected shape";
                 return false;
             }
-            use.physicalValueLayout = std::move(layout);
+            if (use.valueLayout && plan.canonicalLayoutHash != use.valueLayout->layoutHash) {
+                error = "compute value interface plan hash does not match value_layout";
+                return false;
+            }
+            use.interfacePlan = std::move(plan);
         }
         parameter.uses.push_back(std::move(use));
         variant.parameters.push_back(std::move(parameter));
@@ -189,12 +197,13 @@ VernonLoadedPipeline *loadBackendCpuEntryPipeline(VernonRuntimeContext &context,
     pipeline->context = &context;
     ReflectedEntry reflection;
     const std::string entry(entryData, entrySize);
-    if (!buildDirectComputeVariant(parsed, entry, pipeline->variant, reflection, VERNON_RUNTIME_CPU, context.error))
+    if (!buildDirectComputeVariant(parsed, entry, pipeline->variant, reflection, VERNON_RUNTIME_CPU,
+                                   invocationDiagnostic(context)))
         return nullptr;
     CpuKernelState kernel;
     ReflectedEntry loadedReflection;
     if (!loadCpuEntry(entryPoint, reflectionData, reflectionSize, entryData, entrySize, kernel, loadedReflection,
-                      context.error))
+                      invocationDiagnostic(context)))
         return nullptr;
     auto state = std::make_unique<CpuPipelineState>();
     if (!prepareCpuComputePipeline(context, std::move(kernel), std::move(loadedReflection), *state))
@@ -209,11 +218,11 @@ VernonLoadedPipeline *loadBackendCpuNativePipeline(VernonRuntimeContext &context
     pipeline->context = &context;
     ReflectedEntry reflected;
     if (!buildDirectComputeVariant(artifact.reflection, artifact.entry, pipeline->variant, reflected,
-                                   VERNON_RUNTIME_CPU, context.error))
+                                   VERNON_RUNTIME_CPU, invocationDiagnostic(context)))
         return nullptr;
     CpuKernelState kernel;
     ReflectedEntry loadedReflection;
-    if (!loadCpuNativeArtifact(artifact, kernel, loadedReflection, context.error))
+    if (!loadCpuNativeArtifact(artifact, kernel, loadedReflection, invocationDiagnostic(context)))
         return nullptr;
     auto state = std::make_unique<CpuPipelineState>();
     if (!prepareCpuComputePipeline(context, std::move(kernel), std::move(loadedReflection), *state))
@@ -236,7 +245,8 @@ VernonLoadedPipeline *loadBackendArtifactPipeline(VernonRuntimeContext &context,
     pipeline->context = &context;
     ReflectedEntry reflection;
     const std::string entry(entryData, entrySize);
-    if (!buildDirectComputeVariant(parsed, entry, pipeline->variant, reflection, context.backend, context.error))
+    if (!buildDirectComputeVariant(parsed, entry, pipeline->variant, reflection, context.backend,
+                                   invocationDiagnostic(context)))
         return nullptr;
     VernonPipelineBundle bundle;
     bundle.context = &context;

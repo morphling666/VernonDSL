@@ -36,38 +36,11 @@ FrontendPtr &planningFrontend() {
     return frontend;
 }
 
-mlir::LogicalResult appendLayoutTree(mlir::Type type, mlir::ModuleOp module, std::vector<ValueAbiNode> &nodes,
-                                     llvm::ArrayRef<llvm::StringRef> logicalDtypes = {}) {
-    mlir::FailureOr<mlir::vernon::ValueAbiLayout> layout = mlir::vernon::getValueAbiLayout(type, module, logicalDtypes);
-    if (mlir::failed(layout))
-        return mlir::failure();
-    nodes.push_back({layout->size,
-                     layout->alignment,
-                     {layout->fieldOffsets.begin(), layout->fieldOffsets.end()},
-                     layout->elementStride});
-
-    if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type))
-        return appendLayoutTree(tensor.getElementType(), module, nodes);
-    if (auto tensor = mlir::dyn_cast<mlir::vernon::TensorType>(type))
-        return appendLayoutTree(tensor.getElementType(), module, nodes);
-    if (auto vector = mlir::dyn_cast<mlir::VectorType>(type))
-        return appendLayoutTree(vector.getElementType(), module, nodes);
-    if (auto tuple = mlir::dyn_cast<mlir::TupleType>(type)) {
-        for (mlir::Type element : tuple.getTypes())
-            if (mlir::failed(appendLayoutTree(element, module, nodes)))
-                return mlir::failure();
-        return mlir::success();
-    }
-    if (auto structure = mlir::dyn_cast<mlir::vernon::StructType>(type)) {
-        mlir::FailureOr<mlir::vernon::ResolvedStructFields> fields =
-            mlir::vernon::resolveNamedStructFields(structure, module);
-        if (mlir::failed(fields))
-            return mlir::failure();
-        for (const mlir::vernon::ResolvedStructField &field : fields->fields)
-            if (mlir::failed(appendLayoutTree(field.type, module, nodes)))
-                return mlir::failure();
-    }
-    return mlir::success();
+void appendLayoutTree(const mlir::vernon::CanonicalAbiNode &node, std::vector<ValueAbiNode> &nodes) {
+    nodes.push_back(
+        {node.size, node.alignment, {node.childOffsets.begin(), node.childOffsets.end()}, node.elementStride});
+    for (const std::shared_ptr<const mlir::vernon::CanonicalAbiNode> &child : node.children)
+        appendLayoutTree(*child, nodes);
 }
 
 VernonStringView viewOf(const std::string &value) { return {value.data(), value.size()}; }
@@ -131,12 +104,15 @@ VernonPythonValueAbiPlan *vernonCompilerPlanPythonValueAbi(VernonStringView modu
     dtypes.reserve(logicalDtypeCount);
     for (size_t index = 0; index < logicalDtypeCount; ++index)
         dtypes.emplace_back(logicalDtypes[index].data, logicalDtypes[index].size);
-    if (mlir::failed(appendLayoutTree(function.getArgumentTypes().front(), *parsed, plan->nodes, dtypes))) {
+    mlir::FailureOr<mlir::vernon::ValueAbiLayout> layout =
+        mlir::vernon::getValueAbiLayout(function.getArgumentTypes().front(), *parsed, dtypes);
+    if (mlir::failed(layout) || !layout->tree.root) {
         plan->status = VERNON_STATUS_VERIFICATION_ERROR;
         plan->diagnostics = "type has no finite canonical Value ABI layout";
         plan->nodes.clear();
         return plan.release();
     }
+    appendLayoutTree(*layout->tree.root, plan->nodes);
     plan->nodeViews.reserve(plan->nodes.size());
     for (const ValueAbiNode &node : plan->nodes) {
         plan->nodeViews.push_back({node.size, node.alignment, node.fieldOffsets.data(), node.fieldOffsets.size(),

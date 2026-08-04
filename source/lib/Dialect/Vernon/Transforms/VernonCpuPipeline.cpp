@@ -21,6 +21,7 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonInlineHelpers.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUABI.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUResources.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUTensors.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerSynchronization.h"
@@ -96,6 +97,7 @@ void buildVernonCpuLoweringPipeline(OpPassManager &passManager) {
     passManager.addPass(
         createVernonLowerAccumulationPass(AccumulationTargetCapabilities{/*supportsF32AtomicAdd=*/true,
                                                                          /*supportsF64AtomicAdd=*/true}));
+    passManager.addPass(createVernonLowerCPUABIPass());
     passManager.addPass(createVernonLowerCPUTensorsPass());
     passManager.addPass(createVernonLowerSynchronizationPass());
     passManager.addPass(createVernonLowerCPUResourcesPass());

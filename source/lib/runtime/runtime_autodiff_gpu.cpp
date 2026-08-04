@@ -280,7 +280,8 @@ bool resolveProfile(VernonPipelineBundle &bundle, const std::string &id,
     const Stage &stage = bundle.stages.at(id);
     auto profile = std::make_unique<VernonLoadedPipeline>();
     profile->context = bundle.context;
-    if (!buildReflectedComputeVariant(stage, bundle.context->backend, profile->variant, bundle.context->error))
+    if (!buildReflectedComputeVariant(stage, bundle.context->backend, profile->variant,
+                                      invocationDiagnostic(*bundle.context)))
         return false;
     profile->variant.compute = id;
     profile->variant.program["compute"] = id;
@@ -334,8 +335,8 @@ bool createGpuExecutable(VernonPipelineBundle &bundle, const std::string &forwar
     auto backward = std::make_shared<GpuProfile>();
     if (!resolveProfile(bundle, forwardId, forward->pipeline) ||
         !resolveProfile(bundle, backwardId, backward->pipeline) ||
-        !parseResourceProfile(*forward->pipeline, forward->layout, bundle.context->error) ||
-        !parseResourceProfile(*backward->pipeline, backward->layout, bundle.context->error))
+        !parseResourceProfile(*forward->pipeline, forward->layout, invocationDiagnostic(*bundle.context)) ||
+        !parseResourceProfile(*backward->pipeline, backward->layout, invocationDiagnostic(*bundle.context)))
         return false;
     buildInvocationTemplate(*forward);
     buildInvocationTemplate(*backward);
@@ -343,23 +344,14 @@ bool createGpuExecutable(VernonPipelineBundle &bundle, const std::string &forwar
         return stage.workgroup[0] == launch.workgroupSize.x && stage.workgroup[1] == launch.workgroupSize.y &&
                stage.workgroup[2] == launch.workgroupSize.z;
     };
-    const bool serialBackward = std::any_of(
-        launch.accumulationPlans.begin(), launch.accumulationPlans.end(), [&](const AutodiffAccumulationPlan &plan) {
-            if (std::find(plan.evidence.begin(), plan.evidence.end(), "disjoint_scatter") != plan.evidence.end())
-                return false;
-            if (bundle.context->backend != VERNON_RUNTIME_CUDA)
-                return true;
-            const ResourceBinding *gradient = binding(backward->layout, plan.path);
-            return gradient && gradient->abi.role == GpuResourceRole::Gradient &&
-                   gradient->abi.value.dtype != VERNON_DATA_F32;
-        });
     const Stage &backwardStage = bundle.stages.at(backwardId);
+    const bool serialBackward = backwardStage.serialDispatch;
     const bool backwardWorkgroupMatches =
         serialBackward
             ? backwardStage.workgroup[0] == 1 && backwardStage.workgroup[1] == 1 && backwardStage.workgroup[2] == 1
             : workgroupMatches(backwardStage);
     if (!workgroupMatches(bundle.stages.at(forwardId)) || !backwardWorkgroupMatches) {
-        bundle.context->error = "autodiff GPU profile workgroup size does not match its launch plan";
+        invocationDiagnostic(*bundle.context) = "autodiff GPU profile workgroup size does not match its launch plan";
         return false;
     }
     forward->workgroup = launch.workgroupSize;
@@ -370,52 +362,54 @@ bool createGpuExecutable(VernonPipelineBundle &bundle, const std::string &forwar
         if (resource.abi.value.path == "__vernon_launch") {
             if (resource.abi.role != GpuResourceRole::Input || resource.abi.value.dtype != VERNON_DATA_U32 ||
                 resource.abi.value.logicalShape != std::vector<uint64_t>{3}) {
-                bundle.context->error = "autodiff forward GPU profile has an invalid launch resource";
+                invocationDiagnostic(*bundle.context) = "autodiff forward GPU profile has an invalid launch resource";
                 return false;
             }
         } else if (resource.abi.role == GpuResourceRole::Input || resource.abi.role == GpuResourceRole::Storage) {
             signature.inputs.push_back(resource.abi.value);
         } else if (resource.abi.role == GpuResourceRole::Output) {
             if (!signature.output.path.empty()) {
-                bundle.context->error = "autodiff forward GPU profile contains multiple output resources";
+                invocationDiagnostic(*bundle.context) =
+                    "autodiff forward GPU profile contains multiple output resources";
                 return false;
             }
             signature.output = resource.abi.value;
         } else if (resource.abi.role == GpuResourceRole::Tape) {
             signature.tape.push_back(resource.abi.value);
         } else {
-            bundle.context->error = "autodiff forward GPU profile contains a resource with an invalid role";
+            invocationDiagnostic(*bundle.context) =
+                "autodiff forward GPU profile contains a resource with an invalid role";
             return false;
         }
     }
     if (signature.output.path.empty()) {
-        bundle.context->error = "autodiff forward GPU profile has no output resource";
+        invocationDiagnostic(*bundle.context) = "autodiff forward GPU profile has no output resource";
         return false;
     }
     if (!binding(forward->layout, "__vernon_launch")) {
-        bundle.context->error = "autodiff forward GPU profile has no launch resource";
+        invocationDiagnostic(*bundle.context) = "autodiff forward GPU profile has no launch resource";
         return false;
     }
     const ResourceBinding *forwardOutput = uniqueBinding(forward->layout, GpuResourceRole::Output);
     if (!forwardOutput) {
-        bundle.context->error = "autodiff forward GPU profile has an invalid output resource";
+        invocationDiagnostic(*bundle.context) = "autodiff forward GPU profile has an invalid output resource";
         return false;
     }
     const ResourceBinding *cotangent = uniqueBinding(backward->layout, GpuResourceRole::Cotangent);
-    if (!cotangent || !sameValueAbi(signature.output, cotangent->abi.value)) {
-        bundle.context->error = "autodiff output and cotangent GPU resource ABIs do not match";
+    if (!cotangent || !derivativeAbiMatches(signature.output, cotangent->abi.value)) {
+        invocationDiagnostic(*bundle.context) = "autodiff output and cotangent GPU resource ABIs do not match";
         return false;
     }
     signature.cotangent = cotangent->abi.value;
     if (cotangent->abi.physicalShape != forwardOutput->abi.physicalShape) {
-        bundle.context->error = "autodiff output and cotangent physical shapes do not match";
+        invocationDiagnostic(*bundle.context) = "autodiff output and cotangent physical shapes do not match";
         return false;
     }
     for (const ValueAbi &tape : signature.tape) {
         const ResourceBinding *backwardTape = binding(backward->layout, tape.path);
         if (!backwardTape || backwardTape->abi.role != GpuResourceRole::Tape ||
             backwardTape->abi.access != VERNON_ACCESS_READ || !sameValueAbi(tape, backwardTape->abi.value)) {
-            bundle.context->error = "autodiff tape GPU resource ABIs do not match";
+            invocationDiagnostic(*bundle.context) = "autodiff tape GPU resource ABIs do not match";
             return false;
         }
     }
@@ -423,7 +417,7 @@ bool createGpuExecutable(VernonPipelineBundle &bundle, const std::string &forwar
     if (!backwardLaunch || backwardLaunch->abi.role != GpuResourceRole::Input ||
         backwardLaunch->abi.value.dtype != VERNON_DATA_U32 ||
         backwardLaunch->abi.value.logicalShape != std::vector<uint64_t>{3}) {
-        bundle.context->error = "autodiff backward GPU profile has no matching launch resource";
+        invocationDiagnostic(*bundle.context) = "autodiff backward GPU profile has no matching launch resource";
         return false;
     }
     for (const std::string &path : gradientPaths) {
@@ -432,13 +426,13 @@ bool createGpuExecutable(VernonPipelineBundle &bundle, const std::string &forwar
         if (found != backward->layout.byPath.end())
             gradient = &backward->layout.resources[found->second];
         if (!gradient || gradient->abi.role != GpuResourceRole::Gradient) {
-            bundle.context->error = "autodiff gradient paths do not match the GPU resource profile";
+            invocationDiagnostic(*bundle.context) = "autodiff gradient paths do not match the GPU resource profile";
             return false;
         }
         signature.gradients.push_back(gradient->abi.value);
     }
     if (backward->layout.resources.size() != signature.tape.size() + 2 + signature.gradients.size()) {
-        bundle.context->error = "autodiff backward GPU profile contains unexpected resources";
+        invocationDiagnostic(*bundle.context) = "autodiff backward GPU profile contains unexpected resources";
         return false;
     }
     buildResourceAbis(*forward);

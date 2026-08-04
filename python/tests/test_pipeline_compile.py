@@ -43,23 +43,60 @@ def _scalar_layout(dtype: str) -> dict[str, object]:
     }
 
 
-def _physical_value_layout(
+def _interface_plan(
     profile: str,
     size: int,
     alignment: int,
     byte_strides: list[int],
 ) -> dict[str, object]:
-    return {
-        "profile": profile,
+    kind = {
+        "host_value": "cpu_call",
+        "cuda_kernel_parameter": "kernel_parameter",
+        "opengl_native_uniform": "native_uniform",
+    }.get(profile, "byte_transport")
+    root = {
+        "kind": "scalar",
+        "representation": "f32",
+        "offset": 0,
         "size": size,
         "alignment": alignment,
-        "byte_strides": byte_strides,
+        "shape": [],
+        "byte_strides": [],
+        "children": [],
+    }
+    if byte_strides:
+        root = {
+            "kind": "array",
+            "representation": "",
+            "offset": 0,
+            "size": size,
+            "alignment": alignment,
+            "shape": [1] * len(byte_strides),
+            "byte_strides": byte_strides,
+            "children": [
+                {
+                    "kind": "scalar",
+                    "representation": "f32",
+                    "offset": 0,
+                    "size": byte_strides[-1],
+                    "alignment": min(alignment, byte_strides[-1]),
+                    "shape": [],
+                    "byte_strides": [],
+                    "children": [],
+                }
+            ],
+        }
+    return {
+        "kind": kind,
+        "profile": profile,
+        "canonical_layout_hash": "test-layout-hash",
+        "root": root,
     }
 
 
 def _physical_layouts(size: int, alignment: int, byte_strides: list[int]) -> dict[str, object]:
     return {
-        profile: _physical_value_layout(profile, size, alignment, byte_strides)
+        profile: _interface_plan(profile, size, alignment, byte_strides)
         for profile in (
             "host_value",
             "cuda_kernel_parameter",
@@ -444,6 +481,7 @@ class PipelineCompileTests(unittest.TestCase):
                     "arguments": [
                         {
                             "index": 0,
+                            "kind": "tensor_value",
                             "type": "tensor<4x4xf32>",
                             "element_layout": _scalar_layout("f32"),
                             "vernon.source_name": "material",
@@ -460,14 +498,8 @@ class PipelineCompileTests(unittest.TestCase):
         uses = external_parameters(records)["material"]
         self.assertEqual(uses[0]["uniform_name"], "material._m0")
         self.assertEqual(
-            uses[0]["physical_value_layout"],
-            {
-                "profile": "vulkan_std140_uniform_buffer",
-                "transport": "uniform_buffer",
-                "size": 64,
-                "alignment": 16,
-                "byte_strides": [16, 4],
-            },
+            uses[0]["interface_plan"],
+            _interface_plan("vulkan_std140_uniform_buffer", 64, 16, [16, 4]),
         )
 
     def test_reflected_static_tensor_layout_is_normalized_for_runtime(self) -> None:
@@ -497,14 +529,8 @@ class PipelineCompileTests(unittest.TestCase):
         }
         use = external_parameters(records)["weights"][0]
         self.assertEqual(
-            use["physical_value_layout"],
-            {
-                "profile": "vulkan_std140_uniform_buffer",
-                "transport": "uniform_buffer",
-                "size": 120,
-                "alignment": 4,
-                "byte_strides": [60, 20, 4],
-            },
+            use["interface_plan"],
+            _interface_plan("vulkan_std140_uniform_buffer", 120, 4, [60, 20, 4]),
         )
 
     def test_reflected_aggregate_tensor_uses_explicit_storage_buffer_layout(self) -> None:
@@ -543,14 +569,8 @@ class PipelineCompileTests(unittest.TestCase):
         }
         use = external_parameters(records)["aggregate"][0]
         self.assertEqual(
-            use["physical_value_layout"],
-            {
-                "profile": "vulkan_std430_storage_buffer",
-                "transport": "storage_buffer",
-                "size": 1056,
-                "alignment": 4,
-                "byte_strides": [528, 176, 44],
-            },
+            use["interface_plan"],
+            _interface_plan("vulkan_std430_storage_buffer", 1056, 4, [528, 176, 44]),
         )
 
     def test_compute_tensor_resource_is_normalized_to_storage(self) -> None:
@@ -590,7 +610,7 @@ class PipelineCompileTests(unittest.TestCase):
             use["tensor_view_descriptor"],
             {"rank": 2, "offset_binding": 1, "extent_bindings": [2, 3], "stride_bindings": [4, 5]},
         )
-        self.assertNotIn("physical_value_layout", use)
+        self.assertNotIn("interface_plan", use)
 
         del records["compute"]["interface"]["arguments"][0]["vernon.binding"]
         with self.assertRaisesRegex(PipelineCompileError, "missing reflected set/binding"):
@@ -673,6 +693,7 @@ class PipelineCompileTests(unittest.TestCase):
                     },
                     {
                         "index": 1,
+                        "kind": "scalar",
                         "type": "f32",
                         "vernon.source_name": "alpha",
                         "vernon.interface": "uniform",

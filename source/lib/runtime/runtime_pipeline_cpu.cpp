@@ -11,7 +11,7 @@ namespace {
 
 VernonStatus fail(VernonRuntimeContext &context, std::string error,
                   VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) {
-    context.error = std::move(error);
+    invocationDiagnostic(context) = std::move(error);
     return status;
 }
 
@@ -22,7 +22,7 @@ bool resolveCpuPipeline(VernonPipelineBundle &bundle, const Variant &variant, Ve
     CpuKernelState kernel;
     ReflectedEntry reflection;
     if (!loadCpuNativeArtifact(*bundle.stages.at(variant.compute).cpuArtifact, kernel, reflection,
-                               bundle.context->error) ||
+                               invocationDiagnostic(*bundle.context)) ||
         !prepareCpuComputePipeline(*bundle.context, std::move(kernel), std::move(reflection), *state))
         return false;
     installRuntimeBackendState(pipeline, state.release());

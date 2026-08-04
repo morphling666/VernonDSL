@@ -104,13 +104,13 @@ bool validateTargetCapabilities(PreparedModule &prepared, VernonTarget target, s
         for (unsigned index = 0; index < function.getNumArguments(); ++index) {
             if (function.getArgAttrDict(index).get("vernon.builtin"))
                 continue;
-            mlir::FailureOr<mlir::vernon::PhysicalValueAbiPlan> plan = mlir::vernon::getPhysicalValueAbiPlan(
+            mlir::FailureOr<mlir::vernon::BackendInterfaceAbiPlan> plan = mlir::vernon::getBackendInterfaceAbiPlan(
                 function.getArgumentTypes()[index], *module, mlir::vernon::PhysicalAbiProfile::CudaKernelParameter);
             if (mlir::failed(plan)) {
                 diagnostics = "CUDA target capability cannot plan compute argument #" + std::to_string(index);
                 return false;
             }
-            const auto *unsupported = std::get_if<mlir::vernon::UnsupportedPhysicalValueAbi>(&*plan);
+            const auto *unsupported = std::get_if<mlir::vernon::UnsupportedBackendInterfaceAbi>(&*plan);
             if (!unsupported)
                 continue;
             diagnostics = "CUDA target capability '" + unsupported->reason + "' rejects compute argument #" +

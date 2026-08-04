@@ -1,3 +1,4 @@
+#include "runtime/pipeline_manifest.h"
 #include "runtime/tensor_bridge.h"
 
 #include <gtest/gtest.h>
@@ -85,6 +86,14 @@ TEST(TensorBridgeTest, RejectsLogicalByteSizeOverflow) {
     EXPECT_FALSE(vernon::runtime::tensorLogicalByteSize(tensor));
 }
 
+TEST(TensorBridgeTest, RejectsBitIncompatibleTransportRepresentation) {
+    vernon::runtime::TransportNode scalar{vernon::runtime::TransportNodeKind::Scalar, "i32", 0, 4, 4};
+    vernon::runtime::TransportNode array{
+        vernon::runtime::TransportNodeKind::Array, "", 0, 4, 4, {1}, {4}, {std::move(scalar)}};
+    EXPECT_FALSE(
+        vernon::runtime::compileTensorCopyPlan(vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32), array, {1}));
+}
+
 TEST(TensorBridgeTest, PacksNegativeStrideFromLogicalFirstElement) {
     const std::array<float, 4> source{1, 2, 3, 4};
     const std::array<float, 4> expected{4, 3, 2, 1};
@@ -122,7 +131,7 @@ TEST(TensorBridgeTest, PacksNonSquareMatrixIntoReflectedColumnMajorLayout) {
                             strides.data(),
                             0,
                             sizeof(source)};
-    vernon::runtime::TensorPackingLayout layout{sizeof(float), {2, 3}, {sizeof(float), 16}, 48};
+    vernon::runtime::TensorCopyPlan layout{sizeof(float), {2, 3}, {sizeof(float), 16}, 48, {{0, 0, sizeof(float)}}};
 
     const auto packed = vernon::runtime::packTensor(tensor, layout);
     ASSERT_TRUE(packed);
@@ -151,7 +160,7 @@ TEST(TensorBridgeTest, PacksRankThreeTensorWithReflectedPadding) {
                             strides.data(),
                             0,
                             sizeof(source)};
-    vernon::runtime::TensorPackingLayout layout{sizeof(float), {2, 2, 2}, {32, 16, 4}, 56};
+    vernon::runtime::TensorCopyPlan layout{sizeof(float), {2, 2, 2}, {32, 16, 4}, 56, {{0, 0, sizeof(float)}}};
 
     const auto packed = vernon::runtime::packTensor(tensor, layout);
     ASSERT_TRUE(packed);

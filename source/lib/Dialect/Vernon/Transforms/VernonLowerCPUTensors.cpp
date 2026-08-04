@@ -38,10 +38,7 @@ FailureOr<HostAggregateType> getHostAggregateType(Type source, const TypeConvert
         return failure();
     }
     FailureOr<ValueAbiLayout> layout = getValueAbiLayout(source, module);
-    FailureOr<PhysicalValueAbiLayout> physical =
-        getPhysicalValueAbiLayout(source, module, PhysicalAbiProfile::HostValue);
-    if (failed(layout) || failed(physical) || layout->size != physical->size ||
-        layout->alignment != physical->alignment || layout->fieldOffsets.size() != fields.size())
+    if (failed(layout) || layout->fieldOffsets.size() != fields.size())
         return failure();
 
     SmallVector<Type> elements;

@@ -525,12 +525,27 @@ nlohmann::json scalarElementLayout(const std::string &dtype) {
                  {{{"path", nlohmann::json::array()}, {"dtype", dtype}, {"byte_offset", 0}, {"scalar_count", 1}}})}};
 }
 
-nlohmann::json physicalValueLayout(uint64_t size, uint64_t alignment, std::initializer_list<uint64_t> byteStrides) {
-    return {{"profile", "opengl_native_uniform"},
-            {"transport", "native_uniform"},
-            {"size", size},
-            {"alignment", alignment},
-            {"byte_strides", byteStrides}};
+nlohmann::json nativeUniformPlan(uint64_t size, uint64_t alignment, std::initializer_list<uint64_t> byteStrides,
+                                 const char *representation = "f32") {
+    nlohmann::json scalar = {{"kind", "scalar"},
+                             {"representation", representation},
+                             {"offset", 0},
+                             {"size", std::min<uint64_t>(size, 4)},
+                             {"alignment", std::min<uint64_t>(alignment, 4)}};
+    nlohmann::json root = scalar;
+    if (byteStrides.size()) {
+        root = {{"kind", "array"},
+                {"offset", 0},
+                {"size", size},
+                {"alignment", alignment},
+                {"shape", std::vector<uint64_t>(byteStrides.size(), 1)},
+                {"byte_strides", byteStrides},
+                {"children", nlohmann::json::array({std::move(scalar)})}};
+    }
+    return {{"kind", "native_uniform"},
+            {"profile", "opengl_native_uniform"},
+            {"canonical_layout_hash", "test-layout"},
+            {"root", std::move(root)}};
 }
 
 std::string pipelineBundle(const nlohmann::json &artifact) {
@@ -587,7 +602,8 @@ std::string matrixBundle(const char *target) {
                                            {"uniform_name", "transform"},
                                            {"dtype", "f32"},
                                            {"shape", nlohmann::json::array({4, 4})},
-                                           {"physical_value_layout", physicalValueLayout(64, 16, {4, 16})}}})}}});
+                                           {"transport", "native_uniform"},
+                                           {"interface_plan", nativeUniformPlan(64, 16, {4, 16})}}})}}});
     root.erase("content_hash");
     const std::string canonical = root.dump(-1, ' ', false);
     root["content_hash"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
@@ -613,16 +629,17 @@ std::string integerUniformBundle(const char *dtype, uint32_t components) {
           {"element_layout", scalarElementLayout(dtype)},
           {"access", "read"},
           {"shape", shape},
-          {"uses",
-           nlohmann::json::array({{{"stage", "vertex"},
-                                   {"interface", "uniform"},
-                                   {"uniform_name", "budget"},
-                                   {"dtype", dtype},
-                                   {"shape", shape},
-                                   {"physical_value_layout",
-                                    physicalValueLayout(components * sizeof(uint32_t), sizeof(uint32_t),
-                                                        components == 1 ? std::initializer_list<uint64_t>{}
-                                                                        : std::initializer_list<uint64_t>{4})}}})}}});
+          {"uses", nlohmann::json::array(
+                       {{{"stage", "vertex"},
+                         {"interface", "uniform"},
+                         {"uniform_name", "budget"},
+                         {"dtype", dtype},
+                         {"shape", shape},
+                         {"transport", "native_uniform"},
+                         {"interface_plan", nativeUniformPlan(components * sizeof(uint32_t), sizeof(uint32_t),
+                                                              components == 1 ? std::initializer_list<uint64_t>{}
+                                                                              : std::initializer_list<uint64_t>{4},
+                                                              dtype)}}})}}});
     root.erase("content_hash");
     const std::string canonical = root.dump(-1, ' ', false);
     root["content_hash"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
@@ -699,7 +716,8 @@ std::string internalValueBundle() {
                                            {"dtype", "f32"},
                                            {"shape", nlohmann::json::array({2})},
                                            {"uniform_name", "__resolution"},
-                                           {"physical_value_layout", physicalValueLayout(8, 8, {4})}}})}}});
+                                           {"transport", "native_uniform"},
+                                           {"interface_plan", nativeUniformPlan(8, 8, {4})}}})}}});
     root.erase("content_hash");
     const std::string canonical = root.dump(-1, ' ', false);
     root["content_hash"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
@@ -900,13 +918,14 @@ TEST(RuntimeExternalGl, InvokesDirectComputePipelineThroughRuntimeCoreProvider) 
            "alignment":4,"layout_hash":"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",
            "leaves":[{"path":[],"dtype":"f32","byte_offset":0,"scalar_count":1}]},
            "physical_layouts":{"vulkan_std430_storage_buffer":{"profile":"vulkan_std430_storage_buffer",
-           "kind":"descriptor_storage_leaves"}},
+           "kind":"resource_binding","resource_kind":"descriptor_storage_leaves"}},
            "binding":0},
-          {"kind":"scalar","dtype":"f32","element_layout":{"logical_type":"f32","byte_size":4,
+          {"kind":"scalar","dtype":"f32","value_layout":{"logical_type":"f32","byte_size":4,
            "alignment":4,"layout_hash":"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",
            "leaves":[{"path":[],"dtype":"f32","byte_offset":0,"scalar_count":1}]},
            "physical_layouts":{"vulkan_std430_storage_buffer":{"profile":"vulkan_std430_storage_buffer",
-           "size":4,"alignment":4,"byte_strides":[]}},
+           "kind":"byte_transport","canonical_layout_hash":"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",
+           "root":{"kind":"scalar","representation":"f32","offset":0,"size":4,"alignment":4}}},
            "binding":1}
         ]
       }]

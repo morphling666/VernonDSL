@@ -92,8 +92,13 @@ def reflected_parameters(
             interface_name = row.get("vernon.interface")
             if internal_source is not None and (not isinstance(name, str) or not name):
                 name = f"__vernon_{internal_source}_{stage}_{row.get('index', 0)}"
-            if not isinstance(name, str) or not name or not isinstance(interface_name, str):
-                raise PipelineCompileError(f"{stage} external argument is missing source metadata")
+            if (
+                not isinstance(name, str)
+                or not name
+                or not isinstance(interface_name, str)
+                or row.get("kind") not in {"scalar", "tensor_value", "tensor", "texture", "sampler"}
+            ):
+                raise PipelineCompileError(f"{stage} external argument is missing source or kind metadata")
             inferred_dtype, inferred_shape = dtype_and_shape(row.get("type"))
             reflected_shape = row.get("shape")
             if row.get("kind") == "tensor" and isinstance(row.get("source_shape"), list):
@@ -108,7 +113,7 @@ def reflected_parameters(
                 "stage": stage,
                 "entry": record["entry"],
                 "index": row.get("index"),
-                "kind": row.get("kind", "scalar"),
+                "kind": row["kind"],
                 "type": row.get("type"),
                 "shape": reflected_shape if reflected_shape is not None else inferred_shape,
                 "interface": interface_name,
@@ -119,21 +124,25 @@ def reflected_parameters(
             if "tensor_view_descriptor" in row:
                 use["tensor_view_descriptor"] = row["tensor_view_descriptor"]
             physical_layouts = row.get("physical_layouts")
-            cuda_layout = (
-                physical_layouts.get("cuda_kernel_parameter") if isinstance(physical_layouts, Mapping) else None
-            )
-            cuda_static_tensor_value = (
+            compute_plan = None
+            if isinstance(physical_layouts, Mapping):
+                compute_plan = next(
+                    (
+                        plan
+                        for plan in physical_layouts.values()
+                        if isinstance(plan, Mapping) and plan.get("kind") in {"cpu_call", "kernel_parameter"}
+                    ),
+                    None,
+                )
+            compute_static_tensor_value = (
                 stage == "compute"
-                and record.get("target") == "cuda"
                 and row.get("kind") == "tensor"
-                and isinstance(cuda_layout, Mapping)
-                and isinstance(cuda_layout.get("size"), int)
-                and cuda_layout["size"] > 0
-                and "unsupported" not in cuda_layout
+                and isinstance(compute_plan, Mapping)
+                and compute_plan.get("kind") in {"cpu_call", "kernel_parameter"}
             )
             packed_value = interface_name == "uniform" or (
                 stage == "compute"
-                and (row.get("kind", "scalar") not in {"tensor", "texture", "sampler"} or cuda_static_tensor_value)
+                and (row["kind"] not in {"tensor", "texture", "sampler"} or compute_static_tensor_value)
             )
             if packed_value and stage == "compute":
                 use["interface"] = "value"
@@ -142,22 +151,23 @@ def reflected_parameters(
             dtype = row.get("dtype") or row.get("vernon.dtype") or inferred_dtype
             if dtype is not None:
                 use["dtype"] = dtype
-            if row.get("kind") not in {"texture", "sampler"}:
-                element_layout = row.get("element_layout")
-                if not isinstance(element_layout, Mapping):
-                    raise PipelineCompileError(f"{stage} Tensor argument is missing canonical element_layout")
+            element_layout = row.get("element_layout")
+            if isinstance(element_layout, Mapping):
                 use["element_layout"] = dict(element_layout)
+            elif row.get("kind") not in {"texture", "sampler"}:
+                value_layout = row.get("value_layout")
+                if not isinstance(value_layout, Mapping):
+                    raise PipelineCompileError(f"{stage} value argument is missing canonical value_layout")
+                use["value_layout"] = dict(value_layout)
+            if isinstance(row.get("value_layout"), Mapping):
+                use["value_layout"] = dict(row["value_layout"])
             if packed_value:
                 profile, transport = _physical_value_profile(record.get("target"), row.get("value_transport"))
                 selected_layout = physical_layouts.get(profile) if isinstance(physical_layouts, Mapping) else None
                 if not isinstance(selected_layout, Mapping):
                     raise PipelineCompileError(f"{stage} packed value argument is missing profile {profile!r}")
-                use["physical_value_layout"] = {
-                    key: selected_layout[key]
-                    for key in ("profile", "size", "alignment", "byte_strides", "element_leaf_offsets")
-                    if key in selected_layout
-                }
-                use["physical_value_layout"]["transport"] = transport
+                use["interface_plan"] = dict(selected_layout)
+                use["transport"] = transport
             if internal_source is not None:
                 use["internal_source"] = internal_source
                 if internal_source == "system_value":
@@ -176,10 +186,7 @@ def reflected_parameters(
             descriptor_required = (
                 use["interface"] == "storage"
                 or (interface_name == "resource" and row.get("kind") in {"tensor", "texture"})
-                or (
-                    interface_name == "uniform"
-                    and use.get("physical_value_layout", {}).get("transport") in {"uniform_buffer", "storage_buffer"}
-                )
+                or (interface_name == "uniform" and use.get("transport") in {"uniform_buffer", "storage_buffer"})
             )
             if descriptor_required and ("vernon.set" not in use or "vernon.binding" not in use):
                 raise PipelineCompileError(f"{stage} descriptor-backed argument is missing reflected set/binding")
@@ -225,7 +232,10 @@ def merge_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[s
         incompatible_layout = kind != "tensor" and (
             use.get("type") != first.get("type") or use.get("shape", []) != first.get("shape", [])
         )
-        incompatible_tensor_layout = kind == "tensor" and use.get("element_layout") != first.get("element_layout")
+        incompatible_tensor_layout = kind == "tensor" and (
+            use.get("element_layout") != first.get("element_layout")
+            or use.get("value_layout") != first.get("value_layout")
+        )
         if (
             classify_parameter_use(use) != kind
             or (kind != "tensor" and use.get("dtype") != first.get("dtype"))
@@ -237,6 +247,7 @@ def merge_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[s
         next((use for use in normalized if use.get("stage") != "compute"), first) if kind == "tensor" else first
     )
     element_layout = representative.get("element_layout")
+    value_layout = representative.get("value_layout")
     for use in normalized:
         use.pop("element_layout", None)
     access_values = {str(use.get("access", "read")) for use in normalized}
@@ -262,7 +273,10 @@ def merge_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[s
         "uses": normalized,
     }
     if kind == "tensor":
-        parameter["element_layout"] = element_layout
+        if element_layout is not None:
+            parameter["element_layout"] = element_layout
+        elif value_layout is not None:
+            parameter["value_layout"] = value_layout
     else:
         parameter["dtype"] = representative.get("dtype")
     for use in normalized:

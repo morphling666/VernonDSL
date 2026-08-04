@@ -5,6 +5,7 @@
 #include "VernonRuntimeRHIAdapter.h"
 #include "backend_vulkan.h"
 #include "compute_launch_planner.h"
+#include "pipeline_metadata.h"
 #include "tensor_bridge.h"
 
 #include <nlohmann/json.hpp>
@@ -23,7 +24,7 @@ namespace {
 
 VernonStatus fail(VernonRuntimeContext &context, std::string error,
                   VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) {
-    context.error = std::move(error);
+    invocationDiagnostic(context) = std::move(error);
     return status;
 }
 
@@ -37,8 +38,8 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         const Stage &stage = bundle.stages.at(variant.compute);
         ReflectedEntry reflection;
         const nlohmann::json parsed = nlohmann::json::parse(stage.reflection, nullptr, false);
-        if (parsed.is_discarded() ||
-            !parseReflection(parsed, stage.entry, reflection, VERNON_RUNTIME_VULKAN, bundle.context->error)) {
+        if (parsed.is_discarded() || !parseReflection(parsed, stage.entry, reflection, VERNON_RUNTIME_VULKAN,
+                                                      invocationDiagnostic(*bundle.context))) {
             delete state;
             return false;
         }
@@ -64,7 +65,7 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 if (use.stage != "compute" && use.stage != variant.compute)
                     continue;
                 if (use.index >= reflection.arguments.size()) {
-                    bundle.context->error = "Vulkan parameter use exceeds reflected argument table";
+                    invocationDiagnostic(*bundle.context) = "Vulkan parameter use exceeds reflected argument table";
                     delete state;
                     return false;
                 }
@@ -149,8 +150,9 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         if (status != VERNON_STATUS_OK) {
             const VernonStringView providerError =
                 vernonRuntimeRhiAdapterGetLastError(vulkanState(*bundle.context).adapter);
-            bundle.context->error = providerError.data ? std::string(providerError.data, providerError.size)
-                                                       : "failed to prepare Vulkan provider compute pipeline";
+            invocationDiagnostic(*bundle.context) = providerError.data
+                                                        ? std::string(providerError.data, providerError.size)
+                                                        : "failed to prepare Vulkan provider compute pipeline";
             delete state;
             return false;
         }
@@ -200,9 +202,8 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 }
                 return true;
             }
-            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.physicalValueLayout &&
-                use.physicalValueLayout->transport == "storage_buffer" && parameter.elementLayout.byteSize &&
-                use.binding != UINT32_MAX) {
+            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.interfacePlan &&
+                use.transport == "storage_buffer" && parameter.elementLayout.byteSize && use.binding != UINT32_MAX) {
                 candidate.layout.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
                 candidate.layout.element_size = parameter.elementLayout.byteSize;
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
@@ -221,10 +222,11 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 if (!dtype)
                     return false;
                 const size_t elementSize = dataTypeSize(*dtype);
-                candidate.layout.kind = use.physicalValueLayout->transport == "uniform_buffer"
-                                            ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
-                                            : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-                const uint64_t physicalSize = use.physicalValueLayout->size;
+                if (!use.interfacePlan || !use.interfacePlan->root)
+                    return false;
+                candidate.layout.kind = use.transport == "uniform_buffer" ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
+                                                                          : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                const uint64_t physicalSize = use.interfacePlan->root->size;
                 if (!physicalSize || physicalSize > UINT32_MAX ||
                     (candidate.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER && use.binding == UINT32_MAX))
                     return false;
@@ -232,7 +234,7 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
                 candidate.layout.element_count = static_cast<uint32_t>(count);
                 candidate.layout.vector_count = shape.size() == 2 ? static_cast<uint32_t>(shape[0]) : 1;
-                const uint64_t physicalAlignment = use.physicalValueLayout->alignment;
+                const uint64_t physicalAlignment = use.interfacePlan->root->alignment;
                 if (!physicalAlignment || physicalAlignment > UINT32_MAX)
                     return false;
                 candidate.layout.element_alignment = static_cast<uint32_t>(physicalAlignment);
@@ -240,17 +242,12 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 candidate.layout.set = use.descriptorSet;
                 candidate.binding.source = internal ? VulkanPipelineState::Binding::RESOLUTION
                                                     : VulkanPipelineState::Binding::EXTERNAL_UNIFORM;
-                candidate.binding.packing.elementSize = elementSize;
-                candidate.binding.packing.shape = shape;
-                candidate.binding.packing.byteSize = static_cast<size_t>(physicalSize);
-                candidate.binding.packing.byteStrides.reserve(use.physicalValueLayout->byteStrides.size());
-                for (uint64_t stride : use.physicalValueLayout->byteStrides) {
-                    if (stride > SIZE_MAX)
-                        return false;
-                    candidate.binding.packing.byteStrides.push_back(static_cast<size_t>(stride));
-                }
-                if (candidate.binding.packing.byteStrides.size() != shape.size())
+                const ValueLayout &canonical = parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
+                std::optional<TensorCopyPlan> packing =
+                    compileTensorCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root, shape);
+                if (!packing || packing->elementSize != elementSize)
                     return false;
+                candidate.binding.packing = std::move(*packing);
                 candidate.binding.storage.resize(candidate.layout.element_size);
             } else if (parameter.kind == "tensor" && use.interfaceKind == "input" && use.stage == "vertex" &&
                        use.location != UINT32_MAX && !use.attributeLeaves.empty()) {
@@ -296,7 +293,8 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     break;
                 }
         if (!supported) {
-            bundle.context->error = "Vulkan RuntimeCore graphics path does not support this parameter layout";
+            invocationDiagnostic(*bundle.context) =
+                "Vulkan RuntimeCore graphics path does not support this parameter layout";
             delete state;
             return false;
         }
@@ -343,8 +341,9 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         if (status != VERNON_STATUS_OK) {
             const VernonStringView providerError =
                 vernonRuntimeRhiAdapterGetLastError(vulkanState(*bundle.context).adapter);
-            bundle.context->error = providerError.data ? std::string(providerError.data, providerError.size)
-                                                       : "failed to prepare Vulkan provider graphics pipeline";
+            invocationDiagnostic(*bundle.context) = providerError.data
+                                                        ? std::string(providerError.data, providerError.size)
+                                                        : "failed to prepare Vulkan provider graphics pipeline";
             delete state;
             return false;
         }
@@ -495,7 +494,7 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
     PlannedGraphicsState graphicsState;
     const bool hasStencil = plan.depthAttachment && plan.depthAttachment->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT;
     if (!planGraphicsState(invocation, formats.size(), plan.depthAttachment != nullptr, hasStencil, graphicsState,
-                           pipeline.context->error))
+                           invocationDiagnostic(*pipeline.context)))
         return VERNON_STATUS_INVALID_ARGUMENT;
     GraphicsVariantKey variantKey{static_cast<uint32_t>(invocation.topology),
                                   formats,

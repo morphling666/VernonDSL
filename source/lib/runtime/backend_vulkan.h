@@ -51,7 +51,7 @@ struct VulkanPipelineState {
         };
         Source source{};
         uint32_t externalSlot{};
-        TensorPackingLayout packing;
+        TensorCopyPlan packing;
         std::vector<uint8_t> storage;
     };
 

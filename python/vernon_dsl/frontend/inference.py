@@ -1271,15 +1271,12 @@ class _Inference:
                     raise self.error(extent, "workgroup_storage dimensions must be positive compile-time integers")
                 shape.append(extent.value)
 
-            def struct_fields(struct: str) -> tuple[tuple[str, ConcreteType], ...]:
-                return self.structs[struct]
-
             shape_tuple = tuple(shape)
-            footprint = workgroup_physical_bytes(element, shape_tuple, struct_fields)
+            footprint = workgroup_physical_bytes(element, shape_tuple, self.structs.__getitem__)
             if footprint > 16 * 1024:
-                raise self.error(node, "workgroup_storage exceeds the portable 16 KiB allocation limit")
+                raise self.error(node, "combined workgroup storage exceeds the portable 16 KiB workgroup storage limit")
             if self.workgroup_storage_bytes > 16 * 1024 - footprint:
-                raise self.error(node, "combined workgroup_storage exceeds the portable 16 KiB allocation limit")
+                raise self.error(node, "combined workgroup storage exceeds the portable 16 KiB workgroup storage limit")
             self.workgroup_storage_bytes += footprint
             return ConcreteType("tensor_view", "TensorView", (element, shape_tuple, "read_write", "workgroup"))
         if name in ATOMIC_OPERATION_NAMES:

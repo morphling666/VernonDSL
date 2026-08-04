@@ -190,9 +190,10 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                 }
                 if (!attrs.builtin) {
                     if (auto tensor = dyn_cast<RankedTensorType>(type)) {
-                        FailureOr<PhysicalValueAbiLayout> layout =
-                            getPhysicalValueAbiLayout(tensor, module, PhysicalAbiProfile::VulkanStd430StorageBuffer);
-                        if (failed(layout) || layout->byteStrides.size() != static_cast<size_t>(tensor.getRank())) {
+                        FailureOr<ByteTransportPlan> layout =
+                            getByteTransportPlan(tensor, module, PhysicalAbiProfile::VulkanStd430StorageBuffer);
+                        if (failed(layout) ||
+                            layout->root->byteStrides.size() != static_cast<size_t>(tensor.getRank())) {
                             source.emitError() << "compute Tensor-by-value argument #" << index
                                                << " must have a positive static shape and scalar element type";
                             return signalPassFailure();
@@ -281,9 +282,9 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
             }
             for (const InlineTensorArgument &inlineTensor : inlineTensorArguments) {
                 RankedTensorType tensor = inlineTensor.type;
-                FailureOr<PhysicalValueAbiLayout> layout =
-                    getPhysicalValueAbiLayout(tensor, module, PhysicalAbiProfile::VulkanStd430StorageBuffer);
-                if (failed(layout) || layout->byteStrides.size() != static_cast<size_t>(tensor.getRank()))
+                FailureOr<ByteTransportPlan> layout =
+                    getByteTransportPlan(tensor, module, PhysicalAbiProfile::VulkanStd430StorageBuffer);
+                if (failed(layout) || layout->root->byteStrides.size() != static_cast<size_t>(tensor.getRank()))
                     return signalPassFailure();
                 const uint64_t elementSize = std::max<uint64_t>(tensor.getElementType().getIntOrFloatBitWidth() / 8, 1);
                 SmallVector<Value> elements;
@@ -294,7 +295,7 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                     for (int64_t dimension = tensor.getRank(); dimension-- > 0;) {
                         const uint64_t index = remaining % tensor.getDimSize(dimension);
                         remaining /= tensor.getDimSize(dimension);
-                        byteOffset += index * layout->byteStrides[dimension];
+                        byteOffset += index * layout->root->byteStrides[dimension];
                     }
                     Value elementIndex =
                         arith::ConstantIndexOp::create(bodyBuilder, source.getLoc(), byteOffset / elementSize);

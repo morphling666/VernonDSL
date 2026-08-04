@@ -677,7 +677,7 @@ class LanguageVersionTests(unittest.TestCase):
         self.assertNotIn("strides = array", output)
 
     def test_aggregate_workgroup_limit_includes_physical_leaf_alignment(self) -> None:
-        with self.assertRaisesRegex(CompileError, "16 KiB allocation limit"):
+        with self.assertRaisesRegex(CompileError, "portable 16 KiB workgroup storage limit"):
             compile_source(
                 "from vernon_dsl import *\n"
                 "@struct\n"
@@ -692,7 +692,7 @@ class LanguageVersionTests(unittest.TestCase):
             )
 
     def test_workgroup_limit_accumulates_all_kernel_allocations(self) -> None:
-        with self.assertRaisesRegex(CompileError, "combined workgroup_storage exceeds"):
+        with self.assertRaisesRegex(CompileError, "portable 16 KiB workgroup storage limit"):
             compile_source(
                 "from vernon_dsl import *\n"
                 "@kernel\n"

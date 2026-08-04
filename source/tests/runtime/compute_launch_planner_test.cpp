@@ -19,6 +19,25 @@ void setScalarLayout(Parameter &parameter, const char *dtype, VernonDataType dat
     parameter.elementLayout.abiLeaves.assign(view.leaves, view.leaves + view.leaf_count);
 }
 
+ParameterUse packedF32Use(uint32_t index, const std::string &layoutHash) {
+    ParameterUse use;
+    use.stage = "compute";
+    use.interfaceKind = "value";
+    use.dtype = "f32";
+    use.shape = {2};
+    use.index = index;
+    use.transport = "storage_buffer";
+    TransportNode scalar{TransportNodeKind::Scalar, "f32", 0, 4, 4};
+    TransportNode array{TransportNodeKind::Array, "", 0, 8, 4, {2}, {4}, {std::move(scalar)}};
+    InterfacePlan plan;
+    plan.kind = InterfacePlanKind::ByteTransport;
+    plan.profile = "vulkan_std430_storage_buffer";
+    plan.canonicalLayoutHash = layoutHash;
+    plan.root = std::move(array);
+    use.interfacePlan = std::move(plan);
+    return use;
+}
+
 TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
     Variant variant;
     Parameter contiguous;
@@ -26,17 +45,13 @@ TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
     contiguous.kind = "tensor";
     setScalarLayout(contiguous, "f32", VERNON_DATA_F32);
     contiguous.source = "direct";
-    contiguous.uses.push_back({"compute", "buffer", "", "f32", {2}, 1, UINT32_MAX, 0, 0, 0, {}});
-    contiguous.uses.back().physicalValueLayout =
-        PhysicalValueLayout{"vulkan_std430_storage_buffer", "storage_buffer", 8, 4, {4}};
+    contiguous.uses.push_back(packedF32Use(2, contiguous.elementLayout.layoutHash));
     Parameter strided;
     strided.slot = 1;
     strided.kind = "tensor";
     setScalarLayout(strided, "f32", VERNON_DATA_F32);
     strided.source = "direct";
-    strided.uses.push_back({"compute", "buffer", "", "f32", {2}, 0, UINT32_MAX, 0, 0, 1, {}});
-    strided.uses.back().physicalValueLayout =
-        PhysicalValueLayout{"vulkan_std430_storage_buffer", "storage_buffer", 8, 4, {4}};
+    strided.uses.push_back(packedF32Use(0, strided.elementLayout.layoutHash));
     variant.parameters = {contiguous, strided};
 
     const std::array<float, 2> contiguousValues{3, 4};
@@ -77,11 +92,12 @@ TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
     PlannedComputeLaunch plan;
     std::string error;
     ASSERT_TRUE(planComputeInvocation(variant, invocation, plan, error)) << error;
-    ASSERT_EQ(plan.arguments.size(), 2u);
+    ASSERT_EQ(plan.arguments.size(), 3u);
     ASSERT_EQ(plan.hostTensorStorage.size(), 2u);
     const std::array<float, 2> expectedPacked{1, 2};
     EXPECT_EQ(std::memcmp(plan.arguments[0].scalarData, expectedPacked.data(), sizeof(expectedPacked)), 0);
-    EXPECT_EQ(std::memcmp(plan.arguments[1].scalarData, contiguousValues.data(), sizeof(contiguousValues)), 0);
+    EXPECT_EQ(plan.arguments[1].scalarData, nullptr);
+    EXPECT_EQ(std::memcmp(plan.arguments[2].scalarData, contiguousValues.data(), sizeof(contiguousValues)), 0);
     EXPECT_EQ(plan.grid.x, 4u);
     EXPECT_EQ(plan.grid.y, 1u);
     EXPECT_EQ(plan.grid.z, 1u);

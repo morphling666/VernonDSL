@@ -119,27 +119,13 @@ module attributes {
 } {
   func.func @tuple_passthrough(
       %value: tuple<f32, i32> {
-        vernon.abi_alignment = 4 : i64,
-        vernon.abi_field_offsets = array<i64: 0, 4>,
-        vernon.abi_layout_hash = "b5eb9ece18126ac79faf85eeb27a05a40f9d8001124b3ee648704050af420694",
-        vernon.abi_leaf_counts = array<i64: 1, 1>,
         vernon.abi_leaf_dtypes = ["f32", "i32"],
-        vernon.abi_leaf_offsets = array<i64: 0, 4>,
-        vernon.abi_leaf_paths = ["[0]", "[1]"],
-        vernon.abi_size = 8 : i64,
         vernon.interface = "input",
         vernon.location = 0 : i64
       }
     ) -> (
       tuple<f32, i32> {
-        vernon.abi_alignment = 4 : i64,
-        vernon.abi_field_offsets = array<i64: 0, 4>,
-        vernon.abi_layout_hash = "b5eb9ece18126ac79faf85eeb27a05a40f9d8001124b3ee648704050af420694",
-        vernon.abi_leaf_counts = array<i64: 1, 1>,
         vernon.abi_leaf_dtypes = ["f32", "i32"],
-        vernon.abi_leaf_offsets = array<i64: 0, 4>,
-        vernon.abi_leaf_paths = ["[0]", "[1]"],
-        vernon.abi_size = 8 : i64,
         vernon.interface = "output",
         vernon.location = 0 : i64
       }
@@ -377,8 +363,24 @@ class CompiledProgramTests(unittest.TestCase):
         entry = json.loads(program.reflection)["entries"][0]
         self.assertEqual(entry["physical_layouts"]["host_value"]["packed_arguments_size"], 8)
         self.assertEqual(entry["physical_layouts"]["host_value"]["packed_results_size"], 8)
-        self.assertEqual(entry["arguments"][0]["vernon.abi_field_offsets"], [0, 4])
-        self.assertEqual(entry["results"][0]["vernon.abi_field_offsets"], [0, 4])
+        self.assertEqual(
+            [leaf["byte_offset"] for leaf in entry["arguments"][0]["value_layout"]["leaves"]],
+            [0, 4],
+        )
+        self.assertEqual(
+            [leaf["byte_offset"] for leaf in entry["results"][0]["value_layout"]["leaves"]],
+            [0, 4],
+        )
+
+    def test_retired_duplicate_value_abi_metadata_is_rejected(self) -> None:
+        source = CPU_TUPLE_ENTRY_MODULE.replace(
+            'vernon.abi_leaf_dtypes = ["f32", "i32"],',
+            'vernon.abi_size = 8 : i64, vernon.abi_leaf_dtypes = ["f32", "i32"],',
+            1,
+        )
+        program = native.Compiler().compile_program_result(source, native.Target.CPU)
+        self.assertFalse(program.ok)
+        self.assertIn("retired duplicated Value ABI metadata", program.diagnostics)
 
     def test_tuple_and_struct_aggregates_lower_on_every_backend(self) -> None:
         from vernon_dsl import compile_source

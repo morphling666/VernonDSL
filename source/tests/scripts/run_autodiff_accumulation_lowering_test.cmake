@@ -22,7 +22,10 @@ foreach(
     ITEMS "vernon.physical_load"
           "vernon.physical_store"
           "vernon.physical_atomic"
-          "arith.addf")
+          "arith.addf"
+          "vernon.serial_dispatch"
+          "vernon.workgroup_size = array<i32: 1, 1, 1>"
+          "scf.for")
     string(FIND "${output}" "${required}" position)
     if(position EQUAL -1)
         message(FATAL_ERROR "accumulation lowering did not produce '${required}':\n${output}")

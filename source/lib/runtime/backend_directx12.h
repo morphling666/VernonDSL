@@ -42,7 +42,7 @@ struct DirectX12PipelineState {
         };
         Source source{};
         uint32_t externalSlot{};
-        TensorPackingLayout packing;
+        TensorCopyPlan packing;
         std::vector<uint8_t> storage;
     };
 

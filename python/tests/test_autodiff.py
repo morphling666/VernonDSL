@@ -17,10 +17,7 @@ from vernon_dsl.frontend.autodiff import (
     StaticIndicesOp,
 )
 from vernon_dsl.frontend.autodiff_cpu import execute_program_graph as _execute_program_graph
-from vernon_dsl.frontend.autodiff_native import (
-    AutodiffNativeLoweringError,
-    emit_native_autodiff_modules,
-)
+from vernon_dsl.frontend.autodiff_native import emit_native_autodiff_modules
 from vernon_dsl.pipeline_assets import (
     PipelineCompileError,
     cook_pipeline_asset,
@@ -648,8 +645,14 @@ def objective(x: vd.f64, y: vd.f64) -> vd.f64:
                 target="cuda",
             )
             cuda_backward = cuda_modules["backward"]
+            vulkan_backward = emit_native_autodiff_modules(
+                result.program_graph,
+                result.autodiff_profiles,
+                target="vulkan",
+            )["backward"]
             self.assertIn("vernon.workgroup_size = array<i32: 1, 1, 1>", cuda_backward)
-            self.assertGreaterEqual(cuda_backward.count("scf.for"), 3)
+            self.assertNotIn("scf.for", cuda_backward)
+            self.assertEqual(cuda_backward, vulkan_backward)
             bindings = {"x": np.float64(1.3), "y": np.float64(0.7)}
             output, pullback = execute_program_graph(result.program_graph, bindings)
             gradients = pullback()
@@ -696,6 +699,167 @@ def square(values: vd.Tensor[vd.f16, (2,)]) -> vd.Tensor[vd.f16, (2,)]:
             gradient = pullback(np.array([3, 4], dtype=np.float32))["values"]
             np.testing.assert_array_equal(gradient, np.array([12, 24], dtype=np.float32))
             self.assertEqual(gradient.dtype, np.float32)
+
+    def test_native_lowering_covers_all_frontend_derivative_rules(self) -> None:
+        cases = {
+            "acos": (
+                "def objective(x: vd.f32) -> vd.f32:\n    return vd.acos(x)",
+                ("x",),
+            ),
+            "atan2": (
+                "def objective(y: vd.f32, x: vd.f32) -> vd.f32:\n    return vd.atan2(y, x)",
+                ("y", "x"),
+            ),
+            "abs": (
+                "def objective(x: vd.f32) -> vd.f32:\n    return vd.abs(x)",
+                ("x",),
+            ),
+            "power": (
+                "def objective(x: vd.f32, y: vd.f32) -> vd.f32:\n    return x ** y",
+                ("x", "y"),
+            ),
+            "dot": (
+                "def objective(x: vd.Tensor[vd.f32, (3,)], y: vd.Tensor[vd.f32, (3,)]) -> vd.f32:\n"
+                "    return vd.dot(x, y)",
+                ("x", "y"),
+            ),
+            "cross": (
+                "def objective(x: vd.Tensor[vd.f32, (3,)], y: vd.Tensor[vd.f32, (3,)]) "
+                "-> vd.Tensor[vd.f32, (3,)]:\n    return vd.cross(x, y)",
+                ("x", "y"),
+            ),
+            "matmul": (
+                "def objective(x: vd.Tensor[vd.f32, (2, 3)], y: vd.Tensor[vd.f32, (3, 2)]) "
+                "-> vd.Tensor[vd.f32, (2, 2)]:\n    return vd.matmul(x, y)",
+                ("x", "y"),
+            ),
+            "norm": (
+                "def objective(x: vd.Tensor[vd.f32, (3,)]) -> vd.f32:\n    return vd.norm(x)",
+                ("x",),
+            ),
+            "normalize": (
+                "def objective(x: vd.Tensor[vd.f32, (3,)]) -> vd.Tensor[vd.f32, (3,)]:\n    return vd.normalize(x)",
+                ("x",),
+            ),
+            "reflect": (
+                "def objective(x: vd.Tensor[vd.f32, (3,)], y: vd.Tensor[vd.f32, (3,)]) "
+                "-> vd.Tensor[vd.f32, (3,)]:\n    return vd.reflect(x, y)",
+                ("x", "y"),
+            ),
+        }
+        try:
+            from vernon_dsl import _native as native
+        except (ImportError, OSError):
+            self.skipTest("native Vernon compiler is unavailable")
+        compiler = native.Compiler()
+        with tempfile.TemporaryDirectory() as directory:
+            for name, (function, wrt) in cases.items():
+                with self.subTest(operation=name):
+                    source = Path(directory) / f"{name}.py"
+                    source.write_text(f"import vernon_dsl as vd\n\n@vd.kernel\n{function}\n", encoding="utf-8")
+                    result = Compiler().compile_request(
+                        FrontendCompileRequest(
+                            source,
+                            "objective",
+                            program_transform=vd.ad.ProgramTransformSpec("vjp", wrt),
+                        )
+                    )
+                    assert result.program_graph is not None
+                    assert result.autodiff_profiles is not None
+                    for target_name, target in (("cpu", native.Target.CPU), ("metal", native.Target.METAL)):
+                        modules = emit_native_autodiff_modules(
+                            result.program_graph,
+                            result.autodiff_profiles,
+                            target=target_name,
+                        )
+                        if target_name == "metal":
+                            graph = result.program_graph.semantic
+                            nodes = {node.id: node for node in graph.nodes}
+                            storage_writes = sum(
+                                node.operation in {OpCode.STORE, OpCode.STORE_DYNAMIC}
+                                and nodes[node.inputs[0]].type.kind == "tensor_view"
+                                for node in graph.nodes
+                            )
+                            carrier_writes = 1 + len(result.program_graph.reverse.saved_values)
+                            self.assertEqual(
+                                modules["forward_with_tape"].count('"vernon.store"'),
+                                storage_writes + carrier_writes,
+                                f"{name}: each Storage effect must be committed exactly once",
+                            )
+                        for profile, mlir in modules.items():
+                            compiled = compiler.compile_program_result(mlir, target)
+                            self.assertTrue(compiled.ok, f"{name}/{target_name}/{profile}: {compiled.diagnostics}")
+
+    def test_native_f16_uses_f32_cotangent_and_gradient(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "half.py"
+            source.write_text(
+                """
+import vernon_dsl as vd
+
+@vd.kernel
+def power(x: vd.f16, y: vd.f16) -> vd.f16:
+    return x ** y
+""",
+                encoding="utf-8",
+            )
+            result = Compiler().compile_request(
+                FrontendCompileRequest(
+                    source,
+                    "power",
+                    program_transform=vd.ad.ProgramTransformSpec("vjp", ("x", "y")),
+                )
+            )
+            assert result.program_graph is not None
+            assert result.autodiff_profiles is not None
+            try:
+                from vernon_dsl import _native as native
+            except (ImportError, OSError):
+                self.skipTest("native Vernon compiler is unavailable")
+            compiler = native.Compiler()
+            for target_name, target in (("cpu", native.Target.CPU), ("metal", native.Target.METAL)):
+                modules = emit_native_autodiff_modules(
+                    result.program_graph,
+                    result.autodiff_profiles,
+                    target=target_name,
+                )
+                for profile, mlir in modules.items():
+                    compiled = compiler.compile_program_result(mlir, target)
+                    self.assertTrue(
+                        compiled.ok,
+                        f"{target_name}/{profile}: {compiled.diagnostics}",
+                    )
+                    if profile != "backward":
+                        continue
+                    entry = json.loads(compiled.reflection)["entries"][0]
+                    arguments = entry["arguments"]
+                    cotangent = next(
+                        argument for argument in arguments if argument.get("vernon.source_name") == "output"
+                    )
+                    self.assertEqual(
+                        [
+                            leaf["dtype"]
+                            for leaf in (
+                                cotangent["element_layout"]
+                                if "element_layout" in cotangent
+                                else cotangent["value_layout"]
+                            )["leaves"]
+                        ],
+                        ["f32"],
+                    )
+                    gradients = [
+                        *(result for result in entry["results"] if result.get("vernon.source_name") == "gradients"),
+                        *(argument for argument in arguments if argument.get("vernon.autodiff_role") == "gradient"),
+                    ]
+                    self.assertTrue(gradients)
+                    gradient_dtypes = [
+                        leaf["dtype"]
+                        for gradient in gradients
+                        for leaf in (
+                            gradient["element_layout"] if "element_layout" in gradient else gradient["value_layout"]
+                        )["leaves"]
+                    ]
+                    self.assertEqual(gradient_dtypes, ["f32", "f32"])
 
     def test_struct_wrt_path_participates_in_pullback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -760,6 +924,106 @@ def product(pair: Pair) -> vd.f32:
                         program_transform=vd.ad.ProgramTransformSpec("vjp", ("pair",)),
                     )
                 )
+
+    def test_native_cpu_accepts_flattened_struct_input_leaves(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "aggregate_input.py"
+            source.write_text(
+                """
+import vernon_dsl as vd
+
+@vd.struct
+class Pair:
+    x: vd.f32
+    y: vd.f32
+
+@vd.kernel
+def scaled_product(pair: Pair, scale: vd.f32) -> vd.f32:
+    return pair.x * pair.y * scale
+""",
+                encoding="utf-8",
+            )
+            result = Compiler().compile_request(
+                FrontendCompileRequest(
+                    source,
+                    "scaled_product",
+                    program_transform=vd.ad.ProgramTransformSpec("vjp", ("scale",)),
+                )
+            )
+            assert result.program_graph is not None
+            assert result.autodiff_profiles is not None
+            modules = emit_native_autodiff_modules(
+                result.program_graph,
+                result.autodiff_profiles,
+                target="cpu",
+            )
+            self.assertIn('"vernon.struct_get"', modules["forward_with_tape"])
+            self.assert_native_modules_compile(modules)
+
+    def test_native_cpu_accepts_flattened_tuple_input_leaves(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "tuple_input.py"
+            source.write_text(
+                """
+import vernon_dsl as vd
+
+@vd.kernel
+def scaled_product(pair: vd.Tuple[vd.f32, vd.f32], scale: vd.f32) -> vd.f32:
+    return pair[0] * pair[1] * scale
+""",
+                encoding="utf-8",
+            )
+            result = Compiler().compile_request(
+                FrontendCompileRequest(
+                    source,
+                    "scaled_product",
+                    program_transform=vd.ad.ProgramTransformSpec("vjp", ("pair.0",)),
+                )
+            )
+            assert result.program_graph is not None
+            assert result.autodiff_profiles is not None
+            modules = emit_native_autodiff_modules(
+                result.program_graph,
+                result.autodiff_profiles,
+                target="cpu",
+            )
+            self.assertIn('"vernon.tuple_get"', modules["forward_with_tape"])
+            self.assert_native_modules_compile(modules)
+
+    def test_native_cpu_emits_struct_leaf_gradient(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "struct_leaf_gradient.py"
+            source.write_text(
+                """
+import vernon_dsl as vd
+
+@vd.struct
+class Pair:
+    x: vd.f32
+    y: vd.f32
+
+@vd.kernel
+def scaled_product(pair: Pair, scale: vd.f32) -> vd.f32:
+    return pair.x * pair.y * scale
+""",
+                encoding="utf-8",
+            )
+            result = Compiler().compile_request(
+                FrontendCompileRequest(
+                    source,
+                    "scaled_product",
+                    program_transform=vd.ad.ProgramTransformSpec("vjp", ("pair.x",)),
+                )
+            )
+            assert result.program_graph is not None
+            assert result.autodiff_profiles is not None
+            modules = emit_native_autodiff_modules(
+                result.program_graph,
+                result.autodiff_profiles,
+                target="cpu",
+            )
+            self.assertIn('vernon.source_name = "gradients"', modules["backward"])
+            self.assert_native_modules_compile(modules)
 
     def test_struct_output_requires_matching_cotangent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -918,6 +1182,98 @@ def mutate(
             self.assertIn('"vernon.reduce_sum"', gpu_modules["backward"])
             self.assertIn('"vernon.scatter_add"', gpu_modules["backward"])
             self.assert_gpu_autodiff_modules_compile(result.program_graph, result.autodiff_profiles)
+
+    def test_native_storage_control_flow_and_multiple_resources_compile(self) -> None:
+        cases = {
+            "conditional": (
+                """
+def objective(
+    left: vd.TensorView[vd.f32, (2,), vd.read_write],
+    x: vd.f32,
+    flag: vd.i32,
+) -> vd.f32:
+    if flag > 0:
+        left[0] = x
+    else:
+        left[1] = x * x
+    return left[0] + left[1]
+""",
+                ("left", "x"),
+            ),
+            "dynamic_loop": (
+                """
+def objective(
+    left: vd.TensorView[vd.f32, (2,), vd.read_write],
+    x: vd.f32,
+    count: vd.i32,
+) -> vd.f32:
+    remaining = count
+    for _ in range(4):
+        if remaining <= 0:
+            break
+        left[0] = left[0] * x
+        remaining = remaining - 1
+    return left[0]
+""",
+                ("left", "x"),
+            ),
+            "early_return": (
+                """
+def objective(
+    left: vd.TensorView[vd.f32, (2,), vd.read_write],
+    x: vd.f32,
+    flag: vd.i32,
+) -> vd.f32:
+    if flag > 0:
+        left[0] = x
+        return left[0] * x
+    left[1] = x
+    return left[1] + x
+""",
+                ("left", "x"),
+            ),
+            "multiple_storage": (
+                """
+def objective(
+    left: vd.TensorView[vd.f32, (2,), vd.read_write],
+    right: vd.TensorView[vd.f32, (2,), vd.read_write],
+    x: vd.f32,
+) -> vd.f32:
+    left[0] = x
+    right[1] = x * x
+    return left[0] + right[1]
+""",
+                ("left", "right", "x"),
+            ),
+        }
+        try:
+            from vernon_dsl import _native as native
+        except (ImportError, OSError):
+            self.skipTest("native Vernon compiler is unavailable")
+        compiler = native.Compiler()
+        with tempfile.TemporaryDirectory() as directory:
+            for name, (function, wrt) in cases.items():
+                with self.subTest(case=name):
+                    source = Path(directory) / f"{name}.py"
+                    source.write_text(f"import vernon_dsl as vd\n\n@vd.kernel\n{function}", encoding="utf-8")
+                    result = Compiler().compile_request(
+                        FrontendCompileRequest(
+                            source,
+                            "objective",
+                            program_transform=vd.ad.ProgramTransformSpec("vjp", wrt),
+                        )
+                    )
+                    assert result.program_graph is not None
+                    assert result.autodiff_profiles is not None
+                    for target_name, target in (("cpu", native.Target.CPU), ("metal", native.Target.METAL)):
+                        modules = emit_native_autodiff_modules(
+                            result.program_graph,
+                            result.autodiff_profiles,
+                            target=target_name,
+                        )
+                        for profile, mlir in modules.items():
+                            compiled = compiler.compile_program_result(mlir, target)
+                            self.assertTrue(compiled.ok, f"{name}/{target_name}/{profile}: {compiled.diagnostics}")
 
     def test_tensor_view_store_executes_when_return_value_does_not_read_storage(
         self,
@@ -1236,65 +1592,7 @@ def first(values: vd.TensorView[vd.f32, (vd.dyn,), vd.read]) -> vd.f32:
                     )
                 )
 
-    def test_native_storage_control_flow_remains_rejected(self) -> None:
-        programs = {
-            "loop": """
-import vernon_dsl as vd
-
-@vd.kernel
-def mutate(values: vd.TensorView[vd.f32, (2,), vd.read_write], x: vd.f32) -> vd.f32:
-    for i in range(2):
-        values[0] = values[0] + x
-    return values[0]
-""",
-            "early_return": """
-import vernon_dsl as vd
-
-@vd.kernel
-def mutate(values: vd.TensorView[vd.f32, (2,), vd.read_write], x: vd.f32) -> vd.f32:
-    if x > 0.0:
-        values[0] = x
-        return x
-    return values[0]
-""",
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            for name, program in programs.items():
-                with self.subTest(name=name):
-                    source = Path(directory) / f"{name}.py"
-                    source.write_text(program, encoding="utf-8")
-                    if name == "early_return":
-                        with self.assertRaisesRegex(
-                            vd.CompileError,
-                            "branch-local returns with Storage effects are unavailable",
-                        ):
-                            Compiler().compile_request(
-                                FrontendCompileRequest(
-                                    source,
-                                    "mutate",
-                                    program_transform=vd.ad.ProgramTransformSpec("vjp", ("x",)),
-                                )
-                            )
-                        continue
-                    result = Compiler().compile_request(
-                        FrontendCompileRequest(
-                            source,
-                            "mutate",
-                            program_transform=vd.ad.ProgramTransformSpec("vjp", ("x",)),
-                        )
-                    )
-                    assert result.program_graph is not None
-                    assert result.autodiff_profiles is not None
-                    with self.assertRaisesRegex(
-                        AutodiffNativeLoweringError,
-                        "does not support storage control flow",
-                    ):
-                        emit_native_autodiff_modules(
-                            result.program_graph,
-                            result.autodiff_profiles,
-                        )
-
-    def test_tensor_view_alias_requires_alias_aware_lowering(self) -> None:
+    def test_tensor_view_alias_is_lowered_and_rejected_at_binding(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "storage_alias.py"
             source.write_text(
@@ -1323,14 +1621,8 @@ def copy_first(
             )
             assert result.program_graph is not None
             assert result.autodiff_profiles is not None
-            with self.assertRaisesRegex(
-                AutodiffNativeLoweringError,
-                "cannot prove non-aliasing",
-            ):
-                emit_native_autodiff_modules(
-                    result.program_graph,
-                    result.autodiff_profiles,
-                )
+            modules = emit_native_autodiff_modules(result.program_graph, result.autodiff_profiles)
+            self.assert_native_modules_compile(modules)
             shared = np.array([2, 3], dtype=np.float32)
             with self.assertRaisesRegex(TypeError, "cannot prove a legal reverse scatter"):
                 execute_program_graph(

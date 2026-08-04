@@ -46,10 +46,13 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
         "\"leaves\":[{\"path\":[],\"dtype\":\"f32\",\"byte_offset\":0,"
         "\"scalar_count\":1}]},"
         "\"physical_layouts\":{\"host_value\":{\"profile\":\"host_value\","
-        "\"size\":8,\"alignment\":8,\"byte_strides\":[],\"offset\":0}}},"
+        "\"kind\":\"resource_binding\",\"resource_kind\":\"tensor_view_descriptor\","
+        "\"size\":8,\"alignment\":8,\"frame_offset\":0}}},"
         "{\"kind\":\"builtin\",\"builtin\":\"global_invocation_id\","
-        "\"physical_layouts\":{\"host_value\":{\"profile\":\"host_value\",\"size\":12,\"alignment\":4,"
-        "\"byte_strides\":[],\"offset\":8}},"
+        "\"physical_layouts\":{\"host_value\":{\"profile\":\"host_value\",\"kind\":\"cpu_call\","
+        "\"frame_offset\":8,\"root\":{\"kind\":\"array\",\"offset\":0,\"size\":12,\"alignment\":4,"
+        "\"shape\":[3],\"byte_strides\":[4],\"children\":[{\"kind\":\"scalar\","
+        "\"representation\":\"i32\",\"offset\":0,\"size\":4,\"alignment\":4}]}}},"
         "\"index\":1}]}]}";
     VernonRuntimeCapabilities capabilities = vernonRuntimeGetCapabilities(VERNON_RUNTIME_CPU);
     ASSERT_TRUE(capabilities.available && capabilities.supports_compute);

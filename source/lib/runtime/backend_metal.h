@@ -47,7 +47,7 @@ struct MetalPipelineState {
         uint32_t externalSlot{};
         uint32_t descriptorSet{UINT32_MAX};
         uint32_t descriptorBinding{UINT32_MAX};
-        TensorPackingLayout packing;
+        TensorCopyPlan packing;
         std::vector<uint8_t> storage;
     };
 

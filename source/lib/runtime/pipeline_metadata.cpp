@@ -4,6 +4,8 @@
 #include "VernonVersions.h"
 #include <nlohmann/json.hpp>
 
+#include <limits>
+#include <string_view>
 #include <utility>
 
 namespace vernon::runtime {
@@ -49,6 +51,7 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
         if (!entry.is_object() || entry.value("name", "") != selected)
             continue;
         const char *profileName = physicalValueProfileName(backend, "storage_buffer");
+        const std::string_view selectedProfile = profileName;
         const auto entryLayouts = entry.find("physical_layouts");
         if (entryLayouts == entry.end() || !entryLayouts->is_object()) {
             error = "entry reflection has no physical layout table";
@@ -81,12 +84,17 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
             return false;
         }
         for (const nlohmann::json &value : entry["arguments"]) {
-            if (!value.is_object()) {
-                error = "entry contains invalid argument reflection";
+            if (!value.is_object() || !value.contains("kind") || !value["kind"].is_string()) {
+                error = "entry contains argument reflection without an explicit kind";
                 return false;
             }
             ReflectedArgument argument;
-            argument.kind = value.value("kind", "scalar");
+            argument.kind = value["kind"].get<std::string>();
+            if (argument.kind != "scalar" && argument.kind != "tensor_value" && argument.kind != "tensor" &&
+                argument.kind != "texture" && argument.kind != "sampler" && argument.kind != "builtin") {
+                error = "entry contains argument reflection with an unsupported kind";
+                return false;
+            }
             if (argument.kind == "tensor_value")
                 argument.kind = "scalar";
             argument.builtin = value.value("builtin", "");
@@ -101,9 +109,74 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                 error = "argument reflection has no physical profile for the selected target";
                 return false;
             }
-            argument.physical.offset = physical->value("offset", size_t{0});
-            argument.physical.size = physical->value("size", size_t{0});
-            argument.physical.alignment = physical->value("alignment", size_t{1});
+            const auto parseExtent = [](const nlohmann::json &object, const char *key, size_t &extent) {
+                const auto value = object.find(key);
+                if (value == object.end() || !value->is_number_integer())
+                    return false;
+                if (value->is_number_unsigned()) {
+                    const uint64_t parsed = value->get<uint64_t>();
+                    if (parsed > std::numeric_limits<size_t>::max())
+                        return false;
+                    extent = static_cast<size_t>(parsed);
+                    return true;
+                }
+                const int64_t parsed = value->get<int64_t>();
+                if (parsed < 0 || static_cast<uint64_t>(parsed) > std::numeric_limits<size_t>::max())
+                    return false;
+                extent = static_cast<size_t>(parsed);
+                return true;
+            };
+            if (physical->contains("frame_offset") &&
+                !parseExtent(*physical, "frame_offset", argument.physical.offset)) {
+                error = "argument reflection has an invalid frame offset";
+                return false;
+            }
+            const std::string planKind = physical->value("kind", "");
+            if (planKind == "resource_binding") {
+                const std::string resourceKind = physical->value("resource_kind", "");
+                const bool handle = resourceKind == "host_pointer" || resourceKind == "tensor_view_descriptor";
+                const bool descriptor = resourceKind == "strided_memref_storage_leaves" ||
+                                        resourceKind == "descriptor_storage_leaves" ||
+                                        resourceKind == "texture_descriptor" || resourceKind == "sampler_descriptor";
+                const bool profileMatches = selectedProfile == "host_value" ? handle
+                                            : selectedProfile == "cuda_kernel_parameter"
+                                                ? resourceKind == "strided_memref_storage_leaves"
+                                                : resourceKind == "descriptor_storage_leaves" ||
+                                                      resourceKind == "texture_descriptor" ||
+                                                      resourceKind == "sampler_descriptor";
+                if ((!handle && !descriptor) || !profileMatches ||
+                    (handle && (!parseExtent(*physical, "size", argument.physical.size) ||
+                                !parseExtent(*physical, "alignment", argument.physical.alignment))) ||
+                    (descriptor && (physical->contains("size") || physical->contains("alignment")))) {
+                    error = "resource binding reflection does not match its resource kind";
+                    return false;
+                }
+                if (descriptor) {
+                    argument.physical.size = 0;
+                    argument.physical.alignment = 1;
+                }
+            } else if (planKind == "cpu_call" || planKind == "kernel_parameter" || planKind == "byte_transport" ||
+                       planKind == "native_uniform") {
+                const bool planMatchesProfile =
+                    selectedProfile == "host_value" ? planKind == "cpu_call" || planKind == "byte_transport"
+                    : selectedProfile == "cuda_kernel_parameter" ? planKind == "kernel_parameter"
+                    : selectedProfile == "opengl_native_uniform" ? planKind == "native_uniform"
+                                                                 : planKind == "byte_transport";
+                if (!planMatchesProfile) {
+                    error = "typed value interface plan kind does not match its profile";
+                    return false;
+                }
+                const auto root = physical->find("root");
+                if (root == physical->end() || !root->is_object() ||
+                    !parseExtent(*root, "size", argument.physical.size) ||
+                    !parseExtent(*root, "alignment", argument.physical.alignment)) {
+                    error = "typed value interface plan has no recursive root";
+                    return false;
+                }
+            } else {
+                error = "argument reflection has an unsupported interface plan";
+                return false;
+            }
             if (!argument.physical.alignment || (argument.physical.alignment & (argument.physical.alignment - 1)) ||
                 argument.physical.offset % argument.physical.alignment) {
                 error = "argument reflection has an invalid physical alignment";

@@ -55,6 +55,7 @@ namespace {
 
 bool parseUint32(const nlohmann::json &value, uint32_t &result);
 bool hasLegacyManifestKey(const nlohmann::json &value);
+bool parseValueLayout(const nlohmann::json &value, ValueLayout &layout, std::string &error);
 
 template <size_t N> bool hasOnlyKeys(const nlohmann::json &value, const std::string_view (&allowed)[N]) {
     for (auto row = value.begin(); row != value.end(); ++row)
@@ -65,12 +66,12 @@ template <size_t N> bool hasOnlyKeys(const nlohmann::json &value, const std::str
 
 constexpr std::string_view kVariantKeys[] = {"key", "program", "parameters", "internal_parameters", "outputs"};
 constexpr std::string_view kExternalParameterKeys[] = {
-    "slot",  "name",           "kind",  "type",          "uses",      "access",
-    "shape", "element_layout", "dtype", "address_space", "dimension", "texture_format",
+    "slot",         "name",           "kind",  "type",          "uses",      "access",         "shape",
+    "value_layout", "element_layout", "dtype", "address_space", "dimension", "texture_format",
 };
 constexpr std::string_view kInternalParameterKeys[] = {
-    "name",  "kind",          "type",      "uses",           "access", "shape",        "element_layout",
-    "dtype", "address_space", "dimension", "texture_format", "source", "system_value",
+    "name",           "kind",  "type",          "uses",      "access",         "shape",  "value_layout",
+    "element_layout", "dtype", "address_space", "dimension", "texture_format", "source", "system_value",
 };
 constexpr std::string_view kParameterUseKeys[] = {
     "stage",
@@ -83,7 +84,9 @@ constexpr std::string_view kParameterUseKeys[] = {
     "vernon.instance_divisor",
     "vernon.set",
     "vernon.binding",
-    "physical_value_layout",
+    "transport",
+    "value_layout",
+    "interface_plan",
     "attribute_leaves",
     "sampled_texture_bindings",
     "tensor_view_descriptor",
@@ -92,8 +95,9 @@ constexpr std::string_view kOutputKeys[] = {"name", "kind", "dtype", "shape", "a
 constexpr std::string_view kAttributeLeafKeys[] = {"path",  "location",        "location_offset",
                                                    "dtype", "component_count", "byte_offset"};
 constexpr std::string_view kSampledTextureBindingKeys[] = {"set", "binding"};
-constexpr std::string_view kPhysicalValueLayoutKeys[] = {"profile",   "transport",    "size",
-                                                         "alignment", "byte_strides", "element_leaf_offsets"};
+constexpr std::string_view kInterfacePlanKeys[] = {"kind", "profile", "canonical_layout_hash", "root", "frame_offset"};
+constexpr std::string_view kTransportNodeKeys[] = {"kind",      "representation", "offset",       "size",
+                                                   "alignment", "shape",          "byte_strides", "children"};
 constexpr std::string_view kTensorViewDescriptorKeys[] = {"rank", "offset_binding", "extent_bindings",
                                                           "stride_bindings"};
 
@@ -122,6 +126,165 @@ bool parseInt64(const nlohmann::json &value, int64_t &result) {
     if (!value.is_number_integer())
         return false;
     result = value.get<int64_t>();
+    return true;
+}
+
+bool parseTransportNode(const nlohmann::json &value, TransportNode &node, std::string &error) {
+    if (!value.is_object() || !hasOnlyKeys(value, kTransportNodeKeys) || !value.contains("kind") ||
+        !value["kind"].is_string() || !value.contains("offset") || !parseUint64(value["offset"], node.offset) ||
+        !value.contains("size") || !parseUint64(value["size"], node.size) || !value.contains("alignment") ||
+        !parseUint64(value["alignment"], node.alignment) || node.size == 0 || node.alignment == 0 ||
+        (node.alignment & (node.alignment - 1))) {
+        error = "interface plan node has invalid kind, offset, size, or alignment";
+        return false;
+    }
+    const std::string kind = value["kind"].get<std::string>();
+    if (kind == "scalar")
+        node.kind = TransportNodeKind::Scalar;
+    else if (kind == "product")
+        node.kind = TransportNodeKind::Product;
+    else if (kind == "array")
+        node.kind = TransportNodeKind::Array;
+    else {
+        error = "interface plan node has an unsupported kind";
+        return false;
+    }
+    if (value.contains("representation")) {
+        if (!value["representation"].is_string()) {
+            error = "interface plan scalar representation must be a string";
+            return false;
+        }
+        node.representation = value["representation"].get<std::string>();
+    }
+    const auto parseUnsignedArray = [&](const char *key, std::vector<uint64_t> &target) {
+        if (!value.contains(key))
+            return true;
+        if (!value[key].is_array())
+            return false;
+        for (const nlohmann::json &item : value[key]) {
+            uint64_t parsed = 0;
+            if (!parseUint64(item, parsed))
+                return false;
+            target.push_back(parsed);
+        }
+        return true;
+    };
+    if (!parseUnsignedArray("shape", node.shape) || !parseUnsignedArray("byte_strides", node.byteStrides)) {
+        error = "interface plan node shape and strides must contain unsigned integers";
+        return false;
+    }
+    if (value.contains("children")) {
+        if (!value["children"].is_array()) {
+            error = "interface plan node children must be an array";
+            return false;
+        }
+        for (const nlohmann::json &childValue : value["children"]) {
+            TransportNode child;
+            if (!parseTransportNode(childValue, child, error))
+                return false;
+            if (child.offset > node.size || child.size > node.size - child.offset ||
+                child.offset % child.alignment != 0) {
+                error = "interface plan child exceeds its parent bounds";
+                return false;
+            }
+            node.children.push_back(std::move(child));
+        }
+    }
+    if ((node.kind == TransportNodeKind::Scalar &&
+         (!node.children.empty() || node.representation.empty() || !node.shape.empty() || !node.byteStrides.empty())) ||
+        (node.kind == TransportNodeKind::Product &&
+         (node.children.empty() || !node.representation.empty() || !node.shape.empty() || !node.byteStrides.empty())) ||
+        (node.kind == TransportNodeKind::Array &&
+         (node.children.size() != 1 || !node.representation.empty() || node.shape.empty() ||
+          node.byteStrides.size() != node.shape.size()))) {
+        error = "interface plan node topology does not match its kind";
+        return false;
+    }
+    if (node.kind == TransportNodeKind::Scalar) {
+        const uint64_t representationSize =
+            node.representation == "bool"                                                                  ? 1
+            : node.representation == "f16"                                                                 ? 2
+            : node.representation == "i32" || node.representation == "u32" || node.representation == "f32" ? 4
+            : node.representation == "f64" || node.representation == "index"                               ? 8
+                                                                                                           : 0;
+        if (!representationSize || node.size != representationSize || node.alignment > representationSize) {
+            error = "interface plan scalar representation does not match its size and alignment";
+            return false;
+        }
+    }
+    if (node.kind == TransportNodeKind::Product) {
+        uint64_t end = 0;
+        for (const TransportNode &child : node.children) {
+            if (child.offset < end) {
+                error = "interface plan product children overlap or are not ordered";
+                return false;
+            }
+            end = child.offset + child.size;
+        }
+    }
+    if (node.kind == TransportNodeKind::Array) {
+        uint64_t maximumOffset = 0;
+        for (size_t dimension = 0; dimension < node.shape.size(); ++dimension) {
+            if (!node.shape[dimension] || !node.byteStrides[dimension] ||
+                node.shape[dimension] - 1 >
+                    (std::numeric_limits<uint64_t>::max() - maximumOffset) / node.byteStrides[dimension]) {
+                error = "interface plan array extent and strides overflow";
+                return false;
+            }
+            maximumOffset += (node.shape[dimension] - 1) * node.byteStrides[dimension];
+        }
+        const TransportNode &element = node.children.front();
+        if (maximumOffset > node.size || element.offset > node.size - maximumOffset ||
+            element.size > node.size - maximumOffset - element.offset) {
+            error = "interface plan array extent exceeds its parent bounds";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool parseInterfacePlan(const nlohmann::json &value, InterfacePlan &plan, std::string &error) {
+    if (!value.is_object() || !hasOnlyKeys(value, kInterfacePlanKeys) || !value.contains("kind") ||
+        !value["kind"].is_string() || !value.contains("profile") || !value["profile"].is_string() ||
+        !value.contains("canonical_layout_hash") || !value["canonical_layout_hash"].is_string()) {
+        error = "interface_plan is missing typed plan metadata";
+        return false;
+    }
+    const std::string kind = value["kind"].get<std::string>();
+    if (kind == "cpu_call")
+        plan.kind = InterfacePlanKind::CpuCall;
+    else if (kind == "kernel_parameter")
+        plan.kind = InterfacePlanKind::KernelParameter;
+    else if (kind == "byte_transport")
+        plan.kind = InterfacePlanKind::ByteTransport;
+    else if (kind == "native_uniform")
+        plan.kind = InterfacePlanKind::NativeUniform;
+    else {
+        error = "interface_plan has an unsupported kind";
+        return false;
+    }
+    plan.profile = value["profile"].get<std::string>();
+    plan.canonicalLayoutHash = value["canonical_layout_hash"].get<std::string>();
+    if (value.contains("frame_offset") && !parseUint64(value["frame_offset"], plan.frameOffset)) {
+        error = "interface_plan frame_offset must be unsigned";
+        return false;
+    }
+    if (plan.canonicalLayoutHash.empty()) {
+        error = "interface_plan canonical layout hash is empty";
+        return false;
+    }
+    if (!value.contains("root")) {
+        error = "interface_plan must contain a recursive root";
+        return false;
+    }
+    TransportNode root;
+    if (!parseTransportNode(value["root"], root, error))
+        return false;
+    if (root.offset != 0) {
+        error = "interface_plan root offset must be zero";
+        return false;
+    }
+    plan.root = std::move(root);
     return true;
 }
 
@@ -218,65 +381,28 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
                                            static_cast<uint32_t>(componentCount), static_cast<uint32_t>(byteOffset)});
         }
     }
-    if (value.contains("physical_value_layout")) {
-        const nlohmann::json &layout = value["physical_value_layout"];
-        uint64_t size = 0;
-        uint64_t alignment = 0;
-        if (!layout.is_object() || hasLegacyManifestKey(layout) || !hasOnlyKeys(layout, kPhysicalValueLayoutKeys)) {
-            error = "physical_value_layout must contain a supported profile, transport, size, alignment, and "
-                    "byte_strides";
+    if (value.contains("transport")) {
+        if (!value["transport"].is_string()) {
+            error = "parameter use transport must be a string";
             return false;
         }
-        const std::string profile = layout["profile"].get<std::string>();
-        const bool supportedProfile = profile == "host_value" || profile == "cuda_kernel_parameter" ||
-                                      profile == "vulkan_std140_uniform_buffer" ||
-                                      profile == "vulkan_std430_storage_buffer" || profile == "vulkan_push_constant" ||
-                                      profile == "opengl_native_uniform" || profile == "directx_constant_buffer" ||
-                                      profile == "metal_constant_buffer";
-        if (!layout.contains("profile") || !layout["profile"].is_string() || !supportedProfile ||
-            !layout.contains("transport") || !layout["transport"].is_string() || !layout.contains("size") ||
-            !parseUint64(layout["size"], size) || !layout.contains("alignment") ||
-            !parseUint64(layout["alignment"], alignment) || !layout.contains("byte_strides") ||
-            !layout["byte_strides"].is_array()) {
-            error = "physical_value_layout must contain a supported profile, transport, size, alignment, and "
-                    "byte_strides";
+        use.transport = value["transport"].get<std::string>();
+    }
+    if (value.contains("value_layout")) {
+        ValueLayout parsed;
+        if (!parseValueLayout(value["value_layout"], parsed, error))
             return false;
-        }
-        PhysicalValueLayout parsed;
-        parsed.profile = profile;
-        parsed.transport = layout["transport"].get<std::string>();
-        parsed.size = size;
-        parsed.alignment = alignment;
-        for (const nlohmann::json &stride : layout["byte_strides"]) {
-            uint64_t byteStride = 0;
-            if (!parseUint64(stride, byteStride)) {
-                error = "physical_value_layout byte strides must be unsigned";
-                return false;
-            }
-            parsed.byteStrides.push_back(byteStride);
-        }
-        if (layout.contains("element_leaf_offsets")) {
-            if (!layout["element_leaf_offsets"].is_array()) {
-                error = "physical_value_layout element leaf offsets must be an array";
-                return false;
-            }
-            for (const nlohmann::json &offset : layout["element_leaf_offsets"]) {
-                uint64_t byteOffset = 0;
-                if (!parseUint64(offset, byteOffset)) {
-                    error = "physical_value_layout element leaf offsets must be unsigned";
-                    return false;
-                }
-                parsed.elementLeafOffsets.push_back(byteOffset);
-            }
-        }
-        if ((parsed.transport != "host_value" && parsed.transport != "kernel_parameter" &&
-             parsed.transport != "push_constant" && parsed.transport != "native_uniform" &&
-             parsed.transport != "uniform_buffer" && parsed.transport != "storage_buffer") ||
-            parsed.size == 0 || parsed.alignment == 0 || (parsed.alignment & (parsed.alignment - 1))) {
-            error = "physical_value_layout contains unsupported physical layout metadata";
+        use.valueLayout = std::move(parsed);
+    }
+    if (value.contains("interface_plan")) {
+        InterfacePlan parsed;
+        if (!parseInterfacePlan(value["interface_plan"], parsed, error))
             return false;
-        }
-        use.physicalValueLayout = std::move(parsed);
+        use.interfacePlan = std::move(parsed);
+    }
+    if (use.interfacePlan && use.valueLayout && use.interfacePlan->canonicalLayoutHash != use.valueLayout->layoutHash) {
+        error = "interface_plan canonical layout hash does not match value_layout";
+        return false;
     }
     if (value.contains("sampled_texture_bindings")) {
         const nlohmann::json &bindings = value["sampled_texture_bindings"];
@@ -355,8 +481,10 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
         }
         use.tensorViewDescriptor = std::move(parsed);
     }
-    if (use.physicalValueLayout && use.physicalValueLayout->byteStrides.size() != use.shape.size()) {
-        error = "physical_value_layout byte-stride rank does not match the logical Tensor shape";
+    if (use.interfacePlan && use.interfacePlan->root && !use.interfacePlan->root->byteStrides.empty() &&
+        use.interfacePlan->root->byteStrides.size() != use.shape.size()) {
+        error = "interface_plan byte-stride rank " + std::to_string(use.interfacePlan->root->byteStrides.size()) +
+                " does not match logical Tensor rank " + std::to_string(use.shape.size());
         return false;
     }
     return true;
@@ -695,6 +823,10 @@ bool parsePipelineValueLayout(const nlohmann::json &value, ValueLayout &layout, 
     return parseValueLayout(value, layout, error);
 }
 
+bool parsePipelineInterfacePlan(const nlohmann::json &value, InterfacePlan &plan, std::string &error) {
+    return parseInterfacePlan(value, plan, error);
+}
+
 bool Variant::validate(std::string &error) const {
     const auto validTextureDimension = [](const std::string &dimension) {
         return dimension == "2d" || dimension == "3d" || dimension == "cube";
@@ -740,8 +872,8 @@ bool Variant::validate(std::string &error) const {
         }
         for (const ParameterUse &use : parameter.uses)
             if (parameter.kind == "tensor" && (use.interfaceKind == "uniform" || use.interfaceKind == "value") &&
-                !use.physicalValueLayout) {
-                error = "packed Tensor value is missing its compiler-planned physical layout";
+                !use.interfacePlan) {
+                error = "packed Tensor value is missing its typed interface plan";
                 return false;
             }
     }
@@ -757,8 +889,8 @@ bool Variant::validate(std::string &error) const {
         }
         for (const ParameterUse &use : parameter.uses) {
             if (parameter.kind == "tensor" && (use.interfaceKind == "uniform" || use.interfaceKind == "value") &&
-                !use.physicalValueLayout) {
-                error = "packed Tensor value is missing its compiler-planned physical layout";
+                !use.interfacePlan) {
+                error = "packed Tensor value is missing its typed interface plan";
                 return false;
             }
             if (implicitSampler && use.sampledTextureBindings.empty()) {
@@ -783,9 +915,8 @@ bool Variant::validate(std::string &error) const {
             }
             const bool descriptorRequired =
                 (use.interfaceKind == "resource" && (parameter.kind == "tensor" || parameter.kind == "texture")) ||
-                ((use.interfaceKind == "uniform" || use.interfaceKind == "value") && use.physicalValueLayout &&
-                 (use.physicalValueLayout->transport == "uniform_buffer" ||
-                  use.physicalValueLayout->transport == "storage_buffer"));
+                ((use.interfaceKind == "uniform" || use.interfaceKind == "value") &&
+                 (use.transport == "uniform_buffer" || use.transport == "storage_buffer"));
             if (descriptorRequired && use.binding == UINT32_MAX) {
                 error = "descriptor-backed pipeline parameter is missing set/binding";
                 return false;
@@ -1102,11 +1233,21 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
             return false;
         }
         if (parameter.kind == "tensor") {
-            if (row.contains("dtype") || !row.contains("element_layout") ||
-                !parseValueLayout(row["element_layout"], parameter.elementLayout, error))
+            if (row.contains("dtype") || row.contains("element_layout") == row.contains("value_layout")) {
+                error = "Tensor parameter must contain exactly one value_layout or element_layout";
                 return false;
-        } else if (row.contains("element_layout")) {
-            error = "non-Tensor parameter contains element_layout";
+            }
+            if (row.contains("element_layout")) {
+                if (!parseValueLayout(row["element_layout"], parameter.elementLayout, error))
+                    return false;
+            } else {
+                ValueLayout layout;
+                if (!parseValueLayout(row["value_layout"], layout, error))
+                    return false;
+                parameter.valueLayout = std::move(layout);
+            }
+        } else if (row.contains("element_layout") || row.contains("value_layout")) {
+            error = "resource parameter contains a value layout";
             return false;
         }
         if (internal) {

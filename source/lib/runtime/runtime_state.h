@@ -22,7 +22,6 @@ class CompiledAutodiffGraph;
 // Internal definitions for the opaque C ABI handles.
 struct VernonRuntimeContext {
     VernonRuntimeBackend backend{VERNON_RUNTIME_CPU};
-    std::string error;
     size_t liveBundles{};
     size_t livePipelines{};
     size_t liveContextLeases{};
@@ -54,6 +53,17 @@ inline std::shared_ptr<ContextLease> acquireContextLease(VernonRuntimeContext &c
 std::string &invocationDiagnostic(VernonRuntimeContext &context);
 const std::string *currentInvocationDiagnostic(const VernonRuntimeContext &context);
 void clearInvocationDiagnostic(const VernonRuntimeContext &context);
+
+class RuntimeDiagnosticScope {
+public:
+    explicit RuntimeDiagnosticScope(const VernonRuntimeContext *context);
+    RuntimeDiagnosticScope(const RuntimeDiagnosticScope &) = delete;
+    RuntimeDiagnosticScope &operator=(const RuntimeDiagnosticScope &) = delete;
+    ~RuntimeDiagnosticScope();
+
+private:
+    const VernonRuntimeContext *context_;
+};
 
 } // namespace vernon::runtime
 

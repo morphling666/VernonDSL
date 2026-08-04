@@ -3,6 +3,7 @@
 #include "VernonRuntimeRHIAdapter.h"
 #include "backend_opengl.h"
 #include "compute_launch_planner.h"
+#include "pipeline_metadata.h"
 #include "tensor_bridge.h"
 
 #include <nlohmann/json.hpp>
@@ -19,7 +20,7 @@ namespace {
 
 VernonStatus fail(VernonRuntimeContext &context, std::string error,
                   VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) {
-    context.error = std::move(error);
+    invocationDiagnostic(context) = std::move(error);
     return status;
 }
 
@@ -42,8 +43,8 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         const Stage &stage = bundle.stages.at(variant.compute);
         ReflectedEntry reflection;
         const nlohmann::json parsed = nlohmann::json::parse(stage.reflection, nullptr, false);
-        if (parsed.is_discarded() ||
-            !parseReflection(parsed, stage.entry, reflection, bundle.context->backend, bundle.context->error)) {
+        if (parsed.is_discarded() || !parseReflection(parsed, stage.entry, reflection, bundle.context->backend,
+                                                      invocationDiagnostic(*bundle.context))) {
             delete state;
             return false;
         }
@@ -52,7 +53,7 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 if (use.stage != "compute" && use.stage != variant.compute)
                     continue;
                 if (use.index >= reflection.arguments.size() || use.binding == UINT32_MAX) {
-                    bundle.context->error = "OpenGL compute parameter reflection is incomplete";
+                    invocationDiagnostic(*bundle.context) = "OpenGL compute parameter reflection is incomplete";
                     delete state;
                     return false;
                 }
@@ -79,7 +80,7 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                                                    : OpenGLPipelineState::InlineBinding::COMPUTE_INLINE;
                     candidate.source = {ComputeBindingSourceKind::Argument, use.index, 0};
                     if (candidate.layout.element_size == 0) {
-                        bundle.context->error = "OpenGL compute parameter has zero element size";
+                        invocationDiagnostic(*bundle.context) = "OpenGL compute parameter has zero element size";
                         delete state;
                         return false;
                     }
@@ -153,8 +154,9 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         if (status != VERNON_STATUS_OK) {
             const VernonStringView providerError =
                 vernonRuntimeRhiAdapterGetLastError(openGLState(*bundle.context).adapter);
-            bundle.context->error = providerError.data ? std::string(providerError.data, providerError.size)
-                                                       : "failed to prepare OpenGL provider compute pipeline";
+            invocationDiagnostic(*bundle.context) = providerError.data
+                                                        ? std::string(providerError.data, providerError.size)
+                                                        : "failed to prepare OpenGL provider compute pipeline";
             delete state;
             return false;
         }
@@ -221,8 +223,8 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                         break;
                     continue;
                 }
-                if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.physicalValueLayout &&
-                    use.physicalValueLayout->transport == "storage_buffer" && parameter.elementLayout.byteSize &&
+                if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.interfacePlan &&
+                    use.transport == "storage_buffer" && parameter.elementLayout.byteSize &&
                     use.binding != UINT32_MAX) {
                     candidate.layout.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
                     candidate.layout.element_size = parameter.elementLayout.byteSize;
@@ -230,8 +232,8 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     candidate.layout.binding = use.binding;
                     candidate.layout.set = use.descriptorSet;
                     candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_STORAGE;
-                } else if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.physicalValueLayout &&
-                           (!use.uniformName.empty() || use.physicalValueLayout->transport == "uniform_buffer")) {
+                } else if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.interfacePlan &&
+                           use.interfacePlan->root && (!use.uniformName.empty() || use.transport == "uniform_buffer")) {
                     const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
                     const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
                     uint64_t valueCount = 1;
@@ -242,7 +244,7 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                         }
                         valueCount *= dimension;
                     }
-                    const bool buffered = use.physicalValueLayout->transport == "uniform_buffer";
+                    const bool buffered = use.transport == "uniform_buffer";
                     const bool scalarOrVector = shape.empty() || (shape.size() == 1 && shape[0] <= 4);
                     const bool floatingMatrix = use.dtype == "f32" && shape.size() == 2 && shape[0] >= 2 &&
                                                 shape[0] <= 4 && shape[1] >= 2 && shape[1] <= 4;
@@ -257,7 +259,7 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     const size_t elementSize = dataTypeSize(*dtype);
                     candidate.layout.kind =
                         buffered ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-                    const uint64_t physicalSize = use.physicalValueLayout->size;
+                    const uint64_t physicalSize = use.interfacePlan->root->size;
                     if (!physicalSize || physicalSize > UINT32_MAX || (buffered && use.binding == UINT32_MAX)) {
                         representationError = "OpenGL uniform reflection is incomplete";
                         useRhiGraphics = false;
@@ -272,23 +274,16 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     candidate.layout.set = use.descriptorSet;
                     candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_UNIFORM;
                     candidate.name = use.uniformName;
-                    candidate.binding.packing.elementSize = elementSize;
-                    candidate.binding.packing.shape = shape;
-                    candidate.binding.packing.byteSize = static_cast<size_t>(physicalSize);
-                    for (uint64_t stride : use.physicalValueLayout->byteStrides) {
-                        if (stride > SIZE_MAX) {
-                            representationError = "OpenGL uniform stride exceeds the host size range";
-                            useRhiGraphics = false;
-                            break;
-                        }
-                        candidate.binding.packing.byteStrides.push_back(static_cast<size_t>(stride));
-                    }
-                    if (!useRhiGraphics || candidate.binding.packing.byteStrides.size() != shape.size()) {
-                        if (representationError.empty())
-                            representationError = "OpenGL uniform stride rank does not match its shape";
+                    const ValueLayout &canonical =
+                        parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
+                    std::optional<TensorCopyPlan> packing =
+                        compileTensorCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root, shape);
+                    if (!packing || packing->elementSize != elementSize) {
+                        representationError = "OpenGL interface plan does not match the canonical layout";
                         useRhiGraphics = false;
                         break;
                     }
+                    candidate.binding.packing = std::move(*packing);
                 } else if (parameter.kind == "tensor" && use.interfaceKind == "input" && use.stage == "vertex" &&
                            use.location != UINT32_MAX && !use.attributeLeaves.empty()) {
                     candidate.layout.kind = VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
@@ -436,8 +431,9 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         if (status != VERNON_STATUS_OK) {
             const VernonStringView providerError =
                 vernonRuntimeRhiAdapterGetLastError(openGLState(*bundle.context).adapter);
-            bundle.context->error = providerError.data ? std::string(providerError.data, providerError.size)
-                                                       : "failed to prepare OpenGL RHI provider pipeline";
+            invocationDiagnostic(*bundle.context) = providerError.data
+                                                        ? std::string(providerError.data, providerError.size)
+                                                        : "failed to prepare OpenGL RHI provider pipeline";
             delete state;
             return false;
         }
@@ -462,8 +458,9 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
             if (bindingStatus != VERNON_STATUS_OK) {
                 const VernonStringView providerError =
                     vernonRuntimeRhiAdapterGetLastError(openGLState(*bundle.context).adapter);
-                bundle.context->error = providerError.data ? std::string(providerError.data, providerError.size)
-                                                           : "failed to prepare OpenGL RHI bindings";
+                invocationDiagnostic(*bundle.context) = providerError.data
+                                                            ? std::string(providerError.data, providerError.size)
+                                                            : "failed to prepare OpenGL RHI bindings";
                 vernonRuntimeCorePipelineDestroy(state->rhiPipeline);
                 delete state;
                 return false;
@@ -472,9 +469,9 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
         installRuntimeBackendState(pipeline, state);
         return true;
     }
-    bundle.context->error = representationError.empty()
-                                ? "OpenGL PipelineAsset is not representable by the RuntimeCore provider"
-                                : std::move(representationError);
+    invocationDiagnostic(*bundle.context) =
+        representationError.empty() ? "OpenGL PipelineAsset is not representable by the RuntimeCore provider"
+                                    : std::move(representationError);
     delete state;
     return false;
 }
@@ -604,7 +601,7 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
     PlannedGraphicsState graphicsState;
     const bool hasStencil = plan.depthAttachment && plan.depthAttachment->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT;
     if (!planGraphicsState(invocation, formats.size(), plan.depthAttachment != nullptr, hasStencil, graphicsState,
-                           pipeline.context->error))
+                           invocationDiagnostic(*pipeline.context)))
         return VERNON_STATUS_INVALID_ARGUMENT;
     std::vector<uint32_t> vertexStrides;
     for (size_t index = 0; index < state.rhiLayout.size(); ++index) {

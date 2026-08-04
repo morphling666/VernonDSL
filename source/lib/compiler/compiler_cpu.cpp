@@ -16,7 +16,6 @@
 #include "mlir/Target/LLVMIR/Export.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/StringExtras.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
 #include "llvm/IR/Constants.h"
@@ -38,7 +37,6 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
-#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -67,6 +65,20 @@ void CpuExecutionStateDeleter::operator()(CpuExecutionState *state) const { dele
 
 namespace {
 
+mlir::FailureOr<llvm::SmallVector<llvm::StringRef>> logicalDtypes(mlir::DictionaryAttr attributes) {
+    llvm::SmallVector<llvm::StringRef> result;
+    auto dtypes = attributes.getAs<mlir::ArrayAttr>("vernon.abi_leaf_dtypes");
+    if (!dtypes)
+        return result;
+    for (mlir::Attribute attribute : dtypes) {
+        auto dtype = mlir::dyn_cast<mlir::StringAttr>(attribute);
+        if (!dtype)
+            return mlir::failure();
+        result.push_back(dtype.getValue());
+    }
+    return result;
+}
+
 bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrapperMetadata> &entries,
                            llvm::StringRef moduleHash, std::string &diagnostics) {
     for (mlir::func::FuncOp function : module.getOps<mlir::func::FuncOp>()) {
@@ -87,21 +99,51 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
             mlir::DictionaryAttr attrs = function.getArgAttrDict(index);
             if (attrs.get(mlir::vernon::kTensorDescriptorComponentAttrName))
                 continue;
-            mlir::FailureOr<mlir::vernon::PhysicalValueAbiLayout> layout =
-                mlir::vernon::getPhysicalValueAbiLayout(type, module, mlir::vernon::PhysicalAbiProfile::HostValue);
-            if (mlir::failed(layout)) {
-                diagnostics = "unsupported CPU ABI argument type in entry '" + function.getSymName().str() + "'";
+            mlir::FailureOr<llvm::SmallVector<llvm::StringRef>> dtypes = logicalDtypes(attrs);
+            if (mlir::failed(dtypes)) {
+                diagnostics = "malformed CPU ABI dtype metadata in entry '" + function.getSymName().str() + "'";
                 return false;
             }
-            metadata.argumentsSize = llvm::alignTo(metadata.argumentsSize, layout->alignment);
-
-            vernon::CpuAbiArgumentPacking packing{metadata.argumentsSize,
-                                                  layout->size,
-                                                  mlir::isa<mlir::vernon::TensorViewType>(type)
-                                                      ? vernon::CpuAbiArgumentKind::TensorView
-                                                      : vernon::CpuAbiArgumentKind::Direct,
-                                                  0,
-                                                  {}};
+            const bool tensorView = mlir::isa<mlir::vernon::TensorViewType>(type);
+            std::optional<mlir::vernon::CpuCallPlan> valuePlan;
+            if (!tensorView)
+                if (mlir::FailureOr<mlir::vernon::CpuCallPlan> plan =
+                        mlir::vernon::getCpuCallPlan(type, module, *dtypes);
+                    mlir::succeeded(plan))
+                    valuePlan = std::move(*plan);
+            const vernon::CpuAbiArgumentKind kind = tensorView  ? vernon::CpuAbiArgumentKind::TensorView
+                                                    : valuePlan ? vernon::CpuAbiArgumentKind::CanonicalValue
+                                                                : vernon::CpuAbiArgumentKind::OpaqueScalar;
+            uint64_t size = 0;
+            uint64_t alignment = 0;
+            if (valuePlan) {
+                size = valuePlan->layout.size;
+                alignment = valuePlan->layout.alignment;
+            } else if (tensorView || mlir::vernon::isCpuOpaqueAbiType(type)) {
+                mlir::FailureOr<mlir::vernon::BackendInterfaceAbiPlan> interface =
+                    mlir::vernon::getBackendInterfaceAbiPlan(type, module, mlir::vernon::PhysicalAbiProfile::HostValue);
+                const auto *resource =
+                    mlir::succeeded(interface) ? std::get_if<mlir::vernon::ResourceBindingPlan>(&*interface) : nullptr;
+                const auto *bytes =
+                    mlir::succeeded(interface) ? std::get_if<mlir::vernon::ByteTransportPlan>(&*interface) : nullptr;
+                if ((!resource || resource->handleSize == 0) && (!bytes || !bytes->root)) {
+                    diagnostics =
+                        "unsupported explicit CPU ABI contract in entry '" + function.getSymName().str() + "'";
+                    return false;
+                }
+                size = resource ? resource->handleSize : bytes->root->size;
+                alignment = resource ? resource->handleAlignment : bytes->root->alignment;
+            } else {
+                std::string spelling;
+                llvm::raw_string_ostream stream(spelling);
+                type.print(stream);
+                diagnostics = "CPU ABI argument #" + std::to_string(index) + " of type " + stream.str() +
+                              " has neither a canonical Value plan nor an opaque scalar contract in entry '" +
+                              function.getSymName().str() + "'";
+                return false;
+            }
+            metadata.argumentsSize = llvm::alignTo(metadata.argumentsSize, alignment);
+            vernon::CpuAbiArgumentPacking packing{metadata.argumentsSize, size, kind, 0, {}, {}};
             if (packing.kind == vernon::CpuAbiArgumentKind::TensorView) {
                 auto view = mlir::cast<mlir::vernon::TensorViewType>(type);
                 packing.tensorRank = static_cast<uint32_t>(view.getShape().size());
@@ -115,9 +157,17 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
                 for (const mlir::vernon::ValueAbiLeaf &leaf : layout->leaves)
                     packing.tensorLeafElementSizes.push_back(
                         std::max<uint64_t>(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1));
+            } else if (packing.kind == vernon::CpuAbiArgumentKind::CanonicalValue) {
+                for (const mlir::vernon::CpuCallLane &lane : valuePlan->lanes) {
+                    const mlir::vernon::ValueAbiLeaf &leaf = valuePlan->layout.leaves[lane.leafIndex];
+                    const uint64_t scalarSize = std::max<uint64_t>(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1);
+                    packing.callLanes.push_back({leaf.byteOffset + lane.scalarIndex * scalarSize, scalarSize});
+                }
+            } else {
+                packing.callLanes.push_back({0, packing.size});
             }
             metadata.sourceArguments.push_back(packing);
-            metadata.argumentsSize += layout->size;
+            metadata.argumentsSize += packing.size;
         }
 
         if (function.getNumResults() > 1) {
@@ -127,13 +177,24 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
         if (function.getNumResults() == 0) {
             metadata.resultsSize = 0;
         } else {
-            mlir::FailureOr<mlir::vernon::PhysicalValueAbiLayout> layout = mlir::vernon::getPhysicalValueAbiLayout(
-                function.getResultTypes()[0], module, mlir::vernon::PhysicalAbiProfile::HostValue);
-            metadata.resultsSize = mlir::succeeded(layout) ? layout->size : 0;
-        }
-        if (function.getNumResults() != 0 && metadata.resultsSize == 0) {
-            diagnostics = "unsupported CPU ABI result type in entry '" + function.getSymName().str() + "'";
-            return false;
+            mlir::FailureOr<llvm::SmallVector<llvm::StringRef>> dtypes = logicalDtypes(function.getResultAttrDict(0));
+            if (mlir::failed(dtypes)) {
+                diagnostics = "malformed CPU ABI result dtype metadata in entry '" + function.getSymName().str() + "'";
+                return false;
+            }
+            mlir::FailureOr<mlir::vernon::CpuCallPlan> plan =
+                mlir::vernon::getCpuCallPlan(function.getResultTypes()[0], module, *dtypes);
+            if (mlir::failed(plan)) {
+                diagnostics =
+                    "CPU ABI result has no canonical Value plan in entry '" + function.getSymName().str() + "'";
+                return false;
+            }
+            metadata.resultsSize = plan->layout.size;
+            for (const mlir::vernon::CpuCallLane &lane : plan->lanes) {
+                const mlir::vernon::ValueAbiLeaf &leaf = plan->layout.leaves[lane.leafIndex];
+                const uint64_t scalarSize = std::max<uint64_t>(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1);
+                metadata.resultCallLanes.push_back({leaf.byteOffset + lane.scalarIndex * scalarSize, scalarSize});
+            }
         }
         entries.push_back(std::move(metadata));
     }

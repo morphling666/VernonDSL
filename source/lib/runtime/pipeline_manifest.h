@@ -19,13 +19,36 @@ struct SampledTextureBinding {
     uint32_t binding{UINT32_MAX};
 };
 
-struct PhysicalValueLayout {
-    std::string profile;
-    std::string transport;
+enum class InterfacePlanKind {
+    CpuCall,
+    KernelParameter,
+    ByteTransport,
+    NativeUniform,
+};
+
+enum class TransportNodeKind {
+    Scalar,
+    Product,
+    Array,
+};
+
+struct TransportNode {
+    TransportNodeKind kind{TransportNodeKind::Scalar};
+    std::string representation;
+    uint64_t offset{};
     uint64_t size{};
     uint64_t alignment{1};
+    std::vector<uint64_t> shape;
     std::vector<uint64_t> byteStrides;
-    std::vector<uint64_t> elementLeafOffsets;
+    std::vector<TransportNode> children;
+};
+
+struct InterfacePlan {
+    InterfacePlanKind kind{InterfacePlanKind::ByteTransport};
+    std::string profile;
+    std::string canonicalLayoutHash;
+    uint64_t frameOffset{};
+    std::optional<TransportNode> root;
 };
 
 struct AttributeLeaf {
@@ -83,7 +106,9 @@ struct ParameterUse {
     uint32_t binding{UINT32_MAX};
     std::vector<SampledTextureBinding> sampledTextureBindings;
     std::vector<AttributeLeaf> attributeLeaves;
-    std::optional<PhysicalValueLayout> physicalValueLayout;
+    std::string transport;
+    std::optional<ValueLayout> valueLayout;
+    std::optional<InterfacePlan> interfacePlan;
     std::optional<TensorViewDescriptorUse> tensorViewDescriptor;
 };
 
@@ -103,6 +128,7 @@ struct Parameter {
     std::string kind;
     std::string source;
     std::string systemValue;
+    std::optional<ValueLayout> valueLayout;
     ValueLayout elementLayout;
     std::string access;
     std::string addressSpace;
@@ -200,6 +226,7 @@ std::optional<VernonTextureFormat> pipelineTextureFormat(const std::string &form
 bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &error);
 bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifest, std::string &error);
 bool parsePipelineValueLayout(const nlohmann::json &value, ValueLayout &layout, std::string &error);
+bool parsePipelineInterfacePlan(const nlohmann::json &value, InterfacePlan &plan, std::string &error);
 void rebuildValueLayoutPathViews(ValueLayout &layout);
 bool parseRuntimeRequirements(const nlohmann::json &root, const std::string &target, RuntimeRequirements &requirements,
                               std::string &error);

@@ -10,6 +10,8 @@
 
 namespace vernon::runtime {
 
+struct TransportNode;
+
 size_t dataTypeSize(VernonDataType dtype);
 
 bool valueLayoutValid(const VernonValueLayoutView &layout);
@@ -25,15 +27,24 @@ bool tensorFitsAllocation(const VernonTensorView &tensor);
 
 bool isRowMajorContiguous(const VernonTensorView &tensor);
 
-struct TensorPackingLayout {
+struct CopyOperation {
+    size_t sourceOffset{};
+    size_t destinationOffset{};
+    size_t size{};
+};
+
+struct TensorCopyPlan {
     size_t elementSize{};
     std::vector<uint64_t> shape;
     std::vector<size_t> byteStrides;
     size_t byteSize{};
-    std::vector<size_t> elementLeafOffsets;
+    std::vector<CopyOperation> operations;
 };
 
-std::optional<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, const TensorPackingLayout &layout);
+std::optional<TensorCopyPlan> compileTensorCopyPlan(const VernonValueLayoutView &canonical,
+                                                    const TransportNode &transport, std::vector<uint64_t> shape);
+
+std::optional<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, const TensorCopyPlan &plan);
 
 std::optional<std::vector<uint8_t>> packTensorRowMajor(const VernonTensorView &tensor);
 

@@ -307,50 +307,87 @@ TEST(PipelineManifestRequirements, ParsesReflectedUniformTensorLayout) {
     const nlohmann::json manifest = {
         {"key", nlohmann::json::array()},
         {"program", {{"vertex", "vertex.spv"}, {"fragment", "fragment.spv"}}},
-        {"parameters",
-         nlohmann::json::array(
-             {{{"slot", 0},
-               {"name", "weights"},
-               {"kind", "tensor"},
-               {"type", "tensor<2x3xf32>"},
-               {"access", "read"},
-               {"element_layout",
-                {{"logical_type", "f32"},
-                 {"byte_size", 4},
-                 {"alignment", 4},
-                 {"layout_hash", "cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b"},
-                 {"leaves", nlohmann::json::array({{{"path", nlohmann::json::array()},
-                                                    {"dtype", "f32"},
-                                                    {"byte_offset", 0},
-                                                    {"scalar_count", 1}}})}}},
-               {"shape", nlohmann::json::array({2, 3})},
-               {"uses", nlohmann::json::array({{{"stage", "vertex"},
-                                                {"interface", "uniform"},
-                                                {"index", 0},
+        {"parameters", nlohmann::json::array(
+                           {{{"slot", 0},
+                             {"name", "weights"},
+                             {"kind", "tensor"},
+                             {"type", "tensor<2x3xf32>"},
+                             {"access", "read"},
+                             {"element_layout",
+                              {{"logical_type", "f32"},
+                               {"byte_size", 4},
+                               {"alignment", 4},
+                               {"layout_hash", "cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b"},
+                               {"leaves", nlohmann::json::array({{{"path", nlohmann::json::array()},
+                                                                  {"dtype", "f32"},
+                                                                  {"byte_offset", 0},
+                                                                  {"scalar_count", 1}}})}}},
+                             {"shape", nlohmann::json::array({2, 3})},
+                             {"uses", nlohmann::json::array(
+                                          {{{"stage", "vertex"},
+                                            {"interface", "uniform"},
+                                            {"index", 0},
+                                            {"shape", nlohmann::json::array({2, 3})},
+                                            {"vernon.set", 0},
+                                            {"vernon.binding", 2},
+                                            {"transport", "uniform_buffer"},
+                                            {"interface_plan",
+                                             {{"kind", "byte_transport"},
+                                              {"profile", "vulkan_std140_uniform_buffer"},
+                                              {"canonical_layout_hash", "tensor-layout"},
+                                              {"root",
+                                               {{"kind", "array"},
+                                                {"offset", 0},
+                                                {"size", 32},
+                                                {"alignment", 16},
                                                 {"shape", nlohmann::json::array({2, 3})},
-                                                {"vernon.set", 0},
-                                                {"vernon.binding", 2},
-                                                {"physical_value_layout",
-                                                 {{"profile", "vulkan_std140_uniform_buffer"},
-                                                  {"transport", "uniform_buffer"},
-                                                  {"size", 32},
-                                                  {"alignment", 16},
-                                                  {"byte_strides", nlohmann::json::array({16, 4})}}}}})}}})},
+                                                {"byte_strides", nlohmann::json::array({16, 4})},
+                                                {"children", nlohmann::json::array({{{"kind", "scalar"},
+                                                                                     {"representation", "f32"},
+                                                                                     {"offset", 0},
+                                                                                     {"size", 4},
+                                                                                     {"alignment", 4}}})}}}}}}})}}})},
         {"outputs", nlohmann::json::array()}};
     vernon::runtime::Variant variant;
     std::string error;
     ASSERT_TRUE(vernon::runtime::parseVariant(manifest, variant, error)) << error;
     ASSERT_EQ(variant.parameters.size(), 1u);
     ASSERT_EQ(variant.parameters[0].uses.size(), 1u);
-    const auto &layout = variant.parameters[0].uses[0].physicalValueLayout;
+    const auto &layout = variant.parameters[0].uses[0].interfacePlan;
     ASSERT_TRUE(layout);
     EXPECT_EQ(layout->profile, "vulkan_std140_uniform_buffer");
-    EXPECT_EQ(layout->transport, "uniform_buffer");
-    EXPECT_EQ(layout->size, 32u);
-    EXPECT_EQ(layout->alignment, 16u);
-    EXPECT_EQ(layout->byteStrides, (std::vector<uint64_t>{16, 4}));
+    EXPECT_EQ(variant.parameters[0].uses[0].transport, "uniform_buffer");
+    ASSERT_TRUE(layout->root);
+    EXPECT_EQ(layout->root->size, 32u);
+    EXPECT_EQ(layout->root->alignment, 16u);
+    EXPECT_EQ(layout->root->byteStrides, (std::vector<uint64_t>{16, 4}));
     ASSERT_EQ(variant.parameters[0].elementLayout.leaves.size(), 1u);
     EXPECT_TRUE(variant.parameters[0].elementLayout.leaves[0].path.empty());
+
+    nlohmann::json invalid = manifest;
+    invalid["parameters"][0]["uses"][0]["interface_plan"]["root"]["children"] = nlohmann::json::array();
+    EXPECT_FALSE(vernon::runtime::parseVariant(invalid, variant, error));
+    EXPECT_NE(error.find("topology"), std::string::npos);
+
+    invalid = manifest;
+    invalid["parameters"][0]["uses"][0]["interface_plan"]["root"]["children"][0]["offset"] = 30;
+    EXPECT_FALSE(vernon::runtime::parseVariant(invalid, variant, error));
+    EXPECT_NE(error.find("bounds"), std::string::npos);
+
+    invalid = manifest;
+    invalid["parameters"][0]["uses"][0]["interface_plan"]["root"]["children"][0]["size"] = 8;
+    EXPECT_FALSE(vernon::runtime::parseVariant(invalid, variant, error));
+    EXPECT_NE(error.find("representation"), std::string::npos);
+
+    invalid = manifest;
+    invalid["parameters"][0]["uses"][0]["interface_plan"]["root"]["children"][0]["representation"] = "f64";
+    EXPECT_FALSE(vernon::runtime::parseVariant(invalid, variant, error));
+    EXPECT_NE(error.find("representation"), std::string::npos);
+
+    invalid = manifest;
+    invalid["parameters"][0]["uses"][0]["value_layout"] = invalid["parameters"][0]["element_layout"];
+    EXPECT_FALSE(vernon::runtime::parseVariant(invalid, variant, error));
+    EXPECT_NE(error.find("canonical layout hash"), std::string::npos);
 }
 
 TEST(PipelineManifestRequirements, RejectsUnknownAndLegacyVariantRecords) {

@@ -6,7 +6,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -25,6 +27,8 @@ struct HostArgument {
     std::string builtin;
     size_t offset{};
     size_t size{};
+    bool tensorView{};
+    std::string access;
     std::vector<HostLeaf> leaves;
 };
 
@@ -39,6 +43,30 @@ VernonStatus fail(VernonRuntimeContext &context, std::string message,
                   VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) {
     invocationDiagnostic(context) = std::move(message);
     return status;
+}
+
+bool appendLeafPath(const nlohmann::json &value, std::string &path, std::string &error) {
+    if (!value.contains("path") || !value["path"].is_array()) {
+        error = "autodiff Value leaf path is invalid";
+        return false;
+    }
+    for (const nlohmann::json &component : value["path"]) {
+        std::string name;
+        if (component.is_string())
+            name = component.get<std::string>();
+        else if (component.is_number_unsigned())
+            name = std::to_string(component.get<uint64_t>());
+        else {
+            error = "autodiff Value leaf path is invalid";
+            return false;
+        }
+        if (name.empty() || name.find('.') != std::string::npos) {
+            error = "autodiff Value leaf path is invalid";
+            return false;
+        }
+        path += "." + name;
+    }
+    return true;
 }
 
 bool parseLeaf(const nlohmann::json &value, const std::string &path, size_t baseOffset, HostLeaf &leaf,
@@ -89,7 +117,11 @@ bool parseLeaf(const nlohmann::json &value, const std::string &path, size_t base
         error = "autodiff non-scalar Value leaf has no shape";
         return false;
     }
-    leaf = {{path, *dtype, scalarCount * scalarSize, scalarSize, std::move(shape)}, baseOffset + relativeOffset};
+    std::string leafPath = path;
+    if (!appendLeafPath(value, leafPath, error))
+        return false;
+    leaf = {{std::move(leafPath), *dtype, scalarCount * scalarSize, scalarSize, std::move(shape)},
+            baseOffset + relativeOffset};
     return true;
 }
 
@@ -127,30 +159,84 @@ bool parseProfile(const Stage &stage, HostProfileLayout &layout, std::string &er
     }
     for (const nlohmann::json &value : (*entry)["arguments"]) {
         if (!value.is_object() || value.value("kind", "") == "builtin" || !value.contains("physical_layouts") ||
-            !value["physical_layouts"].is_object() || !value.contains("logical_abi") ||
-            !value["logical_abi"].is_object() || !value["logical_abi"].contains("leaves") ||
-            !value["logical_abi"]["leaves"].is_array()) {
+            !value["physical_layouts"].is_object()) {
             error = "autodiff profile contains an invalid argument ABI";
             return false;
         }
         const auto physical = value["physical_layouts"].find("host_value");
-        if (physical == value["physical_layouts"].end() || !physical->is_object() || !physical->contains("offset") ||
-            !(*physical)["offset"].is_number_unsigned() || !physical->contains("size") ||
-            !(*physical)["size"].is_number_unsigned()) {
+        const std::string physicalKind =
+            physical != value["physical_layouts"].end() && physical->is_object() ? physical->value("kind", "") : "";
+        const nlohmann::json *physicalExtent =
+            physicalKind == "cpu_call" && physical->contains("root") && (*physical)["root"].is_object()
+                ? &(*physical)["root"]
+                : (physicalKind == "resource_binding" ? &*physical : nullptr);
+        if (physical == value["physical_layouts"].end() || !physical->is_object() ||
+            !physical->contains("frame_offset") || !(*physical)["frame_offset"].is_number_unsigned() ||
+            !physicalExtent || !physicalExtent->contains("size") || !(*physicalExtent)["size"].is_number_unsigned()) {
             error = "autodiff argument has no host Value layout";
             return false;
         }
         HostArgument argument;
         argument.name = value.value("vernon.source_name", "");
         argument.builtin = value.value("vernon.builtin", "");
-        argument.offset = (*physical)["offset"].get<size_t>();
-        argument.size = (*physical)["size"].get<size_t>();
+        argument.offset = (*physical)["frame_offset"].get<size_t>();
+        argument.size = (*physicalExtent)["size"].get<size_t>();
+        argument.tensorView = physical->value("kind", "") == "resource_binding" &&
+                              physical->value("resource_kind", "") == "tensor_view_descriptor";
+        argument.access = value.value("access", "");
         if (argument.name.empty() || argument.offset > layout.argumentsSize ||
             argument.size > layout.argumentsSize - argument.offset) {
             error = "autodiff argument host Value layout is out of bounds";
             return false;
         }
-        for (const nlohmann::json &leafValue : value["logical_abi"]["leaves"]) {
+        if (argument.tensorView) {
+            if (!value.contains("source_shape") || !value["source_shape"].is_array() ||
+                !value.contains("element_layout") || !value["element_layout"].is_object() ||
+                !value["element_layout"].contains("leaves") || !value["element_layout"]["leaves"].is_array() ||
+                value["element_layout"]["leaves"].size() != 1) {
+                error = "autodiff TensorView argument has an invalid element ABI";
+                return false;
+            }
+            const nlohmann::json &element = value["element_layout"]["leaves"][0];
+            if (!element.is_object() || !element.contains("dtype") || !element["dtype"].is_string() ||
+                element.value("scalar_count", 0u) != 1) {
+                error = "autodiff TensorView argument requires one scalar element leaf";
+                return false;
+            }
+            const auto dtype = pipelineDataType(element["dtype"].get<std::string>());
+            const size_t scalarSize = dtype ? dtypeSize(*dtype) : 0;
+            size_t scalarCount = 1;
+            std::vector<uint64_t> shape;
+            for (const nlohmann::json &extentValue : value["source_shape"]) {
+                if (!extentValue.is_number_unsigned()) {
+                    error = "autodiff TensorView argument has an invalid shape";
+                    return false;
+                }
+                const uint64_t extent = extentValue.get<uint64_t>();
+                if (!extent || extent > SIZE_MAX / scalarCount) {
+                    error = "autodiff TensorView argument shape is empty or overflows";
+                    return false;
+                }
+                scalarCount *= static_cast<size_t>(extent);
+                shape.push_back(extent);
+            }
+            if (!scalarSize || shape.empty() || scalarCount > SIZE_MAX / scalarSize ||
+                argument.size != sizeof(uint64_t) * (2 + 2 * shape.size()) ||
+                (argument.access != "read" && argument.access != "write" && argument.access != "read_write")) {
+                error = "autodiff TensorView argument has an invalid host descriptor";
+                return false;
+            }
+            argument.leaves.push_back(
+                {{argument.name, *dtype, scalarCount * scalarSize, scalarSize, std::move(shape)}, argument.offset});
+            layout.arguments.push_back(std::move(argument));
+            continue;
+        }
+        if (!value.contains("value_layout") || !value["value_layout"].is_object() ||
+            !value["value_layout"].contains("leaves") || !value["value_layout"]["leaves"].is_array()) {
+            error = "autodiff profile contains an invalid argument Value ABI";
+            return false;
+        }
+        for (const nlohmann::json &leafValue : value["value_layout"]["leaves"]) {
             HostLeaf leaf;
             if (!parseLeaf(leafValue, argument.name, argument.offset, leaf, error))
                 return false;
@@ -173,26 +259,27 @@ bool parseProfile(const Stage &stage, HostProfileLayout &layout, std::string &er
     }
     const nlohmann::json &result = (*entry)["results"][0];
     if (!result.is_object() || !result.contains("physical_layouts") || !result["physical_layouts"].is_object() ||
-        !result.contains("logical_abi") || !result["logical_abi"].is_object() ||
-        !result["logical_abi"].contains("leaves") || !result["logical_abi"]["leaves"].is_array()) {
+        !result.contains("value_layout") || !result["value_layout"].is_object() ||
+        !result["value_layout"].contains("leaves") || !result["value_layout"]["leaves"].is_array()) {
         error = "autodiff profile contains an invalid result ABI";
         return false;
     }
     const auto physical = result["physical_layouts"].find("host_value");
-    if (physical == result["physical_layouts"].end() || !physical->is_object() || !physical->contains("offset") ||
-        !(*physical)["offset"].is_number_unsigned() || !physical->contains("size") ||
-        !(*physical)["size"].is_number_unsigned()) {
+    if (physical == result["physical_layouts"].end() || !physical->is_object() || !physical->contains("frame_offset") ||
+        !(*physical)["frame_offset"].is_number_unsigned() || physical->value("kind", "") != "cpu_call" ||
+        !physical->contains("root") || !(*physical)["root"].is_object() || !(*physical)["root"].contains("size") ||
+        !(*physical)["root"]["size"].is_number_unsigned()) {
         error = "autodiff result has no host Value layout";
         return false;
     }
-    const size_t resultOffset = (*physical)["offset"].get<size_t>();
-    const size_t resultSize = (*physical)["size"].get<size_t>();
+    const size_t resultOffset = (*physical)["frame_offset"].get<size_t>();
+    const size_t resultSize = (*physical)["root"]["size"].get<size_t>();
     if (resultOffset > layout.resultsSize || resultSize > layout.resultsSize - resultOffset) {
         error = "autodiff result host Value layout is out of bounds";
         return false;
     }
     size_t index = 0;
-    for (const nlohmann::json &leafValue : result["logical_abi"]["leaves"]) {
+    for (const nlohmann::json &leafValue : result["value_layout"]["leaves"]) {
         HostLeaf leaf;
         if (!parseLeaf(leafValue, "result." + std::to_string(index++), resultOffset, leaf, error))
             return false;
@@ -213,17 +300,17 @@ bool parseProfile(const Stage &stage, HostProfileLayout &layout, std::string &er
 class CpuPullbackExecution final : public PullbackExecution {
 public:
     CpuPullbackExecution(VernonRuntimeContext &context, std::shared_ptr<CpuKernelState> backward,
-                         HostProfileLayout layout, Signature signature, std::vector<std::vector<uint8_t>> arguments)
+                         HostProfileLayout layout, Signature signature, VernonLaunchSize computeGrid,
+                         std::vector<std::vector<uint8_t>> arguments)
         : context_(context), backward_(std::move(backward)), layout_(std::move(layout)),
-          signature_(std::move(signature)), arguments_(std::move(arguments)) {}
+          signature_(std::move(signature)), computeGrid_(computeGrid), arguments_(std::move(arguments)) {}
 
     VernonStatus apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients) override {
         if (gradients.value_count != signature_.gradients.size())
             return fail(context_, "invalid pullback invocation");
         ValueAbi cotangentAbi = signature_.cotangent;
-        if (!arguments_.empty() && cotangentAbi.byteSize > SIZE_MAX / arguments_.size())
+        if (!materializeCarrierValue(cotangentAbi, computeGrid_))
             return fail(context_, "CPU pullback cotangent size overflows");
-        cotangentAbi.byteSize *= arguments_.size();
         std::vector<uint8_t> cotangent;
         if (!makeCotangentBytes(cotangents, cotangentAbi, cotangent, invocationDiagnostic(context_)))
             return VERNON_STATUS_INVALID_ARGUMENT;
@@ -282,6 +369,7 @@ private:
     std::shared_ptr<CpuKernelState> backward_;
     HostProfileLayout layout_;
     Signature signature_;
+    VernonLaunchSize computeGrid_{};
     std::vector<std::vector<uint8_t>> arguments_;
 };
 
@@ -303,19 +391,65 @@ public:
         if (inputs.value_count != signature_.inputs.size() || outputs.value_count != 1)
             return fail(context_, "autodiff forward values do not match the host profile");
         std::vector<uint8_t> arguments(forwardLayout_.argumentsSize);
+        struct StorageRange {
+            uintptr_t begin;
+            uintptr_t end;
+            bool writable;
+        };
+        std::vector<StorageRange> storageRanges;
         for (const HostArgument &argument : forwardLayout_.arguments) {
             if (!argument.builtin.empty())
                 continue;
-            const VernonAdValue *value = findValue(inputs, argument.name);
-            if (!value || argument.leaves.size() != 1 || !valueMatches(*value, argument.leaves.front().value))
-                return fail(context_, "autodiff forward input does not match profile reflection");
-            std::memcpy(arguments.data() + argument.leaves.front().offset, value->data, value->size);
+            if (argument.tensorView) {
+                const HostLeaf &leaf = argument.leaves.front();
+                const VernonAdValue *value = findValue(inputs, leaf.value.path);
+                if (!value || !valueMatches(*value, leaf.value))
+                    return fail(context_, "autodiff forward TensorView input '" + leaf.value.path +
+                                              "' does not match profile reflection");
+                const uintptr_t begin = reinterpret_cast<uintptr_t>(value->data);
+                if (value->size > std::numeric_limits<uintptr_t>::max() - begin)
+                    return fail(context_, "autodiff forward TensorView input address range overflows");
+                const StorageRange range{begin, begin + value->size, argument.access != "read"};
+                for (const StorageRange &existing : storageRanges)
+                    if ((range.writable || existing.writable) && range.begin < existing.end &&
+                        existing.begin < range.end)
+                        return fail(context_, "writable native CPU autodiff Storage inputs overlap");
+                storageRanges.push_back(range);
+                uint8_t *descriptor = arguments.data() + argument.offset;
+                const uintptr_t pointer = reinterpret_cast<uintptr_t>(value->data);
+                const uint64_t zero = 0;
+                std::memcpy(descriptor, &pointer, sizeof(pointer));
+                std::memcpy(descriptor + sizeof(uint64_t), &zero, sizeof(zero));
+                const size_t rank = leaf.value.logicalShape.size();
+                for (size_t dimension = 0; dimension < rank; ++dimension) {
+                    const uint64_t extent = leaf.value.logicalShape[dimension];
+                    std::memcpy(descriptor + sizeof(uint64_t) * (2 + dimension), &extent, sizeof(extent));
+                }
+                uint64_t stride = 1;
+                for (size_t dimension = rank; dimension-- > 0;) {
+                    std::memcpy(descriptor + sizeof(uint64_t) * (2 + rank + dimension), &stride, sizeof(stride));
+                    stride *= leaf.value.logicalShape[dimension];
+                }
+                continue;
+            }
+            for (const HostLeaf &leaf : argument.leaves) {
+                const VernonAdValue *value = findValue(inputs, leaf.value.path);
+                if (!value || !valueMatches(*value, leaf.value))
+                    return fail(
+                        context_,
+                        "autodiff forward input '" + leaf.value.path +
+                            "' does not match profile reflection (expected " + std::to_string(leaf.value.byteSize) +
+                            " bytes at rank " + std::to_string(leaf.value.logicalShape.size()) + ", received " +
+                            (value ? std::to_string(value->size) + " bytes at rank " + std::to_string(value->rank)
+                                   : std::string("no value")) +
+                            ")");
+                std::memcpy(arguments.data() + leaf.offset, value->data, value->size);
+            }
         }
         VernonAdValue *output = findValue(outputs, signature_.output.path);
         ValueAbi outputAbi = signature_.output;
-        if (invocationCount && outputAbi.byteSize > SIZE_MAX / invocationCount)
+        if (!materializeCarrierValue(outputAbi, computeGrid))
             return fail(context_, "native CPU autodiff output size overflows");
-        outputAbi.byteSize *= invocationCount;
         if (!output || !valueMatches(*output, outputAbi))
             return fail(context_, "autodiff output does not match profile reflection");
 
@@ -352,7 +486,7 @@ public:
                             source.value.byteSize);
             }
         }
-        pullback = std::make_unique<CpuPullbackExecution>(context_, backward_, backwardLayout_, signature_,
+        pullback = std::make_unique<CpuPullbackExecution>(context_, backward_, backwardLayout_, signature_, computeGrid,
                                                           std::move(backwardArguments));
         return VERNON_STATUS_OK;
     }
@@ -371,7 +505,7 @@ private:
 bool createCpuExecutable(VernonRuntimeContext &context, const Stage &forwardStage, const Stage &backwardStage,
                          const std::vector<std::string> &gradientPaths, std::shared_ptr<Executable> &executable) {
     if (!forwardStage.cpuArtifact || !backwardStage.cpuArtifact) {
-        context.error = "CPU autodiff profiles have no loadable artifacts";
+        invocationDiagnostic(context) = "CPU autodiff profiles have no loadable artifacts";
         return false;
     }
     HostProfileLayout forward;
@@ -379,27 +513,23 @@ bool createCpuExecutable(VernonRuntimeContext &context, const Stage &forwardStag
     auto forwardKernel = std::make_shared<CpuKernelState>();
     auto backwardKernel = std::make_shared<CpuKernelState>();
     ReflectedEntry reflection;
-    if (!parseProfile(forwardStage, forward, context.error) || !parseProfile(backwardStage, backward, context.error) ||
-        !loadCpuNativeArtifact(*forwardStage.cpuArtifact, *forwardKernel, reflection, context.error) ||
-        !loadCpuNativeArtifact(*backwardStage.cpuArtifact, *backwardKernel, reflection, context.error))
+    if (!parseProfile(forwardStage, forward, invocationDiagnostic(context)) ||
+        !parseProfile(backwardStage, backward, invocationDiagnostic(context)) ||
+        !loadCpuNativeArtifact(*forwardStage.cpuArtifact, *forwardKernel, reflection, invocationDiagnostic(context)) ||
+        !loadCpuNativeArtifact(*backwardStage.cpuArtifact, *backwardKernel, reflection, invocationDiagnostic(context)))
         return false;
     if (forward.results.size() < 1 || backward.arguments.size() != 2 ||
         backward.arguments[0].leaves.size() + 1 != forward.results.size() || backward.arguments[1].leaves.size() != 1 ||
         backward.results.size() != gradientPaths.size()) {
-        context.error = "autodiff profile ABI does not match the contiguous Value Runtime contract";
+        invocationDiagnostic(context) = "autodiff profile ABI does not match the contiguous Value Runtime contract";
         return false;
     }
     Signature signature;
     for (const HostArgument &argument : forward.arguments) {
         if (!argument.builtin.empty())
             continue;
-        if (argument.leaves.size() != 1) {
-            context.error = "CPU autodiff profile requires one Value leaf per input";
-            return false;
-        }
-        ValueAbi value = argument.leaves.front().value;
-        value.path = argument.name;
-        signature.inputs.push_back(std::move(value));
+        for (const HostLeaf &leaf : argument.leaves)
+            signature.inputs.push_back(leaf.value);
     }
     signature.output = forward.results.front().value;
     signature.output.path = "output";
@@ -410,10 +540,8 @@ bool createCpuExecutable(VernonRuntimeContext &context, const Stage &forwardStag
     }
     signature.cotangent = backward.arguments[1].leaves.front().value;
     signature.cotangent.path = "output";
-    if (signature.output.dtype != signature.cotangent.dtype ||
-        signature.output.byteSize != signature.cotangent.byteSize ||
-        signature.output.logicalShape != signature.cotangent.logicalShape) {
-        context.error = "autodiff output and cotangent profile ABIs do not match";
+    if (!derivativeAbiMatches(signature.output, signature.cotangent)) {
+        invocationDiagnostic(context) = "autodiff output and cotangent profile ABIs do not match";
         return false;
     }
     for (size_t index = 0; index < signature.tape.size(); ++index) {
@@ -421,7 +549,7 @@ bool createCpuExecutable(VernonRuntimeContext &context, const Stage &forwardStag
         if (signature.tape[index].dtype != backwardTape.dtype ||
             signature.tape[index].byteSize != backwardTape.byteSize ||
             signature.tape[index].logicalShape != backwardTape.logicalShape) {
-            context.error = "autodiff tape leaves do not match backward reflection";
+            invocationDiagnostic(context) = "autodiff tape leaves do not match backward reflection";
             return false;
         }
     }

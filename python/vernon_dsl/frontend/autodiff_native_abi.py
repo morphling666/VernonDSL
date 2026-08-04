@@ -45,6 +45,38 @@ def native_type(value_type: ConcreteType) -> str:
     return dense_value_type(value_type).mlir
 
 
+def gradient_type(value_type: ConcreteType) -> ConcreteType:
+    if value_type.kind == "scalar":
+        if not value_type.is_float:
+            return value_type
+        return ConcreteType("scalar", "f64" if value_type.name == "f64" else "f32")
+    if value_type.kind == "tensor":
+        element = value_type.arguments[0]
+        if not isinstance(element, ConcreteType):
+            raise NativeAbiError("Tensor element type is unresolved")
+        return ConcreteType("tensor", "Tensor", (gradient_type(element), *value_type.arguments[1:]))
+    if value_type.kind == "tensor_view":
+        element, shape, _, _ = value_type.arguments
+        if not isinstance(element, ConcreteType) or not isinstance(shape, tuple):
+            raise NativeAbiError("TensorView gradient type is unresolved")
+        return ConcreteType("tensor", "Tensor", (gradient_type(element), *shape))
+    return value_type
+
+
+def gradient_resource_type(value_type: ConcreteType) -> ConcreteType:
+    dense = gradient_type(value_type)
+    if dense.kind != "tensor":
+        return dense
+    element = dense.arguments[0]
+    if not isinstance(element, ConcreteType):
+        raise NativeAbiError("Tensor gradient element type is unresolved")
+    return ConcreteType(
+        "tensor_view",
+        "TensorView",
+        (element, tuple(dense.arguments[1:]), "read_write", "device"),
+    )
+
+
 def resource_type(value_type: ConcreteType, access: str, runtime_carrier: bool = False) -> str:
     if runtime_carrier:
         return f'!vernon.tensor_view<{native_type(value_type)}, [-1, -1, -1], "{access}", "device">'
@@ -114,22 +146,13 @@ def backward_resources(program: AutodiffProgram) -> tuple[ResourceBindingPlan, .
             for index, value in enumerate(program.reverse.saved_values)
         ],
     ]
-    resources.append(ResourceBindingPlan("output", output.type, "read", "cotangent", True))
+    resources.append(ResourceBindingPlan("output", gradient_type(output.type), "read", "cotangent", True))
     for path in graph.wrt:
         node = gradient_nodes[path]
-        gradient_type = node.type
-        if node.type.kind == "tensor":
-            element = node.type.arguments[0]
-            assert isinstance(element, ConcreteType)
-            gradient_type = ConcreteType(
-                "tensor_view",
-                "TensorView",
-                (element, tuple(node.type.arguments[1:]), "read_write", "device"),
-            )
         resources.append(
             ResourceBindingPlan(
                 path,
-                gradient_type,
+                gradient_resource_type(node.type),
                 "read_write",
                 "gradient",
             )
@@ -143,6 +166,8 @@ __all__ = [
     "backward_resources",
     "dense_value_type",
     "forward_resources",
+    "gradient_resource_type",
+    "gradient_type",
     "launch_value_type",
     "native_type",
     "resource_argument",

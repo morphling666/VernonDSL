@@ -90,6 +90,7 @@ public:
 size_t dtypeSize(VernonDataType dtype);
 bool validLaunchSize(VernonLaunchSize grid);
 bool carrierCount(VernonLaunchSize grid, size_t &count);
+bool materializeCarrierValue(ValueAbi &abi, VernonLaunchSize grid);
 bool resourceByteSize(const ResourceAbi &abi, VernonLaunchSize grid, size_t &size);
 VernonRhiBufferDescriptor gpuBufferDescriptor(const ValueAbi &abi);
 VernonRhiStatus createGraphBuffer(execution::ExecutionGraph &graph, const ValueAbi &value,
@@ -104,6 +105,7 @@ bool validSet(const VernonAdValueSet *set, bool required);
 VernonAdValue *findValue(VernonAdValueSet &set, const std::string &path);
 const VernonAdValue *findValue(const VernonAdValueSet &set, const std::string &path);
 bool valueMatches(const VernonAdValue &value, const ValueAbi &abi);
+bool derivativeAbiMatches(const ValueAbi &primal, const ValueAbi &derivative);
 bool makeCotangentBytes(const VernonAdValueSet *cotangents, const ValueAbi &abi, std::vector<uint8_t> &bytes,
                         std::string &error);
 

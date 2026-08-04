@@ -13,6 +13,11 @@
 
 namespace {
 
+std::string lastError(const VernonRuntimeContext *context) {
+    const VernonStringView error = vernonRuntimeGetLastError(context);
+    return error.data ? std::string(error.data, error.size) : std::string();
+}
+
 VernonStatus squareForward(const VernonCpuInvocation *invocation) {
     if (!invocation || invocation->arguments_size != sizeof(float) || invocation->results_size != 2 * sizeof(float))
         return VERNON_STATUS_INVALID_ARGUMENT;
@@ -53,6 +58,26 @@ VernonStatus tensorSquareBackward(const VernonCpuInvocation *invocation) {
     return VERNON_STATUS_OK;
 }
 
+VernonStatus aggregateForward(const VernonCpuInvocation *invocation) {
+    if (!invocation || invocation->arguments_size != 3 * sizeof(float) || invocation->results_size != 3 * sizeof(float))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    float arguments[3]{};
+    std::memcpy(arguments, invocation->arguments, sizeof(arguments));
+    const float results[]{arguments[0] * arguments[1] * arguments[2], arguments[0], arguments[1]};
+    std::memcpy(invocation->results, results, sizeof(results));
+    return VERNON_STATUS_OK;
+}
+
+VernonStatus aggregateBackward(const VernonCpuInvocation *invocation) {
+    if (!invocation || invocation->arguments_size != 3 * sizeof(float) || invocation->results_size != sizeof(float))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    float arguments[3]{};
+    std::memcpy(arguments, invocation->arguments, sizeof(arguments));
+    const float gradient = arguments[0] * arguments[1] * arguments[2];
+    std::memcpy(invocation->results, &gradient, sizeof(gradient));
+    return VERNON_STATUS_OK;
+}
+
 VernonStatus halfIdentityForward(const VernonCpuInvocation *invocation) {
     if (!invocation || invocation->arguments_size != 2 || invocation->results_size != 4)
         return VERNON_STATUS_INVALID_ARGUMENT;
@@ -62,9 +87,9 @@ VernonStatus halfIdentityForward(const VernonCpuInvocation *invocation) {
 }
 
 VernonStatus halfIdentityBackward(const VernonCpuInvocation *invocation) {
-    if (!invocation || invocation->arguments_size != 4 || invocation->results_size != 2)
+    if (!invocation || invocation->arguments_size != 8 || invocation->results_size != sizeof(float))
         return VERNON_STATUS_INVALID_ARGUMENT;
-    std::memcpy(invocation->results, static_cast<const std::byte *>(invocation->arguments) + 2, 2);
+    std::memcpy(invocation->results, static_cast<const std::byte *>(invocation->arguments) + 4, sizeof(float));
     return VERNON_STATUS_OK;
 }
 
@@ -76,44 +101,90 @@ nlohmann::json leaf(size_t offset, size_t scalarCount = 1, const char *dtype = "
     return result;
 }
 
+nlohmann::json transportRoot(const nlohmann::json &leaves, size_t size, size_t alignment) {
+    const auto scalarSize = [](const std::string &dtype) {
+        return dtype == "f16" ? size_t{2} : dtype == "f64" ? size_t{8} : size_t{4};
+    };
+    const auto child = [&](const nlohmann::json &value) {
+        const std::string dtype = value["dtype"].get<std::string>();
+        const size_t count = value.value("scalar_count", size_t{1});
+        const size_t offset = value.value("byte_offset", size_t{0});
+        const size_t laneSize = scalarSize(dtype);
+        if (count == 1)
+            return nlohmann::json{{"kind", "scalar"},
+                                  {"representation", dtype},
+                                  {"offset", offset},
+                                  {"size", laneSize},
+                                  {"alignment", laneSize}};
+        return nlohmann::json{{"kind", "array"},
+                              {"offset", offset},
+                              {"size", count * laneSize},
+                              {"alignment", laneSize},
+                              {"shape", nlohmann::json::array({count})},
+                              {"byte_strides", nlohmann::json::array({laneSize})},
+                              {"children", nlohmann::json::array({{{"kind", "scalar"},
+                                                                   {"representation", dtype},
+                                                                   {"offset", 0},
+                                                                   {"size", laneSize},
+                                                                   {"alignment", laneSize}}})}};
+    };
+    if (leaves.size() == 1) {
+        nlohmann::json root = child(leaves[0]);
+        root["offset"] = 0;
+        root["size"] = size;
+        root["alignment"] = alignment;
+        return root;
+    }
+    nlohmann::json children = nlohmann::json::array();
+    for (const nlohmann::json &value : leaves)
+        children.push_back(child(value));
+    return {{"kind", "product"},
+            {"offset", 0},
+            {"size", size},
+            {"alignment", alignment},
+            {"children", std::move(children)}};
+}
+
 nlohmann::json argument(const char *name, size_t offset, nlohmann::json leaves, size_t size = 4, size_t alignment = 4) {
     const std::string dtype =
         leaves.size() == 1 && leaves[0].contains("dtype") ? leaves[0]["dtype"].get<std::string>() : "";
+    nlohmann::json root = transportRoot(leaves, size, alignment);
     return {{"kind", "scalar"},
             {"dtype", dtype},
             {"vernon.source_name", name},
-            {"logical_abi", {{"leaves", std::move(leaves)}}},
+            {"value_layout", {{"leaves", std::move(leaves)}}},
             {"physical_layouts",
              {{"host_value",
                {{"profile", "host_value"},
-                {"offset", offset},
-                {"size", size},
-                {"alignment", alignment},
-                {"byte_strides", nlohmann::json::array()}}}}}};
+                {"kind", "cpu_call"},
+                {"canonical_layout_hash", "test-layout"},
+                {"frame_offset", offset},
+                {"root", std::move(root)}}}}}};
 }
 
 nlohmann::json profileReflection(const char *entry, size_t argumentBytes, size_t resultBytes, nlohmann::json arguments,
                                  nlohmann::json resultLeaves, size_t resultAlignment = 4) {
-    return {{"compiler_contract_version", VERNON_COMPILER_CONTRACT_VERSION},
-            {"pipeline_version", VERNON_PIPELINE_VERSION},
-            {"entries",
-             nlohmann::json::array(
-                 {{{"name", entry},
-                   {"workgroup_size", nlohmann::json::array({1, 1, 1})},
-                   {"physical_layouts",
-                    {{"host_value",
-                      {{"profile", "host_value"},
-                       {"packed_arguments_size", argumentBytes},
-                       {"packed_results_size", resultBytes}}}}},
-                   {"arguments", std::move(arguments)},
-                   {"results", nlohmann::json::array({{{"logical_abi", {{"leaves", std::move(resultLeaves)}}},
-                                                       {"physical_layouts",
-                                                        {{"host_value",
-                                                          {{"profile", "host_value"},
-                                                           {"offset", uint64_t{0}},
-                                                           {"size", resultBytes},
-                                                           {"alignment", resultAlignment},
-                                                           {"byte_strides", nlohmann::json::array()}}}}}}})}}})}};
+    nlohmann::json resultRoot = transportRoot(resultLeaves, resultBytes, resultAlignment);
+    return {
+        {"compiler_contract_version", VERNON_COMPILER_CONTRACT_VERSION},
+        {"pipeline_version", VERNON_PIPELINE_VERSION},
+        {"entries", nlohmann::json::array(
+                        {{{"name", entry},
+                          {"workgroup_size", nlohmann::json::array({1, 1, 1})},
+                          {"physical_layouts",
+                           {{"host_value",
+                             {{"profile", "host_value"},
+                              {"packed_arguments_size", argumentBytes},
+                              {"packed_results_size", resultBytes}}}}},
+                          {"arguments", std::move(arguments)},
+                          {"results", nlohmann::json::array({{{"value_layout", {{"leaves", std::move(resultLeaves)}}},
+                                                              {"physical_layouts",
+                                                               {{"host_value",
+                                                                 {{"profile", "host_value"},
+                                                                  {"kind", "cpu_call"},
+                                                                  {"canonical_layout_hash", "test-layout"},
+                                                                  {"frame_offset", uint64_t{0}},
+                                                                  {"root", std::move(resultRoot)}}}}}}})}}})}};
 }
 
 vernon::runtime::CpuNativeArtifact artifact(const std::filesystem::path &root, const char *entry, const char *symbol,
@@ -167,7 +238,7 @@ void attachCpuAutodiff(VernonRuntimeContext &context, VernonLoadedPipeline &pipe
                        vernon::runtime::Stage backward, std::vector<std::string> gradientPaths) {
     std::shared_ptr<vernon::runtime::ad::Executable> executable;
     ASSERT_TRUE(vernon::runtime::ad::createCpuExecutable(context, forward, backward, gradientPaths, executable))
-        << context.error;
+        << lastError(&context);
     pipeline.autodiff = VernonLoadedAutodiff{std::move(executable)};
 }
 
@@ -243,30 +314,30 @@ TEST(RuntimeAutodiff, ExecutesReusableScalarPullbackFromRegisteredProfiles) {
 
     float x = 3.0f;
     float outputValue = 0.0f;
-    VernonAdValue input{sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), {0, 0, 0, 0}};
-    VernonAdValue output{sizeof(VernonAdValue), {"output", 6},       VERNON_DATA_F32,
-                         &outputValue,          sizeof(outputValue), {0, 0, 0, 0}};
+    VernonAdValue input{sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), 0, nullptr};
+    VernonAdValue output{
+        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &outputValue, sizeof(outputValue), 0, nullptr};
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), &input, 1, {0, 0, 0, 0}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), &output, 1, {0, 0, 0, 0}};
     VernonPullback *pullback = nullptr;
     ASSERT_EQ(vernonAdPipelineForward(&pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
-        << context->error;
+        << lastError(context);
     ASSERT_NE(pullback, nullptr);
     EXPECT_FLOAT_EQ(outputValue, 9.0f);
 
     x = 100.0f;
     float gradientValue = 0.0f;
-    VernonAdValue gradient{sizeof(VernonAdValue), {"x", 1},    VERNON_DATA_F32, &gradientValue,
-                           sizeof(gradientValue), {0, 0, 0, 0}};
+    VernonAdValue gradient{sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &gradientValue,
+                           sizeof(gradientValue), 0,        nullptr};
     VernonAdValueSet gradients{sizeof(VernonAdValueSet), &gradient, 1, {0, 0, 0, 0}};
-    ASSERT_EQ(vernonPullbackApply(pullback, nullptr, &gradients), VERNON_STATUS_OK) << context->error;
+    ASSERT_EQ(vernonPullbackApply(pullback, nullptr, &gradients), VERNON_STATUS_OK) << lastError(context);
     EXPECT_FLOAT_EQ(gradientValue, 6.0f);
 
     float seedValue = 2.0f;
-    VernonAdValue seed{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &seedValue,
-                       sizeof(seedValue),     {0, 0, 0, 0}};
+    VernonAdValue seed{
+        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &seedValue, sizeof(seedValue), 0, nullptr};
     VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seed, 1, {0, 0, 0, 0}};
-    ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << context->error;
+    ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(context);
     EXPECT_FLOAT_EQ(gradientValue, 12.0f);
 
     vernonPullbackDestroy(pullback);
@@ -284,13 +355,16 @@ TEST(RuntimeAutodiff, ExecutesReusableScalarPullbackFromRegisteredProfiles) {
 
     x = 2.0f;
     std::array<float, 24> batchedOutput{};
+    const uint64_t batchedShape[]{4, 3, 2};
     output.data = batchedOutput.data();
     output.size = sizeof(batchedOutput);
+    output.rank = 3;
+    output.shape = batchedShape;
     VernonPullback *batchedPullback = nullptr;
     EXPECT_EQ(vernonAdPipelineForward(&pipeline, {0, 3, 4}, &inputs, &outputs, &batchedPullback),
               VERNON_STATUS_INVALID_ARGUMENT);
     ASSERT_EQ(vernonAdPipelineForward(&pipeline, {2, 3, 4}, &inputs, &outputs, &batchedPullback), VERNON_STATUS_OK)
-        << context->error;
+        << lastError(context);
     for (float value : batchedOutput)
         EXPECT_FLOAT_EQ(value, 4.0f);
     std::array<float, 24> batchedSeed{};
@@ -298,8 +372,10 @@ TEST(RuntimeAutodiff, ExecutesReusableScalarPullbackFromRegisteredProfiles) {
         batchedSeed[index] = static_cast<float>(index + 1);
     seed.data = batchedSeed.data();
     seed.size = sizeof(batchedSeed);
+    seed.rank = 3;
+    seed.shape = batchedShape;
     gradientValue = 0.0f;
-    ASSERT_EQ(vernonPullbackApply(batchedPullback, &seeds, &gradients), VERNON_STATUS_OK) << context->error;
+    ASSERT_EQ(vernonPullbackApply(batchedPullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(context);
     EXPECT_FLOAT_EQ(gradientValue, 1200.0f);
     vernonPullbackDestroy(batchedPullback);
 
@@ -347,29 +423,110 @@ TEST(RuntimeAutodiff, ExecutesContiguousTensorValuePullback) {
 
     float values[]{2.0f, 3.0f};
     float outputsBuffer[2]{};
-    VernonAdValue input{sizeof(VernonAdValue), {"values", 6}, VERNON_DATA_F32, values, sizeof(values), {}};
-    VernonAdValue output{sizeof(VernonAdValue), {"output", 6},         VERNON_DATA_F32,
-                         outputsBuffer,         sizeof(outputsBuffer), {}};
+    const uint64_t tensorShape[]{2};
+    VernonAdValue input{sizeof(VernonAdValue), {"values", 6}, VERNON_DATA_F32, values, sizeof(values), 1, tensorShape};
+    VernonAdValue output{
+        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, outputsBuffer, sizeof(outputsBuffer), 1, tensorShape};
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), &input, 1, {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), &output, 1, {}};
     VernonPullback *pullback = nullptr;
+    const uint64_t wrongShape[]{1, 2};
+    output.rank = 2;
+    output.shape = wrongShape;
+    EXPECT_EQ(vernonAdPipelineForward(&pipeline, {1, 1, 1}, &inputs, &outputs, &pullback),
+              VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(pullback, nullptr);
+    output.rank = 1;
+    output.shape = tensorShape;
     ASSERT_EQ(vernonAdPipelineForward(&pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
-        << context->error;
+        << lastError(context);
     EXPECT_FLOAT_EQ(outputsBuffer[0], 4.0f);
     EXPECT_FLOAT_EQ(outputsBuffer[1], 9.0f);
 
     float gradientsBuffer[2]{};
-    VernonAdValue gradient{sizeof(VernonAdValue), {"values", 6},           VERNON_DATA_F32,
-                           gradientsBuffer,       sizeof(gradientsBuffer), {}};
+    VernonAdValue gradient{sizeof(VernonAdValue),
+                           {"values", 6},
+                           VERNON_DATA_F32,
+                           gradientsBuffer,
+                           sizeof(gradientsBuffer),
+                           1,
+                           tensorShape};
     VernonAdValueSet gradients{sizeof(VernonAdValueSet), &gradient, 1, {}};
     EXPECT_EQ(vernonPullbackApply(pullback, nullptr, &gradients), VERNON_STATUS_INVALID_ARGUMENT);
 
     float seedBuffer[]{1.0f, 2.0f};
-    VernonAdValue seed{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seedBuffer, sizeof(seedBuffer), {}};
+    VernonAdValue seed{
+        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seedBuffer, sizeof(seedBuffer), 1, tensorShape};
     VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seed, 1, {}};
-    ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << context->error;
+    ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(context);
     EXPECT_FLOAT_EQ(gradientsBuffer[0], 4.0f);
     EXPECT_FLOAT_EQ(gradientsBuffer[1], 12.0f);
+
+    vernonPullbackDestroy(pullback);
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+    std::filesystem::remove_all(root);
+}
+
+TEST(RuntimeAutodiff, ExecutesFlattenedAggregateInputLeaves) {
+    static constexpr char forwardSymbol[] = "__vernon_cpu_test_aggregate_forward";
+    static constexpr char backwardSymbol[] = "__vernon_cpu_test_aggregate_backward";
+    ASSERT_EQ(vernonRuntimeRegisterStaticCpuEntry({forwardSymbol, sizeof(forwardSymbol) - 1}, aggregateForward),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeRegisterStaticCpuEntry({backwardSymbol, sizeof(backwardSymbol) - 1}, aggregateBackward),
+              VERNON_STATUS_OK);
+
+    const std::filesystem::path root = std::filesystem::temp_directory_path() / "vernon_runtime_autodiff_aggregate";
+    std::filesystem::create_directories(root);
+    {
+        std::ofstream output(root / "fixture.o", std::ios::binary);
+        output.write("registered object fixture", 25);
+    }
+    nlohmann::json pairX = leaf(0);
+    pairX["path"] = nlohmann::json::array({"x"});
+    nlohmann::json pairY = leaf(4);
+    pairY["path"] = nlohmann::json::array({"y"});
+    const nlohmann::json forwardReflection =
+        profileReflection("forward", 12, 12,
+                          nlohmann::json::array({argument("pair", 0, nlohmann::json::array({pairX, pairY}), 8),
+                                                 argument("scale", 8, nlohmann::json::array({leaf(0)}))}),
+                          nlohmann::json::array({leaf(0), leaf(4), leaf(8)}));
+    const nlohmann::json backwardReflection =
+        profileReflection("backward", 12, 4,
+                          nlohmann::json::array({argument("tape", 0, nlohmann::json::array({leaf(0), leaf(4)}), 8),
+                                                 argument("output", 8, nlohmann::json::array({leaf(0)}))}),
+                          nlohmann::json::array({leaf(0)}));
+
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    VernonLoadedPipeline pipeline;
+    pipeline.context = context;
+    attachCpuAutodiff(*context, pipeline, stage(artifact(root, "forward", forwardSymbol, forwardReflection)),
+                      stage(artifact(root, "backward", backwardSymbol, backwardReflection)), {"scale"});
+
+    float pairXValue = 2.0f;
+    float pairYValue = 3.0f;
+    float scale = 4.0f;
+    VernonAdValue inputsBuffer[]{
+        {sizeof(VernonAdValue), {"pair.x", 6}, VERNON_DATA_F32, &pairXValue, sizeof(pairXValue), 0, nullptr},
+        {sizeof(VernonAdValue), {"pair.y", 6}, VERNON_DATA_F32, &pairYValue, sizeof(pairYValue), 0, nullptr},
+        {sizeof(VernonAdValue), {"scale", 5}, VERNON_DATA_F32, &scale, sizeof(scale), 0, nullptr},
+    };
+    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputsBuffer, std::size(inputsBuffer), {}};
+    float outputValue = 0.0f;
+    VernonAdValue output{
+        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &outputValue, sizeof(outputValue), 0, nullptr};
+    VernonAdValueSet outputs{sizeof(VernonAdValueSet), &output, 1, {}};
+    VernonPullback *pullback = nullptr;
+    ASSERT_EQ(vernonAdPipelineForward(&pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
+        << lastError(context);
+    EXPECT_FLOAT_EQ(outputValue, 24.0f);
+
+    float gradientValue = 0.0f;
+    VernonAdValue gradient{
+        sizeof(VernonAdValue), {"scale", 5}, VERNON_DATA_F32, &gradientValue, sizeof(gradientValue), 0, nullptr};
+    VernonAdValueSet gradients{sizeof(VernonAdValueSet), &gradient, 1, {}};
+    ASSERT_EQ(vernonPullbackApply(pullback, nullptr, &gradients), VERNON_STATUS_OK) << lastError(context);
+    EXPECT_FLOAT_EQ(gradientValue, 6.0f);
 
     vernonPullbackDestroy(pullback);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
@@ -434,16 +591,19 @@ TEST(RuntimeAutodiff, OneElementTensorStillRequiresExplicitCotangent) {
                       stage(artifact(root, "backward", backwardSymbol, backwardReflection)), {"x"});
     float x = 3.0f;
     float outputValue = 0.0f;
-    VernonAdValue input{sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), {}};
-    VernonAdValue output{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &outputValue, sizeof(outputValue), {}};
+    const uint64_t tensorShape[]{1};
+    VernonAdValue input{sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), 1, tensorShape};
+    VernonAdValue output{
+        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &outputValue, sizeof(outputValue), 1, tensorShape};
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), &input, 1, {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), &output, 1, {}};
     VernonPullback *pullback = nullptr;
     ASSERT_EQ(vernonAdPipelineForward(&pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
-        << context->error;
+        << lastError(context);
 
     float gradientValue = 0.0f;
-    VernonAdValue gradient{sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &gradientValue, sizeof(gradientValue), {}};
+    VernonAdValue gradient{sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &gradientValue,
+                           sizeof(gradientValue), 1,        tensorShape};
     VernonAdValueSet gradients{sizeof(VernonAdValueSet), &gradient, 1, {}};
     EXPECT_EQ(vernonPullbackApply(pullback, nullptr, &gradients), VERNON_STATUS_INVALID_ARGUMENT);
 
@@ -452,7 +612,7 @@ TEST(RuntimeAutodiff, OneElementTensorStillRequiresExplicitCotangent) {
     std::filesystem::remove_all(root);
 }
 
-TEST(RuntimeAutodiff, RejectsImplicitCotangentForF16WithoutWritingPastItsSlot) {
+TEST(RuntimeAutodiff, PromotesF16ImplicitCotangentAndGradientToF32) {
     static constexpr char forwardSymbol[] = "__vernon_cpu_test_half_identity_forward";
     static constexpr char backwardSymbol[] = "__vernon_cpu_test_half_identity_backward";
     ASSERT_EQ(vernonRuntimeRegisterStaticCpuEntry({forwardSymbol, sizeof(forwardSymbol) - 1}, halfIdentityForward),
@@ -469,11 +629,11 @@ TEST(RuntimeAutodiff, RejectsImplicitCotangentForF16WithoutWritingPastItsSlot) {
     const nlohmann::json forwardReflection = profileReflection(
         "forward", 2, 4, nlohmann::json::array({argument("x", 0, nlohmann::json::array({leaf(0, 1, "f16")}), 2, 2)}),
         nlohmann::json::array({leaf(0, 1, "f16"), leaf(2, 1, "f16")}), 2);
-    const nlohmann::json backwardReflection = profileReflection(
-        "backward", 4, 2,
-        nlohmann::json::array({argument("tape", 0, nlohmann::json::array({leaf(0, 1, "f16")}), 2, 2),
-                               argument("output", 2, nlohmann::json::array({leaf(0, 1, "f16")}), 2, 2)}),
-        nlohmann::json::array({leaf(0, 1, "f16")}), 2);
+    const nlohmann::json backwardReflection =
+        profileReflection("backward", 8, 4,
+                          nlohmann::json::array({argument("tape", 0, nlohmann::json::array({leaf(0, 1, "f16")}), 2, 2),
+                                                 argument("output", 4, nlohmann::json::array({leaf(0, 1, "f32")}))}),
+                          nlohmann::json::array({leaf(0, 1, "f32")}));
 
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
@@ -489,13 +649,13 @@ TEST(RuntimeAutodiff, RejectsImplicitCotangentForF16WithoutWritingPastItsSlot) {
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), &output, 1, {}};
     VernonPullback *pullback = nullptr;
     ASSERT_EQ(vernonAdPipelineForward(&pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
-        << context->error;
+        << lastError(context);
 
-    uint16_t guardedGradient[2]{0, 0x55aa};
-    VernonAdValue gradient{sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F16, guardedGradient, sizeof(uint16_t), {}};
+    float gradientValue = 0.0f;
+    VernonAdValue gradient{sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &gradientValue, sizeof(gradientValue), {}};
     VernonAdValueSet gradients{sizeof(VernonAdValueSet), &gradient, 1, {}};
-    EXPECT_EQ(vernonPullbackApply(pullback, nullptr, &gradients), VERNON_STATUS_INVALID_ARGUMENT);
-    EXPECT_EQ(guardedGradient[1], 0x55aa);
+    EXPECT_EQ(vernonPullbackApply(pullback, nullptr, &gradients), VERNON_STATUS_OK) << lastError(context);
+    EXPECT_FLOAT_EQ(gradientValue, 1.0f);
 
     vernonPullbackDestroy(pullback);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);

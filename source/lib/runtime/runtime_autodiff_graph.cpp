@@ -136,7 +136,7 @@ public:
           forwardStats(this->forwardGraph->lastStats()) {}
 
     VernonStatus apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients) {
-        clearInvocationDiagnostic(*context);
+        RuntimeDiagnosticScope diagnostic(context);
         std::lock_guard<std::mutex> lock(mutex);
         execution::DeviceExecutionSession session(nodes[outputNode].executable->device());
         if (!ad::validSet(&gradients, true))
@@ -160,11 +160,8 @@ public:
         }
 
         ValueAbi sinkCotangent = nodes[outputNode].executable->signature().cotangent;
-        size_t invocationCount = 0;
-        if (!ad::carrierCount(computeGrid, invocationCount) ||
-            (invocationCount && sinkCotangent.byteSize > SIZE_MAX / invocationCount))
+        if (!ad::materializeCarrierValue(sinkCotangent, computeGrid))
             return fail(context, "graph pullback launch size overflows", VERNON_STATUS_INVALID_ARGUMENT);
-        sinkCotangent.byteSize *= invocationCount;
         std::vector<uint8_t> cotangentBytes;
         if (!ad::makeCotangentBytes(cotangents, sinkCotangent, cotangentBytes, invocationDiagnostic(*context)))
             return VERNON_STATUS_INVALID_ARGUMENT;
@@ -217,9 +214,8 @@ public:
                         auto [entry, inserted] = nodeCotangents.emplace(upstream, GraphBuffer{});
                         if (inserted) {
                             ValueAbi carrier = upstreamCotangent;
-                            if (invocationCount && carrier.byteSize > SIZE_MAX / invocationCount)
+                            if (!ad::materializeCarrierValue(carrier, computeGrid))
                                 return fail(context, "upstream graph cotangent size overflows");
-                            carrier.byteSize *= invocationCount;
                             if (createGraphBuffer(*backwardGraph, carrier, entry->second) != VERNON_RHI_STATUS_OK)
                                 return fail(context, "failed to allocate an upstream graph cotangent",
                                             VERNON_STATUS_INTERNAL_ERROR);
@@ -324,7 +320,7 @@ public:
 
     VernonStatus forward(VernonLaunchSize computeGrid, VernonAdValueSet &inputs, VernonAdValueSet &outputs,
                          std::unique_ptr<AutodiffGraphPullback> &pullback) const {
-        clearInvocationDiagnostic(*context);
+        RuntimeDiagnosticScope diagnostic(context);
         if (!ad::validLaunchSize(computeGrid))
             return fail(context, "compiled autodiff graph requires a positive compute grid");
         execution::DeviceExecutionSession session(nodes[outputNode].executable->device());
@@ -419,11 +415,8 @@ public:
 
         AutodiffGraphPullback::Impl::Node &sink = invocationNodes[outputNode];
         ValueAbi outputSpec = sink.executable->signature().output;
-        size_t invocationCount = 0;
-        if (!ad::carrierCount(computeGrid, invocationCount) ||
-            (invocationCount && outputSpec.byteSize > SIZE_MAX / invocationCount))
+        if (!ad::materializeCarrierValue(outputSpec, computeGrid))
             return fail(context, "compiled autodiff output size overflows");
-        outputSpec.byteSize *= invocationCount;
         VernonAdValue *output = ad::findValue(outputs, outputSpec.path);
         const auto outputBuffer = sink.forwardBuffers.find(outputSpec.path);
         if (!output || !ad::valueMatches(*output, outputSpec) || outputBuffer == sink.forwardBuffers.end())
@@ -541,10 +534,12 @@ VernonStatus AutodiffGraphPullback::apply(const VernonAdValueSet *cotangents, Ve
 }
 
 VernonRhiCommandEncoderStats AutodiffGraphPullback::forwardStats() const {
+    RuntimeDiagnosticScope diagnostic(impl_ ? impl_->context : nullptr);
     return impl_ ? impl_->getForwardStats() : VernonRhiCommandEncoderStats{};
 }
 
 VernonRhiCommandEncoderStats AutodiffGraphPullback::lastBackwardStats() const {
+    RuntimeDiagnosticScope diagnostic(impl_ ? impl_->context : nullptr);
     return impl_ ? impl_->getLastBackwardStats() : VernonRhiCommandEncoderStats{};
 }
 
@@ -554,6 +549,7 @@ AutodiffGraph::AutodiffGraph(AutodiffGraph &&) noexcept = default;
 AutodiffGraph &AutodiffGraph::operator=(AutodiffGraph &&) noexcept = default;
 
 VernonStatus AutodiffGraph::addNode(std::string name, VernonLoadedPipeline *pipeline, AutodiffGraphNode &node) {
+    RuntimeDiagnosticScope diagnostic(impl_ ? impl_->context : nullptr);
     node = {};
     if (!impl_ || !impl_->context || !pipeline || pipeline->context != impl_->context || !pipeline->autodiff ||
         name.empty())
@@ -572,6 +568,7 @@ VernonStatus AutodiffGraph::addNode(std::string name, VernonLoadedPipeline *pipe
 
 VernonStatus AutodiffGraph::declareInput(AutodiffGraphNode node, std::string inputPath, std::string valuePath,
                                          std::string gradientPath) {
+    RuntimeDiagnosticScope diagnostic(impl_ ? impl_->context : nullptr);
     if (!impl_ || !impl_->valid(node) || inputPath.empty() || valuePath.empty())
         return fail(impl_ ? impl_->context : nullptr, "invalid autodiff graph input declaration");
     Impl::Node &target = impl_->nodes[node.index];
@@ -592,6 +589,7 @@ VernonStatus AutodiffGraph::declareInput(AutodiffGraphNode node, std::string inp
 
 VernonStatus AutodiffGraph::connect(AutodiffGraphNode source, AutodiffGraphNode destination,
                                     std::string destinationInputPath) {
+    RuntimeDiagnosticScope diagnostic(impl_ ? impl_->context : nullptr);
     if (!impl_ || !impl_->valid(source) || !impl_->valid(destination) || source.index == destination.index ||
         destinationInputPath.empty())
         return fail(impl_ ? impl_->context : nullptr, "invalid autodiff graph connection");
@@ -606,6 +604,7 @@ VernonStatus AutodiffGraph::connect(AutodiffGraphNode source, AutodiffGraphNode 
 }
 
 VernonStatus AutodiffGraph::setOutput(AutodiffGraphNode node) {
+    RuntimeDiagnosticScope diagnostic(impl_ ? impl_->context : nullptr);
     if (!impl_ || !impl_->valid(node))
         return fail(impl_ ? impl_->context : nullptr, "invalid autodiff graph output node");
     impl_->outputNode = node.index;
@@ -613,6 +612,7 @@ VernonStatus AutodiffGraph::setOutput(AutodiffGraphNode node) {
 }
 
 VernonStatus AutodiffGraph::compile(std::unique_ptr<CompiledAutodiffGraph> &compiled) {
+    RuntimeDiagnosticScope diagnostic(impl_ ? impl_->context : nullptr);
     compiled.reset();
     if (!impl_ || !impl_->context || impl_->nodes.empty() || !impl_->outputNode)
         return fail(impl_ ? impl_->context : nullptr, "invalid autodiff graph compilation");

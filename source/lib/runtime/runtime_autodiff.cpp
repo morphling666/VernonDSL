@@ -40,6 +40,16 @@ bool carrierCount(VernonLaunchSize grid, size_t &count) {
     return true;
 }
 
+bool materializeCarrierValue(ValueAbi &abi, VernonLaunchSize grid) {
+    size_t count = 0;
+    if (!carrierCount(grid, count) || (count && abi.byteSize > SIZE_MAX / count))
+        return false;
+    abi.byteSize *= count;
+    if (count > 1)
+        abi.logicalShape.insert(abi.logicalShape.begin(), {grid.z, grid.y, grid.x});
+    return true;
+}
+
 bool resourceByteSize(const ResourceAbi &abi, VernonLaunchSize grid, size_t &size) {
     size = abi.value.byteSize;
     if (!abi.runtimeCarrier)
@@ -125,7 +135,22 @@ const VernonAdValue *findValue(const VernonAdValueSet &set, const std::string &p
 }
 
 bool valueMatches(const VernonAdValue &value, const ValueAbi &abi) {
-    return value.dtype == abi.dtype && value.data && value.size == abi.byteSize;
+    if (value.dtype != abi.dtype || !value.data || value.size != abi.byteSize ||
+        value.rank != abi.logicalShape.size() || (value.rank && !value.shape))
+        return false;
+    return value.rank == 0 || std::equal(abi.logicalShape.begin(), abi.logicalShape.end(), value.shape);
+}
+
+bool derivativeAbiMatches(const ValueAbi &primal, const ValueAbi &derivative) {
+    if (primal.dtype != VERNON_DATA_F16 && primal.dtype != VERNON_DATA_F32 && primal.dtype != VERNON_DATA_F64)
+        return false;
+    const VernonDataType expected = primal.dtype == VERNON_DATA_F64 ? VERNON_DATA_F64 : VERNON_DATA_F32;
+    if (derivative.dtype != expected || derivative.logicalShape != primal.logicalShape)
+        return false;
+    const size_t primalScalarSize = dtypeSize(primal.dtype);
+    const size_t derivativeScalarSize = dtypeSize(derivative.dtype);
+    return primalScalarSize && derivativeScalarSize && primal.byteSize % primalScalarSize == 0 &&
+           derivative.byteSize == primal.byteSize / primalScalarSize * derivativeScalarSize;
 }
 
 bool makeCotangentBytes(const VernonAdValueSet *cotangents, const ValueAbi &abi, std::vector<uint8_t> &bytes,
@@ -238,6 +263,7 @@ extern "C" {
 
 VernonStatus vernonRuntimeLoadedPipelineGetAdOutputDataType(const VernonLoadedPipeline *pipeline,
                                                             VernonDataType *dtype) {
+    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
     const auto *executable = autodiffExecutable(pipeline);
     if (!executable || !dtype)
         return fail(pipeline ? pipeline->context : nullptr, "pipeline has no autodiff output");
@@ -246,6 +272,7 @@ VernonStatus vernonRuntimeLoadedPipelineGetAdOutputDataType(const VernonLoadedPi
 }
 
 VernonStatus vernonRuntimeLoadedPipelineGetAdOutputRank(const VernonLoadedPipeline *pipeline, size_t *rank) {
+    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
     const auto *executable = autodiffExecutable(pipeline);
     if (!executable || !rank)
         return fail(pipeline ? pipeline->context : nullptr, "invalid autodiff output rank query");
@@ -255,6 +282,7 @@ VernonStatus vernonRuntimeLoadedPipelineGetAdOutputRank(const VernonLoadedPipeli
 
 VernonStatus vernonRuntimeLoadedPipelineGetAdOutputDimension(const VernonLoadedPipeline *pipeline, size_t index,
                                                              uint64_t *extent) {
+    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
     const auto *executable = autodiffExecutable(pipeline);
     if (!executable || !extent)
         return fail(pipeline ? pipeline->context : nullptr, "invalid autodiff output dimension query");
@@ -266,12 +294,14 @@ VernonStatus vernonRuntimeLoadedPipelineGetAdOutputDimension(const VernonLoadedP
 }
 
 size_t vernonRuntimeLoadedPipelineGetAdGradientCount(const VernonLoadedPipeline *pipeline) {
+    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
     const auto *executable = autodiffExecutable(pipeline);
     return executable ? executable->signature().gradients.size() : 0;
 }
 
 VernonStatus vernonRuntimeLoadedPipelineGetAdGradient(const VernonLoadedPipeline *pipeline, size_t index,
                                                       VernonStringView *path, VernonDataType *dtype) {
+    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
     const auto *executable = autodiffExecutable(pipeline);
     if (!executable || !path || !dtype || index >= executable->signature().gradients.size())
         return fail(pipeline ? pipeline->context : nullptr, "invalid autodiff gradient query");
@@ -285,8 +315,7 @@ VernonStatus vernonAdPipelineForward(VernonLoadedPipeline *pipeline, VernonLaunc
                                      const VernonAdValueSet *inputs, VernonAdValueSet *outputs,
                                      VernonPullback **pullback) {
     using namespace vernon::runtime::ad;
-    if (pipeline && pipeline->context)
-        vernon::runtime::clearInvocationDiagnostic(*pipeline->context);
+    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
     if (pullback)
         *pullback = nullptr;
     auto *executable = pipeline && pipeline->autodiff ? pipeline->autodiff->executable.get() : nullptr;
@@ -313,14 +342,18 @@ VernonStatus vernonAdPipelineForward(VernonLoadedPipeline *pipeline, VernonLaunc
 VernonStatus vernonPullbackApply(VernonPullback *pullback, const VernonAdValueSet *cotangents,
                                  VernonAdValueSet *gradients) {
     using namespace vernon::runtime::ad;
-    if (pullback && pullback->contextLease)
-        vernon::runtime::clearInvocationDiagnostic(pullback->contextLease->get());
+    vernon::runtime::RuntimeDiagnosticScope diagnostic(
+        pullback && pullback->contextLease ? &pullback->contextLease->get() : nullptr);
     if (!pullback || !pullback->execution || !validSet(cotangents, false) || !validSet(gradients, true))
         return fail(pullback && pullback->contextLease ? &pullback->contextLease->get() : nullptr,
                     "invalid pullback invocation");
     return pullback->execution->apply(cotangents, *gradients);
 }
 
-void vernonPullbackDestroy(VernonPullback *pullback) { delete pullback; }
+void vernonPullbackDestroy(VernonPullback *pullback) {
+    vernon::runtime::RuntimeDiagnosticScope diagnostic(
+        pullback && pullback->contextLease ? &pullback->contextLease->get() : nullptr);
+    delete pullback;
+}
 
 } // extern "C"

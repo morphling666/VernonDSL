@@ -539,13 +539,15 @@ TEST(RuntimeDirectX12Pipeline, ExecutesReusableCookedGpuPullbackAfterPipelineDes
     float selector = -1.0f;
     int32_t count = 2;
     std::array<float, 2> output{};
+    const uint64_t tensorShape[]{2};
     VernonAdValue inputValues[]{
-        {sizeof(VernonAdValue), {"value", 5}, VERNON_DATA_F32, value.data(), sizeof(value), {}},
+        {sizeof(VernonAdValue), {"value", 5}, VERNON_DATA_F32, value.data(), sizeof(value), 1, tensorShape},
         {sizeof(VernonAdValue), {"factor", 6}, VERNON_DATA_F32, &factor, sizeof(factor), {}},
         {sizeof(VernonAdValue), {"selector", 8}, VERNON_DATA_F32, &selector, sizeof(selector), {}},
         {sizeof(VernonAdValue), {"count", 5}, VERNON_DATA_I32, &count, sizeof(count), {}},
     };
-    VernonAdValue outputValue{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, output.data(), sizeof(output), {}};
+    VernonAdValue outputValue{
+        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, output.data(), sizeof(output), 1, tensorShape};
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), &outputValue, 1, {}};
     VernonPullback *pullback = nullptr;
@@ -558,11 +560,18 @@ TEST(RuntimeDirectX12Pipeline, ExecutesReusableCookedGpuPullbackAfterPipelineDes
     std::array<float, 2> valueGradient{};
     float factorGradient = 1.0f;
     float selectorGradient = 1.0f;
-    VernonAdValue seedValue{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seed.data(), sizeof(seed), {}};
+    VernonAdValue seedValue{
+        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seed.data(), sizeof(seed), 1, tensorShape};
     VernonAdValue gradientValues[]{
         {sizeof(VernonAdValue), {"factor", 6}, VERNON_DATA_F32, &factorGradient, sizeof(factorGradient), {}},
         {sizeof(VernonAdValue), {"selector", 8}, VERNON_DATA_F32, &selectorGradient, sizeof(selectorGradient), {}},
-        {sizeof(VernonAdValue), {"value", 5}, VERNON_DATA_F32, valueGradient.data(), sizeof(valueGradient), {}},
+        {sizeof(VernonAdValue),
+         {"value", 5},
+         VERNON_DATA_F32,
+         valueGradient.data(),
+         sizeof(valueGradient),
+         1,
+         tensorShape},
     };
     VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seedValue, 1, {}};
     VernonAdValueSet gradients{sizeof(VernonAdValueSet), gradientValues, std::size(gradientValues), {}};

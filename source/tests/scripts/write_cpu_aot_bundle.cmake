@@ -57,14 +57,16 @@ file(
           \"element_layout\": {\"logical_type\":\"f32\",\"byte_size\":4,\"alignment\":4,
             \"layout_hash\":\"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b\",
             \"leaves\":[{\"path\":[],\"dtype\":\"f32\",\"byte_offset\":0,\"scalar_count\":1}]},
-          \"physical_layouts\":{\"host_value\":{\"profile\":\"host_value\",\"size\":8,\"alignment\":8,
-            \"byte_strides\":[],\"offset\":0}}
+          \"physical_layouts\":{\"host_value\":{\"profile\":\"host_value\",\"kind\":\"resource_binding\",
+            \"resource_kind\":\"tensor_view_descriptor\",\"size\":8,\"alignment\":8,\"frame_offset\":0}}
         },
         {
           \"kind\": \"builtin\",
           \"builtin\": \"global_invocation_id\",
-          \"physical_layouts\":{\"host_value\":{\"profile\":\"host_value\",\"size\":12,\"alignment\":4,
-            \"byte_strides\":[],\"offset\":8}}
+          \"physical_layouts\":{\"host_value\":{\"profile\":\"host_value\",\"kind\":\"cpu_call\",\"frame_offset\":8,
+            \"root\":{\"kind\":\"array\",\"offset\":0,\"size\":12,\"alignment\":4,\"shape\":[3],
+            \"byte_strides\":[4],\"children\":[{\"kind\":\"scalar\",\"representation\":\"i32\",
+            \"offset\":0,\"size\":4,\"alignment\":4}]}}}
         }
       ]
     }]
@@ -87,10 +89,13 @@ set(PIPELINE_CANONICAL
 \"layout_hash\":\"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b\",\
 \"leaves\":[{\"byte_offset\":0,\"dtype\":\"f32\",\"path\":[],\"scalar_count\":1}],\
 \"logical_type\":\"f32\"},\"kind\":\"tensor\",\"physical_layouts\":{\"host_value\":{\
-\"alignment\":8,\"byte_strides\":[],\"offset\":0,\"profile\":\"host_value\",\"size\":8}}},\
+\"alignment\":8,\"frame_offset\":0,\"kind\":\"resource_binding\",\"profile\":\"host_value\",\
+\"resource_kind\":\"tensor_view_descriptor\",\"size\":8}}},\
 {\"builtin\":\"global_invocation_id\",\"kind\":\"builtin\",\
-\"physical_layouts\":{\"host_value\":{\"alignment\":4,\"byte_strides\":[],\"offset\":8,\
-\"profile\":\"host_value\",\"size\":12}}}],\
+\"physical_layouts\":{\"host_value\":{\"frame_offset\":8,\"kind\":\"cpu_call\",\"profile\":\"host_value\",\
+\"root\":{\"alignment\":4,\"byte_strides\":[4],\"children\":[{\"alignment\":4,\"kind\":\"scalar\",\
+\"offset\":0,\"representation\":\"i32\",\"size\":4}],\"kind\":\"array\",\"offset\":0,\"shape\":[3],\
+\"size\":12}}}}],\
 \"name\":\"fill\",\"physical_layouts\":{\"host_value\":{\"packed_arguments_size\":20,\
 \"profile\":\"host_value\"}},\"workgroup_size\":[2,2,1]}],\
 \"pipeline_version\":${VERNON_PIPELINE_VERSION}},\"stage\":\"compute\",\"symbol\":\"vernon_test_fill\",\

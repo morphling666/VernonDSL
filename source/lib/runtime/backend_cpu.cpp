@@ -344,7 +344,7 @@ bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState ker
         binding.element_size =
             static_cast<uint32_t>(argument.kind == "tensor" ? argument.tensorElementSize : argument.physical.size);
         if (!binding.element_size) {
-            context.error = "CPU compute reflection contains a zero-sized argument";
+            invocationDiagnostic(context) = "CPU compute reflection contains a zero-sized argument";
             return false;
         }
         state.layout.push_back(binding);
@@ -375,8 +375,8 @@ bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState ker
     if (status == VERNON_STATUS_OK)
         return true;
     const VernonStringView providerError = cpuProviderLastError(context);
-    context.error = providerError.data ? std::string(providerError.data, providerError.size)
-                                       : "failed to prepare CPU provider pipeline";
+    invocationDiagnostic(context) = providerError.data ? std::string(providerError.data, providerError.size)
+                                                       : "failed to prepare CPU provider pipeline";
     return false;
 }
 

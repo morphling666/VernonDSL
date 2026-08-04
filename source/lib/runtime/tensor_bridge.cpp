@@ -33,6 +33,54 @@ bool tensorRelativeBounds(const VernonTensorView &tensor, size_t &before, size_t
     return true;
 }
 
+struct TransportScalar {
+    size_t offset{};
+    size_t size{};
+    std::string representation;
+};
+
+bool collectTransportScalars(const TransportNode &node, size_t base, std::vector<TransportScalar> &scalars) {
+    if (node.offset > std::numeric_limits<size_t>::max() - base)
+        return false;
+    const size_t offset = base + static_cast<size_t>(node.offset);
+    if (node.kind == TransportNodeKind::Scalar) {
+        if (node.size > std::numeric_limits<size_t>::max())
+            return false;
+        scalars.push_back({offset, static_cast<size_t>(node.size), node.representation});
+        return true;
+    }
+    if (node.kind == TransportNodeKind::Array) {
+        if (node.children.size() != 1 || node.shape.size() != node.byteStrides.size())
+            return false;
+        size_t count = 1;
+        for (uint64_t extent : node.shape) {
+            if (!extent || extent > std::numeric_limits<size_t>::max() / count)
+                return false;
+            count *= static_cast<size_t>(extent);
+        }
+        for (size_t linear = 0; linear < count; ++linear) {
+            size_t remainder = linear;
+            size_t elementOffset = 0;
+            for (size_t dimension = node.shape.size(); dimension-- > 0;) {
+                const size_t extent = static_cast<size_t>(node.shape[dimension]);
+                const size_t index = remainder % extent;
+                remainder /= extent;
+                if (index && node.byteStrides[dimension] > (std::numeric_limits<size_t>::max() - elementOffset) / index)
+                    return false;
+                elementOffset += index * static_cast<size_t>(node.byteStrides[dimension]);
+            }
+            if (elementOffset > std::numeric_limits<size_t>::max() - offset ||
+                !collectTransportScalars(node.children.front(), offset + elementOffset, scalars))
+                return false;
+        }
+        return true;
+    }
+    for (const TransportNode &child : node.children)
+        if (!collectTransportScalars(child, offset, scalars))
+            return false;
+    return true;
+}
+
 } // namespace
 
 size_t dataTypeSize(VernonDataType dtype) {
@@ -51,6 +99,30 @@ size_t dataTypeSize(VernonDataType dtype) {
     }
     return 0;
 }
+
+namespace {
+
+const char *dataTypeRepresentation(VernonDataType dtype) {
+    switch (dtype) {
+    case VERNON_DATA_BOOL:
+        return "bool";
+    case VERNON_DATA_U8:
+        return "u8";
+    case VERNON_DATA_F16:
+        return "f16";
+    case VERNON_DATA_I32:
+        return "i32";
+    case VERNON_DATA_U32:
+        return "u32";
+    case VERNON_DATA_F32:
+        return "f32";
+    case VERNON_DATA_F64:
+        return "f64";
+    }
+    return "";
+}
+
+} // namespace
 
 bool valueLayoutValid(const VernonValueLayoutView &layout) {
     if (layout.struct_size < sizeof(VernonValueLayoutView) || !layout.byte_size || !layout.alignment ||
@@ -159,11 +231,66 @@ bool isRowMajorContiguous(const VernonTensorView &tensor) {
     return true;
 }
 
-std::optional<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, const TensorPackingLayout &layout) {
+std::optional<TensorCopyPlan> compileTensorCopyPlan(const VernonValueLayoutView &canonical,
+                                                    const TransportNode &transport, std::vector<uint64_t> shape) {
+    if (!valueLayoutValid(canonical) || transport.size > std::numeric_limits<size_t>::max() ||
+        transport.byteStrides.size() != shape.size())
+        return std::nullopt;
+    const TransportNode *element = &transport;
+    if (transport.kind == TransportNodeKind::Array) {
+        if (transport.children.size() != 1)
+            return std::nullopt;
+        element = &transport.children.front();
+    }
+    std::vector<TransportScalar> physicalScalars;
+    if (!collectTransportScalars(*element, 0, physicalScalars))
+        return std::nullopt;
+
+    TensorCopyPlan plan;
+    plan.elementSize = canonical.byte_size;
+    plan.shape = std::move(shape);
+    plan.byteSize = static_cast<size_t>(transport.size);
+    for (uint64_t stride : transport.byteStrides) {
+        if (stride > std::numeric_limits<size_t>::max())
+            return std::nullopt;
+        plan.byteStrides.push_back(static_cast<size_t>(stride));
+    }
+    size_t scalarIndex = 0;
+    for (size_t leafIndex = 0; leafIndex < canonical.leaf_count; ++leafIndex) {
+        const VernonValueLeafView &leaf = canonical.leaves[leafIndex];
+        const size_t scalarSize = dataTypeSize(static_cast<VernonDataType>(leaf.dtype));
+        if (!scalarSize || leaf.scalar_count > std::numeric_limits<size_t>::max() / scalarSize ||
+            scalarIndex > physicalScalars.size() || leaf.scalar_count > physicalScalars.size() - scalarIndex)
+            return std::nullopt;
+        for (size_t lane = 0; lane < leaf.scalar_count; ++lane) {
+            const TransportScalar &physical = physicalScalars[scalarIndex++];
+            const bool compatibleRepresentation =
+                physical.representation == dataTypeRepresentation(static_cast<VernonDataType>(leaf.dtype)) ||
+                (leaf.dtype == VERNON_DATA_U32 &&
+                 (physical.representation == "i32" || physical.representation == "u32"));
+            if (physical.size != scalarSize || !compatibleRepresentation)
+                return std::nullopt;
+            CopyOperation operation{leaf.byte_offset + lane * scalarSize, physical.offset, scalarSize};
+            if (!plan.operations.empty()) {
+                CopyOperation &previous = plan.operations.back();
+                if (previous.sourceOffset + previous.size == operation.sourceOffset &&
+                    previous.destinationOffset + previous.size == operation.destinationOffset) {
+                    previous.size += operation.size;
+                    continue;
+                }
+            }
+            plan.operations.push_back(operation);
+        }
+    }
+    if (scalarIndex != physicalScalars.size())
+        return std::nullopt;
+    return plan;
+}
+
+std::optional<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, const TensorCopyPlan &layout) {
     if (tensor.storage != VERNON_TENSOR_HOST || !valueLayoutValid(tensor.element_layout) ||
         tensor.element_layout.byte_size != layout.elementSize || tensor.rank != layout.shape.size() ||
-        layout.byteStrides.size() != layout.shape.size() || (tensor.rank && !tensor.shape) ||
-        (!layout.elementLeafOffsets.empty() && layout.elementLeafOffsets.size() != tensor.element_layout.leaf_count))
+        layout.byteStrides.size() != layout.shape.size() || (tensor.rank && !tensor.shape) || layout.operations.empty())
         return std::nullopt;
     const size_t elementSize = tensor.element_layout.byte_size;
     if (!elementSize || !tensorFitsAllocation(tensor))
@@ -207,21 +334,13 @@ std::optional<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, c
             destinationOffset += index * layout.byteStrides[dimension];
         }
         const uint8_t *sourceElement = source + positiveOffset - negativeOffset;
-        if (layout.elementLeafOffsets.empty()) {
-            std::memcpy(packed.data() + destinationOffset, sourceElement, elementSize);
-            continue;
-        }
-        for (size_t leafIndex = 0; leafIndex < tensor.element_layout.leaf_count; ++leafIndex) {
-            const VernonValueLeafView &leaf = tensor.element_layout.leaves[leafIndex];
-            const size_t scalarSize = dataTypeSize(static_cast<VernonDataType>(leaf.dtype));
-            if (!scalarSize || leaf.scalar_count > std::numeric_limits<size_t>::max() / scalarSize)
+        for (const CopyOperation &operation : layout.operations) {
+            if (destinationOffset > packed.size() || operation.destinationOffset > packed.size() - destinationOffset ||
+                operation.size > packed.size() - destinationOffset - operation.destinationOffset ||
+                operation.sourceOffset > elementSize || operation.size > elementSize - operation.sourceOffset)
                 return std::nullopt;
-            const size_t leafSize = leaf.scalar_count * scalarSize;
-            const size_t physicalOffset = layout.elementLeafOffsets[leafIndex];
-            if (destinationOffset > packed.size() || physicalOffset > packed.size() - destinationOffset ||
-                leafSize > packed.size() - destinationOffset - physicalOffset)
-                return std::nullopt;
-            std::memcpy(packed.data() + destinationOffset + physicalOffset, sourceElement + leaf.byte_offset, leafSize);
+            std::memcpy(packed.data() + destinationOffset + operation.destinationOffset,
+                        sourceElement + operation.sourceOffset, operation.size);
         }
     }
     return packed;
@@ -232,7 +351,7 @@ std::optional<std::vector<uint8_t>> packTensorRowMajor(const VernonTensorView &t
     const std::optional<size_t> packedSize = tensorLogicalByteSize(tensor);
     if (!elementSize || !packedSize || (tensor.rank && !tensor.shape))
         return std::nullopt;
-    TensorPackingLayout layout;
+    TensorCopyPlan layout;
     layout.elementSize = elementSize;
     if (tensor.rank)
         layout.shape.assign(tensor.shape, tensor.shape + tensor.rank);
@@ -245,6 +364,7 @@ std::optional<std::vector<uint8_t>> packTensorRowMajor(const VernonTensorView &t
         stride *= static_cast<size_t>(layout.shape[dimension]);
     }
     layout.byteSize = *packedSize;
+    layout.operations.push_back({0, 0, elementSize});
     return packTensor(tensor, layout);
 }
 

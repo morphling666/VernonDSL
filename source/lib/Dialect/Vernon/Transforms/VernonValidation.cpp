@@ -125,11 +125,8 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
 
             auto validateInterface = [&](DictionaryAttr dictionary, Type type, unsigned index, bool isResult) {
                 Type abiType = type;
-                StringRef abiPrefix = "vernon.abi_";
-                if (auto view = dyn_cast<TensorViewType>(type)) {
+                if (auto view = dyn_cast<TensorViewType>(type))
                     abiType = view.getElementType();
-                    abiPrefix = "vernon.element_abi_";
-                }
                 const bool abiBearing = abiType.isIntOrFloat() ||
                                         isa<TensorType, RankedTensorType, VectorType, StructType, TupleType>(abiType);
                 if (abiBearing && failed(verifyValueAbiType(abiType, getOperation()))) {
@@ -137,65 +134,21 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
                                          << " has no finite canonical Value ABI layout";
                     invalid = true;
                 }
-                std::string sizeName = (abiPrefix + "size").str();
-                if (dictionary && dictionary.get(sizeName)) {
-                    auto dtypes = dictionary.getAs<ArrayAttr>((abiPrefix + "leaf_dtypes").str());
-                    SmallVector<StringRef> logicalDtypes;
-                    if (dtypes)
-                        for (Attribute dtype : dtypes) {
-                            auto value = dyn_cast<StringAttr>(dtype);
-                            logicalDtypes.push_back(value ? value.getValue() : StringRef());
-                        }
-                    FailureOr<ValueAbiLayout> layout = getValueAbiLayout(abiType, getOperation(), logicalDtypes);
-                    auto reportAbiError = [&](StringRef detail) {
-                        function.emitError() << (isResult ? "result #" : "argument #") << index
-                                             << " has invalid canonical Value ABI metadata: " << detail;
-                        invalid = true;
+                if (dictionary) {
+                    constexpr StringLiteral retiredSuffixes[] = {
+                        "size",           "alignment",    "layout_hash", "field_offsets",
+                        "element_stride", "leaf_offsets", "leaf_counts", "leaf_paths",
                     };
-                    if (failed(layout)) {
-                        reportAbiError("type has no finite layout");
-                    } else {
-                        auto integerMatches = [&](StringRef suffix, uint64_t expected) {
-                            auto value = dictionary.getAs<IntegerAttr>((abiPrefix + suffix).str());
-                            return value && value.getValue().isNonNegative() &&
-                                   value.getValue().getZExtValue() == expected;
-                        };
-                        auto hash = dictionary.getAs<StringAttr>((abiPrefix + "layout_hash").str());
-                        if (!integerMatches("size", layout->size) || !integerMatches("alignment", layout->alignment))
-                            reportAbiError("size or alignment does not match the canonical layout");
-                        else if (!hash || hash.getValue() != layout->layoutHash)
-                            reportAbiError("layout hash does not match the canonical layout");
-
-                        auto offsets = dictionary.getAs<DenseI64ArrayAttr>((abiPrefix + "leaf_offsets").str());
-                        auto counts = dictionary.getAs<DenseI64ArrayAttr>((abiPrefix + "leaf_counts").str());
-                        auto paths = dictionary.getAs<ArrayAttr>((abiPrefix + "leaf_paths").str());
-                        if (!offsets || !counts || !dtypes || !paths || offsets.size() != layout->leaves.size() ||
-                            counts.size() != layout->leaves.size() || dtypes.size() != layout->leaves.size() ||
-                            paths.size() != layout->leaves.size()) {
-                            reportAbiError("leaf arrays do not match the canonical leaf count");
-                        } else {
-                            for (auto [leafIndex, leaf] : llvm::enumerate(layout->leaves)) {
-                                std::string path;
-                                llvm::raw_string_ostream pathStream(path);
-                                for (auto [componentIndex, component] : llvm::enumerate(leaf.path)) {
-                                    if (componentIndex != 0)
-                                        pathStream << '/';
-                                    if (component.field)
-                                        pathStream << *component.field;
-                                    else
-                                        pathStream << '[' << component.index << ']';
-                                }
-                                pathStream.flush();
-                                auto dtypeAttr = dyn_cast<StringAttr>(dtypes[leafIndex]);
-                                auto pathAttr = dyn_cast<StringAttr>(paths[leafIndex]);
-                                if (static_cast<uint64_t>(offsets[leafIndex]) != leaf.byteOffset ||
-                                    static_cast<uint64_t>(counts[leafIndex]) != leaf.scalarCount || !dtypeAttr ||
-                                    dtypeAttr.getValue() != leaf.dtype || !pathAttr || pathAttr.getValue() != path) {
-                                    reportAbiError("leaf contract does not match the canonical layout");
-                                    break;
-                                }
-                            }
-                        }
+                    constexpr StringLiteral abiPrefixes[] = {"vernon.abi_", "vernon.element_abi_"};
+                    if (llvm::any_of(abiPrefixes, [&](StringLiteral prefix) {
+                            return llvm::any_of(retiredSuffixes, [&](StringLiteral suffix) {
+                                return dictionary.get((prefix + suffix).str()) != nullptr;
+                            });
+                        })) {
+                        function.emitError()
+                            << (isResult ? "result #" : "argument #") << index
+                            << " uses retired duplicated Value ABI metadata; only logical leaf dtypes may be supplied";
+                        invalid = true;
                     }
                 }
 

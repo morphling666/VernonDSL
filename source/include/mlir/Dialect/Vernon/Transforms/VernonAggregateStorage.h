@@ -14,6 +14,12 @@ enum class AggregateStorageBackend {
     WorkgroupTensorView,
 };
 
+FailureOr<Value> buildAggregateValueFromScalars(Type type, ValueRange scalars, ModuleOp module, OpBuilder &builder,
+                                                Location location);
+
+FailureOr<SmallVector<Value>> decomposeAggregateValueToScalars(Type type, Value value, ModuleOp module,
+                                                               OpBuilder &builder, Location location);
+
 void populateCpuAggregateTensorViewPatterns(TypeConverter &converter, RewritePatternSet &patterns, ModuleOp module);
 
 LogicalResult lowerGpuAggregateWorkgroupStorage(gpu::GPUFuncOp kernel, ModuleOp module);

@@ -1050,6 +1050,8 @@ const char *numpyDtypeName(VernonDataType dtype) {
         return "int32";
     if (dtype == VERNON_DATA_U32)
         return "uint32";
+    if (dtype == VERNON_DATA_F16)
+        return "float16";
     if (dtype == VERNON_DATA_F32)
         return "float32";
     if (dtype == VERNON_DATA_F64)
@@ -1060,6 +1062,8 @@ const char *numpyDtypeName(VernonDataType dtype) {
 size_t autodiffDtypeSize(VernonDataType dtype) {
     if (dtype == VERNON_DATA_BOOL || dtype == VERNON_DATA_U8)
         return 1;
+    if (dtype == VERNON_DATA_F16)
+        return 2;
     if (dtype == VERNON_DATA_I32 || dtype == VERNON_DATA_U32 || dtype == VERNON_DATA_F32)
         return 4;
     if (dtype == VERNON_DATA_F64)
@@ -1067,22 +1071,30 @@ size_t autodiffDtypeSize(VernonDataType dtype) {
     throw std::invalid_argument("Python autodiff Value dtype is unsupported");
 }
 
+VernonDataType autodiffTangentDtype(VernonDataType primal) {
+    return primal == VERNON_DATA_F16 ? VERNON_DATA_F32 : primal;
+}
+
 struct PythonAdValue {
     std::string path;
     nb::object array;
+    std::vector<uint64_t> shape;
     VernonAdValue value{};
 
     PythonAdValue(std::string path, VernonDataType dtype, std::vector<uint64_t> shape, const nb::object &source)
-        : path(std::move(path)), array(nb::module_::import_("numpy").attr("array")(
-                                     source, nb::module_::import_("numpy").attr(numpyDtypeName(dtype)))) {
-        if (nb::cast<std::vector<uint64_t>>(array.attr("shape")) != shape)
+        : path(std::move(path)), array(nb::module_::import_("numpy").attr("asarray")(
+                                     source, nb::module_::import_("numpy").attr(numpyDtypeName(dtype)))),
+          shape(std::move(shape)) {
+        if (nb::cast<std::vector<uint64_t>>(array.attr("shape")) != this->shape)
             throw std::invalid_argument("Python autodiff Value shape does not match reflection");
         size_t scalarCount = 1;
-        for (uint64_t extent : shape) {
+        for (uint64_t extent : this->shape) {
             if (!extent || extent > std::numeric_limits<size_t>::max() / scalarCount)
                 throw std::invalid_argument("Python autodiff Value shape overflows");
             scalarCount *= static_cast<size_t>(extent);
         }
+        if (this->shape.size() > std::numeric_limits<uint32_t>::max())
+            throw std::invalid_argument("Python autodiff Value rank overflows");
         if (!nb::cast<bool>(array.attr("flags").attr("c_contiguous")))
             throw std::invalid_argument("Python autodiff Values require contiguous storage");
         value.struct_size = sizeof(value);
@@ -1090,11 +1102,15 @@ struct PythonAdValue {
         value.dtype = dtype;
         value.data = reinterpret_cast<void *>(nb::cast<uintptr_t>(array.attr("ctypes").attr("data")));
         value.size = scalarCount * autodiffDtypeSize(dtype);
+        value.rank = static_cast<uint32_t>(this->shape.size());
+        value.shape = this->shape.empty() ? nullptr : this->shape.data();
     }
 
     PythonAdValue(PythonAdValue &&other) noexcept
-        : path(std::move(other.path)), array(std::move(other.array)), value(other.value) {
+        : path(std::move(other.path)), array(std::move(other.array)), shape(std::move(other.shape)),
+          value(other.value) {
         value.path = {path.data(), path.size()};
+        value.shape = shape.empty() ? nullptr : shape.data();
     }
     PythonAdValue(const PythonAdValue &) = delete;
     PythonAdValue &operator=(const PythonAdValue &) = delete;
@@ -1105,6 +1121,44 @@ struct PythonAdMetadata {
     VernonDataType dtype{};
     std::vector<uint64_t> shape;
 };
+
+PythonAdMetadata adInputLeafMetadata(VernonLoadedPipeline *pipeline, const PipelineParameterMetadata &parameter,
+                                     size_t leafIndex) {
+    VernonPipelineValueLeafView leaf{};
+    leaf.struct_size = sizeof(leaf);
+    const VernonStringView parameterName{parameter.name.data(), parameter.name.size()};
+    if (vernonRuntimeLoadedPipelineGetParameterValueLeaf(pipeline, parameterName, leafIndex, &leaf) != VERNON_STATUS_OK)
+        throw std::runtime_error("cannot read autodiff input leaf metadata");
+    PythonAdMetadata result{parameter.name, static_cast<VernonDataType>(leaf.value.dtype), {}};
+    for (size_t index = 0; index < leaf.path_count; ++index) {
+        const VernonValuePathComponentView &component = leaf.path[index];
+        result.path += ".";
+        if (component.kind == VERNON_VALUE_PATH_FIELD)
+            result.path += stringView(component.field);
+        else if (component.kind == VERNON_VALUE_PATH_INDEX)
+            result.path += std::to_string(component.index);
+        else
+            throw std::runtime_error("autodiff input leaf has an invalid path");
+    }
+    if (leaf.static_rank)
+        result.shape.assign(leaf.static_shape, leaf.static_shape + leaf.static_rank);
+    else if (leaf.path_count == 0)
+        result.shape = parameter.shape;
+    return result;
+}
+
+bool findAdInputLeafMetadata(VernonLoadedPipeline *pipeline, const std::vector<PipelineParameterMetadata> &parameters,
+                             const std::string &path, PythonAdMetadata &result) {
+    for (const PipelineParameterMetadata &parameter : parameters)
+        for (size_t leafIndex = 0; leafIndex < parameter.elementLeaves.size(); ++leafIndex) {
+            PythonAdMetadata candidate = adInputLeafMetadata(pipeline, parameter, leafIndex);
+            if (candidate.path == path) {
+                result = std::move(candidate);
+                return true;
+            }
+        }
+    return false;
+}
 
 struct PythonPullback {
     PythonPullback(VernonRuntimeContext *runtime, VernonPullback *handle, std::vector<PythonAdMetadata> gradients,
@@ -1172,19 +1226,23 @@ struct LoadedPipeline {
         if (!gridX || !gridY || !gridZ)
             throw std::invalid_argument("autodiff grid dimensions must be positive");
         const std::vector<PipelineParameterMetadata> metadata = parameters();
-        if (bindings.size() != metadata.size())
+        size_t inputLeafCount = 0;
+        for (const PipelineParameterMetadata &parameter : metadata)
+            inputLeafCount += parameter.elementLeaves.size();
+        if (bindings.size() != inputLeafCount)
             throw std::invalid_argument("autodiff bindings do not match pipeline parameters");
         std::deque<PythonAdValue> inputValues;
         std::vector<VernonAdValue> inputViews;
         for (const PipelineParameterMetadata &parameter : metadata) {
-            if (parameter.elementLeaves.size() != 1)
-                throw std::invalid_argument("Python Runtime vjp requires one contiguous Value leaf per parameter");
-            nb::str key(parameter.name.c_str());
-            if (!bindings.contains(key))
-                throw std::invalid_argument("missing autodiff binding '" + parameter.name + "'");
-            const auto dtype = static_cast<VernonDataType>(parameter.elementLeaves.front().dtype);
-            inputValues.emplace_back(parameter.name, dtype, parameter.shape, nb::borrow<nb::object>(bindings[key]));
-            inputViews.push_back(inputValues.back().value);
+            for (size_t leafIndex = 0; leafIndex < parameter.elementLeaves.size(); ++leafIndex) {
+                PythonAdMetadata leaf = adInputLeafMetadata(pipeline, parameter, leafIndex);
+                nb::str key(leaf.path.c_str());
+                if (!bindings.contains(key))
+                    throw std::invalid_argument("missing autodiff binding '" + leaf.path + "'");
+                inputValues.emplace_back(leaf.path, leaf.dtype, std::move(leaf.shape),
+                                         nb::borrow<nb::object>(bindings[key]));
+                inputViews.push_back(inputValues.back().value);
+            }
         }
         VernonAdValueSet inputSet{sizeof(VernonAdValueSet), inputViews.data(), inputViews.size(), {}};
 
@@ -1231,18 +1289,22 @@ struct LoadedPipeline {
                 throw std::runtime_error("cannot read autodiff gradient reflection");
             }
             const std::string name = stringView(path);
-            const auto parameter =
-                std::find_if(metadata.begin(), metadata.end(),
-                             [&](const PipelineParameterMetadata &candidate) { return candidate.name == name; });
-            if (parameter == metadata.end()) {
+            PythonAdMetadata inputLeaf;
+            if (!findAdInputLeafMetadata(pipeline, metadata, name, inputLeaf)) {
                 vernonPullbackDestroy(pullback);
-                throw std::runtime_error("initial native Tensor gradients require whole-parameter wrt paths");
+                throw std::runtime_error("autodiff gradient path does not match an input Value leaf");
             }
-            gradients.push_back({name, dtype, parameter->shape});
+            if (autodiffTangentDtype(inputLeaf.dtype) != dtype) {
+                vernonPullbackDestroy(pullback);
+                throw std::runtime_error("autodiff gradient dtype does not match its input Value leaf tangent type");
+            }
+            inputLeaf.dtype = dtype;
+            gradients.push_back(std::move(inputLeaf));
         }
         return nb::make_tuple(output.array,
-                              std::make_unique<PythonPullback>(runtime, pullback, std::move(gradients), outputType,
-                                                               std::move(outputShape), std::move(pipelineOwner)));
+                              std::make_unique<PythonPullback>(runtime, pullback, std::move(gradients),
+                                                               autodiffTangentDtype(outputType), std::move(outputShape),
+                                                               std::move(pipelineOwner)));
     }
 
     static size_t dataTypeSize(VernonDataType type) {

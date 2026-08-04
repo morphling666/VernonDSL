@@ -57,12 +57,12 @@ bool initializeBackendForRhiDevice(VernonRuntimeContext &context, VernonRhiDevic
         backend = VERNON_RHI_BACKEND_OPENGL_ES;
         break;
     case VERNON_RUNTIME_CPU:
-        context.error = "CPU Runtime does not use a Vernon RHI device";
+        invocationDiagnostic(context) = "CPU Runtime does not use a Vernon RHI device";
         return false;
     }
     VernonRuntimeRhiAdapter *adapter = vernonRuntimeRhiAdapterCreateForDevice(device, backend);
     if (!adapter) {
-        context.error = "cannot create Runtime adapter for Vernon RHI device";
+        invocationDiagnostic(context) = "cannot create Runtime adapter for Vernon RHI device";
         return false;
     }
     switch (context.backend) {
@@ -139,7 +139,7 @@ bool initializeBackendForRhiDevice(VernonRuntimeContext &context, VernonRhiDevic
     }
     default:
         vernonRuntimeRhiAdapterDestroy(adapter);
-        context.error = "Runtime backend is unavailable for Vernon RHI device";
+        invocationDiagnostic(context) = "Runtime backend is unavailable for Vernon RHI device";
         return false;
     }
     context.borrowedRhiDevice = true;
@@ -269,7 +269,7 @@ bool probeBackend(VernonRuntimeBackend backend, std::string &diagnostic) {
 bool initializeBackend(VernonRuntimeContext &context, uint32_t deviceIndex) {
     if (context.backend == VERNON_RUNTIME_CPU)
         return initializeCpuContext(context, deviceIndex);
-    context.error = "GPU Runtime contexts require a Vernon RHI device";
+    invocationDiagnostic(context) = "GPU Runtime contexts require a Vernon RHI device";
     return false;
 }
 
@@ -322,23 +322,24 @@ bool validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeReq
                                    ? capabilities.supports_graphics
                                    : false;
         if (!supported) {
-            context.error = "pipeline requires unsupported runtime feature '" + feature + "'";
+            invocationDiagnostic(context) = "pipeline requires unsupported runtime feature '" + feature + "'";
             return false;
         }
     }
     if (context.backend == VERNON_RUNTIME_CPU)
-        return validateCpuRuntimeRequirements(requirements.targetTriple, requirements.objectFormat, context.error);
+        return validateCpuRuntimeRequirements(requirements.targetTriple, requirements.objectFormat,
+                                              invocationDiagnostic(context));
     if (isOpenGLBackend(context.backend)) {
         const VernonOpenGLContextCallbacks &actual = openGLState(context).device.callbacks;
         const RuntimeVersion actualApi{actual.api_version_major, actual.api_version_minor};
         const bool apiSatisfied = runtimeVersionAtLeast(actualApi, requirements.apiVersion);
         const uint32_t actualGlsl = glslVersionForApi(actualApi);
         if (!apiSatisfied || actualGlsl < requirements.glslVersion) {
-            context.error = "pipeline requires API " + std::to_string(requirements.apiVersion.major) + "." +
-                            std::to_string(requirements.apiVersion.minor) + " / GLSL " +
-                            std::to_string(requirements.glslVersion) + ", context provides " +
-                            std::to_string(actual.api_version_major) + "." + std::to_string(actual.api_version_minor) +
-                            " / GLSL " + std::to_string(actualGlsl);
+            invocationDiagnostic(context) =
+                "pipeline requires API " + std::to_string(requirements.apiVersion.major) + "." +
+                std::to_string(requirements.apiVersion.minor) + " / GLSL " + std::to_string(requirements.glslVersion) +
+                ", context provides " + std::to_string(actual.api_version_major) + "." +
+                std::to_string(actual.api_version_minor) + " / GLSL " + std::to_string(actualGlsl);
             return false;
         }
         return true;
@@ -349,9 +350,10 @@ bool validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeReq
         const uint32_t actualMajor = VK_VERSION_MAJOR(actual.apiVersion);
         const uint32_t actualMinor = VK_VERSION_MINOR(actual.apiVersion);
         if (!runtimeVersionAtLeast({actualMajor, actualMinor}, requirements.apiVersion)) {
-            context.error = "pipeline requires Vulkan " + std::to_string(requirements.apiVersion.major) + "." +
-                            std::to_string(requirements.apiVersion.minor) + ", device provides " +
-                            std::to_string(actualMajor) + "." + std::to_string(actualMinor);
+            invocationDiagnostic(context) = "pipeline requires Vulkan " +
+                                            std::to_string(requirements.apiVersion.major) + "." +
+                                            std::to_string(requirements.apiVersion.minor) + ", device provides " +
+                                            std::to_string(actualMajor) + "." + std::to_string(actualMinor);
             return false;
         }
         RuntimeVersion supportedSpirv{1, 0};
@@ -364,24 +366,27 @@ bool validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeReq
         if (requirements.shaderVersion.major > supportedSpirv.major ||
             (requirements.shaderVersion.major == supportedSpirv.major &&
              requirements.shaderVersion.minor > supportedSpirv.minor)) {
-            context.error = "pipeline requires SPIR-V " + std::to_string(requirements.shaderVersion.major) + "." +
-                            std::to_string(requirements.shaderVersion.minor) + ", device API supports " +
-                            std::to_string(supportedSpirv.major) + "." + std::to_string(supportedSpirv.minor);
+            invocationDiagnostic(context) =
+                "pipeline requires SPIR-V " + std::to_string(requirements.shaderVersion.major) + "." +
+                std::to_string(requirements.shaderVersion.minor) + ", device API supports " +
+                std::to_string(supportedSpirv.major) + "." + std::to_string(supportedSpirv.minor);
             return false;
         }
         uint64_t invocations = 1;
         for (size_t index = 0; index < 3; ++index) {
             if (requirements.computeWorkgroupSize[index] > actual.maxComputeWorkGroupSize[index]) {
-                context.error = "pipeline compute workgroup dimension " + std::to_string(index) + " requires " +
-                                std::to_string(requirements.computeWorkgroupSize[index]) + ", device provides " +
-                                std::to_string(actual.maxComputeWorkGroupSize[index]);
+                invocationDiagnostic(context) =
+                    "pipeline compute workgroup dimension " + std::to_string(index) + " requires " +
+                    std::to_string(requirements.computeWorkgroupSize[index]) + ", device provides " +
+                    std::to_string(actual.maxComputeWorkGroupSize[index]);
                 return false;
             }
             invocations *= requirements.computeWorkgroupSize[index];
         }
         if (invocations > actual.maxComputeWorkGroupInvocations) {
-            context.error = "pipeline compute workgroup requires " + std::to_string(invocations) +
-                            " invocations, device provides " + std::to_string(actual.maxComputeWorkGroupInvocations);
+            invocationDiagnostic(context) = "pipeline compute workgroup requires " + std::to_string(invocations) +
+                                            " invocations, device provides " +
+                                            std::to_string(actual.maxComputeWorkGroupInvocations);
             return false;
         }
         return true;
@@ -394,7 +399,7 @@ bool validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeReq
         const uint32_t requiredFeatureLevel =
             requirements.minimumFeatureLevel.major * 0x1000 + requirements.minimumFeatureLevel.minor * 0x100;
         if (featureLevel < requiredFeatureLevel) {
-            context.error =
+            invocationDiagnostic(context) =
                 "pipeline requires D3D feature level " + std::to_string(requirements.minimumFeatureLevel.major) + "." +
                 std::to_string(requirements.minimumFeatureLevel.minor) + ", device provides " +
                 std::to_string((featureLevel >> 12) & 0xf) + "." + std::to_string((featureLevel >> 8) & 0xf);
@@ -403,28 +408,28 @@ bool validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeReq
         const uint32_t actualShaderModel = static_cast<uint32_t>(actual.shaderModel);
         const uint32_t requiredShaderModel = requirements.shaderVersion.major * 0x10 + requirements.shaderVersion.minor;
         if (actualShaderModel < requiredShaderModel) {
-            context.error = "pipeline requires Shader Model " + std::to_string(requirements.shaderVersion.major) + "." +
-                            std::to_string(requirements.shaderVersion.minor) + ", device provides " +
-                            std::to_string((actualShaderModel >> 4) & 0xf) + "." +
-                            std::to_string(actualShaderModel & 0xf);
+            invocationDiagnostic(context) =
+                "pipeline requires Shader Model " + std::to_string(requirements.shaderVersion.major) + "." +
+                std::to_string(requirements.shaderVersion.minor) + ", device provides " +
+                std::to_string((actualShaderModel >> 4) & 0xf) + "." + std::to_string(actualShaderModel & 0xf);
             return false;
         }
         const uint32_t requiredRootSignature =
             requirements.rootSignatureVersion.major == 1 ? 1 + requirements.rootSignatureVersion.minor : UINT32_MAX;
         if (static_cast<uint32_t>(actual.rootSignatureVersion) < requiredRootSignature) {
-            context.error = "pipeline requires a newer D3D12 root-signature version";
+            invocationDiagnostic(context) = "pipeline requires a newer D3D12 root-signature version";
             return false;
         }
         uint64_t invocations = 1;
         for (size_t index = 0; index < 3; ++index) {
             if (requirements.computeWorkgroupSize[index] > actual.maxComputeWorkGroupSize[index]) {
-                context.error = "pipeline compute workgroup dimension exceeds D3D12 device limits";
+                invocationDiagnostic(context) = "pipeline compute workgroup dimension exceeds D3D12 device limits";
                 return false;
             }
             invocations *= requirements.computeWorkgroupSize[index];
         }
         if (invocations > actual.maxComputeInvocations) {
-            context.error = "pipeline compute workgroup exceeds D3D12 thread-group limit";
+            invocationDiagnostic(context) = "pipeline compute workgroup exceeds D3D12 thread-group limit";
             return false;
         }
         return true;
@@ -438,35 +443,36 @@ bool validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeReq
         constexpr const char *platform = "ios";
 #endif
         if (requirements.applePlatform != platform) {
-            context.error = "pipeline targets Apple platform '" + requirements.applePlatform +
-                            "', but this Runtime targets '" + platform + "'";
+            invocationDiagnostic(context) = "pipeline targets Apple platform '" + requirements.applePlatform +
+                                            "', but this Runtime targets '" + platform + "'";
             return false;
         }
         if (requirements.shaderVersion.major != 2 || requirements.shaderVersion.minor != 4) {
-            context.error = "pipeline requires unsupported MSL " + std::to_string(requirements.shaderVersion.major) +
-                            "." + std::to_string(requirements.shaderVersion.minor) + "; Runtime supports MSL 2.4";
+            invocationDiagnostic(context) =
+                "pipeline requires unsupported MSL " + std::to_string(requirements.shaderVersion.major) + "." +
+                std::to_string(requirements.shaderVersion.minor) + "; Runtime supports MSL 2.4";
             return false;
         }
         const MetalContextState &actual = metalState(context);
         if (!runtimeVersionAtLeast(actual.operatingSystemVersion, requirements.minimumOsVersion)) {
-            context.error = "pipeline requires " + requirements.applePlatform + " " +
-                            std::to_string(requirements.minimumOsVersion.major) + "." +
-                            std::to_string(requirements.minimumOsVersion.minor) + ", host provides " +
-                            std::to_string(actual.operatingSystemVersion.major) + "." +
-                            std::to_string(actual.operatingSystemVersion.minor);
+            invocationDiagnostic(context) = "pipeline requires " + requirements.applePlatform + " " +
+                                            std::to_string(requirements.minimumOsVersion.major) + "." +
+                                            std::to_string(requirements.minimumOsVersion.minor) + ", host provides " +
+                                            std::to_string(actual.operatingSystemVersion.major) + "." +
+                                            std::to_string(actual.operatingSystemVersion.minor);
             return false;
         }
         uint64_t invocations = 1;
         for (size_t index = 0; index < 3; ++index) {
             if (requirements.computeWorkgroupSize[index] > actual.maxComputeWorkGroupSize[index]) {
-                context.error =
+                invocationDiagnostic(context) =
                     "pipeline compute workgroup dimension " + std::to_string(index) + " exceeds Metal device limit";
                 return false;
             }
             invocations *= requirements.computeWorkgroupSize[index];
         }
         if (invocations > actual.maxComputeInvocations) {
-            context.error = "pipeline compute workgroup exceeds Metal threadgroup limit";
+            invocationDiagnostic(context) = "pipeline compute workgroup exceeds Metal threadgroup limit";
             return false;
         }
         return true;
@@ -477,23 +483,24 @@ bool validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeReq
         const CudaContextState &actual = cudaState(context);
         if (!runtimeVersionAtLeast({actual.computeCapabilityMajor, actual.computeCapabilityMinor},
                                    requirements.minimumComputeCapability)) {
-            context.error = "pipeline requires CUDA compute capability " +
-                            std::to_string(requirements.minimumComputeCapability.major) + "." +
-                            std::to_string(requirements.minimumComputeCapability.minor) + ", device provides " +
-                            std::to_string(actual.computeCapabilityMajor) + "." +
-                            std::to_string(actual.computeCapabilityMinor);
+            invocationDiagnostic(context) = "pipeline requires CUDA compute capability " +
+                                            std::to_string(requirements.minimumComputeCapability.major) + "." +
+                                            std::to_string(requirements.minimumComputeCapability.minor) +
+                                            ", device provides " + std::to_string(actual.computeCapabilityMajor) + "." +
+                                            std::to_string(actual.computeCapabilityMinor);
             return false;
         }
         const uint32_t actualAddressSize = static_cast<uint32_t>(sizeof(void *) * 8);
         if (requirements.addressSize != actualAddressSize) {
-            context.error = "pipeline requires PTX address size " + std::to_string(requirements.addressSize) +
-                            ", runtime provides " + std::to_string(actualAddressSize);
+            invocationDiagnostic(context) = "pipeline requires PTX address size " +
+                                            std::to_string(requirements.addressSize) + ", runtime provides " +
+                                            std::to_string(actualAddressSize);
             return false;
         }
         return true;
 #endif
     }
-    context.error = "runtime requirements cannot be validated by selected backend";
+    invocationDiagnostic(context) = "runtime requirements cannot be validated by selected backend";
     return false;
 }
 

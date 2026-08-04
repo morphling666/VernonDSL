@@ -71,8 +71,9 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
 
     size_t loweredArgumentCount = 1;
     for (const CpuAbiArgumentPacking &argument : metadata.sourceArguments) {
-        loweredArgumentCount +=
-            argument.kind == CpuAbiArgumentKind::TensorView ? 5 * argument.tensorLeafElementSizes.size() : 1;
+        loweredArgumentCount += argument.kind == CpuAbiArgumentKind::TensorView
+                                    ? 5 * argument.tensorLeafElementSizes.size()
+                                    : argument.callLanes.size();
         if (argument.kind == CpuAbiArgumentKind::TensorView)
             loweredArgumentCount += 1 + 2 * argument.tensorRank;
     }
@@ -151,14 +152,17 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
         llvm::Value *address =
             builder.CreateGEP(llvm::Type::getInt8Ty(context), arguments,
                               llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), packing.offset));
-        if (packing.kind == CpuAbiArgumentKind::Direct) {
-            llvm::Type *argumentType = function->getArg(loweredIndex++)->getType();
-            if (module.getDataLayout().getTypeStoreSize(argumentType) != packing.size)
-                return invalidAbi("CPU ABI packing size does not match lowered direct "
-                                  "argument type");
-            llvm::LoadInst *load = builder.CreateLoad(argumentType, address);
-            load->setAlignment(llvm::Align(1));
-            argumentsToCall.push_back(load);
+        if (packing.kind != CpuAbiArgumentKind::TensorView) {
+            for (const CpuCallLanePacking &lane : packing.callLanes) {
+                llvm::Type *argumentType = function->getArg(loweredIndex++)->getType();
+                if (module.getDataLayout().getTypeStoreSize(argumentType) != lane.size)
+                    return invalidAbi("CPU ABI scalar argument lane size does not match its lowered type");
+                llvm::Value *laneAddress =
+                    builder.CreateGEP(builder.getInt8Ty(), address, builder.getInt64(lane.offset));
+                llvm::LoadInst *load = builder.CreateLoad(argumentType, laneAddress);
+                load->setAlignment(llvm::Align(1));
+                argumentsToCall.push_back(load);
+            }
             continue;
         }
 
@@ -206,9 +210,26 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
     }
     argumentsToCall.push_back(textures);
     llvm::CallInst *call = builder.CreateCall(function, argumentsToCall);
-    if (!function->getReturnType()->isVoidTy()) {
-        llvm::StoreInst *store = builder.CreateStore(call, results);
-        store->setAlignment(llvm::Align(1));
+    if (!metadata.resultCallLanes.empty()) {
+        llvm::SmallVector<llvm::Value *> lanes;
+        if (metadata.resultCallLanes.size() == 1) {
+            lanes.push_back(call);
+        } else {
+            auto *resultType = llvm::dyn_cast<llvm::StructType>(call->getType());
+            if (!resultType || resultType->getNumElements() != metadata.resultCallLanes.size())
+                return invalidAbi("CPU ABI scalar result lane count does not match its lowered type");
+            for (unsigned index = 0; index < resultType->getNumElements(); ++index)
+                lanes.push_back(builder.CreateExtractValue(call, index));
+        }
+        for (auto [lane, packing] : llvm::zip_equal(lanes, metadata.resultCallLanes)) {
+            if (module.getDataLayout().getTypeStoreSize(lane->getType()) != packing.size)
+                return invalidAbi("CPU ABI scalar result lane size does not match its lowered type");
+            llvm::Value *target = builder.CreateGEP(builder.getInt8Ty(), results, builder.getInt64(packing.offset));
+            llvm::StoreInst *store = builder.CreateStore(lane, target);
+            store->setAlignment(llvm::Align(1));
+        }
+    } else if (!function->getReturnType()->isVoidTy()) {
+        return invalidAbi("lowered CPU entry unexpectedly returns a value without result lanes");
     }
     builder.CreateRet(llvm::ConstantInt::get(llvm::Type::getInt32Ty(context), 0));
 

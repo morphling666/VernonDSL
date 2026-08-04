@@ -90,37 +90,39 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
     }]
   })";
     const std::string ptxHash = vernon::runtime::sha256Hex(ptx, sizeof(ptx) - 1);
-    std::string bundle = "{" VERNON_PIPELINE_JSON_FIELD R"(,)"
-                         R"("type":"pipeline","id":"cuda/scale","target":{"kind":"cuda","options":{}},)"
-                         R"("features":[],"runtime_requirements":{"backend":"cuda",)"
-                         R"("features":[],"ptx_version":[8,0],)"
-                         R"("minimum_compute_capability":[8,0],"address_size":64},)"
-                         R"("variants":[{"key":[],"parameters":[)"
-                         R"({"slot":0,"name":"output","kind":"tensor",)"
-                         R"("type":"!vernon.tensor_view<f32, [4], \"write\", \"device\">",)"
-                         R"("address_space":"device","element_layout":)"
-                         R"({"logical_type":"f32","byte_size":4,"alignment":4,)"
-                         R"("layout_hash":"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",)"
-                         R"("leaves":[{"path":[],"dtype":"f32","byte_offset":0,"scalar_count":1}]},)"
-                         R"("shape":[4],"access":"write","uses":[{"stage":"compute",)"
-                         R"("index":0,"dtype":"f32","shape":[4],"interface":"storage"}]},)"
-                         R"({"slot":1,"name":"factor","kind":"tensor","type":"f32","element_layout":)"
-                         R"({"logical_type":"f32","byte_size":4,"alignment":4,)"
-                         R"("layout_hash":"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",)"
-                         R"("leaves":[{"path":[],"dtype":"f32","byte_offset":0,"scalar_count":1}]},)"
-                         R"("shape":[],"access":"read","uses":[{"stage":"compute",)"
-                         R"("index":1,"dtype":"f32","shape":[],"interface":"value",)"
-                         R"("physical_value_layout":{"profile":"cuda_kernel_parameter",)"
-                         R"("transport":"kernel_parameter","size":4,)"
-                         R"("alignment":4,"byte_strides":[]}}]})"
-                         R"(],"outputs":[{"name":"result","kind":"tensor","dtype":"f32",)"
-                         R"("shape":[4],"access":"write","location":0}],)"
-                         R"("program":{"compute":"scale"}}],)"
-                         R"("stage_artifacts":{"scale":{"id":"scale","entry":"scale",)"
-                         R"("stage":"compute","target":"cuda","format":"ptx","artifact":{)"
-                         R"("format":"ptx","storage":"inline","encoding":"utf8","data":)" +
-                         jsonString(ptx) + R"(,"size":)" + std::to_string(sizeof(ptx) - 1) + R"(,"sha256":)" +
-                         jsonString(ptxHash.c_str()) + R"(},"reflection":)" + reflection + "}}}";
+    std::string bundle =
+        "{" VERNON_PIPELINE_JSON_FIELD R"(,)"
+        R"("type":"pipeline","id":"cuda/scale","target":{"kind":"cuda","options":{}},)"
+        R"("features":[],"runtime_requirements":{"backend":"cuda",)"
+        R"("features":[],"ptx_version":[8,0],)"
+        R"("minimum_compute_capability":[8,0],"address_size":64},)"
+        R"("variants":[{"key":[],"parameters":[)"
+        R"({"slot":0,"name":"output","kind":"tensor",)"
+        R"("type":"!vernon.tensor_view<f32, [4], \"write\", \"device\">",)"
+        R"("address_space":"device","element_layout":)"
+        R"({"logical_type":"f32","byte_size":4,"alignment":4,)"
+        R"("layout_hash":"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",)"
+        R"("leaves":[{"path":[],"dtype":"f32","byte_offset":0,"scalar_count":1}]},)"
+        R"("shape":[4],"access":"write","uses":[{"stage":"compute",)"
+        R"("index":0,"dtype":"f32","shape":[4],"interface":"storage"}]},)"
+        R"({"slot":1,"name":"factor","kind":"tensor","type":"f32","value_layout":)"
+        R"({"logical_type":"f32","byte_size":4,"alignment":4,)"
+        R"("layout_hash":"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",)"
+        R"("leaves":[{"path":[],"dtype":"f32","byte_offset":0,"scalar_count":1}]},)"
+        R"("shape":[],"access":"read","uses":[{"stage":"compute",)"
+        R"("index":1,"dtype":"f32","shape":[],"interface":"value",)"
+        R"("interface_plan":{"kind":"kernel_parameter","profile":"cuda_kernel_parameter",)"
+        R"("canonical_layout_hash":"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",)"
+        R"("root":{"kind":"scalar","representation":"f32","offset":0,"size":4,)"
+        R"("alignment":4,"shape":[],"byte_strides":[],"children":[]}}}]})"
+        R"(],"outputs":[{"name":"result","kind":"tensor","dtype":"f32",)"
+        R"("shape":[4],"access":"write","location":0}],)"
+        R"("program":{"compute":"scale"}}],)"
+        R"("stage_artifacts":{"scale":{"id":"scale","entry":"scale",)"
+        R"("stage":"compute","target":"cuda","format":"ptx","artifact":{)"
+        R"("format":"ptx","storage":"inline","encoding":"utf8","data":)" +
+        jsonString(ptx) + R"(,"size":)" + std::to_string(sizeof(ptx) - 1) + R"(,"sha256":)" +
+        jsonString(ptxHash.c_str()) + R"(},"reflection":)" + reflection + "}}}";
     bundle = withContentHash(nlohmann::json::parse(bundle));
 
     VernonRuntimeBackend target = VERNON_RUNTIME_CPU;
@@ -246,13 +248,15 @@ TEST(RuntimeCudaPipeline, ExecutesReusableCookedGpuPullbackAfterPipelineDestruct
     float selector = -1.0f;
     int32_t count = 2;
     std::array<float, 2> output{};
+    const uint64_t tensorShape[]{2};
     VernonAdValue inputValues[]{
-        {sizeof(VernonAdValue), {"value", 5}, VERNON_DATA_F32, value.data(), sizeof(value), {}},
+        {sizeof(VernonAdValue), {"value", 5}, VERNON_DATA_F32, value.data(), sizeof(value), 1, tensorShape},
         {sizeof(VernonAdValue), {"factor", 6}, VERNON_DATA_F32, &factor, sizeof(factor), {}},
         {sizeof(VernonAdValue), {"selector", 8}, VERNON_DATA_F32, &selector, sizeof(selector), {}},
         {sizeof(VernonAdValue), {"count", 5}, VERNON_DATA_I32, &count, sizeof(count), {}},
     };
-    VernonAdValue outputValue{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, output.data(), sizeof(output), {}};
+    VernonAdValue outputValue{
+        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, output.data(), sizeof(output), 1, tensorShape};
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), &outputValue, 1, {}};
     VernonPullback *pullback = nullptr;
@@ -265,11 +269,18 @@ TEST(RuntimeCudaPipeline, ExecutesReusableCookedGpuPullbackAfterPipelineDestruct
     std::array<float, 2> valueGradient{};
     float factorGradient = 1.0f;
     float selectorGradient = 1.0f;
-    VernonAdValue seedValue{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seed.data(), sizeof(seed), {}};
+    VernonAdValue seedValue{
+        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seed.data(), sizeof(seed), 1, tensorShape};
     VernonAdValue gradientValues[]{
         {sizeof(VernonAdValue), {"factor", 6}, VERNON_DATA_F32, &factorGradient, sizeof(factorGradient), {}},
         {sizeof(VernonAdValue), {"selector", 8}, VERNON_DATA_F32, &selectorGradient, sizeof(selectorGradient), {}},
-        {sizeof(VernonAdValue), {"value", 5}, VERNON_DATA_F32, valueGradient.data(), sizeof(valueGradient), {}},
+        {sizeof(VernonAdValue),
+         {"value", 5},
+         VERNON_DATA_F32,
+         valueGradient.data(),
+         sizeof(valueGradient),
+         1,
+         tensorShape},
     };
     VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seedValue, 1, {}};
     VernonAdValueSet gradients{sizeof(VernonAdValueSet), gradientValues, std::size(gradientValues), {}};

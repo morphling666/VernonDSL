@@ -4,6 +4,7 @@
 #include "../rhi/rhi_internal.h"
 #include "VernonRuntimeRHIAdapter.h"
 #include "backend_metal.h"
+#include "pipeline_metadata.h"
 
 #include <nlohmann/json.hpp>
 
@@ -23,7 +24,7 @@ namespace {
 
 VernonStatus fail(VernonRuntimeContext &context, std::string error,
                   VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) {
-    context.error = std::move(error);
+    invocationDiagnostic(context) = std::move(error);
     return status;
 }
 
@@ -160,17 +161,17 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
         const nlohmann::json vertexReflection = nlohmann::json::parse(vertex.reflection, nullptr, false);
         const nlohmann::json fragmentReflection = nlohmann::json::parse(fragment.reflection, nullptr, false);
         if (vertexReflection.is_discarded() || fragmentReflection.is_discarded()) {
-            bundle.context->error = "Metal graphics reflection is invalid";
+            invocationDiagnostic(*bundle.context) = "Metal graphics reflection is invalid";
             return false;
         }
         MetalArgumentBufferUsage argumentBufferUsage;
         if (!collectMetalArgumentBufferUsage(vertexReflection, vertex.entry, "vertex", argumentBufferUsage,
-                                             bundle.context->error) ||
+                                             invocationDiagnostic(*bundle.context)) ||
             !collectMetalArgumentBufferUsage(fragmentReflection, fragment.entry, "fragment", argumentBufferUsage,
-                                             bundle.context->error) ||
+                                             invocationDiagnostic(*bundle.context)) ||
             !validateMetalArgumentBufferUsage(argumentBufferUsage, metalState(*bundle.context).argumentBuffersTier,
                                               metalState(*bundle.context).argumentBufferEncodingSupported,
-                                              bundle.context->error))
+                                              invocationDiagnostic(*bundle.context)))
             return false;
         struct Candidate {
             VernonRuntimeProviderBindingLayoutEntry layout{};
@@ -199,7 +200,8 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
             auto resolveDescriptor = [&](const char *kind) {
                 MetalResourceLocation location;
                 if (!resolveMetalResourceLocation(nativeReflection, nativeStage.entry, use.stage.c_str(), kind,
-                                                  use.descriptorSet, use.binding, location, bundle.context->error))
+                                                  use.descriptorSet, use.binding, location,
+                                                  invocationDiagnostic(*bundle.context)))
                     return false;
                 candidate.layout.set = location.argumentBufferIndex;
                 candidate.layout.binding = location.memberId;
@@ -226,7 +228,7 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                     MetalResourceLocation location;
                     if (!resolveMetalResourceLocation(nativeReflection, nativeStage.entry, use.stage.c_str(), "sampler",
                                                       binding.descriptorSet, binding.binding, location,
-                                                      bundle.context->error))
+                                                      invocationDiagnostic(*bundle.context)))
                         return false;
                     sampler.layout.set = location.argumentBufferIndex;
                     sampler.layout.binding = location.memberId;
@@ -237,9 +239,8 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                 }
                 return true;
             }
-            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.physicalValueLayout &&
-                use.physicalValueLayout->transport == "storage_buffer" && parameter.elementLayout.byteSize &&
-                use.binding != UINT32_MAX) {
+            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.interfacePlan &&
+                use.transport == "storage_buffer" && parameter.elementLayout.byteSize && use.binding != UINT32_MAX) {
                 candidate.layout.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
                 candidate.layout.element_size = parameter.elementLayout.byteSize;
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
@@ -248,7 +249,8 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                 candidate.binding.source = MetalPipelineState::GraphicsBinding::EXTERNAL_STORAGE;
                 if (!resolveDescriptor("storage_buffer"))
                     return false;
-            } else if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.physicalValueLayout) {
+            } else if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.interfacePlan &&
+                       use.interfacePlan->root) {
                 const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
                 const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
                 uint64_t count = 1;
@@ -257,31 +259,26 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                         return false;
                     count *= dimension;
                 }
-                if (!dtype || !use.physicalValueLayout->size || use.physicalValueLayout->size > UINT32_MAX ||
-                    !use.physicalValueLayout->alignment || use.physicalValueLayout->alignment > UINT32_MAX)
+                if (!dtype || !use.interfacePlan->root->size || use.interfacePlan->root->size > UINT32_MAX ||
+                    !use.interfacePlan->root->alignment || use.interfacePlan->root->alignment > UINT32_MAX)
                     return false;
-                candidate.layout.kind = use.physicalValueLayout->transport == "uniform_buffer"
-                                            ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
-                                            : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-                candidate.layout.element_size = static_cast<uint32_t>(use.physicalValueLayout->size);
+                candidate.layout.kind = use.transport == "uniform_buffer" ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
+                                                                          : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                candidate.layout.element_size = static_cast<uint32_t>(use.interfacePlan->root->size);
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
                 candidate.layout.element_count = static_cast<uint32_t>(count);
                 candidate.layout.vector_count = shape.size() == 2 ? static_cast<uint32_t>(shape[0]) : 1;
-                candidate.layout.element_alignment = static_cast<uint32_t>(use.physicalValueLayout->alignment);
+                candidate.layout.element_alignment = static_cast<uint32_t>(use.interfacePlan->root->alignment);
                 candidate.layout.set = use.descriptorSet;
                 candidate.layout.binding = use.binding;
                 candidate.binding.source = internal ? MetalPipelineState::GraphicsBinding::RESOLUTION
                                                     : MetalPipelineState::GraphicsBinding::EXTERNAL_UNIFORM;
-                candidate.binding.packing.elementSize = dataTypeSize(*dtype);
-                candidate.binding.packing.shape = shape;
-                candidate.binding.packing.byteSize = candidate.layout.element_size;
-                for (uint64_t stride : use.physicalValueLayout->byteStrides) {
-                    if (stride > SIZE_MAX)
-                        return false;
-                    candidate.binding.packing.byteStrides.push_back(static_cast<size_t>(stride));
-                }
-                if (candidate.binding.packing.byteStrides.size() != shape.size())
+                const ValueLayout &canonical = parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
+                std::optional<TensorCopyPlan> packing =
+                    compileTensorCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root, shape);
+                if (!packing || packing->elementSize != dataTypeSize(*dtype))
                     return false;
+                candidate.binding.packing = std::move(*packing);
                 candidate.binding.storage.resize(candidate.layout.element_size);
                 if (candidate.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
                     if (!resolveDescriptor("uniform_buffer"))
@@ -290,7 +287,7 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                     MetalResourceLocation location;
                     if (!resolveMetalResourceLocation(nativeReflection, nativeStage.entry, use.stage.c_str(),
                                                       "inline_constant", UINT32_MAX, UINT32_MAX, location,
-                                                      bundle.context->error, &parameter.name))
+                                                      invocationDiagnostic(*bundle.context), &parameter.name))
                         return false;
                     candidate.layout.set = UINT32_MAX;
                     candidate.layout.binding = location.directBufferIndex;
@@ -342,8 +339,9 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                     break;
                 }
         if (!supported) {
-            if (bundle.context->error.empty())
-                bundle.context->error = "Metal RuntimeCore graphics path does not support this parameter layout";
+            if (invocationDiagnostic(*bundle.context).empty())
+                invocationDiagnostic(*bundle.context) =
+                    "Metal RuntimeCore graphics path does not support this parameter layout";
             return false;
         }
         std::sort(candidates.begin(), candidates.end(),
@@ -390,8 +388,9 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
         if (status != VERNON_STATUS_OK) {
             const VernonStringView providerError =
                 vernonRuntimeRhiAdapterGetLastError(metalState(*bundle.context).adapter);
-            bundle.context->error = providerError.data ? std::string(providerError.data, providerError.size)
-                                                       : "failed to prepare Metal provider graphics pipeline";
+            invocationDiagnostic(*bundle.context) = providerError.data
+                                                        ? std::string(providerError.data, providerError.size)
+                                                        : "failed to prepare Metal provider graphics pipeline";
             return false;
         }
         installRuntimeBackendState(pipeline, state.release());
@@ -401,13 +400,14 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
     const nlohmann::json parsed = nlohmann::json::parse(stage.reflection, nullptr, false);
     ReflectedEntry reflection;
     if (parsed.is_discarded() ||
-        !parseReflection(parsed, stage.entry, reflection, VERNON_RUNTIME_METAL, bundle.context->error))
+        !parseReflection(parsed, stage.entry, reflection, VERNON_RUNTIME_METAL, invocationDiagnostic(*bundle.context)))
         return false;
     MetalArgumentBufferUsage argumentBufferUsage;
-    if (!collectMetalArgumentBufferUsage(parsed, stage.entry, "compute", argumentBufferUsage, bundle.context->error) ||
+    if (!collectMetalArgumentBufferUsage(parsed, stage.entry, "compute", argumentBufferUsage,
+                                         invocationDiagnostic(*bundle.context)) ||
         !validateMetalArgumentBufferUsage(argumentBufferUsage, metalState(*bundle.context).argumentBuffersTier,
                                           metalState(*bundle.context).argumentBufferEncodingSupported,
-                                          bundle.context->error))
+                                          invocationDiagnostic(*bundle.context)))
         return false;
 
     struct Candidate {
@@ -432,7 +432,7 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
             if (use.stage != "compute" && use.stage != variant.compute)
                 continue;
             if (use.index >= reflection.arguments.size()) {
-                bundle.context->error = "Metal parameter use exceeds reflected argument table";
+                invocationDiagnostic(*bundle.context) = "Metal parameter use exceeds reflected argument table";
                 return false;
             }
             const ReflectedArgument &argument = reflection.arguments[use.index];
@@ -460,7 +460,7 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                 if (candidate.layout.binding == UINT32_MAX || candidate.layout.element_size == 0 ||
                     !resolveMetalResourceLocation(parsed, stage.entry, "compute", "storage_buffer",
                                                   candidate.layout.set, candidate.layout.binding, location,
-                                                  bundle.context->error))
+                                                  invocationDiagnostic(*bundle.context)))
                     return false;
                 candidate.layout.set = location.argumentBufferIndex;
                 candidate.layout.binding = location.memberId;
@@ -482,7 +482,8 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                     candidate.source = {kind, use.index, dimension};
                     MetalResourceLocation location;
                     if (!resolveMetalResourceLocation(parsed, stage.entry, "compute", "storage_buffer",
-                                                      candidate.layout.set, binding, location, bundle.context->error))
+                                                      candidate.layout.set, binding, location,
+                                                      invocationDiagnostic(*bundle.context)))
                         return false;
                     candidate.layout.set = location.argumentBufferIndex;
                     candidate.layout.binding = location.memberId;
@@ -536,8 +537,9 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                                          &descriptor, &state->rhiComputePipeline);
     if (status != VERNON_STATUS_OK) {
         const VernonStringView providerError = vernonRuntimeRhiAdapterGetLastError(metalState(*bundle.context).adapter);
-        bundle.context->error = providerError.data ? std::string(providerError.data, providerError.size)
-                                                   : "failed to prepare Metal provider compute pipeline";
+        invocationDiagnostic(*bundle.context) = providerError.data
+                                                    ? std::string(providerError.data, providerError.size)
+                                                    : "failed to prepare Metal provider compute pipeline";
         return false;
     }
     installRuntimeBackendState(pipeline, state.release());
@@ -673,7 +675,7 @@ VernonStatus invokeMetalGraphicsPipeline(VernonLoadedPipeline &pipeline, const V
     PlannedGraphicsState graphicsState;
     const bool hasStencil = plan.depthAttachment && plan.depthAttachment->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT;
     if (!planGraphicsState(invocation, formats.size(), plan.depthAttachment != nullptr, hasStencil, graphicsState,
-                           pipeline.context->error))
+                           invocationDiagnostic(*pipeline.context)))
         return VERNON_STATUS_INVALID_ARGUMENT;
     std::vector<uint32_t> vertexStrides;
     for (size_t index = 0; index < state.rhiGraphicsLayout.size(); ++index) {

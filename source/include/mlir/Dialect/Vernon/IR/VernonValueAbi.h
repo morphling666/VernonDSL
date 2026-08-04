@@ -4,9 +4,9 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Types.h"
 #include "mlir/Support/LLVM.h"
-#include "llvm/ADT/SmallVector.h"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -45,6 +45,32 @@ struct ValueAbiLeaf {
     uint64_t scalarCount{};
 };
 
+enum class CanonicalAbiNodeKind {
+    Scalar,
+    Product,
+    Array,
+};
+
+/// A node in the canonical, recursive in-memory Value ABI. Offsets are
+/// relative to the containing node; logical paths live only in the derived
+/// leaf view because an Array child represents every logical element.
+struct CanonicalAbiNode {
+    CanonicalAbiNodeKind kind;
+    Type type;
+    std::string representation;
+    SmallVector<uint64_t> shape;
+    uint64_t size{};
+    uint64_t alignment{};
+    SmallVector<uint64_t> childOffsets;
+    std::optional<uint64_t> elementStride;
+    SmallVector<std::shared_ptr<const CanonicalAbiNode>> children;
+};
+
+struct CanonicalAbiTree {
+    std::shared_ptr<const CanonicalAbiNode> root;
+};
+
+/// A derived flat view of CanonicalAbiTree for scalar-oriented lowering.
 struct ValueAbiLayout {
     uint64_t size{};
     uint64_t alignment{};
@@ -52,7 +78,25 @@ struct ValueAbiLayout {
     std::optional<uint64_t> elementStride;
     SmallVector<ValueAbiLeaf> leaves;
     std::string layoutHash;
+    CanonicalAbiTree tree;
 };
+
+struct CpuCallLane {
+    size_t leafIndex{};
+    uint64_t scalarIndex{};
+};
+
+struct ByteTransportNode;
+
+struct CpuCallPlan {
+    ValueAbiLayout layout;
+    SmallVector<CpuCallLane> lanes;
+    std::shared_ptr<const ByteTransportNode> root;
+};
+
+FailureOr<CpuCallPlan> getCpuCallPlan(Type type, ModuleOp module, ArrayRef<StringRef> logicalLeafDtypes = {});
+
+bool isCpuOpaqueAbiType(Type type);
 
 enum class PhysicalAbiProfile {
     HostValue,
@@ -66,11 +110,27 @@ enum class PhysicalAbiProfile {
     Count,
 };
 
-struct PhysicalValueAbiLayout {
+enum class ByteTransportNodeKind {
+    Scalar,
+    Product,
+    Array,
+};
+
+struct ByteTransportNode {
+    ByteTransportNodeKind kind;
+    std::string representation;
+    uint64_t byteOffset{};
     uint64_t size{};
     uint64_t alignment{};
+    SmallVector<uint64_t> shape;
     SmallVector<uint64_t> byteStrides;
-    SmallVector<uint64_t> elementLeafOffsets;
+    SmallVector<std::shared_ptr<const ByteTransportNode>> children;
+};
+
+struct ByteTransportPlan {
+    PhysicalAbiProfile profile;
+    std::string canonicalLayoutHash;
+    std::shared_ptr<const ByteTransportNode> root;
 };
 
 enum class PhysicalResourceAbiKind {
@@ -82,19 +142,28 @@ enum class PhysicalResourceAbiKind {
     GraphicsSampler,
 };
 
-struct PhysicalResourceAbiLayout {
+struct ResourceBindingPlan {
     PhysicalResourceAbiKind kind;
     uint64_t handleSize{};
     uint64_t handleAlignment{};
-    std::optional<ValueAbiLayout> elementLayout;
 };
 
-struct UnsupportedPhysicalValueAbi {
+struct NativeUniformPlan {
+    std::string canonicalLayoutHash;
+    std::shared_ptr<const ByteTransportNode> root;
+};
+
+struct KernelParameterPlan {
+    std::string canonicalLayoutHash;
+    std::shared_ptr<const ByteTransportNode> root;
+};
+
+struct UnsupportedBackendInterfaceAbi {
     std::string reason;
 };
 
-using PhysicalValueAbiPlan =
-    std::variant<PhysicalValueAbiLayout, PhysicalResourceAbiLayout, UnsupportedPhysicalValueAbi>;
+using BackendInterfaceAbiPlan = std::variant<ByteTransportPlan, NativeUniformPlan, KernelParameterPlan,
+                                             ResourceBindingPlan, UnsupportedBackendInterfaceAbi>;
 
 FailureOr<ValueAbiLayout> getValueAbiLayout(Type type, ModuleOp module, ArrayRef<StringRef> logicalLeafDtypes = {});
 
@@ -103,9 +172,10 @@ FailureOr<ValueAbiLayout> getValueAbiLayout(Type type, ModuleOp module, ArrayRef
 /// verifiers so malformed textual IR cannot bypass frontend validation.
 LogicalResult verifyValueAbiType(Type type, ModuleOp module);
 
-FailureOr<PhysicalValueAbiPlan> getPhysicalValueAbiPlan(Type type, ModuleOp module, PhysicalAbiProfile profile);
+FailureOr<BackendInterfaceAbiPlan> getBackendInterfaceAbiPlan(Type type, ModuleOp module, PhysicalAbiProfile profile,
+                                                              ArrayRef<StringRef> logicalLeafDtypes = {});
 
-FailureOr<PhysicalValueAbiLayout> getPhysicalValueAbiLayout(Type type, ModuleOp module, PhysicalAbiProfile profile);
+FailureOr<ByteTransportPlan> getByteTransportPlan(Type type, ModuleOp module, PhysicalAbiProfile profile);
 
 constexpr uint64_t kPortableWorkgroupStorageLimit = 16 * 1024;
 

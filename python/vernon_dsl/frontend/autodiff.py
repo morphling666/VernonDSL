@@ -9,7 +9,7 @@ from typing import Any, NewType
 
 from ..bundle import canonical_json
 from ..language.ast_utils import dotted_name
-from ..language.scalar_types import SCALAR_TYPES
+from .abi import value_abi_extent
 from .model import ConcreteType, TypedFunctionInstance, TypedStatement
 
 Error = Callable[[ast.AST, str], Exception]
@@ -162,6 +162,37 @@ class ProgramGraphNode:
         if self.source_name is not None:
             result["source_name"] = self.source_name
         return result
+
+
+def storage_parameter_owner(
+    value: NodeId,
+    nodes: Mapping[NodeId, ProgramGraphNode],
+) -> ProgramGraphNode | None:
+    visiting: set[NodeId] = set()
+
+    def resolve(node_id: NodeId) -> ProgramGraphNode | None:
+        if node_id in visiting:
+            return None
+        node = nodes[node_id]
+        if node.operation is OpCode.PARAMETER:
+            return node if node.type.kind == "tensor_view" else None
+        if node.type.kind != "tensor_view" or not node.inputs:
+            return None
+        visiting.add(node_id)
+        if node.operation is OpCode.CONDITIONAL:
+            true_owner = resolve(node.inputs[1])
+            false_owner = resolve(node.inputs[2])
+            owner = (
+                true_owner
+                if true_owner is not None and false_owner is not None and true_owner.id == false_owner.id
+                else None
+            )
+        else:
+            owner = resolve(node.inputs[0])
+        visiting.remove(node_id)
+        return owner
+
+    return resolve(value)
 
 
 @dataclass(frozen=True)
@@ -631,14 +662,6 @@ class _ProgramGraphBuilder:
                     return None
             return tuple(mapping)
 
-        def storage_owner(value: NodeId) -> str | None:
-            current = nodes_by_id[value]
-            while current.operation is not OpCode.PARAMETER:
-                if not current.inputs:
-                    return None
-                current = nodes_by_id[current.inputs[0]]
-            return current.source_name if current.type.kind == "tensor_view" else None
-
         accumulation_plans: list[AccumulationPlan] = []
         for path in self.wrt:
             parameter_name = path.split(".", 1)[0]
@@ -659,7 +682,8 @@ class _ProgramGraphBuilder:
                 if (
                     node.id not in active
                     or node.operation not in {OpCode.INDEX, OpCode.INDEX_DYNAMIC, OpCode.STORE_DYNAMIC}
-                    or storage_owner(node.inputs[0]) != parameter_name
+                    or (owner := storage_parameter_owner(node.inputs[0], nodes_by_id)) is None
+                    or owner.source_name != parameter_name
                 ):
                     continue
                 if node.operation is OpCode.INDEX:
@@ -761,44 +785,13 @@ class _ProgramGraphBuilder:
         return tuple(slots), total
 
     def _value_layout(self, value_type: ConcreteType) -> tuple[int, int]:
-        if value_type.kind == "scalar":
-            size = max(SCALAR_TYPES[value_type.name].width // 8, 1)
-            return size, size
-        if value_type.kind == "tensor":
-            element = value_type.arguments[0]
-            assert isinstance(element, ConcreteType)
-            count = 1
-            for extent in value_type.arguments[1:]:
-                if not isinstance(extent, int) or extent <= 0:
-                    raise self.error(
-                        self.function.source,
-                        "autodiff tape requires positive static Tensor shapes",
-                    )
-                count *= extent
-            element_size, element_alignment = self._value_layout(element)
-            stride = ((element_size + element_alignment - 1) // element_alignment) * element_alignment
-            return count * stride, element_alignment
-        if value_type.kind in {"tuple", "struct"}:
-            elements = (
-                tuple(element for element in value_type.arguments if isinstance(element, ConcreteType))
-                if value_type.kind == "tuple"
-                else tuple(field for _, field in self.structs[value_type.name])
-            )
-            offset = 0
-            aggregate_alignment = 1
-            for element in elements:
-                size, alignment = self._value_layout(element)
-                offset = ((offset + alignment - 1) // alignment) * alignment
-                offset += size
-                aggregate_alignment = max(aggregate_alignment, alignment)
-            return (
-                ((offset + aggregate_alignment - 1) // aggregate_alignment) * aggregate_alignment,
-                aggregate_alignment,
-            )
-        raise self.error(
-            self.function.source,
-            f"autodiff cannot save {value_type.kind} in the typed tape",
-        )
+        try:
+            return value_abi_extent(value_type, self.structs.__getitem__)
+        except (RuntimeError, ValueError) as error:
+            raise self.error(
+                self.function.source,
+                f"autodiff cannot save {value_type.mlir} in the typed tape: {error}",
+            ) from error
 
     def _gradient_paths(self, path: str) -> tuple[str, ...]:
         components = path.split(".")
@@ -895,16 +888,11 @@ class _ProgramGraphBuilder:
                 )
 
     def _returning_if(self, statement: ast.If, continuation: list[ast.stmt]) -> None:
-        if any(parameter.type.kind == "tensor_view" for parameter in self.function.parameters):
-            raise self.error(
-                statement,
-                "autodiff branch-local returns with Storage effects are unavailable",
-            )
         condition = self._expression(statement.test)
         before = dict(self.environment)
         previous_outputs = self.outputs
 
-        def branch_output(branch: list[ast.stmt]) -> NodeId:
+        def branch_result(branch: list[ast.stmt]) -> tuple[NodeId, dict[str, NodeId]]:
             self.environment = dict(before)
             self.outputs = ()
             self._statements(branch)
@@ -912,15 +900,35 @@ class _ProgramGraphBuilder:
                 self._statements(continuation)
             if len(self.outputs) != 1:
                 raise self.error(statement, "autodiff early-return branch does not produce one Value")
-            return self.outputs[0]
+            return self.outputs[0], dict(self.environment)
 
-        true_output = branch_output(statement.body)
-        false_output = branch_output(statement.orelse)
+        true_output, true_environment = branch_result(statement.body)
+        false_output, false_environment = branch_result(statement.orelse)
         true_type = self.nodes[true_output].type
         false_type = self.nodes[false_output].type
         if true_type != false_type:
             raise self.error(statement, "autodiff early-return branches have incompatible types")
-        self.environment = before
+        merged = dict(before)
+        for name in sorted(set(true_environment) | set(false_environment)):
+            true_value = true_environment.get(name, before.get(name))
+            false_value = false_environment.get(name, before.get(name))
+            if true_value is None or false_value is None:
+                raise self.error(statement, f"autodiff early-return local '{name}' is not defined on every path")
+            if true_value == false_value:
+                merged[name] = true_value
+                continue
+            true_value_type = self.nodes[true_value].type
+            false_value_type = self.nodes[false_value].type
+            if true_value_type != false_value_type:
+                raise self.error(statement, f"autodiff early-return local '{name}' has incompatible types")
+            merged[name] = self._add(
+                OpCode.CONDITIONAL,
+                (condition, true_value, false_value),
+                true_value_type,
+                statement,
+                name,
+            )
+        self.environment = merged
         self.outputs = (
             self._add(
                 OpCode.CONDITIONAL,
@@ -1012,11 +1020,6 @@ class _ProgramGraphBuilder:
                 raise self.error(
                     statement,
                     "autodiff dynamic loops require one leading 'if condition: break' guard",
-                )
-            if any(parameter.type.kind == "tensor_view" for parameter in self.function.parameters):
-                raise self.error(
-                    statement,
-                    "autodiff dynamic loops with Storage effects are unavailable",
                 )
             if len(iterations) > 256:
                 raise self.error(statement.iter, "autodiff dynamic loop exceeds the iteration cap 256")
@@ -1116,4 +1119,5 @@ __all__ = [
     "TapeLayout",
     "TapeSlot",
     "build_program_graph",
+    "storage_parameter_owner",
 ]

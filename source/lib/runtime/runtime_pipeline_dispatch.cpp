@@ -43,7 +43,7 @@ bool resolveBackendPipeline(VernonPipelineBundle &bundle, const Variant &variant
         return resolveMetalPipeline(bundle, variant, pipeline);
     if (isOpenGLBackend(bundle.context->backend))
         return resolveOpenGLPipeline(bundle, variant, pipeline);
-    bundle.context->error = "unsupported runtime pipeline backend";
+    invocationDiagnostic(*bundle.context) = "unsupported runtime pipeline backend";
     return false;
 }
 

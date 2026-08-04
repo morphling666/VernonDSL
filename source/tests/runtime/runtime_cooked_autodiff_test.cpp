@@ -41,14 +41,15 @@ TEST(RuntimeCookedAutodiff, LoadsStaticallyLinkedObjectsAndExecutesReusablePullb
         float value[]{2.0f, 3.0f};
         int32_t count = 2;
         float outputValue[2]{};
+        const uint64_t tensorShape[]{2};
         VernonAdValue inputValues[]{
-            {sizeof(VernonAdValue), {"value", 5}, VERNON_DATA_F32, value, sizeof(value), {}},
-            {sizeof(VernonAdValue), {"factor", 6}, VERNON_DATA_F32, &factor, sizeof(factor), {}},
-            {sizeof(VernonAdValue), {"selector", 8}, VERNON_DATA_F32, &selector, sizeof(selector), {}},
+            {sizeof(VernonAdValue), {"value", 5}, VERNON_DATA_F32, value, sizeof(value), 1, tensorShape},
+            {sizeof(VernonAdValue), {"parameters.factor", 17}, VERNON_DATA_F32, &factor, sizeof(factor), {}},
+            {sizeof(VernonAdValue), {"parameters.selector", 19}, VERNON_DATA_F32, &selector, sizeof(selector), {}},
             {sizeof(VernonAdValue), {"count", 5}, VERNON_DATA_I32, &count, sizeof(count), {}},
         };
-        VernonAdValue output{sizeof(VernonAdValue), {"output", 6},       VERNON_DATA_F32,
-                             outputValue,           sizeof(outputValue), {}};
+        VernonAdValue output{
+            sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, outputValue, sizeof(outputValue), 1, tensorShape};
         VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, 4, {}};
         VernonAdValueSet outputs{sizeof(VernonAdValueSet), &output, 1, {}};
         VernonPullback *pullback = nullptr;
@@ -62,13 +63,30 @@ TEST(RuntimeCookedAutodiff, LoadsStaticallyLinkedObjectsAndExecutesReusablePullb
         float factorGradient = 1.0f;
         float selectorGradient = 1.0f;
         VernonAdValue gradientValues[]{
-            {sizeof(VernonAdValue), {"value", 5}, VERNON_DATA_F32, valueGradient, sizeof(valueGradient), {}},
-            {sizeof(VernonAdValue), {"factor", 6}, VERNON_DATA_F32, &factorGradient, sizeof(factorGradient), {}},
-            {sizeof(VernonAdValue), {"selector", 8}, VERNON_DATA_F32, &selectorGradient, sizeof(selectorGradient), {}},
+            {sizeof(VernonAdValue),
+             {"value", 5},
+             VERNON_DATA_F32,
+             valueGradient,
+             sizeof(valueGradient),
+             1,
+             tensorShape},
+            {sizeof(VernonAdValue),
+             {"parameters.factor", 17},
+             VERNON_DATA_F32,
+             &factorGradient,
+             sizeof(factorGradient),
+             {}},
+            {sizeof(VernonAdValue),
+             {"parameters.selector", 19},
+             VERNON_DATA_F32,
+             &selectorGradient,
+             sizeof(selectorGradient),
+             {}},
         };
         VernonAdValueSet gradients{sizeof(VernonAdValueSet), gradientValues, 3, {}};
         float seedValue[]{1.0f, 2.0f};
-        VernonAdValue seed{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seedValue, sizeof(seedValue), {}};
+        VernonAdValue seed{
+            sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seedValue, sizeof(seedValue), 1, tensorShape};
         VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seed, 1, {}};
         ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(context);
         EXPECT_FLOAT_EQ(valueGradient[0], expectedValueGradient[0]);

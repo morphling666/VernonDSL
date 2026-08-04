@@ -38,6 +38,10 @@ TEST(RuntimeCommonApi, InitializesOptionsAndReportsErrors) {
     const VernonStringView diagnostic = vernonRuntimeGetLastError(context);
     ASSERT_GE(diagnostic.size, sizeof(diagnosticPrefix) - 1);
     EXPECT_EQ(std::strncmp(diagnostic.data, diagnosticPrefix, sizeof(diagnosticPrefix) - 1), 0);
+    const VernonRuntimeCapabilities refreshed = vernonRuntimeGetContextCapabilities(context);
+    EXPECT_TRUE(refreshed.available);
+    EXPECT_EQ(refreshed.diagnostic.size, 0);
+    EXPECT_EQ(vernonRuntimeGetLastError(context).size, 0);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 
     context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);

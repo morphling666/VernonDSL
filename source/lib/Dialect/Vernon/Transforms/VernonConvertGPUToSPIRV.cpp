@@ -1,12 +1,16 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonConvertGPUToSPIRV.h"
 
+#include "VernonSpirvMath.h"
+
 #include "mlir/Conversion/ArithToSPIRV/ArithToSPIRV.h"
 #include "mlir/Conversion/FuncToSPIRV/FuncToSPIRV.h"
 #include "mlir/Conversion/GPUToSPIRV/GPUToSPIRV.h"
+#include "mlir/Conversion/MathToSPIRV/MathToSPIRV.h"
 #include "mlir/Conversion/MemRefToSPIRV/MemRefToSPIRV.h"
 #include "mlir/Conversion/SCFToSPIRV/SCFToSPIRV.h"
 #include "mlir/Conversion/VectorToSPIRV/VectorToSPIRV.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
@@ -19,6 +23,23 @@
 
 namespace mlir::vernon {
 namespace {
+
+struct Atan2ToSPIRVPattern final : OpConversionPattern<math::Atan2Op> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(math::Atan2Op op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        Type resultType = getTypeConverter()->convertType(op.getType());
+        if (!resultType)
+            return failure();
+        FailureOr<Value> result =
+            lowerAtan2ToSpirv(op.getLoc(), resultType, adaptor.getLhs(), adaptor.getRhs(), rewriter);
+        if (failed(result))
+            return failure();
+        rewriter.replaceOp(op, *result);
+        return success();
+    }
+};
 
 struct AtomicExchangeToSPIRVPattern final : OpConversionPattern<memref::AtomicRMWOp> {
     AtomicExchangeToSPIRVPattern(const SPIRVTypeConverter &converter, MLIRContext *context)
@@ -77,9 +98,11 @@ struct ConvertGPUToSPIRVPass final : PassWrapper<ConvertGPUToSPIRVPass, Operatio
             ScfToSPIRVContext scfContext;
             populateSCFToSPIRVPatterns(typeConverter, scfContext, patterns);
             arith::populateArithToSPIRVPatterns(typeConverter, patterns);
+            populateMathToSPIRVPatterns(typeConverter, patterns);
             populateMemRefToSPIRVPatterns(typeConverter, patterns);
             populateFuncToSPIRVPatterns(typeConverter, patterns);
             populateVectorToSPIRVPatterns(typeConverter, patterns);
+            patterns.add<Atan2ToSPIRVPattern>(typeConverter, &getContext(), PatternBenefit(2));
             patterns.add<AtomicExchangeToSPIRVPattern>(typeConverter, &getContext());
 
             if (failed(applyFullConversion(clone, *target, std::move(patterns)))) {

@@ -45,15 +45,23 @@ bool packTensorViewDescriptor(const VernonTensorView &tensor, std::vector<uint8_
 
 bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &arguments,
                           const VernonPipelineInvocation &invocation, PlannedComputeLaunch &plan, std::string &error) {
+    constexpr size_t kMaxComputeArgumentIndex = 4095;
+    size_t computeArgumentSpan = 0;
     size_t computeArgumentCount = 0;
     for (const Parameter &parameter : variant.parameters)
-        for (const ParameterUse &use : parameter.uses)
-            computeArgumentCount += use.stage == "compute" || use.stage == variant.compute;
+        for (const ParameterUse &use : parameter.uses) {
+            if (use.stage != "compute" && use.stage != variant.compute)
+                continue;
+            if (use.index > kMaxComputeArgumentIndex)
+                return fail(error, "compute argument index exceeds the supported range");
+            computeArgumentSpan = std::max(computeArgumentSpan, static_cast<size_t>(use.index) + 1);
+            ++computeArgumentCount;
+        }
 
     plan = {};
-    plan.arguments.resize(computeArgumentCount);
+    plan.arguments.resize(computeArgumentSpan);
     plan.hostTensorStorage.reserve(computeArgumentCount);
-    std::vector<uint8_t> assigned(computeArgumentCount);
+    std::vector<uint8_t> assigned(computeArgumentSpan);
 
     for (const Parameter &parameter : variant.parameters) {
         const auto suppliedIt = arguments.find(parameter.slot);
@@ -63,8 +71,8 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
         for (const ParameterUse &use : parameter.uses) {
             if (use.stage != "compute" && use.stage != variant.compute)
                 continue;
-            if (use.index >= computeArgumentCount || assigned[use.index])
-                return fail(error, "compute argument indices are not contiguous");
+            if (assigned[use.index])
+                return fail(error, "compute argument index is duplicated");
 
             ComputeLaunchArgument &argument = plan.arguments[use.index];
             if (supplied.kind != VERNON_PIPELINE_TENSOR)
@@ -86,32 +94,23 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
                     argument.hostSize = supplied.tensor.byte_size;
                 } else {
                     argument.kind = ComputeLaunchArgumentKind::Scalar;
-                    if (!use.physicalValueLayout)
-                        return fail(error, "compute value Tensor is missing its compiler-planned physical layout");
-                    if (use.physicalValueLayout->size > std::numeric_limits<size_t>::max())
+                    if (!use.interfacePlan || !use.interfacePlan->root)
+                        return fail(error, "compute value Tensor is missing its typed interface plan");
+                    if (use.interfacePlan->root->size > std::numeric_limits<size_t>::max())
                         return fail(error, "compute Tensor physical size exceeds the host size range");
-                    TensorPackingLayout layout;
-                    layout.elementSize = supplied.tensor.element_layout.byte_size;
-                    layout.shape = use.shape.empty() ? parameter.shape : use.shape;
-                    layout.byteSize = static_cast<size_t>(use.physicalValueLayout->size);
-                    for (uint64_t stride : use.physicalValueLayout->byteStrides) {
-                        if (stride > std::numeric_limits<size_t>::max())
-                            return fail(error, "compute Tensor physical stride exceeds the host size range");
-                        layout.byteStrides.push_back(static_cast<size_t>(stride));
-                    }
-                    for (uint64_t offset : use.physicalValueLayout->elementLeafOffsets) {
-                        if (offset > std::numeric_limits<size_t>::max())
-                            return fail(error, "compute Tensor physical leaf offset exceeds the host size range");
-                        layout.elementLeafOffsets.push_back(static_cast<size_t>(offset));
-                    }
+                    std::optional<TensorCopyPlan> layout =
+                        compileTensorCopyPlan(supplied.tensor.element_layout, *use.interfacePlan->root,
+                                              use.shape.empty() ? parameter.shape : use.shape);
+                    if (!layout)
+                        return fail(error, "compute Tensor interface plan does not match its canonical layout");
                     VernonTensorView packedTensor = supplied.tensor;
-                    if (packedTensor.rank == layout.shape.size() + 1 && packedTensor.shape &&
+                    if (packedTensor.rank == layout->shape.size() + 1 && packedTensor.shape &&
                         packedTensor.byte_strides && packedTensor.shape[0] == 1) {
                         --packedTensor.rank;
                         ++packedTensor.shape;
                         ++packedTensor.byte_strides;
                     }
-                    auto packed = packTensor(packedTensor, layout);
+                    auto packed = packTensor(packedTensor, *layout);
                     if (!packed)
                         return fail(error, "failed to pack reflected compute Tensor layout");
                     plan.hostTensorStorage.push_back(std::move(*packed));
@@ -209,12 +208,13 @@ bool planComputeInvocation(const Variant &variant, const VernonPipelineInvocatio
         if (parameter.kind != "tensor" || found->second->kind != VERNON_PIPELINE_TENSOR)
             return fail(error, "pipeline argument kind does not match layout");
         const VernonTensorView &tensor = found->second->tensor;
+        const ValueLayout &expectedLayout = parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
         const bool accessCompatible = parameter.access.empty()      ? true
                                       : parameter.access == "read"  ? tensor.access != VERNON_ACCESS_WRITE
                                       : parameter.access == "write" ? tensor.access != VERNON_ACCESS_READ
                                                                     : tensor.access == VERNON_ACCESS_READ_WRITE;
         if (tensor.struct_size < sizeof(VernonTensorView) ||
-            !valueLayoutsEqual(tensor.element_layout, pipelineValueLayout(parameter.elementLayout)) ||
+            !valueLayoutsEqual(tensor.element_layout, pipelineValueLayout(expectedLayout)) ||
             tensor.access > VERNON_ACCESS_READ_WRITE || !accessCompatible ||
             (tensor.storage != VERNON_TENSOR_HOST && tensor.storage != VERNON_TENSOR_RHI_RESOURCE) ||
             !tensorFitsAllocation(tensor))

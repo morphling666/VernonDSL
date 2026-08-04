@@ -10,6 +10,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("manifest", type=Path)
     parser.add_argument("object_suffix")
+    parser.add_argument("--wrapper-function", required=True)
     arguments = parser.parse_args()
 
     document = json.loads(arguments.manifest.read_text(encoding="utf-8"))
@@ -29,7 +30,7 @@ def main() -> int:
                 "",
                 f"extern VernonStatus {registration['function']}(void);",
                 "",
-                "VernonStatus vernonRegisterAutodiffFixture(void) {",
+                f"VernonStatus {arguments.wrapper_function}(void) {{",
                 f"    return {registration['function']}();",
                 "}",
                 "",

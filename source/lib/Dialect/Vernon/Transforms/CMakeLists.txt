@@ -5,6 +5,7 @@ add_mlir_library(
     VernonConvertGPUToSPIRV.cpp
     VernonInlineHelpers.cpp
     VernonLowerAccumulation.cpp
+    VernonLowerCPUABI.cpp
     VernonLowerCPUResources.cpp
     VernonLowerCPUTensors.cpp
     VernonLowerCUDAMath.cpp
@@ -12,6 +13,7 @@ add_mlir_library(
     VernonLowerSynchronization.cpp
     VernonAggregateStorage.cpp
     VernonSharedValuePatterns.cpp
+    VernonSpirvMath.cpp
     VernonTensorShapeSemantics.cpp
     VernonValidation.cpp
     VernonToGPU.cpp

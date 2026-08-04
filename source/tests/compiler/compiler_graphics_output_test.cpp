@@ -740,8 +740,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         const nlohmann::json &argument = root.at("entries").at(0).at("arguments").at(0);
         const nlohmann::json &layout = argument.at("physical_layouts").at("vulkan_std140_uniform_buffer");
         EXPECT_EQ(argument.at("shape"), nlohmann::json::array({2, 2, tailWidth}));
-        EXPECT_EQ(layout.at("byte_strides"), nlohmann::json::array({tailWidth * 32u, tailWidth * 16u, 16u}));
-        EXPECT_EQ(layout.at("size"), tailWidth * 64u);
+        EXPECT_EQ(layout.at("root").at("byte_strides"), nlohmann::json::array({tailWidth * 32u, tailWidth * 16u, 16u}));
+        EXPECT_EQ(layout.at("root").at("size"), tailWidth * 64u);
         vernonCompileResultDestroy(result);
     }
     vernonCompilerDestroy(compiler);
@@ -1048,14 +1048,16 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     const nlohmann::json root = nlohmann::json::parse(reflected.data, reflected.data + reflected.size);
     const nlohmann::json &argument = root.at("entries").at(0).at("arguments").at(0);
     EXPECT_FALSE(root.contains("backend_abi_routes"));
-    EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("kind"), "tensor_view_descriptor");
+    EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("kind"), "resource_binding");
+    EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("resource_kind"), "tensor_view_descriptor");
     EXPECT_EQ(argument.at("physical_layouts").at("host_value").at("size"), 32);
-    EXPECT_EQ(argument.at("physical_layouts").at("cuda_kernel_parameter").at("kind"), "strided_memref_storage_leaves");
-    EXPECT_EQ(argument.at("physical_layouts").at("vulkan_std430_storage_buffer").at("kind"),
+    EXPECT_EQ(argument.at("physical_layouts").at("cuda_kernel_parameter").at("resource_kind"),
+              "strided_memref_storage_leaves");
+    EXPECT_EQ(argument.at("physical_layouts").at("vulkan_std430_storage_buffer").at("resource_kind"),
               "descriptor_storage_leaves");
-    EXPECT_EQ(argument.at("physical_layouts").at("directx_constant_buffer").at("kind"), "descriptor_storage_leaves");
-    EXPECT_EQ(argument.at("physical_layouts").at("cuda_kernel_parameter").at("element_layout_hash"),
-              argument.at("physical_layouts").at("vulkan_std430_storage_buffer").at("element_layout_hash"));
+    EXPECT_EQ(argument.at("physical_layouts").at("directx_constant_buffer").at("resource_kind"),
+              "descriptor_storage_leaves");
+    EXPECT_FALSE(argument.at("physical_layouts").at("cuda_kernel_parameter").contains("element_layout_hash"));
     EXPECT_EQ(argument.at("element_layout").at("byte_size"), 20);
     EXPECT_EQ(argument.at("element_layout").at("alignment"), 4);
     EXPECT_EQ(argument.at("element_layout").at("leaves").at(3).at("dtype"), "u32");

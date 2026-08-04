@@ -330,8 +330,10 @@ typedef struct VernonAdValue {
     VernonDataType dtype;
     void *data;
     size_t size;
-    /* Reserved for future use; initialize all elements to zero. */
-    uint32_t reserved[4];
+    /* Logical Value shape. Scalars use rank 0 and shape NULL. */
+    uint32_t rank;
+    /* Must remain valid for the duration of the API call that consumes this Value. */
+    const uint64_t *shape;
 } VernonAdValue;
 
 typedef struct VernonAdValueSet {

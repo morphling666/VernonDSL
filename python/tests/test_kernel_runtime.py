@@ -15,6 +15,7 @@ from aggregate_vertex_shader import (
     copy_complex_aggregate_tensor_view,
     inspect_multidimensional_aggregate_tensor_value,
 )
+from vernon_dsl.host_values import host_abi_layout
 
 
 def _load_fractal() -> ModuleType:
@@ -798,6 +799,8 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                     shape=(4,), strides=(-1,), offset=3, access="read"
                 )
                 output_storage = vd.storage.zeros(dtype=ComplexAggregateVertex, shape=(4,))
+                self.assertEqual(host_abi_layout(ComplexAggregateVertex).size, 44)
+                self.assertEqual(output_storage._native_host_array().nbytes, 4 * 44)
                 output = output_storage.view(access="write")
                 copy_complex_aggregate_tensor_view(output, source, grid=(4, 1, 1))
                 actual = output_storage.to_values()
@@ -873,6 +876,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                     ),
                     dtype=ComplexAggregateVertex,
                 )
+                self.assertEqual(tensor._native_host_array().nbytes, 2 * 3 * 4 * 44)
                 inspect_multidimensional_aggregate_tensor_value(output, tensor, grid=(1, 1, 1))
                 np.testing.assert_array_equal(output.to_numpy(), expected)
 
