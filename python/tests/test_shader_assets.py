@@ -384,6 +384,7 @@ asset = vd.pipeline_asset(
             )
             logical = json.loads(json.dumps(bundle))
             logical.pop("content_hash")
+            registration = logical.pop("cpu_static_registration")
             for record in logical["stage_artifacts"].values():
                 record.pop("artifact")
             self.assertEqual(logical, plans[0].logical_dict())
@@ -401,6 +402,11 @@ asset = vd.pipeline_asset(
             self.assertEqual(stage["artifact"]["format"], "relocatable_object")
             self.assertEqual(stage["artifact"]["path"], f"artifacts/{digest}.obj")
             self.assertEqual((output / stage["artifact"]["path"]).read_bytes(), relocatable_object)
+            self.assertEqual(registration["symbols"], ["__vernon_cpu_module_scale"])
+            registration_source = (output / registration["source"]).read_text(encoding="utf-8")
+            self.assertIn("vernonRuntimeRegisterStaticCpuEntry", registration_source)
+            self.assertIn("&__vernon_cpu_module_scale", registration_source)
+            self.assertTrue((output / registration["header"]).is_file())
             self.assertEqual(manifest_path.name, "cooked.pipeline.json")
             self.assertFalse((output / "pipeline.bundle").exists())
 

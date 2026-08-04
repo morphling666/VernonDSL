@@ -242,13 +242,18 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     ASSERT_TRUE(context != NULL);
     VernonTargetCapabilities vulkan = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_VULKAN);
     ASSERT_TRUE(vulkan.available && vulkan.supports_graphics);
+    ASSERT_TRUE(vulkan.supports_device_storage_atomics && !vulkan.supports_f32_device_atomic_add);
     VernonTargetCapabilities cuda = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_CUDA);
     ASSERT_TRUE(cuda.available && cuda.supports_compute && !cuda.supports_graphics);
+    ASSERT_TRUE(cuda.supports_device_storage_atomics && cuda.supports_f32_device_atomic_add);
     VernonTargetCapabilities cpu = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_CPU);
     ASSERT_TRUE(cpu.available && cpu.supports_graphics && cpu.supports_compute);
+    ASSERT_TRUE(cpu.supports_device_storage_atomics && cpu.supports_f32_device_atomic_add);
     VernonTargetCapabilities opengl = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_OPENGL);
     VernonTargetCapabilities opengles = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_OPENGL_ES);
     VernonTargetCapabilities metal = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_METAL);
+    ASSERT_TRUE(!opengl.supports_device_storage_atomics && !opengles.supports_device_storage_atomics &&
+                !metal.supports_device_storage_atomics);
     VernonTargetCapabilities directx = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_DIRECTX);
     if (directx.available)
         ASSERT_TRUE(directx.supports_graphics && directx.supports_compute);

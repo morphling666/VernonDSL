@@ -21,6 +21,7 @@ from .lowering_types import DslType, FunctionSignature, ModuleContext, Value, el
 from .model import (
     AccessMode,
     ConcreteType,
+    InterfaceMetadata,
     StorageEffect,
     StorageOwnerKind,
     StorageRegionKind,
@@ -35,7 +36,7 @@ from .storage_lowering import (
     lower_storage_store,
     lower_tensor_view_indices,
 )
-from .type_parser import AnnotatedType, Metadata
+from .type_parser import AnnotatedType
 from .type_solver import can_convert
 
 _SWIZZLES = set("xyzwrgba")
@@ -160,7 +161,7 @@ class _FunctionEmitter:
                 raise self.context.error(
                     self.node, f"output field '{field_name}' is not a numeric shader interface value: {error}"
                 ) from None
-            metadata = (*annotation.metadata, Metadata("attribute", (next_location, 0)))
+            metadata = (*annotation.metadata, InterfaceMetadata("attribute", (next_location, 0)))
             planned.append((field_name, AnnotatedType(annotation.type, metadata)))
             next_location += span
         return tuple(planned)
@@ -253,10 +254,7 @@ class _FunctionEmitter:
                 assert isinstance(element_type, DslType)
                 if element_type.kind == "scalar":
                     attributes.append(f'vernon.dtype = "{element_type.name}"')
-                attributes.extend(
-                    attribute.replace("vernon.abi_", "vernon.element_abi_")
-                    for attribute in self._abi_attributes(element_type)
-                )
+                attributes.append(self._abi_leaf_dtypes_attribute(element_type, "vernon.element_abi_leaf_dtypes"))
             if emit_value_abi_metadata and value_type.kind in {"scalar", "tensor", "tuple", "struct"}:
                 attributes.extend(self._abi_attributes(value_type))
             if value_type.kind == "tensor_view":
@@ -350,12 +348,20 @@ class _FunctionEmitter:
         if value_type.kind not in {"scalar", "tensor", "tuple", "struct"}:
             return []
 
+        attributes = [self._abi_leaf_dtypes_attribute(value_type, "vernon.abi_leaf_dtypes")]
+        if value_type.kind == "tensor":
+            element_type = value_type.arguments[0]
+            assert isinstance(element_type, DslType)
+            attributes.append(self._abi_leaf_dtypes_attribute(element_type, "vernon.element_abi_leaf_dtypes"))
+        return attributes
+
+    def _abi_leaf_dtypes_attribute(self, value_type: DslType, attribute: str) -> str:
         def fields(name: str) -> tuple[tuple[str, DslType], ...]:
             return tuple((field_name, annotation.type) for field_name, annotation in self.context.structs[name])
 
         leaves = value_leaves(value_type, fields)
         leaf_dtypes = ", ".join(f'"{leaf.dtype}"' for leaf in leaves)
-        return [f"vernon.abi_leaf_dtypes = [{leaf_dtypes}]"]
+        return f"{attribute} = [{leaf_dtypes}]"
 
     def _append_generated_arguments(self, arguments: list[str]) -> None:
         for sampler_plan in self.interface_plan.implicit_samplers:
@@ -402,7 +408,7 @@ class _FunctionEmitter:
 
     @staticmethod
     def _metadata_attributes(
-        metadata: Iterable[Metadata],
+        metadata: Iterable[InterfaceMetadata],
         *,
         stage: str | None,
         is_result: bool,

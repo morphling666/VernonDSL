@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Mapping
 
 
 @dataclass(frozen=True)
@@ -26,3 +27,4 @@ class ShaderPipelineDescriptor:
     manifest_path: Path
     canonical_manifest: str
     modules: dict[str, ShaderModuleDescriptor]
+    transform: Mapping[str, Any] | None = None

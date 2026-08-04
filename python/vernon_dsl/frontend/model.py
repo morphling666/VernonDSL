@@ -158,10 +158,26 @@ class TypedExpression:
 
 
 @dataclass(frozen=True)
+class InterfaceMetadata:
+    kind: str
+    arguments: tuple[int | str, ...]
+
+
+@dataclass(frozen=True)
 class TypedParameter:
     name: str
     type: ConcreteType
     access: AccessMode = AccessMode.READ
+    interface: tuple[InterfaceMetadata, ...] = ()
+
+    @property
+    def builtin(self) -> str | None:
+        values = tuple(str(item.arguments[0]) for item in self.interface if item.kind == "builtin" and item.arguments)
+        if not values:
+            return None
+        if len(values) != 1:
+            raise ValueError(f"typed parameter '{self.name}' has multiple builtin interfaces")
+        return values[0]
 
 
 class Effect(Enum):
@@ -329,6 +345,7 @@ SemanticValue = (
     | AtomicEffect
     | BarrierEffect
     | EffectScope
+    | InterfaceMetadata
     | MemoryOrdering
     | TypedExpression
     | TypedParameter

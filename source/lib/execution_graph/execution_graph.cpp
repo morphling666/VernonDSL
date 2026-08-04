@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <memory>
+#include <mutex>
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
@@ -16,6 +18,19 @@ bool writes(AccessMode access) { return access != AccessMode::Read; }
 uint64_t handleKey(uint32_t index, uint32_t generation) { return (static_cast<uint64_t>(generation) << 32u) | index; }
 
 std::atomic<uint64_t> nextGraphIdentity{1};
+std::mutex executionSessionRegistryMutex;
+std::unordered_map<uint64_t, std::weak_ptr<std::recursive_mutex>> executionSessions;
+
+std::shared_ptr<std::recursive_mutex> executionSession(VernonRhiDevice device) {
+    const uint64_t key = handleKey(device.index, device.generation);
+    std::lock_guard<std::mutex> lock(executionSessionRegistryMutex);
+    if (const auto found = executionSessions.find(key); found != executionSessions.end())
+        if (auto existing = found->second.lock())
+            return existing;
+    auto created = std::make_shared<std::recursive_mutex>();
+    executionSessions[key] = created;
+    return created;
+}
 
 uint32_t accessBits(const ResourceUse &use) {
     const bool reads = use.access != AccessMode::Write;
@@ -82,6 +97,20 @@ bool compatible(const RenderPass &left, const RenderPass &right) {
 
 } // namespace
 
+class DeviceExecutionSession::Impl {
+public:
+    explicit Impl(VernonRhiDevice device) : mutex(executionSession(device)), lock(*mutex) {}
+
+private:
+    std::shared_ptr<std::recursive_mutex> mutex;
+    std::unique_lock<std::recursive_mutex> lock;
+};
+
+DeviceExecutionSession::DeviceExecutionSession(VernonRhiDevice device) : impl_(std::make_unique<Impl>(device)) {}
+DeviceExecutionSession::~DeviceExecutionSession() = default;
+DeviceExecutionSession::DeviceExecutionSession(DeviceExecutionSession &&) noexcept = default;
+DeviceExecutionSession &DeviceExecutionSession::operator=(DeviceExecutionSession &&) noexcept = default;
+
 ExecutionPass::ExecutionPass(std::string name) : name_(std::move(name)) {}
 
 void ExecutionPass::dependsOn(ExecutionPass &dependency) {
@@ -114,6 +143,18 @@ void ExecutionPass::readWrite(GraphResource resource, VernonRhiResourceState sta
 
 void ExecutionPass::resetDeclaration() { uses_.clear(); }
 
+bool ExecutionResources::buffer(GraphBuffer resource, VernonRhiBuffer &output) const {
+    output = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    if (resource.kind != ResourceKind::Buffer || resource.id >= resources_.size() || resource.id >= buffers_.size())
+        return false;
+    const GraphResource &resolved = resources_[resource.id];
+    if (resolved.graphIdentity != resource.graphIdentity || resolved.kind != ResourceKind::Buffer ||
+        buffers_[resource.id].index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        return false;
+    output = buffers_[resource.id];
+    return true;
+}
+
 void RenderPass::color(uint32_t location, const ColorAttachmentUse &attachment) {
     auto value = attachment;
     value.location = location;
@@ -145,13 +186,28 @@ void RenderPass::renderArea(uint32_t x, uint32_t y, uint32_t width, uint32_t hei
 ExecutionGraph::ExecutionGraph(VernonRhiDevice device)
     : device_(device), graphIdentity_(nextGraphIdentity.fetch_add(1, std::memory_order_relaxed)) {}
 ExecutionGraph::~ExecutionGraph() {
-    for (const ResourceRecord &record : resourceRecords_)
+    for (const ResourceRecord &record : resourceRecords_) {
+        if (record.graphOwned)
+            vernonRhiDeviceDestroyBuffer(device_, record.buffer);
         if (record.resourceKey && record.resourceKey != UINT64_MAX)
             vernon::rhi::releaseResource(device_,
                                          record.resource.kind == ResourceKind::Buffer
                                              ? vernon::rhi::ResourceKind::Buffer
                                              : vernon::rhi::ResourceKind::Image,
                                          record.resourceKey);
+    }
+}
+
+VernonRhiStatus ExecutionGraph::createBuffer(const VernonRhiBufferDescriptor &descriptor, GraphBuffer &output,
+                                             bool exported) {
+    output = {};
+    VernonRhiBuffer buffer{};
+    const VernonRhiStatus status = vernonRhiDeviceCreateBuffer(device_, &descriptor, &buffer);
+    if (status != VERNON_RHI_STATUS_OK)
+        return status;
+    output = importBuffer(buffer, exported);
+    resourceRecords_[output.id].graphOwned = true;
+    return VERNON_RHI_STATUS_OK;
 }
 
 GraphBuffer ExecutionGraph::importBuffer(VernonRhiBuffer buffer, bool exported) {
@@ -583,6 +639,7 @@ VernonRhiStatus ExecutionGraph::execute() {
     std::string error;
     if ((dirty_ && !compile(error)) || !validate(error))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    DeviceExecutionSession session(device_);
     VernonRhiCommandEncoderDescriptor encoderDescriptor{};
     encoderDescriptor.struct_size = sizeof(encoderDescriptor);
     encoderDescriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE | VERNON_RHI_QUEUE_GRAPHICS;
@@ -590,7 +647,12 @@ VernonRhiStatus ExecutionGraph::execute() {
     VernonRhiStatus status = vernonRhiDeviceCreateCommandEncoder(device_, &encoderDescriptor, &native);
     if (status != VERNON_RHI_STATUS_OK)
         return status;
-    ExecutionResources resources(resources_);
+    std::vector<VernonRhiBuffer> buffers(resources_.size(),
+                                         VernonRhiBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+    for (size_t index = 0; index < resourceRecords_.size(); ++index)
+        if (resourceRecords_[index].resource.kind == ResourceKind::Buffer)
+            buffers[index] = resourceRecords_[index].buffer;
+    ExecutionResources resources(resources_, buffers);
     for (const CompiledScope &scope : scopes_) {
         if (!scope.barriers.empty()) {
             status = vernonRhiCommandEncoderBarrier(device_, native, scope.barriers.data(), scope.barriers.size());

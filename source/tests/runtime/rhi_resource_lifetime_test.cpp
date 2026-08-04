@@ -1,3 +1,4 @@
+#include "VernonExecutionGraph.h"
 #include "VernonRuntimeRHIAdapter.h"
 
 #include <gtest/gtest.h>
@@ -11,6 +12,52 @@ struct BackendCase {
 };
 
 class RhiResourceLifetime : public testing::TestWithParam<BackendCase> {};
+
+TEST_P(RhiResourceLifetime, ExecutionGraphDestroysOwnedBuffersButNotImportedBuffers) {
+    const BackendCase test = GetParam();
+    VernonRhiOwnedDeviceDescriptor deviceDescriptor{};
+    deviceDescriptor.struct_size = sizeof(deviceDescriptor);
+    deviceDescriptor.backend = test.backend;
+    const VernonRhiDevice device = vernonRhiCreateDevice(&deviceDescriptor);
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        GTEST_SKIP() << test.name << " is unavailable";
+
+    VernonRhiBufferDescriptor bufferDescriptor{};
+    bufferDescriptor.struct_size = sizeof(bufferDescriptor);
+    bufferDescriptor.size = 64;
+    bufferDescriptor.usage = VERNON_RHI_BUFFER_STORAGE;
+    bufferDescriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
+
+    VernonRhiBuffer imported{};
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &imported), VERNON_RHI_STATUS_OK);
+    {
+        vernon::execution::ExecutionGraph graph(device);
+        const vernon::execution::GraphBuffer first = graph.importBuffer(imported);
+        const vernon::execution::GraphBuffer second = graph.importBuffer(imported);
+        EXPECT_EQ(first.id, second.id);
+    }
+    EXPECT_EQ(vernonRhiDeviceIsBufferValid(device, imported), 1u);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, imported), VERNON_RHI_STATUS_OK);
+
+    VernonRhiBuffer owned{};
+    {
+        vernon::execution::ExecutionGraph graph(device);
+        vernon::execution::GraphBuffer graphBuffer;
+        ASSERT_EQ(graph.createBuffer(bufferDescriptor, graphBuffer), VERNON_RHI_STATUS_OK);
+        owned = graphBuffer.handle;
+        const vernon::execution::GraphBuffer duplicate = graph.importBuffer(owned);
+        EXPECT_EQ(graphBuffer.id, duplicate.id);
+        EXPECT_EQ(vernonRhiDeviceIsBufferValid(device, owned), 1u);
+    }
+    EXPECT_EQ(vernonRhiDeviceIsBufferValid(device, owned), 0u);
+
+    VernonRhiBuffer recycled{};
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &recycled), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(recycled.index, owned.index);
+    EXPECT_NE(recycled.generation, owned.generation);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, recycled), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
+}
 
 TEST_P(RhiResourceLifetime, UnsupportedResourceKindsAreRejected) {
     const BackendCase test = GetParam();

@@ -6,7 +6,7 @@ from typing import Protocol
 
 from ..language.ast_utils import dotted_name, subscript_items
 from ..language.scalar_types import SCALAR_ALIASES, SCALAR_TYPES
-from .model import ConcreteType, is_abi_stable_value, semantic_category
+from .model import ConcreteType, InterfaceMetadata, is_abi_stable_value, semantic_category
 
 
 class TypeContext(Protocol):
@@ -16,15 +16,9 @@ class TypeContext(Protocol):
 
 
 @dataclass(frozen=True)
-class Metadata:
-    kind: str
-    arguments: tuple[int | str, ...]
-
-
-@dataclass(frozen=True)
 class AnnotatedType:
     type: ConcreteType
-    metadata: tuple[Metadata, ...] = ()
+    metadata: tuple[InterfaceMetadata, ...] = ()
 
 
 class TypeParser:
@@ -161,7 +155,7 @@ class TypeParser:
             return value.split(".")[-1]
         raise self.context.error(node, f"{description} must be a string literal or name")
 
-    def _metadata(self, node: ast.AST) -> Metadata:
+    def _metadata(self, node: ast.AST) -> InterfaceMetadata:
         if not isinstance(node, ast.Call):
             raise self.context.error(node, "DSL annotation metadata must be a call")
         kind = (dotted_name(node.func) or "").split(".")[-1]
@@ -214,4 +208,4 @@ class TypeParser:
                 raise self.context.error(node, "attribute location must be non-negative")
             if not isinstance(divisor, int) or divisor < 0:
                 raise self.context.error(node, "attribute divisor must be non-negative")
-        return Metadata(kind, tuple(parsed))
+        return InterfaceMetadata(kind, tuple(parsed))

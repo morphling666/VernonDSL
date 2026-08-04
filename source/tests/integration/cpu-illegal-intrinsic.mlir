@@ -1,4 +1,4 @@
-module attributes {vernon.compiler_contract_version = 9 : i64, vernon.pipeline_version = 12 : i64} {
+module attributes {vernon.compiler_contract_version = 10 : i64, vernon.pipeline_version = 13 : i64} {
   func.func @unsupported_intrinsic(%input: tensor<4xf32>)
       -> tensor<4xf32> {
     %result = "vernon.intrinsic"(%input) <{

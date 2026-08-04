@@ -5,7 +5,10 @@ from pathlib import Path
 from typing import Any
 
 from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
+from ..ad import ProgramTransformSpec
 from .analysis import typed_effect_data
+from .autodiff import AutodiffProgram
+from .autodiff_profiles import AutodiffProfilePlan
 from .model import TypedFunctionInstance
 
 
@@ -19,6 +22,7 @@ class FrontendCompileRequest:
     tensor_shapes: tuple[tuple[str, str, tuple[int, ...]], ...] = ()
     captured_constants: tuple[tuple[str, int | float | bool], ...] = ()
     workgroup_size: tuple[int, int, int] | None = None
+    program_transform: ProgramTransformSpec | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_path", Path(self.source_path).resolve())
@@ -44,6 +48,8 @@ class FrontendCompileResult:
     request: FrontendCompileRequest
     helper_specializations: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = ()
     typed_functions: tuple[TypedFunctionInstance, ...] = ()
+    program_graph: AutodiffProgram | None = None
+    autodiff_profiles: AutodiffProfilePlan | None = None
 
     @property
     def semantic_inputs(self) -> dict[str, Any]:
@@ -67,4 +73,11 @@ class FrontendCompileResult:
             ],
             "entry_effects": ([typed_effect_data(effect) for effect in entry.effects] if entry is not None else []),
             "dependencies": [[path, digest] for path, digest in self.dependencies],
+            "program_transform": (
+                self.request.program_transform.to_dict() if self.request.program_transform is not None else None
+            ),
+            "program_graph": self.program_graph.to_dict() if self.program_graph is not None else None,
+            "autodiff_profiles": (
+                self.autodiff_profiles.manifest_dict() if self.autodiff_profiles is not None else None
+            ),
         }

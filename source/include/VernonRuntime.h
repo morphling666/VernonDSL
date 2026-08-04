@@ -23,6 +23,7 @@ extern "C" {
 typedef struct VernonRuntimeContext VernonRuntimeContext;
 typedef struct VernonPipelineBundle VernonPipelineBundle;
 typedef struct VernonLoadedPipeline VernonLoadedPipeline;
+typedef struct VernonPullback VernonPullback;
 
 typedef enum VernonRuntimeBackend {
     VERNON_RUNTIME_CPU = 0,
@@ -323,6 +324,24 @@ typedef struct VernonPipelineOutputView {
     uint32_t location;
 } VernonPipelineOutputView;
 
+typedef struct VernonAdValue {
+    uint32_t struct_size;
+    VernonStringView path;
+    VernonDataType dtype;
+    void *data;
+    size_t size;
+    /* Reserved for future use; initialize all elements to zero. */
+    uint32_t reserved[4];
+} VernonAdValue;
+
+typedef struct VernonAdValueSet {
+    uint32_t struct_size;
+    VernonAdValue *values;
+    size_t value_count;
+    /* Reserved for future use; initialize all elements to zero. */
+    uint32_t reserved[4];
+} VernonAdValueSet;
+
 typedef struct VernonPipelineBundleLoadOptions {
     uint32_t struct_size;
     /*
@@ -372,6 +391,22 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimePipelineInvoke(VernonLoadedPipelin
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimePipelineEncode(VernonRuntimeProviderObject encoder,
                                                              VernonLoadedPipeline *pipeline,
                                                              const VernonPipelineInvocation *invocation);
+VERNON_RUNTIME_CAPI VernonStatus vernonAdPipelineForward(VernonLoadedPipeline *pipeline, VernonLaunchSize compute_grid,
+                                                         const VernonAdValueSet *inputs, VernonAdValueSet *outputs,
+                                                         VernonPullback **pullback);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdOutputDataType(const VernonLoadedPipeline *pipeline,
+                                                                                VernonDataType *dtype);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdOutputRank(const VernonLoadedPipeline *pipeline,
+                                                                            size_t *rank);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdOutputDimension(const VernonLoadedPipeline *pipeline,
+                                                                                 size_t index, uint64_t *extent);
+VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetAdGradientCount(const VernonLoadedPipeline *pipeline);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdGradient(const VernonLoadedPipeline *pipeline,
+                                                                          size_t index, VernonStringView *path,
+                                                                          VernonDataType *dtype);
+VERNON_RUNTIME_CAPI VernonStatus vernonPullbackApply(VernonPullback *pullback, const VernonAdValueSet *cotangents,
+                                                     VernonAdValueSet *gradients);
+VERNON_RUNTIME_CAPI void vernonPullbackDestroy(VernonPullback *pullback);
 
 #ifdef __cplusplus
 }

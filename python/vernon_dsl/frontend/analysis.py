@@ -109,6 +109,9 @@ def typed_model_data(functions: Iterable[TypedFunctionInstance]) -> list[dict[st
                     "name": parameter.name,
                     "type": parameter.type.mlir,
                     "access": parameter.access.value,
+                    "interface": [
+                        {"kind": item.kind, "arguments": list(item.arguments)} for item in parameter.interface
+                    ],
                 }
                 for parameter in function.parameters
             ],

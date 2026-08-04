@@ -15,6 +15,7 @@
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -230,15 +231,43 @@ LogicalResult AtomicOp::verify() {
     if (getIndices().size() != view.getShape().size())
         return emitOpError("requires one index per TensorView dimension");
     Type elementType = view.getElementType();
-    if (!elementType.isSignlessInteger(32) || getValue().getType() != elementType ||
-        getResult().getType() != elementType)
-        return emitOpError("requires matching 32-bit integer value and result types");
+    const bool supportedElement =
+        elementType.isSignlessInteger(32) || ((elementType.isF32() || elementType.isF64()) && getAtomicKind() == "add");
+    if (!supportedElement || getValue().getType() != elementType || getResult().getType() != elementType)
+        return emitOpError("requires matching i32 types or f32/f64 types for atomic add");
     if (getAtomicKind() != "add" && getAtomicKind() != "min" && getAtomicKind() != "max" && getAtomicKind() != "umin" &&
         getAtomicKind() != "umax" && getAtomicKind() != "exchange")
         return emitOpError("operation must be add, min, max, umin, umax, or exchange");
     if (getOrdering() != "relaxed")
         return emitOpError("currently supports only relaxed memory ordering");
     return success();
+}
+
+static LogicalResult verifyAccumulationContribution(Operation *operation, Value value, Value storage,
+                                                    ValueRange indices) {
+    auto view = dyn_cast<TensorViewType>(storage.getType());
+    if (!view)
+        return operation->emitOpError("storage must be a TensorView");
+    if (view.getAccess() == "read")
+        return operation->emitOpError("requires writable TensorView storage");
+    if (view.getAddressSpace() != "device")
+        return operation->emitOpError("requires device TensorView storage");
+    if (indices.size() != view.getShape().size())
+        return operation->emitOpError("requires one index per TensorView dimension");
+    Type elementType = view.getElementType();
+    if (!elementType.isF16() && !elementType.isF32() && !elementType.isF64())
+        return operation->emitOpError("requires f16, f32, or f64 gradient storage");
+    if (value.getType() != elementType)
+        return operation->emitOpError("contribution type must match the storage element type");
+    return success();
+}
+
+LogicalResult ReduceSumOp::verify() {
+    return verifyAccumulationContribution(getOperation(), getValue(), getStorage(), getIndices());
+}
+
+LogicalResult ScatterAddOp::verify() {
+    return verifyAccumulationContribution(getOperation(), getValue(), getStorage(), getIndices());
 }
 
 LogicalResult PhysicalLoadOp::verify() {
@@ -270,9 +299,10 @@ LogicalResult PhysicalAtomicOp::verify() {
     if (view.getAddressSpace() != "device" && view.getAddressSpace() != "workgroup")
         return emitOpError("requires device or workgroup TensorView storage");
     Type elementType = view.getElementType();
-    if (!elementType.isSignlessInteger(32) || getValue().getType() != elementType ||
-        getResult().getType() != elementType)
-        return emitOpError("requires matching 32-bit integer value and result types");
+    const bool supportedElement =
+        elementType.isSignlessInteger(32) || ((elementType.isF32() || elementType.isF64()) && getAtomicKind() == "add");
+    if (!supportedElement || getValue().getType() != elementType || getResult().getType() != elementType)
+        return emitOpError("requires matching i32 types or f32/f64 types for atomic add");
     if (getAtomicKind() != "add" && getAtomicKind() != "min" && getAtomicKind() != "max" && getAtomicKind() != "umin" &&
         getAtomicKind() != "umax" && getAtomicKind() != "exchange")
         return emitOpError("operation must be add, min, max, umin, umax, or exchange");

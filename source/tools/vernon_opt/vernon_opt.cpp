@@ -10,6 +10,7 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonConvertGPUToSPIRV.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonCpuPipeline.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonInlineHelpers.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUResources.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUTensors.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCUDAMath.h"
@@ -71,6 +72,7 @@ int main(int argc, char **argv) {
     // Register passes
     vernon::registerVernonValidatePass();
     vernon::registerVernonInlineHelpersPass();
+    vernon::registerVernonLowerAccumulationPass();
     vernon::registerVernonLowerCPUTensorsPass();
     vernon::registerVernonLowerCPUResourcesPass();
     vernon::registerVernonCpuPassPipeline();

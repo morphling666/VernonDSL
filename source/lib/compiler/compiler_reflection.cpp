@@ -4,11 +4,8 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
-#include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAttributeAbi.h"
-#include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
-#include "mlir/Dialect/Vernon/Transforms/VernonTensorShapeSemantics.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -393,7 +390,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
             return *bytes;
         if (const auto *resource = std::get_if<mlir::vernon::PhysicalResourceAbiLayout>(&*plan);
             resource && resource->handleSize != 0)
-            return mlir::vernon::PhysicalValueAbiLayout{resource->handleSize, resource->handleAlignment};
+            return mlir::vernon::PhysicalValueAbiLayout{resource->handleSize, resource->handleAlignment, {}, {}};
         return mlir::failure();
     };
     llvm::json::Array entries;
@@ -591,20 +588,23 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
                 argument["vernon.set"] = int64_t{0};
                 argument["vernon.binding"] = static_cast<int64_t>(*computeBindings[index]);
             }
-            llvm::SmallVector<llvm::StringRef> logicalDtypes;
-            const llvm::StringRef dtypeAttribute = mlir::isa<mlir::vernon::TensorViewType>(argumentType)
-                                                       ? "vernon.element_abi_leaf_dtypes"
-                                                       : "vernon.abi_leaf_dtypes";
-            if (argumentAttrs)
-                if (auto dtypes = argumentAttrs.getAs<mlir::ArrayAttr>(dtypeAttribute))
-                    for (mlir::Attribute dtype : dtypes) {
-                        auto value = mlir::dyn_cast<mlir::StringAttr>(dtype);
-                        logicalDtypes.push_back(value ? value.getValue() : llvm::StringRef());
-                    }
+            const auto leafDtypes = [&](llvm::StringRef attribute) {
+                llvm::SmallVector<llvm::StringRef> values;
+                if (argumentAttrs)
+                    if (auto dtypes = argumentAttrs.getAs<mlir::ArrayAttr>(attribute))
+                        for (mlir::Attribute dtype : dtypes) {
+                            auto value = mlir::dyn_cast<mlir::StringAttr>(dtype);
+                            values.push_back(value ? value.getValue() : llvm::StringRef());
+                        }
+                return values;
+            };
+            const llvm::SmallVector<llvm::StringRef> valueLogicalDtypes = leafDtypes("vernon.abi_leaf_dtypes");
+            const llvm::SmallVector<llvm::StringRef> explicitElementLogicalDtypes =
+                leafDtypes("vernon.element_abi_leaf_dtypes");
             if (!argumentType.isIndex() &&
                 !mlir::isa<mlir::vernon::TensorViewType, mlir::vernon::TextureType, mlir::vernon::SamplerType>(
                     argumentType)) {
-                mlir::FailureOr<llvm::json::Object> logicalAbi = reflectValueLayout(argumentType, logicalDtypes);
+                mlir::FailureOr<llvm::json::Object> logicalAbi = reflectValueLayout(argumentType, valueLogicalDtypes);
                 if (mlir::failed(logicalAbi)) {
                     function.emitError() << "cannot reflect canonical logical ABI for argument #" << index;
                     invalid = true;
@@ -623,9 +623,16 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
                      argumentType.isInteger(32) || argumentType.isF16() || argumentType.isF32() || argumentType.isF64())
                 elementLayoutType = argumentType;
             if (elementLayoutType) {
-                llvm::ArrayRef<llvm::StringRef> elementLogicalDtypes = logicalDtypes;
-                if (elementLayoutType != argumentType && !elementLayoutType.isIntOrFloat())
-                    elementLogicalDtypes = {};
+                if (elementLayoutType != argumentType && !valueLogicalDtypes.empty() &&
+                    explicitElementLogicalDtypes.empty()) {
+                    function.emitError() << "container argument #" << index
+                                         << " has value ABI dtypes but no element ABI dtypes";
+                    invalid = true;
+                    return;
+                }
+                llvm::ArrayRef<llvm::StringRef> elementLogicalDtypes = explicitElementLogicalDtypes;
+                if (elementLogicalDtypes.empty() && elementLayoutType == argumentType)
+                    elementLogicalDtypes = valueLogicalDtypes;
                 mlir::FailureOr<llvm::json::Object> elementLayout =
                     reflectValueLayout(elementLayoutType, elementLogicalDtypes);
                 if (mlir::failed(elementLayout)) {
@@ -643,7 +650,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
                 argumentAttrs.getAs<mlir::IntegerAttr>("vernon.location") && !argumentAttrs.get("vernon.builtin");
             if (aggregateVertexAttribute) {
                 mlir::FailureOr<mlir::vernon::AttributeAbiLayout> plan =
-                    mlir::vernon::getAttributeAbiLayout(argumentType, module, logicalDtypes);
+                    mlir::vernon::getAttributeAbiLayout(argumentType, module, valueLogicalDtypes);
                 if (mlir::failed(plan)) {
                     function.emitError() << "cannot reflect vertex attribute layout for argument #" << index;
                     invalid = true;
@@ -1042,6 +1049,120 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
     llvm::raw_string_ostream stream(output);
     stream << llvm::json::Value(std::move(root));
     return output;
+}
+
+bool selectTargetPhysicalLayouts(std::string &reflection, VernonTarget target, std::string &diagnostics) {
+    std::set<std::string> allowed;
+    switch (target) {
+    case VERNON_TARGET_CPU:
+        allowed.emplace("host_value");
+        break;
+    case VERNON_TARGET_CUDA:
+        allowed.emplace("cuda_kernel_parameter");
+        break;
+    case VERNON_TARGET_VULKAN:
+        allowed.emplace("vulkan_std140_uniform_buffer");
+        allowed.emplace("vulkan_std430_storage_buffer");
+        allowed.emplace("vulkan_push_constant");
+        break;
+    case VERNON_TARGET_OPENGL:
+    case VERNON_TARGET_OPENGL_ES:
+        allowed.emplace("vulkan_std140_uniform_buffer");
+        allowed.emplace("vulkan_std430_storage_buffer");
+        allowed.emplace("opengl_native_uniform");
+        break;
+    case VERNON_TARGET_DIRECTX:
+        allowed.emplace("vulkan_std430_storage_buffer");
+        allowed.emplace("directx_constant_buffer");
+        break;
+    case VERNON_TARGET_METAL:
+        allowed.emplace("vulkan_std430_storage_buffer");
+        allowed.emplace("metal_constant_buffer");
+        break;
+    }
+
+    llvm::Expected<llvm::json::Value> parsed = llvm::json::parse(reflection);
+    llvm::json::Object *root = parsed ? parsed->getAsObject() : nullptr;
+    llvm::json::Array *entries = root ? root->getArray("entries") : nullptr;
+    if (!entries) {
+        if (!parsed)
+            llvm::consumeError(parsed.takeError());
+        diagnostics = "compiler reflection has no entry table";
+        return false;
+    }
+    const auto prune = [](llvm::json::Object &layouts, const std::set<std::string> &profiles) {
+        std::vector<std::string> removed;
+        for (const auto &[name, _] : layouts)
+            if (!profiles.count(name.str()))
+                removed.push_back(name.str());
+        for (const std::string &name : removed)
+            layouts.erase(name);
+    };
+    const auto selectedProfile = [&](const llvm::json::Object &row) -> std::optional<std::string> {
+        if (target == VERNON_TARGET_CPU)
+            return "host_value";
+        if (target == VERNON_TARGET_CUDA)
+            return "cuda_kernel_parameter";
+        if (target == VERNON_TARGET_METAL)
+            return "metal_constant_buffer";
+        std::string transport = row.getString("value_transport").value_or("").str();
+        if (transport.empty() && row.getString("vernon.interface").value_or("") == "resource")
+            transport = "storage_buffer";
+        if (transport == "storage_buffer")
+            return "vulkan_std430_storage_buffer";
+        if (target == VERNON_TARGET_VULKAN) {
+            if (transport == "uniform_buffer")
+                return "vulkan_std140_uniform_buffer";
+            if (transport == "push_constant")
+                return "vulkan_push_constant";
+        } else if (target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES) {
+            if (transport == "uniform_buffer")
+                return "vulkan_std140_uniform_buffer";
+            if (transport == "push_constant" || transport == "native_uniform")
+                return "opengl_native_uniform";
+        } else if (target == VERNON_TARGET_DIRECTX && (transport == "uniform_buffer" || transport == "push_constant")) {
+            return "directx_constant_buffer";
+        }
+        return std::nullopt;
+    };
+    for (llvm::json::Value &entryValue : *entries) {
+        llvm::json::Object *entry = entryValue.getAsObject();
+        llvm::json::Object *entryLayouts = entry ? entry->getObject("physical_layouts") : nullptr;
+        if (!entry || !entryLayouts) {
+            diagnostics = "compiler reflection entry has no physical layout table";
+            return false;
+        }
+        std::set<std::string> retainedProfiles;
+        for (llvm::StringRef field : {"arguments", "results"}) {
+            llvm::json::Array *rows = entry->getArray(field);
+            if (!rows) {
+                diagnostics = "compiler reflection entry has no " + field.str() + " table";
+                return false;
+            }
+            for (llvm::json::Value &rowValue : *rows) {
+                llvm::json::Object *row = rowValue.getAsObject();
+                llvm::json::Object *layouts = row ? row->getObject("physical_layouts") : nullptr;
+                if (!row || !layouts) {
+                    diagnostics = "compiler reflection value has no physical layout table";
+                    return false;
+                }
+                const std::optional<std::string> profile = selectedProfile(*row);
+                if (profile) {
+                    const std::set<std::string> selected{*profile};
+                    prune(*layouts, selected);
+                } else {
+                    prune(*layouts, allowed);
+                }
+                for (const auto &[name, _] : *layouts)
+                    retainedProfiles.insert(name.str());
+            }
+        }
+        prune(*entryLayouts, retainedProfiles.empty() ? allowed : retainedProfiles);
+    }
+    reflection.clear();
+    llvm::raw_string_ostream stream(reflection);
+    stream << llvm::json::Value(std::move(*root));
+    return true;
 }
 
 bool setCpuReflectionSymbols(std::string &reflection, const std::vector<vernon::CpuAbiWrapperMetadata> &metadata) {

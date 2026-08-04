@@ -173,7 +173,11 @@ command buffer, context, or stream; provider draw and dispatch callbacks record
 commands but never finish or submit it. Immediate invocation creates an
 ephemeral encoder, records once, finishes, and submits once. ExecutionGraph
 uses the same contract across all compiled scopes and submits once after the
-last scope. Encoder lookup uses an O(1) generation-checked registry and a
+last scope. Concurrent ExecutionGraph executions on one device serialize their
+complete command-encoder lifecycle through a device session because the
+synchronous RHI contract permits only one active encoder per device; this
+policy is independent of Runtime contexts and graph contents. Encoder lookup
+uses an O(1) generation-checked registry and a
 per-encoder lock; backend submission and fence waits never hold the registry
 lock. Recording retains an O(1)-deduplicated set of RHI resources plus prepared
 pipeline and binding objects. Owned submissions release those references after

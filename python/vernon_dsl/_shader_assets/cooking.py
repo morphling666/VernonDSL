@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .._versions import PIPELINE_VERSION
+from ..ad import ProgramTransformSpec
 from ..bundle import (
+    BundlePlan,
     CompiledStage,
     OpenGLTargetOptions,
     PipelineCompileError,
@@ -16,11 +18,15 @@ from ..bundle import (
     compiled_stage_from_program,
     make_target_options,
     materialize_bundle,
+    with_content_hash,
 )
-from ..compiler import compile_file
+from ..compiler import Compiler, FrontendCompileRequest, compile_file
+from ..frontend.autodiff_native import AutodiffNativeLoweringError, emit_native_autodiff_modules
+from ..frontend.autodiff_profiles import build_autodiff_profile_plan
 from ..language.stage_registry import validate_stage_target
 from ..module_graph import load_project
 from .artifact_io import write_external_artifact
+from .cpu_registration import write_cpu_static_registration
 from .descriptors import ShaderModuleDescriptor, ShaderStageReference
 from .parsing import parse_python_pipeline_asset, pipeline_asset_reference
 
@@ -141,6 +147,10 @@ def cook_pipeline_asset(
     elif isinstance(target, str):
         target = make_target_options(target)
     target_name = target.target
+    if pipeline.transform is not None and set(pipeline.stages) != {"compute"}:
+        raise PipelineCompileError(
+            "initial VJP asset cooking supports compute pipelines only; no primal-only substitute was emitted"
+        )
     if target_name == "cpu" and set(pipeline.stages) != {"compute"}:
         raise PipelineCompileError("CPU pipeline bundles support one compute stage and no graphics or barrier steps")
     for stage in pipeline.stages:
@@ -165,15 +175,36 @@ def cook_pipeline_asset(
             raise PipelineCompileError("variant requests undeclared feature(s): " + ", ".join(sorted(unknown)))
 
     output_path = Path(output).resolve()
-    output_path.mkdir(parents=True, exist_ok=True)
     planned_variants: list[tuple[tuple[str, ...], dict[str, CompiledStage]]] = []
+    differentiated_variants: list[dict[str, Any]] = []
+    differentiated_stages: dict[str, CompiledStage] = {}
     compile_cache: dict[tuple[str, str, str, str], CompiledStage] = {}
     compiler = native.Compiler()
+    transform = None
+    resolved_transform = None
+    if pipeline.transform is not None:
+        transform_values = dict(pipeline.transform)
+        transform_values.pop("identity", None)
+        transform = ProgramTransformSpec(
+            kind=str(transform_values["kind"]),
+            wrt=tuple(transform_values["wrt"]),
+            rule_set=transform_values.get("rule_set"),
+            rule_set_identity=transform_values.get("rule_set_identity"),
+            output_cotangents=tuple(transform_values.get("output_cotangents", ())),
+            gradient_policy=str(transform_values["gradient_policy"]),
+            accumulation_policy=str(transform_values["accumulation_policy"]),
+            tape_policy=str(transform_values["tape_policy"]),
+            derivative_rules_version=int(transform_values["derivative_rules_version"]),
+        )
     for variant in pipeline.variants:
         stages: dict[str, CompiledStage] = {}
         for stage, reference in pipeline.stages.items():
             module = selected_modules[stage]
-            mlir = compile_file(module.source, features=variant, entry=reference.entry)
+            mlir = compile_file(
+                module.source,
+                features=variant,
+                entry=reference.entry,
+            )
             key = (
                 reference.module,
                 reference.entry,
@@ -188,6 +219,93 @@ def cook_pipeline_asset(
                 compile_cache[key] = compiled
             stages[stage] = compiled
         planned_variants.append((variant, stages))
+        if transform is not None:
+            frontend = Compiler().compile_request(
+                FrontendCompileRequest(
+                    selected_modules["compute"].source,
+                    pipeline.stages["compute"].entry,
+                    variant,
+                    program_transform=transform,
+                )
+            )
+            if frontend.program_graph is None or frontend.autodiff_profiles is None:
+                raise PipelineCompileError("VJP frontend produced no differentiated profile plan")
+            variant_transform = ProgramTransformSpec(
+                kind=transform.kind,
+                wrt=transform.wrt,
+                rule_set=transform.rule_set,
+                rule_set_identity=transform.rule_set_identity,
+                output_cotangents=frontend.program_graph.reverse.cotangent_paths,
+                gradient_policy=transform.gradient_policy,
+                accumulation_policy=transform.accumulation_policy,
+                tape_policy=transform.tape_policy,
+                derivative_rules_version=transform.derivative_rules_version,
+            )
+            if resolved_transform is None:
+                resolved_transform = variant_transform
+            elif resolved_transform.output_cotangents != variant_transform.output_cotangents:
+                raise PipelineCompileError("VJP variants must expose the same canonical output cotangent paths")
+            profile_plan = build_autodiff_profile_plan(variant_transform, frontend.program_graph)
+            try:
+                profile_modules = emit_native_autodiff_modules(
+                    frontend.program_graph,
+                    profile_plan,
+                    target=target_name,
+                )
+            except AutodiffNativeLoweringError as error:
+                raise PipelineCompileError(str(error)) from None
+            profile_programs: dict[str, dict[str, str]] = {"primal": {"compute": stages["compute"].id}}
+            module = selected_modules["compute"]
+            for profile_name, profile_mlir in profile_modules.items():
+                profile = next(value for value in profile_plan.profiles if value.name == profile_name)
+                profile_manifest = canonical_json(
+                    {
+                        "module": module.id,
+                        "profile": profile_name,
+                        "profiles_identity": profile_plan.identity,
+                        "transform_identity": variant_transform.identity,
+                    }
+                )
+                profile_module = ShaderModuleDescriptor(
+                    f"{module.id}/ad/{profile_name}",
+                    module.source,
+                    module.manifest_path,
+                    profile_manifest,
+                )
+                profile_stage = _compile_stage(
+                    profile_module,
+                    ShaderStageReference(profile_module.id, profile.symbol),
+                    "compute",
+                    variant,
+                    resolved_target,
+                    compiler,
+                    native_target,
+                    profile_mlir,
+                )
+                profile_stage = CompiledStage(
+                    profile_stage.module,
+                    profile_stage.module_manifest,
+                    profile_stage.entry,
+                    profile_stage.stage,
+                    profile_stage.target,
+                    profile_stage.reflection,
+                    profile_stage.interface,
+                    profile_stage.artifact,
+                    {
+                        **dict(profile_stage.metadata),
+                        "autodiff_profile": profile_name,
+                        "autodiff_profiles_identity": profile_plan.identity,
+                    },
+                )
+                differentiated_stages[profile_stage.id] = profile_stage
+                profile_programs[profile_name] = {"compute": profile_stage.id}
+            differentiated_variants.append(
+                {
+                    "key": list(variant),
+                    "plan": profile_plan.manifest_dict(),
+                    "programs": profile_programs,
+                }
+            )
 
     compiled_targets = {
         canonical_json(stage.target.spec): stage.target for _, stages in planned_variants for stage in stages.values()
@@ -201,6 +319,25 @@ def cook_pipeline_asset(
         sorted({feature for variant in pipeline.variants for feature in variant}),
         planned_variants,
     )
+    if transform is not None:
+        assert resolved_transform is not None
+        transform = resolved_transform
+        differentiated_record: dict[str, Any] = {
+            "variants": differentiated_variants,
+        }
+        differentiated_record["identity"] = hashlib.sha256(
+            canonical_json(differentiated_record).encode("utf-8")
+        ).hexdigest()
+        plan = BundlePlan(
+            plan.pipeline_id,
+            plan.target,
+            plan.features,
+            plan.variants,
+            (*plan.stages, *(differentiated_stages[key] for key in sorted(differentiated_stages))),
+            {**transform.to_dict(), "identity": transform.identity},
+            differentiated_record,
+        )
+    output_path.mkdir(parents=True, exist_ok=True)
     descriptors = {
         stage.id: write_external_artifact(
             output_path, stage.artifact.data, stage.artifact.format, stage.stage, stage.artifact.filename
@@ -208,6 +345,13 @@ def cook_pipeline_asset(
         for stage in plan.stages
     }
     bundle = materialize_bundle(plan, descriptors)
+    if target_name == "cpu":
+        registration = write_cpu_static_registration(
+            output_path,
+            [str(stage.metadata.get("symbol", "")) for stage in plan.stages],
+        )
+        bundle["cpu_static_registration"] = registration
+        bundle = with_content_hash(bundle)
     manifest = output_path / f"{output_path.name}.pipeline.json"
     manifest.write_text(
         json.dumps(bundle, indent=2, sort_keys=True, ensure_ascii=False) + "\n",

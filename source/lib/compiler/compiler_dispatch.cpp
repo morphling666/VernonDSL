@@ -5,6 +5,7 @@
 #include "compiler_cuda.h"
 #include "compiler_dxc.h"
 #include "compiler_frontend.h"
+#include "compiler_reflection.h"
 #include "compiler_spirv.h"
 #include "compiler_spirv_cross.h"
 
@@ -22,16 +23,43 @@ std::string copyStringView(VernonStringView value) {
     return value.data && value.size ? std::string(value.data, value.size) : std::string();
 }
 
+VernonTargetCapabilities queryTargetCapabilities(VernonTarget target) {
+#if !defined(VERNON_DXC_EXECUTABLE)
+    if (target == VERNON_TARGET_DIRECTX)
+        return {};
+#endif
+    switch (target) {
+    case VERNON_TARGET_CPU:
+        return {1, 1, 1, 1, 1};
+    case VERNON_TARGET_VULKAN:
+        return {1, 1, 1, 1, 0};
+    case VERNON_TARGET_CUDA:
+        return {1, 0, 1, 1, 1};
+    case VERNON_TARGET_OPENGL:
+    case VERNON_TARGET_OPENGL_ES:
+    case VERNON_TARGET_METAL:
+    case VERNON_TARGET_DIRECTX:
+        return {1, 1, 1, 0, 0};
+    }
+    return {};
+}
+
 bool validateTargetCapabilities(PreparedModule &prepared, VernonTarget target, std::string &diagnostics) {
     mlir::OwningOpRef<mlir::ModuleOp> module = prepared.clone();
     bool usesDeviceAtomics = false;
+    bool usesFloatDeviceAtomics = false;
     module->walk([&](mlir::vernon::PhysicalAtomicOp atomic) {
         auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(atomic.getStorage().getType());
         usesDeviceAtomics |= view && view.getAddressSpace() == "device";
+        usesFloatDeviceAtomics |= view && view.getAddressSpace() == "device" && view.getElementType().isF32();
     });
-    if (usesDeviceAtomics && target != VERNON_TARGET_CPU && target != VERNON_TARGET_CUDA &&
-        target != VERNON_TARGET_VULKAN) {
-        diagnostics = "device-scope storage TensorView atomics are supported only by CPU, CUDA, and Vulkan targets";
+    const VernonTargetCapabilities capabilities = queryTargetCapabilities(target);
+    if (usesFloatDeviceAtomics && !capabilities.supports_f32_device_atomic_add) {
+        diagnostics = "device-scope f32 atomic add requires a target float-atomic capability";
+        return false;
+    }
+    if (usesDeviceAtomics && !capabilities.supports_device_storage_atomics) {
+        diagnostics = "device-scope storage TensorView atomics require a target storage-atomic capability";
         return false;
     }
     if (target != VERNON_TARGET_CPU && target != VERNON_TARGET_CUDA)
@@ -101,22 +129,7 @@ bool validateTargetCapabilities(PreparedModule &prepared, VernonTarget target, s
 
 } // namespace
 
-VernonTargetCapabilities targetCapabilities(VernonTarget target) {
-#if !defined(VERNON_DXC_EXECUTABLE)
-    if (target == VERNON_TARGET_DIRECTX)
-        return VernonTargetCapabilities{0, 0, 0, 0};
-#endif
-    if (target == VERNON_TARGET_CPU || target == VERNON_TARGET_VULKAN)
-        return VernonTargetCapabilities{1, 1, 1, 0};
-    if (target == VERNON_TARGET_CUDA)
-        return VernonTargetCapabilities{1, 0, 1, 0};
-    if (target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES || target == VERNON_TARGET_METAL ||
-        target == VERNON_TARGET_DIRECTX)
-        return VernonTargetCapabilities{1, 1, 1, 0};
-    // Do not advertise an IR-only path as a usable target; availability means
-    // the complete lowering and artifact pipeline is linked.
-    return VernonTargetCapabilities{0, 0, 0, 0};
-}
+VernonTargetCapabilities targetCapabilities(VernonTarget target) { return queryTargetCapabilities(target); }
 
 CompileOptions defaultCompileOptions(VernonTarget target) {
     switch (target) {
@@ -216,6 +229,10 @@ VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }
+        if (!selectTargetPhysicalLayouts(reflection, target, diagnostics)) {
+            artifacts.clear();
+            return VERNON_STATUS_INTERNAL_ERROR;
+        }
         if (!addArtifactTable(reflection, diagnostics, artifacts, options)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
@@ -251,6 +268,10 @@ VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options
             }
             artifacts = std::move(dxilArtifacts);
         }
+        if (!selectTargetPhysicalLayouts(reflection, target, diagnostics)) {
+            artifacts.clear();
+            return VERNON_STATUS_INTERNAL_ERROR;
+        }
         if (!addArtifactTable(reflection, diagnostics, artifacts, options, targetResourceSlots)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
@@ -259,6 +280,10 @@ VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options
     }
     if (target == VERNON_TARGET_CUDA) {
         if (!compileCuda(module, artifacts, diagnostics)) {
+            artifacts.clear();
+            return VERNON_STATUS_INTERNAL_ERROR;
+        }
+        if (!selectTargetPhysicalLayouts(reflection, target, diagnostics)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }

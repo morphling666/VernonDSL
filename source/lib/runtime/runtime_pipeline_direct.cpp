@@ -11,6 +11,29 @@
 namespace vernon::runtime {
 namespace {
 
+bool parseAutodiffResourceRole(const nlohmann::json &argument, AutodiffResourceRole &role, std::string &error) {
+    const std::string value = argument.value("vernon.autodiff_role", "");
+    if (value.empty())
+        return true;
+    if (value == "input")
+        role = AutodiffResourceRole::Input;
+    else if (value == "storage")
+        role = AutodiffResourceRole::Storage;
+    else if (value == "output")
+        role = AutodiffResourceRole::Output;
+    else if (value == "tape")
+        role = AutodiffResourceRole::Tape;
+    else if (value == "cotangent")
+        role = AutodiffResourceRole::Cotangent;
+    else if (value == "gradient")
+        role = AutodiffResourceRole::Gradient;
+    else {
+        error = "compute artifact reflection contains an unknown autodiff resource role";
+        return false;
+    }
+    return true;
+}
+
 bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &entry, Variant &variant,
                                ReflectedEntry &reflection, VernonRuntimeBackend backend, std::string &error) {
     if (!parseReflection(root, entry, reflection, backend, error))
@@ -40,10 +63,13 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
             continue;
         Parameter parameter;
         parameter.slot = slot;
-        parameter.name = argument.value("name", "argument" + std::to_string(slot));
+        parameter.name =
+            argument.value("vernon.source_name", argument.value("name", "argument" + std::to_string(slot)));
         const std::string reflectedKind = argument.value("kind", std::string());
         parameter.kind = reflectedKind == "texture" || reflectedKind == "sampler" ? reflectedKind : "tensor";
         parameter.source = "direct";
+        if (!parseAutodiffResourceRole(argument, parameter.autodiffRole, error))
+            return false;
         if (parameter.kind == "tensor" &&
             (!argument.contains("element_layout") ||
              !parsePipelineValueLayout(argument["element_layout"], parameter.elementLayout, error)))
@@ -136,6 +162,17 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
 }
 
 } // namespace
+
+bool buildReflectedComputeVariant(const Stage &stage, VernonRuntimeBackend backend, Variant &variant,
+                                  std::string &error) {
+    const nlohmann::json reflection = nlohmann::json::parse(stage.reflection, nullptr, false);
+    if (reflection.is_discarded()) {
+        error = "compute artifact reflection is invalid JSON";
+        return false;
+    }
+    ReflectedEntry entry;
+    return buildDirectComputeVariant(reflection, stage.entry, variant, entry, backend, error);
+}
 
 VernonStatus registerBackendStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint entryPoint) {
     return registerStaticCpuEntry(symbol, entryPoint);

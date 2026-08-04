@@ -512,7 +512,7 @@ TEST(CompilerSynchronization, LowersStorageTensorViewAtomicsOnlyForVerifiedTarge
         EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_UNSUPPORTED_TARGET);
         EXPECT_EQ(vernonCompileResultGetArtifactCount(result), 0u);
         const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
-        EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("supported only by CPU, CUDA, and Vulkan"),
+        EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("target storage-atomic capability"),
                   std::string_view::npos);
         vernonCompileResultDestroy(result);
     }

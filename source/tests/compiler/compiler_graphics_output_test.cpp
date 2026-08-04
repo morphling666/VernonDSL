@@ -814,8 +814,14 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         const std::string_view reflected(reflection.data, reflection.size);
         EXPECT_NE(reflected.find("\"kind\":\"tensor_value\""), std::string_view::npos);
         EXPECT_NE(reflected.find("\"shape\":[2,2,2]"), std::string_view::npos);
-        EXPECT_NE(reflected.find("\"profile\":\"vulkan_std430_storage_buffer\""), std::string_view::npos);
-        EXPECT_NE(reflected.find("\"profile\":\"cuda_kernel_parameter\""), std::string_view::npos);
+        EXPECT_EQ(reflected.find("\"profile\":\"vulkan_std430_storage_buffer\"") != std::string_view::npos,
+                  target != VERNON_TARGET_CUDA);
+        EXPECT_EQ(reflected.find("\"profile\":\"cuda_kernel_parameter\"") != std::string_view::npos,
+                  target == VERNON_TARGET_CUDA);
+        EXPECT_EQ(reflected.find("\"profile\":\"host_value\""), std::string_view::npos);
+        EXPECT_EQ(reflected.find("\"profile\":\"metal_constant_buffer\""), std::string_view::npos);
+        EXPECT_EQ(reflected.find("\"profile\":\"directx_constant_buffer\""), std::string_view::npos);
+        EXPECT_EQ(reflected.find("\"profile\":\"opengl_native_uniform\""), std::string_view::npos);
         EXPECT_NE(reflected.find("\"byte_strides\":[16,8,4]"), std::string_view::npos);
         EXPECT_NE(reflected.find("\"size\":32"), std::string_view::npos);
         EXPECT_NE(reflected.find("\"value_transport\":\"storage_buffer\""), std::string_view::npos);

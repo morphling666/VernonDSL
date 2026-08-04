@@ -405,9 +405,10 @@ The portable floating-point math surface includes `sin`, `cos`, `acos`,
 
 Tuple destructuring, short-circuit `and`/`or`, conditional expressions,
 dynamic `range`, `break`, `continue`, and nested/early return are implemented
-current phases under `COMPILER_CONTRACT_VERSION`. Autodiff coverage
-for Phase 5B control flow remains deferred until derivative and tape policies
-land. Chained comparisons, recursion, dynamic allocation, exceptions,
+current phases under `COMPILER_CONTRACT_VERSION`. Compute autodiff accepts
+pure-Value early returns and literal-bounded loops with one dynamic leading
+`if condition: break` guard; general dynamic `range`, `while`, `continue`, and
+loop-local return remain deferred. Chained comparisons, recursion, dynamic allocation, exceptions,
 generators, arbitrary classes, Python list/dict semantics, and Python object
 mutation remain deferred.
 
@@ -419,8 +420,8 @@ a runtime contract violation and must never silently execute zero iterations.
 Fixed-width overflow must terminate the range rather than wrap into an
 unbounded loop. A target without a legal contract-violation mechanism must
 reject dynamic step values during capability validation. Phase 5B control flow
-is outside the accepted autodiff domain until separate derivative and tape
-policies are specified.
+outside the accepted compute-autodiff subset above remains deferred until
+separate derivative and tape policies are specified.
 
 Frontend acceptance guarantees well-typed Vernon IR, not that every target
 implements every operation. Unsupported target/type/stage combinations fail
@@ -428,65 +429,53 @@ explicitly and never silently narrow or change semantics.
 
 ## 8. First-order autodiff
 
-Autodiff transforms specialized, validated typed IR; it never executes Python
-to trace a function. V4 defines:
+The complete normative design is [`../autodiff.md`](../autodiff.md).
+Autodiff transforms specialized, validated typed IR and never executes Python
+to trace a function.
 
-- `jvp(f, primals, tangents)` for first-order forward mode;
-- `vjp(f, primals)` for a primal result and first-order pullback;
-- `grad(f)` for scalar-output reverse-mode gradients;
-- `value_and_grad(f)` for a primal value and gradient;
-- `stop_gradient(value)` as an explicit zero-tangent boundary;
-- versioned custom JVP and VJP rules with validated primal, tangent, and
-  adjoint signatures.
+The initial public reverse-mode surface is one transform:
+`vd.ad.vjp(program, wrt=..., rules=...)`. It produces a program whose execution
+returns primal outputs and a pullback. Applying the pullback to explicit output
+cotangents returns gradients for the canonical input paths selected by `wrt`.
+One floating Scalar output may omit its cotangent and uses seed `1`.
+Tensor/aggregate outputs may not omit cotangents and are never implicitly
+reduced.
 
-The future autodiff graph is a compiler-internal `ProgramGraph` for one
-specialized Kernel or graphics Pipeline program. Its nodes and edges represent
-typed value flow, control flow, Storage effects, and differentiation
-dependencies inside that program. It is not a host orchestration graph and
-does not order PipelineAssets, dispatches, render passes, or backend
-transitions.
+Authored Kernel and graphics entry signatures do not change. The language has
+no `grad_or_not`, `requires_grad`, implicit `.grad`, global gradient clearing,
+or context that silently executes backward work. `pipeline_asset()` remains the
+only cookable declaration; a VJP is represented by a declarative
+`ProgramExpression` in its `program=` operand.
 
 Floating-point Scalar leaves are differentiable. Tensor, Tuple, and Struct
-Values derive tangent and adjoint structure recursively from their leaves.
-Integer, Boolean, Storage, Resource, sampler, and opaque leaves are
-non-differentiable unless a custom operation rule explicitly handles them.
-Derivative Values have ordinary deterministic Value types; dual numbers are
-not embedded into Tensor element types.
+Values derive adjoint structure recursively from floating leaves. Floating
+Scalar and immutable Tensor gradients are ordinary Values. A differentiated
+TensorView or mutable Storage input produces newly owned gradient Storage.
+Integer, Boolean, Resource handle, sampler state, and opaque leaves are
+non-differentiable unless a custom operation rule consumes them without
+requesting a gradient. Gradients never change primal type or identity.
 
-`TensorStorage.grad` denotes separately allocated companion storage managed by
-the runtime. It is never an autodiff object embedded in a Tensor dtype and
-never changes primal storage identity.
+The compiler-internal `ProgramGraph` for one specialized program represents
+typed Value flow, structured control flow, Storage effects, aliases, saved
+Values, and reverse dependencies. It is not a host orchestration graph.
+Stateful differentiation requires legal mutation functionalization, bounded
+tape, effect-preserving reverse traversal, alias/race validation, and
+deterministic or capability-checked gather/scatter accumulation.
 
-The initial accepted domain is pure, non-recursive `@func` code with validated
-numeric operations and structured first-order control flow explicitly covered
-by derivative rules. Arithmetic, casts, Tensor construction, `matmul`, and
-supported math intrinsics must define behavior at non-differentiable points.
-Analytical results are checked against finite differences and supported
-backends are compared with CPU reference behavior.
+Arithmetic, casts, Tensor construction, `matmul`, and supported math intrinsics
+use versioned built-in VJP rules. Graphics pipelines require a named versioned
+custom-rule set for rasterization, visibility, depth, blending, and texture
+sampling. Missing rules are errors. Texture rules may differentiate
+coordinates and texel data explicitly exposed as Storage; Texture handles and
+sampler state remain non-differentiable.
 
-Nested or higher-order transforms are rejected by the current contract. This includes
-`grad(grad(f))`, Hessians, Hessian-vector products, and differentiating a
-generated pullback. Generated derivative IR remains typed so a future language
-version may lift this restriction without changing the Value/Storage model.
+`VernonExecutionGraph` remains host orchestration. Applying `vd.ad.vjp` to an
+ExecutionGraph composes already cooked node VJP profiles into a reverse
+execution plan; it does not turn the graph into another shader asset.
 
-Stateful-kernel autodiff is not part of the initial implementation. It
-requires all of the following before acceptance:
-
-- functionalization of local mutation and Storage writes;
-- alias and race validation;
-- gather/scatter adjoints and deterministic or atomic accumulation;
-- branch/loop tape layout, bounded-loop rules, checkpointing, and
-  recomputation policy;
-- explicit primal and gradient storage bindings;
-- a typed program-internal graph capable of effect-preserving reverse traversal
-  and tape planning.
-
-Texture sampling requires custom gradient rules that distinguish coordinate,
-texel, and sampler inputs. Sampler state is non-differentiable. Rasterization,
-visibility, depth tests, blending decisions, and discontinuous material
-branches are non-differentiable unless explicit custom primitives define their
-derivatives. Differentiating fragment arithmetic alone does not imply
-differentiable rendering.
+JVP, full-Jacobian materialization, convenience `grad` aliases, implicit
+gradient accumulation, nested transforms, Hessians, and Hessian-vector
+products are outside the initial public surface.
 
 ## 9. Legacy migration
 
@@ -515,9 +504,9 @@ cache identity.
 | Layout | Backend/runtime details | Dense strided views, AoS field projections, explicit alias rules | Transparent sparse layouts and SNode trees |
 | Aggregates | Nominal immutable Struct; Vector/Matrix constructors | Tensor, structural Tuple, nominal Struct; no Array | Enums and tagged unions |
 | Effects | Typed read/write records | Region-aware reads/writes, relaxed i32/u32 atomics, and typed barriers | Additional atomic types/orderings and full race model |
-| Autodiff | Not implemented | First-order pure typed-IR JVP/VJP/grad | Higher-order and stateful-kernel AD |
+| Autodiff | Not implemented | First-order VJP over typed programs, stateful Kernels, and versioned graphics custom rules | JVP, full Jacobians, convenience aliases, and higher-order AD |
 | Control flow | Tuple destructuring, short-circuit expressions, early return, dynamic range, break, and continue | Current subset plus explicitly AD-covered flow | Unrestricted recursion and Python-only control flow |
-| Rendering | Typed graphics stages, textures, samplers | Same model with explicit Resource and derivative boundaries | General differentiable rasterization |
+| Rendering | Typed graphics stages, textures, samplers | Same model with versioned rasterization/visibility/depth/blend/texture VJP boundaries | Graphics derivatives without explicit accepted custom rules |
 
 ## 11. Workload expressiveness
 

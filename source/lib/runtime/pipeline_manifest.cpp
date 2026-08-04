@@ -1,9 +1,11 @@
 #include "pipeline_manifest.h"
+#include "content_hash.h"
 #include "pipeline_metadata.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <set>
 #include <string_view>
@@ -1226,6 +1228,313 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
         return false;
     }
     return variant.validate(error);
+}
+
+bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifest, std::string &error) {
+    const bool hasTransform = root.contains("program_transform");
+    const bool hasProfiles = root.contains("autodiff_profiles");
+    if (hasTransform != hasProfiles) {
+        error = "pipeline autodiff manifest requires both program_transform and autodiff_profiles";
+        return false;
+    }
+    if (!hasTransform)
+        return true;
+    const nlohmann::json &transform = root["program_transform"];
+    const nlohmann::json &profiles = root["autodiff_profiles"];
+    auto validIdentity = [](const nlohmann::json &value) {
+        if (!value.is_string())
+            return false;
+        const std::string &text = value.get_ref<const std::string &>();
+        return text.size() == 64 && std::all_of(text.begin(), text.end(), [](unsigned char character) {
+                   return (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f');
+               });
+    };
+    auto verifyIdentity = [&](const nlohmann::json &value, const char *label) {
+        if (!value.is_object() || !value.contains("identity") || !validIdentity(value["identity"]))
+            return false;
+        nlohmann::json canonical = value;
+        const std::string expected = canonical["identity"].get<std::string>();
+        canonical.erase("identity");
+        const std::string bytes = canonical.dump(-1, ' ', false, nlohmann::json::error_handler_t::strict);
+        if (sha256Hex(bytes.data(), bytes.size()) == expected)
+            return true;
+        error = std::string(label) + " identity does not match canonical content";
+        return false;
+    };
+    auto parseLaunchSize = [](const nlohmann::json &value, VernonLaunchSize &size) {
+        if (!value.is_array() || value.size() != 3)
+            return false;
+        uint64_t dimensions[3]{};
+        for (size_t index = 0; index < 3; ++index)
+            if (!parseUint64(value[index], dimensions[index]) || !dimensions[index] || dimensions[index] > UINT32_MAX)
+                return false;
+        size = {static_cast<uint32_t>(dimensions[0]), static_cast<uint32_t>(dimensions[1]),
+                static_cast<uint32_t>(dimensions[2])};
+        return true;
+    };
+    auto parseCanonicalStrings = [](const nlohmann::json &value, std::vector<std::string> &result, bool allowEmpty) {
+        if (!value.is_array() || (!allowEmpty && value.empty()))
+            return false;
+        for (const nlohmann::json &item : value) {
+            if (!item.is_string() || item.get_ref<const std::string &>().empty())
+                return false;
+            result.push_back(item.get<std::string>());
+        }
+        return std::is_sorted(result.begin(), result.end()) &&
+               std::adjacent_find(result.begin(), result.end()) == result.end();
+    };
+    if (!transform.is_object() ||
+        !hasOnlyKeys(transform,
+                     {"kind", "wrt", "output_cotangents", "gradient_policy", "accumulation_policy", "tape_policy",
+                      "derivative_rules_version", "identity", "rule_set", "rule_set_identity"}) ||
+        transform.value("kind", "") != "vjp" || !transform.contains("wrt") || !transform["wrt"].is_array() ||
+        !transform.contains("output_cotangents") || !transform["output_cotangents"].is_array() ||
+        transform.value("gradient_policy", "") != "f16:f32,f32:f32,f64:f64" ||
+        transform.value("accumulation_policy", "") != "fresh" || transform.value("tape_policy", "") != "bounded" ||
+        transform.value("derivative_rules_version", 0) != 1 || !verifyIdentity(transform, "program transform")) {
+        if (error.empty())
+            error = "pipeline program_transform is invalid";
+        return false;
+    }
+    for (const nlohmann::json &path : transform["wrt"]) {
+        if (!path.is_string() || path.get_ref<const std::string &>().empty()) {
+            error = "pipeline program_transform wrt paths are invalid";
+            return false;
+        }
+        manifest.wrt.push_back(path.get<std::string>());
+    }
+    if (manifest.wrt.empty() || !std::is_sorted(manifest.wrt.begin(), manifest.wrt.end()) ||
+        std::adjacent_find(manifest.wrt.begin(), manifest.wrt.end()) != manifest.wrt.end()) {
+        error = "pipeline program_transform wrt paths are not canonical";
+        return false;
+    }
+    for (const nlohmann::json &path : transform["output_cotangents"]) {
+        if (!path.is_string() || path.get_ref<const std::string &>().empty()) {
+            error = "pipeline program_transform output cotangent paths are invalid";
+            return false;
+        }
+        manifest.outputCotangents.push_back(path.get<std::string>());
+    }
+    if (manifest.outputCotangents.empty() ||
+        !std::is_sorted(manifest.outputCotangents.begin(), manifest.outputCotangents.end()) ||
+        std::adjacent_find(manifest.outputCotangents.begin(), manifest.outputCotangents.end()) !=
+            manifest.outputCotangents.end()) {
+        error = "pipeline program_transform output cotangent paths are not canonical";
+        return false;
+    }
+    manifest.transformIdentity = transform["identity"].get<std::string>();
+    if (!profiles.is_object() || !hasOnlyKeys(profiles, {"identity", "variants"}) || !profiles.contains("variants") ||
+        !profiles["variants"].is_array() || !verifyIdentity(profiles, "autodiff profiles")) {
+        if (error.empty())
+            error = "pipeline autodiff_profiles is invalid";
+        return false;
+    }
+    manifest.profilesIdentity = profiles["identity"].get<std::string>();
+    for (const nlohmann::json &value : profiles["variants"]) {
+        if (!value.is_object() || !hasOnlyKeys(value, {"key", "plan", "programs"}) || !value.contains("key") ||
+            !value["key"].is_array() || !value.contains("plan") || !value["plan"].is_object() ||
+            !value.contains("programs") || !value["programs"].is_object()) {
+            error = "autodiff variant profile is invalid";
+            return false;
+        }
+        AutodiffVariant variant;
+        for (const nlohmann::json &feature : value["key"]) {
+            if (!feature.is_string()) {
+                error = "autodiff variant feature key is invalid";
+                return false;
+            }
+            variant.key.push_back(feature.get<std::string>());
+        }
+        if (!std::is_sorted(variant.key.begin(), variant.key.end()) ||
+            std::adjacent_find(variant.key.begin(), variant.key.end()) != variant.key.end()) {
+            error = "autodiff variant feature key is not canonical";
+            return false;
+        }
+        const nlohmann::json &plan = value["plan"];
+        if (!hasOnlyKeys(plan, {"transform_identity", "program_graph_identity", "tape_bytes", "derivative_rules",
+                                "derivative_rules_version", "launch", "profiles", "identity"}) ||
+            plan.value("transform_identity", "") != manifest.transformIdentity ||
+            !plan.contains("program_graph_identity") || !validIdentity(plan["program_graph_identity"]) ||
+            !plan.contains("tape_bytes") || !parseUint64(plan["tape_bytes"], variant.tapeBytes) ||
+            plan.value("derivative_rules_version", 0) != 1 || !plan.contains("launch") || !plan["launch"].is_object() ||
+            !plan.contains("profiles") || !plan["profiles"].is_array() || plan["profiles"].size() != 3 ||
+            !verifyIdentity(plan, "autodiff plan")) {
+            if (error.empty())
+                error = "autodiff profile plan is invalid";
+            return false;
+        }
+        variant.planIdentity = plan["identity"].get<std::string>();
+        variant.programGraphIdentity = plan["program_graph_identity"].get<std::string>();
+        const nlohmann::json &launch = plan["launch"];
+        if (!hasOnlyKeys(launch, {"workgroup_size", "accumulation_plans"}) || !launch.contains("workgroup_size") ||
+            !parseLaunchSize(launch["workgroup_size"], variant.launch.workgroupSize) ||
+            !launch.contains("accumulation_plans") || !launch["accumulation_plans"].is_array() ||
+            launch["accumulation_plans"].size() != manifest.wrt.size()) {
+            error = "autodiff launch plan is invalid";
+            return false;
+        }
+        std::vector<std::string> accumulationPaths;
+        for (const nlohmann::json &resource : launch["accumulation_plans"]) {
+            if (!resource.is_object() || !hasOnlyKeys(resource, {"path", "mode", "evidence", "invocation_axes"}) ||
+                !resource.contains("path") || !resource["path"].is_string() ||
+                resource["path"].get_ref<const std::string &>().empty() || !resource.contains("mode") ||
+                !resource["mode"].is_string() || !resource.contains("evidence") ||
+                !resource.contains("invocation_axes") || !resource["invocation_axes"].is_array()) {
+                error = "autodiff resource accumulation plan is invalid";
+                return false;
+            }
+            AutodiffAccumulationPlan accumulation;
+            accumulation.path = resource["path"].get<std::string>();
+            const std::string mode = resource.value("mode", "");
+            if (mode == "reduce_sum")
+                accumulation.operation = AutodiffAccumulationPlan::Operation::ReduceSum;
+            else if (mode == "scatter_add")
+                accumulation.operation = AutodiffAccumulationPlan::Operation::ScatterAdd;
+            else {
+                error = "autodiff resource accumulation operation is invalid";
+                return false;
+            }
+            if (!parseCanonicalStrings(resource["evidence"], accumulation.evidence, true)) {
+                error = "autodiff resource accumulation evidence is invalid";
+                return false;
+            }
+            constexpr std::array<std::string_view, 5> evidenceKinds{"disjoint_scatter", "injective_global_index",
+                                                                    "non_injective_index", "shared_value",
+                                                                    "static_index_conflict"};
+            if (std::any_of(accumulation.evidence.begin(), accumulation.evidence.end(), [&](const std::string &item) {
+                    return std::find(evidenceKinds.begin(), evidenceKinds.end(), item) == evidenceKinds.end();
+                })) {
+                error = "autodiff resource accumulation evidence is unknown";
+                return false;
+            }
+            for (const nlohmann::json &axisValue : resource["invocation_axes"]) {
+                uint32_t axis = 0;
+                if (!parseUint32(axisValue, axis) || axis >= 3 ||
+                    (!accumulation.invocationAxes.empty() && accumulation.invocationAxes.back() >= axis)) {
+                    error = "autodiff resource invocation axes are not canonical";
+                    return false;
+                }
+                accumulation.invocationAxes.push_back(axis);
+            }
+            const bool disjoint = std::find(accumulation.evidence.begin(), accumulation.evidence.end(),
+                                            "disjoint_scatter") != accumulation.evidence.end();
+            const bool injective = std::find(accumulation.evidence.begin(), accumulation.evidence.end(),
+                                             "injective_global_index") != accumulation.evidence.end();
+            const bool shared = std::find(accumulation.evidence.begin(), accumulation.evidence.end(), "shared_value") !=
+                                accumulation.evidence.end();
+            if ((accumulation.operation == AutodiffAccumulationPlan::Operation::ReduceSum &&
+                 (accumulation.evidence != std::vector<std::string>{"shared_value"} ||
+                  !accumulation.invocationAxes.empty())) ||
+                (accumulation.operation == AutodiffAccumulationPlan::Operation::ScatterAdd &&
+                 (shared || injective != !accumulation.invocationAxes.empty())) ||
+                (disjoint && (accumulation.operation != AutodiffAccumulationPlan::Operation::ScatterAdd ||
+                              accumulation.invocationAxes != std::vector<uint32_t>{0, 1, 2}))) {
+                error = "autodiff resource accumulation evidence is inconsistent";
+                return false;
+            }
+            accumulationPaths.push_back(accumulation.path);
+            variant.launch.accumulationPlans.push_back(std::move(accumulation));
+        }
+        if (accumulationPaths != manifest.wrt) {
+            error = "autodiff launch resources do not match the transform";
+            return false;
+        }
+        static constexpr std::string_view expectedNames[] = {"primal", "forward_with_tape", "backward"};
+        std::vector<std::string> variantGradientPaths;
+        for (size_t index = 0; index < 3; ++index) {
+            const nlohmann::json &profile = plan["profiles"][index];
+            if (!profile.is_object() || !hasOnlyKeys(profile, {"name", "symbol", "inputs", "outputs"}) ||
+                profile.value("name", "") != expectedNames[index] || profile.value("symbol", "").empty() ||
+                !profile.contains("inputs") || !profile["inputs"].is_array() || !profile.contains("outputs") ||
+                !profile["outputs"].is_array()) {
+                error = "autodiff profile ABI is invalid";
+                return false;
+            }
+            auto validBindings = [&](const nlohmann::json &bindings) {
+                return std::all_of(bindings.begin(), bindings.end(), [](const nlohmann::json &binding) {
+                    return binding.is_object() && hasOnlyKeys(binding, {"path", "type", "role"}) &&
+                           !binding.value("path", "").empty() && !binding.value("type", "").empty() &&
+                           !binding.value("role", "").empty();
+                });
+            };
+            if (!validBindings(profile["inputs"]) || !validBindings(profile["outputs"])) {
+                error = "autodiff profile bindings are invalid";
+                return false;
+            }
+            if (index == 2) {
+                const nlohmann::json &inputs = profile["inputs"];
+                if (inputs.empty() || inputs[0].value("path", "") != "tape" || inputs[0].value("role", "") != "tape") {
+                    error = "autodiff backward tape binding is invalid";
+                    return false;
+                }
+                std::vector<std::string> cotangentPaths;
+                for (size_t binding = 1; binding < inputs.size(); ++binding) {
+                    if (inputs[binding].value("role", "") != "cotangent") {
+                        error = "autodiff backward cotangent binding is invalid";
+                        return false;
+                    }
+                    cotangentPaths.push_back(inputs[binding].value("path", ""));
+                }
+                if (cotangentPaths != manifest.outputCotangents) {
+                    error = "autodiff backward cotangents do not match program transform";
+                    return false;
+                }
+                for (const nlohmann::json &binding : profile["outputs"]) {
+                    if (binding.value("role", "") != "gradient") {
+                        error = "autodiff backward gradient binding is invalid";
+                        return false;
+                    }
+                    variantGradientPaths.push_back(binding.value("path", ""));
+                }
+                if (variantGradientPaths.empty() ||
+                    !std::is_sorted(variantGradientPaths.begin(), variantGradientPaths.end()) ||
+                    std::adjacent_find(variantGradientPaths.begin(), variantGradientPaths.end()) !=
+                        variantGradientPaths.end()) {
+                    error = "autodiff gradient paths are not canonical";
+                    return false;
+                }
+            }
+        }
+        if (manifest.gradientPaths.empty())
+            manifest.gradientPaths = variantGradientPaths;
+        else if (manifest.gradientPaths != variantGradientPaths) {
+            error = "autodiff variants expose inconsistent gradient paths";
+            return false;
+        }
+        const nlohmann::json &programs = value["programs"];
+        if (!hasOnlyKeys(programs, {"primal", "forward_with_tape", "backward"})) {
+            error = "autodiff profile program table is invalid";
+            return false;
+        }
+        auto program = [&](const char *name, std::string &output) {
+            if (!programs.contains(name) || !programs[name].is_object() || !hasOnlyKeys(programs[name], {"compute"}) ||
+                !programs[name].contains("compute") || !programs[name]["compute"].is_string() ||
+                programs[name]["compute"].get_ref<const std::string &>().empty())
+                return false;
+            output = programs[name]["compute"].get<std::string>();
+            return true;
+        };
+        if (!program("primal", variant.primal) || !program("forward_with_tape", variant.forwardWithTape) ||
+            !program("backward", variant.backward)) {
+            error = "autodiff profile program reference is invalid";
+            return false;
+        }
+        manifest.variants.push_back(std::move(variant));
+    }
+    if (manifest.variants.empty()) {
+        error = "autodiff profile table is empty";
+        return false;
+    }
+    std::sort(manifest.variants.begin(), manifest.variants.end(),
+              [](const AutodiffVariant &left, const AutodiffVariant &right) { return left.key < right.key; });
+    if (std::adjacent_find(manifest.variants.begin(), manifest.variants.end(),
+                           [](const AutodiffVariant &left, const AutodiffVariant &right) {
+                               return left.key == right.key;
+                           }) != manifest.variants.end()) {
+        error = "autodiff profile table contains duplicate variants";
+        return false;
+    }
+    return true;
 }
 
 } // namespace vernon::runtime

@@ -6,7 +6,7 @@ input module. These Python objects exist for editor completion and type syntax.
 
 from typing import Annotated
 
-from . import interop, storage
+from . import ad, interop, storage
 from .compiler import Compiler, compile_file, compile_source
 from .decorators import fragment, func, kernel, struct, vertex
 from .diagnostics import CompileError
@@ -114,6 +114,7 @@ from .types import (
 
 __all__ = [
     "Annotated",
+    "ad",
     "abs",
     "acos",
     "atan2",

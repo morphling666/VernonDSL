@@ -19,6 +19,14 @@ static VernonStatus fill_grid(const VernonCpuInvocation *invocation) {
     return VERNON_STATUS_OK;
 }
 
+TEST(RuntimeCApi, AutodiffOpaqueHandleRejectsInvalidCalls) {
+    VernonPullback *pullback = reinterpret_cast<VernonPullback *>(uintptr_t{1});
+    EXPECT_EQ(vernonAdPipelineForward(nullptr, {1, 1, 1}, nullptr, nullptr, &pullback), VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(pullback, nullptr);
+    EXPECT_EQ(vernonPullbackApply(nullptr, nullptr, nullptr), VERNON_STATUS_INVALID_ARGUMENT);
+    vernonPullbackDestroy(nullptr);
+}
+
 TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     static const char static_symbol[] = "__vernon_cpu_test_fill";
     ASSERT_TRUE(vernonRuntimeRegisterStaticCpuEntry({static_symbol, sizeof(static_symbol) - 1}, fill_grid) ==

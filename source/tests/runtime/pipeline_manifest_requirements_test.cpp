@@ -1,3 +1,4 @@
+#include "runtime/content_hash.h"
 #include "runtime/pipeline_bundle.h"
 #include "runtime/pipeline_manifest.h"
 
@@ -10,6 +11,60 @@ namespace {
 
 using vernon::runtime::parseRuntimeRequirements;
 using vernon::runtime::RuntimeRequirements;
+
+nlohmann::json withIdentity(nlohmann::json value) {
+    const std::string canonical = value.dump(-1, ' ', false);
+    value["identity"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
+    return value;
+}
+
+nlohmann::json validAutodiffManifest() {
+    nlohmann::json transform = withIdentity({{"kind", "vjp"},
+                                             {"wrt", nlohmann::json::array({"x"})},
+                                             {"output_cotangents", nlohmann::json::array({"output"})},
+                                             {"gradient_policy", "f16:f32,f32:f32,f64:f64"},
+                                             {"accumulation_policy", "fresh"},
+                                             {"tape_policy", "bounded"},
+                                             {"derivative_rules_version", 1}});
+    const std::string transformIdentity = transform["identity"].get<std::string>();
+    const nlohmann::json primal = {{"path", "x"}, {"type", "f32"}, {"role", "primal"}};
+    const nlohmann::json output = {{"path", "output"}, {"type", "f32"}, {"role", "primal"}};
+    const nlohmann::json tape = {{"path", "tape"}, {"type", "!vernon.ad_tape<16>"}, {"role", "tape"}};
+    const nlohmann::json cotangent = {{"path", "output"}, {"type", "f32"}, {"role", "cotangent"}};
+    const nlohmann::json gradient = {{"path", "x"}, {"type", "f32"}, {"role", "gradient"}};
+    nlohmann::json plan = withIdentity(
+        {{"transform_identity", transformIdentity},
+         {"program_graph_identity", std::string(64, 'a')},
+         {"tape_bytes", 16},
+         {"derivative_rules", nlohmann::json::array({"mul"})},
+         {"derivative_rules_version", 1},
+         {"launch",
+          {{"workgroup_size", nlohmann::json::array({1, 1, 1})},
+           {"accumulation_plans", nlohmann::json::array({{{"path", "x"},
+                                                          {"mode", "reduce_sum"},
+                                                          {"evidence", nlohmann::json::array({"shared_value"})},
+                                                          {"invocation_axes", nlohmann::json::array()}}})}}},
+         {"profiles", nlohmann::json::array({{{"name", "primal"},
+                                              {"symbol", "main"},
+                                              {"inputs", nlohmann::json::array({primal})},
+                                              {"outputs", nlohmann::json::array({output})}},
+                                             {{"name", "forward_with_tape"},
+                                              {"symbol", "__forward"},
+                                              {"inputs", nlohmann::json::array({primal})},
+                                              {"outputs", nlohmann::json::array({output, tape})}},
+                                             {{"name", "backward"},
+                                              {"symbol", "__backward"},
+                                              {"inputs", nlohmann::json::array({tape, cotangent})},
+                                              {"outputs", nlohmann::json::array({gradient})}}})}});
+    nlohmann::json profiles =
+        withIdentity({{"variants", nlohmann::json::array({{{"key", nlohmann::json::array()},
+                                                           {"plan", plan},
+                                                           {"programs",
+                                                            {{"primal", {{"compute", "primal"}}},
+                                                             {"forward_with_tape", {{"compute", "forward"}}},
+                                                             {"backward", {{"compute", "backward"}}}}}}})}});
+    return {{"program_transform", std::move(transform)}, {"autodiff_profiles", std::move(profiles)}};
+}
 
 nlohmann::json validTensorVariant() {
     return {{"key", nlohmann::json::array()},
@@ -51,6 +106,43 @@ TEST(PipelineManifestRequirements, RejectsMissingRuntimeRequirements) {
     std::string error;
     EXPECT_FALSE(parseRuntimeRequirements(nlohmann::json::object(), "cpu", requirements, error));
     EXPECT_EQ(error, "pipeline manifest requires runtime_requirements");
+}
+
+TEST(PipelineManifestRequirements, ParsesCanonicalAutodiffProfiles) {
+    using vernon::runtime::AutodiffManifest;
+    using vernon::runtime::parseAutodiffManifest;
+    AutodiffManifest manifest;
+    std::string error;
+    const nlohmann::json root = validAutodiffManifest();
+    ASSERT_TRUE(parseAutodiffManifest(root, manifest, error)) << error;
+    EXPECT_EQ(manifest.wrt, std::vector<std::string>{"x"});
+    EXPECT_EQ(manifest.outputCotangents, std::vector<std::string>{"output"});
+    EXPECT_EQ(manifest.gradientPaths, std::vector<std::string>{"x"});
+    ASSERT_EQ(manifest.variants.size(), 1u);
+    EXPECT_EQ(manifest.variants[0].forwardWithTape, "forward");
+    EXPECT_EQ(manifest.variants[0].backward, "backward");
+    EXPECT_EQ(manifest.variants[0].tapeBytes, 16u);
+    ASSERT_EQ(manifest.variants[0].launch.accumulationPlans.size(), 1u);
+    EXPECT_EQ(manifest.variants[0].launch.accumulationPlans[0].path, "x");
+    EXPECT_EQ(manifest.variants[0].launch.accumulationPlans[0].operation,
+              vernon::runtime::AutodiffAccumulationPlan::Operation::ReduceSum);
+}
+
+TEST(PipelineManifestRequirements, RejectsIncompleteOrTamperedAutodiffProfiles) {
+    using vernon::runtime::AutodiffManifest;
+    using vernon::runtime::parseAutodiffManifest;
+    std::string error;
+    AutodiffManifest manifest;
+    nlohmann::json root = validAutodiffManifest();
+    root.erase("autodiff_profiles");
+    EXPECT_FALSE(parseAutodiffManifest(root, manifest, error));
+
+    root = validAutodiffManifest();
+    root["autodiff_profiles"]["variants"][0]["plan"]["tape_bytes"] = 32;
+    error.clear();
+    manifest = {};
+    EXPECT_FALSE(parseAutodiffManifest(root, manifest, error));
+    EXPECT_NE(error.find("identity"), std::string::npos);
 }
 
 TEST(PipelineManifestRequirements, ParsesEveryRuntimeBackendShape) {

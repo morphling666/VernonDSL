@@ -78,6 +78,8 @@ def build_bundle_plan(
     target: TargetOptions,
     features: Sequence[str],
     variants: Sequence[tuple[Sequence[str], Mapping[str, CompiledStage]]],
+    transform: Mapping[str, Any] | None = None,
+    autodiff_profiles: Mapping[str, Any] | None = None,
 ) -> BundlePlan:
     records_by_variant = [{name: stage.logical_record() for name, stage in stages.items()} for _, stages in variants]
     slots = assign_parameter_slots(records_by_variant)
@@ -96,6 +98,8 @@ def build_bundle_plan(
         tuple(sorted(set(features))),
         variant_plans,
         tuple(unique_stages[key] for key in sorted(unique_stages)),
+        transform,
+        autodiff_profiles,
     )
 
 

@@ -155,6 +155,28 @@ LogicalResult decomposeAggregateValueVernon(Type type, Value value, SmallVectorI
     return success();
 }
 
+FailureOr<SmallVector<int64_t>> getHostAggregateFieldIndices(Type sourceType, TypeRange fields, ModuleOp module) {
+    FailureOr<ValueAbiLayout> layout = getValueAbiLayout(sourceType, module);
+    if (failed(layout) || layout->fieldOffsets.size() != fields.size())
+        return failure();
+    SmallVector<int64_t> indices;
+    uint64_t offset = 0;
+    int64_t physicalIndex = 0;
+    for (auto [index, field] : llvm::enumerate(fields)) {
+        const uint64_t fieldOffset = layout->fieldOffsets[index];
+        if (fieldOffset < offset)
+            return failure();
+        if (fieldOffset != offset)
+            ++physicalIndex;
+        indices.push_back(physicalIndex++);
+        FailureOr<ValueAbiLayout> fieldLayout = getValueAbiLayout(field, module);
+        if (failed(fieldLayout))
+            return failure();
+        offset = fieldOffset + fieldLayout->size;
+    }
+    return indices;
+}
+
 FailureOr<Value> buildAggregateValueLlvm(Type sourceType, ValueRange leaves, unsigned &cursor,
                                          const TypeConverter &converter, ModuleOp module, OpBuilder &builder,
                                          Location location) {
@@ -165,7 +187,8 @@ FailureOr<Value> buildAggregateValueLlvm(Type sourceType, ValueRange leaves, uns
     }
     auto buildProduct = [&](TypeRange fields, Type targetType) -> FailureOr<Value> {
         auto target = dyn_cast<LLVM::LLVMStructType>(targetType);
-        if (!target)
+        FailureOr<SmallVector<int64_t>> fieldIndices = getHostAggregateFieldIndices(sourceType, fields, module);
+        if (!target || failed(fieldIndices))
             return failure();
         Value result = LLVM::UndefOp::create(builder, location, target);
         for (auto [index, field] : llvm::enumerate(fields)) {
@@ -174,7 +197,7 @@ FailureOr<Value> buildAggregateValueLlvm(Type sourceType, ValueRange leaves, uns
             if (failed(value))
                 return failure();
             result = LLVM::InsertValueOp::create(builder, location, result, *value,
-                                                 ArrayRef<int64_t>{static_cast<int64_t>(index)});
+                                                 ArrayRef<int64_t>{(*fieldIndices)[index]});
         }
         return result;
     };
@@ -229,9 +252,12 @@ LogicalResult decomposeAggregateValueLlvm(Type sourceType, Value value, SmallVec
         return success();
     }
     auto decomposeProduct = [&](TypeRange fields) -> LogicalResult {
+        FailureOr<SmallVector<int64_t>> fieldIndices = getHostAggregateFieldIndices(sourceType, fields, module);
+        if (failed(fieldIndices))
+            return failure();
         for (auto [index, field] : llvm::enumerate(fields)) {
             Value extracted =
-                LLVM::ExtractValueOp::create(builder, location, value, ArrayRef<int64_t>{static_cast<int64_t>(index)});
+                LLVM::ExtractValueOp::create(builder, location, value, ArrayRef<int64_t>{(*fieldIndices)[index]});
             if (failed(decomposeAggregateValueLlvm(field, extracted, leaves, converter, module, builder, location)))
                 return failure();
         }

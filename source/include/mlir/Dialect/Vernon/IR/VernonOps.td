@@ -96,6 +96,32 @@ def Vernon_AtomicOp : Vernon_Op<"atomic"> {
   let hasVerifier = 1;
 }
 
+def Vernon_ReduceSumOp : Vernon_Op<"reduce_sum"> {
+  let summary = "Grid-independent sum accumulation contribution";
+  let description = [{
+    Adds one logical invocation's contribution to a destination element.
+    Target lowering selects an atomic add when available, or a canonical
+    serial-grid fallback when deterministic execution is required.
+  }];
+  let arguments = (ins AnyType:$value, Vernon_TensorViewType:$storage,
+                       Variadic<Index>:$indices, BoolAttr:$deterministic);
+  let hasVerifier = 1;
+}
+
+def Vernon_ScatterAddOp : Vernon_Op<"scatter_add"> {
+  let summary = "Grid-independent indexed accumulation contribution";
+  let description = [{
+    Adds one logical invocation's contribution at the supplied destination
+    indices. `disjoint` is an optimization hint backed by grid-independent
+    injectivity evidence; when present, lowering may use a direct store instead
+    of a read-modify-write.
+  }];
+  let arguments = (ins AnyType:$value, Vernon_TensorViewType:$storage,
+                       Variadic<Index>:$indices, BoolAttr:$deterministic,
+                       OptionalAttr<UnitAttr>:$disjoint);
+  let hasVerifier = 1;
+}
+
 def Vernon_PhysicalLoadOp : Vernon_Op<"physical_load"> {
   let summary = "Internal load after TensorView index projection";
   let arguments = (ins Vernon_TensorViewType:$storage, Index:$index);

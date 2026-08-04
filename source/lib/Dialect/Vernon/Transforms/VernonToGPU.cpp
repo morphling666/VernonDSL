@@ -76,12 +76,14 @@ struct PhysicalAtomicConversion final : OpConversionPattern<PhysicalAtomicOp> {
         if (!llvm::hasSingleElement(adaptor.getStorage()) || !llvm::hasSingleElement(adaptor.getIndex()) ||
             !llvm::hasSingleElement(adaptor.getValue()))
             return rewriter.notifyMatchFailure(op, "atomic TensorView storage must lower to one scalar memref");
-        arith::AtomicRMWKind kind = op.getAtomicKind() == "add"    ? arith::AtomicRMWKind::addi
-                                    : op.getAtomicKind() == "min"  ? arith::AtomicRMWKind::mins
-                                    : op.getAtomicKind() == "max"  ? arith::AtomicRMWKind::maxs
-                                    : op.getAtomicKind() == "umin" ? arith::AtomicRMWKind::minu
-                                    : op.getAtomicKind() == "umax" ? arith::AtomicRMWKind::maxu
-                                                                   : arith::AtomicRMWKind::assign;
+        arith::AtomicRMWKind kind =
+            op.getAtomicKind() == "add"
+                ? (isa<FloatType>(op.getValue().getType()) ? arith::AtomicRMWKind::addf : arith::AtomicRMWKind::addi)
+            : op.getAtomicKind() == "min"  ? arith::AtomicRMWKind::mins
+            : op.getAtomicKind() == "max"  ? arith::AtomicRMWKind::maxs
+            : op.getAtomicKind() == "umin" ? arith::AtomicRMWKind::minu
+            : op.getAtomicKind() == "umax" ? arith::AtomicRMWKind::maxu
+                                           : arith::AtomicRMWKind::assign;
         rewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(op, kind, adaptor.getValue().front(),
                                                          adaptor.getStorage().front(), adaptor.getIndex().front());
         return success();
@@ -378,6 +380,7 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                 [&](PhysicalAtomicOp op) { return isNonResourceStorage(op.getStorage()); });
             storageTarget.addDynamicallyLegalOp<gpu::GPUFuncOp>(
                 [&](gpu::GPUFuncOp function) { return storageConverter.isSignatureLegal(function.getFunctionType()); });
+            storageTarget.addIllegalOp<ReduceSumOp, ScatterAddOp>();
             storageTarget.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
             if (failed(applyPartialConversion(kernel, storageTarget, std::move(storagePatterns))))
                 return signalPassFailure();

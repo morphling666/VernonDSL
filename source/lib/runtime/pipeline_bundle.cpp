@@ -136,8 +136,9 @@ bool validateCpuRuntimeRequirements(const std::string &targetTriple, const std::
     constexpr const char *hostOsToken = "linux";
 #endif
     const std::string architecture = hostArchitecture();
-    const bool architectureMatches =
-        targetTriple.rfind(architecture, 0) == 0 || (architecture == "x86_64" && targetTriple.rfind("amd64", 0) == 0);
+    const bool architectureMatches = targetTriple.rfind(architecture, 0) == 0 ||
+                                     (architecture == "x86_64" && targetTriple.rfind("amd64", 0) == 0) ||
+                                     (architecture == "aarch64" && targetTriple.rfind("arm64", 0) == 0);
     if (!architectureMatches || targetTriple.find(hostOsToken) == std::string::npos || objectFormat != hostFormat) {
         error = "pipeline requires CPU target " + targetTriple + " / " + objectFormat + ", runtime provides " +
                 architecture + "-" + hostOsToken + " / " + hostFormat;

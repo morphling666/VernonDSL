@@ -112,6 +112,12 @@ permit removing queue waits or letting recorded work outlive its owners.
   selection distinguishes color, depth, and packed depth/stencil formats.
 - DirectX 12 state conversion uses explicit enum mappings rather than
   arithmetic enum offsets.
+- OpenGL graphics programs, vertex arrays, and framebuffers are retained by a
+  shared native graphics bundle. Core variant-cache hit, miss, reuse, and
+  partial-preparation cleanup paths have tests.
+- Packed D32S8 readback uses one eight-byte depth/stencil layout across enabled
+  backends. Metal and Vulkan tests assert rendered depth/stencil values; the
+  OpenGL adapter has a packed-layout readback test.
 - The pipeline contract was advanced to version 12 with regenerated manifests
   and fixtures.
 
@@ -128,10 +134,17 @@ permit removing queue waits or letting recorded work outlive its owners.
 - Public Runtime compute and offscreen graphics paths compile cooked MSL,
   prepare reflection-driven bindings and pipeline state, dispatch or draw, and
   read back results.
+- Metal D32S8 readback separates depth and stencil planes and normalizes them
+  into the shared packed layout. Provider-level Argument Buffer coverage
+  includes sampled textures, samplers, and writable storage textures.
+- Portable workgroup storage, barriers, and relaxed workgroup atomics compile
+  for Metal. Device-scope TensorView atomics are rejected with an explicit
+  capability diagnostic because they are limited to CPU, CUDA, and Vulkan.
 - Metal is exposed through the Python architecture surface and packaged only in
   Apple builds; non-Apple source graphs remain free of Apple SDK dependencies.
 - macOS resource, retention, compute, graphics, and barrier tests exist.
-  Packaged iOS simulator smoke and the iOS arm64 Runtime build are also present.
+  Packaged iOS simulator smoke and an iOS arm64 Runtime plus smoke-host
+  final-link build are also present.
 
 ## Future work
 
@@ -142,35 +155,61 @@ permit removing queue waits or letting recorded work outlive its owners.
   without capability skips on release hardware.
 - Run the trusted workflow dry run, verify the complete payload, create the
   immutable `v0.1.1` tag, publish, and verify the PyPI and GitHub artifacts.
-- Add scheduled or self-hosted GPU jobs with native validation/debug layers.
 - Add fuzzing for source, manifest, reflection, TensorView, and ExecutionGraph
   inputs.
 - Publish benchmark history and stable regression thresholds.
+
+### Host language and native interop
+
+The proposed [`Host language design`](host_language.md) adds a restricted
+`@vd.host` domain that calls schema-defined C++ APIs. Development uses a typed
+interpreter and generated nanobind bindings; deployment lowers the same Host IR
+to native desktop objects or Emscripten-compatible WebAssembly without a Python
+dependency. The first milestone is one shared gameplay demo with identical
+state and checksums in interpreted, desktop, and browser execution.
+
+This work is post-0.1.1 and does not change the current device-language or
+Runtime contracts.
 
 ### Language v4
 
 The detailed language gates remain in
 [`language/future_language_roadmap.md`](language/future_language_roadmap.md).
+The accepted autodiff architecture is defined in
+[`autodiff.md`](autodiff.md).
 The principal work is:
 
-- first-order JVP, VJP, `grad`, `value_and_grad`, and `stop_gradient` for
-  specialized pure helper functions, validated against finite differences;
+- implement one first-order reverse-mode API, `vd.ad.vjp`, over unchanged
+  Kernel and graphics source, with explicit `wrt`, cotangents, gradient
+  results, and deterministic pullback lifetime;
+- cook primal, forward-with-tape, and backward profiles under one
+  `pipeline_asset()` declaration and expose the same contract to Python, C,
+  and C++;
+- implement stateful Kernel functionalization, bounded tape, and
+  effect/alias-safe gradient accumulation;
+- define versioned custom VJPs for rasterization, visibility, depth, blend, and
+  texture sampling before claiming cross-stage graphics differentiation;
 - complete cross-backend acceptance for workgroup storage, barriers, relaxed
   atomics, and representative language-v4 programs;
 - retain deterministic cache identity and explicit target diagnostics;
 - decide which remaining autodiff gates block declaration of frontend v4.
 
-Stateful-kernel differentiation, nested transforms, Hessians, and general
-differentiable rendering are outside the initial language-v4 target unless the
-language contract is amended.
+JVP, full-Jacobian materialization, convenience `grad` aliases, nested
+transforms, Hessians, and HVPs are outside the initial public autodiff surface.
 
 ### Metal completion and Apple packaging
 
-- Complete and verify stencil attachment load/store/clear behavior.
-- Add public cooked-bundle storage-texture compute binding and acceptance.
+- Extend the existing Metal stencil readback test from explicit clear to the
+  full attachment load/store/clear and stencil-replace matrix.
+- Promote the provider-level storage-texture compute path to a public
+  cooked-bundle binding and acceptance test.
+- Add Metal to the runtime synchronization acceptance suite so workgroup
+  storage, barriers, and relaxed workgroup atomics run on hardware rather than
+  being covered only by compiler lowering and RHI barrier tests.
 - Expand texture/sampler, depth, blend, cull, indexed draw, instancing, owned/
   borrowed encoder lifetime, and ExecutionGraph coverage on Metal hardware.
-- Complete the packaged iOS arm64 device final-link smoke in CI.
+- Run the already final-linked iOS arm64 smoke host on a physical device when a
+  suitable device runner is available.
 - Finish provider layering cleanup where backend headers or cache state are
   still pulled through common adapter structures.
 - Reduce device-wide locking and synchronous `waitUntilCompleted` only as part
@@ -182,15 +221,15 @@ tuning are not current Metal roadmap commitments.
 
 ### Remaining graphics-state cleanup
 
-- Replace OpenGL raw shared native graphics pointers with explicit ref-counted
-  ownership and verify every native pipeline preparation failure path.
-- Consolidate packed D32S8 sizing and readback normalization and assert actual
-  depth/stencil values in OpenGL tests.
+- Finish OpenGL ownership cleanup for the remaining raw layout/device
+  relationships and verify every native pipeline preparation failure path.
+- Replace the OpenGL mock-seeded D32S8 assertion with a post-render value test,
+  and add equivalent DirectX 12 packed depth/stencil readback acceptance.
 - Remove backend-specific naming and duplicated attachment/render-pass helpers
   that remain in shared code.
-- Strengthen tests for OpenGL capability stubs and state calls, complete
-  DirectX 12 state-mapping coverage, variant-key hit/miss behavior, and native
-  object leak handling.
+- Strengthen tests for OpenGL capability stubs and state calls, extend DirectX
+  12 mapping coverage beyond blend/compare/stencil/cull, and add deterministic
+  native-object leak assertions around the existing variant-cache tests.
 - Remove hardcoded native Metal format values from tests and prevent parallel
   backend builds from overwriting the same development Python module.
 
@@ -234,6 +273,10 @@ met.
 
 ### Optional product tracks
 
+- Scheduled or self-hosted real-GPU jobs for long-term regression detection;
+  these are not a near-term feature or release priority.
+- Native Vulkan, DirectX 12, or Metal validation/debug layers for those GPU
+  jobs; these are also operational hardening rather than near-term product work.
 - AMD/ROCDL compiler and Runtime support.
 - Constrained and const generics.
 - Enums, `Option[T]`, exhaustive `match`, and compile-time data structures.

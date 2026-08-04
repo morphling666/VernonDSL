@@ -1,4 +1,4 @@
-module attributes {vernon.compiler_contract_version = 9 : i64, vernon.pipeline_version = 12 : i64} {
+module attributes {vernon.compiler_contract_version = 10 : i64, vernon.pipeline_version = 13 : i64} {
   "vernon.struct"() <{
     fields = ["value"],
     sym_name = "LoweringOnlyMetadata"

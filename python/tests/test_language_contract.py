@@ -123,6 +123,7 @@ class LanguageVersionTests(unittest.TestCase):
         )
         self.assertIn("vernon.shared", shared_output)
         self.assertIn('vernon.abi_leaf_dtypes = ["f32", "i32", "f32", "i32"]', shared_output)
+        self.assertIn('vernon.element_abi_leaf_dtypes = ["f32", "i32"]', shared_output)
         self.assertNotIn("vernon.abi_alignment", shared_output)
         self.assertNotIn("vernon.abi_element_stride", shared_output)
         self.assertNotIn("vernon.abi_size", shared_output)
@@ -377,6 +378,12 @@ class LanguageVersionTests(unittest.TestCase):
             second = Compiler().compile_request(FrontendCompileRequest(path, "main"))
 
         function = next(function for function in first.typed_functions if function.symbol == "main")
+        gid = next(parameter for parameter in function.parameters if parameter.name == "gid")
+        self.assertEqual(gid.builtin, "global_invocation_id")
+        self.assertEqual(
+            typed_model_data((function,))[0]["parameters"][2]["interface"],
+            [{"kind": "builtin", "arguments": ["global_invocation_id"]}],
+        )
         read_static, write_dynamic, branch = function.body
         self.assertEqual(
             read_static.effects,

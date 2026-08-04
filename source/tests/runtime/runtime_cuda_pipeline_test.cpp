@@ -4,8 +4,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <gtest/gtest.h>
 #include <string>
 
@@ -212,3 +215,75 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
     vernonRhiDestroyDevice(context.device);
 }
+
+#if defined(VERNON_CUDA_AUTODIFF_PIPELINE_BUNDLE)
+TEST(RuntimeCudaPipeline, ExecutesReusableCookedGpuPullbackAfterPipelineDestruction) {
+    const std::filesystem::path manifestPath = VERNON_CUDA_AUTODIFF_PIPELINE_BUNDLE;
+    std::ifstream input(manifestPath, std::ios::binary);
+    const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    ASSERT_FALSE(bundle.empty());
+    VernonRuntimeBackend target = VERNON_RUNTIME_CPU;
+    ASSERT_EQ(vernonRuntimePipelineBundleInspectTarget(bundle.data(), bundle.size(), &target), VERNON_STATUS_OK);
+    ASSERT_EQ(target, VERNON_RUNTIME_CUDA);
+    if (!vernonRuntimeGetCapabilities(VERNON_RUNTIME_CUDA).available)
+        GTEST_SKIP() << "CUDA runtime backend is unavailable";
+
+    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_CUDA);
+    VernonRuntimeContext *runtime = context.runtime;
+    ASSERT_NE(runtime, nullptr);
+    const std::string directory = manifestPath.parent_path().u8string();
+    VernonPipelineBundleLoadOptions options{};
+    options.struct_size = sizeof(options);
+    options.bundle_directory = directory.c_str();
+    VernonPipelineBundle *loaded =
+        vernonRuntimeLoadPipelineBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+    ASSERT_NE(loaded, nullptr);
+    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
+    ASSERT_NE(pipeline, nullptr);
+
+    std::array<float, 2> value{2.0f, 3.0f};
+    float factor = 2.0f;
+    float selector = -1.0f;
+    int32_t count = 2;
+    std::array<float, 2> output{};
+    VernonAdValue inputValues[]{
+        {sizeof(VernonAdValue), {"value", 5}, VERNON_DATA_F32, value.data(), sizeof(value), {}},
+        {sizeof(VernonAdValue), {"factor", 6}, VERNON_DATA_F32, &factor, sizeof(factor), {}},
+        {sizeof(VernonAdValue), {"selector", 8}, VERNON_DATA_F32, &selector, sizeof(selector), {}},
+        {sizeof(VernonAdValue), {"count", 5}, VERNON_DATA_I32, &count, sizeof(count), {}},
+    };
+    VernonAdValue outputValue{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, output.data(), sizeof(output), {}};
+    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
+    VernonAdValueSet outputs{sizeof(VernonAdValueSet), &outputValue, 1, {}};
+    VernonPullback *pullback = nullptr;
+    ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK);
+    EXPECT_EQ(output, (std::array<float, 2>{6.0f, 9.0f}));
+    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    vernonRuntimePipelineBundleDestroy(loaded);
+
+    std::array<float, 2> seed{1.0f, 2.0f};
+    std::array<float, 2> valueGradient{};
+    float factorGradient = 1.0f;
+    float selectorGradient = 1.0f;
+    VernonAdValue seedValue{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seed.data(), sizeof(seed), {}};
+    VernonAdValue gradientValues[]{
+        {sizeof(VernonAdValue), {"factor", 6}, VERNON_DATA_F32, &factorGradient, sizeof(factorGradient), {}},
+        {sizeof(VernonAdValue), {"selector", 8}, VERNON_DATA_F32, &selectorGradient, sizeof(selectorGradient), {}},
+        {sizeof(VernonAdValue), {"value", 5}, VERNON_DATA_F32, valueGradient.data(), sizeof(valueGradient), {}},
+    };
+    VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seedValue, 1, {}};
+    VernonAdValueSet gradients{sizeof(VernonAdValueSet), gradientValues, std::size(gradientValues), {}};
+    ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK);
+    EXPECT_EQ(valueGradient, (std::array<float, 2>{3.0f, 6.0f}));
+    EXPECT_EQ(factorGradient, 0.0f);
+    EXPECT_EQ(selectorGradient, 0.0f);
+
+    seed = {2.0f, 3.0f};
+    ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK);
+    EXPECT_EQ(valueGradient, (std::array<float, 2>{6.0f, 9.0f}));
+
+    vernonPullbackDestroy(pullback);
+    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
+    vernonRhiDestroyDevice(context.device);
+}
+#endif

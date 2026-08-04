@@ -87,6 +87,16 @@ struct ParameterUse {
     std::optional<TensorViewDescriptorUse> tensorViewDescriptor;
 };
 
+enum class AutodiffResourceRole {
+    None,
+    Input,
+    Storage,
+    Output,
+    Tape,
+    Cotangent,
+    Gradient,
+};
+
 struct Parameter {
     uint32_t slot{};
     std::string name;
@@ -98,6 +108,7 @@ struct Parameter {
     std::string addressSpace;
     std::string dimension;
     std::string textureFormat;
+    AutodiffResourceRole autodiffRole{AutodiffResourceRole::None};
     std::vector<uint64_t> shape;
     std::vector<ParameterUse> uses;
 };
@@ -147,11 +158,47 @@ struct Variant {
     bool validate(std::string &error) const;
 };
 
+struct AutodiffAccumulationPlan {
+    std::string path;
+    enum class Operation {
+        ReduceSum,
+        ScatterAdd,
+    } operation{Operation::ReduceSum};
+    std::vector<std::string> evidence;
+    std::vector<uint32_t> invocationAxes;
+};
+
+struct AutodiffLaunchPlan {
+    VernonLaunchSize workgroupSize{1, 1, 1};
+    std::vector<AutodiffAccumulationPlan> accumulationPlans;
+};
+
+struct AutodiffVariant {
+    std::vector<std::string> key;
+    std::string planIdentity;
+    std::string programGraphIdentity;
+    std::string primal;
+    std::string forwardWithTape;
+    std::string backward;
+    uint64_t tapeBytes{};
+    AutodiffLaunchPlan launch;
+};
+
+struct AutodiffManifest {
+    std::string transformIdentity;
+    std::string profilesIdentity;
+    std::vector<std::string> wrt;
+    std::vector<std::string> outputCotangents;
+    std::vector<std::string> gradientPaths;
+    std::vector<AutodiffVariant> variants;
+};
+
 std::optional<VernonTextureDimension> pipelineTextureDimension(const std::string &dimension);
 
 std::optional<VernonTextureFormat> pipelineTextureFormat(const std::string &format);
 
 bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &error);
+bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifest, std::string &error);
 bool parsePipelineValueLayout(const nlohmann::json &value, ValueLayout &layout, std::string &error);
 void rebuildValueLayoutPathViews(ValueLayout &layout);
 bool parseRuntimeRequirements(const nlohmann::json &root, const std::string &target, RuntimeRequirements &requirements,

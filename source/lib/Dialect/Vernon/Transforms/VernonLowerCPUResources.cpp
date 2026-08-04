@@ -50,12 +50,14 @@ struct AtomicPattern final : OpConversionPattern<PhysicalAtomicOp> {
         auto storage = dyn_cast<MemRefType>(adaptor.getStorage().getType());
         if (!storage)
             return rewriter.notifyMatchFailure(op, "atomic TensorView did not lower to a memref");
-        arith::AtomicRMWKind kind = op.getAtomicKind() == "add"    ? arith::AtomicRMWKind::addi
-                                    : op.getAtomicKind() == "min"  ? arith::AtomicRMWKind::mins
-                                    : op.getAtomicKind() == "max"  ? arith::AtomicRMWKind::maxs
-                                    : op.getAtomicKind() == "umin" ? arith::AtomicRMWKind::minu
-                                    : op.getAtomicKind() == "umax" ? arith::AtomicRMWKind::maxu
-                                                                   : arith::AtomicRMWKind::assign;
+        arith::AtomicRMWKind kind =
+            op.getAtomicKind() == "add"
+                ? (isa<FloatType>(op.getValue().getType()) ? arith::AtomicRMWKind::addf : arith::AtomicRMWKind::addi)
+            : op.getAtomicKind() == "min"  ? arith::AtomicRMWKind::mins
+            : op.getAtomicKind() == "max"  ? arith::AtomicRMWKind::maxs
+            : op.getAtomicKind() == "umin" ? arith::AtomicRMWKind::minu
+            : op.getAtomicKind() == "umax" ? arith::AtomicRMWKind::maxu
+                                           : arith::AtomicRMWKind::assign;
         rewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(op, kind, adaptor.getValue(), adaptor.getStorage(),
                                                          adaptor.getIndex());
         return success();

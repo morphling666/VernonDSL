@@ -4,6 +4,7 @@ add_mlir_library(
     VernonAttributeAbi.cpp
     VernonConvertGPUToSPIRV.cpp
     VernonInlineHelpers.cpp
+    VernonLowerAccumulation.cpp
     VernonLowerCPUResources.cpp
     VernonLowerCPUTensors.cpp
     VernonLowerCUDAMath.cpp

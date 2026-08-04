@@ -39,6 +39,8 @@ struct ResolvedArtifact {
 struct Stage {
     std::string stage;
     std::string entry;
+    std::string autodiffProfile;
+    std::string autodiffProfilesIdentity;
     std::string source;
     std::string reflection;
     std::vector<uint8_t> binary;

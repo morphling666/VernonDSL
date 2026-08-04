@@ -429,12 +429,12 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
                 auto view = dyn_cast<TensorViewType>(operation->getOperand(isa<StoreOp>(operation) ? 1 : 0).getType());
                 workgroupStorage = view && view.getAddressSpace() == "workgroup";
             }
-            if (!workgroupStorage && !isa<AtomicOp, BarrierOp>(operation))
+            if (!workgroupStorage && !isa<AtomicOp, BarrierOp, ReduceSumOp, ScatterAddOp>(operation))
                 return;
             func::FuncOp function = operation->getParentOfType<func::FuncOp>();
             auto stage = function ? function->getAttrOfType<StringAttr>(kStageAttrName) : nullptr;
             if (!stage || stage.getValue() != "compute") {
-                operation->emitError("workgroup storage, atomics, and barriers require a compute entry");
+                operation->emitError("workgroup storage, atomics, barriers, and accumulation require a compute entry");
                 invalid = true;
             }
             if (isa<WorkgroupAllocOp>(operation) && (!function || operation->getBlock() != &function.front())) {

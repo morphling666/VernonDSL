@@ -23,6 +23,7 @@ from .model import (
     BranchMerge,
     ConcreteType,
     EffectScope,
+    InterfaceMetadata,
     LValue,
     MemoryOrdering,
     ResourceEffect,
@@ -54,6 +55,7 @@ from .type_solver import (
 )
 
 ParseType = Callable[[ast.AST], ConcreteType]
+ParseInterface = Callable[[ast.AST], tuple[InterfaceMetadata, ...]]
 Error = Callable[[ast.AST, str], Exception]
 
 
@@ -142,11 +144,13 @@ class _Inference:
         self,
         module: ast.Module,
         parse_type: ParseType,
+        parse_interface: ParseInterface,
         error: Error,
         enabled_features: tuple[str, ...],
     ):
         self.module = module
         self.parse_type = parse_type
+        self.parse_interface = parse_interface
         self.error = error
         self.enabled_features = enabled_features
         self.functions = {node.name: node for node in module.body if isinstance(node, ast.FunctionDef)}
@@ -298,7 +302,14 @@ class _Inference:
                 if argument_type.kind == "tensor_view":
                     access_name = argument_type.arguments[2]
                     access = AccessMode(str(access_name))
-                parameters.append(TypedParameter(argument.arg, argument_type, access))
+                parameters.append(
+                    TypedParameter(
+                        argument.arg,
+                        argument_type,
+                        access,
+                        self.parse_interface(argument.annotation),
+                    )
+                )
             result_type = (
                 None
                 if function.returns is None
@@ -1593,7 +1604,8 @@ class _Inference:
 def infer_and_monomorphize_helpers(
     module: ast.Module,
     parse_type: ParseType,
+    parse_interface: ParseInterface,
     error: Error,
     enabled_features: tuple[str, ...],
 ) -> ast.Module:
-    return _Inference(module, parse_type, error, enabled_features).run()
+    return _Inference(module, parse_type, parse_interface, error, enabled_features).run()

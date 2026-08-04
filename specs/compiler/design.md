@@ -131,16 +131,17 @@ and implementation modules never circularly re-export those facades.
 
 ## Autodiff representation boundary
 
-Autodiff is a transform of specialized, validated typed numeric functions, not
-an arbitrary Python-object Tensor element model. The transform generates
-explicit primal, tangent, adjoint, and tape values with deterministic ABI and
-cache identity. Floating leaves are differentiable; aggregates derive tangent
-structure recursively, while integer, Boolean, resource, sampler, and opaque
-leaves require an explicit custom rule. Pure-function JVP/VJP precedes
-stateful-kernel differentiation. Language v4 accepts first-order transforms
-only and explicitly rejects nested transforms, Hessians, and HVPs.
-TensorView mutation, aliasing, scatter adjoints, loops requiring tapes, and
-multi-program rendering wait for a future orchestration and effect model.
+The normative architecture is [`../autodiff.md`](../autodiff.md). Autodiff is a
+VJP transform of specialized, validated typed programs, not an arbitrary
+Python-object Tensor element model. The transform generates explicit primal,
+adjoint, and bounded tape representations with deterministic ABI and cache
+identity. Floating leaves are differentiable; aggregates derive adjoint
+structure recursively, while integer, Boolean, Resource handle, sampler, and
+opaque leaves remain non-differentiable unless a versioned custom rule applies.
+Stateful Kernel and graphics VJP require ProgramGraph functionalization,
+effect/alias-safe reverse traversal, and explicit custom graphics primitives.
+The initial public surface rejects JVP, full Jacobian materialization, nested
+transforms, Hessians, and HVPs.
 Native stage compilation, compile-result normalization, variant deduplication,
 and manifest materialization live in `_shader_assets.cooking`. Tests inject
 compiler and project capabilities at that implementation boundary rather than
@@ -715,15 +716,14 @@ decompose it recursively. Reflection records the generated leaf bindings so
 CPU, CUDA, Vulkan, and OpenGL bind one source argument to every generated
 descriptor without exposing this representation in the language or runtime API.
 
-Autodiff is a deterministic transform of specialized, validated typed Value
-IR. Generated primal, tangent, adjoint, and tape objects remain ordinary typed
-representations; gradients use separate companion Storage. V4 accepts
-first-order pure transforms only. Mutation, Storage effects, aliasing,
-gather/scatter accumulation, loops requiring tapes, checkpointing, and
-effect-preserving reverse traversal require a future compiler-internal
-ProgramGraph before stateful-kernel differentiation can be accepted. That
-graph represents one specialized program and is not a deployment asset or
-multi-program orchestration model.
+Autodiff is a deterministic VJP transform of specialized, validated typed
+program IR. Generated primal, adjoint, and tape objects remain ordinary typed
+representations; mutable inputs produce separate owned gradient Storage.
+ProgramGraph represents one specialized program's Value flow, mutation,
+Storage effects, alias regions, gather/scatter accumulation, bounded tape, and
+effect-preserving reverse traversal. It is compiler-internal and is not a
+deployment asset or multi-program orchestration model. `VernonExecutionGraph`
+composes cooked node VJP profiles at the host Runtime layer.
 
 Vertex and instance Tensor inputs use one rank-independent attribute ABI.
 Positive static logical shapes are flattened in row-major order and partitioned

@@ -22,24 +22,40 @@ correctness guarantees are complete.
 
 ## Required v4 gates
 
-### First-order pure-function autodiff
+### First-order VJP autodiff
 
-- Add typed APIs for `jvp`, `vjp`, `grad`, `value_and_grad`, and
-  `stop_gradient`.
-- Transform only specialized, validated, pure, non-recursive `@func` IR.
-- Derive tangent and adjoint Values recursively for floating Scalar, Tensor,
-  Tuple, and Struct leaves.
-- Reject integer, Boolean, Storage, Resource, sampler, and opaque
-  differentiation unless an explicit custom rule exists.
+The normative design is [`../autodiff.md`](../autodiff.md).
+
+- Add one public reverse-mode transform, `vd.ad.vjp`, for a Kernel, graphics
+  stage tuple, or existing ExecutionGraph. Keep authored entry signatures
+  unchanged.
+- Extend `pipeline_asset(program=...)` with a declarative VJP
+  `ProgramExpression`; cook independent primal, forward-with-tape, and
+  backward profiles under one asset ID.
+- Derive adjoint Values recursively for floating Scalar, Tensor, Tuple, and
+  Struct leaves. Return new owned Storage for differentiated TensorView or
+  mutable Storage inputs.
+- Use `wrt` as the only differentiated-input declaration. Do not introduce
+  `grad_or_not`, `requires_grad`, implicit `.grad`, global gradient clearing,
+  or hidden backward execution.
+- Accept Tensor/aggregate outputs through explicit cotangents. Permit omitted
+  cotangent only for one floating Scalar output, where the seed is `1`.
 - Define versioned derivative rules for arithmetic, casts, Tensor
   construction, `matmul`, and supported math intrinsics.
-- Allocate gradient Storage separately from primal element types.
-- Compare analytical derivatives with finite differences on CPU and available
-  CUDA/Vulkan runtimes.
-- Reject nested transforms, Hessians, and HVPs explicitly.
+- Build compiler-internal ProgramGraph Value/control/effect dependencies,
+  functionalize legal Storage mutation, prove alias/scatter behavior, and
+  reject unbounded tape or unsupported accumulation.
+- Define required custom VJPs for rasterization, visibility, depth, blend, and
+  texture sampling before accepting cross-stage graphics differentiation.
+- Add deterministic transform, rule-set, tape, cotangent, gradient, reflection,
+  and manifest identity across Python, C, and C++.
+- Compare analytical derivatives with finite differences on CPU and every
+  backend that advertises the corresponding AD capability.
 
-Whether all autodiff items block the v4 declaration must be decided before
-release; unchecked behavior cannot be implied by the version number.
+JVP, full-Jacobian materialization, convenience `grad` aliases, nested
+transforms, Hessians, and HVPs are outside the initial public surface.
+Whether all VJP items block the v4 declaration must be decided before release;
+unchecked behavior cannot be implied by the version number.
 
 ### Workgroup memory and synchronization
 
@@ -73,38 +89,17 @@ Unavailable devices remain explicit skips, not silent passes.
 - Include compiler-contract and pipeline versions in cache identity.
 - Preserve deterministic MLIR, artifacts, reflection, and symbols.
 
-## Post-v4 compiler work
+## Post-v4 autodiff expansion
 
-### ProgramGraph for autodiff
+- Forward-mode JVP and batched JVP/VJP.
+- Explicit full-Jacobian materialization for statically bounded small Values.
+- Convenience aliases such as `grad` only when they are exact sugar over VJP.
+- Reusable explicit gradient-accumulation buffers.
+- Higher-order transforms, Hessians, HVPs, checkpoint optimization, and
+  measured recomputation policies.
 
-`ProgramGraph` is private compiler IR for one specialized program. It is not a
-host graph of PipelineAssets, dispatches, render passes, or backend
-transitions.
-
-Future work may:
-
-- represent value flow, control flow, Storage effects, alias constraints, and
-  differentiability boundaries;
-- support JVP/VJP transformation, mutation functionalization, tape planning,
-  checkpointing, and reverse traversal;
-- lower transformed graphs through existing target pipelines.
-
-`VernonExecutionGraph` remains the separate public host-orchestration API.
-
-### Stateful kernel autodiff
-
-Stateful differentiation is post-v4 unless the language contract changes. It
-requires:
-
-- functionalization of local mutation and TensorView writes;
-- gather/scatter adjoints and deterministic accumulation;
-- explicit tape bounds, checkpointing, and recomputation;
-- effect-preserving reverse traversal;
-- separate texture-sampling rules;
-- explicit treatment of rasterization, visibility, depth, and blending.
-
-Do not claim general differentiable rendering without finite-difference
-evidence and selected custom primitives.
+Do not claim a derivative for a graphics discontinuity without a versioned
+custom rule and finite-difference evidence for its declared domain.
 
 ## Optional language expansion
 

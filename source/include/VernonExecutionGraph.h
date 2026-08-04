@@ -90,11 +90,16 @@ private:
 
 class ExecutionResources {
 public:
-    explicit ExecutionResources(const std::vector<GraphResource> &resources) : resources_(resources) {}
     const std::vector<GraphResource> &all() const { return resources_; }
+    bool buffer(GraphBuffer resource, VernonRhiBuffer &output) const;
 
 private:
+    friend class ExecutionGraph;
+    ExecutionResources(const std::vector<GraphResource> &resources, const std::vector<VernonRhiBuffer> &buffers)
+        : resources_(resources), buffers_(buffers) {}
+
     const std::vector<GraphResource> &resources_;
+    const std::vector<VernonRhiBuffer> &buffers_;
 };
 
 class ExecutionPass {
@@ -163,6 +168,20 @@ struct CompiledScope {
     std::vector<VernonRhiBarrier> barriers;
 };
 
+class DeviceExecutionSession {
+public:
+    explicit DeviceExecutionSession(VernonRhiDevice device);
+    ~DeviceExecutionSession();
+    DeviceExecutionSession(DeviceExecutionSession &&) noexcept;
+    DeviceExecutionSession &operator=(DeviceExecutionSession &&) noexcept;
+    DeviceExecutionSession(const DeviceExecutionSession &) = delete;
+    DeviceExecutionSession &operator=(const DeviceExecutionSession &) = delete;
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 class ExecutionGraph {
 public:
     explicit ExecutionGraph(VernonRhiDevice device);
@@ -179,6 +198,8 @@ public:
         return reference;
     }
 
+    VernonRhiStatus createBuffer(const VernonRhiBufferDescriptor &descriptor, GraphBuffer &output,
+                                 bool exported = false);
     GraphBuffer importBuffer(VernonRhiBuffer buffer, bool exported = false);
     GraphImage importImage(VernonRhiImage image, VernonRhiImageView view, VernonRhiFormat format, uint32_t width,
                            uint32_t height, uint32_t layers = 1, uint32_t samples = 1, bool exported = false);
@@ -195,6 +216,7 @@ private:
     struct ResourceRecord {
         GraphResource resource;
         bool exported{};
+        bool graphOwned{};
         uint64_t resourceKey{};
         VernonRhiBuffer buffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
         VernonRhiImage image{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};

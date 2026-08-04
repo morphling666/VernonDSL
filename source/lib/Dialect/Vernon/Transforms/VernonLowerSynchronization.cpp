@@ -130,7 +130,9 @@ struct LowerSynchronizationPass final : PassWrapper<LowerSynchronizationPass, Op
             rewriter.eraseOp(op);
         }
         for (PhysicalAtomicOp op : physicalAtomics) {
-            arith::AtomicRMWKind kind = op.getAtomicKind() == "add"    ? arith::AtomicRMWKind::addi
+            arith::AtomicRMWKind kind = op.getAtomicKind() == "add"
+                                            ? (isa<FloatType>(op.getValue().getType()) ? arith::AtomicRMWKind::addf
+                                                                                       : arith::AtomicRMWKind::addi)
                                         : op.getAtomicKind() == "min"  ? arith::AtomicRMWKind::mins
                                         : op.getAtomicKind() == "max"  ? arith::AtomicRMWKind::maxs
                                         : op.getAtomicKind() == "umin" ? arith::AtomicRMWKind::minu

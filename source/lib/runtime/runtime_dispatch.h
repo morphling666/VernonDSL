@@ -25,6 +25,8 @@ VernonLoadedPipeline *loadBackendCpuNativePipeline(VernonRuntimeContext &context
 VernonLoadedPipeline *loadBackendArtifactPipeline(VernonRuntimeContext &context, const void *artifact,
                                                   size_t artifactSize, const char *reflection, size_t reflectionSize,
                                                   const char *entry, size_t entrySize);
+bool buildReflectedComputeVariant(const Stage &stage, VernonRuntimeBackend backend, Variant &variant,
+                                  std::string &error);
 
 bool resolveBackendPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline);
 void destroyBackendPipeline(VernonLoadedPipeline &pipeline);

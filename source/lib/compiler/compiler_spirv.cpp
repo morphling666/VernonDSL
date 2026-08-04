@@ -10,6 +10,7 @@
 #include "mlir/Dialect/SPIRV/Transforms/Passes.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonConvertGPUToSPIRV.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUTensors.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerSynchronization.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonSpirvMarkers.h"
@@ -235,6 +236,9 @@ bool compileSpirv(PreparedModule &prepared, VernonTarget target, std::vector<Art
     }
 
     mlir::PassManager passManager(&context);
+    // The portable SPIR-V environment currently advertises Shader only; it
+    // does not promise floating-point atomic-add extensions.
+    passManager.addPass(mlir::vernon::createVernonLowerAccumulationPass());
     passManager.addPass(mlir::vernon::createVernonToGPUPass(true));
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerSynchronizationPass(true, true));
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerGPUTensorsPass(true));

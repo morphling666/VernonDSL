@@ -5,6 +5,7 @@
 #include "runtime/pipeline_bundle.h"
 #include "runtime/pipeline_manifest.h"
 #include "runtime/pipeline_metadata.h"
+#include "runtime/runtime_autodiff_internal.h"
 #include "runtime/runtime_dispatch.h"
 #include "runtime/runtime_state.h"
 #include "runtime/tensor_bridge.h"
@@ -27,8 +28,30 @@
 #include <vector>
 
 namespace {
+thread_local std::unordered_map<const VernonRuntimeContext *, std::string> invocationDiagnostics;
+}
+
+std::string &vernon::runtime::invocationDiagnostic(VernonRuntimeContext &context) {
+    return invocationDiagnostics[&context];
+}
+
+const std::string *vernon::runtime::currentInvocationDiagnostic(const VernonRuntimeContext &context) {
+    const auto found = invocationDiagnostics.find(&context);
+    return found == invocationDiagnostics.end() ? nullptr : &found->second;
+}
+
+void vernon::runtime::clearInvocationDiagnostic(const VernonRuntimeContext &context) {
+    invocationDiagnostics.erase(&context);
+}
+
+namespace {
 
 using namespace vernon::runtime;
+
+void beginRuntimeOperation(VernonRuntimeContext *context) {
+    if (context)
+        clearInvocationDiagnostic(*context);
+}
 
 } // namespace
 
@@ -36,8 +59,10 @@ namespace {
 
 VernonStatus fail(VernonRuntimeContext *context, std::string error,
                   VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) {
-    if (context)
+    if (context) {
+        clearInvocationDiagnostic(*context);
         context->error = std::move(error);
+    }
     return status;
 }
 
@@ -166,15 +191,20 @@ VernonRuntimeContext *vernonRuntimeCreateForRhiDevice(VernonRuntimeBackend backe
 VernonStatus vernonRuntimeDestroy(VernonRuntimeContext *context) {
     if (!context)
         return VERNON_STATUS_OK;
-    if (context->liveBundles || context->livePipelines)
+    if (context->liveBundles || context->livePipelines || context->liveContextLeases)
         return fail(context, "runtime context still owns live handles");
     destroyBackend(*context);
+    vernon::runtime::clearInvocationDiagnostic(*context);
     delete context;
     return VERNON_STATUS_OK;
 }
 
 VernonStringView vernonRuntimeGetLastError(const VernonRuntimeContext *context) {
-    return context ? VernonStringView{context->error.data(), context->error.size()} : VernonStringView{nullptr, 0};
+    if (!context)
+        return {nullptr, 0};
+    if (const std::string *diagnostic = vernon::runtime::currentInvocationDiagnostic(*context))
+        return {diagnostic->data(), diagnostic->size()};
+    return {context->error.data(), context->error.size()};
 }
 
 VernonRuntimeCapabilities vernonRuntimeGetContextCapabilities(const VernonRuntimeContext *context) {
@@ -271,13 +301,17 @@ VernonStatus vernonRuntimePipelineBundleInspectTarget(const void *bundleData, si
 VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeContext *context, const void *bundleData,
                                                                  size_t bundleSize,
                                                                  const VernonPipelineBundleLoadOptions *options) {
-    if (!context ||
-        (context->backend != VERNON_RUNTIME_CPU && context->backend != VERNON_RUNTIME_OPENGL &&
+    if (!context)
+        return nullptr;
+    beginRuntimeOperation(context);
+    if ((context->backend != VERNON_RUNTIME_CPU && context->backend != VERNON_RUNTIME_OPENGL &&
          context->backend != VERNON_RUNTIME_OPENGL_ES && context->backend != VERNON_RUNTIME_VULKAN &&
          context->backend != VERNON_RUNTIME_CUDA && context->backend != VERNON_RUNTIME_DIRECTX12 &&
          context->backend != VERNON_RUNTIME_METAL) ||
-        !bundleData || !bundleSize || (options && options->struct_size < sizeof(VernonPipelineBundleLoadOptions)))
+        !bundleData || !bundleSize || (options && options->struct_size < sizeof(VernonPipelineBundleLoadOptions))) {
+        context->error = "invalid pipeline bundle load invocation";
         return nullptr;
+    }
     try {
         std::optional<std::filesystem::path> bundleDirectory;
         if (options && options->bundle_directory && options->bundle_directory[0] != '\0')
@@ -307,6 +341,11 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
         auto bundle = std::make_unique<VernonPipelineBundle>();
         bundle->context = context;
         bundle->id = root.value("id", "");
+        AutodiffManifest autodiff;
+        if (!parseAutodiffManifest(root, autodiff, context->error))
+            return nullptr;
+        if (root.contains("program_transform"))
+            bundle->autodiff = std::move(autodiff);
         for (const nlohmann::json &feature : root.value("features", nlohmann::json::array()))
             bundle->features.push_back(feature.get<std::string>());
         if (!std::is_sorted(bundle->features.begin(), bundle->features.end()) ||
@@ -323,6 +362,8 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
             Stage stage;
             stage.stage = value.value("stage", "");
             stage.entry = value.value("entry", "");
+            stage.autodiffProfile = value.value("autodiff_profile", "");
+            stage.autodiffProfilesIdentity = value.value("autodiff_profiles_identity", "");
             if (value.contains("reflection") && value["reflection"].contains("entries")) {
                 stage.reflection = value["reflection"].dump();
                 for (const nlohmann::json &entry : value["reflection"]["entries"]) {
@@ -451,6 +492,30 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
             fail(context, "pipeline bundle contains duplicate feature variants");
             return nullptr;
         }
+        if (bundle->autodiff) {
+            if (bundle->autodiff->variants.size() != bundle->variants.size()) {
+                fail(context, "autodiff profiles do not cover every pipeline variant");
+                return nullptr;
+            }
+            for (size_t index = 0; index < bundle->variants.size(); ++index) {
+                const Variant &variant = bundle->variants[index];
+                const AutodiffVariant &profiles = bundle->autodiff->variants[index];
+                auto profileStage = [&](const std::string &id, const char *profile) {
+                    const auto found = bundle->stages.find(id);
+                    return found != bundle->stages.end() && found->second.stage == "compute" &&
+                           found->second.autodiffProfile == profile &&
+                           found->second.autodiffProfilesIdentity == profiles.planIdentity;
+                };
+                if (profiles.key != variant.key || profiles.primal != variant.compute ||
+                    profiles.primal == profiles.forwardWithTape || profiles.primal == profiles.backward ||
+                    profiles.forwardWithTape == profiles.backward ||
+                    !profileStage(profiles.forwardWithTape, "forward_with_tape") ||
+                    !profileStage(profiles.backward, "backward")) {
+                    fail(context, "autodiff profile references are inconsistent with pipeline variants");
+                    return nullptr;
+                }
+            }
+        }
         if (bundle->id.empty()) {
             fail(context, "pipeline bundle id is missing or empty");
             return nullptr;
@@ -548,12 +613,19 @@ void vernonRuntimePipelineBundleDestroy(VernonPipelineBundle *bundle) {
 }
 
 VernonLoadedPipeline *vernonRuntimeResolvePipeline(VernonPipelineBundle *bundle, VernonFeatureSetView features) {
-    if (!bundle || (features.count && !features.names))
+    if (!bundle)
         return nullptr;
+    beginRuntimeOperation(bundle->context);
+    if (features.count && !features.names) {
+        bundle->context->error = "invalid pipeline feature set";
+        return nullptr;
+    }
     std::vector<std::string> key;
     for (size_t index = 0; index < features.count; ++index) {
-        if (!features.names[index])
+        if (!features.names[index]) {
+            bundle->context->error = "invalid pipeline feature set";
             return nullptr;
+        }
         key.emplace_back(features.names[index]);
     }
     std::sort(key.begin(), key.end());
@@ -566,6 +638,29 @@ VernonLoadedPipeline *vernonRuntimeResolvePipeline(VernonPipelineBundle *bundle,
     auto pipeline = std::make_unique<VernonLoadedPipeline>();
     pipeline->context = bundle->context;
     pipeline->variant = *found;
+    if (bundle->autodiff) {
+        const auto profiles = std::find_if(bundle->autodiff->variants.begin(), bundle->autodiff->variants.end(),
+                                           [&](const AutodiffVariant &candidate) { return candidate.key == key; });
+        if (profiles == bundle->autodiff->variants.end()) {
+            fail(bundle->context, "autodiff profiles have no exact feature variant");
+            return nullptr;
+        }
+        const Stage &forward = bundle->stages.at(profiles->forwardWithTape);
+        const Stage &backward = bundle->stages.at(profiles->backward);
+        std::shared_ptr<vernon::runtime::ad::Executable> executable;
+        const bool resolved =
+            bundle->context->backend == VERNON_RUNTIME_CPU
+                ? vernon::runtime::ad::createCpuExecutable(*bundle->context, forward, backward,
+                                                           bundle->autodiff->gradientPaths, executable)
+                : vernon::runtime::ad::createGpuExecutable(*bundle, profiles->forwardWithTape, profiles->backward,
+                                                           bundle->autodiff->gradientPaths, profiles->launch,
+                                                           executable);
+        if (!resolved)
+            return nullptr;
+        pipeline->autodiff = VernonLoadedAutodiff{std::move(executable)};
+        if (bundle->context->backend != VERNON_RUNTIME_CPU && !vernon::runtime::ad::createImmediateGpuGraph(*pipeline))
+            return nullptr;
+    }
     for (Parameter &parameter : pipeline->variant.parameters)
         rebuildValueLayoutPathViews(parameter.elementLayout);
     if (!resolveBackendPipeline(*bundle, *found, *pipeline))
@@ -671,6 +766,7 @@ void vernonRuntimeLoadedPipelineDestroy(VernonLoadedPipeline *pipeline) {
 }
 
 VernonStatus vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline, const VernonPipelineInvocation *invocation) {
+    beginRuntimeOperation(pipeline ? pipeline->context : nullptr);
     if (!pipeline || !invocation || invocation->struct_size < sizeof(VernonPipelineInvocation) ||
         invocation->abi_version != VERNON_PIPELINE_VERSION || (invocation->argument_count && !invocation->arguments))
         return fail(pipeline ? pipeline->context : nullptr, "invalid pipeline invocation");
@@ -741,30 +837,48 @@ VernonStatus vernonRuntimePipelineEncode(VernonRuntimeProviderObject encoder, Ve
 VernonStatus vernonRuntimeSynchronize(VernonRuntimeContext *context) {
     if (!context)
         return VERNON_STATUS_INVALID_ARGUMENT;
+    beginRuntimeOperation(context);
     return synchronizeBackend(*context);
 }
 
 VernonStatus vernonRuntimeReferenceRhiBuffer(VernonRuntimeContext *context, VernonRhiBuffer buffer, uint64_t offset,
                                              uint64_t size, VernonRuntimeProviderResourceReference *output) {
-    if (!context || !output)
+    if (!context)
         return VERNON_STATUS_INVALID_ARGUMENT;
+    beginRuntimeOperation(context);
+    if (!output)
+        return fail(context, "invalid RHI buffer reference");
     return referenceBackendRhiBuffer(*context, buffer, offset, size, *output);
 }
 
 VernonStatus vernonRuntimeReferenceRhiImage(VernonRuntimeContext *context, VernonRhiImage image,
                                             VernonRuntimeProviderResourceReference *output) {
-    return context && output ? referenceBackendRhiImage(*context, image, *output) : VERNON_STATUS_INVALID_ARGUMENT;
+    if (!context)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    beginRuntimeOperation(context);
+    if (!output)
+        return fail(context, "invalid RHI image reference");
+    return referenceBackendRhiImage(*context, image, *output);
 }
 
 VernonStatus vernonRuntimeReferenceRhiSampler(VernonRuntimeContext *context, VernonRhiSampler sampler,
                                               VernonRuntimeProviderResourceReference *output) {
-    return context && output ? referenceBackendRhiSampler(*context, sampler, *output) : VERNON_STATUS_INVALID_ARGUMENT;
+    if (!context)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    beginRuntimeOperation(context);
+    if (!output)
+        return fail(context, "invalid RHI sampler reference");
+    return referenceBackendRhiSampler(*context, sampler, *output);
 }
 
 VernonStatus vernonRuntimeReferenceRhiCommandEncoder(VernonRuntimeContext *context, VernonRhiCommandEncoder encoder,
                                                      VernonRuntimeProviderObject *output) {
-    return context && output ? referenceBackendCommandEncoder(*context, encoder, *output)
-                             : VERNON_STATUS_INVALID_ARGUMENT;
+    if (!context)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    beginRuntimeOperation(context);
+    if (!output)
+        return fail(context, "invalid RHI command encoder reference");
+    return referenceBackendCommandEncoder(*context, encoder, *output);
 }
 
 } // extern "C"

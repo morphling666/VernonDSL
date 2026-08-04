@@ -521,6 +521,44 @@ private:
     std::vector<VernonPipelineArgument> arguments_;
 };
 
+class Pullback {
+public:
+    Pullback() = default;
+    explicit Pullback(VernonPullback *handle) : handle_(handle) {}
+    Pullback(const Pullback &) = delete;
+    Pullback &operator=(const Pullback &) = delete;
+    Pullback(Pullback &&other) noexcept : handle_(std::exchange(other.handle_, nullptr)) {}
+    Pullback &operator=(Pullback &&other) noexcept {
+        if (this != &other) {
+            vernonPullbackDestroy(handle_);
+            handle_ = std::exchange(other.handle_, nullptr);
+        }
+        return *this;
+    }
+    ~Pullback() { vernonPullbackDestroy(handle_); }
+
+    void apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients) const {
+        if (!handle_)
+            throw std::logic_error("pullback is empty");
+        if (vernonPullbackApply(handle_, cotangents, &gradients) != VERNON_STATUS_OK)
+            throw std::runtime_error("pullback application failed");
+    }
+
+    explicit operator bool() const noexcept { return handle_ != nullptr; }
+    VernonPullback *get() const noexcept { return handle_; }
+
+private:
+    VernonPullback *handle_{};
+};
+
+inline Pullback vjp(VernonLoadedPipeline *pipeline, const VernonAdValueSet &inputs, VernonAdValueSet &outputs,
+                    VernonLaunchSize computeGrid) {
+    VernonPullback *pullback = nullptr;
+    if (vernonAdPipelineForward(pipeline, computeGrid, &inputs, &outputs, &pullback) != VERNON_STATUS_OK)
+        throw std::runtime_error("autodiff forward invocation failed");
+    return Pullback(pullback);
+}
+
 } // namespace vernon::runtime
 
 #endif

@@ -7,6 +7,7 @@
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/GPU/Pipelines/Passes.h"
 #include "mlir/Dialect/Linalg/Passes.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCUDAMath.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUTensors.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerSynchronization.h"
@@ -45,6 +46,9 @@ bool compileCuda(PreparedModule &prepared, std::vector<Artifact> &artifacts, std
     mlir::OwningOpRef<mlir::ModuleOp> module = prepared.clone();
 
     mlir::PassManager passManager(&context);
+    passManager.addPass(mlir::vernon::createVernonLowerAccumulationPass(
+        mlir::vernon::AccumulationTargetCapabilities{/*supportsF32AtomicAdd=*/true,
+                                                     /*supportsF64AtomicAdd=*/false}));
     passManager.addPass(mlir::vernon::createVernonToGPUPass());
     passManager.addPass(std::make_unique<KeepGpuModulesPass>());
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerSynchronizationPass(true));

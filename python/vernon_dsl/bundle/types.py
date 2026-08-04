@@ -277,6 +277,16 @@ class BundlePlan:
     features: tuple[str, ...]
     variants: tuple[VariantPlan, ...]
     stages: tuple[CompiledStage, ...]
+    transform: Mapping[str, Any] | None = None
+    autodiff_profiles: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if (self.transform is None) != (self.autodiff_profiles is None):
+            raise PipelineCompileError("differentiated bundles require both program_transform and autodiff_profiles")
+        if self.transform is not None:
+            object.__setattr__(self, "transform", frozen_mapping(self.transform))
+        if self.autodiff_profiles is not None:
+            object.__setattr__(self, "autodiff_profiles", frozen_mapping(self.autodiff_profiles))
 
     def logical_dict(self) -> dict[str, Any]:
         from .requirements import runtime_requirements
@@ -292,6 +302,9 @@ class BundlePlan:
                 stage.id: stage.logical_record() for stage in sorted(self.stages, key=lambda value: value.id)
             },
         }
+        if self.transform is not None:
+            result["program_transform"] = dict(self.transform)
+            result["autodiff_profiles"] = dict(self.autodiff_profiles or {})
         requirements = runtime_requirements(self.target.target, self.stages)
         if requirements is not None:
             result["runtime_requirements"] = requirements

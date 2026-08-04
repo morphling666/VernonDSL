@@ -33,6 +33,8 @@ def _physical_value_profile(target: object, transport: object) -> tuple[str, str
         return "host_value", "host_value"
     if target == "cuda":
         return "cuda_kernel_parameter", "kernel_parameter"
+    if target == "metal":
+        return "metal_constant_buffer", transport if isinstance(transport, str) else "constant_buffer"
     if not isinstance(transport, str):
         raise PipelineCompileError("packed value argument is missing its reflected transport")
     if transport == "storage_buffer":
@@ -49,8 +51,6 @@ def _physical_value_profile(target: object, transport: object) -> tuple[str, str
             return "opengl_native_uniform", "native_uniform"
     if target == "directx" and transport in {"uniform_buffer", "push_constant"}:
         return "directx_constant_buffer", transport
-    if target == "metal" and transport in {"uniform_buffer", "push_constant"}:
-        return "metal_constant_buffer", transport
     raise PipelineCompileError(f"unsupported physical value transport {transport!r} for target {target!r}")
 
 
@@ -152,7 +152,11 @@ def reflected_parameters(
                 selected_layout = physical_layouts.get(profile) if isinstance(physical_layouts, Mapping) else None
                 if not isinstance(selected_layout, Mapping):
                     raise PipelineCompileError(f"{stage} packed value argument is missing profile {profile!r}")
-                use["physical_value_layout"] = dict(selected_layout)
+                use["physical_value_layout"] = {
+                    key: selected_layout[key]
+                    for key in ("profile", "size", "alignment", "byte_strides", "element_leaf_offsets")
+                    if key in selected_layout
+                }
                 use["physical_value_layout"]["transport"] = transport
             if internal_source is not None:
                 use["internal_source"] = internal_source

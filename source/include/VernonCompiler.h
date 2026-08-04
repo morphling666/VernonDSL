@@ -32,7 +32,8 @@ typedef struct VernonTargetCapabilities {
     uint8_t available;
     uint8_t supports_graphics;
     uint8_t supports_compute;
-    uint8_t reserved;
+    uint8_t supports_device_storage_atomics;
+    uint8_t supports_f32_device_atomic_add;
 } VernonTargetCapabilities;
 
 typedef enum VernonMetalPlatform { VERNON_METAL_PLATFORM_MACOS = 0, VERNON_METAL_PLATFORM_IOS = 1 } VernonMetalPlatform;

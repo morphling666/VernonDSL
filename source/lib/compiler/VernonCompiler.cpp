@@ -63,7 +63,7 @@ void vernonCompilerDestroy(VernonCompilerContext *context) {
 VernonTargetCapabilities vernonCompilerGetTargetCapabilities(const VernonCompilerContext *context,
                                                              VernonTarget target) {
     if (!context || target < VERNON_TARGET_CPU || target > VERNON_TARGET_CUDA)
-        return VernonTargetCapabilities{0, 0, 0, 0};
+        return VernonTargetCapabilities{0, 0, 0, 0, 0};
     return vernon::compiler::targetCapabilities(target);
 }
 
