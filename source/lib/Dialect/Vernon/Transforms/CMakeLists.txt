@@ -1,5 +1,7 @@
 add_mlir_library(
     MLIRVernonTransforms
+    VernonAutodiffAnalysis.cpp
+    VernonAutodiffRules.cpp
     VernonCpuPipeline.cpp
     VernonAttributeAbi.cpp
     VernonConvertGPUToSPIRV.cpp

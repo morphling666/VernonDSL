@@ -82,6 +82,20 @@ foreach(
                                                                          "${CMAKE_CURRENT_BINARY_DIR}/include")
 endforeach()
 
+# Keep compiler-layer unit tests independent from the compiler shared library while exposing the same MLIR build
+# environment through one target.
+add_library(VernonCompilerTestSupport INTERFACE)
+target_link_directories(VernonCompilerTestSupport INTERFACE ${LLVM_LIBRARY_DIRS})
+target_link_libraries(
+    VernonCompilerTestSupport
+    INTERFACE VernonCompilerBuildHeaders
+              MLIRArithDialect
+              MLIRControlFlowDialect
+              MLIRFuncDialect
+              MLIRParser
+              MLIRSCFDialect
+              MLIRVernonDialect)
+
 # The combined build registers tests after Runtime and Python targets exist. Register here only when the compiler is
 # configured as a standalone project.
 if(BUILD_TESTING AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)

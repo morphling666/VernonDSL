@@ -119,7 +119,7 @@ _DERIVATIVE_RULES: dict[OpCode, tuple[tuple[int, ...], bool]] = {
     OpCode.CROSS: ((0, 1), False),
     OpCode.MATMUL: ((0, 1), False),
     OpCode.NORM: ((0,), True),
-    OpCode.NORMALIZE: ((0,), True),
+    OpCode.NORMALIZE: ((0,), False),
     OpCode.REFLECT: ((0, 1), False),
     OpCode.SPLAT: ((), False),
     OpCode.BROADCAST: ((), False),

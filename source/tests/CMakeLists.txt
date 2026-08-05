@@ -21,6 +21,9 @@ if(Python_EXECUTABLE)
 endif()
 
 function(vernon_discover_gtests target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /EHsc)
+    endif()
     gtest_discover_tests(${target} DISCOVERY_MODE POST_BUILD WORKING_DIRECTORY "${VERNON_TEST_BINARY_ROOT}")
 endfunction()
 
@@ -143,9 +146,6 @@ if(TARGET VernonRuntime)
     add_executable(VernonRuntimeCoreProviderTests runtime/runtime_foreign_provider_test.cpp)
     target_link_libraries(VernonRuntimeCoreProviderTests PRIVATE GTest::gtest_main Vernon::RuntimeCore)
     add_dependencies(VernonRuntimeCoreProviderTests VernonRhiPublicCHeaderCheck)
-    if(MSVC)
-        target_compile_options(VernonRuntimeCoreProviderTests PRIVATE /EHsc)
-    endif()
     vernon_discover_gtests(VernonRuntimeCoreProviderTests)
 
     if(VERNON_ENABLE_CUDA_RUNTIME)
@@ -154,9 +154,6 @@ if(TARGET VernonRuntime)
         target_link_libraries(VernonRuntimeRHIAdapterTests PRIVATE GTest::gtest_main Vernon::RuntimeCore
                                                                    Vernon::RuntimeRHIAdapter)
         vernon_stage_target_files(VernonRuntimeRHIAdapterTests VernonRHI)
-        if(MSVC)
-            target_compile_options(VernonRuntimeRHIAdapterTests PRIVATE /EHsc)
-        endif()
         vernon_discover_gtests(VernonRuntimeRHIAdapterTests)
     endif()
 
@@ -234,10 +231,6 @@ if(TARGET VernonRuntime)
         target_link_libraries(VernonRuntimeTests PRIVATE VernonDSLCompiler)
         vernon_stage_target_files(VernonRuntimeTests VernonDSLCompiler)
     endif()
-    if(MSVC)
-        target_compile_options(VernonRuntimeTests PRIVATE /EHsc)
-    endif()
-
     if(TARGET vernon-compile)
         set(compiler_cpu_bundle "${VERNON_TEST_BINARY_ROOT}/compiler_cpu_aot_bundle")
         add_custom_command(
@@ -287,9 +280,6 @@ if(TARGET VernonRuntime)
                                                                    "${CMAKE_BINARY_DIR}/source")
         vernon_stage_target_files(VernonCookedAutodiffTests VernonRuntime)
         vernon_discover_gtests(VernonCookedAutodiffTests)
-        if(MSVC)
-            target_compile_options(VernonCookedAutodiffTests PRIVATE /EHsc)
-        endif()
 
         vernon_add_autodiff_python_fixture(
             VernonCookedAutodiffPythonFixture
@@ -667,6 +657,15 @@ if(TARGET VernonRuntime)
     set_tests_properties(vernon-runtime-package-smoke PROPERTIES RUN_SERIAL TRUE)
 endif()
 
+if(TARGET VernonCompilerTestSupport AND TARGET MLIRVernonTransforms)
+    add_executable(VernonAutodiffAnalysisTests compiler/vernon_autodiff_analysis_test.cpp
+                                               compiler/vernon_autodiff_rules_test.cpp)
+    set_target_properties(VernonAutodiffAnalysisTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/source")
+    target_link_libraries(VernonAutodiffAnalysisTests PRIVATE GTest::gtest_main VernonCompilerTestSupport
+                                                              MLIRVernonTransforms)
+    vernon_discover_gtests(VernonAutodiffAnalysisTests)
+endif()
+
 if(TARGET VernonDSLCompiler)
     add_executable(
         VernonCompilerTests
@@ -692,9 +691,6 @@ if(TARGET VernonDSLCompiler)
                 VernonDSLCompiler
                 vernon-compile-packaging
                 nlohmann_json::nlohmann_json)
-    if(MSVC)
-        target_compile_options(VernonCompilerTests PRIVATE /EHsc)
-    endif()
     vernon_stage_target_files(VernonCompilerTests VernonDSLCompiler)
     add_dependencies(VernonCompilerTests vernon-opt vernon-compile)
     vernon_discover_gtests(VernonCompilerTests)

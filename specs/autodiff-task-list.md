@@ -147,25 +147,25 @@ Primary files:
 
 Implementation:
 
-- [ ] Classify differentiable Scalar and canonical aggregate leaf types.
-- [ ] Resolve canonical `wrt` and active result leaves.
-- [ ] Propagate activity through SSA use-def chains.
-- [ ] Discover `scf.if`, `scf.while`, and nested structured regions.
-- [ ] Classify pure, Storage, atomic, barrier, and externally visible effects.
-- [ ] Reuse `VernonValueAbi` for aggregate leaf projection.
-- [ ] Emit deterministic diagnostics for unsupported active operations and
+- [x] Classify differentiable Scalar and canonical aggregate leaf types.
+- [x] Resolve canonical `wrt` and active result leaves.
+- [x] Propagate activity through SSA use-def chains.
+- [x] Discover `scf.if`, `scf.while`, and nested structured regions.
+- [x] Classify pure, Storage, atomic, barrier, and externally visible effects.
+- [x] Reuse `VernonValueAbi` for aggregate leaf projection.
+- [x] Emit deterministic diagnostics for unsupported active operations and
   effects.
-- [ ] Keep analysis independent of JVP/VJP mode and CPU/GPU target.
+- [x] Keep analysis independent of JVP/VJP mode and CPU/GPU target.
 
 Acceptance:
 
-- [ ] Add unit tests for inactive pruning and active result/`wrt` projection.
-- [ ] Add tests for nested region discovery and effect classification.
-- [ ] Add aggregate leaf activity tests.
+- [x] Add unit tests for inactive pruning and active result/`wrt` projection.
+- [x] Add tests for nested region discovery and effect classification.
+- [x] Add aggregate leaf activity tests.
 
 Gate:
 
-- [ ] VJP and future JVP can consume one immutable shared analysis result.
+- [x] VJP and future JVP can consume one immutable shared analysis result.
 
 ## Phase 4 — Differentiation rule registry
 
@@ -177,33 +177,33 @@ Primary files:
 
 Implementation:
 
-- [ ] Define one rule abstraction for activity classification, VJP primal
+- [x] Define one rule abstraction for activity classification, VJP primal
   requirements, VJP construction, and future JVP construction.
-- [ ] Use a pass-local registry keyed by MLIR operation name or `TypeID`.
-- [ ] Register `arith.addf`, `arith.subf`, `arith.mulf`, `arith.divf`, and
+- [x] Use a pass-local registry keyed by MLIR operation name or `TypeID`.
+- [x] Register `arith.addf`, `arith.subf`, `arith.mulf`, `arith.divf`, and
   negation rules.
-- [ ] Register currently supported scalar `math` rules without changing
+- [x] Register currently supported scalar `math` rules without changing
   numerical behavior.
-- [ ] Declare exact required primal operands/results in each VJP rule.
-- [ ] Keep rules free of tape allocation, backend resources, and CPU/GPU
+- [x] Declare exact required primal operands/results in each VJP rule.
+- [x] Keep rules free of tape allocation, backend resources, and CPU/GPU
   branches.
-- [ ] Diagnose active operations with missing or incompatible rules.
-- [ ] Add parity coverage against the current frontend derivative registry.
-- [ ] Leave a migration path to Vernon differentiation `OpInterface` external
+- [x] Diagnose active operations with missing or incompatible rules.
+- [x] Add parity coverage against the current frontend derivative registry.
+- [x] Leave a migration path to Vernon differentiation `OpInterface` external
   models without modifying upstream dialect definitions.
 
 Acceptance:
 
-- [ ] Add isolated rule tests for primal requirements and emitted local
+- [x] Add isolated rule tests for primal requirements and emitted local
   derivatives.
-- [ ] Compare scalar rule results with finite differences and the CPU reference
+- [x] Compare scalar rule results with finite differences and the CPU reference
   oracle.
-- [ ] Prove that adding an operation requires one rule registration rather
+- [x] Prove that adding an operation requires one rule registration rather
   than edits to multiple transforms.
 
 Gate:
 
-- [ ] Existing scalar VJP rules are represented once in the shared registry.
+- [x] Existing scalar VJP rules are represented once in the shared registry.
 
 ## Phase 5 — Rule-driven tape planning
 
