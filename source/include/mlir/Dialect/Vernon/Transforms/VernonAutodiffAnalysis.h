@@ -39,6 +39,11 @@ struct AutodiffValueActivity {
     SmallVector<unsigned> activeAbiLeaves;
 };
 
+struct AutodiffValueAbi {
+    Value value;
+    ValueAbiLayout layout;
+};
+
 struct AutodiffOperationActivity {
     Operation *operation{};
     AutodiffEffectKind effect{AutodiffEffectKind::Pure};
@@ -62,6 +67,7 @@ public:
     ArrayRef<AutodiffOperationActivity> getOperations() const { return operations; }
     ArrayRef<AutodiffRegion> getRegions() const { return regions; }
 
+    const ValueAbiLayout *getValueAbi(Value value) const;
     bool isActive(Value value, unsigned abiLeafIndex) const;
     bool isActive(Operation *operation) const;
 
@@ -72,6 +78,7 @@ private:
     SmallVector<AutodiffLeaf> wrtLeaves;
     SmallVector<AutodiffLeaf> activeResultLeaves;
     SmallVector<AutodiffValueActivity> activeValues;
+    SmallVector<AutodiffValueAbi, 0> valueAbis;
     SmallVector<AutodiffOperationActivity> operations;
     SmallVector<AutodiffRegion> regions;
 };

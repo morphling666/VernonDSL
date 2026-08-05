@@ -214,29 +214,29 @@ Primary files:
 
 Implementation:
 
-- [ ] Collect only rule-required active primal values.
-- [ ] Deduplicate saved SSA values.
-- [ ] Decompose aggregate values through canonical ABI leaves.
-- [ ] Separate fixed invocation records from dynamic-region records.
-- [ ] Assign checked leaf offsets, record stride, and alignment.
-- [ ] Define invocation and region header schemas.
-- [ ] Assign parent-record identity and child-region ordinals.
-- [ ] Represent predicates, actual iteration counts, and exit kinds needed by
+- [x] Collect only rule-required active primal values.
+- [x] Deduplicate saved SSA values.
+- [x] Decompose aggregate values through canonical ABI leaves.
+- [x] Separate fixed invocation records from dynamic-region records.
+- [x] Assign checked leaf offsets, record stride, and alignment.
+- [x] Define invocation and region header schemas.
+- [x] Assign parent-record identity and child-region ordinals.
+- [x] Represent predicates, actual iteration counts, and exit kinds needed by
   reverse control flow.
-- [ ] Keep save-versus-recompute policy separate from rule semantics.
-- [ ] Ensure `tape_bytes` is a static layout/statistics hint, never an
+- [x] Keep save-versus-recompute policy separate from rule semantics.
+- [x] Ensure `tape_bytes` is a static layout/statistics hint, never an
   iteration or allocation cap.
 
 Acceptance:
 
-- [ ] Add tests showing `addf` saves no primal values.
-- [ ] Add tests showing multiplication/division save only declared values.
-- [ ] Add deduplication and mixed-alignment aggregate tests.
-- [ ] Add checked record-size, offset, and alignment overflow tests.
+- [x] Add tests showing `addf` saves no primal values.
+- [x] Add tests showing multiplication/division save only declared values.
+- [x] Add deduplication and mixed-alignment aggregate tests.
+- [x] Add checked record-size, offset, and alignment overflow tests.
 
 Gate:
 
-- [ ] VJP tape contents are derived from rule requirements rather than
+- [x] VJP tape contents are derived from rule requirements rather than
   save-every-scalar behavior.
 
 ## Phase 6 — Structured scalar VJP

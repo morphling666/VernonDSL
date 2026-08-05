@@ -16,6 +16,12 @@ namespace {
 
 constexpr unsigned kInvalidNode = std::numeric_limits<unsigned>::max();
 
+FailureOr<unsigned> checkedUnsigned(size_t value) {
+    if (value > std::numeric_limits<unsigned>::max())
+        return failure();
+    return static_cast<unsigned>(value);
+}
+
 bool samePathComponent(const ValueAbiPathComponent &left, const ValueAbiPathComponent &right) {
     return left.field == right.field && left.index == right.index;
 }
@@ -58,14 +64,149 @@ struct ValueNodes {
     SmallVector<unsigned> nodes;
 };
 
+SmallVector<std::string> copyDtypes(const ValueAbiLayout &layout) {
+    SmallVector<std::string> result;
+    result.reserve(layout.leaves.size());
+    for (const ValueAbiLeaf &leaf : layout.leaves)
+        result.push_back(leaf.dtype);
+    return result;
+}
+
+class AutodiffValueAbiResolver {
+public:
+    AutodiffValueAbiResolver(func::FuncOp function, ModuleOp module) : function(function), module(module) {}
+
+    FailureOr<ValueAbiLayout> resolve(Value value, ArrayRef<StringRef> explicitDtypes = {}) {
+        if (auto found = cache.find(value); found != cache.end()) {
+            if (!explicitDtypes.empty()) {
+                FailureOr<ValueAbiLayout> explicitLayout =
+                    mlir::vernon::getValueAbiLayout(value.getType(), module, explicitDtypes);
+                if (failed(explicitLayout) || explicitLayout->layoutHash != found->second.layoutHash)
+                    return failure();
+            }
+            return found->second;
+        }
+
+        SmallVector<std::string> ownedDtypes;
+        if (!explicitDtypes.empty()) {
+            for (StringRef dtype : explicitDtypes)
+                ownedDtypes.push_back(dtype.str());
+        } else {
+            FailureOr<SmallVector<std::string>> inferred = inferDtypes(value);
+            if (failed(inferred))
+                return failure();
+            ownedDtypes = std::move(*inferred);
+        }
+        SmallVector<StringRef> dtypeRefs;
+        dtypeRefs.reserve(ownedDtypes.size());
+        for (const std::string &dtype : ownedDtypes)
+            dtypeRefs.push_back(dtype);
+        FailureOr<ValueAbiLayout> layout = mlir::vernon::getValueAbiLayout(value.getType(), module, dtypeRefs);
+        if (failed(layout))
+            return failure();
+        cache.try_emplace(value, *layout);
+        return std::move(*layout);
+    }
+
+private:
+    FailureOr<SmallVector<std::string>> inferDtypes(Value value) {
+        if (auto argument = dyn_cast<BlockArgument>(value)) {
+            if (argument.getOwner() == &function.getBody().front()) {
+                FailureOr<SmallVector<StringRef>> dtypes =
+                    getDtypes(function.getArgAttrOfType<ArrayAttr>(argument.getArgNumber(), "vernon.abi_leaf_dtypes"));
+                if (failed(dtypes))
+                    return failure();
+                SmallVector<std::string> result;
+                for (StringRef dtype : *dtypes)
+                    result.push_back(dtype.str());
+                return result;
+            }
+            if (auto whileOp = dyn_cast_or_null<scf::WhileOp>(argument.getOwner()->getParentOp())) {
+                if (argument.getArgNumber() >= whileOp.getInits().size())
+                    return failure();
+                FailureOr<ValueAbiLayout> initial = resolve(whileOp.getInits()[argument.getArgNumber()]);
+                return succeeded(initial) ? FailureOr<SmallVector<std::string>>(copyDtypes(*initial))
+                                          : FailureOr<SmallVector<std::string>>(failure());
+            }
+            return failure();
+        }
+
+        auto result = dyn_cast<OpResult>(value);
+        if (!result)
+            return SmallVector<std::string>{};
+        Operation *operation = result.getOwner();
+        if (auto whileOp = dyn_cast<scf::WhileOp>(operation)) {
+            if (result.getResultNumber() >= whileOp.getInits().size())
+                return failure();
+            FailureOr<ValueAbiLayout> initial = resolve(whileOp.getInits()[result.getResultNumber()]);
+            return succeeded(initial) ? FailureOr<SmallVector<std::string>>(copyDtypes(*initial))
+                                      : FailureOr<SmallVector<std::string>>(failure());
+        }
+        if (auto ifOp = dyn_cast<scf::IfOp>(operation)) {
+            if (ifOp.getThenRegion().empty() || ifOp.getElseRegion().empty())
+                return failure();
+            FailureOr<ValueAbiLayout> thenLayout = resolve(ifOp.thenYield()->getOperand(result.getResultNumber()));
+            FailureOr<ValueAbiLayout> elseLayout = resolve(ifOp.elseYield()->getOperand(result.getResultNumber()));
+            if (failed(thenLayout) || failed(elseLayout) || thenLayout->layoutHash != elseLayout->layoutHash)
+                return failure();
+            return copyDtypes(*thenLayout);
+        }
+        if (auto get = dyn_cast<StructGetOp>(operation))
+            return projectDtypes(get.getInput(), ValueAbiPathComponent::getField(get.getField()));
+        if (auto get = dyn_cast<TupleGetOp>(operation))
+            return projectDtypes(get.getInput(),
+                                 ValueAbiPathComponent::getIndex(static_cast<uint64_t>(get.getIndex())));
+        if (isa<TupleCreateOp, StructCreateOp>(operation)) {
+            SmallVector<std::string> combined;
+            for (Value operand : operation->getOperands()) {
+                FailureOr<ValueAbiLayout> operandLayout = resolve(operand);
+                if (failed(operandLayout))
+                    return failure();
+                llvm::append_range(combined, copyDtypes(*operandLayout));
+            }
+            return combined;
+        }
+
+        std::optional<SmallVector<std::string>> propagated;
+        for (Value operand : operation->getOperands()) {
+            if (operand.getType() != value.getType())
+                continue;
+            FailureOr<ValueAbiLayout> operandLayout = resolve(operand);
+            if (failed(operandLayout))
+                return failure();
+            SmallVector<std::string> operandDtypes = copyDtypes(*operandLayout);
+            if (propagated && *propagated != operandDtypes)
+                return failure();
+            propagated = std::move(operandDtypes);
+        }
+        return propagated ? std::move(*propagated) : SmallVector<std::string>{};
+    }
+
+    FailureOr<SmallVector<std::string>> projectDtypes(Value input, const ValueAbiPathComponent &prefix) {
+        FailureOr<ValueAbiLayout> inputLayout = resolve(input);
+        if (failed(inputLayout))
+            return failure();
+        SmallVector<std::string> projected;
+        for (const ValueAbiLeaf &leaf : inputLayout->leaves) {
+            if (hasPathPrefix(leaf.path, ArrayRef<ValueAbiPathComponent>(prefix)))
+                projected.push_back(leaf.dtype);
+        }
+        return projected;
+    }
+
+    func::FuncOp function;
+    ModuleOp module;
+    DenseMap<Value, ValueAbiLayout> cache;
+};
+
 } // namespace
 
 class AutodiffAnalysisBuilder {
 public:
     AutodiffAnalysisBuilder(func::FuncOp function, ArrayRef<StringRef> wrtPaths,
                             const VernonAutodiffRuleRegistry &registry)
-        : function(function), module(function->getParentOfType<ModuleOp>()), requestedWrt(wrtPaths),
-          registry(registry) {}
+        : function(function), module(function->getParentOfType<ModuleOp>()), requestedWrt(wrtPaths), registry(registry),
+          abiResolver(function, module) {}
 
     FailureOr<VernonAutodiffAnalysisResult> run();
 
@@ -73,6 +214,7 @@ private:
     FailureOr<unsigned> addValue(Value value, ArrayRef<StringRef> dtypes = {});
     std::optional<unsigned> getNode(Value value, unsigned leafIndex);
     void addDependency(unsigned result, unsigned operand);
+    void verifySameAbi(Operation *operation, ValueRange values);
     void addAllDependencies(Value result, ValueRange operands);
     void addProjectedGetDependencies(Value result, Value input, const ValueAbiPathComponent &prefix);
     void addCreateDependencies(Value result, ValueRange operands);
@@ -80,7 +222,7 @@ private:
     LogicalResult resolveWrt();
     LogicalResult resolveResults();
     void computeActivity();
-    void discoverRegions();
+    LogicalResult discoverRegions();
     LogicalResult collectOperations();
     bool anyActiveLeaf(Value value) const;
     bool hasActiveDescendant(Operation *operation) const;
@@ -91,6 +233,7 @@ private:
     ModuleOp module;
     ArrayRef<StringRef> requestedWrt;
     const VernonAutodiffRuleRegistry &registry;
+    AutodiffValueAbiResolver abiResolver;
     VernonAutodiffAnalysisResult result;
     DenseMap<Value, unsigned> valueIndices;
     SmallVector<ValueNodes, 0> values;
@@ -107,26 +250,33 @@ private:
 
 FailureOr<unsigned> AutodiffAnalysisBuilder::addValue(Value value, ArrayRef<StringRef> dtypes) {
     auto existing = valueIndices.find(value);
-    if (existing != valueIndices.end())
+    if (existing != valueIndices.end()) {
+        if (!dtypes.empty() && failed(abiResolver.resolve(value, dtypes)))
+            return failure();
         return existing->second;
-    FailureOr<ValueAbiLayout> layout = getValueAbiLayout(value.getType(), module, dtypes);
+    }
+    FailureOr<ValueAbiLayout> layout = abiResolver.resolve(value, dtypes);
     if (failed(layout))
         return failure();
 
-    const unsigned valueIndex = values.size();
-    valueIndices.try_emplace(value, valueIndex);
+    FailureOr<unsigned> valueIndex = checkedUnsigned(values.size());
+    if (failed(valueIndex) || layout->leaves.size() > std::numeric_limits<unsigned>::max())
+        return failure();
+    valueIndices.try_emplace(value, *valueIndex);
     ValueNodes &entry = values.emplace_back(ValueNodes{value, std::move(*layout), {}});
     entry.nodes.assign(entry.layout.leaves.size(), kInvalidNode);
     for (auto [leafIndex, leaf] : llvm::enumerate(entry.layout.leaves)) {
         if (!isDifferentiable(leaf))
             continue;
-        const unsigned node = nodeValues.size();
-        entry.nodes[leafIndex] = node;
-        nodeValues.emplace_back(value, leafIndex);
+        FailureOr<unsigned> node = checkedUnsigned(nodeValues.size());
+        if (failed(node))
+            return failure();
+        entry.nodes[leafIndex] = *node;
+        nodeValues.emplace_back(value, static_cast<unsigned>(leafIndex));
         dependencies.emplace_back();
         users.emplace_back();
     }
-    return valueIndex;
+    return *valueIndex;
 }
 
 std::optional<unsigned> AutodiffAnalysisBuilder::getNode(Value value, unsigned leafIndex) {
@@ -146,10 +296,29 @@ void AutodiffAnalysisBuilder::addDependency(unsigned resultNode, unsigned operan
     }
 }
 
+void AutodiffAnalysisBuilder::verifySameAbi(Operation *operation, ValueRange comparedValues) {
+    const ValueAbiLayout *expected = nullptr;
+    for (Value value : comparedValues) {
+        FailureOr<unsigned> valueIndex = addValue(value);
+        if (failed(valueIndex)) {
+            emitDependencyError(operation, "cannot resolve structured control-flow Value ABI metadata");
+            return;
+        }
+        const ValueAbiLayout &layout = values[*valueIndex].layout;
+        if (expected && expected->layoutHash != layout.layoutHash) {
+            emitDependencyError(operation, "structured control-flow values have incompatible canonical Value ABIs");
+            return;
+        }
+        expected = &layout;
+    }
+}
+
 void AutodiffAnalysisBuilder::addAllDependencies(Value resultValue, ValueRange operands) {
     FailureOr<unsigned> resultIndex = addValue(resultValue);
-    if (failed(resultIndex))
+    if (failed(resultIndex)) {
+        emitDependencyError(resultValue.getDefiningOp(), "cannot resolve the result's canonical Value ABI");
         return;
+    }
     for (auto [resultLeafIndex, resultLeaf] : llvm::enumerate(values[*resultIndex].layout.leaves)) {
         if (!isDifferentiable(resultLeaf))
             continue;
@@ -158,8 +327,10 @@ void AutodiffAnalysisBuilder::addAllDependencies(Value resultValue, ValueRange o
             continue;
         for (Value operand : operands) {
             FailureOr<unsigned> operandIndex = addValue(operand);
-            if (failed(operandIndex))
-                continue;
+            if (failed(operandIndex)) {
+                emitDependencyError(resultValue.getDefiningOp(), "cannot resolve an operand's canonical Value ABI");
+                return;
+            }
             for (auto [operandLeafIndex, operandLeaf] : llvm::enumerate(values[*operandIndex].layout.leaves)) {
                 if (isDifferentiable(operandLeaf)) {
                     if (std::optional<unsigned> operandNode = getNode(operand, operandLeafIndex))
@@ -174,8 +345,11 @@ void AutodiffAnalysisBuilder::addProjectedGetDependencies(Value resultValue, Val
                                                           const ValueAbiPathComponent &prefix) {
     FailureOr<unsigned> resultIndex = addValue(resultValue);
     FailureOr<unsigned> inputIndex = addValue(input);
-    if (failed(resultIndex) || failed(inputIndex))
+    if (failed(resultIndex) || failed(inputIndex)) {
+        emitDependencyError(resultValue.getDefiningOp(),
+                            "cannot resolve aggregate projection canonical Value ABI metadata");
         return;
+    }
     for (auto [resultLeafIndex, resultLeaf] : llvm::enumerate(values[*resultIndex].layout.leaves)) {
         if (!isDifferentiable(resultLeaf))
             continue;
@@ -201,8 +375,10 @@ void AutodiffAnalysisBuilder::addProjectedGetDependencies(Value resultValue, Val
 
 void AutodiffAnalysisBuilder::addCreateDependencies(Value resultValue, ValueRange operands) {
     FailureOr<unsigned> resultIndex = addValue(resultValue);
-    if (failed(resultIndex))
+    if (failed(resultIndex)) {
+        emitDependencyError(resultValue.getDefiningOp(), "aggregate create result has no canonical Value ABI");
         return;
+    }
     unsigned flattenedLeaf = 0;
     for (Value operand : operands) {
         FailureOr<unsigned> operandIndex = addValue(operand);
@@ -235,14 +411,21 @@ void AutodiffAnalysisBuilder::buildDependencies(Operation *operation) {
             if (!ifOp.getElseRegion().empty())
                 yielded.push_back(ifOp.elseYield()->getOperand(resultIndex));
             addAllDependencies(value, yielded);
+            yielded.push_back(value);
+            verifySameAbi(operation, yielded);
         }
         return;
     }
     if (auto whileOp = dyn_cast<scf::WhileOp>(operation)) {
         auto condition = cast<scf::ConditionOp>(whileOp.getBefore().front().getTerminator());
         auto afterYield = cast<scf::YieldOp>(whileOp.getAfter().front().getTerminator());
-        for (auto [index, value] : llvm::enumerate(whileOp.getResults()))
+        for (auto [index, value] : llvm::enumerate(whileOp.getResults())) {
             addAllDependencies(value, ValueRange(condition.getArgs()[index]));
+            SmallVector<Value> carried = {whileOp.getInits()[index],      whileOp.getBeforeArguments()[index],
+                                          condition.getArgs()[index],     whileOp.getAfterArguments()[index],
+                                          afterYield.getResults()[index], value};
+            verifySameAbi(operation, carried);
+        }
         for (auto [index, argument] : llvm::enumerate(whileOp.getBeforeArguments())) {
             addAllDependencies(argument, ValueRange(whileOp.getInits()[index]));
             addAllDependencies(argument, ValueRange(afterYield.getResults()[index]));
@@ -294,8 +477,12 @@ InFlightDiagnostic AutodiffAnalysisBuilder::emitFunctionError(const Twine &messa
 }
 
 void AutodiffAnalysisBuilder::emitDependencyError(Operation *operation, const Twine &message) {
-    if (succeeded(dependencyStatus))
-        operation->emitError() << "autodiff analysis: " << message;
+    if (succeeded(dependencyStatus)) {
+        if (operation)
+            operation->emitError() << "autodiff analysis: " << message;
+        else
+            emitFunctionError(message);
+    }
     dependencyStatus = failure();
 }
 
@@ -410,6 +597,9 @@ LogicalResult AutodiffAnalysisBuilder::resolveResults() {
                 return emitFunctionError(Twine("result #") + Twine(resultIndex) + " has no canonical Value ABI");
             if (dtypeArray && dtypeArray.size() != resultLayout->leaves.size())
                 return emitFunctionError(Twine("result #") + Twine(resultIndex) + " has incomplete ABI dtype metadata");
+            if (dtypeArray && failed(abiResolver.resolve(value, *dtypes)))
+                return emitFunctionError(Twine("result #") + Twine(resultIndex) +
+                                         " ABI dtype metadata disagrees with its SSA value");
             StringRef root = "output";
             if (function.getNumResults() > 1) {
                 if (auto name = function.getResultAttrOfType<StringAttr>(resultIndex, "vernon.source_name"))
@@ -461,6 +651,7 @@ void AutodiffAnalysisBuilder::computeActivity() {
     llvm::erase_if(result.activeResultLeaves,
                    [&](const AutodiffLeaf &leaf) { return !active.test(*getNode(leaf.value, leaf.abiLeafIndex)); });
     for (const ValueNodes &entry : values) {
+        result.valueAbis.push_back(AutodiffValueAbi{entry.value, entry.layout});
         AutodiffValueActivity activity;
         activity.value = entry.value;
         for (auto [leafIndex, node] : llvm::enumerate(entry.nodes)) {
@@ -495,11 +686,11 @@ bool AutodiffAnalysisBuilder::hasActiveDescendant(Operation *operation) const {
     return found;
 }
 
-void AutodiffAnalysisBuilder::discoverRegions() {
+LogicalResult AutodiffAnalysisBuilder::discoverRegions() {
     DenseMap<Operation *, unsigned> ordinals;
-    function.walk<WalkOrder::PreOrder>([&](Operation *operation) {
+    WalkResult walkResult = function.walk<WalkOrder::PreOrder>([&](Operation *operation) {
         if (!isa<scf::IfOp, scf::WhileOp>(operation))
-            return;
+            return WalkResult::advance();
         std::optional<unsigned> parent;
         for (Operation *ancestor = operation->getParentOp(); ancestor && ancestor != function.getOperation();
              ancestor = ancestor->getParentOp()) {
@@ -509,12 +700,18 @@ void AutodiffAnalysisBuilder::discoverRegions() {
                 break;
             }
         }
-        const unsigned ordinal = result.regions.size();
-        ordinals.try_emplace(operation, ordinal);
-        result.regions.push_back(AutodiffRegion{operation, ordinal, parent, {}});
+        FailureOr<unsigned> ordinal = checkedUnsigned(result.regions.size());
+        if (failed(ordinal)) {
+            operation->emitError("autodiff region count exceeds the analysis representation");
+            return WalkResult::interrupt();
+        }
+        ordinals.try_emplace(operation, *ordinal);
+        result.regions.push_back(AutodiffRegion{operation, *ordinal, parent, {}});
         if (parent)
-            result.regions[*parent].childOrdinals.push_back(ordinal);
+            result.regions[*parent].childOrdinals.push_back(*ordinal);
+        return WalkResult::advance();
     });
+    return failure(walkResult.wasInterrupted());
 }
 
 LogicalResult AutodiffAnalysisBuilder::collectOperations() {
@@ -564,7 +761,8 @@ FailureOr<VernonAutodiffAnalysisResult> AutodiffAnalysisBuilder::run() {
     if (failed(dependencyStatus))
         return failure();
     computeActivity();
-    discoverRegions();
+    if (failed(discoverRegions()))
+        return failure();
     if (failed(collectOperations()))
         return failure();
     if (failed(verifyAutodiffRuleCoverage(result, registry)))
@@ -575,6 +773,11 @@ FailureOr<VernonAutodiffAnalysisResult> AutodiffAnalysisBuilder::run() {
 bool VernonAutodiffAnalysisResult::isActive(Value value, unsigned abiLeafIndex) const {
     auto activity = llvm::find_if(activeValues, [&](const AutodiffValueActivity &item) { return item.value == value; });
     return activity != activeValues.end() && llvm::is_contained(activity->activeAbiLeaves, abiLeafIndex);
+}
+
+const ValueAbiLayout *VernonAutodiffAnalysisResult::getValueAbi(Value value) const {
+    auto found = llvm::find_if(valueAbis, [&](const AutodiffValueAbi &item) { return item.value == value; });
+    return found == valueAbis.end() ? nullptr : &found->layout;
 }
 
 bool VernonAutodiffAnalysisResult::isActive(Operation *operation) const {

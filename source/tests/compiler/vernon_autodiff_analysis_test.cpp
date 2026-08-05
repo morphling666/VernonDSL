@@ -362,5 +362,23 @@ module {
     EXPECT_NE(failureMessage(function, {"x"}).find("active externally visible operation"), std::string::npos);
 }
 
+TEST_F(VernonAutodiffAnalysisTest, RejectsConflictingSsaAndResultDtypeMetadata) {
+    OwningOpRef<ModuleOp> module = parse(R"mlir(
+module {
+  func.func @dtype_mismatch(
+      %value: tuple<f32, i32> {
+        vernon.source_name = "value",
+        vernon.abi_leaf_dtypes = ["f32", "u32"]
+      }) -> (tuple<f32, i32> {vernon.abi_leaf_dtypes = ["f32", "i32"]}) {
+    func.return %value : tuple<f32, i32>
+  }
+}
+)mlir");
+    ASSERT_TRUE(module);
+    func::FuncOp function = module->lookupSymbol<func::FuncOp>("dtype_mismatch");
+    EXPECT_NE(failureMessage(function, {"value.0"}).find("ABI dtype metadata disagrees with its SSA value"),
+              std::string::npos);
+}
+
 } // namespace
 } // namespace mlir::vernon

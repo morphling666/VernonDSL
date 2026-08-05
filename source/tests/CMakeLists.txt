@@ -658,8 +658,9 @@ if(TARGET VernonRuntime)
 endif()
 
 if(TARGET VernonCompilerTestSupport AND TARGET MLIRVernonTransforms)
-    add_executable(VernonAutodiffAnalysisTests compiler/vernon_autodiff_analysis_test.cpp
-                                               compiler/vernon_autodiff_rules_test.cpp)
+    add_executable(
+        VernonAutodiffAnalysisTests compiler/vernon_autodiff_analysis_test.cpp compiler/vernon_autodiff_rules_test.cpp
+                                    compiler/vernon_autodiff_tape_planning_test.cpp)
     set_target_properties(VernonAutodiffAnalysisTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/source")
     target_link_libraries(VernonAutodiffAnalysisTests PRIVATE GTest::gtest_main VernonCompilerTestSupport
                                                               MLIRVernonTransforms)
