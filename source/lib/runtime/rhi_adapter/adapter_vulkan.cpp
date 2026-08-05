@@ -1,10 +1,10 @@
-#include "../../rhi/rhi_internal.h"
-#include "../vertex_attribute_capabilities.h"
 #include "adapter_common.h"
+#include "rhi/rhi_internal.h"
+#include "runtime/vertex_attribute_capabilities.h"
 
 #if defined(VERNON_HAS_VULKAN_RHI)
 
-#include "../../rhi/vulkan_backend.h"
+#include "rhi/vulkan_backend.h"
 
 #include <algorithm>
 #include <array>

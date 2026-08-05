@@ -16,6 +16,7 @@ add_mlir_library(
     VernonSpirvMath.cpp
     VernonTensorShapeSemantics.cpp
     VernonValidation.cpp
+    VernonVerifyCPUAutodiffABI.cpp
     VernonToGPU.cpp
     VernonToSpirv.cpp
     DEPENDS

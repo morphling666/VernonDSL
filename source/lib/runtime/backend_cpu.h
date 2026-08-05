@@ -1,12 +1,12 @@
 #ifndef VERNON_RUNTIME_BACKEND_CPU_H
 #define VERNON_RUNTIME_BACKEND_CPU_H
 
-#include "../platform/platform_library.h"
 #include "VernonRuntime.h"
 #include "VernonRuntimeCore.h"
 #include "VernonRuntimeProvider.h"
 #include "pipeline_bundle.h"
 #include "pipeline_metadata.h"
+#include "platform/platform_library.h"
 #include "runtime_state.h"
 
 #include <string>

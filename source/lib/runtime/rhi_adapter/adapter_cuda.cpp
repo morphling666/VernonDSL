@@ -2,8 +2,8 @@
 
 #if defined(VERNON_HAS_CUDA_RHI)
 
-#include "../../rhi/cuda_backend.h"
-#include "../../rhi/rhi_internal.h"
+#include "rhi/cuda_backend.h"
+#include "rhi/rhi_internal.h"
 
 #include <algorithm>
 #include <cassert>

@@ -9,7 +9,7 @@
 #include "tensor_bridge.h"
 
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-#include "../rhi/vulkan_backend.h"
+#include "rhi/vulkan_backend.h"
 #endif
 
 #include <string>

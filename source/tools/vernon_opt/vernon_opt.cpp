@@ -18,6 +18,7 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonToGPU.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonToSpirv.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonValidation.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonVerifyCPUAutodiffABI.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -71,6 +72,7 @@ int main(int argc, char **argv) {
     spirv::registerSPIRVPasses();
     // Register passes
     vernon::registerVernonValidatePass();
+    vernon::registerVernonVerifyCPUAutodiffABIPass();
     vernon::registerVernonInlineHelpersPass();
     vernon::registerVernonLowerAccumulationPass();
     vernon::registerVernonLowerCPUTensorsPass();

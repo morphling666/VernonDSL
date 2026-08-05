@@ -1,11 +1,11 @@
-#include "../../rhi/rhi_internal.h"
+#include "rhi/rhi_internal.h"
 #include "adapter_common.h"
 #include "adapter_internal.h"
 
 #if defined(VERNON_HAS_METAL_RHI)
 
-#include "../../rhi/metal_backend.h"
-#include "../metal_runtime_capabilities.h"
+#include "rhi/metal_backend.h"
+#include "runtime/metal_runtime_capabilities.h"
 
 #include <algorithm>
 #include <atomic>

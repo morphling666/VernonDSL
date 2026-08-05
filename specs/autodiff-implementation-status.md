@@ -1,6 +1,6 @@
 # Autodiff implementation status
 
-Last updated: 2026-08-04
+Last updated: 2026-08-05
 
 This document records implemented behavior. `autodiff.md` remains the
 normative design and contract document.
@@ -127,6 +127,12 @@ normative design and contract document.
 
 - Compiler contract version: 10.
 - Pipeline contract version: 13.
+- Versioned `VernonAdTapeAllocator` CPU ABI with a hidden
+  `ad_tape_allocator` packed argument, checked region handles, exact
+  post-capacity required-byte accounting, latched failure states, per-thread
+  invocation ownership, reset semantics, and immutable pullback-owned tape
+  snapshots. The descriptor is an internal Compiler/Runtime header, and a
+  dedicated CPU AD ABI pass verifies the hidden argument before CPU lowering.
 - One grid-independent manifest launch/resource plan containing workgroup,
   semantic accumulation operations, invocation-axis evidence, and dynamic
   carrier ABI.
@@ -192,9 +198,11 @@ same task list.
 - Profile ABI:
   `python/vernon_dsl/frontend/autodiff_profiles.py`
 - GPU Runtime:
-  `source/lib/runtime/runtime_autodiff_gpu.cpp`
+  `source/lib/runtime/autodiff/runtime_autodiff_gpu.cpp`
+- CPU tape allocator:
+  `source/lib/runtime/autodiff/host_tape_allocator.{h,cpp}`
 - ExecutionGraph AD Runtime:
-  `source/lib/runtime/runtime_autodiff_graph.cpp`
+  `source/lib/runtime/autodiff/runtime_autodiff_graph.cpp`
 - Public graph API:
   `source/include/VernonAutodiffGraph.h`
 - Manifest contract:

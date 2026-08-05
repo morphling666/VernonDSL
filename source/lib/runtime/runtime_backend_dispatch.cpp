@@ -1,15 +1,15 @@
 #include "runtime_dispatch.h"
 
 #if defined(VERNON_HAS_CUDA_RUNTIME)
-#include "../rhi/cuda_backend.h"
+#include "rhi/cuda_backend.h"
 #endif
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-#include "../rhi/directx12_backend.h"
+#include "rhi/directx12_backend.h"
 #endif
-#include "../rhi/opengl_backend.h"
-#include "../rhi/rhi_internal.h"
+#include "rhi/opengl_backend.h"
+#include "rhi/rhi_internal.h"
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
-#include "../rhi/vulkan_backend.h"
+#include "rhi/vulkan_backend.h"
 #endif
 #include "backend_cpu.h"
 #include "backend_opengl.h"

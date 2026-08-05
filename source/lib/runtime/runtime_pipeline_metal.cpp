@@ -1,10 +1,10 @@
 #include "runtime_pipeline_backend.h"
 
 #if defined(VERNON_HAS_METAL_RUNTIME)
-#include "../rhi/rhi_internal.h"
 #include "VernonRuntimeRHIAdapter.h"
 #include "backend_metal.h"
 #include "pipeline_metadata.h"
+#include "rhi/rhi_internal.h"
 
 #include <nlohmann/json.hpp>
 

@@ -1,13 +1,13 @@
 #ifndef VERNON_RUNTIME_BACKEND_OPENGL_H
 #define VERNON_RUNTIME_BACKEND_OPENGL_H
 
-#include "../rhi/opengl_backend.h"
 #include "VernonRuntime.h"
 #include "VernonRuntimeCore.h"
 #include "compute_launch_planner.h"
 #include "graphics_invocation_planner.h"
 #include "pipeline_bundle.h"
 #include "pipeline_metadata.h"
+#include "rhi/opengl_backend.h"
 #include "runtime_state.h"
 #include "tensor_bridge.h"
 

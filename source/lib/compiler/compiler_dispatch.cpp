@@ -225,9 +225,11 @@ VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options
     }
     if (target == VERNON_TARGET_CPU) {
         const auto &cpu = std::get<CpuCodegenOptions>(options);
-        if (!compileCpu(module, cpu, artifacts, reflection, diagnostics, cpuExecution)) {
+        const CpuCompileResult result = compileCpu(module, cpu, artifacts, reflection, diagnostics, cpuExecution);
+        if (result != CpuCompileResult::Success) {
             artifacts.clear();
-            return VERNON_STATUS_INTERNAL_ERROR;
+            return result == CpuCompileResult::VerificationFailure ? VERNON_STATUS_VERIFICATION_ERROR
+                                                                   : VERNON_STATUS_INTERNAL_ERROR;
         }
         if (!selectTargetPhysicalLayouts(reflection, target, diagnostics)) {
             artifacts.clear();

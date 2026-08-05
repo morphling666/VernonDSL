@@ -27,6 +27,7 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerSynchronization.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonValidation.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonVerifyCPUAutodiffABI.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
@@ -89,6 +90,7 @@ void registerVernonCpuPipelineDialects(DialectRegistry &registry) {
 
 void buildVernonCpuPreparationPipeline(OpPassManager &passManager) {
     passManager.addPass(createVernonValidatePass());
+    passManager.addPass(createVernonVerifyCPUAutodiffABIPass());
     passManager.addPass(createVernonInlineHelpersPass());
     passManager.addPass(std::make_unique<MaterializeStorageProjectionPass>());
 }

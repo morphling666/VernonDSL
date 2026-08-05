@@ -1,12 +1,12 @@
-#include "../../rhi/rhi_internal.h"
-#include "../runtime_test_hooks.h"
-#include "../vertex_attribute_capabilities.h"
 #include "adapter_common.h"
 #include "adapter_directx12_test_hooks.h"
+#include "rhi/rhi_internal.h"
+#include "runtime/runtime_test_hooks.h"
+#include "runtime/vertex_attribute_capabilities.h"
 
 #if defined(VERNON_HAS_DIRECTX12_RHI)
 
-#include "../../rhi/directx12_backend.h"
+#include "rhi/directx12_backend.h"
 
 #include <algorithm>
 #include <array>

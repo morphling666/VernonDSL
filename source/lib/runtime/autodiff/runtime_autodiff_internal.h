@@ -3,8 +3,8 @@
 
 #include "VernonExecutionGraph.h"
 #include "VernonRuntime.h"
-#include "pipeline_bundle.h"
-#include "pipeline_manifest.h"
+#include "runtime/pipeline_bundle.h"
+#include "runtime/pipeline_manifest.h"
 
 #include <cstddef>
 #include <cstdint>

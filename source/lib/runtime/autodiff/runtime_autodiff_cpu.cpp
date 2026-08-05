@@ -1,8 +1,9 @@
 #include "runtime_autodiff_internal.h"
 
-#include "backend_cpu.h"
-#include "pipeline_metadata.h"
-#include "runtime_state.h"
+#include "host_tape_allocator.h"
+#include "runtime/backend_cpu.h"
+#include "runtime/pipeline_metadata.h"
+#include "runtime/runtime_state.h"
 
 #include <nlohmann/json.hpp>
 
@@ -15,6 +16,7 @@
 #include <vector>
 
 namespace vernon::runtime::ad {
+
 namespace {
 
 struct HostLeaf {
@@ -35,6 +37,7 @@ struct HostArgument {
 struct HostProfileLayout {
     size_t argumentsSize{};
     size_t resultsSize{};
+    bool hasTapeAllocator{};
     std::vector<HostArgument> arguments;
     std::vector<HostLeaf> results;
 };
@@ -43,6 +46,24 @@ VernonStatus fail(VernonRuntimeContext &context, std::string message,
                   VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) {
     invocationDiagnostic(context) = std::move(message);
     return status;
+}
+
+const char *allocatorFailure(VernonAdTapeAllocatorStatus status) {
+    switch (status) {
+    case VERNON_AD_TAPE_ALLOCATOR_CAPACITY_EXHAUSTED:
+        return "capacity exhausted";
+    case VERNON_AD_TAPE_ALLOCATOR_ARITHMETIC_OVERFLOW:
+        return "arithmetic overflow";
+    case VERNON_AD_TAPE_ALLOCATOR_HOST_ALLOCATION_FAILURE:
+        return "host allocation failed";
+    case VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE:
+        return "invalid state";
+    case VERNON_AD_TAPE_ALLOCATOR_INVALID_ABI:
+        return "invalid ABI";
+    case VERNON_AD_TAPE_ALLOCATOR_OK:
+        return "no failure";
+    }
+    return "unknown failure";
 }
 
 bool appendLeafPath(const nlohmann::json &value, std::string &path, std::string &error) {
@@ -158,8 +179,7 @@ bool parseProfile(const Stage &stage, HostProfileLayout &layout, std::string &er
         return false;
     }
     for (const nlohmann::json &value : (*entry)["arguments"]) {
-        if (!value.is_object() || value.value("kind", "") == "builtin" || !value.contains("physical_layouts") ||
-            !value["physical_layouts"].is_object()) {
+        if (!value.is_object() || !value.contains("physical_layouts") || !value["physical_layouts"].is_object()) {
             error = "autodiff profile contains an invalid argument ABI";
             return false;
         }
@@ -178,15 +198,28 @@ bool parseProfile(const Stage &stage, HostProfileLayout &layout, std::string &er
         }
         HostArgument argument;
         argument.name = value.value("vernon.source_name", "");
-        argument.builtin = value.value("vernon.builtin", "");
+        argument.builtin = value.value("builtin", "");
         argument.offset = (*physical)["frame_offset"].get<size_t>();
         argument.size = (*physicalExtent)["size"].get<size_t>();
         argument.tensorView = physical->value("kind", "") == "resource_binding" &&
                               physical->value("resource_kind", "") == "tensor_view_descriptor";
         argument.access = value.value("access", "");
-        if (argument.name.empty() || argument.offset > layout.argumentsSize ||
-            argument.size > layout.argumentsSize - argument.offset) {
+        if (argument.offset > layout.argumentsSize || argument.size > layout.argumentsSize - argument.offset) {
             error = "autodiff argument host Value layout is out of bounds";
+            return false;
+        }
+        if (argument.builtin == VERNON_AD_TAPE_ALLOCATOR_BUILTIN) {
+            if (value.value("kind", "") != "builtin" || argument.size != sizeof(VernonAdTapeAllocator *) ||
+                layout.hasTapeAllocator) {
+                error = "autodiff tape allocator builtin has an invalid host ABI";
+                return false;
+            }
+            layout.hasTapeAllocator = true;
+            layout.arguments.push_back(std::move(argument));
+            continue;
+        }
+        if (argument.name.empty()) {
+            error = "autodiff argument has no source name";
             return false;
         }
         if (argument.tensorView) {
@@ -301,9 +334,11 @@ class CpuPullbackExecution final : public PullbackExecution {
 public:
     CpuPullbackExecution(VernonRuntimeContext &context, std::shared_ptr<CpuKernelState> backward,
                          HostProfileLayout layout, Signature signature, VernonLaunchSize computeGrid,
-                         std::vector<std::vector<uint8_t>> arguments)
+                         std::vector<std::vector<uint8_t>> arguments,
+                         std::vector<std::shared_ptr<const HostTapeSnapshot>> tapeSnapshots)
         : context_(context), backward_(std::move(backward)), layout_(std::move(layout)),
-          signature_(std::move(signature)), computeGrid_(computeGrid), arguments_(std::move(arguments)) {}
+          signature_(std::move(signature)), computeGrid_(computeGrid), arguments_(std::move(arguments)),
+          tapeSnapshots_(std::move(tapeSnapshots)) {}
 
     VernonStatus apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients) override {
         if (gradients.value_count != signature_.gradients.size())
@@ -371,6 +406,7 @@ private:
     Signature signature_;
     VernonLaunchSize computeGrid_{};
     std::vector<std::vector<uint8_t>> arguments_;
+    std::vector<std::shared_ptr<const HostTapeSnapshot>> tapeSnapshots_;
 };
 
 class CpuExecutable final : public HostExecutable {
@@ -455,10 +491,20 @@ public:
 
         std::vector<std::vector<uint8_t>> backwardArguments;
         backwardArguments.reserve(invocationCount);
+        std::vector<std::shared_ptr<const HostTapeSnapshot>> tapeSnapshots;
+        if (forwardLayout_.hasTapeAllocator)
+            tapeSnapshots.reserve(invocationCount);
         for (size_t invocationIndex = 0; invocationIndex < invocationCount; ++invocationIndex) {
+            std::unique_ptr<HostTapeAllocator> tapeAllocator;
             for (const HostArgument &argument : forwardLayout_.arguments) {
                 if (argument.builtin.empty())
                     continue;
+                if (argument.builtin == VERNON_AD_TAPE_ALLOCATOR_BUILTIN) {
+                    tapeAllocator = std::make_unique<HostTapeAllocator>();
+                    VernonAdTapeAllocator *descriptor = &tapeAllocator->descriptor();
+                    std::memcpy(arguments.data() + argument.offset, &descriptor, sizeof(descriptor));
+                    continue;
+                }
                 if (argument.builtin != "global_invocation_id" || argument.leaves.size() != 1 ||
                     argument.leaves.front().value.dtype != VERNON_DATA_U32 ||
                     argument.leaves.front().value.logicalShape != std::vector<uint64_t>{3})
@@ -476,6 +522,18 @@ public:
             const VernonStatus status = forward_->entry(&invocation);
             if (status != VERNON_STATUS_OK)
                 return fail(context_, "autodiff forward profile invocation failed", status);
+            if (tapeAllocator) {
+                const VernonAdTapeAllocatorStatus allocatorStatus = tapeAllocator->descriptor().status;
+                if (allocatorStatus != VERNON_AD_TAPE_ALLOCATOR_OK)
+                    return fail(context_, std::string("autodiff tape allocator ") + allocatorFailure(allocatorStatus),
+                                allocatorStatus == VERNON_AD_TAPE_ALLOCATOR_HOST_ALLOCATION_FAILURE
+                                    ? VERNON_STATUS_INTERNAL_ERROR
+                                    : VERNON_STATUS_INVALID_ARGUMENT);
+                std::shared_ptr<const HostTapeSnapshot> snapshot = tapeAllocator->takeSnapshot();
+                if (!snapshot)
+                    return fail(context_, "autodiff forward profile did not seal its tape");
+                tapeSnapshots.push_back(std::move(snapshot));
+            }
             std::memcpy(static_cast<uint8_t *>(output->data) + invocationIndex * signature_.output.byteSize,
                         results.data() + forwardLayout_.results.front().offset, signature_.output.byteSize);
             backwardArguments.emplace_back(backwardLayout_.argumentsSize);
@@ -487,7 +545,7 @@ public:
             }
         }
         pullback = std::make_unique<CpuPullbackExecution>(context_, backward_, backwardLayout_, signature_, computeGrid,
-                                                          std::move(backwardArguments));
+                                                          std::move(backwardArguments), std::move(tapeSnapshots));
         return VERNON_STATUS_OK;
     }
 

@@ -1,8 +1,8 @@
 #ifndef VERNON_RHI_VULKAN_DRIVER_H
 #define VERNON_RHI_VULKAN_DRIVER_H
 
-#include "../platform/platform_library.h"
 #include "VernonRHI.h"
+#include "platform/platform_library.h"
 
 #include <vulkan/vulkan.h>
 

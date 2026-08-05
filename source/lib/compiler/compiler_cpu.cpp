@@ -11,6 +11,7 @@
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonCpuPipeline.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonVerifyCPUAutodiffABI.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Export.h"
@@ -325,12 +326,18 @@ bool linkHostObjectBytes(llvm::StringRef object, std::string &library, std::stri
 
 } // namespace
 
-bool compileCpu(PreparedModule &prepared, const CpuCodegenOptions &options, std::vector<Artifact> &artifacts,
-                std::string &reflection, std::string &diagnostics, CpuExecutionStatePtr &execution) {
+CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &options,
+                            std::vector<Artifact> &artifacts, std::string &reflection, std::string &diagnostics,
+                            CpuExecutionStatePtr &execution) {
     mlir::MLIRContext &context = prepared.context();
     mlir::ScopedDiagnosticHandler handler(
         &context, [&](mlir::Diagnostic &diagnostic) { appendDiagnostic(diagnostics, diagnostic); });
     mlir::OwningOpRef<mlir::ModuleOp> sourceModule = prepared.clone();
+
+    mlir::PassManager abiVerifier(&context);
+    abiVerifier.addPass(mlir::vernon::createVernonVerifyCPUAutodiffABIPass());
+    if (mlir::failed(abiVerifier.run(*sourceModule)))
+        return CpuCompileResult::VerificationFailure;
 
     llvm::Expected<llvm::json::Value> parsedReflection = llvm::json::parse(reflection);
     llvm::json::Object *reflectionRoot = parsedReflection ? parsedReflection->getAsObject() : nullptr;
@@ -338,11 +345,11 @@ bool compileCpu(PreparedModule &prepared, const CpuCodegenOptions &options, std:
         reflectionRoot ? reflectionRoot->getString("module_hash") : std::nullopt;
     if (!moduleHash || moduleHash->empty()) {
         diagnostics = "CPU reflection is missing its module hash";
-        return false;
+        return CpuCompileResult::CodegenFailure;
     }
     std::vector<vernon::CpuAbiWrapperMetadata> entries;
     if (!captureCpuAbiMetadata(*sourceModule, entries, *moduleHash, diagnostics))
-        return false;
+        return CpuCompileResult::CodegenFailure;
 
     const bool hostTarget = options.targetTriple.empty();
     const std::string targetTriple =
@@ -350,20 +357,20 @@ bool compileCpu(PreparedModule &prepared, const CpuCodegenOptions &options, std:
     const llvm::Triple parsedTriple(targetTriple);
     if (!parsedTriple.isArch64Bit()) {
         diagnostics = "CPU relocatable objects currently require a 64-bit target triple";
-        return false;
+        return CpuCompileResult::CodegenFailure;
     }
     std::string lookupError;
     const llvm::Target *target = llvm::TargetRegistry::lookupTarget(parsedTriple, lookupError);
     if (!target) {
         diagnostics = "CPU target '" + targetTriple + "' is unavailable: " + lookupError;
-        return false;
+        return CpuCompileResult::CodegenFailure;
     }
     llvm::TargetOptions targetOptions;
     std::unique_ptr<llvm::TargetMachine> objectTargetMachine(
         target->createTargetMachine(parsedTriple, options.cpu, options.features, targetOptions, llvm::Reloc::PIC_));
     if (!objectTargetMachine) {
         diagnostics = "failed to create TargetMachine for '" + targetTriple + "'";
-        return false;
+        return CpuCompileResult::CodegenFailure;
     }
     const llvm::DataLayout dataLayout = objectTargetMachine->createDataLayout();
 
@@ -374,24 +381,24 @@ bool compileCpu(PreparedModule &prepared, const CpuCodegenOptions &options, std:
     mlir::PassManager passManager(&context);
     mlir::vernon::buildVernonCpuLoweringPipeline(passManager);
     if (mlir::failed(passManager.run(*sourceModule)))
-        return false;
+        return CpuCompileResult::CodegenFailure;
 
     auto llvmContext = std::make_unique<llvm::LLVMContext>();
     std::unique_ptr<llvm::Module> llvmModule = mlir::translateModuleToLLVMIR(*sourceModule, *llvmContext);
     if (!llvmModule) {
         diagnostics = "failed to translate lowered CPU MLIR to LLVM IR";
-        return false;
+        return CpuCompileResult::CodegenFailure;
     }
     llvmModule->setDataLayout(dataLayout);
     llvmModule->setTargetTriple(llvm::Triple(targetTriple));
     if (llvm::Error error = vernon::defineCpuTextureSampleHelper(*llvmModule)) {
         diagnostics = llvm::toString(std::move(error));
-        return false;
+        return CpuCompileResult::CodegenFailure;
     }
     for (const vernon::CpuAbiWrapperMetadata &entry : entries) {
         if (llvm::Error error = vernon::emitCpuAbiWrapper(*llvmModule, entry)) {
             diagnostics = llvm::toString(std::move(error));
-            return false;
+            return CpuCompileResult::CodegenFailure;
         }
     }
     if (parsedTriple.isOSWindows() && !llvmModule->getNamedGlobal("_fltused"))
@@ -400,18 +407,18 @@ bool compileCpu(PreparedModule &prepared, const CpuCodegenOptions &options, std:
                                  llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llvmContext), 0), "_fltused");
     if (llvm::verifyModule(*llvmModule, &llvm::errs())) {
         diagnostics = "generated CPU LLVM IR failed verification";
-        return false;
+        return CpuCompileResult::CodegenFailure;
     }
     std::string object;
     if (!emitCpuObject(*llvmModule, *objectTargetMachine, object, diagnostics))
-        return false;
+        return CpuCompileResult::CodegenFailure;
 
     CpuExecutionStatePtr nextExecution;
     if (hostTarget) {
         auto jitTargetMachine = llvm::orc::JITTargetMachineBuilder::detectHost();
         if (!jitTargetMachine) {
             diagnostics = llvm::toString(jitTargetMachine.takeError());
-            return false;
+            return CpuCompileResult::CodegenFailure;
         }
         auto createdJit = llvm::orc::LLJITBuilder()
                               .setJITTargetMachineBuilder(std::move(*jitTargetMachine))
@@ -419,20 +426,20 @@ bool compileCpu(PreparedModule &prepared, const CpuCodegenOptions &options, std:
                               .create();
         if (!createdJit) {
             diagnostics = llvm::toString(createdJit.takeError());
-            return false;
+            return CpuCompileResult::CodegenFailure;
         }
         nextExecution.reset(new CpuExecutionState());
         nextExecution->jit = std::move(*createdJit);
         if (llvm::Error error = nextExecution->jit->addIRModule(
                 llvm::orc::ThreadSafeModule(std::move(llvmModule), std::move(llvmContext)))) {
             diagnostics = llvm::toString(std::move(error));
-            return false;
+            return CpuCompileResult::CodegenFailure;
         }
         for (const vernon::CpuAbiWrapperMetadata &entry : entries) {
             auto symbol = nextExecution->jit->lookup(entry.exportedWrapperSymbol);
             if (!symbol) {
                 diagnostics = llvm::toString(symbol.takeError());
-                return false;
+                return CpuCompileResult::CodegenFailure;
             }
             nextExecution->entries.emplace(entry.internalFunctionSymbol, symbol->toPtr<VernonCpuEntryPoint>());
         }
@@ -441,10 +448,10 @@ bool compileCpu(PreparedModule &prepared, const CpuCodegenOptions &options, std:
     artifacts.push_back(Artifact{cpuObjectFilename(parsedTriple), std::move(object)});
     if (!setCpuReflectionSymbols(reflection, entries)) {
         diagnostics = "compiler produced invalid CPU reflection metadata";
-        return false;
+        return CpuCompileResult::CodegenFailure;
     }
     execution = std::move(nextExecution);
-    return true;
+    return CpuCompileResult::Success;
 }
 
 bool linkHostObject(const void *object, size_t objectSize, Artifact &artifact, std::string &diagnostics) {

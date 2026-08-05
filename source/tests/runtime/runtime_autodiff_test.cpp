@@ -1,6 +1,7 @@
 #include "VernonRuntime.hpp"
+#include "runtime/autodiff/host_tape_allocator.h"
+#include "runtime/autodiff/runtime_autodiff_internal.h"
 #include "runtime/content_hash.h"
-#include "runtime/runtime_autodiff_internal.h"
 #include "runtime/runtime_state.h"
 
 #include <gtest/gtest.h>
@@ -10,6 +11,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -93,6 +97,35 @@ VernonStatus halfIdentityBackward(const VernonCpuInvocation *invocation) {
     return VERNON_STATUS_OK;
 }
 
+VernonStatus allocatorSquareForward(const VernonCpuInvocation *invocation) {
+    if (!invocation || invocation->arguments_size != 2 * sizeof(uint64_t) ||
+        invocation->results_size != 2 * sizeof(float))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    float x = 0.0f;
+    VernonAdTapeAllocator *allocator = nullptr;
+    std::memcpy(&x, invocation->arguments, sizeof(x));
+    std::memcpy(&allocator, static_cast<const std::byte *>(invocation->arguments) + sizeof(uint64_t),
+                sizeof(VernonAdTapeAllocator *));
+    if (!allocator || allocator->struct_size != sizeof(*allocator) ||
+        allocator->abi_version != VERNON_AD_TAPE_ALLOCATOR_ABI_VERSION)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    VernonAdRegionHandle region = VERNON_AD_INVALID_REGION_HANDLE;
+    if (allocator->begin_region(allocator, VERNON_AD_INVALID_REGION_HANDLE, &region) != VERNON_AD_TAPE_ALLOCATOR_OK)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    size_t offset = 0;
+    void *address = nullptr;
+    if (allocator->reserve(allocator, region, sizeof(x), alignof(float), &offset, &address) !=
+        VERNON_AD_TAPE_ALLOCATOR_OK)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    std::memcpy(address, &x, sizeof(x));
+    if (allocator->end_region(allocator, region) != VERNON_AD_TAPE_ALLOCATOR_OK ||
+        allocator->seal(allocator) != VERNON_AD_TAPE_ALLOCATOR_OK)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    const float results[]{x * x, x};
+    std::memcpy(invocation->results, results, sizeof(results));
+    return VERNON_STATUS_OK;
+}
+
 nlohmann::json leaf(size_t offset, size_t scalarCount = 1, const char *dtype = "f32", bool shaped = false) {
     nlohmann::json result = {
         {"path", nlohmann::json::array()}, {"dtype", dtype}, {"scalar_count", scalarCount}, {"byte_offset", offset}};
@@ -160,6 +193,23 @@ nlohmann::json argument(const char *name, size_t offset, nlohmann::json leaves, 
                 {"canonical_layout_hash", "test-layout"},
                 {"frame_offset", offset},
                 {"root", std::move(root)}}}}}};
+}
+
+nlohmann::json tapeAllocatorArgument(size_t offset) {
+    return {{"kind", "builtin"},
+            {"builtin", VERNON_AD_TAPE_ALLOCATOR_BUILTIN},
+            {"physical_layouts",
+             {{"host_value",
+               {{"profile", "host_value"},
+                {"kind", "cpu_call"},
+                {"canonical_layout_hash", "ad-tape-allocator-v1"},
+                {"frame_offset", offset},
+                {"root",
+                 {{"kind", "scalar"},
+                  {"representation", "index"},
+                  {"offset", uint64_t{0}},
+                  {"size", sizeof(VernonAdTapeAllocator *)},
+                  {"alignment", alignof(VernonAdTapeAllocator *)}}}}}}}};
 }
 
 nlohmann::json profileReflection(const char *entry, size_t argumentBytes, size_t resultBytes, nlohmann::json arguments,
@@ -257,6 +307,154 @@ private:
     vernon::runtime::ad::Signature signature_;
 };
 
+TEST(RuntimeAutodiffTapeAllocator, HasFrozenVersionedAbi) {
+    EXPECT_EQ(VERNON_AD_TAPE_ALLOCATOR_ABI_VERSION, 1u);
+    EXPECT_EQ(sizeof(VernonAdTapeAllocatorStatus), 4u);
+    EXPECT_EQ(sizeof(VernonAdRegionHandle), 8u);
+    EXPECT_EQ(sizeof(VernonAdTapeAllocator), sizeof(void *) == 8 ? 88u : 48u);
+    EXPECT_EQ(offsetof(VernonAdTapeAllocator, abi_version), sizeof(void *) == 8 ? 8u : 4u);
+    EXPECT_EQ(offsetof(VernonAdTapeAllocator, status), sizeof(void *) == 8 ? 12u : 8u);
+    EXPECT_EQ(offsetof(VernonAdTapeAllocator, user_data), sizeof(void *) == 8 ? 16u : 12u);
+    EXPECT_EQ(offsetof(VernonAdTapeAllocator, capacity_bytes), sizeof(void *) == 8 ? 24u : 16u);
+    EXPECT_EQ(offsetof(VernonAdTapeAllocator, required_bytes), sizeof(void *) == 8 ? 32u : 20u);
+    EXPECT_EQ(offsetof(VernonAdTapeAllocator, reset), sizeof(void *) == 8 ? 40u : 24u);
+    EXPECT_EQ(offsetof(VernonAdTapeAllocator, begin_region), sizeof(void *) == 8 ? 48u : 28u);
+    EXPECT_EQ(offsetof(VernonAdTapeAllocator, reserve), sizeof(void *) == 8 ? 56u : 32u);
+    EXPECT_EQ(offsetof(VernonAdTapeAllocator, end_region), sizeof(void *) == 8 ? 64u : 36u);
+    EXPECT_EQ(offsetof(VernonAdTapeAllocator, seal), sizeof(void *) == 8 ? 72u : 40u);
+    EXPECT_EQ(offsetof(VernonAdTapeAllocator, read_region), sizeof(void *) == 8 ? 80u : 44u);
+
+    vernon::runtime::ad::HostTapeAllocator storage;
+    VernonAdTapeAllocator incompatibleSize = storage.descriptor();
+    --incompatibleSize.struct_size;
+    EXPECT_EQ(incompatibleSize.reset(&incompatibleSize), VERNON_AD_TAPE_ALLOCATOR_INVALID_ABI);
+    EXPECT_EQ(incompatibleSize.status, VERNON_AD_TAPE_ALLOCATOR_INVALID_ABI);
+
+    VernonAdTapeAllocator incompatibleVersion = storage.descriptor();
+    ++incompatibleVersion.abi_version;
+    EXPECT_EQ(incompatibleVersion.reset(&incompatibleVersion), VERNON_AD_TAPE_ALLOCATOR_INVALID_ABI);
+    EXPECT_EQ(incompatibleVersion.status, VERNON_AD_TAPE_ALLOCATOR_INVALID_ABI);
+}
+
+TEST(RuntimeAutodiffTapeAllocator, ReportsDistinctFailuresAndExactRequiredBytes) {
+    vernon::runtime::ad::HostTapeAllocator bounded(8);
+    VernonAdTapeAllocator &allocator = bounded.descriptor();
+    VernonAdRegionHandle region = VERNON_AD_INVALID_REGION_HANDLE;
+    ASSERT_EQ(allocator.begin_region(&allocator, VERNON_AD_INVALID_REGION_HANDLE, &region),
+              VERNON_AD_TAPE_ALLOCATOR_OK);
+    size_t offset = 0;
+    void *address = nullptr;
+    ASSERT_EQ(allocator.reserve(&allocator, region, 5, 4, &offset, &address), VERNON_AD_TAPE_ALLOCATOR_OK);
+    EXPECT_EQ(offset, 0u);
+    ASSERT_NE(address, nullptr);
+    EXPECT_EQ(allocator.required_bytes, 5u);
+
+    EXPECT_EQ(allocator.reserve(&allocator, region, 8, 8, &offset, &address),
+              VERNON_AD_TAPE_ALLOCATOR_CAPACITY_EXHAUSTED);
+    EXPECT_EQ(offset, 8u);
+    EXPECT_EQ(address, nullptr);
+    EXPECT_EQ(allocator.required_bytes, 16u);
+    EXPECT_EQ(allocator.reserve(&allocator, region, 3, 4, &offset, &address),
+              VERNON_AD_TAPE_ALLOCATOR_CAPACITY_EXHAUSTED);
+    EXPECT_EQ(offset, 16u);
+    EXPECT_EQ(allocator.required_bytes, 19u);
+    EXPECT_EQ(allocator.end_region(&allocator, region), VERNON_AD_TAPE_ALLOCATOR_CAPACITY_EXHAUSTED);
+
+    ASSERT_EQ(allocator.reset(&allocator), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(allocator.begin_region(&allocator, VERNON_AD_INVALID_REGION_HANDLE, &region),
+              VERNON_AD_TAPE_ALLOCATOR_OK);
+    EXPECT_EQ(allocator.reserve(&allocator, region, std::numeric_limits<size_t>::max(), 1, &offset, &address),
+              VERNON_AD_TAPE_ALLOCATOR_CAPACITY_EXHAUSTED);
+    EXPECT_EQ(allocator.required_bytes, std::numeric_limits<size_t>::max());
+    EXPECT_EQ(allocator.reserve(&allocator, region, 1, 1, &offset, &address),
+              VERNON_AD_TAPE_ALLOCATOR_ARITHMETIC_OVERFLOW);
+
+    vernon::runtime::ad::HostTapeAllocator unbounded;
+    VernonAdTapeAllocator &hostFailure = unbounded.descriptor();
+    ASSERT_EQ(hostFailure.begin_region(&hostFailure, VERNON_AD_INVALID_REGION_HANDLE, &region),
+              VERNON_AD_TAPE_ALLOCATOR_OK);
+    const size_t maximumStorageSize = std::vector<std::byte>{}.max_size();
+    ASSERT_LT(maximumStorageSize, std::numeric_limits<size_t>::max());
+    const size_t unsupportedStorageSize = maximumStorageSize + 1;
+    EXPECT_EQ(hostFailure.reserve(&hostFailure, region, unsupportedStorageSize, 1, &offset, &address),
+              VERNON_AD_TAPE_ALLOCATOR_HOST_ALLOCATION_FAILURE);
+    EXPECT_EQ(hostFailure.required_bytes, unsupportedStorageSize);
+    EXPECT_EQ(hostFailure.seal(&hostFailure), VERNON_AD_TAPE_ALLOCATOR_HOST_ALLOCATION_FAILURE);
+    EXPECT_EQ(hostFailure.reset(&hostFailure), VERNON_AD_TAPE_ALLOCATOR_OK);
+}
+
+TEST(RuntimeAutodiffTapeAllocator, EnforcesRegionLifetimeResetAndThreadOwnership) {
+    vernon::runtime::ad::HostTapeAllocator storage;
+    VernonAdTapeAllocator &allocator = storage.descriptor();
+    VernonAdRegionHandle root = VERNON_AD_INVALID_REGION_HANDLE;
+    ASSERT_EQ(allocator.begin_region(&allocator, VERNON_AD_INVALID_REGION_HANDLE, &root), VERNON_AD_TAPE_ALLOCATOR_OK);
+    const void *read = nullptr;
+    size_t readSize = 0;
+    EXPECT_EQ(allocator.read_region(&allocator, root, &read, &readSize), VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE);
+
+    ASSERT_EQ(allocator.reset(&allocator), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(allocator.begin_region(&allocator, VERNON_AD_INVALID_REGION_HANDLE, &root), VERNON_AD_TAPE_ALLOCATOR_OK);
+    size_t offset = 0;
+    void *write = nullptr;
+    ASSERT_EQ(allocator.reserve(&allocator, root, sizeof(uint32_t), alignof(uint32_t), &offset, &write),
+              VERNON_AD_TAPE_ALLOCATOR_OK);
+    const uint32_t value = 0x12345678u;
+    std::memcpy(write, &value, sizeof(value));
+    VernonAdRegionHandle nested = VERNON_AD_INVALID_REGION_HANDLE;
+    ASSERT_EQ(allocator.begin_region(&allocator, root, &nested), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(allocator.reserve(&allocator, nested, sizeof(uint32_t), alignof(uint32_t), &offset, &write),
+              VERNON_AD_TAPE_ALLOCATOR_OK);
+    const uint32_t nestedValue = 0xabcdef01u;
+    std::memcpy(write, &nestedValue, sizeof(nestedValue));
+    ASSERT_EQ(allocator.end_region(&allocator, nested), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(allocator.end_region(&allocator, root), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(allocator.seal(&allocator), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(allocator.read_region(&allocator, root, &read, &readSize), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(readSize, sizeof(value) + sizeof(nestedValue));
+    EXPECT_EQ(std::memcmp(read, &value, sizeof(value)), 0);
+    EXPECT_EQ(std::memcmp(static_cast<const std::byte *>(read) + sizeof(value), &nestedValue, sizeof(nestedValue)), 0);
+    ASSERT_EQ(allocator.read_region(&allocator, nested, &read, &readSize), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(readSize, sizeof(nestedValue));
+    EXPECT_EQ(std::memcmp(read, &nestedValue, sizeof(nestedValue)), 0);
+
+    std::shared_ptr<const vernon::runtime::ad::HostTapeSnapshot> snapshot = storage.takeSnapshot();
+    ASSERT_NE(snapshot, nullptr);
+    EXPECT_EQ(storage.takeSnapshot(), nullptr);
+    const VernonAdRegionHandle previousRoot = root;
+    ASSERT_EQ(allocator.reset(&allocator), VERNON_AD_TAPE_ALLOCATOR_OK);
+    EXPECT_EQ(allocator.read_region(&allocator, previousRoot, &read, &readSize),
+              VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE);
+    const std::byte *snapshotData = nullptr;
+    ASSERT_TRUE(snapshot->readRegion(previousRoot, snapshotData, readSize));
+    EXPECT_EQ(readSize, sizeof(value) + sizeof(nestedValue));
+    EXPECT_EQ(std::memcmp(snapshotData, &value, sizeof(value)), 0);
+
+    ASSERT_EQ(allocator.reset(&allocator), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(allocator.begin_region(&allocator, VERNON_AD_INVALID_REGION_HANDLE, &root), VERNON_AD_TAPE_ALLOCATOR_OK);
+    EXPECT_NE(root, previousRoot);
+    ASSERT_EQ(allocator.end_region(&allocator, root), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(allocator.seal(&allocator), VERNON_AD_TAPE_ALLOCATOR_OK);
+    EXPECT_NE(storage.takeSnapshot(), nullptr);
+
+    ASSERT_EQ(allocator.reset(&allocator), VERNON_AD_TAPE_ALLOCATOR_OK);
+    VernonAdTapeAllocatorStatus threadStatus = VERNON_AD_TAPE_ALLOCATOR_OK;
+    std::thread other([&] { threadStatus = allocator.reset(&allocator); });
+    other.join();
+    EXPECT_EQ(threadStatus, VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE);
+}
+
+TEST(RuntimeAutodiffTapeAllocator, RejectsCopiedDescriptorWithoutTrustingUserData) {
+    vernon::runtime::ad::HostTapeAllocator storage;
+    VernonAdTapeAllocator copied = storage.descriptor();
+    copied.user_data = reinterpret_cast<void *>(uintptr_t{1});
+    EXPECT_EQ(copied.reset(&copied), VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE);
+    EXPECT_EQ(copied.status, VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE);
+
+    VernonAdTapeAllocator &allocator = storage.descriptor();
+    allocator.user_data = reinterpret_cast<void *>(uintptr_t{1});
+    EXPECT_EQ(allocator.reset(&allocator), VERNON_AD_TAPE_ALLOCATOR_OK);
+}
+
 TEST(RuntimeAutodiff, OrdinaryRuntimeFailureReplacesThreadLocalInvocationDiagnostic) {
     VernonRuntimeContext context;
     context.backend = VERNON_RUNTIME_CPU;
@@ -269,6 +467,65 @@ TEST(RuntimeAutodiff, OrdinaryRuntimeFailureReplacesThreadLocalInvocationDiagnos
     EXPECT_FALSE(message.empty());
     EXPECT_NE(message, "stale autodiff diagnostic");
     vernon::runtime::clearInvocationDiagnostic(context);
+}
+
+TEST(RuntimeAutodiff, InjectsHiddenTapeAllocatorAndTransfersSealedTape) {
+    static constexpr char forwardSymbol[] = "__vernon_cpu_test_allocator_square_forward";
+    static constexpr char backwardSymbol[] = "__vernon_cpu_test_allocator_square_backward";
+    ASSERT_EQ(vernonRuntimeRegisterStaticCpuEntry({forwardSymbol, sizeof(forwardSymbol) - 1}, allocatorSquareForward),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeRegisterStaticCpuEntry({backwardSymbol, sizeof(backwardSymbol) - 1}, squareBackward),
+              VERNON_STATUS_OK);
+
+    const std::filesystem::path root =
+        std::filesystem::temp_directory_path() / "vernon_runtime_autodiff_allocator_profile";
+    std::filesystem::create_directories(root);
+    {
+        std::ofstream output(root / "fixture.o", std::ios::binary);
+        output.write("registered object fixture", 25);
+    }
+    const nlohmann::json forwardReflection =
+        profileReflection("forward", 2 * sizeof(uint64_t), 2 * sizeof(float),
+                          nlohmann::json::array({argument("x", 0, nlohmann::json::array({leaf(0)})),
+                                                 tapeAllocatorArgument(sizeof(uint64_t))}),
+                          nlohmann::json::array({leaf(0), leaf(sizeof(float))}));
+    const nlohmann::json backwardReflection =
+        profileReflection("backward", 2 * sizeof(float), sizeof(float),
+                          nlohmann::json::array({argument("tape", 0, nlohmann::json::array({leaf(0)})),
+                                                 argument("output", sizeof(float), nlohmann::json::array({leaf(0)}))}),
+                          nlohmann::json::array({leaf(0)}));
+
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    VernonLoadedPipeline pipeline;
+    pipeline.context = context;
+    attachCpuAutodiff(*context, pipeline, stage(artifact(root, "forward", forwardSymbol, forwardReflection)),
+                      stage(artifact(root, "backward", backwardSymbol, backwardReflection)), {"x"});
+
+    float x = 3.0f;
+    float outputValue = 0.0f;
+    VernonAdValue input{sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), 0, nullptr};
+    VernonAdValue output{
+        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &outputValue, sizeof(outputValue), 0, nullptr};
+    VernonAdValueSet inputs{sizeof(VernonAdValueSet), &input, 1, {}};
+    VernonAdValueSet outputs{sizeof(VernonAdValueSet), &output, 1, {}};
+    VernonPullback *pullback = nullptr;
+    ASSERT_EQ(vernonAdPipelineForward(&pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
+        << lastError(context);
+    ASSERT_NE(pullback, nullptr);
+    EXPECT_FLOAT_EQ(outputValue, 9.0f);
+
+    x = 100.0f;
+    float gradientValue = 0.0f;
+    VernonAdValue gradient{sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &gradientValue,
+                           sizeof(gradientValue), 0,        nullptr};
+    VernonAdValueSet gradients{sizeof(VernonAdValueSet), &gradient, 1, {}};
+    ASSERT_EQ(vernonPullbackApply(pullback, nullptr, &gradients), VERNON_STATUS_OK) << lastError(context);
+    EXPECT_FLOAT_EQ(gradientValue, 6.0f);
+
+    vernonPullbackDestroy(pullback);
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+    std::filesystem::remove_all(root);
 }
 
 TEST(RuntimeAutodiff, ExecutesReusableScalarPullbackFromRegisteredProfiles) {

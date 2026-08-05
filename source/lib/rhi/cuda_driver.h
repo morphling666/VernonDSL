@@ -1,8 +1,8 @@
 #ifndef VERNON_RHI_CUDA_DRIVER_H
 #define VERNON_RHI_CUDA_DRIVER_H
 
-#include "../platform/platform_library.h"
 #include "VernonRHI.h"
+#include "platform/platform_library.h"
 
 #include <cstddef>
 #include <mutex>

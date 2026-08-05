@@ -1,8 +1,8 @@
 #include "adapter_common.h"
 
-#include "../../rhi/rhi_internal.h"
 #include "adapter_internal.h"
 #include "adapter_test_hooks.h"
+#include "rhi/rhi_internal.h"
 
 #include <new>
 #include <optional>

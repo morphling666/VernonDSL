@@ -103,35 +103,38 @@ Gate:
 
 Primary files:
 
-- `source/include/VernonRuntime.h`
-- `source/lib/runtime/runtime_autodiff_internal.h`
-- `source/lib/runtime/runtime_autodiff_cpu.cpp`
-- new internal compiler/Runtime shared allocator descriptor header
+- `source/lib/runtime/autodiff/tape_allocator_abi.h`
+- `source/lib/runtime/autodiff/host_tape_allocator.{h,cpp}`
+- `source/lib/runtime/autodiff/runtime_autodiff_internal.h`
+- `source/lib/runtime/autodiff/runtime_autodiff_cpu.cpp`
+- `source/lib/Dialect/Vernon/Transforms/VernonVerifyCPUAutodiffABI.cpp`
 
 Implementation:
 
-- [ ] Define a hidden packed-argument `ad_tape_allocator` builtin without
+- [x] Define a hidden packed-argument `ad_tape_allocator` builtin without
   changing the user-visible function signature.
-- [ ] Define `VernonAdTapeAllocator` with `struct_size` and `abi_version`.
-- [ ] Specify callback behavior after allocation or arithmetic failure.
-- [ ] Distinguish capacity exhaustion, arithmetic overflow, and host allocation
+- [x] Define `VernonAdTapeAllocator` with `struct_size` and `abi_version`.
+- [x] Specify callback behavior after allocation or arithmetic failure.
+- [x] Distinguish capacity exhaustion, arithmetic overflow, and host allocation
   failure.
-- [ ] Require exact `required_bytes` accounting after capacity exhaustion.
-- [ ] Specify region-handle lifetime and read legality.
-- [ ] Specify reset/repeated-capture behavior.
-- [ ] Specify thread and invocation ownership.
-- [ ] Specify successful tape ownership transfer to the pullback.
-- [ ] Keep `VernonCpuInvocation.textures` unchanged and do not repurpose it.
+- [x] Require exact `required_bytes` accounting after capacity exhaustion.
+- [x] Specify region-handle lifetime and read legality.
+- [x] Specify reset/repeated-capture behavior.
+- [x] Specify thread and invocation ownership.
+- [x] Specify successful tape ownership transfer to the pullback.
+- [x] Keep `VernonCpuInvocation.textures` unchanged and do not repurpose it.
+- [x] Verify the hidden builtin in a dedicated CPU AD ABI pass without exposing
+  the internal descriptor through the public Runtime headers.
 
 Acceptance:
 
-- [ ] Add ABI size/version compatibility tests.
-- [ ] Add callback failure-state and exact-size accounting tests.
-- [ ] Add region-handle lifetime and repeated-capture tests.
+- [x] Add ABI size/version compatibility tests.
+- [x] Add callback failure-state and exact-size accounting tests.
+- [x] Add region-handle lifetime and repeated-capture tests.
 
 Gate:
 
-- [ ] The allocator boundary is documented, versioned, checked, and frozen
+- [x] The allocator boundary is documented, versioned, checked, and frozen
   before generated code depends on it.
 
 ## Phase 3 — Shared AD analysis
@@ -315,8 +318,8 @@ Gate:
 Primary files:
 
 - new CPU AD lowering pass
-- `source/lib/runtime/runtime_autodiff_cpu.cpp`
-- `source/lib/runtime/runtime_autodiff_internal.h`
+- `source/lib/runtime/autodiff/runtime_autodiff_cpu.cpp`
+- `source/lib/runtime/autodiff/runtime_autodiff_internal.h`
 
 Implementation:
 
@@ -460,8 +463,8 @@ Primary files:
 - `source/lib/runtime/pipeline_manifest.h`
 - `source/lib/runtime/runtime_pipeline_direct.cpp`
 - new `GpuAutodiffTapeSession.{h,cpp}`
-- `source/lib/runtime/runtime_autodiff_gpu.cpp`
-- `source/lib/runtime/runtime_autodiff_graph.cpp`
+- `source/lib/runtime/autodiff/runtime_autodiff_gpu.cpp`
+- `source/lib/runtime/autodiff/runtime_autodiff_graph.cpp`
 
 Implementation:
 

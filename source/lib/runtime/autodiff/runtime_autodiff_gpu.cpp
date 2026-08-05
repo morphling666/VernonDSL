@@ -1,8 +1,8 @@
 #include "runtime_autodiff_internal.h"
 
-#include "pipeline_metadata.h"
-#include "runtime_dispatch.h"
-#include "runtime_state.h"
+#include "runtime/pipeline_metadata.h"
+#include "runtime/runtime_dispatch.h"
+#include "runtime/runtime_state.h"
 
 #include <algorithm>
 #include <memory>

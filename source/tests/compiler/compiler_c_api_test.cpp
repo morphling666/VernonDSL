@@ -45,6 +45,82 @@ static void sample_texture(void *user_data, uintptr_t texture, float u, float v,
     out_rgba[3] = bias;
 }
 
+TEST(CompilerCApi, ReflectsHiddenCpuTapeAllocatorBuiltin) {
+    static const char module[] = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @forward(
+      %allocator: index {
+        vernon.interface = "input",
+        vernon.builtin = "ad_tape_allocator"
+      }) -> (
+      f32 {
+        vernon.interface = "output",
+        vernon.location = 0 : i64
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 1, 1, 1>
+      } {
+    %zero = arith.constant 0.0 : f32
+    return %zero : f32
+  }
+}
+)mlir";
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_NE(compiler, nullptr);
+    VernonCompileResult *compiled = vernonCompilerCompileMlir(compiler, module, strlen(module), VERNON_TARGET_CPU);
+    ASSERT_NE(compiled, nullptr);
+    ASSERT_EQ(vernonCompileResultGetStatus(compiled), VERNON_STATUS_OK) << std::string(
+        vernonCompileResultGetDiagnostics(compiled).data, vernonCompileResultGetDiagnostics(compiled).size);
+    const VernonStringView reflected = vernonCompileResultGetReflection(compiled);
+    const nlohmann::json reflection = nlohmann::json::parse(reflected.data, reflected.data + reflected.size);
+    const nlohmann::json &entry = reflection.at("entries").at(0);
+    const nlohmann::json &allocator = entry.at("arguments").at(0);
+    EXPECT_EQ(allocator.at("kind"), "builtin");
+    EXPECT_EQ(allocator.at("builtin"), "ad_tape_allocator");
+    EXPECT_EQ(allocator.at("physical_layouts").at("host_value").at("root").at("size"), sizeof(void *));
+    EXPECT_EQ(entry.at("physical_layouts").at("host_value").at("packed_arguments_size"), sizeof(void *));
+    EXPECT_EQ(entry.at("results").size(), 1u);
+    EXPECT_EQ(entry.at("results").at(0).at("physical_layouts").at("host_value").at("root").at("size"), sizeof(float));
+    EXPECT_EQ(entry.at("physical_layouts").at("host_value").at("packed_results_size"), sizeof(float));
+
+    vernonCompileResultDestroy(compiled);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerCApi, RejectsInvalidHiddenCpuTapeAllocatorAbi) {
+    static const char module[] = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @forward(
+      %allocator: f32 {
+        vernon.interface = "input",
+        vernon.builtin = "ad_tape_allocator"
+      }) -> (
+      f32 {
+        vernon.interface = "output",
+        vernon.location = 0 : i64
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 1, 1, 1>
+      } {
+    return %allocator : f32
+  }
+}
+)mlir";
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_NE(compiler, nullptr);
+    VernonCompileResult *compiled = vernonCompilerCompileMlir(compiler, module, strlen(module), VERNON_TARGET_CPU);
+    ASSERT_NE(compiled, nullptr);
+    EXPECT_EQ(vernonCompileResultGetStatus(compiled), VERNON_STATUS_VERIFICATION_ERROR);
+    const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(compiled);
+    EXPECT_NE(std::string(diagnostics.data, diagnostics.size).find("ad_tape_allocator must have index type"),
+              std::string::npos);
+
+    vernonCompileResultDestroy(compiled);
+    vernonCompilerDestroy(compiler);
+}
+
 TEST(CompilerCApi, CpuCanonicalAbiRoundTripsNestedVectorThreeAggregateTensor) {
     static const char module[] = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {

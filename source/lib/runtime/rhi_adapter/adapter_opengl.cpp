@@ -1,7 +1,7 @@
-#include "../../rhi/opengl_backend.h"
-#include "../../rhi/rhi_internal.h"
-#include "../vertex_attribute_capabilities.h"
 #include "adapter_common.h"
+#include "rhi/opengl_backend.h"
+#include "rhi/rhi_internal.h"
+#include "runtime/vertex_attribute_capabilities.h"
 
 #include <algorithm>
 #include <array>

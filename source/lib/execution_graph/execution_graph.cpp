@@ -1,6 +1,6 @@
 #include "VernonExecutionGraph.h"
 
-#include "../rhi/rhi_internal.h"
+#include "rhi/rhi_internal.h"
 
 #include <algorithm>
 #include <atomic>

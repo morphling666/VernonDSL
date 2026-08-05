@@ -1,11 +1,11 @@
 #include "runtime_pipeline_backend.h"
 
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-#include "../rhi/rhi_internal.h"
 #include "VernonRuntimeRHIAdapter.h"
 #include "backend_directx12.h"
 #include "compute_launch_planner.h"
 #include "pipeline_metadata.h"
+#include "rhi/rhi_internal.h"
 #include "tensor_bridge.h"
 
 #include <nlohmann/json.hpp>

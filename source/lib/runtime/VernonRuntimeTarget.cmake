@@ -36,8 +36,10 @@ function(vernon_add_runtime)
     if(WIN32)
         target_compile_definitions(VernonRHI PRIVATE NOMINMAX)
     endif()
-    target_include_directories(VernonRHI PUBLIC $<BUILD_INTERFACE:${_VERNON_RUNTIME_INCLUDE_DIR}>
-                                                $<INSTALL_INTERFACE:include>)
+    target_include_directories(
+        VernonRHI
+        PUBLIC $<BUILD_INTERFACE:${_VERNON_RUNTIME_INCLUDE_DIR}> $<INSTALL_INTERFACE:include>
+        PRIVATE $<BUILD_INTERFACE:${_VERNON_RUNTIME_IMPL_DIR}/..>)
     target_link_libraries(VernonRHI PRIVATE VernonPlatform ${CMAKE_DL_LIBS})
     if(VERNON_ENABLE_CUDA_RUNTIME)
         target_sources(
@@ -90,8 +92,10 @@ function(vernon_add_runtime)
     add_library(VernonExecutionGraph STATIC ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph.cpp)
     add_library(Vernon::ExecutionGraph ALIAS VernonExecutionGraph)
     set_target_properties(VernonExecutionGraph PROPERTIES EXPORT_NAME ExecutionGraph POSITION_INDEPENDENT_CODE ON)
-    target_include_directories(VernonExecutionGraph PUBLIC $<BUILD_INTERFACE:${_VERNON_RUNTIME_INCLUDE_DIR}>
-                                                           $<INSTALL_INTERFACE:include>)
+    target_include_directories(
+        VernonExecutionGraph
+        PUBLIC $<BUILD_INTERFACE:${_VERNON_RUNTIME_INCLUDE_DIR}> $<INSTALL_INTERFACE:include>
+        PRIVATE $<BUILD_INTERFACE:${_VERNON_RUNTIME_IMPL_DIR}/..>)
     target_link_libraries(VernonExecutionGraph PUBLIC Vernon::RHI)
     if(MSVC)
         target_compile_options(VernonExecutionGraph PRIVATE /EHsc)
@@ -112,8 +116,10 @@ function(vernon_add_runtime)
     add_library(VernonRuntimeInternals ALIAS VernonRuntimeCore)
     set_target_properties(VernonRuntimeCore PROPERTIES EXPORT_NAME RuntimeCore POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(VernonRuntimeCore PUBLIC VERNON_RUNTIME_CORE_STATIC)
-    target_include_directories(VernonRuntimeCore PUBLIC $<BUILD_INTERFACE:${_VERNON_RUNTIME_INCLUDE_DIR}>
-                                                        $<INSTALL_INTERFACE:include>)
+    target_include_directories(
+        VernonRuntimeCore
+        PUBLIC $<BUILD_INTERFACE:${_VERNON_RUNTIME_INCLUDE_DIR}> $<INSTALL_INTERFACE:include>
+        PRIVATE $<BUILD_INTERFACE:${_VERNON_RUNTIME_IMPL_DIR}/..>)
     target_link_libraries(VernonRuntimeCore PRIVATE $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>)
     if(MSVC)
         target_compile_options(VernonRuntimeCore PRIVATE /EHsc)
@@ -151,18 +157,20 @@ function(vernon_add_runtime)
         target_link_libraries(VernonRuntimeRHIAdapter PRIVATE ${_vernon_metal_framework}
                                                               ${_vernon_foundation_framework})
     endif()
+    target_include_directories(VernonRuntimeRHIAdapter PRIVATE $<BUILD_INTERFACE:${_VERNON_RUNTIME_IMPL_DIR}/..>)
     target_link_libraries(VernonRuntimeRHIAdapter PUBLIC Vernon::RuntimeCore Vernon::RHI)
 
     add_library(
         VernonRuntime
         ${VERNON_RUNTIME_LIBRARY_TYPE}
         ${_VERNON_RUNTIME_IMPL_DIR}/VernonRuntime.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/host_tape_allocator.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff_cpu.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff_gpu.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff_graph.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/backend_cpu.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/backend_opengl.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/runtime_autodiff.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/runtime_autodiff_cpu.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/runtime_autodiff_graph.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/runtime_autodiff_gpu.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_backend_dispatch.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_cpu.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_cuda.cpp
