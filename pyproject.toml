@@ -42,6 +42,7 @@ build = [
     "ruff>=0.15.6",
     "pytest>=9.0.3",
     "coverage[toml]>=7.10",
+    "lit>=18.1.8",
 ]
 
 [project.scripts]

@@ -125,7 +125,7 @@ where `dY` has the same differentiable Value/Storage structure as `Y`, and
 
 Autodiff does not require `Y` to be scalar. For
 `Y.shape = (2, 2, 2)` and `X.shape = (2, 2)`, the full Jacobian has logical
-shape `(2, 2, 2, 2, 2)`. The initial API does not materialize that matrix; it
+shape `(2, 2, 2, 2, 2, 2)`. The initial API does not materialize that matrix; it
 computes its product with a supplied output cotangent.
 
 If the output is one floating Scalar, `pullback()` may omit the cotangent and

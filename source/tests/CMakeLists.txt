@@ -11,6 +11,10 @@ endif()
 set(VERNON_TEST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 set(VERNON_TEST_BINARY_ROOT "${CMAKE_CURRENT_BINARY_DIR}")
 
+if(TARGET vernon-opt)
+    add_subdirectory(mlir)
+endif()
+
 if(Python_EXECUTABLE)
     add_test(NAME VernonGeneratedVersionsCheck COMMAND "${Python_EXECUTABLE}"
                                                        "${VERNON_REPOSITORY_ROOT}/tools/generate_versions.py" --check)
@@ -236,9 +240,9 @@ if(TARGET VernonRuntime)
         set(compiler_cpu_bundle "${VERNON_TEST_BINARY_ROOT}/compiler_cpu_aot_bundle")
         add_custom_command(
             OUTPUT "${compiler_cpu_bundle}/compute.json"
-            COMMAND $<TARGET_FILE:vernon-compile> --target cpu "${VERNON_TEST_ROOT}/integration/cpu-aot-smoke.mlir"
+            COMMAND $<TARGET_FILE:vernon-compile> --target cpu "${VERNON_TEST_ROOT}/mlir/Validation/cpu-aot-smoke.mlir"
                     --compute-bundle "${compiler_cpu_bundle}" --host-runtime-bundle
-            DEPENDS vernon-compile "${VERNON_TEST_ROOT}/integration/cpu-aot-smoke.mlir"
+            DEPENDS vernon-compile "${VERNON_TEST_ROOT}/mlir/Validation/cpu-aot-smoke.mlir"
             VERBATIM)
         add_custom_target(vernon-compiler-cpu-aot-test-bundle DEPENDS "${compiler_cpu_bundle}/compute.json")
         target_sources(VernonRuntimeTests PRIVATE runtime/runtime_compiler_cpu_aot_test.cpp)
@@ -718,33 +722,7 @@ if(TARGET VernonDSLCompiler)
                              PROPERTIES ENVIRONMENT "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python")
     endif()
 
-    add_test(
-        NAME vernon-cpu-lowering-integration
-        COMMAND ${CMAKE_COMMAND} "-DVERNON_OPT=$<TARGET_FILE:vernon-opt>" "-DTEST_ROOT=${VERNON_TEST_ROOT}/integration"
-                -P "${VERNON_TEST_ROOT}/scripts/run_cpu_lowering_tests.cmake")
-    add_test(
-        NAME vernon-gpu-atomic-exchange-to-spirv
-        COMMAND
-            ${CMAKE_COMMAND} "-DVERNON_OPT=$<TARGET_FILE:vernon-opt>"
-            "-DINPUT=${VERNON_TEST_ROOT}/integration/gpu-atomic-exchange-to-spirv.mlir" -P
-            "${VERNON_TEST_ROOT}/scripts/run_gpu_to_spirv_atomic_exchange_test.cmake")
-    add_test(
-        NAME vernon-to-gpu-tensor-view-1-to-n
-        COMMAND
-            ${CMAKE_COMMAND} "-DVERNON_OPT=$<TARGET_FILE:vernon-opt>"
-            "-DINPUT=${VERNON_TEST_ROOT}/integration/vernon-to-gpu-tensor-view-1-to-n.mlir" -P
-            "${VERNON_TEST_ROOT}/scripts/run_vernon_to_gpu_tensor_view_test.cmake")
-    add_test(
-        NAME vernon-autodiff-accumulation-lowering
-        COMMAND
-            ${CMAKE_COMMAND} "-DVERNON_OPT=$<TARGET_FILE:vernon-opt>"
-            "-DINPUT=${VERNON_TEST_ROOT}/integration/autodiff-accumulation-lowering.mlir" -P
-            "${VERNON_TEST_ROOT}/scripts/run_autodiff_accumulation_lowering_test.cmake")
-
     if(WIN32)
-        add_test(NAME vernon-validation-integration
-                 COMMAND powershell -ExecutionPolicy Bypass -File
-                         "${VERNON_TEST_ROOT}/scripts/run_validation_tests.ps1" -VernonOpt $<TARGET_FILE:vernon-opt>)
         add_test(
             NAME vernon-python-native-integration
             COMMAND

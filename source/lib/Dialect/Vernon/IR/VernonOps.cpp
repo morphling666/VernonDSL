@@ -12,8 +12,10 @@
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/TypeUtilities.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -318,4 +320,346 @@ LogicalResult BarrierOp::verify() {
     if (getScope() != "workgroup" && getScope() != "device")
         return emitOpError("barrier scope must be workgroup or device");
     return success();
+}
+
+namespace {
+
+AdCaptureOp enclosingCapture(Operation *operation) { return operation->getParentOfType<AdCaptureOp>(); }
+
+bool isInsideCommit(Operation *operation) { return static_cast<bool>(operation->getParentOfType<AdCommitOp>()); }
+
+LogicalResult verifyCaptureMutation(Operation *operation) {
+    if (!enclosingCapture(operation))
+        return operation->emitOpError("is only legal inside vernon.ad.capture");
+    if (isInsideCommit(operation))
+        return operation->emitOpError("cannot be nested in vernon.ad.commit");
+    return success();
+}
+
+LogicalResult verifyReverseRead(Operation *operation, Value region) {
+    if (enclosingCapture(operation) || isInsideCommit(operation))
+        return operation->emitOpError("is only legal in the reverse read phase outside capture and commit");
+    if (Operation *definition = region.getDefiningOp()) {
+        if (!isa<AdCaptureOp, AdReadNestedRegionOp>(definition))
+            return operation->emitOpError("requires a finalized capture or nested-region handle");
+    } else if (!isa<BlockArgument>(region)) {
+        return operation->emitOpError("requires a region block argument or finalized region handle");
+    }
+    return success();
+}
+
+bool isPowerOfTwo(int64_t value) {
+    return value > 0 && (static_cast<uint64_t>(value) & (static_cast<uint64_t>(value) - 1)) == 0;
+}
+
+struct CanonicalLeafLayout {
+    int64_t size;
+    int64_t alignment;
+};
+
+std::optional<CanonicalLeafLayout> getCanonicalLeafLayout(Operation *operation, Type type) {
+    ModuleOp module = operation->getParentOfType<ModuleOp>();
+    if (!module)
+        return std::nullopt;
+    FailureOr<ValueAbiLayout> layout = getValueAbiLayout(type, module);
+    if (failed(layout) || !layout->tree.root || layout->tree.root->kind != CanonicalAbiNodeKind::Scalar ||
+        layout->leaves.size() != 1 || layout->leaves.front().scalarCount != 1 ||
+        layout->size > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+        layout->alignment > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+        return std::nullopt;
+    return CanonicalLeafLayout{static_cast<int64_t>(layout->size), static_cast<int64_t>(layout->alignment)};
+}
+
+LogicalResult verifyRecordLayout(Operation *operation, int64_t recordSize, int64_t recordAlignment) {
+    if (recordSize <= 0)
+        return operation->emitOpError("requires a positive record_size");
+    if (!isPowerOfTwo(recordAlignment))
+        return operation->emitOpError("requires record_alignment to be a positive power of two");
+    if (recordSize % recordAlignment != 0)
+        return operation->emitOpError("requires record_size to be a multiple of record_alignment");
+    return success();
+}
+
+LogicalResult verifyLeafLayout(Operation *operation, Type leafType, int64_t recordSize, int64_t recordAlignment,
+                               int64_t leafOffset) {
+    if (failed(verifyRecordLayout(operation, recordSize, recordAlignment)))
+        return failure();
+    std::optional<CanonicalLeafLayout> leaf = getCanonicalLeafLayout(operation, leafType);
+    if (!leaf)
+        return operation->emitOpError("requires a canonical scalar ABI leaf type (i1, i32, f16, f32, or f64)");
+    if (recordAlignment < leaf->alignment)
+        return operation->emitOpError("record_alignment is smaller than the canonical leaf alignment");
+    if (leafOffset < 0 || leafOffset % leaf->alignment != 0)
+        return operation->emitOpError("leaf_offset is negative or violates canonical leaf alignment");
+    if (leafOffset > recordSize || leaf->size > recordSize - leafOffset)
+        return operation->emitOpError("canonical leaf extends beyond the checked record layout");
+    return success();
+}
+
+bool isLogicalAdCaptureOperation(Operation *operation) {
+    return isa<AdCaptureYieldOp, AdBeginInvocationOp, AdBeginRegionOp, AdReserveRecordOp, AdWriteLeafOp, AdEndRegionOp>(
+        operation);
+}
+
+bool isAllowedCaptureOperation(Operation *operation) {
+    if (isLogicalAdCaptureOperation(operation))
+        return true;
+    if (operation->getNumRegions() != 0) {
+        if (!operation->hasTrait<OpTrait::HasRecursiveMemoryEffects>())
+            return false;
+        auto effects = dyn_cast<MemoryEffectOpInterface>(operation);
+        if (!effects)
+            return true;
+        SmallVector<MemoryEffects::EffectInstance> instances;
+        effects.getEffects(instances);
+        return llvm::all_of(instances, [](const MemoryEffects::EffectInstance &effect) {
+            return isa<MemoryEffects::Read, MemoryEffects::Allocate, MemoryEffects::Free>(effect.getEffect());
+        });
+    }
+    if (isMemoryEffectFree(operation))
+        return true;
+    if (isa<LoadOp, PhysicalLoadOp, WorkgroupAllocOp>(operation))
+        return true;
+    if (auto store = dyn_cast<StoreOp>(operation))
+        return store.getStorage().getType().getAddressSpace() != "device";
+    if (auto store = dyn_cast<PhysicalStoreOp>(operation))
+        return store.getStorage().getType().getAddressSpace() != "device";
+    if (auto atomic = dyn_cast<AtomicOp>(operation))
+        return atomic.getStorage().getType().getAddressSpace() != "device";
+    if (auto atomic = dyn_cast<PhysicalAtomicOp>(operation))
+        return atomic.getStorage().getType().getAddressSpace() != "device";
+    if (auto barrier = dyn_cast<BarrierOp>(operation))
+        return barrier.getScope() == "workgroup";
+
+    auto effects = dyn_cast<MemoryEffectOpInterface>(operation);
+    if (!effects)
+        return false;
+    SmallVector<MemoryEffects::EffectInstance> instances;
+    effects.getEffects(instances);
+    return llvm::all_of(instances, [](const MemoryEffects::EffectInstance &effect) {
+        return isa<MemoryEffects::Read, MemoryEffects::Allocate, MemoryEffects::Free>(effect.getEffect());
+    });
+}
+
+Operation *getAncestorInBlock(Operation *operation, Block *block) {
+    while (operation && operation->getBlock() != block)
+        operation = operation->getParentOp();
+    return operation;
+}
+
+LogicalResult verifyRegionHandle(AdBeginRegionOp begin) {
+    AdCaptureOp capture = enclosingCapture(begin);
+    unsigned endCount = 0;
+    AdEndRegionOp end;
+    for (Operation *user : begin.getRegion().getUsers()) {
+        if (auto candidate = dyn_cast<AdEndRegionOp>(user)) {
+            ++endCount;
+            end = candidate;
+        } else if (!isa<AdReserveRecordOp, AdWriteLeafOp, AdBeginRegionOp, AdCaptureYieldOp, AdReadRecordOffsetOp,
+                        AdReadExecutedCountOp, AdReadExitKindOp, AdReadNestedRegionOp, AdReadLeafOp>(user)) {
+            return begin.emitOpError() << "region handle has illegal capture-phase user " << user->getName();
+        }
+        if (enclosingCapture(user) != capture)
+            return begin.emitOpError("region handle escapes its owning capture");
+    }
+    if (endCount != 1)
+        return begin.emitOpError() << "region handle must be finalized exactly once; found " << endCount
+                                   << " vernon.ad.end_region users";
+    if (begin->getBlock() != end->getBlock())
+        return begin.emitOpError("region begin and end must be in the same structured block");
+
+    for (Operation *user : begin.getRegion().getUsers()) {
+        if (user == end.getOperation() || isa<AdCaptureYieldOp>(user))
+            continue;
+        Operation *ancestor = getAncestorInBlock(user, end->getBlock());
+        if (!ancestor)
+            return user->emitOpError("uses a region handle outside its structured lifetime block");
+        if (end->isBeforeInBlock(ancestor))
+            return user->emitOpError("uses a region handle after vernon.ad.end_region");
+    }
+    return success();
+}
+
+} // namespace
+
+LogicalResult AdCaptureYieldOp::verify() {
+    auto capture = cast<AdCaptureOp>((*this)->getParentOp());
+    auto invocation = getTape().getDefiningOp<AdBeginInvocationOp>();
+    auto root = getRootRegion().getDefiningOp<AdBeginRegionOp>();
+    if (!invocation || enclosingCapture(invocation) != capture)
+        return emitOpError("tape must be produced by the enclosing capture's begin_invocation");
+    if (!root || enclosingCapture(root) != capture)
+        return emitOpError("root_region must be produced by the enclosing capture's begin_region");
+    if (root.getTape() != getTape() || !root.getParentLink().empty() || root.getChildOrdinalAttr())
+        return emitOpError("must yield the parentless root region owned by the yielded tape");
+    return success();
+}
+
+LogicalResult AdCaptureOp::verify() {
+    if ((*this)->getParentOfType<AdCaptureOp>() || (*this)->getParentOfType<AdCommitOp>())
+        return emitOpError("cannot be nested in another capture or commit transaction");
+    if (!getBody().hasOneBlock())
+        return emitOpError("requires exactly one body block");
+
+    unsigned invocationCount = 0;
+    unsigned rootCount = 0;
+    WalkResult result = getBody().walk([&](Operation *operation) {
+        if (operation == getOperation())
+            return WalkResult::advance();
+        if (isa<AdCaptureOp, AdCommitOp>(operation)) {
+            operation->emitOpError("cannot nest a capture or commit transaction inside capture");
+            return WalkResult::interrupt();
+        }
+        if (isa<AdBeginInvocationOp>(operation))
+            ++invocationCount;
+        if (auto begin = dyn_cast<AdBeginRegionOp>(operation); begin && begin.getParentLink().empty())
+            ++rootCount;
+        if (!isAllowedCaptureOperation(operation)) {
+            operation->emitOpError(
+                "has unclassified or externally visible effects and is illegal during autodiff capture");
+            return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+    });
+    if (result.wasInterrupted())
+        return failure();
+    if (invocationCount != 1)
+        return emitOpError() << "requires exactly one ad.begin_invocation; found " << invocationCount;
+    if (rootCount != 1)
+        return emitOpError() << "requires exactly one parentless root region; found " << rootCount;
+    return success();
+}
+
+LogicalResult AdCommitOp::verify() {
+    if ((*this)->getParentOfType<AdCaptureOp>() || (*this)->getParentOfType<AdCommitOp>())
+        return emitOpError("cannot be nested in another capture or commit transaction");
+    if (!getBody().hasOneBlock())
+        return emitOpError("requires exactly one body block");
+    auto capture = getTape().getDefiningOp<AdCaptureOp>();
+    if (!capture || getTape() != capture.getTape() || getCaptureSuccess() != capture.getSuccess())
+        return emitOpError("tape and capture_success must be paired results of the same capture");
+    return success();
+}
+
+LogicalResult AdBeginInvocationOp::verify() {
+    if (failed(verifyCaptureMutation(getOperation())))
+        return failure();
+    AdCaptureOp capture = enclosingCapture(*this);
+    unsigned count = 0;
+    capture.getBody().walk([&](AdBeginInvocationOp) { ++count; });
+    if (count != 1)
+        return emitOpError("the enclosing capture must have exactly one invocation owner");
+    for (Operation *user : getTape().getUsers()) {
+        if (!isa<AdBeginRegionOp, AdCaptureYieldOp>(user) || enclosingCapture(user) != capture)
+            return emitOpError() << "invocation tape has illegal or escaping user " << user->getName();
+    }
+    return success();
+}
+
+LogicalResult AdBeginRegionOp::verify() {
+    if (failed(verifyCaptureMutation(getOperation())))
+        return failure();
+    auto invocation = getTape().getDefiningOp<AdBeginInvocationOp>();
+    if (!invocation || enclosingCapture(invocation) != enclosingCapture(*this))
+        return emitOpError("tape must come from the enclosing capture's begin_invocation");
+
+    ValueRange link = getParentLink();
+    if (link.empty()) {
+        if (getChildOrdinalAttr())
+            return emitOpError("root region must not define child_ordinal");
+    } else {
+        if (link.size() != 2 || !isa<AdRegionHeaderType>(link[0].getType()) || !link[1].getType().isIndex())
+            return emitOpError("nested region parent_link must contain parent region and parent record offset");
+        auto parent = link[0].getDefiningOp<AdBeginRegionOp>();
+        auto reservation = link[1].getDefiningOp<AdReserveRecordOp>();
+        if (!parent || !reservation || reservation.getRegion() != link[0])
+            return emitOpError("nested region requires a checked parent record from its direct parent region");
+        if (parent.getTape() != getTape() || enclosingCapture(parent) != enclosingCapture(*this))
+            return emitOpError("nested region and parent must have the same invocation owner");
+        if (!getChildOrdinalAttr() || getChildOrdinalAttr().getInt() < 0)
+            return emitOpError("nested region requires a non-negative child_ordinal");
+        for (Operation *user : parent.getRegion().getUsers()) {
+            auto sibling = dyn_cast<AdBeginRegionOp>(user);
+            if (!sibling || sibling == *this || sibling.getParentLink().size() != 2)
+                continue;
+            if (sibling.getParentLink()[1] == link[1] && sibling.getChildOrdinalAttr() &&
+                sibling.getChildOrdinalAttr().getInt() == getChildOrdinalAttr().getInt())
+                return emitOpError("duplicates a child_ordinal in the same parent record");
+        }
+    }
+    return verifyRegionHandle(*this);
+}
+
+LogicalResult AdReserveRecordOp::verify() {
+    if (failed(verifyCaptureMutation(getOperation())))
+        return failure();
+    auto begin = getRegion().getDefiningOp<AdBeginRegionOp>();
+    if (!begin || enclosingCapture(begin) != enclosingCapture(*this))
+        return emitOpError("region must be owned by the enclosing capture");
+    return verifyRecordLayout(getOperation(), getRecordSizeAttr().getInt(), getRecordAlignmentAttr().getInt());
+}
+
+LogicalResult AdWriteLeafOp::verify() {
+    if (failed(verifyCaptureMutation(getOperation())))
+        return failure();
+    auto reservation = getRecordOffset().getDefiningOp<AdReserveRecordOp>();
+    if (!reservation || reservation.getRegion() != getRegion())
+        return emitOpError("record_offset must come directly from checked ad.reserve_record for this region");
+    if (enclosingCapture(reservation) != enclosingCapture(*this))
+        return emitOpError("record reservation belongs to a different capture invocation");
+    return verifyLeafLayout(getOperation(), getValue().getType(), reservation.getRecordSizeAttr().getInt(),
+                            reservation.getRecordAlignmentAttr().getInt(), getLeafOffsetAttr().getInt());
+}
+
+LogicalResult AdEndRegionOp::verify() {
+    if (failed(verifyCaptureMutation(getOperation())))
+        return failure();
+    auto begin = getRegion().getDefiningOp<AdBeginRegionOp>();
+    if (!begin || enclosingCapture(begin) != enclosingCapture(*this))
+        return emitOpError("region must be owned by the enclosing capture");
+    APInt constant;
+    if (matchPattern(getExecutedCount(), m_ConstantInt(&constant)) && constant.isNegative())
+        return emitOpError("executed_count must not be negative");
+    if (matchPattern(getExitKind(), m_ConstantInt(&constant)) &&
+        (constant.getSExtValue() < 0 || constant.getSExtValue() > 3))
+        return emitOpError("exit_kind must be fallthrough(0), break(1), continue(2), or return(3)");
+
+    if (!begin.getParentLink().empty()) {
+        auto parent = begin.getParentLink()[0].getDefiningOp<AdBeginRegionOp>();
+        AdEndRegionOp parentEnd;
+        for (Operation *user : parent.getRegion().getUsers())
+            if (auto candidate = dyn_cast<AdEndRegionOp>(user))
+                parentEnd = candidate;
+        if (parentEnd && parentEnd->getBlock() == getOperation()->getBlock() &&
+            parentEnd->isBeforeInBlock(getOperation()))
+            return emitOpError("nested region must be finalized before its parent region");
+    }
+    return success();
+}
+
+LogicalResult AdReadRecordOffsetOp::verify() { return verifyReverseRead(getOperation(), getRegion()); }
+
+LogicalResult AdReadExecutedCountOp::verify() { return verifyReverseRead(getOperation(), getRegion()); }
+
+LogicalResult AdReadExitKindOp::verify() { return verifyReverseRead(getOperation(), getRegion()); }
+
+LogicalResult AdReadNestedRegionOp::verify() {
+    if (failed(verifyReverseRead(getOperation(), getRegion())))
+        return failure();
+    if (getChildOrdinalAttr().getInt() < 0)
+        return emitOpError("requires a non-negative child_ordinal");
+    APInt constant;
+    if (matchPattern(getRecordIndex(), m_ConstantInt(&constant)) && constant.isNegative())
+        return emitOpError("record_index must not be negative");
+    return success();
+}
+
+LogicalResult AdReadLeafOp::verify() {
+    if (failed(verifyReverseRead(getOperation(), getRegion())))
+        return failure();
+    APInt constant;
+    if (matchPattern(getRecordIndex(), m_ConstantInt(&constant)) && constant.isNegative())
+        return emitOpError("record_index must not be negative");
+    return verifyLeafLayout(getOperation(), getValue().getType(), getRecordSizeAttr().getInt(),
+                            getRecordAlignmentAttr().getInt(), getLeafOffsetAttr().getInt());
 }

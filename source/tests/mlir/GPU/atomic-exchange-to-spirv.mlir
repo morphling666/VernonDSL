@@ -1,3 +1,7 @@
+// RUN: %vernon-opt --vernon-convert-gpu-to-spirv %s | %FileCheck %s
+//
+// CHECK: spirv.AtomicExchange <Workgroup> <AcquireRelease>
+
 module attributes {vernon.compiler_contract_version = 10 : i64, vernon.pipeline_version = 13 : i64} {
   gpu.module @kernels {
     gpu.func @exchange(%storage: memref<1xi32, #spirv.storage_class<Workgroup>>) kernel

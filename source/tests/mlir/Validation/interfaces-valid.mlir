@@ -1,3 +1,5 @@
+// RUN: %vernon-opt --vernon-validate %s -o %t
+
 module attributes {vernon.compiler_contract_version = 10 : i64, vernon.pipeline_version = 13 : i64} {
   func.func @vertex_main(
       %position: tensor<4xf32> {

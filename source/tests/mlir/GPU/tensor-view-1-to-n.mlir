@@ -1,3 +1,19 @@
+// RUN: %vernon-opt --vernon-materialize-storage-projections --vernon-to-gpu %s | %FileCheck %s
+//
+// CHECK: gpu.module @vernon_kernels
+// CHECK-LABEL: gpu.func @storage_lowering(
+// CHECK-SAME: memref<
+// CHECK-SAME: memref<
+// CHECK-SAME: memref<
+// CHECK-NOT: memref<
+// CHECK-SAME: ) kernel
+// CHECK: memref.load
+// CHECK: memref.store
+// CHECK: memref.atomic_rmw addi
+// CHECK-NOT: !vernon.tensor_view
+// CHECK-NOT: vernon.physical_
+// CHECK-NOT: unrealized_conversion_cast
+
 module attributes {vernon.compiler_contract_version = 10 : i64, vernon.pipeline_version = 13 : i64} {
   "vernon.struct"() {
     sym_name = "Pair",

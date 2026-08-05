@@ -1,3 +1,20 @@
+// RUN: %vernon-opt --vernon-lower-accumulation=supports-atomic-f32=true %s -o %t
+// RUN: %FileCheck %s --check-prefix=CHECK --input-file=%t
+// RUN: %FileCheck %s --check-prefix=ABSENT --input-file=%t
+//
+// CHECK-DAG: vernon.physical_load
+// CHECK-DAG: vernon.physical_load
+// CHECK-DAG: vernon.physical_atomic
+// CHECK-DAG: arith.addf
+// CHECK-DAG: vernon.serial_dispatch
+// CHECK-DAG: vernon.workgroup_size = array<i32: 1, 1, 1>
+// CHECK-DAG: scf.for
+// CHECK-DAG: vernon.physical_store
+//
+// ABSENT: module
+// ABSENT-NOT: vernon.reduce_sum
+// ABSENT-NOT: vernon.scatter_add
+
 module {
   func.func @disjoint(%gradient: !vernon.tensor_view<f32, [-1], "read_write", "device">,
                       %value: f32, %index: index) {

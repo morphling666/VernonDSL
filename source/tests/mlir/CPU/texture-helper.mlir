@@ -1,3 +1,12 @@
+// RUN: %vernon-opt --vernon-lower-cpu-resources %s | %FileCheck %s
+//
+// CHECK: func.func private @__vernon_cpu_texture_sample
+// CHECK: !llvm.ptr
+// CHECK: call @__vernon_cpu_texture_sample
+// CHECK-NOT: vernon.cpu.requires_texture_callbacks
+// CHECK-NOT: !vernon.texture
+// CHECK-NOT: !vernon.sampler
+
 module attributes {vernon.compiler_contract_version = 10 : i64, vernon.pipeline_version = 13 : i64} {
   func.func @sample_texture(
       %texture: !vernon.texture<"2d", f32>,

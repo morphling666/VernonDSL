@@ -1,3 +1,12 @@
+// RUN: %not %vernon-opt --vernon-validate %s 2>&1 | %FileCheck %s
+//
+// CHECK-DAG: cannot have both 'vernon.location' and 'vernon.builtin'
+// CHECK-DAG: uniform must provide both 'vernon.set' and 'vernon.binding', or neither
+// CHECK-DAG: 'vernon.instance_divisor' is only valid on vertex inputs
+// CHECK-DAG: compute entry requires 'vernon.workgroup_size'
+// CHECK-DAG: contains internal TensorView descriptor metadata
+// CHECK-DAG: but the vertex output has type
+
 module attributes {vernon.compiler_contract_version = 10 : i64, vernon.pipeline_version = 13 : i64} {
   func.func @bad_vertex(
       %position: tensor<4xf32> {

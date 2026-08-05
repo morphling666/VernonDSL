@@ -75,4 +75,27 @@ def Vernon_SamplerType : TypeDef<Vernon_Dialect, "Sampler"> {
   let summary = "Texture sampling state";
 }
 
+//===----------------------------------------------------------------------===//
+// Internal logical autodiff types
+//===----------------------------------------------------------------------===//
+
+def Vernon_AdTapeType : TypeDef<Vernon_Dialect, "AdTape"> {
+  let mnemonic = "ad_tape";
+  let summary = "Backend-neutral ownership handle for one autodiff invocation tape";
+  let description = [{
+    An internal logical handle for the tape owned by one differentiated
+    invocation. Its physical representation is intentionally unspecified.
+  }];
+}
+
+def Vernon_AdRegionHeaderType : TypeDef<Vernon_Dialect, "AdRegionHeader"> {
+  let mnemonic = "ad_region_header";
+  let summary = "Backend-neutral handle for one dynamic autodiff region";
+  let description = [{
+    Identifies a checked dynamic-region header in an invocation tape. Region
+    headers record logical record location, execution count, exit kind, and
+    nested-region identity without exposing a physical backend layout.
+  }];
+}
+
 #endif // VERNON_TYPES

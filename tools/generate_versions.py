@@ -66,7 +66,7 @@ set(VERNON_PIPELINE_VERSION {pipeline})
         ROOT / "cmake/VernonVersions.cmake": cmake,
         ROOT / "source/lib/runtime/VERSION": f"{release}\n",
     }
-    for path in (ROOT / "source/tests/integration").glob("*.mlir"):
+    for path in (ROOT / "source/tests/mlir").rglob("*.mlir"):
         fixture = path.read_text(encoding="utf-8")
         fixture = re.sub(
             r"vernon\.compiler_contract_version = \d+ : i64",

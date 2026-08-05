@@ -167,90 +167,17 @@ normative design and contract document.
 - `VernonAdValue` carries complete logical shape and Runtime rejects equal-size
   values whose shapes differ from reflection.
 
-## Prioritized implementation roadmap
+## Implementation roadmap
 
-Checkboxes are authoritative: `[x]` is implemented and accepted; `[ ]` is
-remaining work. Priorities describe implementation order, not API stability.
+This document is an implemented-behavior snapshot and does not maintain
+roadmap checkboxes. The ordered, authoritative task list and acceptance gates
+are in [`autodiff-task-list.md`](autodiff-task-list.md).
 
-### Completed foundations
-
-- [x] Backend-owned accumulation strategy selection and deterministic serial
-  dispatch reflection.
-- [x] Complete logical shape in `VernonAdValue` with Runtime shape validation.
-- [x] Flattened Scalar, Tensor, Tuple, and Struct input leaves on native CPU.
-- [x] Struct/Tuple leaf-level `wrt` gradients through native CPU lowering,
-  cooked Runtime execution, and Python bindings.
-- [x] One canonical CPU HostValue ABI plan for arguments, results, aggregate
-  tensors, and autodiff tape. The MLIR scalar-lane boundary isolates
-  target-specific LLVM padding, and reflection and Runtime consume the same
-  canonical offsets without physical-layout fallback.
-
-### P0 — Correctness and contract parity
-
-**Status: in progress.** The existing correctness items are implemented and
-accepted on CPU, Metal, and Vulkan on current hardware. General
-runtime-bounded control flow and GPU aggregate Values remain P0 requirements.
-Demo development begins after every P0 checkbox below is complete.
-
-- [x] Extend native CPU/GPU lowering to all frontend derivative rules,
-  including `acos`, `atan2`, `abs`, `pow`, `dot`, `matmul`, `norm`,
-  `normalize`, `cross`, and `reflect`. A parity test compares the frontend
-  derivative registry with native lowering coverage.
-- [x] Complete f16 native lowering and Runtime contracts: f16 primals produce
-  f32 gradients, and f16 scalar outputs receive an implicit f32 unit
-  cotangent. Acceptance includes the public Python `pipeline.vjp()` path.
-- [x] Support Stateful Storage control flow: loops, dynamic leading-break
-  loops, early returns, and conditionals involving TensorView state. The
-  numerical fixture executes dynamic loop and early-return paths, both
-  conditional mutation branches, and multiple Storage resources.
-- [x] Add alias-aware lowering for multiple writable Storage parameters:
-  distinct resources lower independently and Runtime binding rejects
-  overlapping writable host ranges.
-- [x] Unify diagnostics for context-bound Runtime APIs so each commits its
-  final per-thread, per-context diagnostic through one common exit path and
-  `vernonRuntimeGetLastError` reads only that channel. Context-less capability,
-  creation, registration, and inspection APIs retain independent diagnostics.
-- [ ] Support general data-dependent `while`, `continue`, arbitrary in-loop
-  `return`, and `for ... else` in differentiated code. Reverse execution uses
-  dynamically sized control-flow tape with checked Runtime allocation rather
-  than a compile-time trip-count bound.
-- [ ] Remove the 1024-iteration literal-range and 256-iteration dynamic
-  leading-break differentiation limits. Executed iteration count is constrained
-  only by checked Runtime resource limits and overflow validation.
-- [ ] Support Struct/Tuple aggregate Values throughout GPU native and cooked
-  AD, including inputs, outputs, tape, cotangents, gradients, per-leaf dtype
-  promotion, reflection, resource binding, and numerical acceptance.
-
-### P1 — Scalable GPU and graph execution
-
-- [ ] Replace deterministic serial accumulation fallback with scalable
-  contribution buffers, deterministic sorting, and segmented reduction. The
-  current fallback is correct but does not scale to large invocation domains.
-- [ ] Extend ExecutionGraph AD with cross-node Storage mutation edges and
-  multiple selected sink outputs.
-- [ ] Expose ExecutionGraph AD composition through public C and Python APIs.
-- [ ] Add an RHI device buffer-fill operation and use it for GPU gradient
-  initialization instead of bounded host-to-device zero uploads.
-- [ ] Add multi-node ExecutionGraph acceptance on Metal, CUDA, DirectX,
-  OpenGL, and OpenGL ES. Current multi-node acceptance is Vulkan-only.
-
-### P2 — Language and differentiation coverage
-
-- [ ] Support keyword arguments and recursive helpers inside differentiated
-  code.
-- [ ] Implement graphics-stage backward lowering and differentiable rendering
-  rules.
-- [ ] Implement forward-mode JVP, materialized Jacobians, Hessians, and
-  higher-order AD.
-- [ ] Add persistent/`accumulate_into` gradient-buffer semantics independently
-  of fresh-gradient VJP execution.
-
-### P3 — Runtime efficiency and platform acceptance
-
-- [ ] Resolve forward and backward backend pipelines lazily instead of eagerly.
-- [ ] Add CUDA hardware CI coverage.
-- [ ] Add DXC-backed DirectX validation on Windows.
-- [ ] Broaden cooked AD acceptance on OpenGL and OpenGL ES.
+The current highest-priority boundary remains general runtime-bounded control
+flow with checked dynamic tape, followed by structured aggregate parity and
+the GPU physical-ABI/capture-retry-commit migration. Later language, graph,
+graphics, higher-order AD, efficiency, and platform work is ordered in the
+same task list.
 
 ## Source map
 

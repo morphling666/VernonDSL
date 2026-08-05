@@ -1,3 +1,12 @@
+// RUN: %vernon-opt --vernon-lower-cpu-tensors %s | %FileCheck %s
+//
+// CHECK: vector<3xf32>
+// CHECK: arith.addf
+// CHECK: scf.if
+// CHECK: scf.yield
+// CHECK-NOT: tensor<3xf32>
+// CHECK-NOT: vernon.struct
+
 module attributes {vernon.compiler_contract_version = 10 : i64, vernon.pipeline_version = 13 : i64} {
   "vernon.struct"() <{
     fields = ["value"],
