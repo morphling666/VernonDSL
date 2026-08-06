@@ -11,6 +11,14 @@
 
 namespace mlir::vernon {
 
+bool containsLogicalAutodiffHandle(Type type) {
+    if (isa<AdTapeType, AdRegionHeaderType>(type))
+        return true;
+    if (auto tuple = dyn_cast<TupleType>(type))
+        return llvm::any_of(tuple.getTypes(), containsLogicalAutodiffHandle);
+    return false;
+}
+
 FailureOr<ResolvedStructFields> resolveNamedStructFields(StructType structure, ModuleOp module) {
     StructDeclOp declaration;
     for (StructDeclOp candidate : module.getOps<StructDeclOp>()) {

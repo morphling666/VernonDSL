@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -212,14 +214,49 @@ bool createImmediateGpuGraph(VernonLoadedPipeline &pipeline) {
     return true;
 }
 
+bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffVariant &profiles,
+                             VernonLoadedPipeline &pipeline) {
+    if (!bundle.context || !bundle.autodiff)
+        return false;
+    const Stage &forward = bundle.stages.at(profiles.forwardWithTape);
+    const Stage &backward = bundle.stages.at(profiles.backward);
+    std::shared_ptr<Executable> executable;
+    bool resolved = false;
+    if (bundle.context->backend == VERNON_RUNTIME_CPU) {
+        if (!forward.autodiff || !backward.autodiff) {
+            invocationDiagnostic(*bundle.context) = "CPU autodiff stages have no protocol metadata";
+        } else if (forward.autodiff->protocol != backward.autodiff->protocol) {
+            invocationDiagnostic(*bundle.context) = "CPU autodiff profile protocols do not match";
+        } else if (forward.autodiff->protocol == "dynamic_v2") {
+            resolved =
+                createCpuExecutable(*bundle.context, forward, backward, bundle.autodiff->gradientPaths, executable);
+        } else if (forward.autodiff->protocol == "legacy_fixed") {
+            resolved = createLegacyCpuExecutable(*bundle.context, forward, backward, bundle.autodiff->gradientPaths,
+                                                 executable);
+        } else {
+            invocationDiagnostic(*bundle.context) = "CPU autodiff profile uses an unsupported protocol";
+        }
+    } else {
+        resolved = createGpuExecutable(bundle, profiles.forwardWithTape, profiles.backward,
+                                       bundle.autodiff->gradientPaths, profiles.launch, executable);
+    }
+    if (!resolved)
+        return false;
+    pipeline.autodiff = VernonLoadedAutodiff{std::move(executable)};
+    return bundle.context->backend == VERNON_RUNTIME_CPU || createImmediateGpuGraph(pipeline);
+}
+
 } // namespace vernon::runtime::ad
 
 namespace {
 
-VernonStatus fail(VernonRuntimeContext *context, std::string message,
-                  VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) {
-    if (context)
-        vernon::runtime::invocationDiagnostic(*context) = std::move(message);
+VernonStatus fail(VernonRuntimeContext *context, std::string_view message,
+                  VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) noexcept {
+    try {
+        if (context)
+            vernon::runtime::invocationDiagnostic(*context) = message;
+    } catch (...) {
+    }
     return status;
 }
 
@@ -265,18 +302,18 @@ VernonStatus vernonRuntimeLoadedPipelineGetAdOutputDataType(const VernonLoadedPi
                                                             VernonDataType *dtype) {
     vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
     const auto *executable = autodiffExecutable(pipeline);
-    if (!executable || !dtype)
+    if (!executable || !dtype || executable->signature().outputs.size() != 1)
         return fail(pipeline ? pipeline->context : nullptr, "pipeline has no autodiff output");
-    *dtype = executable->signature().output.dtype;
+    *dtype = executable->signature().outputs.front().dtype;
     return VERNON_STATUS_OK;
 }
 
 VernonStatus vernonRuntimeLoadedPipelineGetAdOutputRank(const VernonLoadedPipeline *pipeline, size_t *rank) {
     vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
     const auto *executable = autodiffExecutable(pipeline);
-    if (!executable || !rank)
+    if (!executable || !rank || executable->signature().outputs.size() != 1)
         return fail(pipeline ? pipeline->context : nullptr, "invalid autodiff output rank query");
-    *rank = executable->signature().output.logicalShape.size();
+    *rank = executable->signature().outputs.front().logicalShape.size();
     return VERNON_STATUS_OK;
 }
 
@@ -284,9 +321,9 @@ VernonStatus vernonRuntimeLoadedPipelineGetAdOutputDimension(const VernonLoadedP
                                                              uint64_t *extent) {
     vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
     const auto *executable = autodiffExecutable(pipeline);
-    if (!executable || !extent)
+    if (!executable || !extent || executable->signature().outputs.size() != 1)
         return fail(pipeline ? pipeline->context : nullptr, "invalid autodiff output dimension query");
-    const auto &shape = executable->signature().output.logicalShape;
+    const auto &shape = executable->signature().outputs.front().logicalShape;
     if (index >= shape.size())
         return fail(pipeline->context, "autodiff output dimension is out of range");
     *extent = shape[index];
@@ -314,40 +351,58 @@ VernonStatus vernonRuntimeLoadedPipelineGetAdGradient(const VernonLoadedPipeline
 VernonStatus vernonAdPipelineForward(VernonLoadedPipeline *pipeline, VernonLaunchSize computeGrid,
                                      const VernonAdValueSet *inputs, VernonAdValueSet *outputs,
                                      VernonPullback **pullback) {
-    using namespace vernon::runtime::ad;
-    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    if (pullback)
-        *pullback = nullptr;
-    auto *executable = pipeline && pipeline->autodiff ? pipeline->autodiff->executable.get() : nullptr;
-    if (!pipeline || !pullback || !executable || !validLaunchSize(computeGrid) || !validSet(inputs, true) ||
-        !validSet(outputs, true))
-        return fail(pipeline ? pipeline->context : nullptr, "invalid autodiff forward invocation");
-    std::unique_ptr<PullbackExecution> execution;
-    VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT;
-    if (dynamic_cast<GpuGraphExecutable *>(executable))
-        status = forwardGpuGraph(*pipeline, computeGrid, *inputs, *outputs, execution);
-    else if (auto *host = dynamic_cast<HostExecutable *>(executable))
-        status = host->forward(computeGrid, *inputs, *outputs, execution);
-    if (status != VERNON_STATUS_OK)
-        return status;
-    if (!execution)
-        return fail(pipeline->context, "autodiff forward produced no pullback", VERNON_STATUS_INTERNAL_ERROR);
-    auto result = std::make_unique<VernonPullback>();
-    result->contextLease = vernon::runtime::acquireContextLease(*pipeline->context);
-    result->execution = std::move(execution);
-    *pullback = result.release();
-    return VERNON_STATUS_OK;
+    try {
+        using namespace vernon::runtime::ad;
+        vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+        if (pullback)
+            *pullback = nullptr;
+        auto *executable = pipeline && pipeline->autodiff ? pipeline->autodiff->executable.get() : nullptr;
+        if (!pipeline || !pullback || !executable || !validLaunchSize(computeGrid) || !validSet(inputs, true) ||
+            !validSet(outputs, true))
+            return fail(pipeline ? pipeline->context : nullptr, "invalid autodiff forward invocation");
+        auto result = std::make_unique<VernonPullback>();
+        result->contextLease = vernon::runtime::acquireContextLease(*pipeline->context);
+        std::unique_ptr<PullbackExecution> execution;
+        VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT;
+        if (dynamic_cast<GpuGraphExecutable *>(executable))
+            status = forwardGpuGraph(*pipeline, computeGrid, *inputs, *outputs, execution);
+        else if (auto *host = dynamic_cast<HostExecutable *>(executable))
+            status = host->forward(computeGrid, *inputs, *outputs, execution);
+        if (status != VERNON_STATUS_OK)
+            return status;
+        if (!execution)
+            return fail(pipeline->context, "autodiff forward produced no pullback", VERNON_STATUS_INTERNAL_ERROR);
+        result->execution = std::move(execution);
+        *pullback = result.release();
+        return VERNON_STATUS_OK;
+    } catch (const std::bad_alloc &) {
+        return fail(pipeline ? pipeline->context : nullptr, "cannot allocate autodiff forward state",
+                    VERNON_STATUS_INTERNAL_ERROR);
+    } catch (const std::length_error &) {
+        return fail(pipeline ? pipeline->context : nullptr, "autodiff forward allocation is too large",
+                    VERNON_STATUS_INTERNAL_ERROR);
+    } catch (...) {
+        return fail(pipeline ? pipeline->context : nullptr, "unexpected autodiff forward failure",
+                    VERNON_STATUS_INTERNAL_ERROR);
+    }
 }
 
 VernonStatus vernonPullbackApply(VernonPullback *pullback, const VernonAdValueSet *cotangents,
                                  VernonAdValueSet *gradients) {
-    using namespace vernon::runtime::ad;
-    vernon::runtime::RuntimeDiagnosticScope diagnostic(
-        pullback && pullback->contextLease ? &pullback->contextLease->get() : nullptr);
-    if (!pullback || !pullback->execution || !validSet(cotangents, false) || !validSet(gradients, true))
-        return fail(pullback && pullback->contextLease ? &pullback->contextLease->get() : nullptr,
-                    "invalid pullback invocation");
-    return pullback->execution->apply(cotangents, *gradients);
+    VernonRuntimeContext *context = pullback && pullback->contextLease ? &pullback->contextLease->get() : nullptr;
+    try {
+        using namespace vernon::runtime::ad;
+        vernon::runtime::RuntimeDiagnosticScope diagnostic(context);
+        if (!pullback || !pullback->execution || !validSet(cotangents, false) || !validSet(gradients, true))
+            return fail(context, "invalid pullback invocation");
+        return pullback->execution->apply(cotangents, *gradients);
+    } catch (const std::bad_alloc &) {
+        return fail(context, "cannot allocate pullback state", VERNON_STATUS_INTERNAL_ERROR);
+    } catch (const std::length_error &) {
+        return fail(context, "pullback allocation is too large", VERNON_STATUS_INTERNAL_ERROR);
+    } catch (...) {
+        return fail(context, "unexpected pullback failure", VERNON_STATUS_INTERNAL_ERROR);
+    }
 }
 
 void vernonPullbackDestroy(VernonPullback *pullback) {

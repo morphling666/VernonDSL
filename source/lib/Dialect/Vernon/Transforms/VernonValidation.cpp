@@ -127,8 +127,9 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
                 Type abiType = type;
                 if (auto view = dyn_cast<TensorViewType>(type))
                     abiType = view.getElementType();
-                const bool abiBearing = abiType.isIntOrFloat() ||
-                                        isa<TensorType, RankedTensorType, VectorType, StructType, TupleType>(abiType);
+                const bool abiBearing = !containsLogicalAutodiffHandle(abiType) &&
+                                        (abiType.isIntOrFloat() ||
+                                         isa<TensorType, RankedTensorType, VectorType, StructType, TupleType>(abiType));
                 if (abiBearing && failed(verifyValueAbiType(abiType, getOperation()))) {
                     function.emitError() << (isResult ? "result #" : "argument #") << index
                                          << " has no finite canonical Value ABI layout";

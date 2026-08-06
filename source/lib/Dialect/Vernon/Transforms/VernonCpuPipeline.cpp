@@ -22,6 +22,7 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonInlineHelpers.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUABI.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUAutodiff.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUResources.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUTensors.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerSynchronization.h"
@@ -93,6 +94,9 @@ void buildVernonCpuPreparationPipeline(OpPassManager &passManager) {
     passManager.addPass(createVernonVerifyCPUAutodiffABIPass());
     passManager.addPass(createVernonInlineHelpersPass());
     passManager.addPass(std::make_unique<MaterializeStorageProjectionPass>());
+    passManager.addPass(createVernonPrepareCPUAutodiffSignaturesPass());
+    passManager.addPass(createVernonLowerCPUAutodiffPass());
+    passManager.addPass(createVernonCPUAutodiffToLLVMPass());
 }
 
 void buildVernonCpuLoweringPipeline(OpPassManager &passManager) {

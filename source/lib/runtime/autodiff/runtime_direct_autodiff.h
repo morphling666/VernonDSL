@@ -9,7 +9,8 @@ VERNON_RUNTIME_CAPI VernonLoadedPipeline *loadBackendCpuAutodiffPipeline(
     VernonRuntimeContext &context, VernonCpuEntryPoint primalEntry, VernonStringView primalReflection,
     VernonStringView primalName, VernonCpuEntryPoint forwardEntry, VernonStringView forwardReflection,
     VernonStringView forwardName, VernonCpuEntryPoint backwardEntry, VernonStringView backwardReflection,
-    VernonStringView backwardName, const VernonStringView *gradientPaths, size_t gradientPathCount);
+    VernonStringView backwardName, VernonStringView forwardProtocol, VernonStringView backwardProtocol,
+    const VernonStringView *gradientPaths, size_t gradientPathCount);
 
 } // namespace vernon::runtime
 

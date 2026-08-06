@@ -43,6 +43,13 @@ class AutodiffDeclarationTests(unittest.TestCase):
         self.assertEqual(first.transform.wrt, ("value", "z"))
         self.assertEqual(first.transform.identity, second.transform.identity)
 
+    def test_vjp_protocol_participates_in_identity(self) -> None:
+        dynamic = vd.ad.ProgramTransformSpec("vjp", ("value",), protocol="dynamic_v2")
+        legacy = vd.ad.ProgramTransformSpec("vjp", ("value",), protocol="legacy_fixed")
+        self.assertNotEqual(dynamic.identity, legacy.identity)
+        self.assertEqual(dynamic.to_dict()["protocol"], "dynamic_v2")
+        self.assertEqual(legacy.to_dict()["protocol"], "legacy_fixed")
+
     def test_graphics_vjp_requires_rules(self) -> None:
         @vd.vertex
         def vertex(value: vd.f32) -> vd.f32:
@@ -208,7 +215,7 @@ def compute(value: vd.f32) -> vd.f32:
 
 asset = vd.pipeline_asset(
     id="compute/vjp",
-    program=vd.ad.vjp(compute, wrt=("value",)),
+    program=vd.ad.vjp(compute, wrt=("value",), protocol="legacy_fixed"),
 )
 """,
                 encoding="utf-8",
@@ -281,7 +288,7 @@ def compute(value: vd.Tensor[vd.f32, (2,)]) -> vd.Tensor[vd.f32, (2,)]:
 
 asset = vd.pipeline_asset(
     id="compute/vjp",
-    program=vd.ad.vjp(compute, wrt=("value",)),
+    program=vd.ad.vjp(compute, wrt=("value",), protocol="legacy_fixed"),
 )
 """,
                 encoding="utf-8",
@@ -394,7 +401,7 @@ asset = vd.pipeline_asset(
             for symbol in registration["symbols"]:
                 self.assertIn(f"&{symbol}", registration_source)
 
-    def test_cpu_scalar_control_flow_reaches_dynamic_tape_boundary_without_fallback(self) -> None:
+    def test_cpu_scalar_control_flow_cooks_dynamic_tape_without_fallback(self) -> None:
         try:
             from vernon_dsl import _native  # noqa: F401
         except (ImportError, OSError):
@@ -430,19 +437,18 @@ asset = vd.pipeline_asset(
                     "vernon_dsl.frontend.autodiff_native.emit_native_autodiff_modules",
                     side_effect=AssertionError("structured scalar VJP must not use legacy lowering"),
                 ) as legacy_builder,
-                self.assertRaisesRegex(
-                    PipelineCompileError,
-                    "structured CPU VJP requires dynamic tape lowering before profile compilation",
-                ),
             ):
-                cook_pipeline_asset(
+                manifest = cook_pipeline_asset(
                     pipeline_asset=f"{source}:asset",
                     output=output,
                     target="cpu",
                 )
             structured_builder.assert_called_once()
             legacy_builder.assert_not_called()
-            self.assertFalse(output.exists())
+            self.assertTrue(manifest.is_file())
+            document = json.loads(manifest.read_text(encoding="utf-8"))
+            programs = document["autodiff_profiles"]["variants"][0]["programs"]
+            self.assertEqual(set(programs), {"primal", "forward_with_tape", "backward"})
 
     def test_native_structured_vjp_accepts_frontend_loop_control_state(self) -> None:
         try:
@@ -488,6 +494,10 @@ def objective(x: vd.f32, limit: vd.i32) -> vd.f32:
             self.assertTrue(structured.uses_dynamic_tape)
             forward = structured.profiles["forward_with_tape"]
             backward = structured.profiles["backward"]
+            combined = forward + backward
+            self.assertNotIn("__vernon_cpu", combined)
+            self.assertNotIn("descriptor_storage_leaves", combined)
+            self.assertNotIn("status_word", combined)
             self.assertGreaterEqual(forward.count("vernon.ad.checked_increment"), 2)
             self.assertIn("vernon.ad.end_region", forward)
             self.assertGreaterEqual(forward.count("scf.if"), 3)

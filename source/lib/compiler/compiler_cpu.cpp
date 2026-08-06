@@ -10,6 +10,7 @@
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonCpuPipeline.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUAutodiff.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonVerifyCPUAutodiffABI.h"
 #include "mlir/IR/Diagnostics.h"
@@ -332,12 +333,20 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
     mlir::MLIRContext &context = prepared.context();
     mlir::ScopedDiagnosticHandler handler(
         &context, [&](mlir::Diagnostic &diagnostic) { appendDiagnostic(diagnostics, diagnostic); });
-    mlir::OwningOpRef<mlir::ModuleOp> sourceModule = prepared.clone();
-
-    mlir::PassManager abiVerifier(&context);
-    abiVerifier.addPass(mlir::vernon::createVernonVerifyCPUAutodiffABIPass());
-    if (mlir::failed(abiVerifier.run(*sourceModule)))
+    mlir::FailureOr<TargetPreparationResult> preparedTarget =
+        prepareTargetModule(prepared, [&](mlir::ModuleOp module, TargetPreparationProvenance &) {
+            mlir::PassManager preparation(&context);
+            mlir::vernon::buildVernonCpuPreparationPipeline(preparation);
+            return preparation.run(module);
+        });
+    if (mlir::failed(preparedTarget))
         return CpuCompileResult::VerificationFailure;
+    mlir::OwningOpRef<mlir::ModuleOp> sourceModule = std::move(preparedTarget->module);
+    mlir::FailureOr<std::string> targetReflection = buildReflection(
+        *sourceModule, prepared.logicalReflection(), preparedTarget->entries, preparedTarget->provenance);
+    if (mlir::failed(targetReflection))
+        return CpuCompileResult::CodegenFailure;
+    reflection = std::move(*targetReflection);
 
     llvm::Expected<llvm::json::Value> parsedReflection = llvm::json::parse(reflection);
     llvm::json::Object *reflectionRoot = parsedReflection ? parsedReflection->getAsObject() : nullptr;

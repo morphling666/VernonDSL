@@ -1,13 +1,17 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUAutodiff.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStructuredVjp.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
+#include "mlir/Pass/PassManager.h"
 
 #include <gtest/gtest.h>
 
@@ -19,6 +23,7 @@ protected:
     VernonStructuredVjpTest() {
         context.getOrLoadDialect<arith::ArithDialect>();
         context.getOrLoadDialect<func::FuncDialect>();
+        context.getOrLoadDialect<LLVM::LLVMDialect>();
         context.getOrLoadDialect<math::MathDialect>();
         context.getOrLoadDialect<scf::SCFDialect>();
         context.getOrLoadDialect<VernonDialect>();
@@ -70,13 +75,24 @@ TEST_F(VernonStructuredVjpTest, GeneratesProfilesForEveryScalarRule) {
         EXPECT_EQ(result->forward.getNumArguments(), 2u);
         EXPECT_EQ(result->forward.getNumResults(), 1u);
         EXPECT_TRUE(isa<TupleType>(result->forward.getResultTypes().front()));
-        EXPECT_EQ(result->backward.getNumArguments(), 2u);
+        EXPECT_EQ(result->backward.getNumArguments(), 3u);
         EXPECT_EQ(result->backward.getNumResults(), 1u);
         EXPECT_TRUE(isa<TupleType>(result->backward.getResultTypes().front()));
         ASSERT_EQ(result->derivativeRules.size(), 1u);
         EXPECT_EQ(result->derivativeRules.front(), testCase.operation);
         auto forwardResult = cast<TupleType>(result->forward.getResultTypes().front());
-        EXPECT_EQ(cast<TupleType>(forwardResult.getType(1)).size(), testCase.tapeLeaves);
+        EXPECT_TRUE(isa<AdTapeType>(forwardResult.getType(1)));
+        EXPECT_TRUE(isa<AdRegionHeaderType>(forwardResult.getType(2)));
+        unsigned writes = 0;
+        result->forward.walk([&](AdWriteLeafOp) { ++writes; });
+        EXPECT_EQ(writes, testCase.tapeLeaves + 1);
+        for (func::FuncOp profile : {result->forward, result->backward}) {
+            for (unsigned argument = 0; argument < profile.getNumArguments(); ++argument)
+                EXPECT_FALSE(profile.getArgAttr(argument, "vernon.builtin"));
+            profile.walk([&](Operation *operation) {
+                EXPECT_NE(operation->getName().getDialectNamespace(), LLVM::LLVMDialect::getDialectNamespace());
+            });
+        }
     }
 
     OwningOpRef<ModuleOp> powerModule = parseSourceString<ModuleOp>(
@@ -98,8 +114,9 @@ module {
                                  StructuredVjpOptions{{"x", "y"}, "power_forward", "power_backward"});
     ASSERT_TRUE(succeeded(power));
     EXPECT_EQ(power->derivativeRules, SmallVector<std::string>({"vernon.intrinsic.pow"}));
-    auto powerForwardResult = cast<TupleType>(power->forward.getResultTypes().front());
-    EXPECT_EQ(cast<TupleType>(powerForwardResult.getType(1)).size(), 3u);
+    unsigned powerWrites = 0;
+    power->forward.walk([&](AdWriteLeafOp) { ++powerWrites; });
+    EXPECT_EQ(powerWrites, 4u);
 }
 
 TEST_F(VernonStructuredVjpTest, DeduplicatesTapeAndAccumulatesSharedUseAdjoints) {
@@ -121,12 +138,102 @@ module {
     FailureOr<StructuredVjpResult> result = buildStructuredScalarVjp(
         module->lookupSymbol<func::FuncOp>("primal"), StructuredVjpOptions{{"x"}, "shared_forward", "shared_backward"});
     ASSERT_TRUE(succeeded(result));
-    auto forwardResult = cast<TupleType>(result->forward.getResultTypes().front());
-    EXPECT_EQ(cast<TupleType>(forwardResult.getType(1)).size(), 1u);
+    unsigned writes = 0;
+    result->forward.walk([&](AdWriteLeafOp) { ++writes; });
+    EXPECT_EQ(writes, 2u);
     EXPECT_EQ(result->derivativeRules, SmallVector<std::string>({"arith.addf", "arith.mulf"}));
     unsigned additions = 0;
     result->backward.walk([&](arith::AddFOp) { ++additions; });
     EXPECT_GE(additions, 3u);
+}
+
+TEST_F(VernonStructuredVjpTest, CpuPreparationRemovesAllLogicalTapeHandles) {
+    OwningOpRef<ModuleOp> module = parse("arith.mulf");
+    ASSERT_TRUE(module);
+    FailureOr<StructuredVjpResult> result =
+        buildStructuredScalarVjp(module->lookupSymbol<func::FuncOp>("primal"),
+                                 StructuredVjpOptions{{"x", "y"}, "prepared_forward", "prepared_backward"});
+    ASSERT_TRUE(succeeded(result));
+
+    PassManager manager(&context);
+    manager.addPass(createVernonPrepareCPUAutodiffSignaturesPass());
+    manager.addPass(createVernonLowerCPUAutodiffPass());
+    ASSERT_TRUE(succeeded(manager.run(*module)));
+    EXPECT_TRUE(succeeded(verify(*module)));
+    unsigned typedCallbacks = 0;
+    unsigned requiredByteReads = 0;
+    unsigned prematureLlvmCalls = 0;
+    module->walk([&](Operation *operation) {
+        typedCallbacks += isa<CpuAdCallbackOp>(operation);
+        requiredByteReads += isa<CpuAdRequiredBytesOp>(operation);
+        prematureLlvmCalls += isa<LLVM::CallOp>(operation);
+    });
+    EXPECT_GT(typedCallbacks, 0u);
+    EXPECT_GT(requiredByteReads, 0u);
+    EXPECT_EQ(prematureLlvmCalls, 0u);
+
+    PassManager conversion(&context);
+    conversion.addPass(createVernonCPUAutodiffToLLVMPass());
+    ASSERT_TRUE(succeeded(conversion.run(*module)));
+    EXPECT_TRUE(succeeded(verify(*module)));
+
+    bool hasLogicalOperation = false;
+    unsigned indirectCallbacks = 0;
+    module->walk([&](Operation *operation) {
+        hasLogicalOperation = hasLogicalOperation ||
+                              isa<AdCaptureOp, AdBeginInvocationOp, AdBeginRegionOp, AdReserveRecordOp, AdWriteLeafOp,
+                                  AdEndRegionOp, AdCommitOp, AdReadRecordOffsetOp, AdReadExecutedCountOp,
+                                  AdReadExitKindOp, AdReadNestedRegionOp, AdReadLeafOp>(operation);
+        EXPECT_FALSE(isa<CpuAdCallbackOp>(operation));
+        EXPECT_FALSE(isa<CpuAdRequiredBytesOp>(operation));
+        for (Type type : operation->getOperandTypes())
+            EXPECT_FALSE(containsLogicalAutodiffHandle(type));
+        for (Type type : operation->getResultTypes())
+            EXPECT_FALSE(containsLogicalAutodiffHandle(type));
+        if (auto call = dyn_cast<LLVM::CallOp>(operation)) {
+            ++indirectCallbacks;
+            EXPECT_FALSE(call.getCallee().has_value());
+        }
+        for (NamedAttribute attribute : operation->getAttrs())
+            if (auto symbol = dyn_cast<FlatSymbolRefAttr>(attribute.getValue()))
+                EXPECT_FALSE(symbol.getValue().starts_with("__vernon_cpu_ad_"));
+    });
+    EXPECT_FALSE(hasLogicalOperation);
+    EXPECT_GT(indirectCallbacks, 0u);
+}
+
+TEST_F(VernonStructuredVjpTest, RejectsMalformedTypedCpuCallbackSignature) {
+    OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(R"mlir(
+module {
+  func.func @malformed(%descriptor: index, %payload: f32) {
+    "vernon.cpu_ad.callback"(%descriptor, %payload) {callback = 1 : i32} : (index, f32) -> ()
+    func.return
+  }
+}
+)mlir",
+                                                               &context);
+    ASSERT_TRUE(module);
+    PassManager conversion(&context);
+    conversion.addPass(createVernonCPUAutodiffToLLVMPass());
+    EXPECT_TRUE(failed(conversion.run(*module)));
+}
+
+TEST_F(VernonStructuredVjpTest, RejectsUnsupportedTypedCpuCallbackPayload) {
+    OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(R"mlir(
+module {
+  func.func @unsupported_payload(%descriptor: index, %payload: f128) {
+    %zero = arith.constant 0 : i64
+    "vernon.cpu_ad.callback"(%descriptor, %zero, %zero, %payload, %zero)
+        {callback = 3 : i32} : (index, i64, i64, f128, i64) -> ()
+    func.return
+  }
+}
+)mlir",
+                                                               &context);
+    ASSERT_TRUE(module);
+    PassManager conversion(&context);
+    conversion.addPass(createVernonCPUAutodiffToLLVMPass());
+    EXPECT_TRUE(failed(conversion.run(*module)));
 }
 
 TEST_F(VernonStructuredVjpTest, RejectsAmbiguousOptionsWithoutMutatingPrimal) {
@@ -162,12 +269,12 @@ module {
         buildStructuredScalarVjp(module->lookupSymbol<func::FuncOp>("primal"),
                                  StructuredVjpOptions{{"x"}, "structured_forward", "structured_backward"});
     ASSERT_TRUE(succeeded(result));
-    auto forwardResult = cast<TupleType>(result->forward.getResultTypes().front());
-    auto tape = cast<TupleType>(forwardResult.getType(1));
-    EXPECT_EQ(tape.size(), 2u);
+    unsigned writes = 0;
+    result->forward.walk([&](AdWriteLeafOp) { ++writes; });
+    EXPECT_EQ(writes, 3u);
     EXPECT_GT(result->tapeBytes, 0u);
     EXPECT_TRUE(result->backward.getResultTypes().front().isF32());
-    auto cotangentDtypes = cast<ArrayAttr>(result->backward.getArgAttr(1, "vernon.abi_leaf_dtypes"));
+    auto cotangentDtypes = cast<ArrayAttr>(result->backward.getArgAttr(2, "vernon.abi_leaf_dtypes"));
     ASSERT_EQ(cotangentDtypes.size(), 1u);
     EXPECT_EQ(cast<StringAttr>(cotangentDtypes[0]).getValue(), "f32");
     auto gradientDtypes = cast<ArrayAttr>(result->backward.getResultAttr(0, "vernon.abi_leaf_dtypes"));

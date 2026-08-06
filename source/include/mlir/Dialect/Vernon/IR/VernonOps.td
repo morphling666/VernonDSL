@@ -302,4 +302,17 @@ def Vernon_AdReadLeafOp : Vernon_Op<"ad.read_leaf", [Pure]> {
   let hasVerifier = 1;
 }
 
+def Vernon_CpuAdCallbackOp : Vernon_Op<"cpu_ad.callback"> {
+  let summary = "Invoke one typed semantic CPU autodiff tape callback";
+  let arguments = (ins Index:$descriptor, I32Attr:$callback,
+      Variadic<AnyType>:$arguments);
+  let results = (outs Variadic<AnyType>:$results);
+}
+
+def Vernon_CpuAdRequiredBytesOp : Vernon_Op<"cpu_ad.required_bytes", [Pure]> {
+  let summary = "Read the exact required-byte count from the CPU tape descriptor";
+  let arguments = (ins Index:$descriptor);
+  let results = (outs Index:$required_bytes);
+}
+
 #endif // VERNON_OPS

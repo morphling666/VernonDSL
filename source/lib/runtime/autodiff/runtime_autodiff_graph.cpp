@@ -159,7 +159,10 @@ public:
                 return fail(context, "graph pullback gradient output has an invalid ABI");
         }
 
-        ValueAbi sinkCotangent = nodes[outputNode].executable->signature().cotangent;
+        const ad::Signature &sinkSignature = nodes[outputNode].executable->signature();
+        if (sinkSignature.cotangents.size() != 1)
+            return fail(context, "compiled autodiff graph requires one sink cotangent leaf");
+        ValueAbi sinkCotangent = sinkSignature.cotangents.front();
         if (!ad::materializeCarrierValue(sinkCotangent, computeGrid))
             return fail(context, "graph pullback launch size overflows", VERNON_STATUS_INVALID_ARGUMENT);
         std::vector<uint8_t> cotangentBytes;
@@ -208,7 +211,10 @@ public:
                     bool created = false;
                     if (source->second.sourceNode) {
                         const uint32_t upstream = *source->second.sourceNode;
-                        const ValueAbi &upstreamCotangent = nodes[upstream].executable->signature().cotangent;
+                        const ad::Signature &upstreamSignature = nodes[upstream].executable->signature();
+                        if (upstreamSignature.cotangents.size() != 1)
+                            return fail(context, "compiled autodiff graph requires one cotangent leaf per node");
+                        const ValueAbi &upstreamCotangent = upstreamSignature.cotangents.front();
                         if (!ad::sameValueAbi(descriptor.value, upstreamCotangent))
                             return fail(context, "connected graph gradient and cotangent ABIs do not match");
                         auto [entry, inserted] = nodeCotangents.emplace(upstream, GraphBuffer{});
@@ -390,7 +396,10 @@ public:
                         return fail(context, "compiled autodiff graph node has an unbound input");
                     if (source->second.sourceNode) {
                         const auto &upstream = invocationNodes[*source->second.sourceNode];
-                        const auto output = upstream.forwardBuffers.find(upstream.executable->signature().output.path);
+                        const ad::Signature &upstreamSignature = upstream.executable->signature();
+                        if (upstreamSignature.outputs.size() != 1)
+                            return fail(context, "compiled autodiff graph requires one output leaf per node");
+                        const auto output = upstream.forwardBuffers.find(upstreamSignature.outputs.front().path);
                         if (output == upstream.forwardBuffers.end())
                             return fail(context, "compiled autodiff graph source output is unavailable");
                         buffer = output->second;
@@ -414,7 +423,10 @@ public:
             return fail(context, "failed to execute compiled autodiff forward graph", VERNON_STATUS_INTERNAL_ERROR);
 
         AutodiffGraphPullback::Impl::Node &sink = invocationNodes[outputNode];
-        ValueAbi outputSpec = sink.executable->signature().output;
+        const ad::Signature &sinkSignature = sink.executable->signature();
+        if (sinkSignature.outputs.size() != 1)
+            return fail(context, "compiled autodiff graph requires one sink output leaf");
+        ValueAbi outputSpec = sinkSignature.outputs.front();
         if (!ad::materializeCarrierValue(outputSpec, computeGrid))
             return fail(context, "compiled autodiff output size overflows");
         VernonAdValue *output = ad::findValue(outputs, outputSpec.path);
@@ -594,7 +606,10 @@ VernonStatus AutodiffGraph::connect(AutodiffGraphNode source, AutodiffGraphNode 
         destinationInputPath.empty())
         return fail(impl_ ? impl_->context : nullptr, "invalid autodiff graph connection");
     Impl::Node &target = impl_->nodes[destination.index];
-    const ValueAbi &output = impl_->nodes[source.index].executable->signature().output;
+    const ad::Signature &signature = impl_->nodes[source.index].executable->signature();
+    if (signature.outputs.size() != 1)
+        return fail(impl_->context, "autodiff graph nodes require one output leaf");
+    const ValueAbi &output = signature.outputs.front();
     const ResourceAbi *input = resource(target.executable->forwardResources(), destinationInputPath);
     if (!input || input->role != GpuResourceRole::Input || !ad::sameValueAbi(output, input->value) ||
         target.inputs.count(destinationInputPath))

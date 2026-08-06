@@ -18,7 +18,9 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -46,19 +48,28 @@ void vernon::runtime::clearInvocationDiagnostic(const VernonRuntimeContext &cont
     invocationDiagnostics.erase(&context);
 }
 
-vernon::runtime::RuntimeDiagnosticScope::RuntimeDiagnosticScope(const VernonRuntimeContext *context)
+vernon::runtime::RuntimeDiagnosticScope::RuntimeDiagnosticScope(const VernonRuntimeContext *context) noexcept
     : context_(context) {
     if (!context_)
         return;
-    RuntimeDiagnosticState &state = invocationDiagnostics[context_];
-    if (state.depth++ == 0)
-        state.pending.clear();
+    try {
+        RuntimeDiagnosticState &state = invocationDiagnostics[context_];
+        if (state.depth++ == 0)
+            state.pending.clear();
+    } catch (...) {
+        context_ = nullptr;
+    }
 }
 
-vernon::runtime::RuntimeDiagnosticScope::~RuntimeDiagnosticScope() {
+vernon::runtime::RuntimeDiagnosticScope::~RuntimeDiagnosticScope() noexcept {
     if (!context_)
         return;
-    RuntimeDiagnosticState &state = invocationDiagnostics[context_];
+    const auto found = invocationDiagnostics.find(context_);
+    if (found == invocationDiagnostics.end())
+        return;
+    RuntimeDiagnosticState &state = found->second;
+    if (!state.depth)
+        return;
     if (--state.depth == 0)
         state.published = std::move(state.pending);
 }
@@ -67,10 +78,13 @@ namespace {
 
 using namespace vernon::runtime;
 
-VernonStatus fail(VernonRuntimeContext *context, std::string error,
-                  VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) {
-    if (context)
-        invocationDiagnostic(*context) = std::move(error);
+VernonStatus fail(VernonRuntimeContext *context, std::string_view error,
+                  VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) noexcept {
+    try {
+        if (context)
+            invocationDiagnostic(*context) = error;
+    } catch (...) {
+    }
     return status;
 }
 
@@ -379,8 +393,11 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
             Stage stage;
             stage.stage = value.value("stage", "");
             stage.entry = value.value("entry", "");
-            stage.autodiffProfile = value.value("autodiff_profile", "");
-            stage.autodiffProfilesIdentity = value.value("autodiff_profiles_identity", "");
+            if (value.contains("autodiff_profile") || value.contains("autodiff_protocol") ||
+                value.contains("autodiff_profiles_identity"))
+                stage.autodiff =
+                    AutodiffStageMetadata{value.value("autodiff_profile", ""), value.value("autodiff_protocol", ""),
+                                          value.value("autodiff_profiles_identity", "")};
             if (value.contains("reflection") && value["reflection"].contains("entries")) {
                 stage.reflection = value["reflection"].dump();
                 for (const nlohmann::json &entry : value["reflection"]["entries"]) {
@@ -525,8 +542,8 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                 auto profileStage = [&](const std::string &id, const char *profile) {
                     const auto found = bundle->stages.find(id);
                     return found != bundle->stages.end() && found->second.stage == "compute" &&
-                           found->second.autodiffProfile == profile &&
-                           found->second.autodiffProfilesIdentity == profiles.planIdentity;
+                           found->second.autodiff && found->second.autodiff->profile == profile &&
+                           found->second.autodiff->profilesIdentity == profiles.planIdentity;
                 };
                 if (profiles.key != variant.key || profiles.primal != variant.compute ||
                     profiles.primal == profiles.forwardWithTape || profiles.primal == profiles.backward ||
@@ -641,64 +658,61 @@ void vernonRuntimePipelineBundleDestroy(VernonPipelineBundle *bundle) {
 VernonLoadedPipeline *vernonRuntimeResolvePipeline(VernonPipelineBundle *bundle, VernonFeatureSetView features) {
     if (!bundle)
         return nullptr;
-    RuntimeDiagnosticScope diagnostic(bundle->context);
-    if (features.count && !features.names) {
-        invocationDiagnostic(*bundle->context) = "invalid pipeline feature set";
-        return nullptr;
-    }
-    std::vector<std::string> key;
-    for (size_t index = 0; index < features.count; ++index) {
-        if (!features.names[index]) {
+    try {
+        RuntimeDiagnosticScope diagnostic(bundle->context);
+        if (features.count && !features.names) {
             invocationDiagnostic(*bundle->context) = "invalid pipeline feature set";
             return nullptr;
         }
-        key.emplace_back(features.names[index]);
-    }
-    std::sort(key.begin(), key.end());
-    const auto found = std::find_if(bundle->variants.begin(), bundle->variants.end(),
-                                    [&](const Variant &variant) { return variant.key == key; });
-    if (found == bundle->variants.end()) {
-        fail(bundle->context, "pipeline bundle has no exact feature variant");
-        return nullptr;
-    }
-    auto pipeline = std::make_unique<VernonLoadedPipeline>();
-    pipeline->context = bundle->context;
-    pipeline->variant = *found;
-    if (bundle->autodiff) {
-        const auto profiles = std::find_if(bundle->autodiff->variants.begin(), bundle->autodiff->variants.end(),
-                                           [&](const AutodiffVariant &candidate) { return candidate.key == key; });
-        if (profiles == bundle->autodiff->variants.end()) {
-            fail(bundle->context, "autodiff profiles have no exact feature variant");
+        std::vector<std::string> key;
+        for (size_t index = 0; index < features.count; ++index) {
+            if (!features.names[index]) {
+                invocationDiagnostic(*bundle->context) = "invalid pipeline feature set";
+                return nullptr;
+            }
+            key.emplace_back(features.names[index]);
+        }
+        std::sort(key.begin(), key.end());
+        const auto found = std::find_if(bundle->variants.begin(), bundle->variants.end(),
+                                        [&](const Variant &variant) { return variant.key == key; });
+        if (found == bundle->variants.end()) {
+            fail(bundle->context, "pipeline bundle has no exact feature variant");
             return nullptr;
         }
-        const Stage &forward = bundle->stages.at(profiles->forwardWithTape);
-        const Stage &backward = bundle->stages.at(profiles->backward);
-        std::shared_ptr<vernon::runtime::ad::Executable> executable;
-        const bool resolved =
-            bundle->context->backend == VERNON_RUNTIME_CPU
-                ? vernon::runtime::ad::createCpuExecutable(*bundle->context, forward, backward,
-                                                           bundle->autodiff->gradientPaths, executable)
-                : vernon::runtime::ad::createGpuExecutable(*bundle, profiles->forwardWithTape, profiles->backward,
-                                                           bundle->autodiff->gradientPaths, profiles->launch,
-                                                           executable);
-        if (!resolved) {
-            const std::string message = invocationDiagnostic(*bundle->context);
-            fail(bundle->context, message);
-            return nullptr;
+        auto pipeline = std::make_unique<VernonLoadedPipeline>();
+        pipeline->context = bundle->context;
+        pipeline->variant = *found;
+        if (bundle->autodiff) {
+            const auto profiles = std::find_if(bundle->autodiff->variants.begin(), bundle->autodiff->variants.end(),
+                                               [&](const AutodiffVariant &candidate) { return candidate.key == key; });
+            if (profiles == bundle->autodiff->variants.end()) {
+                fail(bundle->context, "autodiff profiles have no exact feature variant");
+                return nullptr;
+            }
+            if (!vernon::runtime::ad::resolvePipelineAutodiff(*bundle, *profiles, *pipeline)) {
+                const std::string message = invocationDiagnostic(*bundle->context);
+                pipeline.reset();
+                fail(bundle->context, message);
+                return nullptr;
+            }
         }
-        pipeline->autodiff = VernonLoadedAutodiff{std::move(executable)};
-        if (bundle->context->backend != VERNON_RUNTIME_CPU && !vernon::runtime::ad::createImmediateGpuGraph(*pipeline))
+        for (Parameter &parameter : pipeline->variant.parameters) {
+            if (parameter.valueLayout)
+                rebuildValueLayoutPathViews(*parameter.valueLayout);
+            rebuildValueLayoutPathViews(parameter.elementLayout);
+        }
+        if (!resolveBackendPipeline(*bundle, *found, *pipeline))
             return nullptr;
+        ++bundle->context->livePipelines;
+        return pipeline.release();
+    } catch (const std::bad_alloc &) {
+        fail(bundle->context, "cannot allocate resolved pipeline", VERNON_STATUS_INTERNAL_ERROR);
+    } catch (const std::length_error &) {
+        fail(bundle->context, "resolved pipeline allocation is too large", VERNON_STATUS_INTERNAL_ERROR);
+    } catch (...) {
+        fail(bundle->context, "unexpected pipeline resolution failure", VERNON_STATUS_INTERNAL_ERROR);
     }
-    for (Parameter &parameter : pipeline->variant.parameters) {
-        if (parameter.valueLayout)
-            rebuildValueLayoutPathViews(*parameter.valueLayout);
-        rebuildValueLayoutPathViews(parameter.elementLayout);
-    }
-    if (!resolveBackendPipeline(*bundle, *found, *pipeline))
-        return nullptr;
-    ++bundle->context->livePipelines;
-    return pipeline.release();
+    return nullptr;
 }
 
 size_t vernonRuntimeLoadedPipelineGetParameterCount(const VernonLoadedPipeline *pipeline) {

@@ -4,6 +4,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAttributeAbi.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
@@ -17,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <optional>
@@ -26,6 +28,207 @@
 #include <utility>
 
 namespace vernon::compiler {
+
+mlir::FailureOr<LogicalReflectionModel> buildLogicalReflectionModel(mlir::ModuleOp module) {
+    LogicalReflectionModel model;
+    auto contract = module->getAttrOfType<mlir::IntegerAttr>("vernon.compiler_contract_version");
+    if (!contract || contract.getInt() != VERNON_COMPILER_CONTRACT_VERSION) {
+        module.emitError("cannot reflect a module with a missing or unsupported compiler contract version");
+        return mlir::failure();
+    }
+    model.compilerContractVersion = contract.getInt();
+    const auto collectValue = [](unsigned index, mlir::Type type, mlir::DictionaryAttr attributes, bool result) {
+        LogicalValueModel value;
+        value.index = index;
+        value.sourcePath = (result ? "result." : "argument.") + std::to_string(index);
+        if (attributes)
+            if (auto sourcePath = attributes.getAs<mlir::StringAttr>("vernon.source_name")) {
+                value.sourcePathExplicit = true;
+                value.sourcePath = sourcePath.getValue().str();
+            }
+        if (attributes)
+            if (auto dtype = attributes.getAs<mlir::StringAttr>("vernon.dtype")) {
+                value.dtypeExplicit = true;
+                value.dtype = dtype.getValue().str();
+            }
+        if (value.dtype.empty()) {
+            mlir::Type scalar = type;
+            if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(type))
+                scalar = shaped.getElementType();
+            else if (auto tensor = mlir::dyn_cast<mlir::vernon::TensorType>(type))
+                scalar = tensor.getElementType();
+            else if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(type))
+                scalar = view.getElementType();
+            if (scalar.isF16())
+                value.dtype = "f16";
+            else if (scalar.isF32())
+                value.dtype = "f32";
+            else if (scalar.isF64())
+                value.dtype = "f64";
+            else if (scalar.isInteger(1))
+                value.dtype = "bool";
+            else if (auto integer = mlir::dyn_cast<mlir::IntegerType>(scalar))
+                value.dtype = integer.isUnsigned() ? "u32" : "i32";
+            else if (scalar.isIndex())
+                value.dtype = "index";
+        }
+        if (attributes)
+            if (auto dtypes = attributes.getAs<mlir::ArrayAttr>("vernon.abi_leaf_dtypes"))
+                for (mlir::Attribute dtype : dtypes)
+                    if (auto string = mlir::dyn_cast<mlir::StringAttr>(dtype))
+                        value.leafDtypes.push_back(string.getValue().str());
+        if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(type))
+            for (int64_t extent : shaped.getShape())
+                value.shape.push_back(extent);
+        else if (auto tensor = mlir::dyn_cast<mlir::vernon::TensorType>(type))
+            for (int64_t extent : tensor.getShape())
+                value.shape.push_back(extent);
+        else if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(type))
+            for (int64_t extent : view.getShape())
+                value.shape.push_back(extent);
+        if (attributes)
+            if (auto shape = attributes.getAs<mlir::DenseI64ArrayAttr>("vernon.source_shape")) {
+                value.shapeExplicit = true;
+                value.shape.clear();
+                for (int64_t extent : shape.asArrayRef())
+                    value.shape.push_back(extent);
+            }
+        return value;
+    };
+    for (mlir::func::FuncOp function : module.getOps<mlir::func::FuncOp>()) {
+        auto stage = function->getAttrOfType<mlir::StringAttr>("vernon.stage");
+        if (!stage)
+            continue;
+        LogicalEntryModel entry;
+        entry.name = function.getSymName().str();
+        entry.stage = stage.getValue().str();
+        entry.isEntry = function->hasAttr("vernon.entry");
+        for (unsigned index = 0; index < function.getNumArguments(); ++index)
+            entry.arguments.push_back(
+                collectValue(index, function.getArgumentTypes()[index], function.getArgAttrDict(index), false));
+        for (unsigned index = 0; index < function.getNumResults(); ++index)
+            entry.results.push_back(
+                collectValue(index, function.getResultTypes()[index], function.getResultAttrDict(index), true));
+        std::set<std::string> argumentPaths;
+        for (const LogicalValueModel &value : entry.arguments)
+            if (value.sourcePathExplicit && !argumentPaths.insert(value.sourcePath).second) {
+                function.emitError() << "contains duplicate logical argument source path '" << value.sourcePath << "'";
+                return mlir::failure();
+            }
+        std::set<std::string> resultPaths;
+        for (const LogicalValueModel &value : entry.results)
+            if (value.sourcePathExplicit && !resultPaths.insert(value.sourcePath).second) {
+                function.emitError() << "contains duplicate logical result source path '" << value.sourcePath << "'";
+                return mlir::failure();
+            }
+        model.entries.push_back(std::move(entry));
+    }
+    std::map<std::string, LogicalStructLayout> structLayouts;
+    for (mlir::vernon::StructDeclOp declaration : module.getOps<mlir::vernon::StructDeclOp>()) {
+        auto structure = mlir::vernon::StructType::get(module.getContext(), declaration.getSymName());
+        mlir::FailureOr<mlir::vernon::ValueAbiLayout> planned = mlir::vernon::getValueAbiLayout(structure, module);
+        if (mlir::failed(planned)) {
+            declaration.emitError("cannot derive canonical struct Value ABI layout");
+            return mlir::failure();
+        }
+        LogicalStructLayout layout;
+        layout.name = declaration.getSymName().str();
+        layout.size = planned->size;
+        layout.alignment = planned->alignment;
+        llvm::append_range(layout.fieldOffsets, planned->fieldOffsets);
+        if (auto values = declaration->getAttrOfType<mlir::ArrayAttr>("fields"))
+            for (mlir::Attribute value : values)
+                if (auto field = mlir::dyn_cast<mlir::StringAttr>(value))
+                    layout.fields.push_back(field.getValue().str());
+        structLayouts.emplace(layout.name, std::move(layout));
+    }
+    for (auto &[name, layout] : structLayouts) {
+        (void)name;
+        model.structLayouts.push_back(std::move(layout));
+    }
+
+    if (auto encoded = module->getAttrOfType<mlir::ArrayAttr>("vernon.source_dependencies"))
+        for (mlir::Attribute attribute : encoded)
+            if (auto value = mlir::dyn_cast<mlir::StringAttr>(attribute)) {
+                auto [path, digest] = value.getValue().split('=');
+                model.dependencies.push_back({path.str(), digest.str()});
+            }
+
+    std::set<std::string> requiredFeatures;
+    module.walk([&](mlir::Operation *operation) {
+        if (mlir::isa<mlir::vernon::WorkgroupAllocOp>(operation))
+            requiredFeatures.insert("workgroup_storage");
+        if (mlir::isa<mlir::vernon::AtomicOp, mlir::vernon::PhysicalAtomicOp>(operation))
+            requiredFeatures.insert("atomics");
+        if (mlir::isa<mlir::vernon::BarrierOp>(operation))
+            requiredFeatures.insert("barriers");
+    });
+    llvm::append_range(model.requiredFeatures, requiredFeatures);
+
+    std::string canonicalModule;
+    llvm::raw_string_ostream moduleStream(canonicalModule);
+    module.print(moduleStream, mlir::OpPrintingFlags().enableDebugInfo(false));
+    model.moduleHash = llvm::utohexstr(llvm::xxHash64(canonicalModule));
+    return model;
+}
+
+std::vector<PhysicalEntryModel> buildPhysicalEntryModels(mlir::ModuleOp module,
+                                                         const std::vector<PhysicalEntryProvenance> &provenance) {
+    std::map<std::string, const PhysicalEntryProvenance *> provenanceEntries;
+    for (const PhysicalEntryProvenance &entry : provenance)
+        provenanceEntries.emplace(entry.name, &entry);
+    std::vector<PhysicalEntryModel> entries;
+    for (mlir::func::FuncOp function : module.getOps<mlir::func::FuncOp>()) {
+        auto stage = function->getAttrOfType<mlir::StringAttr>("vernon.stage");
+        if (!stage)
+            continue;
+        PhysicalEntryModel entry;
+        entry.name = function.getSymName().str();
+        entry.stage = stage.getValue().str();
+        const PhysicalEntryProvenance *entryProvenance = nullptr;
+        if (auto found = provenanceEntries.find(entry.name); found != provenanceEntries.end())
+            entryProvenance = found->second;
+        for (auto [index, type] : llvm::enumerate(function.getArgumentTypes())) {
+            PhysicalArgumentModel argument;
+            argument.index = index;
+            llvm::raw_string_ostream stream(argument.type);
+            type.print(stream);
+            if (auto builtin = function.getArgAttrOfType<mlir::StringAttr>(index, "vernon.builtin"))
+                argument.builtin = builtin.getValue().str();
+            if (entryProvenance && index < entryProvenance->arguments.size())
+                if (const std::optional<LogicalValueOrigin> &origin = entryProvenance->arguments[index]) {
+                    argument.logicalIndex = origin->index;
+                    argument.logicalPath = origin->path;
+                }
+            if (auto owner =
+                    function.getArgAttrOfType<mlir::IntegerAttr>(index, mlir::vernon::kTensorDescriptorOwnerAttrName))
+                if (owner.getInt() >= 0)
+                    argument.descriptorOwner = static_cast<unsigned>(owner.getInt());
+            if (auto component = function.getArgAttrOfType<mlir::StringAttr>(
+                    index, mlir::vernon::kTensorDescriptorComponentAttrName))
+                argument.descriptorComponent = component.getValue().str();
+            if (auto dimension = function.getArgAttrOfType<mlir::IntegerAttr>(
+                    index, mlir::vernon::kTensorDescriptorDimensionAttrName))
+                if (dimension.getInt() >= 0)
+                    argument.descriptorDimension = static_cast<unsigned>(dimension.getInt());
+            entry.arguments.push_back(std::move(argument));
+        }
+        for (auto [index, type] : llvm::enumerate(function.getResultTypes())) {
+            PhysicalResultModel result;
+            result.index = index;
+            llvm::raw_string_ostream stream(result.type);
+            type.print(stream);
+            if (entryProvenance && index < entryProvenance->results.size())
+                if (const std::optional<LogicalValueOrigin> &origin = entryProvenance->results[index]) {
+                    result.logicalIndex = origin->index;
+                    result.logicalPath = origin->path;
+                }
+            entry.results.push_back(std::move(result));
+        }
+        entries.push_back(std::move(entry));
+    }
+    return entries;
+}
 
 namespace {
 
@@ -235,7 +438,24 @@ analyzeSampledTextureBindings(mlir::func::FuncOp function) {
 
 } // namespace
 
-mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::ModuleOp sourceModule) {
+mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const LogicalReflectionModel &logical,
+                                             const std::vector<PhysicalEntryModel> &physicalEntries,
+                                             const std::vector<PhysicalEntryProvenance> &provenance) {
+    std::map<std::string, const LogicalEntryModel *> logicalEntries;
+    for (const LogicalEntryModel &entry : logical.entries)
+        logicalEntries.emplace(entry.name, &entry);
+    std::map<std::string, const PhysicalEntryModel *> physicalEntryTable;
+    for (const PhysicalEntryModel &entry : physicalEntries)
+        if (!physicalEntryTable.emplace(entry.name, &entry).second) {
+            module.emitError() << "duplicate physical entry model for '" << entry.name << "'";
+            return mlir::failure();
+        }
+    std::map<std::string, const PhysicalEntryProvenance *> provenanceTable;
+    for (const PhysicalEntryProvenance &entry : provenance)
+        if (!provenanceTable.emplace(entry.name, &entry).second) {
+            module.emitError() << "duplicate logical-to-physical provenance for '" << entry.name << "'";
+            return mlir::failure();
+        }
     auto scalarDtype = [](mlir::Type type) -> std::string {
         if (type.isF16())
             return "f16";
@@ -432,7 +652,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
         return mlir::failure();
     };
     llvm::json::Array entries;
-    std::set<std::string> requiredFeatures;
+    std::set<std::string> requiredFeatures(logical.requiredFeatures.begin(), logical.requiredFeatures.end());
     bool invalid = false;
     uint32_t nextGeneratedBinding = 0;
     module.walk([&](mlir::func::FuncOp function) {
@@ -450,6 +670,31 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
         auto stage = function->getAttrOfType<mlir::StringAttr>("vernon.stage");
         if (!stage)
             return;
+        auto physicalFound = physicalEntryTable.find(function.getSymName().str());
+        if (physicalFound == physicalEntryTable.end()) {
+            function.emitError("has no target-prepared physical entry model");
+            invalid = true;
+            return;
+        }
+        const PhysicalEntryModel &physicalEntry = *physicalFound->second;
+        if (physicalEntry.stage != stage.getValue() || physicalEntry.arguments.size() != function.getNumArguments() ||
+            physicalEntry.results.size() != function.getNumResults()) {
+            function.emitError("does not match its target-prepared physical entry model");
+            invalid = true;
+            return;
+        }
+        auto provenanceFound = provenanceTable.find(function.getSymName().str());
+        if (provenanceFound == provenanceTable.end() ||
+            provenanceFound->second->arguments.size() != function.getNumArguments() ||
+            provenanceFound->second->results.size() != function.getNumResults()) {
+            function.emitError("does not match its logical-to-physical provenance");
+            invalid = true;
+            return;
+        }
+        const PhysicalEntryProvenance &entryProvenance = *provenanceFound->second;
+        const LogicalEntryModel *logicalEntry = nullptr;
+        if (auto logicalFound = logicalEntries.find(function.getSymName().str()); logicalFound != logicalEntries.end())
+            logicalEntry = logicalFound->second;
         if (stage.getValue() == "compute")
             requiredFeatures.insert("compute");
 
@@ -518,7 +763,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
             uint32_t flattenedBinding = 0;
             for (unsigned index = 0; index < function.getNumArguments(); ++index) {
                 mlir::DictionaryAttr attrs = function.getArgAttrDict(index);
-                if (attrs.get("vernon.builtin"))
+                if (attrs.get("vernon.builtin") || attrs.get(mlir::vernon::kTensorDescriptorOwnerAttrName))
                     continue;
                 computeBindings[index] = flattenedBinding;
                 size_t leafCount = 1;
@@ -553,7 +798,73 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
             if (auto binding = attrs.getAs<mlir::IntegerAttr>("vernon.binding"))
                 nextBinding = std::max(nextBinding, static_cast<uint32_t>(binding.getInt() + 1));
         }
+        bool sawTensorDescriptorArgument = false;
         for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+            const PhysicalArgumentModel &physicalArgument = physicalEntry.arguments[index];
+            std::string physicalType;
+            llvm::raw_string_ostream physicalTypeStream(physicalType);
+            function.getArgumentTypes()[index].print(physicalTypeStream);
+            physicalTypeStream.flush();
+            auto builtin = function.getArgAttrOfType<mlir::StringAttr>(index, "vernon.builtin");
+            const auto descriptorOwner =
+                function.getArgAttrOfType<mlir::IntegerAttr>(index, mlir::vernon::kTensorDescriptorOwnerAttrName);
+            const auto descriptorComponent =
+                function.getArgAttrOfType<mlir::StringAttr>(index, mlir::vernon::kTensorDescriptorComponentAttrName);
+            const auto descriptorDimension =
+                function.getArgAttrOfType<mlir::IntegerAttr>(index, mlir::vernon::kTensorDescriptorDimensionAttrName);
+            const std::optional<unsigned> actualDescriptorOwner =
+                descriptorOwner && descriptorOwner.getInt() >= 0
+                    ? std::optional<unsigned>(static_cast<unsigned>(descriptorOwner.getInt()))
+                    : std::nullopt;
+            const std::optional<unsigned> actualDescriptorDimension =
+                descriptorDimension && descriptorDimension.getInt() >= 0
+                    ? std::optional<unsigned>(static_cast<unsigned>(descriptorDimension.getInt()))
+                    : std::nullopt;
+            if (physicalArgument.index != index || physicalArgument.type != physicalType ||
+                physicalArgument.builtin != (builtin ? builtin.getValue().str() : std::string()) ||
+                physicalArgument.descriptorOwner != actualDescriptorOwner ||
+                physicalArgument.descriptorComponent !=
+                    (descriptorComponent ? descriptorComponent.getValue().str() : std::string()) ||
+                physicalArgument.descriptorDimension != actualDescriptorDimension) {
+                function.emitError() << "argument #" << index << " does not match its physical entry model";
+                invalid = true;
+                return;
+            }
+            std::optional<unsigned> expectedLogicalIndex;
+            std::string expectedLogicalPath;
+            if (const std::optional<LogicalValueOrigin> &origin = entryProvenance.arguments[index]) {
+                expectedLogicalIndex = origin->index;
+                expectedLogicalPath = origin->path;
+                if (!logicalEntry || origin->index >= logicalEntry->arguments.size() ||
+                    logicalEntry->arguments[origin->index].sourcePath != origin->path) {
+                    function.emitError() << "argument #" << index << " has invalid logical provenance";
+                    invalid = true;
+                    return;
+                }
+            }
+            if (physicalArgument.logicalIndex != expectedLogicalIndex ||
+                physicalArgument.logicalPath != expectedLogicalPath) {
+                function.emitError() << "argument #" << index << " has a stale logical origin";
+                invalid = true;
+                return;
+            }
+            const LogicalValueModel *logicalValue = nullptr;
+            if (logicalEntry && physicalArgument.logicalIndex &&
+                *physicalArgument.logicalIndex < logicalEntry->arguments.size())
+                logicalValue = &logicalEntry->arguments[*physicalArgument.logicalIndex];
+            if (mlir::vernon::containsLogicalAutodiffHandle(function.getArgumentTypes()[index]))
+                continue;
+            if (function.getArgAttr(index, mlir::vernon::kTensorDescriptorOwnerAttrName) ||
+                function.getArgAttr(index, mlir::vernon::kTensorDescriptorComponentAttrName) ||
+                function.getArgAttr(index, mlir::vernon::kTensorDescriptorDimensionAttrName)) {
+                sawTensorDescriptorArgument = true;
+                continue;
+            }
+            if (sawTensorDescriptorArgument) {
+                function.emitError() << "contains a visible argument after projected TensorView descriptor arguments";
+                invalid = true;
+                return;
+            }
             llvm::json::Object argument;
             argument["index"] = static_cast<int64_t>(index);
             argument["kind"] = "scalar";
@@ -574,7 +885,10 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
                         }
                 return values;
             };
-            const llvm::SmallVector<llvm::StringRef> valueLogicalDtypes = leafDtypes("vernon.abi_leaf_dtypes");
+            llvm::SmallVector<llvm::StringRef> valueLogicalDtypes = leafDtypes("vernon.abi_leaf_dtypes");
+            if (valueLogicalDtypes.empty() && logicalValue)
+                for (const std::string &dtype : logicalValue->leafDtypes)
+                    valueLogicalDtypes.push_back(dtype);
             const llvm::SmallVector<llvm::StringRef> explicitElementLogicalDtypes =
                 leafDtypes("vernon.element_abi_leaf_dtypes");
             const llvm::ArrayRef<llvm::StringRef> interfaceLogicalDtypes =
@@ -583,9 +897,20 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
                     : llvm::ArrayRef<llvm::StringRef>(valueLogicalDtypes);
             llvm::json::Object physicalLayouts;
             uint64_t hostAlignment = 1;
+            const bool cpuOpaqueBuiltin = argumentType.isIndex() && argumentAttrs.get("vernon.builtin");
             mlir::FailureOr<mlir::vernon::CpuCallPlan> cpuValuePlan =
                 mlir::vernon::getCpuCallPlan(argumentType, module, valueLogicalDtypes);
-            if (mlir::succeeded(cpuValuePlan)) {
+            if (cpuOpaqueBuiltin) {
+                hostAlignment = alignof(uintptr_t);
+                argumentOffset = llvm::alignTo(argumentOffset, hostAlignment);
+                physicalLayouts["host_value"] = llvm::json::Object{
+                    {"profile", "host_value"},
+                    {"kind", "cpu_call"},
+                    {"frame_offset", static_cast<int64_t>(argumentOffset)},
+                    {"root", llvm::json::Object{{"size", static_cast<int64_t>(sizeof(uintptr_t))},
+                                                {"alignment", static_cast<int64_t>(hostAlignment)}}}};
+                argumentOffset += sizeof(uintptr_t);
+            } else if (mlir::succeeded(cpuValuePlan)) {
                 hostAlignment = cpuValuePlan->layout.alignment;
                 argumentOffset = llvm::alignTo(argumentOffset, cpuValuePlan->layout.alignment);
                 llvm::json::Object reflected = reflectCpuValuePlan(*cpuValuePlan);
@@ -649,6 +974,18 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
                     argument[attr.getName().strref().str()] = attributeToJson(attr.getValue());
                     if (attr.getName().strref() == "vernon.instance_divisor")
                         requiredFeatures.insert("instancing");
+                }
+            }
+            if (logicalValue) {
+                if (logicalValue->sourcePathExplicit)
+                    argument["vernon.source_name"] = logicalValue->sourcePath;
+                if (logicalValue->dtypeExplicit)
+                    argument["vernon.dtype"] = logicalValue->dtype;
+                if (logicalValue->shapeExplicit) {
+                    llvm::json::Array shape;
+                    for (int64_t extent : logicalValue->shape)
+                        shape.emplace_back(extent);
+                    argument["vernon.source_shape"] = std::move(shape);
                 }
             }
             if (auto generated = generatedUniformBindings.find(index); generated != generatedUniformBindings.end()) {
@@ -900,6 +1237,40 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
         llvm::json::Array results;
         uint64_t resultSize = 0;
         for (unsigned index = 0; index < function.getNumResults(); ++index) {
+            std::string physicalType;
+            llvm::raw_string_ostream physicalTypeStream(physicalType);
+            function.getResultTypes()[index].print(physicalTypeStream);
+            physicalTypeStream.flush();
+            const PhysicalResultModel &physicalResult = physicalEntry.results[index];
+            if (physicalResult.index != index || physicalResult.type != physicalType) {
+                function.emitError() << "result #" << index << " does not match its physical entry model";
+                invalid = true;
+                return;
+            }
+            std::optional<unsigned> expectedLogicalIndex;
+            std::string expectedLogicalPath;
+            if (const std::optional<LogicalValueOrigin> &origin = entryProvenance.results[index]) {
+                expectedLogicalIndex = origin->index;
+                expectedLogicalPath = origin->path;
+                if (!logicalEntry || origin->index >= logicalEntry->results.size() ||
+                    logicalEntry->results[origin->index].sourcePath != origin->path) {
+                    function.emitError() << "result #" << index << " has invalid logical provenance";
+                    invalid = true;
+                    return;
+                }
+            }
+            if (physicalResult.logicalIndex != expectedLogicalIndex ||
+                physicalResult.logicalPath != expectedLogicalPath) {
+                function.emitError() << "result #" << index << " has a stale logical origin";
+                invalid = true;
+                return;
+            }
+            const LogicalValueModel *logicalValue = nullptr;
+            if (logicalEntry && physicalResult.logicalIndex &&
+                *physicalResult.logicalIndex < logicalEntry->results.size())
+                logicalValue = &logicalEntry->results[*physicalResult.logicalIndex];
+            if (mlir::vernon::containsLogicalAutodiffHandle(function.getResultTypes()[index]))
+                continue;
             llvm::json::Object output;
             output["index"] = static_cast<int64_t>(index);
 
@@ -916,6 +1287,21 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
                         auto value = mlir::dyn_cast<mlir::StringAttr>(dtype);
                         logicalDtypes.push_back(value ? value.getValue() : llvm::StringRef());
                     }
+            if (logicalDtypes.empty() && logicalValue)
+                for (const std::string &dtype : logicalValue->leafDtypes)
+                    logicalDtypes.push_back(dtype);
+            if (logicalValue) {
+                if (logicalValue->sourcePathExplicit)
+                    output["vernon.source_name"] = logicalValue->sourcePath;
+                if (logicalValue->dtypeExplicit)
+                    output["vernon.dtype"] = logicalValue->dtype;
+                if (logicalValue->shapeExplicit) {
+                    llvm::json::Array shape;
+                    for (int64_t extent : logicalValue->shape)
+                        shape.emplace_back(extent);
+                    output["vernon.source_shape"] = std::move(shape);
+                }
+            }
             llvm::json::Object physicalLayouts;
             mlir::FailureOr<mlir::vernon::CpuCallPlan> cpuValuePlan =
                 mlir::vernon::getCpuCallPlan(resultType, module, logicalDtypes);
@@ -1050,74 +1436,42 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, mlir::Module
     llvm::json::Object root;
     root["compiler_contract_version"] = int64_t{VERNON_COMPILER_CONTRACT_VERSION};
     root["pipeline_version"] = int64_t{VERNON_PIPELINE_VERSION};
-    auto compilerContractVersion = sourceModule->getAttrOfType<mlir::IntegerAttr>("vernon.compiler_contract_version");
-    if (!compilerContractVersion || compilerContractVersion.getInt() != VERNON_COMPILER_CONTRACT_VERSION) {
-        sourceModule.emitError("cannot reflect a module with a missing or unsupported compiler contract version");
+    if (logical.compilerContractVersion != VERNON_COMPILER_CONTRACT_VERSION) {
+        module.emitError("cannot reflect a logical model with an unsupported compiler contract version");
         return mlir::failure();
     }
     root["entries"] = std::move(entries);
     root["artifacts"] = llvm::json::Array();
-    std::map<std::string, llvm::json::Object> structLayouts;
-    for (mlir::vernon::StructDeclOp declaration : sourceModule.getOps<mlir::vernon::StructDeclOp>()) {
-        auto structure = mlir::vernon::StructType::get(sourceModule.getContext(), declaration.getSymName());
-        mlir::FailureOr<mlir::vernon::ValueAbiLayout> planned =
-            mlir::vernon::getValueAbiLayout(structure, sourceModule);
-        if (mlir::failed(planned)) {
-            declaration.emitError("cannot derive canonical struct Value ABI layout");
-            return mlir::failure();
-        }
+    llvm::json::Array reflectedStructs;
+    for (const LogicalStructLayout &planned : logical.structLayouts) {
         llvm::json::Object layout;
-        layout["name"] = declaration.getSymName().str();
-        layout["size"] = static_cast<int64_t>(planned->size);
-        layout["alignment"] = static_cast<int64_t>(planned->alignment);
+        layout["name"] = planned.name;
+        layout["size"] = static_cast<int64_t>(planned.size);
+        layout["alignment"] = static_cast<int64_t>(planned.alignment);
         llvm::json::Array offsets;
-        for (uint64_t offset : planned->fieldOffsets)
+        for (uint64_t offset : planned.fieldOffsets)
             offsets.emplace_back(static_cast<int64_t>(offset));
         layout["field_offsets"] = std::move(offsets);
         llvm::json::Array fields;
-        if (auto values = declaration->getAttrOfType<mlir::ArrayAttr>("fields"))
-            for (mlir::Attribute value : values)
-                if (auto field = mlir::dyn_cast<mlir::StringAttr>(value))
-                    fields.emplace_back(field.getValue().str());
+        for (const std::string &field : planned.fields)
+            fields.emplace_back(field);
         layout["fields"] = std::move(fields);
-        structLayouts.emplace(declaration.getSymName().str(), std::move(layout));
-    }
-    llvm::json::Array reflectedStructs;
-    for (auto &[name, layout] : structLayouts) {
-        (void)name;
         reflectedStructs.emplace_back(std::move(layout));
     }
     root["struct_layouts"] = std::move(reflectedStructs);
     llvm::json::Array dependencies;
-    if (auto encoded = sourceModule->getAttrOfType<mlir::ArrayAttr>("vernon.source_dependencies")) {
-        for (mlir::Attribute attribute : encoded) {
-            auto value = mlir::dyn_cast<mlir::StringAttr>(attribute);
-            if (!value)
-                continue;
-            auto [path, digest] = value.getValue().split('=');
-            llvm::json::Object dependency;
-            dependency["path"] = path.str();
-            dependency["sha256"] = digest.str();
-            dependencies.emplace_back(std::move(dependency));
-        }
+    for (const LogicalDependency &value : logical.dependencies) {
+        llvm::json::Object dependency;
+        dependency["path"] = value.path;
+        dependency["sha256"] = value.sha256;
+        dependencies.emplace_back(std::move(dependency));
     }
     root["dependencies"] = std::move(dependencies);
-    sourceModule.walk([&](mlir::Operation *operation) {
-        if (mlir::isa<mlir::vernon::WorkgroupAllocOp>(operation))
-            requiredFeatures.insert("workgroup_storage");
-        if (mlir::isa<mlir::vernon::AtomicOp>(operation))
-            requiredFeatures.insert("atomics");
-        if (mlir::isa<mlir::vernon::BarrierOp>(operation))
-            requiredFeatures.insert("barriers");
-    });
     llvm::json::Array features;
     for (const std::string &feature : requiredFeatures)
         features.emplace_back(feature);
     root["required_features"] = std::move(features);
-    std::string canonicalModule;
-    llvm::raw_string_ostream moduleStream(canonicalModule);
-    sourceModule.print(moduleStream, mlir::OpPrintingFlags().enableDebugInfo(false));
-    root["module_hash"] = llvm::utohexstr(llvm::xxHash64(canonicalModule));
+    root["module_hash"] = logical.moduleHash;
 
     std::string output;
     llvm::raw_string_ostream stream(output);

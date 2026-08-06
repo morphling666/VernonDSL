@@ -10,6 +10,7 @@ add_mlir_library(
     VernonInlineHelpers.cpp
     VernonLowerAccumulation.cpp
     VernonLowerCPUABI.cpp
+    VernonLowerCPUAutodiff.cpp
     VernonLowerCPUResources.cpp
     VernonLowerCPUTensors.cpp
     VernonLowerCUDAMath.cpp
@@ -58,3 +59,5 @@ add_mlir_library(
     MLIRIR
     MLIRPass
     MLIRSupport)
+
+target_include_directories(MLIRVernonTransforms PRIVATE ${PROJECT_SOURCE_DIR}/source/lib)

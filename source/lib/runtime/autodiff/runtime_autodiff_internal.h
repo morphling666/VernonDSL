@@ -35,9 +35,9 @@ inline bool sameValueAbi(const ValueAbi &left, const ValueAbi &right) {
 
 struct Signature {
     std::vector<ValueAbi> inputs;
-    ValueAbi output;
+    std::vector<ValueAbi> outputs;
     std::vector<ValueAbi> tape;
-    ValueAbi cotangent;
+    std::vector<ValueAbi> cotangents;
     std::vector<ValueAbi> gradients;
 };
 
@@ -111,15 +111,20 @@ bool makeCotangentBytes(const VernonAdValueSet *cotangents, const ValueAbi &abi,
 
 bool createCpuExecutable(VernonRuntimeContext &context, const Stage &forward, const Stage &backward,
                          const std::vector<std::string> &gradientPaths, std::shared_ptr<Executable> &executable);
+bool createLegacyCpuExecutable(VernonRuntimeContext &context, const Stage &forward, const Stage &backward,
+                               const std::vector<std::string> &gradientPaths, std::shared_ptr<Executable> &executable);
 bool createCpuEntryExecutable(VernonRuntimeContext &context, VernonCpuEntryPoint forwardEntry,
                               VernonStringView forwardReflection, VernonStringView forwardName,
                               VernonCpuEntryPoint backwardEntry, VernonStringView backwardReflection,
-                              VernonStringView backwardName, const std::vector<std::string> &gradientPaths,
+                              VernonStringView backwardName, VernonStringView forwardProtocol,
+                              VernonStringView backwardProtocol, const std::vector<std::string> &gradientPaths,
                               std::shared_ptr<Executable> &executable);
 bool createGpuExecutable(VernonPipelineBundle &bundle, const std::string &forwardId, const std::string &backwardId,
                          const std::vector<std::string> &gradientPaths, const AutodiffLaunchPlan &launch,
                          std::shared_ptr<Executable> &executable);
 bool createImmediateGpuGraph(VernonLoadedPipeline &pipeline);
+bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffVariant &profiles,
+                             VernonLoadedPipeline &pipeline);
 
 } // namespace vernon::runtime::ad
 

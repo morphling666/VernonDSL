@@ -13,5 +13,5 @@ def mutate(
 
 asset = vd.pipeline_asset(
     id="compute/storage-vjp",
-    program=vd.ad.vjp(mutate, wrt=("scale", "values")),
+    program=vd.ad.vjp(mutate, wrt=("scale", "values"), protocol="legacy_fixed"),
 )

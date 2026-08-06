@@ -19,6 +19,8 @@ class _CompiledDirectVjp:
     primal_symbol: str
     forward_symbol: str
     backward_symbol: str
+    forward_protocol: str
+    backward_protocol: str
     gradient_paths: tuple[str, ...]
     user_parameters: tuple[str, ...]
     pipeline: Any
@@ -63,6 +65,8 @@ def _load(compiled: _CompiledDirectVjp, runtime_state: Any) -> None:
         compiled.forward_symbol,
         compiled.backward,
         compiled.backward_symbol,
+        compiled.forward_protocol,
+        compiled.backward_protocol,
         list(compiled.gradient_paths),
     )
     compiled.runtime_generation = runtime_state._runtime_generation
@@ -76,6 +80,8 @@ def execute_direct_vjp(
     kernel = expression.program
     if not isinstance(kernel, Kernel):
         raise TypeError("direct VJP execution requires one compute Kernel")
+    if expression.transform.protocol != "dynamic_v2":
+        raise RuntimeError("direct structured VJP execution requires protocol='dynamic_v2'")
     runtime_state = _session_state()
     if runtime_state._architecture != runtime_state.cpu:
         raise RuntimeError("direct structured VJP execution currently supports only the CPU runtime")
@@ -123,6 +129,8 @@ def execute_direct_vjp(
             primal_symbol=structured.entry.symbol,
             forward_symbol=profiles["forward_with_tape"].symbol,
             backward_symbol=profiles["backward"].symbol,
+            forward_protocol=structured.protocols["forward_with_tape"],
+            backward_protocol=structured.protocols["backward"],
             gradient_paths=structured.transform.wrt,
             user_parameters=tuple(argument.arg for argument in function.args.args if argument.arg not in builtins),
             pipeline=None,

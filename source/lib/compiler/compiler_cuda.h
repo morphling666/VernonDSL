@@ -10,6 +10,7 @@ namespace vernon::compiler {
 
 class PreparedModule;
 
-bool compileCuda(PreparedModule &prepared, std::vector<Artifact> &artifacts, std::string &diagnostics);
+bool compileCuda(PreparedModule &prepared, std::vector<Artifact> &artifacts, std::string &reflection,
+                 std::string &diagnostics);
 
 } // namespace vernon::compiler

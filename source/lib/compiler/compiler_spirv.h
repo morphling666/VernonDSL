@@ -22,6 +22,6 @@ namespace vernon::compiler {
 class PreparedModule;
 
 bool compileSpirv(PreparedModule &prepared, VernonTarget target, std::vector<Artifact> &artifacts,
-                  std::string &diagnostics);
+                  std::string &reflection, std::string &diagnostics);
 
 } // namespace vernon::compiler

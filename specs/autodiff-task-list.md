@@ -12,8 +12,16 @@ track completion:
   defines compiler component boundaries and reusable differentiation rules.
 - [`gpu-autodiff-responsibility-architecture.md`](gpu-autodiff-responsibility-architecture.md)
   defines the GPU physical ABI and Runtime ownership boundary.
+- [`cpu-dynamic-tape-architecture.md`](cpu-dynamic-tape-architecture.md)
+  defines the authoritative Phase 8 CPU tape, lowering, target-preparation,
+  transaction, and cross-backend boundaries.
 - [`autodiff-implementation-status.md`](autodiff-implementation-status.md)
   records the current implemented-behavior snapshot.
+
+Where the older phase wording in this checklist differs from the CPU dynamic
+tape architecture, the latter is authoritative. This checklist must express
+that architecture without moving CPU callback or host tape details into later
+GPU phases.
 
 The public transform remains VJP-only during this migration. JVP and
 higher-order AD reuse the shared analysis and rule registry later, but do not
@@ -28,8 +36,9 @@ until the next release.
 - Check a phase gate only when every preceding item in that phase is checked.
 - Run formatting tools through `.venv`.
 - Use one `*build/` directory at a time and run build/test stages sequentially.
-- Keep the existing Python/native path until CPU, Metal, and Vulkan have
-  numerical and failure-path parity.
+- Keep separately identified legacy non-structured Python/native profiles until
+  CPU, Metal, and Vulkan have numerical and failure-path parity. Structured CPU
+  profiles must not guess, fall back to, or share a loader with that path.
 - Never silently fall back from structured AD to legacy native AD.
 - Treat all allocation, alignment, offset, counter, and size arithmetic as
   checked, fail-closed operations.
@@ -267,7 +276,8 @@ Implementation:
 - [x] Emit the existing `primal`, `forward_with_tape`, and `backward` profile
   names and metadata without a contract version change.
 - [x] Route eligible CPU scalar cooks through structured compilation by
-  default, with explicit capability dispatch for paths not yet migrated.
+  default; identify paths not yet migrated as separate non-structured
+  profiles rather than fallback candidates.
 - [x] Do not catch structured transform failure to invoke legacy emission.
 - [x] Reuse one structured profile builder for cooked and direct execution.
 - [x] Compile and load direct Python CPU VJP profiles in memory without cooking
@@ -275,7 +285,8 @@ Implementation:
 - [x] Retain compiled profile ownership and invalidate loaded profiles across
   source dependency changes and Runtime recreation.
 - [x] Derive cotangent and gradient ABI metadata from promoted derivative types.
-- [x] Keep legacy CPU VJP cooking tractable during migration by merging
+- [x] Keep separately identified legacy non-structured CPU VJP cooking
+  tractable during migration by merging
   adjoints before reverse-topological propagation, so shared semantic DAG nodes
   are emitted once instead of being recursively expanded per use path.
 
@@ -345,40 +356,176 @@ Gate:
 
 Primary files:
 
-- new CPU AD lowering pass
+- `source/lib/runtime/autodiff/tape_allocator_abi.h`
+- `source/lib/runtime/autodiff/host_tape_allocator.{h,cpp}`
+- `source/lib/runtime/autodiff/host_effect_transaction.h`
+- `source/include/mlir/Dialect/Vernon/Transforms/VernonLowerCPUAutodiff.h`
+- `source/lib/Dialect/Vernon/Transforms/VernonLowerCPUAutodiff.cpp`
+- `source/lib/Dialect/Vernon/Transforms/VernonCpuPipeline.cpp`
+- `source/lib/compiler/compiler_{frontend,cpu,dispatch,spirv,cuda}.cpp`
 - `source/lib/runtime/autodiff/runtime_autodiff_cpu.cpp`
 - `source/lib/runtime/autodiff/runtime_autodiff_internal.h`
 
-Implementation:
+Semantic CPU ABI and Runtime tape ownership:
 
-- [ ] Implement Runtime-owned `HostDynamicTape` using checked
-  `std::vector<std::byte>` growth.
-- [ ] Lower logical tape operations through the hidden allocator descriptor.
-- [ ] Grow tape during one CPU forward execution without replaying the primal.
-- [ ] Read dynamic region headers and records during backward execution.
-- [ ] Replace fixed forward-result-leaf to backward-argument tape copying for
-  structured profiles.
-- [ ] Defer or functionalize Storage and observable output effects during
-  capture.
-- [ ] Commit visible effects exactly once after successful capture.
-- [ ] Transfer successful tape ownership to the pullback.
-- [ ] Keep the tape immutable and reusable across pullback applications.
-- [ ] Release tape ownership when the pullback is destroyed.
+- [x] Freeze host-only allocator ABI v2 with named semantic capture/read
+  callbacks, versioned layout, C compatibility, and C++ layout assertions.
+- [x] Define failure latching, exact required-byte accounting, checked
+  alignment/size arithmetic, thread ownership, reset, and handle lifetime.
+- [x] Implement Runtime-owned `HostDynamicTape` with checked
+  `std::vector<std::byte>` payload growth and private typed region/record
+  metadata.
+- [x] Provide O(1) region, record, child, and leaf lookup without generated
+  code observing snapshot representation.
+- [x] Seal and validate all relationships before moving storage into an
+  immutable `HostTapeSnapshot`.
+- [x] Add context-owned per-invocation and total `HostTapeMemoryPolicy`
+  budgets; retain and release policy charge with live snapshots.
+- [x] Transfer one successful snapshot to the pullback, reuse it across
+  pullback applications, and release it with pullback destruction.
 
-Acceptance:
+Typed CPU preparation:
 
-- [ ] Test zero, one, long, and nested dynamic loops end to end on CPU.
-- [ ] Compare every structured control-flow path, including break, return, and
-  loop-else exits, with the CPU reference oracle.
-- [ ] Test allocator rejection and process memory-policy rejection.
-- [ ] Test no visible Storage/output change after failed capture.
-- [ ] Test successful execution commits once.
-- [ ] Test repeated pullback application against one stable tape snapshot.
+- [x] Delete the embedded LLVM helper and old `__vernon_cpu_ad_*` symbol path.
+- [x] Add explicit `VernonPrepareCPUAutodiffSignatures`,
+  `VernonLowerCPUAutodiff`, and `VernonCPUAutodiffToLLVM` stages.
+- [x] Lower logical operations to `vernon.cpu_ad.callback` operations before
+  the final semantic callback-to-LLVM conversion.
+- [x] Keep callback-table field mapping in the CPU ABI conversion stage and
+  reject malformed callback signatures during conversion.
+- [x] Prove CPU preparation removes logical tape handles and all CPU physical
+  callback operations before ordinary CPU lowering completes.
+- [x] Grow tape during one CPU forward execution without replaying the primal,
+  then read dynamic regions and records during backward execution.
+- [x] Complete per-logical-operation conversion tests for malformed typed CPU
+  callbacks, missing callback entries, and unsupported payload types.
+
+Single-run preparation and reflection:
+
+- [x] Separate the target-neutral compiler module from the inlined logical
+  reflection input and give the latter an explicit `LogicalReflectionModel`
+  owner.
+- [x] Run target physical preparation once per compilation and derive
+  reflection and code generation from the same prepared module.
+- [x] Keep target-specific capability validation on the target-neutral logical
+  module instead of storing target-policy error strings in reflection data or
+  running physical projection a second time.
+- [x] Preserve non-AD CPU, Vulkan, Metal, and CUDA reflection/codegen behavior.
+- [x] Keep logical profiles free of CPU builtin, callback, pointer, and LLVM
+  details so a later GPU preparer consumes the same logical boundary.
+- [x] Replace the current cloned-module reflection carrier with the
+  data-only `LogicalReflectionModel` required by the dynamic-tape architecture.
+- [x] Introduce the shared target-preparation result containing one prepared
+  module and one explicit `PhysicalEntryModel`.
+- [x] Route CPU, Vulkan/Metal SPIR-V, and CUDA compilation through the shared
+  single-run target-preparation entry point.
+- [x] Record physical argument/result logical indices and paths plus TensorView
+  descriptor owner/component/dimension metadata in `PhysicalEntryModel`, and
+  reject stale model/type/descriptor mismatches during reflection.
+- [x] Remove `requiresTargetPreparedReflection` and the remaining frontend
+  AD-specific reflection-order exception.
+- [x] Replace post-preparation `vernon.source_name` origin reconstruction with
+  an explicit logical-to-physical provenance mapping owned and updated by the
+  target preparer; the internal preparation contract now carries stable
+  argument/result origins across arbitrary signature rewrites and validates
+  them independently from physical entry structure.
+- [x] Document and test the intentional reflection-shape distinction:
+  validation exposes all canonical physical profiles while target compilation
+  exposes only the selected target profile; shared logical metadata must remain
+  identical.
+
+Effect transaction and protocol separation:
+
+- [x] Implement `HostEffectTransaction` with capturing, committed, and
+  discarded states.
+- [x] Shadow writable/read-write Storage and observable output during capture;
+  initialize preserved shadows from original bytes.
+- [x] Isolate read-only TensorViews from entry-side mutation and never copy
+  their shadows back.
+- [x] Validate writable overlap before dispatch and discard every shadow after
+  allocator, entry, sealing, snapshot, policy, or allocation failure.
+- [x] Commit external Storage/output exactly once only after successful
+  capture, snapshot transfer, and allocation of the public pullback handle and
+  context lease.
+- [x] Stage gradient accumulation in temporary buffers and commit user gradient
+  destinations only after every backward invocation succeeds.
+- [x] Contain allocation, length, and unexpected C++ exceptions at public
+  forward, pullback, direct-CPU, and pipeline-resolution boundaries; make
+  Runtime diagnostic scope construction/destruction non-throwing.
+- [x] Share CPU forward validation, input staging, invocation, effect
+  transaction, output commit, and pullback finalization between `dynamic_v2`
+  and `legacy_fixed`; keep only their tape strategies separate.
+- [x] Remove test-only Runtime options, commit counters, and traversal
+  statistics from production types.
+- [x] Require explicit `dynamic_v2` structured profiles and reject missing,
+  mixed, or layout-incompatible protocols before loading artifacts.
+- [x] Remove automatic structured-to-legacy cooking fallback; retain any
+  consumed `legacy_fixed` non-structured profile behind its separately named
+  loader.
+- [x] Keep protocol selection as compile-time physical-profile metadata
+  without changing compiler contract version 10 or pipeline contract version
+  13.
+- [x] Restore compatibility for previously valid pipeline-v13 AD manifests
+  whose `program_transform` identity predates the required `protocol` member;
+  absent protocol preserves the original identity and selects the historical
+  `legacy_fixed` protocol without a pipeline contract bump.
+
+Canonical Runtime ABI reuse:
+
+- [x] Reuse the common manifest `ValueLayout` parser and canonical element ABI
+  for CPU AD TensorViews instead of defining an AD-only scalar layout.
+- [x] Pack and flush multi-leaf aggregate TensorView elements by canonical leaf
+  path, dtype, shape, scalar count, byte offset, byte size, and alignment.
+- [x] Validate complete leaf extents, alignment, overlap, duplicate paths, and
+  path components before any TensorView shadow is allocated or dispatched.
+- [x] Separate absolute host-frame leaf offsets from element-relative
+  TensorView leaf offsets in the Runtime host model.
+- [x] Represent AD outputs and cotangents as leaf collections in the shared
+  Runtime signature while retaining an explicit one-output Phase 8 execution
+  restriction.
+- [x] Lazily create the CPU tape memory policy so ordinary non-AD Runtime
+  contexts do not allocate AD state.
+
+Numerical, failure, complexity, and boundary acceptance:
+
+- [x] Test zero, one, medium, long (at least 1500), nested, and three-level
+  dynamic loops end to end through Python and the native CPU Runtime.
+- [x] Compare structured break, continue, return, loop-else, shared-branch,
+  and multiple-`wrt` paths with an independent pure-Python primal and centered
+  finite differences.
+- [x] Test non-unit cotangents and repeated pullback application against one
+  stable immutable snapshot.
+- [x] Add the architecture-specified fixed-seed random-cotangent identity
+  matrix across the complex control-flow cases.
+- [x] Cover fixed-seed random primal samples plus valid near-boundary and
+  singular scalar behavior for division, log, sqrt, acos, abs, and pow,
+  including signed infinity, NaN propagation, and non-unit cotangents.
+- [x] Test that external input mutation after forward does not change the
+  captured pullback.
+- [x] Test capacity, per-invocation policy, total policy, arithmetic,
+  malformed/foreign handle, invalid-state, and partial-capture failures.
+- [x] Test byte-for-byte unchanged Storage/output after failure, read-only
+  isolation, discard behavior, and exactly-one successful commit.
+- [x] Test indexed long-region reads and keep Runtime lookup tables O(1).
+- [x] Add non-production instrumentation that proves approximately linear
+  backward record traversal rather than merely counting requested reads.
+- [x] Prove logical profiles have no CPU physical contract and CPU prepared
+  profiles have no logical tape contract.
+- [x] Add the architecture-required mock GPU target-preparer test that
+  materializes a resource signature from the same logical profile without
+  linking the CPU Runtime.
+- [x] Run the complete 279-target CTest suite and 412-test Python suite with
+  CPU, Vulkan, and Metal coverage; unavailable CUDA/OpenGL-family hardware
+  tests remain explicit skips rather than fallback paths.
 
 Gate:
 
-- [ ] Structured CPU VJP has dynamic control-flow and failure-path parity with
+- [x] Structured CPU VJP has dynamic control-flow and failure-path parity with
   the architecture contract.
+- [x] Phase 8 is commit-ready after stable target-preparer provenance,
+  pipeline-v13 backward compatibility, documented reflection-shape parity, and
+  final full-suite verification of the public-handle/diagnostic exception
+  fixes.
 
 ## Phase 9 — Aggregate and Storage parity
 
@@ -417,8 +564,9 @@ Primary files:
 
 Implementation:
 
-- [ ] Make target preparation produce one target-prepared module consumed by
-  both reflection and code generation.
+- [ ] Consume the Phase 8 single-run target-preparation interface for GPU and
+  produce one GPU-prepared module consumed by both reflection and code
+  generation.
 - [ ] Make `VernonLowerGPUAutodiff` the sole owner of GPU AD physical-boundary
   materialization.
 - [ ] Convert logical tape handles to ordinary status and dynamic-tape
@@ -568,6 +716,10 @@ Gate:
 ## Phase 15 — Legacy removal
 
 Prerequisite: CPU, Metal, and Vulkan numerical and failure-path parity.
+
+Phase 8 already removes fixed-tape compatibility from structured CPU profiles.
+This phase removes the remaining separately identified non-structured
+Python/native profiles after cross-backend migration completes.
 
 Implementation:
 

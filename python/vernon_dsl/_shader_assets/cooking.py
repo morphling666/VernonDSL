@@ -198,6 +198,7 @@ def cook_pipeline_asset(
             gradient_policy=str(transform_values["gradient_policy"]),
             accumulation_policy=str(transform_values["accumulation_policy"]),
             tape_policy=str(transform_values["tape_policy"]),
+            protocol=str(transform_values.get("protocol", "dynamic_v2")),
             derivative_rules_version=int(transform_values["derivative_rules_version"]),
         )
     for variant in pipeline.variants:
@@ -233,18 +234,20 @@ def cook_pipeline_asset(
                         variant,
                     )
                 )
-            if frontend is not None and is_structured_scalar_vjp_abi_eligible(frontend, transform):
+            if transform.protocol == "dynamic_v2":
+                if frontend is None or not is_structured_scalar_vjp_abi_eligible(frontend, transform):
+                    raise PipelineCompileError(
+                        "dynamic_v2 requires a structured scalar CPU VJP; "
+                        "use protocol='legacy_fixed' only for an explicitly identified native profile"
+                    )
                 try:
                     structured = build_structured_scalar_vjp(native, frontend, transform)
                 except ValueError as error:
                     raise PipelineCompileError(str(error)) from None
-                if structured.uses_dynamic_tape:
-                    raise PipelineCompileError(
-                        "structured CPU VJP requires dynamic tape lowering before profile compilation"
-                    )
                 variant_transform = structured.transform
                 profile_plan = structured.plan
                 profile_modules = structured.profiles
+                profile_protocol = "dynamic_v2"
             else:
                 from ..frontend.autodiff_native import (
                     AutodiffNativeLoweringError,
@@ -274,6 +277,7 @@ def cook_pipeline_asset(
                     )
                 except AutodiffNativeLoweringError as error:
                     raise PipelineCompileError(str(error)) from None
+                profile_protocol = "legacy_fixed"
             if resolved_transform is None:
                 resolved_transform = variant_transform
             elif resolved_transform.output_cotangents != variant_transform.output_cotangents:
@@ -318,6 +322,7 @@ def cook_pipeline_asset(
                     {
                         **dict(profile_stage.metadata),
                         "autodiff_profile": profile_name,
+                        "autodiff_protocol": profile_protocol,
                         "autodiff_profiles_identity": profile_plan.identity,
                     },
                 )

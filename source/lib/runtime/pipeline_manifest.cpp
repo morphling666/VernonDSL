@@ -491,6 +491,7 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
 }
 
 bool parseValueLayout(const nlohmann::json &value, ValueLayout &layout, std::string &error) {
+    layout = {};
     uint64_t byteSize = 0;
     uint64_t alignment = 0;
     if (!value.is_object() || !value.contains("logical_type") || !value["logical_type"].is_string() ||
@@ -510,6 +511,8 @@ bool parseValueLayout(const nlohmann::json &value, ValueLayout &layout, std::str
         error = "element_layout contains invalid type, hash, or alignment";
         return false;
     }
+    std::vector<std::pair<uint64_t, uint64_t>> leafRanges;
+    std::set<std::string> leafPaths;
     for (const nlohmann::json &leaf : value["leaves"]) {
         uint64_t scalarCount = 0;
         uint64_t byteOffset = 0;
@@ -522,25 +525,64 @@ bool parseValueLayout(const nlohmann::json &value, ValueLayout &layout, std::str
         }
         const std::string dtype = leaf["dtype"].get<std::string>();
         const auto parsedDtype = pipelineDataType(dtype);
-        if (!parsedDtype || byteOffset >= byteSize) {
+        const auto scalarSize = [&]() -> uint64_t {
+            if (!parsedDtype)
+                return 0;
+            switch (*parsedDtype) {
+            case VERNON_DATA_BOOL:
+            case VERNON_DATA_U8:
+                return 1;
+            case VERNON_DATA_F16:
+                return 2;
+            case VERNON_DATA_I32:
+            case VERNON_DATA_U32:
+            case VERNON_DATA_F32:
+                return 4;
+            case VERNON_DATA_F64:
+                return 8;
+            default:
+                return 0;
+            }
+        }();
+        if (!scalarSize || byteOffset >= byteSize || scalarCount > UINT64_MAX / scalarSize ||
+            scalarCount * scalarSize > byteSize - byteOffset || byteOffset % scalarSize != 0) {
             error = "element_layout leaf has unsupported dtype or byte offset";
             return false;
         }
+        const uint64_t byteEnd = byteOffset + scalarCount * scalarSize;
+        for (const auto &[existingBegin, existingEnd] : leafRanges)
+            if (byteOffset < existingEnd && existingBegin < byteEnd) {
+                error = "element_layout semantic leaves overlap";
+                return false;
+            }
+        leafRanges.emplace_back(byteOffset, byteEnd);
         ValueLeaf parsedLeaf;
         parsedLeaf.dtype = dtype;
         parsedLeaf.scalarCount = static_cast<uint32_t>(scalarCount);
         parsedLeaf.byteOffset = static_cast<uint32_t>(byteOffset);
+        std::string canonicalPath;
         for (const nlohmann::json &component : leaf["path"]) {
-            if (component.is_string())
-                parsedLeaf.path.push_back({component.get<std::string>(), 0});
-            else {
+            if (component.is_string()) {
+                const std::string field = component.get<std::string>();
+                if (field.empty() || field.find('.') != std::string::npos) {
+                    error = "element_layout field path components must be non-empty and cannot contain '.'";
+                    return false;
+                }
+                canonicalPath += "f" + std::to_string(field.size()) + ":" + field + ";";
+                parsedLeaf.path.push_back({field, 0});
+            } else {
                 uint64_t index = 0;
                 if (!parseUint64(component, index)) {
                     error = "element_layout leaf path components must be field names or unsigned indices";
                     return false;
                 }
+                canonicalPath += "i" + std::to_string(index) + ";";
                 parsedLeaf.path.push_back({std::nullopt, index});
             }
+        }
+        if (!leafPaths.insert(std::move(canonicalPath)).second) {
+            error = "element_layout semantic leaf paths are not unique";
+            return false;
         }
         if (leaf.contains("shape")) {
             if (!leaf["shape"].is_array()) {
@@ -1424,14 +1466,17 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
         return std::is_sorted(result.begin(), result.end()) &&
                std::adjacent_find(result.begin(), result.end()) == result.end();
     };
+    const bool hasProtocol = transform.contains("protocol");
     if (!transform.is_object() ||
         !hasOnlyKeys(transform,
                      {"kind", "wrt", "output_cotangents", "gradient_policy", "accumulation_policy", "tape_policy",
-                      "derivative_rules_version", "identity", "rule_set", "rule_set_identity"}) ||
+                      "protocol", "derivative_rules_version", "identity", "rule_set", "rule_set_identity"}) ||
         transform.value("kind", "") != "vjp" || !transform.contains("wrt") || !transform["wrt"].is_array() ||
         !transform.contains("output_cotangents") || !transform["output_cotangents"].is_array() ||
         transform.value("gradient_policy", "") != "f16:f32,f32:f32,f64:f64" ||
         transform.value("accumulation_policy", "") != "fresh" || transform.value("tape_policy", "") != "bounded" ||
+        (hasProtocol && transform.value("protocol", "") != "dynamic_v2" &&
+         transform.value("protocol", "") != "legacy_fixed") ||
         transform.value("derivative_rules_version", 0) != 1 || !verifyIdentity(transform, "program transform")) {
         if (error.empty())
             error = "pipeline program_transform is invalid";
@@ -1464,6 +1509,9 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
         return false;
     }
     manifest.transformIdentity = transform["identity"].get<std::string>();
+    // Pipeline contract v13 predates the protocol member. Such manifests use
+    // the fixed-tape ABI; preserving their original identity is mandatory.
+    manifest.protocol = hasProtocol ? transform["protocol"].get<std::string>() : "legacy_fixed";
     if (!profiles.is_object() || !hasOnlyKeys(profiles, {"identity", "variants"}) || !profiles.contains("variants") ||
         !profiles["variants"].is_array() || !verifyIdentity(profiles, "autodiff profiles")) {
         if (error.empty())

@@ -17,6 +17,7 @@
 #include <string>
 
 namespace vernon::compiler {
+
 namespace {
 
 std::string copyStringView(VernonStringView value) {
@@ -45,15 +46,37 @@ VernonTargetCapabilities queryTargetCapabilities(VernonTarget target) {
 }
 
 bool validateTargetCapabilities(PreparedModule &prepared, VernonTarget target, std::string &diagnostics) {
-    mlir::OwningOpRef<mlir::ModuleOp> module = prepared.clone();
+    mlir::ModuleOp module = prepared.logicalModule();
+    const VernonTargetCapabilities capabilities = queryTargetCapabilities(target);
     bool usesDeviceAtomics = false;
     bool usesFloatDeviceAtomics = false;
-    module->walk([&](mlir::vernon::PhysicalAtomicOp atomic) {
-        auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(atomic.getStorage().getType());
-        usesDeviceAtomics |= view && view.getAddressSpace() == "device";
-        usesFloatDeviceAtomics |= view && view.getAddressSpace() == "device" && view.getElementType().isF32();
+    bool cpuSynchronizationUnsupported = false;
+    bool cudaDeviceBarrier = false;
+    module.walk([&](mlir::Operation *operation) {
+        mlir::Value atomicStorage;
+        if (auto atomic = mlir::dyn_cast<mlir::vernon::AtomicOp>(operation))
+            atomicStorage = atomic.getStorage();
+        else if (auto atomic = mlir::dyn_cast<mlir::vernon::PhysicalAtomicOp>(operation))
+            atomicStorage = atomic.getStorage();
+        if (atomicStorage) {
+            auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(atomicStorage.getType());
+            usesDeviceAtomics |= view && view.getAddressSpace() == "device";
+            usesFloatDeviceAtomics |= view && view.getAddressSpace() == "device" && view.getElementType().isF32();
+            if (!view)
+                cpuSynchronizationUnsupported = true;
+            if (view && view.getAddressSpace() == "device")
+                return;
+        }
+        if (mlir::isa<mlir::vernon::WorkgroupAllocOp, mlir::vernon::AtomicOp, mlir::vernon::PhysicalAtomicOp,
+                      mlir::vernon::BarrierOp>(operation)) {
+            mlir::func::FuncOp function = operation->getParentOfType<mlir::func::FuncOp>();
+            auto size = function ? function->getAttrOfType<mlir::DenseI32ArrayAttr>("vernon.workgroup_size") : nullptr;
+            cpuSynchronizationUnsupported |= !size || size.size() != 3 || size[0] != 1 || size[1] != 1 || size[2] != 1;
+        }
+        if (auto barrier = mlir::dyn_cast<mlir::vernon::BarrierOp>(operation);
+            barrier && barrier.getScope() == "device")
+            cudaDeviceBarrier = true;
     });
-    const VernonTargetCapabilities capabilities = queryTargetCapabilities(target);
     if (usesFloatDeviceAtomics && !capabilities.supports_f32_device_atomic_add) {
         diagnostics = "device-scope f32 atomic add requires a target float-atomic capability";
         return false;
@@ -62,67 +85,41 @@ bool validateTargetCapabilities(PreparedModule &prepared, VernonTarget target, s
         diagnostics = "device-scope storage TensorView atomics require a target storage-atomic capability";
         return false;
     }
-    if (target != VERNON_TARGET_CPU && target != VERNON_TARGET_CUDA)
-        return true;
-    if (target == VERNON_TARGET_CPU) {
-        bool invalid = false;
-        module->walk([&](mlir::Operation *operation) {
-            if (invalid ||
-                !mlir::isa<mlir::vernon::WorkgroupAllocOp, mlir::vernon::PhysicalAtomicOp, mlir::vernon::BarrierOp>(
-                    operation))
-                return;
-            if (auto atomic = mlir::dyn_cast<mlir::vernon::PhysicalAtomicOp>(operation); atomic) {
-                auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(atomic.getStorage().getType());
-                if (!view) {
-                    diagnostics = "physical atomic storage operand is not a TensorView";
-                    invalid = true;
-                    return;
-                }
-                if (view.getAddressSpace() == "device")
-                    return;
-            }
-            mlir::func::FuncOp function = operation->getParentOfType<mlir::func::FuncOp>();
-            auto size = function ? function->getAttrOfType<mlir::DenseI32ArrayAttr>("vernon.workgroup_size") : nullptr;
-            if (!size || size.size() != 3 || size[0] != 1 || size[1] != 1 || size[2] != 1)
-                invalid = true;
-        });
-        if (invalid)
-            diagnostics =
-                "CPU reference synchronization requires workgroup_size=(1, 1, 1); use a GPU target for cooperative "
-                "workgroups";
-        return !invalid;
+    if (target == VERNON_TARGET_CPU && cpuSynchronizationUnsupported) {
+        diagnostics =
+            "CPU reference synchronization requires workgroup_size=(1, 1, 1); use a GPU target for cooperative "
+            "workgroups";
+        return false;
     }
-    for (mlir::func::FuncOp function : module->getOps<mlir::func::FuncOp>()) {
-        auto entry = function->getAttrOfType<mlir::UnitAttr>("vernon.entry");
-        if (!entry)
-            continue;
-        auto stage = function->getAttrOfType<mlir::StringAttr>("vernon.stage");
-        if (!stage || stage.getValue() != "compute") {
-            diagnostics = "CUDA target capability rejects non-compute entry '" + function.getSymName().str() + "'";
+    if (target == VERNON_TARGET_CUDA) {
+        if (cudaDeviceBarrier) {
+            diagnostics = "CUDA target capability rejects device-scope barriers; use workgroup_barrier";
             return false;
         }
-        for (unsigned index = 0; index < function.getNumArguments(); ++index) {
-            if (function.getArgAttrDict(index).get("vernon.builtin"))
+        for (mlir::func::FuncOp function : module.getOps<mlir::func::FuncOp>()) {
+            if (!function->hasAttr("vernon.entry"))
                 continue;
-            mlir::FailureOr<mlir::vernon::BackendInterfaceAbiPlan> plan = mlir::vernon::getBackendInterfaceAbiPlan(
-                function.getArgumentTypes()[index], *module, mlir::vernon::PhysicalAbiProfile::CudaKernelParameter);
-            if (mlir::failed(plan)) {
-                diagnostics = "CUDA target capability cannot plan compute argument #" + std::to_string(index);
+            auto stage = function->getAttrOfType<mlir::StringAttr>("vernon.stage");
+            if (!stage || stage.getValue() != "compute") {
+                diagnostics = "CUDA target capability rejects non-compute entry '" + function.getSymName().str() + "'";
                 return false;
             }
-            const auto *unsupported = std::get_if<mlir::vernon::UnsupportedBackendInterfaceAbi>(&*plan);
-            if (!unsupported)
-                continue;
-            diagnostics = "CUDA target capability '" + unsupported->reason + "' rejects compute argument #" +
-                          std::to_string(index);
-            return false;
+            for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+                if (function.getArgAttrDict(index).get("vernon.builtin"))
+                    continue;
+                mlir::FailureOr<mlir::vernon::BackendInterfaceAbiPlan> plan = mlir::vernon::getBackendInterfaceAbiPlan(
+                    function.getArgumentTypes()[index], module, mlir::vernon::PhysicalAbiProfile::CudaKernelParameter);
+                if (mlir::failed(plan)) {
+                    diagnostics = "CUDA target capability cannot plan compute argument #" + std::to_string(index);
+                    return false;
+                }
+                if (const auto *unsupported = std::get_if<mlir::vernon::UnsupportedBackendInterfaceAbi>(&*plan)) {
+                    diagnostics = "CUDA target capability '" + unsupported->reason + "' rejects compute argument #" +
+                                  std::to_string(index);
+                    return false;
+                }
+            }
         }
-    }
-    bool deviceBarrier = false;
-    module->walk([&](mlir::vernon::BarrierOp barrier) { deviceBarrier |= barrier.getScope() == "device"; });
-    if (deviceBarrier) {
-        diagnostics = "CUDA target capability rejects device-scope barriers; use workgroup_barrier";
-        return false;
     }
     return true;
 }
@@ -252,7 +249,7 @@ VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options
                                                       ? std::get<MetalCompileOptions>(options).platform
                                                       : VERNON_METAL_PLATFORM_MACOS;
         std::vector<TargetResourceSlot> targetResourceSlots;
-        if (!compileSpirv(module, target, artifacts, diagnostics)) {
+        if (!compileSpirv(module, target, artifacts, reflection, diagnostics)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }
@@ -281,7 +278,7 @@ VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options
         return VERNON_STATUS_OK;
     }
     if (target == VERNON_TARGET_CUDA) {
-        if (!compileCuda(module, artifacts, diagnostics)) {
+        if (!compileCuda(module, artifacts, reflection, diagnostics)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }

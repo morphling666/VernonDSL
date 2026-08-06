@@ -30,14 +30,6 @@ Value createTuple(OpBuilder &builder, Location location, TupleType type, ValueRa
     return builder.create(state)->getResult(0);
 }
 
-Value getTupleElement(OpBuilder &builder, Location location, Value tuple, unsigned index, Type type) {
-    OperationState state(location, TupleGetOp::getOperationName());
-    state.addOperands(tuple);
-    state.addTypes(type);
-    state.addAttribute("index", builder.getI64IntegerAttr(index));
-    return builder.create(state)->getResult(0);
-}
-
 Value createZero(OpBuilder &builder, Location location, Type type) {
     auto floatType = dyn_cast<FloatType>(type);
     if (!floatType)
@@ -129,13 +121,6 @@ BackwardProfileTypes getBackwardProfileTypes(MLIRContext *context, const VernonA
     }
     types.result = gradients.size() == 1 ? gradients.front() : static_cast<Type>(TupleType::get(context, gradients));
     return types;
-}
-
-SmallVector<StringRef> getInvocationTapeDtypes(const VernonAutodiffTapePlan &plan) {
-    SmallVector<StringRef> dtypes;
-    for (const AutodiffTapeLeaf &leaf : plan.getInvocationRecord().leaves)
-        dtypes.push_back(leaf.dtype);
-    return dtypes;
 }
 
 void accumulateAdjoint(OpBuilder &builder, Location location, const VernonAutodiffAnalysisResult &analysis,
@@ -275,8 +260,10 @@ public:
     DynamicForwardEmitter(func::FuncOp primal, const VernonAutodiffTapePlan &plan, Value tape, Value rootRegion,
                           Value rootRecord)
         : primal(primal), tape(tape), rootRegion(rootRegion), rootRecord(rootRecord) {
-        for (const AutodiffTapeRegion &region : plan.getRegions())
+        for (const AutodiffTapeRegion &region : plan.getRegions()) {
             regions.try_emplace(region.operation, &region);
+            regionsByOrdinal.try_emplace(region.ordinal, &region);
+        }
     }
 
     IRMapping &getMapping() { return mapping; }
@@ -339,9 +326,13 @@ private:
             return source.emitError("scf.if tape record has no predicate field");
         writeLeaf(builder, source.getLoc(), handle, record, mapping.lookup(source.getCondition()), predicate->offset);
 
-        scf::IfOp target = scf::IfOp::create(builder, source.getLoc(), source.getResultTypes(),
-                                             mapping.lookup(source.getCondition()), !source.getElseRegion().empty());
+        const bool needsSyntheticElse = source.getElseRegion().empty() && !region->childRegionOrdinals.empty();
+        scf::IfOp target =
+            scf::IfOp::create(builder, source.getLoc(), source.getResultTypes(), mapping.lookup(source.getCondition()),
+                              !source.getElseRegion().empty() || needsSyntheticElse);
         for (auto [sourceRegion, targetRegion] : llvm::zip_equal(source->getRegions(), target->getRegions())) {
+            if (sourceRegion.empty())
+                continue;
             Block &targetBlock = targetRegion.front();
             if (failed(emitBlock(sourceRegion.front(), targetBlock, handle, record)))
                 return failure();
@@ -351,6 +342,18 @@ private:
                 branchBuilder.setInsertionPoint(&targetBlock.back());
             if (failed(writePlannedLeaves(branchBuilder, source.getLoc(), *region, handle, record, &sourceRegion)))
                 return failure();
+            for (unsigned childOrdinal : region->childRegionOrdinals) {
+                const AutodiffTapeRegion *child = regionsByOrdinal.lookup(childOrdinal);
+                if (!child)
+                    return source.emitError("active scf.if references an unknown child tape region");
+                Region *owner = child->operation->getParentRegion();
+                if (owner == &sourceRegion || sourceRegion.isAncestor(owner))
+                    continue;
+                Value empty = beginRegion(branchBuilder, source.getLoc(), tape, handle, record, child->childOrdinal);
+                createOperation(branchBuilder, source.getLoc(), AdEndRegionOp::getOperationName(),
+                                {empty, createIndexConstant(branchBuilder, source.getLoc(), 0),
+                                 createI32Constant(branchBuilder, source.getLoc(), 0)});
+            }
             SmallVector<Value> yielded =
                 llvm::map_to_vector(sourceYield.getOperands(), [&](Value value) { return mapping.lookup(value); });
             if (!targetBlock.empty() && isa<scf::YieldOp>(targetBlock.back()))
@@ -359,6 +362,21 @@ private:
                 OpBuilder yieldBuilder = OpBuilder::atBlockEnd(&targetBlock);
                 scf::YieldOp::create(yieldBuilder, sourceYield.getLoc(), yielded);
             }
+        }
+        if (needsSyntheticElse) {
+            Block &elseBlock = target.getElseRegion().front();
+            OpBuilder elseBuilder = OpBuilder::atBlockBegin(&elseBlock);
+            for (unsigned childOrdinal : region->childRegionOrdinals) {
+                const AutodiffTapeRegion *child = regionsByOrdinal.lookup(childOrdinal);
+                if (!child)
+                    return source.emitError("active scf.if references an unknown child tape region");
+                Value empty = beginRegion(elseBuilder, source.getLoc(), tape, handle, record, child->childOrdinal);
+                createOperation(elseBuilder, source.getLoc(), AdEndRegionOp::getOperationName(),
+                                {empty, createIndexConstant(elseBuilder, source.getLoc(), 0),
+                                 createI32Constant(elseBuilder, source.getLoc(), 0)});
+            }
+            if (elseBlock.empty() || !isa<scf::YieldOp>(elseBlock.back()))
+                scf::YieldOp::create(elseBuilder, source.getLoc());
         }
         for (auto [sourceResult, targetResult] : llvm::zip_equal(source.getResults(), target.getResults()))
             mapping.map(sourceResult, targetResult);
@@ -502,6 +520,7 @@ private:
     Value rootRecord;
     IRMapping mapping;
     DenseMap<Operation *, const AutodiffTapeRegion *> regions;
+    DenseMap<unsigned, const AutodiffTapeRegion *> regionsByOrdinal;
 };
 
 class DynamicReverseEmitter {
@@ -753,123 +772,6 @@ private:
     DenseMap<Operation *, const AutodiffTapeRegion *> regions;
 };
 
-FailureOr<func::FuncOp> createForward(func::FuncOp primal, StringRef symbol, const VernonAutodiffTapePlan &plan) {
-    MLIRContext *context = primal.getContext();
-    SmallVector<Type> tapeTypes;
-    for (const AutodiffTapeLeaf &leaf : plan.getInvocationRecord().leaves)
-        tapeTypes.push_back(leaf.scalarType);
-    TupleType tapeType = TupleType::get(context, tapeTypes);
-    TupleType resultType = TupleType::get(context, {primal.getResultTypes().front(), tapeType});
-    OpBuilder moduleBuilder(primal);
-    auto forward = func::FuncOp::create(moduleBuilder, primal.getLoc(), symbol,
-                                        FunctionType::get(context, primal.getArgumentTypes(), {resultType}));
-    bool committed = false;
-    auto cleanup = llvm::make_scope_exit([&] {
-        if (!committed)
-            forward.erase();
-    });
-    copyProfileFunctionAttrs(primal, forward);
-    forward.setAllArgAttrs(primal.getAllArgAttrs());
-    SmallVector<StringRef> forwardDtypes = {scalarDtype(primal.getBody().front().getTerminator()->getOperand(0))};
-    for (const AutodiffTapeLeaf &leaf : plan.getInvocationRecord().leaves)
-        forwardDtypes.push_back(leaf.dtype);
-    SmallVector<DictionaryAttr> forwardResultAttrs = {
-        makeInterfaceAttrs(context, "output", "forward_result", forwardDtypes, 0)};
-    forward.setAllResultAttrs(forwardResultAttrs);
-
-    Block *block = forward.addEntryBlock();
-    IRMapping mapping;
-    DenseMap<Value, Value> forwardValues;
-    for (auto [source, target] : llvm::zip_equal(primal.getArguments(), block->getArguments())) {
-        mapping.map(source, target);
-        forwardValues.try_emplace(source, target);
-    }
-    OpBuilder builder = OpBuilder::atBlockEnd(block);
-    for (Operation &operation : primal.getBody().front().without_terminator()) {
-        Operation *clone = builder.clone(operation, mapping);
-        for (auto [source, target] : llvm::zip_equal(operation.getResults(), clone->getResults()))
-            forwardValues.try_emplace(source, target);
-    }
-    auto primalReturn = cast<func::ReturnOp>(primal.getBody().front().getTerminator());
-    SmallVector<Value> tapeValues;
-    for (const AutodiffTapeLeaf &leaf : plan.getInvocationRecord().leaves) {
-        Value mapped = forwardValues.lookup(leaf.value);
-        if (!mapped) {
-            if (Operation *definition = leaf.value.getDefiningOp())
-                definition->emitError("planned tape value was not cloned into augmented forward");
-            else
-                primal.emitError("planned tape argument was not mapped into augmented forward");
-            return failure();
-        }
-        tapeValues.push_back(mapped);
-    }
-    Value primalResult = mapping.lookupOrNull(primalReturn.getOperand(0));
-    if (!primalResult)
-        return primal.emitError("primal result was not cloned into augmented forward");
-    Value tape = createTuple(builder, primal.getLoc(), tapeType, tapeValues);
-    Value result = createTuple(builder, primal.getLoc(), resultType, {primalResult, tape});
-    func::ReturnOp::create(builder, primal.getLoc(), result);
-    committed = true;
-    return forward;
-}
-
-FailureOr<func::FuncOp> createBackward(func::FuncOp primal, StringRef symbol,
-                                       const VernonAutodiffAnalysisResult &analysis,
-                                       const VernonAutodiffRuleRegistry &registry, const VernonAutodiffTapePlan &plan) {
-    MLIRContext *context = primal.getContext();
-    SmallVector<Type> tapeTypes;
-    for (const AutodiffTapeLeaf &leaf : plan.getInvocationRecord().leaves)
-        tapeTypes.push_back(leaf.scalarType);
-    TupleType tapeType = TupleType::get(context, tapeTypes);
-    BackwardProfileTypes profileTypes = getBackwardProfileTypes(context, analysis);
-
-    OpBuilder moduleBuilder(primal);
-    auto backward =
-        func::FuncOp::create(moduleBuilder, primal.getLoc(), symbol,
-                             FunctionType::get(context, {tapeType, profileTypes.cotangent}, {profileTypes.result}));
-    bool committed = false;
-    auto cleanup = llvm::make_scope_exit([&] {
-        if (!committed)
-            backward.erase();
-    });
-    copyProfileFunctionAttrs(primal, backward);
-    SmallVector<DictionaryAttr> backwardArgumentAttrs = {
-        makeInterfaceAttrs(context, "input", "tape", getInvocationTapeDtypes(plan), 0),
-        makeInterfaceAttrs(context, "input", "output", {scalarDtype(profileTypes.cotangent)}, 1)};
-    backward.setAllArgAttrs(backwardArgumentAttrs);
-    SmallVector<DictionaryAttr> backwardResultAttrs = {
-        makeInterfaceAttrs(context, "output", "gradients", profileTypes.gradientDtypes, 0)};
-    backward.setAllResultAttrs(backwardResultAttrs);
-
-    Block *block = backward.addEntryBlock();
-    OpBuilder builder = OpBuilder::atBlockEnd(block);
-    DenseMap<Value, Value> primals;
-    for (auto [index, leaf] : llvm::enumerate(plan.getInvocationRecord().leaves))
-        primals.try_emplace(leaf.value,
-                            getTupleElement(builder, primal.getLoc(), block->getArgument(0), index, leaf.scalarType));
-
-    DenseMap<Value, Value> adjoints;
-    adjoints.try_emplace(cast<func::ReturnOp>(primal.getBody().front().getTerminator()).getOperand(0),
-                         block->getArgument(1));
-    for (Operation &operation : llvm::reverse(primal.getBody().front().without_terminator()))
-        if (failed(reverseScalarOperation(operation, builder, analysis, registry, primals, adjoints)))
-            return failure();
-
-    SmallVector<Value> gradients;
-    for (const AutodiffLeaf &leaf : analysis.getWrtLeaves()) {
-        Value gradient = adjoints.lookup(leaf.value);
-        if (!gradient)
-            gradient = createZero(builder, primal.getLoc(), leaf.derivativeType);
-        gradients.push_back(gradient);
-    }
-    Value result = gradients.size() == 1
-                       ? gradients.front()
-                       : createTuple(builder, primal.getLoc(), cast<TupleType>(profileTypes.result), gradients);
-    func::ReturnOp::create(builder, primal.getLoc(), result);
-    committed = true;
-    return backward;
-}
-
 FailureOr<func::FuncOp> createDynamicForward(func::FuncOp primal, StringRef symbol, const VernonAutodiffTapePlan &plan,
                                              const DynamicRootLayout &rootLayout) {
     MLIRContext *context = primal.getContext();
@@ -1063,18 +965,14 @@ FailureOr<StructuredVjpResult> buildStructuredScalarVjp(func::FuncOp primal, con
                          [](const AutodiffTapeLeaf &leaf) { return leaf.abiLeafIndex != 0 || leaf.scalarCount != 1; }))
             return primal.emitError("structured scalar VJP dynamic tape contains an unsupported record");
 
-    const bool dynamic = !plan->getRegions().empty();
-    FailureOr<DynamicRootLayout> rootLayout = dynamic ? buildDynamicRootLayout(*plan, primal.getResultTypes().front())
-                                                      : FailureOr<DynamicRootLayout>(failure());
-    if (dynamic && failed(rootLayout))
+    FailureOr<DynamicRootLayout> rootLayout = buildDynamicRootLayout(*plan, primal.getResultTypes().front());
+    if (failed(rootLayout))
         return primal.emitError("structured scalar VJP root record layout overflow");
-    FailureOr<func::FuncOp> forward = dynamic ? createDynamicForward(primal, options.forwardSymbol, *plan, *rootLayout)
-                                              : createForward(primal, options.forwardSymbol, *plan);
+    FailureOr<func::FuncOp> forward = createDynamicForward(primal, options.forwardSymbol, *plan, *rootLayout);
     if (failed(forward))
         return failure();
     FailureOr<func::FuncOp> backward =
-        dynamic ? createDynamicBackward(primal, options.backwardSymbol, *analysis, registry, *plan, *rootLayout)
-                : createBackward(primal, options.backwardSymbol, *analysis, registry, *plan);
+        createDynamicBackward(primal, options.backwardSymbol, *analysis, registry, *plan, *rootLayout);
     if (failed(backward)) {
         forward->erase();
         return failure();
@@ -1094,15 +992,12 @@ FailureOr<StructuredVjpResult> buildStructuredScalarVjp(func::FuncOp primal, con
     }
     llvm::sort(derivativeRules);
     derivativeRules.erase(std::unique(derivativeRules.begin(), derivativeRules.end()), derivativeRules.end());
-    uint64_t tapeBytes = plan->getInvocationRecord().stride;
-    if (dynamic) {
-        if (plan->getStaticTapeBytesHint() > std::numeric_limits<uint64_t>::max() - rootLayout->stride) {
-            forward->erase();
-            backward->erase();
-            return primal.emitError("structured scalar VJP tape statistics hint overflow");
-        }
-        tapeBytes = plan->getStaticTapeBytesHint() + rootLayout->stride;
+    if (plan->getStaticTapeBytesHint() > std::numeric_limits<uint64_t>::max() - rootLayout->stride) {
+        forward->erase();
+        backward->erase();
+        return primal.emitError("structured scalar VJP tape statistics hint overflow");
     }
+    const uint64_t tapeBytes = plan->getStaticTapeBytesHint() + rootLayout->stride;
     return StructuredVjpResult{*forward, *backward, tapeBytes, std::move(derivativeRules)};
 }
 

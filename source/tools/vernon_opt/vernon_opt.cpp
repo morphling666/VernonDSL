@@ -11,6 +11,7 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonCpuPipeline.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonInlineHelpers.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUAutodiff.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUResources.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUTensors.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCUDAMath.h"
@@ -77,6 +78,9 @@ int main(int argc, char **argv) {
     vernon::registerVernonInlineHelpersPass();
     vernon::registerVernonStructuredVjpPass();
     vernon::registerVernonLowerAccumulationPass();
+    vernon::registerVernonPrepareCPUAutodiffSignaturesPass();
+    vernon::registerVernonLowerCPUAutodiffPass();
+    vernon::registerVernonCPUAutodiffToLLVMPass();
     vernon::registerVernonLowerCPUTensorsPass();
     vernon::registerVernonLowerCPUResourcesPass();
     vernon::registerVernonCpuPassPipeline();

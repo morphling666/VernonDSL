@@ -14,6 +14,10 @@
 
 namespace mlir::vernon {
 
+/// True when a boundary type contains logical autodiff handles that must be
+/// materialized by a target lowering before a physical Value ABI is planned.
+bool containsLogicalAutodiffHandle(Type type);
+
 struct ResolvedStructField {
     std::string name;
     Type type;

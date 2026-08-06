@@ -1522,6 +1522,8 @@ struct Runtime {
     std::unique_ptr<LoadedPipeline> loadCpuAutodiff(const CompiledProgram &primal, const std::string &primalName,
                                                     const CompiledProgram &forward, const std::string &forwardName,
                                                     const CompiledProgram &backward, const std::string &backwardName,
+                                                    const std::string &forwardProtocol,
+                                                    const std::string &backwardProtocol,
                                                     const std::vector<std::string> &gradientPaths) {
         const CompiledProgram *programs[] = {&primal, &forward, &backward};
         const std::string *names[] = {&primalName, &forwardName, &backwardName};
@@ -1546,8 +1548,8 @@ struct Runtime {
             gradientViews.push_back(view(path));
         VernonLoadedPipeline *pipeline = vernon::runtime::loadBackendCpuAutodiffPipeline(
             *handle, entries[0], view(reflections[0]), view(primalName), entries[1], view(reflections[1]),
-            view(forwardName), entries[2], view(reflections[2]), view(backwardName), gradientViews.data(),
-            gradientViews.size());
+            view(forwardName), entries[2], view(reflections[2]), view(backwardName), view(forwardProtocol),
+            view(backwardProtocol), gradientViews.data(), gradientViews.size());
         if (!pipeline)
             throw std::runtime_error("cannot load direct CPU autodiff profiles: " +
                                      stringView(vernonRuntimeGetLastError(handle)));

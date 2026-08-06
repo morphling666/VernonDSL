@@ -65,5 +65,6 @@ asset = vd.pipeline_asset(
             "abscissa",
             "signed",
         ),
+        protocol="legacy_fixed",
     ),
 )

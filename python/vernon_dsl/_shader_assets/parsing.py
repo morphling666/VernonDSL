@@ -87,6 +87,7 @@ def _transform_record(
     wrt: tuple[str, ...],
     rule_set_id: str | None,
     rule_set_identity: str | None,
+    protocol: str,
 ) -> dict[str, Any]:
     record: dict[str, Any] = {
         "kind": "vjp",
@@ -95,6 +96,7 @@ def _transform_record(
         "gradient_policy": "f16:f32,f32:f32,f64:f64",
         "accumulation_policy": "fresh",
         "tape_policy": "bounded",
+        "protocol": protocol,
         "derivative_rules_version": 1,
     }
     if rule_set_id is not None:
@@ -188,7 +190,7 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
         if len(program_expression.args) != 1 or any(item.arg is None for item in program_expression.keywords):
             raise PipelineCompileError("vd.ad.vjp requires one program operand and keyword arguments")
         transform_keywords = {item.arg: item.value for item in program_expression.keywords if item.arg is not None}
-        unknown_transform = set(transform_keywords) - {"wrt", "rules"}
+        unknown_transform = set(transform_keywords) - {"wrt", "rules", "protocol"}
         if unknown_transform:
             raise PipelineCompileError("unknown vd.ad.vjp argument(s): " + ", ".join(sorted(unknown_transform)))
         wrt_node = transform_keywords.get("wrt")
@@ -204,6 +206,13 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
             raise PipelineCompileError("vd.ad.vjp wrt must be a non-empty literal tuple or list of source paths")
         if len(set(wrt_value)) != len(wrt_value):
             raise PipelineCompileError("vd.ad.vjp wrt paths must be unique")
+        protocol_node = transform_keywords.get("protocol")
+        try:
+            protocol = ast.literal_eval(protocol_node) if protocol_node is not None else "dynamic_v2"
+        except (ValueError, TypeError, SyntaxError):
+            protocol = None
+        if protocol not in {"dynamic_v2", "legacy_fixed"}:
+            raise PipelineCompileError("vd.ad.vjp protocol must be 'dynamic_v2' or 'legacy_fixed'")
         rule_set_id = None
         rule_set_identity = None
         rules_node = transform_keywords.get("rules")
@@ -220,6 +229,7 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
             tuple(sorted(wrt_value)),
             rule_set_id,
             rule_set_identity,
+            protocol,
         )
         program = program_expression.args[0]
     else:

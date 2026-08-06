@@ -60,6 +60,7 @@ class ProgramTransformSpec:
     gradient_policy: str = "f16:f32,f32:f32,f64:f64"
     accumulation_policy: str = "fresh"
     tape_policy: str = "bounded"
+    protocol: str = "dynamic_v2"
     derivative_rules_version: int = 1
 
     def __post_init__(self) -> None:
@@ -71,6 +72,8 @@ class ProgramTransformSpec:
             raise ValueError("unsupported gradient accumulation policy")
         if self.tape_policy != "bounded":
             raise ValueError("unsupported autodiff tape policy")
+        if self.protocol not in {"dynamic_v2", "legacy_fixed"}:
+            raise ValueError("unsupported autodiff protocol")
         if self.derivative_rules_version != 1:
             raise ValueError("unsupported derivative rules version")
         if (self.rule_set is None) != (self.rule_set_identity is None):
@@ -86,6 +89,7 @@ class ProgramTransformSpec:
             "gradient_policy": self.gradient_policy,
             "accumulation_policy": self.accumulation_policy,
             "tape_policy": self.tape_policy,
+            "protocol": self.protocol,
             "derivative_rules_version": self.derivative_rules_version,
         }
         if self.rule_set is not None:
@@ -125,6 +129,7 @@ def vjp(
     *,
     wrt: tuple[str, ...] | list[str],
     rules: RuleSet | None = None,
+    protocol: str = "dynamic_v2",
 ) -> ProgramExpression:
     """Describe a VJP transform that may be cooked or directly executed on CPU."""
 
@@ -151,6 +156,7 @@ def vjp(
         tuple(wrt),
         rule_set=rules.id if rules is not None else None,
         rule_set_identity=rules.digest if rules is not None else None,
+        protocol=protocol,
     )
     return ProgramExpression(program, spec, rules)
 

@@ -18,6 +18,11 @@ nlohmann::json withIdentity(nlohmann::json value) {
     return value;
 }
 
+nlohmann::json refreshIdentity(nlohmann::json value) {
+    value.erase("identity");
+    return withIdentity(std::move(value));
+}
+
 nlohmann::json validAutodiffManifest() {
     nlohmann::json transform = withIdentity({{"kind", "vjp"},
                                              {"wrt", nlohmann::json::array({"x"})},
@@ -25,6 +30,7 @@ nlohmann::json validAutodiffManifest() {
                                              {"gradient_policy", "f16:f32,f32:f32,f64:f64"},
                                              {"accumulation_policy", "fresh"},
                                              {"tape_policy", "bounded"},
+                                             {"protocol", "dynamic_v2"},
                                              {"derivative_rules_version", 1}});
     const std::string transformIdentity = transform["identity"].get<std::string>();
     const nlohmann::json primal = {{"path", "x"}, {"type", "f32"}, {"role", "primal"}};
@@ -115,6 +121,7 @@ TEST(PipelineManifestRequirements, ParsesCanonicalAutodiffProfiles) {
     std::string error;
     const nlohmann::json root = validAutodiffManifest();
     ASSERT_TRUE(parseAutodiffManifest(root, manifest, error)) << error;
+    EXPECT_EQ(manifest.protocol, "dynamic_v2");
     EXPECT_EQ(manifest.wrt, std::vector<std::string>{"x"});
     EXPECT_EQ(manifest.outputCotangents, std::vector<std::string>{"output"});
     EXPECT_EQ(manifest.gradientPaths, std::vector<std::string>{"x"});
@@ -128,6 +135,24 @@ TEST(PipelineManifestRequirements, ParsesCanonicalAutodiffProfiles) {
               vernon::runtime::AutodiffAccumulationPlan::Operation::ReduceSum);
 }
 
+TEST(PipelineManifestRequirements, ParsesPipelineV13AutodiffTransformWithoutProtocol) {
+    using vernon::runtime::AutodiffManifest;
+    using vernon::runtime::parseAutodiffManifest;
+    nlohmann::json root = validAutodiffManifest();
+    root["program_transform"].erase("protocol");
+    root["program_transform"] = refreshIdentity(std::move(root["program_transform"]));
+    nlohmann::json &plan = root["autodiff_profiles"]["variants"][0]["plan"];
+    plan["transform_identity"] = root["program_transform"]["identity"];
+    plan = refreshIdentity(std::move(plan));
+    root["autodiff_profiles"] = refreshIdentity(std::move(root["autodiff_profiles"]));
+
+    AutodiffManifest manifest;
+    std::string error;
+    ASSERT_TRUE(parseAutodiffManifest(root, manifest, error)) << error;
+    EXPECT_EQ(manifest.protocol, "legacy_fixed");
+    EXPECT_EQ(manifest.transformIdentity, root["program_transform"]["identity"]);
+}
+
 TEST(PipelineManifestRequirements, RejectsIncompleteOrTamperedAutodiffProfiles) {
     using vernon::runtime::AutodiffManifest;
     using vernon::runtime::parseAutodiffManifest;
@@ -136,6 +161,13 @@ TEST(PipelineManifestRequirements, RejectsIncompleteOrTamperedAutodiffProfiles) 
     nlohmann::json root = validAutodiffManifest();
     root.erase("autodiff_profiles");
     EXPECT_FALSE(parseAutodiffManifest(root, manifest, error));
+
+    root = validAutodiffManifest();
+    root["program_transform"]["protocol"] = "unknown";
+    error.clear();
+    manifest = {};
+    EXPECT_FALSE(parseAutodiffManifest(root, manifest, error));
+    EXPECT_NE(error.find("program_transform"), std::string::npos);
 
     root = validAutodiffManifest();
     root["autodiff_profiles"]["variants"][0]["plan"]["tape_bytes"] = 32;
@@ -508,6 +540,30 @@ TEST(PipelineManifestRequirements, ParsesStructuredLeafPathsAndStaticShapes) {
     invalid["leaves"][0]["shape"] = nlohmann::json::array({4, 2});
     EXPECT_FALSE(vernon::runtime::parsePipelineValueLayout(invalid, parsed = {}, error));
     EXPECT_NE(error.find("scalar_count"), std::string::npos);
+
+    invalid = layout;
+    invalid["leaves"][0]["byte_offset"] = 12;
+    EXPECT_FALSE(vernon::runtime::parsePipelineValueLayout(invalid, parsed, error));
+    EXPECT_NE(error.find("byte offset"), std::string::npos);
+    EXPECT_TRUE(parsed.leaves.empty());
+
+    invalid = layout;
+    invalid["leaves"].push_back(
+        {{"path", nlohmann::json::array({"overlap"})}, {"dtype", "f32"}, {"byte_offset", 20}, {"scalar_count", 1}});
+    EXPECT_FALSE(vernon::runtime::parsePipelineValueLayout(invalid, parsed, error));
+    EXPECT_NE(error.find("overlap"), std::string::npos);
+
+    invalid = layout;
+    invalid["leaves"][0]["path"] = nlohmann::json::array({"nested.field"});
+    EXPECT_FALSE(vernon::runtime::parsePipelineValueLayout(invalid, parsed, error));
+    EXPECT_NE(error.find("cannot contain"), std::string::npos);
+
+    invalid = layout;
+    invalid["byte_size"] = 40;
+    invalid["leaves"].push_back(invalid["leaves"][0]);
+    invalid["leaves"][1]["byte_offset"] = 24;
+    EXPECT_FALSE(vernon::runtime::parsePipelineValueLayout(invalid, parsed, error));
+    EXPECT_NE(error.find("not unique"), std::string::npos);
 }
 
 } // namespace

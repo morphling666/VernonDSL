@@ -14,7 +14,8 @@
 
 namespace vernon::runtime::ad {
 class Executable;
-}
+class HostTapeMemoryPolicy;
+} // namespace vernon::runtime::ad
 namespace vernon::runtime {
 class CompiledAutodiffGraph;
 }
@@ -29,6 +30,7 @@ struct VernonRuntimeContext {
     void (*destroyBackendState)(void *){};
     bool borrowedRhiDevice{};
     VernonRhiDevice rhiDevice{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    std::shared_ptr<vernon::runtime::ad::HostTapeMemoryPolicy> cpuTapePolicy;
 };
 
 namespace vernon::runtime {
@@ -56,10 +58,10 @@ void clearInvocationDiagnostic(const VernonRuntimeContext &context);
 
 class RuntimeDiagnosticScope {
 public:
-    explicit RuntimeDiagnosticScope(const VernonRuntimeContext *context);
+    explicit RuntimeDiagnosticScope(const VernonRuntimeContext *context) noexcept;
     RuntimeDiagnosticScope(const RuntimeDiagnosticScope &) = delete;
     RuntimeDiagnosticScope &operator=(const RuntimeDiagnosticScope &) = delete;
-    ~RuntimeDiagnosticScope();
+    ~RuntimeDiagnosticScope() noexcept;
 
 private:
     const VernonRuntimeContext *context_;

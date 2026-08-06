@@ -1,4 +1,9 @@
 #include "VernonVersions.h"
+#include "compiler_frontend.h"
+#include "compiler_reflection.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Parser/Parser.h"
 #include "vernon-c/Compiler.h"
 
 #include <nlohmann/json.hpp>
@@ -8,6 +13,7 @@
 #include <initializer_list>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
 
@@ -62,6 +68,164 @@ void expectDiagnostic(VernonCompilerContext *context, std::string_view module, s
 }
 
 } // namespace
+
+TEST(CompilerPreparation, MockGpuPreparerMaterializesResourceSignatureFromLogicalProfile) {
+    std::unique_ptr<vernon::compiler::CompilerFrontend, decltype(&vernon::compiler::destroyCompilerFrontend)> frontend(
+        vernon::compiler::createCompilerFrontend(), vernon::compiler::destroyCompilerFrontend);
+    ASSERT_NE(frontend, nullptr);
+    mlir::MLIRContext &context = vernon::compiler::compilerMlirContext(*frontend);
+    auto module = mlir::parseSourceString<mlir::ModuleOp>(R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @compute(
+      %values: tensor<4xf32> {
+        vernon.source_name = "values",
+        vernon.dtype = "f32",
+        vernon.abi_leaf_dtypes = ["f32"]
+      }) attributes {vernon.entry, vernon.stage = "compute"} {
+    func.return
+  }
+}
+)mlir",
+                                                          &context);
+    ASSERT_TRUE(module);
+    mlir::FailureOr<vernon::compiler::LogicalReflectionModel> logical =
+        vernon::compiler::buildLogicalReflectionModel(*module);
+    ASSERT_TRUE(mlir::succeeded(logical));
+    ASSERT_EQ(logical->entries.size(), 1u);
+    ASSERT_EQ(logical->entries[0].arguments.size(), 1u);
+    EXPECT_EQ(logical->entries[0].arguments[0].sourcePath, "values");
+    EXPECT_EQ(logical->entries[0].arguments[0].dtype, "f32");
+    EXPECT_EQ(logical->entries[0].arguments[0].shape, (std::vector<int64_t>{4}));
+    vernon::compiler::PreparedModule prepared(std::move(module), std::move(*logical));
+    mlir::FailureOr<vernon::compiler::TargetPreparationResult> result = vernon::compiler::prepareTargetModule(
+        prepared, [](mlir::ModuleOp target, vernon::compiler::TargetPreparationProvenance &provenance) {
+            mlir::func::FuncOp function = *target.getOps<mlir::func::FuncOp>().begin();
+            mlir::Builder builder(target.getContext());
+            auto logicalTensor = mlir::cast<mlir::RankedTensorType>(function.getArgumentTypes()[0]);
+            auto resource = mlir::vernon::TensorViewType::get(target.getContext(), logicalTensor.getElementType(),
+                                                              logicalTensor.getShape(), "read_write", "device");
+            function.getArgument(0).setType(resource);
+            function.setType(builder.getFunctionType({resource}, {}));
+            function.setArgAttrs(
+                0, builder.getDictionaryAttr({
+                       builder.getNamedAttr("vernon.interface", builder.getStringAttr("resource")),
+                       builder.getNamedAttr("vernon.source_name", builder.getStringAttr("physical_resource")),
+                       builder.getNamedAttr("vernon.dtype", builder.getStringAttr("f32")),
+                       builder.getNamedAttr("vernon.element_abi_leaf_dtypes",
+                                            builder.getArrayAttr({builder.getStringAttr("f32")})),
+                       builder.getNamedAttr("vernon.set", builder.getI64IntegerAttr(0)),
+                       builder.getNamedAttr("vernon.binding", builder.getI64IntegerAttr(0)),
+                   }));
+            if (mlir::failed(provenance.mapArgument(function, 0, 0)))
+                return mlir::failure();
+            mlir::NamedAttribute builtin(builder.getStringAttr("vernon.builtin"),
+                                         builder.getStringAttr("mock_gpu_dispatch"));
+            if (mlir::failed(function.insertArgument(function.getNumArguments(), builder.getIndexType(),
+                                                     builder.getDictionaryAttr(builtin), function.getLoc())))
+                return mlir::failure();
+            return mlir::success();
+        });
+    ASSERT_TRUE(mlir::succeeded(result));
+    ASSERT_EQ(result->entries.size(), 1u);
+    EXPECT_EQ(result->entries[0].name, "compute");
+    EXPECT_EQ(result->entries[0].stage, "compute");
+    ASSERT_EQ(result->entries[0].arguments.size(), 2u);
+    EXPECT_EQ(result->entries[0].arguments[0].index, 0u);
+    EXPECT_EQ(result->entries[0].arguments[0].type, "!vernon.tensor_view<f32, [4], \"read_write\", \"device\">");
+    ASSERT_TRUE(result->entries[0].arguments[0].logicalIndex.has_value());
+    EXPECT_EQ(*result->entries[0].arguments[0].logicalIndex, 0u);
+    EXPECT_EQ(result->entries[0].arguments[0].logicalPath, "values");
+    EXPECT_EQ(result->entries[0].arguments[1].index, 1u);
+    EXPECT_EQ(result->entries[0].arguments[1].builtin, "mock_gpu_dispatch");
+    EXPECT_EQ(result->entries[0].arguments[1].type, "index");
+    EXPECT_FALSE(result->entries[0].arguments[1].logicalIndex.has_value());
+    mlir::FailureOr<std::string> reflected = vernon::compiler::buildReflection(
+        *result->module, prepared.logicalReflection(), result->entries, result->provenance);
+    ASSERT_TRUE(mlir::succeeded(reflected));
+    const nlohmann::json reflectedJson = nlohmann::json::parse(*reflected);
+    EXPECT_EQ(argument(entry(reflectedJson, "compute"), 0).at("vernon.source_name"), "values");
+    std::vector<vernon::compiler::PhysicalEntryModel> staleEntries = result->entries;
+    staleEntries[0].arguments[0].type = "f32";
+    EXPECT_TRUE(mlir::failed(vernon::compiler::buildReflection(*result->module, prepared.logicalReflection(),
+                                                               staleEntries, result->provenance)));
+    staleEntries = result->entries;
+    staleEntries[0].arguments[0].logicalIndex.reset();
+    EXPECT_TRUE(mlir::failed(vernon::compiler::buildReflection(*result->module, prepared.logicalReflection(),
+                                                               staleEntries, result->provenance)));
+    mlir::OwningOpRef<mlir::ModuleOp> original = prepared.clone();
+    mlir::func::FuncOp originalFunction = *original->getOps<mlir::func::FuncOp>().begin();
+    EXPECT_EQ(originalFunction.getNumArguments(), 1u);
+}
+
+TEST(CompilerReflection, ValidationKeepsCanonicalProfilesAndTargetCompileSelectsOne) {
+    constexpr std::string_view module = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @compute(
+      %value: f32 {
+        vernon.source_name = "value",
+        vernon.dtype = "f32",
+        vernon.interface = "input",
+        vernon.location = 0 : i64
+      }
+    ) -> (f32 {
+      vernon.source_name = "output",
+      vernon.dtype = "f32",
+      vernon.interface = "output",
+      vernon.location = 0 : i64
+    }) attributes {
+      vernon.entry,
+      vernon.stage = "compute",
+      vernon.workgroup_size = array<i32: 1, 1, 1>
+    } {
+    return %value : f32
+  }
+}
+)mlir";
+    VernonCompilerContext *context = vernonCompilerCreate();
+    ASSERT_NE(context, nullptr);
+    VernonCompileResult *validation = vernonCompilerValidateMlir(context, module.data(), module.size());
+    ASSERT_NE(validation, nullptr);
+    if (vernonCompileResultGetStatus(validation) != VERNON_STATUS_OK) {
+        const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(validation);
+        std::fwrite(diagnostics.data, 1, diagnostics.size, stderr);
+        std::fputc('\n', stderr);
+    }
+    ASSERT_EQ(vernonCompileResultGetStatus(validation), VERNON_STATUS_OK);
+    const VernonStringView validationView = vernonCompileResultGetReflection(validation);
+    const nlohmann::json validationReflection =
+        nlohmann::json::parse(validationView.data, validationView.data + validationView.size);
+
+    VernonCompileResult *compiled = vernonCompilerCompileMlir(context, module.data(), module.size(), VERNON_TARGET_CPU);
+    ASSERT_NE(compiled, nullptr);
+    if (vernonCompileResultGetStatus(compiled) != VERNON_STATUS_OK) {
+        const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(compiled);
+        std::fwrite(diagnostics.data, 1, diagnostics.size, stderr);
+        std::fputc('\n', stderr);
+    }
+    ASSERT_EQ(vernonCompileResultGetStatus(compiled), VERNON_STATUS_OK);
+    const VernonStringView compiledView = vernonCompileResultGetReflection(compiled);
+    const nlohmann::json compiledReflection =
+        nlohmann::json::parse(compiledView.data, compiledView.data + compiledView.size);
+
+    for (std::string_view field :
+         {"compiler_contract_version", "pipeline_version", "struct_layouts", "dependencies", "module_hash"})
+        EXPECT_EQ(validationReflection.at(field), compiledReflection.at(field));
+    const nlohmann::json &validationEntry = entry(validationReflection, "compute");
+    const nlohmann::json &compiledEntry = entry(compiledReflection, "compute");
+    EXPECT_GT(validationEntry.at("physical_layouts").size(), 1u);
+    EXPECT_EQ(compiledEntry.at("physical_layouts").size(), 1u);
+    EXPECT_TRUE(compiledEntry.at("physical_layouts").contains("host_value"));
+    for (std::string_view field : {"vernon.source_name", "vernon.dtype"}) {
+        EXPECT_EQ(argument(validationEntry, 0).at(field), argument(compiledEntry, 0).at(field));
+        EXPECT_EQ(validationEntry.at("results").at(0).at(field), compiledEntry.at("results").at(0).at(field));
+    }
+    EXPECT_GT(argument(validationEntry, 0).at("physical_layouts").size(), 1u);
+    EXPECT_EQ(argument(compiledEntry, 0).at("physical_layouts").size(), 1u);
+
+    vernonCompileResultDestroy(compiled);
+    vernonCompileResultDestroy(validation);
+    vernonCompilerDestroy(context);
+}
 
 TEST(CompilerReflection, TracksTextureSamplerAndSwizzleSemantics) {
     constexpr std::string_view module = R"mlir(

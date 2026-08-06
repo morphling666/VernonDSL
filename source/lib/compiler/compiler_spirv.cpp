@@ -1,6 +1,7 @@
 #include "compiler_spirv.h"
 
 #include "compiler_frontend.h"
+#include "compiler_reflection.h"
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -217,11 +218,20 @@ struct AttachSpirvTargetPass
 } // namespace
 
 bool compileSpirv(PreparedModule &prepared, VernonTarget target, std::vector<Artifact> &artifacts,
-                  std::string &diagnostics) {
+                  std::string &reflection, std::string &diagnostics) {
     mlir::MLIRContext &context = prepared.context();
     mlir::ScopedDiagnosticHandler handler(
         &context, [&](mlir::Diagnostic &diagnostic) { appendDiagnostic(diagnostics, diagnostic); });
-    mlir::OwningOpRef<mlir::ModuleOp> module = prepared.clone();
+    mlir::FailureOr<TargetPreparationResult> preparedTarget =
+        prepareTargetModule(prepared, preparePortableTargetModule);
+    if (mlir::failed(preparedTarget))
+        return false;
+    mlir::OwningOpRef<mlir::ModuleOp> module = std::move(preparedTarget->module);
+    mlir::FailureOr<std::string> targetReflection =
+        buildReflection(*module, prepared.logicalReflection(), preparedTarget->entries, preparedTarget->provenance);
+    if (mlir::failed(targetReflection))
+        return false;
+    reflection = std::move(*targetReflection);
     bool requiresRuntimeContractViolation = false;
     module->walk([&](mlir::cf::AssertOp) { requiresRuntimeContractViolation = true; });
     if (requiresRuntimeContractViolation) {

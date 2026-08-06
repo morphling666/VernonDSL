@@ -21,6 +21,7 @@ class StructuredScalarVjpBuild:
     entry: TypedFunctionInstance
     plan: AutodiffProfilePlan
     profiles: Mapping[str, str]
+    protocols: Mapping[str, str]
     uses_dynamic_tape: bool
 
 
@@ -93,6 +94,7 @@ def build_structured_scalar_vjp(
         entry,
         plan,
         profiles,
+        MappingProxyType({"forward_with_tape": "dynamic_v2", "backward": "dynamic_v2"}),
         any("!vernon.ad_tape" in module for module in profiles.values()),
     )
 

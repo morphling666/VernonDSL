@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -368,12 +369,12 @@ bool createGpuExecutable(VernonPipelineBundle &bundle, const std::string &forwar
         } else if (resource.abi.role == GpuResourceRole::Input || resource.abi.role == GpuResourceRole::Storage) {
             signature.inputs.push_back(resource.abi.value);
         } else if (resource.abi.role == GpuResourceRole::Output) {
-            if (!signature.output.path.empty()) {
+            if (!signature.outputs.empty()) {
                 invocationDiagnostic(*bundle.context) =
                     "autodiff forward GPU profile contains multiple output resources";
                 return false;
             }
-            signature.output = resource.abi.value;
+            signature.outputs.push_back(resource.abi.value);
         } else if (resource.abi.role == GpuResourceRole::Tape) {
             signature.tape.push_back(resource.abi.value);
         } else {
@@ -382,7 +383,7 @@ bool createGpuExecutable(VernonPipelineBundle &bundle, const std::string &forwar
             return false;
         }
     }
-    if (signature.output.path.empty()) {
+    if (signature.outputs.empty()) {
         invocationDiagnostic(*bundle.context) = "autodiff forward GPU profile has no output resource";
         return false;
     }
@@ -396,11 +397,11 @@ bool createGpuExecutable(VernonPipelineBundle &bundle, const std::string &forwar
         return false;
     }
     const ResourceBinding *cotangent = uniqueBinding(backward->layout, GpuResourceRole::Cotangent);
-    if (!cotangent || !derivativeAbiMatches(signature.output, cotangent->abi.value)) {
+    if (!cotangent || !derivativeAbiMatches(signature.outputs.front(), cotangent->abi.value)) {
         invocationDiagnostic(*bundle.context) = "autodiff output and cotangent GPU resource ABIs do not match";
         return false;
     }
-    signature.cotangent = cotangent->abi.value;
+    signature.cotangents.push_back(cotangent->abi.value);
     if (cotangent->abi.physicalShape != forwardOutput->abi.physicalShape) {
         invocationDiagnostic(*bundle.context) = "autodiff output and cotangent physical shapes do not match";
         return false;
@@ -420,12 +421,16 @@ bool createGpuExecutable(VernonPipelineBundle &bundle, const std::string &forwar
         invocationDiagnostic(*bundle.context) = "autodiff backward GPU profile has no matching launch resource";
         return false;
     }
+    std::set<std::string> uniqueGradientPaths;
     for (const std::string &path : gradientPaths) {
         ResourceBinding *gradient = nullptr;
         const auto found = backward->layout.byPath.find(path);
         if (found != backward->layout.byPath.end())
             gradient = &backward->layout.resources[found->second];
-        if (!gradient || gradient->abi.role != GpuResourceRole::Gradient) {
+        const auto primal = std::find_if(signature.inputs.begin(), signature.inputs.end(),
+                                         [&](const ValueAbi &input) { return input.path == path; });
+        if (!uniqueGradientPaths.insert(path).second || !gradient || gradient->abi.role != GpuResourceRole::Gradient ||
+            primal == signature.inputs.end() || !derivativeAbiMatches(*primal, gradient->abi.value)) {
             invocationDiagnostic(*bundle.context) = "autodiff gradient paths do not match the GPU resource profile";
             return false;
         }

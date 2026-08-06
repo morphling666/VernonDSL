@@ -30,5 +30,5 @@ def objective(
 
 asset = vd.pipeline_asset(
     id="runtime/cooked-autodiff",
-    program=vd.ad.vjp(objective, wrt=("value", "factor", "selector")),
+    program=vd.ad.vjp(objective, wrt=("value", "factor", "selector"), protocol="legacy_fixed"),
 )

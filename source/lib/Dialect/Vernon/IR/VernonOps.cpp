@@ -6,6 +6,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVAttributes.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
@@ -418,6 +419,8 @@ bool isAllowedCaptureOperation(Operation *operation) {
     }
     if (isMemoryEffectFree(operation))
         return true;
+    if (isa<IntrinsicOp>(operation) && operation->getNumResults() == 1)
+        return true;
     if (isa<LoadOp, PhysicalLoadOp, WorkgroupAllocOp>(operation))
         return true;
     if (auto store = dyn_cast<StoreOp>(operation))
@@ -556,6 +559,25 @@ LogicalResult AdBeginInvocationOp::verify() {
     return success();
 }
 
+static bool areMutuallyExclusiveBranchOperations(Operation *left, Operation *right) {
+    auto contains = [](Region &region, Operation *operation) {
+        Region *owner = operation->getParentRegion();
+        return owner == &region || region.isAncestor(owner);
+    };
+    for (Operation *ancestor = left->getParentOp(); ancestor; ancestor = ancestor->getParentOp()) {
+        auto conditional = dyn_cast<scf::IfOp>(ancestor);
+        if (!conditional || conditional.getElseRegion().empty())
+            continue;
+        const bool leftThen = contains(conditional.getThenRegion(), left);
+        const bool leftElse = contains(conditional.getElseRegion(), left);
+        const bool rightThen = contains(conditional.getThenRegion(), right);
+        const bool rightElse = contains(conditional.getElseRegion(), right);
+        if ((leftThen && rightElse) || (leftElse && rightThen))
+            return true;
+    }
+    return false;
+}
+
 LogicalResult AdBeginRegionOp::verify() {
     if (failed(verifyCaptureMutation(getOperation())))
         return failure();
@@ -583,7 +605,8 @@ LogicalResult AdBeginRegionOp::verify() {
             if (!sibling || sibling == *this || sibling.getParentLink().size() != 2)
                 continue;
             if (sibling.getParentLink()[1] == link[1] && sibling.getChildOrdinalAttr() &&
-                sibling.getChildOrdinalAttr().getInt() == getChildOrdinalAttr().getInt())
+                sibling.getChildOrdinalAttr().getInt() == getChildOrdinalAttr().getInt() &&
+                !areMutuallyExclusiveBranchOperations(*this, sibling))
                 return emitOpError("duplicates a child_ordinal in the same parent record");
         }
     }

@@ -213,6 +213,7 @@ struct AutodiffVariant {
 struct AutodiffManifest {
     std::string transformIdentity;
     std::string profilesIdentity;
+    std::string protocol;
     std::vector<std::string> wrt;
     std::vector<std::string> outputCotangents;
     std::vector<std::string> gradientPaths;

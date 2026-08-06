@@ -36,11 +36,16 @@ struct ResolvedArtifact {
     bool external{};
 };
 
+struct AutodiffStageMetadata {
+    std::string profile;
+    std::string protocol;
+    std::string profilesIdentity;
+};
+
 struct Stage {
     std::string stage;
     std::string entry;
-    std::string autodiffProfile;
-    std::string autodiffProfilesIdentity;
+    std::optional<AutodiffStageMetadata> autodiff;
     std::string source;
     std::string reflection;
     std::vector<uint8_t> binary;

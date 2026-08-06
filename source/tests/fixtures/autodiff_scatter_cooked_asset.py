@@ -13,5 +13,5 @@ def gather(
 
 asset = vd.pipeline_asset(
     id="compute/scatter-vjp",
-    program=vd.ad.vjp(gather, wrt=("values",)),
+    program=vd.ad.vjp(gather, wrt=("values",), protocol="legacy_fixed"),
 )
