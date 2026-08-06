@@ -3,6 +3,7 @@ add_mlir_library(
     VernonAutodiffAnalysis.cpp
     VernonAutodiffRules.cpp
     VernonAutodiffTapePlanning.cpp
+    VernonStructuredVjp.cpp
     VernonCpuPipeline.cpp
     VernonAttributeAbi.cpp
     VernonConvertGPUToSPIRV.cpp

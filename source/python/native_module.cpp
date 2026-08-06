@@ -3,6 +3,7 @@
 #include "VernonRHI.h"
 #include "VernonRuntime.h"
 #include "compiler_python_bridge.h"
+#include "runtime/autodiff/runtime_direct_autodiff.h"
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/array.h>
@@ -88,6 +89,61 @@ nb::list planValueAbi(const std::string &moduleText, const std::vector<std::stri
         nodes.append(nb::make_tuple(node.byte_size, node.alignment, std::move(offsets), std::move(elementStride)));
     }
     return nodes;
+}
+
+struct StructuredVjp {
+    using ResultPtr = std::unique_ptr<VernonPythonStructuredVjp, decltype(&vernonCompilerDestroyPythonStructuredVjp)>;
+
+    explicit StructuredVjp(VernonPythonStructuredVjp *result)
+        : result(result, &vernonCompilerDestroyPythonStructuredVjp) {}
+
+    VernonPythonStructuredVjpView current() const { return vernonCompilerGetPythonStructuredVjpView(result.get()); }
+
+    uint64_t tapeBytes() const { return current().tape_bytes; }
+
+    nb::list derivativeRules() const {
+        VernonPythonStructuredVjpView transformed = current();
+        nb::list rules;
+        for (size_t index = 0; index < transformed.derivative_rule_count; ++index)
+            rules.append(stringView(transformed.derivative_rules[index]));
+        return rules;
+    }
+
+    nb::dict profiles(const std::string &identity) {
+        if (vernonCompilerFinalizePythonStructuredVjp(result.get(), {identity.data(), identity.size()}) !=
+            VERNON_STATUS_OK) {
+            const std::string diagnostics = stringView(current().diagnostics);
+            throw std::invalid_argument(diagnostics.empty() ? "cannot finalize structured VJP profiles" : diagnostics);
+        }
+        VernonPythonStructuredVjpView transformed = current();
+        nb::dict profiles;
+        profiles["forward_with_tape"] = stringView(transformed.forward_module);
+        profiles["backward"] = stringView(transformed.backward_module);
+        return profiles;
+    }
+
+    ResultPtr result;
+};
+
+std::unique_ptr<StructuredVjp> buildStructuredVjp(const std::string &moduleText, const std::string &entry,
+                                                  const std::vector<std::string> &wrtPaths,
+                                                  const std::string &forwardSymbol, const std::string &backwardSymbol) {
+    std::vector<VernonStringView> paths;
+    paths.reserve(wrtPaths.size());
+    for (const std::string &path : wrtPaths)
+        paths.push_back({path.data(), path.size()});
+    auto view = [](const std::string &value) { return VernonStringView{value.data(), value.size()}; };
+    VernonPythonStructuredVjp *result = vernonCompilerBuildPythonStructuredVjp(
+        view(moduleText), view(entry), paths.data(), paths.size(), view(forwardSymbol), view(backwardSymbol));
+    if (!result)
+        throw std::bad_alloc();
+    std::unique_ptr<StructuredVjp> transformedResult = std::make_unique<StructuredVjp>(result);
+    VernonPythonStructuredVjpView transformed = transformedResult->current();
+    if (transformed.status != VERNON_STATUS_OK) {
+        std::string diagnostics = stringView(transformed.diagnostics);
+        throw std::invalid_argument(diagnostics.empty() ? "structured VJP transform failed" : diagnostics);
+    }
+    return transformedResult;
 }
 
 struct RhiHostState;
@@ -1204,9 +1260,9 @@ struct PythonPullback {
 
 struct LoadedPipeline {
     LoadedPipeline(Runtime *owner, VernonRuntimeContext *runtime, VernonPipelineBundle *bundle,
-                   VernonLoadedPipeline *pipeline, SharedCompileResult retainedResult = {})
+                   VernonLoadedPipeline *pipeline, std::vector<SharedCompileResult> retainedResults = {})
         : owner(owner), runtime(runtime), bundle(bundle), pipeline(pipeline),
-          retainedResult(std::move(retainedResult)) {}
+          retainedResults(std::move(retainedResults)) {}
     ~LoadedPipeline() {
         vernonRuntimeLoadedPipelineDestroy(pipeline);
         vernonRuntimePipelineBundleDestroy(bundle);
@@ -1420,7 +1476,7 @@ struct LoadedPipeline {
     VernonPipelineBundle *bundle{};
     VernonLoadedPipeline *pipeline{};
     // ORC entry pointers are valid only while their compile result owns the JIT.
-    SharedCompileResult retainedResult;
+    std::vector<SharedCompileResult> retainedResults;
 };
 struct Runtime {
     explicit Runtime(VernonRuntimeContext *handle, std::shared_ptr<RhiHostState> rhiHost = {})
@@ -1459,7 +1515,45 @@ struct Runtime {
                                                                    reflection.size(), entry.data(), entry.size());
         if (!pipeline)
             throw std::runtime_error("cannot load CPU entry: " + stringView(vernonRuntimeGetLastError(handle)));
-        return std::make_unique<LoadedPipeline>(this, handle, nullptr, pipeline, program.result);
+        return std::make_unique<LoadedPipeline>(this, handle, nullptr, pipeline,
+                                                std::vector<SharedCompileResult>{program.result});
+    }
+
+    std::unique_ptr<LoadedPipeline> loadCpuAutodiff(const CompiledProgram &primal, const std::string &primalName,
+                                                    const CompiledProgram &forward, const std::string &forwardName,
+                                                    const CompiledProgram &backward, const std::string &backwardName,
+                                                    const std::vector<std::string> &gradientPaths) {
+        const CompiledProgram *programs[] = {&primal, &forward, &backward};
+        const std::string *names[] = {&primalName, &forwardName, &backwardName};
+        VernonCpuEntryPoint entries[3]{};
+        std::string reflections[3];
+        for (size_t index = 0; index < 3; ++index) {
+            programs[index]->requireSuccess();
+            if (programs[index]->target != VERNON_TARGET_CPU)
+                throw std::runtime_error("direct autodiff profiles require CPU compiled programs");
+            if (names[index]->empty())
+                throw std::runtime_error("direct autodiff profile entry names must not be empty");
+            entries[index] = vernonCompileResultGetCpuEntry(programs[index]->result.get(), names[index]->data(),
+                                                            names[index]->size());
+            if (!entries[index])
+                throw std::runtime_error("direct autodiff profile entry '" + *names[index] + "' was not found");
+            reflections[index] = programs[index]->reflection();
+        }
+        auto view = [](const std::string &value) { return VernonStringView{value.data(), value.size()}; };
+        std::vector<VernonStringView> gradientViews;
+        gradientViews.reserve(gradientPaths.size());
+        for (const std::string &path : gradientPaths)
+            gradientViews.push_back(view(path));
+        VernonLoadedPipeline *pipeline = vernon::runtime::loadBackendCpuAutodiffPipeline(
+            *handle, entries[0], view(reflections[0]), view(primalName), entries[1], view(reflections[1]),
+            view(forwardName), entries[2], view(reflections[2]), view(backwardName), gradientViews.data(),
+            gradientViews.size());
+        if (!pipeline)
+            throw std::runtime_error("cannot load direct CPU autodiff profiles: " +
+                                     stringView(vernonRuntimeGetLastError(handle)));
+        return std::make_unique<LoadedPipeline>(
+            this, handle, nullptr, pipeline,
+            std::vector<SharedCompileResult>{primal.result, forward.result, backward.result});
     }
 
     std::unique_ptr<LoadedPipeline> loadComputeBundle(const std::string &directory) {
@@ -1610,6 +1704,12 @@ NB_MODULE(_native, module) {
     module.attr("IMAGE_COLOR_ATTACHMENT") = static_cast<uint32_t>(VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
     module.attr("IMAGE_DEPTH_STENCIL_ATTACHMENT") = static_cast<uint32_t>(VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT);
     module.def("_plan_value_abi", &planValueAbi, nb::arg("module"), nb::arg("logical_dtypes"));
+    nb::class_<StructuredVjp>(module, "_StructuredVjp")
+        .def_prop_ro("tape_bytes", &StructuredVjp::tapeBytes)
+        .def_prop_ro("derivative_rules", &StructuredVjp::derivativeRules)
+        .def("profiles", &StructuredVjp::profiles, nb::arg("identity"));
+    module.def("_build_structured_vjp", &buildStructuredVjp, nb::arg("module"), nb::arg("entry"), nb::arg("wrt_paths"),
+               nb::arg("forward_symbol"), nb::arg("backward_symbol"));
     nb::class_<Compiler>(module, "Compiler")
         .def(nb::init<>())
         .def("compile_program_result", &compileProgramResult, nb::arg("mlir"), nb::arg("target"),
@@ -1740,6 +1840,7 @@ NB_MODULE(_native, module) {
         .def(nb::init<VernonRuntimeBackend>(), nb::arg("backend"))
         .def("load", &Runtime::load, nb::keep_alive<0, 1>())
         .def("load_cpu_entry", &Runtime::loadCpuEntry, nb::keep_alive<0, 1>())
+        .def("load_cpu_autodiff", &Runtime::loadCpuAutodiff, nb::keep_alive<0, 1>())
         .def("load_compute_bundle", &Runtime::loadComputeBundle, nb::keep_alive<0, 1>())
         .def("load_pipeline", &Runtime::loadPipeline, nb::keep_alive<0, 1>())
         .def("load_pipeline_asset", &Runtime::loadPipelineAsset, nb::keep_alive<0, 1>())

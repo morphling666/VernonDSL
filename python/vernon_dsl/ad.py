@@ -1,8 +1,4 @@
-"""Declarative first-order reverse-mode automatic differentiation.
-
-The objects in this module are data, not an eager differentiation API.  The
-pipeline cooker parses the same declarations directly from source.
-"""
+"""Declarative first-order reverse-mode automatic differentiation."""
 
 from __future__ import annotations
 
@@ -108,6 +104,15 @@ class ProgramExpression:
     transform: ProgramTransformSpec
     rules: RuleSet | None = None
 
+    def __call__(
+        self,
+        *arguments: Any,
+        grid: tuple[int, int, int] | None = None,
+    ) -> tuple[Any, Callable[[Any | None], dict[str, Any]]]:
+        from ._runtime.autodiff import execute_direct_vjp
+
+        return execute_direct_vjp(self, arguments, grid)
+
 
 def rule_set(*, id: str, **rules: Callable[..., Any]) -> RuleSet:
     """Declare an immutable, versioned graphics VJP rule set."""
@@ -121,7 +126,7 @@ def vjp(
     wrt: tuple[str, ...] | list[str],
     rules: RuleSet | None = None,
 ) -> ProgramExpression:
-    """Describe a VJP transform without executing or importing compiler input."""
+    """Describe a VJP transform that may be cooked or directly executed on CPU."""
 
     if isinstance(program, ProgramExpression):
         raise TypeError("higher-order program transforms are not supported")

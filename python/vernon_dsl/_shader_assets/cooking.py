@@ -21,8 +21,12 @@ from ..bundle import (
     with_content_hash,
 )
 from ..compiler import Compiler, FrontendCompileRequest, compile_file
-from ..frontend.autodiff_native import AutodiffNativeLoweringError, emit_native_autodiff_modules
 from ..frontend.autodiff_profiles import build_autodiff_profile_plan
+from ..frontend.structured_vjp import (
+    build_structured_scalar_vjp,
+    is_structured_scalar_vjp_abi_eligible,
+    resolve_vjp_transform,
+)
 from ..language.stage_registry import validate_stage_target
 from ..module_graph import load_project
 from .artifact_io import write_external_artifact
@@ -220,40 +224,56 @@ def cook_pipeline_asset(
             stages[stage] = compiled
         planned_variants.append((variant, stages))
         if transform is not None:
-            frontend = Compiler().compile_request(
-                FrontendCompileRequest(
-                    selected_modules["compute"].source,
-                    pipeline.stages["compute"].entry,
-                    variant,
-                    program_transform=transform,
+            frontend = None
+            if target_name == "cpu":
+                frontend = Compiler().compile_request(
+                    FrontendCompileRequest(
+                        selected_modules["compute"].source,
+                        pipeline.stages["compute"].entry,
+                        variant,
+                    )
                 )
-            )
-            if frontend.program_graph is None or frontend.autodiff_profiles is None:
-                raise PipelineCompileError("VJP frontend produced no differentiated profile plan")
-            variant_transform = ProgramTransformSpec(
-                kind=transform.kind,
-                wrt=transform.wrt,
-                rule_set=transform.rule_set,
-                rule_set_identity=transform.rule_set_identity,
-                output_cotangents=frontend.program_graph.reverse.cotangent_paths,
-                gradient_policy=transform.gradient_policy,
-                accumulation_policy=transform.accumulation_policy,
-                tape_policy=transform.tape_policy,
-                derivative_rules_version=transform.derivative_rules_version,
-            )
+            if frontend is not None and is_structured_scalar_vjp_abi_eligible(frontend, transform):
+                try:
+                    structured = build_structured_scalar_vjp(native, frontend, transform)
+                except ValueError as error:
+                    raise PipelineCompileError(str(error)) from None
+                variant_transform = structured.transform
+                profile_plan = structured.plan
+                profile_modules = structured.profiles
+            else:
+                from ..frontend.autodiff_native import (
+                    AutodiffNativeLoweringError,
+                    emit_native_autodiff_modules,
+                )
+
+                legacy_frontend = Compiler().compile_request(
+                    FrontendCompileRequest(
+                        selected_modules["compute"].source,
+                        pipeline.stages["compute"].entry,
+                        variant,
+                        program_transform=transform,
+                    )
+                )
+                if legacy_frontend.program_graph is None or legacy_frontend.autodiff_profiles is None:
+                    raise PipelineCompileError("VJP frontend produced no differentiated profile plan")
+                variant_transform = resolve_vjp_transform(
+                    transform,
+                    legacy_frontend.program_graph.reverse.cotangent_paths,
+                )
+                profile_plan = build_autodiff_profile_plan(variant_transform, legacy_frontend.program_graph)
+                try:
+                    profile_modules = emit_native_autodiff_modules(
+                        legacy_frontend.program_graph,
+                        profile_plan,
+                        target=target_name,
+                    )
+                except AutodiffNativeLoweringError as error:
+                    raise PipelineCompileError(str(error)) from None
             if resolved_transform is None:
                 resolved_transform = variant_transform
             elif resolved_transform.output_cotangents != variant_transform.output_cotangents:
                 raise PipelineCompileError("VJP variants must expose the same canonical output cotangent paths")
-            profile_plan = build_autodiff_profile_plan(variant_transform, frontend.program_graph)
-            try:
-                profile_modules = emit_native_autodiff_modules(
-                    frontend.program_graph,
-                    profile_plan,
-                    target=target_name,
-                )
-            except AutodiffNativeLoweringError as error:
-                raise PipelineCompileError(str(error)) from None
             profile_programs: dict[str, dict[str, str]] = {"primal": {"compute": stages["compute"].id}}
             module = selected_modules["compute"]
             for profile_name, profile_mlir in profile_modules.items():

@@ -34,6 +34,8 @@ FailureOr<Type> getDerivativeValueType(Type type) {
 }
 
 Value castPrimal(OpBuilder &builder, Location location, Value value, Type targetType) {
+    if (!value)
+        return {};
     if (value.getType() == targetType)
         return value;
     Type sourceElement = getElementTypeOrSelf(value.getType());
@@ -176,8 +178,8 @@ LogicalResult buildMatmulVjp(Operation *operation, const AutodiffVjpBuildContext
     if (!leftType || !rightType || !leftType.hasStaticShape() || !rightType.hasStaticShape() ||
         leftType.getRank() < 1 || rightType.getRank() < 1)
         return operation->emitOpError("matmul VJP requires static ranked Tensor operands");
-    Value left = castPrimal(context.builder, context.location, context.primalOperands[0], leftType);
-    Value right = castPrimal(context.builder, context.location, context.primalOperands[1], rightType);
+    Value left = castPrimal(context.builder, context.location, context.getPrimalOperand(0), leftType);
+    Value right = castPrimal(context.builder, context.location, context.getPrimalOperand(1), rightType);
     if (failed(requireValues(operation, {left, right})))
         return failure();
 
@@ -274,9 +276,9 @@ LogicalResult buildMatmulVjp(Operation *operation, const AutodiffVjpBuildContext
 LogicalResult buildPowVjp(Operation *operation, const AutodiffVjpBuildContext &context,
                           SmallVectorImpl<Value> &results) {
     Value seed = context.resultCotangents[0];
-    Value base = castPrimal(context.builder, context.location, context.primalOperands[0], seed.getType());
-    Value exponent = castPrimal(context.builder, context.location, context.primalOperands[1], seed.getType());
-    Value output = castPrimal(context.builder, context.location, context.primalResults[0], seed.getType());
+    Value base = castPrimal(context.builder, context.location, context.getPrimalOperand(0), seed.getType());
+    Value exponent = castPrimal(context.builder, context.location, context.getPrimalOperand(1), seed.getType());
+    Value output = castPrimal(context.builder, context.location, context.getPrimalResult(0), seed.getType());
     if (failed(requireValues(operation, {base, exponent, output})))
         return failure();
     Value one = constant(context.builder, context.location, seed.getType(), 1.0);
@@ -375,6 +377,12 @@ FailureOr<SmallVector<Value>> DifferentiationRule::buildVjp(Operation *operation
     FailureOr<Type> derivativeType = getDerivativeValueType(operation->getResult(0).getType());
     if (failed(derivativeType) || context.resultCotangents.front().getType() != *derivativeType)
         return operation->emitOpError("autodiff VJP cotangent has an incompatible derivative type");
+    for (const AutodiffPrimalRequirement &requirement : vjpPrimalRequirements) {
+        Value primal = requirement.kind == AutodiffPrimalKind::Operand ? context.getPrimalOperand(requirement.index)
+                                                                       : context.getPrimalResult(requirement.index);
+        if (!primal)
+            return operation->emitOpError("autodiff VJP provider omitted a declared primal requirement");
+    }
     SmallVector<Value> contributions;
     if (failed(vjpBuilder(operation, context, contributions)))
         return failure();
@@ -467,9 +475,9 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
                  [](Operation *operation, const AutodiffVjpBuildContext &context, SmallVectorImpl<Value> &results) {
                      Value seed = context.resultCotangents[0];
                      Value left =
-                         castPrimal(context.builder, context.location, context.primalOperands[0], seed.getType());
+                         castPrimal(context.builder, context.location, context.getPrimalOperand(0), seed.getType());
                      Value right =
-                         castPrimal(context.builder, context.location, context.primalOperands[1], seed.getType());
+                         castPrimal(context.builder, context.location, context.getPrimalOperand(1), seed.getType());
                      if (failed(requireValues(operation, {left, right})))
                          return failure();
                      results.push_back(arith::MulFOp::create(context.builder, context.location, seed, right));
@@ -480,9 +488,9 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
                  [](Operation *operation, const AutodiffVjpBuildContext &context, SmallVectorImpl<Value> &results) {
                      Value seed = context.resultCotangents[0];
                      Value numerator =
-                         castPrimal(context.builder, context.location, context.primalOperands[0], seed.getType());
+                         castPrimal(context.builder, context.location, context.getPrimalOperand(0), seed.getType());
                      Value denominator =
-                         castPrimal(context.builder, context.location, context.primalOperands[1], seed.getType());
+                         castPrimal(context.builder, context.location, context.getPrimalOperand(1), seed.getType());
                      if (failed(requireValues(operation, {numerator, denominator})))
                          return failure();
                      results.push_back(arith::DivFOp::create(context.builder, context.location, seed, denominator));
@@ -502,7 +510,7 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
                  [](Operation *operation, const AutodiffVjpBuildContext &context, SmallVectorImpl<Value> &results) {
                      Value seed = context.resultCotangents[0];
                      Value input =
-                         castPrimal(context.builder, context.location, context.primalOperands[0], seed.getType());
+                         castPrimal(context.builder, context.location, context.getPrimalOperand(0), seed.getType());
                      if (failed(requireValues(operation, {input})))
                          return failure();
                      Value factor = math::CosOp::create(context.builder, context.location, input);
@@ -513,7 +521,7 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
                  [](Operation *operation, const AutodiffVjpBuildContext &context, SmallVectorImpl<Value> &results) {
                      Value seed = context.resultCotangents[0];
                      Value input =
-                         castPrimal(context.builder, context.location, context.primalOperands[0], seed.getType());
+                         castPrimal(context.builder, context.location, context.getPrimalOperand(0), seed.getType());
                      if (failed(requireValues(operation, {input})))
                          return failure();
                      Value sine = math::SinOp::create(context.builder, context.location, input);
@@ -525,7 +533,7 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
                  [](Operation *operation, const AutodiffVjpBuildContext &context, SmallVectorImpl<Value> &results) {
                      Value seed = context.resultCotangents[0];
                      Value output =
-                         castPrimal(context.builder, context.location, context.primalResults[0], seed.getType());
+                         castPrimal(context.builder, context.location, context.getPrimalResult(0), seed.getType());
                      if (failed(requireValues(operation, {output})))
                          return failure();
                      results.push_back(arith::MulFOp::create(context.builder, context.location, seed, output));
@@ -535,7 +543,7 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
                  [](Operation *operation, const AutodiffVjpBuildContext &context, SmallVectorImpl<Value> &results) {
                      Value seed = context.resultCotangents[0];
                      Value input =
-                         castPrimal(context.builder, context.location, context.primalOperands[0], seed.getType());
+                         castPrimal(context.builder, context.location, context.getPrimalOperand(0), seed.getType());
                      if (failed(requireValues(operation, {input})))
                          return failure();
                      results.push_back(arith::DivFOp::create(context.builder, context.location, seed, input));
@@ -545,7 +553,7 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
                  [](Operation *operation, const AutodiffVjpBuildContext &context, SmallVectorImpl<Value> &results) {
                      Value seed = context.resultCotangents[0];
                      Value output =
-                         castPrimal(context.builder, context.location, context.primalResults[0], seed.getType());
+                         castPrimal(context.builder, context.location, context.getPrimalResult(0), seed.getType());
                      if (failed(requireValues(operation, {output})))
                          return failure();
                      Value half = constant(context.builder, context.location, seed.getType(), 0.5);
@@ -557,7 +565,7 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
                  [](Operation *operation, const AutodiffVjpBuildContext &context, SmallVectorImpl<Value> &results) {
                      Value seed = context.resultCotangents[0];
                      Value input =
-                         castPrimal(context.builder, context.location, context.primalOperands[0], seed.getType());
+                         castPrimal(context.builder, context.location, context.getPrimalOperand(0), seed.getType());
                      if (failed(requireValues(operation, {input})))
                          return failure();
                      Value one = constant(context.builder, context.location, seed.getType(), 1.0);
@@ -568,32 +576,32 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
                      results.push_back(negative(context.builder, context.location, quotient));
                      return success();
                  }));
-    add(makeRule(math::Atan2Op::getOperationName(), 2, {Requirement::operand(0), Requirement::operand(1)},
-                 [](Operation *operation, const AutodiffVjpBuildContext &context, SmallVectorImpl<Value> &results) {
-                     Value seed = context.resultCotangents[0];
-                     Value y = castPrimal(context.builder, context.location, context.primalOperands[0], seed.getType());
-                     Value x = castPrimal(context.builder, context.location, context.primalOperands[1], seed.getType());
-                     if (failed(requireValues(operation, {y, x})))
-                         return failure();
-                     Value denominator =
-                         arith::AddFOp::create(context.builder, context.location,
-                                               arith::MulFOp::create(context.builder, context.location, y, y),
-                                               arith::MulFOp::create(context.builder, context.location, x, x));
-                     Value dy = arith::DivFOp::create(context.builder, context.location,
-                                                      arith::MulFOp::create(context.builder, context.location, seed, x),
-                                                      denominator);
-                     Value dx = arith::DivFOp::create(context.builder, context.location,
-                                                      arith::MulFOp::create(context.builder, context.location, seed, y),
-                                                      denominator);
-                     results.append({dy, negative(context.builder, context.location, dx)});
-                     return success();
-                 }));
+    add(makeRule(
+        math::Atan2Op::getOperationName(), 2, {Requirement::operand(0), Requirement::operand(1)},
+        [](Operation *operation, const AutodiffVjpBuildContext &context, SmallVectorImpl<Value> &results) {
+            Value seed = context.resultCotangents[0];
+            Value y = castPrimal(context.builder, context.location, context.getPrimalOperand(0), seed.getType());
+            Value x = castPrimal(context.builder, context.location, context.getPrimalOperand(1), seed.getType());
+            if (failed(requireValues(operation, {y, x})))
+                return failure();
+            Value denominator = arith::AddFOp::create(context.builder, context.location,
+                                                      arith::MulFOp::create(context.builder, context.location, y, y),
+                                                      arith::MulFOp::create(context.builder, context.location, x, x));
+            Value dy =
+                arith::DivFOp::create(context.builder, context.location,
+                                      arith::MulFOp::create(context.builder, context.location, seed, x), denominator);
+            Value dx =
+                arith::DivFOp::create(context.builder, context.location,
+                                      arith::MulFOp::create(context.builder, context.location, seed, y), denominator);
+            results.append({dy, negative(context.builder, context.location, dx)});
+            return success();
+        }));
     add(makeRule(
         math::AbsFOp::getOperationName(), 1, {Requirement::operand(0)},
         [](Operation *operation, const AutodiffVjpBuildContext &context,
            SmallVectorImpl<Value> &results) -> LogicalResult {
             Value seed = context.resultCotangents[0];
-            Value input = castPrimal(context.builder, context.location, context.primalOperands[0], seed.getType());
+            Value input = castPrimal(context.builder, context.location, context.getPrimalOperand(0), seed.getType());
             if (failed(requireValues(operation, {input})))
                 return failure();
             Value zero = constant(context.builder, context.location, seed.getType(), 0.0);
@@ -627,8 +635,8 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
             if (leftTensor.getRank() != 1 || leftTensor != rightTensor ||
                 operation->getResult(0).getType() != getElementTypeOrSelf(operation->getOperand(0).getType()))
                 return operation->emitOpError("dot VJP requires equal vectors and a matching scalar result");
-            Value left = castPrimal(context.builder, context.location, context.primalOperands[0], *leftType);
-            Value right = castPrimal(context.builder, context.location, context.primalOperands[1], *rightType);
+            Value left = castPrimal(context.builder, context.location, context.getPrimalOperand(0), *leftType);
+            Value right = castPrimal(context.builder, context.location, context.getPrimalOperand(1), *rightType);
             if (failed(requireValues(operation, {left, right})))
                 return failure();
             results.append({scale(context.builder, context.location, right, seed),
@@ -648,8 +656,8 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
                 cast<RankedTensorType>(*leftType).getDimSize(0) != 3 || *leftType != *rightType ||
                 operation->getResult(0).getType() != operation->getOperand(0).getType())
                 return operation->emitOpError("cross VJP requires matching three-component vectors");
-            Value left = castPrimal(context.builder, context.location, context.primalOperands[0], *leftType);
-            Value right = castPrimal(context.builder, context.location, context.primalOperands[1], *rightType);
+            Value left = castPrimal(context.builder, context.location, context.getPrimalOperand(0), *leftType);
+            Value right = castPrimal(context.builder, context.location, context.getPrimalOperand(1), *rightType);
             if (failed(requireValues(operation, {left, right})))
                 return failure();
             results.append({createIntrinsic(context.builder, context.location, "cross", {right, seed}, *leftType),
@@ -684,7 +692,7 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
             if (cast<RankedTensorType>(*inputType).getRank() != 1 ||
                 operation->getResult(0).getType() != operation->getOperand(0).getType())
                 return operation->emitOpError("normalize VJP requires matching vector operand and result types");
-            Value input = castPrimal(context.builder, context.location, context.primalOperands[0], *inputType);
+            Value input = castPrimal(context.builder, context.location, context.getPrimalOperand(0), *inputType);
             if (failed(requireValues(operation, {input})))
                 return failure();
             auto tensorType = cast<RankedTensorType>(*inputType);
@@ -714,8 +722,9 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
                 cast<RankedTensorType>(*directionType).getRank() != 1 || *directionType != *normalType ||
                 operation->getResult(0).getType() != operation->getOperand(0).getType())
                 return operation->emitOpError("reflect VJP requires floating-point ranked Tensor operands");
-            Value direction = castPrimal(context.builder, context.location, context.primalOperands[0], *directionType);
-            Value normal = castPrimal(context.builder, context.location, context.primalOperands[1], *normalType);
+            Value direction =
+                castPrimal(context.builder, context.location, context.getPrimalOperand(0), *directionType);
+            Value normal = castPrimal(context.builder, context.location, context.getPrimalOperand(1), *normalType);
             if (failed(requireValues(operation, {direction, normal})))
                 return failure();
             Type elementType = cast<RankedTensorType>(*directionType).getElementType();
@@ -763,8 +772,13 @@ LogicalResult verifyAutodiffRuleCoverage(const VernonAutodiffAnalysisResult &ana
                                          const VernonAutodiffRuleRegistry &registry) {
     for (const AutodiffOperationActivity &activity : analysis.getOperations()) {
         Operation *operation = activity.operation;
-        if (!activity.active || operation->getNumResults() != 1 ||
-            !isDifferentiableValueType(operation->getResult(0).getType()) || isStructuralAutodiffOperation(operation))
+        if (!activity.active || isStructuralAutodiffOperation(operation))
+            continue;
+        if (operation->getNumResults() == 0)
+            continue;
+        if (operation->getNumResults() > 1)
+            return operation->emitOpError("active autodiff operation must have exactly one result");
+        if (!isDifferentiableValueType(operation->getResult(0).getType()))
             continue;
         const DifferentiationRule *rule = registry.lookup(operation);
         if (!rule)

@@ -50,6 +50,7 @@ class FrontendCompileResult:
     typed_functions: tuple[TypedFunctionInstance, ...] = ()
     program_graph: AutodiffProgram | None = None
     autodiff_profiles: AutodiffProfilePlan | None = None
+    entry_workgroup_size: tuple[int, int, int] | None = None
 
     @property
     def semantic_inputs(self) -> dict[str, Any]:

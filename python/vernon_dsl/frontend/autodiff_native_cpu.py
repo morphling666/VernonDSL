@@ -770,10 +770,6 @@ def _backward_function(
         )
         target[value] = result
 
-    def merge(target: dict[NodeId, str], source: dict[NodeId, str], target_lines: list[str]) -> None:
-        for value, contribution in source.items():
-            accumulate(target, value, contribution, target_lines)
-
     def constant(value_type: ConcreteType, value: str, target_lines: list[str]) -> str:
         result = names.fresh()
         target_lines.append(
@@ -786,15 +782,9 @@ def _backward_function(
         target_lines.append(f"    {result} = math.{operation} {operand} : {_native_mlir(value_type)}")
         return result
 
-    def backprop(value: NodeId, seed: str, target_lines: list[str]) -> dict[NodeId, str]:
+    def propagate(value: NodeId, seed: str, target_lines: list[str]) -> dict[NodeId, str]:
         node = nodes[value]
         value_type = native_gradient_type(node.type)
-        if value in gradient_node_ids:
-            return {value: seed}
-        if node.operation is OpCode.PARAMETER:
-            return {}
-        if node.operation in {OpCode.CONSTANT, OpCode.COMPARE}:
-            return {}
         if node.operation is OpCode.CONDITIONAL:
             condition = primal[node.inputs[0]]
             result_names = [names.fresh() for _ in gradient_nodes]
@@ -968,7 +958,28 @@ def _backward_function(
         for operand, contribution in zip(node.inputs, contributions, strict=True):
             if contribution is None:
                 continue
-            merge(result, backprop(operand, contribution, target_lines), target_lines)
+            accumulate(result, operand, contribution, target_lines)
+        return result
+
+    def backprop(value: NodeId, seed: str, target_lines: list[str]) -> dict[NodeId, str]:
+        pending = {value: seed}
+        result: dict[NodeId, str] = {}
+        for node in reversed(graph.nodes):
+            node_seed = pending.pop(node.id, None)
+            if node_seed is None:
+                continue
+            if node.id in gradient_node_ids:
+                accumulate(result, node.id, node_seed, target_lines)
+                continue
+            if node.operation in {OpCode.PARAMETER, OpCode.CONSTANT, OpCode.COMPARE}:
+                continue
+            for operand, contribution in propagate(node.id, node_seed, target_lines).items():
+                if operand in gradient_node_ids:
+                    accumulate(result, operand, contribution, target_lines)
+                else:
+                    accumulate(pending, operand, contribution, target_lines)
+        if pending:
+            raise AutodiffNativeLoweringError("semantic graph is not topologically ordered")
         return result
 
     adjoints = backprop(graph.outputs[0], "%cotangent", lines)

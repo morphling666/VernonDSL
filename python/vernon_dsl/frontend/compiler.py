@@ -60,6 +60,7 @@ class Compiler:
         )
         self._helper_specializations = tuple(getattr(module, "_vernon_helper_specializations", ()))
         self._typed_functions = tuple(getattr(module, "_vernon_typed_functions", ()))
+        self._entry_workgroup_size: tuple[int, int, int] | None = None
         context.typed_functions = {function.symbol: function for function in self._typed_functions}
         self._collect_signatures(module, context, type_parser)
         self._program_graph: AutodiffProgram | None = None
@@ -98,6 +99,8 @@ class Compiler:
                 if stage != "compute":
                     raise context.error(node, "runtime workgroup size applies only to compute entries")
                 workgroup_size = runtime_workgroup_size
+            if node.name == runtime_entry:
+                self._entry_workgroup_size = workgroup_size
             annotations = [type_parser.parse(argument.annotation) for argument in node.args.args]
             return _FunctionEmitter(
                 context,
@@ -149,6 +152,7 @@ class Compiler:
             self._typed_functions = cached.typed_functions
             self._program_graph = cached.program_graph
             self._autodiff_profiles = cached.autodiff_profiles
+            self._entry_workgroup_size = cached.entry_workgroup_size
             return cached
 
         project = load_project(request.source_path, request.enabled_features, request.entry)
@@ -173,6 +177,7 @@ class Compiler:
             self._typed_functions,
             self._program_graph,
             self._autodiff_profiles,
+            self._entry_workgroup_size,
         )
         frontend_cache.put(request, result, project.dependency_files)
         return result

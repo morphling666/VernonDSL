@@ -3,9 +3,10 @@
 #include "compiler_frontend.h"
 #include "compiler_internal.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonStructuredVjp.h"
 #include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 
 #include <memory>
@@ -52,6 +53,16 @@ struct VernonPythonValueAbiPlan {
     std::string diagnostics;
     std::vector<ValueAbiNode> nodes;
     std::vector<VernonPythonValueAbiNodeView> nodeViews;
+};
+
+struct VernonPythonStructuredVjp {
+    VernonStatus status{VERNON_STATUS_INTERNAL_ERROR};
+    std::string diagnostics;
+    std::string forwardModule;
+    std::string backwardModule;
+    uint64_t tapeBytes{};
+    std::vector<std::string> derivativeRules;
+    std::vector<VernonStringView> derivativeRuleViews;
 };
 
 extern "C" {
@@ -129,6 +140,158 @@ VernonPythonValueAbiPlanView vernonCompilerGetPythonValueAbiPlanView(const Verno
     if (!plan)
         return {VERNON_STATUS_INVALID_ARGUMENT, {}, nullptr, 0};
     return {plan->status, viewOf(plan->diagnostics), plan->nodeViews.data(), plan->nodeViews.size()};
+}
+
+VernonPythonStructuredVjp *vernonCompilerBuildPythonStructuredVjp(VernonStringView module, VernonStringView entry,
+                                                                  const VernonStringView *wrtPaths, size_t wrtPathCount,
+                                                                  VernonStringView forwardSymbol,
+                                                                  VernonStringView backwardSymbol) {
+    std::unique_ptr<VernonPythonStructuredVjp> result(new (std::nothrow) VernonPythonStructuredVjp());
+    if (!result)
+        return nullptr;
+    auto present = [](VernonStringView value) { return value.data && value.size; };
+    if (!present(module) || !present(entry) || !present(forwardSymbol) || !present(backwardSymbol) ||
+        (!wrtPaths && wrtPathCount != 0) || wrtPathCount == 0) {
+        result->status = VERNON_STATUS_INVALID_ARGUMENT;
+        result->diagnostics = "structured VJP bridge input is invalid";
+        return result.release();
+    }
+    for (size_t index = 0; index < wrtPathCount; ++index) {
+        if (!present(wrtPaths[index])) {
+            result->status = VERNON_STATUS_INVALID_ARGUMENT;
+            result->diagnostics = "structured VJP wrt path is invalid";
+            return result.release();
+        }
+    }
+
+    FrontendPtr &frontend = planningFrontend();
+    if (!frontend) {
+        result->diagnostics = "cannot create compiler frontend for structured VJP";
+        return result.release();
+    }
+    mlir::MLIRContext &context = vernon::compiler::compilerMlirContext(*frontend);
+    mlir::ScopedDiagnosticHandler diagnostics(&context, [&](mlir::Diagnostic &diagnostic) {
+        vernon::compiler::appendDiagnostic(result->diagnostics, diagnostic);
+        return mlir::success();
+    });
+    mlir::OwningOpRef<mlir::ModuleOp> parsed =
+        mlir::parseSourceString<mlir::ModuleOp>(llvm::StringRef(module.data, module.size), &context);
+    if (!parsed) {
+        result->status = VERNON_STATUS_PARSE_ERROR;
+        return result.release();
+    }
+    if (mlir::failed(mlir::verify(*parsed))) {
+        result->status = VERNON_STATUS_VERIFICATION_ERROR;
+        return result.release();
+    }
+    std::string entryName(entry.data, entry.size);
+    mlir::func::FuncOp primal = parsed->lookupSymbol<mlir::func::FuncOp>(entryName);
+    if (!primal) {
+        result->status = VERNON_STATUS_INVALID_ARGUMENT;
+        result->diagnostics = "structured VJP entry function was not found";
+        return result.release();
+    }
+    mlir::vernon::StructuredVjpOptions options;
+    options.forwardSymbol.assign(forwardSymbol.data, forwardSymbol.size);
+    options.backwardSymbol.assign(backwardSymbol.data, backwardSymbol.size);
+    for (size_t index = 0; index < wrtPathCount; ++index)
+        options.wrtPaths.emplace_back(wrtPaths[index].data, wrtPaths[index].size);
+    mlir::FailureOr<mlir::vernon::StructuredVjpResult> transformed =
+        mlir::vernon::buildStructuredScalarVjp(primal, options);
+    if (mlir::failed(transformed)) {
+        result->status = VERNON_STATUS_VERIFICATION_ERROR;
+        return result.release();
+    }
+    result->tapeBytes = transformed->tapeBytes;
+    result->derivativeRules.assign(transformed->derivativeRules.begin(), transformed->derivativeRules.end());
+    result->derivativeRuleViews.reserve(result->derivativeRules.size());
+    for (const std::string &rule : result->derivativeRules)
+        result->derivativeRuleViews.push_back(viewOf(rule));
+    auto printProfile = [&](llvm::StringRef keptSymbol, llvm::StringRef removedSymbol,
+                            llvm::StringRef profileName) -> mlir::FailureOr<std::string> {
+        mlir::OwningOpRef<mlir::ModuleOp> profile(mlir::cast<mlir::ModuleOp>(parsed->clone()));
+        mlir::func::FuncOp removed = profile->lookupSymbol<mlir::func::FuncOp>(removedSymbol);
+        mlir::func::FuncOp original = profile->lookupSymbol<mlir::func::FuncOp>(entryName);
+        mlir::func::FuncOp kept = profile->lookupSymbol<mlir::func::FuncOp>(keptSymbol);
+        if (!removed || !original || !kept)
+            return mlir::failure();
+        removed.erase();
+        original.erase();
+        profile->getOperation()->setAttr("vernon.ad_profile", mlir::StringAttr::get(&context, profileName));
+        kept->setAttr("vernon.entry", mlir::UnitAttr::get(&context));
+        if (mlir::failed(mlir::verify(*profile)))
+            return mlir::failure();
+        std::string text;
+        llvm::raw_string_ostream stream(text);
+        profile->print(stream, mlir::OpPrintingFlags().enableDebugInfo(false));
+        stream << '\n';
+        return text;
+    };
+    mlir::FailureOr<std::string> forward =
+        printProfile(options.forwardSymbol, options.backwardSymbol, "forward_with_tape");
+    mlir::FailureOr<std::string> backward = printProfile(options.backwardSymbol, options.forwardSymbol, "backward");
+    if (mlir::failed(forward) || mlir::failed(backward)) {
+        result->status = VERNON_STATUS_VERIFICATION_ERROR;
+        result->diagnostics += "cannot isolate generated structured VJP profiles";
+        return result.release();
+    }
+    result->forwardModule = std::move(*forward);
+    result->backwardModule = std::move(*backward);
+    result->status = VERNON_STATUS_OK;
+    return result.release();
+}
+
+VernonStatus vernonCompilerFinalizePythonStructuredVjp(VernonPythonStructuredVjp *result,
+                                                       VernonStringView profilesIdentity) {
+    if (!result || !profilesIdentity.data || !profilesIdentity.size)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    FrontendPtr &frontend = planningFrontend();
+    if (!frontend)
+        return VERNON_STATUS_INTERNAL_ERROR;
+    mlir::MLIRContext &context = vernon::compiler::compilerMlirContext(*frontend);
+    result->diagnostics.clear();
+    mlir::ScopedDiagnosticHandler diagnostics(&context, [&](mlir::Diagnostic &diagnostic) {
+        vernon::compiler::appendDiagnostic(result->diagnostics, diagnostic);
+        return mlir::success();
+    });
+    const std::string identity(profilesIdentity.data, profilesIdentity.size);
+    auto finalize = [&](const std::string &text, std::string &finalized) -> mlir::LogicalResult {
+        mlir::OwningOpRef<mlir::ModuleOp> profile = mlir::parseSourceString<mlir::ModuleOp>(text, &context);
+        if (!profile)
+            return mlir::failure();
+        profile->getOperation()->setAttr("vernon.ad_profiles_identity", mlir::StringAttr::get(&context, identity));
+        if (mlir::failed(mlir::verify(*profile)))
+            return mlir::failure();
+        llvm::raw_string_ostream stream(finalized);
+        profile->print(stream, mlir::OpPrintingFlags().enableDebugInfo(false));
+        stream << '\n';
+        return mlir::success();
+    };
+    std::string forward;
+    std::string backward;
+    if (mlir::failed(finalize(result->forwardModule, forward)) ||
+        mlir::failed(finalize(result->backwardModule, backward))) {
+        result->status = VERNON_STATUS_VERIFICATION_ERROR;
+        return result->status;
+    }
+    result->forwardModule = std::move(forward);
+    result->backwardModule = std::move(backward);
+    result->status = VERNON_STATUS_OK;
+    return result->status;
+}
+
+void vernonCompilerDestroyPythonStructuredVjp(VernonPythonStructuredVjp *result) { delete result; }
+
+VernonPythonStructuredVjpView vernonCompilerGetPythonStructuredVjpView(const VernonPythonStructuredVjp *result) {
+    if (!result)
+        return {VERNON_STATUS_INVALID_ARGUMENT, {}, {}, {}, 0, nullptr, 0};
+    return {result->status,
+            viewOf(result->diagnostics),
+            viewOf(result->forwardModule),
+            viewOf(result->backwardModule),
+            result->tapeBytes,
+            result->derivativeRuleViews.data(),
+            result->derivativeRuleViews.size()};
 }
 
 } // extern "C"

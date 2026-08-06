@@ -5,6 +5,7 @@ import weakref
 from dataclasses import dataclass
 from typing import Any
 
+from .autodiff import invalidate_loaded_vjps
 from .kernel import Kernel
 from .pipeline import Pipeline, PrimitiveTopology, lines, pipeline, points, triangles
 from .resources import TensorLayout, TensorStorage, TensorView, Texture
@@ -48,6 +49,7 @@ class RuntimeUnavailableError(RuntimeError):
 def _release_runtime() -> None:
     global _native_runtime, _rhi_host, _owned_opengl_context
     Kernel.invalidate_loaded()
+    invalidate_loaded_vjps()
     for compiled in Pipeline._cache.values():
         compiled.native = None
     for child in list(_runtime_children):

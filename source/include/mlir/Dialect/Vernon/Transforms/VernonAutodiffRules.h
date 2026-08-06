@@ -47,6 +47,13 @@ struct AutodiffVjpBuildContext {
     ValueRange primalOperands;
     ValueRange primalResults;
     ValueRange resultCotangents;
+
+    Value getPrimalOperand(unsigned index) const {
+        return index < primalOperands.size() ? primalOperands[index] : Value{};
+    }
+    Value getPrimalResult(unsigned index) const {
+        return index < primalResults.size() ? primalResults[index] : Value{};
+    }
 };
 
 /// Inputs reserved for the future forward transform. Keeping this callback in

@@ -6,8 +6,15 @@ from typing import Any
 
 from ..ad import ProgramTransformSpec
 from ..bundle import canonical_json
-from .autodiff import AutodiffProgram, LaunchPlan, OpCode
-from .model import ConcreteType
+from .autodiff import (
+    AccessPatternEvidence,
+    AccumulationMode,
+    AccumulationPlan,
+    AutodiffProgram,
+    LaunchPlan,
+    OpCode,
+)
+from .model import ConcreteType, TypedFunctionInstance
 
 
 @dataclass(frozen=True)
@@ -191,9 +198,93 @@ def build_autodiff_profile_plan(
     )
 
 
+def build_structured_scalar_profile_plan(
+    transform: ProgramTransformSpec,
+    entry: TypedFunctionInstance,
+    primal_mlir: str,
+    tape_bytes: int,
+    derivative_rules: tuple[str, ...],
+    workgroup_size: tuple[int, int, int],
+) -> AutodiffProfilePlan:
+    """Build profile metadata without constructing the legacy AD program graph."""
+    if entry.result_type is None or entry.result_type.kind != "scalar" or not entry.result_type.is_float:
+        raise ValueError("structured scalar VJP requires one floating-point scalar result")
+    parameters = {parameter.name: parameter.type for parameter in entry.parameters}
+    if any(path not in parameters for path in transform.wrt):
+        raise ValueError("structured scalar VJP wrt paths must name scalar parameters")
+    gradients = tuple(
+        AutodiffBinding(path, _gradient_type(parameters[path]).mlir, "gradient") for path in transform.wrt
+    )
+    program_identity = hashlib.sha256(primal_mlir.encode("utf-8")).hexdigest()
+    primal_inputs = tuple(
+        AutodiffBinding(parameter.name, parameter.type.mlir, "primal")
+        for parameter in entry.parameters
+        if parameter.builtin is None
+    )
+    output_type = entry.result_type
+    profile_symbols = structured_scalar_profile_symbols(transform, entry, primal_mlir)
+    profiles = (
+        AutodiffProfile(
+            "primal",
+            profile_symbols[0],
+            primal_inputs,
+            (AutodiffBinding("output", output_type.mlir, "primal"),),
+        ),
+        AutodiffProfile(
+            "forward_with_tape",
+            profile_symbols[1],
+            primal_inputs,
+            (
+                AutodiffBinding("output", output_type.mlir, "primal"),
+                AutodiffBinding("tape", f"!vernon.ad_tape<{tape_bytes}>", "tape"),
+            ),
+        ),
+        AutodiffProfile(
+            "backward",
+            profile_symbols[2],
+            (
+                AutodiffBinding("tape", f"!vernon.ad_tape<{tape_bytes}>", "tape"),
+                AutodiffBinding("output", _gradient_type(output_type).mlir, "cotangent"),
+            ),
+            gradients,
+        ),
+    )
+    return AutodiffProfilePlan(
+        transform.identity,
+        program_identity,
+        tape_bytes,
+        derivative_rules,
+        transform.derivative_rules_version,
+        LaunchPlan(
+            workgroup_size,
+            tuple(
+                AccumulationPlan(
+                    path,
+                    AccumulationMode.REDUCE_SUM,
+                    (AccessPatternEvidence.SHARED_VALUE,),
+                )
+                for path in transform.wrt
+            ),
+        ),
+        profiles,
+    )
+
+
+def structured_scalar_profile_symbols(
+    transform: ProgramTransformSpec,
+    entry: TypedFunctionInstance,
+    primal_mlir: str,
+) -> tuple[str, str, str]:
+    program_identity = hashlib.sha256(primal_mlir.encode("utf-8")).hexdigest()
+    prefix = hashlib.sha256(f"{transform.identity}:{program_identity}".encode("utf-8")).hexdigest()[:20]
+    return entry.symbol, f"vernon_ad_{prefix}_forward", f"vernon_ad_{prefix}_backward"
+
+
 __all__ = [
     "AutodiffBinding",
     "AutodiffProfile",
     "AutodiffProfilePlan",
     "build_autodiff_profile_plan",
+    "build_structured_scalar_profile_plan",
+    "structured_scalar_profile_symbols",
 ]

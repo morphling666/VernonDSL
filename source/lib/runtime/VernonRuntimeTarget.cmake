@@ -169,6 +169,7 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff_cpu.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff_gpu.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff_graph.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_direct_autodiff.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/backend_cpu.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/backend_opengl.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_backend_dispatch.cpp

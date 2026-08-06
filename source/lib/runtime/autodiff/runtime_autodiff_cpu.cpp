@@ -558,23 +558,13 @@ private:
     Signature signature_;
 };
 
-} // namespace
-
-bool createCpuExecutable(VernonRuntimeContext &context, const Stage &forwardStage, const Stage &backwardStage,
+bool finishCpuExecutable(VernonRuntimeContext &context, const Stage &forwardStage, const Stage &backwardStage,
+                         std::shared_ptr<CpuKernelState> forwardKernel, std::shared_ptr<CpuKernelState> backwardKernel,
                          const std::vector<std::string> &gradientPaths, std::shared_ptr<Executable> &executable) {
-    if (!forwardStage.cpuArtifact || !backwardStage.cpuArtifact) {
-        invocationDiagnostic(context) = "CPU autodiff profiles have no loadable artifacts";
-        return false;
-    }
     HostProfileLayout forward;
     HostProfileLayout backward;
-    auto forwardKernel = std::make_shared<CpuKernelState>();
-    auto backwardKernel = std::make_shared<CpuKernelState>();
-    ReflectedEntry reflection;
     if (!parseProfile(forwardStage, forward, invocationDiagnostic(context)) ||
-        !parseProfile(backwardStage, backward, invocationDiagnostic(context)) ||
-        !loadCpuNativeArtifact(*forwardStage.cpuArtifact, *forwardKernel, reflection, invocationDiagnostic(context)) ||
-        !loadCpuNativeArtifact(*backwardStage.cpuArtifact, *backwardKernel, reflection, invocationDiagnostic(context)))
+        !parseProfile(backwardStage, backward, invocationDiagnostic(context)))
         return false;
     if (forward.results.size() < 1 || backward.arguments.size() != 2 ||
         backward.arguments[0].leaves.size() + 1 != forward.results.size() || backward.arguments[1].leaves.size() != 1 ||
@@ -620,6 +610,53 @@ bool createCpuExecutable(VernonRuntimeContext &context, const Stage &forwardStag
         std::make_shared<CpuExecutable>(context, std::move(forward), std::move(backward), std::move(forwardKernel),
                                         std::move(backwardKernel), std::move(signature));
     return true;
+}
+
+} // namespace
+
+bool createCpuExecutable(VernonRuntimeContext &context, const Stage &forwardStage, const Stage &backwardStage,
+                         const std::vector<std::string> &gradientPaths, std::shared_ptr<Executable> &executable) {
+    if (!forwardStage.cpuArtifact || !backwardStage.cpuArtifact) {
+        invocationDiagnostic(context) = "CPU autodiff profiles have no loadable artifacts";
+        return false;
+    }
+    auto forwardKernel = std::make_shared<CpuKernelState>();
+    auto backwardKernel = std::make_shared<CpuKernelState>();
+    ReflectedEntry reflection;
+    if (!loadCpuNativeArtifact(*forwardStage.cpuArtifact, *forwardKernel, reflection, invocationDiagnostic(context)) ||
+        !loadCpuNativeArtifact(*backwardStage.cpuArtifact, *backwardKernel, reflection, invocationDiagnostic(context)))
+        return false;
+    return finishCpuExecutable(context, forwardStage, backwardStage, std::move(forwardKernel),
+                               std::move(backwardKernel), gradientPaths, executable);
+}
+
+bool createCpuEntryExecutable(VernonRuntimeContext &context, VernonCpuEntryPoint forwardEntry,
+                              VernonStringView forwardReflection, VernonStringView forwardName,
+                              VernonCpuEntryPoint backwardEntry, VernonStringView backwardReflection,
+                              VernonStringView backwardName, const std::vector<std::string> &gradientPaths,
+                              std::shared_ptr<Executable> &executable) {
+    if (!forwardEntry || !backwardEntry || !forwardReflection.data || !forwardReflection.size ||
+        !backwardReflection.data || !backwardReflection.size || !forwardName.data || !forwardName.size ||
+        !backwardName.data || !backwardName.size) {
+        invocationDiagnostic(context) = "direct CPU autodiff profiles are invalid";
+        return false;
+    }
+    Stage forwardStage;
+    forwardStage.entry.assign(forwardName.data, forwardName.size);
+    forwardStage.reflection.assign(forwardReflection.data, forwardReflection.size);
+    Stage backwardStage;
+    backwardStage.entry.assign(backwardName.data, backwardName.size);
+    backwardStage.reflection.assign(backwardReflection.data, backwardReflection.size);
+    auto forwardKernel = std::make_shared<CpuKernelState>();
+    auto backwardKernel = std::make_shared<CpuKernelState>();
+    ReflectedEntry reflection;
+    if (!loadCpuEntry(forwardEntry, forwardReflection.data, forwardReflection.size, forwardName.data, forwardName.size,
+                      *forwardKernel, reflection, invocationDiagnostic(context)) ||
+        !loadCpuEntry(backwardEntry, backwardReflection.data, backwardReflection.size, backwardName.data,
+                      backwardName.size, *backwardKernel, reflection, invocationDiagnostic(context)))
+        return false;
+    return finishCpuExecutable(context, forwardStage, backwardStage, std::move(forwardKernel),
+                               std::move(backwardKernel), gradientPaths, executable);
 }
 
 } // namespace vernon::runtime::ad

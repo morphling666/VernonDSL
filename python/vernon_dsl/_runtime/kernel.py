@@ -78,6 +78,9 @@ class Kernel:
     def clear_cache(cls) -> None:
         cls._cache.clear()
         cls._dispatch_cache.clear()
+        from .autodiff import clear_vjp_cache
+
+        clear_vjp_cache()
 
     @classmethod
     def invalidate_loaded(cls) -> None:

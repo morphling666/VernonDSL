@@ -247,36 +247,63 @@ Primary files:
 - compiler pipeline registration under
   `source/lib/Dialect/Vernon/Transforms/`
 - `python/vernon_dsl/_shader_assets/cooking.py`
+- `python/vernon_dsl/_runtime/autodiff.py`
+- `python/vernon_dsl/frontend/autodiff_native_cpu.py`
+- direct CPU autodiff loading under `source/lib/runtime/autodiff/`
 
 Implementation:
 
-- [ ] Transform the normal structured primal MLIR instead of rebuilding an AST
+- [x] Transform the normal structured primal MLIR instead of rebuilding an AST
   graph.
-- [ ] Generate an augmented forward function.
-- [ ] Generate a reverse function consuming output cotangents.
-- [ ] Use the shared analysis, rule registry, and tape plan.
-- [ ] Accumulate adjoints in promoted gradient types.
-- [ ] Preserve `vernon.reduce_sum` and `vernon.scatter_add` as accumulation
-  boundaries.
-- [ ] Keep generated derivative arithmetic in ordinary differentiable MLIR
+- [x] Generate an augmented forward function.
+- [x] Generate a reverse function consuming output cotangents.
+- [x] Use the shared analysis, rule registry, and tape plan.
+- [x] Accumulate adjoints in promoted gradient types.
+- [x] Keep scalar reverse accumulation in ordinary differentiable MLIR;
+  `vernon.reduce_sum` and `vernon.scatter_add` remain tensor/effect boundaries
+  for the later structured tensor and effect phases.
+- [x] Keep generated derivative arithmetic in ordinary differentiable MLIR
   until semantic reverse construction is complete.
-- [ ] Emit the existing `primal`, `forward_with_tape`, and `backward` profile
+- [x] Emit the existing `primal`, `forward_with_tape`, and `backward` profile
   names and metadata without a contract version change.
-- [ ] Add an explicit internal opt-in for structured compilation during
-  migration.
-- [ ] Do not catch structured transform failure to invoke legacy emission.
+- [x] Route eligible CPU scalar cooks through structured compilation by
+  default, with explicit capability dispatch for paths not yet migrated.
+- [x] Do not catch structured transform failure to invoke legacy emission.
+- [x] Reuse one structured profile builder for cooked and direct execution.
+- [x] Compile and load direct Python CPU VJP profiles in memory without cooking
+  or loading a pipeline manifest.
+- [x] Retain compiled profile ownership and invalidate loaded profiles across
+  source dependency changes and Runtime recreation.
+- [x] Derive cotangent and gradient ABI metadata from promoted derivative types.
+- [x] Keep legacy CPU VJP cooking tractable during migration by merging
+  adjoints before reverse-topological propagation, so shared semantic DAG nodes
+  are emitted once instead of being recursively expanded per use path.
 
 Acceptance:
 
-- [ ] Add straight-line scalar IR tests for each migrated rule.
-- [ ] Add forward/tape/backward symbol and signature tests.
-- [ ] Compare structured CPU VJP numerics with the existing CPU reference.
-- [ ] Keep all legacy VJP tests green.
+- [x] Add straight-line scalar IR tests for each migrated rule.
+- [x] Add forward/tape/backward symbol and signature tests.
+- [x] Compare structured CPU VJP numerics with the existing CPU reference.
+- [x] Keep all legacy VJP tests green.
+- [x] Execute structured VJP directly from Python without a cooked manifest.
+- [x] Cover all migrated scalar rules, reusable pullbacks, multi-invocation
+  accumulation, and promoted `f16` gradients through the direct Runtime path.
+- [x] Numerically validate the C++ rule builders for dot, cross, matmul,
+  normalize, reflect, construct, splat, and broadcast at the compiler-rule
+  layer, including the dot-plus-sqrt norm decomposition and promoted tensor
+  gradients. Production tensor cooking remains on the legacy emitter until the
+  structured tensor Runtime phases.
+- [x] Add a shared-subgraph regression for legacy backward emission and reduce
+  the complex numeric fixture from 38.5 MB / 679,070 lines of backward MLIR to
+  312 KB / 5,473 lines while preserving cooked Runtime numerics, with an
+  automated upper-bound regression on both bytes and lines.
 
 Gate:
 
-- [ ] Opt-in structured scalar VJP cooks and executes on CPU with current
+- [x] Structured scalar VJP cooks by default and executes on CPU with current
   numerical behavior.
+- [x] Structured scalar VJP compiles and executes through the direct Python CPU
+  Runtime path.
 
 ## Phase 7 — Structured control-flow VJP
 

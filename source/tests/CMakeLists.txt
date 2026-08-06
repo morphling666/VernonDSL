@@ -90,7 +90,7 @@ function(
                "${_vernon_wrapper}"
                ${_vernon_objects}
         COMMAND ${CMAKE_COMMAND} -E rm -rf "${_vernon_directory}"
-        COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${Python_EXECUTABLE} -m
+        COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${ARGN} ${Python_EXECUTABLE} -m
                 vernon_dsl.pipeline_asset_cli "${asset_reference}" --target cpu --output "${_vernon_directory}"
         COMMAND ${Python_EXECUTABLE} "${VERNON_TEST_ROOT}/scripts/prepare_autodiff_cooked_fixture.py"
                 "${_vernon_manifest}" "${CMAKE_C_OUTPUT_EXTENSION}" --wrapper-function "${wrapper_function}"
@@ -270,6 +270,14 @@ if(TARGET VernonRuntime)
             vernonRegisterNativeAutodiffF16Fixture
             native_autodiff_f16_manifest
             native_autodiff_f16_fixture_target)
+        vernon_add_cpu_autodiff_fixture(
+            structured-scalar-autodiff
+            autodiff_structured_scalar_fixture
+            autodiff_structured_scalar_fixture.pipeline.json
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_scalar_asset.py:asset"
+            vernonRegisterStructuredScalarAutodiffFixture
+            structured_scalar_autodiff_manifest
+            structured_scalar_autodiff_fixture_target)
 
         add_executable(VernonCookedAutodiffTests runtime/runtime_cooked_autodiff_test.cpp)
         target_link_libraries(VernonCookedAutodiffTests PRIVATE GTest::gtest_main Vernon::Runtime
@@ -280,6 +288,17 @@ if(TARGET VernonRuntime)
                                                                    "${CMAKE_BINARY_DIR}/source")
         vernon_stage_target_files(VernonCookedAutodiffTests VernonRuntime)
         vernon_discover_gtests(VernonCookedAutodiffTests)
+
+        add_executable(VernonStructuredScalarAutodiffTests runtime/runtime_structured_scalar_autodiff_test.cpp)
+        target_link_libraries(VernonStructuredScalarAutodiffTests PRIVATE GTest::gtest_main Vernon::Runtime
+                                                                          ${structured_scalar_autodiff_fixture_target})
+        target_compile_definitions(
+            VernonStructuredScalarAutodiffTests
+            PRIVATE VERNON_STRUCTURED_SCALAR_AUTODIFF_MANIFEST="${structured_scalar_autodiff_manifest}")
+        set_target_properties(VernonStructuredScalarAutodiffTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                                                             "${CMAKE_BINARY_DIR}/source")
+        vernon_stage_target_files(VernonStructuredScalarAutodiffTests VernonRuntime)
+        vernon_discover_gtests(VernonStructuredScalarAutodiffTests)
 
         vernon_add_autodiff_python_fixture(
             VernonCookedAutodiffPythonFixture
@@ -314,6 +333,11 @@ if(TARGET VernonRuntime)
                 "${Python_EXECUTABLE}" "${VERNON_TEST_ROOT}/python/autodiff_native_f16_runtime_test.py"
                 "${native_autodiff_f16_manifest}" "$<TARGET_FILE_DIR:VernonNativeAutodiffF16PythonFixture>"
                 "${VERNON_REPOSITORY_ROOT}/python")
+        add_test(
+            NAME VernonPythonStructuredScalarDirectAutodiffTest
+            COMMAND
+                "${Python_EXECUTABLE}" "${VERNON_TEST_ROOT}/python/autodiff_structured_scalar_direct_runtime_test.py"
+                "${VERNON_REPOSITORY_ROOT}/python" "${VERNON_TEST_ROOT}/fixtures")
     endif()
 
     target_sources(VernonRuntimeTests PRIVATE runtime/runtime_cuda_pipeline_test.cpp)
@@ -659,8 +683,11 @@ endif()
 
 if(TARGET VernonCompilerTestSupport AND TARGET MLIRVernonTransforms)
     add_executable(
-        VernonAutodiffAnalysisTests compiler/vernon_autodiff_analysis_test.cpp compiler/vernon_autodiff_rules_test.cpp
-                                    compiler/vernon_autodiff_tape_planning_test.cpp)
+        VernonAutodiffAnalysisTests
+        compiler/vernon_autodiff_analysis_test.cpp
+        compiler/vernon_autodiff_rules_test.cpp
+        compiler/vernon_autodiff_tape_planning_test.cpp
+        compiler/vernon_structured_vjp_test.cpp)
     set_target_properties(VernonAutodiffAnalysisTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/source")
     target_link_libraries(VernonAutodiffAnalysisTests PRIVATE GTest::gtest_main VernonCompilerTestSupport
                                                               MLIRVernonTransforms)

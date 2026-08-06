@@ -111,6 +111,11 @@ bool makeCotangentBytes(const VernonAdValueSet *cotangents, const ValueAbi &abi,
 
 bool createCpuExecutable(VernonRuntimeContext &context, const Stage &forward, const Stage &backward,
                          const std::vector<std::string> &gradientPaths, std::shared_ptr<Executable> &executable);
+bool createCpuEntryExecutable(VernonRuntimeContext &context, VernonCpuEntryPoint forwardEntry,
+                              VernonStringView forwardReflection, VernonStringView forwardName,
+                              VernonCpuEntryPoint backwardEntry, VernonStringView backwardReflection,
+                              VernonStringView backwardName, const std::vector<std::string> &gradientPaths,
+                              std::shared_ptr<Executable> &executable);
 bool createGpuExecutable(VernonPipelineBundle &bundle, const std::string &forwardId, const std::string &backwardId,
                          const std::vector<std::string> &gradientPaths, const AutodiffLaunchPlan &launch,
                          std::shared_ptr<Executable> &executable);

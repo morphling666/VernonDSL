@@ -391,6 +391,41 @@ asset = vd.pipeline_asset(
             for symbol in registration["symbols"]:
                 self.assertIn(f"&{symbol}", registration_source)
 
+    def test_cpu_scalar_abi_eligible_control_flow_reports_structured_error_without_fallback(self) -> None:
+        try:
+            from vernon_dsl import _native  # noqa: F401
+        except (ImportError, OSError):
+            self.skipTest("native Vernon compiler is unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "control_flow_asset.py"
+            source.write_text(
+                """
+import vernon_dsl as vd
+
+@vd.kernel
+def objective(x: vd.f32, condition: vd.i32) -> vd.f32:
+    result = x * x
+    if condition > 0:
+        result = result + x
+    return result
+
+asset = vd.pipeline_asset(
+    id="compute/structured-control-flow-vjp",
+    program=vd.ad.vjp(objective, wrt=("x",)),
+)
+""",
+                encoding="utf-8",
+            )
+            output = root / "adbuild"
+            with self.assertRaisesRegex(PipelineCompileError, "structured control-flow VJP belongs to Phase 7"):
+                cook_pipeline_asset(
+                    pipeline_asset=f"{source}:asset",
+                    output=output,
+                    target="cpu",
+                )
+            self.assertFalse(output.exists())
+
 
 class AutodiffReferenceTests(unittest.TestCase):
     def test_scalar_pullback_defaults_to_one_and_is_reusable(self) -> None:
@@ -2108,6 +2143,70 @@ def objective(x: vd.f32, y: vd.f32) -> vd.f32:
                 program = compiler.compile_program_result(mlir, native.Target.CPU)
                 self.assertTrue(program.ok, f"{profile}: {program.diagnostics}")
                 self.assertTrue(program.artifacts)
+
+    def test_native_backward_merges_shared_adjoints_before_propagating(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "shared_ad.py"
+            source.write_text(
+                """
+import vernon_dsl as vd
+
+@vd.kernel
+def objective(x: vd.f32) -> vd.f32:
+    square = x * x
+    fourth = square * square
+    return fourth + fourth
+""",
+                encoding="utf-8",
+            )
+            result = Compiler().compile_request(
+                FrontendCompileRequest(
+                    source,
+                    "objective",
+                    program_transform=vd.ad.ProgramTransformSpec("vjp", ("x",)),
+                )
+            )
+            assert result.program_graph is not None
+            assert result.autodiff_profiles is not None
+            backward = emit_native_autodiff_modules(
+                result.program_graph,
+                result.autodiff_profiles,
+            )["backward"]
+            self.assertLess(backward.count("\n"), 100)
+            self.assertEqual(backward.count("arith.mulf"), 4)
+
+    def test_complex_native_backward_stays_within_shared_subgraph_budget(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[2] / "source" / "tests" / "fixtures" / "autodiff_native_numeric_asset.py"
+        )
+        wrt = (
+            "left",
+            "right",
+            "vector",
+            "normal",
+            "values",
+            "auxiliary",
+            "angle",
+            "ordinate",
+            "abscissa",
+            "signed",
+        )
+        result = Compiler().compile_request(
+            FrontendCompileRequest(
+                source,
+                "native_numeric_objective",
+                program_transform=vd.ad.ProgramTransformSpec("vjp", wrt),
+            )
+        )
+        assert result.program_graph is not None
+        assert result.autodiff_profiles is not None
+        backward = emit_native_autodiff_modules(
+            result.program_graph,
+            result.autodiff_profiles,
+            target="cpu",
+        )["backward"]
+        self.assertLessEqual(len(backward.encode("utf-8")), 312 * 1024)
+        self.assertLessEqual(backward.count("\n"), 5_473)
 
     def test_gpu_tensor_reduction_uses_shape_independent_loops(self) -> None:
         modules_by_extent: dict[int, dict[str, str]] = {}
