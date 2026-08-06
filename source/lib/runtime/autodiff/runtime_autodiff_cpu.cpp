@@ -510,10 +510,9 @@ bool parseProfile(const Stage &stage, HostProfileLayout &layout, std::string &er
         error = "autodiff result host Value layout is out of bounds";
         return false;
     }
-    size_t index = 0;
     for (const nlohmann::json &leafValue : result["value_layout"]["leaves"]) {
         HostFrameLeaf leaf;
-        if (!parseLeaf(leafValue, "result." + std::to_string(index++), resultOffset, leaf, error))
+        if (!parseLeaf(leafValue, "output", resultOffset, leaf, error))
             return false;
         if (leaf.frameOffset < resultOffset || leaf.frameOffset > resultOffset + resultSize ||
             leaf.value.byteSize > resultOffset + resultSize - leaf.frameOffset) {
@@ -608,24 +607,38 @@ public:
           tapeSnapshots_(std::move(tapeSnapshots)) {}
 
     VernonStatus apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients) override {
-        if (signature_.cotangents.size() != 1)
-            return fail(context_, "CPU pullback requires one cotangent leaf");
-        ValueAbi cotangentAbi = signature_.cotangents.front();
-        if (!materializeCarrierValue(cotangentAbi, computeGrid_))
-            return fail(context_, "CPU pullback cotangent size overflows");
-        std::vector<uint8_t> cotangent;
-        if (!makeCotangentBytes(cotangents, cotangentAbi, cotangent, invocationDiagnostic(context_)))
-            return VERNON_STATUS_INVALID_ARGUMENT;
-        const HostArgument *cotangentArgument = nullptr;
+        if (signature_.cotangents.empty())
+            return fail(context_, "CPU pullback has no cotangent leaves");
+        if ((cotangents && cotangents->value_count != signature_.cotangents.size()) ||
+            (!cotangents && signature_.cotangents.size() != 1))
+            return fail(context_, "CPU pullback requires exactly the reflected output cotangent leaves");
+        std::vector<const HostArgument *> cotangentArguments;
         for (const HostArgument &argument : layout_.arguments)
-            if (argument.builtin.empty()) {
-                if (cotangentArgument || argument.leaves.size() != 1)
-                    return fail(context_, "CPU pullback has an invalid cotangent ABI");
-                cotangentArgument = &argument;
+            if (argument.builtin.empty())
+                cotangentArguments.push_back(&argument);
+        if (cotangentArguments.size() != signature_.cotangents.size())
+            return fail(context_, "CPU pullback has an invalid cotangent ABI");
+        std::vector<std::vector<uint8_t>> cotangentBytes;
+        for (size_t index = 0; index < signature_.cotangents.size(); ++index) {
+            const HostArgument &argument = *cotangentArguments[index];
+            if (argument.leaves.size() != 1 || argument.name != signature_.cotangents[index].path)
+                return fail(context_, "CPU pullback cotangent reflection is inconsistent");
+            ValueAbi abi = signature_.cotangents[index];
+            if (!materializeCarrierValue(abi, computeGrid_))
+                return fail(context_, "CPU pullback cotangent size overflows");
+            std::vector<uint8_t> bytes(abi.byteSize);
+            if (cotangents) {
+                const VernonAdValue *value = findValue(*cotangents, abi.path);
+                if (!value || !valueMatches(*value, abi))
+                    return fail(context_, "output cotangent does not match backward reflection");
+                std::memcpy(bytes.data(), value->data, abi.byteSize);
+            } else {
+                if (signature_.cotangents.size() != 1 ||
+                    !makeCotangentBytes(nullptr, abi, bytes, invocationDiagnostic(context_)))
+                    return VERNON_STATUS_INVALID_ARGUMENT;
             }
-        if (!cotangentArgument)
-            return fail(context_, "CPU pullback has no cotangent ABI");
-        const HostFrameLeaf &cotangentLeaf = cotangentArgument->leaves.front();
+            cotangentBytes.push_back(std::move(bytes));
+        }
         std::vector<VernonAdValue *> destinations;
         std::vector<std::vector<uint8_t>> stagedGradients;
         if (VernonStatus status =
@@ -644,9 +657,13 @@ public:
                 return fail(context_, "CPU pullback dynamic tape has no root region");
             std::memcpy(arguments.data() + *layout_.tapeAllocatorOffset, &descriptor, sizeof(VernonAdTapeAllocator *));
             std::memcpy(arguments.data() + *layout_.tapeRootRegionOffset, &root, sizeof(root));
-            std::memcpy(arguments.data() + cotangentLeaf.frameOffset,
-                        cotangent.data() + invocationIndex * signature_.cotangents.front().byteSize,
-                        signature_.cotangents.front().byteSize);
+            for (size_t cotangentIndex = 0; cotangentIndex < cotangentArguments.size(); ++cotangentIndex) {
+                const HostFrameLeaf &leaf = cotangentArguments[cotangentIndex]->leaves.front();
+                std::memcpy(arguments.data() + leaf.frameOffset,
+                            cotangentBytes[cotangentIndex].data() +
+                                invocationIndex * signature_.cotangents[cotangentIndex].byteSize,
+                            signature_.cotangents[cotangentIndex].byteSize);
+            }
             if (VernonStatus status =
                     invokeBackwardAndAccumulate(context_, *backward_, layout_, signature_, arguments, stagedGradients);
                 status != VERNON_STATUS_OK)
@@ -673,23 +690,28 @@ VernonStatus runCpuForward(VernonRuntimeContext &context, const HostProfileLayou
     size_t invocationCount = 0;
     if (!carrierCount(computeGrid, invocationCount))
         return fail(context, "native CPU autodiff launch size overflows");
-    if (inputs.value_count != signature.inputs.size() || outputs.value_count != 1 || signature.outputs.size() != 1)
+    if (inputs.value_count != signature.inputs.size() || outputs.value_count != signature.outputs.size() ||
+        layout.results.size() != signature.outputs.size() + signature.tape.size())
         return fail(context, "autodiff forward values do not match the host profile");
     std::vector<uint8_t> arguments(layout.argumentsSize);
     std::vector<StorageRange> storageRanges;
     std::vector<StagedTensorView> tensorViews;
-    VernonAdValue *output = findValue(outputs, signature.outputs.front().path);
-    ValueAbi outputAbi = signature.outputs.front();
-    if (!materializeCarrierValue(outputAbi, computeGrid))
-        return fail(context, "native CPU autodiff output size overflows");
-    if (!output || !valueMatches(*output, outputAbi))
-        return fail(context, "autodiff output does not match profile reflection");
-    if (!appendStorageRange(output->data, output->size, true, storageRanges))
-        return fail(context, "native CPU autodiff output address range overflows");
-    HostEffectTransaction transaction(outputAbi.byteSize);
-    uint8_t *stagedOutput = transaction.stagedOutput();
-    if (outputAbi.byteSize && !stagedOutput)
-        return fail(context, "cannot allocate native CPU autodiff output shadow", VERNON_STATUS_INTERNAL_ERROR);
+    HostEffectTransaction transaction(0);
+    std::vector<uint8_t *> stagedOutputs;
+    for (const ValueAbi &unmaterialized : signature.outputs) {
+        ValueAbi outputAbi = unmaterialized;
+        if (!materializeCarrierValue(outputAbi, computeGrid))
+            return fail(context, "native CPU autodiff output size overflows");
+        VernonAdValue *output = findValue(outputs, outputAbi.path);
+        if (!output || !valueMatches(*output, outputAbi))
+            return fail(context, "autodiff output does not match profile reflection");
+        if (!appendStorageRange(output->data, output->size, true, storageRanges))
+            return fail(context, "native CPU autodiff output address range overflows");
+        uint8_t *staged = transaction.stageStorage(output->data, outputAbi.byteSize, false);
+        if (outputAbi.byteSize && !staged)
+            return fail(context, "cannot allocate native CPU autodiff output shadow", VERNON_STATUS_INTERNAL_ERROR);
+        stagedOutputs.push_back(staged);
+    }
     if (VernonStatus status =
             stageForwardInputs(context, layout, inputs, arguments, transaction, storageRanges, tensorViews);
         status != VERNON_STATUS_OK)
@@ -698,8 +720,10 @@ VernonStatus runCpuForward(VernonRuntimeContext &context, const HostProfileLayou
         std::vector<uint8_t> results(layout.resultsSize);
         if (VernonStatus status = invoke(invocationIndex, arguments, results); status != VERNON_STATUS_OK)
             return status;
-        std::memcpy(stagedOutput + invocationIndex * signature.outputs.front().byteSize,
-                    results.data() + layout.results.front().frameOffset, signature.outputs.front().byteSize);
+        for (size_t outputIndex = 0; outputIndex < signature.outputs.size(); ++outputIndex)
+            std::memcpy(stagedOutputs[outputIndex] + invocationIndex * signature.outputs[outputIndex].byteSize,
+                        results.data() + layout.results[outputIndex].frameOffset,
+                        signature.outputs[outputIndex].byteSize);
     }
     std::unique_ptr<PullbackExecution> pendingPullback;
     if (VernonStatus status = finish(invocationCount, pendingPullback); status != VERNON_STATUS_OK)
@@ -708,7 +732,7 @@ VernonStatus runCpuForward(VernonRuntimeContext &context, const HostProfileLayou
         return fail(context, "native CPU autodiff did not create a pullback", VERNON_STATUS_INTERNAL_ERROR);
     if (VernonStatus status = flushStagedTensorViews(context, tensorViews); status != VERNON_STATUS_OK)
         return status;
-    if (!transaction.commit(output->data))
+    if (!transaction.commit(nullptr))
         return fail(context, "autodiff effect transaction was already committed");
     pullback = std::move(pendingPullback);
     return VERNON_STATUS_OK;
@@ -885,16 +909,26 @@ private:
 };
 
 bool validateDifferentiationSignature(VernonRuntimeContext &context, const Signature &signature) {
-    if (signature.outputs.empty() || signature.outputs.size() != signature.cotangents.size()) {
-        invocationDiagnostic(context) = "autodiff output and cotangent leaf counts do not match";
+    if (signature.outputs.empty() || signature.cotangents.empty()) {
+        invocationDiagnostic(context) = "autodiff output or cotangent signature is empty";
         return false;
     }
-    for (size_t index = 0; index < signature.outputs.size(); ++index)
-        if (signature.outputs[index].path != signature.cotangents[index].path ||
-            !derivativeAbiMatches(signature.outputs[index], signature.cotangents[index])) {
+    std::set<std::string> outputPaths;
+    for (const ValueAbi &output : signature.outputs)
+        if (output.path.empty() || !outputPaths.insert(output.path).second) {
+            invocationDiagnostic(context) = "autodiff output leaf paths are empty or duplicated";
+            return false;
+        }
+    std::set<std::string> cotangentPaths;
+    for (const ValueAbi &cotangent : signature.cotangents) {
+        const auto output = std::find_if(signature.outputs.begin(), signature.outputs.end(),
+                                         [&](const ValueAbi &value) { return value.path == cotangent.path; });
+        if (cotangent.path.empty() || !cotangentPaths.insert(cotangent.path).second ||
+            output == signature.outputs.end() || !derivativeAbiMatches(*output, cotangent)) {
             invocationDiagnostic(context) = "autodiff output and cotangent profile ABIs do not match";
             return false;
         }
+    }
     std::set<std::string> inputPaths;
     for (const ValueAbi &input : signature.inputs)
         if (input.path.empty() || !inputPaths.insert(input.path).second) {
@@ -931,8 +965,8 @@ bool finishStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &f
     for (const HostArgument &argument : backward.arguments)
         backwardValueArguments += argument.builtin.empty();
     if (!forward.tapeAllocatorOffset || forward.tapeRootRegionOffset || !backward.tapeAllocatorOffset ||
-        !backward.tapeRootRegionOffset || forward.results.size() != 1 || backwardValueArguments != 1 ||
-        backward.results.size() != gradientPaths.size()) {
+        !backward.tapeRootRegionOffset || forward.results.empty() || !backwardValueArguments ||
+        backwardValueArguments > forward.results.size() || backward.results.size() != gradientPaths.size()) {
         invocationDiagnostic(context) = "structured CPU autodiff profile does not use the dynamic tape ABI";
         return false;
     }
@@ -947,19 +981,20 @@ bool finishStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &f
             for (const HostFrameLeaf &leaf : argument.leaves)
                 signature.inputs.push_back(leaf.value);
     }
-    ValueAbi output = forward.results.front().value;
-    output.path = "output";
-    signature.outputs.push_back(std::move(output));
-    const HostArgument *cotangentArgument = nullptr;
+    std::vector<const HostArgument *> cotangentArguments;
     for (const HostArgument &argument : backward.arguments)
         if (argument.builtin.empty())
-            cotangentArgument = &argument;
-    ValueAbi cotangent = cotangentArgument->leaves.front().value;
-    cotangent.path = "output";
-    signature.cotangents.push_back(std::move(cotangent));
-    if (!derivativeAbiMatches(signature.outputs.front(), signature.cotangents.front())) {
-        invocationDiagnostic(context) = "autodiff output and cotangent profile ABIs do not match";
-        return false;
+            cotangentArguments.push_back(&argument);
+    for (const HostFrameLeaf &result : forward.results)
+        signature.outputs.push_back(result.value);
+    for (const HostArgument *argument : cotangentArguments) {
+        if (argument->name.empty() || argument->leaves.size() != 1) {
+            invocationDiagnostic(context) = "structured CPU autodiff cotangent is not one canonical leaf";
+            return false;
+        }
+        ValueAbi cotangent = argument->leaves.front().value;
+        cotangent.path = argument->name;
+        signature.cotangents.push_back(std::move(cotangent));
     }
     for (size_t index = 0; index < gradientPaths.size(); ++index) {
         ValueAbi gradient = backward.results[index].value;

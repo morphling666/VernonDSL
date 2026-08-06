@@ -9,7 +9,7 @@ from ..ad import ProgramTransformSpec
 from .analysis import typed_effect_data
 from .autodiff import AutodiffProgram
 from .autodiff_profiles import AutodiffProfilePlan
-from .model import TypedFunctionInstance
+from .model import ConcreteType, TypedFunctionInstance
 
 
 @dataclass(frozen=True)
@@ -51,6 +51,7 @@ class FrontendCompileResult:
     program_graph: AutodiffProgram | None = None
     autodiff_profiles: AutodiffProfilePlan | None = None
     entry_workgroup_size: tuple[int, int, int] | None = None
+    structs: tuple[tuple[str, tuple[tuple[str, ConcreteType], ...]], ...] = ()
 
     @property
     def semantic_inputs(self) -> dict[str, Any]:

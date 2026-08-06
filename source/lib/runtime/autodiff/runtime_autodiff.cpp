@@ -2,6 +2,7 @@
 
 #include "VernonAutodiffGraph.h"
 #include "runtime/runtime_state.h"
+#include "runtime_direct_autodiff.h"
 
 #include <algorithm>
 #include <cstring>
@@ -295,6 +296,44 @@ VernonStatus forwardGpuGraph(VernonLoadedPipeline &pipeline, VernonLaunchSize co
 }
 
 } // namespace
+
+namespace {
+
+bool copyMetadata(const std::vector<vernon::runtime::ad::ValueAbi> &values, size_t index,
+                  vernon::runtime::AutodiffValueMetadataView &metadata) {
+    if (index >= values.size())
+        return false;
+    const vernon::runtime::ad::ValueAbi &value = values[index];
+    metadata = {{value.path.data(), value.path.size()},
+                value.dtype,
+                value.logicalShape.empty() ? nullptr : value.logicalShape.data(),
+                value.logicalShape.size()};
+    return true;
+}
+
+} // namespace
+
+size_t vernon::runtime::getAutodiffOutputMetadataCount(const VernonLoadedPipeline *pipeline) {
+    const ad::Executable *executable = autodiffExecutable(pipeline);
+    return executable ? executable->signature().outputs.size() : 0;
+}
+
+size_t vernon::runtime::getAutodiffCotangentMetadataCount(const VernonLoadedPipeline *pipeline) {
+    const ad::Executable *executable = autodiffExecutable(pipeline);
+    return executable ? executable->signature().cotangents.size() : 0;
+}
+
+bool vernon::runtime::getAutodiffOutputMetadata(const VernonLoadedPipeline *pipeline, size_t index,
+                                                AutodiffValueMetadataView &metadata) {
+    const ad::Executable *executable = autodiffExecutable(pipeline);
+    return executable && copyMetadata(executable->signature().outputs, index, metadata);
+}
+
+bool vernon::runtime::getAutodiffCotangentMetadata(const VernonLoadedPipeline *pipeline, size_t index,
+                                                   AutodiffValueMetadataView &metadata) {
+    const ad::Executable *executable = autodiffExecutable(pipeline);
+    return executable && copyMetadata(executable->signature().cotangents, index, metadata);
+}
 
 extern "C" {
 

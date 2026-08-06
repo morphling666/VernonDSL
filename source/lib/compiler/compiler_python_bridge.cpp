@@ -196,8 +196,7 @@ VernonPythonStructuredVjp *vernonCompilerBuildPythonStructuredVjp(VernonStringVi
     options.backwardSymbol.assign(backwardSymbol.data, backwardSymbol.size);
     for (size_t index = 0; index < wrtPathCount; ++index)
         options.wrtPaths.emplace_back(wrtPaths[index].data, wrtPaths[index].size);
-    mlir::FailureOr<mlir::vernon::StructuredVjpResult> transformed =
-        mlir::vernon::buildStructuredScalarVjp(primal, options);
+    mlir::FailureOr<mlir::vernon::StructuredVjpResult> transformed = mlir::vernon::buildStructuredVjp(primal, options);
     if (mlir::failed(transformed)) {
         result->status = VERNON_STATUS_VERIFICATION_ERROR;
         return result.release();

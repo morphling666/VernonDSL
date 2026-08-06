@@ -20,11 +20,16 @@ from vernon_dsl.frontend.autodiff import (
 )
 from vernon_dsl.frontend.autodiff_cpu import execute_program_graph as _execute_program_graph
 from vernon_dsl.frontend.autodiff_native import emit_native_autodiff_modules
-from vernon_dsl.frontend.structured_vjp import build_structured_scalar_vjp
+from vernon_dsl.frontend.structured_vjp import build_structured_vjp
 from vernon_dsl.pipeline_assets import (
     PipelineCompileError,
     cook_pipeline_asset,
     parse_python_pipeline_asset,
+)
+
+from python.tests.autodiff_direct_aggregate_fixture import (
+    DirectAggregateParameters,
+    direct_aggregate_objective,
 )
 
 
@@ -430,12 +435,12 @@ asset = vd.pipeline_asset(
             output = root / "adbuild"
             with (
                 patch(
-                    "vernon_dsl._shader_assets.cooking.build_structured_scalar_vjp",
-                    wraps=build_structured_scalar_vjp,
+                    "vernon_dsl._shader_assets.cooking.build_structured_vjp",
+                    wraps=build_structured_vjp,
                 ) as structured_builder,
                 patch(
                     "vernon_dsl.frontend.autodiff_native.emit_native_autodiff_modules",
-                    side_effect=AssertionError("structured scalar VJP must not use legacy lowering"),
+                    side_effect=AssertionError("structured VJP must not use legacy lowering"),
                 ) as legacy_builder,
             ):
                 manifest = cook_pipeline_asset(
@@ -486,7 +491,7 @@ def objective(x: vd.f32, limit: vd.i32) -> vd.f32:
                 encoding="utf-8",
             )
             frontend = Compiler().compile_request(FrontendCompileRequest(source, "objective"))
-            structured = build_structured_scalar_vjp(
+            structured = build_structured_vjp(
                 _native,
                 frontend,
                 ProgramTransformSpec("vjp", ("x",)),
@@ -504,6 +509,116 @@ def objective(x: vd.f32, limit: vd.i32) -> vd.f32:
             self.assertGreaterEqual(backward.count("vernon.ad.read_executed_count"), 2)
             self.assertGreaterEqual(backward.count("scf.for"), 2)
             self.assertGreaterEqual(backward.count("vernon.ad.read_nested_region"), 3)
+
+    def test_structured_tensor_view_preserves_disjoint_scatter_evidence(self) -> None:
+        try:
+            from vernon_dsl import _native
+        except (ImportError, OSError):
+            self.skipTest("native Vernon compiler is unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "disjoint_storage.py"
+            source.write_text(
+                """
+from typing import Annotated
+import vernon_dsl as vd
+
+@vd.kernel
+def gather(
+    values: vd.TensorView[vd.f32, (2, 3, 4), vd.read],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> vd.f32:
+    return values[gid[0], gid[1], gid[2]]
+""",
+                encoding="utf-8",
+            )
+            frontend = Compiler().compile_request(FrontendCompileRequest(source, "gather"))
+            structured = build_structured_vjp(
+                _native,
+                frontend,
+                ProgramTransformSpec("vjp", ("values",)),
+            )
+            accumulation = structured.plan.launch.accumulation_plans
+            self.assertEqual(len(accumulation), 1)
+            self.assertEqual(accumulation[0].mode, AccumulationMode.SCATTER_ADD)
+            self.assertEqual(accumulation[0].invocation_axes, (0, 1, 2))
+            self.assertIn(AccessPatternEvidence.DISJOINT_SCATTER, accumulation[0].evidence)
+            self.assertIn(AccessPatternEvidence.INJECTIVE_GLOBAL_INDEX, accumulation[0].evidence)
+
+    def test_structured_tensor_view_alias_evidence_fails_closed(self) -> None:
+        try:
+            from vernon_dsl import _native
+        except (ImportError, OSError):
+            self.skipTest("native Vernon compiler is unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "aliased_storage.py"
+            source.write_text(
+                """
+from typing import Annotated
+import vernon_dsl as vd
+
+@vd.kernel
+def gather(
+    values: vd.TensorView[vd.f32, (2, 3, 4), vd.read],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> vd.f32:
+    alias = values
+    return alias[gid[0], gid[1], gid[2]]
+""",
+                encoding="utf-8",
+            )
+            frontend = Compiler().compile_request(FrontendCompileRequest(source, "gather"))
+            structured = build_structured_vjp(
+                _native,
+                frontend,
+                ProgramTransformSpec("vjp", ("values",)),
+            )
+            evidence = structured.plan.launch.accumulation_plans[0].evidence
+            self.assertIn(AccessPatternEvidence.NON_INJECTIVE_INDEX, evidence)
+            self.assertNotIn(AccessPatternEvidence.DISJOINT_SCATTER, evidence)
+
+    def test_direct_structured_vjp_executes_nested_aggregate_leaves(self) -> None:
+        try:
+            from vernon_dsl import _native  # noqa: F401
+            from vernon_dsl._runtime import session
+        except (ImportError, OSError):
+            self.skipTest("native Vernon compiler and runtime are unavailable")
+        vd.init(arch=vd.cpu)
+        if session._native_runtime is None:
+            self.skipTest("native Vernon runtime is unavailable")
+        expression = vd.ad.vjp(
+            direct_aggregate_objective,
+            wrt=("value", "parameters.scale", "parameters.bias"),
+        )
+        output, pullback = expression(
+            np.array([2.0, 4.0], dtype=np.float32),
+            DirectAggregateParameters(np.float32(3.0), np.float32(1.0)),
+            grid=(1, 1, 1),
+        )
+        expected = {
+            "output.pair.first": np.float32(7.0),
+            "output.pair.second": np.float32(13.0),
+            "output.tuple_values.0": np.float32(7.0),
+            "output.tuple_values.1": np.float32(13.0),
+            "output.values": np.array([7.0, 13.0], dtype=np.float32),
+            "output.tag": np.int32(7),
+        }
+        self.assertEqual(set(output), set(expected))
+        for path, value in expected.items():
+            np.testing.assert_array_equal(output[path], value)
+        with self.assertRaisesRegex(ValueError, "every output cotangent leaf"):
+            pullback({"output.pair.first": np.float32(1.0)})
+        gradients = pullback(
+            {
+                "output.pair.first": np.float32(1.0),
+                "output.pair.second": np.float32(1.0),
+                "output.tuple_values.0": np.float32(1.0),
+                "output.tuple_values.1": np.float32(1.0),
+                "output.values": np.ones(2, dtype=np.float32),
+            }
+        )
+        np.testing.assert_array_equal(gradients["value"], np.array([9.0, 9.0], dtype=np.float32))
+        np.testing.assert_array_equal(gradients["parameters.scale"], np.float32(18.0))
+        np.testing.assert_array_equal(gradients["parameters.bias"], np.float32(6.0))
 
 
 class AutodiffReferenceTests(unittest.TestCase):

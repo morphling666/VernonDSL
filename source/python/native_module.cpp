@@ -1179,7 +1179,7 @@ struct PythonAdMetadata {
 };
 
 PythonAdMetadata adInputLeafMetadata(VernonLoadedPipeline *pipeline, const PipelineParameterMetadata &parameter,
-                                     size_t leafIndex) {
+                                     size_t leafIndex, VernonPipelineValueLeafView *reflected = nullptr) {
     VernonPipelineValueLeafView leaf{};
     leaf.struct_size = sizeof(leaf);
     const VernonStringView parameterName{parameter.name.data(), parameter.name.size()};
@@ -1200,7 +1200,42 @@ PythonAdMetadata adInputLeafMetadata(VernonLoadedPipeline *pipeline, const Pipel
         result.shape.assign(leaf.static_shape, leaf.static_shape + leaf.static_rank);
     else if (leaf.path_count == 0)
         result.shape = parameter.shape;
+    if (reflected)
+        *reflected = leaf;
     return result;
+}
+
+nb::object resolveAdInputLeaf(const nb::dict &bindings, const PipelineParameterMetadata &parameter,
+                              const VernonPipelineValueLeafView &leaf) {
+    nb::str root(parameter.name.c_str());
+    if (!bindings.contains(root))
+        throw std::invalid_argument("missing autodiff binding '" + parameter.name + "'");
+    nb::object value = nb::borrow<nb::object>(bindings[root]);
+    for (size_t index = 0; index < leaf.path_count; ++index) {
+        const VernonValuePathComponentView &component = leaf.path[index];
+        if (component.kind == VERNON_VALUE_PATH_FIELD) {
+            const std::string field = stringView(component.field);
+            if (nb::isinstance<nb::dict>(value)) {
+                nb::dict mapping = nb::cast<nb::dict>(value);
+                nb::str key(field.c_str());
+                if (!mapping.contains(key))
+                    throw std::invalid_argument("autodiff Struct binding is missing field '" + field + "'");
+                value = nb::borrow<nb::object>(mapping[key]);
+            } else {
+                if (nb::hasattr(value, field.c_str()))
+                    value = value.attr(field.c_str());
+                else if (nb::hasattr(value, "__getitem__"))
+                    value = value.attr("__getitem__")(field);
+                else
+                    throw std::invalid_argument("autodiff Struct binding has no field '" + field + "'");
+            }
+        } else if (component.kind == VERNON_VALUE_PATH_INDEX) {
+            value = value.attr("__getitem__")(component.index);
+        } else {
+            throw std::runtime_error("autodiff input leaf has an invalid path");
+        }
+    }
+    return value;
 }
 
 bool findAdInputLeafMetadata(VernonLoadedPipeline *pipeline, const std::vector<PipelineParameterMetadata> &parameters,
@@ -1218,9 +1253,9 @@ bool findAdInputLeafMetadata(VernonLoadedPipeline *pipeline, const std::vector<P
 
 struct PythonPullback {
     PythonPullback(VernonRuntimeContext *runtime, VernonPullback *handle, std::vector<PythonAdMetadata> gradients,
-                   VernonDataType cotangentType, std::vector<uint64_t> cotangentShape, nb::object pipelineOwner)
-        : runtime(runtime), handle(handle), gradients(std::move(gradients)), cotangentType(cotangentType),
-          cotangentShape(std::move(cotangentShape)), pipelineOwner(std::move(pipelineOwner)) {}
+                   std::vector<PythonAdMetadata> cotangents, nb::object pipelineOwner)
+        : runtime(runtime), handle(handle), gradients(std::move(gradients)), cotangents(std::move(cotangents)),
+          pipelineOwner(std::move(pipelineOwner)) {}
     ~PythonPullback() { vernonPullbackDestroy(handle); }
 
     nb::dict apply(const nb::object &cotangent) {
@@ -1235,12 +1270,31 @@ struct PythonPullback {
         }
         VernonAdValueSet gradientSet{sizeof(VernonAdValueSet), gradientViews.data(), gradientViews.size(), {}};
 
-        std::unique_ptr<PythonAdValue> seed;
+        std::deque<PythonAdValue> seeds;
+        std::vector<VernonAdValue> seedViews;
         VernonAdValueSet seedSet{};
         const VernonAdValueSet *seedView = nullptr;
         if (!cotangent.is_none()) {
-            seed = std::make_unique<PythonAdValue>("output", cotangentType, cotangentShape, cotangent);
-            seedSet = {sizeof(VernonAdValueSet), &seed->value, 1, {}};
+            if (cotangents.size() == 1) {
+                const PythonAdMetadata &metadata = cotangents.front();
+                seeds.emplace_back(metadata.path, metadata.dtype, metadata.shape, cotangent);
+            } else {
+                if (!nb::isinstance<nb::dict>(cotangent))
+                    throw std::invalid_argument("aggregate pullback cotangent must be a leaf-path dictionary");
+                nb::dict values = nb::cast<nb::dict>(cotangent);
+                if (values.size() != cotangents.size())
+                    throw std::invalid_argument("aggregate pullback requires every output cotangent leaf");
+                for (const PythonAdMetadata &metadata : cotangents) {
+                    nb::str path(metadata.path.c_str());
+                    if (!values.contains(path))
+                        throw std::invalid_argument("missing output cotangent leaf '" + metadata.path + "'");
+                    seeds.emplace_back(metadata.path, metadata.dtype, metadata.shape,
+                                       nb::borrow<nb::object>(values[path]));
+                }
+            }
+            for (PythonAdValue &seed : seeds)
+                seedViews.push_back(seed.value);
+            seedSet = {sizeof(VernonAdValueSet), seedViews.data(), seedViews.size(), {}};
             seedView = &seedSet;
         }
         if (vernonPullbackApply(handle, seedView, &gradientSet) != VERNON_STATUS_OK)
@@ -1253,8 +1307,7 @@ struct PythonPullback {
     VernonRuntimeContext *runtime{};
     VernonPullback *handle{};
     std::vector<PythonAdMetadata> gradients;
-    VernonDataType cotangentType{};
-    std::vector<uint64_t> cotangentShape;
+    std::vector<PythonAdMetadata> cotangents;
     nb::object pipelineOwner;
 };
 
@@ -1282,52 +1335,62 @@ struct LoadedPipeline {
         if (!gridX || !gridY || !gridZ)
             throw std::invalid_argument("autodiff grid dimensions must be positive");
         const std::vector<PipelineParameterMetadata> metadata = parameters();
-        size_t inputLeafCount = 0;
-        for (const PipelineParameterMetadata &parameter : metadata)
-            inputLeafCount += parameter.elementLeaves.size();
-        if (bindings.size() != inputLeafCount)
+        if (bindings.size() != metadata.size())
             throw std::invalid_argument("autodiff bindings do not match pipeline parameters");
         std::deque<PythonAdValue> inputValues;
         std::vector<VernonAdValue> inputViews;
         for (const PipelineParameterMetadata &parameter : metadata) {
             for (size_t leafIndex = 0; leafIndex < parameter.elementLeaves.size(); ++leafIndex) {
-                PythonAdMetadata leaf = adInputLeafMetadata(pipeline, parameter, leafIndex);
-                nb::str key(leaf.path.c_str());
-                if (!bindings.contains(key))
-                    throw std::invalid_argument("missing autodiff binding '" + leaf.path + "'");
-                inputValues.emplace_back(leaf.path, leaf.dtype, std::move(leaf.shape),
-                                         nb::borrow<nb::object>(bindings[key]));
+                VernonPipelineValueLeafView reflected{};
+                PythonAdMetadata leaf = adInputLeafMetadata(pipeline, parameter, leafIndex, &reflected);
+                nb::object value = resolveAdInputLeaf(bindings, parameter, reflected);
+                inputValues.emplace_back(leaf.path, leaf.dtype, std::move(leaf.shape), value);
                 inputViews.push_back(inputValues.back().value);
             }
         }
         VernonAdValueSet inputSet{sizeof(VernonAdValueSet), inputViews.data(), inputViews.size(), {}};
 
-        VernonDataType outputType{};
-        if (vernonRuntimeLoadedPipelineGetAdOutputDataType(pipeline, &outputType) != VERNON_STATUS_OK)
-            throw std::runtime_error("pipeline has no executable autodiff profile: " +
-                                     stringView(vernonRuntimeGetLastError(runtime)));
-        std::vector<uint64_t> outputShape;
-        size_t outputRank{};
-        if (vernonRuntimeLoadedPipelineGetAdOutputRank(pipeline, &outputRank) != VERNON_STATUS_OK)
-            throw std::runtime_error("cannot read autodiff output rank: " +
-                                     stringView(vernonRuntimeGetLastError(runtime)));
-        outputShape.reserve(outputRank);
-        for (size_t index = 0; index < outputRank; ++index) {
-            uint64_t extent{};
-            if (vernonRuntimeLoadedPipelineGetAdOutputDimension(pipeline, index, &extent) != VERNON_STATUS_OK)
-                throw std::runtime_error("cannot read autodiff output shape: " +
-                                         stringView(vernonRuntimeGetLastError(runtime)));
-            outputShape.push_back(extent);
-        }
         if (gridX > SIZE_MAX / gridY || static_cast<size_t>(gridX) * gridY > SIZE_MAX / gridZ)
             throw std::invalid_argument("autodiff grid size overflows");
         const size_t carrierCount = static_cast<size_t>(gridX) * gridY * gridZ;
-        if (carrierCount > 1)
-            outputShape.insert(outputShape.begin(), {gridZ, gridY, gridX});
-        nb::object outputZeros = nb::module_::import_("numpy").attr("zeros")(
-            outputShape, nb::module_::import_("numpy").attr(numpyDtypeName(outputType)));
-        PythonAdValue output("output", outputType, outputShape, outputZeros);
-        VernonAdValueSet outputSet{sizeof(VernonAdValueSet), &output.value, 1, {}};
+        const size_t outputCount = vernon::runtime::getAutodiffOutputMetadataCount(pipeline);
+        const size_t cotangentCount = vernon::runtime::getAutodiffCotangentMetadataCount(pipeline);
+        if (!outputCount || !cotangentCount)
+            throw std::runtime_error("pipeline has no consistent autodiff output/cotangent signature");
+        auto materializeMetadata = [&](const vernon::runtime::AutodiffValueMetadataView &value) {
+            PythonAdMetadata result{stringView(value.path), value.dtype, {}};
+            if (value.rank)
+                result.shape.assign(value.shape, value.shape + value.rank);
+            if (carrierCount > 1)
+                result.shape.insert(result.shape.begin(), {gridZ, gridY, gridX});
+            return result;
+        };
+        std::vector<PythonAdMetadata> outputMetadata;
+        std::vector<PythonAdMetadata> cotangentMetadata;
+        outputMetadata.reserve(outputCount);
+        cotangentMetadata.reserve(cotangentCount);
+        std::deque<PythonAdValue> outputValues;
+        std::vector<VernonAdValue> outputViews;
+        nb::dict aggregateOutput;
+        for (size_t index = 0; index < outputCount; ++index) {
+            vernon::runtime::AutodiffValueMetadataView outputValue;
+            if (!vernon::runtime::getAutodiffOutputMetadata(pipeline, index, outputValue))
+                throw std::runtime_error("pipeline has no consistent autodiff output/cotangent signature");
+            outputMetadata.push_back(materializeMetadata(outputValue));
+            const PythonAdMetadata &metadata = outputMetadata.back();
+            nb::object zeros = nb::module_::import_("numpy").attr("zeros")(
+                metadata.shape, nb::module_::import_("numpy").attr(numpyDtypeName(metadata.dtype)));
+            outputValues.emplace_back(metadata.path, metadata.dtype, metadata.shape, zeros);
+            outputViews.push_back(outputValues.back().value);
+            aggregateOutput[nb::str(metadata.path.c_str())] = outputValues.back().array;
+        }
+        for (size_t index = 0; index < cotangentCount; ++index) {
+            vernon::runtime::AutodiffValueMetadataView cotangentValue;
+            if (!vernon::runtime::getAutodiffCotangentMetadata(pipeline, index, cotangentValue))
+                throw std::runtime_error("pipeline has no consistent autodiff output/cotangent signature");
+            cotangentMetadata.push_back(materializeMetadata(cotangentValue));
+        }
+        VernonAdValueSet outputSet{sizeof(VernonAdValueSet), outputViews.data(), outputViews.size(), {}};
         VernonPullback *pullback = nullptr;
         if (vernonAdPipelineForward(pipeline, {gridX, gridY, gridZ}, &inputSet, &outputSet, &pullback) !=
             VERNON_STATUS_OK)
@@ -1357,10 +1420,11 @@ struct LoadedPipeline {
             inputLeaf.dtype = dtype;
             gradients.push_back(std::move(inputLeaf));
         }
-        return nb::make_tuple(output.array,
+        nb::object output =
+            outputValues.size() == 1 ? outputValues.front().array : nb::borrow<nb::object>(aggregateOutput);
+        return nb::make_tuple(output,
                               std::make_unique<PythonPullback>(runtime, pullback, std::move(gradients),
-                                                               autodiffTangentDtype(outputType), std::move(outputShape),
-                                                               std::move(pipelineOwner)));
+                                                               std::move(cotangentMetadata), std::move(pipelineOwner)));
     }
 
     static size_t dataTypeSize(VernonDataType type) {

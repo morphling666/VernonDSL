@@ -101,7 +101,14 @@ public:
         dtypeRefs.reserve(ownedDtypes.size());
         for (const std::string &dtype : ownedDtypes)
             dtypeRefs.push_back(dtype);
-        FailureOr<ValueAbiLayout> layout = mlir::vernon::getValueAbiLayout(value.getType(), module, dtypeRefs);
+        Type abiType = value.getType();
+        if (auto view = dyn_cast<TensorViewType>(abiType)) {
+            if (!view.getElementType().isIntOrFloat() || view.getShape().empty() ||
+                llvm::any_of(view.getShape(), [](int64_t extent) { return extent <= 0; }))
+                return failure();
+            abiType = RankedTensorType::get(view.getShape(), view.getElementType());
+        }
+        FailureOr<ValueAbiLayout> layout = mlir::vernon::getValueAbiLayout(abiType, module, dtypeRefs);
         if (failed(layout))
             return failure();
         cache.try_emplace(value, *layout);
@@ -314,6 +321,8 @@ void AutodiffAnalysisBuilder::verifySameAbi(Operation *operation, ValueRange com
 }
 
 void AutodiffAnalysisBuilder::addAllDependencies(Value resultValue, ValueRange operands) {
+    if (resultValue.getType().isIndex())
+        return;
     FailureOr<unsigned> resultIndex = addValue(resultValue);
     if (failed(resultIndex)) {
         emitDependencyError(resultValue.getDefiningOp(), "cannot resolve the result's canonical Value ABI");
@@ -326,6 +335,8 @@ void AutodiffAnalysisBuilder::addAllDependencies(Value resultValue, ValueRange o
         if (!resultNode)
             continue;
         for (Value operand : operands) {
+            if (operand.getType().isIndex())
+                continue;
             FailureOr<unsigned> operandIndex = addValue(operand);
             if (failed(operandIndex)) {
                 emitDependencyError(resultValue.getDefiningOp(), "cannot resolve an operand's canonical Value ABI");
@@ -403,6 +414,14 @@ void AutodiffAnalysisBuilder::addCreateDependencies(Value resultValue, ValueRang
 }
 
 void AutodiffAnalysisBuilder::buildDependencies(Operation *operation) {
+    if (auto load = dyn_cast<LoadOp>(operation)) {
+        addAllDependencies(load.getResult(), ValueRange(load.getStorage()));
+        return;
+    }
+    if (auto store = dyn_cast<StoreOp>(operation)) {
+        addAllDependencies(store.getStorage(), ValueRange(store.getValue()));
+        return;
+    }
     if (auto ifOp = dyn_cast<scf::IfOp>(operation)) {
         for (auto [resultIndex, value] : llvm::enumerate(ifOp.getResults())) {
             SmallVector<Value> yielded;
@@ -555,9 +574,12 @@ LogicalResult AutodiffAnalysisBuilder::resolveWrt() {
             const std::string path = appendAbiPath(components.front(), leaf.path);
             if (!canonicalPaths.insert(path).second)
                 return emitFunctionError(Twine("duplicate canonical wrt leaf '") + path + "'");
-            Type derivativeType = *getAutodiffDerivativeType(leaf.scalarType);
+            Type derivativeType = leaf.shape.empty() ? *getAutodiffDerivativeType(leaf.scalarType)
+                                                     : static_cast<Type>(RankedTensorType::get(
+                                                           SmallVector<int64_t>(leaf.shape.begin(), leaf.shape.end()),
+                                                           *getAutodiffDerivativeType(leaf.scalarType)));
             result.wrtLeaves.push_back(AutodiffLeaf{argument, static_cast<unsigned>(leafIndex), path, leaf.scalarType,
-                                                    derivativeType, leaf.dtype});
+                                                    derivativeType, leaf.dtype, leaf.shape});
             wrtNodes.push_back(*getNode(argument, leafIndex));
             ++matches;
         }
@@ -617,7 +639,11 @@ LogicalResult AutodiffAnalysisBuilder::resolveResults() {
                     path = appendAbiPath(("output." + std::to_string(resultIndex)), leaf.path);
                 result.activeResultLeaves.push_back(
                     AutodiffLeaf{value, static_cast<unsigned>(leafIndex), std::move(path), leaf.scalarType,
-                                 *getAutodiffDerivativeType(leaf.scalarType), leaf.dtype});
+                                 leaf.shape.empty() ? *getAutodiffDerivativeType(leaf.scalarType)
+                                                    : static_cast<Type>(RankedTensorType::get(
+                                                          SmallVector<int64_t>(leaf.shape.begin(), leaf.shape.end()),
+                                                          *getAutodiffDerivativeType(leaf.scalarType))),
+                                 leaf.dtype, leaf.shape});
             }
         }
     }
@@ -813,12 +839,8 @@ FailureOr<Type> getAutodiffDerivativeType(Type scalarType) {
 AutodiffEffectKind classifyAutodiffEffect(Operation *operation) {
     if (isa<LoadOp, PhysicalLoadOp>(operation))
         return AutodiffEffectKind::StorageRead;
-    if (auto store = dyn_cast<StoreOp>(operation))
-        return store.getStorage().getType().getAddressSpace() == "device" ? AutodiffEffectKind::ExternallyVisible
-                                                                          : AutodiffEffectKind::StorageWrite;
-    if (auto store = dyn_cast<PhysicalStoreOp>(operation))
-        return store.getStorage().getType().getAddressSpace() == "device" ? AutodiffEffectKind::ExternallyVisible
-                                                                          : AutodiffEffectKind::StorageWrite;
+    if (isa<StoreOp, PhysicalStoreOp>(operation))
+        return AutodiffEffectKind::StorageWrite;
     if (auto atomic = dyn_cast<AtomicOp>(operation))
         return atomic.getStorage().getType().getAddressSpace() == "device" ? AutodiffEffectKind::ExternallyVisible
                                                                            : AutodiffEffectKind::Atomic;

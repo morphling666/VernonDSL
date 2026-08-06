@@ -278,6 +278,22 @@ if(TARGET VernonRuntime)
             vernonRegisterStructuredScalarAutodiffFixture
             structured_scalar_autodiff_manifest
             structured_scalar_autodiff_fixture_target)
+        vernon_add_cpu_autodiff_fixture(
+            structured-aggregate-autodiff
+            autodiff_structured_aggregate_fixture
+            autodiff_structured_aggregate_fixture.pipeline.json
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_aggregate_asset.py:asset"
+            vernonRegisterStructuredAggregateAutodiffFixture
+            structured_aggregate_autodiff_manifest
+            structured_aggregate_autodiff_fixture_target)
+        vernon_add_cpu_autodiff_fixture(
+            structured-storage-autodiff
+            autodiff_structured_storage_fixture
+            autodiff_structured_storage_fixture.pipeline.json
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_storage_asset.py:asset"
+            vernonRegisterStructuredStorageAutodiffFixture
+            structured_storage_autodiff_manifest
+            structured_storage_autodiff_fixture_target)
 
         add_executable(VernonCookedAutodiffTests runtime/runtime_cooked_autodiff_test.cpp)
         target_link_libraries(VernonCookedAutodiffTests PRIVATE GTest::gtest_main Vernon::Runtime
@@ -299,6 +315,28 @@ if(TARGET VernonRuntime)
                                                                              "${CMAKE_BINARY_DIR}/source")
         vernon_stage_target_files(VernonStructuredScalarAutodiffTests VernonRuntime)
         vernon_discover_gtests(VernonStructuredScalarAutodiffTests)
+
+        add_executable(VernonStructuredAggregateAutodiffTests runtime/runtime_structured_aggregate_autodiff_test.cpp)
+        target_link_libraries(VernonStructuredAggregateAutodiffTests
+                              PRIVATE GTest::gtest_main Vernon::Runtime ${structured_aggregate_autodiff_fixture_target})
+        target_compile_definitions(
+            VernonStructuredAggregateAutodiffTests
+            PRIVATE VERNON_STRUCTURED_AGGREGATE_AUTODIFF_MANIFEST="${structured_aggregate_autodiff_manifest}")
+        set_target_properties(VernonStructuredAggregateAutodiffTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                                                                "${CMAKE_BINARY_DIR}/source")
+        vernon_stage_target_files(VernonStructuredAggregateAutodiffTests VernonRuntime)
+        vernon_discover_gtests(VernonStructuredAggregateAutodiffTests)
+
+        add_executable(VernonStructuredStorageAutodiffTests runtime/runtime_structured_storage_autodiff_test.cpp)
+        target_link_libraries(VernonStructuredStorageAutodiffTests
+                              PRIVATE GTest::gtest_main Vernon::Runtime ${structured_storage_autodiff_fixture_target})
+        target_compile_definitions(
+            VernonStructuredStorageAutodiffTests
+            PRIVATE VERNON_STRUCTURED_STORAGE_AUTODIFF_MANIFEST="${structured_storage_autodiff_manifest}")
+        set_target_properties(VernonStructuredStorageAutodiffTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                                                              "${CMAKE_BINARY_DIR}/source")
+        vernon_stage_target_files(VernonStructuredStorageAutodiffTests VernonRuntime)
+        vernon_discover_gtests(VernonStructuredStorageAutodiffTests)
 
         vernon_add_autodiff_python_fixture(
             VernonCookedAutodiffPythonFixture

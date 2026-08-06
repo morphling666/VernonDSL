@@ -295,9 +295,10 @@ private:
 
     LogicalResult lowerBeginRegion(AdBeginRegionOp operation) {
         OpBuilder builder(operation);
-        Value tapeDescriptor = descriptors.lookup(operation.getTape());
+        Value logicalTape = operation->getOperand(0);
+        Value tapeDescriptor = descriptors.lookup(logicalTape);
         if (!tapeDescriptor)
-            tapeDescriptor = operation.getTape() == descriptor ? descriptor : Value{};
+            tapeDescriptor = logicalTape == descriptor ? descriptor : Value{};
         if (!tapeDescriptor)
             return operation.emitError("CPU autodiff region has no allocator descriptor");
         Value parent = integerConstant(builder, operation.getLoc(), 64, 0);
@@ -333,12 +334,13 @@ private:
                 childCount =
                     std::max<uint64_t>(childCount, static_cast<uint64_t>(child.getChildOrdinalAttr().getInt()) + 1);
         const uint64_t payloadSize = static_cast<uint64_t>(operation.getRecordSizeAttr().getInt());
-        Value tapeDescriptor = regionDescriptors.lookup(operation.getRegion());
+        Value region = operation->getOperand(0);
+        Value tapeDescriptor = regionDescriptors.lookup(region);
         if (!tapeDescriptor)
             return operation.emitError("CPU autodiff reservation has no allocator descriptor");
         Value rawResult =
             emitCallback(builder, operation.getLoc(), tapeDescriptor, SemanticCallback::ReserveRecord,
-                         {operation.getRegion(), integerConstant(builder, operation.getLoc(), 64, payloadSize),
+                         {region, integerConstant(builder, operation.getLoc(), 64, payloadSize),
                           integerConstant(builder, operation.getLoc(), 64,
                                           static_cast<uint64_t>(operation.getRecordAlignmentAttr().getInt())),
                           integerConstant(builder, operation.getLoc(), 64, childCount)},
@@ -363,7 +365,7 @@ private:
         if (failed(raw))
             return operation.emitError("CPU autodiff tape leaf is not a supported scalar");
         const uint64_t size = std::max<uint64_t>(operation.getValue().getType().getIntOrFloatBitWidth() / 8, 1);
-        emitCallback(builder, operation.getLoc(), regionDescriptors.lookup(operation.getRegion()),
+        emitCallback(builder, operation.getLoc(), regionDescriptors.lookup(operation->getOperand(0)),
                      SemanticCallback::WriteLeaf,
                      {found->second.handle,
                       integerConstant(builder, operation.getLoc(), 64,
@@ -375,12 +377,13 @@ private:
 
     LogicalResult lowerEnd(AdEndRegionOp operation) {
         OpBuilder builder(operation);
-        Value tapeDescriptor = regionDescriptors.lookup(operation.getRegion());
+        Value region = operation->getOperand(0);
+        Value tapeDescriptor = regionDescriptors.lookup(region);
         if (!tapeDescriptor)
             return operation.emitError("CPU autodiff region finalization has no allocator descriptor");
-        emitCallback(builder, operation.getLoc(), tapeDescriptor, SemanticCallback::EndRegion,
-                     {operation.getRegion(), asI64(builder, operation.getLoc(), operation.getExecutedCount()),
-                      operation.getExitKind()});
+        emitCallback(
+            builder, operation.getLoc(), tapeDescriptor, SemanticCallback::EndRegion,
+            {region, asI64(builder, operation.getLoc(), operation.getExecutedCount()), operation.getExitKind()});
         operation.erase();
         return success();
     }
@@ -401,9 +404,10 @@ private:
 
     void lowerExecutedCountRead(AdReadExecutedCountOp operation) {
         OpBuilder builder(operation);
-        Value tapeDescriptor = regionDescriptors.lookup(operation.getRegion());
+        Value region = operation->getOperand(0);
+        Value tapeDescriptor = regionDescriptors.lookup(region);
         Value raw = emitCallback(builder, operation.getLoc(), tapeDescriptor, SemanticCallback::ReadExecutedCount,
-                                 {operation.getRegion()}, {builder.getI64Type()})
+                                 {region}, {builder.getI64Type()})
                         .getResult(0);
         Value result = arith::IndexCastOp::create(builder, operation.getLoc(), builder.getIndexType(), raw);
         operation.getExecutedCount().replaceAllUsesWith(result);
@@ -412,9 +416,10 @@ private:
 
     void lowerExitKindRead(AdReadExitKindOp operation) {
         OpBuilder builder(operation);
-        Value tapeDescriptor = regionDescriptors.lookup(operation.getRegion());
+        Value region = operation->getOperand(0);
+        Value tapeDescriptor = regionDescriptors.lookup(region);
         Value result = emitCallback(builder, operation.getLoc(), tapeDescriptor, SemanticCallback::ReadExitKind,
-                                    {operation.getRegion()}, {builder.getI32Type()})
+                                    {region}, {builder.getI32Type()})
                            .getResult(0);
         operation.getExitKind().replaceAllUsesWith(result);
         operation.erase();
@@ -422,14 +427,14 @@ private:
 
     void lowerNestedRead(AdReadNestedRegionOp operation) {
         OpBuilder builder(operation);
-        Value tapeDescriptor = regionDescriptors.lookup(operation.getRegion());
-        Value result =
-            emitCallback(builder, operation.getLoc(), tapeDescriptor, SemanticCallback::ReadChild,
-                         {operation.getRegion(), asI64(builder, operation.getLoc(), operation.getRecordIndex()),
-                          integerConstant(builder, operation.getLoc(), 64,
-                                          static_cast<uint64_t>(operation.getChildOrdinalAttr().getInt()))},
-                         {builder.getI64Type()})
-                .getResult(0);
+        Value region = operation->getOperand(0);
+        Value tapeDescriptor = regionDescriptors.lookup(region);
+        Value result = emitCallback(builder, operation.getLoc(), tapeDescriptor, SemanticCallback::ReadChild,
+                                    {region, asI64(builder, operation.getLoc(), operation.getRecordIndex()),
+                                     integerConstant(builder, operation.getLoc(), 64,
+                                                     static_cast<uint64_t>(operation.getChildOrdinalAttr().getInt()))},
+                                    {builder.getI64Type()})
+                           .getResult(0);
         regionDescriptors.try_emplace(result, tapeDescriptor);
         operation.getNestedRegion().replaceAllUsesWith(result);
         operation.erase();
@@ -437,11 +442,12 @@ private:
 
     LogicalResult lowerLeafRead(AdReadLeafOp operation) {
         OpBuilder builder(operation);
-        Value tapeDescriptor = regionDescriptors.lookup(operation.getRegion());
+        Value region = operation->getOperand(0);
+        Value tapeDescriptor = regionDescriptors.lookup(region);
         Type type = operation.getValue().getType();
         const uint64_t size = std::max<uint64_t>(type.getIntOrFloatBitWidth() / 8, 1);
         Value raw = emitCallback(builder, operation.getLoc(), tapeDescriptor, SemanticCallback::ReadLeaf,
-                                 {operation.getRegion(), asI64(builder, operation.getLoc(), operation.getRecordIndex()),
+                                 {region, asI64(builder, operation.getLoc(), operation.getRecordIndex()),
                                   integerConstant(builder, operation.getLoc(), 64,
                                                   static_cast<uint64_t>(operation.getLeafOffsetAttr().getInt())),
                                   integerConstant(builder, operation.getLoc(), 64, size)},
@@ -460,8 +466,8 @@ private:
         emitCallback(builder, operation.getLoc(), descriptor, SemanticCallback::Reset, {});
         Block &body = operation.getBody().front();
         auto yield = cast<AdCaptureYieldOp>(body.getTerminator());
-        Value tape = yield.getTape();
-        Value root = yield.getRootRegion();
+        Value tape = yield->getOperand(0);
+        Value root = yield->getOperand(1);
         for (Operation &nested : llvm::make_early_inc_range(body.without_terminator()))
             nested.moveBefore(operation);
         Value sealStatus =

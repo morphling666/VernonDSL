@@ -8,15 +8,18 @@ from typing import Any
 from ..ad import ProgramTransformSpec
 from .autodiff_profiles import (
     AutodiffProfilePlan,
-    build_structured_scalar_profile_plan,
-    structured_scalar_profile_symbols,
+    _gradient_type,
+    _leaves,
+    _resolve_path,
+    build_structured_profile_plan,
+    structured_profile_symbols,
 )
 from .model import TypedFunctionInstance
 from .request import FrontendCompileResult
 
 
 @dataclass(frozen=True)
-class StructuredScalarVjpBuild:
+class StructuredVjpBuild:
     transform: ProgramTransformSpec
     entry: TypedFunctionInstance
     plan: AutodiffProfilePlan
@@ -32,7 +35,7 @@ def resolve_vjp_transform(
     return replace(transform, output_cotangents=output_cotangents)
 
 
-def is_structured_scalar_vjp_abi_eligible(
+def is_structured_vjp_abi_eligible(
     frontend: FrontendCompileResult,
     transform: ProgramTransformSpec,
 ) -> bool:
@@ -42,33 +45,43 @@ def is_structured_scalar_vjp_abi_eligible(
     )
     if entry is None or entry.result_type is None:
         return False
-    if entry.result_type.kind != "scalar" or not entry.result_type.is_float:
+    structs = dict(frontend.structs)
+    if not _leaves(entry.result_type, structs, ("output",)):
         return False
     parameters = {parameter.name: parameter for parameter in entry.parameters}
-    return all(
-        path in parameters
-        and parameters[path].builtin is None
-        and parameters[path].type.kind == "scalar"
-        and parameters[path].type.is_float
-        for path in transform.wrt
-    )
+    try:
+        for path in transform.wrt:
+            root = path.split(".", 1)[0]
+            if root not in parameters or parameters[root].builtin is not None:
+                return False
+            value_type = _resolve_path(path, {name: value.type for name, value in parameters.items()}, structs)
+            leaves = _leaves(value_type, structs, tuple(path.split(".")))
+            if not leaves:
+                return False
+            for _, leaf_type in leaves:
+                _gradient_type(leaf_type)
+    except (KeyError, ValueError, IndexError):
+        return False
+    return True
 
 
-def build_structured_scalar_vjp(
+def build_structured_vjp(
     native: Any,
     frontend: FrontendCompileResult,
     transform: ProgramTransformSpec,
-) -> StructuredScalarVjpBuild:
+) -> StructuredVjpBuild:
     entry = next(
         (function for function in frontend.typed_functions if function.symbol == frontend.request.entry),
         None,
     )
     if entry is None:
         raise ValueError("structured VJP frontend produced no typed entry")
-    if not is_structured_scalar_vjp_abi_eligible(frontend, transform):
-        raise ValueError("structured scalar VJP requires one floating result and scalar floating wrt parameters")
-    resolved = resolve_vjp_transform(transform, ("output",))
-    _, forward_symbol, backward_symbol = structured_scalar_profile_symbols(
+    if not is_structured_vjp_abi_eligible(frontend, transform):
+        raise ValueError("structured VJP requires canonical differentiable result and wrt leaves")
+    structs = dict(frontend.structs)
+    output_cotangents = tuple(path for path, _ in _leaves(entry.result_type, structs, ("output",)))
+    resolved = resolve_vjp_transform(transform, output_cotangents)
+    _, forward_symbol, backward_symbol = structured_profile_symbols(
         resolved,
         entry,
         frontend.mlir,
@@ -80,16 +93,17 @@ def build_structured_scalar_vjp(
         forward_symbol,
         backward_symbol,
     )
-    plan = build_structured_scalar_profile_plan(
+    plan = build_structured_profile_plan(
         resolved,
         entry,
+        structs,
         frontend.mlir,
         int(transformed.tape_bytes),
         tuple(str(rule) for rule in transformed.derivative_rules),
         frontend.entry_workgroup_size or (1, 1, 1),
     )
     profiles = MappingProxyType(dict(transformed.profiles(plan.identity)))
-    return StructuredScalarVjpBuild(
+    return StructuredVjpBuild(
         resolved,
         entry,
         plan,
@@ -100,8 +114,8 @@ def build_structured_scalar_vjp(
 
 
 __all__ = [
-    "StructuredScalarVjpBuild",
-    "build_structured_scalar_vjp",
-    "is_structured_scalar_vjp_abi_eligible",
+    "StructuredVjpBuild",
+    "build_structured_vjp",
+    "is_structured_vjp_abi_eligible",
     "resolve_vjp_transform",
 ]

@@ -23,8 +23,8 @@ from ..bundle import (
 from ..compiler import Compiler, FrontendCompileRequest, compile_file
 from ..frontend.autodiff_profiles import build_autodiff_profile_plan
 from ..frontend.structured_vjp import (
-    build_structured_scalar_vjp,
-    is_structured_scalar_vjp_abi_eligible,
+    build_structured_vjp,
+    is_structured_vjp_abi_eligible,
     resolve_vjp_transform,
 )
 from ..language.stage_registry import validate_stage_target
@@ -235,13 +235,13 @@ def cook_pipeline_asset(
                     )
                 )
             if transform.protocol == "dynamic_v2":
-                if frontend is None or not is_structured_scalar_vjp_abi_eligible(frontend, transform):
+                if frontend is None or not is_structured_vjp_abi_eligible(frontend, transform):
                     raise PipelineCompileError(
-                        "dynamic_v2 requires a structured scalar CPU VJP; "
+                        "dynamic_v2 requires a structured CPU VJP; "
                         "use protocol='legacy_fixed' only for an explicitly identified native profile"
                     )
                 try:
-                    structured = build_structured_scalar_vjp(native, frontend, transform)
+                    structured = build_structured_vjp(native, frontend, transform)
                 except ValueError as error:
                     raise PipelineCompileError(str(error)) from None
                 variant_transform = structured.transform

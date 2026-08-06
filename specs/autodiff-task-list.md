@@ -531,27 +531,27 @@ Gate:
 
 Implementation:
 
-- [ ] Move Scalar, Tensor, Tuple, and Struct input projection to the structured
+- [x] Move Scalar, Tensor, Tuple, and Struct input projection to the structured
   path.
-- [ ] Move aggregate output cotangent projection to the structured path.
-- [ ] Move aggregate tape records to canonical ABI leaf layout.
-- [ ] Move per-leaf f16/f32/f64 gradient promotion to the structured path.
-- [ ] Move static and dynamic Tensor indexing VJPs.
-- [ ] Move Tensor scalar broadcasting and reduction-to-source-shape VJPs.
-- [ ] Move functionalized TensorView load/store VJPs.
-- [ ] Preserve alias rejection for overlapping writable Storage.
-- [ ] Preserve disjoint-scatter evidence and target-owned accumulation choice.
+- [x] Move aggregate output cotangent projection to the structured path.
+- [x] Move aggregate tape records to canonical ABI leaf layout.
+- [x] Move per-leaf f16/f32/f64 gradient promotion to the structured path.
+- [x] Move static and dynamic Tensor indexing VJPs.
+- [x] Move Tensor scalar broadcasting and reduction-to-source-shape VJPs.
+- [x] Move functionalized TensorView load/store VJPs.
+- [x] Preserve alias rejection for overlapping writable Storage.
+- [x] Preserve disjoint-scatter evidence and target-owned accumulation choice.
 
 Acceptance:
 
-- [ ] Add native and cooked CPU numerical tests for nested Tuple/Struct values.
-- [ ] Add dynamic indexing, broadcasting, and Storage mutation tests.
-- [ ] Verify reflection paths, shapes, offsets, and promoted dtypes leaf by
+- [x] Add native and cooked CPU numerical tests for nested Tuple/Struct values.
+- [x] Add dynamic indexing, broadcasting, and Storage mutation tests.
+- [x] Verify reflection paths, shapes, offsets, and promoted dtypes leaf by
   leaf.
 
 Gate:
 
-- [ ] Structured CPU VJP covers the current production CPU capability set.
+- [x] Structured CPU VJP covers the current production CPU capability set.
 
 ## Phase 10 — GPU physical-entry ABI
 

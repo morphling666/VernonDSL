@@ -32,6 +32,7 @@ struct AutodiffLeaf {
     Type primalType;
     Type derivativeType;
     std::string dtype;
+    SmallVector<uint64_t> shape;
 };
 
 struct AutodiffValueActivity {

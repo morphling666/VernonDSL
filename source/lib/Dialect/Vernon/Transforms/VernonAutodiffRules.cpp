@@ -317,7 +317,8 @@ LogicalResult verifyElementwiseOperation(Operation *operation, unsigned operandC
 }
 
 bool isStructuralAutodiffOperation(Operation *operation) {
-    return isa<scf::IfOp, scf::WhileOp, StructGetOp, TupleGetOp, StructCreateOp, TupleCreateOp>(operation);
+    return isa<scf::IfOp, scf::WhileOp, StructGetOp, TupleGetOp, StructCreateOp, TupleCreateOp, LoadOp, StoreOp>(
+        operation);
 }
 
 bool isDifferentiableValueType(Type type) { return succeeded(getDerivativeValueType(type)); }
@@ -388,11 +389,15 @@ FailureOr<SmallVector<Value>> DifferentiationRule::buildVjp(Operation *operation
         return failure();
     if (contributions.size() != operation->getNumOperands())
         return operation->emitOpError("autodiff VJP builder returned the wrong number of operand contributions");
-    if (llvm::any_of(contributions, [](Value value) { return !value; }))
-        return operation->emitOpError("autodiff VJP builder returned an empty contribution");
     for (auto [contribution, operand] : llvm::zip_equal(contributions, operation->getOperands())) {
         FailureOr<Type> expectedType = getDerivativeValueType(operand.getType());
-        if (failed(expectedType) || contribution.getType() != *expectedType)
+        if (failed(expectedType)) {
+            if (contribution)
+                return operation->emitOpError(
+                    "autodiff VJP builder returned a contribution for a non-differentiable operand");
+            continue;
+        }
+        if (!contribution || contribution.getType() != *expectedType)
             return operation->emitOpError("autodiff VJP builder returned an incompatible contribution type");
     }
     return contributions;
@@ -632,9 +637,9 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
                 return operation->emitOpError("dot VJP requires floating-point ranked Tensor operands");
             auto leftTensor = cast<RankedTensorType>(*leftType);
             auto rightTensor = cast<RankedTensorType>(*rightType);
-            if (leftTensor.getRank() != 1 || leftTensor != rightTensor ||
+            if (leftTensor.getRank() == 0 || leftTensor != rightTensor ||
                 operation->getResult(0).getType() != getElementTypeOrSelf(operation->getOperand(0).getType()))
-                return operation->emitOpError("dot VJP requires equal vectors and a matching scalar result");
+                return operation->emitOpError("dot VJP requires equal ranked Tensors and a matching scalar result");
             Value left = castPrimal(context.builder, context.location, context.getPrimalOperand(0), *leftType);
             Value right = castPrimal(context.builder, context.location, context.getPrimalOperand(1), *rightType);
             if (failed(requireValues(operation, {left, right})))
@@ -765,6 +770,45 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
                                 return success();
                             }));
     add(DifferentiationRule(intrinsicRuleKey("broadcast"), 1, 1, {}, buildBroadcastVjp, {}, verifyFloatingIntrinsic));
+    add(DifferentiationRule(
+        tensor::ExtractOp::getOperationName().str(), std::nullopt, 1, {},
+        [](Operation *operation, const AutodiffVjpBuildContext &context,
+           SmallVectorImpl<Value> &results) -> LogicalResult {
+            auto extract = cast<tensor::ExtractOp>(operation);
+            auto sourceType = dyn_cast<RankedTensorType>(extract.getTensor().getType());
+            FailureOr<Type> derivative = getDerivativeValueType(extract.getTensor().getType());
+            if (!sourceType || !sourceType.hasStaticShape() || failed(derivative))
+                return operation->emitOpError("tensor.extract VJP requires a static floating-point Tensor");
+            auto derivativeType = cast<RankedTensorType>(*derivative);
+            Value seed = context.resultCotangents.front();
+            Value zero = constant(context.builder, context.location, derivativeType.getElementType(), 0.0);
+            SmallVector<Value> elements;
+            for (const SmallVector<int64_t> &coordinate : enumerateCoordinates(sourceType.getShape())) {
+                Value selected = seed;
+                for (auto [dimension, expected] : llvm::enumerate(coordinate)) {
+                    Value expectedValue = arith::ConstantIndexOp::create(context.builder, context.location, expected);
+                    Value matches = arith::CmpIOp::create(context.builder, context.location, arith::CmpIPredicate::eq,
+                                                          context.primalOperands[dimension + 1], expectedValue);
+                    selected = arith::SelectOp::create(context.builder, context.location, matches, selected, zero);
+                }
+                elements.push_back(selected);
+            }
+            results.push_back(
+                tensor::FromElementsOp::create(context.builder, context.location, derivativeType, elements));
+            results.append(extract.getIndices().size(), Value{});
+            return success();
+        },
+        {},
+        [](Operation *operation) -> LogicalResult {
+            auto extract = dyn_cast<tensor::ExtractOp>(operation);
+            if (!extract)
+                return failure();
+            auto source = dyn_cast<RankedTensorType>(extract.getTensor().getType());
+            if (!source || !source.hasStaticShape() || !source.getElementType().isIntOrFloat() ||
+                !extract.getResult().getType().isIntOrFloat())
+                return operation->emitOpError("tensor.extract VJP requires a static scalar-element Tensor");
+            return success();
+        }));
     return registry;
 }
 

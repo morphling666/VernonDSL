@@ -230,6 +230,9 @@ module {
     "vernon.barrier"() {ordering = "acquire_release", scope = "workgroup"} : () -> ()
     "vernon.store"(%loaded, %device, %index)
         : (f32, !vernon.tensor_view<f32, [1], "read_write", "device">, index) -> ()
+    %device_old = "vernon.atomic"(%device, %index, %value) {
+      atomic_kind = "add", ordering = "relaxed"
+    } : (!vernon.tensor_view<f32, [1], "read_write", "device">, index, f32) -> f32
     func.return
   }
 }
@@ -348,11 +351,12 @@ TEST_F(VernonAutodiffAnalysisTest, RejectsActiveExternallyVisibleEffect) {
 module {
   func.func @visible(
       %x: f32 {vernon.source_name = "x", vernon.abi_leaf_dtypes = ["f32"]},
-      %device: !vernon.tensor_view<f32, [1], "write", "device">,
+      %device: !vernon.tensor_view<f32, [1], "read_write", "device">,
       %index: index) -> (f32 {vernon.abi_leaf_dtypes = ["f32"]}) {
     %constant = arith.constant 1.0 : f32
-    "vernon.store"(%constant, %device, %index)
-        : (f32, !vernon.tensor_view<f32, [1], "write", "device">, index) -> ()
+    %old = "vernon.atomic"(%device, %index, %constant) {
+      atomic_kind = "add", ordering = "relaxed"
+    } : (!vernon.tensor_view<f32, [1], "read_write", "device">, index, f32) -> f32
     func.return %constant : f32
   }
 }

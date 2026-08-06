@@ -423,10 +423,8 @@ bool isAllowedCaptureOperation(Operation *operation) {
         return true;
     if (isa<LoadOp, PhysicalLoadOp, WorkgroupAllocOp>(operation))
         return true;
-    if (auto store = dyn_cast<StoreOp>(operation))
-        return store.getStorage().getType().getAddressSpace() != "device";
-    if (auto store = dyn_cast<PhysicalStoreOp>(operation))
-        return store.getStorage().getType().getAddressSpace() != "device";
+    if (isa<StoreOp, PhysicalStoreOp>(operation))
+        return operation->hasAttrOfType<UnitAttr>("vernon.ad.functionalized");
     if (auto atomic = dyn_cast<AtomicOp>(operation))
         return atomic.getStorage().getType().getAddressSpace() != "device";
     if (auto atomic = dyn_cast<PhysicalAtomicOp>(operation))

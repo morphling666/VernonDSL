@@ -49,7 +49,7 @@ def abs(value: Any) -> Any:
 
 
 def dot(left: Any, right: Any) -> Any:
-    return np.dot(left, right)
+    return np.sum(np.asarray(left) * np.asarray(right))
 
 
 def cross(left: Any, right: Any) -> Any:

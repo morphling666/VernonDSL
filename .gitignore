@@ -17,4 +17,7 @@ release-artifacts/
 *.lib
 *.exp
 *.exe
+*.npy
+AGENTS.md
+CLAUDE.md
 secret/

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 from dataclasses import dataclass
 from typing import Any
@@ -140,6 +141,78 @@ def _resolve_path(
     return value_type
 
 
+def _tensor_view_evidence(
+    entry: TypedFunctionInstance, parameter_name: str
+) -> tuple[tuple[AccessPatternEvidence, ...], tuple[int, ...]]:
+    builtin_names = {parameter.name for parameter in entry.parameters if parameter.builtin == "global_invocation_id"}
+    mappings: list[tuple[tuple[str, int], ...]] = []
+    direct_storage_references: set[int] = set()
+    static = False
+    non_injective = False
+    axes = {"x": 0, "y": 1, "z": 2}
+    for node in ast.walk(entry.source):
+        if (
+            not isinstance(node, ast.Subscript)
+            or not isinstance(node.value, ast.Name)
+            or node.value.id != parameter_name
+        ):
+            continue
+        direct_storage_references.add(id(node.value))
+        components = node.slice.elts if isinstance(node.slice, ast.Tuple) else (node.slice,)
+        mapping: list[tuple[str, int]] = []
+        for component in components:
+            if isinstance(component, ast.Constant) and isinstance(component.value, int):
+                static = True
+                mapping.append(("constant", component.value))
+            elif (
+                isinstance(component, ast.Attribute)
+                and isinstance(component.value, ast.Name)
+                and component.value.id in builtin_names
+                and component.attr in axes
+            ):
+                mapping.append(("gid", axes[component.attr]))
+            elif (
+                isinstance(component, ast.Subscript)
+                and isinstance(component.value, ast.Name)
+                and component.value.id in builtin_names
+                and isinstance(component.slice, ast.Constant)
+                and isinstance(component.slice.value, int)
+                and 0 <= component.slice.value < 3
+            ):
+                mapping.append(("gid", component.slice.value))
+            else:
+                non_injective = True
+                mapping = []
+                break
+        if mapping:
+            mappings.append(tuple(mapping))
+    if any(
+        isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Load)
+        and node.id == parameter_name
+        and id(node) not in direct_storage_references
+        for node in ast.walk(entry.source)
+    ):
+        non_injective = True
+    evidence: set[AccessPatternEvidence] = set()
+    if static:
+        evidence.add(AccessPatternEvidence.STATIC_INDEX_CONFLICT)
+    invocation_axes = {index for mapping in mappings for kind, index in mapping if kind == "gid"}
+    if invocation_axes:
+        evidence.add(AccessPatternEvidence.INJECTIVE_GLOBAL_INDEX)
+    if non_injective or not mappings:
+        evidence.add(AccessPatternEvidence.NON_INJECTIVE_INDEX)
+    if (
+        invocation_axes == {0, 1, 2}
+        and mappings
+        and all(mapping == mappings[0] for mapping in mappings[1:])
+        and not static
+        and not non_injective
+    ):
+        evidence.add(AccessPatternEvidence.DISJOINT_SCATTER)
+    return tuple(sorted(evidence, key=lambda item: item.value)), tuple(sorted(invocation_axes))
+
+
 def build_autodiff_profile_plan(
     transform: ProgramTransformSpec,
     program: AutodiffProgram,
@@ -151,7 +224,7 @@ def build_autodiff_profile_plan(
     output_type = next(node.type for node in graph.nodes if node.id == graph.outputs[0])
     cotangents = tuple(
         AutodiffBinding(path, _gradient_type(value_type).mlir, "cotangent")
-        for path, value_type in sorted(_leaves(output_type, structs, ("output",)), key=lambda leaf: leaf[0])
+        for path, value_type in _leaves(output_type, structs, ("output",))
     )
     gradients = tuple(
         AutodiffBinding(leaf_path, _gradient_type(value_type).mlir, "gradient")
@@ -198,23 +271,68 @@ def build_autodiff_profile_plan(
     )
 
 
-def build_structured_scalar_profile_plan(
+def build_structured_profile_plan(
     transform: ProgramTransformSpec,
     entry: TypedFunctionInstance,
+    structs: dict[str, tuple[tuple[str, ConcreteType], ...]],
     primal_mlir: str,
     tape_bytes: int,
     derivative_rules: tuple[str, ...],
     workgroup_size: tuple[int, int, int],
 ) -> AutodiffProfilePlan:
     """Build profile metadata without constructing the legacy AD program graph."""
-    if entry.result_type is None or entry.result_type.kind != "scalar" or not entry.result_type.is_float:
-        raise ValueError("structured scalar VJP requires one floating-point scalar result")
+    if entry.result_type is None:
+        raise ValueError("structured VJP requires a result")
     parameters = {parameter.name: parameter.type for parameter in entry.parameters}
-    if any(path not in parameters for path in transform.wrt):
-        raise ValueError("structured scalar VJP wrt paths must name scalar parameters")
-    gradients = tuple(
-        AutodiffBinding(path, _gradient_type(parameters[path]).mlir, "gradient") for path in transform.wrt
+    cotangents = tuple(
+        AutodiffBinding(path, _gradient_type(value_type).mlir, "cotangent")
+        for path, value_type in _leaves(entry.result_type, structs, ("output",))
     )
+    if not cotangents:
+        raise ValueError("structured VJP result has no differentiable leaves")
+    gradients = tuple(
+        AutodiffBinding(leaf_path, _gradient_type(value_type).mlir, "gradient")
+        for leaf_path, value_type in sorted(
+            (
+                leaf
+                for wrt_path in transform.wrt
+                for leaf in _leaves(
+                    _resolve_path(wrt_path, parameters, structs),
+                    structs,
+                    tuple(wrt_path.split(".")),
+                )
+            ),
+            key=lambda leaf: leaf[0],
+        )
+    )
+    if not gradients:
+        raise ValueError("structured VJP wrt paths have no differentiable leaves")
+
+    def gradient_source(path: str) -> ConcreteType:
+        wrt_path = next(
+            candidate for candidate in transform.wrt if path == candidate or path.startswith(candidate + ".")
+        )
+        return _resolve_path(wrt_path, parameters, structs)
+
+    def gradient_evidence(path: str) -> tuple[tuple[AccessPatternEvidence, ...], tuple[int, ...]]:
+        source = gradient_source(path)
+        if source.kind != "tensor_view":
+            return (AccessPatternEvidence.SHARED_VALUE,), ()
+        wrt_path = next(
+            candidate for candidate in transform.wrt if path == candidate or path.startswith(candidate + ".")
+        )
+        return _tensor_view_evidence(entry, wrt_path.split(".", 1)[0])
+
+    def accumulation_plan(gradient: AutodiffBinding) -> AccumulationPlan:
+        source = gradient_source(gradient.path)
+        evidence, invocation_axes = gradient_evidence(gradient.path)
+        return AccumulationPlan(
+            gradient.path,
+            AccumulationMode.SCATTER_ADD if source.kind == "tensor_view" else AccumulationMode.REDUCE_SUM,
+            evidence,
+            invocation_axes,
+        )
+
     program_identity = hashlib.sha256(primal_mlir.encode("utf-8")).hexdigest()
     primal_inputs = tuple(
         AutodiffBinding(parameter.name, parameter.type.mlir, "primal")
@@ -222,7 +340,7 @@ def build_structured_scalar_profile_plan(
         if parameter.builtin is None
     )
     output_type = entry.result_type
-    profile_symbols = structured_scalar_profile_symbols(transform, entry, primal_mlir)
+    profile_symbols = structured_profile_symbols(transform, entry, primal_mlir)
     profiles = (
         AutodiffProfile(
             "primal",
@@ -244,7 +362,7 @@ def build_structured_scalar_profile_plan(
             profile_symbols[2],
             (
                 AutodiffBinding("tape", f"!vernon.ad_tape<{tape_bytes}>", "tape"),
-                AutodiffBinding("output", _gradient_type(output_type).mlir, "cotangent"),
+                *cotangents,
             ),
             gradients,
         ),
@@ -257,20 +375,13 @@ def build_structured_scalar_profile_plan(
         transform.derivative_rules_version,
         LaunchPlan(
             workgroup_size,
-            tuple(
-                AccumulationPlan(
-                    path,
-                    AccumulationMode.REDUCE_SUM,
-                    (AccessPatternEvidence.SHARED_VALUE,),
-                )
-                for path in transform.wrt
-            ),
+            tuple(accumulation_plan(gradient) for gradient in gradients),
         ),
         profiles,
     )
 
 
-def structured_scalar_profile_symbols(
+def structured_profile_symbols(
     transform: ProgramTransformSpec,
     entry: TypedFunctionInstance,
     primal_mlir: str,
@@ -285,6 +396,6 @@ __all__ = [
     "AutodiffProfile",
     "AutodiffProfilePlan",
     "build_autodiff_profile_plan",
-    "build_structured_scalar_profile_plan",
-    "structured_scalar_profile_symbols",
+    "build_structured_profile_plan",
+    "structured_profile_symbols",
 ]

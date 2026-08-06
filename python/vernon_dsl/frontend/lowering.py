@@ -827,17 +827,23 @@ class _FunctionEmitter:
             for argument in arguments[1:]:
                 self._require_same_type(node, arguments[0].type, argument.type)
             return self._intrinsic(node, name, arguments, typed_call.type)
-        if name in {"dot", "cross"}:
+        if name == "dot":
             if len(arguments) != 2:
-                raise self.context.error(node, f"{name} requires two vector arguments")
+                raise self.context.error(node, "dot requires two Tensor arguments")
+            self._require_same_type(node, arguments[0].type, arguments[1].type)
+            tensor = arguments[0].type
+            if tensor.kind != "tensor" or len(tensor.arguments) < 2 or not tensor.is_float:
+                raise self.context.error(node, "dot requires equal floating-point Tensors")
+            return self._intrinsic(node, name, arguments, typed_call.type)
+        if name == "cross":
+            if len(arguments) != 2:
+                raise self.context.error(node, "cross requires two vector arguments")
             self._require_same_type(node, arguments[0].type, arguments[1].type)
             vector = arguments[0].type
             if vector.kind != "tensor" or len(vector.arguments) != 2 or not vector.is_float:
-                raise self.context.error(node, f"{name} requires floating-point vectors")
-            if name == "cross" and vector.arguments[1] != 3:
+                raise self.context.error(node, "cross requires floating-point vectors")
+            if vector.arguments[1] != 3:
                 raise self.context.error(node, "cross requires three-component vectors")
-            element = vector.arguments[0]
-            assert isinstance(element, DslType)
             return self._intrinsic(node, name, arguments, typed_call.type)
         if name == "norm":
             if len(arguments) != 1 or arguments[0].type.kind != "tensor" or not arguments[0].type.is_float:
@@ -894,7 +900,7 @@ class _FunctionEmitter:
             # Entry-point structs are interface aggregates flattened by the
             # frontend. Materializing them would leave an otherwise dead
             # custom struct operation for SPIR-V lowering.
-            if self.stage is not None and self.signature.result == result_type:
+            if self._entry_result_fields() is not None and self.signature.result == result_type:
                 return Value("", result_type, tuple(arguments))
             result = self._fresh()
             self._line(

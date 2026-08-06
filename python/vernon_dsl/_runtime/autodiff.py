@@ -7,7 +7,7 @@ from typing import Any
 
 from ..ad import ProgramExpression
 from ..bundle import make_target_options
-from ..frontend.structured_vjp import build_structured_scalar_vjp
+from ..frontend.structured_vjp import build_structured_vjp
 from .kernel import Kernel, _session_state
 
 
@@ -88,7 +88,7 @@ def execute_direct_vjp(
     if runtime_state._native is None or runtime_state._native_runtime is None:
         raise RuntimeError("CPU VJP execution requires the native compiler and runtime")
     if grid is None:
-        raise TypeError("grid is required for direct scalar VJP execution")
+        raise TypeError("grid is required for direct structured VJP execution")
     if len(grid) != 3 or any(not isinstance(value, int) or value <= 0 for value in grid):
         raise ValueError("grid must contain three positive integers")
 
@@ -101,7 +101,7 @@ def execute_direct_vjp(
         compiled = None
     if compiled is None:
         frontend, function, builtins, _ = kernel._lower(arguments)
-        structured = build_structured_scalar_vjp(
+        structured = build_structured_vjp(
             runtime_state._native,
             frontend,
             expression.transform,
@@ -131,7 +131,7 @@ def execute_direct_vjp(
             backward_symbol=profiles["backward"].symbol,
             forward_protocol=structured.protocols["forward_with_tape"],
             backward_protocol=structured.protocols["backward"],
-            gradient_paths=structured.transform.wrt,
+            gradient_paths=tuple(binding.path for binding in profiles["backward"].outputs),
             user_parameters=tuple(argument.arg for argument in function.args.args if argument.arg not in builtins),
             pipeline=None,
             runtime_generation=-1,

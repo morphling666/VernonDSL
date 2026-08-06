@@ -1,6 +1,8 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffTapePlanning.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffAnalysis.h"
 #include "llvm/ADT/DenseMap.h"
@@ -323,6 +325,45 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
                 return failure();
             }
         }
+    }
+    auto saveIndexSource = [&](Value index, RecordBuilder &builder, auto &self) -> LogicalResult {
+        if (index.getDefiningOp<arith::ConstantOp>() || index.getDefiningOp<arith::ConstantIndexOp>())
+            return success();
+        if (index.getType().isIntOrFloat()) {
+            const ValueAbiLayout *layout = analysis.getValueAbi(index);
+            if (layout)
+                return builder.add(index, *layout);
+            FailureOr<ValueAbiLayout> canonical =
+                getValueAbiLayout(index.getType(), function->getParentOfType<ModuleOp>());
+            return succeeded(canonical) ? builder.add(index, *canonical) : failure();
+        }
+        Operation *defining = index.getDefiningOp();
+        if (!defining || defining->getNumRegions() != 0)
+            return failure();
+        for (Value operand : defining->getOperands())
+            if (failed(self(operand, builder, self)))
+                return failure();
+        return success();
+    };
+    for (const AutodiffOperationActivity &activity : analysis.getOperations()) {
+        if (!activity.active)
+            continue;
+        ValueRange indices;
+        if (auto load = dyn_cast<LoadOp>(activity.operation))
+            indices = load.getIndices();
+        else if (auto store = dyn_cast<StoreOp>(activity.operation))
+            indices = store.getIndices();
+        else if (auto extract = dyn_cast<tensor::ExtractOp>(activity.operation))
+            indices = extract.getIndices();
+        else
+            continue;
+        std::optional<unsigned> owner = indices.empty() ? std::nullopt : owningRegion(indices.front());
+        RecordBuilder &builder = owner ? regionBuilders[*owner] : invocationBuilder;
+        for (Value index : indices)
+            if (failed(saveIndexSource(index, builder, saveIndexSource))) {
+                activity.operation->emitError("cannot save a dynamic index in the canonical tape layout");
+                return failure();
+            }
     }
 
     FailureOr<AutodiffTapeRecord> invocationRecord = std::move(invocationBuilder).finish();

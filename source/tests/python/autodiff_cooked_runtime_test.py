@@ -15,6 +15,41 @@ def main() -> None:
     runtime = _native.Runtime(_native.RuntimeBackend.CPU)
     pipeline = runtime.load_pipeline_asset(manifest.read_bytes(), str(manifest.parent), [])
 
+    def expect_binding_error(bindings: dict[str, object], message: str) -> None:
+        try:
+            pipeline.vjp(bindings, (1, 1, 1))
+        except ValueError as error:
+            assert message in str(error), error
+        else:
+            raise AssertionError(f"expected binding error containing {message!r}")
+
+    expect_binding_error(
+        {
+            "value": np.array([2.0, 3.0], dtype=np.float32),
+            "count": np.int32(2),
+        },
+        "do not match pipeline parameters",
+    )
+    expect_binding_error(
+        {
+            "value": np.array([2.0, 3.0], dtype=np.float32),
+            "parameters": {"factor": np.float32(1.0)},
+            "count": np.int32(2),
+        },
+        "missing field 'selector'",
+    )
+    expect_binding_error(
+        {
+            "value": np.array([2.0, 3.0, 4.0], dtype=np.float32),
+            "parameters": {
+                "factor": np.float32(1.0),
+                "selector": np.float32(1.0),
+            },
+            "count": np.int32(2),
+        },
+        "shape does not match",
+    )
+
     def run_case(
         factor: float,
         selector: float,
@@ -24,8 +59,10 @@ def main() -> None:
         output, pullback = pipeline.vjp(
             {
                 "value": np.array([2.0, 3.0], dtype=np.float32),
-                "parameters.factor": np.float32(factor),
-                "parameters.selector": np.float32(selector),
+                "parameters": {
+                    "factor": np.float32(factor),
+                    "selector": np.float32(selector),
+                },
                 "count": np.int32(2),
             },
             (1, 1, 1),

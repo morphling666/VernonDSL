@@ -50,6 +50,13 @@ class Compiler:
         self._collect_struct_names(module, context)
         type_parser = TypeParser(context)
         self._collect_structs(module, context, type_parser)
+        self._structs = tuple(
+            (
+                name,
+                tuple((field_name, annotation.type) for field_name, annotation in fields),
+            )
+            for name, fields in sorted(context.structs.items())
+        )
         self._validate_entry_annotations(module, context)
         module = infer_and_monomorphize_helpers(
             module,
@@ -178,6 +185,7 @@ class Compiler:
             self._program_graph,
             self._autodiff_profiles,
             self._entry_workgroup_size,
+            self._structs,
         )
         frontend_cache.put(request, result, project.dependency_files)
         return result
