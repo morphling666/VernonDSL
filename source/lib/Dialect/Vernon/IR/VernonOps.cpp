@@ -397,8 +397,8 @@ LogicalResult verifyLeafLayout(Operation *operation, Type leafType, int64_t reco
 }
 
 bool isLogicalAdCaptureOperation(Operation *operation) {
-    return isa<AdCaptureYieldOp, AdBeginInvocationOp, AdBeginRegionOp, AdReserveRecordOp, AdWriteLeafOp, AdEndRegionOp>(
-        operation);
+    return isa<AdCaptureYieldOp, AdBeginInvocationOp, AdBeginRegionOp, AdReserveRecordOp, AdCheckedIncrementOp,
+               AdWriteLeafOp, AdEndRegionOp>(operation);
 }
 
 bool isAllowedCaptureOperation(Operation *operation) {
@@ -597,6 +597,19 @@ LogicalResult AdReserveRecordOp::verify() {
     if (!begin || enclosingCapture(begin) != enclosingCapture(*this))
         return emitOpError("region must be owned by the enclosing capture");
     return verifyRecordLayout(getOperation(), getRecordSizeAttr().getInt(), getRecordAlignmentAttr().getInt());
+}
+
+LogicalResult AdCheckedIncrementOp::verify() {
+    if (failed(verifyCaptureMutation(getOperation())))
+        return failure();
+    APInt constant;
+    if (matchPattern(getCounter(), m_ConstantInt(&constant))) {
+        if (constant.isNegative())
+            return emitOpError("counter must not be negative");
+        if (constant.isMaxSignedValue())
+            return emitOpError("constant counter increment overflows index representation");
+    }
+    return success();
 }
 
 LogicalResult AdWriteLeafOp::verify() {

@@ -1088,6 +1088,56 @@ class LanguageVersionTests(unittest.TestCase):
                     f"invalid_{keyword}.py",
                 )
 
+    def test_loop_else_lowers_normal_and_break_paths(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def loop_else(limit: i32) -> i32:\n"
+            "    result = 0\n"
+            "    for index in range(limit):\n"
+            "        if i32(index) >= 3:\n"
+            "            break\n"
+            "        result += 1\n"
+            "    else:\n"
+            "        result += 10\n"
+            "    return result\n"
+            "@fragment\n"
+            "def main(limit: i32) -> i32:\n"
+            "    return loop_else(limit)\n",
+            "loop_else.py",
+        )
+        self.assertIn("scf.while", output)
+        self.assertGreaterEqual(output.count("scf.if"), 2)
+        self.assertIn("arith.cmpi ne", output)
+        self.assertIn("vernon.loop_control_index", output)
+
+    def test_nested_continue_and_multiple_loop_returns_lower_to_carried_state(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def nested_control(x: f32, limit: i32) -> f32:\n"
+            "    result = x\n"
+            "    for outer in range(limit):\n"
+            "        for inner in range(4):\n"
+            "            if i32(inner) < 2:\n"
+            "                continue\n"
+            "            if result > 8.0:\n"
+            "                return result\n"
+            "            result *= x\n"
+            "        if result < -8.0:\n"
+            "            return -result\n"
+            "    return result\n"
+            "@fragment\n"
+            "def main(x: f32, limit: i32) -> f32:\n"
+            "    return nested_control(x, limit)\n",
+            "nested_loop_returns.py",
+        )
+        self.assertGreaterEqual(output.count("scf.while"), 2)
+        self.assertIn("arith.select", output)
+        self.assertGreaterEqual(output.count("arith.cmpi eq"), 2)
+        self.assertGreaterEqual(output.count("vernon.loop_control_index"), 2)
+        self.assertGreaterEqual(output.count("vernon.return_flag_index"), 2)
+
     def test_dynamic_range_contract_and_type_rules(self) -> None:
         output = compile_source(
             "from vernon_dsl import *\n"

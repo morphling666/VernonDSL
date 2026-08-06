@@ -223,7 +223,7 @@ def emit_guarded_statement(
     control_name: str | None,
 ) -> None:
     outer = emitter.environment.copy()
-    assigned = _assigned_names([typed.source])
+    assigned = assigned_names([typed.source])
     lvalue_types = {value.name: value.type for value in typed.lvalues if value.kind == "local"}
     for name in sorted(assigned - outer.keys()):
         value_type = lvalue_types.get(name)
@@ -331,7 +331,7 @@ def emit_loop_body(
             break
 
 
-def _assigned_names(statements: list[ast.stmt]) -> set[str]:
+def assigned_names(statements: list[ast.stmt]) -> set[str]:
     result: set[str] = set()
 
     def target_names(target: ast.expr) -> set[str]:

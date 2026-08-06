@@ -23,9 +23,8 @@ struct StructuredVjpResult {
     SmallVector<std::string> derivativeRules;
 };
 
-/// Builds straight-line scalar VJP profiles from the structured primal IR.
-/// Structured control flow is intentionally rejected until its reverse
-/// transform is implemented.
+/// Builds scalar VJP profiles directly from structured primal IR, including
+/// runtime-bounded scf.if and scf.while regions.
 FailureOr<StructuredVjpResult> buildStructuredScalarVjp(func::FuncOp primal, const StructuredVjpOptions &options);
 
 std::unique_ptr<Pass> createVernonStructuredVjpPass();

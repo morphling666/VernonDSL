@@ -21,6 +21,7 @@ class StructuredScalarVjpBuild:
     entry: TypedFunctionInstance
     plan: AutodiffProfilePlan
     profiles: Mapping[str, str]
+    uses_dynamic_tape: bool
 
 
 def resolve_vjp_transform(
@@ -86,11 +87,13 @@ def build_structured_scalar_vjp(
         tuple(str(rule) for rule in transformed.derivative_rules),
         frontend.entry_workgroup_size or (1, 1, 1),
     )
+    profiles = MappingProxyType(dict(transformed.profiles(plan.identity)))
     return StructuredScalarVjpBuild(
         resolved,
         entry,
         plan,
-        MappingProxyType(dict(transformed.profiles(plan.identity))),
+        profiles,
+        any("!vernon.ad_tape" in module for module in profiles.values()),
     )
 
 

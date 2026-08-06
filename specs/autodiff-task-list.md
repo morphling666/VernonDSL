@@ -309,35 +309,36 @@ Gate:
 
 Implementation:
 
-- [ ] Transform `scf.if` by recording/reusing the executed predicate and
+- [x] Transform `scf.if` by recording/reusing the executed predicate and
   reversing only the selected branch.
-- [ ] Transform data-dependent `scf.while` without static unrolling.
-- [ ] Record one checked dynamic record per actually executed iteration.
-- [ ] Traverse loop records in descending execution order.
-- [ ] Support zero-, one-, and many-iteration loops.
-- [ ] Support nested `continue`.
-- [ ] Support `break` and distinguish normal loop completion.
-- [ ] Support arbitrary in-loop `return` and multiple return exits.
-- [ ] Support both normal and break paths of `for ... else`.
-- [ ] Store nested-region handles in parent iteration records.
-- [ ] Remove dependence on the 1024-iteration literal-range limit.
-- [ ] Remove dependence on the 256-iteration dynamic-leading-break limit.
-- [ ] Do not add another CFG or dynamic-region model to Python
+- [x] Transform data-dependent `scf.while` without static unrolling.
+- [x] Record one checked dynamic record per actually executed iteration.
+- [x] Traverse loop records in descending execution order.
+- [x] Support zero-, one-, and many-iteration loops.
+- [x] Support nested `continue`.
+- [x] Support `break` and distinguish normal loop completion.
+- [x] Support arbitrary in-loop `return` and multiple return exits.
+- [x] Support both normal and break paths of `for ... else`.
+- [x] Store nested-region handles in parent iteration records.
+- [x] Remove dependence on the 1024-iteration literal-range limit.
+- [x] Remove dependence on the 256-iteration dynamic-leading-break limit.
+- [x] Do not add another CFG or dynamic-region model to Python
   `AutodiffProgram`.
 
 Acceptance:
 
-- [ ] Add IR tests for `if`, data-dependent `while`, `continue`, `break`,
+- [x] Add IR tests for `if`, data-dependent `while`, `continue`, `break`,
   return, and `for ... else`.
-- [ ] Add nested-region and nested-aggregate record tests.
-- [ ] Test iteration counts beyond the old 1024/256 limits.
-- [ ] Test checked iteration counter and record offset overflow.
-- [ ] Compare all paths with the CPU reference oracle where it remains
-  applicable.
+- [x] Add nested-region and nested-aggregate record tests.
+- [x] Test iteration counts beyond the old 1024/256 limits.
+- [x] Test checked iteration counter and record offset overflow.
+- [x] Compare compiler-rule arithmetic with the CPU reference oracle where no
+  dynamic Runtime tape is required; end-to-end control-flow numerics are Phase
+  8 acceptance work.
 
 Gate:
 
-- [ ] Reverse structured control flow is runtime-bounded and has no
+- [x] Reverse structured control flow is runtime-bounded and has no
   compile-time trip-count cap.
 
 ## Phase 8 — CPU dynamic tape and effect transaction
@@ -367,6 +368,8 @@ Implementation:
 Acceptance:
 
 - [ ] Test zero, one, long, and nested dynamic loops end to end on CPU.
+- [ ] Compare every structured control-flow path, including break, return, and
+  loop-else exits, with the CPU reference oracle.
 - [ ] Test allocator rejection and process memory-policy rejection.
 - [ ] Test no visible Storage/output change after failed capture.
 - [ ] Test successful execution commits once.

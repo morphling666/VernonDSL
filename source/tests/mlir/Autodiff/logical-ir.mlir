@@ -9,6 +9,7 @@
 // CHECK-DAG: "vernon.ad.begin_invocation"
 // CHECK-DAG: "vernon.ad.begin_region"
 // CHECK-DAG: "vernon.ad.reserve_record"
+// CHECK-DAG: "vernon.ad.checked_increment"
 // CHECK-DAG: "vernon.ad.write_leaf"
 // CHECK-DAG: "vernon.ad.end_region"
 // CHECK-DAG: "vernon.ad.capture_yield"
@@ -40,6 +41,7 @@ module {
               : (!vernon.ad_tape) -> !vernon.ad_region_header
 
           %one = arith.constant 1 : index
+          %two = "vernon.ad.checked_increment"(%one) : (index) -> index
           %normal_exit = arith.constant 0 : i32
           %root_record = "vernon.ad.reserve_record"(%root_region)
               {record_size = 16 : i64, record_alignment = 8 : i64}

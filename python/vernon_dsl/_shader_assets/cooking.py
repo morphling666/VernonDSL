@@ -238,6 +238,10 @@ def cook_pipeline_asset(
                     structured = build_structured_scalar_vjp(native, frontend, transform)
                 except ValueError as error:
                     raise PipelineCompileError(str(error)) from None
+                if structured.uses_dynamic_tape:
+                    raise PipelineCompileError(
+                        "structured CPU VJP requires dynamic tape lowering before profile compilation"
+                    )
                 variant_transform = structured.transform
                 profile_plan = structured.plan
                 profile_modules = structured.profiles

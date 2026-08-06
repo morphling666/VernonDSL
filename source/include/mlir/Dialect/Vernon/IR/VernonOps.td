@@ -237,6 +237,18 @@ def Vernon_AdReserveRecordOp : Vernon_Op<"ad.reserve_record"> {
   let hasVerifier = 1;
 }
 
+def Vernon_AdCheckedIncrementOp : Vernon_Op<"ad.checked_increment"> {
+  let summary = "Increment a dynamic execution counter with checked arithmetic";
+  let description = [{
+    Adds one to a non-negative index counter. Overflow fails the enclosing
+    capture transaction instead of wrapping. Backend lowerings own the physical
+    failure representation.
+  }];
+  let arguments = (ins Index:$counter);
+  let results = (outs Index:$result);
+  let hasVerifier = 1;
+}
+
 def Vernon_AdWriteLeafOp : Vernon_Op<"ad.write_leaf"> {
   let summary = "Write one canonical ABI leaf into a checked record";
   let arguments = (ins Vernon_AdRegionHeaderType:$region, Index:$record_offset,

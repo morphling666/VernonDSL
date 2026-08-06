@@ -278,6 +278,51 @@ module {
     EXPECT_EQ(record.leaves.front().dtype, "u32");
 }
 
+TEST_F(VernonAutodiffTapePlanningTest, LaysOutNestedAggregateInsideDynamicRecord) {
+    OwningOpRef<ModuleOp> module = parse(R"mlir(
+module {
+  func.func @nested_record(
+      %x: f32 {vernon.source_name = "x", vernon.abi_leaf_dtypes = ["f32"]})
+      -> (f32 {vernon.abi_leaf_dtypes = ["f32"]}) {
+    %true = arith.constant true
+    %result = scf.if %true -> (f32) {
+      %wide = arith.constant 2.0 : f64
+      %index = arith.constant 7 : i32
+      %inner = "vernon.tuple_create"(%x, %wide) : (f32, f64) -> tuple<f32, f64>
+      %nested = "vernon.tuple_create"(%inner, %index)
+          : (tuple<f32, f64>, i32) -> tuple<tuple<f32, f64>, i32>
+      %saved = "vernon.intrinsic"(%nested, %x) {name = "save_nested"}
+          : (tuple<tuple<f32, f64>, i32>, f32) -> f32
+      scf.yield %saved : f32
+    } else {
+      scf.yield %x : f32
+    }
+    func.return %result : f32
+  }
+}
+)mlir");
+    ASSERT_TRUE(module);
+    VernonAutodiffRuleRegistry registry = createDefaultAutodiffRuleRegistry();
+    ASSERT_TRUE(succeeded(registry.registerRule(DifferentiationRule(
+        "vernon.intrinsic.save_nested", 2, 1, {Requirement::operand(0)},
+        [](Operation *, const AutodiffVjpBuildContext &, SmallVectorImpl<Value> &contributions) {
+            contributions.assign(2, Value{});
+            return success();
+        },
+        {}, [](Operation *) { return success(); }))));
+    FailureOr<VernonAutodiffTapePlan> plan = planFunction(*module, "nested_record", {"x"}, registry);
+    ASSERT_TRUE(succeeded(plan));
+    ASSERT_EQ(plan->getRegions().size(), 1u);
+    const AutodiffTapeRecord &record = plan->getRegions().front().record;
+    ASSERT_EQ(record.leaves.size(), 3u);
+    EXPECT_EQ(record.leaves[0].path, "0.0");
+    EXPECT_EQ(record.leaves[1].path, "0.1");
+    EXPECT_EQ(record.leaves[2].path, "1");
+    EXPECT_EQ(record.leaves[0].offset % record.leaves[0].alignment, 0u);
+    EXPECT_EQ(record.leaves[1].offset % record.leaves[1].alignment, 0u);
+    EXPECT_EQ(record.leaves[2].offset % record.leaves[2].alignment, 0u);
+}
+
 TEST(AutodiffTapeLayoutTest, UsesCheckedMixedAlignmentLayout) {
     FailureOr<AutodiffTapeLayout> layout =
         planAutodiffTapeLayout({AutodiffTapeSlot{2, 2}, AutodiffTapeSlot{8, 8}, AutodiffTapeSlot{4, 4}});

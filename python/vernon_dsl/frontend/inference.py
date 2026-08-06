@@ -946,12 +946,13 @@ class _Inference:
                     loop_environment = merged_environment
                 else:
                     raise self.error(statement, "loop-carried type inference did not converge")
+                else_returns = self._merge_loop_else(statement, before, loop_environment, loop_depth)
                 environment.update(loop_environment)
                 self.statement_merges[id(statement)] = tuple(
                     BranchMerge(name, default_type(loop_environment[name]))
                     for name in sorted(before.keys() & loop_environment.keys() & assigned)
                 )
-                returns.extend(loop_returns)
+                returns.extend((*loop_returns, *else_returns))
             elif isinstance(statement, ast.For):
                 if not isinstance(statement.target, ast.Name):
                     raise self.error(statement.target, "for loop target must be a local name")
@@ -996,6 +997,9 @@ class _Inference:
                     loop_environment = next_environment
                 else:
                     raise self.error(statement, "loop-carried type inference did not converge")
+                else_returns = self._merge_loop_else(
+                    statement, before, loop_environment, loop_depth, excluded_name=statement.target.id
+                )
                 environment.update(
                     {name: value for name, value in loop_environment.items() if name != statement.target.id}
                 )
@@ -1003,8 +1007,26 @@ class _Inference:
                     BranchMerge(name, default_type(loop_environment[name]))
                     for name in sorted(before.keys() & loop_environment.keys() & assigned)
                 )
-                returns.extend(loop_returns)
+                returns.extend((*loop_returns, *else_returns))
         return returns
+
+    def _merge_loop_else(
+        self,
+        statement: ast.While | ast.For,
+        before: dict[str, InferenceType],
+        loop_environment: dict[str, InferenceType],
+        loop_depth: int,
+        *,
+        excluded_name: str | None = None,
+    ) -> list[InferenceType | None]:
+        else_environment = {name: value for name, value in loop_environment.items() if name != excluded_name}
+        else_returns = self._statements(statement.orelse, else_environment, loop_depth)
+        for name in sorted(before.keys() & else_environment.keys() & self._assigned_names(statement.orelse)):
+            merged = _common(loop_environment[name], else_environment[name])
+            if merged is None:
+                raise self.error(statement, f"loop-else local '{name}' has incompatible types")
+            loop_environment[name] = merged
+        return else_returns
 
     @staticmethod
     def _is_literal_zero(node: ast.expr) -> bool:

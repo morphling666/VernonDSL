@@ -100,6 +100,26 @@ func.func @record_layout_is_checked() {
 
 // -----
 
+func.func @iteration_counter_overflow_is_checked() {
+  %tape, %root, %ok, %bytes, %overflow = "vernon.ad.capture"() ({
+    %owned = "vernon.ad.begin_invocation"() : () -> !vernon.ad_tape
+    %region = "vernon.ad.begin_region"(%owned)
+        : (!vernon.ad_tape) -> !vernon.ad_region_header
+    %maximum = arith.constant 9223372036854775807 : index
+    // expected-error @+1 {{constant counter increment overflows index representation}}
+    %wrapped = "vernon.ad.checked_increment"(%maximum) : (index) -> index
+    %zero = arith.constant 0 : index
+    %exit = arith.constant 0 : i32
+    "vernon.ad.end_region"(%region, %zero, %exit)
+        : (!vernon.ad_region_header, index, i32) -> ()
+    "vernon.ad.capture_yield"(%owned, %region)
+        : (!vernon.ad_tape, !vernon.ad_region_header) -> ()
+  }) : () -> (!vernon.ad_tape, !vernon.ad_region_header, i1, index, i1)
+  return
+}
+
+// -----
+
 func.func @leaf_write_requires_reservation() {
   %tape, %root, %ok, %bytes, %overflow = "vernon.ad.capture"() ({
     %owned = "vernon.ad.begin_invocation"() : () -> !vernon.ad_tape

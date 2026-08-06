@@ -4,10 +4,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import vernon_dsl as vd
 from vernon_dsl._ad_reference import reference_vjp
+from vernon_dsl.ad import ProgramTransformSpec
 from vernon_dsl.bundle import BundlePlan, CpuTargetOptions
 from vernon_dsl.compiler import Compiler, FrontendCompileRequest
 from vernon_dsl.frontend.autodiff import (
@@ -18,6 +20,7 @@ from vernon_dsl.frontend.autodiff import (
 )
 from vernon_dsl.frontend.autodiff_cpu import execute_program_graph as _execute_program_graph
 from vernon_dsl.frontend.autodiff_native import emit_native_autodiff_modules
+from vernon_dsl.frontend.structured_vjp import build_structured_scalar_vjp
 from vernon_dsl.pipeline_assets import (
     PipelineCompileError,
     cook_pipeline_asset,
@@ -391,7 +394,7 @@ asset = vd.pipeline_asset(
             for symbol in registration["symbols"]:
                 self.assertIn(f"&{symbol}", registration_source)
 
-    def test_cpu_scalar_abi_eligible_control_flow_reports_structured_error_without_fallback(self) -> None:
+    def test_cpu_scalar_control_flow_reaches_dynamic_tape_boundary_without_fallback(self) -> None:
         try:
             from vernon_dsl import _native  # noqa: F401
         except (ImportError, OSError):
@@ -418,13 +421,79 @@ asset = vd.pipeline_asset(
                 encoding="utf-8",
             )
             output = root / "adbuild"
-            with self.assertRaisesRegex(PipelineCompileError, "structured control-flow VJP belongs to Phase 7"):
+            with (
+                patch(
+                    "vernon_dsl._shader_assets.cooking.build_structured_scalar_vjp",
+                    wraps=build_structured_scalar_vjp,
+                ) as structured_builder,
+                patch(
+                    "vernon_dsl.frontend.autodiff_native.emit_native_autodiff_modules",
+                    side_effect=AssertionError("structured scalar VJP must not use legacy lowering"),
+                ) as legacy_builder,
+                self.assertRaisesRegex(
+                    PipelineCompileError,
+                    "structured CPU VJP requires dynamic tape lowering before profile compilation",
+                ),
+            ):
                 cook_pipeline_asset(
                     pipeline_asset=f"{source}:asset",
                     output=output,
                     target="cpu",
                 )
+            structured_builder.assert_called_once()
+            legacy_builder.assert_not_called()
             self.assertFalse(output.exists())
+
+    def test_native_structured_vjp_accepts_frontend_loop_control_state(self) -> None:
+        try:
+            from vernon_dsl import _native
+        except (ImportError, OSError):
+            self.skipTest("native Vernon compiler is unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "loop_control.py"
+            source.write_text(
+                """
+import vernon_dsl as vd
+
+@vd.kernel
+def objective(x: vd.f32, limit: vd.i32) -> vd.f32:
+    result = x
+    index = 0
+    while index < limit:
+        index += 1
+        inner = 0
+        while inner < 3:
+            inner += 1
+            if inner < 2:
+                continue
+            result *= x
+            if result > 8.0:
+                return result
+            if result < -8.0:
+                return -result
+        if index > 5:
+            break
+    else:
+        result += x
+    return result
+""",
+                encoding="utf-8",
+            )
+            frontend = Compiler().compile_request(FrontendCompileRequest(source, "objective"))
+            structured = build_structured_scalar_vjp(
+                _native,
+                frontend,
+                ProgramTransformSpec("vjp", ("x",)),
+            )
+            self.assertTrue(structured.uses_dynamic_tape)
+            forward = structured.profiles["forward_with_tape"]
+            backward = structured.profiles["backward"]
+            self.assertGreaterEqual(forward.count("vernon.ad.checked_increment"), 2)
+            self.assertIn("vernon.ad.end_region", forward)
+            self.assertGreaterEqual(forward.count("scf.if"), 3)
+            self.assertGreaterEqual(backward.count("vernon.ad.read_executed_count"), 2)
+            self.assertGreaterEqual(backward.count("scf.for"), 2)
+            self.assertGreaterEqual(backward.count("vernon.ad.read_nested_region"), 3)
 
 
 class AutodiffReferenceTests(unittest.TestCase):
