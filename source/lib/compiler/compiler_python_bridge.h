@@ -49,6 +49,7 @@ vernonCompilerGetPythonValueAbiPlanView(const VernonPythonValueAbiPlan *plan);
 VERNON_DSL_CAPI VernonPythonStructuredVjp *
 vernonCompilerBuildPythonStructuredVjp(VernonStringView module, VernonStringView entry,
                                        const VernonStringView *wrt_paths, size_t wrt_path_count,
+                                       const VernonStringView *output_paths, size_t output_path_count,
                                        VernonStringView forward_symbol, VernonStringView backward_symbol);
 VERNON_DSL_CAPI VernonStatus vernonCompilerFinalizePythonStructuredVjp(VernonPythonStructuredVjp *result,
                                                                        VernonStringView profiles_identity);

@@ -36,6 +36,15 @@ _STAGE_DECORATORS = ENTRY_DECORATORS
 _FUNCTION_DECORATORS = FUNCTION_DECORATORS
 
 
+@dataclass(frozen=True)
+class _ImportSpec:
+    node: ast.AST
+    module_name: str
+    level: int
+    local_name: str
+    symbol_name: str | None = None
+
+
 @dataclass
 class _Module:
     path: Path
@@ -46,6 +55,7 @@ class _Module:
     host_functions: set[str] = field(default_factory=set)
     features: dict[str, str] = field(default_factory=dict)
     constants: dict[str, int | float | bool] = field(default_factory=dict)
+    import_specs: dict[str, _ImportSpec] = field(default_factory=dict)
     symbol_imports: dict[str, tuple["_Module", str]] = field(default_factory=dict)
     module_imports: dict[str, "_Module"] = field(default_factory=dict)
 
@@ -63,27 +73,31 @@ class _ModuleGraphSnapshot:
     modules: dict[Path, _Module]
     order: tuple[_Module, ...]
     abi_structs: dict[str, tuple[_Module, ast.ClassDef]]
+    reachable_symbols: frozenset[tuple[Path, str]]
     dependencies: tuple[tuple[Path, str], ...]
 
 
 class _ModuleGraphCache:
     def __init__(self) -> None:
-        self._entries: dict[Path, _ModuleGraphSnapshot] = {}
+        self._entries: dict[tuple[Path, str | None, frozenset[str]], _ModuleGraphSnapshot] = {}
+        self._parsed_modules: dict[Path, tuple[str, _Module]] = {}
         self._lock = RLock()
 
     def restore(self, graph: "ModuleGraph") -> bool:
+        key = (graph.input_path, graph.entry, graph.enabled_features)
         with self._lock:
-            snapshot = self._entries.get(graph.input_path)
+            snapshot = self._entries.get(key)
         if snapshot is None:
             return False
         if not all(source_file_digest(path) == digest for path, digest in snapshot.dependencies):
             with self._lock:
-                if self._entries.get(graph.input_path) is snapshot:
-                    self._entries.pop(graph.input_path)
+                if self._entries.get(key) is snapshot:
+                    self._entries.pop(key)
             return False
         graph.modules = snapshot.modules.copy()
         graph.order = list(snapshot.order)
         graph._abi_structs = snapshot.abi_structs.copy()
+        graph.reachable_symbols = set(snapshot.reachable_symbols)
         return True
 
     def store(self, graph: "ModuleGraph") -> None:
@@ -92,14 +106,28 @@ class _ModuleGraphCache:
             graph.modules.copy(),
             tuple(graph.order),
             graph._abi_structs.copy(),
+            frozenset(graph.reachable_symbols),
             dependencies,
         )
+        key = (graph.input_path, graph.entry, graph.enabled_features)
         with self._lock:
-            self._entries[graph.input_path] = snapshot
+            self._entries[key] = snapshot
+
+    def restore_parsed_module(self, path: Path) -> _Module | None:
+        with self._lock:
+            cached = self._parsed_modules.get(path)
+        if cached is None or source_file_digest(path) != cached[0]:
+            return None
+        return copy.deepcopy(cached[1])
+
+    def store_parsed_module(self, module: _Module) -> None:
+        with self._lock:
+            self._parsed_modules[module.path] = (source_text_digest(module.source), copy.deepcopy(module))
 
     def clear(self) -> None:
         with self._lock:
             self._entries.clear()
+            self._parsed_modules.clear()
 
 
 _module_graph_cache = _ModuleGraphCache()
@@ -408,7 +436,7 @@ class _ReferenceRewriter(ast.NodeTransformer):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
         original_name = node.name
-        node.name = self.emitted_names[(self.module.path, original_name)]
+        node.name = self.emitted_names.get((self.module.path, original_name), original_name)
         node.args = self.visit(node.args)
         node.returns = self._rewrite_annotation(node.returns)
         node.body = [self.visit(statement) for statement in node.body]
@@ -456,15 +484,39 @@ class ModuleGraph:
         self.entry = entry
         self.modules: dict[Path, _Module] = {}
         self.order: list[_Module] = []
-        self.loading: list[Path] = []
         self._abi_structs: dict[str, tuple[_Module, ast.ClassDef]] = {}
+        self.reachable_symbols: set[tuple[Path, str]] = set()
+        self._resolving_symbols: list[tuple[Path, str]] = []
 
     def discover(self) -> _Module:
-        return self._load_module(self.input_path, self._module_name(self.input_path))
+        root = self._load_module(self.input_path, self._module_name(self.input_path))
+        if self.entry is not None:
+            seeds = (self.entry,)
+        else:
+            seeds = tuple(
+                name
+                for name, definition in root.definitions.items()
+                if (
+                    isinstance(definition, ast.FunctionDef)
+                    and any(_decorator_name(item) in _FUNCTION_DECORATORS for item in definition.decorator_list)
+                )
+                or (
+                    isinstance(definition, ast.ClassDef)
+                    and any(_decorator_name(item) == "struct" for item in definition.decorator_list)
+                )
+            )
+        for seed in (*seeds, *root.features):
+            self._touch_symbol(root, seed)
+        return root
 
     def load(self) -> LoadedProject:
         root = self.discover()
-        declared_features = {feature for module in self.modules.values() for feature in module.features.values()}
+        declared_features = {
+            feature
+            for module in self.modules.values()
+            for name, feature in module.features.items()
+            if (module.path, name) in self.reachable_symbols
+        }
         unknown_features = self.enabled_features - declared_features
         if unknown_features:
             self._error(root, root.tree, "requested undeclared feature(s): " + ", ".join(sorted(unknown_features)))
@@ -481,6 +533,17 @@ class ModuleGraph:
         for module in self.order:
             rewriter = _ReferenceRewriter(module, emitted_names)
             for original_name, definition in module.definitions.items():
+                if (module.path, original_name) not in self.reachable_symbols:
+                    continue
+                if isinstance(definition, ast.FunctionDef) and original_name in module.host_functions:
+                    emitted_name = emitted_names[(module.path, original_name)]
+                    function_sources[emitted_name] = (module, definition)
+                    host_function_names.add(emitted_name)
+                    continue
+                if isinstance(definition, ast.ClassDef) and not any(
+                    _decorator_name(decorator) == "struct" for decorator in definition.decorator_list
+                ):
+                    continue
                 transformed = copy.deepcopy(definition)
                 transformed = _FeatureSpecializer(self, module, self.enabled_features).visit(transformed)
                 assert isinstance(transformed, (ast.FunctionDef, ast.ClassDef))
@@ -499,9 +562,6 @@ class ModuleGraph:
                 assert isinstance(transformed, (ast.FunctionDef, ast.ClassDef))
                 if isinstance(transformed, ast.FunctionDef):
                     function_sources[transformed.name] = (module, definition)
-                    if original_name in module.host_functions:
-                        host_function_names.add(transformed.name)
-                        continue
                 body.append(transformed)
 
         normalized = normalize_struct_methods(ast.Module(body=body, type_ignores=[]), str(root.path))
@@ -533,15 +593,14 @@ class ModuleGraph:
 
     def _load_module(self, path: Path, name: str) -> _Module:
         path = path.resolve()
-        if path in self.loading:
-            cycle_paths = self.loading[self.loading.index(path) :] + [path]
-            cycle = " -> ".join(self._display_path(item) for item in cycle_paths)
-            raise CompileError(
-                f"DSL import cycle: {cycle}",
-                SourceLocation(str(path), 1, 1),
-            )
         if path in self.modules:
             return self.modules[path]
+        cached = _module_graph_cache.restore_parsed_module(path)
+        if cached is not None:
+            cached.name = name
+            self.modules[path] = cached
+            self.order.append(cached)
+            return cached
         try:
             source = path.read_text(encoding="utf-8")
         except OSError as error:
@@ -556,11 +615,10 @@ class ModuleGraph:
 
         module = _Module(path, name, source, tree)
         self.modules[path] = module
-        self.loading.append(path)
         self._collect_definitions(module)
-        self._resolve_imports(module)
-        self.loading.pop()
+        self._index_imports(module)
         self.order.append(module)
+        _module_graph_cache.store_parsed_module(module)
         return module
 
     def _collect_definitions(self, module: _Module) -> None:
@@ -581,9 +639,10 @@ class ModuleGraph:
                 self._error(module, node, f"duplicate DSL symbol '{node.name}'")
             if isinstance(node, ast.FunctionDef):
                 decorators = [_decorator_name(decorator) for decorator in node.decorator_list]
-                if not decorators:
+                dsl_decorators = [decorator for decorator in decorators if decorator in _FUNCTION_DECORATORS]
+                if not dsl_decorators:
                     module.host_functions.add(node.name)
-                elif len(decorators) != 1 or decorators[0] not in _FUNCTION_DECORATORS:
+                elif len(decorators) != 1:
                     self._error(
                         module,
                         node,
@@ -609,33 +668,118 @@ class ModuleGraph:
             self._error(module, node, f"invalid or duplicate feature declaration '{local_name}'")
         module.features[local_name] = feature_name
 
-    def _resolve_imports(self, module: _Module) -> None:
+    def _index_imports(self, module: _Module) -> None:
         for node in module.tree.body:
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     top_level = alias.name.split(".", 1)[0]
                     if top_level in _HOST_MODULES:
                         continue
-                    target_path = self._resolve_path(module, alias.name, 0, node)
-                    target = self._load_module(target_path, alias.name)
                     local_name = alias.asname or alias.name
-                    self._add_module_import(module, local_name, target, node)
+                    self._add_import_spec(
+                        module,
+                        _ImportSpec(node, alias.name, 0, local_name),
+                    )
             elif isinstance(node, ast.ImportFrom):
                 imported_module = node.module or ""
                 if node.level == 0 and imported_module.split(".", 1)[0] in _HOST_MODULES:
                     continue
-                target_path = self._resolve_path(module, imported_module, node.level, node)
-                target_name = imported_module or target_path.stem
-                target = self._load_module(target_path, target_name)
                 for alias in node.names:
                     if alias.name == "*":
                         self._error(module, alias, "project-local DSL imports must name symbols explicitly")
-                    if alias.name not in target.definitions and alias.name not in target.features:
-                        self._error(module, alias, f"module '{target.name}' has no symbol '{alias.name}'")
                     local_name = alias.asname or alias.name
-                    self._add_symbol_import(module, local_name, target, alias.name, alias)
+                    self._add_import_spec(
+                        module,
+                        _ImportSpec(alias, imported_module, node.level, local_name, alias.name),
+                    )
 
-    def _resolve_path(self, module: _Module, dotted: str, level: int, node: ast.AST) -> Path:
+    def _add_import_spec(self, module: _Module, spec: _ImportSpec) -> None:
+        if (
+            spec.local_name in module.definitions
+            or spec.local_name in module.features
+            or spec.local_name in module.import_specs
+        ):
+            self._error(module, spec.node, f"duplicate imported symbol '{spec.local_name}'")
+        module.import_specs[spec.local_name] = spec
+
+    def _materialize_import(self, module: _Module, local_name: str) -> tuple[_Module, str | None] | None:
+        imported_symbol = module.symbol_imports.get(local_name)
+        if imported_symbol is not None:
+            return imported_symbol
+        imported_module = module.module_imports.get(local_name)
+        if imported_module is not None:
+            return imported_module, None
+        spec = module.import_specs.get(local_name)
+        if spec is None:
+            return None
+        target_path = self._find_local_path(module, spec.module_name, spec.level)
+        if target_path is None:
+            if spec.level:
+                spelling = "." * spec.level + spec.module_name
+                self._error(module, spec.node, f"cannot resolve project-local DSL import '{spelling}'")
+            return None
+        target_name = spec.module_name or target_path.stem
+        target = self._load_module(target_path, target_name)
+        if spec.symbol_name is None:
+            self._add_module_import(module, local_name, target, spec.node)
+            return target, None
+        if spec.symbol_name not in target.definitions and spec.symbol_name not in target.features:
+            self._error(module, spec.node, f"module '{target.name}' has no symbol '{spec.symbol_name}'")
+        self._add_symbol_import(module, local_name, target, spec.symbol_name, spec.node)
+        return target, spec.symbol_name
+
+    def _touch_symbol(self, module: _Module, name: str) -> None:
+        key = (module.path, name)
+        if key in self._resolving_symbols:
+            cycle_start = self._resolving_symbols.index(key)
+            cycle_keys = self._resolving_symbols[cycle_start:] + [key]
+            cycle_paths = [path for path, _ in cycle_keys]
+            if len(set(cycle_paths)) > 1:
+                cycle = " -> ".join(self._display_path(path) for path in cycle_paths)
+                self._error(module, module.tree, f"DSL import cycle: {cycle}")
+            return
+        if key in self.reachable_symbols:
+            return
+        self.reachable_symbols.add(key)
+        self._resolving_symbols.append(key)
+        try:
+            definition = module.definitions.get(name)
+            if definition is not None:
+                if not (isinstance(definition, ast.FunctionDef) and name in module.host_functions) and not (
+                    isinstance(definition, ast.ClassDef)
+                    and not any(_decorator_name(item) == "struct" for item in definition.decorator_list)
+                ):
+                    self._follow_references(module, definition)
+                return
+            if name in module.features or name in module.constants:
+                return
+            imported = self._materialize_import(module, name)
+            if imported is not None and imported[1] is not None:
+                self._touch_symbol(imported[0], imported[1])
+        finally:
+            self._resolving_symbols.pop()
+
+    def _follow_references(self, module: _Module, node: ast.AST) -> None:
+        for value in ast.walk(node):
+            if isinstance(value, ast.Attribute):
+                dotted = _dotted_name(value) or ""
+                root, separator, remainder = dotted.partition(".")
+                if separator and root in module.import_specs:
+                    imported = self._materialize_import(module, root)
+                    if imported is not None and imported[1] is None:
+                        symbol = remainder.split(".", 1)[0]
+                        if symbol in imported[0].definitions or symbol in imported[0].features:
+                            self._touch_symbol(imported[0], symbol)
+            elif isinstance(value, ast.Name) and isinstance(value.ctx, ast.Load):
+                if (
+                    value.id in module.definitions
+                    or value.id in module.features
+                    or value.id in module.constants
+                    or value.id in module.import_specs
+                ):
+                    self._touch_symbol(module, value.id)
+
+    def _find_local_path(self, module: _Module, dotted: str, level: int) -> Path | None:
         parts = tuple(part for part in dotted.split(".") if part)
         bases: list[Path] = []
         if level:
@@ -651,9 +795,7 @@ class ModuleGraph:
             for path in paths:
                 if path.is_file():
                     return path.resolve()
-        spelling = "." * level + dotted
-        self._error(module, node, f"cannot resolve project-local DSL import '{spelling}'")
-        raise AssertionError("unreachable")
+        return None
 
     def _add_symbol_import(self, module: _Module, local_name: str, target: _Module, symbol: str, node: ast.AST) -> None:
         if (

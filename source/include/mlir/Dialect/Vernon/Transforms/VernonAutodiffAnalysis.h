@@ -5,6 +5,7 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Support/LLVM.h"
+#include "llvm/ADT/DenseSet.h"
 
 #include <cstdint>
 #include <optional>
@@ -58,6 +59,35 @@ struct AutodiffRegion {
     SmallVector<unsigned> childOrdinals;
 };
 
+enum class StorageVersionKind {
+    Entry,
+    Write,
+    IfMerge,
+    WhilePhi,
+    WhileExit,
+};
+
+struct AutodiffStorageIdentity {
+    unsigned id{};
+    Value binding;
+};
+
+struct AutodiffStorageVersion {
+    unsigned id{};
+    unsigned identity{};
+    StorageVersionKind kind{StorageVersionKind::Entry};
+    Operation *operation{};
+    SmallVector<unsigned> incomingVersions;
+};
+
+struct AutodiffStorageEffect {
+    unsigned id{};
+    unsigned identity{};
+    Operation *operation{};
+    unsigned versionBefore{};
+    std::optional<unsigned> versionAfter;
+};
+
 /// Immutable, mode-independent facts shared by semantic JVP and VJP
 /// transforms. The pointed-to IR must outlive this result.
 class VernonAutodiffAnalysisResult {
@@ -67,10 +97,16 @@ public:
     ArrayRef<AutodiffValueActivity> getActiveValues() const { return activeValues; }
     ArrayRef<AutodiffOperationActivity> getOperations() const { return operations; }
     ArrayRef<AutodiffRegion> getRegions() const { return regions; }
+    ArrayRef<AutodiffStorageIdentity> getStorageIdentities() const { return storageIdentities; }
+    ArrayRef<AutodiffStorageVersion> getStorageVersions() const { return storageVersions; }
+    ArrayRef<AutodiffStorageEffect> getStorageEffects() const { return storageEffects; }
 
     const ValueAbiLayout *getValueAbi(Value value) const;
+    const AutodiffStorageIdentity *getStorageIdentity(Value binding) const;
+    const AutodiffStorageEffect *getStorageEffect(Operation *operation) const;
     bool isActive(Value value, unsigned abiLeafIndex) const;
     bool isActive(Operation *operation) const;
+    bool isActiveStorageVersion(unsigned version, unsigned abiLeafIndex) const;
 
 private:
     friend class AutodiffAnalysisBuilder;
@@ -82,12 +118,24 @@ private:
     SmallVector<AutodiffValueAbi, 0> valueAbis;
     SmallVector<AutodiffOperationActivity> operations;
     SmallVector<AutodiffRegion> regions;
+    SmallVector<AutodiffStorageIdentity> storageIdentities;
+    SmallVector<AutodiffStorageVersion> storageVersions;
+    SmallVector<AutodiffStorageEffect> storageEffects;
+    SmallVector<SmallVector<unsigned>> storageVersionNodes;
+    SmallVector<SmallVector<unsigned>> activeStorageVersionLeaves;
+    DenseMap<Value, unsigned> valueAbiIndices;
+    DenseMap<Value, unsigned> storageIdentityIndices;
+    DenseMap<Operation *, unsigned> storageEffectIndices;
+    DenseSet<Operation *> activeOperationSet;
 };
 
 /// Analyze a structured primal function. `wrtPaths` use frontend source names
 /// followed by canonical Struct field or Tuple index components.
 FailureOr<VernonAutodiffAnalysisResult> analyzeAutodiffFunction(func::FuncOp function, ArrayRef<StringRef> wrtPaths);
 FailureOr<VernonAutodiffAnalysisResult> analyzeAutodiffFunction(func::FuncOp function, ArrayRef<StringRef> wrtPaths,
+                                                                const VernonAutodiffRuleRegistry &registry);
+FailureOr<VernonAutodiffAnalysisResult> analyzeAutodiffFunction(func::FuncOp function, ArrayRef<StringRef> wrtPaths,
+                                                                ArrayRef<StringRef> outputPaths,
                                                                 const VernonAutodiffRuleRegistry &registry);
 
 bool isDifferentiableAutodiffLeaf(Type scalarType, StringRef logicalDtype = {});

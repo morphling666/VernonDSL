@@ -12,23 +12,15 @@ class Parameters:
     inner: Inner
 
 
-@vd.struct
-class Pair:
-    first: vd.f32
-    second: vd.f32
-
-
-@vd.struct
-class Result:
-    pair: Pair
-    tuple_values: vd.Tuple[vd.f32, vd.f32]
-    values: vd.Tensor[vd.f32, (2,)]
-
-
 @vd.kernel
-def objective(value: vd.Tensor[vd.f32, (2,)], parameters: Parameters) -> Result:
+def objective(
+    value: vd.Tensor[vd.f32, (2,)],
+    parameters: Parameters,
+    output: vd.TensorView[vd.f32, (2,), vd.write],
+) -> None:
     scaled = value * parameters.inner.scale + parameters.inner.bias
-    return Result(Pair(scaled[0], scaled[1]), (scaled[0], scaled[1]), scaled)
+    output[0] = scaled[0]
+    output[1] = scaled[1]
 
 
 asset = vd.pipeline_asset(
@@ -36,5 +28,6 @@ asset = vd.pipeline_asset(
     program=vd.ad.vjp(
         objective,
         wrt=("value", "parameters.inner.scale", "parameters.inner.bias"),
+        outputs=("output",),
     ),
 )

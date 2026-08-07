@@ -92,7 +92,10 @@ def _cpu_stage_metadata(stage: CompiledStage) -> dict[str, Any]:
         "target_triple": target_triple,
         "object_format": _cpu_object_format(stage.artifact.filename, target_triple),
     }
-    for source_name, metadata_name in (("processor", "cpu"), ("features", "cpu_features")):
+    for source_name, metadata_name in (
+        ("processor", "cpu"),
+        ("features", "cpu_features"),
+    ):
         value = reflected_options.get(source_name)
         if isinstance(value, str):
             metadata[metadata_name] = value
@@ -219,7 +222,14 @@ def cook_pipeline_asset(
             compiled = compile_cache.get(key)
             if compiled is None:
                 compiled = _compile_stage(
-                    module, reference, stage, variant, resolved_target, compiler, native_target, mlir
+                    module,
+                    reference,
+                    stage,
+                    variant,
+                    resolved_target,
+                    compiler,
+                    native_target,
+                    mlir,
                 )
                 compile_cache[key] = compiled
             stages[stage] = compiled
@@ -362,14 +372,21 @@ def cook_pipeline_asset(
             plan.target,
             plan.features,
             plan.variants,
-            (*plan.stages, *(differentiated_stages[key] for key in sorted(differentiated_stages))),
+            (
+                *plan.stages,
+                *(differentiated_stages[key] for key in sorted(differentiated_stages)),
+            ),
             {**transform.to_dict(), "identity": transform.identity},
             differentiated_record,
         )
     output_path.mkdir(parents=True, exist_ok=True)
     descriptors = {
         stage.id: write_external_artifact(
-            output_path, stage.artifact.data, stage.artifact.format, stage.stage, stage.artifact.filename
+            output_path,
+            stage.artifact.data,
+            stage.artifact.format,
+            stage.stage,
+            stage.artifact.filename,
         )
         for stage in plan.stages
     }

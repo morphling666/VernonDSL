@@ -294,6 +294,14 @@ if(TARGET VernonRuntime)
             vernonRegisterStructuredStorageAutodiffFixture
             structured_storage_autodiff_manifest
             structured_storage_autodiff_fixture_target)
+        vernon_add_cpu_autodiff_fixture(
+            structured-storage-aggregate-autodiff
+            autodiff_structured_storage_aggregate_fixture
+            autodiff_structured_storage_aggregate_fixture.pipeline.json
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_storage_asset.py:aggregate_asset"
+            vernonRegisterStructuredStorageAggregateAutodiffFixture
+            structured_storage_aggregate_autodiff_manifest
+            structured_storage_aggregate_autodiff_fixture_target)
 
         add_executable(VernonCookedAutodiffTests runtime/runtime_cooked_autodiff_test.cpp)
         target_link_libraries(VernonCookedAutodiffTests PRIVATE GTest::gtest_main Vernon::Runtime
@@ -353,6 +361,11 @@ if(TARGET VernonRuntime)
             vernon_native_autodiff_f16_fixture
             vernonRegisterNativeAutodiffF16Fixture
             ${native_autodiff_f16_fixture_target})
+        vernon_add_autodiff_python_fixture(
+            VernonStructuredStorageAggregateAutodiffPythonFixture
+            vernon_structured_storage_aggregate_autodiff_fixture
+            vernonRegisterStructuredStorageAggregateAutodiffFixture
+            ${structured_storage_aggregate_autodiff_fixture_target})
         add_test(
             NAME VernonPythonCookedAutodiffTest
             COMMAND
@@ -371,6 +384,14 @@ if(TARGET VernonRuntime)
                 "${Python_EXECUTABLE}" "${VERNON_TEST_ROOT}/python/autodiff_native_f16_runtime_test.py"
                 "${native_autodiff_f16_manifest}" "$<TARGET_FILE_DIR:VernonNativeAutodiffF16PythonFixture>"
                 "${VERNON_REPOSITORY_ROOT}/python")
+        add_test(
+            NAME VernonPythonStructuredStorageAggregateAutodiffTest
+            COMMAND
+                "${Python_EXECUTABLE}"
+                "${VERNON_TEST_ROOT}/python/autodiff_structured_storage_aggregate_runtime_test.py"
+                "${structured_storage_aggregate_autodiff_manifest}"
+                "$<TARGET_FILE_DIR:VernonStructuredStorageAggregateAutodiffPythonFixture>"
+                "${VERNON_REPOSITORY_ROOT}/python" "${VERNON_TEST_ROOT}/fixtures")
         add_test(
             NAME VernonPythonStructuredScalarDirectAutodiffTest
             COMMAND

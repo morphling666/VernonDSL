@@ -39,6 +39,7 @@ struct Signature {
     std::vector<ValueAbi> tape;
     std::vector<ValueAbi> cotangents;
     std::vector<ValueAbi> gradients;
+    bool storageObjectives{};
 };
 
 class PullbackExecution {
@@ -108,6 +109,9 @@ bool valueMatches(const VernonAdValue &value, const ValueAbi &abi);
 bool derivativeAbiMatches(const ValueAbi &primal, const ValueAbi &derivative);
 bool makeCotangentBytes(const VernonAdValueSet *cotangents, const ValueAbi &abi, std::vector<uint8_t> &bytes,
                         std::string &error);
+bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
+                                              const std::vector<AutodiffDerivativeGroup> &groups,
+                                              const Signature &signature);
 
 bool createCpuExecutable(VernonRuntimeContext &context, const Stage &forward, const Stage &backward,
                          const std::vector<std::string> &gradientPaths, std::shared_ptr<Executable> &executable);

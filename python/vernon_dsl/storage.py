@@ -25,4 +25,8 @@ def from_values(values: Any, *, dtype: Any) -> TensorStorage:
     return TensorStorage.from_values(values, dtype=dtype)
 
 
-__all__ = ["empty", "from_numpy", "from_values", "zeros"]
+def tangent_zeros(*, dtype: Any, shape: tuple[int, ...]) -> TensorStorage:
+    return TensorStorage.tangent_zeros(dtype=dtype, shape=shape)
+
+
+__all__ = ["empty", "from_numpy", "from_values", "tangent_zeros", "zeros"]

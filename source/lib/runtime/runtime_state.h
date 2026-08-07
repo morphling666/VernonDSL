@@ -101,6 +101,7 @@ struct VernonPipelineBundle {
 struct VernonLoadedAutodiff {
     std::shared_ptr<vernon::runtime::ad::Executable> executable;
     std::shared_ptr<vernon::runtime::CompiledAutodiffGraph> immediateGraph;
+    std::vector<vernon::runtime::AutodiffDerivativeGroup> derivativeGroups;
 };
 
 struct VernonLoadedPipeline {

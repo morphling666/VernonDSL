@@ -17,7 +17,7 @@ std::string lastError(VernonRuntimeContext *context) {
     return std::string(error.data, error.size);
 }
 
-TEST(RuntimeStructuredAggregateAutodiff, ExecutesNestedStructTupleOutputAndCanonicalLeafPullback) {
+TEST(RuntimeStructuredAggregateAutodiff, ExecutesAggregateInputAndStorageObjectivePullback) {
     ASSERT_EQ(vernonRegisterStructuredAggregateAutodiffFixture(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_AGGREGATE_AUTODIFF_MANIFEST;
     std::ifstream input(manifestPath, std::ios::binary);
@@ -79,66 +79,26 @@ TEST(RuntimeStructuredAggregateAutodiff, ExecutesNestedStructTupleOutputAndCanon
     float value[]{2.0f, 3.0f};
     float scale = 4.0f;
     float bias = 1.0f;
+    float outputValues[2]{};
     VernonAdValue inputValues[]{
         {sizeof(VernonAdValue), {"value", 5}, VERNON_DATA_F32, value, sizeof(value), 1, tensorShape},
         {sizeof(VernonAdValue), {"parameters.inner.scale", 22}, VERNON_DATA_F32, &scale, sizeof(scale), {}},
         {sizeof(VernonAdValue), {"parameters.inner.bias", 21}, VERNON_DATA_F32, &bias, sizeof(bias), {}},
+        {sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, outputValues, sizeof(outputValues), 1, tensorShape},
     };
-    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, 3, {}};
-
-    float first{};
-    float second{};
-    float tupleFirst{};
-    float tupleSecond{};
-    float outputValues[2]{};
-    VernonAdValue outputLeaves[]{
-        {sizeof(VernonAdValue), {"output.pair.first", 17}, VERNON_DATA_F32, &first, sizeof(first), {}},
-        {sizeof(VernonAdValue), {"output.pair.second", 18}, VERNON_DATA_F32, &second, sizeof(second), {}},
-        {sizeof(VernonAdValue), {"output.tuple_values.0", 21}, VERNON_DATA_F32, &tupleFirst, sizeof(tupleFirst), {}},
-        {sizeof(VernonAdValue), {"output.tuple_values.1", 21}, VERNON_DATA_F32, &tupleSecond, sizeof(tupleSecond), {}},
-        {sizeof(VernonAdValue),
-         {"output.values", 13},
-         VERNON_DATA_F32,
-         outputValues,
-         sizeof(outputValues),
-         1,
-         tensorShape},
-    };
-    VernonAdValueSet outputs{sizeof(VernonAdValueSet), outputLeaves, 5, {}};
+    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, 4, {}};
+    VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
     VernonPullback *pullback = nullptr;
     ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
         << lastError(context);
     ASSERT_NE(pullback, nullptr);
-    EXPECT_FLOAT_EQ(first, 9.0f);
-    EXPECT_FLOAT_EQ(second, 13.0f);
-    EXPECT_FLOAT_EQ(tupleFirst, 9.0f);
-    EXPECT_FLOAT_EQ(tupleSecond, 13.0f);
     EXPECT_FLOAT_EQ(outputValues[0], 9.0f);
     EXPECT_FLOAT_EQ(outputValues[1], 13.0f);
 
-    float firstSeed = 2.0f;
-    float secondSeed = 3.0f;
-    float tupleFirstSeed = 11.0f;
-    float tupleSecondSeed = 13.0f;
     float valueSeeds[]{5.0f, 7.0f};
-    VernonAdValue seedLeaves[]{
-        {sizeof(VernonAdValue), {"output.pair.first", 17}, VERNON_DATA_F32, &firstSeed, sizeof(firstSeed), {}},
-        {sizeof(VernonAdValue), {"output.pair.second", 18}, VERNON_DATA_F32, &secondSeed, sizeof(secondSeed), {}},
-        {sizeof(VernonAdValue),
-         {"output.tuple_values.0", 21},
-         VERNON_DATA_F32,
-         &tupleFirstSeed,
-         sizeof(tupleFirstSeed),
-         {}},
-        {sizeof(VernonAdValue),
-         {"output.tuple_values.1", 21},
-         VERNON_DATA_F32,
-         &tupleSecondSeed,
-         sizeof(tupleSecondSeed),
-         {}},
-        {sizeof(VernonAdValue), {"output.values", 13}, VERNON_DATA_F32, valueSeeds, sizeof(valueSeeds), 1, tensorShape},
-    };
-    VernonAdValueSet seeds{sizeof(VernonAdValueSet), seedLeaves, 5, {}};
+    VernonAdValue seed{
+        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, valueSeeds, sizeof(valueSeeds), 1, tensorShape};
+    VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seed, 1, {}};
     float biasGradient{};
     float scaleGradient{};
     float valueGradient[2]{};
@@ -159,10 +119,10 @@ TEST(RuntimeStructuredAggregateAutodiff, ExecutesNestedStructTupleOutputAndCanon
     };
     VernonAdValueSet gradients{sizeof(VernonAdValueSet), gradientLeaves, 3, {}};
     ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(context);
-    EXPECT_FLOAT_EQ(biasGradient, 41.0f);
-    EXPECT_FLOAT_EQ(scaleGradient, 105.0f);
-    EXPECT_FLOAT_EQ(valueGradient[0], 72.0f);
-    EXPECT_FLOAT_EQ(valueGradient[1], 92.0f);
+    EXPECT_FLOAT_EQ(biasGradient, 12.0f);
+    EXPECT_FLOAT_EQ(scaleGradient, 31.0f);
+    EXPECT_FLOAT_EQ(valueGradient[0], 20.0f);
+    EXPECT_FLOAT_EQ(valueGradient[1], 28.0f);
 
     vernonPullbackDestroy(pullback);
     vernonRuntimeLoadedPipelineDestroy(pipeline);

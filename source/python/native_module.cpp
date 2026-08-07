@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -127,14 +128,20 @@ struct StructuredVjp {
 
 std::unique_ptr<StructuredVjp> buildStructuredVjp(const std::string &moduleText, const std::string &entry,
                                                   const std::vector<std::string> &wrtPaths,
+                                                  const std::vector<std::string> &outputPaths,
                                                   const std::string &forwardSymbol, const std::string &backwardSymbol) {
     std::vector<VernonStringView> paths;
     paths.reserve(wrtPaths.size());
     for (const std::string &path : wrtPaths)
         paths.push_back({path.data(), path.size()});
+    std::vector<VernonStringView> outputs;
+    outputs.reserve(outputPaths.size());
+    for (const std::string &path : outputPaths)
+        outputs.push_back({path.data(), path.size()});
     auto view = [](const std::string &value) { return VernonStringView{value.data(), value.size()}; };
     VernonPythonStructuredVjp *result = vernonCompilerBuildPythonStructuredVjp(
-        view(moduleText), view(entry), paths.data(), paths.size(), view(forwardSymbol), view(backwardSymbol));
+        view(moduleText), view(entry), paths.data(), paths.size(), outputs.data(), outputs.size(), view(forwardSymbol),
+        view(backwardSymbol));
     if (!result)
         throw std::bad_alloc();
     std::unique_ptr<StructuredVjp> transformedResult = std::make_unique<StructuredVjp>(result);
@@ -1131,18 +1138,35 @@ VernonDataType autodiffTangentDtype(VernonDataType primal) {
     return primal == VERNON_DATA_F16 ? VERNON_DATA_F32 : primal;
 }
 
+std::string formatShape(const std::vector<uint64_t> &shape) {
+    std::string result = "[";
+    for (size_t index = 0; index < shape.size(); ++index) {
+        if (index)
+            result += ", ";
+        result += std::to_string(shape[index]);
+    }
+    return result + "]";
+}
+
 struct PythonAdValue {
     std::string path;
+    nb::object source;
     nb::object array;
     std::vector<uint64_t> shape;
+    bool writable{};
     VernonAdValue value{};
 
-    PythonAdValue(std::string path, VernonDataType dtype, std::vector<uint64_t> shape, const nb::object &source)
-        : path(std::move(path)), array(nb::module_::import_("numpy").attr("asarray")(
+    PythonAdValue(std::string path, VernonDataType dtype, std::vector<uint64_t> shape, const nb::object &source,
+                  bool writable = false)
+        : path(std::move(path)), source(nb::module_::import_("numpy").attr("asarray")(
                                      source, nb::module_::import_("numpy").attr(numpyDtypeName(dtype)))),
-          shape(std::move(shape)) {
-        if (nb::cast<std::vector<uint64_t>>(array.attr("shape")) != this->shape)
-            throw std::invalid_argument("Python autodiff Value shape does not match reflection");
+          array(this->source), shape(std::move(shape)), writable(writable) {
+        if (!nb::cast<bool>(array.attr("flags").attr("c_contiguous")))
+            array = nb::module_::import_("numpy").attr("ascontiguousarray")(array);
+        std::vector<uint64_t> actualShape = nb::cast<std::vector<uint64_t>>(array.attr("shape"));
+        if (actualShape != this->shape)
+            throw std::invalid_argument("Python autodiff Value '" + this->path + "' shape " + formatShape(actualShape) +
+                                        " does not match reflection " + formatShape(this->shape));
         size_t scalarCount = 1;
         for (uint64_t extent : this->shape) {
             if (!extent || extent > std::numeric_limits<size_t>::max() / scalarCount)
@@ -1151,8 +1175,6 @@ struct PythonAdValue {
         }
         if (this->shape.size() > std::numeric_limits<uint32_t>::max())
             throw std::invalid_argument("Python autodiff Value rank overflows");
-        if (!nb::cast<bool>(array.attr("flags").attr("c_contiguous")))
-            throw std::invalid_argument("Python autodiff Values require contiguous storage");
         value.struct_size = sizeof(value);
         value.path = {this->path.data(), this->path.size()};
         value.dtype = dtype;
@@ -1163,10 +1185,14 @@ struct PythonAdValue {
     }
 
     PythonAdValue(PythonAdValue &&other) noexcept
-        : path(std::move(other.path)), array(std::move(other.array)), shape(std::move(other.shape)),
-          value(other.value) {
+        : path(std::move(other.path)), source(std::move(other.source)), array(std::move(other.array)),
+          shape(std::move(other.shape)), writable(other.writable), value(other.value) {
         value.path = {path.data(), path.size()};
         value.shape = shape.empty() ? nullptr : shape.data();
+    }
+    void commit() {
+        if (writable && source.ptr() != array.ptr())
+            nb::module_::import_("numpy").attr("copyto")(source, array);
     }
     PythonAdValue(const PythonAdValue &) = delete;
     PythonAdValue &operator=(const PythonAdValue &) = delete;
@@ -1174,6 +1200,7 @@ struct PythonAdValue {
 
 struct PythonAdMetadata {
     std::string path;
+    std::string binding;
     VernonDataType dtype{};
     std::vector<uint64_t> shape;
 };
@@ -1185,7 +1212,7 @@ PythonAdMetadata adInputLeafMetadata(VernonLoadedPipeline *pipeline, const Pipel
     const VernonStringView parameterName{parameter.name.data(), parameter.name.size()};
     if (vernonRuntimeLoadedPipelineGetParameterValueLeaf(pipeline, parameterName, leafIndex, &leaf) != VERNON_STATUS_OK)
         throw std::runtime_error("cannot read autodiff input leaf metadata");
-    PythonAdMetadata result{parameter.name, static_cast<VernonDataType>(leaf.value.dtype), {}};
+    PythonAdMetadata result{parameter.name, parameter.name, static_cast<VernonDataType>(leaf.value.dtype), {}};
     for (size_t index = 0; index < leaf.path_count; ++index) {
         const VernonValuePathComponentView &component = leaf.path[index];
         result.path += ".";
@@ -1196,10 +1223,13 @@ PythonAdMetadata adInputLeafMetadata(VernonLoadedPipeline *pipeline, const Pipel
         else
             throw std::runtime_error("autodiff input leaf has an invalid path");
     }
-    if (leaf.static_rank)
-        result.shape.assign(leaf.static_shape, leaf.static_shape + leaf.static_rank);
-    else if (leaf.path_count == 0)
+    if (parameter.kind == VERNON_PIPELINE_TENSOR) {
         result.shape = parameter.shape;
+        if (leaf.static_rank)
+            result.shape.insert(result.shape.end(), leaf.static_shape, leaf.static_shape + leaf.static_rank);
+    } else if (leaf.static_rank) {
+        result.shape.assign(leaf.static_shape, leaf.static_shape + leaf.static_rank);
+    }
     if (reflected)
         *reflected = leaf;
     return result;
@@ -1211,6 +1241,18 @@ nb::object resolveAdInputLeaf(const nb::dict &bindings, const PipelineParameterM
     if (!bindings.contains(root))
         throw std::invalid_argument("missing autodiff binding '" + parameter.name + "'");
     nb::object value = nb::borrow<nb::object>(bindings[root]);
+    if (nb::hasattr(value, "_native_host_array")) {
+        nb::object array = value.attr("_native_host_array")();
+        nb::object fields = array.attr("dtype").attr("fields");
+        if (!fields.is_none()) {
+            nb::str key("__value");
+            if (nb::cast<bool>(fields.attr("__contains__")(key)))
+                array = array.attr("__getitem__")(key);
+        }
+        value = std::move(array);
+        if (leaf.path_count == 0)
+            return value;
+    }
     for (size_t index = 0; index < leaf.path_count; ++index) {
         const VernonValuePathComponentView &component = leaf.path[index];
         if (component.kind == VERNON_VALUE_PATH_FIELD) {
@@ -1230,7 +1272,14 @@ nb::object resolveAdInputLeaf(const nb::dict &bindings, const PipelineParameterM
                     throw std::invalid_argument("autodiff Struct binding has no field '" + field + "'");
             }
         } else if (component.kind == VERNON_VALUE_PATH_INDEX) {
-            value = value.attr("__getitem__")(component.index);
+            nb::object fields = nb::hasattr(value, "dtype") ? value.attr("dtype").attr("fields") : nb::none();
+            const std::string index = std::to_string(component.index);
+            nb::str key(index.c_str());
+            if (!fields.is_none() && nb::cast<bool>(fields.attr("__contains__")(key)))
+                value = value.attr("__getitem__")(key);
+            else
+                value = nb::module_::import_("numpy").attr("take")(value, component.index,
+                                                                   nb::arg("axis") = parameter.shape.size());
         } else {
             throw std::runtime_error("autodiff input leaf has an invalid path");
         }
@@ -1253,9 +1302,9 @@ bool findAdInputLeafMetadata(VernonLoadedPipeline *pipeline, const std::vector<P
 
 struct PythonPullback {
     PythonPullback(VernonRuntimeContext *runtime, VernonPullback *handle, std::vector<PythonAdMetadata> gradients,
-                   std::vector<PythonAdMetadata> cotangents, nb::object pipelineOwner)
+                   std::vector<PythonAdMetadata> cotangents, nb::object pipelineOwner, nb::dict bindings)
         : runtime(runtime), handle(handle), gradients(std::move(gradients)), cotangents(std::move(cotangents)),
-          pipelineOwner(std::move(pipelineOwner)) {}
+          pipelineOwner(std::move(pipelineOwner)), bindings(std::move(bindings)) {}
     ~PythonPullback() { vernonPullbackDestroy(handle); }
 
     nb::dict apply(const nb::object &cotangent) {
@@ -1299,8 +1348,28 @@ struct PythonPullback {
         }
         if (vernonPullbackApply(handle, seedView, &gradientSet) != VERNON_STATUS_OK)
             throw std::runtime_error("pullback application failed: " + stringView(vernonRuntimeGetLastError(runtime)));
-        for (PythonAdValue &gradient : gradientValues)
-            result[nb::str(gradient.path.c_str())] = gradient.array;
+        std::unordered_map<PyObject *, nb::object> gradientsByOwner;
+        for (size_t index = 0; index < gradientValues.size(); ++index) {
+            PythonAdValue &gradient = gradientValues[index];
+            const PythonAdMetadata &metadata = gradients[index];
+            nb::str path(gradient.path.c_str());
+            nb::str bindingPath(metadata.binding.c_str());
+            nb::object binding =
+                bindings.contains(bindingPath) ? nb::borrow<nb::object>(bindings[bindingPath]) : nb::none();
+            if (binding.is_none() || !nb::hasattr(binding, "_materialize_gradient")) {
+                result[path] = gradient.array;
+                continue;
+            }
+            nb::object owner = nb::hasattr(binding, "owner") ? binding.attr("owner") : binding;
+            auto existing = gradientsByOwner.find(owner.ptr());
+            nb::object materialized =
+                existing == gradientsByOwner.end()
+                    ? binding.attr("_materialize_gradient")(gradient.array, path)
+                    : binding.attr("_materialize_gradient")(gradient.array, path, existing->second);
+            if (existing == gradientsByOwner.end())
+                gradientsByOwner.emplace(owner.ptr(), materialized);
+            result[path] = std::move(materialized);
+        }
         return result;
     }
 
@@ -1309,6 +1378,7 @@ struct PythonPullback {
     std::vector<PythonAdMetadata> gradients;
     std::vector<PythonAdMetadata> cotangents;
     nb::object pipelineOwner;
+    nb::dict bindings;
 };
 
 struct LoadedPipeline {
@@ -1344,7 +1414,8 @@ struct LoadedPipeline {
                 VernonPipelineValueLeafView reflected{};
                 PythonAdMetadata leaf = adInputLeafMetadata(pipeline, parameter, leafIndex, &reflected);
                 nb::object value = resolveAdInputLeaf(bindings, parameter, reflected);
-                inputValues.emplace_back(leaf.path, leaf.dtype, std::move(leaf.shape), value);
+                inputValues.emplace_back(leaf.path, leaf.dtype, std::move(leaf.shape), value,
+                                         parameter.access != VERNON_ACCESS_READ);
                 inputViews.push_back(inputValues.back().value);
             }
         }
@@ -1358,7 +1429,8 @@ struct LoadedPipeline {
         if (!outputCount || !cotangentCount)
             throw std::runtime_error("pipeline has no consistent autodiff output/cotangent signature");
         auto materializeMetadata = [&](const vernon::runtime::AutodiffValueMetadataView &value) {
-            PythonAdMetadata result{stringView(value.path), value.dtype, {}};
+            const std::string path = stringView(value.path);
+            PythonAdMetadata result{path, path, value.dtype, {}};
             if (value.rank)
                 result.shape.assign(value.shape, value.shape + value.rank);
             if (carrierCount > 1)
@@ -1372,12 +1444,15 @@ struct LoadedPipeline {
         std::deque<PythonAdValue> outputValues;
         std::vector<VernonAdValue> outputViews;
         nb::dict aggregateOutput;
+        const bool storageObjectives = vernon::runtime::hasAutodiffStorageObjectives(pipeline);
         for (size_t index = 0; index < outputCount; ++index) {
             vernon::runtime::AutodiffValueMetadataView outputValue;
             if (!vernon::runtime::getAutodiffOutputMetadata(pipeline, index, outputValue))
                 throw std::runtime_error("pipeline has no consistent autodiff output/cotangent signature");
             outputMetadata.push_back(materializeMetadata(outputValue));
             const PythonAdMetadata &metadata = outputMetadata.back();
+            if (storageObjectives)
+                continue;
             nb::object zeros = nb::module_::import_("numpy").attr("zeros")(
                 metadata.shape, nb::module_::import_("numpy").attr(numpyDtypeName(metadata.dtype)));
             outputValues.emplace_back(metadata.path, metadata.dtype, metadata.shape, zeros);
@@ -1390,12 +1465,19 @@ struct LoadedPipeline {
                 throw std::runtime_error("pipeline has no consistent autodiff output/cotangent signature");
             cotangentMetadata.push_back(materializeMetadata(cotangentValue));
         }
+        if (storageObjectives) {
+            outputValues.clear();
+            outputViews.clear();
+            aggregateOutput.clear();
+        }
         VernonAdValueSet outputSet{sizeof(VernonAdValueSet), outputViews.data(), outputViews.size(), {}};
         VernonPullback *pullback = nullptr;
         if (vernonAdPipelineForward(pipeline, {gridX, gridY, gridZ}, &inputSet, &outputSet, &pullback) !=
             VERNON_STATUS_OK)
             throw std::runtime_error("autodiff forward invocation failed: " +
                                      stringView(vernonRuntimeGetLastError(runtime)));
+        for (PythonAdValue &input : inputValues)
+            input.commit();
 
         std::vector<PythonAdMetadata> gradients;
         const size_t gradientCount = vernonRuntimeLoadedPipelineGetAdGradientCount(pipeline);
@@ -1420,11 +1502,12 @@ struct LoadedPipeline {
             inputLeaf.dtype = dtype;
             gradients.push_back(std::move(inputLeaf));
         }
-        nb::object output =
-            outputValues.size() == 1 ? outputValues.front().array : nb::borrow<nb::object>(aggregateOutput);
-        return nb::make_tuple(output,
-                              std::make_unique<PythonPullback>(runtime, pullback, std::move(gradients),
-                                                               std::move(cotangentMetadata), std::move(pipelineOwner)));
+        nb::object output = storageObjectives          ? nb::none()
+                            : outputValues.size() == 1 ? outputValues.front().array
+                                                       : nb::borrow<nb::object>(aggregateOutput);
+        return nb::make_tuple(output, std::make_unique<PythonPullback>(runtime, pullback, std::move(gradients),
+                                                                       std::move(cotangentMetadata),
+                                                                       std::move(pipelineOwner), nb::dict(bindings)));
     }
 
     static size_t dataTypeSize(VernonDataType type) {
@@ -1509,6 +1592,28 @@ struct LoadedPipeline {
                                      stringView(vernonRuntimeGetLastError(runtime)));
     }
 
+    nb::list derivativeGroups() const {
+        nb::list result;
+        const size_t groupCount = vernon::runtime::getAutodiffDerivativeGroupCount(pipeline);
+        for (size_t groupIndex = 0; groupIndex < groupCount; ++groupIndex) {
+            VernonStringView role{};
+            VernonStringView declaredPath{};
+            size_t leafCount = 0;
+            if (!vernon::runtime::getAutodiffDerivativeGroupMetadata(pipeline, groupIndex, role, declaredPath,
+                                                                     leafCount))
+                throw std::runtime_error("cannot read autodiff derivative group metadata");
+            nb::list leaves;
+            for (size_t leafIndex = 0; leafIndex < leafCount; ++leafIndex) {
+                VernonStringView leafPath{};
+                if (!vernon::runtime::getAutodiffDerivativeGroupLeaf(pipeline, groupIndex, leafIndex, leafPath))
+                    throw std::runtime_error("cannot read autodiff derivative group leaf");
+                leaves.append(stringView(leafPath));
+            }
+            result.append(nb::make_tuple(stringView(role), stringView(declaredPath), leaves));
+        }
+        return result;
+    }
+
     std::vector<PipelineParameterMetadata> parameters() const {
         std::vector<PipelineParameterMetadata> result;
         const size_t count = vernonRuntimeLoadedPipelineGetParameterCount(pipeline);
@@ -1588,7 +1693,7 @@ struct Runtime {
                                                     const CompiledProgram &backward, const std::string &backwardName,
                                                     const std::string &forwardProtocol,
                                                     const std::string &backwardProtocol,
-                                                    const std::vector<std::string> &gradientPaths) {
+                                                    const nb::list &groupMetadata) {
         const CompiledProgram *programs[] = {&primal, &forward, &backward};
         const std::string *names[] = {&primalName, &forwardName, &backwardName};
         VernonCpuEntryPoint entries[3]{};
@@ -1606,14 +1711,38 @@ struct Runtime {
             reflections[index] = programs[index]->reflection();
         }
         auto view = [](const std::string &value) { return VernonStringView{value.data(), value.size()}; };
-        std::vector<VernonStringView> gradientViews;
-        gradientViews.reserve(gradientPaths.size());
-        for (const std::string &path : gradientPaths)
-            gradientViews.push_back(view(path));
+        std::vector<vernon::runtime::AutodiffDerivativeGroup> derivativeGroups;
+        derivativeGroups.reserve(groupMetadata.size());
+        for (nb::handle item : groupMetadata) {
+            nb::tuple metadata = nb::cast<nb::tuple>(item);
+            if (metadata.size() != 3)
+                throw std::invalid_argument("direct autodiff derivative group metadata is invalid");
+            const std::string role = nb::cast<std::string>(metadata[0]);
+            vernon::runtime::AutodiffDerivativeRole derivativeRole;
+            if (role == "gradient")
+                derivativeRole = vernon::runtime::AutodiffDerivativeRole::Gradient;
+            else if (role == "cotangent")
+                derivativeRole = vernon::runtime::AutodiffDerivativeRole::Cotangent;
+            else
+                throw std::invalid_argument("direct autodiff derivative group role is invalid");
+            derivativeGroups.push_back(
+                {derivativeRole, nb::cast<std::string>(metadata[1]), nb::cast<std::vector<std::string>>(metadata[2])});
+        }
+        std::vector<std::vector<VernonStringView>> derivativeLeafViews;
+        std::vector<vernon::runtime::AutodiffDerivativeGroupView> derivativeGroupViews;
+        derivativeLeafViews.reserve(derivativeGroups.size());
+        derivativeGroupViews.reserve(derivativeGroups.size());
+        for (const vernon::runtime::AutodiffDerivativeGroup &group : derivativeGroups) {
+            std::vector<VernonStringView> &leaves = derivativeLeafViews.emplace_back();
+            leaves.reserve(group.leafPaths.size());
+            for (const std::string &leaf : group.leafPaths)
+                leaves.push_back(view(leaf));
+            derivativeGroupViews.push_back({group.role, view(group.declaredPath), leaves.data(), leaves.size()});
+        }
         VernonLoadedPipeline *pipeline = vernon::runtime::loadBackendCpuAutodiffPipeline(
             *handle, entries[0], view(reflections[0]), view(primalName), entries[1], view(reflections[1]),
             view(forwardName), entries[2], view(reflections[2]), view(backwardName), view(forwardProtocol),
-            view(backwardProtocol), gradientViews.data(), gradientViews.size());
+            view(backwardProtocol), derivativeGroupViews.data(), derivativeGroupViews.size());
         if (!pipeline)
             throw std::runtime_error("cannot load direct CPU autodiff profiles: " +
                                      stringView(vernonRuntimeGetLastError(handle)));
@@ -1775,7 +1904,7 @@ NB_MODULE(_native, module) {
         .def_prop_ro("derivative_rules", &StructuredVjp::derivativeRules)
         .def("profiles", &StructuredVjp::profiles, nb::arg("identity"));
     module.def("_build_structured_vjp", &buildStructuredVjp, nb::arg("module"), nb::arg("entry"), nb::arg("wrt_paths"),
-               nb::arg("forward_symbol"), nb::arg("backward_symbol"));
+               nb::arg("output_paths"), nb::arg("forward_symbol"), nb::arg("backward_symbol"));
     nb::class_<Compiler>(module, "Compiler")
         .def(nb::init<>())
         .def("compile_program_result", &compileProgramResult, nb::arg("mlir"), nb::arg("target"),
@@ -2001,6 +2130,7 @@ NB_MODULE(_native, module) {
                 return pipeline.vjp(x, y, z, bindings, nb::cast(&pipeline, nb::rv_policy::reference));
             },
             nb::arg("bindings"), nb::arg("grid"))
+        .def_prop_ro("derivative_groups", &LoadedPipeline::derivativeGroups)
         .def_prop_ro("parameters", &LoadedPipeline::parameters)
         .def_prop_ro("outputs", &LoadedPipeline::outputs);
     module.attr("DATA_BOOL") = static_cast<uint32_t>(VERNON_DATA_BOOL);

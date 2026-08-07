@@ -172,7 +172,7 @@ bool makeCotangentBytes(const VernonAdValueSet *cotangents, const ValueAbi &abi,
         std::memcpy(bytes.data(), cotangent->data, abi.byteSize);
         return true;
     }
-    if (!abi.logicalShape.empty() || abi.byteSize != dtypeSize(abi.dtype)) {
+    if (abi.byteSize != dtypeSize(abi.dtype)) {
         error = "a non-scalar output requires an explicit cotangent";
         return false;
     }
@@ -188,6 +188,29 @@ bool makeCotangentBytes(const VernonAdValueSet *cotangents, const ValueAbi &abi,
     }
     error = "implicit cotangents require an f32 or f64 scalar output";
     return false;
+}
+
+bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
+                                              const std::vector<AutodiffDerivativeGroup> &groups,
+                                              const Signature &signature) {
+    const auto matches = [&](AutodiffDerivativeRole role, const std::vector<ValueAbi> &values) {
+        const std::vector<std::string> expected = autodiffDerivativeLeafPaths(groups, role);
+        if (expected.size() != values.size())
+            return false;
+        for (size_t index = 0; index < values.size(); ++index)
+            if (expected[index] != values[index].path)
+                return false;
+        return true;
+    };
+    if (!matches(AutodiffDerivativeRole::Gradient, signature.gradients)) {
+        invocationDiagnostic(context) = "autodiff gradient groups do not match the executable signature";
+        return false;
+    }
+    if (!matches(AutodiffDerivativeRole::Cotangent, signature.cotangents)) {
+        invocationDiagnostic(context) = "autodiff cotangent groups do not match the executable signature";
+        return false;
+    }
+    return true;
 }
 
 bool createImmediateGpuGraph(VernonLoadedPipeline &pipeline) {
@@ -221,29 +244,37 @@ bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffVariant
         return false;
     const Stage &forward = bundle.stages.at(profiles.forwardWithTape);
     const Stage &backward = bundle.stages.at(profiles.backward);
+    if (!forward.autodiff || !backward.autodiff) {
+        invocationDiagnostic(*bundle.context) = "autodiff stages have no protocol metadata";
+        return false;
+    }
+    if (forward.autodiff->protocol != backward.autodiff->protocol ||
+        forward.autodiff->protocol != bundle.autodiff->protocol) {
+        invocationDiagnostic(*bundle.context) = "autodiff stage protocols do not match the program transform";
+        return false;
+    }
+    const std::vector<std::string> gradientPaths =
+        autodiffDerivativeLeafPaths(bundle.autodiff->derivativeGroups, AutodiffDerivativeRole::Gradient);
     std::shared_ptr<Executable> executable;
     bool resolved = false;
     if (bundle.context->backend == VERNON_RUNTIME_CPU) {
-        if (!forward.autodiff || !backward.autodiff) {
-            invocationDiagnostic(*bundle.context) = "CPU autodiff stages have no protocol metadata";
-        } else if (forward.autodiff->protocol != backward.autodiff->protocol) {
-            invocationDiagnostic(*bundle.context) = "CPU autodiff profile protocols do not match";
-        } else if (forward.autodiff->protocol == "dynamic_v2") {
-            resolved =
-                createCpuExecutable(*bundle.context, forward, backward, bundle.autodiff->gradientPaths, executable);
+        if (forward.autodiff->protocol == "dynamic_v2") {
+            resolved = createCpuExecutable(*bundle.context, forward, backward, gradientPaths, executable);
         } else if (forward.autodiff->protocol == "legacy_fixed") {
-            resolved = createLegacyCpuExecutable(*bundle.context, forward, backward, bundle.autodiff->gradientPaths,
-                                                 executable);
+            resolved = createLegacyCpuExecutable(*bundle.context, forward, backward, gradientPaths, executable);
         } else {
             invocationDiagnostic(*bundle.context) = "CPU autodiff profile uses an unsupported protocol";
         }
     } else {
-        resolved = createGpuExecutable(bundle, profiles.forwardWithTape, profiles.backward,
-                                       bundle.autodiff->gradientPaths, profiles.launch, executable);
+        resolved = createGpuExecutable(bundle, profiles.forwardWithTape, profiles.backward, gradientPaths,
+                                       profiles.launch, executable);
     }
     if (!resolved)
         return false;
-    pipeline.autodiff = VernonLoadedAutodiff{std::move(executable)};
+    if (!validateDerivativeGroupsAgainstSignature(*bundle.context, bundle.autodiff->derivativeGroups,
+                                                  executable->signature()))
+        return false;
+    pipeline.autodiff = VernonLoadedAutodiff{std::move(executable), {}, bundle.autodiff->derivativeGroups};
     return bundle.context->backend == VERNON_RUNTIME_CPU || createImmediateGpuGraph(pipeline);
 }
 
@@ -333,6 +364,42 @@ bool vernon::runtime::getAutodiffCotangentMetadata(const VernonLoadedPipeline *p
                                                    AutodiffValueMetadataView &metadata) {
     const ad::Executable *executable = autodiffExecutable(pipeline);
     return executable && copyMetadata(executable->signature().cotangents, index, metadata);
+}
+
+size_t vernon::runtime::getAutodiffDerivativeGroupCount(const VernonLoadedPipeline *pipeline) {
+    return pipeline && pipeline->autodiff ? pipeline->autodiff->derivativeGroups.size() : 0;
+}
+
+bool vernon::runtime::getAutodiffDerivativeGroupMetadata(const VernonLoadedPipeline *pipeline, size_t groupIndex,
+                                                         VernonStringView &role, VernonStringView &declaredPath,
+                                                         size_t &leafCount) {
+    if (!pipeline || !pipeline->autodiff || groupIndex >= pipeline->autodiff->derivativeGroups.size())
+        return false;
+    const AutodiffDerivativeGroup &group = pipeline->autodiff->derivativeGroups[groupIndex];
+    static constexpr std::string_view gradientRole = "gradient";
+    static constexpr std::string_view cotangentRole = "cotangent";
+    const std::string_view roleName = group.role == AutodiffDerivativeRole::Gradient ? gradientRole : cotangentRole;
+    role = {roleName.data(), roleName.size()};
+    declaredPath = {group.declaredPath.data(), group.declaredPath.size()};
+    leafCount = group.leafPaths.size();
+    return true;
+}
+
+bool vernon::runtime::getAutodiffDerivativeGroupLeaf(const VernonLoadedPipeline *pipeline, size_t groupIndex,
+                                                     size_t leafIndex, VernonStringView &leafPath) {
+    if (!pipeline || !pipeline->autodiff || groupIndex >= pipeline->autodiff->derivativeGroups.size())
+        return false;
+    const AutodiffDerivativeGroup &group = pipeline->autodiff->derivativeGroups[groupIndex];
+    if (leafIndex >= group.leafPaths.size())
+        return false;
+    const std::string &path = group.leafPaths[leafIndex];
+    leafPath = {path.data(), path.size()};
+    return true;
+}
+
+bool vernon::runtime::hasAutodiffStorageObjectives(const VernonLoadedPipeline *pipeline) {
+    const ad::Executable *executable = autodiffExecutable(pipeline);
+    return executable && executable->signature().storageObjectives;
 }
 
 extern "C" {

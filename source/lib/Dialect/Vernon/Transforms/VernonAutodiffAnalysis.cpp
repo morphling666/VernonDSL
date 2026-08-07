@@ -17,7 +17,7 @@ namespace {
 constexpr unsigned kInvalidNode = std::numeric_limits<unsigned>::max();
 
 FailureOr<unsigned> checkedUnsigned(size_t value) {
-    if (value > std::numeric_limits<unsigned>::max())
+    if (value >= kInvalidNode)
         return failure();
     return static_cast<unsigned>(value);
 }
@@ -64,6 +64,11 @@ struct ValueNodes {
     SmallVector<unsigned> nodes;
 };
 
+struct StorageLeafSelection {
+    Value binding;
+    unsigned abiLeafIndex{};
+};
+
 SmallVector<std::string> copyDtypes(const ValueAbiLayout &layout) {
     SmallVector<std::string> result;
     result.reserve(layout.leaves.size());
@@ -79,8 +84,7 @@ public:
     FailureOr<ValueAbiLayout> resolve(Value value, ArrayRef<StringRef> explicitDtypes = {}) {
         if (auto found = cache.find(value); found != cache.end()) {
             if (!explicitDtypes.empty()) {
-                FailureOr<ValueAbiLayout> explicitLayout =
-                    mlir::vernon::getValueAbiLayout(value.getType(), module, explicitDtypes);
+                FailureOr<ValueAbiLayout> explicitLayout = planLayout(value.getType(), explicitDtypes);
                 if (failed(explicitLayout) || explicitLayout->layoutHash != found->second.layoutHash)
                     return failure();
             }
@@ -101,14 +105,7 @@ public:
         dtypeRefs.reserve(ownedDtypes.size());
         for (const std::string &dtype : ownedDtypes)
             dtypeRefs.push_back(dtype);
-        Type abiType = value.getType();
-        if (auto view = dyn_cast<TensorViewType>(abiType)) {
-            if (!view.getElementType().isIntOrFloat() || view.getShape().empty() ||
-                llvm::any_of(view.getShape(), [](int64_t extent) { return extent <= 0; }))
-                return failure();
-            abiType = RankedTensorType::get(view.getShape(), view.getElementType());
-        }
-        FailureOr<ValueAbiLayout> layout = mlir::vernon::getValueAbiLayout(abiType, module, dtypeRefs);
+        FailureOr<ValueAbiLayout> layout = planLayout(value.getType(), dtypeRefs);
         if (failed(layout))
             return failure();
         cache.try_emplace(value, *layout);
@@ -116,6 +113,52 @@ public:
     }
 
 private:
+    FailureOr<ValueAbiLayout> planLayout(Type type, ArrayRef<StringRef> dtypes) {
+        auto view = dyn_cast<TensorViewType>(type);
+        if (!view)
+            return mlir::vernon::getValueAbiLayout(type, module, dtypes);
+        SmallVector<int64_t> shape(view.getShape());
+        if (shape.empty() || llvm::any_of(shape, [](int64_t extent) { return extent <= 0; }))
+            return failure();
+        Type elementType = view.getElementType();
+        if (auto element = dyn_cast<RankedTensorType>(elementType)) {
+            if (!element.hasStaticShape())
+                return failure();
+            llvm::append_range(shape, element.getShape());
+            elementType = element.getElementType();
+        }
+        if (elementType.isIntOrFloat())
+            return mlir::vernon::getValueAbiLayout(RankedTensorType::get(shape, elementType), module, dtypes);
+
+        FailureOr<ValueAbiLayout> elementLayout = mlir::vernon::getValueAbiLayout(elementType, module, dtypes);
+        if (failed(elementLayout))
+            return failure();
+        uint64_t elementCount = 1;
+        SmallVector<uint64_t> storageShape;
+        for (int64_t extent : view.getShape()) {
+            const uint64_t dimension = static_cast<uint64_t>(extent);
+            if (elementCount > std::numeric_limits<uint64_t>::max() / dimension)
+                return failure();
+            elementCount *= dimension;
+            storageShape.push_back(dimension);
+        }
+        ValueAbiLayout layout = std::move(*elementLayout);
+        if (layout.size > std::numeric_limits<uint64_t>::max() / elementCount)
+            return failure();
+        layout.elementStride = layout.size;
+        layout.size *= elementCount;
+        for (ValueAbiLeaf &leaf : layout.leaves) {
+            if (leaf.scalarCount > std::numeric_limits<uint64_t>::max() / elementCount)
+                return failure();
+            leaf.scalarCount *= elementCount;
+            leaf.shape.insert(leaf.shape.begin(), storageShape.begin(), storageShape.end());
+        }
+        layout.layoutHash += ":storage";
+        for (uint64_t extent : storageShape)
+            layout.layoutHash += ":" + std::to_string(extent);
+        return layout;
+    }
+
     FailureOr<SmallVector<std::string>> inferDtypes(Value value) {
         if (auto argument = dyn_cast<BlockArgument>(value)) {
             if (argument.getOwner() == &function.getBody().front()) {
@@ -142,6 +185,11 @@ private:
         if (!result)
             return SmallVector<std::string>{};
         Operation *operation = result.getOwner();
+        if (auto load = dyn_cast<LoadOp>(operation)) {
+            FailureOr<ValueAbiLayout> storage = resolve(load.getStorage());
+            return succeeded(storage) ? FailureOr<SmallVector<std::string>>(copyDtypes(*storage))
+                                      : FailureOr<SmallVector<std::string>>(failure());
+        }
         if (auto whileOp = dyn_cast<scf::WhileOp>(operation)) {
             if (result.getResultNumber() >= whileOp.getInits().size())
                 return failure();
@@ -210,10 +258,10 @@ private:
 
 class AutodiffAnalysisBuilder {
 public:
-    AutodiffAnalysisBuilder(func::FuncOp function, ArrayRef<StringRef> wrtPaths,
+    AutodiffAnalysisBuilder(func::FuncOp function, ArrayRef<StringRef> wrtPaths, ArrayRef<StringRef> outputPaths,
                             const VernonAutodiffRuleRegistry &registry)
-        : function(function), module(function->getParentOfType<ModuleOp>()), requestedWrt(wrtPaths), registry(registry),
-          abiResolver(function, module) {}
+        : function(function), module(function->getParentOfType<ModuleOp>()), requestedWrt(wrtPaths),
+          requestedOutputs(outputPaths), registry(registry), abiResolver(function, module) {}
 
     FailureOr<VernonAutodiffAnalysisResult> run();
 
@@ -228,6 +276,13 @@ private:
     void buildDependencies(Operation *operation);
     LogicalResult resolveWrt();
     LogicalResult resolveResults();
+    LogicalResult resolveStorageOutputs();
+    LogicalResult initializeStorageGraph();
+    LogicalResult buildStructuredDependencies(Region &region, DenseMap<unsigned, unsigned> &versions);
+    FailureOr<unsigned> createStorageVersion(unsigned identity, StorageVersionKind kind, Operation *operation,
+                                             ArrayRef<unsigned> incomingVersions, Value storedValue = {});
+    void addStorageLoadDependencies(LoadOp load, unsigned version);
+    LogicalResult bindStorageRoots(const DenseMap<unsigned, unsigned> &finalVersions);
     void computeActivity();
     LogicalResult discoverRegions();
     LogicalResult collectOperations();
@@ -239,16 +294,20 @@ private:
     func::FuncOp function;
     ModuleOp module;
     ArrayRef<StringRef> requestedWrt;
+    ArrayRef<StringRef> requestedOutputs;
     const VernonAutodiffRuleRegistry &registry;
     AutodiffValueAbiResolver abiResolver;
     VernonAutodiffAnalysisResult result;
     DenseMap<Value, unsigned> valueIndices;
     SmallVector<ValueNodes, 0> values;
-    SmallVector<std::pair<Value, unsigned>> nodeValues;
+    size_t graphNodeCount{};
     SmallVector<SmallVector<unsigned>> dependencies;
     SmallVector<SmallVector<unsigned>> users;
     SmallVector<unsigned> wrtNodes;
     SmallVector<unsigned> resultNodes;
+    SmallVector<StorageLeafSelection> wrtStorageLeaves;
+    SmallVector<StorageLeafSelection> resultStorageLeaves;
+    DenseMap<std::pair<Value, unsigned>, unsigned> selectedResultNodes;
     llvm::BitVector needed;
     llvm::BitVector influenced;
     llvm::BitVector active;
@@ -275,11 +334,11 @@ FailureOr<unsigned> AutodiffAnalysisBuilder::addValue(Value value, ArrayRef<Stri
     for (auto [leafIndex, leaf] : llvm::enumerate(entry.layout.leaves)) {
         if (!isDifferentiable(leaf))
             continue;
-        FailureOr<unsigned> node = checkedUnsigned(nodeValues.size());
+        FailureOr<unsigned> node = checkedUnsigned(graphNodeCount);
         if (failed(node))
             return failure();
         entry.nodes[leafIndex] = *node;
-        nodeValues.emplace_back(value, static_cast<unsigned>(leafIndex));
+        ++graphNodeCount;
         dependencies.emplace_back();
         users.emplace_back();
     }
@@ -304,28 +363,35 @@ void AutodiffAnalysisBuilder::addDependency(unsigned resultNode, unsigned operan
 }
 
 void AutodiffAnalysisBuilder::verifySameAbi(Operation *operation, ValueRange comparedValues) {
-    const ValueAbiLayout *expected = nullptr;
+    std::optional<std::string> expectedHash;
     for (Value value : comparedValues) {
+        if (value.getType().isIntOrIndex())
+            continue;
         FailureOr<unsigned> valueIndex = addValue(value);
         if (failed(valueIndex)) {
             emitDependencyError(operation, "cannot resolve structured control-flow Value ABI metadata");
             return;
         }
         const ValueAbiLayout &layout = values[*valueIndex].layout;
-        if (expected && expected->layoutHash != layout.layoutHash) {
+        if (llvm::none_of(layout.leaves, [&](const ValueAbiLeaf &leaf) { return isDifferentiable(leaf); }))
+            continue;
+        if (expectedHash && *expectedHash != layout.layoutHash) {
             emitDependencyError(operation, "structured control-flow values have incompatible canonical Value ABIs");
             return;
         }
-        expected = &layout;
+        expectedHash = layout.layoutHash;
     }
 }
 
 void AutodiffAnalysisBuilder::addAllDependencies(Value resultValue, ValueRange operands) {
-    if (resultValue.getType().isIndex())
+    if (resultValue.getType().isIntOrIndex())
         return;
     FailureOr<unsigned> resultIndex = addValue(resultValue);
     if (failed(resultIndex)) {
-        emitDependencyError(resultValue.getDefiningOp(), "cannot resolve the result's canonical Value ABI");
+        Operation *defining = resultValue.getDefiningOp();
+        emitDependencyError(defining,
+                            Twine("cannot resolve the result's canonical Value ABI for ") +
+                                (defining ? defining->getName().getStringRef() : StringRef("block argument")));
         return;
     }
     for (auto [resultLeafIndex, resultLeaf] : llvm::enumerate(values[*resultIndex].layout.leaves)) {
@@ -335,7 +401,7 @@ void AutodiffAnalysisBuilder::addAllDependencies(Value resultValue, ValueRange o
         if (!resultNode)
             continue;
         for (Value operand : operands) {
-            if (operand.getType().isIndex())
+            if (operand.getType().isIntOrIndex())
                 continue;
             FailureOr<unsigned> operandIndex = addValue(operand);
             if (failed(operandIndex)) {
@@ -414,14 +480,8 @@ void AutodiffAnalysisBuilder::addCreateDependencies(Value resultValue, ValueRang
 }
 
 void AutodiffAnalysisBuilder::buildDependencies(Operation *operation) {
-    if (auto load = dyn_cast<LoadOp>(operation)) {
-        addAllDependencies(load.getResult(), ValueRange(load.getStorage()));
+    if (isa<LoadOp, StoreOp>(operation))
         return;
-    }
-    if (auto store = dyn_cast<StoreOp>(operation)) {
-        addAllDependencies(store.getStorage(), ValueRange(store.getValue()));
-        return;
-    }
     if (auto ifOp = dyn_cast<scf::IfOp>(operation)) {
         for (auto [resultIndex, value] : llvm::enumerate(ifOp.getResults())) {
             SmallVector<Value> yielded;
@@ -491,6 +551,216 @@ void AutodiffAnalysisBuilder::buildDependencies(Operation *operation) {
         addAllDependencies(operationResult, operation->getOperands());
 }
 
+FailureOr<unsigned> AutodiffAnalysisBuilder::createStorageVersion(unsigned identity, StorageVersionKind kind,
+                                                                  Operation *operation,
+                                                                  ArrayRef<unsigned> incomingVersions,
+                                                                  Value storedValue) {
+    if (identity >= result.storageIdentities.size())
+        return failure();
+    Value binding = result.storageIdentities[identity].binding;
+    auto valueIndex = valueIndices.find(binding);
+    if (valueIndex == valueIndices.end())
+        return failure();
+    const ValueAbiLayout &layout = values[valueIndex->second].layout;
+    FailureOr<unsigned> versionId = checkedUnsigned(result.storageVersions.size());
+    if (failed(versionId))
+        return failure();
+    result.storageVersions.push_back(
+        AutodiffStorageVersion{*versionId, identity, kind, operation, SmallVector<unsigned>(incomingVersions)});
+    SmallVector<unsigned> versionNodes(layout.leaves.size(), kInvalidNode);
+    for (auto [leafIndex, leaf] : llvm::enumerate(layout.leaves)) {
+        if (!isDifferentiable(leaf))
+            continue;
+        FailureOr<unsigned> node = checkedUnsigned(graphNodeCount);
+        if (failed(node))
+            return failure();
+        versionNodes[leafIndex] = *node;
+        ++graphNodeCount;
+        dependencies.emplace_back();
+        users.emplace_back();
+        for (unsigned incoming : incomingVersions) {
+            if (incoming >= result.storageVersionNodes.size() ||
+                leafIndex >= result.storageVersionNodes[incoming].size())
+                return failure();
+            unsigned incomingNode = result.storageVersionNodes[incoming][leafIndex];
+            if (incomingNode != kInvalidNode)
+                addDependency(*node, incomingNode);
+        }
+        if (storedValue) {
+            FailureOr<unsigned> storedIndex = addValue(storedValue);
+            if (failed(storedIndex))
+                return failure();
+            for (auto [storedLeafIndex, storedLeaf] : llvm::enumerate(values[*storedIndex].layout.leaves))
+                if (isDifferentiable(storedLeaf))
+                    if (std::optional<unsigned> storedNode = getNode(storedValue, storedLeafIndex))
+                        addDependency(*node, *storedNode);
+        }
+    }
+    result.storageVersionNodes.push_back(std::move(versionNodes));
+    return *versionId;
+}
+
+void AutodiffAnalysisBuilder::addStorageLoadDependencies(LoadOp load, unsigned version) {
+    FailureOr<unsigned> resultIndex = addValue(load.getResult());
+    if (failed(resultIndex) || version >= result.storageVersionNodes.size()) {
+        emitDependencyError(load, "cannot resolve Storage load effect metadata");
+        return;
+    }
+    for (auto [resultLeafIndex, resultLeaf] : llvm::enumerate(values[*resultIndex].layout.leaves)) {
+        if (!isDifferentiable(resultLeaf))
+            continue;
+        std::optional<unsigned> resultNode = getNode(load.getResult(), resultLeafIndex);
+        if (!resultNode)
+            continue;
+        for (unsigned versionNode : result.storageVersionNodes[version])
+            if (versionNode != kInvalidNode)
+                addDependency(*resultNode, versionNode);
+    }
+}
+
+LogicalResult AutodiffAnalysisBuilder::buildStructuredDependencies(Region &region,
+                                                                   DenseMap<unsigned, unsigned> &versions) {
+    if (region.empty())
+        return success();
+    for (Operation &operation : region.front().without_terminator()) {
+        if (auto load = dyn_cast<LoadOp>(operation)) {
+            auto identity = result.storageIdentityIndices.find(load.getStorage());
+            if (identity == result.storageIdentityIndices.end() || !versions.contains(identity->second))
+                return load.emitError("autodiff Storage load has no effect identity");
+            FailureOr<unsigned> effectId = checkedUnsigned(result.storageEffects.size());
+            if (failed(effectId))
+                return load.emitError("autodiff Storage effect count exceeds the analysis representation");
+            result.storageEffects.push_back(
+                AutodiffStorageEffect{*effectId, identity->second, load, versions[identity->second], std::nullopt});
+            result.storageEffectIndices.try_emplace(load, *effectId);
+            addStorageLoadDependencies(load, versions[identity->second]);
+            continue;
+        }
+        if (auto store = dyn_cast<StoreOp>(operation)) {
+            auto identity = result.storageIdentityIndices.find(store.getStorage());
+            if (identity == result.storageIdentityIndices.end() || !versions.contains(identity->second))
+                return store.emitError("autodiff Storage store has no effect identity");
+            const unsigned before = versions[identity->second];
+            FailureOr<unsigned> after =
+                createStorageVersion(identity->second, StorageVersionKind::Write, store, {before}, store.getValue());
+            if (failed(after))
+                return store.emitError("cannot create autodiff Storage write version");
+            FailureOr<unsigned> effectId = checkedUnsigned(result.storageEffects.size());
+            if (failed(effectId))
+                return store.emitError("autodiff Storage effect count exceeds the analysis representation");
+            result.storageEffects.push_back(AutodiffStorageEffect{*effectId, identity->second, store, before, *after});
+            result.storageEffectIndices.try_emplace(store, *effectId);
+            versions[identity->second] = *after;
+            continue;
+        }
+        if (auto ifOp = dyn_cast<scf::IfOp>(operation)) {
+            buildDependencies(ifOp);
+            DenseMap<unsigned, unsigned> thenVersions = versions;
+            DenseMap<unsigned, unsigned> elseVersions = versions;
+            if (failed(buildStructuredDependencies(ifOp.getThenRegion(), thenVersions)) ||
+                failed(buildStructuredDependencies(ifOp.getElseRegion(), elseVersions)))
+                return failure();
+            for (const AutodiffStorageIdentity &identity : result.storageIdentities) {
+                unsigned thenVersion = thenVersions[identity.id];
+                unsigned elseVersion = elseVersions[identity.id];
+                if (thenVersion == elseVersion) {
+                    versions[identity.id] = thenVersion;
+                    continue;
+                }
+                FailureOr<unsigned> merged =
+                    createStorageVersion(identity.id, StorageVersionKind::IfMerge, ifOp, {thenVersion, elseVersion});
+                if (failed(merged))
+                    return ifOp.emitError("cannot create autodiff Storage branch merge version");
+                versions[identity.id] = *merged;
+            }
+            continue;
+        }
+        if (auto whileOp = dyn_cast<scf::WhileOp>(operation)) {
+            buildDependencies(whileOp);
+            DenseMap<unsigned, unsigned> phiVersions;
+            DenseMap<unsigned, unsigned> loopVersions;
+            for (const AutodiffStorageIdentity &identity : result.storageIdentities) {
+                FailureOr<unsigned> phi =
+                    createStorageVersion(identity.id, StorageVersionKind::WhilePhi, whileOp, {versions[identity.id]});
+                if (failed(phi))
+                    return whileOp.emitError("cannot create autodiff Storage loop phi version");
+                phiVersions[identity.id] = *phi;
+                loopVersions[identity.id] = *phi;
+            }
+            if (failed(buildStructuredDependencies(whileOp.getBefore(), loopVersions)))
+                return failure();
+            DenseMap<unsigned, unsigned> bodyVersions = loopVersions;
+            if (failed(buildStructuredDependencies(whileOp.getAfter(), bodyVersions)))
+                return failure();
+            for (const AutodiffStorageIdentity &identity : result.storageIdentities) {
+                const unsigned phi = phiVersions[identity.id];
+                const unsigned backedge = bodyVersions[identity.id];
+                result.storageVersions[phi].incomingVersions.push_back(backedge);
+                for (auto [leafIndex, phiNode] : llvm::enumerate(result.storageVersionNodes[phi])) {
+                    if (phiNode == kInvalidNode)
+                        continue;
+                    unsigned backedgeNode = result.storageVersionNodes[backedge][leafIndex];
+                    if (backedgeNode != kInvalidNode)
+                        addDependency(phiNode, backedgeNode);
+                }
+                FailureOr<unsigned> exit = createStorageVersion(identity.id, StorageVersionKind::WhileExit, whileOp,
+                                                                {loopVersions[identity.id]});
+                if (failed(exit))
+                    return whileOp.emitError("cannot create autodiff Storage loop exit version");
+                versions[identity.id] = *exit;
+            }
+            continue;
+        }
+        buildDependencies(&operation);
+    }
+    return dependencyStatus;
+}
+
+LogicalResult AutodiffAnalysisBuilder::initializeStorageGraph() {
+    DenseMap<unsigned, unsigned> versions;
+    for (Value argument : function.getArguments()) {
+        if (!isa<TensorViewType>(argument.getType()))
+            continue;
+        FailureOr<unsigned> valueIndex = addValue(argument);
+        if (failed(valueIndex))
+            return emitFunctionError("cannot resolve TensorView Storage ABI");
+        FailureOr<unsigned> identityId = checkedUnsigned(result.storageIdentities.size());
+        if (failed(identityId))
+            return emitFunctionError("Storage identity count exceeds the analysis representation");
+        result.storageIdentities.push_back(AutodiffStorageIdentity{*identityId, argument});
+        result.storageIdentityIndices.try_emplace(argument, *identityId);
+        FailureOr<unsigned> entry = createStorageVersion(*identityId, StorageVersionKind::Entry, nullptr, {});
+        if (failed(entry))
+            return emitFunctionError("cannot create Storage entry version");
+        versions[*identityId] = *entry;
+    }
+    if (failed(buildStructuredDependencies(function.getBody(), versions)))
+        return failure();
+    return bindStorageRoots(versions);
+}
+
+LogicalResult AutodiffAnalysisBuilder::bindStorageRoots(const DenseMap<unsigned, unsigned> &finalVersions) {
+    for (const StorageLeafSelection &selection : wrtStorageLeaves) {
+        auto identity = result.storageIdentityIndices.find(selection.binding);
+        if (identity == result.storageIdentityIndices.end())
+            return emitFunctionError("wrt Storage has no effect identity");
+        unsigned entryVersion =
+            llvm::find_if(result.storageVersions, [&](const AutodiffStorageVersion &version) {
+                return version.identity == identity->second && version.kind == StorageVersionKind::Entry;
+            })->id;
+        wrtNodes.push_back(result.storageVersionNodes[entryVersion][selection.abiLeafIndex]);
+    }
+    for (const StorageLeafSelection &selection : resultStorageLeaves) {
+        auto identity = result.storageIdentityIndices.find(selection.binding);
+        if (identity == result.storageIdentityIndices.end() || !finalVersions.contains(identity->second))
+            return emitFunctionError("Storage objective has no final effect version");
+        unsigned node = result.storageVersionNodes[finalVersions.lookup(identity->second)][selection.abiLeafIndex];
+        resultNodes.push_back(node);
+        selectedResultNodes[{selection.binding, selection.abiLeafIndex}] = node;
+    }
+    return success();
+}
+
 InFlightDiagnostic AutodiffAnalysisBuilder::emitFunctionError(const Twine &message) {
     return function.emitError() << "autodiff analysis: " << message;
 }
@@ -544,6 +814,8 @@ LogicalResult AutodiffAnalysisBuilder::resolveWrt() {
 
         SmallVector<ValueAbiPathComponent> prefix;
         Type current = argument.getType();
+        if (auto view = dyn_cast<TensorViewType>(current))
+            current = view.getElementType();
         for (StringRef component : ArrayRef<StringRef>(components).drop_front()) {
             if (auto structure = dyn_cast<StructType>(current)) {
                 FailureOr<ResolvedStructFields> fields = resolveNamedStructFields(structure, module);
@@ -580,7 +852,10 @@ LogicalResult AutodiffAnalysisBuilder::resolveWrt() {
                                                            *getAutodiffDerivativeType(leaf.scalarType)));
             result.wrtLeaves.push_back(AutodiffLeaf{argument, static_cast<unsigned>(leafIndex), path, leaf.scalarType,
                                                     derivativeType, leaf.dtype, leaf.shape});
-            wrtNodes.push_back(*getNode(argument, leafIndex));
+            if (isa<TensorViewType>(argument.getType()))
+                wrtStorageLeaves.push_back(StorageLeafSelection{argument, static_cast<unsigned>(leafIndex)});
+            else
+                wrtNodes.push_back(*getNode(argument, leafIndex));
             ++matches;
         }
         if (matches == 0)
@@ -652,9 +927,93 @@ LogicalResult AutodiffAnalysisBuilder::resolveResults() {
     return success();
 }
 
+LogicalResult AutodiffAnalysisBuilder::resolveStorageOutputs() {
+    if (function.getNumResults() != 0)
+        return emitFunctionError("Storage-objective VJP requires a void compute function");
+    if (requestedOutputs.empty())
+        return emitFunctionError("requires at least one Storage output path");
+    std::set<std::string> canonicalPaths;
+    for (StringRef path : requestedOutputs) {
+        SmallVector<StringRef> components;
+        path.split(components, '.', -1, false);
+        if (components.empty() || llvm::any_of(components, [](StringRef item) { return item.empty(); }))
+            return emitFunctionError(Twine("invalid Storage output path '") + path + "'");
+        std::optional<unsigned> argumentIndex;
+        for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+            auto sourceName = function.getArgAttrOfType<StringAttr>(index, "vernon.source_name");
+            if (sourceName && sourceName.getValue() == components.front()) {
+                argumentIndex = index;
+                break;
+            }
+        }
+        if (!argumentIndex)
+            return emitFunctionError(Twine("Storage output path '") + path + "' names no entry parameter");
+        Value argument = function.getArgument(*argumentIndex);
+        auto view = dyn_cast<TensorViewType>(argument.getType());
+        if (!view)
+            return emitFunctionError(Twine("Storage output path '") + path + "' is not a TensorView");
+        if (view.getAccess() == "read")
+            return emitFunctionError(Twine("Storage output path '") + path + "' is not writable");
+        Attribute dtypeMetadata = function.getArgAttr(*argumentIndex, "vernon.abi_leaf_dtypes");
+        auto dtypeArray = dyn_cast_or_null<ArrayAttr>(dtypeMetadata);
+        if (dtypeMetadata && !dtypeArray)
+            return emitFunctionError(Twine("Storage output path '") + path + "' has malformed ABI dtype metadata");
+        FailureOr<SmallVector<StringRef>> dtypes = getDtypes(dtypeArray);
+        FailureOr<unsigned> valueIndex = failed(dtypes) ? FailureOr<unsigned>(failure()) : addValue(argument, *dtypes);
+        if (failed(valueIndex))
+            return emitFunctionError(Twine("Storage output path '") + path + "' has no canonical Value ABI");
+        SmallVector<ValueAbiPathComponent> prefix;
+        Type current = view.getElementType();
+        for (StringRef component : ArrayRef<StringRef>(components).drop_front()) {
+            if (auto structure = dyn_cast<StructType>(current)) {
+                FailureOr<ResolvedStructFields> fields = resolveNamedStructFields(structure, module);
+                if (failed(fields))
+                    return emitFunctionError(Twine("cannot resolve Struct in Storage output path '") + path + "'");
+                auto field = llvm::find_if(fields->fields,
+                                           [&](const ResolvedStructField &item) { return item.name == component; });
+                if (field == fields->fields.end())
+                    return emitFunctionError(Twine("Storage output path '") + path + "' names no Struct field");
+                prefix.push_back(ValueAbiPathComponent::getField(component));
+                current = field->type;
+            } else if (auto tuple = dyn_cast<TupleType>(current)) {
+                uint64_t index = 0;
+                if (component.getAsInteger(10, index) || index >= tuple.size())
+                    return emitFunctionError(Twine("Storage output path '") + path + "' has an invalid Tuple index");
+                prefix.push_back(ValueAbiPathComponent::getIndex(index));
+                current = tuple.getType(index);
+            } else {
+                return emitFunctionError(Twine("Storage output path '") + path +
+                                         "' does not resolve through an aggregate");
+            }
+        }
+        unsigned matches = 0;
+        for (auto [leafIndex, leaf] : llvm::enumerate(values[*valueIndex].layout.leaves)) {
+            if (!hasPathPrefix(leaf.path, prefix) || !isDifferentiable(leaf))
+                continue;
+            std::string leafPath = appendAbiPath(components.front(), leaf.path);
+            if (!canonicalPaths.insert(leafPath).second)
+                return emitFunctionError(Twine("duplicate canonical Storage output leaf '") + leafPath + "'");
+            Type derivativeType = leaf.shape.empty() ? *getAutodiffDerivativeType(leaf.scalarType)
+                                                     : static_cast<Type>(RankedTensorType::get(
+                                                           SmallVector<int64_t>(leaf.shape.begin(), leaf.shape.end()),
+                                                           *getAutodiffDerivativeType(leaf.scalarType)));
+            result.activeResultLeaves.push_back(AutodiffLeaf{argument, static_cast<unsigned>(leafIndex),
+                                                             std::move(leafPath), leaf.scalarType, derivativeType,
+                                                             leaf.dtype, leaf.shape});
+            resultStorageLeaves.push_back(StorageLeafSelection{argument, static_cast<unsigned>(leafIndex)});
+            ++matches;
+        }
+        if (!matches)
+            return emitFunctionError(Twine("Storage output path '") + path + "' has no differentiable floating leaves");
+    }
+    if (resultStorageLeaves.empty())
+        return emitFunctionError("selected Storage outputs have no differentiable floating leaves");
+    return success();
+}
+
 void AutodiffAnalysisBuilder::computeActivity() {
-    needed.resize(nodeValues.size());
-    influenced.resize(nodeValues.size());
+    needed.resize(graphNodeCount);
+    influenced.resize(graphNodeCount);
     SmallVector<unsigned> worklist(resultNodes);
     while (!worklist.empty()) {
         unsigned node = worklist.pop_back_val();
@@ -674,9 +1033,16 @@ void AutodiffAnalysisBuilder::computeActivity() {
     active = needed;
     active &= influenced;
 
-    llvm::erase_if(result.activeResultLeaves,
-                   [&](const AutodiffLeaf &leaf) { return !active.test(*getNode(leaf.value, leaf.abiLeafIndex)); });
+    llvm::erase_if(result.activeResultLeaves, [&](const AutodiffLeaf &leaf) {
+        unsigned node = kInvalidNode;
+        if (auto found = selectedResultNodes.find({leaf.value, leaf.abiLeafIndex}); found != selectedResultNodes.end())
+            node = found->second;
+        else if (std::optional<unsigned> valueNode = getNode(leaf.value, leaf.abiLeafIndex))
+            node = *valueNode;
+        return node == kInvalidNode || !active.test(node);
+    });
     for (const ValueNodes &entry : values) {
+        result.valueAbiIndices.try_emplace(entry.value, static_cast<unsigned>(result.valueAbis.size()));
         result.valueAbis.push_back(AutodiffValueAbi{entry.value, entry.layout});
         AutodiffValueActivity activity;
         activity.value = entry.value;
@@ -686,6 +1052,33 @@ void AutodiffAnalysisBuilder::computeActivity() {
         }
         if (!activity.activeAbiLeaves.empty())
             result.activeValues.push_back(std::move(activity));
+    }
+    result.activeStorageVersionLeaves.resize(result.storageVersions.size());
+    for (const AutodiffStorageVersion &version : result.storageVersions)
+        for (auto [leafIndex, node] : llvm::enumerate(result.storageVersionNodes[version.id]))
+            if (node != kInvalidNode && active.test(node))
+                result.activeStorageVersionLeaves[version.id].push_back(static_cast<unsigned>(leafIndex));
+    for (const AutodiffStorageIdentity &identity : result.storageIdentities) {
+        auto existing = llvm::find_if(
+            result.activeValues, [&](const AutodiffValueActivity &item) { return item.value == identity.binding; });
+        AutodiffValueActivity storageActivity;
+        storageActivity.value = identity.binding;
+        for (const AutodiffStorageVersion &version : result.storageVersions) {
+            if (version.identity != identity.id)
+                continue;
+            for (auto [leafIndex, node] : llvm::enumerate(result.storageVersionNodes[version.id]))
+                if (node != kInvalidNode && active.test(node) &&
+                    !llvm::is_contained(storageActivity.activeAbiLeaves, static_cast<unsigned>(leafIndex)))
+                    storageActivity.activeAbiLeaves.push_back(static_cast<unsigned>(leafIndex));
+        }
+        if (existing == result.activeValues.end()) {
+            if (!storageActivity.activeAbiLeaves.empty())
+                result.activeValues.push_back(std::move(storageActivity));
+        } else {
+            for (unsigned leaf : storageActivity.activeAbiLeaves)
+                if (!llvm::is_contained(existing->activeAbiLeaves, leaf))
+                    existing->activeAbiLeaves.push_back(leaf);
+        }
     }
 }
 
@@ -706,7 +1099,7 @@ bool AutodiffAnalysisBuilder::hasActiveDescendant(Operation *operation) const {
         if (nested == operation)
             return;
         if (llvm::any_of(nested->getResults(), [&](Value value) { return anyActiveLeaf(value); }) ||
-            classifyAutodiffEffect(nested) != AutodiffEffectKind::Pure)
+            llvm::any_of(nested->getOperands(), [&](Value value) { return anyActiveLeaf(value); }))
             found = true;
     });
     return found;
@@ -751,11 +1144,18 @@ LogicalResult AutodiffAnalysisBuilder::collectOperations() {
         if (effect == AutodiffEffectKind::Unsupported && isa<IntrinsicOp>(operation) && registry.lookup(operation))
             effect = AutodiffEffectKind::Pure;
         bool operationActive = llvm::any_of(operation->getResults(), [&](Value value) { return anyActiveLeaf(value); });
-        // Effectful operations are part of every differentiated execution even
-        // when their operands are constants or their results are unused. They
-        // cannot be pruned using differentiable SSA activity.
-        if (effect != AutodiffEffectKind::Pure)
-            operationActive = true;
+        if (const AutodiffStorageEffect *storageEffect = result.getStorageEffect(operation)) {
+            const ValueAbiLayout *layout =
+                result.getValueAbi(result.storageIdentities[storageEffect->identity].binding);
+            if (layout)
+                for (unsigned leaf = 0; leaf < layout->leaves.size(); ++leaf)
+                    operationActive |= result.isActiveStorageVersion(storageEffect->versionBefore, leaf) ||
+                                       (storageEffect->versionAfter &&
+                                        result.isActiveStorageVersion(*storageEffect->versionAfter, leaf));
+        } else if (effect != AutodiffEffectKind::Pure) {
+            operationActive |=
+                llvm::any_of(operation->getOperands(), [&](Value value) { return anyActiveLeaf(value); });
+        }
         if (isa<scf::IfOp, scf::WhileOp>(operation))
             operationActive |= hasActiveDescendant(operation);
         if (operation->getNumRegions() != 0 && !isa<scf::IfOp, scf::WhileOp>(operation) && operationActive) {
@@ -764,6 +1164,8 @@ LogicalResult AutodiffAnalysisBuilder::collectOperations() {
             return WalkResult::interrupt();
         }
         result.operations.push_back(AutodiffOperationActivity{operation, effect, operationActive});
+        if (operationActive)
+            result.activeOperationSet.insert(operation);
         if (operationActive &&
             (effect == AutodiffEffectKind::Unsupported || effect == AutodiffEffectKind::ExternallyVisible)) {
             operation->emitError() << "autodiff analysis does not support active " << stringifyAutodiffEffect(effect)
@@ -781,10 +1183,9 @@ FailureOr<VernonAutodiffAnalysisResult> AutodiffAnalysisBuilder::run() {
         emitFunctionError("function must be nested in a module");
         return failure();
     }
-    if (failed(resolveWrt()) || failed(resolveResults()))
+    if (failed(resolveWrt()) || failed(requestedOutputs.empty() ? resolveResults() : resolveStorageOutputs()))
         return failure();
-    function.walk([&](Operation *operation) { buildDependencies(operation); });
-    if (failed(dependencyStatus))
+    if (failed(initializeStorageGraph()) || failed(dependencyStatus))
         return failure();
     computeActivity();
     if (failed(discoverRegions()))
@@ -802,14 +1203,28 @@ bool VernonAutodiffAnalysisResult::isActive(Value value, unsigned abiLeafIndex) 
 }
 
 const ValueAbiLayout *VernonAutodiffAnalysisResult::getValueAbi(Value value) const {
-    auto found = llvm::find_if(valueAbis, [&](const AutodiffValueAbi &item) { return item.value == value; });
-    return found == valueAbis.end() ? nullptr : &found->layout;
+    auto found = valueAbiIndices.find(value);
+    return found == valueAbiIndices.end() ? nullptr : &valueAbis[found->second].layout;
+}
+
+const AutodiffStorageIdentity *VernonAutodiffAnalysisResult::getStorageIdentity(Value binding) const {
+    auto found = storageIdentityIndices.find(binding);
+    return found == storageIdentityIndices.end() ? nullptr : &storageIdentities[found->second];
+}
+
+const AutodiffStorageEffect *VernonAutodiffAnalysisResult::getStorageEffect(Operation *operation) const {
+    auto found = storageEffectIndices.find(operation);
+    return found == storageEffectIndices.end() ? nullptr : &storageEffects[found->second];
+}
+
+bool VernonAutodiffAnalysisResult::isActiveStorageVersion(unsigned version, unsigned abiLeafIndex) const {
+    if (version >= activeStorageVersionLeaves.size())
+        return false;
+    return llvm::is_contained(activeStorageVersionLeaves[version], abiLeafIndex);
 }
 
 bool VernonAutodiffAnalysisResult::isActive(Operation *operation) const {
-    auto activity =
-        llvm::find_if(operations, [&](const AutodiffOperationActivity &item) { return item.operation == operation; });
-    return activity != operations.end() && activity->active;
+    return activeOperationSet.contains(operation);
 }
 
 FailureOr<VernonAutodiffAnalysisResult> analyzeAutodiffFunction(func::FuncOp function, ArrayRef<StringRef> wrtPaths) {
@@ -819,7 +1234,13 @@ FailureOr<VernonAutodiffAnalysisResult> analyzeAutodiffFunction(func::FuncOp fun
 
 FailureOr<VernonAutodiffAnalysisResult> analyzeAutodiffFunction(func::FuncOp function, ArrayRef<StringRef> wrtPaths,
                                                                 const VernonAutodiffRuleRegistry &registry) {
-    return AutodiffAnalysisBuilder(function, wrtPaths, registry).run();
+    return AutodiffAnalysisBuilder(function, wrtPaths, {}, registry).run();
+}
+
+FailureOr<VernonAutodiffAnalysisResult> analyzeAutodiffFunction(func::FuncOp function, ArrayRef<StringRef> wrtPaths,
+                                                                ArrayRef<StringRef> outputPaths,
+                                                                const VernonAutodiffRuleRegistry &registry) {
+    return AutodiffAnalysisBuilder(function, wrtPaths, outputPaths, registry).run();
 }
 
 bool isDifferentiableAutodiffLeaf(Type scalarType, StringRef logicalDtype) {

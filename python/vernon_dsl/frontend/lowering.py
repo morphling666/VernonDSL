@@ -257,7 +257,7 @@ class _FunctionEmitter:
                 attributes.append(self._abi_leaf_dtypes_attribute(element_type, "vernon.element_abi_leaf_dtypes"))
             if emit_value_abi_metadata and value_type.kind in {"scalar", "tensor", "tuple", "struct"}:
                 attributes.extend(self._abi_attributes(value_type))
-            if value_type.kind == "tensor_view":
+            if value_type.kind == "tensor_view" and self.stage is not None:
                 has_explicit_binding = any(attribute.startswith("vernon.binding") for attribute in attributes)
                 attributes = [
                     attribute

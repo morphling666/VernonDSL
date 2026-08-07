@@ -66,6 +66,17 @@ LogicalResult TensorViewType::verify(function_ref<InFlightDiagnostic()> emitErro
     return success();
 }
 
+LogicalResult AdAdjointBufferType::verify(function_ref<InFlightDiagnostic()> emitError, Type elementType,
+                                          ArrayRef<int64_t> shape, unsigned indexRank) {
+    if (!isa<FloatType>(elementType))
+        return emitError() << "adjoint buffer requires a floating scalar element type";
+    if (shape.empty() || llvm::any_of(shape, [](int64_t extent) { return extent <= 0; }))
+        return emitError() << "adjoint buffer requires a positive static flattened shape";
+    if (indexRank == 0 || indexRank > shape.size())
+        return emitError() << "adjoint buffer index rank must select a non-empty shape prefix";
+    return success();
+}
+
 void VernonDialect::initialize() {
     addTypes<
 #define GET_TYPEDEF_LIST

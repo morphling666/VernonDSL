@@ -6,8 +6,8 @@ VernonDSL 0.1.1 is the first stable cross-platform release target. The current
 version axes are:
 
 - release `0.1.1`;
-- compiler contract 9;
-- pipeline contract 12;
+- compiler contract 10;
+- pipeline contract 13;
 - released frontend version 3, with language v4 remaining a future target.
 
 The supported wheel matrix is CPython 3.11–3.14 on Windows x64, Linux x64, and
@@ -118,8 +118,8 @@ permit removing queue waits or letting recorded work outlive its owners.
 - Packed D32S8 readback uses one eight-byte depth/stencil layout across enabled
   backends. Metal and Vulkan tests assert rendered depth/stencil values; the
   OpenGL adapter has a packed-layout readback test.
-- The pipeline contract was advanced to version 12 with regenerated manifests
-  and fixtures.
+- The pipeline contract was advanced through version 13 with regenerated
+  manifests and fixtures.
 
 ### Metal acceptance-tested subset
 
@@ -145,6 +145,24 @@ permit removing queue waits or letting recorded work outlive its owners.
 - macOS resource, retention, compute, graphics, and barrier tests exist.
   Packaged iOS simulator smoke and an iOS arm64 Runtime plus smoke-host
   final-link build are also present.
+
+### CPU structured Storage autodiff
+
+- `vd.ad.vjp` emits deterministic primal, forward-with-tape, and backward
+  profiles with checked dynamic tape and explicit Storage objectives.
+- Direct and cooked CPU execution share one `dynamic_v2` executable,
+  derivative-group validation path, and reusable pullback implementation.
+- Recursive Scalar, Tensor, Tuple, and Struct Storage elements use packed
+  structural tangent layouts with f16-to-f32 promotion and zero nodes for
+  non-differentiable leaves.
+- Dynamic, offset, strided, and reversed TensorViews preserve their descriptors
+  through cotangent gathering and gradient scattering. Compatible `wrt` views
+  sharing one owner accumulate into one fresh tangent owner.
+- Stateful branches, loops, runtime gather/scatter, scratch overwrite,
+  aggregate output cotangents, and multi-invocation carriers have direct,
+  cooked, and finite-difference regression coverage.
+- Compiler contract 10 and pipeline contract 13 freeze the current transform,
+  profile, tape, and manifest boundary without compatibility readers.
 
 ## Future work
 
@@ -179,14 +197,9 @@ The accepted autodiff architecture is defined in
 [`autodiff.md`](autodiff.md).
 The principal work is:
 
-- implement one first-order reverse-mode API, `vd.ad.vjp`, over unchanged
-  Kernel and graphics source, with explicit `wrt`, cotangents, gradient
-  results, and deterministic pullback lifetime;
-- cook primal, forward-with-tape, and backward profiles under one
-  `pipeline_asset()` declaration and expose the same contract to Python, C,
-  and C++;
-- implement stateful Kernel functionalization, bounded tape, and
-  effect/alias-safe gradient accumulation;
+- extend the implemented CPU structured Storage VJP contract to GPU dynamic
+  tape and aggregate tangent execution without backend-specific grouping;
+- expose composed ExecutionGraph VJP beyond the current C++ GPU surface;
 - define versioned custom VJPs for rasterization, visibility, depth, blend, and
   texture sampling before claiming cross-stage graphics differentiation;
 - complete cross-backend acceptance for workgroup storage, barriers, relaxed

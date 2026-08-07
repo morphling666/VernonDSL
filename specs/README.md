@@ -11,7 +11,7 @@ and milestone checklists.
    version 3 until all required v4 gates pass.
 2. [`language/tensor_view.md`](language/tensor_view.md) defines the accepted
    Tensor, TensorStorage, TensorView, workgroup, projection, and ABI contract.
-3. [`autodiff.md`](autodiff.md) defines the proposed VJP program transform,
+3. [`autodiff.md`](autodiff.md) defines the VJP program transform,
    pullback semantics, differentiated asset cooking, and C/C++ deployment API.
 4. [`compiler/design.md`](compiler/design.md) defines compiler boundaries,
    lowering invariants, reflection, target routing, and artifact cooking.

@@ -539,6 +539,34 @@ def main(value: f32) -> f32:
 
 
 class ModuleGraphTests(unittest.TestCase):
+    def test_dsl_entry_can_share_a_module_with_host_program_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "application.py"
+            path.write_text(
+                "from dataclasses import dataclass\n"
+                "from functools import cache\n"
+                "import json\n"
+                "from vernon_dsl import TensorView, dyn, f32, kernel, write\n"
+                "@dataclass\n"
+                "class Options:\n"
+                "    scale: float\n"
+                "@cache\n"
+                "def host_value() -> float:\n"
+                "    def nested() -> float:\n"
+                "        return json.loads('1.0')\n"
+                "    return nested()\n"
+                "@kernel\n"
+                "def main(output: TensorView[f32, (dyn,), write]) -> None:\n"
+                "    output[0] = 2.0\n",
+                encoding="utf-8",
+            )
+
+            output = compile_file(path)
+
+            self.assertIn("func.func @main", output)
+            self.assertNotIn("host_value", output)
+            self.assertNotIn("Options", output)
+
     def test_project_local_helper_is_namespaced_and_hashed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -568,16 +596,43 @@ class ModuleGraphTests(unittest.TestCase):
             self.assertIn("lighting.py=", output)
             self.assertIn("shader.py=", output)
 
+    def test_unreferenced_project_import_is_not_loaded_or_hashed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unused = root / "unused.py"
+            shader = root / "shader.py"
+            unused.write_text("this is not valid Python !!!\n", encoding="utf-8")
+            shader.write_text(
+                "from unused import missing\n"
+                "from vernon_dsl import f32, fragment\n"
+                "@fragment\n"
+                "def main(value: f32) -> f32:\n"
+                "    return value\n",
+                encoding="utf-8",
+            )
+
+            output = compile_file(shader, entry="main")
+
+            self.assertIn("func.func @main", output)
+            self.assertNotIn("unused.py=", output)
+
     def test_import_cycle_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "a.py").write_text("from b import helper\n", encoding="utf-8")
+            (root / "a.py").write_text(
+                "from b import helper\n"
+                "from vernon_dsl import f32, fragment\n"
+                "@fragment\n"
+                "def main(value: f32) -> f32:\n"
+                "    return helper(value)\n",
+                encoding="utf-8",
+            )
             (root / "b.py").write_text(
                 "from a import main\n"
-                "from vernon_dsl import func\n"
+                "from vernon_dsl import f32, func\n"
                 "@func\n"
                 "def helper(value: f32) -> f32:\n"
-                "    return value\n",
+                "    return main(value)\n",
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(CompileError, "import cycle"):

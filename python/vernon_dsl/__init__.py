@@ -10,6 +10,7 @@ from . import ad, interop, storage
 from .compiler import Compiler, compile_file, compile_source
 from .decorators import fragment, func, kernel, struct, vertex
 from .diagnostics import CompileError
+from .host_values import TangentLayout, TangentValue
 from .intrinsics import (
     abs,
     acos,
@@ -45,7 +46,7 @@ from .intrinsics import (
     workgroup_barrier,
     workgroup_storage,
 )
-from .pipeline_assets import PipelineAssetDeclaration, pipeline_asset
+from .pipeline_assets import PipelineAssetDeclaration, load_cooked_vjp_asset, pipeline_asset
 from .runtime import (
     ColorAttachmentUse,
     CompiledBarrier,
@@ -150,6 +151,8 @@ __all__ = [
     "TensorLayout",
     "TensorStorage",
     "TensorView",
+    "TangentLayout",
+    "TangentValue",
     "Texture",
     "StoreOperation",
     "storage_barrier",
@@ -185,6 +188,7 @@ __all__ = [
     "interop",
     "init",
     "lines",
+    "load_cooked_vjp_asset",
     "log",
     "kernel",
     "matmul",

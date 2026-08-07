@@ -5,16 +5,19 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Annotated, Any, get_args, get_origin
+from typing import TYPE_CHECKING, Annotated, Any, get_args, get_origin
 
 import numpy as np
 
 from ..host_values import (
     HostAbiLayout,
+    TangentLayout,
     host_abi_layout,
     host_scalar_shape,
     pack_host_value,
+    tangent_layout,
     unpack_host_value,
+    unpack_tangent_value,
 )
 from ..types import TypeExpr, _Scalar
 
@@ -33,6 +36,20 @@ _NUMPY_DTYPES = {
 }
 
 _ACCESS_MODES = frozenset({"read", "write", "read_write"})
+_VALUE_FIELD = "__value"
+
+
+def _storage_array_dtype(layout: HostAbiLayout | TangentLayout) -> np.dtype[Any]:
+    if layout.dtype.subdtype is None:
+        return layout.dtype
+    return np.dtype(
+        {
+            "names": (_VALUE_FIELD,),
+            "formats": (layout.dtype,),
+            "offsets": (0,),
+            "itemsize": layout.size,
+        }
+    )
 
 
 def _is_logical_collection(value: Any) -> bool:
@@ -55,6 +72,13 @@ def _bind_native_argument(builder: Any, parameter: Any, value: Any, *, host_valu
             list(layout.byte_strides),
             layout.byte_offset,
         )
+
+    value_type = type(value)
+    if getattr(value_type, "__vernon_dsl__", (None, {}))[0] == "struct":
+        layout = host_abi_layout(value_type)
+        host_array = np.empty((), dtype=layout.dtype)
+        host_array[()] = pack_host_value(value_type, value)
+        return builder.host_tensor(parameter.name, host_array)
 
     numpy_dtypes = {
         state._native.DATA_BOOL: np.dtype(np.bool_),
@@ -223,25 +247,25 @@ def _views_overlap(left: TensorView, right: TensorView) -> bool:
 
 
 class TensorStorage:
-    """Host owner of a dense, row-major scalar allocation."""
+    """Host owner of a dense row-major allocation with one canonical element layout."""
 
     def __init__(
         self,
         array: np.ndarray,
         *,
         element_type: Any | None = None,
-        abi_layout: HostAbiLayout | None = None,
+        element_layout: HostAbiLayout | TangentLayout | None = None,
     ):
         if not isinstance(array, np.ndarray) or not array.flags.c_contiguous:
             raise ValueError("TensorStorage requires a contiguous NumPy array")
         if array.dtype not in _NUMPY_DTYPES.values() and element_type is None:
             raise TypeError(f"unsupported TensorStorage dtype {array.dtype}")
-        if abi_layout is not None and array.dtype != abi_layout.dtype:
+        if element_layout is not None and array.dtype != _storage_array_dtype(element_layout):
             raise TypeError("TensorStorage array dtype does not match its canonical element ABI")
         self._array = array
         self._element_type = element_type
-        self._abi_layout = abi_layout
-        self._element_alignment = abi_layout.alignment if abi_layout is not None else array.dtype.itemsize
+        self._element_layout = element_layout
+        self._element_alignment = element_layout.alignment if element_layout is not None else array.dtype.itemsize
         self._native_buffer: Any | None = None
         self._native_generation = -1
         self._host_version = 1
@@ -272,7 +296,7 @@ class TensorStorage:
         if isinstance(dtype, _Scalar):
             return TensorStorage._dtype(dtype), None
         layout = host_abi_layout(dtype)
-        return layout.dtype, layout
+        return _storage_array_dtype(layout), layout
 
     @classmethod
     def zeros(cls, *, dtype: Any, shape: tuple[int, ...]) -> TensorStorage:
@@ -280,7 +304,7 @@ class TensorStorage:
         return cls(
             np.zeros(shape, dtype=numpy_dtype, order="C"),
             element_type=dtype if layout is not None else None,
-            abi_layout=layout,
+            element_layout=layout,
         )
 
     @classmethod
@@ -289,8 +313,20 @@ class TensorStorage:
         return cls(
             np.empty(shape, dtype=numpy_dtype, order="C"),
             element_type=dtype if layout is not None else None,
-            abi_layout=layout,
+            element_layout=layout,
         )
+
+    @classmethod
+    def _tangent_zeros(cls, layout: TangentLayout, shape: tuple[int, ...]) -> TensorStorage:
+        return cls(
+            np.zeros(shape, dtype=_storage_array_dtype(layout), order="C"),
+            element_type=layout.primal_element_type,
+            element_layout=layout,
+        )
+
+    @classmethod
+    def tangent_zeros(cls, *, dtype: Any, shape: tuple[int, ...]) -> TensorStorage:
+        return cls._tangent_zeros(tangent_layout(dtype), shape)
 
     @classmethod
     def from_numpy(cls, array: np.ndarray) -> TensorStorage:
@@ -312,7 +348,11 @@ class TensorStorage:
 
     @property
     def dtype(self) -> np.dtype[Any]:
-        return self._array.dtype
+        return self._element_layout.dtype if self._element_layout is not None else self._array.dtype
+
+    @property
+    def element_layout(self) -> HostAbiLayout | TangentLayout | None:
+        return self._element_layout
 
     @property
     def layout(self) -> TensorLayout:
@@ -324,15 +364,17 @@ class TensorStorage:
         )
 
     def field(self, name: str, *, access: str = "read_write") -> TensorView:
-        if self._abi_layout is None or self._element_type is None:
+        if isinstance(self._element_layout, TangentLayout):
+            return self[name]
+        if self._element_layout is None or self._element_type is None:
             raise TypeError("TensorStorage field projection requires a Struct element type")
         fields = getattr(self._element_type, "__vernon_fields__", {})
-        if name not in fields or name not in self._abi_layout.field_names:
+        if name not in fields or name not in self._element_layout.field_names:
             raise ValueError(f"Struct '{self._element_type.__name__}' has no field '{name}'")
-        field_index = self._abi_layout.field_names.index(name)
+        field_index = self._element_layout.field_names.index(name)
         scalar, field_shape = host_scalar_shape(fields[name])
         scalar_dtype = self._dtype(scalar)
-        byte_offset = self._abi_layout.field_offsets[field_index]
+        byte_offset = self._element_layout.field_offsets[field_index]
         if byte_offset % scalar_dtype.itemsize:
             raise ValueError(f"Struct field '{name}' offset is not aligned to its scalar leaf")
         inner_byte_strides: list[int] = []
@@ -351,6 +393,43 @@ class TensorStorage:
             byte_offset // scalar_dtype.itemsize,
             access,
             dtype=scalar_dtype,
+        )
+
+    def __getitem__(self, path: str) -> TensorView:
+        return self._tangent_view(
+            path,
+            shape=self.shape,
+            strides=tuple(stride // self.dtype.itemsize for stride in self._array.strides),
+            offset=0,
+            access="read_write",
+        )
+
+    def _tangent_view(
+        self,
+        path: str,
+        *,
+        shape: tuple[int, ...],
+        strides: tuple[int, ...],
+        offset: int,
+        access: str,
+    ) -> TensorView:
+        if not isinstance(self._element_layout, TangentLayout):
+            raise TypeError("structural path projection is available only on tangent TensorStorage")
+        leaf = self._element_layout.project(path)
+        byte_strides = (
+            *(stride * self._element_layout.size for stride in strides),
+            *leaf.inner_byte_strides,
+        )
+        byte_offset = offset * self._element_layout.size + leaf.byte_offset
+        if any(stride % leaf.dtype.itemsize for stride in byte_strides) or byte_offset % leaf.dtype.itemsize:
+            raise RuntimeError(f"tangent path '{path}' is not representable as a scalar TensorView")
+        return TensorView(
+            self,
+            (*shape, *leaf.shape),
+            tuple(stride // leaf.dtype.itemsize for stride in byte_strides),
+            byte_offset // leaf.dtype.itemsize,
+            access,
+            dtype=leaf.dtype,
         )
 
     def view(
@@ -403,31 +482,55 @@ class TensorStorage:
     def to_numpy(self) -> np.ndarray:
         self._ensure_host_read_allowed()
         self.synchronize()
-        return self._array.copy(order="C")
+        return self._native_host_array().copy(order="C")
 
     def _borrowed_array(self) -> np.ndarray:
         self.synchronize()
         return self._array
 
     def _native_host_array(self) -> np.ndarray:
+        if self._element_layout is not None and self._element_layout.dtype.subdtype is not None:
+            return self._array[_VALUE_FIELD]
         return self._array
+
+    def _materialize_gradient(
+        self,
+        gradient: np.ndarray,
+        path: str,
+        destination: TensorStorage | None = None,
+    ) -> TensorStorage:
+        if self._element_type is not None:
+            return self._full_view("read")._materialize_gradient(gradient, path, destination)
+        gradient = np.asarray(gradient)
+        if destination is None:
+            return TensorStorage.from_numpy(gradient)
+        target = destination._native_host_array()
+        if target.shape != gradient.shape or target.dtype != gradient.dtype:
+            raise ValueError("shared-owner gradient leaves require matching shapes and dtypes")
+        np.add(target, gradient, out=target)
+        return destination
 
     def copy_from_numpy(self, array: np.ndarray) -> None:
         self._ensure_host_mutation_allowed()
+        target = self._native_host_array()
         if (
             not isinstance(array, np.ndarray)
-            or array.dtype != self.dtype
-            or array.shape != self.shape
+            or array.dtype != target.dtype
+            or array.shape != target.shape
             or not array.flags.c_contiguous
         ):
             raise ValueError("upload requires matching dtype, shape, and contiguity")
-        np.copyto(self._array, array)
+        np.copyto(target, array)
         self._host_version += 1
         self._device_dirty = False
 
     def copy_from_values(self, values: Any) -> None:
         self._ensure_host_mutation_allowed()
-        if self._abi_layout is None or self._element_type is None:
+        if (
+            self._element_layout is None
+            or isinstance(self._element_layout, TangentLayout)
+            or self._element_type is None
+        ):
             raise TypeError("copy_from_values requires a Struct TensorStorage")
         logical_shape = _logical_collection_shape(values, self._element_type)
         if logical_shape != self.shape:
@@ -436,19 +539,29 @@ class TensorStorage:
             logical_value = values
             for component in index:
                 logical_value = logical_value[component]
-            self._array[index] = pack_host_value(self._element_type, logical_value)
+            packed = pack_host_value(self._element_type, logical_value)
+            if self._element_layout.dtype.subdtype is None:
+                self._array[index] = packed
+            else:
+                self._array[_VALUE_FIELD][index] = packed
         self._host_version += 1
         self._device_dirty = False
 
     def to_values(self) -> Any:
-        if self._abi_layout is None or self._element_type is None:
+        if self._element_layout is None or self._element_type is None:
             raise TypeError("to_values requires a Struct TensorStorage")
         self._ensure_host_read_allowed()
         self.synchronize()
+        element_layout = self._element_layout
 
         def materialize(prefix: tuple[int, ...], dimension: int) -> Any:
             if dimension == len(self.shape):
-                return unpack_host_value(self._element_type, self._array[prefix])
+                value = (
+                    self._array[prefix] if element_layout.dtype.subdtype is None else self._array[_VALUE_FIELD][prefix]
+                )
+                if isinstance(element_layout, TangentLayout):
+                    return unpack_tangent_value(element_layout.tangent_schema, value)
+                return unpack_host_value(self._element_type, value)
             return tuple(materialize((*prefix, index), dimension + 1) for index in range(self.shape[dimension]))
 
         return materialize((), 0)
@@ -456,7 +569,7 @@ class TensorStorage:
     def synchronize(self) -> None:
         if not self._device_dirty or self._native_buffer is None:
             return
-        downloaded = np.frombuffer(self._native_buffer.download(), dtype=self.dtype).reshape(self.shape)
+        downloaded = np.frombuffer(self._native_buffer.download(), dtype=self._array.dtype).reshape(self.shape)
         np.copyto(self._array, downloaded)
         self._download_count += 1
         self._device_dirty = False
@@ -634,7 +747,7 @@ class TensorView:
         if not isinstance(owner, (TensorStorage, RawBuffer)):
             raise TypeError("TensorView owner must be a TensorStorage or RawBuffer")
         if isinstance(owner, TensorStorage):
-            if dtype is not None and owner._abi_layout is None and dtype != owner.dtype:
+            if dtype is not None and owner._element_layout is None and dtype != owner.dtype:
                 raise TypeError("TensorStorage view dtype must match its owner")
             dtype = owner.dtype if dtype is None else dtype
             if element_type is None:
@@ -673,6 +786,12 @@ class TensorView:
         if not isinstance(arguments, tuple):
             arguments = (arguments,)
         return TypeExpr("TensorView", arguments)
+
+    if TYPE_CHECKING:
+
+        def __getitem__(self, index: Any) -> Any: ...
+
+        def __setitem__(self, index: Any, value: Any) -> None: ...
 
     @property
     def owner(self) -> TensorStorage | RawBuffer:
@@ -724,13 +843,96 @@ class TensorView:
             strides=tuple(stride * self.dtype.itemsize for stride in self._strides),
         )
 
+    def _materialize_gradient(
+        self,
+        gradient: np.ndarray,
+        path: str,
+        destination: TensorStorage | None = None,
+    ) -> TensorStorage:
+        gradient = np.asarray(gradient)
+        if self._element_type is not None and not isinstance(self._element_type, _Scalar):
+            layout = tangent_layout(self._element_type)
+            root = path.split(".", 1)[0]
+            leaf_path = path[len(root) + 1 :] if path != root else ""
+            leaf = layout.project(leaf_path)
+            trailing_shape = leaf.shape
+            if (
+                tuple(gradient.shape[: len(self.shape)]) != self.shape
+                or tuple(gradient.shape[len(self.shape) :]) != trailing_shape
+            ):
+                raise ValueError("logical gradient shape does not match its aggregate TensorView leaf")
+            if destination is None:
+                if not isinstance(self.owner, TensorStorage):
+                    raise TypeError("aggregate tangent owners require canonical TensorStorage primals")
+                destination = TensorStorage._tangent_zeros(layout, self.owner.shape)
+            elif not isinstance(destination._element_layout, TangentLayout) or (
+                destination._element_layout.layout_hash != layout.layout_hash
+            ):
+                raise ValueError("shared-owner aggregate gradients require one tangent layout")
+            target = np.ndarray(
+                gradient.shape,
+                dtype=leaf.dtype,
+                buffer=destination._array,
+                offset=self._offset * layout.size + leaf.byte_offset,
+                strides=(
+                    *(stride * layout.size for stride in self._strides),
+                    *leaf.inner_byte_strides,
+                ),
+            )
+            np.add(target, gradient, out=target)
+            return destination
+        trailing_shape = tuple(gradient.shape[len(self.shape) :])
+        if tuple(gradient.shape[: len(self.shape)]) != self.shape:
+            raise ValueError("logical gradient shape does not match its TensorView descriptor")
+        scalar_count = int(np.prod(trailing_shape, dtype=np.int64)) if trailing_shape else 1
+        owner_element_count = self.owner._array.nbytes // self.dtype.itemsize
+        owner_shape = (
+            (*self.owner.shape, *trailing_shape)
+            if isinstance(self.owner, TensorStorage)
+            else (owner_element_count, *trailing_shape)
+        )
+        if destination is None:
+            owner_gradient = np.zeros(owner_shape, dtype=gradient.dtype, order="C")
+            destination = TensorStorage.from_numpy(owner_gradient)
+            owner_gradient = destination._native_host_array()
+        else:
+            owner_gradient = destination._native_host_array()
+            if owner_gradient.shape != owner_shape or owner_gradient.dtype != gradient.dtype:
+                raise ValueError("shared-owner TensorView gradients require matching owner layouts")
+        inner_strides: list[int] = []
+        stride = 1
+        for extent in reversed(trailing_shape):
+            inner_strides.append(stride)
+            stride *= extent
+        inner_strides.reverse()
+        scalar_strides = (
+            *(value * scalar_count for value in self._strides),
+            *inner_strides,
+        )
+        target = np.ndarray(
+            gradient.shape,
+            dtype=gradient.dtype,
+            buffer=owner_gradient,
+            offset=self._offset * scalar_count * gradient.dtype.itemsize,
+            strides=tuple(value * gradient.dtype.itemsize for value in scalar_strides),
+        )
+        np.add(target, gradient, out=target)
+        return destination
+
     def copy_from_numpy(self, array: np.ndarray) -> None:
         self._owner._ensure_host_mutation_allowed()
         if self.access == "read":
             raise PermissionError("cannot write through a read-only TensorView")
-        if not isinstance(array, np.ndarray) or array.dtype != self.dtype or array.shape != self.shape:
+        self._owner.synchronize()
+        target = self._native_host_array()
+        if (
+            not isinstance(array, np.ndarray)
+            or array.dtype != target.dtype
+            or array.shape != target.shape
+            or not array.flags.c_contiguous
+        ):
             raise ValueError("upload requires matching dtype and shape")
-        np.copyto(self._borrowed_array(), array)
+        np.copyto(target, array)
         self._owner._host_version += 1
         self._owner._device_dirty = False
 

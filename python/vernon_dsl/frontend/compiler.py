@@ -16,7 +16,7 @@ from .cache import frontend_cache
 from .emission import emit_mlir_module
 from .lowering import _FunctionEmitter
 from .lowering_types import DslType, FunctionSignature, ModuleContext
-from .model import ConcreteType, StorageEffect, StorageOwnerKind, StorageRegionKind, is_abi_stable_value
+from .model import AccessMode, ConcreteType, StorageEffect, StorageOwnerKind, StorageRegionKind, is_abi_stable_value
 from .monomorphize import infer_and_monomorphize_helpers
 from .request import FrontendCompileRequest, FrontendCompileResult
 from .specialization import specialize_frontend_source
@@ -86,19 +86,20 @@ class Compiler:
                 name: tuple((field_name, annotation.type) for field_name, annotation in fields)
                 for name, fields in context.structs.items()
             }
-            self._program_graph = build_program_graph(
-                typed_entry,
-                context.typed_functions,
-                program_transform.wrt,
-                struct_fields,
-                program_transform.derivative_rules_version,
-                runtime_workgroup_size or declared_workgroup_size,
-                context.error,
-            )
-            self._autodiff_profiles = build_autodiff_profile_plan(
-                program_transform,
-                self._program_graph,
-            )
+            if program_transform.protocol == "legacy_fixed":
+                self._program_graph = build_program_graph(
+                    typed_entry,
+                    context.typed_functions,
+                    program_transform.wrt,
+                    struct_fields,
+                    program_transform.derivative_rules_version,
+                    runtime_workgroup_size or declared_workgroup_size,
+                    context.error,
+                )
+                self._autodiff_profiles = build_autodiff_profile_plan(
+                    program_transform,
+                    self._program_graph,
+                )
 
         def emit_function(node: ast.FunctionDef) -> list[str]:
             stage, workgroup_size = self._decorator(node, context)
@@ -218,17 +219,6 @@ class Compiler:
                 function.source,
                 "Storage VJP requires static effects or analyzable parallel TensorView parameter effects",
             )
-        for parameter in function.parameters:
-            if parameter.type.kind != "tensor_view":
-                continue
-            shape = parameter.type.arguments[1]
-            if not isinstance(shape, tuple) or any(not isinstance(extent, int) or extent <= 0 for extent in shape):
-                raise context.error(
-                    function.source,
-                    f"initial Storage VJP requires a positive static shape for TensorView '{parameter.name}'",
-                )
-        if function.result_type is None:
-            raise context.error(function.source, "VJP transform requires a differentiable program result")
 
         def floating_leaves(value_type: ConcreteType) -> int:
             if value_type.kind == "scalar":
@@ -242,28 +232,42 @@ class Compiler:
                 return sum(floating_leaves(field.type) for _, field in context.structs[value_type.name])
             return 0
 
-        if not floating_leaves(function.result_type):
-            raise context.error(function.source, "VJP program result has no differentiable floating Value leaves")
-        parameters = {parameter.name: parameter.type for parameter in function.parameters}
-        for path in transform.wrt:
+        if transform.protocol == "dynamic_v2":
+            if function.result_type is not None:
+                raise context.error(
+                    function.source, "compute kernels must return None; VJP objectives are writable Storage"
+                )
+        elif function.result_type is None or not floating_leaves(function.result_type):
+            raise context.error(function.source, "legacy VJP requires a differentiable program result")
+        typed_parameters = {parameter.name: parameter for parameter in function.parameters}
+
+        def resolve_path(path: str, *, role: str) -> ConcreteType:
             components = path.split(".")
-            value_type = parameters.get(components[0])
-            if value_type is None:
-                raise context.error(function.source, f"VJP wrt path '{path}' names no entry parameter")
+            parameter = typed_parameters.get(components[0])
+            if parameter is None:
+                raise context.error(function.source, f"VJP {role} path '{path}' names no entry parameter")
+            if parameter.builtin is not None:
+                raise context.error(function.source, f"VJP {role} path '{path}' names a builtin parameter")
+            value_type = parameter.type
             for component in components[1:]:
                 if value_type.kind == "struct":
                     fields = dict(context.structs[value_type.name])
                     field = fields.get(component)
                     if field is None:
-                        raise context.error(function.source, f"VJP wrt path '{path}' names no Struct field")
+                        raise context.error(function.source, f"VJP {role} path '{path}' names no Struct field")
                     value_type = field.type
                 elif value_type.kind == "tuple" and component.isdigit():
                     index = int(component)
-                    if index >= len(value_type.arguments) or not isinstance(value_type.arguments[index], ConcreteType):
-                        raise context.error(function.source, f"VJP wrt path '{path}' has an invalid Tuple index")
-                    value_type = value_type.arguments[index]
+                    nested = value_type.arguments[index] if index < len(value_type.arguments) else None
+                    if not isinstance(nested, ConcreteType):
+                        raise context.error(function.source, f"VJP {role} path '{path}' has an invalid Tuple index")
+                    value_type = nested
                 else:
-                    raise context.error(function.source, f"VJP wrt path '{path}' does not resolve to a Value")
+                    raise context.error(function.source, f"VJP {role} path '{path}' does not resolve to a projection")
+            return value_type
+
+        for path in transform.wrt:
+            value_type = resolve_path(path, role="wrt")
             if value_type.kind in {"struct", "tuple"}:
                 raise context.error(
                     function.source,
@@ -271,6 +275,19 @@ class Compiler:
                 )
             if not floating_leaves(value_type):
                 raise context.error(function.source, f"VJP wrt path '{path}' has no differentiable floating leaves")
+        if transform.protocol == "legacy_fixed":
+            return
+        if not transform.output_cotangents:
+            raise context.error(function.source, "compute VJP requires non-empty writable Storage outputs")
+        for path in transform.output_cotangents:
+            value_type = resolve_path(path, role="output")
+            parameter = typed_parameters[path.split(".", 1)[0]]
+            if value_type.kind != "tensor_view":
+                raise context.error(function.source, f"VJP output path '{path}' must resolve to TensorView Storage")
+            if parameter.access is AccessMode.READ:
+                raise context.error(function.source, f"VJP output path '{path}' must be writable")
+            if not floating_leaves(value_type):
+                raise context.error(function.source, f"VJP output path '{path}' has no differentiable floating leaves")
 
     @staticmethod
     def _validate_entry_annotations(module: ast.Module, context: ModuleContext) -> None:

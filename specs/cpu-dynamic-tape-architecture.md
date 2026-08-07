@@ -2,9 +2,9 @@
 
 ## Status
 
-This document records the Phase 8 architecture and implementation plan.
-Completion state remains authoritative only in
-[`autodiff-task-list.md`](autodiff-task-list.md).
+This document records the CPU dynamic-tape architecture decision. Current
+implemented behavior and remaining product work are maintained in
+[`autodiff.md`](autodiff.md) and [`roadmap.md`](roadmap.md).
 
 It refines the CPU sections of
 [`mlir-centered-autodiff-architecture.md`](mlir-centered-autodiff-architecture.md)

@@ -198,7 +198,7 @@ def loop_early_return(
 def dynamic_range_sum(start: vd.i32, stop: vd.i32, step: vd.i32) -> vd.i32:
     total = 0
     for index in range(start, stop, step):
-        total += vd.i32(index)
+        total += index
     return total
 
 
@@ -210,6 +210,19 @@ def dynamic_range(
     output[0] = dynamic_range_sum(controls[0], controls[1], controls[2])
 
 
+@vd.kernel
+def range_i32_expressions(
+    output: vd.TensorView[vd.i32, (vd.dyn,), vd.write],
+    controls: vd.TensorView[vd.i32, (vd.dyn,), vd.read],
+) -> None:
+    width = controls[0]
+    for index in range(width):
+        if index % 2 == 0:
+            output[index] = index + 1
+        else:
+            output[index] = width - index
+
+
 @vd.func
 def signed_literal_step_range_sum(
     start: vd.i32,
@@ -219,10 +232,10 @@ def signed_literal_step_range_sum(
     total = 0
     if direction > 0:
         for index in range(start, stop, 2):
-            total += vd.i32(index)
+            total += index
     else:
         for index in range(start, stop, -3):
-            total += vd.i32(index)
+            total += index
     return total
 
 
@@ -269,6 +282,26 @@ def range_control_flow(
 class AggregateRecord:
     vector: vd.Tensor[vd.f32, (2,)]
     pair: vd.Tuple[vd.i32, vd.f32]
+
+
+@vd.struct(shared=True)
+class RuntimeParameters:
+    scale: vd.f32
+    bias: vd.f32
+
+
+@vd.struct(shared=True)
+class OtherRuntimeParameters:
+    scale: vd.f32
+    bias: vd.f32
+
+
+@vd.kernel
+def use_runtime_parameters(
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    parameters: RuntimeParameters,
+) -> None:
+    output[0] = parameters.scale + parameters.bias
 
 
 @vd.struct
@@ -355,6 +388,24 @@ def copy_value_tensor_view(
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     output[gid[0]] = source[gid[0]]
+
+
+@vd.func
+def load_vector_element(
+    source: vd.TensorView[vd.Vector[vd.f32, 2], (vd.dyn,), vd.read],
+    index: vd.i32,
+) -> vd.Vector[vd.f32, 2]:
+    return source[index]
+
+
+@vd.kernel(workgroup_size=(2, 1, 1))
+def copy_vector_tensor_view_through_helper(
+    output: vd.TensorView[vd.Vector[vd.f32, 2], (vd.dyn,), vd.write],
+    source: vd.TensorView[vd.Vector[vd.f32, 2], (vd.dyn,), vd.read],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    index = vd.i32(gid[0])
+    output[index] = load_vector_element(source, index)
 
 
 @vd.kernel(workgroup_size=(64, 1, 1))
@@ -616,6 +667,72 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                     dynamic_range(output, control_values, grid=(1, 1, 1))
                     np.testing.assert_array_equal(output.to_numpy(), np.array((expected,), dtype=np.int32))
 
+    def test_range_induction_is_i32_until_tensor_view_indexing(self) -> None:
+        vd.init(arch=vd.cpu)
+        output = vd.storage.zeros(dtype=vd.i32, shape=(6,))
+        controls = vd.storage.from_numpy(np.array((6,), dtype=np.int32))
+        range_i32_expressions(output, controls, grid=(1, 1, 1))
+        np.testing.assert_array_equal(output.to_numpy(), np.array((1, 5, 3, 3, 5, 1), dtype=np.int32))
+
+    def test_shared_struct_value_parameter_executes_on_cpu(self) -> None:
+        vd.init(arch=vd.cpu)
+        output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        use_runtime_parameters(
+            output,
+            RuntimeParameters(np.float32(2.5), np.float32(1.25)),
+            grid=(1, 1, 1),
+        )
+        np.testing.assert_array_equal(output.to_numpy(), np.array((3.75,), dtype=np.float32))
+        with self.assertRaisesRegex(TypeError, "has type OtherRuntimeParameters, expected RuntimeParameters"):
+            use_runtime_parameters(
+                output,
+                OtherRuntimeParameters(np.float32(2.5), np.float32(1.25)),
+                grid=(1, 1, 1),
+            )
+
+    def test_flattened_smoke_fluid_kernel_executes_on_cpu(self) -> None:
+        from examples.autodiff_smoke_fluid_kernels import SmokeFluidParameters, smoke_fluid_step
+
+        vd.init(arch=vd.cpu)
+        size = 4
+
+        def scalar_grid() -> vd.TensorStorage:
+            return vd.storage.zeros(dtype=vd.f32, shape=(size, size))
+
+        def vector_grid() -> vd.TensorStorage:
+            return vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(size, size))
+
+        target = vd.storage.from_numpy(np.ones((size, size), dtype=np.float32))
+        output_density = scalar_grid()
+        output_velocity = vector_grid()
+        output_loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        smoke_fluid_step(
+            scalar_grid(),
+            vector_grid(),
+            vd.storage.zeros(dtype=vd.f32, shape=(2,)),
+            target,
+            scalar_grid(),
+            vector_grid(),
+            vector_grid(),
+            scalar_grid(),
+            scalar_grid(),
+            scalar_grid(),
+            output_density,
+            output_velocity,
+            output_loss,
+            SmokeFluidParameters(
+                np.int32(size),
+                np.int32(size),
+                np.int32(2),
+                np.int32(2),
+                np.float32(0.1),
+            ),
+            grid=(1, 1, 1),
+        )
+        np.testing.assert_array_equal(output_density.to_numpy(), np.zeros((size, size), dtype=np.float32))
+        np.testing.assert_array_equal(output_velocity.to_numpy(), np.zeros((size, size, 2), dtype=np.float32))
+        np.testing.assert_array_equal(output_loss.to_numpy(), np.ones((1,), dtype=np.float32))
+
     def test_dynamic_zero_range_step_is_runtime_contract_violation(self) -> None:
         import os
         import subprocess
@@ -849,6 +966,20 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                     np.frombuffer(tensor_output_bytes, dtype=np.float32).reshape(2, 2),
                     np.asarray(tensor_values),
                 )
+
+                vector_type = vd.Vector[vd.f32, 2]
+                vector_source = vd.storage.from_values(tensor_values, dtype=vector_type)
+                vector_output = vd.storage.zeros(dtype=vector_type, shape=(2,))
+                vector_source.view(access="read_write").copy_from_numpy(
+                    np.ascontiguousarray(tensor_values, dtype=np.float32)
+                )
+                copy_vector_tensor_view_through_helper(vector_output, vector_source, grid=(2, 1, 1))
+                np.testing.assert_array_equal(
+                    vector_output.to_numpy(),
+                    np.asarray(tensor_values),
+                )
+                for actual, expected in zip(vector_output.to_values(), tensor_values, strict=True):
+                    np.testing.assert_array_equal(actual, expected)
 
     def test_multidimensional_aggregate_tensor_dispatch(self) -> None:
         values = tuple(

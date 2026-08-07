@@ -31,7 +31,8 @@ def specialize_frontend_source(source: str, request: FrontendCompileRequest) -> 
             values = list(annotation.slice.elts) if isinstance(annotation.slice, ast.Tuple) else [annotation.slice]
             annotation = values[0]
         if not (
-            isinstance(annotation, ast.Subscript) and (dotted_name(annotation.value) or "").split(".")[-1] == "Tensor"
+            isinstance(annotation, ast.Subscript)
+            and (dotted_name(annotation.value) or "").split(".")[-1] in {"Tensor", "TensorView"}
         ):
             continue
         items = list(annotation.slice.elts) if isinstance(annotation.slice, ast.Tuple) else [annotation.slice]
@@ -45,7 +46,9 @@ def specialize_frontend_source(source: str, request: FrontendCompileRequest) -> 
                 SourceLocation(str(request.source_path), argument.lineno, argument.col_offset + 1),
             )
         for index, (declared, concrete) in enumerate(zip(shape_nodes, shape, strict=True)):
-            if isinstance(declared, ast.Constant) and declared.value is None:
+            if (isinstance(declared, ast.Constant) and declared.value is None) or (dotted_name(declared) or "").split(
+                "."
+            )[-1] == "dyn":
                 shape_nodes[index] = ast.copy_location(ast.Constant(value=concrete), declared)
             elif not (isinstance(declared, ast.Constant) and declared.value == concrete):
                 raise CompileError(

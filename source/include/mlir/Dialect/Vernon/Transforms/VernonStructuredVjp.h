@@ -14,6 +14,7 @@ struct StructuredVjpOptions {
     SmallVector<std::string> wrtPaths;
     std::string forwardSymbol;
     std::string backwardSymbol;
+    SmallVector<std::string> outputPaths;
 };
 
 struct StructuredVjpResult {

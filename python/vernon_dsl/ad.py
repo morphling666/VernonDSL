@@ -11,18 +11,22 @@ from typing import Any, Callable, Mapping
 from .bundle import canonical_json
 from .language.stage_registry import GRAPHICS_STAGES, validate_graphics_topology
 
-_PATH = re.compile(r"^[A-Za-z_]\w*(?:\.(?:[A-Za-z_]\w*|\d+))*$")
+_PATH = re.compile(r"^[A-Za-z_]\w*(?:\.(?:[A-Za-z_]\w*|\d+))*$", re.ASCII)
 _RULE_NAMES = ("rasterization", "visibility", "depth", "blend", "texture")
 
 
-def _canonical_paths(values: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+def _canonical_paths(
+    values: tuple[str, ...] | list[str],
+    *,
+    label: str,
+) -> tuple[str, ...]:
     if not isinstance(values, (tuple, list)) or not values:
-        raise ValueError("wrt must be a non-empty tuple or list of canonical source paths")
+        raise ValueError(f"{label} must be a non-empty tuple or list of canonical source paths")
     paths = tuple(values)
     if any(not isinstance(path, str) or not _PATH.fullmatch(path) for path in paths):
-        raise ValueError("wrt entries must be canonical source paths")
+        raise ValueError(f"{label} entries must be canonical source paths")
     if len(set(paths)) != len(paths):
-        raise ValueError("wrt paths must be unique")
+        raise ValueError(f"{label} paths must be unique")
     return tuple(sorted(paths))
 
 
@@ -78,8 +82,13 @@ class ProgramTransformSpec:
             raise ValueError("unsupported derivative rules version")
         if (self.rule_set is None) != (self.rule_set_identity is None):
             raise ValueError("rule set name and identity must be provided together")
-        object.__setattr__(self, "wrt", _canonical_paths(self.wrt))
-        object.__setattr__(self, "output_cotangents", tuple(sorted(self.output_cotangents)))
+        object.__setattr__(self, "wrt", _canonical_paths(self.wrt, label="wrt"))
+        if self.output_cotangents:
+            object.__setattr__(
+                self,
+                "output_cotangents",
+                _canonical_paths(self.output_cotangents, label="outputs"),
+            )
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -128,6 +137,7 @@ def vjp(
     program: Callable[..., Any] | tuple[Callable[..., Any], ...],
     *,
     wrt: tuple[str, ...] | list[str],
+    outputs: tuple[str, ...] | list[str] | None = None,
     rules: RuleSet | None = None,
     protocol: str = "dynamic_v2",
 ) -> ProgramExpression:
@@ -144,11 +154,15 @@ def vjp(
         validate_graphics_topology(kinds)
         if rules is None:
             raise ValueError("graphics VJP requires a named custom rule set")
+        if outputs is not None:
+            raise ValueError("graphics VJP does not accept compute Storage outputs")
     else:
         if getattr(program, "__vernon_dsl__", (None,))[0] != "compute":
             raise TypeError("single-entry VJP program must be a compute Kernel")
         if rules is not None:
             raise ValueError("compute VJP does not accept graphics custom rules")
+        if outputs is None and protocol != "legacy_fixed":
+            raise ValueError("compute VJP requires non-empty writable Storage outputs")
     if rules is not None and not isinstance(rules, RuleSet):
         raise TypeError("rules must be declared with vd.ad.rule_set")
     spec = ProgramTransformSpec(
@@ -156,6 +170,7 @@ def vjp(
         tuple(wrt),
         rule_set=rules.id if rules is not None else None,
         rule_set_identity=rules.digest if rules is not None else None,
+        output_cotangents=(_canonical_paths(outputs, label="outputs") if outputs is not None else ()),
         protocol=protocol,
     )
     return ProgramExpression(program, spec, rules)

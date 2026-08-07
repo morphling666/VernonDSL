@@ -103,6 +103,7 @@ function(vernon_add_runtime)
 
     add_library(
         VernonRuntimeCore STATIC
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/autodiff_metadata.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/compute_launch_planner.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/content_hash.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/graphics_invocation_planner.cpp

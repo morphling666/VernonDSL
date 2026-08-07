@@ -15,21 +15,38 @@ VernonLoadedPipeline *loadBackendCpuAutodiffPipeline(
     VernonStringView primalName, VernonCpuEntryPoint forwardEntry, VernonStringView forwardReflection,
     VernonStringView forwardName, VernonCpuEntryPoint backwardEntry, VernonStringView backwardReflection,
     VernonStringView backwardName, VernonStringView forwardProtocol, VernonStringView backwardProtocol,
-    const VernonStringView *gradientPaths, size_t gradientPathCount) {
+    const AutodiffDerivativeGroupView *groupViews, size_t derivativeGroupCount) {
     try {
-        if ((!gradientPaths && gradientPathCount) || !gradientPathCount) {
-            invocationDiagnostic(context) = "direct CPU autodiff requires gradient paths";
+        if (!groupViews || !derivativeGroupCount) {
+            invocationDiagnostic(context) = "direct CPU autodiff requires derivative groups";
             return nullptr;
         }
-        std::vector<std::string> paths;
-        paths.reserve(gradientPathCount);
-        for (size_t index = 0; index < gradientPathCount; ++index) {
-            if (!gradientPaths[index].data || !gradientPaths[index].size) {
-                invocationDiagnostic(context) = "direct CPU autodiff gradient path is invalid";
+        std::vector<AutodiffDerivativeGroup> derivativeGroups;
+        derivativeGroups.reserve(derivativeGroupCount);
+        for (size_t groupIndex = 0; groupIndex < derivativeGroupCount; ++groupIndex) {
+            const AutodiffDerivativeGroupView &view = groupViews[groupIndex];
+            if (!view.declaredPath.data || !view.declaredPath.size || !view.leafPaths || !view.leafCount) {
+                invocationDiagnostic(context) = "direct CPU autodiff derivative group view is invalid";
                 return nullptr;
             }
-            paths.emplace_back(gradientPaths[index].data, gradientPaths[index].size);
+            AutodiffDerivativeGroup group;
+            group.role = view.role;
+            group.declaredPath.assign(view.declaredPath.data, view.declaredPath.size);
+            group.leafPaths.reserve(view.leafCount);
+            for (size_t leafIndex = 0; leafIndex < view.leafCount; ++leafIndex) {
+                const VernonStringView leaf = view.leafPaths[leafIndex];
+                if (!leaf.data || !leaf.size) {
+                    invocationDiagnostic(context) = "direct CPU autodiff derivative leaf view is invalid";
+                    return nullptr;
+                }
+                group.leafPaths.emplace_back(leaf.data, leaf.size);
+            }
+            derivativeGroups.push_back(std::move(group));
         }
+        if (!validateAutodiffDerivativeGroups(derivativeGroups, invocationDiagnostic(context)))
+            return nullptr;
+        const std::vector<std::string> paths =
+            autodiffDerivativeLeafPaths(derivativeGroups, AutodiffDerivativeRole::Gradient);
         using PipelinePtr = std::unique_ptr<VernonLoadedPipeline, void (*)(VernonLoadedPipeline *)>;
         PipelinePtr pipeline(loadBackendCpuEntryPipeline(context, primalEntry, primalReflection.data,
                                                          primalReflection.size, primalName.data, primalName.size),
@@ -45,7 +62,9 @@ VernonLoadedPipeline *loadBackendCpuAutodiffPipeline(
             invocationDiagnostic(context) = std::move(error);
             return nullptr;
         }
-        pipeline->autodiff = VernonLoadedAutodiff{std::move(executable)};
+        if (!ad::validateDerivativeGroupsAgainstSignature(context, derivativeGroups, executable->signature()))
+            return nullptr;
+        pipeline->autodiff = VernonLoadedAutodiff{std::move(executable), {}, derivativeGroups};
         return pipeline.release();
     } catch (...) {
         try {

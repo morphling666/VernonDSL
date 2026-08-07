@@ -13,7 +13,7 @@ from ..language.stage_registry import ENTRY_DECORATOR_STAGES, validate_graphics_
 from ..module_graph import load_project
 from .descriptors import ShaderModuleDescriptor, ShaderPipelineDescriptor, ShaderStageReference
 
-_AD_PATH = re.compile(r"^[A-Za-z_]\w*(?:\.(?:[A-Za-z_]\w*|\d+))*$")
+_AD_PATH = re.compile(r"^[A-Za-z_]\w*(?:\.(?:[A-Za-z_]\w*|\d+))*$", re.ASCII)
 
 
 def pipeline_asset_reference(value: str | Path) -> tuple[Path, str]:
@@ -85,6 +85,7 @@ def _ad_rule_sets(tree: ast.Module) -> dict[str, tuple[str, tuple[str, ...]]]:
 
 def _transform_record(
     wrt: tuple[str, ...],
+    outputs: tuple[str, ...],
     rule_set_id: str | None,
     rule_set_identity: str | None,
     protocol: str,
@@ -92,7 +93,7 @@ def _transform_record(
     record: dict[str, Any] = {
         "kind": "vjp",
         "wrt": list(wrt),
-        "output_cotangents": [],
+        "output_cotangents": list(outputs),
         "gradient_policy": "f16:f32,f32:f32,f64:f64",
         "accumulation_policy": "fresh",
         "tape_policy": "bounded",
@@ -190,7 +191,7 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
         if len(program_expression.args) != 1 or any(item.arg is None for item in program_expression.keywords):
             raise PipelineCompileError("vd.ad.vjp requires one program operand and keyword arguments")
         transform_keywords = {item.arg: item.value for item in program_expression.keywords if item.arg is not None}
-        unknown_transform = set(transform_keywords) - {"wrt", "rules", "protocol"}
+        unknown_transform = set(transform_keywords) - {"wrt", "outputs", "rules", "protocol"}
         if unknown_transform:
             raise PipelineCompileError("unknown vd.ad.vjp argument(s): " + ", ".join(sorted(unknown_transform)))
         wrt_node = transform_keywords.get("wrt")
@@ -206,6 +207,17 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
             raise PipelineCompileError("vd.ad.vjp wrt must be a non-empty literal tuple or list of source paths")
         if len(set(wrt_value)) != len(wrt_value):
             raise PipelineCompileError("vd.ad.vjp wrt paths must be unique")
+        outputs_node = transform_keywords.get("outputs")
+        try:
+            outputs_value = ast.literal_eval(outputs_node) if outputs_node is not None else ()
+        except (ValueError, TypeError, SyntaxError):
+            outputs_value = None
+        if not isinstance(outputs_value, (tuple, list)) or any(
+            not isinstance(path, str) or not _AD_PATH.fullmatch(path) for path in outputs_value
+        ):
+            raise PipelineCompileError("vd.ad.vjp outputs must be a literal tuple or list of source paths")
+        if len(set(outputs_value)) != len(outputs_value):
+            raise PipelineCompileError("vd.ad.vjp outputs paths must be unique")
         protocol_node = transform_keywords.get("protocol")
         try:
             protocol = ast.literal_eval(protocol_node) if protocol_node is not None else "dynamic_v2"
@@ -227,6 +239,7 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
             rule_set_identity = hashlib.sha256(canonical_json(rule_set_record).encode("utf-8")).hexdigest()
         transform = _transform_record(
             tuple(sorted(wrt_value)),
+            tuple(sorted(outputs_value)),
             rule_set_id,
             rule_set_identity,
             protocol,
@@ -267,6 +280,10 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
             raise PipelineCompileError("graphics VJP requires a named custom rule set")
         if not graphics and "rule_set" in transform:
             raise PipelineCompileError("compute VJP does not accept graphics custom rules")
+        if graphics and transform["output_cotangents"]:
+            raise PipelineCompileError("graphics VJP does not accept compute Storage outputs")
+        if not graphics and transform["protocol"] != "legacy_fixed" and not transform["output_cotangents"]:
+            raise PipelineCompileError("compute VJP requires non-empty writable Storage outputs")
 
     features = _feature_bindings(tree)
     variants_node = keywords.get("variants")

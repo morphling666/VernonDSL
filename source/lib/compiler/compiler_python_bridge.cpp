@@ -4,10 +4,12 @@
 #include "compiler_internal.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonInlineHelpers.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStructuredVjp.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
+#include "mlir/Pass/PassManager.h"
 
 #include <memory>
 #include <new>
@@ -144,6 +146,8 @@ VernonPythonValueAbiPlanView vernonCompilerGetPythonValueAbiPlanView(const Verno
 
 VernonPythonStructuredVjp *vernonCompilerBuildPythonStructuredVjp(VernonStringView module, VernonStringView entry,
                                                                   const VernonStringView *wrtPaths, size_t wrtPathCount,
+                                                                  const VernonStringView *outputPaths,
+                                                                  size_t outputPathCount,
                                                                   VernonStringView forwardSymbol,
                                                                   VernonStringView backwardSymbol) {
     std::unique_ptr<VernonPythonStructuredVjp> result(new (std::nothrow) VernonPythonStructuredVjp());
@@ -151,7 +155,8 @@ VernonPythonStructuredVjp *vernonCompilerBuildPythonStructuredVjp(VernonStringVi
         return nullptr;
     auto present = [](VernonStringView value) { return value.data && value.size; };
     if (!present(module) || !present(entry) || !present(forwardSymbol) || !present(backwardSymbol) ||
-        (!wrtPaths && wrtPathCount != 0) || wrtPathCount == 0) {
+        (!wrtPaths && wrtPathCount != 0) || wrtPathCount == 0 || (!outputPaths && outputPathCount != 0) ||
+        outputPathCount == 0) {
         result->status = VERNON_STATUS_INVALID_ARGUMENT;
         result->diagnostics = "structured VJP bridge input is invalid";
         return result.release();
@@ -160,6 +165,13 @@ VernonPythonStructuredVjp *vernonCompilerBuildPythonStructuredVjp(VernonStringVi
         if (!present(wrtPaths[index])) {
             result->status = VERNON_STATUS_INVALID_ARGUMENT;
             result->diagnostics = "structured VJP wrt path is invalid";
+            return result.release();
+        }
+    }
+    for (size_t index = 0; index < outputPathCount; ++index) {
+        if (!present(outputPaths[index])) {
+            result->status = VERNON_STATUS_INVALID_ARGUMENT;
+            result->diagnostics = "structured VJP output path is invalid";
             return result.release();
         }
     }
@@ -184,6 +196,14 @@ VernonPythonStructuredVjp *vernonCompilerBuildPythonStructuredVjp(VernonStringVi
         result->status = VERNON_STATUS_VERIFICATION_ERROR;
         return result.release();
     }
+    mlir::PassManager normalization(&context);
+    normalization.addPass(mlir::vernon::createVernonInlineHelpersPass());
+    if (mlir::failed(normalization.run(*parsed))) {
+        result->status = VERNON_STATUS_VERIFICATION_ERROR;
+        if (result->diagnostics.empty())
+            result->diagnostics = "structured VJP helper normalization failed";
+        return result.release();
+    }
     std::string entryName(entry.data, entry.size);
     mlir::func::FuncOp primal = parsed->lookupSymbol<mlir::func::FuncOp>(entryName);
     if (!primal) {
@@ -196,6 +216,8 @@ VernonPythonStructuredVjp *vernonCompilerBuildPythonStructuredVjp(VernonStringVi
     options.backwardSymbol.assign(backwardSymbol.data, backwardSymbol.size);
     for (size_t index = 0; index < wrtPathCount; ++index)
         options.wrtPaths.emplace_back(wrtPaths[index].data, wrtPaths[index].size);
+    for (size_t index = 0; index < outputPathCount; ++index)
+        options.outputPaths.emplace_back(outputPaths[index].data, outputPaths[index].size);
     mlir::FailureOr<mlir::vernon::StructuredVjpResult> transformed = mlir::vernon::buildStructuredVjp(primal, options);
     if (mlir::failed(transformed)) {
         result->status = VERNON_STATUS_VERIFICATION_ERROR;

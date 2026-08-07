@@ -805,18 +805,22 @@ class LanguageVersionTests(unittest.TestCase):
                 "invalid_workgroup.py",
             )
 
-    def test_pure_helper_rejects_propagated_storage_effects(self) -> None:
-        with self.assertRaisesRegex(CompileError, "pure helper 'copy' has Storage effects"):
-            compile_source(
-                "from vernon_dsl import *\n"
-                "@func\n"
-                "def copy(output: TensorView[f32, (dyn,), write], source: TensorView[f32, (dyn,), read]) -> None:\n"
-                "    output[0] = source[0]\n"
-                "@kernel\n"
-                "def main(output: TensorView[f32, (dyn,), write], source: TensorView[f32, (dyn,), read]) -> None:\n"
-                "    copy(output, source)\n",
-                "effectful_helper.py",
-            )
+    def test_parameter_bound_storage_helper_effects_propagate(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def copy(output: TensorView[f32, (dyn,), write], source: TensorView[f32, (dyn,), read]) -> None:\n"
+            "    output[0] = source[0]\n"
+            "@kernel\n"
+            "def main(output: TensorView[f32, (dyn,), write], source: TensorView[f32, (dyn,), read]) -> None:\n"
+            "    copy(output, source)\n",
+            "effectful_helper.py",
+        )
+        self.assertIn("func.call @copy", output)
+        self.assertIn('"vernon.load"', output)
+        self.assertIn('"vernon.store"', output)
+        self.assertIn('owner = "output"', output)
+        self.assertIn('owner = "source"', output)
 
     def test_helper_call_rejects_known_incompatible_aliases(self) -> None:
         with self.assertRaisesRegex(CompileError, "helper call 'combine' has incompatible aliased Storage effects"):
@@ -1095,7 +1099,7 @@ class LanguageVersionTests(unittest.TestCase):
             "def loop_else(limit: i32) -> i32:\n"
             "    result = 0\n"
             "    for index in range(limit):\n"
-            "        if i32(index) >= 3:\n"
+            "        if index >= 3:\n"
             "            break\n"
             "        result += 1\n"
             "    else:\n"
@@ -1119,7 +1123,7 @@ class LanguageVersionTests(unittest.TestCase):
             "    result = x\n"
             "    for outer in range(limit):\n"
             "        for inner in range(4):\n"
-            "            if i32(inner) < 2:\n"
+            "            if inner < 2:\n"
             "                continue\n"
             "            if result > 8.0:\n"
             "                return result\n"
@@ -1145,7 +1149,7 @@ class LanguageVersionTests(unittest.TestCase):
             "def total(start: i32, stop: i32, step: i32) -> i32:\n"
             "    result = 0\n"
             "    for index in range(start, stop, step):\n"
-            "        result += i32(index)\n"
+            "        result += index\n"
             "    return result\n",
             "dynamic_range.py",
         )
@@ -1163,9 +1167,23 @@ class LanguageVersionTests(unittest.TestCase):
             "    return result\n",
             "float_range.py",
         )
-        self.assertIn("arith.index_cast", float_output)
         self.assertIn("arith.sitofp", float_output)
-        self.assertNotIn("index to f32", float_output)
+        self.assertNotIn("arith.index_cast", float_output)
+
+        natural_output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def natural(width: i32) -> i32:\n"
+            "    result = 0\n"
+            "    for x in range(width):\n"
+            "        if x + 1 == width or 0 == x or x % 2 == 0:\n"
+            "            result += x\n"
+            "    return i32(f32(result))\n",
+            "natural_range.py",
+        )
+        self.assertIn("arith.remsi", natural_output)
+        self.assertIn("arith.sitofp", natural_output)
+        self.assertIn("arith.fptosi", natural_output)
 
         with self.assertRaisesRegex(CompileError, "range step must not be zero"):
             compile_source(
@@ -1174,7 +1192,7 @@ class LanguageVersionTests(unittest.TestCase):
                 "def zero_step() -> i32:\n"
                 "    result = 0\n"
                 "    for index in range(0, 4, 0):\n"
-                "        result += i32(index)\n"
+                "        result += index\n"
                 "    return result\n",
                 "zero_range.py",
             )
@@ -1186,7 +1204,7 @@ class LanguageVersionTests(unittest.TestCase):
                 "def unsigned_range(stop: u32) -> i32:\n"
                 "    result = 0\n"
                 "    for index in range(stop):\n"
-                "        result += i32(index)\n"
+                "        result += index\n"
                 "    return result\n",
                 "unsigned_range.py",
             )

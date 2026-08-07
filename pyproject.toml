@@ -89,6 +89,12 @@ select = ["E", "F", "I", "B"]
 "python/tests/pipeline_asset_fixture.py" = ["F722"]
 "python/tests/smoke_shader.py" = ["F403", "F405", "F841"]
 
+[tool.basedpyright]
+extraPaths = ["python"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
 [tool.coverage.run]
 branch = true
 source = ["python/vernon_dsl"]

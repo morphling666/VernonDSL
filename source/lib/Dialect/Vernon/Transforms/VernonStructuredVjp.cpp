@@ -9,6 +9,7 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffAnalysis.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffRules.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffTapePlanning.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonAutodiffUtils.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Pass/PassRegistry.h"
@@ -66,8 +67,6 @@ bool isValueDefinedIn(Value value, Region &region) {
     Region *owner = value.getParentRegion();
     return owner && (owner == &region || region.isAncestor(owner));
 }
-
-bool isValueDefinedDirectlyIn(Value value, Region &region) { return value.getParentRegion() == &region; }
 
 void copyProfileFunctionAttrs(func::FuncOp source, func::FuncOp target) {
     for (NamedAttribute attribute : source->getAttrs()) {
@@ -176,11 +175,69 @@ LogicalResult reverseScalarOperation(Operation &operation, OpBuilder &builder,
     return success();
 }
 
+LogicalResult lowerForToWhile(scf::ForOp source) {
+    auto yield = dyn_cast<scf::YieldOp>(source.getBody()->getTerminator());
+    if (!yield || yield.getNumOperands() != source.getInitArgs().size())
+        return source.emitError("structured VJP requires canonical scf.for iter_args");
+
+    OpBuilder builder(source);
+    SmallVector<Value> inits = {source.getLowerBound()};
+    llvm::append_range(inits, source.getInitArgs());
+    SmallVector<Type> resultTypes;
+    for (Value init : inits)
+        resultTypes.push_back(init.getType());
+    OperationState state(source.getLoc(), scf::WhileOp::getOperationName());
+    state.addOperands(inits);
+    state.addTypes(resultTypes);
+    state.addRegion();
+    state.addRegion();
+    auto target = cast<scf::WhileOp>(builder.create(state));
+
+    Block *before = new Block();
+    target.getBefore().push_back(before);
+    for (Type type : resultTypes)
+        before->addArgument(type, source.getLoc());
+    OpBuilder beforeBuilder(before, before->end());
+    Value condition = arith::CmpIOp::create(beforeBuilder, source.getLoc(), arith::CmpIPredicate::slt,
+                                            before->getArgument(0), source.getUpperBound());
+    scf::ConditionOp::create(beforeBuilder, source.getLoc(), condition, before->getArguments());
+
+    Block *after = new Block();
+    target.getAfter().push_back(after);
+    for (Type type : resultTypes)
+        after->addArgument(type, source.getLoc());
+    IRMapping mapping;
+    for (auto [sourceArgument, targetArgument] :
+         llvm::zip_equal(source.getBody()->getArguments(), after->getArguments()))
+        mapping.map(sourceArgument, targetArgument);
+    OpBuilder afterBuilder(after, after->end());
+    for (Operation &operation : source.getBody()->without_terminator())
+        afterBuilder.clone(operation, mapping);
+    SmallVector<Value> next = {
+        arith::AddIOp::create(afterBuilder, source.getLoc(), after->getArgument(0), source.getStep())};
+    for (Value value : yield.getResults())
+        next.push_back(mapping.lookup(value));
+    scf::YieldOp::create(afterBuilder, yield.getLoc(), next);
+
+    source.replaceAllUsesWith(target.getResults().drop_front());
+    source.erase();
+    return success();
+}
+
+LogicalResult normalizeStructuredLoops(func::FuncOp function) {
+    SmallVector<scf::ForOp> loops;
+    function.walk<WalkOrder::PostOrder>([&](scf::ForOp loop) { loops.push_back(loop); });
+    for (scf::ForOp loop : loops)
+        if (failed(lowerForToWhile(loop)))
+            return failure();
+    return success();
+}
+
 LogicalResult validateStructuredPhase(func::FuncOp primal, const VernonAutodiffAnalysisResult &analysis) {
     if (!llvm::hasSingleElement(primal.getBody()))
         return primal.emitError("structured VJP requires one structured entry block");
-    if (primal.getNumResults() != 1 || analysis.getActiveResultLeaves().empty() || analysis.getWrtLeaves().empty())
-        return primal.emitError("structured VJP requires one differentiable result and at least one wrt leaf");
+    if (primal.getNumResults() != 0 || analysis.getActiveResultLeaves().empty() || analysis.getWrtLeaves().empty())
+        return primal.emitError("structured VJP requires selected Storage outputs and at least one wrt leaf");
     WalkResult structured = primal.walk([&](Operation *operation) {
         if (operation->getNumRegions() != 0 && !isa<func::FuncOp, scf::IfOp, scf::WhileOp>(operation)) {
             operation->emitError("structured VJP supports only scf.if and scf.while regions");
@@ -193,29 +250,19 @@ LogicalResult validateStructuredPhase(func::FuncOp primal, const VernonAutodiffA
 
 struct DynamicRootLayout {
     SmallVector<uint64_t> invocationLeafOffsets;
-    SmallVector<uint64_t> outputLeafOffsets;
     uint64_t stride{};
     uint64_t alignment{1};
 };
 
-FailureOr<DynamicRootLayout> buildDynamicRootLayout(const VernonAutodiffTapePlan &plan,
-                                                    const ValueAbiLayout &outputLayout) {
+FailureOr<DynamicRootLayout> buildDynamicRootLayout(const VernonAutodiffTapePlan &plan) {
     SmallVector<AutodiffTapeSlot> slots;
     for (const AutodiffTapeLeaf &leaf : plan.getInvocationRecord().leaves)
         slots.push_back({leaf.size, leaf.alignment});
-    for (const ValueAbiLeaf &leaf : outputLayout.leaves) {
-        const uint64_t scalarSize = std::max<uint64_t>(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1);
-        if (leaf.scalarCount == 0 || leaf.scalarCount > std::numeric_limits<uint64_t>::max() / scalarSize)
-            return failure();
-        slots.push_back({leaf.scalarCount * scalarSize, scalarSize});
-    }
     FailureOr<AutodiffTapeLayout> layout = planAutodiffTapeLayout(slots);
     if (failed(layout) || layout->stride > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
         return failure();
     DynamicRootLayout result;
-    const size_t invocationLeaves = plan.getInvocationRecord().leaves.size();
-    result.invocationLeafOffsets.assign(layout->offsets.begin(), layout->offsets.begin() + invocationLeaves);
-    result.outputLeafOffsets.assign(layout->offsets.begin() + invocationLeaves, layout->offsets.end());
+    result.invocationLeafOffsets.assign(layout->offsets.begin(), layout->offsets.end());
     result.stride = layout->stride;
     result.alignment = layout->alignment;
     return result;
@@ -242,6 +289,10 @@ Value beginRegion(OpBuilder &builder, Location location, Value tape, Value paren
 }
 
 Value reserveRecord(OpBuilder &builder, Location location, Value region, uint64_t stride, uint64_t alignment) {
+    // Even an empty logical payload needs a distinct physical record so loop
+    // iterations and nested-region parent links retain stable identity.
+    stride = std::max<uint64_t>(stride, 1);
+    alignment = std::max<uint64_t>(alignment, 1);
     SmallVector<NamedAttribute> attributes = {
         builder.getNamedAttr("record_size", builder.getI64IntegerAttr(static_cast<int64_t>(stride))),
         builder.getNamedAttr("record_alignment", builder.getI64IntegerAttr(static_cast<int64_t>(alignment))),
@@ -382,8 +433,14 @@ private:
                                      Value handle, Value record, Region *sourceRegion = nullptr) {
         DenseSet<Value> written;
         for (const AutodiffTapeLeaf &leaf : region.record.leaves) {
-            if (sourceRegion && !isValueDefinedDirectlyIn(leaf.value, *sourceRegion))
-                continue;
+            if (sourceRegion) {
+                Value sourceValue = leaf.value;
+                Region *owningChild = sourceValue.getParentRegion();
+                while (owningChild && owningChild->getParentOp() != region.operation)
+                    owningChild = owningChild->getParentOp()->getParentRegion();
+                if (owningChild && owningChild != sourceRegion)
+                    continue;
+            }
             if (!written.insert(leaf.value).second)
                 continue;
             Value mapped = mapping.lookupOrNull(leaf.value);
@@ -480,12 +537,8 @@ private:
             return source.emitError("active scf.while has no dynamic tape plan");
         auto condition = dyn_cast<scf::ConditionOp>(source.getBefore().front().getTerminator());
         auto yield = dyn_cast<scf::YieldOp>(source.getAfter().front().getTerminator());
-        if (!condition || !yield || condition.getArgs().size() != source.getBeforeArguments().size() ||
-            yield.getResults().size() != source.getAfterArguments().size())
-            return source.emitError("structured VJP requires canonical scf.while regions");
-        for (auto [forwarded, argument] : llvm::zip_equal(condition.getArgs(), source.getBeforeArguments()))
-            if (forwarded != argument)
-                return source.emitError("structured VJP requires scf.while conditions to forward carried values");
+        if (!condition || !yield)
+            return source.emitError("structured VJP requires canonical scf.while terminators");
 
         Value handle = beginRegion(builder, source.getLoc(), tape, parentRegion, parentRecord, region->childOrdinal);
         SmallVector<Value> inits;
@@ -641,6 +694,49 @@ public:
         return success();
     }
 
+    LogicalResult initializeStorageAdjoints(OpBuilder &builder, AdjointMap &adjoints) {
+        for (const AutodiffStorageIdentity &identity : analysis.getStorageIdentities()) {
+            const ValueAbiLayout *layout = analysis.getValueAbi(identity.binding);
+            auto view = dyn_cast<TensorViewType>(identity.binding.getType());
+            if (!layout || !view)
+                return primal.emitError("Storage identity has no canonical TensorView ABI");
+            for (auto [leafIndex, leaf] : llvm::enumerate(layout->leaves)) {
+                if (!analysis.isActive(identity.binding, leafIndex))
+                    continue;
+                FailureOr<Type> scalar = getAutodiffDerivativeType(leaf.scalarType);
+                if (failed(scalar) || leaf.shape.empty())
+                    return primal.emitError("active Storage identity has no static derivative buffer shape");
+                auto bufferType = AdAdjointBufferType::get(primal.getContext(), *scalar,
+                                                           SmallVector<int64_t>(leaf.shape.begin(), leaf.shape.end()),
+                                                           static_cast<unsigned>(view.getShape().size()));
+                Value buffer = AdAdjointBufferCreateOp::create(builder, primal.getLoc(), bufferType).getBuffer();
+                storageAdjoints[{identity.id, static_cast<unsigned>(leafIndex)}] = buffer;
+            }
+        }
+        for (const AutodiffLeaf &leaf : analysis.getActiveResultLeaves()) {
+            const AutodiffStorageIdentity *identity = analysis.getStorageIdentity(leaf.value);
+            if (!identity)
+                continue;
+            Value seed = adjoints.lookup({leaf.value, leaf.abiLeafIndex});
+            Value buffer = storageAdjoints.lookup({identity->id, leaf.abiLeafIndex});
+            if (!seed || !buffer)
+                return primal.emitError("Storage objective has no invocation-local adjoint buffer");
+            AdAdjointAccumulateDenseOp::create(builder, primal.getLoc(), buffer, seed);
+            adjoints.erase({leaf.value, leaf.abiLeafIndex});
+        }
+        return success();
+    }
+
+    FailureOr<Value> freezeStorageAdjoint(OpBuilder &builder, const AutodiffLeaf &leaf) {
+        const AutodiffStorageIdentity *identity = analysis.getStorageIdentity(leaf.value);
+        if (!identity)
+            return failure();
+        Value buffer = storageAdjoints.lookup({identity->id, leaf.abiLeafIndex});
+        if (!buffer)
+            return failure();
+        return AdAdjointFreezeOp::create(builder, primal.getLoc(), leaf.derivativeType, buffer).getValue();
+    }
+
     LogicalResult reverseTopLevel(OpBuilder &builder, AdjointMap &adjoints) {
         return reverseBlock(primal.getBody().front(), builder, adjoints, rootRegion,
                             createIndexConstant(builder, primal.getLoc(), 0));
@@ -675,8 +771,14 @@ private:
                                     Region *sourceRegion = nullptr) {
         DenseSet<Value> loaded;
         for (const AutodiffTapeLeaf &leaf : region.record.leaves) {
-            if (sourceRegion && !isValueDefinedDirectlyIn(leaf.value, *sourceRegion))
-                continue;
+            if (sourceRegion) {
+                Value sourceValue = leaf.value;
+                Region *owningChild = sourceValue.getParentRegion();
+                while (owningChild && owningChild->getParentOp() != region.operation)
+                    owningChild = owningChild->getParentOp()->getParentRegion();
+                if (owningChild && owningChild != sourceRegion)
+                    continue;
+            }
             if (!loaded.insert(leaf.value).second)
                 continue;
             saved.emplace_back(leaf.value, primals.lookup(leaf.value));
@@ -709,6 +811,8 @@ private:
             for (Value operand : operation->getOperands()) {
                 if (isValueDefinedIn(operand, region))
                     continue;
+                if (isa<TensorViewType>(operand.getType()))
+                    continue;
                 const ValueAbiLayout *layout = analysis.getValueAbi(operand);
                 if (!layout)
                     continue;
@@ -720,6 +824,14 @@ private:
             }
         });
         return values;
+    }
+
+    bool hasActiveStorageEffect(Region &region) {
+        bool active = false;
+        region.walk([&](Operation *operation) {
+            active |= analysis.getStorageEffect(operation) && analysis.isActive(operation);
+        });
+        return active;
     }
 
     FailureOr<Value> materializePrimal(Value value, OpBuilder &builder) {
@@ -748,17 +860,7 @@ private:
             replacement.getType() != type.getElementType())
             return failure();
         SmallVector<Value> elements;
-        SmallVector<SmallVector<int64_t>> coordinates(1);
-        for (int64_t extent : type.getShape()) {
-            SmallVector<SmallVector<int64_t>> expanded;
-            for (const SmallVector<int64_t> &prefix : coordinates)
-                for (int64_t index = 0; index < extent; ++index) {
-                    SmallVector<int64_t> next(prefix);
-                    next.push_back(index);
-                    expanded.push_back(std::move(next));
-                }
-            coordinates = std::move(expanded);
-        }
+        SmallVector<SmallVector<int64_t>> coordinates = enumerateStaticCoordinates(type.getShape());
         for (const SmallVector<int64_t> &coordinate : coordinates) {
             SmallVector<Value> constants;
             for (int64_t index : coordinate)
@@ -775,9 +877,6 @@ private:
     }
 
     LogicalResult reverseLoad(LoadOp load, OpBuilder &builder, AdjointMap &adjoints) {
-        Value seed = adjoints.lookup({load.getResult(), 0});
-        if (!seed)
-            return success();
         SmallVector<Value> indices;
         for (Value index : load.getIndices()) {
             FailureOr<Value> materialized = materializePrimal(index, builder);
@@ -785,11 +884,23 @@ private:
                 return load.emitError("cannot materialize a dynamic TensorView load index in reverse");
             indices.push_back(*materialized);
         }
-        Value zero = zeroFor(builder, load.getLoc(), load.getStorage());
-        FailureOr<Value> contribution = replaceTensorElement(zero, indices, seed, builder, load.getLoc());
-        if (failed(contribution))
-            return load.emitError("cannot construct a TensorView load scatter contribution");
-        accumulate(builder, load.getLoc(), adjoints, load.getStorage(), 0, *contribution);
+        const AutodiffStorageEffect *effect = analysis.getStorageEffect(load);
+        const ValueAbiLayout *layout = analysis.getValueAbi(load.getResult());
+        if (!effect || !layout)
+            return load.emitError("active TensorView load has no canonical Storage effect ABI");
+        for (unsigned leafIndex = 0; leafIndex < layout->leaves.size(); ++leafIndex) {
+            Value seed = adjoints.lookup({load.getResult(), leafIndex});
+            if (!seed)
+                continue;
+            Value buffer = storageAdjoints.lookup({effect->identity, leafIndex});
+            if (!buffer && analysis.isActive(load.getStorage(), leafIndex))
+                return load.emitError("active TensorView load leaf has no Storage effect adjoint buffer");
+            if (!buffer)
+                continue;
+            SmallVector<Value> operands = {buffer, seed};
+            llvm::append_range(operands, indices);
+            createOperation(builder, load.getLoc(), AdAdjointScatterAddOp::getOperationName(), operands);
+        }
         return success();
     }
 
@@ -813,9 +924,6 @@ private:
     }
 
     LogicalResult reverseStore(StoreOp store, OpBuilder &builder, AdjointMap &adjoints) {
-        Value storageGradient = adjoints.lookup({store.getStorage(), 0});
-        if (!storageGradient)
-            storageGradient = zeroFor(builder, store.getLoc(), store.getStorage());
         SmallVector<Value> indices;
         for (Value index : store.getIndices()) {
             FailureOr<Value> materialized = materializePrimal(index, builder);
@@ -823,13 +931,28 @@ private:
                 return store.emitError("cannot materialize a dynamic TensorView store index in reverse");
             indices.push_back(*materialized);
         }
-        Value valueGradient = tensor::ExtractOp::create(builder, store.getLoc(), storageGradient, indices);
-        accumulate(builder, store.getLoc(), adjoints, store.getValue(), 0, valueGradient);
-        Value zero = createZero(builder, store.getLoc(), valueGradient.getType());
-        FailureOr<Value> priorGradient = replaceTensorElement(storageGradient, indices, zero, builder, store.getLoc());
-        if (failed(priorGradient))
-            return store.emitError("cannot functionalize TensorView store gradient overwrite");
-        adjoints[{store.getStorage(), 0}] = *priorGradient;
+        const AutodiffStorageEffect *effect = analysis.getStorageEffect(store);
+        const ValueAbiLayout *layout = analysis.getValueAbi(store.getValue());
+        if (!effect || !layout)
+            return store.emitError("active TensorView store has no canonical Storage effect ABI");
+        for (unsigned leafIndex = 0; leafIndex < layout->leaves.size(); ++leafIndex) {
+            if (!analysis.isActive(store.getValue(), leafIndex))
+                continue;
+            Value buffer = storageAdjoints.lookup({effect->identity, leafIndex});
+            if (!buffer && analysis.isActive(store.getStorage(), leafIndex))
+                return store.emitError("active TensorView store leaf has no Storage effect adjoint buffer");
+            if (!buffer)
+                continue;
+            FailureOr<Type> valueType = derivativeType(store.getValue(), leafIndex);
+            if (failed(valueType))
+                return store.emitError("cannot resolve TensorView store derivative leaf type");
+            SmallVector<Value> operands = {buffer};
+            llvm::append_range(operands, indices);
+            Value valueGradient = createOperation(builder, store.getLoc(), AdAdjointTakeAndClearOp::getOperationName(),
+                                                  operands, *valueType)
+                                      ->getResult(0);
+            accumulate(builder, store.getLoc(), adjoints, store.getValue(), leafIndex, valueGradient);
+        }
         return success();
     }
 
@@ -901,6 +1024,8 @@ private:
     LogicalResult reverseBlock(Block &block, OpBuilder &builder, AdjointMap &adjoints, Value parentRegion,
                                Value parentRecordIndex) {
         for (Operation &operation : llvm::reverse(block.without_terminator())) {
+            if (!analysis.isActive(&operation))
+                continue;
             if (auto ifOp = dyn_cast<scf::IfOp>(operation)) {
                 if (failed(reverseIf(ifOp, builder, adjoints, parentRegion, parentRecordIndex)))
                     return failure();
@@ -955,6 +1080,7 @@ private:
             return llvm::any_of(llvm::seq<unsigned>(0, layout->leaves.size()),
                                 [&](unsigned leaf) { return adjoints.contains({result, leaf}); });
         });
+        seeded |= hasActiveStorageEffect(source.getThenRegion()) || hasActiveStorageEffect(source.getElseRegion());
         if (!seeded)
             return success();
         const AutodiffTapeRegion *region = regions.lookup(source.getOperation());
@@ -1026,16 +1152,13 @@ private:
             return llvm::any_of(llvm::seq<unsigned>(0, layout->leaves.size()),
                                 [&](unsigned leaf) { return adjoints.contains({result, leaf}); });
         });
+        seeded |= hasActiveStorageEffect(source.getBefore()) || hasActiveStorageEffect(source.getAfter());
         if (!seeded)
             return success();
         const AutodiffTapeRegion *region = regions.lookup(source.getOperation());
         if (!region)
             return source.emitError("active scf.while has no reverse tape region");
-        auto condition = cast<scf::ConditionOp>(source.getBefore().front().getTerminator());
         auto yield = cast<scf::YieldOp>(source.getAfter().front().getTerminator());
-        for (auto [forwarded, argument] : llvm::zip_equal(condition.getArgs(), source.getBeforeArguments()))
-            if (forwarded != argument)
-                return source.emitError("structured reverse requires scf.while conditions to forward carried values");
 
         Value handle =
             readNestedRegion(builder, source.getLoc(), parentRegion, parentRecordIndex, region->childOrdinal);
@@ -1113,14 +1236,15 @@ private:
     Value rootRegion;
     DenseMap<Value, Value> primals;
     DenseMap<Operation *, const AutodiffTapeRegion *> regions;
+    DenseMap<std::pair<unsigned, unsigned>, Value> storageAdjoints;
 };
 
 FailureOr<func::FuncOp> createDynamicForward(func::FuncOp primal, StringRef symbol, const VernonAutodiffTapePlan &plan,
-                                             const ValueAbiLayout &outputLayout, const DynamicRootLayout &rootLayout) {
+                                             const DynamicRootLayout &rootLayout) {
     MLIRContext *context = primal.getContext();
     Type tapeType = AdTapeType::get(context);
     Type regionType = AdRegionHeaderType::get(context);
-    TupleType resultType = TupleType::get(context, {primal.getResultTypes().front(), tapeType, regionType});
+    TupleType resultType = TupleType::get(context, {tapeType, regionType});
     OpBuilder moduleBuilder(primal);
     auto forward = func::FuncOp::create(moduleBuilder, primal.getLoc(), symbol,
                                         FunctionType::get(context, primal.getArgumentTypes(), {resultType}));
@@ -1131,11 +1255,7 @@ FailureOr<func::FuncOp> createDynamicForward(func::FuncOp primal, StringRef symb
     });
     copyProfileFunctionAttrs(primal, forward);
     forward.setAllArgAttrs(primal.getAllArgAttrs());
-    SmallVector<StringRef> outputDtypes;
-    for (const ValueAbiLeaf &leaf : outputLayout.leaves)
-        outputDtypes.push_back(leaf.dtype);
-    SmallVector<DictionaryAttr> forwardResultAttrs = {
-        makeInterfaceAttrs(context, "output", "forward_result", outputDtypes, 0)};
+    SmallVector<DictionaryAttr> forwardResultAttrs = {makeInterfaceAttrs(context, "output", "forward_state", {}, 0)};
     forward.setAllResultAttrs(forwardResultAttrs);
     Block *entry = forward.addEntryBlock();
     OpBuilder builder = OpBuilder::atBlockEnd(entry);
@@ -1168,33 +1288,12 @@ FailureOr<func::FuncOp> createDynamicForward(func::FuncOp primal, StringRef symb
                                            rootLayout.invocationLeafOffsets)))
             return primal.emitError("cannot project an invocation tape value through its canonical ABI");
     }
-    auto primalReturn = cast<func::ReturnOp>(primal.getBody().front().getTerminator());
-    Value primalResult = emitter.getMapping().lookupOrNull(primalReturn.getOperand(0));
-    if (!primalResult)
-        return primal.emitError("augmented forward did not map the primal result");
-    SmallVector<AutodiffTapeLeaf> outputLeaves;
-    for (auto [index, leaf] : llvm::enumerate(outputLayout.leaves)) {
-        const uint64_t scalarSize = std::max<uint64_t>(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1);
-        outputLeaves.push_back(AutodiffTapeLeaf{
-            primalReturn.getOperand(0), static_cast<unsigned>(index), "", leaf.scalarType, leaf.dtype, leaf.scalarCount,
-            rootLayout.outputLeafOffsets[index], leaf.scalarCount * scalarSize, scalarSize});
-    }
-    if (failed(writeCanonicalTapeValue(captureBuilder, primal.getLoc(), primal->getParentOfType<ModuleOp>(), root,
-                                       rootRecord, primalResult, primalReturn.getOperand(0), outputLeaves)))
-        return primal.emitError("cannot project the structured output through its canonical ABI");
     createOperation(captureBuilder, primal.getLoc(), AdEndRegionOp::getOperationName(),
                     {root, createIndexConstant(captureBuilder, primal.getLoc(), 1),
                      createI32Constant(captureBuilder, primal.getLoc(), 0)});
     createOperation(captureBuilder, primal.getLoc(), AdCaptureYieldOp::getOperationName(), {tape, root});
 
-    FailureOr<Value> output =
-        readCanonicalTapeValue(builder, primal.getLoc(), primal->getParentOfType<ModuleOp>(), capture.getRootRegion(),
-                               createIndexConstant(builder, primal.getLoc(), 0), primalReturn.getOperand(0),
-                               outputLeaves, rootLayout.stride, rootLayout.alignment);
-    if (failed(output))
-        return primal.emitError("cannot reconstruct the structured output from canonical ABI leaves");
-    Value result =
-        createTuple(builder, primal.getLoc(), resultType, {*output, capture.getTape(), capture.getRootRegion()});
+    Value result = createTuple(builder, primal.getLoc(), resultType, {capture.getTape(), capture.getRootRegion()});
     func::ReturnOp::create(builder, primal.getLoc(), result);
     committed = true;
     return forward;
@@ -1237,14 +1336,23 @@ FailureOr<func::FuncOp> createDynamicBackward(func::FuncOp primal, StringRef sym
     if (failed(emitter.initializePrimals(builder)))
         return failure();
     AdjointMap adjoints;
-    Value returned = cast<func::ReturnOp>(primal.getBody().front().getTerminator()).getOperand(0);
     for (auto [index, leaf] : llvm::enumerate(analysis.getActiveResultLeaves()))
-        adjoints.try_emplace(AdjointKey{returned, leaf.abiLeafIndex}, entry->getArgument(index + 2));
+        adjoints.try_emplace(AdjointKey{leaf.value, leaf.abiLeafIndex}, entry->getArgument(index + 2));
+    if (failed(emitter.initializeStorageAdjoints(builder, adjoints)))
+        return failure();
     if (failed(emitter.reverseTopLevel(builder, adjoints)))
         return failure();
     SmallVector<Value> gradients;
     for (const AutodiffLeaf &leaf : analysis.getWrtLeaves()) {
-        Value gradient = adjoints.lookup({leaf.value, leaf.abiLeafIndex});
+        Value gradient;
+        if (isa<TensorViewType>(leaf.value.getType())) {
+            FailureOr<Value> storageGradient = emitter.freezeStorageAdjoint(builder, leaf);
+            if (failed(storageGradient))
+                return primal.emitError("cannot materialize wrt Storage adjoint buffer");
+            gradient = *storageGradient;
+        } else {
+            gradient = adjoints.lookup({leaf.value, leaf.abiLeafIndex});
+        }
         gradients.push_back(gradient ? gradient : createZero(builder, primal.getLoc(), leaf.derivativeType));
     }
     Value result = gradients.size() == 1
@@ -1269,12 +1377,16 @@ struct VernonStructuredVjpPass final : PassWrapper<VernonStructuredVjpPass, Oper
         StructuredVjpOptions selected = options;
         if (selected.wrtPaths.empty())
             selected.wrtPaths.assign(wrt.begin(), wrt.end());
+        if (selected.outputPaths.empty())
+            selected.outputPaths.assign(outputs.begin(), outputs.end());
         if (selected.forwardSymbol.empty())
             selected.forwardSymbol = forward;
         if (selected.backwardSymbol.empty())
             selected.backwardSymbol = backward;
-        if (selected.wrtPaths.empty() || selected.forwardSymbol.empty() || selected.backwardSymbol.empty()) {
-            getOperation().emitError("structured VJP pass requires wrt paths and forward/backward symbols");
+        if (selected.wrtPaths.empty() || selected.outputPaths.empty() || selected.forwardSymbol.empty() ||
+            selected.backwardSymbol.empty()) {
+            getOperation().emitError(
+                "structured VJP pass requires wrt paths, Storage output paths, and forward/backward symbols");
             return signalPassFailure();
         }
         SmallVector<func::FuncOp> entries;
@@ -1292,6 +1404,8 @@ struct VernonStructuredVjpPass final : PassWrapper<VernonStructuredVjpPass, Oper
 
     StructuredVjpOptions options;
     ListOption<std::string> wrt{*this, "wrt", llvm::cl::desc("Canonical scalar wrt paths"), llvm::cl::ZeroOrMore};
+    ListOption<std::string> outputs{*this, "outputs", llvm::cl::desc("Canonical Storage output paths"),
+                                    llvm::cl::ZeroOrMore};
     Option<std::string> forward{*this, "forward", llvm::cl::desc("Augmented forward symbol"), llvm::cl::init("")};
     Option<std::string> backward{*this, "backward", llvm::cl::desc("Reverse symbol"), llvm::cl::init("")};
 };
@@ -1301,45 +1415,71 @@ struct VernonStructuredVjpPass final : PassWrapper<VernonStructuredVjpPass, Oper
 FailureOr<StructuredVjpResult> buildStructuredVjp(func::FuncOp primal, const StructuredVjpOptions &options) {
     if (!primal || !primal->getParentOfType<ModuleOp>())
         return failure();
-    if (options.wrtPaths.empty() || options.forwardSymbol.empty() || options.backwardSymbol.empty())
-        return primal.emitError("structured VJP requires wrt paths and profile symbols");
+    if (options.wrtPaths.empty() || options.outputPaths.empty() || options.forwardSymbol.empty() ||
+        options.backwardSymbol.empty())
+        return primal.emitError("structured VJP requires wrt paths, Storage output paths, and profile symbols");
     if (options.forwardSymbol == options.backwardSymbol)
         return primal.emitError("structured VJP requires distinct profile symbols");
     llvm::StringSet<> uniqueWrtPaths;
     for (const std::string &path : options.wrtPaths)
         if (path.empty() || !uniqueWrtPaths.insert(path).second)
             return primal.emitError("structured VJP requires unique non-empty wrt paths");
+    llvm::StringSet<> uniqueOutputPaths;
+    for (const std::string &path : options.outputPaths)
+        if (path.empty() || !uniqueOutputPaths.insert(path).second)
+            return primal.emitError("structured VJP requires unique non-empty Storage output paths");
     ModuleOp module = primal->getParentOfType<ModuleOp>();
     if (module.lookupSymbol(options.forwardSymbol) || module.lookupSymbol(options.backwardSymbol))
         return primal.emitError("structured VJP profile symbol already exists");
 
+    func::FuncOp structuredPrimal = primal;
+    func::FuncOp normalizedPrimal;
+    bool hasFor = false;
+    primal.walk([&](scf::ForOp) { hasFor = true; });
+    if (hasFor) {
+        normalizedPrimal = cast<func::FuncOp>(primal.clone());
+        std::string normalizedSymbol = options.forwardSymbol + "__normalized_primal";
+        while (module.lookupSymbol(normalizedSymbol))
+            normalizedSymbol.push_back('_');
+        normalizedPrimal.setSymName(normalizedSymbol);
+        module.getBody()->push_back(normalizedPrimal);
+        if (failed(normalizeStructuredLoops(normalizedPrimal))) {
+            normalizedPrimal.erase();
+            return failure();
+        }
+        structuredPrimal = normalizedPrimal;
+    }
+    auto eraseNormalizedPrimal = llvm::make_scope_exit([&] {
+        if (normalizedPrimal)
+            normalizedPrimal.erase();
+    });
+
     SmallVector<StringRef> wrtPaths;
     for (const std::string &path : options.wrtPaths)
         wrtPaths.push_back(path);
+    SmallVector<StringRef> outputPaths;
+    for (const std::string &path : options.outputPaths)
+        outputPaths.push_back(path);
     VernonAutodiffRuleRegistry registry = createDefaultAutodiffRuleRegistry();
-    FailureOr<VernonAutodiffAnalysisResult> analysis = analyzeAutodiffFunction(primal, wrtPaths, registry);
-    if (failed(analysis) || failed(validateStructuredPhase(primal, *analysis)))
+    FailureOr<VernonAutodiffAnalysisResult> analysis =
+        analyzeAutodiffFunction(structuredPrimal, wrtPaths, outputPaths, registry);
+    if (failed(analysis) || failed(validateStructuredPhase(structuredPrimal, *analysis)))
         return failure();
-    FailureOr<VernonAutodiffTapePlan> plan = planAutodiffTape(primal, *analysis, registry);
+    FailureOr<VernonAutodiffTapePlan> plan = planAutodiffTape(structuredPrimal, *analysis, registry);
     if (failed(plan))
         return failure();
     for (const AutodiffTapeRegion &region : plan->getRegions())
         if (region.record.stride > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
-            return primal.emitError("structured VJP dynamic tape record is not representable");
+            return structuredPrimal.emitError("structured VJP dynamic tape record is not representable");
 
-    Value returned = cast<func::ReturnOp>(primal.getBody().front().getTerminator()).getOperand(0);
-    const ValueAbiLayout *outputLayout = analysis->getValueAbi(returned);
-    if (!outputLayout)
-        return primal.emitError("structured VJP output has no canonical Value ABI");
-    FailureOr<DynamicRootLayout> rootLayout = buildDynamicRootLayout(*plan, *outputLayout);
+    FailureOr<DynamicRootLayout> rootLayout = buildDynamicRootLayout(*plan);
     if (failed(rootLayout))
-        return primal.emitError("structured VJP root record layout overflow");
-    FailureOr<func::FuncOp> forward =
-        createDynamicForward(primal, options.forwardSymbol, *plan, *outputLayout, *rootLayout);
+        return structuredPrimal.emitError("structured VJP root record layout overflow");
+    FailureOr<func::FuncOp> forward = createDynamicForward(structuredPrimal, options.forwardSymbol, *plan, *rootLayout);
     if (failed(forward))
         return failure();
     FailureOr<func::FuncOp> backward =
-        createDynamicBackward(primal, options.backwardSymbol, *analysis, registry, *plan, *rootLayout);
+        createDynamicBackward(structuredPrimal, options.backwardSymbol, *analysis, registry, *plan, *rootLayout);
     if (failed(backward)) {
         forward->erase();
         return failure();
@@ -1347,7 +1487,7 @@ FailureOr<StructuredVjpResult> buildStructuredVjp(func::FuncOp primal, const Str
     if (failed(verify(*forward)) || failed(verify(*backward))) {
         forward->erase();
         backward->erase();
-        return primal.emitError("generated structured VJP profile failed verification");
+        return structuredPrimal.emitError("generated structured VJP profile failed verification");
     }
     primal->removeAttr(kEntryAttr);
     SmallVector<std::string> derivativeRules;
@@ -1362,7 +1502,7 @@ FailureOr<StructuredVjpResult> buildStructuredVjp(func::FuncOp primal, const Str
     if (plan->getStaticTapeBytesHint() > std::numeric_limits<uint64_t>::max() - rootLayout->stride) {
         forward->erase();
         backward->erase();
-        return primal.emitError("structured VJP tape statistics hint overflow");
+        return structuredPrimal.emitError("structured VJP tape statistics hint overflow");
     }
     const uint64_t tapeBytes = plan->getStaticTapeBytesHint() + rootLayout->stride;
     return StructuredVjpResult{*forward, *backward, tapeBytes, std::move(derivativeRules)};

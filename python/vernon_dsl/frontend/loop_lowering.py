@@ -124,9 +124,7 @@ def lower_for(emitter: LoopEmitter, node: ast.For) -> None:
     emitter._line(f"^bb0({block_arguments}):")
     for name, value_type, argument in zip(carried_names, carried_types, after_arguments, strict=True):
         emitter.environment[name] = Value(argument, value_type)
-    induction = emitter._fresh()
-    emitter._line(f"{induction} = arith.index_cast {emitter.environment[current_name].name} : i32 to index")
-    emitter.environment[node.target.id] = Value(induction, DslType("index", "index"))
+    emitter.environment[node.target.id] = emitter.environment[current_name]
     emitter.loop_controls.append(control_name)
     emit_loop_body(emitter, node.body, control_name, typed_statement.loop_depth + 1)
     emitter.loop_controls.pop()

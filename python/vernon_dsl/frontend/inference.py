@@ -453,11 +453,6 @@ class _Inference:
                         has_lod=invalid_resource.has_lod,
                     ),
                 )
-            if function_kind == "func" and any(isinstance(effect, StorageEffect) for effect in function.effects):
-                raise self.error(
-                    function.source,
-                    f"pure helper '{function.qualified_name}' has Storage effects",
-                )
             if function_kind not in ENTRY_DECORATORS | {"func"} and function.effects:
                 raise self.error(
                     function.source,
@@ -978,8 +973,7 @@ class _Inference:
                 if len(statement.iter.args) == 3 and self._is_literal_zero(statement.iter.args[2]):
                     raise self.error(statement.iter.args[2], "range step must not be zero")
                 before = environment.copy()
-                index_type = ConcreteType("index", "index")
-                loop_environment = {**before, statement.target.id: index_type}
+                loop_environment = {**before, statement.target.id: range_type}
                 loop_returns: list[InferenceType | None] = []
                 assigned = self._assigned_names(statement.body)
                 for _ in range(8):
@@ -991,7 +985,7 @@ class _Inference:
                         if merged is None:
                             raise self.error(statement, f"loop local '{name}' has incompatible types")
                         merged_environment[name] = merged
-                    next_environment = {**merged_environment, statement.target.id: index_type}
+                    next_environment = {**merged_environment, statement.target.id: range_type}
                     if next_environment == loop_environment:
                         break
                     loop_environment = next_environment

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import itertools
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,6 +30,44 @@ class AutodiffBinding:
 
 
 @dataclass(frozen=True)
+class DerivativeGroup:
+    role: str
+    declared_path: str
+    leaf_paths: tuple[str, ...]
+
+    @property
+    def parameter_root(self) -> str:
+        return self.declared_path.split(".", 1)[0]
+
+
+def derivative_groups_from_paths(
+    role: str,
+    declared_paths: tuple[str, ...],
+    leaf_paths: tuple[str, ...],
+) -> tuple[DerivativeGroup, ...]:
+    if len(set(declared_paths)) != len(declared_paths):
+        raise ValueError(f"{role} derivative group paths must be unique")
+    if len(set(leaf_paths)) != len(leaf_paths):
+        raise ValueError(f"{role} derivative leaf paths must be unique")
+    groups: list[DerivativeGroup] = []
+    consumed: set[str] = set()
+    for declared_path in declared_paths:
+        components = declared_path.split(".")
+        leaves = tuple(path for path in leaf_paths if path.split(".")[: len(components)] == components)
+        if not leaves:
+            raise ValueError(f"{role} path '{declared_path}' has no reflected derivative leaves")
+        overlap = consumed.intersection(leaves)
+        if overlap:
+            raise ValueError(f"{role} derivative leaf '{next(iter(overlap))}' belongs to multiple groups")
+        consumed.update(leaves)
+        groups.append(DerivativeGroup(role, declared_path, leaves))
+    if consumed != set(leaf_paths):
+        unexpected = sorted(set(leaf_paths) - consumed)
+        raise ValueError(f"unowned {role} derivative leaf '{unexpected[0]}'")
+    return tuple(groups)
+
+
+@dataclass(frozen=True)
 class AutodiffProfile:
     name: str
     symbol: str
@@ -53,6 +92,7 @@ class AutodiffProfilePlan:
     derivative_rules_version: int
     launch: LaunchPlan
     profiles: tuple[AutodiffProfile, ...]
+    derivative_groups: tuple[DerivativeGroup, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -95,6 +135,19 @@ def _gradient_type(value_type: ConcreteType) -> ConcreteType:
     raise ValueError(f"{value_type.mlir} is not one differentiable ABI leaf")
 
 
+def _structured_derivative_type(value_type: ConcreteType, access: str) -> ConcreteType:
+    if value_type.kind != "tensor_view":
+        return _gradient_type(value_type)
+    element, shape, _, address_space = value_type.arguments
+    if not isinstance(element, ConcreteType) or not isinstance(shape, tuple):
+        raise ValueError("TensorView derivative type is unresolved")
+    return ConcreteType(
+        "tensor_view",
+        "TensorView",
+        (_gradient_type(element), shape, access, address_space),
+    )
+
+
 def _leaves(
     value_type: ConcreteType,
     structs: dict[str, tuple[tuple[str, ConcreteType], ...]],
@@ -121,6 +174,55 @@ def _leaves(
     return ()
 
 
+def _structured_leaves(
+    value_type: ConcreteType,
+    structs: dict[str, tuple[tuple[str, ConcreteType], ...]],
+    prefix: tuple[str, ...],
+) -> tuple[tuple[str, ConcreteType], ...]:
+    if value_type.kind != "tensor_view":
+        return _leaves(value_type, structs, prefix)
+    element, shape, access, address_space = value_type.arguments
+    if not isinstance(element, ConcreteType) or not isinstance(shape, tuple):
+        return ()
+
+    def element_leaves(current: ConcreteType, path: tuple[str, ...]) -> tuple[tuple[str, ConcreteType], ...]:
+        if current.kind == "tensor":
+            child = current.arguments[0]
+            dimensions = current.arguments[1:]
+            if not isinstance(child, ConcreteType) or any(not isinstance(extent, int) for extent in dimensions):
+                return ()
+            static_dimensions = tuple(extent for extent in dimensions if isinstance(extent, int))
+            terminal = child
+            while terminal.kind == "tensor" and isinstance(terminal.arguments[0], ConcreteType):
+                terminal = terminal.arguments[0]
+            if terminal.kind == "scalar":
+                return ((".".join(path), current),) if terminal.is_float else ()
+            return tuple(
+                leaf
+                for coordinate in itertools.product(*(range(extent) for extent in static_dimensions))
+                for leaf in element_leaves(child, (*path, *(str(index) for index in coordinate)))
+            )
+        if current.kind == "tuple":
+            return tuple(
+                leaf
+                for index, child in enumerate(current.arguments)
+                if isinstance(child, ConcreteType)
+                for leaf in element_leaves(child, (*path, str(index)))
+            )
+        if current.kind == "struct":
+            return tuple(leaf for name, child in structs[current.name] for leaf in element_leaves(child, (*path, name)))
+        return ((".".join(path), current),) if current.kind == "scalar" and current.is_float else ()
+
+    resolved_element_leaves = element_leaves(element, prefix)
+    return tuple(
+        (
+            path,
+            ConcreteType("tensor_view", "TensorView", (leaf_type, shape, access, address_space)),
+        )
+        for path, leaf_type in resolved_element_leaves
+    )
+
+
 def _resolve_path(
     path: str,
     parameters: dict[str, ConcreteType],
@@ -128,6 +230,12 @@ def _resolve_path(
 ) -> ConcreteType:
     components = path.split(".")
     value_type = parameters[components[0]]
+    view_arguments = value_type.arguments[1:] if value_type.kind == "tensor_view" else None
+    if view_arguments is not None and len(components) > 1:
+        element = value_type.arguments[0]
+        if not isinstance(element, ConcreteType):
+            raise ValueError(f"unresolved TensorView path {path!r}")
+        value_type = element
     for component in components[1:]:
         if value_type.kind == "struct":
             value_type = dict(structs[value_type.name])[component]
@@ -138,6 +246,8 @@ def _resolve_path(
             value_type = nested
         else:
             raise ValueError(f"path {path!r} does not resolve to an aggregate Value")
+    if view_arguments is not None and len(components) > 1:
+        value_type = ConcreteType("tensor_view", "TensorView", (value_type, *view_arguments))
     return value_type
 
 
@@ -281,56 +391,86 @@ def build_structured_profile_plan(
     workgroup_size: tuple[int, int, int],
 ) -> AutodiffProfilePlan:
     """Build profile metadata without constructing the legacy AD program graph."""
-    if entry.result_type is None:
-        raise ValueError("structured VJP requires a result")
     parameters = {parameter.name: parameter.type for parameter in entry.parameters}
-    cotangents = tuple(
-        AutodiffBinding(path, _gradient_type(value_type).mlir, "cotangent")
-        for path, value_type in _leaves(entry.result_type, structs, ("output",))
-    )
-    if not cotangents:
-        raise ValueError("structured VJP result has no differentiable leaves")
-    gradients = tuple(
-        AutodiffBinding(leaf_path, _gradient_type(value_type).mlir, "gradient")
-        for leaf_path, value_type in sorted(
-            (
-                leaf
-                for wrt_path in transform.wrt
-                for leaf in _leaves(
-                    _resolve_path(wrt_path, parameters, structs),
-                    structs,
-                    tuple(wrt_path.split(".")),
-                )
+    cotangent_leaves = tuple(
+        (
+            path,
+            _structured_leaves(
+                _resolve_path(path, parameters, structs),
+                structs,
+                tuple(path.split(".")),
             ),
+        )
+        for path in transform.output_cotangents
+    )
+    cotangents = tuple(
+        AutodiffBinding(leaf_path, _structured_derivative_type(leaf_type, "read").mlir, "cotangent")
+        for _, leaves in cotangent_leaves
+        for leaf_path, leaf_type in leaves
+    )
+    gradient_leaves = tuple(
+        (
+            path,
+            _structured_leaves(
+                _resolve_path(path, parameters, structs),
+                structs,
+                tuple(path.split(".")),
+            ),
+        )
+        for path in transform.wrt
+    )
+    gradients = tuple(
+        AutodiffBinding(
+            leaf_path,
+            _structured_derivative_type(value_type, "write").mlir,
+            "gradient",
+        )
+        for leaf_path, value_type in sorted(
+            (leaf for _, leaves in gradient_leaves for leaf in leaves),
             key=lambda leaf: leaf[0],
         )
     )
+    derivative_groups = derivative_groups_from_paths(
+        "gradient",
+        transform.wrt,
+        tuple(binding.path for binding in gradients),
+    ) + derivative_groups_from_paths(
+        "cotangent",
+        transform.output_cotangents,
+        tuple(binding.path for binding in cotangents),
+    )
+    if not cotangents:
+        raise ValueError("structured VJP result has no differentiable leaves")
     if not gradients:
         raise ValueError("structured VJP wrt paths have no differentiable leaves")
+    gradient_group_by_leaf = {leaf_path: path for path, leaves in gradient_leaves for leaf_path, _ in leaves}
 
     def gradient_source(path: str) -> ConcreteType:
-        wrt_path = next(
-            candidate for candidate in transform.wrt if path == candidate or path.startswith(candidate + ".")
-        )
-        return _resolve_path(wrt_path, parameters, structs)
+        return _resolve_path(gradient_group_by_leaf[path], parameters, structs)
 
     def gradient_evidence(path: str) -> tuple[tuple[AccessPatternEvidence, ...], tuple[int, ...]]:
         source = gradient_source(path)
         if source.kind != "tensor_view":
             return (AccessPatternEvidence.SHARED_VALUE,), ()
-        wrt_path = next(
-            candidate for candidate in transform.wrt if path == candidate or path.startswith(candidate + ".")
-        )
+        wrt_path = gradient_group_by_leaf[path]
         return _tensor_view_evidence(entry, wrt_path.split(".", 1)[0])
 
-    def accumulation_plan(gradient: AutodiffBinding) -> AccumulationPlan:
-        source = gradient_source(gradient.path)
-        evidence, invocation_axes = gradient_evidence(gradient.path)
+    def accumulation_plan(wrt_path: str) -> AccumulationPlan:
+        source = _resolve_path(wrt_path, parameters, structs)
+        group_leaf_paths = dict(gradient_leaves)[wrt_path]
+        evidence_sets = tuple(gradient_evidence(path) for path, _ in group_leaf_paths)
+        evidence = tuple(
+            sorted(
+                {item for items, _ in evidence_sets for item in items},
+                key=lambda item: item.value,
+            )
+        )
+        axes = tuple(sorted({axis for _, item_axes in evidence_sets for axis in item_axes}))
         return AccumulationPlan(
-            gradient.path,
+            wrt_path,
             AccumulationMode.SCATTER_ADD if source.kind == "tensor_view" else AccumulationMode.REDUCE_SUM,
             evidence,
-            invocation_axes,
+            axes,
         )
 
     program_identity = hashlib.sha256(primal_mlir.encode("utf-8")).hexdigest()
@@ -339,23 +479,19 @@ def build_structured_profile_plan(
         for parameter in entry.parameters
         if parameter.builtin is None
     )
-    output_type = entry.result_type
     profile_symbols = structured_profile_symbols(transform, entry, primal_mlir)
     profiles = (
         AutodiffProfile(
             "primal",
             profile_symbols[0],
             primal_inputs,
-            (AutodiffBinding("output", output_type.mlir, "primal"),),
+            (),
         ),
         AutodiffProfile(
             "forward_with_tape",
             profile_symbols[1],
             primal_inputs,
-            (
-                AutodiffBinding("output", output_type.mlir, "primal"),
-                AutodiffBinding("tape", f"!vernon.ad_tape<{tape_bytes}>", "tape"),
-            ),
+            (AutodiffBinding("tape", f"!vernon.ad_tape<{tape_bytes}>", "tape"),),
         ),
         AutodiffProfile(
             "backward",
@@ -375,9 +511,10 @@ def build_structured_profile_plan(
         transform.derivative_rules_version,
         LaunchPlan(
             workgroup_size,
-            tuple(accumulation_plan(gradient) for gradient in gradients),
+            tuple(accumulation_plan(wrt_path) for wrt_path in transform.wrt),
         ),
         profiles,
+        derivative_groups,
     )
 
 
@@ -395,7 +532,9 @@ __all__ = [
     "AutodiffBinding",
     "AutodiffProfile",
     "AutodiffProfilePlan",
+    "DerivativeGroup",
     "build_autodiff_profile_plan",
     "build_structured_profile_plan",
+    "derivative_groups_from_paths",
     "structured_profile_symbols",
 ]

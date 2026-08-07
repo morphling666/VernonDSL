@@ -12,6 +12,42 @@
 #include <tuple>
 
 namespace vernon::runtime {
+namespace {
+
+bool buildDerivativeGroups(const std::vector<std::string> &declared, const std::vector<std::string> &leaves,
+                           AutodiffDerivativeRole role, std::vector<AutodiffDerivativeGroup> &groups) {
+    if (std::set<std::string>(leaves.begin(), leaves.end()).size() != leaves.size())
+        return false;
+    std::vector<std::vector<std::string>> groupedLeaves(declared.size());
+    for (const std::string &leaf : leaves) {
+        if (!isCanonicalAutodiffPath(leaf))
+            return false;
+        std::optional<size_t> matched;
+        for (size_t index = 0; index < declared.size(); ++index) {
+            const std::string &path = declared[index];
+            const bool contains = leaf == path || (leaf.size() > path.size() &&
+                                                   leaf.compare(0, path.size(), path) == 0 && leaf[path.size()] == '.');
+            if (!contains)
+                continue;
+            if (matched)
+                return false;
+            matched = index;
+        }
+        if (!matched)
+            return false;
+        groupedLeaves[*matched].push_back(leaf);
+    }
+    if (std::any_of(groupedLeaves.begin(), groupedLeaves.end(),
+                    [](const std::vector<std::string> &group) { return group.empty(); }))
+        return false;
+    for (size_t index = 0; index < declared.size(); ++index) {
+        const std::string &path = declared[index];
+        groups.push_back(AutodiffDerivativeGroup{role, path, std::move(groupedLeaves[index])});
+    }
+    return true;
+}
+
+} // namespace
 
 std::optional<VernonTextureDimension> pipelineTextureDimension(const std::string &dimension) {
     if (dimension == "2d")
@@ -1482,29 +1518,29 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
             error = "pipeline program_transform is invalid";
         return false;
     }
+    std::vector<std::string> wrt;
     for (const nlohmann::json &path : transform["wrt"]) {
-        if (!path.is_string() || path.get_ref<const std::string &>().empty()) {
+        if (!path.is_string() || !isCanonicalAutodiffPath(path.get_ref<const std::string &>())) {
             error = "pipeline program_transform wrt paths are invalid";
             return false;
         }
-        manifest.wrt.push_back(path.get<std::string>());
+        wrt.push_back(path.get<std::string>());
     }
-    if (manifest.wrt.empty() || !std::is_sorted(manifest.wrt.begin(), manifest.wrt.end()) ||
-        std::adjacent_find(manifest.wrt.begin(), manifest.wrt.end()) != manifest.wrt.end()) {
+    if (wrt.empty() || !std::is_sorted(wrt.begin(), wrt.end()) ||
+        std::adjacent_find(wrt.begin(), wrt.end()) != wrt.end()) {
         error = "pipeline program_transform wrt paths are not canonical";
         return false;
     }
+    std::vector<std::string> outputCotangents;
     for (const nlohmann::json &path : transform["output_cotangents"]) {
-        if (!path.is_string() || path.get_ref<const std::string &>().empty()) {
+        if (!path.is_string() || !isCanonicalAutodiffPath(path.get_ref<const std::string &>())) {
             error = "pipeline program_transform output cotangent paths are invalid";
             return false;
         }
-        manifest.outputCotangents.push_back(path.get<std::string>());
+        outputCotangents.push_back(path.get<std::string>());
     }
-    if (manifest.outputCotangents.empty() ||
-        !std::is_sorted(manifest.outputCotangents.begin(), manifest.outputCotangents.end()) ||
-        std::adjacent_find(manifest.outputCotangents.begin(), manifest.outputCotangents.end()) !=
-            manifest.outputCotangents.end()) {
+    if (outputCotangents.empty() || !std::is_sorted(outputCotangents.begin(), outputCotangents.end()) ||
+        std::adjacent_find(outputCotangents.begin(), outputCotangents.end()) != outputCotangents.end()) {
         error = "pipeline program_transform output cotangent paths are not canonical";
         return false;
     }
@@ -1519,6 +1555,8 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
         return false;
     }
     manifest.profilesIdentity = profiles["identity"].get<std::string>();
+    std::vector<std::string> gradientPaths;
+    std::vector<std::string> cotangentPaths;
     for (const nlohmann::json &value : profiles["variants"]) {
         if (!value.is_object() || !hasOnlyKeys(value, {"key", "plan", "programs"}) || !value.contains("key") ||
             !value["key"].is_array() || !value.contains("plan") || !value["plan"].is_object() ||
@@ -1558,7 +1596,7 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
         if (!hasOnlyKeys(launch, {"workgroup_size", "accumulation_plans"}) || !launch.contains("workgroup_size") ||
             !parseLaunchSize(launch["workgroup_size"], variant.launch.workgroupSize) ||
             !launch.contains("accumulation_plans") || !launch["accumulation_plans"].is_array() ||
-            launch["accumulation_plans"].size() != manifest.wrt.size()) {
+            launch["accumulation_plans"].size() != wrt.size()) {
             error = "autodiff launch plan is invalid";
             return false;
         }
@@ -1624,12 +1662,13 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
             accumulationPaths.push_back(accumulation.path);
             variant.launch.accumulationPlans.push_back(std::move(accumulation));
         }
-        if (accumulationPaths != manifest.wrt) {
+        if (accumulationPaths != wrt) {
             error = "autodiff launch resources do not match the transform";
             return false;
         }
         static constexpr std::string_view expectedNames[] = {"primal", "forward_with_tape", "backward"};
         std::vector<std::string> variantGradientPaths;
+        std::vector<std::string> variantCotangentPaths;
         for (size_t index = 0; index < 3; ++index) {
             const nlohmann::json &profile = plan["profiles"][index];
             if (!profile.is_object() || !hasOnlyKeys(profile, {"name", "symbol", "inputs", "outputs"}) ||
@@ -1642,7 +1681,7 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
             auto validBindings = [&](const nlohmann::json &bindings) {
                 return std::all_of(bindings.begin(), bindings.end(), [](const nlohmann::json &binding) {
                     return binding.is_object() && hasOnlyKeys(binding, {"path", "type", "role"}) &&
-                           !binding.value("path", "").empty() && !binding.value("type", "").empty() &&
+                           isCanonicalAutodiffPath(binding.value("path", "")) && !binding.value("type", "").empty() &&
                            !binding.value("role", "").empty();
                 });
             };
@@ -1656,15 +1695,14 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
                     error = "autodiff backward tape binding is invalid";
                     return false;
                 }
-                std::vector<std::string> cotangentPaths;
                 for (size_t binding = 1; binding < inputs.size(); ++binding) {
                     if (inputs[binding].value("role", "") != "cotangent") {
                         error = "autodiff backward cotangent binding is invalid";
                         return false;
                     }
-                    cotangentPaths.push_back(inputs[binding].value("path", ""));
+                    variantCotangentPaths.push_back(inputs[binding].value("path", ""));
                 }
-                if (cotangentPaths != manifest.outputCotangents) {
+                if (variantCotangentPaths.empty()) {
                     error = "autodiff backward cotangents do not match program transform";
                     return false;
                 }
@@ -1684,10 +1722,16 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
                 }
             }
         }
-        if (manifest.gradientPaths.empty())
-            manifest.gradientPaths = variantGradientPaths;
-        else if (manifest.gradientPaths != variantGradientPaths) {
+        if (gradientPaths.empty())
+            gradientPaths = variantGradientPaths;
+        else if (gradientPaths != variantGradientPaths) {
             error = "autodiff variants expose inconsistent gradient paths";
+            return false;
+        }
+        if (cotangentPaths.empty())
+            cotangentPaths = variantCotangentPaths;
+        else if (cotangentPaths != variantCotangentPaths) {
+            error = "autodiff variants expose inconsistent cotangent paths";
             return false;
         }
         const nlohmann::json &programs = value["programs"];
@@ -1714,6 +1758,15 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
         error = "autodiff profile table is empty";
         return false;
     }
+    manifest.derivativeGroups.clear();
+    if (!buildDerivativeGroups(wrt, gradientPaths, AutodiffDerivativeRole::Gradient, manifest.derivativeGroups) ||
+        !buildDerivativeGroups(outputCotangents, cotangentPaths, AutodiffDerivativeRole::Cotangent,
+                               manifest.derivativeGroups)) {
+        error = "autodiff derivative groups are inconsistent";
+        return false;
+    }
+    if (!validateAutodiffDerivativeGroups(manifest.derivativeGroups, error))
+        return false;
     std::sort(manifest.variants.begin(), manifest.variants.end(),
               [](const AutodiffVariant &left, const AutodiffVariant &right) { return left.key < right.key; });
     if (std::adjacent_find(manifest.variants.begin(), manifest.variants.end(),

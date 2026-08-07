@@ -52,16 +52,16 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
                (2.0 * epsilon);
     };
     auto runCase = [&](float x, float y, float z) {
+        const uint64_t outputShape[]{1};
+        float outputValue{};
         VernonAdValue inputValues[] = {
             {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), {}},
             {sizeof(VernonAdValue), {"y", 1}, VERNON_DATA_F32, &y, sizeof(y), {}},
             {sizeof(VernonAdValue), {"z", 1}, VERNON_DATA_F32, &z, sizeof(z), {}},
+            {sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &outputValue, sizeof(outputValue), 1, outputShape},
         };
-        float outputValue{};
-        VernonAdValue output{sizeof(VernonAdValue), {"output", 6},       VERNON_DATA_F32,
-                             &outputValue,          sizeof(outputValue), {}};
-        VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, 3, {}};
-        VernonAdValueSet outputs{sizeof(VernonAdValueSet), &output, 1, {}};
+        VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, 4, {}};
+        VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
         VernonPullback *pullback = nullptr;
         ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
             << lastError(context);
@@ -69,7 +69,9 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
         EXPECT_NEAR(outputValue, objective(x, y, z), 2e-5);
 
         float seedValue = 1.75f;
-        VernonAdValue seed{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &seedValue, sizeof(seedValue), {}};
+        const uint64_t seedShape[]{1};
+        VernonAdValue seed{
+            sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &seedValue, sizeof(seedValue), 1, seedShape};
         VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seed, 1, {}};
         float gradientValuesStorage[3]{};
         VernonAdValue gradientValues[] = {
@@ -94,26 +96,25 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
     float x = 1.2f;
     float y = 0.7f;
     float z = 0.2f;
+    float outputValue{};
+    const uint64_t outputShape[]{1};
     VernonAdValue inputValues[] = {
         {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), 0, nullptr},
         {sizeof(VernonAdValue), {"y", 1}, VERNON_DATA_F32, &y, sizeof(y), 0, nullptr},
         {sizeof(VernonAdValue), {"z", 1}, VERNON_DATA_F32, &z, sizeof(z), 0, nullptr},
+        {sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &outputValue, sizeof(outputValue), 1, outputShape},
     };
-    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, 3, {0, 0, 0, 0}};
-    float outputValues[2]{};
-    const uint64_t invocationShape[]{1, 1, 2};
-    VernonAdValue output{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, outputValues, sizeof(outputValues), 3,
-                         invocationShape};
-    VernonAdValueSet outputs{sizeof(VernonAdValueSet), &output, 1, {0, 0, 0, 0}};
+    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, 4, {0, 0, 0, 0}};
+    VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {0, 0, 0, 0}};
     VernonPullback *pullback = nullptr;
     ASSERT_EQ(vernonAdPipelineForward(pipeline, {2, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
         << lastError(context);
     ASSERT_NE(pullback, nullptr);
-    EXPECT_NEAR(outputValues[0], objective(x, y, z), 2e-5);
-    EXPECT_NEAR(outputValues[1], objective(x, y, z), 2e-5);
+    EXPECT_NEAR(outputValue, objective(x, y, z), 2e-5);
 
     float seedValues[]{1.0f, 2.0f};
-    VernonAdValue seed{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seedValues, sizeof(seedValues), 3,
+    const uint64_t invocationShape[]{1, 1, 2, 1};
+    VernonAdValue seed{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seedValues, sizeof(seedValues), 4,
                        invocationShape};
     VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seed, 1, {0, 0, 0, 0}};
     float gradientStorage[3]{};

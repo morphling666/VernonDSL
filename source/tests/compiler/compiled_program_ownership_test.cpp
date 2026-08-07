@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 #include <string_view>
+#include <vector>
 
 namespace {
 
@@ -58,4 +59,32 @@ TEST(CompiledProgramOwnership, OutlivesCompilerContext) {
     ASSERT_TRUE(!vernonCompileResultGetCpuEntry(program, "missing", 7));
 
     vernonCompileResultDestroy(program);
+}
+
+TEST(CompiledProgramOwnership, MultipleResultsOutliveOneCompilerContext) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileOptions options{};
+    options.struct_size = sizeof(options);
+    options.target = VERNON_TARGET_CPU;
+    std::vector<VernonCompileResult *> programs;
+    for (unsigned index = 0; index < 12; ++index) {
+        VernonCompileResult *program =
+            vernonCompilerCompileMlirWithOptions(compiler, module.data(), module.size(), &options);
+        ASSERT_TRUE(program);
+        ASSERT_EQ(vernonCompileResultGetStatus(program), VERNON_STATUS_OK);
+        programs.push_back(program);
+    }
+    vernonCompilerDestroy(compiler);
+
+    for (VernonCompileResult *program : programs) {
+        VernonCpuEntryPoint entry = vernonCompileResultGetCpuEntry(program, "add_vectors", 11);
+        ASSERT_TRUE(entry);
+        float arguments[8] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+        float results[4]{};
+        VernonCpuInvocation invocation{arguments, sizeof(arguments), results, sizeof(results), nullptr};
+        ASSERT_EQ(entry(&invocation), VERNON_STATUS_OK);
+        EXPECT_EQ(results[0], 6.0f);
+        vernonCompileResultDestroy(program);
+    }
 }

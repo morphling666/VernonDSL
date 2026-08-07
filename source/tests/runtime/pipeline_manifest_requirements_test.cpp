@@ -72,6 +72,12 @@ nlohmann::json validAutodiffManifest() {
     return {{"program_transform", std::move(transform)}, {"autodiff_profiles", std::move(profiles)}};
 }
 
+void refreshAutodiffPlanIdentity(nlohmann::json &root) {
+    nlohmann::json &plan = root["autodiff_profiles"]["variants"][0]["plan"];
+    plan = refreshIdentity(std::move(plan));
+    root["autodiff_profiles"] = refreshIdentity(std::move(root["autodiff_profiles"]));
+}
+
 nlohmann::json validTensorVariant() {
     return {{"key", nlohmann::json::array()},
             {"program", {{"compute", "compute.spv"}}},
@@ -122,9 +128,13 @@ TEST(PipelineManifestRequirements, ParsesCanonicalAutodiffProfiles) {
     const nlohmann::json root = validAutodiffManifest();
     ASSERT_TRUE(parseAutodiffManifest(root, manifest, error)) << error;
     EXPECT_EQ(manifest.protocol, "dynamic_v2");
-    EXPECT_EQ(manifest.wrt, std::vector<std::string>{"x"});
-    EXPECT_EQ(manifest.outputCotangents, std::vector<std::string>{"output"});
-    EXPECT_EQ(manifest.gradientPaths, std::vector<std::string>{"x"});
+    ASSERT_EQ(manifest.derivativeGroups.size(), 2u);
+    EXPECT_EQ(manifest.derivativeGroups[0].role, vernon::runtime::AutodiffDerivativeRole::Gradient);
+    EXPECT_EQ(manifest.derivativeGroups[0].declaredPath, "x");
+    EXPECT_EQ(manifest.derivativeGroups[0].leafPaths, std::vector<std::string>{"x"});
+    EXPECT_EQ(manifest.derivativeGroups[1].role, vernon::runtime::AutodiffDerivativeRole::Cotangent);
+    EXPECT_EQ(manifest.derivativeGroups[1].declaredPath, "output");
+    EXPECT_EQ(manifest.derivativeGroups[1].leafPaths, std::vector<std::string>{"output"});
     ASSERT_EQ(manifest.variants.size(), 1u);
     EXPECT_EQ(manifest.variants[0].forwardWithTape, "forward");
     EXPECT_EQ(manifest.variants[0].backward, "backward");
@@ -175,6 +185,56 @@ TEST(PipelineManifestRequirements, RejectsIncompleteOrTamperedAutodiffProfiles) 
     manifest = {};
     EXPECT_FALSE(parseAutodiffManifest(root, manifest, error));
     EXPECT_NE(error.find("identity"), std::string::npos);
+}
+
+TEST(PipelineManifestRequirements, RejectsNonCanonicalAutodiffPaths) {
+    using vernon::runtime::AutodiffManifest;
+    using vernon::runtime::parseAutodiffManifest;
+    AutodiffManifest manifest;
+    std::string error;
+
+    nlohmann::json root = validAutodiffManifest();
+    root["autodiff_profiles"]["variants"][0]["plan"]["profiles"][2]["inputs"][1]["path"] = "output..mass";
+    refreshAutodiffPlanIdentity(root);
+    EXPECT_FALSE(parseAutodiffManifest(root, manifest, error));
+    EXPECT_NE(error.find("bindings"), std::string::npos);
+}
+
+TEST(PipelineManifestRequirements, ValidatesCanonicalDerivativeGroupsAndRejectsDivergentMetadata) {
+    using namespace vernon::runtime;
+    std::string error;
+    const std::vector<AutodiffDerivativeGroup> canonical{
+        {AutodiffDerivativeRole::Gradient, "x", {"x.mass", "x.velocity"}},
+        {AutodiffDerivativeRole::Cotangent, "output", {"output.mass", "output.velocity"}},
+    };
+    EXPECT_TRUE(validateAutodiffDerivativeGroups(canonical, error)) << error;
+
+    std::vector<AutodiffDerivativeGroup> invalid = canonical;
+    std::swap(invalid[0], invalid[1]);
+    error.clear();
+    EXPECT_FALSE(validateAutodiffDerivativeGroups(invalid, error));
+    EXPECT_NE(error.find("role order"), std::string::npos);
+
+    invalid = {
+        {AutodiffDerivativeRole::Gradient, "x", {"x.mass"}},
+        {AutodiffDerivativeRole::Gradient, "x.mass", {"x.mass.value"}},
+        {AutodiffDerivativeRole::Cotangent, "output", {"output.mass"}},
+    };
+    error.clear();
+    EXPECT_FALSE(validateAutodiffDerivativeGroups(invalid, error));
+    EXPECT_NE(error.find("exactly one declared owner"), std::string::npos);
+
+    invalid = canonical;
+    invalid[1].leafPaths = {"output..mass"};
+    error.clear();
+    EXPECT_FALSE(validateAutodiffDerivativeGroups(invalid, error));
+    EXPECT_NE(error.find("leaves"), std::string::npos);
+
+    invalid = canonical;
+    invalid[1].leafPaths = {"output.a速"};
+    error.clear();
+    EXPECT_FALSE(validateAutodiffDerivativeGroups(invalid, error));
+    EXPECT_NE(error.find("leaves"), std::string::npos);
 }
 
 TEST(PipelineManifestRequirements, ParsesEveryRuntimeBackendShape) {

@@ -2,9 +2,9 @@
 
 ## Status
 
-Implementation progress is tracked only in
-[`autodiff-task-list.md`](autodiff-task-list.md). This document records
-architecture decisions and does not maintain completion state.
+This document records architecture decisions and does not maintain completion
+state. Current behavior and remaining work live in
+[`autodiff.md`](autodiff.md) and [`roadmap.md`](roadmap.md).
 
 This document records the prerequisite architecture work for dynamic
 control-flow autodiff. It supersedes attempts to add dynamic regions directly
@@ -250,11 +250,10 @@ Existing `vernon.reduce_sum` and `vernon.scatter_add` are good abstraction
 boundaries. Their target strategy remains owned by
 `VernonLowerAccumulation.cpp`.
 
-## 8. Implementation tracking
+## 8. Implementation boundary
 
-The authoritative implementation order and completion state are maintained in
-[`autodiff-task-list.md`](autodiff-task-list.md). The checklist preserves the
-dependency order established by this architecture.
+Current implementation status is summarized in [`autodiff.md`](autodiff.md);
+remaining product work is tracked in [`roadmap.md`](roadmap.md).
 
 ## 9. Acceptance
 

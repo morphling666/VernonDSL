@@ -21,6 +21,15 @@ def main() -> None:
 
     vd.init(arch=vd.cpu)
 
+    def run(program, *arguments, dtype=vd.f32, grid=(1, 1, 1)):
+        objective = vd.storage.zeros(dtype=dtype, shape=(1,))
+        result, pullback = program(*arguments, objective, grid=grid)
+        assert result is None
+        return objective.to_numpy()[0], pullback
+
+    def scalar_cotangent(value) -> np.ndarray:
+        return np.asarray([value], dtype=np.float32)
+
     def reference(x: float, y: float, z: float) -> float:
         linear = x + y
         difference = x - y
@@ -53,7 +62,8 @@ def main() -> None:
     rng = np.random.default_rng(0xAD2026)
     for x, y, z in ((1.2, 0.7, 0.2), (0.8, 0.3, 0.6)):
         expected = finite_gradients(x, y, z)
-        output, pullback = asset.program(
+        output, pullback = run(
+            asset.program,
             np.float32(x),
             np.float32(y),
             np.float32(z),
@@ -67,7 +77,7 @@ def main() -> None:
             np.testing.assert_allclose(gradients[name], expected[name], rtol=3.0e-3, atol=3.0e-3)
 
         seed = np.float32(rng.uniform(-2.0, 2.0))
-        reused = pullback(seed)
+        reused = pullback(scalar_cotangent(seed))
         for name in expected:
             np.testing.assert_allclose(
                 reused[name],
@@ -82,13 +92,14 @@ def main() -> None:
         z = float(rng.uniform(0.1, 0.75))
         seed = np.float32(rng.uniform(-2.0, 2.0))
         expected = finite_gradients(x, y, z)
-        _, randomized_pullback = asset.program(
+        _, randomized_pullback = run(
+            asset.program,
             np.float32(x),
             np.float32(y),
             np.float32(z),
             grid=(1, 1, 1),
         )
-        randomized_gradients = randomized_pullback(seed)
+        randomized_gradients = randomized_pullback(scalar_cotangent(seed))
         for name in expected:
             np.testing.assert_allclose(
                 randomized_gradients[name],
@@ -125,7 +136,8 @@ def main() -> None:
         (1.0e-7, 3, 1.0e-7, 1.0),
         (-1.0e-7, 3, 1.0e-7, -1.0),
     ):
-        boundary_output, boundary_pullback = boundary_unary_program(
+        boundary_output, boundary_pullback = run(
+            boundary_unary_program,
             np.float32(x),
             np.int32(mode),
             grid=(1, 1, 1),
@@ -133,21 +145,26 @@ def main() -> None:
         assert_scalar_classification(boundary_output, expected_output)
         assert_scalar_classification(boundary_pullback()["x"], float(expected_gradient))
         assert_scalar_classification(
-            boundary_pullback(boundary_seed)["x"],
+            boundary_pullback(scalar_cotangent(boundary_seed))["x"],
             float(boundary_seed) * float(expected_gradient),
         )
 
     for x, mode, expected_output, expected_gradient in unary_boundaries:
-        boundary_output, boundary_pullback = boundary_unary_program(
+        boundary_output, boundary_pullback = run(
+            boundary_unary_program,
             np.float32(x),
             np.int32(mode),
             grid=(1, 1, 1),
         )
         assert_scalar_classification(boundary_output, expected_output)
         assert_scalar_classification(boundary_pullback()["x"], expected_gradient)
-        assert_scalar_classification(boundary_pullback(boundary_seed)["x"], float(boundary_seed) * expected_gradient)
+        assert_scalar_classification(
+            boundary_pullback(scalar_cotangent(boundary_seed))["x"],
+            float(boundary_seed) * expected_gradient,
+        )
 
-    division_output, division_pullback = boundary_division_program(
+    division_output, division_pullback = run(
+        boundary_division_program,
         np.float32(2.0),
         np.float32(0.0),
         grid=(1, 1, 1),
@@ -155,7 +172,7 @@ def main() -> None:
     assert_scalar_classification(division_output, np.inf)
     assert_scalar_classification(division_pullback()["x"], np.inf)
     assert_scalar_classification(division_pullback()["y"], -np.inf)
-    division_seeded = division_pullback(boundary_seed)
+    division_seeded = division_pullback(scalar_cotangent(boundary_seed))
     assert_scalar_classification(division_seeded["x"], -np.inf)
     assert_scalar_classification(division_seeded["y"], np.inf)
 
@@ -164,7 +181,8 @@ def main() -> None:
         (-2.0, 0.5, np.nan, np.nan, np.nan),
         (0.0, 2.0, 0.0, 0.0, np.nan),
     ):
-        power_output, power_pullback = boundary_power_program(
+        power_output, power_pullback = run(
+            boundary_power_program,
             np.float32(base),
             np.float32(exponent),
             grid=(1, 1, 1),
@@ -173,13 +191,14 @@ def main() -> None:
         power_gradients = power_pullback()
         assert_scalar_classification(power_gradients["base"], expected_base)
         assert_scalar_classification(power_gradients["exponent"], expected_exponent)
-        seeded_power_gradients = power_pullback(boundary_seed)
+        seeded_power_gradients = power_pullback(scalar_cotangent(boundary_seed))
         assert_scalar_classification(seeded_power_gradients["base"], float(boundary_seed) * expected_base)
         assert_scalar_classification(seeded_power_gradients["exponent"], float(boundary_seed) * expected_exponent)
 
     del pullback
     vd.init(arch=vd.cpu)
-    output, _ = asset.program(
+    output, _ = run(
+        asset.program,
         np.float32(1.2),
         np.float32(0.7),
         np.float32(0.2),
@@ -188,25 +207,23 @@ def main() -> None:
     np.testing.assert_allclose(output, np.float32(reference(1.2, 0.7, 0.2)), rtol=2.0e-5, atol=2.0e-5)
 
     expected = finite_gradients(1.2, 0.7, 0.2)
-    outputs, pullback = asset.program(
+    output, pullback = run(
+        asset.program,
         np.float32(1.2),
         np.float32(0.7),
         np.float32(0.2),
         grid=(2, 1, 1),
     )
-    np.testing.assert_allclose(
-        outputs,
-        np.full((1, 1, 2), reference(1.2, 0.7, 0.2), dtype=np.float32),
-        rtol=2.0e-5,
-        atol=2.0e-5,
-    )
-    gradients = pullback(np.array([[[1.0, 2.0]]], dtype=np.float32))
+    np.testing.assert_allclose(output, np.float32(reference(1.2, 0.7, 0.2)), rtol=2.0e-5, atol=2.0e-5)
+    gradients = pullback(np.array([[[[1.0], [2.0]]]], dtype=np.float32))
     for name in expected:
         np.testing.assert_allclose(gradients[name], np.float32(3.0) * expected[name], rtol=3.0e-3, atol=3.0e-3)
 
-    half_output, half_pullback = half_program(
+    half_output, half_pullback = run(
+        half_program,
         np.float16(1.5),
         np.float16(0.25),
+        dtype=vd.f16,
         grid=(1, 1, 1),
     )
     np.testing.assert_array_equal(half_output, np.float16(1.875))
@@ -215,7 +232,8 @@ def main() -> None:
     np.testing.assert_array_equal(half_gradients["y"], np.float32(1.5))
 
     for count in (0, 1, 32, 1500):
-        dynamic_output, dynamic_pullback = dynamic_program(
+        dynamic_output, dynamic_pullback = run(
+            dynamic_program,
             np.float32(1.25),
             np.int32(count),
             grid=(1, 1, 1),
@@ -223,15 +241,15 @@ def main() -> None:
         expected_scale = np.float32(1 + 2 * count)
         np.testing.assert_array_equal(dynamic_output, expected_scale * np.float32(1.25))
         np.testing.assert_array_equal(dynamic_pullback()["x"], expected_scale)
-        np.testing.assert_array_equal(dynamic_pullback(np.float32(2))["x"], 2 * expected_scale)
+        np.testing.assert_array_equal(dynamic_pullback(scalar_cotangent(2))["x"], 2 * expected_scale)
         epsilon = np.float32(1.25e-1)
-        positive, _ = dynamic_program(np.float32(1.25) + epsilon, np.int32(count), grid=(1, 1, 1))
-        negative, _ = dynamic_program(np.float32(1.25) - epsilon, np.int32(count), grid=(1, 1, 1))
+        positive, _ = run(dynamic_program, np.float32(1.25) + epsilon, np.int32(count), grid=(1, 1, 1))
+        negative, _ = run(dynamic_program, np.float32(1.25) - epsilon, np.int32(count), grid=(1, 1, 1))
         finite = (positive - negative) / (2 * epsilon)
         np.testing.assert_allclose(dynamic_pullback()["x"], finite, rtol=2.0e-3, atol=2.0e-3)
 
     mutable_x = np.array(1.25, dtype=np.float32)
-    _, stable_pullback = dynamic_program(mutable_x, np.int32(1), grid=(1, 1, 1))
+    _, stable_pullback = run(dynamic_program, mutable_x, np.int32(1), grid=(1, 1, 1))
     mutable_x[...] = np.float32(100)
     np.testing.assert_array_equal(stable_pullback()["x"], np.float32(3))
 
@@ -271,7 +289,8 @@ def main() -> None:
         (0.8, 0.3, 5, 1),
         (0.8, 0.3, 8, 2),
     ):
-        control_output, control_pullback = control_flow_program(
+        control_output, control_pullback = run(
+            control_flow_program,
             np.float32(x),
             np.float32(y),
             np.int32(limit),
@@ -289,7 +308,7 @@ def main() -> None:
         np.testing.assert_allclose(gradients["x"], expected_dx, rtol=4.0e-3, atol=4.0e-3)
         np.testing.assert_allclose(gradients["y"], expected_dy, rtol=4.0e-3, atol=4.0e-3)
         seed = np.float32(rng.uniform(-2.0, 2.0))
-        reused = control_pullback(seed)
+        reused = control_pullback(scalar_cotangent(seed))
         np.testing.assert_allclose(reused["x"], seed * expected_dx, rtol=4.0e-3, atol=4.0e-3)
         np.testing.assert_allclose(reused["y"], seed * expected_dy, rtol=4.0e-3, atol=4.0e-3)
 
@@ -313,7 +332,8 @@ def main() -> None:
     for limits in ((0, 2, 3), (1, 1, 1), (2, 3, 4)):
         x = 0.7
         y = 0.2
-        triple_output, triple_pullback = triple_nested_program(
+        triple_output, triple_pullback = run(
+            triple_nested_program,
             np.float32(x),
             np.float32(y),
             *(np.int32(limit) for limit in limits),
@@ -331,14 +351,15 @@ def main() -> None:
         np.testing.assert_allclose(triple_gradients["x"], np.float32(expected_dx), rtol=5.0e-3, atol=5.0e-3)
         np.testing.assert_allclose(triple_gradients["y"], np.float32(expected_dy), rtol=5.0e-3, atol=5.0e-3)
         seed = np.float32(rng.uniform(-2.0, 2.0))
-        triple_reused = triple_pullback(seed)
+        triple_reused = triple_pullback(scalar_cotangent(seed))
         np.testing.assert_allclose(triple_reused["x"], seed * np.float32(expected_dx), rtol=5.0e-3, atol=5.0e-3)
         np.testing.assert_allclose(triple_reused["y"], seed * np.float32(expected_dy), rtol=5.0e-3, atol=5.0e-3)
 
     assert not hasattr(asset.program, "_direct_runtime")
 
     vd.Kernel.clear_cache()
-    output, _ = asset.program(
+    output, _ = run(
+        asset.program,
         np.float32(1.2),
         np.float32(0.7),
         np.float32(0.2),

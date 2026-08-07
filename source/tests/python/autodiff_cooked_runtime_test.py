@@ -47,7 +47,7 @@ def main() -> None:
             },
             "count": np.int32(2),
         },
-        "shape does not match",
+        "shape [3] does not match reflection [2]",
     )
 
     def run_case(

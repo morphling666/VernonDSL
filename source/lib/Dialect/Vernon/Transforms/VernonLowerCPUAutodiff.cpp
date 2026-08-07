@@ -3,14 +3,19 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonAutodiffUtils.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "runtime/autodiff/tape_allocator_abi.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+
+#include <functional>
 
 namespace mlir::vernon {
 namespace {
@@ -95,6 +100,21 @@ Value integerConstant(OpBuilder &builder, Location location, unsigned width, uin
     return arith::ConstantIntOp::create(builder, location, value, width);
 }
 
+SmallVector<Value> materializeCoordinate(OpBuilder &builder, Location location, ArrayRef<int64_t> coordinate) {
+    SmallVector<Value> result;
+    result.reserve(coordinate.size());
+    for (int64_t index : coordinate)
+        result.push_back(indexConstant(builder, location, index));
+    return result;
+}
+
+SmallVector<Value> appendCoordinate(OpBuilder &builder, Location location, ValueRange prefix,
+                                    ArrayRef<int64_t> coordinate) {
+    SmallVector<Value> result(prefix);
+    llvm::append_range(result, materializeCoordinate(builder, location, coordinate));
+    return result;
+}
+
 FailureOr<Value> toRawBits(OpBuilder &builder, Location location, Value value) {
     Type type = value.getType();
     Value bits = value;
@@ -165,6 +185,8 @@ public:
             if (failed(prepareBackward()))
                 return failure();
         }
+        if (failed(lowerAdjointBuffers()))
+            return failure();
 
         SmallVector<Operation *> operations;
         function.walk<WalkOrder::PreOrder>([&](Operation *operation) { operations.push_back(operation); });
@@ -222,6 +244,118 @@ public:
 private:
     OpBuilder builder() const { return OpBuilder(function->getContext()); }
 
+    void emitStaticLoopNest(OpBuilder &builder, Location location, ArrayRef<int64_t> shape, unsigned dimension,
+                            SmallVectorImpl<Value> &indices, const std::function<void(OpBuilder &, ValueRange)> &body) {
+        if (dimension == shape.size()) {
+            body(builder, indices);
+            return;
+        }
+        Value lower = indexConstant(builder, location, 0);
+        Value upper = indexConstant(builder, location, static_cast<uint64_t>(shape[dimension]));
+        Value step = indexConstant(builder, location, 1);
+        scf::ForOp loop = scf::ForOp::create(builder, location, lower, upper, step);
+        OpBuilder nested(loop.getBody()->getTerminator());
+        indices.push_back(loop.getInductionVar());
+        emitStaticLoopNest(nested, location, shape, dimension + 1, indices, body);
+        indices.pop_back();
+    }
+
+    Value zero(OpBuilder &builder, Location location, Type type) {
+        return arith::ConstantOp::create(builder, location, type, builder.getFloatAttr(type, 0.0));
+    }
+
+    LogicalResult lowerAdjointBuffers() {
+        SmallVector<AdAdjointBufferCreateOp> creates;
+        function.walk([&](AdAdjointBufferCreateOp operation) { creates.push_back(operation); });
+        for (AdAdjointBufferCreateOp create : creates) {
+            AdAdjointBufferType type = create.getBuffer().getType();
+            auto memoryType = MemRefType::get(type.getShape(), type.getElementType());
+            OpBuilder createBuilder(create);
+            Value memory = memref::AllocaOp::create(createBuilder, create.getLoc(), memoryType);
+            SmallVector<Value> initializationIndices;
+            emitStaticLoopNest(createBuilder, create.getLoc(), type.getShape(), 0, initializationIndices,
+                               [&](OpBuilder &nested, ValueRange indices) {
+                                   memref::StoreOp::create(nested, create.getLoc(),
+                                                           zero(nested, create.getLoc(), type.getElementType()), memory,
+                                                           indices);
+                               });
+
+            const SmallVector<SmallVector<int64_t>> fullCoordinates = enumerateStaticCoordinates(type.getShape());
+            const SmallVector<SmallVector<int64_t>> trailingCoordinates =
+                enumerateStaticCoordinates(type.getShape().drop_front(type.getIndexRank()));
+            SmallVector<Operation *> users(create.getBuffer().getUsers());
+            for (Operation *user : users) {
+                if (auto scatter = dyn_cast<AdAdjointScatterAddOp>(user)) {
+                    OpBuilder userBuilder(scatter);
+                    for (const SmallVector<int64_t> &coordinate : trailingCoordinates) {
+                        SmallVector<Value> trailingIndices =
+                            materializeCoordinate(userBuilder, scatter.getLoc(), coordinate);
+                        SmallVector<Value> indices(scatter.getIndices());
+                        llvm::append_range(indices, trailingIndices);
+                        Value contribution = scatter.getValue();
+                        if (!coordinate.empty())
+                            contribution =
+                                tensor::ExtractOp::create(userBuilder, scatter.getLoc(), contribution, trailingIndices);
+                        Value prior = memref::LoadOp::create(userBuilder, scatter.getLoc(), memory, indices);
+                        Value sum = arith::AddFOp::create(userBuilder, scatter.getLoc(), prior, contribution);
+                        memref::StoreOp::create(userBuilder, scatter.getLoc(), sum, memory, indices);
+                    }
+                    scatter.erase();
+                    continue;
+                }
+                if (auto dense = dyn_cast<AdAdjointAccumulateDenseOp>(user)) {
+                    OpBuilder userBuilder(dense);
+                    for (const SmallVector<int64_t> &coordinate : fullCoordinates) {
+                        SmallVector<Value> indices = materializeCoordinate(userBuilder, dense.getLoc(), coordinate);
+                        Value contribution =
+                            tensor::ExtractOp::create(userBuilder, dense.getLoc(), dense.getValue(), indices);
+                        Value prior = memref::LoadOp::create(userBuilder, dense.getLoc(), memory, indices);
+                        Value sum = arith::AddFOp::create(userBuilder, dense.getLoc(), prior, contribution);
+                        memref::StoreOp::create(userBuilder, dense.getLoc(), sum, memory, indices);
+                    }
+                    dense.erase();
+                    continue;
+                }
+                if (auto take = dyn_cast<AdAdjointTakeAndClearOp>(user)) {
+                    OpBuilder userBuilder(take);
+                    SmallVector<Value> elements;
+                    for (const SmallVector<int64_t> &coordinate : trailingCoordinates) {
+                        SmallVector<Value> indices =
+                            appendCoordinate(userBuilder, take.getLoc(), take.getIndices(), coordinate);
+                        elements.push_back(memref::LoadOp::create(userBuilder, take.getLoc(), memory, indices));
+                        memref::StoreOp::create(userBuilder, take.getLoc(),
+                                                zero(userBuilder, take.getLoc(), type.getElementType()), memory,
+                                                indices);
+                    }
+                    Value result = elements.size() == 1
+                                       ? elements.front()
+                                       : tensor::FromElementsOp::create(
+                                             userBuilder, take.getLoc(),
+                                             cast<RankedTensorType>(take.getValue().getType()), elements);
+                    take.getValue().replaceAllUsesWith(result);
+                    take.erase();
+                    continue;
+                }
+                if (auto freeze = dyn_cast<AdAdjointFreezeOp>(user)) {
+                    OpBuilder userBuilder(freeze);
+                    SmallVector<Value> elements;
+                    for (const SmallVector<int64_t> &coordinate : fullCoordinates) {
+                        SmallVector<Value> indices = materializeCoordinate(userBuilder, freeze.getLoc(), coordinate);
+                        elements.push_back(memref::LoadOp::create(userBuilder, freeze.getLoc(), memory, indices));
+                    }
+                    Value result = tensor::FromElementsOp::create(
+                        userBuilder, freeze.getLoc(), cast<RankedTensorType>(freeze.getValue().getType()), elements);
+                    freeze.getValue().replaceAllUsesWith(result);
+                    freeze.erase();
+                    continue;
+                }
+                return user->emitError("unsupported invocation-local adjoint buffer use");
+            }
+            create.erase();
+        }
+        return success();
+    }
+
     Value asI64(OpBuilder &builder, Location location, Value value) const {
         if (value.getType().isIndex())
             return arith::IndexCastOp::create(builder, location, builder.getI64Type(), value);
@@ -242,21 +376,20 @@ private:
         if (function.getNumResults() != 1)
             return function.emitError("dynamic CPU autodiff forward requires one result");
         auto resultType = dyn_cast<TupleType>(function.getResultTypes().front());
-        if (!resultType || resultType.size() != 3 || !isa<AdTapeType>(resultType.getType(1)) ||
-            !isa<AdRegionHeaderType>(resultType.getType(2)))
+        if (!resultType || resultType.size() != 2 || !isa<AdTapeType>(resultType.getType(0)) ||
+            !isa<AdRegionHeaderType>(resultType.getType(1)))
             return function.emitError("dynamic CPU autodiff forward has an invalid logical result");
         SmallVector<func::ReturnOp> returns;
         function.walk([&](func::ReturnOp operation) { returns.push_back(operation); });
         for (func::ReturnOp operation : returns) {
             auto tuple = operation.getOperand(0).getDefiningOp<TupleCreateOp>();
-            if (!tuple || tuple.getElements().size() != 3)
-                return operation.emitError("dynamic CPU autodiff forward must return output, tape, and root region");
-            operation->setOperand(0, tuple.getElements().front());
+            if (!tuple || tuple.getElements().size() != 2)
+                return operation.emitError("dynamic CPU autodiff forward must return tape and root region");
+            operation->setOperands({});
             if (tuple->use_empty())
                 tuple.erase();
         }
-        function.setType(
-            FunctionType::get(function.getContext(), function.getArgumentTypes(), {resultType.getType(0)}));
+        function.setType(FunctionType::get(function.getContext(), function.getArgumentTypes(), {}));
 
         Block &entry = function.getBody().front();
         for (unsigned index = 0; index < function.getNumArguments(); ++index)

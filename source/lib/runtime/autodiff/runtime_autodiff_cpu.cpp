@@ -347,8 +347,8 @@ bool parseProfile(const Stage &stage, HostProfileLayout &layout, std::string &er
     }
     layout.argumentsSize = (*host)["packed_arguments_size"].get<size_t>();
     layout.resultsSize = (*host)["packed_results_size"].get<size_t>();
-    if (!layout.argumentsSize || !layout.resultsSize) {
-        error = "autodiff profile has an empty host Value ABI";
+    if (!layout.argumentsSize) {
+        error = "autodiff profile has an empty host argument ABI";
         return false;
     }
     for (const nlohmann::json &value : (*entry)["arguments"]) {
@@ -485,8 +485,10 @@ bool parseProfile(const Stage &stage, HostProfileLayout &layout, std::string &er
         }
         layout.arguments.push_back(std::move(argument));
     }
+    if ((*entry)["results"].empty())
+        return true;
     if ((*entry)["results"].size() != 1) {
-        error = "CPU autodiff profile requires one result";
+        error = "CPU autodiff profile supports at most one result";
         return false;
     }
     const nlohmann::json &result = (*entry)["results"][0];
@@ -690,28 +692,31 @@ VernonStatus runCpuForward(VernonRuntimeContext &context, const HostProfileLayou
     size_t invocationCount = 0;
     if (!carrierCount(computeGrid, invocationCount))
         return fail(context, "native CPU autodiff launch size overflows");
-    if (inputs.value_count != signature.inputs.size() || outputs.value_count != signature.outputs.size() ||
-        layout.results.size() != signature.outputs.size() + signature.tape.size())
+    const bool storageObjectives = layout.results.empty();
+    const size_t expectedOutputValues = storageObjectives ? 0 : signature.outputs.size();
+    if (inputs.value_count != signature.inputs.size() || outputs.value_count != expectedOutputValues ||
+        (!storageObjectives && layout.results.size() != signature.outputs.size() + signature.tape.size()))
         return fail(context, "autodiff forward values do not match the host profile");
     std::vector<uint8_t> arguments(layout.argumentsSize);
     std::vector<StorageRange> storageRanges;
     std::vector<StagedTensorView> tensorViews;
     HostEffectTransaction transaction(0);
     std::vector<uint8_t *> stagedOutputs;
-    for (const ValueAbi &unmaterialized : signature.outputs) {
-        ValueAbi outputAbi = unmaterialized;
-        if (!materializeCarrierValue(outputAbi, computeGrid))
-            return fail(context, "native CPU autodiff output size overflows");
-        VernonAdValue *output = findValue(outputs, outputAbi.path);
-        if (!output || !valueMatches(*output, outputAbi))
-            return fail(context, "autodiff output does not match profile reflection");
-        if (!appendStorageRange(output->data, output->size, true, storageRanges))
-            return fail(context, "native CPU autodiff output address range overflows");
-        uint8_t *staged = transaction.stageStorage(output->data, outputAbi.byteSize, false);
-        if (outputAbi.byteSize && !staged)
-            return fail(context, "cannot allocate native CPU autodiff output shadow", VERNON_STATUS_INTERNAL_ERROR);
-        stagedOutputs.push_back(staged);
-    }
+    if (!storageObjectives)
+        for (const ValueAbi &unmaterialized : signature.outputs) {
+            ValueAbi outputAbi = unmaterialized;
+            if (!materializeCarrierValue(outputAbi, computeGrid))
+                return fail(context, "native CPU autodiff output size overflows");
+            VernonAdValue *output = findValue(outputs, outputAbi.path);
+            if (!output || !valueMatches(*output, outputAbi))
+                return fail(context, "autodiff output does not match profile reflection");
+            if (!appendStorageRange(output->data, output->size, true, storageRanges))
+                return fail(context, "native CPU autodiff output address range overflows");
+            uint8_t *staged = transaction.stageStorage(output->data, outputAbi.byteSize, false);
+            if (outputAbi.byteSize && !staged)
+                return fail(context, "cannot allocate native CPU autodiff output shadow", VERNON_STATUS_INTERNAL_ERROR);
+            stagedOutputs.push_back(staged);
+        }
     if (VernonStatus status =
             stageForwardInputs(context, layout, inputs, arguments, transaction, storageRanges, tensorViews);
         status != VERNON_STATUS_OK)
@@ -720,10 +725,11 @@ VernonStatus runCpuForward(VernonRuntimeContext &context, const HostProfileLayou
         std::vector<uint8_t> results(layout.resultsSize);
         if (VernonStatus status = invoke(invocationIndex, arguments, results); status != VERNON_STATUS_OK)
             return status;
-        for (size_t outputIndex = 0; outputIndex < signature.outputs.size(); ++outputIndex)
-            std::memcpy(stagedOutputs[outputIndex] + invocationIndex * signature.outputs[outputIndex].byteSize,
-                        results.data() + layout.results[outputIndex].frameOffset,
-                        signature.outputs[outputIndex].byteSize);
+        if (!storageObjectives)
+            for (size_t outputIndex = 0; outputIndex < signature.outputs.size(); ++outputIndex)
+                std::memcpy(stagedOutputs[outputIndex] + invocationIndex * signature.outputs[outputIndex].byteSize,
+                            results.data() + layout.results[outputIndex].frameOffset,
+                            signature.outputs[outputIndex].byteSize);
     }
     std::unique_ptr<PullbackExecution> pendingPullback;
     if (VernonStatus status = finish(invocationCount, pendingPullback); status != VERNON_STATUS_OK)
@@ -964,13 +970,14 @@ bool finishStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &f
     size_t backwardValueArguments = 0;
     for (const HostArgument &argument : backward.arguments)
         backwardValueArguments += argument.builtin.empty();
-    if (!forward.tapeAllocatorOffset || forward.tapeRootRegionOffset || !backward.tapeAllocatorOffset ||
-        !backward.tapeRootRegionOffset || forward.results.empty() || !backwardValueArguments ||
-        backwardValueArguments > forward.results.size() || backward.results.size() != gradientPaths.size()) {
+    if (!forward.results.empty() || !forward.tapeAllocatorOffset || forward.tapeRootRegionOffset ||
+        !backward.tapeAllocatorOffset || !backward.tapeRootRegionOffset || !backwardValueArguments ||
+        backward.results.size() != gradientPaths.size()) {
         invocationDiagnostic(context) = "structured CPU autodiff profile does not use the dynamic tape ABI";
         return false;
     }
     Signature signature;
+    signature.storageObjectives = true;
     for (const HostArgument &argument : forward.arguments) {
         if (!argument.builtin.empty())
             continue;
@@ -985,8 +992,6 @@ bool finishStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &f
     for (const HostArgument &argument : backward.arguments)
         if (argument.builtin.empty())
             cotangentArguments.push_back(&argument);
-    for (const HostFrameLeaf &result : forward.results)
-        signature.outputs.push_back(result.value);
     for (const HostArgument *argument : cotangentArguments) {
         if (argument->name.empty() || argument->leaves.size() != 1) {
             invocationDiagnostic(context) = "structured CPU autodiff cotangent is not one canonical leaf";
@@ -995,6 +1000,15 @@ bool finishStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &f
         ValueAbi cotangent = argument->leaves.front().value;
         cotangent.path = argument->name;
         signature.cotangents.push_back(std::move(cotangent));
+    }
+    for (const ValueAbi &cotangent : signature.cotangents) {
+        const auto input = std::find_if(signature.inputs.begin(), signature.inputs.end(),
+                                        [&](const ValueAbi &value) { return value.path == cotangent.path; });
+        if (input == signature.inputs.end()) {
+            invocationDiagnostic(context) = "structured CPU autodiff Storage objective is not a primal input";
+            return false;
+        }
+        signature.outputs.push_back(*input);
     }
     for (size_t index = 0; index < gradientPaths.size(); ++index) {
         ValueAbi gradient = backward.results[index].value;

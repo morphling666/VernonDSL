@@ -2,9 +2,9 @@
 
 ## Status
 
-Implementation progress is tracked only in
-[`autodiff-task-list.md`](autodiff-task-list.md). This document records
-architecture decisions and does not maintain completion state.
+This document records architecture decisions and does not maintain completion
+state. Current behavior and remaining work live in
+[`autodiff.md`](autodiff.md) and [`roadmap.md`](roadmap.md).
 
 This document defines the architecture refactor that must precede further
 autodiff feature expansion.
@@ -373,11 +373,10 @@ linearization/reverse construction. This leaves a path for:
 Do not require higher-order transforms to differentiate allocator callbacks or
 backend tape operations.
 
-## Refactor tracking
+## Refactor scope
 
-The authoritative refactor order and completion state are maintained in
-[`autodiff-task-list.md`](autodiff-task-list.md). The public migration remains
-VJP-only; JVP validation is tracked as non-blocking post-P0 work there.
+The public transform remains VJP-only. JVP validation is non-blocking future
+work tracked in [`roadmap.md`](roadmap.md).
 
 ## Architecture Gates
 

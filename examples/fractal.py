@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from functools import cache
 from pathlib import Path
 from typing import Annotated
 
@@ -9,6 +10,18 @@ import vernon_dsl as vd
 
 WIDTH = 640
 HEIGHT = 320
+
+
+class RenderDefaults:
+    def __init__(self, *, frames: int, time_step: float, fps: int):
+        self.frames = frames
+        self.time_step = time_step
+        self.fps = fps
+
+
+@cache
+def render_defaults() -> RenderDefaults:
+    return RenderDefaults(frames=1_000_000, time_step=0.03, fps=30)
 
 
 @vd.func
@@ -51,6 +64,7 @@ def render(time: float = 0.0) -> vd.TensorStorage:
 
 
 def main() -> None:
+    defaults = render_defaults()
     parser = argparse.ArgumentParser(description="Render the VernonDSL Julia set")
     parser.add_argument(
         "--arch",
@@ -61,9 +75,9 @@ def main() -> None:
         help=("execution backend; OpenGL profiles require a host context; DirectX requires Windows"),
     )
     parser.add_argument("--time", type=float, default=0.0)
-    parser.add_argument("--frames", type=int, default=1_000_000)
-    parser.add_argument("--time-step", type=float, default=0.03)
-    parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--frames", type=int, default=defaults.frames)
+    parser.add_argument("--time-step", type=float, default=defaults.time_step)
+    parser.add_argument("--fps", type=int, default=defaults.fps)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--animation-output", type=Path)
     parser.add_argument("--emit-metal", type=Path)

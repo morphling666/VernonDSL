@@ -2,6 +2,7 @@
 #define VERNON_RUNTIME_PIPELINE_MANIFEST_H
 
 #include "VernonRuntime.h"
+#include "autodiff/autodiff_metadata.h"
 
 #include <nlohmann/json_fwd.hpp>
 
@@ -214,9 +215,7 @@ struct AutodiffManifest {
     std::string transformIdentity;
     std::string profilesIdentity;
     std::string protocol;
-    std::vector<std::string> wrt;
-    std::vector<std::string> outputCotangents;
-    std::vector<std::string> gradientPaths;
+    std::vector<AutodiffDerivativeGroup> derivativeGroups;
     std::vector<AutodiffVariant> variants;
 };
 

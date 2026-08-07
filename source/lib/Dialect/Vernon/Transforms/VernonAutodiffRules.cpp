@@ -6,6 +6,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffAnalysis.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonAutodiffUtils.h"
 #include "llvm/ADT/STLExtras.h"
 
 #include <limits>
@@ -104,21 +105,6 @@ LogicalResult verifyFloatingIntrinsic(Operation *operation) {
          !cast<RankedTensorType>(operation->getResult(0).getType()).hasStaticShape()))
         return operation->emitOpError("autodiff intrinsic rule requires static Tensor shapes");
     return success();
-}
-
-SmallVector<SmallVector<int64_t>> enumerateCoordinates(ArrayRef<int64_t> shape) {
-    SmallVector<SmallVector<int64_t>> coordinates(1);
-    for (int64_t extent : shape) {
-        SmallVector<SmallVector<int64_t>> expanded;
-        for (const SmallVector<int64_t> &prefix : coordinates)
-            for (int64_t index = 0; index < extent; ++index) {
-                SmallVector<int64_t> coordinate(prefix);
-                coordinate.push_back(index);
-                expanded.push_back(std::move(coordinate));
-            }
-        coordinates = std::move(expanded);
-    }
-    return coordinates;
 }
 
 Value extract(OpBuilder &builder, Location location, Value value, ArrayRef<int64_t> coordinate) {
@@ -229,7 +215,7 @@ LogicalResult buildMatmulVjp(Operation *operation, const AutodiffVjpBuildContext
     };
     SmallVector<SmallVector<int64_t>> batches;
     if (rows != 0 && columns != 0)
-        batches = enumerateCoordinates(*batchShape);
+        batches = enumerateStaticCoordinates(*batchShape);
     for (const SmallVector<int64_t> &batch : batches) {
         SmallVector<int64_t> leftPrefix = broadcastCoordinate(batch, leftBatch);
         SmallVector<int64_t> rightPrefix = broadcastCoordinate(batch, rightBatch);
@@ -297,7 +283,7 @@ LogicalResult buildPowVjp(Operation *operation, const AutodiffVjpBuildContext &c
 LogicalResult buildConstructVjp(Operation *operation, const AutodiffVjpBuildContext &context,
                                 SmallVectorImpl<Value> &results) {
     auto resultType = cast<RankedTensorType>(operation->getResult(0).getType());
-    for (const SmallVector<int64_t> &coordinate : enumerateCoordinates(resultType.getShape()))
+    for (const SmallVector<int64_t> &coordinate : enumerateStaticCoordinates(resultType.getShape()))
         results.push_back(extract(context.builder, context.location, context.resultCotangents[0], coordinate));
     return success();
 }
@@ -511,6 +497,60 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
                      results.push_back(negative(context.builder, context.location, context.resultCotangents[0]));
                      return success();
                  }));
+    add(DifferentiationRule(
+        arith::ExtFOp::getOperationName().str(), 1, 1, {},
+        [](Operation *, const AutodiffVjpBuildContext &context, SmallVectorImpl<Value> &results) {
+            results.push_back(context.resultCotangents[0]);
+            return success();
+        },
+        {},
+        [](Operation *operation) -> LogicalResult {
+            auto extension = dyn_cast<arith::ExtFOp>(operation);
+            if (!extension)
+                return operation->emitOpError("autodiff extension rule requires arith.extf");
+            Type source = extension.getIn().getType();
+            Type result = extension.getOut().getType();
+            FailureOr<Type> sourceDerivative = getDerivativeValueType(source);
+            FailureOr<Type> resultDerivative = getDerivativeValueType(result);
+            if (failed(sourceDerivative) || failed(resultDerivative) || *sourceDerivative != *resultDerivative ||
+                !getElementTypeOrSelf(source).isF16() || !getElementTypeOrSelf(result).isF32())
+                return operation->emitOpError("autodiff extension rule supports only f16-to-f32 promotion");
+            return success();
+        }));
+    add(DifferentiationRule(
+        intrinsicRuleKey("clamp"), 3, 1, {Requirement::operand(0), Requirement::operand(1), Requirement::operand(2)},
+        [](Operation *operation, const AutodiffVjpBuildContext &context,
+           SmallVectorImpl<Value> &results) -> LogicalResult {
+            Value seed = context.resultCotangents[0];
+            Value value = context.getPrimalOperand(0);
+            Value lower = context.getPrimalOperand(1);
+            Value upper = context.getPrimalOperand(2);
+            if (failed(requireValues(operation, {value, lower, upper})))
+                return failure();
+            Value aboveLower =
+                arith::CmpFOp::create(context.builder, context.location, arith::CmpFPredicate::OGT, value, lower);
+            Value belowUpper =
+                arith::CmpFOp::create(context.builder, context.location, arith::CmpFPredicate::OLT, value, upper);
+            Value interior = arith::AndIOp::create(context.builder, context.location, aboveLower, belowUpper);
+            Value belowLower =
+                arith::CmpFOp::create(context.builder, context.location, arith::CmpFPredicate::OLT, value, lower);
+            Value aboveUpper =
+                arith::CmpFOp::create(context.builder, context.location, arith::CmpFPredicate::OGT, value, upper);
+            Value zero = constant(context.builder, context.location, seed.getType(), 0.0);
+            results.append({arith::SelectOp::create(context.builder, context.location, interior, seed, zero),
+                            arith::SelectOp::create(context.builder, context.location, belowLower, seed, zero),
+                            arith::SelectOp::create(context.builder, context.location, aboveUpper, seed, zero)});
+            return success();
+        },
+        {},
+        [](Operation *operation) -> LogicalResult {
+            if (!isa<IntrinsicOp>(operation) || operation->getNumOperands() != 3 || operation->getNumResults() != 1 ||
+                !isa<FloatType>(operation->getResult(0).getType()) ||
+                llvm::any_of(operation->getOperandTypes(),
+                             [&](Type type) { return type != operation->getResult(0).getType(); }))
+                return operation->emitOpError("clamp VJP requires three matching floating scalar operands");
+            return success();
+        }));
     add(makeRule(math::SinOp::getOperationName(), 1, {Requirement::operand(0)},
                  [](Operation *operation, const AutodiffVjpBuildContext &context, SmallVectorImpl<Value> &results) {
                      Value seed = context.resultCotangents[0];
@@ -687,6 +727,46 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
             return success();
         }));
     add(DifferentiationRule(
+        SwizzleOp::getOperationName().str(), 1, 1, {},
+        [](Operation *operation, const AutodiffVjpBuildContext &context,
+           SmallVectorImpl<Value> &results) -> LogicalResult {
+            auto swizzle = cast<SwizzleOp>(operation);
+            auto inputType = cast<RankedTensorType>(*getDerivativeValueType(swizzle.getInput().getType()));
+            StringRef mask = swizzle.getMask();
+            Value seed = context.resultCotangents[0];
+            Value zero = constant(context.builder, context.location, inputType.getElementType(), 0.0);
+            SmallVector<Value> elements(inputType.getDimSize(0), zero);
+            auto component = [](char value) -> int {
+                StringRef xyzw = "xyzw";
+                StringRef rgba = "rgba";
+                size_t index = xyzw.find(value);
+                return static_cast<int>(index == StringRef::npos ? rgba.find(value) : index);
+            };
+            for (auto [outputIndex, spelling] : llvm::enumerate(mask)) {
+                const int inputIndex = component(spelling);
+                Value contribution = mask.size() == 1 ? seed
+                                                      : extract(context.builder, context.location, seed,
+                                                                {static_cast<int64_t>(outputIndex)});
+                Value &target = elements[static_cast<size_t>(inputIndex)];
+                target = target == zero
+                             ? contribution
+                             : arith::AddFOp::create(context.builder, context.location, target, contribution);
+            }
+            results.push_back(tensor::FromElementsOp::create(context.builder, context.location, inputType, elements));
+            return success();
+        },
+        {},
+        [](Operation *operation) -> LogicalResult {
+            auto swizzle = dyn_cast<SwizzleOp>(operation);
+            if (!swizzle)
+                return failure();
+            FailureOr<Type> derivative = getDerivativeValueType(swizzle.getInput().getType());
+            auto input = succeeded(derivative) ? dyn_cast<RankedTensorType>(*derivative) : RankedTensorType{};
+            if (!input || !input.hasStaticShape() || input.getRank() != 1 || input.getDimSize(0) > 4)
+                return operation->emitOpError("swizzle VJP requires a static floating rank-one input");
+            return success();
+        }));
+    add(DifferentiationRule(
         intrinsicRuleKey("normalize"), 1, 1, {Requirement::operand(0)},
         [](Operation *operation, const AutodiffVjpBuildContext &context,
            SmallVectorImpl<Value> &results) -> LogicalResult {
@@ -783,7 +863,7 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
             Value seed = context.resultCotangents.front();
             Value zero = constant(context.builder, context.location, derivativeType.getElementType(), 0.0);
             SmallVector<Value> elements;
-            for (const SmallVector<int64_t> &coordinate : enumerateCoordinates(sourceType.getShape())) {
+            for (const SmallVector<int64_t> &coordinate : enumerateStaticCoordinates(sourceType.getShape())) {
                 Value selected = seed;
                 for (auto [dimension, expected] : llvm::enumerate(coordinate)) {
                     Value expectedValue = arith::ConstantIndexOp::create(context.builder, context.location, expected);

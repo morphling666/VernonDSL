@@ -2,9 +2,9 @@
 
 ## Status
 
-Implementation progress is tracked only in
-[`autodiff-task-list.md`](autodiff-task-list.md). This document records
-architecture decisions and does not maintain completion state.
+This document records architecture decisions and does not maintain completion
+state. Current behavior and remaining work live in
+[`autodiff.md`](autodiff.md) and [`roadmap.md`](roadmap.md).
 
 This document records the architecture decision made after the first Metal
 capture/retry/commit attempt mixed compiler reflection, pipeline parsing,
@@ -291,10 +291,9 @@ CPU, Metal, and Vulkan parity.
 
 ## Migration tracking
 
-The authoritative migration phases, atomic tasks, test commands, and
-completion state are maintained in
-[`autodiff-task-list.md`](autodiff-task-list.md). This document retains the
-responsibility boundaries and invariants that those tasks must satisfy.
+Current migration state is summarized in [`autodiff.md`](autodiff.md) and
+remaining work in [`roadmap.md`](roadmap.md). This document retains the
+responsibility boundaries and invariants that future work must satisfy.
 
 ## Acceptance Gates
 

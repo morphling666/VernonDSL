@@ -4,6 +4,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffAnalysis.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonAutodiffRules.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
@@ -202,7 +203,7 @@ module {
     EXPECT_EQ(*analysis->getRegions()[1].parentOrdinal, 0u);
     BarrierOp barrier;
     function.walk([&](BarrierOp operation) { barrier = operation; });
-    EXPECT_TRUE(analysis->isActive(barrier));
+    EXPECT_FALSE(analysis->isActive(barrier));
     EXPECT_TRUE(analysis->isActive(analysis->getRegions()[0].operation));
     EXPECT_TRUE(analysis->isActive(analysis->getRegions()[1].operation));
     auto barrierActivity = llvm::find_if(analysis->getOperations(), [&](const AutodiffOperationActivity &operation) {
@@ -210,7 +211,7 @@ module {
     });
     ASSERT_NE(barrierActivity, analysis->getOperations().end());
     EXPECT_EQ(barrierActivity->effect, AutodiffEffectKind::Barrier);
-    EXPECT_TRUE(barrierActivity->active);
+    EXPECT_FALSE(barrierActivity->active);
 }
 
 TEST_F(VernonAutodiffAnalysisTest, ClassifiesEffectsWithoutBackendPolicy) {
@@ -276,13 +277,60 @@ module {
     function.walk([&](scf::IfOp operation) { region = operation; });
     function.walk([&](StoreOp operation) { store = operation; });
     EXPECT_TRUE(analysis->isActive(region));
-    EXPECT_TRUE(analysis->isActive(store));
+    EXPECT_FALSE(analysis->isActive(store));
     auto storeActivity = llvm::find_if(analysis->getOperations(), [&](const AutodiffOperationActivity &operation) {
         return operation.operation == store.getOperation();
     });
     ASSERT_NE(storeActivity, analysis->getOperations().end());
     EXPECT_EQ(storeActivity->effect, AutodiffEffectKind::StorageWrite);
-    EXPECT_TRUE(storeActivity->active);
+    EXPECT_FALSE(storeActivity->active);
+}
+
+TEST_F(VernonAutodiffAnalysisTest, VersionsStorageEffectsAcrossBranches) {
+    OwningOpRef<ModuleOp> module = parse(R"mlir(
+module {
+  func.func @storage_versions(
+      %input: !vernon.tensor_view<f32, [1], "read", "device"> {
+        vernon.source_name = "input", vernon.abi_leaf_dtypes = ["f32"]},
+      %scratch: !vernon.tensor_view<f32, [1], "read_write", "device"> {
+        vernon.source_name = "scratch", vernon.abi_leaf_dtypes = ["f32"]},
+      %loss: !vernon.tensor_view<f32, [1], "write", "device"> {
+        vernon.source_name = "loss", vernon.abi_leaf_dtypes = ["f32"]},
+      %condition: i1) {
+    %index = arith.constant 0 : index
+    %value = "vernon.load"(%input, %index)
+        : (!vernon.tensor_view<f32, [1], "read", "device">, index) -> f32
+    scf.if %condition {
+      "vernon.store"(%value, %scratch, %index)
+          : (f32, !vernon.tensor_view<f32, [1], "read_write", "device">, index) -> ()
+    } else {
+      %twice = arith.addf %value, %value : f32
+      "vernon.store"(%twice, %scratch, %index)
+          : (f32, !vernon.tensor_view<f32, [1], "read_write", "device">, index) -> ()
+    }
+    %stored = "vernon.load"(%scratch, %index)
+        : (!vernon.tensor_view<f32, [1], "read_write", "device">, index) -> f32
+    "vernon.store"(%stored, %loss, %index)
+        : (f32, !vernon.tensor_view<f32, [1], "write", "device">, index) -> ()
+    func.return
+  }
+}
+)mlir");
+    ASSERT_TRUE(module);
+    func::FuncOp function = module->lookupSymbol<func::FuncOp>("storage_versions");
+    VernonAutodiffRuleRegistry registry = createDefaultAutodiffRuleRegistry();
+    FailureOr<VernonAutodiffAnalysisResult> analysis = analyzeAutodiffFunction(function, {"input"}, {"loss"}, registry);
+    ASSERT_TRUE(succeeded(analysis));
+
+    EXPECT_EQ(analysis->getStorageIdentities().size(), 3u);
+    EXPECT_EQ(analysis->getStorageEffects().size(), 5u);
+    EXPECT_EQ(analysis->getStorageVersions().size(), 7u);
+    EXPECT_EQ(llvm::count_if(
+                  analysis->getStorageVersions(),
+                  [](const AutodiffStorageVersion &version) { return version.kind == StorageVersionKind::IfMerge; }),
+              1u);
+    for (const AutodiffStorageEffect &effect : analysis->getStorageEffects())
+        EXPECT_TRUE(analysis->isActive(effect.operation));
 }
 
 TEST_F(VernonAutodiffAnalysisTest, RejectsUnsupportedActiveOperation) {
@@ -353,11 +401,10 @@ module {
       %x: f32 {vernon.source_name = "x", vernon.abi_leaf_dtypes = ["f32"]},
       %device: !vernon.tensor_view<f32, [1], "read_write", "device">,
       %index: index) -> (f32 {vernon.abi_leaf_dtypes = ["f32"]}) {
-    %constant = arith.constant 1.0 : f32
-    %old = "vernon.atomic"(%device, %index, %constant) {
+    %old = "vernon.atomic"(%device, %index, %x) {
       atomic_kind = "add", ordering = "relaxed"
     } : (!vernon.tensor_view<f32, [1], "read_write", "device">, index, f32) -> f32
-    func.return %constant : f32
+    func.return %old : f32
   }
 }
 )mlir");

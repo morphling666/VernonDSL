@@ -40,16 +40,17 @@ TEST(RuntimeStructuredStorageAutodiff, ExecutesDynamicIndexMutationAndFreshStora
     float source[]{7.0f, 6.0f, 9.0f};
     int32_t index = 1;
     float scale = 4.0f;
+    float loss{};
+    const uint64_t lossShape[]{1};
     VernonAdValue inputValues[]{
         {sizeof(VernonAdValue), {"values", 6}, VERNON_DATA_F32, values, sizeof(values), 1, storageShape},
         {sizeof(VernonAdValue), {"source", 6}, VERNON_DATA_F32, source, sizeof(source), 1, storageShape},
         {sizeof(VernonAdValue), {"index", 5}, VERNON_DATA_I32, &index, sizeof(index), {}},
         {sizeof(VernonAdValue), {"scale", 5}, VERNON_DATA_F32, &scale, sizeof(scale), {}},
+        {sizeof(VernonAdValue), {"loss", 4}, VERNON_DATA_F32, &loss, sizeof(loss), 1, lossShape},
     };
-    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, 4, {}};
-    float outputValue{};
-    VernonAdValue output{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &outputValue, sizeof(outputValue), {}};
-    VernonAdValueSet outputs{sizeof(VernonAdValueSet), &output, 1, {}};
+    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, 5, {}};
+    VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
     inputValues[1].data = values;
     VernonPullback *rejectedPullback = nullptr;
     EXPECT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &rejectedPullback),
@@ -61,7 +62,7 @@ TEST(RuntimeStructuredStorageAutodiff, ExecutesDynamicIndexMutationAndFreshStora
     ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
         << lastError(context);
     ASSERT_NE(pullback, nullptr);
-    EXPECT_FLOAT_EQ(outputValue, 26.0f);
+    EXPECT_FLOAT_EQ(loss, 26.0f);
     EXPECT_FLOAT_EQ(values[0], 2.0f);
     EXPECT_FLOAT_EQ(values[1], 24.0f);
     EXPECT_FLOAT_EQ(values[2], 5.0f);

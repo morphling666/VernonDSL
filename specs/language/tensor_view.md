@@ -191,6 +191,20 @@ Static source extents, bounds, internal injectivity, owner lifetime, and
 overlapping read/write borrows are validated. Multiple views can share an
 owner when their accessed regions are compatible.
 
+Autodiff creates a separate host-owned tangent allocation rather than writing
+through a primal owner. Scalar elements use the promoted derivative dtype.
+Aggregate elements use the structural `TangentLayout` defined by
+[`autodiff.md`](../autodiff.md#3-value-storage-and-resource-gradients):
+Vector, Matrix, Tensor, Tuple, and Struct dimensions and paths remain element
+structure, while f16 leaves promote to f32 and non-differentiable leaves become
+zero tangent nodes. The tangent layout may have different offsets and stride
+from the primal canonical Value ABI and must not be used to reinterpret primal
+bytes.
+
+All compatible differentiated views of one owner scatter-add into one fresh
+tangent owner. Separately bound overlapping read/write views remain invalid;
+one legal read-write binding is handled through explicit Storage versions.
+
 ## 6. Workgroup storage
 
 The source constructor is:

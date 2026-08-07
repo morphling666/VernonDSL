@@ -117,6 +117,40 @@ def static_rank_three_tensor_arithmetic(
 
 
 class NumpyTensorRuntimeTests(unittest.TestCase):
+    def test_scalar_symbols_are_types_and_numpy_casts(self) -> None:
+        self.assertIsInstance(vd.i32, type)
+        self.assertIsInstance(vd.f32, type)
+        self.assertIsInstance(vd.i32(7), np.int32)
+        self.assertIsInstance(vd.f32(1.25), np.float32)
+
+    def test_vector_host_value_uses_numpy_backed_components_and_operators(self) -> None:
+        vector = vd.Vector([1.0, 2.0, 3.0, 4.0])
+
+        self.assertIsInstance(vector, np.ndarray)
+        self.assertIsInstance(vector, vd.Vector)
+        self.assertEqual((vector.x, vector.y, vector.z, vector.w), (1.0, 2.0, 3.0, 4.0))
+        np.testing.assert_array_equal(vector.xy, np.array((1.0, 2.0), dtype=np.float32))
+        np.testing.assert_array_equal(vector.xyz, np.array((1.0, 2.0, 3.0), dtype=np.float32))
+        np.testing.assert_array_equal(
+            vector + vd.Vector([4.0, 3.0, 2.0, 1.0]),
+            np.full(4, 5.0, dtype=np.float32),
+        )
+        self.assertFalse(vector.flags.writeable)
+
+    def test_vector_and_matrix_are_specialized_tensor_values(self) -> None:
+        tensor = vd.Tensor([[1.0, 2.0], [3.0, 4.0]])
+        matrix = vd.Matrix([[1.0, 2.0], [3.0, 4.0]])
+        vector = vd.Vector([1.0, 2.0])
+
+        self.assertIsInstance(tensor, vd.Tensor)
+        self.assertIsInstance(matrix, vd.Tensor)
+        self.assertIsInstance(matrix, vd.Matrix)
+        self.assertIsInstance(vector, vd.Tensor)
+        np.testing.assert_array_equal(tensor + tensor, np.array(((2.0, 4.0), (6.0, 8.0)), dtype=np.float32))
+        np.testing.assert_array_equal(matrix * 2.0, np.array(((2.0, 4.0), (6.0, 8.0)), dtype=np.float32))
+        self.assertFalse(tensor.flags.writeable)
+        self.assertFalse(matrix.flags.writeable)
+
     @staticmethod
     def _initialize_compute_backend(architecture: object) -> bool:
         target = {

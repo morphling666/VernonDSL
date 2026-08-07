@@ -7,7 +7,7 @@ import importlib
 import inspect
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Protocol
 
 import numpy as np
 
@@ -54,6 +54,10 @@ class _CompiledKernel:
     dependency_hashes: tuple[tuple[Path, str], ...] = ()
     native: Any | None = None
     native_generation: int = -1
+
+
+class _DependencyTracked(Protocol):
+    dependency_hashes: tuple[tuple[Path, str], ...]
 
 
 class Kernel:
@@ -105,7 +109,7 @@ class Kernel:
         )
 
     @staticmethod
-    def _dependencies_current(compiled: _CompiledKernel) -> bool:
+    def _dependencies_current(compiled: _DependencyTracked) -> bool:
         try:
             return all(
                 hashlib.sha256(path.read_text(encoding="utf-8").encode("utf-8")).hexdigest() == digest
@@ -115,9 +119,9 @@ class Kernel:
             return False
 
     @staticmethod
-    def _argument_signature(value: Any) -> tuple[Any, ...]:
+    def _argument_signature(value: Any, *, include_tensor_shape: bool) -> tuple[Any, ...]:
         if isinstance(value, (TensorStorage, TensorView)):
-            return ("tensor",)
+            return ("tensor", tuple(value.shape)) if include_tensor_shape else ("tensor",)
         return ("value", type(value).__module__, type(value).__qualname__)
 
     def _dispatch_key(
@@ -126,6 +130,8 @@ class Kernel:
         features: tuple[str, ...],
         target: str,
         target_options: tuple[tuple[str, Any], ...],
+        *,
+        specialize_tensor_views: bool = False,
     ) -> tuple[Any, ...]:
         source_digest = hashlib.sha256(self._file.read_bytes()).hexdigest()
         constants = tuple(
@@ -143,7 +149,7 @@ class Kernel:
             target,
             target_options,
             features,
-            tuple(self._argument_signature(value) for value in arguments),
+            tuple(self._argument_signature(value, include_tensor_shape=specialize_tensor_views) for value in arguments),
             constants,
         )
 
@@ -301,6 +307,14 @@ class Kernel:
                         runtime_signature(annotation.arguments[0]),
                         tuple(annotation.arguments[1]),
                     )
+                if annotation.name in {"Vector", "Matrix"}:
+                    rank = 1 if annotation.name == "Vector" else 2
+                    if len(annotation.arguments) == rank + 1:
+                        return (
+                            "tensor",
+                            runtime_signature(annotation.arguments[0]),
+                            tuple(annotation.arguments[1:]),
+                        )
             if isinstance(annotation, type) and getattr(annotation, "__vernon_dsl__", (None, {}))[0] == "struct":
                 return ("struct", annotation.__name__)
             return None
@@ -323,6 +337,11 @@ class Kernel:
                     continue
                 if isinstance(value, (TensorStorage, TensorView)):
                     raise TypeError(f"kernel argument {name!r} is runtime storage but its annotation is not TensorView")
+                if parameter.type.kind == "struct" and runtime_signature(type(value)) != dsl_signature(parameter.type):
+                    raise TypeError(
+                        f"kernel Struct argument {name!r} has type {type(value).__name__}, "
+                        f"expected {parameter.type.name}"
+                    )
                 continue
             if not isinstance(value, TensorView):
                 raise TypeError(f"kernel argument {name!r} must be a TensorView")
@@ -359,6 +378,8 @@ class Kernel:
         self,
         arguments: tuple[Any, ...],
         features: tuple[str, ...] = (),
+        *,
+        specialize_tensor_views: bool = False,
     ) -> tuple[
         FrontendCompileResult,
         ast.FunctionDef,
@@ -375,6 +396,12 @@ class Kernel:
             raise RuntimeError("kernel functions must be top-level definitions in files")
         builtins = self._builtin_parameters(function)
         user_parameters, normalized_arguments = self._normalize_arguments(function, builtins, arguments)
+        specialized_tensor_parameters = {
+            argument.arg
+            for argument in function.args.args
+            if self._is_static_tensor_annotation(argument.annotation)
+            or (specialize_tensor_views and self._tensor_view_access(argument.annotation) is not None)
+        }
         tensors = {
             name: value
             for name, value in zip(user_parameters, normalized_arguments, strict=True)
@@ -395,7 +422,7 @@ class Kernel:
             tuple(
                 (name, value.dtype.str, value.shape)
                 for name, value in tensors.items()
-                if isinstance(value, TensorStorage)
+                if name in specialized_tensor_parameters
             ),
             constants,
             self._workgroup_size,

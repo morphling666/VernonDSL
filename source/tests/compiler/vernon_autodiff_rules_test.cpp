@@ -488,7 +488,9 @@ TEST_F(VernonAutodiffRulesTest, RegistryMatchesFrontendPureRuleInventoryAndPrima
     const SmallVector<std::pair<StringRef, SmallVector<Requirement>>> tensorRules = {
         {"tensor.extract", {}},
         {"tensor.splat", {}},
+        {"vernon.swizzle", {}},
         {"vernon.intrinsic.broadcast", {}},
+        {"vernon.intrinsic.clamp", {Requirement::operand(0), Requirement::operand(1), Requirement::operand(2)}},
         {"vernon.intrinsic.construct", {}},
         {"vernon.intrinsic.cross", {Requirement::operand(0), Requirement::operand(1)}},
         {"vernon.intrinsic.dot", {Requirement::operand(0), Requirement::operand(1)}},
@@ -502,6 +504,10 @@ TEST_F(VernonAutodiffRulesTest, RegistryMatchesFrontendPureRuleInventoryAndPrima
         ASSERT_NE(rule, nullptr) << name.str();
         EXPECT_EQ(rule->getVjpPrimalRequirements(), ArrayRef<Requirement>(requirements)) << name.str();
     }
+    expectedNames.push_back("arith.extf");
+    const DifferentiationRule *extension = registry.lookup("arith.extf");
+    ASSERT_NE(extension, nullptr);
+    EXPECT_TRUE(extension->getVjpPrimalRequirements().empty());
     llvm::sort(expectedNames);
     EXPECT_EQ(registry.getRegisteredKeys(), expectedNames);
 }

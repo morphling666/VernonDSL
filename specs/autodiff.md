@@ -1,84 +1,25 @@
 # Autodiff design
 
-Implemented behavior and remaining capability boundaries are tracked in
-[`autodiff-implementation-status.md`](autodiff-implementation-status.md).
-
-> **Status:** normative design target. The source tree implements the
-> declarative `ProgramExpression`/`ProgramTransformSpec` surface, static asset
-> parsing, typed straight-line pure-Value `ProgramGraph`, derivative-rule
-> validation, bounded tape/reverse planning and identity, analytical CPU
-> ProgramGraph pullbacks for Scalar, Tensor, Tuple, and Struct Values, static
-> indexing scatter adjoints, bounded branches, pure-Value early returns,
-> literal-range loops, and literal-bounded loops with a dynamic leading break,
-> plus monomorphized pure-helper inlining with finite-difference validation.
-> Deterministic primal, forward-with-tape, and backward symbols and their
-> cotangent/gradient/tape ABI plans are reflected by the frontend and reserved
-> in the bundle schema. Typed input/storage/output/tape/cotangent/gradient
-> resource roles are preserved in differentiated GPU reflection. TensorView
-> state remains resource SSA in GPU forward and backward profiles. Reverse
-> accumulation uses `vernon.reduce_sum` and `vernon.scatter_add`, with optional
-> grid-independent disjoint evidence, then lowers per target to direct, atomic,
-> or canonical deterministic serial reduction. Runtime output, tape, and
-> cotangent carriers have dynamic `(z,y,x)` physical shape. The invocation grid
-> is absent from assets, identities, manifests, and artifacts. These additions
-> advance the compiler contract to 10 and the pipeline contract to 13; older
-> native components reject them.
-> Independent native forward-with-tape and backward MLIR modules compile for
-> the supported f32/f64 Scalar, static-Tensor, and TensorView stateful subset.
-> CPU uses a direct host Value ABI and currently requires one reflected Value
-> leaf per input. CUDA, Vulkan, Metal, OpenGL, and OpenGL ES use explicit
-> resources for primal Values and gradients, plus dynamic three-dimensional
-> resources for tape leaves, cotangents, and outputs. DirectX uses the same
-> lowering but still requires DXC-backed validation.
-> The cooker emits deterministic primal, forward-with-tape, and backward
-> artifacts for the supported compute VJP subset on CPU, CUDA, Vulkan, Metal,
-> OpenGL, OpenGL ES, and DirectX. Unsupported programs are rejected before
-> output creation without a primal-only substitute. Runtime
-> bundle loading strictly validates transform/profile identities, complete
-> variant coverage, profile-stage metadata, and artifact references before
-> resolution. Loaded pipelines expose output and gradient metadata from either
-> direct host profiles or resource-backed GPU profiles. CPU cooking keeps
-> relocatable objects and emits deterministic C
-> registration source for primal, forward-with-tape, and backward symbols. The
-> initial f32/f64 Scalar and equal-shape static Tensor CPU profiles execute
-> through an opaque C pullback handle with reusable C++ RAII ownership and
-> NumPy binding. Cooked relocatable objects, generated registration code, C
-> Runtime loading, and Python `LoadedPipeline.vjp()` are covered end to end.
-> Resource-backed compute profiles resolve independent forward and backward
-> pipelines. The immediate C API caches them as a one-node compiled
-> ExecutionGraph, so immediate and composed execution share buffer ownership,
-> tape retention, hazard planning, and reverse submission. Vulkan and Metal cooked
-> GPU VJPs are covered end to end for pure Values, statically indexed
-> TensorView mutation with fresh Storage gradients, and injective
-> global-invocation gather/scatter dispatches, including pullback use
-> after destroying the loaded primal pipeline, interleaved pullbacks with
-> independent tape, and concurrent application of distinct pullbacks.
-> Cooked CUDA and DirectX acceptance runs when those native backends are
-> available; OpenGL/ES acceptance runs when suitable compute contexts are
-> available. CUDA still requires hardware execution in CI, and DirectX requires
-> DXC-backed Windows validation.
-> The CPU reference and native Runtime accept a positive invocation-time 3D
-> grid and execute X-fastest. The ProgramGraph only attaches disjoint evidence
-> when every active resource access uses the same direct index mapping and
-> that mapping contains all three global-invocation axes. CUDA lowers
-> conflicting f32 accumulation to atomics; conflicting CUDA f64 gradients and
-> portable targets run one canonical X-fastest backward loop for deterministic
-> reduction. This serial
-> scheduling is currently selected during target-profile emission; scalable
-> contribution sorting/segmented reduction and fully backend-owned scheduling
-> remain future work. GPU runtime rejects overlapping writable Storage bindings
-> before dispatch.
-> It evaluates only the selected side of bounded branches. CPU Native profiles
-> use region-based forward and backward control flow for bounded branches,
-> pure-Value early returns, and literal-bounded loops with a dynamic leading
-> `if condition: break` guard. They statically unroll the maximum loop bound and
-> lower static Tensor broadcasting through explicit splat/broadcast operations
-> with reduction adjoints. C++ `AutodiffGraph` composes multiple cooked GPU VJP
-> profiles into an ExecutionGraph forward plan and a reusable reverse plan,
-> retains tape resources, inserts resource barriers, routes cotangents, and
-> accumulates fan-out contributions. Early returns or dynamic loops with
-> Storage effects, general break/continue/return loop control, and graphics
-> backward lowering remain unavailable.
+> **Status:** accepted contract and implemented compute VJP surface. Compiler
+> contract 10 and pipeline contract 13 provide deterministic
+> `primal`/`forward_with_tape`/`backward` profiles, typed derivative groups,
+> checked dynamic tape, explicit accumulation plans, and invocation-time
+> `(x,y,z)` grids with physical `(z,y,x)` carriers. CPU `dynamic_v2` supports
+> direct and cooked void Kernels with explicit Storage objectives, recursive
+> Scalar/Tensor/Tuple/Struct Storage elements, dynamic and signed-stride
+> TensorViews, mutable scratch versioning, structured branches and loops,
+> runtime gather/scatter accumulation, reusable pullbacks, and fresh packed
+> tangent owners. Direct and cooked execution normalize the same native
+> derivative metadata and share one structured CPU executable and pullback
+> implementation.
+>
+> Cooked GPU VJP remains resource-leaf based and is accepted on supported
+> backends for the existing pure-Value and stateful TensorView subset.
+> ExecutionGraph composition remains C++ and GPU-only. Graphics backward
+> lowering, custom compute VJPs, higher-order AD, persistent `.grad`, and
+> multi-kernel temporal differentiation remain future work. The current
+> compatibility boundary retains `legacy_fixed` cooked assets until a release
+> intentionally advances the contracts.
 
 This document defines Vernon's first public automatic-differentiation model.
 The design uses reverse-mode vector-Jacobian products (VJPs), preserves the
@@ -123,6 +64,11 @@ dX = J_F(X)^T dY
 where `dY` has the same differentiable Value/Storage structure as `Y`, and
 `dX` has the structure selected by `wrt`.
 
+Aggregate Storage cotangents and gradients preserve this logical structure at
+the public API boundary. Compiler profiles may transport canonical ABI leaves
+independently, but the host reconstructs them through one structural
+`TangentLayout` and one packed tangent owner per primal Storage owner.
+
 Autodiff does not require `Y` to be scalar. For
 `Y.shape = (2, 2, 2)` and `X.shape = (2, 2)`, the full Jacobian has logical
 shape `(2, 2, 2, 2, 2, 2)`. The initial API does not materialize that matrix; it
@@ -154,6 +100,9 @@ Values derive gradient structure recursively from floating leaves.
 - An immutable Tensor gradient is an ordinary Tensor Value with the same
   logical shape.
 - A TensorView or mutable Storage gradient is a newly owned Storage result.
+- Vector, Matrix, Tensor, Tuple, and Struct Storage elements derive one
+  structural tangent schema recursively. Their public gradient is one packed
+  tangent `TensorStorage`, not one owner per ABI leaf.
 - Integer and Boolean leaves are non-differentiable unless an explicit custom
   rule consumes them without requesting a gradient.
 - Resource handles and sampler state are non-differentiable.
@@ -170,6 +119,36 @@ Gradient Storage is separate from primal Storage and never changes primal
 type, identity, ownership, or layout. The first API does not expose
 `accumulate_into` or persistent `.grad` state. Explicit reusable accumulation
 buffers are a later, independent Runtime feature.
+
+The tangent layout is independent from the primal layout. Dtype promotion may
+change element size, alignment, product offsets, and element stride.
+Non-differentiable product children remain logical `Zero` nodes and occupy no
+tangent bytes. A tangent layout is structural metadata, not a generated
+nominal DSL Struct declaration, and it must never reinterpret primal bytes.
+
+The recursive tangent schema is:
+
+```text
+T(f16) = Scalar(f32)
+T(f32) = Scalar(f32)
+T(f64) = Scalar(f64)
+T(bool | i32 | u32) = Zero
+T(Tensor[S, shape]) = Tensor(shape, T(S))
+T(Vector[S, n]) = Tensor((n,), T(S))
+T(Matrix[S, m, n]) = Tensor((m, n), T(S))
+T(Tuple[A, ...]) = Product(0:T(A), ...)
+T(Struct{a:A, ...}) = Product(a:T(A), ...)
+```
+
+`TangentLayout` adapts this schema to the same canonical host ABI planner used
+for ordinary Values. It does not maintain an independent alignment or offset
+algorithm. Product-valued Tensor elements retain their element coordinates in
+canonical derivative paths; `Zero` projections fail deterministically.
+
+All compatible `wrt` views of one primal allocation accumulate into one fresh
+tangent owner. Separately bound overlapping read/write aliases remain invalid.
+A legal in-place `read_write` binding is differentiated through explicit
+Storage versions.
 
 ## 4. Source and asset declaration
 
@@ -224,6 +203,10 @@ There is no `ad_pipeline_asset()` and no `autodiff=True` Boolean.
 After the Runtime resolves the cooked pipeline:
 
 ```python
+pipeline = vd.load_cooked_vjp_asset(
+    "build/render/pipeline_manifest.json",
+    features=(),
+)
 image, pullback = pipeline.vjp(bindings, grid=(grid_x, grid_y, grid_z))
 gradients = pullback(d_image)
 
@@ -233,10 +216,25 @@ d_vertices = gradients["vertices.position"]
 
 The binding names and paths accepted by `wrt` are canonical reflected source
 paths. They are fixed at cook time and cannot be changed by a Runtime call.
-Structured output cotangents and aggregate gradients use the same flattened,
-fully qualified leaf paths, such as `output.color` and `material.roughness`;
-the cooked transform records the exact cotangent paths and every profile
-variant must expose identical gradient paths.
+Compiler and Runtime profiles transport structured output cotangents and
+aggregate gradients through flattened, fully qualified leaf paths such as
+`output.color` and `material.roughness`. The public pullback API groups those
+leaves by the declared output or `wrt` path and packs aggregate Storage through
+its reflected `TangentLayout`; leaf paths are not separate public Storage
+owners. Every profile variant must expose identical groups and leaf paths.
+
+The Runtime stores one canonical typed derivative-group table in
+gradient-then-cotangent order. Direct execution supplies it through POD metadata
+views; cooked execution derives it once from the validated transform and
+backward profile. Both paths validate the same canonical paths, unique group
+ownership, protocol, and executable signature. Python always reads groups from
+the loaded native pipeline; it does not maintain a second direct or cooked
+grouping model.
+
+For grids larger than one invocation, packed aggregate cotangents prepend the
+physical `(z,y,x)` carrier dimensions to the primal owner shape. TensorView
+offsets and signed strides apply to the trailing owner dimensions, so
+carrier packing does not erase subview descriptors.
 
 The positive three-dimensional grid is supplied for each forward invocation;
 it is not part of the pipeline asset, manifest identity, ProgramGraph, profile
@@ -365,25 +363,19 @@ autodiff transform.
 
 ## 11. Versioning and acceptance
 
-This feature requires intentional compiler- and pipeline-contract advances.
-No existing manifest may be reinterpreted as containing VJP profiles.
+Compiler contract 10 and pipeline contract 13 are the current VJP boundary. No
+older manifest is reinterpreted as containing current structured profiles.
+`legacy_fixed` remains an explicit protocol, never an implicit fallback from
+`dynamic_v2`.
 
-Acceptance requires:
+CPU acceptance covers direct and cooked structured Storage VJP, recursive
+aggregate tangents, multiple outputs, owner aliases, signed-stride descriptors,
+multi-invocation cotangent carriers, dynamic control flow, scratch overwrite,
+finite differences, and deterministic reusable pullbacks. Runtime acceptance
+also freezes tape allocator ABI, ownership, memory charging, failure latching,
+and public exception containment. GPU acceptance is capability-gated per
+backend and remains narrower than CPU structured Storage acceptance.
 
-1. freeze the VJP, pullback, gradient-result, tape-ownership, mutation, and
-   custom-rule contracts;
-2. add `ProgramExpression`, `ProgramTransformSpec`, deterministic symbols,
-   reflection, and cooked manifest schemas;
-3. implement pure-Value VJP and finite-difference CPU reference tests;
-4. implement Storage functionalization, bounded tape, explicit gradient
-   Storage results, alias validation, and accumulation capability checks;
-5. implement stateful compute Kernel acceptance;
-6. implement rasterization, visibility, depth, blend, and texture custom VJPs
-   plus cross-stage graphics backward execution;
-7. compose cooked VJP profiles through ExecutionGraph in Python and C++;
-8. compare every backend that advertises a given AD capability against the CPU
-   reference.
-
-Any missing custom rule, unbounded tape, unsupported target capability,
-uncertain write conflict, malformed cotangent, or stale contract version must
-fail before execution.
+Any missing derivative or custom rule, unbounded tape, unsupported target
+capability, uncertain write conflict, malformed group/cotangent/signature,
+protocol mismatch, or stale contract version fails before execution.

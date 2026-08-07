@@ -697,3 +697,47 @@ LogicalResult AdReadLeafOp::verify() {
     return verifyLeafLayout(getOperation(), getValue().getType(), getRecordSizeAttr().getInt(),
                             getRecordAlignmentAttr().getInt(), getLeafOffsetAttr().getInt());
 }
+
+static Type getAdjointBufferValueType(AdAdjointBufferType buffer) {
+    ArrayRef<int64_t> trailing = buffer.getShape().drop_front(buffer.getIndexRank());
+    return trailing.empty() ? buffer.getElementType()
+                            : static_cast<Type>(RankedTensorType::get(trailing, buffer.getElementType()));
+}
+
+static LogicalResult verifyAdjointBufferIndexing(Operation *operation, AdAdjointBufferType buffer, ValueRange indices) {
+    if (indices.size() != buffer.getIndexRank())
+        return operation->emitOpError("index count must match the adjoint buffer index rank");
+    return success();
+}
+
+LogicalResult AdAdjointScatterAddOp::verify() {
+    AdAdjointBufferType type = cast<AdAdjointBufferType>(getBuffer().getType());
+    if (failed(verifyAdjointBufferIndexing(getOperation(), type, getIndices())))
+        return failure();
+    return getValue().getType() == getAdjointBufferValueType(type)
+               ? success()
+               : emitOpError("contribution type must match the indexed adjoint buffer element");
+}
+
+LogicalResult AdAdjointAccumulateDenseOp::verify() {
+    AdAdjointBufferType type = cast<AdAdjointBufferType>(getBuffer().getType());
+    Type expected = RankedTensorType::get(type.getShape(), type.getElementType());
+    return getValue().getType() == expected ? success()
+                                            : emitOpError("dense contribution must match the complete adjoint buffer");
+}
+
+LogicalResult AdAdjointTakeAndClearOp::verify() {
+    AdAdjointBufferType type = cast<AdAdjointBufferType>(getBuffer().getType());
+    if (failed(verifyAdjointBufferIndexing(getOperation(), type, getIndices())))
+        return failure();
+    return getValue().getType() == getAdjointBufferValueType(type)
+               ? success()
+               : emitOpError("result type must match the indexed adjoint buffer element");
+}
+
+LogicalResult AdAdjointFreezeOp::verify() {
+    AdAdjointBufferType type = cast<AdAdjointBufferType>(getBuffer().getType());
+    Type expected = RankedTensorType::get(type.getShape(), type.getElementType());
+    return getValue().getType() == expected ? success()
+                                            : emitOpError("result must materialize the complete adjoint buffer");
+}
