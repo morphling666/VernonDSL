@@ -213,25 +213,6 @@ VernonLoadedPipeline *loadBackendCpuEntryPipeline(VernonRuntimeContext &context,
     return pipeline.release();
 }
 
-VernonLoadedPipeline *loadBackendCpuNativePipeline(VernonRuntimeContext &context, const CpuNativeArtifact &artifact) {
-    auto pipeline = std::make_unique<VernonLoadedPipeline>();
-    pipeline->context = &context;
-    ReflectedEntry reflected;
-    if (!buildDirectComputeVariant(artifact.reflection, artifact.entry, pipeline->variant, reflected,
-                                   VERNON_RUNTIME_CPU, invocationDiagnostic(context)))
-        return nullptr;
-    CpuKernelState kernel;
-    ReflectedEntry loadedReflection;
-    if (!loadCpuNativeArtifact(artifact, kernel, loadedReflection, invocationDiagnostic(context)))
-        return nullptr;
-    auto state = std::make_unique<CpuPipelineState>();
-    if (!prepareCpuComputePipeline(context, std::move(kernel), std::move(loadedReflection), *state))
-        return nullptr;
-    installRuntimeBackendState(*pipeline, state.release());
-    ++context.livePipelines;
-    return pipeline.release();
-}
-
 VernonLoadedPipeline *loadBackendArtifactPipeline(VernonRuntimeContext &context, const void *artifact,
                                                   size_t artifactSize, const char *reflectionData,
                                                   size_t reflectionSize, const char *entryData, size_t entrySize) {

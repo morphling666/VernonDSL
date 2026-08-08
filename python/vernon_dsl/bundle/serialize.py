@@ -52,9 +52,15 @@ def materialize_bundle(
     if set(records) != set(artifact_descriptors):
         raise PipelineCompileError("artifact descriptors do not match planned stages")
     for stage_id, descriptor in artifact_descriptors.items():
-        if descriptor.get("sha256") != next(stage.artifact.sha256 for stage in plan.stages if stage.id == stage_id):
+        stage = next(stage for stage in plan.stages if stage.id == stage_id)
+        if descriptor.get("sha256") != stage.artifact.sha256:
             raise PipelineCompileError(f"artifact descriptor digest does not match stage {stage_id}")
         records[stage_id]["artifact"] = dict(descriptor)
+        if stage.target.target == "cpu":
+            symbol = stage.metadata.get("symbol")
+            if not isinstance(symbol, str) or not symbol:
+                raise PipelineCompileError(f"CPU stage {stage_id} has no exported symbol")
+            records[stage_id]["symbol"] = symbol
     return with_content_hash(document)
 
 

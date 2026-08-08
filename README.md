@@ -234,10 +234,13 @@ vernon-cook-pipeline python/tests/pipeline_asset_fixture.py:scale_asset `
   -o build/cpu_scale
 ```
 
-The output contains a versioned `*.pipeline.json` manifest and
+The output contains the canonical pipeline-14 `*.pipeline.json` manifest and
 content-addressed files under `artifacts/`. Depending on the target, artifacts
 are SPIR-V, GLSL/ESSL, DXIL, PTX, Metal source, LLVM IR, or relocatable CPU
-objects. Cooked Metal bundles contain MSL consumed by the Runtime on Apple.
+objects. A differentiated asset adds the optional root `autodiff` object to the
+same manifest schema. CPU cooking also emits a `.o`/`.obj` plus generated
+static-registration `.c` and `.h` sources; there is no separate `compute.json`
+bundle. Cooked Metal bundles contain MSL consumed by the Runtime on Apple.
 Missing variants and unsupported target combinations fail explicitly rather
 than silently falling back.
 

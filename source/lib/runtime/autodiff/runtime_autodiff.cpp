@@ -244,23 +244,14 @@ bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffVariant
         return false;
     const Stage &forward = bundle.stages.at(profiles.forwardWithTape);
     const Stage &backward = bundle.stages.at(profiles.backward);
-    if (!forward.autodiff || !backward.autodiff) {
-        invocationDiagnostic(*bundle.context) = "autodiff stages have no protocol metadata";
-        return false;
-    }
-    if (forward.autodiff->protocol != backward.autodiff->protocol ||
-        forward.autodiff->protocol != bundle.autodiff->protocol) {
-        invocationDiagnostic(*bundle.context) = "autodiff stage protocols do not match the program transform";
-        return false;
-    }
     const std::vector<std::string> gradientPaths =
         autodiffDerivativeLeafPaths(bundle.autodiff->derivativeGroups, AutodiffDerivativeRole::Gradient);
     std::shared_ptr<Executable> executable;
     bool resolved = false;
     if (bundle.context->backend == VERNON_RUNTIME_CPU) {
-        if (forward.autodiff->protocol == "dynamic_v2") {
+        if (bundle.autodiff->protocol == "dynamic_v2") {
             resolved = createCpuExecutable(*bundle.context, forward, backward, gradientPaths, executable);
-        } else if (forward.autodiff->protocol == "legacy_fixed") {
+        } else if (bundle.autodiff->protocol == "legacy_fixed") {
             resolved = createLegacyCpuExecutable(*bundle.context, forward, backward, gradientPaths, executable);
         } else {
             invocationDiagnostic(*bundle.context) = "CPU autodiff profile uses an unsupported protocol";

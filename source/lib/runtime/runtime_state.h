@@ -92,7 +92,6 @@ template <typename Handle> void destroyRuntimeBackendState(Handle &handle) {
 struct VernonPipelineBundle {
     VernonRuntimeContext *context{};
     std::string id;
-    std::vector<std::string> features;
     std::unordered_map<std::string, vernon::runtime::Stage> stages;
     std::vector<vernon::runtime::Variant> variants;
     std::optional<vernon::runtime::AutodiffManifest> autodiff;

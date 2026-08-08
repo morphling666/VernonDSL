@@ -18,7 +18,6 @@ from ..bundle import (
     compiled_stage_from_program,
     make_target_options,
     materialize_bundle,
-    with_content_hash,
 )
 from ..compiler import Compiler, FrontendCompileRequest, compile_file
 from ..frontend.autodiff_profiles import build_autodiff_profile_plan
@@ -257,7 +256,6 @@ def cook_pipeline_asset(
                 variant_transform = structured.transform
                 profile_plan = structured.plan
                 profile_modules = structured.profiles
-                profile_protocol = "dynamic_v2"
             else:
                 from ..frontend.autodiff_native import (
                     AutodiffNativeLoweringError,
@@ -287,12 +285,11 @@ def cook_pipeline_asset(
                     )
                 except AutodiffNativeLoweringError as error:
                     raise PipelineCompileError(str(error)) from None
-                profile_protocol = "legacy_fixed"
             if resolved_transform is None:
                 resolved_transform = variant_transform
             elif resolved_transform.output_cotangents != variant_transform.output_cotangents:
                 raise PipelineCompileError("VJP variants must expose the same canonical output cotangent paths")
-            profile_programs: dict[str, dict[str, str]] = {"primal": {"compute": stages["compute"].id}}
+            profile_programs: dict[str, dict[str, Any]] = {}
             module = selected_modules["compute"]
             for profile_name, profile_mlir in profile_modules.items():
                 profile = next(value for value in profile_plan.profiles if value.name == profile_name)
@@ -320,29 +317,23 @@ def cook_pipeline_asset(
                     native_target,
                     profile_mlir,
                 )
-                profile_stage = CompiledStage(
-                    profile_stage.module,
-                    profile_stage.module_manifest,
-                    profile_stage.entry,
-                    profile_stage.stage,
-                    profile_stage.target,
-                    profile_stage.reflection,
-                    profile_stage.interface,
-                    profile_stage.artifact,
-                    {
-                        **dict(profile_stage.metadata),
-                        "autodiff_profile": profile_name,
-                        "autodiff_protocol": profile_protocol,
-                        "autodiff_profiles_identity": profile_plan.identity,
-                    },
-                )
                 differentiated_stages[profile_stage.id] = profile_stage
-                profile_programs[profile_name] = {"compute": profile_stage.id}
+                profile_programs[profile_name] = {
+                    "compute": profile_stage.id,
+                    "inputs": [binding.to_dict() for binding in profile.inputs],
+                    "outputs": [binding.to_dict() for binding in profile.outputs],
+                }
+            primal_profile = next(value for value in profile_plan.profiles if value.name == "primal")
+            profile_programs["primal"] = {
+                "compute": stages["compute"].id,
+                "inputs": [binding.to_dict() for binding in primal_profile.inputs],
+                "outputs": [binding.to_dict() for binding in primal_profile.outputs],
+            }
             differentiated_variants.append(
                 {
                     "key": list(variant),
-                    "plan": profile_plan.manifest_dict(),
-                    "programs": profile_programs,
+                    "workgroup_size": list(profile_plan.launch.workgroup_size),
+                    "profiles": {name: profile_programs[name] for name in ("primal", "forward_with_tape", "backward")},
                 }
             )
 
@@ -361,12 +352,6 @@ def cook_pipeline_asset(
     if transform is not None:
         assert resolved_transform is not None
         transform = resolved_transform
-        differentiated_record: dict[str, Any] = {
-            "variants": differentiated_variants,
-        }
-        differentiated_record["identity"] = hashlib.sha256(
-            canonical_json(differentiated_record).encode("utf-8")
-        ).hexdigest()
         plan = BundlePlan(
             plan.pipeline_id,
             plan.target,
@@ -376,8 +361,8 @@ def cook_pipeline_asset(
                 *plan.stages,
                 *(differentiated_stages[key] for key in sorted(differentiated_stages)),
             ),
-            {**transform.to_dict(), "identity": transform.identity},
-            differentiated_record,
+            transform.to_dict(),
+            {"variants": differentiated_variants},
         )
     output_path.mkdir(parents=True, exist_ok=True)
     descriptors = {
@@ -392,12 +377,10 @@ def cook_pipeline_asset(
     }
     bundle = materialize_bundle(plan, descriptors)
     if target_name == "cpu":
-        registration = write_cpu_static_registration(
+        write_cpu_static_registration(
             output_path,
             [str(stage.metadata.get("symbol", "")) for stage in plan.stages],
         )
-        bundle["cpu_static_registration"] = registration
-        bundle = with_content_hash(bundle)
     manifest = output_path / f"{output_path.name}.pipeline.json"
     manifest.write_text(
         json.dumps(bundle, indent=2, sort_keys=True, ensure_ascii=False) + "\n",

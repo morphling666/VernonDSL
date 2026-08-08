@@ -103,8 +103,6 @@ VERNON_RUNTIME_CAPI VernonLoadedPipeline *vernonRuntimeLoadCpuEntry(VernonRuntim
  */
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeRegisterStaticCpuEntry(VernonStringView symbol,
                                                                      VernonCpuEntryPoint entry_point);
-VERNON_RUNTIME_CAPI VernonLoadedPipeline *vernonRuntimeLoadComputeBundle(VernonRuntimeContext *context,
-                                                                         const char *directory);
 
 typedef enum VernonIndexType { VERNON_INDEX_U32 = 0 } VernonIndexType;
 

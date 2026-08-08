@@ -21,17 +21,22 @@ def main() -> int:
     for index, artifact in enumerate(artifacts):
         shutil.copyfile(output / artifact, output / f"autodiff_artifact_{index}{arguments.object_suffix}")
 
-    registration = document["cpu_static_registration"]
-    shutil.copyfile(output / registration["source"], output / "autodiff_registration.c")
+    registration_sources = sorted(output.glob("vernon_cpu_registration_*.c"))
+    if len(registration_sources) != 1:
+        raise ValueError("cooked autodiff fixture must contain exactly one CPU registration source")
+    registration_source = registration_sources[0]
+    identity_suffix = registration_source.stem.removeprefix("vernon_cpu_registration_")
+    registration_function = f"vernonRegisterCpuArtifacts_{identity_suffix}"
+    shutil.copyfile(registration_source, output / "autodiff_registration.c")
     (output / "autodiff_registration_wrapper.c").write_text(
         "\n".join(
             [
                 '#include "VernonRuntime.h"',
                 "",
-                f"extern VernonStatus {registration['function']}(void);",
+                f"extern VernonStatus {registration_function}(void);",
                 "",
                 f"VernonStatus {arguments.wrapper_function}(void) {{",
-                f"    return {registration['function']}();",
+                f"    return {registration_function}();",
                 "}",
                 "",
             ]

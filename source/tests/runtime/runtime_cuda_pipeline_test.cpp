@@ -93,7 +93,7 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
     std::string bundle =
         "{" VERNON_PIPELINE_JSON_FIELD R"(,)"
         R"("type":"pipeline","id":"cuda/scale","target":{"kind":"cuda","options":{}},)"
-        R"("features":[],"runtime_requirements":{"backend":"cuda",)"
+        R"("runtime_requirements":{"backend":"cuda",)"
         R"("features":[],"ptx_version":[8,0],)"
         R"("minimum_compute_capability":[8,0],"address_size":64},)"
         R"("variants":[{"key":[],"parameters":[)"
@@ -118,8 +118,8 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
         R"(],"outputs":[{"name":"result","kind":"tensor","dtype":"f32",)"
         R"("shape":[4],"access":"write","location":0}],)"
         R"("program":{"compute":"scale"}}],)"
-        R"("stage_artifacts":{"scale":{"id":"scale","entry":"scale",)"
-        R"("stage":"compute","target":"cuda","format":"ptx","artifact":{)"
+        R"("stage_artifacts":{"scale":{"entry":"scale",)"
+        R"("stage":"compute","artifact":{)"
         R"("format":"ptx","storage":"inline","encoding":"utf8","data":)" +
         jsonString(ptx) + R"(,"size":)" + std::to_string(sizeof(ptx) - 1) + R"(,"sha256":)" +
         jsonString(ptxHash.c_str()) + R"(},"reflection":)" + reflection + "}}}";

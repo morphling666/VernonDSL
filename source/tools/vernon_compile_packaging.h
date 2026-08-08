@@ -13,7 +13,6 @@ namespace vernon::tools {
 struct PackagingOptions {
     std::optional<std::filesystem::path> outputDirectory;
     std::optional<std::filesystem::path> reflectionPath;
-    std::optional<std::filesystem::path> computeBundlePath;
     std::optional<std::string> targetTriple;
 };
 

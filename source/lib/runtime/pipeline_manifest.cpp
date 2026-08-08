@@ -1,11 +1,9 @@
 #include "pipeline_manifest.h"
-#include "content_hash.h"
 #include "pipeline_metadata.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <array>
 #include <limits>
 #include <set>
 #include <string_view>
@@ -59,34 +57,6 @@ std::optional<VernonTextureDimension> pipelineTextureDimension(const std::string
     return std::nullopt;
 }
 
-std::optional<VernonTextureFormat> pipelineTextureFormat(const std::string &format) {
-    if (format == "rgba8_unorm")
-        return VERNON_TEXTURE_RGBA8_UNORM;
-    if (format == "rgba8_srgb")
-        return VERNON_TEXTURE_RGBA8_SRGB;
-    if (format == "rgba16_float")
-        return VERNON_TEXTURE_RGBA16_FLOAT;
-    if (format == "rgba32_float")
-        return VERNON_TEXTURE_RGBA32_FLOAT;
-    if (format == "r8_unorm")
-        return VERNON_TEXTURE_R8_UNORM;
-    if (format == "r16_float")
-        return VERNON_TEXTURE_R16_FLOAT;
-    if (format == "r32_float")
-        return VERNON_TEXTURE_R32_FLOAT;
-    if (format == "rg8_unorm")
-        return VERNON_TEXTURE_RG8_UNORM;
-    if (format == "rgb8_unorm")
-        return VERNON_TEXTURE_RGB8_UNORM;
-    if (format == "r11g11b10_float")
-        return VERNON_TEXTURE_R11G11B10_FLOAT;
-    if (format == "d32_float")
-        return VERNON_TEXTURE_D32_FLOAT;
-    if (format == "d32_float_s8_uint")
-        return VERNON_TEXTURE_D32_FLOAT_S8_UINT;
-    return std::nullopt;
-}
-
 namespace {
 
 bool parseUint32(const nlohmann::json &value, uint32_t &result);
@@ -102,12 +72,12 @@ template <size_t N> bool hasOnlyKeys(const nlohmann::json &value, const std::str
 
 constexpr std::string_view kVariantKeys[] = {"key", "program", "parameters", "internal_parameters", "outputs"};
 constexpr std::string_view kExternalParameterKeys[] = {
-    "slot",         "name",           "kind",  "type",          "uses",      "access",         "shape",
-    "value_layout", "element_layout", "dtype", "address_space", "dimension", "texture_format",
+    "slot",  "name",         "kind",           "type",  "uses",          "access",
+    "shape", "value_layout", "element_layout", "dtype", "address_space", "dimension",
 };
 constexpr std::string_view kInternalParameterKeys[] = {
-    "name",           "kind",  "type",          "uses",      "access",         "shape",  "value_layout",
-    "element_layout", "dtype", "address_space", "dimension", "texture_format", "source", "system_value",
+    "name",           "kind",  "type",          "uses",      "access", "shape",        "value_layout",
+    "element_layout", "dtype", "address_space", "dimension", "source", "system_value",
 };
 constexpr std::string_view kParameterUseKeys[] = {
     "stage",
@@ -127,7 +97,7 @@ constexpr std::string_view kParameterUseKeys[] = {
     "sampled_texture_bindings",
     "tensor_view_descriptor",
 };
-constexpr std::string_view kOutputKeys[] = {"name", "kind", "dtype", "shape", "access", "location", "type"};
+constexpr std::string_view kOutputKeys[] = {"name", "kind", "dtype", "shape", "access", "location"};
 constexpr std::string_view kAttributeLeafKeys[] = {"path",  "location",        "location_offset",
                                                    "dtype", "component_count", "byte_offset"};
 constexpr std::string_view kSampledTextureBindingKeys[] = {"set", "binding"};
@@ -909,11 +879,6 @@ bool Variant::validate(std::string &error) const {
     const auto validTextureDimension = [](const std::string &dimension) {
         return dimension == "2d" || dimension == "3d" || dimension == "cube";
     };
-    const auto validTextureFormat = [](const std::string &format) {
-        return format.empty() || format == "rgba8_unorm" || format == "rgba8_srgb" || format == "rgba16_float" ||
-               format == "rgba32_float" || format == "r8_unorm" || format == "r16_float" || format == "r32_float" ||
-               format == "rg8_unorm" || format == "rgb8_unorm" || format == "r11g11b10_float";
-    };
     if (!std::is_sorted(key.begin(), key.end()) || std::adjacent_find(key.begin(), key.end()) != key.end()) {
         error = "pipeline variant feature key is not canonical";
         return false;
@@ -941,9 +906,7 @@ bool Variant::validate(std::string &error) const {
             return false;
         }
         const bool textureConstraintsValid =
-            parameter.kind == "texture"
-                ? validTextureDimension(parameter.dimension) && validTextureFormat(parameter.textureFormat)
-                : parameter.dimension.empty() && parameter.textureFormat.empty();
+            parameter.kind == "texture" ? validTextureDimension(parameter.dimension) : parameter.dimension.empty();
         if (!textureConstraintsValid) {
             error = "pipeline parameter texture constraint invariant failed";
             return false;
@@ -1257,8 +1220,8 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
             error = "pipeline parameter slot must be a non-negative uint32";
             return false;
         }
-        for (std::string_view field : {"name", "kind", "access", "dtype", "address_space", "dimension",
-                                       "texture_format", "source", "system_value"})
+        for (std::string_view field :
+             {"name", "kind", "access", "dtype", "address_space", "dimension", "source", "system_value"})
             if (row.contains(std::string(field)) && !row[std::string(field)].is_string()) {
                 error = "pipeline parameter string metadata has an invalid type";
                 return false;
@@ -1270,7 +1233,6 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
         parameter.access = row["access"].get<std::string>();
         parameter.addressSpace = row.value("address_space", "");
         parameter.dimension = row.value("dimension", "");
-        parameter.textureFormat = row.value("texture_format", "");
         for (const nlohmann::json &dimension : row["shape"]) {
             uint64_t extent = 0;
             if (!parseUint64(dimension, extent)) {
@@ -1301,12 +1263,11 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
             return false;
         }
         if (parameter.kind == "texture") {
-            if (!pipelineTextureDimension(parameter.dimension) ||
-                (!parameter.textureFormat.empty() && !pipelineTextureFormat(parameter.textureFormat))) {
-                error = "texture parameter has an invalid dimension or texture_format";
+            if (!pipelineTextureDimension(parameter.dimension)) {
+                error = "texture parameter has an invalid dimension";
                 return false;
             }
-        } else if (!parameter.dimension.empty() || !parameter.textureFormat.empty()) {
+        } else if (!parameter.dimension.empty()) {
             error = "non-texture parameter contains texture constraints";
             return false;
         }
@@ -1417,8 +1378,6 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
                 output.shape.push_back(extent);
             }
         }
-        if (output.dtype.empty())
-            parseStaticType(row.value("type", ""), output.dtype, output.shape);
         if (output.name.empty() || output.dtype.empty() || output.location == UINT32_MAX) {
             error = "pipeline output metadata is incomplete";
             return false;
@@ -1449,37 +1408,57 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
     return variant.validate(error);
 }
 
-bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifest, std::string &error) {
-    const bool hasTransform = root.contains("program_transform");
-    const bool hasProfiles = root.contains("autodiff_profiles");
-    if (hasTransform != hasProfiles) {
-        error = "pipeline autodiff manifest requires both program_transform and autodiff_profiles";
+bool validatePipelineRootSchema(const nlohmann::json &root, std::string &error) {
+    static constexpr std::string_view keys[] = {
+        "pipeline_version", "type",     "id",          "target", "runtime_requirements", "variants",
+        "stage_artifacts",  "autodiff", "content_hash"};
+    for (std::string_view required : {"pipeline_version", "type", "id", "target", "runtime_requirements", "variants",
+                                      "stage_artifacts", "content_hash"})
+        if (!root.contains(std::string(required))) {
+            error = "pipeline manifest is missing a required root field";
+            return false;
+        }
+    if (!root.is_object() || !hasOnlyKeys(root, keys)) {
+        error = "pipeline manifest contains an unknown or legacy root field";
         return false;
     }
-    if (!hasTransform)
+    return true;
+}
+
+bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifest, std::string &error) {
+    if (!root.contains("autodiff"))
         return true;
-    const nlohmann::json &transform = root["program_transform"];
-    const nlohmann::json &profiles = root["autodiff_profiles"];
-    auto validIdentity = [](const nlohmann::json &value) {
-        if (!value.is_string())
-            return false;
-        const std::string &text = value.get_ref<const std::string &>();
-        return text.size() == 64 && std::all_of(text.begin(), text.end(), [](unsigned char character) {
-                   return (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f');
-               });
-    };
-    auto verifyIdentity = [&](const nlohmann::json &value, const char *label) {
-        if (!value.is_object() || !value.contains("identity") || !validIdentity(value["identity"]))
-            return false;
-        nlohmann::json canonical = value;
-        const std::string expected = canonical["identity"].get<std::string>();
-        canonical.erase("identity");
-        const std::string bytes = canonical.dump(-1, ' ', false, nlohmann::json::error_handler_t::strict);
-        if (sha256Hex(bytes.data(), bytes.size()) == expected)
-            return true;
-        error = std::string(label) + " identity does not match canonical content";
+    const nlohmann::json &autodiff = root["autodiff"];
+    if (!autodiff.is_object() || !hasOnlyKeys(autodiff, {"kind", "protocol", "wrt", "output_cotangents", "variants"}) ||
+        autodiff.value("kind", "") != "vjp" ||
+        (autodiff.value("protocol", "") != "dynamic_v2" && autodiff.value("protocol", "") != "legacy_fixed") ||
+        !autodiff.contains("wrt") || !autodiff["wrt"].is_array() || !autodiff.contains("output_cotangents") ||
+        !autodiff["output_cotangents"].is_array() || !autodiff.contains("variants") ||
+        !autodiff["variants"].is_array()) {
+        error = "pipeline autodiff object is invalid";
         return false;
+    }
+    manifest.protocol = autodiff["protocol"].get<std::string>();
+    auto parsePaths = [&](const nlohmann::json &value, std::vector<std::string> &paths, const char *label) {
+        for (const nlohmann::json &path : value) {
+            if (!path.is_string() || !isCanonicalAutodiffPath(path.get_ref<const std::string &>())) {
+                error = std::string("pipeline autodiff ") + label + " paths are invalid";
+                return false;
+            }
+            paths.push_back(path.get<std::string>());
+        }
+        if (paths.empty() || !std::is_sorted(paths.begin(), paths.end()) ||
+            std::adjacent_find(paths.begin(), paths.end()) != paths.end()) {
+            error = std::string("pipeline autodiff ") + label + " paths are not canonical";
+            return false;
+        }
+        return true;
     };
+    std::vector<std::string> wrt;
+    std::vector<std::string> outputCotangents;
+    if (!parsePaths(autodiff["wrt"], wrt, "wrt") ||
+        !parsePaths(autodiff["output_cotangents"], outputCotangents, "output cotangent"))
+        return false;
     auto parseLaunchSize = [](const nlohmann::json &value, VernonLaunchSize &size) {
         if (!value.is_array() || value.size() != 3)
             return false;
@@ -1491,82 +1470,18 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
                 static_cast<uint32_t>(dimensions[2])};
         return true;
     };
-    auto parseCanonicalStrings = [](const nlohmann::json &value, std::vector<std::string> &result, bool allowEmpty) {
-        if (!value.is_array() || (!allowEmpty && value.empty()))
-            return false;
-        for (const nlohmann::json &item : value) {
-            if (!item.is_string() || item.get_ref<const std::string &>().empty())
-                return false;
-            result.push_back(item.get<std::string>());
-        }
-        return std::is_sorted(result.begin(), result.end()) &&
-               std::adjacent_find(result.begin(), result.end()) == result.end();
-    };
-    const bool hasProtocol = transform.contains("protocol");
-    if (!transform.is_object() ||
-        !hasOnlyKeys(transform,
-                     {"kind", "wrt", "output_cotangents", "gradient_policy", "accumulation_policy", "tape_policy",
-                      "protocol", "derivative_rules_version", "identity", "rule_set", "rule_set_identity"}) ||
-        transform.value("kind", "") != "vjp" || !transform.contains("wrt") || !transform["wrt"].is_array() ||
-        !transform.contains("output_cotangents") || !transform["output_cotangents"].is_array() ||
-        transform.value("gradient_policy", "") != "f16:f32,f32:f32,f64:f64" ||
-        transform.value("accumulation_policy", "") != "fresh" || transform.value("tape_policy", "") != "bounded" ||
-        (hasProtocol && transform.value("protocol", "") != "dynamic_v2" &&
-         transform.value("protocol", "") != "legacy_fixed") ||
-        transform.value("derivative_rules_version", 0) != 1 || !verifyIdentity(transform, "program transform")) {
-        if (error.empty())
-            error = "pipeline program_transform is invalid";
-        return false;
-    }
-    std::vector<std::string> wrt;
-    for (const nlohmann::json &path : transform["wrt"]) {
-        if (!path.is_string() || !isCanonicalAutodiffPath(path.get_ref<const std::string &>())) {
-            error = "pipeline program_transform wrt paths are invalid";
-            return false;
-        }
-        wrt.push_back(path.get<std::string>());
-    }
-    if (wrt.empty() || !std::is_sorted(wrt.begin(), wrt.end()) ||
-        std::adjacent_find(wrt.begin(), wrt.end()) != wrt.end()) {
-        error = "pipeline program_transform wrt paths are not canonical";
-        return false;
-    }
-    std::vector<std::string> outputCotangents;
-    for (const nlohmann::json &path : transform["output_cotangents"]) {
-        if (!path.is_string() || !isCanonicalAutodiffPath(path.get_ref<const std::string &>())) {
-            error = "pipeline program_transform output cotangent paths are invalid";
-            return false;
-        }
-        outputCotangents.push_back(path.get<std::string>());
-    }
-    if (outputCotangents.empty() || !std::is_sorted(outputCotangents.begin(), outputCotangents.end()) ||
-        std::adjacent_find(outputCotangents.begin(), outputCotangents.end()) != outputCotangents.end()) {
-        error = "pipeline program_transform output cotangent paths are not canonical";
-        return false;
-    }
-    manifest.transformIdentity = transform["identity"].get<std::string>();
-    // Pipeline contract v13 predates the protocol member. Such manifests use
-    // the fixed-tape ABI; preserving their original identity is mandatory.
-    manifest.protocol = hasProtocol ? transform["protocol"].get<std::string>() : "legacy_fixed";
-    if (!profiles.is_object() || !hasOnlyKeys(profiles, {"identity", "variants"}) || !profiles.contains("variants") ||
-        !profiles["variants"].is_array() || !verifyIdentity(profiles, "autodiff profiles")) {
-        if (error.empty())
-            error = "pipeline autodiff_profiles is invalid";
-        return false;
-    }
-    manifest.profilesIdentity = profiles["identity"].get<std::string>();
     std::vector<std::string> gradientPaths;
     std::vector<std::string> cotangentPaths;
-    for (const nlohmann::json &value : profiles["variants"]) {
-        if (!value.is_object() || !hasOnlyKeys(value, {"key", "plan", "programs"}) || !value.contains("key") ||
-            !value["key"].is_array() || !value.contains("plan") || !value["plan"].is_object() ||
-            !value.contains("programs") || !value["programs"].is_object()) {
-            error = "autodiff variant profile is invalid";
+    for (const nlohmann::json &value : autodiff["variants"]) {
+        if (!value.is_object() || !hasOnlyKeys(value, {"key", "workgroup_size", "profiles"}) ||
+            !value.contains("key") || !value["key"].is_array() || !value.contains("workgroup_size") ||
+            !value.contains("profiles") || !value["profiles"].is_object()) {
+            error = "autodiff variant is invalid";
             return false;
         }
         AutodiffVariant variant;
         for (const nlohmann::json &feature : value["key"]) {
-            if (!feature.is_string()) {
+            if (!feature.is_string() || feature.get_ref<const std::string &>().empty()) {
                 error = "autodiff variant feature key is invalid";
                 return false;
             }
@@ -1577,108 +1492,31 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
             error = "autodiff variant feature key is not canonical";
             return false;
         }
-        const nlohmann::json &plan = value["plan"];
-        if (!hasOnlyKeys(plan, {"transform_identity", "program_graph_identity", "tape_bytes", "derivative_rules",
-                                "derivative_rules_version", "launch", "profiles", "identity"}) ||
-            plan.value("transform_identity", "") != manifest.transformIdentity ||
-            !plan.contains("program_graph_identity") || !validIdentity(plan["program_graph_identity"]) ||
-            !plan.contains("tape_bytes") || !parseUint64(plan["tape_bytes"], variant.tapeBytes) ||
-            plan.value("derivative_rules_version", 0) != 1 || !plan.contains("launch") || !plan["launch"].is_object() ||
-            !plan.contains("profiles") || !plan["profiles"].is_array() || plan["profiles"].size() != 3 ||
-            !verifyIdentity(plan, "autodiff plan")) {
-            if (error.empty())
-                error = "autodiff profile plan is invalid";
+        if (!parseLaunchSize(value["workgroup_size"], variant.launch.workgroupSize)) {
+            error = "autodiff variant workgroup size is invalid";
             return false;
         }
-        variant.planIdentity = plan["identity"].get<std::string>();
-        variant.programGraphIdentity = plan["program_graph_identity"].get<std::string>();
-        const nlohmann::json &launch = plan["launch"];
-        if (!hasOnlyKeys(launch, {"workgroup_size", "accumulation_plans"}) || !launch.contains("workgroup_size") ||
-            !parseLaunchSize(launch["workgroup_size"], variant.launch.workgroupSize) ||
-            !launch.contains("accumulation_plans") || !launch["accumulation_plans"].is_array() ||
-            launch["accumulation_plans"].size() != wrt.size()) {
-            error = "autodiff launch plan is invalid";
+        const nlohmann::json &profiles = value["profiles"];
+        if (!hasOnlyKeys(profiles, {"primal", "forward_with_tape", "backward"}) || profiles.size() != 3) {
+            error = "autodiff profile table is invalid";
             return false;
         }
-        std::vector<std::string> accumulationPaths;
-        for (const nlohmann::json &resource : launch["accumulation_plans"]) {
-            if (!resource.is_object() || !hasOnlyKeys(resource, {"path", "mode", "evidence", "invocation_axes"}) ||
-                !resource.contains("path") || !resource["path"].is_string() ||
-                resource["path"].get_ref<const std::string &>().empty() || !resource.contains("mode") ||
-                !resource["mode"].is_string() || !resource.contains("evidence") ||
-                !resource.contains("invocation_axes") || !resource["invocation_axes"].is_array()) {
-                error = "autodiff resource accumulation plan is invalid";
-                return false;
-            }
-            AutodiffAccumulationPlan accumulation;
-            accumulation.path = resource["path"].get<std::string>();
-            const std::string mode = resource.value("mode", "");
-            if (mode == "reduce_sum")
-                accumulation.operation = AutodiffAccumulationPlan::Operation::ReduceSum;
-            else if (mode == "scatter_add")
-                accumulation.operation = AutodiffAccumulationPlan::Operation::ScatterAdd;
-            else {
-                error = "autodiff resource accumulation operation is invalid";
-                return false;
-            }
-            if (!parseCanonicalStrings(resource["evidence"], accumulation.evidence, true)) {
-                error = "autodiff resource accumulation evidence is invalid";
-                return false;
-            }
-            constexpr std::array<std::string_view, 5> evidenceKinds{"disjoint_scatter", "injective_global_index",
-                                                                    "non_injective_index", "shared_value",
-                                                                    "static_index_conflict"};
-            if (std::any_of(accumulation.evidence.begin(), accumulation.evidence.end(), [&](const std::string &item) {
-                    return std::find(evidenceKinds.begin(), evidenceKinds.end(), item) == evidenceKinds.end();
-                })) {
-                error = "autodiff resource accumulation evidence is unknown";
-                return false;
-            }
-            for (const nlohmann::json &axisValue : resource["invocation_axes"]) {
-                uint32_t axis = 0;
-                if (!parseUint32(axisValue, axis) || axis >= 3 ||
-                    (!accumulation.invocationAxes.empty() && accumulation.invocationAxes.back() >= axis)) {
-                    error = "autodiff resource invocation axes are not canonical";
-                    return false;
-                }
-                accumulation.invocationAxes.push_back(axis);
-            }
-            const bool disjoint = std::find(accumulation.evidence.begin(), accumulation.evidence.end(),
-                                            "disjoint_scatter") != accumulation.evidence.end();
-            const bool injective = std::find(accumulation.evidence.begin(), accumulation.evidence.end(),
-                                             "injective_global_index") != accumulation.evidence.end();
-            const bool shared = std::find(accumulation.evidence.begin(), accumulation.evidence.end(), "shared_value") !=
-                                accumulation.evidence.end();
-            if ((accumulation.operation == AutodiffAccumulationPlan::Operation::ReduceSum &&
-                 (accumulation.evidence != std::vector<std::string>{"shared_value"} ||
-                  !accumulation.invocationAxes.empty())) ||
-                (accumulation.operation == AutodiffAccumulationPlan::Operation::ScatterAdd &&
-                 (shared || injective != !accumulation.invocationAxes.empty())) ||
-                (disjoint && (accumulation.operation != AutodiffAccumulationPlan::Operation::ScatterAdd ||
-                              accumulation.invocationAxes != std::vector<uint32_t>{0, 1, 2}))) {
-                error = "autodiff resource accumulation evidence is inconsistent";
-                return false;
-            }
-            accumulationPaths.push_back(accumulation.path);
-            variant.launch.accumulationPlans.push_back(std::move(accumulation));
-        }
-        if (accumulationPaths != wrt) {
-            error = "autodiff launch resources do not match the transform";
-            return false;
-        }
-        static constexpr std::string_view expectedNames[] = {"primal", "forward_with_tape", "backward"};
         std::vector<std::string> variantGradientPaths;
         std::vector<std::string> variantCotangentPaths;
+        const char *names[] = {"primal", "forward_with_tape", "backward"};
+        std::string *stageIds[] = {&variant.primal, &variant.forwardWithTape, &variant.backward};
+        std::string forwardTapeType;
         for (size_t index = 0; index < 3; ++index) {
-            const nlohmann::json &profile = plan["profiles"][index];
-            if (!profile.is_object() || !hasOnlyKeys(profile, {"name", "symbol", "inputs", "outputs"}) ||
-                profile.value("name", "") != expectedNames[index] || profile.value("symbol", "").empty() ||
-                !profile.contains("inputs") || !profile["inputs"].is_array() || !profile.contains("outputs") ||
-                !profile["outputs"].is_array()) {
-                error = "autodiff profile ABI is invalid";
+            const nlohmann::json &profile = profiles.value(names[index], nlohmann::json{});
+            if (!profile.is_object() || !hasOnlyKeys(profile, {"compute", "inputs", "outputs"}) ||
+                !profile.contains("compute") || !profile["compute"].is_string() ||
+                profile["compute"].get_ref<const std::string &>().empty() || !profile.contains("inputs") ||
+                !profile["inputs"].is_array() || !profile.contains("outputs") || !profile["outputs"].is_array()) {
+                error = "autodiff profile is invalid";
                 return false;
             }
-            auto validBindings = [&](const nlohmann::json &bindings) {
+            *stageIds[index] = profile["compute"].get<std::string>();
+            auto validBindings = [](const nlohmann::json &bindings) {
                 return std::all_of(bindings.begin(), bindings.end(), [](const nlohmann::json &binding) {
                     return binding.is_object() && hasOnlyKeys(binding, {"path", "type", "role"}) &&
                            isCanonicalAutodiffPath(binding.value("path", "")) && !binding.value("type", "").empty() &&
@@ -1689,38 +1527,57 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
                 error = "autodiff profile bindings are invalid";
                 return false;
             }
-            if (index == 2) {
-                const nlohmann::json &inputs = profile["inputs"];
-                if (inputs.empty() || inputs[0].value("path", "") != "tape" || inputs[0].value("role", "") != "tape") {
-                    error = "autodiff backward tape binding is invalid";
+            const nlohmann::json &inputs = profile["inputs"];
+            const nlohmann::json &outputs = profile["outputs"];
+            const auto allHaveRole = [](const nlohmann::json &bindings, std::string_view role) {
+                return std::all_of(bindings.begin(), bindings.end(),
+                                   [&](const nlohmann::json &binding) { return binding.value("role", "") == role; });
+            };
+            if (index == 0) {
+                if (!allHaveRole(inputs, "primal") || !allHaveRole(outputs, "primal")) {
+                    error = "autodiff primal bindings are invalid";
                     return false;
                 }
-                for (size_t binding = 1; binding < inputs.size(); ++binding) {
-                    if (inputs[binding].value("role", "") != "cotangent") {
-                        error = "autodiff backward cotangent binding is invalid";
-                        return false;
-                    }
-                    variantCotangentPaths.push_back(inputs[binding].value("path", ""));
-                }
-                if (variantCotangentPaths.empty()) {
-                    error = "autodiff backward cotangents do not match program transform";
-                    return false;
-                }
-                for (const nlohmann::json &binding : profile["outputs"]) {
-                    if (binding.value("role", "") != "gradient") {
-                        error = "autodiff backward gradient binding is invalid";
-                        return false;
-                    }
-                    variantGradientPaths.push_back(binding.value("path", ""));
-                }
-                if (variantGradientPaths.empty() ||
-                    !std::is_sorted(variantGradientPaths.begin(), variantGradientPaths.end()) ||
-                    std::adjacent_find(variantGradientPaths.begin(), variantGradientPaths.end()) !=
-                        variantGradientPaths.end()) {
-                    error = "autodiff gradient paths are not canonical";
-                    return false;
-                }
+                continue;
             }
+            if (index == 1) {
+                if (!allHaveRole(inputs, "primal") || outputs.empty() || outputs.back().value("role", "") != "tape" ||
+                    outputs.back().value("path", "") != "tape" ||
+                    !std::all_of(outputs.begin(), std::prev(outputs.end()),
+                                 [](const nlohmann::json &binding) { return binding.value("role", "") == "primal"; })) {
+                    error = "autodiff forward bindings are invalid";
+                    return false;
+                }
+                forwardTapeType = outputs.back().value("type", "");
+                continue;
+            }
+            if (inputs.empty() || inputs[0].value("role", "") != "tape" || inputs[0].value("path", "") != "tape" ||
+                inputs[0].value("type", "") != forwardTapeType) {
+                error = "autodiff backward tape binding is invalid";
+                return false;
+            }
+            for (size_t binding = 1; binding < inputs.size(); ++binding) {
+                if (inputs[binding].value("role", "") != "cotangent") {
+                    error = "autodiff backward cotangent binding is invalid";
+                    return false;
+                }
+                variantCotangentPaths.push_back(inputs[binding].value("path", ""));
+            }
+            for (const nlohmann::json &binding : profile["outputs"]) {
+                if (binding.value("role", "") != "gradient") {
+                    error = "autodiff backward gradient binding is invalid";
+                    return false;
+                }
+                variantGradientPaths.push_back(binding.value("path", ""));
+            }
+        }
+        if (variantGradientPaths.empty() || variantCotangentPaths.empty() ||
+            std::set<std::string>(variantGradientPaths.begin(), variantGradientPaths.end()).size() !=
+                variantGradientPaths.size() ||
+            std::set<std::string>(variantCotangentPaths.begin(), variantCotangentPaths.end()).size() !=
+                variantCotangentPaths.size()) {
+            error = "autodiff derivative binding paths are not canonical";
+            return false;
         }
         if (gradientPaths.empty())
             gradientPaths = variantGradientPaths;
@@ -1732,24 +1589,6 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
             cotangentPaths = variantCotangentPaths;
         else if (cotangentPaths != variantCotangentPaths) {
             error = "autodiff variants expose inconsistent cotangent paths";
-            return false;
-        }
-        const nlohmann::json &programs = value["programs"];
-        if (!hasOnlyKeys(programs, {"primal", "forward_with_tape", "backward"})) {
-            error = "autodiff profile program table is invalid";
-            return false;
-        }
-        auto program = [&](const char *name, std::string &output) {
-            if (!programs.contains(name) || !programs[name].is_object() || !hasOnlyKeys(programs[name], {"compute"}) ||
-                !programs[name].contains("compute") || !programs[name]["compute"].is_string() ||
-                programs[name]["compute"].get_ref<const std::string &>().empty())
-                return false;
-            output = programs[name]["compute"].get<std::string>();
-            return true;
-        };
-        if (!program("primal", variant.primal) || !program("forward_with_tape", variant.forwardWithTape) ||
-            !program("backward", variant.backward)) {
-            error = "autodiff profile program reference is invalid";
             return false;
         }
         manifest.variants.push_back(std::move(variant));

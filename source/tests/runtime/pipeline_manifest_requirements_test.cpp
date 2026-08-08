@@ -1,4 +1,3 @@
-#include "runtime/content_hash.h"
 #include "runtime/pipeline_bundle.h"
 #include "runtime/pipeline_manifest.h"
 
@@ -12,70 +11,32 @@ namespace {
 using vernon::runtime::parseRuntimeRequirements;
 using vernon::runtime::RuntimeRequirements;
 
-nlohmann::json withIdentity(nlohmann::json value) {
-    const std::string canonical = value.dump(-1, ' ', false);
-    value["identity"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
-    return value;
-}
-
-nlohmann::json refreshIdentity(nlohmann::json value) {
-    value.erase("identity");
-    return withIdentity(std::move(value));
-}
-
 nlohmann::json validAutodiffManifest() {
-    nlohmann::json transform = withIdentity({{"kind", "vjp"},
-                                             {"wrt", nlohmann::json::array({"x"})},
-                                             {"output_cotangents", nlohmann::json::array({"output"})},
-                                             {"gradient_policy", "f16:f32,f32:f32,f64:f64"},
-                                             {"accumulation_policy", "fresh"},
-                                             {"tape_policy", "bounded"},
-                                             {"protocol", "dynamic_v2"},
-                                             {"derivative_rules_version", 1}});
-    const std::string transformIdentity = transform["identity"].get<std::string>();
     const nlohmann::json primal = {{"path", "x"}, {"type", "f32"}, {"role", "primal"}};
     const nlohmann::json output = {{"path", "output"}, {"type", "f32"}, {"role", "primal"}};
     const nlohmann::json tape = {{"path", "tape"}, {"type", "!vernon.ad_tape<16>"}, {"role", "tape"}};
     const nlohmann::json cotangent = {{"path", "output"}, {"type", "f32"}, {"role", "cotangent"}};
     const nlohmann::json gradient = {{"path", "x"}, {"type", "f32"}, {"role", "gradient"}};
-    nlohmann::json plan = withIdentity(
-        {{"transform_identity", transformIdentity},
-         {"program_graph_identity", std::string(64, 'a')},
-         {"tape_bytes", 16},
-         {"derivative_rules", nlohmann::json::array({"mul"})},
-         {"derivative_rules_version", 1},
-         {"launch",
-          {{"workgroup_size", nlohmann::json::array({1, 1, 1})},
-           {"accumulation_plans", nlohmann::json::array({{{"path", "x"},
-                                                          {"mode", "reduce_sum"},
-                                                          {"evidence", nlohmann::json::array({"shared_value"})},
-                                                          {"invocation_axes", nlohmann::json::array()}}})}}},
-         {"profiles", nlohmann::json::array({{{"name", "primal"},
-                                              {"symbol", "main"},
-                                              {"inputs", nlohmann::json::array({primal})},
-                                              {"outputs", nlohmann::json::array({output})}},
-                                             {{"name", "forward_with_tape"},
-                                              {"symbol", "__forward"},
-                                              {"inputs", nlohmann::json::array({primal})},
-                                              {"outputs", nlohmann::json::array({output, tape})}},
-                                             {{"name", "backward"},
-                                              {"symbol", "__backward"},
-                                              {"inputs", nlohmann::json::array({tape, cotangent})},
-                                              {"outputs", nlohmann::json::array({gradient})}}})}});
-    nlohmann::json profiles =
-        withIdentity({{"variants", nlohmann::json::array({{{"key", nlohmann::json::array()},
-                                                           {"plan", plan},
-                                                           {"programs",
-                                                            {{"primal", {{"compute", "primal"}}},
-                                                             {"forward_with_tape", {{"compute", "forward"}}},
-                                                             {"backward", {{"compute", "backward"}}}}}}})}});
-    return {{"program_transform", std::move(transform)}, {"autodiff_profiles", std::move(profiles)}};
-}
-
-void refreshAutodiffPlanIdentity(nlohmann::json &root) {
-    nlohmann::json &plan = root["autodiff_profiles"]["variants"][0]["plan"];
-    plan = refreshIdentity(std::move(plan));
-    root["autodiff_profiles"] = refreshIdentity(std::move(root["autodiff_profiles"]));
+    return {{"autodiff",
+             {{"kind", "vjp"},
+              {"protocol", "dynamic_v2"},
+              {"wrt", nlohmann::json::array({"x"})},
+              {"output_cotangents", nlohmann::json::array({"output"})},
+              {"variants", nlohmann::json::array({{{"key", nlohmann::json::array()},
+                                                   {"workgroup_size", nlohmann::json::array({1, 1, 1})},
+                                                   {"profiles",
+                                                    {{"primal",
+                                                      {{"compute", "primal"},
+                                                       {"inputs", nlohmann::json::array({primal})},
+                                                       {"outputs", nlohmann::json::array({output})}}},
+                                                     {"forward_with_tape",
+                                                      {{"compute", "forward"},
+                                                       {"inputs", nlohmann::json::array({primal})},
+                                                       {"outputs", nlohmann::json::array({output, tape})}}},
+                                                     {"backward",
+                                                      {{"compute", "backward"},
+                                                       {"inputs", nlohmann::json::array({tape, cotangent})},
+                                                       {"outputs", nlohmann::json::array({gradient})}}}}}}})}}}};
 }
 
 nlohmann::json validTensorVariant() {
@@ -138,53 +99,46 @@ TEST(PipelineManifestRequirements, ParsesCanonicalAutodiffProfiles) {
     ASSERT_EQ(manifest.variants.size(), 1u);
     EXPECT_EQ(manifest.variants[0].forwardWithTape, "forward");
     EXPECT_EQ(manifest.variants[0].backward, "backward");
-    EXPECT_EQ(manifest.variants[0].tapeBytes, 16u);
-    ASSERT_EQ(manifest.variants[0].launch.accumulationPlans.size(), 1u);
-    EXPECT_EQ(manifest.variants[0].launch.accumulationPlans[0].path, "x");
-    EXPECT_EQ(manifest.variants[0].launch.accumulationPlans[0].operation,
-              vernon::runtime::AutodiffAccumulationPlan::Operation::ReduceSum);
+    EXPECT_EQ(manifest.variants[0].launch.workgroupSize.x, 1u);
 }
 
-TEST(PipelineManifestRequirements, ParsesPipelineV13AutodiffTransformWithoutProtocol) {
+TEST(PipelineManifestRequirements, RejectsLegacyAutodiffMetadata) {
     using vernon::runtime::AutodiffManifest;
     using vernon::runtime::parseAutodiffManifest;
     nlohmann::json root = validAutodiffManifest();
-    root["program_transform"].erase("protocol");
-    root["program_transform"] = refreshIdentity(std::move(root["program_transform"]));
-    nlohmann::json &plan = root["autodiff_profiles"]["variants"][0]["plan"];
-    plan["transform_identity"] = root["program_transform"]["identity"];
-    plan = refreshIdentity(std::move(plan));
-    root["autodiff_profiles"] = refreshIdentity(std::move(root["autodiff_profiles"]));
+    root["autodiff"]["gradient_policy"] = "f16:f32,f32:f32,f64:f64";
 
     AutodiffManifest manifest;
     std::string error;
-    ASSERT_TRUE(parseAutodiffManifest(root, manifest, error)) << error;
-    EXPECT_EQ(manifest.protocol, "legacy_fixed");
-    EXPECT_EQ(manifest.transformIdentity, root["program_transform"]["identity"]);
+    EXPECT_FALSE(parseAutodiffManifest(root, manifest, error));
+    EXPECT_NE(error.find("autodiff object"), std::string::npos);
 }
 
-TEST(PipelineManifestRequirements, RejectsIncompleteOrTamperedAutodiffProfiles) {
+TEST(PipelineManifestRequirements, RejectsIncompleteOrUnknownAutodiffProfiles) {
     using vernon::runtime::AutodiffManifest;
     using vernon::runtime::parseAutodiffManifest;
     std::string error;
     AutodiffManifest manifest;
     nlohmann::json root = validAutodiffManifest();
-    root.erase("autodiff_profiles");
-    EXPECT_FALSE(parseAutodiffManifest(root, manifest, error));
-
-    root = validAutodiffManifest();
-    root["program_transform"]["protocol"] = "unknown";
+    root["autodiff"]["protocol"] = "unknown";
     error.clear();
     manifest = {};
     EXPECT_FALSE(parseAutodiffManifest(root, manifest, error));
-    EXPECT_NE(error.find("program_transform"), std::string::npos);
+    EXPECT_NE(error.find("autodiff object"), std::string::npos);
 
     root = validAutodiffManifest();
-    root["autodiff_profiles"]["variants"][0]["plan"]["tape_bytes"] = 32;
+    root["autodiff"]["variants"][0]["profiles"]["backward"]["symbol"] = "__backward";
     error.clear();
     manifest = {};
     EXPECT_FALSE(parseAutodiffManifest(root, manifest, error));
-    EXPECT_NE(error.find("identity"), std::string::npos);
+    EXPECT_NE(error.find("profile"), std::string::npos);
+
+    root = validAutodiffManifest();
+    root["autodiff"]["variants"][0]["profiles"]["forward_with_tape"]["outputs"][1]["role"] = "primal";
+    error.clear();
+    manifest = {};
+    EXPECT_FALSE(parseAutodiffManifest(root, manifest, error));
+    EXPECT_NE(error.find("forward bindings"), std::string::npos);
 }
 
 TEST(PipelineManifestRequirements, RejectsNonCanonicalAutodiffPaths) {
@@ -194,10 +148,28 @@ TEST(PipelineManifestRequirements, RejectsNonCanonicalAutodiffPaths) {
     std::string error;
 
     nlohmann::json root = validAutodiffManifest();
-    root["autodiff_profiles"]["variants"][0]["plan"]["profiles"][2]["inputs"][1]["path"] = "output..mass";
-    refreshAutodiffPlanIdentity(root);
+    root["autodiff"]["variants"][0]["profiles"]["backward"]["inputs"][1]["path"] = "output..mass";
     EXPECT_FALSE(parseAutodiffManifest(root, manifest, error));
     EXPECT_NE(error.find("bindings"), std::string::npos);
+}
+
+TEST(PipelineManifestRequirements, RejectsInconsistentAutodiffTapeBindings) {
+    using vernon::runtime::AutodiffManifest;
+    using vernon::runtime::parseAutodiffManifest;
+    AutodiffManifest manifest;
+    std::string error;
+
+    nlohmann::json root = validAutodiffManifest();
+    root["autodiff"]["variants"][0]["profiles"]["backward"]["inputs"][0]["path"] = "saved";
+    EXPECT_FALSE(parseAutodiffManifest(root, manifest, error));
+    EXPECT_NE(error.find("backward tape binding"), std::string::npos);
+
+    root = validAutodiffManifest();
+    root["autodiff"]["variants"][0]["profiles"]["backward"]["inputs"][0]["type"] = "!vernon.ad_tape<32>";
+    error.clear();
+    manifest = {};
+    EXPECT_FALSE(parseAutodiffManifest(root, manifest, error));
+    EXPECT_NE(error.find("backward tape binding"), std::string::npos);
 }
 
 TEST(PipelineManifestRequirements, ValidatesCanonicalDerivativeGroupsAndRejectsDivergentMetadata) {

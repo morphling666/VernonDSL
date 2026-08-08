@@ -227,7 +227,9 @@ and target options to that C API; none may carry an independent lowering or
 reflection path.
 `vernon-compile` is a compatibility and file-packaging shell over the C API,
 not an internal compiler service. Python runtime and cooker code must never
-invoke it as a subprocess.
+invoke it as a subprocess. It may write raw compiler artifacts and reflection;
+the removed `--compute-bundle` option and `compute.json` format are not
+pipeline packaging surfaces.
 
 Compilation stops at owned artifacts, reflection, and optional CPU JIT entry
 points. Creating a runtime context, loading a pipeline, and dispatching work
@@ -323,8 +325,8 @@ compiler-internal ProgramGraph proposed for autodiff.
 
 Texture parameter constraints are queried through a separate `struct_size`-
 versioned runtime view so `VernonPipelineParameterView` remains ABI-stable.
-Dimension is required; manifests may additionally provide canonical
-`texture_format` names. Omitted formats are explicitly unconstrained.
+Pipeline 14 records the required texture dimension; format remains
+unconstrained.
 
 A target is reported as available only after its complete lowering and
 artifact generation pipeline is registered. An IR-only prototype must return
@@ -653,6 +655,14 @@ content hashes, artifact paths, sizes, digests, reflection, and exact feature
 keys. Metal MSL manifests are consumed by the Metal Runtime on Apple; that path
 is part of the stable Apple Silicon macOS compute and offscreen graphics
 subset. DirectX DXIL manifests use the Windows D3D12 runtime backend.
+
+Pipeline 14 defines one canonical `*.pipeline.json` root for every target and
+for both compute and graphics programs. Primal-only assets omit autodiff
+metadata. Differentiated assets add one optional root `autodiff` object; the
+pipeline-13 transform/profile fields must not be emitted or interpreted as
+current-schema aliases. CPU cooking writes the same manifest, a
+content-addressed relocatable `.o`/`.obj`, and generated static-registration
+`.c`/`.h` sources.
 
 Runtime-backed PipelineAssets also carry hash-covered `runtime_requirements`.
 The cooker derives these from the emitted object,

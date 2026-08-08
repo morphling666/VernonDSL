@@ -20,8 +20,6 @@ struct CpuNativeArtifact {
     std::string format{"native_library"};
     std::string entry;
     std::string symbol;
-    std::string operatingSystem;
-    std::string architecture;
     std::string targetTriple;
     std::string objectFormat;
     uint64_t size{};
@@ -36,16 +34,9 @@ struct ResolvedArtifact {
     bool external{};
 };
 
-struct AutodiffStageMetadata {
-    std::string profile;
-    std::string protocol;
-    std::string profilesIdentity;
-};
-
 struct Stage {
     std::string stage;
     std::string entry;
-    std::optional<AutodiffStageMetadata> autodiff;
     std::string source;
     std::string reflection;
     std::vector<uint8_t> binary;
@@ -63,8 +54,6 @@ bool resolveArtifact(const nlohmann::json &descriptor, const std::optional<std::
 
 bool resolveCpuNativeArtifact(const CpuNativeArtifact &artifact, std::filesystem::path &libraryPath,
                               ReflectedEntry *reflection, std::string &error);
-
-bool parseCpuComputeBundle(const std::filesystem::path &root, CpuNativeArtifact &artifact, std::string &error);
 
 } // namespace vernon::runtime
 

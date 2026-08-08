@@ -5,10 +5,6 @@
 #include <stdio.h>
 #include <string.h>
 
-#ifndef VERNON_CPU_BUNDLE_PATH
-#error VERNON_CPU_BUNDLE_PATH must name the CPU bundle test fixture
-#endif
-
 static VernonStatus fill_grid(const VernonCpuInvocation *invocation) {
     uintptr_t address = 0;
     uint32_t gid[3] = {0, 0, 0};
@@ -90,18 +86,6 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     ASSERT_TRUE(values[0] == 0.0f && values[2] == 2.0f);
     ASSERT_TRUE(values[3] == 10.0f && values[11] == 112.0f);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_INVALID_ARGUMENT);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-
-    memset(values, 0, sizeof(values));
-    pipeline = vernonRuntimeLoadComputeBundle(runtime, VERNON_CPU_BUNDLE_PATH);
-    if (!pipeline) {
-        VernonStringView error = vernonRuntimeGetLastError(runtime);
-        fprintf(stderr, "%.*s\n", (int)error.size, error.data);
-    }
-    ASSERT_TRUE(pipeline);
-    ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
-    ASSERT_TRUE(values[0] == 0.0f && values[2] == 2.0f);
-    ASSERT_TRUE(values[3] == 10.0f && values[11] == 112.0f);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
 
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);

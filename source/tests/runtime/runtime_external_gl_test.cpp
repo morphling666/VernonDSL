@@ -554,7 +554,6 @@ std::string pipelineBundle(const nlohmann::json &artifact) {
         {"type", "pipeline"},
         {"id", "pipeline/gl"},
         {"target", {{"kind", "opengl"}, {"options", nlohmann::json::object()}}},
-        {"features", nlohmann::json::array()},
         {"runtime_requirements",
          {{"backend", "opengl"},
           {"features", nlohmann::json::array({"textures"})},
@@ -566,9 +565,13 @@ std::string pipelineBundle(const nlohmann::json &artifact) {
                                              {"outputs", nlohmann::json::array()},
                                              {"program", {{"vertex", "vs"}, {"fragment", "fs"}}}}})},
         {"stage_artifacts",
-         {{"vs", {{"id", "vs"}, {"stage", "vertex"}, {"entry", "main"}, {"target", "opengl"}, {"artifact", artifact}}},
+         {{"vs",
+           {{"stage", "vertex"}, {"entry", "main"}, {"artifact", artifact}, {"reflection", nlohmann::json::object()}}},
           {"fs",
-           {{"id", "fs"}, {"stage", "fragment"}, {"entry", "main"}, {"target", "opengl"}, {"artifact", artifact}}}}}};
+           {{"stage", "fragment"},
+            {"entry", "main"},
+            {"artifact", artifact},
+            {"reflection", nlohmann::json::object()}}}}}};
     const std::string canonical = root.dump(-1, ' ', false);
     root["content_hash"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
     return root.dump(-1, ' ', false);
@@ -580,8 +583,6 @@ std::string matrixBundle(const char *target) {
     nlohmann::json root = nlohmann::json::parse(pipelineBundle(inlineArtifact(source)));
     root["target"] = {{"kind", target}, {"options", nlohmann::json::object()}};
     root["runtime_requirements"]["backend"] = target;
-    root["stage_artifacts"]["vs"]["target"] = target;
-    root["stage_artifacts"]["fs"]["target"] = target;
     if (std::strcmp(target, "opengles") == 0) {
         root["runtime_requirements"]["api_version"] = nlohmann::json::array({3, 1});
         root["runtime_requirements"]["glsl_version"] = 310;

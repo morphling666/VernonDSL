@@ -1,15 +1,18 @@
 # Runtime design
 
-## CPU compute bundles
+## CPU cooked pipelines
 
-Persistent CPU bundles contain a target relocatable object with stable,
-module-hashed C entry wrappers. The manifest records `PIPELINE_VERSION`, the
-target triple, object format, exported symbol, artifact size, and SHA-256.
-Applications link the object at build time and register its wrapper with
-VernonRuntime; Runtime validates the external descriptor but never parses or
-relocates object files. Python immediate execution uses compiler-owned LLJIT to
-load the host object directly. LLVM IR and ORC JIT are not persistent runtime
-bundle formats.
+CPU cooking emits the canonical `*.pipeline.json` manifest, a target
+relocatable `.o`/`.obj` with stable module-hashed C entry wrappers, and
+generated registration `.c`/`.h` sources. The manifest records
+`PIPELINE_VERSION`, the target triple, object format, exported symbol, artifact
+size, and SHA-256. Applications link the object and generated registration
+source at build time and call its registration function before loading the
+pipeline. Runtime validates the external descriptor but never parses or
+relocates object files. The removed `vernon-compile --compute-bundle` and
+`compute.json` format are not pipeline-14 deployment APIs. Python immediate
+execution uses compiler-owned LLJIT to load the host object directly. LLVM IR
+and ORC JIT are not persistent runtime bundle formats.
 
 ## Backend loading
 
@@ -497,6 +500,11 @@ registry and topology rules. Runtime loading must reject a language-valid
 stage topology with an explicit unsupported-target result when that backend
 does not implement it. Manifest parsing must not hard-code vertex-plus-fragment
 as the only representable topology.
+
+Pipeline 14 uses one canonical `*.pipeline.json` schema for compute and
+graphics. Its optional root `autodiff` object contains differentiated-program
+metadata; it is absent for ordinary primal-only assets. Pipeline-13
+transform/profile fields are not current aliases.
 
 The current `PIPELINE_VERSION` manifest binds each variant directly through its
 `program` stage-to-artifact map. It contains either one compute program or one

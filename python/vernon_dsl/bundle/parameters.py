@@ -392,7 +392,6 @@ def fragment_outputs(records: Mapping[str, Mapping[str, Any]]) -> list[dict[str,
                 "shape": shape,
                 "access": "write",
                 "location": location,
-                "type": type_name,
             }
         )
     return outputs

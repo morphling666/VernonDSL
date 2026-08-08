@@ -1146,21 +1146,11 @@ bool loadStructuredCpuEntryExecutable(VernonRuntimeContext &context, const Stage
 
 bool createCpuExecutable(VernonRuntimeContext &context, const Stage &forwardStage, const Stage &backwardStage,
                          const std::vector<std::string> &gradientPaths, std::shared_ptr<Executable> &executable) {
-    if (!forwardStage.autodiff || !backwardStage.autodiff || forwardStage.autodiff->protocol != "dynamic_v2" ||
-        backwardStage.autodiff->protocol != "dynamic_v2") {
-        invocationDiagnostic(context) = "structured CPU autodiff requires explicit dynamic_v2 profiles";
-        return false;
-    }
     return loadStructuredCpuExecutable(context, forwardStage, backwardStage, gradientPaths, executable);
 }
 
 bool createLegacyCpuExecutable(VernonRuntimeContext &context, const Stage &forwardStage, const Stage &backwardStage,
                                const std::vector<std::string> &gradientPaths, std::shared_ptr<Executable> &executable) {
-    if (!forwardStage.autodiff || !backwardStage.autodiff || forwardStage.autodiff->protocol != "legacy_fixed" ||
-        backwardStage.autodiff->protocol != "legacy_fixed") {
-        invocationDiagnostic(context) = "legacy CPU autodiff requires explicit legacy_fixed profiles";
-        return false;
-    }
     return loadLegacyCpuExecutable(context, forwardStage, backwardStage, gradientPaths, executable);
 }
 
@@ -1180,12 +1170,11 @@ bool createCpuEntryExecutable(VernonRuntimeContext &context, VernonCpuEntryPoint
     Stage forwardStage;
     forwardStage.entry.assign(forwardName.data, forwardName.size);
     forwardStage.reflection.assign(forwardReflection.data, forwardReflection.size);
-    forwardStage.autodiff = AutodiffStageMetadata{"", std::string(forwardProtocol.data, forwardProtocol.size), ""};
     Stage backwardStage;
     backwardStage.entry.assign(backwardName.data, backwardName.size);
     backwardStage.reflection.assign(backwardReflection.data, backwardReflection.size);
-    backwardStage.autodiff = AutodiffStageMetadata{"", std::string(backwardProtocol.data, backwardProtocol.size), ""};
-    if (forwardStage.autodiff->protocol != "dynamic_v2" || backwardStage.autodiff->protocol != "dynamic_v2") {
+    if (std::string_view(forwardProtocol.data, forwardProtocol.size) != "dynamic_v2" ||
+        std::string_view(backwardProtocol.data, backwardProtocol.size) != "dynamic_v2") {
         invocationDiagnostic(context) = "direct structured CPU autodiff requires explicit dynamic_v2 profiles";
         return false;
     }

@@ -12,7 +12,7 @@ below is green. `versions.toml` is the single manually edited version source.
 - Windows x64, Linux x64, and Apple Silicon macOS wheels;
 - CPython 3.11 through 3.14;
 - wheel-only distribution for `0.1.1`; no sdist or Intel macOS wheel;
-- compiler contract 9 and pipeline contract 12.
+- compiler contract 10 and pipeline contract 14.
 
 Backend capabilities and limitations are defined in
 [`RELEASE_NOTES.md`](RELEASE_NOTES.md) and [`SUPPORT.md`](SUPPORT.md). Public
@@ -21,7 +21,8 @@ surface and compatibility guarantees are defined in
 
 ## Required gates
 
-- [ ] `versions.toml` and all generated version files report `0.1.1`.
+- [ ] `versions.toml` and all generated version files report release `0.1.1`,
+      compiler contract 10, and pipeline contract 14.
 - [ ] Native CTest and Python tests pass on Linux, macOS, and Windows on the
       exact release commit.
 - [ ] Windows formatting, Ruff, Python coverage, and Runtime AddressSanitizer

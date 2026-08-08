@@ -1,7 +1,7 @@
 # Autodiff design
 
 > **Status:** accepted contract and implemented compute VJP surface. Compiler
-> contract 10 and pipeline contract 13 provide deterministic
+> contract 10 and pipeline contract 14 provide deterministic
 > `primal`/`forward_with_tape`/`backward` profiles, typed derivative groups,
 > checked dynamic tape, explicit accumulation plans, and invocation-time
 > `(x,y,z)` grids with physical `(z,y,x)` carriers. CPU `dynamic_v2` supports
@@ -204,7 +204,7 @@ After the Runtime resolves the cooked pipeline:
 
 ```python
 pipeline = vd.load_cooked_vjp_asset(
-    "build/render/pipeline_manifest.json",
+    "build/render/render.pipeline.json",
     features=(),
 )
 image, pullback = pipeline.vjp(bindings, grid=(grid_x, grid_y, grid_z))
@@ -376,7 +376,10 @@ autodiff transform.
 
 ## 11. Versioning and acceptance
 
-Compiler contract 10 and pipeline contract 13 are the current VJP boundary. No
+Compiler contract 10 and pipeline contract 14 are the current VJP boundary.
+Differentiated assets use the canonical pipeline manifest with one optional
+root `autodiff` object; pipeline-13 transform/profile fields are not aliases in
+the current schema. No
 older manifest is reinterpreted as containing current structured profiles.
 `legacy_fixed` remains an explicit protocol, never an implicit fallback from
 `dynamic_v2`.

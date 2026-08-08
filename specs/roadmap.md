@@ -7,7 +7,7 @@ version axes are:
 
 - release `0.1.1`;
 - compiler contract 10;
-- pipeline contract 13;
+- pipeline contract 14;
 - released frontend version 3, with language v4 remaining a future target.
 
 The supported wheel matrix is CPython 3.11–3.14 on Windows x64, Linux x64, and
@@ -170,8 +170,8 @@ permit removing queue waits or letting recorded work outlive its owners.
 - Cooked CPU regression coverage includes f64 primal/cotangent/gradient
   preservation, signed-stride aggregate outputs, strided gradient scatter,
   gather accumulation, and independent multi-output cotangents.
-- Compiler contract 10 and pipeline contract 13 freeze the current transform,
-  profile, tape, and manifest boundary without compatibility readers.
+- Compiler contract 10 and pipeline contract 14 freeze the current unified
+  autodiff and manifest boundary without compatibility readers.
 
 ## Future work
 

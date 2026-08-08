@@ -6,6 +6,7 @@
 #include <array>
 #include <fstream>
 #include <limits>
+#include <string_view>
 
 namespace vernon::runtime {
 namespace {
@@ -71,18 +72,6 @@ std::optional<std::vector<uint8_t>> decodeBase64Strict(const std::string &encode
             result.push_back(static_cast<uint8_t>(value));
     }
     return result;
-}
-
-const char *hostOperatingSystem() {
-#if defined(_WIN32)
-    return "windows";
-#elif defined(__APPLE__)
-    return "macos";
-#elif defined(__linux__)
-    return "linux";
-#else
-    return "unknown";
-#endif
 }
 
 const char *hostArchitecture() {
@@ -158,6 +147,18 @@ bool resolveArtifact(const nlohmann::json &descriptor, const std::optional<std::
     }
     output.format = descriptor["format"].get<std::string>();
     const std::string storage = descriptor["storage"].get<std::string>();
+    const auto hasOnlyKeys = [&](std::initializer_list<std::string_view> allowed) {
+        for (const auto &[key, unused] : descriptor.items())
+            if (std::find(allowed.begin(), allowed.end(), key) == allowed.end())
+                return false;
+        return true;
+    };
+    if ((storage == "inline" && !hasOnlyKeys({"format", "storage", "encoding", "data", "size", "sha256"})) ||
+        (storage == "external" && !hasOnlyKeys({"format", "storage", "path", "size", "sha256"})) ||
+        (storage != "inline" && storage != "external")) {
+        error = "pipeline artifact descriptor contains an unknown field";
+        return false;
+    }
     const uint64_t declaredSize = descriptor["size"].get<uint64_t>();
     const std::string expectedHash = descriptor["sha256"].get<std::string>();
     if (output.format.empty() || !isSha256(expectedHash)) {
@@ -233,12 +234,9 @@ bool resolveCpuNativeArtifact(const CpuNativeArtifact &artifact, std::filesystem
     const bool nativeLibrary = artifact.format == "native_library";
     const bool relocatableObject = artifact.format == "relocatable_object";
     if (artifact.entry.empty() || artifact.symbol.empty() || artifact.relativeLibrary.empty() ||
-        artifact.sha256.size() != 64 || (!nativeLibrary && !relocatableObject) ||
-        (nativeLibrary &&
-         (artifact.operatingSystem != hostOperatingSystem() || artifact.architecture != hostArchitecture())) ||
-        (relocatableObject &&
-         (artifact.targetTriple.empty() || (artifact.objectFormat != "coff" && artifact.objectFormat != "elf" &&
-                                            artifact.objectFormat != "macho" && artifact.objectFormat != "wasm")))) {
+        artifact.sha256.size() != 64 || (!nativeLibrary && !relocatableObject) || artifact.targetTriple.empty() ||
+        (artifact.objectFormat != "coff" && artifact.objectFormat != "elf" && artifact.objectFormat != "macho" &&
+         artifact.objectFormat != "wasm")) {
         error = "unsupported or invalid CPU AOT artifact";
         return false;
     }
@@ -278,28 +276,6 @@ bool resolveCpuNativeArtifact(const CpuNativeArtifact &artifact, std::filesystem
     libraryPath = candidate;
     if (reflection)
         *reflection = std::move(parsed);
-    return true;
-}
-
-bool parseCpuComputeBundle(const std::filesystem::path &root, CpuNativeArtifact &artifact, std::string &error) {
-    const std::vector<uint8_t> manifestBytes = readFile(root / "compute.json");
-    const nlohmann::json manifest = nlohmann::json::parse(manifestBytes.begin(), manifestBytes.end(), nullptr, false);
-    if (manifest.is_discarded() || !manifest.is_object() ||
-        manifest.value("pipeline_version", 0) != VERNON_PIPELINE_VERSION || manifest.value("target", "") != "cpu" ||
-        manifest.value("artifact_format", "") != "native_library" || !manifest.contains("reflection")) {
-        error = "unsupported or invalid CPU AOT bundle";
-        return false;
-    }
-    artifact = {};
-    artifact.root = root;
-    artifact.relativeLibrary = std::filesystem::u8path(manifest.value("artifact", ""));
-    artifact.entry = manifest.value("entry", "");
-    artifact.symbol = manifest.value("symbol", "");
-    artifact.operatingSystem = manifest.value("operating_system", "");
-    artifact.architecture = manifest.value("architecture", "");
-    artifact.size = manifest.value("artifact_size", uint64_t{0});
-    artifact.sha256 = manifest.value("artifact_sha256", "");
-    artifact.reflection = manifest["reflection"];
     return true;
 }
 

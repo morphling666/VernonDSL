@@ -314,6 +314,55 @@ class PipelineCompileTests(unittest.TestCase):
         self.assertEqual(set(logical["stage_artifacts"]), {stage.id})
         self.assertEqual(set(changed["stage_artifacts"]), {stage.id})
 
+    def test_manifest_v14_autodiff_schema_omits_planning_metadata(self) -> None:
+        stage = _stage("compute", b"#version 430\nvoid main() {}", {"workgroup_size": [1, 1, 1]})
+        profiles = {
+            name: {
+                "compute": stage.id,
+                "inputs": [],
+                "outputs": [],
+            }
+            for name in ("primal", "forward_with_tape", "backward")
+        }
+        plan = build_bundle_plan(
+            "autodiff/schema",
+            stage.target,
+            ("INTERNAL_FEATURE",),
+            [((), {"compute": stage})],
+            {
+                "kind": "vjp",
+                "protocol": "dynamic_v2",
+                "wrt": ["value"],
+                "output_cotangents": ["output"],
+                "gradient_policy": "explicit",
+                "identity": "internal-transform",
+            },
+            {
+                "identity": "internal-profiles",
+                "tape_bytes": 64,
+                "variants": [
+                    {
+                        "key": [],
+                        "workgroup_size": [1, 1, 1],
+                        "profiles": profiles,
+                    }
+                ],
+            },
+        )
+
+        logical = plan.logical_dict()
+        self.assertNotIn("features", logical)
+        self.assertNotIn("program_transform", logical)
+        self.assertNotIn("autodiff_profiles", logical)
+        self.assertEqual(
+            set(logical["autodiff"]),
+            {"kind", "protocol", "wrt", "output_cotangents", "variants"},
+        )
+        self.assertEqual(
+            set(logical["stage_artifacts"][stage.id]),
+            {"stage", "entry", "reflection"},
+        )
+
     def test_native_options_are_scoped_to_the_selected_target(self) -> None:
         self.assertEqual(OpenGLTargetOptions(version=330).native_options, {"options": {"version": 330}})
         self.assertEqual(
@@ -823,7 +872,6 @@ class PipelineCompileTests(unittest.TestCase):
                         "shape": [4],
                         "access": "write",
                         "location": 0,
-                        "type": "tensor<4xf32>",
                     }
                 ],
             },

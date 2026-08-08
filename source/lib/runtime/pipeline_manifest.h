@@ -134,7 +134,6 @@ struct Parameter {
     std::string access;
     std::string addressSpace;
     std::string dimension;
-    std::string textureFormat;
     AutodiffResourceRole autodiffRole{AutodiffResourceRole::None};
     std::vector<uint64_t> shape;
     std::vector<ParameterUse> uses;
@@ -185,35 +184,19 @@ struct Variant {
     bool validate(std::string &error) const;
 };
 
-struct AutodiffAccumulationPlan {
-    std::string path;
-    enum class Operation {
-        ReduceSum,
-        ScatterAdd,
-    } operation{Operation::ReduceSum};
-    std::vector<std::string> evidence;
-    std::vector<uint32_t> invocationAxes;
-};
-
 struct AutodiffLaunchPlan {
     VernonLaunchSize workgroupSize{1, 1, 1};
-    std::vector<AutodiffAccumulationPlan> accumulationPlans;
 };
 
 struct AutodiffVariant {
     std::vector<std::string> key;
-    std::string planIdentity;
-    std::string programGraphIdentity;
     std::string primal;
     std::string forwardWithTape;
     std::string backward;
-    uint64_t tapeBytes{};
     AutodiffLaunchPlan launch;
 };
 
 struct AutodiffManifest {
-    std::string transformIdentity;
-    std::string profilesIdentity;
     std::string protocol;
     std::vector<AutodiffDerivativeGroup> derivativeGroups;
     std::vector<AutodiffVariant> variants;
@@ -221,10 +204,9 @@ struct AutodiffManifest {
 
 std::optional<VernonTextureDimension> pipelineTextureDimension(const std::string &dimension);
 
-std::optional<VernonTextureFormat> pipelineTextureFormat(const std::string &format);
-
 bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &error);
 bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifest, std::string &error);
+bool validatePipelineRootSchema(const nlohmann::json &root, std::string &error);
 bool parsePipelineValueLayout(const nlohmann::json &value, ValueLayout &layout, std::string &error);
 bool parsePipelineInterfacePlan(const nlohmann::json &value, InterfacePlan &plan, std::string &error);
 void rebuildValueLayoutPathViews(ValueLayout &layout);

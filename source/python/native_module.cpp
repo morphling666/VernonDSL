@@ -1754,13 +1754,6 @@ struct Runtime {
             std::vector<SharedCompileResult>{primal.result, forward.result, backward.result});
     }
 
-    std::unique_ptr<LoadedPipeline> loadComputeBundle(const std::string &directory) {
-        VernonLoadedPipeline *pipeline = vernonRuntimeLoadComputeBundle(handle, directory.c_str());
-        if (!pipeline)
-            throw std::runtime_error("cannot load compute bundle: " + stringView(vernonRuntimeGetLastError(handle)));
-        return std::make_unique<LoadedPipeline>(this, handle, nullptr, pipeline);
-    }
-
     std::unique_ptr<LoadedPipeline> loadPipeline(const nb::bytes &data, const std::vector<std::string> &features) {
         VernonPipelineBundle *bundle =
             vernonRuntimeLoadPipelineBundleWithOptions(handle, data.c_str(), data.size(), nullptr);
@@ -2039,7 +2032,6 @@ NB_MODULE(_native, module) {
         .def("load", &Runtime::load, nb::keep_alive<0, 1>())
         .def("load_cpu_entry", &Runtime::loadCpuEntry, nb::keep_alive<0, 1>())
         .def("load_cpu_autodiff", &Runtime::loadCpuAutodiff, nb::keep_alive<0, 1>())
-        .def("load_compute_bundle", &Runtime::loadComputeBundle, nb::keep_alive<0, 1>())
         .def("load_pipeline", &Runtime::loadPipeline, nb::keep_alive<0, 1>())
         .def("load_pipeline_asset", &Runtime::loadPipelineAsset, nb::keep_alive<0, 1>())
         .def("synchronize", &Runtime::synchronize);

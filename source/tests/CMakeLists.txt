@@ -176,15 +176,14 @@ if(TARGET VernonRuntime)
     target_include_directories(vernon-cpu-aot-fixture PRIVATE "${VERNON_REPOSITORY_ROOT}/source/include")
     set(cpu_bundle "${VERNON_TEST_BINARY_ROOT}/cpu_aot_bundle")
     add_custom_command(
-        OUTPUT "${cpu_bundle}/compute.json" "${cpu_bundle}/cpu_fill.pipeline.json"
+        OUTPUT "${cpu_bundle}/cpu_fill.pipeline.json"
         COMMAND
             ${CMAKE_COMMAND} "-DARTIFACT=$<TARGET_FILE:vernon-cpu-aot-fixture>" "-DOUTPUT=${cpu_bundle}"
             "-DOPERATING_SYSTEM=${runtime_test_os}" "-DARCHITECTURE=${runtime_test_arch}" -P
             "${VERNON_TEST_ROOT}/scripts/write_cpu_aot_bundle.cmake"
         DEPENDS vernon-cpu-aot-fixture "${VERNON_TEST_ROOT}/scripts/write_cpu_aot_bundle.cmake"
         VERBATIM)
-    add_custom_target(vernon-cpu-aot-test-bundle DEPENDS "${cpu_bundle}/compute.json"
-                                                         "${cpu_bundle}/cpu_fill.pipeline.json")
+    add_custom_target(vernon-cpu-aot-test-bundle DEPENDS "${cpu_bundle}/cpu_fill.pipeline.json")
     add_test(
         NAME vernon-cpu-aot-bundle-platform-mapping
         COMMAND

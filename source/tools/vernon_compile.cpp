@@ -44,10 +44,8 @@ int main(int argc, char **argv) {
                      "[--output-dir <directory>] [--reflection <file>] "
                      "[--opengl-version <version>] "
                      "[--directx-shader-model <model>] [--metal-platform <macos|ios>] "
-                     "[--compute-bundle <directory>] "
                      "[--cpu-triple <triple>] [--cpu-name <name>] "
-                     "[--cpu-features <features>]\n"
-                     "  --compute-bundle writes a relocatable CPU object bundle.\n";
+                     "[--cpu-features <features>]\n";
         return 2;
     }
 
@@ -76,8 +74,6 @@ int main(int argc, char **argv) {
                 packaging.outputDirectory = argv[index + 1];
             else if (option == "--reflection")
                 packaging.reflectionPath = argv[index + 1];
-            else if (option == "--compute-bundle")
-                packaging.computeBundlePath = argv[index + 1];
             else if (option == "--cpu-triple")
                 packaging.targetTriple = argv[index + 1];
             else if (option == "--cpu-name")
@@ -117,10 +113,6 @@ int main(int argc, char **argv) {
                 return 2;
             }
             index += 2;
-        }
-        if (packaging.computeBundlePath && packaging.outputDirectory) {
-            std::cerr << "--compute-bundle cannot be combined with --output-dir\n";
-            return 2;
         }
         if ((packaging.targetTriple || cpuName || cpuFeatures) && *target != VERNON_TARGET_CPU) {
             std::cerr << "CPU target options require --target cpu\n";

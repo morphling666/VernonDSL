@@ -544,13 +544,16 @@ artifact，只要其 stage 和 feature 被该 target 支持。
 
 Cooked output 包含：
 
-- 当前 `PIPELINE_VERSION`；
+- 当前 pipeline 14 `PIPELINE_VERSION`，且所有 target 共用唯一 canonical
+  `*.pipeline.json` root schema；
 - pipeline id 和按 backend 标记的 canonical `target.kind` / `target.options`；
 - feature universe 和显式 variant keys；
 - 每个 variant 的 stage map、parameter slots、internal parameters 和 outputs；
 - 去重后的 stage reflection；
 - artifact relative path、format、byte size 和 SHA-256；
 - runtime requirements；
+- differentiated asset 可选的 root `autodiff` object；普通 primal-only asset
+  不含该字段，pipeline 13 的 transform/profile 字段不是当前 schema alias；
 - 对整个 canonical manifest 的 `content_hash`。
 
 Artifact descriptor 与 stage digest 必须一致。Runtime 在把 bytes 交给 backend
@@ -568,10 +571,13 @@ Artifact descriptor 与 stage digest 必须一致。Runtime 在把 bytes 交给 
 
 ### 9.4 CPU 部署差异
 
-CPU Cook 产出 relocatable object，而不是可由 Runtime 随意 `dlopen` 的 LLVM
-中间格式。部署应用将 object 链入自身，并通过 module-hashed wrapper symbol
-注册 entry。Runtime 验证 manifest 中的 symbol、target triple、object format、
-size 和 digest，再解析已注册 entry。
+CPU Cook 产出 canonical `*.pipeline.json`、relocatable `.o`/`.obj` 和生成的
+static-registration `.c`/`.h`，而不是可由 Runtime 随意 `dlopen` 的 LLVM
+中间格式。部署应用将 object 与 registration source 链入自身，调用生成的
+registration function，并通过 module-hashed wrapper symbol 注册 entry。
+Runtime 验证 manifest 中的 symbol、target triple、object format、size 和
+digest，再解析已注册 entry。已移除的 `vernon-compile --compute-bundle` 和
+`compute.json` 不属于 pipeline 14 部署接口。
 
 ### 9.5 Load、Resolve 与 Invoke
 
@@ -611,7 +617,7 @@ dispatch path。重复 invocation 复用 prepared pipeline、layout 和绑定结
   -> typed Tensor/TensorView semantics
   -> Vernon MLIR
   -> CPU object / CUDA PTX / Vulkan SPIR-V
-  -> reflection-driven compute bundle
+  -> canonical pipeline manifest + external artifacts
   -> RuntimeCore binding plan
   -> CPU entry or RHI compute command
 ```

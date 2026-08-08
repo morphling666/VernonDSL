@@ -227,20 +227,10 @@ class CompiledStage:
 
     def logical_record(self) -> dict[str, Any]:
         record = {
-            "id": self.id,
-            "module": self.module,
             "entry": self.entry,
             "stage": self.stage,
-            "target": self.target.target,
-            "format": self.artifact.format,
-            "module_hash": self.reflection.get("module_hash"),
-            "dependencies": self.reflection.get("dependencies", []),
-            "interface": dict(self.interface),
             "reflection": dict(self.reflection),
-            **dict(self.metadata),
         }
-        if not self.module:
-            record.pop("module")
         return record
 
 
@@ -296,15 +286,19 @@ class BundlePlan:
             "type": "pipeline",
             "id": self.pipeline_id,
             "target": self.target.spec,
-            "features": list(self.features),
             "variants": [variant.to_dict() for variant in self.variants],
             "stage_artifacts": {
                 stage.id: stage.logical_record() for stage in sorted(self.stages, key=lambda value: value.id)
             },
         }
         if self.transform is not None:
-            result["program_transform"] = dict(self.transform)
-            result["autodiff_profiles"] = dict(self.autodiff_profiles or {})
+            result["autodiff"] = {
+                "kind": self.transform["kind"],
+                "protocol": self.transform["protocol"],
+                "wrt": list(self.transform["wrt"]),
+                "output_cotangents": list(self.transform["output_cotangents"]),
+                "variants": list((self.autodiff_profiles or {})["variants"]),
+            }
         requirements = runtime_requirements(self.target.target, self.stages)
         if requirements is not None:
             result["runtime_requirements"] = requirements

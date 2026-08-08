@@ -1056,9 +1056,10 @@ class VulkanPipelineTests(unittest.TestCase):
             [("position", 0, "tensor")],
         )
         self.assertEqual(
-            [(row["name"], row["location"], row["type"]) for row in variant["outputs"]],
-            [("output_0", 0, "tensor<4xf32>")],
+            [(row["name"], row["location"]) for row in variant["outputs"]],
+            [("output_0", 0)],
         )
+        self.assertNotIn("type", variant["outputs"][0])
         self.assertEqual(render.compile_count, 1)
         vd.init(arch=vd.vulkan)
         render(position=positions, target=attachments)

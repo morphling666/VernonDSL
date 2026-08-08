@@ -361,7 +361,7 @@ asset = vd.pipeline_asset(
                 ],
             )
             bundle = json.loads(manifest_path.read_text(encoding="utf-8"))
-            self.assertEqual(bundle["features"], [])
+            self.assertNotIn("features", bundle)
             self.assertEqual(
                 bundle["target"],
                 {
@@ -384,29 +384,28 @@ asset = vd.pipeline_asset(
             )
             logical = json.loads(json.dumps(bundle))
             logical.pop("content_hash")
-            registration = logical.pop("cpu_static_registration")
             for record in logical["stage_artifacts"].values():
                 record.pop("artifact")
+                record.pop("symbol")
             self.assertEqual(logical, plans[0].logical_dict())
             stage = next(iter(bundle["stage_artifacts"].values()))
-            self.assertEqual(stage["format"], "relocatable_object")
             self.assertEqual(stage["symbol"], "__vernon_cpu_module_scale")
-            self.assertEqual(stage["target_triple"], "x86_64-pc-windows-msvc")
-            self.assertEqual(stage["object_format"], "coff")
-            self.assertEqual(stage["pipeline_version"], PIPELINE_VERSION)
-            self.assertEqual(stage["cpu"], "generic")
-            self.assertEqual(stage["cpu_features"], "+sse2")
+            self.assertEqual(
+                set(stage),
+                {"stage", "entry", "reflection", "artifact", "symbol"},
+            )
             self.assertEqual(stage["artifact"]["sha256"], digest)
             self.assertEqual(stage["artifact"]["size"], len(relocatable_object))
             self.assertEqual(stage["artifact"]["storage"], "external")
             self.assertEqual(stage["artifact"]["format"], "relocatable_object")
             self.assertEqual(stage["artifact"]["path"], f"artifacts/{digest}.obj")
             self.assertEqual((output / stage["artifact"]["path"]).read_bytes(), relocatable_object)
-            self.assertEqual(registration["symbols"], ["__vernon_cpu_module_scale"])
-            registration_source = (output / registration["source"]).read_text(encoding="utf-8")
+            registration_sources = list(output.glob("vernon_cpu_registration_*.c"))
+            self.assertEqual(len(registration_sources), 1)
+            registration_source = registration_sources[0].read_text(encoding="utf-8")
             self.assertIn("vernonRuntimeRegisterStaticCpuEntry", registration_source)
             self.assertIn("&__vernon_cpu_module_scale", registration_source)
-            self.assertTrue((output / registration["header"]).is_file())
+            self.assertTrue(registration_sources[0].with_suffix(".h").is_file())
             self.assertEqual(manifest_path.name, "cooked.pipeline.json")
             self.assertFalse((output / "pipeline.bundle").exists())
 
@@ -716,7 +715,7 @@ asset = vd.pipeline_asset(
                 output=directory,
             )
             bundle = json.loads(manifest.read_text(encoding="utf-8"))
-            self.assertEqual(bundle["features"], ["INSTANCE", "SKIN"])
+            self.assertNotIn("features", bundle)
             self.assertEqual(len(bundle["variants"]), 4)
             self.assertEqual(len(bundle["stage_artifacts"]), 5)
             fragment_ids = {variant["program"]["fragment"] for variant in bundle["variants"]}
@@ -724,7 +723,10 @@ asset = vd.pipeline_asset(
             self.assertEqual(len(fragment_ids), 1)
             self.assertEqual(len(vertex_ids), 4)
             combined = next(variant for variant in bundle["variants"] if variant["key"] == ["INSTANCE", "SKIN"])
-            interface = bundle["stage_artifacts"][combined["program"]["vertex"]]["interface"]["arguments"]
+            vertex_record = bundle["stage_artifacts"][combined["program"]["vertex"]]
+            interface = next(
+                entry for entry in vertex_record["reflection"]["entries"] if entry["name"] == vertex_record["entry"]
+            )["arguments"]
             locations = [value["vernon.location"] for value in interface if "vernon.location" in value]
             self.assertEqual(locations, [0, 1, 5, 6])
             runtime_bundle = bundle

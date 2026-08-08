@@ -59,7 +59,7 @@ VernonStatus staticallyLinkedFill(const VernonCpuInvocation *invocation) {
 
 } // namespace
 
-TEST(RuntimeCpuPipeline, ReflectsVersionedTextureConstraints) {
+TEST(RuntimeCpuPipeline, ReflectsTextureDimensionsAndRejectsFormatMetadata) {
     const std::filesystem::path directory = VERNON_CPU_BUNDLE_PATH;
     const std::string directoryUtf8 = directory.u8string();
     const std::string bundle = readFile(directory / "cpu_fill.pipeline.json");
@@ -85,7 +85,6 @@ TEST(RuntimeCpuPipeline, ReflectsVersionedTextureConstraints) {
     parameter.erase("element_layout");
     parameter["access"] = "read";
     parameter["dimension"] = "3d";
-    parameter["texture_format"] = "rgba16_float";
     parameter["shape"] = nlohmann::json::array();
     VernonPipelineBundle *textureBundle = loadWithDirectory(runtime, withContentHash(constrained), directoryUtf8);
     ASSERT_NE(textureBundle, nullptr);
@@ -97,8 +96,7 @@ TEST(RuntimeCpuPipeline, ReflectsVersionedTextureConstraints) {
     ASSERT_EQ(vernonRuntimeLoadedPipelineGetTextureConstraintByParameterIndex(texturePipeline, 0, &constraint),
               VERNON_STATUS_OK);
     EXPECT_EQ(constraint.dimension, VERNON_TEXTURE_3D);
-    EXPECT_EQ(constraint.has_format_constraint, 1u);
-    EXPECT_EQ(constraint.format, VERNON_TEXTURE_RGBA16_FLOAT);
+    EXPECT_EQ(constraint.has_format_constraint, 0u);
 
     constraint = {};
     constraint.struct_size = sizeof(constraint);
@@ -112,20 +110,9 @@ TEST(RuntimeCpuPipeline, ReflectsVersionedTextureConstraints) {
     EXPECT_EQ(vernonRuntimeLoadedPipelineGetTextureConstraintByParameterIndex(texturePipeline, 0, &constraint),
               VERNON_STATUS_INVALID_ARGUMENT);
 
-    constrained["variants"][0]["parameters"][0].erase("texture_format");
-    VernonPipelineBundle *unconstrainedBundle = loadWithDirectory(runtime, withContentHash(constrained), directoryUtf8);
-    ASSERT_NE(unconstrainedBundle, nullptr);
-    VernonLoadedPipeline *unconstrainedPipeline = vernonRuntimeResolvePipeline(unconstrainedBundle, {nullptr, 0});
-    ASSERT_NE(unconstrainedPipeline, nullptr);
-    constraint = {};
-    constraint.struct_size = sizeof(constraint);
-    ASSERT_EQ(vernonRuntimeLoadedPipelineGetTextureConstraintByParameterIndex(unconstrainedPipeline, 0, &constraint),
-              VERNON_STATUS_OK);
-    EXPECT_EQ(constraint.dimension, VERNON_TEXTURE_3D);
-    EXPECT_EQ(constraint.has_format_constraint, 0u);
+    constrained["variants"][0]["parameters"][0]["texture_format"] = "rgba16_float";
+    EXPECT_EQ(loadWithDirectory(runtime, withContentHash(constrained), directoryUtf8), nullptr);
 
-    vernonRuntimeLoadedPipelineDestroy(unconstrainedPipeline);
-    vernonRuntimePipelineBundleDestroy(unconstrainedBundle);
     vernonRuntimeLoadedPipelineDestroy(texturePipeline);
     vernonRuntimePipelineBundleDestroy(textureBundle);
     vernonRuntimeLoadedPipelineDestroy(tensorPipeline);
@@ -169,9 +156,6 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     objectStage["artifact"]["path"] = objectPath.filename().string();
     objectStage["artifact"]["size"] = objectBytes.size();
     objectStage["artifact"]["sha256"] = vernon::runtime::sha256Hex(objectBytes.data(), objectBytes.size());
-    objectStage["format"] = "relocatable_object";
-    objectStage["target_triple"] = "test-host-triple";
-    objectStage["object_format"] = "elf";
     objectBundle.erase("content_hash");
     std::string objectCanonical = objectBundle.dump(-1, ' ', false);
     objectBundle["content_hash"] = vernon::runtime::sha256Hex(objectCanonical.data(), objectCanonical.size());
@@ -223,6 +207,14 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
 
     invalidDocument = nlohmann::json::parse(bundle);
     invalidDocument["stage_artifacts"]["fill"]["architecture"] = "unsupported";
+    ASSERT_TRUE(!loadWithDirectory(runtime, withContentHash(invalidDocument), directoryUtf8));
+
+    invalidDocument = nlohmann::json::parse(bundle);
+    invalidDocument["features"] = nlohmann::json::array();
+    ASSERT_TRUE(!loadWithDirectory(runtime, withContentHash(invalidDocument), directoryUtf8));
+
+    invalidDocument = nlohmann::json::parse(bundle);
+    invalidDocument["stage_artifacts"]["fill"]["artifact"]["legacy"] = true;
     ASSERT_TRUE(!loadWithDirectory(runtime, withContentHash(invalidDocument), directoryUtf8));
 
     const VernonStringView id = vernonRuntimePipelineBundleGetId(loaded);

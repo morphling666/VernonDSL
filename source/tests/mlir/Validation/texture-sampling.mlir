@@ -1,6 +1,6 @@
 // RUN: %vernon-opt --vernon-validate %s -o %t
 
-module attributes {vernon.compiler_contract_version = 10 : i64, vernon.pipeline_version = 13 : i64} {
+module attributes {vernon.compiler_contract_version = 10 : i64, vernon.pipeline_version = 14 : i64} {
   func.func @sample_2d(
       %texture: !vernon.texture<"2d", f32> {
         vernon.interface = "resource",

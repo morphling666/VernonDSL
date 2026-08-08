@@ -7,7 +7,7 @@
 // CHECK-NOT: tensor<3xf32>
 // CHECK-NOT: vernon.struct
 
-module attributes {vernon.compiler_contract_version = 10 : i64, vernon.pipeline_version = 13 : i64} {
+module attributes {vernon.compiler_contract_version = 10 : i64, vernon.pipeline_version = 14 : i64} {
   "vernon.struct"() <{
     fields = ["value"],
     sym_name = "LoweringOnlyMetadata"

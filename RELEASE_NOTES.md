@@ -10,6 +10,12 @@ compiler, offline cooker, synchronous Runtime/RHI, and ExecutionGraph APIs.
 - Direct CPU compute dispatch and GPU-optional runtime execution.
 - Offscreen graphics pipelines, host readback, PipelineAsset cooking, and
   bundled VernonRuntime CMake sources.
+- Pipeline 14 unifies cooked compute, graphics, and differentiated assets under
+  the canonical `*.pipeline.json` schema. Differentiated manifests use an
+  optional root `autodiff` object.
+- CPU cooking emits that manifest, a relocatable `.o`/`.obj`, and generated
+  static-registration `.c`/`.h` sources. The native compiler's former
+  `--compute-bundle`/`compute.json` packaging interface has been removed.
 - Terrain and Mandelbulb headless showcases with deterministic presets and
   machine-readable acceptance results.
 
@@ -48,7 +54,7 @@ repository's `python` directory and run commands with
 
 ## Compatibility and lifecycle
 
-This release uses compiler contract 9 and pipeline contract 12. Incompatible
+This release uses compiler contract 10 and pipeline contract 14. Incompatible
 artifacts are rejected rather than silently loaded. The stable API, ABI,
 deprecation, cache, support, and security policies are documented in
 [`PUBLIC_API.md`](PUBLIC_API.md), [`COMPATIBILITY.md`](COMPATIBILITY.md),

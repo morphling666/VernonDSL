@@ -1,7 +1,7 @@
 # Compatibility policy
 
 VernonDSL has independent release, compiler-contract, and pipeline version
-axes. The 0.1.1 release uses compiler contract 9 and pipeline contract 12.
+axes. The 0.1.1 release uses compiler contract 10 and pipeline contract 14.
 
 ## Release and ABI
 
@@ -21,6 +21,9 @@ unsupported.
 
 Compiler input must carry the exact supported `vernon.compiler_contract_version`.
 Pipeline manifests must carry the exact supported `pipeline_version`.
+Pipeline 14 has one canonical `*.pipeline.json` schema for compute and graphics
+targets. Differentiated assets use its optional root `autodiff` object; fields
+from pipeline 13 are not accepted as current-schema aliases.
 Incompatible input, reflection, manifests, and artifacts are rejected before
 publication or execution rather than interpreted using best-effort fallback.
 

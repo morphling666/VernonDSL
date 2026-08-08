@@ -274,22 +274,6 @@ VernonLoadedPipeline *vernonRuntimeLoadArtifact(VernonRuntimeContext *context, c
     return loadBackendArtifactPipeline(*context, artifact, artifactSize, reflection, reflectionSize, entry, entrySize);
 }
 
-VernonLoadedPipeline *vernonRuntimeLoadComputeBundle(VernonRuntimeContext *context, const char *directory) {
-    RuntimeDiagnosticScope diagnostic(context);
-    if (!context || context->backend != VERNON_RUNTIME_CPU || !directory)
-        return nullptr;
-    try {
-        const std::filesystem::path root = std::filesystem::u8path(directory);
-        CpuNativeArtifact artifact;
-        if (!parseCpuComputeBundle(root, artifact, invocationDiagnostic(*context)))
-            return nullptr;
-        return loadBackendCpuNativePipeline(*context, artifact);
-    } catch (const std::exception &error) {
-        fail(context, std::string("failed to load CPU AOT bundle: ") + error.what(), VERNON_STATUS_INTERNAL_ERROR);
-        return nullptr;
-    }
-}
-
 VernonStatus vernonRuntimePipelineBundleInspectTarget(const void *bundleData, size_t bundleSize,
                                                       VernonRuntimeBackend *target) {
     if (!bundleData || !bundleSize || !target)
@@ -302,7 +286,8 @@ VernonStatus vernonRuntimePipelineBundleInspectTarget(const void *bundleData, si
         const bool pipelineSchema =
             root.value("pipeline_version", 0) == VERNON_PIPELINE_VERSION && root.value("type", "") == "pipeline";
         std::string manifestError;
-        if (!pipelineSchema || !validateManifestHash(root, true, manifestError))
+        if (!pipelineSchema || !validatePipelineRootSchema(root, manifestError) ||
+            !validateManifestHash(root, true, manifestError))
             return VERNON_STATUS_PARSE_ERROR;
         const std::string name = pipelineTargetKind(root);
         if (name.empty())
@@ -358,7 +343,8 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                                          : (context->backend == VERNON_RUNTIME_OPENGL_ES ? "opengles" : "opengl");
         const bool pipelineSchema = root.is_object() && root.value("pipeline_version", 0) == VERNON_PIPELINE_VERSION &&
                                     root.value("type", "") == "pipeline";
-        if (!pipelineSchema || pipelineTargetKind(root) != expectedTarget || !root.contains("stage_artifacts") ||
+        if (!pipelineSchema || !validatePipelineRootSchema(root, invocationDiagnostic(*context)) ||
+            pipelineTargetKind(root) != expectedTarget || !root.contains("stage_artifacts") ||
             !root["stage_artifacts"].is_object() || !root.contains("variants") || !root["variants"].is_array()) {
             fail(context, "unsupported or invalid pipeline bundle");
             return nullptr;
@@ -375,30 +361,29 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
         AutodiffManifest autodiff;
         if (!parseAutodiffManifest(root, autodiff, invocationDiagnostic(*context)))
             return nullptr;
-        if (root.contains("program_transform"))
+        if (root.contains("autodiff"))
             bundle->autodiff = std::move(autodiff);
-        for (const nlohmann::json &feature : root.value("features", nlohmann::json::array()))
-            bundle->features.push_back(feature.get<std::string>());
-        if (!std::is_sorted(bundle->features.begin(), bundle->features.end()) ||
-            std::adjacent_find(bundle->features.begin(), bundle->features.end()) != bundle->features.end()) {
-            fail(context, "pipeline feature table is not canonical");
-            return nullptr;
-        }
         for (const auto &[id, value] : root["stage_artifacts"].items()) {
-            if (!value.is_object() ||
-                (value.contains("id") && (!value["id"].is_string() || value["id"].get<std::string>() != id))) {
+            const auto validStageKeys = [&](const nlohmann::json &stage) {
+                for (const auto &[key, unused] : stage.items())
+                    if (key != "stage" && key != "entry" && key != "artifact" && key != "reflection" &&
+                        (context->backend != VERNON_RUNTIME_CPU || key != "symbol"))
+                        return false;
+                return true;
+            };
+            if (!value.is_object() || !validStageKeys(value) || !value.contains("stage") ||
+                !value["stage"].is_string() || !value.contains("entry") || !value["entry"].is_string() ||
+                !value.contains("artifact") || !value["artifact"].is_object() || !value.contains("reflection") ||
+                !value["reflection"].is_object() ||
+                (context->backend == VERNON_RUNTIME_CPU && (!value.contains("symbol") || !value["symbol"].is_string() ||
+                                                            value["symbol"].get_ref<const std::string &>().empty()))) {
                 fail(context, "pipeline stage id is invalid");
                 return nullptr;
             }
             Stage stage;
             stage.stage = value.value("stage", "");
             stage.entry = value.value("entry", "");
-            if (value.contains("autodiff_profile") || value.contains("autodiff_protocol") ||
-                value.contains("autodiff_profiles_identity"))
-                stage.autodiff =
-                    AutodiffStageMetadata{value.value("autodiff_profile", ""), value.value("autodiff_protocol", ""),
-                                          value.value("autodiff_profiles_identity", "")};
-            if (value.contains("reflection") && value["reflection"].contains("entries")) {
+            if (value["reflection"].contains("entries")) {
                 stage.reflection = value["reflection"].dump();
                 for (const nlohmann::json &entry : value["reflection"]["entries"]) {
                     if (entry.value("name", "") != stage.entry)
@@ -441,8 +426,7 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
             if (!validFormat || (resolved.external && value["artifact"].contains("encoding")) ||
                 (!resolved.external &&
                  (((resolved.format == "spirv" || resolved.format == "dxil") && encoding != "base64") ||
-                  (resolved.format != "spirv" && resolved.format != "dxil" && encoding != "utf8"))) ||
-                value.value("target", "") != expectedTarget) {
+                  (resolved.format != "spirv" && resolved.format != "dxil" && encoding != "utf8")))) {
                 fail(context, "pipeline stage artifact format is invalid for target");
                 return nullptr;
             }
@@ -451,23 +435,18 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                     fail(context, "CPU pipeline artifacts require an external bundle directory");
                     return nullptr;
                 }
-                const nlohmann::json &nativeArtifact =
-                    value.contains("artifact") && value["artifact"].is_object() ? value["artifact"] : value;
+                const nlohmann::json &nativeArtifact = value["artifact"];
                 CpuNativeArtifact artifact;
                 artifact.root = *bundleDirectory;
-                artifact.relativeLibrary =
-                    std::filesystem::u8path(nativeArtifact.value("path", value.value("native_library", "")));
+                artifact.relativeLibrary = std::filesystem::u8path(nativeArtifact.value("path", ""));
                 artifact.entry = stage.entry;
                 artifact.format = resolved.format;
                 artifact.symbol = value.value("symbol", "");
-                artifact.operatingSystem = value.value("operating_system", "");
-                artifact.architecture = value.value("architecture", "");
-                artifact.targetTriple = value.value("target_triple", "");
-                artifact.objectFormat = value.value("object_format", "");
+                artifact.targetTriple = requirements.targetTriple;
+                artifact.objectFormat = requirements.objectFormat;
                 artifact.size = nativeArtifact.value("size", uint64_t{0});
                 artifact.sha256 = nativeArtifact.value("sha256", "");
-                if (value.contains("reflection"))
-                    artifact.reflection = value["reflection"];
+                artifact.reflection = value["reflection"];
                 std::filesystem::path validatedPath;
                 const std::string format = resolved.format;
                 if ((format != "native_library" && format != "relocatable_object") ||
@@ -539,17 +518,14 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
             for (size_t index = 0; index < bundle->variants.size(); ++index) {
                 const Variant &variant = bundle->variants[index];
                 const AutodiffVariant &profiles = bundle->autodiff->variants[index];
-                auto profileStage = [&](const std::string &id, const char *profile) {
+                auto profileStage = [&](const std::string &id) {
                     const auto found = bundle->stages.find(id);
-                    return found != bundle->stages.end() && found->second.stage == "compute" &&
-                           found->second.autodiff && found->second.autodiff->profile == profile &&
-                           found->second.autodiff->profilesIdentity == profiles.planIdentity;
+                    return found != bundle->stages.end() && found->second.stage == "compute";
                 };
                 if (profiles.key != variant.key || profiles.primal != variant.compute ||
                     profiles.primal == profiles.forwardWithTape || profiles.primal == profiles.backward ||
-                    profiles.forwardWithTape == profiles.backward ||
-                    !profileStage(profiles.forwardWithTape, "forward_with_tape") ||
-                    !profileStage(profiles.backward, "backward")) {
+                    profiles.forwardWithTape == profiles.backward || !profileStage(profiles.forwardWithTape) ||
+                    !profileStage(profiles.backward)) {
                     fail(context, "autodiff profile references are inconsistent with pipeline variants");
                     return nullptr;
                 }
@@ -614,13 +590,11 @@ VernonStatus fillTextureConstraintView(const Parameter &source, VernonPipelineTe
     if (source.kind != "texture")
         return VERNON_STATUS_INVALID_ARGUMENT;
     const auto dimension = pipelineTextureDimension(source.dimension);
-    const auto format = source.textureFormat.empty() ? std::optional<VernonTextureFormat>{}
-                                                     : pipelineTextureFormat(source.textureFormat);
-    if (!dimension || (!source.textureFormat.empty() && !format))
+    if (!dimension)
         return VERNON_STATUS_PARSE_ERROR;
     destination.dimension = *dimension;
-    destination.has_format_constraint = format.has_value() ? 1u : 0u;
-    destination.format = format.value_or(static_cast<VernonTextureFormat>(0));
+    destination.has_format_constraint = 0;
+    destination.format = static_cast<VernonTextureFormat>(0);
     std::fill(std::begin(destination.reserved), std::end(destination.reserved), 0);
     return VERNON_STATUS_OK;
 }

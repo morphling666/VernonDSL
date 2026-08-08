@@ -21,7 +21,6 @@ VernonStatus registerBackendStaticCpuEntry(VernonStringView symbol, VernonCpuEnt
 VernonLoadedPipeline *loadBackendCpuEntryPipeline(VernonRuntimeContext &context, VernonCpuEntryPoint entryPoint,
                                                   const char *reflection, size_t reflectionSize, const char *entry,
                                                   size_t entrySize);
-VernonLoadedPipeline *loadBackendCpuNativePipeline(VernonRuntimeContext &context, const CpuNativeArtifact &artifact);
 VernonLoadedPipeline *loadBackendArtifactPipeline(VernonRuntimeContext &context, const void *artifact,
                                                   size_t artifactSize, const char *reflection, size_t reflectionSize,
                                                   const char *entry, size_t entrySize);

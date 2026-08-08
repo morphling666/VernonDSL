@@ -214,41 +214,6 @@ TEST(RuntimeAutodiff, CpuTapePolicyIsLazyForOrdinaryRuntimeContexts) {
     EXPECT_EQ(context.cpuTapePolicy, nullptr);
 }
 
-TEST(RuntimeAutodiff, RejectsMismatchedStructuredProfileProtocols) {
-    VernonRuntimeContext context;
-    context.backend = VERNON_RUNTIME_CPU;
-    vernon::runtime::Stage forward;
-    vernon::runtime::Stage backward;
-    forward.autodiff = vernon::runtime::AutodiffStageMetadata{"", "dynamic_v2", ""};
-    backward.autodiff = vernon::runtime::AutodiffStageMetadata{"", "legacy_fixed", ""};
-    std::shared_ptr<vernon::runtime::ad::Executable> executable;
-    EXPECT_FALSE(vernon::runtime::ad::createCpuExecutable(context, forward, backward, {"x"}, executable));
-    EXPECT_EQ(vernon::runtime::invocationDiagnostic(context),
-              "structured CPU autodiff requires explicit dynamic_v2 profiles");
-}
-
-TEST(RuntimeAutodiff, RejectsStageProtocolThatDivergesFromProgramTransform) {
-    VernonRuntimeContext context;
-    context.backend = VERNON_RUNTIME_CPU;
-    VernonPipelineBundle bundle;
-    bundle.context = &context;
-    bundle.autodiff = vernon::runtime::AutodiffManifest{};
-    bundle.autodiff->protocol = "dynamic_v2";
-    vernon::runtime::Stage forward;
-    vernon::runtime::Stage backward;
-    forward.autodiff = vernon::runtime::AutodiffStageMetadata{"forward_with_tape", "legacy_fixed", ""};
-    backward.autodiff = vernon::runtime::AutodiffStageMetadata{"backward", "legacy_fixed", ""};
-    bundle.stages.emplace("forward", std::move(forward));
-    bundle.stages.emplace("backward", std::move(backward));
-    vernon::runtime::AutodiffVariant profiles;
-    profiles.forwardWithTape = "forward";
-    profiles.backward = "backward";
-    VernonLoadedPipeline pipeline;
-    EXPECT_FALSE(vernon::runtime::ad::resolvePipelineAutodiff(bundle, profiles, pipeline));
-    EXPECT_EQ(vernon::runtime::invocationDiagnostic(context),
-              "autodiff stage protocols do not match the program transform");
-}
-
 TEST(RuntimeAutodiff, ReplacesStaleInvocationDiagnosticAtPublicBoundary) {
     VernonRuntimeContext context;
     context.backend = VERNON_RUNTIME_CPU;

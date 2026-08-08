@@ -81,7 +81,18 @@ def build_bundle_plan(
     transform: Mapping[str, Any] | None = None,
     autodiff_profiles: Mapping[str, Any] | None = None,
 ) -> BundlePlan:
-    records_by_variant = [{name: stage.logical_record() for name, stage in stages.items()} for _, stages in variants]
+    records_by_variant = [
+        {
+            name: {
+                "id": stage.id,
+                "entry": stage.entry,
+                "target": stage.target.target,
+                "interface": dict(stage.interface),
+            }
+            for name, stage in stages.items()
+        }
+        for _, stages in variants
+    ]
     slots = assign_parameter_slots(records_by_variant)
     variant_plans = tuple(
         plan_variant(key, records, slots) for (key, _), records in zip(variants, records_by_variant, strict=True)

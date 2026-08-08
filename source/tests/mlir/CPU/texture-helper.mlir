@@ -7,7 +7,7 @@
 // CHECK-NOT: !vernon.texture
 // CHECK-NOT: !vernon.sampler
 
-module attributes {vernon.compiler_contract_version = 10 : i64, vernon.pipeline_version = 13 : i64} {
+module attributes {vernon.compiler_contract_version = 10 : i64, vernon.pipeline_version = 14 : i64} {
   func.func @sample_texture(
       %texture: !vernon.texture<"2d", f32>,
       %sampler: !vernon.sampler,

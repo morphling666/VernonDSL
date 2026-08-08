@@ -374,7 +374,7 @@ class CompileSurfaceParityTests(unittest.TestCase):
                 self.assertEqual(cooked["target"], {"kind": target_name, "options": target_options})
                 self.assertNotIn("targets", cooked)
                 self.assertEqual([variant["key"] for variant in cooked["variants"]], GOLDEN["graphics"]["variants"])
-                self.assertEqual(cooked["features"], GOLDEN["graphics"]["features"])
+                self.assertNotIn("features", cooked)
                 selected = next(variant for variant in cooked["variants"] if variant["key"] == ["OFFSET"])
                 interactive_variant = interactive["variants"][0]
                 self.assertEqual(interactive_variant["key"], ["OFFSET"])
