@@ -90,7 +90,6 @@ jobs:
           -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DMLIR_DIR="$GITHUB_WORKSPACE/llvm-project/install/lib/cmake/mlir"
-          -DLLD_DIR="$GITHUB_WORKSPACE/llvm-project/install/lib/cmake/lld"
           -DPython_EXECUTABLE="$GITHUB_WORKSPACE/.venv/bin/python"
           -DVERNON_INSTALL_GIT_HOOK=OFF
           -DBUILD_TESTING=ON

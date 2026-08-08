@@ -297,10 +297,6 @@ VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options
     return VERNON_STATUS_UNSUPPORTED_TARGET;
 }
 
-bool linkCpuHostObject(const void *object, size_t objectSize, Artifact &artifact, std::string &diagnostics) {
-    return linkHostObject(object, objectSize, artifact, diagnostics);
-}
-
 VernonCpuEntryPoint findCompiledCpuEntry(const CpuExecutionState *execution, std::string_view entry) {
     return findCpuEntry(execution, entry);
 }

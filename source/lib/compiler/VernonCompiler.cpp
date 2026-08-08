@@ -104,24 +104,6 @@ VernonCompileResult *vernonCompilerCompileMlirWithOptions(VernonCompilerContext 
     return result.release();
 }
 
-VernonCompileResult *vernonCompilerLinkHostObject(VernonCompilerContext *context, const void *object,
-                                                  size_t objectSize) {
-    auto result = std::make_unique<VernonCompileResult>();
-    if (!context || !object || objectSize == 0) {
-        result->status = VERNON_STATUS_INVALID_ARGUMENT;
-        result->diagnostics = "host object linking requires a compiler context and object bytes";
-        return result.release();
-    }
-    vernon::compiler::Artifact artifact;
-    if (!vernon::compiler::linkCpuHostObject(object, objectSize, artifact, result->diagnostics)) {
-        result->status = VERNON_STATUS_INTERNAL_ERROR;
-        return result.release();
-    }
-    result->artifacts.push_back(std::move(artifact));
-    result->status = VERNON_STATUS_OK;
-    return result.release();
-}
-
 void vernonCompileResultDestroy(VernonCompileResult *result) { delete result; }
 
 VernonStatus vernonCompileResultGetStatus(const VernonCompileResult *result) {

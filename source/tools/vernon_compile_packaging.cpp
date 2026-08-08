@@ -42,28 +42,6 @@ std::string_view targetName(VernonTarget target) {
     return "unknown";
 }
 
-std::string_view hostOperatingSystem() {
-#if defined(_WIN32)
-    return "windows";
-#elif defined(__APPLE__)
-    return "macos";
-#elif defined(__linux__)
-    return "linux";
-#else
-    return "unknown";
-#endif
-}
-
-std::string_view hostArchitecture() {
-#if defined(_M_X64) || defined(__x86_64__)
-    return "x86_64";
-#elif defined(_M_ARM64) || defined(__aarch64__)
-    return "aarch64";
-#else
-    return "unknown";
-#endif
-}
-
 std::string objectFormat(const llvm::Triple &triple) {
     if (triple.isOSBinFormatCOFF())
         return "coff";
@@ -74,38 +52,12 @@ std::string objectFormat(const llvm::Triple &triple) {
     return "elf";
 }
 
-bool linkHostLibrary(VernonCompilerContext *context, VernonStringView object, std::string &filename,
-                     std::string &library, std::string &diagnostic) {
-    VernonCompileResult *linked = vernonCompilerLinkHostObject(context, object.data, object.size);
-    if (!linked || vernonCompileResultGetStatus(linked) != VERNON_STATUS_OK) {
-        if (linked) {
-            VernonStringView error = vernonCompileResultGetDiagnostics(linked);
-            diagnostic.assign(error.data ? error.data : "", error.size);
-            vernonCompileResultDestroy(linked);
-        } else {
-            diagnostic = "embedded LLD returned no result";
-        }
-        return false;
-    }
-    if (vernonCompileResultGetArtifactCount(linked) != 1) {
-        diagnostic = "embedded LLD returned an invalid artifact set";
-        vernonCompileResultDestroy(linked);
-        return false;
-    }
-    VernonStringView name = vernonCompileResultGetArtifactName(linked, 0);
-    VernonStringView data = vernonCompileResultGetArtifactData(linked, 0);
-    filename.assign(name.data, name.size);
-    library.assign(data.data, data.size);
-    vernonCompileResultDestroy(linked);
-    return true;
-}
-
 } // namespace
 
 namespace vernon::tools {
 
-VernonStatus packageCompileResult(VernonCompilerContext *context, const VernonCompileResult *result,
-                                  VernonTarget target, const PackagingOptions &options, std::ostream &standardOutput,
+VernonStatus packageCompileResult(const VernonCompileResult *result, VernonTarget target,
+                                  const PackagingOptions &options, std::ostream &standardOutput,
                                   std::ostream &standardError) {
     VernonStatus status = vernonCompileResultGetStatus(result);
     if (status != VERNON_STATUS_OK)
@@ -171,13 +123,6 @@ VernonStatus packageCompileResult(VernonCompilerContext *context, const VernonCo
                 standardError << "CPU compilation did not produce a relocatable object\n";
                 return VERNON_STATUS_INTERNAL_ERROR;
             }
-            if (options.hostRuntimeBundle) {
-                std::string linkDiagnostic;
-                if (!linkHostLibrary(context, artifactData, artifactFilename, packagedArtifact, linkDiagnostic)) {
-                    standardError << linkDiagnostic << '\n';
-                    return VERNON_STATUS_INTERNAL_ERROR;
-                }
-            }
         }
         std::ofstream artifactOutput(*options.computeBundlePath / artifactFilename, std::ios::binary);
         artifactOutput.write(packagedArtifact.data(), static_cast<std::streamsize>(packagedArtifact.size()));
@@ -194,22 +139,16 @@ VernonStatus packageCompileResult(VernonCompilerContext *context, const VernonCo
         manifest["pipeline_version"] = int64_t{VERNON_PIPELINE_VERSION};
         manifest["release_version"] = VERNON_RELEASE_VERSION;
         if (target == VERNON_TARGET_CPU) {
-            if (options.hostRuntimeBundle) {
-                manifest["operating_system"] = std::string(hostOperatingSystem());
-                manifest["architecture"] = std::string(hostArchitecture());
-            } else {
-                const llvm::Triple triple(
-                    llvm::Triple::normalize(options.targetTriple.value_or(llvm::sys::getDefaultTargetTriple())));
-                manifest["target_triple"] = triple.str();
-                manifest["object_format"] = objectFormat(triple);
-            }
+            const llvm::Triple triple(
+                llvm::Triple::normalize(options.targetTriple.value_or(llvm::sys::getDefaultTargetTriple())));
+            manifest["target_triple"] = triple.str();
+            manifest["object_format"] = objectFormat(triple);
         }
         manifest["target"] = std::string(targetName(target));
         manifest["entry"] = computeEntry->getString("name").value_or("").str();
         manifest["symbol"] = computeEntry->getString("symbol").value_or("").str();
         manifest["artifact"] = artifactFilename;
-        manifest["artifact_format"] = target == VERNON_TARGET_CPU
-                                          ? (options.hostRuntimeBundle ? "native_library" : "relocatable_object")
+        manifest["artifact_format"] = target == VERNON_TARGET_CPU      ? "relocatable_object"
                                       : target == VERNON_TARGET_CUDA   ? "ptx"
                                       : target == VERNON_TARGET_VULKAN ? "spirv"
                                       : target == VERNON_TARGET_METAL  ? "msl"

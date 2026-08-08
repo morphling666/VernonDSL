@@ -97,12 +97,6 @@ VERNON_DSL_CAPI VernonCompileResult *vernonCompilerCompileMlir(VernonCompilerCon
 VERNON_DSL_CAPI VernonCompileResult *vernonCompilerCompileMlirWithOptions(VernonCompilerContext *context,
                                                                           const char *source, size_t source_size,
                                                                           const VernonCompileOptions *options);
-/*
- * Finalizes a host relocatable object into a temporary-loadable native
- * library. The result contains exactly one DLL/so/dylib artifact.
- */
-VERNON_DSL_CAPI VernonCompileResult *vernonCompilerLinkHostObject(VernonCompilerContext *context, const void *object,
-                                                                  size_t object_size);
 
 VERNON_DSL_CAPI void vernonCompileResultDestroy(VernonCompileResult *result);
 VERNON_DSL_CAPI VernonStatus vernonCompileResultGetStatus(const VernonCompileResult *result);

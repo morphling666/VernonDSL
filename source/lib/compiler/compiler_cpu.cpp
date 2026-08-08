@@ -4,22 +4,17 @@
 #include "compiler_frontend.h"
 #include "compiler_reflection.h"
 
-#include "lld/Common/Driver.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonCpuPipeline.h"
-#include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUAutodiff.h"
-#include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
-#include "mlir/Dialect/Vernon/Transforms/VernonVerifyCPUAutodiffABI.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Export.h"
-#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
-#include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -28,32 +23,20 @@
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/Error.h"
-#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Host.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 
-#include <filesystem>
-#include <fstream>
-#include <iterator>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
-
-#if defined(_WIN32)
-LLD_HAS_DRIVER(coff)
-#elif defined(__APPLE__)
-LLD_HAS_DRIVER(macho)
-#else
-LLD_HAS_DRIVER(elf)
-#endif
 
 namespace vernon::compiler {
 
@@ -230,101 +213,6 @@ bool emitCpuObject(llvm::Module &module, llvm::TargetMachine &targetMachine, std
     return true;
 }
 
-std::string hostNativeLibraryFilename() {
-#if defined(_WIN32)
-    return "module.dll";
-#elif defined(__APPLE__)
-    return "module.dylib";
-#else
-    return "module.so";
-#endif
-}
-
-bool linkHostObjectBytes(llvm::StringRef object, std::string &library, std::string &diagnostics) {
-    llvm::SmallString<128> directory;
-    if (std::error_code error = llvm::sys::fs::createUniqueDirectory("vernon_cpu_link", directory)) {
-        diagnostics = "cannot create temporary LLD directory: " + error.message();
-        return false;
-    }
-    const std::filesystem::path root(directory.str().str());
-#if defined(_WIN32)
-    const std::filesystem::path objectPath = root / "module.obj";
-#else
-    const std::filesystem::path objectPath = root / "module.o";
-#endif
-    const std::filesystem::path outputPath = root / hostNativeLibraryFilename();
-    auto cleanup = [&] {
-        std::error_code ignored;
-        std::filesystem::remove_all(root, ignored);
-    };
-    {
-        std::ofstream output(objectPath, std::ios::binary);
-        output.write(object.data(), static_cast<std::streamsize>(object.size()));
-        if (!output) {
-            diagnostics = "cannot write temporary CPU object";
-            cleanup();
-            return false;
-        }
-    }
-
-    std::vector<std::string> storage;
-#if defined(_WIN32)
-    storage = {"lld-link", "/dll", "/noentry", "/out:" + outputPath.string(), objectPath.string()};
-    const lld::DriverDef driver{lld::WinLink, &lld::coff::link};
-#elif defined(__APPLE__)
-#if defined(__aarch64__)
-    constexpr const char *hostArch = "arm64";
-#else
-    constexpr const char *hostArch = "x86_64";
-#endif
-    storage = {"ld64.lld",
-               "-dylib",
-               "-arch",
-               hostArch,
-               "-platform_version",
-               "macos",
-               "11.0",
-               "11.0",
-               "-install_name",
-               "@rpath/module.dylib",
-               "-o",
-               outputPath.string(),
-               objectPath.string()};
-    const lld::DriverDef driver{lld::Darwin, &lld::macho::link};
-#else
-    storage = {"ld.lld", "-shared", objectPath.string(), "-o", outputPath.string()};
-    const lld::DriverDef driver{lld::Gnu, &lld::elf::link};
-#endif
-    std::vector<const char *> arguments;
-    arguments.reserve(storage.size());
-    for (const std::string &argument : storage)
-        arguments.push_back(argument.c_str());
-
-    std::string linkerOutput;
-    llvm::raw_string_ostream linkerStream(linkerOutput);
-    static std::mutex linkerMutex;
-    lld::Result linkResult{1, false};
-    {
-        std::lock_guard<std::mutex> lock(linkerMutex);
-        linkResult = lld::lldMain(arguments, linkerStream, linkerStream, {driver});
-    }
-    linkerStream.flush();
-    if (linkResult.retCode != 0 || !linkResult.canRunAgain) {
-        diagnostics = linkerOutput.empty() ? "embedded LLD failed" : std::move(linkerOutput);
-        cleanup();
-        return false;
-    }
-    std::ifstream input(outputPath, std::ios::binary);
-    library.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
-    if (!input || library.empty()) {
-        diagnostics = "embedded LLD produced no readable native library";
-        cleanup();
-        return false;
-    }
-    cleanup();
-    return true;
-}
-
 } // namespace
 
 CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &options,
@@ -439,8 +327,8 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
         }
         nextExecution.reset(new CpuExecutionState());
         nextExecution->jit = std::move(*createdJit);
-        if (llvm::Error error = nextExecution->jit->addIRModule(
-                llvm::orc::ThreadSafeModule(std::move(llvmModule), std::move(llvmContext)))) {
+        if (llvm::Error error = nextExecution->jit->addObjectFile(
+                llvm::MemoryBuffer::getMemBufferCopy(object, cpuObjectFilename(parsedTriple)))) {
             diagnostics = llvm::toString(std::move(error));
             return CpuCompileResult::CodegenFailure;
         }
@@ -461,14 +349,6 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
     }
     execution = std::move(nextExecution);
     return CpuCompileResult::Success;
-}
-
-bool linkHostObject(const void *object, size_t objectSize, Artifact &artifact, std::string &diagnostics) {
-    std::string library;
-    if (!linkHostObjectBytes(llvm::StringRef(static_cast<const char *>(object), objectSize), library, diagnostics))
-        return false;
-    artifact = Artifact{hostNativeLibraryFilename(), std::move(library)};
-    return true;
 }
 
 VernonCpuEntryPoint findCpuEntry(const CpuExecutionState *execution, std::string_view name) {

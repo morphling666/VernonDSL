@@ -7,17 +7,16 @@ module-hashed C entry wrappers. The manifest records `PIPELINE_VERSION`, the
 target triple, object format, exported symbol, artifact size, and SHA-256.
 Applications link the object at build time and register its wrapper with
 VernonRuntime; Runtime validates the external descriptor but never parses or
-relocates object files. Python immediate execution may use a host-native
-shared-library descriptor after embedded LLD finalizes the object into an
-ephemeral DLL/so/dylib. LLVM IR and ORC JIT are not persistent runtime bundle
-formats.
+relocates object files. Python immediate execution uses compiler-owned LLJIT to
+load the host object directly. LLVM IR and ORC JIT are not persistent runtime
+bundle formats.
 
 ## Backend loading
 
 `VernonRuntime` owns the Win32/POSIX library loader used by CPU native-library
 descriptors. CPU relocatable objects resolve through the static entry registry.
 VernonRHI owns CUDA Driver and Vulkan loader discovery; Vulkan headers are
-compile-only. This keeps LLVM, LLD, GLFW, CUDA Toolkit libraries, and the
+compile-only. This keeps LLVM, GLFW, CUDA Toolkit libraries, and the
 Vulkan loader import library outside the deployable runtime dependency closure.
 Vulkan loader discovery is runtime-only and ordered: `VERNON_VULKAN_LOADER`, a
 loader under `VULKAN_SDK`, the normal OS loader name, then Homebrew fallbacks on

@@ -60,8 +60,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     vernon::tools::PackagingOptions computePackaging;
     computePackaging.computeBundlePath = root / "compute";
     computePackaging.targetTriple = std::string(triple);
-    ASSERT_TRUE(vernon::tools::packageCompileResult(context, cpuResult, VERNON_TARGET_CPU, computePackaging, output,
-                                                    error) == VERNON_STATUS_OK);
+    ASSERT_TRUE(vernon::tools::packageCompileResult(cpuResult, VERNON_TARGET_CPU, computePackaging, output, error) ==
+                VERNON_STATUS_OK);
     nlohmann::json computeManifest = nlohmann::json::parse(readFile(root / "compute" / "compute.json"));
     ASSERT_TRUE(computeManifest.at("pipeline_version") == VERNON_PIPELINE_VERSION);
     ASSERT_TRUE(computeManifest.at("target") == "cpu");
@@ -73,8 +73,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 
     vernon::tools::PackagingOptions outputPackaging;
     outputPackaging.outputDirectory = root / "output";
-    ASSERT_TRUE(vernon::tools::packageCompileResult(context, cpuResult, VERNON_TARGET_CPU, outputPackaging, output,
-                                                    error) == VERNON_STATUS_OK);
+    ASSERT_TRUE(vernon::tools::packageCompileResult(cpuResult, VERNON_TARGET_CPU, outputPackaging, output, error) ==
+                VERNON_STATUS_OK);
     ASSERT_TRUE(std::filesystem::is_regular_file(root / "output" / "reflection.json"));
     ASSERT_TRUE(std::filesystem::is_regular_file(root / "output" /
                                                  std::string(vernonCompileResultGetArtifactName(cpuResult, 0).data,

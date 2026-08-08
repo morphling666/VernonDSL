@@ -361,9 +361,9 @@ Vernon conversion patterns do not. Internal entry functions and memref
 descriptors are never exported.
 
 Relocatable objects are the canonical persistent CPU artifact. Desktop Python
-uses the same-host LLD driver embedded in `VernonDSLCompiler` to create an
-ephemeral shared library for immediate execution. Vernon desktop/mobile builds
-link target objects into the application and register their exported wrappers;
+uses LLJIT to load the same host object directly for immediate execution.
+Vernon desktop/mobile builds link target objects into the application and
+register their exported wrappers;
 the lightweight Runtime never embeds an object linker. Initial cross-target
 support covers the compiler host and iOS arm64 Mach-O.
 

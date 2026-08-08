@@ -325,8 +325,8 @@ cmake --build . --config Release --parallel
 ctest -C Release --output-on-failure
 ```
 
-CMake runs the frozen `uv sync`, uses MLIR and LLD from
-`llvm-project/install`, selects the synchronized Python interpreter and host
+CMake runs the frozen `uv sync`, uses MLIR from `llvm-project/install`,
+selects the synchronized Python interpreter and host
 compiler architecture, and disables runtime backends unsupported by the target
 platform and architecture. Single-configuration generators default to Release.
 Tests and the staged-file formatting Git hook are enabled by default. Each

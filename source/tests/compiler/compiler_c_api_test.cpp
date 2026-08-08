@@ -642,22 +642,6 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
 #endif
     ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(cpu_compile), "__vernon_cpu_"));
     ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(cpu_compile), "_add_vectors"));
-    VernonStringView host_object = vernonCompileResultGetArtifactData(cpu_compile, 0);
-    VernonCompileResult *host_library = vernonCompilerLinkHostObject(context, host_object.data, host_object.size);
-    ASSERT_TRUE(host_library != NULL);
-    ASSERT_TRUE(vernonCompileResultGetStatus(host_library) == VERNON_STATUS_OK);
-    VernonStringView host_library_data = vernonCompileResultGetArtifactData(host_library, 0);
-    ASSERT_TRUE(host_library_data.size > 4);
-#if defined(_WIN32)
-    ASSERT_TRUE(host_library_data.data[0] == 'M' && host_library_data.data[1] == 'Z');
-#elif defined(__APPLE__)
-    ASSERT_TRUE((unsigned char)host_library_data.data[0] == 0xcf);
-#else
-    ASSERT_TRUE((unsigned char)host_library_data.data[0] == 0x7f);
-    ASSERT_TRUE(host_library_data.data[1] == 'E' && host_library_data.data[2] == 'L' &&
-                host_library_data.data[3] == 'F');
-#endif
-    vernonCompileResultDestroy(host_library);
     VernonCpuEntryPoint add_vectors = vernonCompileResultGetCpuEntry(cpu_compile, "add_vectors", 11);
     ASSERT_TRUE(add_vectors != NULL);
     float cpu_arguments[8] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};

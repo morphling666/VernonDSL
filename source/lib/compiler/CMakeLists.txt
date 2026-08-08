@@ -23,17 +23,10 @@ if(NOT MLIR_DIR)
         "${VERNON_REPOSITORY_ROOT}/llvm-project/install/lib/cmake/mlir"
         CACHE PATH "Directory containing MLIRConfig.cmake" FORCE)
 endif()
-if(NOT LLD_DIR)
-    set(LLD_DIR
-        "${VERNON_REPOSITORY_ROOT}/llvm-project/install/lib/cmake/lld"
-        CACHE PATH "Directory containing LLDConfig.cmake" FORCE)
-endif()
 find_package(MLIR REQUIRED CONFIG)
-find_package(LLD REQUIRED CONFIG)
 
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
-message(STATUS "Using LLDConfig.cmake in: ${LLD_DIR}")
 
 list(
     APPEND
@@ -58,8 +51,7 @@ target_include_directories(
     INTERFACE "${VERNON_SOURCE_DIR}/include"
               "${CMAKE_CURRENT_BINARY_DIR}/include"
               ${LLVM_INCLUDE_DIRS}
-              ${MLIR_INCLUDE_DIRS}
-              ${LLD_INCLUDE_DIRS})
+              ${MLIR_INCLUDE_DIRS})
 if(NOT LLVM_ENABLE_RTTI)
     if(MSVC)
         target_compile_options(VernonCompilerBuildHeaders INTERFACE /GR-)

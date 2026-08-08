@@ -18,8 +18,6 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
                             std::vector<Artifact> &artifacts, std::string &reflection, std::string &diagnostics,
                             CpuExecutionStatePtr &execution);
 
-bool linkHostObject(const void *object, size_t objectSize, Artifact &artifact, std::string &diagnostics);
-
 VernonCpuEntryPoint findCpuEntry(const CpuExecutionState *execution, std::string_view name);
 
 } // namespace vernon::compiler

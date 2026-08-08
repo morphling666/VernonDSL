@@ -231,20 +231,6 @@ if(TARGET VernonRuntime)
         target_link_libraries(VernonRuntimeTests PRIVATE VernonDSLCompiler)
         vernon_stage_target_files(VernonRuntimeTests VernonDSLCompiler)
     endif()
-    if(TARGET vernon-compile)
-        set(compiler_cpu_bundle "${VERNON_TEST_BINARY_ROOT}/compiler_cpu_aot_bundle")
-        add_custom_command(
-            OUTPUT "${compiler_cpu_bundle}/compute.json"
-            COMMAND $<TARGET_FILE:vernon-compile> --target cpu "${VERNON_TEST_ROOT}/mlir/Validation/cpu-aot-smoke.mlir"
-                    --compute-bundle "${compiler_cpu_bundle}" --host-runtime-bundle
-            DEPENDS vernon-compile "${VERNON_TEST_ROOT}/mlir/Validation/cpu-aot-smoke.mlir"
-            VERBATIM)
-        add_custom_target(vernon-compiler-cpu-aot-test-bundle DEPENDS "${compiler_cpu_bundle}/compute.json")
-        target_sources(VernonRuntimeTests PRIVATE runtime/runtime_compiler_cpu_aot_test.cpp)
-        target_compile_definitions(VernonRuntimeTests PRIVATE VERNON_COMPILER_CPU_BUNDLE_PATH="${compiler_cpu_bundle}")
-        add_dependencies(VernonRuntimeTests vernon-compiler-cpu-aot-test-bundle)
-    endif()
-
     if(TARGET vernon-dsl-native AND Python_FOUND)
         vernon_add_cpu_autodiff_fixture(
             cooked-autodiff

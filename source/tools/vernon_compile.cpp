@@ -44,12 +44,10 @@ int main(int argc, char **argv) {
                      "[--output-dir <directory>] [--reflection <file>] "
                      "[--opengl-version <version>] "
                      "[--directx-shader-model <model>] [--metal-platform <macos|ios>] "
-                     "[--compute-bundle <directory>] [--host-runtime-bundle] "
+                     "[--compute-bundle <directory>] "
                      "[--cpu-triple <triple>] [--cpu-name <name>] "
                      "[--cpu-features <features>]\n"
-                     "  --compute-bundle writes a relocatable CPU object bundle.\n"
-                     "  --host-runtime-bundle finalizes that object with embedded "
-                     "LLD for immediate host execution.\n";
+                     "  --compute-bundle writes a relocatable CPU object bundle.\n";
         return 2;
     }
 
@@ -70,11 +68,6 @@ int main(int argc, char **argv) {
         inputPath = argv[3];
         for (int index = 4; index < argc;) {
             std::string_view option = argv[index];
-            if (option == "--host-runtime-bundle") {
-                packaging.hostRuntimeBundle = true;
-                ++index;
-                continue;
-            }
             if (index + 1 >= argc) {
                 std::cerr << "missing value for " << argv[index] << '\n';
                 return 2;
@@ -129,10 +122,6 @@ int main(int argc, char **argv) {
             std::cerr << "--compute-bundle cannot be combined with --output-dir\n";
             return 2;
         }
-        if (packaging.hostRuntimeBundle && (!packaging.computeBundlePath || *target != VERNON_TARGET_CPU)) {
-            std::cerr << "--host-runtime-bundle requires a CPU --compute-bundle\n";
-            return 2;
-        }
         if ((packaging.targetTriple || cpuName || cpuFeatures) && *target != VERNON_TARGET_CPU) {
             std::cerr << "CPU target options require --target cpu\n";
             return 2;
@@ -147,10 +136,6 @@ int main(int argc, char **argv) {
         }
         if (metalPlatform && *target != VERNON_TARGET_METAL) {
             std::cerr << "--metal-platform requires --target metal\n";
-            return 2;
-        }
-        if (packaging.hostRuntimeBundle && packaging.targetTriple) {
-            std::cerr << "--host-runtime-bundle always uses the compiler host target\n";
             return 2;
         }
     } else if (argc != 2) {
@@ -202,8 +187,8 @@ int main(int argc, char **argv) {
         writeView(std::cerr, vernonCompileResultGetDiagnostics(result));
         std::cerr << '\n';
     } else {
-        status = vernon::tools::packageCompileResult(context, result, target.value_or(VERNON_TARGET_CPU), packaging,
-                                                     std::cout, std::cerr);
+        status = vernon::tools::packageCompileResult(result, target.value_or(VERNON_TARGET_CPU), packaging, std::cout,
+                                                     std::cerr);
     }
 
     vernonCompileResultDestroy(result);

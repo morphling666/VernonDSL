@@ -72,13 +72,6 @@ target_link_libraries(
             MLIRUBToLLVM
             MLIRVectorToLLVM
             ${VERNON_LLVM_JIT_LIBS})
-if(WIN32)
-    target_link_libraries(VernonDSLCompiler PRIVATE lldCommon lldCOFF)
-elseif(APPLE)
-    target_link_libraries(VernonDSLCompiler PRIVATE lldCommon lldMachO)
-else()
-    target_link_libraries(VernonDSLCompiler PRIVATE lldCommon lldELF)
-endif()
 target_link_libraries(VernonDSLCompiler PRIVATE spirv-cross-glsl spirv-cross-hlsl spirv-cross-msl)
 
 if(SKBUILD)

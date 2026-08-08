@@ -219,8 +219,8 @@ Vernon MLIR
 ```
 
 CPU 是 compute reference backend。持久化格式是 relocatable object；交互式
-Python 执行可由 embedded LLD 将 object 链成临时 host DLL/so/dylib。LLVM IR
-和 ORC JIT 都不是持久化 bundle 格式。
+Python 执行由 LLJIT 直接加载 object。LLVM IR 和 ORC JIT 都不是持久化
+bundle 格式。
 
 **CUDA**
 
