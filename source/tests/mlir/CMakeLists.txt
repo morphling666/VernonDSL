@@ -1,5 +1,6 @@
 set(VERNON_LIT_CONFIG_INPUT "${CMAKE_CURRENT_BINARY_DIR}/lit.site.cfg.py.in")
-set(VERNON_LIT_CONFIG "${CMAKE_CURRENT_BINARY_DIR}/lit.site.cfg.py")
+set(VERNON_LIT_CONFIG_DIR "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>")
+set(VERNON_LIT_CONFIG "${VERNON_LIT_CONFIG_DIR}/lit.site.cfg.py")
 
 find_package(LLVM REQUIRED CONFIG)
 
@@ -33,7 +34,7 @@ file(
 add_lit_testsuite(
     check-vernon-mlir
     "Running Vernon MLIR tests"
-    "${CMAKE_CURRENT_BINARY_DIR}"
+    "${VERNON_LIT_CONFIG_DIR}"
     DEPENDS
     FileCheck
     not

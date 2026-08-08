@@ -1,6 +1,7 @@
 #include "compiler_cpu.h"
 
 #include "VernonCpuAbiWrapper.h"
+#include "VernonCpuHalfConversion.h"
 #include "compiler_frontend.h"
 #include "compiler_reflection.h"
 
@@ -304,6 +305,14 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
                                  llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llvmContext), 0), "_fltused");
     if (llvm::verifyModule(*llvmModule, &llvm::errs())) {
         diagnostics = "generated CPU LLVM IR failed verification";
+        return CpuCompileResult::CodegenFailure;
+    }
+    if (llvm::Error error = vernon::lowerCpuHalfConversions(*llvmModule, *objectTargetMachine)) {
+        diagnostics = llvm::toString(std::move(error));
+        return CpuCompileResult::CodegenFailure;
+    }
+    if (llvm::verifyModule(*llvmModule, &llvm::errs())) {
+        diagnostics = "CPU f16 legalization produced invalid LLVM IR";
         return CpuCompileResult::CodegenFailure;
     }
     std::string object;

@@ -20,6 +20,12 @@ if(Python_EXECUTABLE)
                                                        "${VERNON_REPOSITORY_ROOT}/tools/generate_versions.py" --check)
 endif()
 
+file(
+    GLOB_RECURSE
+    VERNON_TEST_BUNDLE_PYTHON_SOURCES
+    CONFIGURE_DEPENDS
+    "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/*.py")
+
 function(vernon_discover_gtests target)
     if(MSVC)
         target_compile_options(${target} PRIVATE /EHsc)
@@ -44,16 +50,12 @@ function(
                 "${asset_reference}")
     add_custom_command(
         OUTPUT "${_vernon_bundle_manifest}"
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "${_vernon_bundle_directory}"
         COMMAND
             ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${Python_EXECUTABLE} -m
             vernon_dsl.pipeline_asset_cli "${asset_reference}" --target "${architecture}" --output
             "${_vernon_bundle_directory}"
-        DEPENDS vernon-dsl-native
-                "${_vernon_asset_source}"
-                "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/parameters.py"
-                "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/requirements.py"
-                "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/bundle/types.py"
-                "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/pipeline_assets.py"
+        DEPENDS vernon-dsl-native "${_vernon_asset_source}" ${VERNON_TEST_BUNDLE_PYTHON_SOURCES}
         VERBATIM)
     add_custom_target("vernon-${name}-test-bundle" DEPENDS "${_vernon_bundle_manifest}")
     set(${output_variable}
@@ -94,7 +96,9 @@ function(
                 vernon_dsl.pipeline_asset_cli "${asset_reference}" --target cpu --output "${_vernon_directory}"
         COMMAND ${Python_EXECUTABLE} "${VERNON_TEST_ROOT}/scripts/prepare_autodiff_cooked_fixture.py"
                 "${_vernon_manifest}" "${CMAKE_C_OUTPUT_EXTENSION}" --wrapper-function "${wrapper_function}"
-        DEPENDS vernon-dsl-native "${_vernon_asset_source}"
+        DEPENDS vernon-dsl-native
+                "${_vernon_asset_source}"
+                ${VERNON_TEST_BUNDLE_PYTHON_SOURCES}
                 "${VERNON_TEST_ROOT}/scripts/prepare_autodiff_cooked_fixture.py"
         VERBATIM)
     set_source_files_properties("${_vernon_registration}" "${_vernon_wrapper}" PROPERTIES GENERATED TRUE)

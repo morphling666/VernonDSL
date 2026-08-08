@@ -27,8 +27,6 @@ jobs:
     name: Build and test
     runs-on: macos-15
     timeout-minutes: 240
-    env:
-      MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS: "0"
 
     steps:
       - name: Check out code

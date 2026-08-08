@@ -15,7 +15,8 @@ add_library(
     compiler_reflection.cpp
     compiler_spirv.cpp
     VernonCompiler.cpp
-    VernonCpuAbiWrapper.cpp)
+    VernonCpuAbiWrapper.cpp
+    VernonCpuHalfConversion.cpp)
 llvm_map_components_to_libnames(
     VERNON_LLVM_JIT_LIBS
     AllTargetsAsmParsers
@@ -26,6 +27,7 @@ llvm_map_components_to_libnames(
     Core
     OrcJIT
     Target
+    TargetParser
     native)
 target_compile_definitions(VernonDSLCompiler PRIVATE VERNON_DSL_COMPILER_BUILD)
 if(MSVC)

@@ -227,6 +227,12 @@ bool compileSpirv(PreparedModule &prepared, VernonTarget target, std::vector<Art
     if (mlir::failed(preparedTarget))
         return false;
     mlir::OwningOpRef<mlir::ModuleOp> module = std::move(preparedTarget->module);
+    {
+        mlir::PassManager passManager(&context);
+        passManager.addPass(mlir::vernon::createVernonLowerAccumulationPass());
+        if (mlir::failed(passManager.run(*module)))
+            return false;
+    }
     mlir::FailureOr<std::string> targetReflection =
         buildReflection(*module, prepared.logicalReflection(), preparedTarget->entries, preparedTarget->provenance);
     if (mlir::failed(targetReflection))
@@ -247,7 +253,6 @@ bool compileSpirv(PreparedModule &prepared, VernonTarget target, std::vector<Art
     mlir::PassManager passManager(&context);
     // The portable SPIR-V environment currently advertises Shader only; it
     // does not promise floating-point atomic-add extensions.
-    passManager.addPass(mlir::vernon::createVernonLowerAccumulationPass());
     passManager.addPass(mlir::vernon::createVernonToGPUPass(true));
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerSynchronizationPass(true, true));
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerGPUTensorsPass(true));

@@ -198,6 +198,239 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     vernonCompilerDestroy(compiler);
 }
 
+TEST(CompilerCApi, CpuHalfConversionsAreSelfContainedAndIeeeCompliant) {
+    static const char module[] = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @extend_f32(
+      %value: f16 {vernon.interface = "input", vernon.location = 0 : i64}) ->
+      (f32 {vernon.interface = "output", vernon.location = 0 : i64})
+      attributes {vernon.entry, vernon.stage = "compute",
+                  vernon.workgroup_size = array<i32: 1, 1, 1>} {
+    %result = arith.extf %value : f16 to f32
+    return %result : f32
+  }
+  func.func @truncate_f32(
+      %value: f32 {vernon.interface = "input", vernon.location = 0 : i64}) ->
+      (f16 {vernon.interface = "output", vernon.location = 0 : i64})
+      attributes {vernon.entry, vernon.stage = "compute",
+                  vernon.workgroup_size = array<i32: 1, 1, 1>} {
+    %result = arith.truncf %value : f32 to f16
+    return %result : f16
+  }
+  func.func @extend_f64(
+      %value: f16 {vernon.interface = "input", vernon.location = 0 : i64}) ->
+      (f64 {vernon.interface = "output", vernon.location = 0 : i64})
+      attributes {vernon.entry, vernon.stage = "compute",
+                  vernon.workgroup_size = array<i32: 1, 1, 1>} {
+    %result = arith.extf %value : f16 to f64
+    return %result : f64
+  }
+  func.func @truncate_f64(
+      %value: f64 {vernon.interface = "input", vernon.location = 0 : i64}) ->
+      (f16 {vernon.interface = "output", vernon.location = 0 : i64})
+      attributes {vernon.entry, vernon.stage = "compute",
+                  vernon.workgroup_size = array<i32: 1, 1, 1>} {
+    %result = arith.truncf %value : f64 to f16
+    return %result : f16
+  }
+  func.func private @extend_v2(%value: vector<2xf16>) -> vector<2xf32> {
+    %result = arith.extf %value : vector<2xf16> to vector<2xf32>
+    return %result : vector<2xf32>
+  }
+  func.func @square_f16(
+      %value: f16 {vernon.interface = "input", vernon.location = 0 : i64}) ->
+      (f16 {vernon.interface = "output", vernon.location = 0 : i64})
+      attributes {vernon.entry, vernon.stage = "compute",
+                  vernon.workgroup_size = array<i32: 1, 1, 1>} {
+    %result = arith.mulf %value, %value : f16
+    return %result : f16
+  }
+}
+)mlir";
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *compiled = vernonCompilerCompileMlir(compiler, module, strlen(module), VERNON_TARGET_CPU);
+    ASSERT_TRUE(compiled);
+    ASSERT_EQ(vernonCompileResultGetStatus(compiled), VERNON_STATUS_OK) << std::string(
+        vernonCompileResultGetDiagnostics(compiled).data, vernonCompileResultGetDiagnostics(compiled).size);
+
+    VernonCpuEntryPoint extendF32 = vernonCompileResultGetCpuEntry(compiled, "extend_f32", 10);
+    VernonCpuEntryPoint truncateF32 = vernonCompileResultGetCpuEntry(compiled, "truncate_f32", 12);
+    VernonCpuEntryPoint extendF64 = vernonCompileResultGetCpuEntry(compiled, "extend_f64", 10);
+    VernonCpuEntryPoint truncateF64 = vernonCompileResultGetCpuEntry(compiled, "truncate_f64", 12);
+    VernonCpuEntryPoint squareF16 = vernonCompileResultGetCpuEntry(compiled, "square_f16", 10);
+    ASSERT_TRUE(extendF32);
+    ASSERT_TRUE(truncateF32);
+    ASSERT_TRUE(extendF64);
+    ASSERT_TRUE(truncateF64);
+    ASSERT_TRUE(squareF16);
+
+    const auto extend32 = [&](uint16_t input) {
+        uint32_t output = 0;
+        VernonCpuInvocation invocation{&input, sizeof(input), &output, sizeof(output), nullptr};
+        EXPECT_EQ(extendF32(&invocation), VERNON_STATUS_OK);
+        return output;
+    };
+    EXPECT_EQ(extend32(0x0000), 0x00000000u);
+    EXPECT_EQ(extend32(0x8000), 0x80000000u);
+    EXPECT_EQ(extend32(0x0001), 0x33800000u);
+    EXPECT_EQ(extend32(0x03ff), 0x387fc000u);
+    EXPECT_EQ(extend32(0x83ff), 0xb87fc000u);
+    EXPECT_EQ(extend32(0x0400), 0x38800000u);
+    EXPECT_EQ(extend32(0x3c00), 0x3f800000u);
+    EXPECT_EQ(extend32(0x7c00), 0x7f800000u);
+    EXPECT_EQ(extend32(0xfc00), 0xff800000u);
+    EXPECT_EQ(extend32(0x7e00), 0x7fc00000u);
+
+    const auto truncate32 = [&](uint32_t input) {
+        uint16_t output = 0;
+        VernonCpuInvocation invocation{&input, sizeof(input), &output, sizeof(output), nullptr};
+        EXPECT_EQ(truncateF32(&invocation), VERNON_STATUS_OK);
+        return output;
+    };
+    EXPECT_EQ(truncate32(0x00000000), 0x0000);
+    EXPECT_EQ(truncate32(0x80000000), 0x8000);
+    EXPECT_EQ(truncate32(0x33000000), 0x0000);
+    EXPECT_EQ(truncate32(0x33000001), 0x0001);
+    EXPECT_EQ(truncate32(0x33800000), 0x0001);
+    EXPECT_EQ(truncate32(0x387fc000), 0x03ff);
+    EXPECT_EQ(truncate32(0x387fe000), 0x0400);
+    EXPECT_EQ(truncate32(0x3f800000), 0x3c00);
+    EXPECT_EQ(truncate32(0x477fe000), 0x7bff);
+    EXPECT_EQ(truncate32(0x477ff000), 0x7c00);
+    EXPECT_EQ(truncate32(0x7f800000), 0x7c00);
+    EXPECT_EQ(truncate32(0xff800000), 0xfc00);
+    EXPECT_EQ(truncate32(0x7fc00000), 0x7e00);
+    EXPECT_EQ(truncate32(0x3f801000), 0x3c00);
+    EXPECT_EQ(truncate32(0x3f803000), 0x3c02);
+
+    uint16_t halfOne = 0x3c00;
+    uint64_t doubleOne = 0;
+    VernonCpuInvocation extendDoubleInvocation{&halfOne, sizeof(halfOne), &doubleOne, sizeof(doubleOne), nullptr};
+    EXPECT_EQ(extendF64(&extendDoubleInvocation), VERNON_STATUS_OK);
+    EXPECT_EQ(doubleOne, 0x3ff0000000000000ull);
+    uint64_t doubleSmallestHalf = 0x3e70000000000000ull;
+    uint16_t smallestHalf = 0;
+    VernonCpuInvocation truncateDoubleInvocation{&doubleSmallestHalf, sizeof(doubleSmallestHalf), &smallestHalf,
+                                                 sizeof(smallestHalf), nullptr};
+    EXPECT_EQ(truncateF64(&truncateDoubleInvocation), VERNON_STATUS_OK);
+    EXPECT_EQ(smallestHalf, 0x0001);
+    uint16_t halfOnePointFive = 0x3e00;
+    uint16_t halfSquare = 0;
+    VernonCpuInvocation squareInvocation{&halfOnePointFive, sizeof(halfOnePointFive), &halfSquare, sizeof(halfSquare),
+                                         nullptr};
+    EXPECT_EQ(squareF16(&squareInvocation), VERNON_STATUS_OK);
+    EXPECT_EQ(halfSquare, 0x4080);
+
+    VernonCompileOptions options{};
+    options.struct_size = sizeof(options);
+    options.target = VERNON_TARGET_CPU;
+    constexpr std::string_view linuxTriple = "x86_64-unknown-linux-gnu";
+    options.as.cpu.triple = {linuxTriple.data(), linuxTriple.size()};
+    VernonCompileResult *linux = vernonCompilerCompileMlirWithOptions(compiler, module, strlen(module), &options);
+    ASSERT_TRUE(linux);
+    ASSERT_EQ(vernonCompileResultGetStatus(linux), VERNON_STATUS_OK)
+        << std::string(vernonCompileResultGetDiagnostics(linux).data, vernonCompileResultGetDiagnostics(linux).size);
+    VernonStringView object = vernonCompileResultGetArtifactData(linux, 0);
+    EXPECT_FALSE(view_contains(object, "__extendhfsf2"));
+    EXPECT_FALSE(view_contains(object, "__extendhfdf2"));
+    EXPECT_FALSE(view_contains(object, "__truncsfhf2"));
+    EXPECT_FALSE(view_contains(object, "__truncdfhf2"));
+    EXPECT_FALSE(view_contains(object, "__mulhf3"));
+    EXPECT_TRUE(view_contains(object, "__vernon_cpu_f16_to_f32_bits"));
+
+    constexpr std::string_view windowsTriple = "x86_64-pc-windows-msvc";
+    options.as.cpu.triple = {windowsTriple.data(), windowsTriple.size()};
+    VernonCompileResult *windows = vernonCompilerCompileMlirWithOptions(compiler, module, strlen(module), &options);
+    ASSERT_TRUE(windows);
+    ASSERT_EQ(vernonCompileResultGetStatus(windows), VERNON_STATUS_OK) << std::string(
+        vernonCompileResultGetDiagnostics(windows).data, vernonCompileResultGetDiagnostics(windows).size);
+    VernonStringView windowsObject = vernonCompileResultGetArtifactData(windows, 0);
+    EXPECT_FALSE(view_contains(windowsObject, "__extendhfsf2"));
+    EXPECT_FALSE(view_contains(windowsObject, "__extendhfdf2"));
+    EXPECT_FALSE(view_contains(windowsObject, "__truncsfhf2"));
+    EXPECT_FALSE(view_contains(windowsObject, "__truncdfhf2"));
+    EXPECT_FALSE(view_contains(windowsObject, "__mulhf3"));
+
+    constexpr std::string_view appleTriple = "arm64-apple-macosx14.0";
+    options.as.cpu.triple = {appleTriple.data(), appleTriple.size()};
+    VernonCompileResult *apple = vernonCompilerCompileMlirWithOptions(compiler, module, strlen(module), &options);
+    ASSERT_TRUE(apple);
+    ASSERT_EQ(vernonCompileResultGetStatus(apple), VERNON_STATUS_OK)
+        << std::string(vernonCompileResultGetDiagnostics(apple).data, vernonCompileResultGetDiagnostics(apple).size);
+    VernonStringView appleObject = vernonCompileResultGetArtifactData(apple, 0);
+    EXPECT_FALSE(view_contains(appleObject, "__vernon_cpu_f16_to_f32_bits"));
+    EXPECT_FALSE(view_contains(appleObject, "__extendhfsf2"));
+    EXPECT_FALSE(view_contains(appleObject, "__extendhfdf2"));
+    EXPECT_FALSE(view_contains(appleObject, "__truncsfhf2"));
+    EXPECT_FALSE(view_contains(appleObject, "__truncdfhf2"));
+    EXPECT_FALSE(view_contains(appleObject, "__mulhf3"));
+
+    constexpr std::string_view avx512Fp16 = "+avx512fp16";
+    options.as.cpu.triple = {linuxTriple.data(), linuxTriple.size()};
+    options.as.cpu.features = {avx512Fp16.data(), avx512Fp16.size()};
+    VernonCompileResult *nativeX86 = vernonCompilerCompileMlirWithOptions(compiler, module, strlen(module), &options);
+    ASSERT_TRUE(nativeX86);
+    ASSERT_EQ(vernonCompileResultGetStatus(nativeX86), VERNON_STATUS_OK) << std::string(
+        vernonCompileResultGetDiagnostics(nativeX86).data, vernonCompileResultGetDiagnostics(nativeX86).size);
+    VernonStringView nativeX86Object = vernonCompileResultGetArtifactData(nativeX86, 0);
+    EXPECT_FALSE(view_contains(nativeX86Object, "__vernon_cpu_f16_to_f32_bits"));
+    EXPECT_FALSE(view_contains(nativeX86Object, "__extendhfsf2"));
+    EXPECT_FALSE(view_contains(nativeX86Object, "__extendhfdf2"));
+    EXPECT_FALSE(view_contains(nativeX86Object, "__truncsfhf2"));
+    EXPECT_FALSE(view_contains(nativeX86Object, "__truncdfhf2"));
+    EXPECT_FALSE(view_contains(nativeX86Object, "__mulhf3"));
+
+    static const char unsupportedModule[] = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @integer_to_half(
+      %value: i32 {vernon.interface = "input", vernon.location = 0 : i64}) ->
+      (f16 {vernon.interface = "output", vernon.location = 0 : i64})
+      attributes {vernon.entry, vernon.stage = "compute",
+                  vernon.workgroup_size = array<i32: 1, 1, 1>} {
+    %result = arith.sitofp %value : i32 to f16
+    return %result : f16
+  }
+}
+)mlir";
+    options.as.cpu.features = {};
+    VernonCompileResult *unsupported =
+        vernonCompilerCompileMlirWithOptions(compiler, unsupportedModule, strlen(unsupportedModule), &options);
+    ASSERT_TRUE(unsupported);
+    EXPECT_NE(vernonCompileResultGetStatus(unsupported), VERNON_STATUS_OK);
+    EXPECT_TRUE(view_contains(vernonCompileResultGetDiagnostics(unsupported), "unsupported by software legalization"));
+
+    static const char collisionModule[] = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func private @__vernon_cpu_f16_to_f32_bits(%value: f32) -> f32 {
+    return %value : f32
+  }
+  func.func @extend_with_collision(
+      %value: f16 {vernon.interface = "input", vernon.location = 0 : i64}) ->
+      (f32 {vernon.interface = "output", vernon.location = 0 : i64})
+      attributes {vernon.entry, vernon.stage = "compute",
+                  vernon.workgroup_size = array<i32: 1, 1, 1>} {
+    %result = arith.extf %value : f16 to f32
+    return %result : f32
+  }
+}
+)mlir";
+    VernonCompileResult *collision =
+        vernonCompilerCompileMlirWithOptions(compiler, collisionModule, strlen(collisionModule), &options);
+    ASSERT_TRUE(collision);
+    EXPECT_EQ(vernonCompileResultGetStatus(collision), VERNON_STATUS_OK) << std::string(
+        vernonCompileResultGetDiagnostics(collision).data, vernonCompileResultGetDiagnostics(collision).size);
+
+    vernonCompileResultDestroy(collision);
+    vernonCompileResultDestroy(unsupported);
+    vernonCompileResultDestroy(nativeX86);
+    vernonCompileResultDestroy(apple);
+    vernonCompileResultDestroy(windows);
+    vernonCompileResultDestroy(linux);
+    vernonCompileResultDestroy(compiled);
+    vernonCompilerDestroy(compiler);
+}
+
 TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     static const char module[] = "module attributes {" VERNON_MLIR_VERSION_ATTRIBUTES "} {\n"
                                  "  func.func @vertex_main("
