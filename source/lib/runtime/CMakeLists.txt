@@ -186,6 +186,11 @@ endif()
 include("${_vernon_runtime_target_file}")
 vernon_add_runtime()
 
+option(VERNON_HOST_TAPE_INSTRUMENTATION "Instrument host autodiff tape traversal in test builds" ${BUILD_TESTING})
+if(VERNON_HOST_TAPE_INSTRUMENTATION)
+    target_compile_definitions(VernonRuntime PRIVATE VERNON_HOST_TAPE_INSTRUMENTATION=1)
+endif()
+
 option(VERNON_BUILD_IOS_METAL_SMOKE_HOST "Build the iOS Metal RHI smoke-test application" OFF)
 if(VERNON_BUILD_IOS_METAL_SMOKE_HOST)
     if(NOT _vernon_is_ios

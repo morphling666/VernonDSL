@@ -344,6 +344,30 @@ typedef struct VernonAdValueSet {
     uint32_t reserved[4];
 } VernonAdValueSet;
 
+typedef struct VernonAdValueMetadataView {
+    uint32_t struct_size;
+    VernonStringView path;
+    VernonDataType dtype;
+    uint32_t rank;
+    const uint64_t *shape;
+    /* Reserved for future use; initialize all elements to zero. */
+    uint32_t reserved[4];
+} VernonAdValueMetadataView;
+
+typedef enum VernonAdDerivativeRole {
+    VERNON_AD_DERIVATIVE_GRADIENT = 0,
+    VERNON_AD_DERIVATIVE_COTANGENT = 1
+} VernonAdDerivativeRole;
+
+typedef struct VernonAdDerivativeGroupView {
+    uint32_t struct_size;
+    VernonAdDerivativeRole role;
+    VernonStringView declared_path;
+    size_t leaf_count;
+    /* Reserved for future use; initialize all elements to zero. */
+    uint32_t reserved[4];
+} VernonAdDerivativeGroupView;
+
 typedef struct VernonPipelineBundleLoadOptions {
     uint32_t struct_size;
     /*
@@ -396,16 +420,23 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimePipelineEncode(VernonRuntimeProvid
 VERNON_RUNTIME_CAPI VernonStatus vernonAdPipelineForward(VernonLoadedPipeline *pipeline, VernonLaunchSize compute_grid,
                                                          const VernonAdValueSet *inputs, VernonAdValueSet *outputs,
                                                          VernonPullback **pullback);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdOutputDataType(const VernonLoadedPipeline *pipeline,
-                                                                                VernonDataType *dtype);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdOutputRank(const VernonLoadedPipeline *pipeline,
-                                                                            size_t *rank);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdOutputDimension(const VernonLoadedPipeline *pipeline,
-                                                                                 size_t index, uint64_t *extent);
+VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetAdOutputCount(const VernonLoadedPipeline *pipeline);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdOutputByIndex(const VernonLoadedPipeline *pipeline,
+                                                                               size_t index,
+                                                                               VernonAdValueMetadataView *metadata);
+VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetAdCotangentCount(const VernonLoadedPipeline *pipeline);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdCotangentByIndex(const VernonLoadedPipeline *pipeline,
+                                                                                  size_t index,
+                                                                                  VernonAdValueMetadataView *metadata);
 VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetAdGradientCount(const VernonLoadedPipeline *pipeline);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdGradient(const VernonLoadedPipeline *pipeline,
-                                                                          size_t index, VernonStringView *path,
-                                                                          VernonDataType *dtype);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdGradientByIndex(const VernonLoadedPipeline *pipeline,
+                                                                                 size_t index,
+                                                                                 VernonAdValueMetadataView *metadata);
+VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetAdDerivativeGroupCount(const VernonLoadedPipeline *pipeline);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdDerivativeGroupByIndex(
+    const VernonLoadedPipeline *pipeline, size_t group_index, VernonAdDerivativeGroupView *group);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdDerivativeGroupLeaf(
+    const VernonLoadedPipeline *pipeline, size_t group_index, size_t leaf_index, VernonStringView *leaf_path);
 VERNON_RUNTIME_CAPI VernonStatus vernonPullbackApply(VernonPullback *pullback, const VernonAdValueSet *cotangents,
                                                      VernonAdValueSet *gradients);
 VERNON_RUNTIME_CAPI void vernonPullbackDestroy(VernonPullback *pullback);

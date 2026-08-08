@@ -363,6 +363,15 @@ Failure tests include:
 Use instrumentation to prove approximately linear record traversal. Do not use
 a fragile wall-clock benchmark.
 
+The Runtime acceptance suite implements this under the test-only
+`VERNON_HOST_TAPE_INSTRUMENTATION` build flag. Product builds contain neither
+the metrics structure nor counter branches. A cooked dynamic-loop backward is
+measured at 0, 1, 32, and 1500 iterations; callback record resolutions scale
+with executed records. A separate cooked Storage test calibrates one carrier's
+tape charge, constrains the context to that charge, then launches two carriers.
+Failure in the second carrier leaves every external Storage/output byte
+unchanged and releases the first carrier's retained tape.
+
 ## 9. Implementation Sequence
 
 1. Finalize ABI v2 and its state-machine/C ABI tests.

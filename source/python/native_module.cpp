@@ -1424,11 +1424,11 @@ struct LoadedPipeline {
         if (gridX > SIZE_MAX / gridY || static_cast<size_t>(gridX) * gridY > SIZE_MAX / gridZ)
             throw std::invalid_argument("autodiff grid size overflows");
         const size_t carrierCount = static_cast<size_t>(gridX) * gridY * gridZ;
-        const size_t outputCount = vernon::runtime::getAutodiffOutputMetadataCount(pipeline);
-        const size_t cotangentCount = vernon::runtime::getAutodiffCotangentMetadataCount(pipeline);
+        const size_t outputCount = vernonRuntimeLoadedPipelineGetAdOutputCount(pipeline);
+        const size_t cotangentCount = vernonRuntimeLoadedPipelineGetAdCotangentCount(pipeline);
         if (!outputCount || !cotangentCount)
             throw std::runtime_error("pipeline has no consistent autodiff output/cotangent signature");
-        auto materializeMetadata = [&](const vernon::runtime::AutodiffValueMetadataView &value) {
+        auto materializeMetadata = [&](const VernonAdValueMetadataView &value) {
             const std::string path = stringView(value.path);
             PythonAdMetadata result{path, path, value.dtype, {}};
             if (value.rank)
@@ -1446,8 +1446,9 @@ struct LoadedPipeline {
         nb::dict aggregateOutput;
         const bool storageObjectives = vernon::runtime::hasAutodiffStorageObjectives(pipeline);
         for (size_t index = 0; index < outputCount; ++index) {
-            vernon::runtime::AutodiffValueMetadataView outputValue;
-            if (!vernon::runtime::getAutodiffOutputMetadata(pipeline, index, outputValue))
+            VernonAdValueMetadataView outputValue{};
+            outputValue.struct_size = sizeof(outputValue);
+            if (vernonRuntimeLoadedPipelineGetAdOutputByIndex(pipeline, index, &outputValue) != VERNON_STATUS_OK)
                 throw std::runtime_error("pipeline has no consistent autodiff output/cotangent signature");
             outputMetadata.push_back(materializeMetadata(outputValue));
             const PythonAdMetadata &metadata = outputMetadata.back();
@@ -1460,8 +1461,9 @@ struct LoadedPipeline {
             aggregateOutput[nb::str(metadata.path.c_str())] = outputValues.back().array;
         }
         for (size_t index = 0; index < cotangentCount; ++index) {
-            vernon::runtime::AutodiffValueMetadataView cotangentValue;
-            if (!vernon::runtime::getAutodiffCotangentMetadata(pipeline, index, cotangentValue))
+            VernonAdValueMetadataView cotangentValue{};
+            cotangentValue.struct_size = sizeof(cotangentValue);
+            if (vernonRuntimeLoadedPipelineGetAdCotangentByIndex(pipeline, index, &cotangentValue) != VERNON_STATUS_OK)
                 throw std::runtime_error("pipeline has no consistent autodiff output/cotangent signature");
             cotangentMetadata.push_back(materializeMetadata(cotangentValue));
         }
@@ -1483,23 +1485,23 @@ struct LoadedPipeline {
         const size_t gradientCount = vernonRuntimeLoadedPipelineGetAdGradientCount(pipeline);
         gradients.reserve(gradientCount);
         for (size_t index = 0; index < gradientCount; ++index) {
-            VernonStringView path{};
-            VernonDataType dtype{};
-            if (vernonRuntimeLoadedPipelineGetAdGradient(pipeline, index, &path, &dtype) != VERNON_STATUS_OK) {
+            VernonAdValueMetadataView gradient{};
+            gradient.struct_size = sizeof(gradient);
+            if (vernonRuntimeLoadedPipelineGetAdGradientByIndex(pipeline, index, &gradient) != VERNON_STATUS_OK) {
                 vernonPullbackDestroy(pullback);
                 throw std::runtime_error("cannot read autodiff gradient reflection");
             }
-            const std::string name = stringView(path);
+            const std::string name = stringView(gradient.path);
             PythonAdMetadata inputLeaf;
             if (!findAdInputLeafMetadata(pipeline, metadata, name, inputLeaf)) {
                 vernonPullbackDestroy(pullback);
                 throw std::runtime_error("autodiff gradient path does not match an input Value leaf");
             }
-            if (autodiffTangentDtype(inputLeaf.dtype) != dtype) {
+            if (autodiffTangentDtype(inputLeaf.dtype) != gradient.dtype) {
                 vernonPullbackDestroy(pullback);
                 throw std::runtime_error("autodiff gradient dtype does not match its input Value leaf tangent type");
             }
-            inputLeaf.dtype = dtype;
+            inputLeaf.dtype = gradient.dtype;
             gradients.push_back(std::move(inputLeaf));
         }
         nb::object output = storageObjectives          ? nb::none()
@@ -1594,22 +1596,23 @@ struct LoadedPipeline {
 
     nb::list derivativeGroups() const {
         nb::list result;
-        const size_t groupCount = vernon::runtime::getAutodiffDerivativeGroupCount(pipeline);
+        const size_t groupCount = vernonRuntimeLoadedPipelineGetAdDerivativeGroupCount(pipeline);
         for (size_t groupIndex = 0; groupIndex < groupCount; ++groupIndex) {
-            VernonStringView role{};
-            VernonStringView declaredPath{};
-            size_t leafCount = 0;
-            if (!vernon::runtime::getAutodiffDerivativeGroupMetadata(pipeline, groupIndex, role, declaredPath,
-                                                                     leafCount))
+            VernonAdDerivativeGroupView group{};
+            group.struct_size = sizeof(group);
+            if (vernonRuntimeLoadedPipelineGetAdDerivativeGroupByIndex(pipeline, groupIndex, &group) !=
+                VERNON_STATUS_OK)
                 throw std::runtime_error("cannot read autodiff derivative group metadata");
             nb::list leaves;
-            for (size_t leafIndex = 0; leafIndex < leafCount; ++leafIndex) {
+            for (size_t leafIndex = 0; leafIndex < group.leaf_count; ++leafIndex) {
                 VernonStringView leafPath{};
-                if (!vernon::runtime::getAutodiffDerivativeGroupLeaf(pipeline, groupIndex, leafIndex, leafPath))
+                if (vernonRuntimeLoadedPipelineGetAdDerivativeGroupLeaf(pipeline, groupIndex, leafIndex, &leafPath) !=
+                    VERNON_STATUS_OK)
                     throw std::runtime_error("cannot read autodiff derivative group leaf");
                 leaves.append(stringView(leafPath));
             }
-            result.append(nb::make_tuple(stringView(role), stringView(declaredPath), leaves));
+            result.append(nb::make_tuple(group.role == VERNON_AD_DERIVATIVE_GRADIENT ? "gradient" : "cotangent",
+                                         stringView(group.declared_path), leaves));
         }
         return result;
     }

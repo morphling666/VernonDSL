@@ -1,10 +1,16 @@
 #include "VernonRuntime.h"
+#include "runtime/autodiff/host_tape_allocator.h"
+#include "runtime/autodiff/host_tape_test_hooks.h"
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
+#include <memory>
 #include <string>
 
 extern "C" VernonStatus vernonRegisterStructuredStorageAutodiffFixture(void);
@@ -102,5 +108,83 @@ TEST(RuntimeStructuredStorageAutodiff, ExecutesDynamicIndexMutationAndFreshStora
     vernonRuntimePipelineBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
+
+#ifdef VERNON_HOST_TAPE_INSTRUMENTATION
+TEST(RuntimeStructuredStorageAutodiff, RollsBackAllExternalBytesAfterPartialMultiInvocationCaptureFailure) {
+    ASSERT_EQ(vernonRegisterStructuredStorageAutodiffFixture(), VERNON_STATUS_OK);
+    const std::filesystem::path manifestPath = VERNON_STRUCTURED_STORAGE_AUTODIFF_MANIFEST;
+    std::ifstream input(manifestPath, std::ios::binary);
+    ASSERT_TRUE(input);
+    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    const std::string bundleDirectory = manifestPath.parent_path().string();
+
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    auto calibrationPolicy = std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(
+        std::numeric_limits<size_t>::max(), std::numeric_limits<size_t>::max());
+    vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, calibrationPolicy);
+    VernonPipelineBundleLoadOptions options{};
+    options.struct_size = sizeof(options);
+    options.bundle_directory = bundleDirectory.c_str();
+    VernonPipelineBundle *bundle =
+        vernonRuntimeLoadPipelineBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    ASSERT_NE(bundle, nullptr) << lastError(context);
+    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    ASSERT_NE(pipeline, nullptr) << lastError(context);
+
+    const uint64_t storageShape[]{3};
+    const uint64_t lossShape[]{1};
+    float values[]{2.0f, 3.0f, 5.0f};
+    float source[]{7.0f, 6.0f, 9.0f};
+    int32_t index = 1;
+    float scale = 4.0f;
+    float loss = -17.0f;
+    VernonAdValue inputValues[]{
+        {sizeof(VernonAdValue), {"values", 6}, VERNON_DATA_F32, values, sizeof(values), 1, storageShape},
+        {sizeof(VernonAdValue), {"source", 6}, VERNON_DATA_F32, source, sizeof(source), 1, storageShape},
+        {sizeof(VernonAdValue), {"index", 5}, VERNON_DATA_I32, &index, sizeof(index), {}},
+        {sizeof(VernonAdValue), {"scale", 5}, VERNON_DATA_F32, &scale, sizeof(scale), {}},
+        {sizeof(VernonAdValue), {"loss", 4}, VERNON_DATA_F32, &loss, sizeof(loss), 1, lossShape},
+    };
+    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
+    VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
+    VernonPullback *calibrationPullback = nullptr;
+    ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &calibrationPullback), VERNON_STATUS_OK)
+        << lastError(context);
+    ASSERT_NE(calibrationPullback, nullptr);
+    const size_t oneInvocationBytes =
+        vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*calibrationPolicy);
+    ASSERT_GT(oneInvocationBytes, 0u);
+    vernonPullbackDestroy(calibrationPullback);
+    EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*calibrationPolicy), 0u);
+    vernonRuntimeLoadedPipelineDestroy(pipeline);
+
+    auto boundedPolicy = std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(std::numeric_limits<size_t>::max(),
+                                                                                     oneInvocationBytes);
+    vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, boundedPolicy);
+    pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    ASSERT_NE(pipeline, nullptr) << lastError(context);
+    values[0] = 2.0f;
+    values[1] = 3.0f;
+    values[2] = 5.0f;
+    loss = -17.0f;
+    std::array<unsigned char, sizeof(values)> valuesBefore{};
+    std::array<unsigned char, sizeof(loss)> lossBefore{};
+    std::memcpy(valuesBefore.data(), values, sizeof(values));
+    std::memcpy(lossBefore.data(), &loss, sizeof(loss));
+
+    VernonPullback *rejectedPullback = reinterpret_cast<VernonPullback *>(uintptr_t{1});
+    EXPECT_EQ(vernonAdPipelineForward(pipeline, {2, 1, 1}, &inputs, &outputs, &rejectedPullback),
+              VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(rejectedPullback, nullptr);
+    EXPECT_EQ(std::memcmp(valuesBefore.data(), values, sizeof(values)), 0);
+    EXPECT_EQ(std::memcmp(lossBefore.data(), &loss, sizeof(loss)), 0);
+    EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*boundedPolicy), 0u);
+
+    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    vernonRuntimePipelineBundleDestroy(bundle);
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+#endif
 
 } // namespace

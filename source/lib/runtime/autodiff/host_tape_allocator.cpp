@@ -13,6 +13,10 @@ namespace {
 using TapeRegistryEntry = std::pair<VernonAdTapeAllocator *, HostDynamicTape *>;
 thread_local std::vector<TapeRegistryEntry> tapeRegistry;
 
+#ifdef VERNON_HOST_TAPE_INSTRUMENTATION
+thread_local HostTapeTraversalMetrics *activeTraversalMetrics;
+#endif
+
 bool checkedAdd(size_t left, size_t right, size_t &result) {
     if (right > std::numeric_limits<size_t>::max() - left)
         return false;
@@ -28,6 +32,13 @@ bool checkedMultiply(size_t left, size_t right, size_t &result) {
 }
 
 } // namespace
+
+#ifdef VERNON_HOST_TAPE_INSTRUMENTATION
+HostTapeTraversalScope::HostTapeTraversalScope(HostTapeTraversalMetrics &metrics)
+    : previous_(std::exchange(activeTraversalMetrics, &metrics)) {}
+
+HostTapeTraversalScope::~HostTapeTraversalScope() { activeTraversalMetrics = previous_; }
+#endif
 
 bool HostTapeMemoryPolicy::reserve(size_t currentInvocationBytes, size_t additionalBytes) {
     std::lock_guard lock(mutex_);
@@ -46,12 +57,23 @@ void HostTapeMemoryPolicy::release(size_t bytes) {
     contextBytes_ = bytes > contextBytes_ ? 0 : contextBytes_ - bytes;
 }
 
+#ifdef VERNON_HOST_TAPE_INSTRUMENTATION
+size_t hostTapeMemoryPolicyChargedBytesForTesting(HostTapeMemoryPolicy &policy) {
+    std::lock_guard lock(policy.mutex_);
+    return policy.contextBytes_;
+}
+#endif
+
 HostTapeSnapshot::~HostTapeSnapshot() {
     if (policy_ && policyCharge_)
         policy_->release(policyCharge_);
 }
 
 const HostTapeSnapshot::Region *HostTapeSnapshot::findRegion(VernonAdRegionHandle handle) const {
+#ifdef VERNON_HOST_TAPE_INSTRUMENTATION
+    if (activeTraversalMetrics)
+        ++activeTraversalMetrics->regionLookups;
+#endif
     const auto found = regionIndex_.find(handle);
     return found == regionIndex_.end() || found->second >= regions_.size() ? nullptr : &regions_[found->second];
 }
@@ -102,6 +124,12 @@ VernonAdTapeAllocatorStatus HostTapeSnapshot::readLeaf(VernonAdTapeAllocator *al
     const Region *region = self->findRegion(regionHandle);
     if (!region || recordIndex >= region->records.size() || region->records[recordIndex] >= self->records_.size())
         return reject(allocator);
+#ifdef VERNON_HOST_TAPE_INSTRUMENTATION
+    if (activeTraversalMetrics) {
+        ++activeTraversalMetrics->recordResolutions;
+        ++activeTraversalMetrics->leafReads;
+    }
+#endif
     const Record &record = self->records_[region->records[recordIndex]];
     size_t end = 0;
     if (!checkedAdd(leafOffset, byteSize, end) || end > record.payloadSize ||
@@ -126,6 +154,12 @@ VernonAdTapeAllocatorStatus HostTapeSnapshot::readChild(VernonAdTapeAllocator *a
     const Region *region = self->findRegion(regionHandle);
     if (!region || recordIndex >= region->records.size() || region->records[recordIndex] >= self->records_.size())
         return reject(allocator);
+#ifdef VERNON_HOST_TAPE_INSTRUMENTATION
+    if (activeTraversalMetrics) {
+        ++activeTraversalMetrics->recordResolutions;
+        ++activeTraversalMetrics->childReads;
+    }
+#endif
     const Record &record = self->records_[region->records[recordIndex]];
     if (childOrdinal >= record.children.size() || !self->findRegion(record.children[childOrdinal]))
         return reject(allocator);
@@ -146,6 +180,10 @@ VernonAdTapeAllocatorStatus HostTapeSnapshot::readExecutedCount(VernonAdTapeAllo
     const Region *region = self->findRegion(regionHandle);
     if (!region)
         return reject(allocator);
+#ifdef VERNON_HOST_TAPE_INSTRUMENTATION
+    if (activeTraversalMetrics)
+        ++activeTraversalMetrics->executedCountReads;
+#endif
     *executedCount = region->executedCount;
     return VERNON_AD_TAPE_ALLOCATOR_OK;
 }
@@ -162,6 +200,10 @@ VernonAdTapeAllocatorStatus HostTapeSnapshot::readExitKind(VernonAdTapeAllocator
     const Region *region = self->findRegion(regionHandle);
     if (!region)
         return reject(allocator);
+#ifdef VERNON_HOST_TAPE_INSTRUMENTATION
+    if (activeTraversalMetrics)
+        ++activeTraversalMetrics->exitKindReads;
+#endif
     *exitKind = region->exitKind;
     return VERNON_AD_TAPE_ALLOCATOR_OK;
 }

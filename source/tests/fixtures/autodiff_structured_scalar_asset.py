@@ -56,6 +56,21 @@ def dynamic_objective(x: vd.f32, count: vd.i32, output: vd.TensorView[vd.f32, (1
 
 
 dynamic_program = vd.ad.vjp(dynamic_objective, wrt=("x",), outputs=("output",))
+dynamic_asset = vd.pipeline_asset(
+    id="compute/structured_dynamic_vjp",
+    program=vd.ad.vjp(dynamic_objective, wrt=("x",), outputs=("output",)),
+)
+
+
+@vd.kernel
+def double_objective(x: vd.f64, output: vd.TensorView[vd.f64, (1,), vd.write]) -> None:
+    output[0] = x * x + x
+
+
+double_asset = vd.pipeline_asset(
+    id="compute/structured_f64_vjp",
+    program=vd.ad.vjp(double_objective, wrt=("x",), outputs=("output",)),
+)
 
 
 @vd.kernel

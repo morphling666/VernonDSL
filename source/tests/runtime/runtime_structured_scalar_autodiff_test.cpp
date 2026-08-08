@@ -1,4 +1,6 @@
 #include "VernonRuntime.h"
+#include "runtime/autodiff/host_tape_allocator.h"
+#include "runtime/autodiff/host_tape_test_hooks.h"
 
 #include <gtest/gtest.h>
 
@@ -9,6 +11,8 @@
 #include <string>
 
 extern "C" VernonStatus vernonRegisterStructuredScalarAutodiffFixture(void);
+extern "C" VernonStatus vernonRegisterStructuredDynamicAutodiffFixture(void);
+extern "C" VernonStatus vernonRegisterStructuredF64AutodiffFixture(void);
 
 namespace {
 
@@ -129,6 +133,143 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
         EXPECT_NEAR(gradientStorage[index], 3.0 * finiteDifference(x, y, z, index), 3e-3);
     vernonPullbackDestroy(pullback);
 
+    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    vernonRuntimePipelineBundleDestroy(bundle);
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+
+#ifdef VERNON_HOST_TAPE_INSTRUMENTATION
+TEST(RuntimeStructuredScalarAutodiff, DynamicTapeTraversalScalesLinearlyWithExecutedRecords) {
+    ASSERT_EQ(vernonRegisterStructuredDynamicAutodiffFixture(), VERNON_STATUS_OK);
+    const std::filesystem::path manifestPath = VERNON_STRUCTURED_DYNAMIC_AUTODIFF_MANIFEST;
+    std::ifstream input(manifestPath, std::ios::binary);
+    ASSERT_TRUE(input);
+    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    const std::string bundleDirectory = manifestPath.parent_path().string();
+
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    vernon::runtime::ad::HostTapeTraversalMetrics metrics;
+    vernon::runtime::ad::HostTapeTraversalScope traversalScope(metrics);
+    vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(
+        *context,
+        std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(
+            vernon::runtime::ad::kDefaultHostTapeInvocationLimit, vernon::runtime::ad::kDefaultHostTapeContextLimit));
+    VernonPipelineBundleLoadOptions options{};
+    options.struct_size = sizeof(options);
+    options.bundle_directory = bundleDirectory.c_str();
+    VernonPipelineBundle *bundle =
+        vernonRuntimeLoadPipelineBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    ASSERT_NE(bundle, nullptr) << lastError(context);
+    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    ASSERT_NE(pipeline, nullptr) << lastError(context);
+
+    auto measure = [&](int32_t count) {
+        float x = 1.25f;
+        float output = 0.0f;
+        const uint64_t shape[]{1};
+        VernonAdValue inputValues[]{
+            {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), {}},
+            {sizeof(VernonAdValue), {"count", 5}, VERNON_DATA_I32, &count, sizeof(count), {}},
+            {sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &output, sizeof(output), 1, shape},
+        };
+        VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
+        VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
+        VernonPullback *pullback = nullptr;
+        EXPECT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
+            << lastError(context);
+        EXPECT_NE(pullback, nullptr);
+        if (!pullback)
+            return metrics;
+        EXPECT_FLOAT_EQ(output, (1.0f + 2.0f * count) * x);
+
+        metrics.reset();
+        float gradient = 0.0f;
+        VernonAdValue gradientValue{sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &gradient, sizeof(gradient), {}};
+        VernonAdValueSet gradients{sizeof(VernonAdValueSet), &gradientValue, 1, {}};
+        EXPECT_EQ(vernonPullbackApply(pullback, nullptr, &gradients), VERNON_STATUS_OK) << lastError(context);
+        EXPECT_FLOAT_EQ(gradient, 1.0f + 2.0f * count);
+        vernonPullbackDestroy(pullback);
+        return metrics;
+    };
+
+    const auto zero = measure(0);
+    const auto one = measure(1);
+    const auto medium = measure(32);
+    const auto longLoop = measure(1500);
+    EXPECT_EQ(zero.recordResolutions, zero.leafReads + zero.childReads);
+    EXPECT_EQ(one.recordResolutions, one.leafReads + one.childReads);
+    EXPECT_EQ(medium.recordResolutions, medium.leafReads + medium.childReads);
+    EXPECT_EQ(longLoop.recordResolutions, longLoop.leafReads + longLoop.childReads);
+    const size_t mediumVariable = medium.recordResolutions - zero.recordResolutions;
+    const size_t longVariable = longLoop.recordResolutions - zero.recordResolutions;
+    ASSERT_GT(mediumVariable, 0u);
+    EXPECT_GE(longVariable, mediumVariable * 40u);
+    EXPECT_LE(longVariable, mediumVariable * 50u);
+    EXPECT_LE(longLoop.regionLookups,
+              longLoop.leafReads + 2u * longLoop.childReads + longLoop.executedCountReads + longLoop.exitKindReads);
+
+    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    vernonRuntimePipelineBundleDestroy(bundle);
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+#endif
+
+TEST(RuntimeStructuredScalarAutodiff, PreservesF64PrimalCotangentAndGradientDtypes) {
+    ASSERT_EQ(vernonRegisterStructuredF64AutodiffFixture(), VERNON_STATUS_OK);
+    const std::filesystem::path manifestPath = VERNON_STRUCTURED_F64_AUTODIFF_MANIFEST;
+    std::ifstream input(manifestPath, std::ios::binary);
+    ASSERT_TRUE(input);
+    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    const std::string bundleDirectory = manifestPath.parent_path().string();
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    VernonPipelineBundleLoadOptions options{};
+    options.struct_size = sizeof(options);
+    options.bundle_directory = bundleDirectory.c_str();
+    VernonPipelineBundle *bundle =
+        vernonRuntimeLoadPipelineBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    ASSERT_NE(bundle, nullptr) << lastError(context);
+    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    ASSERT_NE(pipeline, nullptr) << lastError(context);
+
+    VernonAdValueMetadataView outputMetadata{sizeof(VernonAdValueMetadataView)};
+    VernonAdValueMetadataView cotangentMetadata{sizeof(VernonAdValueMetadataView)};
+    VernonAdValueMetadataView gradientMetadata{sizeof(VernonAdValueMetadataView)};
+    ASSERT_EQ(vernonRuntimeLoadedPipelineGetAdOutputByIndex(pipeline, 0, &outputMetadata), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeLoadedPipelineGetAdCotangentByIndex(pipeline, 0, &cotangentMetadata), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeLoadedPipelineGetAdGradientByIndex(pipeline, 0, &gradientMetadata), VERNON_STATUS_OK);
+    EXPECT_EQ(outputMetadata.dtype, VERNON_DATA_F64);
+    EXPECT_EQ(cotangentMetadata.dtype, VERNON_DATA_F64);
+    EXPECT_EQ(gradientMetadata.dtype, VERNON_DATA_F64);
+
+    double x = 1.5;
+    double output = 0.0;
+    const uint64_t shape[]{1};
+    VernonAdValue inputValues[]{
+        {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F64, &x, sizeof(x), {}},
+        {sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F64, &output, sizeof(output), 1, shape},
+    };
+    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
+    VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
+    VernonPullback *pullback = nullptr;
+    ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
+        << lastError(context);
+    ASSERT_NE(pullback, nullptr);
+    EXPECT_DOUBLE_EQ(output, 3.75);
+
+    double gradient = 0.0;
+    VernonAdValue gradientValue{sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F64, &gradient, sizeof(gradient), {}};
+    VernonAdValueSet gradients{sizeof(VernonAdValueSet), &gradientValue, 1, {}};
+    ASSERT_EQ(vernonPullbackApply(pullback, nullptr, &gradients), VERNON_STATUS_OK) << lastError(context);
+    EXPECT_DOUBLE_EQ(gradient, 4.0);
+    double seed = 2.0;
+    VernonAdValue cotangent{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F64, &seed, sizeof(seed), 1, shape};
+    VernonAdValueSet cotangents{sizeof(VernonAdValueSet), &cotangent, 1, {}};
+    ASSERT_EQ(vernonPullbackApply(pullback, &cotangents, &gradients), VERNON_STATUS_OK) << lastError(context);
+    EXPECT_DOUBLE_EQ(gradient, 8.0);
+
+    vernonPullbackDestroy(pullback);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     vernonRuntimePipelineBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);

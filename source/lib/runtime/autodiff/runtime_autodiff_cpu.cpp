@@ -20,6 +20,10 @@
 #include <utility>
 #include <vector>
 
+#ifdef VERNON_HOST_TAPE_INSTRUMENTATION
+#include "host_tape_test_hooks.h"
+#endif
+
 namespace vernon::runtime::ad {
 
 namespace {
@@ -1188,5 +1192,11 @@ bool createCpuEntryExecutable(VernonRuntimeContext &context, VernonCpuEntryPoint
     return loadStructuredCpuEntryExecutable(context, forwardStage, forwardEntry, backwardStage, backwardEntry,
                                             gradientPaths, executable);
 }
+
+#ifdef VERNON_HOST_TAPE_INSTRUMENTATION
+void setHostTapeMemoryPolicyForTesting(VernonRuntimeContext &context, std::shared_ptr<HostTapeMemoryPolicy> policy) {
+    context.cpuTapePolicy = std::move(policy);
+}
+#endif
 
 } // namespace vernon::runtime::ad

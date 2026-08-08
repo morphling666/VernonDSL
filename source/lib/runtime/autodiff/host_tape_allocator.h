@@ -17,6 +17,31 @@ namespace vernon::runtime::ad {
 inline constexpr size_t kDefaultHostTapeInvocationLimit = 64u * 1024u * 1024u;
 inline constexpr size_t kDefaultHostTapeContextLimit = 256u * 1024u * 1024u;
 
+#ifdef VERNON_HOST_TAPE_INSTRUMENTATION
+struct HostTapeTraversalMetrics {
+    size_t regionLookups{};
+    size_t recordResolutions{};
+    size_t leafReads{};
+    size_t childReads{};
+    size_t executedCountReads{};
+    size_t exitKindReads{};
+
+    void reset() { *this = {}; }
+};
+
+class HostTapeTraversalScope {
+public:
+    explicit HostTapeTraversalScope(HostTapeTraversalMetrics &metrics);
+    ~HostTapeTraversalScope();
+
+    HostTapeTraversalScope(const HostTapeTraversalScope &) = delete;
+    HostTapeTraversalScope &operator=(const HostTapeTraversalScope &) = delete;
+
+private:
+    HostTapeTraversalMetrics *previous_{};
+};
+#endif
+
 class HostTapeMemoryPolicy {
 public:
     HostTapeMemoryPolicy(size_t invocationLimit = kDefaultHostTapeInvocationLimit,
@@ -28,6 +53,9 @@ public:
 private:
     friend class HostDynamicTape;
     friend class HostTapeSnapshot;
+#ifdef VERNON_HOST_TAPE_INSTRUMENTATION
+    friend size_t hostTapeMemoryPolicyChargedBytesForTesting(HostTapeMemoryPolicy &policy);
+#endif
 
     bool reserve(size_t currentInvocationBytes, size_t additionalBytes);
     void release(size_t bytes);

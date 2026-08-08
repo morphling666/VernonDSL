@@ -279,6 +279,22 @@ if(TARGET VernonRuntime)
             structured_scalar_autodiff_manifest
             structured_scalar_autodiff_fixture_target)
         vernon_add_cpu_autodiff_fixture(
+            structured-dynamic-autodiff
+            autodiff_structured_dynamic_fixture
+            autodiff_structured_dynamic_fixture.pipeline.json
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_scalar_asset.py:dynamic_asset"
+            vernonRegisterStructuredDynamicAutodiffFixture
+            structured_dynamic_autodiff_manifest
+            structured_dynamic_autodiff_fixture_target)
+        vernon_add_cpu_autodiff_fixture(
+            structured-f64-autodiff
+            autodiff_structured_f64_fixture
+            autodiff_structured_f64_fixture.pipeline.json
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_scalar_asset.py:double_asset"
+            vernonRegisterStructuredF64AutodiffFixture
+            structured_f64_autodiff_manifest
+            structured_f64_autodiff_fixture_target)
+        vernon_add_cpu_autodiff_fixture(
             structured-aggregate-autodiff
             autodiff_structured_aggregate_fixture
             autodiff_structured_aggregate_fixture.pipeline.json
@@ -302,6 +318,38 @@ if(TARGET VernonRuntime)
             vernonRegisterStructuredStorageAggregateAutodiffFixture
             structured_storage_aggregate_autodiff_manifest
             structured_storage_aggregate_autodiff_fixture_target)
+        vernon_add_cpu_autodiff_fixture(
+            dynamic-v2-signed-stride
+            autodiff_dynamic_v2_signed_stride_fixture
+            autodiff_dynamic_v2_signed_stride_fixture.pipeline.json
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_v2_parity_asset.py:signed_stride_asset"
+            vernonRegisterDynamicV2SignedStrideFixture
+            dynamic_v2_signed_stride_manifest
+            dynamic_v2_signed_stride_fixture_target)
+        vernon_add_cpu_autodiff_fixture(
+            dynamic-v2-strided-scatter
+            autodiff_dynamic_v2_strided_scatter_fixture
+            autodiff_dynamic_v2_strided_scatter_fixture.pipeline.json
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_v2_parity_asset.py:strided_scatter_asset"
+            vernonRegisterDynamicV2StridedScatterFixture
+            dynamic_v2_strided_scatter_manifest
+            dynamic_v2_strided_scatter_fixture_target)
+        vernon_add_cpu_autodiff_fixture(
+            dynamic-v2-gather
+            autodiff_dynamic_v2_gather_fixture
+            autodiff_dynamic_v2_gather_fixture.pipeline.json
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_v2_parity_asset.py:gather_asset"
+            vernonRegisterDynamicV2GatherFixture
+            dynamic_v2_gather_manifest
+            dynamic_v2_gather_fixture_target)
+        vernon_add_cpu_autodiff_fixture(
+            dynamic-v2-multi-output
+            autodiff_dynamic_v2_multi_output_fixture
+            autodiff_dynamic_v2_multi_output_fixture.pipeline.json
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_v2_parity_asset.py:multi_output_asset"
+            vernonRegisterDynamicV2MultiOutputFixture
+            dynamic_v2_multi_output_manifest
+            dynamic_v2_multi_output_fixture_target)
 
         add_executable(VernonCookedAutodiffTests runtime/runtime_cooked_autodiff_test.cpp)
         target_link_libraries(VernonCookedAutodiffTests PRIVATE GTest::gtest_main Vernon::Runtime
@@ -314,11 +362,22 @@ if(TARGET VernonRuntime)
         vernon_discover_gtests(VernonCookedAutodiffTests)
 
         add_executable(VernonStructuredScalarAutodiffTests runtime/runtime_structured_scalar_autodiff_test.cpp)
-        target_link_libraries(VernonStructuredScalarAutodiffTests PRIVATE GTest::gtest_main Vernon::Runtime
-                                                                          ${structured_scalar_autodiff_fixture_target})
+        target_link_libraries(
+            VernonStructuredScalarAutodiffTests
+            PRIVATE GTest::gtest_main
+                    Vernon::Runtime
+                    ${structured_scalar_autodiff_fixture_target}
+                    ${structured_dynamic_autodiff_fixture_target}
+                    ${structured_f64_autodiff_fixture_target})
+        target_include_directories(VernonStructuredScalarAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib")
         target_compile_definitions(
             VernonStructuredScalarAutodiffTests
-            PRIVATE VERNON_STRUCTURED_SCALAR_AUTODIFF_MANIFEST="${structured_scalar_autodiff_manifest}")
+            PRIVATE VERNON_STRUCTURED_SCALAR_AUTODIFF_MANIFEST="${structured_scalar_autodiff_manifest}"
+                    VERNON_STRUCTURED_DYNAMIC_AUTODIFF_MANIFEST="${structured_dynamic_autodiff_manifest}"
+                    VERNON_STRUCTURED_F64_AUTODIFF_MANIFEST="${structured_f64_autodiff_manifest}")
+        if(VERNON_HOST_TAPE_INSTRUMENTATION)
+            target_compile_definitions(VernonStructuredScalarAutodiffTests PRIVATE VERNON_HOST_TAPE_INSTRUMENTATION=1)
+        endif()
         set_target_properties(VernonStructuredScalarAutodiffTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                              "${CMAKE_BINARY_DIR}/source")
         vernon_stage_target_files(VernonStructuredScalarAutodiffTests VernonRuntime)
@@ -341,6 +400,10 @@ if(TARGET VernonRuntime)
         target_compile_definitions(
             VernonStructuredStorageAutodiffTests
             PRIVATE VERNON_STRUCTURED_STORAGE_AUTODIFF_MANIFEST="${structured_storage_autodiff_manifest}")
+        if(VERNON_HOST_TAPE_INSTRUMENTATION)
+            target_compile_definitions(VernonStructuredStorageAutodiffTests PRIVATE VERNON_HOST_TAPE_INSTRUMENTATION=1)
+        endif()
+        target_include_directories(VernonStructuredStorageAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib")
         set_target_properties(VernonStructuredStorageAutodiffTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                               "${CMAKE_BINARY_DIR}/source")
         vernon_stage_target_files(VernonStructuredStorageAutodiffTests VernonRuntime)
@@ -366,6 +429,26 @@ if(TARGET VernonRuntime)
             vernon_structured_storage_aggregate_autodiff_fixture
             vernonRegisterStructuredStorageAggregateAutodiffFixture
             ${structured_storage_aggregate_autodiff_fixture_target})
+        vernon_add_autodiff_python_fixture(
+            VernonDynamicV2SignedStridePythonFixture
+            vernon_dynamic_v2_signed_stride_fixture
+            vernonRegisterDynamicV2SignedStrideFixture
+            ${dynamic_v2_signed_stride_fixture_target})
+        vernon_add_autodiff_python_fixture(
+            VernonDynamicV2StridedScatterPythonFixture
+            vernon_dynamic_v2_strided_scatter_fixture
+            vernonRegisterDynamicV2StridedScatterFixture
+            ${dynamic_v2_strided_scatter_fixture_target})
+        vernon_add_autodiff_python_fixture(
+            VernonDynamicV2GatherPythonFixture
+            vernon_dynamic_v2_gather_fixture
+            vernonRegisterDynamicV2GatherFixture
+            ${dynamic_v2_gather_fixture_target})
+        vernon_add_autodiff_python_fixture(
+            VernonDynamicV2MultiOutputPythonFixture
+            vernon_dynamic_v2_multi_output_fixture
+            vernonRegisterDynamicV2MultiOutputFixture
+            ${dynamic_v2_multi_output_fixture_target})
         add_test(
             NAME VernonPythonCookedAutodiffTest
             COMMAND
@@ -397,6 +480,14 @@ if(TARGET VernonRuntime)
             COMMAND
                 "${Python_EXECUTABLE}" "${VERNON_TEST_ROOT}/python/autodiff_structured_scalar_direct_runtime_test.py"
                 "${VERNON_REPOSITORY_ROOT}/python" "${VERNON_TEST_ROOT}/fixtures")
+        add_test(
+            NAME VernonPythonDynamicV2ParityTest
+            COMMAND
+                "${Python_EXECUTABLE}" "${VERNON_TEST_ROOT}/python/autodiff_dynamic_v2_parity_runtime_test.py"
+                "${dynamic_v2_signed_stride_manifest}" "${dynamic_v2_strided_scatter_manifest}"
+                "${dynamic_v2_gather_manifest}" "${dynamic_v2_multi_output_manifest}"
+                "$<TARGET_FILE_DIR:VernonDynamicV2SignedStridePythonFixture>" "${VERNON_REPOSITORY_ROOT}/python"
+                "${VERNON_TEST_ROOT}/fixtures")
     endif()
 
     target_sources(VernonRuntimeTests PRIVATE runtime/runtime_cuda_pipeline_test.cpp)
@@ -798,6 +889,15 @@ if(TARGET VernonDSLCompiler)
     endif()
 
     if(TARGET vernon-dsl-native)
+        add_test(NAME vernon-python-test_storage_vjp_contract
+                 COMMAND ${Python_EXECUTABLE} -m unittest discover -s "${VERNON_REPOSITORY_ROOT}/python/tests" -p
+                         "test_storage_vjp_contract.py")
+        set_tests_properties(
+            vernon-python-test_storage_vjp_contract
+            PROPERTIES ENVIRONMENT
+                       "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python"
+                       WORKING_DIRECTORY
+                       "${VERNON_REPOSITORY_ROOT}")
         add_test(NAME vernon-python-native-compiled-program
                  COMMAND ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/python/tests/test_native_compiled_program.py")
         add_test(NAME vernon-python-compile-surface-parity

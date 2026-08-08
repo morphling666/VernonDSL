@@ -161,6 +161,15 @@ permit removing queue waits or letting recorded work outlive its owners.
 - Stateful branches, loops, runtime gather/scatter, scratch overwrite,
   aggregate output cotangents, and multi-invocation carriers have direct,
   cooked, and finite-difference regression coverage.
+- Indexed C reflection exposes every output, cotangent, gradient, and derivative
+  group with its canonical path, dtype, and logical shape; aggregate
+  multi-output signatures no longer depend on a single-output query.
+- Capture failure after a completed carrier is tested to leave external Storage
+  and outputs byte-for-byte unchanged. Callback instrumentation verifies linear
+  backward tape traversal for 0, 1, 32, and 1500 loop iterations.
+- Cooked CPU regression coverage includes f64 primal/cotangent/gradient
+  preservation, signed-stride aggregate outputs, strided gradient scatter,
+  gather accumulation, and independent multi-output cotangents.
 - Compiler contract 10 and pipeline contract 13 freeze the current transform,
   profile, tape, and manifest boundary without compatibility readers.
 

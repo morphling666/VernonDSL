@@ -231,6 +231,19 @@ ownership, protocol, and executable signature. Python always reads groups from
 the loaded native pipeline; it does not maintain a second direct or cooked
 grouping model.
 
+The public C Runtime exposes indexed reflection rather than a scalar-output
+special case:
+
+- `vernonRuntimeLoadedPipelineGetAdOutputCount` and
+  `vernonRuntimeLoadedPipelineGetAdOutputByIndex`;
+- the equivalent cotangent and gradient count/index pairs;
+- derivative-group count/index queries and indexed leaf-path queries.
+
+Each value query returns one `VernonAdValueMetadataView` containing the
+canonical path, tangent dtype, rank, and logical shape. This is the only public
+output/cotangent/gradient reflection API and supports aggregate and independent
+multi-output objectives without reinterpretation.
+
 For grids larger than one invocation, packed aggregate cotangents prepend the
 physical `(z,y,x)` carrier dimensions to the primal owner shape. TensorView
 offsets and signed strides apply to the trailing owner dimensions, so

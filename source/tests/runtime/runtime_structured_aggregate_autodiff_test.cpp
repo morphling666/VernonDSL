@@ -36,6 +36,31 @@ TEST(RuntimeStructuredAggregateAutodiff, ExecutesAggregateInputAndStorageObjecti
     VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
+    ASSERT_EQ(vernonRuntimeLoadedPipelineGetAdOutputCount(pipeline), 1u);
+    VernonAdValueMetadataView outputMetadata{sizeof(VernonAdValueMetadataView)};
+    ASSERT_EQ(vernonRuntimeLoadedPipelineGetAdOutputByIndex(pipeline, 0, &outputMetadata), VERNON_STATUS_OK);
+    EXPECT_EQ(std::string_view(outputMetadata.path.data, outputMetadata.path.size), "output");
+    EXPECT_EQ(outputMetadata.dtype, VERNON_DATA_F32);
+    ASSERT_EQ(outputMetadata.rank, 1u);
+    EXPECT_EQ(outputMetadata.shape[0], 2u);
+    EXPECT_EQ(vernonRuntimeLoadedPipelineGetAdCotangentCount(pipeline), 1u);
+    VernonAdValueMetadataView cotangentMetadata{sizeof(VernonAdValueMetadataView)};
+    ASSERT_EQ(vernonRuntimeLoadedPipelineGetAdCotangentByIndex(pipeline, 0, &cotangentMetadata), VERNON_STATUS_OK);
+    EXPECT_EQ(std::string_view(cotangentMetadata.path.data, cotangentMetadata.path.size), "output");
+    EXPECT_EQ(cotangentMetadata.dtype, VERNON_DATA_F32);
+    EXPECT_EQ(vernonRuntimeLoadedPipelineGetAdGradientCount(pipeline), 3u);
+    VernonAdValueMetadataView gradientMetadata{sizeof(VernonAdValueMetadataView)};
+    ASSERT_EQ(vernonRuntimeLoadedPipelineGetAdGradientByIndex(pipeline, 0, &gradientMetadata), VERNON_STATUS_OK);
+    EXPECT_FALSE(std::string_view(gradientMetadata.path.data, gradientMetadata.path.size).empty());
+    ASSERT_EQ(vernonRuntimeLoadedPipelineGetAdDerivativeGroupCount(pipeline), 4u);
+    VernonAdDerivativeGroupView group{sizeof(VernonAdDerivativeGroupView)};
+    ASSERT_EQ(vernonRuntimeLoadedPipelineGetAdDerivativeGroupByIndex(pipeline, 0, &group), VERNON_STATUS_OK);
+    EXPECT_EQ(group.role, VERNON_AD_DERIVATIVE_GRADIENT);
+    EXPECT_GE(group.leaf_count, 1u);
+    VernonStringView groupLeaf{};
+    ASSERT_EQ(vernonRuntimeLoadedPipelineGetAdDerivativeGroupLeaf(pipeline, 0, 0, &groupLeaf), VERNON_STATUS_OK);
+    EXPECT_FALSE(std::string_view(groupLeaf.data, groupLeaf.size).empty());
+
     auto expectField = [](const VernonValuePathComponentView &component, std::string_view name) {
         EXPECT_EQ(component.kind, VERNON_VALUE_PATH_FIELD);
         EXPECT_EQ(std::string_view(component.field.data, component.field.size), name);
