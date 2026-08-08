@@ -1,18 +1,18 @@
-# VernonDSL 0.1.1 release readiness
+# VernonDSL 0.1.2 release readiness
 
 Assessment date: 2026-08-02
 
 ## Release decision
 
-`0.1.1` is publishable only from an exact commit for which every required gate
+`0.1.2` is publishable only from an exact commit for which every required gate
 below is green. `versions.toml` is the single manually edited version source.
 
 ## Supported distribution
 
 - Windows x64, Linux x64, and Apple Silicon macOS wheels;
 - CPython 3.11 through 3.14;
-- wheel-only distribution for `0.1.1`; no sdist or Intel macOS wheel;
-- compiler contract 10 and pipeline contract 14.
+- wheel-only distribution for `0.1.2`; no sdist or Intel macOS wheel;
+- compiler contract 11 and pipeline contract 15.
 
 Backend capabilities and limitations are defined in
 [`RELEASE_NOTES.md`](RELEASE_NOTES.md) and [`SUPPORT.md`](SUPPORT.md). Public
@@ -21,8 +21,8 @@ surface and compatibility guarantees are defined in
 
 ## Required gates
 
-- [ ] `versions.toml` and all generated version files report release `0.1.1`,
-      compiler contract 10, and pipeline contract 14.
+- [ ] `versions.toml` and all generated version files report release `0.1.2`,
+      compiler contract 11, and pipeline contract 15.
 - [ ] Native CTest and Python tests pass on Linux, macOS, and Windows on the
       exact release commit.
 - [ ] Windows formatting, Ruff, Python coverage, and Runtime AddressSanitizer
@@ -40,7 +40,7 @@ surface and compatibility guarantees are defined in
       SBOM, and provenance, stages those files in a GitHub Release, and
       publishes the wheels to PyPI through Trusted Publishing.
 - [ ] Clean CPython 3.11 environments on Windows, Linux, and macOS install
-      `vernon-lang==0.1.1` from PyPI and repeat the installed-wheel smoke test
+      `vernon-lang==0.1.2` from PyPI and repeat the installed-wheel smoke test
       before the GitHub Release leaves draft state.
 
 ## Publication procedure
@@ -48,7 +48,7 @@ surface and compatibility guarantees are defined in
 1. Merge the release changes through review.
 2. Require all platform and wheel checks on that exact merged commit.
 3. Verify the PyPI `pypi` environment and Trusted Publisher configuration.
-4. Create the immutable `v0.1.1` tag on that commit.
+4. Create the immutable `v0.1.2` tag on that commit.
 5. Let the release workflow build, verify, attest, stage, publish, verify from
    PyPI, and then finalize the GitHub Release.
 6. Verify GitHub Release and PyPI filenames, hashes, version, and clean install.

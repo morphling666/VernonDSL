@@ -249,13 +249,10 @@ bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffVariant
     std::shared_ptr<Executable> executable;
     bool resolved = false;
     if (bundle.context->backend == VERNON_RUNTIME_CPU) {
-        if (bundle.autodiff->protocol == "dynamic_v2") {
+        if (bundle.autodiff->protocol == "dynamic_v2")
             resolved = createCpuExecutable(*bundle.context, forward, backward, gradientPaths, executable);
-        } else if (bundle.autodiff->protocol == "legacy_fixed") {
-            resolved = createLegacyCpuExecutable(*bundle.context, forward, backward, gradientPaths, executable);
-        } else {
+        else
             invocationDiagnostic(*bundle.context) = "CPU autodiff profile uses an unsupported protocol";
-        }
     } else {
         resolved = createGpuExecutable(bundle, profiles.forwardWithTape, profiles.backward, gradientPaths,
                                        profiles.launch, executable);

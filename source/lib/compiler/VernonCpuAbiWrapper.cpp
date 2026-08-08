@@ -181,11 +181,18 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
                 return invalidAbi("lowered CPU buffer descriptor pointer types are "
                                   "incompatible");
             llvm::Constant *offset = integerConstant(offsetType, 0);
-            llvm::Constant *extent = integerConstant(sizeType, 0);
             llvm::Constant *stride = integerConstant(strideType, 1);
+            llvm::Value *extent = integerConstant(sizeType, 1);
             if (!offset || !extent || !stride)
                 return invalidAbi("lowered CPU buffer descriptor index types are "
                                   "incompatible");
+            for (uint32_t dimension = 0; dimension < packing.tensorRank; ++dimension) {
+                llvm::Value *extentAddress = builder.CreateGEP(
+                    builder.getInt8Ty(), address, builder.getInt64(8 * (2 + static_cast<uint64_t>(dimension))));
+                llvm::LoadInst *runtimeExtent = builder.CreateLoad(sizeType, extentAddress);
+                runtimeExtent->setAlignment(llvm::Align(1));
+                extent = builder.CreateMul(extent, runtimeExtent);
+            }
             argumentsToCall.append({rawPointer, rawPointer, offset, extent, stride});
         }
     }

@@ -18,6 +18,7 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <future>
 #include <initializer_list>
 #include <limits>
 #include <memory>
@@ -659,6 +660,24 @@ struct CompiledProgram {
     VernonTarget target;
 };
 
+struct CpuTargetOptionStrings {
+    std::string triple;
+    std::string processor;
+    std::string features;
+};
+
+CpuTargetOptionStrings parseCpuTargetOptions(const nb::dict &targetOptions) {
+    for (auto item : targetOptions) {
+        const std::string key = nb::cast<std::string>(item.first);
+        if (key != "triple" && key != "processor" && key != "features")
+            throw std::invalid_argument("unknown option '" + key + "' for CPU target");
+    }
+    auto readString = [&](const char *name) {
+        return targetOptions.contains(name) ? nb::cast<std::string>(targetOptions[name]) : std::string();
+    };
+    return {readString("triple"), readString("processor"), readString("features")};
+}
+
 std::unique_ptr<CompiledProgram> compileProgramResult(Compiler &compiler, const std::string &mlir, VernonTarget target,
                                                       const nb::dict &targetOptions) {
     auto readString = [&](const char *name) {
@@ -674,17 +693,12 @@ std::unique_ptr<CompiledProgram> compileProgramResult(Compiler &compiler, const 
     VernonCompileOptions options{};
     options.struct_size = sizeof(options);
     options.target = target;
-    std::string triple;
-    std::string processor;
-    std::string features;
+    CpuTargetOptionStrings cpu;
     if (target == VERNON_TARGET_CPU) {
-        rejectUnknown({"triple", "processor", "features"});
-        triple = readString("triple");
-        processor = readString("processor");
-        features = readString("features");
-        options.as.cpu.triple = VernonStringView{triple.data(), triple.size()};
-        options.as.cpu.processor = VernonStringView{processor.data(), processor.size()};
-        options.as.cpu.features = VernonStringView{features.data(), features.size()};
+        cpu = parseCpuTargetOptions(targetOptions);
+        options.as.cpu.triple = VernonStringView{cpu.triple.data(), cpu.triple.size()};
+        options.as.cpu.processor = VernonStringView{cpu.processor.data(), cpu.processor.size()};
+        options.as.cpu.features = VernonStringView{cpu.features.data(), cpu.features.size()};
     } else if (target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES) {
         rejectUnknown({"version"});
         options.as.opengl.version =
@@ -704,6 +718,36 @@ std::unique_ptr<CompiledProgram> compileProgramResult(Compiler &compiler, const 
     }
     return std::make_unique<CompiledProgram>(
         vernonCompilerCompileMlirWithOptions(compiler.context, mlir.data(), mlir.size(), &options), target);
+}
+
+std::vector<std::unique_ptr<CompiledProgram>> compileCpuProgramResults(const std::vector<std::string> &modules,
+                                                                       const nb::dict &targetOptions) {
+    const CpuTargetOptionStrings cpu = parseCpuTargetOptions(targetOptions);
+
+    std::vector<std::future<std::unique_ptr<CompiledProgram>>> futures;
+    std::vector<std::unique_ptr<CompiledProgram>> results;
+    futures.reserve(modules.size());
+    results.reserve(modules.size());
+    {
+        nb::gil_scoped_release release;
+        for (const std::string &module : modules) {
+            futures.push_back(std::async(std::launch::async, [module, cpu] {
+                Compiler compiler;
+                VernonCompileOptions options{};
+                options.struct_size = sizeof(options);
+                options.target = VERNON_TARGET_CPU;
+                options.as.cpu.triple = VernonStringView{cpu.triple.data(), cpu.triple.size()};
+                options.as.cpu.processor = VernonStringView{cpu.processor.data(), cpu.processor.size()};
+                options.as.cpu.features = VernonStringView{cpu.features.data(), cpu.features.size()};
+                return std::make_unique<CompiledProgram>(
+                    vernonCompilerCompileMlirWithOptions(compiler.context, module.data(), module.size(), &options),
+                    VERNON_TARGET_CPU);
+            }));
+        }
+        for (auto &future : futures)
+            results.push_back(future.get());
+    }
+    return results;
 }
 
 struct PipelineParameterMetadata {
@@ -1169,17 +1213,20 @@ struct PythonAdValue {
                                         " does not match reflection " + formatShape(this->shape));
         size_t scalarCount = 1;
         for (uint64_t extent : this->shape) {
-            if (!extent || extent > std::numeric_limits<size_t>::max() / scalarCount)
+            if (scalarCount && extent > std::numeric_limits<size_t>::max() / scalarCount)
                 throw std::invalid_argument("Python autodiff Value shape overflows");
             scalarCount *= static_cast<size_t>(extent);
         }
+        const size_t scalarSize = autodiffDtypeSize(dtype);
+        if (!scalarSize || (scalarCount && scalarSize > std::numeric_limits<size_t>::max() / scalarCount))
+            throw std::invalid_argument("Python autodiff Value byte size overflows");
         if (this->shape.size() > std::numeric_limits<uint32_t>::max())
             throw std::invalid_argument("Python autodiff Value rank overflows");
         value.struct_size = sizeof(value);
         value.path = {this->path.data(), this->path.size()};
         value.dtype = dtype;
         value.data = reinterpret_cast<void *>(nb::cast<uintptr_t>(array.attr("ctypes").attr("data")));
-        value.size = scalarCount * autodiffDtypeSize(dtype);
+        value.size = scalarCount * scalarSize;
         value.rank = static_cast<uint32_t>(this->shape.size());
         value.shape = this->shape.empty() ? nullptr : this->shape.data();
     }
@@ -1285,19 +1332,6 @@ nb::object resolveAdInputLeaf(const nb::dict &bindings, const PipelineParameterM
         }
     }
     return value;
-}
-
-bool findAdInputLeafMetadata(VernonLoadedPipeline *pipeline, const std::vector<PipelineParameterMetadata> &parameters,
-                             const std::string &path, PythonAdMetadata &result) {
-    for (const PipelineParameterMetadata &parameter : parameters)
-        for (size_t leafIndex = 0; leafIndex < parameter.elementLeaves.size(); ++leafIndex) {
-            PythonAdMetadata candidate = adInputLeafMetadata(pipeline, parameter, leafIndex);
-            if (candidate.path == path) {
-                result = std::move(candidate);
-                return true;
-            }
-        }
-    return false;
 }
 
 struct PythonPullback {
@@ -1409,14 +1443,21 @@ struct LoadedPipeline {
             throw std::invalid_argument("autodiff bindings do not match pipeline parameters");
         std::deque<PythonAdValue> inputValues;
         std::vector<VernonAdValue> inputViews;
+        std::vector<PythonAdMetadata> inputLeafMetadata;
         for (const PipelineParameterMetadata &parameter : metadata) {
             for (size_t leafIndex = 0; leafIndex < parameter.elementLeaves.size(); ++leafIndex) {
                 VernonPipelineValueLeafView reflected{};
                 PythonAdMetadata leaf = adInputLeafMetadata(pipeline, parameter, leafIndex, &reflected);
                 nb::object value = resolveAdInputLeaf(bindings, parameter, reflected);
-                inputValues.emplace_back(leaf.path, leaf.dtype, std::move(leaf.shape), value,
+                const std::vector<uint64_t> actualShape = nb::cast<std::vector<uint64_t>>(value.attr("shape"));
+                if (actualShape.size() == leaf.shape.size())
+                    for (size_t dimension = 0; dimension < leaf.shape.size(); ++dimension)
+                        if (!leaf.shape[dimension])
+                            leaf.shape[dimension] = actualShape[dimension];
+                inputValues.emplace_back(leaf.path, leaf.dtype, leaf.shape, value,
                                          parameter.access != VERNON_ACCESS_READ);
                 inputViews.push_back(inputValues.back().value);
+                inputLeafMetadata.push_back(std::move(leaf));
             }
         }
         VernonAdValueSet inputSet{sizeof(VernonAdValueSet), inputViews.data(), inputViews.size(), {}};
@@ -1428,13 +1469,16 @@ struct LoadedPipeline {
         const size_t cotangentCount = vernonRuntimeLoadedPipelineGetAdCotangentCount(pipeline);
         if (!outputCount || !cotangentCount)
             throw std::runtime_error("pipeline has no consistent autodiff output/cotangent signature");
+        auto prependCarrierDimensions = [&](std::vector<uint64_t> &shape) {
+            if (carrierCount > 1)
+                shape.insert(shape.begin(), {gridZ, gridY, gridX});
+        };
         auto materializeMetadata = [&](const VernonAdValueMetadataView &value) {
             const std::string path = stringView(value.path);
             PythonAdMetadata result{path, path, value.dtype, {}};
             if (value.rank)
                 result.shape.assign(value.shape, value.shape + value.rank);
-            if (carrierCount > 1)
-                result.shape.insert(result.shape.begin(), {gridZ, gridY, gridX});
+            prependCarrierDimensions(result.shape);
             return result;
         };
         std::vector<PythonAdMetadata> outputMetadata;
@@ -1465,7 +1509,16 @@ struct LoadedPipeline {
             cotangentValue.struct_size = sizeof(cotangentValue);
             if (vernonRuntimeLoadedPipelineGetAdCotangentByIndex(pipeline, index, &cotangentValue) != VERNON_STATUS_OK)
                 throw std::runtime_error("pipeline has no consistent autodiff output/cotangent signature");
-            cotangentMetadata.push_back(materializeMetadata(cotangentValue));
+            PythonAdMetadata cotangent = materializeMetadata(cotangentValue);
+            const auto input =
+                std::find_if(inputLeafMetadata.begin(), inputLeafMetadata.end(),
+                             [&](const PythonAdMetadata &candidate) { return candidate.path == cotangent.path; });
+            if (input != inputLeafMetadata.end()) {
+                cotangent.binding = input->binding;
+                cotangent.shape = input->shape;
+                prependCarrierDimensions(cotangent.shape);
+            }
+            cotangentMetadata.push_back(std::move(cotangent));
         }
         if (storageObjectives) {
             outputValues.clear();
@@ -1492,11 +1545,14 @@ struct LoadedPipeline {
                 throw std::runtime_error("cannot read autodiff gradient reflection");
             }
             const std::string name = stringView(gradient.path);
-            PythonAdMetadata inputLeaf;
-            if (!findAdInputLeafMetadata(pipeline, metadata, name, inputLeaf)) {
+            const auto reflectedInput =
+                std::find_if(inputLeafMetadata.begin(), inputLeafMetadata.end(),
+                             [&](const PythonAdMetadata &candidate) { return candidate.path == name; });
+            if (reflectedInput == inputLeafMetadata.end()) {
                 vernonPullbackDestroy(pullback);
                 throw std::runtime_error("autodiff gradient path does not match an input Value leaf");
             }
+            PythonAdMetadata inputLeaf = *reflectedInput;
             if (autodiffTangentDtype(inputLeaf.dtype) != gradient.dtype) {
                 vernonPullbackDestroy(pullback);
                 throw std::runtime_error("autodiff gradient dtype does not match its input Value leaf tangent type");
@@ -1905,6 +1961,8 @@ NB_MODULE(_native, module) {
         .def(nb::init<>())
         .def("compile_program_result", &compileProgramResult, nb::arg("mlir"), nb::arg("target"),
              nb::arg("options") = nb::dict());
+    module.def("_compile_cpu_program_results", &compileCpuProgramResults, nb::arg("modules"),
+               nb::arg("options") = nb::dict());
     nb::class_<CompiledProgram>(module, "CompiledProgram")
         .def_prop_ro("ok", &CompiledProgram::ok)
         .def_prop_ro("status", &CompiledProgram::status)

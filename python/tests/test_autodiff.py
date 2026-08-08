@@ -115,6 +115,35 @@ asset = vd.pipeline_asset(
             manifest = json.loads(descriptor.canonical_manifest)
             self.assertEqual(manifest["transform"], descriptor.transform)
 
+    def test_named_vjp_program_matches_inline_declaration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "asset.py"
+            source.write_text(
+                """
+import vernon_dsl as vd
+
+@vd.kernel
+def compute(
+    value: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+    loss: vd.TensorView[vd.f32, (1,), vd.write],
+) -> None:
+    loss[0] = value[0] * value[0]
+
+compute_vjp = vd.ad.vjp(compute, wrt=("value",), outputs=("loss",))
+named = vd.pipeline_asset(id="compute/vjp", program=compute_vjp)
+inline = vd.pipeline_asset(
+    id="compute/vjp",
+    program=vd.ad.vjp(compute, wrt=("value",), outputs=("loss",)),
+)
+""",
+                encoding="utf-8",
+            )
+            named = parse_python_pipeline_asset(source, "named")
+            inline = parse_python_pipeline_asset(source, "inline")
+            self.assertEqual(named.transform, inline.transform)
+            self.assertEqual(named.stages["compute"].entry, inline.stages["compute"].entry)
+            self.assertEqual(named.variants, inline.variants)
+
     def test_dynamic_pipeline_requires_declared_storage_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "asset.py"

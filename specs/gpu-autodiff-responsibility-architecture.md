@@ -6,6 +6,10 @@ This document records architecture decisions and does not maintain completion
 state. Current behavior and remaining work live in
 [`autodiff.md`](autodiff.md) and [`roadmap.md`](roadmap.md).
 
+GPU/graphics cooking temporarily retains the explicit `legacy_fixed`
+protocol. This compatibility boundary is GPU-only; compiler contract 11 and
+pipeline contract 15 do not permit `legacy_fixed` CPU VJP assets.
+
 This document records the architecture decision made after the first Metal
 capture/retry/commit attempt mixed compiler reflection, pipeline parsing,
 autodiff graph orchestration, backend binding, and Python cooking.

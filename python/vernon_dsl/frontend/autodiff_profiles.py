@@ -448,6 +448,9 @@ def build_structured_profile_plan(
     def gradient_source(path: str) -> ConcreteType:
         return _resolve_path(gradient_group_by_leaf[path], parameters, structs)
 
+    storage_gradients = tuple(binding for binding in gradients if gradient_source(binding.path).kind == "tensor_view")
+    value_gradients = tuple(binding for binding in gradients if gradient_source(binding.path).kind != "tensor_view")
+
     def gradient_evidence(path: str) -> tuple[tuple[AccessPatternEvidence, ...], tuple[int, ...]]:
         source = gradient_source(path)
         if source.kind != "tensor_view":
@@ -479,6 +482,24 @@ def build_structured_profile_plan(
         for parameter in entry.parameters
         if parameter.builtin is None
     )
+    shape_sources = tuple(
+        AutodiffBinding(
+            f"shape.{parameter.name}",
+            ConcreteType(
+                "tensor_view",
+                "TensorView",
+                (
+                    parameter.type.arguments[0],
+                    parameter.type.arguments[1],
+                    "read",
+                    parameter.type.arguments[3],
+                ),
+            ).mlir,
+            "shape_source",
+        )
+        for parameter in entry.parameters
+        if parameter.builtin is None and parameter.type.kind == "tensor_view"
+    )
     profile_symbols = structured_profile_symbols(transform, entry, primal_mlir)
     profiles = (
         AutodiffProfile(
@@ -498,9 +519,11 @@ def build_structured_profile_plan(
             profile_symbols[2],
             (
                 AutodiffBinding("tape", f"!vernon.ad_tape<{tape_bytes}>", "tape"),
+                *shape_sources,
                 *cotangents,
+                *storage_gradients,
             ),
-            gradients,
+            value_gradients,
         ),
     )
     return AutodiffProfilePlan(

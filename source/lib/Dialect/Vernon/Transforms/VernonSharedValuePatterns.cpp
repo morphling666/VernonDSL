@@ -110,6 +110,19 @@ template <typename Op> struct ElementwisePattern final : OpConversionPattern<Op>
     }
 };
 
+template <typename Op> struct UnaryElementwisePattern final : OpConversionPattern<Op> {
+    using OpConversionPattern<Op>::OpConversionPattern;
+    using OpAdaptor = typename Op::Adaptor;
+
+    LogicalResult matchAndRewrite(Op op, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
+        Type resultType = this->getTypeConverter()->convertType(op.getResult().getType());
+        if (!resultType || resultType == op.getResult().getType())
+            return failure();
+        rewriter.replaceOpWithNewOp<Op>(op, resultType, adaptor.getOperands().front());
+        return success();
+    }
+};
+
 SmallVector<Value> flattenConstructOperands(Location location, ValueRange operands,
                                             ConversionPatternRewriter &rewriter) {
     SmallVector<Value> elements;
@@ -359,7 +372,8 @@ void populateVernonSharedValuePatterns(TypeConverter &converter, RewritePatternS
         .add<ConstantPattern, FromElementsPattern, SplatPattern, ExtractPattern, IntrinsicPattern, SwizzlePattern,
              ElementwisePattern<arith::AddFOp>, ElementwisePattern<arith::SubFOp>, ElementwisePattern<arith::MulFOp>,
              ElementwisePattern<arith::DivFOp>, ElementwisePattern<arith::AddIOp>, ElementwisePattern<arith::SubIOp>,
-             ElementwisePattern<arith::MulIOp>>(converter, context);
+             ElementwisePattern<arith::MulIOp>, UnaryElementwisePattern<arith::ExtFOp>,
+             UnaryElementwisePattern<arith::TruncFOp>>(converter, context);
 }
 
 void populateVernonSharedValueStructuralTypeConversions(TypeConverter &converter, RewritePatternSet &patterns,

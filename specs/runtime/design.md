@@ -186,7 +186,7 @@ pipeline and binding objects. Owned submissions release those references after
 the synchronous backend completion; borrowed native command targets retain
 them until encoder destruction, which is the owner's completion signal.
 Failed recordings are abandoned with the same cleanup path.
-The stable `0.1.1` API does not expose asynchronous submission, deferred graph
+The stable `0.1.2` API does not expose asynchronous submission, deferred graph
 execution, or multiple frames in flight. Callers must not infer those
 capabilities from backend-native queues or streams. Adding them requires
 completion-serial tracking and deferred reclamation for every enabled backend,

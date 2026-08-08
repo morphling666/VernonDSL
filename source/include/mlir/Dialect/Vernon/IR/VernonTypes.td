@@ -103,7 +103,7 @@ def Vernon_AdAdjointBufferType : TypeDef<Vernon_Dialect, "AdAdjointBuffer"> {
   let summary = "Invocation-local mutable Storage adjoint state";
   let parameters = (ins
     TypeParameter<"::mlir::Type", "scalar derivative type">:$elementType,
-    ArrayRefParameter<"int64_t", "flattened static shape">:$shape,
+    ArrayRefParameter<"int64_t", "flattened runtime-capable shape">:$shape,
     "unsigned":$indexRank
   );
   let genVerifyDecl = 1;

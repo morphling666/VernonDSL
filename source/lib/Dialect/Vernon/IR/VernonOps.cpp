@@ -721,6 +721,13 @@ LogicalResult AdAdjointScatterAddOp::verify() {
 
 LogicalResult AdAdjointAccumulateDenseOp::verify() {
     AdAdjointBufferType type = cast<AdAdjointBufferType>(getBuffer().getType());
+    if (auto view = dyn_cast<TensorViewType>(getValue().getType())) {
+        if (view.getShape().size() != type.getIndexRank() ||
+            !llvm::equal(view.getShape(), type.getShape().take_front(type.getIndexRank())) ||
+            view.getElementType() != getAdjointBufferValueType(type))
+            return emitOpError("TensorView contribution must match the adjoint buffer shape and element");
+        return success();
+    }
     Type expected = RankedTensorType::get(type.getShape(), type.getElementType());
     return getValue().getType() == expected ? success()
                                             : emitOpError("dense contribution must match the complete adjoint buffer");
@@ -735,9 +742,16 @@ LogicalResult AdAdjointTakeAndClearOp::verify() {
                : emitOpError("result type must match the indexed adjoint buffer element");
 }
 
-LogicalResult AdAdjointFreezeOp::verify() {
-    AdAdjointBufferType type = cast<AdAdjointBufferType>(getBuffer().getType());
-    Type expected = RankedTensorType::get(type.getShape(), type.getElementType());
-    return getValue().getType() == expected ? success()
-                                            : emitOpError("result must materialize the complete adjoint buffer");
+LogicalResult AdAdjointStoreOp::verify() {
+    AdAdjointBufferType buffer = cast<AdAdjointBufferType>(getBuffer().getType());
+    TensorViewType destination = getDestination().getType();
+    if (destination.getAccess() == "read")
+        return emitOpError("destination must be writable");
+    if (destination.getShape().size() != buffer.getIndexRank() ||
+        !llvm::equal(destination.getShape(), buffer.getShape().take_front(buffer.getIndexRank())))
+        return emitOpError("destination shape must match the adjoint buffer indexed shape");
+    Type expectedElement = getAdjointBufferValueType(buffer);
+    return destination.getElementType() == expectedElement
+               ? success()
+               : emitOpError("destination element type must match the adjoint buffer element");
 }

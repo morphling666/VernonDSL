@@ -6,60 +6,85 @@ from pathlib import Path
 
 def main() -> None:
     manifest = Path(sys.argv[1])
-    sys.path[:0] = [sys.argv[2], sys.argv[3]]
-    backend = sys.argv[4] if len(sys.argv) > 4 else "cpu"
+    sys.path[:0] = sys.argv[2:-1]
+    backend = sys.argv[-1]
 
     import vernon_dsl as vd
     from vernon_dsl import _native
     from vernon_dsl._runtime import session
 
-    if backend == "cpu":
-        import vernon_native_autodiff_fixture  # noqa: F401
-
-        runtime = _native.Runtime(_native.RuntimeBackend.CPU)
+    architecture, api_version = {
+        "cpu": (vd.cpu, None),
+        "cuda": (vd.cuda, None),
+        "directx": (vd.directx, None),
+        "metal": (vd.metal, None),
+        "opengl": (vd.opengl, (4, 3)),
+        "opengles": (vd.opengles, (3, 1)),
+        "vulkan": (vd.vulkan, None),
+    }[backend]
+    runtime_backend = {
+        "cpu": _native.RuntimeBackend.CPU,
+        "cuda": _native.RuntimeBackend.CUDA,
+        "directx": _native.RuntimeBackend.DIRECTX12,
+        "metal": _native.RuntimeBackend.METAL,
+        "opengl": _native.RuntimeBackend.OPENGL,
+        "opengles": _native.RuntimeBackend.OPENGL_ES,
+        "vulkan": _native.RuntimeBackend.VULKAN,
+    }[backend]
+    if not _native.runtime_available(runtime_backend):
+        print(f"{backend} runtime capability reports unavailable")
+        raise SystemExit(77)
+    if api_version is None:
+        vd.init(arch=architecture)
     else:
-        architecture, api_version = {
-            "cuda": (vd.cuda, None),
-            "directx": (vd.directx, None),
-            "metal": (vd.metal, None),
-            "opengl": (vd.opengl, (4, 3)),
-            "opengles": (vd.opengles, (3, 1)),
-            "vulkan": (vd.vulkan, None),
-        }[backend]
-        runtime_backend = {
-            "cuda": _native.RuntimeBackend.CUDA,
-            "directx": _native.RuntimeBackend.DIRECTX12,
-            "metal": _native.RuntimeBackend.METAL,
-            "opengl": _native.RuntimeBackend.OPENGL,
-            "opengles": _native.RuntimeBackend.OPENGL_ES,
-            "vulkan": _native.RuntimeBackend.VULKAN,
-        }[backend]
-        if not _native.runtime_available(runtime_backend):
-            print(f"{backend} runtime capability reports unavailable")
-            raise SystemExit(77)
-        if api_version is None:
-            vd.init(arch=architecture)
-        else:
-            vd.init(arch=architecture, api_version=api_version)
-        assert session._native_runtime is not None
-        runtime = session._native_runtime
+        vd.init(arch=architecture, api_version=api_version)
+    assert session._native_runtime is not None
+    runtime = session._native_runtime
+    if backend == "cpu":
+        __import__("vernon_native_autodiff_numeric_cpu_fixture")
 
     try:
-        run_numeric_acceptance(runtime, manifest)
+        run_numeric_acceptance(runtime, manifest, backend)
     except RuntimeError as error:
         if backend == "metal" and "argument-buffer encoding is unavailable" in str(error):
             print(error)
             raise SystemExit(77) from error
         raise
     finally:
-        if backend != "cpu":
-            vd.init(arch=vd.cpu)
+        vd.init(arch=vd.cpu)
 
 
-def run_numeric_acceptance(runtime, manifest: Path) -> None:
+def run_numeric_acceptance(runtime, manifest: Path, backend: str) -> None:
     import numpy as np
+    import vernon_dsl as vd
 
     pipeline = runtime.load_pipeline_asset(manifest.read_bytes(), str(manifest.parent), [])
+
+    def invoke(native_inputs):
+        if backend != "cpu":
+            return pipeline.vjp(native_inputs, (1, 1, 1))
+
+        storages = {}
+        bindings = dict(native_inputs)
+        for name in ("values", "auxiliary"):
+            source = native_inputs[name]
+            storage = storages.setdefault(id(source), vd.storage.from_numpy(source))
+            bindings[name] = storage
+        output_storage = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        bindings["output"] = output_storage
+        output, pullback = pipeline.vjp(bindings, (1, 1, 1))
+        assert output is None
+        for name in ("values", "auxiliary"):
+            np.copyto(native_inputs[name], bindings[name].to_numpy())
+
+        def apply_pullback():
+            gradients = pullback(None)
+            return {
+                name: value.to_numpy() if isinstance(value, vd.TensorStorage) else value
+                for name, value in gradients.items()
+            }
+
+        return output_storage.to_numpy()[0], apply_pullback
 
     differentiable = (
         "left",
@@ -146,7 +171,7 @@ def run_numeric_acceptance(runtime, manifest: Path) -> None:
         expected_output, expected_values, expected_auxiliary = reference(base, count, flag)
         expected_gradients = finite_gradients(count, flag)
 
-        output, pullback = pipeline.vjp(native_inputs, (1, 1, 1))
+        output, pullback = invoke(native_inputs)
         np.testing.assert_allclose(output, np.float32(expected_output), rtol=2.0e-5, atol=2.0e-5)
         np.testing.assert_allclose(native_inputs["values"], expected_values.astype(np.float32), rtol=0.0, atol=2.0e-5)
         np.testing.assert_allclose(
@@ -188,7 +213,7 @@ def run_numeric_acceptance(runtime, manifest: Path) -> None:
             abscissa=np.array(abscissa, dtype=np.float64),
         )
         expected_output, _, _ = reference(reference_inputs, 0, 1)
-        output, _ = pipeline.vjp(edge_inputs, (1, 1, 1))
+        output, _ = invoke(edge_inputs)
         np.testing.assert_allclose(
             output,
             np.float32(expected_output),
@@ -201,12 +226,12 @@ def run_numeric_acceptance(runtime, manifest: Path) -> None:
     aliased_inputs = {name: value.astype(np.float32) for name, value in base.items()}
     aliased_inputs.update(values=shared, auxiliary=shared, count=np.int32(count), flag=np.int32(1))
     try:
-        pipeline.vjp(aliased_inputs, (1, 1, 1))
+        invoke(aliased_inputs)
     except RuntimeError as error:
         if "overlap" not in str(error):
             raise
     else:
-        raise AssertionError("native CPU autodiff accepted overlapping writable Storage inputs")
+        raise AssertionError("native autodiff accepted overlapping writable Storage inputs")
 
 
 if __name__ == "__main__":

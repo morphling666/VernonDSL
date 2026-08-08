@@ -10,8 +10,9 @@ This document records the prerequisite architecture work for dynamic
 control-flow autodiff. It supersedes attempts to add dynamic regions directly
 to the Python flat `AutodiffProgram` graph.
 
-The compiler and pipeline contract versions remain unchanged until the next
-release.
+This decision was released in compiler contract 11 and pipeline contract 15.
+CPU now uses the structured `dynamic_v2` path exclusively; GPU/graphics
+temporarily retain the explicit `legacy_fixed` emitter.
 
 ## Problem
 
@@ -22,9 +23,9 @@ Autodiff currently lives at the wrong abstraction layer:
   carried-value merging.
 - Normal frontend control flow is independently implemented by
   `control_flow_lowering.py` and `loop_lowering.py`.
-- `autodiff_native_cpu.py` and `autodiff_native_gpu.py` each combine the AD
-  transform, graph traversal, control-flow emission, tape layout, and
-  target-specific lowering.
+- the former `autodiff_native_cpu.py` and the retained
+  `autodiff_native_gpu.py` combined the AD transform, graph traversal,
+  control-flow emission, tape layout, and target-specific lowering.
 - CPU Runtime copies a fixed product of reflected tape leaves. GPU Runtime
   supports only fixed resource sizes multiplied by the dispatch grid.
 - GPU emitter phases named `CAPTURE_TAPE`, `COMMIT_STORAGE`, and

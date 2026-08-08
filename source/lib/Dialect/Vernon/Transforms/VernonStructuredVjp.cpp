@@ -106,27 +106,48 @@ StringRef scalarDtype(Type type) {
 }
 
 struct BackwardProfileTypes {
+    SmallVector<Type> shapeSources;
     SmallVector<Type> cotangents;
-    SmallVector<Type> gradients;
+    SmallVector<Type> storageGradients;
+    SmallVector<Type> valueGradients;
     Type result;
     SmallVector<StringRef> cotangentDtypes;
     SmallVector<StringRef> gradientDtypes;
+    SmallVector<StringRef> valueGradientDtypes;
 };
 
 BackwardProfileTypes getBackwardProfileTypes(MLIRContext *context, const VernonAutodiffAnalysisResult &analysis) {
     BackwardProfileTypes types;
+    for (const AutodiffStorageIdentity &identity : analysis.getStorageIdentities()) {
+        auto source = cast<TensorViewType>(identity.binding.getType());
+        types.shapeSources.push_back(
+            TensorViewType::get(context, source.getElementType(), source.getShape(), "read", source.getAddressSpace()));
+    }
     for (const AutodiffLeaf &leaf : analysis.getActiveResultLeaves()) {
-        types.cotangents.push_back(leaf.derivativeType);
+        auto source = dyn_cast<TensorViewType>(leaf.value.getType());
+        types.cotangents.push_back(
+            source ? static_cast<Type>(TensorViewType::get(context, leaf.derivativeType, source.getShape(), "read",
+                                                           source.getAddressSpace()))
+                   : leaf.derivativeType);
         types.cotangentDtypes.push_back(scalarDtype(leaf.primalType));
         if (leaf.primalType.isF16())
             types.cotangentDtypes.back() = "f32";
     }
     for (const AutodiffLeaf &leaf : analysis.getWrtLeaves()) {
-        types.gradients.push_back(leaf.derivativeType);
-        types.gradientDtypes.push_back(leaf.primalType.isF64() ? "f64" : "f32");
+        StringRef dtype = leaf.primalType.isF64() ? "f64" : "f32";
+        if (auto source = dyn_cast<TensorViewType>(leaf.value.getType()))
+            types.storageGradients.push_back(TensorViewType::get(context, leaf.derivativeType, source.getShape(),
+                                                                 "write", source.getAddressSpace()));
+        else {
+            types.valueGradients.push_back(leaf.derivativeType);
+            types.valueGradientDtypes.push_back(dtype);
+        }
+        types.gradientDtypes.push_back(dtype);
     }
-    types.result = types.gradients.size() == 1 ? types.gradients.front()
-                                               : static_cast<Type>(TupleType::get(context, types.gradients));
+    if (!types.valueGradients.empty())
+        types.result = types.valueGradients.size() == 1
+                           ? types.valueGradients.front()
+                           : static_cast<Type>(TupleType::get(context, types.valueGradients));
     return types;
 }
 
@@ -694,7 +715,9 @@ public:
         return success();
     }
 
-    LogicalResult initializeStorageAdjoints(OpBuilder &builder, AdjointMap &adjoints) {
+    LogicalResult initializeStorageAdjoints(OpBuilder &builder, AdjointMap &adjoints, ValueRange shapeSources) {
+        if (shapeSources.size() != analysis.getStorageIdentities().size())
+            return primal.emitError("Storage adjoint shape-source count does not match Storage identities");
         for (const AutodiffStorageIdentity &identity : analysis.getStorageIdentities()) {
             const ValueAbiLayout *layout = analysis.getValueAbi(identity.binding);
             auto view = dyn_cast<TensorViewType>(identity.binding.getType());
@@ -704,12 +727,16 @@ public:
                 if (!analysis.isActive(identity.binding, leafIndex))
                     continue;
                 FailureOr<Type> scalar = getAutodiffDerivativeType(leaf.scalarType);
-                if (failed(scalar) || leaf.shape.empty())
-                    return primal.emitError("active Storage identity has no static derivative buffer shape");
-                auto bufferType = AdAdjointBufferType::get(primal.getContext(), *scalar,
-                                                           SmallVector<int64_t>(leaf.shape.begin(), leaf.shape.end()),
+                if (failed(scalar))
+                    return primal.emitError("active Storage identity has no derivative scalar type");
+                SmallVector<int64_t> shape(view.getShape());
+                llvm::append_range(
+                    shape, llvm::map_range(leaf.shape, [](uint64_t extent) { return static_cast<int64_t>(extent); }));
+                auto bufferType = AdAdjointBufferType::get(primal.getContext(), *scalar, shape,
                                                            static_cast<unsigned>(view.getShape().size()));
-                Value buffer = AdAdjointBufferCreateOp::create(builder, primal.getLoc(), bufferType).getBuffer();
+                Value buffer =
+                    AdAdjointBufferCreateOp::create(builder, primal.getLoc(), bufferType, shapeSources[identity.id])
+                        .getBuffer();
                 storageAdjoints[{identity.id, static_cast<unsigned>(leafIndex)}] = buffer;
             }
         }
@@ -727,14 +754,15 @@ public:
         return success();
     }
 
-    FailureOr<Value> freezeStorageAdjoint(OpBuilder &builder, const AutodiffLeaf &leaf) {
+    LogicalResult storeStorageAdjoint(OpBuilder &builder, const AutodiffLeaf &leaf, Value destination) {
         const AutodiffStorageIdentity *identity = analysis.getStorageIdentity(leaf.value);
         if (!identity)
             return failure();
         Value buffer = storageAdjoints.lookup({identity->id, leaf.abiLeafIndex});
         if (!buffer)
             return failure();
-        return AdAdjointFreezeOp::create(builder, primal.getLoc(), leaf.derivativeType, buffer).getValue();
+        AdAdjointStoreOp::create(builder, primal.getLoc(), buffer, destination);
+        return success();
     }
 
     LogicalResult reverseTopLevel(OpBuilder &builder, AdjointMap &adjoints) {
@@ -1309,9 +1337,14 @@ FailureOr<func::FuncOp> createDynamicBackward(func::FuncOp primal, StringRef sym
     BackwardProfileTypes profileTypes = getBackwardProfileTypes(context, analysis);
     OpBuilder moduleBuilder(primal);
     SmallVector<Type> backwardArguments = {tapeType, regionType};
+    llvm::append_range(backwardArguments, profileTypes.shapeSources);
     llvm::append_range(backwardArguments, profileTypes.cotangents);
+    llvm::append_range(backwardArguments, profileTypes.storageGradients);
+    SmallVector<Type> backwardResults;
+    if (profileTypes.result)
+        backwardResults.push_back(profileTypes.result);
     auto backward = func::FuncOp::create(moduleBuilder, primal.getLoc(), symbol,
-                                         FunctionType::get(context, backwardArguments, {profileTypes.result}));
+                                         FunctionType::get(context, backwardArguments, backwardResults));
     bool committed = false;
     auto cleanup = llvm::make_scope_exit([&] {
         if (!committed)
@@ -1322,13 +1355,35 @@ FailureOr<func::FuncOp> createDynamicBackward(func::FuncOp primal, StringRef sym
         makeInterfaceAttrs(context, "input", "tape", {}, 0),
         makeInterfaceAttrs(context, "input", "tape_region", {}, 1),
     };
+    for (auto [index, identity] : llvm::enumerate(analysis.getStorageIdentities())) {
+        auto sourceName = primal.getArgAttrOfType<StringAttr>(cast<BlockArgument>(identity.binding).getArgNumber(),
+                                                              "vernon.source_name");
+        if (!sourceName || sourceName.getValue().empty())
+            return primal.emitError("Storage identity has no source name for its backward shape source");
+        std::string path = ("shape." + sourceName.getValue()).str();
+        backwardArgumentAttrs.push_back(
+            makeInterfaceAttrs(context, "input", path, {}, index + 2, identity.binding.getType()));
+    }
+    const unsigned cotangentBase = 2 + profileTypes.shapeSources.size();
     for (auto [index, leaf] : llvm::enumerate(analysis.getActiveResultLeaves()))
-        backwardArgumentAttrs.push_back(makeInterfaceAttrs(
-            context, "input", leaf.path, {profileTypes.cotangentDtypes[index]}, index + 2, leaf.derivativeType));
+        backwardArgumentAttrs.push_back(makeInterfaceAttrs(context, "input", leaf.path,
+                                                           {profileTypes.cotangentDtypes[index]}, cotangentBase + index,
+                                                           profileTypes.cotangents[index]));
+    const unsigned gradientBase = cotangentBase + profileTypes.cotangents.size();
+    unsigned storageGradientIndex = 0;
+    for (auto [index, leaf] : llvm::enumerate(analysis.getWrtLeaves()))
+        if (isa<TensorViewType>(leaf.value.getType())) {
+            backwardArgumentAttrs.push_back(makeInterfaceAttrs(
+                context, "input", leaf.path, {profileTypes.gradientDtypes[index]}, gradientBase + storageGradientIndex,
+                profileTypes.storageGradients[storageGradientIndex]));
+            ++storageGradientIndex;
+        }
     backward.setAllArgAttrs(backwardArgumentAttrs);
-    SmallVector<DictionaryAttr> backwardResultAttrs = {
-        makeInterfaceAttrs(context, "output", "gradients", profileTypes.gradientDtypes, 0)};
-    backward.setAllResultAttrs(backwardResultAttrs);
+    if (profileTypes.result) {
+        SmallVector<DictionaryAttr> resultAttrs = {
+            makeInterfaceAttrs(context, "output", "gradients", profileTypes.valueGradientDtypes, 0)};
+        backward.setAllResultAttrs(resultAttrs);
+    }
 
     Block *entry = backward.addEntryBlock();
     OpBuilder builder = OpBuilder::atBlockEnd(entry);
@@ -1337,28 +1392,33 @@ FailureOr<func::FuncOp> createDynamicBackward(func::FuncOp primal, StringRef sym
         return failure();
     AdjointMap adjoints;
     for (auto [index, leaf] : llvm::enumerate(analysis.getActiveResultLeaves()))
-        adjoints.try_emplace(AdjointKey{leaf.value, leaf.abiLeafIndex}, entry->getArgument(index + 2));
-    if (failed(emitter.initializeStorageAdjoints(builder, adjoints)))
+        adjoints.try_emplace(AdjointKey{leaf.value, leaf.abiLeafIndex}, entry->getArgument(cotangentBase + index));
+    if (failed(emitter.initializeStorageAdjoints(builder, adjoints,
+                                                 entry->getArguments().slice(2, profileTypes.shapeSources.size()))))
         return failure();
     if (failed(emitter.reverseTopLevel(builder, adjoints)))
         return failure();
-    SmallVector<Value> gradients;
+    SmallVector<Value> valueGradients;
+    storageGradientIndex = 0;
     for (const AutodiffLeaf &leaf : analysis.getWrtLeaves()) {
         Value gradient;
         if (isa<TensorViewType>(leaf.value.getType())) {
-            FailureOr<Value> storageGradient = emitter.freezeStorageAdjoint(builder, leaf);
-            if (failed(storageGradient))
-                return primal.emitError("cannot materialize wrt Storage adjoint buffer");
-            gradient = *storageGradient;
+            if (failed(emitter.storeStorageAdjoint(builder, leaf,
+                                                   entry->getArgument(gradientBase + storageGradientIndex++))))
+                return primal.emitError("cannot store wrt Storage adjoint buffer");
         } else {
             gradient = adjoints.lookup({leaf.value, leaf.abiLeafIndex});
+            valueGradients.push_back(gradient ? gradient : createZero(builder, primal.getLoc(), leaf.derivativeType));
         }
-        gradients.push_back(gradient ? gradient : createZero(builder, primal.getLoc(), leaf.derivativeType));
     }
-    Value result = gradients.size() == 1
-                       ? gradients.front()
-                       : createTuple(builder, primal.getLoc(), cast<TupleType>(profileTypes.result), gradients);
-    func::ReturnOp::create(builder, primal.getLoc(), result);
+    if (valueGradients.empty()) {
+        func::ReturnOp::create(builder, primal.getLoc());
+    } else {
+        Value result = valueGradients.size() == 1 ? valueGradients.front()
+                                                  : createTuple(builder, primal.getLoc(),
+                                                                cast<TupleType>(profileTypes.result), valueGradients);
+        func::ReturnOp::create(builder, primal.getLoc(), result);
+    }
     committed = true;
     return backward;
 }

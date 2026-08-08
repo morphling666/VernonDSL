@@ -9,6 +9,7 @@
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffUtils.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "runtime/autodiff/tape_allocator_abi.h"
@@ -244,20 +245,35 @@ public:
 private:
     OpBuilder builder() const { return OpBuilder(function->getContext()); }
 
-    void emitStaticLoopNest(OpBuilder &builder, Location location, ArrayRef<int64_t> shape, unsigned dimension,
-                            SmallVectorImpl<Value> &indices, const std::function<void(OpBuilder &, ValueRange)> &body) {
-        if (dimension == shape.size()) {
+    void emitLoopNest(OpBuilder &builder, Location location, ValueRange bounds, unsigned dimension,
+                      SmallVectorImpl<Value> &indices, const std::function<void(OpBuilder &, ValueRange)> &body) {
+        if (dimension == bounds.size()) {
             body(builder, indices);
             return;
         }
         Value lower = indexConstant(builder, location, 0);
-        Value upper = indexConstant(builder, location, static_cast<uint64_t>(shape[dimension]));
         Value step = indexConstant(builder, location, 1);
-        scf::ForOp loop = scf::ForOp::create(builder, location, lower, upper, step);
+        scf::ForOp loop = scf::ForOp::create(builder, location, lower, bounds[dimension], step);
         OpBuilder nested(loop.getBody()->getTerminator());
         indices.push_back(loop.getInductionVar());
-        emitStaticLoopNest(nested, location, shape, dimension + 1, indices, body);
+        emitLoopNest(nested, location, bounds, dimension + 1, indices, body);
         indices.pop_back();
+    }
+
+    FailureOr<Value> descriptorExtent(Value source, unsigned dimension) {
+        auto argument = dyn_cast<BlockArgument>(source);
+        if (!argument || argument.getOwner() != &function.getBody().front())
+            return failure();
+        for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+            auto owner = function.getArgAttrOfType<IntegerAttr>(index, kTensorDescriptorOwnerAttrName);
+            auto component = function.getArgAttrOfType<StringAttr>(index, kTensorDescriptorComponentAttrName);
+            auto descriptorDimension =
+                function.getArgAttrOfType<IntegerAttr>(index, kTensorDescriptorDimensionAttrName);
+            if (owner && owner.getInt() == argument.getArgNumber() && component && component.getValue() == "extent" &&
+                descriptorDimension && descriptorDimension.getInt() == dimension)
+                return function.getArgument(index);
+        }
+        return failure();
     }
 
     Value zero(OpBuilder &builder, Location location, Type type) {
@@ -269,18 +285,38 @@ private:
         function.walk([&](AdAdjointBufferCreateOp operation) { creates.push_back(operation); });
         for (AdAdjointBufferCreateOp create : creates) {
             AdAdjointBufferType type = create.getBuffer().getType();
-            auto memoryType = MemRefType::get(type.getShape(), type.getElementType());
+            SmallVector<int64_t> memoryShape(type.getShape());
+            for (int64_t &extent : memoryShape)
+                if (extent < 0)
+                    extent = ShapedType::kDynamic;
+            auto memoryType = MemRefType::get(memoryShape, type.getElementType());
             OpBuilder createBuilder(create);
-            Value memory = memref::AllocaOp::create(createBuilder, create.getLoc(), memoryType);
+            SmallVector<Value> bounds;
+            SmallVector<Value> dynamicSizes;
+            for (auto [dimension, extent] : llvm::enumerate(type.getShape())) {
+                Value bound;
+                if (extent < 0) {
+                    if (dimension >= type.getIndexRank())
+                        return create.emitError("dynamic adjoint element dimensions are unsupported");
+                    FailureOr<Value> runtimeExtent = descriptorExtent(create.getShapeSource(), dimension);
+                    if (failed(runtimeExtent))
+                        return create.emitError("dynamic adjoint buffer has no canonical TensorView extent source");
+                    bound = *runtimeExtent;
+                    dynamicSizes.push_back(bound);
+                } else {
+                    bound = indexConstant(createBuilder, create.getLoc(), static_cast<uint64_t>(extent));
+                }
+                bounds.push_back(bound);
+            }
+            Value memory = memref::AllocaOp::create(createBuilder, create.getLoc(), memoryType, dynamicSizes);
             SmallVector<Value> initializationIndices;
-            emitStaticLoopNest(createBuilder, create.getLoc(), type.getShape(), 0, initializationIndices,
-                               [&](OpBuilder &nested, ValueRange indices) {
-                                   memref::StoreOp::create(nested, create.getLoc(),
-                                                           zero(nested, create.getLoc(), type.getElementType()), memory,
-                                                           indices);
-                               });
+            emitLoopNest(createBuilder, create.getLoc(), bounds, 0, initializationIndices,
+                         [&](OpBuilder &nested, ValueRange indices) {
+                             memref::StoreOp::create(nested, create.getLoc(),
+                                                     zero(nested, create.getLoc(), type.getElementType()), memory,
+                                                     indices);
+                         });
 
-            const SmallVector<SmallVector<int64_t>> fullCoordinates = enumerateStaticCoordinates(type.getShape());
             const SmallVector<SmallVector<int64_t>> trailingCoordinates =
                 enumerateStaticCoordinates(type.getShape().drop_front(type.getIndexRank()));
             SmallVector<Operation *> users(create.getBuffer().getUsers());
@@ -305,14 +341,29 @@ private:
                 }
                 if (auto dense = dyn_cast<AdAdjointAccumulateDenseOp>(user)) {
                     OpBuilder userBuilder(dense);
-                    for (const SmallVector<int64_t> &coordinate : fullCoordinates) {
-                        SmallVector<Value> indices = materializeCoordinate(userBuilder, dense.getLoc(), coordinate);
-                        Value contribution =
-                            tensor::ExtractOp::create(userBuilder, dense.getLoc(), dense.getValue(), indices);
-                        Value prior = memref::LoadOp::create(userBuilder, dense.getLoc(), memory, indices);
-                        Value sum = arith::AddFOp::create(userBuilder, dense.getLoc(), prior, contribution);
-                        memref::StoreOp::create(userBuilder, dense.getLoc(), sum, memory, indices);
-                    }
+                    if (!isa<TensorViewType>(dense.getValue().getType()))
+                        return dense.emitError("CPU dynamic adjoint accumulation requires a TensorView contribution");
+                    SmallVector<Value> prefix;
+                    emitLoopNest(
+                        userBuilder, dense.getLoc(), ValueRange(bounds).take_front(type.getIndexRank()), 0, prefix,
+                        [&](OpBuilder &nested, ValueRange indices) {
+                            Value contribution =
+                                LoadOp::create(nested, dense.getLoc(),
+                                               cast<TensorViewType>(dense.getValue().getType()).getElementType(),
+                                               dense.getValue(), indices)
+                                    .getResult();
+                            for (const SmallVector<int64_t> &coordinate : trailingCoordinates) {
+                                SmallVector<Value> trailing = materializeCoordinate(nested, dense.getLoc(), coordinate);
+                                SmallVector<Value> memoryIndices(indices);
+                                llvm::append_range(memoryIndices, trailing);
+                                Value scalar = contribution;
+                                if (!coordinate.empty())
+                                    scalar = tensor::ExtractOp::create(nested, dense.getLoc(), contribution, trailing);
+                                Value prior = memref::LoadOp::create(nested, dense.getLoc(), memory, memoryIndices);
+                                Value sum = arith::AddFOp::create(nested, dense.getLoc(), prior, scalar);
+                                memref::StoreOp::create(nested, dense.getLoc(), sum, memory, memoryIndices);
+                            }
+                        });
                     dense.erase();
                     continue;
                 }
@@ -336,17 +387,31 @@ private:
                     take.erase();
                     continue;
                 }
-                if (auto freeze = dyn_cast<AdAdjointFreezeOp>(user)) {
-                    OpBuilder userBuilder(freeze);
-                    SmallVector<Value> elements;
-                    for (const SmallVector<int64_t> &coordinate : fullCoordinates) {
-                        SmallVector<Value> indices = materializeCoordinate(userBuilder, freeze.getLoc(), coordinate);
-                        elements.push_back(memref::LoadOp::create(userBuilder, freeze.getLoc(), memory, indices));
-                    }
-                    Value result = tensor::FromElementsOp::create(
-                        userBuilder, freeze.getLoc(), cast<RankedTensorType>(freeze.getValue().getType()), elements);
-                    freeze.getValue().replaceAllUsesWith(result);
-                    freeze.erase();
+                if (auto store = dyn_cast<AdAdjointStoreOp>(user)) {
+                    OpBuilder userBuilder(store);
+                    SmallVector<Value> prefix;
+                    emitLoopNest(
+                        userBuilder, store.getLoc(), ValueRange(bounds).take_front(type.getIndexRank()), 0, prefix,
+                        [&](OpBuilder &nested, ValueRange indices) {
+                            SmallVector<Value> elements;
+                            for (const SmallVector<int64_t> &coordinate : trailingCoordinates) {
+                                SmallVector<Value> memoryIndices =
+                                    appendCoordinate(nested, store.getLoc(), indices, coordinate);
+                                elements.push_back(
+                                    memref::LoadOp::create(nested, store.getLoc(), memory, memoryIndices));
+                            }
+                            Value value =
+                                elements.size() == 1
+                                    ? elements.front()
+                                    : tensor::FromElementsOp::create(
+                                          nested, store.getLoc(),
+                                          cast<RankedTensorType>(
+                                              cast<TensorViewType>(store.getDestination().getType()).getElementType()),
+                                          elements)
+                                          .getResult();
+                            StoreOp::create(nested, store.getLoc(), value, store.getDestination(), indices);
+                        });
+                    store.erase();
                     continue;
                 }
                 return user->emitError("unsupported invocation-local adjoint buffer use");
@@ -887,6 +952,10 @@ struct VernonLowerCPUAutodiffPass final : PassWrapper<VernonLowerCPUAutodiffPass
     }
 
     void runOnOperation() override {
+        if (failed(appendTensorViewDescriptorArguments(getOperation()))) {
+            signalPassFailure();
+            return;
+        }
         SmallVector<func::FuncOp> functions;
         for (func::FuncOp function : getOperation().getOps<func::FuncOp>())
             if (!function.isDeclaration())

@@ -1,6 +1,6 @@
 # Public API policy
 
-VernonDSL 0.1.1 treats the following installed interfaces as public:
+VernonDSL 0.1.2 treats the following installed interfaces as public:
 
 - names exported by `vernon_dsl.__all__`;
 - `vernon_dsl.runtime_source` helpers for locating the bundled Runtime source;
@@ -13,7 +13,7 @@ VernonDSL 0.1.1 treats the following installed interfaces as public:
 - the standalone CMake project bundled under `vernon_dsl/runtime_src` and its
   documented Runtime targets;
 - canonical `*.pipeline.json` manifests and artifacts accepted by compiler
-  contract 10 and pipeline contract 14.
+  contract 11 and pipeline contract 15.
 
 The wheel does not install a prebuilt `lib/cmake/VernonRuntime` package into the
 environment. Embedders locate `vernon_dsl/runtime_src` and configure that
@@ -52,4 +52,4 @@ are stable within the 0.1 release series.
 The Runtime contract is synchronous. Invocation, owned RHI submission, and
 `ExecutionGraph.execute()` complete backend work before returning. Asynchronous
 dispatch, deferred execution, swapchain presentation, and multiple frames in
-flight are not public 0.1.1 behavior.
+flight are not public 0.1.2 behavior.

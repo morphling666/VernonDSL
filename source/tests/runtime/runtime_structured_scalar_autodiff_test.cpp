@@ -1,6 +1,7 @@
 #include "VernonRuntime.h"
 #include "runtime/autodiff/host_tape_allocator.h"
 #include "runtime/autodiff/host_tape_test_hooks.h"
+#include "runtime/runtime_state.h"
 
 #include <gtest/gtest.h>
 
@@ -134,6 +135,32 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
     vernonPullbackDestroy(pullback);
 
     vernonRuntimeLoadedPipelineDestroy(pipeline);
+    vernonRuntimePipelineBundleDestroy(bundle);
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeStructuredScalarAutodiff, CpuRejectsLegacyFixedProtocolAtResolve) {
+    ASSERT_EQ(vernonRegisterStructuredScalarAutodiffFixture(), VERNON_STATUS_OK);
+    const std::filesystem::path manifestPath = VERNON_STRUCTURED_SCALAR_AUTODIFF_MANIFEST;
+    std::ifstream input(manifestPath, std::ios::binary);
+    ASSERT_TRUE(input);
+    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    const std::string bundleDirectory = manifestPath.parent_path().string();
+
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    VernonPipelineBundleLoadOptions options{};
+    options.struct_size = sizeof(options);
+    options.bundle_directory = bundleDirectory.c_str();
+    VernonPipelineBundle *bundle =
+        vernonRuntimeLoadPipelineBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    ASSERT_NE(bundle, nullptr) << lastError(context);
+    ASSERT_TRUE(bundle->autodiff.has_value());
+    bundle->autodiff->protocol = "legacy_fixed";
+
+    EXPECT_EQ(vernonRuntimeResolvePipeline(bundle, {nullptr, 0}), nullptr);
+    EXPECT_EQ(lastError(context), "CPU autodiff profile uses an unsupported protocol");
+
     vernonRuntimePipelineBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }

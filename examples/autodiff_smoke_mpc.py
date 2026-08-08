@@ -78,11 +78,19 @@ class SmokeFluidSimulation:
         )
 
     def set_objective_inputs(self, control: np.ndarray, target: np.ndarray) -> None:
+        self.set_control(control)
+        self.set_target(target)
+
+    def set_control(self, control: np.ndarray) -> None:
         self.controls.copy_from_numpy(np.ascontiguousarray(control, dtype=np.float32))
+
+    def set_target(self, target: np.ndarray) -> None:
         self.target.copy_from_numpy(np.ascontiguousarray(target, dtype=np.float32))
 
-    def step(self, control: np.ndarray, target: np.ndarray) -> None:
-        self.set_objective_inputs(control, target)
+    def step(self, control: np.ndarray, target: np.ndarray | None = None) -> None:
+        self.set_control(control)
+        if target is not None:
+            self.set_target(target)
         smoke_fluid_step(*self.kernel_arguments(), grid=(1, 1, 1))
         self.density, self.next_density = self.next_density, self.density
         self.velocity, self.next_velocity = self.next_velocity, self.velocity
@@ -142,6 +150,7 @@ def optimize(
     simulation = SmokeFluidSimulation()
     timings = SmokeTimings(initialization_seconds=time.perf_counter() - start)
     target = v_target()
+    simulation.set_target(target)
     control = np.full((NOZZLES,), np.float32(0.25), dtype=np.float32)
     applied: list[np.ndarray] = []
     losses: list[float] = []
@@ -149,7 +158,7 @@ def optimize(
     for step in range(steps):
         for iteration in range(iterations):
             mpc_start = time.perf_counter()
-            simulation.set_objective_inputs(control, target)
+            simulation.set_control(control)
             _, pullback = objective(
                 *simulation.kernel_arguments(),
                 grid=(1, 1, 1),
@@ -167,7 +176,7 @@ def optimize(
             timings.mpc_iterations += 1
 
         simulation_start = time.perf_counter()
-        simulation.step(control, target)
+        simulation.step(control)
         timings.simulation_seconds += time.perf_counter() - simulation_start
         timings.simulation_steps += 1
         density = simulation.density_numpy()

@@ -183,6 +183,29 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
     program_expression = keywords.get("program")
     if program_expression is None:
         raise PipelineCompileError("pipeline_asset declaration requires 'program'")
+    if isinstance(program_expression, ast.Name):
+        named_expressions = []
+        for statement in tree.body:
+            targets = (
+                statement.targets
+                if isinstance(statement, ast.Assign)
+                else [statement.target]
+                if isinstance(statement, ast.AnnAssign)
+                else []
+            )
+            value = statement.value if isinstance(statement, (ast.Assign, ast.AnnAssign)) else None
+            if (
+                len(targets) == 1
+                and isinstance(targets[0], ast.Name)
+                and targets[0].id == program_expression.id
+                and isinstance(value, ast.Call)
+                and (dotted_name(value.func) or "").split(".")[-1] == "vjp"
+            ):
+                named_expressions.append(value)
+        if len(named_expressions) > 1:
+            raise PipelineCompileError(f"duplicate VJP program declaration: {program_expression.id}")
+        if named_expressions:
+            program_expression = named_expressions[0]
     transform: dict[str, Any] | None = None
     if (
         isinstance(program_expression, ast.Call)

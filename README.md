@@ -52,10 +52,10 @@ paint(pixels, 0.0, grid=(WIDTH, HEIGHT, 1))
 image = pixels.to_numpy()
 ```
 
-The current stable release is `0.1.1`. It supports CPython 3.11 through 3.14
+The current stable release is `0.1.2`. It supports CPython 3.11 through 3.14
 on Windows x64, Linux x64, and Apple Silicon macOS. The frontend remains
 language version 3 while the v4 roadmap is developed. See the
-[`0.1.1 release notes`](https://github.com/morphling666/VernonDSL/blob/master/RELEASE_NOTES.md),
+[`0.1.2 release notes`](https://github.com/morphling666/VernonDSL/blob/master/RELEASE_NOTES.md),
 [`PUBLIC_API.md`](PUBLIC_API.md), and [`COMPATIBILITY.md`](COMPATIBILITY.md)
 for the supported surface and compatibility contract.
 
@@ -126,10 +126,10 @@ Prebuilt wheels are provided for Windows x64, Linux x64, and Apple Silicon
 macOS 15 or newer for CPython 3.11 through 3.14:
 
 ```powershell
-py -m pip install vernon-lang==0.1.1
+py -m pip install vernon-lang==0.1.2
 ```
 
-VernonDSL 0.1.1 is wheel-only. Intel macOS, source distributions, PyPy, and
+VernonDSL 0.1.2 is wheel-only. Intel macOS, source distributions, PyPy, and
 other Python versions are not published.
 
 Verify the installation:
@@ -155,13 +155,13 @@ Runtime availability therefore depends on the selected backend:
   supported Apple Silicon Macs, with no additional loader.
 
 Cooked MSL bundles are consumed by the Runtime on Apple. Metal presentation and
-swapchain management are outside the `0.1.1` contract. Argument-buffer
+swapchain management are outside the `0.1.2` contract. Argument-buffer
 pipelines fail explicitly when the selected device cannot provide the required
 tier or encoder.
 
 CPU graphics, CUDA images and samplers, f16/f64 vertex attributes,
 non-relaxed atomics, asynchronous dispatch, and multiple frames in flight are
-outside the supported `0.1.1` subset. See
+outside the supported `0.1.2` subset. See
 [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for the complete release contract.
 
 ### Optional Vulkan setup
@@ -436,7 +436,7 @@ More examples and their third-party attributions are documented in
 
 ## Future roadmap
 
-The post-`0.1.1` roadmap includes:
+The post-`0.1.2` roadmap includes:
 
 1. finish and accept the language-v4 contract, including first-order
    pure-function autodiff;

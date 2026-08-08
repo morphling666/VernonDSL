@@ -115,8 +115,6 @@ bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
 
 bool createCpuExecutable(VernonRuntimeContext &context, const Stage &forward, const Stage &backward,
                          const std::vector<std::string> &gradientPaths, std::shared_ptr<Executable> &executable);
-bool createLegacyCpuExecutable(VernonRuntimeContext &context, const Stage &forward, const Stage &backward,
-                               const std::vector<std::string> &gradientPaths, std::shared_ptr<Executable> &executable);
 bool createCpuEntryExecutable(VernonRuntimeContext &context, VernonCpuEntryPoint forwardEntry,
                               VernonStringView forwardReflection, VernonStringView forwardName,
                               VernonCpuEntryPoint backwardEntry, VernonStringView backwardReflection,

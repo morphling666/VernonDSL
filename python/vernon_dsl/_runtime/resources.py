@@ -56,7 +56,14 @@ def _is_logical_collection(value: Any) -> bool:
     return isinstance(value, (list, tuple)) or (isinstance(value, np.ndarray) and value.ndim > 0)
 
 
-def _bind_native_argument(builder: Any, parameter: Any, value: Any, *, host_value: bool = False) -> Any:
+def _bind_native_argument(
+    builder: Any,
+    parameter: Any,
+    value: Any,
+    *,
+    host_value: bool = False,
+    annotation: Any | None = None,
+) -> Any:
     state = _session_state()
     if isinstance(value, (TensorStorage, TensorView)):
         if state._architecture == state.cpu or host_value:
@@ -74,10 +81,17 @@ def _bind_native_argument(builder: Any, parameter: Any, value: Any, *, host_valu
         )
 
     value_type = type(value)
-    if getattr(value_type, "__vernon_dsl__", (None, {}))[0] == "struct":
-        layout = host_abi_layout(value_type)
+    struct_type = (
+        annotation
+        if isinstance(annotation, type) and getattr(annotation, "__vernon_dsl__", (None, {}))[0] == "struct"
+        else value_type
+        if getattr(value_type, "__vernon_dsl__", (None, {}))[0] == "struct"
+        else None
+    )
+    if struct_type is not None:
+        layout = host_abi_layout(struct_type)
         host_array = np.empty((), dtype=layout.dtype)
-        host_array[()] = pack_host_value(value_type, value)
+        host_array[()] = pack_host_value(struct_type, value, parameter.name)
         return builder.host_tensor(parameter.name, host_array)
 
     numpy_dtypes = {

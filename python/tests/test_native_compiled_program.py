@@ -310,6 +310,19 @@ class CompiledProgramTests(unittest.TestCase):
         invocation.grid(3, 1, 1).invoke()
         np.testing.assert_array_equal(values.to_numpy(), np.array([3.0, 5.0, 7.0], dtype=np.float32))
 
+    def test_cpu_profile_batch_compilation_preserves_order_and_options(self) -> None:
+        programs = native._compile_cpu_program_results(
+            [CPU_MODULE, CPU_MODULE],
+            {"processor": "generic"},
+        )
+        self.assertEqual(len(programs), 2)
+        for program in programs:
+            self.assertTrue(program.ok, program.diagnostics)
+            self.assertTrue(program.has_cpu_entry("increment"))
+            self.assertEqual(json.loads(program.reflection)["target"]["options"]["processor"], "generic")
+        with self.assertRaisesRegex(ValueError, "unknown option 'version'"):
+            native._compile_cpu_program_results([CPU_MODULE], {"version": "450"})
+
     def test_cpu_artifact_reuses_dynamic_tensor_view_descriptor(self) -> None:
         program = native.Compiler().compile_program_result(DYNAMIC_CPU_MODULE, native.Target.CPU)
         self.assertTrue(program.ok, program.diagnostics)

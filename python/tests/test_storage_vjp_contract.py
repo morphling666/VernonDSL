@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import vernon_dsl as vd
+import vernon_dsl._runtime.autodiff as runtime_autodiff
 from vernon_dsl.compiler import Compiler, FrontendCompileRequest
 from vernon_dsl.diagnostics import CompileError
 from vernon_dsl.frontend.autodiff_profiles import derivative_groups_from_paths
@@ -33,6 +34,7 @@ from python.tests.storage_vjp_direct_fixture import (
     nested_branch_accumulation_objective_vjp,
     nested_dynamic_scratch_objective_vjp,
     overwrite_objective_vjp,
+    partially_dynamic_objective_vjp,
     scratch_objective_vjp,
     shared_nested_inputs_objective_vjp,
     storage_objective_vjp,
@@ -70,6 +72,13 @@ class StorageVjpContractTests(unittest.TestCase):
             storage_objective_vjp(values, loss, grid=(True, 1, 1))
 
     def test_dynamic_void_storage_objective_is_accepted(self) -> None:
+        from vernon_dsl import _native  # pyright: ignore[reportAttributeAccessIssue]
+
+        transform = vd.ad.ProgramTransformSpec(
+            "vjp",
+            ("values",),
+            output_cotangents=("loss",),
+        )
         result = self.compile_source(
             """
 import vernon_dsl as vd
@@ -81,14 +90,16 @@ def objective(
 ) -> None:
     loss[0] = values[0] * values[0]
 """,
-            transform=vd.ad.ProgramTransformSpec(
-                "vjp",
-                ("values",),
-                output_cotangents=("loss",),
-            ),
+            transform=transform,
         )
         self.assertIsNone(result.program_graph)
         self.assertIsNone(result.autodiff_profiles)
+        structured = build_structured_vjp(_native, result, transform)
+        backward = structured.profiles["backward"]
+        self.assertIn('!vernon.tensor_view<f32, [-1], "write", "device">', backward)
+        self.assertNotIn("-> tensor<-1", backward)
+        compiled = _native.Compiler().compile_program_result(backward, _native.Target.CPU)
+        self.assertTrue(compiled.ok, compiled.diagnostics)
 
     def test_non_void_compute_kernel_is_rejected(self) -> None:
         with self.assertRaisesRegex(CompileError, "must return None"):
@@ -450,8 +461,9 @@ def objective(
             np.zeros((1,), dtype=np.float32),
         )
 
-    def test_dynamic_storage_shapes_use_distinct_direct_vjp_specializations(self) -> None:
+    def test_dynamic_storage_shapes_share_one_direct_vjp_compilation(self) -> None:
         vd.init(arch=vd.cpu)
+        runtime_autodiff.clear_vjp_cache()
         for values_array, expected_gradient in (
             (np.array([3.0, 4.0], dtype=np.float32), np.array([6.0, 1.0], dtype=np.float32)),
             (np.array([5.0, 6.0, 7.0], dtype=np.float32), np.array([10.0, 1.0, 0.0], dtype=np.float32)),
@@ -459,7 +471,51 @@ def objective(
             values = vd.storage.from_numpy(values_array)
             loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
             _, pullback = storage_objective_vjp(values, loss, grid=(1, 1, 1))
-            np.testing.assert_array_equal(pullback(None)["values"].to_numpy(), expected_gradient)
+            cotangent = np.array([1.0], dtype=np.float32)
+            cotangent_before = cotangent.copy()
+            np.testing.assert_array_equal(pullback(cotangent)["values"].to_numpy(), expected_gradient)
+            np.testing.assert_array_equal(cotangent, cotangent_before)
+        self.assertEqual(
+            len(runtime_autodiff._direct_state(storage_objective_vjp.program, storage_objective_vjp).compiled),
+            1,
+        )
+
+    def test_partially_dynamic_storage_shape_preserves_static_extents(self) -> None:
+        vd.init(arch=vd.cpu)
+        runtime_autodiff.clear_vjp_cache()
+        for outer, inner in ((3, 5), (7, 9)):
+            shape = (outer, 2, 4, inner)
+            values_array = np.zeros(shape, dtype=np.float32)
+            values_array[0, 1, 3, 0] = 3.0
+            values_array[outer - 1, 0, 0, inner - 1] = 4.0
+            values = vd.storage.from_numpy(values_array)
+            loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+
+            _, pullback = partially_dynamic_objective_vjp(
+                values,
+                np.int32(outer),
+                np.int32(inner),
+                loss,
+                grid=(1, 1, 1),
+            )
+            expected = np.zeros(shape, dtype=np.float32)
+            expected[0, 1, 3, 0] = 6.0
+            expected[outer - 1, 0, 0, inner - 1] = 1.0
+            np.testing.assert_array_equal(pullback(None)["values"].to_numpy(), expected)
+        self.assertEqual(
+            len(
+                runtime_autodiff._direct_state(
+                    partially_dynamic_objective_vjp.program,
+                    partially_dynamic_objective_vjp,
+                ).compiled
+            ),
+            1,
+        )
+
+        invalid = vd.storage.zeros(dtype=vd.f32, shape=(3, 3, 4, 5))
+        loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        with self.assertRaisesRegex(ValueError, r"shape \[3, 3, 4, 5\] does not match reflection \[3, 2, 4, 5\]"):
+            partially_dynamic_objective_vjp(invalid, np.int32(3), np.int32(5), loss, grid=(1, 1, 1))
 
     def test_tensor_view_gradient_scatter_targets_its_owner_descriptor(self) -> None:
         vd.init(arch=vd.cpu)

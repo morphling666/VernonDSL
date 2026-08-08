@@ -451,6 +451,9 @@ Floating-point Scalar leaves are differentiable. Tensor, Tuple, and Struct
 Values derive adjoint structure recursively from floating leaves. Floating
 Scalar and immutable Tensor gradients are ordinary Values. A differentiated
 TensorView or mutable Storage input produces newly owned gradient Storage.
+The backward compiler ABI receives that Storage as a writable TensorView
+argument, with dynamic extents preserved in its descriptor; it is not returned
+as a fixed-shape Value.
 Integer, Boolean, Resource handle, sampler state, and opaque leaves are
 non-differentiable unless a custom operation rule consumes them without
 requesting a gradient. Gradients never change primal type or identity.

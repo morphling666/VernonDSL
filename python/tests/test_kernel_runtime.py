@@ -683,6 +683,18 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             grid=(1, 1, 1),
         )
         np.testing.assert_array_equal(output.to_numpy(), np.array((3.75,), dtype=np.float32))
+        use_runtime_parameters(
+            output,
+            {"scale": np.float32(4.0), "bias": np.float32(-1.5)},
+            grid=(1, 1, 1),
+        )
+        np.testing.assert_array_equal(output.to_numpy(), np.array((2.5,), dtype=np.float32))
+        with self.assertRaisesRegex(TypeError, "is missing field 'bias'"):
+            use_runtime_parameters(
+                output,
+                {"scale": np.float32(2.5)},
+                grid=(1, 1, 1),
+            )
         with self.assertRaisesRegex(TypeError, "has type OtherRuntimeParameters, expected RuntimeParameters"):
             use_runtime_parameters(
                 output,

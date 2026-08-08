@@ -1,6 +1,6 @@
-# VernonDSL 0.1.1 release notes
+# VernonDSL 0.1.2 release notes
 
-VernonDSL 0.1.1 is the first cross-platform stable release of the language,
+VernonDSL 0.1.2 is the current cross-platform stable release of the language,
 compiler, offline cooker, synchronous Runtime/RHI, and ExecutionGraph APIs.
 
 ## Highlights
@@ -10,9 +10,12 @@ compiler, offline cooker, synchronous Runtime/RHI, and ExecutionGraph APIs.
 - Direct CPU compute dispatch and GPU-optional runtime execution.
 - Offscreen graphics pipelines, host readback, PipelineAsset cooking, and
   bundled VernonRuntime CMake sources.
-- Pipeline 14 unifies cooked compute, graphics, and differentiated assets under
+- Pipeline 15 unifies cooked compute, graphics, and differentiated assets under
   the canonical `*.pipeline.json` schema. Differentiated manifests use an
   optional root `autodiff` object.
+- CPU automatic differentiation uses one `dynamic_v2` ABI for direct and
+  cooked execution, including dynamic/partially dynamic Storage shapes,
+  reusable pullbacks, aggregate leaves, aliases, and zero extents.
 - CPU cooking emits that manifest, a relocatable `.o`/`.obj`, and generated
   static-registration `.c`/`.h` sources. The native compiler's former
   `--compute-bundle`/`compute.json` packaging interface has been removed.
@@ -39,9 +42,9 @@ compiler, offline cooker, synchronous Runtime/RHI, and ExecutionGraph APIs.
 - Dynamic TensorView shape, stride, and offset are invocation data and do not
   require recompilation.
 - CPU graphics, CUDA image/sampler resources, f16/f64 vertex attributes, and
-  non-relaxed atomic orderings are outside the supported `0.1.1` subset.
+  non-relaxed atomic orderings are outside the supported `0.1.2` subset.
 - Asynchronous dispatch, deferred graph execution, and multiple frames in
-  flight are outside the `0.1.1` contract.
+  flight are outside the `0.1.2` contract.
 - The released frontend remains language version 3. Language v4 is a roadmap
   target.
 
@@ -54,7 +57,7 @@ repository's `python` directory and run commands with
 
 ## Compatibility and lifecycle
 
-This release uses compiler contract 10 and pipeline contract 14. Incompatible
+This release uses compiler contract 11 and pipeline contract 15. Incompatible
 artifacts are rejected rather than silently loaded. The stable API, ABI,
 deprecation, cache, support, and security policies are documented in
 [`PUBLIC_API.md`](PUBLIC_API.md), [`COMPATIBILITY.md`](COMPATIBILITY.md),

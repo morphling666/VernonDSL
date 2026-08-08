@@ -94,8 +94,8 @@ void buildVernonCpuPreparationPipeline(OpPassManager &passManager) {
     passManager.addPass(createVernonVerifyCPUAutodiffABIPass());
     passManager.addPass(createVernonInlineHelpersPass());
     passManager.addPass(createVernonPrepareCPUAutodiffSignaturesPass());
-    passManager.addPass(std::make_unique<MaterializeStorageProjectionPass>());
     passManager.addPass(createVernonLowerCPUAutodiffPass());
+    passManager.addPass(std::make_unique<MaterializeStorageProjectionPass>());
     passManager.addPass(createVernonCPUAutodiffToLLVMPass());
 }
 

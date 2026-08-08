@@ -74,6 +74,11 @@ const HostTapeSnapshot::Region *HostTapeSnapshot::findRegion(VernonAdRegionHandl
     if (activeTraversalMetrics)
         ++activeTraversalMetrics->regionLookups;
 #endif
+    if (handle != VERNON_AD_INVALID_REGION_HANDLE) {
+        const size_t directIndex = static_cast<size_t>(handle - 1);
+        if (directIndex < regions_.size() && regions_[directIndex].handle == handle)
+            return &regions_[directIndex];
+    }
     const auto found = regionIndex_.find(handle);
     return found == regionIndex_.end() || found->second >= regions_.size() ? nullptr : &regions_[found->second];
 }
@@ -291,11 +296,21 @@ void HostDynamicTape::releaseCharge() {
 }
 
 HostDynamicTape::Region *HostDynamicTape::findRegion(VernonAdRegionHandle handle) {
+    if (handle != VERNON_AD_INVALID_REGION_HANDLE) {
+        const size_t directIndex = static_cast<size_t>(handle - 1);
+        if (directIndex < regions_.size() && regions_[directIndex].handle == handle)
+            return &regions_[directIndex];
+    }
     const auto found = regionIndex_.find(handle);
     return found == regionIndex_.end() || found->second >= regions_.size() ? nullptr : &regions_[found->second];
 }
 
 HostDynamicTape::Record *HostDynamicTape::findRecord(VernonAdRecordHandle handle) {
+    if (handle != VERNON_AD_INVALID_RECORD_HANDLE) {
+        const size_t directIndex = static_cast<size_t>(handle - 1);
+        if (directIndex < records_.size() && records_[directIndex].handle == handle)
+            return &records_[directIndex];
+    }
     const auto found = recordIndex_.find(handle);
     return found == recordIndex_.end() || found->second >= records_.size() ? nullptr : &records_[found->second];
 }
@@ -573,14 +588,14 @@ std::shared_ptr<const HostTapeSnapshot> HostDynamicTape::takeSnapshot() {
         return {};
     try {
         auto snapshot = std::make_shared<HostTapeSnapshot>();
-        snapshot->payload_ = payload_;
+        snapshot->payload_ = std::move(payload_);
         snapshot->regions_.reserve(regions_.size());
         snapshot->records_.reserve(records_.size());
         for (const Region &region : regions_)
             snapshot->regions_.push_back({region.handle, region.records, region.executedCount, region.exitKind});
         for (const Record &record : records_)
             snapshot->records_.push_back({record.handle, record.payloadOffset, record.payloadSize, record.children});
-        snapshot->regionIndex_ = regionIndex_;
+        snapshot->regionIndex_ = std::move(regionIndex_);
         snapshot->policy_ = policy_;
         snapshot->policyCharge_ = std::exchange(policyCharge_, 0);
         snapshot->initializeDescriptor();

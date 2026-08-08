@@ -1557,7 +1557,14 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
                 return false;
             }
             for (size_t binding = 1; binding < inputs.size(); ++binding) {
-                if (inputs[binding].value("role", "") != "cotangent") {
+                const std::string role = inputs[binding].value("role", "");
+                if (role == "shape_source")
+                    continue;
+                if (role == "gradient") {
+                    variantGradientPaths.push_back(inputs[binding].value("path", ""));
+                    continue;
+                }
+                if (role != "cotangent") {
                     error = "autodiff backward cotangent binding is invalid";
                     return false;
                 }

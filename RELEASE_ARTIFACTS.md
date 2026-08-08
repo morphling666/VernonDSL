@@ -1,6 +1,6 @@
 # Release artifacts
 
-VernonDSL 0.1.1 is a wheel-only release. A complete release contains exactly
+VernonDSL 0.1.2 is a wheel-only release. A complete release contains exactly
 12 wheels: CPython 3.11–3.14 for Windows x64, Linux x64, and macOS 15 arm64.
 
 The trusted release workflow validates the complete matrix before publication

@@ -29,6 +29,18 @@ def main() -> None:
     np.testing.assert_array_equal(explicit["x"], np.float32(6.0))
     assert explicit["x"].dtype == np.dtype(np.float32)
 
+    vd.init(arch=vd.cpu)
+    cooked = vd.load_cooked_vjp_asset(manifest)
+    wrapped_objective = vd.storage.zeros(dtype=vd.f16, shape=(1,))
+    _, wrapped_pullback = cooked.vjp(
+        {"x": np.float16(1.5), "output": wrapped_objective},
+        (1, 1, 1),
+    )
+    cotangent = vd.storage.tangent_zeros(dtype=vd.f16, shape=(1,))
+    cotangent.copy_from_numpy(np.array([2.0], dtype=np.float32))
+    wrapped = wrapped_pullback(cotangent)
+    np.testing.assert_array_equal(wrapped["x"], np.float32(6.0))
+
 
 if __name__ == "__main__":
     main()

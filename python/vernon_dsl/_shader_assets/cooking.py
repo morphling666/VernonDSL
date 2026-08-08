@@ -203,6 +203,8 @@ def cook_pipeline_asset(
             protocol=str(transform_values.get("protocol", "dynamic_v2")),
             derivative_rules_version=int(transform_values["derivative_rules_version"]),
         )
+        if target_name == "cpu" and transform.protocol != "dynamic_v2":
+            raise PipelineCompileError("CPU VJP assets require protocol='dynamic_v2'")
     for variant in pipeline.variants:
         stages: dict[str, CompiledStage] = {}
         for stage, reference in pipeline.stages.items():
@@ -246,8 +248,7 @@ def cook_pipeline_asset(
             if transform.protocol == "dynamic_v2":
                 if frontend is None or not is_structured_vjp_abi_eligible(frontend, transform):
                     raise PipelineCompileError(
-                        "dynamic_v2 requires a structured CPU VJP; "
-                        "use protocol='legacy_fixed' only for an explicitly identified native profile"
+                        "dynamic_v2 requires a structured CPU VJP with explicit writable Storage outputs"
                     )
                 try:
                     structured = build_structured_vjp(native, frontend, transform)

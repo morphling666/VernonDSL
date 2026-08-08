@@ -1,13 +1,13 @@
 # Compatibility policy
 
 VernonDSL has independent release, compiler-contract, and pipeline version
-axes. The 0.1.1 release uses compiler contract 10 and pipeline contract 14.
+axes. The 0.1.2 release uses compiler contract 11 and pipeline contract 15.
 
 ## Release and ABI
 
 Patch releases in the 0.1 series preserve the documented Python API and public
 C ABI. Wheels are supported only on their tagged Python, operating-system, and
-architecture combination. VernonDSL 0.1.1 ships CPython 3.11–3.14 wheels for
+architecture combination. VernonDSL 0.1.2 ships CPython 3.11–3.14 wheels for
 Windows x64, Linux x64, and macOS arm64.
 It is a wheel-only release: no source distribution, Intel macOS wheel, PyPy
 wheel, or 32-bit wheel is published.
@@ -21,7 +21,7 @@ unsupported.
 
 Compiler input must carry the exact supported `vernon.compiler_contract_version`.
 Pipeline manifests must carry the exact supported `pipeline_version`.
-Pipeline 14 has one canonical `*.pipeline.json` schema for compute and graphics
+Pipeline 15 has one canonical `*.pipeline.json` schema for compute and graphics
 targets. Differentiated assets use its optional root `autodiff` object; fields
 from pipeline 13 are not accepted as current-schema aliases.
 Incompatible input, reflection, manifests, and artifacts are rejected before

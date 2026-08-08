@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Annotated, Any, get_args, get_origin, get_type_hints
@@ -579,11 +579,25 @@ def pack_host_value(annotation: Any, value: Any, field_name: str = "value") -> A
             )
         return coerce_host_value(annotation, value, field_name)
     if isinstance(annotation, type) and getattr(annotation, "__vernon_dsl__", (None, {}))[0] == "struct":
-        if not isinstance(value, annotation):
+        fields = _struct_fields(annotation)
+        mapping = value if isinstance(value, Mapping) else None
+        if mapping is not None:
+            unknown = set(value) - set(fields)
+            if unknown:
+                unknown_field = min(unknown, key=repr)
+                raise TypeError(f"field '{field_name}' has unknown field {unknown_field!r}")
+            missing = [name for name in fields if name not in value]
+            if missing:
+                raise TypeError(f"field '{field_name}' is missing field '{missing[0]}'")
+        elif not isinstance(value, annotation):
             raise TypeError(f"field '{field_name}' requires {annotation.__name__}")
         return tuple(
-            pack_host_value(field_type, getattr(value, name), f"{field_name}.{name}")
-            for name, field_type in _struct_fields(annotation).items()
+            pack_host_value(
+                field_type,
+                mapping[name] if mapping is not None else getattr(value, name),
+                f"{field_name}.{name}",
+            )
+            for name, field_type in fields.items()
         )
     raise TypeError(f"field '{field_name}' has unsupported host annotation {annotation!r}")
 

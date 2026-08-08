@@ -470,3 +470,22 @@ dynamic_while_objective_vjp = vd.ad.vjp(
     wrt=("values",),
     outputs=("output",),
 )
+
+
+@vd.kernel
+def partially_dynamic_objective(
+    values: vd.TensorView[vd.f32, (vd.dyn, 2, 4, vd.dyn), vd.read],
+    outer: vd.i32,
+    inner: vd.i32,
+    loss: vd.TensorView[vd.f32, (1,), vd.write],
+) -> None:
+    first = values[0, 1, 3, 0]
+    last = values[outer - 1, 0, 0, inner - 1]
+    loss[0] = first * first + last
+
+
+partially_dynamic_objective_vjp = vd.ad.vjp(
+    partially_dynamic_objective,
+    wrt=("values",),
+    outputs=("loss",),
+)

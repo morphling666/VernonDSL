@@ -40,6 +40,7 @@ class AutodiffSmokeMpcTests(unittest.TestCase):
         self.assertTrue(np.isfinite(final_density).all())
         self.assertEqual(timings.mpc_iterations, 9)
         self.assertEqual(timings.simulation_steps, 3)
+        self.assertGreater(timings.first_vjp_seconds, 0.0)
         self.assertLess(losses[-1], losses[0])
 
     def test_control_gradient_matches_finite_difference_and_descends(self) -> None:

@@ -117,44 +117,14 @@ private:
         auto view = dyn_cast<TensorViewType>(type);
         if (!view)
             return mlir::vernon::getValueAbiLayout(type, module, dtypes);
-        SmallVector<int64_t> shape(view.getShape());
-        if (shape.empty() || llvm::any_of(shape, [](int64_t extent) { return extent <= 0; }))
-            return failure();
-        Type elementType = view.getElementType();
-        if (auto element = dyn_cast<RankedTensorType>(elementType)) {
-            if (!element.hasStaticShape())
-                return failure();
-            llvm::append_range(shape, element.getShape());
-            elementType = element.getElementType();
-        }
-        if (elementType.isIntOrFloat())
-            return mlir::vernon::getValueAbiLayout(RankedTensorType::get(shape, elementType), module, dtypes);
-
-        FailureOr<ValueAbiLayout> elementLayout = mlir::vernon::getValueAbiLayout(elementType, module, dtypes);
+        FailureOr<ValueAbiLayout> elementLayout =
+            mlir::vernon::getValueAbiLayout(view.getElementType(), module, dtypes);
         if (failed(elementLayout))
             return failure();
-        uint64_t elementCount = 1;
-        SmallVector<uint64_t> storageShape;
-        for (int64_t extent : view.getShape()) {
-            const uint64_t dimension = static_cast<uint64_t>(extent);
-            if (elementCount > std::numeric_limits<uint64_t>::max() / dimension)
-                return failure();
-            elementCount *= dimension;
-            storageShape.push_back(dimension);
-        }
         ValueAbiLayout layout = std::move(*elementLayout);
-        if (layout.size > std::numeric_limits<uint64_t>::max() / elementCount)
-            return failure();
         layout.elementStride = layout.size;
-        layout.size *= elementCount;
-        for (ValueAbiLeaf &leaf : layout.leaves) {
-            if (leaf.scalarCount > std::numeric_limits<uint64_t>::max() / elementCount)
-                return failure();
-            leaf.scalarCount *= elementCount;
-            leaf.shape.insert(leaf.shape.begin(), storageShape.begin(), storageShape.end());
-        }
         layout.layoutHash += ":storage";
-        for (uint64_t extent : storageShape)
+        for (int64_t extent : view.getShape())
             layout.layoutHash += ":" + std::to_string(extent);
         return layout;
     }
@@ -852,10 +822,11 @@ LogicalResult AutodiffAnalysisBuilder::resolveWrt() {
                                                            *getAutodiffDerivativeType(leaf.scalarType)));
             result.wrtLeaves.push_back(AutodiffLeaf{argument, static_cast<unsigned>(leafIndex), path, leaf.scalarType,
                                                     derivativeType, leaf.dtype, leaf.shape});
-            if (isa<TensorViewType>(argument.getType()))
+            if (isa<TensorViewType>(argument.getType())) {
                 wrtStorageLeaves.push_back(StorageLeafSelection{argument, static_cast<unsigned>(leafIndex)});
-            else
+            } else {
                 wrtNodes.push_back(*getNode(argument, leafIndex));
+            }
             ++matches;
         }
         if (matches == 0)

@@ -162,6 +162,7 @@ module {
                            StructuredVjpOptions{{"values"}, "aggregate_forward", "aggregate_backward", {"loss"}});
     ASSERT_TRUE(succeeded(result));
     EXPECT_TRUE(succeeded(verify(*module)));
+    EXPECT_EQ(result->backward.getNumResults(), 0u);
     unsigned scatterAdds = 0;
     unsigned takeAndClears = 0;
     result->backward.walk([&](Operation *operation) {
@@ -171,6 +172,46 @@ module {
     });
     EXPECT_GE(scatterAdds, 4u);
     EXPECT_GE(takeAndClears, 3u);
+}
+
+TEST_F(VernonStructuredVjpTest, BuildsDynamicStorageGradientAsWritableTensorViewArgument) {
+    OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
+        R"mlir(
+module {
+  func.func @primal(
+      %values: !vernon.tensor_view<f32, [-1], "read", "device">
+          {vernon.source_name = "values", vernon.abi_leaf_dtypes = ["f32"]},
+      %loss: !vernon.tensor_view<f32, [1], "write", "device">
+          {vernon.source_name = "loss", vernon.abi_leaf_dtypes = ["f32"]})
+      attributes {vernon.entry, vernon.stage = "compute"} {
+    %index = arith.constant 0 : index
+    %value = "vernon.load"(%values, %index)
+        : (!vernon.tensor_view<f32, [-1], "read", "device">, index) -> f32
+    %squared = arith.mulf %value, %value : f32
+    "vernon.store"(%squared, %loss, %index)
+        : (f32, !vernon.tensor_view<f32, [1], "write", "device">, index) -> ()
+    func.return
+  }
+}
+)mlir",
+        ParserConfig(&context));
+    ASSERT_TRUE(module);
+    FailureOr<StructuredVjpResult> result =
+        buildStructuredVjp(module->lookupSymbol<func::FuncOp>("primal"),
+                           StructuredVjpOptions{{"values"}, "dynamic_forward", "dynamic_backward", {"loss"}});
+    ASSERT_TRUE(succeeded(result));
+    EXPECT_TRUE(succeeded(verify(*module)));
+    EXPECT_EQ(result->backward.getNumResults(), 0u);
+    ASSERT_EQ(result->backward.getNumArguments(), 6u);
+    auto gradient = dyn_cast<TensorViewType>(result->backward.getArgumentTypes().back());
+    ASSERT_TRUE(gradient);
+    EXPECT_EQ(gradient.getShape(), ArrayRef<int64_t>({-1}));
+    EXPECT_EQ(gradient.getAccess(), "write");
+    unsigned dynamicBuffers = 0;
+    result->backward.walk([&](AdAdjointBufferCreateOp create) {
+        dynamicBuffers += llvm::is_contained(create.getBuffer().getType().getShape(), int64_t{-1});
+    });
+    EXPECT_GE(dynamicBuffers, 1u);
 }
 
 TEST_F(VernonStructuredVjpTest, BuildsDynamicForStorageObjective) {

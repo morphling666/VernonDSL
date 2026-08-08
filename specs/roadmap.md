@@ -2,12 +2,12 @@
 
 ## Current position
 
-VernonDSL 0.1.1 is the first stable cross-platform release target. The current
+VernonDSL 0.1.2 is the current stable cross-platform release target. The current
 version axes are:
 
-- release `0.1.1`;
-- compiler contract 10;
-- pipeline contract 14;
+- release `0.1.2`;
+- compiler contract 11;
+- pipeline contract 15;
 - released frontend version 3, with language v4 remaining a future target.
 
 The supported wheel matrix is CPython 3.11–3.14 on Windows x64, Linux x64, and
@@ -52,7 +52,7 @@ implementation plans and milestone checklists that it replaces.
   compatibility parser.
 - Aggregate workgroup storage, barriers, relaxed atomics, nested values,
   padding, control flow, and independent-workgroup behavior have compiler and
-  available-runtime coverage for the synchronous 0.1.1 subset.
+  available-runtime coverage for the synchronous 0.1.2 subset.
 
 ### Backend capability baseline
 
@@ -68,7 +68,7 @@ implementation plans and milestone checklists that it replaces.
 
 CPU graphics, CUDA image/sampler resources, f16/f64 vertex attributes,
 non-relaxed atomics, and backend-independent window presentation are outside
-the 0.1.1 capability baseline.
+the 0.1.2 capability baseline.
 
 ### Cross-platform release foundations
 
@@ -170,7 +170,7 @@ permit removing queue waits or letting recorded work outlive its owners.
 - Cooked CPU regression coverage includes f64 primal/cotangent/gradient
   preservation, signed-stride aggregate outputs, strided gradient scatter,
   gather accumulation, and independent multi-output cotangents.
-- Compiler contract 10 and pipeline contract 14 freeze the current unified
+- Compiler contract 11 and pipeline contract 15 freeze the current unified
   autodiff and manifest boundary without compatibility readers.
 
 ## Future work
@@ -181,7 +181,7 @@ permit removing queue waits or letting recorded work outlive its owners.
 - Execute Metal compute, graphics, Argument Buffer, dispatch, and readback gates
   without capability skips on release hardware.
 - Run the trusted workflow dry run, verify the complete payload, create the
-  immutable `v0.1.1` tag, publish, and verify the PyPI and GitHub artifacts.
+  immutable `v0.1.2` tag, publish, and verify the PyPI and GitHub artifacts.
 - Add fuzzing for source, manifest, reflection, TensorView, and ExecutionGraph
   inputs.
 - Publish benchmark history and stable regression thresholds.
@@ -195,7 +195,7 @@ to native desktop objects or Emscripten-compatible WebAssembly without a Python
 dependency. The first milestone is one shared gameplay demo with identical
 state and checksums in interpreted, desktop, and browser execution.
 
-This work is post-0.1.1 and does not change the current device-language or
+This work is post-0.1.2 and does not change the current device-language or
 Runtime contracts.
 
 ### Language v4

@@ -17,6 +17,8 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -35,7 +37,7 @@ struct HostFrameLeaf {
 
 struct HostTensorView {
     std::string access;
-    std::vector<uint64_t> shape;
+    std::vector<int64_t> shape;
     ValueLayout elementLayout;
     std::vector<ValueAbi> leaves;
 };
@@ -67,12 +69,54 @@ struct StorageRange {
 struct StagedTensorView {
     const HostArgument *argument{};
     size_t elementCount{};
+    std::vector<uint64_t> shape;
     std::vector<uint8_t> packed;
     std::vector<uint8_t *> leafShadows;
 };
 
+using RuntimeTensorShapes = std::unordered_map<std::string, std::vector<uint64_t>>;
+
+bool materializeTensorViewShape(const HostArgument &argument, const VernonAdValueSet &inputs,
+                                std::vector<uint64_t> &shape) {
+    const HostTensorView &view = *argument.tensorView;
+    for (size_t leafIndex = 0; leafIndex < view.leaves.size(); ++leafIndex) {
+        const ValueAbi &leaf = view.leaves[leafIndex];
+        const ValueLeaf &layoutLeaf = view.elementLayout.leaves[leafIndex];
+        const VernonAdValue *value = findValue(inputs, leaf.path);
+        if (!value || value->dtype != leaf.dtype || value->rank != view.shape.size() + layoutLeaf.shape.size() ||
+            (value->rank && !value->shape))
+            return false;
+        std::vector<uint64_t> candidate(value->shape, value->shape + view.shape.size());
+        for (size_t dimension = 0; dimension < view.shape.size(); ++dimension)
+            if (view.shape[dimension] >= 0 && candidate[dimension] != static_cast<uint64_t>(view.shape[dimension]))
+                return false;
+        for (size_t dimension = 0; dimension < layoutLeaf.shape.size(); ++dimension)
+            if (value->shape[view.shape.size() + dimension] != layoutLeaf.shape[dimension])
+                return false;
+        size_t scalarCount = 1;
+        for (uint64_t extent : candidate) {
+            if (scalarCount && extent > SIZE_MAX / scalarCount)
+                return false;
+            scalarCount *= static_cast<size_t>(extent);
+        }
+        const size_t scalarSize = dtypeSize(leaf.dtype);
+        if (!scalarSize || (scalarCount && layoutLeaf.scalarCount > SIZE_MAX / scalarCount))
+            return false;
+        const size_t leafScalarCount = scalarCount * layoutLeaf.scalarCount;
+        if ((leafScalarCount && scalarSize > SIZE_MAX / leafScalarCount) || value->size != leafScalarCount * scalarSize)
+            return false;
+        if (shape.empty())
+            shape = std::move(candidate);
+        else if (shape != candidate)
+            return false;
+    }
+    return !shape.empty();
+}
+
 VernonStatus fail(VernonRuntimeContext &context, std::string message,
                   VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT);
+bool writeTensorViewDescriptor(const HostArgument &argument, const std::vector<uint64_t> &shape, void *data,
+                               std::vector<uint8_t> &arguments);
 
 bool appendStorageRange(const void *data, size_t size, bool writable, std::vector<StorageRange> &ranges) {
     const uintptr_t begin = reinterpret_cast<uintptr_t>(data);
@@ -103,8 +147,10 @@ VernonStatus stageForwardInputs(VernonRuntimeContext &context, const HostProfile
             StagedTensorView staged;
             staged.argument = &argument;
             staged.elementCount = 1;
-            for (uint64_t extent : view.shape) {
-                if (!extent || extent > std::numeric_limits<size_t>::max() / staged.elementCount)
+            if (!materializeTensorViewShape(argument, inputs, staged.shape))
+                return fail(context, "autodiff forward TensorView inputs do not match profile reflection");
+            for (uint64_t extent : staged.shape) {
+                if (staged.elementCount && extent > std::numeric_limits<size_t>::max() / staged.elementCount)
                     return fail(context, "autodiff forward TensorView element count overflows");
                 staged.elementCount *= static_cast<size_t>(extent);
             }
@@ -124,13 +170,16 @@ VernonStatus stageForwardInputs(VernonRuntimeContext &context, const HostProfile
             for (size_t leafIndex = 0; leafIndex < view.leaves.size(); ++leafIndex) {
                 const ValueAbi &leaf = view.leaves[leafIndex];
                 const VernonAdValue *value = findValue(inputs, leaf.path);
-                if (!value || !valueMatches(*value, leaf))
+                if (!value)
                     return fail(context, "autodiff forward TensorView input '" + leaf.path +
                                              "' does not match profile reflection");
                 if (!appendStorageRange(value->data, value->size, writable, storageRanges))
                     return fail(context, "observable native CPU autodiff Storage/output ranges overlap or overflow");
+                auto *source = static_cast<const uint8_t *>(value->data);
                 auto *shadow =
-                    static_cast<uint8_t *>(transaction.stageStorage(value->data, value->size, preserve, writable));
+                    writable
+                        ? static_cast<uint8_t *>(transaction.stageStorage(value->data, value->size, preserve, true))
+                        : const_cast<uint8_t *>(source);
                 if (value->size && !shadow)
                     return fail(context, "cannot allocate native CPU autodiff Storage shadow",
                                 VERNON_STATUS_INTERNAL_ERROR);
@@ -145,26 +194,15 @@ VernonStatus stageForwardInputs(VernonRuntimeContext &context, const HostProfile
                 if (layoutLeaf.byteOffset > view.elementLayout.byteSize ||
                     leafBytes > view.elementLayout.byteSize - layoutLeaf.byteOffset)
                     return fail(context, "autodiff TensorView leaf exceeds its canonical element layout");
+                const uint8_t *packedSource = writable ? shadow : source;
                 for (size_t element = 0; element < staged.elementCount; ++element)
                     std::memcpy(staged.packed.data() + element * view.elementLayout.byteSize + layoutLeaf.byteOffset,
-                                shadow + element * leafBytes, leafBytes);
+                                packedSource + element * leafBytes, leafBytes);
             }
             tensorViews.push_back(std::move(staged));
-            uint8_t *descriptor = arguments.data() + argument.offset;
-            const uintptr_t pointer = reinterpret_cast<uintptr_t>(tensorViews.back().packed.data());
-            const uint64_t zero = 0;
-            std::memcpy(descriptor, &pointer, sizeof(pointer));
-            std::memcpy(descriptor + sizeof(uint64_t), &zero, sizeof(zero));
-            const size_t rank = view.shape.size();
-            for (size_t dimension = 0; dimension < rank; ++dimension) {
-                const uint64_t extent = view.shape[dimension];
-                std::memcpy(descriptor + sizeof(uint64_t) * (2 + dimension), &extent, sizeof(extent));
-            }
-            uint64_t stride = 1;
-            for (size_t dimension = rank; dimension-- > 0;) {
-                std::memcpy(descriptor + sizeof(uint64_t) * (2 + rank + dimension), &stride, sizeof(stride));
-                stride *= view.shape[dimension];
-            }
+            if (!writeTensorViewDescriptor(argument, tensorViews.back().shape, tensorViews.back().packed.data(),
+                                           arguments))
+                return fail(context, "autodiff forward TensorView descriptor overflows");
             continue;
         }
         for (const HostFrameLeaf &leaf : argument.leaves) {
@@ -421,20 +459,18 @@ bool parseProfile(const Stage &stage, HostProfileLayout &layout, std::string &er
                     error = "autodiff TensorView argument has an invalid canonical element layout";
                 return false;
             }
-            std::vector<uint64_t> shape;
+            std::vector<int64_t> shape;
             const std::string access = value.value("access", "");
-            size_t elementCount = 1;
             for (const nlohmann::json &extentValue : value["source_shape"]) {
-                if (!extentValue.is_number_unsigned()) {
+                if (!extentValue.is_number_integer()) {
                     error = "autodiff TensorView argument has an invalid shape";
                     return false;
                 }
-                const uint64_t extent = extentValue.get<uint64_t>();
-                if (!extent || extent > SIZE_MAX / elementCount) {
-                    error = "autodiff TensorView argument shape is empty or overflows";
+                const int64_t extent = extentValue.get<int64_t>();
+                if (!extent || extent < -1) {
+                    error = "autodiff TensorView argument shape is empty or invalid";
                     return false;
                 }
-                elementCount *= static_cast<size_t>(extent);
                 shape.push_back(extent);
             }
             if (shape.empty() || argument.size != sizeof(uint64_t) * (2 + 2 * shape.size()) ||
@@ -448,19 +484,31 @@ bool parseProfile(const Stage &stage, HostProfileLayout &layout, std::string &er
             for (const ValueLeaf &layoutLeaf : elementLayout.leaves) {
                 const auto dtype = pipelineDataType(layoutLeaf.dtype);
                 const size_t scalarSize = dtype ? dtypeSize(*dtype) : 0;
-                if (!scalarSize || !layoutLeaf.scalarCount || elementCount > SIZE_MAX / layoutLeaf.scalarCount ||
-                    elementCount * layoutLeaf.scalarCount > SIZE_MAX / scalarSize) {
+                if (!scalarSize || !layoutLeaf.scalarCount) {
                     error = "autodiff TensorView element leaf size overflows";
                     return false;
                 }
                 std::string path = argument.name;
                 for (const ValuePathComponent &component : layoutLeaf.path)
                     path += component.field ? "." + *component.field : "." + std::to_string(component.index);
-                std::vector<uint64_t> leafShape = shape;
+                std::vector<uint64_t> leafShape;
+                leafShape.reserve(shape.size() + layoutLeaf.shape.size());
+                for (int64_t extent : shape)
+                    leafShape.push_back(extent < 0 ? 0 : static_cast<uint64_t>(extent));
                 leafShape.insert(leafShape.end(), layoutLeaf.shape.begin(), layoutLeaf.shape.end());
-                tensorView.leaves.push_back({std::move(path), *dtype,
-                                             elementCount * layoutLeaf.scalarCount * scalarSize, scalarSize,
-                                             std::move(leafShape)});
+                size_t byteSize = layoutLeaf.scalarCount * scalarSize;
+                for (int64_t extent : shape) {
+                    if (extent < 0) {
+                        byteSize = 0;
+                        break;
+                    }
+                    if (static_cast<uint64_t>(extent) > SIZE_MAX / byteSize) {
+                        error = "autodiff TensorView element leaf size overflows";
+                        return false;
+                    }
+                    byteSize *= static_cast<size_t>(extent);
+                }
+                tensorView.leaves.push_back({std::move(path), *dtype, byteSize, scalarSize, std::move(leafShape)});
             }
             tensorView.elementLayout = std::move(elementLayout);
             argument.tensorView = std::move(tensorView);
@@ -558,41 +606,123 @@ VernonStatus prepareGradientDestinations(VernonRuntimeContext &context, const Si
     return VERNON_STATUS_OK;
 }
 
+bool writeTensorViewDescriptor(const HostArgument &argument, const std::vector<uint64_t> &shape, void *data,
+                               std::vector<uint8_t> &arguments) {
+    if (!argument.tensorView || shape.size() != argument.tensorView->shape.size() ||
+        argument.size != sizeof(uint64_t) * (2 + 2 * shape.size()))
+        return false;
+    uint8_t *descriptor = arguments.data() + argument.offset;
+    const uintptr_t pointer = reinterpret_cast<uintptr_t>(data);
+    const uint64_t zero = 0;
+    std::memcpy(descriptor, &pointer, sizeof(pointer));
+    std::memcpy(descriptor + sizeof(uint64_t), &zero, sizeof(zero));
+    uint64_t stride = 1;
+    for (size_t dimension = shape.size(); dimension-- > 0;) {
+        if (stride && shape[dimension] > UINT64_MAX / stride)
+            return false;
+        std::memcpy(descriptor + sizeof(uint64_t) * (2 + dimension), &shape[dimension], sizeof(uint64_t));
+        std::memcpy(descriptor + sizeof(uint64_t) * (2 + shape.size() + dimension), &stride, sizeof(uint64_t));
+        stride *= shape[dimension];
+    }
+    return true;
+}
+
+bool isShapeSource(const HostArgument &argument) { return argument.name.rfind("shape.", 0) == 0; }
+
+std::string tensorOwnerName(const HostArgument &argument) {
+    std::string name = isShapeSource(argument) ? argument.name.substr(6) : argument.name;
+    const size_t separator = name.find('.');
+    if (separator != std::string::npos)
+        name.resize(separator);
+    return name;
+}
+
+bool materializeRuntimeSignature(Signature &signature, const VernonAdValueSet &inputs) {
+    for (ValueAbi &input : signature.inputs) {
+        const VernonAdValue *value = findValue(inputs, input.path);
+        if (!value || value->dtype != input.dtype || (value->rank && !value->shape))
+            return false;
+        input.byteSize = value->size;
+        input.logicalShape.assign(value->shape, value->shape + value->rank);
+    }
+    auto materializeDerivative = [&](ValueAbi &derivative) {
+        const auto primal = std::find_if(signature.inputs.begin(), signature.inputs.end(),
+                                         [&](const ValueAbi &value) { return value.path == derivative.path; });
+        if (primal == signature.inputs.end())
+            return false;
+        const size_t primalScalarSize = dtypeSize(primal->dtype);
+        const size_t derivativeScalarSize = dtypeSize(derivative.dtype);
+        if (!primalScalarSize || !derivativeScalarSize || primal->byteSize % primalScalarSize ||
+            primal->byteSize / primalScalarSize > SIZE_MAX / derivativeScalarSize)
+            return false;
+        derivative.byteSize = primal->byteSize / primalScalarSize * derivativeScalarSize;
+        derivative.logicalShape = primal->logicalShape;
+        return true;
+    };
+    for (ValueAbi &output : signature.outputs)
+        if (!materializeDerivative(output))
+            return false;
+    for (ValueAbi &cotangent : signature.cotangents)
+        if (!materializeDerivative(cotangent))
+            return false;
+    for (ValueAbi &gradient : signature.gradients)
+        if (!materializeDerivative(gradient))
+            return false;
+    return true;
+}
+
+VernonStatus accumulateFloatingBytes(VernonRuntimeContext &context, VernonDataType dtype, uint8_t *destination,
+                                     const uint8_t *source, size_t byteSize) {
+    auto accumulate = [&](auto scalar) {
+        using Scalar = decltype(scalar);
+        if (byteSize % sizeof(Scalar))
+            return false;
+        for (size_t offset = 0; offset < byteSize; offset += sizeof(Scalar)) {
+            Scalar current;
+            Scalar contribution;
+            std::memcpy(&current, destination + offset, sizeof(Scalar));
+            std::memcpy(&contribution, source + offset, sizeof(Scalar));
+            current += contribution;
+            std::memcpy(destination + offset, &current, sizeof(Scalar));
+        }
+        return true;
+    };
+    if ((dtype == VERNON_DATA_F32 && accumulate(float{})) || (dtype == VERNON_DATA_F64 && accumulate(double{})))
+        return VERNON_STATUS_OK;
+    return fail(context, "CPU pullback can only accumulate well-formed floating gradients");
+}
+
 VernonStatus invokeBackwardAndAccumulate(VernonRuntimeContext &context, const CpuKernelState &backward,
                                          const HostProfileLayout &layout, const Signature &signature,
                                          std::vector<uint8_t> &arguments,
+                                         const std::vector<size_t> &resultGradientIndices,
                                          std::vector<std::vector<uint8_t>> &stagedGradients) {
     std::vector<uint8_t> results(layout.resultsSize);
     const VernonCpuInvocation invocation{arguments.data(), arguments.size(), results.data(), results.size(), nullptr};
     const VernonStatus status = backward.entry(&invocation);
     if (status != VERNON_STATUS_OK)
         return fail(context, "autodiff backward profile invocation failed", status);
-    for (size_t index = 0; index < signature.gradients.size(); ++index) {
+    if (layout.results.size() != resultGradientIndices.size())
+        return fail(context, "CPU pullback result gradient ABI is inconsistent");
+    for (size_t index = 0; index < resultGradientIndices.size(); ++index) {
+        const size_t gradientIndex = resultGradientIndices[index];
         const HostFrameLeaf &source = layout.results[index];
-        uint8_t *destination = stagedGradients[index].data();
+        uint8_t *destination = stagedGradients[gradientIndex].data();
         const uint8_t *contribution = results.data() + source.frameOffset;
-        const size_t scalarSize = dtypeSize(source.value.dtype);
-        for (size_t offset = 0; offset < source.value.byteSize; offset += scalarSize) {
-            if (source.value.dtype == VERNON_DATA_F32) {
-                float current;
-                float value;
-                std::memcpy(&current, destination + offset, sizeof(current));
-                std::memcpy(&value, contribution + offset, sizeof(value));
-                current += value;
-                std::memcpy(destination + offset, &current, sizeof(current));
-            } else if (source.value.dtype == VERNON_DATA_F64) {
-                double current;
-                double value;
-                std::memcpy(&current, destination + offset, sizeof(current));
-                std::memcpy(&value, contribution + offset, sizeof(value));
-                current += value;
-                std::memcpy(destination + offset, &current, sizeof(current));
-            } else {
-                return fail(context, "CPU pullback can only reduce floating gradients");
-            }
-        }
+        if (VernonStatus accumulateStatus =
+                accumulateFloatingBytes(context, source.value.dtype, destination, contribution, source.value.byteSize);
+            accumulateStatus != VERNON_STATUS_OK)
+            return accumulateStatus;
     }
     return VERNON_STATUS_OK;
+}
+
+VernonStatus accumulateGradientBytes(VernonRuntimeContext &context, const ValueAbi &abi, const uint8_t *source,
+                                     std::vector<uint8_t> &destination) {
+    const size_t scalarSize = dtypeSize(abi.dtype);
+    if (!scalarSize || destination.size() != abi.byteSize)
+        return fail(context, "CPU pullback gradient accumulation ABI is inconsistent");
+    return accumulateFloatingBytes(context, abi.dtype, destination.data(), source, abi.byteSize);
 }
 
 void commitGradientDestinations(const std::vector<VernonAdValue *> &destinations,
@@ -607,10 +737,12 @@ public:
     StructuredCpuPullbackExecution(VernonRuntimeContext &context, std::shared_ptr<CpuKernelState> backward,
                                    HostProfileLayout layout, Signature signature, VernonLaunchSize computeGrid,
                                    std::vector<std::vector<uint8_t>> arguments,
-                                   std::vector<std::shared_ptr<const HostTapeSnapshot>> tapeSnapshots)
+                                   std::vector<std::shared_ptr<const HostTapeSnapshot>> tapeSnapshots,
+                                   RuntimeTensorShapes tensorShapes, std::vector<size_t> resultGradientIndices)
         : context_(context), backward_(std::move(backward)), layout_(std::move(layout)),
           signature_(std::move(signature)), computeGrid_(computeGrid), arguments_(std::move(arguments)),
-          tapeSnapshots_(std::move(tapeSnapshots)) {}
+          tapeSnapshots_(std::move(tapeSnapshots)), tensorShapes_(std::move(tensorShapes)),
+          resultGradientIndices_(std::move(resultGradientIndices)) {}
 
     VernonStatus apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients) override {
         if (signature_.cotangents.empty())
@@ -618,16 +750,22 @@ public:
         if ((cotangents && cotangents->value_count != signature_.cotangents.size()) ||
             (!cotangents && signature_.cotangents.size() != 1))
             return fail(context_, "CPU pullback requires exactly the reflected output cotangent leaves");
+        std::unordered_map<std::string_view, size_t> gradientIndices;
+        gradientIndices.reserve(signature_.gradients.size());
+        for (size_t index = 0; index < signature_.gradients.size(); ++index)
+            gradientIndices.emplace(signature_.gradients[index].path, index);
         std::vector<const HostArgument *> cotangentArguments;
         for (const HostArgument &argument : layout_.arguments)
-            if (argument.builtin.empty())
+            if (argument.builtin.empty() && !isShapeSource(argument) &&
+                gradientIndices.find(argument.name) == gradientIndices.end())
                 cotangentArguments.push_back(&argument);
         if (cotangentArguments.size() != signature_.cotangents.size())
             return fail(context_, "CPU pullback has an invalid cotangent ABI");
         std::vector<std::vector<uint8_t>> cotangentBytes;
         for (size_t index = 0; index < signature_.cotangents.size(); ++index) {
             const HostArgument &argument = *cotangentArguments[index];
-            if (argument.leaves.size() != 1 || argument.name != signature_.cotangents[index].path)
+            const size_t leafCount = argument.tensorView ? argument.tensorView->leaves.size() : argument.leaves.size();
+            if (leafCount != 1 || argument.name != signature_.cotangents[index].path)
                 return fail(context_, "CPU pullback cotangent reflection is inconsistent");
             ValueAbi abi = signature_.cotangents[index];
             if (!materializeCarrierValue(abi, computeGrid_))
@@ -651,8 +789,33 @@ public:
                 prepareGradientDestinations(context_, signature_, gradients, destinations, stagedGradients);
             status != VERNON_STATUS_OK)
             return status;
+        std::vector<std::vector<uint8_t>> invocationStorageGradients(signature_.gradients.size());
+        uint8_t shapeSourceSentinel{};
+        for (const HostArgument &argument : layout_.arguments) {
+            if (!argument.tensorView)
+                continue;
+            const bool shapeSource = isShapeSource(argument);
+            const std::string shapeName = tensorOwnerName(argument);
+            const auto shape = tensorShapes_.find(shapeName);
+            if (shape == tensorShapes_.end())
+                return fail(context_, "CPU pullback TensorView argument has no retained forward shape");
+            void *data = &shapeSourceSentinel;
+            if (!shapeSource) {
+                const auto gradient = gradientIndices.find(argument.name);
+                if (gradient == gradientIndices.end())
+                    continue;
+                const size_t index = gradient->second;
+                invocationStorageGradients[index].resize(signature_.gradients[index].byteSize);
+                data = invocationStorageGradients[index].data();
+            }
+            for (std::vector<uint8_t> &arguments : arguments_)
+                if (!writeTensorViewDescriptor(argument, shape->second, data, arguments))
+                    return fail(context_, "CPU pullback TensorView descriptor overflows");
+        }
         for (size_t invocationIndex = 0; invocationIndex < arguments_.size(); ++invocationIndex) {
             std::vector<uint8_t> &arguments = arguments_[invocationIndex];
+            for (std::vector<uint8_t> &gradient : invocationStorageGradients)
+                std::fill(gradient.begin(), gradient.end(), uint8_t{0});
             if (!layout_.tapeAllocatorOffset || !layout_.tapeRootRegionOffset ||
                 invocationIndex >= tapeSnapshots_.size())
                 return fail(context_, "CPU pullback dynamic tape ABI is incomplete");
@@ -664,16 +827,34 @@ public:
             std::memcpy(arguments.data() + *layout_.tapeAllocatorOffset, &descriptor, sizeof(VernonAdTapeAllocator *));
             std::memcpy(arguments.data() + *layout_.tapeRootRegionOffset, &root, sizeof(root));
             for (size_t cotangentIndex = 0; cotangentIndex < cotangentArguments.size(); ++cotangentIndex) {
-                const HostFrameLeaf &leaf = cotangentArguments[cotangentIndex]->leaves.front();
-                std::memcpy(arguments.data() + leaf.frameOffset,
-                            cotangentBytes[cotangentIndex].data() +
-                                invocationIndex * signature_.cotangents[cotangentIndex].byteSize,
-                            signature_.cotangents[cotangentIndex].byteSize);
+                const HostArgument &argument = *cotangentArguments[cotangentIndex];
+                uint8_t *source = cotangentBytes[cotangentIndex].data() +
+                                  invocationIndex * signature_.cotangents[cotangentIndex].byteSize;
+                if (argument.tensorView) {
+                    const std::string shapeName = tensorOwnerName(argument);
+                    const auto shape = tensorShapes_.find(shapeName);
+                    if (shape == tensorShapes_.end() ||
+                        !writeTensorViewDescriptor(argument, shape->second, source, arguments))
+                        return fail(context_, "CPU pullback cotangent descriptor is inconsistent");
+                } else {
+                    const HostFrameLeaf &leaf = argument.leaves.front();
+                    std::memcpy(arguments.data() + leaf.frameOffset, source,
+                                signature_.cotangents[cotangentIndex].byteSize);
+                }
             }
-            if (VernonStatus status =
-                    invokeBackwardAndAccumulate(context_, *backward_, layout_, signature_, arguments, stagedGradients);
+            if (VernonStatus status = invokeBackwardAndAccumulate(context_, *backward_, layout_, signature_, arguments,
+                                                                  resultGradientIndices_, stagedGradients);
                 status != VERNON_STATUS_OK)
                 return status;
+            for (size_t gradientIndex = 0; gradientIndex < invocationStorageGradients.size(); ++gradientIndex) {
+                const std::vector<uint8_t> &contribution = invocationStorageGradients[gradientIndex];
+                if (!contribution.empty())
+                    if (VernonStatus status =
+                            accumulateGradientBytes(context_, signature_.gradients[gradientIndex], contribution.data(),
+                                                    stagedGradients[gradientIndex]);
+                        status != VERNON_STATUS_OK)
+                        return status;
+            }
         }
         commitGradientDestinations(destinations, stagedGradients);
         return VERNON_STATUS_OK;
@@ -687,6 +868,8 @@ private:
     VernonLaunchSize computeGrid_{};
     std::vector<std::vector<uint8_t>> arguments_;
     std::vector<std::shared_ptr<const HostTapeSnapshot>> tapeSnapshots_;
+    RuntimeTensorShapes tensorShapes_;
+    std::vector<size_t> resultGradientIndices_;
 };
 
 template <typename Invoke, typename Finish>
@@ -696,47 +879,34 @@ VernonStatus runCpuForward(VernonRuntimeContext &context, const HostProfileLayou
     size_t invocationCount = 0;
     if (!carrierCount(computeGrid, invocationCount))
         return fail(context, "native CPU autodiff launch size overflows");
-    const bool storageObjectives = layout.results.empty();
-    const size_t expectedOutputValues = storageObjectives ? 0 : signature.outputs.size();
-    if (inputs.value_count != signature.inputs.size() || outputs.value_count != expectedOutputValues ||
-        (!storageObjectives && layout.results.size() != signature.outputs.size() + signature.tape.size()))
+    if (inputs.value_count != signature.inputs.size() || outputs.value_count != 0 || !layout.results.empty())
         return fail(context, "autodiff forward values do not match the host profile");
     std::vector<uint8_t> arguments(layout.argumentsSize);
     std::vector<StorageRange> storageRanges;
     std::vector<StagedTensorView> tensorViews;
     HostEffectTransaction transaction(0);
-    std::vector<uint8_t *> stagedOutputs;
-    if (!storageObjectives)
-        for (const ValueAbi &unmaterialized : signature.outputs) {
-            ValueAbi outputAbi = unmaterialized;
-            if (!materializeCarrierValue(outputAbi, computeGrid))
-                return fail(context, "native CPU autodiff output size overflows");
-            VernonAdValue *output = findValue(outputs, outputAbi.path);
-            if (!output || !valueMatches(*output, outputAbi))
-                return fail(context, "autodiff output does not match profile reflection");
-            if (!appendStorageRange(output->data, output->size, true, storageRanges))
-                return fail(context, "native CPU autodiff output address range overflows");
-            uint8_t *staged = transaction.stageStorage(output->data, outputAbi.byteSize, false);
-            if (outputAbi.byteSize && !staged)
-                return fail(context, "cannot allocate native CPU autodiff output shadow", VERNON_STATUS_INTERNAL_ERROR);
-            stagedOutputs.push_back(staged);
-        }
     if (VernonStatus status =
             stageForwardInputs(context, layout, inputs, arguments, transaction, storageRanges, tensorViews);
         status != VERNON_STATUS_OK)
         return status;
+    Signature runtimeSignature = signature;
+    if (!materializeRuntimeSignature(runtimeSignature, inputs))
+        return fail(context, "cannot materialize native CPU autodiff runtime signature");
+    RuntimeTensorShapes tensorShapes;
+    tensorShapes.reserve(tensorViews.size());
+    for (const StagedTensorView &view : tensorViews) {
+        const auto [retained, inserted] = tensorShapes.emplace(tensorOwnerName(*view.argument), view.shape);
+        if (!inserted && retained->second != view.shape)
+            return fail(context, "native CPU autodiff retained incompatible TensorView shapes for one owner");
+    }
     for (size_t invocationIndex = 0; invocationIndex < invocationCount; ++invocationIndex) {
         std::vector<uint8_t> results(layout.resultsSize);
         if (VernonStatus status = invoke(invocationIndex, arguments, results); status != VERNON_STATUS_OK)
             return status;
-        if (!storageObjectives)
-            for (size_t outputIndex = 0; outputIndex < signature.outputs.size(); ++outputIndex)
-                std::memcpy(stagedOutputs[outputIndex] + invocationIndex * signature.outputs[outputIndex].byteSize,
-                            results.data() + layout.results[outputIndex].frameOffset,
-                            signature.outputs[outputIndex].byteSize);
     }
     std::unique_ptr<PullbackExecution> pendingPullback;
-    if (VernonStatus status = finish(invocationCount, pendingPullback); status != VERNON_STATUS_OK)
+    if (VernonStatus status = finish(invocationCount, runtimeSignature, std::move(tensorShapes), pendingPullback);
+        status != VERNON_STATUS_OK)
         return status;
     if (!pendingPullback)
         return fail(context, "native CPU autodiff did not create a pullback", VERNON_STATUS_INTERNAL_ERROR);
@@ -752,10 +922,11 @@ class StructuredCpuExecutable final : public HostExecutable {
 public:
     StructuredCpuExecutable(VernonRuntimeContext &context, HostProfileLayout forwardLayout,
                             HostProfileLayout backwardLayout, std::shared_ptr<CpuKernelState> forward,
-                            std::shared_ptr<CpuKernelState> backward, Signature signature)
+                            std::shared_ptr<CpuKernelState> backward, Signature signature,
+                            std::vector<size_t> resultGradientIndices)
         : context_(context), forwardLayout_(std::move(forwardLayout)), backwardLayout_(std::move(backwardLayout)),
           forward_(std::move(forward)), backward_(std::move(backward)), signature_(std::move(signature)),
-          tapePolicy_(context.cpuTapePolicy) {}
+          tapePolicy_(context.cpuTapePolicy), resultGradientIndices_(std::move(resultGradientIndices)) {}
 
     const Signature &signature() const override { return signature_; }
 
@@ -796,12 +967,14 @@ public:
                 tapeSnapshots.push_back(std::move(snapshot));
                 return VERNON_STATUS_OK;
             },
-            [&](size_t invocationCount, std::unique_ptr<PullbackExecution> &pending) {
+            [&](size_t invocationCount, Signature runtimeSignature, RuntimeTensorShapes tensorShapes,
+                std::unique_ptr<PullbackExecution> &pending) {
                 std::vector<std::vector<uint8_t>> backwardArguments(
                     invocationCount, std::vector<uint8_t>(backwardLayout_.argumentsSize));
                 pending = std::make_unique<StructuredCpuPullbackExecution>(
-                    context_, backward_, backwardLayout_, signature_, computeGrid, std::move(backwardArguments),
-                    std::move(tapeSnapshots));
+                    context_, backward_, backwardLayout_, std::move(runtimeSignature), computeGrid,
+                    std::move(backwardArguments), std::move(tapeSnapshots), std::move(tensorShapes),
+                    resultGradientIndices_);
                 return VERNON_STATUS_OK;
             });
     }
@@ -814,108 +987,7 @@ private:
     std::shared_ptr<CpuKernelState> backward_;
     Signature signature_;
     std::shared_ptr<HostTapeMemoryPolicy> tapePolicy_;
-};
-
-class LegacyCpuPullbackExecution final : public PullbackExecution {
-public:
-    LegacyCpuPullbackExecution(VernonRuntimeContext &context, std::shared_ptr<CpuKernelState> backward,
-                               HostProfileLayout layout, Signature signature, VernonLaunchSize computeGrid,
-                               std::vector<std::vector<uint8_t>> arguments)
-        : context_(context), backward_(std::move(backward)), layout_(std::move(layout)),
-          signature_(std::move(signature)), computeGrid_(computeGrid), arguments_(std::move(arguments)) {}
-
-    VernonStatus apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients) override {
-        if (signature_.cotangents.size() != 1)
-            return fail(context_, "legacy CPU pullback requires one cotangent leaf");
-        ValueAbi cotangentAbi = signature_.cotangents.front();
-        if (!materializeCarrierValue(cotangentAbi, computeGrid_))
-            return fail(context_, "CPU pullback cotangent size overflows");
-        std::vector<uint8_t> cotangent;
-        if (!makeCotangentBytes(cotangents, cotangentAbi, cotangent, invocationDiagnostic(context_)))
-            return VERNON_STATUS_INVALID_ARGUMENT;
-        if (layout_.arguments.size() != 2 || layout_.arguments[1].leaves.size() != 1)
-            return fail(context_, "legacy CPU pullback has an invalid cotangent ABI");
-        const HostFrameLeaf &cotangentLeaf = layout_.arguments[1].leaves.front();
-        std::vector<VernonAdValue *> destinations;
-        std::vector<std::vector<uint8_t>> stagedGradients;
-        if (VernonStatus status =
-                prepareGradientDestinations(context_, signature_, gradients, destinations, stagedGradients);
-            status != VERNON_STATUS_OK)
-            return status;
-        for (size_t invocationIndex = 0; invocationIndex < arguments_.size(); ++invocationIndex) {
-            std::vector<uint8_t> &arguments = arguments_[invocationIndex];
-            std::memcpy(arguments.data() + cotangentLeaf.frameOffset,
-                        cotangent.data() + invocationIndex * signature_.cotangents.front().byteSize,
-                        signature_.cotangents.front().byteSize);
-            if (VernonStatus status =
-                    invokeBackwardAndAccumulate(context_, *backward_, layout_, signature_, arguments, stagedGradients);
-                status != VERNON_STATUS_OK)
-                return status;
-        }
-        commitGradientDestinations(destinations, stagedGradients);
-        return VERNON_STATUS_OK;
-    }
-
-private:
-    VernonRuntimeContext &context_;
-    std::shared_ptr<CpuKernelState> backward_;
-    HostProfileLayout layout_;
-    Signature signature_;
-    VernonLaunchSize computeGrid_{};
-    std::vector<std::vector<uint8_t>> arguments_;
-};
-
-class LegacyCpuExecutable final : public HostExecutable {
-public:
-    LegacyCpuExecutable(VernonRuntimeContext &context, HostProfileLayout forwardLayout,
-                        HostProfileLayout backwardLayout, std::shared_ptr<CpuKernelState> forward,
-                        std::shared_ptr<CpuKernelState> backward, Signature signature)
-        : context_(context), forwardLayout_(std::move(forwardLayout)), backwardLayout_(std::move(backwardLayout)),
-          forward_(std::move(forward)), backward_(std::move(backward)), signature_(std::move(signature)) {}
-
-    const Signature &signature() const override { return signature_; }
-
-    VernonStatus forward(VernonLaunchSize computeGrid, const VernonAdValueSet &inputs, VernonAdValueSet &outputs,
-                         std::unique_ptr<PullbackExecution> &pullback) override {
-        std::vector<std::vector<uint8_t>> backwardArguments;
-        return runCpuForward(
-            context_, forwardLayout_, signature_, computeGrid, inputs, outputs, pullback,
-            [&](size_t invocationIndex, std::vector<uint8_t> &arguments, std::vector<uint8_t> &results) {
-                for (const HostArgument &argument : forwardLayout_.arguments)
-                    if (!argument.builtin.empty() &&
-                        !writeGlobalInvocationId(argument, computeGrid, invocationIndex, arguments))
-                        return fail(context_, "native CPU autodiff has an unsupported builtin ABI");
-                const VernonCpuInvocation invocation{arguments.data(), arguments.size(), results.data(), results.size(),
-                                                     nullptr};
-                const VernonStatus status = forward_->entry(&invocation);
-                if (status != VERNON_STATUS_OK)
-                    return fail(context_, "autodiff forward profile invocation failed", status);
-                backwardArguments.emplace_back(backwardLayout_.argumentsSize);
-                for (size_t index = 0; index < signature_.tape.size(); ++index) {
-                    const HostFrameLeaf &source = forwardLayout_.results[index + 1];
-                    const HostFrameLeaf &destination = backwardLayout_.arguments[0].leaves[index];
-                    std::memcpy(backwardArguments.back().data() + destination.frameOffset,
-                                results.data() + source.frameOffset, source.value.byteSize);
-                }
-                return VERNON_STATUS_OK;
-            },
-            [&](size_t invocationCount, std::unique_ptr<PullbackExecution> &pending) {
-                if (backwardArguments.size() != invocationCount)
-                    return fail(context_, "legacy CPU autodiff captured an incomplete tape",
-                                VERNON_STATUS_INTERNAL_ERROR);
-                pending = std::make_unique<LegacyCpuPullbackExecution>(context_, backward_, backwardLayout_, signature_,
-                                                                       computeGrid, std::move(backwardArguments));
-                return VERNON_STATUS_OK;
-            });
-    }
-
-private:
-    VernonRuntimeContext &context_;
-    HostProfileLayout forwardLayout_;
-    HostProfileLayout backwardLayout_;
-    std::shared_ptr<CpuKernelState> forward_;
-    std::shared_ptr<CpuKernelState> backward_;
-    Signature signature_;
+    std::vector<size_t> resultGradientIndices_;
 };
 
 bool validateDifferentiationSignature(VernonRuntimeContext &context, const Signature &signature) {
@@ -971,12 +1043,8 @@ bool finishStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &f
     if (!parseProfile(forwardStage, forward, invocationDiagnostic(context)) ||
         !parseProfile(backwardStage, backward, invocationDiagnostic(context)))
         return false;
-    size_t backwardValueArguments = 0;
-    for (const HostArgument &argument : backward.arguments)
-        backwardValueArguments += argument.builtin.empty();
     if (!forward.results.empty() || !forward.tapeAllocatorOffset || forward.tapeRootRegionOffset ||
-        !backward.tapeAllocatorOffset || !backward.tapeRootRegionOffset || !backwardValueArguments ||
-        backward.results.size() != gradientPaths.size()) {
+        !backward.tapeAllocatorOffset || !backward.tapeRootRegionOffset) {
         invocationDiagnostic(context) = "structured CPU autodiff profile does not use the dynamic tape ABI";
         return false;
     }
@@ -994,14 +1062,17 @@ bool finishStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &f
     }
     std::vector<const HostArgument *> cotangentArguments;
     for (const HostArgument &argument : backward.arguments)
-        if (argument.builtin.empty())
+        if (argument.builtin.empty() && !isShapeSource(argument) &&
+            std::find(gradientPaths.begin(), gradientPaths.end(), argument.name) == gradientPaths.end())
             cotangentArguments.push_back(&argument);
     for (const HostArgument *argument : cotangentArguments) {
-        if (argument->name.empty() || argument->leaves.size() != 1) {
+        const size_t leafCount = argument->tensorView ? argument->tensorView->leaves.size() : argument->leaves.size();
+        if (argument->name.empty() || leafCount != 1) {
             invocationDiagnostic(context) = "structured CPU autodiff cotangent is not one canonical leaf";
             return false;
         }
-        ValueAbi cotangent = argument->leaves.front().value;
+        ValueAbi cotangent =
+            argument->tensorView ? argument->tensorView->leaves.front() : argument->leaves.front().value;
         cotangent.path = argument->name;
         signature.cotangents.push_back(std::move(cotangent));
     }
@@ -1014,10 +1085,35 @@ bool finishStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &f
         }
         signature.outputs.push_back(*input);
     }
-    for (size_t index = 0; index < gradientPaths.size(); ++index) {
-        ValueAbi gradient = backward.results[index].value;
-        gradient.path = gradientPaths[index];
+    std::vector<size_t> resultGradientIndices;
+    size_t resultIndex = 0;
+    for (const std::string &gradientPath : gradientPaths) {
+        const auto storageArgument =
+            std::find_if(backward.arguments.begin(), backward.arguments.end(), [&](const HostArgument &argument) {
+                return argument.builtin.empty() && argument.tensorView && argument.name == gradientPath;
+            });
+        ValueAbi gradient;
+        if (storageArgument != backward.arguments.end()) {
+            if (storageArgument->tensorView->leaves.size() != 1) {
+                invocationDiagnostic(context) =
+                    "structured CPU autodiff storage gradient is not one canonical reflected leaf";
+                return false;
+            }
+            gradient = storageArgument->tensorView->leaves.front();
+        } else {
+            if (resultIndex >= backward.results.size()) {
+                invocationDiagnostic(context) = "structured CPU autodiff has too few value gradient results";
+                return false;
+            }
+            gradient = backward.results[resultIndex++].value;
+            resultGradientIndices.push_back(signature.gradients.size());
+        }
+        gradient.path = gradientPath;
         signature.gradients.push_back(std::move(gradient));
+    }
+    if (resultIndex != backward.results.size()) {
+        invocationDiagnostic(context) = "structured CPU autodiff has unclaimed value gradient results";
+        return false;
     }
     if (!validateDifferentiationSignature(context, signature))
         return false;
@@ -1025,69 +1121,7 @@ bool finishStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &f
         context.cpuTapePolicy = std::make_shared<HostTapeMemoryPolicy>();
     executable = std::make_shared<StructuredCpuExecutable>(context, std::move(forward), std::move(backward),
                                                            std::move(forwardKernel), std::move(backwardKernel),
-                                                           std::move(signature));
-    return true;
-}
-
-bool finishLegacyCpuExecutable(VernonRuntimeContext &context, const Stage &forwardStage, const Stage &backwardStage,
-                               std::shared_ptr<CpuKernelState> forwardKernel,
-                               std::shared_ptr<CpuKernelState> backwardKernel,
-                               const std::vector<std::string> &gradientPaths, std::shared_ptr<Executable> &executable) {
-    HostProfileLayout forward;
-    HostProfileLayout backward;
-    if (!parseProfile(forwardStage, forward, invocationDiagnostic(context)) ||
-        !parseProfile(backwardStage, backward, invocationDiagnostic(context)))
-        return false;
-    if (forward.tapeAllocatorOffset || forward.tapeRootRegionOffset || backward.tapeAllocatorOffset ||
-        backward.tapeRootRegionOffset || forward.results.size() < 2 || backward.arguments.size() != 2 ||
-        backward.arguments[0].leaves.size() + 1 != forward.results.size() || backward.arguments[1].leaves.size() != 1 ||
-        backward.results.size() != gradientPaths.size()) {
-        invocationDiagnostic(context) = "legacy CPU autodiff profile does not match its explicit fixed protocol";
-        return false;
-    }
-    Signature signature;
-    for (const HostArgument &argument : forward.arguments) {
-        if (!argument.builtin.empty())
-            continue;
-        if (argument.tensorView)
-            signature.inputs.insert(signature.inputs.end(), argument.tensorView->leaves.begin(),
-                                    argument.tensorView->leaves.end());
-        else
-            for (const HostFrameLeaf &leaf : argument.leaves)
-                signature.inputs.push_back(leaf.value);
-    }
-    ValueAbi output = forward.results.front().value;
-    output.path = "output";
-    signature.outputs.push_back(std::move(output));
-    for (size_t index = 1; index < forward.results.size(); ++index) {
-        ValueAbi tape = forward.results[index].value;
-        tape.path = "tape." + std::to_string(index - 1);
-        signature.tape.push_back(std::move(tape));
-    }
-    ValueAbi cotangent = backward.arguments[1].leaves.front().value;
-    cotangent.path = "output";
-    signature.cotangents.push_back(std::move(cotangent));
-    if (!derivativeAbiMatches(signature.outputs.front(), signature.cotangents.front())) {
-        invocationDiagnostic(context) = "autodiff output and cotangent profile ABIs do not match";
-        return false;
-    }
-    for (size_t index = 0; index < signature.tape.size(); ++index) {
-        const ValueAbi &backwardTape = backward.arguments[0].leaves[index].value;
-        if (!sameValueAbi(signature.tape[index], backwardTape)) {
-            invocationDiagnostic(context) = "legacy CPU autodiff tape leaves do not match backward reflection";
-            return false;
-        }
-    }
-    for (size_t index = 0; index < gradientPaths.size(); ++index) {
-        ValueAbi gradient = backward.results[index].value;
-        gradient.path = gradientPaths[index];
-        signature.gradients.push_back(std::move(gradient));
-    }
-    if (!validateDifferentiationSignature(context, signature))
-        return false;
-    executable = std::make_shared<LegacyCpuExecutable>(context, std::move(forward), std::move(backward),
-                                                       std::move(forwardKernel), std::move(backwardKernel),
-                                                       std::move(signature));
+                                                           std::move(signature), std::move(resultGradientIndices));
     return true;
 }
 
@@ -1106,22 +1140,6 @@ bool loadStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &for
         return false;
     return finishStructuredCpuExecutable(context, forwardStage, backwardStage, std::move(forwardKernel),
                                          std::move(backwardKernel), gradientPaths, executable);
-}
-
-bool loadLegacyCpuExecutable(VernonRuntimeContext &context, const Stage &forwardStage, const Stage &backwardStage,
-                             const std::vector<std::string> &gradientPaths, std::shared_ptr<Executable> &executable) {
-    if (!forwardStage.cpuArtifact || !backwardStage.cpuArtifact) {
-        invocationDiagnostic(context) = "CPU autodiff profiles have no loadable artifacts";
-        return false;
-    }
-    auto forwardKernel = std::make_shared<CpuKernelState>();
-    auto backwardKernel = std::make_shared<CpuKernelState>();
-    ReflectedEntry reflection;
-    if (!loadCpuNativeArtifact(*forwardStage.cpuArtifact, *forwardKernel, reflection, invocationDiagnostic(context)) ||
-        !loadCpuNativeArtifact(*backwardStage.cpuArtifact, *backwardKernel, reflection, invocationDiagnostic(context)))
-        return false;
-    return finishLegacyCpuExecutable(context, forwardStage, backwardStage, std::move(forwardKernel),
-                                     std::move(backwardKernel), gradientPaths, executable);
 }
 
 bool loadStructuredCpuEntryExecutable(VernonRuntimeContext &context, const Stage &forwardStage,
@@ -1147,11 +1165,6 @@ bool loadStructuredCpuEntryExecutable(VernonRuntimeContext &context, const Stage
 bool createCpuExecutable(VernonRuntimeContext &context, const Stage &forwardStage, const Stage &backwardStage,
                          const std::vector<std::string> &gradientPaths, std::shared_ptr<Executable> &executable) {
     return loadStructuredCpuExecutable(context, forwardStage, backwardStage, gradientPaths, executable);
-}
-
-bool createLegacyCpuExecutable(VernonRuntimeContext &context, const Stage &forwardStage, const Stage &backwardStage,
-                               const std::vector<std::string> &gradientPaths, std::shared_ptr<Executable> &executable) {
-    return loadLegacyCpuExecutable(context, forwardStage, backwardStage, gradientPaths, executable);
 }
 
 bool createCpuEntryExecutable(VernonRuntimeContext &context, VernonCpuEntryPoint forwardEntry,

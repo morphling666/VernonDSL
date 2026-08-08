@@ -174,9 +174,7 @@ def emit_native_autodiff_modules(
     """Validate and dispatch native VJP lowering to the selected emitter."""
 
     _validate(program.semantic, target)
-    if target == "cpu":
-        from .autodiff_native_cpu import emit_backward, emit_forward
-    elif target in _GPU_TARGETS:
+    if target in _GPU_TARGETS:
         from .autodiff_native_gpu import emit_backward, emit_forward
     else:
         raise AutodiffNativeLoweringError(f"native autodiff lowering does not support target '{target}'")

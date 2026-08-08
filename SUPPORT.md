@@ -2,7 +2,7 @@
 
 ## Supported installations
 
-VernonDSL 0.1.1 provides wheels for:
+VernonDSL 0.1.2 provides wheels for:
 
 - Windows x64;
 - Linux x64 with the wheel's declared manylinux baseline;
@@ -16,7 +16,7 @@ not claim compatibility with an older baseline than that tag.
 Python 3.11 and 3.12 installations require NumPy 1.26 or newer but below 2.0.
 Python 3.13 and 3.14 installations require NumPy 2.1 or newer but below 3.0.
 Intel macOS, 32-bit platforms, source distributions, PyPy, and unsupported
-Python versions are outside the published 0.1.1 wheel matrix.
+Python versions are outside the published 0.1.2 wheel matrix.
 
 ## Runtime backends
 

@@ -303,7 +303,8 @@ def Vernon_AdReadLeafOp : Vernon_Op<"ad.read_leaf", [Pure]> {
 }
 
 def Vernon_AdAdjointBufferCreateOp : Vernon_Op<"ad.adjoint_buffer.create"> {
-  let summary = "Create zeroed invocation-local Storage adjoint state";
+  let summary = "Create zeroed invocation-local Storage adjoint state from a shape source";
+  let arguments = (ins Vernon_TensorViewType:$shape_source);
   let results = (outs Vernon_AdAdjointBufferType:$buffer);
 }
 
@@ -327,10 +328,10 @@ def Vernon_AdAdjointTakeAndClearOp : Vernon_Op<"ad.adjoint_buffer.take_and_clear
   let hasVerifier = 1;
 }
 
-def Vernon_AdAdjointFreezeOp : Vernon_Op<"ad.adjoint_buffer.freeze"> {
-  let summary = "Materialize one local Storage adjoint at the profile ABI boundary";
-  let arguments = (ins Vernon_AdAdjointBufferType:$buffer);
-  let results = (outs AnyType:$value);
+def Vernon_AdAdjointStoreOp : Vernon_Op<"ad.adjoint_buffer.store"> {
+  let summary = "Store one local Storage adjoint through a writable TensorView ABI argument";
+  let arguments = (ins Vernon_AdAdjointBufferType:$buffer,
+      Vernon_TensorViewType:$destination);
   let hasVerifier = 1;
 }
 

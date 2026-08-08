@@ -52,6 +52,34 @@ class _StructuredPullback:
     bindings: dict[str, Any]
     carrier_shape: tuple[int, ...]
 
+    def _single_storage_cotangent(self, group: DerivativeGroup, value: TensorStorage) -> Any:
+        primal = self.bindings[group.parameter_root]
+        if not isinstance(primal, (TensorStorage, TensorView)):
+            raise TypeError(f"output cotangent '{group.declared_path}' is not Storage-backed")
+        if not isinstance(value.element_layout, TangentLayout):
+            raise TypeError(f"output cotangent '{group.declared_path}' requires packed tangent TensorStorage")
+        expected_shape = (*self.carrier_shape, *primal.shape)
+        primal_dtype = TensorStorage._dtype(value.element_layout.primal_element_type)
+        if primal_dtype != primal.dtype or value.shape != expected_shape:
+            raise ValueError(
+                f"output cotangent '{group.declared_path}' has an incompatible tangent dtype or owner shape"
+            )
+        if not isinstance(primal, TensorView):
+            return value.to_numpy()
+        projection = value._tangent_view(
+            "",
+            shape=expected_shape,
+            strides=(
+                *tuple(
+                    stride // value.element_layout.size for stride in value._array.strides[: len(self.carrier_shape)]
+                ),
+                *primal._strides,
+            ),
+            offset=primal._offset,
+            access="read",
+        )
+        return projection.to_numpy()
+
     def _packed_cotangent(self, group: DerivativeGroup, value: Any) -> dict[str, Any]:
         primal = self.bindings[group.parameter_root]
         owner = primal.owner if isinstance(primal, TensorView) else primal
@@ -104,8 +132,15 @@ class _StructuredPullback:
             leaves: dict[str, Any] = {}
             for group in self.cotangent_groups:
                 value = supplied[group.declared_path]
-                if len(group.leaf_paths) == 1 and not isinstance(value, TensorStorage):
-                    leaves[group.leaf_paths[0]] = value
+                primal = self.bindings[group.parameter_root]
+                owner = primal.owner if isinstance(primal, TensorView) else primal
+                aggregate_storage = isinstance(owner, TensorStorage) and owner._element_type is not None
+                if isinstance(value, TensorStorage) and aggregate_storage:
+                    leaves.update(self._packed_cotangent(group, value))
+                elif len(group.leaf_paths) == 1:
+                    leaves[group.leaf_paths[0]] = (
+                        self._single_storage_cotangent(group, value) if isinstance(value, TensorStorage) else value
+                    )
                 else:
                     leaves.update(self._packed_cotangent(group, value))
             native_cotangent = next(iter(leaves.values())) if len(leaves) == 1 else leaves
@@ -271,7 +306,6 @@ def execute_direct_vjp(
         (),
         options.target,
         tuple(sorted(options.options.items())),
-        specialize_tensor_views=True,
     )
     direct = _direct_state(kernel, expression)
     compiled = direct.compiled.get(key)
@@ -279,41 +313,28 @@ def execute_direct_vjp(
         del direct.compiled[key]
         compiled = None
     if compiled is None:
-        frontend, function, builtins, _ = kernel._lower(arguments, specialize_tensor_views=True)
+        frontend, function, builtins, _ = kernel._lower(arguments)
         structured = build_structured_vjp(
             runtime_state._native,
             frontend,
             expression.transform,
         )
         profiles = {profile.name: profile for profile in structured.plan.profiles}
-        compiler = runtime_state._native.Compiler()
-
-        def compile_profile(mlir: str) -> Any:
-            program = compiler.compile_program_result(
-                mlir,
-                runtime_state._native.Target.CPU,
-                **options.native_options,
-            )
+        programs = runtime_state._native._compile_cpu_program_results(
+            [
+                frontend.mlir,
+                structured.profiles["forward_with_tape"],
+                structured.profiles["backward"],
+            ],
+            options.native_options["options"],
+        )
+        if len(programs) != 3:
+            raise RuntimeError("CPU VJP profile compilation returned an invalid result count")
+        for program in programs:
             if not program.ok:
                 raise RuntimeError(program.diagnostics)
-            return program
-
-        primal = compile_profile(frontend.mlir)
-        forward = compile_profile(structured.profiles["forward_with_tape"])
-        backward = compile_profile(structured.profiles["backward"])
+        primal, forward, backward = programs
         derivative_groups = structured.plan.derivative_groups
-        grouped_gradient_paths = {
-            path for group in derivative_groups if group.role == "gradient" for path in group.leaf_paths
-        }
-        grouped_cotangent_paths = {
-            path for group in derivative_groups if group.role == "cotangent" for path in group.leaf_paths
-        }
-        reflected_gradient_paths = {binding.path for binding in profiles["backward"].outputs}
-        reflected_cotangent_paths = {
-            binding.path for binding in profiles["backward"].inputs if binding.role == "cotangent"
-        }
-        if grouped_gradient_paths != reflected_gradient_paths or grouped_cotangent_paths != reflected_cotangent_paths:
-            raise RuntimeError("typed derivative groups do not match the backward profile leaves")
         compiled = _CompiledDirectVjp(
             primal=primal,
             forward=forward,

@@ -2,9 +2,9 @@
 
 ## Status
 
-This document is a post-0.1.1 design and implementation plan. None of the Host
+This document is a post-0.1.2 design and implementation plan. None of the Host
 language, C++ extern, desktop Host AOT, or browser WebAssembly interfaces
-described here are part of the 0.1.1 public contract.
+described here are part of the 0.1.2 public contract.
 
 The first acceptance target is one gameplay example whose source:
 

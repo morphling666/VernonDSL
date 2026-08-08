@@ -70,8 +70,8 @@ LogicalResult AdAdjointBufferType::verify(function_ref<InFlightDiagnostic()> emi
                                           ArrayRef<int64_t> shape, unsigned indexRank) {
     if (!isa<FloatType>(elementType))
         return emitError() << "adjoint buffer requires a floating scalar element type";
-    if (shape.empty() || llvm::any_of(shape, [](int64_t extent) { return extent <= 0; }))
-        return emitError() << "adjoint buffer requires a positive static flattened shape";
+    if (shape.empty() || llvm::any_of(shape, [](int64_t extent) { return extent == 0 || extent < -1; }))
+        return emitError() << "adjoint buffer dimensions must be positive or -1 for dynamic";
     if (indexRank == 0 || indexRank > shape.size())
         return emitError() << "adjoint buffer index rank must select a non-empty shape prefix";
     return success();

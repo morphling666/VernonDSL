@@ -5,6 +5,7 @@ import atexit
 import hashlib
 import importlib
 import inspect
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Protocol
@@ -15,6 +16,7 @@ from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
 from ..bundle import canonical_json, make_target_options
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
 from ..frontend.model import AccessMode, ConcreteType, StorageEffect, StorageEffectKind
+from ..host_values import pack_host_value
 from ..types import TypeExpr, _Scalar
 from .execution_graph import (
     ComputeEncoder,
@@ -119,9 +121,9 @@ class Kernel:
             return False
 
     @staticmethod
-    def _argument_signature(value: Any, *, include_tensor_shape: bool) -> tuple[Any, ...]:
+    def _argument_signature(value: Any) -> tuple[Any, ...]:
         if isinstance(value, (TensorStorage, TensorView)):
-            return ("tensor", tuple(value.shape)) if include_tensor_shape else ("tensor",)
+            return ("tensor",)
         return ("value", type(value).__module__, type(value).__qualname__)
 
     def _dispatch_key(
@@ -130,8 +132,6 @@ class Kernel:
         features: tuple[str, ...],
         target: str,
         target_options: tuple[tuple[str, Any], ...],
-        *,
-        specialize_tensor_views: bool = False,
     ) -> tuple[Any, ...]:
         source_digest = hashlib.sha256(self._file.read_bytes()).hexdigest()
         constants = tuple(
@@ -149,7 +149,7 @@ class Kernel:
             target,
             target_options,
             features,
-            tuple(self._argument_signature(value, include_tensor_shape=specialize_tensor_views) for value in arguments),
+            tuple(self._argument_signature(value) for value in arguments),
             constants,
         )
 
@@ -279,6 +279,7 @@ class Kernel:
             "write": {"write", "read_write"},
             "read_write": {"read_write"},
         }
+        annotations = inspect.get_annotations(self._function, eval_str=True)
 
         def dsl_signature(value_type: Any) -> Any:
             if value_type.kind == "scalar":
@@ -337,11 +338,17 @@ class Kernel:
                     continue
                 if isinstance(value, (TensorStorage, TensorView)):
                     raise TypeError(f"kernel argument {name!r} is runtime storage but its annotation is not TensorView")
-                if parameter.type.kind == "struct" and runtime_signature(type(value)) != dsl_signature(parameter.type):
-                    raise TypeError(
-                        f"kernel Struct argument {name!r} has type {type(value).__name__}, "
-                        f"expected {parameter.type.name}"
-                    )
+                if parameter.type.kind == "struct":
+                    annotation = annotations.get(name)
+                    if isinstance(value, Mapping):
+                        if runtime_signature(annotation) != dsl_signature(parameter.type):
+                            raise RuntimeError(f"kernel Struct argument {name!r} has an inconsistent host annotation")
+                        pack_host_value(annotation, value, name)
+                    elif runtime_signature(type(value)) != dsl_signature(parameter.type):
+                        raise TypeError(
+                            f"kernel Struct argument {name!r} has type {type(value).__name__}, "
+                            f"expected {parameter.type.name}"
+                        )
                 continue
             if not isinstance(value, TensorView):
                 raise TypeError(f"kernel argument {name!r} must be a TensorView")
@@ -378,8 +385,6 @@ class Kernel:
         self,
         arguments: tuple[Any, ...],
         features: tuple[str, ...] = (),
-        *,
-        specialize_tensor_views: bool = False,
     ) -> tuple[
         FrontendCompileResult,
         ast.FunctionDef,
@@ -396,12 +401,6 @@ class Kernel:
             raise RuntimeError("kernel functions must be top-level definitions in files")
         builtins = self._builtin_parameters(function)
         user_parameters, normalized_arguments = self._normalize_arguments(function, builtins, arguments)
-        specialized_tensor_parameters = {
-            argument.arg
-            for argument in function.args.args
-            if self._is_static_tensor_annotation(argument.annotation)
-            or (specialize_tensor_views and self._tensor_view_access(argument.annotation) is not None)
-        }
         tensors = {
             name: value
             for name, value in zip(user_parameters, normalized_arguments, strict=True)
@@ -419,11 +418,7 @@ class Kernel:
             self._file,
             self._entry,
             features,
-            tuple(
-                (name, value.dtype.str, value.shape)
-                for name, value in tensors.items()
-                if name in specialized_tensor_parameters
-            ),
+            (),
             constants,
             self._workgroup_size,
         )
@@ -591,12 +586,14 @@ class Kernel:
                 for argument in compiled.function.args.args
                 if self._is_static_tensor_annotation(argument.annotation)
             }
+            annotations = inspect.get_annotations(self._function, eval_str=True)
             for user_name, parameter, value in zip(user_parameters, compiled.native.parameters, arguments, strict=True):
                 _bind_native_argument(
                     builder,
                     parameter,
                     value,
                     host_value=state._architecture == state.cuda and user_name in static_tensor_names,
+                    annotation=annotations.get(user_name),
                 )
             builder.grid(*grid)
             if encoder is None:

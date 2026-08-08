@@ -1,7 +1,7 @@
 # Autodiff design
 
 > **Status:** accepted contract and implemented compute VJP surface. Compiler
-> contract 10 and pipeline contract 14 provide deterministic
+> contract 11 and pipeline contract 15 provide deterministic
 > `primal`/`forward_with_tape`/`backward` profiles, typed derivative groups,
 > checked dynamic tape, explicit accumulation plans, and invocation-time
 > `(x,y,z)` grids with physical `(z,y,x)` carriers. CPU `dynamic_v2` supports
@@ -18,8 +18,9 @@
 > ExecutionGraph composition remains C++ and GPU-only. Graphics backward
 > lowering, custom compute VJPs, higher-order AD, persistent `.grad`, and
 > multi-kernel temporal differentiation remain future work. The current
-> compatibility boundary retains `legacy_fixed` cooked assets until a release
-> intentionally advances the contracts.
+> compatibility boundary retains `legacy_fixed` only for cooked GPU/graphics
+> assets. Compiler contract 11 and pipeline contract 15 require `dynamic_v2`
+> for every direct or cooked CPU VJP.
 
 This document defines Vernon's first public automatic-differentiation model.
 The design uses reverse-mode vector-Jacobian products (VJPs), preserves the
@@ -99,7 +100,9 @@ Values derive gradient structure recursively from floating leaves.
 - A floating Scalar gradient is an ordinary Scalar Value.
 - An immutable Tensor gradient is an ordinary Tensor Value with the same
   logical shape.
-- A TensorView or mutable Storage gradient is a newly owned Storage result.
+- A TensorView or mutable Storage gradient is newly owned Storage at the public
+  pullback boundary. In the compiler ABI it is a writable TensorView argument
+  of the backward profile, not a fixed-shape SSA result.
 - Vector, Matrix, Tensor, Tuple, and Struct Storage elements derive one
   structural tangent schema recursively. Their public gradient is one packed
   tangent `TensorStorage`, not one owner per ABI leaf.
@@ -119,6 +122,13 @@ Gradient Storage is separate from primal Storage and never changes primal
 type, identity, ownership, or layout. The first API does not expose
 `accumulate_into` or persistent `.grad` state. Explicit reusable accumulation
 buffers are a later, independent Runtime feature.
+
+Dynamic Storage extents remain dynamic through differentiation. Backward
+profiles receive descriptor-backed shape-source TensorViews for primal Storage
+identities, descriptor-backed cotangent TensorViews, and writable gradient
+TensorViews. Invocation-local adjoint buffers use those runtime extents;
+compiler analysis and reflection must not specialize `dyn` dimensions. This
+does not change the tape allocator ABI.
 
 The tangent layout is independent from the primal layout. Dtype promotion may
 change element size, alignment, product offsets, and element stride.
@@ -376,13 +386,14 @@ autodiff transform.
 
 ## 11. Versioning and acceptance
 
-Compiler contract 10 and pipeline contract 14 are the current VJP boundary.
+Compiler contract 11 and pipeline contract 15 are the current VJP boundary.
 Differentiated assets use the canonical pipeline manifest with one optional
-root `autodiff` object; pipeline-13 transform/profile fields are not aliases in
+root `autodiff` object; pipeline-14 transform/profile fields are not aliases in
 the current schema. No
 older manifest is reinterpreted as containing current structured profiles.
-`legacy_fixed` remains an explicit protocol, never an implicit fallback from
-`dynamic_v2`.
+`legacy_fixed` remains an explicit GPU/graphics protocol, never an implicit
+fallback from `dynamic_v2`. CPU cooking and loading reject it; CPU VJP has one
+structured `dynamic_v2` compiler/runtime path.
 
 CPU acceptance covers direct and cooked structured Storage VJP, recursive
 aggregate tangents, multiple outputs, owner aliases, signed-stride descriptors,
