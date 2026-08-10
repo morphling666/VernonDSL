@@ -9,8 +9,8 @@
 namespace vernon::runtime::ad {
 namespace {
 
-using TapeRegistryEntry = std::pair<VernonAdTapeAllocator *, HostDynamicTape *>;
-thread_local std::vector<TapeRegistryEntry> tapeRegistry;
+std::mutex tapeRegistryMutex;
+std::unordered_map<VernonAdTapeAllocator *, HostDynamicTape *> tapeRegistry;
 
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION
 thread_local HostTapeTraversalMetrics *activeTraversalMetrics;
@@ -332,8 +332,8 @@ void HostTapeSnapshot::initializeDescriptor() {
 
 HostDynamicTape::HostDynamicTape(size_t capacityBytes, std::shared_ptr<HostTapeMemoryPolicy> policy,
                                  std::shared_ptr<HostTapeDispatchBudget> dispatchBudget)
-    : policy_(dispatchBudget ? dispatchBudget->policy_ : std::move(policy)), dispatchBudget_(std::move(dispatchBudget)),
-      ownerThread_(std::this_thread::get_id()) {
+    : policy_(dispatchBudget ? dispatchBudget->policy_ : std::move(policy)),
+      dispatchBudget_(std::move(dispatchBudget)) {
     descriptor_.struct_size = sizeof(descriptor_);
     descriptor_.abi_version = VERNON_AD_TAPE_ALLOCATOR_ABI_VERSION;
     descriptor_.user_data = this;
@@ -349,16 +349,16 @@ HostDynamicTape::HostDynamicTape(size_t capacityBytes, std::shared_ptr<HostTapeM
     descriptor_.read_child = readChild;
     descriptor_.read_executed_count = readCount;
     descriptor_.read_exit_kind = readExit;
-    tapeRegistry.emplace_back(&descriptor_, this);
+    {
+        std::lock_guard lock(tapeRegistryMutex);
+        tapeRegistry.emplace(&descriptor_, this);
+    }
     reset(&descriptor_);
 }
 
 HostDynamicTape::~HostDynamicTape() {
-    const auto entry =
-        std::find_if(tapeRegistry.begin(), tapeRegistry.end(),
-                     [this](const TapeRegistryEntry &candidate) { return candidate.first == &descriptor_; });
-    if (entry != tapeRegistry.end())
-        tapeRegistry.erase(entry);
+    std::lock_guard lock(tapeRegistryMutex);
+    tapeRegistry.erase(&descriptor_);
     releaseCharge();
 }
 
@@ -370,16 +370,14 @@ HostDynamicTape *HostDynamicTape::owner(VernonAdTapeAllocator *allocator) {
         allocator->status = VERNON_AD_TAPE_ALLOCATOR_INVALID_ABI;
         return nullptr;
     }
-    const auto found = std::find_if(tapeRegistry.begin(), tapeRegistry.end(),
-                                    [allocator](const TapeRegistryEntry &entry) { return entry.first == allocator; });
+    std::lock_guard lock(tapeRegistryMutex);
+    const auto found = tapeRegistry.find(allocator);
     if (found == tapeRegistry.end()) {
         allocator->status = VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE;
         return nullptr;
     }
     return found->second;
 }
-
-bool HostDynamicTape::callable() const { return ownerThread_ == std::this_thread::get_id(); }
 
 VernonAdTapeAllocatorStatus HostDynamicTape::fail(VernonAdTapeAllocatorStatus status) {
     if (descriptor_.status == VERNON_AD_TAPE_ALLOCATOR_OK ||
@@ -420,8 +418,7 @@ VernonAdTapeAllocatorStatus HostDynamicTape::reset(VernonAdTapeAllocator *alloca
     HostDynamicTape *self = owner(allocator);
     if (!self)
         return allocator ? allocator->status : VERNON_AD_TAPE_ALLOCATOR_INVALID_ABI;
-    if (!self->callable())
-        return self->fail(VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE);
+    std::lock_guard lock(self->mutex_);
     self->releaseCharge();
     self->payload_.clear();
     self->regions_.clear();
@@ -442,8 +439,7 @@ VernonAdTapeAllocatorStatus HostDynamicTape::beginRegion(VernonAdTapeAllocator *
     HostDynamicTape *self = owner(allocator);
     if (!self)
         return allocator ? allocator->status : VERNON_AD_TAPE_ALLOCATOR_INVALID_ABI;
-    if (!self->callable())
-        return self->fail(VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE);
+    std::lock_guard lock(self->mutex_);
     if (allocator->status != VERNON_AD_TAPE_ALLOCATOR_OK)
         return allocator->status;
     if (!region || self->sealed_)
@@ -476,8 +472,7 @@ VernonAdTapeAllocatorStatus HostDynamicTape::reserveRecord(VernonAdTapeAllocator
     HostDynamicTape *self = owner(allocator);
     if (!self)
         return allocator ? allocator->status : VERNON_AD_TAPE_ALLOCATOR_INVALID_ABI;
-    if (!self->callable())
-        return self->fail(VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE);
+    std::lock_guard lock(self->mutex_);
     if (allocator->status != VERNON_AD_TAPE_ALLOCATOR_OK &&
         allocator->status != VERNON_AD_TAPE_ALLOCATOR_CAPACITY_EXHAUSTED)
         return allocator->status;
@@ -538,8 +533,7 @@ VernonAdTapeAllocatorStatus HostDynamicTape::writeLeaf(VernonAdTapeAllocator *al
     HostDynamicTape *self = owner(allocator);
     if (!self)
         return allocator ? allocator->status : VERNON_AD_TAPE_ALLOCATOR_INVALID_ABI;
-    if (!self->callable())
-        return self->fail(VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE);
+    std::lock_guard lock(self->mutex_);
     if (allocator->status != VERNON_AD_TAPE_ALLOCATOR_OK)
         return allocator->status;
     if (self->sealed_ || (byteSize && !data))
@@ -560,8 +554,7 @@ VernonAdTapeAllocatorStatus HostDynamicTape::setChild(VernonAdTapeAllocator *all
     HostDynamicTape *self = owner(allocator);
     if (!self)
         return allocator ? allocator->status : VERNON_AD_TAPE_ALLOCATOR_INVALID_ABI;
-    if (!self->callable())
-        return self->fail(VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE);
+    std::lock_guard lock(self->mutex_);
     if (allocator->status != VERNON_AD_TAPE_ALLOCATOR_OK)
         return allocator->status;
     if (self->sealed_)
@@ -582,8 +575,7 @@ VernonAdTapeAllocatorStatus HostDynamicTape::endRegion(VernonAdTapeAllocator *al
     HostDynamicTape *self = owner(allocator);
     if (!self)
         return allocator ? allocator->status : VERNON_AD_TAPE_ALLOCATOR_INVALID_ABI;
-    if (!self->callable())
-        return self->fail(VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE);
+    std::lock_guard lock(self->mutex_);
     if (allocator->status != VERNON_AD_TAPE_ALLOCATOR_OK)
         return allocator->status;
     if (self->sealed_ || self->openRegions_.empty())
@@ -603,8 +595,7 @@ VernonAdTapeAllocatorStatus HostDynamicTape::seal(VernonAdTapeAllocator *allocat
     HostDynamicTape *self = owner(allocator);
     if (!self)
         return allocator ? allocator->status : VERNON_AD_TAPE_ALLOCATOR_INVALID_ABI;
-    if (!self->callable())
-        return self->fail(VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE);
+    std::lock_guard lock(self->mutex_);
     if (allocator->status != VERNON_AD_TAPE_ALLOCATOR_OK)
         return allocator->status;
     if (self->sealed_ || !self->openRegions_.empty() || self->regions_.empty())
@@ -626,7 +617,8 @@ VernonAdTapeAllocatorStatus HostDynamicTape::readLeaf(VernonAdTapeAllocator *all
     HostDynamicTape *self = owner(allocator);
     if (!self)
         return allocator ? allocator->status : VERNON_AD_TAPE_ALLOCATOR_INVALID_ABI;
-    if (!self->callable() || allocator->status != VERNON_AD_TAPE_ALLOCATOR_OK || !self->sealed_ || (byteSize && !data))
+    std::lock_guard lock(self->mutex_);
+    if (allocator->status != VERNON_AD_TAPE_ALLOCATOR_OK || !self->sealed_ || (byteSize && !data))
         return self->fail(VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE);
     Region *region = self->findRegion(regionHandle);
     if (!region || recordIndex >= region->records.size() || region->records[recordIndex] >= self->records_.size())
@@ -648,7 +640,8 @@ VernonAdTapeAllocatorStatus HostDynamicTape::readChild(VernonAdTapeAllocator *al
     HostDynamicTape *self = owner(allocator);
     if (!self)
         return allocator ? allocator->status : VERNON_AD_TAPE_ALLOCATOR_INVALID_ABI;
-    if (!self->callable() || allocator->status != VERNON_AD_TAPE_ALLOCATOR_OK || !self->sealed_ || !child)
+    std::lock_guard lock(self->mutex_);
+    if (allocator->status != VERNON_AD_TAPE_ALLOCATOR_OK || !self->sealed_ || !child)
         return self->fail(VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE);
     Region *region = self->findRegion(regionHandle);
     if (!region || recordIndex >= region->records.size() || region->records[recordIndex] >= self->records_.size())
@@ -667,7 +660,8 @@ VernonAdTapeAllocatorStatus HostDynamicTape::readCount(VernonAdTapeAllocator *al
     HostDynamicTape *self = owner(allocator);
     if (!self)
         return allocator ? allocator->status : VERNON_AD_TAPE_ALLOCATOR_INVALID_ABI;
-    if (!self->callable() || allocator->status != VERNON_AD_TAPE_ALLOCATOR_OK || !self->sealed_ || !count)
+    std::lock_guard lock(self->mutex_);
+    if (allocator->status != VERNON_AD_TAPE_ALLOCATOR_OK || !self->sealed_ || !count)
         return self->fail(VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE);
     Region *region = self->findRegion(regionHandle);
     if (!region)
@@ -683,7 +677,8 @@ VernonAdTapeAllocatorStatus HostDynamicTape::readExit(VernonAdTapeAllocator *all
     HostDynamicTape *self = owner(allocator);
     if (!self)
         return allocator ? allocator->status : VERNON_AD_TAPE_ALLOCATOR_INVALID_ABI;
-    if (!self->callable() || allocator->status != VERNON_AD_TAPE_ALLOCATOR_OK || !self->sealed_ || !exitKind)
+    std::lock_guard lock(self->mutex_);
+    if (allocator->status != VERNON_AD_TAPE_ALLOCATOR_OK || !self->sealed_ || !exitKind)
         return self->fail(VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE);
     Region *region = self->findRegion(regionHandle);
     if (!region)
@@ -693,7 +688,8 @@ VernonAdTapeAllocatorStatus HostDynamicTape::readExit(VernonAdTapeAllocator *all
 }
 
 std::shared_ptr<const HostTapeSnapshot> HostDynamicTape::takeSnapshot() {
-    if (!callable() || !sealed_ || descriptor_.status != VERNON_AD_TAPE_ALLOCATOR_OK)
+    std::lock_guard lock(mutex_);
+    if (!sealed_ || descriptor_.status != VERNON_AD_TAPE_ALLOCATOR_OK)
         return {};
     try {
         auto snapshot = std::make_shared<HostTapeSnapshot>();

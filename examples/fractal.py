@@ -80,14 +80,7 @@ def main() -> None:
     parser.add_argument("--fps", type=int, default=defaults.fps)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--animation-output", type=Path)
-    parser.add_argument("--emit-metal", type=Path)
     arguments = parser.parse_args()
-    if arguments.emit_metal is not None:
-        pixels = vd.storage.zeros(dtype=vd.f32, shape=(HEIGHT, WIDTH))
-        source, _ = paint.compile_artifact(pixels, arguments.time, target="metal")
-        arguments.emit_metal.write_bytes(source)
-        print(f"Wrote {arguments.emit_metal}")
-        return
 
     try:
         import cv2  # pyright: ignore[reportMissingImports]

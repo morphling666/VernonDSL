@@ -28,6 +28,7 @@ struct CpuAbiArgumentPacking {
     uint64_t size;
     CpuAbiArgumentKind kind;
     uint32_t tensorRank;
+    std::string builtin;
     std::vector<uint64_t> tensorLeafElementSizes;
     std::vector<CpuCallLanePacking> callLanes;
 };
@@ -39,6 +40,7 @@ struct CpuAbiWrapperMetadata {
     uint64_t resultsSize;
     std::vector<CpuCallLanePacking> resultCallLanes;
     bool requiresTextureCallbacks;
+    bool requiresPhases;
     std::string exportedWrapperSymbol;
 };
 

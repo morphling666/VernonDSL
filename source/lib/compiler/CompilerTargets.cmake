@@ -26,6 +26,7 @@ llvm_map_components_to_libnames(
     AsmParser
     Core
     OrcJIT
+    Passes
     Target
     TargetParser
     native)

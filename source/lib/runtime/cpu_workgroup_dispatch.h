@@ -1,8 +1,8 @@
 #ifndef VERNON_RUNTIME_CPU_WORKGROUP_DISPATCH_H
 #define VERNON_RUNTIME_CPU_WORKGROUP_DISPATCH_H
 
+#include "VernonCommon.h"
 #include "VernonCpuWorkgroupABI.h"
-#include "VernonRuntime.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -19,7 +19,9 @@ struct CpuLaneCoordinates {
     size_t linearIndex{};
 };
 
-using CpuLaneCallback = std::function<VernonStatus(const CpuLaneCoordinates &)>;
+CpuLaneCoordinates cpuRangeCoordinates(const VernonCpuRangeV1 &range, size_t localLinear) noexcept;
+
+using CpuRangeCallback = std::function<VernonStatus(VernonCpuRangeV1 &)>;
 
 struct CpuWorkgroupSchedulerConfig {
     size_t threadBudget{};
@@ -37,10 +39,8 @@ public:
     CpuWorkgroupScheduler &operator=(const CpuWorkgroupScheduler &) = delete;
 
     VernonStatus dispatch(const uint32_t grid[3], const uint32_t workgroup[3],
-                          const CpuLaneCallback &callback) noexcept;
+                          const CpuRangeCallback &callback) noexcept;
     const std::string &lastDiagnostic() const noexcept;
-    size_t workerCount() const noexcept;
-    size_t maxWorkgroupVolume() const noexcept;
 
 private:
     class Impl;

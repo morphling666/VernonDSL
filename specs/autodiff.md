@@ -273,6 +273,49 @@ multiple cotangents; each call returns fresh gradients and does not consume or
 mutate the tape. Destroying the pullback releases the tape. The synchronous
 Runtime contract does not promise concurrent calls on one pullback.
 
+### CPU range-phase execution
+
+CPU primal, `forward_with_tape`, and `backward` profiles all use the ordinary
+range-phase scheduler described by
+[`runtime/design.md`](runtime/design.md#cpu-range-phase-execution). There is no
+AD scalar-entry adapter, worker-local lane identity, fixed-tape execution
+branch, protocol guessing, or serial fallback.
+
+For each scheduler range, Runtime lazily prepares the active lanes' packed
+argument/result frames and supplies flattened-global pointer tables to the
+compiled range entry. The generated wrapper invokes the lowered program for
+every lane in the contiguous interval without a Runtime callback per lane.
+Frames persist while a lane is yielded and are released immediately after
+final completion; pointer-table bounds are explicit in `VernonCpuRangeV1`.
+
+Each logical forward invocation owns one `HostDynamicTape`, independent of the
+worker executing its current phase. The allocator registry provides checked
+O(1) descriptor ownership lookup, and each tape serializes its mutable
+metadata. A barrier yield retains the live tape and coroutine frame. Final lane
+completion seals and validates the tape, transfers an immutable
+`HostTapeSnapshot` to the pending pullback, and releases the mutable tape.
+Snapshots retain their memory-policy charge until the pullback releases them.
+Compiler-generated code sees only the versioned semantic allocator callbacks
+and opaque handles; Runtime alone owns payload, region, record, and index
+representation.
+
+Backward execution creates fresh mutable lane/workgroup phase state for each
+pullback application while retaining the immutable forward snapshots. Reverse
+barriers are lowered through the same coroutine/yield machinery as primal
+barriers. Invocation-private gradients follow logical lanes across workers;
+workgroup-shared gradients remain in the group arena; atomic-shared updates use
+the declared target capability. External gradients are accumulated and
+published only after every backward workgroup completes successfully.
+
+Before dispatch, checked policy accounting covers tape reservation,
+cotangent carriers, invocation-private or workgroup-shared gradient staging,
+and arithmetic overflow. Forward Storage/output writes use
+`HostEffectTransaction` shadows and commit exactly once only after every lane
+has completed and every snapshot is valid. Failure discards shadows, mutable
+tapes, untransferred snapshots, lane frames, group arenas, staging, and
+dispatch reservations. Parallel range failures collect diagnostics without
+writing shared invocation state from worker threads.
+
 ## 6. Typed transform and cache identity
 
 Autodiff runs after source loading, feature/constant specialization,

@@ -354,13 +354,34 @@ SCF semantics.
 
 The external `__vernon_cpu_<module-hash>_<entry>` ABI remains a dedicated
 LLVM-only component. The module hash prevents symbol collisions when many
-objects are statically linked into one game. The wrapper validates
-`VernonCpuInvocation`, unpacks direct values, constructs the five internal
-rank-one memref arguments from each packed raw buffer pointer (zero offset,
-captured static extent or zero, unit stride), and appends the texture callback
-table. The private texture helper owns callback-table layout knowledge; generic
-Vernon conversion patterns do not. Internal entry functions and memref
-descriptors are never exported.
+objects are statically linked into one game. Every exported CPU entry accepts a
+`VernonCpuInvocation` whose argument is exactly one checked
+`VernonCpuRangeV1`; scalar-entry compatibility dispatch is not supported. The
+wrapper rejects a stale descriptor size, empty or out-of-bounds lane interval,
+zero or overflowing grid/workgroup extent, out-of-range group coordinate, and
+undersized or null common/per-invocation frames before entering the lane loop.
+The LLVM `StructLayout` for the generated descriptor is checked against the
+host C layout during compilation.
+
+The generated wrapper loops directly over one contiguous workgroup-linear lane
+interval. It derives local, workgroup, and global IDs in compiled code, selects
+either common packed frames or flattened-global per-invocation frame tables,
+unpacks direct values, constructs the internal memref arguments, and appends
+the texture callback table. There is no runtime per-lane callback or indirect
+kernel-entry call inside the loop. The private texture helper owns
+callback-table layout knowledge; generic Vernon conversion patterns do not.
+Internal entry functions and memref descriptors are never exported.
+
+Barrier-free entries are one complete range phase. If an entry contains a
+validated workgroup barrier, the ABI wrapper clones its lowered function into
+an LLVM coroutine before the standard `-O2` pipeline. Barrier calls become
+suspension points, and values live across a barrier are spilled by coroutine
+lowering into lane-owned frame storage obtained from
+`vernonCpuLaneAddressV1`. A final suspend distinguishes lane completion from a
+barrier yield. Coroutine handles and frames use reserved lane-allocation sites;
+allocation overflow or failure returns an internal error rather than
+dereferencing a null frame. The runtime advances a workgroup only when every
+range reports the same barrier site or every lane completes.
 
 Relocatable objects are the canonical persistent CPU artifact. Desktop Python
 uses LLJIT to load the same host object directly for immediate execution.

@@ -14,6 +14,55 @@ relocates object files. The removed `vernon-compile --compute-bundle` and
 execution uses compiler-owned LLJIT to load the host object directly. LLVM IR
 and ORC JIT are not persistent runtime bundle formats.
 
+## CPU range-phase execution
+
+Ordinary CPU compute and CPU autodiff use one range-only execution model.
+Runtime passes a `VernonCpuRangeV1` to the compiled entry; it does not invoke a
+scalar kernel entry once per logical invocation and has no blocking
+cooperative-workgroup compatibility executor.
+
+One scheduler owns a persistent worker pool bounded by
+`VERNON_CPU_THREAD_BUDGET`. A callback processes one contiguous
+workgroup-linear lane interval in compiled code. Scheduling is hierarchical:
+
+- grids with at least as many workgroups as runners are claimed in bounded
+  groups, and each claimed workgroup executes as one range;
+- fewer, larger workgroups divide each phase into deterministic non-empty lane
+  ranges assigned across the available runners;
+- one workgroup of at most 64 lanes executes inline to avoid queue and wake-up
+  overhead.
+
+The pool never creates one OS thread or queue item per lane. A dispatch with
+many groups streams group state through bounded workers; a large individual
+workgroup uses at most the configured worker count. Multiple callers share the
+same bounded pool. Scheduling is currently non-preemptive at the runner-job
+level, so one sufficiently parallel long dispatch may occupy the pool until it
+completes; fair multi-dispatch latency is a future QoS feature, not part of the
+synchronous execution contract.
+
+Each active workgroup owns:
+
+- a lazily allocated 16 KiB primal shared arena;
+- lazily allocated pullback shared-adjoint sites;
+- cache-aligned eight-lane blocks for lane-private allocations and coroutine
+  frames;
+- the current phase, expected barrier site, outstanding-range count, and
+  latched failure diagnostic.
+
+Shared allocation sites are established before the first yield and sealed
+after it. Workgroup and lane allocation use checked size/alignment arithmetic;
+inconsistent sites, overflow, allocation failure, or a new sealed shared site
+fail the dispatch. Lane storage belongs to logical lanes rather than worker
+threads and therefore survives phase migration.
+
+A compiled range starts with `outcome = complete`. A lowered barrier changes
+it to `yielded` and records the site. The last range in a phase advances the
+workgroup only when all ranges either complete or yield at the same site.
+Mixed completion/yield, different sites, exceptions, invalid outcomes, and
+entry errors latch one failure, stop new phases, wake the dispatch waiter, and
+release group state when the job is destroyed. Workers never wait at a
+workgroup barrier.
+
 ## Backend loading
 
 `VernonRuntime` owns the Win32/POSIX library loader used by CPU native-library

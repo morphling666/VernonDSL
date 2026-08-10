@@ -24,6 +24,8 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/Passes/OptimizationLevel.h"
+#include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/JSON.h"
@@ -96,9 +98,11 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
         metadata.exportedWrapperSymbol = "__vernon_cpu_" + moduleHash.str() + "_" + function.getSymName().str();
         metadata.argumentsSize = 0;
         metadata.requiresTextureCallbacks = false;
+        metadata.requiresPhases = false;
         function.walk([&](mlir::vernon::IntrinsicOp intrinsic) {
             metadata.requiresTextureCallbacks |= intrinsic.getName() == "texture_sample";
         });
+        function.walk([&](mlir::vernon::BarrierOp) { metadata.requiresPhases = true; });
 
         for (unsigned index = 0; index < function.getNumArguments(); ++index) {
             mlir::Type type = function.getArgumentTypes()[index];
@@ -149,7 +153,9 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
                 return false;
             }
             metadata.argumentsSize = llvm::alignTo(metadata.argumentsSize, alignment);
-            vernon::CpuAbiArgumentPacking packing{metadata.argumentsSize, size, kind, 0, {}, {}};
+            const auto builtin = attrs.getAs<mlir::StringAttr>("vernon.builtin");
+            vernon::CpuAbiArgumentPacking packing{
+                metadata.argumentsSize, size, kind, 0, builtin ? builtin.getValue().str() : std::string{}, {}, {}};
             if (packing.kind == vernon::CpuAbiArgumentKind::TensorView) {
                 auto view = mlir::cast<mlir::vernon::TensorViewType>(type);
                 packing.tensorRank = static_cast<uint32_t>(view.getShape().size());
@@ -319,6 +325,20 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
             return CpuCompileResult::CodegenFailure;
         }
     }
+    {
+        llvm::LoopAnalysisManager loopAnalyses;
+        llvm::FunctionAnalysisManager functionAnalyses;
+        llvm::CGSCCAnalysisManager cgsccAnalyses;
+        llvm::ModuleAnalysisManager moduleAnalyses;
+        llvm::PassBuilder passBuilder(objectTargetMachine.get());
+        passBuilder.registerModuleAnalyses(moduleAnalyses);
+        passBuilder.registerCGSCCAnalyses(cgsccAnalyses);
+        passBuilder.registerFunctionAnalyses(functionAnalyses);
+        passBuilder.registerLoopAnalyses(loopAnalyses);
+        passBuilder.crossRegisterProxies(loopAnalyses, functionAnalyses, cgsccAnalyses, moduleAnalyses);
+        llvm::ModulePassManager optimization = passBuilder.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
+        optimization.run(*llvmModule, moduleAnalyses);
+    }
     if (parsedTriple.isOSWindows() && !llvmModule->getNamedGlobal("_fltused"))
         new llvm::GlobalVariable(*llvmModule, llvm::Type::getInt32Ty(*llvmContext), true,
                                  llvm::GlobalValue::WeakAnyLinkage,
@@ -405,7 +425,8 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
                 diagnostics = llvm::toString(symbol.takeError());
                 return CpuCompileResult::CodegenFailure;
             }
-            nextExecution->entries.emplace(entry.internalFunctionSymbol, symbol->toPtr<VernonCpuEntryPoint>());
+            VernonCpuEntryPoint entryPoint = symbol->toPtr<VernonCpuEntryPoint>();
+            nextExecution->entries.emplace(entry.internalFunctionSymbol, entryPoint);
         }
     }
     artifacts.clear();

@@ -148,6 +148,18 @@ permit removing queue waits or letting recorded work outlive its owners.
 
 ### CPU structured Storage autodiff
 
+- CPU execution uses one compiler-generated range-phase ABI for ordinary
+  compute, forward tape capture, and pullback replay. Barrier-free kernels are
+  the single-phase case; barrier kernels suspend and resume logical lanes
+  through lane-owned coroutine frames.
+- The persistent scheduler is bounded by the CPU thread budget. Large grids
+  stream whole workgroups, large individual workgroups split into deterministic
+  non-empty lane ranges, and tiny single-workgroup dispatches execute inline.
+  No production path creates or blocks one OS thread per logical lane.
+- Workgroup arenas, lane-private blocks, tape state, and reverse-mode adjoints
+  persist across phases independently of worker identity. Checked allocation,
+  phase agreement, cancellation, and malformed range descriptors fail
+  explicitly.
 - `vd.ad.vjp` emits deterministic primal, forward-with-tape, and backward
   profiles with checked dynamic tape and explicit Storage objectives.
 - Direct and cooked CPU execution share one `dynamic_v2` executable,
@@ -290,6 +302,9 @@ met.
 - Make cooking cost proportional to unique specialized stages rather than
   `variants * stages`.
 - Keep warm dispatch allocation-free when pipelines and bindings are reused.
+- Add fair or weighted runner scheduling only when concurrent CPU dispatch
+  latency becomes a product requirement; the current bounded pool is
+  non-preemptive at the dispatch-runner level.
 - Report transfer, queue wait, execution, readback, pending bytes, and
   reclamation latency separately.
 

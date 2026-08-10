@@ -52,9 +52,6 @@ struct CpuPreparedPipeline {
     CpuPreparedShader *shader{};
     CpuPreparedLayout *layout{};
     uint32_t workgroup[3]{1, 1, 1};
-    std::vector<const ReflectedArgument *> globalInvocationIds;
-    std::vector<const ReflectedArgument *> localInvocationIds;
-    std::vector<const ReflectedArgument *> workgroupIds;
 };
 
 struct CpuPreparedBindings {
@@ -138,20 +135,6 @@ VernonStatus prepareCpuPipeline(void *data, const VernonRuntimeProviderPipelineD
     if (!pipeline->shader || !pipeline->layout)
         return fail(context.error, "CPU provider pipeline references invalid prepared objects");
     std::copy_n(descriptor->workgroup_size, 3, pipeline->workgroup);
-    try {
-        for (const ReflectedArgument &argument : pipeline->shader->reflection.arguments) {
-            if (argument.kind != "builtin")
-                continue;
-            if (argument.builtin == "global_invocation_id")
-                pipeline->globalInvocationIds.push_back(&argument);
-            else if (argument.builtin == "local_invocation_id")
-                pipeline->localInvocationIds.push_back(&argument);
-            else if (argument.builtin == "workgroup_id")
-                pipeline->workgroupIds.push_back(&argument);
-        }
-    } catch (const std::bad_alloc &) {
-        return fail(context.error, "cannot prepare CPU builtin bindings", VERNON_STATUS_INTERNAL_ERROR);
-    }
     pipeline->layout->pipeline = pipeline.get();
     *output = toHandle(pipeline.release());
     return VERNON_STATUS_OK;
@@ -254,30 +237,14 @@ VernonStatus encodeCpuDispatch(void *data, VernonRuntimeProviderObject,
     auto *bindings = descriptor ? fromHandle<CpuPreparedBindings>(descriptor->bindings) : nullptr;
     if (!descriptor || !pipeline || !bindings || bindings->pipeline != pipeline)
         return fail(context.error, "invalid CPU provider dispatch");
-    auto writeBuiltins = [](std::vector<unsigned char> &packed, const std::vector<const ReflectedArgument *> &builtins,
-                            const uint32_t id[3]) {
-        for (const ReflectedArgument *builtin : builtins) {
-            if (builtin->physical.offset > packed.size() ||
-                builtin->physical.size > packed.size() - builtin->physical.offset)
-                return false;
-            unsigned char *destination = packed.data() + builtin->physical.offset;
-            if (builtin->physical.size == sizeof(uint64_t)) {
-                const uint64_t scalar = id[0];
-                std::memcpy(destination, &scalar, sizeof(scalar));
-            } else {
-                std::memcpy(destination, id, std::min(builtin->physical.size, sizeof(uint32_t) * 3));
-            }
-        }
-        return true;
-    };
-    const VernonStatus status = context.scheduler->dispatch(
-        descriptor->group_count, pipeline->workgroup, [&](const CpuLaneCoordinates &coordinates) {
-            std::vector<unsigned char> packed = bindings->packed;
-            if (!writeBuiltins(packed, pipeline->globalInvocationIds, coordinates.global) ||
-                !writeBuiltins(packed, pipeline->localInvocationIds, coordinates.local) ||
-                !writeBuiltins(packed, pipeline->workgroupIds, coordinates.group))
-                return VERNON_STATUS_INVALID_ARGUMENT;
-            const VernonCpuInvocation invocation{packed.data(), packed.size(), nullptr, 0, nullptr};
+    const VernonStatus status =
+        context.scheduler->dispatch(descriptor->group_count, pipeline->workgroup, [&](VernonCpuRangeV1 &range) {
+            range.arguments = bindings->packed.data();
+            range.arguments_size = bindings->packed.size();
+            range.results = nullptr;
+            range.results_size = 0;
+            range.textures = nullptr;
+            const VernonCpuInvocation invocation{&range, VERNON_CPU_RANGE_ARGUMENTS_SIZE_V1, nullptr, 0, nullptr};
             return pipeline->shader->kernel.entry(&invocation);
         });
     if (status != VERNON_STATUS_OK)
@@ -435,10 +402,12 @@ bool loadCpuNativeArtifact(const CpuNativeArtifact &artifact, CpuKernelState &st
     if (!resolveCpuNativeArtifact(artifact, libraryPath, &metadata, error))
         return false;
     if (artifact.format == "relocatable_object") {
-        std::lock_guard<std::mutex> lock(staticEntriesMutex());
-        const auto found = staticEntries().find(artifact.symbol);
-        if (found != staticEntries().end())
-            state.entry = found->second;
+        {
+            std::lock_guard<std::mutex> lock(staticEntriesMutex());
+            const auto found = staticEntries().find(artifact.symbol);
+            if (found != staticEntries().end())
+                state.entry = found->second;
+        }
     } else {
         const std::string nativePath = libraryPath.u8string();
         if (!state.nativeLibrary.open(nativePath.c_str(), error))

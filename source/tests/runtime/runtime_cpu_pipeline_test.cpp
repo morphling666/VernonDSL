@@ -1,3 +1,4 @@
+#include "VernonCpuWorkgroupABI.h"
 #include "runtime/content_hash.h"
 #include "vernon-c/Runtime.h"
 
@@ -46,14 +47,24 @@ std::string withContentHash(nlohmann::json root) {
 }
 
 VernonStatus staticallyLinkedFill(const VernonCpuInvocation *invocation) {
-    uintptr_t address = 0;
-    uint32_t gid[3] = {0, 0, 0};
-    if (!invocation || invocation->arguments_size < 20)
+    if (!invocation || invocation->arguments_size != VERNON_CPU_RANGE_ARGUMENTS_SIZE_V1)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    std::memcpy(&address, invocation->arguments, sizeof(address));
-    std::memcpy(gid, static_cast<const unsigned char *>(invocation->arguments) + 8, sizeof(gid));
+    auto *range = reinterpret_cast<VernonCpuRangeV1 *>(const_cast<void *>(invocation->arguments));
+    if (!range || range->struct_size != sizeof(*range))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    uintptr_t address = 0;
+    std::memcpy(&address, range->arguments, sizeof(address));
     float *values = reinterpret_cast<float *>(address);
-    values[gid[2] * 8 + gid[1] * 4 + gid[0]] = static_cast<float>(gid[0] + 10 * gid[1] + 100 * gid[2]);
+    for (size_t lane = range->lane_begin; lane < range->lane_end; ++lane) {
+        const uint32_t localX = static_cast<uint32_t>(lane % range->workgroup[0]);
+        const uint32_t localY = static_cast<uint32_t>((lane / range->workgroup[0]) % range->workgroup[1]);
+        const uint32_t localZ =
+            static_cast<uint32_t>(lane / (static_cast<size_t>(range->workgroup[0]) * range->workgroup[1]));
+        const uint32_t x = range->group[0] * range->workgroup[0] + localX;
+        const uint32_t y = range->group[1] * range->workgroup[1] + localY;
+        const uint32_t z = range->group[2] * range->workgroup[2] + localZ;
+        values[z * 8 + y * 4 + x] = static_cast<float>(x + 10 * y + 100 * z);
+    }
     return VERNON_STATUS_OK;
 }
 

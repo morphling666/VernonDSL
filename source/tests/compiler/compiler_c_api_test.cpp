@@ -1,4 +1,5 @@
 #include "VernonCompiler.h"
+#include "VernonCpuWorkgroupABI.h"
 #include "VernonVersions.h"
 #include "compiler_artifacts.h"
 #include "compiler_target_test_utils.h"
@@ -22,6 +23,24 @@ static int view_contains(VernonStringView value, const char *needle) {
             return 1;
     }
     return 0;
+}
+
+static VernonStatus invoke_cpu_range(VernonCpuEntryPoint entry, const VernonCpuInvocation &lane,
+                                     size_t localLinear = 0) {
+    VernonCpuRangeV1 range{};
+    range.struct_size = sizeof(range);
+    range.arguments = lane.arguments;
+    range.arguments_size = lane.arguments_size;
+    range.results = lane.results;
+    range.results_size = lane.results_size;
+    range.textures = lane.textures;
+    range.grid[0] = range.grid[1] = range.grid[2] = 1;
+    range.workgroup[0] = static_cast<uint32_t>(localLinear + 1);
+    range.workgroup[1] = range.workgroup[2] = 1;
+    range.lane_begin = localLinear;
+    range.lane_end = localLinear + 1;
+    const VernonCpuInvocation invocation{&range, VERNON_CPU_RANGE_ARGUMENTS_SIZE_V1, nullptr, 0, nullptr};
+    return entry(&invocation);
 }
 
 TEST(CompilerArtifacts, RejectsInvalidReflectionBeforePublishingArtifacts) {
@@ -180,7 +199,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     const Payload input[2] = {{{1.0f, 2.0f, 3.0f}, 7}, {{4.0f, 5.0f, 6.0f}, 11}};
     Payload output[2]{};
     VernonCpuInvocation invocation = {input, sizeof(input), output, sizeof(output), nullptr};
-    ASSERT_EQ(roundtrip(&invocation), VERNON_STATUS_OK);
+    ASSERT_EQ(invoke_cpu_range(roundtrip, invocation), VERNON_STATUS_OK);
     EXPECT_EQ(memcmp(input, output, sizeof(input)), 0);
 
     for (std::string_view triple : {"x86_64-pc-windows-msvc", "arm64-apple-ios17.0"}) {
@@ -268,7 +287,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     const auto extend32 = [&](uint16_t input) {
         uint32_t output = 0;
         VernonCpuInvocation invocation{&input, sizeof(input), &output, sizeof(output), nullptr};
-        EXPECT_EQ(extendF32(&invocation), VERNON_STATUS_OK);
+        EXPECT_EQ(invoke_cpu_range(extendF32, invocation), VERNON_STATUS_OK);
         return output;
     };
     EXPECT_EQ(extend32(0x0000), 0x00000000u);
@@ -285,7 +304,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     const auto truncate32 = [&](uint32_t input) {
         uint16_t output = 0;
         VernonCpuInvocation invocation{&input, sizeof(input), &output, sizeof(output), nullptr};
-        EXPECT_EQ(truncateF32(&invocation), VERNON_STATUS_OK);
+        EXPECT_EQ(invoke_cpu_range(truncateF32, invocation), VERNON_STATUS_OK);
         return output;
     };
     EXPECT_EQ(truncate32(0x00000000), 0x0000);
@@ -307,19 +326,19 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     uint16_t halfOne = 0x3c00;
     uint64_t doubleOne = 0;
     VernonCpuInvocation extendDoubleInvocation{&halfOne, sizeof(halfOne), &doubleOne, sizeof(doubleOne), nullptr};
-    EXPECT_EQ(extendF64(&extendDoubleInvocation), VERNON_STATUS_OK);
+    EXPECT_EQ(invoke_cpu_range(extendF64, extendDoubleInvocation), VERNON_STATUS_OK);
     EXPECT_EQ(doubleOne, 0x3ff0000000000000ull);
     uint64_t doubleSmallestHalf = 0x3e70000000000000ull;
     uint16_t smallestHalf = 0;
     VernonCpuInvocation truncateDoubleInvocation{&doubleSmallestHalf, sizeof(doubleSmallestHalf), &smallestHalf,
                                                  sizeof(smallestHalf), nullptr};
-    EXPECT_EQ(truncateF64(&truncateDoubleInvocation), VERNON_STATUS_OK);
+    EXPECT_EQ(invoke_cpu_range(truncateF64, truncateDoubleInvocation), VERNON_STATUS_OK);
     EXPECT_EQ(smallestHalf, 0x0001);
     uint16_t halfOnePointFive = 0x3e00;
     uint16_t halfSquare = 0;
     VernonCpuInvocation squareInvocation{&halfOnePointFive, sizeof(halfOnePointFive), &halfSquare, sizeof(halfSquare),
                                          nullptr};
-    EXPECT_EQ(squareF16(&squareInvocation), VERNON_STATUS_OK);
+    EXPECT_EQ(invoke_cpu_range(squareF16, squareInvocation), VERNON_STATUS_OK);
     EXPECT_EQ(halfSquare, 0x4080);
 
     VernonCompileOptions options{};
@@ -883,17 +902,17 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     float cpu_arguments[8] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
     float cpu_results[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     VernonCpuInvocation invocation = {cpu_arguments, sizeof(cpu_arguments), cpu_results, sizeof(cpu_results), NULL};
-    ASSERT_TRUE(add_vectors(&invocation) == VERNON_STATUS_OK);
+    ASSERT_TRUE(invoke_cpu_range(add_vectors, invocation) == VERNON_STATUS_OK);
     ASSERT_TRUE(cpu_results[0] == 6.0f && cpu_results[1] == 8.0f);
     ASSERT_TRUE(cpu_results[2] == 10.0f && cpu_results[3] == 12.0f);
     invocation.arguments_size = 0;
-    ASSERT_TRUE(add_vectors(&invocation) == VERNON_STATUS_INVALID_ARGUMENT);
+    ASSERT_TRUE(invoke_cpu_range(add_vectors, invocation) == VERNON_STATUS_INVALID_ARGUMENT);
     invocation.arguments_size = sizeof(cpu_arguments);
     invocation.results_size = 0;
-    ASSERT_TRUE(add_vectors(&invocation) == VERNON_STATUS_INVALID_ARGUMENT);
+    ASSERT_TRUE(invoke_cpu_range(add_vectors, invocation) == VERNON_STATUS_INVALID_ARGUMENT);
     invocation.results_size = sizeof(cpu_results);
     invocation.results = NULL;
-    ASSERT_TRUE(add_vectors(&invocation) == VERNON_STATUS_INVALID_ARGUMENT);
+    ASSERT_TRUE(invoke_cpu_range(add_vectors, invocation) == VERNON_STATUS_INVALID_ARGUMENT);
     ASSERT_TRUE(add_vectors(NULL) == VERNON_STATUS_INVALID_ARGUMENT);
     vernonCompileResultDestroy(cpu_compile);
 
@@ -934,7 +953,7 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     }
     VernonCpuInvocation large_invocation = {large_arguments, sizeof(large_arguments), large_results,
                                             sizeof(large_results), NULL};
-    ASSERT_TRUE(add_large(&large_invocation) == VERNON_STATUS_OK);
+    ASSERT_TRUE(invoke_cpu_range(add_large, large_invocation) == VERNON_STATUS_OK);
     ASSERT_TRUE(large_results[0] == 2.0f && large_results[19] == 21.0f);
     vernonCompileResultDestroy(cpu_large_compile);
 
@@ -957,7 +976,7 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     float intrinsic_result = 0.0f;
     VernonCpuInvocation intrinsic_invocation = {intrinsic_arguments, sizeof(intrinsic_arguments), &intrinsic_result,
                                                 sizeof(intrinsic_result), NULL};
-    ASSERT_TRUE(normal_score(&intrinsic_invocation) == VERNON_STATUS_OK);
+    ASSERT_TRUE(invoke_cpu_range(normal_score, intrinsic_invocation) == VERNON_STATUS_OK);
     ASSERT_TRUE(intrinsic_result == 1.0f);
     vernonCompileResultDestroy(cpu_intrinsic_compile);
 
@@ -979,7 +998,7 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
         uint32_t id[3];
     } compute_arguments = {{compute_values, 0, 3, 1}, {1, 0, 0}};
     VernonCpuInvocation compute_invocation = {&compute_arguments, sizeof(compute_arguments), NULL, 0, NULL};
-    ASSERT_TRUE(increment(&compute_invocation) == VERNON_STATUS_OK);
+    ASSERT_TRUE(invoke_cpu_range(increment, compute_invocation, 1) == VERNON_STATUS_OK);
     ASSERT_TRUE(compute_values[0] == 2.0f && compute_values[1] == 5.0f && compute_values[2] == 6.0f);
     vernonCompileResultDestroy(cpu_compute_compile);
 
@@ -995,7 +1014,7 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
         float phase;
     } loop_arguments = {{loop_values, 0, 1, 1}, 0.0f};
     VernonCpuInvocation loop_invocation = {&loop_arguments, sizeof(loop_arguments), NULL, 0, NULL};
-    ASSERT_TRUE(loop(&loop_invocation) == VERNON_STATUS_OK);
+    ASSERT_TRUE(invoke_cpu_range(loop, loop_invocation) == VERNON_STATUS_OK);
     ASSERT_TRUE(loop_values[0] == 4.0f);
     vernonCompileResultDestroy(cpu_scf_compile);
 
@@ -1015,11 +1034,11 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     VernonCpuTextureCallbacks texture_callbacks = {&texture_bias, sample_texture, NULL};
     VernonCpuInvocation texture_invocation = {&texture_arguments, sizeof(texture_arguments), texture_result,
                                               sizeof(texture_result), &texture_callbacks};
-    ASSERT_TRUE(sample_color(&texture_invocation) == VERNON_STATUS_OK);
+    ASSERT_TRUE(invoke_cpu_range(sample_color, texture_invocation) == VERNON_STATUS_OK);
     ASSERT_TRUE(texture_result[0] == 0.25f && texture_result[1] == 0.75f);
     ASSERT_TRUE(texture_result[2] == 3.0f && texture_result[3] == 0.5f);
     texture_invocation.textures = NULL;
-    ASSERT_TRUE(sample_color(&texture_invocation) == VERNON_STATUS_INVALID_ARGUMENT);
+    ASSERT_TRUE(invoke_cpu_range(sample_color, texture_invocation) == VERNON_STATUS_INVALID_ARGUMENT);
     vernonCompileResultDestroy(cpu_texture_compile);
 
     vernonCompilerDestroy(context);

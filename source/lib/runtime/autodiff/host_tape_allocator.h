@@ -8,7 +8,6 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -219,10 +218,10 @@ private:
     VernonAdTapeAllocatorStatus fail(VernonAdTapeAllocatorStatus status);
     Region *findRegion(VernonAdRegionHandle handle);
     Record *findRecord(VernonAdRecordHandle handle);
-    bool callable() const;
     void releaseCharge();
 
     VernonAdTapeAllocator descriptor_{};
+    mutable std::mutex mutex_;
     std::vector<std::byte> payload_;
     std::vector<Region> regions_;
     std::vector<Record> records_;
@@ -231,7 +230,6 @@ private:
     std::vector<size_t> openRegions_;
     std::shared_ptr<HostTapeMemoryPolicy> policy_;
     std::shared_ptr<HostTapeDispatchBudget> dispatchBudget_;
-    std::thread::id ownerThread_;
     VernonAdRegionHandle nextRegionHandle_{1};
     VernonAdRecordHandle nextRecordHandle_{1};
     size_t policyCharge_{};

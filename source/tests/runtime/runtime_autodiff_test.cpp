@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -273,13 +274,34 @@ TEST(RuntimeAutodiffTapeAllocator, RejectsCopiedDescriptorWithoutTrustingUserDat
     EXPECT_EQ(allocator.reset(&allocator), VERNON_AD_TAPE_ALLOCATOR_OK);
 }
 
-TEST(RuntimeAutodiffTapeAllocator, EnforcesThreadOwnership) {
+TEST(RuntimeAutodiffTapeAllocator, AllowsSequentialThreadMigration) {
     vernon::runtime::ad::HostDynamicTape storage;
     VernonAdTapeAllocator &allocator = storage.descriptor();
     VernonAdTapeAllocatorStatus status = VERNON_AD_TAPE_ALLOCATOR_OK;
     std::thread other([&] { status = allocator.reset(&allocator); });
     other.join();
-    EXPECT_EQ(status, VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE);
+    EXPECT_EQ(status, VERNON_AD_TAPE_ALLOCATOR_OK);
+    EXPECT_EQ(allocator.reset(&allocator), VERNON_AD_TAPE_ALLOCATOR_OK);
+}
+
+TEST(RuntimeAutodiffTapeAllocator, SerializesConcurrentMigratedCalls) {
+    vernon::runtime::ad::HostDynamicTape storage;
+    VernonAdTapeAllocator &allocator = storage.descriptor();
+    std::array<VernonAdTapeAllocatorStatus, 8> statuses{};
+    std::array<std::thread, 8> callers;
+
+    for (size_t index = 0; index < callers.size(); ++index) {
+        callers[index] = std::thread([&, index] {
+            statuses[index] = VERNON_AD_TAPE_ALLOCATOR_OK;
+            for (size_t iteration = 0; iteration < 1000; ++iteration)
+                if ((statuses[index] = allocator.reset(&allocator)) != VERNON_AD_TAPE_ALLOCATOR_OK)
+                    return;
+        });
+    }
+    for (std::thread &caller : callers)
+        caller.join();
+    for (VernonAdTapeAllocatorStatus status : statuses)
+        EXPECT_EQ(status, VERNON_AD_TAPE_ALLOCATOR_OK);
 }
 
 TEST(RuntimeAutodiff, CpuTapePolicyIsLazyForOrdinaryRuntimeContexts) {
