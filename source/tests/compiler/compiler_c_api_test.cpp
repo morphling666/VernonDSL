@@ -631,7 +631,7 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
         "}\n";
     static const char cpu_texture_module[] = "module attributes {" VERNON_MLIR_VERSION_ATTRIBUTES "} {\n"
                                              "  func.func @sample_color("
-                                             "%texture: !vernon.texture<\"2d\", f32> "
+                                             "%texture: !vernon.texture<\"2d\", f32, \"unknown\", \"sampled\"> "
                                              "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
                                              "vernon.binding = 0 : i64}, "
                                              "%sampler: !vernon.sampler {vernon.interface = \"resource\", "
@@ -643,7 +643,8 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
                                              "vernon.stage = \"fragment\"} {\n"
                                              "    %color = \"vernon.intrinsic\"(%texture, %sampler, %uv) "
                                              "{name = \"texture_sample\"} : "
-                                             "(!vernon.texture<\"2d\", f32>, !vernon.sampler, tensor<2xf32>) "
+                                             "(!vernon.texture<\"2d\", f32, \"unknown\", \"sampled\">, "
+                                             "!vernon.sampler, tensor<2xf32>) "
                                              "-> tensor<4xf32>\n"
                                              "    return %color : tensor<4xf32>\n"
                                              "  }\n"

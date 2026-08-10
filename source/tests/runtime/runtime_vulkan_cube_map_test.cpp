@@ -83,6 +83,9 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
         uploads[index] = {sizeof(VernonRhiImageUploadDescriptor),
                           0,
                           static_cast<uint32_t>(index),
+                          0,
+                          0,
+                          0,
                           1,
                           1,
                           1,
@@ -166,10 +169,19 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
 
     std::vector<uint8_t> colorPixels(32 * 32 * 4);
     std::vector<uint8_t> bloomPixels(32 * 32 * 4);
-    ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, color.handle, colorPixels.data(), colorPixels.size()),
-              VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, bloom.handle, bloomPixels.data(), bloomPixels.size()),
-              VERNON_RHI_STATUS_OK);
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.width = 32;
+    download.height = 32;
+    download.depth = 1;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    ASSERT_EQ(
+        vernonRhiDeviceDownloadImage(context.device, color.handle, &download, colorPixels.data(), colorPixels.size()),
+        VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(
+        vernonRhiDeviceDownloadImage(context.device, bloom.handle, &download, bloomPixels.data(), bloomPixels.size()),
+        VERNON_RHI_STATUS_OK);
     const size_t center = (16 * 32 + 16) * 4;
     EXPECT_NEAR(colorPixels[center], 64, 10);
     EXPECT_NEAR(colorPixels[center + 1], 200, 10);

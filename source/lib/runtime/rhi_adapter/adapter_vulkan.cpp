@@ -389,6 +389,7 @@ VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayout
                                    source.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
                                    source.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
                                    source.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
+                                   source.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
                                    source.kind == VERNON_RUNTIME_PROVIDER_SAMPLER ||
                                    source.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
             if (!supported || source.array_count != 1)
@@ -1067,7 +1068,9 @@ PreparedBindingSet::Snapshot *snapshotBindings(VernonRuntimeRhiAdapter &adapter,
                 return nullptr;
             }
             info.imageView = image->view;
-            info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            info.imageLayout = slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE
+                                   ? VK_IMAGE_LAYOUT_GENERAL
+                                   : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             const auto samplerIndex = bindings.samplerByBinding.find(slot.entry.layout.binding);
             if (samplerIndex != bindings.samplerByBinding.end()) {
                 const auto &sampler = snapshot->slots[samplerIndex->second];
@@ -1221,6 +1224,17 @@ VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject commandEncod
         return fail(adapter, "Vulkan dispatch command encoder is invalid");
     if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
         return fail(adapter, "Vulkan dispatch could not retain provider objects", VERNON_STATUS_INTERNAL_ERROR);
+    if (bindings)
+        for (const auto &slot : bindings->slots)
+            if (slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
+                slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE) {
+                auto *image = reinterpret_cast<rhi::vulkan::Image *>(resolveRhiResource(adapter, slot.value.resource));
+                const VkImageLayout layout = slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE
+                                                 ? VK_IMAGE_LAYOUT_GENERAL
+                                                 : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                if (!image || !transitionImage(adapter, commandEncoder, command, *image, layout))
+                    return fail(adapter, "Vulkan dispatch could not track image layout", VERNON_STATUS_INTERNAL_ERROR);
+            }
     auto *bindingSnapshot =
         bindings ? snapshotBindings(adapter, commandEncoder, *pipeline, *bindings, command) : nullptr;
     if (bindings && !bindingSnapshot)

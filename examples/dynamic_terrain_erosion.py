@@ -277,13 +277,11 @@ def main() -> None:
     stage_materials = vd.storage.from_numpy(stage[3])
 
     output = vd.Texture.zeros(shape=(args.size, args.size))
-    target = vd.RenderTarget(shape=output.shape).attach_color(0, output).attach_depth(format=vd.depth32)
+    target = vd.RenderTarget(shape=output.shape).attach_color(0, output).attach_depth()
     shadow_size = args.size * 2
-    shadow_map = vd.Texture.zeros(shape=(shadow_size, shadow_size), format=vd.depth32)
     shadow_color = vd.Texture.zeros(shape=(shadow_size, shadow_size))
-    shadow_target = (
-        vd.RenderTarget(shape=shadow_map.shape).attach_color(0, shadow_color).attach_depth(texture=shadow_map)
-    )
+    shadow_target = vd.RenderTarget(shape=shadow_color.shape).attach_color(0, shadow_color).attach_depth()
+    shadow_map = shadow_target.depth_texture
     shadow_sampler = vd.sampler(address="clamp_to_edge")
     environment_map = load_equirectangular_environment(
         Path(__file__).resolve().parent / "assets" / "environment" / "belfast_sunset_puresky_1k.hdr",

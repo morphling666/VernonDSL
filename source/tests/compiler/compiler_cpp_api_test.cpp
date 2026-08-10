@@ -242,7 +242,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         vernon.interface = "input",
         vernon.location = 0 : i64
       },
-      %environment: !vernon.texture<"cube", f32> {
+      %environment: !vernon.texture<"cube", f32, "unknown", "sampled"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
         vernon.binding = 1 : i64
@@ -264,7 +264,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       } {
     %sample = "vernon.intrinsic"(%environment, %sampler, %direction) {
       name = "texture_sample"
-    } : (!vernon.texture<"cube", f32>, !vernon.sampler, tensor<3xf32>)
+    } : (!vernon.texture<"cube", f32, "unknown", "sampled">, !vernon.sampler, tensor<3xf32>)
         -> tensor<4xf32>
     return %sample : tensor<4xf32>
   }
@@ -302,7 +302,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %uv: tensor<2xf32> {
         vernon.interface = "input", vernon.location = 0 : i64
       },
-      %texture_a: !vernon.texture<"2d", f32> {
+      %texture_a: !vernon.texture<"2d", f32, "unknown", "sampled"> {
         vernon.interface = "resource", vernon.set = 0 : i64,
         vernon.binding = 1 : i64
       },
@@ -310,11 +310,11 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         vernon.interface = "resource", vernon.set = 0 : i64,
         vernon.binding = 7 : i64
       },
-      %texture_b: !vernon.texture<"2d", f32> {
+      %texture_b: !vernon.texture<"2d", f32, "unknown", "sampled"> {
         vernon.interface = "resource", vernon.set = 0 : i64,
         vernon.binding = 2 : i64
       },
-      %texture_c: !vernon.texture<"2d", f32> {
+      %texture_c: !vernon.texture<"2d", f32, "unknown", "sampled"> {
         vernon.interface = "resource", vernon.set = 0 : i64,
         vernon.binding = 3 : i64
       },
@@ -326,19 +326,19 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       }) attributes {vernon.entry, vernon.stage = "fragment"} {
     %a0 = "vernon.intrinsic"(%texture_a, %shared_sampler, %uv)
         {name = "texture_sample"} :
-        (!vernon.texture<"2d", f32>, !vernon.sampler, tensor<2xf32>)
+        (!vernon.texture<"2d", f32, "unknown", "sampled">, !vernon.sampler, tensor<2xf32>)
         -> tensor<4xf32>
     %a1 = "vernon.intrinsic"(%texture_a, %shared_sampler, %uv)
         {name = "texture_sample"} :
-        (!vernon.texture<"2d", f32>, !vernon.sampler, tensor<2xf32>)
+        (!vernon.texture<"2d", f32, "unknown", "sampled">, !vernon.sampler, tensor<2xf32>)
         -> tensor<4xf32>
     %b = "vernon.intrinsic"(%texture_b, %shared_sampler, %uv)
         {name = "texture_sample"} :
-        (!vernon.texture<"2d", f32>, !vernon.sampler, tensor<2xf32>)
+        (!vernon.texture<"2d", f32, "unknown", "sampled">, !vernon.sampler, tensor<2xf32>)
         -> tensor<4xf32>
     %c = "vernon.intrinsic"(%texture_c, %sampler_c, %uv)
         {name = "texture_sample"} :
-        (!vernon.texture<"2d", f32>, !vernon.sampler, tensor<2xf32>)
+        (!vernon.texture<"2d", f32, "unknown", "sampled">, !vernon.sampler, tensor<2xf32>)
         -> tensor<4xf32>
     return %c : tensor<4xf32>
   }
@@ -365,7 +365,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %condition: i1 {
         vernon.interface = "input", vernon.location = 0 : i64
       },
-      %texture_a: !vernon.texture<"2d", f32> {
+      %texture_a: !vernon.texture<"2d", f32, "unknown", "sampled"> {
         vernon.interface = "resource", vernon.set = 0 : i64,
         vernon.binding = 1 : i64
       },
@@ -376,7 +376,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         vernon.interface = "resource", vernon.set = 0 : i64,
         vernon.binding = 7 : i64
       },
-      %texture_b: !vernon.texture<"2d", f32> {
+      %texture_b: !vernon.texture<"2d", f32, "unknown", "sampled"> {
         vernon.interface = "resource", vernon.set = 0 : i64,
         vernon.binding = 2 : i64
       }) -> (tensor<4xf32> {
@@ -385,44 +385,45 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     scf.if %condition {
       %nested = "vernon.intrinsic"(%texture_a, %sampler, %uv)
           {name = "texture_sample"} :
-          (!vernon.texture<"2d", f32>, !vernon.sampler, tensor<2xf32>)
+          (!vernon.texture<"2d", f32, "unknown", "sampled">, !vernon.sampler, tensor<2xf32>)
           -> tensor<4xf32>
       scf.yield
     } else {
       scf.yield
     }
     %selected = arith.select %condition, %texture_a, %texture_b :
-        !vernon.texture<"2d", f32>
-    %conditional = scf.if %condition -> (!vernon.texture<"2d", f32>) {
-      scf.yield %selected : !vernon.texture<"2d", f32>
+        !vernon.texture<"2d", f32, "unknown", "sampled">
+    %conditional = scf.if %condition -> (!vernon.texture<"2d", f32, "unknown", "sampled">) {
+      scf.yield %selected : !vernon.texture<"2d", f32, "unknown", "sampled">
     } else {
-      scf.yield %texture_b : !vernon.texture<"2d", f32>
+      scf.yield %texture_b : !vernon.texture<"2d", f32, "unknown", "sampled">
     }
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %looped = scf.for %i = %c0 to %c1 step %c1
         iter_args(%carried = %conditional)
-        -> (!vernon.texture<"2d", f32>) {
+        -> (!vernon.texture<"2d", f32, "unknown", "sampled">) {
       %loop_sample = "vernon.intrinsic"(%carried, %sampler, %uv)
           {name = "texture_sample"} :
-          (!vernon.texture<"2d", f32>, !vernon.sampler, tensor<2xf32>)
+          (!vernon.texture<"2d", f32, "unknown", "sampled">, !vernon.sampler, tensor<2xf32>)
           -> tensor<4xf32>
-      scf.yield %carried : !vernon.texture<"2d", f32>
+      scf.yield %carried : !vernon.texture<"2d", f32, "unknown", "sampled">
     }
     %while_result = scf.while (%before = %looped) :
-        (!vernon.texture<"2d", f32>) -> (!vernon.texture<"2d", f32>) {
+        (!vernon.texture<"2d", f32, "unknown", "sampled">) ->
+        (!vernon.texture<"2d", f32, "unknown", "sampled">) {
       %while_sample = "vernon.intrinsic"(%before, %sampler, %uv)
           {name = "texture_sample"} :
-          (!vernon.texture<"2d", f32>, !vernon.sampler, tensor<2xf32>)
+          (!vernon.texture<"2d", f32, "unknown", "sampled">, !vernon.sampler, tensor<2xf32>)
           -> tensor<4xf32>
-      scf.condition(%condition) %before : !vernon.texture<"2d", f32>
+      scf.condition(%condition) %before : !vernon.texture<"2d", f32, "unknown", "sampled">
     } do {
-    ^bb0(%after: !vernon.texture<"2d", f32>):
-      scf.yield %after : !vernon.texture<"2d", f32>
+    ^bb0(%after: !vernon.texture<"2d", f32, "unknown", "sampled">):
+      scf.yield %after : !vernon.texture<"2d", f32, "unknown", "sampled">
     }
     %result = "vernon.intrinsic"(%while_result, %sampler, %uv)
         {name = "texture_sample"} :
-        (!vernon.texture<"2d", f32>, !vernon.sampler, tensor<2xf32>)
+        (!vernon.texture<"2d", f32, "unknown", "sampled">, !vernon.sampler, tensor<2xf32>)
         -> tensor<4xf32>
     return %result : tensor<4xf32>
   }
@@ -437,11 +438,11 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     constexpr std::string_view helperModule = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func private @sample_helper(
-      %texture: !vernon.texture<"2d", f32>, %sampler: !vernon.sampler,
+      %texture: !vernon.texture<"2d", f32, "unknown", "sampled">, %sampler: !vernon.sampler,
       %uv: tensor<2xf32>) -> tensor<4xf32> {
     %sample = "vernon.intrinsic"(%texture, %sampler, %uv)
         {name = "texture_sample"} :
-        (!vernon.texture<"2d", f32>, !vernon.sampler, tensor<2xf32>)
+        (!vernon.texture<"2d", f32, "unknown", "sampled">, !vernon.sampler, tensor<2xf32>)
         -> tensor<4xf32>
     return %sample : tensor<4xf32>
   }
@@ -453,14 +454,14 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         vernon.interface = "resource", vernon.set = 0 : i64,
         vernon.binding = 7 : i64
       },
-      %texture: !vernon.texture<"2d", f32> {
+      %texture: !vernon.texture<"2d", f32, "unknown", "sampled"> {
         vernon.interface = "resource", vernon.set = 0 : i64,
         vernon.binding = 4 : i64
       }) -> (tensor<4xf32> {
         vernon.interface = "output", vernon.location = 0 : i64
       }) attributes {vernon.entry, vernon.stage = "fragment"} {
     %sample = call @sample_helper(%texture, %sampler, %uv) :
-        (!vernon.texture<"2d", f32>, !vernon.sampler, tensor<2xf32>)
+        (!vernon.texture<"2d", f32, "unknown", "sampled">, !vernon.sampler, tensor<2xf32>)
         -> tensor<4xf32>
     return %sample : tensor<4xf32>
   }
@@ -479,7 +480,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %condition: i1 {
         vernon.interface = "input", vernon.location = 0 : i64
       },
-      %texture: !vernon.texture<"2d", f32> {
+      %texture: !vernon.texture<"2d", f32, "unknown", "sampled"> {
         vernon.interface = "resource", vernon.set = 0 : i64,
         vernon.binding = 1 : i64
       },
@@ -500,7 +501,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         !vernon.sampler
     %sample = "vernon.intrinsic"(%texture, %selected, %uv)
         {name = "texture_sample"} :
-        (!vernon.texture<"2d", f32>, !vernon.sampler, tensor<2xf32>)
+        (!vernon.texture<"2d", f32, "unknown", "sampled">, !vernon.sampler, tensor<2xf32>)
         -> tensor<4xf32>
     return %sample : tensor<4xf32>
   }
@@ -525,10 +526,10 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         vernon.interface = "output", vernon.location = 0 : i64
       }) attributes {vernon.entry, vernon.stage = "fragment"} {
     %unknown_texture = builtin.unrealized_conversion_cast %raw :
-        i64 to !vernon.texture<"2d", f32>
+        i64 to !vernon.texture<"2d", f32, "unknown", "sampled">
     %sample = "vernon.intrinsic"(%unknown_texture, %sampler, %uv)
         {name = "texture_sample"} :
-        (!vernon.texture<"2d", f32>, !vernon.sampler, tensor<2xf32>)
+        (!vernon.texture<"2d", f32, "unknown", "sampled">, !vernon.sampler, tensor<2xf32>)
         -> tensor<4xf32>
     return %sample : tensor<4xf32>
   }
@@ -538,11 +539,11 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 
     std::fprintf(stderr, "intrinsic\n");
     expectDiagnostic(context, R"mlir(module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
-        func.func @bad(%texture: !vernon.texture<"2d", f32>,
+        func.func @bad(%texture: !vernon.texture<"2d", f32, "unknown", "sampled">,
                        %coordinates: tensor<2xf32>) -> tensor<4xf32> {
           %sample = "vernon.intrinsic"(%texture, %coordinates)
               {name = "texture_sample"} :
-              (!vernon.texture<"2d", f32>, tensor<2xf32>) -> tensor<4xf32>
+              (!vernon.texture<"2d", f32, "unknown", "sampled">, tensor<2xf32>) -> tensor<4xf32>
           return %sample : tensor<4xf32>
         }
       })mlir",

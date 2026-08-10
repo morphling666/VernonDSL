@@ -170,6 +170,13 @@ uint64_t resolveRhiResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProvi
     return kind ? vernon::rhi::resolveResource(adapter.rhiDevice, *kind, resource.resource.value) : 0;
 }
 
+bool describeRhiImage(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderResourceReference resource,
+                      VernonRhiImageDescriptor &descriptor) {
+    const auto kind = resourceKind(adapter, resource);
+    return kind == vernon::rhi::ResourceKind::Image &&
+           vernon::rhi::describeImageResource(adapter.rhiDevice, resource.resource.value, descriptor);
+}
+
 uint64_t nativeCommandEncoder(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder) {
     return vernon::rhi::commandEncoderNative(adapter.rhiDevice, encoder.value, adapter.rhiBackend);
 }

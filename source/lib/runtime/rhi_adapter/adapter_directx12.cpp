@@ -278,6 +278,7 @@ VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayout
         layout->entries.assign(descriptor->bindings, descriptor->bindings + descriptor->binding_count);
         for (const auto &entry : layout->entries) {
             const bool compute = (entry.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
+                                  entry.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
                                   entry.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE) &&
                                  entry.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE && entry.element_size != 0;
             const bool graphicsResource = (entry.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
@@ -384,6 +385,9 @@ VernonStatus prepareGraphicsPipelineImpl(VernonRuntimeRhiAdapter &adapter,
             resourceRanges.push_back(
                 {D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, entry.binding, entry.set, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND});
         else if (entry.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER)
+            resourceRanges.push_back(
+                {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, entry.binding, entry.set, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND});
+        else if (entry.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE)
             resourceRanges.push_back(
                 {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, entry.binding, entry.set, D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND});
         else if (entry.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE)
@@ -715,10 +719,12 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
             if (defaultSampler)
                 bindings.resolvedValues[index] = 0;
             else {
-                const uint64_t expectedKind =
-                    slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ? kRhiImageResource
-                    : slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER     ? kRhiSamplerResource
-                                                                              : kRhiBufferResource;
+                const uint64_t expectedKind = slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
+                                                      slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE
+                                                  ? kRhiImageResource
+                                              : slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER
+                                                  ? kRhiSamplerResource
+                                                  : kRhiBufferResource;
                 const uint64_t native = resolveRhiResource(adapter, value->resource);
                 if ((value->resource.identity & kRhiResourceKindMask) != expectedKind || native == 0 ||
                     (slot.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && value->stride == 0))
@@ -847,6 +853,7 @@ VernonStatus createBindings(void *data, const VernonRuntimeProviderBindingSetDes
                 }
             }
             bindings->resourceDescriptorCount += slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
+                                                 slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
                                                  slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
                                                  slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
             bindings->samplerDescriptorCount += slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER;
@@ -1168,6 +1175,24 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
                     device.device->CreateUnorderedAccessView(buffer->resource, nullptr, &view, resourceCpu);
                     resourceCpu.ptr += resourceIncrement;
                 }
+            } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE) {
+                auto *image = static_cast<rhi::directx12::Image *>(slot.opaqueResource);
+                if (!image || !image->resource ||
+                    !transition(adapter, commandEncoder, commands, *image, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+                    return fail(adapter, "D3D12 dispatch could not track storage image state",
+                                VERNON_STATUS_INTERNAL_ERROR);
+                if (!reuseDescriptors) {
+                    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+                    view.Format = image->format;
+                    if (image->dimension == VERNON_RHI_IMAGE_3D) {
+                        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+                        view.Texture3D.WSize = UINT_MAX;
+                    } else {
+                        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                    }
+                    device.device->CreateUnorderedAccessView(image->resource, nullptr, &view, resourceCpu);
+                    resourceCpu.ptr += resourceIncrement;
+                }
             } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
                 auto *image = static_cast<rhi::directx12::Image *>(slot.opaqueResource);
                 if (!transition(adapter, commandEncoder, commands, *image, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE))
@@ -1181,6 +1206,9 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
                     if (image->dimension == VERNON_RHI_IMAGE_CUBE) {
                         view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
                         view.TextureCube.MipLevels = native.MipLevels;
+                    } else if (image->dimension == VERNON_RHI_IMAGE_3D) {
+                        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+                        view.Texture3D.MipLevels = native.MipLevels;
                     } else {
                         view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
                         view.Texture2D.MipLevels = native.MipLevels;

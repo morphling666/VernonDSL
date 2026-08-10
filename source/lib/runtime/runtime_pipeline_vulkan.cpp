@@ -78,15 +78,19 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     candidate.layout.binding = argument.storageLeaves.size() <= 1
                                                    ? argumentBindings[use.index] + static_cast<uint32_t>(leafIndex)
                                                    : argument.storageLeaves[leafIndex].binding;
-                    candidate.layout.kind = argument.kind == "tensor" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
-                                                                      : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                    candidate.layout.kind = parameter.kind == "texture"
+                                                ? (parameter.format.empty() ? VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE
+                                                                            : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE)
+                                            : argument.kind == "tensor" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
+                                                                        : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
                     candidate.layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
                     candidate.layout.array_count = 1;
                     candidate.layout.argument_index = use.index;
                     candidate.layout.element_size = static_cast<uint32_t>(
-                        argument.storageLeaves.empty()
-                            ? (argument.kind == "tensor" ? argument.tensorElementSize : argument.physical.size)
-                            : argument.storageLeaves[leafIndex].elementSize);
+                        argument.storageLeaves.empty() ? (parameter.kind == "texture" ? 1
+                                                          : argument.kind == "tensor" ? argument.tensorElementSize
+                                                                                      : argument.physical.size)
+                                                       : argument.storageLeaves[leafIndex].elementSize);
                     // Aggregate lowering already folds each leaf's byte offset into the shader index.
                     // Every leaf descriptor must therefore retain the base address of the original AoS buffer.
                     candidate.resourceOffset = 0;
@@ -266,7 +270,8 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 }
                 candidate.binding.source = VulkanPipelineState::Binding::EXTERNAL_VERTEX;
             } else if (parameter.kind == "texture" && use.interfaceKind == "resource") {
-                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE;
+                candidate.layout.kind = parameter.format.empty() ? VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE
+                                                                 : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE;
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
                 candidate.layout.set = use.descriptorSet;
                 candidate.layout.binding = use.binding;
@@ -596,6 +601,11 @@ VernonStatus invokeVulkanComputePipeline(VernonLoadedPipeline &pipeline, const P
                 return fail(*pipeline.context, "Vulkan aggregate storage leaf exceeds its Tensor resource");
             value.resource.offset += leafOffset;
             value.resource.size -= leafOffset;
+        } else if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
+                   layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
+            if (argument.kind != ComputeLaunchArgumentKind::Texture || !argument.resource.resource.value)
+                return fail(*pipeline.context, "Vulkan prepared image binding requires an RHI Texture");
+            value.resource = argument.resource;
         } else {
             if (argument.kind != ComputeLaunchArgumentKind::Scalar || !argument.scalarData)
                 return fail(*pipeline.context, "Vulkan prepared inline binding requires host data");

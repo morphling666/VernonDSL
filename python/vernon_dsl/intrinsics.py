@@ -114,6 +114,16 @@ def texture_size(texture: Any, lod: Any | None = None) -> Any:
     return _raise_device_only("texture_size")
 
 
+def texture_load(texture: Any, coordinates: Any) -> Any:
+    del texture, coordinates
+    return _raise_device_only("texture_load")
+
+
+def texture_store(texture: Any, coordinates: Any, value: Any) -> None:
+    del texture, coordinates, value
+    _raise_device_only("texture_store")
+
+
 def workgroup_storage(element_type: Any, *, shape: tuple[int, ...]) -> Any:
     del element_type, shape
     return _raise_device_only("workgroup_storage")

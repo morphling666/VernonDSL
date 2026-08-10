@@ -80,16 +80,20 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                     // in source argument order, independent of canonical
                     // PipelineAsset slot ordering.
                     candidate.layout.binding = argumentBindings[use.index] + static_cast<uint32_t>(leafIndex);
-                    candidate.layout.kind = argument.kind == "tensor" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
-                                                                      : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                    candidate.layout.kind = parameter.kind == "texture"
+                                                ? (parameter.format.empty() ? VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE
+                                                                            : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE)
+                                            : argument.kind == "tensor" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
+                                                                        : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
                     candidate.layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
                     candidate.layout.access = parameter.access == "read" ? 1u : parameter.access == "write" ? 2u : 3u;
                     candidate.layout.array_count = 1;
                     candidate.layout.argument_index = use.index;
                     candidate.layout.element_size = static_cast<uint32_t>(
-                        argument.storageLeaves.empty()
-                            ? (argument.kind == "tensor" ? argument.tensorElementSize : argument.physical.size)
-                            : argument.storageLeaves[leafIndex].elementSize);
+                        argument.storageLeaves.empty() ? (parameter.kind == "texture" ? 1
+                                                          : argument.kind == "tensor" ? argument.tensorElementSize
+                                                                                      : argument.physical.size)
+                                                       : argument.storageLeaves[leafIndex].elementSize);
                     // Aggregate lowering already folds each leaf's byte offset into the shader index.
                     // Every leaf descriptor must therefore retain the base address of the original AoS buffer.
                     candidate.resourceOffset = 0;
@@ -271,7 +275,8 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                 candidate.binding.source = DirectX12PipelineState::GraphicsBinding::EXTERNAL_VERTEX;
             } else if (parameter.kind == "texture" && use.interfaceKind == "resource" && use.descriptorSet == 0 &&
                        use.binding != UINT32_MAX) {
-                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE;
+                candidate.layout.kind = parameter.format.empty() ? VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE
+                                                                 : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE;
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
                 candidate.layout.binding = use.binding;
                 candidate.binding.source = DirectX12PipelineState::GraphicsBinding::EXTERNAL_TEXTURE;
@@ -641,6 +646,11 @@ VernonStatus invokeDirectX12ComputePipeline(VernonLoadedPipeline &pipeline, cons
                 return fail(*pipeline.context, "D3D12 prepared storage binding requires an RHI Tensor");
             value.resource = argument.resource;
             value.resource.offset += state.rhiComputeResourceOffsets[index];
+        } else if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
+                   layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
+            if (argument.kind != ComputeLaunchArgumentKind::Texture || !argument.resource.resource.value)
+                return fail(*pipeline.context, "D3D12 prepared image binding requires an RHI Texture");
+            value.resource = argument.resource;
         } else {
             if (argument.kind != ComputeLaunchArgumentKind::Scalar || !argument.scalarData || !argument.scalarSize)
                 return fail(*pipeline.context, "D3D12 prepared inline binding requires host data at argument " +

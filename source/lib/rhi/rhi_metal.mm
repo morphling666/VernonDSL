@@ -1,4 +1,5 @@
 #include "backend_dispatch.h"
+#include "image_data_layout.h"
 #include "logical_resource_record.h"
 #include "metal_backend.h"
 #include "sampler_filter.h"
@@ -478,26 +479,19 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image,
                : VERNON_RHI_STATUS_UNSUPPORTED;
 }
 
-VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image, void *destination, size_t size) {
+VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image,
+                              const VernonRhiImageDownloadDescriptor *download, void *destination, size_t size) {
     auto device = lookupMetalDevice(handle);
-    if (!device || !destination)
+    if (!device || !download || download->struct_size < sizeof(*download) || !destination)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(device->mutex);
     MetalImageSlot *slot = lookupPublicResource(device->images, image);
     if (!slot)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    const size_t pixelSize = vernon::rhi::metal::bytesPerPixel(slot->descriptor.format);
-    if (slot->descriptor.width > (std::numeric_limits<size_t>::max)() / pixelSize)
+    const auto required = vernon::rhi::imageDownloadByteSize(slot->descriptor, *download);
+    if (!required || size != *required)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    size_t required = pixelSize * slot->descriptor.width;
-    for (uint32_t dimension : {slot->descriptor.height, slot->descriptor.depth, slot->descriptor.array_layers}) {
-        if (dimension > (std::numeric_limits<size_t>::max)() / required)
-            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-        required *= dimension;
-    }
-    if (size < required)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    return device->state.downloadImage(slot->native, slot->descriptor, destination, size, device->error)
+    return device->state.downloadImage(slot->native, slot->descriptor, *download, destination, size, device->error)
                ? VERNON_RHI_STATUS_OK
                : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
@@ -508,7 +502,11 @@ VernonRhiStatus generateImageMipmaps(VernonRhiDevice handle, VernonRhiImage imag
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(device->mutex);
     MetalImageSlot *slot = lookupPublicResource(device->images, image);
-    if (!slot)
+    if (!slot || slot->descriptor.mip_levels < 2 ||
+        !(slot->descriptor.usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE) ||
+        !(slot->descriptor.usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION) ||
+        slot->descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT ||
+        slot->descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     return device->state.generateImageMipmaps(slot->native, slot->descriptor.mip_levels, device->error)
                ? VERNON_RHI_STATUS_OK
@@ -650,6 +648,18 @@ uint64_t resolveResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key
     }
     MetalSamplerSlot *slot = lookupResourceRecord(device->samplers, key);
     return slot ? reinterpret_cast<uintptr_t>((__bridge void *)slot->native.sampler) : 0;
+}
+
+bool describeImageResource(VernonRhiDevice handle, uint64_t key, VernonRhiImageDescriptor *descriptor) {
+    auto device = lookupMetalDevice(handle);
+    if (!device || !descriptor)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    const MetalImageSlot *slot = lookupResourceRecord(device->images, key);
+    if (!slot || !slot->occupied)
+        return false;
+    *descriptor = slot->descriptor;
+    return true;
 }
 
 void releaseResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
@@ -895,6 +905,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
         samplerResource,
         retainResource,
         resolveResource,
+        describeImageResource,
         releaseResource,
         beginCommands,
         submitCommands,

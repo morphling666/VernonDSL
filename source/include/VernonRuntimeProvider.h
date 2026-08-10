@@ -3,6 +3,7 @@
 
 #include "VernonCommon.h"
 #include "VernonGraphicsState.h"
+#include "VernonTextureTypes.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -151,6 +152,8 @@ typedef struct VernonRuntimeProviderBindingValue {
     size_t inline_size;
     uint32_t flags;
     uint32_t stride;
+    VernonTextureFormat texture_format;
+    VernonTextureDimension texture_dimension;
 } VernonRuntimeProviderBindingValue;
 
 typedef struct VernonRuntimeProviderBindingSetDescriptor {

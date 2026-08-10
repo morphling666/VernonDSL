@@ -76,7 +76,8 @@ struct VERNON_RHI_CAPI DeviceState {
     void destroyImage(Image &image);
     bool uploadImage(const Image &image, const VernonRhiImageDescriptor &descriptor,
                      const VernonRhiImageUploadDescriptor *uploads, size_t uploadCount, std::string &error);
-    bool downloadImage(const Image &image, const VernonRhiImageDescriptor &descriptor, void *destination, size_t size,
+    bool downloadImage(const Image &image, const VernonRhiImageDescriptor &descriptor,
+                       const VernonRhiImageDownloadDescriptor &download, void *destination, size_t size,
                        std::string &error);
     bool generateImageMipmaps(const Image &image, uint32_t mipLevels, std::string &error);
     bool createImageView(ImageView &view, const Image &image, const VernonRhiImageViewDescriptor &descriptor,

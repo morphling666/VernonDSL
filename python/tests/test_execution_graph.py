@@ -164,9 +164,9 @@ class ExecutionGraphTests(unittest.TestCase):
     def test_sampled_depth_target_and_texture_share_graph_identity(self) -> None:
         graph = vd.ExecutionGraph()
         events: list[str] = []
-        depth = vd.Texture.zeros(shape=(8, 8), format=vd.depth32)
         color = vd.Texture.zeros(shape=(8, 8))
-        target = vd.RenderTarget(shape=(8, 8)).attach_color(0, color).attach_depth(texture=depth)
+        target = vd.RenderTarget(shape=(8, 8)).attach_color(0, color).attach_depth()
+        depth = target.depth_texture
         writer = RecordingRenderPass("shadow", events, target)
         reader = RecordingComputePass("sample", events, read=depth)
         reader.side_effect = True

@@ -38,9 +38,9 @@ from .resources import (
     SamplerState,
     TensorStorage,
     TensorView,
-    Texture,
     _bind_native_argument,
     _dispatch_borrow_scope,
+    _TextureResource,
 )
 
 
@@ -281,7 +281,7 @@ class Pipeline:
         for parameter in parameters:
             value = arguments[parameter.name]
             if parameter.kind == state._native.PIPELINE_TEXTURE:
-                if not isinstance(value, Texture):
+                if not isinstance(value, _TextureResource):
                     raise TypeError(f"texture {parameter.name!r} must be a Texture")
                 builder.rhi_texture(parameter.name, value._resident_texture())
                 continue
@@ -381,7 +381,7 @@ class Pipeline:
         compiled = self._compile(arguments)
         for parameter in compiled.native.parameters:
             value = arguments[parameter.name]
-            if isinstance(value, Texture):
+            if isinstance(value, _TextureResource):
                 execution_pass.read(value)
             elif isinstance(value, (TensorStorage, TensorView)):
                 if parameter.access == state._native.ACCESS_READ:

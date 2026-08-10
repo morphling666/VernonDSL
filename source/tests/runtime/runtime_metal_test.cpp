@@ -164,7 +164,14 @@ TEST(RuntimeMetal, RoundTripsTextureGeneratesMipmapsAndCreatesSampler) {
     ASSERT_EQ(vernonRhiDeviceUploadImage(device, image, &upload, 1), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceGenerateImageMipmaps(device, image), VERNON_RHI_STATUS_OK);
     std::array<uint8_t, source.size()> destination{};
-    ASSERT_EQ(vernonRhiDeviceDownloadImage(device, image, destination.data(), destination.size()),
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.width = descriptor.width;
+    download.height = descriptor.height;
+    download.depth = 1;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(device, image, &download, destination.data(), destination.size()),
               VERNON_RHI_STATUS_OK);
     EXPECT_EQ(destination, source);
     uint64_t nativeImage = 0;
@@ -405,8 +412,19 @@ TEST(RuntimeMetal, RoundTripsThreeDimensionalCubeAndDepthTextures) {
         }
         EXPECT_EQ(vernonRhiDeviceUploadImage(device, image, uploads.data(), uploads.size()), VERNON_RHI_STATUS_OK);
         std::vector<uint8_t> destination(byteSize);
-        EXPECT_EQ(vernonRhiDeviceDownloadImage(device, image, destination.data(), destination.size()),
-                  VERNON_RHI_STATUS_OK);
+        VernonRhiImageDownloadDescriptor download{};
+        download.struct_size = sizeof(download);
+        download.width = width;
+        download.height = height;
+        download.depth = depth;
+        download.destination_format = sourceFormat;
+        download.destination_type = sourceType;
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+            download.array_layer = dimension == VERNON_RHI_IMAGE_3D ? 0 : layer;
+            EXPECT_EQ(vernonRhiDeviceDownloadImage(device, image, &download, destination.data() + layer * layerSize,
+                                                   layerSize),
+                      VERNON_RHI_STATUS_OK);
+        }
         EXPECT_EQ(std::memcmp(destination.data(), source, byteSize), 0);
         EXPECT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
     };
@@ -864,7 +882,15 @@ kernel void copy_texture(constant TextureArguments &arguments [[buffer(0)]]) {
     ASSERT_EQ(vernonRhiCommandEncoderFinish(device, command), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceSubmit(device, command), VERNON_RHI_STATUS_OK);
     std::array<uint8_t, 4> result{};
-    ASSERT_EQ(vernonRhiDeviceDownloadImage(device, output, result.data(), result.size()), VERNON_RHI_STATUS_OK);
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.width = 1;
+    download.height = 1;
+    download.depth = 1;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(device, output, &download, result.data(), result.size()),
+              VERNON_RHI_STATUS_OK);
     EXPECT_EQ(result, color);
 
     EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, command), VERNON_RHI_STATUS_OK);
@@ -1097,7 +1123,15 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     ASSERT_EQ(vernonRhiCommandEncoderFinish(device, command), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceSubmit(device, command), VERNON_RHI_STATUS_OK);
     std::array<uint8_t, 4 * 4 * 4> pixels{};
-    ASSERT_EQ(vernonRhiDeviceDownloadImage(device, image, pixels.data(), pixels.size()), VERNON_RHI_STATUS_OK);
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.width = 4;
+    download.height = 4;
+    download.depth = 1;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(device, image, &download, pixels.data(), pixels.size()),
+              VERNON_RHI_STATUS_OK);
     for (size_t index = 0; index < pixels.size(); index += 4) {
         EXPECT_EQ(pixels[index], 0);
         EXPECT_EQ(pixels[index + 1], 0);
@@ -1105,7 +1139,9 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
         EXPECT_EQ(pixels[index + 3], 255);
     }
     std::array<uint8_t, 4 * 4 * 8> depthStencil{};
-    ASSERT_EQ(vernonRhiDeviceDownloadImage(device, depthImage, depthStencil.data(), depthStencil.size()),
+    download.destination_format = VERNON_RHI_IMAGE_DATA_DEPTH_STENCIL;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_FLOAT32;
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(device, depthImage, &download, depthStencil.data(), depthStencil.size()),
               VERNON_RHI_STATUS_OK);
     for (size_t index = 0; index < depthStencil.size(); index += 8) {
         float depth = 0.0f;
@@ -1318,7 +1354,15 @@ TEST(RuntimeMetal, PublicRuntimeBindsCookedResolutionUniform) {
     ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     std::vector<uint8_t> pixels(32 * 32 * 4);
-    ASSERT_EQ(vernonRhiDeviceDownloadImage(device, target, pixels.data(), pixels.size()), VERNON_RHI_STATUS_OK);
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.width = 32;
+    download.height = 32;
+    download.depth = 1;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(device, target, &download, pixels.data(), pixels.size()),
+              VERNON_RHI_STATUS_OK);
     const size_t center = (16 * 32 + 16) * 4;
     EXPECT_GT(pixels[center], 250);
     EXPECT_GT(pixels[center + 1], 250);
@@ -1395,6 +1439,9 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
     ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &sampled), VERNON_RHI_STATUS_OK);
     constexpr uint8_t sampledPixel[]{64, 200, 100, 128};
     VernonRhiImageUploadDescriptor upload{sizeof(VernonRhiImageUploadDescriptor),
+                                          0,
+                                          0,
+                                          0,
                                           0,
                                           0,
                                           1,
@@ -1479,7 +1526,15 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
 
     std::vector<uint8_t> pixels(32 * 32 * 4);
-    ASSERT_EQ(vernonRhiDeviceDownloadImage(device, target, pixels.data(), pixels.size()), VERNON_RHI_STATUS_OK);
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.width = 32;
+    download.height = 32;
+    download.depth = 1;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(device, target, &download, pixels.data(), pixels.size()),
+              VERNON_RHI_STATUS_OK);
     const size_t center = (16 * 32 + 16) * 4;
     EXPECT_NEAR(pixels[center], sampledPixel[0], 2);
     EXPECT_NEAR(pixels[center + 1], sampledPixel[1], 2);
@@ -1500,7 +1555,8 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
     };
     auto centerPixel = [&] {
         std::vector<uint8_t> result(32 * 32 * 4);
-        EXPECT_EQ(vernonRhiDeviceDownloadImage(device, target, result.data(), result.size()), VERNON_RHI_STATUS_OK);
+        EXPECT_EQ(vernonRhiDeviceDownloadImage(device, target, &download, result.data(), result.size()),
+                  VERNON_RHI_STATUS_OK);
         std::array<uint8_t, 4> pixel{};
         std::copy_n(result.begin() + center, pixel.size(), pixel.begin());
         return pixel;

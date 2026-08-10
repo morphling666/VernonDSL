@@ -399,7 +399,7 @@ class PipelineCompileTests(unittest.TestCase):
                         {
                             "index": 0,
                             "kind": "texture",
-                            "type": "!vernon.texture<2d, f32>",
+                            "type": '!vernon.texture<"2d", f32, "unknown", "sampled">',
                             "dtype": "f32",
                             "dimension": "2d",
                             "vernon.source_name": "image",

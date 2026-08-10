@@ -123,6 +123,23 @@ FailureOr<Type> convertValueType(Type type, ModuleOp module = {}) {
                                                   .Default(std::nullopt);
         if (!dimension)
             return failure();
+        if (texture.getAccess() != "sampled") {
+            std::optional<spirv::ImageFormat> format =
+                llvm::StringSwitch<std::optional<spirv::ImageFormat>>(texture.getFormat())
+                    .Case("r8_unorm", spirv::ImageFormat::R8)
+                    .Case("r16_float", spirv::ImageFormat::R16f)
+                    .Case("r32_float", spirv::ImageFormat::R32f)
+                    .Case("rg8_unorm", spirv::ImageFormat::Rg8)
+                    .Case("rgba8_unorm", spirv::ImageFormat::Rgba8)
+                    .Case("rgba16_float", spirv::ImageFormat::Rgba16f)
+                    .Case("rgba32_float", spirv::ImageFormat::Rgba32f)
+                    .Default(std::nullopt);
+            if (!format || texture.getDimension() == "cube")
+                return failure();
+            return spirv::ImageType::get(texture.getElementType(), *dimension, spirv::ImageDepthInfo::NoDepth,
+                                         spirv::ImageArrayedInfo::NonArrayed, spirv::ImageSamplingInfo::SingleSampled,
+                                         spirv::ImageSamplerUseInfo::NoSampler, *format);
+        }
         auto image = spirv::ImageType::get(texture.getElementType(), *dimension, spirv::ImageDepthInfo::NoDepth,
                                            spirv::ImageArrayedInfo::NonArrayed, spirv::ImageSamplingInfo::SingleSampled,
                                            spirv::ImageSamplerUseInfo::NeedSampler, spirv::ImageFormat::Unknown);
@@ -862,6 +879,16 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
                                                            spirv::ImageOperandsAttr(), ValueRange{})
                 .getResult();
         }
+        if (intrinsic.getName() == "texture_load") {
+            Value image = mapped(intrinsic.getOperand(0));
+            Value coordinates = mapped(intrinsic.getOperand(1));
+            FailureOr<Type> resultType = convertValueType(intrinsic.getResult().getType());
+            if (!image || !coordinates || failed(resultType))
+                return failure();
+            return spirv::ImageReadOp::create(builder, location, *resultType, image, coordinates,
+                                              spirv::ImageOperandsAttr(), ValueRange{})
+                .getResult();
+        }
         if (intrinsic.getName() == "texture_size") {
             Value sampledImage = mapped(intrinsic.getOperand(0));
             FailureOr<Type> resultType = convertValueType(intrinsic.getResult().getType());
@@ -1165,6 +1192,20 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
     return failure();
 }
 
+LogicalResult translateVoidOperation(Operation &operation, OpBuilder &builder, IRMapping &mapping) {
+    auto intrinsic = dyn_cast<IntrinsicOp>(operation);
+    if (!intrinsic || intrinsic.getName() != "texture_store" || intrinsic.getNumOperands() != 3)
+        return failure();
+    Value image = mapping.lookupOrNull(intrinsic.getOperand(0));
+    Value coordinates = mapping.lookupOrNull(intrinsic.getOperand(1));
+    Value texel = mapping.lookupOrNull(intrinsic.getOperand(2));
+    if (!image || !coordinates || !texel)
+        return failure();
+    spirv::ImageWriteOp::create(builder, operation.getLoc(), image, coordinates, texel, spirv::ImageOperandsAttr(),
+                                ValueRange{});
+    return success();
+}
+
 LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder, Block *functionEntry, IRMapping &mapping,
                                          SmallVectorImpl<Value> &yieldedValues, Value *condition = nullptr);
 
@@ -1279,6 +1320,12 @@ LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder, Bloc
                 return failure();
             for (auto [sourceResult, translatedResult] : llvm::zip_equal(whileOp.getResults(), translatedResults))
                 mapping.map(sourceResult, translatedResult);
+            continue;
+        }
+        if (operation.getNumResults() == 0) {
+            if (failed(translateVoidOperation(operation, builder, mapping)))
+                return operation.emitError()
+                       << "operation cannot be translated inside structured control flow: " << operation.getName();
             continue;
         }
         FailureOr<Value> translated = translateOperation(operation, builder, mapping);
@@ -1667,6 +1714,12 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             })) {
             // Every use is scalarized by TensorGet translation, so materializing
             // the full composite would only create backend-local aggregate arrays.
+            continue;
+        }
+        if (operation.getNumResults() == 0) {
+            if (failed(translateVoidOperation(operation, bodyBuilder, mapping)))
+                return operation.emitError()
+                       << "operation '" << operation.getName() << "' is not supported by SPIR-V lowering";
             continue;
         }
         FailureOr<Value> translated = translateOperation(operation, bodyBuilder, mapping);

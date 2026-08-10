@@ -204,6 +204,15 @@ def cube_direction_fragment(
 
 
 @vd.fragment
+def volume_coordinate_fragment(
+    coordinate: Annotated[vd.Vector[vd.f32, 3], vd.uniform()],
+    image: Annotated[vd.Texture["3d", vd.f32], vd.resource(set=0, binding=0)],  # noqa: F722, F821
+    sampler: Annotated[vd.Sampler, vd.resource(set=0, binding=1)],
+) -> vd.Vector[vd.f32, 4]:
+    return vd.texture_sample(image, sampler, coordinate)
+
+
+@vd.fragment
 def optional_texture_fragment(
     base_image: Annotated[vd.Texture["2d", vd.f32], vd.resource(set=0, binding=0)],  # noqa: F722, F821
     base_sampler: Annotated[vd.Sampler, vd.resource(set=0, binding=1)],

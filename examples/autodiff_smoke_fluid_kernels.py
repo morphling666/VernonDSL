@@ -57,6 +57,7 @@ def apply_forces(
         source = control_nozzles[nozzle] * horizontal * vertical
         density = state_density[y, x]
         velocity = state_velocity[y, x]
+        curl = vd.sin(vd.f32(y) * 0.23 + vd.f32(nozzle) * 1.7) * (density + source) * delta_time * 0.12
         forced_density[y, x] = vd.clamp(
             density * 0.995 + source * delta_time * 3.0,
             0.0,
@@ -64,7 +65,7 @@ def apply_forces(
         )
         forced_velocity[y, x] = vd.Vector(
             [
-                velocity.x + (vd.f32(nozzle) - (vd.f32(nozzle_count) - 1.0) * 0.5) * source * delta_time * 0.08,
+                velocity.x + (vd.f32(nozzle) - (vd.f32(nozzle_count) - 1.0) * 0.5) * source * delta_time * 0.08 + curl,
                 velocity.y - (density * 0.9 + source * 1.6) * delta_time,
             ]
         )

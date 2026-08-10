@@ -252,7 +252,8 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                 argument.tensorElements = elements;
                 argument.tensorBytes = elements * elementSize;
             }
-            if (argument.kind != "tensor" && argument.kind != "scalar" && argument.kind != "builtin") {
+            if (argument.kind != "tensor" && argument.kind != "scalar" && argument.kind != "builtin" &&
+                argument.kind != "texture" && argument.kind != "sampler") {
                 error = "argument layout has an unsupported kind";
                 return false;
             }

@@ -186,6 +186,7 @@ std::vector<GlEnum> shaderKinds;
 std::vector<GlEnum> invalidatedAttachments;
 std::vector<unsigned char> bufferStorage;
 std::vector<unsigned char> textureStorage;
+std::vector<GlInt> framebufferTextureLayers;
 std::array<GlInt, 4> signedUniformUpload{};
 std::array<GlUint, 4> unsignedUniformUpload{};
 
@@ -201,6 +202,9 @@ void GL_CALL enumNoop(GlEnum) {}
 void GL_CALL enumIntNoop(GlEnum, GlInt) {}
 void GL_CALL deleteNamesNoop(GlSize, const GlUint *) {}
 void GL_CALL framebufferTexture2DNoop(GlEnum, GlEnum, GlEnum, GlUint, GlInt) {}
+void GL_CALL framebufferTextureLayer(GlEnum, GlEnum, GlUint, GlInt, GlInt layer) {
+    framebufferTextureLayers.push_back(layer);
+}
 void GL_CALL drawBuffersNoop(GlSize, const GlEnum *) {}
 void GL_CALL drawArraysInstanced(GlEnum, GlInt, GlSize, GlSize) { ++drawCount; }
 void GL_CALL uniformFvNoop(GlInt, GlSize, const float *) {}
@@ -415,6 +419,7 @@ void *getProcAddress(void *, const char *name) {
     PROC("glCheckFramebufferStatus", framebufferStatus);
     PROC("glBindFramebuffer", bindFramebuffer);
     PROC("glFramebufferTexture2D", framebufferTexture2DNoop);
+    PROC("glFramebufferTextureLayer", framebufferTextureLayer);
     PROC("glDrawBuffers", drawBuffersNoop);
     PROC("glDrawArrays", drawArrays);
     PROC("glDrawArraysInstanced", drawArraysInstanced);
@@ -680,7 +685,7 @@ std::string internalValueBundle() {
         nlohmann::json::array({{{"slot", 0},
                                 {"name", "image"},
                                 {"kind", "texture"},
-                                {"type", "!vernon.texture<\"2d\", f32>"},
+                                {"type", "!vernon.texture<\"2d\", f32, \"unknown\", \"sampled\">"},
                                 {"dtype", "f32"},
                                 {"access", "read"},
                                 {"dimension", "2d"},
@@ -879,13 +884,70 @@ TEST(RuntimeExternalGl, CreatesAndReadsBackD32S8Image) {
     VernonRhiImage image{};
     ASSERT_EQ(vernonRhiDeviceCreateImage(context.device, &descriptor, &image), VERNON_RHI_STATUS_OK);
     std::array<uint8_t, 2 * 2 * 8> data{};
-    EXPECT_EQ(vernonRhiDeviceDownloadImage(context.device, image, data.data(), data.size()), VERNON_RHI_STATUS_OK);
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.width = descriptor.width;
+    download.height = descriptor.height;
+    download.depth = descriptor.depth;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_DEPTH_STENCIL;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_FLOAT32;
+    EXPECT_EQ(vernonRhiDeviceDownloadImage(context.device, image, &download, data.data(), data.size()),
+              VERNON_RHI_STATUS_OK);
     for (size_t offset = 0; offset < data.size(); offset += 8) {
         float depth{};
         std::memcpy(&depth, data.data() + offset, sizeof(depth));
         EXPECT_FLOAT_EQ(depth, 0.25f);
         EXPECT_EQ(data[offset + sizeof(depth)], 7);
     }
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(context.device, image), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeDestroy(context.runtime), VERNON_STATUS_OK);
+    vernonRhiDestroyDevice(context.device);
+}
+
+TEST(RuntimeExternalGl, ReadsEveryThreeDimensionalImageLayer) {
+    framebufferTextureLayers.clear();
+    VernonOpenGLContextCallbacks callbacks{};
+    callbacks.struct_size = sizeof(callbacks);
+    callbacks.make_current = &makeCurrent;
+    callbacks.get_proc_address = &getProcAddress;
+    callbacks.api_version_major = 4;
+    callbacks.api_version_minor = 3;
+    vernon::tests::RhiRuntime context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_OPENGL, &callbacks);
+    ASSERT_NE(context.runtime, nullptr);
+
+    VernonRhiImageDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.dimension = VERNON_RHI_IMAGE_3D;
+    descriptor.width = 2;
+    descriptor.height = 2;
+    descriptor.depth = 3;
+    descriptor.mip_levels = 1;
+    descriptor.array_layers = 1;
+    descriptor.sample_count = 1;
+    descriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    descriptor.usage =
+        VERNON_RHI_IMAGE_SAMPLED | VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION;
+    VernonRhiImage image{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(context.device, &descriptor, &image), VERNON_RHI_STATUS_OK);
+
+    std::array<uint8_t, 2 * 2 * 4> layer{};
+    for (size_t index = 0; index < layer.size(); ++index)
+        layer[index] = static_cast<uint8_t>(index);
+    textureStorage.assign(layer.begin(), layer.end());
+    std::array<uint8_t, 3 * 2 * 2 * 4> volume{};
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.width = descriptor.width;
+    download.height = descriptor.height;
+    download.depth = descriptor.depth;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, image, &download, volume.data(), volume.size()),
+              VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(framebufferTextureLayers, (std::vector<GlInt>{0, 1, 2}));
+    for (size_t offset = 0; offset < volume.size(); offset += layer.size())
+        EXPECT_TRUE(std::equal(layer.begin(), layer.end(), volume.begin() + static_cast<ptrdiff_t>(offset)));
+
     EXPECT_EQ(vernonRhiDeviceDestroyImage(context.device, image), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRuntimeDestroy(context.runtime), VERNON_STATUS_OK);
     vernonRhiDestroyDevice(context.device);
@@ -916,13 +978,13 @@ TEST(RuntimeExternalGl, InvokesDirectComputePipelineThroughRuntimeCoreProvider) 
           }
         },
         "arguments": [
-          {"kind":"tensor","dtype":"f32","shape":[4],"element_layout":{"logical_type":"f32","byte_size":4,
+          {"kind":"tensor","dtype":"f32","access":"write","shape":[4],"element_layout":{"logical_type":"f32","byte_size":4,
            "alignment":4,"layout_hash":"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",
            "leaves":[{"path":[],"dtype":"f32","byte_offset":0,"scalar_count":1}]},
            "physical_layouts":{"vulkan_std430_storage_buffer":{"profile":"vulkan_std430_storage_buffer",
            "kind":"resource_binding","resource_kind":"descriptor_storage_leaves"}},
            "binding":0},
-          {"kind":"scalar","dtype":"f32","value_layout":{"logical_type":"f32","byte_size":4,
+          {"kind":"scalar","dtype":"f32","access":"read","value_layout":{"logical_type":"f32","byte_size":4,
            "alignment":4,"layout_hash":"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b",
            "leaves":[{"path":[],"dtype":"f32","byte_offset":0,"scalar_count":1}]},
            "physical_layouts":{"vulkan_std430_storage_buffer":{"profile":"vulkan_std430_storage_buffer",
@@ -1008,6 +1070,94 @@ TEST(RuntimeExternalGl, InvokesDirectComputePipelineThroughRuntimeCoreProvider) 
     EXPECT_NE(recycled.handle.generation, buffer.handle.generation);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(rhiRuntime(gl).device, recycled.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(rhiRuntime(gl).device, replacement.handle), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeExternalGl, RejectsStorageImageMetadataThatDisagreesWithRhiResource) {
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    ASSERT_TRUE(gl);
+    auto image = vernon::tests::createImage(rhiRuntime(gl), VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM, 1, 1, 1,
+                                            VERNON_RHI_IMAGE_STORAGE);
+    ASSERT_NE(image.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+
+    static constexpr char source[] = "#version 430\nlayout(local_size_x=1) in;"
+                                     "layout(rgba32f,binding=0) uniform writeonly image2D outputImage;"
+                                     "void main(){imageStore(outputImage,ivec2(0),vec4(1.0));}";
+    static constexpr char reflection[] = "{" VERNON_JSON_VERSION_FIELDS R"(,
+      "entries": [{
+        "name": "main",
+        "workgroup_size": [1, 1, 1],
+        "dispatch_contract": {"unit_grid_axes": [], "requires_unit_workgroup": false},
+        "physical_layouts": {
+          "vulkan_std430_storage_buffer": {
+            "profile":"vulkan_std430_storage_buffer","packing":"resource_bindings"
+          }
+        },
+        "arguments": [{
+          "kind":"texture","access":"write","dimension":"2d","format":"rgba32_float",
+          "physical_layouts":{"vulkan_std430_storage_buffer":{
+            "profile":"vulkan_std430_storage_buffer","kind":"resource_binding",
+            "resource_kind":"texture_descriptor"}},
+          "vernon.binding":0
+        }]
+      }]
+    })";
+    VernonLoadedPipeline *pipeline =
+        vernonRuntimeLoadArtifact(gl, source, sizeof(source) - 1, reflection, sizeof(reflection) - 1, "main", 4);
+    ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
+
+    VernonPipelineArgument argument{};
+    argument.slot = 0;
+    argument.kind = VERNON_PIPELINE_TEXTURE;
+    argument.texture.format = VERNON_TEXTURE_RGBA32_FLOAT;
+    argument.texture.access = VERNON_ACCESS_WRITE;
+    argument.texture.dimension = VERNON_TEXTURE_2D;
+    argument.texture.width = argument.texture.height = argument.texture.depth = 1;
+    argument.texture.resource = image.reference;
+    VernonPipelineInvocation invocation{};
+    invocation.struct_size = sizeof(invocation);
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.arguments = &argument;
+    invocation.argument_count = 1;
+    invocation.compute_grid = {1, 1, 1};
+    EXPECT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
+
+    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, image.handle), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeExternalGl, RejectsComputeSampledTextureAtPipelinePreparation) {
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    ASSERT_TRUE(gl);
+
+    static constexpr char source[] = "#version 430\nlayout(local_size_x=1) in;"
+                                     "layout(binding=0) uniform sampler2D inputImage;"
+                                     "void main(){vec4 value=texture(inputImage,vec2(0.5));}";
+    static constexpr char reflection[] = "{" VERNON_JSON_VERSION_FIELDS R"(,
+      "entries": [{
+        "name": "main",
+        "workgroup_size": [1, 1, 1],
+        "dispatch_contract": {"unit_grid_axes": [], "requires_unit_workgroup": false},
+        "physical_layouts": {
+          "vulkan_std430_storage_buffer": {
+            "profile":"vulkan_std430_storage_buffer","packing":"resource_bindings"
+          }
+        },
+        "arguments": [{
+          "kind":"texture","access":"read","dimension":"2d",
+          "physical_layouts":{"vulkan_std430_storage_buffer":{
+            "profile":"vulkan_std430_storage_buffer","kind":"resource_binding",
+            "resource_kind":"texture_descriptor"}},
+          "vernon.binding":0
+        }]
+      }]
+    })";
+    EXPECT_EQ(vernonRuntimeLoadArtifact(gl, source, sizeof(source) - 1, reflection, sizeof(reflection) - 1, "main", 4),
+              nullptr);
+    const VernonStringView error = vernonRuntimeGetLastError(gl);
+    EXPECT_NE(std::string(error.data, error.size).find("compute pipelines do not support sampled textures"),
+              std::string::npos);
     EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
 }
 

@@ -41,8 +41,10 @@ struct VERNON_RHI_CAPI DeviceState {
     void importImage(Image &image, Uint name);
     void destroyImage(Image &image);
     bool uploadImage2D(const Image &image, Size width, Size height, Enum externalFormat, Enum type, const void *source);
-    bool downloadImage2D(const Image &image, Size width, Size height, Enum externalFormat, Enum type, void *destination,
-                         std::string &error);
+    bool downloadImage2D(const Image &image, Enum target, Int mipLevel, Int x, Int y, Size width, Size height,
+                         Enum externalFormat, Enum type, void *destination, std::string &error);
+    bool downloadImage3D(const Image &image, Int mipLevel, Int x, Int y, Int z, Size width, Size height, Size depth,
+                         Enum externalFormat, Enum type, size_t layerSize, void *destination, std::string &error);
 
     bool createSampler(Sampler &sampler, Int wrapU, Int wrapV, Int wrapW, Int minFilter, Int magFilter,
                        std::string &error);

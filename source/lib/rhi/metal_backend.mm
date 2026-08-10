@@ -94,45 +94,11 @@ uint32_t pixelFormat(VernonRhiFormat format) {
     }
 }
 
-size_t bytesPerPixel(VernonRhiFormat format) {
-    switch (format) {
-    case VERNON_RHI_FORMAT_R8_UNORM:
-        return 1;
-    case VERNON_RHI_FORMAT_RG8_UNORM:
-    case VERNON_RHI_FORMAT_R16_FLOAT:
-        return 2;
-    case VERNON_RHI_FORMAT_RGBA8_UNORM:
-    case VERNON_RHI_FORMAT_RGBA8_SRGB:
-    case VERNON_RHI_FORMAT_R32_FLOAT:
-    case VERNON_RHI_FORMAT_R11G11B10_FLOAT:
-    case VERNON_RHI_FORMAT_D32_FLOAT:
-        return 4;
-    case VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT:
-        return packedDepthStencilPixelSize;
-    case VERNON_RHI_FORMAT_RGBA16_FLOAT:
-    case VERNON_RHI_FORMAT_RG32_FLOAT:
-        return 8;
-    case VERNON_RHI_FORMAT_RGBA32_FLOAT:
-        return 16;
-    default:
-        return 0;
-    }
-}
+size_t bytesPerPixel(VernonRhiFormat format) { return vernon::rhi::imageFormatPixelSize(format); }
 
 bool uploadLayoutMatches(VernonRhiFormat destination, VernonRhiImageDataFormat sourceFormat,
                          VernonRhiImageDataType sourceType) {
-    if (sourceType == VERNON_RHI_IMAGE_DATA_UINT8) {
-        return (destination == VERNON_RHI_FORMAT_R8_UNORM && sourceFormat == VERNON_RHI_IMAGE_DATA_RED) ||
-               (destination == VERNON_RHI_FORMAT_RG8_UNORM && sourceFormat == VERNON_RHI_IMAGE_DATA_RG) ||
-               ((destination == VERNON_RHI_FORMAT_RGBA8_UNORM || destination == VERNON_RHI_FORMAT_RGBA8_SRGB) &&
-                sourceFormat == VERNON_RHI_IMAGE_DATA_RGBA);
-    }
-    if (sourceType != VERNON_RHI_IMAGE_DATA_FLOAT32)
-        return false;
-    return (destination == VERNON_RHI_FORMAT_R32_FLOAT && sourceFormat == VERNON_RHI_IMAGE_DATA_RED) ||
-           (destination == VERNON_RHI_FORMAT_RG32_FLOAT && sourceFormat == VERNON_RHI_IMAGE_DATA_RG) ||
-           (destination == VERNON_RHI_FORMAT_RGBA32_FLOAT && sourceFormat == VERNON_RHI_IMAGE_DATA_RGBA) ||
-           (destination == VERNON_RHI_FORMAT_D32_FLOAT && sourceFormat == VERNON_RHI_IMAGE_DATA_DEPTH);
+    return vernon::rhi::uploadLayoutMatches(destination, sourceFormat, sourceType);
 }
 
 bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
@@ -295,12 +261,19 @@ bool DeviceState::uploadImage(const Image &image, const VernonRhiImageDescriptor
         const bool validLayer =
             descriptor.dimension == VERNON_RHI_IMAGE_3D ? upload.array_layer == 0
                                                         : upload.array_layer < descriptor.array_layers;
-        const uint32_t mipWidth = std::max(descriptor.width >> upload.mip_level, 1u);
-        const uint32_t mipHeight = std::max(descriptor.height >> upload.mip_level, 1u);
-        const uint32_t mipDepth =
-            descriptor.dimension == VERNON_RHI_IMAGE_3D ? std::max(descriptor.depth >> upload.mip_level, 1u) : 1u;
-        if (upload.struct_size < sizeof(upload) || !upload.data || upload.mip_level >= descriptor.mip_levels ||
-            !validLayer || upload.width != mipWidth || upload.height != mipHeight || upload.depth != mipDepth ||
+        const bool validMip = upload.mip_level < descriptor.mip_levels;
+        const uint32_t mipWidth = validMip ? vernon::rhi::imageMipExtent(descriptor.width, upload.mip_level) : 0;
+        const uint32_t mipHeight = validMip ? vernon::rhi::imageMipExtent(descriptor.height, upload.mip_level) : 0;
+        const uint32_t mipDepth = !validMip
+                                      ? 0
+                                      : descriptor.dimension == VERNON_RHI_IMAGE_3D
+                                            ? vernon::rhi::imageMipExtent(descriptor.depth, upload.mip_level)
+                                            : 1u;
+        if (upload.struct_size < sizeof(upload) || !upload.data || !validMip || !validLayer || !upload.width ||
+            !upload.height || !upload.depth || upload.offset_x >= mipWidth ||
+            upload.width > mipWidth - upload.offset_x || upload.offset_y >= mipHeight ||
+            upload.height > mipHeight - upload.offset_y || upload.offset_z >= mipDepth ||
+            upload.depth > mipDepth - upload.offset_z ||
             !uploadLayoutMatches(descriptor.format, upload.source_format, upload.source_type)) {
             error = "Metal image upload layout is unsupported";
             return false;
@@ -342,7 +315,7 @@ bool DeviceState::uploadImage(const Image &image, const VernonRhiImageDescriptor
                      toTexture:image.texture
               destinationSlice:descriptor.dimension == VERNON_RHI_IMAGE_3D ? 0 : upload.array_layer
               destinationLevel:upload.mip_level
-             destinationOrigin:MTLOriginMake(0, 0, 0)];
+             destinationOrigin:MTLOriginMake(upload.offset_x, upload.offset_y, upload.offset_z)];
         [encoder endEncoding];
         [commandBuffer commit];
         [commandBuffer waitUntilCompleted];
@@ -354,17 +327,17 @@ bool DeviceState::uploadImage(const Image &image, const VernonRhiImageDescriptor
     return true;
 }
 
-bool DeviceState::downloadImage(const Image &image, const VernonRhiImageDescriptor &descriptor, void *destination,
-                                size_t size, std::string &error) {
+bool DeviceState::downloadImage(const Image &image, const VernonRhiImageDescriptor &descriptor,
+                                const VernonRhiImageDownloadDescriptor &download, void *destination, size_t size,
+                                std::string &error) {
     const size_t pixelSize = bytesPerPixel(descriptor.format);
-    if (descriptor.width > (std::numeric_limits<size_t>::max)() / pixelSize ||
-        descriptor.height > (std::numeric_limits<size_t>::max)() / (pixelSize * descriptor.width)) {
+    if (download.width > (std::numeric_limits<size_t>::max)() / pixelSize ||
+        download.height > (std::numeric_limits<size_t>::max)() / (pixelSize * download.width)) {
         error = "Metal image readback size overflows the host address range";
         return false;
     }
-    const size_t layerSize = pixelSize * descriptor.width * descriptor.height * descriptor.depth;
-    if (descriptor.array_layers > (std::numeric_limits<size_t>::max)() / layerSize ||
-        size < layerSize * descriptor.array_layers) {
+    const size_t layerSize = pixelSize * download.width * download.height * download.depth;
+    if (size < layerSize) {
         error = "Metal image readback destination is too small";
         return false;
     }
@@ -373,45 +346,40 @@ bool DeviceState::downloadImage(const Image &image, const VernonRhiImageDescript
             error = "Metal depth/stencil readback only supports 2D images";
             return false;
         }
-        const size_t depthRowSize = sizeof(float) * descriptor.width;
+        const size_t depthRowSize = sizeof(float) * download.width;
         const size_t depthRowPitch = alignedTextureRowSize(depthRowSize);
-        const size_t stencilRowSize = descriptor.width;
+        const size_t stencilRowSize = download.width;
         const size_t stencilRowPitch = alignedTextureRowSize(stencilRowSize);
-        const size_t depthLayerSize = depthRowPitch * descriptor.height;
-        const size_t stencilLayerSize = stencilRowPitch * descriptor.height;
-        id<MTLBuffer> depthStaging =
-            [device newBufferWithLength:depthLayerSize * descriptor.array_layers
-                                options:MTLResourceStorageModeShared];
+        const size_t depthLayerSize = depthRowPitch * download.height;
+        const size_t stencilLayerSize = stencilRowPitch * download.height;
+        id<MTLBuffer> depthStaging = [device newBufferWithLength:depthLayerSize options:MTLResourceStorageModeShared];
         id<MTLBuffer> stencilStaging =
-            [device newBufferWithLength:stencilLayerSize * descriptor.array_layers
-                                options:MTLResourceStorageModeShared];
+            [device newBufferWithLength:stencilLayerSize options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
         id<MTLBlitCommandEncoder> encoder = [commandBuffer blitCommandEncoder];
         if (!depthStaging || !stencilStaging || !commandBuffer || !encoder) {
             error = "Metal depth/stencil readback staging or view creation failed";
             return false;
         }
-        for (uint32_t layer = 0; layer < descriptor.array_layers; ++layer) {
-            [encoder copyFromTexture:image.texture
-                        sourceSlice:layer
-                        sourceLevel:0
-                       sourceOrigin:MTLOriginMake(0, 0, 0)
-                         sourceSize:MTLSizeMake(descriptor.width, descriptor.height, 1)
-                           toBuffer:depthStaging
-                  destinationOffset:layer * depthLayerSize
-             destinationBytesPerRow:depthRowPitch
-           destinationBytesPerImage:depthLayerSize];
-            [encoder copyFromTexture:image.texture
-                        sourceSlice:layer
-                        sourceLevel:0
-                       sourceOrigin:MTLOriginMake(0, 0, 0)
-                         sourceSize:MTLSizeMake(descriptor.width, descriptor.height, 1)
-                           toBuffer:stencilStaging
-                  destinationOffset:layer * stencilLayerSize
-             destinationBytesPerRow:stencilRowPitch
-           destinationBytesPerImage:stencilLayerSize
-                          options:MTLBlitOptionStencilFromDepthStencil];
-        }
+        [encoder copyFromTexture:image.texture
+                    sourceSlice:download.array_layer
+                    sourceLevel:download.mip_level
+                   sourceOrigin:MTLOriginMake(download.offset_x, download.offset_y, 0)
+                     sourceSize:MTLSizeMake(download.width, download.height, 1)
+                       toBuffer:depthStaging
+              destinationOffset:0
+         destinationBytesPerRow:depthRowPitch
+       destinationBytesPerImage:depthLayerSize];
+        [encoder copyFromTexture:image.texture
+                    sourceSlice:download.array_layer
+                    sourceLevel:download.mip_level
+                   sourceOrigin:MTLOriginMake(download.offset_x, download.offset_y, 0)
+                     sourceSize:MTLSizeMake(download.width, download.height, 1)
+                       toBuffer:stencilStaging
+              destinationOffset:0
+         destinationBytesPerRow:stencilRowPitch
+       destinationBytesPerImage:stencilLayerSize
+                      options:MTLBlitOptionStencilFromDepthStencil];
         [encoder endEncoding];
         [commandBuffer commit];
         [commandBuffer waitUntilCompleted];
@@ -422,54 +390,46 @@ bool DeviceState::downloadImage(const Image &image, const VernonRhiImageDescript
         auto *output = static_cast<uint8_t *>(destination);
         const auto *depthSource = static_cast<const uint8_t *>(depthStaging.contents);
         const auto *stencilSource = static_cast<const uint8_t *>(stencilStaging.contents);
-        for (uint32_t layer = 0; layer < descriptor.array_layers; ++layer)
-            for (uint32_t y = 0; y < descriptor.height; ++y)
-                for (uint32_t x = 0; x < descriptor.width; ++x) {
+        for (uint32_t y = 0; y < download.height; ++y)
+            for (uint32_t x = 0; x < download.width; ++x) {
                     const size_t outputOffset =
-                        (static_cast<size_t>(layer) * descriptor.width * descriptor.height +
-                         static_cast<size_t>(y) * descriptor.width + x) *
-                        packedDepthStencilPixelSize;
-                    const size_t depthOffset = layer * depthLayerSize + y * depthRowPitch + x * sizeof(float);
-                    const size_t stencilOffset = layer * stencilLayerSize + y * stencilRowPitch + x;
+                        (static_cast<size_t>(y) * download.width + x) * packedDepthStencilPixelSize;
+                    const size_t depthOffset = y * depthRowPitch + x * sizeof(float);
+                    const size_t stencilOffset = y * stencilRowPitch + x;
                     float depthValue{};
                     std::memcpy(&depthValue, depthSource + depthOffset, sizeof(depthValue));
                     storePackedDepthStencil(output + outputOffset, depthValue, stencilSource[stencilOffset]);
-                }
+            }
         return true;
     }
-    const size_t rowSize = pixelSize * descriptor.width;
+    const size_t rowSize = pixelSize * download.width;
     const size_t rowPitch = alignedTextureRowSize(rowSize);
-    if (descriptor.height > (std::numeric_limits<size_t>::max)() / rowPitch) {
+    if (download.height > (std::numeric_limits<size_t>::max)() / rowPitch) {
         error = "Metal image readback staging size overflows the host address range";
         return false;
     }
-    const size_t imagePitch = rowPitch * descriptor.height;
-    if (descriptor.depth > (std::numeric_limits<size_t>::max)() / imagePitch ||
-        descriptor.array_layers > (std::numeric_limits<size_t>::max)() / (imagePitch * descriptor.depth)) {
+    const size_t imagePitch = rowPitch * download.height;
+    if (download.depth > (std::numeric_limits<size_t>::max)() / imagePitch) {
         error = "Metal image readback staging size overflows the host address range";
         return false;
     }
-    const size_t stagingLayerSize = imagePitch * descriptor.depth;
-    id<MTLBuffer> staging =
-        [device newBufferWithLength:stagingLayerSize * descriptor.array_layers
-                            options:MTLResourceStorageModeShared];
+    const size_t stagingLayerSize = imagePitch * download.depth;
+    id<MTLBuffer> staging = [device newBufferWithLength:stagingLayerSize options:MTLResourceStorageModeShared];
     id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
     id<MTLBlitCommandEncoder> encoder = [commandBuffer blitCommandEncoder];
     if (!staging || !commandBuffer || !encoder) {
         error = "Metal image readback staging or encoder creation failed";
         return false;
     }
-    for (uint32_t layer = 0; layer < descriptor.array_layers; ++layer) {
-        [encoder copyFromTexture:image.texture
-                    sourceSlice:descriptor.dimension == VERNON_RHI_IMAGE_3D ? 0 : layer
-                    sourceLevel:0
-                   sourceOrigin:MTLOriginMake(0, 0, 0)
-                     sourceSize:MTLSizeMake(descriptor.width, descriptor.height, descriptor.depth)
-                       toBuffer:staging
-              destinationOffset:layer * stagingLayerSize
-         destinationBytesPerRow:rowPitch
-       destinationBytesPerImage:imagePitch];
-    }
+    [encoder copyFromTexture:image.texture
+                sourceSlice:descriptor.dimension == VERNON_RHI_IMAGE_3D ? 0 : download.array_layer
+                sourceLevel:download.mip_level
+               sourceOrigin:MTLOriginMake(download.offset_x, download.offset_y, download.offset_z)
+                 sourceSize:MTLSizeMake(download.width, download.height, download.depth)
+                   toBuffer:staging
+          destinationOffset:0
+     destinationBytesPerRow:rowPitch
+   destinationBytesPerImage:imagePitch];
     [encoder endEncoding];
     [commandBuffer commit];
     [commandBuffer waitUntilCompleted];
@@ -479,12 +439,10 @@ bool DeviceState::downloadImage(const Image &image, const VernonRhiImageDescript
     }
     auto *output = static_cast<uint8_t *>(destination);
     const auto *source = static_cast<const uint8_t *>(staging.contents);
-    for (uint32_t layer = 0; layer < descriptor.array_layers; ++layer)
-        for (uint32_t z = 0; z < descriptor.depth; ++z)
-            for (uint32_t y = 0; y < descriptor.height; ++y)
-                std::memcpy(output + layer * layerSize +
-                                (static_cast<size_t>(z) * descriptor.height + y) * rowSize,
-                            source + layer * stagingLayerSize + z * imagePitch + y * rowPitch, rowSize);
+    for (uint32_t z = 0; z < download.depth; ++z)
+        for (uint32_t y = 0; y < download.height; ++y)
+            std::memcpy(output + (static_cast<size_t>(z) * download.height + y) * rowSize,
+                        source + z * imagePitch + y * rowPitch, rowSize);
     return true;
 }
 

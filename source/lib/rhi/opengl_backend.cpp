@@ -167,8 +167,8 @@ bool DeviceState::uploadImage2D(const Image &image, Size width, Size height, Enu
     return true;
 }
 
-bool DeviceState::downloadImage2D(const Image &image, Size width, Size height, Enum externalFormat, Enum type,
-                                  void *destination, std::string &error) {
+bool DeviceState::downloadImage2D(const Image &image, Enum target, Int mipLevel, Int x, Int y, Size width, Size height,
+                                  Enum externalFormat, Enum type, void *destination, std::string &error) {
     if (!image.name || !destination)
         return false;
     makeCurrent();
@@ -181,8 +181,8 @@ bool DeviceState::downloadImage2D(const Image &image, Size width, Size height, E
     driver.bindFramebuffer(kFramebuffer, framebuffer);
     ++framebufferGeneration;
     const bool depthStencil = externalFormat == 0x84F9;
-    driver.framebufferTexture2D(kFramebuffer, depthStencil ? kDepthStencilAttachment : kColorAttachment0, kTexture2D,
-                                image.name, 0);
+    driver.framebufferTexture2D(kFramebuffer, depthStencil ? kDepthStencilAttachment : kColorAttachment0, target,
+                                image.name, mipLevel);
     if (depthStencil) {
         const Enum none = kNone;
         driver.drawBuffers(1, &none);
@@ -195,7 +195,37 @@ bool DeviceState::downloadImage2D(const Image &image, Size width, Size height, E
     }
     constexpr Enum packAlignment = 0x0D05;
     driver.pixelStorei(packAlignment, 1);
-    driver.readPixels(0, 0, width, height, externalFormat, type, destination);
+    driver.readPixels(x, y, width, height, externalFormat, type, destination);
+    driver.deleteFramebuffers(1, &framebuffer);
+    return true;
+}
+
+bool DeviceState::downloadImage3D(const Image &image, Int mipLevel, Int x, Int y, Int z, Size width, Size height,
+                                  Size depth, Enum externalFormat, Enum type, size_t layerSize, void *destination,
+                                  std::string &error) {
+    if (!image.name || width <= 0 || height <= 0 || depth <= 0 || !layerSize || !destination)
+        return false;
+    makeCurrent();
+    Uint framebuffer = 0;
+    driver.genFramebuffers(1, &framebuffer);
+    if (!framebuffer) {
+        error = "OpenGL 3D image readback framebuffer creation failed";
+        return false;
+    }
+    driver.bindFramebuffer(kFramebuffer, framebuffer);
+    ++framebufferGeneration;
+    constexpr Enum packAlignment = 0x0D05;
+    driver.pixelStorei(packAlignment, 1);
+    auto *output = static_cast<unsigned char *>(destination);
+    for (Int layer = 0; layer < depth; ++layer) {
+        driver.framebufferTextureLayer(kFramebuffer, kColorAttachment0, image.name, mipLevel, z + layer);
+        if (driver.checkFramebufferStatus(kFramebuffer) != kFramebufferComplete) {
+            driver.deleteFramebuffers(1, &framebuffer);
+            error = "OpenGL 3D image layer is not readable as an attachment";
+            return false;
+        }
+        driver.readPixels(x, y, width, height, externalFormat, type, output + static_cast<size_t>(layer) * layerSize);
+    }
     driver.deleteFramebuffers(1, &framebuffer);
     return true;
 }

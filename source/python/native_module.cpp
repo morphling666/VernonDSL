@@ -270,21 +270,24 @@ VernonRhiImageDimension rhiDimension(VernonTextureDimension dimension) {
 }
 
 struct RhiImage {
-    RhiImage(std::shared_ptr<RhiHostState> host, uint32_t width, uint32_t height, VernonTextureFormat format,
-             VernonTextureDimension dimension, uint32_t usage)
-        : host(std::move(host)), width(width), height(height), format(format), dimension(dimension), usage(usage),
-          layers(dimension == VERNON_TEXTURE_CUBE ? 6u : 1u) {
-        if (!width || !height || !usage || dimension == VERNON_TEXTURE_3D ||
-            (dimension == VERNON_TEXTURE_CUBE && width != height))
-            throw std::invalid_argument("RHI image extent and usage must be non-zero");
+    RhiImage(std::shared_ptr<RhiHostState> host, uint32_t width, uint32_t height, uint32_t depth,
+             VernonTextureFormat format, VernonTextureDimension dimension, uint32_t mipLevels, uint32_t usage)
+        : host(std::move(host)), width(width), height(height), depth(depth), format(format), dimension(dimension),
+          mipLevels(mipLevels), usage(usage), layers(dimension == VERNON_TEXTURE_CUBE ? 6u : 1u) {
+        if (!width || !height || !depth || !mipLevels || !usage)
+            throw std::invalid_argument("RHI image extent, mip count, and usage must be non-zero");
+        if (dimension != VERNON_TEXTURE_3D && depth != 1)
+            throw std::invalid_argument("only a 3D RHI image may have depth greater than one");
+        if (dimension == VERNON_TEXTURE_CUBE && width != height)
+            throw std::invalid_argument("RHI cube image faces must be square");
         VernonRhiImageDescriptor descriptor{};
         descriptor.struct_size = sizeof(descriptor);
         descriptor.dimension = rhiDimension(dimension);
         descriptor.format = rhiFormat(format);
         descriptor.width = width;
         descriptor.height = height;
-        descriptor.depth = 1;
-        descriptor.mip_levels = 1;
+        descriptor.depth = depth;
+        descriptor.mip_levels = mipLevels;
         descriptor.array_layers = layers;
         descriptor.sample_count = 1;
         descriptor.usage = usage;
@@ -293,25 +296,39 @@ struct RhiImage {
     }
     ~RhiImage() { vernonRhiDeviceDestroyImage(host->device, handle); }
 
-    void upload(const nb::bytes &data) {
-        if ((format != VERNON_TEXTURE_RGBA8_UNORM && format != VERNON_TEXTURE_D32_FLOAT) ||
-            !(usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION))
+    void upload(const nb::bytes &data, uint32_t mipLevel, uint32_t offsetX, uint32_t offsetY, uint32_t offsetZ,
+                uint32_t uploadWidth, uint32_t uploadHeight, uint32_t uploadDepth) {
+        if (!(usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION))
             throw std::runtime_error("image format does not support upload");
-        const size_t layerSize = static_cast<size_t>(width) * height * 4;
+        if (mipLevel >= mipLevels)
+            throw std::invalid_argument("RHI image upload mip level is out of range");
+        const uint32_t mipWidth = mipExtent(width, mipLevel);
+        const uint32_t mipHeight = mipExtent(height, mipLevel);
+        const uint32_t mipDepth = dimension == VERNON_TEXTURE_3D ? mipExtent(depth, mipLevel) : depth;
+        uploadWidth = uploadWidth ? uploadWidth : mipWidth - offsetX;
+        uploadHeight = uploadHeight ? uploadHeight : mipHeight - offsetY;
+        uploadDepth = uploadDepth ? uploadDepth : mipDepth - offsetZ;
+        if (offsetX >= mipWidth || offsetY >= mipHeight || offsetZ >= mipDepth || uploadWidth > mipWidth - offsetX ||
+            uploadHeight > mipHeight - offsetY || uploadDepth > mipDepth - offsetZ)
+            throw std::invalid_argument("RHI image upload region is out of range");
+        const Layout layout = dataLayout(format);
+        const size_t layerSize = checkedByteSize(uploadWidth, uploadHeight, uploadDepth, layout.pixelSize);
         if (data.size() != layerSize * layers)
             throw std::runtime_error("RHI image upload size does not match its extent");
         std::vector<VernonRhiImageUploadDescriptor> descriptors(layers);
         for (uint32_t layer = 0; layer < layers; ++layer) {
             VernonRhiImageUploadDescriptor &descriptor = descriptors[layer];
             descriptor.struct_size = sizeof(descriptor);
+            descriptor.mip_level = mipLevel;
             descriptor.array_layer = layer;
-            descriptor.width = width;
-            descriptor.height = height;
-            descriptor.depth = 1;
-            descriptor.source_format =
-                format == VERNON_TEXTURE_D32_FLOAT ? VERNON_RHI_IMAGE_DATA_DEPTH : VERNON_RHI_IMAGE_DATA_RGBA;
-            descriptor.source_type =
-                format == VERNON_TEXTURE_D32_FLOAT ? VERNON_RHI_IMAGE_DATA_FLOAT32 : VERNON_RHI_IMAGE_DATA_UINT8;
+            descriptor.offset_x = offsetX;
+            descriptor.offset_y = offsetY;
+            descriptor.offset_z = offsetZ;
+            descriptor.width = uploadWidth;
+            descriptor.height = uploadHeight;
+            descriptor.depth = uploadDepth;
+            descriptor.source_format = layout.format;
+            descriptor.source_type = layout.type;
             descriptor.data = data.c_str() + layerSize * layer;
         }
         if (vernonRhiDeviceUploadImage(host->device, handle, descriptors.data(), descriptors.size()) !=
@@ -319,27 +336,114 @@ struct RhiImage {
             throw std::runtime_error("RHI image upload failed: " +
                                      stringView(vernonRhiDeviceGetLastError(host->device)));
     }
-    nb::bytes download() const {
-        if ((format != VERNON_TEXTURE_RGBA8_UNORM && format != VERNON_TEXTURE_D32_FLOAT &&
-             format != VERNON_TEXTURE_D32_FLOAT_S8_UINT) ||
-            !(usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE))
+    nb::bytes download(uint32_t mipLevel, uint32_t offsetX, uint32_t offsetY, uint32_t offsetZ, uint32_t downloadWidth,
+                       uint32_t downloadHeight, uint32_t downloadDepth) const {
+        if (!(usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE))
             throw std::runtime_error("image format does not support download");
-        const size_t pixelSize = format == VERNON_TEXTURE_D32_FLOAT_S8_UINT ? 8 : 4;
-        std::string data(static_cast<size_t>(width) * height * layers * pixelSize, '\0');
-        if (vernonRhiDeviceDownloadImage(host->device, handle, data.data(), data.size()) != VERNON_RHI_STATUS_OK)
-            throw std::runtime_error("RHI image download failed: " +
-                                     stringView(vernonRhiDeviceGetLastError(host->device)));
+        if (mipLevel >= mipLevels)
+            throw std::invalid_argument("RHI image download mip level is out of range");
+        const uint32_t mipWidth = mipExtent(width, mipLevel);
+        const uint32_t mipHeight = mipExtent(height, mipLevel);
+        const uint32_t mipDepth = dimension == VERNON_TEXTURE_3D ? mipExtent(depth, mipLevel) : depth;
+        downloadWidth = downloadWidth ? downloadWidth : mipWidth - offsetX;
+        downloadHeight = downloadHeight ? downloadHeight : mipHeight - offsetY;
+        downloadDepth = downloadDepth ? downloadDepth : mipDepth - offsetZ;
+        if (offsetX >= mipWidth || offsetY >= mipHeight || offsetZ >= mipDepth || downloadWidth > mipWidth - offsetX ||
+            downloadHeight > mipHeight - offsetY || downloadDepth > mipDepth - offsetZ)
+            throw std::invalid_argument("RHI image download region is out of range");
+        const Layout layout = dataLayout(format);
+        const size_t layerSize = checkedByteSize(downloadWidth, downloadHeight, downloadDepth, layout.pixelSize);
+        std::string data(layerSize * layers, '\0');
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+            VernonRhiImageDownloadDescriptor descriptor{};
+            descriptor.struct_size = sizeof(descriptor);
+            descriptor.mip_level = mipLevel;
+            descriptor.array_layer = layer;
+            descriptor.offset_x = offsetX;
+            descriptor.offset_y = offsetY;
+            descriptor.offset_z = offsetZ;
+            descriptor.width = downloadWidth;
+            descriptor.height = downloadHeight;
+            descriptor.depth = downloadDepth;
+            descriptor.destination_format = layout.format;
+            descriptor.destination_type = layout.type;
+            if (vernonRhiDeviceDownloadImage(host->device, handle, &descriptor, data.data() + layer * layerSize,
+                                             layerSize) != VERNON_RHI_STATUS_OK)
+                throw std::runtime_error("RHI image download failed: " +
+                                         stringView(vernonRhiDeviceGetLastError(host->device)));
+        }
         return nb::bytes(data.data(), data.size());
+    }
+
+    void generateMipmaps() {
+        if (mipLevels < 2)
+            throw std::runtime_error("image has no mip chain to generate");
+        if (vernonRhiDeviceGenerateImageMipmaps(host->device, handle) != VERNON_RHI_STATUS_OK)
+            throw std::runtime_error("RHI image mipmap generation failed: " +
+                                     stringView(vernonRhiDeviceGetLastError(host->device)));
     }
 
     std::shared_ptr<RhiHostState> host;
     VernonRhiImage handle{};
     uint32_t width{};
     uint32_t height{};
+    uint32_t depth{1};
     VernonTextureFormat format{};
     VernonTextureDimension dimension{};
+    uint32_t mipLevels{1};
     uint32_t usage{};
     uint32_t layers{1};
+
+private:
+    struct Layout {
+        size_t pixelSize;
+        VernonRhiImageDataFormat format;
+        VernonRhiImageDataType type;
+    };
+
+    static uint32_t mipExtent(uint32_t extent, uint32_t level) {
+        const uint32_t value = extent >> level;
+        return value ? value : 1;
+    }
+
+    static Layout dataLayout(VernonTextureFormat format) {
+        switch (format) {
+        case VERNON_TEXTURE_R8_UNORM:
+            return {1, VERNON_RHI_IMAGE_DATA_RED, VERNON_RHI_IMAGE_DATA_UINT8};
+        case VERNON_TEXTURE_RG8_UNORM:
+            return {2, VERNON_RHI_IMAGE_DATA_RG, VERNON_RHI_IMAGE_DATA_UINT8};
+        case VERNON_TEXTURE_RGB8_UNORM:
+            return {3, VERNON_RHI_IMAGE_DATA_RGB, VERNON_RHI_IMAGE_DATA_UINT8};
+        case VERNON_TEXTURE_RGBA8_UNORM:
+        case VERNON_TEXTURE_RGBA8_SRGB:
+            return {4, VERNON_RHI_IMAGE_DATA_RGBA, VERNON_RHI_IMAGE_DATA_UINT8};
+        case VERNON_TEXTURE_R16_FLOAT:
+            return {2, VERNON_RHI_IMAGE_DATA_RED, VERNON_RHI_IMAGE_DATA_FLOAT16};
+        case VERNON_TEXTURE_RGBA16_FLOAT:
+            return {8, VERNON_RHI_IMAGE_DATA_RGBA, VERNON_RHI_IMAGE_DATA_FLOAT16};
+        case VERNON_TEXTURE_R32_FLOAT:
+            return {4, VERNON_RHI_IMAGE_DATA_RED, VERNON_RHI_IMAGE_DATA_FLOAT32};
+        case VERNON_TEXTURE_RGBA32_FLOAT:
+            return {16, VERNON_RHI_IMAGE_DATA_RGBA, VERNON_RHI_IMAGE_DATA_FLOAT32};
+        case VERNON_TEXTURE_R11G11B10_FLOAT:
+            return {4, VERNON_RHI_IMAGE_DATA_RGB, VERNON_RHI_IMAGE_DATA_UINT32};
+        case VERNON_TEXTURE_D32_FLOAT:
+            return {4, VERNON_RHI_IMAGE_DATA_DEPTH, VERNON_RHI_IMAGE_DATA_FLOAT32};
+        case VERNON_TEXTURE_D32_FLOAT_S8_UINT:
+            return {8, VERNON_RHI_IMAGE_DATA_DEPTH_STENCIL, VERNON_RHI_IMAGE_DATA_FLOAT32};
+        }
+        throw std::invalid_argument("unsupported RHI image data layout");
+    }
+
+    static size_t checkedByteSize(uint32_t width, uint32_t height, uint32_t depth, size_t pixelSize) {
+        size_t size = width;
+        for (const size_t extent : {static_cast<size_t>(height), static_cast<size_t>(depth), pixelSize}) {
+            if (extent && size > std::numeric_limits<size_t>::max() / extent)
+                throw std::overflow_error("RHI image byte size overflows");
+            size *= extent;
+        }
+        return size;
+    }
 };
 
 struct RhiSampler {
@@ -386,15 +490,19 @@ struct RhiHost {
 
     std::unique_ptr<RhiBuffer> createBuffer(size_t size) { return std::make_unique<RhiBuffer>(state, size); }
     std::unique_ptr<RhiImage> createImage(uint32_t width, uint32_t height, VernonTextureFormat format,
-                                          VernonTextureDimension dimension) {
-        if (dimension == VERNON_TEXTURE_CUBE && format != VERNON_TEXTURE_RGBA8_UNORM)
-            throw std::invalid_argument("cube textures currently require RGBA8 format");
-        uint32_t usage =
-            VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION | VERNON_RHI_IMAGE_SAMPLED;
-        usage |= format == VERNON_TEXTURE_D32_FLOAT || format == VERNON_TEXTURE_D32_FLOAT_S8_UINT
-                     ? VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT
-                     : VERNON_RHI_IMAGE_COLOR_ATTACHMENT;
-        return std::make_unique<RhiImage>(state, width, height, format, dimension, usage);
+                                          VernonTextureDimension dimension, uint32_t depth, uint32_t mipLevels,
+                                          uint32_t usage) {
+        if (dimension == VERNON_TEXTURE_3D &&
+            (format == VERNON_TEXTURE_D32_FLOAT || format == VERNON_TEXTURE_D32_FLOAT_S8_UINT))
+            throw std::invalid_argument("3D depth textures are unsupported");
+        if (!usage) {
+            usage = VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION | VERNON_RHI_IMAGE_SAMPLED;
+            if (dimension != VERNON_TEXTURE_3D)
+                usage |= format == VERNON_TEXTURE_D32_FLOAT || format == VERNON_TEXTURE_D32_FLOAT_S8_UINT
+                             ? VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT
+                             : VERNON_RHI_IMAGE_COLOR_ATTACHMENT;
+        }
+        return std::make_unique<RhiImage>(state, width, height, depth, format, dimension, mipLevels, usage);
     }
     std::unique_ptr<RhiImage> createAttachmentImage(uint32_t width, uint32_t height, VernonTextureFormat format,
                                                     uint32_t usage) {
@@ -406,7 +514,7 @@ struct RhiHost {
         const bool depthUsage = (usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) != 0;
         if (depthFormat != depthUsage || (depthUsage && (usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)))
             throw std::invalid_argument("attachment image format does not match its usage");
-        return std::make_unique<RhiImage>(state, width, height, format, VERNON_TEXTURE_2D, usage);
+        return std::make_unique<RhiImage>(state, width, height, 1, format, VERNON_TEXTURE_2D, 1, usage);
     }
     std::unique_ptr<RhiSampler> createSampler(VernonRhiSamplerAddressMode address) {
         return std::make_unique<RhiSampler>(state, address);
@@ -777,6 +885,8 @@ struct PipelineParameterMetadata {
     std::string layoutHash;
     std::vector<VernonValueLeafView> elementLeaves;
     VernonValueAccess access{};
+    bool hasTextureFormat{};
+    VernonTextureFormat textureFormat{};
     std::vector<uint64_t> shape;
 };
 
@@ -829,7 +939,17 @@ struct PipelineInvocationBuilder {
             if (vernonRuntimeLoadedPipelineFindParameter(pipeline, {name.data(), name.size()}, &view) !=
                 VERNON_STATUS_OK)
                 throw std::invalid_argument("unknown pipeline parameter '" + name + "'");
-            return parameterMetadata(view);
+            PipelineParameterMetadata metadata = parameterMetadata(view);
+            if (view.kind == VERNON_PIPELINE_TEXTURE) {
+                VernonPipelineTextureConstraintView constraint{};
+                constraint.struct_size = sizeof(constraint);
+                if (vernonRuntimeLoadedPipelineFindTextureConstraint(pipeline, {name.data(), name.size()},
+                                                                     &constraint) != VERNON_STATUS_OK)
+                    throw std::runtime_error("cannot query pipeline texture constraint");
+                metadata.hasTextureFormat = constraint.has_format_constraint != 0;
+                metadata.textureFormat = constraint.format;
+            }
+            return metadata;
         }
         if (!nb::isinstance<nb::int_>(identifier))
             throw std::invalid_argument("pipeline parameter must be a name or slot");
@@ -837,8 +957,19 @@ struct PipelineInvocationBuilder {
         const size_t count = vernonRuntimeLoadedPipelineGetParameterCount(pipeline);
         for (size_t index = 0; index < count; ++index) {
             if (vernonRuntimeLoadedPipelineGetParameterByIndex(pipeline, index, &view) == VERNON_STATUS_OK &&
-                view.slot == slot)
-                return parameterMetadata(view);
+                view.slot == slot) {
+                PipelineParameterMetadata metadata = parameterMetadata(view);
+                if (view.kind == VERNON_PIPELINE_TEXTURE) {
+                    VernonPipelineTextureConstraintView constraint{};
+                    constraint.struct_size = sizeof(constraint);
+                    if (vernonRuntimeLoadedPipelineGetTextureConstraintByParameterIndex(pipeline, index, &constraint) !=
+                        VERNON_STATUS_OK)
+                        throw std::runtime_error("cannot query pipeline texture constraint");
+                    metadata.hasTextureFormat = constraint.has_format_constraint != 0;
+                    metadata.textureFormat = constraint.format;
+                }
+                return metadata;
+            }
         }
         throw std::invalid_argument("unknown pipeline parameter slot " + std::to_string(slot));
     }
@@ -992,9 +1123,14 @@ struct PipelineInvocationBuilder {
     }
 
     PipelineInvocationBuilder &rhiTexture(const nb::object &identifier, RhiImage *texture, RhiSampler *sampler) {
-        if (!texture || !(texture->usage & VERNON_RHI_IMAGE_SAMPLED) || (sampler && sampler->host != texture->host))
-            throw std::invalid_argument("RHI texture and sampler belong to different devices");
         const PipelineParameterMetadata parameter = resolveParameter(identifier);
+        const uint32_t requiredUsage = parameter.hasTextureFormat ? VERNON_RHI_IMAGE_STORAGE : VERNON_RHI_IMAGE_SAMPLED;
+        if (!texture || !(texture->usage & requiredUsage) || (sampler && sampler->host != texture->host))
+            throw std::invalid_argument("RHI texture usage or sampler device does not match the pipeline parameter");
+        if (parameter.hasTextureFormat && texture->format != parameter.textureFormat)
+            throw std::invalid_argument("RHI texture format does not match the storage texture parameter");
+        if (parameter.hasTextureFormat && sampler)
+            throw std::invalid_argument("storage texture parameters cannot use a sampler");
         OwnedArgument &argument = addArgument(parameter, VERNON_PIPELINE_TEXTURE);
         if (vernonRuntimeReferenceRhiImage(runtime, texture->handle, &argument.value.texture.resource) !=
             VERNON_STATUS_OK)
@@ -1007,7 +1143,7 @@ struct PipelineInvocationBuilder {
         argument.value.texture.dimension = texture->dimension;
         argument.value.texture.width = texture->width;
         argument.value.texture.height = texture->height;
-        argument.value.texture.depth = 1;
+        argument.value.texture.depth = texture->depth;
         return *this;
     }
 
@@ -2080,6 +2216,10 @@ NB_MODULE(_native, module) {
         .value("MIRRORED_REPEAT", VERNON_RHI_ADDRESS_MIRRORED_REPEAT);
     module.attr("IMAGE_COLOR_ATTACHMENT") = static_cast<uint32_t>(VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
     module.attr("IMAGE_DEPTH_STENCIL_ATTACHMENT") = static_cast<uint32_t>(VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT);
+    module.attr("IMAGE_TRANSFER_SOURCE") = static_cast<uint32_t>(VERNON_RHI_IMAGE_TRANSFER_SOURCE);
+    module.attr("IMAGE_TRANSFER_DESTINATION") = static_cast<uint32_t>(VERNON_RHI_IMAGE_TRANSFER_DESTINATION);
+    module.attr("IMAGE_SAMPLED") = static_cast<uint32_t>(VERNON_RHI_IMAGE_SAMPLED);
+    module.attr("IMAGE_STORAGE") = static_cast<uint32_t>(VERNON_RHI_IMAGE_STORAGE);
     module.def("_plan_value_abi", &planValueAbi, nb::arg("module"), nb::arg("logical_dtypes"));
     nb::class_<StructuredVjp>(module, "_StructuredVjp")
         .def_prop_ro("tape_bytes", &StructuredVjp::tapeBytes)
@@ -2107,7 +2247,8 @@ NB_MODULE(_native, module) {
                     nb::arg("make_current"), nb::arg("get_proc_address"), nb::arg("api_major"), nb::arg("api_minor"))
         .def("create_buffer", &RhiHost::createBuffer)
         .def("create_image", &RhiHost::createImage, nb::arg("width"), nb::arg("height"),
-             nb::arg("format") = VERNON_TEXTURE_RGBA8_UNORM, nb::arg("dimension") = VERNON_TEXTURE_2D)
+             nb::arg("format") = VERNON_TEXTURE_RGBA8_UNORM, nb::arg("dimension") = VERNON_TEXTURE_2D,
+             nb::arg("depth") = 1, nb::arg("mip_levels") = 1, nb::arg("usage") = 0)
         .def("create_attachment_image", &RhiHost::createAttachmentImage)
         .def("create_sampler", &RhiHost::createSampler, nb::arg("address") = VERNON_RHI_ADDRESS_REPEAT)
         .def("create_runtime", &RhiHost::createRuntime, nb::keep_alive<0, 1>())
@@ -2120,8 +2261,15 @@ NB_MODULE(_native, module) {
     nb::class_<RhiImage>(module, "RhiImage")
         .def_prop_ro("width", [](const RhiImage &value) { return value.width; })
         .def_prop_ro("height", [](const RhiImage &value) { return value.height; })
-        .def("upload", &RhiImage::upload)
-        .def("download", &RhiImage::download);
+        .def_prop_ro("depth", [](const RhiImage &value) { return value.depth; })
+        .def_prop_ro("mip_levels", [](const RhiImage &value) { return value.mipLevels; })
+        .def("upload", &RhiImage::upload, nb::arg("data"), nb::arg("mip_level") = 0, nb::arg("offset_x") = 0,
+             nb::arg("offset_y") = 0, nb::arg("offset_z") = 0, nb::arg("width") = 0, nb::arg("height") = 0,
+             nb::arg("depth") = 0)
+        .def("download", &RhiImage::download, nb::arg("mip_level") = 0, nb::arg("offset_x") = 0,
+             nb::arg("offset_y") = 0, nb::arg("offset_z") = 0, nb::arg("width") = 0, nb::arg("height") = 0,
+             nb::arg("depth") = 0)
+        .def("generate_mipmaps", &RhiImage::generateMipmaps);
     nb::class_<RhiSampler>(module, "RhiSampler");
     nb::class_<PythonGraphResource>(module, "_GraphResource")
         .def_prop_ro("id", [](const PythonGraphResource &value) { return value.resource.id; })

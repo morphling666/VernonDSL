@@ -46,7 +46,7 @@ class TypeParserCoverageTests(unittest.TestCase):
             "Matrix[f32, 3, 3]": "tensor<3x3xf32>",
             "TensorView[f32, (dyn,), read]": '!vernon.tensor_view<f32, [-1], "read", "device">',
             "TensorView[f32, (4, dyn), read_write]": '!vernon.tensor_view<f32, [4, -1], "read_write", "device">',
-            'Texture["cube", f32]': '!vernon.texture<"cube", f32>',
+            'Texture["cube", f32]': '!vernon.texture<"cube", f32, "unknown", "sampled">',
         }
         for source, mlir in expected.items():
             with self.subTest(source=source):

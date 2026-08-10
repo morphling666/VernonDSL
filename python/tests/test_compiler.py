@@ -42,7 +42,7 @@ def resources(
             '!vernon.tensor_view<!vernon.struct<"Vertex">, [-1], "read", "device">',
             output,
         )
-        self.assertIn('!vernon.texture<"2d", f32>', output)
+        self.assertIn('!vernon.texture<"2d", f32, "unknown", "sampled">', output)
         self.assertIn('vernon.interface = "resource"', output)
         self.assertIn("vernon.set = 1 : i64", output)
         self.assertIn("vernon.location = 5 : i64", output)
@@ -65,7 +65,7 @@ def sample(
     return texture_sample(image, sampler, uv)
 """
             output = compile_source(source, f"texture_{dimension}.py")
-            self.assertIn(f'!vernon.texture<"{dimension}", f32>', output)
+            self.assertIn(f'!vernon.texture<"{dimension}", f32, "unknown", "sampled">', output)
             self.assertIn('name = "texture_sample"', output)
 
     def test_texture_dimension_and_coordinate_rank_are_validated(self) -> None:
@@ -87,6 +87,31 @@ def sample(image: Texture["cube", f32], sampler: Sampler,
 """
         with self.assertRaisesRegex(CompileError, "3-component"):
             compile_source(invalid_coordinates, "bad_coordinates.py")
+
+    def test_storage_texture_uses_unified_texture_annotation(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@kernel
+def store(
+    image: Annotated[Texture["3d", rgba32_float, write], resource(set=0, binding=0)],
+    coordinate: Vector[i32, 3],
+    value: Vector[f32, 4],
+) -> None:
+    texture_store(image, coordinate, value)
+"""
+        output = compile_source(source, "storage_texture.py")
+        self.assertIn('!vernon.texture<"3d", f32, "rgba32_float", "write">', output)
+        self.assertIn('name = "texture_store"', output)
+
+        invalid = """
+from vernon_dsl import *
+@kernel
+def bad(image: Texture["cube", rgba32_float, write]) -> None:
+    pass
+"""
+        with self.assertRaisesRegex(CompileError, "storage Texture dimension"):
+            compile_source(invalid, "bad_storage_texture.py")
 
     def test_sampling_overloads_and_texture_size(self) -> None:
         source = """
@@ -118,7 +143,10 @@ def explicit_sample(
         self.assertEqual(output.count('name = "texture_size"'), 2)
         self.assertEqual(output.count('vernon.implicit = "sampler"'), 1)
         self.assertNotIn('vernon.implicit = "texture_size"', output)
-        self.assertIn('(!vernon.texture<"2d", f32>, !vernon.sampler, tensor<2xf32>, f32)', output)
+        self.assertIn(
+            '(!vernon.texture<"2d", f32, "unknown", "sampled">, !vernon.sampler, tensor<2xf32>, f32)',
+            output,
+        )
         explicit_only = compile_source(
             """
 from vernon_dsl import *

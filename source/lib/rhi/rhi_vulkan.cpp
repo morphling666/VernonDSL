@@ -89,10 +89,6 @@ template <typename Slots> auto *lookupResourceRecord(Slots &slots, uint64_t key)
     return slot.isRetained(generation) ? &slot : nullptr;
 }
 
-std::optional<size_t> downloadSize(const VernonRhiImageDescriptor &descriptor) {
-    return vernon::rhi::simpleImageDownloadSize(descriptor);
-}
-
 std::shared_ptr<VulkanInteropDevice> lookupVulkanDevice(VernonRhiDevice handle) {
     if ((handle.index & vulkanDeviceBit) == 0)
         return {};
@@ -210,6 +206,20 @@ VkImageLayout vulkanImageLayout(VernonRhiResourceState state) {
         return VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     }
     return VK_IMAGE_LAYOUT_UNDEFINED;
+}
+
+VkImageLayout defaultVulkanImageLayout(const VernonRhiImageDescriptor &descriptor) {
+    if (descriptor.usage & VERNON_RHI_IMAGE_STORAGE)
+        return VK_IMAGE_LAYOUT_GENERAL;
+    if (descriptor.usage & VERNON_RHI_IMAGE_SAMPLED)
+        return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    if (descriptor.usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT)
+        return VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    if (descriptor.usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)
+        return VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    if (descriptor.usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE)
+        return VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    return VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 }
 
 void vulkanBufferDependency(VernonRhiResourceState state, VkPipelineStageFlags &stages, VkAccessFlags &access) {
@@ -360,8 +370,9 @@ void transitionVulkanImage(VkCommandBuffer command, VulkanImageSlot &slot, VkIma
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = image.image;
     barrier.subresourceRange.aspectMask = vernon::rhi::vulkan::imageAspectMask(image.format);
-    barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.layerCount = 1;
+    const VernonRhiImageDescriptor &descriptor = image.owned ? slot.ownedDescriptor : slot.descriptor.descriptor;
+    barrier.subresourceRange.levelCount = descriptor.mip_levels;
+    barrier.subresourceRange.layerCount = descriptor.array_layers;
     VkPipelineStageFlags sourceStage{};
     VkPipelineStageFlags destinationStage{};
     vulkanImageDependency(image.layout, sourceStage, barrier.srcAccessMask);
@@ -847,8 +858,9 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
     if (!slot || !slot->image.owned)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     const VernonRhiImageDescriptor &descriptor = slot->ownedDescriptor;
-    if ((descriptor.dimension != VERNON_RHI_IMAGE_2D && descriptor.dimension != VERNON_RHI_IMAGE_CUBE) ||
-        descriptor.format != VERNON_RHI_FORMAT_RGBA8_UNORM || descriptor.depth != 1 || descriptor.mip_levels != 1)
+    if ((descriptor.dimension != VERNON_RHI_IMAGE_2D && descriptor.dimension != VERNON_RHI_IMAGE_3D &&
+         descriptor.dimension != VERNON_RHI_IMAGE_CUBE) ||
+        (descriptor.dimension != VERNON_RHI_IMAGE_3D && descriptor.depth != 1))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     size_t totalSize = 0;
     std::vector<size_t> uploadSizes(uploadCount);
@@ -857,16 +869,25 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
         const bool validLayer = descriptor.dimension == VERNON_RHI_IMAGE_CUBE
                                     ? upload.array_layer < descriptor.array_layers
                                     : upload.array_layer == 0;
-        if (upload.struct_size < sizeof(upload) || upload.mip_level != 0 || !validLayer ||
-            upload.width != descriptor.width || upload.height != descriptor.height || upload.depth != 1 ||
-            upload.source_format != VERNON_RHI_IMAGE_DATA_RGBA || upload.source_type != VERNON_RHI_IMAGE_DATA_UINT8 ||
-            !upload.data || upload.width > (std::numeric_limits<size_t>::max)() / upload.height)
+        const bool validMip = upload.mip_level < descriptor.mip_levels;
+        const uint32_t mipWidth = validMip ? vernon::rhi::imageMipExtent(descriptor.width, upload.mip_level) : 0;
+        const uint32_t mipHeight = validMip ? vernon::rhi::imageMipExtent(descriptor.height, upload.mip_level) : 0;
+        const uint32_t mipDepth = !validMip ? 0
+                                  : descriptor.dimension == VERNON_RHI_IMAGE_3D
+                                      ? vernon::rhi::imageMipExtent(descriptor.depth, upload.mip_level)
+                                      : descriptor.depth;
+        const auto uploadSize =
+            vernon::rhi::imageRegionByteSize(descriptor.format, upload.width, upload.height, upload.depth);
+        if (upload.struct_size < sizeof(upload) || !validMip || !validLayer || !upload.width || !upload.height ||
+            !upload.depth || upload.offset_x >= mipWidth || upload.width > mipWidth - upload.offset_x ||
+            upload.offset_y >= mipHeight || upload.height > mipHeight - upload.offset_y ||
+            upload.offset_z >= mipDepth || upload.depth > mipDepth - upload.offset_z ||
+            !vernon::rhi::uploadLayoutMatches(descriptor.format, upload.source_format, upload.source_type) ||
+            !upload.data || !uploadSize)
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-        const size_t pixels = static_cast<size_t>(upload.width) * upload.height;
-        if (pixels > (std::numeric_limits<size_t>::max)() / 4 ||
-            pixels * 4 > (std::numeric_limits<size_t>::max)() - totalSize)
+        if (*uploadSize > (std::numeric_limits<size_t>::max)() - totalSize)
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-        uploadSizes[index] = pixels * 4;
+        uploadSizes[index] = *uploadSize;
         totalSize += uploadSizes[index];
     }
     VkBuffer staging = VK_NULL_HANDLE;
@@ -881,9 +902,13 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
         VkBufferImageCopy &region = regions[index];
         region.bufferOffset = stagingOffset + byteOffset;
         region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = uploads[index].mip_level;
         region.imageSubresource.baseArrayLayer = uploads[index].array_layer;
         region.imageSubresource.layerCount = 1;
-        region.imageExtent = {uploads[index].width, uploads[index].height, 1};
+        region.imageOffset = {static_cast<int32_t>(uploads[index].offset_x),
+                              static_cast<int32_t>(uploads[index].offset_y),
+                              static_cast<int32_t>(uploads[index].offset_z)};
+        region.imageExtent = {uploads[index].width, uploads[index].height, uploads[index].depth};
         byteOffset += uploadSizes[index];
     }
     VkCommandBuffer command = VK_NULL_HANDLE;
@@ -893,12 +918,13 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
     vernon::rhi::vulkan::driver().cmdCopyBufferToImage(command, staging, slot->image.image,
                                                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                                        static_cast<uint32_t>(regions.size()), regions.data());
-    transitionVulkanImage(command, *slot, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    transitionVulkanImage(command, *slot, defaultVulkanImageLayout(slot->ownedDescriptor));
     return device->state.submitCommands(command, device->error) ? VERNON_RHI_STATUS_OK
                                                                 : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
-VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image, void *destination, size_t size) {
+VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image,
+                              const VernonRhiImageDownloadDescriptor *download, void *destination, size_t size) {
     auto device = lookupVulkanDevice(handle);
     if (!device) {
         return VERNON_RHI_STATUS_UNSUPPORTED;
@@ -906,9 +932,9 @@ VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image, void
 
     std::lock_guard<std::mutex> guard(device->mutex);
     VulkanImageSlot *slot = lookupVulkanSlot(device->images, image);
-    if (!slot || !slot->image.owned)
+    if (!slot || !slot->image.owned || !download || download->struct_size < sizeof(*download) || !destination)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    const auto expected = downloadSize(slot->ownedDescriptor);
+    const auto expected = imageDownloadByteSize(slot->ownedDescriptor, *download);
     if (!expected || size != *expected)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     VkBuffer staging = VK_NULL_HANDLE;
@@ -916,19 +942,24 @@ VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image, void
     uint8_t *mapped = nullptr;
     if (!device->state.acquireStaging(false, size, 16, staging, stagingOffset, mapped, device->error))
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    const VkImageLayout restore =
-        slot->image.layout == VK_IMAGE_LAYOUT_UNDEFINED ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : slot->image.layout;
+    const VkImageLayout restore = slot->image.layout == VK_IMAGE_LAYOUT_UNDEFINED
+                                      ? defaultVulkanImageLayout(slot->ownedDescriptor)
+                                      : slot->image.layout;
     VkCommandBuffer command = VK_NULL_HANDLE;
     if (!device->state.beginCommands(command, device->error))
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
     transitionVulkanImage(command, *slot, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     const bool depthStencil = slot->ownedDescriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT;
-    const size_t pixels = static_cast<size_t>(slot->ownedDescriptor.width) * slot->ownedDescriptor.height;
+    const size_t pixels = static_cast<size_t>(download->width) * download->height * download->depth;
     std::array<VkBufferImageCopy, 2> regions{};
     regions[0].bufferOffset = stagingOffset;
     regions[0].imageSubresource.aspectMask = vernon::rhi::vulkan::imagePrimaryCopyAspectMask(slot->image.format);
+    regions[0].imageSubresource.mipLevel = download->mip_level;
+    regions[0].imageSubresource.baseArrayLayer = download->array_layer;
     regions[0].imageSubresource.layerCount = 1;
-    regions[0].imageExtent = {slot->ownedDescriptor.width, slot->ownedDescriptor.height, 1};
+    regions[0].imageOffset = {static_cast<int32_t>(download->offset_x), static_cast<int32_t>(download->offset_y),
+                              static_cast<int32_t>(download->offset_z)};
+    regions[0].imageExtent = {download->width, download->height, download->depth};
     uint32_t regionCount = 1;
     if (depthStencil) {
         regions[1] = regions[0];
@@ -957,7 +988,80 @@ VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image, void
 }
 
 VernonRhiStatus generateImageMipmaps(VernonRhiDevice handle, VernonRhiImage image) {
-    return VERNON_RHI_STATUS_UNSUPPORTED;
+    auto device = lookupVulkanDevice(handle);
+    if (!device)
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    VulkanImageSlot *slot = lookupVulkanSlot(device->images, image);
+    if (!slot || !slot->image.owned || slot->ownedDescriptor.mip_levels < 2 ||
+        slot->ownedDescriptor.format == VERNON_RHI_FORMAT_D32_FLOAT ||
+        slot->ownedDescriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT ||
+        !(slot->ownedDescriptor.usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE) ||
+        !(slot->ownedDescriptor.usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION))
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    VkFormatProperties properties{};
+    vernon::rhi::vulkan::driver().getPhysicalDeviceFormatProperties(device->state.physicalDevice, slot->image.format,
+                                                                    &properties);
+    constexpr VkFormatFeatureFlags blitFeatures = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    if ((properties.optimalTilingFeatures & blitFeatures) != blitFeatures)
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    const VkImageLayout restore = slot->image.layout == VK_IMAGE_LAYOUT_UNDEFINED
+                                      ? defaultVulkanImageLayout(slot->ownedDescriptor)
+                                      : slot->image.layout;
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    if (!device->state.beginCommands(command, device->error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    transitionVulkanImage(command, *slot, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    auto barrier = [&](uint32_t baseMip, uint32_t mipCount, VkImageLayout oldLayout, VkImageLayout newLayout) {
+        VkImageMemoryBarrier value{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        value.oldLayout = oldLayout;
+        value.newLayout = newLayout;
+        value.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        value.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        value.image = slot->image.image;
+        value.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        value.subresourceRange.baseMipLevel = baseMip;
+        value.subresourceRange.levelCount = mipCount;
+        value.subresourceRange.layerCount = slot->ownedDescriptor.array_layers;
+        VkPipelineStageFlags sourceStage{};
+        VkPipelineStageFlags destinationStage{};
+        vulkanImageDependency(oldLayout, sourceStage, value.srcAccessMask);
+        vulkanImageDependency(newLayout, destinationStage, value.dstAccessMask);
+        vernon::rhi::vulkan::driver().cmdPipelineBarrier(command, sourceStage, destinationStage, 0, 0, nullptr, 0,
+                                                         nullptr, 1, &value);
+    };
+    const VkFilter filter = properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT
+                                ? VK_FILTER_LINEAR
+                                : VK_FILTER_NEAREST;
+    for (uint32_t level = 1; level < slot->ownedDescriptor.mip_levels; ++level) {
+        barrier(level - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkImageBlit blit{};
+        blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.srcSubresource.mipLevel = level - 1;
+        blit.srcSubresource.layerCount = slot->ownedDescriptor.array_layers;
+        blit.srcOffsets[1] = {
+            static_cast<int32_t>(vernon::rhi::imageMipExtent(slot->ownedDescriptor.width, level - 1)),
+            static_cast<int32_t>(vernon::rhi::imageMipExtent(slot->ownedDescriptor.height, level - 1)),
+            static_cast<int32_t>(slot->ownedDescriptor.dimension == VERNON_RHI_IMAGE_3D
+                                     ? vernon::rhi::imageMipExtent(slot->ownedDescriptor.depth, level - 1)
+                                     : 1)};
+        blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        blit.dstSubresource.mipLevel = level;
+        blit.dstSubresource.layerCount = slot->ownedDescriptor.array_layers;
+        blit.dstOffsets[1] = {static_cast<int32_t>(vernon::rhi::imageMipExtent(slot->ownedDescriptor.width, level)),
+                              static_cast<int32_t>(vernon::rhi::imageMipExtent(slot->ownedDescriptor.height, level)),
+                              static_cast<int32_t>(slot->ownedDescriptor.dimension == VERNON_RHI_IMAGE_3D
+                                                       ? vernon::rhi::imageMipExtent(slot->ownedDescriptor.depth, level)
+                                                       : 1)};
+        vernon::rhi::vulkan::driver().cmdBlitImage(command, slot->image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                                   slot->image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                                                   filter);
+    }
+    barrier(0, slot->ownedDescriptor.mip_levels - 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, restore);
+    barrier(slot->ownedDescriptor.mip_levels - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, restore);
+    slot->image.layout = restore;
+    return device->state.submitCommands(command, device->error) ? VERNON_RHI_STATUS_OK
+                                                                : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
 VernonRhiStatus bindImage(VernonRhiDevice handle, VernonRhiImage image, uint32_t textureUnit) {
@@ -1361,6 +1465,18 @@ uint64_t resolveResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key
     return slot && slot->occupied ? reinterpret_cast<uintptr_t>(&slot->sampler) : 0;
 }
 
+bool describeImageResource(VernonRhiDevice handle, uint64_t key, VernonRhiImageDescriptor *descriptor) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device || !descriptor)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    const VulkanImageSlot *slot = lookupResourceRecord(device->images, key);
+    if (!slot || !slot->occupied)
+        return false;
+    *descriptor = slot->ownedDescriptor;
+    return true;
+}
+
 void releaseResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
     auto device = lookupVulkanDevice(handle);
     if (!device)
@@ -1426,6 +1542,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::vulkanBackendDispatch() {
         samplerResource,
         retainResource,
         resolveResource,
+        describeImageResource,
         releaseResource,
         beginCommands,
         submitCommands,

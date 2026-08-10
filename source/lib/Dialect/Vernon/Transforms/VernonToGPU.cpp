@@ -212,6 +212,14 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                     }
                 }
                 if (kind && kind.getValue() == "resource") {
+                    if (isa<TextureType>(type)) {
+                        unsigned kernelIndex = kernelArgumentTypes.size();
+                        auto descriptorSet = cast<IntegerAttr>(attrs.descriptorSet);
+                        kernelArgumentTypes.push_back(type);
+                        resourceBindings.emplace_back(kernelIndex, std::make_pair(descriptorSet.getInt(), kernelIndex));
+                        sourceArgumentRanges[index] = {kernelIndex, 1};
+                        continue;
+                    }
                     auto view = dyn_cast<TensorViewType>(type);
                     FailureOr<ValueAbiLayout> layout =
                         view ? getValueAbiLayout(view.getElementType(), module) : FailureOr<ValueAbiLayout>(failure());
@@ -366,25 +374,28 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                 return success();
             });
 
-            RewritePatternSet storagePatterns(module.getContext());
-            storagePatterns.add<PhysicalLoadConversion, PhysicalStoreConversion, PhysicalAtomicConversion>(
-                storageConverter, module.getContext());
-            populateFunctionOpInterfaceTypeConversionPattern<gpu::GPUFuncOp>(storagePatterns, storageConverter);
+            if (llvm::any_of(kernelArgumentTypes, [](Type type) { return isa<TensorViewType>(type); })) {
+                RewritePatternSet storagePatterns(module.getContext());
+                storagePatterns.add<PhysicalLoadConversion, PhysicalStoreConversion, PhysicalAtomicConversion>(
+                    storageConverter, module.getContext());
+                populateFunctionOpInterfaceTypeConversionPattern<gpu::GPUFuncOp>(storagePatterns, storageConverter);
 
-            ConversionTarget storageTarget(*module.getContext());
-            auto isNonResourceStorage = [](Value storage) { return !isa<BlockArgument>(storage); };
-            storageTarget.addDynamicallyLegalOp<PhysicalLoadOp>(
-                [&](PhysicalLoadOp op) { return isNonResourceStorage(op.getStorage()); });
-            storageTarget.addDynamicallyLegalOp<PhysicalStoreOp>(
-                [&](PhysicalStoreOp op) { return isNonResourceStorage(op.getStorage()); });
-            storageTarget.addDynamicallyLegalOp<PhysicalAtomicOp>(
-                [&](PhysicalAtomicOp op) { return isNonResourceStorage(op.getStorage()); });
-            storageTarget.addDynamicallyLegalOp<gpu::GPUFuncOp>(
-                [&](gpu::GPUFuncOp function) { return storageConverter.isSignatureLegal(function.getFunctionType()); });
-            storageTarget.addIllegalOp<ReduceSumOp, ScatterAddOp>();
-            storageTarget.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
-            if (failed(applyPartialConversion(kernel, storageTarget, std::move(storagePatterns))))
-                return signalPassFailure();
+                ConversionTarget storageTarget(*module.getContext());
+                auto isNonResourceStorage = [](Value storage) { return !isa<BlockArgument>(storage); };
+                storageTarget.addDynamicallyLegalOp<PhysicalLoadOp>(
+                    [&](PhysicalLoadOp op) { return isNonResourceStorage(op.getStorage()); });
+                storageTarget.addDynamicallyLegalOp<PhysicalStoreOp>(
+                    [&](PhysicalStoreOp op) { return isNonResourceStorage(op.getStorage()); });
+                storageTarget.addDynamicallyLegalOp<PhysicalAtomicOp>(
+                    [&](PhysicalAtomicOp op) { return isNonResourceStorage(op.getStorage()); });
+                storageTarget.addDynamicallyLegalOp<gpu::GPUFuncOp>([&](gpu::GPUFuncOp function) {
+                    return storageConverter.isSignatureLegal(function.getFunctionType());
+                });
+                storageTarget.addIllegalOp<ReduceSumOp, ScatterAddOp>();
+                storageTarget.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
+                if (failed(applyPartialConversion(kernel, storageTarget, std::move(storagePatterns))))
+                    return signalPassFailure();
+            }
 
             SmallVector<std::pair<unsigned, unsigned>> convertedArgumentRanges;
             unsigned convertedIndex = 0;
@@ -396,9 +407,19 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                 convertedIndex += convertedTypes.size();
             }
             for (auto [originalIndex, binding] : resourceBindings) {
+                if (originalIndex >= convertedArgumentRanges.size()) {
+                    source.emitError() << "resource argument index " << originalIndex
+                                       << " exceeds converted kernel signature size " << convertedArgumentRanges.size();
+                    return signalPassFailure();
+                }
                 auto [first, count] = convertedArgumentRanges[originalIndex];
                 for (unsigned offset = 0; offset < count; ++offset) {
                     const unsigned index = first + offset;
+                    if (index >= kernel.getNumArguments()) {
+                        source.emitError() << "converted resource argument index " << index
+                                           << " exceeds kernel argument count " << kernel.getNumArguments();
+                        return signalPassFailure();
+                    }
                     kernel.setArgAttr(
                         index, spirv::getInterfaceVarABIAttrName(),
                         spirv::getInterfaceVarABIAttr(binding.first, index, std::nullopt, source.getContext()));

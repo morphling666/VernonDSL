@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -161,8 +162,9 @@ struct PreparedBindingSet {
         uint64_t resource{};
         VernonRuntimeProviderResourceReference resourceReference{};
         uint64_t resourceOffset{};
-        uint32_t resourceTarget{};
+        VernonRhiImageDimension resourceTarget{VERNON_RHI_IMAGE_2D};
         uint32_t resourceStride{};
+        VernonRhiFormat textureFormat{VERNON_RHI_FORMAT_UNDEFINED};
         uint32_t binding{};
         uint32_t stageMask{};
         uint32_t numericType{};
@@ -177,6 +179,7 @@ struct PreparedBindingSet {
     std::vector<size_t> valueIndices;
     std::vector<uint8_t> seenSlots;
     std::vector<uint64_t> resolvedValues;
+    std::vector<VernonRhiImageDescriptor> resolvedImageDescriptors;
     std::mutex mutex;
 
     ~PreparedBindingSet() {
@@ -350,6 +353,9 @@ VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayout
             const bool sampledImage = source.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE &&
                                       source.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE &&
                                       source.binding != UINT32_MAX && source.name.data && source.name.size != 0;
+            const bool storageImage = source.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE &&
+                                      source.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE &&
+                                      source.binding != UINT32_MAX && source.access != 0;
             const bool sampler = source.kind == VERNON_RUNTIME_PROVIDER_SAMPLER &&
                                  source.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE &&
                                  source.binding != UINT32_MAX;
@@ -357,7 +363,8 @@ VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayout
                                       source.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_VERTEX_INPUT &&
                                       source.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_VERTEX &&
                                       source.binding != UINT32_MAX && source.element_size != 0;
-            if (!inlineValue && !uniformBuffer && !storageBuffer && !sampledImage && !sampler && !vertexBuffer)
+            if (!inlineValue && !uniformBuffer && !storageBuffer && !sampledImage && !storageImage && !sampler &&
+                !vertexBuffer)
                 return fail(adapter, "OpenGL adapter pipeline layout contains an unsupported binding");
             PreparedLayout::Entry entry;
             entry.layout = source;
@@ -390,6 +397,69 @@ VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayout
     *output = toHandle(layout.release());
     adapter.layoutPreparations.fetch_add(1, std::memory_order_relaxed);
     return VERNON_STATUS_OK;
+}
+
+std::optional<VernonRhiFormat> rhiTextureFormat(VernonTextureFormat format) {
+    switch (format) {
+    case VERNON_TEXTURE_RGBA8_UNORM:
+        return VERNON_RHI_FORMAT_RGBA8_UNORM;
+    case VERNON_TEXTURE_RGBA8_SRGB:
+        return VERNON_RHI_FORMAT_RGBA8_SRGB;
+    case VERNON_TEXTURE_RGBA16_FLOAT:
+        return VERNON_RHI_FORMAT_RGBA16_FLOAT;
+    case VERNON_TEXTURE_RGBA32_FLOAT:
+        return VERNON_RHI_FORMAT_RGBA32_FLOAT;
+    case VERNON_TEXTURE_R8_UNORM:
+        return VERNON_RHI_FORMAT_R8_UNORM;
+    case VERNON_TEXTURE_R16_FLOAT:
+        return VERNON_RHI_FORMAT_R16_FLOAT;
+    case VERNON_TEXTURE_R32_FLOAT:
+        return VERNON_RHI_FORMAT_R32_FLOAT;
+    case VERNON_TEXTURE_RG8_UNORM:
+        return VERNON_RHI_FORMAT_RG8_UNORM;
+    case VERNON_TEXTURE_RGB8_UNORM:
+        return VERNON_RHI_FORMAT_RGB8_UNORM;
+    case VERNON_TEXTURE_R11G11B10_FLOAT:
+        return VERNON_RHI_FORMAT_R11G11B10_FLOAT;
+    case VERNON_TEXTURE_D32_FLOAT:
+        return VERNON_RHI_FORMAT_D32_FLOAT;
+    case VERNON_TEXTURE_D32_FLOAT_S8_UINT:
+        return VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT;
+    }
+    return std::nullopt;
+}
+
+std::optional<VernonRhiImageDimension> rhiTextureDimension(VernonTextureDimension dimension) {
+    switch (dimension) {
+    case VERNON_TEXTURE_2D:
+        return VERNON_RHI_IMAGE_2D;
+    case VERNON_TEXTURE_3D:
+        return VERNON_RHI_IMAGE_3D;
+    case VERNON_TEXTURE_CUBE:
+        return VERNON_RHI_IMAGE_CUBE;
+    }
+    return std::nullopt;
+}
+
+std::optional<rhi::opengl::Enum> storageImageFormat(VernonRhiFormat format) {
+    switch (format) {
+    case VERNON_RHI_FORMAT_R8_UNORM:
+        return 0x8229;
+    case VERNON_RHI_FORMAT_R16_FLOAT:
+        return 0x822D;
+    case VERNON_RHI_FORMAT_R32_FLOAT:
+        return 0x822E;
+    case VERNON_RHI_FORMAT_RG8_UNORM:
+        return 0x822B;
+    case VERNON_RHI_FORMAT_RGBA8_UNORM:
+        return 0x8058;
+    case VERNON_RHI_FORMAT_RGBA16_FLOAT:
+        return 0x881A;
+    case VERNON_RHI_FORMAT_RGBA32_FLOAT:
+        return 0x8814;
+    default:
+        return std::nullopt;
+    }
 }
 
 VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDescriptor *descriptor,
@@ -571,16 +641,39 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
             bindings.resolvedValues[index] = 0;
         } else {
             const bool defaultResource = (value->flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) != 0;
-            const uint64_t expectedKind = slot.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ? kRhiImageResource
-                                          : slot.kind == VERNON_RUNTIME_PROVIDER_SAMPLER     ? kRhiSamplerResource
-                                                                                             : kRhiBufferResource;
+            const uint64_t expectedKind =
+                slot.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE || slot.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE
+                    ? kRhiImageResource
+                : slot.kind == VERNON_RUNTIME_PROVIDER_SAMPLER ? kRhiSamplerResource
+                                                               : kRhiBufferResource;
             const uint64_t native = defaultResource ? 0 : resolveRhiResource(adapter, value->resource);
+            const bool imageBinding = slot.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
+                                      slot.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE;
             if ((value->flags & ~VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) != 0 ||
                 (!defaultResource &&
                  ((value->resource.identity & kRhiResourceKindMask) != expectedKind || native == 0)) ||
-                (slot.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE && value->stride > 2) ||
                 (slot.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && !defaultResource && value->stride == 0))
                 return fail(adapter, "OpenGL resource binding is invalid");
+            if (imageBinding) {
+                const auto expectedFormat = rhiTextureFormat(value->texture_format);
+                const auto expectedDimension = rhiTextureDimension(value->texture_dimension);
+                VernonRhiImageDescriptor imageDescriptor{};
+                if (!expectedFormat || !expectedDimension ||
+                    (!defaultResource && !describeRhiImage(adapter, value->resource, imageDescriptor)))
+                    return fail(adapter, "OpenGL image binding metadata is invalid");
+                if (defaultResource) {
+                    imageDescriptor.format = *expectedFormat;
+                    imageDescriptor.dimension = *expectedDimension;
+                } else {
+                    const uint32_t requiredUsage = slot.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE
+                                                       ? VERNON_RHI_IMAGE_STORAGE
+                                                       : VERNON_RHI_IMAGE_SAMPLED;
+                    if (imageDescriptor.format != *expectedFormat || imageDescriptor.dimension != *expectedDimension ||
+                        !(imageDescriptor.usage & requiredUsage))
+                        return fail(adapter, "OpenGL image binding does not match its RHI descriptor");
+                }
+                bindings.resolvedImageDescriptors[index] = imageDescriptor;
+            }
             bindings.resolvedValues[index] = native;
         }
     }
@@ -602,8 +695,12 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
             slot.resource = native;
             slot.resourceReference = defaultResource ? VernonRuntimeProviderResourceReference{} : value->resource;
             slot.resourceOffset = value->resource.offset;
-            slot.resourceTarget = value->stride;
             slot.resourceStride = value->stride;
+            if (slot.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
+                slot.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE) {
+                slot.resourceTarget = bindings.resolvedImageDescriptors[index].dimension;
+                slot.textureFormat = bindings.resolvedImageDescriptors[index].format;
+            }
         }
         slot.flags = value->flags;
     }
@@ -635,6 +732,7 @@ VernonStatus createBindings(void *data, const VernonRuntimeProviderBindingSetDes
         bindings->valueIndices.resize(layout->entries.size());
         bindings->seenSlots.resize(layout->entries.size());
         bindings->resolvedValues.resize(layout->entries.size());
+        bindings->resolvedImageDescriptors.resize(layout->entries.size());
         for (size_t index = 0; index < layout->entries.size(); ++index) {
             const auto &entry = layout->entries[index];
             PreparedBindingSet::Slot slot;
@@ -714,10 +812,22 @@ VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject commandEncod
         const auto &slot = bindings->slots[index];
         if (binding.slot != slot.slot || binding.kind != slot.kind ||
             (binding.kind != VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
+             binding.kind != VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE &&
              binding.kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE))
             return fail(adapter, "OpenGL compute binding set does not match its pipeline");
-        device.driver.bindBufferBase(rhi::opengl::kShaderStorageBuffer, binding.binding,
-                                     static_cast<rhi::opengl::Uint>(slot.resource));
+        if (binding.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE) {
+            const auto format = storageImageFormat(slot.textureFormat);
+            if (!slot.resource || !format || !device.driver.bindImageTexture)
+                return fail(adapter, "OpenGL storage image format or entry point is unavailable");
+            const rhi::opengl::Enum access = binding.access == 1   ? rhi::opengl::kReadOnly
+                                             : binding.access == 2 ? rhi::opengl::kWriteOnly
+                                                                   : rhi::opengl::kReadWrite;
+            device.driver.bindImageTexture(binding.binding, static_cast<rhi::opengl::Uint>(slot.resource), 0,
+                                           slot.resourceTarget == VERNON_RHI_IMAGE_3D, 0, access, *format);
+        } else {
+            device.driver.bindBufferBase(rhi::opengl::kShaderStorageBuffer, binding.binding,
+                                         static_cast<rhi::opengl::Uint>(slot.resource));
+        }
     }
     device.driver.dispatchCompute(descriptor->group_count[0], descriptor->group_count[1], descriptor->group_count[2]);
     for (size_t index = 0; index < pipeline->native->bindings.size(); ++index)
@@ -888,9 +998,9 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
             driver.bindBufferBase(rhi::opengl::kShaderStorageBuffer, binding.binding,
                                   static_cast<rhi::opengl::Uint>(slot.resource));
         } else if (binding.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
-            const auto target = slot.resourceTarget == 0   ? rhi::opengl::kTexture2D
-                                : slot.resourceTarget == 1 ? rhi::opengl::kTexture3D
-                                                           : rhi::opengl::kTextureCubeMap;
+            const auto target = slot.resourceTarget == VERNON_RHI_IMAGE_2D   ? rhi::opengl::kTexture2D
+                                : slot.resourceTarget == VERNON_RHI_IMAGE_3D ? rhi::opengl::kTexture3D
+                                                                             : rhi::opengl::kTextureCubeMap;
             driver.activeTexture(rhi::opengl::kTexture0 + binding.binding);
             driver.bindTexture(target, static_cast<rhi::opengl::Uint>(slot.resource));
             driver.uniform1i(binding.location, static_cast<rhi::opengl::Int>(binding.binding));

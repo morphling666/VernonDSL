@@ -91,6 +91,7 @@ struct VERNON_RHI_CAPI Driver {
     PFN_vkCmdPipelineBarrier cmdPipelineBarrier{};
     PFN_vkCmdCopyBufferToImage cmdCopyBufferToImage{};
     PFN_vkCmdCopyImageToBuffer cmdCopyImageToBuffer{};
+    PFN_vkCmdBlitImage cmdBlitImage{};
     PFN_vkCmdBeginRenderPass cmdBeginRenderPass{};
     PFN_vkCmdEndRenderPass cmdEndRenderPass{};
     PFN_vkCmdClearAttachments cmdClearAttachments{};

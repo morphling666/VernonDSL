@@ -257,7 +257,7 @@ class _FunctionEmitter:
                 attributes.append(self._abi_leaf_dtypes_attribute(element_type, "vernon.element_abi_leaf_dtypes"))
             if emit_value_abi_metadata and value_type.kind in {"scalar", "tensor", "tuple", "struct"}:
                 attributes.extend(self._abi_attributes(value_type))
-            if value_type.kind == "tensor_view" and self.stage is not None:
+            if value_type.kind in {"tensor_view", "texture"} and self.stage is not None:
                 has_explicit_binding = any(attribute.startswith("vernon.binding") for attribute in attributes)
                 attributes = [
                     attribute
@@ -892,6 +892,15 @@ class _FunctionEmitter:
             return lower_texture_sample(self, node, arguments, typed_call.type)
         if name == "texture_size":
             return lower_texture_size(self, node, arguments, typed_call.type)
+        if name == "texture_load":
+            return self._intrinsic(node, name, arguments, typed_call.type)
+        if name == "texture_store":
+            operand_types = ", ".join(argument.type.mlir for argument in arguments)
+            self._line(
+                f'"vernon.intrinsic"({", ".join(argument.name for argument in arguments)}) '
+                f'{{name = "texture_store"}} : ({operand_types}) -> ()'
+            )
+            return Value("", typed_call.type)
         if name in self.context.structs:
             fields = self.context.structs[name]
             if len(arguments) != len(fields):
@@ -1028,7 +1037,9 @@ class _FunctionEmitter:
             indices = [
                 "xyzw".find(character) if character in "xyzw" else "rgba".find(character) for character in node.attr
             ]
-            if any(index >= int(shape[0]) for index in indices):
+            extent = shape[0]
+            assert isinstance(extent, int)
+            if any(index >= extent for index in indices):
                 raise self.context.error(node, f"swizzle '{node.attr}' is out of bounds")
             canonical_mask = "".join("xyzw"[index] for index in indices)
             element = value.type.arguments[0]

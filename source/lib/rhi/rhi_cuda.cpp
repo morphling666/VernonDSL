@@ -391,6 +391,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::cudaBackendDispatch() {
         nullptr,
         retainResource,
         resolveResource,
+        nullptr,
         releaseResource,
         beginCommands,
         submitCommands,

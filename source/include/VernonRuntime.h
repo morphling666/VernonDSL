@@ -5,6 +5,7 @@
 #include "VernonOpenGLContext.h"
 #include "VernonRHI.h"
 #include "VernonRuntimeProvider.h"
+#include "VernonTextureTypes.h"
 
 #if defined(VERNON_RUNTIME_STATIC)
 #define VERNON_RUNTIME_CAPI
@@ -67,27 +68,6 @@ VERNON_RUNTIME_CAPI VernonRuntimeContext *vernonRuntimeCreateForRhiDevice(Vernon
                                                                           VernonRhiDevice device);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeDestroy(VernonRuntimeContext *context);
 VERNON_RUNTIME_CAPI VernonStringView vernonRuntimeGetLastError(const VernonRuntimeContext *context);
-
-typedef enum VernonTextureFormat {
-    VERNON_TEXTURE_RGBA8_UNORM = 0,
-    VERNON_TEXTURE_RGBA8_SRGB = 1,
-    VERNON_TEXTURE_RGBA16_FLOAT = 2,
-    VERNON_TEXTURE_RGBA32_FLOAT = 3,
-    VERNON_TEXTURE_R8_UNORM = 4,
-    VERNON_TEXTURE_R16_FLOAT = 5,
-    VERNON_TEXTURE_R32_FLOAT = 6,
-    VERNON_TEXTURE_RG8_UNORM = 7,
-    VERNON_TEXTURE_RGB8_UNORM = 8,
-    VERNON_TEXTURE_R11G11B10_FLOAT = 9,
-    VERNON_TEXTURE_D32_FLOAT = 10,
-    VERNON_TEXTURE_D32_FLOAT_S8_UINT = 11
-} VernonTextureFormat;
-
-typedef enum VernonTextureDimension {
-    VERNON_TEXTURE_2D = 0,
-    VERNON_TEXTURE_3D = 1,
-    VERNON_TEXTURE_CUBE = 2
-} VernonTextureDimension;
 
 VERNON_RUNTIME_CAPI VernonLoadedPipeline *vernonRuntimeLoadArtifact(VernonRuntimeContext *context, const void *artifact,
                                                                     size_t artifact_size, const char *reflection,

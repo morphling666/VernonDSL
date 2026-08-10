@@ -49,6 +49,7 @@ from pipeline_shader import (
     translated_vertex,
     triangle_vertex,
     u32_attribute_vertex,
+    volume_coordinate_fragment,
 )
 
 
@@ -74,27 +75,76 @@ class RenderTargetTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-negative"):
             target.attach_color(-1, color)
 
-        target.attach_depth(format=vd.depth32)
+        target.attach_depth()
         with self.assertRaisesRegex(ValueError, "already has"):
-            target.attach_depth(format=vd.depth32)
+            target.attach_depth()
 
-    def test_generic_depth_and_cube_texture_validation(self) -> None:
-        depth = vd.Texture.zeros(shape=(16, 16), format=vd.depth32)
-        target = vd.RenderTarget(shape=depth.shape).attach_depth(texture=depth)
+    def test_render_target_owned_depth_and_cube_texture_validation(self) -> None:
+        target = vd.RenderTarget(shape=(16, 16)).attach_depth()
+        depth = target.depth_texture
         self.assertEqual(target.shape, (16, 16))
-        self.assertEqual(depth.to_numpy().dtype, np.float32)
+        self.assertEqual(depth.shape, (16, 16))
+        with self.assertRaisesRegex(RuntimeError, "cannot be uploaded"):
+            depth.copy_from_numpy(np.zeros((16, 16), dtype=np.float32))
+        with self.assertRaisesRegex(RuntimeError, "readback is not exposed"):
+            depth.to_numpy()
 
         faces = np.zeros((6, 8, 8, 4), dtype=np.uint8)
         cube = vd.Texture.cube(faces)
         self.assertEqual(cube.shape, (8, 8))
         np.testing.assert_array_equal(cube.to_numpy(), faces)
 
-        with self.assertRaisesRegex(ValueError, "exactly one"):
-            vd.RenderTarget(shape=(16, 16)).attach_depth()
-        with self.assertRaisesRegex(ValueError, "exactly one"):
-            vd.RenderTarget(shape=(16, 16)).attach_depth(format=vd.depth32, texture=depth)
+        with self.assertRaisesRegex(RuntimeError, "no depth attachment"):
+            _ = vd.RenderTarget(shape=(16, 16)).depth_texture
         with self.assertRaisesRegex(ValueError, "6"):
             vd.Texture.cube(np.zeros((5, 8, 8, 4), dtype=np.uint8))
+
+    def test_three_dimensional_texture_storage(self) -> None:
+        source = np.arange(3 * 4 * 5 * 4, dtype=np.uint8).reshape(3, 4, 5, 4)
+        texture = vd.Texture.from_numpy(source, dimension="3d")
+        self.assertEqual(texture.shape, (3, 4, 5))
+        np.testing.assert_array_equal(texture.to_numpy(), source)
+
+        replacement = np.full_like(source, 23)
+        texture.copy_from_numpy(replacement)
+        np.testing.assert_array_equal(texture.to_numpy(), replacement)
+        self.assertEqual(vd.Texture.zeros(shape=(2, 3, 4), dimension="3d").shape, (2, 3, 4))
+
+        with self.assertRaisesRegex(ValueError, "3 positive dimensions"):
+            vd.Texture.zeros(shape=(3, 4), dimension="3d")
+        with self.assertRaisesRegex(ValueError, "two positive dimensions"):
+            vd.RenderTarget(shape=texture.shape)
+
+    def test_texture_formats_mips_and_subregions(self) -> None:
+        texture = vd.Texture.zeros(
+            shape=(4, 6, 8),
+            dimension="3d",
+            format=vd.rgba32_float,
+            mip_levels=4,
+            usage=("sampled", "storage", "transfer_source", "transfer_destination"),
+        )
+        self.assertEqual(texture.format, vd.rgba32_float)
+        self.assertEqual(texture.dimension, "3d")
+        self.assertEqual(texture.mip_levels, 4)
+        self.assertIn("storage", texture.usage)
+
+        region = np.full((1, 2, 3, 4), 7.0, dtype=np.float32)
+        texture.upload(region, mip_level=0, origin=(2, 1, 4))
+        expected = np.zeros((4, 6, 8, 4), dtype=np.float32)
+        expected[2:3, 1:3, 4:7] = 7.0
+        np.testing.assert_array_equal(texture.download(), expected)
+
+        mip = np.full((2, 3, 4, 4), 2.0, dtype=np.float32)
+        texture.upload(mip, mip_level=1)
+        np.testing.assert_array_equal(texture.download(mip_level=1), mip)
+
+        cube = vd.Texture.cube(np.zeros((6, 4, 4, 4), dtype=np.uint8), mip_levels=2)
+        cube.upload(np.full((6, 2, 2, 4), 9, dtype=np.uint8), mip_level=1)
+        np.testing.assert_array_equal(cube.download(mip_level=1), np.full((6, 2, 2, 4), 9, dtype=np.uint8))
+
+        storage_only = vd.Texture.zeros(shape=(2, 2), usage=("storage",))
+        with self.assertRaisesRegex(RuntimeError, "transfer_source"):
+            storage_only.download()
 
 
 def assert_depth_attachment_selects_nearest(test: unittest.TestCase) -> None:
@@ -109,7 +159,7 @@ def assert_depth_attachment_selects_nearest(test: unittest.TestCase) -> None:
         np.array(((1.0, 0.0, 0.0, 1.0),) * 3 + ((0.0, 1.0, 0.0, 1.0),) * 3, dtype=np.float32)
     )
     target = vd.Texture.zeros(shape=(32, 32))
-    attachments = render_target(target).attach_depth(format=vd.depth32)
+    attachments = render_target(target).attach_depth()
 
     vd.pipeline(depth_vertex, depth_fragment)(position=positions, color=colors, target=attachments)
 
@@ -388,6 +438,26 @@ def assert_cube_faces_remain_distinct(test: unittest.TestCase) -> None:
     test.assertLess(int(seam_pixel[1]), 16)
     test.assertGreater(int(seam_pixel[2]), 80)
     test.assertLess(int(seam_pixel[2]), 180)
+
+
+def assert_three_dimensional_texture_samples(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+    colors = np.array(((255, 32, 16, 255), (24, 64, 255, 255)), dtype=np.uint8)
+    volume = np.broadcast_to(colors[:, None, None, :], (2, 2, 2, 4)).copy()
+    image = vd.Texture.from_numpy(volume, dimension="3d")
+    sampler = vd.sampler(address="clamp_to_edge")
+    render = vd.pipeline(triangle_vertex, volume_coordinate_fragment)
+
+    for layer, color in enumerate(colors):
+        target = vd.Texture.zeros(shape=(8, 8))
+        render(
+            position=positions,
+            coordinate=np.array((0.5, 0.5, (layer + 0.5) / len(colors)), dtype=np.float32),
+            image=image,
+            sampler=sampler,
+            target=render_target(target),
+        )
+        np.testing.assert_allclose(target.to_numpy()[4, 4], color, atol=1)
 
 
 def assert_inactive_texture_binding_renders(test: unittest.TestCase) -> None:
@@ -756,6 +826,9 @@ class OpenGLPipelineTests(unittest.TestCase):
     def test_cube_faces_remain_distinct(self) -> None:
         assert_cube_faces_remain_distinct(self)
 
+    def test_three_dimensional_texture_samples(self) -> None:
+        assert_three_dimensional_texture_samples(self)
+
     def test_inactive_texture_binding_renders(self) -> None:
         assert_inactive_texture_binding_renders(self)
 
@@ -977,6 +1050,9 @@ class VulkanPipelineTests(unittest.TestCase):
     def test_cube_faces_remain_distinct(self) -> None:
         assert_cube_faces_remain_distinct(self)
 
+    def test_three_dimensional_texture_samples(self) -> None:
+        assert_three_dimensional_texture_samples(self)
+
     def test_inactive_texture_binding_renders(self) -> None:
         assert_inactive_texture_binding_renders(self)
 
@@ -1121,6 +1197,9 @@ class DirectXPipelineTests(unittest.TestCase):
 
     def test_cube_faces_remain_distinct(self) -> None:
         assert_cube_faces_remain_distinct(self)
+
+    def test_three_dimensional_texture_samples(self) -> None:
+        assert_three_dimensional_texture_samples(self)
 
     def test_inactive_texture_binding_renders(self) -> None:
         assert_inactive_texture_binding_renders(self)

@@ -25,7 +25,13 @@ from .execution_graph import (
     ExecutionResources,
     PipelineInvocation,
 )
-from .resources import TensorStorage, TensorView, _bind_native_argument, _dispatch_borrow_scope
+from .resources import (
+    TensorStorage,
+    TensorView,
+    _bind_native_argument,
+    _dispatch_borrow_scope,
+    _TextureResource,
+)
 
 
 def _session_state() -> Any:
@@ -204,7 +210,12 @@ class Kernel:
         writable = {
             parameter.name
             for parameter in entry.parameters
-            if parameter.type.kind == "tensor_view" and parameter.access is not AccessMode.READ
+            if (
+                parameter.type.kind == "tensor_view"
+                and parameter.access is not AccessMode.READ
+                or parameter.type.kind == "texture"
+                and parameter.type.arguments[3] in {"write", "read_write"}
+            )
         }
         writable.update(
             effect.owner.name
@@ -558,7 +569,7 @@ class Kernel:
             writable_shapes = {
                 value.shape
                 for name, value in zip(user_parameters, arguments, strict=True)
-                if name in compiled.writable_names and isinstance(value, (TensorStorage, TensorView))
+                if name in compiled.writable_names and isinstance(value, (TensorStorage, TensorView, _TextureResource))
             }
             if not writable_shapes:
                 raise TypeError("grid is required when no writable Tensor domain can be inferred")
@@ -578,7 +589,7 @@ class Kernel:
         dispatch_borrows = [
             (name, value, "write" if name in compiled.writable_names else "read")
             for name, value in zip(user_parameters, arguments, strict=True)
-            if isinstance(value, (TensorStorage, TensorView))
+            if isinstance(value, (TensorStorage, TensorView, _TextureResource))
         ]
         with _dispatch_borrow_scope(dispatch_borrows):
             builder = compiled.native.invocation_builder()
@@ -605,7 +616,7 @@ class Kernel:
                 if (
                     state._architecture != state.cpu
                     and name in compiled.writable_names
-                    and isinstance(value, (TensorStorage, TensorView))
+                    and isinstance(value, (TensorStorage, TensorView, _TextureResource))
                 ):
                     value._mark_device_dirty()
 
@@ -633,7 +644,7 @@ class Kernel:
         state = _session_state()
         compiled = self._compile(arguments, features)
         for parameter, value in zip(compiled.native.parameters, arguments, strict=True):
-            if not isinstance(value, (TensorStorage, TensorView)):
+            if not isinstance(value, (TensorStorage, TensorView, _TextureResource)):
                 continue
             if parameter.access == state._native.ACCESS_READ:
                 execution_pass.read(value)

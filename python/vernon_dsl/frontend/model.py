@@ -77,9 +77,9 @@ class ConcreteType:
             dimensions = ", ".join(str(-1 if extent == "?" else extent) for extent in shape)
             return f'!vernon.tensor_view<{element.mlir}, [{dimensions}], "{access}", "{address_space}">'
         if self.kind == "texture":
-            dimension, element = self.arguments
+            dimension, element, format_name, access = self.arguments
             assert isinstance(element, ConcreteType)
-            return f'!vernon.texture<"{dimension}", {element.mlir}>'
+            return f'!vernon.texture<"{dimension}", {element.mlir}, "{format_name}", "{access}">'
         if self.kind == "sampler":
             return "!vernon.sampler"
         raise AssertionError(f"unknown type kind {self.kind}")

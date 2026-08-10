@@ -59,6 +59,7 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
     LOAD(deleteFramebuffers, "glDeleteFramebuffers");
     LOAD(bindFramebuffer, "glBindFramebuffer");
     LOAD(framebufferTexture2D, "glFramebufferTexture2D");
+    LOAD(framebufferTextureLayer, "glFramebufferTextureLayer");
     LOAD(checkFramebufferStatus, "glCheckFramebufferStatus");
     LOAD(drawBuffers, "glDrawBuffers");
     LOAD(readBuffer, "glReadBuffer");
@@ -123,6 +124,8 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
     LOAD(genTextures, "glGenTextures");
     LOAD(deleteTextures, "glDeleteTextures");
     LOAD(bindTexture, "glBindTexture");
+    driver.bindImageTexture = reinterpret_cast<decltype(driver.bindImageTexture)>(
+        callbacks.get_proc_address(callbacks.user_data, "glBindImageTexture"));
     LOAD(texImage2D, "glTexImage2D");
     LOAD(texImage3D, "glTexImage3D");
     LOAD(texSubImage2D, "glTexSubImage2D");

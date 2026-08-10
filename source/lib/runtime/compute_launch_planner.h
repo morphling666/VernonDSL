@@ -11,7 +11,7 @@
 
 namespace vernon::runtime {
 
-enum class ComputeLaunchArgumentKind { Tensor, Scalar };
+enum class ComputeLaunchArgumentKind { Tensor, Texture, Scalar };
 
 struct ComputeLaunchArgument {
     ComputeLaunchArgumentKind kind{ComputeLaunchArgumentKind::Tensor};
@@ -21,6 +21,8 @@ struct ComputeLaunchArgument {
     const void *scalarData{};
     size_t scalarSize{};
     const VernonTensorView *tensorView{};
+    VernonTextureFormat textureFormat{};
+    VernonTextureDimension textureDimension{};
 };
 
 enum class ComputeBindingSourceKind { Argument, TensorOffset, TensorExtent, TensorStride };

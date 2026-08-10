@@ -5,6 +5,7 @@ import json
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import vernon_dsl as vd
@@ -12,9 +13,9 @@ import vernon_dsl as vd
 from examples.autodiff_smoke_fluid_graph import build_smoke_fluid_graph
 from examples.autodiff_smoke_fluid_kernels import SmokeFluidParameters
 
-GRID = 16
+GRID = 64
 NOZZLES = 4
-PRESSURE_ITERATIONS = 4
+PRESSURE_ITERATIONS = 20
 DELTA_TIME = np.float32(0.12)
 
 
@@ -45,12 +46,12 @@ class SmokeFluidSimulation:
         self.controls = vd.storage.zeros(dtype=vd.f32, shape=(nozzles,))
         self.target = vd.storage.zeros(dtype=vd.f32, shape=(grid, grid))
         self.output_loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
-        self.parameters = SmokeFluidParameters(
-            width=np.int32(grid),
-            height=np.int32(grid),
-            nozzle_count=np.int32(nozzles),
-            pressure_iterations=np.int32(pressure_iterations),
-            delta_time=DELTA_TIME,
+        self.parameters = cast(Any, SmokeFluidParameters)(
+            np.int32(grid),
+            np.int32(grid),
+            np.int32(nozzles),
+            np.int32(pressure_iterations),
+            DELTA_TIME,
         )
 
     def set_objective_inputs(self, control: np.ndarray, target: np.ndarray) -> None:
@@ -95,30 +96,69 @@ def v_target(grid: int = GRID) -> np.ndarray:
     return target
 
 
-def smoke_image(density: np.ndarray, target: np.ndarray, control: np.ndarray) -> np.ndarray:
-    normalized = np.clip(density / np.float32(1.3), 0.0, 1.0)
-    alpha = 1.0 - np.exp(-normalized * np.float32(2.4))
-    blue = np.clip(normalized * 1.4, 0.0, 1.0)
-    smoke = np.stack(
+def smoke_image(
+    density: np.ndarray,
+    target: np.ndarray,
+    control: np.ndarray,
+    *,
+    output_size: int | None = None,
+) -> np.ndarray:
+    import cv2
+
+    size = density.shape[1] if output_size is None else output_size
+    if size <= 0:
+        raise ValueError("smoke render size must be positive")
+
+    rendered_density = cv2.resize(density, (size, size), interpolation=cv2.INTER_CUBIC)
+    normalized = np.clip(rendered_density / np.float32(1.45), 0.0, 1.0)
+    haze = cv2.GaussianBlur(normalized, (0, 0), sigmaX=max(size / 160.0, 0.8))
+    glow = cv2.GaussianBlur(normalized, (0, 0), sigmaX=max(size / 64.0, 1.5))
+    opacity = 1.0 - np.exp(-(normalized * np.float32(2.4) + haze * np.float32(0.8)))
+
+    y, x = np.mgrid[0:size, 0:size].astype(np.float32)
+    x = x / np.float32(max(size - 1, 1))
+    y = y / np.float32(max(size - 1, 1))
+    vignette = np.clip(1.0 - 0.42 * ((x - 0.5) ** 2 + (y - 0.45) ** 2), 0.65, 1.0)
+    background = np.stack(
         (
-            np.clip(alpha * (0.72 + blue * 0.28), 0.0, 1.0),
-            np.clip(alpha * (0.78 + blue * 0.22), 0.0, 1.0),
-            np.clip(alpha * (0.9 + blue * 0.1), 0.0, 1.0),
+            (0.055 + 0.025 * (1.0 - y)) * vignette,
+            (0.025 + 0.018 * (1.0 - y)) * vignette,
+            (0.018 + 0.012 * (1.0 - y)) * vignette,
         ),
         axis=-1,
     )
-    target_overlay = np.zeros_like(smoke)
-    target_overlay[..., 1] = target * 0.18
-    target_overlay[..., 2] = target * 0.08
-    image = np.clip(smoke + target_overlay, 0.0, 1.0)
-    nozzle_width = density.shape[1] // len(control)
+
+    temperature = np.clip(normalized * 1.5, 0.0, 1.0)[..., None]
+    cool_smoke = np.array([0.78, 0.43, 0.28], dtype=np.float32)
+    dense_smoke = np.array([1.0, 0.98, 0.94], dtype=np.float32)
+    smoke_color = cool_smoke + (dense_smoke - cool_smoke) * temperature
+    image = background * (1.0 - opacity[..., None]) + smoke_color * opacity[..., None]
+    image += glow[..., None] * np.array([0.12, 0.07, 0.035], dtype=np.float32)
+
+    target_line = cv2.resize(target, (size, size), interpolation=cv2.INTER_CUBIC)
+    target_line = np.clip(target_line, 0.0, 1.0).astype(np.float32)
+    target_line = cv2.GaussianBlur(target_line, (0, 0), sigmaX=max(size / 512.0, 0.6))
+    target_glow = cv2.GaussianBlur(target_line, (0, 0), sigmaX=max(size / 80.0, 1.0))
+    image += target_glow[..., None] * np.array([0.08, 0.24, 0.06], dtype=np.float32)
+    image += target_line[..., None] * np.array([0.14, 0.42, 0.12], dtype=np.float32)
+
+    nozzle_spacing = size / len(control)
+    nozzle_radius = max(round(nozzle_spacing * 0.06), 2)
     for nozzle, amount in enumerate(control):
-        begin = nozzle * nozzle_width
-        image[-2:, begin : begin + nozzle_width, 0] = np.maximum(
-            image[-2:, begin : begin + nozzle_width, 0],
-            np.float32(amount),
+        center = (round((nozzle + 0.5) * nozzle_spacing), size - nozzle_radius - 2)
+        strength = float(np.clip(amount, 0.0, 1.0))
+        color = (round(65 + 90 * strength), round(120 + 105 * strength), round(210 + 45 * strength))
+        cv2.circle(image, center, nozzle_radius + 2, (0.035, 0.05, 0.09), -1, cv2.LINE_AA)
+        cv2.circle(
+            image,
+            center,
+            nozzle_radius,
+            tuple(channel / 255.0 for channel in color),
+            -1,
+            cv2.LINE_AA,
         )
-    return (image[..., ::-1] * np.float32(255.0)).astype(np.uint8)
+
+    return (np.clip(image, 0.0, 1.0) * np.float32(255.0)).astype(np.uint8)
 
 
 def optimize(**_arguments: object) -> None:
@@ -129,21 +169,31 @@ def simulate(
     *,
     steps: int,
     control: np.ndarray | None = None,
-    architecture: object = vd.cpu,
+    architecture=vd.cpu,
     verbose: bool = True,
     render_callback=None,
+    grid: int = GRID,
+    nozzles: int = NOZZLES,
+    pressure_iterations: int = PRESSURE_ITERATIONS,
+    render_size: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[float], SmokeTimings]:
     start = time.perf_counter()
     vd.init(arch=architecture)
-    simulation = SmokeFluidSimulation()
+    simulation = SmokeFluidSimulation(
+        grid=grid,
+        nozzles=nozzles,
+        pressure_iterations=pressure_iterations,
+    )
     timings = SmokeTimings(initialization_seconds=time.perf_counter() - start)
-    target = v_target()
+    target = v_target(grid)
     simulation.set_target(target)
     applied_control = (
-        np.full((NOZZLES,), np.float32(0.25), dtype=np.float32)
+        np.full((nozzles,), np.float32(0.25), dtype=np.float32)
         if control is None
         else np.ascontiguousarray(control, dtype=np.float32)
     )
+    if applied_control.shape != (nozzles,):
+        raise ValueError(f"control must have shape ({nozzles},)")
     applied: list[np.ndarray] = []
     losses: list[float] = []
 
@@ -158,7 +208,15 @@ def simulate(
         applied.append(applied_control.copy())
         if render_callback is not None:
             render_start = time.perf_counter()
-            render_callback(step, smoke_image(density, target, applied_control))
+            render_callback(
+                step,
+                smoke_image(
+                    density,
+                    target,
+                    applied_control,
+                    output_size=render_size,
+                ),
+            )
             timings.render_seconds += time.perf_counter() - render_start
         if verbose:
             error = float(np.linalg.norm(density - target))
@@ -169,14 +227,23 @@ def simulate(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="A forward stable-fluid smoke simulation")
-    parser.add_argument("--steps", type=int, default=120)
+    parser.add_argument("--steps", type=int, default=240)
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--grid", type=int, default=GRID)
+    parser.add_argument("--pressure-iterations", type=int, default=PRESSURE_ITERATIONS)
+    parser.add_argument("--render-size", type=int, default=768)
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--output", type=Path, default=Path("smoke_forward.png"))
+    parser.add_argument("--animation-output", type=Path, help="write all rendered frames as a looping WebP")
     parser.add_argument("--benchmark-json", type=Path)
     arguments = parser.parse_args()
-    if min(arguments.steps, arguments.fps) <= 0:
-        parser.error("steps and fps must be positive")
+    if min(arguments.steps, arguments.fps, arguments.grid, arguments.render_size) <= 0:
+        parser.error("steps, fps, grid, and render size must be positive")
+    if arguments.pressure_iterations < 0:
+        parser.error("pressure iterations must be non-negative")
+    if arguments.animation_output is not None and arguments.animation_output.suffix.lower() != ".webp":
+        parser.error("--animation-output must use a .webp extension")
 
     try:
         import cv2
@@ -187,10 +254,13 @@ def main() -> None:
 
     window = "VernonDSL Smoke Forward"
     last_image: np.ndarray | None = None
+    animation_frames: list[np.ndarray] = []
 
     def render(_step: int, image: np.ndarray) -> None:
         nonlocal last_image
-        last_image = cv2.resize(image, (768, 768), interpolation=cv2.INTER_CUBIC)
+        last_image = image
+        if arguments.animation_output is not None:
+            animation_frames.append(cv2.cvtColor(image, cv2.COLOR_BGR2BGRA))
         if not arguments.headless:
             cv2.imshow(window, last_image)
             cv2.waitKey(max(1, round(1000 / arguments.fps)))
@@ -201,6 +271,10 @@ def main() -> None:
         density, controls, losses, timings = simulate(
             steps=arguments.steps,
             render_callback=render,
+            grid=arguments.grid,
+            pressure_iterations=arguments.pressure_iterations,
+            render_size=arguments.render_size,
+            verbose=not arguments.quiet,
         )
     finally:
         if not arguments.headless:
@@ -208,6 +282,10 @@ def main() -> None:
 
     if last_image is None or not cv2.imwrite(str(arguments.output), last_image):
         raise RuntimeError(f"failed to write {arguments.output}")
+    if arguments.animation_output is not None:
+        from examples.showcase_common import write_animation
+
+        write_animation(arguments.animation_output, animation_frames, arguments.fps)
     np.save(arguments.output.with_name(arguments.output.stem + "_density.npy"), density)
     np.save(arguments.output.with_name(arguments.output.stem + "_controls.npy"), controls)
     benchmark = {

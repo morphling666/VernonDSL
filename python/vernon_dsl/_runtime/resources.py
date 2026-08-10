@@ -56,6 +56,35 @@ def _is_logical_collection(value: Any) -> bool:
     return isinstance(value, (list, tuple)) or (isinstance(value, np.ndarray) and value.ndim > 0)
 
 
+class _TextureResource:
+    def __init__(self) -> None:
+        self._borrow_lock = threading.RLock()
+        self._active_borrows: list[tuple[object, _TextureResource, str]] = []
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        raise NotImplementedError
+
+    def _resident_texture(self) -> Any:
+        raise NotImplementedError
+
+    def _mark_device_dirty(self) -> None:
+        raise NotImplementedError
+
+    def _graph_identity(self) -> object:
+        return self
+
+    def _ensure_host_mutation_allowed(self) -> None:
+        with self._borrow_lock:
+            if self._active_borrows:
+                raise RuntimeError("host mutation is forbidden while a device dispatch borrows Texture")
+
+    def _ensure_host_read_allowed(self) -> None:
+        with self._borrow_lock:
+            if any(access != "read" for _, _, access in self._active_borrows):
+                raise RuntimeError("host reads are forbidden while a device dispatch writes Texture")
+
+
 def _bind_native_argument(
     builder: Any,
     parameter: Any,
@@ -79,6 +108,12 @@ def _bind_native_argument(
             list(layout.byte_strides),
             layout.byte_offset,
         )
+    if isinstance(value, _TextureResource):
+        if state._architecture == state.cpu:
+            raise TypeError("CPU kernels do not support Texture arguments")
+        if state._rhi_host is None:
+            raise RuntimeError("Texture arguments require a GPU RHI host")
+        return builder.rhi_texture(parameter.name, value._resident_texture())
 
     value_type = type(value)
     struct_type = (
@@ -556,6 +591,7 @@ class TensorStorage:
             self._uploaded_version = 0
             self._device_dirty = False
             self._allocation_count += 1
+        assert self._native_buffer is not None
         if self._uploaded_version != self._host_version:
             self._native_buffer.upload(self._array.tobytes(order="C"))
             self._uploaded_version = self._host_version
@@ -681,6 +717,7 @@ class RawBuffer:
             self._native_generation = state._runtime_generation
             self._uploaded_version = 0
             self._device_dirty = False
+        assert self._native_buffer is not None
         if self._uploaded_version != self._host_version:
             self._native_buffer.upload(self._array.tobytes())
             self._uploaded_version = self._host_version
@@ -912,45 +949,60 @@ class TensorView:
 
 
 def _normalize_dispatch_borrows(
-    borrows: list[tuple[str, TensorStorage | TensorView, str]],
-) -> list[tuple[str, TensorView, str]]:
-    normalized: list[tuple[str, TensorView, str]] = []
+    borrows: list[tuple[str, TensorStorage | TensorView | _TextureResource, str]],
+) -> list[tuple[str, TensorView | _TextureResource, str]]:
+    normalized: list[tuple[str, TensorView | _TextureResource, str]] = []
     for name, value, access in borrows:
         access = _checked_access(access)
-        view = value._full_view("read_write") if isinstance(value, TensorStorage) else value
-        if access in {"read", "read_write"} and view.access == "write":
-            raise ValueError(f"TensorView argument '{name}' does not permit reads")
-        if access in {"write", "read_write"} and view.access == "read":
-            raise ValueError(f"TensorView argument '{name}' does not permit writes")
-        normalized.append((name, view, access))
+        resource = value._full_view("read_write") if isinstance(value, TensorStorage) else value
+        if isinstance(resource, TensorView):
+            if access in {"read", "read_write"} and resource.access == "write":
+                raise ValueError(f"TensorView argument '{name}' does not permit reads")
+            if access in {"write", "read_write"} and resource.access == "read":
+                raise ValueError(f"TensorView argument '{name}' does not permit writes")
+        normalized.append((name, resource, access))
     return normalized
 
 
 def _validate_dispatch_borrows(
-    borrows: list[tuple[str, TensorStorage | TensorView, str]],
+    borrows: list[tuple[str, TensorStorage | TensorView | _TextureResource, str]],
 ) -> None:
     _normalize_dispatch_borrows(borrows)
 
 
+def _dispatch_borrow_owner(resource: TensorView | _TextureResource) -> TensorStorage | RawBuffer | _TextureResource:
+    return resource.owner if isinstance(resource, TensorView) else resource
+
+
+def _dispatch_borrows_overlap(
+    left: TensorView | _TextureResource,
+    right: TensorView | _TextureResource,
+) -> bool:
+    if isinstance(left, TensorView) and isinstance(right, TensorView):
+        return _borrow_ranges_may_overlap(left, right)
+    return True
+
+
 @contextmanager
 def _dispatch_borrow_scope(
-    borrows: list[tuple[str, TensorStorage | TensorView, str]],
+    borrows: list[tuple[str, TensorStorage | TensorView | _TextureResource, str]],
 ) -> Iterator[None]:
     """Retain owners and reject incompatible borrows until dispatch completion."""
     normalized = _normalize_dispatch_borrows(borrows)
-    owners = sorted({view.owner for _, view, _ in normalized}, key=id)
+    owners = sorted({_dispatch_borrow_owner(resource) for _, resource, _ in normalized}, key=id)
     token = object()
     for owner in owners:
         owner._borrow_lock.acquire()
     try:
-        for name, view, access in normalized:
-            for _, active_view, active_access in view.owner._active_borrows:
+        for name, resource, access in normalized:
+            owner = _dispatch_borrow_owner(resource)
+            for _, active_resource, active_access in owner._active_borrows:
                 if access == active_access == "read":
                     continue
-                if _borrow_ranges_may_overlap(view, active_view):
+                if _dispatch_borrows_overlap(resource, active_resource):
                     raise RuntimeError(f"dispatch argument '{name}' conflicts with an outstanding device borrow")
-        for _, view, access in normalized:
-            view.owner._active_borrows.append((token, view, access))
+        for _, resource, access in normalized:
+            _dispatch_borrow_owner(resource)._active_borrows.append((token, resource, access))
     finally:
         for owner in reversed(owners):
             owner._borrow_lock.release()
@@ -968,56 +1020,165 @@ def _dispatch_borrow_scope(
 
 
 @dataclass(frozen=True)
-class _TextureFormat:
+class TextureFormat:
     name: str
     _native_name: str
-    _depth: bool = False
+    dtype: np.dtype[Any]
+    channels: int
+    storage: bool = True
 
 
-rgba8 = _TextureFormat("rgba8", "RGBA8_UNORM")
-depth32 = _TextureFormat("depth32", "D32_FLOAT", True)
+rgba8_unorm = TextureFormat("rgba8_unorm", "RGBA8_UNORM", np.dtype(np.uint8), 4)
+rgba8_srgb = TextureFormat("rgba8_srgb", "RGBA8_SRGB", np.dtype(np.uint8), 4, False)
+rgba16_float = TextureFormat("rgba16_float", "RGBA16_FLOAT", np.dtype(np.float16), 4)
+rgba32_float = TextureFormat("rgba32_float", "RGBA32_FLOAT", np.dtype(np.float32), 4)
+r8_unorm = TextureFormat("r8_unorm", "R8_UNORM", np.dtype(np.uint8), 1)
+r16_float = TextureFormat("r16_float", "R16_FLOAT", np.dtype(np.float16), 1)
+r32_float = TextureFormat("r32_float", "R32_FLOAT", np.dtype(np.float32), 1)
+rg8_unorm = TextureFormat("rg8_unorm", "RG8_UNORM", np.dtype(np.uint8), 2)
+rgb8_unorm = TextureFormat("rgb8_unorm", "RGB8_UNORM", np.dtype(np.uint8), 3, False)
+r11g11b10_float = TextureFormat("r11g11b10_float", "R11G11B10_FLOAT", np.dtype(np.uint32), 1, False)
+
+_TEXTURE_FORMATS = (
+    rgba8_unorm,
+    rgba8_srgb,
+    rgba16_float,
+    rgba32_float,
+    r8_unorm,
+    r16_float,
+    r32_float,
+    rg8_unorm,
+    rgb8_unorm,
+    r11g11b10_float,
+)
+_TEXTURE_FORMAT_SET = frozenset(_TEXTURE_FORMATS)
+_TEXTURE_USAGES = frozenset({"sampled", "storage", "transfer_source", "transfer_destination", "color_attachment"})
 
 
-class Texture:
+class Texture(_TextureResource):
     """Runtime image storage and shader texture annotation constructor."""
 
     def __init__(
         self,
         array: np.ndarray,
         *,
-        format: _TextureFormat | None = None,
+        format: TextureFormat = rgba8_unorm,
         dimension: str = "2d",
+        mip_levels: int = 1,
+        usage: tuple[str, ...] | None = None,
     ):
         if not isinstance(array, np.ndarray):
             raise ValueError("Texture storage must be a NumPy array")
-        format = format or rgba8
-        if dimension not in {"2d", "cube"}:
-            raise ValueError("Texture dimension must be '2d' or 'cube'")
-        if format._depth:
-            valid = dimension == "2d" and array.dtype == np.float32 and array.ndim == 2
-            expected = "contiguous float32 (height, width)"
-        elif dimension == "cube":
-            valid = (
-                array.dtype == np.uint8
-                and array.ndim == 4
-                and array.shape[0] == 6
-                and array.shape[1] == array.shape[2]
-                and array.shape[3] == 4
-            )
-            expected = "contiguous uint8 (6, size, size, 4)"
-        else:
-            valid = array.dtype == np.uint8 and array.ndim == 3 and array.shape[2] == 4
-            expected = "contiguous uint8 (height, width, 4)"
+        if format not in _TEXTURE_FORMAT_SET:
+            raise ValueError("unsupported Texture format")
+        if dimension not in {"2d", "3d", "cube"}:
+            raise ValueError("Texture dimension must be '2d', '3d', or 'cube'")
+        logical_rank = 3 if dimension in {"3d", "cube"} else 2
+        channel_rank = 0 if format.channels == 1 else 1
+        valid = array.dtype == format.dtype and array.ndim == logical_rank + channel_rank
+        if channel_rank:
+            valid = valid and array.shape[-1] == format.channels
+        if dimension == "cube":
+            valid = valid and array.shape[0] == 6 and array.shape[1] == array.shape[2]
+        expected_shape = {
+            "2d": "(height, width)",
+            "3d": "(depth, height, width)",
+            "cube": "(6, size, size)",
+        }[dimension]
+        if channel_rank:
+            expected_shape = f"{expected_shape[:-1]}, {format.channels})"
+        expected = f"contiguous {format.dtype.name} {expected_shape}"
         if not isinstance(array, np.ndarray) or not valid or not array.flags.c_contiguous:
             raise ValueError(f"Texture storage must be {expected}")
+        if not isinstance(mip_levels, int) or isinstance(mip_levels, bool) or mip_levels <= 0:
+            raise ValueError("Texture mip_levels must be a positive integer")
+        logical_shape = self._logical_shape(array.shape, dimension, format.channels)
+        max_mip_levels = max(logical_shape).bit_length()
+        if mip_levels > max_mip_levels:
+            raise ValueError(f"Texture mip_levels cannot exceed {max_mip_levels} for shape {logical_shape}")
+        if usage is None:
+            resolved_usage = {"sampled", "transfer_source", "transfer_destination"}
+            if dimension == "2d":
+                resolved_usage.add("color_attachment")
+        else:
+            if not isinstance(usage, tuple) or not usage or any(item not in _TEXTURE_USAGES for item in usage):
+                raise ValueError(f"Texture usage must be a non-empty tuple containing {sorted(_TEXTURE_USAGES)}")
+            resolved_usage = set(usage)
+        if "storage" in resolved_usage and not format.storage:
+            raise ValueError(f"Texture format {format.name!r} does not support storage usage")
+        if "color_attachment" in resolved_usage and dimension != "2d":
+            raise ValueError("color_attachment usage requires a two-dimensional Texture")
+        super().__init__()
         self._array = np.array(array, copy=True, order="C")
+        self._mip_arrays: dict[int, np.ndarray] = {0: self._array}
         self._format = format
         self._dimension = dimension
+        self._mip_levels = mip_levels
+        self._usage = frozenset(resolved_usage)
         self._native_texture: Any | None = None
         self._native_generation = -1
-        self._host_dirty = not format._depth
-        self._device_dirty = False
+        self._host_dirty_mips = {0}
+        self._device_dirty_mips: set[int] = set()
         _session_state()._runtime_children.add(self)
+
+    @staticmethod
+    def _logical_shape(array_shape: tuple[int, ...], dimension: str, channels: int) -> tuple[int, ...]:
+        shape = array_shape[:-1] if channels != 1 else array_shape
+        return shape[1:] if dimension == "cube" else shape
+
+    def _mip_shape(self, mip_level: int) -> tuple[int, ...]:
+        if not isinstance(mip_level, int) or isinstance(mip_level, bool) or not 0 <= mip_level < self._mip_levels:
+            raise ValueError("Texture mip level is out of range")
+        return tuple(max(1, extent >> mip_level) for extent in self.shape)
+
+    def _array_shape(self, mip_level: int) -> tuple[int, ...]:
+        logical = self._mip_shape(mip_level)
+        if self._dimension == "cube":
+            logical = (6, *logical)
+        return (*logical, self._format.channels) if self._format.channels != 1 else logical
+
+    def _download_device_region(
+        self,
+        mip_level: int,
+        origin: tuple[int, ...],
+        shape: tuple[int, ...],
+    ) -> None:
+        if self._native_texture is None:
+            raise RuntimeError("device-dirty Texture has no allocation")
+        if self._dimension == "3d":
+            offset_z, offset_y, offset_x = origin
+            download_depth, download_height, download_width = shape
+        else:
+            offset_y, offset_x = origin
+            offset_z = 0
+            download_height, download_width = shape
+            download_depth = 1
+        downloaded_shape = (6, *shape) if self._dimension == "cube" else shape
+        if self._format.channels != 1:
+            downloaded_shape = (*downloaded_shape, self._format.channels)
+        downloaded = np.frombuffer(
+            self._native_texture.download(
+                mip_level,
+                offset_x,
+                offset_y,
+                offset_z,
+                download_width,
+                download_height,
+                download_depth,
+            ),
+            dtype=self._format.dtype,
+        ).reshape(downloaded_shape)
+        target = self._mip_arrays.setdefault(
+            mip_level, np.zeros(self._array_shape(mip_level), dtype=self._format.dtype)
+        )
+        slices = tuple(slice(start, start + size) for start, size in zip(origin, shape, strict=True))
+        if self._dimension == "cube":
+            slices = (slice(None), *slices)
+        if self._format.channels != 1:
+            slices = (*slices, slice(None))
+        np.copyto(target[slices], downloaded)
+        if origin == (0,) * len(shape) and shape == self._mip_shape(mip_level):
+            self._device_dirty_mips.discard(mip_level)
 
     @classmethod
     def __class_getitem__(cls, arguments: Any) -> TypeExpr:
@@ -1026,85 +1187,325 @@ class Texture:
         return TypeExpr("Texture", arguments)
 
     @classmethod
-    def zeros(cls, *, shape: tuple[int, int], format: _TextureFormat | None = None) -> Texture:
+    def zeros(
+        cls,
+        *,
+        shape: tuple[int, ...],
+        format: TextureFormat = rgba8_unorm,
+        dimension: str = "2d",
+        mip_levels: int = 1,
+        usage: tuple[str, ...] | None = None,
+    ) -> Texture:
+        if dimension not in {"2d", "3d"}:
+            raise ValueError("Texture.zeros dimension must be '2d' or '3d'")
+        expected_rank = 3 if dimension == "3d" else 2
         if (
             not isinstance(shape, tuple)
-            or len(shape) != 2
+            or len(shape) != expected_rank
             or any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in shape)
         ):
-            raise ValueError("Texture shape must contain two positive dimensions")
-        if format is not None and format is not depth32:
+            raise ValueError(f"{dimension} Texture shape must contain {expected_rank} positive dimensions")
+        if format not in _TEXTURE_FORMAT_SET:
             raise ValueError("unsupported Texture format")
-        if format is depth32:
-            return cls(np.zeros(shape, dtype=np.float32), format=format)
-        return cls(np.zeros((*shape, 4), dtype=np.uint8))
+        array_shape = (*shape, format.channels) if format.channels != 1 else shape
+        return cls(
+            np.zeros(array_shape, dtype=format.dtype),
+            format=format,
+            dimension=dimension,
+            mip_levels=mip_levels,
+            usage=usage,
+        )
 
     @classmethod
-    def from_numpy(cls, array: np.ndarray) -> Texture:
-        return cls(array)
+    def from_numpy(
+        cls,
+        array: np.ndarray,
+        *,
+        format: TextureFormat = rgba8_unorm,
+        dimension: str = "2d",
+        mip_levels: int = 1,
+        usage: tuple[str, ...] | None = None,
+    ) -> Texture:
+        return cls(array, format=format, dimension=dimension, mip_levels=mip_levels, usage=usage)
 
     @classmethod
-    def cube(cls, faces: np.ndarray) -> Texture:
-        return cls(faces, dimension="cube")
+    def cube(
+        cls,
+        faces: np.ndarray,
+        *,
+        format: TextureFormat = rgba8_unorm,
+        mip_levels: int = 1,
+        usage: tuple[str, ...] | None = None,
+    ) -> Texture:
+        return cls(faces, format=format, dimension="cube", mip_levels=mip_levels, usage=usage)
 
     @property
-    def shape(self) -> tuple[int, int]:
-        if self._dimension == "cube":
-            return self._array.shape[1:3]
-        return self._array.shape[:2]
+    def shape(self) -> tuple[int, ...]:
+        return self._logical_shape(self._array.shape, self._dimension, self._format.channels)
+
+    @property
+    def format(self) -> TextureFormat:
+        return self._format
+
+    @property
+    def dimension(self) -> str:
+        return self._dimension
+
+    @property
+    def mip_levels(self) -> int:
+        return self._mip_levels
+
+    @property
+    def usage(self) -> frozenset[str]:
+        return self._usage
 
     def copy_from_numpy(self, array: np.ndarray) -> None:
-        if self._format._depth:
-            raise RuntimeError("depth Texture storage is produced by rendering and cannot be uploaded from the host")
+        self.upload(array)
+
+    def upload(
+        self,
+        array: np.ndarray,
+        *,
+        mip_level: int = 0,
+        origin: tuple[int, ...] | None = None,
+    ) -> None:
+        self._ensure_host_mutation_allowed()
+        if "transfer_destination" not in self._usage:
+            raise RuntimeError("Texture was not created with transfer_destination usage")
+        mip_shape = self._mip_shape(mip_level)
+        if origin is None:
+            origin = (0,) * len(mip_shape)
+        if (
+            not isinstance(origin, tuple)
+            or len(origin) != len(mip_shape)
+            or any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in origin)
+        ):
+            raise ValueError(f"Texture upload origin must contain {len(mip_shape)} non-negative integers")
+        channel_rank = 0 if self._format.channels == 1 else 1
+        layer_rank = 1 if self._dimension == "cube" else 0
         if (
             not isinstance(array, np.ndarray)
-            or array.dtype != np.uint8
-            or array.shape != self._array.shape
+            or array.dtype != self._format.dtype
+            or array.ndim != len(mip_shape) + channel_rank + layer_rank
+            or (layer_rank and array.shape[0] != 6)
+            or (channel_rank and array.shape[-1] != self._format.channels)
             or not array.flags.c_contiguous
         ):
-            raise ValueError("texture upload requires matching uint8 shape and contiguity")
-        np.copyto(self._array, array)
-        self._host_dirty = True
-        self._device_dirty = False
+            raise ValueError(
+                f"Texture upload requires contiguous {self._format.dtype.name} data with "
+                f"{self._format.channels} channel(s)"
+            )
+        region_shape = array.shape[layer_rank : -1 if channel_rank else None]
+        if any(
+            start >= extent or size > extent - start
+            for start, size, extent in zip(origin, region_shape, mip_shape, strict=True)
+        ):
+            raise ValueError("Texture upload region exceeds the selected mip level")
+        full_region = origin == (0,) * len(mip_shape) and region_shape == mip_shape
+        if mip_level in self._device_dirty_mips and not full_region:
+            self._download_device_region(mip_level, (0,) * len(mip_shape), mip_shape)
+        destination = self._mip_arrays.get(mip_level)
+        if destination is None:
+            destination = np.zeros(self._array_shape(mip_level), dtype=self._format.dtype)
+            self._mip_arrays[mip_level] = destination
+        slices = tuple(slice(start, start + size) for start, size in zip(origin, region_shape, strict=True))
+        if layer_rank:
+            slices = (slice(None), *slices)
+        if channel_rank:
+            slices = (*slices, slice(None))
+        np.copyto(destination[slices], array)
+        state = _session_state()
+        resident = self._native_texture is not None and self._native_generation == state._runtime_generation
+        if resident:
+            assert self._native_texture is not None
+            if self._dimension == "3d":
+                offset_z, offset_y, offset_x = origin
+                upload_depth, upload_height, upload_width = region_shape
+            else:
+                offset_y, offset_x = origin
+                offset_z = 0
+                upload_height, upload_width = region_shape
+                upload_depth = 1
+            self._native_texture.upload(
+                array.tobytes(order="C"),
+                mip_level,
+                offset_x,
+                offset_y,
+                offset_z,
+                upload_width,
+                upload_height,
+                upload_depth,
+            )
+            self._host_dirty_mips.discard(mip_level)
+        else:
+            self._host_dirty_mips.add(mip_level)
+        self._device_dirty_mips.discard(mip_level)
+
+    def download(
+        self,
+        *,
+        mip_level: int = 0,
+        origin: tuple[int, ...] | None = None,
+        shape: tuple[int, ...] | None = None,
+    ) -> np.ndarray:
+        self._ensure_host_read_allowed()
+        if "transfer_source" not in self._usage:
+            raise RuntimeError("Texture was not created with transfer_source usage")
+        mip_shape = self._mip_shape(mip_level)
+        if origin is None:
+            origin = (0,) * len(mip_shape)
+        if (
+            not isinstance(origin, tuple)
+            or len(origin) != len(mip_shape)
+            or any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in origin)
+        ):
+            raise ValueError(f"Texture download origin must contain {len(mip_shape)} non-negative integers")
+        if shape is None:
+            shape = tuple(extent - start for start, extent in zip(origin, mip_shape, strict=True))
+        if (
+            not isinstance(shape, tuple)
+            or len(shape) != len(mip_shape)
+            or any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in shape)
+            or any(
+                start >= extent or size > extent - start
+                for start, size, extent in zip(origin, shape, mip_shape, strict=True)
+            )
+        ):
+            raise ValueError("Texture download region exceeds the selected mip level")
+        if mip_level in self._device_dirty_mips:
+            self._download_device_region(mip_level, origin, shape)
+        array = self._mip_arrays.get(mip_level)
+        if array is None:
+            raise RuntimeError("Texture mip level has not been initialized")
+        slices = tuple(slice(start, start + size) for start, size in zip(origin, shape, strict=True))
+        if self._dimension == "cube":
+            slices = (slice(None), *slices)
+        if self._format.channels != 1:
+            slices = (*slices, slice(None))
+        return array[slices].copy(order="C")
 
     def to_numpy(self) -> np.ndarray:
-        if self._device_dirty:
-            if self._native_texture is None:
-                raise RuntimeError("device-dirty Texture has no allocation")
-            downloaded = np.frombuffer(self._native_texture.download(), dtype=self._array.dtype).reshape(
-                self._array.shape
-            )
-            np.copyto(self._array, downloaded)
-            self._device_dirty = False
-            self._host_dirty = False
-        return self._array.copy(order="C")
+        return self.download()
+
+    def generate_mipmaps(self) -> None:
+        self._ensure_host_mutation_allowed()
+        if self._mip_levels < 2:
+            raise RuntimeError("Texture has no mip chain to generate")
+        if not {"transfer_source", "transfer_destination"}.issubset(self._usage):
+            raise RuntimeError("mipmap generation requires transfer_source and transfer_destination usage")
+        texture = self._resident_texture()
+        texture.generate_mipmaps()
+        self._mip_arrays = {0: self._array}
+        self._host_dirty_mips.clear()
+        self._device_dirty_mips.update(range(1, self._mip_levels))
 
     def _resident_texture(self) -> Any:
         state = _session_state()
         if state._native_runtime is None:
             raise RuntimeError("Texture requires an initialized native runtime")
         if self._native_texture is None or self._native_generation != state._runtime_generation:
-            height, width = self.shape
+            if self._dimension == "3d":
+                depth, height, width = self.shape
+            else:
+                height, width = self.shape
+                depth = 1
             if state._rhi_host is None:
                 raise RuntimeError("Texture requires a GPU RHI host")
             native_format = getattr(state._native.TextureFormat, self._format._native_name)
-            native_dimension = (
-                state._native.TextureDimension.CUBE
-                if self._dimension == "cube"
-                else state._native.TextureDimension.TEXTURE_2D
+            native_dimension = {
+                "2d": state._native.TextureDimension.TEXTURE_2D,
+                "3d": state._native.TextureDimension.TEXTURE_3D,
+                "cube": state._native.TextureDimension.CUBE,
+            }[self._dimension]
+            self._native_texture = state._rhi_host.create_image(
+                width,
+                height,
+                native_format,
+                native_dimension,
+                depth,
+                self._mip_levels,
+                self._native_usage(),
             )
-            self._native_texture = state._rhi_host.create_image(width, height, native_format, native_dimension)
             self._native_generation = state._runtime_generation
-            self._host_dirty = not self._format._depth
-            self._device_dirty = False
-        if self._host_dirty:
-            self._native_texture.upload(self._array.tobytes(order="C"))
-            self._host_dirty = False
+            self._host_dirty_mips = set(self._mip_arrays)
+            self._device_dirty_mips.clear()
+        assert self._native_texture is not None
+        for mip_level in sorted(self._host_dirty_mips):
+            array = self._mip_arrays[mip_level]
+            self._native_texture.upload(array.tobytes(order="C"), mip_level)
+        self._host_dirty_mips.clear()
         return self._native_texture
 
+    def _native_usage(self) -> int:
+        state = _session_state()
+        names = {
+            "sampled": "IMAGE_SAMPLED",
+            "storage": "IMAGE_STORAGE",
+            "transfer_source": "IMAGE_TRANSFER_SOURCE",
+            "transfer_destination": "IMAGE_TRANSFER_DESTINATION",
+            "color_attachment": "IMAGE_COLOR_ATTACHMENT",
+        }
+        return sum(int(getattr(state._native, names[item])) for item in self._usage)
+
     def _mark_device_dirty(self) -> None:
-        self._device_dirty = True
-        self._host_dirty = False
+        self._device_dirty_mips.add(0)
+        self._host_dirty_mips.discard(0)
+
+
+class _DepthTexture(_TextureResource):
+    """Sampled view of a RenderTarget-owned depth attachment."""
+
+    def __init__(self, owner: RenderTarget):
+        super().__init__()
+        self._owner = owner
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self._owner.shape
+
+    @property
+    def dimension(self) -> str:
+        return "2d"
+
+    @property
+    def mip_levels(self) -> int:
+        return 1
+
+    @property
+    def usage(self) -> frozenset[str]:
+        return frozenset({"sampled"})
+
+    def upload(self, array: np.ndarray, *, mip_level: int = 0, origin: tuple[int, ...] | None = None) -> None:
+        del array, mip_level, origin
+        raise RuntimeError("depth attachments cannot be uploaded from the host")
+
+    def copy_from_numpy(self, array: np.ndarray) -> None:
+        self.upload(array)
+
+    def download(
+        self,
+        *,
+        mip_level: int = 0,
+        origin: tuple[int, ...] | None = None,
+        shape: tuple[int, ...] | None = None,
+    ) -> np.ndarray:
+        del mip_level, origin, shape
+        raise RuntimeError("depth attachment readback is not exposed as Texture data")
+
+    def to_numpy(self) -> np.ndarray:
+        return self.download()
+
+    def _resident_texture(self) -> Any:
+        image = self._owner._resident_depth_attachment()
+        if image is None:
+            raise RuntimeError("RenderTarget has no depth attachment")
+        return image
+
+    def _mark_device_dirty(self) -> None:
+        pass
+
+    def _graph_identity(self) -> object:
+        return self._owner
 
 
 class SamplerState:
@@ -1140,7 +1541,7 @@ def sampler(*, address: str = "repeat") -> SamplerState:
 class RenderTarget:
     """Backend-neutral collection of color and render-only depth attachments."""
 
-    def __init__(self, *, shape: tuple[int, int]):
+    def __init__(self, *, shape: tuple[int, ...]):
         if (
             not isinstance(shape, tuple)
             or len(shape) != 2
@@ -1149,8 +1550,8 @@ class RenderTarget:
             raise ValueError("RenderTarget shape must contain two positive dimensions")
         self._shape = shape
         self._colors: dict[int, Texture] = {}
-        self._depth_format: _TextureFormat | None = None
-        self._depth_texture: Texture | None = None
+        self._has_depth = False
+        self._depth_texture: _DepthTexture | None = None
         self._native_depth: Any | None = None
         self._native_depth_generation = -1
         _session_state()._runtime_children.add(self)
@@ -1166,55 +1567,47 @@ class RenderTarget:
             raise ValueError(f"color attachment location {location} is already occupied")
         if not isinstance(texture, Texture):
             raise TypeError("color attachment must be a Texture")
-        if texture._format._depth or texture._dimension != "2d":
+        if texture._dimension != "2d":
             raise ValueError("color attachment must be a two-dimensional color Texture")
+        if "color_attachment" not in texture._usage:
+            raise ValueError("color attachment Texture requires color_attachment usage")
         if texture.shape != self.shape:
             raise ValueError("color attachment dimensions must match RenderTarget shape")
         self._colors[location] = texture
         return self
 
-    def attach_depth(
-        self,
-        *,
-        format: _TextureFormat | None = None,
-        texture: Texture | None = None,
-    ) -> RenderTarget:
-        if self._depth_format is not None:
+    def attach_depth(self) -> RenderTarget:
+        if self._has_depth:
             raise ValueError("RenderTarget already has a depth attachment")
-        if (format is None) == (texture is None):
-            raise ValueError("depth attachment requires exactly one of format or texture")
-        if texture is not None:
-            if texture._format is not depth32 or texture._dimension != "2d":
-                raise ValueError("depth attachment texture must be a two-dimensional depth32 Texture")
-            if texture.shape != self.shape:
-                raise ValueError("depth attachment dimensions must match RenderTarget shape")
-            self._depth_texture = texture
-            self._depth_format = depth32
-            return self
-        if format is not depth32:
-            raise ValueError("depth attachment requires a depth format")
-        self._depth_format = format
+        self._has_depth = True
+        self._depth_texture = _DepthTexture(self)
         return self
+
+    @property
+    def depth_texture(self) -> _TextureResource:
+        if self._depth_texture is None:
+            raise RuntimeError("RenderTarget has no depth attachment")
+        return self._depth_texture
 
     def _color_attachments(self) -> tuple[tuple[int, Texture], ...]:
         return tuple(sorted(self._colors.items()))
 
     def _resident_depth_attachment(self) -> Any | None:
-        if self._depth_format is None:
+        if not self._has_depth:
             return None
-        if self._depth_texture is not None:
-            return self._depth_texture._resident_texture()
         state = _session_state()
         if state._native_runtime is None or state._rhi_host is None or state._native is None:
             raise RuntimeError("RenderTarget depth attachment requires an initialized GPU RHI runtime")
         if self._native_depth is None or self._native_depth_generation != state._runtime_generation:
             height, width = self.shape
-            native_format = getattr(state._native.TextureFormat, self._depth_format._native_name)
-            self._native_depth = state._rhi_host.create_attachment_image(
+            self._native_depth = state._rhi_host.create_image(
                 width,
                 height,
-                native_format,
-                state._native.IMAGE_DEPTH_STENCIL_ATTACHMENT,
+                state._native.TextureFormat.D32_FLOAT,
+                state._native.TextureDimension.TEXTURE_2D,
+                1,
+                1,
+                int(state._native.IMAGE_DEPTH_STENCIL_ATTACHMENT) + int(state._native.IMAGE_SAMPLED),
             )
             self._native_depth_generation = state._runtime_generation
         return self._native_depth
@@ -1228,6 +1621,16 @@ __all__ = [
     "TensorStorage",
     "TensorView",
     "Texture",
-    "depth32",
+    "TextureFormat",
+    "r11g11b10_float",
+    "r16_float",
+    "r32_float",
+    "r8_unorm",
+    "rg8_unorm",
+    "rgb8_unorm",
+    "rgba16_float",
+    "rgba32_float",
+    "rgba8_srgb",
+    "rgba8_unorm",
     "sampler",
 ]

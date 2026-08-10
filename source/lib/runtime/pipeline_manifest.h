@@ -134,6 +134,7 @@ struct Parameter {
     std::string access;
     std::string addressSpace;
     std::string dimension;
+    std::string format;
     AutodiffResourceRole autodiffRole{AutodiffResourceRole::None};
     std::vector<uint64_t> shape;
     std::vector<ParameterUse> uses;
@@ -203,6 +204,7 @@ struct AutodiffManifest {
 };
 
 std::optional<VernonTextureDimension> pipelineTextureDimension(const std::string &dimension);
+std::optional<VernonTextureFormat> pipelineTextureFormat(const std::string &format);
 
 bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &error);
 bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifest, std::string &error);

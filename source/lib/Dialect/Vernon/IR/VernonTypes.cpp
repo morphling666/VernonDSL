@@ -51,6 +51,30 @@ bool isStructurallyAbiStableValue(Type type) {
 }
 } // namespace
 
+LogicalResult TextureType::verify(function_ref<InFlightDiagnostic()> emitError, StringRef dimension, Type elementType,
+                                  StringRef format, StringRef access) {
+    if (dimension != "2d" && dimension != "3d" && dimension != "cube")
+        return emitError() << "Texture dimension must be 2d, 3d, or cube";
+    if (!elementType.isF32() && !elementType.isInteger(32))
+        return emitError() << "Texture shader element type must be f32, i32, or u32";
+    if (access == "sampled") {
+        if (format != "unknown")
+            return emitError() << "sampled Texture format must be unknown";
+        return success();
+    }
+    if (access != "read" && access != "write" && access != "read_write")
+        return emitError() << "Texture access must be sampled, read, write, or read_write";
+    if (dimension == "cube")
+        return emitError() << "storage Texture dimension must be 2d or 3d";
+    if (!elementType.isF32())
+        return emitError() << "current storage Texture formats require f32 shader elements";
+    if (!llvm::is_contained(ArrayRef<StringRef>{"r8_unorm", "r16_float", "r32_float", "rg8_unorm", "rgba8_unorm",
+                                                "rgba16_float", "rgba32_float"},
+                            format))
+        return emitError() << "unsupported storage Texture format " << format;
+    return success();
+}
+
 LogicalResult TensorViewType::verify(function_ref<InFlightDiagnostic()> emitError, Type elementType,
                                      ArrayRef<int64_t> shape, StringRef access, StringRef addressSpace) {
     if (!isStructurallyAbiStableValue(elementType) || shape.empty())

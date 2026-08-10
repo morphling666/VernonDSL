@@ -35,7 +35,8 @@ struct BackendDispatch {
     VernonRhiStatus (*createImage)(VernonRhiDevice, const VernonRhiImageDescriptor *, VernonRhiImage *);
     VernonRhiStatus (*setImageSampler)(VernonRhiDevice, VernonRhiImage, const VernonRhiSamplerDescriptor *);
     VernonRhiStatus (*uploadImage)(VernonRhiDevice, VernonRhiImage, const VernonRhiImageUploadDescriptor *, size_t);
-    VernonRhiStatus (*downloadImage)(VernonRhiDevice, VernonRhiImage, void *, size_t);
+    VernonRhiStatus (*downloadImage)(VernonRhiDevice, VernonRhiImage, const VernonRhiImageDownloadDescriptor *, void *,
+                                     size_t);
     VernonRhiStatus (*generateImageMipmaps)(VernonRhiDevice, VernonRhiImage);
     VernonRhiStatus (*bindImage)(VernonRhiDevice, VernonRhiImage, uint32_t);
     VernonRhiStatus (*destroyImage)(VernonRhiDevice, VernonRhiImage);
@@ -51,6 +52,7 @@ struct BackendDispatch {
     uint64_t (*samplerResource)(VernonRhiDevice, VernonRhiSampler);
     bool (*retainResource)(VernonRhiDevice, ResourceKind, uint64_t);
     uint64_t (*resolveResource)(VernonRhiDevice, ResourceKind, uint64_t);
+    bool (*describeImageResource)(VernonRhiDevice, uint64_t, VernonRhiImageDescriptor *);
     void (*releaseResource)(VernonRhiDevice, ResourceKind, uint64_t);
 
     bool (*beginCommands)(VernonRhiDevice, uint64_t &, VernonRhiBackend &);

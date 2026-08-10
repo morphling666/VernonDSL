@@ -65,9 +65,12 @@ def Vernon_TextureType : TypeDef<Vernon_Dialect, "Texture"> {
   let summary = "Sampled or storage texture resource";
   let parameters = (ins
     StringRefParameter<"texture dimension">:$dimension,
-    TypeParameter<"::mlir::Type", "sample element type">:$elementType
+    TypeParameter<"::mlir::Type", "texel element type">:$elementType,
+    StringRefParameter<"storage image format or unknown">:$format,
+    StringRefParameter<"sampled, read, write, or read_write access">:$access
   );
-  let assemblyFormat = "`<` $dimension `,` $elementType `>`";
+  let genVerifyDecl = 1;
+  let assemblyFormat = "`<` $dimension `,` $elementType `,` $format `,` $access `>`";
 }
 
 def Vernon_SamplerType : TypeDef<Vernon_Dialect, "Sampler"> {

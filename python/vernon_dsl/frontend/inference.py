@@ -124,12 +124,19 @@ def _annotation(value_type: ConcreteType) -> ast.expr:
             ctx=ast.Load(),
         )
     if value_type.kind == "texture":
-        dimension, element = value_type.arguments
+        dimension, element, format_name, access = value_type.arguments
         assert isinstance(element, ConcreteType)
+        elements = [ast.Constant(value=dimension), _annotation(element)]
+        if access != "sampled":
+            elements = [
+                ast.Constant(value=dimension),
+                ast.Name(id=str(format_name), ctx=ast.Load()),
+                ast.Name(id=str(access), ctx=ast.Load()),
+            ]
         return ast.Subscript(
             value=ast.Name(id="Texture", ctx=ast.Load()),
             slice=ast.Tuple(
-                elts=[ast.Constant(value=dimension), _annotation(element)],
+                elts=elements,
                 ctx=ast.Load(),
             ),
             ctx=ast.Load(),
@@ -1416,11 +1423,48 @@ class _Inference:
             if result_shape:
                 return ConcreteType("tensor", "Tensor", (element, *result_shape))
             return element
+        if name in {"texture_load", "texture_store"}:
+            expected_arguments = 2 if name == "texture_load" else 3
+            if len(arguments) != expected_arguments or not isinstance(arguments[0], ConcreteType):
+                raise self.error(node, f"{name} requires a storage texture and coordinates")
+            texture = arguments[0]
+            if texture.kind != "texture" or texture.arguments[3] == "sampled":
+                raise self.error(node.args[0], f"{name} requires a storage Texture")
+            dimension, element, _, access = texture.arguments
+            rank = 3 if dimension == "3d" else 2
+            coordinates = arguments[1]
+            coordinate_element = (
+                coordinates.arguments[0]
+                if isinstance(coordinates, ConcreteType) and coordinates.kind == "tensor"
+                else None
+            )
+            if (
+                not isinstance(coordinates, ConcreteType)
+                or coordinates.kind != "tensor"
+                or coordinates.arguments[1:] != (rank,)
+                or not isinstance(coordinate_element, ConcreteType)
+                or not coordinate_element.is_integer
+            ):
+                raise self.error(
+                    node.args[1],
+                    f"{name} coordinates for a {dimension} storage texture must be a {rank}-component integer vector",
+                )
+            assert isinstance(element, ConcreteType)
+            texel = ConcreteType("tensor", "Tensor", (element, 4))
+            if name == "texture_load":
+                if access == "write":
+                    raise self.error(node.args[0], "texture_load requires read or read_write access")
+                return texel
+            if access == "read":
+                raise self.error(node.args[0], "texture_store requires write or read_write access")
+            if not can_convert(arguments[2], texel):
+                raise self.error(node.args[2], f"texture_store value must be {texel.mlir}")
+            return ConcreteType("void", "void")
         if name == "texture_sample":
             if len(arguments) not in {2, 3, 4} or not isinstance(arguments[0], ConcreteType):
                 raise self.error(node, "texture_sample requires a texture and coordinates")
             texture = arguments[0]
-            if texture.kind != "texture":
+            if texture.kind != "texture" or texture.arguments[3] != "sampled":
                 raise self.error(node, "texture_sample requires a texture and coordinates")
             coordinate_index = (
                 2

@@ -49,7 +49,7 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
         "\"packed_arguments_size\":20}},"
         "\"workgroup_size\":[2,2,1],"
         "\"dispatch_contract\":{\"unit_grid_axes\":[],\"requires_unit_workgroup\":false},\"arguments\":["
-        "{\"kind\":\"tensor\",\"dtype\":\"f32\",\"shape\":[16],"
+        "{\"kind\":\"tensor\",\"dtype\":\"f32\",\"access\":\"read_write\",\"shape\":[16],"
         "\"element_layout\":{\"logical_type\":\"f32\",\"byte_size\":4,"
         "\"alignment\":4,\"layout_hash\":"
         "\"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b\","

@@ -53,14 +53,25 @@ def smoke_reference(
                 np.float32(1.0),
             )
             source = controls[nozzle] * horizontal * vertical
+            curl = (
+                np.sin(np.float32(y) * np.float32(0.23) + np.float32(nozzle) * np.float32(1.7))
+                * (density[y, x] + source)
+                * delta_time
+                * np.float32(0.12)
+            )
             forced_density[y, x] = np.clip(
                 density[y, x] * np.float32(0.995) + source * delta_time * np.float32(3.0),
                 np.float32(0.0),
                 np.float32(2.0),
             )
-            forced_velocity[y, x, 0] = velocity[y, x, 0] + (
-                np.float32(nozzle) - (np.float32(nozzle_count) - np.float32(1.0)) * np.float32(0.5)
-            ) * source * delta_time * np.float32(0.08)
+            forced_velocity[y, x, 0] = (
+                velocity[y, x, 0]
+                + (np.float32(nozzle) - (np.float32(nozzle_count) - np.float32(1.0)) * np.float32(0.5))
+                * source
+                * delta_time
+                * np.float32(0.08)
+                + curl
+            )
             forced_velocity[y, x, 1] = (
                 velocity[y, x, 1] - (density[y, x] * np.float32(0.9) + source * np.float32(1.6)) * delta_time
             )

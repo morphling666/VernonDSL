@@ -93,19 +93,40 @@ class TypeParser:
                 raise self.context.error(items[2], "TensorView access must be read, write, or read_write")
             return ConcreteType("tensor_view", "TensorView", (element, shape, access, "device"))
         if constructor == "Texture":
-            if len(items) != 2:
-                raise self.context.error(node, "Texture requires a dimension and element type")
+            if len(items) not in {2, 3}:
+                raise self.context.error(
+                    node,
+                    "Texture requires dimension and sample type, or dimension, storage format, and access",
+                )
             dimension = self._string_or_name(items[0], "texture dimension")
             if dimension not in {"2d", "3d", "cube"}:
                 raise self.context.error(
                     items[0],
                     "texture dimension must be one of '2d', '3d', or 'cube'",
                 )
-            return ConcreteType(
-                "texture",
-                "Texture",
-                (dimension, self.parse_type(items[1])),
-            )
+            if len(items) == 2:
+                element = self.parse_type(items[1])
+                if element.kind != "scalar" or element.name not in {"f32", "i32", "u32"}:
+                    raise self.context.error(items[1], "sampled Texture type must be f32, i32, or u32")
+                return ConcreteType("texture", "Texture", (dimension, element, "unknown", "sampled"))
+            if dimension == "cube":
+                raise self.context.error(items[0], "storage Texture dimension must be '2d' or '3d'")
+            format_name = self._string_or_name(items[1], "storage texture format")
+            if format_name not in {
+                "r8_unorm",
+                "r16_float",
+                "r32_float",
+                "rg8_unorm",
+                "rgba8_unorm",
+                "rgba16_float",
+                "rgba32_float",
+            }:
+                raise self.context.error(items[1], "unsupported storage texture format")
+            access = self._string_or_name(items[2], "storage Texture access")
+            if access not in {"read", "write", "read_write"}:
+                raise self.context.error(items[2], "storage Texture access must be read, write, or read_write")
+            element = ConcreteType("scalar", "f32")
+            return ConcreteType("texture", "Texture", (dimension, element, format_name, access))
         raise self.context.error(node, f"unknown DSL type constructor '{constructor}'")
 
     def _require_storage_element(self, node: ast.AST, element: ConcreteType, constructor: str) -> None:

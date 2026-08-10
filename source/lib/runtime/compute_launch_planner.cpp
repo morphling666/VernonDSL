@@ -75,6 +75,25 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
                 return fail(error, "compute argument index is duplicated");
 
             ComputeLaunchArgument &argument = plan.arguments[use.index];
+            if (supplied.kind == VERNON_PIPELINE_TEXTURE) {
+                if (parameter.kind != "texture" || !supplied.texture.resource.identity ||
+                    !supplied.texture.resource.resource.value)
+                    return fail(error, "compute texture argument is invalid");
+                const auto dimension = pipelineTextureDimension(parameter.dimension);
+                if (!dimension || supplied.texture.dimension != *dimension)
+                    return fail(error, "compute texture dimension does not match");
+                if (!parameter.format.empty()) {
+                    const auto format = pipelineTextureFormat(parameter.format);
+                    if (!format || supplied.texture.format != *format)
+                        return fail(error, "compute storage texture format does not match");
+                }
+                argument.kind = ComputeLaunchArgumentKind::Texture;
+                argument.resource = supplied.texture.resource;
+                argument.textureFormat = supplied.texture.format;
+                argument.textureDimension = supplied.texture.dimension;
+                assigned[use.index] = 1;
+                continue;
+            }
             if (supplied.kind != VERNON_PIPELINE_TENSOR)
                 return fail(error, "compute argument kind is unsupported");
             if (supplied.tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
@@ -213,6 +232,11 @@ bool planComputeInvocation(const Variant &variant, VernonLaunchSize workgroup,
         const auto found = arguments.find(parameter.slot);
         if (found == arguments.end())
             return fail(error, "pipeline argument kind does not match layout");
+        if (parameter.kind == "texture") {
+            if (found->second->kind != VERNON_PIPELINE_TEXTURE)
+                return fail(error, "pipeline argument kind does not match layout");
+            continue;
+        }
         if (parameter.kind != "tensor" || found->second->kind != VERNON_PIPELINE_TENSOR)
             return fail(error, "pipeline argument kind does not match layout");
         const VernonTensorView &tensor = found->second->tensor;

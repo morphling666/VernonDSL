@@ -208,7 +208,7 @@ def main() -> None:
     materials = vd.storage.from_numpy(np.ascontiguousarray(mesh.materials[draw_order]))
     light_value = np.array((3.0, 5.0, 4.0), dtype=np.float32)
     color = vd.Texture.zeros(shape=(args.size, args.size))
-    target = vd.RenderTarget(shape=(args.size, args.size)).attach_color(0, color).attach_depth(format=vd.depth32)
+    target = vd.RenderTarget(shape=(args.size, args.size)).attach_color(0, color).attach_depth()
     shadow_enabled = not args.no_shadow
     environment_enabled = not args.no_cubemap
     features = {
@@ -220,11 +220,9 @@ def main() -> None:
         if enabled
     }
     if shadow_enabled:
-        shadow_map = vd.Texture.zeros(shape=(args.size, args.size), format=vd.depth32)
         shadow_color = vd.Texture.zeros(shape=(args.size, args.size))
-        shadow_target = (
-            vd.RenderTarget(shape=shadow_map.shape).attach_color(0, shadow_color).attach_depth(texture=shadow_map)
-        )
+        shadow_target = vd.RenderTarget(shape=shadow_color.shape).attach_color(0, shadow_color).attach_depth()
+        shadow_map = shadow_target.depth_texture
         shadow_sampler = vd.sampler(address="clamp_to_edge")
     if environment_enabled:
         environment_map = create_environment_cube()

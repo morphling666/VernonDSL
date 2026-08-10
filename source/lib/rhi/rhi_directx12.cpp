@@ -98,10 +98,6 @@ template <typename Slot> bool publicAlive(const Slot &slot) {
     return true;
 }
 
-std::optional<size_t> downloadSize(const VernonRhiImageDescriptor &descriptor) {
-    return vernon::rhi::simpleImageDownloadSize(descriptor);
-}
-
 std::shared_ptr<DirectX12InteropDevice> lookupDirectX12Device(VernonRhiDevice handle) {
     if ((handle.index & directX12DeviceBit) == 0)
         return {};
@@ -609,8 +605,9 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
     if (!slot || !slot->image.owned)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     const VernonRhiImageDescriptor &descriptor = slot->ownedDescriptor;
-    if ((descriptor.dimension != VERNON_RHI_IMAGE_2D && descriptor.dimension != VERNON_RHI_IMAGE_CUBE) ||
-        descriptor.format != VERNON_RHI_FORMAT_RGBA8_UNORM || descriptor.depth != 1 || descriptor.mip_levels != 1)
+    if ((descriptor.dimension != VERNON_RHI_IMAGE_2D && descriptor.dimension != VERNON_RHI_IMAGE_3D &&
+         descriptor.dimension != VERNON_RHI_IMAGE_CUBE) ||
+        (descriptor.dimension != VERNON_RHI_IMAGE_3D && descriptor.depth != 1))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     auto &state = device->state;
     const D3D12_RESOURCE_DESC native = slot->image.resource->GetDesc();
@@ -622,30 +619,44 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
     };
     std::vector<UploadFootprint> footprints(uploadCount);
     UINT64 required = 0;
-    const size_t expectedLayerSize = static_cast<size_t>(descriptor.width) * descriptor.height * 4;
     for (size_t index = 0; index < uploadCount; ++index) {
         const VernonRhiImageUploadDescriptor &upload = uploads[index];
         const bool validLayer = descriptor.dimension == VERNON_RHI_IMAGE_CUBE
                                     ? upload.array_layer < descriptor.array_layers
                                     : upload.array_layer == 0;
-        if (upload.struct_size < sizeof(upload) || upload.mip_level != 0 || !validLayer ||
-            upload.width != descriptor.width || upload.height != descriptor.height || upload.depth != 1 ||
-            upload.source_format != VERNON_RHI_IMAGE_DATA_RGBA || upload.source_type != VERNON_RHI_IMAGE_DATA_UINT8 ||
+        const bool validMip = upload.mip_level < descriptor.mip_levels;
+        const uint32_t mipWidth = validMip ? vernon::rhi::imageMipExtent(descriptor.width, upload.mip_level) : 0;
+        const uint32_t mipHeight = validMip ? vernon::rhi::imageMipExtent(descriptor.height, upload.mip_level) : 0;
+        const uint32_t mipDepth = !validMip ? 0
+                                  : descriptor.dimension == VERNON_RHI_IMAGE_3D
+                                      ? vernon::rhi::imageMipExtent(descriptor.depth, upload.mip_level)
+                                      : descriptor.depth;
+        const size_t pixelSize = vernon::rhi::imageFormatPixelSize(descriptor.format);
+        if (upload.struct_size < sizeof(upload) || !validMip || !validLayer || !upload.width || !upload.height ||
+            !upload.depth || upload.offset_x >= mipWidth || upload.width > mipWidth - upload.offset_x ||
+            upload.offset_y >= mipHeight || upload.height > mipHeight - upload.offset_y ||
+            upload.offset_z >= mipDepth || upload.depth > mipDepth - upload.offset_z || !pixelSize ||
+            !vernon::rhi::uploadLayoutMatches(descriptor.format, upload.source_format, upload.source_type) ||
             !upload.data)
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-        footprints[index].subresource = upload.array_layer;
-        UINT64 nextRequired = 0;
-        state.device->GetCopyableFootprints(&native, footprints[index].subresource, 1, required,
-                                            &footprints[index].placed, &footprints[index].rows,
-                                            &footprints[index].rowBytes, &nextRequired);
-        if (static_cast<size_t>(footprints[index].rowBytes) * footprints[index].rows != expectedLayerSize)
-            return VERNON_RHI_STATUS_UNSUPPORTED;
-        // pTotalBytes is the footprint size for this call, independent of
-        // BaseOffset. Advance past the aligned placed footprint instead of
-        // reusing the same staging range for every array layer.
-        if (nextRequired > (std::numeric_limits<UINT64>::max)() - footprints[index].placed.Offset)
+        auto &footprint = footprints[index];
+        footprint.subresource = upload.mip_level + upload.array_layer * descriptor.mip_levels;
+        footprint.rowBytes = static_cast<UINT64>(upload.width) * pixelSize;
+        footprint.rows = upload.height;
+        footprint.placed.Offset = (required + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) &
+                                  ~(static_cast<UINT64>(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT) - 1);
+        footprint.placed.Footprint.Format = native.Format;
+        footprint.placed.Footprint.Width = upload.width;
+        footprint.placed.Footprint.Height = upload.height;
+        footprint.placed.Footprint.Depth = upload.depth;
+        footprint.placed.Footprint.RowPitch =
+            static_cast<UINT>((footprint.rowBytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+                              ~(static_cast<UINT64>(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) - 1));
+        const UINT64 footprintSize =
+            static_cast<UINT64>(footprint.placed.Footprint.RowPitch) * upload.height * upload.depth;
+        if (footprintSize > (std::numeric_limits<UINT64>::max)() - footprint.placed.Offset)
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-        required = footprints[index].placed.Offset + nextRequired;
+        required = footprint.placed.Offset + footprintSize;
     }
     ID3D12Resource *staging = nullptr;
     size_t stagingOffset = 0;
@@ -656,10 +667,14 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
     for (size_t index = 0; index < uploadCount; ++index) {
         auto &footprint = footprints[index];
         footprint.placed.Offset += stagingOffset;
-        for (UINT row = 0; row < footprint.rows; ++row)
-            std::memcpy(mapped + (footprint.placed.Offset - stagingOffset) + row * footprint.placed.Footprint.RowPitch,
-                        static_cast<const uint8_t *>(uploads[index].data) + row * footprint.rowBytes,
-                        static_cast<size_t>(footprint.rowBytes));
+        for (UINT slice = 0; slice < footprint.placed.Footprint.Depth; ++slice)
+            for (UINT row = 0; row < footprint.rows; ++row)
+                std::memcpy(mapped + (footprint.placed.Offset - stagingOffset) +
+                                (static_cast<size_t>(slice) * footprint.rows + row) *
+                                    footprint.placed.Footprint.RowPitch,
+                            static_cast<const uint8_t *>(uploads[index].data) +
+                                (static_cast<size_t>(slice) * footprint.rows + row) * footprint.rowBytes,
+                            static_cast<size_t>(footprint.rowBytes));
     }
     if (!state.beginCommands(device->error))
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
@@ -674,14 +689,16 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
         source.pResource = staging;
         source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         source.PlacedFootprint = footprints[index].placed;
-        state.commandList()->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        state.commandList()->CopyTextureRegion(&destination, uploads[index].offset_x, uploads[index].offset_y,
+                                               uploads[index].offset_z, &source, nullptr);
     }
     vernon::rhi::directx12::transition(state.commandList(), slot->image.resource, slot->image.state,
                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     return state.submitCommands(device->error) ? VERNON_RHI_STATUS_OK : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
-VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image, void *destination, size_t size) {
+VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image,
+                              const VernonRhiImageDownloadDescriptor *download, void *destination, size_t size) {
     auto device = lookupDirectX12Device(handle);
     if (!device) {
         return VERNON_RHI_STATUS_UNSUPPORTED;
@@ -689,9 +706,9 @@ VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image, void
 
     std::lock_guard<std::mutex> guard(device->mutex);
     DirectX12ImageSlot *slot = lookupDirectX12Slot(device->images, image);
-    if (!slot || !slot->image.owned)
+    if (!slot || !slot->image.owned || !download || download->struct_size < sizeof(*download) || !destination)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    const auto expected = downloadSize(slot->ownedDescriptor);
+    const auto expected = imageDownloadByteSize(slot->ownedDescriptor, *download);
     if (!expected || size != *expected)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     auto &state = device->state;
@@ -702,20 +719,37 @@ VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image, void
     std::array<UINT, 2> rows{};
     std::array<UINT64, 2> rowBytes{};
     UINT64 required = 0;
-    state.device->GetCopyableFootprints(&native, 0, planeCount, 0, footprints.data(), rows.data(), rowBytes.data(),
-                                        &required);
+    const UINT baseSubresource = download->mip_level + download->array_layer * slot->ownedDescriptor.mip_levels;
+    const UINT planeStride = slot->ownedDescriptor.mip_levels * slot->ownedDescriptor.array_layers;
+    for (UINT plane = 0; plane < planeCount; ++plane) {
+        UINT64 planeRequired = 0;
+        state.device->GetCopyableFootprints(&native, baseSubresource + plane * planeStride, 1, required,
+                                            &footprints[plane], &rows[plane], &rowBytes[plane], &planeRequired);
+        required = planeRequired;
+    }
     ID3D12Resource *staging = nullptr;
     size_t stagingOffset = 0;
     uint8_t *mapped = nullptr;
     if (!state.acquireStaging(false, static_cast<size_t>(required), D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, staging,
                               stagingOffset, mapped, device->error))
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    state.device->GetCopyableFootprints(&native, 0, planeCount, stagingOffset, footprints.data(), rows.data(),
-                                        rowBytes.data(), nullptr);
+    required = stagingOffset;
+    for (UINT plane = 0; plane < planeCount; ++plane) {
+        UINT64 planeRequired = 0;
+        state.device->GetCopyableFootprints(&native, baseSubresource + plane * planeStride, 1, required,
+                                            &footprints[plane], &rows[plane], &rowBytes[plane], &planeRequired);
+        required = planeRequired;
+    }
     if (!state.beginCommands(device->error))
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
     vernon::rhi::directx12::transition(state.commandList(), slot->image.resource, slot->image.state,
                                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    const D3D12_BOX sourceBox{download->offset_x,
+                              download->offset_y,
+                              download->offset_z,
+                              download->offset_x + download->width,
+                              download->offset_y + download->height,
+                              download->offset_z + download->depth};
     for (UINT plane = 0; plane < planeCount; ++plane) {
         D3D12_TEXTURE_COPY_LOCATION target{};
         target.pResource = staging;
@@ -724,8 +758,8 @@ VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image, void
         D3D12_TEXTURE_COPY_LOCATION source{};
         source.pResource = slot->image.resource;
         source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        source.SubresourceIndex = plane;
-        state.commandList()->CopyTextureRegion(&target, 0, 0, 0, &source, nullptr);
+        source.SubresourceIndex = baseSubresource + plane * planeStride;
+        state.commandList()->CopyTextureRegion(&target, 0, 0, 0, &source, &sourceBox);
     }
     vernon::rhi::directx12::transition(state.commandList(), slot->image.resource, slot->image.state,
                                        depthStencil ? D3D12_RESOURCE_STATE_DEPTH_WRITE
@@ -733,19 +767,25 @@ VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image, void
     if (!state.submitCommands(device->error))
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
     if (!depthStencil) {
-        for (UINT row = 0; row < rows[0]; ++row)
-            std::memcpy(static_cast<uint8_t *>(destination) + row * rowBytes[0],
-                        mapped + (footprints[0].Offset - stagingOffset) + row * footprints[0].Footprint.RowPitch,
-                        static_cast<size_t>(rowBytes[0]));
+        const size_t outputRowBytes =
+            static_cast<size_t>(download->width) * vernon::rhi::imageFormatPixelSize(slot->ownedDescriptor.format);
+        for (UINT slice = 0; slice < download->depth; ++slice)
+            for (UINT row = 0; row < download->height; ++row)
+                std::memcpy(static_cast<uint8_t *>(destination) +
+                                (static_cast<size_t>(slice) * download->height + row) * outputRowBytes,
+                            mapped + (footprints[0].Offset - stagingOffset) +
+                                (static_cast<size_t>(slice) * footprints[0].Footprint.Height + row) *
+                                    footprints[0].Footprint.RowPitch,
+                            outputRowBytes);
     } else {
         auto *output = static_cast<uint8_t *>(destination);
-        for (UINT row = 0; row < slot->ownedDescriptor.height; ++row) {
+        for (UINT row = 0; row < download->height; ++row) {
             const uint8_t *depthRow =
                 mapped + (footprints[0].Offset - stagingOffset) + row * footprints[0].Footprint.RowPitch;
             const uint8_t *stencilRow =
                 mapped + (footprints[1].Offset - stagingOffset) + row * footprints[1].Footprint.RowPitch;
-            for (UINT column = 0; column < slot->ownedDescriptor.width; ++column) {
-                const size_t pixel = static_cast<size_t>(row) * slot->ownedDescriptor.width + column;
+            for (UINT column = 0; column < download->width; ++column) {
+                const size_t pixel = static_cast<size_t>(row) * download->width + column;
                 float depth{};
                 std::memcpy(&depth, depthRow + column * sizeof(depth), sizeof(depth));
                 vernon::rhi::storePackedDepthStencil(output + pixel * vernon::rhi::packedDepthStencilPixelSize, depth,
@@ -1148,6 +1188,18 @@ uint64_t resolveResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key
     return slot && slot->occupied ? reinterpret_cast<uintptr_t>(&slot->sampler) : 0;
 }
 
+bool describeImageResource(VernonRhiDevice handle, uint64_t key, VernonRhiImageDescriptor *descriptor) {
+    auto device = lookupDirectX12Device(handle);
+    if (!device || !descriptor)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    const DirectX12ImageSlot *slot = lookupResourceRecord(device->images, key);
+    if (!slot || !slot->occupied)
+        return false;
+    *descriptor = slot->descriptor;
+    return true;
+}
+
 void releaseResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
     auto device = lookupDirectX12Device(handle);
     if (!device)
@@ -1221,6 +1273,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::directX12BackendDispatch() {
         samplerResource,
         retainResource,
         resolveResource,
+        describeImageResource,
         releaseResource,
         beginCommands,
         submitCommands,

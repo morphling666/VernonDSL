@@ -84,8 +84,31 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
                 return false;
             }
         }
-        parameter.access =
-            argument.value("access", argument.value("kind", std::string()) == "tensor" ? "read_write" : "read");
+        if (argument.contains("access")) {
+            if (!argument["access"].is_string()) {
+                error = "compute argument reflection has invalid access metadata";
+                return false;
+            }
+            parameter.access = argument["access"].get<std::string>();
+        } else if (reflectedKind == "scalar" || reflectedKind == "tensor_value") {
+            parameter.access = "read";
+        } else {
+            error = "compute resource reflection has no access metadata";
+            return false;
+        }
+        if (!pipelineValueAccess(parameter.access)) {
+            error = "compute argument reflection has invalid access metadata";
+            return false;
+        }
+        if (parameter.kind == "texture") {
+            parameter.dimension = argument.value("dimension", std::string());
+            parameter.format = argument.value("format", std::string());
+            if (!pipelineTextureDimension(parameter.dimension) ||
+                (!parameter.format.empty() && !pipelineTextureFormat(parameter.format))) {
+                error = "compute texture reflection has invalid dimension or format metadata";
+                return false;
+            }
+        }
         if (argument.contains("shape") && argument["shape"].is_array())
             parameter.shape = argument["shape"].get<std::vector<uint64_t>>();
         else if (argument.contains("source_shape") && argument["source_shape"].is_array())

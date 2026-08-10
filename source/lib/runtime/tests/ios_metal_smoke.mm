@@ -62,9 +62,16 @@ bool testImageAndSampler(VernonRhiDevice device) {
     upload.source_type = VERNON_RHI_IMAGE_DATA_UINT8;
     upload.data = source.data();
     std::array<uint8_t, source.size()> destination{};
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.width = descriptor.width;
+    download.height = descriptor.height;
+    download.depth = 1;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
     bool success = vernonRhiDeviceUploadImage(device, image, &upload, 1) == VERNON_RHI_STATUS_OK &&
                    vernonRhiDeviceGenerateImageMipmaps(device, image) == VERNON_RHI_STATUS_OK &&
-                   vernonRhiDeviceDownloadImage(device, image, destination.data(), destination.size()) ==
+                   vernonRhiDeviceDownloadImage(device, image, &download, destination.data(), destination.size()) ==
                        VERNON_RHI_STATUS_OK &&
                    destination == source;
 

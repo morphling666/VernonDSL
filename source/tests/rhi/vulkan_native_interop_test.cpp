@@ -109,7 +109,12 @@ TEST(VulkanOwnedDevice, DownloadsDepthOnlyImageThroughDepthAspect) {
     VernonRhiImage image{};
     ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &image), VERNON_RHI_STATUS_OK);
     float depth{};
-    EXPECT_EQ(vernonRhiDeviceDownloadImage(device, image, &depth, sizeof(depth)), VERNON_RHI_STATUS_OK)
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.width = download.height = download.depth = 1;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_DEPTH;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_FLOAT32;
+    EXPECT_EQ(vernonRhiDeviceDownloadImage(device, image, &download, &depth, sizeof(depth)), VERNON_RHI_STATUS_OK)
         << vernon::test::text(vernonRhiDeviceGetLastError(device));
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
     vernonRhiDestroyDevice(device);

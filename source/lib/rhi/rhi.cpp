@@ -166,9 +166,10 @@ extern "C" VernonRhiStatus vernonRhiDeviceUploadImage(VernonRhiDevice device, Ve
     VERNON_DISPATCH_STATUS(device, uploadImage, image, uploads, uploadCount);
 }
 
-extern "C" VernonRhiStatus vernonRhiDeviceDownloadImage(VernonRhiDevice device, VernonRhiImage image, void *destination,
-                                                        size_t size) {
-    VERNON_DISPATCH_STATUS(device, downloadImage, image, destination, size);
+extern "C" VernonRhiStatus vernonRhiDeviceDownloadImage(VernonRhiDevice device, VernonRhiImage image,
+                                                        const VernonRhiImageDownloadDescriptor *descriptor,
+                                                        void *destination, size_t size) {
+    VERNON_DISPATCH_STATUS(device, downloadImage, image, descriptor, destination, size);
 }
 
 extern "C" VernonRhiStatus vernonRhiDeviceGenerateImageMipmaps(VernonRhiDevice device, VernonRhiImage image) {
@@ -234,6 +235,11 @@ bool vernon::rhi::retainResource(VernonRhiDevice device, ResourceKind kind, uint
 uint64_t vernon::rhi::resolveResource(VernonRhiDevice device, ResourceKind kind, uint64_t key) {
     const BackendDispatch *backend = dispatch(device);
     return backend && backend->resolveResource ? backend->resolveResource(device, kind, key) : 0;
+}
+
+bool vernon::rhi::describeImageResource(VernonRhiDevice device, uint64_t key, VernonRhiImageDescriptor &descriptor) {
+    const BackendDispatch *backend = dispatch(device);
+    return backend && backend->describeImageResource && backend->describeImageResource(device, key, &descriptor);
 }
 
 void vernon::rhi::releaseResource(VernonRhiDevice device, ResourceKind kind, uint64_t key) {

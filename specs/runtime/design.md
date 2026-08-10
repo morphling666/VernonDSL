@@ -171,10 +171,13 @@ RuntimeCore never owns textures, framebuffers, execution graphs, queues, or
 resource state. It transactionally retains opaque provider resource references
 held by prepared bindings. The provider owns allocation, logical records,
 barriers, submission, completion, and transient descriptor/upload storage.
-Python `Texture` owns generic 2D RGBA8, sampled D32, or six-face Cube image
-storage, while `RenderTarget` only groups attachment references. A D32
-`Texture` may therefore be written as an attachment and sampled by a dependent
-pass without a dedicated depth resource type. Immutable `SamplerState` objects
+Python `Texture` owns color image storage, including two-dimensional,
+three-dimensional, and six-face Cube resources. Three-dimensional textures use
+`(depth, height, width, channels)` host order and are shader resources rather
+than attachments. `RenderTarget` owns or groups two-dimensional attachment
+references and manages its optional depth attachment explicitly. Its
+`depth_texture` is a shader-readable resource view of that attachment; depth is
+not a public host-transfer `Texture` format. Immutable `SamplerState` objects
 bind shader `Sampler` parameters independently of image ownership.
 
 ## Reflection-driven structured Value binding
@@ -356,10 +359,11 @@ Rendering scopes carry explicit `Clear`, `Preserve`, or `Discard` load
 operations and `Preserve` or `Discard` store operations. Clear values belong to
 the attachment use, not the pipeline. An optional D32 attachment enables
 less-than depth testing and depth writes in Vulkan, D3D12, and OpenGL. Python
-groups external color textures with either an internal render-only depth image
-or a generic sampled D32 `Texture` in `RenderTarget`. Importing that texture
-through both its resource and target identities resolves to one native graph
-resource, so attachment-to-sampling hazards remain visible.
+keeps that attachment under `RenderTarget` ownership and exposes a
+shader-readable `depth_texture` reference when depth sampling is required.
+Importing the attachment through both its target and shader-resource identities
+resolves to one native graph resource, so attachment-to-sampling hazards remain
+visible.
 
 ## PBR integration reference
 
@@ -500,11 +504,14 @@ hidden context through the separately linked `_gl_context` GLFW extension.
 
 Each backend accepts only pipeline bundles compiled for its matching GLSL
 profile. Compute requires OpenGL 4.3 or OpenGL ES 3.1 and binds reflected
-storage buffers before issuing a shader-storage barrier. Graphics accepts
-imported host buffer, texture, and sampler names without deleting them. It also
-creates owned child resources for standalone execution; all GL allocation,
-transfer, deletion, and invocation operations first make the associated
-context current.
+storage buffers and storage images before issuing the required memory barrier.
+The current language contract permits filtered texture sampling only in
+fragment shaders, so a compute pipeline containing a sampled-image parameter is
+rejected during preparation rather than failing later during dispatch.
+Graphics accepts imported host buffer, texture, and sampler names without
+deleting them. It also creates owned child resources for standalone execution;
+all GL allocation, transfer, deletion, and invocation operations first make
+the associated context current.
 The current `PIPELINE_VERSION` invocation ABI represents every numeric argument
 as one `VernonTensorView`. The storage discriminator selects immutable host
 Value transport, borrowed TensorStorage memory, or a runtime-owned device

@@ -268,6 +268,7 @@ if(SKBUILD)
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.hpp"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonExecutionGraph.h"
+              "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonTextureTypes.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntime.h"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntime.hpp"
               "${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntimeCore.h"

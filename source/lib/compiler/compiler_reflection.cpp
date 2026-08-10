@@ -1110,7 +1110,9 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 argument["kind"] = "texture";
                 argument["dtype"] = scalarDtype(texture.getElementType());
                 argument["dimension"] = texture.getDimension().str();
-                argument["access"] = "read";
+                argument["access"] = texture.getAccess() == "sampled" ? "read" : texture.getAccess().str();
+                if (texture.getAccess() != "sampled")
+                    argument["format"] = texture.getFormat().str();
             } else if (mlir::isa<mlir::vernon::SamplerType>(argumentType)) {
                 argument["kind"] = "sampler";
                 argument["access"] = "read";

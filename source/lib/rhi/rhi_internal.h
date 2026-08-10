@@ -19,6 +19,7 @@ VERNON_RHI_CAPI uint64_t samplerResource(VernonRhiDevice device, VernonRhiSample
 VERNON_RHI_CAPI bool retainResource(VernonRhiDevice device, ResourceKind kind, uint64_t key);
 VERNON_RHI_CAPI void releaseResource(VernonRhiDevice device, ResourceKind kind, uint64_t key);
 VERNON_RHI_CAPI uint64_t resolveResource(VernonRhiDevice device, ResourceKind kind, uint64_t key);
+VERNON_RHI_CAPI bool describeImageResource(VernonRhiDevice device, uint64_t key, VernonRhiImageDescriptor &descriptor);
 VERNON_RHI_CAPI bool beginCommandRecording(VernonRhiDevice device, uint64_t &native, VernonRhiBackend &backend);
 VERNON_RHI_CAPI bool submitCommandRecording(VernonRhiDevice device, uint64_t native, bool compute_writes,
                                             bool &completed);

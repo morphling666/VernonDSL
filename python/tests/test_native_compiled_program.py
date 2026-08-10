@@ -213,6 +213,25 @@ class CompiledProgramTests(unittest.TestCase):
                 image.upload(source)
                 self.assertEqual(image.download(), source)
 
+    def test_standalone_rhi_three_dimensional_image_round_trip(self) -> None:
+        for backend in (native.RhiBackend.VULKAN, native.RhiBackend.DIRECTX12):
+            with self.subTest(backend=backend):
+                try:
+                    host = native.RhiHost(backend)
+                except RuntimeError:
+                    continue
+                source = bytes(range(2 * 3 * 4 * 4))
+                image = host.create_image(
+                    4,
+                    3,
+                    native.TextureFormat.RGBA8_UNORM,
+                    native.TextureDimension.TEXTURE_3D,
+                    2,
+                )
+                self.assertEqual((image.width, image.height, image.depth), (4, 3, 2))
+                image.upload(source)
+                self.assertEqual(image.download(), source)
+
     def test_graphics_dynamic_bounds_structured_loop_compiles(self) -> None:
         module = compile_source(
             "from vernon_dsl import *\n"

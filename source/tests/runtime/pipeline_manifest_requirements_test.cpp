@@ -519,7 +519,7 @@ TEST(PipelineManifestRequirements, RejectsAmbiguousOrUnresolvedResourceBindings)
         return nlohmann::json{{"slot", slot},
                               {"name", name},
                               {"kind", "texture"},
-                              {"type", "!vernon.texture<\"2d\", f32>"},
+                              {"type", "!vernon.texture<\"2d\", f32, \"unknown\", \"sampled\">"},
                               {"access", "read"},
                               {"shape", nlohmann::json::array()},
                               {"dimension", "2d"},

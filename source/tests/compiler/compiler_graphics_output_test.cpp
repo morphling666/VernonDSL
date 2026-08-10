@@ -68,7 +68,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         vernon.location = 0 : i64,
         vernon.source_name = "tex_coord"
       },
-      %cubeMap: !vernon.texture<"cube", f32> {
+      %cubeMap: !vernon.texture<"cube", f32, "unknown", "sampled"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
         vernon.binding = 0 : i64,
@@ -92,7 +92,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         }) attributes {vernon.entry, vernon.stage = "fragment"} {
     %color = "vernon.intrinsic"(%cubeMap, %sampler, %texCoord) {
       name = "texture_sample"
-    } : (!vernon.texture<"cube", f32>, !vernon.sampler, tensor<3xf32>)
+    } : (!vernon.texture<"cube", f32, "unknown", "sampled">, !vernon.sampler, tensor<3xf32>)
         -> tensor<4xf32>
     %rgb = "vernon.swizzle"(%color) {
       mask = "rgb"
@@ -403,15 +403,15 @@ TEST(CompilerGraphicsOutput, LowersSamplingBuiltinsTextureSizeAndMath) {
     constexpr std::string_view samplingModule = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @sampling_fragment(
-      %texture: !vernon.texture<"2d", f32> {
+      %texture: !vernon.texture<"2d", f32, "unknown", "sampled"> {
         vernon.interface = "resource", vernon.set = 0 : i64,
         vernon.binding = 0 : i64, vernon.source_name = "texture"
       },
-      %texture3d: !vernon.texture<"3d", f32> {
+      %texture3d: !vernon.texture<"3d", f32, "unknown", "sampled"> {
         vernon.interface = "resource", vernon.set = 0 : i64,
         vernon.binding = 2 : i64, vernon.source_name = "texture3d"
       },
-      %textureCube: !vernon.texture<"cube", f32> {
+      %textureCube: !vernon.texture<"cube", f32, "unknown", "sampled"> {
         vernon.interface = "resource", vernon.set = 0 : i64,
         vernon.binding = 3 : i64, vernon.source_name = "textureCube"
       },
@@ -455,26 +455,26 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     %level = arith.constant 1 : i32
     %implicit = "vernon.intrinsic"(%texture, %sampler, %uv)
         {name = "texture_sample"} :
-        (!vernon.texture<"2d", f32>, !vernon.sampler, tensor<2xf32>)
+        (!vernon.texture<"2d", f32, "unknown", "sampled">, !vernon.sampler, tensor<2xf32>)
         -> tensor<4xf32>
     %explicit = "vernon.intrinsic"(%texture, %sampler, %uv, %lod)
         {name = "texture_sample"} :
-        (!vernon.texture<"2d", f32>, !vernon.sampler, tensor<2xf32>, f32)
+        (!vernon.texture<"2d", f32, "unknown", "sampled">, !vernon.sampler, tensor<2xf32>, f32)
         -> tensor<4xf32>
     %size2d0 = "vernon.intrinsic"(%texture) {name = "texture_size"} :
-        (!vernon.texture<"2d", f32>) -> tensor<2xi32>
+        (!vernon.texture<"2d", f32, "unknown", "sampled">) -> tensor<2xi32>
     %size2d1 = "vernon.intrinsic"(%texture, %level) {name = "texture_size"} :
-        (!vernon.texture<"2d", f32>, i32) -> tensor<2xi32>
+        (!vernon.texture<"2d", f32, "unknown", "sampled">, i32) -> tensor<2xi32>
     %size3d0 = "vernon.intrinsic"(%texture3d) {name = "texture_size"} :
-        (!vernon.texture<"3d", f32>) -> tensor<3xi32>
+        (!vernon.texture<"3d", f32, "unknown", "sampled">) -> tensor<3xi32>
     %size3d1 = "vernon.intrinsic"(%texture3d, %level)
         {name = "texture_size"} :
-        (!vernon.texture<"3d", f32>, i32) -> tensor<3xi32>
+        (!vernon.texture<"3d", f32, "unknown", "sampled">, i32) -> tensor<3xi32>
     %sizeCube0 = "vernon.intrinsic"(%textureCube) {name = "texture_size"} :
-        (!vernon.texture<"cube", f32>) -> tensor<2xi32>
+        (!vernon.texture<"cube", f32, "unknown", "sampled">) -> tensor<2xi32>
     %sizeCube1 = "vernon.intrinsic"(%textureCube, %level)
         {name = "texture_size"} :
-        (!vernon.texture<"cube", f32>, i32) -> tensor<2xi32>
+        (!vernon.texture<"cube", f32, "unknown", "sampled">, i32) -> tensor<2xi32>
     %x = "vernon.swizzle"(%fragCoord) {mask = "x"} :
         (tensor<4xf32>) -> f32
     %sin = math.sin %x : f32
@@ -551,6 +551,63 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
             for (std::string_view texture : {"texture", "texture3d", "textureCube"})
                 EXPECT_NE(output.find(texture), std::string::npos);
         }
+        vernonCompileResultDestroy(result);
+    }
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerGraphicsOutput, LowersUnifiedStorageTextureForEveryGpuTarget) {
+    constexpr std::string_view storageModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @storage_main(
+      %image: !vernon.texture<"3d", f32, "rgba32_float", "read_write"> {
+        vernon.interface = "resource",
+        vernon.set = 0 : i64,
+        vernon.binding = 0 : i64,
+        vernon.source_name = "image"
+      },
+      %coordinate: tensor<3xi32> {
+        vernon.interface = "uniform",
+        vernon.source_name = "coordinate"
+      },
+      %value: tensor<4xf32> {
+        vernon.interface = "uniform",
+        vernon.source_name = "value"
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 1, 1, 1>
+      } {
+    %loaded = "vernon.intrinsic"(%image, %coordinate) {
+      name = "texture_load"
+    } : (!vernon.texture<"3d", f32, "rgba32_float", "read_write">, tensor<3xi32>) -> tensor<4xf32>
+    "vernon.intrinsic"(%image, %coordinate, %loaded) {
+      name = "texture_store"
+    } : (!vernon.texture<"3d", f32, "rgba32_float", "read_write">, tensor<3xi32>, tensor<4xf32>) -> ()
+    return
+  }
+}
+)mlir";
+
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    for (VernonTarget target :
+         {VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL, VERNON_TARGET_DIRECTX, VERNON_TARGET_METAL}) {
+        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+            continue;
+        VernonCompileResult *result =
+            vernonCompilerCompileMlir(compiler, storageModule.data(), storageModule.size(), target);
+        ASSERT_TRUE(result);
+        if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
+            const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+            std::fprintf(stderr, "storage texture compile failed: %.*s\n", static_cast<int>(diagnostics.size),
+                         diagnostics.data);
+        }
+        ASSERT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
+        const VernonStringView reflection = vernonCompileResultGetReflection(result);
+        const std::string_view reflectionView(reflection.data, reflection.size);
+        EXPECT_NE(reflectionView.find("\"format\":\"rgba32_float\""), std::string_view::npos);
+        EXPECT_NE(reflectionView.find("\"access\":\"read_write\""), std::string_view::npos);
         vernonCompileResultDestroy(result);
     }
     vernonCompilerDestroy(compiler);

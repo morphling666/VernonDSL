@@ -6,11 +6,19 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable
 
-from .resources import RawBuffer, RenderTarget, TensorStorage, TensorView, Texture
+from .resources import RawBuffer, RenderTarget, TensorStorage, TensorView, Texture, _TextureResource
 
 
 def _session_state() -> Any:
     return importlib.import_module("vernon_dsl._runtime.session")
+
+
+def _resource_identity(value: Any) -> object:
+    if isinstance(value, TensorView):
+        return value.owner
+    if isinstance(value, _TextureResource):
+        return value._graph_identity()
+    return value
 
 
 class LoadOperation(Enum):
@@ -301,7 +309,7 @@ class RenderPass(ExecutionPass):
                 location,
                 ColorAttachmentUse(texture, color_load, color_store, _checked_clear_color(clear_color)),
             )
-        if target._depth_format is not None:
+        if target._has_depth:
             self.depth(DepthStencilAttachmentUse(target, depth_load, depth_store, clear_depth))
 
     def color(self, location: int, attachment: ColorAttachmentUse) -> None:
@@ -479,18 +487,18 @@ class ExecutionGraph:
 
     def import_resource(self, value: Any, *, exported: bool = True) -> GraphResource:
         native_graph = self._ensure_current()
-        identity_value = value.owner if isinstance(value, TensorView) else value
+        identity_value = _resource_identity(value)
         identity = id(identity_value)
         existing = self._resource_by_identity.get(identity)
         if existing is not None:
-            existing_identity = existing.value.owner if isinstance(existing.value, TensorView) else existing.value
+            existing_identity = _resource_identity(existing.value)
             if existing_identity is not identity_value:
                 raise RuntimeError("Python resource identity collision")
             return existing
         state = _session_state()
         if state._architecture == state.cpu and isinstance(value, (TensorStorage, TensorView, RawBuffer)):
             native_resource = native_graph.import_host_buffer(identity, exported)
-        elif isinstance(value, Texture):
+        elif isinstance(value, _TextureResource):
             native_resource = native_graph.import_image(value._resident_texture(), exported)
         elif isinstance(value, RenderTarget):
             image = value._resident_depth_attachment()

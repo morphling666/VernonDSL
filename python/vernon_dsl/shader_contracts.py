@@ -108,6 +108,8 @@ DEVICE_ONLY_OPERATION_NAMES = frozenset(
         *ATOMIC_OPERATION_NAMES,
         "storage_barrier",
         "texture_sample",
+        "texture_load",
+        "texture_store",
         "texture_size",
         "workgroup_storage",
         "workgroup_barrier",

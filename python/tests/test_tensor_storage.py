@@ -149,6 +149,29 @@ class TensorStorageRuntimeTests(unittest.TestCase):
                 storage.copy_from_numpy(values)
         np.testing.assert_array_equal(storage.to_numpy(), values)
 
+    def test_dispatch_scope_protects_texture_host_access(self) -> None:
+        texture = vd.Texture.zeros(shape=(2, 2), usage=("storage", "transfer_source", "transfer_destination"))
+        values = np.ones((2, 2, 4), dtype=np.uint8)
+
+        with _dispatch_borrow_scope([("input", texture, "read")]):
+            np.testing.assert_array_equal(texture.download(), np.zeros_like(values))
+            with self.assertRaisesRegex(RuntimeError, "host mutation"):
+                texture.upload(values)
+            with _dispatch_borrow_scope([("second_input", texture, "read")]):
+                pass
+
+        with _dispatch_borrow_scope([("output", texture, "write")]):
+            with self.assertRaisesRegex(RuntimeError, "host reads"):
+                texture.download()
+            with self.assertRaisesRegex(RuntimeError, "host mutation"):
+                texture.upload(values)
+            with self.assertRaisesRegex(RuntimeError, "outstanding device borrow"):
+                with _dispatch_borrow_scope([("conflicting_output", texture, "write")]):
+                    pass
+
+        texture.upload(values)
+        np.testing.assert_array_equal(texture.download(), values)
+
     def test_outstanding_dispatch_borrows_are_region_aware(self) -> None:
         storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(8,))
         left = storage.view(shape=(4,), strides=(1,), offset=0, access="write")

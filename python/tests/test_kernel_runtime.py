@@ -73,6 +73,16 @@ def vector_while(
     output[x] = vd.f32(iterations)
 
 
+@vd.kernel(workgroup_size=(2, 2, 2))
+def storage_texture_round_trip(
+    image: vd.Texture["3d", vd.rgba32_float, vd.read_write],  # noqa: F722
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    coordinate = vd.Vector([vd.i32(gid[0]), vd.i32(gid[1]), vd.i32(gid[2])])
+    value = vd.texture_load(image, coordinate)
+    vd.texture_store(image, coordinate, value + vd.Vector([1.0, 2.0, 3.0, 4.0]))
+
+
 @vd.kernel(workgroup_size=(2, 1, 1))
 def matrix_vector(
     output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
@@ -537,10 +547,64 @@ class KernelTensorRuntimeTests(unittest.TestCase):
 
     def _available_compute_backends(self, *, include_cpu: bool = True) -> list[object]:
         backends: list[object] = [vd.cpu] if include_cpu else []
-        for architecture in (vd.cuda, vd.vulkan, vd.directx, vd.opengl, vd.opengles):
+        for architecture in (vd.cuda, vd.vulkan, vd.directx, vd.metal, vd.opengl, vd.opengles):
             if self._runtime_available(architecture):
                 backends.append(architecture)
         return backends
+
+    def test_storage_texture_backend_parity(self) -> None:
+        backends = [
+            architecture
+            for architecture in (vd.vulkan, vd.directx, vd.metal, vd.opengl, vd.opengles)
+            if self._runtime_available(architecture)
+        ]
+        if not backends:
+            self.skipTest("no storage texture backend is available")
+        source = np.arange(2 * 4 * 4 * 4, dtype=np.float32).reshape(2, 4, 4, 4)
+        device_result = source + np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+        for backend in backends:
+            with self.subTest(backend=backend.name):
+                vd.init(arch=backend)  # type: ignore[arg-type]
+                image = vd.Texture.from_numpy(
+                    source,
+                    dimension="3d",
+                    format=vd.rgba32_float,
+                    usage=("storage", "transfer_source", "transfer_destination"),
+                )
+                storage_texture_round_trip(image, grid=(2, 2, 1))
+                replacement = np.full((1, 1, 1, 4), 42.0, dtype=np.float32)
+                image.upload(replacement, origin=(0, 1, 1))
+                expected = device_result.copy()
+                expected[0:1, 1:2, 1:2] = replacement
+                np.testing.assert_array_equal(
+                    image.download(origin=(0, 1, 1), shape=(1, 2, 2)),
+                    expected[0:1, 1:3, 1:3],
+                )
+                np.testing.assert_array_equal(image.download(), expected)
+
+    def test_three_dimensional_texture_mipmap_backend_parity(self) -> None:
+        backends = [architecture for architecture in (vd.vulkan, vd.metal) if self._runtime_available(architecture)]
+        if not backends:
+            self.skipTest("no 3D texture mipmap backend is available")
+        source = np.broadcast_to(
+            np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
+            (2, 4, 4, 4),
+        ).copy()
+        for backend in backends:
+            with self.subTest(backend=backend.name):
+                vd.init(arch=backend)  # type: ignore[arg-type]
+                image = vd.Texture.from_numpy(
+                    source,
+                    dimension="3d",
+                    format=vd.rgba32_float,
+                    mip_levels=2,
+                    usage=("sampled", "transfer_source", "transfer_destination"),
+                )
+                image.generate_mipmaps()
+                np.testing.assert_array_equal(
+                    image.download(mip_level=1),
+                    np.broadcast_to(source[0, 0, 0], (1, 2, 2, 4)),
+                )
 
     def test_global_tensor_view_atomic_backend_parity(self) -> None:
         backends: list[object] = [vd.cpu]

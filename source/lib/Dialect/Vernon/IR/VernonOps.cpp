@@ -117,17 +117,12 @@ LogicalResult SwizzleOp::verify() {
 LogicalResult IntrinsicOp::verify() {
     if (getNameAttr().getValue().empty())
         return emitOpError("requires a non-empty intrinsic name");
-    if (getName() != "texture_sample" && getName() != "texture_size")
+    if (getName() != "texture_sample" && getName() != "texture_size" && getName() != "texture_load" &&
+        getName() != "texture_store")
         return success();
 
-    if (getNumResults() != 1)
-        return emitOpError() << getName() << " requires exactly one result";
     if (getNumOperands() == 0)
         return emitOpError() << getName() << " requires a texture operand";
-
-    auto texture = dyn_cast<TextureType>(getOperand(0).getType());
-    if (!texture)
-        return emitOpError() << getName() << " operand #0 must be a Vernon texture";
 
     auto shapedWidthAndElement = [](Type type) -> std::optional<std::pair<int64_t, Type>> {
         if (auto tensor = dyn_cast<RankedTensorType>(type)) {
@@ -142,6 +137,35 @@ LogicalResult IntrinsicOp::verify() {
         }
         return std::nullopt;
     };
+
+    if (getName() == "texture_load" || getName() == "texture_store") {
+        auto texture = dyn_cast<TextureType>(getOperand(0).getType());
+        if (!texture || texture.getAccess() == "sampled")
+            return emitOpError() << getName() << " operand #0 must be a Vernon storage Texture";
+        const bool load = getName() == "texture_load";
+        if ((load && texture.getAccess() == "write") || (!load && texture.getAccess() == "read"))
+            return emitOpError() << getName() << " is incompatible with " << texture.getAccess() << " access";
+        if (getNumOperands() != (load ? 2u : 3u) || getNumResults() != (load ? 1u : 0u))
+            return emitOpError() << getName() << " has an invalid operand or result count";
+        const int64_t rank = texture.getDimension() == "3d" ? 3 : 2;
+        auto coordinates = shapedWidthAndElement(getOperand(1).getType());
+        if (!coordinates || coordinates->first != rank || !coordinates->second.isSignlessInteger(32))
+            return emitOpError() << getName() << " coordinates must be a " << rank << "-component i32 vector";
+        Type texelType = load ? getResult().getType() : getOperand(2).getType();
+        auto texel = shapedWidthAndElement(texelType);
+        if (!texel || texel->first != 4 || texel->second != texture.getElementType())
+            return emitOpError() << getName() << " texel must be a 4-component " << texture.getElementType()
+                                 << " vector";
+        return success();
+    }
+
+    if (getNumResults() != 1)
+        return emitOpError() << getName() << " requires exactly one result";
+    auto texture = dyn_cast<TextureType>(getOperand(0).getType());
+    if (!texture)
+        return emitOpError() << getName() << " operand #0 must be a Vernon texture";
+    if (texture.getAccess() != "sampled")
+        return emitOpError() << getName() << " requires a sampled Texture";
 
     if (getName() == "texture_size") {
         if (getNumOperands() < 1 || getNumOperands() > 2)

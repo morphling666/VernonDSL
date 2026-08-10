@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -48,7 +49,13 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
             delete state;
             return false;
         }
-        for (const Parameter &parameter : variant.parameters)
+        for (const Parameter &parameter : variant.parameters) {
+            if (parameter.kind == "texture" && parameter.format.empty()) {
+                invocationDiagnostic(*bundle.context) =
+                    "OpenGL compute pipelines do not support sampled textures in the current language contract";
+                delete state;
+                return false;
+            }
             for (const ParameterUse &use : parameter.uses) {
                 if (use.stage != "compute" && use.stage != variant.compute)
                     continue;
@@ -64,20 +71,25 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     candidate.layout.slot = leafIndex == 0 ? parameter.slot : ++computeInternalSlot;
                     candidate.layout.binding =
                         argument.storageLeaves.empty() ? use.binding : argument.storageLeaves[leafIndex].binding;
-                    candidate.layout.kind = argument.kind == "tensor" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
-                                                                      : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                    candidate.layout.kind = parameter.kind == "texture"
+                                                ? (parameter.format.empty() ? VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE
+                                                                            : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE)
+                                            : argument.kind == "tensor" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
+                                                                        : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
                     candidate.layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
                     candidate.layout.access = parameter.access == "read" ? 1u : parameter.access == "write" ? 2u : 3u;
                     candidate.layout.array_count = 1;
                     candidate.layout.argument_index = use.index;
                     candidate.layout.element_size = static_cast<uint32_t>(
-                        argument.storageLeaves.empty()
-                            ? (argument.kind == "tensor" ? argument.tensorElementSize : argument.physical.size)
-                            : argument.storageLeaves[leafIndex].elementSize);
+                        argument.storageLeaves.empty() ? (parameter.kind == "texture" ? 1
+                                                          : argument.kind == "tensor" ? argument.tensorElementSize
+                                                                                      : argument.physical.size)
+                                                       : argument.storageLeaves[leafIndex].elementSize);
                     candidate.binding.externalSlot = parameter.slot;
-                    candidate.binding.source = argument.kind == "tensor"
-                                                   ? OpenGLPipelineState::InlineBinding::EXTERNAL_STORAGE
-                                                   : OpenGLPipelineState::InlineBinding::COMPUTE_INLINE;
+                    candidate.binding.source =
+                        parameter.kind == "texture" ? OpenGLPipelineState::InlineBinding::EXTERNAL_TEXTURE
+                        : argument.kind == "tensor" ? OpenGLPipelineState::InlineBinding::EXTERNAL_STORAGE
+                                                    : OpenGLPipelineState::InlineBinding::COMPUTE_INLINE;
                     candidate.source = {ComputeBindingSourceKind::Argument, use.index, 0};
                     if (candidate.layout.element_size == 0) {
                         invocationDiagnostic(*bundle.context) = "OpenGL compute parameter has zero element size";
@@ -112,6 +124,7 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                                       use.tensorViewDescriptor->strideBindings[dimension]);
                 }
             }
+        }
         std::sort(candidates.begin(), candidates.end(),
                   [](const auto &left, const auto &right) { return left.layout.slot < right.layout.slot; });
         state->rhiLayout.reserve(candidates.size());
@@ -307,7 +320,8 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_VERTEX;
                 } else if (parameter.kind == "texture" && use.interfaceKind == "resource" &&
                            use.binding != UINT32_MAX) {
-                    candidate.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE;
+                    candidate.layout.kind = parameter.format.empty() ? VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE
+                                                                     : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE;
                     candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
                     candidate.layout.set = use.descriptorSet;
                     candidate.layout.binding = use.binding;
@@ -495,6 +509,8 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
         value.flags = 0;
         value.resource = {};
         value.stride = 0;
+        value.texture_format = VERNON_TEXTURE_RGBA8_UNORM;
+        value.texture_dimension = VERNON_TEXTURE_2D;
         if (prepared.source == OpenGLPipelineState::InlineBinding::EXTERNAL_VERTEX) {
             const auto found = plan.arguments.find(prepared.externalSlot);
             if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
@@ -527,7 +543,8 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
                 !found->second->texture.resource.resource.value)
                 return fail(*pipeline.context, "OpenGL RHI texture argument is missing");
             value.resource = found->second->texture.resource;
-            value.stride = static_cast<uint32_t>(found->second->texture.dimension);
+            value.texture_format = found->second->texture.format;
+            value.texture_dimension = found->second->texture.dimension;
             continue;
         }
         if (prepared.source == OpenGLPipelineState::InlineBinding::EXTERNAL_SAMPLER) {
@@ -702,6 +719,13 @@ VernonStatus invokeOpenGLComputePipeline(VernonLoadedPipeline &pipeline, const P
             if (argument.kind != ComputeLaunchArgumentKind::Tensor || !argument.resource.resource.value)
                 return fail(*pipeline.context, "OpenGL prepared storage binding requires an RHI Tensor");
             value.resource = argument.resource;
+        } else if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
+                   layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
+            if (argument.kind != ComputeLaunchArgumentKind::Texture || !argument.resource.resource.value)
+                return fail(*pipeline.context, "OpenGL prepared image binding requires an RHI Texture");
+            value.resource = argument.resource;
+            value.texture_format = argument.textureFormat;
+            value.texture_dimension = argument.textureDimension;
         } else {
             if (argument.kind != ComputeLaunchArgumentKind::Scalar || !argument.scalarData || !argument.scalarSize)
                 return fail(*pipeline.context, "OpenGL prepared inline binding requires host data");

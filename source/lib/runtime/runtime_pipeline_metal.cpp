@@ -309,12 +309,14 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                 }
                 candidate.binding.source = MetalPipelineState::GraphicsBinding::EXTERNAL_VERTEX;
             } else if (parameter.kind == "texture" && use.interfaceKind == "resource") {
-                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE;
+                const bool storage = !parameter.format.empty();
+                candidate.layout.kind =
+                    storage ? VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE : VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE;
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
                 candidate.layout.set = use.descriptorSet;
                 candidate.layout.binding = use.binding;
                 candidate.binding.source = MetalPipelineState::GraphicsBinding::EXTERNAL_TEXTURE;
-                if (!resolveDescriptor("sampled_image"))
+                if (!resolveDescriptor(storage ? "storage_image" : "sampled_image"))
                     return false;
             } else {
                 return false;
@@ -444,22 +446,29 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                 candidate.layout.binding = argument.storageLeaves.size() <= 1
                                                ? argumentBindings[use.index] + static_cast<uint32_t>(leafIndex)
                                                : argument.storageLeaves[leafIndex].binding;
-                candidate.layout.kind = argument.kind == "tensor" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
-                                                                  : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                candidate.layout.kind = parameter.kind == "texture"
+                                            ? (parameter.format.empty() ? VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE
+                                                                        : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE)
+                                        : argument.kind == "tensor" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
+                                                                    : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
                 candidate.layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
                 candidate.layout.access = parameter.access == "read" ? 1u : parameter.access == "write" ? 2u : 3u;
                 candidate.layout.array_count = 1;
                 candidate.layout.argument_index = use.index;
                 candidate.layout.element_size = static_cast<uint32_t>(
-                    argument.storageLeaves.empty()
-                        ? (argument.kind == "tensor" ? argument.tensorElementSize : argument.physical.size)
-                        : argument.storageLeaves[leafIndex].elementSize);
+                    argument.storageLeaves.empty() ? (parameter.kind == "texture" ? 1
+                                                      : argument.kind == "tensor" ? argument.tensorElementSize
+                                                                                  : argument.physical.size)
+                                                   : argument.storageLeaves[leafIndex].elementSize);
                 candidate.resourceOffset = 0;
                 candidate.source = {ComputeBindingSourceKind::Argument, use.index, 0};
                 MetalResourceLocation location;
+                const char *resourceKind = parameter.kind == "texture"
+                                               ? (parameter.format.empty() ? "sampled_image" : "storage_image")
+                                               : "storage_buffer";
                 if (candidate.layout.binding == UINT32_MAX || candidate.layout.element_size == 0 ||
-                    !resolveMetalResourceLocation(parsed, stage.entry, "compute", "storage_buffer",
-                                                  candidate.layout.set, candidate.layout.binding, location,
+                    !resolveMetalResourceLocation(parsed, stage.entry, "compute", resourceKind, candidate.layout.set,
+                                                  candidate.layout.binding, location,
                                                   invocationDiagnostic(*bundle.context)))
                     return false;
                 candidate.layout.set = location.argumentBufferIndex;
@@ -782,6 +791,11 @@ VernonStatus invokeMetalComputePipeline(VernonLoadedPipeline &pipeline, const Pl
                 return fail(*pipeline.context, "Metal prepared storage binding requires an RHI Tensor");
             value.resource = argument.resource;
             value.resource.offset += state.rhiComputeResourceOffsets[index];
+        } else if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
+                   layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
+            if (argument.kind != ComputeLaunchArgumentKind::Texture || !argument.resource.resource.value)
+                return fail(*pipeline.context, "Metal prepared image binding requires an RHI Texture");
+            value.resource = argument.resource;
         } else {
             if (argument.kind != ComputeLaunchArgumentKind::Scalar || !argument.scalarData || !argument.scalarSize)
                 return fail(*pipeline.context, "Metal prepared inline binding requires packed host data");

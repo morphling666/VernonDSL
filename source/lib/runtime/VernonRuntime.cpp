@@ -591,8 +591,15 @@ VernonStatus fillTextureConstraintView(const Parameter &source, VernonPipelineTe
     if (!dimension)
         return VERNON_STATUS_PARSE_ERROR;
     destination.dimension = *dimension;
-    destination.has_format_constraint = 0;
-    destination.format = static_cast<VernonTextureFormat>(0);
+    destination.has_format_constraint = source.format.empty() ? 0u : 1u;
+    if (destination.has_format_constraint) {
+        const auto format = pipelineTextureFormat(source.format);
+        if (!format)
+            return VERNON_STATUS_PARSE_ERROR;
+        destination.format = *format;
+    } else {
+        destination.format = static_cast<VernonTextureFormat>(0);
+    }
     std::fill(std::begin(destination.reserved), std::end(destination.reserved), 0);
     return VERNON_STATUS_OK;
 }

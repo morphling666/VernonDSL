@@ -274,6 +274,15 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
                  (parameter.dimension == "3d" && argument.texture.dimension != VERNON_TEXTURE_3D) ||
                  (parameter.dimension == "cube" && argument.texture.dimension != VERNON_TEXTURE_CUBE)))
                 return fail(error, "pipeline texture argument does not match layout");
+            if (!parameter.format.empty()) {
+                const auto format = pipelineTextureFormat(parameter.format);
+                if (!format || argument.texture.format != *format)
+                    return fail(error, "pipeline storage texture format does not match layout");
+            }
+            if ((parameter.access == "read" && argument.texture.access != VERNON_ACCESS_READ) ||
+                (parameter.access == "write" && argument.texture.access != VERNON_ACCESS_WRITE) ||
+                (parameter.access == "read_write" && argument.texture.access != VERNON_ACCESS_READ_WRITE))
+                return fail(error, "pipeline texture access does not match layout");
         } else if (!argument.resource.identity || !argument.resource.resource.value) {
             return fail(error, "pipeline sampler belongs to another runtime");
         }

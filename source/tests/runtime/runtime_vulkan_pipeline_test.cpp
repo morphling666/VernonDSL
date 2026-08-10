@@ -158,6 +158,9 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     VernonRhiImageUploadDescriptor upload{sizeof(VernonRhiImageUploadDescriptor),
                                           0,
                                           0,
+                                          0,
+                                          0,
+                                          0,
                                           1,
                                           1,
                                           1,
@@ -295,7 +298,14 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_TRUE(warmStats.lastDrawIndexed);
 
     std::vector<uint8_t> pixels(32 * 32 * 4);
-    ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, firstTarget.handle, pixels.data(), pixels.size()),
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.width = 32;
+    download.height = 32;
+    download.depth = 1;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, firstTarget.handle, &download, pixels.data(), pixels.size()),
               VERNON_RHI_STATUS_OK);
     bool rendered = false;
     for (size_t index = 0; index < pixels.size(); index += 4)
@@ -307,9 +317,11 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     ASSERT_TRUE(pixels[center + 2] > 90 && pixels[center + 2] < 110);
 
     std::vector<uint8_t> secondPixels(48 * 24 * 4);
-    ASSERT_EQ(
-        vernonRhiDeviceDownloadImage(context.device, secondTarget.handle, secondPixels.data(), secondPixels.size()),
-        VERNON_RHI_STATUS_OK);
+    download.width = 48;
+    download.height = 24;
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, secondTarget.handle, &download, secondPixels.data(),
+                                           secondPixels.size()),
+              VERNON_RHI_STATUS_OK);
     const size_t secondCenter = (9 * 48 + 16) * 4;
     EXPECT_TRUE(secondPixels[secondCenter] > 170 && secondPixels[secondCenter] < 190);
     EXPECT_TRUE(secondPixels[secondCenter + 1] > 30 && secondPixels[secondCenter + 1] < 50);
@@ -320,7 +332,11 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(secondPixels[outsideViewport + 2], 0u);
 
     std::vector<uint8_t> depthStencilPixels(32 * 32 * 8);
-    ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, firstDepth.handle, depthStencilPixels.data(),
+    download.width = 32;
+    download.height = 32;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_DEPTH_STENCIL;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_FLOAT32;
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, firstDepth.handle, &download, depthStencilPixels.data(),
                                            depthStencilPixels.size()),
               VERNON_RHI_STATUS_OK);
     EXPECT_EQ(depthStencilPixels[(16 * 32 + 16) * 8 + sizeof(float)], 3u);

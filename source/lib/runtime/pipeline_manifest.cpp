@@ -57,6 +57,24 @@ std::optional<VernonTextureDimension> pipelineTextureDimension(const std::string
     return std::nullopt;
 }
 
+std::optional<VernonTextureFormat> pipelineTextureFormat(const std::string &format) {
+    if (format == "r8_unorm")
+        return VERNON_TEXTURE_R8_UNORM;
+    if (format == "r16_float")
+        return VERNON_TEXTURE_R16_FLOAT;
+    if (format == "r32_float")
+        return VERNON_TEXTURE_R32_FLOAT;
+    if (format == "rg8_unorm")
+        return VERNON_TEXTURE_RG8_UNORM;
+    if (format == "rgba8_unorm")
+        return VERNON_TEXTURE_RGBA8_UNORM;
+    if (format == "rgba16_float")
+        return VERNON_TEXTURE_RGBA16_FLOAT;
+    if (format == "rgba32_float")
+        return VERNON_TEXTURE_RGBA32_FLOAT;
+    return std::nullopt;
+}
+
 namespace {
 
 bool parseUint32(const nlohmann::json &value, uint32_t &result);
@@ -72,12 +90,12 @@ template <size_t N> bool hasOnlyKeys(const nlohmann::json &value, const std::str
 
 constexpr std::string_view kVariantKeys[] = {"key", "program", "parameters", "internal_parameters", "outputs"};
 constexpr std::string_view kExternalParameterKeys[] = {
-    "slot",  "name",         "kind",           "type",  "uses",          "access",
-    "shape", "value_layout", "element_layout", "dtype", "address_space", "dimension",
+    "slot",         "name",           "kind",  "type",          "uses",      "access", "shape",
+    "value_layout", "element_layout", "dtype", "address_space", "dimension", "format",
 };
 constexpr std::string_view kInternalParameterKeys[] = {
-    "name",           "kind",  "type",          "uses",      "access", "shape",        "value_layout",
-    "element_layout", "dtype", "address_space", "dimension", "source", "system_value",
+    "name",           "kind",  "type",          "uses",      "access", "shape",  "value_layout",
+    "element_layout", "dtype", "address_space", "dimension", "format", "source", "system_value",
 };
 constexpr std::string_view kParameterUseKeys[] = {
     "stage",
@@ -703,6 +721,8 @@ struct ParsedLogicalParameterType {
     LogicalParameterTypeKind kind{LogicalParameterTypeKind::Invalid};
     std::string addressSpace;
     std::string textureDimension;
+    std::string textureFormat;
+    std::string textureAccess;
 };
 
 bool parseQuotedManifestToken(std::string_view text, size_t &cursor, std::string &token) {
@@ -771,6 +791,27 @@ bool parseTextureLogicalType(const std::string &type, ParsedLogicalParameterType
     while (cursor < type.size() && type[cursor] == ' ')
         ++cursor;
     if (cursor >= type.size() || type[cursor] != ',')
+        return false;
+    cursor = type.find(',', cursor + 1);
+    if (cursor == std::string::npos)
+        return false;
+    ++cursor;
+    while (cursor < type.size() && type[cursor] == ' ')
+        ++cursor;
+    if (!parseQuotedManifestToken(type, cursor, parsed.textureFormat))
+        return false;
+    while (cursor < type.size() && type[cursor] == ' ')
+        ++cursor;
+    if (cursor >= type.size() || type[cursor] != ',')
+        return false;
+    ++cursor;
+    while (cursor < type.size() && type[cursor] == ' ')
+        ++cursor;
+    if (!parseQuotedManifestToken(type, cursor, parsed.textureAccess))
+        return false;
+    while (cursor < type.size() && type[cursor] == ' ')
+        ++cursor;
+    if (cursor + 1 != type.size() || type[cursor] != '>')
         return false;
     parsed.kind = LogicalParameterTypeKind::Texture;
     return true;
@@ -1221,7 +1262,7 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
             return false;
         }
         for (std::string_view field :
-             {"name", "kind", "access", "dtype", "address_space", "dimension", "source", "system_value"})
+             {"name", "kind", "access", "dtype", "address_space", "dimension", "format", "source", "system_value"})
             if (row.contains(std::string(field)) && !row[std::string(field)].is_string()) {
                 error = "pipeline parameter string metadata has an invalid type";
                 return false;
@@ -1233,6 +1274,7 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
         parameter.access = row["access"].get<std::string>();
         parameter.addressSpace = row.value("address_space", "");
         parameter.dimension = row.value("dimension", "");
+        parameter.format = row.value("format", "");
         for (const nlohmann::json &dimension : row["shape"]) {
             uint64_t extent = 0;
             if (!parseUint64(dimension, extent)) {
@@ -1265,6 +1307,18 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
         if (parameter.kind == "texture") {
             if (!pipelineTextureDimension(parameter.dimension)) {
                 error = "texture parameter has an invalid dimension";
+                return false;
+            }
+            if (!parameter.format.empty() && !pipelineTextureFormat(parameter.format)) {
+                error = "texture parameter has an invalid format";
+                return false;
+            }
+            const std::string expectedFormat =
+                parsedType.textureFormat == "unknown" ? std::string{} : parsedType.textureFormat;
+            const std::string expectedAccess =
+                parsedType.textureAccess == "sampled" ? std::string{"read"} : parsedType.textureAccess;
+            if (parameter.format != expectedFormat || parameter.access != expectedAccess) {
+                error = "texture parameter constraints do not match its logical type";
                 return false;
             }
         } else if (!parameter.dimension.empty()) {

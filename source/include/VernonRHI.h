@@ -163,7 +163,9 @@ typedef enum VernonRhiImageDimension {
 
 typedef enum VernonRhiImageDataType {
     VERNON_RHI_IMAGE_DATA_UINT8 = 0,
-    VERNON_RHI_IMAGE_DATA_FLOAT32 = 1
+    VERNON_RHI_IMAGE_DATA_FLOAT16 = 1,
+    VERNON_RHI_IMAGE_DATA_FLOAT32 = 2,
+    VERNON_RHI_IMAGE_DATA_UINT32 = 3
 } VernonRhiImageDataType;
 
 typedef enum VernonRhiImageDataFormat {
@@ -295,6 +297,9 @@ typedef struct VernonRhiImageUploadDescriptor {
     uint32_t struct_size;
     uint32_t mip_level;
     uint32_t array_layer;
+    uint32_t offset_x;
+    uint32_t offset_y;
+    uint32_t offset_z;
     uint32_t width;
     uint32_t height;
     uint32_t depth;
@@ -303,6 +308,21 @@ typedef struct VernonRhiImageUploadDescriptor {
     const void *data;
     uint32_t reserved[4];
 } VernonRhiImageUploadDescriptor;
+
+typedef struct VernonRhiImageDownloadDescriptor {
+    uint32_t struct_size;
+    uint32_t mip_level;
+    uint32_t array_layer;
+    uint32_t offset_x;
+    uint32_t offset_y;
+    uint32_t offset_z;
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;
+    VernonRhiImageDataFormat destination_format;
+    VernonRhiImageDataType destination_type;
+    uint32_t reserved[4];
+} VernonRhiImageDownloadDescriptor;
 
 typedef struct VernonRhiShaderModuleDescriptor {
     uint32_t struct_size;
@@ -592,6 +612,7 @@ VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceUploadImage(VernonRhiDevice devic
                                                            const VernonRhiImageUploadDescriptor *uploads,
                                                            size_t upload_count);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceDownloadImage(VernonRhiDevice device, VernonRhiImage image,
+                                                             const VernonRhiImageDownloadDescriptor *descriptor,
                                                              void *destination, size_t size);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceGenerateImageMipmaps(VernonRhiDevice device, VernonRhiImage image);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceBindImage(VernonRhiDevice device, VernonRhiImage image,

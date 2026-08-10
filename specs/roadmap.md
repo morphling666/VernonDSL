@@ -270,6 +270,35 @@ tuning are not current Metal roadmap commitments.
 Any further public RHI, Provider, or RuntimeCore layout cleanup requires an
 intentional pipeline contract bump and migration of every enabled backend.
 
+### Texture follow-up
+
+The accepted long-term resource, view, binding, provider, and RHI direction is
+defined in
+[`Image resource architecture`](runtime/image_resources.md). Its migration is
+post-0.1.2 and requires an intentional pipeline contract revision; the current
+flattened invocation and provider records are not the target architecture.
+
+The 0.1.2 texture work does not include a public shader-visible image-view API.
+Regional upload and download remain transfer operations and do not imply shader
+view aliasing. Complete image views later as separate, reviewable changes:
+
+1. define the Python and native view semantics for mip ranges, array/cube
+   layers, format compatibility, ownership, and resource lifetime;
+2. implement and test owned Vulkan, Metal, and DirectX 12 views;
+3. implement OpenGL views only for OpenGL 4.3 or `ARB_texture_view`, while older
+   OpenGL and OpenGL ES continue to support transfer-region slicing only;
+4. connect views to sampled/storage bindings and add cross-backend acceptance
+   tests.
+
+DirectX 12 mip generation also remains separate work. Add an internal compute
+shader, compile it during the build/release process, embed the generated shader
+artifact, and cover 2D and 3D mip chains on Windows hardware. Do not add a
+runtime shader-compiler dependency.
+
+Keep these as independent commits: image-view contract, one backend per view
+implementation, binding integration, and DirectX 12 mip generation must not be
+combined into one texture feature commit.
+
 ### Asynchronous GPU resource lifetime
 
 Deferred reclamation activates only when at least one product requirement is
