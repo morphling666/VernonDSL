@@ -64,7 +64,7 @@ VernonLoadedPipeline *loadBackendCpuAutodiffPipeline(
         }
         if (!ad::validateDerivativeGroupsAgainstSignature(context, derivativeGroups, executable->signature()))
             return nullptr;
-        pipeline->autodiff = VernonLoadedAutodiff{std::move(executable), {}, derivativeGroups};
+        pipeline->autodiff = VernonLoadedAutodiff{std::move(executable), derivativeGroups};
         return pipeline.release();
     } catch (...) {
         try {

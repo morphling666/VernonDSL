@@ -1,6 +1,7 @@
 #include "vernon-c/Runtime.h"
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -11,7 +12,7 @@ static VernonStatus fill_grid(const VernonCpuInvocation *invocation) {
     memcpy(&address, invocation->arguments, sizeof(address));
     memcpy(gid, (const unsigned char *)invocation->arguments + 8, sizeof(gid));
     float *values = (float *)address;
-    values[gid[2] * 6 + gid[1] * 3 + gid[0]] = (float)(gid[0] + 10 * gid[1] + 100 * gid[2]);
+    values[gid[2] * 8 + gid[1] * 4 + gid[0]] = (float)(gid[0] + 10 * gid[1] + 100 * gid[2]);
     return VERNON_STATUS_OK;
 }
 
@@ -34,8 +35,9 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
         "{" VERNON_JSON_VERSION_FIELDS ",\"entries\":[{\"name\":\"fill\","
         "\"physical_layouts\":{\"host_value\":{\"profile\":\"host_value\","
         "\"packed_arguments_size\":20}},"
-        "\"workgroup_size\":[2,2,1],\"arguments\":["
-        "{\"kind\":\"tensor\",\"dtype\":\"f32\",\"shape\":[12],"
+        "\"workgroup_size\":[2,2,1],"
+        "\"dispatch_contract\":{\"unit_grid_axes\":[],\"requires_unit_workgroup\":false},\"arguments\":["
+        "{\"kind\":\"tensor\",\"dtype\":\"f32\",\"shape\":[16],"
         "\"element_layout\":{\"logical_type\":\"f32\",\"byte_size\":4,"
         "\"alignment\":4,\"layout_hash\":"
         "\"cb580e347f23fbe3afbd1c5f72b4d2339b09e33d876f79e9d290445edb43c03b\","
@@ -60,9 +62,9 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     VernonLoadedPipeline *pipeline =
         vernonRuntimeLoadCpuEntry(runtime, fill_grid, reflection, sizeof(reflection) - 1, "fill", 4);
     ASSERT_TRUE(pipeline);
-    uint64_t shape[] = {12};
+    uint64_t shape[] = {16};
     int64_t strides[] = {4};
-    float values[12] = {0};
+    float values[16] = {0};
     VernonPipelineArgument argument = {};
     argument.slot = 0;
     argument.kind = VERNON_PIPELINE_TENSOR;
@@ -74,8 +76,8 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     argument.tensor.rank = 1;
     argument.tensor.shape = shape;
     argument.tensor.byte_strides = strides;
-    argument.tensor.byte_size = 12 * sizeof(float);
-    VernonLaunchSize grid = {3, 2, 2};
+    argument.tensor.byte_size = 16 * sizeof(float);
+    VernonLaunchSize grid = {2, 1, 2};
     VernonPipelineInvocation invocation = {};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
@@ -83,8 +85,34 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     invocation.argument_count = 1;
     invocation.compute_grid = grid;
     ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
-    ASSERT_TRUE(values[0] == 0.0f && values[2] == 2.0f);
-    ASSERT_TRUE(values[3] == 10.0f && values[11] == 112.0f);
+    ASSERT_TRUE(values[0] == 0.0f && values[3] == 3.0f);
+    ASSERT_TRUE(values[4] == 10.0f && values[15] == 113.0f);
+
+    nlohmann::json constrainedJson = nlohmann::json::parse(reflection);
+    constrainedJson["entries"][0]["workgroup_size"] = {2, 1, 1};
+    constrainedJson["entries"][0]["dispatch_contract"] = {{"unit_grid_axes", {1, 2}},
+                                                          {"requires_unit_workgroup", false}};
+    const std::string constrainedReflection = constrainedJson.dump();
+    VernonLoadedPipeline *constrainedPipeline = vernonRuntimeLoadCpuEntry(
+        runtime, fill_grid, constrainedReflection.data(), constrainedReflection.size(), "fill", 4);
+    ASSERT_NE(constrainedPipeline, nullptr);
+    EXPECT_EQ(vernonRuntimePipelineInvoke(constrainedPipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
+    invocation.compute_grid = {2, 1, 1};
+    EXPECT_EQ(vernonRuntimePipelineInvoke(constrainedPipeline, &invocation), VERNON_STATUS_OK);
+    vernonRuntimeLoadedPipelineDestroy(constrainedPipeline);
+
+    constrainedJson["entries"][0]["workgroup_size"] = {1, 1, 1};
+    constrainedJson["entries"][0]["dispatch_contract"] = {{"unit_grid_axes", {0, 1, 2}},
+                                                          {"requires_unit_workgroup", true}};
+    const std::string singleInvocationReflection = constrainedJson.dump();
+    VernonLoadedPipeline *singleInvocationPipeline = vernonRuntimeLoadCpuEntry(
+        runtime, fill_grid, singleInvocationReflection.data(), singleInvocationReflection.size(), "fill", 4);
+    ASSERT_NE(singleInvocationPipeline, nullptr);
+    EXPECT_EQ(vernonRuntimePipelineInvoke(singleInvocationPipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
+    invocation.compute_grid = {1, 1, 1};
+    EXPECT_EQ(vernonRuntimePipelineInvoke(singleInvocationPipeline, &invocation), VERNON_STATUS_OK);
+    vernonRuntimeLoadedPipelineDestroy(singleInvocationPipeline);
+
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_INVALID_ARGUMENT);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
 

@@ -29,7 +29,7 @@ module attributes {$VERNON_VERSION_ATTRIBUTES} {
         vernon.set = 0 : i64,
         vernon.binding = 0 : i64
       },
-      %id: index {
+      %id: tensor<3xi32> {
         vernon.interface = "input",
         vernon.builtin = "global_invocation_id"
       }) attributes {
@@ -41,11 +41,14 @@ module attributes {$VERNON_VERSION_ATTRIBUTES} {
           {kind = "write", owner = "values", region = "unknown"}
         ]
       } {
-    %value = "vernon.load"(%values, %id) :
+    %zero = arith.constant 0 : index
+    %id_i32 = tensor.extract %id[%zero] : tensor<3xi32>
+    %id_x = arith.index_castui %id_i32 : i32 to index
+    %value = "vernon.load"(%values, %id_x) :
         (!vernon.tensor_view<f32, [3], "read_write", "device">, index) -> f32
     %one = arith.constant 1.0 : f32
     %sum = arith.addf %value, %one : f32
-    "vernon.store"(%sum, %values, %id) :
+    "vernon.store"(%sum, %values, %id_x) :
         (f32, !vernon.tensor_view<f32, [3], "read_write", "device">, index) -> ()
     return
   }
@@ -53,6 +56,30 @@ module attributes {$VERNON_VERSION_ATTRIBUTES} {
 """)
 
 DYNAMIC_CPU_MODULE = CPU_MODULE.replace("[3]", "[-1]")
+
+CONSTANT_WRITE_CPU_MODULE = _versioned(r"""
+module attributes {$VERNON_VERSION_ATTRIBUTES} {
+  func.func @constant_write(
+      %values: !vernon.tensor_view<f32, [1], "write", "device"> {
+        vernon.interface = "resource",
+        vernon.set = 0 : i64,
+        vernon.binding = 0 : i64
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 1, 1, 1>,
+        vernon.storage_effects = [
+          {kind = "write", owner = "values", region = "element", indices = array<i64: 0>}
+        ]
+      } {
+    %zero = arith.constant 0 : index
+    %one = arith.constant 1.0 : f32
+    "vernon.store"(%one, %values, %zero) :
+        (f32, !vernon.tensor_view<f32, [1], "write", "device">, index) -> ()
+    return
+  }
+}
+""")
 
 MULTI_ENTRY_MODULE = _versioned(r"""
 module attributes {$VERNON_VERSION_ATTRIBUTES} {
@@ -309,6 +336,23 @@ class CompiledProgramTests(unittest.TestCase):
         _bind_native_argument(invocation, pipeline.parameters[0], values)
         invocation.grid(3, 1, 1).invoke()
         np.testing.assert_array_equal(values.to_numpy(), np.array([3.0, 5.0, 7.0], dtype=np.float32))
+
+    def test_cpu_constant_write_requires_single_invocation(self) -> None:
+        program = native.Compiler().compile_program_result(CONSTANT_WRITE_CPU_MODULE, native.Target.CPU)
+        self.assertTrue(program.ok, program.diagnostics)
+        runtime = native.Runtime(native.RuntimeBackend.CPU)
+        pipeline = runtime.load_cpu_entry(program, "constant_write")
+        values = vd.storage.from_numpy(np.array([0.0], dtype=np.float32))
+
+        invocation = pipeline.invocation_builder()
+        _bind_native_argument(invocation, pipeline.parameters[0], values)
+        invocation.grid(1, 1, 1).invoke()
+        np.testing.assert_array_equal(values.to_numpy(), np.array([1.0], dtype=np.float32))
+
+        invocation = pipeline.invocation_builder()
+        _bind_native_argument(invocation, pipeline.parameters[0], values)
+        with self.assertRaisesRegex(RuntimeError, "dispatch grid axis 0 must equal 1"):
+            invocation.grid(2, 1, 1).invoke()
 
     def test_cpu_profile_batch_compilation_preserves_order_and_options(self) -> None:
         programs = native._compile_cpu_program_results(

@@ -1,6 +1,5 @@
 #include "runtime/autodiff/host_effect_transaction.h"
 #include "runtime/autodiff/host_tape_allocator.h"
-#include "runtime/autodiff/runtime_autodiff_internal.h"
 #include "runtime/runtime_state.h"
 
 #include <gtest/gtest.h>
@@ -11,7 +10,6 @@
 #include <memory>
 #include <string>
 #include <thread>
-#include <vector>
 
 namespace {
 
@@ -186,6 +184,81 @@ TEST(RuntimeAutodiffTapeAllocator, RetainsSharedMemoryPolicyChargeUntilSnapshotR
     ASSERT_EQ(allocator.begin_region(&allocator, VERNON_AD_INVALID_REGION_HANDLE, &region),
               VERNON_AD_TAPE_ALLOCATOR_OK);
     EXPECT_EQ(allocator.reserve_record(&allocator, region, 1, 1, 0, &record), VERNON_AD_TAPE_ALLOCATOR_OK);
+}
+
+TEST(RuntimeAutodiffTapeAllocator, DispatchBudgetAllowsUnevenInvocationUsage) {
+    using namespace vernon::runtime::ad;
+    auto policy = std::make_shared<HostTapeMemoryPolicy>(16, 16);
+    std::shared_ptr<HostTapeDispatchBudget> budget = HostTapeDispatchBudget::reserve(policy, 16);
+    ASSERT_NE(budget, nullptr);
+    ASSERT_EQ(budget->capacity(), 16u);
+
+    std::shared_ptr<const HostTapeSnapshot> largeSnapshot;
+    std::shared_ptr<const HostTapeSnapshot> smallSnapshot;
+    {
+        HostDynamicTape large(16, policy, budget);
+        VernonAdTapeAllocator &largeAllocator = large.descriptor();
+        VernonAdRegionHandle largeRegion = VERNON_AD_INVALID_REGION_HANDLE;
+        VernonAdRecordHandle largeRecord = VERNON_AD_INVALID_RECORD_HANDLE;
+        ASSERT_EQ(largeAllocator.begin_region(&largeAllocator, VERNON_AD_INVALID_REGION_HANDLE, &largeRegion),
+                  VERNON_AD_TAPE_ALLOCATOR_OK);
+        ASSERT_EQ(largeAllocator.reserve_record(&largeAllocator, largeRegion, 12, 1, 0, &largeRecord),
+                  VERNON_AD_TAPE_ALLOCATOR_OK);
+        ASSERT_EQ(largeAllocator.end_region(&largeAllocator, largeRegion, 1, 0), VERNON_AD_TAPE_ALLOCATOR_OK);
+        ASSERT_EQ(largeAllocator.seal(&largeAllocator), VERNON_AD_TAPE_ALLOCATOR_OK);
+        largeSnapshot = large.takeSnapshot();
+        ASSERT_NE(largeSnapshot, nullptr);
+
+        HostDynamicTape small(16, policy, budget);
+        VernonAdTapeAllocator &smallAllocator = small.descriptor();
+        VernonAdRegionHandle smallRegion = VERNON_AD_INVALID_REGION_HANDLE;
+        VernonAdRecordHandle smallRecord = VERNON_AD_INVALID_RECORD_HANDLE;
+        ASSERT_EQ(smallAllocator.begin_region(&smallAllocator, VERNON_AD_INVALID_REGION_HANDLE, &smallRegion),
+                  VERNON_AD_TAPE_ALLOCATOR_OK);
+        ASSERT_EQ(smallAllocator.reserve_record(&smallAllocator, smallRegion, 4, 1, 0, &smallRecord),
+                  VERNON_AD_TAPE_ALLOCATOR_OK);
+        ASSERT_EQ(smallAllocator.end_region(&smallAllocator, smallRegion, 1, 0), VERNON_AD_TAPE_ALLOCATOR_OK);
+        ASSERT_EQ(smallAllocator.seal(&smallAllocator), VERNON_AD_TAPE_ALLOCATOR_OK);
+        smallSnapshot = small.takeSnapshot();
+        ASSERT_NE(smallSnapshot, nullptr);
+    }
+
+    EXPECT_EQ(budget->usedBytes(), 16u);
+    budget->commit();
+    HostDynamicTape blocked(16, policy);
+    VernonAdTapeAllocator &blockedAllocator = blocked.descriptor();
+    VernonAdRegionHandle blockedRegion = VERNON_AD_INVALID_REGION_HANDLE;
+    VernonAdRecordHandle blockedRecord = VERNON_AD_INVALID_RECORD_HANDLE;
+    ASSERT_EQ(blockedAllocator.begin_region(&blockedAllocator, VERNON_AD_INVALID_REGION_HANDLE, &blockedRegion),
+              VERNON_AD_TAPE_ALLOCATOR_OK);
+    EXPECT_EQ(blockedAllocator.reserve_record(&blockedAllocator, blockedRegion, 1, 1, 0, &blockedRecord),
+              VERNON_AD_TAPE_ALLOCATOR_CAPACITY_EXHAUSTED);
+
+    largeSnapshot.reset();
+    smallSnapshot.reset();
+    budget.reset();
+    ASSERT_EQ(blockedAllocator.reset(&blockedAllocator), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(blockedAllocator.begin_region(&blockedAllocator, VERNON_AD_INVALID_REGION_HANDLE, &blockedRegion),
+              VERNON_AD_TAPE_ALLOCATOR_OK);
+    EXPECT_EQ(blockedAllocator.reserve_record(&blockedAllocator, blockedRegion, 1, 1, 0, &blockedRecord),
+              VERNON_AD_TAPE_ALLOCATOR_OK);
+}
+
+TEST(RuntimeAutodiffTapeAllocator, DispatchReservationsAtomicallyPartitionContextBudget) {
+    using namespace vernon::runtime::ad;
+    auto policy = std::make_shared<HostTapeMemoryPolicy>(16, 16);
+    std::shared_ptr<HostTapeDispatchBudget> first = HostTapeDispatchBudget::reserve(policy, 10);
+    std::shared_ptr<HostTapeDispatchBudget> second = HostTapeDispatchBudget::reserve(policy, 10);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(first->capacity(), 10u);
+    EXPECT_EQ(second->capacity(), 6u);
+    EXPECT_EQ(HostTapeDispatchBudget::reserve(policy, 1), nullptr);
+
+    first->commit();
+    std::shared_ptr<HostTapeDispatchBudget> replacement = HostTapeDispatchBudget::reserve(policy, 10);
+    ASSERT_NE(replacement, nullptr);
+    EXPECT_EQ(replacement->capacity(), 10u);
 }
 
 TEST(RuntimeAutodiffTapeAllocator, RejectsCopiedDescriptorWithoutTrustingUserData) {

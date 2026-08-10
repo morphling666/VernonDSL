@@ -48,7 +48,7 @@ def paint(
 
 vd.init(arch=vd.cuda)
 pixels = vd.storage.zeros(dtype=vd.f32, shape=(HEIGHT, WIDTH))
-paint(pixels, 0.0, grid=(WIDTH, HEIGHT, 1))
+paint(pixels, 0.0, grid=(WIDTH // 16, HEIGHT // 16, 1))
 image = pixels.to_numpy()
 ```
 

@@ -11,6 +11,7 @@
 
 struct VernonCompilerContext {
     vernon::compiler::CompilerFrontend *frontend{};
+    VernonCpuRuntimeHelpersV1 cpuRuntimeHelpers{};
 };
 
 struct VernonCompileResult {
@@ -44,6 +45,16 @@ std::unique_ptr<VernonCompileResult> validate(VernonCompilerContext *context, co
 } // namespace
 
 extern "C" {
+
+VernonStatus vernonCompilerRegisterCpuRuntimeHelpersV1(VernonCompilerContext *context,
+                                                       const VernonCpuRuntimeHelpersV1 *helpers) {
+    if (!context || !helpers || helpers->struct_size != sizeof(VernonCpuRuntimeHelpersV1) ||
+        !helpers->workgroup_address || !helpers->lane_address || !helpers->workgroup_barrier ||
+        !helpers->workgroup_is_leader)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    context->cpuRuntimeHelpers = *helpers;
+    return VERNON_STATUS_OK;
+}
 
 VernonCompilerContext *vernonCompilerCreate(void) {
     std::unique_ptr<VernonCompilerContext> context(new (std::nothrow) VernonCompilerContext());
@@ -99,8 +110,9 @@ VernonCompileResult *vernonCompilerCompileMlirWithOptions(VernonCompilerContext 
         result->artifacts.clear();
         return result.release();
     }
-    result->status = vernon::compiler::compileTarget(*prepared, parsedOptions, result->artifacts, result->reflection,
-                                                     result->diagnostics, result->cpuExecution);
+    result->status =
+        vernon::compiler::compileTarget(*prepared, parsedOptions, result->artifacts, result->reflection,
+                                        result->diagnostics, &context->cpuRuntimeHelpers, result->cpuExecution);
     return result.release();
 }
 

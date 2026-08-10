@@ -1,3 +1,5 @@
+from typing import Annotated
+
 import vernon_dsl as vd
 
 
@@ -205,9 +207,9 @@ aggregate_multi_output_objective_vjp = vd.ad.vjp(
 @vd.kernel
 def storage_objective(
     values: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
-    loss: vd.TensorView[vd.f32, (1,), vd.write],
+    loss: vd.TensorView[vd.f32, (1,), vd.read_write],
 ) -> None:
-    loss[0] = values[0] * values[0] + values[1]
+    vd.atomic_add(loss, 0, values[0] * values[0] + values[1])
 
 
 storage_objective_vjp = vd.ad.vjp(
@@ -236,11 +238,12 @@ aliased_inputs_objective_vjp = vd.ad.vjp(
 @vd.kernel
 def scratch_objective(
     values: vd.TensorView[vd.f32, (1,), vd.read],
-    scratch: vd.TensorView[vd.f32, (1,), vd.read_write],
-    loss: vd.TensorView[vd.f32, (1,), vd.write],
+    scratch: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn), vd.read_write],
+    loss: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
-    scratch[0] = values[0] * 2.0
-    loss[0] = scratch[0] * scratch[0]
+    scratch[gid[0], gid[1], gid[2]] = values[0] * 2.0
+    loss[gid[0], gid[1], gid[2]] = scratch[gid[0], gid[1], gid[2]] * scratch[gid[0], gid[1], gid[2]]
 
 
 scratch_objective_vjp = vd.ad.vjp(
@@ -253,12 +256,13 @@ scratch_objective_vjp = vd.ad.vjp(
 @vd.kernel
 def overwrite_objective(
     values: vd.TensorView[vd.f32, (1,), vd.read],
-    scratch: vd.TensorView[vd.f32, (1,), vd.read_write],
-    loss: vd.TensorView[vd.f32, (1,), vd.write],
+    scratch: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn), vd.read_write],
+    loss: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
-    scratch[0] = values[0] * 2.0
-    scratch[0] = values[0] * 3.0
-    loss[0] = scratch[0] * scratch[0]
+    scratch[gid[0], gid[1], gid[2]] = values[0] * 2.0
+    scratch[gid[0], gid[1], gid[2]] = values[0] * 3.0
+    loss[gid[0], gid[1], gid[2]] = scratch[gid[0], gid[1], gid[2]] * scratch[gid[0], gid[1], gid[2]]
 
 
 overwrite_objective_vjp = vd.ad.vjp(
@@ -271,12 +275,13 @@ overwrite_objective_vjp = vd.ad.vjp(
 @vd.kernel
 def vector_scratch_objective(
     values: vd.TensorView[vd.f32, (1,), vd.read],
-    scratch: vd.TensorView[vd.Vector[vd.f32, 2], (1,), vd.read_write],
-    loss: vd.TensorView[vd.f32, (1,), vd.write],
+    scratch: vd.TensorView[vd.Vector[vd.f32, 2], (vd.dyn, vd.dyn, vd.dyn), vd.read_write],
+    loss: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
-    scratch[0] = vd.Vector([values[0] * 2.0, values[0] * 3.0])
-    value = scratch[0]
-    loss[0] = value.x * value.x + value.y * value.y
+    scratch[gid[0], gid[1], gid[2]] = vd.Vector([values[0] * 2.0, values[0] * 3.0])
+    value = scratch[gid[0], gid[1], gid[2]]
+    loss[gid[0], gid[1], gid[2]] = value.x * value.x + value.y * value.y
 
 
 vector_scratch_objective_vjp = vd.ad.vjp(
@@ -289,16 +294,17 @@ vector_scratch_objective_vjp = vd.ad.vjp(
 @vd.kernel
 def loop_scratch_objective(
     values: vd.TensorView[vd.f32, (2,), vd.read],
-    scratch: vd.TensorView[vd.f32, (2,), vd.read_write],
-    output: vd.TensorView[vd.f32, (1,), vd.write],
+    scratch: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn, 2), vd.read_write],
+    output: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     for index in range(2):
-        scratch[index] = values[index] * 2.0
+        scratch[gid[0], gid[1], gid[2], index] = values[index] * 2.0
     loss = 0.0
     for index in range(2):
-        value = scratch[index]
+        value = scratch[gid[0], gid[1], gid[2], index]
         loss = loss + value * value
-    output[0] = loss
+    output[gid[0], gid[1], gid[2]] = loss
 
 
 loop_scratch_objective_vjp = vd.ad.vjp(
@@ -311,15 +317,16 @@ loop_scratch_objective_vjp = vd.ad.vjp(
 @vd.kernel
 def branch_scratch_objective(
     values: vd.TensorView[vd.f32, (1,), vd.read],
-    scratch: vd.TensorView[vd.f32, (1,), vd.read_write],
-    output: vd.TensorView[vd.f32, (1,), vd.write],
+    scratch: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn), vd.read_write],
+    output: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     if values[0] > 0.0:
-        scratch[0] = values[0] * 2.0
+        scratch[gid[0], gid[1], gid[2]] = values[0] * 2.0
     else:
-        scratch[0] = values[0] * 3.0
-    value = scratch[0]
-    output[0] = value * value
+        scratch[gid[0], gid[1], gid[2]] = values[0] * 3.0
+    value = scratch[gid[0], gid[1], gid[2]]
+    output[gid[0], gid[1], gid[2]] = value * value
 
 
 branch_scratch_objective_vjp = vd.ad.vjp(
@@ -371,17 +378,18 @@ dynamic_gather_objective_vjp = vd.ad.vjp(
 @vd.kernel
 def dynamic_scratch_gather_objective(
     values: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
-    scratch: vd.TensorView[vd.f32, (vd.dyn,), vd.read_write],
+    scratch: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn, vd.dyn), vd.read_write],
     count: vd.i32,
-    output: vd.TensorView[vd.f32, (1,), vd.write],
+    output: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     for index in range(count):
-        scratch[index] = values[index]
+        scratch[gid[0], gid[1], gid[2], index] = values[index]
     loss = 0.0
     for index in range(count):
-        value = scratch[index]
+        value = scratch[gid[0], gid[1], gid[2], index]
         loss = loss + value * value
-    output[0] = loss
+    output[gid[0], gid[1], gid[2]] = loss
 
 
 dynamic_scratch_gather_objective_vjp = vd.ad.vjp(
@@ -394,21 +402,22 @@ dynamic_scratch_gather_objective_vjp = vd.ad.vjp(
 @vd.kernel
 def nested_dynamic_scratch_objective(
     values: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
-    scratch: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.read_write],
+    scratch: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn, vd.dyn, vd.dyn), vd.read_write],
     width: vd.i32,
     height: vd.i32,
-    output: vd.TensorView[vd.f32, (1,), vd.write],
+    output: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     for y in range(height):
         for x in range(width):
             index = vd.i32(vd.f32(x) * 4.0 / vd.f32(width))
-            scratch[y, x] = values[index]
+            scratch[gid[0], gid[1], gid[2], y, x] = values[index]
     loss = 0.0
     for y in range(height):
         for x in range(width):
-            value = scratch[y, x]
+            value = scratch[gid[0], gid[1], gid[2], y, x]
             loss = loss + value * value
-    output[0] = loss
+    output[gid[0], gid[1], gid[2]] = loss
 
 
 nested_dynamic_scratch_objective_vjp = vd.ad.vjp(
@@ -446,11 +455,12 @@ nested_branch_accumulation_objective_vjp = vd.ad.vjp(
 @vd.kernel
 def dynamic_while_objective(
     values: vd.TensorView[vd.f32, (1,), vd.read],
-    scratch: vd.TensorView[vd.f32, (1,), vd.read_write],
+    scratch: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn), vd.read_write],
     limit: vd.i32,
     start: vd.i32,
     stop: vd.i32,
-    output: vd.TensorView[vd.f32, (1,), vd.write],
+    output: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     accumulated = 0.0
     index = 0
@@ -460,9 +470,9 @@ def dynamic_while_objective(
             break
         if index < start:
             continue
-        scratch[0] = values[0] * 0.5
-        accumulated = accumulated + scratch[0]
-    output[0] = accumulated * accumulated
+        scratch[gid[0], gid[1], gid[2]] = values[0] * 0.5
+        accumulated = accumulated + scratch[gid[0], gid[1], gid[2]]
+    output[gid[0], gid[1], gid[2]] = accumulated * accumulated
 
 
 dynamic_while_objective_vjp = vd.ad.vjp(

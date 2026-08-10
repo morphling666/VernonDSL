@@ -611,9 +611,7 @@ VernonStatus invokeVulkanComputePipeline(VernonLoadedPipeline &pipeline, const P
                                               state.rhiComputeValues.size(), &state.rhiComputeBindings);
     if (status != VERNON_STATUS_OK)
         return fail(*pipeline.context, "failed to prepare Vulkan invocation bindings", status);
-    const uint32_t groups[3]{(launch.grid.x - 1) / state.rhiComputeWorkgroup[0] + 1,
-                             (launch.grid.y - 1) / state.rhiComputeWorkgroup[1] + 1,
-                             (launch.grid.z - 1) / state.rhiComputeWorkgroup[2] + 1};
+    const uint32_t groups[3]{launch.grid.x, launch.grid.y, launch.grid.z};
     status = vernonRuntimeCoreEncodeDispatch(state.rhiComputePipeline, state.rhiComputeBindings, launch.commandEncoder,
                                              groups, nullptr, 0);
     return status == VERNON_STATUS_OK ? status

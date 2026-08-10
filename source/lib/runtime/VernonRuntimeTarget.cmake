@@ -168,11 +168,10 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/host_tape_allocator.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff_cpu.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff_gpu.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff_graph.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_direct_autodiff.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/backend_cpu.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/backend_opengl.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/cpu_workgroup_dispatch.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_backend_dispatch.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_cpu.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_cuda.cpp
@@ -260,7 +259,6 @@ function(vernon_add_runtime)
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonOpenGLContext.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.hpp
-              ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonAutodiffGraph.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonExecutionGraph.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntime.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntime.hpp

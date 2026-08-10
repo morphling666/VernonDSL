@@ -229,7 +229,10 @@ bool compileSpirv(PreparedModule &prepared, VernonTarget target, std::vector<Art
     mlir::OwningOpRef<mlir::ModuleOp> module = std::move(preparedTarget->module);
     {
         mlir::PassManager passManager(&context);
-        passManager.addPass(mlir::vernon::createVernonLowerAccumulationPass());
+        passManager.addPass(mlir::vernon::createVernonLowerAccumulationPass(
+            mlir::vernon::AccumulationTargetCapabilities{/*supportsF32AtomicAdd=*/false,
+                                                         /*supportsF64AtomicAdd=*/false,
+                                                         mlir::vernon::AggregateGradientStorage::Shared}));
         if (mlir::failed(passManager.run(*module)))
             return false;
     }
@@ -251,10 +254,8 @@ bool compileSpirv(PreparedModule &prepared, VernonTarget target, std::vector<Art
     }
 
     mlir::PassManager passManager(&context);
-    // The portable SPIR-V environment currently advertises Shader only; it
-    // does not promise floating-point atomic-add extensions.
     passManager.addPass(mlir::vernon::createVernonToGPUPass(true));
-    passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerSynchronizationPass(true, true));
+    passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerGPUSynchronizationPass(true));
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerGPUTensorsPass(true));
     passManager.addPass(mlir::vernon::createVernonConvertGPUToSPIRVPass());
     passManager.addPass(mlir::vernon::createVernonToSPIRVPass(target == VERNON_TARGET_VULKAN));

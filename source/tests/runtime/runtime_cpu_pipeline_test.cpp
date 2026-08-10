@@ -53,7 +53,7 @@ VernonStatus staticallyLinkedFill(const VernonCpuInvocation *invocation) {
     std::memcpy(&address, invocation->arguments, sizeof(address));
     std::memcpy(gid, static_cast<const unsigned char *>(invocation->arguments) + 8, sizeof(gid));
     float *values = reinterpret_cast<float *>(address);
-    values[gid[2] * 6 + gid[1] * 3 + gid[0]] = static_cast<float>(gid[0] + 10 * gid[1] + 100 * gid[2]);
+    values[gid[2] * 8 + gid[1] * 4 + gid[0]] = static_cast<float>(gid[0] + 10 * gid[1] + 100 * gid[2]);
     return VERNON_STATUS_OK;
 }
 
@@ -142,7 +142,8 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     ASSERT_TRUE(!vernonRuntimeLoadPipelineBundleWithOptions(runtime, bundle.data(), bundle.size(), nullptr));
 
     VernonPipelineBundle *loaded = loadWithDirectory(runtime, bundle, directoryUtf8);
-    ASSERT_TRUE(loaded);
+    const VernonStringView loadError = vernonRuntimeGetLastError(runtime);
+    ASSERT_TRUE(loaded) << std::string(loadError.data ? loadError.data : "", loadError.size);
 
     const std::string objectBytes = "test relocatable object";
     const std::filesystem::path objectPath = directory / "test_static.o";
@@ -156,8 +157,24 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     objectStage["artifact"]["path"] = objectPath.filename().string();
     objectStage["artifact"]["size"] = objectBytes.size();
     objectStage["artifact"]["sha256"] = vernon::runtime::sha256Hex(objectBytes.data(), objectBytes.size());
+    objectStage["symbol"] = "vernon_missing_static_fill";
     objectBundle.erase("content_hash");
     std::string objectCanonical = objectBundle.dump(-1, ' ', false);
+    objectBundle["content_hash"] = vernon::runtime::sha256Hex(objectCanonical.data(), objectCanonical.size());
+    const std::string missingObjectManifest = objectBundle.dump(-1, ' ', false);
+    VernonPipelineBundle *missingObjectLoaded = loadWithDirectory(runtime, missingObjectManifest, directoryUtf8);
+    ASSERT_TRUE(missingObjectLoaded);
+    EXPECT_EQ(vernonRuntimeResolvePipeline(missingObjectLoaded, {nullptr, 0}), nullptr);
+    const VernonStringView missingRegistrationError = vernonRuntimeGetLastError(runtime);
+    EXPECT_NE(
+        std::string(missingRegistrationError.data ? missingRegistrationError.data : "", missingRegistrationError.size)
+            .find("was not statically registered"),
+        std::string::npos);
+    vernonRuntimePipelineBundleDestroy(missingObjectLoaded);
+
+    objectStage["symbol"] = "vernon_test_fill";
+    objectBundle.erase("content_hash");
+    objectCanonical = objectBundle.dump(-1, ' ', false);
     objectBundle["content_hash"] = vernon::runtime::sha256Hex(objectCanonical.data(), objectCanonical.size());
     const std::string objectManifest = objectBundle.dump(-1, ' ', false);
     ASSERT_TRUE(vernonRuntimeRegisterStaticCpuEntry({"vernon_test_fill", std::strlen("vernon_test_fill")},
@@ -229,7 +246,7 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     ASSERT_TRUE(parameter.slot == 0 && parameter.kind == VERNON_PIPELINE_TENSOR &&
                 parameter.element_layout.leaf_count == 1 &&
                 parameter.element_layout.leaves[0].dtype == VERNON_DATA_F32 &&
-                parameter.access == VERNON_ACCESS_WRITE && parameter.rank == 1 && parameter.static_shape[0] == 12);
+                parameter.access == VERNON_ACCESS_WRITE && parameter.rank == 1 && parameter.static_shape[0] == 16);
     ASSERT_TRUE(vernonRuntimeLoadedPipelineFindParameter(pipeline, {"output", std::strlen("output")}, &parameter) ==
                 VERNON_STATUS_OK);
     ASSERT_TRUE(vernonRuntimeLoadedPipelineGetOutputCount(pipeline) == 1);
@@ -237,10 +254,10 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     ASSERT_TRUE(vernonRuntimeLoadedPipelineFindOutput(pipeline, {"result", std::strlen("result")}, &outputView) ==
                 VERNON_STATUS_OK);
     ASSERT_TRUE(outputView.kind == VERNON_PIPELINE_TENSOR && outputView.dtype == VERNON_DATA_F32 &&
-                outputView.rank == 1 && outputView.static_shape[0] == 12 && outputView.location == 0);
+                outputView.rank == 1 && outputView.static_shape[0] == 16 && outputView.location == 0);
 
-    float output[12]{};
-    const uint64_t shape[] = {12};
+    float output[16]{};
+    const uint64_t shape[] = {16};
     const int64_t strides[] = {sizeof(float)};
     VernonPipelineArgument argument{};
     argument.slot = 0;
@@ -253,18 +270,36 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     argument.tensor.rank = 1;
     argument.tensor.shape = shape;
     argument.tensor.byte_strides = strides;
-    argument.tensor.byte_size = 12 * sizeof(float);
+    argument.tensor.byte_size = 16 * sizeof(float);
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
-    invocation.compute_grid = {3, 2, 2};
+    invocation.compute_grid = {2, 1, 2};
     ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
 
-    ASSERT_TRUE(output[0] == 0.0f && output[2] == 2.0f);
-    ASSERT_TRUE(output[3] == 10.0f && output[11] == 112.0f);
+    ASSERT_TRUE(output[0] == 0.0f && output[3] == 3.0f);
+    ASSERT_TRUE(output[4] == 10.0f && output[15] == 113.0f);
 
+    nlohmann::json constantWriteBundle = nlohmann::json::parse(bundle);
+    nlohmann::json &constantEntry = constantWriteBundle["stage_artifacts"]["fill"]["reflection"]["entries"][0];
+    constantEntry["dispatch_contract"] = {{"unit_grid_axes", {0, 1, 2}}, {"requires_unit_workgroup", true}};
+    VernonPipelineBundle *constantLoaded =
+        loadWithDirectory(runtime, withContentHash(constantWriteBundle), directoryUtf8);
+    ASSERT_TRUE(constantLoaded);
+    VernonLoadedPipeline *constantPipeline = vernonRuntimeResolvePipeline(constantLoaded, {nullptr, 0});
+    ASSERT_TRUE(constantPipeline);
+    EXPECT_EQ(vernonRuntimePipelineInvoke(constantPipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
+    const VernonStringView constantError = vernonRuntimeGetLastError(runtime);
+    EXPECT_NE(std::string(constantError.data ? constantError.data : "", constantError.size)
+                  .find("compute dispatch grid axis"),
+              std::string::npos);
+    invocation.compute_grid = {1, 1, 1};
+    EXPECT_EQ(vernonRuntimePipelineInvoke(constantPipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
+
+    vernonRuntimeLoadedPipelineDestroy(constantPipeline);
+    vernonRuntimePipelineBundleDestroy(constantLoaded);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     vernonRuntimePipelineBundleDestroy(loaded);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);

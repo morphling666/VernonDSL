@@ -70,10 +70,8 @@ VernonStatus invokeCpuComputePipeline(VernonLoadedPipeline &pipeline, const Plan
                                        : "failed to prepare CPU provider bindings",
                     status);
     }
-    const uint32_t groups[3]{(launch.grid.x - 1) / state.workgroup[0] + 1, (launch.grid.y - 1) / state.workgroup[1] + 1,
-                             (launch.grid.z - 1) / state.workgroup[2] + 1};
-    status = vernonRuntimeCoreEncodeDispatch(state.pipeline, state.bindings, launch.commandEncoder, groups,
-                                             &launch.grid, sizeof(launch.grid));
+    const uint32_t groups[3]{launch.grid.x, launch.grid.y, launch.grid.z};
+    status = vernonRuntimeCoreEncodeDispatch(state.pipeline, state.bindings, launch.commandEncoder, groups, nullptr, 0);
     if (status != VERNON_STATUS_OK) {
         const VernonStringView providerError = cpuProviderLastError(*pipeline.context);
         return fail(*pipeline.context,

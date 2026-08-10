@@ -218,12 +218,15 @@ def _invoke_structured_pipeline(
     ]
     with _dispatch_borrow_scope(borrows):
         output, pullback = pipeline.vjp(bindings, grid)
+    workgroup = tuple(pipeline.workgroup_size)
+    extent = tuple(count * size for count, size in zip(grid, workgroup, strict=True))
+    carrier_shape = () if extent == (1, 1, 1) else tuple(reversed(extent))
     return output, _StructuredPullback(
         pullback,
         tuple(group for group in derivative_groups if group.role == "gradient"),
         tuple(group for group in derivative_groups if group.role == "cotangent"),
         bindings,
-        (grid[2], grid[1], grid[0]) if grid[0] * grid[1] * grid[2] > 1 else (),
+        carrier_shape,
     )
 
 

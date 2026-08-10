@@ -541,7 +541,7 @@ def assert_static_tensor_compute_argument(test: unittest.TestCase) -> None:
         large,
         matrix_left,
         matrix_right,
-        grid=(11, 1, 1),
+        grid=(3, 1, 1),
     )
 
     np.testing.assert_allclose(

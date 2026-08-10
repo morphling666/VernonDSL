@@ -1,3 +1,5 @@
+from typing import Annotated
+
 import vernon_dsl as vd
 
 
@@ -6,14 +8,15 @@ def objective(
     x: vd.f32,
     y: vd.f32,
     z: vd.f32,
-    output: vd.TensorView[vd.f32, (1,), vd.write],
+    output: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     linear = x + y
     difference = x - y
     product = linear * difference
     quotient = product / y
     negated = -z
-    output[0] = (
+    output[gid[2], gid[1], gid[0]] = (
         quotient
         + negated
         + vd.sin(x)

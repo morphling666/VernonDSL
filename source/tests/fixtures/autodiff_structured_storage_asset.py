@@ -1,17 +1,20 @@
+from typing import Annotated
+
 import vernon_dsl as vd
 
 
 @vd.kernel
 def mutate(
-    values: vd.TensorView[vd.f32, (3,), vd.read_write],
-    source: vd.TensorView[vd.f32, (3,), vd.read],
+    values: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn, 3), vd.read_write],
+    source: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn, 3), vd.read],
     index: vd.i32,
     scale: vd.f32,
-    loss: vd.TensorView[vd.f32, (1,), vd.write],
+    loss: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
-    old = source[index]
-    values[index] = old * scale
-    loss[0] = values[0] + values[index]
+    old = source[gid[0], gid[1], gid[2], index]
+    values[gid[0], gid[1], gid[2], index] = old * scale
+    loss[gid[0], gid[1], gid[2]] = values[gid[0], gid[1], gid[2], 0] + values[gid[0], gid[1], gid[2], index]
 
 
 asset = vd.pipeline_asset(

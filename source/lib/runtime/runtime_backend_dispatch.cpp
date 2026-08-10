@@ -316,11 +316,12 @@ bool validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeReq
     VernonRuntimeCapabilities capabilities{};
     fillBackendCapabilities(context, capabilities);
     for (const std::string &feature : requirements.features) {
-        const bool supported = feature == "compute"        ? capabilities.supports_compute
-                               : feature == "tensor_views" ? capabilities.supports_storage_buffers
-                               : feature == "instancing" || feature == "samplers" || feature == "textures"
-                                   ? capabilities.supports_graphics
-                                   : false;
+        const bool supported =
+            feature == "compute" || feature == "atomics" || feature == "barriers" || feature == "workgroup_storage"
+                ? capabilities.supports_compute
+            : feature == "tensor_views" ? capabilities.supports_storage_buffers
+            : feature == "instancing" || feature == "samplers" || feature == "textures" ? capabilities.supports_graphics
+                                                                                        : false;
         if (!supported) {
             invocationDiagnostic(context) = "pipeline requires unsupported runtime feature '" + feature + "'";
             return false;

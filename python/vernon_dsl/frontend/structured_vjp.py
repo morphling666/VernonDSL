@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
@@ -39,8 +39,6 @@ def resolve_vjp_transform(
     transform: ProgramTransformSpec,
     output_cotangents: tuple[str, ...],
 ) -> ProgramTransformSpec:
-    if transform.protocol == "legacy_fixed" and not transform.output_cotangents:
-        return replace(transform, output_cotangents=output_cotangents)
     if transform.output_cotangents != output_cotangents:
         raise ValueError("structured VJP output paths changed after declaration")
     return transform

@@ -79,6 +79,8 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
             entry["workgroup_size"].size() == 3)
             for (size_t index = 0; index < 3; ++index)
                 output.workgroup[index] = entry["workgroup_size"][index].get<uint32_t>();
+        if (!parseDispatchContract(entry, output.dispatchContract, error))
+            return false;
         if (!entry.contains("arguments") || !entry["arguments"].is_array()) {
             error = "entry has no argument layout";
             return false;

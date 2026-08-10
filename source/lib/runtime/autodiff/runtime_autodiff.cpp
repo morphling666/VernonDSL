@@ -1,11 +1,11 @@
 #include "runtime_autodiff_internal.h"
 
-#include "VernonAutodiffGraph.h"
 #include "runtime/runtime_state.h"
 #include "runtime_direct_autodiff.h"
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -35,80 +35,31 @@ size_t dtypeSize(VernonDataType dtype) {
 
 bool validLaunchSize(VernonLaunchSize grid) { return grid.x != 0 && grid.y != 0 && grid.z != 0; }
 
-bool carrierCount(VernonLaunchSize grid, size_t &count) {
-    if (!validLaunchSize(grid) || grid.x > SIZE_MAX / grid.y ||
-        static_cast<size_t>(grid.x) * grid.y > SIZE_MAX / grid.z)
+bool invocationExtent(VernonLaunchSize grid, VernonLaunchSize workgroup, VernonLaunchSize &extent) {
+    if (!validLaunchSize(grid) || !validLaunchSize(workgroup) ||
+        grid.x > std::numeric_limits<uint32_t>::max() / workgroup.x ||
+        grid.y > std::numeric_limits<uint32_t>::max() / workgroup.y ||
+        grid.z > std::numeric_limits<uint32_t>::max() / workgroup.z)
         return false;
-    count = static_cast<size_t>(grid.x) * grid.y * grid.z;
+    extent = {grid.x * workgroup.x, grid.y * workgroup.y, grid.z * workgroup.z};
     return true;
 }
 
-bool materializeCarrierValue(ValueAbi &abi, VernonLaunchSize grid) {
+bool carrierCount(VernonLaunchSize extent, size_t &count) {
+    if (!validLaunchSize(extent) || extent.x > SIZE_MAX / extent.y ||
+        static_cast<size_t>(extent.x) * extent.y > SIZE_MAX / extent.z)
+        return false;
+    count = static_cast<size_t>(extent.x) * extent.y * extent.z;
+    return true;
+}
+
+bool materializeCarrierValue(ValueAbi &abi, VernonLaunchSize extent) {
     size_t count = 0;
-    if (!carrierCount(grid, count) || (count && abi.byteSize > SIZE_MAX / count))
+    if (!carrierCount(extent, count) || (count && abi.byteSize > SIZE_MAX / count))
         return false;
     abi.byteSize *= count;
     if (count > 1)
-        abi.logicalShape.insert(abi.logicalShape.begin(), {grid.z, grid.y, grid.x});
-    return true;
-}
-
-bool resourceByteSize(const ResourceAbi &abi, VernonLaunchSize grid, size_t &size) {
-    size = abi.value.byteSize;
-    if (!abi.runtimeCarrier)
-        return true;
-    size_t count = 0;
-    if (!carrierCount(grid, count) || (count && size > SIZE_MAX / count))
-        return false;
-    size *= count;
-    return true;
-}
-
-VernonRhiBufferDescriptor gpuBufferDescriptor(const ValueAbi &abi) {
-    VernonRhiBufferDescriptor descriptor{};
-    descriptor.struct_size = sizeof(descriptor);
-    descriptor.size = abi.byteSize;
-    descriptor.alignment = abi.alignment;
-    descriptor.usage =
-        VERNON_RHI_BUFFER_STORAGE | VERNON_RHI_BUFFER_TRANSFER_SOURCE | VERNON_RHI_BUFFER_TRANSFER_DESTINATION;
-    descriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
-    return descriptor;
-}
-
-VernonRhiStatus createGraphBuffer(execution::ExecutionGraph &graph, const ValueAbi &value,
-                                  execution::GraphBuffer &buffer, bool exported) {
-    return graph.createBuffer(gpuBufferDescriptor(value), buffer, exported);
-}
-
-bool uploadGpuBuffer(VernonRuntimeContext &context, VernonRhiBuffer buffer, uint64_t offset, const void *data,
-                     size_t size, const char *label) {
-    if (!data || !size ||
-        vernonRhiDeviceUploadBuffer(context.rhiDevice, buffer, offset, data, size) != VERNON_RHI_STATUS_OK) {
-        invocationDiagnostic(context) = std::string("failed to upload ") + label;
-        return false;
-    }
-    return true;
-}
-
-bool downloadGpuBuffer(VernonRuntimeContext &context, VernonRhiBuffer buffer, uint64_t offset, void *data, size_t size,
-                       const char *label) {
-    if (!data || !size ||
-        vernonRhiDeviceDownloadBuffer(context.rhiDevice, buffer, offset, data, size) != VERNON_RHI_STATUS_OK) {
-        invocationDiagnostic(context) = std::string("failed to download ") + label;
-        return false;
-    }
-    return true;
-}
-
-bool clearGpuBuffer(VernonRuntimeContext &context, VernonRhiBuffer buffer, uint64_t offset, size_t size,
-                    const char *label) {
-    constexpr size_t chunkSize = 64 * 1024;
-    const std::vector<uint8_t> zero(std::min(size, chunkSize));
-    for (size_t written = 0; written < size; written += zero.size()) {
-        const size_t count = std::min(zero.size(), size - written);
-        if (!uploadGpuBuffer(context, buffer, offset + written, zero.data(), count, label))
-            return false;
-    }
+        abi.logicalShape.insert(abi.logicalShape.begin(), {extent.z, extent.y, extent.x});
     return true;
 }
 
@@ -213,31 +164,6 @@ bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
     return true;
 }
 
-bool createImmediateGpuGraph(VernonLoadedPipeline &pipeline) {
-    if (!pipeline.autodiff || !std::dynamic_pointer_cast<GpuGraphExecutable>(pipeline.autodiff->executable))
-        return false;
-    AutodiffGraph builder(pipeline.context);
-    AutodiffGraphNode node;
-    VernonStatus status = builder.addNode("immediate", &pipeline, node);
-    if (status != VERNON_STATUS_OK)
-        return false;
-    const Signature &signature = pipeline.autodiff->executable->signature();
-    for (const ValueAbi &input : signature.inputs) {
-        const bool differentiable = std::any_of(signature.gradients.begin(), signature.gradients.end(),
-                                                [&](const ValueAbi &gradient) { return gradient.path == input.path; });
-        status = builder.declareInput(node, input.path, input.path, differentiable ? input.path : std::string());
-        if (status != VERNON_STATUS_OK)
-            return false;
-    }
-    if (builder.setOutput(node) != VERNON_STATUS_OK)
-        return false;
-    std::unique_ptr<CompiledAutodiffGraph> compiled;
-    if (builder.compile(compiled) != VERNON_STATUS_OK)
-        return false;
-    pipeline.autodiff->immediateGraph = std::shared_ptr<CompiledAutodiffGraph>(std::move(compiled));
-    return true;
-}
-
 bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffVariant &profiles,
                              VernonLoadedPipeline &pipeline) {
     if (!bundle.context || !bundle.autodiff)
@@ -247,23 +173,22 @@ bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffVariant
     const std::vector<std::string> gradientPaths =
         autodiffDerivativeLeafPaths(bundle.autodiff->derivativeGroups, AutodiffDerivativeRole::Gradient);
     std::shared_ptr<Executable> executable;
-    bool resolved = false;
-    if (bundle.context->backend == VERNON_RUNTIME_CPU) {
-        if (bundle.autodiff->protocol == "dynamic_v2")
-            resolved = createCpuExecutable(*bundle.context, forward, backward, gradientPaths, executable);
-        else
-            invocationDiagnostic(*bundle.context) = "CPU autodiff profile uses an unsupported protocol";
-    } else {
-        resolved = createGpuExecutable(bundle, profiles.forwardWithTape, profiles.backward, gradientPaths,
-                                       profiles.launch, executable);
+    if (bundle.context->backend != VERNON_RUNTIME_CPU) {
+        invocationDiagnostic(*bundle.context) = "GPU autodiff is unsupported; runtime only supports CPU dynamic_v2";
+        return false;
     }
+    if (bundle.autodiff->protocol != "dynamic_v2") {
+        invocationDiagnostic(*bundle.context) = "CPU autodiff requires the dynamic_v2 protocol";
+        return false;
+    }
+    const bool resolved = createCpuExecutable(*bundle.context, forward, backward, gradientPaths, executable);
     if (!resolved)
         return false;
     if (!validateDerivativeGroupsAgainstSignature(*bundle.context, bundle.autodiff->derivativeGroups,
                                                   executable->signature()))
         return false;
-    pipeline.autodiff = VernonLoadedAutodiff{std::move(executable), {}, bundle.autodiff->derivativeGroups};
-    return bundle.context->backend == VERNON_RUNTIME_CPU || createImmediateGpuGraph(pipeline);
+    pipeline.autodiff = VernonLoadedAutodiff{std::move(executable), bundle.autodiff->derivativeGroups};
+    return true;
 }
 
 } // namespace vernon::runtime::ad
@@ -282,36 +207,6 @@ VernonStatus fail(VernonRuntimeContext *context, std::string_view message,
 
 const vernon::runtime::ad::Executable *autodiffExecutable(const VernonLoadedPipeline *pipeline) {
     return pipeline && pipeline->autodiff ? pipeline->autodiff->executable.get() : nullptr;
-}
-
-class GraphPullbackExecution final : public vernon::runtime::ad::PullbackExecution {
-public:
-    explicit GraphPullbackExecution(std::unique_ptr<vernon::runtime::AutodiffGraphPullback> pullback)
-        : pullback_(std::move(pullback)) {}
-
-    VernonStatus apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients) override {
-        return pullback_->apply(cotangents, gradients);
-    }
-
-private:
-    std::unique_ptr<vernon::runtime::AutodiffGraphPullback> pullback_;
-};
-
-VernonStatus forwardGpuGraph(VernonLoadedPipeline &pipeline, VernonLaunchSize computeGrid,
-                             const VernonAdValueSet &inputs, VernonAdValueSet &outputs,
-                             std::unique_ptr<vernon::runtime::ad::PullbackExecution> &execution) {
-    using namespace vernon::runtime;
-    using namespace vernon::runtime::ad;
-    std::shared_ptr<CompiledAutodiffGraph> compiled = pipeline.autodiff->immediateGraph;
-    if (!compiled)
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    VernonAdValueSet mutableInputs = inputs;
-    std::unique_ptr<AutodiffGraphPullback> pullback;
-    const VernonStatus status = compiled->forward(computeGrid, mutableInputs, outputs, pullback);
-    if (status != VERNON_STATUS_OK)
-        return status;
-    execution = std::make_unique<GraphPullbackExecution>(std::move(pullback));
-    return VERNON_STATUS_OK;
 }
 
 } // namespace
@@ -337,6 +232,10 @@ bool copyMetadata(const std::vector<vernon::runtime::ad::ValueAbi> &values, size
 bool vernon::runtime::hasAutodiffStorageObjectives(const VernonLoadedPipeline *pipeline) {
     const ad::Executable *executable = autodiffExecutable(pipeline);
     return executable && executable->signature().storageObjectives;
+}
+
+VernonLaunchSize vernon::runtime::autodiffWorkgroupSize(const VernonLoadedPipeline *pipeline) {
+    return pipeline ? pipeline->workgroupSize : VernonLaunchSize{};
 }
 
 extern "C" {
@@ -439,9 +338,7 @@ VernonStatus vernonAdPipelineForward(VernonLoadedPipeline *pipeline, VernonLaunc
         result->contextLease = vernon::runtime::acquireContextLease(*pipeline->context);
         std::unique_ptr<PullbackExecution> execution;
         VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT;
-        if (dynamic_cast<GpuGraphExecutable *>(executable))
-            status = forwardGpuGraph(*pipeline, computeGrid, *inputs, *outputs, execution);
-        else if (auto *host = dynamic_cast<HostExecutable *>(executable))
+        if (auto *host = dynamic_cast<HostExecutable *>(executable))
             status = host->forward(computeGrid, *inputs, *outputs, execution);
         if (status != VERNON_STATUS_OK)
             return status;

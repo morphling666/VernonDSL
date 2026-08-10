@@ -102,8 +102,9 @@ def Vernon_ReduceSumOp : Vernon_Op<"reduce_sum"> {
   let summary = "Grid-independent sum accumulation contribution";
   let description = [{
     Adds one logical invocation's contribution to a destination element.
-    Target lowering selects an atomic add when available, or a canonical
-    serial-grid fallback when deterministic execution is required.
+    Target lowering selects an atomic add when available. Deterministic shared
+    accumulation requires a dedicated reduction implementation and otherwise
+    fails closed.
   }];
   let arguments = (ins AnyType:$value, Vernon_TensorViewType:$storage,
       Variadic<Index>:$indices, BoolAttr:$deterministic);
@@ -303,9 +304,11 @@ def Vernon_AdReadLeafOp : Vernon_Op<"ad.read_leaf", [Pure]> {
 }
 
 def Vernon_AdAdjointBufferCreateOp : Vernon_Op<"ad.adjoint_buffer.create"> {
-  let summary = "Create zeroed invocation-local Storage adjoint state from a shape source";
-  let arguments = (ins Vernon_TensorViewType:$shape_source);
+  let summary = "Create zeroed Storage adjoint state with explicit ownership";
+  let arguments = (ins Optional<Vernon_TensorViewType>:$shape_source,
+      OptionalAttr<StrAttr>:$ownership);
   let results = (outs Vernon_AdAdjointBufferType:$buffer);
+  let hasVerifier = 1;
 }
 
 def Vernon_AdAdjointScatterAddOp : Vernon_Op<"ad.adjoint_buffer.scatter_add"> {
@@ -323,6 +326,13 @@ def Vernon_AdAdjointAccumulateDenseOp : Vernon_Op<"ad.adjoint_buffer.accumulate_
 
 def Vernon_AdAdjointTakeAndClearOp : Vernon_Op<"ad.adjoint_buffer.take_and_clear"> {
   let summary = "Read and clear one overwritten element cotangent";
+  let arguments = (ins Vernon_AdAdjointBufferType:$buffer, Variadic<Index>:$indices);
+  let results = (outs AnyType:$value);
+  let hasVerifier = 1;
+}
+
+def Vernon_AdAdjointPeekOp : Vernon_Op<"ad.adjoint_buffer.peek"> {
+  let summary = "Read one additive element cotangent without clearing it";
   let arguments = (ins Vernon_AdAdjointBufferType:$buffer, Variadic<Index>:$indices);
   let results = (outs AnyType:$value);
   let hasVerifier = 1;

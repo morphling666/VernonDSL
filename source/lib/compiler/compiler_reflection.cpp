@@ -1227,6 +1227,8 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             }
             if (mlir::isa<mlir::vernon::TensorViewType>(argumentType))
                 requiredFeatures.insert("tensor_views");
+            if (auto ownership = function.getArgAttrOfType<mlir::StringAttr>(index, "vernon.accumulation_ownership"))
+                argument["vernon.accumulation_ownership"] = ownership.getValue();
             if (mlir::isa<mlir::vernon::TextureType>(argumentType))
                 requiredFeatures.insert("textures");
             if (mlir::isa<mlir::vernon::SamplerType>(argumentType))
@@ -1402,8 +1404,21 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 dimensions.emplace_back(static_cast<int64_t>(dimension));
             entry["workgroup_size"] = std::move(dimensions);
         }
-        if (function->hasAttr("vernon.serial_dispatch"))
-            entry["serial_dispatch"] = true;
+        if (stage.getValue() == "compute") {
+            auto contract = function->getAttrOfType<mlir::DictionaryAttr>(mlir::vernon::kDispatchContractAttrName);
+            auto axes = contract ? contract.getAs<mlir::DenseI32ArrayAttr>("unit_grid_axes") : nullptr;
+            auto unitWorkgroup = contract ? contract.getAs<mlir::BoolAttr>("requires_unit_workgroup") : nullptr;
+            if (!contract || !axes || !unitWorkgroup) {
+                function.emitError("has no validated dispatch contract");
+                invalid = true;
+                return;
+            }
+            llvm::json::Array reflectedAxes;
+            for (int32_t axis : axes.asArrayRef())
+                reflectedAxes.emplace_back(static_cast<int64_t>(axis));
+            entry["dispatch_contract"] = llvm::json::Object{{"unit_grid_axes", std::move(reflectedAxes)},
+                                                            {"requires_unit_workgroup", unitWorkgroup.getValue()}};
+        }
         llvm::json::Array effects;
         if (auto reflectedEffects = function->getAttrOfType<mlir::ArrayAttr>("vernon.storage_effects")) {
             for (mlir::Attribute reflectedEffect : reflectedEffects) {
@@ -1419,6 +1434,8 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 reflected["kind"] = kind.getValue().str();
                 reflected["owner"] = owner.getValue().str();
                 reflected["region"] = region.getValue().str();
+                if (auto atomic = effect.getAs<mlir::BoolAttr>("atomic"))
+                    reflected["atomic"] = atomic.getValue();
                 llvm::json::Array indices;
                 if (auto values = effect.getAs<mlir::DenseI64ArrayAttr>("indices"))
                     for (int64_t index : values.asArrayRef())

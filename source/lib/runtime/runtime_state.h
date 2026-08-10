@@ -16,10 +16,6 @@ namespace vernon::runtime::ad {
 class Executable;
 class HostTapeMemoryPolicy;
 } // namespace vernon::runtime::ad
-namespace vernon::runtime {
-class CompiledAutodiffGraph;
-}
-
 // Internal definitions for the opaque C ABI handles.
 struct VernonRuntimeContext {
     VernonRuntimeBackend backend{VERNON_RUNTIME_CPU};
@@ -99,13 +95,14 @@ struct VernonPipelineBundle {
 
 struct VernonLoadedAutodiff {
     std::shared_ptr<vernon::runtime::ad::Executable> executable;
-    std::shared_ptr<vernon::runtime::CompiledAutodiffGraph> immediateGraph;
     std::vector<vernon::runtime::AutodiffDerivativeGroup> derivativeGroups;
 };
 
 struct VernonLoadedPipeline {
     VernonRuntimeContext *context{};
     vernon::runtime::Variant variant;
+    VernonLaunchSize workgroupSize{1, 1, 1};
+    vernon::runtime::DispatchContract dispatchContract;
     std::optional<VernonLoadedAutodiff> autodiff;
     void *backendState{};
     void (*destroyBackendState)(void *){};

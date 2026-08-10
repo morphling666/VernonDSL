@@ -19,6 +19,8 @@
 // LOWER-SAME: index {vernon.builtin = "ad_tape_allocator", vernon.interface = "input"}
 // LOWER-SAME: index {vernon.builtin = "ad_tape_root_region", vernon.interface = "input"}
 // LOWER: "vernon.cpu_ad.callback"
+// LOWER: llvm.load
+// LOWER-NOT: "vernon.ad.adjoint_buffer.peek"
 // LOWER-NOT: !vernon.ad_tape
 // LOWER-NOT: !vernon.ad_region_header
 //
@@ -68,7 +70,12 @@ module {
         {record_size = 8 : i64, record_alignment = 8 : i64,
          leaf_offset = 0 : i64}
         : (!vernon.ad_region_header, index) -> f64
-    %gradient = arith.mulf %saved, %seed : f64
+    %buffer = "vernon.ad.adjoint_buffer.create"() {ownership = "lane_private"}
+        : () -> !vernon.ad_adjoint_buffer<f64, [1], 1>
+    %peek = "vernon.ad.adjoint_buffer.peek"(%buffer, %zero)
+        : (!vernon.ad_adjoint_buffer<f64, [1], 1>, index) -> f64
+    %product = arith.mulf %saved, %seed : f64
+    %gradient = arith.addf %product, %peek : f64
     return %gradient : f64
   }
 }

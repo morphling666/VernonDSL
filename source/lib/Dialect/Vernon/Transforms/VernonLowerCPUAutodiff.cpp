@@ -1,5 +1,6 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUAutodiff.h"
 
+#include "VernonCpuWorkgroupABI.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -9,6 +10,7 @@
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffUtils.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/PassRegistry.h"
@@ -17,6 +19,8 @@
 #include "llvm/ADT/STLExtras.h"
 
 #include <functional>
+#include <limits>
+#include <optional>
 
 namespace mlir::vernon {
 namespace {
@@ -283,39 +287,120 @@ private:
     LogicalResult lowerAdjointBuffers() {
         SmallVector<AdAdjointBufferCreateOp> creates;
         function.walk([&](AdAdjointBufferCreateOp operation) { creates.push_back(operation); });
-        for (AdAdjointBufferCreateOp create : creates) {
+        ModuleOp module = function->getParentOfType<ModuleOp>();
+        if (!module)
+            return function.emitError("CPU autodiff lowering requires a module");
+        func::FuncOp addressHelper = module.lookupSymbol<func::FuncOp>(VERNON_CPU_WORKGROUP_ADDRESS_V1_SYMBOL);
+        if (!addressHelper) {
+            OpBuilder moduleBuilder(module.getBodyRegion());
+            moduleBuilder.setInsertionPointToStart(module.getBody());
+            Type i64 = moduleBuilder.getI64Type();
+            addressHelper = func::FuncOp::create(moduleBuilder, module.getLoc(), VERNON_CPU_WORKGROUP_ADDRESS_V1_SYMBOL,
+                                                 moduleBuilder.getFunctionType({i64, i64, i64, i64}, {i64}));
+            addressHelper.setPrivate();
+            addressHelper->setAttr("llvm.linkage",
+                                   LLVM::LinkageAttr::get(module.getContext(), LLVM::Linkage::ExternWeak));
+        }
+        func::FuncOp laneAddressHelper = module.lookupSymbol<func::FuncOp>(VERNON_CPU_LANE_ADDRESS_V1_SYMBOL);
+        if (!laneAddressHelper) {
+            OpBuilder moduleBuilder(module.getBodyRegion());
+            moduleBuilder.setInsertionPointToStart(module.getBody());
+            Type i64 = moduleBuilder.getI64Type();
+            laneAddressHelper = func::FuncOp::create(moduleBuilder, module.getLoc(), VERNON_CPU_LANE_ADDRESS_V1_SYMBOL,
+                                                     moduleBuilder.getFunctionType({i64, i64, i64, i64}, {i64}));
+            laneAddressHelper.setPrivate();
+            laneAddressHelper->setAttr("llvm.linkage",
+                                       LLVM::LinkageAttr::get(module.getContext(), LLVM::Linkage::ExternWeak));
+        }
+        func::FuncOp leaderHelper = module.lookupSymbol<func::FuncOp>(VERNON_CPU_WORKGROUP_IS_LEADER_V1_SYMBOL);
+        if (!leaderHelper) {
+            OpBuilder moduleBuilder(module.getBodyRegion());
+            moduleBuilder.setInsertionPointToStart(module.getBody());
+            leaderHelper =
+                func::FuncOp::create(moduleBuilder, module.getLoc(), VERNON_CPU_WORKGROUP_IS_LEADER_V1_SYMBOL,
+                                     moduleBuilder.getFunctionType({}, {moduleBuilder.getI1Type()}));
+            leaderHelper.setPrivate();
+            leaderHelper->setAttr("llvm.linkage",
+                                  LLVM::LinkageAttr::get(module.getContext(), LLVM::Linkage::ExternWeak));
+        }
+        for (auto [site, create] : llvm::enumerate(creates)) {
+            const uint64_t siteId = uint64_t{1} << 63 | static_cast<uint64_t>(site);
+            const bool workgroupShared =
+                create.getOwnershipAttr() && create.getOwnershipAttr().getValue() == "workgroup_shared";
+            func::FuncOp allocationHelper = workgroupShared ? addressHelper : laneAddressHelper;
             AdAdjointBufferType type = create.getBuffer().getType();
-            SmallVector<int64_t> memoryShape(type.getShape());
-            for (int64_t &extent : memoryShape)
-                if (extent < 0)
-                    extent = ShapedType::kDynamic;
-            auto memoryType = MemRefType::get(memoryShape, type.getElementType());
+            if (workgroupShared) {
+                uint64_t bytes = std::max<uint64_t>(1, (type.getElementType().getIntOrFloatBitWidth() + 7) / 8);
+                for (int64_t extent : type.getShape()) {
+                    if (extent < 0)
+                        break;
+                    if (!extent || bytes > std::numeric_limits<uint64_t>::max() / static_cast<uint64_t>(extent))
+                        return create.emitError("workgroup-shared adjoint static allocation size overflows");
+                    bytes *= static_cast<uint64_t>(extent);
+                }
+            }
+            Value shapeSource = create.getShapeSource();
             OpBuilder createBuilder(create);
             SmallVector<Value> bounds;
-            SmallVector<Value> dynamicSizes;
             for (auto [dimension, extent] : llvm::enumerate(type.getShape())) {
                 Value bound;
                 if (extent < 0) {
                     if (dimension >= type.getIndexRank())
                         return create.emitError("dynamic adjoint element dimensions are unsupported");
-                    FailureOr<Value> runtimeExtent = descriptorExtent(create.getShapeSource(), dimension);
+                    if (!shapeSource)
+                        return create.emitError("dynamic adjoint buffer has no TensorView shape source");
+                    FailureOr<Value> runtimeExtent = descriptorExtent(shapeSource, dimension);
                     if (failed(runtimeExtent))
                         return create.emitError("dynamic adjoint buffer has no canonical TensorView extent source");
                     bound = *runtimeExtent;
-                    dynamicSizes.push_back(bound);
                 } else {
                     bound = indexConstant(createBuilder, create.getLoc(), static_cast<uint64_t>(extent));
                 }
                 bounds.push_back(bound);
             }
-            Value memory = memref::AllocaOp::create(createBuilder, create.getLoc(), memoryType, dynamicSizes);
-            SmallVector<Value> initializationIndices;
-            emitLoopNest(createBuilder, create.getLoc(), bounds, 0, initializationIndices,
-                         [&](OpBuilder &nested, ValueRange indices) {
-                             memref::StoreOp::create(nested, create.getLoc(),
-                                                     zero(nested, create.getLoc(), type.getElementType()), memory,
-                                                     indices);
-                         });
+            const uint64_t elementBytes =
+                std::max<uint64_t>(1, (type.getElementType().getIntOrFloatBitWidth() + 7) / 8);
+            const uint64_t allocationAlignment = workgroupShared ? 16 : elementBytes;
+            auto asI64Value = [&](OpBuilder &builder, Location location, Value value) {
+                return value.getType().isIndex()
+                           ? arith::IndexCastOp::create(builder, location, builder.getI64Type(), value).getResult()
+                           : value;
+            };
+            auto i64Constant = [&](OpBuilder &builder, Location location, uint64_t value) {
+                return arith::ConstantOp::create(builder, location, builder.getI64Type(),
+                                                 builder.getI64IntegerAttr(static_cast<int64_t>(value)))
+                    .getResult();
+            };
+            auto totalBytes = [&](OpBuilder &builder, Location location) {
+                Value elements = i64Constant(builder, location, 1);
+                for (Value bound : bounds)
+                    elements = arith::MulIOp::create(builder, location, elements, asI64Value(builder, location, bound));
+                return arith::MulIOp::create(builder, location, elements, i64Constant(builder, location, elementBytes))
+                    .getResult();
+            };
+            func::CallOp::create(createBuilder, create.getLoc(), allocationHelper,
+                                 ValueRange{i64Constant(createBuilder, create.getLoc(), siteId),
+                                            totalBytes(createBuilder, create.getLoc()),
+                                            i64Constant(createBuilder, create.getLoc(), allocationAlignment),
+                                            i64Constant(createBuilder, create.getLoc(), 0)});
+            auto address = [&](OpBuilder &builder, Location location, ValueRange indices) {
+                Value linear = i64Constant(builder, location, 0);
+                for (auto [index, bound] : llvm::zip_equal(indices, bounds)) {
+                    linear = arith::MulIOp::create(builder, location, linear, asI64Value(builder, location, bound));
+                    linear = arith::AddIOp::create(builder, location, linear, asI64Value(builder, location, index));
+                }
+                Value offset =
+                    arith::MulIOp::create(builder, location, linear, i64Constant(builder, location, elementBytes));
+                Value raw = func::CallOp::create(
+                                builder, location, allocationHelper,
+                                ValueRange{i64Constant(builder, location, siteId), totalBytes(builder, location),
+                                           i64Constant(builder, location, allocationAlignment), offset})
+                                .getResult(0);
+                return LLVM::IntToPtrOp::create(builder, location, LLVM::LLVMPointerType::get(module.getContext()), raw)
+                    .getResult();
+            };
+            const LLVM::AtomicBinOp atomicAdd =
+                isa<FloatType>(type.getElementType()) ? LLVM::AtomicBinOp::fadd : LLVM::AtomicBinOp::add;
 
             const SmallVector<SmallVector<int64_t>> trailingCoordinates =
                 enumerateStaticCoordinates(type.getShape().drop_front(type.getIndexRank()));
@@ -332,17 +417,24 @@ private:
                         if (!coordinate.empty())
                             contribution =
                                 tensor::ExtractOp::create(userBuilder, scatter.getLoc(), contribution, trailingIndices);
-                        Value prior = memref::LoadOp::create(userBuilder, scatter.getLoc(), memory, indices);
-                        Value sum = arith::AddFOp::create(userBuilder, scatter.getLoc(), prior, contribution);
-                        memref::StoreOp::create(userBuilder, scatter.getLoc(), sum, memory, indices);
+                        Value pointer = address(userBuilder, scatter.getLoc(), indices);
+                        if (workgroupShared) {
+                            LLVM::AtomicRMWOp::create(userBuilder, scatter.getLoc(), atomicAdd, pointer, contribution,
+                                                      LLVM::AtomicOrdering::monotonic);
+                        } else {
+                            Value previous =
+                                LLVM::LoadOp::create(userBuilder, scatter.getLoc(), type.getElementType(), pointer);
+                            Value sum = arith::AddFOp::create(userBuilder, scatter.getLoc(), previous, contribution);
+                            LLVM::StoreOp::create(userBuilder, scatter.getLoc(), sum, pointer);
+                        }
                     }
                     scatter.erase();
                     continue;
                 }
                 if (auto dense = dyn_cast<AdAdjointAccumulateDenseOp>(user)) {
-                    OpBuilder userBuilder(dense);
                     if (!isa<TensorViewType>(dense.getValue().getType()))
                         return dense.emitError("CPU dynamic adjoint accumulation requires a TensorView contribution");
+                    OpBuilder userBuilder(dense);
                     SmallVector<Value> prefix;
                     emitLoopNest(
                         userBuilder, dense.getLoc(), ValueRange(bounds).take_front(type.getIndexRank()), 0, prefix,
@@ -359,9 +451,16 @@ private:
                                 Value scalar = contribution;
                                 if (!coordinate.empty())
                                     scalar = tensor::ExtractOp::create(nested, dense.getLoc(), contribution, trailing);
-                                Value prior = memref::LoadOp::create(nested, dense.getLoc(), memory, memoryIndices);
-                                Value sum = arith::AddFOp::create(nested, dense.getLoc(), prior, scalar);
-                                memref::StoreOp::create(nested, dense.getLoc(), sum, memory, memoryIndices);
+                                Value pointer = address(nested, dense.getLoc(), memoryIndices);
+                                if (workgroupShared) {
+                                    LLVM::AtomicRMWOp::create(nested, dense.getLoc(), atomicAdd, pointer, scalar,
+                                                              LLVM::AtomicOrdering::monotonic);
+                                } else {
+                                    Value previous =
+                                        LLVM::LoadOp::create(nested, dense.getLoc(), type.getElementType(), pointer);
+                                    Value sum = arith::AddFOp::create(nested, dense.getLoc(), previous, scalar);
+                                    LLVM::StoreOp::create(nested, dense.getLoc(), sum, pointer);
+                                }
                             }
                         });
                     dense.erase();
@@ -373,10 +472,17 @@ private:
                     for (const SmallVector<int64_t> &coordinate : trailingCoordinates) {
                         SmallVector<Value> indices =
                             appendCoordinate(userBuilder, take.getLoc(), take.getIndices(), coordinate);
-                        elements.push_back(memref::LoadOp::create(userBuilder, take.getLoc(), memory, indices));
-                        memref::StoreOp::create(userBuilder, take.getLoc(),
-                                                zero(userBuilder, take.getLoc(), type.getElementType()), memory,
-                                                indices);
+                        Value pointer = address(userBuilder, take.getLoc(), indices);
+                        Value cleared = zero(userBuilder, take.getLoc(), type.getElementType());
+                        if (workgroupShared) {
+                            elements.push_back(LLVM::AtomicRMWOp::create(userBuilder, take.getLoc(),
+                                                                         LLVM::AtomicBinOp::xchg, pointer, cleared,
+                                                                         LLVM::AtomicOrdering::monotonic));
+                        } else {
+                            elements.push_back(
+                                LLVM::LoadOp::create(userBuilder, take.getLoc(), type.getElementType(), pointer));
+                            LLVM::StoreOp::create(userBuilder, take.getLoc(), cleared, pointer);
+                        }
                     }
                     Value result = elements.size() == 1
                                        ? elements.front()
@@ -387,8 +493,41 @@ private:
                     take.erase();
                     continue;
                 }
+                if (auto peek = dyn_cast<AdAdjointPeekOp>(user)) {
+                    OpBuilder userBuilder(peek);
+                    SmallVector<Value> elements;
+                    for (const SmallVector<int64_t> &coordinate : trailingCoordinates) {
+                        SmallVector<Value> indices =
+                            appendCoordinate(userBuilder, peek.getLoc(), peek.getIndices(), coordinate);
+                        Value pointer = address(userBuilder, peek.getLoc(), indices);
+                        if (workgroupShared) {
+                            Value zeroValue = zero(userBuilder, peek.getLoc(), type.getElementType());
+                            elements.push_back(LLVM::AtomicRMWOp::create(userBuilder, peek.getLoc(), atomicAdd, pointer,
+                                                                         zeroValue, LLVM::AtomicOrdering::monotonic));
+                        } else {
+                            elements.push_back(
+                                LLVM::LoadOp::create(userBuilder, peek.getLoc(), type.getElementType(), pointer));
+                        }
+                    }
+                    Value result = elements.size() == 1
+                                       ? elements.front()
+                                       : tensor::FromElementsOp::create(
+                                             userBuilder, peek.getLoc(),
+                                             cast<RankedTensorType>(peek.getValue().getType()), elements);
+                    peek.getValue().replaceAllUsesWith(result);
+                    peek.erase();
+                    continue;
+                }
                 if (auto store = dyn_cast<AdAdjointStoreOp>(user)) {
+                    OpBuilder controlBuilder(store);
+                    std::optional<scf::IfOp> leaderConditional;
                     OpBuilder userBuilder(store);
+                    if (workgroupShared) {
+                        Value leader = func::CallOp::create(controlBuilder, store.getLoc(), leaderHelper, ValueRange{})
+                                           .getResult(0);
+                        leaderConditional = scf::IfOp::create(controlBuilder, store.getLoc(), leader, false);
+                        userBuilder = OpBuilder::atBlockTerminator(&leaderConditional->getThenRegion().front());
+                    }
                     SmallVector<Value> prefix;
                     emitLoopNest(
                         userBuilder, store.getLoc(), ValueRange(bounds).take_front(type.getIndexRank()), 0, prefix,
@@ -397,8 +536,9 @@ private:
                             for (const SmallVector<int64_t> &coordinate : trailingCoordinates) {
                                 SmallVector<Value> memoryIndices =
                                     appendCoordinate(nested, store.getLoc(), indices, coordinate);
+                                Value pointer = address(nested, store.getLoc(), memoryIndices);
                                 elements.push_back(
-                                    memref::LoadOp::create(nested, store.getLoc(), memory, memoryIndices));
+                                    LLVM::LoadOp::create(nested, store.getLoc(), type.getElementType(), pointer));
                             }
                             Value value =
                                 elements.size() == 1
@@ -409,7 +549,26 @@ private:
                                               cast<TensorViewType>(store.getDestination().getType()).getElementType()),
                                           elements)
                                           .getResult();
-                            StoreOp::create(nested, store.getLoc(), value, store.getDestination(), indices);
+                            if (workgroupShared) {
+                                StoreOp::create(nested, store.getLoc(), value, store.getDestination(), indices);
+                            } else if (!isa<FloatType>(
+                                           cast<TensorViewType>(store.getDestination().getType()).getElementType())) {
+                                StoreOp::create(nested, store.getLoc(), value, store.getDestination(), indices);
+                            } else {
+                                OperationState scatterState(store.getLoc(), ScatterAddOp::getOperationName());
+                                scatterState.addOperands(value);
+                                scatterState.addOperands(store.getDestination());
+                                scatterState.addOperands(indices);
+                                scatterState.addAttribute("deterministic", nested.getBoolAttr(false));
+                                auto destination = dyn_cast<BlockArgument>(store.getDestination());
+                                auto ownership =
+                                    destination ? function.getArgAttrOfType<StringAttr>(destination.getArgNumber(),
+                                                                                        kAccumulationOwnershipAttrName)
+                                                : nullptr;
+                                if (ownership && ownership.getValue() == kInvocationPrivateAccumulationOwnership)
+                                    scatterState.addAttribute(kAccumulationOwnershipAttrName, ownership);
+                                nested.create(scatterState);
+                            }
                         });
                     store.erase();
                     continue;

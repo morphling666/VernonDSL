@@ -10,8 +10,7 @@ from ..language.ast_utils import dotted_name
 from ..language.stage_registry import ENTRY_DECORATORS, GRAPHICS_STAGES, STAGE_BY_DECORATOR
 from ..module_graph import clear_project_cache, load_project
 from ..struct_methods import normalize_struct_methods
-from .autodiff import AutodiffProgram, build_program_graph
-from .autodiff_profiles import AutodiffProfilePlan, build_autodiff_profile_plan
+from .autodiff_profiles import AutodiffProfilePlan
 from .cache import frontend_cache
 from .emission import emit_mlir_module
 from .lowering import _FunctionEmitter
@@ -70,36 +69,16 @@ class Compiler:
         self._entry_workgroup_size: tuple[int, int, int] | None = None
         context.typed_functions = {function.symbol: function for function in self._typed_functions}
         self._collect_signatures(module, context, type_parser)
-        self._program_graph: AutodiffProgram | None = None
         self._autodiff_profiles: AutodiffProfilePlan | None = None
         if program_transform is not None:
             self._validate_program_transform(program_transform, runtime_entry, context)
             assert runtime_entry is not None
-            typed_entry = context.typed_functions[runtime_entry]
             entry_node = next(
                 node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == runtime_entry
             )
-            entry_stage, declared_workgroup_size = self._decorator(entry_node, context)
+            entry_stage, _ = self._decorator(entry_node, context)
             if entry_stage != "compute":
                 raise context.error(entry_node, "autodiff currently requires a compute entry")
-            struct_fields = {
-                name: tuple((field_name, annotation.type) for field_name, annotation in fields)
-                for name, fields in context.structs.items()
-            }
-            if program_transform.protocol == "legacy_fixed":
-                self._program_graph = build_program_graph(
-                    typed_entry,
-                    context.typed_functions,
-                    program_transform.wrt,
-                    struct_fields,
-                    program_transform.derivative_rules_version,
-                    runtime_workgroup_size or declared_workgroup_size,
-                    context.error,
-                )
-                self._autodiff_profiles = build_autodiff_profile_plan(
-                    program_transform,
-                    self._program_graph,
-                )
 
         def emit_function(node: ast.FunctionDef) -> list[str]:
             stage, workgroup_size = self._decorator(node, context)
@@ -129,7 +108,6 @@ class Compiler:
             emit_function=emit_function,
             error=context.error,
             program_transform=program_transform,
-            program_graph=self._program_graph,
             autodiff_profiles=self._autodiff_profiles,
         )
 
@@ -158,7 +136,6 @@ class Compiler:
         if cached is not None:
             self._helper_specializations = cached.helper_specializations
             self._typed_functions = cached.typed_functions
-            self._program_graph = cached.program_graph
             self._autodiff_profiles = cached.autodiff_profiles
             self._entry_workgroup_size = cached.entry_workgroup_size
             return cached
@@ -183,7 +160,6 @@ class Compiler:
             request,
             self._helper_specializations,
             self._typed_functions,
-            self._program_graph,
             self._autodiff_profiles,
             self._entry_workgroup_size,
             self._structs,
@@ -232,13 +208,10 @@ class Compiler:
                 return sum(floating_leaves(field.type) for _, field in context.structs[value_type.name])
             return 0
 
-        if transform.protocol == "dynamic_v2":
-            if function.result_type is not None:
-                raise context.error(
-                    function.source, "compute kernels must return None; VJP objectives are writable Storage"
-                )
-        elif function.result_type is None or not floating_leaves(function.result_type):
-            raise context.error(function.source, "legacy VJP requires a differentiable program result")
+        if function.result_type is not None:
+            raise context.error(
+                function.source, "compute kernels must return None; VJP objectives are writable Storage"
+            )
         typed_parameters = {parameter.name: parameter for parameter in function.parameters}
 
         def resolve_path(path: str, *, role: str) -> ConcreteType:
@@ -275,8 +248,6 @@ class Compiler:
                 )
             if not floating_leaves(value_type):
                 raise context.error(function.source, f"VJP wrt path '{path}' has no differentiable floating leaves")
-        if transform.protocol == "legacy_fixed":
-            return
         if not transform.output_cotangents:
             raise context.error(function.source, "compute VJP requires non-empty writable Storage outputs")
         for path in transform.output_cotangents:

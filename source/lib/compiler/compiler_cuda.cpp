@@ -50,6 +50,15 @@ bool compileCuda(PreparedModule &prepared, std::vector<Artifact> &artifacts, std
     if (mlir::failed(preparedTarget))
         return false;
     mlir::OwningOpRef<mlir::ModuleOp> module = std::move(preparedTarget->module);
+    {
+        mlir::PassManager passManager(&context);
+        passManager.addPass(mlir::vernon::createVernonLowerAccumulationPass(
+            mlir::vernon::AccumulationTargetCapabilities{/*supportsF32AtomicAdd=*/true,
+                                                         /*supportsF64AtomicAdd=*/false,
+                                                         mlir::vernon::AggregateGradientStorage::Shared}));
+        if (mlir::failed(passManager.run(*module)))
+            return false;
+    }
     mlir::FailureOr<std::string> targetReflection =
         buildReflection(*module, prepared.logicalReflection(), preparedTarget->entries, preparedTarget->provenance);
     if (mlir::failed(targetReflection))
@@ -57,12 +66,9 @@ bool compileCuda(PreparedModule &prepared, std::vector<Artifact> &artifacts, std
     reflection = std::move(*targetReflection);
 
     mlir::PassManager passManager(&context);
-    passManager.addPass(mlir::vernon::createVernonLowerAccumulationPass(
-        mlir::vernon::AccumulationTargetCapabilities{/*supportsF32AtomicAdd=*/true,
-                                                     /*supportsF64AtomicAdd=*/false}));
     passManager.addPass(mlir::vernon::createVernonToGPUPass());
     passManager.addPass(std::make_unique<KeepGpuModulesPass>());
-    passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerSynchronizationPass(true));
+    passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerGPUSynchronizationPass());
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerGPUTensorsPass());
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::createConvertElementwiseToLinalgPass());
     mlir::bufferization::OneShotBufferizePassOptions bufferizationOptions;

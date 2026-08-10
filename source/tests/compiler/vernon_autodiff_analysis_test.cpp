@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffAnalysis.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffRules.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonGlobalIdIndexProof.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
@@ -44,6 +45,91 @@ protected:
 
     MLIRContext context;
 };
+
+TEST_F(VernonAutodiffAnalysisTest, AppliesGlobalIdProofPolicies) {
+    OwningOpRef<ModuleOp> module = parse(R"mlir(
+module {
+  func.func @proof_inputs(
+      %gid: tensor<3xi32> {vernon.builtin = "global_invocation_id"},
+      %group: tensor<3xi32> {vernon.builtin = "workgroup_id"},
+      %local: tensor<3xi32> {vernon.builtin = "local_invocation_id"},
+      %unknown: index,
+      %scalar_gid: index {vernon.builtin = "global_invocation_id"}) attributes {
+        vernon.workgroup_size = array<i32: 4, 1, 1>
+      } {
+    %zero = arith.constant 0 : index
+    %one = arith.constant 1 : index
+    %two = arith.constant 2 : index
+    %four = arith.constant 4 : index
+    %gx_i32 = tensor.extract %gid[%zero] : tensor<3xi32>
+    %group_x_i32 = tensor.extract %group[%zero] : tensor<3xi32>
+    %local_x_i32 = tensor.extract %local[%zero] : tensor<3xi32>
+    %gy_i32 = tensor.extract %gid[%one] : tensor<3xi32>
+    %gz_i32 = tensor.extract %gid[%two] : tensor<3xi32>
+    %gx = arith.index_cast %gx_i32 : i32 to index
+    %gx_bits = arith.bitcast %gx_i32 : i32 to i32
+    %gx_bitcast = arith.index_cast %gx_bits : i32 to index
+    %group_x = arith.index_castui %group_x_i32 : i32 to index
+    %local_x = arith.index_castui %local_x_i32 : i32 to index
+    %group_base = arith.muli %group_x, %four : index
+    %reconstructed_x = arith.addi %group_base, %local_x : index
+    %gy = arith.index_cast %gy_i32 : i32 to index
+    %gz = arith.index_cast %gz_i32 : i32 to index
+    %gx_unsigned = arith.index_castui %gx_i32 : i32 to index
+    %remainder = arith.remui %gx, %four : index
+    %quotient = arith.divui %gx, %four : index
+    %short = arith.trunci %gx_i32 : i32 to i16
+    %truncated = arith.index_cast %short : i16 to index
+    func.return
+  }
+}
+)mlir");
+    ASSERT_TRUE(module);
+    func::FuncOp function = module->lookupSymbol<func::FuncOp>("proof_inputs");
+    SmallVector<Value> casts;
+    Value remainder;
+    Value quotient;
+    Value unsignedCast;
+    function.walk([&](arith::IndexCastOp operation) { casts.push_back(operation.getResult()); });
+    function.walk([&](arith::IndexCastUIOp operation) { unsignedCast = operation.getResult(); });
+    function.walk([&](arith::RemUIOp operation) { remainder = operation.getResult(); });
+    function.walk([&](arith::DivUIOp operation) { quotient = operation.getResult(); });
+    ASSERT_EQ(casts.size(), 5u);
+    ASSERT_TRUE(remainder);
+    ASSERT_TRUE(quotient);
+    ASSERT_TRUE(unsignedCast);
+
+    SmallVector<Value> complete{casts[0], casts[2], casts[3]};
+    EXPECT_TRUE(proveStrictInvocationOwnedIndex(complete));
+    auto completeProof = proveInvocationOwnedIndex(complete);
+    ASSERT_TRUE(completeProof);
+    EXPECT_TRUE(completeProof->unitGridAxes.empty());
+    EXPECT_FALSE(proveStrictInvocationOwnedIndex({unsignedCast}));
+    EXPECT_FALSE(proveStrictInvocationOwnedIndex({casts[1]}));
+    EXPECT_FALSE(proveStrictInvocationOwnedIndex({function.getArgument(4)}));
+    EXPECT_FALSE(proveInvocationOwnedIndex({function.getArgument(4)}));
+
+    arith::AddIOp reconstructed;
+    function.walk([&](arith::AddIOp operation) { reconstructed = operation; });
+    ASSERT_TRUE(reconstructed);
+    EXPECT_FALSE(proveStrictInvocationOwnedIndex({reconstructed.getResult()}));
+    EXPECT_FALSE(proveInvocationOwnedIndex({function.getArgument(2)}));
+    EXPECT_FALSE(proveInvocationOwnedIndex({function.getArgument(1)}));
+
+    SmallVector<Value> trailingUnknown{casts[0], casts[2], casts[3], function.getArgument(3)};
+    EXPECT_FALSE(proveStrictInvocationOwnedIndex(trailingUnknown));
+    EXPECT_TRUE(proveInvocationOwnedIndex(trailingUnknown));
+
+    EXPECT_FALSE(proveInvocationOwnedIndex({function.getArgument(3), casts[0], casts[2], casts[3]}));
+    auto partialProof = proveInvocationOwnedIndex({casts[0]});
+    ASSERT_TRUE(partialProof);
+    EXPECT_EQ(partialProof->unitGridAxes, (SmallVector<unsigned>{1, 2}));
+    EXPECT_FALSE(proveInvocationOwnedIndex({function.getArgument(1)}));
+    EXPECT_FALSE(proveInvocationOwnedIndex({casts[0], casts[2], casts[3], casts[0]}));
+    EXPECT_FALSE(proveInvocationOwnedIndex({casts[0], casts[2], casts[3], remainder}));
+    EXPECT_FALSE(proveInvocationOwnedIndex({casts[0], casts[2], casts[3], quotient}));
+    EXPECT_FALSE(proveInvocationOwnedIndex({casts[0], casts[2], casts[3], casts[4]}));
+}
 
 TEST_F(VernonAutodiffAnalysisTest, PrunesValuesOutsideWrtToResultPath) {
     OwningOpRef<ModuleOp> module = parse(R"mlir(
@@ -246,9 +332,9 @@ module {
     });
     EXPECT_TRUE(llvm::is_contained(effects, AutodiffEffectKind::StorageRead));
     EXPECT_TRUE(llvm::is_contained(effects, AutodiffEffectKind::StorageWrite));
-    EXPECT_TRUE(llvm::is_contained(effects, AutodiffEffectKind::Atomic));
+    EXPECT_EQ(llvm::count(effects, AutodiffEffectKind::Atomic), 2u);
     EXPECT_TRUE(llvm::is_contained(effects, AutodiffEffectKind::Barrier));
-    EXPECT_TRUE(llvm::is_contained(effects, AutodiffEffectKind::ExternallyVisible));
+    EXPECT_FALSE(llvm::is_contained(effects, AutodiffEffectKind::ExternallyVisible));
 }
 
 TEST_F(VernonAutodiffAnalysisTest, KeepsEffectOnlyStructuredRegionActive) {
@@ -284,34 +370,297 @@ module {
     ASSERT_NE(storeActivity, analysis->getOperations().end());
     EXPECT_EQ(storeActivity->effect, AutodiffEffectKind::StorageWrite);
     EXPECT_FALSE(storeActivity->active);
+    const AutodiffStorageIdentity *identity = analysis->getStorageIdentity(function.getArgument(1));
+    ASSERT_NE(identity, nullptr);
+    EXPECT_EQ(identity->internalAdjointOwnership, AutodiffInternalAdjointOwnership::None);
+    EXPECT_FALSE(identity->externalGradientDestination);
+}
+
+TEST_F(VernonAutodiffAnalysisTest, ClassifiesActiveWorkgroupStorageAsCoupled) {
+    OwningOpRef<ModuleOp> module = parse(R"mlir(
+module {
+  func.func @active_workgroup(
+      %x: f32 {vernon.source_name = "x", vernon.abi_leaf_dtypes = ["f32"]},
+      %workgroup: !vernon.tensor_view<f32, [1], "read_write", "workgroup">,
+      %index: index) -> (f32 {vernon.abi_leaf_dtypes = ["f32"]}) {
+    "vernon.store"(%x, %workgroup, %index)
+        : (f32, !vernon.tensor_view<f32, [1], "read_write", "workgroup">, index) -> ()
+    %loaded = "vernon.load"(%workgroup, %index)
+        : (!vernon.tensor_view<f32, [1], "read_write", "workgroup">, index) -> f32
+    func.return %loaded : f32
+  }
+}
+)mlir");
+    ASSERT_TRUE(module);
+    func::FuncOp function = module->lookupSymbol<func::FuncOp>("active_workgroup");
+    FailureOr<VernonAutodiffAnalysisResult> analysis = analyzeAutodiffFunction(function, {"x"});
+    ASSERT_TRUE(succeeded(analysis));
+    const AutodiffStorageIdentity *identity = analysis->getStorageIdentity(function.getArgument(1));
+    ASSERT_NE(identity, nullptr);
+    EXPECT_EQ(identity->internalAdjointOwnership, AutodiffInternalAdjointOwnership::WorkgroupCoupled);
+    EXPECT_FALSE(identity->externalGradientDestination);
+}
+
+TEST_F(VernonAutodiffAnalysisTest, RejectsUnprovenDeviceInternalAdjointOwnership) {
+    OwningOpRef<ModuleOp> module = parse(R"mlir(
+module {
+  func.func @ambiguous_device_scratch(
+      %x: f32 {vernon.source_name = "x", vernon.abi_leaf_dtypes = ["f32"]},
+      %scratch: !vernon.tensor_view<f32, [1], "read_write", "device">)
+      -> (f32 {vernon.abi_leaf_dtypes = ["f32"]}) attributes {
+        vernon.workgroup_size = array<i32: 4, 1, 1>
+      } {
+    %zero = arith.constant 0 : index
+    "vernon.store"(%x, %scratch, %zero)
+        : (f32, !vernon.tensor_view<f32, [1], "read_write", "device">, index) -> ()
+    "vernon.barrier"() {ordering = "acquire_release", scope = "workgroup"} : () -> ()
+    %loaded = "vernon.load"(%scratch, %zero)
+        : (!vernon.tensor_view<f32, [1], "read_write", "device">, index) -> f32
+    func.return %loaded : f32
+  }
+}
+)mlir");
+    ASSERT_TRUE(module);
+    func::FuncOp function = module->lookupSymbol<func::FuncOp>("ambiguous_device_scratch");
+    EXPECT_NE(failureMessage(function, {"x"}).find("no proven lane-owned injective index mapping"), std::string::npos);
+}
+
+TEST_F(VernonAutodiffAnalysisTest, RejectsPartialGlobalIdTupleAsNonInjective) {
+    OwningOpRef<ModuleOp> module = parse(R"mlir(
+module {
+  func.func @partial_global_id(
+      %x: f32 {vernon.source_name = "x", vernon.abi_leaf_dtypes = ["f32"]},
+      %scratch: !vernon.tensor_view<f32, [4], "read_write", "device">,
+      %gid: tensor<3xi32> {vernon.builtin = "global_invocation_id"})
+      -> (f32 {vernon.abi_leaf_dtypes = ["f32"]}) {
+    %zero = arith.constant 0 : index
+    %gx_i32 = tensor.extract %gid[%zero] : tensor<3xi32>
+    %gx = arith.index_cast %gx_i32 : i32 to index
+    "vernon.store"(%x, %scratch, %gx)
+        : (f32, !vernon.tensor_view<f32, [4], "read_write", "device">, index) -> ()
+    %loaded = "vernon.load"(%scratch, %gx)
+        : (!vernon.tensor_view<f32, [4], "read_write", "device">, index) -> f32
+    func.return %loaded : f32
+  }
+}
+)mlir");
+    ASSERT_TRUE(module);
+    func::FuncOp function = module->lookupSymbol<func::FuncOp>("partial_global_id");
+    EXPECT_NE(failureMessage(function, {"x"}).find("no proven lane-owned injective index mapping"), std::string::npos);
+}
+
+TEST_F(VernonAutodiffAnalysisTest, RejectsScalarGlobalIdAsLanePrivate) {
+    OwningOpRef<ModuleOp> module = parse(R"mlir(
+module {
+  func.func @scalar_global_id(
+      %x: f32 {vernon.source_name = "x", vernon.abi_leaf_dtypes = ["f32"]},
+      %scratch: !vernon.tensor_view<f32, [4], "read_write", "device">,
+      %gid: index {vernon.builtin = "global_invocation_id"})
+      -> (f32 {vernon.abi_leaf_dtypes = ["f32"]}) {
+    "vernon.store"(%x, %scratch, %gid)
+        : (f32, !vernon.tensor_view<f32, [4], "read_write", "device">, index) -> ()
+    %loaded = "vernon.load"(%scratch, %gid)
+        : (!vernon.tensor_view<f32, [4], "read_write", "device">, index) -> f32
+    func.return %loaded : f32
+  }
+}
+)mlir");
+    ASSERT_TRUE(module);
+    func::FuncOp function = module->lookupSymbol<func::FuncOp>("scalar_global_id");
+    EXPECT_NE(failureMessage(function, {"x"}).find("no proven lane-owned injective index mapping"), std::string::npos);
+}
+
+TEST_F(VernonAutodiffAnalysisTest, AcceptsCompleteGlobalIdTupleAsLanePrivate) {
+    OwningOpRef<ModuleOp> module = parse(R"mlir(
+module {
+  func.func @complete_global_id(
+      %x: f32 {vernon.source_name = "x", vernon.abi_leaf_dtypes = ["f32"]},
+      %scratch: !vernon.tensor_view<f32, [4, 4, 4], "read_write", "device">,
+      %gid: tensor<3xi32> {vernon.builtin = "global_invocation_id"})
+      -> (f32 {vernon.abi_leaf_dtypes = ["f32"]}) {
+    %zero = arith.constant 0 : index
+    %one = arith.constant 1 : index
+    %two = arith.constant 2 : index
+    %gx_i32 = tensor.extract %gid[%zero] : tensor<3xi32>
+    %gy_i32 = tensor.extract %gid[%one] : tensor<3xi32>
+    %gz_i32 = tensor.extract %gid[%two] : tensor<3xi32>
+    %gx = arith.index_cast %gx_i32 : i32 to index
+    %gy = arith.index_cast %gy_i32 : i32 to index
+    %gz = arith.index_cast %gz_i32 : i32 to index
+    "vernon.store"(%x, %scratch, %gx, %gy, %gz)
+        : (f32, !vernon.tensor_view<f32, [4, 4, 4], "read_write", "device">,
+           index, index, index) -> ()
+    %loaded = "vernon.load"(%scratch, %gx, %gy, %gz)
+        : (!vernon.tensor_view<f32, [4, 4, 4], "read_write", "device">,
+           index, index, index) -> f32
+    func.return %loaded : f32
+  }
+}
+)mlir");
+    ASSERT_TRUE(module);
+    func::FuncOp function = module->lookupSymbol<func::FuncOp>("complete_global_id");
+    FailureOr<VernonAutodiffAnalysisResult> analysis = analyzeAutodiffFunction(function, {"x"});
+    ASSERT_TRUE(succeeded(analysis));
+    const AutodiffStorageIdentity *identity = analysis->getStorageIdentity(function.getArgument(1));
+    ASSERT_NE(identity, nullptr);
+    EXPECT_EQ(identity->internalAdjointOwnership, AutodiffInternalAdjointOwnership::LanePrivate);
+}
+
+TEST_F(VernonAutodiffAnalysisTest, AcceptsTrailingUnknownAfterCompleteGlobalIdTuple) {
+    OwningOpRef<ModuleOp> module = parse(R"mlir(
+module {
+  func.func @complete_global_id_with_tail(
+      %x: f32 {vernon.source_name = "x", vernon.abi_leaf_dtypes = ["f32"]},
+      %scratch: !vernon.tensor_view<f32, [4, 4, 4, 4], "read_write", "device">,
+      %gid: tensor<3xi32> {vernon.builtin = "global_invocation_id"},
+      %tail: index) -> (f32 {vernon.abi_leaf_dtypes = ["f32"]}) {
+    %zero = arith.constant 0 : index
+    %one = arith.constant 1 : index
+    %two = arith.constant 2 : index
+    %gx_i32 = tensor.extract %gid[%zero] : tensor<3xi32>
+    %gy_i32 = tensor.extract %gid[%one] : tensor<3xi32>
+    %gz_i32 = tensor.extract %gid[%two] : tensor<3xi32>
+    %gx = arith.index_cast %gx_i32 : i32 to index
+    %gy = arith.index_cast %gy_i32 : i32 to index
+    %gz = arith.index_cast %gz_i32 : i32 to index
+    "vernon.store"(%x, %scratch, %gx, %gy, %gz, %tail)
+        : (f32, !vernon.tensor_view<f32, [4, 4, 4, 4], "read_write", "device">,
+           index, index, index, index) -> ()
+    %loaded = "vernon.load"(%scratch, %gx, %gy, %gz, %tail)
+        : (!vernon.tensor_view<f32, [4, 4, 4, 4], "read_write", "device">,
+           index, index, index, index) -> f32
+    func.return %loaded : f32
+  }
+}
+)mlir");
+    ASSERT_TRUE(module);
+    func::FuncOp function = module->lookupSymbol<func::FuncOp>("complete_global_id_with_tail");
+    FailureOr<VernonAutodiffAnalysisResult> analysis = analyzeAutodiffFunction(function, {"x"});
+    ASSERT_TRUE(succeeded(analysis));
+    const AutodiffStorageIdentity *identity = analysis->getStorageIdentity(function.getArgument(1));
+    ASSERT_NE(identity, nullptr);
+    EXPECT_EQ(identity->internalAdjointOwnership, AutodiffInternalAdjointOwnership::LanePrivate);
+}
+
+TEST_F(VernonAutodiffAnalysisTest, RejectsRemainderAfterCompleteGlobalIdTuple) {
+    OwningOpRef<ModuleOp> module = parse(R"mlir(
+module {
+  func.func @global_id_with_remainder(
+      %x: f32 {vernon.source_name = "x", vernon.abi_leaf_dtypes = ["f32"]},
+      %scratch: !vernon.tensor_view<f32, [4, 4, 4, 4], "read_write", "device">,
+      %gid: tensor<3xi32> {vernon.builtin = "global_invocation_id"})
+      -> (f32 {vernon.abi_leaf_dtypes = ["f32"]}) {
+    %zero = arith.constant 0 : index
+    %one = arith.constant 1 : index
+    %two = arith.constant 2 : index
+    %four = arith.constant 4 : index
+    %gx_i32 = tensor.extract %gid[%zero] : tensor<3xi32>
+    %gy_i32 = tensor.extract %gid[%one] : tensor<3xi32>
+    %gz_i32 = tensor.extract %gid[%two] : tensor<3xi32>
+    %gx = arith.index_cast %gx_i32 : i32 to index
+    %gy = arith.index_cast %gy_i32 : i32 to index
+    %gz = arith.index_cast %gz_i32 : i32 to index
+    %wrapped = arith.remui %gx, %four : index
+    "vernon.store"(%x, %scratch, %gx, %gy, %gz, %wrapped)
+        : (f32, !vernon.tensor_view<f32, [4, 4, 4, 4], "read_write", "device">,
+           index, index, index, index) -> ()
+    %loaded = "vernon.load"(%scratch, %gx, %gy, %gz, %wrapped)
+        : (!vernon.tensor_view<f32, [4, 4, 4, 4], "read_write", "device">,
+           index, index, index, index) -> f32
+    func.return %loaded : f32
+  }
+}
+)mlir");
+    ASSERT_TRUE(module);
+    func::FuncOp function = module->lookupSymbol<func::FuncOp>("global_id_with_remainder");
+    EXPECT_NE(failureMessage(function, {"x"}).find("no proven lane-owned injective index mapping"), std::string::npos);
+}
+
+TEST_F(VernonAutodiffAnalysisTest, RejectsCrossLaneDeviceInternalAdjointOwnership) {
+    OwningOpRef<ModuleOp> module = parse(R"mlir(
+module {
+  func.func @proven_device_scratch(
+      %x: f32 {vernon.source_name = "x", vernon.abi_leaf_dtypes = ["f32"]},
+      %scratch: !vernon.tensor_view<f32, [4, 4, 4], "read_write", "device">,
+      %gid: tensor<3xi32> {vernon.builtin = "global_invocation_id"},
+      %group: tensor<3xi32> {vernon.builtin = "workgroup_id"},
+      %local: tensor<3xi32> {vernon.builtin = "local_invocation_id"})
+      -> (f32 {vernon.abi_leaf_dtypes = ["f32"]}) attributes {
+        vernon.workgroup_size = array<i32: 4, 1, 1>
+      } {
+    %zero = arith.constant 0 : index
+    %one = arith.constant 1 : index
+    %two = arith.constant 2 : index
+    %gy_i32 = tensor.extract %gid[%one] : tensor<3xi32>
+    %gz_i32 = tensor.extract %gid[%two] : tensor<3xi32>
+    %group_x_i32 = tensor.extract %group[%zero] : tensor<3xi32>
+    %local_x_i32 = tensor.extract %local[%zero] : tensor<3xi32>
+    %gy = arith.index_cast %gy_i32 : i32 to index
+    %gz = arith.index_cast %gz_i32 : i32 to index
+    %group_x = arith.index_cast %group_x_i32 : i32 to index
+    %local_x = arith.index_cast %local_x_i32 : i32 to index
+    %four = arith.constant 4 : index
+    %group_base = arith.muli %group_x, %four : index
+    %store_x = arith.addi %group_base, %local_x : index
+    "vernon.store"(%x, %scratch, %gz, %gy, %store_x)
+        : (f32, !vernon.tensor_view<f32, [4, 4, 4], "read_write", "device">,
+           index, index, index) -> ()
+    "vernon.barrier"() {ordering = "acquire_release", scope = "workgroup"} : () -> ()
+    %next = arith.addi %local_x, %one : index
+    %neighbor = arith.remui %next, %four : index
+    %load_x = arith.addi %group_base, %neighbor : index
+    %loaded = "vernon.load"(%scratch, %gz, %gy, %load_x)
+        : (!vernon.tensor_view<f32, [4, 4, 4], "read_write", "device">,
+           index, index, index) -> f32
+    func.return %loaded : f32
+  }
+}
+)mlir");
+    ASSERT_TRUE(module);
+    func::FuncOp function = module->lookupSymbol<func::FuncOp>("proven_device_scratch");
+    EXPECT_NE(failureMessage(function, {"x"}).find("no proven lane-owned injective index mapping"), std::string::npos);
 }
 
 TEST_F(VernonAutodiffAnalysisTest, VersionsStorageEffectsAcrossBranches) {
     OwningOpRef<ModuleOp> module = parse(R"mlir(
 module {
   func.func @storage_versions(
-      %input: !vernon.tensor_view<f32, [1], "read", "device"> {
+      %input: !vernon.tensor_view<f32, [1, 1, 1], "read", "device"> {
         vernon.source_name = "input", vernon.abi_leaf_dtypes = ["f32"]},
-      %scratch: !vernon.tensor_view<f32, [1], "read_write", "device"> {
+      %scratch: !vernon.tensor_view<f32, [1, 1, 1], "read_write", "device"> {
         vernon.source_name = "scratch", vernon.abi_leaf_dtypes = ["f32"]},
-      %loss: !vernon.tensor_view<f32, [1], "write", "device"> {
+      %loss: !vernon.tensor_view<f32, [1, 1, 1], "write", "device"> {
         vernon.source_name = "loss", vernon.abi_leaf_dtypes = ["f32"]},
-      %condition: i1) {
-    %index = arith.constant 0 : index
-    %value = "vernon.load"(%input, %index)
-        : (!vernon.tensor_view<f32, [1], "read", "device">, index) -> f32
+      %condition: i1,
+      %gid: tensor<3xi32> {vernon.builtin = "global_invocation_id"}) {
+    %zero = arith.constant 0 : index
+    %one = arith.constant 1 : index
+    %two = arith.constant 2 : index
+    %gx_i32 = tensor.extract %gid[%zero] : tensor<3xi32>
+    %gy_i32 = tensor.extract %gid[%one] : tensor<3xi32>
+    %gz_i32 = tensor.extract %gid[%two] : tensor<3xi32>
+    %gx = arith.index_cast %gx_i32 : i32 to index
+    %gy = arith.index_cast %gy_i32 : i32 to index
+    %gz = arith.index_cast %gz_i32 : i32 to index
+    %value = "vernon.load"(%input, %gx, %gy, %gz)
+        : (!vernon.tensor_view<f32, [1, 1, 1], "read", "device">,
+           index, index, index) -> f32
     scf.if %condition {
-      "vernon.store"(%value, %scratch, %index)
-          : (f32, !vernon.tensor_view<f32, [1], "read_write", "device">, index) -> ()
+      "vernon.store"(%value, %scratch, %gx, %gy, %gz)
+          : (f32, !vernon.tensor_view<f32, [1, 1, 1], "read_write", "device">,
+             index, index, index) -> ()
     } else {
       %twice = arith.addf %value, %value : f32
-      "vernon.store"(%twice, %scratch, %index)
-          : (f32, !vernon.tensor_view<f32, [1], "read_write", "device">, index) -> ()
+      "vernon.store"(%twice, %scratch, %gx, %gy, %gz)
+          : (f32, !vernon.tensor_view<f32, [1, 1, 1], "read_write", "device">,
+             index, index, index) -> ()
     }
-    %stored = "vernon.load"(%scratch, %index)
-        : (!vernon.tensor_view<f32, [1], "read_write", "device">, index) -> f32
-    "vernon.store"(%stored, %loss, %index)
-        : (f32, !vernon.tensor_view<f32, [1], "write", "device">, index) -> ()
+    %stored = "vernon.load"(%scratch, %gx, %gy, %gz)
+        : (!vernon.tensor_view<f32, [1, 1, 1], "read_write", "device">,
+           index, index, index) -> f32
+    "vernon.store"(%stored, %loss, %gx, %gy, %gz)
+        : (f32, !vernon.tensor_view<f32, [1, 1, 1], "write", "device">,
+           index, index, index) -> ()
     func.return
   }
 }
@@ -325,6 +674,18 @@ module {
     EXPECT_EQ(analysis->getStorageIdentities().size(), 3u);
     EXPECT_EQ(analysis->getStorageEffects().size(), 5u);
     EXPECT_EQ(analysis->getStorageVersions().size(), 7u);
+    const AutodiffStorageIdentity *inputIdentity = analysis->getStorageIdentity(function.getArgument(0));
+    const AutodiffStorageIdentity *scratchIdentity = analysis->getStorageIdentity(function.getArgument(1));
+    const AutodiffStorageIdentity *lossIdentity = analysis->getStorageIdentity(function.getArgument(2));
+    ASSERT_NE(inputIdentity, nullptr);
+    ASSERT_NE(scratchIdentity, nullptr);
+    ASSERT_NE(lossIdentity, nullptr);
+    EXPECT_EQ(inputIdentity->internalAdjointOwnership, AutodiffInternalAdjointOwnership::None);
+    EXPECT_TRUE(inputIdentity->externalGradientDestination);
+    EXPECT_EQ(scratchIdentity->internalAdjointOwnership, AutodiffInternalAdjointOwnership::LanePrivate);
+    EXPECT_FALSE(scratchIdentity->externalGradientDestination);
+    EXPECT_EQ(lossIdentity->internalAdjointOwnership, AutodiffInternalAdjointOwnership::None);
+    EXPECT_FALSE(lossIdentity->externalGradientDestination);
     EXPECT_EQ(llvm::count_if(
                   analysis->getStorageVersions(),
                   [](const AutodiffStorageVersion &version) { return version.kind == StorageVersionKind::IfMerge; }),
@@ -394,12 +755,13 @@ module {
               std::string::npos);
 }
 
-TEST_F(VernonAutodiffAnalysisTest, RejectsActiveExternallyVisibleEffect) {
+TEST_F(VernonAutodiffAnalysisTest, RejectsCollidingActiveAtomicOldValue) {
     OwningOpRef<ModuleOp> module = parse(R"mlir(
 module {
   func.func @visible(
-      %x: f32 {vernon.source_name = "x", vernon.abi_leaf_dtypes = ["f32"]},
-      %device: !vernon.tensor_view<f32, [1], "read_write", "device">,
+      %device: !vernon.tensor_view<f32, [1], "read_write", "device">
+          {vernon.source_name = "device", vernon.abi_leaf_dtypes = ["f32"]},
+      %x: f32,
       %index: index) -> (f32 {vernon.abi_leaf_dtypes = ["f32"]}) {
     %old = "vernon.atomic"(%device, %index, %x) {
       atomic_kind = "add", ordering = "relaxed"
@@ -410,7 +772,45 @@ module {
 )mlir");
     ASSERT_TRUE(module);
     func::FuncOp function = module->lookupSymbol<func::FuncOp>("visible");
-    EXPECT_NE(failureMessage(function, {"x"}).find("active externally visible operation"), std::string::npos);
+    EXPECT_NE(failureMessage(function, {"device"}).find("requires a proven lane-exclusive device index mapping"),
+              std::string::npos);
+}
+
+TEST_F(VernonAutodiffAnalysisTest, AnalyzesWorkgroupAtomicAddSideEffect) {
+    OwningOpRef<ModuleOp> module = parse(R"mlir(
+module {
+  func.func @workgroup_atomic(
+      %x: f32 {vernon.source_name = "x", vernon.abi_leaf_dtypes = ["f32"]},
+      %loss: !vernon.tensor_view<f32, [1], "write", "device">
+          {vernon.source_name = "loss", vernon.abi_leaf_dtypes = ["f32"]},
+      %gid: index {vernon.builtin = "global_invocation_id"}) {
+    %zero = arith.constant 0 : index
+    %scratch = "vernon.workgroup_alloc"()
+        : () -> !vernon.tensor_view<f32, [1], "read_write", "workgroup">
+    %old = "vernon.atomic"(%scratch, %zero, %x) {
+      atomic_kind = "add", ordering = "relaxed"
+    } : (!vernon.tensor_view<f32, [1], "read_write", "workgroup">, index, f32) -> f32
+    "vernon.barrier"() {ordering = "acquire_release", scope = "workgroup"} : () -> ()
+    %sum = "vernon.load"(%scratch, %zero)
+        : (!vernon.tensor_view<f32, [1], "read_write", "workgroup">, index) -> f32
+    "vernon.store"(%sum, %loss, %gid)
+        : (f32, !vernon.tensor_view<f32, [1], "write", "device">, index) -> ()
+    func.return
+  }
+}
+)mlir");
+    ASSERT_TRUE(module);
+    func::FuncOp function = module->lookupSymbol<func::FuncOp>("workgroup_atomic");
+    VernonAutodiffRuleRegistry registry = createDefaultAutodiffRuleRegistry();
+    FailureOr<VernonAutodiffAnalysisResult> analysis = analyzeAutodiffFunction(function, {"x"}, {"loss"}, registry);
+    ASSERT_TRUE(succeeded(analysis));
+    AtomicOp atomic;
+    function.walk([&](AtomicOp operation) { atomic = operation; });
+    ASSERT_TRUE(atomic);
+    EXPECT_TRUE(analysis->isActive(atomic));
+    const AutodiffStorageIdentity *identity = analysis->getStorageIdentity(atomic.getStorage());
+    ASSERT_NE(identity, nullptr);
+    EXPECT_EQ(identity->internalAdjointOwnership, AutodiffInternalAdjointOwnership::WorkgroupCoupled);
 }
 
 TEST_F(VernonAutodiffAnalysisTest, RejectsConflictingSsaAndResultDtypeMetadata) {

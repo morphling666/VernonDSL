@@ -8,13 +8,11 @@ from typing import Any
 
 from ..ad import ProgramTransformSpec
 from ..bundle import canonical_json
-from .autodiff import (
+from .autodiff_types import (
     AccessPatternEvidence,
     AccumulationMode,
     AccumulationPlan,
-    AutodiffProgram,
     LaunchPlan,
-    OpCode,
 )
 from .model import ConcreteType, TypedFunctionInstance
 
@@ -86,7 +84,6 @@ class AutodiffProfile:
 @dataclass(frozen=True)
 class AutodiffProfilePlan:
     transform_identity: str
-    program_graph_identity: str
     tape_bytes: int
     derivative_rules: tuple[str, ...]
     derivative_rules_version: int
@@ -97,7 +94,6 @@ class AutodiffProfilePlan:
     def to_dict(self) -> dict[str, Any]:
         return {
             "transform_identity": self.transform_identity,
-            "program_graph_identity": self.program_graph_identity,
             "tape_bytes": self.tape_bytes,
             "derivative_rules": list(self.derivative_rules),
             "derivative_rules_version": self.derivative_rules_version,
@@ -323,64 +319,6 @@ def _tensor_view_evidence(
     return tuple(sorted(evidence, key=lambda item: item.value)), tuple(sorted(invocation_axes))
 
 
-def build_autodiff_profile_plan(
-    transform: ProgramTransformSpec,
-    program: AutodiffProgram,
-) -> AutodiffProfilePlan:
-    graph = program.semantic
-    structs = dict(graph.structs)
-    parameter_nodes = tuple(node for node in graph.nodes if node.operation is OpCode.PARAMETER)
-    parameters = {node.source_name: node.type for node in parameter_nodes if node.source_name is not None}
-    output_type = next(node.type for node in graph.nodes if node.id == graph.outputs[0])
-    cotangents = tuple(
-        AutodiffBinding(path, _gradient_type(value_type).mlir, "cotangent")
-        for path, value_type in _leaves(output_type, structs, ("output",))
-    )
-    gradients = tuple(
-        AutodiffBinding(leaf_path, _gradient_type(value_type).mlir, "gradient")
-        for leaf_path, value_type in sorted(
-            (
-                leaf
-                for wrt_path in transform.wrt
-                for leaf in _leaves(
-                    _resolve_path(wrt_path, parameters, structs),
-                    structs,
-                    tuple(wrt_path.split(".")),
-                )
-            ),
-            key=lambda leaf: leaf[0],
-        )
-    )
-    primal_inputs = tuple(AutodiffBinding(node.source_name or "", node.type.mlir, "primal") for node in parameter_nodes)
-    primal_outputs = (AutodiffBinding("output", output_type.mlir, "primal"),)
-    tape = AutodiffBinding("tape", f"!vernon.ad_tape<{program.tape.bytes}>", "tape")
-    identity_prefix = hashlib.sha256(f"{transform.identity}:{program.identity}".encode("utf-8")).hexdigest()[:20]
-    profiles = (
-        AutodiffProfile("primal", graph.entry, primal_inputs, primal_outputs),
-        AutodiffProfile(
-            "forward_with_tape",
-            f"vernon_ad_{identity_prefix}_forward",
-            primal_inputs,
-            (*primal_outputs, tape),
-        ),
-        AutodiffProfile(
-            "backward",
-            f"vernon_ad_{identity_prefix}_backward",
-            (tape, *cotangents),
-            gradients,
-        ),
-    )
-    return AutodiffProfilePlan(
-        transform.identity,
-        program.identity,
-        program.tape.bytes,
-        program.reverse.derivative_rules,
-        program.reverse.derivative_rules_version,
-        program.launch,
-        profiles,
-    )
-
-
 def build_structured_profile_plan(
     transform: ProgramTransformSpec,
     entry: TypedFunctionInstance,
@@ -476,7 +414,6 @@ def build_structured_profile_plan(
             axes,
         )
 
-    program_identity = hashlib.sha256(primal_mlir.encode("utf-8")).hexdigest()
     primal_inputs = tuple(
         AutodiffBinding(parameter.name, parameter.type.mlir, "primal")
         for parameter in entry.parameters
@@ -528,7 +465,6 @@ def build_structured_profile_plan(
     )
     return AutodiffProfilePlan(
         transform.identity,
-        program_identity,
         tape_bytes,
         derivative_rules,
         transform.derivative_rules_version,
@@ -556,7 +492,6 @@ __all__ = [
     "AutodiffProfile",
     "AutodiffProfilePlan",
     "DerivativeGroup",
-    "build_autodiff_profile_plan",
     "build_structured_profile_plan",
     "derivative_groups_from_paths",
     "structured_profile_symbols",

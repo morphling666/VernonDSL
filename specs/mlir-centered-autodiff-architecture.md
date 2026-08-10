@@ -7,12 +7,12 @@ state. Current behavior and remaining work live in
 [`autodiff.md`](autodiff.md) and [`roadmap.md`](roadmap.md).
 
 This document records the prerequisite architecture work for dynamic
-control-flow autodiff. It supersedes attempts to add dynamic regions directly
-to the Python flat `AutodiffProgram` graph.
+control-flow autodiff. It supersedes the removed Python flat graph
+reconstruction path.
 
 This decision was released in compiler contract 11 and pipeline contract 15.
-CPU now uses the structured `dynamic_v2` path exclusively; GPU/graphics
-temporarily retain the explicit `legacy_fixed` emitter.
+CPU now uses the structured `dynamic_v2` path exclusively. GPU and graphics
+autodiff are deferred and unsupported.
 
 ## Problem
 
@@ -23,16 +23,15 @@ Autodiff currently lives at the wrong abstraction layer:
   carried-value merging.
 - Normal frontend control flow is independently implemented by
   `control_flow_lowering.py` and `loop_lowering.py`.
-- the former `autodiff_native_cpu.py` and the retained
-  `autodiff_native_gpu.py` combined the AD transform, graph traversal,
-  control-flow emission, tape layout, and target-specific lowering.
-- CPU Runtime copies a fixed product of reflected tape leaves. GPU Runtime
-  supports only fixed resource sizes multiplied by the dispatch grid.
+- former target-specific native emitters combined the AD transform, graph
+  traversal, control-flow emission, tape layout, and target-specific lowering.
+- earlier runtimes copied fixed products of reflected tape leaves or assumed
+  fixed resource sizes multiplied by the dispatch grid.
 - GPU emitter phases named `CAPTURE_TAPE`, `COMMIT_STORAGE`, and
   `OBSERVE_OUTPUT` are fused graph-replay strategies, not an IR-level effect
   transaction visible to Runtime.
-- `runtime_autodiff_graph.cpp` builds an allocate-once, execute-once graph. It
-  cannot read capture status, resize tape, replay capture, and then commit.
+- the removed GPU graph runtime used an allocate-once, execute-once model that
+  could not read capture status, resize tape, replay capture, and then commit.
 
 Consequently, every control-flow feature must currently be implemented in
 inference, normal MLIR lowering, the AD graph builder, the CPU reference
@@ -61,7 +60,7 @@ Autodiff consumes that MLIR rather than reconstructing source control flow.
 
 ## 1. Restore a Verifiable Baseline
 
-- Preserve completed canonical ABI and GPU aggregate AD work.
+- Preserve the completed canonical ABI and CPU structured AD work.
 - Isolate or remove the incomplete Python `DynamicRegion` path until native
   and Runtime consumers exist.
 - Restore the full test suite to green before starting the architecture
@@ -167,10 +166,10 @@ Instead:
 Capture must functionalize or defer Storage changes until all tape allocations
 succeed, then commit exactly once.
 
-## 5. GPU Backend
+## 5. Deferred GPU Backend
 
-GPU dispatch binds fixed-capacity buffers before launch. Dynamic allocation is
-implemented through capture/count and checked retry:
+GPU autodiff is not implemented or supported. A future implementation would
+need fixed-capacity buffers before launch and capture/count with checked retry:
 
 1. Allocate provisional tape and compact status resources.
 2. Run capture. Each invocation uses a monotonic required-byte counter.
@@ -187,8 +186,8 @@ headers. It is not part of the user ABI.
 Runtime must orchestrate capture and commit as distinct observable phases. A
 single command encoder cannot hide a host readback/allocation retry.
 
-`runtime_autodiff_graph.cpp` therefore needs a per-forward session state
-machine rather than a single static `ExecutionGraph::execute()`:
+A future GPU runtime therefore needs a per-forward session state machine rather
+than a single static `ExecutionGraph::execute()`:
 
 ```text
 Idle
@@ -232,20 +231,12 @@ The existing manifest key set, compiler contract version, and pipeline
 contract version remain unchanged. Internal reflection may add allocator,
 status, or tape-layout roles if old profiles retain compatible parsing.
 
-## 7. Remove the Old Native AD Path
+## 7. Removed Native AD Path
 
-After the C++ structured transform and both backend lowerings cover existing
-AD:
-
-- remove Python native forward/backward graph evaluators;
-- remove duplicated CPU/GPU derivative rule bodies;
-- remove `_GpuForwardEmitter` graph replay as the owner of effect
-  transactions;
-- remove static loop unrolling and its 1024/256 limits;
-- reduce `AutodiffProgram` to user transform metadata, canonical ABI/profile
-  identity, and launch/accumulation plans;
-- keep a reference interpreter only as a test oracle, not as a second compiler
-  semantics implementation.
+The Python graph reconstruction and native GPU forward/backward emitters have
+been removed. CPU `dynamic_v2` now owns canonical ABI/profile identity and
+launch/accumulation plans. GPU and graphics autodiff remain deferred rather
+than retaining a second compiler-semantics implementation.
 
 Existing `vernon.reduce_sum` and `vernon.scatter_add` are good abstraction
 boundaries. Their target strategy remains owned by

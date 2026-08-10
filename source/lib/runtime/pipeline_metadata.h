@@ -2,6 +2,7 @@
 #define VERNON_RUNTIME_PIPELINE_METADATA_H
 
 #include "VernonRuntime.h"
+#include "dispatch_contract.h"
 
 #include <nlohmann/json_fwd.hpp>
 
@@ -55,6 +56,7 @@ struct ReflectedEntry {
     std::vector<ReflectedArgument> arguments;
     std::optional<PackedArgumentsLayout> packedArguments;
     uint32_t workgroup[3]{1, 1, 1};
+    DispatchContract dispatchContract;
 };
 
 bool parseReflection(const nlohmann::json &root, const std::string &selected, ReflectedEntry &output,

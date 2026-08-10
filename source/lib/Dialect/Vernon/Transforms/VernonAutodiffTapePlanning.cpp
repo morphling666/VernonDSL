@@ -3,6 +3,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffAnalysis.h"
 #include "llvm/ADT/DenseMap.h"
@@ -329,6 +330,11 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
     auto saveIndexSource = [&](Value index, RecordBuilder &builder, auto &self) -> LogicalResult {
         if (index.getDefiningOp<arith::ConstantOp>() || index.getDefiningOp<arith::ConstantIndexOp>())
             return success();
+        if (auto argument = dyn_cast<BlockArgument>(index)) {
+            auto owner = dyn_cast_or_null<func::FuncOp>(argument.getOwner()->getParentOp());
+            if (owner && owner.getArgAttr(argument.getArgNumber(), kBuiltinAttrName))
+                return success();
+        }
         if (index.getType().isIntOrFloat()) {
             const ValueAbiLayout *layout = analysis.getValueAbi(index);
             if (layout)

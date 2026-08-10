@@ -150,31 +150,14 @@ def _address_range(shape: tuple[int, ...], strides: tuple[int, ...], offset: int
     return low, high
 
 
-def _is_injective(shape: tuple[int, ...], strides: tuple[int, ...]) -> bool:
-    count = int(np.prod(shape, dtype=np.int64))
-    if count <= 1:
-        return True
-    if any(extent > 1 and stride == 0 for extent, stride in zip(shape, strides, strict=True)):
+def _borrow_ranges_may_overlap(left: TensorView, right: TensorView) -> bool:
+    if left.owner is not right.owner or any(extent == 0 for extent in left.shape + right.shape):
         return False
-    # Prove ordinary contiguous, transposed, and padded layouts in O(rank).
-    # Fall back to exact validation only for unusual small descriptors.
-    covered_span = 0
-    proven = True
-    for extent, stride in sorted(zip(shape, strides, strict=True), key=lambda item: abs(item[1])):
-        if extent <= 1:
-            continue
-        if abs(stride) <= covered_span:
-            proven = False
-            break
-        covered_span += (extent - 1) * abs(stride)
-    if proven:
-        return True
-    if count > 1_000_000:
+    left_range = _address_range(left.shape, left._strides, left._offset)
+    right_range = _address_range(right.shape, right._strides, right._offset)
+    if left_range is None or right_range is None:
         return False
-    addresses = {
-        sum(index * stride for index, stride in zip(indices, strides, strict=True)) for indices in np.ndindex(shape)
-    }
-    return len(addresses) == count
+    return left_range[0] <= right_range[1] and right_range[0] <= left_range[1]
 
 
 def _matches_logical_value(value: Any, element_type: Any) -> bool:
@@ -231,33 +214,6 @@ def _logical_collection_shape(values: Any, element_type: Any) -> tuple[int, ...]
     if any(shape != child_shapes[0] for shape in child_shapes[1:]):
         raise ValueError("logical Values must form a rectangular storage shape")
     return (len(values), *child_shapes[0])
-
-
-def _view_addresses(view: TensorView) -> set[int] | None:
-    count = int(np.prod(view.shape, dtype=np.int64))
-    if count > 1_000_000:
-        return None
-    return {
-        view._offset + sum(index * stride for index, stride in zip(indices, view._strides, strict=True))
-        for indices in np.ndindex(view.shape)
-    }
-
-
-def _views_overlap(left: TensorView, right: TensorView) -> bool:
-    if left.owner is not right.owner or any(extent == 0 for extent in left.shape + right.shape):
-        return False
-    left_range = _address_range(left.shape, left._strides, left._offset)
-    right_range = _address_range(right.shape, right._strides, right._offset)
-    if left_range is None or right_range is None:
-        raise ValueError("TensorView overlap analysis requires non-empty views with defined address ranges")
-    if left_range[1] < right_range[0] or right_range[1] < left_range[0]:
-        return False
-    left_addresses = _view_addresses(left)
-    right_addresses = _view_addresses(right)
-    if left_addresses is None or right_addresses is None:
-        # Unknown overlap is conservatively aliasing for large irregular views.
-        return True
-    return not left_addresses.isdisjoint(right_addresses)
 
 
 class TensorStorage:
@@ -784,8 +740,6 @@ class TensorView:
         owner_elements = owner._array.nbytes // dtype.itemsize
         if address_range is not None and (address_range[0] < 0 or address_range[1] >= owner_elements):
             raise ValueError("TensorView layout is outside its owner allocation")
-        if access != "read" and not _is_injective(shape, strides):
-            raise ValueError("writable TensorView layout must be internally injective")
         self._owner = owner
         self._shape = shape
         self._strides = strides
@@ -972,23 +926,10 @@ def _normalize_dispatch_borrows(
     return normalized
 
 
-def _validate_normalized_borrows(normalized: list[tuple[str, TensorView, str]]) -> None:
-    """Validate shared-owner aliases within one dispatch."""
-
-    for index, (left_name, left, left_access) in enumerate(normalized):
-        for right_name, right, right_access in normalized[index + 1 :]:
-            if left_access == right_access == "read":
-                continue
-            if _views_overlap(left, right):
-                raise ValueError(
-                    f"dispatch arguments '{left_name}' and '{right_name}' have incompatible overlapping borrows"
-                )
-
-
 def _validate_dispatch_borrows(
     borrows: list[tuple[str, TensorStorage | TensorView, str]],
 ) -> None:
-    _validate_normalized_borrows(_normalize_dispatch_borrows(borrows))
+    _normalize_dispatch_borrows(borrows)
 
 
 @contextmanager
@@ -997,7 +938,6 @@ def _dispatch_borrow_scope(
 ) -> Iterator[None]:
     """Retain owners and reject incompatible borrows until dispatch completion."""
     normalized = _normalize_dispatch_borrows(borrows)
-    _validate_normalized_borrows(normalized)
     owners = sorted({view.owner for _, view, _ in normalized}, key=id)
     token = object()
     for owner in owners:
@@ -1007,7 +947,7 @@ def _dispatch_borrow_scope(
             for _, active_view, active_access in view.owner._active_borrows:
                 if access == active_access == "read":
                     continue
-                if _views_overlap(view, active_view):
+                if _borrow_ranges_may_overlap(view, active_view):
                     raise RuntimeError(f"dispatch argument '{name}' conflicts with an outstanding device borrow")
         for _, view, access in normalized:
             view.owner._active_borrows.append((token, view, access))

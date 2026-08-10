@@ -183,13 +183,15 @@ void RenderPass::renderArea(uint32_t x, uint32_t y, uint32_t width, uint32_t hei
     renderArea_[3] = height;
 }
 
+ExecutionGraph::ExecutionGraph() : graphIdentity_(nextGraphIdentity.fetch_add(1, std::memory_order_relaxed)) {}
 ExecutionGraph::ExecutionGraph(VernonRhiDevice device)
-    : device_(device), graphIdentity_(nextGraphIdentity.fetch_add(1, std::memory_order_relaxed)) {}
+    : provider_(Provider::Rhi), device_(device),
+      graphIdentity_(nextGraphIdentity.fetch_add(1, std::memory_order_relaxed)) {}
 ExecutionGraph::~ExecutionGraph() {
     for (const ResourceRecord &record : resourceRecords_) {
-        if (record.graphOwned)
+        if (provider_ == Provider::Rhi && record.graphOwned)
             vernonRhiDeviceDestroyBuffer(device_, record.buffer);
-        if (record.resourceKey && record.resourceKey != UINT64_MAX)
+        if (provider_ == Provider::Rhi && record.resourceKey && record.resourceKey != UINT64_MAX)
             vernon::rhi::releaseResource(device_,
                                          record.resource.kind == ResourceKind::Buffer
                                              ? vernon::rhi::ResourceKind::Buffer
@@ -198,9 +200,35 @@ ExecutionGraph::~ExecutionGraph() {
     }
 }
 
+GraphBuffer ExecutionGraph::importHostBuffer(uint64_t identity, bool exported) {
+    if (!identity || provider_ != Provider::Cpu)
+        return {};
+    if (const auto found = importedHostBuffers_.find(identity); found != importedHostBuffers_.end()) {
+        ResourceRecord &record = resourceRecords_[found->second];
+        record.exported = record.exported || exported;
+        GraphBuffer result;
+        result.id = found->second;
+        result.kind = ResourceKind::Buffer;
+        result.graphIdentity = graphIdentity_;
+        return result;
+    }
+    GraphBuffer result;
+    result.id = static_cast<uint32_t>(resources_.size());
+    result.kind = ResourceKind::Buffer;
+    result.graphIdentity = graphIdentity_;
+    resources_.push_back(result);
+    resourceRecords_.push_back({result, exported});
+    resourceRecords_.back().resourceKey = identity;
+    importedHostBuffers_.emplace(identity, result.id);
+    dirty_ = true;
+    return result;
+}
+
 VernonRhiStatus ExecutionGraph::createBuffer(const VernonRhiBufferDescriptor &descriptor, GraphBuffer &output,
                                              bool exported) {
     output = {};
+    if (provider_ != Provider::Rhi)
+        return VERNON_RHI_STATUS_UNSUPPORTED;
     VernonRhiBuffer buffer{};
     const VernonRhiStatus status = vernonRhiDeviceCreateBuffer(device_, &descriptor, &buffer);
     if (status != VERNON_RHI_STATUS_OK)
@@ -211,6 +239,8 @@ VernonRhiStatus ExecutionGraph::createBuffer(const VernonRhiBufferDescriptor &de
 }
 
 GraphBuffer ExecutionGraph::importBuffer(VernonRhiBuffer buffer, bool exported) {
+    if (provider_ != Provider::Rhi)
+        return {};
     const uint64_t key = handleKey(buffer.index, buffer.generation);
     if (const auto found = importedBuffers_.find(key); found != importedBuffers_.end()) {
         ResourceRecord &record = resourceRecords_[found->second];
@@ -247,6 +277,8 @@ GraphBuffer ExecutionGraph::importBuffer(VernonRhiBuffer buffer, bool exported) 
 GraphImage ExecutionGraph::importImage(VernonRhiImage image, VernonRhiImageView view, VernonRhiFormat format,
                                        uint32_t width, uint32_t height, uint32_t layers, uint32_t samples,
                                        bool exported) {
+    if (provider_ != Provider::Rhi)
+        return {};
     const uint64_t key = handleKey(image.index, image.generation);
     if (const auto found = importedImages_.find(key); found != importedImages_.end()) {
         ResourceRecord &record = resourceRecords_[found->second];
@@ -547,6 +579,10 @@ bool ExecutionGraph::validate(std::string &error) const {
         const auto *render = dynamic_cast<const RenderPass *>(pass.get());
         if (!render)
             continue;
+        if (provider_ == Provider::Cpu) {
+            error = "CPU execution graphs support compute passes only";
+            return false;
+        }
         if ((render->colors_.empty() && !render->depth_) || render->colors_.size() > 8) {
             error = "render pass '" + pass->name() + "' must declare between one and eight attachments";
             return false;
@@ -639,6 +675,28 @@ VernonRhiStatus ExecutionGraph::execute() {
     std::string error;
     if ((dirty_ && !compile(error)) || !validate(error))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    return provider_ == Provider::Cpu ? executeCpu() : executeRhi();
+}
+
+VernonRhiStatus ExecutionGraph::executeCpu() {
+    std::vector<VernonRhiBuffer> buffers(resources_.size(),
+                                         VernonRhiBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+    ExecutionResources resources(resources_, buffers);
+    ComputeEncoder encoder(device_, {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+    for (const CompiledScope &scope : scopes_) {
+        if (scope.rendering)
+            return VERNON_RHI_STATUS_UNSUPPORTED;
+        for (uint32_t passIndex : scope.passIndices) {
+            const VernonRhiStatus status =
+                static_cast<ComputePass *>(passes_[passIndex].get())->execute(encoder, resources);
+            if (status != VERNON_RHI_STATUS_OK)
+                return status;
+        }
+    }
+    return VERNON_RHI_STATUS_OK;
+}
+
+VernonRhiStatus ExecutionGraph::executeRhi() {
     DeviceExecutionSession session(device_);
     VernonRhiCommandEncoderDescriptor encoderDescriptor{};
     encoderDescriptor.struct_size = sizeof(encoderDescriptor);

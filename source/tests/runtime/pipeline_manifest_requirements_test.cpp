@@ -114,6 +114,18 @@ TEST(PipelineManifestRequirements, RejectsLegacyAutodiffMetadata) {
     EXPECT_NE(error.find("autodiff object"), std::string::npos);
 }
 
+TEST(PipelineManifestRequirements, RejectsUnsupportedAutodiffProtocol) {
+    using vernon::runtime::AutodiffManifest;
+    using vernon::runtime::parseAutodiffManifest;
+    nlohmann::json root = validAutodiffManifest();
+    root["autodiff"]["protocol"] = "unsupported_protocol";
+
+    AutodiffManifest manifest;
+    std::string error;
+    EXPECT_FALSE(parseAutodiffManifest(root, manifest, error));
+    EXPECT_NE(error.find("autodiff object"), std::string::npos);
+}
+
 TEST(PipelineManifestRequirements, RejectsIncompleteOrUnknownAutodiffProfiles) {
     using vernon::runtime::AutodiffManifest;
     using vernon::runtime::parseAutodiffManifest;

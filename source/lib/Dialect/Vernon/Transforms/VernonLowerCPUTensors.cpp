@@ -286,11 +286,21 @@ struct VernonLowerCPUTensorsPass final : PassWrapper<VernonLowerCPUTensorsPass, 
             [module](TensorViewType view, SmallVectorImpl<Type> &types) -> std::optional<LogicalResult> {
                 if (view.getElementType().isIntOrFloat())
                     return std::nullopt;
-                FailureOr<ValueAbiLayout> layout = getValueAbiLayout(view.getElementType(), module);
-                if (failed(layout))
-                    return failure();
-                for (const ValueAbiLeaf &leaf : layout->leaves)
-                    types.push_back(MemRefType::get({ShapedType::kDynamic}, leaf.scalarType));
+                if (view.getAddressSpace() == "workgroup") {
+                    FailureOr<WorkgroupPhysicalStoragePlan> plan = getWorkgroupPhysicalStoragePlan(view, module);
+                    if (failed(plan))
+                        return failure();
+                    for (const WorkgroupPhysicalLeaf &leaf : plan->leaves)
+                        types.push_back(TensorViewType::get(view.getContext(), leaf.scalarType,
+                                                            {static_cast<int64_t>(leaf.scalarCount)}, "read_write",
+                                                            "workgroup"));
+                } else {
+                    FailureOr<ValueAbiLayout> layout = getValueAbiLayout(view.getElementType(), module);
+                    if (failed(layout))
+                        return failure();
+                    for (const ValueAbiLeaf &leaf : layout->leaves)
+                        types.push_back(MemRefType::get({ShapedType::kDynamic}, leaf.scalarType));
+                }
                 return success();
             });
 
@@ -319,6 +329,8 @@ struct VernonLowerCPUTensorsPass final : PassWrapper<VernonLowerCPUTensorsPass, 
         });
         target.addDynamicallyLegalOp<LoadOp, StoreOp, PhysicalLoadOp, PhysicalStoreOp, PhysicalAtomicOp>(
             [&](Operation *operation) { return converter.isLegal(operation); });
+        target.addDynamicallyLegalOp<WorkgroupAllocOp>(
+            [&](WorkgroupAllocOp operation) { return converter.isLegal(operation.getOperation()); });
         target.addIllegalOp<SwizzleOp, StructCreateOp, StructGetOp, TupleCreateOp, TupleGetOp, ReduceSumOp,
                             ScatterAddOp>();
         populateVernonSharedValueStructuralTypeConversions(converter, patterns, target);

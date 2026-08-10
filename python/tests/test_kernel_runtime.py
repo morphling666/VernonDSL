@@ -84,6 +84,57 @@ def matrix_vector(
     output[x] = value[x]
 
 
+@vd.kernel(workgroup_size=(4, 1, 1))
+def multi_group_objective(
+    scale: vd.f32,
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    output[gid[0]] = scale * vd.f32(gid[0])
+
+
+multi_group_objective_vjp = vd.ad.vjp(multi_group_objective, wrt=("scale",), outputs=("output",))
+
+
+@vd.kernel(workgroup_size=(4, 1, 1))
+def multi_group_storage_objective(
+    values: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    index = gid[0]
+    output[index] = values[index] * values[index]
+
+
+multi_group_storage_objective_vjp = vd.ad.vjp(
+    multi_group_storage_objective,
+    wrt=("values",),
+    outputs=("output",),
+)
+
+
+@vd.kernel(workgroup_size=(4, 1, 1))
+def cooperative_shared_objective(
+    scale: vd.f32,
+    carriers: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+    lane_id: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("local_invocation_id")],
+) -> None:
+    shared = vd.workgroup_storage(vd.f32, shape=(1,))
+    if lane_id[0] == 0:
+        shared[0] = scale
+    vd.workgroup_barrier()
+    output[gid[0]] = shared[0] * carriers[gid[0]]
+
+
+cooperative_shared_objective_vjp = vd.ad.vjp(
+    cooperative_shared_objective,
+    wrt=("scale",),
+    outputs=("output",),
+)
+
+
 @vd.kernel(workgroup_size=(8, 1, 1))
 def floating_power(
     output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
@@ -95,7 +146,7 @@ def floating_power(
     output[x] = values[x] ** 2.5 + values[x] ** exponent
 
 
-@vd.kernel(workgroup_size=(4, 2, 1))
+@vd.kernel(workgroup_size=(1, 1, 1))
 def copy_tensor_view(
     output: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.read_write],
     source: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.read],
@@ -434,7 +485,7 @@ def global_atomic_operations(values: vd.TensorView[vd.i32, (vd.dyn,), vd.read_wr
 
 @vd.kernel(workgroup_size=(4, 1, 1))
 def workgroup_atomic_lanes(
-    output: vd.TensorView[vd.i32, (vd.dyn,), vd.write],
+    output: vd.TensorView[vd.i32, (vd.dyn,), vd.read_write],
     lane_id: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("local_invocation_id")],
     group_id: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("workgroup_id")],
 ) -> None:
@@ -445,17 +496,17 @@ def workgroup_atomic_lanes(
         shared[0] = vd.i32(group) * 100
     vd.workgroup_barrier()
     previous = vd.atomic_add(shared, 0, 1)
-    output[group * 4 + lane] = previous
     vd.workgroup_barrier()
     if lane == 0:
-        output[8 + group] = shared[0]
+        vd.atomic_exchange(output, 8 + group, shared[0])
+    output[group * 4 + lane] = previous
 
 
 class KernelTensorRuntimeTests(unittest.TestCase):
     @staticmethod
     def _run_tensor_operators(arch: object) -> np.ndarray:
         vd.init(arch=arch)  # type: ignore[arg-type]
-        shape = (2, 3, 4)
+        shape = (2, 4, 4)
         left_array = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
         right_array = np.linspace(0.25, 2.5, np.prod(shape), dtype=np.float32).reshape(shape)
         output = vd.storage.zeros(dtype=vd.f32, shape=shape)
@@ -464,7 +515,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             vd.storage.from_numpy(left_array),
             vd.storage.from_numpy(right_array),
             2.0,
-            grid=(shape[2], shape[1], shape[0]),
+            grid=(1, 2, 2),
         )
         return output.to_numpy()
 
@@ -472,7 +523,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
     def _run_vector_while(arch: object) -> np.ndarray:
         vd.init(arch=arch)  # type: ignore[arg-type]
         output = vd.storage.zeros(dtype=vd.f32, shape=(16,))
-        vector_while(output, 0.35, grid=(16, 1, 1))
+        vector_while(output, 0.35, grid=(2, 1, 1))
         return output.to_numpy()
 
     @staticmethod
@@ -500,7 +551,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             with self.subTest(backend=backend.name):
                 vd.init(arch=backend)  # type: ignore[arg-type]
                 values = vd.storage.zeros(dtype=vd.i32, shape=(1,))
-                global_atomic_increment(values, grid=(256, 1, 1))
+                global_atomic_increment(values, grid=(4, 1, 1))
                 self.assertEqual(values.to_numpy()[0], 256)
 
                 inferred = vd.storage.zeros(dtype=vd.i32, shape=(8,))
@@ -514,7 +565,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
     def test_workgroup_atomic_lane_backend_parity(self) -> None:
         backends = [
             architecture
-            for architecture in (vd.cuda, vd.vulkan, vd.opengl, vd.directx)
+            for architecture in (vd.cpu, vd.cuda, vd.vulkan, vd.opengl, vd.directx)
             if self._runtime_available(architecture)
         ]
         if not backends:
@@ -524,7 +575,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             with self.subTest(backend=backend.name):
                 vd.init(arch=backend)  # type: ignore[arg-type]
                 output = vd.storage.zeros(dtype=vd.i32, shape=(10,))
-                workgroup_atomic_lanes(output, grid=(8, 1, 1))
+                workgroup_atomic_lanes(output, grid=(2, 1, 1))
                 result = output.to_numpy()
                 for group in range(2):
                     base = group * 100
@@ -535,7 +586,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
     def test_aggregate_workgroup_backend_parity(self) -> None:
         backends = [
             architecture
-            for architecture in (vd.cuda, vd.vulkan, vd.opengl, vd.directx)
+            for architecture in (vd.cpu, vd.cuda, vd.vulkan, vd.opengl, vd.directx)
             if self._runtime_available(architecture)
         ]
         if not backends:
@@ -553,12 +604,12 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             with self.subTest(backend=backend.name):
                 vd.init(arch=backend)  # type: ignore[arg-type]
                 output = vd.storage.zeros(dtype=vd.f32, shape=(32,))
-                aggregate_workgroup_values(output, grid=(8, 1, 1))
+                aggregate_workgroup_values(output, grid=(2, 1, 1))
                 np.testing.assert_allclose(output.to_numpy(), expected, rtol=0.0, atol=0.0)
 
     def test_rank_three_tensor_operators(self) -> None:
         actual = self._run_tensor_operators(vd.cpu)
-        shape = (2, 3, 4)
+        shape = (2, 4, 4)
         left = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
         right = np.linspace(0.25, 2.5, np.prod(shape), dtype=np.float32).reshape(shape)
         expected = ((left + right) * 2.0 - right) / 2.0
@@ -569,6 +620,64 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             with self.subTest(backend=backend.name):
                 backend_actual = self._run_tensor_operators(backend)
                 np.testing.assert_allclose(backend_actual, expected, rtol=0.0, atol=1e-6)
+
+    def test_autodiff_grid_counts_multiple_cooperative_workgroups(self) -> None:
+        vd.init(arch=vd.cpu)
+        output = vd.storage.zeros(dtype=vd.f32, shape=(8,))
+        result, pullback = multi_group_objective_vjp(np.float32(2.0), output, grid=(2, 1, 1))
+        self.assertIsNone(result)
+        np.testing.assert_array_equal(output.to_numpy(), np.arange(8, dtype=np.float32) * 2.0)
+        cotangent = np.zeros((1, 1, 8, 8), dtype=np.float32)
+        cotangent[0, 0, np.arange(8), np.arange(8)] = np.arange(1, 9, dtype=np.float32)
+        gradient = pullback(cotangent)["scale"]
+        np.testing.assert_allclose(gradient, np.array(168.0, dtype=np.float32), rtol=0.0, atol=0.0)
+
+    def test_autodiff_storage_gradient_keeps_every_cooperative_lane(self) -> None:
+        vd.init(arch=vd.cpu)
+        values_array = np.linspace(0.5, 4.0, 8, dtype=np.float32)
+        weights = np.arange(1, 9, dtype=np.float32)
+        values = vd.storage.from_numpy(values_array)
+        output = vd.storage.zeros(dtype=vd.f32, shape=(8,))
+        _, pullback = multi_group_storage_objective_vjp(values, output, grid=(2, 1, 1))
+
+        cotangent = np.zeros((1, 1, 8, 8), dtype=np.float32)
+        cotangent[0, 0, np.arange(8), np.arange(8)] = weights
+        expected = 2.0 * values_array * weights
+        first = pullback(cotangent)["values"].to_numpy()
+        second = pullback(cotangent * np.float32(-0.25))["values"].to_numpy()
+        np.testing.assert_allclose(first, expected, rtol=1.0e-6, atol=1.0e-6)
+        np.testing.assert_allclose(second, expected * -0.25, rtol=1.0e-6, atol=1.0e-6)
+
+        epsilon = np.float32(1.0e-3)
+        for index in (0, 3, 7):
+            positive = values_array.copy()
+            negative = values_array.copy()
+            positive[index] += epsilon
+            negative[index] -= epsilon
+            finite_difference = (
+                weights[index]
+                * (np.float64(positive[index]) ** 2 - np.float64(negative[index]) ** 2)
+                / np.float64(positive[index] - negative[index])
+            )
+            np.testing.assert_allclose(first[index], finite_difference, rtol=2.0e-3, atol=2.0e-3)
+
+    def test_autodiff_joint_reverse_of_workgroup_shared_storage(self) -> None:
+        vd.init(arch=vd.cpu)
+        carriers_array = np.linspace(0.25, 2.0, 8, dtype=np.float32)
+        weights = np.arange(1, 9, dtype=np.float32)
+        carriers = vd.storage.from_numpy(carriers_array)
+        output = vd.storage.zeros(dtype=vd.f32, shape=(8,))
+        _, pullback = cooperative_shared_objective_vjp(
+            np.float32(1.5),
+            carriers,
+            output,
+            grid=(2, 1, 1),
+        )
+        cotangent = np.zeros((1, 1, 8, 8), dtype=np.float32)
+        cotangent[0, 0, np.arange(8), np.arange(8)] = weights
+        expected = np.sum(carriers_array * weights, dtype=np.float32)
+        gradient = pullback(cotangent)["scale"]
+        np.testing.assert_allclose(gradient, expected, rtol=1.0e-6, atol=1.0e-6)
 
     def test_lazy_short_circuit_boolean_backend_parity(self) -> None:
         left_values = np.array((1, 0, -1, 2), dtype=np.int32)
@@ -583,7 +692,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                     output,
                     vd.storage.from_numpy(left_values),
                     vd.storage.from_numpy(right_values),
-                    grid=(4, 1, 1),
+                    grid=(1, 1, 1),
                 )
                 np.testing.assert_array_equal(output.to_numpy(), expected)
 
@@ -600,7 +709,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                     output,
                     vd.storage.from_numpy(left_values),
                     vd.storage.from_numpy(right_values),
-                    grid=(4, 1, 1),
+                    grid=(1, 1, 1),
                 )
                 np.testing.assert_array_equal(output.to_numpy(), expected)
 
@@ -702,49 +811,6 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                 grid=(1, 1, 1),
             )
 
-    def test_flattened_smoke_fluid_kernel_executes_on_cpu(self) -> None:
-        from examples.autodiff_smoke_fluid_kernels import SmokeFluidParameters, smoke_fluid_step
-
-        vd.init(arch=vd.cpu)
-        size = 4
-
-        def scalar_grid() -> vd.TensorStorage:
-            return vd.storage.zeros(dtype=vd.f32, shape=(size, size))
-
-        def vector_grid() -> vd.TensorStorage:
-            return vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(size, size))
-
-        target = vd.storage.from_numpy(np.ones((size, size), dtype=np.float32))
-        output_density = scalar_grid()
-        output_velocity = vector_grid()
-        output_loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
-        smoke_fluid_step(
-            scalar_grid(),
-            vector_grid(),
-            vd.storage.zeros(dtype=vd.f32, shape=(2,)),
-            target,
-            scalar_grid(),
-            vector_grid(),
-            vector_grid(),
-            scalar_grid(),
-            scalar_grid(),
-            scalar_grid(),
-            output_density,
-            output_velocity,
-            output_loss,
-            SmokeFluidParameters(
-                np.int32(size),
-                np.int32(size),
-                np.int32(2),
-                np.int32(2),
-                np.float32(0.1),
-            ),
-            grid=(1, 1, 1),
-        )
-        np.testing.assert_array_equal(output_density.to_numpy(), np.zeros((size, size), dtype=np.float32))
-        np.testing.assert_array_equal(output_velocity.to_numpy(), np.zeros((size, size, 2), dtype=np.float32))
-        np.testing.assert_array_equal(output_loss.to_numpy(), np.ones((1,), dtype=np.float32))
-
     def test_dynamic_zero_range_step_is_runtime_contract_violation(self) -> None:
         import os
         import subprocess
@@ -806,7 +872,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             with self.subTest(backend=backend.name):
                 vd.init(arch=backend)
                 output = vd.storage.zeros(dtype=vd.f32, shape=(2,))
-                matrix_vector(output, grid=(2, 1, 1))
+                matrix_vector(output, grid=(1, 1, 1))
                 np.testing.assert_allclose(
                     output.to_numpy(), np.array((17.0, 39.0), dtype=np.float32), rtol=0.0, atol=1e-6
                 )
@@ -824,7 +890,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                     output,
                     vd.storage.from_numpy(values),
                     exponent,
-                    grid=(values.size, 1, 1),
+                    grid=(2, 1, 1),
                 )
                 np.testing.assert_allclose(output.to_numpy(), expected, rtol=2e-6, atol=2e-6)
 
@@ -931,7 +997,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                 self.assertEqual(host_abi_layout(ComplexAggregateVertex).size, 44)
                 self.assertEqual(output_storage._native_host_array().nbytes, 4 * 44)
                 output = output_storage.view(access="write")
-                copy_complex_aggregate_tensor_view(output, source, grid=(4, 1, 1))
+                copy_complex_aggregate_tensor_view(output, source, grid=(1, 1, 1))
                 actual = output_storage.to_values()
                 for result, expected in zip(actual, reversed(values), strict=True):
                     np.testing.assert_array_equal(result.position, expected.position)
@@ -947,7 +1013,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                 copy_tuple_tensor_view(
                     tuple_output.view(access="write"),
                     tuple_source.view(access="read"),
-                    grid=(2, 1, 1),
+                    grid=(1, 1, 1),
                 )
                 self.assertEqual(tuple_output.to_values(), tuple_values)
 
@@ -972,7 +1038,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                     access="write",
                     layout_units="bytes",
                 )
-                copy_value_tensor_view(tensor_output, tensor_source, grid=(2, 1, 1))
+                copy_value_tensor_view(tensor_output, tensor_source, grid=(1, 1, 1))
                 tensor_output.owner.synchronize()
                 np.testing.assert_array_equal(
                     np.frombuffer(tensor_output_bytes, dtype=np.float32).reshape(2, 2),
@@ -985,7 +1051,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                 vector_source.view(access="read_write").copy_from_numpy(
                     np.ascontiguousarray(tensor_values, dtype=np.float32)
                 )
-                copy_vector_tensor_view_through_helper(vector_output, vector_source, grid=(2, 1, 1))
+                copy_vector_tensor_view_through_helper(vector_output, vector_source, grid=(1, 1, 1))
                 np.testing.assert_array_equal(
                     vector_output.to_numpy(),
                     np.asarray(tensor_values),
@@ -1037,7 +1103,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                 self.assertIn(f'"target":"{target}"', reflection)
 
 
-@vd.kernel(workgroup_size=(4, 2, 1))
+@vd.kernel(workgroup_size=(1, 1, 1))
 def fill(
     output: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write],
     scale: vd.f32,

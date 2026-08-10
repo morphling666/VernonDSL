@@ -4,11 +4,12 @@
 #include "VernonRuntime.h"
 #include "VernonRuntimeCore.h"
 #include "VernonRuntimeProvider.h"
+#include "cpu_workgroup_dispatch.h"
 #include "pipeline_bundle.h"
 #include "pipeline_metadata.h"
 #include "platform/platform_library.h"
-#include "runtime_state.h"
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -23,6 +24,7 @@ struct CpuKernelState {
 
 struct CpuContextState {
     VernonRuntimeDeviceProvider provider{};
+    std::unique_ptr<CpuWorkgroupScheduler> scheduler;
     std::string error;
 };
 
@@ -41,6 +43,7 @@ struct CpuProviderShaderPayload {
 
 bool initializeCpuContext(VernonRuntimeContext &context, uint32_t deviceIndex);
 const VernonRuntimeDeviceProvider *cpuProvider(VernonRuntimeContext &context);
+CpuWorkgroupScheduler &cpuWorkgroupScheduler(VernonRuntimeContext &context);
 uint64_t cpuProviderResourceIdentity(const VernonRuntimeContext &context);
 VernonStringView cpuProviderLastError(const VernonRuntimeContext &context);
 bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState kernel, ReflectedEntry reflection,

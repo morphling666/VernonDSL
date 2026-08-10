@@ -5,11 +5,13 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAggregateStorage.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffAnalysis.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffRules.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffTapePlanning.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffUtils.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Pass/PassRegistry.h"
@@ -116,9 +118,43 @@ struct BackwardProfileTypes {
     SmallVector<StringRef> valueGradientDtypes;
 };
 
+bool hasExternalStorageShapeSource(const AutodiffStorageIdentity &identity) {
+    auto view = dyn_cast<TensorViewType>(identity.binding.getType());
+    return identity.internalAdjointOwnership != AutodiffInternalAdjointOwnership::None && view &&
+           view.getAddressSpace() == "device" && isa<BlockArgument>(identity.binding);
+}
+
+bool requiresWorkgroupBackwardSynchronization(const VernonAutodiffAnalysisResult &analysis) {
+    if (llvm::any_of(analysis.getStorageIdentities(), [](const AutodiffStorageIdentity &identity) {
+            return identity.internalAdjointOwnership == AutodiffInternalAdjointOwnership::WorkgroupCoupled;
+        }))
+        return true;
+    return llvm::any_of(analysis.getOperations(), [](const AutodiffOperationActivity &activity) {
+        if (!activity.active)
+            return false;
+        if (activity.effect == AutodiffEffectKind::Barrier)
+            return true;
+        Value storage;
+        if (auto load = dyn_cast<LoadOp>(activity.operation))
+            storage = load.getStorage();
+        else if (auto store = dyn_cast<StoreOp>(activity.operation))
+            storage = store.getStorage();
+        else if (auto atomic = dyn_cast<AtomicOp>(activity.operation))
+            storage = atomic.getStorage();
+        else if (auto reduce = dyn_cast<ReduceSumOp>(activity.operation))
+            storage = reduce.getStorage();
+        else if (auto scatter = dyn_cast<ScatterAddOp>(activity.operation))
+            storage = scatter.getStorage();
+        auto view = storage ? dyn_cast<TensorViewType>(storage.getType()) : TensorViewType{};
+        return view && view.getAddressSpace() == "workgroup";
+    });
+}
+
 BackwardProfileTypes getBackwardProfileTypes(MLIRContext *context, const VernonAutodiffAnalysisResult &analysis) {
     BackwardProfileTypes types;
     for (const AutodiffStorageIdentity &identity : analysis.getStorageIdentities()) {
+        if (!hasExternalStorageShapeSource(identity))
+            continue;
         auto source = cast<TensorViewType>(identity.binding.getType());
         types.shapeSources.push_back(
             TensorViewType::get(context, source.getElementType(), source.getShape(), "read", source.getAddressSpace()));
@@ -135,10 +171,18 @@ BackwardProfileTypes getBackwardProfileTypes(MLIRContext *context, const VernonA
     }
     for (const AutodiffLeaf &leaf : analysis.getWrtLeaves()) {
         StringRef dtype = leaf.primalType.isF64() ? "f64" : "f32";
-        if (auto source = dyn_cast<TensorViewType>(leaf.value.getType()))
+        if (auto source = dyn_cast<TensorViewType>(leaf.value.getType())) {
+            const auto identity =
+                llvm::find_if(analysis.getStorageIdentities(), [&](const AutodiffStorageIdentity &candidate) {
+                    return candidate.binding == leaf.value;
+                });
+            const bool invocationPrivate =
+                identity != analysis.getStorageIdentities().end() &&
+                identity->externalGradientOwnership == AutodiffExternalGradientOwnership::InvocationPrivate;
             types.storageGradients.push_back(TensorViewType::get(context, leaf.derivativeType, source.getShape(),
-                                                                 "write", source.getAddressSpace()));
-        else {
+                                                                 invocationPrivate ? "read_write" : "write",
+                                                                 source.getAddressSpace()));
+        } else {
             types.valueGradients.push_back(leaf.derivativeType);
             types.valueGradientDtypes.push_back(dtype);
         }
@@ -433,7 +477,7 @@ private:
                 return emitWhile(whileOp, builder, parentRegion, parentRecord);
         }
         Operation *clone = builder.clone(operation, mapping);
-        if (isa<StoreOp>(operation))
+        if (isa<StoreOp, ReduceSumOp, ScatterAddOp, AtomicOp>(operation))
             clone->setAttr("vernon.ad.functionalized", UnitAttr::get(builder.getContext()));
         for (auto [source, target] : llvm::zip_equal(operation.getResults(), clone->getResults()))
             mapping.map(source, target);
@@ -695,6 +739,11 @@ public:
             regions.try_emplace(region.operation, &region);
     }
 
+    void initializeBuiltinPrimals(ArrayRef<BlockArgument> sources, ValueRange values) {
+        for (auto [source, value] : llvm::zip_equal(sources, values))
+            primals.try_emplace(source, value);
+    }
+
     LogicalResult initializePrimals(OpBuilder &builder) {
         Value zero = createIndexConstant(builder, primal.getLoc(), 0);
         DenseSet<Value> loaded;
@@ -715,9 +764,27 @@ public:
         return success();
     }
 
-    LogicalResult initializeStorageAdjoints(OpBuilder &builder, AdjointMap &adjoints, ValueRange shapeSources) {
-        if (shapeSources.size() != analysis.getStorageIdentities().size())
+    LogicalResult initializeStorageAdjoints(OpBuilder &builder, AdjointMap &adjoints, ValueRange shapeSources,
+                                            ValueRange gradientDestinations) {
+        const size_t expectedShapeSources =
+            llvm::count_if(analysis.getStorageIdentities(), hasExternalStorageShapeSource);
+        if (shapeSources.size() != expectedShapeSources)
             return primal.emitError("Storage adjoint shape-source count does not match Storage identities");
+        const size_t expectedGradientDestinations =
+            llvm::count_if(analysis.getWrtLeaves(),
+                           [](const AutodiffLeaf &leaf) { return isa<TensorViewType>(leaf.value.getType()); });
+        if (gradientDestinations.size() != expectedGradientDestinations)
+            return primal.emitError("Storage gradient destination count does not match wrt Storage leaves");
+        size_t gradientIndex = 0;
+        for (const AutodiffLeaf &leaf : analysis.getWrtLeaves()) {
+            if (!isa<TensorViewType>(leaf.value.getType()))
+                continue;
+            const AutodiffStorageIdentity *identity = analysis.getStorageIdentity(leaf.value);
+            if (!identity)
+                return primal.emitError("wrt Storage has no Storage identity");
+            externalStorageAdjoints[{identity->id, leaf.abiLeafIndex}] = gradientDestinations[gradientIndex++];
+        }
+        size_t shapeSourceIndex = 0;
         for (const AutodiffStorageIdentity &identity : analysis.getStorageIdentities()) {
             const ValueAbiLayout *layout = analysis.getValueAbi(identity.binding);
             auto view = dyn_cast<TensorViewType>(identity.binding.getType());
@@ -725,6 +792,8 @@ public:
                 return primal.emitError("Storage identity has no canonical TensorView ABI");
             for (auto [leafIndex, leaf] : llvm::enumerate(layout->leaves)) {
                 if (!analysis.isActive(identity.binding, leafIndex))
+                    continue;
+                if (identity.internalAdjointOwnership == AutodiffInternalAdjointOwnership::None)
                     continue;
                 FailureOr<Type> scalar = getAutodiffDerivativeType(leaf.scalarType);
                 if (failed(scalar))
@@ -734,11 +803,28 @@ public:
                     shape, llvm::map_range(leaf.shape, [](uint64_t extent) { return static_cast<int64_t>(extent); }));
                 auto bufferType = AdAdjointBufferType::get(primal.getContext(), *scalar, shape,
                                                            static_cast<unsigned>(view.getShape().size()));
-                Value buffer =
-                    AdAdjointBufferCreateOp::create(builder, primal.getLoc(), bufferType, shapeSources[identity.id])
-                        .getBuffer();
+                Value shapeSource = hasExternalStorageShapeSource(identity) ? shapeSources[shapeSourceIndex] : Value{};
+                OperationState createState(primal.getLoc(), AdAdjointBufferCreateOp::getOperationName());
+                if (shapeSource)
+                    createState.addOperands(shapeSource);
+                createState.addTypes(bufferType);
+                StringRef ownership;
+                switch (identity.internalAdjointOwnership) {
+                case AutodiffInternalAdjointOwnership::LanePrivate:
+                    ownership = "lane_private";
+                    break;
+                case AutodiffInternalAdjointOwnership::WorkgroupCoupled:
+                    ownership = "workgroup_shared";
+                    break;
+                case AutodiffInternalAdjointOwnership::None:
+                    return primal.emitError("active Storage identity has no internal adjoint ownership");
+                }
+                createState.addAttribute("ownership", builder.getStringAttr(ownership));
+                AdAdjointBufferCreateOp create = cast<AdAdjointBufferCreateOp>(builder.create(createState));
+                Value buffer = create.getBuffer();
                 storageAdjoints[{identity.id, static_cast<unsigned>(leafIndex)}] = buffer;
             }
+            shapeSourceIndex += hasExternalStorageShapeSource(identity);
         }
         for (const AutodiffLeaf &leaf : analysis.getActiveResultLeaves()) {
             const AutodiffStorageIdentity *identity = analysis.getStorageIdentity(leaf.value);
@@ -746,9 +832,13 @@ public:
                 continue;
             Value seed = adjoints.lookup({leaf.value, leaf.abiLeafIndex});
             Value buffer = storageAdjoints.lookup({identity->id, leaf.abiLeafIndex});
-            if (!seed || !buffer)
-                return primal.emitError("Storage objective has no invocation-local adjoint buffer");
-            AdAdjointAccumulateDenseOp::create(builder, primal.getLoc(), buffer, seed);
+            if (!seed)
+                return primal.emitError("Storage objective has no cotangent");
+            if (buffer) {
+                AdAdjointAccumulateDenseOp::create(builder, primal.getLoc(), buffer, seed);
+            } else {
+                externalStorageCotangents[{identity->id, leaf.abiLeafIndex}] = seed;
+            }
             adjoints.erase({leaf.value, leaf.abiLeafIndex});
         }
         return success();
@@ -759,8 +849,12 @@ public:
         if (!identity)
             return failure();
         Value buffer = storageAdjoints.lookup({identity->id, leaf.abiLeafIndex});
-        if (!buffer)
+        if (!buffer) {
+            if (identity->internalAdjointOwnership == AutodiffInternalAdjointOwnership::None &&
+                externalStorageAdjoints.contains({identity->id, leaf.abiLeafIndex}))
+                return success();
             return failure();
+        }
         AdAdjointStoreOp::create(builder, primal.getLoc(), buffer, destination);
         return success();
     }
@@ -921,10 +1015,25 @@ private:
             if (!seed)
                 continue;
             Value buffer = storageAdjoints.lookup({effect->identity, leafIndex});
-            if (!buffer && analysis.isActive(load.getStorage(), leafIndex))
-                return load.emitError("active TensorView load leaf has no Storage effect adjoint buffer");
-            if (!buffer)
+            Value external = externalStorageAdjoints.lookup({effect->identity, leafIndex});
+            if (!buffer && !external)
                 continue;
+            if (!buffer) {
+                SmallVector<Value> operands = {seed, external};
+                llvm::append_range(operands, indices);
+                SmallVector<NamedAttribute> attributes = {
+                    builder.getNamedAttr("deterministic", builder.getBoolAttr(false))};
+                const AutodiffExternalGradientOwnership ownership =
+                    analysis.getStorageIdentities()[effect->identity].externalGradientOwnership;
+                if (ownership == AutodiffExternalGradientOwnership::InvocationPrivate)
+                    attributes.push_back(
+                        builder.getNamedAttr(kAccumulationOwnershipAttrName,
+                                             builder.getStringAttr(kInvocationPrivateAccumulationOwnership)));
+                else if (ownership != AutodiffExternalGradientOwnership::AtomicShared)
+                    return load.emitError("active external Storage gradient has no supported ownership proof");
+                createOperation(builder, load.getLoc(), ScatterAddOp::getOperationName(), operands, {}, attributes);
+                continue;
+            }
             SmallVector<Value> operands = {buffer, seed};
             llvm::append_range(operands, indices);
             createOperation(builder, load.getLoc(), AdAdjointScatterAddOp::getOperationName(), operands);
@@ -967,19 +1076,84 @@ private:
             if (!analysis.isActive(store.getValue(), leafIndex))
                 continue;
             Value buffer = storageAdjoints.lookup({effect->identity, leafIndex});
-            if (!buffer && analysis.isActive(store.getStorage(), leafIndex))
-                return store.emitError("active TensorView store leaf has no Storage effect adjoint buffer");
-            if (!buffer)
-                continue;
             FailureOr<Type> valueType = derivativeType(store.getValue(), leafIndex);
             if (failed(valueType))
                 return store.emitError("cannot resolve TensorView store derivative leaf type");
-            SmallVector<Value> operands = {buffer};
-            llvm::append_range(operands, indices);
-            Value valueGradient = createOperation(builder, store.getLoc(), AdAdjointTakeAndClearOp::getOperationName(),
-                                                  operands, *valueType)
-                                      ->getResult(0);
+            Value valueGradient;
+            if (buffer) {
+                SmallVector<Value> operands = {buffer};
+                llvm::append_range(operands, indices);
+                valueGradient = createOperation(builder, store.getLoc(), AdAdjointTakeAndClearOp::getOperationName(),
+                                                operands, *valueType)
+                                    ->getResult(0);
+            } else if (Value cotangent = externalStorageCotangents.lookup({effect->identity, leafIndex})) {
+                valueGradient = LoadOp::create(builder, store.getLoc(), *valueType, cotangent, indices);
+            } else if (analysis.isActive(store.getStorage(), leafIndex)) {
+                return store.emitError("active TensorView store leaf has no internal adjoint or output cotangent");
+            } else {
+                continue;
+            }
             accumulate(builder, store.getLoc(), adjoints, store.getValue(), leafIndex, valueGradient);
+        }
+        return success();
+    }
+
+    LogicalResult reverseAdditiveRmw(Operation &operation, Value contribution, ValueRange sourceIndices, Value oldValue,
+                                     OpBuilder &builder, AdjointMap &adjoints) {
+        SmallVector<Value> indices;
+        for (Value index : sourceIndices) {
+            FailureOr<Value> materialized = materializePrimal(index, builder);
+            if (failed(materialized))
+                return operation.emitError("cannot materialize an additive Storage index in reverse");
+            indices.push_back(*materialized);
+        }
+        const AutodiffStorageEffect *effect = analysis.getStorageEffect(&operation);
+        const ValueAbiLayout *layout = analysis.getValueAbi(contribution);
+        if (!effect || !layout)
+            return operation.emitError("active additive Storage effect has no canonical effect ABI");
+        for (unsigned leafIndex = 0; leafIndex < layout->leaves.size(); ++leafIndex) {
+            if (!analysis.isActive(contribution, leafIndex) && !(oldValue && analysis.isActive(oldValue, leafIndex)))
+                continue;
+            FailureOr<Type> valueType = derivativeType(contribution, leafIndex);
+            if (failed(valueType))
+                return operation.emitError("cannot resolve additive contribution derivative leaf type");
+            Value buffer = storageAdjoints.lookup({effect->identity, leafIndex});
+            Value postCotangent;
+            if (analysis.isActive(contribution, leafIndex) && buffer) {
+                SmallVector<Value> operands = {buffer};
+                llvm::append_range(operands, indices);
+                postCotangent = createOperation(builder, operation.getLoc(), AdAdjointPeekOp::getOperationName(),
+                                                operands, *valueType)
+                                    ->getResult(0);
+            } else if (Value cotangent = externalStorageCotangents.lookup({effect->identity, leafIndex});
+                       analysis.isActive(contribution, leafIndex) && cotangent) {
+                postCotangent = LoadOp::create(builder, operation.getLoc(), *valueType, cotangent, indices);
+            } else if (analysis.isActive(contribution, leafIndex)) {
+                return operation.emitError("active additive Storage contribution has no post-state cotangent");
+            }
+            if (postCotangent)
+                accumulate(builder, operation.getLoc(), adjoints, contribution, leafIndex, postCotangent);
+
+            if (!oldValue)
+                continue;
+            Value oldSeed = adjoints.lookup({oldValue, leafIndex});
+            if (!oldSeed)
+                continue;
+            Value external = externalStorageAdjoints.lookup({effect->identity, leafIndex});
+            if (!buffer && !external)
+                return operation.emitError("active atomic old-value result has no pre-state Storage adjoint");
+            if (buffer) {
+                SmallVector<Value> operands = {buffer, oldSeed};
+                llvm::append_range(operands, indices);
+                createOperation(builder, operation.getLoc(), AdAdjointScatterAddOp::getOperationName(), operands);
+            } else {
+                SmallVector<Value> operands = {oldSeed, external};
+                llvm::append_range(operands, indices);
+                SmallVector<NamedAttribute> attributes = {
+                    builder.getNamedAttr("deterministic", builder.getBoolAttr(false))};
+                createOperation(builder, operation.getLoc(), ScatterAddOp::getOperationName(), operands, {},
+                                attributes);
+            }
         }
         return success();
     }
@@ -1052,6 +1226,10 @@ private:
     LogicalResult reverseBlock(Block &block, OpBuilder &builder, AdjointMap &adjoints, Value parentRegion,
                                Value parentRecordIndex) {
         for (Operation &operation : llvm::reverse(block.without_terminator())) {
+            if (auto barrier = dyn_cast<BarrierOp>(operation)) {
+                BarrierOp::create(builder, barrier.getLoc(), barrier.getOrdering(), barrier.getScope());
+                continue;
+            }
             if (!analysis.isActive(&operation))
                 continue;
             if (auto ifOp = dyn_cast<scf::IfOp>(operation)) {
@@ -1081,6 +1259,24 @@ private:
             }
             if (auto store = dyn_cast<StoreOp>(operation)) {
                 if (failed(reverseStore(store, builder, adjoints)))
+                    return failure();
+                continue;
+            }
+            if (auto reduce = dyn_cast<ReduceSumOp>(operation)) {
+                if (failed(
+                        reverseAdditiveRmw(operation, reduce.getValue(), reduce.getIndices(), {}, builder, adjoints)))
+                    return failure();
+                continue;
+            }
+            if (auto scatter = dyn_cast<ScatterAddOp>(operation)) {
+                if (failed(
+                        reverseAdditiveRmw(operation, scatter.getValue(), scatter.getIndices(), {}, builder, adjoints)))
+                    return failure();
+                continue;
+            }
+            if (auto atomic = dyn_cast<AtomicOp>(operation)) {
+                if (failed(reverseAdditiveRmw(operation, atomic.getValue(), atomic.getIndices(), atomic.getResult(),
+                                              builder, adjoints)))
                     return failure();
                 continue;
             }
@@ -1265,6 +1461,8 @@ private:
     DenseMap<Value, Value> primals;
     DenseMap<Operation *, const AutodiffTapeRegion *> regions;
     DenseMap<std::pair<unsigned, unsigned>, Value> storageAdjoints;
+    DenseMap<std::pair<unsigned, unsigned>, Value> externalStorageAdjoints;
+    DenseMap<std::pair<unsigned, unsigned>, Value> externalStorageCotangents;
 };
 
 FailureOr<func::FuncOp> createDynamicForward(func::FuncOp primal, StringRef symbol, const VernonAutodiffTapePlan &plan,
@@ -1337,6 +1535,12 @@ FailureOr<func::FuncOp> createDynamicBackward(func::FuncOp primal, StringRef sym
     BackwardProfileTypes profileTypes = getBackwardProfileTypes(context, analysis);
     OpBuilder moduleBuilder(primal);
     SmallVector<Type> backwardArguments = {tapeType, regionType};
+    SmallVector<BlockArgument> builtinArguments;
+    for (BlockArgument argument : primal.getArguments())
+        if (primal.getArgAttr(argument.getArgNumber(), kBuiltinAttrName)) {
+            builtinArguments.push_back(argument);
+            backwardArguments.push_back(argument.getType());
+        }
     llvm::append_range(backwardArguments, profileTypes.shapeSources);
     llvm::append_range(backwardArguments, profileTypes.cotangents);
     llvm::append_range(backwardArguments, profileTypes.storageGradients);
@@ -1355,16 +1559,23 @@ FailureOr<func::FuncOp> createDynamicBackward(func::FuncOp primal, StringRef sym
         makeInterfaceAttrs(context, "input", "tape", {}, 0),
         makeInterfaceAttrs(context, "input", "tape_region", {}, 1),
     };
-    for (auto [index, identity] : llvm::enumerate(analysis.getStorageIdentities())) {
+    for (BlockArgument argument : builtinArguments)
+        backwardArgumentAttrs.push_back(primal.getArgAttrDict(argument.getArgNumber()));
+    const unsigned shapeBase = 2 + builtinArguments.size();
+    unsigned shapeSourceIndex = 0;
+    for (const AutodiffStorageIdentity &identity : analysis.getStorageIdentities()) {
+        if (!hasExternalStorageShapeSource(identity))
+            continue;
         auto sourceName = primal.getArgAttrOfType<StringAttr>(cast<BlockArgument>(identity.binding).getArgNumber(),
                                                               "vernon.source_name");
         if (!sourceName || sourceName.getValue().empty())
             return primal.emitError("Storage identity has no source name for its backward shape source");
         std::string path = ("shape." + sourceName.getValue()).str();
         backwardArgumentAttrs.push_back(
-            makeInterfaceAttrs(context, "input", path, {}, index + 2, identity.binding.getType()));
+            makeInterfaceAttrs(context, "input", path, {}, shapeBase + shapeSourceIndex, identity.binding.getType()));
+        ++shapeSourceIndex;
     }
-    const unsigned cotangentBase = 2 + profileTypes.shapeSources.size();
+    const unsigned cotangentBase = shapeBase + profileTypes.shapeSources.size();
     for (auto [index, leaf] : llvm::enumerate(analysis.getActiveResultLeaves()))
         backwardArgumentAttrs.push_back(makeInterfaceAttrs(context, "input", leaf.path,
                                                            {profileTypes.cotangentDtypes[index]}, cotangentBase + index,
@@ -1379,6 +1590,26 @@ FailureOr<func::FuncOp> createDynamicBackward(func::FuncOp primal, StringRef sym
             ++storageGradientIndex;
         }
     backward.setAllArgAttrs(backwardArgumentAttrs);
+    for (const AutodiffStorageIdentity &identity : analysis.getStorageIdentities()) {
+        if (!identity.externalGradientDestination)
+            continue;
+        StringRef ownership = identity.externalGradientOwnership == AutodiffExternalGradientOwnership::InvocationPrivate
+                                  ? "invocation_private"
+                              : identity.externalGradientOwnership == AutodiffExternalGradientOwnership::AtomicShared
+                                  ? "atomic_shared"
+                              : identity.externalGradientOwnership == AutodiffExternalGradientOwnership::WorkgroupShared
+                                  ? "workgroup_shared"
+                                  : "none";
+        unsigned tensorGradientIndex = 0;
+        for (const AutodiffLeaf &leaf : analysis.getWrtLeaves()) {
+            if (!isa<TensorViewType>(leaf.value.getType()))
+                continue;
+            if (leaf.value == identity.binding)
+                backward.setArgAttr(gradientBase + tensorGradientIndex, kAccumulationOwnershipAttrName,
+                                    StringAttr::get(context, ownership));
+            ++tensorGradientIndex;
+        }
+    }
     if (profileTypes.result) {
         SmallVector<DictionaryAttr> resultAttrs = {
             makeInterfaceAttrs(context, "output", "gradients", profileTypes.valueGradientDtypes, 0)};
@@ -1388,16 +1619,25 @@ FailureOr<func::FuncOp> createDynamicBackward(func::FuncOp primal, StringRef sym
     Block *entry = backward.addEntryBlock();
     OpBuilder builder = OpBuilder::atBlockEnd(entry);
     DynamicReverseEmitter emitter(primal, analysis, registry, plan, rootLayout, entry->getArgument(1));
+    emitter.initializeBuiltinPrimals(builtinArguments, entry->getArguments().slice(2, builtinArguments.size()));
     if (failed(emitter.initializePrimals(builder)))
         return failure();
     AdjointMap adjoints;
     for (auto [index, leaf] : llvm::enumerate(analysis.getActiveResultLeaves()))
         adjoints.try_emplace(AdjointKey{leaf.value, leaf.abiLeafIndex}, entry->getArgument(cotangentBase + index));
-    if (failed(emitter.initializeStorageAdjoints(builder, adjoints,
-                                                 entry->getArguments().slice(2, profileTypes.shapeSources.size()))))
+    if (failed(emitter.initializeStorageAdjoints(
+            builder, adjoints, entry->getArguments().slice(shapeBase, profileTypes.shapeSources.size()),
+            entry->getArguments().slice(gradientBase, profileTypes.storageGradients.size()))))
         return failure();
+    const bool synchronizeWorkgroup = requiresWorkgroupBackwardSynchronization(analysis);
+    if (synchronizeWorkgroup)
+        BarrierOp::create(builder, primal.getLoc(), builder.getStringAttr("acquire_release"),
+                          builder.getStringAttr("workgroup"));
     if (failed(emitter.reverseTopLevel(builder, adjoints)))
         return failure();
+    if (synchronizeWorkgroup)
+        BarrierOp::create(builder, primal.getLoc(), builder.getStringAttr("acquire_release"),
+                          builder.getStringAttr("workgroup"));
     SmallVector<Value> valueGradients;
     storageGradientIndex = 0;
     for (const AutodiffLeaf &leaf : analysis.getWrtLeaves()) {

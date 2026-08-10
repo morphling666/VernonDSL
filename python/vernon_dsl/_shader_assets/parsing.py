@@ -88,7 +88,6 @@ def _transform_record(
     outputs: tuple[str, ...],
     rule_set_id: str | None,
     rule_set_identity: str | None,
-    protocol: str,
 ) -> dict[str, Any]:
     record: dict[str, Any] = {
         "kind": "vjp",
@@ -97,7 +96,7 @@ def _transform_record(
         "gradient_policy": "f16:f32,f32:f32,f64:f64",
         "accumulation_policy": "fresh",
         "tape_policy": "bounded",
-        "protocol": protocol,
+        "protocol": "dynamic_v2",
         "derivative_rules_version": 1,
     }
     if rule_set_id is not None:
@@ -214,7 +213,7 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
         if len(program_expression.args) != 1 or any(item.arg is None for item in program_expression.keywords):
             raise PipelineCompileError("vd.ad.vjp requires one program operand and keyword arguments")
         transform_keywords = {item.arg: item.value for item in program_expression.keywords if item.arg is not None}
-        unknown_transform = set(transform_keywords) - {"wrt", "outputs", "rules", "protocol"}
+        unknown_transform = set(transform_keywords) - {"wrt", "outputs", "rules"}
         if unknown_transform:
             raise PipelineCompileError("unknown vd.ad.vjp argument(s): " + ", ".join(sorted(unknown_transform)))
         wrt_node = transform_keywords.get("wrt")
@@ -241,13 +240,6 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
             raise PipelineCompileError("vd.ad.vjp outputs must be a literal tuple or list of source paths")
         if len(set(outputs_value)) != len(outputs_value):
             raise PipelineCompileError("vd.ad.vjp outputs paths must be unique")
-        protocol_node = transform_keywords.get("protocol")
-        try:
-            protocol = ast.literal_eval(protocol_node) if protocol_node is not None else "dynamic_v2"
-        except (ValueError, TypeError, SyntaxError):
-            protocol = None
-        if protocol not in {"dynamic_v2", "legacy_fixed"}:
-            raise PipelineCompileError("vd.ad.vjp protocol must be 'dynamic_v2' or 'legacy_fixed'")
         rule_set_id = None
         rule_set_identity = None
         rules_node = transform_keywords.get("rules")
@@ -265,7 +257,6 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
             tuple(sorted(outputs_value)),
             rule_set_id,
             rule_set_identity,
-            protocol,
         )
         program = program_expression.args[0]
     else:
@@ -305,7 +296,7 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
             raise PipelineCompileError("compute VJP does not accept graphics custom rules")
         if graphics and transform["output_cotangents"]:
             raise PipelineCompileError("graphics VJP does not accept compute Storage outputs")
-        if not graphics and transform["protocol"] != "legacy_fixed" and not transform["output_cotangents"]:
+        if not graphics and not transform["output_cotangents"]:
             raise PipelineCompileError("compute VJP requires non-empty writable Storage outputs")
 
     features = _feature_bindings(tree)

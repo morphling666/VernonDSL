@@ -73,7 +73,7 @@ public:
     VernonRhiCommandEncoder native() const { return encoder_; }
 
 private:
-    VernonRhiDevice device_;
+    VernonRhiDevice device_{};
     VernonRhiCommandEncoder encoder_;
 };
 
@@ -184,6 +184,7 @@ private:
 
 class ExecutionGraph {
 public:
+    ExecutionGraph();
     explicit ExecutionGraph(VernonRhiDevice device);
     ~ExecutionGraph();
     ExecutionGraph(const ExecutionGraph &) = delete;
@@ -200,6 +201,7 @@ public:
 
     VernonRhiStatus createBuffer(const VernonRhiBufferDescriptor &descriptor, GraphBuffer &output,
                                  bool exported = false);
+    GraphBuffer importHostBuffer(uint64_t identity, bool exported = false);
     GraphBuffer importBuffer(VernonRhiBuffer buffer, bool exported = false);
     GraphImage importImage(VernonRhiImage image, VernonRhiImageView view, VernonRhiFormat format, uint32_t width,
                            uint32_t height, uint32_t layers = 1, uint32_t samples = 1, bool exported = false);
@@ -222,12 +224,19 @@ private:
         VernonRhiImage image{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     };
 
+    enum class Provider : uint8_t { Cpu, Rhi };
+
+    VernonRhiStatus executeCpu();
+    VernonRhiStatus executeRhi();
+
+    Provider provider_{Provider::Cpu};
     VernonRhiDevice device_;
     uint64_t graphIdentity_{};
     std::vector<std::unique_ptr<ExecutionPass>> passes_;
     std::vector<GraphResource> resources_;
     std::vector<ResourceRecord> resourceRecords_;
     std::unordered_map<uint64_t, uint32_t> importedBuffers_;
+    std::unordered_map<uint64_t, uint32_t> importedHostBuffers_;
     std::unordered_map<uint64_t, uint32_t> importedImages_;
     std::vector<uint32_t> schedule_;
     std::vector<CompiledScope> scopes_;

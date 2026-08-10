@@ -705,20 +705,20 @@ asset = vd.pipeline_asset(
                     target="cpu",
                 )
 
-    def test_cpu_legacy_fixed_vjp_is_rejected_before_compilation(self) -> None:
-        source = Path(__file__).parents[2] / "source" / "tests" / "fixtures" / "autodiff_native_numeric_asset.py"
+    def test_gpu_vjp_is_rejected_before_compilation(self) -> None:
+        source = Path(__file__).parents[2] / "source" / "tests" / "fixtures" / "autodiff_native_f16_asset.py"
         with tempfile.TemporaryDirectory() as directory:
             with (
                 mock.patch(
                     "vernon_dsl._shader_assets.cooking._native_module",
-                    return_value=_fake_native(mock.Mock(side_effect=AssertionError("compiler invoked"))),
+                    side_effect=AssertionError("native compiler loaded"),
                 ),
-                self.assertRaisesRegex(PipelineCompileError, "CPU VJP assets require protocol='dynamic_v2'"),
+                self.assertRaisesRegex(PipelineCompileError, "GPU target 'vulkan' is not supported"),
             ):
                 cook_pipeline_asset(
                     pipeline_asset=f"{source}:asset",
                     output=directory,
-                    target="cpu",
+                    target="vulkan",
                 )
 
     def test_four_variants_share_unchanged_fragment(self) -> None:

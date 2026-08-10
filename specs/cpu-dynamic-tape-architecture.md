@@ -7,9 +7,9 @@ implemented behavior and remaining product work are maintained in
 [`autodiff.md`](autodiff.md) and [`roadmap.md`](roadmap.md).
 
 At compiler contract 11 and pipeline contract 15, CPU VJP exclusively uses
-`dynamic_v2` for both direct and cooked execution. The former CPU
-`legacy_fixed` emitter, executable, and compatibility fixtures have been
-removed.
+`dynamic_v2` for both direct and cooked execution. Earlier fixed-protocol
+emitters, executables, and compatibility fixtures have been removed. GPU and
+graphics autodiff are deferred and unsupported.
 
 It refines the CPU sections of
 [`mlir-centered-autodiff-architecture.md`](mlir-centered-autodiff-architecture.md)

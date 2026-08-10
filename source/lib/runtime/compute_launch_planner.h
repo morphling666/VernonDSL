@@ -41,8 +41,8 @@ struct PlannedComputeLaunch {
 std::optional<int64_t> computeBindingDescriptorValue(const ComputeLaunchArgument &argument,
                                                      const ComputeBindingSource &source);
 
-bool planComputeInvocation(const Variant &variant, const VernonPipelineInvocation &invocation,
-                           PlannedComputeLaunch &plan, std::string &error);
+bool planComputeInvocation(const Variant &variant, VernonLaunchSize workgroup,
+                           const VernonPipelineInvocation &invocation, PlannedComputeLaunch &plan, std::string &error);
 
 } // namespace vernon::runtime
 

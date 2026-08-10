@@ -1,8 +1,10 @@
 #include "tensor_bridge.h"
 #include "pipeline_manifest.h"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
+#include <numeric>
 
 namespace vernon::runtime {
 namespace {
@@ -11,7 +13,7 @@ uint64_t strideMagnitude(int64_t stride) {
     return stride < 0 ? static_cast<uint64_t>(-(stride + 1)) + 1 : static_cast<uint64_t>(stride);
 }
 
-bool tensorRelativeBounds(const VernonTensorView &tensor, size_t &before, size_t &after) {
+bool computeTensorRelativeByteBounds(const VernonTensorView &tensor, size_t &before, size_t &after) {
     if (tensor.rank && (!tensor.shape || !tensor.byte_strides))
         return false;
     before = 0;
@@ -79,6 +81,134 @@ bool collectTransportScalars(const TransportNode &node, size_t base, std::vector
         if (!collectTransportScalars(child, offset, scalars))
             return false;
     return true;
+}
+
+struct TensorPhysicalRange {
+    uint64_t begin{};
+    uint64_t end{};
+    uint64_t base{};
+    bool empty{};
+};
+
+bool addPhysicalOffset(uint64_t base, size_t offset, uint64_t &result) {
+    if (offset > std::numeric_limits<uint64_t>::max() - base)
+        return false;
+    result = base + static_cast<uint64_t>(offset);
+    return true;
+}
+
+bool tensorPhysicalRange(const VernonTensorView &tensor, TensorPhysicalRange &range) {
+    const std::optional<size_t> count = tensorElementCount(tensor);
+    if (!count || !tensorFitsAllocation(tensor))
+        return false;
+    if (!*count) {
+        range.empty = true;
+        return true;
+    }
+
+    size_t before = 0;
+    size_t after = 0;
+    if (!tensorRelativeByteBounds(tensor, before, after))
+        return false;
+    const size_t localBegin = tensor.byte_offset - before;
+    if (tensor.element_layout.byte_size > std::numeric_limits<size_t>::max() - tensor.byte_offset - after)
+        return false;
+    const size_t localEnd = tensor.byte_offset + after + tensor.element_layout.byte_size;
+
+    if (tensor.storage == VERNON_TENSOR_HOST) {
+        if (!tensor.host_data)
+            return false;
+        range.base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(tensor.host_data));
+    } else if (tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
+        if (!tensor.resource.identity || !tensor.resource.resource.value || tensor.byte_size > tensor.resource.size ||
+            tensor.resource.size > std::numeric_limits<uint64_t>::max() - tensor.resource.offset)
+            return false;
+        range.base = tensor.resource.offset;
+    } else {
+        return false;
+    }
+    return addPhysicalOffset(range.base, localBegin, range.begin) && addPhysicalOffset(range.base, localEnd, range.end);
+}
+
+uint64_t tensorStrideLattice(const VernonTensorView &tensor) {
+    uint64_t lattice = 0;
+    for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension)
+        if (tensor.shape[dimension] > 1)
+            lattice = std::gcd(lattice, strideMagnitude(tensor.byte_strides[dimension]));
+    return lattice;
+}
+
+bool byteIntervalsOverlap(uint64_t left, size_t leftSize, uint64_t right, size_t rightSize) {
+    if (leftSize > std::numeric_limits<uint64_t>::max() - left ||
+        rightSize > std::numeric_limits<uint64_t>::max() - right)
+        return true;
+    return left < right + rightSize && right < left + leftSize;
+}
+
+bool latticeProvesDisjoint(uint64_t leftAddress, size_t leftSize, uint64_t leftLattice, uint64_t rightAddress,
+                           size_t rightSize, uint64_t rightLattice) {
+    const uint64_t lattice = std::gcd(leftLattice, rightLattice);
+    if (!lattice)
+        return false;
+    if (leftSize >= lattice || rightSize >= lattice)
+        return false;
+    const uint64_t rightFromLeft = rightAddress >= leftAddress
+                                       ? (rightAddress - leftAddress) % lattice
+                                       : (lattice - (leftAddress - rightAddress) % lattice) % lattice;
+    const uint64_t leftFromRight = (lattice - rightFromLeft) % lattice;
+    return rightFromLeft >= leftSize && leftFromRight >= rightSize;
+}
+
+bool periodicSpan(const VernonTensorView &tensor, uint64_t address, uint64_t period, uint64_t &begin, uint64_t &end) {
+    uint64_t before = 0;
+    uint64_t after = 0;
+    for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension) {
+        if (tensor.shape[dimension] <= 1)
+            continue;
+        const uint64_t stride = strideMagnitude(tensor.byte_strides[dimension]);
+        if (stride >= period) {
+            if (stride % period)
+                return false;
+            continue;
+        }
+        const uint64_t steps = tensor.shape[dimension] - 1;
+        if (steps &&
+            stride >
+                (std::numeric_limits<uint64_t>::max() - (tensor.byte_strides[dimension] < 0 ? before : after)) / steps)
+            return false;
+        (tensor.byte_strides[dimension] < 0 ? before : after) += stride * steps;
+    }
+    const uint64_t residue = address % period;
+    const uint64_t elementSize = tensor.element_layout.byte_size;
+    if (before > residue || after > period - residue || elementSize > period - residue - after)
+        return false;
+    begin = residue - before;
+    end = residue + after + elementSize;
+    return true;
+}
+
+bool periodicSpansProveDisjoint(const VernonTensorView &left, uint64_t leftAddress, const VernonTensorView &right,
+                                uint64_t rightAddress) {
+    for (uint32_t leftDimension = 0; leftDimension < left.rank; ++leftDimension) {
+        const uint64_t period = strideMagnitude(left.byte_strides[leftDimension]);
+        if (left.shape[leftDimension] <= 1 || !period)
+            continue;
+        bool sharedPeriod = false;
+        for (uint32_t rightDimension = 0; rightDimension < right.rank; ++rightDimension)
+            sharedPeriod |=
+                right.shape[rightDimension] > 1 && strideMagnitude(right.byte_strides[rightDimension]) == period;
+        if (!sharedPeriod)
+            continue;
+        uint64_t leftBegin = 0;
+        uint64_t leftEnd = 0;
+        uint64_t rightBegin = 0;
+        uint64_t rightEnd = 0;
+        if (periodicSpan(left, leftAddress, period, leftBegin, leftEnd) &&
+            periodicSpan(right, rightAddress, period, rightBegin, rightEnd) &&
+            (leftEnd <= rightBegin || rightEnd <= leftBegin))
+            return true;
+    }
+    return false;
 }
 
 } // namespace
@@ -164,6 +294,8 @@ std::optional<size_t> tensorElementCount(const VernonTensorView &tensor) {
         return std::nullopt;
     size_t count = 1;
     for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension) {
+        if (!count)
+            return 0;
         if (tensor.shape[dimension] > std::numeric_limits<size_t>::max() / count)
             return std::nullopt;
         count *= static_cast<size_t>(tensor.shape[dimension]);
@@ -179,6 +311,10 @@ std::optional<size_t> tensorLogicalByteSize(const VernonTensorView &tensor) {
     return *elementCount * elementSize;
 }
 
+bool tensorRelativeByteBounds(const VernonTensorView &tensor, size_t &before, size_t &after) {
+    return computeTensorRelativeByteBounds(tensor, before, after);
+}
+
 bool tensorRequiredSpan(const VernonTensorView &tensor, size_t &span) {
     const size_t elementSize = valueLayoutValid(tensor.element_layout) ? tensor.element_layout.byte_size : 0;
     const std::optional<size_t> elementCount = tensorElementCount(tensor);
@@ -190,7 +326,7 @@ bool tensorRequiredSpan(const VernonTensorView &tensor, size_t &span) {
     }
     size_t before = 0;
     size_t after = 0;
-    if (!tensorRelativeBounds(tensor, before, after) || after > std::numeric_limits<size_t>::max() - before ||
+    if (!tensorRelativeByteBounds(tensor, before, after) || after > std::numeric_limits<size_t>::max() - before ||
         elementSize > std::numeric_limits<size_t>::max() - before - after)
         return false;
     span = before + after + elementSize;
@@ -206,11 +342,103 @@ bool tensorFitsAllocation(const VernonTensorView &tensor) {
         return true;
     size_t before = 0;
     size_t after = 0;
-    if (!tensorRelativeBounds(tensor, before, after) || before > tensor.byte_offset)
+    if (!tensorRelativeByteBounds(tensor, before, after) || before > tensor.byte_offset)
         return false;
     const size_t availableAfter = tensor.byte_size - tensor.byte_offset;
     const size_t elementSize = tensor.element_layout.byte_size;
     return after <= availableAfter && elementSize <= availableAfter - after;
+}
+
+bool tensorByteLayoutInjective(const VernonTensorView &tensor) {
+    const size_t elementSize = valueLayoutValid(tensor.element_layout) ? tensor.element_layout.byte_size : 0;
+    const std::optional<size_t> elementCount = tensorElementCount(tensor);
+    if (!elementSize || !elementCount || !tensorFitsAllocation(tensor))
+        return false;
+    if (*elementCount < 2)
+        return true;
+
+    if (elementSize - 1 > std::numeric_limits<uint64_t>::max())
+        return false;
+    uint64_t coveredSpan = static_cast<uint64_t>(elementSize - 1);
+    std::vector<std::pair<uint64_t, uint64_t>> dimensions;
+    dimensions.reserve(tensor.rank);
+    for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension)
+        dimensions.emplace_back(strideMagnitude(tensor.byte_strides[dimension]), tensor.shape[dimension]);
+    std::sort(dimensions.begin(), dimensions.end());
+    for (auto [stride, extent] : dimensions) {
+        if (extent <= 1)
+            continue;
+        if (!stride || stride <= coveredSpan)
+            return false;
+        const uint64_t steps = extent - 1;
+        if (stride > (std::numeric_limits<uint64_t>::max() - coveredSpan) / steps)
+            return false;
+        coveredSpan += stride * steps;
+    }
+    return true;
+}
+
+TensorPhysicalOverlap tensorViewsPhysicalOverlap(const VernonTensorView &left, const VernonTensorView &right) {
+    const auto supportedStorage = [](VernonTensorStorage storage) {
+        return storage == VERNON_TENSOR_HOST || storage == VERNON_TENSOR_RHI_RESOURCE;
+    };
+    if (!supportedStorage(left.storage) || !supportedStorage(right.storage))
+        return TensorPhysicalOverlap::Unknown;
+    if (left.storage != right.storage)
+        return TensorPhysicalOverlap::Disjoint;
+    if (left.storage == VERNON_TENSOR_RHI_RESOURCE) {
+        if (!left.resource.identity || !right.resource.identity || !left.resource.resource.value ||
+            !right.resource.resource.value)
+            return TensorPhysicalOverlap::Unknown;
+        if (left.resource.identity != right.resource.identity ||
+            left.resource.resource.value != right.resource.resource.value)
+            return TensorPhysicalOverlap::Disjoint;
+    }
+
+    TensorPhysicalRange leftRange;
+    TensorPhysicalRange rightRange;
+    if (!tensorPhysicalRange(left, leftRange) || !tensorPhysicalRange(right, rightRange))
+        return TensorPhysicalOverlap::Unknown;
+    if (leftRange.empty || rightRange.empty || leftRange.begin >= rightRange.end || rightRange.begin >= leftRange.end)
+        return TensorPhysicalOverlap::Disjoint;
+
+    uint64_t leftFirst = 0;
+    uint64_t rightFirst = 0;
+    if (!addPhysicalOffset(leftRange.base, left.byte_offset, leftFirst) ||
+        !addPhysicalOffset(rightRange.base, right.byte_offset, rightFirst))
+        return TensorPhysicalOverlap::Unknown;
+    const size_t leftSize = left.element_layout.byte_size;
+    const size_t rightSize = right.element_layout.byte_size;
+    if (byteIntervalsOverlap(leftFirst, leftSize, rightFirst, rightSize))
+        return TensorPhysicalOverlap::Overlapping;
+    if (isRowMajorContiguous(left) && isRowMajorContiguous(right))
+        return TensorPhysicalOverlap::Overlapping;
+    if (periodicSpansProveDisjoint(left, leftFirst, right, rightFirst))
+        return TensorPhysicalOverlap::Disjoint;
+    if (latticeProvesDisjoint(leftFirst, leftSize, tensorStrideLattice(left), rightFirst, rightSize,
+                              tensorStrideLattice(right)))
+        return TensorPhysicalOverlap::Disjoint;
+    return TensorPhysicalOverlap::Unknown;
+}
+
+bool tensorViewsHaveWritableOverlap(const VernonTensorView &left, const VernonTensorView &right) {
+    if (left.access == VERNON_ACCESS_READ && right.access == VERNON_ACCESS_READ)
+        return false;
+    return tensorViewsPhysicalOverlap(left, right) != TensorPhysicalOverlap::Disjoint;
+}
+
+bool hostByteRangesHaveWritableOverlap(const void *leftData, size_t leftSize, bool leftWritable, const void *rightData,
+                                       size_t rightSize, bool rightWritable) {
+    if ((!leftWritable && !rightWritable) || !leftSize || !rightSize)
+        return false;
+    if (!leftData || !rightData)
+        return true;
+    const uintptr_t leftBegin = reinterpret_cast<uintptr_t>(leftData);
+    const uintptr_t rightBegin = reinterpret_cast<uintptr_t>(rightData);
+    if (leftSize > std::numeric_limits<uintptr_t>::max() - leftBegin ||
+        rightSize > std::numeric_limits<uintptr_t>::max() - rightBegin)
+        return true;
+    return leftBegin < rightBegin + rightSize && rightBegin < leftBegin + leftSize;
 }
 
 bool isRowMajorContiguous(const VernonTensorView &tensor) {

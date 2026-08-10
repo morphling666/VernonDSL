@@ -24,6 +24,19 @@ std::optional<size_t> tensorLogicalByteSize(const VernonTensorView &tensor);
 
 bool tensorRequiredSpan(const VernonTensorView &tensor, size_t &span);
 bool tensorFitsAllocation(const VernonTensorView &tensor);
+bool tensorRelativeByteBounds(const VernonTensorView &tensor, size_t &before, size_t &after);
+bool tensorByteLayoutInjective(const VernonTensorView &tensor);
+
+enum class TensorPhysicalOverlap {
+    Disjoint,
+    Overlapping,
+    Unknown,
+};
+
+TensorPhysicalOverlap tensorViewsPhysicalOverlap(const VernonTensorView &left, const VernonTensorView &right);
+bool tensorViewsHaveWritableOverlap(const VernonTensorView &left, const VernonTensorView &right);
+bool hostByteRangesHaveWritableOverlap(const void *leftData, size_t leftSize, bool leftWritable, const void *rightData,
+                                       size_t rightSize, bool rightWritable);
 
 bool isRowMajorContiguous(const VernonTensorView &tensor);
 

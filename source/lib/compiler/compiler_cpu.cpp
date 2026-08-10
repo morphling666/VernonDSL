@@ -2,6 +2,7 @@
 
 #include "VernonCpuAbiWrapper.h"
 #include "VernonCpuHalfConversion.h"
+#include "VernonCpuWorkgroupABI.h"
 #include "compiler_frontend.h"
 #include "compiler_reflection.h"
 
@@ -15,6 +16,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Export.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -38,6 +40,24 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+namespace {
+
+void *registeredCpuHelperAddress(const VernonCpuRuntimeHelpersV1 *helpers, llvm::StringRef name) {
+    if (!helpers)
+        return nullptr;
+    if (name == VERNON_CPU_WORKGROUP_ADDRESS_V1_SYMBOL)
+        return reinterpret_cast<void *>(helpers->workgroup_address);
+    if (name == VERNON_CPU_LANE_ADDRESS_V1_SYMBOL)
+        return reinterpret_cast<void *>(helpers->lane_address);
+    if (name == VERNON_CPU_WORKGROUP_BARRIER_V1_SYMBOL)
+        return reinterpret_cast<void *>(helpers->workgroup_barrier);
+    if (name == VERNON_CPU_WORKGROUP_IS_LEADER_V1_SYMBOL)
+        return reinterpret_cast<void *>(helpers->workgroup_is_leader);
+    return nullptr;
+}
+
+} // namespace
 
 namespace vernon::compiler {
 
@@ -218,7 +238,7 @@ bool emitCpuObject(llvm::Module &module, llvm::TargetMachine &targetMachine, std
 
 CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &options,
                             std::vector<Artifact> &artifacts, std::string &reflection, std::string &diagnostics,
-                            CpuExecutionStatePtr &execution) {
+                            const VernonCpuRuntimeHelpersV1 *runtimeHelpers, CpuExecutionStatePtr &execution) {
     mlir::MLIRContext &context = prepared.context();
     mlir::ScopedDiagnosticHandler handler(
         &context, [&](mlir::Diagnostic &diagnostic) { appendDiagnostic(diagnostics, diagnostic); });
@@ -320,7 +340,17 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
         return CpuCompileResult::CodegenFailure;
 
     CpuExecutionStatePtr nextExecution;
-    if (hostTarget) {
+    bool runtimeHelpersAvailable = true;
+    if (hostTarget)
+        for (const char *helper : {VERNON_CPU_WORKGROUP_ADDRESS_V1_SYMBOL, VERNON_CPU_LANE_ADDRESS_V1_SYMBOL,
+                                   VERNON_CPU_WORKGROUP_BARRIER_V1_SYMBOL, VERNON_CPU_WORKGROUP_IS_LEADER_V1_SYMBOL}) {
+            llvm::Function *declaration = llvmModule->getFunction(helper);
+            if (declaration && !declaration->use_empty() && !registeredCpuHelperAddress(runtimeHelpers, helper)) {
+                runtimeHelpersAvailable = false;
+                break;
+            }
+        }
+    if (hostTarget && runtimeHelpersAvailable) {
         auto jitTargetMachine = llvm::orc::JITTargetMachineBuilder::detectHost();
         if (!jitTargetMachine) {
             diagnostics = llvm::toString(jitTargetMachine.takeError());
@@ -336,6 +366,34 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
         }
         nextExecution.reset(new CpuExecutionState());
         nextExecution->jit = std::move(*createdJit);
+        llvm::orc::SymbolMap helperSymbols;
+        for (const char *helper : {VERNON_CPU_WORKGROUP_ADDRESS_V1_SYMBOL, VERNON_CPU_LANE_ADDRESS_V1_SYMBOL,
+                                   VERNON_CPU_WORKGROUP_BARRIER_V1_SYMBOL, VERNON_CPU_WORKGROUP_IS_LEADER_V1_SYMBOL}) {
+            llvm::Function *declaration = llvmModule->getFunction(helper);
+            if (!declaration || declaration->use_empty())
+                continue;
+            void *address = registeredCpuHelperAddress(runtimeHelpers, helper);
+            if (!address) {
+                diagnostics = std::string("CPU JIT requires runtime helper '") + helper +
+                              "' but no explicit helper address is available";
+                return CpuCompileResult::CodegenFailure;
+            }
+            helperSymbols[nextExecution->jit->mangleAndIntern(helper)] = {llvm::orc::ExecutorAddr::fromPtr(address),
+                                                                          llvm::JITSymbolFlags::Exported};
+        }
+        if (!helperSymbols.empty())
+            if (llvm::Error error = nextExecution->jit->getMainJITDylib().define(
+                    llvm::orc::absoluteSymbols(std::move(helperSymbols)))) {
+                diagnostics = llvm::toString(std::move(error));
+                return CpuCompileResult::CodegenFailure;
+            }
+        auto processSymbols =
+            llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(dataLayout.getGlobalPrefix());
+        if (!processSymbols) {
+            diagnostics = llvm::toString(processSymbols.takeError());
+            return CpuCompileResult::CodegenFailure;
+        }
+        nextExecution->jit->getMainJITDylib().addGenerator(std::move(*processSymbols));
         if (llvm::Error error = nextExecution->jit->addObjectFile(
                 llvm::MemoryBuffer::getMemBufferCopy(object, cpuObjectFilename(parsedTriple)))) {
             diagnostics = llvm::toString(std::move(error));

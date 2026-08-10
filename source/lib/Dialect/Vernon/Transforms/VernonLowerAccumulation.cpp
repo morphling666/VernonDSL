@@ -2,24 +2,29 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonGlobalIdIndexProof.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
+
+#include <string>
 
 namespace mlir::vernon {
 namespace {
 
-enum class SelectedStrategy {
-    Direct,
-    Atomic,
+enum class LoweringForm {
+    Store,
+    AtomicAdd,
     LoadAddStore,
 };
 
-SelectedStrategy selectStrategy(Operation *operation, bool supportsF32AtomicAdd, bool supportsF64AtomicAdd) {
+struct LoweringDecision {
+    LoweringForm form;
+};
+
+FailureOr<LoweringDecision> selectLowering(Operation *operation, bool supportsF32AtomicAdd, bool supportsF64AtomicAdd,
+                                           AggregateGradientStorage aggregateGradientStorage) {
     Value value;
     bool deterministic = false;
     bool disjoint = false;
@@ -32,10 +37,31 @@ SelectedStrategy selectStrategy(Operation *operation, bool supportsF32AtomicAdd,
         deterministic = scatter.getDeterministic();
         disjoint = static_cast<bool>(scatter.getDisjointAttr());
     }
+    auto ownership = operation->getAttrOfType<StringAttr>(kAccumulationOwnershipAttrName);
+    if (ownership && ownership.getValue() != kInvocationPrivateAccumulationOwnership)
+        return operation->emitError("has unsupported accumulation ownership '") << ownership.getValue() << "'";
+    if (ownership && !isa<ScatterAddOp>(operation))
+        return operation->emitError("invocation-private accumulation ownership is only valid on scatter_add");
+    if (ownership && aggregateGradientStorage != AggregateGradientStorage::InvocationPrivateStaging)
+        return operation->emitError(
+            "invocation-private accumulation requires target support for invocation-private gradient staging");
+    if (disjoint && !proveStrictInvocationOwnedIndex(cast<ScatterAddOp>(operation).getIndices()))
+        return operation->emitError(
+            "scatter_add 'disjoint' hint requires a lane-exclusive global invocation index proof");
+
     const bool atomicSupported =
         (value.getType().isF32() && supportsF32AtomicAdd) || (value.getType().isF64() && supportsF64AtomicAdd);
-    return disjoint ? SelectedStrategy::Direct
-                    : (!deterministic && atomicSupported ? SelectedStrategy::Atomic : SelectedStrategy::LoadAddStore);
+    if (disjoint)
+        return LoweringDecision{LoweringForm::Store};
+    if (ownership)
+        return LoweringDecision{LoweringForm::LoadAddStore};
+    if (!deterministic && atomicSupported)
+        return LoweringDecision{LoweringForm::AtomicAdd};
+    if (deterministic)
+        return operation->emitError("deterministic shared accumulation requires a dedicated reduction kernel");
+    if (isa<ShapedType>(value.getType()))
+        return operation->emitError("shared shaped accumulation requires proven invocation-private gradient staging");
+    return operation->emitError("shared scalar accumulation requires a supported atomic add");
 }
 
 Operation *createLoad(OpBuilder &builder, Location location, Value storage, ValueRange indices, Type type) {
@@ -46,11 +72,14 @@ Operation *createLoad(OpBuilder &builder, Location location, Value storage, Valu
     return builder.create(state);
 }
 
-Operation *createStore(OpBuilder &builder, Location location, Value value, Value storage, ValueRange indices) {
+Operation *createStore(OpBuilder &builder, Location location, Value value, Value storage, ValueRange indices,
+                       StringAttr ownership = {}) {
     OperationState state(location, StoreOp::getOperationName());
     state.addOperands(value);
     state.addOperands(storage);
     state.addOperands(indices);
+    if (ownership)
+        state.addAttribute(kAccumulationOwnershipAttrName, ownership);
     return builder.create(state);
 }
 
@@ -65,79 +94,6 @@ Operation *createAtomicAdd(OpBuilder &builder, Location location, Value value, V
     return builder.create(state);
 }
 
-FailureOr<std::pair<BlockArgument, BlockArgument>> findSerialDispatchArguments(func::FuncOp function) {
-    BlockArgument launch;
-    BlockArgument globalId;
-    for (BlockArgument argument : function.getArguments()) {
-        const unsigned index = argument.getArgNumber();
-        auto sourceName = function.getArgAttrOfType<StringAttr>(index, "vernon.source_name");
-        auto builtin = function.getArgAttrOfType<StringAttr>(index, "vernon.builtin");
-        if (sourceName && sourceName.getValue() == "__vernon_launch")
-            launch = argument;
-        if (builtin && builtin.getValue() == "global_invocation_id")
-            globalId = argument;
-    }
-    if (!launch || !globalId || !isa<RankedTensorType>(globalId.getType()))
-        return failure();
-    return std::make_pair(launch, globalId);
-}
-
-LogicalResult makeSerialDispatch(func::FuncOp function) {
-    FailureOr<std::pair<BlockArgument, BlockArgument>> arguments = findSerialDispatchArguments(function);
-    if (failed(arguments))
-        return function.emitError("deterministic accumulation requires launch and global-invocation arguments");
-
-    Block &entry = function.front();
-    Operation *terminator = entry.getTerminator();
-    SmallVector<Operation *> originalOperations;
-    for (Operation &operation : entry.without_terminator())
-        originalOperations.push_back(&operation);
-    OpBuilder builder(terminator);
-    Location location = function.getLoc();
-    Value zero = arith::ConstantIndexOp::create(builder, location, 0);
-    Value one = arith::ConstantIndexOp::create(builder, location, 1);
-    auto launchType = dyn_cast<TensorViewType>(arguments->first.getType());
-    auto extentTensorType = launchType ? dyn_cast<RankedTensorType>(launchType.getElementType()) : nullptr;
-    auto globalIdType = dyn_cast<RankedTensorType>(arguments->second.getType());
-    if (!extentTensorType || extentTensorType.getShape() != ArrayRef<int64_t>{3} ||
-        !extentTensorType.getElementType().isInteger(32) || globalIdType != extentTensorType)
-        return function.emitError("deterministic accumulation has an invalid launch ABI");
-
-    Operation *load = createLoad(builder, location, arguments->first, ValueRange{zero}, extentTensorType);
-    SmallVector<Value> extents;
-    for (int64_t axis = 0; axis != 3; ++axis) {
-        Value index = arith::ConstantIndexOp::create(builder, location, axis);
-        Value extent = tensor::ExtractOp::create(builder, location, load->getResult(0), ValueRange{index}).getResult();
-        extents.push_back(arith::IndexCastUIOp::create(builder, location, builder.getIndexType(), extent));
-    }
-
-    scf::ForOp zLoop = scf::ForOp::create(builder, location, zero, extents[2], one);
-    builder.setInsertionPointToStart(zLoop.getBody());
-    scf::ForOp yLoop = scf::ForOp::create(builder, location, zero, extents[1], one);
-    builder.setInsertionPointToStart(yLoop.getBody());
-    scf::ForOp xLoop = scf::ForOp::create(builder, location, zero, extents[0], one);
-    builder.setInsertionPointToStart(xLoop.getBody());
-
-    SmallVector<Value> coordinates;
-    for (Value index : {xLoop.getInductionVar(), yLoop.getInductionVar(), zLoop.getInductionVar()})
-        coordinates.push_back(
-            arith::IndexCastUIOp::create(builder, location, extentTensorType.getElementType(), index));
-    Value globalId = tensor::FromElementsOp::create(builder, location, globalIdType, coordinates);
-
-    IRMapping mapping;
-    for (BlockArgument argument : function.getArguments())
-        mapping.map(argument, argument);
-    mapping.map(arguments->second, globalId);
-    for (Operation *operation : originalOperations)
-        builder.clone(*operation, mapping);
-    for (Operation *operation : llvm::reverse(originalOperations))
-        operation->erase();
-
-    function->setAttr("vernon.workgroup_size", builder.getDenseI32ArrayAttr({1, 1, 1}));
-    function->setAttr("vernon.serial_dispatch", builder.getUnitAttr());
-    return success();
-}
-
 struct VernonLowerAccumulationPass final : PassWrapper<VernonLowerAccumulationPass, OperationPass<ModuleOp>> {
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VernonLowerAccumulationPass)
 
@@ -145,10 +101,15 @@ struct VernonLowerAccumulationPass final : PassWrapper<VernonLowerAccumulationPa
     explicit VernonLowerAccumulationPass(AccumulationTargetCapabilities capabilities) {
         supportsF32AtomicAdd = capabilities.supportsF32AtomicAdd;
         supportsF64AtomicAdd = capabilities.supportsF64AtomicAdd;
+        aggregateGradientStorage =
+            capabilities.aggregateGradientStorage == AggregateGradientStorage::InvocationPrivateStaging
+                ? "invocation-private-staging"
+                : "shared";
     }
     VernonLowerAccumulationPass(const VernonLowerAccumulationPass &other) : PassWrapper(other) {
         supportsF32AtomicAdd = other.supportsF32AtomicAdd;
         supportsF64AtomicAdd = other.supportsF64AtomicAdd;
+        aggregateGradientStorage = other.aggregateGradientStorage;
     }
 
     StringRef getArgument() const final { return "vernon-lower-accumulation"; }
@@ -157,30 +118,34 @@ struct VernonLowerAccumulationPass final : PassWrapper<VernonLowerAccumulationPa
     }
 
     void getDependentDialects(DialectRegistry &registry) const override {
-        registry
-            .insert<arith::ArithDialect, func::FuncDialect, scf::SCFDialect, tensor::TensorDialect, VernonDialect>();
+        registry.insert<arith::ArithDialect, func::FuncDialect, VernonDialect>();
     }
 
     void runOnOperation() override {
-        for (func::FuncOp function : getOperation().getOps<func::FuncOp>()) {
-            bool requiresSerialDispatch = false;
-            function.walk([&](Operation *operation) {
-                if (isa<ReduceSumOp, ScatterAddOp>(operation) &&
-                    selectStrategy(operation, supportsF32AtomicAdd, supportsF64AtomicAdd) ==
-                        SelectedStrategy::LoadAddStore)
-                    requiresSerialDispatch = true;
-            });
-            if (requiresSerialDispatch && function->hasAttr("vernon.entry") && failed(makeSerialDispatch(function)))
-                return signalPassFailure();
+        AggregateGradientStorage storageModel;
+        if (aggregateGradientStorage == "shared") {
+            storageModel = AggregateGradientStorage::Shared;
+        } else if (aggregateGradientStorage == "invocation-private-staging") {
+            storageModel = AggregateGradientStorage::InvocationPrivateStaging;
+        } else {
+            getOperation()->emitError("unknown aggregate gradient storage model '") << aggregateGradientStorage << "'";
+            return signalPassFailure();
         }
-
-        SmallVector<Operation *> operations;
-        getOperation().walk([&](Operation *operation) {
-            if (isa<ReduceSumOp, ScatterAddOp>(operation))
-                operations.push_back(operation);
+        SmallVector<std::pair<Operation *, LoweringDecision>> decisions;
+        WalkResult analysis = getOperation().walk([&](Operation *operation) {
+            if (!isa<ReduceSumOp, ScatterAddOp>(operation))
+                return WalkResult::advance();
+            FailureOr<LoweringDecision> decision =
+                selectLowering(operation, supportsF32AtomicAdd, supportsF64AtomicAdd, storageModel);
+            if (failed(decision))
+                return WalkResult::interrupt();
+            decisions.emplace_back(operation, *decision);
+            return WalkResult::advance();
         });
+        if (analysis.wasInterrupted())
+            return signalPassFailure();
 
-        for (Operation *operation : operations) {
+        for (auto [operation, decision] : decisions) {
             Value value;
             Value storage;
             ValueRange indices;
@@ -195,17 +160,16 @@ struct VernonLowerAccumulationPass final : PassWrapper<VernonLowerAccumulationPa
                 indices = scatter.getIndices();
             }
 
-            const SelectedStrategy strategy = selectStrategy(operation, supportsF32AtomicAdd, supportsF64AtomicAdd);
-
             OpBuilder builder(operation);
-            if (strategy == SelectedStrategy::Direct) {
-                createStore(builder, operation->getLoc(), value, storage, indices);
-            } else if (strategy == SelectedStrategy::Atomic) {
+            auto ownership = operation->getAttrOfType<StringAttr>(kAccumulationOwnershipAttrName);
+            if (decision.form == LoweringForm::Store) {
+                createStore(builder, operation->getLoc(), value, storage, indices, ownership);
+            } else if (decision.form == LoweringForm::AtomicAdd) {
                 createAtomicAdd(builder, operation->getLoc(), value, storage, indices);
             } else {
                 Operation *load = createLoad(builder, operation->getLoc(), storage, indices, value.getType());
                 Value sum = arith::AddFOp::create(builder, operation->getLoc(), load->getResult(0), value);
-                createStore(builder, operation->getLoc(), sum, storage, indices);
+                createStore(builder, operation->getLoc(), sum, storage, indices, ownership);
             }
             operation->erase();
         }
@@ -220,6 +184,10 @@ struct VernonLowerAccumulationPass final : PassWrapper<VernonLowerAccumulationPa
     Option<bool> supportsF64AtomicAdd{*this, "supports-atomic-f64",
                                       llvm::cl::desc("Target supports device-scope f64 atomic add"),
                                       llvm::cl::init(false)};
+    Option<std::string> aggregateGradientStorage{
+        *this, "aggregate-gradient-storage",
+        llvm::cl::desc("Aggregate gradient storage model: shared or invocation-private-staging"),
+        llvm::cl::init("shared")};
 };
 
 } // namespace

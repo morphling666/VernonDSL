@@ -100,12 +100,12 @@ void buildVernonCpuPreparationPipeline(OpPassManager &passManager) {
 }
 
 void buildVernonCpuLoweringPipeline(OpPassManager &passManager) {
-    passManager.addPass(
-        createVernonLowerAccumulationPass(AccumulationTargetCapabilities{/*supportsF32AtomicAdd=*/true,
-                                                                         /*supportsF64AtomicAdd=*/true}));
+    passManager.addPass(createVernonLowerAccumulationPass(AccumulationTargetCapabilities{
+        /*supportsF32AtomicAdd=*/true,
+        /*supportsF64AtomicAdd=*/true, AggregateGradientStorage::InvocationPrivateStaging}));
     passManager.addPass(createVernonLowerCPUABIPass());
     passManager.addPass(createVernonLowerCPUTensorsPass());
-    passManager.addPass(createVernonLowerSynchronizationPass());
+    passManager.addPass(createVernonLowerCPUSynchronizationPass());
     passManager.addPass(createVernonLowerCPUResourcesPass());
     passManager.addPass(createSCFToControlFlowPass());
     passManager.addPass(createConvertToLLVMPass());

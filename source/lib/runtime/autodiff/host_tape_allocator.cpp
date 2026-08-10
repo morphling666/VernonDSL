@@ -1,5 +1,4 @@
 #include "host_tape_allocator.h"
-#include "VernonRuntime.h"
 
 #include <algorithm>
 #include <cstring>
@@ -15,6 +14,7 @@ thread_local std::vector<TapeRegistryEntry> tapeRegistry;
 
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION
 thread_local HostTapeTraversalMetrics *activeTraversalMetrics;
+std::mutex traversalMetricsMutex;
 #endif
 
 bool checkedAdd(size_t left, size_t right, size_t &result) {
@@ -38,6 +38,28 @@ HostTapeTraversalScope::HostTapeTraversalScope(HostTapeTraversalMetrics &metrics
     : previous_(std::exchange(activeTraversalMetrics, &metrics)) {}
 
 HostTapeTraversalScope::~HostTapeTraversalScope() { activeTraversalMetrics = previous_; }
+
+HostTapeTraversalMetrics *currentHostTapeTraversalMetrics() { return activeTraversalMetrics; }
+
+VernonStatus withHostTapeTraversalMetrics(HostTapeTraversalMetrics *destination,
+                                          const std::function<VernonStatus()> &callback) {
+    if (!destination)
+        return callback();
+    HostTapeTraversalMetrics local;
+    VernonStatus status;
+    {
+        HostTapeTraversalScope scope(local);
+        status = callback();
+    }
+    std::lock_guard lock(traversalMetricsMutex);
+    destination->regionLookups += local.regionLookups;
+    destination->recordResolutions += local.recordResolutions;
+    destination->leafReads += local.leafReads;
+    destination->childReads += local.childReads;
+    destination->executedCountReads += local.executedCountReads;
+    destination->exitKindReads += local.exitKindReads;
+    return status;
+}
 #endif
 
 bool HostTapeMemoryPolicy::reserve(size_t currentInvocationBytes, size_t additionalBytes) {
@@ -57,6 +79,78 @@ void HostTapeMemoryPolicy::release(size_t bytes) {
     contextBytes_ = bytes > contextBytes_ ? 0 : contextBytes_ - bytes;
 }
 
+std::shared_ptr<HostTapeDispatchBudget> HostTapeDispatchBudget::reserve(std::shared_ptr<HostTapeMemoryPolicy> policy,
+                                                                        size_t capacity) {
+    if (!policy || !capacity)
+        return {};
+    std::lock_guard lock(policy->mutex_);
+    if (policy->contextBytes_ >= policy->contextLimit_)
+        return {};
+    capacity = std::min(capacity, policy->contextLimit_ - policy->contextBytes_);
+    std::shared_ptr<HostTapeDispatchBudget> budget;
+    try {
+        budget = std::shared_ptr<HostTapeDispatchBudget>(new HostTapeDispatchBudget(policy, capacity));
+    } catch (const std::bad_alloc &) {
+        return {};
+    }
+    policy->contextBytes_ += capacity;
+    budget->policyCharge_ = capacity;
+    return budget;
+}
+
+HostTapeDispatchBudget::~HostTapeDispatchBudget() {
+    size_t charge = 0;
+    {
+        std::lock_guard lock(mutex_);
+        charge = std::exchange(policyCharge_, 0);
+    }
+    if (policy_ && charge)
+        policy_->release(charge);
+}
+
+size_t HostTapeDispatchBudget::usedBytes() const {
+    std::lock_guard lock(mutex_);
+    return usedBytes_;
+}
+
+bool HostTapeDispatchBudget::reserveBytes(size_t additionalBytes) {
+    std::lock_guard lock(mutex_);
+    size_t required = 0;
+    if (committed_ || !checkedAdd(usedBytes_, additionalBytes, required) || required > capacity_)
+        return false;
+    usedBytes_ = required;
+    return true;
+}
+
+void HostTapeDispatchBudget::releaseBytes(size_t bytes) {
+    size_t policyRelease = 0;
+    {
+        std::lock_guard lock(mutex_);
+        const size_t released = std::min(bytes, usedBytes_);
+        usedBytes_ -= released;
+        if (committed_) {
+            policyRelease = std::min(released, policyCharge_);
+            policyCharge_ -= policyRelease;
+        }
+    }
+    if (policy_ && policyRelease)
+        policy_->release(policyRelease);
+}
+
+void HostTapeDispatchBudget::commit() {
+    size_t unused = 0;
+    {
+        std::lock_guard lock(mutex_);
+        if (committed_)
+            return;
+        unused = capacity_ - usedBytes_;
+        policyCharge_ = usedBytes_;
+        committed_ = true;
+    }
+    if (policy_ && unused)
+        policy_->release(unused);
+}
+
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION
 size_t hostTapeMemoryPolicyChargedBytesForTesting(HostTapeMemoryPolicy &policy) {
     std::lock_guard lock(policy.mutex_);
@@ -65,7 +159,9 @@ size_t hostTapeMemoryPolicyChargedBytesForTesting(HostTapeMemoryPolicy &policy) 
 #endif
 
 HostTapeSnapshot::~HostTapeSnapshot() {
-    if (policy_ && policyCharge_)
+    if (dispatchBudget_ && policyCharge_)
+        dispatchBudget_->releaseBytes(policyCharge_);
+    else if (policy_ && policyCharge_)
         policy_->release(policyCharge_);
 }
 
@@ -234,8 +330,10 @@ void HostTapeSnapshot::initializeDescriptor() {
     descriptor_.read_exit_kind = readExitKind;
 }
 
-HostDynamicTape::HostDynamicTape(size_t capacityBytes, std::shared_ptr<HostTapeMemoryPolicy> policy)
-    : policy_(std::move(policy)), ownerThread_(std::this_thread::get_id()) {
+HostDynamicTape::HostDynamicTape(size_t capacityBytes, std::shared_ptr<HostTapeMemoryPolicy> policy,
+                                 std::shared_ptr<HostTapeDispatchBudget> dispatchBudget)
+    : policy_(dispatchBudget ? dispatchBudget->policy_ : std::move(policy)), dispatchBudget_(std::move(dispatchBudget)),
+      ownerThread_(std::this_thread::get_id()) {
     descriptor_.struct_size = sizeof(descriptor_);
     descriptor_.abi_version = VERNON_AD_TAPE_ALLOCATOR_ABI_VERSION;
     descriptor_.user_data = this;
@@ -291,8 +389,11 @@ VernonAdTapeAllocatorStatus HostDynamicTape::fail(VernonAdTapeAllocatorStatus st
 }
 
 void HostDynamicTape::releaseCharge() {
-    if (policy_ && policyCharge_)
-        policy_->release(std::exchange(policyCharge_, 0));
+    const size_t charge = std::exchange(policyCharge_, 0);
+    if (dispatchBudget_ && charge)
+        dispatchBudget_->releaseBytes(charge);
+    else if (policy_ && charge)
+        policy_->release(charge);
 }
 
 HostDynamicTape::Region *HostDynamicTape::findRegion(VernonAdRegionHandle handle) {
@@ -398,8 +499,10 @@ VernonAdTapeAllocatorStatus HostDynamicTape::reserveRecord(VernonAdTapeAllocator
         return self->fail(VERNON_AD_TAPE_ALLOCATOR_ARITHMETIC_OVERFLOW);
     const size_t additional = end - allocator->required_bytes;
     allocator->required_bytes = end;
-    if (allocator->status == VERNON_AD_TAPE_ALLOCATOR_CAPACITY_EXHAUSTED || end > allocator->capacity_bytes ||
-        !self->policy_ || !self->policy_->reserve(self->policyCharge_, additional))
+    if (allocator->status == VERNON_AD_TAPE_ALLOCATOR_CAPACITY_EXHAUSTED || end > allocator->capacity_bytes)
+        return self->fail(VERNON_AD_TAPE_ALLOCATOR_CAPACITY_EXHAUSTED);
+    if (self->dispatchBudget_ ? !self->dispatchBudget_->reserveBytes(additional)
+                              : !self->policy_ || !self->policy_->reserve(self->policyCharge_, additional))
         return self->fail(VERNON_AD_TAPE_ALLOCATOR_CAPACITY_EXHAUSTED);
 
     const size_t payloadOffset = self->payload_.size();
@@ -415,10 +518,16 @@ VernonAdTapeAllocatorStatus HostDynamicTape::reserveRecord(VernonAdTapeAllocator
         *record = handle;
         return VERNON_AD_TAPE_ALLOCATOR_OK;
     } catch (const std::bad_alloc &) {
-        self->policy_->release(additional);
+        if (self->dispatchBudget_)
+            self->dispatchBudget_->releaseBytes(additional);
+        else
+            self->policy_->release(additional);
         return self->fail(VERNON_AD_TAPE_ALLOCATOR_HOST_ALLOCATION_FAILURE);
     } catch (const std::length_error &) {
-        self->policy_->release(additional);
+        if (self->dispatchBudget_)
+            self->dispatchBudget_->releaseBytes(additional);
+        else
+            self->policy_->release(additional);
         return self->fail(VERNON_AD_TAPE_ALLOCATOR_HOST_ALLOCATION_FAILURE);
     }
 }
@@ -597,6 +706,7 @@ std::shared_ptr<const HostTapeSnapshot> HostDynamicTape::takeSnapshot() {
             snapshot->records_.push_back({record.handle, record.payloadOffset, record.payloadSize, record.children});
         snapshot->regionIndex_ = std::move(regionIndex_);
         snapshot->policy_ = policy_;
+        snapshot->dispatchBudget_ = dispatchBudget_;
         snapshot->policyCharge_ = std::exchange(policyCharge_, 0);
         snapshot->initializeDescriptor();
         descriptor_.status = VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE;

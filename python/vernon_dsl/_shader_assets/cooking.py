@@ -20,11 +20,9 @@ from ..bundle import (
     materialize_bundle,
 )
 from ..compiler import Compiler, FrontendCompileRequest, compile_file
-from ..frontend.autodiff_profiles import build_autodiff_profile_plan
 from ..frontend.structured_vjp import (
     build_structured_vjp,
     is_structured_vjp_abi_eligible,
-    resolve_vjp_transform,
 )
 from ..language.stage_registry import validate_stage_target
 from ..module_graph import load_project
@@ -155,7 +153,11 @@ def cook_pipeline_asset(
     target_name = target.target
     if pipeline.transform is not None and set(pipeline.stages) != {"compute"}:
         raise PipelineCompileError(
-            "initial VJP asset cooking supports compute pipelines only; no primal-only substitute was emitted"
+            "graphics VJP asset cooking is not supported; automatic differentiation requires a CPU compute pipeline"
+        )
+    if pipeline.transform is not None and target_name != "cpu":
+        raise PipelineCompileError(
+            f"VJP asset cooking requires target='cpu'; GPU target '{target_name}' is not supported"
         )
     if target_name == "cpu" and set(pipeline.stages) != {"compute"}:
         raise PipelineCompileError("CPU pipeline bundles support one compute stage and no graphics or barrier steps")
@@ -200,11 +202,8 @@ def cook_pipeline_asset(
             gradient_policy=str(transform_values["gradient_policy"]),
             accumulation_policy=str(transform_values["accumulation_policy"]),
             tape_policy=str(transform_values["tape_policy"]),
-            protocol=str(transform_values.get("protocol", "dynamic_v2")),
             derivative_rules_version=int(transform_values["derivative_rules_version"]),
         )
-        if target_name == "cpu" and transform.protocol != "dynamic_v2":
-            raise PipelineCompileError("CPU VJP assets require protocol='dynamic_v2'")
     for variant in pipeline.variants:
         stages: dict[str, CompiledStage] = {}
         for stage, reference in pipeline.stages.items():
@@ -236,56 +235,24 @@ def cook_pipeline_asset(
             stages[stage] = compiled
         planned_variants.append((variant, stages))
         if transform is not None:
-            frontend = None
-            if target_name == "cpu":
-                frontend = Compiler().compile_request(
-                    FrontendCompileRequest(
-                        selected_modules["compute"].source,
-                        pipeline.stages["compute"].entry,
-                        variant,
-                    )
+            frontend = Compiler().compile_request(
+                FrontendCompileRequest(
+                    selected_modules["compute"].source,
+                    pipeline.stages["compute"].entry,
+                    variant,
                 )
-            if transform.protocol == "dynamic_v2":
-                if frontend is None or not is_structured_vjp_abi_eligible(frontend, transform):
-                    raise PipelineCompileError(
-                        "dynamic_v2 requires a structured CPU VJP with explicit writable Storage outputs"
-                    )
-                try:
-                    structured = build_structured_vjp(native, frontend, transform)
-                except ValueError as error:
-                    raise PipelineCompileError(str(error)) from None
-                variant_transform = structured.transform
-                profile_plan = structured.plan
-                profile_modules = structured.profiles
-            else:
-                from ..frontend.autodiff_native import (
-                    AutodiffNativeLoweringError,
-                    emit_native_autodiff_modules,
+            )
+            if not is_structured_vjp_abi_eligible(frontend, transform):
+                raise PipelineCompileError(
+                    "dynamic_v2 requires a structured CPU VJP with explicit writable Storage outputs"
                 )
-
-                legacy_frontend = Compiler().compile_request(
-                    FrontendCompileRequest(
-                        selected_modules["compute"].source,
-                        pipeline.stages["compute"].entry,
-                        variant,
-                        program_transform=transform,
-                    )
-                )
-                if legacy_frontend.program_graph is None or legacy_frontend.autodiff_profiles is None:
-                    raise PipelineCompileError("VJP frontend produced no differentiated profile plan")
-                variant_transform = resolve_vjp_transform(
-                    transform,
-                    legacy_frontend.program_graph.reverse.cotangent_paths,
-                )
-                profile_plan = build_autodiff_profile_plan(variant_transform, legacy_frontend.program_graph)
-                try:
-                    profile_modules = emit_native_autodiff_modules(
-                        legacy_frontend.program_graph,
-                        profile_plan,
-                        target=target_name,
-                    )
-                except AutodiffNativeLoweringError as error:
-                    raise PipelineCompileError(str(error)) from None
+            try:
+                structured = build_structured_vjp(native, frontend, transform)
+            except ValueError as error:
+                raise PipelineCompileError(str(error)) from None
+            variant_transform = structured.transform
+            profile_plan = structured.plan
+            profile_modules = structured.profiles
             if resolved_transform is None:
                 resolved_transform = variant_transform
             elif resolved_transform.output_cotangents != variant_transform.output_cotangents:

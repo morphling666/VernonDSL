@@ -20,7 +20,7 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
         vernon.set = 0 : i64,
         vernon.binding = 0 : i64
       },
-      %id: index {
+      %id: tensor<3xi32> {
         vernon.interface = "input",
         vernon.builtin = "global_invocation_id"
       }) attributes {
@@ -28,11 +28,14 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
         vernon.stage = "compute",
         vernon.workgroup_size = array<i32: 8, 1, 1>
       } {
-    %value = "vernon.load"(%values, %id) :
+    %zero = arith.constant 0 : index
+    %id_i32 = tensor.extract %id[%zero] : tensor<3xi32>
+    %id_x = arith.index_castui %id_i32 : i32 to index
+    %value = "vernon.load"(%values, %id_x) :
       (!vernon.tensor_view<f32, [-1], "read_write", "device">, index) -> f32
     %one = arith.constant 1.0 : f32
     %sum = arith.addf %value, %one : f32
-    "vernon.store"(%sum, %values, %id) :
+    "vernon.store"(%sum, %values, %id_x) :
       (f32, !vernon.tensor_view<f32, [-1], "read_write", "device">, index) -> ()
     return
   }

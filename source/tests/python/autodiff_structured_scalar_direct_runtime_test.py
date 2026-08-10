@@ -21,14 +21,27 @@ def main() -> None:
 
     vd.init(arch=vd.cpu)
 
-    def run(program, *arguments, dtype=vd.f32, grid=(1, 1, 1)):
-        objective = vd.storage.zeros(dtype=dtype, shape=(1,))
+    def run(program, *arguments, dtype=vd.f32, grid=(1, 1, 1), objective_shape=(1,)):
+        objective = vd.storage.zeros(dtype=dtype, shape=objective_shape)
         result, pullback = program(*arguments, objective, grid=grid)
         assert result is None
-        return objective.to_numpy()[0], pullback
+        output = objective.to_numpy()
+        return (output.flat[0] if objective_shape == (1,) else output), pullback
+
+    def lane_output_shape(grid=(1, 1, 1)) -> tuple[int, int, int]:
+        grid_x, grid_y, grid_z = grid
+        return (grid_z * 1, grid_y * 3, grid_x * 2)
 
     def scalar_cotangent(value) -> np.ndarray:
         return np.asarray([value], dtype=np.float32)
+
+    def cooperative_scalar_cotangent(value, grid=(1, 1, 1)) -> np.ndarray:
+        output_shape = lane_output_shape(grid)
+        weights = np.broadcast_to(np.asarray(value, dtype=np.float32), output_shape)
+        cotangent = np.zeros(output_shape + output_shape, dtype=np.float32)
+        for index in np.ndindex(output_shape):
+            cotangent[index + index] = weights[index]
+        return cotangent
 
     def reference(x: float, y: float, z: float) -> float:
         linear = x + y
@@ -68,20 +81,21 @@ def main() -> None:
             np.float32(y),
             np.float32(z),
             grid=(1, 1, 1),
+            objective_shape=lane_output_shape(),
         )
         np.testing.assert_allclose(output, np.float32(reference(x, y, z)), rtol=2.0e-5, atol=2.0e-5)
 
-        gradients = pullback()
+        gradients = pullback(cooperative_scalar_cotangent(1.0))
         assert set(gradients) == {"x", "y", "z"}
         for name in expected:
-            np.testing.assert_allclose(gradients[name], expected[name], rtol=3.0e-3, atol=3.0e-3)
+            np.testing.assert_allclose(gradients[name], 6.0 * expected[name], rtol=3.0e-3, atol=3.0e-3)
 
         seed = np.float32(rng.uniform(-2.0, 2.0))
-        reused = pullback(scalar_cotangent(seed))
+        reused = pullback(cooperative_scalar_cotangent(seed))
         for name in expected:
             np.testing.assert_allclose(
                 reused[name],
-                seed * expected[name],
+                6.0 * seed * expected[name],
                 rtol=3.0e-3,
                 atol=3.0e-3,
             )
@@ -98,12 +112,13 @@ def main() -> None:
             np.float32(y),
             np.float32(z),
             grid=(1, 1, 1),
+            objective_shape=lane_output_shape(),
         )
-        randomized_gradients = randomized_pullback(scalar_cotangent(seed))
+        randomized_gradients = randomized_pullback(cooperative_scalar_cotangent(seed))
         for name in expected:
             np.testing.assert_allclose(
                 randomized_gradients[name],
-                seed * expected[name],
+                6.0 * seed * expected[name],
                 rtol=4.0e-3,
                 atol=4.0e-3,
             )
@@ -203,6 +218,7 @@ def main() -> None:
         np.float32(0.7),
         np.float32(0.2),
         grid=(1, 1, 1),
+        objective_shape=lane_output_shape(),
     )
     np.testing.assert_allclose(output, np.float32(reference(1.2, 0.7, 0.2)), rtol=2.0e-5, atol=2.0e-5)
 
@@ -213,11 +229,17 @@ def main() -> None:
         np.float32(0.7),
         np.float32(0.2),
         grid=(2, 1, 1),
+        objective_shape=lane_output_shape((2, 1, 1)),
     )
     np.testing.assert_allclose(output, np.float32(reference(1.2, 0.7, 0.2)), rtol=2.0e-5, atol=2.0e-5)
-    gradients = pullback(np.array([[[[1.0], [2.0]]]], dtype=np.float32))
+    gradients = pullback(
+        cooperative_scalar_cotangent(
+            np.arange(1.0, 13.0, dtype=np.float32).reshape(1, 3, 4),
+            grid=(2, 1, 1),
+        )
+    )
     for name in expected:
-        np.testing.assert_allclose(gradients[name], np.float32(3.0) * expected[name], rtol=3.0e-3, atol=3.0e-3)
+        np.testing.assert_allclose(gradients[name], np.float32(78.0) * expected[name], rtol=3.0e-3, atol=3.0e-3)
 
     half_output, half_pullback = run(
         half_program,
@@ -364,6 +386,7 @@ def main() -> None:
         np.float32(0.7),
         np.float32(0.2),
         grid=(1, 1, 1),
+        objective_shape=lane_output_shape(),
     )
     np.testing.assert_allclose(output, np.float32(reference(1.2, 0.7, 0.2)), rtol=2.0e-5, atol=2.0e-5)
 

@@ -6,9 +6,10 @@ This document records architecture decisions and does not maintain completion
 state. Current behavior and remaining work live in
 [`autodiff.md`](autodiff.md) and [`roadmap.md`](roadmap.md).
 
-GPU/graphics cooking temporarily retains the explicit `legacy_fixed`
-protocol. This compatibility boundary is GPU-only; compiler contract 11 and
-pipeline contract 15 do not permit `legacy_fixed` CPU VJP assets.
+GPU and graphics autodiff are deferred and unsupported. Current GPU backends
+compile and execute ordinary non-AD compute and graphics pipelines only. This
+document describes constraints for a possible future implementation, not an
+available compatibility path.
 
 This document records the architecture decision made after the first Metal
 capture/retry/commit attempt mixed compiler reflection, pipeline parsing,
@@ -40,10 +41,10 @@ autodiff facts:
   rewrote function boundaries;
 - `runtime_pipeline_direct.cpp` expanded hidden resources and inferred
   cotangent/output/gradient carriers;
-- `runtime_autodiff_gpu.cpp` detected structured profiles from resource names
-  and changed shape rules;
-- `runtime_autodiff_graph.cpp` found protocol resources by path and directly
-  implemented capture/retry/commit;
+- the removed GPU pullback runtime detected structured profiles from resource
+  names and changed shape rules;
+- the removed graph pullback runtime found protocol resources by path and
+  directly implemented capture/retry/commit;
 - `runtime_pipeline_metal.cpp` required a structured-autodiff binding branch;
 - Python cooking mixed structured and legacy compilation through fallback
   behavior.
@@ -219,9 +220,9 @@ Serialized strings stop at this boundary.
 It does not append resources that were absent from reflection and does not
 infer carriers from function roles.
 
-### GPU Profile and Invocation
+### Future GPU Profile and Invocation
 
-`runtime_autodiff_gpu.cpp` builds `ResourceAbi` from typed role/protocol
+A future GPU profile loader would build `ResourceAbi` from typed role/protocol
 metadata. It must not:
 
 - compare resource names with `__vernon_ad_status`,
@@ -230,24 +231,16 @@ metadata. It must not:
   rules;
 - encode capture/retry/commit orchestration.
 
-### GPU Autodiff Tape Session
+### Deferred GPU Autodiff Tape Session
 
-A single internal `GpuAutodiffTapeSession` owns:
+No GPU autodiff tape session or executable exists in the current runtime.
+When GPU autodiff is reintroduced, its tape lifecycle and typed resource
+bindings must be backend-independent rather than restoring the removed native
+emitter/runtime path.
 
-- provisional status/tape allocation;
-- capture dispatch construction and submission;
-- status readback and validation;
-- checked exact allocation and at most one exact retry;
-- commit dispatch;
-- transfer of successful tape ownership to the pullback;
-- deterministic error reporting and cleanup.
+### Future Graph Composition
 
-The session consumes `GpuGraphExecutable` and typed resource bindings, so it is
-independent of Metal and Vulkan.
-
-### Autodiff Graph
-
-`runtime_autodiff_graph.cpp` owns:
+A future graph-level differentiation layer would own:
 
 - graph topology;
 - node dependency order;
@@ -284,11 +277,12 @@ Python owns:
 
 During migration:
 
-- targets without structured GPU support explicitly use legacy profiles;
+- unsupported GPU targets reject differentiated assets explicitly;
 - a structured compiler failure remains a structured compiler failure;
 - no exception-based or empty-artifact fallback silently changes the
   implementation;
-- structured and legacy paths remain separately observable in tests.
+- CPU structured paths and rejected GPU requests remain separately observable
+  in tests.
 
 Delete Python native AD, flat graph, and static-loop implementations only after
 CPU, Metal, and Vulkan parity.
@@ -303,7 +297,7 @@ responsibility boundaries and invariants that future work must satisfy.
 
 Do not proceed from one phase to the next unless:
 
-- existing CPU and legacy GPU tests remain green;
+- existing CPU AD and non-AD GPU tests remain green;
 - no general runtime or backend file contains a structured-AD special branch;
 - reflection exactly matches the physical entry signature;
 - all protocol selection below reflection ingestion is typed;

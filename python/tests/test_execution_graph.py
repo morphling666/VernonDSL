@@ -1,9 +1,20 @@
 from __future__ import annotations
 
 import unittest
+from typing import Annotated
 
+import numpy as np
 import vernon_dsl as vd
 from vernon_dsl._runtime.session import RuntimeUnavailableError
+
+
+@vd.kernel(workgroup_size=(1, 1, 1))
+def graph_increment(
+    output: vd.TensorView[vd.f32, (vd.dyn,), vd.write],
+    source: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    output[gid[0]] = source[gid[0]] + 1.0
 
 
 class RecordingComputePass(vd.ComputePass):
@@ -28,6 +39,77 @@ class RecordingComputePass(vd.ComputePass):
 
     def execute(self, encoder: vd.ComputeEncoder, resources: vd.ExecutionResources) -> None:
         self.events.append(self.name)
+
+
+class InvocationComputePass(vd.ComputePass):
+    def __init__(self, name: str, invocation: vd.PipelineInvocation):
+        super().__init__(name)
+        self.invocation = invocation
+
+    def declare(self) -> None:
+        self.invocation.declare(self)
+
+    def execute(self, encoder: vd.ComputeEncoder, resources: vd.ExecutionResources) -> None:
+        self.invocation.encode(encoder, resources)
+
+
+class FailingComputePass(vd.ComputePass):
+    def __init__(self, events: list[str]):
+        super().__init__("failure")
+        self.events = events
+        self.side_effect = True
+
+    def declare(self) -> None:
+        pass
+
+    def execute(self, encoder: vd.ComputeEncoder, resources: vd.ExecutionResources) -> None:
+        self.events.append(self.name)
+        raise RuntimeError("intentional graph failure")
+
+
+class CpuExecutionGraphTests(unittest.TestCase):
+    def setUp(self) -> None:
+        vd.init(arch=vd.cpu)
+
+    def test_cpu_uses_native_hazard_schedule(self) -> None:
+        graph = vd.ExecutionGraph()
+        events: list[str] = []
+        shared = vd.storage.zeros(dtype=vd.f32, shape=(4,))
+        graph.add_pass(RecordingComputePass("write", events, write=shared))
+        graph.add_pass(RecordingComputePass("read", events, read=shared))
+        graph._passes[-1].side_effect = True
+
+        graph.execute()
+
+        self.assertEqual([execution_pass.name for execution_pass in graph.schedule], ["write", "read"])
+        self.assertEqual(events, ["write", "read"])
+        self.assertEqual(len(graph.scopes[1].barriers), 1)
+
+    def test_cpu_kernel_invocations_execute_through_graph(self) -> None:
+        source = vd.storage.from_numpy(np.arange(4, dtype=np.float32))
+        intermediate = vd.storage.zeros(dtype=vd.f32, shape=(4,))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(4,))
+        graph = vd.ExecutionGraph()
+        graph.add_pass(InvocationComputePass("first", graph_increment.invocation(intermediate, source)))
+        graph.add_pass(InvocationComputePass("second", graph_increment.invocation(output, intermediate)))
+
+        graph.execute()
+
+        np.testing.assert_array_equal(output.to_numpy(), np.arange(4, dtype=np.float32) + 2.0)
+        self.assertEqual([execution_pass.name for execution_pass in graph.schedule], ["first", "second"])
+
+    def test_cpu_callback_failure_is_propagated_and_stops_execution(self) -> None:
+        events: list[str] = []
+        graph = vd.ExecutionGraph()
+        graph.add_pass(FailingComputePass(events))
+        after = RecordingComputePass("after", events)
+        after.side_effect = True
+        graph.add_pass(after)
+
+        with self.assertRaisesRegex(RuntimeError, "intentional graph failure"):
+            graph.execute()
+
+        self.assertEqual(events, ["failure"])
 
 
 class RecordingRenderPass(vd.RenderPass):

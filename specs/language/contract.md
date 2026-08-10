@@ -299,6 +299,22 @@ Read/write effects include projected regions where statically known, and an
 atomic read-modify-write also marks its owner writable for runtime
 synchronization. Unknown overlap is conservatively aliasing.
 
+Every compute entry carries a compiler-derived `vernon.dispatch_contract`.
+Its `unit_grid_axes` and `requires_unit_workgroup` constraints are residual
+conditions of the ordinary-write injectivity proof. All public direct, cooked,
+AOT, graph, and autodiff dispatch paths validate this contract before
+allocation, staging, mutation, or submission. A failed constraint is an error;
+the runtime never serializes the dispatch. Constant ordinary writes therefore
+require a unit grid and unit workgroup, while unconstrained multi-invocation
+accumulation must use a formal accumulation or atomic operation.
+
+TensorView bounds, writable injectivity, physical identity, and overlap use
+the shared native validation model. Distinct allocation identities and
+non-overlapping byte spans prove disjointness; regular strided views may also
+use stride-lattice congruence. An unproven writable overlap is rejected.
+Semantic acceptance never depends on enumerating elements or on an
+element-count threshold.
+
 Ordinary `@func` code has no Storage, atomic, or barrier effects. It may read
 Resources passed explicitly as parameters; those effects propagate through the
 call graph and are checked against the concrete entry stage. Shared

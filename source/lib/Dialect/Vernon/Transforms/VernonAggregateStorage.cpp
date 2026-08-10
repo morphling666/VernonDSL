@@ -373,6 +373,9 @@ struct AggregateViewPattern final : ConversionPattern {
         Value recordIndex = operands[indicesPosition].front();
         Location loc = operation->getLoc();
         if (load) {
+            const AggregateStorageBackend backend = view.getAddressSpace() == "workgroup"
+                                                        ? AggregateStorageBackend::WorkgroupTensorView
+                                                        : AggregateStorageBackend::MemRef;
             SmallVector<Value> leaves;
             for (auto [leaf, storage] : llvm::zip_equal(layout->leaves, storageOperands))
                 for (uint64_t scalarIndex = 0; scalarIndex < leaf.scalarCount; ++scalarIndex)
@@ -380,7 +383,7 @@ struct AggregateViewPattern final : ConversionPattern {
                         loadStorageLeaf(storage,
                                         aggregateLeafIndex(recordIndex, *layout, leaf, scalarIndex,
                                                            view.getAddressSpace() == "workgroup", rewriter, loc),
-                                        AggregateStorageBackend::MemRef, rewriter, loc, leaf.scalarType));
+                                        backend, rewriter, loc, leaf.scalarType));
             unsigned cursor = 0;
             FailureOr<Value> value = buildAggregateValueLlvm(view.getElementType(), leaves, cursor, *getTypeConverter(),
                                                              module, rewriter, loc);
@@ -397,6 +400,9 @@ struct AggregateViewPattern final : ConversionPattern {
                                                module, rewriter, loc))) {
             return operation->emitError("cannot decompose aggregate TensorView value");
         }
+        const AggregateStorageBackend backend = view.getAddressSpace() == "workgroup"
+                                                    ? AggregateStorageBackend::WorkgroupTensorView
+                                                    : AggregateStorageBackend::MemRef;
         unsigned cursor = 0;
         for (auto [leaf, storage] : llvm::zip_equal(layout->leaves, storageOperands))
             for (uint64_t scalarIndex = 0; scalarIndex < leaf.scalarCount; ++scalarIndex) {
@@ -405,7 +411,7 @@ struct AggregateViewPattern final : ConversionPattern {
                 storeStorageLeaf(leaves[cursor++], storage,
                                  aggregateLeafIndex(recordIndex, *layout, leaf, scalarIndex,
                                                     view.getAddressSpace() == "workgroup", rewriter, loc),
-                                 AggregateStorageBackend::MemRef, rewriter, loc);
+                                 backend, rewriter, loc);
             }
         if (cursor != leaves.size())
             return operation->emitError("cannot decompose aggregate TensorView value");
@@ -430,9 +436,9 @@ struct AggregateWorkgroupAllocPattern final : OpConversionPattern<WorkgroupAlloc
         SmallVector<Value> storages;
         storages.reserve(plan->leaves.size());
         for (const WorkgroupPhysicalLeaf &leaf : plan->leaves) {
-            auto memref = MemRefType::get({ShapedType::kDynamic}, leaf.scalarType);
-            Value size = arith::ConstantIndexOp::create(rewriter, op.getLoc(), leaf.scalarCount);
-            storages.push_back(memref::AllocaOp::create(rewriter, op.getLoc(), memref, ValueRange{size}));
+            auto leafView = TensorViewType::get(op.getContext(), leaf.scalarType,
+                                                {static_cast<int64_t>(leaf.scalarCount)}, "read_write", "workgroup");
+            storages.push_back(WorkgroupAllocOp::create(rewriter, op.getLoc(), leafView).getResult());
         }
         rewriter.replaceOpWithMultiple(op, {storages});
         return success();

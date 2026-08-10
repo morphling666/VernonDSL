@@ -7,7 +7,6 @@ from typing import Any
 from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
 from ..ad import ProgramTransformSpec
 from .analysis import typed_effect_data
-from .autodiff import AutodiffProgram
 from .autodiff_profiles import AutodiffProfilePlan
 from .model import ConcreteType, TypedFunctionInstance
 
@@ -48,7 +47,6 @@ class FrontendCompileResult:
     request: FrontendCompileRequest
     helper_specializations: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = ()
     typed_functions: tuple[TypedFunctionInstance, ...] = ()
-    program_graph: AutodiffProgram | None = None
     autodiff_profiles: AutodiffProfilePlan | None = None
     entry_workgroup_size: tuple[int, int, int] | None = None
     structs: tuple[tuple[str, tuple[tuple[str, ConcreteType], ...]], ...] = ()
@@ -78,7 +76,6 @@ class FrontendCompileResult:
             "program_transform": (
                 self.request.program_transform.to_dict() if self.request.program_transform is not None else None
             ),
-            "program_graph": self.program_graph.to_dict() if self.program_graph is not None else None,
             "autodiff_profiles": (
                 self.autodiff_profiles.manifest_dict() if self.autodiff_profiles is not None else None
             ),

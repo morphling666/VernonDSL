@@ -4,6 +4,7 @@
 #include "VernonRuntime.h"
 #include "compiler_python_bridge.h"
 #include "runtime/autodiff/runtime_direct_autodiff.h"
+#include "runtime/tensor_bridge.h"
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/array.h>
@@ -40,6 +41,14 @@ struct Compiler {
     Compiler() : context(vernonCompilerCreate()) {
         if (!context)
             throw std::runtime_error("cannot create Vernon compiler");
+        const VernonCpuRuntimeHelpersV1 cpuHelpers{sizeof(VernonCpuRuntimeHelpersV1), &vernonCpuWorkgroupAddressV1,
+                                                   &vernonCpuLaneAddressV1, &vernonCpuWorkgroupBarrierV1,
+                                                   &vernonCpuWorkgroupIsLeaderV1};
+        if (vernonCompilerRegisterCpuRuntimeHelpersV1(context, &cpuHelpers) != VERNON_STATUS_OK) {
+            vernonCompilerDestroy(context);
+            context = nullptr;
+            throw std::runtime_error("cannot register CPU workgroup helpers with the Vernon compiler");
+        }
     }
     ~Compiler() { vernonCompilerDestroy(context); }
 
@@ -413,6 +422,7 @@ struct RhiHost {
 };
 
 struct PythonGraphResource {
+    explicit PythonGraphResource(vernon::execution::GraphResource value) : resource(value) {}
     explicit PythonGraphResource(vernon::execution::GraphBuffer value) : resource(value), buffer(value) {}
     explicit PythonGraphResource(vernon::execution::GraphImage value) : resource(value), image(value), isImage(true) {}
 
@@ -518,6 +528,7 @@ struct PythonCompiledScope {
 };
 
 struct PythonExecutionGraph {
+    PythonExecutionGraph() = default;
     explicit PythonExecutionGraph(std::shared_ptr<RhiHostState> host)
         : host(std::move(host)), graph(this->host->device) {}
 
@@ -533,6 +544,13 @@ struct PythonExecutionGraph {
         if (buffer.host != host)
             throw std::invalid_argument("buffer belongs to another execution graph device");
         return PythonGraphResource(graph.importBuffer(buffer.handle, exported));
+    }
+
+    PythonGraphResource importHostBuffer(uint64_t identity, bool exported) {
+        const vernon::execution::GraphBuffer resource = graph.importHostBuffer(identity, exported);
+        if (resource.id == UINT32_MAX)
+            throw std::invalid_argument("host execution graph resource identity must be non-zero");
+        return PythonGraphResource(resource);
     }
 
     PythonGraphResource importImage(RhiImage &image, bool exported) {
@@ -563,7 +581,7 @@ struct PythonExecutionGraph {
             std::rethrow_exception(exception);
         }
         if (status != VERNON_RHI_STATUS_OK)
-            throw std::runtime_error("execution graph failed with RHI status " +
+            throw std::runtime_error("execution graph failed with provider status " +
                                      std::to_string(static_cast<uint32_t>(status)));
     }
 
@@ -899,28 +917,20 @@ struct PipelineInvocationBuilder {
         }
         argument.shape.assign(arrayShape.begin(), arrayShape.begin() + static_cast<std::ptrdiff_t>(rank));
         argument.strides.assign(arrayStrides.begin(), arrayStrides.begin() + static_cast<std::ptrdiff_t>(rank));
+        for (uint64_t extent : argument.shape)
+            if (!extent)
+                throw std::invalid_argument("NumPy Tensor dimensions must be positive");
+        VernonTensorView layoutProbe{};
+        layoutProbe.element_layout = argument.value.tensor.element_layout;
+        layoutProbe.rank = static_cast<uint32_t>(rank);
+        layoutProbe.shape = argument.shape.data();
+        layoutProbe.byte_strides = argument.strides.data();
         size_t before = 0;
         size_t after = 0;
-        for (size_t dimension = 0; dimension < rank; ++dimension) {
-            if (!argument.shape[dimension])
-                throw std::invalid_argument("NumPy Tensor dimensions must be positive");
-            const int64_t stride = argument.strides[dimension];
-            const uint64_t magnitude =
-                stride < 0 ? static_cast<uint64_t>(-(stride + 1)) + 1 : static_cast<uint64_t>(stride);
-            const uint64_t steps = argument.shape[dimension] - 1;
-            if (magnitude > std::numeric_limits<size_t>::max() ||
-                (steps && magnitude > std::numeric_limits<size_t>::max() / steps))
-                throw std::invalid_argument("NumPy Tensor byte span overflows");
-            const size_t extent = static_cast<size_t>(steps * magnitude);
-            size_t &bound = stride < 0 ? before : after;
-            if (extent > std::numeric_limits<size_t>::max() - bound)
-                throw std::invalid_argument("NumPy Tensor byte span overflows");
-            bound += extent;
-        }
-        if (after > std::numeric_limits<size_t>::max() - before ||
-            parameter.elementByteSize > std::numeric_limits<size_t>::max() - before - after)
+        size_t span = 0;
+        if (!vernon::runtime::tensorRelativeByteBounds(layoutProbe, before, after) ||
+            !vernon::runtime::tensorRequiredSpan(layoutProbe, span))
             throw std::invalid_argument("NumPy Tensor byte span overflows");
-        const size_t span = before + after + parameter.elementByteSize;
         if (array.attr("dtype").attr("fields").is_none() && parameter.elementLeaves.size() == 1 &&
             parameter.elementLeaves[0].scalar_count == 1 && parameter.elementLeaves[0].byte_offset == 0 &&
             numpyDataType(array) != static_cast<VernonDataType>(parameter.elementLeaves[0].dtype))
@@ -949,6 +959,9 @@ struct PipelineInvocationBuilder {
         argument.value.tensor.byte_strides = argument.strides.data();
         argument.value.tensor.byte_offset = data - allocation;
         argument.value.tensor.byte_size = allocationSize;
+        if (argument.value.tensor.access != VERNON_ACCESS_READ &&
+            !vernon::runtime::tensorByteLayoutInjective(argument.value.tensor))
+            throw std::invalid_argument("writable NumPy Tensor must have an internally injective layout");
         return *this;
     }
 
@@ -972,6 +985,9 @@ struct PipelineInvocationBuilder {
         argument.value.tensor.byte_strides = argument.strides.data();
         argument.value.tensor.byte_offset = offset;
         argument.value.tensor.byte_size = buffer->size;
+        if (argument.value.tensor.access != VERNON_ACCESS_READ &&
+            !vernon::runtime::tensorByteLayoutInjective(argument.value.tensor))
+            throw std::invalid_argument("writable RHI Tensor must have an internally injective layout");
         return *this;
     }
 
@@ -1192,25 +1208,114 @@ std::string formatShape(const std::vector<uint64_t> &shape) {
     return result + "]";
 }
 
+struct PythonAdViewDescriptor {
+    uintptr_t allocationBegin{};
+    size_t allocationSize{};
+    size_t byteOffset{};
+    VernonDataType dtype{};
+    bool writable{};
+    std::vector<uint64_t> shape;
+    std::vector<int64_t> strides;
+
+    VernonTensorView tensorView() const {
+        VernonTensorView tensor{};
+        tensor.struct_size = sizeof(VernonTensorView);
+        tensor.storage = VERNON_TENSOR_HOST;
+        tensor.host_data = reinterpret_cast<const void *>(allocationBegin);
+        tensor.element_layout = vernonRuntimeGetScalarValueLayout(dtype);
+        tensor.access = writable ? VERNON_ACCESS_READ_WRITE : VERNON_ACCESS_READ;
+        tensor.rank = static_cast<uint32_t>(shape.size());
+        tensor.shape = shape.data();
+        tensor.byte_strides = strides.data();
+        tensor.byte_offset = byteOffset;
+        tensor.byte_size = allocationSize;
+        return tensor;
+    }
+};
+
+PythonAdViewDescriptor validatePythonAdOriginalView(const std::string &path, VernonDataType dtype,
+                                                    const std::vector<uint64_t> &expectedShape, const nb::object &array,
+                                                    bool writable) {
+    std::vector<uint64_t> shape = nb::cast<std::vector<uint64_t>>(array.attr("shape"));
+    if (shape != expectedShape)
+        throw std::invalid_argument("Python autodiff Value '" + path + "' shape " + formatShape(shape) +
+                                    " does not match reflection " + formatShape(expectedShape));
+    const size_t itemSize = nb::cast<size_t>(array.attr("dtype").attr("itemsize"));
+    if (itemSize != autodiffDtypeSize(dtype) ||
+        !nb::cast<bool>(
+            array.attr("dtype").attr("__eq__")(nb::module_::import_("numpy").attr("dtype")(numpyDtypeName(dtype)))))
+        throw std::invalid_argument("Python autodiff Value '" + path + "' dtype does not match reflection");
+    std::vector<int64_t> strides = nb::cast<std::vector<int64_t>>(array.attr("strides"));
+    if (strides.size() != shape.size())
+        throw std::invalid_argument("Python autodiff Value '" + path + "' has an invalid stride rank");
+
+    nb::object allocation = array;
+    std::unordered_set<PyObject *> visited;
+    visited.insert(allocation.ptr());
+    while (nb::hasattr(allocation, "base")) {
+        nb::object base = allocation.attr("base");
+        if (base.is_none() || !visited.insert(base.ptr()).second)
+            break;
+        allocation = std::move(base);
+    }
+    nb::object numpy = nb::module_::import_("numpy");
+    nb::object allocationArray = numpy.attr("asarray")(allocation);
+    nb::tuple allocationBounds = nb::cast<nb::tuple>(numpy.attr("byte_bounds")(allocationArray));
+    const uintptr_t allocationBegin = nb::cast<uintptr_t>(allocationBounds[0]);
+    const uintptr_t allocationEnd = nb::cast<uintptr_t>(allocationBounds[1]);
+    const uintptr_t data = nb::cast<uintptr_t>(array.attr("ctypes").attr("data"));
+    if (allocationEnd < allocationBegin || data < allocationBegin || data > allocationEnd)
+        throw std::invalid_argument("Python autodiff Value '" + path + "' has an invalid allocation base");
+    const uintptr_t allocationSize = allocationEnd - allocationBegin;
+    if (allocationSize > std::numeric_limits<size_t>::max())
+        throw std::invalid_argument("Python autodiff Value '" + path + "' allocation size overflows");
+
+    PythonAdViewDescriptor descriptor;
+    descriptor.allocationBegin = allocationBegin;
+    descriptor.allocationSize = static_cast<size_t>(allocationSize);
+    descriptor.byteOffset = static_cast<size_t>(data - allocationBegin);
+    descriptor.dtype = dtype;
+    descriptor.writable = writable;
+    descriptor.shape = std::move(shape);
+    descriptor.strides = std::move(strides);
+    const VernonTensorView tensor = descriptor.tensorView();
+    if (!vernon::runtime::tensorElementCount(tensor))
+        throw std::invalid_argument("Python autodiff Value '" + path + "' shape overflows");
+    if (!vernon::runtime::tensorLogicalByteSize(tensor))
+        throw std::invalid_argument("Python autodiff Value '" + path + "' byte size overflows");
+    if (!vernon::runtime::tensorFitsAllocation(tensor))
+        throw std::invalid_argument("Python autodiff Value '" + path + "' layout is outside its owner allocation");
+    if (writable && !vernon::runtime::tensorByteLayoutInjective(tensor))
+        throw std::invalid_argument("writable Python autodiff Value '" + path +
+                                    "' must have an internally injective layout");
+    return descriptor;
+}
+
+bool pythonAdViewsOverlap(const PythonAdViewDescriptor &left, const PythonAdViewDescriptor &right) {
+    return vernon::runtime::tensorViewsHaveWritableOverlap(left.tensorView(), right.tensorView());
+}
+
 struct PythonAdValue {
     std::string path;
     nb::object source;
     nb::object array;
     std::vector<uint64_t> shape;
     bool writable{};
+    PythonAdViewDescriptor originalView;
     VernonAdValue value{};
 
     PythonAdValue(std::string path, VernonDataType dtype, std::vector<uint64_t> shape, const nb::object &source,
-                  bool writable = false)
-        : path(std::move(path)), source(nb::module_::import_("numpy").attr("asarray")(
-                                     source, nb::module_::import_("numpy").attr(numpyDtypeName(dtype)))),
-          array(this->source), shape(std::move(shape)), writable(writable) {
-        if (!nb::cast<bool>(array.attr("flags").attr("c_contiguous")))
-            array = nb::module_::import_("numpy").attr("ascontiguousarray")(array);
-        std::vector<uint64_t> actualShape = nb::cast<std::vector<uint64_t>>(array.attr("shape"));
-        if (actualShape != this->shape)
-            throw std::invalid_argument("Python autodiff Value '" + this->path + "' shape " + formatShape(actualShape) +
-                                        " does not match reflection " + formatShape(this->shape));
+                  uint32_t access = VERNON_ACCESS_READ)
+        : path(std::move(path)), source(nb::module_::import_("numpy").attr("asarray")(source)), array(this->source),
+          shape(std::move(shape)), writable(access != VERNON_ACCESS_READ) {
+        originalView = validatePythonAdOriginalView(this->path, dtype, this->shape, this->source, writable);
+        if (!nb::cast<bool>(array.attr("flags").attr("c_contiguous"))) {
+            nb::object numpy = nb::module_::import_("numpy");
+            array =
+                access == VERNON_ACCESS_WRITE
+                    ? numpy.attr("empty")(this->shape, nb::arg("dtype") = numpy.attr("dtype")(numpyDtypeName(dtype)))
+                    : numpy.attr("ascontiguousarray")(array);
+        }
         size_t scalarCount = 1;
         for (uint64_t extent : this->shape) {
             if (scalarCount && extent > std::numeric_limits<size_t>::max() / scalarCount)
@@ -1233,7 +1338,8 @@ struct PythonAdValue {
 
     PythonAdValue(PythonAdValue &&other) noexcept
         : path(std::move(other.path)), source(std::move(other.source)), array(std::move(other.array)),
-          shape(std::move(other.shape)), writable(other.writable), value(other.value) {
+          shape(std::move(other.shape)), writable(other.writable), originalView(std::move(other.originalView)),
+          value(other.value) {
         value.path = {path.data(), path.size()};
         value.shape = shape.empty() ? nullptr : shape.data();
     }
@@ -1429,6 +1535,11 @@ struct LoadedPipeline {
         return std::make_unique<PipelineInvocationBuilder>(owner, runtime, pipeline);
     }
 
+    std::array<uint32_t, 3> workgroupSize() const {
+        const VernonLaunchSize size = vernon::runtime::autodiffWorkgroupSize(pipeline);
+        return {size.x, size.y, size.z};
+    }
+
     void invoke(PipelineInvocationBuilder &builder) {
         if (builder.pipeline != pipeline)
             throw std::invalid_argument("invocation builder belongs to another pipeline");
@@ -1454,25 +1565,39 @@ struct LoadedPipeline {
                     for (size_t dimension = 0; dimension < leaf.shape.size(); ++dimension)
                         if (!leaf.shape[dimension])
                             leaf.shape[dimension] = actualShape[dimension];
-                inputValues.emplace_back(leaf.path, leaf.dtype, leaf.shape, value,
-                                         parameter.access != VERNON_ACCESS_READ);
+                inputValues.emplace_back(leaf.path, leaf.dtype, leaf.shape, value, parameter.access);
                 inputViews.push_back(inputValues.back().value);
                 inputLeafMetadata.push_back(std::move(leaf));
             }
         }
+        for (size_t left = 0; left < inputValues.size(); ++left)
+            for (size_t right = left + 1; right < inputValues.size(); ++right) {
+                const PythonAdValue &leftValue = inputValues[left];
+                const PythonAdValue &rightValue = inputValues[right];
+                if (pythonAdViewsOverlap(leftValue.originalView, rightValue.originalView))
+                    throw std::invalid_argument("Python autodiff Values '" + leftValue.path + "' and '" +
+                                                rightValue.path + "' have incompatible overlapping views");
+            }
         VernonAdValueSet inputSet{sizeof(VernonAdValueSet), inputViews.data(), inputViews.size(), {}};
 
-        if (gridX > SIZE_MAX / gridY || static_cast<size_t>(gridX) * gridY > SIZE_MAX / gridZ)
+        const VernonLaunchSize workgroup = vernon::runtime::autodiffWorkgroupSize(pipeline);
+        if (gridX > UINT32_MAX / workgroup.x || gridY > UINT32_MAX / workgroup.y || gridZ > UINT32_MAX / workgroup.z)
+            throw std::invalid_argument("autodiff invocation extent overflows");
+        const uint32_t extentX = gridX * workgroup.x;
+        const uint32_t extentY = gridY * workgroup.y;
+        const uint32_t extentZ = gridZ * workgroup.z;
+        if (extentX > SIZE_MAX / extentY || static_cast<size_t>(extentX) * extentY > SIZE_MAX / extentZ)
             throw std::invalid_argument("autodiff grid size overflows");
-        const size_t carrierCount = static_cast<size_t>(gridX) * gridY * gridZ;
+        const size_t carrierCount = static_cast<size_t>(extentX) * extentY * extentZ;
         const size_t outputCount = vernonRuntimeLoadedPipelineGetAdOutputCount(pipeline);
         const size_t cotangentCount = vernonRuntimeLoadedPipelineGetAdCotangentCount(pipeline);
         if (!outputCount || !cotangentCount)
             throw std::runtime_error("pipeline has no consistent autodiff output/cotangent signature");
         auto prependCarrierDimensions = [&](std::vector<uint64_t> &shape) {
             if (carrierCount > 1)
-                shape.insert(shape.begin(), {gridZ, gridY, gridX});
+                shape.insert(shape.begin(), {extentZ, extentY, extentX});
         };
+        const bool storageObjectives = vernon::runtime::hasAutodiffStorageObjectives(pipeline);
         auto materializeMetadata = [&](const VernonAdValueMetadataView &value) {
             const std::string path = stringView(value.path);
             PythonAdMetadata result{path, path, value.dtype, {}};
@@ -1488,7 +1613,6 @@ struct LoadedPipeline {
         std::deque<PythonAdValue> outputValues;
         std::vector<VernonAdValue> outputViews;
         nb::dict aggregateOutput;
-        const bool storageObjectives = vernon::runtime::hasAutodiffStorageObjectives(pipeline);
         for (size_t index = 0; index < outputCount; ++index) {
             VernonAdValueMetadataView outputValue{};
             outputValue.struct_size = sizeof(outputValue);
@@ -1717,6 +1841,12 @@ struct Runtime {
             throw std::runtime_error("requested runtime backend is unavailable");
     }
     ~Runtime() { vernonRuntimeDestroy(handle); }
+
+    std::unique_ptr<PythonExecutionGraph> createExecutionGraph() {
+        if (rhiHost)
+            return std::make_unique<PythonExecutionGraph>(rhiHost);
+        return std::make_unique<PythonExecutionGraph>();
+    }
 
     std::unique_ptr<LoadedPipeline> load(const nb::bytes &artifact, const std::string &reflection,
                                          const std::string &entry) {
@@ -2074,6 +2204,8 @@ NB_MODULE(_native, module) {
         .def("add_render_pass", &PythonExecutionGraph::addRenderPass, nb::rv_policy::reference)
         .def("add_compute_pass", &PythonExecutionGraph::addComputePass, nb::rv_policy::reference)
         .def("import_buffer", &PythonExecutionGraph::importBuffer, nb::arg("buffer"), nb::arg("exported") = false)
+        .def("import_host_buffer", &PythonExecutionGraph::importHostBuffer, nb::arg("identity"),
+             nb::arg("exported") = false)
         .def("import_image", &PythonExecutionGraph::importImage, nb::arg("image"), nb::arg("exported") = false)
         .def("compile", &PythonExecutionGraph::compile)
         .def("validate", &PythonExecutionGraph::validate)
@@ -2092,6 +2224,7 @@ NB_MODULE(_native, module) {
         .def("load_cpu_autodiff", &Runtime::loadCpuAutodiff, nb::keep_alive<0, 1>())
         .def("load_pipeline", &Runtime::loadPipeline, nb::keep_alive<0, 1>())
         .def("load_pipeline_asset", &Runtime::loadPipelineAsset, nb::keep_alive<0, 1>())
+        .def("create_execution_graph", &Runtime::createExecutionGraph)
         .def("synchronize", &Runtime::synchronize);
     nb::class_<PipelineParameterMetadata>(module, "PipelineParameter")
         .def_ro("slot", &PipelineParameterMetadata::slot)
@@ -2184,6 +2317,7 @@ NB_MODULE(_native, module) {
             },
             nb::arg("bindings"), nb::arg("grid"))
         .def_prop_ro("derivative_groups", &LoadedPipeline::derivativeGroups)
+        .def_prop_ro("workgroup_size", &LoadedPipeline::workgroupSize)
         .def_prop_ro("parameters", &LoadedPipeline::parameters)
         .def_prop_ro("outputs", &LoadedPipeline::outputs);
     module.attr("DATA_BOOL") = static_cast<uint32_t>(VERNON_DATA_BOOL);

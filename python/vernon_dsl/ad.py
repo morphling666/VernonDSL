@@ -76,8 +76,8 @@ class ProgramTransformSpec:
             raise ValueError("unsupported gradient accumulation policy")
         if self.tape_policy != "bounded":
             raise ValueError("unsupported autodiff tape policy")
-        if self.protocol not in {"dynamic_v2", "legacy_fixed"}:
-            raise ValueError("unsupported autodiff protocol")
+        if self.protocol != "dynamic_v2":
+            raise ValueError("autodiff protocol must be 'dynamic_v2'")
         if self.derivative_rules_version != 1:
             raise ValueError("unsupported derivative rules version")
         if (self.rule_set is None) != (self.rule_set_identity is None):
@@ -139,7 +139,6 @@ def vjp(
     wrt: tuple[str, ...] | list[str],
     outputs: tuple[str, ...] | list[str] | None = None,
     rules: RuleSet | None = None,
-    protocol: str = "dynamic_v2",
 ) -> ProgramExpression:
     """Describe a VJP transform that may be cooked or directly executed on CPU."""
 
@@ -161,7 +160,7 @@ def vjp(
             raise TypeError("single-entry VJP program must be a compute Kernel")
         if rules is not None:
             raise ValueError("compute VJP does not accept graphics custom rules")
-        if outputs is None and protocol != "legacy_fixed":
+        if outputs is None:
             raise ValueError("compute VJP requires non-empty writable Storage outputs")
     if rules is not None and not isinstance(rules, RuleSet):
         raise TypeError("rules must be declared with vd.ad.rule_set")
@@ -171,7 +170,6 @@ def vjp(
         rule_set=rules.id if rules is not None else None,
         rule_set_identity=rules.digest if rules is not None else None,
         output_cotangents=(_canonical_paths(outputs, label="outputs") if outputs is not None else ()),
-        protocol=protocol,
     )
     return ProgramExpression(program, spec, rules)
 

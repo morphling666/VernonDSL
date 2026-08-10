@@ -59,7 +59,7 @@ def paint(
 
 def render(time: float = 0.0) -> vd.TensorStorage:
     pixels = vd.storage.zeros(dtype=vd.f32, shape=(HEIGHT, WIDTH))
-    paint(pixels, time, grid=(WIDTH, HEIGHT, 1))
+    paint(pixels, time, grid=(WIDTH // 16, HEIGHT // 16, 1))
     return pixels
 
 
@@ -118,7 +118,7 @@ def main() -> None:
             paint(
                 pixels,
                 arguments.time + frame * arguments.time_step,
-                grid=(WIDTH, HEIGHT, 1),
+                grid=(WIDTH // 16, HEIGHT // 16, 1),
             )
             image = pixels.to_numpy()
             if arguments.animation_output is not None:

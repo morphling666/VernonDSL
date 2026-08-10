@@ -67,15 +67,11 @@ bool validateTargetCapabilities(PreparedModule &prepared, VernonTarget target, s
             if (view && view.getAddressSpace() == "device")
                 return;
         }
-        if (mlir::isa<mlir::vernon::WorkgroupAllocOp, mlir::vernon::AtomicOp, mlir::vernon::PhysicalAtomicOp,
-                      mlir::vernon::BarrierOp>(operation)) {
-            mlir::func::FuncOp function = operation->getParentOfType<mlir::func::FuncOp>();
-            auto size = function ? function->getAttrOfType<mlir::DenseI32ArrayAttr>("vernon.workgroup_size") : nullptr;
-            cpuSynchronizationUnsupported |= !size || size.size() != 3 || size[0] != 1 || size[1] != 1 || size[2] != 1;
-        }
         if (auto barrier = mlir::dyn_cast<mlir::vernon::BarrierOp>(operation);
-            barrier && barrier.getScope() == "device")
+            barrier && barrier.getScope() == "device") {
             cudaDeviceBarrier = true;
+            cpuSynchronizationUnsupported = true;
+        }
     });
     if (usesFloatDeviceAtomics && !capabilities.supports_f32_device_atomic_add) {
         diagnostics = "device-scope f32 atomic add requires a target float-atomic capability";
@@ -86,9 +82,8 @@ bool validateTargetCapabilities(PreparedModule &prepared, VernonTarget target, s
         return false;
     }
     if (target == VERNON_TARGET_CPU && cpuSynchronizationUnsupported) {
-        diagnostics =
-            "CPU reference synchronization requires workgroup_size=(1, 1, 1); use a GPU target for cooperative "
-            "workgroups";
+        diagnostics = "CPU target does not support cross-workgroup device barriers; split the work into multiple "
+                      "kernel launches";
         return false;
     }
     if (target == VERNON_TARGET_CUDA) {
@@ -213,7 +208,8 @@ VernonStatus parseCompileOptions(const VernonCompileOptions &source, CompileOpti
 }
 
 VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options, std::vector<Artifact> &artifacts,
-                           std::string &reflection, std::string &diagnostics, CpuExecutionStatePtr &cpuExecution) {
+                           std::string &reflection, std::string &diagnostics,
+                           const VernonCpuRuntimeHelpersV1 *cpuRuntimeHelpers, CpuExecutionStatePtr &cpuExecution) {
     const VernonTarget target = compileTargetKind(options);
     diagnostics.clear();
     if (!validateTargetCapabilities(module, target, diagnostics)) {
@@ -222,7 +218,8 @@ VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options
     }
     if (target == VERNON_TARGET_CPU) {
         const auto &cpu = std::get<CpuCodegenOptions>(options);
-        const CpuCompileResult result = compileCpu(module, cpu, artifacts, reflection, diagnostics, cpuExecution);
+        const CpuCompileResult result =
+            compileCpu(module, cpu, artifacts, reflection, diagnostics, cpuRuntimeHelpers, cpuExecution);
         if (result != CpuCompileResult::Success) {
             artifacts.clear();
             return result == CpuCompileResult::VerificationFailure ? VERNON_STATUS_VERIFICATION_ERROR

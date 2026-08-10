@@ -62,14 +62,31 @@ struct AutodiffRegion {
 enum class StorageVersionKind {
     Entry,
     Write,
+    AdditiveWrite,
     IfMerge,
     WhilePhi,
     WhileExit,
 };
 
+enum class AutodiffInternalAdjointOwnership {
+    None,
+    LanePrivate,
+    WorkgroupCoupled,
+};
+
+enum class AutodiffExternalGradientOwnership {
+    None,
+    InvocationPrivate,
+    AtomicShared,
+    WorkgroupShared,
+};
+
 struct AutodiffStorageIdentity {
     unsigned id{};
     Value binding;
+    AutodiffInternalAdjointOwnership internalAdjointOwnership{AutodiffInternalAdjointOwnership::None};
+    AutodiffExternalGradientOwnership externalGradientOwnership{AutodiffExternalGradientOwnership::None};
+    bool externalGradientDestination{};
 };
 
 struct AutodiffStorageVersion {

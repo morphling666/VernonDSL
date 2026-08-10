@@ -909,6 +909,7 @@ TEST(RuntimeExternalGl, InvokesDirectComputePipelineThroughRuntimeCoreProvider) 
       "entries": [{
         "name": "main",
         "workgroup_size": [4, 1, 1],
+        "dispatch_contract": {"unit_grid_axes": [], "requires_unit_workgroup": false},
         "physical_layouts": {
           "vulkan_std430_storage_buffer": {
             "profile":"vulkan_std430_storage_buffer","packing":"resource_bindings"

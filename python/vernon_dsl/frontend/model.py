@@ -223,6 +223,7 @@ class StorageEffect:
     kind: StorageEffectKind
     owner: StorageOwner
     region: StorageRegion
+    atomic: bool = False
 
 
 @dataclass(frozen=True)

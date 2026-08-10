@@ -316,6 +316,8 @@ class _FunctionEmitter:
                 if effect.region.kind is StorageRegionKind.ELEMENT:
                     indices = ", ".join(str(index) for index in effect.region.indices)
                     fields.append(f"indices = array<i64: {indices}>")
+                if effect.atomic:
+                    fields.append("atomic = true")
                 reflected_effects.append("{" + ", ".join(fields) + "}")
             function_attributes.append(f"vernon.storage_effects = [{', '.join(reflected_effects)}]")
         elif emit_value_abi_metadata:

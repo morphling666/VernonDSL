@@ -453,7 +453,9 @@ class ExecutionGraph:
         self._schedule: tuple[ExecutionPass, ...] = ()
         self._scopes: tuple[CompiledScope, ...] = ()
         self._dirty = True
-        self._native_graph = state._rhi_host.create_execution_graph() if state._rhi_host is not None else None
+        self._native_graph = (
+            state._native_runtime.create_execution_graph() if state._native_runtime is not None else None
+        )
         state._runtime_children.add(self)
 
     def _dispose_native(self) -> None:
@@ -472,18 +474,23 @@ class ExecutionGraph:
     def _ensure_current(self) -> Any:
         state = _session_state()
         if self._native_graph is None or self._generation != state._runtime_generation:
-            raise RuntimeError("ExecutionGraph requires the current initialized GPU runtime")
+            raise RuntimeError("ExecutionGraph requires the current initialized runtime")
         return self._native_graph
 
     def import_resource(self, value: Any, *, exported: bool = True) -> GraphResource:
         native_graph = self._ensure_current()
-        identity = id(value)
+        identity_value = value.owner if isinstance(value, TensorView) else value
+        identity = id(identity_value)
         existing = self._resource_by_identity.get(identity)
         if existing is not None:
-            if existing.value is not value:
+            existing_identity = existing.value.owner if isinstance(existing.value, TensorView) else existing.value
+            if existing_identity is not identity_value:
                 raise RuntimeError("Python resource identity collision")
             return existing
-        if isinstance(value, Texture):
+        state = _session_state()
+        if state._architecture == state.cpu and isinstance(value, (TensorStorage, TensorView, RawBuffer)):
+            native_resource = native_graph.import_host_buffer(identity, exported)
+        elif isinstance(value, Texture):
             native_resource = native_graph.import_image(value._resident_texture(), exported)
         elif isinstance(value, RenderTarget):
             image = value._resident_depth_attachment()

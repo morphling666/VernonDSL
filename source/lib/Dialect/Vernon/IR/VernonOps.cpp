@@ -258,8 +258,14 @@ static LogicalResult verifyAccumulationContribution(Operation *operation, Value 
     if (indices.size() != view.getShape().size())
         return operation->emitOpError("requires one index per TensorView dimension");
     Type elementType = view.getElementType();
-    if (!elementType.isF16() && !elementType.isF32() && !elementType.isF64())
-        return operation->emitOpError("requires f16, f32, or f64 gradient storage");
+    Type scalarType = elementType;
+    if (auto shaped = dyn_cast<ShapedType>(elementType)) {
+        if (!shaped.hasStaticShape())
+            return operation->emitOpError("requires statically shaped gradient elements");
+        scalarType = shaped.getElementType();
+    }
+    if (!scalarType.isF16() && !scalarType.isF32() && !scalarType.isF64())
+        return operation->emitOpError("requires floating scalar or tensor gradient storage");
     if (value.getType() != elementType)
         return operation->emitOpError("contribution type must match the storage element type");
     return success();
@@ -423,10 +429,11 @@ bool isAllowedCaptureOperation(Operation *operation) {
         return true;
     if (isa<LoadOp, PhysicalLoadOp, WorkgroupAllocOp>(operation))
         return true;
-    if (isa<StoreOp, PhysicalStoreOp>(operation))
+    if (isa<StoreOp, PhysicalStoreOp, ReduceSumOp, ScatterAddOp>(operation))
         return operation->hasAttrOfType<UnitAttr>("vernon.ad.functionalized");
     if (auto atomic = dyn_cast<AtomicOp>(operation))
-        return atomic.getStorage().getType().getAddressSpace() != "device";
+        return atomic.getStorage().getType().getAddressSpace() != "device" ||
+               operation->hasAttrOfType<UnitAttr>("vernon.ad.functionalized");
     if (auto atomic = dyn_cast<PhysicalAtomicOp>(operation))
         return atomic.getStorage().getType().getAddressSpace() != "device";
     if (auto barrier = dyn_cast<BarrierOp>(operation))
@@ -710,6 +717,22 @@ static LogicalResult verifyAdjointBufferIndexing(Operation *operation, AdAdjoint
     return success();
 }
 
+LogicalResult AdAdjointBufferCreateOp::verify() {
+    StringRef ownership = getOwnershipAttr() ? getOwnershipAttr().getValue() : "lane_private";
+    if (ownership != "lane_private" && ownership != "workgroup_shared")
+        return emitOpError("ownership must be 'lane_private' or 'workgroup_shared'");
+    AdAdjointBufferType buffer = cast<AdAdjointBufferType>(getBuffer().getType());
+    if (Value shapeSource = getShapeSource()) {
+        TensorViewType source = cast<TensorViewType>(shapeSource.getType());
+        if (source.getShape().size() != buffer.getIndexRank() ||
+            !llvm::equal(source.getShape(), buffer.getShape().take_front(buffer.getIndexRank())))
+            return emitOpError("shape source must match the indexed adjoint buffer shape");
+    } else if (llvm::is_contained(buffer.getShape(), int64_t{-1})) {
+        return emitOpError("dynamic adjoint buffer requires a shape source");
+    }
+    return success();
+}
+
 LogicalResult AdAdjointScatterAddOp::verify() {
     AdAdjointBufferType type = cast<AdAdjointBufferType>(getBuffer().getType());
     if (failed(verifyAdjointBufferIndexing(getOperation(), type, getIndices())))
@@ -734,6 +757,15 @@ LogicalResult AdAdjointAccumulateDenseOp::verify() {
 }
 
 LogicalResult AdAdjointTakeAndClearOp::verify() {
+    AdAdjointBufferType type = cast<AdAdjointBufferType>(getBuffer().getType());
+    if (failed(verifyAdjointBufferIndexing(getOperation(), type, getIndices())))
+        return failure();
+    return getValue().getType() == getAdjointBufferValueType(type)
+               ? success()
+               : emitOpError("result type must match the indexed adjoint buffer element");
+}
+
+LogicalResult AdAdjointPeekOp::verify() {
     AdAdjointBufferType type = cast<AdAdjointBufferType>(getBuffer().getType());
     if (failed(verifyAdjointBufferIndexing(getOperation(), type, getIndices())))
         return failure();

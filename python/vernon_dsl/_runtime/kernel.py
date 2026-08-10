@@ -567,8 +567,9 @@ class Kernel:
             shape = next(iter(writable_shapes))
             if not 1 <= len(shape) <= 3:
                 raise ValueError("inferred compute grids require Tensor rank one through three")
-            grid = tuple(reversed(shape)) + (1,) * (3 - len(shape))
-        if len(grid) != 3 or any(not isinstance(value, int) or value <= 0 for value in grid):
+            extent = tuple(reversed(shape)) + (1,) * (3 - len(shape))
+            grid = tuple((value + size - 1) // size for value, size in zip(extent, self._workgroup_size, strict=True))
+        if len(grid) != 3 or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in grid):
             raise ValueError("grid must contain three positive integers")
         if state._native_runtime is None:
             raise RuntimeError(f"{state._architecture.name} kernel execution requires the native runtime")
@@ -614,10 +615,6 @@ class Kernel:
         grid: tuple[int, int, int] | None = None,
         features: tuple[str, ...] = (),
     ) -> None:
-        state = _session_state()
-        if state._architecture == state.cpu:
-            self._invoke_direct(tuple(arguments), grid, features)
-            return
         invocation = self.invocation(*arguments, grid=grid, features=features)
 
         graph = ExecutionGraph()
@@ -652,9 +649,14 @@ class Kernel:
         features: tuple[str, ...] = (),
     ) -> PipelineInvocation:
         captured = tuple(arguments)
+
+        def invoke(encoder: ComputeEncoder) -> None:
+            state = _session_state()
+            self._invoke_direct(captured, grid, features, None if state._architecture == state.cpu else encoder)
+
         return PipelineInvocation(
             "compute",
-            lambda encoder: self._invoke_direct(captured, grid, features, encoder),
+            invoke,
             lambda execution_pass: self._declare_invocation(captured, features, execution_pass),
         )
 

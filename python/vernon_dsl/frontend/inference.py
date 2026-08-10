@@ -736,7 +736,7 @@ class _Inference:
                     MemoryOrdering.RELAXED,
                     scope,
                 )
-                storage_effect = StorageEffect(StorageEffectKind.WRITE, owner, region)
+                storage_effect = StorageEffect(StorageEffectKind.WRITE, owner, region, atomic=True)
                 if scope is EffectScope.DEVICE and storage_effect not in effects:
                     effects.append(storage_effect)
             else:
@@ -1310,8 +1310,10 @@ class _Inference:
             assert isinstance(shape, tuple)
             if storage.arguments[2] == "read":
                 raise self.error(node.args[0], f"{name} requires a writable TensorView")
-            if element.kind != "scalar" or element.name not in {"i32", "u32"}:
-                raise self.error(node.args[0], f"{name} requires i32 or u32 storage elements")
+            supported_elements = {"i32", "u32", "f32", "f64"} if name == "atomic_add" else {"i32", "u32"}
+            if element.kind != "scalar" or element.name not in supported_elements:
+                expected = "i32, u32, f32, or f64" if name == "atomic_add" else "i32 or u32"
+                raise self.error(node.args[0], f"{name} requires {expected} storage elements")
             index_nodes = list(node.args[1].elts) if isinstance(node.args[1], ast.Tuple) else [node.args[1]]
             if len(shape) == 1:
                 if len(index_nodes) != 1 or not index.is_integer:

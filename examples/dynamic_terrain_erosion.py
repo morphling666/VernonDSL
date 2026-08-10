@@ -384,7 +384,7 @@ def main() -> None:
                 water_a,
                 flow_a,
                 *erosion_arguments,
-                grid=(vertex_count, 1, 1),
+                grid=((vertex_count + 63) // 64, 1, 1),
             )
             erosion_ab_slot.value = apply_erosion_flow.invocation(
                 height_a,
@@ -395,14 +395,14 @@ def main() -> None:
                 water_b,
                 sediment_b,
                 *erosion_arguments,
-                grid=(vertex_count, 1, 1),
+                grid=((vertex_count + 63) // 64, 1, 1),
             )
             flow_b_slot.value = compute_erosion_flow.invocation(
                 height_b,
                 water_b,
                 flow_b,
                 *erosion_arguments,
-                grid=(vertex_count, 1, 1),
+                grid=((vertex_count + 63) // 64, 1, 1),
             )
             erosion_ba_slot.value = apply_erosion_flow.invocation(
                 height_b,
@@ -413,7 +413,7 @@ def main() -> None:
                 water_a,
                 sediment_a,
                 *erosion_arguments,
-                grid=(vertex_count, 1, 1),
+                grid=((vertex_count + 63) // 64, 1, 1),
             )
             mesh_slot.value = build_terrain_mesh.invocation(
                 height_a,
@@ -427,7 +427,7 @@ def main() -> None:
                 np.uint32(args.grid),
                 np.float32(args.extent),
                 phase,
-                grid=(vertex_count, 1, 1),
+                grid=((vertex_count + 63) // 64, 1, 1),
             )
             expand_slot.value = expand_indexed_mesh.invocation(
                 positions,
@@ -439,7 +439,7 @@ def main() -> None:
                 draw_normals,
                 draw_colors,
                 draw_materials,
-                grid=(draw_count, 1, 1),
+                grid=((draw_count + 63) // 64, 1, 1),
             )
             angle = float(phase) * 0.025 - 1.88
             camera = np.array((11.8 * math.cos(angle), 6.15, 11.8 * math.sin(angle)), dtype=np.float32)

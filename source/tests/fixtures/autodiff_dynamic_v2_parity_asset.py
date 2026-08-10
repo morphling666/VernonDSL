@@ -1,3 +1,5 @@
+from typing import Annotated
+
 import vernon_dsl as vd
 
 
@@ -129,9 +131,10 @@ def mixed_alias_objective(
     left: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
     right: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
     scale: vd.f32,
-    loss: vd.TensorView[vd.f32, (1,), vd.write],
+    loss: vd.TensorView[vd.f32, (2,), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
-    loss[0] = left[0] * scale + right[1] * right[1]
+    loss[gid[0]] = left[0] * scale + right[1] * right[1]
 
 
 mixed_alias_asset = vd.pipeline_asset(

@@ -9,7 +9,8 @@ from pathlib import Path
 import numpy as np
 import vernon_dsl as vd
 
-from examples.autodiff_smoke_fluid_kernels import SmokeFluidParameters, smoke_fluid_step, smoke_fluid_step_vjp
+from examples.autodiff_smoke_fluid_graph import build_smoke_fluid_graph
+from examples.autodiff_smoke_fluid_kernels import SmokeFluidParameters
 
 GRID = 16
 NOZZLES = 4
@@ -20,16 +21,9 @@ DELTA_TIME = np.float32(0.12)
 @dataclass
 class SmokeTimings:
     initialization_seconds: float = 0.0
-    first_vjp_seconds: float = 0.0
-    mpc_seconds: float = 0.0
     simulation_seconds: float = 0.0
     render_seconds: float = 0.0
-    mpc_iterations: int = 0
     simulation_steps: int = 0
-
-    @property
-    def average_mpc_seconds(self) -> float:
-        return self.mpc_seconds / max(self.mpc_iterations, 1)
 
     @property
     def average_simulation_seconds(self) -> float:
@@ -37,44 +31,26 @@ class SmokeTimings:
 
 
 class SmokeFluidSimulation:
-    def __init__(self) -> None:
-        self.density = vd.storage.zeros(dtype=vd.f32, shape=(GRID, GRID))
-        self.velocity = vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(GRID, GRID))
-        self.controls = vd.storage.zeros(dtype=vd.f32, shape=(NOZZLES,))
-        self.target = vd.storage.zeros(dtype=vd.f32, shape=(GRID, GRID))
-        self.forced_density = vd.storage.zeros(dtype=vd.f32, shape=(GRID, GRID))
-        self.forced_velocity = vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(GRID, GRID))
-        self.advected_velocity = vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(GRID, GRID))
-        self.divergence = vd.storage.zeros(dtype=vd.f32, shape=(GRID, GRID))
-        self.pressure_a = vd.storage.zeros(dtype=vd.f32, shape=(GRID, GRID))
-        self.pressure_b = vd.storage.zeros(dtype=vd.f32, shape=(GRID, GRID))
-        self.next_density = vd.storage.zeros(dtype=vd.f32, shape=(GRID, GRID))
-        self.next_velocity = vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(GRID, GRID))
+    def __init__(
+        self,
+        *,
+        grid: int = GRID,
+        nozzles: int = NOZZLES,
+        pressure_iterations: int = PRESSURE_ITERATIONS,
+    ) -> None:
+        self.grid = grid
+        self.nozzles = nozzles
+        self.density = vd.storage.zeros(dtype=vd.f32, shape=(grid, grid))
+        self.velocity = vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(grid, grid))
+        self.controls = vd.storage.zeros(dtype=vd.f32, shape=(nozzles,))
+        self.target = vd.storage.zeros(dtype=vd.f32, shape=(grid, grid))
         self.output_loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
         self.parameters = SmokeFluidParameters(
-            GRID,
-            GRID,
-            NOZZLES,
-            PRESSURE_ITERATIONS,
-            DELTA_TIME,
-        )
-
-    def kernel_arguments(self) -> tuple:
-        return (
-            self.density,
-            self.velocity,
-            self.controls,
-            self.target,
-            self.forced_density,
-            self.forced_velocity,
-            self.advected_velocity,
-            self.divergence,
-            self.pressure_a,
-            self.pressure_b,
-            self.next_density,
-            self.next_velocity,
-            self.output_loss,
-            self.parameters,
+            width=np.int32(grid),
+            height=np.int32(grid),
+            nozzle_count=np.int32(nozzles),
+            pressure_iterations=np.int32(pressure_iterations),
+            delta_time=DELTA_TIME,
         )
 
     def set_objective_inputs(self, control: np.ndarray, target: np.ndarray) -> None:
@@ -91,9 +67,17 @@ class SmokeFluidSimulation:
         self.set_control(control)
         if target is not None:
             self.set_target(target)
-        smoke_fluid_step(*self.kernel_arguments(), grid=(1, 1, 1))
-        self.density, self.next_density = self.next_density, self.density
-        self.velocity, self.next_velocity = self.next_velocity, self.velocity
+        graph = build_smoke_fluid_graph(
+            state_density=self.density,
+            state_velocity=self.velocity,
+            control_nozzles=self.controls,
+            objective_target_density=self.target,
+            parameters=self.parameters,
+        )
+        outputs = graph.execute()
+        self.density = outputs.density
+        self.velocity = outputs.velocity
+        self.output_loss = outputs.loss
 
     def density_numpy(self) -> np.ndarray:
         return self.density.to_numpy()
@@ -127,86 +111,72 @@ def smoke_image(density: np.ndarray, target: np.ndarray, control: np.ndarray) ->
     target_overlay[..., 1] = target * 0.18
     target_overlay[..., 2] = target * 0.08
     image = np.clip(smoke + target_overlay, 0.0, 1.0)
-    nozzle_width = GRID // NOZZLES
+    nozzle_width = density.shape[1] // len(control)
     for nozzle, amount in enumerate(control):
         begin = nozzle * nozzle_width
         image[-2:, begin : begin + nozzle_width, 0] = np.maximum(
-            image[-2:, begin : begin + nozzle_width, 0], np.float32(amount)
+            image[-2:, begin : begin + nozzle_width, 0],
+            np.float32(amount),
         )
     return (image[..., ::-1] * np.float32(255.0)).astype(np.uint8)
 
 
-def optimize(
+def optimize(**_arguments: object) -> None:
+    raise RuntimeError("smoke-fluid optimization is deferred until ExecutionGraph VJP is implemented")
+
+
+def simulate(
     *,
     steps: int,
-    iterations: int,
-    learning_rate: float,
+    control: np.ndarray | None = None,
+    architecture: object = vd.cpu,
     verbose: bool = True,
     render_callback=None,
 ) -> tuple[np.ndarray, np.ndarray, list[float], SmokeTimings]:
     start = time.perf_counter()
-    vd.init(arch=vd.cpu)
-    objective = smoke_fluid_step_vjp
+    vd.init(arch=architecture)
     simulation = SmokeFluidSimulation()
     timings = SmokeTimings(initialization_seconds=time.perf_counter() - start)
     target = v_target()
     simulation.set_target(target)
-    control = np.full((NOZZLES,), np.float32(0.25), dtype=np.float32)
+    applied_control = (
+        np.full((NOZZLES,), np.float32(0.25), dtype=np.float32)
+        if control is None
+        else np.ascontiguousarray(control, dtype=np.float32)
+    )
     applied: list[np.ndarray] = []
     losses: list[float] = []
 
     for step in range(steps):
-        for iteration in range(iterations):
-            mpc_start = time.perf_counter()
-            simulation.set_control(control)
-            _, pullback = objective(
-                *simulation.kernel_arguments(),
-                grid=(1, 1, 1),
-            )
-            if step == 0 and iteration == 0:
-                timings.first_vjp_seconds = time.perf_counter() - mpc_start
-            gradients = pullback(None)
-            control_gradient = gradients["control_nozzles"].to_numpy()
-            control = np.clip(
-                control - np.float32(learning_rate) * control_gradient,
-                0.0,
-                1.0,
-            ).astype(np.float32)
-            timings.mpc_seconds += time.perf_counter() - mpc_start
-            timings.mpc_iterations += 1
-
         simulation_start = time.perf_counter()
-        simulation.step(control)
+        simulation.step(applied_control)
         timings.simulation_seconds += time.perf_counter() - simulation_start
         timings.simulation_steps += 1
         density = simulation.density_numpy()
         loss = float(simulation.output_loss.to_numpy()[0])
-        error = float(np.linalg.norm(density - target))
-        control_norm = float(np.linalg.norm(control))
         losses.append(loss)
-        applied.append(control.copy())
+        applied.append(applied_control.copy())
         if render_callback is not None:
             render_start = time.perf_counter()
-            render_callback(step, smoke_image(density, target, applied[-1]))
+            render_callback(step, smoke_image(density, target, applied_control))
             timings.render_seconds += time.perf_counter() - render_start
         if verbose:
-            print(f"step={step:03d} loss={loss:.6f} density_error={error:.6f} control_norm={control_norm:.6f}")
+            error = float(np.linalg.norm(density - target))
+            print(f"step={step:03d} loss={loss:.6f} density_error={error:.6f}")
 
     return simulation.density_numpy(), np.stack(applied), losses, timings
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="A compiler-differentiated stable-fluid smoke MPC simulation")
+    parser = argparse.ArgumentParser(description="A forward stable-fluid smoke simulation")
     parser.add_argument("--steps", type=int, default=120)
-    parser.add_argument("--iterations", type=int, default=4)
-    parser.add_argument("--learning-rate", type=float, default=0.08)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--output", type=Path, default=Path("smoke_mpc.png"))
+    parser.add_argument("--output", type=Path, default=Path("smoke_forward.png"))
     parser.add_argument("--benchmark-json", type=Path)
     arguments = parser.parse_args()
-    if min(arguments.steps, arguments.iterations, arguments.fps) <= 0 or arguments.learning_rate <= 0:
-        parser.error("steps, iterations, fps, and learning-rate must be positive")
+    if min(arguments.steps, arguments.fps) <= 0:
+        parser.error("steps and fps must be positive")
 
     try:
         import cv2
@@ -215,7 +185,7 @@ def main() -> None:
             "Install the project examples dependency to render smoke: pip install '.[examples]'"
         ) from error
 
-    window = "VernonDSL Smoke MPC"
+    window = "VernonDSL Smoke Forward"
     last_image: np.ndarray | None = None
 
     def render(_step: int, image: np.ndarray) -> None:
@@ -228,10 +198,8 @@ def main() -> None:
     if not arguments.headless:
         cv2.namedWindow(window)
     try:
-        density, controls, losses, timings = optimize(
+        density, controls, losses, timings = simulate(
             steps=arguments.steps,
-            iterations=arguments.iterations,
-            learning_rate=arguments.learning_rate,
             render_callback=render,
         )
     finally:
@@ -244,9 +212,7 @@ def main() -> None:
     np.save(arguments.output.with_name(arguments.output.stem + "_controls.npy"), controls)
     benchmark = {
         **asdict(timings),
-        "average_mpc_seconds": timings.average_mpc_seconds,
         "average_simulation_seconds": timings.average_simulation_seconds,
-        "first_frame_seconds": timings.initialization_seconds + timings.first_vjp_seconds,
         "final_loss": losses[-1],
     }
     if arguments.benchmark_json is not None:

@@ -229,10 +229,32 @@ if(TARGET VernonRuntime)
     add_dependencies(VernonRuntimeTests vernon-cpu-aot-test-bundle)
     add_dependencies(VernonRuntimeTests VernonRuntimeAutodiffAbiCHeaderCheck VernonRuntimePublicCHeaderCheck)
     vernon_stage_target_files(VernonRuntimeTests VernonRuntime VernonRHI)
+    add_executable(VernonRuntimeCpuWorkgroupTests runtime/cpu_workgroup_dispatch_test.cpp)
+    set_target_properties(VernonRuntimeCpuWorkgroupTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                                                    "${CMAKE_BINARY_DIR}/source")
+    target_include_directories(VernonRuntimeCpuWorkgroupTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib")
+    target_link_libraries(VernonRuntimeCpuWorkgroupTests PRIVATE GTest::gtest_main Vernon::Runtime)
+    vernon_stage_target_files(VernonRuntimeCpuWorkgroupTests VernonRuntime)
+    vernon_discover_gtests(VernonRuntimeCpuWorkgroupTests)
     if(TARGET VernonDSLCompiler)
-        target_sources(VernonRuntimeTests PRIVATE runtime/runtime_synchronization_test.cpp)
-        target_link_libraries(VernonRuntimeTests PRIVATE VernonDSLCompiler)
-        vernon_stage_target_files(VernonRuntimeTests VernonDSLCompiler)
+        add_executable(VernonCompilerRuntimeIntegrationTests runtime/runtime_synchronization_test.cpp)
+        set_target_properties(VernonCompilerRuntimeIntegrationTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                                                               "${CMAKE_BINARY_DIR}/source")
+        target_include_directories(VernonCompilerRuntimeIntegrationTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
+                                                                                 "${VERNON_TEST_ROOT}/support")
+        target_link_libraries(
+            VernonCompilerRuntimeIntegrationTests
+            PRIVATE GTest::gtest_main
+                    Vernon::Runtime
+                    Vernon::ExecutionGraph
+                    Vernon::RuntimeRHIAdapter
+                    VernonDSLCompiler)
+        vernon_stage_target_files(
+            VernonCompilerRuntimeIntegrationTests
+            VernonRuntime
+            VernonRHI
+            VernonDSLCompiler)
+        vernon_discover_gtests(VernonCompilerRuntimeIntegrationTests)
     endif()
     if(TARGET vernon-dsl-native AND Python_FOUND)
         vernon_add_cpu_autodiff_fixture(
@@ -255,7 +277,7 @@ if(TARGET VernonRuntime)
             native-autodiff-numeric-cpu
             autodiff_native_numeric_cpu_fixture
             autodiff_native_numeric_cpu_fixture.pipeline.json
-            "${VERNON_TEST_ROOT}/fixtures/autodiff_native_numeric_asset.py:cpu_asset"
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_native_numeric_asset.py:asset"
             vernonRegisterNativeAutodiffNumericCpuFixture
             native_autodiff_numeric_cpu_manifest
             native_autodiff_numeric_cpu_fixture_target)
@@ -307,6 +329,14 @@ if(TARGET VernonRuntime)
             vernonRegisterStructuredStorageAggregateAutodiffFixture
             structured_storage_aggregate_autodiff_manifest
             structured_storage_aggregate_autodiff_fixture_target)
+        vernon_add_cpu_autodiff_fixture(
+            structured-storage-workgroup-autodiff
+            autodiff_structured_storage_workgroup_fixture
+            autodiff_structured_storage_workgroup_fixture.pipeline.json
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_workgroup_storage_asset.py:asset"
+            vernonRegisterStructuredStorageWorkgroupAutodiffFixture
+            structured_storage_workgroup_autodiff_manifest
+            structured_storage_workgroup_autodiff_fixture_target)
         vernon_add_cpu_autodiff_fixture(
             dynamic-v2-signed-stride
             autodiff_dynamic_v2_signed_stride_fixture
@@ -363,14 +393,8 @@ if(TARGET VernonRuntime)
             vernonRegisterDynamicV2MixedAliasFixture
             dynamic_v2_mixed_alias_manifest
             dynamic_v2_mixed_alias_fixture_target)
-        vernon_add_cpu_autodiff_fixture(
-            dynamic-smoke-fluid
-            autodiff_dynamic_smoke_fluid_fixture
-            autodiff_dynamic_smoke_fluid_fixture.pipeline.json
-            "${VERNON_REPOSITORY_ROOT}/examples/autodiff_smoke_fluid_kernels.py:smoke_fluid_cpu_asset"
-            vernonRegisterDynamicSmokeFluidFixture
-            dynamic_smoke_fluid_manifest
-            dynamic_smoke_fluid_fixture_target)
+        # Smoke-fluid graph VJP and its cooked fixture are deferred until the multi-dispatch ExecutionGraph autodiff
+        # contract is implemented.
 
         add_executable(VernonStructuredScalarAutodiffTests runtime/runtime_structured_scalar_autodiff_test.cpp)
         target_link_libraries(
@@ -420,6 +444,20 @@ if(TARGET VernonRuntime)
                                                                               "${CMAKE_BINARY_DIR}/source")
         vernon_stage_target_files(VernonStructuredStorageAutodiffTests VernonRuntime)
         vernon_discover_gtests(VernonStructuredStorageAutodiffTests)
+
+        add_executable(VernonRuntimeWorkgroupAutodiffTests runtime/runtime_workgroup_autodiff_test.cpp)
+        target_link_libraries(
+            VernonRuntimeWorkgroupAutodiffTests PRIVATE GTest::gtest_main Vernon::Runtime
+                                                        ${structured_storage_workgroup_autodiff_fixture_target})
+        target_compile_definitions(
+            VernonRuntimeWorkgroupAutodiffTests
+            PRIVATE
+                VERNON_STRUCTURED_STORAGE_WORKGROUP_AUTODIFF_MANIFEST="${structured_storage_workgroup_autodiff_manifest}"
+        )
+        set_target_properties(VernonRuntimeWorkgroupAutodiffTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                                                             "${CMAKE_BINARY_DIR}/source")
+        vernon_stage_target_files(VernonRuntimeWorkgroupAutodiffTests VernonRuntime)
+        vernon_discover_gtests(VernonRuntimeWorkgroupAutodiffTests)
 
         vernon_add_autodiff_python_fixture(
             VernonCookedAutodiffPythonFixture
@@ -476,11 +514,6 @@ if(TARGET VernonRuntime)
             vernon_dynamic_v2_mixed_alias_fixture
             vernonRegisterDynamicV2MixedAliasFixture
             ${dynamic_v2_mixed_alias_fixture_target})
-        vernon_add_autodiff_python_fixture(
-            VernonDynamicSmokeFluidPythonFixture
-            vernon_dynamic_smoke_fluid_fixture
-            vernonRegisterDynamicSmokeFluidFixture
-            ${dynamic_smoke_fluid_fixture_target})
         add_test(
             NAME VernonPythonCookedAutodiffTest
             COMMAND
@@ -498,7 +531,7 @@ if(TARGET VernonRuntime)
             COMMAND
                 "${Python_EXECUTABLE}" "${VERNON_TEST_ROOT}/python/autodiff_native_numeric_runtime_test.py"
                 "${native_autodiff_numeric_cpu_manifest}"
-                "$<TARGET_FILE_DIR:VernonNativeAutodiffNumericCpuPythonFixture>" "${VERNON_REPOSITORY_ROOT}/python" cpu)
+                "$<TARGET_FILE_DIR:VernonNativeAutodiffNumericCpuPythonFixture>" "${VERNON_REPOSITORY_ROOT}/python")
         add_test(
             NAME VernonPythonStructuredStorageAggregateAutodiffTest
             COMMAND
@@ -521,12 +554,6 @@ if(TARGET VernonRuntime)
                 "${dynamic_v2_multi_output_manifest}" "${dynamic_v2_partially_dynamic_manifest}"
                 "${dynamic_v2_mixed_alias_manifest}" "$<TARGET_FILE_DIR:VernonDynamicV2SignedStridePythonFixture>"
                 "${VERNON_REPOSITORY_ROOT}/python" "${VERNON_TEST_ROOT}/fixtures")
-        add_test(
-            NAME VernonPythonDynamicSmokeFluidParityTest
-            COMMAND
-                "${Python_EXECUTABLE}" "${VERNON_TEST_ROOT}/python/autodiff_dynamic_smoke_fluid_runtime_test.py"
-                "${dynamic_smoke_fluid_manifest}" "$<TARGET_FILE_DIR:VernonDynamicSmokeFluidPythonFixture>"
-                "${VERNON_REPOSITORY_ROOT}/python" "${VERNON_REPOSITORY_ROOT}")
     endif()
 
     target_sources(VernonRuntimeTests PRIVATE runtime/runtime_cuda_pipeline_test.cpp)
@@ -566,54 +593,16 @@ if(TARGET VernonRuntime)
                 "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:resolution_asset"
                 metal_resolution_pipeline_bundle
                 metal_resolution_pipeline_test_manifest)
-            vernon_add_pipeline_test_bundle(
-                metal-autodiff-pipeline
-                metal
-                "${VERNON_TEST_ROOT}/fixtures/autodiff_cooked_asset.py:asset"
-                metal_autodiff_pipeline_bundle
-                metal_autodiff_pipeline_test_manifest)
-            vernon_add_pipeline_test_bundle(
-                metal-autodiff-storage-pipeline
-                metal
-                "${VERNON_TEST_ROOT}/fixtures/autodiff_storage_cooked_asset.py:asset"
-                metal_autodiff_storage_pipeline_bundle
-                metal_autodiff_storage_pipeline_test_manifest)
-            vernon_add_pipeline_test_bundle(
-                metal-autodiff-scatter-pipeline
-                metal
-                "${VERNON_TEST_ROOT}/fixtures/autodiff_scatter_cooked_asset.py:asset"
-                metal_autodiff_scatter_pipeline_bundle
-                metal_autodiff_scatter_pipeline_test_manifest)
-            vernon_add_pipeline_test_bundle(
-                metal-autodiff-native-numeric-pipeline
-                metal
-                "${VERNON_TEST_ROOT}/fixtures/autodiff_native_numeric_asset.py:asset"
-                metal_autodiff_native_numeric_pipeline_bundle
-                metal_autodiff_native_numeric_pipeline_test_manifest)
             target_compile_definitions(
                 VernonRuntimeTests
                 PRIVATE VERNON_METAL_COMPUTE_PIPELINE_BUNDLE="${metal_compute_pipeline_test_manifest}"
                         VERNON_METAL_GRAPHICS_PIPELINE_BUNDLE="${metal_graphics_pipeline_test_manifest}"
-                        VERNON_METAL_RESOLUTION_PIPELINE_BUNDLE="${metal_resolution_pipeline_test_manifest}"
-                        VERNON_METAL_AUTODIFF_PIPELINE_BUNDLE="${metal_autodiff_pipeline_test_manifest}"
-                        VERNON_METAL_AUTODIFF_STORAGE_PIPELINE_BUNDLE="${metal_autodiff_storage_pipeline_test_manifest}"
-                        VERNON_METAL_AUTODIFF_SCATTER_PIPELINE_BUNDLE="${metal_autodiff_scatter_pipeline_test_manifest}"
-            )
+                        VERNON_METAL_RESOLUTION_PIPELINE_BUNDLE="${metal_resolution_pipeline_test_manifest}")
             add_dependencies(
                 VernonRuntimeTests
                 vernon-metal-compute-pipeline-test-bundle
                 vernon-metal-graphics-pipeline-test-bundle
-                vernon-metal-resolution-pipeline-test-bundle
-                vernon-metal-autodiff-pipeline-test-bundle
-                vernon-metal-autodiff-storage-pipeline-test-bundle
-                vernon-metal-autodiff-scatter-pipeline-test-bundle
-                vernon-metal-autodiff-native-numeric-pipeline-test-bundle)
-            add_test(
-                NAME VernonPythonMetalNativeAutodiffNumericTest
-                COMMAND
-                    "${Python_EXECUTABLE}" "${VERNON_TEST_ROOT}/python/autodiff_native_numeric_runtime_test.py"
-                    "${metal_autodiff_native_numeric_pipeline_test_manifest}" "${VERNON_REPOSITORY_ROOT}/python" metal)
-            set_tests_properties(VernonPythonMetalNativeAutodiffNumericTest PROPERTIES SKIP_RETURN_CODE 77)
+                vernon-metal-resolution-pipeline-test-bundle)
             add_test(
                 NAME vernon-metal-mandelbulb-showcase
                 COMMAND
@@ -680,40 +669,18 @@ if(TARGET VernonRuntime)
                 "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:resolution_asset"
                 directx_resolution_pipeline_bundle
                 directx_resolution_pipeline_test_manifest)
-            vernon_add_pipeline_test_bundle(
-                directx-autodiff-pipeline
-                directx
-                "${VERNON_TEST_ROOT}/fixtures/autodiff_cooked_asset.py:asset"
-                directx_autodiff_pipeline_bundle
-                directx_autodiff_pipeline_test_manifest)
-            vernon_add_pipeline_test_bundle(
-                directx-autodiff-native-numeric-pipeline
-                directx
-                "${VERNON_TEST_ROOT}/fixtures/autodiff_native_numeric_asset.py:asset"
-                directx_autodiff_native_numeric_pipeline_bundle
-                directx_autodiff_native_numeric_pipeline_test_manifest)
             target_sources(VernonRuntimeTests PRIVATE runtime/runtime_directx12_pipeline_test.cpp)
             target_compile_definitions(
                 VernonRuntimeTests
                 PRIVATE VERNON_DIRECTX_PIPELINE_BUNDLE="${directx_pipeline_test_manifest}"
                         VERNON_DIRECTX_COMPUTE_PIPELINE_BUNDLE="${directx_compute_pipeline_test_manifest}"
-                        VERNON_DIRECTX_RESOLUTION_PIPELINE_BUNDLE="${directx_resolution_pipeline_test_manifest}"
-                        VERNON_DIRECTX_AUTODIFF_PIPELINE_BUNDLE="${directx_autodiff_pipeline_test_manifest}")
+                        VERNON_DIRECTX_RESOLUTION_PIPELINE_BUNDLE="${directx_resolution_pipeline_test_manifest}")
             target_link_libraries(VernonRuntimeTests PRIVATE VernonDSLCompiler)
             add_dependencies(
                 VernonRuntimeTests
                 vernon-directx-pipeline-test-bundle
                 vernon-directx-compute-pipeline-test-bundle
-                vernon-directx-resolution-pipeline-test-bundle
-                vernon-directx-autodiff-pipeline-test-bundle
-                vernon-directx-autodiff-native-numeric-pipeline-test-bundle)
-            add_test(
-                NAME VernonPythonDirectXNativeAutodiffNumericTest
-                COMMAND
-                    "${Python_EXECUTABLE}" "${VERNON_TEST_ROOT}/python/autodiff_native_numeric_runtime_test.py"
-                    "${directx_autodiff_native_numeric_pipeline_test_manifest}" "${VERNON_REPOSITORY_ROOT}/python"
-                    directx)
-            set_tests_properties(VernonPythonDirectXNativeAutodiffNumericTest PROPERTIES SKIP_RETURN_CODE 77)
+                vernon-directx-resolution-pipeline-test-bundle)
         endif()
     endif()
 
@@ -738,82 +705,21 @@ if(TARGET VernonRuntime)
             "${VERNON_REPOSITORY_ROOT}/python/tests/cube_map_shader.py:cube_map_asset"
             vulkan_cube_map_bundle
             vulkan_cube_map_test_manifest)
-        vernon_add_pipeline_test_bundle(
-            vulkan-autodiff-pipeline
-            vulkan
-            "${VERNON_TEST_ROOT}/fixtures/autodiff_cooked_asset.py:asset"
-            vulkan_autodiff_pipeline_bundle
-            vulkan_autodiff_pipeline_test_manifest)
-        vernon_add_pipeline_test_bundle(
-            vulkan-autodiff-storage-pipeline
-            vulkan
-            "${VERNON_TEST_ROOT}/fixtures/autodiff_storage_cooked_asset.py:asset"
-            vulkan_autodiff_storage_pipeline_bundle
-            vulkan_autodiff_storage_pipeline_test_manifest)
-        vernon_add_pipeline_test_bundle(
-            vulkan-autodiff-scatter-pipeline
-            vulkan
-            "${VERNON_TEST_ROOT}/fixtures/autodiff_scatter_cooked_asset.py:asset"
-            vulkan_autodiff_scatter_pipeline_bundle
-            vulkan_autodiff_scatter_pipeline_test_manifest)
-        vernon_add_pipeline_test_bundle(
-            vulkan-autodiff-native-numeric-pipeline
-            vulkan
-            "${VERNON_TEST_ROOT}/fixtures/autodiff_native_numeric_asset.py:asset"
-            vulkan_autodiff_native_numeric_pipeline_bundle
-            vulkan_autodiff_native_numeric_pipeline_test_manifest)
         target_sources(VernonRuntimeTests PRIVATE runtime/runtime_vulkan_pipeline_test.cpp
                                                   runtime/runtime_vulkan_cube_map_test.cpp)
         target_compile_definitions(
             VernonRuntimeTests
             PRIVATE VERNON_VULKAN_PIPELINE_BUNDLE="${vulkan_pipeline_test_manifest}"
                     VERNON_VULKAN_CUBE_MAP_BUNDLE="${vulkan_cube_map_test_manifest}"
-                    VERNON_VULKAN_COMPUTE_PIPELINE_BUNDLE="${vulkan_compute_pipeline_test_manifest}"
-                    VERNON_VULKAN_AUTODIFF_PIPELINE_BUNDLE="${vulkan_autodiff_pipeline_test_manifest}"
-                    VERNON_VULKAN_AUTODIFF_STORAGE_PIPELINE_BUNDLE="${vulkan_autodiff_storage_pipeline_test_manifest}"
-                    VERNON_VULKAN_AUTODIFF_SCATTER_PIPELINE_BUNDLE="${vulkan_autodiff_scatter_pipeline_test_manifest}")
+                    VERNON_VULKAN_COMPUTE_PIPELINE_BUNDLE="${vulkan_compute_pipeline_test_manifest}")
         add_dependencies(
             VernonRuntimeTests
             vernon-vulkan-pipeline-test-bundle
             vernon-vulkan-cube-map-test-bundle
-            vernon-vulkan-compute-pipeline-test-bundle
-            vernon-vulkan-autodiff-pipeline-test-bundle
-            vernon-vulkan-autodiff-storage-pipeline-test-bundle
-            vernon-vulkan-autodiff-scatter-pipeline-test-bundle
-            vernon-vulkan-autodiff-native-numeric-pipeline-test-bundle)
-        add_test(
-            NAME VernonPythonVulkanNativeAutodiffNumericTest
-            COMMAND
-                "${Python_EXECUTABLE}" "${VERNON_TEST_ROOT}/python/autodiff_native_numeric_runtime_test.py"
-                "${vulkan_autodiff_native_numeric_pipeline_test_manifest}" "${VERNON_REPOSITORY_ROOT}/python" vulkan)
-        set_tests_properties(VernonPythonVulkanNativeAutodiffNumericTest PROPERTIES SKIP_RETURN_CODE 77)
+            vernon-vulkan-compute-pipeline-test-bundle)
     endif()
 
     if(TARGET vernon-dsl-native AND Python_FOUND)
-        vernon_add_pipeline_test_bundle(
-            cuda-autodiff-pipeline
-            cuda
-            "${VERNON_TEST_ROOT}/fixtures/autodiff_cooked_asset.py:asset"
-            cuda_autodiff_pipeline_bundle
-            cuda_autodiff_pipeline_test_manifest)
-        vernon_add_pipeline_test_bundle(
-            cuda-autodiff-native-numeric-pipeline
-            cuda
-            "${VERNON_TEST_ROOT}/fixtures/autodiff_native_numeric_asset.py:asset"
-            cuda_autodiff_native_numeric_pipeline_bundle
-            cuda_autodiff_native_numeric_pipeline_test_manifest)
-        vernon_add_pipeline_test_bundle(
-            opengl-autodiff-native-numeric-pipeline
-            opengl
-            "${VERNON_TEST_ROOT}/fixtures/autodiff_native_numeric_asset.py:asset"
-            opengl_autodiff_native_numeric_pipeline_bundle
-            opengl_autodiff_native_numeric_pipeline_test_manifest)
-        vernon_add_pipeline_test_bundle(
-            opengles-autodiff-native-numeric-pipeline
-            opengles
-            "${VERNON_TEST_ROOT}/fixtures/autodiff_native_numeric_asset.py:asset"
-            opengles_autodiff_native_numeric_pipeline_bundle
-            opengles_autodiff_native_numeric_pipeline_test_manifest)
         vernon_add_pipeline_test_bundle(
             opengl-runtime-acceptance
             opengl
@@ -821,36 +727,8 @@ if(TARGET VernonRuntime)
             opengl_runtime_acceptance_bundle
             opengl_runtime_acceptance_manifest)
         target_compile_definitions(
-            VernonRuntimeTests PRIVATE VERNON_CUDA_AUTODIFF_PIPELINE_BUNDLE="${cuda_autodiff_pipeline_test_manifest}"
-                                       VERNON_OPENGL_RUNTIME_ACCEPTANCE_BUNDLE="${opengl_runtime_acceptance_manifest}")
-        add_dependencies(
-            VernonRuntimeTests
-            vernon-cuda-autodiff-pipeline-test-bundle
-            vernon-cuda-autodiff-native-numeric-pipeline-test-bundle
-            vernon-opengl-runtime-acceptance-test-bundle
-            vernon-opengl-autodiff-native-numeric-pipeline-test-bundle
-            vernon-opengles-autodiff-native-numeric-pipeline-test-bundle)
-        foreach(target IN ITEMS cuda opengl opengles)
-            string(
-                SUBSTRING "${target}"
-                          0
-                          1
-                          target_initial)
-            string(TOUPPER "${target_initial}" target_initial)
-            string(
-                SUBSTRING "${target}"
-                          1
-                          -1
-                          target_suffix)
-            set(target_label "${target_initial}${target_suffix}")
-            add_test(
-                NAME VernonPython${target_label}NativeAutodiffNumericTest
-                COMMAND
-                    "${Python_EXECUTABLE}" "${VERNON_TEST_ROOT}/python/autodiff_native_numeric_runtime_test.py"
-                    "${${target}_autodiff_native_numeric_pipeline_test_manifest}" "${VERNON_REPOSITORY_ROOT}/python"
-                    "${target}")
-            set_tests_properties(VernonPython${target_label}NativeAutodiffNumericTest PROPERTIES SKIP_RETURN_CODE 77)
-        endforeach()
+            VernonRuntimeTests PRIVATE VERNON_OPENGL_RUNTIME_ACCEPTANCE_BUNDLE="${opengl_runtime_acceptance_manifest}")
+        add_dependencies(VernonRuntimeTests vernon-opengl-runtime-acceptance-test-bundle)
     endif()
 
     vernon_discover_gtests(VernonRuntimeTests)
@@ -928,19 +806,25 @@ if(TARGET VernonDSLCompiler)
         add_test(NAME vernon-python-test_storage_vjp_contract
                  COMMAND ${Python_EXECUTABLE} -m unittest discover -s "${VERNON_REPOSITORY_ROOT}/python/tests" -p
                          "test_storage_vjp_contract.py")
+        add_test(NAME vernon-python-smoke-fluid-graph
+                 COMMAND ${Python_EXECUTABLE} -m unittest discover -s "${VERNON_REPOSITORY_ROOT}/python/tests" -p
+                         "test_smoke_fluid_graph.py")
         set_tests_properties(
-            vernon-python-test_storage_vjp_contract
+            vernon-python-test_storage_vjp_contract vernon-python-smoke-fluid-graph
             PROPERTIES ENVIRONMENT
                        "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python"
                        WORKING_DIRECTORY
                        "${VERNON_REPOSITORY_ROOT}")
         add_test(NAME vernon-python-native-compiled-program
                  COMMAND ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/python/tests/test_native_compiled_program.py")
+        add_test(NAME vernon-python-kernel-memory-phase-compile
+                 COMMAND ${Python_EXECUTABLE} "${VERNON_TEST_ROOT}/python/kernel_memory_phase_compile_test.py")
         add_test(NAME vernon-python-compile-surface-parity
                  COMMAND ${Python_EXECUTABLE} "${VERNON_TEST_ROOT}/compiler/compile_surface_parity_test.py"
                          $<TARGET_FILE:VernonDSLCompiler> $<TARGET_FILE:vernon-compile>)
-        set_tests_properties(vernon-python-native-compiled-program vernon-python-compile-surface-parity
-                             PROPERTIES ENVIRONMENT "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python")
+        set_tests_properties(
+            vernon-python-native-compiled-program vernon-python-kernel-memory-phase-compile
+            vernon-python-compile-surface-parity PROPERTIES ENVIRONMENT "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python")
     endif()
 
     if(WIN32)

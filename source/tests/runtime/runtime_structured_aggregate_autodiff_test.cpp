@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -113,6 +114,14 @@ TEST(RuntimeStructuredAggregateAutodiff, ExecutesAggregateInputAndStorageObjecti
     };
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, 4, {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
+    VernonPullback *rejectedPullback = reinterpret_cast<VernonPullback *>(uintptr_t{1});
+    EXPECT_EQ(vernonAdPipelineForward(pipeline, {2, 1, 1}, &inputs, &outputs, &rejectedPullback),
+              VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(rejectedPullback, nullptr);
+    EXPECT_NE(lastError(context).find("dispatch grid axis 0 must equal 1"), std::string::npos);
+    EXPECT_FLOAT_EQ(outputValues[0], 0.0f);
+    EXPECT_FLOAT_EQ(outputValues[1], 0.0f);
+
     VernonPullback *pullback = nullptr;
     ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
         << lastError(context);

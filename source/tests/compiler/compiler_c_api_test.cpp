@@ -503,15 +503,18 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
         "%values: !vernon.tensor_view<f32, [3], \"read_write\", \"device\"> "
         "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
         "vernon.binding = 0 : i64}, "
-        "%id: index {vernon.interface = \"input\", "
+        "%id: tensor<3xi32> {vernon.interface = \"input\", "
         "vernon.builtin = \"global_invocation_id\"}) attributes {vernon.entry, "
         "vernon.stage = \"compute\", "
         "vernon.workgroup_size = array<i32: 8, 1, 1>} {\n"
-        "    %value = \"vernon.load\"(%values, %id) : "
+        "    %zero = arith.constant 0 : index\n"
+        "    %id_i32 = tensor.extract %id[%zero] : tensor<3xi32>\n"
+        "    %id_x = arith.index_castui %id_i32 : i32 to index\n"
+        "    %value = \"vernon.load\"(%values, %id_x) : "
         "(!vernon.tensor_view<f32, [3], \"read_write\", \"device\">, index) -> f32\n"
         "    %one = arith.constant 1.0 : f32\n"
         "    %sum = arith.addf %value, %one : f32\n"
-        "    \"vernon.store\"(%sum, %values, %id) : "
+        "    \"vernon.store\"(%sum, %values, %id_x) : "
         "(f32, !vernon.tensor_view<f32, [3], \"read_write\", \"device\">, index) -> ()\n"
         "    return\n"
         "  }\n"
@@ -973,8 +976,8 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     };
     struct {
         RankOneTensorViewDescriptor values;
-        size_t id;
-    } compute_arguments = {{compute_values, 0, 3, 1}, 1};
+        uint32_t id[3];
+    } compute_arguments = {{compute_values, 0, 3, 1}, {1, 0, 0}};
     VernonCpuInvocation compute_invocation = {&compute_arguments, sizeof(compute_arguments), NULL, 0, NULL};
     ASSERT_TRUE(increment(&compute_invocation) == VERNON_STATUS_OK);
     ASSERT_TRUE(compute_values[0] == 2.0f && compute_values[1] == 5.0f && compute_values[2] == 6.0f);

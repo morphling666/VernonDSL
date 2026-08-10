@@ -684,6 +684,9 @@ PipelineAssets or interactive Pipelines
 - Metal 可在所有 wheel 上离线 Cook MSL；Apple Silicon macOS wheel 还提供
   compute 与离屏 graphics Runtime，但不提供 swapchain presentation；
 - Runtime 当前采用同步 submission，不公开多帧 in-flight；
-- sparse layout、任意动态分配、递归和完整 autodiff 仍不属于当前稳定能力；
+- 自动微分只支持 CPU `dynamic_v2` 的 direct/cooked VJP；GPU/graphics AD
+  与 graph-level pullback 已推迟且不受支持，但非 AD GPU compute/graphics
+  pipeline 不受影响；
+- sparse layout、任意动态分配、递归和更完整的 autodiff 仍不属于当前稳定能力；
 - 合法的 frontend program 仍可能因目标 capability 不足而在 target validation
   阶段被明确拒绝。

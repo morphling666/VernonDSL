@@ -5,11 +5,13 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <thread>
 
 extern "C" VernonStatus vernonRegisterStructuredScalarAutodiffFixture(void);
 extern "C" VernonStatus vernonRegisterStructuredDynamicAutodiffFixture(void);
@@ -57,13 +59,14 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
                (2.0 * epsilon);
     };
     auto runCase = [&](float x, float y, float z) {
-        const uint64_t outputShape[]{1};
-        float outputValue{};
+        constexpr size_t laneCount = 6;
+        const uint64_t outputShape[]{1, 3, 2};
+        float outputValues[laneCount]{};
         VernonAdValue inputValues[] = {
             {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), {}},
             {sizeof(VernonAdValue), {"y", 1}, VERNON_DATA_F32, &y, sizeof(y), {}},
             {sizeof(VernonAdValue), {"z", 1}, VERNON_DATA_F32, &z, sizeof(z), {}},
-            {sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &outputValue, sizeof(outputValue), 1, outputShape},
+            {sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, outputValues, sizeof(outputValues), 3, outputShape},
         };
         VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, 4, {}};
         VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
@@ -71,12 +74,16 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
         ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
             << lastError(context);
         ASSERT_NE(pullback, nullptr);
-        EXPECT_NEAR(outputValue, objective(x, y, z), 2e-5);
+        for (float outputValue : outputValues)
+            EXPECT_NEAR(outputValue, objective(x, y, z), 2e-5);
 
         float seedValue = 1.75f;
-        const uint64_t seedShape[]{1};
+        float seedValues[laneCount * laneCount]{};
+        for (size_t lane = 0; lane < laneCount; ++lane)
+            seedValues[lane * laneCount + lane] = seedValue;
+        const uint64_t seedShape[]{1, 3, 2, 1, 3, 2};
         VernonAdValue seed{
-            sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &seedValue, sizeof(seedValue), 1, seedShape};
+            sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seedValues, sizeof(seedValues), 6, seedShape};
         VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seed, 1, {}};
         float gradientValuesStorage[3]{};
         VernonAdValue gradientValues[] = {
@@ -87,12 +94,64 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
         VernonAdValueSet gradients{sizeof(VernonAdValueSet), gradientValues, 3, {}};
         ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(context);
         for (unsigned index = 0; index < 3; ++index)
-            EXPECT_NEAR(gradientValuesStorage[index], seedValue * finiteDifference(x, y, z, index), 3e-3);
+            EXPECT_NEAR(gradientValuesStorage[index], 6.0 * seedValue * finiteDifference(x, y, z, index), 3e-3);
 
         seedValue = 0.5f;
+        for (size_t lane = 0; lane < laneCount; ++lane)
+            seedValues[lane * laneCount + lane] = seedValue;
         ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(context);
         for (unsigned index = 0; index < 3; ++index)
-            EXPECT_NEAR(gradientValuesStorage[index], seedValue * finiteDifference(x, y, z, index), 3e-3);
+            EXPECT_NEAR(gradientValuesStorage[index], 6.0 * seedValue * finiteDifference(x, y, z, index), 3e-3);
+
+        std::array<VernonStatus, 2> concurrentStatuses{};
+        std::array<std::array<float, 3>, 2> concurrentGradientStorage{};
+        std::array<std::thread, 2> workers;
+        for (size_t worker = 0; worker < workers.size(); ++worker) {
+            workers[worker] = std::thread([&, worker] {
+                const float concurrentSeedValue = static_cast<float>(worker + 1);
+                float concurrentSeedValues[laneCount * laneCount]{};
+                for (size_t lane = 0; lane < laneCount; ++lane)
+                    concurrentSeedValues[lane * laneCount + lane] = concurrentSeedValue;
+                VernonAdValue concurrentSeed{sizeof(VernonAdValue),
+                                             {"output", 6},
+                                             VERNON_DATA_F32,
+                                             concurrentSeedValues,
+                                             sizeof(concurrentSeedValues),
+                                             6,
+                                             seedShape};
+                VernonAdValueSet concurrentSeeds{sizeof(VernonAdValueSet), &concurrentSeed, 1, {}};
+                VernonAdValue concurrentGradientValues[] = {
+                    {sizeof(VernonAdValue),
+                     {"x", 1},
+                     VERNON_DATA_F32,
+                     &concurrentGradientStorage[worker][0],
+                     sizeof(float),
+                     {}},
+                    {sizeof(VernonAdValue),
+                     {"y", 1},
+                     VERNON_DATA_F32,
+                     &concurrentGradientStorage[worker][1],
+                     sizeof(float),
+                     {}},
+                    {sizeof(VernonAdValue),
+                     {"z", 1},
+                     VERNON_DATA_F32,
+                     &concurrentGradientStorage[worker][2],
+                     sizeof(float),
+                     {}},
+                };
+                VernonAdValueSet concurrentGradients{sizeof(VernonAdValueSet), concurrentGradientValues, 3, {}};
+                concurrentStatuses[worker] = vernonPullbackApply(pullback, &concurrentSeeds, &concurrentGradients);
+            });
+        }
+        for (std::thread &worker : workers)
+            worker.join();
+        for (size_t worker = 0; worker < workers.size(); ++worker) {
+            ASSERT_EQ(concurrentStatuses[worker], VERNON_STATUS_OK) << lastError(context);
+            for (unsigned index = 0; index < 3; ++index)
+                EXPECT_NEAR(concurrentGradientStorage[worker][index],
+                            6.0 * static_cast<double>(worker + 1) * finiteDifference(x, y, z, index), 3e-3);
+        }
         vernonPullbackDestroy(pullback);
     };
     runCase(1.2f, 0.7f, 0.2f);
@@ -101,13 +160,14 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
     float x = 1.2f;
     float y = 0.7f;
     float z = 0.2f;
-    float outputValue{};
-    const uint64_t outputShape[]{1};
+    constexpr size_t laneCount = 12;
+    float outputValues[laneCount]{};
+    const uint64_t outputShape[]{1, 3, 4};
     VernonAdValue inputValues[] = {
         {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), 0, nullptr},
         {sizeof(VernonAdValue), {"y", 1}, VERNON_DATA_F32, &y, sizeof(y), 0, nullptr},
         {sizeof(VernonAdValue), {"z", 1}, VERNON_DATA_F32, &z, sizeof(z), 0, nullptr},
-        {sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &outputValue, sizeof(outputValue), 1, outputShape},
+        {sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, outputValues, sizeof(outputValues), 3, outputShape},
     };
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, 4, {0, 0, 0, 0}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {0, 0, 0, 0}};
@@ -115,11 +175,14 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
     ASSERT_EQ(vernonAdPipelineForward(pipeline, {2, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
         << lastError(context);
     ASSERT_NE(pullback, nullptr);
-    EXPECT_NEAR(outputValue, objective(x, y, z), 2e-5);
+    for (float outputValue : outputValues)
+        EXPECT_NEAR(outputValue, objective(x, y, z), 2e-5);
 
-    float seedValues[]{1.0f, 2.0f};
-    const uint64_t invocationShape[]{1, 1, 2, 1};
-    VernonAdValue seed{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seedValues, sizeof(seedValues), 4,
+    float seedValues[laneCount * laneCount]{};
+    for (size_t lane = 0; lane < laneCount; ++lane)
+        seedValues[lane * laneCount + lane] = static_cast<float>(lane + 1);
+    const uint64_t invocationShape[]{1, 3, 4, 1, 3, 4};
+    VernonAdValue seed{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seedValues, sizeof(seedValues), 6,
                        invocationShape};
     VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seed, 1, {0, 0, 0, 0}};
     float gradientStorage[3]{};
@@ -131,7 +194,7 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
     VernonAdValueSet gradients{sizeof(VernonAdValueSet), gradientValues, 3, {0, 0, 0, 0}};
     ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(context);
     for (unsigned index = 0; index < 3; ++index)
-        EXPECT_NEAR(gradientStorage[index], 3.0 * finiteDifference(x, y, z, index), 3e-3);
+        EXPECT_NEAR(gradientStorage[index], 78.0 * finiteDifference(x, y, z, index), 3e-3);
     vernonPullbackDestroy(pullback);
 
     vernonRuntimeLoadedPipelineDestroy(pipeline);
@@ -139,7 +202,7 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
-TEST(RuntimeStructuredScalarAutodiff, CpuRejectsLegacyFixedProtocolAtResolve) {
+TEST(RuntimeStructuredScalarAutodiff, CpuRejectsUnsupportedProtocolAtResolve) {
     ASSERT_EQ(vernonRegisterStructuredScalarAutodiffFixture(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_SCALAR_AUTODIFF_MANIFEST;
     std::ifstream input(manifestPath, std::ios::binary);
@@ -156,10 +219,10 @@ TEST(RuntimeStructuredScalarAutodiff, CpuRejectsLegacyFixedProtocolAtResolve) {
         vernonRuntimeLoadPipelineBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
     ASSERT_TRUE(bundle->autodiff.has_value());
-    bundle->autodiff->protocol = "legacy_fixed";
+    bundle->autodiff->protocol = "unsupported_protocol";
 
     EXPECT_EQ(vernonRuntimeResolvePipeline(bundle, {nullptr, 0}), nullptr);
-    EXPECT_EQ(lastError(context), "CPU autodiff profile uses an unsupported protocol");
+    EXPECT_EQ(lastError(context), "CPU autodiff requires the dynamic_v2 protocol");
 
     vernonRuntimePipelineBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);

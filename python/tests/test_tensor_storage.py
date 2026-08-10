@@ -78,13 +78,13 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         self.assertEqual(interleaved.layout.byte_strides, (16, 4))
         self.assertEqual(interleaved.layout.byte_offset, 4)
 
-    def test_view_validation_rejects_out_of_bounds_and_writable_aliasing(self) -> None:
+    def test_view_validation_rejects_out_of_bounds_and_defers_injectivity(self) -> None:
         storage = vd.TensorStorage.zeros(dtype=vd.i32, shape=(8,))
 
         with self.assertRaisesRegex(ValueError, "outside its owner"):
             storage.view(shape=(4,), strides=(1,), offset=6)
-        with self.assertRaisesRegex(ValueError, "internally injective"):
-            storage.view(shape=(2, 2), strides=(1, 1), access="write")
+        writable_alias = storage.view(shape=(2, 2), strides=(1, 1), access="write")
+        self.assertEqual(writable_alias.layout.element_strides, (1, 1))
 
         overlapping_reader = storage.view(shape=(2, 2), strides=(1, 1), access="read")
         np.testing.assert_array_equal(overlapping_reader.to_numpy(), np.zeros((2, 2), dtype=np.int32))
@@ -113,15 +113,14 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         self.assertFalse(hasattr(vd.Tensor, "zeros"))
         self.assertFalse(value.flags.writeable)
 
-    def test_dispatch_borrows_allow_disjoint_writes_and_reject_aliases(self) -> None:
+    def test_dispatch_borrows_defer_same_dispatch_alias_validation(self) -> None:
         storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(4, 4))
         left = storage.view(shape=(4, 2), strides=(4, 1), offset=0, access="write")
         right = storage.view(shape=(4, 2), strides=(4, 1), offset=2, access="write")
         overlapping = storage.view(shape=(4, 2), strides=(4, 1), offset=1, access="read")
 
         _validate_dispatch_borrows([("left", left, "write"), ("right", right, "write")])
-        with self.assertRaisesRegex(ValueError, "incompatible overlapping borrows"):
-            _validate_dispatch_borrows([("left", left, "write"), ("overlapping", overlapping, "read")])
+        _validate_dispatch_borrows([("left", left, "write"), ("overlapping", overlapping, "read")])
 
     def test_dispatch_access_cannot_exceed_view_capability(self) -> None:
         storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(4,))

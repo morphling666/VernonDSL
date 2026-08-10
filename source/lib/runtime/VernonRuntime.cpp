@@ -397,11 +397,9 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                                 return nullptr;
                             }
                         }
-                    if (entry.contains("serial_dispatch") && !entry["serial_dispatch"].is_boolean()) {
-                        fail(context, "compute serial-dispatch metadata must be Boolean");
+                    if (stage.stage == "compute" &&
+                        !parseDispatchContract(entry, stage.dispatchContract, invocationDiagnostic(*context)))
                         return nullptr;
-                    }
-                    stage.serialDispatch = entry.value("serial_dispatch", false);
                 }
             }
             if (!value.contains("artifact")) {
@@ -656,6 +654,11 @@ VernonLoadedPipeline *vernonRuntimeResolvePipeline(VernonPipelineBundle *bundle,
         auto pipeline = std::make_unique<VernonLoadedPipeline>();
         pipeline->context = bundle->context;
         pipeline->variant = *found;
+        if (!found->compute.empty()) {
+            const Stage &stage = bundle->stages.at(found->compute);
+            pipeline->workgroupSize = {stage.workgroup[0], stage.workgroup[1], stage.workgroup[2]};
+            pipeline->dispatchContract = stage.dispatchContract;
+        }
         if (bundle->autodiff) {
             const auto profiles = std::find_if(bundle->autodiff->variants.begin(), bundle->autodiff->variants.end(),
                                                [&](const AutodiffVariant &candidate) { return candidate.key == key; });
@@ -804,9 +807,15 @@ VernonStatus vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline, const V
         return fail(pipeline ? pipeline->context : nullptr, "invalid pipeline invocation");
     auto encode = [&](const VernonPipelineInvocation &encoded) {
         if (!pipeline->variant.compute.empty()) {
+            const uint32_t grid[3]{encoded.compute_grid.x, encoded.compute_grid.y, encoded.compute_grid.z};
+            const uint32_t workgroup[3]{pipeline->workgroupSize.x, pipeline->workgroupSize.y,
+                                        pipeline->workgroupSize.z};
+            if (!validateDispatchContract(pipeline->dispatchContract, grid, workgroup,
+                                          invocationDiagnostic(*pipeline->context)))
+                return VERNON_STATUS_INVALID_ARGUMENT;
             PlannedComputeLaunch plan;
             std::string planningError;
-            if (!planComputeInvocation(pipeline->variant, encoded, plan, planningError))
+            if (!planComputeInvocation(pipeline->variant, pipeline->workgroupSize, encoded, plan, planningError))
                 return fail(pipeline->context, planningError);
             return invokeBackendComputePipeline(*pipeline, plan);
         }

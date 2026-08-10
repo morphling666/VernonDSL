@@ -538,13 +538,15 @@ interfaces are merged and validated, making the specialized reflection the
 only runtime binding contract.
 
 `PIPELINE_VERSION` covers the invocation carrying index bindings, attachment
-operations, topology, viewport, scissor, compute grid, an optional active
+operations, topology, viewport, scissor, compute workgroup grid, an optional active
 encoder, and reflected argument slots.
 Backend-specific command encoding consumes this common invocation without
 exposing legacy program/draw entry points.
 
 Runtime planning separates the two pipeline kinds before backend dispatch.
-Compute validation, argument packing, and grid inference produce one
+The compute grid stores workgroup counts; total invocation extent is the
+component-wise product of grid and reflected workgroup size. Compute
+validation, argument packing, and grid inference produce one
 `PlannedComputeLaunch`; graphics attachment, resource-pairing, vertex-input,
 and draw-state validation produce one `PlannedGraphicsInvocation`. Backends
 consume the corresponding plan and do not repeat frontend invocation planning.

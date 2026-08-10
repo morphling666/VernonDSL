@@ -43,7 +43,7 @@ bool packTensorViewDescriptor(const VernonTensorView &tensor, std::vector<uint8_
     return true;
 }
 
-bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &arguments,
+bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &arguments, VernonLaunchSize workgroup,
                           const VernonPipelineInvocation &invocation, PlannedComputeLaunch &plan, std::string &error) {
     constexpr size_t kMaxComputeArgumentIndex = 4095;
     size_t computeArgumentSpan = 0;
@@ -144,15 +144,21 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
             const uint32_t rank = argument.tensor.rank;
             const uint32_t gridDimensions = rank < 3 ? rank : 3;
             for (uint32_t dimension = 0; dimension < gridDimensions; ++dimension) {
-                if (argument.tensor.shape[rank - 1 - dimension] > std::numeric_limits<uint32_t>::max())
+                if (!argument.tensor.shape[rank - 1 - dimension] ||
+                    argument.tensor.shape[rank - 1 - dimension] > std::numeric_limits<uint32_t>::max())
                     return fail(error, "inferred compute grid exceeds uint32 range");
             }
+            if (!workgroup.x || !workgroup.y || !workgroup.z)
+                return fail(error, "compute workgroup size is invalid");
+            const auto groups = [](uint64_t extent, uint32_t size) {
+                return static_cast<uint32_t>((extent - 1) / size + 1);
+            };
             plan.grid = {1, 1, 1};
-            plan.grid.x = static_cast<uint32_t>(argument.tensor.shape[rank - 1]);
+            plan.grid.x = groups(argument.tensor.shape[rank - 1], workgroup.x);
             if (rank > 1)
-                plan.grid.y = static_cast<uint32_t>(argument.tensor.shape[rank - 2]);
+                plan.grid.y = groups(argument.tensor.shape[rank - 2], workgroup.y);
             if (rank > 2)
-                plan.grid.z = static_cast<uint32_t>(argument.tensor.shape[rank - 3]);
+                plan.grid.z = groups(argument.tensor.shape[rank - 3], workgroup.z);
             break;
         }
     }
@@ -192,8 +198,8 @@ std::optional<int64_t> computeBindingDescriptorValue(const ComputeLaunchArgument
     return std::nullopt;
 }
 
-bool planComputeInvocation(const Variant &variant, const VernonPipelineInvocation &invocation,
-                           PlannedComputeLaunch &plan, std::string &error) {
+bool planComputeInvocation(const Variant &variant, VernonLaunchSize workgroup,
+                           const VernonPipelineInvocation &invocation, PlannedComputeLaunch &plan, std::string &error) {
     ComputeArgumentMap arguments;
     for (size_t index = 0; index < invocation.argument_count; ++index)
         if (!arguments.emplace(invocation.arguments[index].slot, &invocation.arguments[index]).second)
@@ -201,6 +207,8 @@ bool planComputeInvocation(const Variant &variant, const VernonPipelineInvocatio
     if (arguments.size() != variant.parameters.size())
         return fail(error, "pipeline argument count does not match layout");
 
+    std::vector<const VernonTensorView *> tensors;
+    tensors.reserve(variant.parameters.size());
     for (const Parameter &parameter : variant.parameters) {
         const auto found = arguments.find(parameter.slot);
         if (found == arguments.end())
@@ -219,6 +227,8 @@ bool planComputeInvocation(const Variant &variant, const VernonPipelineInvocatio
             (tensor.storage != VERNON_TENSOR_HOST && tensor.storage != VERNON_TENSOR_RHI_RESOURCE) ||
             !tensorFitsAllocation(tensor))
             return fail(error, "pipeline Tensor argument does not match layout");
+        if (tensor.access != VERNON_ACCESS_READ && !tensorByteLayoutInjective(tensor))
+            return fail(error, "writable pipeline Tensor argument must have an injective byte layout");
         for (const ParameterUse &use : parameter.uses) {
             if (use.stage != "compute" && use.stage != variant.compute)
                 continue;
@@ -250,8 +260,13 @@ bool planComputeInvocation(const Variant &variant, const VernonPipelineInvocatio
         }
         if (tensor.storage == VERNON_TENSOR_HOST && !tensor.host_data)
             return fail(error, "pipeline Tensor argument does not match layout");
+        tensors.push_back(&tensor);
     }
-    return planComputeArguments(variant, arguments, invocation, plan, error);
+    for (size_t left = 0; left < tensors.size(); ++left)
+        for (size_t right = left + 1; right < tensors.size(); ++right)
+            if (tensorViewsHaveWritableOverlap(*tensors[left], *tensors[right]))
+                return fail(error, "pipeline Tensor arguments have incompatible physical overlap");
+    return planComputeArguments(variant, arguments, workgroup, invocation, plan, error);
 }
 
 } // namespace vernon::runtime

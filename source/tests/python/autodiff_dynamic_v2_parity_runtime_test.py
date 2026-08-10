@@ -257,7 +257,7 @@ def main() -> None:
         owner = vd.storage.from_numpy(np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32))
         left = owner.view(shape=(2,), strides=(2,), offset=0, access="read")
         right = owner.view(shape=(2,), strides=(2,), offset=1, access="read")
-        loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        loss = vd.storage.zeros(dtype=vd.f32, shape=(2,))
         if cooked:
             pullback = cooked_pullback(
                 mixed_pipeline,
@@ -275,7 +275,7 @@ def main() -> None:
                 loss,
                 grid=(2, 1, 1),
             )
-        cotangent = np.array([[[[1.0], [3.0]]]], dtype=np.float32)
+        cotangent = np.array([[[[1.0, 0.0], [0.0, 3.0]]]], dtype=np.float32)
         first = pullback(cotangent)
         second = pullback(cotangent)
         if first["left"] is not first["right"] or second["left"] is not second["right"]:
@@ -292,7 +292,7 @@ def main() -> None:
     np.testing.assert_array_equal(cooked_loss, direct_loss)
     np.testing.assert_array_equal(cooked_owner_gradient, np.array([8.0, 0.0, 0.0, 32.0], dtype=np.float32))
     np.testing.assert_array_equal(cooked_scale_gradient, np.float32(4.0))
-    np.testing.assert_array_equal(cooked_loss, np.array([18.0], dtype=np.float32))
+    np.testing.assert_array_equal(cooked_loss, np.array([18.0, 18.0], dtype=np.float32))
 
     partial_pipeline = vd.load_cooked_vjp_asset(partial_manifest)
     for outer, inner in ((3, 5), (7, 9)):

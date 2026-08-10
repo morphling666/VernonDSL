@@ -2,6 +2,7 @@
 #define VERNON_C_COMPILER_H
 
 #include "VernonCommon.h"
+#include "VernonCpuWorkgroupABI.h"
 
 #if defined(_WIN32) && defined(VERNON_DSL_COMPILER_BUILD)
 #define VERNON_DSL_CAPI __declspec(dllexport)
@@ -17,6 +18,17 @@ extern "C" {
 
 typedef struct VernonCompilerContext VernonCompilerContext;
 typedef struct VernonCompileResult VernonCompileResult;
+
+typedef struct VernonCpuRuntimeHelpersV1 {
+    size_t struct_size;
+    uint64_t (*workgroup_address)(uint64_t, uint64_t, uint64_t, uint64_t);
+    uint64_t (*lane_address)(uint64_t, uint64_t, uint64_t, uint64_t);
+    void (*workgroup_barrier)(uint64_t);
+    bool (*workgroup_is_leader)(void);
+} VernonCpuRuntimeHelpersV1;
+
+VERNON_DSL_CAPI VernonStatus vernonCompilerRegisterCpuRuntimeHelpersV1(VernonCompilerContext *context,
+                                                                       const VernonCpuRuntimeHelpersV1 *helpers);
 
 typedef enum VernonTarget {
     VERNON_TARGET_CPU = 0,

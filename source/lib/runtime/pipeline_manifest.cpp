@@ -1430,8 +1430,7 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
         return true;
     const nlohmann::json &autodiff = root["autodiff"];
     if (!autodiff.is_object() || !hasOnlyKeys(autodiff, {"kind", "protocol", "wrt", "output_cotangents", "variants"}) ||
-        autodiff.value("kind", "") != "vjp" ||
-        (autodiff.value("protocol", "") != "dynamic_v2" && autodiff.value("protocol", "") != "legacy_fixed") ||
+        autodiff.value("kind", "") != "vjp" || autodiff.value("protocol", "") != "dynamic_v2" ||
         !autodiff.contains("wrt") || !autodiff["wrt"].is_array() || !autodiff.contains("output_cotangents") ||
         !autodiff["output_cotangents"].is_array() || !autodiff.contains("variants") ||
         !autodiff["variants"].is_array()) {

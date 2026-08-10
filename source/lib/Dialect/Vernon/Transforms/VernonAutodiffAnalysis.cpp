@@ -3,6 +3,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffRules.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonGlobalIdIndexProof.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/STLExtras.h"
@@ -20,6 +21,62 @@ FailureOr<unsigned> checkedUnsigned(size_t value) {
     if (value >= kInvalidNode)
         return failure();
     return static_cast<unsigned>(value);
+}
+
+ValueRange storageIndices(Operation *operation) {
+    if (auto load = dyn_cast<LoadOp>(operation))
+        return load.getIndices();
+    if (auto store = dyn_cast<StoreOp>(operation))
+        return store.getIndices();
+    if (auto reduce = dyn_cast<ReduceSumOp>(operation))
+        return reduce.getIndices();
+    if (auto scatter = dyn_cast<ScatterAddOp>(operation))
+        return scatter.getIndices();
+    if (auto atomic = dyn_cast<AtomicOp>(operation))
+        return atomic.getIndices();
+    return {};
+}
+
+bool hasActiveStorageEffect(const VernonAutodiffAnalysisResult &result, const AutodiffStorageEffect &effect) {
+    const AutodiffStorageIdentity &identity = result.getStorageIdentities()[effect.identity];
+    const ValueAbiLayout *layout = result.getValueAbi(identity.binding);
+    if (!layout)
+        return false;
+    return llvm::any_of(llvm::seq<unsigned>(0, layout->leaves.size()), [&](unsigned leafIndex) {
+        return result.isActiveStorageVersion(effect.versionBefore, leafIndex) ||
+               (effect.versionAfter && result.isActiveStorageVersion(*effect.versionAfter, leafIndex));
+    });
+}
+
+bool needsInternalStorageAdjoint(const VernonAutodiffAnalysisResult &result, const AutodiffStorageIdentity &identity) {
+    bool hasActiveLoad = false;
+    bool hasActiveStore = false;
+    for (const AutodiffStorageEffect &effect : result.getStorageEffects()) {
+        if (effect.identity != identity.id || !hasActiveStorageEffect(result, effect))
+            continue;
+        hasActiveLoad |= isa<LoadOp>(effect.operation);
+        if (auto atomic = dyn_cast<AtomicOp>(effect.operation))
+            hasActiveLoad |= result.isActive(atomic.getResult(), 0);
+        hasActiveStore |= isa<StoreOp, ReduceSumOp, ScatterAddOp, AtomicOp>(effect.operation);
+    }
+    return hasActiveLoad && hasActiveStore;
+}
+
+LogicalResult verifyLaneOwnedDeviceAdjoint(const VernonAutodiffAnalysisResult &result,
+                                           const AutodiffStorageIdentity &identity) {
+    std::optional<GlobalIdAffineIndexTuple> ownedTuple;
+    for (const AutodiffStorageEffect &effect : result.getStorageEffects()) {
+        if (effect.identity != identity.id || !hasActiveStorageEffect(result, effect))
+            continue;
+        ValueRange indices = storageIndices(effect.operation);
+        std::optional<ConditionalIndexProof> proof = proveInvocationOwnedIndex(indices);
+        if (!proof || (ownedTuple && *ownedTuple != proof->normalizedIndices))
+            return failure();
+        ownedTuple = std::move(proof->normalizedIndices);
+    }
+    if (!ownedTuple)
+        return failure();
+    return success();
 }
 
 bool samePathComponent(const ValueAbiPathComponent &left, const ValueAbiPathComponent &right) {
@@ -254,6 +311,7 @@ private:
     void addStorageLoadDependencies(LoadOp load, unsigned version);
     LogicalResult bindStorageRoots(const DenseMap<unsigned, unsigned> &finalVersions);
     void computeActivity();
+    LogicalResult classifyStorageOwnership();
     LogicalResult discoverRegions();
     LogicalResult collectOperations();
     bool anyActiveLeaf(Value value) const;
@@ -450,7 +508,7 @@ void AutodiffAnalysisBuilder::addCreateDependencies(Value resultValue, ValueRang
 }
 
 void AutodiffAnalysisBuilder::buildDependencies(Operation *operation) {
-    if (isa<LoadOp, StoreOp>(operation))
+    if (isa<LoadOp, StoreOp, ReduceSumOp, ScatterAddOp, AtomicOp>(operation))
         return;
     if (auto ifOp = dyn_cast<scf::IfOp>(operation)) {
         for (auto [resultIndex, value] : llvm::enumerate(ifOp.getResults())) {
@@ -623,6 +681,55 @@ LogicalResult AutodiffAnalysisBuilder::buildStructuredDependencies(Region &regio
             versions[identity->second] = *after;
             continue;
         }
+        if (isa<ReduceSumOp, ScatterAddOp, AtomicOp>(operation)) {
+            Value storage;
+            Value contribution;
+            bool supportedAdd = true;
+            if (auto reduce = dyn_cast<ReduceSumOp>(operation)) {
+                storage = reduce.getStorage();
+                contribution = reduce.getValue();
+            } else if (auto scatter = dyn_cast<ScatterAddOp>(operation)) {
+                storage = scatter.getStorage();
+                contribution = scatter.getValue();
+            } else {
+                auto atomic = cast<AtomicOp>(operation);
+                storage = atomic.getStorage();
+                contribution = atomic.getValue();
+                supportedAdd = atomic.getAtomicKind() == "add" &&
+                               isa<FloatType>(cast<TensorViewType>(storage.getType()).getElementType());
+            }
+            auto identity = result.storageIdentityIndices.find(storage);
+            if (identity == result.storageIdentityIndices.end() || !versions.contains(identity->second))
+                return operation.emitError("autodiff additive Storage effect has no identity");
+            const unsigned before = versions[identity->second];
+            FailureOr<unsigned> after =
+                createStorageVersion(identity->second, StorageVersionKind::AdditiveWrite, &operation, {before},
+                                     supportedAdd ? contribution : Value{});
+            if (failed(after))
+                return operation.emitError("cannot create autodiff additive Storage version");
+            FailureOr<unsigned> effectId = checkedUnsigned(result.storageEffects.size());
+            if (failed(effectId))
+                return operation.emitError("autodiff Storage effect count exceeds the analysis representation");
+            result.storageEffects.push_back(
+                AutodiffStorageEffect{*effectId, identity->second, &operation, before, *after});
+            result.storageEffectIndices.try_emplace(&operation, *effectId);
+            versions[identity->second] = *after;
+
+            if (auto atomic = dyn_cast<AtomicOp>(operation)) {
+                FailureOr<unsigned> resultIndex = addValue(atomic.getResult());
+                if (failed(resultIndex))
+                    return atomic.emitError("cannot resolve atomic old-value result ABI");
+                for (auto [leafIndex, leaf] : llvm::enumerate(values[*resultIndex].layout.leaves)) {
+                    if (!isDifferentiable(leaf))
+                        continue;
+                    std::optional<unsigned> resultNode = getNode(atomic.getResult(), leafIndex);
+                    unsigned versionNode = result.storageVersionNodes[before][leafIndex];
+                    if (resultNode && versionNode != kInvalidNode)
+                        addDependency(*resultNode, versionNode);
+                }
+            }
+            continue;
+        }
         if (auto ifOp = dyn_cast<scf::IfOp>(operation)) {
             buildDependencies(ifOp);
             DenseMap<unsigned, unsigned> thenVersions = versions;
@@ -704,6 +811,25 @@ LogicalResult AutodiffAnalysisBuilder::initializeStorageGraph() {
             return emitFunctionError("cannot create Storage entry version");
         versions[*identityId] = *entry;
     }
+    WalkResult allocationResult = function.walk([&](WorkgroupAllocOp allocation) {
+        Value binding = allocation.getResult();
+        FailureOr<unsigned> valueIndex = addValue(binding);
+        if (failed(valueIndex))
+            return allocation.emitError("cannot resolve workgroup Storage ABI"), WalkResult::interrupt();
+        FailureOr<unsigned> identityId = checkedUnsigned(result.storageIdentities.size());
+        if (failed(identityId))
+            return allocation.emitError("Storage identity count exceeds the analysis representation"),
+                   WalkResult::interrupt();
+        result.storageIdentities.push_back(AutodiffStorageIdentity{*identityId, binding});
+        result.storageIdentityIndices.try_emplace(binding, *identityId);
+        FailureOr<unsigned> entry = createStorageVersion(*identityId, StorageVersionKind::Entry, nullptr, {});
+        if (failed(entry))
+            return allocation.emitError("cannot create workgroup Storage entry version"), WalkResult::interrupt();
+        versions[*identityId] = *entry;
+        return WalkResult::advance();
+    });
+    if (allocationResult.wasInterrupted())
+        return failure();
     if (failed(buildStructuredDependencies(function.getBody(), versions)))
         return failure();
     return bindStorageRoots(versions);
@@ -1053,6 +1179,59 @@ void AutodiffAnalysisBuilder::computeActivity() {
     }
 }
 
+LogicalResult AutodiffAnalysisBuilder::classifyStorageOwnership() {
+    for (AutodiffStorageIdentity &identity : result.storageIdentities) {
+        identity.externalGradientDestination =
+            llvm::any_of(result.wrtLeaves, [&](const AutodiffLeaf &leaf) { return leaf.value == identity.binding; });
+        auto view = dyn_cast<TensorViewType>(identity.binding.getType());
+        if (!view)
+            return emitFunctionError("Storage identity has no TensorView type");
+        if (identity.externalGradientDestination) {
+            bool hasActiveLoad = false;
+            bool invocationOwned = true;
+            for (const AutodiffStorageEffect &effect : result.storageEffects) {
+                if (effect.identity != identity.id || !isa<LoadOp>(effect.operation) ||
+                    !hasActiveStorageEffect(result, effect))
+                    continue;
+                hasActiveLoad = true;
+                invocationOwned &= static_cast<bool>(proveInvocationOwnedIndex(storageIndices(effect.operation)));
+            }
+            const ValueAbiLayout *layout = result.getValueAbi(identity.binding);
+            const bool hasAggregateLeaf =
+                layout && llvm::any_of(layout->leaves, [](const ValueAbiLeaf &leaf) { return !leaf.shape.empty(); });
+            if (hasActiveLoad)
+                identity.externalGradientOwnership =
+                    view.getAddressSpace() == "workgroup" ? AutodiffExternalGradientOwnership::WorkgroupShared
+                    : hasAggregateLeaf || invocationOwned ? AutodiffExternalGradientOwnership::InvocationPrivate
+                                                          : AutodiffExternalGradientOwnership::AtomicShared;
+        }
+        for (const AutodiffStorageEffect &effect : result.storageEffects) {
+            if (effect.identity != identity.id)
+                continue;
+            auto atomic = dyn_cast<AtomicOp>(effect.operation);
+            if (!atomic || !result.isActive(atomic.getResult(), 0))
+                continue;
+            if (view.getAddressSpace() != "device" || !proveInvocationOwnedIndex(atomic.getIndices()))
+                return atomic.emitError(
+                    "active atomic old-value result requires a proven lane-exclusive device index mapping");
+        }
+        if (view.getAccess() == "read")
+            continue;
+        if (!needsInternalStorageAdjoint(result, identity))
+            continue;
+
+        if (view.getAddressSpace() == "workgroup") {
+            identity.internalAdjointOwnership = AutodiffInternalAdjointOwnership::WorkgroupCoupled;
+            continue;
+        }
+        if (view.getAddressSpace() != "device" || failed(verifyLaneOwnedDeviceAdjoint(result, identity)))
+            return emitFunctionError(
+                "device Storage requiring an internal adjoint has no proven lane-owned injective index mapping");
+        identity.internalAdjointOwnership = AutodiffInternalAdjointOwnership::LanePrivate;
+    }
+    return success();
+}
+
 bool AutodiffAnalysisBuilder::anyActiveLeaf(Value value) const {
     auto found = valueIndices.find(value);
     if (found == valueIndices.end())
@@ -1144,6 +1323,23 @@ LogicalResult AutodiffAnalysisBuilder::collectOperations() {
             status = failure();
             return WalkResult::interrupt();
         }
+        if (operationActive) {
+            if (auto atomic = dyn_cast<AtomicOp>(operation)) {
+                auto view = cast<TensorViewType>(atomic.getStorage().getType());
+                if (atomic.getAtomicKind() != "add" || !isa<FloatType>(view.getElementType())) {
+                    atomic.emitError("autodiff supports only floating-point additive atomics");
+                    status = failure();
+                    return WalkResult::interrupt();
+                }
+                if (result.isActive(atomic.getResult(), 0) &&
+                    (view.getAddressSpace() != "device" || !proveInvocationOwnedIndex(atomic.getIndices()))) {
+                    atomic.emitError(
+                        "active atomic old-value result requires a proven lane-exclusive device index mapping");
+                    status = failure();
+                    return WalkResult::interrupt();
+                }
+            }
+        }
         return WalkResult::advance();
     });
     return status;
@@ -1159,6 +1355,8 @@ FailureOr<VernonAutodiffAnalysisResult> AutodiffAnalysisBuilder::run() {
     if (failed(initializeStorageGraph()) || failed(dependencyStatus))
         return failure();
     computeActivity();
+    if (failed(classifyStorageOwnership()))
+        return failure();
     if (failed(discoverRegions()))
         return failure();
     if (failed(collectOperations()))
@@ -1233,18 +1431,13 @@ AutodiffEffectKind classifyAutodiffEffect(Operation *operation) {
         return AutodiffEffectKind::StorageRead;
     if (isa<StoreOp, PhysicalStoreOp>(operation))
         return AutodiffEffectKind::StorageWrite;
-    if (auto atomic = dyn_cast<AtomicOp>(operation))
-        return atomic.getStorage().getType().getAddressSpace() == "device" ? AutodiffEffectKind::ExternallyVisible
-                                                                           : AutodiffEffectKind::Atomic;
+    if (isa<AtomicOp>(operation))
+        return AutodiffEffectKind::Atomic;
     if (auto atomic = dyn_cast<PhysicalAtomicOp>(operation))
         return atomic.getStorage().getType().getAddressSpace() == "device" ? AutodiffEffectKind::ExternallyVisible
                                                                            : AutodiffEffectKind::Atomic;
-    if (auto reduce = dyn_cast<ReduceSumOp>(operation))
-        return reduce.getStorage().getType().getAddressSpace() == "device" ? AutodiffEffectKind::ExternallyVisible
-                                                                           : AutodiffEffectKind::StorageWrite;
-    if (auto scatter = dyn_cast<ScatterAddOp>(operation))
-        return scatter.getStorage().getType().getAddressSpace() == "device" ? AutodiffEffectKind::ExternallyVisible
-                                                                            : AutodiffEffectKind::StorageWrite;
+    if (isa<ReduceSumOp, ScatterAddOp>(operation))
+        return AutodiffEffectKind::StorageWrite;
     if (isa<WorkgroupAllocOp>(operation))
         return AutodiffEffectKind::StorageWrite;
     if (auto barrier = dyn_cast<BarrierOp>(operation))

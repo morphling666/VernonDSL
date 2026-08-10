@@ -21,6 +21,7 @@ VERNON_RUNTIME_CAPI VernonLoadedPipeline *loadBackendCpuAutodiffPipeline(
     const AutodiffDerivativeGroupView *derivativeGroups, size_t derivativeGroupCount);
 
 VERNON_RUNTIME_CAPI bool hasAutodiffStorageObjectives(const VernonLoadedPipeline *pipeline);
+VERNON_RUNTIME_CAPI VernonLaunchSize autodiffWorkgroupSize(const VernonLoadedPipeline *pipeline);
 
 } // namespace vernon::runtime
 

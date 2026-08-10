@@ -12,6 +12,11 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef VERNON_HOST_TAPE_INSTRUMENTATION
+#include "VernonCommon.h"
+#include <functional>
+#endif
+
 namespace vernon::runtime::ad {
 
 inline constexpr size_t kDefaultHostTapeInvocationLimit = 64u * 1024u * 1024u;
@@ -40,7 +45,13 @@ public:
 private:
     HostTapeTraversalMetrics *previous_{};
 };
+
+HostTapeTraversalMetrics *currentHostTapeTraversalMetrics();
+VernonStatus withHostTapeTraversalMetrics(HostTapeTraversalMetrics *destination,
+                                          const std::function<VernonStatus()> &callback);
 #endif
+
+class HostTapeDispatchBudget;
 
 class HostTapeMemoryPolicy {
 public:
@@ -49,10 +60,12 @@ public:
         : invocationLimit_(invocationLimit), contextLimit_(contextLimit) {}
 
     size_t invocationLimit() const { return invocationLimit_; }
+    size_t contextLimit() const { return contextLimit_; }
 
 private:
     friend class HostDynamicTape;
     friend class HostTapeSnapshot;
+    friend class HostTapeDispatchBudget;
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION
     friend size_t hostTapeMemoryPolicyChargedBytesForTesting(HostTapeMemoryPolicy &policy);
 #endif
@@ -60,10 +73,38 @@ private:
     bool reserve(size_t currentInvocationBytes, size_t additionalBytes);
     void release(size_t bytes);
 
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     size_t invocationLimit_;
     size_t contextLimit_;
     size_t contextBytes_{};
+};
+
+class HostTapeDispatchBudget {
+public:
+    static std::shared_ptr<HostTapeDispatchBudget> reserve(std::shared_ptr<HostTapeMemoryPolicy> policy,
+                                                           size_t capacity);
+    ~HostTapeDispatchBudget();
+
+    size_t capacity() const { return capacity_; }
+    size_t usedBytes() const;
+    void commit();
+
+private:
+    HostTapeDispatchBudget(std::shared_ptr<HostTapeMemoryPolicy> policy, size_t capacity)
+        : policy_(std::move(policy)), capacity_(capacity) {}
+
+    friend class HostDynamicTape;
+    friend class HostTapeSnapshot;
+
+    bool reserveBytes(size_t additionalBytes);
+    void releaseBytes(size_t bytes);
+
+    std::shared_ptr<HostTapeMemoryPolicy> policy_;
+    mutable std::mutex mutex_;
+    size_t capacity_{};
+    size_t usedBytes_{};
+    size_t policyCharge_{};
+    bool committed_{};
 };
 
 class HostTapeSnapshot {
@@ -117,6 +158,7 @@ private:
     std::vector<Record> records_;
     std::unordered_map<VernonAdRegionHandle, size_t> regionIndex_;
     std::shared_ptr<HostTapeMemoryPolicy> policy_;
+    std::shared_ptr<HostTapeDispatchBudget> dispatchBudget_;
     size_t policyCharge_{};
     mutable VernonAdTapeAllocator descriptor_{};
 };
@@ -124,7 +166,8 @@ private:
 class HostDynamicTape {
 public:
     explicit HostDynamicTape(size_t capacityBytes = std::numeric_limits<size_t>::max(),
-                             std::shared_ptr<HostTapeMemoryPolicy> policy = std::make_shared<HostTapeMemoryPolicy>());
+                             std::shared_ptr<HostTapeMemoryPolicy> policy = std::make_shared<HostTapeMemoryPolicy>(),
+                             std::shared_ptr<HostTapeDispatchBudget> dispatchBudget = {});
     ~HostDynamicTape();
 
     HostDynamicTape(const HostDynamicTape &) = delete;
@@ -187,6 +230,7 @@ private:
     std::unordered_map<VernonAdRecordHandle, size_t> recordIndex_;
     std::vector<size_t> openRegions_;
     std::shared_ptr<HostTapeMemoryPolicy> policy_;
+    std::shared_ptr<HostTapeDispatchBudget> dispatchBudget_;
     std::thread::id ownerThread_;
     VernonAdRegionHandle nextRegionHandle_{1};
     VernonAdRecordHandle nextRecordHandle_{1};

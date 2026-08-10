@@ -16,11 +16,11 @@
 namespace mlir::vernon {
 namespace {
 
-struct LowerSynchronizationPass final : PassWrapper<LowerSynchronizationPass, OperationPass<>> {
-    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerSynchronizationPass)
+struct LowerGpuSynchronizationPass final : PassWrapper<LowerGpuSynchronizationPass, OperationPass<>> {
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerGpuSynchronizationPass)
 
-    LowerSynchronizationPass() = default;
-    LowerSynchronizationPass(bool gpu, bool spirv) : gpuTarget(gpu), spirvTarget(spirv) {}
+    LowerGpuSynchronizationPass() = default;
+    explicit LowerGpuSynchronizationPass(bool spirv) : spirvTarget(spirv) {}
 
     void getDependentDialects(DialectRegistry &registry) const override {
         registry.insert<gpu::GPUDialect, memref::MemRefDialect, spirv::SPIRVDialect>();
@@ -72,7 +72,7 @@ struct LowerSynchronizationPass final : PassWrapper<LowerSynchronizationPass, Op
             Attribute memorySpace;
             if (spirvTarget)
                 memorySpace = spirv::StorageClassAttr::get(root->getContext(), spirv::StorageClass::Workgroup);
-            else if (gpuTarget)
+            else
                 memorySpace = gpu::AddressSpaceAttr::get(root->getContext(), gpu::AddressSpace::Workgroup);
             int64_t elementCount = 1;
             for (int64_t extent : type.getShape())
@@ -83,7 +83,7 @@ struct LowerSynchronizationPass final : PassWrapper<LowerSynchronizationPass, Op
             if (spirvTarget) {
                 rewriter.setInsertionPoint(op);
                 replacement = memref::AllocOp::create(rewriter, op.getLoc(), memref);
-            } else if (gpuTarget) {
+            } else {
                 gpu::GPUFuncOp function = op->getParentOfType<gpu::GPUFuncOp>();
                 if (!function) {
                     op.emitError("workgroup allocation must be inside a GPU function");
@@ -97,9 +97,6 @@ struct LowerSynchronizationPass final : PassWrapper<LowerSynchronizationPass, Op
                 // at only scalar alignment on NVPTX.
                 function.setWorkgroupAttributionAttr(attributionIndex, LLVM::LLVMDialect::getAlignAttrName(),
                                                      rewriter.getI64IntegerAttr(16));
-            } else {
-                rewriter.setInsertionPoint(op);
-                replacement = memref::AllocaOp::create(rewriter, op.getLoc(), memref);
             }
             loweredStorage.insert({op.getResult(), replacement});
         }
@@ -146,9 +143,7 @@ struct LowerSynchronizationPass final : PassWrapper<LowerSynchronizationPass, Op
             rewriter.eraseOp(op);
         for (BarrierOp op : barriers) {
             rewriter.setInsertionPoint(op);
-            if (!gpuTarget) {
-                rewriter.eraseOp(op);
-            } else if (spirvTarget && op.getScope() == "device") {
+            if (spirvTarget && op.getScope() == "device") {
                 auto scope = spirv::ScopeAttr::get(root->getContext(), spirv::Scope::Device);
                 auto semantics = spirv::MemorySemanticsAttr::get(
                     root->getContext(), spirv::MemorySemantics::UniformMemory | spirv::MemorySemantics::AcquireRelease);
@@ -160,14 +155,13 @@ struct LowerSynchronizationPass final : PassWrapper<LowerSynchronizationPass, Op
         }
     }
 
-    bool gpuTarget{};
     bool spirvTarget{};
 };
 
 } // namespace
 
-std::unique_ptr<Pass> createVernonLowerSynchronizationPass(bool gpu, bool spirv) {
-    return std::make_unique<LowerSynchronizationPass>(gpu, spirv);
+std::unique_ptr<Pass> createVernonLowerGPUSynchronizationPass(bool spirv) {
+    return std::make_unique<LowerGpuSynchronizationPass>(spirv);
 }
 
 } // namespace mlir::vernon

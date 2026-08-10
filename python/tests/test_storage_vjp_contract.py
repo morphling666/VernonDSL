@@ -92,7 +92,6 @@ def objective(
 """,
             transform=transform,
         )
-        self.assertIsNone(result.program_graph)
         self.assertIsNone(result.autodiff_profiles)
         structured = build_structured_vjp(_native, result, transform)
         backward = structured.profiles["backward"]
@@ -234,7 +233,9 @@ def objective(
         with self.assertRaisesRegex(ValueError, "non-differentiable"):
             gradient["tag"]
 
-    def test_tensor_of_products_projects_and_unpacks_structural_tangent_leaves(self) -> None:
+    def test_tensor_of_products_projects_and_unpacks_structural_tangent_leaves(
+        self,
+    ) -> None:
         top_level = tangent_layout(vd.Tensor[TensorProductLeaf, (2,)])
         self.assertEqual(top_level.project("0.value").dtype, np.dtype(np.float32))
         self.assertEqual(top_level.project("1.value").dtype, np.dtype(np.float32))
@@ -271,7 +272,9 @@ def objective(
         )
         np.testing.assert_array_equal(gradient["mass"].to_numpy(), np.array([24.0], dtype=np.float32))
 
-    def test_aggregate_output_cotangent_gathers_through_its_view_descriptor(self) -> None:
+    def test_aggregate_output_cotangent_gathers_through_its_view_descriptor(
+        self,
+    ) -> None:
         vd.init(arch=vd.cpu)
         particles = vd.storage.zeros(dtype=Particle, shape=(2,))
         values = particles.to_numpy()
@@ -293,7 +296,9 @@ def objective(
         )
         np.testing.assert_array_equal(gradient["mass"].to_numpy(), np.array([56.0, 30.0], dtype=np.float32))
 
-    def test_multiple_aggregate_output_cotangents_are_grouped_independently(self) -> None:
+    def test_multiple_aggregate_output_cotangents_are_grouped_independently(
+        self,
+    ) -> None:
         vd.init(arch=vd.cpu)
         particles = vd.storage.zeros(dtype=Particle, shape=(1,))
         values = particles.to_numpy()
@@ -318,7 +323,7 @@ def objective(
         )
         np.testing.assert_array_equal(gradient["mass"].to_numpy(), np.array([45.0], dtype=np.float32))
 
-    def test_aggregate_cotangent_preserves_invocation_carrier_axes(self) -> None:
+    def test_constant_aggregate_store_rejects_multi_invocation_grid(self) -> None:
         vd.init(arch=vd.cpu)
         particles = vd.storage.zeros(dtype=Particle, shape=(1,))
         values = particles.to_numpy()
@@ -326,18 +331,8 @@ def objective(
         values["mass"][0] = np.float32(4.0)
         particles.copy_from_numpy(values)
         output = vd.storage.zeros(dtype=Particle, shape=(1,))
-        _, pullback = aggregate_output_objective_vjp(particles, output, grid=(2, 1, 1))
-
-        cotangent = vd.storage.tangent_zeros(dtype=Particle, shape=(1, 1, 2, 1))
-        cotangent["velocity"].copy_from_numpy(np.array([[[[[1.0, 2.0]], [[4.0, 5.0]]]]], dtype=np.float32))
-        cotangent["mass"].copy_from_numpy(np.array([[[[3.0], [7.0]]]], dtype=np.float32))
-        gradient = pullback(cotangent)["particles"]
-
-        np.testing.assert_array_equal(
-            gradient["velocity"].to_numpy(),
-            np.array([[5.0, 7.0]], dtype=np.float32),
-        )
-        np.testing.assert_array_equal(gradient["mass"].to_numpy(), np.array([80.0], dtype=np.float32))
+        with self.assertRaisesRegex(RuntimeError, "dispatch grid axis 0 must equal 1"):
+            aggregate_output_objective_vjp(particles, output, grid=(2, 1, 1))
 
     def test_nested_input_and_output_route_every_tangent_leaf(self) -> None:
         vd.init(arch=vd.cpu)
@@ -394,7 +389,9 @@ def objective(
         with self.assertRaisesRegex(ValueError, "non-differentiable"):
             gradient["pair.1"]
 
-    def test_nested_inputs_sharing_one_storage_accumulate_into_one_tangent_owner(self) -> None:
+    def test_nested_inputs_sharing_one_storage_accumulate_into_one_tangent_owner(
+        self,
+    ) -> None:
         vd.init(arch=vd.cpu)
         source = vd.storage.zeros(dtype=NestedRecord, shape=(2,))
         values = source.to_numpy()
@@ -465,8 +462,14 @@ def objective(
         vd.init(arch=vd.cpu)
         runtime_autodiff.clear_vjp_cache()
         for values_array, expected_gradient in (
-            (np.array([3.0, 4.0], dtype=np.float32), np.array([6.0, 1.0], dtype=np.float32)),
-            (np.array([5.0, 6.0, 7.0], dtype=np.float32), np.array([10.0, 1.0, 0.0], dtype=np.float32)),
+            (
+                np.array([3.0, 4.0], dtype=np.float32),
+                np.array([6.0, 1.0], dtype=np.float32),
+            ),
+            (
+                np.array([5.0, 6.0, 7.0], dtype=np.float32),
+                np.array([10.0, 1.0, 0.0], dtype=np.float32),
+            ),
         ):
             values = vd.storage.from_numpy(values_array)
             loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
@@ -522,7 +525,7 @@ def objective(
         owner = vd.storage.from_numpy(np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32))
         values = owner.view(shape=(2,), strides=(2,), offset=1, access="read")
         loss_owner = vd.storage.zeros(dtype=vd.f32, shape=(3,))
-        loss = loss_owner.view(shape=(1,), strides=(1,), offset=1, access="write")
+        loss = loss_owner.view(shape=(1,), strides=(1,), offset=1, access="read_write")
         output, pullback = storage_objective_vjp(values, loss, grid=(1, 1, 1))
         self.assertIsNone(output)
         np.testing.assert_array_equal(loss_owner.to_numpy(), np.array([0.0, 8.0, 0.0], dtype=np.float32))
@@ -553,7 +556,7 @@ def objective(
         vd.init(arch=vd.cpu)
         owner = vd.storage.from_numpy(np.array([1.0, 2.0, 0.0], dtype=np.float32))
         values = owner.view(shape=(2,), strides=(1,), offset=0, access="read")
-        loss = owner.view(shape=(1,), strides=(1,), offset=1, access="write")
+        loss = owner.view(shape=(1,), strides=(1,), offset=1, access="read_write")
         with self.assertRaisesRegex(ValueError, "overlap"):
             storage_objective_vjp(values, loss, grid=(1, 1, 1))
 
@@ -570,8 +573,8 @@ def objective(
     def test_direct_storage_objective_reverses_scratch_write(self) -> None:
         vd.init(arch=vd.cpu)
         values = vd.storage.from_numpy(np.array([3.0], dtype=np.float32))
-        scratch = vd.storage.zeros(dtype=vd.f32, shape=(1,))
-        loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        scratch = vd.storage.zeros(dtype=vd.f32, shape=(1, 1, 1))
+        loss = vd.storage.zeros(dtype=vd.f32, shape=(1, 1, 1))
         _, pullback = scratch_objective_vjp(values, scratch, loss, grid=(1, 1, 1))
         np.testing.assert_array_equal(
             pullback(None)["values"].to_numpy(),
@@ -581,8 +584,8 @@ def objective(
     def test_overwrite_clears_the_replaced_storage_adjoint(self) -> None:
         vd.init(arch=vd.cpu)
         values = vd.storage.from_numpy(np.array([3.0], dtype=np.float32))
-        scratch = vd.storage.zeros(dtype=vd.f32, shape=(1,))
-        loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        scratch = vd.storage.zeros(dtype=vd.f32, shape=(1, 1, 1))
+        loss = vd.storage.zeros(dtype=vd.f32, shape=(1, 1, 1))
         _, pullback = overwrite_objective_vjp(values, scratch, loss, grid=(1, 1, 1))
         np.testing.assert_array_equal(
             pullback(None)["values"].to_numpy(),
@@ -592,8 +595,8 @@ def objective(
     def test_descriptor_scatter_supports_vector_storage_elements(self) -> None:
         vd.init(arch=vd.cpu)
         values = vd.storage.from_numpy(np.array([3.0], dtype=np.float32))
-        scratch = vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(1,))
-        loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        scratch = vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(1, 1, 1))
+        loss = vd.storage.zeros(dtype=vd.f32, shape=(1, 1, 1))
         _, pullback = vector_scratch_objective_vjp(values, scratch, loss, grid=(1, 1, 1))
         np.testing.assert_array_equal(
             pullback(None)["values"].to_numpy(),
@@ -603,8 +606,8 @@ def objective(
     def test_descriptor_scatter_reverses_loop_scratch_writes(self) -> None:
         vd.init(arch=vd.cpu)
         values = vd.storage.from_numpy(np.array([3.0, 4.0], dtype=np.float32))
-        scratch = vd.storage.zeros(dtype=vd.f32, shape=(2,))
-        output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        scratch = vd.storage.zeros(dtype=vd.f32, shape=(1, 1, 1, 2))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(1, 1, 1))
         _, pullback = loop_scratch_objective_vjp(values, scratch, output, grid=(1, 1, 1))
         np.testing.assert_array_equal(
             pullback(None)["values"].to_numpy(),
@@ -615,8 +618,8 @@ def objective(
         vd.init(arch=vd.cpu)
         for primal, expected in ((3.0, 24.0), (-3.0, -54.0)):
             values = vd.storage.from_numpy(np.array([primal], dtype=np.float32))
-            scratch = vd.storage.zeros(dtype=vd.f32, shape=(1,))
-            output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+            scratch = vd.storage.zeros(dtype=vd.f32, shape=(1, 1, 1))
+            output = vd.storage.zeros(dtype=vd.f32, shape=(1, 1, 1))
             _, pullback = branch_scratch_objective_vjp(values, scratch, output, grid=(1, 1, 1))
             np.testing.assert_array_equal(
                 pullback(None)["values"].to_numpy(),
@@ -667,8 +670,8 @@ def objective(
     def test_dynamic_loop_scratch_versions_propagate_every_element(self) -> None:
         vd.init(arch=vd.cpu)
         values = vd.storage.from_numpy(np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32))
-        scratch = vd.storage.zeros(dtype=vd.f32, shape=(4,))
-        output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        scratch = vd.storage.zeros(dtype=vd.f32, shape=(1, 1, 1, 4))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(1, 1, 1))
         _, pullback = dynamic_scratch_gather_objective_vjp(
             values,
             scratch,
@@ -684,8 +687,8 @@ def objective(
     def test_nested_dynamic_scratch_versions_propagate_every_element(self) -> None:
         vd.init(arch=vd.cpu)
         values = vd.storage.from_numpy(np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32))
-        scratch = vd.storage.zeros(dtype=vd.f32, shape=(3, 4))
-        output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        scratch = vd.storage.zeros(dtype=vd.f32, shape=(1, 1, 1, 3, 4))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(1, 1, 1))
         _, pullback = nested_dynamic_scratch_objective_vjp(
             values,
             scratch,
@@ -726,8 +729,8 @@ def objective(
         )
         for limit, start, stop in cases:
             values = vd.storage.from_numpy(np.array([primal], dtype=np.float32))
-            scratch = vd.storage.zeros(dtype=vd.f32, shape=(1,))
-            output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+            scratch = vd.storage.zeros(dtype=vd.f32, shape=(1, 1, 1))
+            output = vd.storage.zeros(dtype=vd.f32, shape=(1, 1, 1))
             _, pullback = dynamic_while_objective_vjp(
                 values,
                 scratch,
@@ -740,7 +743,10 @@ def objective(
             active = max(min(limit, stop) - start + 1, 0)
             accumulated = np.float32(0.5 * active) * primal
             expected_gradient = np.float32(0.5 * active * active) * primal
-            np.testing.assert_allclose(output.to_numpy(), np.array([accumulated * accumulated], dtype=np.float32))
+            np.testing.assert_allclose(
+                output.to_numpy(),
+                np.array([[[accumulated * accumulated]]], dtype=np.float32),
+            )
             for _ in range(2):
                 np.testing.assert_allclose(
                     pullback(None)["values"].to_numpy(),

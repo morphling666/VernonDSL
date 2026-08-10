@@ -9,7 +9,6 @@ from ..ad import ProgramTransformSpec
 from ..bundle import canonical_json
 from ..diagnostics import CompileError
 from .abi import value_leaves
-from .autodiff import AutodiffProgram
 from .autodiff_profiles import AutodiffProfilePlan
 from .model import ConcreteType
 from .type_parser import AnnotatedType
@@ -25,7 +24,6 @@ def emit_mlir_module(
     emit_function: Callable[[ast.FunctionDef], list[str]],
     error: Callable[[ast.AST, str], CompileError],
     program_transform: ProgramTransformSpec | None = None,
-    program_graph: AutodiffProgram | None = None,
     autodiff_profiles: AutodiffProfilePlan | None = None,
 ) -> str:
     attributes = [
@@ -46,10 +44,6 @@ def emit_mlir_module(
         encoded_transform = json.dumps(canonical_json(program_transform.to_dict()))
         attributes.append(f"vernon.program_transform = {encoded_transform}")
         attributes.append(f'vernon.program_transform_identity = "{program_transform.identity}"')
-    if program_graph is not None:
-        encoded_graph = json.dumps(canonical_json(program_graph.to_dict()))
-        attributes.append(f"vernon.ad_program_graph = {encoded_graph}")
-        attributes.append(f'vernon.ad_program_graph_identity = "{program_graph.identity}"')
     if autodiff_profiles is not None:
         encoded_profiles = json.dumps(canonical_json(autodiff_profiles.manifest_dict()))
         attributes.append(f"vernon.ad_profiles = {encoded_profiles}")

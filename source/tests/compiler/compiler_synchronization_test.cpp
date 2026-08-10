@@ -38,6 +38,96 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 }
 )mlir";
 
+constexpr std::string_view divergentBarrierModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @divergent_barrier(
+      %lane: index {
+        vernon.interface = "input",
+        vernon.builtin = "local_invocation_id"
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 2, 1, 1>
+      } {
+    %zero = arith.constant 0 : index
+    %is_leader = arith.cmpi eq, %lane, %zero : index
+    scf.if %is_leader {
+      "vernon.barrier"() {ordering = "acquire_release", scope = "workgroup"} : () -> ()
+    }
+    return
+  }
+}
+)mlir";
+
+constexpr std::string_view divergentWhileBarrierModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @divergent_while_barrier(
+      %lane: index {
+        vernon.interface = "input",
+        vernon.builtin = "local_invocation_id"
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 2, 1, 1>
+      } {
+    %zero = arith.constant 0 : index
+    %two = arith.constant 2 : index
+    %result = scf.while (%counter = %zero) : (index) -> index {
+      %condition = arith.cmpi slt, %counter, %two : index
+      scf.condition(%condition) %counter : index
+    } do {
+    ^bb0(%counter: index):
+      "vernon.barrier"() {ordering = "acquire_release", scope = "workgroup"} : () -> ()
+      %next = arith.addi %counter, %lane : index
+      scf.yield %next : index
+    }
+    return
+  }
+}
+)mlir";
+
+constexpr std::string_view branchInvariantWhileBarrierModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @branch_invariant_while_barrier(
+      %lane: index {
+        vernon.interface = "input",
+        vernon.builtin = "local_invocation_id"
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 2, 1, 1>
+      } {
+    %zero = arith.constant 0 : index
+    %two = arith.constant 2 : index
+    %true = arith.constant true
+    %result:3 = scf.while (%counter = %zero, %active = %true, %control = %zero)
+        : (index, i1, index) -> (index, i1, index) {
+      %in_range = arith.cmpi slt, %counter, %two : index
+      %condition = arith.andi %in_range, %active : i1
+      scf.condition(%condition) %counter, %active, %control : index, i1, index
+    } do {
+    ^bb0(%counter: index, %active: i1, %control: index):
+      %is_leader = arith.cmpi eq, %lane, %zero : index
+      %forwarded = scf.if %is_leader -> (index) {
+        %nested = scf.if %is_leader -> (index) {
+          scf.yield %control : index
+        } else {
+          scf.yield %control : index
+        }
+        scf.yield %nested : index
+      } else {
+        scf.yield %control : index
+      }
+      "vernon.barrier"() {ordering = "acquire_release", scope = "workgroup"} : () -> ()
+      %one = arith.constant 1 : index
+      %next = arith.addi %counter, %one : index
+      scf.yield %next, %active, %forwarded : index, i1, index
+    }
+    return
+  }
+}
+)mlir";
+
 constexpr std::string_view aggregateWorkgroupModule = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   "vernon.struct"() {
@@ -86,6 +176,10 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %lane: index {
         vernon.interface = "input",
         vernon.builtin = "local_invocation_id"
+      },
+      %global: tensor<3xi32> {
+        vernon.interface = "input",
+        vernon.builtin = "global_invocation_id"
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",
@@ -113,7 +207,9 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       field = "vector", index = 1 : i64
     } : (!vernon.struct<"AlignedValue">) -> tensor<2xf32>
     %first = tensor.extract %vector[%zero] : tensor<2xf32>
-    "vernon.store"(%first, %output, %lane) :
+    %global_x_i32 = tensor.extract %global[%zero] : tensor<3xi32>
+    %global_x = arith.index_castui %global_x_i32 : i32 to index
+    "vernon.store"(%first, %output, %global_x) :
       (f32, !vernon.tensor_view<f32, [2], "write", "device">, index) -> ()
     return
   }
@@ -292,6 +388,29 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 }
 )mlir";
 
+constexpr std::string_view independentEntryWorkgroupModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @first() attributes {
+      vernon.entry,
+      vernon.stage = "compute",
+      vernon.workgroup_size = array<i32: 1, 1, 1>
+    } {
+    %storage = "vernon.workgroup_alloc"() : () ->
+      !vernon.tensor_view<f32, [4096], "read_write", "workgroup">
+    return
+  }
+  func.func @second() attributes {
+      vernon.entry,
+      vernon.stage = "compute",
+      vernon.workgroup_size = array<i32: 1, 1, 1>
+    } {
+    %storage = "vernon.workgroup_alloc"() : () ->
+      !vernon.tensor_view<f32, [4096], "read_write", "workgroup">
+    return
+  }
+}
+)mlir";
+
 constexpr std::string_view noResultConditionalModule = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @conditional(
@@ -388,6 +507,58 @@ TEST(CompilerSynchronization, RejectsAggregateWorkgroupStorageAboveCanonicalLimi
     EXPECT_NE(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
     const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
     EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("16 KiB"), std::string_view::npos);
+    vernonCompileResultDestroy(result);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, PlansWorkgroupAllocationSitesIndependentlyPerEntry) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *result = vernonCompilerCompileMlir(compiler, independentEntryWorkgroupModule.data(),
+                                                            independentEntryWorkgroupModule.size(), VERNON_TARGET_CPU);
+    ASSERT_TRUE(result);
+    const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+    EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK)
+        << std::string_view(diagnostics.data ? diagnostics.data : "", diagnostics.size);
+    vernonCompileResultDestroy(result);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, RejectsLaneVaryingBarrierCondition) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *result =
+        vernonCompilerValidateMlir(compiler, divergentBarrierModule.data(), divergentBarrierModule.size());
+    ASSERT_TRUE(result);
+    EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_VERIFICATION_ERROR);
+    const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+    EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("lane-varying condition"),
+              std::string_view::npos);
+    vernonCompileResultDestroy(result);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, RejectsLaneVaryingWhileCarriedBarrierCondition) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *result =
+        vernonCompilerValidateMlir(compiler, divergentWhileBarrierModule.data(), divergentWhileBarrierModule.size());
+    ASSERT_TRUE(result);
+    EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_VERIFICATION_ERROR);
+    const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+    EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("lane-varying loop"), std::string_view::npos);
+    vernonCompileResultDestroy(result);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, AcceptsBranchInvariantWhileCarriedBarrierCondition) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *result = vernonCompilerValidateMlir(compiler, branchInvariantWhileBarrierModule.data(),
+                                                             branchInvariantWhileBarrierModule.size());
+    ASSERT_TRUE(result);
+    EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK)
+        << std::string(vernonCompileResultGetDiagnostics(result).data, vernonCompileResultGetDiagnostics(result).size);
     vernonCompileResultDestroy(result);
     vernonCompilerDestroy(compiler);
 }

@@ -22,8 +22,10 @@ unsupported.
 Compiler input must carry the exact supported `vernon.compiler_contract_version`.
 Pipeline manifests must carry the exact supported `pipeline_version`.
 Pipeline 15 has one canonical `*.pipeline.json` schema for compute and graphics
-targets. Differentiated assets use its optional root `autodiff` object; fields
-from pipeline 13 are not accepted as current-schema aliases.
+targets. Supported differentiated assets are CPU-only, use the `dynamic_v2`
+protocol, and carry the optional root `autodiff` object. GPU and graphics
+autodiff are deferred and unsupported; ordinary non-AD GPU pipelines remain
+supported. Fields from pipeline 13 are not accepted as current-schema aliases.
 Incompatible input, reflection, manifests, and artifacts are rejected before
 publication or execution rather than interpreted using best-effort fallback.
 

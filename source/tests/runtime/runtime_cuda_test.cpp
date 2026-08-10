@@ -51,6 +51,7 @@ TEST(RuntimeCuda, CopiesAndInvokesDirectComputePipeline) {
     "entries": [{
       "name": "scale",
       "workgroup_size": [4, 1, 1],
+      "dispatch_contract": {"unit_grid_axes": [], "requires_unit_workgroup": false},
       "physical_layouts": {
         "cuda_kernel_parameter": {"profile":"cuda_kernel_parameter","packing":"kernel_parameters"}
       },

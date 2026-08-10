@@ -25,6 +25,34 @@ private:
     GraphResource writeResource_;
 };
 
+class CpuComputePass final : public ComputePass {
+public:
+    CpuComputePass(std::string name, GraphResource resource, AccessMode access, std::vector<std::string> &events,
+                   VernonRhiStatus status = VERNON_RHI_STATUS_OK)
+        : ComputePass(std::move(name)), resource_(resource), access_(access), events_(events), status_(status) {}
+
+    void declare() override {
+        if (access_ == AccessMode::Read)
+            read(resource_);
+        else if (access_ == AccessMode::Write)
+            write(resource_);
+        else
+            readWrite(resource_);
+        setFlags(PassSideEffect);
+    }
+
+    VernonRhiStatus execute(ComputeEncoder &, const ExecutionResources &) override {
+        events_.push_back(name());
+        return status_;
+    }
+
+private:
+    GraphResource resource_;
+    AccessMode access_;
+    std::vector<std::string> &events_;
+    VernonRhiStatus status_;
+};
+
 class TestRenderPass final : public RenderPass {
 public:
     TestRenderPass(std::string name, GraphImage target, VernonRhiLoadOperation load = VERNON_RHI_LOAD_PRESERVE,
@@ -147,6 +175,39 @@ TEST(ExecutionGraph, InfersHazardsAndHonorsExplicitDependencies) {
     EXPECT_EQ(graph.schedule(), (std::vector<uint32_t>{0, 1}));
     ASSERT_EQ(graph.scopes().size(), 2u);
     EXPECT_FALSE(graph.scopes()[0].rendering);
+}
+
+TEST(ExecutionGraph, CpuProviderExecutesCompiledRawWarAndWawSchedules) {
+    const auto executeHazard = [](AccessMode firstAccess, AccessMode secondAccess) {
+        ExecutionGraph graph;
+        const GraphBuffer shared = graph.importHostBuffer(1, true);
+        std::vector<std::string> events;
+        graph.emplacePass<CpuComputePass>("first", shared, firstAccess, events);
+        graph.emplacePass<CpuComputePass>("second", shared, secondAccess, events);
+
+        std::string error;
+        EXPECT_TRUE(graph.compile(error)) << error;
+        EXPECT_EQ(graph.schedule(), (std::vector<uint32_t>{0, 1}));
+        EXPECT_EQ(graph.execute(), VERNON_RHI_STATUS_OK);
+        EXPECT_EQ(events, (std::vector<std::string>{"first", "second"}));
+    };
+
+    executeHazard(AccessMode::Write, AccessMode::Read);
+    executeHazard(AccessMode::Read, AccessMode::Write);
+    executeHazard(AccessMode::Write, AccessMode::Write);
+}
+
+TEST(ExecutionGraph, CpuProviderPropagatesFailureAndStopsSchedule) {
+    ExecutionGraph graph;
+    const GraphBuffer shared = graph.importHostBuffer(1, true);
+    std::vector<std::string> events;
+    graph.emplacePass<CpuComputePass>("first", shared, AccessMode::Write, events);
+    graph.emplacePass<CpuComputePass>("failure", shared, AccessMode::ReadWrite, events,
+                                      VERNON_RHI_STATUS_INTERNAL_ERROR);
+    graph.emplacePass<CpuComputePass>("not-run", shared, AccessMode::Read, events);
+
+    EXPECT_EQ(graph.execute(), VERNON_RHI_STATUS_INTERNAL_ERROR);
+    EXPECT_EQ(events, (std::vector<std::string>{"first", "failure"}));
 }
 
 TEST(ExecutionGraph, FusesCompatibleRenderPassesAndSplitsCompute) {

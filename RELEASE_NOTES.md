@@ -16,6 +16,9 @@ compiler, offline cooker, synchronous Runtime/RHI, and ExecutionGraph APIs.
 - CPU automatic differentiation uses one `dynamic_v2` ABI for direct and
   cooked execution, including dynamic/partially dynamic Storage shapes,
   reusable pullbacks, aggregate leaves, aliases, and zero extents.
+- GPU and graphics automatic differentiation and graph-level pullbacks are
+  deferred and unsupported. Ordinary non-AD GPU compute and graphics support
+  is unchanged.
 - CPU cooking emits that manifest, a relocatable `.o`/`.obj`, and generated
   static-registration `.c`/`.h` sources. The native compiler's former
   `--compute-bundle`/`compute.json` packaging interface has been removed.

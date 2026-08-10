@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <filesystem>
@@ -41,19 +42,19 @@ TEST(RuntimeStructuredStorageAutodiff, ExecutesDynamicIndexMutationAndFreshStora
     VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
-    const uint64_t storageShape[]{3};
+    const uint64_t storageShape[]{1, 1, 1, 3};
     float values[]{2.0f, 3.0f, 5.0f};
     float source[]{7.0f, 6.0f, 9.0f};
     int32_t index = 1;
     float scale = 4.0f;
     float loss{};
-    const uint64_t lossShape[]{1};
+    const uint64_t lossShape[]{1, 1, 1};
     VernonAdValue inputValues[]{
-        {sizeof(VernonAdValue), {"values", 6}, VERNON_DATA_F32, values, sizeof(values), 1, storageShape},
-        {sizeof(VernonAdValue), {"source", 6}, VERNON_DATA_F32, source, sizeof(source), 1, storageShape},
+        {sizeof(VernonAdValue), {"values", 6}, VERNON_DATA_F32, values, sizeof(values), 4, storageShape},
+        {sizeof(VernonAdValue), {"source", 6}, VERNON_DATA_F32, source, sizeof(source), 4, storageShape},
         {sizeof(VernonAdValue), {"index", 5}, VERNON_DATA_I32, &index, sizeof(index), {}},
         {sizeof(VernonAdValue), {"scale", 5}, VERNON_DATA_F32, &scale, sizeof(scale), {}},
-        {sizeof(VernonAdValue), {"loss", 4}, VERNON_DATA_F32, &loss, sizeof(loss), 1, lossShape},
+        {sizeof(VernonAdValue), {"loss", 4}, VERNON_DATA_F32, &loss, sizeof(loss), 3, lossShape},
     };
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, 5, {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
@@ -83,14 +84,14 @@ TEST(RuntimeStructuredStorageAutodiff, ExecutesDynamicIndexMutationAndFreshStora
          VERNON_DATA_F32,
          sourceGradient,
          sizeof(sourceGradient),
-         1,
+         4,
          storageShape},
         {sizeof(VernonAdValue),
          {"values", 6},
          VERNON_DATA_F32,
          valuesGradient,
          sizeof(valuesGradient),
-         1,
+         4,
          storageShape},
     };
     VernonAdValueSet gradients{sizeof(VernonAdValueSet), gradientValues, 3, {}};
@@ -110,7 +111,7 @@ TEST(RuntimeStructuredStorageAutodiff, ExecutesDynamicIndexMutationAndFreshStora
 }
 
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION
-TEST(RuntimeStructuredStorageAutodiff, RollsBackAllExternalBytesAfterPartialMultiInvocationCaptureFailure) {
+TEST(RuntimeStructuredStorageAutodiff, RejectsDispatchWideTapeBudgetBeforeExternalEffects) {
     ASSERT_EQ(vernonRegisterStructuredStorageAutodiffFixture(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_STORAGE_AUTODIFF_MANIFEST;
     std::ifstream input(manifestPath, std::ios::binary);
@@ -132,19 +133,19 @@ TEST(RuntimeStructuredStorageAutodiff, RollsBackAllExternalBytesAfterPartialMult
     VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
-    const uint64_t storageShape[]{3};
-    const uint64_t lossShape[]{1};
-    float values[]{2.0f, 3.0f, 5.0f};
-    float source[]{7.0f, 6.0f, 9.0f};
+    const uint64_t storageShape[]{2, 1, 1, 3};
+    const uint64_t lossShape[]{2, 1, 1};
+    float values[]{2.0f, 3.0f, 5.0f, 11.0f, 13.0f, 17.0f};
+    float source[]{7.0f, 6.0f, 9.0f, 19.0f, 23.0f, 29.0f};
     int32_t index = 1;
     float scale = 4.0f;
-    float loss = -17.0f;
+    float loss[]{-17.0f, -31.0f};
     VernonAdValue inputValues[]{
-        {sizeof(VernonAdValue), {"values", 6}, VERNON_DATA_F32, values, sizeof(values), 1, storageShape},
-        {sizeof(VernonAdValue), {"source", 6}, VERNON_DATA_F32, source, sizeof(source), 1, storageShape},
+        {sizeof(VernonAdValue), {"values", 6}, VERNON_DATA_F32, values, sizeof(values), 4, storageShape},
+        {sizeof(VernonAdValue), {"source", 6}, VERNON_DATA_F32, source, sizeof(source), 4, storageShape},
         {sizeof(VernonAdValue), {"index", 5}, VERNON_DATA_I32, &index, sizeof(index), {}},
         {sizeof(VernonAdValue), {"scale", 5}, VERNON_DATA_F32, &scale, sizeof(scale), {}},
-        {sizeof(VernonAdValue), {"loss", 4}, VERNON_DATA_F32, &loss, sizeof(loss), 1, lossShape},
+        {sizeof(VernonAdValue), {"loss", 4}, VERNON_DATA_F32, loss, sizeof(loss), 3, lossShape},
     };
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
@@ -159,26 +160,29 @@ TEST(RuntimeStructuredStorageAutodiff, RollsBackAllExternalBytesAfterPartialMult
     EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*calibrationPolicy), 0u);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
 
-    auto boundedPolicy = std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(std::numeric_limits<size_t>::max(),
-                                                                                     oneInvocationBytes);
+    auto boundedPolicy =
+        std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(oneInvocationBytes, oneInvocationBytes);
     vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, boundedPolicy);
     pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
-    values[0] = 2.0f;
-    values[1] = 3.0f;
-    values[2] = 5.0f;
-    loss = -17.0f;
+    const float originalValues[]{2.0f, 3.0f, 5.0f, 11.0f, 13.0f, 17.0f};
+    const float originalLoss[]{-17.0f, -31.0f};
+    std::copy(std::begin(originalValues), std::end(originalValues), values);
+    std::copy(std::begin(originalLoss), std::end(originalLoss), loss);
     std::array<unsigned char, sizeof(values)> valuesBefore{};
     std::array<unsigned char, sizeof(loss)> lossBefore{};
     std::memcpy(valuesBefore.data(), values, sizeof(values));
-    std::memcpy(lossBefore.data(), &loss, sizeof(loss));
+    std::memcpy(lossBefore.data(), loss, sizeof(loss));
 
     VernonPullback *rejectedPullback = reinterpret_cast<VernonPullback *>(uintptr_t{1});
     EXPECT_EQ(vernonAdPipelineForward(pipeline, {2, 1, 1}, &inputs, &outputs, &rejectedPullback),
               VERNON_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(rejectedPullback, nullptr);
+    EXPECT_NE(lastError(context).find("tape allocator"), std::string::npos);
+    EXPECT_NE(lastError(context).find("dispatch budget"), std::string::npos);
+    EXPECT_NE(lastError(context).find("context limit"), std::string::npos);
     EXPECT_EQ(std::memcmp(valuesBefore.data(), values, sizeof(values)), 0);
-    EXPECT_EQ(std::memcmp(lossBefore.data(), &loss, sizeof(loss)), 0);
+    EXPECT_EQ(std::memcmp(lossBefore.data(), loss, sizeof(loss)), 0);
     EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*boundedPolicy), 0u);
 
     vernonRuntimeLoadedPipelineDestroy(pipeline);

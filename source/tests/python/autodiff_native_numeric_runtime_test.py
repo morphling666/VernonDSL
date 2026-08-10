@@ -6,85 +6,59 @@ from pathlib import Path
 
 def main() -> None:
     manifest = Path(sys.argv[1])
-    sys.path[:0] = sys.argv[2:-1]
-    backend = sys.argv[-1]
+    sys.path[:0] = sys.argv[2:]
 
     import vernon_dsl as vd
-    from vernon_dsl import _native
     from vernon_dsl._runtime import session
 
-    architecture, api_version = {
-        "cpu": (vd.cpu, None),
-        "cuda": (vd.cuda, None),
-        "directx": (vd.directx, None),
-        "metal": (vd.metal, None),
-        "opengl": (vd.opengl, (4, 3)),
-        "opengles": (vd.opengles, (3, 1)),
-        "vulkan": (vd.vulkan, None),
-    }[backend]
-    runtime_backend = {
-        "cpu": _native.RuntimeBackend.CPU,
-        "cuda": _native.RuntimeBackend.CUDA,
-        "directx": _native.RuntimeBackend.DIRECTX12,
-        "metal": _native.RuntimeBackend.METAL,
-        "opengl": _native.RuntimeBackend.OPENGL,
-        "opengles": _native.RuntimeBackend.OPENGL_ES,
-        "vulkan": _native.RuntimeBackend.VULKAN,
-    }[backend]
-    if not _native.runtime_available(runtime_backend):
-        print(f"{backend} runtime capability reports unavailable")
-        raise SystemExit(77)
-    if api_version is None:
-        vd.init(arch=architecture)
-    else:
-        vd.init(arch=architecture, api_version=api_version)
+    vd.init(arch=vd.cpu)
     assert session._native_runtime is not None
     runtime = session._native_runtime
-    if backend == "cpu":
-        __import__("vernon_native_autodiff_numeric_cpu_fixture")
+    __import__("vernon_native_autodiff_numeric_cpu_fixture")
 
     try:
-        run_numeric_acceptance(runtime, manifest, backend)
-    except RuntimeError as error:
-        if backend == "metal" and "argument-buffer encoding is unavailable" in str(error):
-            print(error)
-            raise SystemExit(77) from error
-        raise
+        run_numeric_acceptance(runtime, manifest)
     finally:
         vd.init(arch=vd.cpu)
 
 
-def run_numeric_acceptance(runtime, manifest: Path, backend: str) -> None:
+def run_numeric_acceptance(runtime, manifest: Path) -> None:
     import numpy as np
     import vernon_dsl as vd
 
     pipeline = runtime.load_pipeline_asset(manifest.read_bytes(), str(manifest.parent), [])
 
     def invoke(native_inputs):
-        if backend != "cpu":
-            return pipeline.vjp(native_inputs, (1, 1, 1))
-
         storages = {}
         bindings = dict(native_inputs)
         for name in ("values", "auxiliary"):
             source = native_inputs[name]
-            storage = storages.setdefault(id(source), vd.storage.from_numpy(source))
+            storage = storages.setdefault(
+                id(source),
+                vd.storage.from_numpy(source.reshape((1, 1, 1) + source.shape)),
+            )
             bindings[name] = storage
-        output_storage = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        output_storage = vd.storage.zeros(dtype=vd.f32, shape=(1, 1, 1))
         bindings["output"] = output_storage
         output, pullback = pipeline.vjp(bindings, (1, 1, 1))
         assert output is None
         for name in ("values", "auxiliary"):
-            np.copyto(native_inputs[name], bindings[name].to_numpy())
+            np.copyto(native_inputs[name], bindings[name].to_numpy().reshape(native_inputs[name].shape))
 
         def apply_pullback():
             gradients = pullback(None)
             return {
-                name: value.to_numpy() if isinstance(value, vd.TensorStorage) else value
+                name: (
+                    value.to_numpy().reshape(native_inputs[name].shape)
+                    if isinstance(value, vd.TensorStorage) and name in {"values", "auxiliary"}
+                    else value.to_numpy()
+                    if isinstance(value, vd.TensorStorage)
+                    else value
+                )
                 for name, value in gradients.items()
             }
 
-        return output_storage.to_numpy()[0], apply_pullback
+        return output_storage.to_numpy()[0, 0, 0], apply_pullback
 
     differentiable = (
         "left",
@@ -227,7 +201,7 @@ def run_numeric_acceptance(runtime, manifest: Path, backend: str) -> None:
     aliased_inputs.update(values=shared, auxiliary=shared, count=np.int32(count), flag=np.int32(1))
     try:
         invoke(aliased_inputs)
-    except RuntimeError as error:
+    except ValueError as error:
         if "overlap" not in str(error):
             raise
     else:

@@ -106,6 +106,11 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
                                                               logicalTensor.getShape(), "read_write", "device");
             function.getArgument(0).setType(resource);
             function.setType(builder.getFunctionType({resource}, {}));
+            function->setAttr("vernon.dispatch_contract",
+                              builder.getDictionaryAttr({
+                                  builder.getNamedAttr("unit_grid_axes", builder.getDenseI32ArrayAttr({1, 2})),
+                                  builder.getNamedAttr("requires_unit_workgroup", builder.getBoolAttr(false)),
+                              }));
             function.setArgAttrs(
                 0, builder.getDictionaryAttr({
                        builder.getNamedAttr("vernon.interface", builder.getStringAttr("resource")),
@@ -144,6 +149,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     ASSERT_TRUE(mlir::succeeded(reflected));
     const nlohmann::json reflectedJson = nlohmann::json::parse(*reflected);
     EXPECT_EQ(argument(entry(reflectedJson, "compute"), 0).at("vernon.source_name"), "values");
+    EXPECT_EQ(entry(reflectedJson, "compute").at("dispatch_contract"),
+              (nlohmann::json{{"unit_grid_axes", {1, 2}}, {"requires_unit_workgroup", false}}));
     std::vector<vernon::compiler::PhysicalEntryModel> staleEntries = result->entries;
     staleEntries[0].arguments[0].type = "f32";
     EXPECT_TRUE(mlir::failed(vernon::compiler::buildReflection(*result->module, prepared.logicalReflection(),

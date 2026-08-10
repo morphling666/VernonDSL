@@ -1,5 +1,6 @@
 #include "backend_cpu.h"
 
+#include "cpu_workgroup_dispatch.h"
 #include "runtime_state.h"
 
 #include <nlohmann/json.hpp>
@@ -52,6 +53,8 @@ struct CpuPreparedPipeline {
     CpuPreparedLayout *layout{};
     uint32_t workgroup[3]{1, 1, 1};
     std::vector<const ReflectedArgument *> globalInvocationIds;
+    std::vector<const ReflectedArgument *> localInvocationIds;
+    std::vector<const ReflectedArgument *> workgroupIds;
 };
 
 struct CpuPreparedBindings {
@@ -136,9 +139,16 @@ VernonStatus prepareCpuPipeline(void *data, const VernonRuntimeProviderPipelineD
         return fail(context.error, "CPU provider pipeline references invalid prepared objects");
     std::copy_n(descriptor->workgroup_size, 3, pipeline->workgroup);
     try {
-        for (const ReflectedArgument &argument : pipeline->shader->reflection.arguments)
-            if (argument.kind == "builtin" && argument.builtin == "global_invocation_id")
+        for (const ReflectedArgument &argument : pipeline->shader->reflection.arguments) {
+            if (argument.kind != "builtin")
+                continue;
+            if (argument.builtin == "global_invocation_id")
                 pipeline->globalInvocationIds.push_back(&argument);
+            else if (argument.builtin == "local_invocation_id")
+                pipeline->localInvocationIds.push_back(&argument);
+            else if (argument.builtin == "workgroup_id")
+                pipeline->workgroupIds.push_back(&argument);
+        }
     } catch (const std::bad_alloc &) {
         return fail(context.error, "cannot prepare CPU builtin bindings", VERNON_STATUS_INTERNAL_ERROR);
     }
@@ -244,32 +254,40 @@ VernonStatus encodeCpuDispatch(void *data, VernonRuntimeProviderObject,
     auto *bindings = descriptor ? fromHandle<CpuPreparedBindings>(descriptor->bindings) : nullptr;
     if (!descriptor || !pipeline || !bindings || bindings->pipeline != pipeline)
         return fail(context.error, "invalid CPU provider dispatch");
-    VernonCpuInvocation invocation{bindings->packed.data(), bindings->packed.size(), nullptr, 0, nullptr};
-    uint32_t global[3]{descriptor->group_count[0] * pipeline->workgroup[0],
-                       descriptor->group_count[1] * pipeline->workgroup[1],
-                       descriptor->group_count[2] * pipeline->workgroup[2]};
-    if (descriptor->push_constants && descriptor->push_constant_size == sizeof(VernonLaunchSize)) {
-        const auto &exact = *static_cast<const VernonLaunchSize *>(descriptor->push_constants);
-        global[0] = exact.x;
-        global[1] = exact.y;
-        global[2] = exact.z;
-    }
-    for (uint32_t z = 0; z < global[2]; ++z)
-        for (uint32_t y = 0; y < global[1]; ++y)
-            for (uint32_t x = 0; x < global[0]; ++x) {
-                const uint32_t id[3]{x, y, z};
-                for (const ReflectedArgument *builtin : pipeline->globalInvocationIds) {
-                    if (builtin->physical.offset > bindings->packed.size() ||
-                        builtin->physical.size > bindings->packed.size() - builtin->physical.offset)
-                        return fail(context.error, "CPU builtin reflection is out of bounds");
-                    std::memcpy(bindings->packed.data() + builtin->physical.offset, id,
-                                std::min(builtin->physical.size, sizeof(id)));
-                }
-                const VernonStatus status = pipeline->shader->kernel.entry(&invocation);
-                if (status != VERNON_STATUS_OK)
-                    return fail(context.error, "CPU provider entry invocation failed", status);
+    auto writeBuiltins = [](std::vector<unsigned char> &packed, const std::vector<const ReflectedArgument *> &builtins,
+                            const uint32_t id[3]) {
+        for (const ReflectedArgument *builtin : builtins) {
+            if (builtin->physical.offset > packed.size() ||
+                builtin->physical.size > packed.size() - builtin->physical.offset)
+                return false;
+            unsigned char *destination = packed.data() + builtin->physical.offset;
+            if (builtin->physical.size == sizeof(uint64_t)) {
+                const uint64_t scalar = id[0];
+                std::memcpy(destination, &scalar, sizeof(scalar));
+            } else {
+                std::memcpy(destination, id, std::min(builtin->physical.size, sizeof(uint32_t) * 3));
             }
-    return VERNON_STATUS_OK;
+        }
+        return true;
+    };
+    const VernonStatus status = context.scheduler->dispatch(
+        descriptor->group_count, pipeline->workgroup, [&](const CpuLaneCoordinates &coordinates) {
+            std::vector<unsigned char> packed = bindings->packed;
+            if (!writeBuiltins(packed, pipeline->globalInvocationIds, coordinates.global) ||
+                !writeBuiltins(packed, pipeline->localInvocationIds, coordinates.local) ||
+                !writeBuiltins(packed, pipeline->workgroupIds, coordinates.group))
+                return VERNON_STATUS_INVALID_ARGUMENT;
+            const VernonCpuInvocation invocation{packed.data(), packed.size(), nullptr, 0, nullptr};
+            return pipeline->shader->kernel.entry(&invocation);
+        });
+    if (status != VERNON_STATUS_OK)
+        return fail(context.error,
+                    context.scheduler->lastDiagnostic().empty()
+                        ? (status == VERNON_STATUS_INVALID_ARGUMENT ? "CPU builtin reflection or dispatch is invalid"
+                                                                    : "CPU provider entry invocation failed")
+                        : context.scheduler->lastDiagnostic(),
+                    status);
+    return status;
 }
 
 VernonStatus unsupportedCpuDraw(void *, VernonRuntimeProviderObject, const VernonRuntimeProviderDrawDescriptor *) {
@@ -288,6 +306,9 @@ bool initializeCpuContext(VernonRuntimeContext &context, uint32_t deviceIndex) {
         return false;
     auto state = std::unique_ptr<CpuContextState>(new (std::nothrow) CpuContextState());
     if (!state)
+        return false;
+    state->scheduler = CpuWorkgroupScheduler::create(CpuWorkgroupScheduler::defaultConfig(), state->error);
+    if (!state->scheduler)
         return false;
     state->provider.struct_size = sizeof(VernonRuntimeDeviceProvider);
     state->provider.abi_version = VERNON_PIPELINE_VERSION;
@@ -313,6 +334,10 @@ bool initializeCpuContext(VernonRuntimeContext &context, uint32_t deviceIndex) {
 
 const VernonRuntimeDeviceProvider *cpuProvider(VernonRuntimeContext &context) {
     return &runtimeBackendState<CpuContextState>(context).provider;
+}
+
+CpuWorkgroupScheduler &cpuWorkgroupScheduler(VernonRuntimeContext &context) {
+    return *runtimeBackendState<CpuContextState>(context).scheduler;
 }
 
 uint64_t cpuProviderResourceIdentity(const VernonRuntimeContext &context) {

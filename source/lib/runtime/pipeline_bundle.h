@@ -42,7 +42,7 @@ struct Stage {
     std::vector<uint8_t> binary;
     std::optional<CpuNativeArtifact> cpuArtifact;
     uint32_t workgroup[3]{1, 1, 1};
-    bool serialDispatch{};
+    DispatchContract dispatchContract;
 };
 
 bool validateManifestHash(const nlohmann::json &root, bool required, std::string &error);

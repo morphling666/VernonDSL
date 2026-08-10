@@ -264,7 +264,7 @@ def main() -> None:
                 height_b,
                 velocity_b,
                 *wave_arguments,
-                grid=(vertex_count, 1, 1),
+                grid=((vertex_count + 63) // 64, 1, 1),
             )
             wave_ba_slot.value = step_ocean.invocation(
                 height_b,
@@ -272,7 +272,7 @@ def main() -> None:
                 height_a,
                 velocity_a,
                 *wave_arguments,
-                grid=(vertex_count, 1, 1),
+                grid=((vertex_count + 63) // 64, 1, 1),
             )
             mesh_slot.value = build_ocean_mesh.invocation(
                 height_a,
@@ -283,7 +283,7 @@ def main() -> None:
                 np.uint32(args.grid),
                 np.float32(args.extent),
                 phase,
-                grid=(vertex_count, 1, 1),
+                grid=((vertex_count + 63) // 64, 1, 1),
             )
             expand_slot.value = expand_indexed_mesh.invocation(
                 positions,
@@ -295,7 +295,7 @@ def main() -> None:
                 draw_normals,
                 draw_colors,
                 draw_materials,
-                grid=(draw_count, 1, 1),
+                grid=((draw_count + 63) // 64, 1, 1),
             )
             angle = float(phase) * 0.13 + 0.72
             camera = np.array((5.15 * math.cos(angle), 1.12, 5.15 * math.sin(angle)), dtype=np.float32)

@@ -802,9 +802,7 @@ VernonStatus invokeMetalComputePipeline(VernonLoadedPipeline &pipeline, const Pl
                                        : "failed to prepare Metal invocation bindings",
                     status);
     }
-    const uint32_t groups[3]{(launch.grid.x - 1) / state.rhiComputeWorkgroup[0] + 1,
-                             (launch.grid.y - 1) / state.rhiComputeWorkgroup[1] + 1,
-                             (launch.grid.z - 1) / state.rhiComputeWorkgroup[2] + 1};
+    const uint32_t groups[3]{launch.grid.x, launch.grid.y, launch.grid.z};
     status = vernonRuntimeCoreEncodeDispatch(state.rhiComputePipeline, state.rhiComputeBindings, launch.commandEncoder,
                                              groups, nullptr, 0);
     if (status != VERNON_STATUS_OK) {

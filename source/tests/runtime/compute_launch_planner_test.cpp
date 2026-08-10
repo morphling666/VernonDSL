@@ -38,6 +38,21 @@ ParameterUse packedF32Use(uint32_t index, const std::string &layoutHash) {
     return use;
 }
 
+Parameter storageF32Parameter(uint32_t slot, uint32_t index, const char *access) {
+    Parameter parameter;
+    parameter.slot = slot;
+    parameter.kind = "tensor";
+    parameter.source = "direct";
+    parameter.access = access;
+    setScalarLayout(parameter, "f32", VERNON_DATA_F32);
+    ParameterUse use;
+    use.stage = "compute";
+    use.interfaceKind = "storage";
+    use.index = index;
+    parameter.uses.push_back(std::move(use));
+    return parameter;
+}
+
 TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
     Variant variant;
     Parameter contiguous;
@@ -91,7 +106,7 @@ TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
 
     PlannedComputeLaunch plan;
     std::string error;
-    ASSERT_TRUE(planComputeInvocation(variant, invocation, plan, error)) << error;
+    ASSERT_TRUE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error)) << error;
     ASSERT_EQ(plan.arguments.size(), 3u);
     ASSERT_EQ(plan.hostTensorStorage.size(), 2u);
     const std::array<float, 2> expectedPacked{1, 2};
@@ -136,7 +151,7 @@ TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
     invocation.argument_count = 1;
     PlannedComputeLaunch plan;
     std::string error;
-    ASSERT_TRUE(planComputeInvocation(variant, invocation, plan, error)) << error;
+    ASSERT_TRUE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error)) << error;
     ASSERT_EQ(plan.arguments.size(), 1u);
     EXPECT_EQ(plan.arguments[0].resource.identity, resource.identity);
     EXPECT_EQ(plan.arguments[0].resource.resource.value, resource.resource.value);
@@ -149,21 +164,21 @@ TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
     supplied.tensor.shape = secondShape.data();
     supplied.tensor.byte_strides = secondStrides.data();
     supplied.tensor.byte_offset = 0;
-    ASSERT_TRUE(planComputeInvocation(variant, invocation, plan, error)) << error;
+    ASSERT_TRUE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error)) << error;
     ASSERT_TRUE(plan.arguments[0].tensorView);
     EXPECT_EQ(*computeBindingDescriptorValue(plan.arguments[0], {ComputeBindingSourceKind::TensorExtent, 0, 1}), 4);
     EXPECT_EQ(*computeBindingDescriptorValue(plan.arguments[0], {ComputeBindingSourceKind::TensorStride, 0, 0}), 4);
 
     const std::array<uint64_t, 2> invalidStaticShape{3, 4};
     supplied.tensor.shape = invalidStaticShape.data();
-    ASSERT_FALSE(planComputeInvocation(variant, invocation, plan, error));
+    ASSERT_FALSE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error));
     EXPECT_EQ(error, "pipeline TensorView descriptor violates static shape or element stride");
 
     supplied.tensor.shape = shape.data();
     supplied.tensor.byte_strides = strides.data();
     supplied.tensor.byte_offset = 2 * sizeof(float);
     supplied.tensor.byte_size = 6 * sizeof(float);
-    ASSERT_FALSE(planComputeInvocation(variant, invocation, plan, error));
+    ASSERT_FALSE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error));
     EXPECT_EQ(error, "pipeline Tensor argument does not match layout");
 }
 
@@ -199,8 +214,58 @@ TEST(ComputeLaunchPlannerTest, RejectsTensorViewAccessMismatchBeforeDispatch) {
 
     PlannedComputeLaunch plan;
     std::string error;
-    ASSERT_FALSE(planComputeInvocation(variant, invocation, plan, error));
+    ASSERT_FALSE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error));
     EXPECT_EQ(error, "pipeline Tensor argument does not match layout");
+}
+
+TEST(ComputeLaunchPlannerTest, EnforcesInjectiveAndPairwisePhysicalTensorAliases) {
+    Variant variant;
+    variant.parameters = {storageF32Parameter(0, 0, "write")};
+
+    const std::array<float, 8> values{};
+    const std::array<uint64_t, 1> shape{2};
+    const std::array<int64_t, 1> zeroStride{0};
+    VernonPipelineArgument supplied[2]{};
+    supplied[0].slot = 0;
+    supplied[0].kind = VERNON_PIPELINE_TENSOR;
+    supplied[0].tensor = {sizeof(VernonTensorView),
+                          VERNON_TENSOR_HOST,
+                          {values.data()},
+                          vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32),
+                          VERNON_ACCESS_WRITE,
+                          1,
+                          shape.data(),
+                          zeroStride.data(),
+                          0,
+                          sizeof(values)};
+    VernonPipelineInvocation invocation{};
+    invocation.arguments = supplied;
+    invocation.argument_count = 1;
+    invocation.compute_grid = {1, 1, 1};
+    PlannedComputeLaunch plan;
+    std::string error;
+    EXPECT_FALSE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error));
+    EXPECT_EQ(error, "writable pipeline Tensor argument must have an injective byte layout");
+
+    const std::array<int64_t, 1> sparseStride{2 * sizeof(float)};
+    supplied[0].tensor.byte_strides = sparseStride.data();
+    supplied[0].tensor.access = VERNON_ACCESS_READ;
+    supplied[1] = supplied[0];
+    supplied[1].slot = 1;
+    supplied[1].tensor.access = VERNON_ACCESS_WRITE;
+    supplied[1].tensor.byte_offset = sizeof(float);
+    variant.parameters = {storageF32Parameter(0, 0, "read"), storageF32Parameter(1, 1, "write")};
+    invocation.argument_count = 2;
+    ASSERT_TRUE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error)) << error;
+
+    supplied[1].tensor.byte_offset = 2;
+    EXPECT_FALSE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error));
+    EXPECT_EQ(error, "pipeline Tensor arguments have incompatible physical overlap");
+
+    supplied[0].tensor.access = VERNON_ACCESS_READ;
+    supplied[1].tensor.access = VERNON_ACCESS_READ;
+    variant.parameters[1].access = "read";
+    EXPECT_TRUE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error)) << error;
 }
 
 } // namespace

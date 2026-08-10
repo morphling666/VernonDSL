@@ -6,6 +6,7 @@ add_mlir_library(
     VernonStructuredVjp.cpp
     VernonCpuPipeline.cpp
     VernonAttributeAbi.cpp
+    VernonGlobalIdIndexProof.cpp
     VernonConvertGPUToSPIRV.cpp
     VernonInlineHelpers.cpp
     VernonLowerAccumulation.cpp
@@ -13,6 +14,7 @@ add_mlir_library(
     VernonLowerCPUAutodiff.cpp
     VernonLowerCPUResources.cpp
     VernonLowerCPUTensors.cpp
+    VernonLowerCPUSynchronization.cpp
     VernonLowerCUDAMath.cpp
     VernonLowerGPUTensors.cpp
     VernonLowerSynchronization.cpp
