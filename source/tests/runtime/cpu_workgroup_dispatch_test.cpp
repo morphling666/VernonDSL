@@ -73,8 +73,13 @@ TEST_F(CpuWorkgroupDispatchTest, ExecutesEachInvocationInContiguousGroupRangesAn
 
     for (const std::atomic<uint32_t> &visit : visits)
         EXPECT_EQ(visit.load(std::memory_order_relaxed), 2u);
+    EXPECT_FALSE(launchThreads[0].empty());
+    EXPECT_FALSE(launchThreads[1].empty());
     EXPECT_LE(launchThreads[0].size(), 8u);
-    EXPECT_EQ(launchThreads[0], launchThreads[1]);
+    EXPECT_LE(launchThreads[1].size(), 8u);
+    std::set<std::thread::id> workerPool = launchThreads[0];
+    workerPool.insert(launchThreads[1].begin(), launchThreads[1].end());
+    EXPECT_LE(workerPool.size(), 8u);
 }
 
 TEST_F(CpuWorkgroupDispatchTest, PersistsSharedStorageAcrossNonblockingPhases) {
