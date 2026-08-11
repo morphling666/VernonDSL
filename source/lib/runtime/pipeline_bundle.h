@@ -25,6 +25,7 @@ struct CpuNativeArtifact {
     uint64_t size{};
     std::string sha256;
     nlohmann::json reflection;
+    bool staticallyLinked{};
 };
 
 struct ResolvedArtifact {
@@ -32,6 +33,11 @@ struct ResolvedArtifact {
     std::vector<uint8_t> bytes;
     std::filesystem::path path;
     bool external{};
+};
+
+enum class ArtifactResolution {
+    LoadBytes,
+    MetadataOnly,
 };
 
 struct Stage {
@@ -50,7 +56,8 @@ bool validateCpuRuntimeRequirements(const std::string &targetTriple, const std::
                                     std::string &error);
 
 bool resolveArtifact(const nlohmann::json &descriptor, const std::optional<std::filesystem::path> &directory,
-                     ResolvedArtifact &output, std::string &error);
+                     ResolvedArtifact &output, std::string &error,
+                     ArtifactResolution resolution = ArtifactResolution::LoadBytes);
 
 bool resolveCpuNativeArtifact(const CpuNativeArtifact &artifact, std::filesystem::path &libraryPath,
                               ReflectedEntry *reflection, std::string &error);

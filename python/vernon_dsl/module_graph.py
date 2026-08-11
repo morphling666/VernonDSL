@@ -69,6 +69,13 @@ class LoadedProject:
 
 
 @dataclass(frozen=True)
+class ProjectEntryResolution:
+    name: str
+    source_path: Path
+    decorators: frozenset[str]
+
+
+@dataclass(frozen=True)
 class _ModuleGraphSnapshot:
     modules: dict[Path, _Module]
     order: tuple[_Module, ...]
@@ -509,6 +516,18 @@ class ModuleGraph:
             self._touch_symbol(root, seed)
         return root
 
+    def _selected_entry_symbol(self, root: _Module) -> tuple[_Module, str] | None:
+        if self.entry is None:
+            return None
+        if self.entry in root.definitions:
+            return root, self.entry
+        imported = root.symbol_imports.get(self.entry)
+        if imported is None:
+            imported = self._materialize_import(root, self.entry)
+        if imported is None or imported[1] is None:
+            return None
+        return imported[0], imported[1]
+
     def load(self) -> LoadedProject:
         root = self.discover()
         declared_features = {
@@ -525,6 +544,12 @@ class ModuleGraph:
             prefix = "" if module is root else self._symbol_prefix(module)
             for symbol in module.definitions:
                 emitted_names[(module.path, symbol)] = f"{prefix}{symbol}" if prefix else symbol
+        selected_entry_symbol = self._selected_entry_symbol(root)
+        selected_entry_key = (
+            (selected_entry_symbol[0].path, selected_entry_symbol[1]) if selected_entry_symbol is not None else None
+        )
+        if selected_entry_symbol is not None and self.entry is not None:
+            emitted_names[(selected_entry_symbol[0].path, selected_entry_symbol[1])] = self.entry
 
         body: list[ast.stmt] = []
         function_sources: dict[str, tuple[_Module, ast.FunctionDef]] = {}
@@ -551,9 +576,10 @@ class ModuleGraph:
                     is_entry = any(
                         _decorator_name(decorator) in _STAGE_DECORATORS for decorator in transformed.decorator_list
                     )
+                    is_selected_entry = selected_entry_key == (module.path, original_name)
                     if is_entry:
                         entry_names.add(emitted_names[(module.path, original_name)])
-                    if module is not root:
+                    if module is not root and not is_selected_entry:
                         # Imported entries are retained as private functions.
                         # The call-graph check still remembers their original
                         # stage identity and rejects calls to them.
@@ -1087,14 +1113,34 @@ class ModuleGraph:
         )
 
 
+def _load_project_graph(
+    input_path: str | Path, enabled_features: tuple[str, ...], entry: str | None
+) -> tuple[ModuleGraph, _Module]:
+    graph = ModuleGraph(input_path, enabled_features, entry)
+    if _module_graph_cache.restore(graph):
+        return graph, graph.modules[graph.input_path]
+    root = graph.discover()
+    _module_graph_cache.store(graph)
+    return graph, root
+
+
 def load_project(
     input_path: str | Path, enabled_features: tuple[str, ...] = (), entry: str | None = None
 ) -> LoadedProject:
-    graph = ModuleGraph(input_path, enabled_features, entry)
-    if not _module_graph_cache.restore(graph):
-        graph.discover()
-        _module_graph_cache.store(graph)
+    graph, _ = _load_project_graph(input_path, enabled_features, entry)
     return graph.load()
+
+
+def resolve_project_entry(input_path: str | Path, entry: str) -> ProjectEntryResolution | None:
+    graph, root = _load_project_graph(input_path, (), entry)
+    selected = graph._selected_entry_symbol(root)
+    if selected is None:
+        return None
+    definition = selected[0].definitions.get(selected[1])
+    if not isinstance(definition, ast.FunctionDef):
+        return None
+    decorators = frozenset(_decorator_name(decorator) for decorator in definition.decorator_list)
+    return ProjectEntryResolution(entry, selected[0].path, decorators)
 
 
 def clear_project_cache() -> None:

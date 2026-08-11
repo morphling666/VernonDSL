@@ -14,8 +14,16 @@ function(vernon_add_runtime)
         set(VERNON_RUNTIME_LIBRARY_TYPE SHARED)
     endif()
 
-    add_library(VernonPlatform STATIC ${_VERNON_RUNTIME_IMPL_DIR}/../platform/platform_library.cpp)
+    if(VERNON_RUNTIME_PROFILE STREQUAL "web")
+        set(_vernon_platform_library_source ${_VERNON_RUNTIME_IMPL_DIR}/../platform/platform_library_web.cpp)
+    else()
+        set(_vernon_platform_library_source ${_VERNON_RUNTIME_IMPL_DIR}/../platform/platform_library.cpp)
+    endif()
+    add_library(VernonPlatform STATIC ${_vernon_platform_library_source})
     set_target_properties(VernonPlatform PROPERTIES EXPORT_NAME Platform POSITION_INDEPENDENT_CODE ON)
+    if(VERNON_RUNTIME_PROFILE STREQUAL "web")
+        target_compile_definitions(VernonPlatform PRIVATE VERNON_RUNTIME_PROFILE_WEB=1)
+    endif()
 
     add_library(
         VernonRHI
@@ -41,7 +49,13 @@ function(vernon_add_runtime)
         VernonRHI
         PUBLIC $<BUILD_INTERFACE:${_VERNON_RUNTIME_INCLUDE_DIR}> $<INSTALL_INTERFACE:include>
         PRIVATE $<BUILD_INTERFACE:${_VERNON_RUNTIME_IMPL_DIR}/..>)
-    target_link_libraries(VernonRHI PRIVATE VernonPlatform ${CMAKE_DL_LIBS})
+    target_link_libraries(VernonRHI PRIVATE VernonPlatform)
+    if(NOT
+       VERNON_RUNTIME_PROFILE
+       STREQUAL
+       "web")
+        target_link_libraries(VernonRHI PRIVATE ${CMAKE_DL_LIBS})
+    endif()
     if(VERNON_ENABLE_CUDA_RUNTIME)
         target_sources(
             VernonRHI
@@ -259,6 +273,10 @@ function(vernon_add_runtime)
     target_sources(VernonRuntime PRIVATE $<TARGET_OBJECTS:VernonRuntimeInternals>)
     set_target_properties(VernonRuntime PROPERTIES EXPORT_NAME Runtime)
     target_compile_definitions(VernonRuntime PRIVATE VERNON_RUNTIME_BUILD)
+    if(VERNON_RUNTIME_PROFILE STREQUAL "web")
+        target_compile_definitions(VernonRuntime PUBLIC VERNON_RUNTIME_PROFILE_WEB=1)
+        target_compile_definitions(VernonRuntimeInternals PRIVATE VERNON_RUNTIME_PROFILE_WEB=1)
+    endif()
     if(WIN32)
         target_compile_definitions(VernonRuntime PRIVATE NOMINMAX)
     endif()
@@ -296,8 +314,13 @@ function(vernon_add_runtime)
                 VernonPlatform
                 VernonRHI
                 VernonExecutionGraph
-                $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>
-                ${CMAKE_DL_LIBS})
+                $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>)
+    if(NOT
+       VERNON_RUNTIME_PROFILE
+       STREQUAL
+       "web")
+        target_link_libraries(VernonRuntime PRIVATE ${CMAKE_DL_LIBS})
+    endif()
     if(BUILD_TESTING)
         target_compile_definitions(VernonRuntime PRIVATE VERNON_RUNTIME_TESTING=1)
     endif()

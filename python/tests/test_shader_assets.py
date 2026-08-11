@@ -10,8 +10,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from vernon_dsl._shader_assets.artifact_io import artifact_extension
 from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
 from vernon_dsl.bundle import CpuTargetOptions, build_bundle_plan, make_target_options
+from vernon_dsl.module_graph import load_project, resolve_project_entry
 from vernon_dsl.pipeline_assets import (
     PipelineCompileError,
     cook_pipeline_asset,
@@ -47,6 +49,109 @@ def _native_available() -> bool:
 
 
 class ShaderAssetManifestTests(unittest.TestCase):
+    def test_pipeline_asset_promotes_an_imported_entry_without_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "shaders"
+            package.mkdir()
+            (package / "fullscreen.py").write_text(
+                """
+import vernon_dsl as vd
+
+@vd.vertex
+def vertex(value: vd.f32) -> vd.f32:
+    return value
+""",
+                encoding="utf-8",
+            )
+            source = package / "asset.py"
+            source.write_text(
+                """
+import vernon_dsl as vd
+from .fullscreen import vertex as fullscreen_vertex
+
+@vd.fragment
+def fragment_main() -> vd.Vector[vd.f32, 4]:
+    return vd.Vector([1.0, 0.0, 0.0, 1.0])
+
+asset = vd.pipeline_asset(
+    id="pipelines/imported",
+    program=(fullscreen_vertex, fragment_main),
+)
+""",
+                encoding="utf-8",
+            )
+
+            descriptor = parse_python_pipeline_asset(source, "asset")
+            self.assertEqual(descriptor.stages["vertex"].entry, "fullscreen_vertex")
+            resolution = resolve_project_entry(source, "fullscreen_vertex")
+            self.assertIsNotNone(resolution)
+            assert resolution is not None
+            self.assertIn("vertex", resolution.decorators)
+            self.assertEqual(resolution.name, "fullscreen_vertex")
+            self.assertEqual(resolution.source_path, (package / "fullscreen.py").resolve())
+            promoted = load_project(source, entry="fullscreen_vertex")
+            self.assertIn("@vd.vertex", promoted.source)
+            self.assertIn("def fullscreen_vertex(", promoted.source)
+            self.assertIn("fullscreen.py", dict(promoted.dependencies))
+
+    def test_pipeline_asset_rejects_unsupported_import_entry_forms(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "fullscreen.py").write_text(
+                """
+import vernon_dsl as vd
+
+@vd.vertex
+def fullscreen_vertex(value: vd.f32) -> vd.f32:
+    return value
+""",
+                encoding="utf-8",
+            )
+            qualified = root / "qualified.py"
+            qualified.write_text(
+                """
+import vernon_dsl as vd
+import fullscreen
+
+@vd.fragment
+def fragment_main() -> vd.Vector[vd.f32, 4]:
+    return vd.Vector([1.0, 0.0, 0.0, 1.0])
+
+asset = vd.pipeline_asset(
+    id="pipelines/qualified",
+    program=(fullscreen.fullscreen_vertex, fragment_main),
+)
+""",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(PipelineCompileError, "simple imported or local function names"):
+                parse_python_pipeline_asset(qualified, "asset")
+
+            (root / "exports.py").write_text(
+                "from fullscreen import fullscreen_vertex\n",
+                encoding="utf-8",
+            )
+            reexported = root / "reexported.py"
+            reexported.write_text(
+                """
+import vernon_dsl as vd
+from exports import fullscreen_vertex
+
+@vd.fragment
+def fragment_main() -> vd.Vector[vd.f32, 4]:
+    return vd.Vector([1.0, 0.0, 0.0, 1.0])
+
+asset = vd.pipeline_asset(
+    id="pipelines/reexported",
+    program=(fullscreen_vertex, fragment_main),
+)
+""",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(PipelineCompileError, "has no symbol 'fullscreen_vertex'"):
+                parse_python_pipeline_asset(reexported, "asset")
+
     def test_python_pipeline_asset_is_parsed_without_execution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "asset.py"
@@ -187,6 +292,12 @@ asset = vd.pipeline_asset(
 
 
 class ShaderAssetCookTests(unittest.TestCase):
+    def test_wasm_relocatable_object_preserves_compound_suffix(self) -> None:
+        self.assertEqual(
+            artifact_extension("relocatable_object", "compute", "module.wasm.o"),
+            ".wasm.o",
+        )
+
     def test_cooker_rejects_non_python_pipeline_asset_references(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

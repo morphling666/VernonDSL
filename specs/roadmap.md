@@ -198,6 +198,13 @@ permit removing queue waits or letting recorded work outlive its owners.
   inputs.
 - Publish benchmark history and stable regression thresholds.
 
+### Post-release platform and execution sequence
+
+The sequencing and scope for performance work, statically linked browser
+WebAssembly CPU objects, asynchronous GPU execution, and GPU autodiff are
+defined in the
+[`Platform and execution evolution plan`](platform_execution_plan.md).
+
 ### Host language and native interop
 
 The proposed [`Host language design`](host_language.md) adds a restricted

@@ -70,6 +70,7 @@ VernonStatus staticallyLinkedFill(const VernonCpuInvocation *invocation) {
 
 } // namespace
 
+#if !defined(VERNON_RUNTIME_PROFILE_WEB)
 TEST(RuntimeCpuPipeline, ReflectsImageConstraintsAndRejectsLegacyMetadata) {
     const std::filesystem::path directory = VERNON_CPU_BUNDLE_PATH;
     const std::string directoryUtf8 = directory.u8string();
@@ -317,3 +318,81 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     vernonRuntimePipelineBundleDestroy(loaded);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
 }
+#endif
+
+#if defined(VERNON_RUNTIME_PROFILE_WEB)
+TEST(RuntimeCpuPipeline, WebProfileLoadsMultipleStaticPipelinesWithoutFilesystem) {
+    const std::filesystem::path directory = VERNON_CPU_BUNDLE_PATH;
+    const std::string fixture = readFile(directory / "cpu_fill.pipeline.json");
+    ASSERT_FALSE(fixture.empty());
+
+    auto wasmManifest = [&](const char *id, const char *symbol) {
+        nlohmann::json root = nlohmann::json::parse(fixture);
+        root["id"] = id;
+        root["target"]["options"] = {{"triple", "wasm32-unknown-emscripten"}};
+        root["runtime_requirements"]["target_triple"] = "wasm32-unknown-emscripten";
+        root["runtime_requirements"]["object_format"] = "wasm";
+        nlohmann::json &stage = root["stage_artifacts"]["fill"];
+        stage["symbol"] = symbol;
+        stage["artifact"] = {{"format", "relocatable_object"},
+                             {"storage", "external"},
+                             {"path", std::string(symbol) + ".wasm.o"},
+                             {"size", 16},
+                             {"sha256", std::string(64, 'a')}};
+        stage["reflection"]["target"]["options"] = {{"triple", "wasm32-unknown-emscripten"}};
+        return withContentHash(std::move(root));
+    };
+
+    ASSERT_EQ(vernonRuntimeRegisterStaticCpuEntry({"vernon_web_fill_a", 17}, staticallyLinkedFill), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeRegisterStaticCpuEntry({"vernon_web_fill_b", 17}, staticallyLinkedFill), VERNON_STATUS_OK);
+    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(runtime, nullptr);
+
+    const std::string firstManifest = wasmManifest("cpu/web/a", "vernon_web_fill_a");
+    const std::string secondManifest = wasmManifest("cpu/web/b", "vernon_web_fill_b");
+    VernonPipelineBundle *firstBundle =
+        vernonRuntimeLoadPipelineBundleWithOptions(runtime, firstManifest.data(), firstManifest.size(), nullptr);
+    VernonPipelineBundle *secondBundle =
+        vernonRuntimeLoadPipelineBundleWithOptions(runtime, secondManifest.data(), secondManifest.size(), nullptr);
+    const VernonStringView loadError = vernonRuntimeGetLastError(runtime);
+    ASSERT_NE(firstBundle, nullptr) << std::string(loadError.data ? loadError.data : "", loadError.size);
+    ASSERT_NE(secondBundle, nullptr) << std::string(loadError.data ? loadError.data : "", loadError.size);
+    VernonLoadedPipeline *first = vernonRuntimeResolvePipeline(firstBundle, {nullptr, 0});
+    VernonLoadedPipeline *second = vernonRuntimeResolvePipeline(secondBundle, {nullptr, 0});
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(second, nullptr);
+
+    VernonPipelineParameterView parameter{};
+    ASSERT_EQ(vernonRuntimeLoadedPipelineGetParameterByIndex(first, 0, &parameter), VERNON_STATUS_OK);
+    float output[16]{};
+    const uint64_t shape[] = {16};
+    const int64_t strides[] = {sizeof(float)};
+    VernonPipelineArgument argument{};
+    argument.slot = 0;
+    argument.kind = VERNON_PIPELINE_TENSOR;
+    argument.tensor.struct_size = sizeof(VernonTensorView);
+    argument.tensor.storage = VERNON_TENSOR_HOST;
+    argument.tensor.host_data = output;
+    argument.tensor.element_layout = parameter.element_layout;
+    argument.tensor.access = VERNON_ACCESS_WRITE;
+    argument.tensor.rank = 1;
+    argument.tensor.shape = shape;
+    argument.tensor.byte_strides = strides;
+    argument.tensor.byte_size = sizeof(output);
+    VernonPipelineInvocation invocation{};
+    invocation.struct_size = sizeof(invocation);
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.arguments = &argument;
+    invocation.argument_count = 1;
+    invocation.compute_grid = {2, 1, 2};
+    EXPECT_EQ(vernonRuntimePipelineInvoke(first, &invocation), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRuntimePipelineInvoke(second, &invocation), VERNON_STATUS_OK);
+    EXPECT_EQ(output[15], 113.0f);
+
+    vernonRuntimeLoadedPipelineDestroy(second);
+    vernonRuntimeLoadedPipelineDestroy(first);
+    vernonRuntimePipelineBundleDestroy(secondBundle);
+    vernonRuntimePipelineBundleDestroy(firstBundle);
+    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
+}
+#endif

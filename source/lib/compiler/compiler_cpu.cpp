@@ -218,6 +218,8 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
 }
 
 std::string cpuObjectFilename(const llvm::Triple &triple) {
+    if (triple.isWasm())
+        return "module.wasm.o";
     return triple.isOSBinFormatCOFF() ? "module.obj" : "module.o";
 }
 
@@ -279,8 +281,9 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
     const std::string targetTriple =
         llvm::Triple::normalize(hostTarget ? llvm::sys::getDefaultTargetTriple() : options.targetTriple);
     const llvm::Triple parsedTriple(targetTriple);
-    if (!parsedTriple.isArch64Bit()) {
-        diagnostics = "CPU relocatable objects currently require a 64-bit target triple";
+    const bool supportedWasmTarget = parsedTriple.getArch() == llvm::Triple::wasm32 && parsedTriple.isOSEmscripten();
+    if (!parsedTriple.isArch64Bit() && !supportedWasmTarget) {
+        diagnostics = "CPU relocatable objects require a 64-bit native target or wasm32-unknown-emscripten";
         return CpuCompileResult::CodegenFailure;
     }
     std::string lookupError;

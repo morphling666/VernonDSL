@@ -51,6 +51,8 @@ def artifact_extension(artifact_format: str, stage: str, original_name: str = ""
     if artifact_format == "native_library":
         return Path(original_name).suffix or ".native"
     if artifact_format == "relocatable_object":
+        if original_name.endswith(".wasm.o"):
+            return ".wasm.o"
         suffix = Path(original_name).suffix
         return suffix if suffix in {".o", ".obj"} else ".o"
     return Path(original_name).suffix or f".{artifact_format}"

@@ -78,6 +78,17 @@ namespace {
 
 using namespace vernon::runtime;
 
+ArtifactResolution artifactResolutionFor(const VernonRuntimeContext &context, const RuntimeRequirements &requirements) {
+#if defined(VERNON_RUNTIME_PROFILE_WEB)
+    if (context.backend == VERNON_RUNTIME_CPU && requirements.objectFormat == "wasm")
+        return ArtifactResolution::MetadataOnly;
+#else
+    (void)context;
+    (void)requirements;
+#endif
+    return ArtifactResolution::LoadBytes;
+}
+
 VernonStatus fail(VernonRuntimeContext *context, std::string_view error,
                   VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) noexcept {
     try {
@@ -407,7 +418,9 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                 return nullptr;
             }
             ResolvedArtifact resolved;
-            if (!resolveArtifact(value["artifact"], bundleDirectory, resolved, invocationDiagnostic(*context)))
+            const ArtifactResolution resolution = artifactResolutionFor(*context, requirements);
+            if (!resolveArtifact(value["artifact"], bundleDirectory, resolved, invocationDiagnostic(*context),
+                                 resolution))
                 return nullptr;
             const char *expectedFormat = context->backend == VERNON_RUNTIME_CUDA        ? "ptx"
                                          : context->backend == VERNON_RUNTIME_VULKAN    ? "spirv"
@@ -429,13 +442,14 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                 return nullptr;
             }
             if (context->backend == VERNON_RUNTIME_CPU) {
-                if (!bundleDirectory || !resolved.external) {
+                if (!resolved.external || (resolution == ArtifactResolution::LoadBytes && !bundleDirectory)) {
                     fail(context, "CPU pipeline artifacts require an external bundle directory");
                     return nullptr;
                 }
                 const nlohmann::json &nativeArtifact = value["artifact"];
                 CpuNativeArtifact artifact;
-                artifact.root = *bundleDirectory;
+                if (bundleDirectory)
+                    artifact.root = *bundleDirectory;
                 artifact.relativeLibrary = std::filesystem::u8path(nativeArtifact.value("path", ""));
                 artifact.entry = stage.entry;
                 artifact.format = resolved.format;
@@ -445,6 +459,7 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                 artifact.size = nativeArtifact.value("size", uint64_t{0});
                 artifact.sha256 = nativeArtifact.value("sha256", "");
                 artifact.reflection = value["reflection"];
+                artifact.staticallyLinked = resolution == ArtifactResolution::MetadataOnly;
                 std::filesystem::path validatedPath;
                 const std::string format = resolved.format;
                 if ((format != "native_library" && format != "relocatable_object") ||

@@ -20,6 +20,7 @@ def _parser() -> argparse.ArgumentParser:
             "CPU examples:\n"
             "  --target cpu --cpu-triple x86_64-pc-windows-msvc --cpu-name x86-64-v3\n"
             "  --target cpu --cpu-triple aarch64-apple-darwin --cpu-name apple-m1 --cpu-features +neon\n"
+            "  --target cpu --cpu-triple wasm32-unknown-emscripten\n"
             "\n"
             "The target triple selects the ISA, OS, and ABI. --cpu-name then selects a processor model "
             "within that ISA, while --cpu-features applies explicit LLVM feature toggles."
@@ -68,7 +69,8 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "LLVM target triple for --target cpu; selects architecture, platform, and ABI, "
             "for example x86_64-pc-windows-msvc or aarch64-apple-darwin; "
-            "defaults to the host triple and currently must describe a 64-bit target"
+            "defaults to the host triple; supported targets are 64-bit native triples and "
+            "wasm32-unknown-emscripten"
         ),
     )
     cpu.add_argument(

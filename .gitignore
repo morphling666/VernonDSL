@@ -1,5 +1,6 @@
 *.pyc
 *build/
+*-cooked/
 .venv/
 __pycache__/
 .pytest_cache/

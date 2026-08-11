@@ -169,6 +169,11 @@ llvm::Error defineCpuTextureSampleHelper(llvm::Module &module) {
 
     llvm::LLVMContext &context = module.getContext();
     llvm::Type *pointerType = llvm::PointerType::get(context, 0);
+    const unsigned pointerBits = module.getDataLayout().getPointerSizeInBits();
+    if (pointerBits != 32 && pointerBits != 64)
+        return invalidAbi("CPU texture callback ABI requires 32-bit or 64-bit pointers");
+    llvm::IntegerType *uintptrType = llvm::IntegerType::get(context, pointerBits);
+    auto *callbacksType = llvm::StructType::get(context, {pointerType, pointerType, pointerType});
     auto *uvType = llvm::FixedVectorType::get(llvm::Type::getFloatTy(context), 2);
     auto *resultType = llvm::FixedVectorType::get(llvm::Type::getFloatTy(context), 4);
     if (helper->arg_size() != 4 || helper->getArg(0)->getType() != llvm::Type::getInt64Ty(context) ||
@@ -180,21 +185,21 @@ llvm::Error defineCpuTextureSampleHelper(llvm::Module &module) {
     llvm::BasicBlock *entry = llvm::BasicBlock::Create(context, "entry", helper);
     llvm::IRBuilder<> builder(entry);
     llvm::Value *callbacks = helper->getArg(3);
-    llvm::LoadInst *userData = builder.CreateLoad(pointerType, callbacks, "user_data");
+    llvm::LoadInst *userData =
+        builder.CreateLoad(pointerType, builder.CreateStructGEP(callbacksType, callbacks, 0), "user_data");
     userData->setAlignment(llvm::Align(1));
-    llvm::Value *sampleAddress = builder.CreateGEP(llvm::Type::getInt8Ty(context), callbacks,
-                                                   llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8));
+    llvm::Value *sampleAddress = builder.CreateStructGEP(callbacksType, callbacks, 1);
     llvm::LoadInst *sampleFunction = builder.CreateLoad(pointerType, sampleAddress, "sample_2d");
     sampleFunction->setAlignment(llvm::Align(1));
     llvm::Value *output = builder.CreateAlloca(llvm::ArrayType::get(llvm::Type::getFloatTy(context), 4));
-    auto callbackType =
-        llvm::FunctionType::get(llvm::Type::getVoidTy(context),
-                                {pointerType, llvm::Type::getInt64Ty(context), llvm::Type::getFloatTy(context),
-                                 llvm::Type::getFloatTy(context), pointerType},
-                                false);
+    auto callbackType = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(context),
+        {pointerType, uintptrType, llvm::Type::getFloatTy(context), llvm::Type::getFloatTy(context), pointerType},
+        false);
     llvm::Value *uv = helper->getArg(2);
+    llvm::Value *texture = builder.CreateZExtOrTrunc(helper->getArg(0), uintptrType);
     builder.CreateCall(callbackType, sampleFunction,
-                       {userData, helper->getArg(0), builder.CreateExtractElement(uv, uint64_t{0}),
+                       {userData, texture, builder.CreateExtractElement(uv, uint64_t{0}),
                         builder.CreateExtractElement(uv, uint64_t{1}), output});
     llvm::LoadInst *sample = builder.CreateLoad(resultType, output);
     sample->setAlignment(llvm::Align(1));
@@ -227,6 +232,11 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
 
     llvm::LLVMContext &context = module.getContext();
     llvm::Type *pointerType = llvm::PointerType::get(context, 0);
+    const unsigned pointerBits = module.getDataLayout().getPointerSizeInBits();
+    if (pointerBits != 32 && pointerBits != 64)
+        return invalidAbi("CPU ABI requires 32-bit or 64-bit pointers");
+    llvm::IntegerType *sizeType = llvm::IntegerType::get(context, pointerBits);
+    auto *invocationType = llvm::StructType::get(context, {pointerType, sizeType, pointerType, sizeType, pointerType});
     auto wrapperType = llvm::FunctionType::get(llvm::Type::getInt32Ty(context), {pointerType}, false);
     llvm::Function *laneWrapper = llvm::Function::Create(wrapperType, llvm::GlobalValue::InternalLinkage,
                                                          metadata.exportedWrapperSymbol + ".lane", module);
@@ -243,21 +253,19 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
         invalidBlock, sizeBlock);
 
     builder.SetInsertPoint(sizeBlock);
-    llvm::LoadInst *argumentsLoad = builder.CreateLoad(pointerType, invocation, "arguments");
+    llvm::LoadInst *argumentsLoad =
+        builder.CreateLoad(pointerType, builder.CreateStructGEP(invocationType, invocation, 0), "arguments");
     argumentsLoad->setAlignment(llvm::Align(1));
     llvm::Value *arguments = argumentsLoad;
-    llvm::Value *argumentsSizeAddress = builder.CreateGEP(llvm::Type::getInt8Ty(context), invocation,
-                                                          llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8));
-    llvm::LoadInst *argumentsSize = builder.CreateLoad(llvm::Type::getInt64Ty(context), argumentsSizeAddress);
+    llvm::LoadInst *argumentsSize =
+        builder.CreateLoad(sizeType, builder.CreateStructGEP(invocationType, invocation, 1), "arguments_size");
     argumentsSize->setAlignment(llvm::Align(1));
-    llvm::Value *resultsAddress = builder.CreateGEP(llvm::Type::getInt8Ty(context), invocation,
-                                                    llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 16));
-    llvm::LoadInst *resultsLoad = builder.CreateLoad(pointerType, resultsAddress, "results");
+    llvm::LoadInst *resultsLoad =
+        builder.CreateLoad(pointerType, builder.CreateStructGEP(invocationType, invocation, 2), "results");
     resultsLoad->setAlignment(llvm::Align(1));
     llvm::Value *results = resultsLoad;
-    llvm::Value *resultsSizeAddress = builder.CreateGEP(llvm::Type::getInt8Ty(context), invocation,
-                                                        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 24));
-    llvm::LoadInst *resultsSize = builder.CreateLoad(llvm::Type::getInt64Ty(context), resultsSizeAddress);
+    llvm::LoadInst *resultsSize =
+        builder.CreateLoad(sizeType, builder.CreateStructGEP(invocationType, invocation, 3), "results_size");
     resultsSize->setAlignment(llvm::Align(1));
     llvm::Value *validArguments =
         metadata.argumentsSize == 0
@@ -265,19 +273,16 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
             : builder.CreateAnd(
                   builder.CreateICmpNE(arguments,
                                        llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(pointerType))),
-                  builder.CreateICmpUGE(
-                      argumentsSize, llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), metadata.argumentsSize)));
+                  builder.CreateICmpUGE(argumentsSize, llvm::ConstantInt::get(sizeType, metadata.argumentsSize)));
     llvm::Value *validResults =
         metadata.resultsSize == 0
             ? llvm::ConstantInt::getTrue(context)
             : builder.CreateAnd(
                   builder.CreateICmpNE(results,
                                        llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(pointerType))),
-                  builder.CreateICmpUGE(resultsSize,
-                                        llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), metadata.resultsSize)));
-    llvm::Value *texturesAddress = builder.CreateGEP(llvm::Type::getInt8Ty(context), invocation,
-                                                     llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 32));
-    llvm::LoadInst *textures = builder.CreateLoad(pointerType, texturesAddress, "textures");
+                  builder.CreateICmpUGE(resultsSize, llvm::ConstantInt::get(sizeType, metadata.resultsSize)));
+    llvm::LoadInst *textures =
+        builder.CreateLoad(pointerType, builder.CreateStructGEP(invocationType, invocation, 4), "textures");
     textures->setAlignment(llvm::Align(1));
     llvm::Value *validTextures =
         metadata.requiresTextureCallbacks
@@ -308,10 +313,11 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
         }
 
         const uint64_t descriptorSize = 8 * (2 + 2 * static_cast<uint64_t>(packing.tensorRank));
-        if (packing.size != descriptorSize || module.getDataLayout().getPointerSize() != 8)
+        if (packing.size != descriptorSize)
             return invalidAbi("CPU TensorView descriptor has an incompatible size");
-        llvm::LoadInst *rawPointer = builder.CreateLoad(pointerType, address, "buffer");
-        rawPointer->setAlignment(llvm::Align(1));
+        llvm::LoadInst *rawPointerBits = builder.CreateLoad(builder.getInt64Ty(), address, "buffer_address");
+        rawPointerBits->setAlignment(llvm::Align(1));
+        llvm::Value *rawPointer = builder.CreateIntToPtr(rawPointerBits, pointerType, "buffer");
         for (size_t leafIndex = 0; leafIndex < packing.tensorLeafElementSizes.size(); ++leafIndex) {
             llvm::Type *allocatedType = function->getArg(loweredIndex++)->getType();
             llvm::Type *alignedType = function->getArg(loweredIndex++)->getType();
@@ -364,9 +370,11 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
             llvm::FunctionType::get(
                 builder.getInt64Ty(),
                 {builder.getInt64Ty(), builder.getInt64Ty(), builder.getInt64Ty(), builder.getInt64Ty()}, false));
-        llvm::Value *slotInteger = builder.CreateCall(
-            laneAddress, {builder.getInt64(VERNON_CPU_LANE_COROUTINE_HANDLE_SITE_V1), builder.getInt64(sizeof(void *)),
-                          builder.getInt64(alignof(void *)), builder.getInt64(0)});
+        llvm::Value *slotInteger =
+            builder.CreateCall(laneAddress, {builder.getInt64(VERNON_CPU_LANE_COROUTINE_HANDLE_SITE_V1),
+                                             builder.getInt64(module.getDataLayout().getPointerSize()),
+                                             builder.getInt64(module.getDataLayout().getPointerABIAlignment(0).value()),
+                                             builder.getInt64(0)});
         llvm::BasicBlock *slotReady = llvm::BasicBlock::Create(context, "phase.slot.ready", laneWrapper);
         llvm::BasicBlock *slotFailed = llvm::BasicBlock::Create(context, "phase.slot.failed", laneWrapper);
         builder.CreateCondBr(builder.CreateICmpNE(slotInteger, builder.getInt64(0)), slotReady, slotFailed);
@@ -375,7 +383,7 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
         builder.SetInsertPoint(slotReady);
         llvm::Value *slot = builder.CreateIntToPtr(slotInteger, pointerType);
         llvm::LoadInst *existingHandle = builder.CreateLoad(pointerType, slot, "coro.handle");
-        existingHandle->setAlignment(llvm::Align(alignof(void *)));
+        existingHandle->setAlignment(module.getDataLayout().getPointerABIAlignment(0));
 
         llvm::BasicBlock *create = llvm::BasicBlock::Create(context, "phase.create", laneWrapper);
         llvm::BasicBlock *resume = llvm::BasicBlock::Create(context, "phase.resume", laneWrapper);
@@ -398,7 +406,7 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
         builder.CreateRet(builder.getInt32(VERNON_STATUS_INTERNAL_ERROR));
 
         builder.SetInsertPoint(createReady);
-        builder.CreateStore(createdHandle, slot)->setAlignment(llvm::Align(alignof(void *)));
+        builder.CreateStore(createdHandle, slot)->setAlignment(module.getDataLayout().getPointerABIAlignment(0));
         builder.CreateBr(joined);
 
         builder.SetInsertPoint(resume);
@@ -417,7 +425,7 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
         llvm::Function *coroDestroy = llvm::Intrinsic::getOrInsertDeclaration(&module, llvm::Intrinsic::coro_destroy);
         builder.CreateCall(coroDestroy, {handle});
         builder.CreateStore(llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(pointerType)), slot)
-            ->setAlignment(llvm::Align(alignof(void *)));
+            ->setAlignment(module.getDataLayout().getPointerABIAlignment(0));
         builder.CreateRet(builder.getInt32(kLanePhaseComplete));
 
         builder.SetInsertPoint(yielded);
@@ -461,18 +469,19 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
     llvm::Type *i8 = llvm::Type::getInt8Ty(context);
     llvm::Type *i32 = llvm::Type::getInt32Ty(context);
     llvm::Type *i64 = llvm::Type::getInt64Ty(context);
-    auto *rangeType = llvm::StructType::get(context, {i64, pointerType, i64, pointerType, i64, pointerType,
-                                                      llvm::ArrayType::get(i32, 3), llvm::ArrayType::get(i32, 3),
-                                                      llvm::ArrayType::get(i32, 3), i64, i64, i64, i64, i64, i64, i32,
-                                                      pointerType, pointerType, i64});
+    auto *rangeType = llvm::StructType::get(
+        context, {sizeType, pointerType, sizeType, pointerType, sizeType, pointerType, llvm::ArrayType::get(i32, 3),
+                  llvm::ArrayType::get(i32, 3), llvm::ArrayType::get(i32, 3), sizeType, sizeType, sizeType, i64, i64,
+                  sizeType, i32, pointerType, pointerType, sizeType});
     const llvm::StructLayout *rangeLayout = module.getDataLayout().getStructLayout(rangeType);
-    if (rangeLayout->getSizeInBytes() != sizeof(VernonCpuRangeV1) ||
-        rangeLayout->getElementOffset(6) != offsetof(VernonCpuRangeV1, grid) ||
-        rangeLayout->getElementOffset(9) != offsetof(VernonCpuRangeV1, lane_begin) ||
-        rangeLayout->getElementOffset(16) != offsetof(VernonCpuRangeV1, lane_arguments) ||
-        rangeLayout->getElementOffset(18) != offsetof(VernonCpuRangeV1, lane_table_count))
+    if (pointerBits == sizeof(void *) * 8 &&
+        (rangeLayout->getSizeInBytes() != sizeof(VernonCpuRangeV1) ||
+         rangeLayout->getElementOffset(6) != offsetof(VernonCpuRangeV1, grid) ||
+         rangeLayout->getElementOffset(9) != offsetof(VernonCpuRangeV1, lane_begin) ||
+         rangeLayout->getElementOffset(16) != offsetof(VernonCpuRangeV1, lane_arguments) ||
+         rangeLayout->getElementOffset(18) != offsetof(VernonCpuRangeV1, lane_table_count)))
         return invalidAbi("CPU range descriptor layout does not match the host ABI");
-    auto *invocationType = llvm::StructType::get(context, {pointerType, i64, pointerType, i64, pointerType});
+    const uint64_t targetRangeSize = rangeLayout->getSizeInBytes();
 
     llvm::BasicBlock *dispatchEntry = llvm::BasicBlock::Create(context, "entry", wrapper);
     llvm::BasicBlock *rangeCheck = llvm::BasicBlock::Create(context, "range_check", wrapper);
@@ -494,11 +503,10 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
     builder.SetInsertPoint(dispatchKind);
     llvm::Value *publicArgumentsSizeAddress =
         builder.CreateStructGEP(invocationType, publicInvocation, 1, "arguments_size_address");
-    llvm::LoadInst *publicArgumentsSize = builder.CreateLoad(i64, publicArgumentsSizeAddress, "arguments_size");
+    llvm::LoadInst *publicArgumentsSize = builder.CreateLoad(sizeType, publicArgumentsSizeAddress, "arguments_size");
     publicArgumentsSize->setAlignment(llvm::Align(1));
-    builder.CreateCondBr(
-        builder.CreateICmpEQ(publicArgumentsSize, builder.getInt64(VERNON_CPU_RANGE_ARGUMENTS_SIZE_V1)), rangeCheck,
-        rangeInvalid);
+    builder.CreateCondBr(builder.CreateICmpEQ(publicArgumentsSize, llvm::ConstantInt::getAllOnesValue(sizeType)),
+                         rangeCheck, rangeInvalid);
 
     builder.SetInsertPoint(rangeCheck);
     llvm::LoadInst *rangePointer = builder.CreateLoad(pointerType, publicInvocation, "range");
@@ -508,21 +516,25 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
     builder.CreateCondBr(rangePresent, rangeSetup, rangeInvalid);
 
     builder.SetInsertPoint(rangeSetup);
-    llvm::LoadInst *rangeStructSize = builder.CreateLoad(i64, builder.CreateStructGEP(rangeType, rangePointer, 0));
+    llvm::LoadInst *rangeStructSize = builder.CreateLoad(sizeType, builder.CreateStructGEP(rangeType, rangePointer, 0));
     rangeStructSize->setAlignment(llvm::Align(1));
-    builder.CreateCondBr(builder.CreateICmpEQ(rangeStructSize, builder.getInt64(sizeof(VernonCpuRangeV1))), rangeFields,
-                         rangeInvalid);
+    builder.CreateCondBr(builder.CreateICmpEQ(rangeStructSize, llvm::ConstantInt::get(sizeType, targetRangeSize)),
+                         rangeFields, rangeInvalid);
 
     builder.SetInsertPoint(rangeFields);
     llvm::LoadInst *rangeArguments =
         builder.CreateLoad(pointerType, builder.CreateStructGEP(rangeType, rangePointer, 1));
     rangeArguments->setAlignment(llvm::Align(1));
-    llvm::LoadInst *rangeArgumentsSize = builder.CreateLoad(i64, builder.CreateStructGEP(rangeType, rangePointer, 2));
-    rangeArgumentsSize->setAlignment(llvm::Align(1));
+    llvm::LoadInst *rangeArgumentsSizeValue =
+        builder.CreateLoad(sizeType, builder.CreateStructGEP(rangeType, rangePointer, 2));
+    rangeArgumentsSizeValue->setAlignment(llvm::Align(1));
+    llvm::Value *rangeArgumentsSize = builder.CreateZExtOrTrunc(rangeArgumentsSizeValue, i64);
     llvm::LoadInst *rangeResults = builder.CreateLoad(pointerType, builder.CreateStructGEP(rangeType, rangePointer, 3));
     rangeResults->setAlignment(llvm::Align(1));
-    llvm::LoadInst *rangeResultsSize = builder.CreateLoad(i64, builder.CreateStructGEP(rangeType, rangePointer, 4));
-    rangeResultsSize->setAlignment(llvm::Align(1));
+    llvm::LoadInst *rangeResultsSizeValue =
+        builder.CreateLoad(sizeType, builder.CreateStructGEP(rangeType, rangePointer, 4));
+    rangeResultsSizeValue->setAlignment(llvm::Align(1));
+    llvm::Value *rangeResultsSize = builder.CreateZExtOrTrunc(rangeResultsSizeValue, i64);
     llvm::LoadInst *rangeTextures =
         builder.CreateLoad(pointerType, builder.CreateStructGEP(rangeType, rangePointer, 5));
     rangeTextures->setAlignment(llvm::Align(1));
@@ -531,12 +543,16 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
     laneArguments->setAlignment(llvm::Align(1));
     llvm::LoadInst *laneResults = builder.CreateLoad(pointerType, builder.CreateStructGEP(rangeType, rangePointer, 17));
     laneResults->setAlignment(llvm::Align(1));
-    llvm::LoadInst *laneTableCount = builder.CreateLoad(i64, builder.CreateStructGEP(rangeType, rangePointer, 18));
-    laneTableCount->setAlignment(llvm::Align(1));
-    llvm::LoadInst *laneBegin = builder.CreateLoad(i64, builder.CreateStructGEP(rangeType, rangePointer, 9));
-    laneBegin->setAlignment(llvm::Align(1));
-    llvm::LoadInst *laneEnd = builder.CreateLoad(i64, builder.CreateStructGEP(rangeType, rangePointer, 10));
-    laneEnd->setAlignment(llvm::Align(1));
+    llvm::LoadInst *laneTableCountValue =
+        builder.CreateLoad(sizeType, builder.CreateStructGEP(rangeType, rangePointer, 18));
+    laneTableCountValue->setAlignment(llvm::Align(1));
+    llvm::Value *laneTableCount = builder.CreateZExtOrTrunc(laneTableCountValue, i64);
+    llvm::LoadInst *laneBeginValue = builder.CreateLoad(sizeType, builder.CreateStructGEP(rangeType, rangePointer, 9));
+    laneBeginValue->setAlignment(llvm::Align(1));
+    llvm::Value *laneBegin = builder.CreateZExtOrTrunc(laneBeginValue, i64);
+    llvm::LoadInst *laneEndValue = builder.CreateLoad(sizeType, builder.CreateStructGEP(rangeType, rangePointer, 10));
+    laneEndValue->setAlignment(llvm::Align(1));
+    llvm::Value *laneEnd = builder.CreateZExtOrTrunc(laneEndValue, i64);
 
     llvm::Value *workgroupValidationPointer = builder.CreateStructGEP(rangeType, rangePointer, 7);
     llvm::Value *gridValidationPointer = builder.CreateStructGEP(rangeType, rangePointer, 6);
@@ -612,11 +628,11 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
     llvm::AllocaInst *packed = builder.CreateAlloca(packedType, nullptr, "range_arguments");
     packed->setAlignment(llvm::Align(16));
     llvm::AllocaInst *laneInvocation = builder.CreateAlloca(invocationType, nullptr, "lane_invocation");
-    laneInvocation->setAlignment(llvm::Align(8));
+    laneInvocation->setAlignment(module.getDataLayout().getABITypeAlign(invocationType));
     builder.CreateStore(packed, builder.CreateStructGEP(invocationType, laneInvocation, 0));
-    builder.CreateStore(builder.getInt64(metadata.argumentsSize),
+    builder.CreateStore(llvm::ConstantInt::get(sizeType, metadata.argumentsSize),
                         builder.CreateStructGEP(invocationType, laneInvocation, 1));
-    builder.CreateStore(builder.getInt64(metadata.resultsSize),
+    builder.CreateStore(llvm::ConstantInt::get(sizeType, metadata.resultsSize),
                         builder.CreateStructGEP(invocationType, laneInvocation, 3));
     builder.CreateStore(rangeTextures, builder.CreateStructGEP(invocationType, laneInvocation, 4));
     builder.CreateCondBr(validRange, rangeLoop, rangeInvalid);
@@ -627,7 +643,8 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
     builder.CreateCondBr(builder.CreateICmpULT(lane, laneEnd), rangeCall, rangeDone);
 
     builder.SetInsertPoint(rangeCall);
-    builder.CreateStore(lane, builder.CreateStructGEP(rangeType, rangePointer, 11));
+    builder.CreateStore(builder.CreateZExtOrTrunc(lane, sizeType),
+                        builder.CreateStructGEP(rangeType, rangePointer, 11));
     llvm::Value *workgroupPointer = builder.CreateStructGEP(rangeType, rangePointer, 7);
     llvm::Value *groupPointer = builder.CreateStructGEP(rangeType, rangePointer, 8);
     llvm::SmallVector<llvm::Value *, 3> workgroup;
@@ -738,8 +755,8 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
 
         builder.SetInsertPoint(recordCompletion);
         llvm::Value *completedAddress = builder.CreateStructGEP(rangeType, rangePointer, 14);
-        llvm::Value *completed = builder.CreateLoad(i64, completedAddress);
-        builder.CreateStore(builder.CreateAdd(completed, builder.getInt64(1)), completedAddress);
+        llvm::Value *completed = builder.CreateLoad(sizeType, completedAddress);
+        builder.CreateStore(builder.CreateAdd(completed, llvm::ConstantInt::get(sizeType, 1)), completedAddress);
         builder.CreateBr(rangeNext);
 
         builder.SetInsertPoint(phaseFailure);
@@ -750,8 +767,8 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
         builder.CreateCondBr(builder.CreateICmpEQ(laneStatus, builder.getInt32(0)), laneCompleted, laneFailure);
         builder.SetInsertPoint(laneCompleted);
         llvm::Value *completedAddress = builder.CreateStructGEP(rangeType, rangePointer, 14);
-        llvm::Value *completed = builder.CreateLoad(i64, completedAddress);
-        builder.CreateStore(builder.CreateAdd(completed, builder.getInt64(1)), completedAddress);
+        llvm::Value *completed = builder.CreateLoad(sizeType, completedAddress);
+        builder.CreateStore(builder.CreateAdd(completed, llvm::ConstantInt::get(sizeType, 1)), completedAddress);
         builder.CreateBr(rangeNext);
         builder.SetInsertPoint(laneFailure);
         builder.CreateRet(laneStatus);

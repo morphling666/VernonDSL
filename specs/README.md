@@ -31,6 +31,11 @@ Supporting future designs:
   lists incomplete language-v4 acceptance gates.
 - [`host_language.md`](host_language.md) defines the proposed interpreted and
   AOT Host domain, C++ API schema, and desktop/browser acceptance demo.
+- [`platform_execution_plan.md`](platform_execution_plan.md) sequences
+  performance measurement, statically linked browser WebAssembly CPU support,
+  asynchronous GPU execution, and GPU autodiff.
+- [`web_wasm.md`](web_wasm.md) describes the static WebAssembly CPU architecture,
+  build, linking, and browser deployment path.
 
 ## Version policy
 

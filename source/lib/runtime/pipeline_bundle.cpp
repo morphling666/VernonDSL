@@ -114,6 +114,15 @@ bool validateManifestHash(const nlohmann::json &root, bool required, std::string
 
 bool validateCpuRuntimeRequirements(const std::string &targetTriple, const std::string &objectFormat,
                                     std::string &error) {
+#if defined(VERNON_RUNTIME_PROFILE_WEB)
+    if (targetTriple.rfind("wasm32-", 0) != 0 || targetTriple.find("emscripten") == std::string::npos ||
+        objectFormat != "wasm") {
+        error = "pipeline requires CPU target " + targetTriple + " / " + objectFormat +
+                ", web runtime provides wasm32-unknown-emscripten / wasm";
+        return false;
+    }
+    return true;
+#else
 #if defined(_WIN32)
     constexpr const char *hostFormat = "coff";
     constexpr const char *hostOsToken = "windows";
@@ -134,10 +143,11 @@ bool validateCpuRuntimeRequirements(const std::string &targetTriple, const std::
         return false;
     }
     return true;
+#endif
 }
 
 bool resolveArtifact(const nlohmann::json &descriptor, const std::optional<std::filesystem::path> &directory,
-                     ResolvedArtifact &output, std::string &error) {
+                     ResolvedArtifact &output, std::string &error, ArtifactResolution resolution) {
     if (!descriptor.is_object() || !descriptor.contains("format") || !descriptor["format"].is_string() ||
         !descriptor.contains("storage") || !descriptor["storage"].is_string() || !descriptor.contains("size") ||
         !descriptor["size"].is_number_unsigned() || !descriptor.contains("sha256") ||
@@ -188,7 +198,8 @@ bool resolveArtifact(const nlohmann::json &descriptor, const std::optional<std::
             return false;
         }
     } else if (storage == "external") {
-        if (!directory || !descriptor.contains("path") || !descriptor["path"].is_string()) {
+        if (!descriptor.contains("path") || !descriptor["path"].is_string() ||
+            (resolution == ArtifactResolution::LoadBytes && !directory)) {
             error = "external pipeline artifacts require a bundle directory and path";
             return false;
         }
@@ -198,6 +209,15 @@ bool resolveArtifact(const nlohmann::json &descriptor, const std::optional<std::
             std::find(relative.begin(), relative.end(), std::filesystem::path("..")) != relative.end()) {
             error = "external pipeline artifact path is not normalized";
             return false;
+        }
+        output.external = true;
+        if (resolution == ArtifactResolution::MetadataOnly) {
+            if (!declaredSize) {
+                error = "metadata-only pipeline artifact has an invalid size";
+                return false;
+            }
+            output.path = relative;
+            return true;
         }
         std::error_code filesystemError;
         const std::filesystem::path root = std::filesystem::canonical(*directory, filesystemError);
@@ -216,7 +236,6 @@ bool resolveArtifact(const nlohmann::json &descriptor, const std::optional<std::
             return false;
         }
         output.bytes = readFile(output.path);
-        output.external = true;
     } else {
         error = "pipeline artifact storage is unsupported";
         return false;
@@ -233,8 +252,9 @@ bool resolveCpuNativeArtifact(const CpuNativeArtifact &artifact, std::filesystem
                               ReflectedEntry *reflection, std::string &error) {
     const bool nativeLibrary = artifact.format == "native_library";
     const bool relocatableObject = artifact.format == "relocatable_object";
-    if (artifact.entry.empty() || artifact.symbol.empty() || artifact.relativeLibrary.empty() ||
-        artifact.sha256.size() != 64 || (!nativeLibrary && !relocatableObject) || artifact.targetTriple.empty() ||
+    if (artifact.entry.empty() || artifact.symbol.empty() || artifact.relativeLibrary.empty() || !artifact.size ||
+        !isSha256(artifact.sha256) || (!nativeLibrary && !relocatableObject) ||
+        (artifact.staticallyLinked && !relocatableObject) || artifact.targetTriple.empty() ||
         (artifact.objectFormat != "coff" && artifact.objectFormat != "elf" && artifact.objectFormat != "macho" &&
          artifact.objectFormat != "wasm")) {
         error = "unsupported or invalid CPU AOT artifact";
@@ -245,6 +265,16 @@ bool resolveCpuNativeArtifact(const CpuNativeArtifact &artifact, std::filesystem
             artifact.relativeLibrary.end()) {
         error = "CPU AOT artifact path is invalid";
         return false;
+    }
+
+    ReflectedEntry parsed;
+    if (!parseReflection(artifact.reflection, artifact.entry, parsed, VERNON_RUNTIME_CPU, error))
+        return false;
+    if (artifact.staticallyLinked) {
+        libraryPath.clear();
+        if (reflection)
+            *reflection = std::move(parsed);
+        return true;
     }
 
     std::error_code filesystemError;
@@ -270,9 +300,6 @@ bool resolveCpuNativeArtifact(const CpuNativeArtifact &artifact, std::filesystem
         error = "CPU AOT artifact size or SHA-256 mismatch";
         return false;
     }
-    ReflectedEntry parsed;
-    if (!parseReflection(artifact.reflection, artifact.entry, parsed, VERNON_RUNTIME_CPU, error))
-        return false;
     libraryPath = candidate;
     if (reflection)
         *reflection = std::move(parsed);

@@ -686,6 +686,15 @@ public:
     explicit Impl(CpuWorkgroupSchedulerConfig config) : config_(config) {}
 
     bool start(std::string &error) noexcept {
+#if defined(VERNON_RUNTIME_PROFILE_WEB)
+        if (config_.executionPolicy != CpuSchedulerExecutionPolicy::CallingThread) {
+            error = "the web Runtime requires the calling-thread CPU scheduler policy";
+            return false;
+        }
+        return true;
+#else
+        if (config_.executionPolicy == CpuSchedulerExecutionPolicy::CallingThread)
+            return true;
         if (ensureWorkers(config_.threadBudget))
             return true;
         try {
@@ -693,9 +702,11 @@ public:
         } catch (...) {
         }
         return false;
+#endif
     }
 
     ~Impl() {
+#if !defined(VERNON_RUNTIME_PROFILE_WEB)
         {
             std::lock_guard lock(queueMutex_);
             stopping_ = true;
@@ -704,6 +715,7 @@ public:
         for (std::thread &worker : workers_)
             if (worker.joinable())
                 worker.join();
+#endif
     }
 
     VernonStatus dispatch(const uint32_t grid[3], const uint32_t workgroup[3],
@@ -736,13 +748,24 @@ public:
                 return job->status();
             }
             const size_t runners =
-                std::min(config_.threadBudget, groupCount > std::numeric_limits<size_t>::max() / workgroupVolume
-                                                   ? config_.threadBudget
-                                                   : groupCount * workgroupVolume);
+                config_.executionPolicy == CpuSchedulerExecutionPolicy::CallingThread
+                    ? 1
+                    : std::min(config_.threadBudget, groupCount > std::numeric_limits<size_t>::max() / workgroupVolume
+                                                         ? config_.threadBudget
+                                                         : groupCount * workgroupVolume);
             auto job = std::make_shared<RangeJob>(runners, groupCount, workgroupVolume, grid, workgroup, callback);
-            if (!enqueue(job, runners))
-                return VERNON_STATUS_INTERNAL_ERROR;
-            job->wait();
+            if (config_.executionPolicy == CpuSchedulerExecutionPolicy::CallingThread) {
+                job->run();
+            } else {
+#if defined(VERNON_RUNTIME_PROFILE_WEB)
+                return fail("worker-pool scheduling is unavailable in the web Runtime",
+                            VERNON_STATUS_UNSUPPORTED_TARGET);
+#else
+                if (!enqueue(job, runners))
+                    return VERNON_STATUS_INTERNAL_ERROR;
+                job->wait();
+#endif
+            }
             if (job->status() != VERNON_STATUS_OK)
                 schedulerDiagnostic = job->diagnostic();
             return job->status();
@@ -762,6 +785,7 @@ public:
     const std::string &lastDiagnostic() const noexcept { return schedulerDiagnostic; }
 
 private:
+#if !defined(VERNON_RUNTIME_PROFILE_WEB)
     bool ensureWorkers(size_t required) {
         std::lock_guard workersLock(workersMutex_);
         if (workers_.size() >= required)
@@ -815,6 +839,7 @@ private:
             job->run();
         }
     }
+#endif
 
     VernonStatus fail(std::string message, VernonStatus status) noexcept {
         try {
@@ -825,12 +850,14 @@ private:
     }
 
     CpuWorkgroupSchedulerConfig config_;
+#if !defined(VERNON_RUNTIME_PROFILE_WEB)
     std::mutex workersMutex_;
     std::mutex queueMutex_;
     std::condition_variable workAvailable_;
     std::deque<std::shared_ptr<SchedulerJob>> queue_;
     bool stopping_{};
     std::vector<std::thread> workers_;
+#endif
 };
 
 CpuLaneCoordinates cpuRangeCoordinates(const VernonCpuRangeV1 &range, size_t localLinear) noexcept {
@@ -851,9 +878,14 @@ CpuLaneCoordinates cpuRangeCoordinates(const VernonCpuRangeV1 &range, size_t loc
 }
 
 CpuWorkgroupSchedulerConfig CpuWorkgroupScheduler::defaultConfig() noexcept {
+#if defined(VERNON_RUNTIME_PROFILE_WEB)
+    return {1, environmentSize("VERNON_CPU_MAX_WORKGROUP_VOLUME", kDefaultMaxWorkgroupVolume),
+            CpuSchedulerExecutionPolicy::CallingThread};
+#else
     const size_t detected = std::max(1u, std::thread::hardware_concurrency());
     return {environmentSize("VERNON_CPU_THREAD_BUDGET", detected),
             environmentSize("VERNON_CPU_MAX_WORKGROUP_VOLUME", kDefaultMaxWorkgroupVolume)};
+#endif
 }
 
 std::unique_ptr<CpuWorkgroupScheduler> CpuWorkgroupScheduler::create(CpuWorkgroupSchedulerConfig config,

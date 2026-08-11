@@ -146,6 +146,11 @@ def benchmark_kernel(iterations: int, architecture: str, elements: int) -> dict[
     ]
 
     host_values = np.ones(elements, dtype=np.float32)
+    upload_samples = [_milliseconds(lambda: values.copy_from_numpy(host_values)) for _ in range(iterations)]
+    readback_samples: list[float] = []
+    for _ in range(iterations):
+        BASELINE_SCALE(values, np.float32(1.0001), grid=grid)
+        readback_samples.append(_milliseconds(lambda: values.to_numpy()))
 
     def transfer_round_trip() -> None:
         values.copy_from_numpy(host_values)
@@ -159,6 +164,8 @@ def benchmark_kernel(iterations: int, architecture: str, elements: int) -> dict[
         "elements": elements,
         "cold_compile_and_dispatch_ms": round(cold_ms, 4),
         "warm_dispatch": _summary(warm_samples),
+        "host_upload": _summary(upload_samples),
+        "host_readback_after_dispatch": _summary(readback_samples),
         "upload_dispatch_readback": _summary(transfer_samples),
         "compile_count": BASELINE_SCALE.compile_count,
     }

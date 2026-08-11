@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Vernon external engine</title>
+    <style>
+      body {
+        max-width: 52rem;
+        margin: 4rem auto;
+        padding: 0 1rem;
+        font: 16px/1.5 system-ui, sans-serif;
+      }
+
+      pre {
+        padding: 1rem;
+        overflow: auto;
+        background: #111;
+        color: #eee;
+      }
+
+      canvas {
+        width: 100%;
+        height: auto;
+        background: #000;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Vernon external engine</h1>
+    <canvas id="canvas" width="800" height="450"></canvas>
+    <pre id="output">Loading WebAssembly…</pre>
+    <script>
+      const output = document.getElementById("output");
+      output.textContent = "";
+      var Module = {
+        canvas: document.getElementById("canvas"),
+        print(text) {
+          output.textContent += `${text}\n`;
+        },
+        printErr(text) {
+          output.textContent += `error: ${text}\n`;
+        },
+      };
+    </script>
+    <script src="vernon-external-engine.js"></script>
+  </body>
+</html>

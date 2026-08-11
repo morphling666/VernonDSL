@@ -357,11 +357,15 @@ TEST(PipelineManifestRequirements, ComparesApiAndCpuHostRequirements) {
     EXPECT_FALSE(runtimeVersionAtLeast({4, 5}, {4, 6}));
     EXPECT_EQ(glslVersionForApi(RuntimeVersion{3, 3}), 330u);
 
-#if defined(_M_ARM64) || defined(__aarch64__)
+#if defined(VERNON_RUNTIME_PROFILE_WEB)
+    constexpr const char *triple = "wasm32-unknown-emscripten";
+    constexpr const char *format = "wasm";
+#elif defined(_M_ARM64) || defined(__aarch64__)
 #define VERNON_TEST_TRIPLE_ARCH "aarch64"
 #else
 #define VERNON_TEST_TRIPLE_ARCH "x86_64"
 #endif
+#if !defined(VERNON_RUNTIME_PROFILE_WEB)
 #if defined(_WIN32)
     constexpr const char *triple = VERNON_TEST_TRIPLE_ARCH "-pc-windows-msvc";
     constexpr const char *format = "coff";
@@ -373,9 +377,14 @@ TEST(PipelineManifestRequirements, ComparesApiAndCpuHostRequirements) {
     constexpr const char *format = "elf";
 #endif
 #undef VERNON_TEST_TRIPLE_ARCH
+#endif
     std::string error;
     EXPECT_TRUE(validateCpuRuntimeRequirements(triple, format, error)) << error;
+#if defined(VERNON_RUNTIME_PROFILE_WEB)
+    EXPECT_FALSE(validateCpuRuntimeRequirements(triple, "macho", error));
+#else
     EXPECT_FALSE(validateCpuRuntimeRequirements(triple, "wasm", error));
+#endif
     EXPECT_NE(error.find("runtime provides"), std::string::npos);
 }
 

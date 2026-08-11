@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Any
 
 from ..bundle import PipelineCompileError, canonical_json
-from ..language.ast_utils import decorator_name, dotted_name
+from ..diagnostics import CompileError
+from ..language.ast_utils import dotted_name
 from ..language.stage_registry import ENTRY_DECORATOR_STAGES, validate_graphics_topology
-from ..module_graph import load_project
+from ..module_graph import load_project, resolve_project_entry
 from .descriptors import ShaderModuleDescriptor, ShaderPipelineDescriptor, ShaderStageReference
 
 _AD_PATH = re.compile(r"^[A-Za-z_]\w*(?:\.(?:[A-Za-z_]\w*|\d+))*$", re.ASCII)
@@ -160,19 +161,19 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
     pipeline_id = _literal_keyword(keywords, "id")
     if not isinstance(pipeline_id, str) or not pipeline_id:
         raise PipelineCompileError("pipeline asset id must be a non-empty string")
-    definitions = {
-        statement.name: {decorator_name(decorator) for decorator in statement.decorator_list}
-        for statement in tree.body
-        if isinstance(statement, ast.FunctionDef)
-    }
 
     def entry_stage(entry: ast.expr) -> tuple[str, str]:
         if not isinstance(entry, ast.Name):
-            raise PipelineCompileError("pipeline_asset program entries must reference functions in the same module")
-        decorators = definitions.get(entry.id)
-        if decorators is None:
+            raise PipelineCompileError(
+                "pipeline_asset program entries must use simple imported or local function names"
+            )
+        try:
+            resolution = resolve_project_entry(source_path, entry.id)
+        except CompileError as error:
+            raise PipelineCompileError(str(error)) from None
+        if resolution is None:
             raise PipelineCompileError(f"pipeline_asset program entry '{entry.id}' is not a function")
-        stages = {ENTRY_DECORATOR_STAGES[name] for name in decorators if name in ENTRY_DECORATOR_STAGES}
+        stages = {ENTRY_DECORATOR_STAGES[name] for name in resolution.decorators if name in ENTRY_DECORATOR_STAGES}
         if len(stages) != 1:
             raise PipelineCompileError(
                 f"pipeline_asset program entry '{entry.id}' must have exactly one entry-stage decorator"

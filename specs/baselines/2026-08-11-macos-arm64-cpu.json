@@ -1,0 +1,42 @@
+{
+  "environment": {
+    "platform": "macOS-26.4-arm64-arm-64bit",
+    "python": "3.11.9"
+  },
+  "result": {
+    "architecture": "cpu",
+    "cold_compile_and_dispatch_ms": 21.6217,
+    "compile_count": 1,
+    "elements": 65536,
+    "host_readback_after_dispatch": {
+      "count": 5,
+      "maximum_ms": 0.013,
+      "median_ms": 0.0117,
+      "minimum_ms": 0.0105,
+      "p95_ms": 0.013
+    },
+    "host_upload": {
+      "count": 5,
+      "maximum_ms": 0.0134,
+      "median_ms": 0.0095,
+      "minimum_ms": 0.0092,
+      "p95_ms": 0.0134
+    },
+    "scenario": "kernel",
+    "upload_dispatch_readback": {
+      "count": 5,
+      "maximum_ms": 1.363,
+      "median_ms": 1.3229,
+      "minimum_ms": 1.2802,
+      "p95_ms": 1.363
+    },
+    "warm_dispatch": {
+      "count": 5,
+      "maximum_ms": 1.4176,
+      "median_ms": 1.3586,
+      "minimum_ms": 1.2333,
+      "p95_ms": 1.4176
+    }
+  },
+  "schema_version": 1
+}

@@ -936,6 +936,29 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     ASSERT_TRUE(vernonCompileResultGetCpuEntry(ios_cpu_compile, "add_vectors", 11) == NULL);
     vernonCompileResultDestroy(ios_cpu_compile);
 
+    const char *wasm_triple = "wasm32-unknown-emscripten";
+    VernonCompileOptions wasm_options = {0};
+    wasm_options.struct_size = sizeof(wasm_options);
+    wasm_options.target = VERNON_TARGET_CPU;
+    wasm_options.as.cpu.triple = {wasm_triple, strlen(wasm_triple)};
+    VernonCompileResult *wasm_cpu_compile =
+        vernonCompilerCompileMlirWithOptions(context, cpu_module, strlen(cpu_module), &wasm_options);
+    ASSERT_TRUE(wasm_cpu_compile != NULL);
+    ASSERT_EQ(vernonCompileResultGetStatus(wasm_cpu_compile), VERNON_STATUS_OK)
+        << std::string(vernonCompileResultGetDiagnostics(wasm_cpu_compile).data,
+                       vernonCompileResultGetDiagnostics(wasm_cpu_compile).size);
+    ASSERT_TRUE(view_contains(vernonCompileResultGetArtifactName(wasm_cpu_compile, 0), "module.wasm.o"));
+    VernonStringView wasm_object = vernonCompileResultGetArtifactData(wasm_cpu_compile, 0);
+    ASSERT_TRUE(wasm_object.size > 8);
+    ASSERT_TRUE((unsigned char)wasm_object.data[0] == 0x00);
+    ASSERT_TRUE((unsigned char)wasm_object.data[1] == 0x61);
+    ASSERT_TRUE((unsigned char)wasm_object.data[2] == 0x73);
+    ASSERT_TRUE((unsigned char)wasm_object.data[3] == 0x6d);
+    ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(wasm_cpu_compile), "wasm32-unknown-emscripten"));
+    ASSERT_TRUE(view_contains(vernonCompileResultGetReflection(wasm_cpu_compile), "__vernon_cpu_"));
+    ASSERT_TRUE(vernonCompileResultGetCpuEntry(wasm_cpu_compile, "add_vectors", 11) == NULL);
+    vernonCompileResultDestroy(wasm_cpu_compile);
+
     VernonCompileResult *cpu_large_compile =
         vernonCompilerCompileMlir(context, cpu_large_vector_module, strlen(cpu_large_vector_module), VERNON_TARGET_CPU);
     ASSERT_TRUE(cpu_large_compile != NULL);

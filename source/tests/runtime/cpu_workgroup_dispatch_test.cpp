@@ -29,7 +29,11 @@ template <typename Callback> VernonStatus forEachLane(VernonCpuRangeV1 &range, C
 class CpuWorkgroupDispatchTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        scheduler_ = vernon::runtime::CpuWorkgroupScheduler::create({8, 256}, error_);
+        vernon::runtime::CpuWorkgroupSchedulerConfig config{8, 256};
+#if defined(VERNON_RUNTIME_PROFILE_WEB)
+        config.executionPolicy = vernon::runtime::CpuSchedulerExecutionPolicy::CallingThread;
+#endif
+        scheduler_ = vernon::runtime::CpuWorkgroupScheduler::create(config, error_);
         ASSERT_NE(scheduler_, nullptr) << error_;
     }
 
@@ -80,6 +84,33 @@ TEST_F(CpuWorkgroupDispatchTest, ExecutesEachInvocationInContiguousGroupRangesAn
     std::set<std::thread::id> workerPool = launchThreads[0];
     workerPool.insert(launchThreads[1].begin(), launchThreads[1].end());
     EXPECT_LE(workerPool.size(), 8u);
+}
+
+TEST_F(CpuWorkgroupDispatchTest, CallingThreadPolicyReusesRangePhaseEngineWithoutWorkers) {
+    std::string error;
+    auto scheduler = vernon::runtime::CpuWorkgroupScheduler::create(
+        {1, 256, vernon::runtime::CpuSchedulerExecutionPolicy::CallingThread}, error);
+    ASSERT_NE(scheduler, nullptr) << error;
+    constexpr uint32_t grid[3]{3, 1, 1};
+    constexpr uint32_t workgroup[3]{4, 1, 1};
+    std::array<uint32_t, 12> visits{};
+    const std::thread::id callingThread = std::this_thread::get_id();
+
+    ASSERT_EQ(scheduler->dispatch(grid, workgroup,
+                                  [&](VernonCpuRangeV1 &range) {
+                                      EXPECT_EQ(std::this_thread::get_id(), callingThread);
+                                      if (range.phase == 0) {
+                                          yield(range, 7);
+                                          return VERNON_STATUS_OK;
+                                      }
+                                      return forEachLane(range, [&](const vernon::runtime::CpuLaneCoordinates &lane) {
+                                          ++visits[lane.linearIndex];
+                                          return VERNON_STATUS_OK;
+                                      });
+                                  }),
+              VERNON_STATUS_OK)
+        << scheduler->lastDiagnostic();
+    EXPECT_TRUE(std::all_of(visits.begin(), visits.end(), [](uint32_t count) { return count == 1; }));
 }
 
 TEST_F(CpuWorkgroupDispatchTest, PersistsSharedStorageAcrossNonblockingPhases) {
@@ -179,6 +210,7 @@ TEST_F(CpuWorkgroupDispatchTest, PersistsLanePrivateScratchAcrossPhases) {
         << scheduler_->lastDiagnostic();
 }
 
+#if !defined(VERNON_RUNTIME_PROFILE_WEB)
 TEST_F(CpuWorkgroupDispatchTest, RunsConcurrentDispatchesWithinOneWorkerBudget) {
     constexpr uint32_t grid[3]{8, 1, 1};
     constexpr uint32_t workgroup[3]{4, 1, 1};
@@ -215,6 +247,7 @@ TEST_F(CpuWorkgroupDispatchTest, RunsConcurrentDispatchesWithinOneWorkerBudget) 
     EXPECT_EQ(statuses[0], VERNON_STATUS_OK);
     EXPECT_EQ(statuses[1], VERNON_STATUS_OK);
 }
+#endif
 
 TEST_F(CpuWorkgroupDispatchTest, ContainsRangeFailuresAndInvalidOutcomes) {
     constexpr uint32_t grid[3]{2, 1, 1};
@@ -267,6 +300,7 @@ TEST_F(CpuWorkgroupDispatchTest, ReportsArenaOverflowAndSealsAtFirstYield) {
     EXPECT_NE(scheduler_->lastDiagnostic().find("not established during preflight"), std::string::npos);
 }
 
+#if !defined(VERNON_RUNTIME_PROFILE_WEB)
 TEST_F(CpuWorkgroupDispatchTest, KeepsWorkerCountBoundedForLargeWorkgroups) {
     constexpr uint32_t grid[3]{1, 1, 1};
     constexpr uint32_t workgroup[3]{256, 1, 1};
@@ -290,6 +324,7 @@ TEST_F(CpuWorkgroupDispatchTest, KeepsWorkerCountBoundedForLargeWorkgroups) {
     EXPECT_GT(threads.size(), 1u);
     EXPECT_LE(threads.size(), 8u);
 }
+#endif
 
 TEST_F(CpuWorkgroupDispatchTest, PartitionsUnevenLaneChunksWithoutEmptyRanges) {
     constexpr uint32_t grid[3]{2, 1, 1};

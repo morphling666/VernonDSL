@@ -23,9 +23,15 @@ CpuLaneCoordinates cpuRangeCoordinates(const VernonCpuRangeV1 &range, size_t loc
 
 using CpuRangeCallback = std::function<VernonStatus(VernonCpuRangeV1 &)>;
 
+enum class CpuSchedulerExecutionPolicy {
+    WorkerPool,
+    CallingThread,
+};
+
 struct CpuWorkgroupSchedulerConfig {
     size_t threadBudget{};
     size_t maxWorkgroupVolume{};
+    CpuSchedulerExecutionPolicy executionPolicy{CpuSchedulerExecutionPolicy::WorkerPool};
 };
 
 class CpuWorkgroupScheduler {

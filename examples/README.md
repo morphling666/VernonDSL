@@ -1,5 +1,12 @@
 # VernonDSL examples
 
+## External engine integration
+
+[`external_engine/`](external_engine/) is a minimal C++ host that links a
+cooked CPU pipeline and the Vernon Runtime. Its source is shared by native
+desktop and Emscripten builds and has no Python or nanobind dependency at
+runtime.
+
 ## Visual showcases
 
 Install the optional presenter dependency before running either showcase:
