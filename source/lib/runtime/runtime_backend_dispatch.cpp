@@ -190,10 +190,10 @@ VernonStatus referenceBackendRhiBuffer(VernonRuntimeContext &context, VernonRhiB
     return vernonRuntimeRhiAdapterReferenceBuffer(adapter, buffer, offset, size, &output);
 }
 
-VernonStatus referenceBackendRhiImage(VernonRuntimeContext &context, VernonRhiImage image,
-                                      VernonRuntimeProviderResourceReference &output) {
+VernonStatus referenceBackendRhiImageView(VernonRuntimeContext &context, VernonRhiImageView view,
+                                          VernonRuntimeProviderResourceReference &output) {
     VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context);
-    return adapter ? vernonRuntimeRhiAdapterReferenceImage(adapter, image, &output) : VERNON_STATUS_INVALID_ARGUMENT;
+    return adapter ? vernonRuntimeRhiAdapterReferenceImageView(adapter, view, &output) : VERNON_STATUS_INVALID_ARGUMENT;
 }
 
 VernonStatus referenceBackendRhiSampler(VernonRuntimeContext &context, VernonRhiSampler sampler,
@@ -201,6 +201,14 @@ VernonStatus referenceBackendRhiSampler(VernonRuntimeContext &context, VernonRhi
     VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context);
     return adapter ? vernonRuntimeRhiAdapterReferenceSampler(adapter, sampler, &output)
                    : VERNON_STATUS_INVALID_ARGUMENT;
+}
+
+VernonStatus describeBackendImage(VernonRuntimeContext &context, VernonRuntimeProviderResourceReference resource,
+                                  VernonRuntimeProviderImageDescription &description) {
+    VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context);
+    const VernonRuntimeDeviceProvider *provider = vernonRuntimeRhiAdapterGetProvider(adapter);
+    return provider && provider->describe_image ? provider->describe_image(provider->user_data, resource, &description)
+                                                : VERNON_STATUS_INVALID_ARGUMENT;
 }
 
 VernonStatus referenceBackendCommandEncoder(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,

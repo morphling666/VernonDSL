@@ -93,7 +93,7 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
             ReflectedArgument argument;
             argument.kind = value["kind"].get<std::string>();
             if (argument.kind != "scalar" && argument.kind != "tensor_value" && argument.kind != "tensor" &&
-                argument.kind != "texture" && argument.kind != "sampler" && argument.kind != "builtin") {
+                argument.kind != "image" && argument.kind != "sampler" && argument.kind != "builtin") {
                 error = "entry contains argument reflection with an unsupported kind";
                 return false;
             }
@@ -139,12 +139,12 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                 const bool handle = resourceKind == "host_pointer" || resourceKind == "tensor_view_descriptor";
                 const bool descriptor = resourceKind == "strided_memref_storage_leaves" ||
                                         resourceKind == "descriptor_storage_leaves" ||
-                                        resourceKind == "texture_descriptor" || resourceKind == "sampler_descriptor";
+                                        resourceKind == "image_reference" || resourceKind == "sampler_descriptor";
                 const bool profileMatches = selectedProfile == "host_value" ? handle
                                             : selectedProfile == "cuda_kernel_parameter"
                                                 ? resourceKind == "strided_memref_storage_leaves"
                                                 : resourceKind == "descriptor_storage_leaves" ||
-                                                      resourceKind == "texture_descriptor" ||
+                                                      resourceKind == "image_reference" ||
                                                       resourceKind == "sampler_descriptor";
                 if ((!handle && !descriptor) || !profileMatches ||
                     (handle && (!parseExtent(*physical, "size", argument.physical.size) ||
@@ -253,7 +253,7 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                 argument.tensorBytes = elements * elementSize;
             }
             if (argument.kind != "tensor" && argument.kind != "scalar" && argument.kind != "builtin" &&
-                argument.kind != "texture" && argument.kind != "sampler") {
+                argument.kind != "image" && argument.kind != "sampler") {
                 error = "argument layout has an unsupported kind";
                 return false;
             }
@@ -278,8 +278,8 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
 std::optional<VernonPipelineArgumentKind> pipelineArgumentKind(const std::string &kind) {
     if (kind == "tensor")
         return VERNON_PIPELINE_TENSOR;
-    if (kind == "texture")
-        return VERNON_PIPELINE_TEXTURE;
+    if (kind == "image")
+        return VERNON_PIPELINE_IMAGE;
     if (kind == "sampler")
         return VERNON_PIPELINE_SAMPLER;
     return std::nullopt;
@@ -320,6 +320,28 @@ std::optional<VernonValueAccess> pipelineValueAccess(const std::string &access) 
     if (access == "read_write")
         return VERNON_ACCESS_READ_WRITE;
     return std::nullopt;
+}
+
+bool configureImageBindingLayout(const Parameter &parameter, VernonRuntimeProviderBindingLayoutEntry &layout) {
+    if (parameter.kind != "image")
+        return false;
+    const auto dimension = pipelineTextureDimension(parameter.dimension);
+    if (!dimension)
+        return false;
+    layout.image_dimension = *dimension;
+    if (parameter.bindingRole == "sampled") {
+        if (parameter.sampleResultClass != "float")
+            return false;
+        layout.sample_result_class = VERNON_IMAGE_SAMPLE_FLOAT;
+        return true;
+    }
+    if (parameter.bindingRole != "storage")
+        return false;
+    const auto format = pipelineTextureFormat(parameter.exactStorageFormat);
+    if (!format)
+        return false;
+    layout.storage_image_format = *format;
+    return true;
 }
 
 } // namespace vernon::runtime

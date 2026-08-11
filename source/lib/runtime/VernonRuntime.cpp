@@ -584,21 +584,23 @@ bool fillParameterView(const Parameter &source, VernonPipelineParameterView &des
     return true;
 }
 
-VernonStatus fillTextureConstraintView(const Parameter &source, VernonPipelineTextureConstraintView &destination) {
-    if (source.kind != "texture")
+VernonStatus fillImageConstraintView(const Parameter &source, VernonPipelineImageConstraintView &destination) {
+    if (source.kind != "image")
         return VERNON_STATUS_INVALID_ARGUMENT;
     const auto dimension = pipelineTextureDimension(source.dimension);
     if (!dimension)
         return VERNON_STATUS_PARSE_ERROR;
     destination.dimension = *dimension;
-    destination.has_format_constraint = source.format.empty() ? 0u : 1u;
-    if (destination.has_format_constraint) {
-        const auto format = pipelineTextureFormat(source.format);
+    destination.binding_role =
+        source.bindingRole == "sampled" ? VERNON_IMAGE_BINDING_SAMPLED : VERNON_IMAGE_BINDING_STORAGE;
+    destination.sample_result_class = VERNON_IMAGE_SAMPLE_FLOAT;
+    if (destination.binding_role == VERNON_IMAGE_BINDING_STORAGE) {
+        const auto format = pipelineTextureFormat(source.exactStorageFormat);
         if (!format)
             return VERNON_STATUS_PARSE_ERROR;
-        destination.format = *format;
+        destination.storage_format = *format;
     } else {
-        destination.format = static_cast<VernonTextureFormat>(0);
+        destination.storage_format = static_cast<VernonTextureFormat>(0);
     }
     std::fill(std::begin(destination.reserved), std::end(destination.reserved), 0);
     return VERNON_STATUS_OK;
@@ -749,20 +751,20 @@ VernonStatus vernonRuntimeLoadedPipelineGetParameterValueLeaf(const VernonLoaded
     return VERNON_STATUS_OK;
 }
 
-VernonStatus vernonRuntimeLoadedPipelineGetTextureConstraintByParameterIndex(
-    const VernonLoadedPipeline *pipeline, size_t parameterIndex, VernonPipelineTextureConstraintView *constraint) {
+VernonStatus vernonRuntimeLoadedPipelineGetImageConstraintByParameterIndex(
+    const VernonLoadedPipeline *pipeline, size_t parameterIndex, VernonPipelineImageConstraintView *constraint) {
     RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    if (!pipeline || !constraint || constraint->struct_size < sizeof(VernonPipelineTextureConstraintView) ||
+    if (!pipeline || !constraint || constraint->struct_size < sizeof(VernonPipelineImageConstraintView) ||
         parameterIndex >= pipeline->variant.parameters.size())
         return VERNON_STATUS_INVALID_ARGUMENT;
-    return fillTextureConstraintView(pipeline->variant.parameters[parameterIndex], *constraint);
+    return fillImageConstraintView(pipeline->variant.parameters[parameterIndex], *constraint);
 }
 
-VernonStatus vernonRuntimeLoadedPipelineFindTextureConstraint(const VernonLoadedPipeline *pipeline,
-                                                              VernonStringView parameterName,
-                                                              VernonPipelineTextureConstraintView *constraint) {
+VernonStatus vernonRuntimeLoadedPipelineFindImageConstraint(const VernonLoadedPipeline *pipeline,
+                                                            VernonStringView parameterName,
+                                                            VernonPipelineImageConstraintView *constraint) {
     RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    if (!pipeline || !constraint || constraint->struct_size < sizeof(VernonPipelineTextureConstraintView) ||
+    if (!pipeline || !constraint || constraint->struct_size < sizeof(VernonPipelineImageConstraintView) ||
         (parameterName.size && !parameterName.data))
         return VERNON_STATUS_INVALID_ARGUMENT;
     const auto found =
@@ -770,7 +772,7 @@ VernonStatus vernonRuntimeLoadedPipelineFindTextureConstraint(const VernonLoaded
                      [&](const Parameter &parameter) { return stringViewEquals(parameterName, parameter.name); });
     if (found == pipeline->variant.parameters.end())
         return VERNON_STATUS_INVALID_ARGUMENT;
-    return fillTextureConstraintView(*found, *constraint);
+    return fillImageConstraintView(*found, *constraint);
 }
 
 size_t vernonRuntimeLoadedPipelineGetOutputCount(const VernonLoadedPipeline *pipeline) {
@@ -829,7 +831,13 @@ VernonStatus vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline, const V
 
         PlannedGraphicsInvocation plan;
         std::string planningError;
-        if (!planGraphicsInvocation(pipeline->variant, encoded, plan, planningError))
+        if (!planGraphicsInvocation(
+                pipeline->variant, encoded,
+                [](void *userData, VernonRuntimeProviderResourceReference resource,
+                   VernonRuntimeProviderImageDescription *description) {
+                    return describeBackendImage(*static_cast<VernonRuntimeContext *>(userData), resource, *description);
+                },
+                pipeline->context, plan, planningError))
             return fail(pipeline->context, planningError);
         return invokeBackendPipeline(*pipeline, encoded, plan);
     };
@@ -899,14 +907,14 @@ VernonStatus vernonRuntimeReferenceRhiBuffer(VernonRuntimeContext *context, Vern
     return referenceBackendRhiBuffer(*context, buffer, offset, size, *output);
 }
 
-VernonStatus vernonRuntimeReferenceRhiImage(VernonRuntimeContext *context, VernonRhiImage image,
-                                            VernonRuntimeProviderResourceReference *output) {
+VernonStatus vernonRuntimeReferenceRhiImageView(VernonRuntimeContext *context, VernonRhiImageView view,
+                                                VernonRuntimeProviderResourceReference *output) {
     if (!context)
         return VERNON_STATUS_INVALID_ARGUMENT;
     RuntimeDiagnosticScope diagnostic(context);
     if (!output)
-        return fail(context, "invalid RHI image reference");
-    return referenceBackendRhiImage(*context, image, *output);
+        return fail(context, "invalid RHI image view reference");
+    return referenceBackendRhiImageView(*context, view, *output);
 }
 
 VernonStatus vernonRuntimeReferenceRhiSampler(VernonRuntimeContext *context, VernonRhiSampler sampler,

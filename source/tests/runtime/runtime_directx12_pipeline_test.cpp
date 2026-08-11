@@ -63,6 +63,61 @@ TEST(RuntimeDirectX12Pipeline, MapsEveryGraphicsStateEnumerationExplicitly) {
         EXPECT_EQ(vernon::runtime::getDirectX12CullModeMapping(index), cullModes[index]);
 }
 
+TEST(RuntimeDirectX12Pipeline, GeneratesMipmapsWithEmbeddedComputeShader) {
+    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_DIRECTX12, nullptr, true);
+    ASSERT_NE(context.runtime, nullptr);
+    VernonRhiImageDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.dimension = VERNON_RHI_IMAGE_2D;
+    descriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    descriptor.width = 4;
+    descriptor.height = 4;
+    descriptor.depth = 1;
+    descriptor.mip_levels = 3;
+    descriptor.array_layers = 1;
+    descriptor.sample_count = 1;
+    descriptor.usage =
+        VERNON_RHI_IMAGE_SAMPLED | VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION;
+    VernonRhiImage image{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(context.device, &descriptor, &image), VERNON_RHI_STATUS_OK);
+    std::array<uint8_t, 4 * 4 * 4> pixels{};
+    for (size_t index = 0; index < pixels.size(); index += 4) {
+        pixels[index] = 64;
+        pixels[index + 1] = 128;
+        pixels[index + 2] = 192;
+        pixels[index + 3] = 255;
+    }
+    VernonRhiImageUploadDescriptor upload{};
+    upload.struct_size = sizeof(upload);
+    upload.width = 4;
+    upload.height = 4;
+    upload.depth = 1;
+    upload.source_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    upload.source_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    upload.data = pixels.data();
+    ASSERT_EQ(vernonRhiDeviceUploadImage(context.device, image, &upload, 1), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceGenerateImageMipmaps(context.device, image), VERNON_RHI_STATUS_OK);
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.mip_level = 1;
+    download.width = 2;
+    download.height = 2;
+    download.depth = 1;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    std::array<uint8_t, 2 * 2 * 4> result{};
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, image, &download, result.data(), result.size()),
+              VERNON_RHI_STATUS_OK);
+    for (size_t index = 0; index < result.size(); index += 4) {
+        EXPECT_EQ(result[index], 64);
+        EXPECT_EQ(result[index + 1], 128);
+        EXPECT_EQ(result[index + 2], 192);
+        EXPECT_EQ(result[index + 3], 255);
+    }
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(context.device, image), VERNON_RHI_STATUS_OK);
+    vernon::tests::destroyRhiRuntime(context);
+}
+
 TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     const std::filesystem::path manifestPath = VERNON_DIRECTX_PIPELINE_BUNDLE;
     std::ifstream input(manifestPath, std::ios::binary);
@@ -117,9 +172,8 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     constexpr int64_t strides[] = {2 * sizeof(float), sizeof(float)};
     VernonPipelineArgument arguments[3]{};
     arguments[0].slot = 0;
-    arguments[0].kind = VERNON_PIPELINE_TEXTURE;
-    arguments[0].texture = {
-        VERNON_TEXTURE_RGBA8_UNORM, VERNON_ACCESS_READ, VERNON_TEXTURE_2D, 1, 1, 1, sampled.reference, {}};
+    arguments[0].kind = VERNON_PIPELINE_IMAGE;
+    arguments[0].image = {sampled.reference};
     arguments[1].slot = 1;
     arguments[1].kind = VERNON_PIPELINE_TENSOR;
     arguments[1].tensor.struct_size = sizeof(VernonTensorView);
@@ -134,9 +188,9 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     arguments[2].slot = 2;
     arguments[2].kind = VERNON_PIPELINE_SAMPLER;
     arguments[2].resource = sampler.reference;
-    VernonColorAttachment attachment{0, target.reference, 32, 32, VERNON_TEXTURE_RGBA8_UNORM};
+    VernonColorAttachment attachment{0, target.reference};
     VernonDepthAttachment depthAttachment{};
-    depthAttachment.resource = depth.reference;
+    depthAttachment.view = depth.reference;
     depthAttachment.width = 32;
     depthAttachment.height = 32;
     depthAttachment.format = VERNON_TEXTURE_D32_FLOAT_S8_UINT;
@@ -291,7 +345,7 @@ TEST(RuntimeDirectX12Pipeline, SuppliesEffectiveResolutionWithWarp) {
     argument.tensor.shape = shape;
     argument.tensor.byte_strides = strides;
     argument.tensor.byte_size = sizeof(positions);
-    VernonColorAttachment attachment{0, target.reference, 32, 32, VERNON_TEXTURE_RGBA8_UNORM};
+    VernonColorAttachment attachment{0, target.reference};
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;

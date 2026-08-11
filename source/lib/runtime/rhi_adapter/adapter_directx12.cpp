@@ -702,15 +702,15 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
             return fail(adapter, "D3D12 binding slot or kind is invalid");
         if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
             slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
-            if (!value->inline_data || value->inline_size != slot.inlineStorage.size())
+            if (!value->payload.inline_value.data || value->payload.inline_value.size != slot.inlineStorage.size())
                 return fail(adapter, "D3D12 inline or uniform-buffer binding size is invalid");
             bindings.resolvedValues[index] = 0;
         } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            const uint64_t native = resolveRhiResource(adapter, value->resource);
+            const auto &resource = value->payload.buffer.resource;
+            const uint64_t native = resolveRhiResource(adapter, resource);
             auto *buffer = reinterpret_cast<rhi::directx12::Buffer *>(native);
-            if ((value->resource.identity & kRhiResourceKindMask) != kRhiBufferResource || !buffer ||
-                !buffer->resource || value->resource.offset > value->resource.size ||
-                slot.layout.element_size > value->resource.size - value->resource.offset)
+            if ((resource.identity & kRhiResourceKindMask) != kRhiBufferResource || !buffer || !buffer->resource ||
+                resource.offset > resource.size || slot.layout.element_size > resource.size - resource.offset)
                 return fail(adapter, "D3D12 storage binding is invalid");
             bindings.resolvedValues[index] = native;
         } else {
@@ -719,15 +719,17 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
             if (defaultSampler)
                 bindings.resolvedValues[index] = 0;
             else {
-                const uint64_t expectedKind = slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
-                                                      slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE
-                                                  ? kRhiImageResource
-                                              : slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER
-                                                  ? kRhiSamplerResource
-                                                  : kRhiBufferResource;
-                const uint64_t native = resolveRhiResource(adapter, value->resource);
-                if ((value->resource.identity & kRhiResourceKindMask) != expectedKind || native == 0 ||
-                    (slot.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && value->stride == 0))
+                const auto *resource = providerBindingResource(*value);
+                const bool image = slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
+                                   slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE;
+                const uint64_t expectedKind =
+                    slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER ? kRhiSamplerResource : kRhiBufferResource;
+                const uint64_t native = resource ? resolveRhiResource(adapter, *resource) : 0;
+                if (!resource ||
+                    (image ? !isRhiImageReference(*resource)
+                           : (resource->identity & kRhiResourceKindMask) != expectedKind) ||
+                    native == 0 ||
+                    (slot.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && value->payload.buffer.stride == 0))
                     return fail(adapter, "D3D12 graphics resource binding is invalid");
                 bindings.resolvedValues[index] = native;
             }
@@ -744,12 +746,16 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
         const auto &value = values[bindings.valueIndices[index]];
         const bool defaultSampler = slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER &&
                                     (value.flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) != 0;
+        const auto *bindingResource = providerBindingResource(value);
         const VernonRuntimeProviderResourceReference resource =
-            defaultSampler ? VernonRuntimeProviderResourceReference{} : value.resource;
+            defaultSampler || !bindingResource ? VernonRuntimeProviderResourceReference{} : *bindingResource;
         const bool slotChanged =
             slot.flags != value.flags || !sameResource(slot.resourceReference, resource) ||
-            slot.stride != value.stride ||
-            (value.inline_data && std::memcmp(slot.inlineStorage.data(), value.inline_data, value.inline_size));
+            (value.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && slot.stride != value.payload.buffer.stride) ||
+            ((value.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
+              value.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) &&
+             value.payload.inline_value.data &&
+             std::memcmp(slot.inlineStorage.data(), value.payload.inline_value.data, value.payload.inline_value.size));
         const bool graphicsRootConstant = slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
                                           slot.layout.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM &&
                                           (slot.layout.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_VERTEX ||
@@ -764,7 +770,7 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
         slot.resourceReference = {};
         if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
             slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
-            std::memcpy(slot.inlineStorage.data(), value.inline_data, value.inline_size);
+            std::memcpy(slot.inlineStorage.data(), value.payload.inline_value.data, value.payload.inline_value.size);
             slot.resource = slot.inlineResource.resource;
             slot.offset = 0;
             slot.size = slot.inlineStorage.size();
@@ -772,9 +778,9 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
             auto *buffer = reinterpret_cast<rhi::directx12::Buffer *>(bindings.resolvedValues[index]);
             slot.resource = buffer->resource;
             slot.opaqueResource = buffer;
-            slot.resourceReference = value.resource;
-            slot.offset = value.resource.offset;
-            slot.size = value.resource.size - value.resource.offset;
+            slot.resourceReference = value.payload.buffer.resource;
+            slot.offset = value.payload.buffer.resource.offset;
+            slot.size = value.payload.buffer.resource.size - value.payload.buffer.resource.offset;
         } else {
             slot.opaqueResource = reinterpret_cast<void *>(bindings.resolvedValues[index]);
             if (!slot.opaqueResource) {
@@ -783,10 +789,10 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
                 slot.stride = 0;
                 continue;
             }
-            slot.resourceReference = value.resource;
-            slot.offset = value.resource.offset;
-            slot.size = value.resource.size;
-            slot.stride = value.stride;
+            slot.resourceReference = resource;
+            slot.offset = resource.offset;
+            slot.size = resource.size;
+            slot.stride = value.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER ? value.payload.buffer.stride : 0;
             if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
                 slot.resource = static_cast<rhi::directx12::Buffer *>(slot.opaqueResource)->resource;
         }
@@ -970,7 +976,8 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     auto *bindings = descriptor ? fromHandle<PreparedBindingSet>(descriptor->bindings) : nullptr;
     if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !pipeline || !pipeline->graphics ||
         !pipeline->pipeline || (descriptor->bindings.value != 0 && !bindings) ||
-        descriptor->color_attachment_count == 0 || descriptor->color_attachment_count > 8)
+        descriptor->color_attachment_count == 0 ||
+        descriptor->color_attachment_count > VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS)
         return fail(adapter, "D3D12 adapter received an invalid draw descriptor");
     auto &device = *pipeline->device;
     ID3D12DescriptorHeap *rtvHeap = nullptr;
@@ -1016,8 +1023,8 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
                                                        samplerHeap, samplerCpu, samplerGpu, adapter.error))
             return VERNON_STATUS_INTERNAL_ERROR;
     }
-    std::array<VernonRhiLoadOperation, 8> colorLoads{};
-    std::array<std::array<float, 4>, 8> colorClears{};
+    std::array<VernonRhiLoadOperation, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> colorLoads{};
+    std::array<std::array<float, 4>, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> colorClears{};
     for (size_t index = 0; index < descriptor->color_attachment_count; ++index) {
         colorLoads[index] = static_cast<VernonRhiLoadOperation>(descriptor->color_attachments[index].load_operation);
         std::copy(std::begin(descriptor->color_attachments[index].clear_color),
@@ -1039,21 +1046,21 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
                                                 static_cast<uint32_t>(descriptor->color_attachment_count), rtvHeap, rtv,
                                                 ignoredGpu, adapter.error))
         return VERNON_STATUS_INTERNAL_ERROR;
-    if (firstDraw && descriptor->depth_stencil_attachment.resource.value &&
+    if (firstDraw && descriptor->depth_stencil_view.resource.value &&
         !device.acquireDescriptors(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, false, 1, dsvHeap, dsv, ignoredGpu, adapter.error))
         return VERNON_STATUS_INTERNAL_ERROR;
-    std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 8> renderTargets{};
-    std::array<uint64_t, 8> renderTargetResources{};
-    const bool hasDepth = descriptor->depth_stencil_attachment.resource.value != 0;
+    std::array<D3D12_CPU_DESCRIPTOR_HANDLE, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> renderTargets{};
+    std::array<uint64_t, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> renderTargetResources{};
+    const bool hasDepth = descriptor->depth_stencil_view.resource.value != 0;
     const UINT rtvIncrement = device.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     if (firstDraw) {
         for (size_t index = 0; index < descriptor->color_attachment_count; ++index) {
             const auto &attachment = descriptor->color_attachments[index];
-            if (!retainCommandResource(adapter, commandEncoder, attachment.image))
+            if (!retainCommandResource(adapter, commandEncoder, attachment.view))
                 return fail(adapter, "D3D12 draw could not retain its color attachment", VERNON_STATUS_INTERNAL_ERROR);
-            if ((attachment.image.identity & kRhiResourceKindMask) != kRhiImageResource)
+            if (!isRhiImageReference(attachment.view))
                 return fail(adapter, "D3D12 draw contains an invalid color attachment");
-            auto *image = reinterpret_cast<rhi::directx12::Image *>(resolveRhiResource(adapter, attachment.image));
+            auto *image = reinterpret_cast<rhi::directx12::Image *>(resolveRhiResource(adapter, attachment.view));
             if (!image || !image->resource)
                 return fail(adapter, "D3D12 draw contains an empty color attachment");
             renderTargetResources[attachment.location] = reinterpret_cast<uintptr_t>(image->resource);
@@ -1067,12 +1074,12 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
             rtv.ptr += rtvIncrement;
         }
         if (hasDepth) {
-            if (!retainCommandResource(adapter, commandEncoder, descriptor->depth_stencil_attachment))
+            if (!retainCommandResource(adapter, commandEncoder, descriptor->depth_stencil_view))
                 return fail(adapter, "D3D12 draw could not retain its depth attachment", VERNON_STATUS_INTERNAL_ERROR);
-            if ((descriptor->depth_stencil_attachment.identity & kRhiResourceKindMask) != kRhiImageResource)
+            if (!isRhiImageReference(descriptor->depth_stencil_view))
                 return fail(adapter, "D3D12 draw contains an invalid depth attachment");
-            auto *image = reinterpret_cast<rhi::directx12::Image *>(
-                resolveRhiResource(adapter, descriptor->depth_stencil_attachment));
+            auto *image =
+                reinterpret_cast<rhi::directx12::Image *>(resolveRhiResource(adapter, descriptor->depth_stencil_view));
             if (!image || !image->resource ||
                 (image->format != DXGI_FORMAT_D32_FLOAT && image->format != DXGI_FORMAT_D32_FLOAT_S8X24_UINT))
                 return fail(adapter, "D3D12 draw contains an invalid depth attachment");
@@ -1086,12 +1093,13 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
             view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
             device.device->CreateDepthStencilView(image->resource, &view, dsv);
         }
-        std::array<uint64_t, 8> colorTargets{};
+        std::array<uint64_t, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> colorTargets{};
         for (size_t index = 0; index < descriptor->color_attachment_count; ++index)
             colorTargets[descriptor->color_attachments[index].location] = renderTargets[index].ptr;
-        auto *depthImage = hasDepth ? reinterpret_cast<rhi::directx12::Image *>(
-                                          resolveRhiResource(adapter, descriptor->depth_stencil_attachment))
-                                    : nullptr;
+        auto *depthImage =
+            hasDepth
+                ? reinterpret_cast<rhi::directx12::Image *>(resolveRhiResource(adapter, descriptor->depth_stencil_view))
+                : nullptr;
         if (!setCommandRenderingTargets(adapter, commandEncoder, colorTargets.data(), renderTargetResources.data(),
                                         colorTargets.size(), hasDepth ? dsv.ptr : 0,
                                         depthImage ? reinterpret_cast<uintptr_t>(depthImage->resource) : 0))
@@ -1184,11 +1192,20 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
                 if (!reuseDescriptors) {
                     D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
                     view.Format = image->format;
+                    const bool selected = image->view.struct_size >= sizeof(VernonRhiImageViewDescriptor);
+                    const uint32_t mip = selected ? image->view.base_mip_level : 0;
                     if (image->dimension == VERNON_RHI_IMAGE_3D) {
                         view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+                        view.Texture3D.MipSlice = mip;
                         view.Texture3D.WSize = UINT_MAX;
+                    } else if (selected && image->view.array_layer_count > 1) {
+                        view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                        view.Texture2DArray.MipSlice = mip;
+                        view.Texture2DArray.FirstArraySlice = image->view.base_array_layer;
+                        view.Texture2DArray.ArraySize = image->view.array_layer_count;
                     } else {
                         view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                        view.Texture2D.MipSlice = mip;
                     }
                     device.device->CreateUnorderedAccessView(image->resource, nullptr, &view, resourceCpu);
                     resourceCpu.ptr += resourceIncrement;
@@ -1203,15 +1220,27 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
                     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
                     view.Format = image->format == DXGI_FORMAT_D32_FLOAT ? DXGI_FORMAT_R32_FLOAT : image->format;
                     view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    const bool selected = image->view.struct_size >= sizeof(VernonRhiImageViewDescriptor);
+                    const uint32_t firstMip = selected ? image->view.base_mip_level : 0;
+                    const uint32_t mipCount = selected ? image->view.mip_level_count : native.MipLevels;
                     if (image->dimension == VERNON_RHI_IMAGE_CUBE) {
                         view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-                        view.TextureCube.MipLevels = native.MipLevels;
+                        view.TextureCube.MostDetailedMip = firstMip;
+                        view.TextureCube.MipLevels = mipCount;
                     } else if (image->dimension == VERNON_RHI_IMAGE_3D) {
                         view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
-                        view.Texture3D.MipLevels = native.MipLevels;
+                        view.Texture3D.MostDetailedMip = firstMip;
+                        view.Texture3D.MipLevels = mipCount;
+                    } else if (selected && image->view.array_layer_count > 1) {
+                        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                        view.Texture2DArray.MostDetailedMip = firstMip;
+                        view.Texture2DArray.MipLevels = mipCount;
+                        view.Texture2DArray.FirstArraySlice = image->view.base_array_layer;
+                        view.Texture2DArray.ArraySize = image->view.array_layer_count;
                     } else {
                         view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                        view.Texture2D.MipLevels = native.MipLevels;
+                        view.Texture2D.MostDetailedMip = firstMip;
+                        view.Texture2D.MipLevels = mipCount;
                     }
                     device.device->CreateShaderResourceView(image->resource, &view, resourceCpu);
                     resourceCpu.ptr += resourceIncrement;
@@ -1306,15 +1335,15 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     }
     if (standaloneRendering) {
         for (size_t index = 0; index < descriptor->color_attachment_count; ++index)
-            if (descriptor->color_attachments[index].store_operation == VERNON_RHI_STORE_DISCARD) {
+            if (descriptor->color_attachments[index].store_operation == VERNON_RUNTIME_PROVIDER_STORE_DISCARD) {
                 auto *image = reinterpret_cast<rhi::directx12::Image *>(
-                    resolveRhiResource(adapter, descriptor->color_attachments[index].image));
+                    resolveRhiResource(adapter, descriptor->color_attachments[index].view));
                 commands->DiscardResource(image->resource, nullptr);
             }
-        if (hasDepth && descriptor->depth_store_operation == VERNON_RHI_STORE_DISCARD &&
-            descriptor->stencil_store_operation == VERNON_RHI_STORE_DISCARD) {
-            auto *image = reinterpret_cast<rhi::directx12::Image *>(
-                resolveRhiResource(adapter, descriptor->depth_stencil_attachment));
+        if (hasDepth && descriptor->depth_store_operation == VERNON_RUNTIME_PROVIDER_STORE_DISCARD &&
+            descriptor->stencil_store_operation == VERNON_RUNTIME_PROVIDER_STORE_DISCARD) {
+            auto *image =
+                reinterpret_cast<rhi::directx12::Image *>(resolveRhiResource(adapter, descriptor->depth_stencil_view));
             commands->DiscardResource(image->resource, nullptr);
         }
     }
@@ -1359,6 +1388,7 @@ void initializeDirectX12Provider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.prepare_pipeline = preparePipeline;
     adapter.provider.retain_resource = retainResource;
     adapter.provider.release_resource = releaseResource;
+    adapter.provider.describe_image = describeProviderImageCallback;
     adapter.provider.create_binding_set = createBindings;
     adapter.provider.update_binding_set = updateBindings;
     adapter.provider.encode_dispatch = encodeDispatch;

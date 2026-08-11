@@ -269,6 +269,8 @@ VernonRhiImageDimension rhiDimension(VernonTextureDimension dimension) {
     throw std::invalid_argument("unsupported texture dimension");
 }
 
+struct RhiImageView;
+
 struct RhiImage {
     RhiImage(std::shared_ptr<RhiHostState> host, uint32_t width, uint32_t height, uint32_t depth,
              VernonTextureFormat format, VernonTextureDimension dimension, uint32_t mipLevels, uint32_t usage)
@@ -446,6 +448,49 @@ private:
     }
 };
 
+struct RhiImageView {
+    RhiImageView(RhiImage *image, VernonTextureFormat format, VernonTextureDimension dimension, uint32_t baseMipLevel,
+                 uint32_t mipLevelCount, uint32_t baseArrayLayer, uint32_t arrayLayerCount, uint32_t aspects)
+        : image(image), host(image ? image->host : nullptr), format(format), dimension(dimension),
+          baseMipLevel(baseMipLevel), mipLevelCount(mipLevelCount), baseArrayLayer(baseArrayLayer),
+          arrayLayerCount(arrayLayerCount), aspects(aspects) {
+        if (!image || !mipLevelCount || !arrayLayerCount || !aspects)
+            throw std::invalid_argument("RHI image view requires an image and non-empty subresources");
+        VernonRhiImageViewDescriptor descriptor{};
+        descriptor.struct_size = sizeof(descriptor);
+        descriptor.image = image->handle;
+        descriptor.dimension = rhiDimension(dimension);
+        descriptor.format = rhiFormat(format);
+        descriptor.base_mip_level = baseMipLevel;
+        descriptor.mip_level_count = mipLevelCount;
+        descriptor.base_array_layer = baseArrayLayer;
+        descriptor.array_layer_count = arrayLayerCount;
+        descriptor.aspects = aspects;
+        if (vernonRhiDeviceCreateImageView(host->device, &descriptor, &handle) != VERNON_RHI_STATUS_OK)
+            throw std::invalid_argument("cannot create Vernon RHI image view: " +
+                                        stringView(vernonRhiDeviceGetLastError(host->device)));
+        width = std::max(image->width >> baseMipLevel, 1u);
+        height = std::max(image->height >> baseMipLevel, 1u);
+        layers = dimension == VERNON_TEXTURE_3D ? 1u : arrayLayerCount;
+    }
+
+    ~RhiImageView() { vernonRhiDeviceDestroyImageView(host->device, handle); }
+
+    RhiImage *image{};
+    std::shared_ptr<RhiHostState> host;
+    VernonRhiImageView handle{};
+    VernonTextureFormat format{};
+    VernonTextureDimension dimension{};
+    uint32_t baseMipLevel{};
+    uint32_t mipLevelCount{};
+    uint32_t baseArrayLayer{};
+    uint32_t arrayLayerCount{};
+    uint32_t aspects{};
+    uint32_t width{};
+    uint32_t height{};
+    uint32_t layers{1};
+};
+
 struct RhiSampler {
     RhiSampler(std::shared_ptr<RhiHostState> host, VernonRhiSamplerAddressMode address) : host(std::move(host)) {
         if (address > VERNON_RHI_ADDRESS_MIRRORED_REPEAT)
@@ -552,12 +597,21 @@ struct PythonRenderPass final : vernon::execution::RenderPass {
 
     void use(const PythonGraphResource &resource, vernon::execution::AccessMode access, VernonRhiResourceState state,
              uint32_t stageMask) {
-        if (access == vernon::execution::AccessMode::Read)
-            read(resource.resource, state, stageMask);
-        else if (access == vernon::execution::AccessMode::Write)
-            write(resource.resource, state, stageMask);
-        else
+        if (access == vernon::execution::AccessMode::Read) {
+            if (resource.isImage)
+                read(resource.image, state, stageMask);
+            else
+                read(resource.resource, state, stageMask);
+        } else if (access == vernon::execution::AccessMode::Write) {
+            if (resource.isImage)
+                write(resource.image, state, stageMask);
+            else
+                write(resource.resource, state, stageMask);
+        } else if (resource.isImage) {
+            readWrite(resource.image, state, stageMask);
+        } else {
             readWrite(resource.resource, state, stageMask);
+        }
     }
 
     void addColor(uint32_t location, const PythonGraphResource &resource, VernonRhiLoadOperation load,
@@ -607,12 +661,21 @@ struct PythonComputePass final : vernon::execution::ComputePass {
 
     void use(const PythonGraphResource &resource, vernon::execution::AccessMode access, VernonRhiResourceState state,
              uint32_t stageMask) {
-        if (access == vernon::execution::AccessMode::Read)
-            read(resource.resource, state, stageMask);
-        else if (access == vernon::execution::AccessMode::Write)
-            write(resource.resource, state, stageMask);
-        else
+        if (access == vernon::execution::AccessMode::Read) {
+            if (resource.isImage)
+                read(resource.image, state, stageMask);
+            else
+                read(resource.resource, state, stageMask);
+        } else if (access == vernon::execution::AccessMode::Write) {
+            if (resource.isImage)
+                write(resource.image, state, stageMask);
+            else
+                write(resource.resource, state, stageMask);
+        } else if (resource.isImage) {
+            readWrite(resource.image, state, stageMask);
+        } else {
             readWrite(resource.resource, state, stageMask);
+        }
     }
 
     PythonExecutionGraph *graph{};
@@ -627,6 +690,11 @@ struct PythonCompiledBarrier {
     uint32_t oldState{};
     uint32_t newState{};
     bool isImage{};
+    uint32_t baseMipLevel{};
+    uint32_t mipLevelCount{};
+    uint32_t baseArrayLayer{};
+    uint32_t arrayLayerCount{};
+    uint32_t aspects{};
 };
 
 struct PythonCompiledScope {
@@ -661,12 +729,10 @@ struct PythonExecutionGraph {
         return PythonGraphResource(resource);
     }
 
-    PythonGraphResource importImage(RhiImage &image, bool exported) {
-        if (image.host != host)
+    PythonGraphResource importImage(RhiImageView &view, bool exported) {
+        if (view.host != host)
             throw std::invalid_argument("image belongs to another execution graph device");
-        const VernonRhiImageView view{image.handle.index, image.handle.generation};
-        return PythonGraphResource(graph.importImage(image.handle, view, rhiFormat(image.format), image.width,
-                                                     image.height, image.layers, 1, exported));
+        return PythonGraphResource(graph.importImage(view.image->handle, view.handle, exported));
     }
 
     void compile() {
@@ -700,10 +766,13 @@ struct PythonExecutionGraph {
             PythonCompiledScope compiled{scope.rendering, scope.passIndices, {}};
             compiled.barriers.reserve(scope.barriers.size());
             for (const VernonRhiBarrier &barrier : scope.barriers)
-                compiled.barriers.push_back({barrier.source_stage_mask, barrier.destination_stage_mask,
-                                             barrier.source_access, barrier.destination_access,
-                                             static_cast<uint32_t>(barrier.old_state),
-                                             static_cast<uint32_t>(barrier.new_state), barrier.is_image != 0});
+                compiled.barriers.push_back(
+                    {barrier.source_stage_mask, barrier.destination_stage_mask, barrier.source_access,
+                     barrier.destination_access, static_cast<uint32_t>(barrier.old_state),
+                     static_cast<uint32_t>(barrier.new_state), barrier.is_image != 0,
+                     barrier.image_subresources.base_mip_level, barrier.image_subresources.mip_level_count,
+                     barrier.image_subresources.base_array_layer, barrier.image_subresources.array_layer_count,
+                     barrier.image_subresources.aspects});
             result.push_back(std::move(compiled));
         }
         return result;
@@ -885,8 +954,8 @@ struct PipelineParameterMetadata {
     std::string layoutHash;
     std::vector<VernonValueLeafView> elementLeaves;
     VernonValueAccess access{};
-    bool hasTextureFormat{};
-    VernonTextureFormat textureFormat{};
+    VernonImageBindingRole imageBindingRole{VERNON_IMAGE_BINDING_SAMPLED};
+    VernonTextureFormat storageImageFormat{};
     std::vector<uint64_t> shape;
 };
 
@@ -940,14 +1009,14 @@ struct PipelineInvocationBuilder {
                 VERNON_STATUS_OK)
                 throw std::invalid_argument("unknown pipeline parameter '" + name + "'");
             PipelineParameterMetadata metadata = parameterMetadata(view);
-            if (view.kind == VERNON_PIPELINE_TEXTURE) {
-                VernonPipelineTextureConstraintView constraint{};
+            if (view.kind == VERNON_PIPELINE_IMAGE) {
+                VernonPipelineImageConstraintView constraint{};
                 constraint.struct_size = sizeof(constraint);
-                if (vernonRuntimeLoadedPipelineFindTextureConstraint(pipeline, {name.data(), name.size()},
-                                                                     &constraint) != VERNON_STATUS_OK)
-                    throw std::runtime_error("cannot query pipeline texture constraint");
-                metadata.hasTextureFormat = constraint.has_format_constraint != 0;
-                metadata.textureFormat = constraint.format;
+                if (vernonRuntimeLoadedPipelineFindImageConstraint(pipeline, {name.data(), name.size()}, &constraint) !=
+                    VERNON_STATUS_OK)
+                    throw std::runtime_error("cannot query pipeline image constraint");
+                metadata.imageBindingRole = constraint.binding_role;
+                metadata.storageImageFormat = constraint.storage_format;
             }
             return metadata;
         }
@@ -959,14 +1028,14 @@ struct PipelineInvocationBuilder {
             if (vernonRuntimeLoadedPipelineGetParameterByIndex(pipeline, index, &view) == VERNON_STATUS_OK &&
                 view.slot == slot) {
                 PipelineParameterMetadata metadata = parameterMetadata(view);
-                if (view.kind == VERNON_PIPELINE_TEXTURE) {
-                    VernonPipelineTextureConstraintView constraint{};
+                if (view.kind == VERNON_PIPELINE_IMAGE) {
+                    VernonPipelineImageConstraintView constraint{};
                     constraint.struct_size = sizeof(constraint);
-                    if (vernonRuntimeLoadedPipelineGetTextureConstraintByParameterIndex(pipeline, index, &constraint) !=
+                    if (vernonRuntimeLoadedPipelineGetImageConstraintByParameterIndex(pipeline, index, &constraint) !=
                         VERNON_STATUS_OK)
-                        throw std::runtime_error("cannot query pipeline texture constraint");
-                    metadata.hasTextureFormat = constraint.has_format_constraint != 0;
-                    metadata.textureFormat = constraint.format;
+                        throw std::runtime_error("cannot query pipeline image constraint");
+                    metadata.imageBindingRole = constraint.binding_role;
+                    metadata.storageImageFormat = constraint.storage_format;
                 }
                 return metadata;
             }
@@ -1122,28 +1191,17 @@ struct PipelineInvocationBuilder {
         return *this;
     }
 
-    PipelineInvocationBuilder &rhiTexture(const nb::object &identifier, RhiImage *texture, RhiSampler *sampler) {
+    PipelineInvocationBuilder &rhiTexture(const nb::object &identifier, RhiImageView *view) {
         const PipelineParameterMetadata parameter = resolveParameter(identifier);
-        const uint32_t requiredUsage = parameter.hasTextureFormat ? VERNON_RHI_IMAGE_STORAGE : VERNON_RHI_IMAGE_SAMPLED;
-        if (!texture || !(texture->usage & requiredUsage) || (sampler && sampler->host != texture->host))
-            throw std::invalid_argument("RHI texture usage or sampler device does not match the pipeline parameter");
-        if (parameter.hasTextureFormat && texture->format != parameter.textureFormat)
+        const bool storage = parameter.imageBindingRole == VERNON_IMAGE_BINDING_STORAGE;
+        const uint32_t requiredUsage = storage ? VERNON_RHI_IMAGE_STORAGE : VERNON_RHI_IMAGE_SAMPLED;
+        if (!view || !(view->image->usage & requiredUsage))
+            throw std::invalid_argument("RHI texture usage does not match the pipeline parameter");
+        if (storage && view->format != parameter.storageImageFormat)
             throw std::invalid_argument("RHI texture format does not match the storage texture parameter");
-        if (parameter.hasTextureFormat && sampler)
-            throw std::invalid_argument("storage texture parameters cannot use a sampler");
-        OwnedArgument &argument = addArgument(parameter, VERNON_PIPELINE_TEXTURE);
-        if (vernonRuntimeReferenceRhiImage(runtime, texture->handle, &argument.value.texture.resource) !=
-            VERNON_STATUS_OK)
-            throw std::invalid_argument("RHI image belongs to another Runtime device");
-        if (sampler && vernonRuntimeReferenceRhiSampler(runtime, sampler->handle,
-                                                        &argument.value.texture.sampler_resource) != VERNON_STATUS_OK)
-            throw std::invalid_argument("RHI sampler belongs to another Runtime device");
-        argument.value.texture.format = texture->format;
-        argument.value.texture.access = parameter.access;
-        argument.value.texture.dimension = texture->dimension;
-        argument.value.texture.width = texture->width;
-        argument.value.texture.height = texture->height;
-        argument.value.texture.depth = texture->depth;
+        OwnedArgument &argument = addArgument(parameter, VERNON_PIPELINE_IMAGE);
+        if (vernonRuntimeReferenceRhiImageView(runtime, view->handle, &argument.value.image.view) != VERNON_STATUS_OK)
+            throw std::invalid_argument("RHI image view belongs to another Runtime device");
         return *this;
     }
 
@@ -1157,41 +1215,35 @@ struct PipelineInvocationBuilder {
         return *this;
     }
 
-    PipelineInvocationBuilder &rhiColorAttachment(uint32_t location, RhiImage *texture, uint32_t loadOperation,
+    PipelineInvocationBuilder &rhiColorAttachment(uint32_t location, RhiImageView *view, uint32_t loadOperation,
                                                   uint32_t storeOperation, const std::array<float, 4> &clearColor) {
-        if (!texture || !(texture->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT) ||
-            (texture->format == VERNON_TEXTURE_D32_FLOAT || texture->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT) ||
+        if (!view || !(view->image->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT) ||
+            (view->format == VERNON_TEXTURE_D32_FLOAT || view->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT) ||
             loadOperation > VERNON_RHI_LOAD_DISCARD || storeOperation > VERNON_RHI_STORE_DISCARD)
             throw std::invalid_argument("RHI color attachment is null");
         VernonColorAttachment attachment{};
         attachment.location = location;
-        if (vernonRuntimeReferenceRhiImage(runtime, texture->handle, &attachment.resource) != VERNON_STATUS_OK)
+        if (vernonRuntimeReferenceRhiImageView(runtime, view->handle, &attachment.view) != VERNON_STATUS_OK)
             throw std::invalid_argument("RHI color attachment belongs to another Runtime device");
-        attachment.width = texture->width;
-        attachment.height = texture->height;
-        attachment.format = texture->format;
-        attachment.load_operation = static_cast<VernonRhiLoadOperation>(loadOperation);
-        attachment.store_operation = static_cast<VernonRhiStoreOperation>(storeOperation);
+        attachment.load_operation = static_cast<VernonRuntimeProviderLoadOperation>(loadOperation);
+        attachment.store_operation = static_cast<VernonRuntimeProviderStoreOperation>(storeOperation);
         std::copy(clearColor.begin(), clearColor.end(), attachment.clear_color);
         attachments.push_back(attachment);
         return *this;
     }
 
-    PipelineInvocationBuilder &rhiDepthAttachment(RhiImage *texture, uint32_t loadOperation, uint32_t storeOperation,
+    PipelineInvocationBuilder &rhiDepthAttachment(RhiImageView *view, uint32_t loadOperation, uint32_t storeOperation,
                                                   float clearDepth) {
-        if (!texture || !(texture->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) ||
-            (texture->format != VERNON_TEXTURE_D32_FLOAT && texture->format != VERNON_TEXTURE_D32_FLOAT_S8_UINT) ||
+        if (!view || !(view->image->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) ||
+            (view->format != VERNON_TEXTURE_D32_FLOAT && view->format != VERNON_TEXTURE_D32_FLOAT_S8_UINT) ||
             loadOperation > VERNON_RHI_LOAD_DISCARD || storeOperation > VERNON_RHI_STORE_DISCARD || clearDepth < 0.0f ||
             clearDepth > 1.0f)
             throw std::invalid_argument("RHI depth attachment must use D32 format");
         depthAttachment = {};
-        if (vernonRuntimeReferenceRhiImage(runtime, texture->handle, &depthAttachment.resource) != VERNON_STATUS_OK)
+        if (vernonRuntimeReferenceRhiImageView(runtime, view->handle, &depthAttachment.view) != VERNON_STATUS_OK)
             throw std::invalid_argument("RHI depth attachment belongs to another Runtime device");
-        depthAttachment.width = texture->width;
-        depthAttachment.height = texture->height;
-        depthAttachment.format = texture->format;
-        depthAttachment.load_operation = static_cast<VernonRhiLoadOperation>(loadOperation);
-        depthAttachment.store_operation = static_cast<VernonRhiStoreOperation>(storeOperation);
+        depthAttachment.load_operation = static_cast<VernonRuntimeProviderLoadOperation>(loadOperation);
+        depthAttachment.store_operation = static_cast<VernonRuntimeProviderStoreOperation>(storeOperation);
         depthAttachment.clear_depth = clearDepth;
         hasDepthAttachment = true;
         return *this;
@@ -2220,6 +2272,9 @@ NB_MODULE(_native, module) {
     module.attr("IMAGE_TRANSFER_DESTINATION") = static_cast<uint32_t>(VERNON_RHI_IMAGE_TRANSFER_DESTINATION);
     module.attr("IMAGE_SAMPLED") = static_cast<uint32_t>(VERNON_RHI_IMAGE_SAMPLED);
     module.attr("IMAGE_STORAGE") = static_cast<uint32_t>(VERNON_RHI_IMAGE_STORAGE);
+    module.attr("IMAGE_ASPECT_COLOR") = static_cast<uint32_t>(VERNON_RHI_IMAGE_ASPECT_COLOR);
+    module.attr("IMAGE_ASPECT_DEPTH") = static_cast<uint32_t>(VERNON_RHI_IMAGE_ASPECT_DEPTH);
+    module.attr("IMAGE_ASPECT_STENCIL") = static_cast<uint32_t>(VERNON_RHI_IMAGE_ASPECT_STENCIL);
     module.def("_plan_value_abi", &planValueAbi, nb::arg("module"), nb::arg("logical_dtypes"));
     nb::class_<StructuredVjp>(module, "_StructuredVjp")
         .def_prop_ro("tape_bytes", &StructuredVjp::tapeBytes)
@@ -2269,7 +2324,38 @@ NB_MODULE(_native, module) {
         .def("download", &RhiImage::download, nb::arg("mip_level") = 0, nb::arg("offset_x") = 0,
              nb::arg("offset_y") = 0, nb::arg("offset_z") = 0, nb::arg("width") = 0, nb::arg("height") = 0,
              nb::arg("depth") = 0)
-        .def("generate_mipmaps", &RhiImage::generateMipmaps);
+        .def("generate_mipmaps", &RhiImage::generateMipmaps)
+        .def(
+            "create_view",
+            [](RhiImage &image, const nb::object &format, const nb::object &dimension, uint32_t baseMipLevel,
+               uint32_t mipLevelCount, uint32_t baseArrayLayer, uint32_t arrayLayerCount, uint32_t aspects) {
+                const VernonTextureFormat viewFormat =
+                    format.is_none() ? image.format : nb::cast<VernonTextureFormat>(format);
+                const VernonTextureDimension viewDimension =
+                    dimension.is_none() ? image.dimension : nb::cast<VernonTextureDimension>(dimension);
+                if (baseMipLevel >= image.mipLevels || baseArrayLayer >= image.layers)
+                    throw std::invalid_argument("RHI image view base subresource is out of range");
+                mipLevelCount = mipLevelCount ? mipLevelCount : image.mipLevels - baseMipLevel;
+                arrayLayerCount = arrayLayerCount ? arrayLayerCount : image.layers - baseArrayLayer;
+                if (!aspects)
+                    aspects = image.format == VERNON_TEXTURE_D32_FLOAT ? VERNON_RHI_IMAGE_ASPECT_DEPTH
+                              : image.format == VERNON_TEXTURE_D32_FLOAT_S8_UINT
+                                  ? VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL
+                                  : VERNON_RHI_IMAGE_ASPECT_COLOR;
+                return std::make_unique<RhiImageView>(&image, viewFormat, viewDimension, baseMipLevel, mipLevelCount,
+                                                      baseArrayLayer, arrayLayerCount, aspects);
+            },
+            nb::arg("format") = nb::none(), nb::arg("dimension") = nb::none(), nb::arg("base_mip_level") = 0,
+            nb::arg("mip_level_count") = 0, nb::arg("base_array_layer") = 0, nb::arg("array_layer_count") = 0,
+            nb::arg("aspects") = 0, nb::keep_alive<0, 1>());
+    nb::class_<RhiImageView>(module, "RhiImageView")
+        .def_prop_ro("width", [](const RhiImageView &value) { return value.width; })
+        .def_prop_ro("height", [](const RhiImageView &value) { return value.height; })
+        .def_prop_ro("base_mip_level", [](const RhiImageView &value) { return value.baseMipLevel; })
+        .def_prop_ro("mip_level_count", [](const RhiImageView &value) { return value.mipLevelCount; })
+        .def_prop_ro("base_array_layer", [](const RhiImageView &value) { return value.baseArrayLayer; })
+        .def_prop_ro("array_layer_count", [](const RhiImageView &value) { return value.arrayLayerCount; })
+        .def_prop_ro("aspects", [](const RhiImageView &value) { return value.aspects; });
     nb::class_<RhiSampler>(module, "RhiSampler");
     nb::class_<PythonGraphResource>(module, "_GraphResource")
         .def_prop_ro("id", [](const PythonGraphResource &value) { return value.resource.id; })
@@ -2343,7 +2429,12 @@ NB_MODULE(_native, module) {
         .def_ro("destination_access", &PythonCompiledBarrier::destinationAccess)
         .def_ro("old_state", &PythonCompiledBarrier::oldState)
         .def_ro("new_state", &PythonCompiledBarrier::newState)
-        .def_ro("is_image", &PythonCompiledBarrier::isImage);
+        .def_ro("is_image", &PythonCompiledBarrier::isImage)
+        .def_ro("base_mip_level", &PythonCompiledBarrier::baseMipLevel)
+        .def_ro("mip_level_count", &PythonCompiledBarrier::mipLevelCount)
+        .def_ro("base_array_layer", &PythonCompiledBarrier::baseArrayLayer)
+        .def_ro("array_layer_count", &PythonCompiledBarrier::arrayLayerCount)
+        .def_ro("aspects", &PythonCompiledBarrier::aspects);
     nb::class_<PythonCompiledScope>(module, "_CompiledScope")
         .def_ro("rendering", &PythonCompiledScope::rendering)
         .def_ro("pass_indices", &PythonCompiledScope::passIndices)
@@ -2405,8 +2496,7 @@ NB_MODULE(_native, module) {
              nb::arg("access"), nb::arg("shape"), nb::arg("strides"), nb::arg("offset") = 0,
              nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
         .def("rhi_texture", &PipelineInvocationBuilder::rhiTexture, nb::arg("parameter"), nb::arg("texture"),
-             nb::arg("sampler") = nullptr, nb::rv_policy::reference_internal, nb::keep_alive<1, 3>(),
-             nb::keep_alive<1, 4>())
+             nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
         .def("rhi_sampler", &PipelineInvocationBuilder::rhiSampler, nb::arg("parameter"), nb::arg("sampler"),
              nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
         .def("rhi_color_attachment", &PipelineInvocationBuilder::rhiColorAttachment, nb::arg("location"),
@@ -2478,7 +2568,7 @@ NB_MODULE(_native, module) {
     module.attr("ACCESS_WRITE") = static_cast<uint32_t>(VERNON_ACCESS_WRITE);
     module.attr("ACCESS_READ_WRITE") = static_cast<uint32_t>(VERNON_ACCESS_READ_WRITE);
     module.attr("PIPELINE_TENSOR") = static_cast<uint32_t>(VERNON_PIPELINE_TENSOR);
-    module.attr("PIPELINE_TEXTURE") = static_cast<uint32_t>(VERNON_PIPELINE_TEXTURE);
+    module.attr("PIPELINE_IMAGE") = static_cast<uint32_t>(VERNON_PIPELINE_IMAGE);
     module.attr("PIPELINE_SAMPLER") = static_cast<uint32_t>(VERNON_PIPELINE_SAMPLER);
     module.attr("TOPOLOGY_TRIANGLE_LIST") = static_cast<uint32_t>(VERNON_TOPOLOGY_TRIANGLE_LIST);
     module.attr("ATTACHMENT_CLEAR") = static_cast<uint32_t>(VERNON_RHI_LOAD_CLEAR);

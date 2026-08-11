@@ -274,16 +274,16 @@ class Pipeline:
         dispatch_borrows = [
             (parameter.name, arguments[parameter.name], access_names[parameter.access])
             for parameter in parameters
-            if parameter.kind == state._native.PIPELINE_TENSOR
-            and isinstance(arguments[parameter.name], (TensorStorage, TensorView))
+            if parameter.kind in {state._native.PIPELINE_TENSOR, state._native.PIPELINE_IMAGE}
+            and isinstance(arguments[parameter.name], (TensorStorage, TensorView, _TextureResource))
         ]
         builder = compiled.native.invocation_builder()
         for parameter in parameters:
             value = arguments[parameter.name]
-            if parameter.kind == state._native.PIPELINE_TEXTURE:
+            if parameter.kind == state._native.PIPELINE_IMAGE:
                 if not isinstance(value, _TextureResource):
                     raise TypeError(f"texture {parameter.name!r} must be a Texture")
-                builder.rhi_texture(parameter.name, value._resident_texture())
+                builder.rhi_texture(parameter.name, value._resident_view())
                 continue
             if parameter.kind == state._native.PIPELINE_SAMPLER:
                 if not isinstance(value, SamplerState):
@@ -299,6 +299,11 @@ class Pipeline:
             _bind_native_argument(builder, parameter, value, host_value=host_value)
         outputs = tuple(compiled.native.outputs)
         color_attachments = target._color_attachments()
+        dispatch_borrows.extend(
+            (f"color_attachment_{location}", texture, "write") for location, texture in color_attachments
+        )
+        if target._depth_texture is not None:
+            dispatch_borrows.append(("depth_attachment", target._depth_texture, "write"))
         output_locations = {output.location for output in outputs}
         attachment_locations = {location for location, _ in color_attachments}
         if attachment_locations != output_locations:
@@ -323,7 +328,7 @@ class Pipeline:
             store = attachment.store if last_in_scope else StoreOperation.PRESERVE
             builder.rhi_color_attachment(
                 location,
-                texture._resident_texture(),
+                texture._resident_view(),
                 load_values[load],
                 store_values[store],
                 list(attachment.clear_value),
@@ -339,8 +344,9 @@ class Pipeline:
                 else LoadOperation.PRESERVE
             )
             store = attachment.depth_store if last_in_scope else StoreOperation.PRESERVE
+            assert target._depth_texture is not None
             builder.rhi_depth_attachment(
-                depth_attachment,
+                target._depth_texture._resident_view(),
                 load_values[load],
                 store_values[store],
                 attachment.clear_depth,

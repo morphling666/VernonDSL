@@ -96,7 +96,7 @@ def reflected_parameters(
                 not isinstance(name, str)
                 or not name
                 or not isinstance(interface_name, str)
-                or row.get("kind") not in {"scalar", "tensor_value", "tensor", "texture", "sampler"}
+                or row.get("kind") not in {"scalar", "tensor_value", "tensor", "image", "sampler"}
             ):
                 raise PipelineCompileError(f"{stage} external argument is missing source or kind metadata")
             inferred_dtype, inferred_shape = dtype_and_shape(row.get("type"))
@@ -120,6 +120,9 @@ def reflected_parameters(
                 "access": row.get("access", "read"),
                 "address_space": row.get("address_space"),
                 "dimension": row.get("dimension"),
+                "binding_role": row.get("binding_role"),
+                "sample_result_class": row.get("sample_result_class"),
+                "exact_storage_format": row.get("exact_storage_format"),
             }
             if "tensor_view_descriptor" in row:
                 use["tensor_view_descriptor"] = row["tensor_view_descriptor"]
@@ -142,7 +145,7 @@ def reflected_parameters(
             )
             packed_value = interface_name == "uniform" or (
                 stage == "compute"
-                and (row["kind"] not in {"tensor", "texture", "sampler"} or compute_static_tensor_value)
+                and (row["kind"] not in {"tensor", "image", "sampler"} or compute_static_tensor_value)
             )
             if packed_value and stage == "compute":
                 use["interface"] = "value"
@@ -154,7 +157,7 @@ def reflected_parameters(
             element_layout = row.get("element_layout")
             if isinstance(element_layout, Mapping):
                 use["element_layout"] = dict(element_layout)
-            elif row.get("kind") not in {"texture", "sampler"}:
+            elif row.get("kind") not in {"image", "sampler"}:
                 value_layout = row.get("value_layout")
                 if not isinstance(value_layout, Mapping):
                     raise PipelineCompileError(f"{stage} value argument is missing canonical value_layout")
@@ -177,7 +180,7 @@ def reflected_parameters(
                 "vernon.instance_divisor",
                 "vernon.set",
                 "vernon.binding",
-                "sampled_texture_bindings",
+                "sampled_image_bindings",
                 "location_span",
                 "attribute_leaves",
             ):
@@ -185,20 +188,20 @@ def reflected_parameters(
                     use[key] = row[key]
             descriptor_required = (
                 use["interface"] == "storage"
-                or (interface_name == "resource" and row.get("kind") in {"tensor", "texture"})
+                or (interface_name == "resource" and row.get("kind") in {"tensor", "image"})
                 or (interface_name == "uniform" and use.get("transport") in {"uniform_buffer", "storage_buffer"})
             )
             if descriptor_required and ("vernon.set" not in use or "vernon.binding" not in use):
                 raise PipelineCompileError(f"{stage} descriptor-backed argument is missing reflected set/binding")
-            if row.get("kind") == "sampler" and not use.get("sampled_texture_bindings"):
-                raise PipelineCompileError(f"{stage} sampler argument has no reflected sampled texture binding")
+            if row.get("kind") == "sampler" and not use.get("sampled_image_bindings"):
+                raise PipelineCompileError(f"{stage} sampler argument has no reflected sampled image binding")
             backend_name = _backend_name(name)
             if interface_name == "uniform":
                 if record.get("target") in {"opengl", "opengles", "metal", "directx"} and "vernon.binding" not in row:
                     use["uniform_name"] = backend_name
                 else:
                     use["uniform_name"] = f"{backend_name}._m0"
-            elif row.get("kind") == "texture":
+            elif row.get("kind") == "image":
                 use["uniform_name"] = backend_name
             table = internal if internal_source is not None else external
             table.setdefault(name, []).append(use)
@@ -215,7 +218,7 @@ def internal_parameters(records: Mapping[str, Mapping[str, Any]]) -> dict[str, l
 
 def classify_parameter_use(use: Mapping[str, Any]) -> str:
     kind = use.get("kind")
-    if kind in {"texture", "sampler"}:
+    if kind in {"image", "sampler"}:
         return str(kind)
     return "tensor"
 
@@ -270,6 +273,9 @@ def merge_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[s
         "access": access,
         "address_space": "device" if tensor_view else None,
         "dimension": first.get("dimension"),
+        "binding_role": first.get("binding_role"),
+        "sample_result_class": first.get("sample_result_class"),
+        "exact_storage_format": first.get("exact_storage_format"),
         "uses": normalized,
     }
     if kind == "tensor":
@@ -287,6 +293,9 @@ def merge_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[s
             "access",
             "address_space",
             "dimension",
+            "binding_role",
+            "sample_result_class",
+            "exact_storage_format",
             "internal_source",
             "system_value",
             "location_span",
@@ -315,13 +324,13 @@ def merge_internal_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) 
             or leaves[0].get("scalar_count") != 1
         ):
             raise PipelineCompileError("resolution system value must have reflected type tensor<2xf32>")
-        if any(use.get("sampled_texture_bindings") for use in uses):
-            raise PipelineCompileError("resolution system value cannot pair sampled textures")
+        if any(use.get("sampled_image_bindings") for use in uses):
+            raise PipelineCompileError("resolution system value cannot pair sampled images")
     else:
         if parameter.get("kind") != "sampler":
             raise PipelineCompileError("implicit sampler metadata must annotate a sampler argument")
         for use in uses:
-            bindings = use.get("sampled_texture_bindings")
+            bindings = use.get("sampled_image_bindings")
             if (
                 not isinstance(bindings, list)
                 or not bindings
@@ -336,7 +345,7 @@ def merge_internal_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) 
                     for binding in bindings
                 )
             ):
-                raise PipelineCompileError("implicit sampler requires reflected sampled texture bindings")
+                raise PipelineCompileError("implicit sampler requires reflected sampled image bindings")
     return parameter
 
 
@@ -387,7 +396,7 @@ def fragment_outputs(records: Mapping[str, Mapping[str, Any]]) -> list[dict[str,
         outputs.append(
             {
                 "name": row.get("vernon.source_name") or f"output_{location}",
-                "kind": "texture",
+                "kind": "image",
                 "dtype": dtype,
                 "shape": shape,
                 "access": "write",

@@ -1124,7 +1124,7 @@ class VulkanPipelineTests(unittest.TestCase):
             [("output_0", 0)],
         )
         with self.assertRaisesRegex(ValueError, "different reflected kind"):
-            compiled.native.invocation_builder().rhi_texture(0, target._resident_texture())
+            compiled.native.invocation_builder().rhi_texture(0, target._resident_view())
         bundle = json.loads(compiled.bundle)
         variant = bundle["variants"][0]
         self.assertEqual(

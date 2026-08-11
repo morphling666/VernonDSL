@@ -100,6 +100,12 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
 
     auto color = createTexture2D(context, 32, 32);
     auto bloom = createTexture2D(context, 32, 32);
+    const auto cubeView =
+        vernon::tests::createImageView(context, cube, VERNON_RHI_IMAGE_CUBE, VERNON_RHI_FORMAT_RGBA8_UNORM, 1, 6);
+    const auto colorView =
+        vernon::tests::createImageView(context, color, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
+    const auto bloomView =
+        vernon::tests::createImageView(context, bloom, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
     ASSERT_NE(color.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     ASSERT_NE(bloom.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
 
@@ -129,10 +135,8 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
     arguments[0].tensor.byte_strides = vertexStrides;
     arguments[0].tensor.byte_size = sizeof(positions);
     arguments[1].slot = cubeParameter.slot;
-    arguments[1].kind = VERNON_PIPELINE_TEXTURE;
-    arguments[1].texture = {
-        VERNON_TEXTURE_RGBA8_UNORM, VERNON_ACCESS_READ, VERNON_TEXTURE_CUBE, 1, 1, 1, cube.reference,
-        sampler.reference};
+    arguments[1].kind = VERNON_PIPELINE_IMAGE;
+    arguments[1].image = {cubeView.reference};
     for (size_t index = 2; index < arguments.size(); ++index) {
         arguments[index].kind = VERNON_PIPELINE_TENSOR;
         arguments[index].tensor.struct_size = sizeof(VernonTensorView);
@@ -150,8 +154,8 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
     arguments[4].slot = viewParameter.slot;
 
     const VernonColorAttachment attachments[] = {
-        {0, color.reference, 32, 32, VERNON_TEXTURE_RGBA8_UNORM},
-        {1, bloom.reference, 32, 32, VERNON_TEXTURE_RGBA8_UNORM},
+        {0, colorView.reference},
+        {1, bloomView.reference},
     };
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
@@ -192,6 +196,9 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
     EXPECT_LT(bloomPixels[center + 2], 10);
     EXPECT_GT(bloomPixels[center + 3], 240);
 
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(context.device, bloomView.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(context.device, colorView.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(context.device, cubeView.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, bloom.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, color.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroySampler(context.device, sampler.handle), VERNON_RHI_STATUS_OK);

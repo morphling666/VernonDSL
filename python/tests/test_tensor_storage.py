@@ -185,6 +185,18 @@ class TensorStorageRuntimeTests(unittest.TestCase):
                 with _dispatch_borrow_scope([("overlap", overlap, "write")]):
                     pass
 
+    def test_texture_view_borrows_are_subresource_aware(self) -> None:
+        texture = vd.Texture.zeros(shape=(8, 8), mip_levels=2)
+        mip0 = texture.view(base_mip_level=0, mip_level_count=1)
+        mip1 = texture.view(base_mip_level=1, mip_level_count=1)
+
+        with _dispatch_borrow_scope([("mip0", mip0, "write")]):
+            with _dispatch_borrow_scope([("mip1", mip1, "write")]):
+                pass
+            with self.assertRaisesRegex(RuntimeError, "outstanding device borrow"):
+                with _dispatch_borrow_scope([("same_mip", mip0, "read")]):
+                    pass
+
     def test_raw_buffer_requires_explicit_byte_layout_units(self) -> None:
         values = np.arange(12, dtype=np.float32).reshape(3, 4)
         backing = bytearray(values.tobytes())

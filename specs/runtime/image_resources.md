@@ -2,19 +2,20 @@
 
 ## Status
 
-This document defines the long-term architecture for Texture, sampled-image,
-storage-image, image-view, Runtime provider, and RHI integration. It is a future
-design, not the current 0.1.2 contract. The migration requires an intentional
-pipeline contract bump and must not add compatibility aliases or parallel
-binding paths.
+This document defines the 0.1.2 image-resource architecture for Texture,
+sampled-image, storage-image, image-view, Runtime provider, and RHI
+integration. The ABI changes were made before the 0.1.2 release without
+changing the compiler or pipeline contract version: the existing reflection
+already contains the required image binding role, dimension, sample-result
+class, storage format, and access constraints.
 
-The current implementation may repeat image format and dimension metadata in
-`VernonTextureView`, compute launch plans, and provider binding values. Those
-records are transitional implementation details, not the target architecture.
 Provider-neutral logical texture enums live in `VernonTextureTypes.h`;
-`VernonRuntimeProvider.h` must not depend on `VernonRHI.h`. The VernonRHI
-adapter validates repeated logical metadata against the authoritative retained
-RHI image descriptor before native binding.
+`VernonRuntimeProvider.h` and RuntimeCore do not depend on `VernonRHI.h`.
+Invocation attachments and image arguments carry image-view references rather
+than caller-authored copies of image format or extent. Provider descriptor
+queries return the immutable parent descriptor, the selected view descriptor,
+the parent hazard identity, and whether the reference denotes an owner or a
+view.
 
 ## 1. Semantic model
 
@@ -168,8 +169,9 @@ ComputeArgument =
   | SamplerArgument
 ```
 
-`ImageArgument` carries the retained opaque provider resource reference and the
-logical binding facts needed for validation. Image descriptor metadata is not
+`ImageArgument` carries one retained opaque image-view reference. Samplers are
+separate pipeline arguments and are never embedded in an image argument.
+Image descriptor metadata is not
 converted to RHI enum values in RuntimeCore. Once validation is complete,
 physical format and dimension are obtained from the provider's resource
 record, not trusted from repeated invocation fields.
@@ -198,8 +200,10 @@ ProviderBindingValue
     | SamplerReference
 ```
 
-An image payload contains only the opaque retained image or image-view
-reference required to resolve the provider-owned resource record. Format,
+An image payload contains only the opaque retained image-view reference
+required to resolve the provider-owned resource record. Owner references are
+valid for ownership and transfer operations, but shader and attachment
+bindings require views. Format,
 dimension, extent, and usage do not appear as loose fields on every binding.
 The prepared binding layout already records sampled versus storage role,
 shader access, and exact storage-format constraints derived from reflection.
@@ -214,7 +218,8 @@ or recorded command still retains the record.
 
 VernonRHI owns physical image descriptors, native images and views, resource
 state, command encoding, submission, and completion. Runtime-to-RHI format
-conversion occurs exactly once at the RHI adapter boundary.
+conversion occurs at the backend-provider boundary from the authoritative
+logical view format.
 
 The RHI adapter must have an internal descriptor query over a retained resource
 record. A public `get image descriptor` function is optional; the architectural
@@ -229,10 +234,12 @@ RHI view dimension         -> backend native view target
 ```
 
 OpenGL 4.3 or `ARB_texture_view` is required for true shader-visible aliased
-views. Older OpenGL and OpenGL ES continue to support transfer-region slicing
-without claiming image-view support. D3D12 mip generation uses a build-time
-compiled and embedded utility compute shader; it does not add a runtime shader
-compiler dependency.
+views. A canonical identity view whose format, dimension, aspects, and complete
+subresource range equal its parent may resolve directly to the parent's texture
+object. Older OpenGL and OpenGL ES otherwise continue to support transfer-region
+slicing without claiming aliased image-view support. D3D12 mip generation uses
+a build-time compiled and embedded utility compute shader; it does not add a
+runtime shader compiler dependency.
 
 ## 8. Synchronization and hazards
 
@@ -254,31 +261,24 @@ The RHI translates those declarations into image layouts, resource states,
 barriers, and cache visibility operations. Backend code must not infer hazards
 from shader code or rely on implicit whole-device synchronization.
 
-## 9. Migration sequence
+## 9. Contract invariants
 
-Implement the architecture only with the next intentional pipeline-contract
-revision, in independently reviewable changes:
+The implementation must preserve these invariants:
 
-1. preserve the shared provider-neutral texture contract in
-   `VernonTextureTypes.h` and keep RuntimeCore and Provider headers free of RHI
-   image types;
-2. replace flattened C++ launch arguments and C provider binding values with
-   discriminated payloads, migrating every provider together;
-3. make provider resource records expose authoritative immutable image
-   descriptors and remove repeated binding format/dimension fields;
-4. define image-view ownership, compatibility, subresource, and hazard
-   semantics;
-5. implement one backend's image views per change, followed by binding
-   integration and cross-backend acceptance;
-6. implement D3D12 mip generation as its own build-artifact change.
-
-Do not retain the old flattened records as compatibility structures. Do not
-accept both logical and RHI enum encodings in one field. Do not add
-backend-specific metadata to RuntimeCore to make one provider pass tests.
+1. RuntimeCore and Provider headers remain free of RHI image types;
+2. provider retain/release callbacks are mandatory;
+3. shader and attachment bindings accept image views only;
+4. descriptors are queried from retained resource records;
+5. ExecutionGraph retains every imported view and its parent and tracks hazards
+   by parent identity plus subresource overlap;
+6. backend state tracking and barriers preserve per-mip and per-layer state,
+   with aspect planes tracked separately where the native API supports it;
+7. no flattened compatibility records, implicit image-owned sampler field, or
+   parallel binding path is reintroduced.
 
 ## 10. Acceptance requirements
 
-The migration is complete only when:
+The architecture is accepted only when:
 
 - RuntimeCore builds and tests without VernonRHI headers or libraries;
 - a foreign mock provider binds sampled and storage images using only the

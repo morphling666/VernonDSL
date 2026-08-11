@@ -286,11 +286,11 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     ASSERT_TRUE(reflectionView.find("\"fragment_main\"") != std::string_view::npos);
     ASSERT_TRUE(reflectionView.find("\"results\"") != std::string_view::npos);
     ASSERT_TRUE(reflectionView.find("\"vernon.location\":0") != std::string_view::npos);
-    ASSERT_TRUE(reflectionView.find("\"kind\":\"texture\"") != std::string_view::npos);
+    ASSERT_TRUE(reflectionView.find("\"kind\":\"image\"") != std::string_view::npos);
     ASSERT_TRUE(reflectionView.find("\"dimension\":\"cube\"") != std::string_view::npos);
     ASSERT_TRUE(reflectionView.find("\"kind\":\"sampler\"") != std::string_view::npos);
-    ASSERT_TRUE(reflectionView.find("\"sampled_texture_bindings\"") != std::string_view::npos);
-    ASSERT_TRUE(reflectionView.find("\"sampled_texture_binding\":") == std::string_view::npos);
+    ASSERT_TRUE(reflectionView.find("\"sampled_image_bindings\"") != std::string_view::npos);
+    ASSERT_TRUE(reflectionView.find("\"sampled_image_binding\":") == std::string_view::npos);
     ASSERT_TRUE(reflectionView.find("\"sampled_texture_set\":") == std::string_view::npos);
 
     vernonCompileResultDestroy(result);
@@ -347,16 +347,16 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     nlohmann::json relationReflection = validateReflection(context, relationModule);
     std::fprintf(stderr, "%s\n", relationReflection.dump(2).c_str());
     const nlohmann::json &relationEntry = entry(relationReflection, "relation");
-    ASSERT_TRUE(argument(relationEntry, 1).at("kind") == "texture");
+    ASSERT_TRUE(argument(relationEntry, 1).at("kind") == "image");
     ASSERT_TRUE(argument(relationEntry, 2).at("kind") == "sampler");
-    ASSERT_TRUE(argument(relationEntry, 2).at("sampled_texture_bindings") ==
+    ASSERT_TRUE(argument(relationEntry, 2).at("sampled_image_bindings") ==
                 nlohmann::json::array({{{"set", 0}, {"binding", 1}}, {{"set", 0}, {"binding", 2}}}));
     ASSERT_TRUE(!argument(relationEntry, 2).contains("sampled_texture_set"));
-    ASSERT_TRUE(!argument(relationEntry, 2).contains("sampled_texture_binding"));
-    ASSERT_TRUE(argument(relationEntry, 5).at("sampled_texture_bindings") ==
+    ASSERT_TRUE(!argument(relationEntry, 2).contains("sampled_image_binding"));
+    ASSERT_TRUE(argument(relationEntry, 5).at("sampled_image_bindings") ==
                 nlohmann::json::array({{{"set", 0}, {"binding", 3}}}));
     ASSERT_TRUE(!argument(relationEntry, 5).contains("sampled_texture_set"));
-    ASSERT_TRUE(!argument(relationEntry, 5).contains("sampled_texture_binding"));
+    ASSERT_TRUE(!argument(relationEntry, 5).contains("sampled_image_binding"));
 
     std::fprintf(stderr, "forwarding\n");
     constexpr std::string_view forwardingModule = R"mlir(
@@ -431,7 +431,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 )mlir";
     nlohmann::json forwardingReflection = validateReflection(context, forwardingModule);
     const nlohmann::json &forwardingEntry = entry(forwardingReflection, "forwarding");
-    ASSERT_TRUE(argument(forwardingEntry, 3).at("sampled_texture_bindings") ==
+    ASSERT_TRUE(argument(forwardingEntry, 3).at("sampled_image_bindings") ==
                 nlohmann::json::array({{{"set", 0}, {"binding", 1}}, {{"set", 0}, {"binding", 2}}}));
 
     std::fprintf(stderr, "helper\n");
@@ -470,7 +470,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     nlohmann::json helperReflection = validateReflection(context, helperModule);
     const nlohmann::json &helperEntry = entry(helperReflection, "helper_entry");
     ASSERT_TRUE(helperReflection.at("entries").size() == 1);
-    ASSERT_TRUE(argument(helperEntry, 1).at("sampled_texture_bindings") ==
+    ASSERT_TRUE(argument(helperEntry, 1).at("sampled_image_bindings") ==
                 nlohmann::json::array({{{"set", 0}, {"binding", 4}}}));
 
     std::fprintf(stderr, "ambiguity\n");

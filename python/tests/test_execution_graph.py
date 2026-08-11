@@ -111,6 +111,22 @@ class CpuExecutionGraphTests(unittest.TestCase):
 
         self.assertEqual(events, ["failure"])
 
+    def test_texture_view_rejects_incompatible_reinterpretations(self) -> None:
+        texture = vd.Texture.zeros(shape=(4, 4))
+        with self.assertRaisesRegex(ValueError, "format is incompatible"):
+            texture.view(format=vd.r16_float)
+        with self.assertRaisesRegex(ValueError, "dimension is incompatible"):
+            texture.view(dimension="3d")
+        with self.assertRaisesRegex(ValueError, "aspects are incompatible"):
+            texture.view(aspects=("depth",))
+
+    def test_cube_face_view_selects_one_layer(self) -> None:
+        texture = vd.Texture.cube(np.zeros((6, 4, 4, 4), dtype=np.uint8))
+        face = texture.view(dimension="2d", base_array_layer=2, array_layer_count=1)
+        self.assertEqual(face.dimension, "2d")
+        with self.assertRaisesRegex(ValueError, "exactly one array layer"):
+            texture.view(dimension="2d")
+
 
 class RecordingRenderPass(vd.RenderPass):
     def __init__(
@@ -177,6 +193,32 @@ class ExecutionGraphTests(unittest.TestCase):
 
         self.assertEqual([execution_pass.name for execution_pass in graph.schedule], ["shadow", "sample"])
         self.assertEqual(len(graph.scopes[1].barriers), 1)
+
+    def test_texture_views_track_disjoint_mips_without_false_barriers(self) -> None:
+        texture = vd.Texture.zeros(
+            shape=(8, 8),
+            mip_levels=2,
+            usage=("sampled", "storage", "transfer_source", "transfer_destination"),
+        )
+        mip0 = texture.view(base_mip_level=0, mip_level_count=1)
+        mip1 = texture.view(base_mip_level=1, mip_level_count=1)
+        graph = vd.ExecutionGraph()
+        events: list[str] = []
+        for execution_pass in (
+            RecordingComputePass("write-mip-0", events, write=mip0),
+            RecordingComputePass("read-mip-1", events, read=mip1),
+            RecordingComputePass("read-mip-0", events, read=mip0),
+        ):
+            execution_pass.side_effect = True
+            graph.add_pass(execution_pass)
+
+        graph.compile()
+
+        self.assertEqual(len(graph.scopes), 3)
+        self.assertEqual(len(graph.scopes[1].barriers), 0)
+        self.assertEqual(len(graph.scopes[2].barriers), 1)
+        self.assertEqual(graph.scopes[2].barriers[0].base_mip_level, 0)
+        self.assertEqual(graph.scopes[2].barriers[0].mip_level_count, 1)
 
     def test_dependency_cycle_is_rejected(self) -> None:
         graph = vd.ExecutionGraph()

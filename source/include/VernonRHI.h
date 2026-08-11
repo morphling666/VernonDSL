@@ -19,7 +19,7 @@
 extern "C" {
 #endif
 
-enum { VERNON_RHI_INVALID_HANDLE_INDEX = UINT32_MAX };
+enum { VERNON_RHI_INVALID_HANDLE_INDEX = UINT32_MAX, VERNON_RHI_MAX_COLOR_ATTACHMENTS = 8 };
 
 typedef enum VernonRhiStatus {
     VERNON_RHI_STATUS_OK = 0,
@@ -210,6 +210,12 @@ typedef enum VernonRhiAttachmentAspectBits {
     VERNON_RHI_ATTACHMENT_STENCIL = 1u << 1
 } VernonRhiAttachmentAspectBits;
 
+typedef enum VernonRhiImageAspectBits {
+    VERNON_RHI_IMAGE_ASPECT_COLOR = 1u << 0,
+    VERNON_RHI_IMAGE_ASPECT_DEPTH = 1u << 1,
+    VERNON_RHI_IMAGE_ASPECT_STENCIL = 1u << 2
+} VernonRhiImageAspectBits;
+
 typedef struct VernonRhiDeviceIdentity {
     uint64_t adapter_id;
     uint64_t device_id;
@@ -270,15 +276,25 @@ typedef struct VernonRhiImageDescriptor {
     uint32_t reserved[4];
 } VernonRhiImageDescriptor;
 
+typedef struct VernonRhiImageSubresourceRange {
+    uint32_t base_mip_level;
+    uint32_t mip_level_count;
+    uint32_t base_array_layer;
+    uint32_t array_layer_count;
+    uint32_t aspects;
+} VernonRhiImageSubresourceRange;
+
 typedef struct VernonRhiImageViewDescriptor {
     uint32_t struct_size;
     VernonRhiImage image;
+    VernonRhiImageDimension dimension;
     VernonRhiFormat format;
     uint32_t base_mip_level;
     uint32_t mip_level_count;
     uint32_t base_array_layer;
     uint32_t array_layer_count;
-    uint32_t reserved[4];
+    uint32_t aspects;
+    uint32_t reserved[3];
 } VernonRhiImageViewDescriptor;
 
 typedef struct VernonRhiSamplerDescriptor {
@@ -469,7 +485,8 @@ typedef struct VernonRhiBarrier {
         VernonRhiImage image;
     };
     uint32_t is_image;
-    uint32_t reserved[4];
+    VernonRhiImageSubresourceRange image_subresources;
+    uint32_t reserved[3];
 } VernonRhiBarrier;
 
 typedef struct VernonRhiCommandEncoderStats {

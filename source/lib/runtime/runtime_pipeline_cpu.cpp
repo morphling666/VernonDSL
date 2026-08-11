@@ -47,16 +47,24 @@ VernonStatus invokeCpuComputePipeline(VernonLoadedPipeline &pipeline, const Plan
         value.slot = layout.slot;
         value.kind = layout.kind;
         if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            if (argument.kind != ComputeLaunchArgumentKind::Tensor || !argument.hostData || !argument.hostSize)
+            const auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
+            if (!tensor || !tensor->hostData || !tensor->hostSize)
                 return fail(*pipeline.context, "CPU storage binding requires a host Tensor");
-            value.resource.identity = cpuProviderResourceIdentity(*pipeline.context);
-            value.resource.resource.value = reinterpret_cast<uintptr_t>(argument.hostData);
-            value.resource.size = argument.hostSize;
+            value.payload.buffer.resource.identity = cpuProviderResourceIdentity(*pipeline.context);
+            value.payload.buffer.resource.resource.value = reinterpret_cast<uintptr_t>(tensor->hostData);
+            value.payload.buffer.resource.size = tensor->hostSize;
         } else {
-            if (!argument.scalarData || !argument.scalarSize)
+            const auto *scalar = std::get_if<ComputeScalarArgument>(&argument);
+            const auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
+            if (scalar && scalar->data && scalar->size) {
+                value.payload.inline_value.data = scalar->data;
+                value.payload.inline_value.size = scalar->size;
+            } else if (tensor && tensor->tensorViewData && tensor->tensorViewSize == layout.element_size) {
+                value.payload.inline_value.data = tensor->tensorViewData;
+                value.payload.inline_value.size = tensor->tensorViewSize;
+            } else {
                 return fail(*pipeline.context, "CPU inline binding requires host data");
-            value.inline_data = argument.scalarData;
-            value.inline_size = argument.scalarSize;
+            }
         }
     }
     VernonStatus status =

@@ -1,5 +1,6 @@
 #include "VernonRuntimeCore.h"
-#include "graphics_invocation_planner.h"
+#include "graphics_variant_key.h"
+#include "provider_image_description.h"
 
 #include <algorithm>
 #include <array>
@@ -18,6 +19,7 @@ struct VernonRuntimeCorePipeline {
     VernonRuntimeProviderObject layout{};
     VernonRuntimeProviderObject pipeline{};
     std::array<VernonRuntimeProviderObject, VERNON_RUNTIME_PROVIDER_MAX_SHADER_STAGES> shaders{};
+    std::vector<VernonRuntimeProviderBindingLayoutEntry> bindings;
     size_t shaderCount{};
     uint32_t pushConstantSize{};
     std::unordered_map<vernon::runtime::GraphicsVariantKey, VernonRuntimeProviderObject,
@@ -43,12 +45,30 @@ namespace {
 
 constexpr bool present(VernonRuntimeProviderObject object) { return object.value != 0; }
 
+const VernonRuntimeProviderResourceReference *bindingResource(const VernonRuntimeProviderBindingValue &value) {
+    switch (value.kind) {
+    case VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER:
+    case VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER:
+        return &value.payload.buffer.resource;
+    case VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE:
+    case VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE:
+        return &value.payload.image.view;
+    case VERNON_RUNTIME_PROVIDER_SAMPLER:
+        return &value.payload.sampler.resource;
+    case VERNON_RUNTIME_PROVIDER_INLINE_VALUE:
+    case VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER:
+        return nullptr;
+    }
+    return nullptr;
+}
+
 bool providerIsValid(const VernonRuntimeDeviceProvider &provider, VernonRuntimeProviderPipelineKind kind) {
     if (provider.struct_size < sizeof(VernonRuntimeDeviceProvider) || provider.abi_version != VERNON_PIPELINE_VERSION ||
         !provider.get_capabilities || !provider.get_device_identity || !provider.prepare_shader ||
         !provider.prepare_pipeline_layout || !provider.prepare_pipeline || !provider.create_binding_set ||
-        !provider.update_binding_set || !provider.destroy_shader || !provider.destroy_pipeline_layout ||
-        !provider.destroy_pipeline || !provider.destroy_binding_set)
+        !provider.update_binding_set || !provider.retain_resource || !provider.release_resource ||
+        !provider.destroy_shader || !provider.destroy_pipeline_layout || !provider.destroy_pipeline ||
+        !provider.destroy_binding_set)
         return false;
     return kind == VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE ? provider.encode_dispatch != nullptr
                                                             : provider.encode_draw != nullptr;
@@ -84,6 +104,26 @@ bool layoutIsCanonical(const VernonRuntimeProviderBindingLayoutEntry *bindings, 
     return true;
 }
 
+bool imageSampleResultClass(VernonTextureFormat format, VernonImageSampleResultClass &result) {
+    switch (format) {
+    case VERNON_TEXTURE_RGBA8_UNORM:
+    case VERNON_TEXTURE_RGBA8_SRGB:
+    case VERNON_TEXTURE_RGBA16_FLOAT:
+    case VERNON_TEXTURE_RGBA32_FLOAT:
+    case VERNON_TEXTURE_R8_UNORM:
+    case VERNON_TEXTURE_R16_FLOAT:
+    case VERNON_TEXTURE_R32_FLOAT:
+    case VERNON_TEXTURE_RG8_UNORM:
+    case VERNON_TEXTURE_RGB8_UNORM:
+    case VERNON_TEXTURE_R11G11B10_FLOAT:
+    case VERNON_TEXTURE_D32_FLOAT:
+    case VERNON_TEXTURE_D32_FLOAT_S8_UINT:
+        result = VERNON_IMAGE_SAMPLE_FLOAT;
+        return true;
+    }
+    return false;
+}
+
 bool shaderStagesAreValid(const VernonRuntimeCorePipelineDescriptor &descriptor) {
     if (!descriptor.shaders || descriptor.shader_count == 0 ||
         descriptor.shader_count > VERNON_RUNTIME_PROVIDER_MAX_SHADER_STAGES)
@@ -109,8 +149,6 @@ bool shaderStagesAreValid(const VernonRuntimeCorePipelineDescriptor &descriptor)
 
 void releaseResources(const VernonRuntimeDeviceProvider &provider,
                       const std::vector<VernonRuntimeProviderResourceReference> &resources) {
-    if (!provider.release_resource)
-        return;
     for (auto resource = resources.rbegin(); resource != resources.rend(); ++resource)
         provider.release_resource(provider.user_data, *resource);
 }
@@ -133,7 +171,7 @@ VernonStatus retainResources(const VernonRuntimeDeviceProvider &provider,
     for (size_t index = 0; index < valueCount; ++index) {
         if (values[index].kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
             values[index].kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
-            if (!values[index].inline_data || values[index].inline_size == 0) {
+            if (!values[index].payload.inline_value.data || values[index].payload.inline_value.size == 0) {
                 releaseResources(provider, resources);
                 resources.clear();
                 return VERNON_STATUS_INVALID_ARGUMENT;
@@ -142,20 +180,58 @@ VernonStatus retainResources(const VernonRuntimeDeviceProvider &provider,
         }
         if ((values[index].flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) != 0)
             continue;
-        if (!present(values[index].resource.resource) || values[index].resource.identity == 0) {
+        const VernonRuntimeProviderResourceReference *resource = bindingResource(values[index]);
+        if (!resource || !present(resource->resource) || resource->identity == 0) {
             releaseResources(provider, resources);
             resources.clear();
             return VERNON_STATUS_INVALID_ARGUMENT;
         }
-        if (provider.retain_resource) {
-            const VernonStatus status = provider.retain_resource(provider.user_data, values[index].resource);
-            if (status != VERNON_STATUS_OK) {
-                releaseResources(provider, resources);
-                resources.clear();
-                return status;
-            }
+        const VernonStatus status = provider.retain_resource(provider.user_data, *resource);
+        if (status != VERNON_STATUS_OK) {
+            releaseResources(provider, resources);
+            resources.clear();
+            return status;
         }
-        resources.push_back(values[index].resource);
+        resources.push_back(*resource);
+    }
+    return VERNON_STATUS_OK;
+}
+
+VernonStatus validateImageBindings(const VernonRuntimeCorePipeline &pipeline,
+                                   const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
+    if (valueCount != pipeline.bindings.size() || (valueCount && !values))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    for (size_t index = 0; index < valueCount; ++index) {
+        const auto found = std::lower_bound(
+            pipeline.bindings.begin(), pipeline.bindings.end(), values[index].slot,
+            [](const VernonRuntimeProviderBindingLayoutEntry &entry, uint32_t slot) { return entry.slot < slot; });
+        if (found == pipeline.bindings.end() || found->slot != values[index].slot || found->kind != values[index].kind)
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        if (found->kind != VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE &&
+            found->kind != VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE)
+            continue;
+        if ((values[index].flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) != 0)
+            continue;
+        if (!pipeline.provider.describe_image)
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        VernonRuntimeProviderImageDescription description{};
+        description.struct_size = sizeof(description);
+        const VernonStatus status = pipeline.provider.describe_image(pipeline.provider.user_data,
+                                                                     values[index].payload.image.view, &description);
+        if (status != VERNON_STATUS_OK)
+            return status;
+        const uint32_t requiredUsage =
+            found->kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ? VERNON_IMAGE_STORAGE : VERNON_IMAGE_SAMPLED;
+        VernonImageSampleResultClass sampleResultClass{};
+        if (!vernon::runtime::providerImageDescriptionIsCanonical(description) ||
+            description.resource_kind != VERNON_RUNTIME_PROVIDER_IMAGE_VIEW ||
+            description.view.dimension != found->image_dimension || !(description.image.usage & requiredUsage) ||
+            (found->kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE &&
+             (!imageSampleResultClass(description.view.format, sampleResultClass) ||
+              sampleResultClass != found->sample_result_class)) ||
+            (found->kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE &&
+             description.view.format != found->storage_image_format))
+            return VERNON_STATUS_INVALID_ARGUMENT;
     }
     return VERNON_STATUS_OK;
 }
@@ -166,23 +242,83 @@ bool drawInvocationIsValid(const VernonRuntimeCorePipeline *pipeline, const Vern
         invocation->struct_size < sizeof(VernonRuntimeCoreDrawInvocation) || invocation->vertex_count == 0 ||
         invocation->instance_count == 0 || (bindings && bindings->pipeline != pipeline) ||
         (invocation->color_attachment_count != 0 && !invocation->color_attachments) ||
+        invocation->color_attachment_count > VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS ||
         ((invocation->index_count != 0) != (invocation->index_buffer.resource.value != 0)) ||
-        invocation->depth_load_operation > VERNON_RHI_LOAD_DISCARD ||
-        invocation->depth_store_operation > VERNON_RHI_STORE_DISCARD ||
-        invocation->stencil_load_operation > VERNON_RHI_LOAD_DISCARD ||
-        invocation->stencil_store_operation > VERNON_RHI_STORE_DISCARD || !std::isfinite(invocation->clear_depth) ||
-        invocation->clear_depth < 0.0f || invocation->clear_depth > 1.0f || invocation->clear_stencil > 0xff ||
-        invocation->stencil_reference > 0xff)
+        invocation->depth_load_operation > VERNON_RUNTIME_PROVIDER_LOAD_DISCARD ||
+        invocation->depth_store_operation > VERNON_RUNTIME_PROVIDER_STORE_DISCARD ||
+        invocation->stencil_load_operation > VERNON_RUNTIME_PROVIDER_LOAD_DISCARD ||
+        invocation->stencil_store_operation > VERNON_RUNTIME_PROVIDER_STORE_DISCARD ||
+        !std::isfinite(invocation->clear_depth) || invocation->clear_depth < 0.0f || invocation->clear_depth > 1.0f ||
+        invocation->clear_stencil > 0xff || invocation->stencil_reference > 0xff)
         return false;
     for (size_t index = 0; index < invocation->color_attachment_count; ++index) {
         const auto &attachment = invocation->color_attachments[index];
-        if (attachment.location != index || attachment.load_operation > VERNON_RHI_LOAD_DISCARD ||
-            attachment.store_operation > VERNON_RHI_STORE_DISCARD ||
+        if (attachment.location != index || attachment.load_operation > VERNON_RUNTIME_PROVIDER_LOAD_DISCARD ||
+            attachment.store_operation > VERNON_RUNTIME_PROVIDER_STORE_DISCARD ||
             !std::all_of(std::begin(attachment.clear_color), std::end(attachment.clear_color),
                          [](float value) { return std::isfinite(value); }))
             return false;
     }
     return true;
+}
+
+VernonStatus validateDrawAttachments(const VernonRuntimeCorePipeline &pipeline,
+                                     const VernonRuntimeCoreDrawInvocation &invocation) {
+    struct Attachment {
+        VernonRuntimeProviderImageDescription description{};
+        uint32_t width{};
+        uint32_t height{};
+    };
+    std::array<Attachment, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS + 1> attachments{};
+    size_t attachmentCount = 0;
+    const auto describe = [&](VernonRuntimeProviderResourceReference view, uint32_t requiredUsage,
+                              uint32_t requiredAspects) -> VernonStatus {
+        if (!view.identity || !present(view.resource))
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        Attachment attachment;
+        attachment.description.struct_size = sizeof(attachment.description);
+        const VernonStatus status =
+            pipeline.provider.describe_image(pipeline.provider.user_data, view, &attachment.description);
+        if (status != VERNON_STATUS_OK)
+            return status;
+        const auto &description = attachment.description;
+        const auto &range = description.view.subresources;
+        if (!vernon::runtime::providerImageDescriptionIsCanonical(description) ||
+            description.resource_kind != VERNON_RUNTIME_PROVIDER_IMAGE_VIEW ||
+            (description.image.usage & requiredUsage) == 0 || (range.aspects & requiredAspects) == 0 ||
+            (range.aspects & ~requiredAspects) != 0 || range.mip_level_count != 1 ||
+            description.view.dimension == VERNON_TEXTURE_3D)
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        attachment.width = std::max(description.image.extent.width >> range.base_mip_level, 1u);
+        attachment.height = std::max(description.image.extent.height >> range.base_mip_level, 1u);
+        for (size_t index = 0; index < attachmentCount; ++index) {
+            const Attachment &existing = attachments[index];
+            const auto &left = existing.description.view.subresources;
+            const bool mipOverlap = left.base_mip_level < range.base_mip_level + range.mip_level_count &&
+                                    range.base_mip_level < left.base_mip_level + left.mip_level_count;
+            const bool layerOverlap = left.base_array_layer < range.base_array_layer + range.array_layer_count &&
+                                      range.base_array_layer < left.base_array_layer + left.array_layer_count;
+            if (existing.description.parent_identity == description.parent_identity && mipOverlap && layerOverlap &&
+                (left.aspects & range.aspects) != 0)
+                return VERNON_STATUS_INVALID_ARGUMENT;
+            if (existing.width != attachment.width || existing.height != attachment.height ||
+                existing.description.view.subresources.array_layer_count != range.array_layer_count ||
+                existing.description.image.sample_count != description.image.sample_count)
+                return VERNON_STATUS_INVALID_ARGUMENT;
+        }
+        attachments[attachmentCount++] = std::move(attachment);
+        return VERNON_STATUS_OK;
+    };
+    for (size_t index = 0; index < invocation.color_attachment_count; ++index) {
+        const VernonStatus status = describe(invocation.color_attachments[index].view, VERNON_IMAGE_COLOR_ATTACHMENT,
+                                             VERNON_IMAGE_ASPECT_COLOR);
+        if (status != VERNON_STATUS_OK)
+            return status;
+    }
+    if (present(invocation.depth_stencil_view.resource))
+        return describe(invocation.depth_stencil_view, VERNON_IMAGE_DEPTH_STENCIL_ATTACHMENT,
+                        VERNON_IMAGE_ASPECT_DEPTH | VERNON_IMAGE_ASPECT_STENCIL);
+    return VERNON_STATUS_OK;
 }
 
 } // namespace
@@ -195,6 +331,16 @@ extern "C" VernonStatus vernonRuntimeCorePreparePipeline(const VernonRuntimeDevi
     if (!provider || !descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
         !providerIsValid(*provider, descriptor->kind) ||
         !layoutIsCanonical(descriptor->bindings, descriptor->binding_count) || !shaderStagesAreValid(*descriptor))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    const bool requiresImageDescriptions =
+        descriptor->kind == VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE ||
+        (descriptor->binding_count != 0 &&
+         std::any_of(descriptor->bindings, descriptor->bindings + descriptor->binding_count,
+                     [](const VernonRuntimeProviderBindingLayoutEntry &binding) {
+                         return binding.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
+                                binding.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE;
+                     }));
+    if (requiresImageDescriptions && !provider->describe_image)
         return VERNON_STATUS_INVALID_ARGUMENT;
 
     const uint32_t requiredFacet = descriptor->kind == VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE
@@ -213,6 +359,11 @@ extern "C" VernonStatus vernonRuntimeCorePreparePipeline(const VernonRuntimeDevi
     pipeline->identity = provider->get_device_identity(provider->user_data);
     pipeline->kind = descriptor->kind;
     pipeline->pushConstantSize = descriptor->push_constant_size;
+    try {
+        pipeline->bindings.assign(descriptor->bindings, descriptor->bindings + descriptor->binding_count);
+    } catch (const std::bad_alloc &) {
+        return VERNON_STATUS_INTERNAL_ERROR;
+    }
 
     for (size_t index = 0; index < descriptor->shader_count; ++index) {
         VernonRuntimeProviderObject shader{};
@@ -286,7 +437,10 @@ extern "C" VernonStatus vernonRuntimeCoreCreateBindings(VernonRuntimeCorePipelin
     if (!bindings)
         return VERNON_STATUS_INTERNAL_ERROR;
     bindings->pipeline = pipeline;
-    VernonStatus status = retainResources(pipeline->provider, values, valueCount, bindings->resources);
+    VernonStatus status = validateImageBindings(*pipeline, values, valueCount);
+    if (status != VERNON_STATUS_OK)
+        return status;
+    status = retainResources(pipeline->provider, values, valueCount, bindings->resources);
     if (status != VERNON_STATUS_OK)
         return status;
     const VernonRuntimeProviderBindingSetDescriptor descriptor{
@@ -319,7 +473,10 @@ extern "C" VernonStatus vernonRuntimeCoreUpdateBindings(VernonRuntimeCoreBinding
     if (!bindings)
         return VERNON_STATUS_INVALID_ARGUMENT;
     bindings->pendingResources.clear();
-    VernonStatus status = retainResources(bindings->pipeline->provider, values, valueCount, bindings->pendingResources);
+    VernonStatus status = validateImageBindings(*bindings->pipeline, values, valueCount);
+    if (status != VERNON_STATUS_OK)
+        return status;
+    status = retainResources(bindings->pipeline->provider, values, valueCount, bindings->pendingResources);
     if (status != VERNON_STATUS_OK)
         return status;
     status = bindings->pipeline->provider.update_binding_set(bindings->pipeline->provider.user_data, bindings->handle,
@@ -489,6 +646,9 @@ extern "C" VernonStatus vernonRuntimeCoreEncodeDrawInvocation(const VernonRuntim
                                                               const VernonRuntimeCoreDrawInvocation *invocation) {
     if (!drawInvocationIsValid(pipeline, bindings, invocation))
         return VERNON_STATUS_INVALID_ARGUMENT;
+    const VernonStatus attachmentStatus = validateDrawAttachments(*pipeline, *invocation);
+    if (attachmentStatus != VERNON_STATUS_OK)
+        return attachmentStatus;
     const VernonRuntimeProviderDrawDescriptor descriptor{
         sizeof(VernonRuntimeProviderDrawDescriptor),
         pipeline->pipeline,
@@ -499,7 +659,7 @@ extern "C" VernonStatus vernonRuntimeCoreEncodeDrawInvocation(const VernonRuntim
         invocation->first_instance,
         invocation->color_attachments,
         invocation->color_attachment_count,
-        invocation->depth_stencil_attachment,
+        invocation->depth_stencil_view,
         invocation->depth_load_operation,
         invocation->depth_store_operation,
         invocation->clear_depth,
@@ -525,6 +685,9 @@ vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(const VernonRuntimeCoreGrap
     const VernonRuntimeCorePipeline *pipeline = variant ? variant->pipeline : nullptr;
     if (!variant || !drawInvocationIsValid(pipeline, bindings, invocation))
         return VERNON_STATUS_INVALID_ARGUMENT;
+    const VernonStatus attachmentStatus = validateDrawAttachments(*pipeline, *invocation);
+    if (attachmentStatus != VERNON_STATUS_OK)
+        return attachmentStatus;
     const VernonRuntimeProviderDrawDescriptor descriptor{
         sizeof(VernonRuntimeProviderDrawDescriptor),
         variant->handle,
@@ -535,7 +698,7 @@ vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(const VernonRuntimeCoreGrap
         invocation->first_instance,
         invocation->color_attachments,
         invocation->color_attachment_count,
-        invocation->depth_stencil_attachment,
+        invocation->depth_stencil_view,
         invocation->depth_load_operation,
         invocation->depth_store_operation,
         invocation->clear_depth,

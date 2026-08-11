@@ -169,24 +169,25 @@ VernonStatus updateCpuBindingsImpl(CpuContextState &context, CpuPreparedBindings
             argument.physical.size > bindings.packed.size() - argument.physical.offset)
             return fail(context.error, "CPU provider binding does not match reflection");
         if (value.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            if (!value.resource.resource.value ||
-                value.resource.identity != static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&context)) ||
-                !value.resource.size)
+            const auto &resource = value.payload.buffer.resource;
+            if (!resource.resource.value ||
+                resource.identity != static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&context)) || !resource.size)
                 return fail(context.error, "CPU provider storage binding is invalid");
-            const auto *storage = reinterpret_cast<const uint8_t *>(
-                static_cast<uintptr_t>(value.resource.resource.value) + value.resource.offset);
+            const auto *storage =
+                reinterpret_cast<const uint8_t *>(static_cast<uintptr_t>(resource.resource.value) + resource.offset);
             if (argument.physical.size == sizeof(uintptr_t)) {
                 const uintptr_t pointer = reinterpret_cast<uintptr_t>(storage);
                 std::memcpy(bindings.packed.data() + argument.physical.offset, &pointer, sizeof(pointer));
             } else {
-                if (value.resource.size < argument.physical.size)
+                if (resource.size < argument.physical.size)
                     return fail(context.error, "CPU provider storage binding is smaller than the inline argument");
                 std::memcpy(bindings.packed.data() + argument.physical.offset, storage, argument.physical.size);
             }
         } else {
-            if (!value.inline_data || value.inline_size != argument.physical.size)
+            if (!value.payload.inline_value.data || value.payload.inline_value.size != argument.physical.size)
                 return fail(context.error, "CPU provider inline binding is invalid");
-            std::memcpy(bindings.packed.data() + argument.physical.offset, value.inline_data, value.inline_size);
+            std::memcpy(bindings.packed.data() + argument.physical.offset, value.payload.inline_value.data,
+                        value.payload.inline_value.size);
         }
         ++reflectedIndex;
     }
@@ -334,7 +335,8 @@ bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState ker
         binding.array_count = 1;
         binding.argument_index = argumentIndex;
         binding.element_size =
-            static_cast<uint32_t>(argument.kind == "tensor" ? argument.tensorElementSize : argument.physical.size);
+            static_cast<uint32_t>(binding.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ? argument.tensorElementSize
+                                                                                         : argument.physical.size);
         if (!binding.element_size) {
             invocationDiagnostic(context) = "CPU compute reflection contains a zero-sized argument";
             return false;

@@ -222,6 +222,11 @@ uint64_t vernon::rhi::imageResource(VernonRhiDevice device, VernonRhiImage image
     return backend && backend->imageResource ? backend->imageResource(device, image) : 0;
 }
 
+uint64_t vernon::rhi::imageViewResource(VernonRhiDevice device, VernonRhiImageView view) {
+    const BackendDispatch *backend = dispatch(device);
+    return backend && backend->imageViewResource ? backend->imageViewResource(device, view) : 0;
+}
+
 uint64_t vernon::rhi::samplerResource(VernonRhiDevice device, VernonRhiSampler sampler) {
     const BackendDispatch *backend = dispatch(device);
     return backend && backend->samplerResource ? backend->samplerResource(device, sampler) : 0;
@@ -240,6 +245,13 @@ uint64_t vernon::rhi::resolveResource(VernonRhiDevice device, ResourceKind kind,
 bool vernon::rhi::describeImageResource(VernonRhiDevice device, uint64_t key, VernonRhiImageDescriptor &descriptor) {
     const BackendDispatch *backend = dispatch(device);
     return backend && backend->describeImageResource && backend->describeImageResource(device, key, &descriptor);
+}
+
+bool vernon::rhi::describeImageViewResource(VernonRhiDevice device, uint64_t key, VernonRhiImageViewDescriptor &view,
+                                            VernonRhiImageDescriptor &image, uint64_t &parentKey) {
+    const BackendDispatch *backend = dispatch(device);
+    return backend && backend->describeImageViewResource &&
+           backend->describeImageViewResource(device, key, &view, &image, &parentKey);
 }
 
 void vernon::rhi::releaseResource(VernonRhiDevice device, ResourceKind kind, uint64_t key) {

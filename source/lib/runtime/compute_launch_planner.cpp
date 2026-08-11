@@ -75,22 +75,10 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
                 return fail(error, "compute argument index is duplicated");
 
             ComputeLaunchArgument &argument = plan.arguments[use.index];
-            if (supplied.kind == VERNON_PIPELINE_TEXTURE) {
-                if (parameter.kind != "texture" || !supplied.texture.resource.identity ||
-                    !supplied.texture.resource.resource.value)
-                    return fail(error, "compute texture argument is invalid");
-                const auto dimension = pipelineTextureDimension(parameter.dimension);
-                if (!dimension || supplied.texture.dimension != *dimension)
-                    return fail(error, "compute texture dimension does not match");
-                if (!parameter.format.empty()) {
-                    const auto format = pipelineTextureFormat(parameter.format);
-                    if (!format || supplied.texture.format != *format)
-                        return fail(error, "compute storage texture format does not match");
-                }
-                argument.kind = ComputeLaunchArgumentKind::Texture;
-                argument.resource = supplied.texture.resource;
-                argument.textureFormat = supplied.texture.format;
-                argument.textureDimension = supplied.texture.dimension;
+            if (supplied.kind == VERNON_PIPELINE_IMAGE) {
+                if (parameter.kind != "image" || !supplied.image.view.identity || !supplied.image.view.resource.value)
+                    return fail(error, "compute image argument is invalid");
+                argument = ComputeImageArgument{supplied.image.view};
                 assigned[use.index] = 1;
                 continue;
             }
@@ -101,18 +89,14 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
                     supplied.tensor.byte_offset > supplied.tensor.resource.size ||
                     supplied.tensor.byte_size > supplied.tensor.resource.size || !tensorFitsAllocation(supplied.tensor))
                     return fail(error, "compute RHI Tensor view is invalid");
-                argument.kind = ComputeLaunchArgumentKind::Tensor;
-                argument.resource = supplied.tensor.resource;
+                argument = ComputeTensorArgument{supplied.tensor.resource};
             } else {
                 if (use.interfaceKind == "storage") {
                     if (supplied.tensor.storage != VERNON_TENSOR_HOST || !supplied.tensor.host_data ||
                         !tensorFitsAllocation(supplied.tensor))
                         return fail(error, "compute host storage Tensor is invalid");
-                    argument.kind = ComputeLaunchArgumentKind::Tensor;
-                    argument.hostData = supplied.tensor.host_data;
-                    argument.hostSize = supplied.tensor.byte_size;
+                    argument = ComputeTensorArgument{{}, supplied.tensor.host_data, supplied.tensor.byte_size};
                 } else {
-                    argument.kind = ComputeLaunchArgumentKind::Scalar;
                     if (!use.interfacePlan || !use.interfacePlan->root)
                         return fail(error, "compute value Tensor is missing its typed interface plan");
                     if (use.interfacePlan->root->size > std::numeric_limits<size_t>::max())
@@ -133,17 +117,20 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
                     if (!packed)
                         return fail(error, "failed to pack reflected compute Tensor layout");
                     plan.hostTensorStorage.push_back(std::move(*packed));
-                    argument.scalarData = plan.hostTensorStorage.back().data();
-                    argument.scalarSize = plan.hostTensorStorage.back().size();
+                    argument = ComputeScalarArgument{plan.hostTensorStorage.back().data(),
+                                                     plan.hostTensorStorage.back().size()};
                 }
             }
             if (use.tensorViewDescriptor) {
                 plan.hostTensorStorage.emplace_back();
                 if (!packTensorViewDescriptor(supplied.tensor, plan.hostTensorStorage.back()))
                     return fail(error, "failed to pack TensorView dispatch descriptor");
-                argument.scalarData = plan.hostTensorStorage.back().data();
-                argument.scalarSize = plan.hostTensorStorage.back().size();
-                argument.tensorView = &supplied.tensor;
+                auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
+                if (!tensor)
+                    return fail(error, "TensorView descriptor is attached to a non-Tensor argument");
+                tensor->tensorView = &supplied.tensor;
+                tensor->tensorViewData = plan.hostTensorStorage.back().data();
+                tensor->tensorViewSize = plan.hostTensorStorage.back().size();
             }
             assigned[use.index] = 1;
         }
@@ -190,7 +177,8 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
 
 std::optional<int64_t> computeBindingDescriptorValue(const ComputeLaunchArgument &argument,
                                                      const ComputeBindingSource &source) {
-    const VernonTensorView *tensor = argument.tensorView;
+    const auto *tensorArgument = std::get_if<ComputeTensorArgument>(&argument);
+    const VernonTensorView *tensor = tensorArgument ? tensorArgument->tensorView : nullptr;
     if (!tensor || !valueLayoutValid(tensor->element_layout))
         return std::nullopt;
     const int64_t elementSize = static_cast<int64_t>(tensor->element_layout.byte_size);
@@ -232,8 +220,8 @@ bool planComputeInvocation(const Variant &variant, VernonLaunchSize workgroup,
         const auto found = arguments.find(parameter.slot);
         if (found == arguments.end())
             return fail(error, "pipeline argument kind does not match layout");
-        if (parameter.kind == "texture") {
-            if (found->second->kind != VERNON_PIPELINE_TEXTURE)
+        if (parameter.kind == "image") {
+            if (found->second->kind != VERNON_PIPELINE_IMAGE)
                 return fail(error, "pipeline argument kind does not match layout");
             continue;
         }

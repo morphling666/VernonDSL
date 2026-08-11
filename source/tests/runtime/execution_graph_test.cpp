@@ -2,9 +2,95 @@
 
 #include <gtest/gtest.h>
 
+namespace vernon::execution::detail {
+
+struct ExecutionGraphTestAccess {
+    static GraphBuffer importBuffer(ExecutionGraph &graph, VernonRhiBuffer buffer, bool exported = false) {
+        const uint64_t key = (static_cast<uint64_t>(buffer.generation) << 32) | (uint64_t{buffer.index} + 1);
+        if (const auto found = graph.importedBuffers_.find(key); found != graph.importedBuffers_.end()) {
+            graph.resourceRecords_[found->second].exported |= exported;
+            GraphBuffer result;
+            result.id = found->second;
+            result.kind = ResourceKind::Buffer;
+            result.graphIdentity = graph.graphIdentity_;
+            result.handle = buffer;
+            return result;
+        }
+        GraphBuffer result;
+        result.id = static_cast<uint32_t>(graph.resources_.size());
+        result.kind = ResourceKind::Buffer;
+        result.graphIdentity = graph.graphIdentity_;
+        result.handle = buffer;
+        graph.resources_.push_back(result);
+        graph.resourceRecords_.push_back({result, exported});
+        graph.resourceRecords_.back().buffer = buffer;
+        graph.resourceRecords_.back().resourceKey = key;
+        graph.importedBuffers_.emplace(key, result.id);
+        graph.dirty_ = true;
+        return result;
+    }
+
+    static GraphImage importImage(ExecutionGraph &graph, VernonRhiImage image, VernonRhiImageView view,
+                                  VernonRhiFormat format, uint32_t width, uint32_t height, uint32_t layers = 1,
+                                  uint32_t samples = 1, bool exported = false,
+                                  const VernonRhiImageSubresourceRange *subresources = nullptr) {
+        const uint32_t aspects =
+            subresources ? subresources->aspects
+                         : static_cast<uint32_t>(format == VERNON_RHI_FORMAT_D32_FLOAT ? VERNON_RHI_IMAGE_ASPECT_DEPTH
+                                                 : format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT
+                                                     ? VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL
+                                                     : VERNON_RHI_IMAGE_ASPECT_COLOR);
+        const uint32_t baseMip = subresources ? subresources->base_mip_level : 0;
+        const uint32_t mipCount =
+            subresources && subresources->mip_level_count != UINT32_MAX ? subresources->mip_level_count : 1;
+        const uint32_t baseLayer = subresources ? subresources->base_array_layer : 0;
+        const uint32_t layerCount =
+            subresources && subresources->array_layer_count != UINT32_MAX ? subresources->array_layer_count : layers;
+        GraphImage result;
+        result.kind = ResourceKind::Image;
+        result.graphIdentity = graph.graphIdentity_;
+        result.handle = image;
+        result.view = view;
+        result.format = format;
+        result.width = width;
+        result.height = height;
+        result.layers = layerCount;
+        result.samples = samples;
+        result.subresources = {baseMip, mipCount, baseLayer, layerCount, aspects};
+        const uint64_t key = (static_cast<uint64_t>(image.generation) << 32) | (uint64_t{image.index} + 1);
+        if (const auto found = graph.importedImages_.find(key); found != graph.importedImages_.end()) {
+            graph.resourceRecords_[found->second].exported |= exported;
+            result.id = found->second;
+            return result;
+        }
+        result.id = static_cast<uint32_t>(graph.resources_.size());
+        graph.resources_.push_back(result);
+        graph.resourceRecords_.push_back({result, exported});
+        graph.resourceRecords_.back().image = image;
+        graph.resourceRecords_.back().resourceKey = key;
+        graph.importedImages_.emplace(key, result.id);
+        graph.dirty_ = true;
+        return result;
+    }
+};
+
+} // namespace vernon::execution::detail
+
 namespace {
 
 using namespace vernon::execution;
+
+GraphBuffer importBufferForTesting(ExecutionGraph &graph, VernonRhiBuffer buffer, bool exported = false) {
+    return detail::ExecutionGraphTestAccess::importBuffer(graph, buffer, exported);
+}
+
+GraphImage importImageForTesting(ExecutionGraph &graph, VernonRhiImage image, VernonRhiImageView view,
+                                 VernonRhiFormat format, uint32_t width, uint32_t height, uint32_t layers = 1,
+                                 uint32_t samples = 1, bool exported = false,
+                                 const VernonRhiImageSubresourceRange *subresources = nullptr) {
+    return detail::ExecutionGraphTestAccess::importImage(graph, image, view, format, width, height, layers, samples,
+                                                         exported, subresources);
+}
 
 class TestComputePass final : public ComputePass {
 public:
@@ -159,13 +245,33 @@ private:
     bool readOnly_;
 };
 
+class TestImageSubresourcePass final : public ComputePass {
+public:
+    TestImageSubresourcePass(std::string name, GraphImage image, AccessMode access)
+        : ComputePass(std::move(name)), image_(image), access_(access) {}
+
+    void declare() override {
+        if (access_ == AccessMode::Read)
+            read(image_);
+        else
+            write(image_);
+        setFlags(PassSideEffect);
+    }
+
+    VernonRhiStatus execute(ComputeEncoder &, const ExecutionResources &) override { return VERNON_RHI_STATUS_OK; }
+
+private:
+    GraphImage image_;
+    AccessMode access_;
+};
+
 GraphResource none() { return {UINT32_MAX, ResourceKind::Buffer}; }
 
 TEST(ExecutionGraph, InfersHazardsAndHonorsExplicitDependencies) {
     ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
-    const GraphBuffer source = graph.importBuffer({0, 1});
-    const GraphBuffer intermediate = graph.importBuffer({1, 1});
-    const GraphBuffer output = graph.importBuffer({2, 1}, true);
+    const GraphBuffer source = importBufferForTesting(graph, {0, 1});
+    const GraphBuffer intermediate = importBufferForTesting(graph, {1, 1});
+    const GraphBuffer output = importBufferForTesting(graph, {2, 1}, true);
     auto &produce = graph.emplacePass<TestComputePass>("produce", source, intermediate);
     auto &consume = graph.emplacePass<TestComputePass>("consume", intermediate, output);
     consume.dependsOn(produce);
@@ -212,8 +318,9 @@ TEST(ExecutionGraph, CpuProviderPropagatesFailureAndStopsSchedule) {
 
 TEST(ExecutionGraph, FusesCompatibleRenderPassesAndSplitsCompute) {
     ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
-    const GraphImage color = graph.importImage({0, 1}, {0, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 64, 64, 1, 1, true);
-    const GraphBuffer buffer = graph.importBuffer({0, 1}, true);
+    const GraphImage color =
+        importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 64, 64, 1, 1, true);
+    const GraphBuffer buffer = importBufferForTesting(graph, {0, 1}, true);
     graph.emplacePass<TestRenderPass>("first", color, VERNON_RHI_LOAD_CLEAR);
     graph.emplacePass<TestRenderPass>("second", color);
     graph.emplacePass<TestComputePass>("compute", none(), buffer);
@@ -244,7 +351,7 @@ TEST(ExecutionGraph, RejectsDependencyCycles) {
 
 TEST(ExecutionGraph, CullsTransientPassesWithoutLiveConsumers) {
     ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
-    const GraphBuffer transient = graph.importBuffer({0, 1});
+    const GraphBuffer transient = importBufferForTesting(graph, {0, 1});
     graph.emplacePass<TestComputePass>("dead", none(), transient);
 
     std::string error;
@@ -255,13 +362,13 @@ TEST(ExecutionGraph, CullsTransientPassesWithoutLiveConsumers) {
 
 TEST(ExecutionGraph, DeduplicatesImportsAndPromotesExportedResources) {
     ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
-    const GraphBuffer first = graph.importBuffer({4, 9});
-    const GraphBuffer second = graph.importBuffer({4, 9}, true);
+    const GraphBuffer first = importBufferForTesting(graph, {4, 9});
+    const GraphBuffer second = importBufferForTesting(graph, {4, 9}, true);
     EXPECT_EQ(first.id, second.id);
     EXPECT_EQ(first.graphIdentity, second.graphIdentity);
 
-    const GraphImage firstView = graph.importImage({7, 3}, {10, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 16);
-    const GraphImage secondView = graph.importImage({7, 3}, {11, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 16);
+    const GraphImage firstView = importImageForTesting(graph, {7, 3}, {10, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 16);
+    const GraphImage secondView = importImageForTesting(graph, {7, 3}, {11, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 16);
     EXPECT_EQ(firstView.id, secondView.id);
     EXPECT_NE(firstView.view.index, secondView.view.index);
 
@@ -274,9 +381,9 @@ TEST(ExecutionGraph, DeduplicatesImportsAndPromotesExportedResources) {
 TEST(ExecutionGraph, AliasedImportsPreserveRawWarAndWawHazards) {
     const auto expectBothPassesLive = [](AccessMode firstAccess, AccessMode secondAccess) {
         ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
-        const GraphBuffer firstAlias = graph.importBuffer({4, 9}, secondAccess != AccessMode::Read);
-        const GraphBuffer secondAlias = graph.importBuffer({4, 9});
-        const GraphBuffer output = graph.importBuffer({5, 1}, secondAccess == AccessMode::Read);
+        const GraphBuffer firstAlias = importBufferForTesting(graph, {4, 9}, secondAccess != AccessMode::Read);
+        const GraphBuffer secondAlias = importBufferForTesting(graph, {4, 9});
+        const GraphBuffer output = importBufferForTesting(graph, {5, 1}, secondAccess == AccessMode::Read);
         if (firstAccess == AccessMode::Read)
             graph.emplacePass<TestComputePass>("first", firstAlias, output);
         else
@@ -297,8 +404,8 @@ TEST(ExecutionGraph, AliasedImportsPreserveRawWarAndWawHazards) {
 TEST(ExecutionGraph, RejectsResourceFromAnotherGraphWithMatchingNumericId) {
     ExecutionGraph first({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
     ExecutionGraph second({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
-    const GraphBuffer foreign = first.importBuffer({0, 1});
-    const GraphBuffer output = second.importBuffer({1, 1}, true);
+    const GraphBuffer foreign = importBufferForTesting(first, {0, 1});
+    const GraphBuffer output = importBufferForTesting(second, {1, 1}, true);
     second.emplacePass<TestComputePass>("foreign", foreign, output);
 
     std::string error;
@@ -309,8 +416,9 @@ TEST(ExecutionGraph, RejectsResourceFromAnotherGraphWithMatchingNumericId) {
 
 TEST(ExecutionGraph, DerivesBarrierStageAccessAndStateFromUses) {
     ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
-    const GraphBuffer intermediate = graph.importBuffer({0, 1});
-    const GraphImage color = graph.importImage({1, 1}, {1, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 16, 1, 1, true);
+    const GraphBuffer intermediate = importBufferForTesting(graph, {0, 1});
+    const GraphImage color =
+        importImageForTesting(graph, {1, 1}, {1, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 16, 1, 1, true);
     graph.emplacePass<TestComputePass>("produce", none(), intermediate);
     graph.emplacePass<TestRenderReadPass>("consume", color, intermediate);
 
@@ -327,10 +435,41 @@ TEST(ExecutionGraph, DerivesBarrierStageAccessAndStateFromUses) {
     EXPECT_EQ(barrier.new_state, VERNON_RHI_STATE_SHADER_READ);
 }
 
+TEST(ExecutionGraph, TracksImageHazardsByParentAndSubresourceRange) {
+    ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+    const VernonRhiImageSubresourceRange mip0{0, 1, 0, 1, VERNON_RHI_IMAGE_ASPECT_COLOR};
+    const VernonRhiImageSubresourceRange mip1{1, 1, 0, 1, VERNON_RHI_IMAGE_ASPECT_COLOR};
+    const GraphImage first =
+        importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 16, 1, 1, false, &mip0);
+    const GraphImage second =
+        importImageForTesting(graph, {0, 1}, {1, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 8, 8, 1, 1, false, &mip1);
+    ASSERT_EQ(first.id, second.id);
+    graph.emplacePass<TestImageSubresourcePass>("write-mip-0", first, AccessMode::Write);
+    graph.emplacePass<TestImageSubresourcePass>("read-mip-1", second, AccessMode::Read);
+    graph.emplacePass<TestImageSubresourcePass>("read-mip-0", first, AccessMode::Read);
+
+    std::string error;
+    ASSERT_TRUE(graph.compile(error)) << error;
+    ASSERT_EQ(graph.scopes().size(), 3u);
+    EXPECT_TRUE(graph.scopes()[1].barriers.empty());
+    ASSERT_EQ(graph.scopes()[2].barriers.size(), 1u);
+    const VernonRhiBarrier &barrier = graph.scopes()[2].barriers.front();
+    EXPECT_EQ(barrier.image_subresources.base_mip_level, 0u);
+    EXPECT_EQ(barrier.image_subresources.mip_level_count, 1u);
+    EXPECT_EQ(barrier.image_subresources.base_array_layer, 0u);
+    EXPECT_EQ(barrier.image_subresources.array_layer_count, 1u);
+    EXPECT_EQ(barrier.image_subresources.aspects, VERNON_RHI_IMAGE_ASPECT_COLOR);
+    EXPECT_EQ(barrier.old_state, VERNON_RHI_STATE_SHADER_WRITE);
+    EXPECT_EQ(barrier.new_state, VERNON_RHI_STATE_SHADER_READ);
+    EXPECT_EQ(barrier.source_access, VERNON_RHI_ACCESS_SHADER_WRITE);
+    EXPECT_EQ(barrier.destination_access, VERNON_RHI_ACCESS_SHADER_READ);
+}
+
 TEST(ExecutionGraph, RejectsInvalidAttachmentFormatAndExtent) {
     {
         ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
-        const GraphImage depth = graph.importImage({0, 1}, {0, 1}, VERNON_RHI_FORMAT_D32_FLOAT, 16, 16, 1, 1, true);
+        const GraphImage depth =
+            importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_D32_FLOAT, 16, 16, 1, 1, true);
         graph.emplacePass<TestRenderPass>("depth-as-color", depth);
         std::string error;
         EXPECT_FALSE(graph.compile(error));
@@ -338,8 +477,10 @@ TEST(ExecutionGraph, RejectsInvalidAttachmentFormatAndExtent) {
     }
     {
         ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
-        const GraphImage first = graph.importImage({0, 1}, {0, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 16, 1, 1, true);
-        const GraphImage second = graph.importImage({1, 1}, {1, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 32, 16, 1, 1, true);
+        const GraphImage first =
+            importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 16, 1, 1, true);
+        const GraphImage second =
+            importImageForTesting(graph, {1, 1}, {1, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 32, 16, 1, 1, true);
         graph.emplacePass<TestMultiRenderPass>("mismatched", first, second);
         std::string error;
         EXPECT_FALSE(graph.compile(error));
@@ -350,7 +491,8 @@ TEST(ExecutionGraph, RejectsInvalidAttachmentFormatAndExtent) {
 TEST(ExecutionGraph, RejectsClearOnReadOnlyDepthAndSplitsReadOnlyChanges) {
     {
         ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
-        const GraphImage depth = graph.importImage({0, 1}, {0, 1}, VERNON_RHI_FORMAT_D32_FLOAT, 16, 16, 1, 1, true);
+        const GraphImage depth =
+            importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_D32_FLOAT, 16, 16, 1, 1, true);
         graph.emplacePass<TestDepthPass>("read-only-clear", depth, VERNON_RHI_LOAD_CLEAR, true);
         std::string error;
         EXPECT_FALSE(graph.compile(error));
@@ -358,7 +500,8 @@ TEST(ExecutionGraph, RejectsClearOnReadOnlyDepthAndSplitsReadOnlyChanges) {
     }
     {
         ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
-        const GraphImage depth = graph.importImage({0, 1}, {0, 1}, VERNON_RHI_FORMAT_D32_FLOAT, 16, 16, 1, 1, true);
+        const GraphImage depth =
+            importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_D32_FLOAT, 16, 16, 1, 1, true);
         graph.emplacePass<TestDepthPass>("write", depth, VERNON_RHI_LOAD_PRESERVE, false);
         auto &read = graph.emplacePass<TestDepthPass>("read", depth, VERNON_RHI_LOAD_PRESERVE, true);
         read.setFlags(PassSideEffect);
@@ -370,7 +513,8 @@ TEST(ExecutionGraph, RejectsClearOnReadOnlyDepthAndSplitsReadOnlyChanges) {
 
 TEST(ExecutionGraph, SplitsScopesWhenIntermediateDiscardCannotBeRepresented) {
     ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
-    const GraphImage color = graph.importImage({0, 1}, {0, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 16, 1, 1, true);
+    const GraphImage color =
+        importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 16, 1, 1, true);
     graph.emplacePass<TestRenderPass>("discard-output", color, VERNON_RHI_LOAD_CLEAR, VERNON_RHI_STORE_DISCARD);
     graph.emplacePass<TestRenderPass>("preserve-input", color, VERNON_RHI_LOAD_PRESERVE);
 
@@ -384,7 +528,8 @@ TEST(ExecutionGraph, SplitsScopesWhenIntermediateDiscardCannotBeRepresented) {
 TEST(ExecutionGraph, FusesAnIntermediateClearButSplitsAnIntermediateDiscardLoad) {
     const auto compileScopes = [](VernonRhiLoadOperation secondLoad) {
         ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
-        const GraphImage color = graph.importImage({0, 1}, {0, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 16, 1, 1, true);
+        const GraphImage color =
+            importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 16, 1, 1, true);
         graph.emplacePass<TestRenderPass>("first", color);
         graph.emplacePass<TestRenderPass>("second", color, secondLoad);
         std::string error;
@@ -397,8 +542,9 @@ TEST(ExecutionGraph, FusesAnIntermediateClearButSplitsAnIntermediateDiscardLoad)
 
 TEST(ExecutionGraph, SplitsRenderScopesForNonAttachmentHazards) {
     ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
-    const GraphImage color = graph.importImage({0, 1}, {0, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 16, 1, 1, true);
-    const GraphBuffer buffer = graph.importBuffer({1, 1});
+    const GraphImage color =
+        importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 16, 1, 1, true);
+    const GraphBuffer buffer = importBufferForTesting(graph, {1, 1});
     graph.emplacePass<TestRenderResourcePass>("write", color, buffer, AccessMode::Write);
     graph.emplacePass<TestRenderResourcePass>("read", color, buffer, AccessMode::Read);
 

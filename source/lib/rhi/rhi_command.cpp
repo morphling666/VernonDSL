@@ -73,8 +73,8 @@ struct EncoderSlot {
     uint32_t renderWidth{};
     uint32_t renderHeight{};
     uint32_t renderLayers{};
-    std::array<uint64_t, 8> colorTargets{};
-    std::array<uint64_t, 8> colorResources{};
+    std::array<uint64_t, VERNON_RHI_MAX_COLOR_ATTACHMENTS> colorTargets{};
+    std::array<uint64_t, VERNON_RHI_MAX_COLOR_ATTACHMENTS> colorResources{};
     uint64_t depthTarget{};
     uint64_t depthResource{};
     uint32_t generation{1};
@@ -171,7 +171,8 @@ bool validStore(VernonRhiStoreOperation operation) {
 }
 
 bool validRendering(const VernonRhiRenderingDescriptor &descriptor) {
-    if (!descriptor.width || !descriptor.height || !descriptor.layers || descriptor.color_attachment_count > 8 ||
+    if (!descriptor.width || !descriptor.height || !descriptor.layers ||
+        descriptor.color_attachment_count > VERNON_RHI_MAX_COLOR_ATTACHMENTS ||
         (descriptor.color_attachment_count && !descriptor.color_attachments))
         return false;
     for (size_t index = 0; index < descriptor.color_attachment_count; ++index) {
@@ -323,12 +324,18 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderBarrier(VernonRhiDevice device
         VERNON_RHI_ACCESS_DEPTH_STENCIL_READ | VERNON_RHI_ACCESS_DEPTH_STENCIL_WRITE | VERNON_RHI_ACCESS_VERTEX_READ |
         VERNON_RHI_ACCESS_INDEX_READ | VERNON_RHI_ACCESS_INDIRECT_READ | VERNON_RHI_ACCESS_HOST_READ |
         VERNON_RHI_ACCESS_HOST_WRITE;
+    constexpr uint32_t allAspects =
+        VERNON_RHI_IMAGE_ASPECT_COLOR | VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL;
     for (size_t index = 0; index < barrierCount; ++index)
         if (barriers[index].struct_size < sizeof(VernonRhiBarrier) ||
             barriers[index].old_state > VERNON_RHI_STATE_PRESENT ||
             barriers[index].new_state > VERNON_RHI_STATE_PRESENT || barriers[index].is_image > 1 ||
             (barriers[index].source_stage_mask & ~allStages) || (barriers[index].destination_stage_mask & ~allStages) ||
-            (barriers[index].source_access & ~allAccess) || (barriers[index].destination_access & ~allAccess))
+            (barriers[index].source_access & ~allAccess) || (barriers[index].destination_access & ~allAccess) ||
+            (barriers[index].is_image &&
+             (!barriers[index].image_subresources.mip_level_count ||
+              !barriers[index].image_subresources.array_layer_count || !barriers[index].image_subresources.aspects ||
+              (barriers[index].image_subresources.aspects & ~allAspects))))
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     const uint64_t key = (static_cast<uint64_t>(encoder.generation) << 32) | (static_cast<uint64_t>(encoder.index) + 1);
     for (size_t index = 0; index < barrierCount; ++index) {
@@ -529,11 +536,11 @@ extern "C" VernonRhiStatus vernonRhiDeviceSubmit(VernonRhiDevice device, VernonR
         }
     }
     if (submitted && completed) {
-        releaseActiveEncoder(encoder.index, slot);
         for (auto cleanup = cleanups.rbegin(); cleanup != cleanups.rend(); ++cleanup)
             cleanup->function(cleanup->context, cleanup->object);
         for (const auto &resource : resources)
             vernon::rhi::releaseResource(device, resource.kind, resource.key);
+        releaseActiveEncoder(encoder.index, slot);
     }
     return submitted ? VERNON_RHI_STATUS_OK : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
@@ -724,7 +731,7 @@ bool vernon::rhi::deferCommandCleanup(VernonRhiDevice device, uint64_t key, void
     if (!slot)
         return false;
     std::lock_guard<std::mutex> guard(slot->mutex);
-    if (!slot->alive || slot->busy || slot->finished)
+    if (!slot->alive || slot->finished)
         return false;
     if (object == 0) {
         const EncoderSlot::ActionIdentity identity{context, cleanup};
@@ -774,7 +781,7 @@ bool vernon::rhi::deferCommandRollback(VernonRhiDevice device, uint64_t key, voi
 bool vernon::rhi::setCommandRenderingTargets(VernonRhiDevice device, uint64_t key, const uint64_t *colors,
                                              const uint64_t *resources, size_t colorCount, uint64_t depth,
                                              uint64_t depthResource) {
-    if (colorCount > 8 || (colorCount && (!colors || !resources)))
+    if (colorCount > VERNON_RHI_MAX_COLOR_ATTACHMENTS || (colorCount && (!colors || !resources)))
         return false;
     auto slot = lookupKey(device, key);
     if (!slot)

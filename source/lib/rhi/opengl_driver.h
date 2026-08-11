@@ -175,6 +175,7 @@ struct Driver {
     void(VERNON_GL_CALL *genTextures)(Size, Uint *){};
     void(VERNON_GL_CALL *deleteTextures)(Size, const Uint *){};
     void(VERNON_GL_CALL *bindTexture)(Enum, Uint){};
+    void(VERNON_GL_CALL *textureView)(Uint, Enum, Uint, Enum, Uint, Uint, Uint, Uint){};
     void(VERNON_GL_CALL *bindImageTexture)(Uint, Uint, Int, unsigned char, Int, Enum, Enum){};
     void(VERNON_GL_CALL *texImage2D)(Enum, Int, Int, Size, Size, Int, Enum, Enum, const void *){};
     void(VERNON_GL_CALL *texImage3D)(Enum, Int, Int, Size, Size, Size, Int, Enum, Enum, const void *){};

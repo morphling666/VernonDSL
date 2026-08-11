@@ -22,6 +22,7 @@ function(vernon_add_runtime)
         ${VERNON_RUNTIME_LIBRARY_TYPE}
         ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/opengl_backend.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/opengl_driver.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/image_descriptor_validation.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/rhi_command.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/rhi_device.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/rhi.cpp
@@ -49,8 +50,74 @@ function(vernon_add_runtime)
         target_compile_definitions(VernonRHI PRIVATE VERNON_HAS_CUDA_RHI=1)
     endif()
     if(VERNON_ENABLE_DIRECTX12_RUNTIME)
+        find_program(_vernon_hlsl_compiler NAMES dxc fxc REQUIRED)
+        get_filename_component(_vernon_hlsl_compiler_name "${_vernon_hlsl_compiler}" NAME_WE)
+        set(_vernon_directx12_generated_dir "${CMAKE_CURRENT_BINARY_DIR}/directx12_generated")
+        file(MAKE_DIRECTORY "${_vernon_directx12_generated_dir}")
+        set(_vernon_mipmap_shader "${_VERNON_RUNTIME_IMPL_DIR}/../rhi/directx12_mipmap.hlsl")
+        foreach(_vernon_mipmap_dimension IN ITEMS 2d 3d)
+            set(_vernon_mipmap_blob
+                "${_vernon_directx12_generated_dir}/directx12_mipmap_${_vernon_mipmap_dimension}.bin")
+            set(_vernon_mipmap_header
+                "${_vernon_directx12_generated_dir}/directx12_mipmap_${_vernon_mipmap_dimension}.h")
+            if(_vernon_hlsl_compiler_name STREQUAL "dxc")
+                set(_vernon_hlsl_args
+                    -T
+                    cs_6_0
+                    -E
+                    main
+                    -Fo
+                    "${_vernon_mipmap_blob}")
+                if(_vernon_mipmap_dimension STREQUAL "3d")
+                    list(
+                        APPEND
+                        _vernon_hlsl_args
+                        -D
+                        VERNON_MIPMAP_3D=1)
+                else()
+                    list(
+                        APPEND
+                        _vernon_hlsl_args
+                        -D
+                        VERNON_MIPMAP_3D=0)
+                endif()
+            else()
+                set(_vernon_hlsl_args
+                    /nologo
+                    /T
+                    cs_5_1
+                    /E
+                    main
+                    /Fo
+                    "${_vernon_mipmap_blob}")
+                if(_vernon_mipmap_dimension STREQUAL "3d")
+                    list(
+                        APPEND
+                        _vernon_hlsl_args
+                        /D
+                        VERNON_MIPMAP_3D=1)
+                else()
+                    list(
+                        APPEND
+                        _vernon_hlsl_args
+                        /D
+                        VERNON_MIPMAP_3D=0)
+                endif()
+            endif()
+            add_custom_command(
+                OUTPUT "${_vernon_mipmap_header}"
+                COMMAND "${_vernon_hlsl_compiler}" ${_vernon_hlsl_args} "${_vernon_mipmap_shader}"
+                COMMAND
+                    "${CMAKE_COMMAND}" -DINPUT=${_vernon_mipmap_blob} -DOUTPUT=${_vernon_mipmap_header}
+                    -DSYMBOL=vernon_directx12_mipmap_${_vernon_mipmap_dimension} -P
+                    "${_vernon_repository_root}/cmake/EmbedBinary.cmake"
+                DEPENDS "${_vernon_mipmap_shader}" "${_vernon_repository_root}/cmake/EmbedBinary.cmake"
+                VERBATIM)
+            list(APPEND _vernon_mipmap_headers "${_vernon_mipmap_header}")
+        endforeach()
         target_sources(VernonRHI PRIVATE ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/directx12_backend.cpp
-                                         ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/rhi_directx12.cpp)
+                                         ${_VERNON_RUNTIME_IMPL_DIR}/../rhi/rhi_directx12.cpp ${_vernon_mipmap_headers})
+        target_include_directories(VernonRHI PRIVATE "${_vernon_directx12_generated_dir}")
         target_compile_definitions(VernonRHI PRIVATE VERNON_HAS_DIRECTX12_RHI=1)
         target_link_libraries(VernonRHI PRIVATE d3d12 dxgi dxguid)
     endif()
@@ -101,8 +168,21 @@ function(vernon_add_runtime)
         target_compile_options(VernonExecutionGraph PRIVATE /EHsc)
     endif()
 
+    add_library(VernonRuntimeCore STATIC ${_VERNON_RUNTIME_IMPL_DIR}/graphics_variant_key.cpp
+                                         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_core.cpp)
+    add_library(Vernon::RuntimeCore ALIAS VernonRuntimeCore)
+    set_target_properties(VernonRuntimeCore PROPERTIES EXPORT_NAME RuntimeCore POSITION_INDEPENDENT_CODE ON)
+    target_compile_definitions(VernonRuntimeCore PUBLIC VERNON_RUNTIME_CORE_STATIC)
+    target_include_directories(
+        VernonRuntimeCore
+        PUBLIC $<BUILD_INTERFACE:${_VERNON_RUNTIME_INCLUDE_DIR}> $<INSTALL_INTERFACE:include>
+        PRIVATE $<BUILD_INTERFACE:${_VERNON_RUNTIME_IMPL_DIR}/..>)
+    if(MSVC)
+        target_compile_options(VernonRuntimeCore PRIVATE /EHsc)
+    endif()
+
     add_library(
-        VernonRuntimeCore STATIC
+        VernonRuntimeInternals OBJECT
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/autodiff_metadata.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/compute_launch_planner.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/content_hash.cpp
@@ -110,20 +190,14 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_bundle.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_manifest.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_metadata.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/runtime_core.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/tensor_bridge.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/vertex_attribute_capabilities.cpp)
-    add_library(Vernon::RuntimeCore ALIAS VernonRuntimeCore)
-    add_library(VernonRuntimeInternals ALIAS VernonRuntimeCore)
-    set_target_properties(VernonRuntimeCore PROPERTIES EXPORT_NAME RuntimeCore POSITION_INDEPENDENT_CODE ON)
-    target_compile_definitions(VernonRuntimeCore PUBLIC VERNON_RUNTIME_CORE_STATIC)
-    target_include_directories(
-        VernonRuntimeCore
-        PUBLIC $<BUILD_INTERFACE:${_VERNON_RUNTIME_INCLUDE_DIR}> $<INSTALL_INTERFACE:include>
-        PRIVATE $<BUILD_INTERFACE:${_VERNON_RUNTIME_IMPL_DIR}/..>)
-    target_link_libraries(VernonRuntimeCore PRIVATE $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>)
+    set_target_properties(VernonRuntimeInternals PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(VernonRuntimeInternals PRIVATE $<BUILD_INTERFACE:${_VERNON_RUNTIME_INCLUDE_DIR}>
+                                                              $<BUILD_INTERFACE:${_VERNON_RUNTIME_IMPL_DIR}/..>)
+    target_link_libraries(VernonRuntimeInternals PRIVATE $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>)
     if(MSVC)
-        target_compile_options(VernonRuntimeCore PRIVATE /EHsc)
+        target_compile_options(VernonRuntimeInternals PRIVATE /EHsc)
     endif()
 
     add_library(
@@ -159,7 +233,7 @@ function(vernon_add_runtime)
                                                               ${_vernon_foundation_framework})
     endif()
     target_include_directories(VernonRuntimeRHIAdapter PRIVATE $<BUILD_INTERFACE:${_VERNON_RUNTIME_IMPL_DIR}/..>)
-    target_link_libraries(VernonRuntimeRHIAdapter PUBLIC Vernon::RuntimeCore Vernon::RHI)
+    target_link_libraries(VernonRuntimeRHIAdapter PUBLIC Vernon::RHI)
 
     add_library(
         VernonRuntime
@@ -182,6 +256,7 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_opengl.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_vulkan.cpp)
     add_library(Vernon::Runtime ALIAS VernonRuntime)
+    target_sources(VernonRuntime PRIVATE $<TARGET_OBJECTS:VernonRuntimeInternals>)
     set_target_properties(VernonRuntime PROPERTIES EXPORT_NAME Runtime)
     target_compile_definitions(VernonRuntime PRIVATE VERNON_RUNTIME_BUILD)
     if(WIN32)

@@ -29,6 +29,36 @@ VernonStatus fail(VernonRuntimeContext &context, std::string error,
     return status;
 }
 
+DXGI_FORMAT directX12TextureFormat(VernonTextureFormat format) {
+    switch (format) {
+    case VERNON_TEXTURE_RGBA8_UNORM:
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case VERNON_TEXTURE_RGBA8_SRGB:
+        return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    case VERNON_TEXTURE_RGBA16_FLOAT:
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case VERNON_TEXTURE_RGBA32_FLOAT:
+        return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case VERNON_TEXTURE_R8_UNORM:
+        return DXGI_FORMAT_R8_UNORM;
+    case VERNON_TEXTURE_R16_FLOAT:
+        return DXGI_FORMAT_R16_FLOAT;
+    case VERNON_TEXTURE_R32_FLOAT:
+        return DXGI_FORMAT_R32_FLOAT;
+    case VERNON_TEXTURE_RG8_UNORM:
+        return DXGI_FORMAT_R8G8_UNORM;
+    case VERNON_TEXTURE_R11G11B10_FLOAT:
+        return DXGI_FORMAT_R11G11B10_FLOAT;
+    case VERNON_TEXTURE_D32_FLOAT:
+        return DXGI_FORMAT_D32_FLOAT;
+    case VERNON_TEXTURE_D32_FLOAT_S8_UINT:
+        return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    case VERNON_TEXTURE_RGB8_UNORM:
+        return DXGI_FORMAT_UNKNOWN;
+    }
+    return DXGI_FORMAT_UNKNOWN;
+}
+
 } // namespace
 #endif
 
@@ -80,17 +110,19 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                     // in source argument order, independent of canonical
                     // PipelineAsset slot ordering.
                     candidate.layout.binding = argumentBindings[use.index] + static_cast<uint32_t>(leafIndex);
-                    candidate.layout.kind = parameter.kind == "texture"
-                                                ? (parameter.format.empty() ? VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE
-                                                                            : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE)
+                    candidate.layout.kind = parameter.kind == "image"   ? (parameter.bindingRole == "sampled"
+                                                                               ? VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE
+                                                                               : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE)
                                             : argument.kind == "tensor" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
                                                                         : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
                     candidate.layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
                     candidate.layout.access = parameter.access == "read" ? 1u : parameter.access == "write" ? 2u : 3u;
+                    if (parameter.kind == "image" && !configureImageBindingLayout(parameter, candidate.layout))
+                        return false;
                     candidate.layout.array_count = 1;
                     candidate.layout.argument_index = use.index;
                     candidate.layout.element_size = static_cast<uint32_t>(
-                        argument.storageLeaves.empty() ? (parameter.kind == "texture" ? 1
+                        argument.storageLeaves.empty() ? (parameter.kind == "image"   ? 1
                                                           : argument.kind == "tensor" ? argument.tensorElementSize
                                                                                       : argument.physical.size)
                                                        : argument.storageLeaves[leafIndex].elementSize);
@@ -273,18 +305,20 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                 if (!supported)
                     break;
                 candidate.binding.source = DirectX12PipelineState::GraphicsBinding::EXTERNAL_VERTEX;
-            } else if (parameter.kind == "texture" && use.interfaceKind == "resource" && use.descriptorSet == 0 &&
+            } else if (parameter.kind == "image" && use.interfaceKind == "resource" && use.descriptorSet == 0 &&
                        use.binding != UINT32_MAX) {
-                candidate.layout.kind = parameter.format.empty() ? VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE
-                                                                 : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE;
+                candidate.layout.kind = parameter.bindingRole == "sampled" ? VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE
+                                                                           : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE;
+                if (!configureImageBindingLayout(parameter, candidate.layout))
+                    return false;
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
                 candidate.layout.binding = use.binding;
                 candidate.binding.source = DirectX12PipelineState::GraphicsBinding::EXTERNAL_TEXTURE;
-            } else if (parameter.kind == "sampler" && use.sampledTextureBindings.size() == 1 &&
-                       use.sampledTextureBindings[0].descriptorSet == 0) {
+            } else if (parameter.kind == "sampler" && use.sampledImageBindings.size() == 1 &&
+                       use.sampledImageBindings[0].descriptorSet == 0) {
                 candidate.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLER;
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
-                candidate.layout.binding = use.sampledTextureBindings[0].binding;
+                candidate.layout.binding = use.sampledImageBindings[0].binding;
                 candidate.binding.source = DirectX12PipelineState::GraphicsBinding::EXTERNAL_SAMPLER;
             } else {
                 supported = false;
@@ -306,10 +340,10 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                 use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
             candidate.layout.array_count = 1;
             if (parameter.source == "implicit_sampler" && parameter.kind == "sampler" &&
-                use.sampledTextureBindings.size() == 1 && use.sampledTextureBindings[0].descriptorSet == 0) {
+                use.sampledImageBindings.size() == 1 && use.sampledImageBindings[0].descriptorSet == 0) {
                 candidate.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLER;
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
-                candidate.layout.binding = use.sampledTextureBindings[0].binding;
+                candidate.layout.binding = use.sampledImageBindings[0].binding;
                 candidate.binding.source = DirectX12PipelineState::GraphicsBinding::IMPLICIT_SAMPLER;
             } else if (parameter.source == "system_value" && parameter.systemValue == "resolution" &&
                        parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.interfacePlan) {
@@ -442,8 +476,8 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
             if (!packed || packed->size() != prepared.storage.size())
                 return fail(*pipeline.context, "D3D12 RHI uniform Tensor is invalid");
             prepared.storage = *packed;
-            value.inline_data = prepared.storage.data();
-            value.inline_size = prepared.storage.size();
+            value.payload.inline_value.data = prepared.storage.data();
+            value.payload.inline_value.size = prepared.storage.size();
         } else if (prepared.source == DirectX12PipelineState::GraphicsBinding::EXTERNAL_VERTEX) {
             const auto found = plan.arguments.find(prepared.externalSlot);
             if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
@@ -452,9 +486,9 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
                 found->second->tensor.byte_strides[0] <= 0)
                 return fail(*pipeline.context, "D3D12 RHI vertex argument is missing or invalid");
             const VernonTensorView &tensor = found->second->tensor;
-            value.resource = tensor.resource;
-            value.resource.offset += tensor.byte_offset;
-            value.stride = static_cast<uint32_t>(tensor.byte_strides[0]);
+            value.payload.buffer.resource = tensor.resource;
+            value.payload.buffer.resource.offset += tensor.byte_offset;
+            value.payload.buffer.stride = static_cast<uint32_t>(tensor.byte_strides[0]);
         } else if (prepared.source == DirectX12PipelineState::GraphicsBinding::EXTERNAL_STORAGE) {
             const auto found = plan.arguments.find(prepared.externalSlot);
             if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
@@ -462,34 +496,34 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
                 !found->second->tensor.resource.resource.value)
                 return fail(*pipeline.context, "D3D12 RHI storage argument is missing");
             const VernonTensorView &tensor = found->second->tensor;
-            value.resource = tensor.resource;
-            value.resource.offset += tensor.byte_offset;
+            value.payload.buffer.resource = tensor.resource;
+            value.payload.buffer.resource.offset += tensor.byte_offset;
         } else if (prepared.source == DirectX12PipelineState::GraphicsBinding::EXTERNAL_TEXTURE) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TEXTURE ||
-                !found->second->texture.resource.resource.value)
-                return fail(*pipeline.context, "D3D12 RHI texture argument is missing");
-            value.resource = found->second->texture.resource;
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_IMAGE ||
+                !found->second->image.view.resource.value)
+                return fail(*pipeline.context, "D3D12 RHI image argument is missing");
+            value.payload.image.view = found->second->image.view;
         } else if (prepared.source == DirectX12PipelineState::GraphicsBinding::EXTERNAL_SAMPLER) {
             const auto found = plan.arguments.find(prepared.externalSlot);
             if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_SAMPLER ||
                 !found->second->resource.resource.value)
                 return fail(*pipeline.context, "D3D12 RHI sampler argument is missing");
-            value.resource = found->second->resource;
+            value.payload.sampler.resource = found->second->resource;
         } else if (prepared.source == DirectX12PipelineState::GraphicsBinding::IMPLICIT_SAMPLER) {
             const auto sampled = plan.sampledResources.find({layout.set, layout.binding});
             if (sampled == plan.sampledResources.end())
                 return fail(*pipeline.context, "D3D12 RHI implicit sampler binding is missing");
             if (sampled->second.samplerResource.resource.value) {
-                value.resource = sampled->second.samplerResource;
+                value.payload.sampler.resource = sampled->second.samplerResource;
             } else {
                 value.flags = VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE;
             }
         } else if (prepared.source == DirectX12PipelineState::GraphicsBinding::RESOLUTION) {
             std::memcpy(prepared.storage.data(), plan.resolution.data(),
                         std::min(prepared.storage.size(), sizeof(plan.resolution)));
-            value.inline_data = prepared.storage.data();
-            value.inline_size = prepared.storage.size();
+            value.payload.inline_value.data = prepared.storage.data();
+            value.payload.inline_value.size = prepared.storage.size();
         } else {
             return fail(*pipeline.context, "D3D12 RHI graphics binding source is invalid");
         }
@@ -508,28 +542,26 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
                                        : "failed to update D3D12 RHI graphics bindings",
                     status);
     }
-    constexpr size_t maxAttachments = 8;
-    if (plan.attachments.empty() || plan.attachments.size() > maxAttachments)
+    if (plan.attachments.empty() || plan.attachments.size() > VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS)
         return fail(*pipeline.context, "D3D12 RHI draw requires one to eight color attachments");
-    std::array<VernonRuntimeProviderColorAttachment, maxAttachments> attachments{};
+    std::array<VernonRuntimeProviderColorAttachment, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> attachments{};
     VernonRuntimeProviderResourceReference depthAttachment{};
     std::vector<uint32_t> formats;
     formats.reserve(plan.attachments.size());
     for (size_t index = 0; index < plan.attachments.size(); ++index) {
         const VernonColorAttachment &source = *plan.attachments[index];
         attachments[index].location = source.location;
-        attachments[index].image = source.resource;
+        attachments[index].view = source.view;
         attachments[index].load_operation = source.load_operation;
         attachments[index].store_operation = source.store_operation;
         std::copy(std::begin(source.clear_color), std::end(source.clear_color), attachments[index].clear_color);
-        const auto *image = reinterpret_cast<const rhi::directx12::Image *>(vernon::rhi::resolveResource(
-            pipeline.context->rhiDevice, vernon::rhi::ResourceKind::Image, source.resource.resource.value));
-        if (!image)
-            return fail(*pipeline.context, "D3D12 RHI color attachment is stale");
-        formats.push_back(static_cast<uint32_t>(image->format));
+        const DXGI_FORMAT format = directX12TextureFormat(plan.attachmentFormats[index]);
+        if (format == DXGI_FORMAT_UNKNOWN)
+            return fail(*pipeline.context, "D3D12 RHI color attachment format is unsupported");
+        formats.push_back(static_cast<uint32_t>(format));
     }
     if (plan.depthAttachment) {
-        depthAttachment = plan.depthAttachment->resource;
+        depthAttachment = plan.depthAttachment->view;
     }
     std::vector<uint32_t> vertexStrides;
     for (size_t index = 0; index < state.rhiGraphicsLayout.size(); ++index)
@@ -537,15 +569,15 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
             const uint32_t binding = state.rhiGraphicsLayout[index].binding;
             if (vertexStrides.size() <= binding)
                 vertexStrides.resize(binding + 1);
-            vertexStrides[binding] = state.rhiGraphicsValues[index].stride;
+            vertexStrides[binding] = state.rhiGraphicsValues[index].payload.buffer.stride;
         }
-    const uint32_t depthFormat =
-        !plan.depthAttachment ? 0
-                              : static_cast<uint32_t>(plan.depthAttachment->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT
-                                                          ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT
-                                                          : DXGI_FORMAT_D32_FLOAT);
+    const uint32_t depthFormat = !plan.depthAttachment
+                                     ? 0
+                                     : static_cast<uint32_t>(plan.depthFormat == VERNON_TEXTURE_D32_FLOAT_S8_UINT
+                                                                 ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                                                                 : DXGI_FORMAT_D32_FLOAT);
     PlannedGraphicsState graphicsState;
-    const bool hasStencil = plan.depthAttachment && plan.depthAttachment->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT;
+    const bool hasStencil = plan.depthAttachment && plan.depthFormat == VERNON_TEXTURE_D32_FLOAT_S8_UINT;
     if (!planGraphicsState(invocation, formats.size(), plan.depthAttachment != nullptr, hasStencil, graphicsState,
                            invocationDiagnostic(*pipeline.context)))
         return VERNON_STATUS_INVALID_ARGUMENT;
@@ -574,15 +606,16 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
     draw.instance_count = plan.instanceCount;
     draw.color_attachments = attachments.data();
     draw.color_attachment_count = plan.attachments.size();
-    draw.depth_stencil_attachment = depthAttachment;
+    draw.depth_stencil_view = depthAttachment;
     draw.depth_load_operation =
-        plan.depthAttachment ? static_cast<uint32_t>(plan.depthAttachment->load_operation) : VERNON_RHI_LOAD_DISCARD;
+        plan.depthAttachment ? plan.depthAttachment->load_operation : VERNON_RUNTIME_PROVIDER_LOAD_DISCARD;
     draw.depth_store_operation =
-        plan.depthAttachment ? static_cast<uint32_t>(plan.depthAttachment->store_operation) : VERNON_RHI_STORE_DISCARD;
+        plan.depthAttachment ? plan.depthAttachment->store_operation : VERNON_RUNTIME_PROVIDER_STORE_DISCARD;
     draw.clear_depth = plan.depthAttachment ? plan.depthAttachment->clear_depth : 1.0f;
-    draw.stencil_load_operation = hasStencil ? plan.depthAttachment->stencil_load_operation : VERNON_RHI_LOAD_DISCARD;
+    draw.stencil_load_operation =
+        hasStencil ? plan.depthAttachment->stencil_load_operation : VERNON_RUNTIME_PROVIDER_LOAD_DISCARD;
     draw.stencil_store_operation =
-        hasStencil ? plan.depthAttachment->stencil_store_operation : VERNON_RHI_STORE_DISCARD;
+        hasStencil ? plan.depthAttachment->stencil_store_operation : VERNON_RUNTIME_PROVIDER_STORE_DISCARD;
     draw.clear_stencil = hasStencil ? plan.depthAttachment->clear_stencil : 0;
     draw.stencil_reference = graphicsState.stencilReference;
     draw.viewport[0] = hasViewport ? invocation.viewport[0] : 0;
@@ -637,28 +670,31 @@ VernonStatus invokeDirectX12ComputePipeline(VernonLoadedPipeline &pipeline, cons
             if (!descriptor || *descriptor < INT32_MIN || *descriptor > INT32_MAX)
                 return fail(*pipeline.context, "D3D12 TensorView descriptor exceeds the shader index range");
             state.rhiComputeDescriptorValues[index] = static_cast<int32_t>(*descriptor);
-            value.inline_data = &state.rhiComputeDescriptorValues[index];
-            value.inline_size = sizeof(int32_t);
+            value.payload.inline_value.data = &state.rhiComputeDescriptorValues[index];
+            value.payload.inline_value.size = sizeof(int32_t);
             continue;
         }
         if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            if (argument.kind != ComputeLaunchArgumentKind::Tensor || !argument.resource.resource.value)
+            const auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
+            if (!tensor || !tensor->resource.resource.value)
                 return fail(*pipeline.context, "D3D12 prepared storage binding requires an RHI Tensor");
-            value.resource = argument.resource;
-            value.resource.offset += state.rhiComputeResourceOffsets[index];
+            value.payload.buffer.resource = tensor->resource;
+            value.payload.buffer.resource.offset += state.rhiComputeResourceOffsets[index];
         } else if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
                    layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
-            if (argument.kind != ComputeLaunchArgumentKind::Texture || !argument.resource.resource.value)
+            const auto *image = std::get_if<ComputeImageArgument>(&argument);
+            if (!image || !image->view.resource.value)
                 return fail(*pipeline.context, "D3D12 prepared image binding requires an RHI Texture");
-            value.resource = argument.resource;
+            value.payload.image.view = image->view;
         } else {
-            if (argument.kind != ComputeLaunchArgumentKind::Scalar || !argument.scalarData || !argument.scalarSize)
+            const auto *scalar = std::get_if<ComputeScalarArgument>(&argument);
+            if (!scalar || !scalar->data || !scalar->size)
                 return fail(*pipeline.context, "D3D12 prepared inline binding requires host data at argument " +
                                                    std::to_string(layout.argument_index) + " (kind " +
-                                                   std::to_string(static_cast<uint32_t>(argument.kind)) + ", size " +
-                                                   std::to_string(argument.scalarSize) + ")");
-            value.inline_data = argument.scalarData;
-            value.inline_size = argument.scalarSize;
+                                                   std::to_string(argument.index()) + ", size " +
+                                                   std::to_string(scalar ? scalar->size : 0) + ")");
+            value.payload.inline_value.data = scalar->data;
+            value.payload.inline_value.size = scalar->size;
         }
     }
     VernonStatus status =

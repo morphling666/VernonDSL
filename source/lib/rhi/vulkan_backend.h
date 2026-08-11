@@ -6,6 +6,8 @@
 
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace vernon::rhi::vulkan {
 
@@ -30,10 +32,17 @@ struct Buffer {
 };
 
 struct Image {
+    struct LayoutJournal {
+        VkImageLayout layout{VK_IMAGE_LAYOUT_UNDEFINED};
+        std::vector<VkImageLayout> subresources;
+    };
+
     VkImage image{};
     VkDeviceMemory memory{};
     VkImageView view{};
     VkImageLayout layout{VK_IMAGE_LAYOUT_UNDEFINED};
+    std::vector<VkImageLayout> subresourceLayouts;
+    std::unordered_map<uint64_t, LayoutJournal> layoutJournals;
     VkFormat format{VK_FORMAT_UNDEFINED};
     bool colorAttachment{};
     bool owned{true};

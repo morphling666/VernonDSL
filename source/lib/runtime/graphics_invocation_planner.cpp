@@ -1,10 +1,10 @@
 #include "graphics_invocation_planner.h"
 #include "pipeline_metadata.h"
+#include "provider_image_description.h"
 #include "tensor_bridge.h"
 
 #include <algorithm>
 #include <cmath>
-#include <functional>
 #include <limits>
 #include <optional>
 
@@ -13,7 +13,7 @@ namespace {
 
 bool kindMatches(const Parameter &parameter, const VernonPipelineArgument &argument) {
     return (parameter.kind == "tensor" && argument.kind == VERNON_PIPELINE_TENSOR) ||
-           (parameter.kind == "texture" && argument.kind == VERNON_PIPELINE_TEXTURE) ||
+           (parameter.kind == "image" && argument.kind == VERNON_PIPELINE_IMAGE) ||
            (parameter.kind == "sampler" && argument.kind == VERNON_PIPELINE_SAMPLER);
 }
 
@@ -40,32 +40,6 @@ uint32_t shaderStage(const ParameterUse &use) {
 bool fail(std::string &error, const char *message) {
     error = message;
     return false;
-}
-
-bool rasterizationEqual(const VernonRasterizationState &left, const VernonRasterizationState &right) {
-    return left.cull_mode == right.cull_mode && left.front_face == right.front_face &&
-           left.depth_clamp == right.depth_clamp && left.depth_bias_enabled == right.depth_bias_enabled &&
-           left.depth_bias_constant == right.depth_bias_constant && left.depth_bias_slope == right.depth_bias_slope;
-}
-
-bool stencilFaceEqual(const VernonStencilFaceState &left, const VernonStencilFaceState &right) {
-    return left.stencil_fail == right.stencil_fail && left.depth_fail == right.depth_fail && left.pass == right.pass &&
-           left.compare == right.compare;
-}
-
-bool depthStencilEqual(const VernonDepthStencilState &left, const VernonDepthStencilState &right) {
-    return left.depth_test == right.depth_test && left.depth_write == right.depth_write &&
-           left.depth_compare == right.depth_compare && left.stencil_test == right.stencil_test &&
-           stencilFaceEqual(left.front, right.front) && stencilFaceEqual(left.back, right.back) &&
-           left.stencil_read_mask == right.stencil_read_mask && left.stencil_write_mask == right.stencil_write_mask;
-}
-
-bool blendEqual(const VernonColorBlendState &left, const VernonColorBlendState &right) {
-    return left.blend_enabled == right.blend_enabled && left.source_color_factor == right.source_color_factor &&
-           left.destination_color_factor == right.destination_color_factor &&
-           left.color_operation == right.color_operation && left.source_alpha_factor == right.source_alpha_factor &&
-           left.destination_alpha_factor == right.destination_alpha_factor &&
-           left.alpha_operation == right.alpha_operation && left.write_mask == right.write_mask;
 }
 
 } // namespace
@@ -145,63 +119,6 @@ bool planGraphicsState(const VernonPipelineInvocation &invocation, size_t colorC
     return true;
 }
 
-bool graphicsVariantKeysEqual(const GraphicsVariantKey &left, const GraphicsVariantKey &right) {
-    return left.topology == right.topology && left.colorFormats == right.colorFormats &&
-           left.depthStencilFormat == right.depthStencilFormat && left.sampleCount == right.sampleCount &&
-           left.vertexStrides == right.vertexStrides && rasterizationEqual(left.rasterization, right.rasterization) &&
-           depthStencilEqual(left.depthStencil, right.depthStencil) &&
-           left.colorBlends.size() == right.colorBlends.size() &&
-           std::equal(left.colorBlends.begin(), left.colorBlends.end(), right.colorBlends.begin(), blendEqual);
-}
-
-size_t graphicsVariantKeyHash(const GraphicsVariantKey &key) {
-    size_t result = 0xcbf29ce484222325ull;
-    const auto combine = [&](auto value) {
-        result ^= std::hash<decltype(value)>{}(value) + 0x9e3779b97f4a7c15ull + (result << 6) + (result >> 2);
-    };
-    const auto combineFace = [&](const VernonStencilFaceState &face) {
-        combine(face.stencil_fail);
-        combine(face.depth_fail);
-        combine(face.pass);
-        combine(face.compare);
-    };
-    combine(key.topology);
-    for (uint32_t format : key.colorFormats)
-        combine(format);
-    combine(key.colorFormats.size());
-    combine(key.depthStencilFormat);
-    combine(key.sampleCount);
-    for (uint32_t stride : key.vertexStrides)
-        combine(stride);
-    combine(key.vertexStrides.size());
-    combine(key.rasterization.cull_mode);
-    combine(key.rasterization.front_face);
-    combine(key.rasterization.depth_clamp);
-    combine(key.rasterization.depth_bias_enabled);
-    combine(key.rasterization.depth_bias_constant);
-    combine(key.rasterization.depth_bias_slope);
-    combine(key.depthStencil.depth_test);
-    combine(key.depthStencil.depth_write);
-    combine(key.depthStencil.depth_compare);
-    combine(key.depthStencil.stencil_test);
-    combineFace(key.depthStencil.front);
-    combineFace(key.depthStencil.back);
-    combine(key.depthStencil.stencil_read_mask);
-    combine(key.depthStencil.stencil_write_mask);
-    for (const auto &blend : key.colorBlends) {
-        combine(blend.blend_enabled);
-        combine(blend.source_color_factor);
-        combine(blend.destination_color_factor);
-        combine(blend.color_operation);
-        combine(blend.source_alpha_factor);
-        combine(blend.destination_alpha_factor);
-        combine(blend.alpha_operation);
-        combine(blend.write_mask);
-    }
-    combine(key.colorBlends.size());
-    return result;
-}
-
 VernonStatus ensureGraphicsVariant(VernonRuntimeCorePipeline *pipeline, const GraphicsVariantKey &key,
                                    PreparedGraphicsVariant &prepared) {
     if (prepared.handle && graphicsVariantKeysEqual(prepared.key, key))
@@ -235,6 +152,7 @@ void destroyGraphicsVariant(PreparedGraphicsVariant &prepared) {
 }
 
 bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocation &invocation,
+                            DescribeImageResource describeImage, void *describeImageUserData,
                             PlannedGraphicsInvocation &plan, std::string &error) {
     plan = {};
     for (size_t index = 0; index < invocation.argument_count; ++index)
@@ -266,23 +184,9 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
                         parameter.shape[dimension] != argument.tensor.shape[dimension + offset])
                         return fail(error, "pipeline Tensor shape does not match layout");
             }
-        } else if (argument.kind == VERNON_PIPELINE_TEXTURE) {
-            if (!argument.texture.resource.identity || !argument.texture.resource.resource.value)
-                return fail(error, "pipeline texture argument does not match layout");
-            if (!parameter.dimension.empty() &&
-                ((parameter.dimension == "2d" && argument.texture.dimension != VERNON_TEXTURE_2D) ||
-                 (parameter.dimension == "3d" && argument.texture.dimension != VERNON_TEXTURE_3D) ||
-                 (parameter.dimension == "cube" && argument.texture.dimension != VERNON_TEXTURE_CUBE)))
-                return fail(error, "pipeline texture argument does not match layout");
-            if (!parameter.format.empty()) {
-                const auto format = pipelineTextureFormat(parameter.format);
-                if (!format || argument.texture.format != *format)
-                    return fail(error, "pipeline storage texture format does not match layout");
-            }
-            if ((parameter.access == "read" && argument.texture.access != VERNON_ACCESS_READ) ||
-                (parameter.access == "write" && argument.texture.access != VERNON_ACCESS_WRITE) ||
-                (parameter.access == "read_write" && argument.texture.access != VERNON_ACCESS_READ_WRITE))
-                return fail(error, "pipeline texture access does not match layout");
+        } else if (argument.kind == VERNON_PIPELINE_IMAGE) {
+            if (!argument.image.view.identity || !argument.image.view.resource.value)
+                return fail(error, "pipeline image argument does not match layout");
         } else if (!argument.resource.identity || !argument.resource.resource.value) {
             return fail(error, "pipeline sampler belongs to another runtime");
         }
@@ -293,43 +197,16 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
 
     if (!invocation.color_attachment_count || !invocation.color_attachments)
         return fail(error, "graphics pipeline requires color attachments");
+    if (!describeImage)
+        return fail(error, "graphics image descriptor resolver is missing");
     for (size_t index = 0; index < invocation.color_attachment_count; ++index) {
         const VernonColorAttachment &attachment = invocation.color_attachments[index];
-        uint32_t width = attachment.width;
-        uint32_t height = attachment.height;
-        if (!attachment.resource.identity || !attachment.resource.resource.value)
+        if (!attachment.view.identity || !attachment.view.resource.value)
             return fail(error, "render target is invalid");
-        if (!width || !height)
-            return fail(error, "render target extent is invalid");
-        if (attachment.load_operation > VERNON_RHI_LOAD_DISCARD ||
-            attachment.store_operation > VERNON_RHI_STORE_DISCARD)
+        if (attachment.load_operation > VERNON_RUNTIME_PROVIDER_LOAD_DISCARD ||
+            attachment.store_operation > VERNON_RUNTIME_PROVIDER_STORE_DISCARD)
             return fail(error, "render target attachment operation is invalid");
-        if (!plan.attachmentWidth) {
-            plan.attachmentWidth = width;
-            plan.attachmentHeight = height;
-        } else if (plan.attachmentWidth != width || plan.attachmentHeight != height) {
-            return fail(error, "render target extents differ");
-        }
         plan.attachments.push_back(&attachment);
-    }
-    if (invocation.depth_attachment) {
-        const VernonDepthAttachment &attachment = *invocation.depth_attachment;
-        uint32_t width = attachment.width;
-        uint32_t height = attachment.height;
-        VernonTextureFormat format = attachment.format;
-        if (!attachment.resource.identity || !attachment.resource.resource.value)
-            return fail(error, "depth attachment is invalid");
-        if (!width || !height || width != plan.attachmentWidth || height != plan.attachmentHeight ||
-            (format != VERNON_TEXTURE_D32_FLOAT && format != VERNON_TEXTURE_D32_FLOAT_S8_UINT))
-            return fail(error, "depth attachment must be D32 or D32S8 with the render-target extent");
-        if (attachment.load_operation > VERNON_RHI_LOAD_DISCARD ||
-            attachment.store_operation > VERNON_RHI_STORE_DISCARD || !std::isfinite(attachment.clear_depth) ||
-            attachment.clear_depth < 0.0f || attachment.clear_depth > 1.0f ||
-            attachment.stencil_load_operation > VERNON_RHI_LOAD_DISCARD ||
-            attachment.stencil_store_operation > VERNON_RHI_STORE_DISCARD || attachment.clear_stencil > 0xff ||
-            (format == VERNON_TEXTURE_D32_FLOAT && attachment.clear_stencil != 0))
-            return fail(error, "depth attachment operation is invalid");
-        plan.depthAttachment = &attachment;
     }
     std::sort(plan.attachments.begin(), plan.attachments.end(),
               [](const VernonColorAttachment *left, const VernonColorAttachment *right) {
@@ -343,6 +220,59 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
     for (size_t index = 0; index < plan.attachments.size(); ++index)
         if (plan.attachments[index]->location != index)
             return fail(error, "render target locations must be contiguous from zero");
+    plan.attachmentFormats.reserve(plan.attachments.size());
+    for (const VernonColorAttachment *attachment : plan.attachments) {
+        VernonRuntimeProviderImageDescription description{};
+        description.struct_size = sizeof(description);
+        if (describeImage(describeImageUserData, attachment->view, &description) != VERNON_STATUS_OK ||
+            !providerImageDescriptionIsCanonical(description) ||
+            description.resource_kind != VERNON_RUNTIME_PROVIDER_IMAGE_VIEW ||
+            description.view.dimension != VERNON_TEXTURE_2D ||
+            !(description.image.usage & VERNON_IMAGE_COLOR_ATTACHMENT) ||
+            description.view.subresources.aspects != VERNON_IMAGE_ASPECT_COLOR)
+            return fail(error, "render target view is incompatible");
+        const uint32_t width =
+            std::max(description.image.extent.width >> description.view.subresources.base_mip_level, 1u);
+        const uint32_t height =
+            std::max(description.image.extent.height >> description.view.subresources.base_mip_level, 1u);
+        if (!plan.attachmentWidth) {
+            plan.attachmentWidth = width;
+            plan.attachmentHeight = height;
+        } else if (plan.attachmentWidth != width || plan.attachmentHeight != height) {
+            return fail(error, "render target extents differ");
+        }
+        plan.attachmentFormats.push_back(description.view.format);
+    }
+    if (invocation.depth_attachment) {
+        const VernonDepthAttachment &attachment = *invocation.depth_attachment;
+        if (!attachment.view.identity || !attachment.view.resource.value)
+            return fail(error, "depth attachment is invalid");
+        VernonRuntimeProviderImageDescription description{};
+        description.struct_size = sizeof(description);
+        if (describeImage(describeImageUserData, attachment.view, &description) != VERNON_STATUS_OK ||
+            !providerImageDescriptionIsCanonical(description) ||
+            description.resource_kind != VERNON_RUNTIME_PROVIDER_IMAGE_VIEW)
+            return fail(error, "depth attachment is stale");
+        const VernonTextureFormat format = description.view.format;
+        const uint32_t width =
+            std::max(description.image.extent.width >> description.view.subresources.base_mip_level, 1u);
+        const uint32_t height =
+            std::max(description.image.extent.height >> description.view.subresources.base_mip_level, 1u);
+        if (description.view.dimension != VERNON_TEXTURE_2D ||
+            !(description.image.usage & VERNON_IMAGE_DEPTH_STENCIL_ATTACHMENT) || !width || !height ||
+            width != plan.attachmentWidth || height != plan.attachmentHeight ||
+            (format != VERNON_TEXTURE_D32_FLOAT && format != VERNON_TEXTURE_D32_FLOAT_S8_UINT))
+            return fail(error, "depth attachment must be D32 or D32S8 with the render-target extent");
+        if (attachment.load_operation > VERNON_RUNTIME_PROVIDER_LOAD_DISCARD ||
+            attachment.store_operation > VERNON_RUNTIME_PROVIDER_STORE_DISCARD ||
+            !std::isfinite(attachment.clear_depth) || attachment.clear_depth < 0.0f || attachment.clear_depth > 1.0f ||
+            attachment.stencil_load_operation > VERNON_RUNTIME_PROVIDER_LOAD_DISCARD ||
+            attachment.stencil_store_operation > VERNON_RUNTIME_PROVIDER_STORE_DISCARD ||
+            attachment.clear_stencil > 0xff || (format == VERNON_TEXTURE_D32_FLOAT && attachment.clear_stencil != 0))
+            return fail(error, "depth attachment operation is invalid");
+        plan.depthAttachment = &attachment;
+        plan.depthFormat = format;
+    }
     const bool hasViewport = invocation.viewport[2] && invocation.viewport[3];
     plan.resolution = {static_cast<float>(hasViewport ? invocation.viewport[2] : plan.attachmentWidth),
                        static_cast<float>(hasViewport ? invocation.viewport[3] : plan.attachmentHeight)};
@@ -356,27 +286,22 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
             const uint32_t stage = shaderStage(use);
             if (!stage)
                 continue;
-            if (argument.kind == VERNON_PIPELINE_TEXTURE) {
+            if (argument.kind == VERNON_PIPELINE_IMAGE) {
                 if (use.binding == UINT32_MAX)
-                    return fail(error, "sampled texture is missing set/binding");
+                    return fail(error, "sampled image is missing set/binding");
                 PlannedSampledResource &resource = sampled[{use.descriptorSet, use.binding}];
-                if (resource.imageResource.resource.value &&
-                    resource.imageResource.resource.value != argument.texture.resource.resource.value)
-                    return fail(error, "sampled texture binding is ambiguous");
-                if (resource.imageResource.resource.value && !resource.explicitSampler &&
-                    resource.samplerResource.resource.value != argument.texture.sampler_resource.resource.value)
-                    return fail(error, "texture binding has conflicting sampler policies");
-                resource.imageResource = argument.texture.resource;
-                if (!resource.explicitSampler)
-                    resource.samplerResource = argument.texture.sampler_resource;
+                if (resource.imageView.resource.value &&
+                    resource.imageView.resource.value != argument.image.view.resource.value)
+                    return fail(error, "sampled image binding is ambiguous");
+                resource.imageView = argument.image.view;
                 resource.stages |= stage;
                 continue;
             }
             if (argument.kind == VERNON_PIPELINE_SAMPLER) {
-                if (use.sampledTextureBindings.empty())
-                    return fail(error, "sampler reflection has no paired sampled texture "
+                if (use.sampledImageBindings.empty())
+                    return fail(error, "sampler reflection has no paired sampled image "
                                        "binding");
-                for (const SampledTextureBinding &binding : use.sampledTextureBindings) {
+                for (const SampledImageBinding &binding : use.sampledImageBindings) {
                     PlannedSampledResource &resource = sampled[{binding.descriptorSet, binding.binding}];
                     if (resource.explicitSampler &&
                         resource.samplerResource.resource.value != argument.resource.resource.value)
@@ -437,7 +362,7 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
             const uint32_t stage = shaderStage(use);
             if (!stage)
                 continue;
-            for (const SampledTextureBinding &binding : use.sampledTextureBindings) {
+            for (const SampledImageBinding &binding : use.sampledImageBindings) {
                 PlannedSampledResource &resource = sampled[{binding.descriptorSet, binding.binding}];
                 if (resource.explicitSampler)
                     return fail(error, "implicit and explicit samplers conflict");
@@ -447,9 +372,9 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
         }
     }
     for (const auto &[binding, resource] : sampled) {
-        if (!resource.imageResource.resource.value ||
+        if (!resource.imageView.resource.value ||
             (!resource.samplerResource.resource.value && !resource.implicitSampler))
-            return fail(error, "sampled image requires paired texture and sampler");
+            return fail(error, "sampled image requires paired image view and sampler");
         plan.sampledResources.emplace(binding, resource);
     }
 

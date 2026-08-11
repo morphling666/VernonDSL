@@ -184,24 +184,26 @@ VernonStatus invokeCudaComputePipeline(VernonLoadedPipeline &pipeline, const Pla
             if (!descriptor)
                 return fail(*pipeline.context, "CUDA TensorView descriptor value is invalid");
             state.descriptorValues[index] = *descriptor;
-            value.inline_data = &state.descriptorValues[index];
-            value.inline_size = sizeof(int64_t);
+            value.payload.inline_value.data = &state.descriptorValues[index];
+            value.payload.inline_value.size = sizeof(int64_t);
             continue;
         }
         if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            if (argument.kind != ComputeLaunchArgumentKind::Tensor || !argument.resource.resource.value)
+            const auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
+            if (!tensor || !tensor->resource.resource.value)
                 return fail(*pipeline.context, "CUDA prepared storage binding requires an RHI Tensor");
-            value.resource = argument.resource;
+            value.payload.buffer.resource = tensor->resource;
         } else {
-            if (argument.kind != ComputeLaunchArgumentKind::Scalar)
+            const auto *scalar = std::get_if<ComputeScalarArgument>(&argument);
+            if (!scalar)
                 return fail(*pipeline.context, "CUDA prepared inline binding for argument #" +
                                                    std::to_string(layout.argument_index) +
                                                    " received a resource value");
-            if (!argument.scalarData || !argument.scalarSize)
+            if (!scalar->data || !scalar->size)
                 return fail(*pipeline.context, "CUDA prepared inline binding for argument #" +
                                                    std::to_string(layout.argument_index) + " has no packed host data");
-            value.inline_data = argument.scalarData;
-            value.inline_size = argument.scalarSize;
+            value.payload.inline_value.data = scalar->data;
+            value.payload.inline_value.size = scalar->size;
         }
     }
     VernonStatus status =

@@ -603,7 +603,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             reflected["resource_kind"] = "descriptor_storage_leaves";
             break;
         case mlir::vernon::PhysicalResourceAbiKind::GraphicsTexture:
-            reflected["resource_kind"] = "texture_descriptor";
+            reflected["resource_kind"] = "image_reference";
             break;
         case mlir::vernon::PhysicalResourceAbiKind::GraphicsSampler:
             reflected["resource_kind"] = "sampler_descriptor";
@@ -1107,12 +1107,18 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 argument["rank"] = static_cast<int64_t>(tensor.getShape().size());
             }
             if (auto texture = mlir::dyn_cast<mlir::vernon::TextureType>(argumentType)) {
-                argument["kind"] = "texture";
-                argument["dtype"] = scalarDtype(texture.getElementType());
+                argument["kind"] = "image";
+                argument["resource_kind"] = "image";
                 argument["dimension"] = texture.getDimension().str();
-                argument["access"] = texture.getAccess() == "sampled" ? "read" : texture.getAccess().str();
-                if (texture.getAccess() != "sampled")
-                    argument["format"] = texture.getFormat().str();
+                if (texture.getAccess() == "sampled") {
+                    argument["binding_role"] = "sampled";
+                    argument["sample_result_class"] = "float";
+                    argument["access"] = "read";
+                } else {
+                    argument["binding_role"] = "storage";
+                    argument["exact_storage_format"] = texture.getFormat().str();
+                    argument["access"] = texture.getAccess().str();
+                }
             } else if (mlir::isa<mlir::vernon::SamplerType>(argumentType)) {
                 argument["kind"] = "sampler";
                 argument["access"] = "read";
@@ -1125,7 +1131,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                         reflectedBinding["binding"] = pair.binding;
                         bindings.emplace_back(std::move(reflectedBinding));
                     }
-                    argument["sampled_texture_bindings"] = std::move(bindings);
+                    argument["sampled_image_bindings"] = std::move(bindings);
                 }
             }
             if (stage.getValue() == "compute") {

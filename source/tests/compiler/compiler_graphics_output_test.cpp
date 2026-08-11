@@ -541,8 +541,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
             const std::string_view reflectionView(reflection.data, reflection.size);
             EXPECT_NE(reflectionView.find("\"vernon.implicit\":\"sampler\""), std::string_view::npos);
             EXPECT_EQ(reflectionView.find("\"vernon.implicit\":\"texture_size\""), std::string_view::npos);
-            EXPECT_NE(reflectionView.find("\"sampled_texture_bindings\""), std::string_view::npos);
-            EXPECT_EQ(reflectionView.find("\"sampled_texture_binding\":"), std::string_view::npos);
+            EXPECT_NE(reflectionView.find("\"sampled_image_bindings\""), std::string_view::npos);
+            EXPECT_EQ(reflectionView.find("\"sampled_image_binding\":"), std::string_view::npos);
         } else {
             size_t queryCount = 0;
             for (size_t offset = 0; (offset = output.find("textureSize(", offset)) != std::string::npos; offset += 12)
@@ -606,7 +606,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         ASSERT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
         const VernonStringView reflection = vernonCompileResultGetReflection(result);
         const std::string_view reflectionView(reflection.data, reflection.size);
-        EXPECT_NE(reflectionView.find("\"format\":\"rgba32_float\""), std::string_view::npos);
+        EXPECT_NE(reflectionView.find("\"exact_storage_format\":\"rgba32_float\""), std::string_view::npos);
         EXPECT_NE(reflectionView.find("\"access\":\"read_write\""), std::string_view::npos);
         vernonCompileResultDestroy(result);
     }

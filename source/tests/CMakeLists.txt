@@ -221,8 +221,10 @@ if(TARGET VernonRuntime)
                 Vernon::Runtime
                 Vernon::ExecutionGraph
                 Vernon::RuntimeRHIAdapter
-                VernonRuntimeInternals
                 nlohmann_json::nlohmann_json)
+    if(VERNON_RUNTIME_LIBRARY_TYPE STREQUAL "SHARED")
+        target_link_libraries(VernonRuntimeTests PRIVATE VernonRuntimeInternals Vernon::RuntimeCore)
+    endif()
     target_compile_definitions(
         VernonRuntimeTests PRIVATE VERNON_CPU_BUNDLE_PATH="${cpu_bundle}" VERNON_RUNTIME_TEST_OS="${runtime_test_os}"
                                    VERNON_RUNTIME_TEST_ARCH="${runtime_test_arch}")

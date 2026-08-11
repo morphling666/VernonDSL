@@ -515,14 +515,16 @@ TEST(PipelineManifestRequirements, RejectsParameterKindTypeAndAddressSpaceMismat
 }
 
 TEST(PipelineManifestRequirements, RejectsAmbiguousOrUnresolvedResourceBindings) {
-    const auto texture = [](uint32_t slot, const char *name, uint32_t binding) {
+    const auto image = [](uint32_t slot, const char *name, uint32_t binding) {
         return nlohmann::json{{"slot", slot},
                               {"name", name},
-                              {"kind", "texture"},
+                              {"kind", "image"},
                               {"type", "!vernon.texture<\"2d\", f32, \"unknown\", \"sampled\">"},
                               {"access", "read"},
                               {"shape", nlohmann::json::array()},
                               {"dimension", "2d"},
+                              {"binding_role", "sampled"},
+                              {"sample_result_class", "float"},
                               {"uses", nlohmann::json::array({{{"stage", "fragment"},
                                                                {"interface", "resource"},
                                                                {"vernon.set", 0},
@@ -530,7 +532,7 @@ TEST(PipelineManifestRequirements, RejectsAmbiguousOrUnresolvedResourceBindings)
     };
     nlohmann::json manifest = {{"key", nlohmann::json::array()},
                                {"program", {{"vertex", "vertex"}, {"fragment", "fragment"}}},
-                               {"parameters", nlohmann::json::array({texture(0, "left", 3), texture(1, "right", 3)})},
+                               {"parameters", nlohmann::json::array({image(0, "left", 3), image(1, "right", 3)})},
                                {"outputs", nlohmann::json::array()}};
     vernon::runtime::Variant variant;
     std::string error;
@@ -547,11 +549,11 @@ TEST(PipelineManifestRequirements, RejectsAmbiguousOrUnresolvedResourceBindings)
           {"uses", nlohmann::json::array(
                        {{{"stage", "fragment"},
                          {"interface", "resource"},
-                         {"sampled_texture_bindings", nlohmann::json::array({{{"set", 0}, {"binding", 3}}})}}})}}});
+                         {"sampled_image_bindings", nlohmann::json::array({{{"set", 0}, {"binding", 3}}})}}})}}});
     variant = {};
     error.clear();
     EXPECT_FALSE(vernon::runtime::parseVariant(manifest, variant, error));
-    EXPECT_EQ(error, "sampler references an unknown sampled texture binding");
+    EXPECT_EQ(error, "sampler references an unknown sampled image binding");
 }
 
 TEST(PipelineManifestRequirements, ParsesStructuredLeafPathsAndStaticShapes) {

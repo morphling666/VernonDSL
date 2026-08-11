@@ -15,6 +15,7 @@
 namespace vernon::runtime {
 
 struct ValueLayout;
+struct Parameter;
 
 struct ReflectedStorageLeaf {
     size_t elementSize{};
@@ -71,6 +72,8 @@ std::optional<VernonDataType> pipelineDataType(const std::string &dtype);
 VernonValueLayoutView pipelineValueLayout(const ValueLayout &layout);
 
 std::optional<VernonValueAccess> pipelineValueAccess(const std::string &access);
+
+bool configureImageBindingLayout(const Parameter &parameter, VernonRuntimeProviderBindingLayoutEntry &layout);
 
 } // namespace vernon::runtime
 

@@ -9,6 +9,32 @@ namespace {
 
 using namespace vernon::runtime;
 
+VernonStatus describeTestImage(void *, VernonRuntimeProviderResourceReference resource,
+                               VernonRuntimeProviderImageDescription *description) {
+    if (!description || !resource.identity)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    const bool large = resource.identity == 4 || resource.identity == 5;
+    description->struct_size = sizeof(*description);
+    description->image.dimension = VERNON_TEXTURE_2D;
+    description->image.extent = {large ? 64u : 16u, large ? 32u : 16u, 1};
+    description->image.format = VERNON_TEXTURE_RGBA8_UNORM;
+    description->image.mip_level_count = 1;
+    description->image.array_layer_count = 1;
+    description->image.sample_count = 1;
+    description->image.usage = VERNON_IMAGE_COLOR_ATTACHMENT;
+    description->view.dimension = VERNON_TEXTURE_2D;
+    description->view.format = VERNON_TEXTURE_RGBA8_UNORM;
+    description->view.subresources = {0, 1, 0, 1, VERNON_IMAGE_ASPECT_COLOR};
+    description->parent_identity = resource.resource.value;
+    description->resource_kind = VERNON_RUNTIME_PROVIDER_IMAGE_VIEW;
+    return VERNON_STATUS_OK;
+}
+
+bool planForTest(const Variant &variant, const VernonPipelineInvocation &invocation, PlannedGraphicsInvocation &plan,
+                 std::string &error) {
+    return planGraphicsInvocation(variant, invocation, describeTestImage, nullptr, plan, error);
+}
+
 bool planVertexTensor(const char *dtype, VernonDataType dataType, const std::vector<uint64_t> &valueShape,
                       const std::vector<AttributeLeaf> &leaves, const std::vector<uint64_t> &tensorShape,
                       const std::vector<int64_t> &tensorStrides, uint32_t divisor, uint32_t instanceCount,
@@ -54,9 +80,7 @@ bool planVertexTensor(const char *dtype, VernonDataType dataType, const std::vec
     argument.tensor.byte_size = 4096;
 
     VernonColorAttachment attachment{};
-    attachment.resource = {1, {3}, 0, 1024};
-    attachment.width = 16;
-    attachment.height = 16;
+    attachment.view = {1, {3}, 0, 1024};
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
@@ -66,7 +90,7 @@ bool planVertexTensor(const char *dtype, VernonDataType dataType, const std::vec
     invocation.color_attachment_count = 1;
     invocation.vertex_count = divisor ? 3 : 0;
     invocation.instance_count = instanceCount;
-    return planGraphicsInvocation(variant, invocation, plan, error);
+    return planForTest(variant, invocation, plan, error);
 }
 
 TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndIndex) {
@@ -75,7 +99,6 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     const VernonRuntimeProviderResourceReference sampledTexture{3, {13}, 0, 0};
     const VernonRuntimeProviderResourceReference firstTarget{4, {14}, 0, 0};
     const VernonRuntimeProviderResourceReference secondTarget{5, {15}, 0, 0};
-    const VernonRuntimeProviderResourceReference sampler{6, {16}, 0, 0};
 
     Variant variant;
     variant.vertex = "vertex";
@@ -96,8 +119,10 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     Parameter texture;
     texture.slot = 1;
     texture.name = "albedo";
-    texture.kind = "texture";
+    texture.kind = "image";
     texture.dimension = "2d";
+    texture.bindingRole = "sampled";
+    texture.sampleResultClass = "float";
     texture.uses.push_back({"fragment", "uniform", "albedo", "", {}, 0, UINT32_MAX, 0, 0, 5, {}});
     variant.parameters = {vertices, texture};
     Parameter implicitSampler;
@@ -122,13 +147,13 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     arguments[0].tensor.byte_strides = vertexStrides.data();
     arguments[0].tensor.byte_size = 48;
     arguments[1].slot = 1;
-    arguments[1].kind = VERNON_PIPELINE_TEXTURE;
-    arguments[1].texture = {
-        VERNON_TEXTURE_RGBA8_UNORM, VERNON_ACCESS_READ, VERNON_TEXTURE_2D, 16, 8, 1, sampledTexture, sampler};
-    VernonColorAttachment attachments[] = {
-        {1, secondTarget, 64, 32, VERNON_TEXTURE_RGBA8_UNORM},
-        {0, firstTarget, 64, 32, VERNON_TEXTURE_RGBA8_UNORM},
-    };
+    arguments[1].kind = VERNON_PIPELINE_IMAGE;
+    arguments[1].image = {sampledTexture};
+    VernonColorAttachment attachments[2]{};
+    attachments[0].location = 1;
+    attachments[0].view = secondTarget;
+    attachments[1].location = 0;
+    attachments[1].view = firstTarget;
     VernonIndexBinding index{VERNON_INDEX_U32, 0, 6, indexBuffer};
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
@@ -143,7 +168,7 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
 
     PlannedGraphicsInvocation plan;
     std::string error;
-    ASSERT_TRUE(planGraphicsInvocation(variant, invocation, plan, error)) << error;
+    ASSERT_TRUE(planForTest(variant, invocation, plan, error)) << error;
     ASSERT_EQ(plan.attachments.size(), 2u);
     EXPECT_EQ(plan.attachments[0]->location, 0u);
     EXPECT_EQ(plan.attachments[1]->location, 1u);
@@ -157,22 +182,22 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     EXPECT_EQ(plan.vertexInputs[0].use->attributeLeaves.size(), 1u);
     const auto sampled = plan.sampledResources.find({0, 5});
     ASSERT_NE(sampled, plan.sampledResources.end());
-    EXPECT_EQ(sampled->second.imageResource.identity, sampledTexture.identity);
-    EXPECT_EQ(sampled->second.samplerResource.identity, sampler.identity);
+    EXPECT_EQ(sampled->second.imageView.identity, sampledTexture.identity);
+    EXPECT_EQ(sampled->second.samplerResource.identity, 0u);
     EXPECT_TRUE(sampled->second.implicitSampler);
     EXPECT_EQ(sampled->second.stages, PLANNED_STAGE_FRAGMENT);
 
     index.type = static_cast<VernonIndexType>(1);
-    EXPECT_FALSE(planGraphicsInvocation(variant, invocation, plan, error));
+    EXPECT_FALSE(planForTest(variant, invocation, plan, error));
     EXPECT_EQ(error, "index binding is invalid");
     index.type = VERNON_INDEX_U32;
     attachments[0].location = 2;
-    EXPECT_FALSE(planGraphicsInvocation(variant, invocation, plan, error));
+    EXPECT_FALSE(planForTest(variant, invocation, plan, error));
     EXPECT_EQ(error, "render target locations must be contiguous from zero");
     attachments[0].location = 1;
     vertexStrides[0] = -12;
     arguments[0].tensor.byte_offset = 36;
-    EXPECT_FALSE(planGraphicsInvocation(variant, invocation, plan, error));
+    EXPECT_FALSE(planForTest(variant, invocation, plan, error));
     EXPECT_EQ(error, "graphics Tensor strides must be positive");
 }
 

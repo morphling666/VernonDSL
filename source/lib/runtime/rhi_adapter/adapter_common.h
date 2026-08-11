@@ -53,10 +53,20 @@ struct VernonRuntimeRhiAdapter {
 
 namespace vernon::runtime::rhi_adapter {
 
-inline constexpr uint64_t kRhiResourceKindMask = 3;
+inline constexpr uint64_t kRhiResourceKindMask = 7;
 inline constexpr uint64_t kRhiImageResource = 1;
 inline constexpr uint64_t kRhiSamplerResource = 2;
 inline constexpr uint64_t kRhiBufferResource = 3;
+inline constexpr uint64_t kRhiImageViewResource = 4;
+
+inline bool isRhiImageReference(VernonRuntimeProviderResourceReference resource) {
+    const uint64_t kind = resource.identity & kRhiResourceKindMask;
+    return kind == kRhiImageResource || kind == kRhiImageViewResource;
+}
+
+inline bool isRhiImageViewReference(VernonRuntimeProviderResourceReference resource) {
+    return (resource.identity & kRhiResourceKindMask) == kRhiImageViewResource;
+}
 
 template <typename Object> VernonRuntimeProviderObject toHandle(Object *object) {
     return {static_cast<uint64_t>(reinterpret_cast<uintptr_t>(object))};
@@ -74,6 +84,11 @@ void releaseRhiResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderR
 uint64_t resolveRhiResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderResourceReference resource);
 bool describeRhiImage(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderResourceReference resource,
                       VernonRhiImageDescriptor &descriptor);
+VernonStatus describeProviderImage(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderResourceReference resource,
+                                   VernonRuntimeProviderImageDescription &description);
+VernonStatus describeProviderImageCallback(void *data, VernonRuntimeProviderResourceReference resource,
+                                           VernonRuntimeProviderImageDescription *description);
+const VernonRuntimeProviderResourceReference *providerBindingResource(const VernonRuntimeProviderBindingValue &value);
 uint64_t nativeCommandEncoder(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder);
 bool commandEncoderRendering(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder);
 bool commandEncoderHasRenderingDescriptor(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder);

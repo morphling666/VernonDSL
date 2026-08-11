@@ -23,6 +23,10 @@ struct RhiBuffer {
 
 struct RhiImage {
     VernonRhiImage handle{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+};
+
+struct RhiImageView {
+    VernonRhiImageView handle{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     VernonRuntimeProviderResourceReference reference{};
 };
 
@@ -172,8 +176,25 @@ inline RhiImage createImage(RhiRuntime &context, VernonRhiImageDimension dimensi
     RhiImage result;
     if (vernonRhiDeviceCreateImage(context.device, &descriptor, &result.handle) != VERNON_RHI_STATUS_OK)
         return result;
-    if (vernonRuntimeReferenceRhiImage(context.runtime, result.handle, &result.reference) != VERNON_STATUS_OK)
+    return result;
+}
+
+inline RhiImageView createImageView(RhiRuntime &context, const RhiImage &image, VernonRhiImageDimension dimension,
+                                    VernonRhiFormat format, uint32_t mipLevels = 1, uint32_t arrayLayers = 1,
+                                    uint32_t aspects = VERNON_RHI_IMAGE_ASPECT_COLOR) {
+    VernonRhiImageViewDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.image = image.handle;
+    descriptor.dimension = dimension;
+    descriptor.format = format;
+    descriptor.mip_level_count = mipLevels;
+    descriptor.array_layer_count = arrayLayers;
+    descriptor.aspects = aspects;
+    RhiImageView result;
+    if (vernonRhiDeviceCreateImageView(context.device, &descriptor, &result.handle) != VERNON_RHI_STATUS_OK)
         return result;
+    if (vernonRuntimeReferenceRhiImageView(context.runtime, result.handle, &result.reference) != VERNON_STATUS_OK)
+        return {};
     return result;
 }
 

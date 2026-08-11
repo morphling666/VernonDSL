@@ -1,5 +1,6 @@
 #include "backend_dispatch.h"
 #include "image_data_layout.h"
+#include "image_descriptor_validation.h"
 #include "logical_resource_record.h"
 #include "opengl_backend.h"
 #include "rhi_test_hooks.h"
@@ -17,6 +18,7 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -26,6 +28,7 @@ using vernon::rhi::opengl::Enum;
 using vernon::rhi::opengl::Image;
 using vernon::rhi::opengl::Int;
 using vernon::rhi::opengl::Size;
+using vernon::rhi::opengl::Uint;
 
 struct FormatInfo {
     Int internal{};
@@ -42,6 +45,19 @@ struct ImageSlot : vernon::rhi::LogicalResourceRecord {
     Enum target{};
 };
 
+struct IdentityImageViewBacking {};
+struct OwnedTextureViewBacking {
+    Image image;
+};
+using ImageViewBacking = std::variant<IdentityImageViewBacking, OwnedTextureViewBacking>;
+
+struct ImageViewSlot : vernon::rhi::LogicalResourceRecord {
+    ImageViewBacking backing;
+    VernonRhiImageViewDescriptor descriptor{};
+    uint64_t imageResource{};
+    Enum target{};
+};
+
 struct BufferSlot : vernon::rhi::LogicalResourceRecord {
     vernon::rhi::opengl::Buffer buffer;
     VernonRhiBufferDescriptor descriptor{};
@@ -55,6 +71,7 @@ struct OpenGLDevice {
     DeviceState state;
     std::vector<BufferSlot> buffers;
     std::vector<ImageSlot> images;
+    std::vector<ImageViewSlot> imageViews;
     std::vector<SamplerSlot> samplers;
     std::string error;
     std::mutex mutex;
@@ -115,6 +132,38 @@ ImageSlot *lookupImage(OpenGLDevice &device, VernonRhiImage handle) {
     return slot.isPublic(handle.generation) ? &slot : nullptr;
 }
 
+ImageViewSlot *lookupImageView(OpenGLDevice &device, VernonRhiImageView handle) {
+    if (handle.index >= device.imageViews.size())
+        return nullptr;
+    ImageViewSlot &slot = device.imageViews[handle.index];
+    return slot.isPublic(handle.generation) ? &slot : nullptr;
+}
+
+ImageSlot *lookupImageViewParent(OpenGLDevice &device, const ImageViewSlot &view) {
+    return lookupResourceRecord(device.images, view.imageResource);
+}
+
+Uint imageViewName(OpenGLDevice &device, const ImageViewSlot &view) {
+    if (const auto *owned = std::get_if<OwnedTextureViewBacking>(&view.backing))
+        return owned->image.name;
+    const ImageSlot *parent = lookupImageViewParent(device, view);
+    return parent ? parent->image.name : 0;
+}
+
+void recycleImageView(OpenGLDevice &device, ImageViewSlot &view) {
+    const uint64_t parentKey = view.imageResource;
+    if (auto *owned = std::get_if<OwnedTextureViewBacking>(&view.backing)) {
+        device.state.destroyImage(owned->image);
+        view.backing.emplace<IdentityImageViewBacking>();
+    }
+    view.recycle();
+    ImageSlot *parent = lookupResourceRecord(device.images, parentKey);
+    if (parent && parent->release()) {
+        device.state.destroyImage(parent->image);
+        parent->recycle();
+    }
+}
+
 BufferSlot *lookupBuffer(OpenGLDevice &device, VernonRhiBuffer handle) {
     if (handle.index >= device.buffers.size())
         return nullptr;
@@ -137,6 +186,13 @@ void validate(const OpenGLDevice &device) {
     for (const ImageSlot &slot : device.images) {
         slot.validate();
         assert(slot.occupied == (slot.image.name != 0));
+    }
+    for (const ImageViewSlot &slot : device.imageViews) {
+        slot.validate();
+        const auto *owned = std::get_if<OwnedTextureViewBacking>(&slot.backing);
+        assert(slot.occupied || !owned);
+        assert(!owned || owned->image.name != 0);
+        assert(!slot.occupied || slot.imageResource != 0);
     }
     for (const SamplerSlot &slot : device.samplers) {
         slot.validate();
@@ -288,6 +344,10 @@ void destroyDevice(VernonRhiDevice handle) {
     for (BufferSlot &buffer : device->buffers)
         if (buffer.occupied)
             device->state.destroyBuffer(buffer.buffer);
+    for (ImageViewSlot &view : device->imageViews)
+        if (view.occupied)
+            if (auto *owned = std::get_if<OwnedTextureViewBacking>(&view.backing))
+                device->state.destroyImage(owned->image);
     for (ImageSlot &image : device->images)
         if (image.occupied)
             device->state.destroyImage(image.image);
@@ -719,6 +779,98 @@ VernonRhiStatus getImageNativeHandle(VernonRhiDevice handle, VernonRhiImage imag
     return VERNON_RHI_STATUS_OK;
 }
 
+VernonRhiStatus createImageView(VernonRhiDevice handle, const VernonRhiImageViewDescriptor *descriptor,
+                                VernonRhiImageView *output) {
+    auto device = lookupDevice(handle);
+    if (!device || !descriptor || descriptor->struct_size < sizeof(*descriptor) || !output ||
+        !descriptor->mip_level_count || !descriptor->array_layer_count || !descriptor->aspects)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    *output = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    std::lock_guard<std::mutex> guard(device->mutex);
+    ImageSlot *parent = lookupImage(*device, descriptor->image);
+    FormatInfo format{};
+    if (!parent || !formatInfo(descriptor->format, format))
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!vernon::rhi::validImageViewDescriptor(parent->descriptor, *descriptor))
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (descriptor->dimension == VERNON_RHI_IMAGE_2D && descriptor->array_layer_count != 1)
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    if (!parent->retain())
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    uint32_t index = 0;
+    while (index < device->imageViews.size() && device->imageViews[index].occupied)
+        ++index;
+    if (index == device->imageViews.size()) {
+        try {
+            device->imageViews.emplace_back();
+        } catch (const std::bad_alloc &) {
+            parent->release();
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        }
+    }
+    ImageViewSlot &slot = device->imageViews[index];
+    const bool identityView =
+        descriptor->format == parent->descriptor.format && descriptor->dimension == parent->descriptor.dimension &&
+        descriptor->aspects == vernon::rhi::imageFormatAspects(parent->descriptor.format) &&
+        descriptor->base_mip_level == 0 && descriptor->mip_level_count == parent->descriptor.mip_levels &&
+        descriptor->base_array_layer == 0 && descriptor->array_layer_count == parent->descriptor.array_layers;
+    slot.backing.emplace<IdentityImageViewBacking>();
+    if (!identityView) {
+        if (device->state.embeddedProfile || !device->state.driver.textureView) {
+            parent->release();
+            return VERNON_RHI_STATUS_UNSUPPORTED;
+        }
+        device->state.makeCurrent();
+        auto &owned = slot.backing.emplace<OwnedTextureViewBacking>();
+        device->state.driver.genTextures(1, &owned.image.name);
+        if (!owned.image.name) {
+            slot.backing.emplace<IdentityImageViewBacking>();
+            parent->release();
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        }
+        owned.image.imported = false;
+        slot.target = imageTarget(descriptor->dimension);
+        device->state.driver.textureView(owned.image.name, slot.target, parent->image.name, format.internal,
+                                         descriptor->base_mip_level, descriptor->mip_level_count,
+                                         descriptor->base_array_layer, descriptor->array_layer_count);
+    }
+    slot.target = imageTarget(descriptor->dimension);
+    slot.descriptor = *descriptor;
+    slot.imageResource = resourceKey(descriptor->image);
+    slot.publish();
+    *output = {index, slot.generation};
+    validate(*device);
+    return VERNON_RHI_STATUS_OK;
+}
+
+VernonRhiStatus destroyImageView(VernonRhiDevice handle, VernonRhiImageView view) {
+    auto device = lookupDevice(handle);
+    if (!device)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    ImageViewSlot *slot = lookupImageView(*device, view);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    slot->destroyPublicOwner();
+    if (slot->bindingReferences != 0)
+        return VERNON_RHI_STATUS_OK;
+    recycleImageView(*device, *slot);
+    validate(*device);
+    return VERNON_RHI_STATUS_OK;
+}
+
+VernonRhiStatus getImageViewNativeHandle(VernonRhiDevice handle, VernonRhiImageView view, uint64_t *output) {
+    auto device = lookupDevice(handle);
+    if (!device || !output)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    ImageViewSlot *slot = lookupImageView(*device, view);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    *output = imageViewName(*device, *slot);
+    return VERNON_RHI_STATUS_OK;
+}
+
 VernonRhiStatus destroyBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer) {
 
     auto device = lookupDevice(handle);
@@ -961,6 +1113,15 @@ uint64_t imageResource(VernonRhiDevice handle, VernonRhiImage image) {
     return 0;
 }
 
+uint64_t imageViewResource(VernonRhiDevice handle, VernonRhiImageView view) {
+    if (auto device = lookupDevice(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        if (lookupImageView(*device, view))
+            return resourceKey(view);
+    }
+    return 0;
+}
+
 uint64_t samplerResource(VernonRhiDevice handle, VernonRhiSampler sampler) {
 
     if (auto device = lookupDevice(handle)) {
@@ -985,6 +1146,10 @@ bool retainResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
         ImageSlot *slot = lookupResourceRecord(device->images, key);
         return slot && slot->retain();
     }
+    if (kind == ResourceKind::ImageView) {
+        ImageViewSlot *slot = lookupResourceRecord(device->imageViews, key);
+        return slot && slot->retain();
+    }
     SamplerSlot *slot = lookupResourceRecord(device->samplers, key);
     return slot && slot->retain();
 }
@@ -1003,6 +1168,10 @@ uint64_t resolveResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key
         auto *slot = lookupResourceRecord(device->images, key);
         return slot && slot->occupied ? slot->image.name : 0;
     }
+    if (kind == ResourceKind::ImageView) {
+        auto *slot = lookupResourceRecord(device->imageViews, key);
+        return slot ? imageViewName(*device, *slot) : 0;
+    }
     auto *slot = lookupResourceRecord(device->samplers, key);
     return slot && slot->occupied ? slot->sampler.name : 0;
 }
@@ -1016,6 +1185,24 @@ bool describeImageResource(VernonRhiDevice handle, uint64_t key, VernonRhiImageD
     if (!slot || !slot->occupied)
         return false;
     *descriptor = slot->descriptor;
+    return true;
+}
+
+bool describeImageViewResource(VernonRhiDevice handle, uint64_t key, VernonRhiImageViewDescriptor *view,
+                               VernonRhiImageDescriptor *image, uint64_t *parentKey) {
+    auto device = lookupDevice(handle);
+    if (!device || !view || !image || !parentKey)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    const ImageViewSlot *slot = lookupResourceRecord(device->imageViews, key);
+    if (!slot)
+        return false;
+    const ImageSlot *parent = lookupResourceRecord(device->images, slot->imageResource);
+    if (!parent)
+        return false;
+    *view = slot->descriptor;
+    *image = parent->descriptor;
+    *parentKey = slot->imageResource;
     return true;
 }
 
@@ -1039,6 +1226,13 @@ void releaseResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
             return;
         device->state.destroyImage(slot->image);
         slot->recycle();
+        return;
+    }
+    if (kind == ResourceKind::ImageView) {
+        auto *slot = lookupResourceRecord(device->imageViews, key);
+        if (!slot || !slot->release())
+            return;
+        recycleImageView(*device, *slot);
         return;
     }
     auto *slot = lookupResourceRecord(device->samplers, key);
@@ -1094,6 +1288,11 @@ const vernon::rhi::BackendDispatch &vernon::rhi::openGLBackendDispatch() {
         clearColor,
         clearDepthStencil,
         nullptr,
+        createImageView,
+        destroyImageView,
+        getImageViewNativeHandle,
+        imageViewResource,
+        describeImageViewResource,
     };
     return dispatch;
 }

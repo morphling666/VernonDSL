@@ -59,7 +59,7 @@ def _is_logical_collection(value: Any) -> bool:
 class _TextureResource:
     def __init__(self) -> None:
         self._borrow_lock = threading.RLock()
-        self._active_borrows: list[tuple[object, _TextureResource, str]] = []
+        self._active_borrows: list[tuple[object, object, str]] = []
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -68,11 +68,11 @@ class _TextureResource:
     def _resident_texture(self) -> Any:
         raise NotImplementedError
 
-    def _mark_device_dirty(self) -> None:
+    def _resident_view(self) -> Any:
         raise NotImplementedError
 
-    def _graph_identity(self) -> object:
-        return self
+    def _mark_device_dirty(self) -> None:
+        raise NotImplementedError
 
     def _ensure_host_mutation_allowed(self) -> None:
         with self._borrow_lock:
@@ -113,7 +113,7 @@ def _bind_native_argument(
             raise TypeError("CPU kernels do not support Texture arguments")
         if state._rhi_host is None:
             raise RuntimeError("Texture arguments require a GPU RHI host")
-        return builder.rhi_texture(parameter.name, value._resident_texture())
+        return builder.rhi_texture(parameter.name, value._resident_view())
 
     value_type = type(value)
     struct_type = (
@@ -280,7 +280,7 @@ class TensorStorage:
         self._upload_count = 0
         self._download_count = 0
         self._borrow_lock = threading.RLock()
-        self._active_borrows: list[tuple[object, TensorView, str]] = []
+        self._active_borrows: list[tuple[object, object, str]] = []
         self._full_views: dict[str, TensorView] = {}
         _session_state()._runtime_children.add(self)
 
@@ -634,7 +634,7 @@ class RawBuffer:
         self._uploaded_version = 0
         self._device_dirty = False
         self._borrow_lock = threading.RLock()
-        self._active_borrows: list[tuple[object, TensorView, str]] = []
+        self._active_borrows: list[tuple[object, object, str]] = []
         _session_state()._runtime_children.add(self)
 
     @classmethod
@@ -971,7 +971,7 @@ def _validate_dispatch_borrows(
 
 
 def _dispatch_borrow_owner(resource: TensorView | _TextureResource) -> TensorStorage | RawBuffer | _TextureResource:
-    return resource.owner if isinstance(resource, TensorView) else resource
+    return resource.owner if isinstance(resource, (TensorView, TextureView)) else resource
 
 
 def _dispatch_borrows_overlap(
@@ -980,6 +980,18 @@ def _dispatch_borrows_overlap(
 ) -> bool:
     if isinstance(left, TensorView) and isinstance(right, TensorView):
         return _borrow_ranges_may_overlap(left, right)
+    if isinstance(left, TextureView) and isinstance(right, TextureView) and left.owner is right.owner:
+        left_mip_end = left._base_mip_level + left._mip_level_count
+        right_mip_end = right._base_mip_level + right._mip_level_count
+        left_layer_end = left._base_array_layer + left._array_layer_count
+        right_layer_end = right._base_array_layer + right._array_layer_count
+        return (
+            left._base_mip_level < right_mip_end
+            and right._base_mip_level < left_mip_end
+            and left._base_array_layer < right_layer_end
+            and right._base_array_layer < left_layer_end
+            and not left._aspects.isdisjoint(right._aspects)
+        )
     return True
 
 
@@ -999,7 +1011,9 @@ def _dispatch_borrow_scope(
             for _, active_resource, active_access in owner._active_borrows:
                 if access == active_access == "read":
                     continue
-                if _dispatch_borrows_overlap(resource, active_resource):
+                if isinstance(active_resource, (TensorView, _TextureResource)) and _dispatch_borrows_overlap(
+                    resource, active_resource
+                ):
                     raise RuntimeError(f"dispatch argument '{name}' conflicts with an outstanding device borrow")
         for _, resource, access in normalized:
             _dispatch_borrow_owner(resource)._active_borrows.append((token, resource, access))
@@ -1116,6 +1130,7 @@ class Texture(_TextureResource):
         self._mip_levels = mip_levels
         self._usage = frozenset(resolved_usage)
         self._native_texture: Any | None = None
+        self._native_view: Any | None = None
         self._native_generation = -1
         self._host_dirty_mips = {0}
         self._device_dirty_mips: set[int] = set()
@@ -1258,6 +1273,28 @@ class Texture(_TextureResource):
     @property
     def usage(self) -> frozenset[str]:
         return self._usage
+
+    def view(
+        self,
+        *,
+        format: TextureFormat | None = None,
+        dimension: str | None = None,
+        base_mip_level: int = 0,
+        mip_level_count: int | None = None,
+        base_array_layer: int = 0,
+        array_layer_count: int | None = None,
+        aspects: tuple[str, ...] | None = None,
+    ) -> TextureView:
+        return TextureView(
+            self,
+            format=format,
+            dimension=dimension,
+            base_mip_level=base_mip_level,
+            mip_level_count=mip_level_count,
+            base_array_layer=base_array_layer,
+            array_layer_count=array_layer_count,
+            aspects=aspects,
+        )
 
     def copy_from_numpy(self, array: np.ndarray) -> None:
         self.upload(array)
@@ -1426,6 +1463,7 @@ class Texture(_TextureResource):
                 self._mip_levels,
                 self._native_usage(),
             )
+            self._native_view = None
             self._native_generation = state._runtime_generation
             self._host_dirty_mips = set(self._mip_arrays)
             self._device_dirty_mips.clear()
@@ -1435,6 +1473,12 @@ class Texture(_TextureResource):
             self._native_texture.upload(array.tobytes(order="C"), mip_level)
         self._host_dirty_mips.clear()
         return self._native_texture
+
+    def _resident_view(self) -> Any:
+        texture = self._resident_texture()
+        if self._native_view is None:
+            self._native_view = texture.create_view()
+        return self._native_view
 
     def _native_usage(self) -> int:
         state = _session_state()
@@ -1452,12 +1496,161 @@ class Texture(_TextureResource):
         self._host_dirty_mips.discard(0)
 
 
+class TextureView(_TextureResource):
+    """A non-owning shader-visible subresource interpretation of a Texture."""
+
+    def __init__(
+        self,
+        owner: Texture,
+        *,
+        format: TextureFormat | None = None,
+        dimension: str | None = None,
+        base_mip_level: int = 0,
+        mip_level_count: int | None = None,
+        base_array_layer: int = 0,
+        array_layer_count: int | None = None,
+        aspects: tuple[str, ...] | None = None,
+    ):
+        if not isinstance(owner, Texture):
+            raise TypeError("TextureView owner must be a Texture")
+        format = owner.format if format is None else format
+        dimension = owner.dimension if dimension is None else dimension
+        if format not in _TEXTURE_FORMAT_SET or dimension not in {"2d", "3d", "cube"}:
+            raise ValueError("TextureView format or dimension is unsupported")
+        if format != owner.format and {format, owner.format} != {rgba8_unorm, rgba8_srgb}:
+            raise ValueError("TextureView format is incompatible with its owner")
+        if dimension != owner.dimension and not (owner.dimension == "cube" and dimension == "2d"):
+            raise ValueError("TextureView dimension is incompatible with its owner")
+        if (
+            not isinstance(base_mip_level, int)
+            or isinstance(base_mip_level, bool)
+            or not 0 <= base_mip_level < owner.mip_levels
+        ):
+            raise ValueError("TextureView base_mip_level is out of range")
+        mip_level_count = owner.mip_levels - base_mip_level if mip_level_count is None else mip_level_count
+        owner_layers = 6 if owner.dimension == "cube" else 1
+        if (
+            not isinstance(base_array_layer, int)
+            or isinstance(base_array_layer, bool)
+            or not 0 <= base_array_layer < owner_layers
+        ):
+            raise ValueError("TextureView base_array_layer is out of range")
+        array_layer_count = owner_layers - base_array_layer if array_layer_count is None else array_layer_count
+        if (
+            not isinstance(mip_level_count, int)
+            or isinstance(mip_level_count, bool)
+            or mip_level_count <= 0
+            or mip_level_count > owner.mip_levels - base_mip_level
+            or not isinstance(array_layer_count, int)
+            or isinstance(array_layer_count, bool)
+            or array_layer_count <= 0
+            or array_layer_count > owner_layers - base_array_layer
+        ):
+            raise ValueError("TextureView subresource range is out of bounds")
+        if dimension == "2d" and array_layer_count != 1:
+            raise ValueError("2D TextureView must select exactly one array layer")
+        if dimension == "3d" and (base_array_layer != 0 or array_layer_count != 1):
+            raise ValueError("3D TextureView cannot select array layers")
+        if dimension == "cube" and (base_array_layer != 0 or array_layer_count != 6):
+            raise ValueError("cube TextureView must select all six faces")
+        if aspects is None:
+            aspects = ("color",)
+        if (
+            not isinstance(aspects, tuple)
+            or not aspects
+            or any(value not in {"color", "depth", "stencil"} for value in aspects)
+        ):
+            raise ValueError("TextureView aspects must select color, depth, or stencil")
+        if set(aspects) != {"color"}:
+            raise ValueError("TextureView aspects are incompatible with a color Texture")
+        super().__init__()
+        self._owner = owner
+        self._format = format
+        self._dimension = dimension
+        self._base_mip_level = base_mip_level
+        self._mip_level_count = mip_level_count
+        self._base_array_layer = base_array_layer
+        self._array_layer_count = array_layer_count
+        self._aspects = frozenset(aspects)
+        self._native_view: Any | None = None
+        self._native_generation = -1
+
+    @property
+    def owner(self) -> Texture:
+        return self._owner
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self._owner._mip_shape(self._base_mip_level)
+
+    @property
+    def format(self) -> TextureFormat:
+        return self._format
+
+    @property
+    def dimension(self) -> str:
+        return self._dimension
+
+    @property
+    def mip_levels(self) -> int:
+        return self._mip_level_count
+
+    @property
+    def usage(self) -> frozenset[str]:
+        return self._owner.usage
+
+    def _resident_texture(self) -> Any:
+        return self._owner._resident_texture()
+
+    def _resident_view(self) -> Any:
+        state = _session_state()
+        texture = self._resident_texture()
+        if self._native_view is None or self._native_generation != state._runtime_generation:
+            native_format = getattr(state._native.TextureFormat, self._format._native_name)
+            native_dimension = {
+                "2d": state._native.TextureDimension.TEXTURE_2D,
+                "3d": state._native.TextureDimension.TEXTURE_3D,
+                "cube": state._native.TextureDimension.CUBE,
+            }[self._dimension]
+            aspect_names = {
+                "color": "IMAGE_ASPECT_COLOR",
+                "depth": "IMAGE_ASPECT_DEPTH",
+                "stencil": "IMAGE_ASPECT_STENCIL",
+            }
+            native_aspects = sum(int(getattr(state._native, aspect_names[value])) for value in self._aspects)
+            self._native_view = texture.create_view(
+                native_format,
+                native_dimension,
+                self._base_mip_level,
+                self._mip_level_count,
+                self._base_array_layer,
+                self._array_layer_count,
+                native_aspects,
+            )
+            self._native_generation = state._runtime_generation
+        return self._native_view
+
+    def _mark_device_dirty(self) -> None:
+        self._owner._device_dirty_mips.update(range(self._base_mip_level, self._base_mip_level + self._mip_level_count))
+        self._owner._host_dirty_mips.difference_update(
+            range(self._base_mip_level, self._base_mip_level + self._mip_level_count)
+        )
+
+    def _ensure_host_mutation_allowed(self) -> None:
+        self._owner._ensure_host_mutation_allowed()
+
+    def _ensure_host_read_allowed(self) -> None:
+        self._owner._ensure_host_read_allowed()
+
+
 class _DepthTexture(_TextureResource):
     """Sampled view of a RenderTarget-owned depth attachment."""
 
     def __init__(self, owner: RenderTarget):
         super().__init__()
         self._owner = owner
+        self._native_view: Any | None = None
+        self._native_generation = -1
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -1501,11 +1694,16 @@ class _DepthTexture(_TextureResource):
             raise RuntimeError("RenderTarget has no depth attachment")
         return image
 
+    def _resident_view(self) -> Any:
+        state = _session_state()
+        image = self._resident_texture()
+        if self._native_view is None or self._native_generation != state._runtime_generation:
+            self._native_view = image.create_view(aspects=int(state._native.IMAGE_ASPECT_DEPTH))
+            self._native_generation = state._runtime_generation
+        return self._native_view
+
     def _mark_device_dirty(self) -> None:
         pass
-
-    def _graph_identity(self) -> object:
-        return self._owner
 
 
 class SamplerState:
@@ -1549,7 +1747,7 @@ class RenderTarget:
         ):
             raise ValueError("RenderTarget shape must contain two positive dimensions")
         self._shape = shape
-        self._colors: dict[int, Texture] = {}
+        self._colors: dict[int, Texture | TextureView] = {}
         self._has_depth = False
         self._depth_texture: _DepthTexture | None = None
         self._native_depth: Any | None = None
@@ -1560,16 +1758,16 @@ class RenderTarget:
     def shape(self) -> tuple[int, int]:
         return self._shape
 
-    def attach_color(self, location: int, texture: Texture) -> RenderTarget:
+    def attach_color(self, location: int, texture: Texture | TextureView) -> RenderTarget:
         if not isinstance(location, int) or isinstance(location, bool) or not 0 <= location < 2**32:
             raise ValueError("color attachment location must be a non-negative u32")
         if location in self._colors:
             raise ValueError(f"color attachment location {location} is already occupied")
-        if not isinstance(texture, Texture):
-            raise TypeError("color attachment must be a Texture")
-        if texture._dimension != "2d":
+        if not isinstance(texture, (Texture, TextureView)):
+            raise TypeError("color attachment must be a Texture or TextureView")
+        if texture.dimension != "2d":
             raise ValueError("color attachment must be a two-dimensional color Texture")
-        if "color_attachment" not in texture._usage:
+        if "color_attachment" not in texture.usage:
             raise ValueError("color attachment Texture requires color_attachment usage")
         if texture.shape != self.shape:
             raise ValueError("color attachment dimensions must match RenderTarget shape")
@@ -1589,7 +1787,7 @@ class RenderTarget:
             raise RuntimeError("RenderTarget has no depth attachment")
         return self._depth_texture
 
-    def _color_attachments(self) -> tuple[tuple[int, Texture], ...]:
+    def _color_attachments(self) -> tuple[tuple[int, Texture | TextureView], ...]:
         return tuple(sorted(self._colors.items()))
 
     def _resident_depth_attachment(self) -> Any | None:
@@ -1621,6 +1819,7 @@ __all__ = [
     "TensorStorage",
     "TensorView",
     "Texture",
+    "TextureView",
     "TextureFormat",
     "r11g11b10_float",
     "r16_float",

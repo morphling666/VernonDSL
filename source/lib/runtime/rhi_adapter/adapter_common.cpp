@@ -147,9 +147,42 @@ std::optional<vernon::rhi::ResourceKind> resourceKind(const VernonRuntimeRhiAdap
         return vernon::rhi::ResourceKind::Buffer;
     if (encodedKind == kRhiImageResource)
         return vernon::rhi::ResourceKind::Image;
+    if (encodedKind == kRhiImageViewResource)
+        return vernon::rhi::ResourceKind::ImageView;
     if (encodedKind == kRhiSamplerResource)
         return vernon::rhi::ResourceKind::Sampler;
     return std::nullopt;
+}
+
+std::optional<VernonTextureFormat> providerTextureFormat(VernonRhiFormat format) {
+    switch (format) {
+    case VERNON_RHI_FORMAT_R8_UNORM:
+        return VERNON_TEXTURE_R8_UNORM;
+    case VERNON_RHI_FORMAT_RG8_UNORM:
+        return VERNON_TEXTURE_RG8_UNORM;
+    case VERNON_RHI_FORMAT_RGB8_UNORM:
+        return VERNON_TEXTURE_RGB8_UNORM;
+    case VERNON_RHI_FORMAT_RGBA8_UNORM:
+        return VERNON_TEXTURE_RGBA8_UNORM;
+    case VERNON_RHI_FORMAT_RGBA8_SRGB:
+        return VERNON_TEXTURE_RGBA8_SRGB;
+    case VERNON_RHI_FORMAT_R16_FLOAT:
+        return VERNON_TEXTURE_R16_FLOAT;
+    case VERNON_RHI_FORMAT_RGBA16_FLOAT:
+        return VERNON_TEXTURE_RGBA16_FLOAT;
+    case VERNON_RHI_FORMAT_R32_FLOAT:
+        return VERNON_TEXTURE_R32_FLOAT;
+    case VERNON_RHI_FORMAT_RGBA32_FLOAT:
+        return VERNON_TEXTURE_RGBA32_FLOAT;
+    case VERNON_RHI_FORMAT_R11G11B10_FLOAT:
+        return VERNON_TEXTURE_R11G11B10_FLOAT;
+    case VERNON_RHI_FORMAT_D32_FLOAT:
+        return VERNON_TEXTURE_D32_FLOAT;
+    case VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT:
+        return VERNON_TEXTURE_D32_FLOAT_S8_UINT;
+    default:
+        return std::nullopt;
+    }
 }
 
 } // namespace
@@ -173,8 +206,98 @@ uint64_t resolveRhiResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProvi
 bool describeRhiImage(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderResourceReference resource,
                       VernonRhiImageDescriptor &descriptor) {
     const auto kind = resourceKind(adapter, resource);
-    return kind == vernon::rhi::ResourceKind::Image &&
-           vernon::rhi::describeImageResource(adapter.rhiDevice, resource.resource.value, descriptor);
+    if (kind == vernon::rhi::ResourceKind::Image)
+        return vernon::rhi::describeImageResource(adapter.rhiDevice, resource.resource.value, descriptor);
+    if (kind != vernon::rhi::ResourceKind::ImageView)
+        return false;
+    VernonRhiImageViewDescriptor view{};
+    uint64_t parentKey = 0;
+    if (!vernon::rhi::describeImageViewResource(adapter.rhiDevice, resource.resource.value, view, descriptor,
+                                                parentKey))
+        return false;
+    return true;
+}
+
+VernonStatus describeProviderImage(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderResourceReference resource,
+                                   VernonRuntimeProviderImageDescription &description) {
+    VernonRhiImageDescriptor source{};
+    VernonRhiImageViewDescriptor sourceView{};
+    uint64_t parentKey = 0;
+    const auto kind = resourceKind(adapter, resource);
+    const bool view = kind == vernon::rhi::ResourceKind::ImageView;
+    const bool described = view ? vernon::rhi::describeImageViewResource(adapter.rhiDevice, resource.resource.value,
+                                                                         sourceView, source, parentKey)
+                                : describeRhiImage(adapter, resource, source);
+    if (description.struct_size < sizeof(description) || !described)
+        return fail(adapter, "RHI image view reference is invalid");
+    const auto format = providerTextureFormat(source.format);
+    if (!format)
+        return fail(adapter, "RHI image format has no provider-neutral representation");
+    const VernonTextureDimension dimension = source.dimension == VERNON_RHI_IMAGE_3D     ? VERNON_TEXTURE_3D
+                                             : source.dimension == VERNON_RHI_IMAGE_CUBE ? VERNON_TEXTURE_CUBE
+                                                                                         : VERNON_TEXTURE_2D;
+    uint32_t usage = 0;
+    usage |= (source.usage & VERNON_RHI_IMAGE_SAMPLED) ? VERNON_IMAGE_SAMPLED : 0;
+    usage |= (source.usage & VERNON_RHI_IMAGE_STORAGE) ? VERNON_IMAGE_STORAGE : 0;
+    usage |= (source.usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT) ? VERNON_IMAGE_COLOR_ATTACHMENT : 0;
+    usage |= (source.usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) ? VERNON_IMAGE_DEPTH_STENCIL_ATTACHMENT : 0;
+    usage |= (source.usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE) ? VERNON_IMAGE_TRANSFER_SOURCE : 0;
+    usage |= (source.usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION) ? VERNON_IMAGE_TRANSFER_DESTINATION : 0;
+    const uint32_t aspects = *format == VERNON_TEXTURE_D32_FLOAT ? VERNON_IMAGE_ASPECT_DEPTH
+                             : *format == VERNON_TEXTURE_D32_FLOAT_S8_UINT
+                                 ? VERNON_IMAGE_ASPECT_DEPTH | VERNON_IMAGE_ASPECT_STENCIL
+                                 : VERNON_IMAGE_ASPECT_COLOR;
+    description.image = {dimension,
+                         {source.width, source.height, source.depth},
+                         *format,
+                         source.mip_levels,
+                         source.array_layers,
+                         source.sample_count,
+                         usage};
+    const VernonTextureDimension viewDimension = !view                                         ? dimension
+                                                 : sourceView.dimension == VERNON_RHI_IMAGE_2D ? VERNON_TEXTURE_2D
+                                                 : sourceView.dimension == VERNON_RHI_IMAGE_3D ? VERNON_TEXTURE_3D
+                                                                                               : VERNON_TEXTURE_CUBE;
+    const auto viewFormat = view ? providerTextureFormat(sourceView.format) : format;
+    if (!viewFormat)
+        return fail(adapter, "RHI image view format has no provider-neutral representation");
+    const uint32_t viewAspects =
+        !view ? aspects
+              : ((sourceView.aspects & VERNON_RHI_IMAGE_ASPECT_COLOR) ? VERNON_IMAGE_ASPECT_COLOR : 0) |
+                    ((sourceView.aspects & VERNON_RHI_IMAGE_ASPECT_DEPTH) ? VERNON_IMAGE_ASPECT_DEPTH : 0) |
+                    ((sourceView.aspects & VERNON_RHI_IMAGE_ASPECT_STENCIL) ? VERNON_IMAGE_ASPECT_STENCIL : 0);
+    description.view = {viewDimension,
+                        *viewFormat,
+                        {view ? sourceView.base_mip_level : 0, view ? sourceView.mip_level_count : source.mip_levels,
+                         view ? sourceView.base_array_layer : 0,
+                         view ? sourceView.array_layer_count : source.array_layers, viewAspects}};
+    description.parent_identity = parentKey ? parentKey : resource.resource.value;
+    description.resource_kind = view ? VERNON_RUNTIME_PROVIDER_IMAGE_VIEW : VERNON_RUNTIME_PROVIDER_IMAGE_OWNER;
+    return VERNON_STATUS_OK;
+}
+
+VernonStatus describeProviderImageCallback(void *data, VernonRuntimeProviderResourceReference resource,
+                                           VernonRuntimeProviderImageDescription *description) {
+    if (!data || !description)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    return describeProviderImage(*static_cast<VernonRuntimeRhiAdapter *>(data), resource, *description);
+}
+
+const VernonRuntimeProviderResourceReference *providerBindingResource(const VernonRuntimeProviderBindingValue &value) {
+    switch (value.kind) {
+    case VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER:
+    case VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER:
+        return &value.payload.buffer.resource;
+    case VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE:
+    case VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE:
+        return &value.payload.image.view;
+    case VERNON_RUNTIME_PROVIDER_SAMPLER:
+        return &value.payload.sampler.resource;
+    case VERNON_RUNTIME_PROVIDER_INLINE_VALUE:
+    case VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER:
+        return nullptr;
+    }
+    return nullptr;
 }
 
 uint64_t nativeCommandEncoder(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder) {
@@ -271,6 +394,18 @@ extern "C" VernonStatus vernonRuntimeRhiAdapterReferenceImage(const VernonRuntim
     if (!resource)
         return VERNON_STATUS_INVALID_ARGUMENT;
     *output = {resourceIdentity(*adapter, kRhiImageResource), {resource}, 0, 0};
+    return VERNON_STATUS_OK;
+}
+
+extern "C" VernonStatus vernonRuntimeRhiAdapterReferenceImageView(const VernonRuntimeRhiAdapter *adapter,
+                                                                  VernonRhiImageView view,
+                                                                  VernonRuntimeProviderResourceReference *output) {
+    if (!adapter || !output)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    const uint64_t resource = vernon::rhi::imageViewResource(adapter->rhiDevice, view);
+    if (!resource)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    *output = {resourceIdentity(*adapter, kRhiImageViewResource), {resource}, 0, 0};
     return VERNON_STATUS_OK;
 }
 

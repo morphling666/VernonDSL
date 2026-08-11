@@ -468,8 +468,14 @@ bool DeviceState::generateImageMipmaps(const Image &image, uint32_t mipLevels, s
 bool DeviceState::createImageView(ImageView &view, const Image &image,
                                   const VernonRhiImageViewDescriptor &descriptor, std::string &error) {
     const MTLPixelFormat format = static_cast<MTLPixelFormat>(pixelFormat(descriptor.format));
+    const MTLTextureType textureType =
+        descriptor.dimension == VERNON_RHI_IMAGE_3D
+            ? MTLTextureType3D
+        : descriptor.dimension == VERNON_RHI_IMAGE_CUBE ? MTLTextureTypeCube
+        : descriptor.array_layer_count > 1                 ? MTLTextureType2DArray
+                                                           : MTLTextureType2D;
     view.texture = [image.texture newTextureViewWithPixelFormat:format
-                                                   textureType:image.texture.textureType
+                                                   textureType:textureType
                                                         levels:NSMakeRange(descriptor.base_mip_level,
                                                                            descriptor.mip_level_count)
                                                         slices:NSMakeRange(descriptor.base_array_layer,

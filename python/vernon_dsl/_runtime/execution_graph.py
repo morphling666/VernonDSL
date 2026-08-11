@@ -17,7 +17,7 @@ def _resource_identity(value: Any) -> object:
     if isinstance(value, TensorView):
         return value.owner
     if isinstance(value, _TextureResource):
-        return value._graph_identity()
+        return value
     return value
 
 
@@ -441,6 +441,11 @@ class CompiledBarrier:
     old_state: int
     new_state: int
     is_image: bool
+    base_mip_level: int
+    mip_level_count: int
+    base_array_layer: int
+    array_layer_count: int
+    aspects: int
 
 
 @dataclass(frozen=True)
@@ -499,12 +504,11 @@ class ExecutionGraph:
         if state._architecture == state.cpu and isinstance(value, (TensorStorage, TensorView, RawBuffer)):
             native_resource = native_graph.import_host_buffer(identity, exported)
         elif isinstance(value, _TextureResource):
-            native_resource = native_graph.import_image(value._resident_texture(), exported)
+            native_resource = native_graph.import_image(value._resident_view(), exported)
         elif isinstance(value, RenderTarget):
-            image = value._resident_depth_attachment()
-            if image is None:
+            if value._depth_texture is None:
                 raise ValueError("RenderTarget graph resources require a depth attachment")
-            native_resource = native_graph.import_image(image, exported)
+            native_resource = native_graph.import_image(value._depth_texture._resident_view(), exported)
         elif isinstance(value, (TensorStorage, TensorView, RawBuffer)):
             native_resource = native_graph.import_buffer(value._resident_buffer(), exported)
         else:
@@ -599,6 +603,11 @@ class ExecutionGraph:
                             barrier.old_state,
                             barrier.new_state,
                             barrier.is_image,
+                            barrier.base_mip_level,
+                            barrier.mip_level_count,
+                            barrier.base_array_layer,
+                            barrier.array_layer_count,
+                            barrier.aspects,
                         )
                         for barrier in native_scope.barriers
                     ),

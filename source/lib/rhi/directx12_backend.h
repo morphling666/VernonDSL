@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace vernon::rhi::directx12 {
@@ -25,11 +26,19 @@ struct Buffer {
 };
 
 struct Image {
+    struct StateJournal {
+        D3D12_RESOURCE_STATES state{};
+        std::vector<D3D12_RESOURCE_STATES> subresources;
+    };
+
     ID3D12Resource *resource{};
     DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
     VernonRhiImageDimension dimension{VERNON_RHI_IMAGE_2D};
     D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};
+    std::vector<D3D12_RESOURCE_STATES> subresourceStates;
+    std::unordered_map<uint64_t, StateJournal> stateJournals;
     bool owned{true};
+    VernonRhiImageViewDescriptor view{};
 };
 
 struct Sampler {

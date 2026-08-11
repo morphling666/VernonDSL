@@ -59,6 +59,7 @@ uint32_t clearCount = 0;
 uint32_t invalidateCount = 0;
 uint32_t programBindCount = 0;
 uint32_t framebufferBindCount = 0;
+uint32_t textureViewCount = 0;
 uint32_t viewportCount = 0;
 uint32_t scissorCount = 0;
 uint32_t stencilFuncCount = 0;
@@ -110,6 +111,18 @@ RhiImage createTexture2D(VernonRuntimeContext *runtime, uint32_t width, uint32_t
 RhiImage importOpenGLTexture2D(VernonRuntimeContext *runtime, uint32_t, uint32_t width, uint32_t height,
                                VernonTextureFormat format) {
     return createTexture2D(runtime, width, height, format);
+}
+
+VernonRhiImageViewDescriptor fullImageView(RhiImage image, VernonRhiFormat format) {
+    VernonRhiImageViewDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.image = image.handle;
+    descriptor.dimension = VERNON_RHI_IMAGE_2D;
+    descriptor.format = format;
+    descriptor.mip_level_count = 1;
+    descriptor.array_layer_count = 1;
+    descriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
+    return descriptor;
 }
 
 class RuntimeGraphRenderPass final : public vernon::execution::RenderPass {
@@ -307,6 +320,7 @@ void GL_CALL texSubImage2D(GlEnum, GlInt, GlInt, GlInt, GlSize width, GlSize hei
     textureStorage.assign(static_cast<const unsigned char *>(source),
                           static_cast<const unsigned char *>(source) + size);
 }
+void GL_CALL textureView(GlUint, GlEnum, GlUint, GlEnum, GlUint, GlUint, GlUint, GlUint) { ++textureViewCount; }
 void GL_CALL readPixels(GlInt, GlInt, GlSize width, GlSize height, GlEnum, GlEnum type, void *destination) {
     std::memcpy(destination, textureStorage.data(), static_cast<size_t>(width) * height * (type == 0x8DAD ? 8 : 4));
 }
@@ -405,6 +419,7 @@ void *getProcAddress(void *, const char *name) {
     PROC("glGenTextures", genNames);
     PROC("glDeleteTextures", deleteTextureNames);
     PROC("glBindTexture", objectPairNoop);
+    PROC("glTextureView", textureView);
     PROC("glTexImage2D", texImage2D);
     PROC("glTexImage3D", texImage3DNoop);
     PROC("glTexSubImage2D", texSubImage2D);
@@ -485,11 +500,16 @@ void *getProcAddress(void *, const char *name) {
     return nullptr;
 }
 
-VernonRuntimeContext *create(VernonRuntimeBackend backend, uint16_t major, uint16_t minor) {
+void *getProcAddressWithoutTextureView(void *userData, const char *name) {
+    return std::strcmp(name, "glTextureView") == 0 ? nullptr : getProcAddress(userData, name);
+}
+
+VernonRuntimeContext *create(VernonRuntimeBackend backend, uint16_t major, uint16_t minor,
+                             bool exposeTextureView = true) {
     VernonOpenGLContextCallbacks callbacks{};
     callbacks.struct_size = sizeof(callbacks);
     callbacks.make_current = &makeCurrent;
-    callbacks.get_proc_address = &getProcAddress;
+    callbacks.get_proc_address = exposeTextureView ? &getProcAddress : &getProcAddressWithoutTextureView;
     callbacks.api_version_major = major;
     callbacks.api_version_minor = minor;
     RhiRuntime context = vernon::tests::createRhiRuntime(backend, &callbacks);
@@ -684,11 +704,13 @@ std::string internalValueBundle() {
     root["variants"][0]["parameters"] =
         nlohmann::json::array({{{"slot", 0},
                                 {"name", "image"},
-                                {"kind", "texture"},
+                                {"kind", "image"},
                                 {"type", "!vernon.texture<\"2d\", f32, \"unknown\", \"sampled\">"},
                                 {"dtype", "f32"},
                                 {"access", "read"},
                                 {"dimension", "2d"},
+                                {"binding_role", "sampled"},
+                                {"sample_result_class", "float"},
                                 {"shape", nlohmann::json::array()},
                                 {"uses", nlohmann::json::array({{{"stage", "fragment"},
                                                                  {"interface", "resource"},
@@ -707,7 +729,7 @@ std::string internalValueBundle() {
                        {{{"stage", "fragment"},
                          {"interface", "resource"},
                          {"index", 1},
-                         {"sampled_texture_bindings", nlohmann::json::array({{{"set", 0}, {"binding", 3}}})}}})}},
+                         {"sampled_image_bindings", nlohmann::json::array({{{"set", 0}, {"binding", 3}}})}}})}},
          {{"name", "__resolution"},
           {"kind", "tensor"},
           {"type", "tensor<2xf32>"},
@@ -762,8 +784,10 @@ void expectMatrixUpload(VernonRuntimeBackend backend, const char *target, uint16
         vernonRuntimeLoadPipelineBundleWithOptions(gl, bundleData.data(), bundleData.size(), nullptr);
     ASSERT_TRUE(bundle) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
     VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
-    ASSERT_TRUE(pipeline);
+    ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
     RhiImage renderTarget = importOpenGLTexture2D(gl, 7, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
+    const auto renderTargetView = vernon::tests::createImageView(rhiRuntime(gl), renderTarget, VERNON_RHI_IMAGE_2D,
+                                                                 VERNON_RHI_FORMAT_RGBA8_UNORM);
     ASSERT_NE(renderTarget.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
 
     constexpr std::array<uint64_t, 2> shape = {4, 4};
@@ -779,7 +803,7 @@ void expectMatrixUpload(VernonRuntimeBackend backend, const char *target, uint16
     argument.tensor.shape = shape.data();
     argument.tensor.byte_strides = strides.data();
     argument.tensor.byte_size = sizeof(storage);
-    VernonColorAttachment attachment{0, renderTarget.reference, 16, 16, VERNON_TEXTURE_RGBA8_UNORM};
+    VernonColorAttachment attachment{0, renderTargetView.reference};
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
@@ -800,6 +824,7 @@ void expectMatrixUpload(VernonRuntimeBackend backend, const char *target, uint16
     EXPECT_EQ(clearedDrawBuffer, 0);
     EXPECT_EQ(clearColor, (std::array<float, 4>{}));
 
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, renderTargetView.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, renderTarget.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     EXPECT_EQ(vernon::runtime::getRhiAdapterLivePreparedPipelineCount(gl), 0u);
@@ -817,6 +842,8 @@ void expectIntegerUniformUpload(const char *dtype, VernonDataType dataType, cons
     VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
     ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
     RhiImage renderTarget = importOpenGLTexture2D(gl, 7, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
+    const auto renderTargetView = vernon::tests::createImageView(rhiRuntime(gl), renderTarget, VERNON_RHI_IMAGE_2D,
+                                                                 VERNON_RHI_FORMAT_RGBA8_UNORM);
     ASSERT_NE(renderTarget.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
 
     const uint64_t shape = components;
@@ -833,7 +860,7 @@ void expectIntegerUniformUpload(const char *dtype, VernonDataType dataType, cons
     argument.tensor.shape = components == 1 ? nullptr : &shape;
     argument.tensor.byte_strides = components == 1 ? nullptr : &stride;
     argument.tensor.byte_size = components * sizeof(uint32_t);
-    VernonColorAttachment attachment{0, renderTarget.reference, 16, 16, VERNON_TEXTURE_RGBA8_UNORM};
+    VernonColorAttachment attachment{0, renderTargetView.reference};
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
@@ -846,6 +873,7 @@ void expectIntegerUniformUpload(const char *dtype, VernonDataType dataType, cons
     invocation.instance_count = 1;
     ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK);
 
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, renderTargetView.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, renderTarget.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     vernonRuntimePipelineBundleDestroy(bundle);
@@ -1034,7 +1062,8 @@ TEST(RuntimeExternalGl, InvokesDirectComputePipelineThroughRuntimeCoreProvider) 
               VERNON_RHI_STATUS_OK);
     VernonRuntimeProviderObject providerEncoder{};
     ASSERT_EQ(vernonRuntimeReferenceRhiCommandEncoder(gl, encoder, &providerEncoder), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimePipelineEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimePipelineEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_OK)
+        << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
     VernonRhiCommandEncoderStats encoderStats{};
     ASSERT_EQ(vernonRhiCommandEncoderGetStats(rhiRuntime(gl).device, encoder, &encoderStats), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(encoderStats.dispatch_count, 1u);
@@ -1078,6 +1107,8 @@ TEST(RuntimeExternalGl, RejectsStorageImageMetadataThatDisagreesWithRhiResource)
     ASSERT_TRUE(gl);
     auto image = vernon::tests::createImage(rhiRuntime(gl), VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM, 1, 1, 1,
                                             VERNON_RHI_IMAGE_STORAGE);
+    const auto imageView =
+        vernon::tests::createImageView(rhiRuntime(gl), image, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
     ASSERT_NE(image.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
 
     static constexpr char source[] = "#version 430\nlayout(local_size_x=1) in;"
@@ -1094,10 +1125,11 @@ TEST(RuntimeExternalGl, RejectsStorageImageMetadataThatDisagreesWithRhiResource)
           }
         },
         "arguments": [{
-          "kind":"texture","access":"write","dimension":"2d","format":"rgba32_float",
+          "kind":"image","resource_kind":"image","binding_role":"storage","access":"write",
+          "dimension":"2d","exact_storage_format":"rgba32_float",
           "physical_layouts":{"vulkan_std430_storage_buffer":{
             "profile":"vulkan_std430_storage_buffer","kind":"resource_binding",
-            "resource_kind":"texture_descriptor"}},
+            "resource_kind":"image_reference"}},
           "vernon.binding":0
         }]
       }]
@@ -1108,12 +1140,8 @@ TEST(RuntimeExternalGl, RejectsStorageImageMetadataThatDisagreesWithRhiResource)
 
     VernonPipelineArgument argument{};
     argument.slot = 0;
-    argument.kind = VERNON_PIPELINE_TEXTURE;
-    argument.texture.format = VERNON_TEXTURE_RGBA32_FLOAT;
-    argument.texture.access = VERNON_ACCESS_WRITE;
-    argument.texture.dimension = VERNON_TEXTURE_2D;
-    argument.texture.width = argument.texture.height = argument.texture.depth = 1;
-    argument.texture.resource = image.reference;
+    argument.kind = VERNON_PIPELINE_IMAGE;
+    argument.image.view = imageView.reference;
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
@@ -1123,6 +1151,7 @@ TEST(RuntimeExternalGl, RejectsStorageImageMetadataThatDisagreesWithRhiResource)
     EXPECT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
 
     vernonRuntimeLoadedPipelineDestroy(pipeline);
+    EXPECT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, imageView.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, image.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
 }
@@ -1145,10 +1174,11 @@ TEST(RuntimeExternalGl, RejectsComputeSampledTextureAtPipelinePreparation) {
           }
         },
         "arguments": [{
-          "kind":"texture","access":"read","dimension":"2d",
+          "kind":"image","resource_kind":"image","binding_role":"sampled",
+          "sample_result_class":"float","access":"read","dimension":"2d",
           "physical_layouts":{"vulkan_std430_storage_buffer":{
             "profile":"vulkan_std430_storage_buffer","kind":"resource_binding",
-            "resource_kind":"texture_descriptor"}},
+            "resource_kind":"image_reference"}},
           "vernon.binding":0
         }]
       }]
@@ -1217,6 +1247,8 @@ TEST(RuntimeExternalGl, InvokesGeneratedResolutionAndSignedUniformPipeline) {
                                                 VERNON_RHI_BUFFER_VERTEX, positions.data());
     ASSERT_NE(vertices.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     RhiImage renderTarget = importOpenGLTexture2D(gl, 7, 37, 23, VERNON_TEXTURE_RGBA8_UNORM);
+    const auto renderTargetView = vernon::tests::createImageView(rhiRuntime(gl), renderTarget, VERNON_RHI_IMAGE_2D,
+                                                                 VERNON_RHI_FORMAT_RGBA8_UNORM);
     ASSERT_NE(renderTarget.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
 
     constexpr GlInt maxSteps = 19;
@@ -1242,7 +1274,7 @@ TEST(RuntimeExternalGl, InvokesGeneratedResolutionAndSignedUniformPipeline) {
     arguments[1].tensor.shape = positionShape.data();
     arguments[1].tensor.byte_strides = positionStrides.data();
     arguments[1].tensor.byte_size = sizeof(positions);
-    VernonColorAttachment attachment{0, renderTarget.reference, 37, 23, VERNON_TEXTURE_RGBA8_UNORM};
+    VernonColorAttachment attachment{0, renderTargetView.reference};
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
@@ -1258,6 +1290,7 @@ TEST(RuntimeExternalGl, InvokesGeneratedResolutionAndSignedUniformPipeline) {
     EXPECT_EQ(resolutionUpload, (std::array<float, 2>{37.0F, 23.0F}));
     EXPECT_EQ(signedUniformUpload[0], maxSteps);
 
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, renderTargetView.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, renderTarget.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyBuffer(rhiRuntime(gl).device, vertices.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
@@ -1300,27 +1333,27 @@ TEST(RuntimeExternalGl, RejectsNonCanonicalInternalParameterContracts) {
 
     nlohmann::json legacy = nlohmann::json::parse(internalValueBundle());
     nlohmann::json &legacyUse = legacy["variants"][0]["internal_parameters"][0]["uses"][0];
-    legacyUse.erase("sampled_texture_bindings");
+    legacyUse.erase("sampled_image_bindings");
     legacyUse["sampled_texture_set"] = 0;
     legacyUse["sampled_texture_binding"] = 3;
     std::string bundleData = serialize(std::move(legacy));
     EXPECT_FALSE(vernonRuntimeLoadPipelineBundleWithOptions(gl, bundleData.data(), bundleData.size(), nullptr));
 
     nlohmann::json ambiguous = nlohmann::json::parse(internalValueBundle());
-    ambiguous["variants"][0]["internal_parameters"][0]["uses"][0]["sampled_texture_bindings"].push_back(
+    ambiguous["variants"][0]["internal_parameters"][0]["uses"][0]["sampled_image_bindings"].push_back(
         {{"set", 0}, {"binding", 4}});
     bundleData = serialize(std::move(ambiguous));
     EXPECT_FALSE(vernonRuntimeLoadPipelineBundleWithOptions(gl, bundleData.data(), bundleData.size(), nullptr));
 
     nlohmann::json invalidResolution = nlohmann::json::parse(internalValueBundle());
-    invalidResolution["variants"][0]["internal_parameters"][1]["uses"][0]["sampled_texture_bindings"] =
+    invalidResolution["variants"][0]["internal_parameters"][1]["uses"][0]["sampled_image_bindings"] =
         nlohmann::json::array({{{"set", 0}, {"binding", 3}}});
     bundleData = serialize(std::move(invalidResolution));
     EXPECT_FALSE(vernonRuntimeLoadPipelineBundleWithOptions(gl, bundleData.data(), bundleData.size(), nullptr));
 
     nlohmann::json nonzeroSet = nlohmann::json::parse(internalValueBundle());
     nonzeroSet["variants"][0]["parameters"][0]["uses"][0]["vernon.set"] = 1;
-    nonzeroSet["variants"][0]["internal_parameters"][0]["uses"][0]["sampled_texture_bindings"][0]["set"] = 1;
+    nonzeroSet["variants"][0]["internal_parameters"][0]["uses"][0]["sampled_image_bindings"][0]["set"] = 1;
     bundleData = serialize(std::move(nonzeroSet));
     VernonPipelineBundle *bundle =
         vernonRuntimeLoadPipelineBundleWithOptions(gl, bundleData.data(), bundleData.size(), nullptr);
@@ -1331,6 +1364,56 @@ TEST(RuntimeExternalGl, RejectsNonCanonicalInternalParameterContracts) {
     vernonRuntimePipelineBundleDestroy(bundle);
 
     ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeExternalGl, CreatesIdentityImageViewsWithoutTextureViewExtension) {
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 3, 3, false);
+    ASSERT_TRUE(gl);
+    RhiImage image = importOpenGLTexture2D(gl, 8, 4, 4, VERNON_TEXTURE_RGBA8_UNORM);
+    VernonRhiImageViewDescriptor descriptor = fullImageView(image, VERNON_RHI_FORMAT_RGBA8_UNORM);
+    VernonRhiImageView view{};
+    ASSERT_EQ(vernonRhiDeviceCreateImageView(rhiRuntime(gl).device, &descriptor, &view), VERNON_RHI_STATUS_OK);
+    uint64_t parentNative = 0;
+    uint64_t native = 0;
+    ASSERT_EQ(vernonRhiDeviceGetImageNativeHandle(rhiRuntime(gl).device, image.handle, &parentNative),
+              VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, image.handle), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceIsImageValid(rhiRuntime(gl).device, image.handle), 0u);
+    EXPECT_EQ(vernonRhiDeviceGetImageViewNativeHandle(rhiRuntime(gl).device, view, &native), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(native, parentNative);
+    EXPECT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, view), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeExternalGl, RejectsAliasedImageViewsWithoutTextureViewExtension) {
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 3, 3, false);
+    ASSERT_TRUE(gl);
+    RhiImage image = importOpenGLTexture2D(gl, 8, 4, 4, VERNON_TEXTURE_RGBA8_UNORM);
+    VernonRhiImageViewDescriptor descriptor = fullImageView(image, VERNON_RHI_FORMAT_RGBA8_SRGB);
+    VernonRhiImageView view{};
+    EXPECT_EQ(vernonRhiDeviceCreateImageView(rhiRuntime(gl).device, &descriptor, &view), VERNON_RHI_STATUS_UNSUPPORTED);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, image.handle), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeExternalGl, CreatesNativeAliasedImageViewsWithTextureViewExtension) {
+    const uint32_t callsBefore = textureViewCount;
+    VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
+    ASSERT_TRUE(gl);
+    RhiImage image = importOpenGLTexture2D(gl, 8, 4, 4, VERNON_TEXTURE_RGBA8_UNORM);
+    VernonRhiImageViewDescriptor descriptor = fullImageView(image, VERNON_RHI_FORMAT_RGBA8_SRGB);
+    VernonRhiImageView view{};
+    ASSERT_EQ(vernonRhiDeviceCreateImageView(rhiRuntime(gl).device, &descriptor, &view), VERNON_RHI_STATUS_OK);
+    uint64_t parentNative = 0;
+    uint64_t viewNative = 0;
+    ASSERT_EQ(vernonRhiDeviceGetImageNativeHandle(rhiRuntime(gl).device, image.handle, &parentNative),
+              VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceGetImageViewNativeHandle(rhiRuntime(gl).device, view, &viewNative), VERNON_RHI_STATUS_OK);
+    EXPECT_NE(viewNative, parentNative);
+    EXPECT_EQ(textureViewCount, callsBefore + 1);
+    EXPECT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, view), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, image.handle), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(destroy(gl), VERNON_STATUS_OK);
 }
 
 TEST(RuntimeExternalGl, SuppliesImplicitSamplerAndEffectiveResolution) {
@@ -1345,21 +1428,37 @@ TEST(RuntimeExternalGl, SuppliesImplicitSamplerAndEffectiveResolution) {
         vernonRuntimeLoadPipelineBundleWithOptions(gl, bundleData.data(), bundleData.size(), nullptr);
     ASSERT_TRUE(bundle) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
     VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
-    ASSERT_TRUE(pipeline);
+    ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
     ASSERT_EQ(vernonRuntimeLoadedPipelineGetParameterCount(pipeline), 1u);
 
     RhiImage sampled = importOpenGLTexture2D(gl, 8, 4, 4, VERNON_TEXTURE_RGBA8_UNORM);
     RhiImage target = importOpenGLTexture2D(gl, 7, 16, 12, VERNON_TEXTURE_RGBA8_UNORM);
+    VernonRhiImageViewDescriptor sampledViewDescriptor{};
+    sampledViewDescriptor.struct_size = sizeof(sampledViewDescriptor);
+    sampledViewDescriptor.image = sampled.handle;
+    sampledViewDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    sampledViewDescriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    sampledViewDescriptor.mip_level_count = 1;
+    sampledViewDescriptor.array_layer_count = 1;
+    sampledViewDescriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
+    VernonRhiImageView sampledView{};
+    ASSERT_EQ(vernonRhiDeviceCreateImageView(rhiRuntime(gl).device, &sampledViewDescriptor, &sampledView),
+              VERNON_RHI_STATUS_OK);
+    VernonRuntimeProviderResourceReference sampledViewReference{};
+    ASSERT_EQ(vernonRuntimeReferenceRhiImageView(gl, sampledView, &sampledViewReference), VERNON_STATUS_OK);
+    const auto targetView =
+        vernon::tests::createImageView(rhiRuntime(gl), target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
     auto textureSampler = vernon::tests::createSampler(rhiRuntime(gl));
     ASSERT_NE(sampled.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     ASSERT_NE(textureSampler.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     VernonPipelineArgument argument{};
     argument.slot = 0;
-    argument.kind = VERNON_PIPELINE_TEXTURE;
-    argument.texture = {VERNON_TEXTURE_RGBA8_UNORM, VERNON_ACCESS_READ,      VERNON_TEXTURE_2D, 4, 4, 1,
-                        sampled.reference,          textureSampler.reference};
-    VernonColorAttachment attachment{0, target.reference, 16, 12, VERNON_TEXTURE_RGBA8_UNORM};
+    argument.kind = VERNON_PIPELINE_IMAGE;
+    argument.image = {sampledViewReference};
+    VernonColorAttachment attachment{};
+    attachment.location = 0;
+    attachment.view = targetView.reference;
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
@@ -1397,33 +1496,24 @@ TEST(RuntimeExternalGl, SuppliesImplicitSamplerAndEffectiveResolution) {
     ASSERT_EQ(vernonRuntimeReferenceRhiCommandEncoder(gl, encoder, &providerEncoder), VERNON_STATUS_OK);
     ASSERT_EQ(vernonRuntimePipelineEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_OK);
     EXPECT_EQ(boundSamplerUnit, 3u);
-    EXPECT_NE(boundSamplerName, 0u);
     EXPECT_EQ(resolutionUpload, (std::array<float, 2>{7.0F, 9.0F}));
     EXPECT_EQ(viewportUpload, (std::array<GlInt, 4>{2, 3, 7, 9}));
     EXPECT_EQ(nextName, nextNameAfterPreparation);
 
     ASSERT_EQ(vernonRhiDeviceDestroySampler(rhiRuntime(gl).device, textureSampler.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, sampledView), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, sampled.handle), VERNON_RHI_STATUS_OK);
     RhiImage replacementSampled = importOpenGLTexture2D(gl, 9, 4, 4, VERNON_TEXTURE_RGBA8_UNORM);
     auto replacementSampler = vernon::tests::createSampler(rhiRuntime(gl));
     ASSERT_NE(replacementSampled.handle.index, sampled.handle.index);
-    ASSERT_NE(replacementSampler.handle.index, textureSampler.handle.index);
+    ASSERT_EQ(replacementSampler.handle.index, textureSampler.handle.index);
+    ASSERT_NE(replacementSampler.handle.generation, textureSampler.handle.generation);
 
-    argument.texture.sampler_resource = {};
     std::fill(std::begin(invocation.viewport), std::end(invocation.viewport), 0);
     ASSERT_EQ(vernonRuntimePipelineEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_OK);
     EXPECT_EQ(resolutionUpload, (std::array<float, 2>{16.0F, 12.0F}));
     EXPECT_EQ(viewportUpload, (std::array<GlInt, 4>{0, 0, 16, 12}));
     EXPECT_EQ(boundSamplerName, 0u);
-
-    VernonRuntimeContext *other = create(VERNON_RUNTIME_OPENGL, 4, 3);
-    ASSERT_TRUE(other);
-    auto foreignSampler = vernon::tests::createSampler(rhiRuntime(other));
-    ASSERT_NE(foreignSampler.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    argument.texture.sampler_resource = foreignSampler.reference;
-    EXPECT_EQ(vernonRuntimePipelineEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
-    ASSERT_EQ(vernonRhiDeviceDestroySampler(rhiRuntime(other).device, foreignSampler.handle), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(destroy(other), VERNON_STATUS_OK);
 
     ASSERT_EQ(vernonRhiCommandEncoderEndRendering(rhiRuntime(gl).device, encoder), VERNON_RHI_STATUS_OK);
     VernonRhiCommandEncoderStats encoderStats{};
@@ -1441,6 +1531,7 @@ TEST(RuntimeExternalGl, SuppliesImplicitSamplerAndEffectiveResolution) {
     ASSERT_EQ(vernonRhiDeviceDestroyCommandEncoder(rhiRuntime(gl).device, encoder), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroySampler(rhiRuntime(gl).device, replacementSampler.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, replacementSampled.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, targetView.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, target.handle), VERNON_RHI_STATUS_OK);
     RhiImage recycledSampled = importOpenGLTexture2D(gl, 10, 4, 4, VERNON_TEXTURE_RGBA8_UNORM);
     auto recycledSampler = vernon::tests::createSampler(rhiRuntime(gl));
@@ -1461,9 +1552,11 @@ TEST(RuntimeExternalGl, ExecutionGraphFusesDrawsAndSubmitsOnce) {
         vernonRuntimeLoadPipelineBundleWithOptions(gl, bundleData.data(), bundleData.size(), nullptr);
     ASSERT_TRUE(bundle);
     VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
-    ASSERT_TRUE(pipeline);
+    ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
     RhiImage sampled = importOpenGLTexture2D(gl, 8, 4, 4, VERNON_TEXTURE_RGBA8_UNORM);
     RhiImage target = importOpenGLTexture2D(gl, 7, 16, 12, VERNON_TEXTURE_RGBA8_UNORM);
+    const auto sampledView =
+        vernon::tests::createImageView(rhiRuntime(gl), sampled, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
     auto sampler = vernon::tests::createSampler(rhiRuntime(gl));
     ASSERT_NE(sampled.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
@@ -1471,10 +1564,15 @@ TEST(RuntimeExternalGl, ExecutionGraphFusesDrawsAndSubmitsOnce) {
 
     VernonPipelineArgument argument{};
     argument.slot = 0;
-    argument.kind = VERNON_PIPELINE_TEXTURE;
-    argument.texture = {VERNON_TEXTURE_RGBA8_UNORM, VERNON_ACCESS_READ, VERNON_TEXTURE_2D, 4, 4, 1,
-                        sampled.reference,          sampler.reference};
-    VernonColorAttachment attachment{0, target.reference, 16, 12, VERNON_TEXTURE_RGBA8_UNORM};
+    argument.kind = VERNON_PIPELINE_IMAGE;
+    argument.image = {sampledView.reference};
+    VernonRhiImageViewDescriptor targetViewDescriptor = fullImageView(target, VERNON_RHI_FORMAT_RGBA8_UNORM);
+    VernonRhiImageView targetView{};
+    ASSERT_EQ(vernonRhiDeviceCreateImageView(rhiRuntime(gl).device, &targetViewDescriptor, &targetView),
+              VERNON_RHI_STATUS_OK);
+    VernonColorAttachment attachment{};
+    attachment.location = 0;
+    ASSERT_EQ(vernonRuntimeReferenceRhiImageView(gl, targetView, &attachment.view), VERNON_STATUS_OK);
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
@@ -1492,8 +1590,8 @@ TEST(RuntimeExternalGl, ExecutionGraphFusesDrawsAndSubmitsOnce) {
         framebufferBindCount = 0;
         const size_t commandsBeforeGraph = vernon::runtime::getRhiAdapterRecordedCommandCount(gl);
         vernon::execution::ExecutionGraph graph(rhiRuntime(gl).device);
-        const auto graphTarget = graph.importImage(target.handle, {target.handle.index, target.handle.generation},
-                                                   VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 12, 1, 1, true);
+        const auto graphTarget = graph.importImage(target.handle, targetView, true);
+        ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, targetView), VERNON_RHI_STATUS_OK);
         ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, target.handle), VERNON_RHI_STATUS_OK);
         EXPECT_EQ(vernonRhiDeviceIsImageValid(rhiRuntime(gl).device, target.handle), 0u);
         RhiImage replacement = importOpenGLTexture2D(gl, 11, 16, 12, VERNON_TEXTURE_RGBA8_UNORM);
@@ -1520,13 +1618,14 @@ TEST(RuntimeExternalGl, ExecutionGraphFusesDrawsAndSubmitsOnce) {
     EXPECT_NE(recycled.handle.generation, target.handle.generation);
     ASSERT_EQ(vernonRhiDeviceDestroySampler(rhiRuntime(gl).device, sampler.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, recycled.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, sampledView.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, sampled.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     vernonRuntimePipelineBundleDestroy(bundle);
     ASSERT_EQ(destroy(gl), VERNON_STATUS_OK);
 }
 
-TEST(RuntimeExternalGl, ExplicitSamplerOverridesTextureViewSampler) {
+TEST(RuntimeExternalGl, BindsExplicitSamplerSeparately) {
     boundSamplerName = UINT32_MAX;
     VernonRuntimeContext *gl = create(VERNON_RUNTIME_OPENGL, 4, 3);
     ASSERT_TRUE(gl);
@@ -1535,27 +1634,28 @@ TEST(RuntimeExternalGl, ExplicitSamplerOverridesTextureViewSampler) {
         vernonRuntimeLoadPipelineBundleWithOptions(gl, bundleData.data(), bundleData.size(), nullptr);
     ASSERT_TRUE(bundle);
     VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
-    ASSERT_TRUE(pipeline);
+    ASSERT_TRUE(pipeline) << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
     ASSERT_EQ(vernonRuntimeLoadedPipelineGetParameterCount(pipeline), 2u);
 
     RhiImage sampled = importOpenGLTexture2D(gl, 8, 4, 4, VERNON_TEXTURE_RGBA8_UNORM);
     RhiImage target = importOpenGLTexture2D(gl, 7, 16, 12, VERNON_TEXTURE_RGBA8_UNORM);
-    auto textureSampler = vernon::tests::createSampler(rhiRuntime(gl));
+    const auto sampledView =
+        vernon::tests::createImageView(rhiRuntime(gl), sampled, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
+    const auto targetView =
+        vernon::tests::createImageView(rhiRuntime(gl), target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
     auto explicitSampler = vernon::tests::createSampler(rhiRuntime(gl));
     ASSERT_NE(sampled.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    ASSERT_NE(textureSampler.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     ASSERT_NE(explicitSampler.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
 
     VernonPipelineArgument arguments[2]{};
     arguments[0].slot = 0;
-    arguments[0].kind = VERNON_PIPELINE_TEXTURE;
-    arguments[0].texture = {VERNON_TEXTURE_RGBA8_UNORM, VERNON_ACCESS_READ,      VERNON_TEXTURE_2D, 4, 4, 1,
-                            sampled.reference,          textureSampler.reference};
+    arguments[0].kind = VERNON_PIPELINE_IMAGE;
+    arguments[0].image = {sampledView.reference};
     arguments[1].slot = 1;
     arguments[1].kind = VERNON_PIPELINE_SAMPLER;
     arguments[1].resource = explicitSampler.reference;
-    VernonColorAttachment attachment{0, target.reference, 16, 12, VERNON_TEXTURE_RGBA8_UNORM};
+    VernonColorAttachment attachment{0, targetView.reference};
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
@@ -1570,7 +1670,8 @@ TEST(RuntimeExternalGl, ExplicitSamplerOverridesTextureViewSampler) {
     EXPECT_NE(boundSamplerName, 0u);
 
     ASSERT_EQ(vernonRhiDeviceDestroySampler(rhiRuntime(gl).device, explicitSampler.handle), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDestroySampler(rhiRuntime(gl).device, textureSampler.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, targetView.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, sampledView.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, target.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, sampled.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
@@ -1599,6 +1700,8 @@ TEST(RuntimeExternalGl, BindsVertexAndIndexBuffersThroughRhi) {
     auto vertices = vernon::tests::createBuffer(rhiRuntime(gl), 36, alignof(float), VERNON_RHI_BUFFER_VERTEX);
     auto indices = vernon::tests::createBuffer(rhiRuntime(gl), 12, alignof(uint32_t), VERNON_RHI_BUFFER_INDEX);
     RhiImage target = importOpenGLTexture2D(gl, 7, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
+    const auto targetView =
+        vernon::tests::createImageView(rhiRuntime(gl), target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
     ASSERT_NE(vertices.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     ASSERT_NE(indices.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
@@ -1617,7 +1720,7 @@ TEST(RuntimeExternalGl, BindsVertexAndIndexBuffersThroughRhi) {
     argument.tensor.byte_strides = strides;
     argument.tensor.byte_size = 36;
     const VernonIndexBinding indexBinding{VERNON_INDEX_U32, 0, 3, indices.reference};
-    const VernonColorAttachment attachment{0, target.reference, 16, 16, VERNON_TEXTURE_RGBA8_UNORM};
+    const VernonColorAttachment attachment{0, targetView.reference};
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
@@ -1649,6 +1752,7 @@ TEST(RuntimeExternalGl, BindsVertexAndIndexBuffersThroughRhi) {
     EXPECT_EQ(indexedDrawCount, 3);
     EXPECT_EQ(drawCount, 1u);
 
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, targetView.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, target.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyBuffer(rhiRuntime(gl).device, indices.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyBuffer(rhiRuntime(gl).device, vertices.handle), VERNON_RHI_STATUS_OK);
@@ -1686,6 +1790,8 @@ TEST(RuntimeExternalGl, BindsAllFormalVertexNumericFormatsAndRejectsUnsupportedF
         const uint32_t stride = 3 * format.size;
         auto vertices = vernon::tests::createBuffer(rhiRuntime(gl), 3 * stride, format.size, VERNON_RHI_BUFFER_VERTEX);
         RhiImage target = importOpenGLTexture2D(gl, 8, 16, 16, VERNON_TEXTURE_RGBA8_UNORM);
+        const auto targetView =
+            vernon::tests::createImageView(rhiRuntime(gl), target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
         ASSERT_NE(vertices.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
         ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
         const uint64_t shape[2] = {3, 3};
@@ -1701,7 +1807,7 @@ TEST(RuntimeExternalGl, BindsAllFormalVertexNumericFormatsAndRejectsUnsupportedF
         argument.tensor.shape = shape;
         argument.tensor.byte_strides = strides;
         argument.tensor.byte_size = 3 * stride;
-        const VernonColorAttachment attachment{0, target.reference, 16, 16, VERNON_TEXTURE_RGBA8_UNORM};
+        const VernonColorAttachment attachment{0, targetView.reference};
         VernonPipelineInvocation invocation{};
         invocation.struct_size = sizeof(invocation);
         invocation.abi_version = VERNON_PIPELINE_VERSION;
@@ -1717,6 +1823,7 @@ TEST(RuntimeExternalGl, BindsAllFormalVertexNumericFormatsAndRejectsUnsupportedF
         EXPECT_EQ(vertexAttributePointerKind, format.pointerKind);
         EXPECT_EQ(vertexAttributeStride, static_cast<GlSize>(stride));
 
+        ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, targetView.handle), VERNON_RHI_STATUS_OK);
         ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, target.handle), VERNON_RHI_STATUS_OK);
         ASSERT_EQ(vernonRhiDeviceDestroyBuffer(rhiRuntime(gl).device, vertices.handle), VERNON_RHI_STATUS_OK);
         vernonRuntimeLoadedPipelineDestroy(pipeline);
@@ -1778,20 +1885,22 @@ TEST(RuntimeExternalGl, LoadsAssetsAndInvokesPipeline) {
     RhiImage depthStencil =
         vernon::tests::createImage(rhiRuntime(gl), VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, 16, 16, 1,
                                    VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT);
+    const auto targetView =
+        vernon::tests::createImageView(rhiRuntime(gl), target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
+    const auto depthStencilView = vernon::tests::createImageView(
+        rhiRuntime(gl), depthStencil, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, 1, 1,
+        VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL);
     ASSERT_NE(depthStencil.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     RhiImage cube = vernon::tests::createImage(rhiRuntime(gl), VERNON_RHI_IMAGE_CUBE, VERNON_RHI_FORMAT_RGBA16_FLOAT,
                                                32, 32, 1, VERNON_RHI_IMAGE_SAMPLED, 6);
     ASSERT_NE(cube.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     auto sampler = vernon::tests::createSampler(rhiRuntime(gl));
     ASSERT_NE(sampler.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    VernonColorAttachment attachment{0, target.reference, 16, 16, VERNON_TEXTURE_RGBA8_UNORM};
+    VernonColorAttachment attachment{0, targetView.reference};
     attachment.clear_color[0] = 0.25f;
     attachment.clear_color[1] = 0.5f;
     VernonDepthAttachment depthAttachment{};
-    depthAttachment.resource = depthStencil.reference;
-    depthAttachment.width = 16;
-    depthAttachment.height = 16;
-    depthAttachment.format = VERNON_TEXTURE_D32_FLOAT_S8_UINT;
+    depthAttachment.view = depthStencilView.reference;
     depthAttachment.clear_depth = 1.0f;
     VernonColorBlendState blend{};
     blend.blend_enabled = 1;
@@ -1832,11 +1941,11 @@ TEST(RuntimeExternalGl, LoadsAssetsAndInvokesPipeline) {
     invocation.instance_count = 1;
     const GlUint nextNameAfterPreparation = nextName;
     ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
-    attachment.load_operation = VERNON_RHI_LOAD_PRESERVE;
-    attachment.store_operation = VERNON_RHI_STORE_DISCARD;
-    depthAttachment.load_operation = VERNON_RHI_LOAD_PRESERVE;
-    depthAttachment.stencil_load_operation = VERNON_RHI_LOAD_PRESERVE;
-    depthAttachment.stencil_store_operation = VERNON_RHI_STORE_DISCARD;
+    attachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
+    attachment.store_operation = VERNON_RUNTIME_PROVIDER_STORE_DISCARD;
+    depthAttachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
+    depthAttachment.stencil_load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
+    depthAttachment.stencil_store_operation = VERNON_RUNTIME_PROVIDER_STORE_DISCARD;
     // The host may change OpenGL state between command encoders, so each invocation must restore its bindings.
     ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
     ASSERT_TRUE(drawCount == 2);
@@ -1863,6 +1972,8 @@ TEST(RuntimeExternalGl, LoadsAssetsAndInvokesPipeline) {
     EXPECT_EQ(blendOperations, (std::array<GlEnum, 2>{kAdd, kAdd}));
     EXPECT_EQ(colorWriteMask, (std::array<GlBoolean, 4>{1, 1, 0, 0}));
     ASSERT_TRUE(nextName == nextNameAfterPreparation);
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, depthStencilView.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, targetView.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, target.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, depthStencil.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, cube.handle), VERNON_RHI_STATUS_OK);

@@ -96,8 +96,8 @@ TEST(CudaRhiAdapter, PreparesAndDispatchesThroughRuntimeCore) {
     VernonRuntimeProviderBindingValue value{};
     value.slot = 0;
     value.kind = VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-    value.inline_data = &factor;
-    value.inline_size = sizeof(factor);
+    value.payload.inline_value.data = &factor;
+    value.payload.inline_value.size = sizeof(factor);
     VernonRuntimeCoreBindings *bindings = nullptr;
     ASSERT_EQ(vernonRuntimeCoreCreateBindings(pipeline, &value, 1, &bindings), VERNON_STATUS_OK);
     VernonRhiCommandEncoderDescriptor encoderDescriptor{};

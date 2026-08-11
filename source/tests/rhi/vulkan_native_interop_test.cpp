@@ -156,6 +156,7 @@ TEST(VulkanOwnedDevice, TransitionsPackedDepthStencilImageWithBothAspects) {
     barrier.new_state = VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT;
     barrier.image = image;
     barrier.is_image = 1;
+    barrier.image_subresources = {0, 1, 0, 1, VERNON_RHI_IMAGE_ASPECT_DEPTH};
     EXPECT_EQ(vernonRhiCommandEncoderBarrier(device, encoder, &barrier, 1), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceSubmit(device, encoder), VERNON_RHI_STATUS_OK);
@@ -238,9 +239,11 @@ TEST(VulkanNativeInterop, BorrowsObjectsWithoutOwningTheirLifetime) {
     imageViewDescriptor.image_view = handleBits(image.view);
     imageViewDescriptor.descriptor.struct_size = sizeof(imageViewDescriptor.descriptor);
     imageViewDescriptor.descriptor.image = importedImage;
+    imageViewDescriptor.descriptor.dimension = VERNON_RHI_IMAGE_2D;
     imageViewDescriptor.descriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
     imageViewDescriptor.descriptor.mip_level_count = 1;
     imageViewDescriptor.descriptor.array_layer_count = 1;
+    imageViewDescriptor.descriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
     VernonRhiImageView importedImageView{};
     ASSERT_EQ(vernonRhiVulkanDeviceImportBorrowedImageView(device, &imageViewDescriptor, &importedImageView),
               VERNON_RHI_STATUS_OK);
@@ -258,9 +261,9 @@ TEST(VulkanNativeInterop, BorrowsObjectsWithoutOwningTheirLifetime) {
     EXPECT_EQ(vernonRhiDeviceGetImageViewNativeHandle(device, importedImageView, &nativeBits), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(nativeBits, handleBits(image.view));
 
-    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, importedImage), VERNON_RHI_STATUS_INVALID_ARGUMENT);
-    EXPECT_EQ(vernonRhiDeviceDestroyImageView(device, importedImageView), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, importedImage), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImageView(device, importedImageView), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, importedImage), VERNON_RHI_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, importedBuffer), VERNON_RHI_STATUS_OK);
     vernonRhiDestroyDevice(device);
 

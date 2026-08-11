@@ -13,6 +13,9 @@
 namespace vernon::execution {
 
 class ExecutionGraph;
+namespace detail {
+struct ExecutionGraphTestAccess;
+}
 
 enum class ResourceKind : uint8_t { Buffer, Image };
 enum class AccessMode : uint8_t { Read, Write, ReadWrite };
@@ -35,15 +38,20 @@ struct GraphImage : GraphResource {
     uint32_t height{};
     uint32_t layers{1};
     uint32_t samples{1};
+    VernonRhiImageSubresourceRange subresources{0, UINT32_MAX, 0, UINT32_MAX, VERNON_RHI_IMAGE_ASPECT_COLOR};
 };
 
 enum PassFlagBits : uint32_t { PassNone = 0, PassNeverCull = 1u << 0, PassNoMerge = 1u << 1, PassSideEffect = 1u << 2 };
+
+enum class ImageUseRole : uint8_t { None, Sampled, Storage, ColorAttachment, DepthAttachment, Transfer };
 
 struct ResourceUse {
     GraphResource resource;
     AccessMode access{AccessMode::Read};
     VernonRhiResourceState state{VERNON_RHI_STATE_COMMON};
     uint32_t stageMask{};
+    ImageUseRole imageRole{ImageUseRole::None};
+    VernonRhiImageSubresourceRange imageSubresources{};
 };
 
 struct ColorAttachmentUse {
@@ -120,9 +128,14 @@ public:
 protected:
     void read(GraphResource resource, VernonRhiResourceState state = VERNON_RHI_STATE_SHADER_READ,
               uint32_t stageMask = 0);
+    void read(GraphImage resource, VernonRhiResourceState state = VERNON_RHI_STATE_SHADER_READ, uint32_t stageMask = 0);
     void write(GraphResource resource, VernonRhiResourceState state = VERNON_RHI_STATE_SHADER_WRITE,
                uint32_t stageMask = 0);
+    void write(GraphImage resource, VernonRhiResourceState state = VERNON_RHI_STATE_SHADER_WRITE,
+               uint32_t stageMask = 0);
     void readWrite(GraphResource resource, VernonRhiResourceState state = VERNON_RHI_STATE_SHADER_WRITE,
+                   uint32_t stageMask = 0);
+    void readWrite(GraphImage resource, VernonRhiResourceState state = VERNON_RHI_STATE_SHADER_WRITE,
                    uint32_t stageMask = 0);
 
 private:
@@ -203,8 +216,7 @@ public:
                                  bool exported = false);
     GraphBuffer importHostBuffer(uint64_t identity, bool exported = false);
     GraphBuffer importBuffer(VernonRhiBuffer buffer, bool exported = false);
-    GraphImage importImage(VernonRhiImage image, VernonRhiImageView view, VernonRhiFormat format, uint32_t width,
-                           uint32_t height, uint32_t layers = 1, uint32_t samples = 1, bool exported = false);
+    GraphImage importImage(VernonRhiImage image, VernonRhiImageView view, bool exported = false);
     bool compile(std::string &error);
     bool validate(std::string &error) const;
     VernonRhiStatus execute();
@@ -215,11 +227,13 @@ public:
 
 private:
     friend class ExecutionPass;
+    friend struct detail::ExecutionGraphTestAccess;
     struct ResourceRecord {
         GraphResource resource;
         bool exported{};
         bool graphOwned{};
         uint64_t resourceKey{};
+        std::vector<uint64_t> imageViewKeys;
         VernonRhiBuffer buffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
         VernonRhiImage image{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     };

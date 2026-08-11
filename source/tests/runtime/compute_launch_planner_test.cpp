@@ -110,9 +110,11 @@ TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
     ASSERT_EQ(plan.arguments.size(), 3u);
     ASSERT_EQ(plan.hostTensorStorage.size(), 2u);
     const std::array<float, 2> expectedPacked{1, 2};
-    EXPECT_EQ(std::memcmp(plan.arguments[0].scalarData, expectedPacked.data(), sizeof(expectedPacked)), 0);
-    EXPECT_EQ(plan.arguments[1].scalarData, nullptr);
-    EXPECT_EQ(std::memcmp(plan.arguments[2].scalarData, contiguousValues.data(), sizeof(contiguousValues)), 0);
+    const auto &first = std::get<ComputeScalarArgument>(plan.arguments[0]);
+    EXPECT_EQ(std::memcmp(first.data, expectedPacked.data(), sizeof(expectedPacked)), 0);
+    EXPECT_TRUE(std::holds_alternative<ComputeTensorArgument>(plan.arguments[1]));
+    const auto &third = std::get<ComputeScalarArgument>(plan.arguments[2]);
+    EXPECT_EQ(std::memcmp(third.data, contiguousValues.data(), sizeof(contiguousValues)), 0);
     EXPECT_EQ(plan.grid.x, 4u);
     EXPECT_EQ(plan.grid.y, 1u);
     EXPECT_EQ(plan.grid.z, 1u);
@@ -153,8 +155,9 @@ TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
     std::string error;
     ASSERT_TRUE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error)) << error;
     ASSERT_EQ(plan.arguments.size(), 1u);
-    EXPECT_EQ(plan.arguments[0].resource.identity, resource.identity);
-    EXPECT_EQ(plan.arguments[0].resource.resource.value, resource.resource.value);
+    const auto &firstPlan = std::get<ComputeTensorArgument>(plan.arguments[0]);
+    EXPECT_EQ(firstPlan.resource.identity, resource.identity);
+    EXPECT_EQ(firstPlan.resource.resource.value, resource.resource.value);
     EXPECT_EQ(plan.grid.x, 3u);
     EXPECT_EQ(plan.grid.y, 2u);
     EXPECT_EQ(plan.grid.z, 1u);
@@ -165,7 +168,7 @@ TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
     supplied.tensor.byte_strides = secondStrides.data();
     supplied.tensor.byte_offset = 0;
     ASSERT_TRUE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error)) << error;
-    ASSERT_TRUE(plan.arguments[0].tensorView);
+    ASSERT_TRUE(std::get<ComputeTensorArgument>(plan.arguments[0]).tensorView);
     EXPECT_EQ(*computeBindingDescriptorValue(plan.arguments[0], {ComputeBindingSourceKind::TensorExtent, 0, 1}), 4);
     EXPECT_EQ(*computeBindingDescriptorValue(plan.arguments[0], {ComputeBindingSourceKind::TensorStride, 0, 0}), 4);
 

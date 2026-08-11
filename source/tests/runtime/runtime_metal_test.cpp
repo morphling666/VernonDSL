@@ -219,11 +219,13 @@ TEST(RuntimeMetal, CreatesImageViewsAndRetainsTheirParentImage) {
     VernonRhiImageViewDescriptor viewDescriptor{};
     viewDescriptor.struct_size = sizeof(viewDescriptor);
     viewDescriptor.image = image;
+    viewDescriptor.dimension = VERNON_RHI_IMAGE_2D;
     viewDescriptor.format = VERNON_RHI_FORMAT_RGBA8_SRGB;
     viewDescriptor.base_mip_level = 1;
     viewDescriptor.mip_level_count = 2;
     viewDescriptor.base_array_layer = 0;
     viewDescriptor.array_layer_count = 1;
+    viewDescriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
     VernonRhiImageView view{};
     ASSERT_EQ(vernonRhiDeviceCreateImageView(device, &viewDescriptor, &view), VERNON_RHI_STATUS_OK);
     uint64_t native = 0;
@@ -313,6 +315,7 @@ TEST(RuntimeMetal, ValidatesAndRecordsHazardTrackedBarriers) {
     barriers[1] = barriers[0];
     barriers[1].image = image;
     barriers[1].is_image = 1;
+    barriers[1].image_subresources = {0, 1, 0, 1, VERNON_RHI_IMAGE_ASPECT_COLOR};
     VernonRhiBarrier invalid = barriers[0];
     invalid.destination_stage_mask = uint32_t{1} << 31;
     EXPECT_EQ(vernonRhiCommandEncoderBarrier(device, encoder, &invalid, 1), VERNON_RHI_STATUS_INVALID_ARGUMENT);
@@ -556,11 +559,11 @@ kernel void add_value(constant AddArguments &arguments [[buffer(0)]],
     std::array<VernonRuntimeProviderBindingValue, 2> values{};
     values[0].slot = 0;
     values[0].kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
-    values[0].resource = bufferReference;
+    values[0].payload.buffer.resource = bufferReference;
     values[1].slot = 1;
     values[1].kind = VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-    values[1].inline_data = &amount;
-    values[1].inline_size = sizeof(amount);
+    values[1].payload.inline_value.data = &amount;
+    values[1].payload.inline_value.size = sizeof(amount);
     VernonRuntimeProviderBindingSetDescriptor bindingDescriptor{};
     bindingDescriptor.struct_size = sizeof(bindingDescriptor);
     bindingDescriptor.layout = layout;
@@ -569,7 +572,7 @@ kernel void add_value(constant AddArguments &arguments [[buffer(0)]],
     VernonRuntimeProviderObject bindings{};
     ASSERT_EQ(provider->create_binding_set(provider->user_data, &bindingDescriptor, &bindings), VERNON_STATUS_OK);
     auto invalidValues = values;
-    invalidValues[1].inline_size = 0;
+    invalidValues[1].payload.inline_value.size = 0;
     EXPECT_EQ(provider->update_binding_set(provider->user_data, bindings, invalidValues.data(), invalidValues.size()),
               VERNON_STATUS_INVALID_ARGUMENT);
 
@@ -703,7 +706,7 @@ TEST(RuntimeMetal, ProviderBindsMoreThanThirtyBuffersAcrossDescriptorSetsAndReta
             VERNON_STATUS_OK);
         values[index].slot = index;
         values[index].kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
-        values[index].resource = references[index];
+        values[index].payload.buffer.resource = references[index];
     }
     VernonRuntimeProviderBindingSetDescriptor bindingDescriptor{};
     bindingDescriptor.struct_size = sizeof(bindingDescriptor);
@@ -732,7 +735,7 @@ TEST(RuntimeMetal, ProviderBindsMoreThanThirtyBuffersAcrossDescriptorSetsAndReta
     ASSERT_EQ(vernonRhiDeviceUploadBuffer(device, replacement, 0, &replacementValue, sizeof(replacementValue)),
               VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRuntimeRhiAdapterReferenceBuffer(adapter, replacement, 0, sizeof(replacementValue),
-                                                     &values.back().resource),
+                                                     &values.back().payload.buffer.resource),
               VERNON_STATUS_OK);
     ASSERT_EQ(provider->update_binding_set(provider->user_data, bindings, values.data(), values.size()),
               VERNON_STATUS_OK);
@@ -851,13 +854,14 @@ kernel void copy_texture(constant TextureArguments &arguments [[buffer(0)]]) {
     std::array<VernonRuntimeProviderBindingValue, 3> values{};
     values[0].slot = 0;
     values[0].kind = VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE;
-    ASSERT_EQ(vernonRuntimeRhiAdapterReferenceImage(adapter, input, &values[0].resource), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeRhiAdapterReferenceImage(adapter, input, &values[0].payload.image.view), VERNON_STATUS_OK);
     values[1].slot = 1;
     values[1].kind = VERNON_RUNTIME_PROVIDER_SAMPLER;
-    ASSERT_EQ(vernonRuntimeRhiAdapterReferenceSampler(adapter, sampler, &values[1].resource), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeRhiAdapterReferenceSampler(adapter, sampler, &values[1].payload.sampler.resource),
+              VERNON_STATUS_OK);
     values[2].slot = 2;
     values[2].kind = VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE;
-    ASSERT_EQ(vernonRuntimeRhiAdapterReferenceImage(adapter, output, &values[2].resource), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeRhiAdapterReferenceImage(adapter, output, &values[2].payload.image.view), VERNON_STATUS_OK);
     VernonRuntimeProviderBindingSetDescriptor bindingDescriptor{};
     bindingDescriptor.struct_size = sizeof(bindingDescriptor);
     bindingDescriptor.layout = layout;
@@ -1005,13 +1009,15 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     VernonRhiImageViewDescriptor viewDescriptor{};
     viewDescriptor.struct_size = sizeof(viewDescriptor);
     viewDescriptor.image = image;
+    viewDescriptor.dimension = VERNON_RHI_IMAGE_2D;
     viewDescriptor.format = imageDescriptor.format;
     viewDescriptor.mip_level_count = 1;
     viewDescriptor.array_layer_count = 1;
+    viewDescriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
     VernonRhiImageView view{};
     ASSERT_EQ(vernonRhiDeviceCreateImageView(device, &viewDescriptor, &view), VERNON_RHI_STATUS_OK);
     VernonRuntimeProviderResourceReference imageReference{};
-    ASSERT_EQ(vernonRuntimeRhiAdapterReferenceImage(adapter, image, &imageReference), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeRhiAdapterReferenceImageView(adapter, view, &imageReference), VERNON_STATUS_OK);
     VernonRuntimeProviderResourceReference secondImageReference{};
     ASSERT_EQ(vernonRuntimeRhiAdapterReferenceImage(adapter, secondImage, &secondImageReference), VERNON_STATUS_OK);
     VernonRhiImageDescriptor depthDescriptor = imageDescriptor;
@@ -1021,10 +1027,11 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     ASSERT_EQ(vernonRhiDeviceCreateImage(device, &depthDescriptor, &depthImage), VERNON_RHI_STATUS_OK);
     viewDescriptor.image = depthImage;
     viewDescriptor.format = depthDescriptor.format;
+    viewDescriptor.aspects = VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL;
     VernonRhiImageView depthView{};
     ASSERT_EQ(vernonRhiDeviceCreateImageView(device, &viewDescriptor, &depthView), VERNON_RHI_STATUS_OK);
     VernonRuntimeProviderResourceReference depthReference{};
-    ASSERT_EQ(vernonRuntimeRhiAdapterReferenceImage(adapter, depthImage, &depthReference), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeRhiAdapterReferenceImageView(adapter, depthView, &depthReference), VERNON_STATUS_OK);
 
     VernonRhiCommandEncoderDescriptor commandDescriptor{};
     commandDescriptor.struct_size = sizeof(commandDescriptor);
@@ -1078,9 +1085,9 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
               VERNON_STATUS_INVALID_ARGUMENT);
     ASSERT_EQ(vernonRhiCommandEncoderBeginRendering(device, command, &rendering), VERNON_RHI_STATUS_OK);
     VernonRuntimeProviderColorAttachment attachment{};
-    attachment.image = imageReference;
-    attachment.load_operation = VERNON_RHI_LOAD_CLEAR;
-    attachment.store_operation = VERNON_RHI_STORE_PRESERVE;
+    attachment.view = imageReference;
+    attachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
+    attachment.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
     VernonRuntimeProviderDrawDescriptor draw{};
     draw.struct_size = sizeof(draw);
     draw.pipeline = pipeline;
@@ -1088,12 +1095,12 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     draw.instance_count = 1;
     draw.color_attachments = &attachment;
     draw.color_attachment_count = 1;
-    draw.depth_stencil_attachment = depthReference;
-    draw.depth_load_operation = VERNON_RHI_LOAD_CLEAR;
-    draw.depth_store_operation = VERNON_RHI_STORE_PRESERVE;
+    draw.depth_stencil_view = depthReference;
+    draw.depth_load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
+    draw.depth_store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
     draw.clear_depth = 1.0f;
-    draw.stencil_load_operation = VERNON_RHI_LOAD_CLEAR;
-    draw.stencil_store_operation = VERNON_RHI_STORE_PRESERVE;
+    draw.stencil_load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
+    draw.stencil_store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
     draw.clear_stencil = 7;
     draw.stencil_reference = 7;
     draw.viewport[2] = imageDescriptor.width;
@@ -1111,9 +1118,9 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     const auto drawStats = vernon::runtime::getRhiAdapterPreparationStats(*adapter);
     EXPECT_EQ(drawStats.lastStencilReference, 7u);
     EXPECT_FALSE(drawStats.lastDrawIndexed);
-    attachment.image = secondImageReference;
+    attachment.view = secondImageReference;
     EXPECT_EQ(provider->encode_draw(provider->user_data, providerCommand, &draw), VERNON_STATUS_INVALID_ARGUMENT);
-    attachment.image = imageReference;
+    attachment.view = imageReference;
     constexpr float explicitClear[]{0, 0, 0, 1};
     EXPECT_EQ(vernonRhiCommandEncoderClearColorAttachment(device, command, 0, explicitClear), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiCommandEncoderClearDepthStencilAttachment(
@@ -1324,8 +1331,18 @@ TEST(RuntimeMetal, PublicRuntimeBindsCookedResolutionUniform) {
     targetDescriptor.usage = VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE;
     VernonRhiImage target{};
     ASSERT_EQ(vernonRhiDeviceCreateImage(device, &targetDescriptor, &target), VERNON_RHI_STATUS_OK);
+    VernonRhiImageViewDescriptor targetViewDescriptor{};
+    targetViewDescriptor.struct_size = sizeof(targetViewDescriptor);
+    targetViewDescriptor.image = target;
+    targetViewDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    targetViewDescriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    targetViewDescriptor.mip_level_count = 1;
+    targetViewDescriptor.array_layer_count = 1;
+    targetViewDescriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
+    VernonRhiImageView targetView{};
+    ASSERT_EQ(vernonRhiDeviceCreateImageView(device, &targetViewDescriptor, &targetView), VERNON_RHI_STATUS_OK);
     VernonRuntimeProviderResourceReference targetReference{};
-    ASSERT_EQ(vernonRuntimeReferenceRhiImage(runtime, target, &targetReference), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeReferenceRhiImageView(runtime, targetView, &targetReference), VERNON_STATUS_OK);
 
     constexpr uint64_t shape[]{3, 2};
     constexpr int64_t strides[]{2 * sizeof(float), sizeof(float)};
@@ -1341,7 +1358,7 @@ TEST(RuntimeMetal, PublicRuntimeBindsCookedResolutionUniform) {
     position.tensor.shape = shape;
     position.tensor.byte_strides = strides;
     position.tensor.byte_size = sizeof(positions);
-    VernonColorAttachment attachment{0, targetReference, 32, 32, VERNON_TEXTURE_RGBA8_UNORM};
+    VernonColorAttachment attachment{0, targetReference};
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
@@ -1367,6 +1384,7 @@ TEST(RuntimeMetal, PublicRuntimeBindsCookedResolutionUniform) {
     EXPECT_GT(pixels[center], 250);
     EXPECT_GT(pixels[center + 1], 250);
 
+    EXPECT_EQ(vernonRhiDeviceDestroyImageView(device, targetView), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, target), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, vertices), VERNON_RHI_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
@@ -1451,8 +1469,18 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
                                           VERNON_RHI_IMAGE_DATA_UINT8,
                                           sampledPixel};
     ASSERT_EQ(vernonRhiDeviceUploadImage(device, sampled, &upload, 1), VERNON_RHI_STATUS_OK);
+    VernonRhiImageViewDescriptor sampledViewDescriptor{};
+    sampledViewDescriptor.struct_size = sizeof(sampledViewDescriptor);
+    sampledViewDescriptor.image = sampled;
+    sampledViewDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    sampledViewDescriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    sampledViewDescriptor.mip_level_count = 1;
+    sampledViewDescriptor.array_layer_count = 1;
+    sampledViewDescriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
+    VernonRhiImageView sampledView{};
+    ASSERT_EQ(vernonRhiDeviceCreateImageView(device, &sampledViewDescriptor, &sampledView), VERNON_RHI_STATUS_OK);
     VernonRuntimeProviderResourceReference sampledReference{};
-    ASSERT_EQ(vernonRuntimeReferenceRhiImage(runtime, sampled, &sampledReference), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeReferenceRhiImageView(runtime, sampledView, &sampledReference), VERNON_STATUS_OK);
 
     VernonRhiSamplerDescriptor samplerDescriptor{};
     samplerDescriptor.struct_size = sizeof(samplerDescriptor);
@@ -1471,16 +1499,19 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
         VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION;
     VernonRhiImage target{};
     ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &target), VERNON_RHI_STATUS_OK);
+    VernonRhiImageViewDescriptor targetViewDescriptor = sampledViewDescriptor;
+    targetViewDescriptor.image = target;
+    VernonRhiImageView targetView{};
+    ASSERT_EQ(vernonRhiDeviceCreateImageView(device, &targetViewDescriptor, &targetView), VERNON_RHI_STATUS_OK);
     VernonRuntimeProviderResourceReference targetReference{};
-    ASSERT_EQ(vernonRuntimeReferenceRhiImage(runtime, target, &targetReference), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeReferenceRhiImageView(runtime, targetView, &targetReference), VERNON_STATUS_OK);
 
     constexpr uint64_t shape[]{3, 2};
     constexpr int64_t strides[]{2 * sizeof(float), sizeof(float)};
     VernonPipelineArgument arguments[3]{};
     arguments[0].slot = imageParameter.slot;
-    arguments[0].kind = VERNON_PIPELINE_TEXTURE;
-    arguments[0].texture = {VERNON_TEXTURE_RGBA8_UNORM, VERNON_ACCESS_READ, VERNON_TEXTURE_2D, 1, 1, 1,
-                            sampledReference,           samplerReference};
+    arguments[0].kind = VERNON_PIPELINE_IMAGE;
+    arguments[0].image = {sampledReference};
     arguments[1].slot = samplerParameter.slot;
     arguments[1].kind = VERNON_PIPELINE_SAMPLER;
     arguments[1].resource = samplerReference;
@@ -1506,7 +1537,7 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
     VernonRuntimeProviderResourceReference indexReference{};
     ASSERT_EQ(vernonRuntimeReferenceRhiBuffer(runtime, indexBuffer, 0, sizeof(indices), &indexReference),
               VERNON_STATUS_OK);
-    VernonColorAttachment attachment{0, targetReference, 32, 32, VERNON_TEXTURE_RGBA8_UNORM};
+    VernonColorAttachment attachment{0, targetReference};
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
@@ -1563,8 +1594,7 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
     };
     auto executeGraph = [&](uint32_t passCount) {
         vernon::execution::ExecutionGraph graph(device);
-        const auto graphTarget = graph.importImage(target, {target.index, target.generation},
-                                                   VERNON_RHI_FORMAT_RGBA8_UNORM, 32, 32, 1, 1, true);
+        const auto graphTarget = graph.importImage(target, targetView, true);
         for (uint32_t pass = 0; pass < passCount; ++pass)
             graph.emplacePass<vernon::tests::RuntimeGraphRenderPass>(pass ? "second draw" : "first draw", graphTarget,
                                                                      runtime, pipeline, &invocation,
@@ -1626,8 +1656,10 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
         backCulled[0] != cullBackground[0] || backCulled[1] != cullBackground[1] || backCulled[2] != cullBackground[2];
     EXPECT_NE(frontRendered, backRendered);
 
+    EXPECT_EQ(vernonRhiDeviceDestroyImageView(device, targetView), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, target), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroySampler(device, sampler), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImageView(device, sampledView), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, sampled), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, indexBuffer), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, vertices), VERNON_RHI_STATUS_OK);

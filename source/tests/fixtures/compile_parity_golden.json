@@ -11,7 +11,7 @@
       {
         "access": "write",
         "dtype": "f32",
-        "kind": "texture",
+        "kind": "image",
         "location": 0,
         "name": "output_0",
         "shape": [

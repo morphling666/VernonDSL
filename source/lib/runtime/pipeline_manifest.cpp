@@ -90,12 +90,39 @@ template <size_t N> bool hasOnlyKeys(const nlohmann::json &value, const std::str
 
 constexpr std::string_view kVariantKeys[] = {"key", "program", "parameters", "internal_parameters", "outputs"};
 constexpr std::string_view kExternalParameterKeys[] = {
-    "slot",         "name",           "kind",  "type",          "uses",      "access", "shape",
-    "value_layout", "element_layout", "dtype", "address_space", "dimension", "format",
+    "slot",
+    "name",
+    "kind",
+    "type",
+    "uses",
+    "access",
+    "shape",
+    "value_layout",
+    "element_layout",
+    "dtype",
+    "address_space",
+    "dimension",
+    "binding_role",
+    "sample_result_class",
+    "exact_storage_format",
 };
 constexpr std::string_view kInternalParameterKeys[] = {
-    "name",           "kind",  "type",          "uses",      "access", "shape",  "value_layout",
-    "element_layout", "dtype", "address_space", "dimension", "format", "source", "system_value",
+    "name",
+    "kind",
+    "type",
+    "uses",
+    "access",
+    "shape",
+    "value_layout",
+    "element_layout",
+    "dtype",
+    "address_space",
+    "dimension",
+    "binding_role",
+    "sample_result_class",
+    "exact_storage_format",
+    "source",
+    "system_value",
 };
 constexpr std::string_view kParameterUseKeys[] = {
     "stage",
@@ -112,13 +139,13 @@ constexpr std::string_view kParameterUseKeys[] = {
     "value_layout",
     "interface_plan",
     "attribute_leaves",
-    "sampled_texture_bindings",
+    "sampled_image_bindings",
     "tensor_view_descriptor",
 };
 constexpr std::string_view kOutputKeys[] = {"name", "kind", "dtype", "shape", "access", "location"};
 constexpr std::string_view kAttributeLeafKeys[] = {"path",  "location",        "location_offset",
                                                    "dtype", "component_count", "byte_offset"};
-constexpr std::string_view kSampledTextureBindingKeys[] = {"set", "binding"};
+constexpr std::string_view kSampledImageBindingKeys[] = {"set", "binding"};
 constexpr std::string_view kInterfacePlanKeys[] = {"kind", "profile", "canonical_layout_hash", "root", "frame_offset"};
 constexpr std::string_view kTransportNodeKeys[] = {"kind",      "representation", "offset",       "size",
                                                    "alignment", "shape",          "byte_strides", "children"};
@@ -428,10 +455,10 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
         error = "interface_plan canonical layout hash does not match value_layout";
         return false;
     }
-    if (value.contains("sampled_texture_bindings")) {
-        const nlohmann::json &bindings = value["sampled_texture_bindings"];
+    if (value.contains("sampled_image_bindings")) {
+        const nlohmann::json &bindings = value["sampled_image_bindings"];
         if (!bindings.is_array()) {
-            error = "sampled_texture_bindings must be an array";
+            error = "sampled_image_bindings must be an array";
             return false;
         }
         for (const nlohmann::json &binding : bindings) {
@@ -447,13 +474,13 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
             uint32_t descriptorSet = 0;
             uint32_t descriptorBinding = 0;
             if (!binding.is_object() || hasLegacyManifestKey(binding) ||
-                !hasOnlyKeys(binding, kSampledTextureBindingKeys) || !binding.contains("set") ||
+                !hasOnlyKeys(binding, kSampledImageBindingKeys) || !binding.contains("set") ||
                 !parseBindingIndex(binding["set"], descriptorSet) || !binding.contains("binding") ||
                 !parseBindingIndex(binding["binding"], descriptorBinding)) {
                 error = "sampled texture binding must contain unsigned set/binding";
                 return false;
             }
-            use.sampledTextureBindings.push_back({descriptorSet, descriptorBinding});
+            use.sampledImageBindings.push_back({descriptorSet, descriptorBinding});
         }
     }
     if (value.contains("shape")) {
@@ -847,9 +874,9 @@ bool validateParameterKindTypeCoherence(const std::string &kind, const ParsedLog
         error = "pipeline parameter type is not a recognized schema-v5 logical type";
         return false;
     }
-    if (kind == "texture") {
+    if (kind == "image") {
         if (logicalType.kind != LogicalParameterTypeKind::Texture) {
-            error = "texture parameter kind does not match its logical type";
+            error = "image parameter kind does not match its logical type";
             return false;
         }
         return true;
@@ -869,7 +896,7 @@ bool validateParameterKindTypeCoherence(const std::string &kind, const ParsedLog
         }
         return true;
     }
-    error = "pipeline parameter kind must be tensor, texture, or sampler";
+    error = "pipeline parameter kind must be tensor, image, or sampler";
     return false;
 }
 
@@ -886,7 +913,7 @@ bool validateParameterAddressSpace(const std::string &kind, const ParsedLogicalP
         error = "non-TensorView parameter contains address_space";
         return false;
     }
-    if (kind == "texture" && !logicalType.textureDimension.empty()) {
+    if (kind == "image" && !logicalType.textureDimension.empty()) {
         // Dimension is validated separately against the reflected parameter.dimension field.
     }
     return true;
@@ -946,10 +973,10 @@ bool Variant::validate(std::string &error) const {
             error = "external pipeline parameter invariant failed";
             return false;
         }
-        const bool textureConstraintsValid =
-            parameter.kind == "texture" ? validTextureDimension(parameter.dimension) : parameter.dimension.empty();
-        if (!textureConstraintsValid) {
-            error = "pipeline parameter texture constraint invariant failed";
+        const bool imageConstraintsValid =
+            parameter.kind == "image" ? validTextureDimension(parameter.dimension) : parameter.dimension.empty();
+        if (!imageConstraintsValid) {
+            error = "pipeline parameter image constraint invariant failed";
             return false;
         }
         for (const ParameterUse &use : parameter.uses)
@@ -975,19 +1002,19 @@ bool Variant::validate(std::string &error) const {
                 error = "packed Tensor value is missing its typed interface plan";
                 return false;
             }
-            if (implicitSampler && use.sampledTextureBindings.empty()) {
-                error = "implicit sampler requires reflected sampled texture bindings";
+            if (implicitSampler && use.sampledImageBindings.empty()) {
+                error = "implicit sampler requires reflected sampled image bindings";
                 return false;
             }
-            if (resolution && !use.sampledTextureBindings.empty()) {
-                error = "resolution cannot have sampled texture bindings";
+            if (resolution && !use.sampledImageBindings.empty()) {
+                error = "resolution cannot have sampled image bindings";
                 return false;
             }
         }
     }
     using BindingKey = std::tuple<std::string, uint32_t, uint32_t>;
     std::map<BindingKey, std::pair<std::string, std::string>> descriptorOwners;
-    std::set<BindingKey> textureBindings;
+    std::set<BindingKey> imageBindings;
     std::vector<BindingKey> samplerBindings;
     const auto validateBindings = [&](const Parameter &parameter) {
         for (const ParameterUse &use : parameter.uses) {
@@ -996,7 +1023,7 @@ bool Variant::validate(std::string &error) const {
                 return false;
             }
             const bool descriptorRequired =
-                (use.interfaceKind == "resource" && (parameter.kind == "tensor" || parameter.kind == "texture")) ||
+                (use.interfaceKind == "resource" && (parameter.kind == "tensor" || parameter.kind == "image")) ||
                 ((use.interfaceKind == "uniform" || use.interfaceKind == "value") &&
                  (use.transport == "uniform_buffer" || use.transport == "storage_buffer"));
             if (descriptorRequired && use.binding == UINT32_MAX) {
@@ -1010,18 +1037,18 @@ bool Variant::validate(std::string &error) const {
                     error = "pipeline descriptor binding is assigned to multiple parameters";
                     return false;
                 }
-                if (parameter.kind == "texture")
-                    textureBindings.insert(std::move(key));
+                if (parameter.kind == "image")
+                    imageBindings.insert(std::move(key));
             }
             if (parameter.kind == "sampler") {
-                if (use.sampledTextureBindings.empty()) {
-                    error = "sampler parameter has no paired sampled texture binding";
+                if (use.sampledImageBindings.empty()) {
+                    error = "sampler parameter has no paired sampled image binding";
                     return false;
                 }
-                for (const SampledTextureBinding &binding : use.sampledTextureBindings)
+                for (const SampledImageBinding &binding : use.sampledImageBindings)
                     samplerBindings.emplace_back(use.stage, binding.descriptorSet, binding.binding);
-            } else if (!use.sampledTextureBindings.empty()) {
-                error = "non-sampler parameter contains sampled texture bindings";
+            } else if (!use.sampledImageBindings.empty()) {
+                error = "non-sampler parameter contains sampled image bindings";
                 return false;
             }
         }
@@ -1034,8 +1061,8 @@ bool Variant::validate(std::string &error) const {
         if (!validateBindings(parameter))
             return false;
     for (const BindingKey &binding : samplerBindings)
-        if (textureBindings.find(binding) == textureBindings.end()) {
-            error = "sampler references an unknown sampled texture binding";
+        if (imageBindings.find(binding) == imageBindings.end()) {
+            error = "sampler references an unknown sampled image binding";
             return false;
         }
     const bool computeTopology = !compute.empty() && program.size() == 1;
@@ -1274,7 +1301,9 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
         parameter.access = row["access"].get<std::string>();
         parameter.addressSpace = row.value("address_space", "");
         parameter.dimension = row.value("dimension", "");
-        parameter.format = row.value("format", "");
+        parameter.bindingRole = row.value("binding_role", "");
+        parameter.sampleResultClass = row.value("sample_result_class", "");
+        parameter.exactStorageFormat = row.value("exact_storage_format", "");
         for (const nlohmann::json &dimension : row["shape"]) {
             uint64_t extent = 0;
             if (!parseUint64(dimension, extent)) {
@@ -1301,28 +1330,32 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
             return false;
         if (parsedType.kind == LogicalParameterTypeKind::Texture && !parsedType.textureDimension.empty() &&
             parsedType.textureDimension != parameter.dimension) {
-            error = "texture parameter dimension does not match its logical type";
+            error = "image parameter dimension does not match its logical type";
             return false;
         }
-        if (parameter.kind == "texture") {
+        if (parameter.kind == "image") {
             if (!pipelineTextureDimension(parameter.dimension)) {
-                error = "texture parameter has an invalid dimension";
+                error = "image parameter has an invalid dimension";
                 return false;
             }
-            if (!parameter.format.empty() && !pipelineTextureFormat(parameter.format)) {
-                error = "texture parameter has an invalid format";
+            if (parameter.bindingRole != "sampled" && parameter.bindingRole != "storage") {
+                error = "image parameter has an invalid binding role";
                 return false;
             }
             const std::string expectedFormat =
                 parsedType.textureFormat == "unknown" ? std::string{} : parsedType.textureFormat;
             const std::string expectedAccess =
                 parsedType.textureAccess == "sampled" ? std::string{"read"} : parsedType.textureAccess;
-            if (parameter.format != expectedFormat || parameter.access != expectedAccess) {
-                error = "texture parameter constraints do not match its logical type";
+            const std::string expectedRole = parsedType.textureAccess == "sampled" ? "sampled" : "storage";
+            if (parameter.bindingRole != expectedRole || parameter.exactStorageFormat != expectedFormat ||
+                parameter.access != expectedAccess ||
+                (parameter.bindingRole == "sampled" && parameter.sampleResultClass.empty()) ||
+                (parameter.bindingRole == "storage" && !pipelineTextureFormat(parameter.exactStorageFormat))) {
+                error = "image parameter constraints do not match its logical type";
                 return false;
             }
         } else if (!parameter.dimension.empty()) {
-            error = "non-texture parameter contains texture constraints";
+            error = "non-image parameter contains image constraints";
             return false;
         }
         if (parameter.kind == "tensor") {
@@ -1396,8 +1429,8 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
         if (parameter.source != "implicit_sampler")
             continue;
         for (const ParameterUse &use : parameter.uses)
-            if (use.sampledTextureBindings.empty()) {
-                error = "implicit sampler has no paired sampled texture binding";
+            if (use.sampledImageBindings.empty()) {
+                error = "implicit sampler has no paired sampled image binding";
                 return false;
             }
     }

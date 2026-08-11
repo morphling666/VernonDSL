@@ -70,7 +70,7 @@ VernonStatus staticallyLinkedFill(const VernonCpuInvocation *invocation) {
 
 } // namespace
 
-TEST(RuntimeCpuPipeline, ReflectsTextureDimensionsAndRejectsFormatMetadata) {
+TEST(RuntimeCpuPipeline, ReflectsImageConstraintsAndRejectsLegacyMetadata) {
     const std::filesystem::path directory = VERNON_CPU_BUNDLE_PATH;
     const std::string directoryUtf8 = directory.u8string();
     const std::string bundle = readFile(directory / "cpu_fill.pipeline.json");
@@ -83,19 +83,21 @@ TEST(RuntimeCpuPipeline, ReflectsTextureDimensionsAndRejectsFormatMetadata) {
     ASSERT_NE(tensorBundle, nullptr);
     VernonLoadedPipeline *tensorPipeline = vernonRuntimeResolvePipeline(tensorBundle, {nullptr, 0});
     ASSERT_NE(tensorPipeline, nullptr);
-    VernonPipelineTextureConstraintView constraint{};
+    VernonPipelineImageConstraintView constraint{};
     constraint.struct_size = sizeof(constraint);
-    EXPECT_EQ(vernonRuntimeLoadedPipelineGetTextureConstraintByParameterIndex(tensorPipeline, 0, &constraint),
+    EXPECT_EQ(vernonRuntimeLoadedPipelineGetImageConstraintByParameterIndex(tensorPipeline, 0, &constraint),
               VERNON_STATUS_INVALID_ARGUMENT);
 
     nlohmann::json constrained = nlohmann::json::parse(bundle);
     nlohmann::json &parameter = constrained["variants"][0]["parameters"][0];
-    parameter["kind"] = "texture";
+    parameter["kind"] = "image";
     parameter["type"] = "!vernon.texture<\"3d\", f32, \"unknown\", \"sampled\">";
     parameter.erase("address_space");
     parameter.erase("element_layout");
     parameter["access"] = "read";
     parameter["dimension"] = "3d";
+    parameter["binding_role"] = "sampled";
+    parameter["sample_result_class"] = "float";
     parameter["shape"] = nlohmann::json::array();
     VernonPipelineBundle *textureBundle = loadWithDirectory(runtime, withContentHash(constrained), directoryUtf8);
     ASSERT_NE(textureBundle, nullptr);
@@ -104,21 +106,21 @@ TEST(RuntimeCpuPipeline, ReflectsTextureDimensionsAndRejectsFormatMetadata) {
 
     constraint = {};
     constraint.struct_size = sizeof(constraint);
-    ASSERT_EQ(vernonRuntimeLoadedPipelineGetTextureConstraintByParameterIndex(texturePipeline, 0, &constraint),
+    ASSERT_EQ(vernonRuntimeLoadedPipelineGetImageConstraintByParameterIndex(texturePipeline, 0, &constraint),
               VERNON_STATUS_OK);
     EXPECT_EQ(constraint.dimension, VERNON_TEXTURE_3D);
-    EXPECT_EQ(constraint.has_format_constraint, 0u);
+    EXPECT_EQ(constraint.binding_role, VERNON_IMAGE_BINDING_SAMPLED);
 
     constraint = {};
     constraint.struct_size = sizeof(constraint);
-    ASSERT_EQ(vernonRuntimeLoadedPipelineFindTextureConstraint(texturePipeline, {"output", std::strlen("output")},
-                                                               &constraint),
-              VERNON_STATUS_OK);
+    ASSERT_EQ(
+        vernonRuntimeLoadedPipelineFindImageConstraint(texturePipeline, {"output", std::strlen("output")}, &constraint),
+        VERNON_STATUS_OK);
     EXPECT_EQ(constraint.dimension, VERNON_TEXTURE_3D);
 
     constraint = {};
     constraint.struct_size = sizeof(constraint) - 1;
-    EXPECT_EQ(vernonRuntimeLoadedPipelineGetTextureConstraintByParameterIndex(texturePipeline, 0, &constraint),
+    EXPECT_EQ(vernonRuntimeLoadedPipelineGetImageConstraintByParameterIndex(texturePipeline, 0, &constraint),
               VERNON_STATUS_INVALID_ARGUMENT);
 
     constrained["variants"][0]["parameters"][0]["texture_format"] = "rgba16_float";

@@ -3,6 +3,7 @@
 
 #include "VernonRuntime.h"
 #include "VernonRuntimeCore.h"
+#include "graphics_variant_key.h"
 #include "pipeline_manifest.h"
 
 #include <array>
@@ -21,7 +22,7 @@ using PipelineArgumentMap = std::unordered_map<uint32_t, const VernonPipelineArg
 enum PlannedShaderStage : uint32_t { PLANNED_STAGE_VERTEX = 1u << 0, PLANNED_STAGE_FRAGMENT = 1u << 1 };
 
 struct PlannedSampledResource {
-    VernonRuntimeProviderResourceReference imageResource{};
+    VernonRuntimeProviderResourceReference imageView{};
     VernonRuntimeProviderResourceReference samplerResource{};
     bool implicitSampler{};
     bool explicitSampler{};
@@ -37,7 +38,9 @@ struct PlannedVertexInput {
 struct PlannedGraphicsInvocation {
     PipelineArgumentMap arguments;
     std::vector<const VernonColorAttachment *> attachments;
+    std::vector<VernonTextureFormat> attachmentFormats;
     const VernonDepthAttachment *depthAttachment{};
+    VernonTextureFormat depthFormat{};
     std::map<std::pair<uint32_t, uint32_t>, PlannedSampledResource> sampledResources;
     std::vector<PlannedVertexInput> vertexInputs;
     std::array<float, 2> resolution{};
@@ -48,22 +51,14 @@ struct PlannedGraphicsInvocation {
     const VernonIndexBinding *indexBinding{};
 };
 
+using DescribeImageResource = VernonStatus (*)(void *userData, VernonRuntimeProviderResourceReference resource,
+                                               VernonRuntimeProviderImageDescription *description);
+
 struct PlannedGraphicsState {
     VernonRasterizationState rasterization{};
     VernonDepthStencilState depthStencil{};
     std::vector<VernonColorBlendState> colorBlends;
     uint32_t stencilReference{};
-};
-
-struct GraphicsVariantKey {
-    uint32_t topology{};
-    std::vector<uint32_t> colorFormats;
-    uint32_t depthStencilFormat{};
-    uint32_t sampleCount{1};
-    std::vector<uint32_t> vertexStrides;
-    VernonRasterizationState rasterization{};
-    VernonDepthStencilState depthStencil{};
-    std::vector<VernonColorBlendState> colorBlends;
 };
 
 struct PreparedGraphicsVariant {
@@ -72,19 +67,10 @@ struct PreparedGraphicsVariant {
 };
 
 bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocation &invocation,
+                            DescribeImageResource describeImage, void *describeImageUserData,
                             PlannedGraphicsInvocation &plan, std::string &error);
 bool planGraphicsState(const VernonPipelineInvocation &invocation, size_t colorCount, bool hasDepth, bool hasStencil,
                        PlannedGraphicsState &state, std::string &error);
-bool graphicsVariantKeysEqual(const GraphicsVariantKey &left, const GraphicsVariantKey &right);
-size_t graphicsVariantKeyHash(const GraphicsVariantKey &key);
-struct GraphicsVariantKeyHash {
-    size_t operator()(const GraphicsVariantKey &key) const { return graphicsVariantKeyHash(key); }
-};
-struct GraphicsVariantKeyEqual {
-    bool operator()(const GraphicsVariantKey &left, const GraphicsVariantKey &right) const {
-        return graphicsVariantKeysEqual(left, right);
-    }
-};
 VernonStatus ensureGraphicsVariant(VernonRuntimeCorePipeline *pipeline, const GraphicsVariantKey &key,
                                    PreparedGraphicsVariant &prepared);
 void destroyGraphicsVariant(PreparedGraphicsVariant &prepared);

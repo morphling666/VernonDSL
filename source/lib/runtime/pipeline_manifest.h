@@ -15,7 +15,7 @@
 
 namespace vernon::runtime {
 
-struct SampledTextureBinding {
+struct SampledImageBinding {
     uint32_t descriptorSet{};
     uint32_t binding{UINT32_MAX};
 };
@@ -105,7 +105,7 @@ struct ParameterUse {
     uint32_t divisor{};
     uint32_t descriptorSet{};
     uint32_t binding{UINT32_MAX};
-    std::vector<SampledTextureBinding> sampledTextureBindings;
+    std::vector<SampledImageBinding> sampledImageBindings;
     std::vector<AttributeLeaf> attributeLeaves;
     std::string transport;
     std::optional<ValueLayout> valueLayout;
@@ -134,7 +134,9 @@ struct Parameter {
     std::string access;
     std::string addressSpace;
     std::string dimension;
-    std::string format;
+    std::string bindingRole;
+    std::string sampleResultClass;
+    std::string exactStorageFormat;
     AutodiffResourceRole autodiffRole{AutodiffResourceRole::None};
     std::vector<uint64_t> shape;
     std::vector<ParameterUse> uses;

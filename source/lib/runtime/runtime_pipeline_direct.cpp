@@ -66,7 +66,7 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
         parameter.name =
             argument.value("vernon.source_name", argument.value("name", "argument" + std::to_string(slot)));
         const std::string reflectedKind = argument.value("kind", std::string());
-        parameter.kind = reflectedKind == "texture" || reflectedKind == "sampler" ? reflectedKind : "tensor";
+        parameter.kind = reflectedKind == "image" || reflectedKind == "sampler" ? reflectedKind : "tensor";
         parameter.source = "direct";
         if (!parseAutodiffResourceRole(argument, parameter.autodiffRole, error))
             return false;
@@ -100,12 +100,15 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
             error = "compute argument reflection has invalid access metadata";
             return false;
         }
-        if (parameter.kind == "texture") {
+        if (parameter.kind == "image") {
             parameter.dimension = argument.value("dimension", std::string());
-            parameter.format = argument.value("format", std::string());
+            parameter.bindingRole = argument.value("binding_role", std::string());
+            parameter.sampleResultClass = argument.value("sample_result_class", std::string());
+            parameter.exactStorageFormat = argument.value("exact_storage_format", std::string());
             if (!pipelineTextureDimension(parameter.dimension) ||
-                (!parameter.format.empty() && !pipelineTextureFormat(parameter.format))) {
-                error = "compute texture reflection has invalid dimension or format metadata";
+                (parameter.bindingRole != "sampled" && parameter.bindingRole != "storage") ||
+                (parameter.bindingRole == "storage" && !pipelineTextureFormat(parameter.exactStorageFormat))) {
+                error = "compute image reflection has invalid role, dimension, or format metadata";
                 return false;
             }
         }
@@ -123,9 +126,9 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
         use.stage = "compute";
         use.index = static_cast<uint32_t>(reflectedIndex);
         const std::string &physicalKind = reflection.arguments[reflectedIndex].kind;
-        use.interfaceKind = physicalKind == "tensor"                                 ? "storage"
-                            : physicalKind == "texture" || physicalKind == "sampler" ? "resource"
-                                                                                     : "value";
+        use.interfaceKind = physicalKind == "tensor"                               ? "storage"
+                            : physicalKind == "image" || physicalKind == "sampler" ? "resource"
+                                                                                   : "value";
         use.dtype = argument.value("dtype", std::string());
         use.shape = parameter.shape;
         use.transport = transport;

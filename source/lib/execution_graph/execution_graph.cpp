@@ -15,6 +15,60 @@ namespace {
 
 bool writes(AccessMode access) { return access != AccessMode::Read; }
 
+ImageUseRole imageRole(VernonRhiResourceState state) {
+    switch (state) {
+    case VERNON_RHI_STATE_SHADER_READ:
+        return ImageUseRole::Sampled;
+    case VERNON_RHI_STATE_SHADER_WRITE:
+        return ImageUseRole::Storage;
+    case VERNON_RHI_STATE_COLOR_ATTACHMENT:
+        return ImageUseRole::ColorAttachment;
+    case VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT:
+        return ImageUseRole::DepthAttachment;
+    case VERNON_RHI_STATE_TRANSFER_SOURCE:
+    case VERNON_RHI_STATE_TRANSFER_DESTINATION:
+        return ImageUseRole::Transfer;
+    default:
+        return ImageUseRole::None;
+    }
+}
+
+bool intervalsOverlap(uint32_t leftBase, uint32_t leftCount, uint32_t rightBase, uint32_t rightCount) {
+    const uint64_t leftEnd = leftCount == UINT32_MAX ? UINT64_MAX : uint64_t{leftBase} + leftCount;
+    const uint64_t rightEnd = rightCount == UINT32_MAX ? UINT64_MAX : uint64_t{rightBase} + rightCount;
+    return uint64_t{leftBase} < rightEnd && uint64_t{rightBase} < leftEnd;
+}
+
+bool usesOverlap(const ResourceUse &left, const ResourceUse &right) {
+    if (left.resource.id != right.resource.id)
+        return false;
+    if (left.resource.kind != ResourceKind::Image || left.imageRole == ImageUseRole::None ||
+        right.imageRole == ImageUseRole::None)
+        return true;
+    const auto &a = left.imageSubresources;
+    const auto &b = right.imageSubresources;
+    return (a.aspects & b.aspects) != 0 &&
+           intervalsOverlap(a.base_mip_level, a.mip_level_count, b.base_mip_level, b.mip_level_count) &&
+           intervalsOverlap(a.base_array_layer, a.array_layer_count, b.base_array_layer, b.array_layer_count);
+}
+
+VernonRhiImageSubresourceRange intersection(const VernonRhiImageSubresourceRange &left,
+                                            const VernonRhiImageSubresourceRange &right) {
+    const auto interval = [](uint32_t leftBase, uint32_t leftCount, uint32_t rightBase, uint32_t rightCount) {
+        const uint64_t begin = std::max(leftBase, rightBase);
+        const uint64_t leftEnd = leftCount == UINT32_MAX ? UINT64_MAX : uint64_t{leftBase} + leftCount;
+        const uint64_t rightEnd = rightCount == UINT32_MAX ? UINT64_MAX : uint64_t{rightBase} + rightCount;
+        const uint64_t end = std::min(leftEnd, rightEnd);
+        return std::pair{static_cast<uint32_t>(begin),
+                         end == UINT64_MAX ? UINT32_MAX : static_cast<uint32_t>(end - begin)};
+    };
+    const auto [baseMip, mipCount] =
+        interval(left.base_mip_level, left.mip_level_count, right.base_mip_level, right.mip_level_count);
+    const auto [baseLayer, layerCount] =
+        interval(left.base_array_layer, left.array_layer_count, right.base_array_layer, right.array_layer_count);
+    return {baseMip, mipCount, baseLayer, layerCount, left.aspects & right.aspects};
+}
+
 uint64_t handleKey(uint32_t index, uint32_t generation) { return (static_cast<uint64_t>(generation) << 32u) | index; }
 
 std::atomic<uint64_t> nextGraphIdentity{1};
@@ -69,7 +123,7 @@ bool attachmentUse(const ResourceUse &use) {
 bool hasUnrepresentableHazard(const RenderPass &left, const RenderPass &right) {
     for (const ResourceUse &first : left.uses())
         for (const ResourceUse &second : right.uses())
-            if (first.resource.id == second.resource.id && (writes(first.access) || writes(second.access)) &&
+            if (usesOverlap(first, second) && (writes(first.access) || writes(second.access)) &&
                 !(attachmentUse(first) && attachmentUse(second) && first.state == second.state))
                 return true;
     return false;
@@ -133,14 +187,25 @@ void ExecutionPass::read(GraphResource resource, VernonRhiResourceState state, u
     uses_.push_back({resource, AccessMode::Read, state, stageMask});
 }
 
+void ExecutionPass::read(GraphImage resource, VernonRhiResourceState state, uint32_t stageMask) {
+    uses_.push_back({resource, AccessMode::Read, state, stageMask, imageRole(state), resource.subresources});
+}
+
 void ExecutionPass::write(GraphResource resource, VernonRhiResourceState state, uint32_t stageMask) {
     uses_.push_back({resource, AccessMode::Write, state, stageMask});
+}
+
+void ExecutionPass::write(GraphImage resource, VernonRhiResourceState state, uint32_t stageMask) {
+    uses_.push_back({resource, AccessMode::Write, state, stageMask, imageRole(state), resource.subresources});
 }
 
 void ExecutionPass::readWrite(GraphResource resource, VernonRhiResourceState state, uint32_t stageMask) {
     uses_.push_back({resource, AccessMode::ReadWrite, state, stageMask});
 }
 
+void ExecutionPass::readWrite(GraphImage resource, VernonRhiResourceState state, uint32_t stageMask) {
+    uses_.push_back({resource, AccessMode::ReadWrite, state, stageMask, imageRole(state), resource.subresources});
+}
 void ExecutionPass::resetDeclaration() { uses_.clear(); }
 
 bool ExecutionResources::buffer(GraphBuffer resource, VernonRhiBuffer &output) const {
@@ -191,7 +256,10 @@ ExecutionGraph::~ExecutionGraph() {
     for (const ResourceRecord &record : resourceRecords_) {
         if (provider_ == Provider::Rhi && record.graphOwned)
             vernonRhiDeviceDestroyBuffer(device_, record.buffer);
-        if (provider_ == Provider::Rhi && record.resourceKey && record.resourceKey != UINT64_MAX)
+        if (provider_ == Provider::Rhi)
+            for (uint64_t viewKey : record.imageViewKeys)
+                vernon::rhi::releaseResource(device_, vernon::rhi::ResourceKind::ImageView, viewKey);
+        if (provider_ == Provider::Rhi && record.resourceKey)
             vernon::rhi::releaseResource(device_,
                                          record.resource.kind == ResourceKind::Buffer
                                              ? vernon::rhi::ResourceKind::Buffer
@@ -239,7 +307,7 @@ VernonRhiStatus ExecutionGraph::createBuffer(const VernonRhiBufferDescriptor &de
 }
 
 GraphBuffer ExecutionGraph::importBuffer(VernonRhiBuffer buffer, bool exported) {
-    if (provider_ != Provider::Rhi)
+    if (provider_ != Provider::Rhi || !vernon::rhi::deviceExists(device_))
         return {};
     const uint64_t key = handleKey(buffer.index, buffer.generation);
     if (const auto found = importedBuffers_.find(key); found != importedBuffers_.end()) {
@@ -252,74 +320,105 @@ GraphBuffer ExecutionGraph::importBuffer(VernonRhiBuffer buffer, bool exported) 
         result.handle = buffer;
         return result;
     }
+    const uint64_t resourceKey = vernon::rhi::bufferResource(device_, buffer);
+    if (!resourceKey || !vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::Buffer, resourceKey))
+        return {};
     GraphBuffer result;
     result.id = static_cast<uint32_t>(resources_.size());
     result.kind = ResourceKind::Buffer;
     result.graphIdentity = graphIdentity_;
     result.handle = buffer;
+    try {
+        resources_.reserve(resources_.size() + 1);
+        resourceRecords_.reserve(resourceRecords_.size() + 1);
+        importedBuffers_.reserve(importedBuffers_.size() + 1);
+        if (!importedBuffers_.emplace(key, result.id).second) {
+            vernon::rhi::releaseResource(device_, vernon::rhi::ResourceKind::Buffer, resourceKey);
+            return {};
+        }
+    } catch (const std::bad_alloc &) {
+        vernon::rhi::releaseResource(device_, vernon::rhi::ResourceKind::Buffer, resourceKey);
+        return {};
+    }
     resources_.push_back(result);
     resourceRecords_.push_back({result, exported});
-    importedBuffers_.emplace(key, result.id);
     resourceRecords_.back().buffer = buffer;
-    if (!vernon::rhi::deviceExists(device_)) {
-        resourceRecords_.back().resourceKey = UINT64_MAX;
-        dirty_ = true;
-        return result;
-    }
-    resourceRecords_.back().resourceKey = vernon::rhi::bufferResource(device_, buffer);
-    if (!resourceRecords_.back().resourceKey ||
-        !vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::Buffer, resourceRecords_.back().resourceKey))
-        resourceRecords_.back().resourceKey = 0;
+    resourceRecords_.back().resourceKey = resourceKey;
     dirty_ = true;
     return result;
 }
 
-GraphImage ExecutionGraph::importImage(VernonRhiImage image, VernonRhiImageView view, VernonRhiFormat format,
-                                       uint32_t width, uint32_t height, uint32_t layers, uint32_t samples,
-                                       bool exported) {
-    if (provider_ != Provider::Rhi)
+GraphImage ExecutionGraph::importImage(VernonRhiImage image, VernonRhiImageView view, bool exported) {
+    if (provider_ != Provider::Rhi || !vernon::rhi::deviceExists(device_))
         return {};
-    const uint64_t key = handleKey(image.index, image.generation);
-    if (const auto found = importedImages_.find(key); found != importedImages_.end()) {
-        ResourceRecord &record = resourceRecords_[found->second];
-        record.exported = record.exported || exported;
-        GraphImage result;
-        result.id = found->second;
-        result.kind = ResourceKind::Image;
-        result.graphIdentity = graphIdentity_;
-        result.handle = image;
-        result.view = view;
-        result.format = format;
-        result.width = width;
-        result.height = height;
-        result.layers = layers;
-        result.samples = samples;
-        return result;
-    }
+    const uint64_t imageKey = vernon::rhi::imageResource(device_, image);
+    const uint64_t viewKey = vernon::rhi::imageViewResource(device_, view);
+    VernonRhiImageDescriptor imageDescriptor{};
+    VernonRhiImageViewDescriptor viewDescriptor{};
+    uint64_t parentKey{};
+    if (!imageKey || !viewKey ||
+        !vernon::rhi::describeImageViewResource(device_, viewKey, viewDescriptor, imageDescriptor, parentKey) ||
+        parentKey != imageKey)
+        return {};
     GraphImage result;
-    result.id = static_cast<uint32_t>(resources_.size());
     result.kind = ResourceKind::Image;
     result.graphIdentity = graphIdentity_;
     result.handle = image;
     result.view = view;
-    result.format = format;
-    result.width = width;
-    result.height = height;
-    result.layers = layers;
-    result.samples = samples;
-    resources_.push_back(result);
-    resourceRecords_.push_back({result, exported});
-    importedImages_.emplace(key, result.id);
-    resourceRecords_.back().image = image;
-    if (!vernon::rhi::deviceExists(device_)) {
-        resourceRecords_.back().resourceKey = UINT64_MAX;
-        dirty_ = true;
+    result.format = viewDescriptor.format;
+    result.width = std::max(imageDescriptor.width >> viewDescriptor.base_mip_level, 1u);
+    result.height = std::max(imageDescriptor.height >> viewDescriptor.base_mip_level, 1u);
+    result.layers = viewDescriptor.array_layer_count;
+    result.samples = imageDescriptor.sample_count;
+    result.subresources = {viewDescriptor.base_mip_level, viewDescriptor.mip_level_count,
+                           viewDescriptor.base_array_layer, viewDescriptor.array_layer_count, viewDescriptor.aspects};
+    const uint64_t key = handleKey(image.index, image.generation);
+    if (const auto found = importedImages_.find(key); found != importedImages_.end()) {
+        ResourceRecord &record = resourceRecords_[found->second];
+        result.id = found->second;
+        if (std::find(record.imageViewKeys.begin(), record.imageViewKeys.end(), viewKey) ==
+            record.imageViewKeys.end()) {
+            try {
+                record.imageViewKeys.reserve(record.imageViewKeys.size() + 1);
+            } catch (const std::bad_alloc &) {
+                return {};
+            }
+            if (!vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::ImageView, viewKey))
+                return {};
+            record.imageViewKeys.push_back(viewKey);
+        }
+        record.exported |= exported;
         return result;
     }
-    resourceRecords_.back().resourceKey = vernon::rhi::imageResource(device_, image);
-    if (!resourceRecords_.back().resourceKey ||
-        !vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::Image, resourceRecords_.back().resourceKey))
-        resourceRecords_.back().resourceKey = 0;
+    try {
+        resources_.reserve(resources_.size() + 1);
+        resourceRecords_.reserve(resourceRecords_.size() + 1);
+        importedImages_.reserve(importedImages_.size() + 1);
+    } catch (const std::bad_alloc &) {
+        return {};
+    }
+    result.id = static_cast<uint32_t>(resources_.size());
+    ResourceRecord record{result, exported};
+    record.image = image;
+    record.resourceKey = imageKey;
+    try {
+        record.imageViewKeys.push_back(viewKey);
+        if (!importedImages_.emplace(key, result.id).second)
+            return {};
+    } catch (const std::bad_alloc &) {
+        return {};
+    }
+    if (!vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::Image, imageKey)) {
+        importedImages_.erase(key);
+        return {};
+    }
+    if (!vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::ImageView, viewKey)) {
+        vernon::rhi::releaseResource(device_, vernon::rhi::ResourceKind::Image, imageKey);
+        importedImages_.erase(key);
+        return {};
+    }
+    resources_.push_back(result);
+    resourceRecords_.push_back(std::move(record));
     dirty_ = true;
     return result;
 }
@@ -384,7 +483,7 @@ bool ExecutionGraph::compile(std::string &error) {
         for (uint32_t right = left + 1; right < count; ++right)
             for (const ResourceUse &first : passes_[left]->uses_)
                 for (const ResourceUse &second : passes_[right]->uses_)
-                    if (first.resource.id == second.resource.id && (writes(first.access) || writes(second.access)))
+                    if (usesOverlap(first, second) && (writes(first.access) || writes(second.access)))
                         edges[left][right] = true;
 
     std::vector<bool> live(count);
@@ -452,16 +551,10 @@ bool ExecutionGraph::compile(std::string &error) {
         }
         scopes_.push_back({render != nullptr, {passIndex}});
     }
-    struct LastUse {
-        ResourceUse use;
-        bool present{};
-    };
-    std::vector<LastUse> lastUses(resources_.size());
+    std::vector<std::vector<ResourceUse>> lastUses(resources_.size());
     for (CompiledScope &scope : scopes_) {
-        std::vector<ResourceUse> firstUses(resources_.size());
-        std::vector<ResourceUse> finalUses(resources_.size());
-        std::vector<bool> firstUsePresent(resources_.size());
-        std::vector<bool> finalUsePresent(resources_.size());
+        std::vector<std::vector<ResourceUse>> firstUses(resources_.size());
+        std::vector<std::vector<ResourceUse>> finalUses(resources_.size());
         for (uint32_t passIndex : scope.passIndices) {
             const uint32_t stageMask = dynamic_cast<ComputePass *>(passes_[passIndex].get())
                                            ? VERNON_RHI_STAGE_COMPUTE
@@ -471,41 +564,49 @@ bool ExecutionGraph::compile(std::string &error) {
                 if (!effective.stageMask && (effective.state == VERNON_RHI_STATE_SHADER_READ ||
                                              effective.state == VERNON_RHI_STATE_SHADER_WRITE))
                     effective.stageMask = stageMask;
-                if (!firstUsePresent[use.resource.id]) {
-                    firstUses[use.resource.id] = effective;
-                    firstUsePresent[use.resource.id] = true;
-                }
-                finalUses[use.resource.id] = effective;
-                finalUsePresent[use.resource.id] = true;
+                auto &current = finalUses[use.resource.id];
+                if (std::none_of(current.begin(), current.end(),
+                                 [&](const ResourceUse &prior) { return usesOverlap(prior, effective); }))
+                    firstUses[use.resource.id].push_back(effective);
+                current.erase(std::remove_if(current.begin(), current.end(),
+                                             [&](const ResourceUse &prior) { return usesOverlap(prior, effective); }),
+                              current.end());
+                current.push_back(effective);
             }
         }
         for (uint32_t resourceId = 0; resourceId < firstUses.size(); ++resourceId) {
-            if (!firstUsePresent[resourceId])
-                continue;
-            const ResourceUse &use = firstUses[resourceId];
-            const LastUse &previous = lastUses[resourceId];
-            if (!previous.present ||
-                (previous.use.state == use.state && !writes(previous.use.access) && !writes(use.access)))
-                continue;
-            VernonRhiBarrier barrier{};
-            barrier.struct_size = sizeof(barrier);
-            barrier.source_stage_mask = previous.use.stageMask;
-            barrier.destination_stage_mask = use.stageMask;
-            barrier.source_access = accessBits(previous.use);
-            barrier.destination_access = accessBits(use);
-            barrier.old_state = previous.use.state;
-            barrier.new_state = use.state;
-            const ResourceRecord &record = resourceRecords_[resourceId];
-            barrier.is_image = record.resource.kind == ResourceKind::Image;
-            if (barrier.is_image)
-                barrier.image = record.image;
-            else
-                barrier.buffer = record.buffer;
-            scope.barriers.push_back(barrier);
+            for (const ResourceUse &use : firstUses[resourceId])
+                for (const ResourceUse &previous : lastUses[resourceId]) {
+                    if (!usesOverlap(previous, use) ||
+                        (previous.state == use.state && !writes(previous.access) && !writes(use.access)))
+                        continue;
+                    VernonRhiBarrier barrier{};
+                    barrier.struct_size = sizeof(barrier);
+                    barrier.source_stage_mask = previous.stageMask;
+                    barrier.destination_stage_mask = use.stageMask;
+                    barrier.source_access = accessBits(previous);
+                    barrier.destination_access = accessBits(use);
+                    barrier.old_state = previous.state;
+                    barrier.new_state = use.state;
+                    const ResourceRecord &record = resourceRecords_[resourceId];
+                    barrier.is_image = record.resource.kind == ResourceKind::Image;
+                    if (barrier.is_image) {
+                        barrier.image = record.image;
+                        barrier.image_subresources = intersection(previous.imageSubresources, use.imageSubresources);
+                    } else {
+                        barrier.buffer = record.buffer;
+                    }
+                    scope.barriers.push_back(barrier);
+                }
         }
         for (uint32_t resourceId = 0; resourceId < finalUses.size(); ++resourceId)
-            if (finalUsePresent[resourceId])
-                lastUses[resourceId] = {finalUses[resourceId], true};
+            for (const ResourceUse &use : finalUses[resourceId]) {
+                auto &previous = lastUses[resourceId];
+                previous.erase(std::remove_if(previous.begin(), previous.end(),
+                                              [&](const ResourceUse &prior) { return usesOverlap(prior, use); }),
+                               previous.end());
+                previous.push_back(use);
+            }
     }
     if (!validate(error))
         return false;
@@ -541,7 +642,11 @@ bool ExecutionGraph::validate(std::string &error) const {
         const ResourceRecord &record = resourceRecords_[image.id];
         if (record.image.index != image.handle.index || record.image.generation != image.handle.generation ||
             image.view.index == static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX) || !image.width ||
-            !image.height || !image.layers || !image.samples || image.format == VERNON_RHI_FORMAT_UNDEFINED) {
+            !image.height || !image.layers || !image.samples || image.format == VERNON_RHI_FORMAT_UNDEFINED ||
+            !image.subresources.mip_level_count || !image.subresources.array_layer_count ||
+            !image.subresources.aspects ||
+            (image.subresources.aspects &
+             ~(VERNON_RHI_IMAGE_ASPECT_COLOR | VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL))) {
             error = "pass '" + passName + "' contains an invalid image resource " + std::to_string(image.id);
             return false;
         }
@@ -568,6 +673,9 @@ bool ExecutionGraph::validate(std::string &error) const {
                 (use.state == VERNON_RHI_STATE_SHADER_READ && writes(use.access)) ||
                 (use.state == VERNON_RHI_STATE_SHADER_WRITE && !writes(use.access)) ||
                 (use.state == VERNON_RHI_STATE_PRESENT && use.access != AccessMode::Read) ||
+                (use.imageRole != ImageUseRole::None &&
+                 (!use.imageSubresources.mip_level_count || !use.imageSubresources.array_layer_count ||
+                  !use.imageSubresources.aspects)) ||
                 ((use.state == VERNON_RHI_STATE_COLOR_ATTACHMENT ||
                   use.state == VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT || use.state == VERNON_RHI_STATE_PRESENT) &&
                  use.resource.kind != ResourceKind::Image)) {

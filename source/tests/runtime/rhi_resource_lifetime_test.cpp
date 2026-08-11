@@ -203,6 +203,128 @@ TEST_P(RhiResourceLifetime, RetainedImageAndSamplerDelaySlotReuse) {
     vernonRhiDestroyDevice(device);
 }
 
+TEST_P(RhiResourceLifetime, RetainedImageViewKeepsParentDescriptorAlive) {
+    const BackendCase test = GetParam();
+    if (!test.supportsImages)
+        GTEST_SKIP() << test.name << " does not expose images";
+
+    VernonRhiOwnedDeviceDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.backend = test.backend;
+    const VernonRhiDevice device = vernonRhiCreateDevice(&descriptor);
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        GTEST_SKIP() << test.name << " is unavailable";
+    VernonRuntimeRhiAdapter *adapter = vernonRuntimeRhiAdapterCreateForDevice(device, test.backend);
+    ASSERT_NE(adapter, nullptr);
+    const VernonRuntimeDeviceProvider *provider = vernonRuntimeRhiAdapterGetProvider(adapter);
+
+    VernonRhiImageDescriptor imageDescriptor{};
+    imageDescriptor.struct_size = sizeof(imageDescriptor);
+    imageDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    imageDescriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    imageDescriptor.width = imageDescriptor.height = 4;
+    imageDescriptor.depth = 1;
+    imageDescriptor.mip_levels = 2;
+    imageDescriptor.array_layers = 1;
+    imageDescriptor.sample_count = 1;
+    imageDescriptor.usage = VERNON_RHI_IMAGE_SAMPLED;
+    VernonRhiImage image{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &image), VERNON_RHI_STATUS_OK);
+    VernonRhiImageViewDescriptor viewDescriptor{};
+    viewDescriptor.struct_size = sizeof(viewDescriptor);
+    viewDescriptor.image = image;
+    viewDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    viewDescriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    viewDescriptor.base_mip_level = 1;
+    viewDescriptor.mip_level_count = 1;
+    viewDescriptor.array_layer_count = 1;
+    viewDescriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
+    VernonRhiImageView view{};
+    ASSERT_EQ(vernonRhiDeviceCreateImageView(device, &viewDescriptor, &view), VERNON_RHI_STATUS_OK);
+    VernonRuntimeProviderResourceReference reference{};
+    ASSERT_EQ(vernonRuntimeRhiAdapterReferenceImageView(adapter, view, &reference), VERNON_STATUS_OK);
+    ASSERT_EQ(provider->retain_resource(provider->user_data, reference), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(device, view), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
+
+    VernonRuntimeProviderImageDescription description{};
+    description.struct_size = sizeof(description);
+    ASSERT_EQ(provider->describe_image(provider->user_data, reference, &description), VERNON_STATUS_OK);
+    EXPECT_NE(description.parent_identity, 0u);
+    EXPECT_EQ(description.view.subresources.base_mip_level, 1u);
+    EXPECT_EQ(description.view.subresources.mip_level_count, 1u);
+
+    VernonRhiImage replacement{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &replacement), VERNON_RHI_STATUS_OK);
+    EXPECT_NE(replacement.index, image.index);
+    provider->release_resource(provider->user_data, reference);
+    VernonRhiImage recycled{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &recycled), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(recycled.index, image.index);
+    EXPECT_NE(recycled.generation, image.generation);
+
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, replacement), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, recycled), VERNON_RHI_STATUS_OK);
+    vernonRuntimeRhiAdapterDestroy(adapter);
+    vernonRhiDestroyDevice(device);
+}
+
+TEST_P(RhiResourceLifetime, ExecutionGraphRetainsImportedImageViewAndParent) {
+    const BackendCase test = GetParam();
+    if (!test.supportsImages)
+        GTEST_SKIP() << test.name << " does not expose images";
+
+    VernonRhiOwnedDeviceDescriptor deviceDescriptor{};
+    deviceDescriptor.struct_size = sizeof(deviceDescriptor);
+    deviceDescriptor.backend = test.backend;
+    const VernonRhiDevice device = vernonRhiCreateDevice(&deviceDescriptor);
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        GTEST_SKIP() << test.name << " is unavailable";
+
+    VernonRhiImageDescriptor imageDescriptor{};
+    imageDescriptor.struct_size = sizeof(imageDescriptor);
+    imageDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    imageDescriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    imageDescriptor.width = imageDescriptor.height = 4;
+    imageDescriptor.depth = 1;
+    imageDescriptor.mip_levels = 1;
+    imageDescriptor.array_layers = 1;
+    imageDescriptor.sample_count = 1;
+    imageDescriptor.usage = VERNON_RHI_IMAGE_SAMPLED;
+    VernonRhiImage image{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &image), VERNON_RHI_STATUS_OK);
+
+    VernonRhiImageViewDescriptor viewDescriptor{};
+    viewDescriptor.struct_size = sizeof(viewDescriptor);
+    viewDescriptor.image = image;
+    viewDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    viewDescriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    viewDescriptor.mip_level_count = 1;
+    viewDescriptor.array_layer_count = 1;
+    viewDescriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
+    VernonRhiImageView view{};
+    ASSERT_EQ(vernonRhiDeviceCreateImageView(device, &viewDescriptor, &view), VERNON_RHI_STATUS_OK);
+
+    VernonRhiImage replacement{};
+    {
+        vernon::execution::ExecutionGraph graph(device);
+        const vernon::execution::GraphImage imported = graph.importImage(image, view);
+        ASSERT_NE(imported.id, UINT32_MAX);
+        ASSERT_EQ(vernonRhiDeviceDestroyImageView(device, view), VERNON_RHI_STATUS_OK);
+        ASSERT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
+        ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &replacement), VERNON_RHI_STATUS_OK);
+        EXPECT_NE(replacement.index, image.index);
+    }
+
+    VernonRhiImage recycled{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &recycled), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(recycled.index, image.index);
+    EXPECT_NE(recycled.generation, image.generation);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, replacement), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, recycled), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
+}
+
 INSTANTIATE_TEST_SUITE_P(GpuBackends, RhiResourceLifetime,
                          testing::Values(BackendCase{VERNON_RHI_BACKEND_CUDA, "CUDA", false},
                                          BackendCase{VERNON_RHI_BACKEND_VULKAN, "Vulkan", true},

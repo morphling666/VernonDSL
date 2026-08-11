@@ -36,10 +36,12 @@ VernonStatus invokeBackendComputePipeline(VernonLoadedPipeline &pipeline, const 
 VernonStatus synchronizeBackend(VernonRuntimeContext &context);
 VernonStatus referenceBackendRhiBuffer(VernonRuntimeContext &context, VernonRhiBuffer buffer, uint64_t offset,
                                        uint64_t size, VernonRuntimeProviderResourceReference &output);
-VernonStatus referenceBackendRhiImage(VernonRuntimeContext &context, VernonRhiImage image,
-                                      VernonRuntimeProviderResourceReference &output);
+VernonStatus referenceBackendRhiImageView(VernonRuntimeContext &context, VernonRhiImageView view,
+                                          VernonRuntimeProviderResourceReference &output);
 VernonStatus referenceBackendRhiSampler(VernonRuntimeContext &context, VernonRhiSampler sampler,
                                         VernonRuntimeProviderResourceReference &output);
+VernonStatus describeBackendImage(VernonRuntimeContext &context, VernonRuntimeProviderResourceReference resource,
+                                  VernonRuntimeProviderImageDescription &description);
 VernonStatus referenceBackendCommandEncoder(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
                                             VernonRuntimeProviderObject &output);
 

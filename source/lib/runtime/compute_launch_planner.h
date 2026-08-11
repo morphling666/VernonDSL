@@ -7,23 +7,35 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace vernon::runtime {
 
-enum class ComputeLaunchArgumentKind { Tensor, Texture, Scalar };
-
-struct ComputeLaunchArgument {
-    ComputeLaunchArgumentKind kind{ComputeLaunchArgumentKind::Tensor};
+struct ComputeTensorArgument {
     VernonRuntimeProviderResourceReference resource{};
     const void *hostData{};
     size_t hostSize{};
-    const void *scalarData{};
-    size_t scalarSize{};
     const VernonTensorView *tensorView{};
-    VernonTextureFormat textureFormat{};
-    VernonTextureDimension textureDimension{};
+    const void *tensorViewData{};
+    size_t tensorViewSize{};
 };
+
+struct ComputeImageArgument {
+    VernonRuntimeProviderResourceReference view{};
+};
+
+struct ComputeScalarArgument {
+    const void *data{};
+    size_t size{};
+};
+
+struct ComputeSamplerArgument {
+    VernonRuntimeProviderResourceReference resource{};
+};
+
+using ComputeLaunchArgument =
+    std::variant<ComputeTensorArgument, ComputeImageArgument, ComputeScalarArgument, ComputeSamplerArgument>;
 
 enum class ComputeBindingSourceKind { Argument, TensorOffset, TensorExtent, TensorStride };
 

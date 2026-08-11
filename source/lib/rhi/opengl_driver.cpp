@@ -124,6 +124,8 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
     LOAD(genTextures, "glGenTextures");
     LOAD(deleteTextures, "glDeleteTextures");
     LOAD(bindTexture, "glBindTexture");
+    driver.textureView = reinterpret_cast<decltype(driver.textureView)>(
+        callbacks.get_proc_address(callbacks.user_data, "glTextureView"));
     driver.bindImageTexture = reinterpret_cast<decltype(driver.bindImageTexture)>(
         callbacks.get_proc_address(callbacks.user_data, "glBindImageTexture"));
     LOAD(texImage2D, "glTexImage2D");

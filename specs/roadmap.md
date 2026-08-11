@@ -267,37 +267,17 @@ tuning are not current Metal roadmap commitments.
 - Remove hardcoded native Metal format values from tests and prevent parallel
   backend builds from overwriting the same development Python module.
 
-Any further public RHI, Provider, or RuntimeCore layout cleanup requires an
-intentional pipeline contract bump and migration of every enabled backend.
+Public RHI, Provider, or RuntimeCore layout changes require coordinated
+cross-backend migration, but only changes to serialized reflection or compiled
+pipeline artifacts require a pipeline contract bump.
 
 ### Texture follow-up
 
-The accepted long-term resource, view, binding, provider, and RHI direction is
-defined in
-[`Image resource architecture`](runtime/image_resources.md). Its migration is
-post-0.1.2 and requires an intentional pipeline contract revision; the current
-flattened invocation and provider records are not the target architecture.
-
-The 0.1.2 texture work does not include a public shader-visible image-view API.
-Regional upload and download remain transfer operations and do not imply shader
-view aliasing. Complete image views later as separate, reviewable changes:
-
-1. define the Python and native view semantics for mip ranges, array/cube
-   layers, format compatibility, ownership, and resource lifetime;
-2. implement and test owned Vulkan, Metal, and DirectX 12 views;
-3. implement OpenGL views only for OpenGL 4.3 or `ARB_texture_view`, while older
-   OpenGL and OpenGL ES continue to support transfer-region slicing only;
-4. connect views to sampled/storage bindings and add cross-backend acceptance
-   tests.
-
-DirectX 12 mip generation also remains separate work. Add an internal compute
-shader, compile it during the build/release process, embed the generated shader
-artifact, and cover 2D and 3D mip chains on Windows hardware. Do not add a
-runtime shader-compiler dependency.
-
-Keep these as independent commits: image-view contract, one backend per view
-implementation, binding integration, and DirectX 12 mip generation must not be
-combined into one texture feature commit.
+The accepted resource, view, binding, provider, and RHI contract is defined in
+[`Image resource architecture`](runtime/image_resources.md). The 0.1.2
+implementation includes public Python image views, view-only shader and
+attachment bindings, authoritative provider descriptor queries, cross-backend
+view lifetime handling, and build-time embedded DirectX 12 mip generation.
 
 ### Asynchronous GPU resource lifetime
 

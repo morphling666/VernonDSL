@@ -7,7 +7,7 @@
 
 namespace vernon::rhi {
 
-enum class ResourceKind : uint32_t { Buffer = 1, Image = 2, Sampler = 3 };
+enum class ResourceKind : uint32_t { Buffer = 1, Image = 2, Sampler = 3, ImageView = 4 };
 enum CommandRenderingKind : uint32_t {
     CommandRenderingDynamic = 1,
     CommandRenderingRenderPass = 2,
@@ -71,12 +71,17 @@ struct BackendDispatch {
     VernonRhiStatus (*createImageView)(VernonRhiDevice, const VernonRhiImageViewDescriptor *, VernonRhiImageView *);
     VernonRhiStatus (*destroyImageView)(VernonRhiDevice, VernonRhiImageView);
     VernonRhiStatus (*getImageViewNativeHandle)(VernonRhiDevice, VernonRhiImageView, uint64_t *);
+    uint64_t (*imageViewResource)(VernonRhiDevice, VernonRhiImageView);
+    bool (*describeImageViewResource)(VernonRhiDevice, uint64_t, VernonRhiImageViewDescriptor *,
+                                      VernonRhiImageDescriptor *, uint64_t *);
 };
 
 void setDeviceCreationError(std::string error);
 const BackendDispatch &openGLBackendDispatch();
 VERNON_RHI_CAPI bool deferCommandRollback(VernonRhiDevice device, uint64_t encoderKey, void *context, uint64_t object,
                                           void (*rollback)(void *, uint64_t));
+VERNON_RHI_CAPI bool deferCommandCleanup(VernonRhiDevice device, uint64_t encoderKey, void *context, uint64_t object,
+                                         void (*cleanup)(void *, uint64_t));
 #if defined(VERNON_HAS_CUDA_RHI)
 const BackendDispatch &cudaBackendDispatch();
 #endif

@@ -50,9 +50,9 @@ struct RenderAttachmentSignature {
 
 struct RenderingState {
     id<MTLRenderCommandEncoder> encoder;
-    std::array<id<MTLTexture>, 8> colorTextures{};
+    std::array<id<MTLTexture>, VERNON_RHI_MAX_COLOR_ATTACHMENTS> colorTextures{};
     id<MTLTexture> depthStencilTexture;
-    std::array<RenderAttachmentSignature, 8> colors{};
+    std::array<RenderAttachmentSignature, VERNON_RHI_MAX_COLOR_ATTACHMENTS> colors{};
     RenderAttachmentSignature depth{};
     size_t colorCount{};
     bool hasDepth{};

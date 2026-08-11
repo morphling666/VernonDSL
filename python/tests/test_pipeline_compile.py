@@ -398,10 +398,12 @@ class PipelineCompileTests(unittest.TestCase):
                     "arguments": [
                         {
                             "index": 0,
-                            "kind": "texture",
+                            "kind": "image",
                             "type": '!vernon.texture<"2d", f32, "unknown", "sampled">',
                             "dtype": "f32",
                             "dimension": "2d",
+                            "binding_role": "sampled",
+                            "sample_result_class": "float",
                             "vernon.source_name": "image",
                             "vernon.interface": "resource",
                             "vernon.set": 0,
@@ -415,7 +417,7 @@ class PipelineCompileTests(unittest.TestCase):
                             "vernon.interface": "resource",
                             "vernon.implicit": "sampler",
                             "vernon.implicit_texture": "image",
-                            "sampled_texture_bindings": [
+                            "sampled_image_bindings": [
                                 {
                                     "set": 0,
                                     "binding": 3,
@@ -470,9 +472,9 @@ class PipelineCompileTests(unittest.TestCase):
         )
 
         unpaired = json.loads(json.dumps(records))
-        del unpaired["fragment"]["interface"]["arguments"][1]["sampled_texture_bindings"]
+        del unpaired["fragment"]["interface"]["arguments"][1]["sampled_image_bindings"]
         unpaired_fragment = _stage("fragment", b"fragment", unpaired["fragment"]["interface"])
-        with self.assertRaisesRegex(PipelineCompileError, "no reflected sampled texture binding"):
+        with self.assertRaisesRegex(PipelineCompileError, "no reflected sampled image binding"):
             build_bundle_plan(
                 "pipeline",
                 fragment.target,
@@ -508,7 +510,7 @@ class PipelineCompileTests(unittest.TestCase):
                             "type": "!vernon.sampler",
                             "vernon.source_name": "linear_sampler",
                             "vernon.interface": "resource",
-                            "sampled_texture_bindings": [
+                            "sampled_image_bindings": [
                                 {
                                     "set": 0,
                                     "binding": 1,
@@ -867,7 +869,7 @@ class PipelineCompileTests(unittest.TestCase):
                 "outputs": [
                     {
                         "name": "output_0",
-                        "kind": "texture",
+                        "kind": "image",
                         "dtype": "f32",
                         "shape": [4],
                         "access": "write",
