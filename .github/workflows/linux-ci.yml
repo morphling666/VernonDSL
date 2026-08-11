@@ -76,7 +76,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: llvm-project/install
-          key: linux-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-aarch64-nvptx-libdevice-${{ env.NVIDIA_NVCC_VERSION }}-v1
+          key: linux-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-aarch64-nvptx-wasm-libdevice-${{ env.NVIDIA_NVCC_VERSION }}-v1
 
       - name: Install NVIDIA libdevice
         if: steps.llvm-cache.outputs.cache-hit != 'true'
@@ -93,7 +93,7 @@ jobs:
           --generator Ninja
           --cuda on
           --libdevice "$MLIR_NVVM_LIBDEVICE_PATH"
-          --targets X86,AArch64,NVPTX
+          --targets X86,AArch64,NVPTX,WebAssembly
           --build
           --parallel 3
 
@@ -186,7 +186,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: llvm-project/install
-          key: linux-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-aarch64-nvptx-libdevice-${{ env.NVIDIA_NVCC_VERSION }}-v1
+          key: linux-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-aarch64-nvptx-wasm-libdevice-${{ env.NVIDIA_NVCC_VERSION }}-v1
 
       - name: Install NVIDIA libdevice
         if: steps.llvm-cache.outputs.cache-hit != 'true'
@@ -203,7 +203,7 @@ jobs:
           --generator Ninja
           --cuda on
           --libdevice "$MLIR_NVVM_LIBDEVICE_PATH"
-          --targets X86,AArch64,NVPTX
+          --targets X86,AArch64,NVPTX,WebAssembly
           --build
           --parallel 3
 

@@ -67,7 +67,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: llvm-project/install
-          key: macos-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-aarch64-nvptx-v1
+          key: macos-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-aarch64-nvptx-wasm-v1
 
       - name: Build and install LLVM
         if: steps.llvm-cache.outputs.cache-hit != 'true'
@@ -75,7 +75,7 @@ jobs:
           python scripts/configure_llvm.py
           --generator Ninja
           --cuda off
-          --targets X86,AArch64,NVPTX
+          --targets X86,AArch64,NVPTX,WebAssembly
           --build
           --parallel 3
 
@@ -233,7 +233,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: llvm-project/install
-          key: macos-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-aarch64-nvptx-v1
+          key: macos-${{ runner.arch }}-llvm-${{ steps.llvm-revision.outputs.sha }}-x86-aarch64-nvptx-wasm-v1
 
       - name: Build and install LLVM
         if: steps.llvm-cache.outputs.cache-hit != 'true'
@@ -241,7 +241,7 @@ jobs:
           python scripts/configure_llvm.py
           --generator Ninja
           --cuda off
-          --targets X86,AArch64,NVPTX
+          --targets X86,AArch64,NVPTX,WebAssembly
           --build
           --parallel 3
 
