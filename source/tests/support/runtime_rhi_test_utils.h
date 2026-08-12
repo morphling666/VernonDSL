@@ -35,6 +35,29 @@ struct RhiSampler {
     VernonRuntimeProviderResourceReference reference{};
 };
 
+inline VernonStatus completeSubmission(VernonLoadedPipeline *pipeline, const VernonPipelineInvocation *invocation) {
+    VernonSubmission *submission{};
+    const VernonStatus submitStatus = vernonRuntimePipelineSubmit(pipeline, invocation, &submission);
+    if (submitStatus != VERNON_STATUS_OK)
+        return submitStatus;
+    const VernonStatus completionStatus = vernonSubmissionWait(submission);
+    vernonSubmissionDestroy(submission);
+    return completionStatus;
+}
+
+inline VernonRhiStatus completeSubmission(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
+                                          VernonRhiCommandEncoderStats *stats = nullptr) {
+    VernonRhiCompletion completion{};
+    VernonRhiStatus status = vernonRhiDeviceSubmit(device, encoder, &completion);
+    if (status != VERNON_RHI_STATUS_OK)
+        return status;
+    status = vernonRhiCompletionWait(device, completion);
+    if (status == VERNON_RHI_STATUS_OK && stats)
+        status = vernonRhiCompletionGetCommandStats(device, completion, stats);
+    const VernonRhiStatus destroyStatus = vernonRhiDeviceDestroyCompletion(device, completion);
+    return status == VERNON_RHI_STATUS_OK ? destroyStatus : status;
+}
+
 class RuntimeGraphRenderPass final : public execution::RenderPass {
 public:
     RuntimeGraphRenderPass(std::string name, execution::GraphImage target, VernonRuntimeContext *runtime,

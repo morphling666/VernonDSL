@@ -89,11 +89,24 @@ TEST(RuntimeMetal, CreatesDeviceAndRoundTripsAllBufferMemoryClasses) {
     VernonRhiCommandEncoder encoder{};
     ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceSubmit(device, encoder), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, encoder), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceSynchronize(device), VERNON_RHI_STATUS_OK);
+    VernonRhiCompletion completion{};
+    ASSERT_EQ(vernonRhiDeviceSubmit(device, encoder, &completion), VERNON_RHI_STATUS_OK);
+    VernonRhiCompletionState completionState{};
+    ASSERT_EQ(vernonRhiCompletionGetState(device, completion, &completionState), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(completionState, VERNON_RHI_COMPLETION_SUCCEEDED);
+    ASSERT_EQ(vernonRhiCompletionWait(device, completion), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyCompletion(device, completion), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiCompletionGetState(device, completion, &completionState), VERNON_RHI_STATUS_INVALID_ARGUMENT);
+
+    VernonRhiCommandEncoder shutdownEncoder{};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &encoderDescriptor, &shutdownEncoder), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderFinish(device, shutdownEncoder), VERNON_RHI_STATUS_OK);
+    VernonRhiCompletion shutdownCompletion{};
+    ASSERT_EQ(vernonRhiDeviceSubmit(device, shutdownEncoder, &shutdownCompletion), VERNON_RHI_STATUS_OK);
 
     vernonRhiDestroyDevice(device);
+    EXPECT_EQ(vernonRhiCompletionGetState(device, shutdownCompletion, &completionState),
+              VERNON_RHI_STATUS_INVALID_ARGUMENT);
 }
 
 TEST(RuntimeMetal, ValidatesMslHostVersionAndComputeLimitsWithSpecificErrors) {
@@ -321,8 +334,7 @@ TEST(RuntimeMetal, ValidatesAndRecordsHazardTrackedBarriers) {
     EXPECT_EQ(vernonRhiCommandEncoderBarrier(device, encoder, &invalid, 1), VERNON_RHI_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(vernonRhiCommandEncoderBarrier(device, encoder, barriers.data(), barriers.size()), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceSubmit(device, encoder), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernon::tests::completeSubmission(device, encoder), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, buffer), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
     vernonRhiDestroyDevice(device);
@@ -605,12 +617,11 @@ kernel void add_value(constant AddArguments &arguments [[buffer(0)]],
     dispatch.group_count[2] = 1;
     ASSERT_EQ(provider->encode_dispatch(provider->user_data, providerCommand, &dispatch), VERNON_STATUS_OK);
     ASSERT_EQ(vernonRhiCommandEncoderFinish(device, command), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceSubmit(device, command), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernon::tests::completeSubmission(device, command), VERNON_RHI_STATUS_OK);
     std::array<uint32_t, input.size()> output{};
     ASSERT_EQ(vernonRhiDeviceDownloadBuffer(device, buffer, 0, output.data(), sizeof(output)), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(output, (std::array<uint32_t, 4>{8, 9, 10, 11}));
 
-    EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, command), VERNON_RHI_STATUS_OK);
     provider->destroy_binding_set(provider->user_data, bindings);
     provider->destroy_pipeline(provider->user_data, pipeline);
     provider->destroy_pipeline_layout(provider->user_data, layout);
@@ -742,12 +753,11 @@ TEST(RuntimeMetal, ProviderBindsMoreThanThirtyBuffersAcrossDescriptorSetsAndReta
     for (size_t index = 1; index < buffers.size(); ++index)
         ASSERT_EQ(vernonRhiDeviceDestroyBuffer(device, buffers[index]), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiCommandEncoderFinish(device, command), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceSubmit(device, command), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernon::tests::completeSubmission(device, command), VERNON_RHI_STATUS_OK);
     uint32_t output = 0;
     ASSERT_EQ(vernonRhiDeviceDownloadBuffer(device, buffers[0], 0, &output, sizeof(output)), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(output, 528u);
 
-    EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, command), VERNON_RHI_STATUS_OK);
     provider->destroy_binding_set(provider->user_data, bindings);
     provider->destroy_pipeline(provider->user_data, pipeline);
     provider->destroy_pipeline_layout(provider->user_data, layout);
@@ -884,7 +894,7 @@ kernel void copy_texture(constant TextureArguments &arguments [[buffer(0)]]) {
     dispatch.group_count[0] = dispatch.group_count[1] = dispatch.group_count[2] = 1;
     ASSERT_EQ(provider->encode_dispatch(provider->user_data, providerCommand, &dispatch), VERNON_STATUS_OK);
     ASSERT_EQ(vernonRhiCommandEncoderFinish(device, command), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceSubmit(device, command), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernon::tests::completeSubmission(device, command), VERNON_RHI_STATUS_OK);
     std::array<uint8_t, 4> result{};
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
@@ -897,7 +907,6 @@ kernel void copy_texture(constant TextureArguments &arguments [[buffer(0)]]) {
               VERNON_RHI_STATUS_OK);
     EXPECT_EQ(result, color);
 
-    EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, command), VERNON_RHI_STATUS_OK);
     provider->destroy_binding_set(provider->user_data, bindings);
     provider->destroy_pipeline(provider->user_data, pipeline);
     provider->destroy_pipeline_layout(provider->user_data, layout);
@@ -1128,7 +1137,7 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
               VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiCommandEncoderEndRendering(device, command), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiCommandEncoderFinish(device, command), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceSubmit(device, command), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernon::tests::completeSubmission(device, command), VERNON_RHI_STATUS_OK);
     std::array<uint8_t, 4 * 4 * 4> pixels{};
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
@@ -1157,7 +1166,6 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
         EXPECT_EQ(depthStencil[index + 4], 3);
     }
 
-    EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, command), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImageView(device, depthView), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, depthImage), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImageView(device, view), VERNON_RHI_STATUS_OK);
@@ -1263,10 +1271,14 @@ TEST(RuntimeMetal, PublicRuntimeLoadsDispatchesAndReadsBackCookedBundle) {
                                                               &invocation);
     graph.emplacePass<vernon::tests::RuntimeGraphComputePass>("second scale", graphBuffer, runtime, pipeline,
                                                               &invocation);
-    ASSERT_EQ(graph.execute(), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(graph.lastStats().dispatch_count, 2u);
-    EXPECT_EQ(graph.lastStats().barrier_count, 1u);
-    EXPECT_EQ(graph.lastStats().submission_count, 1u);
+    std::string graphError;
+    auto plan = graph.compile(graphError);
+    ASSERT_TRUE(plan) << graphError;
+    auto submission = plan->submit();
+    ASSERT_EQ(submission.wait(), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(submission.commandStats().dispatch_count, 2u);
+    EXPECT_EQ(submission.commandStats().barrier_count, 1u);
+    EXPECT_EQ(submission.commandStats().submission_count, 1u);
     std::array<float, source.size()> output{};
     ASSERT_EQ(vernonRhiDeviceDownloadBuffer(device, buffer, 0, output.data(), sizeof(output)), VERNON_RHI_STATUS_OK);
     for (size_t index = 0; index < output.size(); ++index)
@@ -1368,7 +1380,7 @@ TEST(RuntimeMetal, PublicRuntimeBindsCookedResolutionUniform) {
     invocation.color_attachment_count = 1;
     invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
     invocation.instance_count = 1;
-    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
+    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     std::vector<uint8_t> pixels(32 * 32 * 4);
     VernonRhiImageDownloadDescriptor download{};
@@ -1549,11 +1561,11 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
     invocation.instance_count = 1;
     VernonIndexBinding invalidIndex{static_cast<VernonIndexType>(1), 0, indices.size(), indexReference};
     invocation.index_binding = &invalidIndex;
-    EXPECT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
     const VernonStringView indexError = vernonRuntimeGetLastError(runtime);
     EXPECT_NE(std::string(indexError.data, indexError.size).find("index binding is invalid"), std::string::npos);
     invocation.index_binding = nullptr;
-    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
+    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
 
     std::vector<uint8_t> pixels(32 * 32 * 4);
@@ -1599,8 +1611,12 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
             graph.emplacePass<vernon::tests::RuntimeGraphRenderPass>(pass ? "second draw" : "first draw", graphTarget,
                                                                      runtime, pipeline, &invocation,
                                                                      VERNON_RHI_LOAD_PRESERVE);
-        EXPECT_EQ(graph.execute(), VERNON_RHI_STATUS_OK);
-        return graph.lastStats();
+        std::string graphError;
+        auto plan = graph.compile(graphError);
+        EXPECT_TRUE(plan) << graphError;
+        auto submission = plan->submit();
+        EXPECT_EQ(submission.wait(), VERNON_RHI_STATUS_OK);
+        return submission.commandStats();
     };
 
     VernonColorBlendState blend{};

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -193,36 +193,16 @@ def create_sky_cube() -> np.ndarray:
     return np.ascontiguousarray(corners[two_sided.reshape(-1)])
 
 
-@dataclass
-class InvocationSlot:
-    value: vd.PipelineInvocation | None = None
-
-    def require(self) -> vd.PipelineInvocation:
-        if self.value is None:
-            raise RuntimeError("execution graph invocation was not prepared")
-        return self.value
-
-
 class ComputeInvocationPass(vd.ComputePass):
-    def __init__(self, name: str, slot: InvocationSlot):
+    def __init__(self, name: str, invocation: vd.PipelineInvocation):
         super().__init__(name)
-        self.slot = slot
+        self.invocation = invocation
 
     def declare(self) -> None:
-        self.slot.require().declare(self)
+        self.invocation.declare(self)
 
     def execute(self, encoder: vd.ComputeEncoder, resources: vd.ExecutionResources) -> None:
-        self.slot.require().encode(encoder, resources)
-
-
-@dataclass
-class InvocationBatch:
-    values: list[vd.PipelineInvocation] = field(default_factory=list)
-
-    def require(self) -> list[vd.PipelineInvocation]:
-        if not self.values:
-            raise RuntimeError("render invocation batch was not prepared")
-        return self.values
+        self.invocation.encode(encoder, resources)
 
 
 class BatchRenderPass(vd.RenderPass):
@@ -230,22 +210,22 @@ class BatchRenderPass(vd.RenderPass):
         self,
         name: str,
         target: vd.RenderTarget,
-        batch: InvocationBatch,
+        invocations: list[vd.PipelineInvocation],
         *,
         clear_color: tuple[float, float, float, float],
     ):
         super().__init__(name)
         self.target = target
-        self.batch = batch
+        self.invocations = tuple(invocations)
         self.clear_color = clear_color
 
     def declare(self) -> None:
-        for invocation in self.batch.require():
+        for invocation in self.invocations:
             invocation.declare(self)
         self.attachments(self.target, clear_color=self.clear_color)
 
     def execute(self, encoder: vd.GraphicsEncoder, resources: vd.ExecutionResources) -> None:
-        for invocation in self.batch.require():
+        for invocation in self.invocations:
             invocation.encode(encoder, resources)
 
 
@@ -288,7 +268,7 @@ class FramePresenter:
             raise RuntimeError(f"cannot write screenshot to {output}")
 
 
-def architecture_from_name(name: str) -> object:
+def architecture_from_name(name: str) -> Any:
     architectures = {
         "vulkan": vd.vulkan,
         "directx": vd.directx,
@@ -397,17 +377,20 @@ def image_statistics(image: np.ndarray) -> dict[str, float | int | list[int]]:
         raise ValueError("showcase image must be a non-empty four-channel image")
     rgb = image[..., :3].astype(np.float32)
     alpha = image[..., 3]
+    stddev = float(np.std(rgb))
+    maximum = int(np.max(rgb))
+    nonzero_alpha = int(np.count_nonzero(alpha))
     statistics: dict[str, float | int | list[int]] = {
         "shape": [int(value) for value in image.shape],
         "mean": float(np.mean(rgb)),
-        "stddev": float(np.std(rgb)),
+        "stddev": stddev,
         "minimum": int(np.min(rgb)),
-        "maximum": int(np.max(rgb)),
-        "nonzero_alpha": int(np.count_nonzero(alpha)),
+        "maximum": maximum,
+        "nonzero_alpha": nonzero_alpha,
     }
-    if statistics["nonzero_alpha"] == 0:
+    if nonzero_alpha == 0:
         raise RuntimeError("showcase produced an image with empty alpha")
-    if statistics["maximum"] == 0 or statistics["stddev"] < 0.25:
+    if maximum == 0 or stddev < 0.25:
         raise RuntimeError("showcase produced an empty or effectively uniform image")
     return statistics
 

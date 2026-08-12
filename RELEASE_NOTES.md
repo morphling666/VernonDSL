@@ -1,7 +1,7 @@
 # VernonDSL 0.1.2 release notes
 
-VernonDSL 0.1.2 is the current cross-platform stable release of the language,
-compiler, offline cooker, synchronous Runtime/RHI, and ExecutionGraph APIs.
+VernonDSL 0.1.2 is the upcoming cross-platform release of the language,
+compiler, offline cooker, and submission-based Runtime/RHI and ExecutionGraph APIs.
 
 ## Highlights
 
@@ -40,14 +40,15 @@ compiler, offline cooker, synchronous Runtime/RHI, and ExecutionGraph APIs.
   provide the required argument-buffer tier or encoder.
 - Graphics rendering is offscreen with host readback; VernonRuntime does not
   provide swapchain or window presentation.
-- Runtime invocation, owned RHI submission, and `ExecutionGraph.execute()` are
-  synchronous and permit at most one owned submission in flight per device.
+- Runtime, RHI, and ExecutionGraph execution return explicit submission
+  objects. ExecutionGraph now separates a mutable builder, immutable compiled
+  plan, and per-run submission state.
 - Dynamic TensorView shape, stride, and offset are invocation data and do not
   require recompilation.
 - CPU graphics, CUDA image/sampler resources, f16/f64 vertex attributes, and
   non-relaxed atomic orderings are outside the supported `0.1.2` subset.
-- Asynchronous dispatch, deferred graph execution, and multiple frames in
-  flight are outside the `0.1.2` contract.
+- Concurrent dispatch and multiple frames in flight are not guaranteed in
+  `0.1.2`; backends may complete submissions inline.
 - The released frontend remains language version 3. Language v4 is a roadmap
   target.
 

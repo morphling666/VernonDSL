@@ -1,5 +1,6 @@
 #include "VernonCpuWorkgroupABI.h"
 #include "runtime/content_hash.h"
+#include "runtime_rhi_test_utils.h"
 #include "vernon-c/Runtime.h"
 
 #include <nlohmann/json.hpp>
@@ -291,7 +292,7 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.compute_grid = {2, 1, 2};
-    ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
+    ASSERT_TRUE(vernon::tests::completeSubmission(pipeline, &invocation) == VERNON_STATUS_OK);
 
     ASSERT_TRUE(output[0] == 0.0f && output[3] == 3.0f);
     ASSERT_TRUE(output[4] == 10.0f && output[15] == 113.0f);
@@ -304,13 +305,13 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     ASSERT_TRUE(constantLoaded);
     VernonLoadedPipeline *constantPipeline = vernonRuntimeResolvePipeline(constantLoaded, {nullptr, 0});
     ASSERT_TRUE(constantPipeline);
-    EXPECT_EQ(vernonRuntimePipelineInvoke(constantPipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(vernon::tests::completeSubmission(constantPipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
     const VernonStringView constantError = vernonRuntimeGetLastError(runtime);
     EXPECT_NE(std::string(constantError.data ? constantError.data : "", constantError.size)
                   .find("compute dispatch grid axis"),
               std::string::npos);
     invocation.compute_grid = {1, 1, 1};
-    EXPECT_EQ(vernonRuntimePipelineInvoke(constantPipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(vernon::tests::completeSubmission(constantPipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
 
     vernonRuntimeLoadedPipelineDestroy(constantPipeline);
     vernonRuntimePipelineBundleDestroy(constantLoaded);
@@ -385,8 +386,8 @@ TEST(RuntimeCpuPipeline, WebProfileLoadsMultipleStaticPipelinesWithoutFilesystem
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.compute_grid = {2, 1, 2};
-    EXPECT_EQ(vernonRuntimePipelineInvoke(first, &invocation), VERNON_STATUS_OK);
-    EXPECT_EQ(vernonRuntimePipelineInvoke(second, &invocation), VERNON_STATUS_OK);
+    EXPECT_EQ(vernon::tests::completeSubmission(first, &invocation), VERNON_STATUS_OK);
+    EXPECT_EQ(vernon::tests::completeSubmission(second, &invocation), VERNON_STATUS_OK);
     EXPECT_EQ(output[15], 113.0f);
 
     vernonRuntimeLoadedPipelineDestroy(second);

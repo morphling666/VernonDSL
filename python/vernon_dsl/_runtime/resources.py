@@ -85,68 +85,156 @@ class _TextureResource:
                 raise RuntimeError("host reads are forbidden while a device dispatch writes Texture")
 
 
-def _bind_native_argument(
-    builder: Any,
-    parameter: Any,
-    value: Any,
-    *,
-    host_value: bool = False,
-    annotation: Any | None = None,
-) -> Any:
-    state = _session_state()
-    if isinstance(value, (TensorStorage, TensorView)):
-        if state._architecture == state.cpu or host_value:
-            return builder.host_tensor(parameter.name, value._native_host_array())
-        if state._rhi_host is None:
-            raise RuntimeError("device Tensor arguments require a GPU RHI host")
-        layout = value.layout
-        return builder.rhi_tensor(
-            parameter.name,
-            value._resident_buffer(),
-            parameter.access,
-            list(value.shape),
-            list(layout.byte_strides),
-            layout.byte_offset,
-        )
-    if isinstance(value, _TextureResource):
-        if state._architecture == state.cpu:
-            raise TypeError("CPU kernels do not support Texture arguments")
-        if state._rhi_host is None:
-            raise RuntimeError("Texture arguments require a GPU RHI host")
-        return builder.rhi_texture(parameter.name, value._resident_view())
+class _NativeBindingCache:
+    """Caches immutable native arguments while still performing dirty resource residency checks."""
 
-    value_type = type(value)
-    struct_type = (
-        annotation
-        if isinstance(annotation, type) and getattr(annotation, "__vernon_dsl__", (None, {}))[0] == "struct"
-        else value_type
-        if getattr(value_type, "__vernon_dsl__", (None, {}))[0] == "struct"
-        else None
-    )
-    if struct_type is not None:
-        layout = host_abi_layout(struct_type)
-        host_array = np.empty((), dtype=layout.dtype)
-        host_array[()] = pack_host_value(struct_type, value, parameter.name)
-        return builder.host_tensor(parameter.name, host_array)
+    def __init__(self) -> None:
+        self._native_pipeline: Any | None = None
+        self._prepared: dict[int, tuple[tuple[Any, ...], Any]] = {}
+        self._lock = threading.RLock()
 
-    numpy_dtypes = {
-        state._native.DATA_BOOL: np.dtype(np.bool_),
-        state._native.DATA_I32: np.dtype(np.int32),
-        state._native.DATA_U32: np.dtype(np.uint32),
-        state._native.DATA_F16: np.dtype(np.float16),
-        state._native.DATA_F32: np.dtype(np.float32),
-        state._native.DATA_F64: np.dtype(np.float64),
-    }
-    leaves = tuple(parameter.element_leaves)
-    dtype = numpy_dtypes.get(leaves[0][0]) if len(leaves) == 1 and leaves[0][1:] == (1, 0) else None
-    if dtype is None:
-        raise TypeError(f"aggregate parameter {parameter.name!r} requires canonical TensorStorage")
-    host_array = np.asarray(value, dtype=dtype)
-    if tuple(host_array.shape) != tuple(parameter.shape):
-        raise ValueError(
-            f"parameter {parameter.name!r} expects shape {tuple(parameter.shape)}, got {tuple(host_array.shape)}"
+    def clear(self) -> None:
+        with self._lock:
+            self._native_pipeline = None
+            self._prepared.clear()
+
+    @contextmanager
+    def invocation(self, native_pipeline: Any) -> Iterator[Any]:
+        with self._lock:
+            if native_pipeline is not self._native_pipeline:
+                self._native_pipeline = native_pipeline
+                self._prepared.clear()
+            yield native_pipeline.invocation_builder()
+
+    def _bind(self, builder: Any, parameter: Any, token: tuple[Any, ...], prepare: Any) -> None:
+        cached = self._prepared.get(parameter.slot)
+        if cached is None or cached[0] != token:
+            cached = (token, prepare())
+            self._prepared[parameter.slot] = cached
+        builder.prepared_argument(cached[1])
+
+    def bind_argument(
+        self,
+        builder: Any,
+        native_pipeline: Any,
+        parameter: Any,
+        value: Any,
+        *,
+        host_value: bool = False,
+        annotation: Any | None = None,
+        binding_token: int | None = None,
+    ) -> None:
+        state = _session_state()
+        if isinstance(value, (TensorStorage, TensorView)):
+            if state._architecture == state.cpu or host_value:
+                array = value._native_host_array()
+                token = (
+                    "host-resource",
+                    int(array.ctypes.data),
+                    array.dtype.str,
+                    tuple(array.shape),
+                    tuple(array.strides),
+                )
+                self._bind(
+                    builder,
+                    parameter,
+                    token,
+                    lambda: builder.prepare_host_tensor(parameter.name, array),
+                )
+                return
+            if state._rhi_host is None:
+                raise RuntimeError("device Tensor arguments require a GPU RHI host")
+            buffer = value._resident_buffer()
+            layout = value.layout
+            token = (
+                "rhi-tensor",
+                id(buffer),
+                parameter.access,
+                tuple(value.shape),
+                tuple(layout.byte_strides),
+                layout.byte_offset,
+            )
+            self._bind(
+                builder,
+                parameter,
+                token,
+                lambda: builder.prepare_rhi_tensor(
+                    parameter.name,
+                    buffer,
+                    parameter.access,
+                    list(value.shape),
+                    list(layout.byte_strides),
+                    layout.byte_offset,
+                ),
+            )
+            return
+        if isinstance(value, _TextureResource):
+            if state._architecture == state.cpu:
+                raise TypeError("CPU kernels do not support Texture arguments")
+            if state._rhi_host is None:
+                raise RuntimeError("Texture arguments require a GPU RHI host")
+            view = value._resident_view()
+            self._bind(
+                builder,
+                parameter,
+                ("rhi-texture", id(view)),
+                lambda: builder.prepare_rhi_texture(parameter.name, view),
+            )
+            return
+
+        execution_token = ("execution-value", binding_token) if binding_token is not None else None
+        cached = self._prepared.get(parameter.slot)
+        if execution_token is not None and cached is not None and cached[0] == execution_token:
+            builder.prepared_argument(cached[1])
+            return
+
+        value_type = type(value)
+        struct_type = (
+            annotation
+            if isinstance(annotation, type) and getattr(annotation, "__vernon_dsl__", (None, {}))[0] == "struct"
+            else value_type
+            if getattr(value_type, "__vernon_dsl__", (None, {}))[0] == "struct"
+            else None
         )
-    return builder.host_tensor(parameter.name, host_array)
+        if struct_type is not None:
+            layout = host_abi_layout(struct_type)
+            host_array = np.empty((), dtype=layout.dtype)
+            host_array[()] = pack_host_value(struct_type, value, parameter.name)
+        else:
+            numpy_dtypes = {
+                state._native.DATA_BOOL: np.dtype(np.bool_),
+                state._native.DATA_I32: np.dtype(np.int32),
+                state._native.DATA_U32: np.dtype(np.uint32),
+                state._native.DATA_F16: np.dtype(np.float16),
+                state._native.DATA_F32: np.dtype(np.float32),
+                state._native.DATA_F64: np.dtype(np.float64),
+            }
+            leaves = tuple(parameter.element_leaves)
+            dtype = numpy_dtypes.get(leaves[0][0]) if len(leaves) == 1 and leaves[0][1:] == (1, 0) else None
+            if dtype is None:
+                raise TypeError(f"aggregate parameter {parameter.name!r} requires canonical TensorStorage")
+            host_array = np.asarray(value, dtype=dtype)
+            if tuple(host_array.shape) != tuple(parameter.shape):
+                raise ValueError(
+                    f"parameter {parameter.name!r} expects shape {tuple(parameter.shape)}, "
+                    f"got {tuple(host_array.shape)}"
+                )
+        token = execution_token or ("host-value", host_array.dtype.str, tuple(host_array.shape), host_array.tobytes())
+        self._bind(
+            builder,
+            parameter,
+            token,
+            lambda: builder.prepare_host_tensor(parameter.name, host_array),
+        )
+
+    def bind_sampler(self, builder: Any, native_pipeline: Any, parameter: Any, sampler: SamplerState) -> None:
+        resident = sampler._resident_sampler()
+        self._bind(
+            builder,
+            parameter,
+            ("rhi-sampler", id(resident)),
+            lambda: builder.prepare_rhi_sampler(parameter.name, resident),
+        )
 
 
 @dataclass(frozen=True)
@@ -251,6 +339,78 @@ def _logical_collection_shape(values: Any, element_type: Any) -> tuple[int, ...]
     return (len(values), *child_shapes[0])
 
 
+def _coalesced_byte_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    result: list[tuple[int, int]] = []
+    for begin, end in sorted(ranges):
+        if begin >= end:
+            continue
+        if result and begin <= result[-1][1]:
+            result[-1] = (result[-1][0], max(result[-1][1], end))
+        else:
+            result.append((begin, end))
+    return result
+
+
+_MAX_DIRTY_BYTE_RANGES = 4096
+
+
+class _DirtyRangeSet:
+    """Exact coalesced byte ranges awaiting host-to-device transfer."""
+
+    def __init__(self, byte_size: int, *, dirty: bool = False):
+        self._byte_size = byte_size
+        self._ranges = [(0, byte_size)] if dirty and byte_size else []
+
+    @property
+    def ranges(self) -> tuple[tuple[int, int], ...]:
+        return tuple(self._ranges)
+
+    def mark(self, ranges: list[tuple[int, int]], *, allow_full: bool) -> None:
+        if not ranges:
+            return
+        dirty = _coalesced_byte_ranges([*self._ranges, *ranges])
+        if allow_full and (
+            len(dirty) > _MAX_DIRTY_BYTE_RANGES or sum(end - begin for begin, end in dirty) * 2 >= self._byte_size
+        ):
+            dirty = [(0, self._byte_size)]
+        self._ranges = dirty
+
+    def should_promote_full(self, ranges: list[tuple[int, int]]) -> bool:
+        dirty = _coalesced_byte_ranges([*self._ranges, *ranges])
+        return len(dirty) > _MAX_DIRTY_BYTE_RANGES or sum(end - begin for begin, end in dirty) * 2 >= self._byte_size
+
+    def mark_all(self) -> None:
+        self._ranges = [(0, self._byte_size)] if self._byte_size else []
+
+    def clear(self) -> None:
+        self._ranges.clear()
+
+    def __bool__(self) -> bool:
+        return bool(self._ranges)
+
+
+def _array_byte_ranges(array: np.ndarray, allocation: np.ndarray) -> list[tuple[int, int]]:
+    if not array.size:
+        return []
+    base_offset = int(array.ctypes.data) - int(allocation.ctypes.data)
+    block_size = array.dtype.itemsize
+    split = array.ndim
+    for dimension in range(array.ndim - 1, -1, -1):
+        if array.strides[dimension] != block_size:
+            break
+        block_size *= array.shape[dimension]
+        split = dimension
+    if split == 0:
+        return [(base_offset, base_offset + block_size)]
+    ranges = []
+    for index in np.ndindex(array.shape[:split]):
+        offset = base_offset + sum(
+            component * stride for component, stride in zip(index, array.strides[:split], strict=True)
+        )
+        ranges.append((offset, offset + block_size))
+    return _coalesced_byte_ranges(ranges)
+
+
 class TensorStorage:
     """Host owner of a dense row-major allocation with one canonical element layout."""
 
@@ -273,12 +433,8 @@ class TensorStorage:
         self._element_alignment = element_layout.alignment if element_layout is not None else array.dtype.itemsize
         self._native_buffer: Any | None = None
         self._native_generation = -1
-        self._host_version = 1
-        self._uploaded_version = 0
+        self._dirty_ranges = _DirtyRangeSet(array.nbytes, dirty=True)
         self._device_dirty = False
-        self._allocation_count = 0
-        self._upload_count = 0
-        self._download_count = 0
         self._borrow_lock = threading.RLock()
         self._active_borrows: list[tuple[object, object, str]] = []
         self._full_views: dict[str, TensorView] = {}
@@ -526,8 +682,97 @@ class TensorStorage:
         ):
             raise ValueError("upload requires matching dtype, shape, and contiguity")
         np.copyto(target, array)
-        self._host_version += 1
-        self._device_dirty = False
+        self._mark_host_dirty([(0, self._array.nbytes)])
+
+    def update(self, indices: int | slice | list[int] | np.ndarray, values: np.ndarray) -> None:
+        """Replace selected first-axis elements and dirty only their backing byte ranges."""
+        self._ensure_host_mutation_allowed()
+        if not self.shape:
+            raise ValueError("partial TensorStorage updates require a non-scalar storage shape")
+        target = self._native_host_array()
+        normalized_indices: np.ndarray | None = None
+        if isinstance(indices, (int, np.integer)) and not isinstance(indices, bool):
+            normalized = int(indices)
+            if normalized < 0:
+                normalized += self.shape[0]
+            if normalized < 0 or normalized >= self.shape[0]:
+                raise IndexError("partial update index is outside TensorStorage")
+            selection: int | slice | np.ndarray = normalized
+        elif isinstance(indices, slice):
+            selection = indices
+        else:
+            raw_indices = np.asarray(indices)
+            if raw_indices.ndim != 1:
+                raise ValueError("partial update indices must be one-dimensional")
+            if raw_indices.dtype.kind not in {"i", "u"}:
+                raise TypeError("partial update indices must be integers")
+            normalized_indices = raw_indices.astype(np.int64, copy=False)
+            normalized_indices = np.where(
+                normalized_indices < 0, normalized_indices + self.shape[0], normalized_indices
+            )
+            if np.any(normalized_indices < 0) or np.any(normalized_indices >= self.shape[0]):
+                raise IndexError("partial update index is outside TensorStorage")
+            selection = normalized_indices
+        selected = target[selection]
+        if (
+            not isinstance(values, np.ndarray)
+            or values.dtype != selected.dtype
+            or values.shape != selected.shape
+            or not values.flags.c_contiguous
+        ):
+            raise ValueError("partial update values require matching dtype, shape, and contiguity")
+        if isinstance(selection, int):
+            ranges = _array_byte_ranges(target[normalized : normalized + 1], self._array)
+        elif isinstance(selection, slice):
+            ranges = _array_byte_ranges(target[selection], self._array)
+        else:
+            assert normalized_indices is not None
+            ranges = [
+                byte_range
+                for index in normalized_indices
+                for byte_range in _array_byte_ranges(target[int(index) : int(index) + 1], self._array)
+            ]
+        self._prepare_partial_host_write(ranges)
+        target[selection] = values
+        self._mark_host_dirty(ranges, host_complete=False)
+
+    def update_values(self, indices: int | list[int] | np.ndarray, values: Any) -> None:
+        """Replace selected logical struct elements without repacking unchanged elements."""
+        self._ensure_host_mutation_allowed()
+        if (
+            self._element_layout is None
+            or isinstance(self._element_layout, TangentLayout)
+            or self._element_type is None
+        ):
+            raise TypeError("update_values requires a Struct TensorStorage")
+        if len(self.shape) != 1:
+            raise ValueError("update_values currently requires one-dimensional Struct storage")
+        scalar_index = isinstance(indices, (int, np.integer)) and not isinstance(indices, bool)
+        raw_indices = np.asarray([indices] if scalar_index else indices)
+        if raw_indices.ndim != 1:
+            raise ValueError("partial value update indices must be one-dimensional")
+        if raw_indices.dtype.kind not in {"i", "u"}:
+            raise TypeError("partial value update indices must be integers")
+        normalized_indices = raw_indices.astype(np.int64, copy=False)
+        normalized_indices = np.where(normalized_indices < 0, normalized_indices + self.shape[0], normalized_indices)
+        if np.any(normalized_indices < 0) or np.any(normalized_indices >= self.shape[0]):
+            raise IndexError("partial value update index is outside TensorStorage")
+        logical_values = (values,) if scalar_index else tuple(values)
+        if len(logical_values) != len(normalized_indices):
+            raise ValueError("partial value update requires one logical Value per index")
+        ranges = [
+            byte_range
+            for index in normalized_indices
+            for byte_range in _array_byte_ranges(self._array[int(index) : int(index) + 1], self._array)
+        ]
+        self._prepare_partial_host_write(ranges)
+        for index, logical_value in zip(normalized_indices, logical_values, strict=True):
+            packed = pack_host_value(self._element_type, logical_value)
+            if self._element_layout.dtype.subdtype is None:
+                self._array[int(index)] = packed
+            else:
+                self._array[_VALUE_FIELD][int(index)] = packed
+        self._mark_host_dirty(ranges, host_complete=False)
 
     def copy_from_values(self, values: Any) -> None:
         self._ensure_host_mutation_allowed()
@@ -549,8 +794,16 @@ class TensorStorage:
                 self._array[index] = packed
             else:
                 self._array[_VALUE_FIELD][index] = packed
-        self._host_version += 1
-        self._device_dirty = False
+        self._mark_host_dirty([(0, self._array.nbytes)])
+
+    def _mark_host_dirty(self, ranges: list[tuple[int, int]], *, host_complete: bool = True) -> None:
+        self._dirty_ranges.mark(ranges, allow_full=host_complete or not self._device_dirty)
+        if host_complete:
+            self._device_dirty = False
+
+    def _prepare_partial_host_write(self, ranges: list[tuple[int, int]]) -> None:
+        if self._device_dirty and self._dirty_ranges.should_promote_full(ranges):
+            self.synchronize()
 
     def to_values(self) -> Any:
         if self._element_layout is None or self._element_type is None:
@@ -574,32 +827,44 @@ class TensorStorage:
     def synchronize(self) -> None:
         if not self._device_dirty or self._native_buffer is None:
             return
+        if self._dirty_ranges:
+            self._upload_dirty_ranges()
         downloaded = np.frombuffer(self._native_buffer.download(), dtype=self._array.dtype).reshape(self.shape)
         np.copyto(self._array, downloaded)
-        self._download_count += 1
         self._device_dirty = False
-        self._host_version += 1
-        self._uploaded_version = self._host_version
+        self._dirty_ranges.clear()
+
+    def _release_runtime_native(self) -> None:
+        self.synchronize()
+        self._native_buffer = None
+        self._native_generation = -1
 
     def _resident_buffer(self) -> Any:
         state = _session_state()
         if state._native_runtime is None or state._rhi_host is None:
             raise RuntimeError("device TensorStorage residency requires a GPU RHI host")
         if self._native_buffer is None or self._native_generation != state._runtime_generation:
+            if self._native_buffer is not None and self._device_dirty:
+                self.synchronize()
             self._native_buffer = state._rhi_host.create_buffer(self._array.nbytes)
             self._native_generation = state._runtime_generation
-            self._uploaded_version = 0
+            self._dirty_ranges.mark_all()
             self._device_dirty = False
-            self._allocation_count += 1
         assert self._native_buffer is not None
-        if self._uploaded_version != self._host_version:
-            self._native_buffer.upload(self._array.tobytes(order="C"))
-            self._uploaded_version = self._host_version
-            self._upload_count += 1
+        if self._dirty_ranges:
+            self._upload_dirty_ranges()
         return self._native_buffer
+
+    def _upload_dirty_ranges(self) -> None:
+        assert self._native_buffer is not None
+        bytes_view = self._array.view(np.uint8).reshape(-1)
+        uploads = [(begin, bytes(bytes_view[begin:end])) for begin, end in self._dirty_ranges.ranges]
+        self._native_buffer.upload_ranges(uploads)
+        self._dirty_ranges.clear()
 
     def _mark_device_dirty(self) -> None:
         self._device_dirty = True
+        self._dirty_ranges.clear()
 
     def _ensure_host_mutation_allowed(self) -> None:
         with self._borrow_lock:
@@ -708,11 +973,18 @@ class RawBuffer:
         self._host_version += 1
         self._uploaded_version = self._host_version
 
+    def _release_runtime_native(self) -> None:
+        self.synchronize()
+        self._native_buffer = None
+        self._native_generation = -1
+
     def _resident_buffer(self) -> Any:
         state = _session_state()
         if state._native_runtime is None or state._rhi_host is None:
             raise RuntimeError("device RawBuffer residency requires a GPU RHI host")
         if self._native_buffer is None or self._native_generation != state._runtime_generation:
+            if self._native_buffer is not None and self._device_dirty:
+                self.synchronize()
             self._native_buffer = state._rhi_host.create_buffer(self.byte_size)
             self._native_generation = state._runtime_generation
             self._uploaded_version = 0
@@ -928,7 +1200,8 @@ class TensorView:
         self._owner._ensure_host_mutation_allowed()
         if self.access == "read":
             raise PermissionError("cannot write through a read-only TensorView")
-        self._owner.synchronize()
+        if not isinstance(self._owner, TensorStorage):
+            self._owner.synchronize()
         target = self._native_host_array()
         if (
             not isinstance(array, np.ndarray)
@@ -937,9 +1210,15 @@ class TensorView:
             or not array.flags.c_contiguous
         ):
             raise ValueError("upload requires matching dtype and shape")
+        ranges = _array_byte_ranges(target, self._owner._array) if isinstance(self._owner, TensorStorage) else []
+        if isinstance(self._owner, TensorStorage):
+            self._owner._prepare_partial_host_write(ranges)
         np.copyto(target, array)
-        self._owner._host_version += 1
-        self._owner._device_dirty = False
+        if isinstance(self._owner, TensorStorage):
+            self._owner._mark_host_dirty(ranges, host_complete=False)
+        else:
+            self._owner._host_version += 1
+            self._owner._device_dirty = False
 
     def _resident_buffer(self) -> Any:
         return self._owner._resident_buffer()
@@ -949,9 +1228,9 @@ class TensorView:
 
 
 def _normalize_dispatch_borrows(
-    borrows: list[tuple[str, TensorStorage | TensorView | _TextureResource, str]],
-) -> list[tuple[str, TensorView | _TextureResource, str]]:
-    normalized: list[tuple[str, TensorView | _TextureResource, str]] = []
+    borrows: list[tuple[str, TensorStorage | RawBuffer | TensorView | _TextureResource, str]],
+) -> list[tuple[str, RawBuffer | TensorView | _TextureResource, str]]:
+    normalized: list[tuple[str, RawBuffer | TensorView | _TextureResource, str]] = []
     for name, value, access in borrows:
         access = _checked_access(access)
         resource = value._full_view("read_write") if isinstance(value, TensorStorage) else value
@@ -964,19 +1243,15 @@ def _normalize_dispatch_borrows(
     return normalized
 
 
-def _validate_dispatch_borrows(
-    borrows: list[tuple[str, TensorStorage | TensorView | _TextureResource, str]],
-) -> None:
-    _normalize_dispatch_borrows(borrows)
-
-
-def _dispatch_borrow_owner(resource: TensorView | _TextureResource) -> TensorStorage | RawBuffer | _TextureResource:
+def _dispatch_borrow_owner(
+    resource: RawBuffer | TensorView | _TextureResource,
+) -> TensorStorage | RawBuffer | _TextureResource:
     return resource.owner if isinstance(resource, (TensorView, TextureView)) else resource
 
 
 def _dispatch_borrows_overlap(
-    left: TensorView | _TextureResource,
-    right: TensorView | _TextureResource,
+    left: RawBuffer | TensorView | _TextureResource,
+    right: RawBuffer | TensorView | _TextureResource,
 ) -> bool:
     if isinstance(left, TensorView) and isinstance(right, TensorView):
         return _borrow_ranges_may_overlap(left, right)
@@ -995,42 +1270,66 @@ def _dispatch_borrows_overlap(
     return True
 
 
-@contextmanager
-def _dispatch_borrow_scope(
-    borrows: list[tuple[str, TensorStorage | TensorView | _TextureResource, str]],
-) -> Iterator[None]:
-    """Retain owners and reject incompatible borrows until dispatch completion."""
-    normalized = _normalize_dispatch_borrows(borrows)
-    owners = sorted({_dispatch_borrow_owner(resource) for _, resource, _ in normalized}, key=id)
-    token = object()
-    for owner in owners:
-        owner._borrow_lock.acquire()
-    try:
-        for name, resource, access in normalized:
-            owner = _dispatch_borrow_owner(resource)
-            for _, active_resource, active_access in owner._active_borrows:
-                if access == active_access == "read":
-                    continue
-                if isinstance(active_resource, (TensorView, _TextureResource)) and _dispatch_borrows_overlap(
-                    resource, active_resource
-                ):
-                    raise RuntimeError(f"dispatch argument '{name}' conflicts with an outstanding device borrow")
-        for _, resource, access in normalized:
-            _dispatch_borrow_owner(resource)._active_borrows.append((token, resource, access))
-    finally:
-        for owner in reversed(owners):
-            owner._borrow_lock.release()
-    try:
-        yield
-    finally:
-        for owner in owners:
+class _DispatchBorrowLease:
+    """An acquired resource borrow released only after dispatch completion."""
+
+    def __init__(
+        self,
+        borrows: list[tuple[str, TensorStorage | RawBuffer | TensorView | _TextureResource, str]],
+    ):
+        self._owners: list[TensorStorage | RawBuffer | _TextureResource] = []
+        self._token: object | None = None
+        normalized = _normalize_dispatch_borrows(borrows)
+        self._owners = sorted({_dispatch_borrow_owner(resource) for _, resource, _ in normalized}, key=id)
+        self._token = object()
+        for owner in self._owners:
             owner._borrow_lock.acquire()
         try:
-            for owner in owners:
+            for name, resource, access in normalized:
+                owner = _dispatch_borrow_owner(resource)
+                for _, active_resource, active_access in owner._active_borrows:
+                    if access == active_access == "read":
+                        continue
+                    if isinstance(active_resource, (RawBuffer, TensorView, _TextureResource)) and (
+                        _dispatch_borrows_overlap(resource, active_resource)
+                    ):
+                        raise RuntimeError(f"dispatch argument '{name}' conflicts with an outstanding device borrow")
+            for _, resource, access in normalized:
+                _dispatch_borrow_owner(resource)._active_borrows.append((self._token, resource, access))
+        finally:
+            for owner in reversed(self._owners):
+                owner._borrow_lock.release()
+
+    def release(self) -> None:
+        token = self._token
+        if token is None:
+            return
+        self._token = None
+        for owner in self._owners:
+            owner._borrow_lock.acquire()
+        try:
+            for owner in self._owners:
                 owner._active_borrows[:] = [active for active in owner._active_borrows if active[0] is not token]
         finally:
-            for owner in reversed(owners):
+            for owner in reversed(self._owners):
                 owner._borrow_lock.release()
+
+    def __enter__(self) -> _DispatchBorrowLease:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.release()
+
+    def __del__(self) -> None:
+        self.release()
+
+
+@contextmanager
+def _dispatch_borrow_scope(
+    borrows: list[tuple[str, TensorStorage | RawBuffer | TensorView | _TextureResource, str]],
+) -> Iterator[None]:
+    with _DispatchBorrowLease(borrows):
+        yield
 
 
 @dataclass(frozen=True)
@@ -1436,11 +1735,29 @@ class Texture(_TextureResource):
         self._host_dirty_mips.clear()
         self._device_dirty_mips.update(range(1, self._mip_levels))
 
+    def _release_runtime_native(self) -> None:
+        for mip_level in sorted(self._device_dirty_mips):
+            self._download_device_region(
+                mip_level,
+                (0,) * len(self._mip_shape(mip_level)),
+                self._mip_shape(mip_level),
+            )
+        self._native_texture = None
+        self._native_view = None
+        self._native_generation = -1
+
     def _resident_texture(self) -> Any:
         state = _session_state()
         if state._native_runtime is None:
             raise RuntimeError("Texture requires an initialized native runtime")
         if self._native_texture is None or self._native_generation != state._runtime_generation:
+            if self._native_texture is not None:
+                for mip_level in sorted(self._device_dirty_mips):
+                    self._download_device_region(
+                        mip_level,
+                        (0,) * len(self._mip_shape(mip_level)),
+                        self._mip_shape(mip_level),
+                    )
             if self._dimension == "3d":
                 depth, height, width = self.shape
             else:
@@ -1717,6 +2034,10 @@ class SamplerState:
         self._native_generation = -1
         _session_state()._runtime_children.add(self)
 
+    def _release_runtime_native(self) -> None:
+        self._native_sampler = None
+        self._native_generation = -1
+
     def _resident_sampler(self) -> Any:
         state = _session_state()
         if state._native_runtime is None or state._rhi_host is None:
@@ -1753,6 +2074,10 @@ class RenderTarget:
         self._native_depth: Any | None = None
         self._native_depth_generation = -1
         _session_state()._runtime_children.add(self)
+
+    def _release_runtime_native(self) -> None:
+        self._native_depth = None
+        self._native_depth_generation = -1
 
     @property
     def shape(self) -> tuple[int, int]:

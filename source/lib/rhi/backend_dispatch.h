@@ -27,6 +27,7 @@ struct BackendDispatch {
 
     VernonRhiStatus (*createBuffer)(VernonRhiDevice, const VernonRhiBufferDescriptor *, VernonRhiBuffer *);
     VernonRhiStatus (*uploadBuffer)(VernonRhiDevice, VernonRhiBuffer, uint64_t, const void *, uint64_t);
+    VernonRhiStatus (*uploadBufferRanges)(VernonRhiDevice, VernonRhiBuffer, const VernonRhiBufferUploadRange *, size_t);
     VernonRhiStatus (*downloadBuffer)(VernonRhiDevice, VernonRhiBuffer, uint64_t, void *, uint64_t);
     VernonRhiStatus (*destroyBuffer)(VernonRhiDevice, VernonRhiBuffer);
     uint32_t (*isBufferValid)(VernonRhiDevice, VernonRhiBuffer);
@@ -56,7 +57,7 @@ struct BackendDispatch {
     void (*releaseResource)(VernonRhiDevice, ResourceKind, uint64_t);
 
     bool (*beginCommands)(VernonRhiDevice, uint64_t &, VernonRhiBackend &);
-    bool (*submitCommands)(VernonRhiDevice, uint64_t, bool, bool &);
+    bool (*submitCommands)(VernonRhiDevice, uint64_t, bool, bool &, bool &);
     void (*completeBorrowedCommands)(VernonRhiDevice, uint64_t);
     void (*abandonCommands)(VernonRhiDevice, uint64_t);
     bool (*recordBarriers)(VernonRhiDevice, uint64_t, uint64_t, const VernonRhiBarrier *, size_t);

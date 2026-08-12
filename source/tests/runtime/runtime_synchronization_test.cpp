@@ -143,7 +143,7 @@ TEST(CompilerRuntimeSynchronization, CpuJitEntryExecutesCooperativeWorkgroups) {
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.compute_grid = {2, 1, 1};
-    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
+    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
         << stringValue(vernonRuntimeGetLastError(runtime));
     verifySynchronizationResult(result);
 
@@ -214,10 +214,9 @@ TEST_P(RhiRuntimeSynchronization, ExecutesIndependentWorkgroupBarrierAndAtomic) 
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.compute_grid = {2, 1, 1};
-    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
+    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
         << "RHI: " << stringValue(vernonRhiDeviceGetLastError(context.device))
         << "; runtime: " << stringValue(vernonRuntimeGetLastError(context.runtime));
-    ASSERT_EQ(vernonRuntimeSynchronize(context.runtime), VERNON_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDownloadBuffer(context.device, buffer.handle, 0, result.data(), sizeof(result)),
               VERNON_RHI_STATUS_OK);
     verifySynchronizationResult(result);

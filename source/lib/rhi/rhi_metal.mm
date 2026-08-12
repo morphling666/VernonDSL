@@ -300,6 +300,28 @@ VernonRhiStatus uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uin
                : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
+VernonRhiStatus uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
+                                   const VernonRhiBufferUploadRange *ranges, size_t rangeCount) {
+    auto device = lookupMetalDevice(handle);
+    if (!device)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!ranges || rangeCount == 0)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    MetalBufferSlot *slot = lookupPublicResource(device->buffers, buffer);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    for (size_t index = 0; index < rangeCount; ++index) {
+        const VernonRhiBufferUploadRange &range = ranges[index];
+        if (!range.source || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
+            range.offset > slot->descriptor.size || range.size > slot->descriptor.size - range.offset)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    }
+    return device->state.uploadBufferRanges(slot->native, ranges, rangeCount, device->error)
+               ? VERNON_RHI_STATUS_OK
+               : VERNON_RHI_STATUS_INTERNAL_ERROR;
+}
+
 VernonRhiStatus downloadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset, void *destination,
                                uint64_t size) {
     auto device = lookupMetalDevice(handle);
@@ -742,7 +764,8 @@ bool beginCommands(VernonRhiDevice handle, uint64_t &native, VernonRhiBackend &b
     return true;
 }
 
-bool submitCommands(VernonRhiDevice handle, uint64_t native, bool, bool &completed) {
+bool submitCommands(VernonRhiDevice handle, uint64_t native, bool, bool &completed, bool &externalCompletion) {
+    externalCompletion = false;
     auto device = lookupMetalDevice(handle);
     if (!device)
         return false;
@@ -961,6 +984,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
         deviceStateForBackend,
         createBuffer,
         uploadBuffer,
+        uploadBufferRanges,
         downloadBuffer,
         destroyBuffer,
         isBufferValid,

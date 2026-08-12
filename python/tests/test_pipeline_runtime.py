@@ -661,6 +661,20 @@ class PipelineContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "pipeline stages"):
             vd.pipeline(solid_fragment, triangle_vertex)
 
+    def test_immediate_binding_failure_releases_dispatch_lease(self) -> None:
+        pipeline = object.__new__(pipeline_module.Pipeline)
+        lease = mock.Mock()
+        plan = types.SimpleNamespace(compiled=types.SimpleNamespace(native=object()), lease=lease)
+        binding_cache = mock.MagicMock()
+        binding_cache.invocation.return_value.__enter__.return_value = object()
+        with (
+            mock.patch.object(pipeline, "_prepare_graphics_invocation", return_value=plan),
+            mock.patch.object(pipeline, "_bind_graphics_arguments", side_effect=RuntimeError("binding failed")),
+            self.assertRaisesRegex(RuntimeError, "binding failed"),
+        ):
+            pipeline._invoke_direct({}, None, binding_cache)
+        lease.release.assert_called_once_with()
+
     def test_tensor_layout_and_contiguous_swizzle(self) -> None:
         tensor = vd.storage.from_numpy(np.zeros((3, 4), dtype=np.float32))
         self.assertEqual(tensor.layout.shape, (3, 4))
@@ -917,9 +931,7 @@ class OpenGLPipelineTests(unittest.TestCase):
         self.assertGreater(int(color_pixels[32, 19, 2]), 240)
         self.assertGreater(int(id_pixels[32, 19, 0]), 240)
         self.assertGreater(int(id_pixels[32, 19, 1]), 40)
-        self.assertEqual(indices._allocation_count, 1)
         render(**arguments)
-        self.assertEqual(indices._allocation_count, 1)
         self.assertEqual(render.compile_count, 1)
 
     def test_feature_and_advanced_draw_validation(self) -> None:
@@ -1114,7 +1126,7 @@ class VulkanPipelineTests(unittest.TestCase):
         compiled = render._compiled
         self.assertIsNotNone(compiled)
         assert compiled is not None
-        self.assertTrue(callable(compiled.native.invoke))
+        self.assertTrue(callable(compiled.native.submit))
         self.assertEqual(
             [(parameter.name, parameter.slot, tuple(parameter.shape)) for parameter in compiled.native.parameters],
             [("position", 0, (2,))],

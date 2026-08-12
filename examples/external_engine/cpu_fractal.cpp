@@ -44,8 +44,13 @@ public:
 
     VernonRhiStatus execute(vernon::execution::ComputeEncoder &,
                             const vernon::execution::ExecutionResources &) override {
-        if (vernonRuntimePipelineInvoke(pipeline_, invocation_) == VERNON_STATUS_OK)
+        VernonSubmission *submission{};
+        if (vernonRuntimePipelineSubmit(pipeline_, invocation_, &submission) == VERNON_STATUS_OK &&
+            vernonSubmissionWait(submission) == VERNON_STATUS_OK) {
+            vernonSubmissionDestroy(submission);
             return VERNON_RHI_STATUS_OK;
+        }
+        vernonSubmissionDestroy(submission);
         std::cerr << "fractal invocation failed: " << runtimeError(runtime_) << '\n';
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
     }
@@ -186,12 +191,13 @@ public:
                 return false;
         }
 
-        graph_ = std::make_unique<vernon::execution::ExecutionGraph>();
-        const auto graphPixels = graph_->importHostBuffer(reinterpret_cast<uint64_t>(pixels_.data()), true);
-        graph_->emplacePass<FractalComputePass>(graphPixels, runtime_, pipeline_, &invocation_);
-        graph_->emplacePass<FractalPresentPass>(graphPixels, &pixels_, &rgba_, graphics_, presentImage_, headless_);
+        vernon::execution::ExecutionGraph graph;
+        const auto graphPixels = graph.importHostBuffer(reinterpret_cast<uint64_t>(pixels_.data()), true);
+        graph.emplacePass<FractalComputePass>(graphPixels, runtime_, pipeline_, &invocation_);
+        graph.emplacePass<FractalPresentPass>(graphPixels, &pixels_, &rgba_, graphics_, presentImage_, headless_);
         std::string error;
-        if (!graph_->compile(error)) {
+        graph_ = graph.compile(error);
+        if (!graph_) {
             std::cerr << "failed to compile CPU fractal graph: " << error << '\n';
             return false;
         }
@@ -200,7 +206,10 @@ public:
 
     bool renderFrame(double elapsedSeconds, uint32_t, uint32_t) override {
         time_ = static_cast<float>(elapsedSeconds);
-        return graph_ && graph_->execute() == VERNON_RHI_STATUS_OK;
+        if (!graph_)
+            return false;
+        auto submission = graph_->submit();
+        return submission.wait() == VERNON_RHI_STATUS_OK;
     }
 
     VernonRhiImage image() const override { return presentImage_; }
@@ -235,7 +244,7 @@ private:
     float time_{};
     std::array<VernonPipelineArgument, 2> arguments_{};
     VernonPipelineInvocation invocation_{};
-    std::unique_ptr<vernon::execution::ExecutionGraph> graph_;
+    std::shared_ptr<vernon::execution::CompiledExecutionGraph> graph_;
 };
 
 } // namespace

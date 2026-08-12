@@ -68,6 +68,7 @@ VernonStringView vernon::rhi::deviceCreationError() { return {creationError.data
 void vernon::rhi::destroyDevice(VernonRhiDevice device) {
     if (deviceHasActiveCommandEncoder(device))
         return;
+    drainDeviceCompletions(device);
     if (const BackendDispatch *backend = dispatch(device))
         backend->destroyDevice(device);
 }
@@ -114,6 +115,12 @@ extern "C" VernonRhiStatus vernonRhiDeviceCreateBuffer(VernonRhiDevice device,
 extern "C" VernonRhiStatus vernonRhiDeviceUploadBuffer(VernonRhiDevice device, VernonRhiBuffer buffer, uint64_t offset,
                                                        const void *source, uint64_t size) {
     VERNON_DISPATCH_STATUS(device, uploadBuffer, buffer, offset, source, size);
+}
+
+extern "C" VernonRhiStatus vernonRhiDeviceUploadBufferRanges(VernonRhiDevice device, VernonRhiBuffer buffer,
+                                                             const VernonRhiBufferUploadRange *ranges,
+                                                             size_t rangeCount) {
+    VERNON_DISPATCH_STATUS(device, uploadBufferRanges, buffer, ranges, rangeCount);
 }
 
 extern "C" VernonRhiStatus vernonRhiDeviceDownloadBuffer(VernonRhiDevice device, VernonRhiBuffer buffer,
@@ -265,9 +272,11 @@ bool vernon::rhi::beginCommandRecording(VernonRhiDevice device, uint64_t &native
     return backend && backend->beginCommands && backend->beginCommands(device, native, backendKind);
 }
 
-bool vernon::rhi::submitCommandRecording(VernonRhiDevice device, uint64_t native, bool computeWrites, bool &completed) {
+bool vernon::rhi::submitCommandRecording(VernonRhiDevice device, uint64_t native, bool computeWrites, bool &completed,
+                                         bool &externalCompletion) {
     const BackendDispatch *backend = dispatch(device);
-    return backend && backend->submitCommands && backend->submitCommands(device, native, computeWrites, completed);
+    return backend && backend->submitCommands &&
+           backend->submitCommands(device, native, computeWrites, completed, externalCompletion);
 }
 
 void vernon::rhi::completeBorrowedCommandRecording(VernonRhiDevice device, uint64_t native) {

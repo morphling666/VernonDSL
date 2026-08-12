@@ -635,6 +635,52 @@ VernonRhiStatus uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uin
     return device->state.submitCommands(device->error) ? VERNON_RHI_STATUS_OK : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
+VernonRhiStatus uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
+                                   const VernonRhiBufferUploadRange *ranges, size_t rangeCount) {
+    auto device = lookupDirectX12Device(handle);
+    if (!device)
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    if (!ranges || rangeCount == 0)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    DirectX12BufferSlot *slot = lookupDirectX12Slot(device->buffers, buffer);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::vector<size_t> packedOffsets;
+    packedOffsets.reserve(rangeCount);
+    size_t packedSize = 0;
+    for (size_t index = 0; index < rangeCount; ++index) {
+        const VernonRhiBufferUploadRange &range = ranges[index];
+        if (!range.source || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
+            range.offset > slot->ownedDescriptor.size || range.size > slot->ownedDescriptor.size - range.offset)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        if (packedSize > (std::numeric_limits<size_t>::max)() - 255u)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        packedSize = (packedSize + 255u) & ~size_t{255u};
+        packedOffsets.push_back(packedSize);
+        if (static_cast<size_t>(range.size) > (std::numeric_limits<size_t>::max)() - packedSize)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        packedSize += static_cast<size_t>(range.size);
+    }
+    ID3D12Resource *upload = nullptr;
+    size_t uploadOffset = 0;
+    uint8_t *mapped = nullptr;
+    if (!device->state.acquireStaging(true, packedSize, 256, upload, uploadOffset, mapped, device->error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    for (size_t index = 0; index < rangeCount; ++index)
+        std::memcpy(mapped + packedOffsets[index], ranges[index].source, static_cast<size_t>(ranges[index].size));
+    if (!device->state.beginCommands(device->error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    vernon::rhi::directx12::transition(device->state.commandList(), slot->buffer.resource, slot->buffer.state,
+                                       D3D12_RESOURCE_STATE_COPY_DEST);
+    for (size_t index = 0; index < rangeCount; ++index)
+        device->state.commandList()->CopyBufferRegion(slot->buffer.resource, ranges[index].offset, upload,
+                                                      uploadOffset + packedOffsets[index], ranges[index].size);
+    vernon::rhi::directx12::transition(device->state.commandList(), slot->buffer.resource, slot->buffer.state,
+                                       D3D12_RESOURCE_STATE_COMMON);
+    return device->state.submitCommands(device->error) ? VERNON_RHI_STATUS_OK : VERNON_RHI_STATUS_INTERNAL_ERROR;
+}
+
 VernonRhiStatus downloadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset, void *destination,
                                uint64_t size) {
     auto device = lookupDirectX12Device(handle);
@@ -1281,7 +1327,8 @@ bool beginCommands(VernonRhiDevice handle, uint64_t &native, VernonRhiBackend &b
     return true;
 }
 
-bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites, bool &completed) {
+bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites, bool &completed,
+                    bool &externalCompletion) {
     auto device = lookupDirectX12Device(handle);
     if (!device) {
         return false;
@@ -1292,6 +1339,7 @@ bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites,
         return false;
     const bool submitted = device->state.submitCommands(device->error);
     completed = submitted && !device->state.nativeObjectsBorrowed;
+    externalCompletion = submitted && device->state.nativeObjectsBorrowed;
     return submitted;
 }
 
@@ -1696,6 +1744,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::directX12BackendDispatch() {
         deviceStateForBackend,
         createBuffer,
         uploadBuffer,
+        uploadBufferRanges,
         downloadBuffer,
         destroyBuffer,
         isBufferValid,

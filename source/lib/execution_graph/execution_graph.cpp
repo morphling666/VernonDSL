@@ -208,6 +208,34 @@ void ExecutionPass::readWrite(GraphImage resource, VernonRhiResourceState state,
 }
 void ExecutionPass::resetDeclaration() { uses_.clear(); }
 
+const std::shared_ptr<const ExecutionBindingValue> &ExecutionBindings::at(ExecutionParameter parameter) const {
+    if (parameter.graphIdentity != graphIdentity_ || parameter.id >= values_.size() || !values_[parameter.id])
+        throw std::invalid_argument("execution parameter does not belong to this binding snapshot");
+    return values_[parameter.id];
+}
+
+ExecutionBindingsBuilder::ExecutionBindingsBuilder(uint64_t graphIdentity, size_t parameterCount)
+    : graphIdentity_(graphIdentity), values_(parameterCount) {}
+
+void ExecutionBindingsBuilder::set(ExecutionParameter parameter, std::shared_ptr<const ExecutionBindingValue> value) {
+    if (parameter.graphIdentity != graphIdentity_ || parameter.id >= values_.size())
+        throw std::invalid_argument("execution parameter does not belong to this binding builder");
+    if (!value)
+        throw std::invalid_argument("execution parameter binding value must not be null");
+    if (values_[parameter.id] == value)
+        return;
+    values_[parameter.id] = std::move(value);
+    cached_.reset();
+}
+
+std::shared_ptr<const ExecutionBindings> ExecutionBindingsBuilder::snapshot() const {
+    if (std::any_of(values_.begin(), values_.end(), [](const auto &value) { return !value; }))
+        throw std::invalid_argument("execution parameter bindings are incomplete");
+    if (!cached_)
+        cached_ = std::shared_ptr<const ExecutionBindings>(new ExecutionBindings(graphIdentity_, values_));
+    return cached_;
+}
+
 bool ExecutionResources::buffer(GraphBuffer resource, VernonRhiBuffer &output) const {
     output = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     if (resource.kind != ResourceKind::Buffer || resource.id >= resources_.size() || resource.id >= buffers_.size())
@@ -218,6 +246,12 @@ bool ExecutionResources::buffer(GraphBuffer resource, VernonRhiBuffer &output) c
         return false;
     output = buffers_[resource.id];
     return true;
+}
+
+const std::shared_ptr<const ExecutionBindingValue> &ExecutionResources::binding(ExecutionParameter parameter) const {
+    if (!bindings_)
+        throw std::invalid_argument("execution submission has no parameter bindings");
+    return bindings_->at(parameter);
 }
 
 void RenderPass::color(uint32_t location, const ColorAttachmentUse &attachment) {
@@ -250,16 +284,16 @@ void RenderPass::renderArea(uint32_t x, uint32_t y, uint32_t width, uint32_t hei
 
 ExecutionGraph::ExecutionGraph() : graphIdentity_(nextGraphIdentity.fetch_add(1, std::memory_order_relaxed)) {}
 ExecutionGraph::ExecutionGraph(VernonRhiDevice device)
-    : provider_(Provider::Rhi), device_(device),
+    : provider_(detail::ExecutionProvider::Rhi), device_(device),
       graphIdentity_(nextGraphIdentity.fetch_add(1, std::memory_order_relaxed)) {}
 ExecutionGraph::~ExecutionGraph() {
-    for (const ResourceRecord &record : resourceRecords_) {
-        if (provider_ == Provider::Rhi && record.graphOwned)
+    for (const detail::ExecutionResourceRecord &record : resourceRecords_) {
+        if (provider_ == detail::ExecutionProvider::Rhi && record.graphOwned)
             vernonRhiDeviceDestroyBuffer(device_, record.buffer);
-        if (provider_ == Provider::Rhi)
+        if (provider_ == detail::ExecutionProvider::Rhi)
             for (uint64_t viewKey : record.imageViewKeys)
                 vernon::rhi::releaseResource(device_, vernon::rhi::ResourceKind::ImageView, viewKey);
-        if (provider_ == Provider::Rhi && record.resourceKey)
+        if (provider_ == detail::ExecutionProvider::Rhi && record.resourceKey)
             vernon::rhi::releaseResource(device_,
                                          record.resource.kind == ResourceKind::Buffer
                                              ? vernon::rhi::ResourceKind::Buffer
@@ -268,11 +302,25 @@ ExecutionGraph::~ExecutionGraph() {
     }
 }
 
+ExecutionParameter ExecutionGraph::parameter(std::string name) {
+    if (compiled_)
+        throw std::logic_error("cannot mutate a compiled execution graph builder");
+    if (name.empty())
+        throw std::invalid_argument("execution parameter name must not be empty");
+    if (parameterIds_.find(name) != parameterIds_.end())
+        throw std::invalid_argument("execution parameter name must be unique");
+    const uint32_t id = static_cast<uint32_t>(parameterNames_.size());
+    parameterIds_.emplace(name, id);
+    parameterNames_.push_back(std::move(name));
+    dirty_ = true;
+    return {id, graphIdentity_};
+}
+
 GraphBuffer ExecutionGraph::importHostBuffer(uint64_t identity, bool exported) {
-    if (!identity || provider_ != Provider::Cpu)
+    if (compiled_ || !identity || provider_ != detail::ExecutionProvider::Cpu)
         return {};
     if (const auto found = importedHostBuffers_.find(identity); found != importedHostBuffers_.end()) {
-        ResourceRecord &record = resourceRecords_[found->second];
+        detail::ExecutionResourceRecord &record = resourceRecords_[found->second];
         record.exported = record.exported || exported;
         GraphBuffer result;
         result.id = found->second;
@@ -295,7 +343,7 @@ GraphBuffer ExecutionGraph::importHostBuffer(uint64_t identity, bool exported) {
 VernonRhiStatus ExecutionGraph::createBuffer(const VernonRhiBufferDescriptor &descriptor, GraphBuffer &output,
                                              bool exported) {
     output = {};
-    if (provider_ != Provider::Rhi)
+    if (compiled_ || provider_ != detail::ExecutionProvider::Rhi)
         return VERNON_RHI_STATUS_UNSUPPORTED;
     VernonRhiBuffer buffer{};
     const VernonRhiStatus status = vernonRhiDeviceCreateBuffer(device_, &descriptor, &buffer);
@@ -307,11 +355,11 @@ VernonRhiStatus ExecutionGraph::createBuffer(const VernonRhiBufferDescriptor &de
 }
 
 GraphBuffer ExecutionGraph::importBuffer(VernonRhiBuffer buffer, bool exported) {
-    if (provider_ != Provider::Rhi || !vernon::rhi::deviceExists(device_))
+    if (compiled_ || provider_ != detail::ExecutionProvider::Rhi || !vernon::rhi::deviceExists(device_))
         return {};
     const uint64_t key = handleKey(buffer.index, buffer.generation);
     if (const auto found = importedBuffers_.find(key); found != importedBuffers_.end()) {
-        ResourceRecord &record = resourceRecords_[found->second];
+        detail::ExecutionResourceRecord &record = resourceRecords_[found->second];
         record.exported = record.exported || exported;
         GraphBuffer result;
         result.id = found->second;
@@ -349,7 +397,7 @@ GraphBuffer ExecutionGraph::importBuffer(VernonRhiBuffer buffer, bool exported) 
 }
 
 GraphImage ExecutionGraph::importImage(VernonRhiImage image, VernonRhiImageView view, bool exported) {
-    if (provider_ != Provider::Rhi || !vernon::rhi::deviceExists(device_))
+    if (compiled_ || provider_ != detail::ExecutionProvider::Rhi || !vernon::rhi::deviceExists(device_))
         return {};
     const uint64_t imageKey = vernon::rhi::imageResource(device_, image);
     const uint64_t viewKey = vernon::rhi::imageViewResource(device_, view);
@@ -374,7 +422,7 @@ GraphImage ExecutionGraph::importImage(VernonRhiImage image, VernonRhiImageView 
                            viewDescriptor.base_array_layer, viewDescriptor.array_layer_count, viewDescriptor.aspects};
     const uint64_t key = handleKey(image.index, image.generation);
     if (const auto found = importedImages_.find(key); found != importedImages_.end()) {
-        ResourceRecord &record = resourceRecords_[found->second];
+        detail::ExecutionResourceRecord &record = resourceRecords_[found->second];
         result.id = found->second;
         if (std::find(record.imageViewKeys.begin(), record.imageViewKeys.end(), viewKey) ==
             record.imageViewKeys.end()) {
@@ -398,7 +446,7 @@ GraphImage ExecutionGraph::importImage(VernonRhiImage image, VernonRhiImageView 
         return {};
     }
     result.id = static_cast<uint32_t>(resources_.size());
-    ResourceRecord record{result, exported};
+    detail::ExecutionResourceRecord record{result, exported};
     record.image = image;
     record.resourceKey = imageKey;
     try {
@@ -423,8 +471,12 @@ GraphImage ExecutionGraph::importImage(VernonRhiImage image, VernonRhiImageView 
     return result;
 }
 
-bool ExecutionGraph::compile(std::string &error) {
+bool ExecutionGraph::buildPlan(std::string &error) {
     error.clear();
+    if (compiled_) {
+        error = "execution graph builder was already compiled";
+        return false;
+    }
     schedule_.clear();
     scopes_.clear();
     bool compiled = false;
@@ -588,7 +640,7 @@ bool ExecutionGraph::compile(std::string &error) {
                     barrier.destination_access = accessBits(use);
                     barrier.old_state = previous.state;
                     barrier.new_state = use.state;
-                    const ResourceRecord &record = resourceRecords_[resourceId];
+                    const detail::ExecutionResourceRecord &record = resourceRecords_[resourceId];
                     barrier.is_image = record.resource.kind == ResourceKind::Image;
                     if (barrier.is_image) {
                         barrier.image = record.image;
@@ -639,7 +691,7 @@ bool ExecutionGraph::validate(std::string &error) const {
     const auto validateImage = [&](const std::string &passName, const GraphImage &image) {
         if (!validateResource(passName, image) || image.kind != ResourceKind::Image)
             return false;
-        const ResourceRecord &record = resourceRecords_[image.id];
+        const detail::ExecutionResourceRecord &record = resourceRecords_[image.id];
         if (record.image.index != image.handle.index || record.image.generation != image.handle.generation ||
             image.view.index == static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX) || !image.width ||
             !image.height || !image.layers || !image.samples || image.format == VERNON_RHI_FORMAT_UNDEFINED ||
@@ -687,7 +739,7 @@ bool ExecutionGraph::validate(std::string &error) const {
         const auto *render = dynamic_cast<const RenderPass *>(pass.get());
         if (!render)
             continue;
-        if (provider_ == Provider::Cpu) {
+        if (provider_ == detail::ExecutionProvider::Cpu) {
             error = "CPU execution graphs support compute passes only";
             return false;
         }
@@ -778,61 +830,218 @@ bool ExecutionGraph::validate(std::string &error) const {
     return true;
 }
 
-VernonRhiStatus ExecutionGraph::execute() {
-    lastStats_ = {};
-    std::string error;
-    if ((dirty_ && !compile(error)) || !validate(error))
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    return provider_ == Provider::Cpu ? executeCpu() : executeRhi();
-}
+struct CompiledExecutionGraph::State {
+    detail::ExecutionProvider provider{detail::ExecutionProvider::Cpu};
+    VernonRhiDevice device{};
+    uint64_t graphIdentity{};
+    std::vector<std::unique_ptr<ExecutionPass>> passes;
+    std::vector<GraphResource> resources;
+    std::vector<detail::ExecutionResourceRecord> resourceRecords;
+    std::vector<std::string> parameterNames;
+    std::vector<uint32_t> schedule;
+    std::vector<CompiledScope> scopes;
 
-VernonRhiStatus ExecutionGraph::executeCpu() {
-    std::vector<VernonRhiBuffer> buffers(resources_.size(),
-                                         VernonRhiBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
-    ExecutionResources resources(resources_, buffers);
-    ComputeEncoder encoder(device_, {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
-    for (const CompiledScope &scope : scopes_) {
-        if (scope.rendering)
-            return VERNON_RHI_STATUS_UNSUPPORTED;
-        for (uint32_t passIndex : scope.passIndices) {
-            const VernonRhiStatus status =
-                static_cast<ComputePass *>(passes_[passIndex].get())->execute(encoder, resources);
-            if (status != VERNON_RHI_STATUS_OK)
-                return status;
+    ~State() {
+        for (const detail::ExecutionResourceRecord &record : resourceRecords) {
+            if (provider == detail::ExecutionProvider::Rhi && record.graphOwned)
+                vernonRhiDeviceDestroyBuffer(device, record.buffer);
+            if (provider == detail::ExecutionProvider::Rhi)
+                for (uint64_t viewKey : record.imageViewKeys)
+                    vernon::rhi::releaseResource(device, vernon::rhi::ResourceKind::ImageView, viewKey);
+            if (provider == detail::ExecutionProvider::Rhi && record.resourceKey)
+                vernon::rhi::releaseResource(device,
+                                             record.resource.kind == ResourceKind::Buffer
+                                                 ? vernon::rhi::ResourceKind::Buffer
+                                                 : vernon::rhi::ResourceKind::Image,
+                                             record.resourceKey);
         }
     }
-    return VERNON_RHI_STATUS_OK;
+};
+
+class ExecutionSubmission::Impl {
+public:
+    Impl(std::shared_ptr<CompiledExecutionGraph::State> retainedPlan,
+         std::shared_ptr<const ExecutionBindings> retainedBindings)
+        : plan(std::move(retainedPlan)), bindings(std::move(retainedBindings)) {}
+    ~Impl() {
+        if (completion.index != VERNON_RHI_INVALID_HANDLE_INDEX)
+            (void)vernonRhiDeviceDestroyCompletion(plan->device, completion);
+    }
+
+    std::shared_ptr<CompiledExecutionGraph::State> plan;
+    std::shared_ptr<const ExecutionBindings> bindings;
+    State state{State::Pending};
+    VernonRhiStatus status{VERNON_RHI_STATUS_OK};
+    VernonRhiCompletion completion{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    VernonRhiCommandEncoderStats stats{};
+};
+
+std::shared_ptr<CompiledExecutionGraph> ExecutionGraph::compile(std::string &error) {
+    if (!buildPlan(error))
+        return {};
+    std::shared_ptr<CompiledExecutionGraph::State> state;
+    try {
+        state = std::make_shared<CompiledExecutionGraph::State>();
+    } catch (const std::bad_alloc &) {
+        error = "cannot allocate compiled execution graph";
+        return {};
+    }
+    state->provider = provider_;
+    state->device = device_;
+    state->graphIdentity = graphIdentity_;
+    state->passes = std::move(passes_);
+    state->resources = std::move(resources_);
+    state->resourceRecords = std::move(resourceRecords_);
+    state->parameterNames = std::move(parameterNames_);
+    state->schedule = std::move(schedule_);
+    state->scopes = std::move(scopes_);
+    for (const auto &pass : state->passes)
+        pass->owner_ = nullptr;
+    importedBuffers_.clear();
+    importedHostBuffers_.clear();
+    importedImages_.clear();
+    parameterIds_.clear();
+    compiled_ = true;
+    return std::shared_ptr<CompiledExecutionGraph>(new CompiledExecutionGraph(std::move(state)));
 }
 
-VernonRhiStatus ExecutionGraph::executeRhi() {
-    DeviceExecutionSession session(device_);
+ExecutionSubmission::ExecutionSubmission() = default;
+ExecutionSubmission::ExecutionSubmission(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+ExecutionSubmission::~ExecutionSubmission() = default;
+ExecutionSubmission::ExecutionSubmission(ExecutionSubmission &&) noexcept = default;
+ExecutionSubmission &ExecutionSubmission::operator=(ExecutionSubmission &&) noexcept = default;
+
+ExecutionSubmission::State ExecutionSubmission::state() const {
+    if (!impl_)
+        return State::Failed;
+    if (impl_->completion.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        return impl_->state;
+    VernonRhiCompletionState state{};
+    if (vernonRhiCompletionGetState(impl_->plan->device, impl_->completion, &state) != VERNON_RHI_STATUS_OK)
+        return State::Failed;
+    if (state == VERNON_RHI_COMPLETION_PENDING)
+        return State::Pending;
+    return state == VERNON_RHI_COMPLETION_SUCCEEDED ? State::Succeeded : State::Failed;
+}
+
+VernonRhiStatus ExecutionSubmission::wait() {
+    if (!impl_)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (impl_->completion.index != VERNON_RHI_INVALID_HANDLE_INDEX) {
+        impl_->status = vernonRhiCompletionWait(impl_->plan->device, impl_->completion);
+        impl_->state = impl_->status == VERNON_RHI_STATUS_OK ? State::Succeeded : State::Failed;
+        const VernonRhiStatus statsStatus =
+            vernonRhiCompletionGetCommandStats(impl_->plan->device, impl_->completion, &impl_->stats);
+        if (statsStatus != VERNON_RHI_STATUS_OK) {
+            impl_->status = statsStatus;
+            impl_->state = State::Failed;
+        }
+    }
+    return impl_->status;
+}
+
+VernonRhiStatus ExecutionSubmission::signal(VernonRhiStatus result) {
+    if (!impl_ || impl_->completion.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    return vernonRhiCompletionSignal(impl_->plan->device, impl_->completion, result);
+}
+
+VernonRhiStatus ExecutionSubmission::status() const {
+    return impl_ ? impl_->status : VERNON_RHI_STATUS_INVALID_ARGUMENT;
+}
+
+const VernonRhiCommandEncoderStats &ExecutionSubmission::commandStats() const {
+    static const VernonRhiCommandEncoderStats empty{};
+    return impl_ ? impl_->stats : empty;
+}
+
+CompiledExecutionGraph::CompiledExecutionGraph(std::shared_ptr<State> state) : state_(std::move(state)) {}
+CompiledExecutionGraph::~CompiledExecutionGraph() = default;
+
+const std::vector<uint32_t> &CompiledExecutionGraph::schedule() const { return state_->schedule; }
+const std::vector<CompiledScope> &CompiledExecutionGraph::scopes() const { return state_->scopes; }
+
+ExecutionBindingsBuilder CompiledExecutionGraph::createBindings(const std::vector<ExecutionBinding> &initial) const {
+    ExecutionBindingsBuilder builder(state_->graphIdentity, state_->parameterNames.size());
+    std::vector<bool> seen(state_->parameterNames.size());
+    for (const ExecutionBinding &binding : initial) {
+        if (binding.parameter.graphIdentity != state_->graphIdentity ||
+            binding.parameter.id >= state_->parameterNames.size())
+            throw std::invalid_argument("execution parameter does not belong to this compiled graph");
+        if (seen[binding.parameter.id])
+            throw std::invalid_argument("execution parameter was bound more than once");
+        seen[binding.parameter.id] = true;
+        builder.set(binding.parameter, binding.value);
+    }
+    (void)builder.snapshot();
+    return builder;
+}
+
+ExecutionSubmission CompiledExecutionGraph::submit(std::shared_ptr<const ExecutionBindings> bindings) const {
+    if (!bindings) {
+        if (!state_->parameterNames.empty())
+            throw std::invalid_argument("compiled execution graph requires parameter bindings");
+    } else if (bindings->graphIdentity_ != state_->graphIdentity ||
+               bindings->values_.size() != state_->parameterNames.size()) {
+        throw std::invalid_argument("execution bindings do not belong to this compiled graph");
+    }
+    auto submission = std::make_unique<ExecutionSubmission::Impl>(state_, std::move(bindings));
+    if (state_->provider == detail::ExecutionProvider::Cpu) {
+        std::vector<VernonRhiBuffer> buffers(
+            state_->resources.size(), VernonRhiBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+        ExecutionResources resources(state_->resources, buffers, submission->bindings);
+        ComputeEncoder encoder(state_->device, {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+        for (const CompiledScope &scope : state_->scopes) {
+            if (scope.rendering) {
+                submission->status = VERNON_RHI_STATUS_UNSUPPORTED;
+                break;
+            }
+            for (uint32_t passIndex : scope.passIndices) {
+                submission->status =
+                    static_cast<ComputePass *>(state_->passes[passIndex].get())->execute(encoder, resources);
+                if (submission->status != VERNON_RHI_STATUS_OK)
+                    break;
+            }
+            if (submission->status != VERNON_RHI_STATUS_OK)
+                break;
+        }
+        submission->state = submission->status == VERNON_RHI_STATUS_OK ? ExecutionSubmission::State::Succeeded
+                                                                       : ExecutionSubmission::State::Failed;
+        return ExecutionSubmission(std::move(submission));
+    }
+
+    DeviceExecutionSession session(state_->device);
     VernonRhiCommandEncoderDescriptor encoderDescriptor{};
     encoderDescriptor.struct_size = sizeof(encoderDescriptor);
     encoderDescriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE | VERNON_RHI_QUEUE_GRAPHICS;
     VernonRhiCommandEncoder native{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
-    VernonRhiStatus status = vernonRhiDeviceCreateCommandEncoder(device_, &encoderDescriptor, &native);
-    if (status != VERNON_RHI_STATUS_OK)
-        return status;
-    std::vector<VernonRhiBuffer> buffers(resources_.size(),
+    VernonRhiStatus status = vernonRhiDeviceCreateCommandEncoder(state_->device, &encoderDescriptor, &native);
+    if (status != VERNON_RHI_STATUS_OK) {
+        submission->status = status;
+        submission->state = ExecutionSubmission::State::Failed;
+        return ExecutionSubmission(std::move(submission));
+    }
+    std::vector<VernonRhiBuffer> buffers(state_->resources.size(),
                                          VernonRhiBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
-    for (size_t index = 0; index < resourceRecords_.size(); ++index)
-        if (resourceRecords_[index].resource.kind == ResourceKind::Buffer)
-            buffers[index] = resourceRecords_[index].buffer;
-    ExecutionResources resources(resources_, buffers);
-    for (const CompiledScope &scope : scopes_) {
+    for (size_t index = 0; index < state_->resourceRecords.size(); ++index)
+        if (state_->resourceRecords[index].resource.kind == ResourceKind::Buffer)
+            buffers[index] = state_->resourceRecords[index].buffer;
+    ExecutionResources resources(state_->resources, buffers, submission->bindings);
+    for (const CompiledScope &scope : state_->scopes) {
         if (!scope.barriers.empty()) {
-            status = vernonRhiCommandEncoderBarrier(device_, native, scope.barriers.data(), scope.barriers.size());
+            status =
+                vernonRhiCommandEncoderBarrier(state_->device, native, scope.barriers.data(), scope.barriers.size());
             if (status != VERNON_RHI_STATUS_OK)
                 break;
         }
         if (scope.rendering) {
-            auto *first = static_cast<RenderPass *>(passes_[scope.passIndices.front()].get());
-            auto *last = static_cast<RenderPass *>(passes_[scope.passIndices.back()].get());
+            auto *first = static_cast<RenderPass *>(state_->passes[scope.passIndices.front()].get());
+            auto *last = static_cast<RenderPass *>(state_->passes[scope.passIndices.back()].get());
             std::vector<VernonRhiColorAttachment> colors;
-            colors.reserve(first->colors_.size());
-            for (size_t index = 0; index < first->colors_.size(); ++index) {
-                const auto &begin = first->colors_[index];
-                const auto &finish = last->colors_[index];
+            colors.reserve(first->colors().size());
+            for (size_t index = 0; index < first->colors().size(); ++index) {
+                const auto &begin = first->colors()[index];
+                const auto &finish = last->colors()[index];
                 VernonRhiColorAttachment attachment{};
                 attachment.view = begin.image.view;
                 attachment.location = begin.location;
@@ -844,54 +1053,56 @@ VernonRhiStatus ExecutionGraph::executeRhi() {
                 colors.push_back(attachment);
             }
             VernonRhiDepthStencilAttachment depth{};
-            if (first->depth_) {
-                depth.view = first->depth_->image.view;
+            if (first->depthAttachment()) {
+                const DepthStencilAttachmentUse &firstDepth = *first->depthAttachment();
+                const DepthStencilAttachmentUse &lastDepth = *last->depthAttachment();
+                depth.view = firstDepth.image.view;
                 depth.initial_state = VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT;
                 depth.final_state = VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT;
-                depth.depth_load_operation = first->depth_->depthLoad;
-                depth.depth_store_operation = last->depth_->depthStore;
-                depth.clear_depth = first->depth_->clearDepth;
-                depth.stencil_load_operation = first->depth_->stencilLoad;
-                depth.stencil_store_operation = last->depth_->stencilStore;
-                depth.clear_stencil = first->depth_->clearStencil;
-                depth.read_only_depth = first->depth_->readOnlyDepth;
-                depth.read_only_stencil = first->depth_->readOnlyStencil;
+                depth.depth_load_operation = firstDepth.depthLoad;
+                depth.depth_store_operation = lastDepth.depthStore;
+                depth.clear_depth = firstDepth.clearDepth;
+                depth.stencil_load_operation = firstDepth.stencilLoad;
+                depth.stencil_store_operation = lastDepth.stencilStore;
+                depth.clear_stencil = firstDepth.clearStencil;
+                depth.read_only_depth = firstDepth.readOnlyDepth;
+                depth.read_only_stencil = firstDepth.readOnlyStencil;
             }
             VernonRhiRenderingDescriptor descriptor{};
             descriptor.struct_size = sizeof(descriptor);
             descriptor.color_attachments = colors.data();
             descriptor.color_attachment_count = colors.size();
-            descriptor.depth_stencil_attachment = first->depth_ ? &depth : nullptr;
-            descriptor.offset_x = first->renderArea_[0];
-            descriptor.offset_y = first->renderArea_[1];
-            descriptor.width = first->renderArea_[2];
-            descriptor.height = first->renderArea_[3];
-            descriptor.layers =
-                !first->colors_.empty() ? first->colors_.front().image.layers : first->depth_->image.layers;
-            status = vernonRhiCommandEncoderBeginRendering(device_, native, &descriptor);
+            descriptor.depth_stencil_attachment = first->depthAttachment() ? &depth : nullptr;
+            descriptor.offset_x = first->renderAreaData()[0];
+            descriptor.offset_y = first->renderAreaData()[1];
+            descriptor.width = first->renderAreaData()[2];
+            descriptor.height = first->renderAreaData()[3];
+            descriptor.layers = !first->colors().empty() ? first->colors().front().image.layers
+                                                         : first->depthAttachment()->image.layers;
+            status = vernonRhiCommandEncoderBeginRendering(state_->device, native, &descriptor);
             if (status != VERNON_RHI_STATUS_OK)
                 break;
-            GraphicsEncoder encoder(device_, native);
+            GraphicsEncoder encoder(state_->device, native);
             for (size_t scopeIndex = 0; scopeIndex < scope.passIndices.size(); ++scopeIndex) {
-                auto *renderPass = static_cast<RenderPass *>(passes_[scope.passIndices[scopeIndex]].get());
+                auto *renderPass = static_cast<RenderPass *>(state_->passes[scope.passIndices[scopeIndex]].get());
                 if (scopeIndex) {
-                    for (const auto &color : renderPass->colors_)
+                    for (const auto &color : renderPass->colors())
                         if (color.load == VERNON_RHI_LOAD_CLEAR) {
-                            status = vernonRhiCommandEncoderClearColorAttachment(device_, native, color.location,
+                            status = vernonRhiCommandEncoderClearColorAttachment(state_->device, native, color.location,
                                                                                  color.clear);
                             if (status != VERNON_RHI_STATUS_OK)
                                 break;
                         }
-                    if (status == VERNON_RHI_STATUS_OK && renderPass->depth_) {
+                    if (status == VERNON_RHI_STATUS_OK && renderPass->depthAttachment()) {
+                        const DepthStencilAttachmentUse &depthUse = *renderPass->depthAttachment();
                         uint32_t aspects = 0;
-                        if (renderPass->depth_->depthLoad == VERNON_RHI_LOAD_CLEAR)
+                        if (depthUse.depthLoad == VERNON_RHI_LOAD_CLEAR)
                             aspects |= VERNON_RHI_ATTACHMENT_DEPTH;
-                        if (renderPass->depth_->stencilLoad == VERNON_RHI_LOAD_CLEAR)
+                        if (depthUse.stencilLoad == VERNON_RHI_LOAD_CLEAR)
                             aspects |= VERNON_RHI_ATTACHMENT_STENCIL;
                         if (aspects)
                             status = vernonRhiCommandEncoderClearDepthStencilAttachment(
-                                device_, native, renderPass->depth_->clearDepth, renderPass->depth_->clearStencil,
-                                aspects);
+                                state_->device, native, depthUse.clearDepth, depthUse.clearStencil, aspects);
                     }
                 }
                 if (status == VERNON_RHI_STATUS_OK)
@@ -899,24 +1110,35 @@ VernonRhiStatus ExecutionGraph::executeRhi() {
                 if (status != VERNON_RHI_STATUS_OK)
                     break;
             }
-            const VernonRhiStatus endStatus = vernonRhiCommandEncoderEndRendering(device_, native);
+            const VernonRhiStatus endStatus = vernonRhiCommandEncoderEndRendering(state_->device, native);
             if (status == VERNON_RHI_STATUS_OK)
                 status = endStatus;
         } else {
-            ComputeEncoder encoder(device_, native);
-            status = static_cast<ComputePass *>(passes_[scope.passIndices.front()].get())->execute(encoder, resources);
+            ComputeEncoder encoder(state_->device, native);
+            status = static_cast<ComputePass *>(state_->passes[scope.passIndices.front()].get())
+                         ->execute(encoder, resources);
         }
         if (status != VERNON_RHI_STATUS_OK)
             break;
     }
     if (status == VERNON_RHI_STATUS_OK)
-        status = vernonRhiCommandEncoderFinish(device_, native);
+        status = vernonRhiCommandEncoderFinish(state_->device, native);
     if (status == VERNON_RHI_STATUS_OK)
-        status = vernonRhiDeviceSubmit(device_, native);
-    if (status == VERNON_RHI_STATUS_OK)
-        status = vernonRhiCommandEncoderGetStats(device_, native, &lastStats_);
-    const VernonRhiStatus destroyStatus = vernonRhiDeviceDestroyCommandEncoder(device_, native);
-    return status == VERNON_RHI_STATUS_OK ? destroyStatus : status;
+        status = vernonRhiDeviceSubmit(state_->device, native, &submission->completion);
+    if (status != VERNON_RHI_STATUS_OK)
+        (void)vernonRhiDeviceDestroyCommandEncoder(state_->device, native);
+    submission->status = status;
+    submission->state =
+        status == VERNON_RHI_STATUS_OK ? ExecutionSubmission::State::Pending : ExecutionSubmission::State::Failed;
+    if (status == VERNON_RHI_STATUS_OK) {
+        VernonRhiCompletionState completionState{};
+        if (vernonRhiCompletionGetState(state_->device, submission->completion, &completionState) ==
+                VERNON_RHI_STATUS_OK &&
+            completionState == VERNON_RHI_COMPLETION_SUCCEEDED)
+            submission->state = ExecutionSubmission::State::Succeeded;
+        (void)vernonRhiCompletionGetCommandStats(state_->device, submission->completion, &submission->stats);
+    }
+    return ExecutionSubmission(std::move(submission));
 }
 
 } // namespace vernon::execution

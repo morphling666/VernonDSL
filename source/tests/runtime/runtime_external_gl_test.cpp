@@ -815,8 +815,8 @@ void expectMatrixUpload(VernonRuntimeBackend backend, const char *target, uint16
     invocation.vertex_count = 3;
     invocation.instance_count = 1;
     const GlUint nextNameAfterPreparation = nextName;
-    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK);
+    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK);
+    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK);
     EXPECT_EQ(nextName, nextNameAfterPreparation);
     EXPECT_EQ(matrixTranspose, expectedTranspose);
     EXPECT_EQ(matrixUpload, expectedUpload);
@@ -871,7 +871,7 @@ void expectIntegerUniformUpload(const char *dtype, VernonDataType dataType, cons
     invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
     invocation.vertex_count = 3;
     invocation.instance_count = 1;
-    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK);
+    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK);
 
     ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, renderTargetView.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, renderTarget.handle), VERNON_RHI_STATUS_OK);
@@ -1065,19 +1065,15 @@ TEST(RuntimeExternalGl, InvokesDirectComputePipelineThroughRuntimeCoreProvider) 
     ASSERT_EQ(vernonRuntimePipelineEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
     VernonRhiCommandEncoderStats encoderStats{};
-    ASSERT_EQ(vernonRhiCommandEncoderGetStats(rhiRuntime(gl).device, encoder, &encoderStats), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(encoderStats.dispatch_count, 1u);
     ASSERT_EQ(vernonRhiCommandEncoderFinish(rhiRuntime(gl).device, encoder), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceSubmit(rhiRuntime(gl).device, encoder), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiCommandEncoderGetStats(rhiRuntime(gl).device, encoder, &encoderStats), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernon::tests::completeSubmission(rhiRuntime(gl).device, encoder, &encoderStats), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(encoderStats.dispatch_count, 1u);
     EXPECT_EQ(encoderStats.submission_count, 1u);
     VernonRhiCommandEncoder nextEncoder{};
     ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(rhiRuntime(gl).device, &encoderDescriptor, &nextEncoder),
               VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiCommandEncoderFinish(rhiRuntime(gl).device, nextEncoder), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceSubmit(rhiRuntime(gl).device, nextEncoder), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDestroyCommandEncoder(rhiRuntime(gl).device, nextEncoder), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDestroyCommandEncoder(rhiRuntime(gl).device, encoder), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernon::tests::completeSubmission(rhiRuntime(gl).device, nextEncoder), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRuntimePipelineEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(rhiRuntime(gl).device, buffer.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceIsBufferValid(rhiRuntime(gl).device, buffer.handle), 0u);
@@ -1086,7 +1082,7 @@ TEST(RuntimeExternalGl, InvokesDirectComputePipelineThroughRuntimeCoreProvider) 
     ASSERT_NE(replacement.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     EXPECT_NE(replacement.handle.index, buffer.handle.index);
     for (size_t iteration = 0; iteration < 128; ++iteration)
-        ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK);
+        ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK);
     EXPECT_EQ(dispatchCount, 129u);
     EXPECT_EQ(storageBindingCount, 258u);
     EXPECT_EQ(memoryBarrierCount, 129u);
@@ -1148,7 +1144,7 @@ TEST(RuntimeExternalGl, RejectsStorageImageMetadataThatDisagreesWithRhiResource)
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.compute_grid = {1, 1, 1};
-    EXPECT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
 
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     EXPECT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, imageView.handle), VERNON_RHI_STATUS_OK);
@@ -1285,7 +1281,7 @@ TEST(RuntimeExternalGl, InvokesGeneratedResolutionAndSignedUniformPipeline) {
     invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
     invocation.vertex_count = 3;
     invocation.instance_count = 1;
-    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
+    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
     EXPECT_EQ(resolutionUpload, (std::array<float, 2>{37.0F, 23.0F}));
     EXPECT_EQ(signedUniformUpload[0], maxSteps);
@@ -1517,18 +1513,15 @@ TEST(RuntimeExternalGl, SuppliesImplicitSamplerAndEffectiveResolution) {
 
     ASSERT_EQ(vernonRhiCommandEncoderEndRendering(rhiRuntime(gl).device, encoder), VERNON_RHI_STATUS_OK);
     VernonRhiCommandEncoderStats encoderStats{};
-    ASSERT_EQ(vernonRhiCommandEncoderGetStats(rhiRuntime(gl).device, encoder, &encoderStats), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(encoderStats.rendering_scope_count, 1u);
-    EXPECT_EQ(encoderStats.draw_count, 2u);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     pipeline = nullptr;
     vernonRuntimePipelineBundleDestroy(bundle);
     bundle = nullptr;
     ASSERT_EQ(vernonRhiCommandEncoderFinish(rhiRuntime(gl).device, encoder), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceSubmit(rhiRuntime(gl).device, encoder), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiCommandEncoderGetStats(rhiRuntime(gl).device, encoder, &encoderStats), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernon::tests::completeSubmission(rhiRuntime(gl).device, encoder, &encoderStats), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(encoderStats.rendering_scope_count, 1u);
+    EXPECT_EQ(encoderStats.draw_count, 2u);
     EXPECT_EQ(encoderStats.submission_count, 1u);
-    ASSERT_EQ(vernonRhiDeviceDestroyCommandEncoder(rhiRuntime(gl).device, encoder), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroySampler(rhiRuntime(gl).device, replacementSampler.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(rhiRuntime(gl).device, replacementSampled.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, targetView.handle), VERNON_RHI_STATUS_OK);
@@ -1601,11 +1594,15 @@ TEST(RuntimeExternalGl, ExecutionGraphFusesDrawsAndSubmitsOnce) {
                                                   VERNON_RHI_LOAD_CLEAR);
         graph.emplacePass<RuntimeGraphRenderPass>("second", graphTarget, gl, pipeline, &invocation,
                                                   VERNON_RHI_LOAD_PRESERVE, VERNON_RHI_STORE_DISCARD);
-        ASSERT_EQ(graph.execute(), VERNON_RHI_STATUS_OK);
-        EXPECT_EQ(graph.lastStats().rendering_scope_count, 1u);
-        EXPECT_EQ(graph.lastStats().barrier_count, 1u);
-        EXPECT_EQ(graph.lastStats().draw_count, 2u);
-        EXPECT_EQ(graph.lastStats().submission_count, 1u);
+        std::string error;
+        auto plan = graph.compile(error);
+        ASSERT_TRUE(plan) << error;
+        auto submission = plan->submit();
+        ASSERT_EQ(submission.wait(), VERNON_RHI_STATUS_OK);
+        EXPECT_EQ(submission.commandStats().rendering_scope_count, 1u);
+        EXPECT_EQ(submission.commandStats().barrier_count, 1u);
+        EXPECT_EQ(submission.commandStats().draw_count, 2u);
+        EXPECT_EQ(submission.commandStats().submission_count, 1u);
         EXPECT_EQ(invalidateCount, 1u);
         EXPECT_NE(lastMemoryBarrierBits & 0x00000400u, 0u);
         EXPECT_EQ(framebufferBindCount, 1u);
@@ -1666,7 +1663,7 @@ TEST(RuntimeExternalGl, BindsExplicitSamplerSeparately) {
     invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
     invocation.vertex_count = 3;
     invocation.instance_count = 1;
-    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK);
+    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK);
     EXPECT_NE(boundSamplerName, 0u);
 
     ASSERT_EQ(vernonRhiDeviceDestroySampler(rhiRuntime(gl).device, explicitSampler.handle), VERNON_RHI_STATUS_OK);
@@ -1732,7 +1729,7 @@ TEST(RuntimeExternalGl, BindsVertexAndIndexBuffersThroughRhi) {
     invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
     invocation.vertex_count = 3;
     invocation.instance_count = 3;
-    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
+    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
     void *vertexNative = nullptr;
     void *indexNative = nullptr;
@@ -1817,7 +1814,7 @@ TEST(RuntimeExternalGl, BindsAllFormalVertexNumericFormatsAndRejectsUnsupportedF
         invocation.color_attachment_count = 1;
         invocation.vertex_count = 3;
         invocation.instance_count = 3;
-        ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
+        ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
             << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
         EXPECT_EQ(vertexAttributeType, format.nativeType);
         EXPECT_EQ(vertexAttributePointerKind, format.pointerKind);
@@ -1940,14 +1937,14 @@ TEST(RuntimeExternalGl, LoadsAssetsAndInvokesPipeline) {
     invocation.vertex_count = 3;
     invocation.instance_count = 1;
     const GlUint nextNameAfterPreparation = nextName;
-    ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
+    ASSERT_TRUE(vernon::tests::completeSubmission(pipeline, &invocation) == VERNON_STATUS_OK);
     attachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
     attachment.store_operation = VERNON_RUNTIME_PROVIDER_STORE_DISCARD;
     depthAttachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
     depthAttachment.stencil_load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
     depthAttachment.stencil_store_operation = VERNON_RUNTIME_PROVIDER_STORE_DISCARD;
     // The host may change OpenGL state between command encoders, so each invocation must restore its bindings.
-    ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
+    ASSERT_TRUE(vernon::tests::completeSubmission(pipeline, &invocation) == VERNON_STATUS_OK);
     ASSERT_TRUE(drawCount == 2);
     ASSERT_EQ(clearCount, 1u);
     EXPECT_FLOAT_EQ(clearColor[0], 0.25f);

@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -13,6 +14,8 @@
 namespace vernon::execution {
 
 class ExecutionGraph;
+class CompiledExecutionGraph;
+class ExecutionSubmission;
 namespace detail {
 struct ExecutionGraphTestAccess;
 }
@@ -96,18 +99,67 @@ private:
     VernonRhiCommandEncoder encoder_;
 };
 
+struct ExecutionParameter {
+    uint32_t id{UINT32_MAX};
+    uint64_t graphIdentity{};
+};
+
+class ExecutionBindingValue {
+public:
+    virtual ~ExecutionBindingValue() = default;
+};
+
+struct ExecutionBinding {
+    ExecutionParameter parameter;
+    std::shared_ptr<const ExecutionBindingValue> value;
+};
+
+class ExecutionBindings {
+public:
+    const std::shared_ptr<const ExecutionBindingValue> &at(ExecutionParameter parameter) const;
+    size_t size() const { return values_.size(); }
+
+private:
+    friend class CompiledExecutionGraph;
+    friend class ExecutionBindingsBuilder;
+    friend class ExecutionResources;
+    ExecutionBindings(uint64_t graphIdentity, std::vector<std::shared_ptr<const ExecutionBindingValue>> values)
+        : graphIdentity_(graphIdentity), values_(std::move(values)) {}
+
+    uint64_t graphIdentity_{};
+    std::vector<std::shared_ptr<const ExecutionBindingValue>> values_;
+};
+
+class ExecutionBindingsBuilder {
+public:
+    void set(ExecutionParameter parameter, std::shared_ptr<const ExecutionBindingValue> value);
+    std::shared_ptr<const ExecutionBindings> snapshot() const;
+
+private:
+    friend class CompiledExecutionGraph;
+    ExecutionBindingsBuilder(uint64_t graphIdentity, size_t parameterCount);
+
+    uint64_t graphIdentity_{};
+    std::vector<std::shared_ptr<const ExecutionBindingValue>> values_;
+    mutable std::shared_ptr<const ExecutionBindings> cached_;
+};
+
 class ExecutionResources {
 public:
     const std::vector<GraphResource> &all() const { return resources_; }
     bool buffer(GraphBuffer resource, VernonRhiBuffer &output) const;
+    bool hasBindings() const { return static_cast<bool>(bindings_); }
+    const std::shared_ptr<const ExecutionBindingValue> &binding(ExecutionParameter parameter) const;
 
 private:
-    friend class ExecutionGraph;
-    ExecutionResources(const std::vector<GraphResource> &resources, const std::vector<VernonRhiBuffer> &buffers)
-        : resources_(resources), buffers_(buffers) {}
+    friend class CompiledExecutionGraph;
+    ExecutionResources(const std::vector<GraphResource> &resources, const std::vector<VernonRhiBuffer> &buffers,
+                       std::shared_ptr<const ExecutionBindings> bindings)
+        : resources_(resources), buffers_(buffers), bindings_(std::move(bindings)) {}
 
     const std::vector<GraphResource> &resources_;
     const std::vector<VernonRhiBuffer> &buffers_;
+    std::shared_ptr<const ExecutionBindings> bindings_;
 };
 
 class ExecutionPass {
@@ -181,6 +233,20 @@ struct CompiledScope {
     std::vector<VernonRhiBarrier> barriers;
 };
 
+namespace detail {
+enum class ExecutionProvider : uint8_t { Cpu, Rhi };
+
+struct ExecutionResourceRecord {
+    GraphResource resource;
+    bool exported{};
+    bool graphOwned{};
+    uint64_t resourceKey{};
+    std::vector<uint64_t> imageViewKeys;
+    VernonRhiBuffer buffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    VernonRhiImage image{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+};
+} // namespace detail
+
 class DeviceExecutionSession {
 public:
     explicit DeviceExecutionSession(VernonRhiDevice device);
@@ -204,6 +270,8 @@ public:
     ExecutionGraph &operator=(const ExecutionGraph &) = delete;
 
     template <typename Pass, typename... Arguments> Pass &emplacePass(Arguments &&...arguments) {
+        if (compiled_)
+            throw std::logic_error("cannot mutate a compiled execution graph builder");
         auto pass = std::make_unique<Pass>(std::forward<Arguments>(arguments)...);
         Pass &reference = *pass;
         passes_.push_back(std::move(pass));
@@ -217,45 +285,74 @@ public:
     GraphBuffer importHostBuffer(uint64_t identity, bool exported = false);
     GraphBuffer importBuffer(VernonRhiBuffer buffer, bool exported = false);
     GraphImage importImage(VernonRhiImage image, VernonRhiImageView view, bool exported = false);
-    bool compile(std::string &error);
+    ExecutionParameter parameter(std::string name);
+    std::shared_ptr<CompiledExecutionGraph> compile(std::string &error);
     bool validate(std::string &error) const;
-    VernonRhiStatus execute();
-
-    const std::vector<uint32_t> &schedule() const { return schedule_; }
-    const std::vector<CompiledScope> &scopes() const { return scopes_; }
-    const VernonRhiCommandEncoderStats &lastStats() const { return lastStats_; }
 
 private:
     friend class ExecutionPass;
     friend struct detail::ExecutionGraphTestAccess;
-    struct ResourceRecord {
-        GraphResource resource;
-        bool exported{};
-        bool graphOwned{};
-        uint64_t resourceKey{};
-        std::vector<uint64_t> imageViewKeys;
-        VernonRhiBuffer buffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
-        VernonRhiImage image{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
-    };
 
-    enum class Provider : uint8_t { Cpu, Rhi };
+    bool buildPlan(std::string &error);
 
-    VernonRhiStatus executeCpu();
-    VernonRhiStatus executeRhi();
-
-    Provider provider_{Provider::Cpu};
+    detail::ExecutionProvider provider_{detail::ExecutionProvider::Cpu};
     VernonRhiDevice device_;
     uint64_t graphIdentity_{};
     std::vector<std::unique_ptr<ExecutionPass>> passes_;
     std::vector<GraphResource> resources_;
-    std::vector<ResourceRecord> resourceRecords_;
+    std::vector<detail::ExecutionResourceRecord> resourceRecords_;
     std::unordered_map<uint64_t, uint32_t> importedBuffers_;
     std::unordered_map<uint64_t, uint32_t> importedHostBuffers_;
     std::unordered_map<uint64_t, uint32_t> importedImages_;
+    std::vector<std::string> parameterNames_;
+    std::unordered_map<std::string, uint32_t> parameterIds_;
     std::vector<uint32_t> schedule_;
     std::vector<CompiledScope> scopes_;
-    VernonRhiCommandEncoderStats lastStats_{};
     bool dirty_{true};
+    bool compiled_{};
+};
+
+class ExecutionSubmission {
+public:
+    enum class State : uint8_t { Pending, Succeeded, Failed };
+
+    ExecutionSubmission();
+    ~ExecutionSubmission();
+    ExecutionSubmission(ExecutionSubmission &&) noexcept;
+    ExecutionSubmission &operator=(ExecutionSubmission &&) noexcept;
+    ExecutionSubmission(const ExecutionSubmission &) = delete;
+    ExecutionSubmission &operator=(const ExecutionSubmission &) = delete;
+
+    State state() const;
+    VernonRhiStatus wait();
+    VernonRhiStatus signal(VernonRhiStatus result);
+    VernonRhiStatus status() const;
+    const VernonRhiCommandEncoderStats &commandStats() const;
+
+private:
+    friend class CompiledExecutionGraph;
+    class Impl;
+    explicit ExecutionSubmission(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+};
+
+class CompiledExecutionGraph {
+public:
+    ~CompiledExecutionGraph();
+    CompiledExecutionGraph(const CompiledExecutionGraph &) = delete;
+    CompiledExecutionGraph &operator=(const CompiledExecutionGraph &) = delete;
+
+    ExecutionBindingsBuilder createBindings(const std::vector<ExecutionBinding> &initial) const;
+    ExecutionSubmission submit(std::shared_ptr<const ExecutionBindings> bindings = {}) const;
+    const std::vector<uint32_t> &schedule() const;
+    const std::vector<CompiledScope> &scopes() const;
+
+private:
+    friend class ExecutionGraph;
+    friend class ExecutionSubmission;
+    struct State;
+    explicit CompiledExecutionGraph(std::shared_ptr<State> state);
+    std::shared_ptr<State> state_;
 };
 
 } // namespace vernon::execution

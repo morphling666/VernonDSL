@@ -245,7 +245,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     invocation.index_binding = &indexBinding;
     invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
     invocation.instance_count = 1;
-    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
+    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     const vernon::runtime::VulkanGraphicsCacheStats firstStats =
         vernon::runtime::getVulkanGraphicsCacheStats(runtime, pipeline);
@@ -270,7 +270,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     invocation.viewport[1] = 3;
     invocation.viewport[2] = 24;
     invocation.viewport[3] = 12;
-    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
+    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     const vernon::runtime::VulkanGraphicsCacheStats secondStats =
         vernon::runtime::getVulkanGraphicsCacheStats(runtime, pipeline);
@@ -285,7 +285,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(secondStats.renderPassCreations, firstStats.renderPassCreations);
 
     invocation.stencil_reference = 9;
-    ASSERT_EQ(vernonRuntimePipelineInvoke(pipeline, &invocation), VERNON_STATUS_OK)
+    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     const vernon::runtime::VulkanGraphicsCacheStats warmStats =
         vernon::runtime::getVulkanGraphicsCacheStats(runtime, pipeline);
@@ -357,10 +357,14 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
                                                                  VERNON_RHI_LOAD_CLEAR);
         graph.emplacePass<vernon::tests::RuntimeGraphRenderPass>("second", graphTarget, runtime, pipeline, &invocation,
                                                                  VERNON_RHI_LOAD_PRESERVE);
-        ASSERT_EQ(graph.execute(), VERNON_RHI_STATUS_OK);
-        EXPECT_EQ(graph.lastStats().rendering_scope_count, 1u);
-        EXPECT_EQ(graph.lastStats().draw_count, 2u);
-        EXPECT_EQ(graph.lastStats().submission_count, 1u);
+        std::string graphError;
+        auto plan = graph.compile(graphError);
+        ASSERT_TRUE(plan) << graphError;
+        auto submission = plan->submit();
+        ASSERT_EQ(submission.wait(), VERNON_RHI_STATUS_OK);
+        EXPECT_EQ(submission.commandStats().rendering_scope_count, 1u);
+        EXPECT_EQ(submission.commandStats().draw_count, 2u);
+        EXPECT_EQ(submission.commandStats().submission_count, 1u);
     }
     EXPECT_EQ(vernon::runtime::getRhiAdapterRecordedCommandCount(runtime) - commandsBeforeGraph, 2u);
 
@@ -473,8 +477,7 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     ASSERT_EQ(vernonRuntimePipelineEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     ASSERT_EQ(vernonRhiCommandEncoderFinish(context.device, encoder), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceSubmit(context.device, encoder), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDestroyCommandEncoder(context.device, encoder), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernon::tests::completeSubmission(context.device, encoder), VERNON_RHI_STATUS_OK);
     std::array<float, 4> output{};
     ASSERT_EQ(vernonRhiDeviceDownloadBuffer(context.device, buffer.handle, 0, output.data(), sizeof(output)),
               VERNON_RHI_STATUS_OK);

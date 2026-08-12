@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 namespace vernon::rhi::metal {
 namespace {
@@ -188,6 +189,61 @@ bool DeviceState::uploadBuffer(const Buffer &buffer, uint64_t offset, const void
     }
     return runCopy(*this, staging, 0, buffer.buffer, static_cast<NSUInteger>(offset), static_cast<NSUInteger>(size),
                    error);
+}
+
+bool DeviceState::uploadBufferRanges(const Buffer &buffer, const VernonRhiBufferUploadRange *ranges,
+                                     size_t rangeCount, std::string &error) {
+    if (buffer.buffer.storageMode == MTLStorageModeShared) {
+        auto *destination = static_cast<unsigned char *>(buffer.buffer.contents);
+        for (size_t index = 0; index < rangeCount; ++index)
+            std::memcpy(destination + ranges[index].offset, ranges[index].source,
+                        static_cast<size_t>(ranges[index].size));
+        return true;
+    }
+    std::vector<NSUInteger> stagingOffsets;
+    stagingOffsets.reserve(rangeCount);
+    NSUInteger stagingSize = 0;
+    for (size_t index = 0; index < rangeCount; ++index) {
+        if (stagingSize > (std::numeric_limits<NSUInteger>::max)() - 3u) {
+            error = "Metal batched upload size overflow";
+            return false;
+        }
+        stagingSize = (stagingSize + 3u) & ~NSUInteger{3u};
+        stagingOffsets.push_back(stagingSize);
+        if (ranges[index].size > (std::numeric_limits<NSUInteger>::max)() - stagingSize) {
+            error = "Metal batched upload size overflow";
+            return false;
+        }
+        stagingSize += static_cast<NSUInteger>(ranges[index].size);
+    }
+    id<MTLBuffer> staging =
+        [device newBufferWithLength:stagingSize options:MTLResourceStorageModeShared];
+    if (!staging) {
+        error = "Metal batched upload staging buffer allocation failed";
+        return false;
+    }
+    auto *mapped = static_cast<unsigned char *>(staging.contents);
+    for (size_t index = 0; index < rangeCount; ++index)
+        std::memcpy(mapped + stagingOffsets[index], ranges[index].source, static_cast<size_t>(ranges[index].size));
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> encoder = [commandBuffer blitCommandEncoder];
+    if (!commandBuffer || !encoder) {
+        error = "Metal failed to create a batched upload command encoder";
+        return false;
+    }
+    for (size_t index = 0; index < rangeCount; ++index)
+        [encoder copyFromBuffer:staging
+                   sourceOffset:stagingOffsets[index]
+                       toBuffer:buffer.buffer
+              destinationOffset:static_cast<NSUInteger>(ranges[index].offset)
+                           size:static_cast<NSUInteger>(ranges[index].size)];
+    [encoder endEncoding];
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+    if (commandBuffer.status == MTLCommandBufferStatusCompleted)
+        return true;
+    setCommandError(error, commandBuffer, "Metal batched buffer upload failed");
+    return false;
 }
 
 bool DeviceState::downloadBuffer(const Buffer &buffer, uint64_t offset, void *destination, uint64_t size,

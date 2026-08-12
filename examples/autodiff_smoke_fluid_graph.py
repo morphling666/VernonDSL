@@ -55,6 +55,9 @@ class SmokeFluidGraph:
         control_nozzles: vd.TensorStorage,
         objective_target_density: vd.TensorStorage,
         parameters: SmokeFluidParameters,
+        output_density: vd.TensorStorage | None = None,
+        output_velocity: vd.TensorStorage | None = None,
+        output_loss: vd.TensorStorage | None = None,
     ):
         width = int(parameters.width)
         height = int(parameters.height)
@@ -78,9 +81,15 @@ class SmokeFluidGraph:
         self.divergence = vd.storage.zeros(dtype=vd.f32, shape=(height, width))
         self.pressure_a = vd.storage.zeros(dtype=vd.f32, shape=(height, width))
         self.pressure_b = vd.storage.zeros(dtype=vd.f32, shape=(height, width))
-        self.output_density = vd.storage.zeros(dtype=vd.f32, shape=(height, width))
-        self.output_velocity = vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(height, width))
-        self.output_loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        self.output_density = (
+            output_density if output_density is not None else vd.storage.zeros(dtype=vd.f32, shape=(height, width))
+        )
+        self.output_velocity = (
+            output_velocity
+            if output_velocity is not None
+            else vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(height, width))
+        )
+        self.output_loss = output_loss if output_loss is not None else vd.storage.zeros(dtype=vd.f32, shape=(1,))
 
         for value in (
             state_density,
@@ -206,6 +215,7 @@ class SmokeFluidGraph:
             ),
             previous,
         )
+        self.graph = self.graph.compile()
 
     def _add_dispatch(
         self,
@@ -223,7 +233,7 @@ class SmokeFluidGraph:
         return SmokeFluidOutputs(self.output_density, self.output_velocity, self.output_loss)
 
     def execute(self) -> SmokeFluidOutputs:
-        self.graph.execute()
+        self.graph.submit().wait()
         return self.outputs
 
 
@@ -234,6 +244,9 @@ def build_smoke_fluid_graph(
     control_nozzles: vd.TensorStorage,
     objective_target_density: vd.TensorStorage,
     parameters: SmokeFluidParameters,
+    output_density: vd.TensorStorage | None = None,
+    output_velocity: vd.TensorStorage | None = None,
+    output_loss: vd.TensorStorage | None = None,
 ) -> SmokeFluidGraph:
     return SmokeFluidGraph(
         state_density=state_density,
@@ -241,4 +254,7 @@ def build_smoke_fluid_graph(
         control_nozzles=control_nozzles,
         objective_target_density=objective_target_density,
         parameters=parameters,
+        output_density=output_density,
+        output_velocity=output_velocity,
+        output_loss=output_loss,
     )

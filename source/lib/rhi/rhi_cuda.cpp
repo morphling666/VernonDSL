@@ -205,6 +205,33 @@ VernonRhiStatus uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uin
     return VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
+VernonRhiStatus uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
+                                   const VernonRhiBufferUploadRange *ranges, size_t rangeCount) {
+    auto device = lookupCudaDevice(handle);
+    if (!device)
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    if (!ranges || rangeCount == 0)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    CudaBufferSlot *slot = lookupCudaBuffer(*device, buffer);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    size_t stagingSize = 0;
+    for (size_t index = 0; index < rangeCount; ++index) {
+        const VernonRhiBufferUploadRange &range = ranges[index];
+        if (!range.source || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
+            range.offset > slot->descriptor.size || range.size > slot->descriptor.size - range.offset ||
+            static_cast<size_t>(range.size) > (std::numeric_limits<size_t>::max)() - stagingSize)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        stagingSize += static_cast<size_t>(range.size);
+    }
+    const auto status = device->state.uploadRanges(slot->pointer, ranges, rangeCount);
+    if (status == vernon::rhi::cuda::kSuccess)
+        return VERNON_RHI_STATUS_OK;
+    device->error = vernon::rhi::cuda::describeResult(status, "batched cuMemcpyHtoDAsync");
+    return VERNON_RHI_STATUS_INTERNAL_ERROR;
+}
+
 VernonRhiStatus downloadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset, void *destination,
                                uint64_t size) {
     auto device = lookupCudaDevice(handle);
@@ -277,7 +304,9 @@ bool beginCommands(VernonRhiDevice handle, uint64_t &native, VernonRhiBackend &b
     return true;
 }
 
-bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites, bool &completed) {
+bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites, bool &completed,
+                    bool &externalCompletion) {
+    externalCompletion = false;
     auto device = lookupCudaDevice(handle);
     if (!device) {
         return false;
@@ -370,6 +399,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::cudaBackendDispatch() {
         deviceStateForBackend,
         createBuffer,
         uploadBuffer,
+        uploadBufferRanges,
         downloadBuffer,
         destroyBuffer,
         isBufferValid,

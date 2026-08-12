@@ -10,7 +10,7 @@ size, and SHA-256. Applications link the object and generated registration
 source at build time and call its registration function before loading the
 pipeline. Runtime validates the external descriptor but never parses or
 relocates object files. The removed `vernon-compile --compute-bundle` and
-`compute.json` format are not pipeline-14 deployment APIs. Python immediate
+`compute.json` format are not current deployment APIs. Python immediate
 execution uses compiler-owned LLJIT to load the host object directly. LLVM IR
 and ORC JIT are not persistent runtime bundle formats.
 
@@ -216,7 +216,7 @@ synthetic compute pipelines, and `runtime_pipeline_dispatch` routes
 PipelineAsset resolution plus compute/graphics invocation. Pipeline
 preparation, destruction, and invocation live in the CPU, CUDA, Vulkan, D3D12,
 and OpenGL pipeline translation units; the dispatch file contains only backend
-routing and synchronization. There is no Runtime Kernel handle or kernel
+routing. There is no Runtime Kernel handle or kernel
 dispatch layer. RHI provider implementations are split into common, CUDA,
 D3D12, OpenGL, and Vulkan translation units; CPU provider preparation remains
 with RuntimeCpuProvider.
@@ -227,24 +227,26 @@ command buffer, context, or stream; provider draw and dispatch callbacks record
 commands but never finish or submit it. Immediate invocation creates an
 ephemeral encoder, records once, finishes, and submits once. ExecutionGraph
 uses the same contract across all compiled scopes and submits once after the
-last scope. Concurrent ExecutionGraph executions on one device serialize their
-complete command-encoder lifecycle through a device session because the
-synchronous RHI contract permits only one active encoder per device; this
-policy is independent of Runtime contexts and graph contents. Encoder lookup
-uses an O(1) generation-checked registry and a
-per-encoder lock; backend submission and fence waits never hold the registry
-lock. Recording retains an O(1)-deduplicated set of RHI resources plus prepared
-pipeline and binding objects. Owned submissions release those references after
-the synchronous backend completion; borrowed native command targets retain
-them until encoder destruction, which is the owner's completion signal.
-Failed recordings are abandoned with the same cleanup path.
-The stable `0.1.2` API does not expose asynchronous submission, deferred graph
-execution, or multiple frames in flight. Callers must not infer those
-capabilities from backend-native queues or streams. Adding them requires
-completion-serial tracking and deferred reclamation for every enabled backend,
-as defined by the
+last scope. Successful submission consumes the encoder and transfers command
+statistics, cleanup actions, and retained resources to a generation-checked
+completion. Concurrent recordings on one device still serialize their encoder
+lifecycle through a device session, independently of Runtime contexts and graph
+contents. Encoder and completion lookup use O(1) registries with per-object
+locks; backend submission and waits never hold the registry lock.
+
+Owned backends may complete inline; otherwise completion wait and destruction
+retain resources until backend work finishes. Borrowed Vulkan and D3D12 command
+targets are submitted by their external owner, so their completion remains
+pending until that owner calls `vernonRhiCompletionSignal` after its fence
+finishes. Destroying a device drains its completions and therefore requires all
+borrowed completions to be signaled first. Failed recordings are abandoned
+without producing a completion.
+
+The `0.1.2` API exposes explicit submissions but does not guarantee concurrent
+execution or multiple frames in flight. Backends may complete inline while
+preserving the same state and lifetime model. True queue overlap remains the
 [`asynchronous GPU resource lifetime`](../roadmap.md#asynchronous-gpu-resource-lifetime)
-roadmap.
+roadmap phase.
 
 ExecutionGraph render scopes own the first attachment load operations and the
 last attachment store operations. Providers consume those scope operations
@@ -286,15 +288,16 @@ address duplicate static registries.
 D3D12 device selection, COM device/queue/allocator/list/fence ownership,
 resource creation, and resource destruction live in VernonRHI. RuntimeCore
 owns format and invocation planning; the D3D12 provider owns preparation and
-encoding. Synchronous submission reuses one allocator/list command frame. Persistently
+encoding. Owned submission currently completes before reusing its one
+allocator/list command frame. Persistently
 mapped upload/readback rings and persistent RTV/resource/sampler descriptor
 rings grow geometrically and reuse storage after completed submissions. The
 Provider references encode stable RHI slot-and-generation keys rather than slot
 addresses or COM pointers. Public destruction invalidates the owner handle
 immediately; an owned native resource remains in its logical record until all
-prepared bindings release it. The current C ABI submission remains synchronous,
-so ring wrap cannot overwrite in-flight GPU data; asynchronous submission will
-require fence-tagged ring segments.
+prepared bindings release it. Explicit completion owns transient ring segments
+until work completes; future queue overlap requires fence-tagged reuse within
+those rings.
 
 D3D12 graphics preparation is lazy because render-target formats, topology,
 and concrete vertex strides arrive with the first invocation. The resulting
@@ -345,8 +348,9 @@ buffer. Unchanged snapshots are shared across command encoders; in-flight
 command references retain stale revisions until completion, while the current
 revision stays cached with the prepared binding set. Binding updates therefore
 cannot mutate earlier commands, and push-constant-only animation does not
-allocate descriptor sets. Submission remains synchronous, so completed
-submissions safely reset transient ring offsets.
+allocate descriptor sets. Inline-complete submissions may safely reset
+transient ring offsets; deferred implementations retain their segments through
+the completion.
 
 Vulkan graphics prefers dynamic rendering when Vulkan 1.3, or Vulkan 1.2 with
 `VK_KHR_dynamic_rendering`, exposes the feature. Older devices use cached render
@@ -469,7 +473,7 @@ DirectX cooking emits Shader Model 6 DXIL containers and `VernonRuntime`
 exposes a Windows-only D3D12 backend. The backend owns its device, direct queue,
 command allocator, fence, buffers, textures, samplers, descriptor heaps, and
 offscreen render targets. Deployments load pre-cooked DXIL and do not load DXC.
-Synchronous submission keeps transient upload/readback and descriptor storage
+Submission completions keep transient upload/readback and descriptor storage
 alive until the fence completes. Tests select WARP through an internal hook;
 normal device creation skips software adapters.
 
@@ -557,7 +561,7 @@ stage topology with an explicit unsupported-target result when that backend
 does not implement it. Manifest parsing must not hard-code vertex-plus-fragment
 as the only representable topology.
 
-Pipeline 14 uses one canonical `*.pipeline.json` schema for compute and
+Pipeline 15 uses one canonical `*.pipeline.json` schema for compute and
 graphics. Its optional root `autodiff` object contains differentiated-program
 metadata; it is absent for ordinary primal-only assets. Pipeline-13
 transform/profile fields are not current aliases.

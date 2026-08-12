@@ -45,7 +45,6 @@ from pipeline_asset_fixture import (  # noqa: E402
     solid_fragment,
     triangle_vertex,
 )
-from vernon_dsl._runtime.resources import _bind_native_argument  # noqa: E402
 from vernon_dsl.bundle import OpenGLTargetOptions, VulkanTargetOptions, canonical_json  # noqa: E402
 from vernon_dsl.compiler import compile_file  # noqa: E402
 from vernon_dsl.pipeline_asset_cli import main as pipeline_asset_main  # noqa: E402
@@ -421,10 +420,9 @@ class CompileSurfaceParityTests(unittest.TestCase):
         direct_kernel = direct_runtime.load_cpu_entry(program, "scale")
         direct_values = vd.storage.from_numpy(source)
         direct_builder = direct_kernel.invocation_builder()
-        _bind_native_argument(direct_builder, direct_kernel.parameters[0], direct_values)
-        _bind_native_argument(direct_builder, direct_kernel.parameters[1], 2.5)
-        direct_builder.grid(4, 1, 1).invoke()
-        direct_runtime.synchronize()
+        direct_builder.host_tensor(direct_kernel.parameters[0].name, direct_values._native_host_array())
+        direct_builder.host_tensor(direct_kernel.parameters[1].name, np.asarray(np.float32(2.5)))
+        direct_builder.grid(4, 1, 1).submit().wait()
         direct_result = direct_values.to_numpy()
 
         runtime_module.Kernel.clear_cache()

@@ -200,8 +200,7 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
     invocation.arguments = arguments;
     invocation.argument_count = 2;
     invocation.compute_grid = {4, 1, 1};
-    ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
-    ASSERT_TRUE(vernonRuntimeSynchronize(runtime) == VERNON_STATUS_OK);
+    ASSERT_TRUE(vernon::tests::completeSubmission(pipeline, &invocation) == VERNON_STATUS_OK);
 
     float output[4]{};
     ASSERT_EQ(vernonRhiDeviceDownloadBuffer(context.device, buffer.handle, 0, output, sizeof(output)),

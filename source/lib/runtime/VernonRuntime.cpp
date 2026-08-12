@@ -824,40 +824,62 @@ void vernonRuntimeLoadedPipelineDestroy(VernonLoadedPipeline *pipeline) {
     delete pipeline;
 }
 
-VernonStatus vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline, const VernonPipelineInvocation *invocation) {
-    RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    if (!pipeline || !invocation || invocation->struct_size < sizeof(VernonPipelineInvocation) ||
-        invocation->abi_version != VERNON_PIPELINE_VERSION || (invocation->argument_count && !invocation->arguments))
-        return fail(pipeline ? pipeline->context : nullptr, "invalid pipeline invocation");
-    auto encode = [&](const VernonPipelineInvocation &encoded) {
-        if (!pipeline->variant.compute.empty()) {
-            const uint32_t grid[3]{encoded.compute_grid.x, encoded.compute_grid.y, encoded.compute_grid.z};
-            const uint32_t workgroup[3]{pipeline->workgroupSize.x, pipeline->workgroupSize.y,
-                                        pipeline->workgroupSize.z};
-            if (!validateDispatchContract(pipeline->dispatchContract, grid, workgroup,
-                                          invocationDiagnostic(*pipeline->context)))
-                return VERNON_STATUS_INVALID_ARGUMENT;
-            PlannedComputeLaunch plan;
-            std::string planningError;
-            if (!planComputeInvocation(pipeline->variant, pipeline->workgroupSize, encoded, plan, planningError))
-                return fail(pipeline->context, planningError);
-            return invokeBackendComputePipeline(*pipeline, plan);
-        }
+namespace {
 
-        PlannedGraphicsInvocation plan;
+VernonStatus encodePipelineInvocation(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation) {
+    if (!pipeline.variant.compute.empty()) {
+        const uint32_t grid[3]{invocation.compute_grid.x, invocation.compute_grid.y, invocation.compute_grid.z};
+        const uint32_t workgroup[3]{pipeline.workgroupSize.x, pipeline.workgroupSize.y, pipeline.workgroupSize.z};
+        if (!validateDispatchContract(pipeline.dispatchContract, grid, workgroup,
+                                      invocationDiagnostic(*pipeline.context)))
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        PlannedComputeLaunch plan;
         std::string planningError;
-        if (!planGraphicsInvocation(
-                pipeline->variant, encoded,
-                [](void *userData, VernonRuntimeProviderResourceReference resource,
-                   VernonRuntimeProviderImageDescription *description) {
-                    return describeBackendImage(*static_cast<VernonRuntimeContext *>(userData), resource, *description);
-                },
-                pipeline->context, plan, planningError))
-            return fail(pipeline->context, planningError);
-        return invokeBackendPipeline(*pipeline, encoded, plan);
-    };
-    if (invocation->command_encoder.value != 0 || pipeline->context->rhiDevice.index == VERNON_RHI_INVALID_HANDLE_INDEX)
-        return encode(*invocation);
+        if (!planComputeInvocation(pipeline.variant, pipeline.workgroupSize, invocation, plan, planningError))
+            return fail(pipeline.context, planningError);
+        return invokeBackendComputePipeline(pipeline, plan);
+    }
+
+    PlannedGraphicsInvocation plan;
+    std::string planningError;
+    if (!planGraphicsInvocation(
+            pipeline.variant, invocation,
+            [](void *userData, VernonRuntimeProviderResourceReference resource,
+               VernonRuntimeProviderImageDescription *description) {
+                return describeBackendImage(*static_cast<VernonRuntimeContext *>(userData), resource, *description);
+            },
+            pipeline.context, plan, planningError))
+        return fail(pipeline.context, planningError);
+    return invokeBackendPipeline(pipeline, invocation, plan);
+}
+
+} // namespace
+
+VernonStatus vernonRuntimePipelineSubmit(VernonLoadedPipeline *pipeline, const VernonPipelineInvocation *invocation,
+                                         VernonSubmission **output) {
+    RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+    if (output)
+        *output = nullptr;
+    if (!pipeline || !invocation || !output || invocation->struct_size < sizeof(VernonPipelineInvocation) ||
+        invocation->abi_version != VERNON_PIPELINE_VERSION || (invocation->argument_count && !invocation->arguments) ||
+        invocation->command_encoder.value != 0)
+        return fail(pipeline ? pipeline->context : nullptr, "invalid pipeline submission");
+    std::unique_ptr<VernonSubmission> submission;
+    try {
+        submission = std::make_unique<VernonSubmission>();
+        submission->contextLease = acquireContextLease(*pipeline->context);
+        submission->device = pipeline->context->rhiDevice;
+    } catch (const std::bad_alloc &) {
+        return fail(pipeline->context, "cannot allocate pipeline submission", VERNON_STATUS_INTERNAL_ERROR);
+    }
+    if (pipeline->context->rhiDevice.index == VERNON_RHI_INVALID_HANDLE_INDEX) {
+        const VernonStatus status = encodePipelineInvocation(*pipeline, *invocation);
+        if (status != VERNON_STATUS_OK)
+            return status;
+        submission->state = VERNON_SUBMISSION_SUCCEEDED;
+        *output = submission.release();
+        return VERNON_STATUS_OK;
+    }
 
     const bool graphics = pipeline->variant.compute.empty();
     VernonRhiCommandEncoderDescriptor descriptor{};
@@ -875,7 +897,7 @@ VernonStatus vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline, const V
             status = fail(pipeline->context, "failed to begin immediate rendering");
     }
     if (status == VERNON_STATUS_OK)
-        status = encode(encoded);
+        status = encodePipelineInvocation(*pipeline, encoded);
     if (rendering) {
         const VernonRhiStatus endStatus = vernonRhiCommandEncoderEndRendering(pipeline->context->rhiDevice, native);
         if (status == VERNON_STATUS_OK && endStatus != VERNON_RHI_STATUS_OK)
@@ -885,31 +907,74 @@ VernonStatus vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline, const V
         vernonRhiCommandEncoderFinish(pipeline->context->rhiDevice, native) != VERNON_RHI_STATUS_OK)
         status = fail(pipeline->context, "failed to finish the immediate command encoder");
     if (status == VERNON_STATUS_OK &&
-        vernonRhiDeviceSubmit(pipeline->context->rhiDevice, native) != VERNON_RHI_STATUS_OK) {
+        vernonRhiDeviceSubmit(pipeline->context->rhiDevice, native, &submission->completion) != VERNON_RHI_STATUS_OK) {
         const VernonStringView detail = vernonRhiDeviceGetLastError(pipeline->context->rhiDevice);
         std::string error = "failed to submit the immediate command encoder";
         if (detail.data && detail.size)
             error.append(": ").append(detail.data, detail.size);
         status = fail(pipeline->context, std::move(error));
     }
-    vernonRhiDeviceDestroyCommandEncoder(pipeline->context->rhiDevice, native);
-    return status;
+    if (status != VERNON_STATUS_OK) {
+        (void)vernonRhiDeviceDestroyCommandEncoder(pipeline->context->rhiDevice, native);
+        return status;
+    }
+    VernonRhiCompletionState completionState{};
+    if (vernonRhiCompletionGetState(submission->device, submission->completion, &completionState) !=
+        VERNON_RHI_STATUS_OK) {
+        (void)vernonRhiDeviceDestroyCompletion(submission->device, submission->completion);
+        return fail(pipeline->context, "failed to query pipeline submission", VERNON_STATUS_INTERNAL_ERROR);
+    }
+    submission->state = completionState == VERNON_RHI_COMPLETION_PENDING  ? VERNON_SUBMISSION_PENDING
+                        : completionState == VERNON_RHI_COMPLETION_FAILED ? VERNON_SUBMISSION_FAILED
+                                                                          : VERNON_SUBMISSION_SUCCEEDED;
+    *output = submission.release();
+    return VERNON_STATUS_OK;
 }
 
 VernonStatus vernonRuntimePipelineEncode(VernonRuntimeProviderObject encoder, VernonLoadedPipeline *pipeline,
                                          const VernonPipelineInvocation *invocation) {
-    if (!invocation)
+    RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+    if (!pipeline || !invocation || invocation->struct_size < sizeof(VernonPipelineInvocation) ||
+        invocation->abi_version != VERNON_PIPELINE_VERSION || (invocation->argument_count && !invocation->arguments))
         return fail(pipeline ? pipeline->context : nullptr, "invalid pipeline invocation");
     VernonPipelineInvocation encoded = *invocation;
     encoded.command_encoder = encoder;
-    return vernonRuntimePipelineInvoke(pipeline, &encoded);
+    return encodePipelineInvocation(*pipeline, encoded);
 }
 
-VernonStatus vernonRuntimeSynchronize(VernonRuntimeContext *context) {
-    if (!context)
+VernonStatus vernonSubmissionGetState(const VernonSubmission *submission, VernonSubmissionState *output) {
+    if (!submission || !output)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    RuntimeDiagnosticScope diagnostic(context);
-    return synchronizeBackend(*context);
+    if (submission->completion.index == VERNON_RHI_INVALID_HANDLE_INDEX) {
+        *output = submission->state;
+        return VERNON_STATUS_OK;
+    }
+    VernonRhiCompletionState state{};
+    if (vernonRhiCompletionGetState(submission->device, submission->completion, &state) != VERNON_RHI_STATUS_OK)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    *output = state == VERNON_RHI_COMPLETION_PENDING  ? VERNON_SUBMISSION_PENDING
+              : state == VERNON_RHI_COMPLETION_FAILED ? VERNON_SUBMISSION_FAILED
+                                                      : VERNON_SUBMISSION_SUCCEEDED;
+    return VERNON_STATUS_OK;
+}
+
+VernonStatus vernonSubmissionWait(VernonSubmission *submission) {
+    if (!submission)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    if (submission->completion.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        return submission->status;
+    const VernonRhiStatus status = vernonRhiCompletionWait(submission->device, submission->completion);
+    submission->status = status == VERNON_RHI_STATUS_OK ? VERNON_STATUS_OK : VERNON_STATUS_INTERNAL_ERROR;
+    submission->state = status == VERNON_RHI_STATUS_OK ? VERNON_SUBMISSION_SUCCEEDED : VERNON_SUBMISSION_FAILED;
+    return submission->status;
+}
+
+void vernonSubmissionDestroy(VernonSubmission *submission) {
+    if (!submission)
+        return;
+    if (submission->completion.index != VERNON_RHI_INVALID_HANDLE_INDEX)
+        (void)vernonRhiDeviceDestroyCompletion(submission->device, submission->completion);
+    delete submission;
 }
 
 VernonStatus vernonRuntimeReferenceRhiBuffer(VernonRuntimeContext *context, VernonRhiBuffer buffer, uint64_t offset,

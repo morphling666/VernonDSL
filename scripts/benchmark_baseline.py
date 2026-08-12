@@ -132,7 +132,7 @@ def benchmark_cook(iterations: int, target: str) -> dict[str, object]:
     }
 
 
-def benchmark_kernel(iterations: int, architecture: str, elements: int) -> dict[str, object]:
+def benchmark_kernel(iterations: int, warmup_iterations: int, architecture: str, elements: int) -> dict[str, object]:
     api_version = (4, 3) if architecture == "opengl" else (3, 1) if architecture == "opengles" else None
     vd.init(arch=_architecture(architecture), api_version=api_version)
     type(BASELINE_SCALE).clear_cache()
@@ -141,6 +141,8 @@ def benchmark_kernel(iterations: int, architecture: str, elements: int) -> dict[
     grid = (elements, 1, 1)
 
     cold_ms = _milliseconds(lambda: BASELINE_SCALE(values, np.float32(1.0001), grid=grid))
+    for _ in range(warmup_iterations):
+        BASELINE_SCALE(values, np.float32(1.0001), grid=grid)
     warm_samples = [
         _milliseconds(lambda: BASELINE_SCALE(values, np.float32(1.0001), grid=grid)) for _ in range(iterations)
     ]
@@ -162,6 +164,7 @@ def benchmark_kernel(iterations: int, architecture: str, elements: int) -> dict[
         "scenario": "kernel",
         "architecture": architecture,
         "elements": elements,
+        "warmup_iterations": warmup_iterations,
         "cold_compile_and_dispatch_ms": round(cold_ms, 4),
         "warm_dispatch": _summary(warm_samples),
         "host_upload": _summary(upload_samples),
@@ -229,6 +232,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run reproducible VernonDSL baseline benchmarks.")
     parser.add_argument("scenario", choices=("frontend", "native", "cook", "kernel", "showcase"))
     parser.add_argument("--iterations", type=int, default=10)
+    parser.add_argument("--warmup-iterations", type=int, default=20)
     parser.add_argument("--arch", choices=("cpu", "cuda", "vulkan", "opengl", "opengles", "directx"), default="cpu")
     parser.add_argument(
         "--target",
@@ -248,6 +252,8 @@ def main(argv: list[str] | None = None) -> int:
     positive = (arguments.iterations, arguments.elements, arguments.frames, arguments.grid, arguments.size)
     if any(value <= 0 for value in positive):
         raise ValueError("iterations, elements, frames, grid, and size must be positive")
+    if arguments.warmup_iterations < 0:
+        raise ValueError("warmup iterations must be non-negative")
     if arguments.scenario == "frontend":
         result = benchmark_frontend(arguments.iterations)
     elif arguments.scenario == "native":
@@ -255,7 +261,12 @@ def main(argv: list[str] | None = None) -> int:
     elif arguments.scenario == "cook":
         result = benchmark_cook(arguments.iterations, arguments.target)
     elif arguments.scenario == "kernel":
-        result = benchmark_kernel(arguments.iterations, arguments.arch, arguments.elements)
+        result = benchmark_kernel(
+            arguments.iterations,
+            arguments.warmup_iterations,
+            arguments.arch,
+            arguments.elements,
+        )
     else:
         if arguments.arch not in {"vulkan", "opengl", "directx"}:
             raise ValueError("the visual showcases support vulkan, opengl, and directx")

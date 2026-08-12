@@ -25,6 +25,13 @@ typedef struct VernonRuntimeContext VernonRuntimeContext;
 typedef struct VernonPipelineBundle VernonPipelineBundle;
 typedef struct VernonLoadedPipeline VernonLoadedPipeline;
 typedef struct VernonPullback VernonPullback;
+typedef struct VernonSubmission VernonSubmission;
+
+typedef enum VernonSubmissionState {
+    VERNON_SUBMISSION_PENDING = 0,
+    VERNON_SUBMISSION_SUCCEEDED = 1,
+    VERNON_SUBMISSION_FAILED = 2
+} VernonSubmissionState;
 
 typedef enum VernonRuntimeBackend {
     VERNON_RUNTIME_CPU = 0,
@@ -126,7 +133,6 @@ typedef struct VernonGraphicsState {
     uint32_t reserved[4];
 } VernonGraphicsState;
 
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeSynchronize(VernonRuntimeContext *context);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeReferenceRhiBuffer(VernonRuntimeContext *context, VernonRhiBuffer buffer,
                                                                  uint64_t offset, uint64_t size,
                                                                  VernonRuntimeProviderResourceReference *output);
@@ -374,11 +380,16 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetOutputByIndex(con
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineFindOutput(const VernonLoadedPipeline *pipeline,
                                                                        VernonStringView name,
                                                                        VernonPipelineOutputView *output);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimePipelineInvoke(VernonLoadedPipeline *pipeline,
-                                                             const VernonPipelineInvocation *invocation);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimePipelineSubmit(VernonLoadedPipeline *pipeline,
+                                                             const VernonPipelineInvocation *invocation,
+                                                             VernonSubmission **output);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimePipelineEncode(VernonRuntimeProviderObject encoder,
                                                              VernonLoadedPipeline *pipeline,
                                                              const VernonPipelineInvocation *invocation);
+VERNON_RUNTIME_CAPI VernonStatus vernonSubmissionGetState(const VernonSubmission *submission,
+                                                          VernonSubmissionState *output);
+VERNON_RUNTIME_CAPI VernonStatus vernonSubmissionWait(VernonSubmission *submission);
+VERNON_RUNTIME_CAPI void vernonSubmissionDestroy(VernonSubmission *submission);
 VERNON_RUNTIME_CAPI VernonStatus vernonAdPipelineForward(VernonLoadedPipeline *pipeline, VernonLaunchSize compute_grid,
                                                          const VernonAdValueSet *inputs, VernonAdValueSet *outputs,
                                                          VernonPullback **pullback);

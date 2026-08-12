@@ -1,6 +1,7 @@
 #include "VernonRuntimeCore.h"
 #include "VernonRuntimeRHIAdapter.h"
 #include "runtime/rhi_adapter/adapter_test_hooks.h"
+#include "runtime_rhi_test_utils.h"
 
 #include <gtest/gtest.h>
 
@@ -117,8 +118,7 @@ TEST(CudaRhiAdapter, PreparesAndDispatchesThroughRuntimeCore) {
     EXPECT_EQ(vernonRuntimeCoreEncodeDispatch(pipeline, bindings, providerEncoder, groups, nullptr, 0),
               VERNON_STATUS_OK);
     EXPECT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceSubmit(device, encoder), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernon::tests::completeSubmission(device, encoder), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRuntimeRhiAdapterSynchronize(adapter), VERNON_STATUS_OK);
     const vernon::runtime::RhiAdapterPreparationStats stats = vernon::runtime::getRhiAdapterPreparationStats(*adapter);
     EXPECT_EQ(stats.shaderPreparations, 1u);

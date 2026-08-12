@@ -53,6 +53,31 @@ class SmokeFluidSimulation:
             np.int32(pressure_iterations),
             DELTA_TIME,
         )
+        alternate_density = vd.storage.zeros(dtype=vd.f32, shape=(grid, grid))
+        alternate_velocity = vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(grid, grid))
+        self._graphs = (
+            build_smoke_fluid_graph(
+                state_density=self.density,
+                state_velocity=self.velocity,
+                control_nozzles=self.controls,
+                objective_target_density=self.target,
+                parameters=self.parameters,
+                output_density=alternate_density,
+                output_velocity=alternate_velocity,
+                output_loss=self.output_loss,
+            ),
+            build_smoke_fluid_graph(
+                state_density=alternate_density,
+                state_velocity=alternate_velocity,
+                control_nozzles=self.controls,
+                objective_target_density=self.target,
+                parameters=self.parameters,
+                output_density=self.density,
+                output_velocity=self.velocity,
+                output_loss=self.output_loss,
+            ),
+        )
+        self._next_graph = 0
 
     def set_objective_inputs(self, control: np.ndarray, target: np.ndarray) -> None:
         self.set_control(control)
@@ -68,14 +93,8 @@ class SmokeFluidSimulation:
         self.set_control(control)
         if target is not None:
             self.set_target(target)
-        graph = build_smoke_fluid_graph(
-            state_density=self.density,
-            state_velocity=self.velocity,
-            control_nozzles=self.controls,
-            objective_target_density=self.target,
-            parameters=self.parameters,
-        )
-        outputs = graph.execute()
+        outputs = self._graphs[self._next_graph].execute()
+        self._next_graph ^= 1
         self.density = outputs.density
         self.velocity = outputs.velocity
         self.output_loss = outputs.loss

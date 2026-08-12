@@ -171,7 +171,7 @@ public:
         cameraPosition_ = {3.15F * std::cos(angle), 0.48F + std::sin(phase * 0.17F) * 0.12F, 3.15F * std::sin(angle)};
         time_ = phase;
         power_ = 8.0F + std::sin(phase * 0.21F) * 0.18F;
-        if (!graph_ || graph_->execute() != VERNON_RHI_STATUS_OK)
+        if (!graph_ || graph_->submit().wait() != VERNON_RHI_STATUS_OK)
             return false;
         if (frame_++ == 0)
             std::cout << "Vernon Mandelbulb Execution Graph animation started\n";
@@ -246,11 +246,12 @@ private:
         invocation_.viewport[3] = height;
         invocation_.scissor[2] = width;
         invocation_.scissor[3] = height;
-        graph_ = std::make_unique<vernon::execution::ExecutionGraph>(graphics_->device());
-        const auto target = graph_->importImage(image_, view_, true);
-        graph_->emplacePass<MandelbulbRenderPass>(target, runtime_, pipeline_, &invocation_);
+        vernon::execution::ExecutionGraph graph(graphics_->device());
+        const auto target = graph.importImage(image_, view_, true);
+        graph.emplacePass<MandelbulbRenderPass>(target, runtime_, pipeline_, &invocation_);
         std::string error;
-        if (graph_->compile(error))
+        graph_ = graph.compile(error);
+        if (graph_)
             return true;
         std::cerr << "failed to compile Mandelbulb graph: " << error << '\n';
         return false;
@@ -275,7 +276,7 @@ private:
     std::array<VernonPipelineArgument, 8> arguments_{};
     VernonColorAttachment attachment_{};
     VernonPipelineInvocation invocation_{};
-    std::unique_ptr<vernon::execution::ExecutionGraph> graph_;
+    std::shared_ptr<vernon::execution::CompiledExecutionGraph> graph_;
     uint32_t renderWidth_{};
     uint32_t renderHeight_{};
     uint64_t frame_{};

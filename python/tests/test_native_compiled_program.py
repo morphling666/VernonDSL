@@ -8,7 +8,6 @@ import unittest
 import numpy as np
 import vernon_dsl as vd
 from vernon_dsl import _native as native
-from vernon_dsl._runtime.resources import _bind_native_argument
 from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
 from vernon_dsl.frontend.compiler import compile_source
 
@@ -199,7 +198,6 @@ class CompiledProgramTests(unittest.TestCase):
         self.assertEqual(buffer.download(), source)
         runtime = host.create_runtime()
         self.assertIsNotNone(runtime)
-        host.synchronize()
 
     def test_standalone_rhi_image_upload_and_download(self) -> None:
         for backend in (native.RhiBackend.VULKAN, native.RhiBackend.DIRECTX12):
@@ -352,8 +350,8 @@ class CompiledProgramTests(unittest.TestCase):
 
         values = vd.storage.from_numpy(np.array([2.0, 4.0, 6.0], dtype=np.float32))
         invocation = pipeline.invocation_builder()
-        _bind_native_argument(invocation, pipeline.parameters[0], values)
-        invocation.grid(3, 1, 1).invoke()
+        invocation.host_tensor(pipeline.parameters[0].name, values._native_host_array())
+        invocation.grid(3, 1, 1).submit().wait()
         np.testing.assert_array_equal(values.to_numpy(), np.array([3.0, 5.0, 7.0], dtype=np.float32))
 
     def test_cpu_constant_write_requires_single_invocation(self) -> None:
@@ -364,14 +362,14 @@ class CompiledProgramTests(unittest.TestCase):
         values = vd.storage.from_numpy(np.array([0.0], dtype=np.float32))
 
         invocation = pipeline.invocation_builder()
-        _bind_native_argument(invocation, pipeline.parameters[0], values)
-        invocation.grid(1, 1, 1).invoke()
+        invocation.host_tensor(pipeline.parameters[0].name, values._native_host_array())
+        invocation.grid(1, 1, 1).submit().wait()
         np.testing.assert_array_equal(values.to_numpy(), np.array([1.0], dtype=np.float32))
 
         invocation = pipeline.invocation_builder()
-        _bind_native_argument(invocation, pipeline.parameters[0], values)
+        invocation.host_tensor(pipeline.parameters[0].name, values._native_host_array())
         with self.assertRaisesRegex(RuntimeError, "dispatch grid axis 0 must equal 1"):
-            invocation.grid(2, 1, 1).invoke()
+            invocation.grid(2, 1, 1).submit().wait()
 
     def test_cpu_profile_batch_compilation_preserves_order_and_options(self) -> None:
         programs = native._compile_cpu_program_results(
@@ -394,13 +392,13 @@ class CompiledProgramTests(unittest.TestCase):
         values = vd.storage.from_numpy(np.arange(5, dtype=np.float32))
 
         invocation = pipeline.invocation_builder()
-        _bind_native_argument(invocation, pipeline.parameters[0], values)
-        invocation.grid(5, 1, 1).invoke()
+        invocation.host_tensor(pipeline.parameters[0].name, values._native_host_array())
+        invocation.grid(5, 1, 1).submit().wait()
 
         reverse = values.view(shape=(3,), strides=(-1,), offset=4, access="read_write")
         invocation = pipeline.invocation_builder()
-        _bind_native_argument(invocation, pipeline.parameters[0], reverse)
-        invocation.grid(3, 1, 1).invoke()
+        invocation.host_tensor(pipeline.parameters[0].name, reverse._native_host_array())
+        invocation.grid(3, 1, 1).submit().wait()
         np.testing.assert_array_equal(values.to_numpy(), np.array([1.0, 2.0, 4.0, 5.0, 6.0], dtype=np.float32))
 
     def test_cpu_tuple_create_and_constant_extract_lowering(self) -> None:

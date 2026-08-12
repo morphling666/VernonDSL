@@ -16,8 +16,6 @@ from showcase_common import (
     BatchRenderPass,
     ComputeInvocationPass,
     FramePresenter,
-    InvocationBatch,
-    InvocationSlot,
     architecture_from_name,
     create_sky_cube,
     load_equirectangular_environment,
@@ -304,38 +302,6 @@ def main() -> None:
     )
     render_shadow = vd.pipeline(shadow_vertex, shadow_fragment)
 
-    flow_a_slot = InvocationSlot()
-    erosion_ab_slot = InvocationSlot()
-    flow_b_slot = InvocationSlot()
-    erosion_ba_slot = InvocationSlot()
-    mesh_slot = InvocationSlot()
-    expand_slot = InvocationSlot()
-    shadow_batch = InvocationBatch()
-    main_batch = InvocationBatch()
-    graph = vd.ExecutionGraph()
-    graph.add_pass(ComputeInvocationPass("water-flow-a", flow_a_slot))
-    graph.add_pass(ComputeInvocationPass("erosion-a-to-b", erosion_ab_slot))
-    graph.add_pass(ComputeInvocationPass("water-flow-b", flow_b_slot))
-    graph.add_pass(ComputeInvocationPass("erosion-b-to-a", erosion_ba_slot))
-    graph.add_pass(ComputeInvocationPass("terrain-normal-material", mesh_slot))
-    graph.add_pass(ComputeInvocationPass("terrain-draw-expand", expand_slot))
-    graph.add_pass(
-        BatchRenderPass(
-            "terrain-shadow",
-            shadow_target,
-            shadow_batch,
-            clear_color=(1.0, 1.0, 1.0, 1.0),
-        )
-    )
-    graph.add_pass(
-        BatchRenderPass(
-            "terrain-pbr",
-            target,
-            main_batch,
-            clear_color=(0.006, 0.003, 0.002, 1.0),
-        )
-    )
-
     projection = perspective(
         math.radians(40.0),
         1.0,
@@ -354,6 +320,168 @@ def main() -> None:
         )
         @ look_at(light_position, np.array((0.0, 0.35, 0.0), dtype=np.float32))
     )
+    half_step = np.float32(0.5 / args.fps)
+    graph = vd.ExecutionGraph()
+    phase_parameter = graph.parameter("phase")
+    view_projection_parameter = graph.parameter("view_projection")
+    camera_parameter = graph.parameter("camera_position")
+    erosion_arguments = (
+        np.uint32(args.grid),
+        half_step,
+        phase_parameter,
+        np.float32(args.rainfall),
+    )
+    flow_a_invocation = compute_erosion_flow.invocation(
+        height_a,
+        water_a,
+        flow_a,
+        *erosion_arguments,
+        grid=((vertex_count + 63) // 64, 1, 1),
+    )
+    erosion_ab_invocation = apply_erosion_flow.invocation(
+        height_a,
+        water_a,
+        sediment_a,
+        flow_a,
+        height_b,
+        water_b,
+        sediment_b,
+        *erosion_arguments,
+        grid=((vertex_count + 63) // 64, 1, 1),
+    )
+    flow_b_invocation = compute_erosion_flow.invocation(
+        height_b,
+        water_b,
+        flow_b,
+        *erosion_arguments,
+        grid=((vertex_count + 63) // 64, 1, 1),
+    )
+    erosion_ba_invocation = apply_erosion_flow.invocation(
+        height_b,
+        water_b,
+        sediment_b,
+        flow_b,
+        height_a,
+        water_a,
+        sediment_a,
+        *erosion_arguments,
+        grid=((vertex_count + 63) // 64, 1, 1),
+    )
+    mesh_invocation = build_terrain_mesh.invocation(
+        height_a,
+        water_a,
+        sediment_a,
+        rock_detail,
+        positions,
+        normals,
+        colors,
+        materials,
+        np.uint32(args.grid),
+        np.float32(args.extent),
+        phase_parameter,
+        grid=((vertex_count + 63) // 64, 1, 1),
+    )
+    expand_invocation = expand_indexed_mesh.invocation(
+        positions,
+        normals,
+        colors,
+        materials,
+        indices,
+        draw_positions,
+        draw_normals,
+        draw_colors,
+        draw_materials,
+        grid=((draw_count + 63) // 64, 1, 1),
+    )
+    common_shadow = {
+        "light_view_projection": light_view_projection,
+        "topology": vd.triangles,
+    }
+    shadow_invocations = [
+        render_shadow.invocation(position=draw_positions, **common_shadow),
+        render_shadow.invocation(position=stage_positions, **common_shadow),
+    ]
+    common_lighting: dict[str, object] = {
+        "view_projection": view_projection_parameter,
+        "light_view_projection": light_view_projection,
+        "camera_position": camera_parameter,
+        "light_position": light_position,
+        "shadow_depth_scale": np.float32(0.5 if args.arch == "opengl" else 1.0),
+        "shadow_depth_bias": np.float32(0.5 if args.arch == "opengl" else 0.0),
+        "shadow_uv_scale": np.array((0.5, 0.5 if args.arch == "opengl" else -0.5), dtype=np.float32),
+        "shadow_texel_size": np.array((1.0 / shadow_size, 1.0 / shadow_size), dtype=np.float32),
+        "shadow_map": shadow_map,
+        "shadow_sampler": shadow_sampler,
+        "topology": vd.triangles,
+    }
+    common_pbr: dict[str, object] = {
+        **common_lighting,
+        "environment_map": environment_map,
+        "environment_sampler": environment_sampler,
+    }
+    main_invocations = [
+        render_sky.invocation(
+            direction=sky_positions,
+            view_projection=view_projection_parameter,
+            camera_position=camera_parameter,
+            environment_map=environment_map,
+            environment_sampler=environment_sampler,
+            topology=vd.triangles,
+        ),
+        render_terrain.invocation(
+            position=draw_positions,
+            normal=draw_normals,
+            base_color=draw_colors,
+            material=draw_materials,
+            rock_material=rock_material,
+            rock_sampler=rock_sampler,
+            **common_lighting,
+        ),
+        render.invocation(
+            position=stage_positions,
+            normal=stage_normals,
+            base_color=stage_colors,
+            material=stage_materials,
+            **common_pbr,
+        ),
+    ]
+    graph.add_pass(ComputeInvocationPass("water-flow-a", flow_a_invocation))
+    graph.add_pass(ComputeInvocationPass("erosion-a-to-b", erosion_ab_invocation))
+    graph.add_pass(ComputeInvocationPass("water-flow-b", flow_b_invocation))
+    graph.add_pass(ComputeInvocationPass("erosion-b-to-a", erosion_ba_invocation))
+    graph.add_pass(ComputeInvocationPass("terrain-normal-material", mesh_invocation))
+    graph.add_pass(ComputeInvocationPass("terrain-draw-expand", expand_invocation))
+    graph.add_pass(
+        BatchRenderPass(
+            "terrain-shadow",
+            shadow_target,
+            shadow_invocations,
+            clear_color=(1.0, 1.0, 1.0, 1.0),
+        )
+    )
+    graph.add_pass(
+        BatchRenderPass(
+            "terrain-pbr",
+            target,
+            main_invocations,
+            clear_color=(0.006, 0.003, 0.002, 1.0),
+        )
+    )
+    plan = graph.compile()
+
+    def frame_values(phase: np.float32) -> dict[vd.ExecutionParameter, object]:
+        angle = float(phase) * 0.025 - 1.88
+        camera = np.array((11.8 * math.cos(angle), 6.15, 11.8 * math.sin(angle)), dtype=np.float32)
+        view_projection = np.ascontiguousarray(
+            projection @ look_at(camera, np.array((0.0, -1.42, 0.2), dtype=np.float32))
+        )
+        return {
+            phase_parameter: phase,
+            view_projection_parameter: view_projection,
+            camera_parameter: camera,
+        }
+
+    bindings = plan.create_bindings(frame_values(np.float32(0.0)))
     presenter = FramePresenter(
         output,
         architecture=args.arch,
@@ -363,146 +491,21 @@ def main() -> None:
     )
     frame = 0
     start = time.perf_counter()
-    half_step = np.float32(0.5 / args.fps)
-    common_shadow = {
-        "light_view_projection": light_view_projection,
-        "topology": vd.triangles,
-    }
     try:
         while args.frames == 0 or frame < args.frames:
             phase = np.float32(time.perf_counter() - start if args.frames == 0 else frame / args.fps)
-            erosion_arguments = (
-                np.uint32(args.grid),
-                half_step,
-                phase,
-                np.float32(args.rainfall),
-            )
-            flow_a_slot.value = compute_erosion_flow.invocation(
-                height_a,
-                water_a,
-                flow_a,
-                *erosion_arguments,
-                grid=((vertex_count + 63) // 64, 1, 1),
-            )
-            erosion_ab_slot.value = apply_erosion_flow.invocation(
-                height_a,
-                water_a,
-                sediment_a,
-                flow_a,
-                height_b,
-                water_b,
-                sediment_b,
-                *erosion_arguments,
-                grid=((vertex_count + 63) // 64, 1, 1),
-            )
-            flow_b_slot.value = compute_erosion_flow.invocation(
-                height_b,
-                water_b,
-                flow_b,
-                *erosion_arguments,
-                grid=((vertex_count + 63) // 64, 1, 1),
-            )
-            erosion_ba_slot.value = apply_erosion_flow.invocation(
-                height_b,
-                water_b,
-                sediment_b,
-                flow_b,
-                height_a,
-                water_a,
-                sediment_a,
-                *erosion_arguments,
-                grid=((vertex_count + 63) // 64, 1, 1),
-            )
-            mesh_slot.value = build_terrain_mesh.invocation(
-                height_a,
-                water_a,
-                sediment_a,
-                rock_detail,
-                positions,
-                normals,
-                colors,
-                materials,
-                np.uint32(args.grid),
-                np.float32(args.extent),
-                phase,
-                grid=((vertex_count + 63) // 64, 1, 1),
-            )
-            expand_slot.value = expand_indexed_mesh.invocation(
-                positions,
-                normals,
-                colors,
-                materials,
-                indices,
-                draw_positions,
-                draw_normals,
-                draw_colors,
-                draw_materials,
-                grid=((draw_count + 63) // 64, 1, 1),
-            )
-            angle = float(phase) * 0.025 - 1.88
-            camera = np.array((11.8 * math.cos(angle), 6.15, 11.8 * math.sin(angle)), dtype=np.float32)
-            view_projection = np.ascontiguousarray(
-                projection @ look_at(camera, np.array((0.0, -1.42, 0.2), dtype=np.float32))
-            )
-            shadow_batch.values = [
-                render_shadow.invocation(position=draw_positions, **common_shadow),
-                render_shadow.invocation(position=stage_positions, **common_shadow),
-            ]
-            common_lighting: dict[str, object] = {
-                "view_projection": view_projection,
-                "light_view_projection": light_view_projection,
-                "camera_position": camera,
-                "light_position": light_position,
-                "shadow_depth_scale": np.float32(0.5 if args.arch == "opengl" else 1.0),
-                "shadow_depth_bias": np.float32(0.5 if args.arch == "opengl" else 0.0),
-                "shadow_uv_scale": np.array((0.5, 0.5 if args.arch == "opengl" else -0.5), dtype=np.float32),
-                "shadow_texel_size": np.array((1.0 / shadow_size, 1.0 / shadow_size), dtype=np.float32),
-                "shadow_map": shadow_map,
-                "shadow_sampler": shadow_sampler,
-                "topology": vd.triangles,
-            }
-            common_pbr: dict[str, object] = {
-                **common_lighting,
-                "environment_map": environment_map,
-                "environment_sampler": environment_sampler,
-            }
-            main_batch.values = [
-                render_sky.invocation(
-                    direction=sky_positions,
-                    view_projection=view_projection,
-                    camera_position=camera,
-                    environment_map=environment_map,
-                    environment_sampler=environment_sampler,
-                    topology=vd.triangles,
-                ),
-                render_terrain.invocation(
-                    position=draw_positions,
-                    normal=draw_normals,
-                    base_color=draw_colors,
-                    material=draw_materials,
-                    rock_material=rock_material,
-                    rock_sampler=rock_sampler,
-                    **common_lighting,
-                ),
-                render.invocation(
-                    position=stage_positions,
-                    normal=stage_normals,
-                    base_color=stage_colors,
-                    material=stage_materials,
-                    **common_pbr,
-                ),
-            ]
-            graph.execute()
+            bindings.update(frame_values(phase))
+            plan.submit(bindings).wait()
             frame += 1
             if not presenter.present():
                 break
     finally:
         presenter.close()
     presenter.write(args.output)
-    barrier_count = sum(len(scope.barriers) for scope in graph.scopes)
+    barrier_count = sum(len(scope.barriers) for scope in plan.scopes)
     print(
         f"backend={args.arch} frames={frame} grid={args.grid} rainfall={args.rainfall} "
-        f"passes={len(graph.schedule)} barriers={barrier_count}"
+        f"passes={len(plan.schedule)} barriers={barrier_count}"
     )
 
 

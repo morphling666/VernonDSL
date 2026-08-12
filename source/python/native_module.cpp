@@ -210,10 +210,32 @@ struct RhiBuffer {
     }
     ~RhiBuffer() { vernonRhiDeviceDestroyBuffer(host->device, handle); }
 
-    void upload(const nb::bytes &data) {
-        if (data.size() != size ||
-            vernonRhiDeviceUploadBuffer(host->device, handle, 0, data.c_str(), data.size()) != VERNON_RHI_STATUS_OK)
+    void upload(const nb::bytes &data, size_t offset) {
+        if (offset > size || data.size() > size - offset ||
+            vernonRhiDeviceUploadBuffer(host->device, handle, offset, data.c_str(), data.size()) !=
+                VERNON_RHI_STATUS_OK)
             throw std::runtime_error("RHI buffer upload failed");
+    }
+    void uploadRanges(const nb::list &ranges) {
+        std::vector<std::pair<size_t, nb::bytes>> uploads;
+        std::vector<VernonRhiBufferUploadRange> nativeRanges;
+        uploads.reserve(nb::len(ranges));
+        nativeRanges.reserve(nb::len(ranges));
+        for (nb::handle item : ranges) {
+            nb::tuple range = nb::cast<nb::tuple>(item);
+            if (nb::len(range) != 2)
+                throw std::invalid_argument("RHI buffer upload range must contain an offset and bytes");
+            const size_t offset = nb::cast<size_t>(range[0]);
+            nb::bytes data = nb::cast<nb::bytes>(range[1]);
+            if (offset > size || data.size() > size - offset)
+                throw std::invalid_argument("RHI buffer upload range is outside the buffer");
+            uploads.emplace_back(offset, std::move(data));
+        }
+        for (const auto &[offset, data] : uploads)
+            nativeRanges.push_back({offset, data.c_str(), data.size()});
+        if (vernonRhiDeviceUploadBufferRanges(host->device, handle, nativeRanges.data(), nativeRanges.size()) !=
+            VERNON_RHI_STATUS_OK)
+            throw std::runtime_error("RHI buffer range upload failed");
     }
     nb::bytes download() const {
         std::string data(size, '\0');
@@ -566,10 +588,6 @@ struct RhiHost {
     }
     std::unique_ptr<Runtime> createRuntime();
     std::unique_ptr<PythonExecutionGraph> createExecutionGraph();
-    void synchronize() {
-        if (vernonRhiDeviceSynchronize(state->device) != VERNON_RHI_STATUS_OK)
-            throw std::runtime_error("RHI device synchronization failed");
-    }
 
     std::shared_ptr<RhiHostState> state;
 };
@@ -585,11 +603,54 @@ struct PythonGraphResource {
     bool isImage{};
 };
 
+struct PythonExecutionParameter {
+    explicit PythonExecutionParameter(vernon::execution::ExecutionParameter value) : parameter(value) {}
+    vernon::execution::ExecutionParameter parameter;
+};
+
+struct PythonExecutionBindingValue final : vernon::execution::ExecutionBindingValue {
+    explicit PythonExecutionBindingValue(nb::object value) : value(std::move(value)) {}
+    nb::object value;
+};
+
+struct PythonExecutionBindingsBuilder {
+    explicit PythonExecutionBindingsBuilder(vernon::execution::ExecutionBindingsBuilder value)
+        : builder(std::move(value)) {}
+
+    void set(const PythonExecutionParameter &parameter, nb::object value) {
+        builder.set(parameter.parameter, std::make_shared<PythonExecutionBindingValue>(std::move(value)));
+    }
+
+    vernon::execution::ExecutionBindingsBuilder builder;
+};
+
+struct PythonExecutionBindingsView {
+    explicit PythonExecutionBindingsView(const vernon::execution::ExecutionResources &value) : resources(value) {}
+
+    nb::object get(const PythonExecutionParameter &parameter) const {
+        auto value =
+            std::dynamic_pointer_cast<const PythonExecutionBindingValue>(resources.binding(parameter.parameter));
+        if (!value)
+            throw std::runtime_error("execution parameter binding has an incompatible native value type");
+        return value->value;
+    }
+
+    uintptr_t token(const PythonExecutionParameter &parameter) const {
+        return reinterpret_cast<uintptr_t>(resources.binding(parameter.parameter).get());
+    }
+
+    const vernon::execution::ExecutionResources &resources;
+};
+
 struct PythonExecutionGraph;
 
+struct PythonGraphCallbackState {
+    std::exception_ptr exception;
+};
+
 struct PythonRenderPass final : vernon::execution::RenderPass {
-    PythonRenderPass(PythonExecutionGraph *graph, std::string name, PyObject *owner)
-        : RenderPass(std::move(name)), graph(graph), owner(owner) {}
+    PythonRenderPass(std::shared_ptr<PythonGraphCallbackState> callbackState, std::string name, PyObject *owner)
+        : RenderPass(std::move(name)), callbackState(std::move(callbackState)), owner(owner) {}
 
     void declare() override;
     VernonRhiStatus execute(vernon::execution::GraphicsEncoder &encoder,
@@ -647,13 +708,13 @@ struct PythonRenderPass final : vernon::execution::RenderPass {
 
     void setRenderArea(uint32_t x, uint32_t y, uint32_t width, uint32_t height) { renderArea(x, y, width, height); }
 
-    PythonExecutionGraph *graph{};
+    std::shared_ptr<PythonGraphCallbackState> callbackState;
     PyObject *owner{};
 };
 
 struct PythonComputePass final : vernon::execution::ComputePass {
-    PythonComputePass(PythonExecutionGraph *graph, std::string name, PyObject *owner)
-        : ComputePass(std::move(name)), graph(graph), owner(owner) {}
+    PythonComputePass(std::shared_ptr<PythonGraphCallbackState> callbackState, std::string name, PyObject *owner)
+        : ComputePass(std::move(name)), callbackState(std::move(callbackState)), owner(owner) {}
 
     void declare() override;
     VernonRhiStatus execute(vernon::execution::ComputeEncoder &encoder,
@@ -678,7 +739,7 @@ struct PythonComputePass final : vernon::execution::ComputePass {
         }
     }
 
-    PythonExecutionGraph *graph{};
+    std::shared_ptr<PythonGraphCallbackState> callbackState;
     PyObject *owner{};
 };
 
@@ -703,17 +764,90 @@ struct PythonCompiledScope {
     std::vector<PythonCompiledBarrier> barriers;
 };
 
+struct PythonExecutionSubmission {
+    PythonExecutionSubmission(vernon::execution::ExecutionSubmission value,
+                              std::shared_ptr<std::vector<nb::object>> retainedOwners)
+        : submission(std::move(value)), owners(std::move(retainedOwners)) {}
+
+    void wait() {
+        const VernonRhiStatus status = submission.wait();
+        if (status != VERNON_RHI_STATUS_OK)
+            throw std::runtime_error("execution submission failed with provider status " +
+                                     std::to_string(static_cast<uint32_t>(status)));
+    }
+
+    uint32_t state() const { return static_cast<uint32_t>(submission.state()); }
+    vernon::execution::ExecutionSubmission submission;
+    std::shared_ptr<std::vector<nb::object>> owners;
+};
+
+struct PythonCompiledExecutionGraph {
+    PythonCompiledExecutionGraph(std::shared_ptr<vernon::execution::CompiledExecutionGraph> value,
+                                 std::shared_ptr<PythonGraphCallbackState> state,
+                                 std::shared_ptr<std::vector<nb::object>> retainedOwners)
+        : plan(std::move(value)), callbackState(std::move(state)), owners(std::move(retainedOwners)) {}
+
+    std::unique_ptr<PythonExecutionBindingsBuilder> createBindings(const nb::list &initial) {
+        std::vector<vernon::execution::ExecutionBinding> bindings;
+        bindings.reserve(nb::len(initial));
+        for (nb::handle item : initial) {
+            nb::tuple entry = nb::cast<nb::tuple>(item);
+            if (nb::len(entry) != 2)
+                throw std::invalid_argument("execution binding entries must contain a parameter and value");
+            const auto &parameter = nb::cast<const PythonExecutionParameter &>(entry[0]);
+            bindings.push_back(
+                {parameter.parameter, std::make_shared<PythonExecutionBindingValue>(nb::borrow<nb::object>(entry[1]))});
+        }
+        return std::make_unique<PythonExecutionBindingsBuilder>(plan->createBindings(bindings));
+    }
+
+    std::unique_ptr<PythonExecutionSubmission> submit(PythonExecutionBindingsBuilder *bindings) {
+        callbackState->exception = nullptr;
+        auto snapshot =
+            bindings ? bindings->builder.snapshot() : std::shared_ptr<const vernon::execution::ExecutionBindings>{};
+        auto submission = std::make_unique<PythonExecutionSubmission>(plan->submit(std::move(snapshot)), owners);
+        if (callbackState->exception)
+            std::rethrow_exception(std::exchange(callbackState->exception, nullptr));
+        return submission;
+    }
+
+    std::vector<PythonCompiledScope> scopes() const {
+        std::vector<PythonCompiledScope> result;
+        result.reserve(plan->scopes().size());
+        for (const auto &scope : plan->scopes()) {
+            PythonCompiledScope compiled{scope.rendering, scope.passIndices, {}};
+            compiled.barriers.reserve(scope.barriers.size());
+            for (const VernonRhiBarrier &barrier : scope.barriers)
+                compiled.barriers.push_back(
+                    {barrier.source_stage_mask, barrier.destination_stage_mask, barrier.source_access,
+                     barrier.destination_access, static_cast<uint32_t>(barrier.old_state),
+                     static_cast<uint32_t>(barrier.new_state), barrier.is_image != 0,
+                     barrier.image_subresources.base_mip_level, barrier.image_subresources.mip_level_count,
+                     barrier.image_subresources.base_array_layer, barrier.image_subresources.array_layer_count,
+                     barrier.image_subresources.aspects});
+            result.push_back(std::move(compiled));
+        }
+        return result;
+    }
+
+    std::shared_ptr<vernon::execution::CompiledExecutionGraph> plan;
+    std::shared_ptr<PythonGraphCallbackState> callbackState;
+    std::shared_ptr<std::vector<nb::object>> owners;
+};
+
 struct PythonExecutionGraph {
     PythonExecutionGraph() = default;
     explicit PythonExecutionGraph(std::shared_ptr<RhiHostState> host)
         : host(std::move(host)), graph(this->host->device) {}
 
     PythonRenderPass *addRenderPass(const std::string &name, const nb::object &owner) {
-        return &graph.emplacePass<PythonRenderPass>(this, name, owner.ptr());
+        owners->push_back(owner);
+        return &graph.emplacePass<PythonRenderPass>(callbackState, name, owner.ptr());
     }
 
     PythonComputePass *addComputePass(const std::string &name, const nb::object &owner) {
-        return &graph.emplacePass<PythonComputePass>(this, name, owner.ptr());
+        owners->push_back(owner);
+        return &graph.emplacePass<PythonComputePass>(callbackState, name, owner.ptr());
     }
 
     PythonGraphResource importBuffer(RhiBuffer &buffer, bool exported) {
@@ -735,10 +869,16 @@ struct PythonExecutionGraph {
         return PythonGraphResource(graph.importImage(view.image->handle, view.handle, exported));
     }
 
-    void compile() {
+    PythonExecutionParameter parameter(const std::string &name) {
+        return PythonExecutionParameter(graph.parameter(name));
+    }
+
+    std::unique_ptr<PythonCompiledExecutionGraph> compile() {
         std::string error;
-        if (!graph.compile(error))
+        auto plan = graph.compile(error);
+        if (!plan)
             throw std::invalid_argument(error);
+        return std::make_unique<PythonCompiledExecutionGraph>(std::move(plan), callbackState, owners);
     }
 
     void validate() const {
@@ -747,51 +887,27 @@ struct PythonExecutionGraph {
             throw std::invalid_argument(error);
     }
 
-    void execute() {
-        callbackException = nullptr;
-        const VernonRhiStatus status = graph.execute();
-        if (callbackException) {
-            std::exception_ptr exception = std::exchange(callbackException, nullptr);
-            std::rethrow_exception(exception);
-        }
-        if (status != VERNON_RHI_STATUS_OK)
-            throw std::runtime_error("execution graph failed with provider status " +
-                                     std::to_string(static_cast<uint32_t>(status)));
-    }
-
-    std::vector<PythonCompiledScope> scopes() const {
-        std::vector<PythonCompiledScope> result;
-        result.reserve(graph.scopes().size());
-        for (const auto &scope : graph.scopes()) {
-            PythonCompiledScope compiled{scope.rendering, scope.passIndices, {}};
-            compiled.barriers.reserve(scope.barriers.size());
-            for (const VernonRhiBarrier &barrier : scope.barriers)
-                compiled.barriers.push_back(
-                    {barrier.source_stage_mask, barrier.destination_stage_mask, barrier.source_access,
-                     barrier.destination_access, static_cast<uint32_t>(barrier.old_state),
-                     static_cast<uint32_t>(barrier.new_state), barrier.is_image != 0,
-                     barrier.image_subresources.base_mip_level, barrier.image_subresources.mip_level_count,
-                     barrier.image_subresources.base_array_layer, barrier.image_subresources.array_layer_count,
-                     barrier.image_subresources.aspects});
-            result.push_back(std::move(compiled));
-        }
-        return result;
-    }
-
     std::shared_ptr<RhiHostState> host;
+    std::shared_ptr<PythonGraphCallbackState> callbackState{std::make_shared<PythonGraphCallbackState>()};
+    std::shared_ptr<std::vector<nb::object>> owners{std::make_shared<std::vector<nb::object>>()};
     vernon::execution::ExecutionGraph graph;
-    std::exception_ptr callbackException;
 };
 
 void PythonRenderPass::declare() { nb::borrow<nb::object>(owner).attr("_native_declare")(); }
 
 VernonRhiStatus PythonRenderPass::execute(vernon::execution::GraphicsEncoder &encoder,
-                                          const vernon::execution::ExecutionResources &) {
+                                          const vernon::execution::ExecutionResources &resources) {
     try {
-        nb::borrow<nb::object>(owner).attr("_native_execute")(nb::cast(encoder));
+        if (resources.hasBindings()) {
+            PythonExecutionBindingsView bindings(resources);
+            nb::borrow<nb::object>(owner).attr("_native_execute")(nb::cast(encoder),
+                                                                  nb::cast(&bindings, nb::rv_policy::reference));
+        } else {
+            nb::borrow<nb::object>(owner).attr("_native_execute")(nb::cast(encoder), nb::none());
+        }
         return VERNON_RHI_STATUS_OK;
     } catch (...) {
-        graph->callbackException = std::current_exception();
+        callbackState->exception = std::current_exception();
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
     }
 }
@@ -799,12 +915,18 @@ VernonRhiStatus PythonRenderPass::execute(vernon::execution::GraphicsEncoder &en
 void PythonComputePass::declare() { nb::borrow<nb::object>(owner).attr("_native_declare")(); }
 
 VernonRhiStatus PythonComputePass::execute(vernon::execution::ComputeEncoder &encoder,
-                                           const vernon::execution::ExecutionResources &) {
+                                           const vernon::execution::ExecutionResources &resources) {
     try {
-        nb::borrow<nb::object>(owner).attr("_native_execute")(nb::cast(encoder));
+        if (resources.hasBindings()) {
+            PythonExecutionBindingsView bindings(resources);
+            nb::borrow<nb::object>(owner).attr("_native_execute")(nb::cast(encoder),
+                                                                  nb::cast(&bindings, nb::rv_policy::reference));
+        } else {
+            nb::borrow<nb::object>(owner).attr("_native_execute")(nb::cast(encoder), nb::none());
+        }
         return VERNON_RHI_STATUS_OK;
     } catch (...) {
-        graph->callbackException = std::current_exception();
+        callbackState->exception = std::current_exception();
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
     }
 }
@@ -997,9 +1119,41 @@ PipelineOutputMetadata outputMetadata(const VernonPipelineOutputView &view) {
     return result;
 }
 
+struct PythonRuntimeSubmission {
+    explicit PythonRuntimeSubmission(VernonSubmission *value) : handle(value) {}
+    ~PythonRuntimeSubmission() { vernonSubmissionDestroy(handle); }
+    PythonRuntimeSubmission(const PythonRuntimeSubmission &) = delete;
+    PythonRuntimeSubmission &operator=(const PythonRuntimeSubmission &) = delete;
+
+    void wait() {
+        if (vernonSubmissionWait(handle) != VERNON_STATUS_OK)
+            throw std::runtime_error("pipeline submission failed");
+    }
+
+    uint32_t state() const {
+        VernonSubmissionState value{};
+        if (vernonSubmissionGetState(handle, &value) != VERNON_STATUS_OK)
+            throw std::runtime_error("cannot query pipeline submission");
+        return static_cast<uint32_t>(value);
+    }
+
+    VernonSubmission *handle{};
+};
+
+struct PreparedPipelineArgument {
+    VernonPipelineArgument value{};
+    std::vector<uint64_t> shape;
+    std::vector<int64_t> strides;
+    std::string layoutHash;
+    std::vector<VernonValueLeafView> elementLeaves;
+    nb::object owner;
+};
+
 struct PipelineInvocationBuilder {
     PipelineInvocationBuilder(Runtime *owner, VernonRuntimeContext *runtime, VernonLoadedPipeline *pipeline)
         : owner(owner), runtime(runtime), pipeline(pipeline) {}
+    PipelineInvocationBuilder(const PipelineInvocationBuilder &) = delete;
+    PipelineInvocationBuilder &operator=(const PipelineInvocationBuilder &) = delete;
 
     PipelineParameterMetadata resolveParameter(const nb::object &identifier) {
         VernonPipelineParameterView view{};
@@ -1043,22 +1197,12 @@ struct PipelineInvocationBuilder {
         throw std::invalid_argument("unknown pipeline parameter slot " + std::to_string(slot));
     }
 
-    struct OwnedArgument {
-        VernonPipelineArgument value{};
-        std::vector<uint64_t> shape;
-        std::vector<int64_t> strides;
-        std::string layoutHash;
-        std::vector<VernonValueLeafView> elementLeaves;
-        nb::object hostOwner;
-    };
-
-    OwnedArgument &addArgument(const PipelineParameterMetadata &parameter, VernonPipelineArgumentKind kind) {
+    std::unique_ptr<PreparedPipelineArgument> createArgument(const PipelineParameterMetadata &parameter,
+                                                             VernonPipelineArgumentKind kind) {
         if (parameter.kind != kind)
             throw std::invalid_argument("pipeline parameter '" + parameter.name + "' has a different reflected kind");
-        if (!slots.insert(parameter.slot).second)
-            throw std::invalid_argument("pipeline parameter was already bound");
-        arguments.emplace_back();
-        OwnedArgument &result = arguments.back();
+        auto prepared = std::make_unique<PreparedPipelineArgument>();
+        PreparedPipelineArgument &result = *prepared;
         result.value.slot = parameter.slot;
         result.value.kind = kind;
         if (kind == VERNON_PIPELINE_TENSOR) {
@@ -1070,7 +1214,20 @@ struct PipelineInvocationBuilder {
                 result.elementLeaves.data(),   result.elementLeaves.size(),
             };
         }
-        return result;
+        return prepared;
+    }
+
+    PipelineInvocationBuilder &preparedArgument(PreparedPipelineArgument &prepared) {
+        if (!slots.insert(prepared.value.slot).second)
+            throw std::invalid_argument("pipeline parameter was already bound");
+        arguments.push_back(&prepared);
+        return *this;
+    }
+
+    PipelineInvocationBuilder &ownedArgument(std::unique_ptr<PreparedPipelineArgument> prepared) {
+        PreparedPipelineArgument &value = *prepared;
+        ownedArguments.push_back(std::move(prepared));
+        return preparedArgument(value);
     }
 
     static VernonDataType numpyDataType(const nb::object &array) {
@@ -1092,11 +1249,12 @@ struct PipelineInvocationBuilder {
         throw std::invalid_argument("unsupported NumPy pipeline dtype '" + name + "'");
     }
 
-    PipelineInvocationBuilder &hostTensor(const nb::object &identifier, const nb::object &array) {
+    std::unique_ptr<PreparedPipelineArgument> prepareHostTensor(const nb::object &identifier, const nb::object &array) {
         if (!nb::isinstance(array, nb::module_::import_("numpy").attr("ndarray")))
             throw std::invalid_argument("host tensor must be a NumPy ndarray");
         const PipelineParameterMetadata parameter = resolveParameter(identifier);
-        OwnedArgument &argument = addArgument(parameter, VERNON_PIPELINE_TENSOR);
+        auto prepared = createArgument(parameter, VERNON_PIPELINE_TENSOR);
+        PreparedPipelineArgument &argument = *prepared;
         const std::vector<uint64_t> arrayShape = nb::cast<std::vector<uint64_t>>(array.attr("shape"));
         const std::vector<int64_t> arrayStrides = nb::cast<std::vector<int64_t>>(array.attr("strides"));
         if (arrayStrides.size() != arrayShape.size())
@@ -1135,7 +1293,7 @@ struct PipelineInvocationBuilder {
             parameter.elementLeaves[0].scalar_count == 1 && parameter.elementLeaves[0].byte_offset == 0 &&
             numpyDataType(array) != static_cast<VernonDataType>(parameter.elementLeaves[0].dtype))
             throw std::invalid_argument("host tensor dtype does not match pipeline reflection");
-        argument.hostOwner = array;
+        argument.owner = array;
         const uintptr_t data = nb::cast<uintptr_t>(array.attr("ctypes").attr("data"));
         uintptr_t allocation = data - before;
         size_t allocationSize = span;
@@ -1162,16 +1320,22 @@ struct PipelineInvocationBuilder {
         if (argument.value.tensor.access != VERNON_ACCESS_READ &&
             !vernon::runtime::tensorByteLayoutInjective(argument.value.tensor))
             throw std::invalid_argument("writable NumPy Tensor must have an internally injective layout");
-        return *this;
+        return prepared;
     }
 
-    PipelineInvocationBuilder &rhiTensor(const nb::object &identifier, RhiBuffer *buffer, uint32_t access,
-                                         const std::vector<uint64_t> &shape, const std::vector<int64_t> &strides,
-                                         size_t offset) {
+    PipelineInvocationBuilder &hostTensor(const nb::object &identifier, const nb::object &array) {
+        return ownedArgument(prepareHostTensor(identifier, array));
+    }
+
+    std::unique_ptr<PreparedPipelineArgument> prepareRhiTensor(const nb::object &identifier, RhiBuffer *buffer,
+                                                               uint32_t access, const std::vector<uint64_t> &shape,
+                                                               const std::vector<int64_t> &strides, size_t offset) {
         if (!buffer || shape.size() != strides.size() || shape.empty())
             throw std::invalid_argument("RHI Tensor shape and strides must have equal non-zero rank");
         const PipelineParameterMetadata parameter = resolveParameter(identifier);
-        OwnedArgument &argument = addArgument(parameter, VERNON_PIPELINE_TENSOR);
+        auto prepared = createArgument(parameter, VERNON_PIPELINE_TENSOR);
+        PreparedPipelineArgument &argument = *prepared;
+        argument.owner = nb::cast(buffer, nb::rv_policy::reference);
         argument.shape = shape;
         argument.strides = strides;
         argument.value.tensor.struct_size = sizeof(VernonTensorView);
@@ -1188,10 +1352,16 @@ struct PipelineInvocationBuilder {
         if (argument.value.tensor.access != VERNON_ACCESS_READ &&
             !vernon::runtime::tensorByteLayoutInjective(argument.value.tensor))
             throw std::invalid_argument("writable RHI Tensor must have an internally injective layout");
-        return *this;
+        return prepared;
     }
 
-    PipelineInvocationBuilder &rhiTexture(const nb::object &identifier, RhiImageView *view) {
+    PipelineInvocationBuilder &rhiTensor(const nb::object &identifier, RhiBuffer *buffer, uint32_t access,
+                                         const std::vector<uint64_t> &shape, const std::vector<int64_t> &strides,
+                                         size_t offset) {
+        return ownedArgument(prepareRhiTensor(identifier, buffer, access, shape, strides, offset));
+    }
+
+    std::unique_ptr<PreparedPipelineArgument> prepareRhiTexture(const nb::object &identifier, RhiImageView *view) {
         const PipelineParameterMetadata parameter = resolveParameter(identifier);
         const bool storage = parameter.imageBindingRole == VERNON_IMAGE_BINDING_STORAGE;
         const uint32_t requiredUsage = storage ? VERNON_RHI_IMAGE_STORAGE : VERNON_RHI_IMAGE_SAMPLED;
@@ -1199,20 +1369,32 @@ struct PipelineInvocationBuilder {
             throw std::invalid_argument("RHI texture usage does not match the pipeline parameter");
         if (storage && view->format != parameter.storageImageFormat)
             throw std::invalid_argument("RHI texture format does not match the storage texture parameter");
-        OwnedArgument &argument = addArgument(parameter, VERNON_PIPELINE_IMAGE);
+        auto prepared = createArgument(parameter, VERNON_PIPELINE_IMAGE);
+        PreparedPipelineArgument &argument = *prepared;
+        argument.owner = nb::cast(view, nb::rv_policy::reference);
         if (vernonRuntimeReferenceRhiImageView(runtime, view->handle, &argument.value.image.view) != VERNON_STATUS_OK)
             throw std::invalid_argument("RHI image view belongs to another Runtime device");
-        return *this;
+        return prepared;
     }
 
-    PipelineInvocationBuilder &rhiSampler(const nb::object &identifier, RhiSampler *sampler) {
+    PipelineInvocationBuilder &rhiTexture(const nb::object &identifier, RhiImageView *view) {
+        return ownedArgument(prepareRhiTexture(identifier, view));
+    }
+
+    std::unique_ptr<PreparedPipelineArgument> prepareRhiSampler(const nb::object &identifier, RhiSampler *sampler) {
         if (!sampler)
             throw std::invalid_argument("RHI sampler is null");
         const PipelineParameterMetadata parameter = resolveParameter(identifier);
-        OwnedArgument &argument = addArgument(parameter, VERNON_PIPELINE_SAMPLER);
+        auto prepared = createArgument(parameter, VERNON_PIPELINE_SAMPLER);
+        PreparedPipelineArgument &argument = *prepared;
+        argument.owner = nb::cast(sampler, nb::rv_policy::reference);
         if (vernonRuntimeReferenceRhiSampler(runtime, sampler->handle, &argument.value.resource) != VERNON_STATUS_OK)
             throw std::invalid_argument("RHI sampler belongs to another Runtime device");
-        return *this;
+        return prepared;
+    }
+
+    PipelineInvocationBuilder &rhiSampler(const nb::object &identifier, RhiSampler *sampler) {
+        return ownedArgument(prepareRhiSampler(identifier, sampler));
     }
 
     PipelineInvocationBuilder &rhiColorAttachment(uint32_t location, RhiImageView *view, uint32_t loadOperation,
@@ -1297,11 +1479,11 @@ struct PipelineInvocationBuilder {
         return *this;
     }
 
-    void submit(VernonRuntimeProviderObject *encoder) {
+    std::unique_ptr<PythonRuntimeSubmission> submit(VernonRuntimeProviderObject *encoder) {
         std::vector<VernonPipelineArgument> values;
         values.reserve(arguments.size());
-        for (const OwnedArgument &argument : arguments)
-            values.push_back(argument.value);
+        for (const PreparedPipelineArgument *argument : arguments)
+            values.push_back(argument->value);
         VernonPipelineInvocation invocation{};
         invocation.struct_size = sizeof(invocation);
         invocation.abi_version = VERNON_PIPELINE_VERSION;
@@ -1317,27 +1499,31 @@ struct PipelineInvocationBuilder {
         invocation.compute_grid = computeGrid;
         std::memcpy(invocation.viewport, viewport, sizeof(viewport));
         std::memcpy(invocation.scissor, scissor, sizeof(scissor));
-        const VernonStatus status = encoder ? vernonRuntimePipelineEncode(*encoder, pipeline, &invocation)
-                                            : vernonRuntimePipelineInvoke(pipeline, &invocation);
-        if (status != VERNON_STATUS_OK)
-            throw std::runtime_error(
-                std::string(encoder ? "pipeline encoding failed: " : "pipeline invocation failed: ") +
-                stringView(vernonRuntimeGetLastError(runtime)));
+        if (encoder) {
+            if (vernonRuntimePipelineEncode(*encoder, pipeline, &invocation) != VERNON_STATUS_OK)
+                throw std::runtime_error("pipeline encoding failed: " + stringView(vernonRuntimeGetLastError(runtime)));
+            return {};
+        }
+        VernonSubmission *submission{};
+        if (vernonRuntimePipelineSubmit(pipeline, &invocation, &submission) != VERNON_STATUS_OK)
+            throw std::runtime_error("pipeline submission failed: " + stringView(vernonRuntimeGetLastError(runtime)));
+        return std::make_unique<PythonRuntimeSubmission>(submission);
     }
 
-    void invoke() { submit(nullptr); }
+    std::unique_ptr<PythonRuntimeSubmission> submit() { return submit(nullptr); }
 
     template <typename Encoder> void encode(const Encoder &encoder) {
         VernonRuntimeProviderObject providerEncoder{};
         if (vernonRuntimeReferenceRhiCommandEncoder(runtime, encoder.native(), &providerEncoder) != VERNON_STATUS_OK)
             throw std::invalid_argument("command encoder belongs to another Runtime device");
-        submit(&providerEncoder);
+        (void)submit(&providerEncoder);
     }
 
     Runtime *owner{};
     VernonRuntimeContext *runtime{};
     VernonLoadedPipeline *pipeline{};
-    std::deque<OwnedArgument> arguments;
+    std::vector<PreparedPipelineArgument *> arguments;
+    std::vector<std::unique_ptr<PreparedPipelineArgument>> ownedArguments;
     std::unordered_set<uint32_t> slots;
     std::vector<VernonColorAttachment> attachments;
     VernonDepthAttachment depthAttachment{};
@@ -1728,12 +1914,6 @@ struct LoadedPipeline {
         return {size.x, size.y, size.z};
     }
 
-    void invoke(PipelineInvocationBuilder &builder) {
-        if (builder.pipeline != pipeline)
-            throw std::invalid_argument("invocation builder belongs to another pipeline");
-        builder.invoke();
-    }
-
     nb::tuple vjp(uint32_t gridX, uint32_t gridY, uint32_t gridZ, const nb::dict &bindings, nb::object pipelineOwner) {
         if (!gridX || !gridY || !gridZ)
             throw std::invalid_argument("autodiff grid dimensions must be positive");
@@ -1897,7 +2077,7 @@ struct LoadedPipeline {
         throw std::invalid_argument("unsupported compute pipeline data type");
     }
 
-    void invokeCompute(uint32_t x, uint32_t y, uint32_t z, const nb::list &values) {
+    std::unique_ptr<PythonRuntimeSubmission> submitCompute(uint32_t x, uint32_t y, uint32_t z, const nb::list &values) {
         const std::vector<PipelineParameterMetadata> metadata = parameters();
         if (values.size() != metadata.size())
             throw std::invalid_argument("compute pipeline value count does not match reflection");
@@ -1957,9 +2137,11 @@ struct LoadedPipeline {
         invocation.arguments = arguments.data();
         invocation.argument_count = arguments.size();
         invocation.compute_grid = {x, y, z};
-        if (vernonRuntimePipelineInvoke(pipeline, &invocation) != VERNON_STATUS_OK)
-            throw std::runtime_error("compute pipeline invocation failed: " +
+        VernonSubmission *submission{};
+        if (vernonRuntimePipelineSubmit(pipeline, &invocation, &submission) != VERNON_STATUS_OK)
+            throw std::runtime_error("compute pipeline submission failed: " +
                                      stringView(vernonRuntimeGetLastError(runtime)));
+        return std::make_unique<PythonRuntimeSubmission>(submission);
     }
 
     nb::list derivativeGroups() const {
@@ -2166,11 +2348,6 @@ struct Runtime {
         return std::make_unique<LoadedPipeline>(this, handle, bundle, pipeline);
     }
 
-    void synchronize() {
-        if (vernonRuntimeSynchronize(handle) != VERNON_STATUS_OK)
-            throw std::runtime_error("runtime synchronization failed");
-    }
-
     VernonRuntimeContext *handle{};
     std::shared_ptr<RhiHostState> rhiHost;
 };
@@ -2307,11 +2484,11 @@ NB_MODULE(_native, module) {
         .def("create_attachment_image", &RhiHost::createAttachmentImage)
         .def("create_sampler", &RhiHost::createSampler, nb::arg("address") = VERNON_RHI_ADDRESS_REPEAT)
         .def("create_runtime", &RhiHost::createRuntime, nb::keep_alive<0, 1>())
-        .def("create_execution_graph", &RhiHost::createExecutionGraph)
-        .def("synchronize", &RhiHost::synchronize);
+        .def("create_execution_graph", &RhiHost::createExecutionGraph);
     nb::class_<RhiBuffer>(module, "RhiBuffer")
         .def_prop_ro("size", [](const RhiBuffer &value) { return value.size; })
-        .def("upload", &RhiBuffer::upload)
+        .def("upload", &RhiBuffer::upload, nb::arg("data"), nb::arg("offset") = 0)
+        .def("upload_ranges", &RhiBuffer::uploadRanges, nb::arg("ranges"))
         .def("download", &RhiBuffer::download);
     nb::class_<RhiImage>(module, "RhiImage")
         .def_prop_ro("width", [](const RhiImage &value) { return value.width; })
@@ -2439,6 +2616,13 @@ NB_MODULE(_native, module) {
         .def_ro("rendering", &PythonCompiledScope::rendering)
         .def_ro("pass_indices", &PythonCompiledScope::passIndices)
         .def_ro("barriers", &PythonCompiledScope::barriers);
+    nb::class_<PythonExecutionParameter>(module, "_ExecutionParameter")
+        .def_prop_ro("id", [](const PythonExecutionParameter &value) { return value.parameter.id; });
+    nb::class_<PythonExecutionBindingsBuilder>(module, "_ExecutionBindings")
+        .def("set", &PythonExecutionBindingsBuilder::set);
+    nb::class_<PythonExecutionBindingsView>(module, "_ExecutionBindingsView")
+        .def("get", &PythonExecutionBindingsView::get)
+        .def("token", &PythonExecutionBindingsView::token);
     nb::class_<PythonExecutionGraph>(module, "_ExecutionGraph")
         .def("add_render_pass", &PythonExecutionGraph::addRenderPass, nb::rv_policy::reference)
         .def("add_compute_pass", &PythonExecutionGraph::addComputePass, nb::rv_policy::reference)
@@ -2446,14 +2630,22 @@ NB_MODULE(_native, module) {
         .def("import_host_buffer", &PythonExecutionGraph::importHostBuffer, nb::arg("identity"),
              nb::arg("exported") = false)
         .def("import_image", &PythonExecutionGraph::importImage, nb::arg("image"), nb::arg("exported") = false)
+        .def("parameter", &PythonExecutionGraph::parameter)
         .def("compile", &PythonExecutionGraph::compile)
-        .def("validate", &PythonExecutionGraph::validate)
-        .def("execute", &PythonExecutionGraph::execute)
+        .def("validate", &PythonExecutionGraph::validate);
+    nb::class_<PythonCompiledExecutionGraph>(module, "_CompiledExecutionGraph")
+        .def("create_bindings", &PythonCompiledExecutionGraph::createBindings)
+        .def("submit", &PythonCompiledExecutionGraph::submit, nb::arg("bindings") = nb::none())
         .def_prop_ro(
             "schedule",
-            [](const PythonExecutionGraph &value) -> const std::vector<uint32_t> & { return value.graph.schedule(); },
+            [](const PythonCompiledExecutionGraph &value) -> const std::vector<uint32_t> & {
+                return value.plan->schedule();
+            },
             nb::rv_policy::reference_internal)
-        .def_prop_ro("scopes", &PythonExecutionGraph::scopes);
+        .def_prop_ro("scopes", &PythonCompiledExecutionGraph::scopes);
+    nb::class_<PythonExecutionSubmission>(module, "_ExecutionSubmission")
+        .def("wait", &PythonExecutionSubmission::wait, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("state", &PythonExecutionSubmission::state);
     nb::class_<vernon::execution::GraphicsEncoder>(module, "_GraphicsEncoder");
     nb::class_<vernon::execution::ComputeEncoder>(module, "_ComputeEncoder");
     nb::class_<Runtime>(module, "Runtime")
@@ -2463,8 +2655,7 @@ NB_MODULE(_native, module) {
         .def("load_cpu_autodiff", &Runtime::loadCpuAutodiff, nb::keep_alive<0, 1>())
         .def("load_pipeline", &Runtime::loadPipeline, nb::keep_alive<0, 1>())
         .def("load_pipeline_asset", &Runtime::loadPipelineAsset, nb::keep_alive<0, 1>())
-        .def("create_execution_graph", &Runtime::createExecutionGraph)
-        .def("synchronize", &Runtime::synchronize);
+        .def("create_execution_graph", &Runtime::createExecutionGraph);
     nb::class_<PipelineParameterMetadata>(module, "PipelineParameter")
         .def_ro("slot", &PipelineParameterMetadata::slot)
         .def_ro("name", &PipelineParameterMetadata::name)
@@ -2489,7 +2680,21 @@ NB_MODULE(_native, module) {
         .def_prop_ro("access", [](const PipelineOutputMetadata &value) { return static_cast<uint32_t>(value.access); })
         .def_ro("shape", &PipelineOutputMetadata::shape)
         .def_ro("location", &PipelineOutputMetadata::location);
+    nb::class_<PythonRuntimeSubmission>(module, "Submission")
+        .def("wait", &PythonRuntimeSubmission::wait, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("state", &PythonRuntimeSubmission::state);
+    nb::class_<PreparedPipelineArgument>(module, "_PreparedPipelineArgument");
     nb::class_<PipelineInvocationBuilder>(module, "PipelineInvocationBuilder")
+        .def("prepare_host_tensor", &PipelineInvocationBuilder::prepareHostTensor, nb::arg("parameter"),
+             nb::arg("array"))
+        .def("prepare_rhi_tensor", &PipelineInvocationBuilder::prepareRhiTensor, nb::arg("parameter"),
+             nb::arg("buffer"), nb::arg("access"), nb::arg("shape"), nb::arg("strides"), nb::arg("offset") = 0)
+        .def("prepare_rhi_texture", &PipelineInvocationBuilder::prepareRhiTexture, nb::arg("parameter"),
+             nb::arg("texture"))
+        .def("prepare_rhi_sampler", &PipelineInvocationBuilder::prepareRhiSampler, nb::arg("parameter"),
+             nb::arg("sampler"))
+        .def("prepared_argument", &PipelineInvocationBuilder::preparedArgument, nb::arg("argument"),
+             nb::rv_policy::reference_internal, nb::keep_alive<1, 2>())
         .def("host_tensor", &PipelineInvocationBuilder::hostTensor, nb::arg("parameter"), nb::arg("array"),
              nb::rv_policy::reference_internal)
         .def("rhi_tensor", &PipelineInvocationBuilder::rhiTensor, nb::arg("parameter"), nb::arg("buffer"),
@@ -2521,19 +2726,24 @@ NB_MODULE(_native, module) {
                           const vernon::execution::GraphicsEncoder &encoder) { builder.encode(encoder); })
         .def("encode", [](PipelineInvocationBuilder &builder,
                           const vernon::execution::ComputeEncoder &encoder) { builder.encode(encoder); })
-        .def("invoke", &PipelineInvocationBuilder::invoke);
+        .def("submit", [](PipelineInvocationBuilder &builder) { return builder.submit(); });
     nb::class_<PythonPullback>(module, "Pullback")
         .def("__call__", &PythonPullback::apply, nb::arg("cotangent") = nb::none());
     nb::class_<LoadedPipeline>(module, "LoadedPipeline")
         .def("invocation_builder", &LoadedPipeline::invocationBuilder, nb::keep_alive<0, 1>())
         .def(
-            "invoke",
+            "submit",
             [](LoadedPipeline &pipeline, uint32_t x, uint32_t y, uint32_t z, const nb::list &values) {
-                pipeline.invokeCompute(x, y, z, values);
+                return pipeline.submitCompute(x, y, z, values);
             },
             nb::arg("x"), nb::arg("y"), nb::arg("z"), nb::arg("values"))
         .def(
-            "invoke", [](LoadedPipeline &pipeline, PipelineInvocationBuilder &builder) { pipeline.invoke(builder); },
+            "submit",
+            [](LoadedPipeline &pipeline, PipelineInvocationBuilder &builder) {
+                if (builder.pipeline != pipeline.pipeline)
+                    throw std::invalid_argument("invocation builder belongs to another pipeline");
+                return builder.submit();
+            },
             nb::arg("builder"))
         .def(
             "vjp",

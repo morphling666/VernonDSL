@@ -781,7 +781,12 @@ VernonRhiStatus createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescri
         usage |= VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
     if ((descriptor->usage & VERNON_RHI_BUFFER_UNIFORM) != 0)
         usage |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
-    if (!device->state.createBuffer(slot.buffer, descriptor->size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+    if (descriptor->size > (std::numeric_limits<VkDeviceSize>::max)() - 3) {
+        releaseVulkanSlot(slot);
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    }
+    const VkDeviceSize allocationSize = (descriptor->size + 3) & ~VkDeviceSize{3};
+    if (!device->state.createBuffer(slot.buffer, allocationSize, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                                     device->error)) {
         releaseVulkanSlot(slot);
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
@@ -790,31 +795,163 @@ VernonRhiStatus createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescri
     return VERNON_RHI_STATUS_OK;
 }
 
+VernonRhiStatus uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
+                                   const VernonRhiBufferUploadRange *ranges, size_t rangeCount);
+
 VernonRhiStatus uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset, const void *source,
                              uint64_t size) {
-    auto device = lookupVulkanDevice(handle);
-    if (!device) {
-        return VERNON_RHI_STATUS_UNSUPPORTED;
-    }
+    const VernonRhiBufferUploadRange range{offset, source, size};
+    return uploadBufferRanges(handle, buffer, &range, 1);
+}
 
-    if (!source)
+VernonRhiStatus uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
+                                   const VernonRhiBufferUploadRange *ranges, size_t rangeCount) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device)
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    if (!ranges || rangeCount == 0 || rangeCount > (std::numeric_limits<uint32_t>::max)())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(device->mutex);
     VulkanBufferSlot *slot = lookupVulkanSlot(device->buffers, buffer);
-    if (!slot || offset > slot->ownedDescriptor.size || size > slot->ownedDescriptor.size - offset)
+    if (!slot)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::vector<VkBufferCopy> copies;
+    copies.reserve(rangeCount);
+    VkDeviceSize packedSize = 0;
+    VkDeviceSize destinationBegin = (std::numeric_limits<VkDeviceSize>::max)();
+    VkDeviceSize destinationEnd = 0;
+    bool allCopiesAligned = true;
+    for (size_t index = 0; index < rangeCount; ++index) {
+        const VernonRhiBufferUploadRange &range = ranges[index];
+        if (!range.source || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
+            range.offset > slot->ownedDescriptor.size || range.size > slot->ownedDescriptor.size - range.offset)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        if (packedSize > (std::numeric_limits<VkDeviceSize>::max)() - 15)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        packedSize = (packedSize + 15) & ~VkDeviceSize{15};
+        if (range.size > (std::numeric_limits<VkDeviceSize>::max)() - packedSize)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        copies.push_back({packedSize, range.offset, range.size});
+        packedSize += range.size;
+        destinationBegin = std::min(destinationBegin, range.offset);
+        destinationEnd = std::max(destinationEnd, range.offset + range.size);
+        allCopiesAligned = allCopiesAligned && (range.offset & 3) == 0 && (range.size & 3) == 0;
+    }
+    auto &driver = vernon::rhi::vulkan::driver();
+    if (!allCopiesAligned) {
+        std::vector<std::pair<VkDeviceSize, VkDeviceSize>> alignedRanges;
+        alignedRanges.reserve(rangeCount);
+        for (size_t index = 0; index < rangeCount; ++index) {
+            const VkDeviceSize begin = ranges[index].offset & ~VkDeviceSize{3};
+            const VkDeviceSize end = (ranges[index].offset + ranges[index].size + 3) & ~VkDeviceSize{3};
+            alignedRanges.emplace_back(begin, end);
+        }
+        std::sort(alignedRanges.begin(), alignedRanges.end());
+        size_t mergedCount = 0;
+        for (const auto &[begin, end] : alignedRanges) {
+            if (mergedCount && begin <= alignedRanges[mergedCount - 1].second) {
+                alignedRanges[mergedCount - 1].second = std::max(alignedRanges[mergedCount - 1].second, end);
+            } else {
+                alignedRanges[mergedCount++] = {begin, end};
+            }
+        }
+        alignedRanges.resize(mergedCount);
+
+        VkDeviceSize alignedSize = 0;
+        std::vector<VkBufferCopy> readbackCopies;
+        readbackCopies.reserve(mergedCount);
+        for (const auto &[begin, end] : alignedRanges) {
+            const VkDeviceSize size = end - begin;
+            if (size > (std::numeric_limits<VkDeviceSize>::max)() - alignedSize)
+                return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+            readbackCopies.push_back({begin, alignedSize, size});
+            alignedSize += size;
+        }
+        if (alignedSize > (std::numeric_limits<size_t>::max)())
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        std::vector<uint8_t> contents;
+        try {
+            contents.resize(static_cast<size_t>(alignedSize));
+        } catch (const std::bad_alloc &) {
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        }
+        VkBuffer readback{};
+        VkDeviceSize readbackOffset{};
+        uint8_t *readbackMapped = nullptr;
+        if (!device->state.acquireStaging(false, alignedSize, 16, readback, readbackOffset, readbackMapped,
+                                          device->error))
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        for (VkBufferCopy &copy : readbackCopies)
+            copy.dstOffset += readbackOffset;
+        VkCommandBuffer readbackCommand{};
+        if (!device->state.beginCommands(readbackCommand, device->error))
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        driver.cmdCopyBuffer(readbackCommand, slot->buffer.buffer, readback,
+                             static_cast<uint32_t>(readbackCopies.size()), readbackCopies.data());
+        if (!device->state.submitCommands(readbackCommand, device->error))
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        for (size_t index = 0; index < alignedRanges.size(); ++index) {
+            const VkDeviceSize size = alignedRanges[index].second - alignedRanges[index].first;
+            std::memcpy(contents.data() + (readbackCopies[index].dstOffset - readbackOffset),
+                        readbackMapped + (readbackCopies[index].dstOffset - readbackOffset), static_cast<size_t>(size));
+        }
+        for (size_t rangeIndex = 0; rangeIndex < rangeCount; ++rangeIndex) {
+            for (size_t alignedIndex = 0; alignedIndex < alignedRanges.size(); ++alignedIndex) {
+                const auto [begin, end] = alignedRanges[alignedIndex];
+                if (ranges[rangeIndex].offset < begin || ranges[rangeIndex].offset + ranges[rangeIndex].size > end)
+                    continue;
+                const VkDeviceSize packedBegin = readbackCopies[alignedIndex].dstOffset - readbackOffset;
+                std::memcpy(contents.data() + packedBegin + ranges[rangeIndex].offset - begin,
+                            ranges[rangeIndex].source, static_cast<size_t>(ranges[rangeIndex].size));
+                break;
+            }
+        }
+
+        VkBuffer staging{};
+        VkDeviceSize stagingOffset{};
+        uint8_t *mapped = nullptr;
+        if (!device->state.acquireStaging(true, alignedSize, 16, staging, stagingOffset, mapped, device->error))
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        std::memcpy(mapped, contents.data(), contents.size());
+        std::vector<VkBufferCopy> uploadCopies;
+        uploadCopies.reserve(alignedRanges.size());
+        VkDeviceSize sourceOffset = stagingOffset;
+        for (const auto &[begin, end] : alignedRanges) {
+            uploadCopies.push_back({sourceOffset, begin, end - begin});
+            sourceOffset += end - begin;
+        }
+        VkCommandBuffer command{};
+        if (!device->state.beginCommands(command, device->error))
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        driver.cmdCopyBuffer(command, staging, slot->buffer.buffer, static_cast<uint32_t>(uploadCopies.size()),
+                             uploadCopies.data());
+        VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
+                                VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = slot->buffer.buffer;
+        barrier.offset = destinationBegin;
+        barrier.size = destinationEnd - destinationBegin;
+        driver.cmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
+                                  nullptr, 1, &barrier, 0, nullptr);
+        return device->state.submitCommands(command, device->error) ? VERNON_RHI_STATUS_OK
+                                                                    : VERNON_RHI_STATUS_INTERNAL_ERROR;
+    }
     VkBuffer staging{};
     VkDeviceSize stagingOffset{};
     uint8_t *mapped = nullptr;
-    if (!device->state.acquireStaging(true, size, 16, staging, stagingOffset, mapped, device->error))
+    if (!device->state.acquireStaging(true, packedSize, 16, staging, stagingOffset, mapped, device->error))
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    std::memcpy(mapped, source, static_cast<size_t>(size));
+    for (size_t index = 0; index < rangeCount; ++index) {
+        std::memcpy(mapped + copies[index].srcOffset, ranges[index].source, static_cast<size_t>(ranges[index].size));
+        copies[index].srcOffset += stagingOffset;
+    }
     VkCommandBuffer command{};
     if (!device->state.beginCommands(command, device->error))
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    const VkBufferCopy copy{stagingOffset, offset, size};
-    auto &driver = vernon::rhi::vulkan::driver();
-    driver.cmdCopyBuffer(command, staging, slot->buffer.buffer, 1, &copy);
+    driver.cmdCopyBuffer(command, staging, slot->buffer.buffer, static_cast<uint32_t>(copies.size()), copies.data());
     VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
@@ -822,8 +959,8 @@ VernonRhiStatus uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uin
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.buffer = slot->buffer.buffer;
-    barrier.offset = offset;
-    barrier.size = size;
+    barrier.offset = destinationBegin;
+    barrier.size = destinationEnd - destinationBegin;
     driver.cmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
                               nullptr, 1, &barrier, 0, nullptr);
     return device->state.submitCommands(command, device->error) ? VERNON_RHI_STATUS_OK
@@ -837,25 +974,28 @@ VernonRhiStatus downloadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, u
         return VERNON_RHI_STATUS_UNSUPPORTED;
     }
 
-    if (!destination)
+    if (!destination || size == 0)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(device->mutex);
     VulkanBufferSlot *slot = lookupVulkanSlot(device->buffers, buffer);
     if (!slot || offset > slot->ownedDescriptor.size || size > slot->ownedDescriptor.size - offset)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    const VkDeviceSize alignedBegin = offset & ~VkDeviceSize{3};
+    const VkDeviceSize alignedEnd = (offset + size + 3) & ~VkDeviceSize{3};
+    const VkDeviceSize alignedSize = alignedEnd - alignedBegin;
     VkBuffer staging{};
     VkDeviceSize stagingOffset{};
     uint8_t *mapped = nullptr;
-    if (!device->state.acquireStaging(false, size, 16, staging, stagingOffset, mapped, device->error))
+    if (!device->state.acquireStaging(false, alignedSize, 16, staging, stagingOffset, mapped, device->error))
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
     VkCommandBuffer command{};
     if (!device->state.beginCommands(command, device->error))
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    const VkBufferCopy copy{offset, stagingOffset, size};
+    const VkBufferCopy copy{alignedBegin, stagingOffset, alignedSize};
     vernon::rhi::vulkan::driver().cmdCopyBuffer(command, slot->buffer.buffer, staging, 1, &copy);
     if (!device->state.submitCommands(command, device->error))
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    std::memcpy(destination, mapped, static_cast<size_t>(size));
+    std::memcpy(destination, mapped + (offset - alignedBegin), static_cast<size_t>(size));
     return VERNON_RHI_STATUS_OK;
 }
 
@@ -1330,7 +1470,8 @@ bool beginCommands(VernonRhiDevice handle, uint64_t &native, VernonRhiBackend &b
     return true;
 }
 
-bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites, bool &completed) {
+bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites, bool &completed,
+                    bool &externalCompletion) {
     auto device = lookupVulkanDevice(handle);
     if (!device) {
         return false;
@@ -1340,6 +1481,7 @@ bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites,
     const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
     const bool submitted = command && device->state.submitCommands(command, device->error);
     completed = submitted && !device->state.nativeObjectsBorrowed;
+    externalCompletion = submitted && device->state.nativeObjectsBorrowed;
     return submitted;
 }
 
@@ -1712,6 +1854,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::vulkanBackendDispatch() {
         deviceStateForBackend,
         createBuffer,
         uploadBuffer,
+        uploadBufferRanges,
         downloadBuffer,
         destroyBuffer,
         isBufferValid,

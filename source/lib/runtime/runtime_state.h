@@ -65,6 +65,14 @@ private:
 
 } // namespace vernon::runtime
 
+struct VernonSubmission {
+    std::shared_ptr<vernon::runtime::ContextLease> contextLease;
+    VernonSubmissionState state{VERNON_SUBMISSION_PENDING};
+    VernonStatus status{VERNON_STATUS_OK};
+    VernonRhiDevice device{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    VernonRhiCompletion completion{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+};
+
 template <typename State, typename Handle> State &runtimeBackendState(Handle &handle) {
     return *static_cast<State *>(handle.backendState);
 }

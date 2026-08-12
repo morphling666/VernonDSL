@@ -39,6 +39,7 @@ _owned_opengl_context: Any | None = None
 _runtime_generation = 0
 _api_version: tuple[int, int] | None = None
 _external_opengl_contexts: dict[_Architecture, tuple[int, int, int, tuple[int, int]]] = {}
+_runtime_submissions: weakref.WeakSet[Any] = weakref.WeakSet()
 _runtime_children: weakref.WeakSet[Any] = weakref.WeakSet()
 
 
@@ -52,18 +53,10 @@ def _release_runtime() -> None:
     invalidate_loaded_vjps()
     for compiled in Pipeline._cache.values():
         compiled.native = None
+    for submission in list(_runtime_submissions):
+        submission._release_runtime_native()
     for child in list(_runtime_children):
-        if hasattr(child, "_native_buffer"):
-            child._native_buffer = None
-        if hasattr(child, "_native_texture"):
-            child._native_texture = None
-        if hasattr(child, "_native_sampler"):
-            child._native_sampler = None
-        if hasattr(child, "_dispose_native"):
-            child._dispose_native()
-        if hasattr(child, "_compiled"):
-            child._compiled = None
-            child._compiled_generation = -1
+        child._release_runtime_native()
     _native_runtime = None
     _rhi_host = None
     _owned_opengl_context = None

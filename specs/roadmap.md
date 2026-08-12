@@ -24,9 +24,12 @@ implementation plans and milestone checklists that it replaces.
 
 ### Stable Runtime and compatibility contracts
 
-- Runtime invocation, owned RHI submission, and `ExecutionGraph.execute()` are
-  synchronous and complete backend work before returning.
-- At most one owned submission may be in flight per device.
+- Runtime, RHI, and ExecutionGraph execution return explicit submissions with
+  state queries, waits, and deterministic destruction.
+- ExecutionGraph separates its one-shot mutable builder from a reusable
+  immutable compiled plan and per-run submission state.
+- Backends may complete submissions inline; concurrent execution is not yet a
+  guaranteed capability.
 - Unsupported target capabilities fail explicitly instead of silently changing
   backend or program semantics.
 - Public Python behavior and the application-facing C ABI are defined for the

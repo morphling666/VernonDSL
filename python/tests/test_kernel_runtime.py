@@ -1015,6 +1015,18 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                 self.assertEqual(copy_tensor_view.compile_count, 1)
                 self.assertEqual(len(type(copy_tensor_view)._dispatch_cache), 1)
 
+    def test_gpu_written_storage_survives_runtime_reinitialization(self) -> None:
+        for backend in self._available_compute_backends():
+            with self.subTest(backend=backend.name):
+                vd.init(arch=backend)
+                output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
+                fill(output, 4.0)
+                vd.init(arch=vd.cpu)
+                np.testing.assert_array_equal(
+                    output.to_numpy(),
+                    np.array([[0.0, 1.0, 2.0], [4.0, 5.0, 6.0]], dtype=np.float32),
+                )
+
     def test_cached_tensor_view_dispatch_revalidates_abi(self) -> None:
         vd.init(arch=vd.cpu)
         copy_tensor_view.compile_count = 0
@@ -1204,7 +1216,7 @@ class KernelTests(unittest.TestCase):
 
     def test_explicit_grid_and_cache(self) -> None:
         output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
-        fill(output, 10.0, grid=(3, 2, 1))
+        self.assertIsNone(fill(output, 10.0, grid=(3, 2, 1)))
         np.testing.assert_array_equal(
             output.to_numpy(),
             np.array([[0, 1, 2], [10, 11, 12]], dtype=np.float32),
@@ -1263,13 +1275,10 @@ class KernelTests(unittest.TestCase):
 
     def test_cpu_host_tensor_avoids_device_residency(self) -> None:
         output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
-        fill(output, 2.0)
-        fill(output, 3.0)
-        self.assertEqual(output._allocation_count, 0)
-        self.assertEqual(output._upload_count, 0)
-        self.assertEqual(output._download_count, 0)
-        output.to_numpy()
-        self.assertEqual(output._download_count, 0)
+        with mock.patch.object(output, "_resident_buffer", side_effect=AssertionError("unexpected residency")):
+            fill(output, 2.0)
+            fill(output, 3.0)
+            output.to_numpy()
 
     def test_fractal_matches_vectorized_numpy_reference(self) -> None:
         width, height = 4, 3

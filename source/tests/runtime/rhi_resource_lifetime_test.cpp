@@ -3,6 +3,8 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+
 namespace {
 
 struct BackendCase {
@@ -12,6 +14,59 @@ struct BackendCase {
 };
 
 class RhiResourceLifetime : public testing::TestWithParam<BackendCase> {};
+
+TEST_P(RhiResourceLifetime, BatchedBufferUploadsValidateBeforeMutation) {
+    const BackendCase test = GetParam();
+    VernonRhiOwnedDeviceDescriptor deviceDescriptor{};
+    deviceDescriptor.struct_size = sizeof(deviceDescriptor);
+    deviceDescriptor.backend = test.backend;
+    const VernonRhiDevice device = vernonRhiCreateDevice(&deviceDescriptor);
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        GTEST_SKIP() << test.name << " is unavailable";
+
+    VernonRhiBufferDescriptor bufferDescriptor{};
+    bufferDescriptor.struct_size = sizeof(bufferDescriptor);
+    bufferDescriptor.size = 32;
+    bufferDescriptor.usage =
+        VERNON_RHI_BUFFER_TRANSFER_SOURCE | VERNON_RHI_BUFFER_TRANSFER_DESTINATION | VERNON_RHI_BUFFER_STORAGE;
+    bufferDescriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
+    VernonRhiBuffer buffer{};
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &buffer), VERNON_RHI_STATUS_OK);
+
+    std::array<uint8_t, 32> contents{};
+    ASSERT_EQ(vernonRhiDeviceUploadBuffer(device, buffer, 0, contents.data(), contents.size()), VERNON_RHI_STATUS_OK);
+    const std::array<uint8_t, 3> first{1, 2, 3};
+    const std::array<uint8_t, 4> second{4, 5, 6, 7};
+    const std::array<VernonRhiBufferUploadRange, 2> valid{
+        VernonRhiBufferUploadRange{4, first.data(), first.size()},
+        VernonRhiBufferUploadRange{20, second.data(), second.size()},
+    };
+    ASSERT_EQ(vernonRhiDeviceUploadBufferRanges(device, buffer, valid.data(), valid.size()), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(device, buffer, 0, contents.data(), contents.size()), VERNON_RHI_STATUS_OK);
+    const std::array<uint8_t, 3> actualFirst{contents[4], contents[5], contents[6]};
+    const std::array<uint8_t, 4> actualSecond{contents[20], contents[21], contents[22], contents[23]};
+    EXPECT_EQ(actualFirst, first);
+    EXPECT_EQ(actualSecond, second);
+    std::array<uint8_t, 3> partialDownload{};
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(device, buffer, 4, partialDownload.data(), partialDownload.size()),
+              VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(partialDownload, first);
+
+    const std::array<uint8_t, 2> rejected{9, 9};
+    const std::array<VernonRhiBufferUploadRange, 2> invalid{
+        VernonRhiBufferUploadRange{0, rejected.data(), rejected.size()},
+        VernonRhiBufferUploadRange{31, rejected.data(), rejected.size()},
+    };
+    EXPECT_EQ(vernonRhiDeviceUploadBufferRanges(device, buffer, invalid.data(), invalid.size()),
+              VERNON_RHI_STATUS_INVALID_ARGUMENT);
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(device, buffer, 0, contents.data(), contents.size()), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(contents[0], 0);
+    EXPECT_EQ(contents[1], 0);
+    EXPECT_EQ(vernonRhiDeviceUploadBufferRanges(device, buffer, nullptr, 0), VERNON_RHI_STATUS_INVALID_ARGUMENT);
+
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, buffer), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
+}
 
 TEST_P(RhiResourceLifetime, ExecutionGraphDestroysOwnedBuffersButNotImportedBuffers) {
     const BackendCase test = GetParam();
@@ -329,7 +384,8 @@ INSTANTIATE_TEST_SUITE_P(GpuBackends, RhiResourceLifetime,
                          testing::Values(BackendCase{VERNON_RHI_BACKEND_CUDA, "CUDA", false},
                                          BackendCase{VERNON_RHI_BACKEND_VULKAN, "Vulkan", true},
                                          BackendCase{VERNON_RHI_BACKEND_DIRECTX12, "DirectX12", true},
-                                         BackendCase{VERNON_RHI_BACKEND_METAL, "Metal", true}),
+                                         BackendCase{VERNON_RHI_BACKEND_METAL, "Metal", true},
+                                         BackendCase{VERNON_RHI_BACKEND_OPENGL, "OpenGL", true}),
                          [](const testing::TestParamInfo<BackendCase> &info) { return info.param.name; });
 
 } // namespace

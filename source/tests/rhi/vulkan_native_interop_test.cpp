@@ -1,6 +1,7 @@
 #include "VernonRHI.h"
 #include "rhi/rhi_internal.h"
 #include "rhi/vulkan_backend.h"
+#include "runtime_rhi_test_utils.h"
 #include "vernon_test_support.h"
 
 #include <gtest/gtest.h>
@@ -159,8 +160,7 @@ TEST(VulkanOwnedDevice, TransitionsPackedDepthStencilImageWithBothAspects) {
     barrier.image_subresources = {0, 1, 0, 1, VERNON_RHI_IMAGE_ASPECT_DEPTH};
     EXPECT_EQ(vernonRhiCommandEncoderBarrier(device, encoder, &barrier, 1), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceSubmit(device, encoder), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernon::tests::completeSubmission(device, encoder), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
     vernonRhiDestroyDevice(device);
 }
@@ -260,6 +260,20 @@ TEST(VulkanNativeInterop, BorrowsObjectsWithoutOwningTheirLifetime) {
     EXPECT_EQ(nativeBits, handleBits(image.image));
     EXPECT_EQ(vernonRhiDeviceGetImageViewNativeHandle(device, importedImageView, &nativeBits), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(nativeBits, handleBits(image.view));
+
+    VernonRhiCommandEncoderDescriptor encoderDescriptor{};
+    encoderDescriptor.struct_size = sizeof(encoderDescriptor);
+    VernonRhiCommandEncoder encoder{};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+    VernonRhiCompletion completion{};
+    ASSERT_EQ(vernonRhiDeviceSubmit(device, encoder, &completion), VERNON_RHI_STATUS_OK);
+    VernonRhiCompletionState completionState{};
+    ASSERT_EQ(vernonRhiCompletionGetState(device, completion, &completionState), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(completionState, VERNON_RHI_COMPLETION_PENDING);
+    ASSERT_EQ(vernonRhiCompletionSignal(device, completion, VERNON_RHI_STATUS_OK), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCompletionWait(device, completion), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyCompletion(device, completion), VERNON_RHI_STATUS_OK);
 
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, importedImage), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImageView(device, importedImageView), VERNON_RHI_STATUS_OK);

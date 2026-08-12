@@ -13,7 +13,3 @@ extern "C" void vernonRhiDestroyDevice(VernonRhiDevice device) { vernon::rhi::de
 extern "C" VernonStringView vernonRhiDeviceGetLastError(VernonRhiDevice device) {
     return vernon::rhi::deviceLastError(device);
 }
-
-extern "C" VernonRhiStatus vernonRhiDeviceSynchronize(VernonRhiDevice device) {
-    return vernon::rhi::synchronizeDevice(device);
-}

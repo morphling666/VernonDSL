@@ -1,4 +1,5 @@
 #include "VernonCpuWorkgroupABI.h"
+#include "runtime_rhi_test_utils.h"
 #include "vernon-c/Runtime.h"
 
 #include <gtest/gtest.h>
@@ -96,7 +97,14 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.compute_grid = grid;
-    ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
+    VernonSubmission *submission{};
+    ASSERT_EQ(vernonRuntimePipelineSubmit(pipeline, &invocation, &submission), VERNON_STATUS_OK);
+    ASSERT_NE(submission, nullptr);
+    VernonSubmissionState submissionState{};
+    ASSERT_EQ(vernonSubmissionGetState(submission, &submissionState), VERNON_STATUS_OK);
+    EXPECT_EQ(submissionState, VERNON_SUBMISSION_SUCCEEDED);
+    ASSERT_EQ(vernonSubmissionWait(submission), VERNON_STATUS_OK);
+    vernonSubmissionDestroy(submission);
     ASSERT_TRUE(values[0] == 0.0f && values[3] == 3.0f);
     ASSERT_TRUE(values[4] == 10.0f && values[15] == 113.0f);
 
@@ -108,9 +116,9 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     VernonLoadedPipeline *constrainedPipeline = vernonRuntimeLoadCpuEntry(
         runtime, fill_grid, constrainedReflection.data(), constrainedReflection.size(), "fill", 4);
     ASSERT_NE(constrainedPipeline, nullptr);
-    EXPECT_EQ(vernonRuntimePipelineInvoke(constrainedPipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(vernon::tests::completeSubmission(constrainedPipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
     invocation.compute_grid = {2, 1, 1};
-    EXPECT_EQ(vernonRuntimePipelineInvoke(constrainedPipeline, &invocation), VERNON_STATUS_OK);
+    EXPECT_EQ(vernon::tests::completeSubmission(constrainedPipeline, &invocation), VERNON_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(constrainedPipeline);
 
     constrainedJson["entries"][0]["workgroup_size"] = {1, 1, 1};
@@ -120,9 +128,9 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     VernonLoadedPipeline *singleInvocationPipeline = vernonRuntimeLoadCpuEntry(
         runtime, fill_grid, singleInvocationReflection.data(), singleInvocationReflection.size(), "fill", 4);
     ASSERT_NE(singleInvocationPipeline, nullptr);
-    EXPECT_EQ(vernonRuntimePipelineInvoke(singleInvocationPipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(vernon::tests::completeSubmission(singleInvocationPipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
     invocation.compute_grid = {1, 1, 1};
-    EXPECT_EQ(vernonRuntimePipelineInvoke(singleInvocationPipeline, &invocation), VERNON_STATUS_OK);
+    EXPECT_EQ(vernon::tests::completeSubmission(singleInvocationPipeline, &invocation), VERNON_STATUS_OK);
     vernonRuntimeLoadedPipelineDestroy(singleInvocationPipeline);
 
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_INVALID_ARGUMENT);

@@ -103,8 +103,7 @@ int main() {
         const VernonRhiDevice device = vernonRhiCreateDevice(&descriptor);
         if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
             return 1;
-        const bool success = testBuffers(device) && testImageAndSampler(device) &&
-                             vernonRhiDeviceSynchronize(device) == VERNON_RHI_STATUS_OK;
+        const bool success = testBuffers(device) && testImageAndSampler(device);
         vernonRhiDestroyDevice(device);
         NSLog(@"Vernon iOS Metal smoke test %@", success ? @"passed" : @"failed");
         return success ? 0 : 2;

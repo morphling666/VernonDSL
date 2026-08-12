@@ -33,7 +33,6 @@ VernonStatus invokeBackendPipeline(VernonLoadedPipeline &pipeline, const VernonP
                                    const PlannedGraphicsInvocation &plan);
 VernonStatus invokeBackendComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &plan);
 
-VernonStatus synchronizeBackend(VernonRuntimeContext &context);
 VernonStatus referenceBackendRhiBuffer(VernonRuntimeContext &context, VernonRhiBuffer buffer, uint64_t offset,
                                        uint64_t size, VernonRuntimeProviderResourceReference &output);
 VernonStatus referenceBackendRhiImageView(VernonRuntimeContext &context, VernonRhiImageView view,

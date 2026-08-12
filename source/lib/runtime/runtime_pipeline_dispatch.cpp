@@ -93,22 +93,6 @@ VernonStatus invokeBackendComputePipeline(VernonLoadedPipeline &pipeline, const 
     return invokeOpenGLComputePipeline(pipeline, plan);
 }
 
-VernonStatus synchronizeBackend(VernonRuntimeContext &context) {
-    if (context.backend == VERNON_RUNTIME_CPU)
-        return VERNON_STATUS_OK;
-    switch (vernonRhiDeviceSynchronize(context.rhiDevice)) {
-    case VERNON_RHI_STATUS_OK:
-        return VERNON_STATUS_OK;
-    case VERNON_RHI_STATUS_INVALID_ARGUMENT:
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    case VERNON_RHI_STATUS_UNSUPPORTED:
-        return VERNON_STATUS_UNSUPPORTED_TARGET;
-    case VERNON_RHI_STATUS_INTERNAL_ERROR:
-        return VERNON_STATUS_INTERNAL_ERROR;
-    }
-    return VERNON_STATUS_INTERNAL_ERROR;
-}
-
 #if defined(VERNON_RUNTIME_TESTING)
 VulkanGraphicsCacheStats getVulkanGraphicsCacheStats(const VernonRuntimeContext *context,
                                                      const VernonLoadedPipeline *pipeline) {

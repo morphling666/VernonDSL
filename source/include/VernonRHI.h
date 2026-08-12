@@ -28,6 +28,12 @@ typedef enum VernonRhiStatus {
     VERNON_RHI_STATUS_INTERNAL_ERROR = 3
 } VernonRhiStatus;
 
+typedef enum VernonRhiCompletionState {
+    VERNON_RHI_COMPLETION_PENDING = 0,
+    VERNON_RHI_COMPLETION_SUCCEEDED = 1,
+    VERNON_RHI_COMPLETION_FAILED = 2
+} VernonRhiCompletionState;
+
 #define VERNON_RHI_DECLARE_HANDLE(Name)                                                                                \
     typedef struct Name {                                                                                              \
         uint32_t index;                                                                                                \
@@ -262,6 +268,12 @@ typedef struct VernonRhiBufferDescriptor {
     uint32_t reserved[4];
 } VernonRhiBufferDescriptor;
 
+typedef struct VernonRhiBufferUploadRange {
+    uint64_t offset;
+    const void *source;
+    uint64_t size;
+} VernonRhiBufferUploadRange;
+
 typedef struct VernonRhiImageDescriptor {
     uint32_t struct_size;
     VernonRhiImageDimension dimension;
@@ -465,13 +477,6 @@ typedef struct VernonRhiCommandEncoderDescriptor {
     uint32_t reserved[4];
 } VernonRhiCommandEncoderDescriptor;
 
-typedef struct VernonRhiCompletionDescriptor {
-    uint32_t struct_size;
-    uint64_t initial_value;
-    uint32_t host_visible;
-    uint32_t reserved[4];
-} VernonRhiCompletionDescriptor;
-
 typedef struct VernonRhiBarrier {
     uint32_t struct_size;
     uint32_t source_stage_mask;
@@ -583,7 +588,6 @@ VERNON_RHI_CAPI VernonRhiDevice vernonRhiCreateOpenGLDevice(const VernonOpenGLCo
                                                             uint32_t embedded_profile);
 VERNON_RHI_CAPI void vernonRhiDestroyDevice(VernonRhiDevice device);
 VERNON_RHI_CAPI VernonStringView vernonRhiDeviceGetLastError(VernonRhiDevice device);
-VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceSynchronize(VernonRhiDevice device);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceCreateCommandEncoder(VernonRhiDevice device,
                                                                     const VernonRhiCommandEncoderDescriptor *descriptor,
                                                                     VernonRhiCommandEncoder *output);
@@ -606,14 +610,26 @@ VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderClearDepthStencilAttachme
                                                                                    uint32_t clear_stencil,
                                                                                    uint32_t aspects);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderFinish(VernonRhiDevice device, VernonRhiCommandEncoder encoder);
-VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceSubmit(VernonRhiDevice device, VernonRhiCommandEncoder encoder);
-VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderGetStats(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
-                                                                VernonRhiCommandEncoderStats *output);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceSubmit(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
+                                                      VernonRhiCompletion *output);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiCompletionGetState(VernonRhiDevice device, VernonRhiCompletion completion,
+                                                            VernonRhiCompletionState *output);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiCompletionWait(VernonRhiDevice device, VernonRhiCompletion completion);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiCompletionSignal(VernonRhiDevice device, VernonRhiCompletion completion,
+                                                          VernonRhiStatus result);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiCompletionGetCommandStats(VernonRhiDevice device,
+                                                                   VernonRhiCompletion completion,
+                                                                   VernonRhiCommandEncoderStats *output);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceDestroyCompletion(VernonRhiDevice device,
+                                                                 VernonRhiCompletion completion);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceCreateBuffer(VernonRhiDevice device,
                                                             const VernonRhiBufferDescriptor *descriptor,
                                                             VernonRhiBuffer *output);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceUploadBuffer(VernonRhiDevice device, VernonRhiBuffer buffer,
                                                             uint64_t offset, const void *source, uint64_t size);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceUploadBufferRanges(VernonRhiDevice device, VernonRhiBuffer buffer,
+                                                                  const VernonRhiBufferUploadRange *ranges,
+                                                                  size_t range_count);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceDownloadBuffer(VernonRhiDevice device, VernonRhiBuffer buffer,
                                                               uint64_t offset, void *destination, uint64_t size);
 VERNON_RHI_CAPI uint32_t vernonRhiDeviceIsBufferValid(VernonRhiDevice device, VernonRhiBuffer buffer);

@@ -211,6 +211,11 @@ def main() -> None:
     target = vd.RenderTarget(shape=(args.size, args.size)).attach_color(0, color).attach_depth()
     shadow_enabled = not args.no_shadow
     environment_enabled = not args.no_cubemap
+    shadow_target: vd.RenderTarget | None = None
+    shadow_map: object | None = None
+    shadow_sampler: object | None = None
+    environment_map: object | None = None
+    environment_sampler: object | None = None
     features = {
         feature
         for feature, enabled in (
@@ -231,6 +236,7 @@ def main() -> None:
     render_shadow = vd.pipeline(shadow_vertex, shadow_fragment) if shadow_enabled else None
     invocation: vd.PipelineInvocation | None = None
     shadow_invocation: vd.PipelineInvocation | None = None
+    plan: vd.CompiledExecutionGraph | None = None
 
     class PbrPass(vd.RenderPass):
         def declare(self) -> None:
@@ -246,13 +252,15 @@ def main() -> None:
 
     graph = vd.ExecutionGraph()
     if shadow_enabled:
+        assert shadow_target is not None
+        active_shadow_target = shadow_target
 
         class ShadowPass(vd.RenderPass):
             def declare(self) -> None:
                 if shadow_invocation is None:
                     raise RuntimeError("shadow pass invocation was not prepared")
                 shadow_invocation.declare(self)
-                self.attachments(shadow_target)
+                self.attachments(active_shadow_target)
 
             def execute(self, encoder: vd.GraphicsEncoder, resources: vd.ExecutionResources) -> None:
                 if shadow_invocation is None:
@@ -261,6 +269,8 @@ def main() -> None:
 
         graph.add_pass(ShadowPass("shadow"))
     graph.add_pass(PbrPass("pbr"))
+    view_projection_parameter = graph.parameter("view_projection")
+    camera_position_parameter = graph.parameter("camera_position")
 
     projection = perspective(
         math.radians(48.0),
@@ -269,6 +279,7 @@ def main() -> None:
         30.0,
         zero_to_one=args.arch != "opengl",
     )
+    light_view_projection: np.ndarray | None = None
     if shadow_enabled:
         light_view = look_at(light_value, np.array((0.0, 0.35, 0.0), dtype=np.float32))
         light_projection = perspective(
@@ -279,6 +290,49 @@ def main() -> None:
             zero_to_one=args.arch != "opengl",
         )
         light_view_projection = np.ascontiguousarray(light_projection @ light_view)
+        if render_shadow is None:
+            raise RuntimeError("shadow pipeline was not prepared")
+        shadow_invocation = render_shadow.invocation(
+            position=positions,
+            light_view_projection=light_view_projection,
+            topology=vd.triangles,
+        )
+    render_arguments: dict[str, object] = {
+        "position": positions,
+        "normal": normals,
+        "base_color": colors,
+        "material": materials,
+        "view_projection": view_projection_parameter,
+        "camera_position": camera_position_parameter,
+        "light_position": light_value,
+        "topology": vd.triangles,
+    }
+    if shadow_enabled:
+        assert light_view_projection is not None
+        assert shadow_map is not None
+        assert shadow_sampler is not None
+        render_arguments.update(
+            light_view_projection=light_view_projection,
+            shadow_depth_scale=np.float32(0.5 if args.arch == "opengl" else 1.0),
+            shadow_depth_bias=np.float32(0.5 if args.arch == "opengl" else 0.0),
+            shadow_uv_scale=np.array(
+                (0.5, 0.5 if args.arch == "opengl" else -0.5),
+                dtype=np.float32,
+            ),
+            shadow_texel_size=np.array((1.0 / args.size, 1.0 / args.size), dtype=np.float32),
+            shadow_map=shadow_map,
+            shadow_sampler=shadow_sampler,
+        )
+    if environment_enabled:
+        assert environment_map is not None
+        assert environment_sampler is not None
+        render_arguments.update(
+            environment_map=environment_map,
+            environment_sampler=environment_sampler,
+        )
+    invocation = render.invocation(**render_arguments)
+    plan = graph.compile()
+    bindings: vd.ExecutionBindings | None = None
     start_time = time.perf_counter()
     delay_ms = max(1, round(1000 / args.fps))
     frame = 0
@@ -293,44 +347,15 @@ def main() -> None:
             )
             view = look_at(camera, np.array((0.0, 0.45, 0.0), dtype=np.float32))
             view_projection = projection @ view
-            if shadow_enabled:
-                if render_shadow is None:
-                    raise RuntimeError("shadow pipeline was not prepared")
-                shadow_invocation = render_shadow.invocation(
-                    position=positions,
-                    light_view_projection=light_view_projection,
-                    topology=vd.triangles,
-                )
-            render_arguments: dict[str, object] = {
-                "position": positions,
-                "normal": normals,
-                "base_color": colors,
-                "material": materials,
-                "view_projection": np.ascontiguousarray(view_projection),
-                "camera_position": np.ascontiguousarray(camera),
-                "light_position": light_value,
-                "topology": vd.triangles,
+            frame_values = {
+                view_projection_parameter: np.ascontiguousarray(view_projection),
+                camera_position_parameter: np.ascontiguousarray(camera),
             }
-            if shadow_enabled:
-                render_arguments.update(
-                    light_view_projection=light_view_projection,
-                    shadow_depth_scale=np.float32(0.5 if args.arch == "opengl" else 1.0),
-                    shadow_depth_bias=np.float32(0.5 if args.arch == "opengl" else 0.0),
-                    shadow_uv_scale=np.array(
-                        (0.5, 0.5 if args.arch == "opengl" else -0.5),
-                        dtype=np.float32,
-                    ),
-                    shadow_texel_size=np.array((1.0 / args.size, 1.0 / args.size), dtype=np.float32),
-                    shadow_map=shadow_map,
-                    shadow_sampler=shadow_sampler,
-                )
-            if environment_enabled:
-                render_arguments.update(
-                    environment_map=environment_map,
-                    environment_sampler=environment_sampler,
-                )
-            invocation = render.invocation(**render_arguments)
-            graph.execute()
+            if bindings is None:
+                bindings = plan.create_bindings(frame_values)
+            else:
+                bindings.update(frame_values)
+            plan.submit(bindings).wait()
             rgba = color.to_numpy()
             if args.arch == "opengl":
                 rgba = np.flipud(rgba)

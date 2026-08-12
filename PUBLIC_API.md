@@ -47,9 +47,34 @@ defect.
 Struct-based C APIs use `struct_size` and reserved fields for compatible
 extension. Callers must zero-initialize structures, set `struct_size`, and leave
 reserved fields zero. Enum numeric values and exported C function signatures
-are stable within the 0.1 release series.
+are stable once published in a 0.1 release. Unreleased API drafts may be
+replaced without compatibility wrappers before their first release.
 
-The Runtime contract is synchronous. Invocation, owned RHI submission, and
-`ExecutionGraph.execute()` complete backend work before returning. Asynchronous
-dispatch, deferred execution, swapchain presentation, and multiple frames in
-flight are not public 0.1.2 behavior.
+Execution is submission-based. Runtime pipelines use
+`vernonRuntimePipelineSubmit`, RHI command encoders are consumed by
+`vernonRhiDeviceSubmit`, and Python/C++ execution graphs compile into immutable
+plans whose `submit()` method returns a submission. A submission may already be
+complete; callers use its state query or `wait()` method. C callers explicitly
+destroy submission/completion handles, while C++ and Python submissions use
+managed lifetime. Submission destruction and device shutdown drain unfinished
+work before releasing retained resources.
+
+Borrowed Vulkan and DirectX 12 command targets are queued by their external
+owner. Their completions remain pending until that owner has observed its GPU
+fence and calls `vernonRhiCompletionSignal`; retained resources are not
+released before that signal. All borrowed completions must be signaled before
+destroying the Vernon RHI device.
+
+Python `Kernel(...)` and graphics `Pipeline(...)` calls are synchronous
+convenience operations. Explicit asynchronous execution is exposed through
+compiled execution plans and their `submit()` method, rather than requiring
+direct-call users to manage submissions.
+
+Sparse host updates use `vernonRhiDeviceUploadBufferRanges`, which validates a
+complete range list before mutation and lets each backend execute the list as
+one transfer transaction.
+
+The 0.1.2 contract does not guarantee concurrent execution or multiple frames
+in flight. Backends may complete work inline while preserving the same
+submission and lifetime semantics. Swapchain presentation remains outside the
+public Runtime contract.

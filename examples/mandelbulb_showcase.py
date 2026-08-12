@@ -11,7 +11,6 @@ from shader_lib.mandelbulb import mandelbulb_fragment
 from showcase_common import (
     BatchRenderPass,
     FramePresenter,
-    InvocationBatch,
     ShowcasePreset,
     architecture_from_name,
     configure_showcase_parser,
@@ -43,13 +42,30 @@ def main() -> None:
     output = vd.Texture.zeros(shape=(options.size, options.size))
     target = vd.RenderTarget(shape=output.shape).attach_color(0, output)
     render_mandelbulb = vd.pipeline(fullscreen_vertex, mandelbulb_fragment)
-    render_batch = InvocationBatch()
+    quality = {
+        "smoke": (np.int32(48), np.int32(9), np.int32(12)),
+        "showoff": (np.int32(112), np.int32(18), np.int32(32)),
+    }[options.preset]
     graph = vd.ExecutionGraph()
+    camera_parameter = graph.parameter("camera_position")
+    time_parameter = graph.parameter("time")
+    power_parameter = graph.parameter("power")
+    invocation = render_mandelbulb.invocation(
+        position=positions,
+        camera_position=camera_parameter,
+        camera_target=np.array((0.0, 0.0, 0.0), dtype=np.float32),
+        time=time_parameter,
+        power=power_parameter,
+        max_steps=quality[0],
+        max_iterations=quality[1],
+        shadow_steps=quality[2],
+        topology=vd.triangles,
+    )
     graph.add_pass(
         BatchRenderPass(
             "mandelbulb-raymarch",
             target,
-            render_batch,
+            [invocation],
             clear_color=(0.0, 0.0, 0.0, 1.0),
         )
     )
@@ -60,35 +76,29 @@ def main() -> None:
         headless=options.headless,
         fps=options.fps,
     )
-    quality = {
-        "smoke": (np.int32(48), np.int32(9), np.int32(12)),
-        "showoff": (np.int32(112), np.int32(18), np.int32(32)),
-    }[options.preset]
+    plan = graph.compile()
+
+    def frame_values(phase: float) -> dict[vd.ExecutionParameter, object]:
+        angle = phase * 0.22 + 0.55
+        camera = np.array(
+            (3.15 * math.cos(angle), 0.48 + math.sin(phase * 0.17) * 0.12, 3.15 * math.sin(angle)),
+            dtype=np.float32,
+        )
+        return {
+            camera_parameter: camera,
+            time_parameter: np.float32(phase),
+            power_parameter: np.float32(8.0 + math.sin(phase * 0.21) * 0.18),
+        }
+
+    bindings = plan.create_bindings(frame_values(0.0))
     animation_frames: list[np.ndarray] = []
     frame = 0
     start = time.perf_counter()
     try:
         while options.frames == 0 or frame < options.frames:
             phase = float(time.perf_counter() - start if options.frames == 0 else frame / options.fps)
-            angle = phase * 0.22 + 0.55
-            camera = np.array(
-                (3.15 * math.cos(angle), 0.48 + math.sin(phase * 0.17) * 0.12, 3.15 * math.sin(angle)),
-                dtype=np.float32,
-            )
-            render_batch.values = [
-                render_mandelbulb.invocation(
-                    position=positions,
-                    camera_position=camera,
-                    camera_target=np.array((0.0, 0.0, 0.0), dtype=np.float32),
-                    time=np.float32(phase),
-                    power=np.float32(8.0 + math.sin(phase * 0.21) * 0.18),
-                    max_steps=quality[0],
-                    max_iterations=quality[1],
-                    shadow_steps=quality[2],
-                    topology=vd.triangles,
-                )
-            ]
-            graph.execute()
+            bindings.update(frame_values(phase))
+            plan.submit(bindings).wait()
             frame += 1
             if not presenter.present():
                 break
@@ -102,14 +112,14 @@ def main() -> None:
         write_animation(options.animation_output, animation_frames, options.fps)
     if presenter.image is None:
         raise RuntimeError("Mandelbulb showcase did not render an image")
-    barrier_count = sum(len(scope.barriers) for scope in graph.scopes)
+    barrier_count = sum(len(scope.barriers) for scope in plan.scopes)
     emit_showcase_result(
         name="mandelbulb",
         options=options,
         image=presenter.image,
         rendered_frames=frame,
         elapsed_seconds=elapsed,
-        passes=len(graph.schedule),
+        passes=len(plan.schedule),
         barriers=barrier_count,
     )
 

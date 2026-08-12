@@ -411,6 +411,30 @@ VernonRhiStatus uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uin
                : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
+VernonRhiStatus uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
+                                   const VernonRhiBufferUploadRange *ranges, size_t rangeCount) {
+    auto device = lookupDevice(handle);
+    if (!device || !ranges || rangeCount == 0)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    BufferSlot *slot = lookupBuffer(*device, buffer);
+    if (!slot)
+        return fail(*device, "OpenGL RHI buffer upload handle is invalid");
+    for (size_t index = 0; index < rangeCount; ++index) {
+        const VernonRhiBufferUploadRange &range = ranges[index];
+        if (!range.source || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
+            range.offset > slot->descriptor.size || range.size > slot->descriptor.size - range.offset)
+            return fail(*device, "OpenGL RHI buffer upload range is invalid");
+    }
+    for (size_t index = 0; index < rangeCount; ++index) {
+        const VernonRhiBufferUploadRange &range = ranges[index];
+        if (!device->state.uploadBuffer(slot->buffer, static_cast<size_t>(range.offset), range.source,
+                                        static_cast<size_t>(range.size), device->error))
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    }
+    return VERNON_RHI_STATUS_OK;
+}
+
 VernonRhiStatus downloadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset, void *destination,
                                uint64_t size) {
 
@@ -922,9 +946,11 @@ bool beginCommands(VernonRhiDevice handle, uint64_t &native, VernonRhiBackend &b
     return false;
 }
 
-bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites, bool &completed) {
+bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites, bool &completed,
+                    bool &externalCompletion) {
 
     completed = false;
+    externalCompletion = false;
     if (auto device = lookupDevice(handle)) {
         if (native != reinterpret_cast<uintptr_t>(&device->state))
             return false;
@@ -1256,6 +1282,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::openGLBackendDispatch() {
         deviceStateForBackend,
         createBuffer,
         uploadBuffer,
+        uploadBufferRanges,
         downloadBuffer,
         destroyBuffer,
         isBufferValid,

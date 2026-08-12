@@ -167,7 +167,7 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
     invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
     invocation.vertex_count = 3;
     invocation.instance_count = 1;
-    const VernonStatus invokeStatus = vernonRuntimePipelineInvoke(pipeline, &invocation);
+    const VernonStatus invokeStatus = vernon::tests::completeSubmission(pipeline, &invocation);
     expectRuntimeOk(runtime, invokeStatus);
     ASSERT_EQ(invokeStatus, VERNON_STATUS_OK);
 

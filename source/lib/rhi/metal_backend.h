@@ -70,6 +70,8 @@ struct VERNON_RHI_CAPI DeviceState {
     bool createBuffer(Buffer &buffer, const VernonRhiBufferDescriptor &descriptor, std::string &error);
     void destroyBuffer(Buffer &buffer);
     bool uploadBuffer(const Buffer &buffer, uint64_t offset, const void *source, uint64_t size, std::string &error);
+    bool uploadBufferRanges(const Buffer &buffer, const VernonRhiBufferUploadRange *ranges, size_t rangeCount,
+                            std::string &error);
     bool downloadBuffer(const Buffer &buffer, uint64_t offset, void *destination, uint64_t size, std::string &error);
 
     bool createImage(Image &image, const VernonRhiImageDescriptor &descriptor, std::string &error);
