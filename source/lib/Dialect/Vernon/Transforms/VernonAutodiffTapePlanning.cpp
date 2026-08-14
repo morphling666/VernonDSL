@@ -14,6 +14,8 @@
 namespace mlir::vernon {
 namespace {
 
+constexpr uint64_t kMaximumRematerializationCost = 8;
+
 FailureOr<uint64_t> checkedAdd(uint64_t left, uint64_t right) {
     if (left > std::numeric_limits<uint64_t>::max() - right)
         return failure();
@@ -140,6 +142,55 @@ struct RecordBuilder {
     }
 };
 
+uint64_t estimateRematerializationCost(Operation *operation) {
+    if (operation->hasTrait<OpTrait::ConstantLike>())
+        return 0;
+    const StringRef name = operation->getName().getStringRef();
+    if (name == "arith.divf" || name == "arith.divsi" || name == "arith.divui" || name == "arith.remf" ||
+        name == "arith.remsi" || name == "arith.remui")
+        return 4;
+    return 1;
+}
+
+bool isRematerializableDialect(Operation *operation) {
+    const StringRef dialect = operation->getName().getDialectNamespace();
+    return dialect == "arith" || dialect == "index" || dialect == "tensor" ||
+           isa<TupleCreateOp, TupleGetOp, StructCreateOp, StructGetOp>(operation);
+}
+
+FailureOr<AdRematerializationRecipe> buildRematerializationRecipe(Value value, func::FuncOp function) {
+    AdRematerializationRecipe recipe;
+    recipe.value = value;
+    DenseSet<Operation *> planned;
+    DenseSet<Value> visiting;
+    auto visit = [&](Value current, auto &self) -> LogicalResult {
+        if (auto argument = dyn_cast<BlockArgument>(current)) {
+            auto owner = dyn_cast_or_null<func::FuncOp>(argument.getOwner()->getParentOp());
+            return success(owner && owner == function && owner.getArgAttr(argument.getArgNumber(), kBuiltinAttrName));
+        }
+        Operation *defining = current.getDefiningOp();
+        if (!defining || defining->getNumRegions() != 0 ||
+            classifyAutodiffEffect(defining) != AutodiffEffectKind::Pure || !isRematerializableDialect(defining))
+            return failure();
+        if (!visiting.insert(current).second)
+            return failure();
+        for (Value operand : defining->getOperands())
+            if (failed(self(operand, self)))
+                return failure();
+        visiting.erase(current);
+        if (!planned.insert(defining).second)
+            return success();
+        FailureOr<uint64_t> cost = checkedAdd(recipe.estimatedCost, estimateRematerializationCost(defining));
+        if (failed(cost) || *cost > kMaximumRematerializationCost)
+            return failure();
+        recipe.estimatedCost = *cost;
+        recipe.operations.push_back(defining);
+        return success();
+    };
+    return succeeded(visit(value, visit)) ? FailureOr<AdRematerializationRecipe>(std::move(recipe))
+                                          : FailureOr<AdRematerializationRecipe>(failure());
+}
+
 } // namespace
 
 FailureOr<AutodiffTapeLayout> planAutodiffTapeLayout(ArrayRef<AutodiffTapeSlot> slots, uint64_t prefixSize,
@@ -171,6 +222,180 @@ FailureOr<AutodiffTapeLayout> planAutodiffTapeLayout(ArrayRef<AutodiffTapeSlot> 
     return result;
 }
 
+FailureOr<AdBufferAssignment> assignAdMemoryBuffers(ArrayRef<AdResidualInterval> residuals) {
+    struct ReusableBuffer {
+        unsigned physicalBuffer{};
+        uint64_t availableAfter{};
+    };
+    AdBufferAssignment result;
+    result.residualSlices.resize(residuals.size());
+    SmallVector<unsigned> order;
+    order.reserve(residuals.size());
+    for (auto [index, residual] : llvm::enumerate(residuals)) {
+        if (residual.rematerialized)
+            continue;
+        if (!residual.byteSize || !residual.alignment || !llvm::isPowerOf2_64(residual.alignment) ||
+            residual.lifetimeEnd < residual.lifetimeBegin)
+            return failure();
+        FailureOr<unsigned> residualIndex = checkedUnsigned(index);
+        if (failed(residualIndex))
+            return failure();
+        order.push_back(*residualIndex);
+    }
+    llvm::sort(order, [&](unsigned left, unsigned right) {
+        if (residuals[left].lifetimeBegin != residuals[right].lifetimeBegin)
+            return residuals[left].lifetimeBegin < residuals[right].lifetimeBegin;
+        if (residuals[left].byteSize != residuals[right].byteSize)
+            return residuals[left].byteSize > residuals[right].byteSize;
+        return left < right;
+    });
+
+    SmallVector<ReusableBuffer> reusable;
+    for (unsigned residualIndex : order) {
+        const AdResidualInterval &residual = residuals[residualIndex];
+        ReusableBuffer *selected = nullptr;
+        for (ReusableBuffer &candidate : reusable) {
+            AdPhysicalBuffer &physical = result.physicalBuffers[candidate.physicalBuffer];
+            if (candidate.availableAfter > residual.lifetimeBegin || physical.domain != residual.domain ||
+                physical.byteSize < residual.byteSize)
+                continue;
+            if (!selected || physical.byteSize < result.physicalBuffers[selected->physicalBuffer].byteSize)
+                selected = &candidate;
+        }
+        if (!selected) {
+            FailureOr<unsigned> physicalBuffer = checkedUnsigned(result.physicalBuffers.size());
+            if (failed(physicalBuffer))
+                return failure();
+            result.physicalBuffers.push_back({residual.domain, 0, residual.byteSize, residual.alignment});
+            reusable.push_back({*physicalBuffer, residual.lifetimeEnd});
+            selected = &reusable.back();
+        } else {
+            selected->availableAfter = residual.lifetimeEnd;
+            result.physicalBuffers[selected->physicalBuffer].alignment =
+                std::max(result.physicalBuffers[selected->physicalBuffer].alignment, residual.alignment);
+        }
+        result.residualSlices[residualIndex] = {selected->physicalBuffer, 0, residual.byteSize};
+    }
+
+    auto domainIndex = [](AdMemoryDomain domain) -> size_t {
+        switch (domain) {
+        case AdMemoryDomain::PersistentResidual:
+            return 0;
+        case AdMemoryDomain::TransientGradient:
+            return 1;
+        case AdMemoryDomain::GraphCheckpoint:
+            return 2;
+        case AdMemoryDomain::ForwardEffectShadow:
+            return 3;
+        }
+        llvm_unreachable("unknown autodiff memory domain");
+    };
+    for (AdPhysicalBuffer &physical : result.physicalBuffers) {
+        uint64_t &cursor = result.peakBytesByDomain[domainIndex(physical.domain)];
+        FailureOr<uint64_t> offset = checkedAlign(cursor, physical.alignment);
+        if (failed(offset))
+            return failure();
+        FailureOr<uint64_t> end = checkedAdd(*offset, physical.byteSize);
+        if (failed(end))
+            return failure();
+        physical.offset = *offset;
+        cursor = *end;
+    }
+    for (AdBufferSlice &slice : result.residualSlices)
+        if (slice.physicalBuffer != std::numeric_limits<unsigned>::max())
+            slice.offset = result.physicalBuffers[slice.physicalBuffer].offset;
+    for (uint64_t bytes : result.peakBytesByDomain) {
+        FailureOr<uint64_t> peak = checkedAdd(result.peakBytes, bytes);
+        if (failed(peak))
+            return failure();
+        result.peakBytes = *peak;
+    }
+    return result;
+}
+
+FailureOr<AdBudgetedBufferAssignment>
+assignAdMemoryBuffersWithinBudget(ArrayRef<AdResidualInterval> residuals,
+                                  ArrayRef<AdRematerializationCandidate> candidates, uint64_t budgetBytes) {
+    struct ScoredCandidate {
+        unsigned index{};
+        uint64_t savedBytes{};
+        uint64_t cost{};
+    };
+
+    SmallVector<AdResidualInterval> working(residuals);
+    FailureOr<AdBufferAssignment> initial = assignAdMemoryBuffers(working);
+    if (failed(initial))
+        return failure();
+
+    AdBudgetedBufferAssignment result;
+    result.buffers = std::move(*initial);
+    result.selectedCandidates.resize(candidates.size(), false);
+    SmallVector<ScoredCandidate> order;
+    order.reserve(candidates.size());
+    DenseSet<unsigned> candidateOwners;
+    for (auto [candidateIndex, candidate] : llvm::enumerate(candidates)) {
+        FailureOr<unsigned> checkedIndex = checkedUnsigned(candidateIndex);
+        if (failed(checkedIndex) || candidate.residualIndices.empty())
+            return failure();
+        DenseSet<unsigned> unique;
+        uint64_t savedBytes = 0;
+        for (unsigned residualIndex : candidate.residualIndices) {
+            if (residualIndex >= working.size() || !unique.insert(residualIndex).second ||
+                !candidateOwners.insert(residualIndex).second)
+                return failure();
+            if (working[residualIndex].rematerialized)
+                continue;
+            FailureOr<uint64_t> total = checkedAdd(savedBytes, working[residualIndex].byteSize);
+            if (failed(total))
+                return failure();
+            savedBytes = *total;
+        }
+        order.push_back({*checkedIndex, savedBytes, candidate.recomputationCost});
+    }
+    llvm::stable_sort(order, [](const ScoredCandidate &left, const ScoredCandidate &right) {
+        const long double leftScore = static_cast<long double>(left.savedBytes) / std::max<uint64_t>(left.cost, 1);
+        const long double rightScore = static_cast<long double>(right.savedBytes) / std::max<uint64_t>(right.cost, 1);
+        if (leftScore != rightScore)
+            return leftScore > rightScore;
+        if (left.cost != right.cost)
+            return left.cost < right.cost;
+        return left.index < right.index;
+    });
+
+    for (const ScoredCandidate &scored : order) {
+        if (result.buffers.peakBytes <= budgetBytes)
+            break;
+        const AdRematerializationCandidate &candidate = candidates[scored.index];
+        SmallVector<unsigned> changed;
+        for (unsigned residualIndex : candidate.residualIndices)
+            if (!working[residualIndex].rematerialized) {
+                working[residualIndex].rematerialized = true;
+                working[residualIndex].recomputationCost = candidate.recomputationCost;
+                changed.push_back(residualIndex);
+            }
+        if (changed.empty())
+            continue;
+        FailureOr<AdBufferAssignment> assignment = assignAdMemoryBuffers(working);
+        if (failed(assignment))
+            return failure();
+        if (assignment->peakBytes >= result.buffers.peakBytes) {
+            for (unsigned residualIndex : changed) {
+                working[residualIndex].rematerialized = false;
+                working[residualIndex].recomputationCost = 0;
+            }
+            continue;
+        }
+        FailureOr<uint64_t> cost = checkedAdd(result.recomputationCost, candidate.recomputationCost);
+        if (failed(cost))
+            return failure();
+        result.recomputationCost = *cost;
+        result.selectedCandidates[scored.index] = true;
+        result.buffers = std::move(*assignment);
+    }
+    return result.buffers.peakBytes <= budgetBytes ? FailureOr<AdBudgetedBufferAssignment>(std::move(result))
+                                                   : FailureOr<AdBudgetedBufferAssignment>(failure());
+}
+
 FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const VernonAutodiffAnalysisResult &analysis,
                                                    const VernonAutodiffRuleRegistry &registry) {
     ModuleOp module = function->getParentOfType<ModuleOp>();
@@ -188,6 +413,17 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
         return failure();
 
     VernonAutodiffTapePlan plan;
+    SmallVector<AdResidualInterval> residuals;
+    SmallVector<AdRematerializationRecipe> rematerializations;
+    DenseMap<Operation *, uint64_t> operationOrder;
+    for (auto [index, activity] : llvm::enumerate(analysis.getOperations()))
+        operationOrder.try_emplace(activity.operation, static_cast<uint64_t>(index));
+    const uint64_t scheduleLength = static_cast<uint64_t>(analysis.getOperations().size());
+    FailureOr<uint64_t> reverseScheduleEnd = checkedMultiply(scheduleLength, 2);
+    if (failed(reverseScheduleEnd)) {
+        function.emitError("autodiff residual schedule length overflows");
+        return failure();
+    }
     DenseMap<Operation *, unsigned> regionPlanIndices;
     DenseMap<unsigned, unsigned> sourceToPlanIndex;
     for (const AutodiffRegion &source : analysis.getRegions()) {
@@ -304,10 +540,42 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
     };
 
     RecordBuilder invocationBuilder;
-    // The planner's current storage policy is intentionally conservative:
-    // save every semantic requirement declared by a rule. A future
-    // recomputation policy belongs here, but must also produce a materialization
-    // recipe instead of silently dropping a required primal.
+    DenseSet<Value> plannedRequirements;
+    DenseSet<Value> plannedResidualValues;
+    auto appendResidualIntervals = [&](Value value, const ValueAbiLayout &layout, uint64_t lifetimeEnd,
+                                       bool rematerialized, uint64_t recomputationCost,
+                                       Operation *diagnostic) -> LogicalResult {
+        if (!plannedResidualValues.insert(value).second) {
+            for (AdResidualInterval &residual : residuals) {
+                if (residual.value != value)
+                    continue;
+                residual.lifetimeEnd = std::max(residual.lifetimeEnd, lifetimeEnd);
+                if (!rematerialized) {
+                    residual.rematerialized = false;
+                    residual.recomputationCost = 0;
+                }
+            }
+            if (!rematerialized)
+                llvm::erase_if(rematerializations,
+                               [&](const AdRematerializationRecipe &recipe) { return recipe.value == value; });
+            return success();
+        }
+        const uint64_t lifetimeBegin =
+            value.getDefiningOp() ? operationOrder.lookup(value.getDefiningOp()) : uint64_t{0};
+        for (auto [leafIndex, leaf] : llvm::enumerate(layout.leaves)) {
+            FailureOr<unsigned> abiLeafIndex = checkedUnsigned(leafIndex);
+            const uint64_t scalarSize = std::max<uint64_t>(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1);
+            FailureOr<uint64_t> byteSize = checkedMultiply(scalarSize, leaf.scalarCount);
+            if (failed(abiLeafIndex) || failed(byteSize)) {
+                diagnostic->emitError("autodiff residual layout metadata overflows");
+                return failure();
+            }
+            residuals.push_back(AdResidualInterval{value, *abiLeafIndex, AdMemoryDomain::PersistentResidual, *byteSize,
+                                                   scalarSize, lifetimeBegin, lifetimeEnd, rematerialized,
+                                                   rematerialized ? recomputationCost : uint64_t{0}});
+        }
+        return success();
+    };
     for (const AutodiffOperationActivity &activity : analysis.getOperations()) {
         Operation *operation = activity.operation;
         if (!activity.active)
@@ -315,19 +583,41 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
         const DifferentiationRule *rule = registry.lookup(operation);
         if (!rule)
             continue;
+        SmallVector<unsigned> activeOperands;
+        for (auto [operandIndex, operand] : llvm::enumerate(operation->getOperands()))
+            if (analysis.isActive(operand, 0))
+                activeOperands.push_back(static_cast<unsigned>(operandIndex));
         for (const AutodiffPrimalRequirement &requirement : rule->getVjpPrimalRequirements()) {
+            if (!requirement.isRequiredFor(activeOperands))
+                continue;
             Value value = requirement.kind == AutodiffPrimalKind::Operand ? operation->getOperand(requirement.index)
                                                                           : operation->getResult(requirement.index);
+            if (!plannedRequirements.insert(value).second)
+                continue;
             std::optional<unsigned> owner = owningRegion(value);
             RecordBuilder &builder = owner ? regionBuilders[*owner] : invocationBuilder;
             const ValueAbiLayout *layout = analysis.getValueAbi(value);
-            if (!layout || failed(builder.add(value, *layout))) {
+            if (!layout) {
                 operation->emitError("cannot lay out a rule-required primal value on the autodiff tape");
                 return failure();
             }
+            FailureOr<AdRematerializationRecipe> recipe = buildRematerializationRecipe(value, function);
+            const bool rematerialized = succeeded(recipe);
+            if (!rematerialized && failed(builder.add(value, *layout))) {
+                operation->emitError("cannot lay out a rule-required primal value on the autodiff tape");
+                return failure();
+            }
+            const uint64_t lifetimeEnd =
+                *reverseScheduleEnd - std::min(scheduleLength, operationOrder.lookup(operation));
+            if (failed(appendResidualIntervals(value, *layout, lifetimeEnd, rematerialized,
+                                               rematerialized ? recipe->estimatedCost : uint64_t{0}, operation)))
+                return failure();
+            if (rematerialized)
+                rematerializations.push_back(std::move(*recipe));
         }
     }
-    auto saveIndexSource = [&](Value index, RecordBuilder &builder, auto &self) -> LogicalResult {
+    auto saveIndexSource = [&](Value index, RecordBuilder &builder, uint64_t lifetimeEnd, Operation *diagnostic,
+                               auto &self) -> LogicalResult {
         if (index.getDefiningOp<arith::ConstantOp>() || index.getDefiningOp<arith::ConstantIndexOp>())
             return success();
         if (auto argument = dyn_cast<BlockArgument>(index)) {
@@ -337,17 +627,22 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
         }
         if (index.getType().isIntOrFloat()) {
             const ValueAbiLayout *layout = analysis.getValueAbi(index);
-            if (layout)
-                return builder.add(index, *layout);
+            if (layout) {
+                if (failed(builder.add(index, *layout)))
+                    return failure();
+                return appendResidualIntervals(index, *layout, lifetimeEnd, false, 0, diagnostic);
+            }
             FailureOr<ValueAbiLayout> canonical =
                 getValueAbiLayout(index.getType(), function->getParentOfType<ModuleOp>());
-            return succeeded(canonical) ? builder.add(index, *canonical) : failure();
+            if (failed(canonical) || failed(builder.add(index, *canonical)))
+                return failure();
+            return appendResidualIntervals(index, *canonical, lifetimeEnd, false, 0, diagnostic);
         }
         Operation *defining = index.getDefiningOp();
         if (!defining || defining->getNumRegions() != 0)
             return failure();
         for (Value operand : defining->getOperands())
-            if (failed(self(operand, builder, self)))
+            if (failed(self(operand, builder, lifetimeEnd, diagnostic, self)))
                 return failure();
         return success();
     };
@@ -365,8 +660,10 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
             continue;
         std::optional<unsigned> owner = indices.empty() ? std::nullopt : owningRegion(indices.front());
         RecordBuilder &builder = owner ? regionBuilders[*owner] : invocationBuilder;
+        const uint64_t lifetimeEnd =
+            *reverseScheduleEnd - std::min(scheduleLength, operationOrder.lookup(activity.operation));
         for (Value index : indices)
-            if (failed(saveIndexSource(index, builder, saveIndexSource))) {
+            if (failed(saveIndexSource(index, builder, lifetimeEnd, activity.operation, saveIndexSource))) {
                 activity.operation->emitError("cannot save a dynamic index in the canonical tape layout");
                 return failure();
             }
@@ -399,6 +696,15 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
         return failure();
     }
     plan.staticTapeBytesHint = *hint;
+    plan.memoryPlan.residuals = std::move(residuals);
+    plan.memoryPlan.rematerializations = std::move(rematerializations);
+    FailureOr<AdBufferAssignment> assignment = assignAdMemoryBuffers(plan.memoryPlan.residuals);
+    if (failed(assignment)) {
+        function.emitError("autodiff residual buffer assignment failed");
+        return failure();
+    }
+    plan.memoryPlan.bufferAssignment = std::move(*assignment);
+    plan.memoryPlan.estimatedPersistentBytes = *hint;
     return plan;
 }
 

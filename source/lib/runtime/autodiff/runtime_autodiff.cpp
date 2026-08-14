@@ -1,5 +1,6 @@
 #include "runtime_autodiff_internal.h"
 
+#include "host_tape_allocator.h"
 #include "runtime/runtime_state.h"
 #include "runtime_direct_autodiff.h"
 
@@ -181,7 +182,8 @@ bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffVariant
         invocationDiagnostic(*bundle.context) = "CPU autodiff requires the dynamic_v2 protocol";
         return false;
     }
-    const bool resolved = createCpuExecutable(*bundle.context, forward, backward, gradientPaths, executable);
+    const bool resolved = createCpuExecutable(*bundle.context, forward, backward, gradientPaths,
+                                              profiles.staticTapeBytesHint, executable);
     if (!resolved)
         return false;
     if (!validateDerivativeGroupsAgainstSignature(*bundle.context, bundle.autodiff->derivativeGroups,
@@ -236,6 +238,18 @@ bool vernon::runtime::hasAutodiffStorageObjectives(const VernonLoadedPipeline *p
 
 VernonLaunchSize vernon::runtime::autodiffWorkgroupSize(const VernonLoadedPipeline *pipeline) {
     return pipeline ? pipeline->workgroupSize : VernonLaunchSize{};
+}
+
+vernon::runtime::AutodiffPullbackMemoryUsage
+vernon::runtime::autodiffPullbackMemoryUsage(const VernonPullback *pullback) {
+    if (!pullback || !pullback->execution)
+        return {};
+    const ad::PullbackMemoryUsage usage = pullback->execution->memoryUsage();
+    return {usage.logicalResidualBytes, usage.residentBytes, usage.allocatedBytes};
+}
+
+size_t vernon::runtime::autodiffHostTapeContextLimit(const VernonRuntimeContext *context) {
+    return context && context->cpuTapePolicy ? context->cpuTapePolicy->contextLimit() : 0;
 }
 
 extern "C" {

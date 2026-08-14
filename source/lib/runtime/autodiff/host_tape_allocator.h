@@ -3,12 +3,13 @@
 
 #include "runtime/autodiff/tape_allocator_abi.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <unordered_map>
+#include <type_traits>
 #include <vector>
 
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION
@@ -20,6 +21,71 @@ namespace vernon::runtime::ad {
 
 inline constexpr size_t kDefaultHostTapeInvocationLimit = 64u * 1024u * 1024u;
 inline constexpr size_t kDefaultHostTapeContextLimit = 256u * 1024u * 1024u;
+
+namespace detail {
+struct HostTapeRegion {
+    VernonAdRegionHandle handle{};
+    VernonAdRegionHandle parent{};
+    size_t firstRecordIndex{std::numeric_limits<size_t>::max()};
+    size_t lastRecordIndex{std::numeric_limits<size_t>::max()};
+    size_t recordOffset{};
+    size_t recordCount{};
+    size_t executedCount{};
+    uint32_t exitKind{};
+    bool open{};
+    bool ended{};
+};
+
+struct HostTapeRecord {
+    VernonAdRecordHandle handle{};
+    size_t regionIndex{};
+    size_t payloadOffset{};
+    size_t payloadSize{};
+    size_t childOffset{};
+    size_t childCount{};
+    size_t nextRegionRecordIndex{std::numeric_limits<size_t>::max()};
+};
+
+struct HostTapeSnapshotRegion {
+    size_t recordOffset{};
+    size_t recordCount{};
+    size_t executedCount{};
+    uint32_t exitKind{};
+};
+
+struct HostTapeSnapshotRecord {
+    size_t payloadOffset{};
+    size_t payloadSize{};
+    size_t childOffset{};
+    size_t childCount{};
+};
+} // namespace detail
+
+inline constexpr uint32_t kHostTapePageLayoutVersion = 1;
+static_assert(std::is_standard_layout_v<detail::HostTapeSnapshotRegion>);
+static_assert(std::is_trivially_copyable_v<detail::HostTapeSnapshotRegion>);
+static_assert(offsetof(detail::HostTapeSnapshotRegion, recordOffset) == 0);
+static_assert(offsetof(detail::HostTapeSnapshotRegion, recordCount) == sizeof(size_t));
+static_assert(offsetof(detail::HostTapeSnapshotRegion, executedCount) == 2 * sizeof(size_t));
+static_assert(offsetof(detail::HostTapeSnapshotRegion, exitKind) == 3 * sizeof(size_t));
+static_assert(sizeof(detail::HostTapeSnapshotRegion) == 4 * sizeof(size_t));
+static_assert(std::is_standard_layout_v<detail::HostTapeSnapshotRecord>);
+static_assert(std::is_trivially_copyable_v<detail::HostTapeSnapshotRecord>);
+static_assert(offsetof(detail::HostTapeSnapshotRecord, payloadOffset) == 0);
+static_assert(offsetof(detail::HostTapeSnapshotRecord, payloadSize) == sizeof(size_t));
+static_assert(offsetof(detail::HostTapeSnapshotRecord, childOffset) == 2 * sizeof(size_t));
+static_assert(offsetof(detail::HostTapeSnapshotRecord, childCount) == 3 * sizeof(size_t));
+static_assert(sizeof(detail::HostTapeSnapshotRecord) == 4 * sizeof(size_t));
+
+inline constexpr size_t kHostTapeRegionResidentBytes = sizeof(detail::HostTapeRegion) + sizeof(size_t);
+inline constexpr size_t kHostTapeRecordResidentBytes = sizeof(detail::HostTapeRecord) + sizeof(size_t);
+inline constexpr size_t kHostTapeSnapshotRegionResidentBytes = sizeof(detail::HostTapeSnapshotRegion);
+inline constexpr size_t kHostTapeSnapshotRecordResidentBytes = sizeof(detail::HostTapeSnapshotRecord);
+
+struct HostTapeMemoryUsage {
+    size_t currentBytes{};
+    size_t peakBytes{};
+};
 
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION
 struct HostTapeTraversalMetrics {
@@ -51,6 +117,9 @@ VernonStatus withHostTapeTraversalMetrics(HostTapeTraversalMetrics *destination,
 #endif
 
 class HostTapeDispatchBudget;
+class HostDynamicTapeBatch;
+class HostStaticTapeBatch;
+bool hostStaticTapeBatchPureStaticBytes(size_t laneCount, size_t payloadStride, size_t &result);
 
 class HostTapeMemoryPolicy {
 public:
@@ -60,22 +129,24 @@ public:
 
     size_t invocationLimit() const { return invocationLimit_; }
     size_t contextLimit() const { return contextLimit_; }
+    HostTapeMemoryUsage usage() const;
 
 private:
-    friend class HostDynamicTape;
-    friend class HostTapeSnapshot;
+    friend class HostDynamicTapeBatch;
+    friend class HostStaticTapeBatch;
     friend class HostTapeDispatchBudget;
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION
     friend size_t hostTapeMemoryPolicyChargedBytesForTesting(HostTapeMemoryPolicy &policy);
 #endif
 
-    bool reserve(size_t currentInvocationBytes, size_t additionalBytes);
+    bool reserveContext(size_t additionalBytes);
     void release(size_t bytes);
 
     mutable std::mutex mutex_;
     size_t invocationLimit_;
     size_t contextLimit_;
     size_t contextBytes_{};
+    size_t peakContextBytes_{};
 };
 
 class HostTapeDispatchBudget {
@@ -86,14 +157,16 @@ public:
 
     size_t capacity() const { return capacity_; }
     size_t usedBytes() const;
+    HostTapeMemoryUsage usage() const;
+    bool reserveTransientBytes(size_t bytes) { return reserveBytes(bytes); }
+    void releaseTransientBytes(size_t bytes) { releaseBytes(bytes); }
     void commit();
 
 private:
     HostTapeDispatchBudget(std::shared_ptr<HostTapeMemoryPolicy> policy, size_t capacity)
         : policy_(std::move(policy)), capacity_(capacity) {}
 
-    friend class HostDynamicTape;
-    friend class HostTapeSnapshot;
+    friend class HostDynamicTapeBatch;
 
     bool reserveBytes(size_t additionalBytes);
     void releaseBytes(size_t bytes);
@@ -102,98 +175,135 @@ private:
     mutable std::mutex mutex_;
     size_t capacity_{};
     size_t usedBytes_{};
-    size_t policyCharge_{};
+    size_t peakUsedBytes_{};
     bool committed_{};
 };
 
-class HostTapeSnapshot {
+class HostDynamicTapeBatch {
 public:
-    ~HostTapeSnapshot();
+    HostDynamicTapeBatch(size_t laneCount, size_t invocationCapacity, std::shared_ptr<HostTapeMemoryPolicy> policy,
+                         std::shared_ptr<HostTapeDispatchBudget> dispatchBudget);
+    ~HostDynamicTapeBatch();
 
-    VernonAdTapeAllocator *descriptor() const { return &descriptor_; }
-    VernonAdRegionHandle rootRegion() const;
+    HostDynamicTapeBatch(const HostDynamicTapeBatch &) = delete;
+    HostDynamicTapeBatch &operator=(const HostDynamicTapeBatch &) = delete;
+
+    VernonAdTapeAllocatorStatus reset(size_t lane);
+    VernonAdTapeAllocatorStatus beginRegion(size_t lane, VernonAdRegionHandle parent, VernonAdRegionHandle *region);
+    VernonAdTapeAllocatorStatus reserveRecord(size_t lane, VernonAdRegionHandle region, size_t payloadSize,
+                                              size_t payloadAlignment, size_t childCount, VernonAdRecordHandle *record);
+    VernonAdTapeAllocatorStatus writeLeaf(size_t lane, VernonAdRecordHandle record, size_t leafOffset, const void *data,
+                                          size_t byteSize);
+    VernonAdTapeAllocatorStatus setChild(size_t lane, VernonAdRecordHandle record, size_t childOrdinal,
+                                         VernonAdRegionHandle child);
+    VernonAdTapeAllocatorStatus endRegion(size_t lane, VernonAdRegionHandle region, size_t executedCount,
+                                          uint32_t exitKind);
+    VernonAdTapeAllocatorStatus seal(size_t lane);
+    VernonAdTapeAllocatorStatus status(size_t lane) const;
+    size_t requiredBytes(size_t lane) const;
+
+    bool compact();
+    bool isCompacted() const;
+    VernonAdRegionHandle rootRegion(size_t lane) const;
+    VernonAdTapeAllocatorStatus readLeaf(size_t lane, VernonAdRegionHandle region, size_t recordIndex,
+                                         size_t leafOffset, void *data, size_t byteSize) const;
+    VernonAdTapeAllocatorStatus readChild(size_t lane, VernonAdRegionHandle region, size_t recordIndex,
+                                          size_t childOrdinal, VernonAdRegionHandle *child) const;
+    VernonAdTapeAllocatorStatus readCount(size_t lane, VernonAdRegionHandle region, size_t *count) const;
+    VernonAdTapeAllocatorStatus readExit(size_t lane, VernonAdRegionHandle region, uint32_t *exitKind) const;
+
+    size_t logicalBytes() const;
+    size_t residentBytes() const;
+    size_t allocatedBytes() const;
 
 private:
-    friend class HostDynamicTape;
-
-    struct Region {
-        VernonAdRegionHandle handle{};
-        std::vector<size_t> records;
-        size_t executedCount{};
-        uint32_t exitKind{};
-    };
-
-    struct Record {
-        VernonAdRecordHandle handle{};
-        size_t payloadOffset{};
-        size_t payloadSize{};
-        std::vector<VernonAdRegionHandle> children;
-    };
-
-    static VernonAdTapeAllocatorStatus reject(VernonAdTapeAllocator *allocator);
-    static VernonAdTapeAllocatorStatus rejectBegin(VernonAdTapeAllocator *allocator, VernonAdRegionHandle,
-                                                   VernonAdRegionHandle *);
-    static VernonAdTapeAllocatorStatus rejectReserve(VernonAdTapeAllocator *allocator, VernonAdRegionHandle, size_t,
-                                                     size_t, size_t, VernonAdRecordHandle *);
-    static VernonAdTapeAllocatorStatus rejectWrite(VernonAdTapeAllocator *allocator, VernonAdRecordHandle, size_t,
-                                                   const void *, size_t);
-    static VernonAdTapeAllocatorStatus rejectChild(VernonAdTapeAllocator *allocator, VernonAdRecordHandle, size_t,
-                                                   VernonAdRegionHandle);
-    static VernonAdTapeAllocatorStatus rejectEnd(VernonAdTapeAllocator *allocator, VernonAdRegionHandle, size_t,
-                                                 uint32_t);
-    static VernonAdTapeAllocatorStatus readLeaf(VernonAdTapeAllocator *allocator, VernonAdRegionHandle region,
-                                                size_t recordIndex, size_t leafOffset, void *data, size_t byteSize);
-    static VernonAdTapeAllocatorStatus readChild(VernonAdTapeAllocator *allocator, VernonAdRegionHandle region,
-                                                 size_t recordIndex, size_t childOrdinal, VernonAdRegionHandle *child);
-    static VernonAdTapeAllocatorStatus readExecutedCount(VernonAdTapeAllocator *allocator, VernonAdRegionHandle region,
-                                                         size_t *executedCount);
-    static VernonAdTapeAllocatorStatus readExitKind(VernonAdTapeAllocator *allocator, VernonAdRegionHandle region,
-                                                    uint32_t *exitKind);
-    void initializeDescriptor();
-    const Region *findRegion(VernonAdRegionHandle handle) const;
-
-    std::vector<std::byte> payload_;
-    std::vector<Region> regions_;
-    std::vector<Record> records_;
-    std::unordered_map<VernonAdRegionHandle, size_t> regionIndex_;
-    std::shared_ptr<HostTapeMemoryPolicy> policy_;
-    std::shared_ptr<HostTapeDispatchBudget> dispatchBudget_;
-    size_t policyCharge_{};
-    mutable VernonAdTapeAllocator descriptor_{};
+    class Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
-class HostDynamicTape {
+/// Dispatch-owned allocator for both straight-line and dynamic VJP profiles.
+/// Descriptors, lane state, and static payloads are contiguous. Dynamic lanes
+/// append to one shared arena and seal into one immutable batch.
+class HostStaticTapeBatch : public std::enable_shared_from_this<HostStaticTapeBatch> {
 public:
-    explicit HostDynamicTape(size_t capacityBytes = std::numeric_limits<size_t>::max(),
-                             std::shared_ptr<HostTapeMemoryPolicy> policy = std::make_shared<HostTapeMemoryPolicy>(),
-                             std::shared_ptr<HostTapeDispatchBudget> dispatchBudget = {});
-    ~HostDynamicTape();
+    class Reader {
+    public:
+        Reader() = default;
+        VernonAdTapeAllocator *descriptor() { return &descriptor_; }
+        VernonAdRegionHandle rootRegion() const;
 
-    HostDynamicTape(const HostDynamicTape &) = delete;
-    HostDynamicTape &operator=(const HostDynamicTape &) = delete;
+    private:
+        friend class HostStaticTapeBatch;
 
-    VernonAdTapeAllocator &descriptor() { return descriptor_; }
-    std::shared_ptr<const HostTapeSnapshot> takeSnapshot();
+        static VernonAdTapeAllocatorStatus reject(VernonAdTapeAllocator *allocator);
+        static VernonAdTapeAllocatorStatus rejectBegin(VernonAdTapeAllocator *allocator, VernonAdRegionHandle,
+                                                       VernonAdRegionHandle *);
+        static VernonAdTapeAllocatorStatus rejectReserve(VernonAdTapeAllocator *allocator, VernonAdRegionHandle, size_t,
+                                                         size_t, size_t, VernonAdRecordHandle *);
+        static VernonAdTapeAllocatorStatus rejectWrite(VernonAdTapeAllocator *allocator, VernonAdRecordHandle, size_t,
+                                                       const void *, size_t);
+        static VernonAdTapeAllocatorStatus rejectChild(VernonAdTapeAllocator *allocator, VernonAdRecordHandle, size_t,
+                                                       VernonAdRegionHandle);
+        static VernonAdTapeAllocatorStatus rejectEnd(VernonAdTapeAllocator *allocator, VernonAdRegionHandle, size_t,
+                                                     uint32_t);
+        static VernonAdTapeAllocatorStatus readLeaf(VernonAdTapeAllocator *allocator, VernonAdRegionHandle region,
+                                                    size_t recordIndex, size_t leafOffset, void *data, size_t byteSize);
+        static VernonAdTapeAllocatorStatus readChild(VernonAdTapeAllocator *allocator, VernonAdRegionHandle, size_t,
+                                                     size_t, VernonAdRegionHandle *);
+        static VernonAdTapeAllocatorStatus readCount(VernonAdTapeAllocator *allocator, VernonAdRegionHandle region,
+                                                     size_t *count);
+        static VernonAdTapeAllocatorStatus readExit(VernonAdTapeAllocator *allocator, VernonAdRegionHandle region,
+                                                    uint32_t *exitKind);
+        static Reader *owner(VernonAdTapeAllocator *allocator);
+
+        VernonAdTapeAllocator descriptor_{};
+        const HostStaticTapeBatch *batch_{};
+        size_t lane_{std::numeric_limits<size_t>::max()};
+        size_t laneCount_{};
+    };
+
+    static std::shared_ptr<HostStaticTapeBatch> create(size_t laneCount, size_t payloadStride,
+                                                       size_t invocationCapacity,
+                                                       std::shared_ptr<HostTapeMemoryPolicy> policy,
+                                                       std::shared_ptr<HostTapeDispatchBudget> dispatchBudget);
+    ~HostStaticTapeBatch();
+
+    HostStaticTapeBatch(const HostStaticTapeBatch &) = delete;
+    HostStaticTapeBatch &operator=(const HostStaticTapeBatch &) = delete;
+
+    size_t size() const { return laneCount_; }
+    VernonAdTapeAllocator *descriptor(size_t lane);
+    VernonAdRegionHandle rootRegion(size_t lane) const;
+    bool compact();
+    bool initializeReader(size_t lane, Reader &reader) const;
+    bool isCompacted() const { return compacted_; }
+    size_t logicalBytes() const;
+    size_t residentBytes() const;
+    size_t allocatedBytes() const;
 
 private:
-    struct Region {
-        VernonAdRegionHandle handle{};
-        VernonAdRegionHandle parent{};
-        std::vector<size_t> records;
+    friend bool hostStaticTapeBatchPureStaticBytes(size_t laneCount, size_t payloadStride, size_t &result);
+    enum class LanePhase : uint8_t {
+        Empty,
+        RegionOpen,
+        RecordOpen,
+        RegionEnded,
+        Sealed,
+        Promoted,
+    };
+
+    struct LaneState {
+        LanePhase phase{LanePhase::Empty};
+        size_t payloadSize{};
         size_t executedCount{};
         uint32_t exitKind{};
-        bool open{};
-        bool ended{};
     };
 
-    struct Record {
-        VernonAdRecordHandle handle{};
-        size_t regionIndex{};
-        size_t payloadOffset{};
-        size_t payloadSize{};
-        std::vector<VernonAdRegionHandle> children;
-    };
+    HostStaticTapeBatch(size_t laneCount, size_t payloadStride, size_t invocationCapacity,
+                        std::shared_ptr<HostTapeMemoryPolicy> policy,
+                        std::shared_ptr<HostTapeDispatchBudget> dispatchBudget);
 
+    static std::pair<HostStaticTapeBatch *, size_t> owner(VernonAdTapeAllocator *allocator);
     static VernonAdTapeAllocatorStatus reset(VernonAdTapeAllocator *allocator);
     static VernonAdTapeAllocatorStatus beginRegion(VernonAdTapeAllocator *allocator, VernonAdRegionHandle parent,
                                                    VernonAdRegionHandle *region);
@@ -207,33 +317,39 @@ private:
     static VernonAdTapeAllocatorStatus endRegion(VernonAdTapeAllocator *allocator, VernonAdRegionHandle region,
                                                  size_t executedCount, uint32_t exitKind);
     static VernonAdTapeAllocatorStatus seal(VernonAdTapeAllocator *allocator);
-    static VernonAdTapeAllocatorStatus readLeaf(VernonAdTapeAllocator *allocator, VernonAdRegionHandle, size_t, size_t,
-                                                void *, size_t);
-    static VernonAdTapeAllocatorStatus readChild(VernonAdTapeAllocator *allocator, VernonAdRegionHandle, size_t, size_t,
-                                                 VernonAdRegionHandle *);
-    static VernonAdTapeAllocatorStatus readCount(VernonAdTapeAllocator *allocator, VernonAdRegionHandle, size_t *);
-    static VernonAdTapeAllocatorStatus readExit(VernonAdTapeAllocator *allocator, VernonAdRegionHandle, uint32_t *);
+    static VernonAdTapeAllocatorStatus readLeaf(VernonAdTapeAllocator *allocator, VernonAdRegionHandle region,
+                                                size_t recordIndex, size_t leafOffset, void *data, size_t byteSize);
+    static VernonAdTapeAllocatorStatus readChild(VernonAdTapeAllocator *allocator, VernonAdRegionHandle region,
+                                                 size_t recordIndex, size_t childOrdinal, VernonAdRegionHandle *child);
+    static VernonAdTapeAllocatorStatus readCount(VernonAdTapeAllocator *allocator, VernonAdRegionHandle region,
+                                                 size_t *count);
+    static VernonAdTapeAllocatorStatus readExit(VernonAdTapeAllocator *allocator, VernonAdRegionHandle region,
+                                                uint32_t *exitKind);
 
-    static HostDynamicTape *owner(VernonAdTapeAllocator *allocator);
-    VernonAdTapeAllocatorStatus fail(VernonAdTapeAllocatorStatus status);
-    Region *findRegion(VernonAdRegionHandle handle);
-    Record *findRecord(VernonAdRecordHandle handle);
-    void releaseCharge();
+    VernonAdTapeAllocatorStatus fail(size_t lane, VernonAdTapeAllocatorStatus status);
+    HostDynamicTapeBatch *dynamicBatch() const { return dynamicBatchAddress_.load(std::memory_order_acquire); }
+    HostDynamicTapeBatch *ensureDynamicBatch();
+    VernonAdTapeAllocatorStatus promote(size_t lane, size_t payloadSize, size_t payloadAlignment, size_t childCount,
+                                        VernonAdRecordHandle *record);
+    VernonAdTapeAllocatorStatus syncDynamic(size_t lane, VernonAdTapeAllocatorStatus status);
+    std::byte *payload(size_t lane) { return payload_.data() + lane * payloadStride_; }
+    const std::byte *payload(size_t lane) const { return payload_.data() + lane * payloadStride_; }
 
-    VernonAdTapeAllocator descriptor_{};
-    mutable std::mutex mutex_;
+    std::vector<VernonAdTapeAllocator> descriptors_;
+    std::vector<LaneState> lanes_;
+    std::unique_ptr<HostDynamicTapeBatch> dynamicBatchOwner_;
+    std::atomic<HostDynamicTapeBatch *> dynamicBatchAddress_{};
+    std::once_flag dynamicBatchOnce_;
     std::vector<std::byte> payload_;
-    std::vector<Region> regions_;
-    std::vector<Record> records_;
-    std::unordered_map<VernonAdRegionHandle, size_t> regionIndex_;
-    std::unordered_map<VernonAdRecordHandle, size_t> recordIndex_;
-    std::vector<size_t> openRegions_;
+    std::vector<uint8_t> compactedLaneKinds_;
+    size_t laneCount_{};
+    size_t payloadStride_{};
+    size_t invocationCapacity_{};
     std::shared_ptr<HostTapeMemoryPolicy> policy_;
     std::shared_ptr<HostTapeDispatchBudget> dispatchBudget_;
-    VernonAdRegionHandle nextRegionHandle_{1};
-    VernonAdRecordHandle nextRecordHandle_{1};
     size_t policyCharge_{};
-    bool sealed_{};
+    size_t compactedLogicalBytes_{};
+    bool compacted_{};
 };
 
 } // namespace vernon::runtime::ad

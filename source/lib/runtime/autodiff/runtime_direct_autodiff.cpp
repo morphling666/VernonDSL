@@ -15,7 +15,7 @@ VernonLoadedPipeline *loadBackendCpuAutodiffPipeline(
     VernonStringView primalName, VernonCpuEntryPoint forwardEntry, VernonStringView forwardReflection,
     VernonStringView forwardName, VernonCpuEntryPoint backwardEntry, VernonStringView backwardReflection,
     VernonStringView backwardName, VernonStringView forwardProtocol, VernonStringView backwardProtocol,
-    const AutodiffDerivativeGroupView *groupViews, size_t derivativeGroupCount) {
+    const AutodiffDerivativeGroupView *groupViews, size_t derivativeGroupCount, uint64_t staticTapeBytesHint) {
     try {
         if (!groupViews || !derivativeGroupCount) {
             invocationDiagnostic(context) = "direct CPU autodiff requires derivative groups";
@@ -56,7 +56,7 @@ VernonLoadedPipeline *loadBackendCpuAutodiffPipeline(
         std::shared_ptr<ad::Executable> executable;
         if (!ad::createCpuEntryExecutable(context, forwardEntry, forwardReflection, forwardName, backwardEntry,
                                           backwardReflection, backwardName, forwardProtocol, backwardProtocol, paths,
-                                          executable)) {
+                                          staticTapeBytesHint, executable)) {
             std::string error = invocationDiagnostic(context);
             pipeline.reset();
             invocationDiagnostic(context) = std::move(error);

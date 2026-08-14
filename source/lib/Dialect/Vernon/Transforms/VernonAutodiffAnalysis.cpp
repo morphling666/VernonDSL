@@ -1196,13 +1196,10 @@ LogicalResult AutodiffAnalysisBuilder::classifyStorageOwnership() {
                 hasActiveLoad = true;
                 invocationOwned &= static_cast<bool>(proveInvocationOwnedIndex(storageIndices(effect.operation)));
             }
-            const ValueAbiLayout *layout = result.getValueAbi(identity.binding);
-            const bool hasAggregateLeaf =
-                layout && llvm::any_of(layout->leaves, [](const ValueAbiLeaf &leaf) { return !leaf.shape.empty(); });
             if (hasActiveLoad)
                 identity.externalGradientOwnership =
                     view.getAddressSpace() == "workgroup" ? AutodiffExternalGradientOwnership::WorkgroupShared
-                    : hasAggregateLeaf || invocationOwned ? AutodiffExternalGradientOwnership::InvocationPrivate
+                    : invocationOwned                     ? AutodiffExternalGradientOwnership::InvocationPrivate
                                                           : AutodiffExternalGradientOwnership::AtomicShared;
         }
         for (const AutodiffStorageEffect &effect : result.storageEffects) {

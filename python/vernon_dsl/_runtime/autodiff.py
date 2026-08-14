@@ -9,9 +9,8 @@ from ..ad import ProgramExpression
 from ..bundle import make_target_options
 from ..frontend.autodiff_profiles import DerivativeGroup
 from ..frontend.structured_vjp import build_structured_vjp
-from ..host_values import TangentLayout, tangent_layout
 from .kernel import Kernel, _session_state
-from .resources import TensorStorage, TensorView, _dispatch_borrow_scope
+from .resources import TensorStorage, TensorView, _dispatch_borrow_scope, _NativeBindingCache
 
 
 @dataclass
@@ -25,6 +24,9 @@ class _CompiledDirectVjp:
     forward_protocol: str
     backward_protocol: str
     derivative_groups: tuple[DerivativeGroup, ...]
+    tape_bytes_per_invocation: int
+    active_operation_count: int
+    recomputation_cost: int
     user_parameters: tuple[str, ...]
     pipeline: Any
     runtime_generation: int
@@ -51,108 +53,42 @@ class _StructuredPullback:
     cotangent_groups: tuple[DerivativeGroup, ...]
     bindings: dict[str, Any]
     carrier_shape: tuple[int, ...]
+    estimated_tape_bytes: int
+    active_operation_count: int
+    recomputation_cost: int
 
-    def _single_storage_cotangent(self, group: DerivativeGroup, value: TensorStorage) -> Any:
-        primal = self.bindings[group.parameter_root]
-        if not isinstance(primal, (TensorStorage, TensorView)):
-            raise TypeError(f"output cotangent '{group.declared_path}' is not Storage-backed")
-        if not isinstance(value.element_layout, TangentLayout):
-            raise TypeError(f"output cotangent '{group.declared_path}' requires packed tangent TensorStorage")
-        expected_shape = (*self.carrier_shape, *primal.shape)
-        primal_dtype = TensorStorage._dtype(value.element_layout.primal_element_type)
-        if primal_dtype != primal.dtype or value.shape != expected_shape:
-            raise ValueError(
-                f"output cotangent '{group.declared_path}' has an incompatible tangent dtype or owner shape"
-            )
-        if not isinstance(primal, TensorView):
-            return value.to_numpy()
-        projection = value._tangent_view(
-            "",
-            shape=expected_shape,
-            strides=(
-                *tuple(
-                    stride // value.element_layout.size for stride in value._array.strides[: len(self.carrier_shape)]
-                ),
-                *primal._strides,
-            ),
-            offset=primal._offset,
-            access="read",
-        )
-        return projection.to_numpy()
+    @property
+    def logical_residual_bytes(self) -> int:
+        return int(self.native.logical_residual_bytes)
 
-    def _packed_cotangent(self, group: DerivativeGroup, value: Any) -> dict[str, Any]:
-        primal = self.bindings[group.parameter_root]
-        owner = primal.owner if isinstance(primal, TensorView) else primal
-        if not isinstance(value, TensorStorage) or not isinstance(value.element_layout, TangentLayout):
-            raise TypeError(f"output cotangent '{group.declared_path}' requires packed tangent TensorStorage")
-        if not isinstance(owner, TensorStorage) or owner._element_type is None:
-            raise TypeError(f"output cotangent '{group.declared_path}' is not aggregate Storage")
-        expected = tangent_layout(owner._element_type)
-        expected_shape = (*self.carrier_shape, *owner.shape)
-        if value.element_layout.layout_hash != expected.layout_hash or value.shape != expected_shape:
-            raise ValueError(
-                f"output cotangent '{group.declared_path}' has an incompatible tangent layout or owner shape"
-            )
-        packed: dict[str, Any] = {}
-        for leaf_path in group.leaf_paths:
-            suffix = leaf_path[len(group.parameter_root) + 1 :] if leaf_path != group.parameter_root else ""
-            projection = (
-                value._tangent_view(
-                    suffix,
-                    shape=(*self.carrier_shape, *primal.shape),
-                    strides=(
-                        *tuple(
-                            stride // value.element_layout.size
-                            for stride in value._array.strides[: len(self.carrier_shape)]
-                        ),
-                        *primal._strides,
-                    ),
-                    offset=primal._offset,
-                    access="read",
-                )
-                if isinstance(primal, TensorView)
-                else value[suffix]
-            )
-            packed[leaf_path] = projection.to_numpy()
-        return packed
+    @property
+    def resident_tape_bytes(self) -> int:
+        return int(self.native.resident_bytes)
+
+    @property
+    def allocated_tape_bytes(self) -> int:
+        return int(self.native.allocated_bytes)
+
+    @property
+    def recomputation_factor(self) -> float:
+        return 1.0 + self.recomputation_cost / max(self.active_operation_count, 1)
 
     def __call__(self, cotangent: Any = None) -> dict[str, Any]:
-        if cotangent is None:
-            native_cotangent = None
-        else:
-            supplied = (
-                cotangent
-                if isinstance(cotangent, dict)
-                else {self.cotangent_groups[0].declared_path: cotangent}
-                if len(self.cotangent_groups) == 1
-                else None
+        return self._apply(cotangent, logical=False)
+
+    def apply_logical(self, cotangent: Any) -> dict[str, Any]:
+        return self._apply(cotangent, logical=True)
+
+    def _apply(self, cotangent: Any, *, logical: bool) -> dict[str, Any]:
+        return dict(
+            self.native.apply_grouped(
+                cotangent,
+                self.gradient_groups,
+                self.cotangent_groups,
+                self.carrier_shape,
+                logical,
             )
-            if supplied is None or set(supplied) != {group.declared_path for group in self.cotangent_groups}:
-                raise ValueError("pullback requires exactly one cotangent per declared output path")
-            leaves: dict[str, Any] = {}
-            for group in self.cotangent_groups:
-                value = supplied[group.declared_path]
-                primal = self.bindings[group.parameter_root]
-                owner = primal.owner if isinstance(primal, TensorView) else primal
-                aggregate_storage = isinstance(owner, TensorStorage) and owner._element_type is not None
-                if isinstance(value, TensorStorage) and aggregate_storage:
-                    leaves.update(self._packed_cotangent(group, value))
-                elif len(group.leaf_paths) == 1:
-                    leaves[group.leaf_paths[0]] = (
-                        self._single_storage_cotangent(group, value) if isinstance(value, TensorStorage) else value
-                    )
-                else:
-                    leaves.update(self._packed_cotangent(group, value))
-            native_cotangent = next(iter(leaves.values())) if len(leaves) == 1 else leaves
-        leaf_results = self.native(native_cotangent)
-        grouped: dict[str, Any] = {}
-        for group in self.gradient_groups:
-            values = tuple(leaf_results[path] for path in group.leaf_paths)
-            first = values[0]
-            if any(value is not first for value in values[1:]):
-                raise RuntimeError(f"gradient leaves for '{group.declared_path}' did not materialize into one owner")
-            grouped[group.declared_path] = first
-        return grouped
+        )
 
 
 @dataclass
@@ -162,6 +98,7 @@ class CookedVjpPipeline:
     _features: tuple[str, ...]
     _native: Any = None
     _runtime_generation: int = -1
+    _binding_cache: _NativeBindingCache = field(default_factory=_NativeBindingCache, init=False, repr=False)
 
     def _load(self) -> None:
         state = _session_state()
@@ -186,6 +123,33 @@ class CookedVjpPipeline:
         self._load()
         return _invoke_structured_pipeline(self._native, bindings, grid)
 
+    def primal(self, bindings: dict[str, Any], grid: tuple[int, int, int]) -> None:
+        self._load()
+        parameters = tuple(self._native.parameters)
+        if set(bindings) != {parameter.name for parameter in parameters}:
+            raise ValueError("cooked VJP primal bindings do not match pipeline parameters")
+        state = _session_state()
+        access_names = {
+            state._native.ACCESS_READ: "read",
+            state._native.ACCESS_WRITE: "write",
+            state._native.ACCESS_READ_WRITE: "read_write",
+        }
+        borrows = [
+            (parameter.name, bindings[parameter.name], access_names[parameter.access])
+            for parameter in parameters
+            if isinstance(bindings[parameter.name], (TensorStorage, TensorView))
+        ]
+        with _dispatch_borrow_scope(borrows), self._binding_cache.invocation(self._native) as builder:
+            for parameter in parameters:
+                self._binding_cache.bind_argument(
+                    builder,
+                    self._native,
+                    parameter,
+                    bindings[parameter.name],
+                )
+            builder.grid(*grid)
+            builder.submit().wait()
+
 
 def _pipeline_derivative_groups(pipeline: Any) -> tuple[DerivativeGroup, ...]:
     groups = tuple(
@@ -201,6 +165,9 @@ def _invoke_structured_pipeline(
     pipeline: Any,
     bindings: dict[str, Any],
     grid: tuple[int, int, int],
+    tape_bytes_per_invocation: int = 0,
+    active_operation_count: int = 0,
+    recomputation_cost: int = 0,
 ) -> tuple[Any, _StructuredPullback]:
     _validate_grid(grid)
     derivative_groups = _pipeline_derivative_groups(pipeline)
@@ -211,7 +178,7 @@ def _invoke_structured_pipeline(
         state._native.ACCESS_READ_WRITE: "read_write",
     }
     access_by_name = {parameter.name: access_names[parameter.access] for parameter in pipeline.parameters}
-    borrows = [
+    borrows: list[tuple[str, Any, str]] = [
         (name, value, access_by_name[name])
         for name, value in bindings.items()
         if name in access_by_name and isinstance(value, (TensorStorage, TensorView))
@@ -221,12 +188,16 @@ def _invoke_structured_pipeline(
     workgroup = tuple(pipeline.workgroup_size)
     extent = tuple(count * size for count, size in zip(grid, workgroup, strict=True))
     carrier_shape = () if extent == (1, 1, 1) else tuple(reversed(extent))
+    invocation_count = extent[0] * extent[1] * extent[2]
     return output, _StructuredPullback(
         pullback,
         tuple(group for group in derivative_groups if group.role == "gradient"),
         tuple(group for group in derivative_groups if group.role == "cotangent"),
         bindings,
         carrier_shape,
+        tape_bytes_per_invocation * invocation_count,
+        active_operation_count * invocation_count,
+        recomputation_cost * invocation_count,
     )
 
 
@@ -279,16 +250,13 @@ def _load(compiled: _CompiledDirectVjp, runtime_state: Any) -> None:
         compiled.backward_symbol,
         compiled.forward_protocol,
         compiled.backward_protocol,
+        compiled.tape_bytes_per_invocation,
         [(group.role, group.declared_path, list(group.leaf_paths)) for group in compiled.derivative_groups],
     )
     compiled.runtime_generation = runtime_state._runtime_generation
 
 
-def execute_direct_vjp(
-    expression: ProgramExpression,
-    arguments: tuple[Any, ...],
-    grid: tuple[int, int, int] | None,
-) -> tuple[Any, Any]:
+def _compile_direct_vjp(expression: ProgramExpression, arguments: tuple[Any, ...]) -> _CompiledDirectVjp:
     kernel = expression.program
     if not isinstance(kernel, Kernel):
         raise TypeError("direct VJP execution requires one compute Kernel")
@@ -299,10 +267,6 @@ def execute_direct_vjp(
         raise RuntimeError("direct structured VJP execution currently supports only the CPU runtime")
     if runtime_state._native is None or runtime_state._native_runtime is None:
         raise RuntimeError("CPU VJP execution requires the native compiler and runtime")
-    if grid is None:
-        raise TypeError("grid is required for direct structured VJP execution")
-    _validate_grid(grid)
-
     options = make_target_options("cpu")
     key = kernel._dispatch_key(
         arguments,
@@ -348,6 +312,9 @@ def execute_direct_vjp(
             forward_protocol=structured.protocols["forward_with_tape"],
             backward_protocol=structured.protocols["backward"],
             derivative_groups=derivative_groups,
+            tape_bytes_per_invocation=int(structured.plan.tape_bytes),
+            active_operation_count=structured.active_operation_count,
+            recomputation_cost=structured.recomputation_cost,
             user_parameters=tuple(argument.arg for argument in function.args.args if argument.arg not in builtins),
             pipeline=None,
             runtime_generation=-1,
@@ -357,13 +324,28 @@ def execute_direct_vjp(
         _load(compiled, runtime_state)
     else:
         _load(compiled, runtime_state)
+    return compiled
+
+
+def execute_direct_vjp(
+    expression: ProgramExpression,
+    arguments: tuple[Any, ...],
+    grid: tuple[int, int, int] | None,
+) -> tuple[Any, Any]:
+    if grid is None:
+        raise TypeError("grid is required for direct structured VJP execution")
+    _validate_grid(grid)
+    compiled = _compile_direct_vjp(expression, arguments)
     if len(arguments) != len(compiled.user_parameters):
-        raise TypeError(f"{kernel.__name__} expects {len(compiled.user_parameters)} launch arguments")
+        raise TypeError(f"direct VJP expects {len(compiled.user_parameters)} launch arguments")
     bindings = dict(zip(compiled.user_parameters, arguments, strict=True))
     return _invoke_structured_pipeline(
         compiled.pipeline,
         bindings,
         grid,
+        compiled.tape_bytes_per_invocation,
+        compiled.active_operation_count,
+        compiled.recomputation_cost,
     )
 
 

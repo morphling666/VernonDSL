@@ -69,6 +69,10 @@ module {
     %r = arith.negf %x : f32
     func.return %r : f32
   }
+  func.func @floor(%x: f32) -> f32 {
+    %r = math.floor %x : f32
+    func.return %r : f32
+  }
   func.func @sin(%x: f32) -> f32 {
     %r = math.sin %x : f32
     func.return %r : f32
@@ -114,13 +118,14 @@ module {
         return {
             {"add", "arith.addf", {}, {1.3, 0.7}, {1.0, 1.0}},
             {"sub", "arith.subf", {}, {1.3, 0.7}, {1.0, -1.0}},
-            {"mul", "arith.mulf", {Requirement::operand(0), Requirement::operand(1)}, {1.3, 0.7}, {0.7, 1.3}},
+            {"mul", "arith.mulf", {Requirement::operand(0, {1}), Requirement::operand(1, {0})}, {1.3, 0.7}, {0.7, 1.3}},
             {"div",
              "arith.divf",
              {Requirement::operand(0), Requirement::operand(1)},
              {1.3, 0.7},
              {1.0 / 0.7, -1.3 / (0.7 * 0.7)}},
             {"neg", "arith.negf", {}, {1.3}, {-1.0}},
+            {"floor", "math.floor", {}, {1.4}, {0.0}},
             {"sin", "math.sin", {Requirement::operand(0)}, {0.4}, {std::cos(0.4)}},
             {"cos", "math.cos", {Requirement::operand(0)}, {0.4}, {-std::sin(0.4)}},
             {"acos", "math.acos", {Requirement::operand(0)}, {0.4}, {-1.0 / std::sqrt(1.0 - 0.4 * 0.4)}},
@@ -161,6 +166,8 @@ module {
             result = operand(0) / operand(1);
         else if (isa<arith::NegFOp>(operation))
             result = -operand(0);
+        else if (isa<math::FloorOp>(operation))
+            result = std::floor(operand(0));
         else if (isa<math::SinOp>(operation))
             result = std::sin(operand(0));
         else if (isa<math::CosOp>(operation))

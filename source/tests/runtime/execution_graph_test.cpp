@@ -1,6 +1,11 @@
 #include "VernonExecutionGraph.h"
+#include "execution_graph/execution_graph_checkpoint_planner_internal.h"
 
 #include <gtest/gtest.h>
+
+#include <atomic>
+#include <cstring>
+#include <future>
 
 namespace vernon::execution::detail {
 
@@ -104,6 +109,8 @@ public:
             write(writeResource_);
     }
 
+    void addReadForTesting(GraphResource resource) { read(resource); }
+
     VernonRhiStatus execute(ComputeEncoder &, const ExecutionResources &) override { return VERNON_RHI_STATUS_OK; }
 
 private:
@@ -142,6 +149,249 @@ private:
 struct IntegerBindingValue final : ExecutionBindingValue {
     explicit IntegerBindingValue(int value) : value(value) {}
     int value;
+};
+
+struct ScalarAutodiffValue final : GraphAutodiffValue {
+    explicit ScalarAutodiffValue(double value) : value(value) {}
+
+    uintptr_t logicalIdentity() const override { return reinterpret_cast<uintptr_t>(this); }
+
+    std::shared_ptr<GraphAutodiffValue> add(const GraphAutodiffValue &other, std::string &error) const override {
+        const auto *scalar = dynamic_cast<const ScalarAutodiffValue *>(&other);
+        if (!scalar) {
+            error = "incompatible test autodiff value";
+            return {};
+        }
+        return std::make_shared<ScalarAutodiffValue>(value + scalar->value);
+    }
+
+    double value;
+};
+
+class ByteCheckpointResource final : public GraphCheckpointResource {
+public:
+    explicit ByteCheckpointResource(uint64_t byteSize, uint64_t expectedAlignment = 1)
+        : bytes_(byteSize), expectedAlignment_(expectedAlignment) {}
+
+    uint64_t byteSize() const override { return bytes_.size(); }
+    uint64_t alignment() const override { return expectedAlignment_; }
+    void expectAlignment(uint64_t alignment) { expectedAlignment_ = alignment; }
+    void failRestoreWithoutError(bool value = true) { failRestoreWithoutError_ = value; }
+    float floatValue() const {
+        float value = 0;
+        std::memcpy(&value, bytes_.data(), sizeof(value));
+        return value;
+    }
+    void setFloatValue(float value) { std::memcpy(bytes_.data(), &value, sizeof(value)); }
+
+    bool copyTo(void *destination, uint64_t byteSize, std::string &error) const override {
+        if (byteSize != bytes_.size() || reinterpret_cast<uintptr_t>(destination) % expectedAlignment_ != 0) {
+            error = "test checkpoint copy size mismatch";
+            return false;
+        }
+        std::memcpy(destination, bytes_.data(), bytes_.size());
+        return true;
+    }
+
+    bool copyFrom(const void *source, uint64_t byteSize, std::string &error) override {
+        if (failRestoreWithoutError_)
+            return false;
+        if (byteSize != bytes_.size() || reinterpret_cast<uintptr_t>(source) % expectedAlignment_ != 0) {
+            error = "test checkpoint restore size mismatch";
+            return false;
+        }
+        std::memcpy(bytes_.data(), source, bytes_.size());
+        return true;
+    }
+
+private:
+    std::vector<uint8_t> bytes_;
+    uint64_t expectedAlignment_;
+    bool failRestoreWithoutError_{};
+};
+
+GraphBuffer importCheckpointBuffer(ExecutionGraph &graph, uint64_t identity, bool exported = false) {
+    return graph.importHostBuffer(identity, exported,
+                                  std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float)));
+}
+
+class ScalarPassPullback final : public PassPullback {
+public:
+    ScalarPassPullback(std::vector<PassDerivativeMapping> gradients, double scale, bool fail, uint64_t tapeBytes = 8,
+                       std::shared_ptr<std::atomic<uint32_t>> remainingFailures = {})
+        : gradients_(std::move(gradients)), scale_(scale), fail_(fail), tapeStorage_(tapeBytes),
+          remainingFailures_(std::move(remainingFailures)) {}
+
+    bool apply(const NamedGraphAutodiffValues &cotangents, NamedGraphAutodiffValues &gradients,
+               std::string &error) override {
+        uint32_t remaining = remainingFailures_ ? remainingFailures_->load() : 0;
+        const bool oneShotFailure =
+            remainingFailures_ && remaining &&
+            remainingFailures_->compare_exchange_strong(remaining, remaining - 1, std::memory_order_relaxed);
+        if (fail_ || oneShotFailure) {
+            error = "test backward failure";
+            return false;
+        }
+        double total = 0.0;
+        for (const auto &cotangent : cotangents) {
+            const auto scalar = std::dynamic_pointer_cast<ScalarAutodiffValue>(cotangent.second);
+            if (!scalar) {
+                error = "incompatible test cotangent";
+                return false;
+            }
+            total += scalar->value;
+        }
+        for (const PassDerivativeMapping &gradient : gradients_)
+            gradients.emplace_back(gradient.path, std::make_shared<ScalarAutodiffValue>(total * scale_));
+        return true;
+    }
+
+    uint64_t estimatedTapeBytes() const override { return tapeStorage_.size(); }
+    uint64_t logicalResidualBytes() const override { return 4; }
+    uint64_t residentTapeBytes() const override { return tapeStorage_.size(); }
+    uint64_t allocatedTapeBytes() const override { return tapeStorage_.size(); }
+    uint64_t activeOperationCount() const override { return 1; }
+    uint64_t recomputationCost() const override { return 0; }
+    uint64_t tapeContextLimitBytes() const override { return 0; }
+
+private:
+    std::vector<PassDerivativeMapping> gradients_;
+    double scale_;
+    bool fail_;
+    std::vector<std::byte> tapeStorage_;
+    std::shared_ptr<std::atomic<uint32_t>> remainingFailures_;
+};
+
+class ScalarDifferentiablePass final : public ComputePass, public DifferentiablePass {
+public:
+    ScalarDifferentiablePass(std::string name, GraphResource input, GraphResource output, double scale,
+                             bool failForward = false, bool failBackward = false,
+                             std::shared_ptr<std::atomic<uint32_t>> forwardCount = {},
+                             uint32_t failForwardAfter = UINT32_MAX, uint64_t estimatedResidualBytes = 8,
+                             uint64_t actualTapeBytes = 0,
+                             std::shared_ptr<std::atomic<uint32_t>> remainingBackwardFailures = {},
+                             bool supportsReplay = true, bool throwForward = false)
+        : ComputePass(std::move(name)), input_(input), output_(output), scale_(scale), failForward_(failForward),
+          failBackward_(failBackward), forwardCount_(std::move(forwardCount)), failForwardAfter_(failForwardAfter),
+          estimatedResidualBytes_(estimatedResidualBytes),
+          actualTapeBytes_(actualTapeBytes ? actualTapeBytes : estimatedResidualBytes),
+          remainingBackwardFailures_(std::move(remainingBackwardFailures)), supportsReplay_(supportsReplay),
+          throwForward_(throwForward), gradients_({{"input", {DerivativeEndpointKind::Resource, input.id}}}),
+          cotangents_({{"output", {DerivativeEndpointKind::Resource, output.id}}}) {}
+
+    void declare() override {
+        read(input_);
+        write(output_);
+    }
+
+    VernonRhiStatus execute(ComputeEncoder &, const ExecutionResources &) override { return VERNON_RHI_STATUS_OK; }
+    DifferentiablePass *differentiable() override { return this; }
+    const std::vector<PassDerivativeMapping> &gradientMappings() const override { return gradients_; }
+    const std::vector<PassDerivativeMapping> &cotangentMappings() const override { return cotangents_; }
+    uint64_t estimatedResidualBytes() const override { return estimatedResidualBytes_; }
+    uint64_t estimatedRetainedAllocationBytes() const override { return estimatedResidualBytes_; }
+    uint64_t replayCost() const override { return 1; }
+    bool hasCheckpointPlanningMetadata() const override { return true; }
+    bool supportsReplay() const override { return supportsReplay_; }
+
+    bool forward(ComputeEncoder &, const ExecutionResources &, std::unique_ptr<PassPullback> &pullback,
+                 std::string &error) override {
+        if (throwForward_)
+            throw std::runtime_error("test forward exception");
+        const bool countedFailure = forwardCount_ && forwardCount_->fetch_add(1) >= failForwardAfter_;
+        if (failForward_ || countedFailure) {
+            error = "test forward failure";
+            return false;
+        }
+        pullback = std::make_unique<ScalarPassPullback>(gradients_, scale_, failBackward_, actualTapeBytes_,
+                                                        remainingBackwardFailures_);
+        return true;
+    }
+
+    bool zeroCotangent(const std::string &, const ExecutionResources &, std::shared_ptr<GraphAutodiffValue> &value,
+                       std::string &) override {
+        value = std::make_shared<ScalarAutodiffValue>(0.0);
+        return true;
+    }
+
+    bool implicitCotangent(const std::string &, const ExecutionResources &, std::shared_ptr<GraphAutodiffValue> &value,
+                           std::string &) override {
+        value = std::make_shared<ScalarAutodiffValue>(1.0);
+        return true;
+    }
+
+private:
+    GraphResource input_;
+    GraphResource output_;
+    double scale_;
+    bool failForward_;
+    bool failBackward_;
+    std::shared_ptr<std::atomic<uint32_t>> forwardCount_;
+    uint32_t failForwardAfter_;
+    uint64_t estimatedResidualBytes_;
+    uint64_t actualTapeBytes_;
+    std::shared_ptr<std::atomic<uint32_t>> remainingBackwardFailures_;
+    bool supportsReplay_;
+    bool throwForward_;
+    std::vector<PassDerivativeMapping> gradients_;
+    std::vector<PassDerivativeMapping> cotangents_;
+};
+
+class ResourceSquarePass final : public ComputePass, public DifferentiablePass {
+public:
+    ResourceSquarePass(std::string name, GraphResource input, GraphResource output,
+                       std::shared_ptr<ByteCheckpointResource> inputState,
+                       std::shared_ptr<ByteCheckpointResource> outputState)
+        : ComputePass(std::move(name)), input_(input), output_(output), inputState_(std::move(inputState)),
+          outputState_(std::move(outputState)), gradients_({{"input", {DerivativeEndpointKind::Resource, input.id}}}),
+          cotangents_({{"output", {DerivativeEndpointKind::Resource, output.id}}}) {}
+
+    void declare() override {
+        read(input_);
+        write(output_);
+    }
+
+    VernonRhiStatus execute(ComputeEncoder &, const ExecutionResources &) override {
+        const float value = inputState_->floatValue();
+        outputState_->setFloatValue(value * value);
+        return VERNON_RHI_STATUS_OK;
+    }
+    DifferentiablePass *differentiable() override { return this; }
+    const std::vector<PassDerivativeMapping> &gradientMappings() const override { return gradients_; }
+    const std::vector<PassDerivativeMapping> &cotangentMappings() const override { return cotangents_; }
+    uint64_t estimatedResidualBytes() const override { return 100; }
+    uint64_t estimatedRetainedAllocationBytes() const override { return 100; }
+    uint64_t replayCost() const override { return 1; }
+    bool hasCheckpointPlanningMetadata() const override { return true; }
+    bool supportsReplay() const override { return true; }
+
+    bool forward(ComputeEncoder &encoder, const ExecutionResources &resources, std::unique_ptr<PassPullback> &pullback,
+                 std::string &) override {
+        const float value = inputState_->floatValue();
+        execute(encoder, resources);
+        pullback = std::make_unique<ScalarPassPullback>(gradients_, 2.0 * value, false, estimatedResidualBytes());
+        return true;
+    }
+
+    bool zeroCotangent(const std::string &, const ExecutionResources &, std::shared_ptr<GraphAutodiffValue> &value,
+                       std::string &) override {
+        value = std::make_shared<ScalarAutodiffValue>(0.0);
+        return true;
+    }
+
+    bool implicitCotangent(const std::string &, const ExecutionResources &, std::shared_ptr<GraphAutodiffValue> &value,
+                           std::string &) override {
+        value = std::make_shared<ScalarAutodiffValue>(1.0);
+        return true;
+    }
+
+private:
+    GraphResource input_;
+    GraphResource output_;
+    std::shared_ptr<ByteCheckpointResource> inputState_;
+    std::shared_ptr<ByteCheckpointResource> outputState_;
+    std::vector<PassDerivativeMapping> gradients_;
+    std::vector<PassDerivativeMapping> cotangents_;
 };
 
 class ParameterComputePass final : public ComputePass {
@@ -248,14 +498,22 @@ private:
 
 class TestDepthPass final : public RenderPass {
 public:
-    TestDepthPass(std::string name, GraphImage target, VernonRhiLoadOperation load, bool readOnly)
-        : RenderPass(std::move(name)), target_(target), load_(load), readOnly_(readOnly) {}
+    TestDepthPass(std::string name, GraphImage target, VernonRhiLoadOperation load, bool readOnlyDepth,
+                  VernonRhiStoreOperation depthStore = VERNON_RHI_STORE_PRESERVE,
+                  VernonRhiLoadOperation stencilLoad = VERNON_RHI_LOAD_DISCARD,
+                  VernonRhiStoreOperation stencilStore = VERNON_RHI_STORE_DISCARD, bool readOnlyStencil = false)
+        : RenderPass(std::move(name)), target_(target), load_(load), depthStore_(depthStore), stencilLoad_(stencilLoad),
+          stencilStore_(stencilStore), readOnlyDepth_(readOnlyDepth), readOnlyStencil_(readOnlyStencil) {}
 
     void declare() override {
         DepthStencilAttachmentUse attachment{};
         attachment.image = target_;
         attachment.depthLoad = load_;
-        attachment.readOnlyDepth = readOnly_;
+        attachment.depthStore = depthStore_;
+        attachment.stencilLoad = stencilLoad_;
+        attachment.stencilStore = stencilStore_;
+        attachment.readOnlyDepth = readOnlyDepth_;
+        attachment.readOnlyStencil = readOnlyStencil_;
         depth(attachment);
     }
 
@@ -264,7 +522,11 @@ public:
 private:
     GraphImage target_;
     VernonRhiLoadOperation load_;
-    bool readOnly_;
+    VernonRhiStoreOperation depthStore_;
+    VernonRhiLoadOperation stencilLoad_;
+    VernonRhiStoreOperation stencilStore_;
+    bool readOnlyDepth_;
+    bool readOnlyStencil_;
 };
 
 class TestImageSubresourcePass final : public ComputePass {
@@ -285,6 +547,21 @@ public:
 private:
     GraphImage image_;
     AccessMode access_;
+};
+
+class ConditionalFlagPass final : public ComputePass {
+public:
+    ConditionalFlagPass(std::string name, bool &sideEffect) : ComputePass(std::move(name)), sideEffect_(sideEffect) {}
+
+    void declare() override {
+        if (sideEffect_)
+            setFlags(PassSideEffect);
+    }
+
+    VernonRhiStatus execute(ComputeEncoder &, const ExecutionResources &) override { return VERNON_RHI_STATUS_OK; }
+
+private:
+    bool &sideEffect_;
 };
 
 GraphResource none() { return {UINT32_MAX, ResourceKind::Buffer}; }
@@ -365,6 +642,18 @@ TEST(ExecutionGraph, CompiledPlanOwnsPassesAndSupportsRepeatedSubmissions) {
     EXPECT_EQ(events, (std::vector<std::string>{"run", "run"}));
 }
 
+TEST(ExecutionGraph, FreezesRetainedPassReferencesAfterCompilation) {
+    ExecutionGraph graph;
+    const GraphBuffer output = graph.importHostBuffer(1, true);
+    auto &pass = graph.emplacePass<TestComputePass>("run", none(), output);
+    std::string error;
+    auto compiled = graph.compile(error);
+    ASSERT_TRUE(compiled) << error;
+    EXPECT_THROW(pass.setFlags(PassNeverCull), std::logic_error);
+    EXPECT_THROW(pass.dependsOn(pass), std::logic_error);
+    EXPECT_THROW(pass.addReadForTesting(output), std::logic_error);
+}
+
 TEST(ExecutionGraph, SubmissionRetainsCompiledPlan) {
     std::vector<std::string> events;
     ExecutionGraph graph;
@@ -425,6 +714,32 @@ TEST(ExecutionGraph, CullsTransientPassesWithoutLiveConsumers) {
     EXPECT_TRUE(plan->scopes().empty());
 }
 
+TEST(ExecutionGraph, RebuildClearsDeclarationDerivedFlags) {
+    ExecutionGraph graph;
+    bool sideEffect = true;
+    graph.emplacePass<ConditionalFlagPass>("conditional", sideEffect);
+    std::string error;
+    ASSERT_TRUE(graph.validate(error)) << error;
+    sideEffect = false;
+    auto compiled = graph.compile(error);
+    ASSERT_TRUE(compiled) << error;
+    EXPECT_TRUE(compiled->schedule().empty());
+}
+
+TEST(ExecutionGraph, KeepsUnexportedAutodiffObjectiveProducerLive) {
+    ExecutionGraph graph;
+    const GraphBuffer input = importCheckpointBuffer(graph, 1);
+    const GraphBuffer objective = importCheckpointBuffer(graph, 2);
+    graph.emplacePass<ScalarDifferentiablePass>("objective", input, objective, 2.0);
+    graph.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, input.id}}},
+                               {{"objective", {DerivativeEndpointKind::Resource, objective.id}}});
+
+    std::string error;
+    auto compiled = graph.compile(error);
+    ASSERT_TRUE(compiled) << error;
+    EXPECT_EQ(compiled->schedule(), (std::vector<uint32_t>{0}));
+}
+
 TEST(ExecutionGraph, DeduplicatesImportsAndPromotesExportedResources) {
     ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
     const GraphBuffer first = importBufferForTesting(graph, {4, 9});
@@ -476,6 +791,9 @@ TEST(ExecutionGraph, RejectsResourceFromAnotherGraphWithMatchingNumericId) {
     second.emplacePass<TestComputePass>("foreign", foreign, output);
 
     std::string error;
+    EXPECT_FALSE(second.validate(error));
+    EXPECT_NE(error.find("another execution graph"), std::string::npos);
+    error.clear();
     EXPECT_FALSE(second.compile(error));
     EXPECT_NE(error.find("another execution graph"), std::string::npos);
     EXPECT_NE(error.find("foreign"), std::string::npos);
@@ -534,6 +852,31 @@ TEST(ExecutionGraph, TracksImageHazardsByParentAndSubresourceRange) {
     EXPECT_EQ(barrier.destination_access, VERNON_RHI_ACCESS_SHADER_READ);
 }
 
+TEST(ExecutionGraph, PreservesComputeImageViewMetadataAndRejectsSlicedImages) {
+    {
+        ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+        const VernonRhiImageSubresourceRange range{2, 1, 3, 2, VERNON_RHI_IMAGE_ASPECT_COLOR};
+        const GraphImage image =
+            importImageForTesting(graph, {4, 2}, {7, 3}, VERNON_RHI_FORMAT_RGBA8_UNORM, 8, 8, 2, 1, true, &range);
+        auto &pass = graph.emplacePass<TestImageSubresourcePass>("image", image, AccessMode::Read);
+        std::string error;
+        ASSERT_TRUE(graph.validate(error)) << error;
+        ASSERT_EQ(pass.uses().size(), 1u);
+        ASSERT_TRUE(pass.uses().front().image.has_value());
+        EXPECT_EQ(pass.uses().front().image->view.index, image.view.index);
+        EXPECT_EQ(pass.uses().front().image->subresources.base_mip_level, 2u);
+        EXPECT_EQ(pass.uses().front().image->subresources.base_array_layer, 3u);
+    }
+    {
+        ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+        const GraphImage image =
+            importImageForTesting(graph, {4, 2}, {7, 3}, VERNON_RHI_FORMAT_RGBA8_UNORM, 8, 8, 1, 1, true);
+        graph.emplacePass<TestComputePass>("sliced-image", none(), image);
+        std::string error;
+        EXPECT_FALSE(graph.validate(error));
+    }
+}
+
 TEST(ExecutionGraph, RejectsInvalidAttachmentFormatAndExtent) {
     {
         ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
@@ -581,6 +924,32 @@ TEST(ExecutionGraph, RejectsClearOnReadOnlyDepthAndSplitsReadOnlyChanges) {
     }
 }
 
+TEST(ExecutionGraph, TracksWritableStencilAndRejectsReadOnlyStencilMutation) {
+    {
+        ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+        const GraphImage depthStencil =
+            importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, 16, 16, 1, 1, true);
+        graph.emplacePass<TestDepthPass>("stencil-write", depthStencil, VERNON_RHI_LOAD_PRESERVE, true,
+                                         VERNON_RHI_STORE_PRESERVE, VERNON_RHI_LOAD_PRESERVE, VERNON_RHI_STORE_PRESERVE,
+                                         false);
+        std::string error;
+        auto plan = graph.compile(error);
+        ASSERT_TRUE(plan) << error;
+        ASSERT_EQ(plan->schedule(), (std::vector<uint32_t>{0}));
+    }
+    {
+        ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+        const GraphImage depthStencil =
+            importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, 16, 16, 1, 1, true);
+        graph.emplacePass<TestDepthPass>("read-only-stencil-clear", depthStencil, VERNON_RHI_LOAD_PRESERVE, false,
+                                         VERNON_RHI_STORE_PRESERVE, VERNON_RHI_LOAD_CLEAR, VERNON_RHI_STORE_PRESERVE,
+                                         true);
+        std::string error;
+        EXPECT_FALSE(graph.compile(error));
+        EXPECT_NE(error.find("read-only-stencil-clear"), std::string::npos);
+    }
+}
+
 TEST(ExecutionGraph, SplitsScopesWhenIntermediateDiscardCannotBeRepresented) {
     ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
     const GraphImage color =
@@ -610,6 +979,20 @@ TEST(ExecutionGraph, FusesAnIntermediateClearButSplitsAnIntermediateDiscardLoad)
     };
     EXPECT_EQ(compileScopes(VERNON_RHI_LOAD_CLEAR), 1u);
     EXPECT_EQ(compileScopes(VERNON_RHI_LOAD_DISCARD), 2u);
+}
+
+TEST(ExecutionGraph, SplitsRenderScopesAcrossDiscardedStencilBoundary) {
+    ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+    const GraphImage depthStencil =
+        importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, 16, 16, 1, 1, true);
+    graph.emplacePass<TestDepthPass>("discard-stencil", depthStencil, VERNON_RHI_LOAD_PRESERVE, false,
+                                     VERNON_RHI_STORE_PRESERVE, VERNON_RHI_LOAD_PRESERVE, VERNON_RHI_STORE_DISCARD);
+    graph.emplacePass<TestDepthPass>("preserve-stencil", depthStencil, VERNON_RHI_LOAD_PRESERVE, false,
+                                     VERNON_RHI_STORE_PRESERVE, VERNON_RHI_LOAD_PRESERVE, VERNON_RHI_STORE_PRESERVE);
+    std::string error;
+    auto plan = graph.compile(error);
+    ASSERT_TRUE(plan) << error;
+    EXPECT_EQ(plan->scopes().size(), 2u);
 }
 
 TEST(ExecutionGraph, SplitsRenderScopesForNonAttachmentHazards) {
@@ -682,6 +1065,746 @@ TEST(ExecutionGraph, SnapshotsSparseParameterUpdatesAndRetainsSubmissionValues) 
     plan.reset();
     EXPECT_EQ(first.wait(), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(second.wait(), VERNON_RHI_STATUS_OK);
+}
+
+TEST(ExecutionGraphAutodiff, ComposesNativePullbacksAndSupportsReuseAfterPlanRelease) {
+    ExecutionGraph graph;
+    const GraphBuffer input = importCheckpointBuffer(graph, 1);
+    const GraphBuffer intermediate = importCheckpointBuffer(graph, 2);
+    const GraphBuffer objective = importCheckpointBuffer(graph, 3, true);
+    graph.emplacePass<ScalarDifferentiablePass>("first", input, intermediate, 2.0);
+    graph.emplacePass<ScalarDifferentiablePass>("second", intermediate, objective, 5.0);
+    graph.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, input.id}}},
+                               {{"objective", {DerivativeEndpointKind::Resource, objective.id}}});
+
+    std::string error;
+    auto plan = graph.compile(error);
+    ASSERT_TRUE(plan) << error;
+    auto pullback = plan->vjp({}, error);
+    ASSERT_TRUE(pullback) << error;
+    EXPECT_EQ(pullback->forwardSubmission().state(), ExecutionSubmission::State::Succeeded);
+    EXPECT_EQ(pullback->estimatedTapeBytes(), 16u);
+    EXPECT_EQ(pullback->logicalResidualBytes(), 8u);
+    EXPECT_EQ(pullback->residentTapeBytes(), 16u);
+    EXPECT_EQ(pullback->allocatedTapeBytes(), 16u);
+    EXPECT_EQ(pullback->checkpointBytes(), 0u);
+    EXPECT_EQ(pullback->peakRuntimeManagedBytes(), 24u);
+    plan.reset();
+
+    auto explicitSubmission = pullback->submit({{"objective", std::make_shared<ScalarAutodiffValue>(3.0)}}, false);
+    ASSERT_TRUE(explicitSubmission->wait(error)) << error;
+    ASSERT_EQ(explicitSubmission->gradients().size(), 1u);
+    const auto explicitGradient =
+        std::dynamic_pointer_cast<ScalarAutodiffValue>(explicitSubmission->gradients().front().second);
+    ASSERT_TRUE(explicitGradient);
+    EXPECT_DOUBLE_EQ(explicitGradient->value, 30.0);
+
+    auto implicitSubmission = pullback->submit({}, true);
+    ASSERT_TRUE(implicitSubmission->wait(error)) << error;
+    const auto implicitGradient =
+        std::dynamic_pointer_cast<ScalarAutodiffValue>(implicitSubmission->gradients().front().second);
+    ASSERT_TRUE(implicitGradient);
+    EXPECT_DOUBLE_EQ(implicitGradient->value, 10.0);
+}
+
+TEST(ExecutionGraphAutodiff, SerializesConcurrentApplicationsWithoutSharingGradients) {
+    ExecutionGraph graph;
+    const GraphBuffer input = importCheckpointBuffer(graph, 1);
+    const GraphBuffer intermediate = importCheckpointBuffer(graph, 2);
+    const GraphBuffer objective = importCheckpointBuffer(graph, 3, true);
+    graph.emplacePass<ScalarDifferentiablePass>("first", input, intermediate, 2.0);
+    graph.emplacePass<ScalarDifferentiablePass>("second", intermediate, objective, 5.0);
+    graph.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, input.id}}},
+                               {{"objective", {DerivativeEndpointKind::Resource, objective.id}}});
+    std::string error;
+    auto plan = graph.compile(error);
+    ASSERT_TRUE(plan) << error;
+    auto pullback = plan->vjp({}, error);
+    ASSERT_TRUE(pullback) << error;
+
+    std::vector<std::future<double>> applications;
+    for (uint32_t index = 1; index <= 8; ++index)
+        applications.push_back(std::async(std::launch::async, [pullback, index] {
+            auto submission = pullback->submit({{"objective", std::make_shared<ScalarAutodiffValue>(index)}}, false);
+            std::string applyError;
+            if (!submission->wait(applyError))
+                throw std::runtime_error(applyError);
+            const auto gradient =
+                std::dynamic_pointer_cast<ScalarAutodiffValue>(submission->gradients().front().second);
+            if (!gradient)
+                throw std::runtime_error("concurrent graph VJP returned an incompatible gradient");
+            return gradient->value;
+        }));
+    for (uint32_t index = 0; index < applications.size(); ++index)
+        EXPECT_DOUBLE_EQ(applications[index].get(), static_cast<double>((index + 1) * 10));
+}
+
+TEST(ExecutionGraphAutodiff, AccumulatesBranchedObjectivesByEndpointIdentity) {
+    ExecutionGraph graph;
+    const GraphBuffer input = importCheckpointBuffer(graph, 1);
+    const GraphBuffer leftObjective = importCheckpointBuffer(graph, 2, true);
+    const GraphBuffer rightObjective = importCheckpointBuffer(graph, 3, true);
+    graph.emplacePass<ScalarDifferentiablePass>("left", input, leftObjective, 2.0);
+    graph.emplacePass<ScalarDifferentiablePass>("right", input, rightObjective, 3.0);
+    graph.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, input.id}}},
+                               {{"left", {DerivativeEndpointKind::Resource, leftObjective.id}},
+                                {"right", {DerivativeEndpointKind::Resource, rightObjective.id}}});
+    std::string error;
+    auto plan = graph.compile(error);
+    ASSERT_TRUE(plan) << error;
+    auto pullback = plan->vjp({}, error);
+    ASSERT_TRUE(pullback) << error;
+    auto submission = pullback->submit(
+        {{"left", std::make_shared<ScalarAutodiffValue>(5.0)}, {"right", std::make_shared<ScalarAutodiffValue>(7.0)}},
+        false);
+    ASSERT_TRUE(submission->wait(error)) << error;
+    const auto gradient = std::dynamic_pointer_cast<ScalarAutodiffValue>(submission->gradients().front().second);
+    ASSERT_TRUE(gradient);
+    EXPECT_DOUBLE_EQ(gradient->value, 31.0);
+}
+
+TEST(ExecutionGraphAutodiff, ReturnsMultipleDeclaredInputGradients) {
+    ExecutionGraph graph;
+    const GraphBuffer leftInput = importCheckpointBuffer(graph, 1);
+    const GraphBuffer rightInput = importCheckpointBuffer(graph, 2);
+    const GraphBuffer leftObjective = importCheckpointBuffer(graph, 3, true);
+    const GraphBuffer rightObjective = importCheckpointBuffer(graph, 4, true);
+    graph.emplacePass<ScalarDifferentiablePass>("left", leftInput, leftObjective, 2.0);
+    graph.emplacePass<ScalarDifferentiablePass>("right", rightInput, rightObjective, 3.0);
+    graph.setAutodiffEndpoints({{"left_input", {DerivativeEndpointKind::Resource, leftInput.id}},
+                                {"right_input", {DerivativeEndpointKind::Resource, rightInput.id}}},
+                               {{"left", {DerivativeEndpointKind::Resource, leftObjective.id}},
+                                {"right", {DerivativeEndpointKind::Resource, rightObjective.id}}});
+    std::string error;
+    auto plan = graph.compile(error);
+    ASSERT_TRUE(plan) << error;
+    auto pullback = plan->vjp({}, error);
+    ASSERT_TRUE(pullback) << error;
+    auto submission = pullback->submit(
+        {{"left", std::make_shared<ScalarAutodiffValue>(5.0)}, {"right", std::make_shared<ScalarAutodiffValue>(7.0)}},
+        false);
+    ASSERT_TRUE(submission->wait(error)) << error;
+    ASSERT_EQ(submission->gradients().size(), 2u);
+    const auto left = std::dynamic_pointer_cast<ScalarAutodiffValue>(submission->gradients()[0].second);
+    const auto right = std::dynamic_pointer_cast<ScalarAutodiffValue>(submission->gradients()[1].second);
+    ASSERT_TRUE(left);
+    ASSERT_TRUE(right);
+    EXPECT_DOUBLE_EQ(left->value, 10.0);
+    EXPECT_DOUBLE_EQ(right->value, 21.0);
+}
+
+TEST(ExecutionGraphAutodiff, PublishesNoPartialGradientsForDisconnectedInput) {
+    ExecutionGraph graph;
+    const GraphBuffer connected = importCheckpointBuffer(graph, 1);
+    const GraphBuffer disconnected = graph.importHostBuffer(2);
+    const GraphBuffer objective = importCheckpointBuffer(graph, 3, true);
+    graph.emplacePass<ScalarDifferentiablePass>("connected", connected, objective, 2.0);
+    graph.setAutodiffEndpoints({{"connected", {DerivativeEndpointKind::Resource, connected.id}},
+                                {"disconnected", {DerivativeEndpointKind::Resource, disconnected.id}}},
+                               {{"objective", {DerivativeEndpointKind::Resource, objective.id}}});
+    std::string error;
+    auto compiled = graph.compile(error);
+    ASSERT_TRUE(compiled) << error;
+    auto pullback = compiled->vjp({}, error);
+    ASSERT_TRUE(pullback) << error;
+    auto backward = pullback->submit({{"objective", std::make_shared<ScalarAutodiffValue>(1.0)}}, false);
+    EXPECT_FALSE(backward->wait(error));
+    EXPECT_TRUE(backward->gradients().empty());
+    EXPECT_NE(error.find("disconnected"), std::string::npos);
+}
+
+TEST(ExecutionGraphAutodiff, CompilationRejectsDuplicateLogicalEndpoints) {
+    ExecutionGraph duplicateInputs;
+    const GraphBuffer input = duplicateInputs.importHostBuffer(1);
+    const GraphBuffer objective = duplicateInputs.importHostBuffer(2, true);
+    duplicateInputs.emplacePass<ScalarDifferentiablePass>("step", input, objective, 2.0);
+    duplicateInputs.setAutodiffEndpoints({{"first", {DerivativeEndpointKind::Resource, input.id}},
+                                          {"second", {DerivativeEndpointKind::Resource, input.id}}},
+                                         {{"objective", {DerivativeEndpointKind::Resource, objective.id}}});
+    std::string error;
+    EXPECT_FALSE(duplicateInputs.compile(error));
+    EXPECT_NE(error.find("invalid differentiable input endpoint"), std::string::npos);
+
+    ExecutionGraph duplicateObjectives;
+    const GraphBuffer secondInput = duplicateObjectives.importHostBuffer(3);
+    const GraphBuffer secondObjective = duplicateObjectives.importHostBuffer(4, true);
+    duplicateObjectives.emplacePass<ScalarDifferentiablePass>("step", secondInput, secondObjective, 2.0);
+    duplicateObjectives.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, secondInput.id}}},
+                                             {{"first", {DerivativeEndpointKind::Resource, secondObjective.id}},
+                                              {"second", {DerivativeEndpointKind::Resource, secondObjective.id}}});
+    error.clear();
+    EXPECT_FALSE(duplicateObjectives.compile(error));
+    EXPECT_NE(error.find("invalid objective endpoint"), std::string::npos);
+}
+
+TEST(ExecutionGraphAutodiff, CompilationRejectsNonDifferentiableWriteOnActiveReversePath) {
+    ExecutionGraph graph;
+    const GraphBuffer input = importCheckpointBuffer(graph, 1);
+    const GraphBuffer objective = importCheckpointBuffer(graph, 2, true);
+    std::vector<std::string> events;
+    graph.emplacePass<CpuComputePass>("non-differentiable", objective, AccessMode::Write, events);
+    graph.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, input.id}}},
+                               {{"objective", {DerivativeEndpointKind::Resource, objective.id}}});
+
+    std::string error;
+    auto plan = graph.compile(error);
+    EXPECT_FALSE(plan);
+    EXPECT_NE(error.find("non-differentiable pass"), std::string::npos);
+}
+
+TEST(ExecutionGraphAutodiff, RollsBackPartialForwardPullbacksOnFailure) {
+    ExecutionGraph graph;
+    const GraphBuffer input = importCheckpointBuffer(graph, 1);
+    const GraphBuffer intermediate = importCheckpointBuffer(graph, 2);
+    const GraphBuffer objective = importCheckpointBuffer(graph, 3, true);
+    graph.emplacePass<ScalarDifferentiablePass>("first", input, intermediate, 2.0);
+    graph.emplacePass<ScalarDifferentiablePass>("failure", intermediate, objective, 5.0, true);
+    graph.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, input.id}}},
+                               {{"objective", {DerivativeEndpointKind::Resource, objective.id}}});
+
+    std::string error;
+    auto plan = graph.compile(error);
+    ASSERT_TRUE(plan) << error;
+    EXPECT_FALSE(plan->vjp({}, error));
+    EXPECT_EQ(error, "test forward failure");
+}
+
+TEST(ExecutionGraphAutodiff, RestoresWritableResourcesAfterForwardFailureOrException) {
+    const auto run = [](bool throwForward) {
+        ExecutionGraph graph;
+        auto inputState = std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float));
+        auto intermediateState = std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float));
+        auto objectiveState = std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float));
+        inputState->setFloatValue(3.0f);
+        intermediateState->setFloatValue(-7.0f);
+        objectiveState->setFloatValue(-11.0f);
+        const GraphBuffer input = graph.importHostBuffer(1, false, inputState);
+        const GraphBuffer intermediate = graph.importHostBuffer(2, false, intermediateState);
+        const GraphBuffer objective = graph.importHostBuffer(3, true, objectiveState);
+        graph.emplacePass<ResourceSquarePass>("mutate", input, intermediate, inputState, intermediateState);
+        graph.emplacePass<ScalarDifferentiablePass>("failure", intermediate, objective, 1.0, !throwForward, false,
+                                                    nullptr, UINT32_MAX, 8, 0, nullptr, true, throwForward);
+        graph.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, input.id}}},
+                                   {{"objective", {DerivativeEndpointKind::Resource, objective.id}}});
+        std::string error;
+        auto compiled = graph.compile(error);
+        EXPECT_TRUE(compiled) << error;
+        if (!compiled)
+            return;
+        EXPECT_FALSE(compiled->vjp({}, error));
+        if (throwForward)
+            EXPECT_NE(error.find("test forward exception"), std::string::npos);
+        else
+            EXPECT_EQ(error, "test forward failure");
+        EXPECT_FLOAT_EQ(intermediateState->floatValue(), -7.0f);
+        EXPECT_FLOAT_EQ(objectiveState->floatValue(), -11.0f);
+    };
+    run(false);
+    run(true);
+}
+
+TEST(ExecutionGraphAutodiff, ReportsRollbackFailureWhenCheckpointResourceProvidesNoError) {
+    ExecutionGraph graph;
+    auto inputState = std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float));
+    auto intermediateState = std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float));
+    auto objectiveState = std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float));
+    inputState->setFloatValue(3.0f);
+    intermediateState->setFloatValue(-7.0f);
+    objectiveState->setFloatValue(-11.0f);
+    const GraphBuffer input = graph.importHostBuffer(1, false, inputState);
+    const GraphBuffer intermediate = graph.importHostBuffer(2, false, intermediateState);
+    const GraphBuffer objective = graph.importHostBuffer(3, true, objectiveState);
+    graph.emplacePass<ResourceSquarePass>("mutate", input, intermediate, inputState, intermediateState);
+    graph.emplacePass<ScalarDifferentiablePass>("failure", intermediate, objective, 1.0, true);
+    graph.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, input.id}}},
+                               {{"objective", {DerivativeEndpointKind::Resource, objective.id}}});
+    std::string error;
+    auto compiled = graph.compile(error);
+    ASSERT_TRUE(compiled) << error;
+    intermediateState->failRestoreWithoutError();
+
+    EXPECT_FALSE(compiled->vjp({}, error));
+    EXPECT_EQ(error, "test forward failure; rollback failed: graph VJP forward rollback failed");
+}
+
+TEST(ExecutionGraphAutodiff, PublishesNoGradientsWhenBackwardFails) {
+    ExecutionGraph graph;
+    const GraphBuffer input = importCheckpointBuffer(graph, 1);
+    const GraphBuffer objective = importCheckpointBuffer(graph, 2, true);
+    graph.emplacePass<ScalarDifferentiablePass>("failure", input, objective, 2.0, false, true);
+    graph.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, input.id}}},
+                               {{"objective", {DerivativeEndpointKind::Resource, objective.id}}});
+    std::string error;
+    auto plan = graph.compile(error);
+    ASSERT_TRUE(plan) << error;
+    auto pullback = plan->vjp({}, error);
+    ASSERT_TRUE(pullback) << error;
+
+    auto submission = pullback->submit({{"objective", std::make_shared<ScalarAutodiffValue>(1.0)}}, false);
+    EXPECT_FALSE(submission->wait(error));
+    EXPECT_EQ(error, "test backward failure");
+    EXPECT_TRUE(submission->gradients().empty());
+    EXPECT_EQ(submission->state(), GraphBackwardSubmission::State::Failed);
+}
+
+TEST(ExecutionGraphAutodiff, RestoresStateAndPublishesNoGradientsWhenReplayFails) {
+    ExecutionGraph graph;
+    std::vector<GraphBuffer> resources;
+    for (uint64_t identity = 1; identity <= 5; ++identity)
+        resources.push_back(graph.importHostBuffer(
+            identity, identity == 5, std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float))));
+    const auto forwardCount = std::make_shared<std::atomic<uint32_t>>(0);
+    graph.emplacePass<ScalarDifferentiablePass>("replay-failure", resources[0], resources[1], 2.0, false, false,
+                                                forwardCount, 1, 100);
+    for (uint32_t index = 1; index < 4; ++index)
+        graph.emplacePass<ScalarDifferentiablePass>("step" + std::to_string(index), resources[index],
+                                                    resources[index + 1], 2.0, false, false, nullptr, UINT32_MAX, 100);
+    graph.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, resources.front().id}}},
+                               {{"objective", {DerivativeEndpointKind::Resource, resources.back().id}}});
+    graph.planAutodiffCheckpoints(250);
+    std::string error;
+    auto plan = graph.compile(error);
+    ASSERT_TRUE(plan) << error;
+    auto pullback = plan->vjp({}, error);
+    ASSERT_TRUE(pullback) << error;
+    EXPECT_GT(pullback->checkpointBytes(), 0u);
+    EXPECT_GE(pullback->peakRuntimeManagedBytes(), pullback->allocatedTapeBytes() + pullback->checkpointBytes());
+
+    auto submission = pullback->submit({{"objective", std::make_shared<ScalarAutodiffValue>(1.0)}}, false);
+    EXPECT_FALSE(submission->wait(error));
+    EXPECT_EQ(error, "test forward failure");
+    EXPECT_TRUE(submission->gradients().empty());
+    EXPECT_EQ(submission->state(), GraphBackwardSubmission::State::Failed);
+
+    auto retry = pullback->submit({{"objective", std::make_shared<ScalarAutodiffValue>(1.0)}}, false);
+    EXPECT_FALSE(retry->wait(error));
+    EXPECT_EQ(error, "test forward failure");
+}
+
+TEST(ExecutionGraphAutodiff, ReconstructsRetainedTapesAfterRecoverableBackwardFailure) {
+    ExecutionGraph graph;
+    std::vector<GraphBuffer> resources;
+    for (uint64_t identity = 1; identity <= 5; ++identity)
+        resources.push_back(graph.importHostBuffer(
+            identity, identity == 5, std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float))));
+    const auto remainingFailures = std::make_shared<std::atomic<uint32_t>>(1);
+    graph.emplacePass<ScalarDifferentiablePass>("one-shot-failure", resources[0], resources[1], 2.0, false, false,
+                                                nullptr, UINT32_MAX, 100, 0, remainingFailures);
+    for (uint32_t index = 1; index < 4; ++index)
+        graph.emplacePass<ScalarDifferentiablePass>("step" + std::to_string(index), resources[index],
+                                                    resources[index + 1], 2.0, false, false, nullptr, UINT32_MAX, 100);
+    graph.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, resources.front().id}}},
+                               {{"objective", {DerivativeEndpointKind::Resource, resources.back().id}}});
+    graph.planAutodiffCheckpoints(250);
+    std::string error;
+    auto plan = graph.compile(error);
+    ASSERT_TRUE(plan) << error;
+    auto pullback = plan->vjp({}, error);
+    ASSERT_TRUE(pullback) << error;
+    ASSERT_GT(pullback->checkpointBytes(), 0u);
+
+    auto failed = pullback->submit({{"objective", std::make_shared<ScalarAutodiffValue>(1.0)}}, false);
+    EXPECT_FALSE(failed->wait(error));
+    EXPECT_EQ(error, "test backward failure");
+    auto retry = pullback->submit({{"objective", std::make_shared<ScalarAutodiffValue>(1.0)}}, false);
+    ASSERT_TRUE(retry->wait(error)) << error;
+    const auto gradient = std::dynamic_pointer_cast<ScalarAutodiffValue>(retry->gradients().front().second);
+    ASSERT_TRUE(gradient);
+    EXPECT_DOUBLE_EQ(gradient->value, 16.0);
+}
+
+TEST(ExecutionGraphAutodiff, RejectsRuntimeTapeAllocationAbovePlannedBudget) {
+    ExecutionGraph graph;
+    const GraphBuffer input = graph.importHostBuffer(1, false, std::make_shared<ByteCheckpointResource>(sizeof(float)));
+    const GraphBuffer output = graph.importHostBuffer(2, true, std::make_shared<ByteCheckpointResource>(sizeof(float)));
+    graph.emplacePass<ScalarDifferentiablePass>("underestimated", input, output, 2.0, false, false, nullptr, UINT32_MAX,
+                                                1, 8);
+    graph.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, input.id}}},
+                               {{"objective", {DerivativeEndpointKind::Resource, output.id}}});
+    graph.planAutodiffCheckpoints(5);
+    std::string error;
+    auto plan = graph.compile(error);
+    ASSERT_TRUE(plan) << error;
+    EXPECT_FALSE(plan->vjp({}, error));
+    EXPECT_EQ(error, "graph autodiff runtime allocation exceeds the compiled checkpoint memory budget");
+}
+
+TEST(ExecutionGraphAutodiff, RejectsCheckpointReplayForNonReplayablePass) {
+    ExecutionGraph graph;
+    const GraphBuffer input = graph.importHostBuffer(1, false, std::make_shared<ByteCheckpointResource>(sizeof(float)));
+    const GraphBuffer intermediate =
+        graph.importHostBuffer(2, false, std::make_shared<ByteCheckpointResource>(sizeof(float)));
+    const GraphBuffer output = graph.importHostBuffer(3, true, std::make_shared<ByteCheckpointResource>(sizeof(float)));
+    graph.emplacePass<ScalarDifferentiablePass>("side-effectful", input, intermediate, 2.0, false, false, nullptr,
+                                                UINT32_MAX, 100, 0, std::shared_ptr<std::atomic<uint32_t>>{}, false);
+    graph.emplacePass<ScalarDifferentiablePass>("pure", intermediate, output, 2.0, false, false, nullptr, UINT32_MAX,
+                                                100);
+    graph.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, input.id}}},
+                               {{"objective", {DerivativeEndpointKind::Resource, output.id}}});
+    graph.planAutodiffCheckpoints(150);
+    std::string error;
+    EXPECT_FALSE(graph.compile(error));
+    EXPECT_EQ(error, "autodiff DAG checkpoint schedule requires replaying a non-replayable node");
+}
+
+TEST(ExecutionGraphAutodiff, ReplaysFromOriginalInputAndRestoresCallerState) {
+    ExecutionGraph graph;
+    std::vector<GraphBuffer> resources;
+    std::vector<std::shared_ptr<ByteCheckpointResource>> states;
+    for (uint64_t identity = 1; identity <= 4; ++identity) {
+        auto state = std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float));
+        states.push_back(state);
+        resources.push_back(graph.importHostBuffer(identity, identity == 4, state));
+    }
+    states.front()->setFloatValue(2.0f);
+    for (uint32_t index = 0; index < 3; ++index)
+        graph.emplacePass<ResourceSquarePass>("square" + std::to_string(index), resources[index], resources[index + 1],
+                                              states[index], states[index + 1]);
+    graph.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, resources.front().id}}},
+                               {{"objective", {DerivativeEndpointKind::Resource, resources.back().id}}});
+    graph.planAutodiffCheckpoints(200);
+    std::string error;
+    auto plan = graph.compile(error);
+    ASSERT_TRUE(plan) << error;
+    const AutodiffDagCheckpointPlan *checkpointPlan = plan->autodiffCheckpointPlan();
+    ASSERT_NE(checkpointPlan, nullptr);
+    EXPECT_EQ(checkpointPlan->initialStateBytes, sizeof(float));
+    EXPECT_GT(checkpointPlan->cuts.size(), 0u);
+    auto pullback = plan->vjp({}, error);
+    ASSERT_TRUE(pullback) << error;
+    EXPECT_FLOAT_EQ(states.back()->floatValue(), 256.0f);
+
+    states.front()->setFloatValue(10.0f);
+    states.back()->setFloatValue(999.0f);
+    auto submission = pullback->submit({{"objective", std::make_shared<ScalarAutodiffValue>(1.0)}}, false);
+    ASSERT_TRUE(submission->wait(error)) << error;
+    const auto gradient = std::dynamic_pointer_cast<ScalarAutodiffValue>(submission->gradients().front().second);
+    ASSERT_TRUE(gradient);
+    EXPECT_DOUBLE_EQ(gradient->value, 1024.0);
+    EXPECT_FLOAT_EQ(states.front()->floatValue(), 10.0f);
+    EXPECT_FLOAT_EQ(states.back()->floatValue(), 999.0f);
+}
+
+TEST(ExecutionGraphAutodiff, RestoresInitialInputsFirstReadAfterCheckpointCut) {
+    ExecutionGraph graph;
+    std::vector<std::shared_ptr<ByteCheckpointResource>> states;
+    std::vector<GraphBuffer> resources;
+    for (uint64_t identity = 1; identity <= 5; ++identity) {
+        auto state = std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float));
+        states.push_back(state);
+        resources.push_back(graph.importHostBuffer(identity, false, state));
+    }
+    states[0]->setFloatValue(2.0f);
+    states[3]->setFloatValue(2.0f);
+    graph.emplacePass<ResourceSquarePass>("early-square-0", resources[0], resources[1], states[0], states[1]);
+    graph.emplacePass<ResourceSquarePass>("early-square-1", resources[1], resources[2], states[1], states[2]);
+    graph.emplacePass<ResourceSquarePass>("late-square", resources[3], resources[4], states[3], states[4]);
+    graph.setAutodiffEndpoints({{"early_input", {DerivativeEndpointKind::Resource, resources[0].id}},
+                                {"late_input", {DerivativeEndpointKind::Resource, resources[3].id}}},
+                               {{"early_objective", {DerivativeEndpointKind::Resource, resources[2].id}},
+                                {"late_objective", {DerivativeEndpointKind::Resource, resources[4].id}}});
+    graph.planAutodiffCheckpoints(230);
+    std::string error;
+    auto compiled = graph.compile(error);
+    ASSERT_TRUE(compiled) << error;
+    ASSERT_FALSE(compiled->autodiffCheckpointPlan()->cuts.empty());
+    auto pullback = compiled->vjp({}, error);
+    ASSERT_TRUE(pullback) << error;
+
+    states[3]->setFloatValue(10.0f);
+    for (uint32_t application = 0; application < 2; ++application) {
+        auto backward = pullback->submit({{"early_objective", std::make_shared<ScalarAutodiffValue>(0.0)},
+                                          {"late_objective", std::make_shared<ScalarAutodiffValue>(1.0)}},
+                                         false);
+        ASSERT_TRUE(backward->wait(error)) << error;
+        const auto lateGradient = std::dynamic_pointer_cast<ScalarAutodiffValue>(backward->gradients()[1].second);
+        ASSERT_TRUE(lateGradient);
+        EXPECT_DOUBLE_EQ(lateGradient->value, 4.0);
+        EXPECT_FLOAT_EQ(states[3]->floatValue(), 10.0f);
+    }
+}
+
+TEST(ExecutionGraphAutodiff, UsesAlignedCheckpointStorageAcrossReusableApplications) {
+    ExecutionGraph graph;
+    std::vector<GraphBuffer> resources;
+    std::vector<std::shared_ptr<ByteCheckpointResource>> checkpointResources;
+    for (uint64_t identity = 1; identity <= 5; ++identity) {
+        auto checkpoint = std::make_shared<ByteCheckpointResource>(sizeof(float), 64);
+        checkpointResources.push_back(checkpoint);
+        resources.push_back(graph.importHostBuffer(identity, identity == 5, std::move(checkpoint)));
+    }
+    for (uint32_t index = 0; index < 4; ++index)
+        graph.emplacePass<ScalarDifferentiablePass>("step" + std::to_string(index), resources[index],
+                                                    resources[index + 1], 2.0, false, false, nullptr, UINT32_MAX, 100);
+    graph.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, resources.front().id}}},
+                               {{"objective", {DerivativeEndpointKind::Resource, resources.back().id}}});
+    graph.planAutodiffCheckpoints(250);
+    std::string error;
+    auto plan = graph.compile(error);
+    ASSERT_TRUE(plan) << error;
+    const AutodiffDagCheckpointPlan *checkpointPlan = plan->autodiffCheckpointPlan();
+    ASSERT_NE(checkpointPlan, nullptr);
+    EXPECT_EQ(checkpointPlan->restorationBytes, 5 * sizeof(float));
+    EXPECT_LE(checkpointPlan->peakBytes, 250u);
+    for (const AutodiffCheckpointResource &checkpoint : checkpointPlan->checkpointResources) {
+        ASSERT_LT(checkpoint.producer + 1, checkpointResources.size());
+        checkpointResources[checkpoint.producer + 1]->expectAlignment(checkpoint.alignment);
+    }
+    auto pullback = plan->vjp({}, error);
+    ASSERT_TRUE(pullback) << error;
+    EXPECT_EQ(pullback->checkpointBytes(), checkpointPlan->persistentCheckpointBytes);
+    const uint64_t retainedTapeBytes = pullback->allocatedTapeBytes();
+
+    for (uint32_t application = 0; application < 2; ++application) {
+        auto submission = pullback->submit({{"objective", std::make_shared<ScalarAutodiffValue>(1.0)}}, false);
+        ASSERT_TRUE(submission->wait(error)) << error;
+        const auto gradient = std::dynamic_pointer_cast<ScalarAutodiffValue>(submission->gradients().front().second);
+        ASSERT_TRUE(gradient);
+        EXPECT_DOUBLE_EQ(gradient->value, 16.0);
+        EXPECT_EQ(pullback->allocatedTapeBytes(), retainedTapeBytes);
+    }
+    EXPECT_GE(pullback->peakRuntimeManagedBytes(), pullback->allocatedTapeBytes() + pullback->checkpointBytes());
+    EXPECT_GT(pullback->recomputationFactor(), 1.0);
+}
+
+TEST(ExecutionGraphAutodiffCheckpointTest, StoresImmutablePlanInCompiledGraph) {
+    ExecutionGraph graph;
+    std::vector<GraphBuffer> resources;
+    for (uint64_t identity = 1; identity <= 5; ++identity)
+        resources.push_back(graph.importHostBuffer(
+            identity, identity == 5, std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float))));
+    for (uint32_t index = 0; index < 4; ++index)
+        graph.emplacePass<ScalarDifferentiablePass>("step" + std::to_string(index), resources[index],
+                                                    resources[index + 1], 2.0, false, false, nullptr, UINT32_MAX, 100);
+    graph.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, resources.front().id}}},
+                               {{"objective", {DerivativeEndpointKind::Resource, resources.back().id}}});
+    graph.planAutodiffCheckpoints(250);
+    std::string error;
+    auto compiled = graph.compile(error);
+    ASSERT_TRUE(compiled) << error;
+    const AutodiffDagCheckpointPlan *plan = compiled->autodiffCheckpointPlan();
+    ASSERT_NE(plan, nullptr);
+    EXPECT_EQ(plan->cuts.size(), 1u);
+    EXPECT_LE(plan->peakBytes, 250u);
+    EXPECT_THROW(graph.planAutodiffCheckpoints(0), std::logic_error);
+}
+
+struct TestDagNode {
+    std::vector<uint32_t> predecessors;
+    uint64_t checkpointBytes;
+    uint64_t residualBytes;
+    uint64_t replayCost;
+    bool replayable;
+    uint64_t checkpointAlignment{1};
+};
+
+std::vector<detail::AutodiffDagNode> valueDag(std::initializer_list<TestDagNode> nodes) {
+    std::vector<detail::AutodiffDagNode> result;
+    result.reserve(nodes.size());
+    for (const TestDagNode &source : nodes) {
+        detail::AutodiffDagNode node;
+        node.predecessors = source.predecessors;
+        node.residualBytes = source.residualBytes;
+        node.retainedAllocationBytes = source.residualBytes;
+        node.forwardPeakBytes = source.residualBytes;
+        node.replayCost = source.replayCost;
+        node.replayable = source.replayable;
+        if (source.checkpointBytes)
+            node.outputs.push_back(
+                {static_cast<uint32_t>(result.size()), source.checkpointBytes, source.checkpointAlignment, true, {}});
+        result.push_back(std::move(node));
+    }
+    for (uint32_t consumer = 0; consumer < result.size(); ++consumer)
+        for (uint32_t producer : result[consumer].predecessors)
+            if (!result[producer].outputs.empty() &&
+                std::find(result[producer].outputs[0].consumers.begin(), result[producer].outputs[0].consumers.end(),
+                          consumer) == result[producer].outputs[0].consumers.end())
+                result[producer].outputs[0].consumers.push_back(consumer);
+    return result;
+}
+
+TEST(ExecutionGraphAutodiffCheckpointTest, PlansDagCutsFromLiveResources) {
+    const std::vector<detail::AutodiffDagNode> nodes = valueDag({
+        {{}, 4, 10, 1, true, 4},
+        {{0}, 3, 10, 2, true},
+        {{0}, 5, 10, 3, true},
+        {{1, 2}, 0, 10, 4, true},
+    });
+    AutodiffDagCheckpointPlan plan;
+    std::string error;
+    ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 27, plan, error)) << error;
+    ASSERT_EQ(plan.cuts.size(), 1u);
+    EXPECT_EQ(plan.cuts[0].scheduleOffset, 2u);
+    ASSERT_EQ(plan.cuts[0].checkpointResources.size(), 2u);
+    ASSERT_EQ(plan.checkpointResources.size(), 2u);
+    EXPECT_EQ(plan.checkpointResources[0].producer, 0u);
+    EXPECT_EQ(plan.checkpointResources[0].offset, 0u);
+    EXPECT_EQ(plan.checkpointResources[0].firstCut, 0u);
+    EXPECT_EQ(plan.checkpointResources[0].lastCut, 0u);
+    EXPECT_EQ(plan.checkpointResources[1].producer, 1u);
+    EXPECT_EQ(plan.checkpointResources[1].offset, 4u);
+    EXPECT_EQ(plan.persistentCheckpointBytes, 7u);
+    EXPECT_EQ(plan.peakBytes, 27u);
+}
+
+TEST(ExecutionGraphAutodiffCheckpointTest, DoesNotCheckpointSchedulingOnlyPredecessors) {
+    std::vector<detail::AutodiffDagNode> nodes =
+        valueDag({{{}, 10, 100, 1, true}, {{0}, 10, 100, 1, true}, {{1}, 0, 100, 1, true}});
+    nodes[0].outputs[0].consumers.clear();
+    AutodiffDagCheckpointPlan plan;
+    std::string error;
+    ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 200, plan, error)) << error;
+    ASSERT_EQ(plan.cuts.size(), 1u);
+    EXPECT_EQ(plan.cuts[0].scheduleOffset, 1u);
+    EXPECT_TRUE(plan.checkpointResources.empty());
+}
+
+TEST(ExecutionGraphAutodiffCheckpointTest, CheckpointsOnlyLiveOutputs) {
+    std::vector<detail::AutodiffDagNode> nodes =
+        valueDag({{{}, 1, 100, 1, true}, {{0}, 0, 100, 1, true}, {{1}, 0, 100, 1, true}});
+    nodes[0].outputs.push_back({99, 1000, 8, true, {}});
+    AutodiffDagCheckpointPlan plan;
+    std::string error;
+    ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 101, plan, error)) << error;
+    ASSERT_EQ(plan.checkpointResources.size(), 1u);
+    EXPECT_EQ(plan.checkpointResources[0].resource, 0u);
+    EXPECT_EQ(plan.persistentCheckpointBytes, 1u);
+}
+
+TEST(ExecutionGraphAutodiffCheckpointTest, NoCutPlanAllocatesOnlyTransactionSnapshot) {
+    const std::vector<detail::AutodiffDagNode> nodes = valueDag({{{}, 4, 16, 1, true}, {{0}, 4, 16, 1, true}});
+    auto noCheckpointNodes = nodes;
+    for (auto &node : noCheckpointNodes)
+        for (auto &output : node.outputs)
+            output.checkpointable = false;
+    AutodiffDagCheckpointPlan plan;
+    std::string error;
+    ASSERT_TRUE(
+        detail::planDagAutodiffCheckpoints(noCheckpointNodes, 160, plan, error, 64, false, 128, true, 128, true))
+        << error;
+    EXPECT_TRUE(plan.cuts.empty());
+    EXPECT_EQ(plan.initialStateBytes, 0u);
+    EXPECT_EQ(plan.restorationBytes, 128u);
+    EXPECT_EQ(plan.peakBytes, 160u);
+}
+
+TEST(ExecutionGraphAutodiffCheckpointTest, TracksSharedCheckpointCutLifetimes) {
+    const std::vector<detail::AutodiffDagNode> nodes = valueDag({
+        {{}, 2, 10, 1, true},
+        {{}, 1, 10, 1, true},
+        {{1}, 1, 10, 1, true},
+        {{2}, 1, 10, 1, true},
+        {{0, 3}, 0, 10, 1, true},
+    });
+    AutodiffDagCheckpointPlan plan;
+    std::string error;
+    ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 24, plan, error)) << error;
+    ASSERT_EQ(plan.cuts.size(), 2u);
+    ASSERT_EQ(plan.checkpointResources.size(), 3u);
+    EXPECT_EQ(plan.checkpointResources[0].producer, 0u);
+    EXPECT_EQ(plan.checkpointResources[0].firstCut, 0u);
+    EXPECT_EQ(plan.checkpointResources[0].lastCut, 1u);
+    EXPECT_EQ(plan.checkpointResources[1].firstCut, 0u);
+    EXPECT_EQ(plan.checkpointResources[1].lastCut, 0u);
+    EXPECT_EQ(plan.checkpointResources[2].firstCut, 1u);
+    EXPECT_EQ(plan.checkpointResources[2].lastCut, 1u);
+    ASSERT_EQ(plan.replaySegments.size(), 3u);
+    EXPECT_EQ(plan.replaySegments[1].releaseCheckpointResources, std::vector<uint32_t>({0, 1}));
+    EXPECT_EQ(plan.replaySegments[2].releaseCheckpointResources, std::vector<uint32_t>({2}));
+    EXPECT_EQ(plan.persistentCheckpointBytes, 4u);
+    EXPECT_EQ(plan.peakBytes, 24u);
+}
+
+TEST(ExecutionGraphAutodiffCheckpointTest, SplitsTiedDagPeakSegmentsTogether) {
+    const std::vector<detail::AutodiffDagNode> nodes = valueDag({
+        {{}, 2, 10, 1, true},
+        {{0}, 2, 10, 1, true},
+        {{1}, 2, 10, 1, true},
+        {{2}, 0, 10, 1, true},
+    });
+    AutodiffDagCheckpointPlan plan;
+    std::string error;
+    ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 16, plan, error)) << error;
+    EXPECT_EQ(plan.cuts.size(), 3u);
+    EXPECT_EQ(plan.replaySegments.size(), 4u);
+    EXPECT_EQ(plan.persistentCheckpointBytes, 6u);
+    EXPECT_EQ(plan.peakBytes, 16u);
+}
+
+TEST(ExecutionGraphAutodiffCheckpointTest, AcceptsTemporaryPeakIncreaseNeededForFeasibleCuts) {
+    std::vector<detail::AutodiffDagNode> nodes(3);
+    for (auto &node : nodes) {
+        node.residualBytes = 10;
+        node.retainedAllocationBytes = 10;
+        node.forwardPeakBytes = 10;
+        node.replayCost = 1;
+        node.replayable = true;
+    }
+    nodes[0].outputs.push_back({0, 15, 1, true, {2}});
+    nodes[2].predecessors.push_back(0);
+    AutodiffDagCheckpointPlan plan;
+    std::string error;
+    ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 25, plan, error)) << error;
+    EXPECT_EQ(plan.cuts.size(), 2u);
+    EXPECT_EQ(plan.peakBytes, 25u);
+    EXPECT_EQ(plan.persistentCheckpointBytes, 15u);
+}
+
+TEST(ExecutionGraphAutodiffCheckpointTest, ReplacesEarlierCutsToFindFeasibleFrontier) {
+    const std::vector<detail::AutodiffDagNode> nodes = valueDag({
+        {{}, 7, 15, 1, true},
+        {{0}, 19, 18, 1, true},
+        {{1}, 10, 13, 1, true},
+        {{2}, 0, 20, 1, true},
+    });
+    AutodiffDagCheckpointPlan plan;
+    std::string error;
+    ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 48, plan, error)) << error;
+    ASSERT_EQ(plan.cuts.size(), 2u);
+    EXPECT_EQ(plan.cuts[0].scheduleOffset, 1u);
+    EXPECT_EQ(plan.cuts[1].scheduleOffset, 3u);
+    EXPECT_EQ(plan.peakBytes, 48u);
+}
+
+TEST(ExecutionGraphAutodiffCheckpointTest, ChargesPhysicalRetainedAllocationInsteadOfLogicalPayload) {
+    std::vector<detail::AutodiffDagNode> nodes = valueDag({
+        {{}, 0, 1, 1, true},
+        {{0}, 0, 1, 1, true},
+    });
+    nodes[0].retainedAllocationBytes = 24;
+    nodes[0].forwardPeakBytes = 24;
+    nodes[1].retainedAllocationBytes = 24;
+    nodes[1].forwardPeakBytes = 24;
+    AutodiffDagCheckpointPlan plan;
+    std::string error;
+    ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 48, plan, error)) << error;
+    EXPECT_EQ(plan.peakBytes, 48u);
+    EXPECT_EQ(plan.replaySegments.front().transientResidualBytes, 48u);
+}
+
+TEST(ExecutionGraphAutodiffCheckpointTest, RejectsInvalidOrUnbudgetableDags) {
+    AutodiffDagCheckpointPlan plan;
+    std::string error;
+    EXPECT_FALSE(detail::planDagAutodiffCheckpoints(valueDag({{{1}, 1, 1, 1, true}}), 1, plan, error));
+    EXPECT_EQ(error, "autodiff DAG nodes are not in topological order");
+    EXPECT_FALSE(
+        detail::planDagAutodiffCheckpoints(valueDag({{{}, 1, 1, 1, true}, {{0, 0}, 1, 1, 1, true}}), 2, plan, error));
+    EXPECT_EQ(error, "autodiff DAG node contains a duplicate predecessor");
+    EXPECT_FALSE(detail::planDagAutodiffCheckpoints(valueDag({{{}, 1, 1, 1, false}}), 0, plan, error));
+    EXPECT_EQ(error, "autodiff DAG checkpoint schedule cannot satisfy the memory budget");
+
+    const auto nonReplayableTail = valueDag({{{}, 1, 10, 1, true}, {{0}, 1, 10, 1, true}, {{1}, 0, 1, 1, false}});
+    EXPECT_FALSE(detail::planDagAutodiffCheckpoints(nonReplayableTail, 12, plan, error));
+    EXPECT_EQ(error, "autodiff DAG checkpoint schedule requires replaying a non-replayable node");
+
+    const std::vector<detail::AutodiffDagNode> diamond = valueDag({
+        {{}, 4, 10, 1, true},
+        {{0}, 3, 10, 1, true},
+        {{0}, 5, 10, 1, true},
+        {{1, 2}, 0, 10, 1, true},
+    });
+    EXPECT_FALSE(detail::planDagAutodiffCheckpoints(diamond, 21, plan, error));
+    EXPECT_EQ(error, "autodiff DAG checkpoint schedule cannot satisfy the memory budget");
 }
 
 } // namespace

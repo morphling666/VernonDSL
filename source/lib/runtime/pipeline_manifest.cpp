@@ -4,6 +4,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <charconv>
 #include <limits>
 #include <set>
 #include <string_view>
@@ -11,6 +12,19 @@
 
 namespace vernon::runtime {
 namespace {
+
+std::optional<uint64_t> autodiffTapeBytesHint(std::string_view type) {
+    constexpr std::string_view prefix = "!vernon.ad_tape<";
+    if (type.size() <= prefix.size() || type.substr(0, prefix.size()) != prefix || type.back() != '>')
+        return std::nullopt;
+    type.remove_prefix(prefix.size());
+    type.remove_suffix(1);
+    uint64_t bytes = 0;
+    const auto [end, error] = std::from_chars(type.data(), type.data() + type.size(), bytes);
+    if (error != std::errc{} || end != type.data() + type.size() || !bytes)
+        return std::nullopt;
+    return bytes;
+}
 
 bool buildDerivativeGroups(const std::vector<std::string> &declared, const std::vector<std::string> &leaves,
                            AutodiffDerivativeRole role, std::vector<AutodiffDerivativeGroup> &groups) {
@@ -1684,6 +1698,8 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
             error = "autodiff variants expose inconsistent cotangent paths";
             return false;
         }
+        if (std::optional<uint64_t> hint = autodiffTapeBytesHint(forwardTapeType))
+            variant.staticTapeBytesHint = *hint;
         manifest.variants.push_back(std::move(variant));
     }
     if (manifest.variants.empty()) {

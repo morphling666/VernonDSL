@@ -3,8 +3,11 @@
 
 #include "VernonRHI.h"
 
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -16,6 +19,9 @@ namespace vernon::execution {
 class ExecutionGraph;
 class CompiledExecutionGraph;
 class ExecutionSubmission;
+class ExecutionResources;
+class GraphPullback;
+class GraphBackwardSubmission;
 namespace detail {
 struct ExecutionGraphTestAccess;
 }
@@ -55,6 +61,7 @@ struct ResourceUse {
     uint32_t stageMask{};
     ImageUseRole imageRole{ImageUseRole::None};
     VernonRhiImageSubresourceRange imageSubresources{};
+    std::optional<GraphImage> image;
 };
 
 struct ColorAttachmentUse {
@@ -114,6 +121,76 @@ struct ExecutionBinding {
     std::shared_ptr<const ExecutionBindingValue> value;
 };
 
+enum class DerivativeEndpointKind : uint8_t { Resource, Parameter };
+
+struct DerivativeEndpointKey {
+    DerivativeEndpointKind kind{DerivativeEndpointKind::Resource};
+    uint32_t id{UINT32_MAX};
+
+    bool operator==(const DerivativeEndpointKey &other) const { return kind == other.kind && id == other.id; }
+};
+
+struct NamedDerivativeEndpoint {
+    std::string name;
+    DerivativeEndpointKey endpoint;
+};
+
+struct PassDerivativeMapping {
+    std::string path;
+    DerivativeEndpointKey endpoint;
+};
+
+class GraphAutodiffValue {
+public:
+    virtual ~GraphAutodiffValue() = default;
+    virtual uintptr_t logicalIdentity() const = 0;
+    virtual std::shared_ptr<GraphAutodiffValue> add(const GraphAutodiffValue &other, std::string &error) const = 0;
+};
+
+using NamedGraphAutodiffValues = std::vector<std::pair<std::string, std::shared_ptr<GraphAutodiffValue>>>;
+
+class PassPullback {
+public:
+    virtual ~PassPullback() = default;
+    virtual bool apply(const NamedGraphAutodiffValues &cotangents, NamedGraphAutodiffValues &gradients,
+                       std::string &error) = 0;
+    virtual uint64_t estimatedTapeBytes() const = 0;
+    virtual uint64_t logicalResidualBytes() const = 0;
+    virtual uint64_t residentTapeBytes() const = 0;
+    virtual uint64_t allocatedTapeBytes() const = 0;
+    virtual uint64_t activeOperationCount() const = 0;
+    virtual uint64_t recomputationCost() const = 0;
+    virtual uint64_t tapeContextLimitBytes() const = 0;
+};
+
+class DifferentiablePass {
+public:
+    virtual ~DifferentiablePass() = default;
+    virtual const std::vector<PassDerivativeMapping> &gradientMappings() const = 0;
+    virtual const std::vector<PassDerivativeMapping> &cotangentMappings() const = 0;
+    virtual bool forward(ComputeEncoder &encoder, const ExecutionResources &resources,
+                         std::unique_ptr<PassPullback> &pullback, std::string &error) = 0;
+    virtual bool zeroCotangent(const std::string &path, const ExecutionResources &resources,
+                               std::shared_ptr<GraphAutodiffValue> &value, std::string &error) = 0;
+    virtual bool implicitCotangent(const std::string &path, const ExecutionResources &resources,
+                                   std::shared_ptr<GraphAutodiffValue> &value, std::string &error) = 0;
+    virtual uint64_t estimatedResidualBytes() const { return 0; }
+    virtual uint64_t estimatedRetainedAllocationBytes() const = 0;
+    virtual uint64_t estimatedForwardPeakBytes() const { return estimatedRetainedAllocationBytes(); }
+    virtual uint64_t replayCost() const { return 0; }
+    virtual bool hasCheckpointPlanningMetadata() const { return false; }
+    virtual bool supportsReplay() const { return false; }
+};
+
+class GraphCheckpointResource {
+public:
+    virtual ~GraphCheckpointResource() = default;
+    virtual uint64_t byteSize() const = 0;
+    virtual uint64_t alignment() const { return 1; }
+    virtual bool copyTo(void *destination, uint64_t byteSize, std::string &error) const = 0;
+    virtual bool copyFrom(const void *source, uint64_t byteSize, std::string &error) = 0;
+};
+
 class ExecutionBindings {
 public:
     const std::shared_ptr<const ExecutionBindingValue> &at(ExecutionParameter parameter) const;
@@ -121,6 +198,7 @@ public:
 
 private:
     friend class CompiledExecutionGraph;
+    friend class GraphPullback;
     friend class ExecutionBindingsBuilder;
     friend class ExecutionResources;
     ExecutionBindings(uint64_t graphIdentity, std::vector<std::shared_ptr<const ExecutionBindingValue>> values)
@@ -146,6 +224,9 @@ private:
 
 class ExecutionResources {
 public:
+    ExecutionResources(const std::vector<GraphResource> &resources, const std::vector<VernonRhiBuffer> &buffers,
+                       std::shared_ptr<const ExecutionBindings> bindings)
+        : resources_(resources), buffers_(buffers), bindings_(std::move(bindings)) {}
     const std::vector<GraphResource> &all() const { return resources_; }
     bool buffer(GraphBuffer resource, VernonRhiBuffer &output) const;
     bool hasBindings() const { return static_cast<bool>(bindings_); }
@@ -153,10 +234,6 @@ public:
 
 private:
     friend class CompiledExecutionGraph;
-    ExecutionResources(const std::vector<GraphResource> &resources, const std::vector<VernonRhiBuffer> &buffers,
-                       std::shared_ptr<const ExecutionBindings> bindings)
-        : resources_(resources), buffers_(buffers), bindings_(std::move(bindings)) {}
-
     const std::vector<GraphResource> &resources_;
     const std::vector<VernonRhiBuffer> &buffers_;
     std::shared_ptr<const ExecutionBindings> bindings_;
@@ -178,6 +255,7 @@ public:
     virtual void declare() = 0;
 
 protected:
+    void ensureMutable() const;
     void read(GraphResource resource, VernonRhiResourceState state = VERNON_RHI_STATE_SHADER_READ,
               uint32_t stageMask = 0);
     void read(GraphImage resource, VernonRhiResourceState state = VERNON_RHI_STATE_SHADER_READ, uint32_t stageMask = 0);
@@ -193,10 +271,14 @@ protected:
 private:
     friend class ExecutionGraph;
     void resetDeclaration();
+    void finishDeclaration();
 
     std::string name_;
     uint32_t flags_{};
+    uint32_t configuredFlags_{};
+    bool declaring_{};
     ExecutionGraph *owner_{};
+    bool frozen_{};
     std::vector<ExecutionPass *> dependencies_;
     std::vector<ResourceUse> uses_;
 };
@@ -225,12 +307,50 @@ class ComputePass : public ExecutionPass {
 public:
     using ExecutionPass::ExecutionPass;
     virtual VernonRhiStatus execute(ComputeEncoder &encoder, const ExecutionResources &resources) = 0;
+    virtual DifferentiablePass *differentiable() { return nullptr; }
 };
 
 struct CompiledScope {
     bool rendering{};
     std::vector<uint32_t> passIndices;
     std::vector<VernonRhiBarrier> barriers;
+};
+
+struct AutodiffReplaySegment {
+    uint32_t beginStep{};
+    uint32_t endStep{};
+    uint32_t checkpointIndex{std::numeric_limits<uint32_t>::max()};
+    uint64_t transientResidualBytes{};
+    uint64_t peakBytes{};
+    uint64_t replayCost{};
+    std::vector<uint32_t> releaseCheckpointResources;
+};
+
+struct AutodiffCheckpointResource {
+    uint32_t producer{};
+    uint32_t resource{};
+    uint64_t offset{};
+    uint64_t byteSize{};
+    uint64_t alignment{1};
+    uint32_t firstCut{std::numeric_limits<uint32_t>::max()};
+    uint32_t lastCut{};
+};
+
+struct AutodiffLivenessCut {
+    uint32_t scheduleOffset{};
+    std::vector<uint32_t> checkpointResources;
+};
+
+struct AutodiffDagCheckpointPlan {
+    std::vector<AutodiffCheckpointResource> checkpointResources;
+    std::vector<AutodiffLivenessCut> cuts;
+    std::vector<AutodiffReplaySegment> replaySegments;
+    uint64_t persistentCheckpointBytes{};
+    uint64_t initialStateBytes{};
+    uint64_t restorationBytes{};
+    uint64_t memoryBudget{};
+    uint64_t peakBytes{};
+    uint64_t replayCost{};
 };
 
 namespace detail {
@@ -244,6 +364,7 @@ struct ExecutionResourceRecord {
     std::vector<uint64_t> imageViewKeys;
     VernonRhiBuffer buffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     VernonRhiImage image{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    std::shared_ptr<GraphCheckpointResource> checkpoint;
 };
 } // namespace detail
 
@@ -282,18 +403,23 @@ public:
 
     VernonRhiStatus createBuffer(const VernonRhiBufferDescriptor &descriptor, GraphBuffer &output,
                                  bool exported = false);
-    GraphBuffer importHostBuffer(uint64_t identity, bool exported = false);
+    GraphBuffer importHostBuffer(uint64_t identity, bool exported = false,
+                                 std::shared_ptr<GraphCheckpointResource> checkpoint = {});
     GraphBuffer importBuffer(VernonRhiBuffer buffer, bool exported = false);
     GraphImage importImage(VernonRhiImage image, VernonRhiImageView view, bool exported = false);
     ExecutionParameter parameter(std::string name);
+    void setAutodiffEndpoints(std::vector<NamedDerivativeEndpoint> differentiableInputs,
+                              std::vector<NamedDerivativeEndpoint> objectives);
+    void planAutodiffCheckpoints(uint64_t memoryBudget);
     std::shared_ptr<CompiledExecutionGraph> compile(std::string &error);
-    bool validate(std::string &error) const;
+    bool validate(std::string &error);
 
 private:
     friend class ExecutionPass;
     friend struct detail::ExecutionGraphTestAccess;
 
     bool buildPlan(std::string &error);
+    bool validateDeclarations(std::string &error) const;
 
     detail::ExecutionProvider provider_{detail::ExecutionProvider::Cpu};
     VernonRhiDevice device_;
@@ -308,6 +434,13 @@ private:
     std::unordered_map<std::string, uint32_t> parameterIds_;
     std::vector<uint32_t> schedule_;
     std::vector<CompiledScope> scopes_;
+    std::vector<uint32_t> autodiffInitialResources_;
+    std::vector<uint32_t> autodiffRestorationResources_;
+    AutodiffDagCheckpointPlan autodiffCheckpointPlan_;
+    uint64_t autodiffMemoryBudget_{};
+    bool hasAutodiffSchedule_{};
+    std::vector<NamedDerivativeEndpoint> differentiableInputs_;
+    std::vector<NamedDerivativeEndpoint> objectives_;
     bool dirty_{true};
     bool compiled_{};
 };
@@ -344,15 +477,57 @@ public:
 
     ExecutionBindingsBuilder createBindings(const std::vector<ExecutionBinding> &initial) const;
     ExecutionSubmission submit(std::shared_ptr<const ExecutionBindings> bindings = {}) const;
+    std::shared_ptr<GraphPullback> vjp(std::shared_ptr<const ExecutionBindings> bindings, std::string &error) const;
     const std::vector<uint32_t> &schedule() const;
     const std::vector<CompiledScope> &scopes() const;
+    const AutodiffDagCheckpointPlan *autodiffCheckpointPlan() const;
 
 private:
     friend class ExecutionGraph;
     friend class ExecutionSubmission;
+    friend class GraphPullback;
     struct State;
     explicit CompiledExecutionGraph(std::shared_ptr<State> state);
     std::shared_ptr<State> state_;
+};
+
+class GraphBackwardSubmission {
+public:
+    enum class State : uint8_t { Pending, Succeeded, Failed };
+
+    State state() const;
+    bool wait(std::string &error);
+    const NamedGraphAutodiffValues &gradients() const;
+
+private:
+    friend class GraphPullback;
+    State state_{State::Pending};
+    std::string error_;
+    NamedGraphAutodiffValues gradients_;
+};
+
+class GraphPullback {
+public:
+    ~GraphPullback();
+    GraphPullback(const GraphPullback &) = delete;
+    GraphPullback &operator=(const GraphPullback &) = delete;
+    ExecutionSubmission &forwardSubmission();
+    const ExecutionSubmission &forwardSubmission() const;
+    std::shared_ptr<GraphBackwardSubmission> submit(const NamedGraphAutodiffValues &cotangents, bool implicit);
+    uint64_t estimatedTapeBytes() const;
+    uint64_t logicalResidualBytes() const;
+    uint64_t residentTapeBytes() const;
+    uint64_t allocatedTapeBytes() const;
+    uint64_t checkpointBytes() const;
+    uint64_t peakRuntimeManagedBytes() const;
+    uint64_t tapeContextLimitBytes() const;
+    double recomputationFactor() const;
+
+private:
+    friend class CompiledExecutionGraph;
+    class Impl;
+    explicit GraphPullback(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
 };
 
 } // namespace vernon::execution

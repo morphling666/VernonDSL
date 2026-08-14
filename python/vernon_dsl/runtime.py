@@ -21,6 +21,7 @@ from ._runtime.execution_graph import (
     StoreOperation,
     SubmissionState,
 )
+from ._runtime.graph_autodiff import GraphBackwardSubmission, GraphPullback, VjpComputePass
 from ._runtime.kernel import Kernel
 from ._runtime.pipeline import Pipeline, PrimitiveTopology, lines, pipeline, points, triangles
 from ._runtime.resources import (
@@ -70,6 +71,8 @@ __all__ = [
     "ExecutionPass",
     "ExecutionResources",
     "ExecutionSubmission",
+    "GraphBackwardSubmission",
+    "GraphPullback",
     "GraphResource",
     "GraphicsEncoder",
     "LoadOperation",
@@ -81,6 +84,7 @@ __all__ = [
     "RenderPass",
     "StoreOperation",
     "SubmissionState",
+    "VjpComputePass",
     "TensorLayout",
     "TensorStorage",
     "TensorView",

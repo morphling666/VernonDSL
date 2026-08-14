@@ -9,147 +9,97 @@ import vernon_dsl as vd
 
 from examples.autodiff_smoke_fluid_graph import build_smoke_fluid_graph
 from examples.autodiff_smoke_fluid_kernels import SmokeFluidParameters, smoke_loss
+from examples.autodiff_smoke_mpc import (
+    SmokeFluidSimulation,
+    evaluate_initial_velocity,
+    optimize_initial_velocity,
+    v_target,
+)
 
 
 def _bilinear(field: np.ndarray, x: float, y: float, width: int, height: int) -> np.ndarray:
-    sample_x = np.clip(np.float32(x), np.float32(0.0), np.float32(width - 1) - np.float32(0.001))
-    sample_y = np.clip(np.float32(y), np.float32(0.0), np.float32(height - 1) - np.float32(0.001))
+    sample_x = np.float32(x) % np.float32(width)
+    sample_y = np.float32(y) % np.float32(height)
     x0 = int(np.floor(sample_x))
     y0 = int(np.floor(sample_y))
     tx = np.float32(sample_x - np.float32(x0))
     ty = np.float32(sample_y - np.float32(y0))
-    lower = field[y0, x0] * (np.float32(1.0) - tx) + field[y0, x0 + 1] * tx
-    upper = field[y0 + 1, x0] * (np.float32(1.0) - tx) + field[y0 + 1, x0 + 1] * tx
+    x1 = (x0 + 1) % width
+    y1 = (y0 + 1) % height
+    lower = field[y0, x0] * (np.float32(1.0) - tx) + field[y0, x1] * tx
+    upper = field[y1, x0] * (np.float32(1.0) - tx) + field[y1, x1] * tx
     return lower * (np.float32(1.0) - ty) + upper * ty
 
 
 def smoke_reference(
     density: np.ndarray,
     velocity: np.ndarray,
-    controls: np.ndarray,
     target: np.ndarray,
     *,
     pressure_iterations: int,
-    delta_time: np.float32,
 ) -> tuple[np.ndarray, np.ndarray, np.float32]:
     height, width = density.shape
-    nozzle_count = len(controls)
-    forced_density = np.zeros_like(density)
-    forced_velocity = np.zeros_like(velocity)
-    for y in range(1, height - 1):
-        for x in range(1, width - 1):
-            nozzle = int(np.float32(x) * np.float32(nozzle_count) / np.float32(width))
-            center = (np.float32(nozzle) + np.float32(0.5)) * (np.float32(width) / np.float32(nozzle_count))
-            horizontal = np.clip(
-                np.float32(1.0) - np.abs(np.float32(x) - center) * np.float32(0.25),
-                np.float32(0.0),
-                np.float32(1.0),
-            )
-            source_height = np.float32(height) * np.float32(0.125)
-            source_bottom = np.float32(height) - source_height - np.float32(2.0)
-            vertical = np.clip(
-                (np.float32(y) - source_bottom) / source_height,
-                np.float32(0.0),
-                np.float32(1.0),
-            )
-            source = controls[nozzle] * horizontal * vertical
-            curl = (
-                np.sin(np.float32(y) * np.float32(0.23) + np.float32(nozzle) * np.float32(1.7))
-                * (density[y, x] + source)
-                * delta_time
-                * np.float32(0.12)
-            )
-            forced_density[y, x] = np.clip(
-                density[y, x] * np.float32(0.995) + source * delta_time * np.float32(3.0),
-                np.float32(0.0),
-                np.float32(2.0),
-            )
-            forced_velocity[y, x, 0] = (
-                velocity[y, x, 0]
-                + (np.float32(nozzle) - (np.float32(nozzle_count) - np.float32(1.0)) * np.float32(0.5))
-                * source
-                * delta_time
-                * np.float32(0.08)
-                + curl
-            )
-            forced_velocity[y, x, 1] = (
-                velocity[y, x, 1] - (density[y, x] * np.float32(0.9) + source * np.float32(1.6)) * delta_time
-            )
-
     advected_velocity = np.zeros_like(velocity)
-    for y in range(1, height - 1):
-        for x in range(1, width - 1):
-            local_velocity = forced_velocity[y, x]
+    for y in range(height):
+        for x in range(width):
+            local_velocity = velocity[y, x]
             advected_velocity[y, x] = _bilinear(
-                forced_velocity,
-                np.float32(x) - local_velocity[0] * delta_time,
-                np.float32(y) - local_velocity[1] * delta_time,
+                velocity,
+                np.float32(x) - local_velocity[0],
+                np.float32(y) - local_velocity[1],
                 width,
                 height,
-            ) * np.float32(0.998)
+            )
 
     divergence = np.zeros_like(density)
-    for y in range(1, height - 1):
-        for x in range(1, width - 1):
+    for y in range(height):
+        for x in range(width):
             divergence[y, x] = (
-                advected_velocity[y, x + 1, 0]
-                - advected_velocity[y, x - 1, 0]
-                + advected_velocity[y + 1, x, 1]
-                - advected_velocity[y - 1, x, 1]
+                advected_velocity[y, (x + 1) % width, 0]
+                - advected_velocity[y, (x - 1) % width, 0]
+                + advected_velocity[(y + 1) % height, x, 1]
+                - advected_velocity[(y - 1) % height, x, 1]
             ) * np.float32(0.5)
 
     pressure_input = np.zeros_like(density)
     pressure_output = np.zeros_like(density)
     for _ in range(pressure_iterations):
         pressure_output.fill(np.float32(0.0))
-        for y in range(1, height - 1):
-            for x in range(1, width - 1):
+        for y in range(height):
+            for x in range(width):
                 pressure_output[y, x] = (
-                    pressure_input[y, x - 1]
-                    + pressure_input[y, x + 1]
-                    + pressure_input[y - 1, x]
-                    + pressure_input[y + 1, x]
+                    pressure_input[y, (x - 1) % width]
+                    + pressure_input[y, (x + 1) % width]
+                    + pressure_input[(y - 1) % height, x]
+                    + pressure_input[(y + 1) % height, x]
                     - divergence[y, x]
                 ) * np.float32(0.25)
         pressure_input, pressure_output = pressure_output, pressure_input
 
     projected_velocity = np.zeros_like(velocity)
-    for y in range(1, height - 1):
-        for x in range(1, width - 1):
+    for y in range(height):
+        for x in range(width):
             projected_velocity[y, x, 0] = advected_velocity[y, x, 0] - (
-                pressure_input[y, x + 1] - pressure_input[y, x - 1]
+                pressure_input[y, (x + 1) % width] - pressure_input[y, (x - 1) % width]
             ) * np.float32(0.5)
             projected_velocity[y, x, 1] = advected_velocity[y, x, 1] - (
-                pressure_input[y + 1, x] - pressure_input[y - 1, x]
+                pressure_input[(y + 1) % height, x] - pressure_input[(y - 1) % height, x]
             ) * np.float32(0.5)
 
     output_density = np.zeros_like(density)
-    for y in range(1, height - 1):
-        for x in range(1, width - 1):
+    for y in range(height):
+        for x in range(width):
             local_velocity = projected_velocity[y, x]
-            transported = _bilinear(
-                forced_density,
-                np.float32(x) - local_velocity[0] * delta_time,
-                np.float32(y) - local_velocity[1] * delta_time,
+            output_density[y, x] = _bilinear(
+                density,
+                np.float32(x) - local_velocity[0],
+                np.float32(y) - local_velocity[1],
                 width,
                 height,
-            )
-            laplacian = (
-                forced_density[y, x - 1]
-                + forced_density[y, x + 1]
-                + forced_density[y - 1, x]
-                + forced_density[y + 1, x]
-                - forced_density[y, x] * np.float32(4.0)
-            )
-            output_density[y, x] = np.clip(
-                (transported + laplacian * np.float32(0.0008)) * np.float32(0.996),
-                np.float32(0.0),
-                np.float32(2.0),
             )
 
     difference = output_density - target
     loss = np.sum(difference * difference, dtype=np.float32)
-    loss += np.sum(controls * controls * np.float32(0.002), dtype=np.float32)
     return output_density, projected_velocity, np.float32(loss / np.float32(width * height))
 
 
@@ -162,30 +112,26 @@ class SmokeFluidGraphTests(unittest.TestCase):
             raise unittest.SkipTest("native Vernon compiler and runtime are unavailable") from error
 
     @staticmethod
-    def _inputs(size: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _inputs(size: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         generator = np.random.default_rng(7000 + size)
         density = generator.uniform(0.0, 0.7, size=(size, size)).astype(np.float32)
         velocity = generator.uniform(-0.12, 0.12, size=(size, size, 2)).astype(np.float32)
-        controls = np.array((0.2, 0.35, 0.5, 0.65), dtype=np.float32)
         target = generator.uniform(0.0, 1.0, size=(size, size)).astype(np.float32)
-        return density, velocity, controls, target
+        return density, velocity, target
 
     def _run(self, architecture: object, size: int, pressure_iterations: int = 3):
         vd.init(arch=architecture)  # type: ignore[arg-type]
-        density, velocity, controls, target = self._inputs(size)
+        density, velocity, target = self._inputs(size)
         velocity_storage = vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(size, size))
         velocity_storage.copy_from_numpy(velocity)
         parameters = cast(Any, SmokeFluidParameters)(
             width=np.int32(size),
             height=np.int32(size),
-            nozzle_count=np.int32(len(controls)),
             pressure_iterations=np.int32(pressure_iterations),
-            delta_time=np.float32(0.12),
         )
         graph = build_smoke_fluid_graph(
             state_density=vd.storage.from_numpy(density),
             state_velocity=velocity_storage,
-            control_nozzles=vd.storage.from_numpy(controls),
             objective_target_density=vd.storage.from_numpy(target),
             parameters=parameters,
         )
@@ -198,10 +144,8 @@ class SmokeFluidGraphTests(unittest.TestCase):
             smoke_reference(
                 density,
                 velocity,
-                controls,
                 target,
                 pressure_iterations=pressure_iterations,
-                delta_time=np.float32(0.12),
             ),
         )
 
@@ -213,7 +157,7 @@ class SmokeFluidGraphTests(unittest.TestCase):
                 np.testing.assert_allclose(velocity, expected[1], rtol=2.0e-5, atol=2.0e-6)
                 np.testing.assert_allclose(loss[0], expected[2], rtol=2.0e-5, atol=2.0e-6)
                 self.assertEqual(graph.grid, ((size + 15) // 16, (size + 15) // 16, 1))
-                self.assertEqual(len(graph.graph.schedule), 9)
+                self.assertEqual(len(graph.graph.schedule), 8)
 
     def test_available_gpu_backends_match_cpu(self) -> None:
         expected_density, expected_velocity, expected_loss, _, _ = self._run(vd.cpu, 17)
@@ -235,6 +179,166 @@ class SmokeFluidGraphTests(unittest.TestCase):
         self.assertEqual(graph.graph.schedule[-1].name, "smoke-loss")
         _, _, _, odd_graph, _ = self._run(vd.cpu, 6, pressure_iterations=3)
         self.assertIs(odd_graph.final_pressure, odd_graph.pressure_b)
+
+    def test_zero_state_is_invariant(self) -> None:
+        vd.init(arch=vd.cpu)
+        simulation = SmokeFluidSimulation(grid=16, pressure_iterations=4)
+        simulation.step(np.zeros((16, 16), dtype=np.float32))
+        np.testing.assert_array_equal(simulation.density_numpy(), np.zeros((16, 16), dtype=np.float32))
+        np.testing.assert_array_equal(simulation.velocity_numpy(), np.zeros((16, 16, 2), dtype=np.float32))
+        np.testing.assert_array_equal(simulation.output_loss.to_numpy(), np.zeros((1,), dtype=np.float32))
+
+    def test_single_step_velocity_gradient_matches_finite_difference(self) -> None:
+        vd.init(arch=vd.cpu)
+        size = 4
+        pressure_iterations = 1
+        density, velocity, target = self._inputs(size)
+        velocity_storage = vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(size, size))
+        velocity_storage.copy_from_numpy(velocity)
+        parameters = cast(Any, SmokeFluidParameters)(
+            width=np.int32(size),
+            height=np.int32(size),
+            pressure_iterations=np.int32(pressure_iterations),
+        )
+        graph = build_smoke_fluid_graph(
+            state_density=vd.storage.from_numpy(density),
+            state_velocity=velocity_storage,
+            objective_target_density=vd.storage.from_numpy(target),
+            parameters=parameters,
+            differentiable=True,
+        )
+
+        pullback = graph.vjp()
+        self.assertGreater(pullback.estimated_tape_bytes, 0)
+        self.assertGreater(pullback.logical_residual_bytes, 0)
+        self.assertLessEqual(pullback.logical_residual_bytes, pullback.estimated_tape_bytes)
+        self.assertGreaterEqual(pullback.resident_tape_bytes, pullback.logical_residual_bytes)
+        self.assertGreaterEqual(pullback.allocated_tape_bytes, pullback.resident_tape_bytes)
+        self.assertGreaterEqual(pullback.recomputation_factor, 1.0)
+        gradients = pullback(
+            {
+                "density": np.zeros((size, size), dtype=np.float32),
+                "velocity": vd.storage.tangent_zeros(
+                    dtype=vd.Vector[vd.f32, 2],
+                    shape=(size, size),
+                ),
+                "loss": np.ones((1,), dtype=np.float32),
+            }
+        )
+        analytic = gradients["state_velocity"].to_numpy()
+        epsilon = np.float32(2.0e-3)
+        numerical = np.zeros_like(velocity)
+        for index in np.ndindex(velocity.shape):
+            lower = velocity.copy()
+            upper = velocity.copy()
+            lower[index] -= epsilon
+            upper[index] += epsilon
+            lower_loss = smoke_reference(
+                density,
+                lower,
+                target,
+                pressure_iterations=pressure_iterations,
+            )[2]
+            upper_loss = smoke_reference(
+                density,
+                upper,
+                target,
+                pressure_iterations=pressure_iterations,
+            )[2]
+            numerical[index] = (upper_loss - lower_loss) / (np.float32(2.0) * epsilon)
+
+        np.testing.assert_allclose(analytic, numerical, rtol=2.0e-2, atol=2.0e-3)
+
+    def test_phase2_tape_telemetry_for_ci_grids(self) -> None:
+        vd.init(arch=vd.cpu)
+        for size in (32, 64):
+            simulation = SmokeFluidSimulation(grid=size, pressure_iterations=1, differentiable=True)
+            pullback = simulation.step_vjp(v_target(size))
+            logical = pullback.logical_residual_bytes
+            resident = pullback.resident_tape_bytes
+            allocated = pullback.allocated_tape_bytes
+            self.assertGreater(pullback.estimated_tape_bytes, 0)
+            self.assertGreater(logical, 0)
+            self.assertGreaterEqual(resident, logical)
+            self.assertGreaterEqual(allocated, resident)
+            self.assertEqual(pullback.tape_context_limit_bytes, 256 * 1024 * 1024)
+            self.assertLessEqual(pullback.peak_runtime_managed_bytes, pullback.tape_context_limit_bytes)
+            self.assertLessEqual(
+                resident / logical,
+                3.5,
+                "resident/logical regression tolerance is frozen at 3.5 for normal CI grids",
+            )
+            pullback(
+                {
+                    "density": np.zeros((size, size), dtype=np.float32),
+                    "velocity": vd.storage.tangent_zeros(
+                        dtype=vd.Vector[vd.f32, 2],
+                        shape=(size, size),
+                    ),
+                    "loss": np.ones((1,), dtype=np.float32),
+                }
+            )
+            self.assertEqual(pullback.reverse_python_callback_count, 9)
+
+    def test_checkpointed_initial_velocity_gradient_matches_finite_difference(self) -> None:
+        vd.init(arch=vd.cpu)
+        size = 4
+        generator = np.random.default_rng(481)
+        density = generator.uniform(0.0, 0.7, size=(size, size)).astype(np.float32)
+        velocity = generator.uniform(-0.08, 0.08, size=(size, size, 2)).astype(np.float32)
+        target = generator.uniform(0.0, 1.0, size=(size, size)).astype(np.float32)
+        targets = np.zeros((2, size, size), dtype=np.float32)
+        targets[-1] = target
+        simulation = SmokeFluidSimulation(
+            grid=size,
+            pressure_iterations=1,
+            differentiable=True,
+        )
+        _, velocity_gradient = evaluate_initial_velocity(
+            simulation,
+            initial_density=density,
+            initial_velocity=velocity,
+            target=target,
+            horizon=2,
+        )
+
+        def reference_loss(initial_velocity: np.ndarray) -> np.float32:
+            state_density = density
+            state_velocity = initial_velocity
+            loss = np.float32(0.0)
+            for step in range(2):
+                state_density, state_velocity, loss = smoke_reference(
+                    state_density,
+                    state_velocity,
+                    targets[step],
+                    pressure_iterations=1,
+                )
+            return loss
+
+        epsilon = np.float32(2.0e-3)
+        for index in ((1, 1, 0), (2, 2, 1)):
+            lower = velocity.copy()
+            upper = velocity.copy()
+            lower[index] -= epsilon
+            upper[index] += epsilon
+            numerical = (reference_loss(upper) - reference_loss(lower)) / (np.float32(2.0) * epsilon)
+            np.testing.assert_allclose(
+                velocity_gradient[index],
+                numerical,
+                rtol=4.0e-2,
+                atol=3.0e-3,
+            )
+
+    def test_initial_velocity_optimization_reduces_terminal_objective(self) -> None:
+        result = optimize_initial_velocity(
+            grid=8,
+            horizon=4,
+            iterations=2,
+            pressure_iterations=1,
+            verbose=False,
+        )
+        self.assertLess(result.objective_history[1], result.objective_history[0])
+        self.assertEqual(result.initial_velocity.shape, (8, 8, 2))
 
 
 if __name__ == "__main__":

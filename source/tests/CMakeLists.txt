@@ -395,9 +395,6 @@ if(TARGET VernonRuntime)
             vernonRegisterDynamicV2MixedAliasFixture
             dynamic_v2_mixed_alias_manifest
             dynamic_v2_mixed_alias_fixture_target)
-        # Smoke-fluid graph VJP and its cooked fixture are deferred until the multi-dispatch ExecutionGraph autodiff
-        # contract is implemented.
-
         add_executable(VernonStructuredScalarAutodiffTests runtime/runtime_structured_scalar_autodiff_test.cpp)
         target_link_libraries(
             VernonStructuredScalarAutodiffTests
@@ -811,12 +808,27 @@ if(TARGET VernonDSLCompiler)
         add_test(NAME vernon-python-smoke-fluid-graph
                  COMMAND ${Python_EXECUTABLE} -m unittest discover -s "${VERNON_REPOSITORY_ROOT}/python/tests" -p
                          "test_smoke_fluid_graph.py")
+        add_test(NAME vernon-python-execution-graph
+                 COMMAND ${Python_EXECUTABLE} -m unittest discover -s "${VERNON_REPOSITORY_ROOT}/python/tests" -p
+                         "test_execution_graph.py")
+        add_test(NAME vernon-python-autodiff-phase2-benchmark
+                 COMMAND ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/scripts/benchmark_autodiff_smoke_phase2.py"
+                         --grids 32 64 --output "${VERNON_TEST_BINARY_ROOT}/autodiff_phase2_benchmark_ci.json")
         set_tests_properties(
-            vernon-python-test_storage_vjp_contract vernon-python-smoke-fluid-graph
+            vernon-python-test_storage_vjp_contract
+            vernon-python-smoke-fluid-graph
+            vernon-python-execution-graph
+            vernon-python-autodiff-phase2-benchmark
             PROPERTIES ENVIRONMENT
                        "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python"
                        WORKING_DIRECTORY
                        "${VERNON_REPOSITORY_ROOT}")
+        set_tests_properties(
+            vernon-python-autodiff-phase2-benchmark
+            PROPERTIES TIMEOUT
+                       300
+                       LABELS
+                       benchmark)
         add_test(NAME vernon-python-native-compiled-program
                  COMMAND ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/python/tests/test_native_compiled_program.py")
         add_test(NAME vernon-python-kernel-memory-phase-compile

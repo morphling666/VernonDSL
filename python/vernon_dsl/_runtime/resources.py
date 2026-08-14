@@ -654,6 +654,45 @@ class TensorStorage:
             return self._array[_VALUE_FIELD]
         return self._array
 
+    @staticmethod
+    def _add_gradients(left: TensorStorage, right: TensorStorage | np.ndarray) -> TensorStorage:
+        if not isinstance(left, TensorStorage):
+            raise TypeError("graph gradient accumulation requires TensorStorage")
+        left._ensure_host_read_allowed()
+        left.synchronize()
+        if isinstance(right, TensorStorage):
+            right._ensure_host_read_allowed()
+            right.synchronize()
+            if left.shape != right.shape:
+                raise ValueError("graph cotangent contributions have incompatible shapes")
+            if (left._element_layout is None) != (right._element_layout is None):
+                raise ValueError("graph cotangent contributions have incompatible tangent layouts")
+            if left._element_layout is not None:
+                if (
+                    right._element_layout is None
+                    or left._element_layout.layout_hash != right._element_layout.layout_hash
+                ):
+                    raise ValueError("graph cotangent contributions have incompatible tangent layouts")
+                result = TensorStorage._tangent_zeros(left._element_layout, left.shape)
+                for leaf in left._element_layout.leaves:
+                    np.add(
+                        left[leaf.path]._native_host_array(),
+                        right[leaf.path]._native_host_array(),
+                        out=result[leaf.path]._native_host_array(),
+                    )
+                return result
+            right_array = right._native_host_array()
+        else:
+            if left._element_layout is not None:
+                raise ValueError("packed tangent cotangents require matching TensorStorage contributions")
+            right_array = np.asarray(right)
+        left_array = left._native_host_array()
+        if left_array.shape != right_array.shape or left_array.dtype != right_array.dtype:
+            raise ValueError("graph cotangent contributions have incompatible shapes or dtypes")
+        result = TensorStorage(np.empty_like(left_array, order="C"))
+        np.add(left_array, right_array, out=result._native_host_array())
+        return result
+
     def _materialize_gradient(
         self,
         gradient: np.ndarray,

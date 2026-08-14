@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <filesystem>
@@ -93,6 +94,20 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
         };
         VernonAdValueSet gradients{sizeof(VernonAdValueSet), gradientValues, 3, {}};
         ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(context);
+        for (unsigned index = 0; index < 3; ++index)
+            EXPECT_NEAR(gradientValuesStorage[index], 6.0 * seedValue * finiteDifference(x, y, z, index), 3e-3);
+
+        float logicalSeedValues[laneCount];
+        std::fill(std::begin(logicalSeedValues), std::end(logicalSeedValues), seedValue);
+        VernonAdValue logicalSeed{sizeof(VernonAdValue),
+                                  {"output", 6},
+                                  VERNON_DATA_F32,
+                                  logicalSeedValues,
+                                  sizeof(logicalSeedValues),
+                                  3,
+                                  outputShape};
+        VernonAdValueSet logicalSeeds{sizeof(VernonAdValueSet), &logicalSeed, 1, {}};
+        ASSERT_EQ(vernonPullbackApply(pullback, &logicalSeeds, &gradients), VERNON_STATUS_OK) << lastError(context);
         for (unsigned index = 0; index < 3; ++index)
             EXPECT_NEAR(gradientValuesStorage[index], 6.0 * seedValue * finiteDifference(x, y, z, index), 3e-3);
 

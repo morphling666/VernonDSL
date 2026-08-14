@@ -320,6 +320,13 @@ DifferentiationRule::DifferentiationRule(std::string registryKey, std::optional<
       vjpPrimalRequirements(std::move(vjpPrimalRequirements)), vjpBuilder(std::move(vjpBuilder)),
       jvpBuilder(std::move(jvpBuilder)), verifier(std::move(verifier)) {}
 
+bool AutodiffPrimalRequirement::isRequiredFor(ArrayRef<unsigned> activeOperands) const {
+    if (contributionOperands.empty() || activeOperands.empty())
+        return true;
+    return llvm::any_of(contributionOperands,
+                        [&](unsigned operand) { return llvm::is_contained(activeOperands, operand); });
+}
+
 LogicalResult DifferentiationRule::verifyCompatibility(Operation *operation) const {
     if (getRuleKey(operation) != registryKey)
         return operation->emitOpError() << "was passed to the autodiff rule for '" << registryKey << "'";
@@ -365,6 +372,8 @@ FailureOr<SmallVector<Value>> DifferentiationRule::buildVjp(Operation *operation
     if (failed(derivativeType) || context.resultCotangents.front().getType() != *derivativeType)
         return operation->emitOpError("autodiff VJP cotangent has an incompatible derivative type");
     for (const AutodiffPrimalRequirement &requirement : vjpPrimalRequirements) {
+        if (!requirement.isRequiredFor(context.activeOperandIndices))
+            continue;
         Value primal = requirement.kind == AutodiffPrimalKind::Operand ? context.getPrimalOperand(requirement.index)
                                                                        : context.getPrimalResult(requirement.index);
         if (!primal)
@@ -375,7 +384,9 @@ FailureOr<SmallVector<Value>> DifferentiationRule::buildVjp(Operation *operation
         return failure();
     if (contributions.size() != operation->getNumOperands())
         return operation->emitOpError("autodiff VJP builder returned the wrong number of operand contributions");
-    for (auto [contribution, operand] : llvm::zip_equal(contributions, operation->getOperands())) {
+    for (unsigned operandIndex = 0; operandIndex < contributions.size(); ++operandIndex) {
+        Value contribution = contributions[operandIndex];
+        Value operand = operation->getOperand(operandIndex);
         FailureOr<Type> expectedType = getDerivativeValueType(operand.getType());
         if (failed(expectedType)) {
             if (contribution)
@@ -383,7 +394,8 @@ FailureOr<SmallVector<Value>> DifferentiationRule::buildVjp(Operation *operation
                     "autodiff VJP builder returned a contribution for a non-differentiable operand");
             continue;
         }
-        if (!contribution || contribution.getType() != *expectedType)
+        if ((!contribution && context.isOperandActive(operandIndex)) ||
+            (contribution && contribution.getType() != *expectedType))
             return operation->emitOpError("autodiff VJP builder returned an incompatible contribution type");
     }
     return contributions;
@@ -462,17 +474,26 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
                      results.append({seed, negative(context.builder, context.location, seed)});
                      return success();
                  }));
-    add(makeRule(arith::MulFOp::getOperationName(), 2, {Requirement::operand(0), Requirement::operand(1)},
-                 [](Operation *operation, const AutodiffVjpBuildContext &context, SmallVectorImpl<Value> &results) {
+    add(makeRule(arith::MulFOp::getOperationName(), 2, {Requirement::operand(0, {1}), Requirement::operand(1, {0})},
+                 [](Operation *operation, const AutodiffVjpBuildContext &context,
+                    SmallVectorImpl<Value> &results) -> LogicalResult {
                      Value seed = context.resultCotangents[0];
-                     Value left =
-                         castPrimal(context.builder, context.location, context.getPrimalOperand(0), seed.getType());
-                     Value right =
-                         castPrimal(context.builder, context.location, context.getPrimalOperand(1), seed.getType());
-                     if (failed(requireValues(operation, {left, right})))
-                         return failure();
-                     results.push_back(arith::MulFOp::create(context.builder, context.location, seed, right));
-                     results.push_back(arith::MulFOp::create(context.builder, context.location, seed, left));
+                     Value left;
+                     Value right;
+                     if (context.isOperandActive(1))
+                         left =
+                             castPrimal(context.builder, context.location, context.getPrimalOperand(0), seed.getType());
+                     if (context.isOperandActive(0))
+                         right =
+                             castPrimal(context.builder, context.location, context.getPrimalOperand(1), seed.getType());
+                     if ((context.isOperandActive(1) && !left) || (context.isOperandActive(0) && !right))
+                         return operation->emitOpError("autodiff multiplication rule omitted a required primal");
+                     results.push_back(context.isOperandActive(0)
+                                           ? arith::MulFOp::create(context.builder, context.location, seed, right)
+                                           : Value{});
+                     results.push_back(context.isOperandActive(1)
+                                           ? arith::MulFOp::create(context.builder, context.location, seed, left)
+                                           : Value{});
                      return success();
                  }));
     add(makeRule(arith::DivFOp::getOperationName(), 2, {Requirement::operand(0), Requirement::operand(1)},
@@ -551,6 +572,12 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
                 return operation->emitOpError("clamp VJP requires three matching floating scalar operands");
             return success();
         }));
+    add(makeRule(math::FloorOp::getOperationName(), 1, {},
+                 [](Operation *, const AutodiffVjpBuildContext &context, SmallVectorImpl<Value> &results) {
+                     results.push_back(
+                         constant(context.builder, context.location, context.resultCotangents[0].getType(), 0.0));
+                     return success();
+                 }));
     add(makeRule(math::SinOp::getOperationName(), 1, {Requirement::operand(0)},
                  [](Operation *operation, const AutodiffVjpBuildContext &context, SmallVectorImpl<Value> &results) {
                      Value seed = context.resultCotangents[0];

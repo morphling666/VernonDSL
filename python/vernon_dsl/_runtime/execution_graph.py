@@ -565,9 +565,10 @@ class ExecutionSubmission:
 
 
 class ExecutionBindings:
-    def __init__(self, plan: CompiledExecutionGraph, native: Any):
+    def __init__(self, plan: CompiledExecutionGraph, native: Any, values: Mapping[ExecutionParameter, Any]):
         self._plan = plan
         self._native = native
+        self._values = dict(values)
 
     def update(self, changes: Mapping[ExecutionParameter, Any]) -> ExecutionBindings:
         self._plan._ensure_current()
@@ -579,6 +580,7 @@ class ExecutionBindings:
             snapshots.append((parameter, _snapshot_parameter_value(value)))
         for parameter, value in snapshots:
             self._native.set(parameter._native, value)
+            self._values[parameter] = value
         return self
 
 
@@ -590,10 +592,13 @@ class CompiledExecutionGraph:
         self._passes = tuple(builder._passes)
         self._resources = tuple(builder._resources)
         self._parameters = tuple(builder._parameters)
+        self._differentiable_inputs = dict(builder._differentiable_inputs)
+        self._objectives = dict(builder._objectives)
         self._schedule = tuple(self._passes[index] for index in native.schedule)
         self._borrows = [
             borrow
             for execution_pass in self._schedule
+            if not getattr(execution_pass, "_manages_borrows", False)
             for borrow in execution_pass._borrow_uses
             if isinstance(borrow[1], (TensorStorage, RawBuffer, TensorView, _TextureResource))
         ]
@@ -650,6 +655,10 @@ class CompiledExecutionGraph:
     def scopes(self) -> tuple[CompiledScope, ...]:
         return self._scopes
 
+    @property
+    def autodiff_checkpoint_plan(self) -> Mapping[str, Any] | None:
+        return self._ensure_current().autodiff_checkpoint_plan
+
     def _validate_resource(self, resource: GraphResource) -> None:
         if (
             not isinstance(resource, GraphResource)
@@ -682,7 +691,14 @@ class CompiledExecutionGraph:
         if len(initial) != len(self._parameters) or any(parameter not in initial for parameter in self._parameters):
             raise ValueError("initial execution bindings must bind every parameter exactly once")
         entries = [(parameter._native, _snapshot_parameter_value(initial[parameter])) for parameter in self._parameters]
-        return ExecutionBindings(self, native.create_bindings(entries))
+        return ExecutionBindings(
+            self,
+            native.create_bindings(entries),
+            {
+                parameter: value
+                for parameter, value in zip(self._parameters, (entry[1] for entry in entries), strict=True)
+            },
+        )
 
     def submit(self, bindings: ExecutionBindings | None = None) -> ExecutionSubmission:
         native = self._ensure_current()
@@ -694,11 +710,22 @@ class CompiledExecutionGraph:
         try:
             native_submission = native.submit(None if bindings is None else bindings._native)
         except Exception:
-            lease.release()
+            if lease is not None:
+                lease.release()
             raise
         submission = ExecutionSubmission(native_submission, self, lease)
         submission._release_if_complete()
         return submission
+
+    def vjp(self, bindings: ExecutionBindings | None = None) -> Any:
+        from .graph_autodiff import GraphPullback
+
+        native = self._ensure_current()
+        if bindings is not None and (not isinstance(bindings, ExecutionBindings) or bindings._plan is not self):
+            raise ValueError("execution bindings do not belong to this compiled execution graph")
+        if bindings is None and self._parameters:
+            raise ValueError("compiled execution graph requires parameter bindings")
+        return GraphPullback(native.vjp(None if bindings is None else bindings._native), self)
 
 
 class ExecutionGraph:
@@ -711,6 +738,8 @@ class ExecutionGraph:
         self._resource_by_identity: dict[int, GraphResource] = {}
         self._parameters: list[ExecutionParameter] = []
         self._parameter_by_name: dict[str, ExecutionParameter] = {}
+        self._differentiable_inputs: dict[str, GraphResource | ExecutionParameter] = {}
+        self._objectives: dict[str, GraphResource] = {}
         self._native_graph = (
             state._native_runtime.create_execution_graph() if state._native_runtime is not None else None
         )
@@ -739,7 +768,8 @@ class ExecutionGraph:
             return existing
         state = _session_state()
         if state._architecture == state.cpu and isinstance(value, (TensorStorage, TensorView, RawBuffer)):
-            native_resource = native_graph.import_host_buffer(identity, exported)
+            checkpoint_owner = _resource_identity(value)
+            native_resource = native_graph.import_host_buffer(identity, checkpoint_owner._array, exported)
         elif isinstance(value, _TextureResource):
             native_resource = native_graph.import_image(value._resident_view(), exported)
         elif isinstance(value, RenderTarget):
@@ -765,6 +795,46 @@ class ExecutionGraph:
         self._parameters.append(parameter)
         self._parameter_by_name[name] = parameter
         return parameter
+
+    def differentiable_input(
+        self,
+        name: str,
+        value: GraphResource | ExecutionParameter | Any,
+    ) -> GraphResource | ExecutionParameter:
+        if not isinstance(name, str) or not name:
+            raise ValueError("differentiable input name must be a non-empty string")
+        if name in self._differentiable_inputs:
+            raise ValueError(f"differentiable input name {name!r} is already defined")
+        endpoint = value if isinstance(value, (GraphResource, ExecutionParameter)) else self.import_resource(value)
+        if isinstance(endpoint, GraphResource):
+            self._validate_resource(endpoint)
+        else:
+            self._validate_parameter(endpoint)
+        if any(
+            type(candidate) is type(endpoint) and candidate._native is endpoint._native
+            for candidate in self._differentiable_inputs.values()
+        ):
+            raise ValueError("a graph value cannot be declared as two differentiable inputs")
+        self._differentiable_inputs[name] = endpoint
+        return endpoint
+
+    def objective(self, name: str, value: GraphResource | Any) -> GraphResource:
+        if not isinstance(name, str) or not name:
+            raise ValueError("objective name must be a non-empty string")
+        if name in self._objectives:
+            raise ValueError(f"objective name {name!r} is already defined")
+        resource = value if isinstance(value, GraphResource) else self.import_resource(value)
+        self._validate_resource(resource)
+        if any(candidate.id == resource.id for candidate in self._objectives.values()):
+            raise ValueError("a graph resource cannot be declared as two objectives")
+        self._objectives[name] = resource
+        return resource
+
+    def plan_autodiff_checkpoints(self, *, memory_budget: int) -> None:
+        native_graph = self._ensure_current()
+        if isinstance(memory_budget, bool) or not isinstance(memory_budget, int) or memory_budget < 0:
+            raise ValueError("autodiff checkpoint memory budget must be a non-negative integer")
+        native_graph.plan_autodiff_checkpoints(memory_budget)
 
     def add_pass(self, execution_pass: ExecutionPass) -> ExecutionPass:
         native_graph = self._ensure_current()
@@ -830,8 +900,6 @@ class ExecutionGraph:
     def validate(self) -> None:
         native_graph = self._ensure_current()
         self._validate_structure()
-        for execution_pass in self._passes:
-            execution_pass._native_declare()
         native_graph.validate()
 
     def compile(self) -> CompiledExecutionGraph:
@@ -840,6 +908,17 @@ class ExecutionGraph:
         self._sync_dependencies()
         for execution_pass in self._passes:
             execution_pass._sync_flags()
+        native_graph.set_autodiff_endpoints(
+            [
+                (
+                    name,
+                    0 if isinstance(endpoint, GraphResource) else 1,
+                    endpoint.id if isinstance(endpoint, GraphResource) else endpoint._native.id,
+                )
+                for name, endpoint in self._differentiable_inputs.items()
+            ],
+            [(name, 0, resource.id) for name, resource in self._objectives.items()],
+        )
         native_plan = native_graph.compile()
         plan = CompiledExecutionGraph(self, native_plan)
         self._native_graph = None
@@ -848,6 +927,8 @@ class ExecutionGraph:
         self._resource_by_identity = {}
         self._parameters = []
         self._parameter_by_name = {}
+        self._differentiable_inputs = {}
+        self._objectives = {}
         return plan
 
 

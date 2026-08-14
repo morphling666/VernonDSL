@@ -7,6 +7,10 @@
 
 namespace vernon::rhi {
 
+template <typename Handle> constexpr uint64_t encodeResourceKey(Handle handle) {
+    return (static_cast<uint64_t>(handle.generation) << 32) | (static_cast<uint64_t>(handle.index) + 1);
+}
+
 struct LogicalResourceRecord {
     uint32_t bindingReferences{};
     uint32_t generation{1};

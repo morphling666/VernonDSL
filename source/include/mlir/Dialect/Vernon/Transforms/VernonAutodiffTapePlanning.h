@@ -5,13 +5,16 @@
 #include "mlir/IR/Value.h"
 #include "mlir/Support/LLVM.h"
 
+#include <array>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 
 namespace mlir::vernon {
 
 class VernonAutodiffAnalysisResult;
+class VernonAutodiffTapePlan;
 
 /// A physical slot in a logical tape record. This low-level description is
 /// public so all offset, size, and alignment arithmetic can be tested without
@@ -108,11 +111,92 @@ struct AutodiffTapeRegion {
     AutodiffTapeRecord record;
 };
 
+enum class AdMemoryDomain {
+    PersistentResidual,
+    TransientGradient,
+    GraphCheckpoint,
+    ForwardEffectShadow,
+};
+inline constexpr size_t kAdMemoryDomainCount = 4;
+
+struct AdResidualInterval {
+    Value value;
+    unsigned abiLeafIndex{};
+    AdMemoryDomain domain{AdMemoryDomain::PersistentResidual};
+    uint64_t byteSize{};
+    uint64_t alignment{1};
+    uint64_t lifetimeBegin{};
+    uint64_t lifetimeEnd{};
+    bool rematerialized{};
+    uint64_t recomputationCost{};
+};
+
+struct AdRematerializationRecipe {
+    Value value;
+    SmallVector<Operation *> operations;
+    uint64_t estimatedCost{};
+};
+
+struct AdPhysicalBuffer {
+    AdMemoryDomain domain{AdMemoryDomain::PersistentResidual};
+    uint64_t offset{};
+    uint64_t byteSize{};
+    uint64_t alignment{1};
+};
+
+struct AdBufferSlice {
+    unsigned physicalBuffer{std::numeric_limits<unsigned>::max()};
+    uint64_t offset{};
+    uint64_t byteSize{};
+};
+
+struct AdBufferAssignment {
+    SmallVector<AdPhysicalBuffer> physicalBuffers;
+    SmallVector<AdBufferSlice> residualSlices;
+    std::array<uint64_t, kAdMemoryDomainCount> peakBytesByDomain{};
+    uint64_t peakBytes{};
+};
+
+FailureOr<AdBufferAssignment> assignAdMemoryBuffers(ArrayRef<AdResidualInterval> residuals);
+
+struct AdRematerializationCandidate {
+    SmallVector<unsigned> residualIndices;
+    uint64_t recomputationCost{};
+};
+
+struct AdBudgetedBufferAssignment {
+    AdBufferAssignment buffers;
+    SmallVector<bool> selectedCandidates;
+    uint64_t recomputationCost{};
+};
+
+FailureOr<AdBudgetedBufferAssignment>
+assignAdMemoryBuffersWithinBudget(ArrayRef<AdResidualInterval> residuals,
+                                  ArrayRef<AdRematerializationCandidate> candidates, uint64_t budgetBytes);
+
+class AdMemoryPlan {
+public:
+    ArrayRef<AdResidualInterval> getResiduals() const { return residuals; }
+    ArrayRef<AdRematerializationRecipe> getRematerializations() const { return rematerializations; }
+    const AdBufferAssignment &getBufferAssignment() const { return bufferAssignment; }
+    uint64_t getEstimatedPersistentBytes() const { return estimatedPersistentBytes; }
+
+private:
+    friend FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp, const VernonAutodiffAnalysisResult &,
+                                                              const VernonAutodiffRuleRegistry &);
+
+    SmallVector<AdResidualInterval> residuals;
+    SmallVector<AdRematerializationRecipe> rematerializations;
+    AdBufferAssignment bufferAssignment;
+    uint64_t estimatedPersistentBytes{};
+};
+
 class VernonAutodiffTapePlan {
 public:
     const AutodiffTapeHeaderSchema &getInvocationHeader() const { return invocationHeader; }
     const AutodiffTapeRecord &getInvocationRecord() const { return invocationRecord; }
     ArrayRef<AutodiffTapeRegion> getRegions() const { return regions; }
+    const AdMemoryPlan &getMemoryPlan() const { return memoryPlan; }
 
     /// Static layout/statistics hint: invocation storage plus one sample record
     /// and header per dynamic region. It is never a capacity or iteration cap.
@@ -125,6 +209,7 @@ private:
     AutodiffTapeHeaderSchema invocationHeader;
     AutodiffTapeRecord invocationRecord;
     SmallVector<AutodiffTapeRegion, 0> regions;
+    AdMemoryPlan memoryPlan;
     uint64_t staticTapeBytesHint{};
 };
 

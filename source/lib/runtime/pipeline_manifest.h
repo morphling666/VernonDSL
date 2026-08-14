@@ -196,6 +196,7 @@ struct AutodiffVariant {
     std::string primal;
     std::string forwardWithTape;
     std::string backward;
+    uint64_t staticTapeBytesHint{};
     AutodiffLaunchPlan launch;
 };
 

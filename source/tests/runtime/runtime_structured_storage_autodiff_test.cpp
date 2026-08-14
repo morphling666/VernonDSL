@@ -111,7 +111,7 @@ TEST(RuntimeStructuredStorageAutodiff, ExecutesDynamicIndexMutationAndFreshStora
 }
 
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION
-TEST(RuntimeStructuredStorageAutodiff, RejectsDispatchWideTapeBudgetBeforeExternalEffects) {
+TEST(RuntimeStructuredStorageAutodiff, RollsBackWhenCompactTapeWindowDoesNotFit) {
     ASSERT_EQ(vernonRegisterStructuredStorageAutodiffFixture(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_STORAGE_AUTODIFF_MANIFEST;
     std::ifstream input(manifestPath, std::ios::binary);
@@ -178,9 +178,8 @@ TEST(RuntimeStructuredStorageAutodiff, RejectsDispatchWideTapeBudgetBeforeExtern
     EXPECT_EQ(vernonAdPipelineForward(pipeline, {2, 1, 1}, &inputs, &outputs, &rejectedPullback),
               VERNON_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(rejectedPullback, nullptr);
-    EXPECT_NE(lastError(context).find("tape allocator"), std::string::npos);
-    EXPECT_NE(lastError(context).find("dispatch budget"), std::string::npos);
-    EXPECT_NE(lastError(context).find("context limit"), std::string::npos);
+    EXPECT_NE(lastError(context).find("compact tape batch"), std::string::npos);
+    EXPECT_NE(lastError(context).find("resident context window"), std::string::npos);
     EXPECT_EQ(std::memcmp(valuesBefore.data(), values, sizeof(values)), 0);
     EXPECT_EQ(std::memcmp(lossBefore.data(), loss, sizeof(loss)), 0);
     EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*boundedPolicy), 0u);

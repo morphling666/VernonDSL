@@ -99,6 +99,7 @@ TEST(PipelineManifestRequirements, ParsesCanonicalAutodiffProfiles) {
     ASSERT_EQ(manifest.variants.size(), 1u);
     EXPECT_EQ(manifest.variants[0].forwardWithTape, "forward");
     EXPECT_EQ(manifest.variants[0].backward, "backward");
+    EXPECT_EQ(manifest.variants[0].staticTapeBytesHint, 16u);
     EXPECT_EQ(manifest.variants[0].launch.workgroupSize.x, 1u);
 }
 

@@ -111,9 +111,38 @@ module {
     VernonAutodiffRuleRegistry registry = createDefaultAutodiffRuleRegistry();
     FailureOr<VernonAutodiffTapePlan> plan = planFunction(*module, "implicit_dtype", {"x"}, registry);
     ASSERT_TRUE(succeeded(plan));
-    ASSERT_EQ(plan->getInvocationRecord().leaves.size(), 4u);
+    ASSERT_EQ(plan->getInvocationRecord().leaves.size(), 2u);
     EXPECT_TRUE(llvm::all_of(plan->getInvocationRecord().leaves,
                              [](const AutodiffTapeLeaf &leaf) { return leaf.dtype == "f32"; }));
+    ASSERT_EQ(plan->getMemoryPlan().getRematerializations().size(), 1u);
+    const AdRematerializationRecipe &recipe = plan->getMemoryPlan().getRematerializations().front();
+    ASSERT_EQ(recipe.operations.size(), 1u);
+    EXPECT_TRUE(recipe.operations.front()->hasTrait<OpTrait::ConstantLike>());
+    EXPECT_EQ(recipe.estimatedCost, 0u);
+    EXPECT_TRUE(llvm::none_of(plan->getInvocationRecord().leaves,
+                              [&](const AutodiffTapeLeaf &leaf) { return leaf.value == recipe.value; }));
+    EXPECT_TRUE(plan->getRegions().empty());
+    const AdMemoryPlan &memory = plan->getMemoryPlan();
+    ASSERT_EQ(memory.getResiduals().size(), memory.getBufferAssignment().residualSlices.size());
+    EXPECT_TRUE(llvm::any_of(plan->getMemoryPlan().getResiduals(), [&](const AdResidualInterval &residual) {
+        return residual.value == recipe.value && residual.rematerialized && residual.byteSize == sizeof(float) &&
+               residual.domain == AdMemoryDomain::PersistentResidual && residual.lifetimeEnd > residual.lifetimeBegin;
+    }));
+    for (auto [residual, slice] : llvm::zip_equal(memory.getResiduals(), memory.getBufferAssignment().residualSlices)) {
+        EXPECT_GT(residual.lifetimeEnd, residual.lifetimeBegin);
+        EXPECT_GT(residual.byteSize, 0u);
+        if (residual.rematerialized) {
+            EXPECT_EQ(slice.physicalBuffer, std::numeric_limits<unsigned>::max());
+            EXPECT_EQ(slice.byteSize, 0u);
+            continue;
+        }
+        EXPECT_EQ(residual.byteSize, slice.byteSize);
+        ASSERT_LT(slice.physicalBuffer, memory.getBufferAssignment().physicalBuffers.size());
+        const AdPhysicalBuffer &buffer = memory.getBufferAssignment().physicalBuffers[slice.physicalBuffer];
+        EXPECT_EQ(slice.offset % residual.alignment, 0u);
+        EXPECT_EQ(buffer.domain, residual.domain);
+        EXPECT_GE(buffer.byteSize, slice.byteSize);
+    }
 }
 
 TEST_F(VernonAutodiffTapePlanningTest, DecomposesAggregateThroughCanonicalAbiLeaves) {
@@ -196,8 +225,7 @@ module {
     ASSERT_EQ(plan->getInvocationRecord().leaves.size(), 1u);
     EXPECT_EQ(plan->getInvocationRecord().leaves.front().value,
               module->lookupSymbol<func::FuncOp>("regions").getArgument(1));
-    ASSERT_EQ(loop.record.leaves.size(), 1u);
-    EXPECT_TRUE(isa<BlockArgument>(loop.record.leaves.front().value));
+    EXPECT_TRUE(loop.record.leaves.empty());
     EXPECT_TRUE(branch.record.leaves.empty());
 
     EXPECT_TRUE(llvm::any_of(plan->getInvocationHeader().fields, [](const AutodiffTapeField &field) {
@@ -340,6 +368,69 @@ TEST(AutodiffTapeLayoutTest, RejectsOffsetSizeStrideAndAlignmentOverflow) {
     EXPECT_TRUE(failed(planAutodiffTapeLayout({AutodiffTapeSlot{maximum - 6, 8}})));
     EXPECT_TRUE(failed(planAutodiffTapeLayout({AutodiffTapeSlot{4, 3}})));
     EXPECT_TRUE(failed(planAutodiffTapeLayout({}, 0, 3)));
+}
+
+TEST(AutodiffBufferAssignmentTest, ReusesNonOverlappingIntervalsWithinMemoryDomains) {
+    SmallVector<AdResidualInterval> residuals = {
+        {Value{}, 0, AdMemoryDomain::PersistentResidual, 8, 8, 0, 5, false, 0},
+        {Value{}, 1, AdMemoryDomain::PersistentResidual, 4, 4, 1, 4, false, 0},
+        {Value{}, 2, AdMemoryDomain::PersistentResidual, 8, 8, 5, 9, false, 0},
+        {Value{}, 3, AdMemoryDomain::PersistentResidual, 64, 8, 0, 9, true, 2},
+        {Value{}, 4, AdMemoryDomain::TransientGradient, 8, 8, 5, 9, false, 0},
+    };
+    FailureOr<AdBufferAssignment> assignment = assignAdMemoryBuffers(residuals);
+    ASSERT_TRUE(succeeded(assignment));
+    ASSERT_EQ(assignment->physicalBuffers.size(), 3u);
+    EXPECT_EQ(assignment->residualSlices[0].physicalBuffer, assignment->residualSlices[2].physicalBuffer);
+    EXPECT_NE(assignment->residualSlices[0].physicalBuffer, assignment->residualSlices[1].physicalBuffer);
+    EXPECT_EQ(assignment->residualSlices[3].physicalBuffer, std::numeric_limits<unsigned>::max());
+    EXPECT_NE(assignment->residualSlices[2].physicalBuffer, assignment->residualSlices[4].physicalBuffer);
+    EXPECT_EQ(assignment->physicalBuffers[0].offset, 0u);
+    EXPECT_EQ(assignment->physicalBuffers[1].offset, 8u);
+    EXPECT_EQ(assignment->physicalBuffers[2].offset, 0u);
+    EXPECT_EQ(assignment->peakBytesByDomain[0], 12u);
+    EXPECT_EQ(assignment->peakBytesByDomain[1], 8u);
+    EXPECT_EQ(assignment->peakBytesByDomain[2], 0u);
+    EXPECT_EQ(assignment->peakBytesByDomain[3], 0u);
+    EXPECT_EQ(assignment->peakBytes, 20u);
+}
+
+TEST(AutodiffBufferAssignmentTest, RejectsInvalidIntervalsAndAlignment) {
+    EXPECT_TRUE(failed(assignAdMemoryBuffers(
+        {AdResidualInterval{Value{}, 0, AdMemoryDomain::PersistentResidual, 4, 3, 0, 1, false, 0}})));
+    EXPECT_TRUE(failed(assignAdMemoryBuffers(
+        {AdResidualInterval{Value{}, 0, AdMemoryDomain::PersistentResidual, 4, 4, 2, 1, false, 0}})));
+}
+
+TEST(AutodiffBufferAssignmentTest, SelectsRematerializationBySavedBytesPerCost) {
+    SmallVector<AdResidualInterval> residuals = {
+        {Value{}, 0, AdMemoryDomain::PersistentResidual, 8, 8, 0, 5, false, 0},
+        {Value{}, 1, AdMemoryDomain::PersistentResidual, 4, 4, 1, 4, false, 0},
+        {Value{}, 2, AdMemoryDomain::PersistentResidual, 8, 8, 5, 9, false, 0},
+        {Value{}, 3, AdMemoryDomain::TransientGradient, 8, 8, 0, 9, false, 0},
+    };
+    SmallVector<AdRematerializationCandidate> candidates = {
+        {{0, 2}, 8},
+        {{1}, 1},
+    };
+    FailureOr<AdBudgetedBufferAssignment> assignment = assignAdMemoryBuffersWithinBudget(residuals, candidates, 16);
+    ASSERT_TRUE(succeeded(assignment));
+    EXPECT_FALSE(assignment->selectedCandidates[0]);
+    EXPECT_TRUE(assignment->selectedCandidates[1]);
+    EXPECT_EQ(assignment->recomputationCost, 1u);
+    EXPECT_EQ(assignment->buffers.peakBytes, 16u);
+}
+
+TEST(AutodiffBufferAssignmentTest, RejectsUnreachableBudgetAndInvalidCandidates) {
+    SmallVector<AdResidualInterval> residuals = {
+        {Value{}, 0, AdMemoryDomain::PersistentResidual, 8, 8, 0, 5, false, 0},
+        {Value{}, 1, AdMemoryDomain::PersistentResidual, 4, 4, 1, 4, false, 0},
+    };
+    EXPECT_TRUE(failed(assignAdMemoryBuffersWithinBudget(residuals, {AdRematerializationCandidate{{1}, 1}}, 4)));
+    EXPECT_TRUE(failed(assignAdMemoryBuffersWithinBudget(residuals, {AdRematerializationCandidate{{0, 0}, 1}}, 8)));
+    EXPECT_TRUE(failed(assignAdMemoryBuffersWithinBudget(
+        residuals, {AdRematerializationCandidate{{0}, 1}, AdRematerializationCandidate{{0, 1}, 2}}, 8)));
+    EXPECT_TRUE(failed(assignAdMemoryBuffersWithinBudget(residuals, {AdRematerializationCandidate{{2}, 1}}, 8)));
 }
 
 } // namespace

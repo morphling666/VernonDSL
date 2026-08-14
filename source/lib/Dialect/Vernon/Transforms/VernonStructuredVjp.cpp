@@ -179,9 +179,14 @@ BackwardProfileTypes getBackwardProfileTypes(MLIRContext *context, const VernonA
             const bool invocationPrivate =
                 identity != analysis.getStorageIdentities().end() &&
                 identity->externalGradientOwnership == AutodiffExternalGradientOwnership::InvocationPrivate;
-            types.storageGradients.push_back(TensorViewType::get(context, leaf.derivativeType, source.getShape(),
-                                                                 invocationPrivate ? "read_write" : "write",
-                                                                 source.getAddressSpace()));
+            Type elementType = leaf.derivativeType;
+            SmallVector<int64_t> shape(source.getShape());
+            if (auto aggregate = dyn_cast<RankedTensorType>(elementType)) {
+                elementType = aggregate.getElementType();
+                llvm::append_range(shape, aggregate.getShape());
+            }
+            types.storageGradients.push_back(TensorViewType::get(
+                context, elementType, shape, invocationPrivate ? "read_write" : "write", source.getAddressSpace()));
         } else {
             types.valueGradients.push_back(leaf.derivativeType);
             types.valueGradientDtypes.push_back(dtype);
@@ -228,11 +233,16 @@ LogicalResult reverseScalarOperation(Operation &operation, OpBuilder &builder,
     if (!rule)
         return operation.emitError("active scalar operation has no VJP rule");
     SmallVector<Value> operands;
-    for (Value operand : operation.getOperands())
+    SmallVector<unsigned> activeOperands;
+    for (auto [operandIndex, operand] : llvm::enumerate(operation.getOperands())) {
         operands.push_back(primals.lookup(operand));
+        if (analysis.isActive(operand, 0))
+            activeOperands.push_back(static_cast<unsigned>(operandIndex));
+    }
     SmallVector<Value> results = {primals.lookup(operation.getResult(0))};
-    FailureOr<SmallVector<Value>> contributions = rule->buildVjp(
-        &operation, AutodiffVjpBuildContext{builder, operation.getLoc(), operands, results, ValueRange(seed->second)});
+    FailureOr<SmallVector<Value>> contributions =
+        rule->buildVjp(&operation, AutodiffVjpBuildContext{builder, operation.getLoc(), operands, results,
+                                                           ValueRange(seed->second), activeOperands});
     if (failed(contributions))
         return failure();
     for (auto [operand, contribution] : llvm::zip_equal(operation.getOperands(), *contributions))
@@ -313,24 +323,56 @@ LogicalResult validateStructuredPhase(func::FuncOp primal, const VernonAutodiffA
     return structured.wasInterrupted() ? failure() : success();
 }
 
-struct DynamicRootLayout {
+struct ResidualRootLayout {
     SmallVector<uint64_t> invocationLeafOffsets;
     uint64_t stride{};
     uint64_t alignment{1};
 };
 
-FailureOr<DynamicRootLayout> buildDynamicRootLayout(const VernonAutodiffTapePlan &plan) {
+FailureOr<ResidualRootLayout> buildDynamicRootLayout(const VernonAutodiffTapePlan &plan) {
     SmallVector<AutodiffTapeSlot> slots;
     for (const AutodiffTapeLeaf &leaf : plan.getInvocationRecord().leaves)
         slots.push_back({leaf.size, leaf.alignment});
     FailureOr<AutodiffTapeLayout> layout = planAutodiffTapeLayout(slots);
     if (failed(layout) || layout->stride > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
         return failure();
-    DynamicRootLayout result;
+    ResidualRootLayout result;
     result.invocationLeafOffsets.assign(layout->offsets.begin(), layout->offsets.end());
     result.stride = layout->stride;
     result.alignment = layout->alignment;
     return result;
+}
+
+FailureOr<ResidualRootLayout> buildStaticRootLayout(const VernonAutodiffTapePlan &plan) {
+    if (!plan.getRegions().empty())
+        return failure();
+    const AdMemoryPlan &memory = plan.getMemoryPlan();
+    const AdBufferAssignment &assignment = memory.getBufferAssignment();
+    ResidualRootLayout result;
+    result.invocationLeafOffsets.reserve(plan.getInvocationRecord().leaves.size());
+    for (const AutodiffTapeLeaf &leaf : plan.getInvocationRecord().leaves) {
+        std::optional<uint64_t> offset;
+        for (auto [index, residual] : llvm::enumerate(memory.getResiduals())) {
+            if (residual.value != leaf.value || residual.abiLeafIndex != leaf.abiLeafIndex || residual.rematerialized)
+                continue;
+            if (index >= assignment.residualSlices.size())
+                return failure();
+            const AdBufferSlice &slice = assignment.residualSlices[index];
+            if (slice.physicalBuffer >= assignment.physicalBuffers.size() || slice.byteSize != leaf.size)
+                return failure();
+            offset = slice.offset;
+            result.alignment = std::max(result.alignment, residual.alignment);
+            break;
+        }
+        if (!offset)
+            return failure();
+        result.invocationLeafOffsets.push_back(*offset);
+    }
+    result.stride =
+        std::max<uint64_t>(assignment.peakBytesByDomain[static_cast<size_t>(AdMemoryDomain::PersistentResidual)], 1);
+    return result.stride <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
+               ? FailureOr<ResidualRootLayout>(std::move(result))
+               : FailureOr<ResidualRootLayout>(failure());
 }
 
 const AutodiffTapeField *findField(const AutodiffTapeHeaderSchema &schema, AutodiffTapeFieldKind kind) {
@@ -448,10 +490,10 @@ FailureOr<Value> readCanonicalTapeValue(OpBuilder &builder, Location location, M
     return buildAggregateValueFromScalars(source.getType(), scalars, module, builder, location);
 }
 
-class DynamicForwardEmitter {
+class ForwardEmitterCore {
 public:
-    DynamicForwardEmitter(func::FuncOp primal, const VernonAutodiffTapePlan &plan, Value tape, Value rootRegion,
-                          Value rootRecord)
+    ForwardEmitterCore(func::FuncOp primal, const VernonAutodiffTapePlan &plan, Value tape, Value rootRegion,
+                       Value rootRecord)
         : primal(primal), tape(tape), rootRegion(rootRegion), rootRecord(rootRecord) {
         for (const AutodiffTapeRegion &region : plan.getRegions()) {
             regions.try_emplace(region.operation, &region);
@@ -728,11 +770,11 @@ private:
     DenseMap<unsigned, const AutodiffTapeRegion *> regionsByOrdinal;
 };
 
-class DynamicReverseEmitter {
+class ReverseEmitterCore {
 public:
-    DynamicReverseEmitter(func::FuncOp primal, const VernonAutodiffAnalysisResult &analysis,
-                          const VernonAutodiffRuleRegistry &registry, const VernonAutodiffTapePlan &plan,
-                          const DynamicRootLayout &rootLayout, Value rootRegion)
+    ReverseEmitterCore(func::FuncOp primal, const VernonAutodiffAnalysisResult &analysis,
+                       const VernonAutodiffRuleRegistry &registry, const VernonAutodiffTapePlan &plan,
+                       const ResidualRootLayout &rootLayout, Value rootRegion)
         : primal(primal), analysis(analysis), registry(registry), plan(plan), rootLayout(rootLayout),
           rootRegion(rootRegion) {
         for (const AutodiffTapeRegion &region : plan.getRegions())
@@ -1019,8 +1061,6 @@ private:
             if (!buffer && !external)
                 continue;
             if (!buffer) {
-                SmallVector<Value> operands = {seed, external};
-                llvm::append_range(operands, indices);
                 SmallVector<NamedAttribute> attributes = {
                     builder.getNamedAttr("deterministic", builder.getBoolAttr(false))};
                 const AutodiffExternalGradientOwnership ownership =
@@ -1031,7 +1071,25 @@ private:
                                              builder.getStringAttr(kInvocationPrivateAccumulationOwnership)));
                 else if (ownership != AutodiffExternalGradientOwnership::AtomicShared)
                     return load.emitError("active external Storage gradient has no supported ownership proof");
-                createOperation(builder, load.getLoc(), ScatterAddOp::getOperationName(), operands, {}, attributes);
+                if (auto aggregate = dyn_cast<RankedTensorType>(seed.getType())) {
+                    if (!aggregate.hasStaticShape())
+                        return load.emitError("external aggregate Storage gradient has a dynamic element shape");
+                    for (const SmallVector<int64_t> &coordinate : enumerateStaticCoordinates(aggregate.getShape())) {
+                        SmallVector<Value> componentIndices(indices);
+                        for (int64_t index : coordinate)
+                            componentIndices.push_back(createIndexConstant(builder, load.getLoc(), index));
+                        Value component = tensor::ExtractOp::create(
+                            builder, load.getLoc(), seed, ValueRange(componentIndices).drop_front(indices.size()));
+                        SmallVector<Value> operands = {component, external};
+                        llvm::append_range(operands, componentIndices);
+                        createOperation(builder, load.getLoc(), ScatterAddOp::getOperationName(), operands, {},
+                                        attributes);
+                    }
+                } else {
+                    SmallVector<Value> operands = {seed, external};
+                    llvm::append_range(operands, indices);
+                    createOperation(builder, load.getLoc(), ScatterAddOp::getOperationName(), operands, {}, attributes);
+                }
                 continue;
             }
             SmallVector<Value> operands = {buffer, seed};
@@ -1159,6 +1217,25 @@ private:
     }
 
     LogicalResult reverseRule(Operation &operation, OpBuilder &builder, AdjointMap &adjoints) {
+        const DifferentiationRule *rule = registry.lookup(&operation);
+        if (!rule)
+            return operation.emitError("active scalar operation has no VJP rule");
+        SmallVector<unsigned> activeOperands;
+        for (auto [operandIndex, operand] : llvm::enumerate(operation.getOperands()))
+            if (analysis.isActive(operand, 0))
+                activeOperands.push_back(static_cast<unsigned>(operandIndex));
+        for (const AutodiffPrimalRequirement &requirement : rule->getVjpPrimalRequirements()) {
+            if (!requirement.isRequiredFor(activeOperands))
+                continue;
+            Value source = requirement.kind == AutodiffPrimalKind::Operand ? operation.getOperand(requirement.index)
+                                                                           : operation.getResult(requirement.index);
+            if (primals.contains(source))
+                continue;
+            FailureOr<Value> materialized = materializePrimal(source, builder);
+            if (failed(materialized))
+                return operation.emitError("cannot rematerialize a rule-required primal value");
+            primals.try_emplace(source, *materialized);
+        }
         return reverseScalarOperation(operation, builder, analysis, registry, primals, adjoints);
     }
 
@@ -1456,7 +1533,7 @@ private:
     const VernonAutodiffAnalysisResult &analysis;
     const VernonAutodiffRuleRegistry &registry;
     const VernonAutodiffTapePlan &plan;
-    const DynamicRootLayout &rootLayout;
+    const ResidualRootLayout &rootLayout;
     Value rootRegion;
     DenseMap<Value, Value> primals;
     DenseMap<Operation *, const AutodiffTapeRegion *> regions;
@@ -1465,8 +1542,9 @@ private:
     DenseMap<std::pair<unsigned, unsigned>, Value> externalStorageCotangents;
 };
 
-FailureOr<func::FuncOp> createDynamicForward(func::FuncOp primal, StringRef symbol, const VernonAutodiffTapePlan &plan,
-                                             const DynamicRootLayout &rootLayout) {
+FailureOr<func::FuncOp> createStructuredForward(func::FuncOp primal, StringRef symbol,
+                                                const VernonAutodiffTapePlan &plan,
+                                                const ResidualRootLayout &rootLayout) {
     MLIRContext *context = primal.getContext();
     Type tapeType = AdTapeType::get(context);
     Type regionType = AdRegionHeaderType::get(context);
@@ -1497,7 +1575,7 @@ FailureOr<func::FuncOp> createDynamicForward(func::FuncOp primal, StringRef symb
                      ->getResult(0);
     Value root = beginRegion(captureBuilder, primal.getLoc(), tape);
     Value rootRecord = reserveRecord(captureBuilder, primal.getLoc(), root, rootLayout.stride, rootLayout.alignment);
-    DynamicForwardEmitter emitter(primal, plan, tape, root, rootRecord);
+    ForwardEmitterCore emitter(primal, plan, tape, root, rootRecord);
     for (auto [source, target] : llvm::zip_equal(primal.getArguments(), entry->getArguments()))
         emitter.getMapping().map(source, target);
     if (failed(emitter.emitTopLevel(captureBuilder)))
@@ -1525,10 +1603,11 @@ FailureOr<func::FuncOp> createDynamicForward(func::FuncOp primal, StringRef symb
     return forward;
 }
 
-FailureOr<func::FuncOp> createDynamicBackward(func::FuncOp primal, StringRef symbol,
-                                              const VernonAutodiffAnalysisResult &analysis,
-                                              const VernonAutodiffRuleRegistry &registry,
-                                              const VernonAutodiffTapePlan &plan, const DynamicRootLayout &rootLayout) {
+FailureOr<func::FuncOp> createStructuredBackward(func::FuncOp primal, StringRef symbol,
+                                                 const VernonAutodiffAnalysisResult &analysis,
+                                                 const VernonAutodiffRuleRegistry &registry,
+                                                 const VernonAutodiffTapePlan &plan,
+                                                 const ResidualRootLayout &rootLayout) {
     MLIRContext *context = primal.getContext();
     Type tapeType = AdTapeType::get(context);
     Type regionType = AdRegionHeaderType::get(context);
@@ -1618,7 +1697,7 @@ FailureOr<func::FuncOp> createDynamicBackward(func::FuncOp primal, StringRef sym
 
     Block *entry = backward.addEntryBlock();
     OpBuilder builder = OpBuilder::atBlockEnd(entry);
-    DynamicReverseEmitter emitter(primal, analysis, registry, plan, rootLayout, entry->getArgument(1));
+    ReverseEmitterCore emitter(primal, analysis, registry, plan, rootLayout, entry->getArgument(1));
     emitter.initializeBuiltinPrimals(builtinArguments, entry->getArguments().slice(2, builtinArguments.size()));
     if (failed(emitter.initializePrimals(builder)))
         return failure();
@@ -1772,14 +1851,18 @@ FailureOr<StructuredVjpResult> buildStructuredVjp(func::FuncOp primal, const Str
         if (region.record.stride > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
             return structuredPrimal.emitError("structured VJP dynamic tape record is not representable");
 
-    FailureOr<DynamicRootLayout> rootLayout = buildDynamicRootLayout(*plan);
+    FailureOr<ResidualRootLayout> rootLayout = buildDynamicRootLayout(*plan);
+    const bool staticResiduals = plan->getRegions().empty();
+    if (staticResiduals)
+        rootLayout = buildStaticRootLayout(*plan);
     if (failed(rootLayout))
         return structuredPrimal.emitError("structured VJP root record layout overflow");
-    FailureOr<func::FuncOp> forward = createDynamicForward(structuredPrimal, options.forwardSymbol, *plan, *rootLayout);
+    FailureOr<func::FuncOp> forward =
+        createStructuredForward(structuredPrimal, options.forwardSymbol, *plan, *rootLayout);
     if (failed(forward))
         return failure();
     FailureOr<func::FuncOp> backward =
-        createDynamicBackward(structuredPrimal, options.backwardSymbol, *analysis, registry, *plan, *rootLayout);
+        createStructuredBackward(structuredPrimal, options.backwardSymbol, *analysis, registry, *plan, *rootLayout);
     if (failed(backward)) {
         forward->erase();
         return failure();
@@ -1789,6 +1872,24 @@ FailureOr<StructuredVjpResult> buildStructuredVjp(func::FuncOp primal, const Str
         backward->erase();
         return structuredPrimal.emitError("generated structured VJP profile failed verification");
     }
+    const StringAttr residualStorage = StringAttr::get(primal.getContext(), staticResiduals ? "static" : "dynamic");
+    (*forward)->setAttr("vernon.ad.residual_storage", residualStorage);
+    (*backward)->setAttr("vernon.ad.residual_storage", residualStorage);
+    const uint64_t activeOperationCount = llvm::count_if(
+        analysis->getOperations(), [](const AutodiffOperationActivity &activity) { return activity.active; });
+    uint64_t recomputationCost = 0;
+    for (const AdRematerializationRecipe &recipe : plan->getMemoryPlan().getRematerializations()) {
+        if (recipe.estimatedCost > std::numeric_limits<uint64_t>::max() - recomputationCost) {
+            forward->erase();
+            backward->erase();
+            return structuredPrimal.emitError("structured VJP recomputation telemetry overflows");
+        }
+        recomputationCost += recipe.estimatedCost;
+    }
+    (*backward)->setAttr("vernon.ad.active_operation_count",
+                         IntegerAttr::get(IntegerType::get(primal.getContext(), 64), activeOperationCount));
+    (*backward)->setAttr("vernon.ad.recomputation_cost",
+                         IntegerAttr::get(IntegerType::get(primal.getContext(), 64), recomputationCost));
     primal->removeAttr(kEntryAttr);
     SmallVector<std::string> derivativeRules;
     for (const AutodiffOperationActivity &activity : analysis->getOperations()) {
@@ -1799,12 +1900,14 @@ FailureOr<StructuredVjpResult> buildStructuredVjp(func::FuncOp primal, const Str
     }
     llvm::sort(derivativeRules);
     derivativeRules.erase(std::unique(derivativeRules.begin(), derivativeRules.end()), derivativeRules.end());
-    if (plan->getStaticTapeBytesHint() > std::numeric_limits<uint64_t>::max() - rootLayout->stride) {
+    if (!staticResiduals &&
+        plan->getStaticTapeBytesHint() > std::numeric_limits<uint64_t>::max() - rootLayout->stride) {
         forward->erase();
         backward->erase();
         return structuredPrimal.emitError("structured VJP tape statistics hint overflow");
     }
-    const uint64_t tapeBytes = plan->getStaticTapeBytesHint() + rootLayout->stride;
+    const uint64_t tapeBytes =
+        staticResiduals ? rootLayout->stride : plan->getStaticTapeBytesHint() + rootLayout->stride;
     return StructuredVjpResult{*forward, *backward, tapeBytes, std::move(derivativeRules)};
 }
 

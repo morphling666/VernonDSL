@@ -70,6 +70,16 @@ convenience operations. Explicit asynchronous execution is exposed through
 compiled execution plans and their `submit()` method, rather than requiring
 direct-call users to manage submissions.
 
+Python execution graphs declare logical differentiable resources or execution
+value parameters and objective resources with
+`ExecutionGraph.differentiable_input()` and `ExecutionGraph.objective()`.
+A `VjpComputePass` reuses a structured direct or cooked CPU VJP. Calling
+`CompiledExecutionGraph.vjp()` runs the forward plan and returns a
+`GraphPullback`; its `submit()` method returns a backward submission whose
+`gradients` mapping is available after `wait()`. Calling the pullback directly
+is the synchronous shorthand. Omitting the cotangent is supported only for one
+scalar objective.
+
 Sparse host updates use `vernonRhiDeviceUploadBufferRanges`, which validates a
 complete range list before mutation and lets each backend execute the list as
 one transfer transaction.

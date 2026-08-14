@@ -34,6 +34,7 @@ namespace vernon::runtime::ad {
 namespace {
 
 constexpr size_t kCpuAdGradientDispatchLimit = 512u * 1024u * 1024u;
+constexpr size_t kCpuAdInlineInvocationLimit = 16u * 1024u;
 
 bool checkedAddBytes(size_t &total, size_t count, size_t bytes) {
     if (count && bytes > std::numeric_limits<size_t>::max() / count)
@@ -134,7 +135,7 @@ bool materializeTensorViewShape(const HostArgument &argument, const VernonAdValu
 VernonStatus fail(VernonRuntimeContext &context, std::string message,
                   VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT);
 bool writeTensorViewDescriptor(const HostArgument &argument, const std::vector<uint64_t> &shape, void *data,
-                               std::vector<uint8_t> &arguments);
+                               uint8_t *arguments);
 
 bool appendStorageRange(const void *data, size_t size, bool writable, std::vector<StorageRange> &ranges) {
     const uintptr_t begin = reinterpret_cast<uintptr_t>(data);
@@ -221,7 +222,7 @@ VernonStatus stageForwardInputs(VernonRuntimeContext &context, const HostProfile
             }
             tensorViews.push_back(std::move(staged));
             if (!writeTensorViewDescriptor(argument, tensorViews.back().shape, tensorViews.back().packed.data(),
-                                           arguments))
+                                           arguments.data()))
                 return fail(context, "autodiff forward TensorView descriptor overflows");
             continue;
         }
@@ -263,8 +264,7 @@ VernonStatus flushStagedTensorViews(VernonRuntimeContext &context, const std::ve
     return VERNON_STATUS_OK;
 }
 
-bool writeInvocationBuiltin(const HostArgument &argument, const CpuLaneCoordinates &coordinates,
-                            std::vector<uint8_t> &arguments) {
+bool writeInvocationBuiltin(const HostArgument &argument, const CpuLaneCoordinates &coordinates, uint8_t *arguments) {
     if ((argument.builtin != "global_invocation_id" && argument.builtin != "local_invocation_id" &&
          argument.builtin != "workgroup_id") ||
         argument.leaves.size() != 1 || argument.leaves.front().value.dtype != VERNON_DATA_U32 ||
@@ -273,7 +273,7 @@ bool writeInvocationBuiltin(const HostArgument &argument, const CpuLaneCoordinat
     const uint32_t *value = argument.builtin == "global_invocation_id"
                                 ? coordinates.global
                                 : (argument.builtin == "local_invocation_id" ? coordinates.local : coordinates.group);
-    std::memcpy(arguments.data() + argument.leaves.front().frameOffset, value, sizeof(uint32_t) * 3);
+    std::memcpy(arguments + argument.leaves.front().frameOffset, value, sizeof(uint32_t) * 3);
     return true;
 }
 
@@ -648,11 +648,11 @@ VernonStatus prepareGradientDestinations(VernonRuntimeContext &context, const Si
 }
 
 bool writeTensorViewDescriptor(const HostArgument &argument, const std::vector<uint64_t> &shape, void *data,
-                               std::vector<uint8_t> &arguments) {
+                               uint8_t *arguments) {
     if (!argument.tensorView || shape.size() != argument.tensorView->shape.size() ||
         argument.size != sizeof(uint64_t) * (2 + 2 * shape.size()))
         return false;
-    uint8_t *descriptor = arguments.data() + argument.offset;
+    uint8_t *descriptor = arguments + argument.offset;
     const uintptr_t pointer = reinterpret_cast<uintptr_t>(data);
     const uint64_t zero = 0;
     std::memcpy(descriptor, &pointer, sizeof(pointer));
@@ -666,6 +666,25 @@ bool writeTensorViewDescriptor(const HostArgument &argument, const std::vector<u
         stride *= shape[dimension];
     }
     return true;
+}
+
+bool tensorViewDescriptorShape(const HostArgument &argument, const std::vector<uint64_t> &logicalShape,
+                               std::vector<uint64_t> &descriptorShape) {
+    if (!argument.tensorView)
+        return false;
+    const size_t rank = argument.tensorView->shape.size();
+    if (logicalShape.size() < rank)
+        return false;
+    descriptorShape.assign(logicalShape.begin(), logicalShape.begin() + rank);
+    for (size_t dimension = 0; dimension < rank; ++dimension)
+        if (argument.tensorView->shape[dimension] >= 0 &&
+            descriptorShape[dimension] != static_cast<uint64_t>(argument.tensorView->shape[dimension]))
+            return false;
+    return std::any_of(argument.tensorView->elementLayout.leaves.begin(),
+                       argument.tensorView->elementLayout.leaves.end(), [&](const ValueLeaf &leaf) {
+                           return leaf.shape.size() == logicalShape.size() - rank &&
+                                  std::equal(leaf.shape.begin(), leaf.shape.end(), logicalShape.begin() + rank);
+                       });
 }
 
 bool isShapeSource(const HostArgument &argument) { return argument.name.rfind("shape.", 0) == 0; }
@@ -734,16 +753,18 @@ VernonStatus accumulateFloatingBytes(VernonDataType dtype, uint8_t *destination,
 }
 
 VernonStatus accumulateBackwardResults(const HostProfileLayout &layout, const Signature &signature,
-                                       const std::vector<uint8_t> &results,
-                                       const std::vector<size_t> &resultGradientIndices,
-                                       std::vector<std::vector<uint8_t>> &stagedGradients) {
+                                       const uint8_t *results, const std::vector<size_t> &resultGradientIndices,
+                                       uint8_t *privateGradients, const std::vector<size_t> &privateGradientOffsets) {
     if (layout.results.size() != resultGradientIndices.size())
         return VERNON_STATUS_INVALID_ARGUMENT;
     for (size_t index = 0; index < resultGradientIndices.size(); ++index) {
         const size_t gradientIndex = resultGradientIndices[index];
         const HostFrameLeaf &source = layout.results[index];
-        uint8_t *destination = stagedGradients[gradientIndex].data();
-        const uint8_t *contribution = results.data() + source.frameOffset;
+        if (gradientIndex >= privateGradientOffsets.size() ||
+            privateGradientOffsets[gradientIndex] == std::numeric_limits<size_t>::max())
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        uint8_t *destination = privateGradients + privateGradientOffsets[gradientIndex];
+        const uint8_t *contribution = results + source.frameOffset;
         if (VernonStatus accumulateStatus =
                 accumulateFloatingBytes(source.value.dtype, destination, contribution, source.value.byteSize);
             accumulateStatus != VERNON_STATUS_OK)
@@ -770,31 +791,25 @@ void commitGradientDestinations(const std::vector<VernonAdValue *> &destinations
             std::memcpy(destinations[index]->data, stagedGradients[index].data(), stagedGradients[index].size());
 }
 
-struct CpuPullbackInvocationState {
-    std::vector<uint8_t> packedArguments;
-    std::vector<uint8_t> packedResults;
-    std::shared_ptr<const HostTapeSnapshot> tape;
-    std::vector<std::vector<uint8_t>> privateGradients;
-};
-
-struct CpuPullbackWorkgroupState {
-    std::vector<std::vector<uint8_t>> sharedGradientStaging;
-};
-
 class StructuredCpuPullbackExecution final : public PullbackExecution {
 public:
     StructuredCpuPullbackExecution(VernonRuntimeContext &context, std::shared_ptr<CpuKernelState> backward,
                                    HostProfileLayout layout, Signature signature, VernonLaunchSize computeGrid,
-                                   size_t invocationCount,
-                                   std::vector<std::shared_ptr<const HostTapeSnapshot>> tapeSnapshots,
+                                   size_t invocationCount, std::shared_ptr<HostStaticTapeBatch> tapeBatch,
                                    RuntimeTensorShapes tensorShapes, std::vector<size_t> resultGradientIndices)
         : context_(context), backward_(std::move(backward)), layout_(std::move(layout)),
           signature_(std::move(signature)), computeGrid_(computeGrid), tensorShapes_(std::move(tensorShapes)),
-          resultGradientIndices_(std::move(resultGradientIndices)) {
-        invocations_.reserve(invocationCount);
-        for (size_t index = 0; index < invocationCount; ++index)
-            invocations_.push_back(
-                {{}, {}, index < tapeSnapshots.size() ? std::move(tapeSnapshots[index]) : nullptr, {}});
+          resultGradientIndices_(std::move(resultGradientIndices)), invocationCount_(invocationCount),
+          tapeBatch_(std::move(tapeBatch)) {}
+
+    PullbackMemoryUsage memoryUsage() const override {
+        PullbackMemoryUsage usage;
+        if (tapeBatch_) {
+            usage.logicalResidualBytes = tapeBatch_->logicalBytes();
+            usage.residentBytes = tapeBatch_->residentBytes();
+            usage.allocatedBytes = tapeBatch_->allocatedBytes();
+        }
+        return usage;
     }
 
     VernonStatus apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients) override {
@@ -815,6 +830,7 @@ public:
         for (size_t index = 0; index < signature_.gradients.size(); ++index)
             gradientIndices.emplace(signature_.gradients[index].path, index);
         std::vector<std::string> gradientOwnership(signature_.gradients.size());
+        std::vector<bool> storageGradients(signature_.gradients.size());
         for (size_t gradientIndex : resultGradientIndices_) {
             if (gradientIndex >= gradientOwnership.size())
                 return fail(context_, "CPU pullback result gradient index is invalid");
@@ -822,26 +838,49 @@ public:
         }
         for (const HostArgument &argument : layout_.arguments)
             if (argument.tensorView && !isShapeSource(argument))
-                if (const auto gradient = gradientIndices.find(argument.name); gradient != gradientIndices.end())
+                if (const auto gradient = gradientIndices.find(argument.name); gradient != gradientIndices.end()) {
                     gradientOwnership[gradient->second] = argument.accumulationOwnership;
+                    storageGradients[gradient->second] = true;
+                }
         if (std::any_of(gradientOwnership.begin(), gradientOwnership.end(),
                         [](const std::string &ownership) { return ownership.empty(); }))
             return fail(context_, "CPU pullback gradient has no reflected ownership");
         size_t invocationCount = 0;
-        size_t workgroupCount = 0;
-        if (!carrierCount(extent, invocationCount) || !carrierCount(computeGrid_, workgroupCount))
+        if (!carrierCount(extent, invocationCount))
             return fail(context_, "CPU pullback dispatch size overflows");
+        const bool inlineExecution = invocationCount <= kCpuAdInlineInvocationLimit;
+        std::vector<bool> sharedCotangents(signature_.cotangents.size());
+        if (cotangents) {
+            for (size_t index = 0; index < signature_.cotangents.size(); ++index) {
+                const ValueAbi &logical = signature_.cotangents[index];
+                ValueAbi carried = logical;
+                if (!materializeCarrierValue(carried, extent))
+                    return fail(context_, "CPU pullback cotangent size overflows");
+                const VernonAdValue *value = findValue(*cotangents, logical.path);
+                if (!value)
+                    return fail(context_, "output cotangent does not match backward reflection");
+                if (valueMatches(*value, logical))
+                    sharedCotangents[index] = true;
+                else if (!valueMatches(*value, carried))
+                    return fail(context_, "output cotangent does not match backward reflection");
+            }
+        }
         size_t requiredGradientBytes = 0;
-        for (const ValueAbi &cotangent : signature_.cotangents)
-            if (!checkedAddBytes(requiredGradientBytes, invocationCount, cotangent.byteSize))
+        for (size_t index = 0; index < signature_.cotangents.size(); ++index)
+            if (!checkedAddBytes(requiredGradientBytes, sharedCotangents[index] ? 1 : invocationCount,
+                                 signature_.cotangents[index].byteSize))
                 return fail(context_, "CPU pullback dispatch memory size overflows");
         for (size_t gradientIndex = 0; gradientIndex < signature_.gradients.size(); ++gradientIndex) {
             const size_t byteSize = signature_.gradients[gradientIndex].byteSize;
             if (!checkedAddBytes(requiredGradientBytes, 1, byteSize))
                 return fail(context_, "CPU pullback dispatch memory size overflows");
-            const size_t carrierCount = gradientOwnership[gradientIndex] == "none"                 ? 0
-                                        : gradientOwnership[gradientIndex] == "invocation_private" ? invocationCount
-                                                                                                   : workgroupCount;
+            const size_t carrierCount =
+                storageGradients[gradientIndex] || gradientOwnership[gradientIndex] == "none" ? 0
+                : gradientOwnership[gradientIndex] == "invocation_private" ? (inlineExecution ? 1 : invocationCount)
+                                                                           : 0;
+            if (!storageGradients[gradientIndex] && gradientOwnership[gradientIndex] != "none" &&
+                gradientOwnership[gradientIndex] != "invocation_private")
+                return fail(context_, "CPU pullback non-Storage gradient requires invocation-private ownership");
             if (!checkedAddBytes(requiredGradientBytes, carrierCount, byteSize))
                 return fail(context_, "CPU pullback dispatch memory size overflows");
         }
@@ -865,12 +904,13 @@ public:
             ValueAbi abi = signature_.cotangents[index];
             if (!materializeCarrierValue(abi, extent))
                 return fail(context_, "CPU pullback cotangent size overflows");
-            std::vector<uint8_t> bytes(abi.byteSize);
+            const size_t byteSize = sharedCotangents[index] ? signature_.cotangents[index].byteSize : abi.byteSize;
+            std::vector<uint8_t> bytes(byteSize);
             if (cotangents) {
                 const VernonAdValue *value = findValue(*cotangents, abi.path);
-                if (!value || !valueMatches(*value, abi))
+                if (!value || value->size != byteSize)
                     return fail(context_, "output cotangent does not match backward reflection");
-                std::memcpy(bytes.data(), value->data, abi.byteSize);
+                std::memcpy(bytes.data(), value->data, byteSize);
             } else {
                 if (signature_.cotangents.size() != 1 ||
                     !makeCotangentBytes(nullptr, abi, bytes, invocationDiagnostic(context_)))
@@ -884,32 +924,28 @@ public:
                 prepareGradientDestinations(context_, signature_, gradients, destinations, stagedGradients);
             status != VERNON_STATUS_OK)
             return status;
-        std::vector<CpuPullbackInvocationState> invocations = invocations_;
-        std::vector<const void *> laneArguments(invocations.size());
-        std::vector<void *> laneResults(invocations.size());
-        for (CpuPullbackInvocationState &invocation : invocations)
-            invocation.privateGradients.assign(signature_.gradients.size(), {});
-        std::vector<CpuPullbackWorkgroupState> workgroups(workgroupCount);
-        for (CpuPullbackWorkgroupState &workgroup : workgroups)
-            workgroup.sharedGradientStaging.resize(signature_.gradients.size());
+        size_t argumentFrameBytes = 0;
+        size_t resultFrameBytes = 0;
+        if (!checkedAddBytes(argumentFrameBytes, invocationCount, layout_.argumentsSize) ||
+            !checkedAddBytes(resultFrameBytes, invocationCount, layout_.resultsSize))
+            return fail(context_, "CPU pullback invocation frame size overflows");
+        std::vector<uint8_t> packedArguments(argumentFrameBytes);
+        std::vector<uint8_t> packedResults(resultFrameBytes);
+        std::vector<const void *> laneArguments(invocationCount);
+        std::vector<void *> laneResults(invocationCount);
+        std::vector<size_t> privateGradientOffsets(signature_.gradients.size(), std::numeric_limits<size_t>::max());
+        size_t privateGradientStride = 0;
         for (size_t gradientIndex = 0; gradientIndex < signature_.gradients.size(); ++gradientIndex) {
-            if (gradientOwnership[gradientIndex] == "atomic_shared" ||
-                gradientOwnership[gradientIndex] == "workgroup_shared") {
-                for (CpuPullbackWorkgroupState &workgroup : workgroups)
-                    workgroup.sharedGradientStaging[gradientIndex].resize(signature_.gradients[gradientIndex].byteSize);
-            } else if (gradientOwnership[gradientIndex] == "invocation_private") {
-                for (CpuPullbackInvocationState &invocation : invocations)
-                    invocation.privateGradients[gradientIndex].resize(signature_.gradients[gradientIndex].byteSize);
-            }
+            if (storageGradients[gradientIndex] || gradientOwnership[gradientIndex] != "invocation_private")
+                continue;
+            privateGradientOffsets[gradientIndex] = privateGradientStride;
+            if (!checkedAddBytes(privateGradientStride, 1, signature_.gradients[gradientIndex].byteSize))
+                return fail(context_, "CPU pullback private gradient layout overflows");
         }
-        const auto workgroupIndex = [&](size_t invocationIndex) {
-            const size_t x = invocationIndex % extent.x;
-            const size_t y = (invocationIndex / extent.x) % extent.y;
-            const size_t z = invocationIndex / (static_cast<size_t>(extent.x) * extent.y);
-            return x / layout_.workgroup[0] +
-                   static_cast<size_t>(computeGrid_.x) *
-                       (y / layout_.workgroup[1] + static_cast<size_t>(computeGrid_.y) * (z / layout_.workgroup[2]));
-        };
+        size_t privateGradientBytes = 0;
+        if (!checkedAddBytes(privateGradientBytes, inlineExecution ? 1 : invocationCount, privateGradientStride))
+            return fail(context_, "CPU pullback private gradient storage overflows");
+        std::vector<uint8_t> privateGradients(privateGradientBytes);
         uint8_t shapeSourceSentinel{};
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION
         HostTapeTraversalMetrics *traversalMetrics = currentHostTapeTraversalMetrics();
@@ -923,67 +959,74 @@ public:
             return status;
         };
         CpuWorkgroupScheduler &scheduler = cpuWorkgroupScheduler(context_);
-        const VernonStatus dispatchStatus = scheduler.dispatch(grid, layout_.workgroup, [&](VernonCpuRangeV1 &range) {
+        const CpuRangeCallback executeRange = [&](VernonCpuRangeV1 &range) {
+            std::vector<HostStaticTapeBatch::Reader> staticReaders;
+            staticReaders.resize(range.lane_end - range.lane_begin);
+            for (size_t localLinear = range.lane_begin; localLinear < range.lane_end; ++localLinear) {
+                const size_t invocationIndex = cpuRangeCoordinates(range, localLinear).linearIndex;
+                if (!tapeBatch_->initializeReader(invocationIndex, staticReaders[localLinear - range.lane_begin]))
+                    return failDispatch("CPU pullback tape reader could not be initialized");
+            }
             for (size_t localLinear = range.lane_begin; localLinear < range.lane_end; ++localLinear) {
                 const CpuLaneCoordinates coordinates = cpuRangeCoordinates(range, localLinear);
                 auto prepareLane = [&]() -> VernonStatus {
                     const size_t invocationIndex = coordinates.linearIndex;
-                    CpuPullbackInvocationState &invocation = invocations[invocationIndex];
-                    if (invocation.packedArguments.empty() && layout_.argumentsSize)
-                        invocation.packedArguments.resize(layout_.argumentsSize);
-                    if (invocation.packedResults.empty() && layout_.resultsSize)
-                        invocation.packedResults.resize(layout_.resultsSize);
-                    std::vector<uint8_t> &arguments = invocation.packedArguments;
-                    laneArguments[invocationIndex] = arguments.data();
-                    laneResults[invocationIndex] = invocation.packedResults.data();
+                    uint8_t *arguments = packedArguments.data() + invocationIndex * layout_.argumentsSize;
+                    uint8_t *results = packedResults.data() + invocationIndex * layout_.resultsSize;
+                    laneArguments[invocationIndex] = arguments;
+                    laneResults[invocationIndex] = results;
                     for (const HostArgument &argument : layout_.arguments) {
                         if (!argument.tensorView)
                             continue;
-                        const std::string shapeName = tensorOwnerName(argument);
-                        const auto shape = tensorShapes_.find(shapeName);
-                        if (shape == tensorShapes_.end())
-                            return failDispatch("CPU pullback TensorView argument has no retained forward shape");
                         uint8_t *data = &shapeSourceSentinel;
-                        if (!isShapeSource(argument)) {
+                        const std::vector<uint64_t> *shape = nullptr;
+                        std::vector<uint64_t> descriptorShape;
+                        if (isShapeSource(argument)) {
+                            const auto retained = tensorShapes_.find(tensorOwnerName(argument));
+                            if (retained == tensorShapes_.end())
+                                return failDispatch("CPU pullback TensorView argument has no retained forward shape");
+                            shape = &retained->second;
+                        } else {
                             const auto gradient = gradientIndices.find(argument.name);
                             if (gradient == gradientIndices.end())
                                 continue;
                             const size_t gradientIndex = gradient->second;
-                            data = (gradientOwnership[gradientIndex] == "atomic_shared" ||
-                                    gradientOwnership[gradientIndex] == "workgroup_shared")
-                                       ? workgroups[workgroupIndex(invocationIndex)]
-                                             .sharedGradientStaging[gradientIndex]
-                                             .data()
-                                   : gradientOwnership[gradientIndex] == "invocation_private"
-                                       ? invocation.privateGradients[gradientIndex].data()
-                                       : &shapeSourceSentinel;
+                            if (!tensorViewDescriptorShape(argument, signature_.gradients[gradientIndex].logicalShape,
+                                                           descriptorShape))
+                                return failDispatch("CPU pullback gradient descriptor shape is inconsistent");
+                            shape = &descriptorShape;
+                            data = gradientOwnership[gradientIndex] == "none" ? &shapeSourceSentinel
+                                                                              : stagedGradients[gradientIndex].data();
                         }
-                        if (!writeTensorViewDescriptor(argument, shape->second, data, arguments))
+                        if (!shape || !writeTensorViewDescriptor(argument, *shape, data, arguments))
                             return failDispatch("CPU pullback TensorView descriptor overflows");
                     }
-                    if (!layout_.tapeAllocatorOffset || !layout_.tapeRootRegionOffset || !invocation.tape)
+                    if (!layout_.tapeAllocatorOffset || !layout_.tapeRootRegionOffset)
                         return failDispatch("CPU pullback dynamic tape ABI is incomplete");
-                    const std::shared_ptr<const HostTapeSnapshot> &snapshot = invocation.tape;
-                    VernonAdTapeAllocator *descriptor = snapshot->descriptor();
-                    const VernonAdRegionHandle root = snapshot->rootRegion();
+                    HostStaticTapeBatch::Reader &reader = staticReaders[localLinear - range.lane_begin];
+                    VernonAdTapeAllocator *descriptor = reader.descriptor();
+                    const VernonAdRegionHandle root = reader.rootRegion();
+                    if (!descriptor)
+                        return failDispatch("CPU pullback tape view is unavailable");
                     if (!root)
                         return failDispatch("CPU pullback dynamic tape has no root region");
-                    std::memcpy(arguments.data() + *layout_.tapeAllocatorOffset, &descriptor,
-                                sizeof(VernonAdTapeAllocator *));
-                    std::memcpy(arguments.data() + *layout_.tapeRootRegionOffset, &root, sizeof(root));
+                    std::memcpy(arguments + *layout_.tapeAllocatorOffset, &descriptor, sizeof(VernonAdTapeAllocator *));
+                    std::memcpy(arguments + *layout_.tapeRootRegionOffset, &root, sizeof(root));
                     for (size_t cotangentIndex = 0; cotangentIndex < cotangentArguments.size(); ++cotangentIndex) {
                         const HostArgument &argument = *cotangentArguments[cotangentIndex];
                         uint8_t *source = cotangentBytes[cotangentIndex].data() +
-                                          invocationIndex * signature_.cotangents[cotangentIndex].byteSize;
+                                          (sharedCotangents[cotangentIndex]
+                                               ? 0
+                                               : invocationIndex * signature_.cotangents[cotangentIndex].byteSize);
                         if (argument.tensorView) {
-                            const std::string shapeName = tensorOwnerName(argument);
-                            const auto shape = tensorShapes_.find(shapeName);
-                            if (shape == tensorShapes_.end() ||
-                                !writeTensorViewDescriptor(argument, shape->second, source, arguments))
+                            std::vector<uint64_t> descriptorShape;
+                            if (!tensorViewDescriptorShape(argument, signature_.cotangents[cotangentIndex].logicalShape,
+                                                           descriptorShape) ||
+                                !writeTensorViewDescriptor(argument, descriptorShape, source, arguments))
                                 return failDispatch("CPU pullback cotangent descriptor is inconsistent");
                         } else {
                             const HostFrameLeaf &leaf = argument.leaves.front();
-                            std::memcpy(arguments.data() + leaf.frameOffset, source,
+                            std::memcpy(arguments + leaf.frameOffset, source,
                                         signature_.cotangents[cotangentIndex].byteSize);
                         }
                     }
@@ -1028,19 +1071,22 @@ public:
                 return failDispatch("autodiff backward lanes completed at different barrier phases");
             for (size_t localLinear = range.lane_begin; localLinear < range.lane_end; ++localLinear) {
                 const size_t invocationIndex = cpuRangeCoordinates(range, localLinear).linearIndex;
-                CpuPullbackInvocationState &lane = invocations[invocationIndex];
-                if (VernonStatus accumulateStatus = accumulateBackwardResults(
-                        layout_, signature_, lane.packedResults, resultGradientIndices_, lane.privateGradients);
+                uint8_t *results = packedResults.data() + invocationIndex * layout_.resultsSize;
+                uint8_t *lanePrivateGradients =
+                    privateGradients.data() + (inlineExecution ? 0 : invocationIndex * privateGradientStride);
+                if (VernonStatus accumulateStatus =
+                        accumulateBackwardResults(layout_, signature_, results, resultGradientIndices_,
+                                                  lanePrivateGradients, privateGradientOffsets);
                     accumulateStatus != VERNON_STATUS_OK)
                     return failDispatch("CPU pullback result gradient ABI is inconsistent", accumulateStatus);
                 laneArguments[invocationIndex] = nullptr;
                 laneResults[invocationIndex] = nullptr;
-                lane.packedArguments = {};
-                lane.packedResults = {};
-                lane.tape.reset();
             }
             return VERNON_STATUS_OK;
-        });
+        };
+        const VernonStatus dispatchStatus = inlineExecution
+                                                ? scheduler.dispatchInline(grid, layout_.workgroup, executeRange)
+                                                : scheduler.dispatch(grid, layout_.workgroup, executeRange);
         if (dispatchStatus != VERNON_STATUS_OK) {
             const std::string diagnostic = !dispatchFailure.empty() ? dispatchFailure
                                            : scheduler.lastDiagnostic().empty()
@@ -1049,21 +1095,16 @@ public:
             return fail(context_, diagnostic, dispatchStatus);
         }
         for (size_t gradientIndex = 0; gradientIndex < signature_.gradients.size(); ++gradientIndex) {
-            if (gradientOwnership[gradientIndex] == "none") {
+            if (gradientOwnership[gradientIndex] == "none" || storageGradients[gradientIndex]) {
                 continue;
-            } else if (gradientOwnership[gradientIndex] == "atomic_shared" ||
-                       gradientOwnership[gradientIndex] == "workgroup_shared") {
-                for (const CpuPullbackWorkgroupState &workgroup : workgroups)
-                    if (VernonStatus status = accumulateGradientBytes(
-                            context_, signature_.gradients[gradientIndex],
-                            workgroup.sharedGradientStaging[gradientIndex].data(), stagedGradients[gradientIndex]);
-                        status != VERNON_STATUS_OK)
-                        return status;
             } else {
-                for (const CpuPullbackInvocationState &invocation : invocations)
-                    if (VernonStatus status = accumulateGradientBytes(context_, signature_.gradients[gradientIndex],
-                                                                      invocation.privateGradients[gradientIndex].data(),
-                                                                      stagedGradients[gradientIndex]);
+                const size_t contributionCount = inlineExecution ? 1 : invocationCount;
+                for (size_t contribution = 0; contribution < contributionCount; ++contribution)
+                    if (VernonStatus status =
+                            accumulateGradientBytes(context_, signature_.gradients[gradientIndex],
+                                                    privateGradients.data() + contribution * privateGradientStride +
+                                                        privateGradientOffsets[gradientIndex],
+                                                    stagedGradients[gradientIndex]);
                         status != VERNON_STATUS_OK)
                         return status;
             }
@@ -1078,9 +1119,10 @@ private:
     HostProfileLayout layout_;
     Signature signature_;
     VernonLaunchSize computeGrid_{};
-    std::vector<CpuPullbackInvocationState> invocations_;
     RuntimeTensorShapes tensorShapes_;
     std::vector<size_t> resultGradientIndices_;
+    size_t invocationCount_{};
+    std::shared_ptr<HostStaticTapeBatch> tapeBatch_;
 };
 
 template <typename Invoke, typename Finish>
@@ -1124,30 +1166,41 @@ VernonStatus runCpuForward(VernonRuntimeContext &context, const HostProfileLayou
             invocationFailure = std::move(diagnostic);
     };
     struct ForwardInvocationFrame {
-        std::vector<uint8_t> arguments;
-        std::vector<uint8_t> results;
+        uint8_t *arguments{};
+        uint8_t *results{};
     };
     std::vector<ForwardInvocationFrame> invocationFrames;
+    std::vector<uint8_t> argumentFrames;
+    std::vector<uint8_t> resultFrames;
     std::vector<const void *> laneArguments;
     std::vector<void *> laneResults;
     try {
+        size_t argumentFrameBytes = 0;
+        size_t resultFrameBytes = 0;
+        if (!checkedAddBytes(argumentFrameBytes, invocationCount, layout.argumentsSize) ||
+            !checkedAddBytes(resultFrameBytes, invocationCount, layout.resultsSize))
+            return fail(context, "CPU autodiff lane frame size overflows");
         invocationFrames.resize(invocationCount);
+        argumentFrames.resize(argumentFrameBytes);
+        resultFrames.resize(resultFrameBytes);
         laneArguments.resize(invocationCount);
         laneResults.resize(invocationCount);
     } catch (const std::bad_alloc &) {
         return fail(context, "cannot allocate persistent CPU autodiff lane frames");
     }
-    const VernonStatus dispatchStatus = scheduler.dispatch(grid, layout.workgroup, [&](VernonCpuRangeV1 &range) {
+    const CpuRangeCallback executeRange = [&](VernonCpuRangeV1 &range) {
         try {
             for (size_t localLinear = range.lane_begin; localLinear < range.lane_end; ++localLinear) {
                 const size_t invocationIndex = cpuRangeCoordinates(range, localLinear).linearIndex;
                 ForwardInvocationFrame &frame = invocationFrames[invocationIndex];
-                if (frame.arguments.empty() && layout.argumentsSize)
-                    frame.arguments = arguments;
-                if (frame.results.empty() && layout.resultsSize)
-                    frame.results.resize(layout.resultsSize);
-                laneArguments[invocationIndex] = frame.arguments.data();
-                laneResults[invocationIndex] = frame.results.data();
+                if (!frame.arguments && layout.argumentsSize) {
+                    frame.arguments = argumentFrames.data() + invocationIndex * layout.argumentsSize;
+                    std::memcpy(frame.arguments, arguments.data(), layout.argumentsSize);
+                }
+                if (!frame.results && layout.resultsSize)
+                    frame.results = resultFrames.data() + invocationIndex * layout.resultsSize;
+                laneArguments[invocationIndex] = frame.arguments;
+                laneResults[invocationIndex] = frame.results;
             }
         } catch (const std::bad_alloc &) {
             recordInvocationFailure("cannot allocate active CPU autodiff lane frames");
@@ -1170,12 +1223,14 @@ VernonStatus runCpuForward(VernonRuntimeContext &context, const HostProfileLayou
                 const size_t invocationIndex = cpuRangeCoordinates(range, localLinear).linearIndex;
                 laneArguments[invocationIndex] = nullptr;
                 laneResults[invocationIndex] = nullptr;
-                invocationFrames[invocationIndex].arguments = {};
-                invocationFrames[invocationIndex].results = {};
+                invocationFrames[invocationIndex] = {};
             }
         }
         return status;
-    });
+    };
+    const VernonStatus dispatchStatus = invocationCount <= kCpuAdInlineInvocationLimit
+                                            ? scheduler.dispatchInline(grid, layout.workgroup, executeRange)
+                                            : scheduler.dispatch(grid, layout.workgroup, executeRange);
     if (dispatchStatus != VERNON_STATUS_OK)
         return fail(context,
                     invocationFailure.empty()
@@ -1202,10 +1257,13 @@ public:
     StructuredCpuExecutable(VernonRuntimeContext &context, HostProfileLayout forwardLayout,
                             HostProfileLayout backwardLayout, std::shared_ptr<CpuKernelState> forward,
                             std::shared_ptr<CpuKernelState> backward, Signature signature,
-                            std::vector<size_t> resultGradientIndices)
+                            std::vector<size_t> resultGradientIndices, uint64_t staticTapeBytesHint)
         : context_(context), forwardLayout_(std::move(forwardLayout)), backwardLayout_(std::move(backwardLayout)),
           forward_(std::move(forward)), backward_(std::move(backward)), signature_(std::move(signature)),
-          tapePolicy_(context.cpuTapePolicy), resultGradientIndices_(std::move(resultGradientIndices)) {}
+          tapePolicy_(context.cpuTapePolicy), resultGradientIndices_(std::move(resultGradientIndices)),
+          staticTapeBytesHint_(staticTapeBytesHint > std::numeric_limits<size_t>::max()
+                                   ? std::numeric_limits<size_t>::max()
+                                   : static_cast<size_t>(staticTapeBytesHint)) {}
 
     const Signature &signature() const override { return signature_; }
 
@@ -1222,6 +1280,9 @@ public:
                               extent) ||
             !carrierCount(extent, invocationCount))
             return fail(context_, "native CPU autodiff launch size overflows");
+        const size_t tapeBytesHint = staticTapeBytesHint_;
+        if (tapeBytesHint > tapePolicy_->invocationLimit())
+            return fail(context_, "CPU autodiff tape allocator static estimate exceeds the per-invocation limit");
         size_t maximumTapeBytes = 0;
         if (!checkedAddBytes(maximumTapeBytes, invocationCount, tapePolicy_->invocationLimit()))
             return fail(context_, "CPU autodiff dispatch tape upper bound overflows");
@@ -1232,25 +1293,33 @@ public:
             return fail(context_, "CPU autodiff forward cannot reserve its " + std::to_string(reservationBytes) +
                                       "-byte dispatch tape budget under the " +
                                       std::to_string(tapePolicy_->contextLimit()) + "-byte context limit");
-        std::vector<std::shared_ptr<const HostTapeSnapshot>> tapeSnapshots(invocationCount);
-        std::vector<std::unique_ptr<HostDynamicTape>> activeTapes(invocationCount);
+        std::shared_ptr<HostStaticTapeBatch> tapeBatch;
+        try {
+            tapeBatch = HostStaticTapeBatch::create(invocationCount, std::max<size_t>(tapeBytesHint, 1),
+                                                    tapePolicy_->invocationLimit(), tapePolicy_, tapeBudget);
+            if (!tapeBatch)
+                return fail(context_, "CPU autodiff compact tape batch does not fit the resident context window");
+        } catch (const std::bad_alloc &) {
+            return fail(context_, "CPU autodiff cannot allocate compact tape batch", VERNON_STATUS_INTERNAL_ERROR);
+        } catch (const std::length_error &) {
+            return fail(context_, "CPU autodiff compact tape batch exceeds the host representation");
+        }
         const VernonStatus status = runCpuForward(
             context_, forwardLayout_, signature_, computeGrid, inputs, outputs, pullback,
             [&](VernonCpuRangeV1 &range, auto &frames, std::string &diagnostic) {
                 for (size_t localLinear = range.lane_begin; localLinear < range.lane_end; ++localLinear) {
                     const CpuLaneCoordinates coordinates = cpuRangeCoordinates(range, localLinear);
-                    std::vector<uint8_t> &arguments = frames[coordinates.linearIndex].arguments;
-                    std::unique_ptr<HostDynamicTape> &tape = activeTapes[coordinates.linearIndex];
+                    uint8_t *arguments = frames[coordinates.linearIndex].arguments;
                     for (const HostArgument &argument : forwardLayout_.arguments) {
                         if (argument.builtin.empty())
                             continue;
                         if (argument.builtin == VERNON_AD_TAPE_ALLOCATOR_BUILTIN) {
-                            if (!tape)
-                                tape = std::make_unique<HostDynamicTape>(tapePolicy_->invocationLimit(), tapePolicy_,
-                                                                         tapeBudget);
-                            VernonAdTapeAllocator *descriptor = &tape->descriptor();
-                            std::memcpy(arguments.data() + argument.offset, &descriptor,
-                                        sizeof(VernonAdTapeAllocator *));
+                            VernonAdTapeAllocator *descriptor = tapeBatch->descriptor(coordinates.linearIndex);
+                            if (!descriptor) {
+                                diagnostic = "CPU autodiff compact tape view was not initialized";
+                                return VERNON_STATUS_INTERNAL_ERROR;
+                            }
+                            std::memcpy(arguments + argument.offset, &descriptor, sizeof(VernonAdTapeAllocator *));
                         } else if (!writeInvocationBuiltin(argument, coordinates, arguments)) {
                             diagnostic = "native CPU autodiff has an unsupported builtin ABI";
                             return VERNON_STATUS_INVALID_ARGUMENT;
@@ -1276,15 +1345,15 @@ public:
                 }
                 for (size_t localLinear = range.lane_begin; localLinear < range.lane_end; ++localLinear) {
                     const size_t invocationIndex = cpuRangeCoordinates(range, localLinear).linearIndex;
-                    std::unique_ptr<HostDynamicTape> &tape = activeTapes[invocationIndex];
-                    if (!tape) {
-                        diagnostic = "autodiff forward profile has no dynamic tape descriptor";
+                    VernonAdTapeAllocator *descriptor = tapeBatch->descriptor(invocationIndex);
+                    if (!descriptor) {
+                        diagnostic = "autodiff forward profile has no compact tape descriptor";
                         return VERNON_STATUS_INVALID_ARGUMENT;
                     }
-                    const VernonAdTapeAllocatorStatus allocatorStatus = tape->descriptor().status;
+                    const VernonAdTapeAllocatorStatus allocatorStatus = descriptor->status;
                     if (allocatorStatus != VERNON_AD_TAPE_ALLOCATOR_OK) {
                         diagnostic = std::string("autodiff tape allocator ") + allocatorFailure(allocatorStatus) +
-                                     " after requiring " + std::to_string(tape->descriptor().required_bytes) +
+                                     " after requiring " + std::to_string(descriptor->required_bytes) +
                                      " bytes for one invocation under the " +
                                      std::to_string(tapePolicy_->invocationLimit()) +
                                      "-byte per-invocation limit and " + std::to_string(tapeBudget->capacity()) +
@@ -1294,21 +1363,20 @@ public:
                                    ? VERNON_STATUS_INTERNAL_ERROR
                                    : VERNON_STATUS_INVALID_ARGUMENT;
                     }
-                    std::shared_ptr<const HostTapeSnapshot> snapshot = tape->takeSnapshot();
-                    if (!snapshot) {
+                    if (!tapeBatch->rootRegion(invocationIndex)) {
                         diagnostic = "autodiff forward profile did not seal its tape";
                         return VERNON_STATUS_INVALID_ARGUMENT;
                     }
-                    tapeSnapshots[invocationIndex] = std::move(snapshot);
-                    tape.reset();
                 }
                 return VERNON_STATUS_OK;
             },
             [&](size_t invocationCount, Signature runtimeSignature, RuntimeTensorShapes tensorShapes,
                 std::unique_ptr<PullbackExecution> &pending) {
+                if (!tapeBatch->compact())
+                    return fail(context_, "CPU autodiff tape batch could not be compacted");
                 pending = std::make_unique<StructuredCpuPullbackExecution>(
                     context_, backward_, backwardLayout_, std::move(runtimeSignature), computeGrid, invocationCount,
-                    std::move(tapeSnapshots), std::move(tensorShapes), resultGradientIndices_);
+                    tapeBatch, std::move(tensorShapes), resultGradientIndices_);
                 return VERNON_STATUS_OK;
             });
         if (status == VERNON_STATUS_OK)
@@ -1325,6 +1393,7 @@ private:
     Signature signature_;
     std::shared_ptr<HostTapeMemoryPolicy> tapePolicy_;
     std::vector<size_t> resultGradientIndices_;
+    size_t staticTapeBytesHint_{};
 };
 
 bool validateDifferentiationSignature(VernonRuntimeContext &context, const Signature &signature) {
@@ -1373,7 +1442,7 @@ bool validateDifferentiationSignature(VernonRuntimeContext &context, const Signa
 bool finishStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &forwardStage, const Stage &backwardStage,
                                    std::shared_ptr<CpuKernelState> forwardKernel,
                                    std::shared_ptr<CpuKernelState> backwardKernel,
-                                   const std::vector<std::string> &gradientPaths,
+                                   const std::vector<std::string> &gradientPaths, uint64_t staticTapeBytesHint,
                                    std::shared_ptr<Executable> &executable) {
     HostProfileLayout forward;
     HostProfileLayout backward;
@@ -1460,14 +1529,14 @@ bool finishStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &f
         return false;
     if (!context.cpuTapePolicy)
         context.cpuTapePolicy = std::make_shared<HostTapeMemoryPolicy>();
-    executable = std::make_shared<StructuredCpuExecutable>(context, std::move(forward), std::move(backward),
-                                                           std::move(forwardKernel), std::move(backwardKernel),
-                                                           std::move(signature), std::move(resultGradientIndices));
+    executable = std::make_shared<StructuredCpuExecutable>(
+        context, std::move(forward), std::move(backward), std::move(forwardKernel), std::move(backwardKernel),
+        std::move(signature), std::move(resultGradientIndices), staticTapeBytesHint);
     return true;
 }
 
 bool loadStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &forwardStage, const Stage &backwardStage,
-                                 const std::vector<std::string> &gradientPaths,
+                                 const std::vector<std::string> &gradientPaths, uint64_t staticTapeBytesHint,
                                  std::shared_ptr<Executable> &executable) {
     if (!forwardStage.cpuArtifact || !backwardStage.cpuArtifact) {
         invocationDiagnostic(context) = "CPU autodiff profiles have no loadable artifacts";
@@ -1480,13 +1549,13 @@ bool loadStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &for
         !loadCpuNativeArtifact(*backwardStage.cpuArtifact, *backwardKernel, reflection, invocationDiagnostic(context)))
         return false;
     return finishStructuredCpuExecutable(context, forwardStage, backwardStage, std::move(forwardKernel),
-                                         std::move(backwardKernel), gradientPaths, executable);
+                                         std::move(backwardKernel), gradientPaths, staticTapeBytesHint, executable);
 }
 
 bool loadStructuredCpuEntryExecutable(VernonRuntimeContext &context, const Stage &forwardStage,
                                       VernonCpuEntryPoint forwardEntry, const Stage &backwardStage,
                                       VernonCpuEntryPoint backwardEntry, const std::vector<std::string> &gradientPaths,
-                                      std::shared_ptr<Executable> &executable) {
+                                      uint64_t staticTapeBytesHint, std::shared_ptr<Executable> &executable) {
     auto forwardKernel = std::make_shared<CpuKernelState>();
     auto backwardKernel = std::make_shared<CpuKernelState>();
     ReflectedEntry reflection;
@@ -1498,14 +1567,16 @@ bool loadStructuredCpuEntryExecutable(VernonRuntimeContext &context, const Stage
                       invocationDiagnostic(context)))
         return false;
     return finishStructuredCpuExecutable(context, forwardStage, backwardStage, std::move(forwardKernel),
-                                         std::move(backwardKernel), gradientPaths, executable);
+                                         std::move(backwardKernel), gradientPaths, staticTapeBytesHint, executable);
 }
 
 } // namespace
 
 bool createCpuExecutable(VernonRuntimeContext &context, const Stage &forwardStage, const Stage &backwardStage,
-                         const std::vector<std::string> &gradientPaths, std::shared_ptr<Executable> &executable) {
-    return loadStructuredCpuExecutable(context, forwardStage, backwardStage, gradientPaths, executable);
+                         const std::vector<std::string> &gradientPaths, uint64_t staticTapeBytesHint,
+                         std::shared_ptr<Executable> &executable) {
+    return loadStructuredCpuExecutable(context, forwardStage, backwardStage, gradientPaths, staticTapeBytesHint,
+                                       executable);
 }
 
 bool createCpuEntryExecutable(VernonRuntimeContext &context, VernonCpuEntryPoint forwardEntry,
@@ -1513,7 +1584,7 @@ bool createCpuEntryExecutable(VernonRuntimeContext &context, VernonCpuEntryPoint
                               VernonCpuEntryPoint backwardEntry, VernonStringView backwardReflection,
                               VernonStringView backwardName, VernonStringView forwardProtocol,
                               VernonStringView backwardProtocol, const std::vector<std::string> &gradientPaths,
-                              std::shared_ptr<Executable> &executable) {
+                              uint64_t staticTapeBytesHint, std::shared_ptr<Executable> &executable) {
     if (!forwardEntry || !backwardEntry || !forwardReflection.data || !forwardReflection.size ||
         !backwardReflection.data || !backwardReflection.size || !forwardName.data || !forwardName.size ||
         !backwardName.data || !backwardName.size || !forwardProtocol.data || !forwardProtocol.size ||
@@ -1533,7 +1604,7 @@ bool createCpuEntryExecutable(VernonRuntimeContext &context, VernonCpuEntryPoint
         return false;
     }
     return loadStructuredCpuEntryExecutable(context, forwardStage, forwardEntry, backwardStage, backwardEntry,
-                                            gradientPaths, executable);
+                                            gradientPaths, staticTapeBytesHint, executable);
 }
 
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION

@@ -31,6 +31,8 @@ typedef struct VernonPythonStructuredVjpView {
     VernonStringView forward_module;
     VernonStringView backward_module;
     uint64_t tape_bytes;
+    uint64_t active_operation_count;
+    uint64_t recomputation_cost;
     const VernonStringView *derivative_rules;
     size_t derivative_rule_count;
 } VernonPythonStructuredVjpView;

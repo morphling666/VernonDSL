@@ -26,6 +26,8 @@ class StructuredVjpBuild:
     profiles: Mapping[str, str]
     protocols: Mapping[str, str]
     uses_dynamic_tape: bool
+    active_operation_count: int
+    recomputation_cost: int
 
 
 def _validate_nonoverlapping_paths(paths: tuple[str, ...], role: str) -> None:
@@ -169,6 +171,8 @@ def build_structured_vjp(
         profiles,
         MappingProxyType({"forward_with_tape": "dynamic_v2", "backward": "dynamic_v2"}),
         any("!vernon.ad_tape" in module for module in profiles.values()),
+        int(transformed.active_operation_count),
+        int(transformed.recomputation_cost),
     )
 
 

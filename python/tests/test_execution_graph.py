@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import unittest
 from typing import Annotated
+from unittest import mock
 
 import numpy as np
 import vernon_dsl as vd
+from vernon_dsl._runtime.autodiff import _StructuredPullback
 from vernon_dsl._runtime.session import RuntimeUnavailableError
+
+from python.tests.storage_vjp_direct_fixture import Particle, aggregate_storage_objective_vjp
 
 
 @vd.kernel(workgroup_size=(1, 1, 1))
@@ -25,6 +29,63 @@ def graph_add_parameter(
     gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
 ) -> None:
     output[gid[0]] = source[gid[0]] + amount
+
+
+@vd.kernel(workgroup_size=(1, 1, 1))
+def graph_square(
+    source: vd.TensorView[vd.f32, (1,), vd.read],
+    output: vd.TensorView[vd.f32, (1,), vd.write],
+) -> None:
+    output[0] = source[0] * source[0]
+
+
+@vd.kernel(workgroup_size=(1, 1, 1))
+def graph_heavy_square(
+    source: vd.TensorView[vd.f32, (1,), vd.read],
+    output: vd.TensorView[vd.f32, (1,), vd.write],
+) -> None:
+    value = source[0]
+    value = value * value
+    value = value * value
+    value = value * value
+    value = value * value
+    value = value * value
+    value = value * value
+    value = value * value
+    output[0] = value * value
+
+
+@vd.kernel(workgroup_size=(1, 1, 1))
+def graph_cube(
+    source: vd.TensorView[vd.f32, (1,), vd.read],
+    output: vd.TensorView[vd.f32, (1,), vd.write],
+) -> None:
+    output[0] = source[0] * source[0] * source[0]
+
+
+@vd.kernel(workgroup_size=(1, 1, 1))
+def graph_product(
+    left: vd.TensorView[vd.f32, (1,), vd.read],
+    right: vd.TensorView[vd.f32, (1,), vd.read],
+    output: vd.TensorView[vd.f32, (1,), vd.write],
+) -> None:
+    output[0] = left[0] * right[0]
+
+
+@vd.kernel(workgroup_size=(1, 1, 1))
+def graph_scale(
+    source: vd.TensorView[vd.f32, (1,), vd.read],
+    factor: vd.f32,
+    output: vd.TensorView[vd.f32, (1,), vd.write],
+) -> None:
+    output[0] = source[0] * factor
+
+
+graph_square_vjp = vd.ad.vjp(graph_square, wrt=("source",), outputs=("output",))
+graph_heavy_square_vjp = vd.ad.vjp(graph_heavy_square, wrt=("source",), outputs=("output",))
+graph_cube_vjp = vd.ad.vjp(graph_cube, wrt=("source",), outputs=("output",))
+graph_product_vjp = vd.ad.vjp(graph_product, wrt=("left", "right"), outputs=("output",))
+graph_scale_vjp = vd.ad.vjp(graph_scale, wrt=("factor",), outputs=("output",))
 
 
 class RecordingComputePass(vd.ComputePass):
@@ -109,6 +170,44 @@ class CpuExecutionGraphTests(unittest.TestCase):
         self.assertEqual([execution_pass.name for execution_pass in plan.schedule], ["write", "read"])
         self.assertEqual(events, ["write", "read"])
         self.assertEqual(len(plan.scopes[1].barriers), 1)
+
+    def test_autodiff_checkpoint_planning_validates_memory_budget(self) -> None:
+        graph = vd.ExecutionGraph()
+        with self.assertRaisesRegex(ValueError, "non-negative integer"):
+            graph.plan_autodiff_checkpoints(memory_budget=-1)
+
+    def test_autodiff_budget_charges_static_tape_allocation_overhead_per_pass(self) -> None:
+        def make_graph() -> vd.ExecutionGraph:
+            source = vd.storage.from_numpy(np.array([2.0], dtype=np.float32))
+            intermediate = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+            objective = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+            graph = vd.ExecutionGraph()
+            previous = graph.differentiable_input("source", source)
+            for name, storage in (("first", intermediate), ("second", objective)):
+                output = (
+                    graph.objective("loss", storage)
+                    if name == "second"
+                    else graph.import_resource(storage, exported=False)
+                )
+                graph.add_pass(
+                    vd.VjpComputePass(
+                        name,
+                        graph_square_vjp,
+                        {"source": previous, "output": output},
+                        grid=(1, 1, 1),
+                    )
+                )
+                previous = output
+            return graph
+
+        pullback = make_graph().compile().vjp()
+        logical_only_budget = pullback.logical_residual_bytes + 2 * np.dtype(np.float32).itemsize
+        self.assertGreater(pullback.peak_runtime_managed_bytes, logical_only_budget)
+
+        graph = make_graph()
+        graph.plan_autodiff_checkpoints(memory_budget=logical_only_budget)
+        with self.assertRaisesRegex(ValueError, "cannot satisfy the memory budget"):
+            graph.compile()
 
     def test_compile_rejects_foreign_dependencies_and_freezes_compiled_passes(self) -> None:
         first_graph = vd.ExecutionGraph()
@@ -236,6 +335,342 @@ class CpuExecutionGraphTests(unittest.TestCase):
             plan.submit()
 
         self.assertEqual(events, ["failure"])
+
+    def test_vjp_compute_pass_ordinary_submission_uses_primal_pipeline(self) -> None:
+        source = vd.storage.from_numpy(np.array([3.0], dtype=np.float32))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        graph = vd.ExecutionGraph()
+        execution_pass = vd.VjpComputePass(
+            "square",
+            graph_square_vjp,
+            {"source": graph.import_resource(source), "output": graph.import_resource(output)},
+            grid=(1, 1, 1),
+        )
+        graph.add_pass(execution_pass)
+
+        with mock.patch.object(
+            execution_pass,
+            "_native_vjp_forward",
+            side_effect=AssertionError("ordinary submission allocated an autodiff tape"),
+        ) as forward:
+            graph.compile().submit().wait()
+
+        forward.assert_not_called()
+        np.testing.assert_array_equal(output.to_numpy(), np.array([9.0], dtype=np.float32))
+
+    def test_graph_vjp_composes_multi_pass_chain_and_retains_destroyed_plan(self) -> None:
+        source = vd.storage.from_numpy(np.array([3.0], dtype=np.float32))
+        intermediate = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        graph = vd.ExecutionGraph()
+        source_resource = graph.differentiable_input("source", source)
+        intermediate_resource = graph.import_resource(intermediate, exported=False)
+        loss_resource = graph.objective("loss", loss)
+        graph.add_pass(
+            vd.VjpComputePass(
+                "square-source",
+                graph_square_vjp,
+                {"source": source_resource, "output": intermediate_resource},
+                grid=(1, 1, 1),
+            )
+        )
+        graph.add_pass(
+            vd.VjpComputePass(
+                "square-intermediate",
+                graph_square_vjp,
+                {"source": intermediate_resource, "output": loss_resource},
+                grid=(1, 1, 1),
+            )
+        )
+
+        plan = graph.compile()
+        pullback = plan.vjp()
+        del graph
+        del plan
+
+        self.assertEqual(float(loss.to_numpy()[0]), 81.0)
+        with mock.patch.object(
+            _StructuredPullback,
+            "apply_logical",
+            side_effect=AssertionError("graph reverse called Python pullback orchestration"),
+        ) as apply_logical:
+            gradients = pullback(None)
+        apply_logical.assert_not_called()
+        np.testing.assert_array_equal(gradients["source"].to_numpy(), np.array([108.0], dtype=np.float32))
+        epsilon = 1.0e-3
+        finite_difference = ((3.0 + epsilon) ** 4 - (3.0 - epsilon) ** 4) / (2.0 * epsilon)
+        self.assertAlmostEqual(float(gradients["source"].to_numpy()[0]), finite_difference, places=3)
+
+    def test_graph_vjp_replays_checkpointed_segments_and_remains_reusable(self) -> None:
+        source = vd.storage.from_numpy(np.array([1.0], dtype=np.float32))
+        states = [vd.storage.zeros(dtype=vd.f32, shape=(1,)) for _ in range(4)]
+        graph = vd.ExecutionGraph()
+        previous = graph.differentiable_input("source", source)
+        for index, state in enumerate(states):
+            output = graph.objective("loss", state) if index == 3 else graph.import_resource(state, exported=False)
+            graph.add_pass(
+                vd.VjpComputePass(
+                    f"square-{index}",
+                    graph_heavy_square_vjp,
+                    {"source": previous, "output": output},
+                    grid=(1, 1, 1),
+                )
+            )
+            previous = output
+        graph.plan_autodiff_checkpoints(memory_budget=240)
+
+        with mock.patch.object(
+            vd.TensorStorage,
+            "to_numpy",
+            side_effect=AssertionError("checkpoint used NumPy"),
+        ) as read:
+            compiled = graph.compile()
+            pullback = compiled.vjp()
+        read.assert_not_called()
+        checkpoint_plan = compiled.autodiff_checkpoint_plan
+        assert checkpoint_plan is not None
+        self.assertEqual(checkpoint_plan["memory_budget"], 240)
+        self.assertGreater(checkpoint_plan["initial_state_bytes"], 0)
+        self.assertGreater(checkpoint_plan["restoration_bytes"], 0)
+        self.assertGreater(pullback.checkpoint_bytes, 0)
+        self.assertGreaterEqual(
+            pullback.peak_runtime_managed_bytes,
+            pullback.allocated_tape_bytes + pullback.checkpoint_bytes,
+        )
+        expected_loss = np.float32(1.0)
+        self.assertAlmostEqual(float(states[-1].to_numpy()[0]), float(expected_loss), places=5)
+        expected_gradient = np.float32(2**32)
+        source.copy_from_numpy(np.array([2.0], dtype=np.float32))
+        for _ in range(2):
+            gradient = pullback(None)["source"].to_numpy()
+            self.assertAlmostEqual(float(gradient[0]), float(expected_gradient), places=4)
+            self.assertAlmostEqual(float(states[-1].to_numpy()[0]), float(expected_loss), places=5)
+            np.testing.assert_array_equal(source.to_numpy(), np.array([2.0], dtype=np.float32))
+
+    def test_graph_vjp_accumulates_branches_deterministically(self) -> None:
+        source = vd.storage.from_numpy(np.array([2.0], dtype=np.float32))
+        square = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        cube = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        graph = vd.ExecutionGraph()
+        source_resource = graph.differentiable_input("source", source)
+        square_resource = graph.objective("square", square)
+        cube_resource = graph.objective("cube", cube)
+        graph.add_pass(
+            vd.VjpComputePass(
+                "square",
+                graph_square_vjp,
+                {"source": source_resource, "output": square_resource},
+                grid=(1, 1, 1),
+            )
+        )
+        graph.add_pass(
+            vd.VjpComputePass(
+                "cube",
+                graph_cube_vjp,
+                {"source": source_resource, "output": cube_resource},
+                grid=(1, 1, 1),
+            )
+        )
+
+        pullback = graph.compile().vjp()
+        with mock.patch.object(
+            vd.TensorStorage,
+            "_add_gradients",
+            wraps=vd.TensorStorage._add_gradients,
+        ) as add_gradients:
+            gradients = pullback(
+                {
+                    "square": np.array([1.0], dtype=np.float32),
+                    "cube": np.array([2.0], dtype=np.float32),
+                }
+            )
+
+        add_gradients.assert_called_once()
+        self.assertEqual(pullback.reverse_python_callback_count, 3)
+        np.testing.assert_array_equal(gradients["source"].to_numpy(), np.array([28.0], dtype=np.float32))
+
+    def test_nested_pullback_keeps_reverse_callback_telemetry_isolated(self) -> None:
+        source = vd.storage.from_numpy(np.array([2.0], dtype=np.float32))
+        square = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        cube = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        outer_graph = vd.ExecutionGraph()
+        outer_input = outer_graph.differentiable_input("source", source)
+        outer_graph.add_pass(
+            vd.VjpComputePass(
+                "square",
+                graph_square_vjp,
+                {"source": outer_input, "output": outer_graph.objective("square", square)},
+                grid=(1, 1, 1),
+            )
+        )
+        outer_graph.add_pass(
+            vd.VjpComputePass(
+                "cube",
+                graph_cube_vjp,
+                {"source": outer_input, "output": outer_graph.objective("cube", cube)},
+                grid=(1, 1, 1),
+            )
+        )
+        compiled = outer_graph.compile()
+        outer_pullback = compiled.vjp()
+        inner_pullback = compiled.vjp()
+        add_gradients = vd.TensorStorage._add_gradients
+        applying_inner = False
+
+        def accumulate_with_nested_pullback(left: object, right: object) -> object:
+            nonlocal applying_inner
+            if not applying_inner:
+                applying_inner = True
+                try:
+                    inner_pullback(None)
+                    self.assertEqual(inner_pullback.reverse_python_callback_count, 5)
+                finally:
+                    applying_inner = False
+            return add_gradients(left, right)
+
+        with mock.patch.object(vd.TensorStorage, "_add_gradients", side_effect=accumulate_with_nested_pullback):
+            outer_pullback(
+                {
+                    "square": np.ones((1,), dtype=np.float32),
+                    "cube": np.ones((1,), dtype=np.float32),
+                }
+            )
+
+        self.assertEqual(outer_pullback.reverse_python_callback_count, 3)
+        self.assertEqual(inner_pullback.reverse_python_callback_count, 5)
+
+    def test_graph_vjp_preserves_accumulation_exception(self) -> None:
+        source = vd.storage.from_numpy(np.array([2.0], dtype=np.float32))
+        square = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        cube = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        graph = vd.ExecutionGraph()
+        source_resource = graph.differentiable_input("source", source)
+        graph.add_pass(
+            vd.VjpComputePass(
+                "square",
+                graph_square_vjp,
+                {"source": source_resource, "output": graph.objective("square", square)},
+                grid=(1, 1, 1),
+            )
+        )
+        graph.add_pass(
+            vd.VjpComputePass(
+                "cube",
+                graph_cube_vjp,
+                {"source": source_resource, "output": graph.objective("cube", cube)},
+                grid=(1, 1, 1),
+            )
+        )
+        pullback = graph.compile().vjp()
+
+        with (
+            mock.patch.object(vd.TensorStorage, "_add_gradients", side_effect=ValueError("merge failed")),
+            self.assertRaisesRegex(ValueError, "merge failed"),
+        ):
+            pullback({"square": np.ones((1,), dtype=np.float32), "cube": np.ones((1,), dtype=np.float32)})
+
+    def test_graph_vjp_returns_multiple_input_gradients_and_backward_submission(self) -> None:
+        left = vd.storage.from_numpy(np.array([3.0], dtype=np.float32))
+        right = vd.storage.from_numpy(np.array([5.0], dtype=np.float32))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        graph = vd.ExecutionGraph()
+        left_resource = graph.differentiable_input("left", left)
+        right_resource = graph.differentiable_input("right", right)
+        output_resource = graph.objective("output", output)
+        graph.add_pass(
+            vd.VjpComputePass(
+                "product",
+                graph_product_vjp,
+                {"left": left_resource, "right": right_resource, "output": output_resource},
+                grid=(1, 1, 1),
+            )
+        )
+
+        compiled = graph.compile()
+        pullback = compiled.vjp()
+        second_pullback = compiled.vjp()
+        backward = pullback.submit(None)
+
+        self.assertIs(backward.state, vd.SubmissionState.SUCCEEDED)
+        backward.wait()
+        np.testing.assert_array_equal(backward.gradients["left"].to_numpy(), np.array([5.0], dtype=np.float32))
+        np.testing.assert_array_equal(backward.gradients["right"].to_numpy(), np.array([3.0], dtype=np.float32))
+        self.assertEqual(pullback.reverse_python_callback_count, 2)
+        second_pullback(
+            {
+                "output": np.ones((1,), dtype=np.float32),
+            }
+        )
+        self.assertEqual(second_pullback.reverse_python_callback_count, 1)
+        self.assertEqual(pullback.reverse_python_callback_count, 2)
+
+    def test_graph_vjp_does_not_double_count_aliased_pipeline_gradients(self) -> None:
+        source = vd.storage.from_numpy(np.array([3.0], dtype=np.float32))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        graph = vd.ExecutionGraph()
+        source_resource = graph.differentiable_input("source", source)
+        output_resource = graph.objective("output", output)
+        graph.add_pass(
+            vd.VjpComputePass(
+                "square-through-product",
+                graph_product_vjp,
+                {"left": source_resource, "right": source_resource, "output": output_resource},
+                grid=(1, 1, 1),
+            )
+        )
+
+        gradient = graph.compile().vjp()(None)["source"]
+
+        np.testing.assert_array_equal(gradient.to_numpy(), np.array([6.0], dtype=np.float32))
+
+    def test_graph_vjp_differentiates_execution_value_parameters(self) -> None:
+        source = vd.storage.from_numpy(np.array([4.0], dtype=np.float32))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        graph = vd.ExecutionGraph()
+        factor = graph.parameter("factor")
+        graph.differentiable_input("factor", factor)
+        output_resource = graph.objective("output", output)
+        graph.add_pass(
+            vd.VjpComputePass(
+                "scale",
+                graph_scale_vjp,
+                {"source": source, "factor": factor, "output": output_resource},
+                grid=(1, 1, 1),
+            )
+        )
+        plan = graph.compile()
+        bindings = plan.create_bindings({factor: np.float32(3.0)})
+
+        gradient = plan.vjp(bindings)(None)["factor"]
+
+        self.assertEqual(float(np.asarray(gradient)), 4.0)
+
+    def test_graph_vjp_preserves_structured_storage_gradients(self) -> None:
+        particles = vd.storage.zeros(dtype=Particle, shape=(1,))
+        values = particles.to_numpy()
+        values["velocity"][0] = np.array([2.0, -3.0], dtype=np.float16)
+        values["mass"][0] = np.float32(4.0)
+        particles.copy_from_numpy(values)
+        loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        graph = vd.ExecutionGraph()
+        particles_resource = graph.differentiable_input("particles", particles)
+        loss_resource = graph.objective("loss", loss)
+        graph.add_pass(
+            vd.VjpComputePass(
+                "aggregate",
+                aggregate_storage_objective_vjp,
+                {"particles": particles_resource, "loss": loss_resource},
+                grid=(1, 1, 1),
+            )
+        )
+
+        gradient = graph.compile().vjp()(None)["particles"]
+
+        np.testing.assert_array_equal(
+            gradient["velocity"].to_numpy(),
+            np.array([[4.0, -6.0]], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(gradient["mass"].to_numpy(), np.array([8.0], dtype=np.float32))
 
     def test_texture_view_rejects_incompatible_reinterpretations(self) -> None:
         texture = vd.Texture.zeros(shape=(4, 4))

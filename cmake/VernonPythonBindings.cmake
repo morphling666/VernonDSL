@@ -52,7 +52,16 @@ function(vernon_add_python_bindings package_directory source_directory)
     endif()
 
     target_sources(VernonDSLCompiler PRIVATE "${source_directory}/lib/compiler/compiler_python_bridge.cpp")
-    nanobind_add_module(vernon-dsl-native "${source_directory}/python/native_module.cpp")
+    nanobind_add_module(
+        vernon-dsl-native
+        "${source_directory}/python/native_compiler.cpp"
+        "${source_directory}/python/native_module.cpp"
+        "${source_directory}/python/native_execution_graph.cpp"
+        "${source_directory}/python/native_execution_graph_autodiff.cpp"
+        "${source_directory}/python/native_pipeline.cpp"
+        "${source_directory}/python/native_pipeline_autodiff.cpp"
+        "${source_directory}/python/native_rhi.cpp"
+        "${source_directory}/python/native_runtime.cpp")
     _vernon_set_python_module_output(vernon-dsl-native "${package_directory}")
     target_link_libraries(
         vernon-dsl-native

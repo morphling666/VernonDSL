@@ -718,8 +718,8 @@ public:
 #endif
     }
 
-    VernonStatus dispatch(const uint32_t grid[3], const uint32_t workgroup[3],
-                          const CpuRangeCallback &callback) noexcept {
+    VernonStatus dispatch(const uint32_t grid[3], const uint32_t workgroup[3], const CpuRangeCallback &callback,
+                          bool forceCallingThread) noexcept {
         try {
             schedulerDiagnostic.clear();
             if (activeWorkgroup)
@@ -748,13 +748,13 @@ public:
                 return job->status();
             }
             const size_t runners =
-                config_.executionPolicy == CpuSchedulerExecutionPolicy::CallingThread
+                forceCallingThread || config_.executionPolicy == CpuSchedulerExecutionPolicy::CallingThread
                     ? 1
                     : std::min(config_.threadBudget, groupCount > std::numeric_limits<size_t>::max() / workgroupVolume
                                                          ? config_.threadBudget
                                                          : groupCount * workgroupVolume);
             auto job = std::make_shared<RangeJob>(runners, groupCount, workgroupVolume, grid, workgroup, callback);
-            if (config_.executionPolicy == CpuSchedulerExecutionPolicy::CallingThread) {
+            if (forceCallingThread || config_.executionPolicy == CpuSchedulerExecutionPolicy::CallingThread) {
                 job->run();
             } else {
 #if defined(VERNON_RUNTIME_PROFILE_WEB)
@@ -927,7 +927,12 @@ CpuWorkgroupScheduler::~CpuWorkgroupScheduler() = default;
 
 VernonStatus CpuWorkgroupScheduler::dispatch(const uint32_t grid[3], const uint32_t workgroup[3],
                                              const CpuRangeCallback &callback) noexcept {
-    return impl_->dispatch(grid, workgroup, callback);
+    return impl_->dispatch(grid, workgroup, callback, false);
+}
+
+VernonStatus CpuWorkgroupScheduler::dispatchInline(const uint32_t grid[3], const uint32_t workgroup[3],
+                                                   const CpuRangeCallback &callback) noexcept {
+    return impl_->dispatch(grid, workgroup, callback, true);
 }
 
 const std::string &CpuWorkgroupScheduler::lastDiagnostic() const noexcept { return impl_->lastDiagnostic(); }

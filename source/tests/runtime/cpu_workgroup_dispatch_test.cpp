@@ -113,6 +113,24 @@ TEST_F(CpuWorkgroupDispatchTest, CallingThreadPolicyReusesRangePhaseEngineWithou
     EXPECT_TRUE(std::all_of(visits.begin(), visits.end(), [](uint32_t count) { return count == 1; }));
 }
 
+TEST_F(CpuWorkgroupDispatchTest, InlineDispatchBypassesWorkerPoolForMultipleLargeGroups) {
+    constexpr uint32_t grid[3]{4, 1, 1};
+    constexpr uint32_t workgroup[3]{256, 1, 1};
+    const std::thread::id callingThread = std::this_thread::get_id();
+    std::atomic<size_t> visits{};
+
+    ASSERT_EQ(scheduler_->dispatchInline(grid, workgroup,
+                                         [&](VernonCpuRangeV1 &range) {
+                                             EXPECT_EQ(std::this_thread::get_id(), callingThread);
+                                             visits.fetch_add(range.lane_end - range.lane_begin,
+                                                              std::memory_order_relaxed);
+                                             return VERNON_STATUS_OK;
+                                         }),
+              VERNON_STATUS_OK)
+        << scheduler_->lastDiagnostic();
+    EXPECT_EQ(visits.load(std::memory_order_relaxed), 1024u);
+}
+
 TEST_F(CpuWorkgroupDispatchTest, PersistsSharedStorageAcrossNonblockingPhases) {
     constexpr uint32_t grid[3]{2, 1, 1};
     constexpr uint32_t workgroup[3]{4, 1, 1};

@@ -41,10 +41,17 @@ struct Signature {
     bool storageObjectives{};
 };
 
+struct PullbackMemoryUsage {
+    size_t logicalResidualBytes{};
+    size_t residentBytes{};
+    size_t allocatedBytes{};
+};
+
 class PullbackExecution {
 public:
     virtual ~PullbackExecution() = default;
     virtual VernonStatus apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients) = 0;
+    virtual PullbackMemoryUsage memoryUsage() const = 0;
 };
 
 class Executable {
@@ -76,13 +83,14 @@ bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
                                               const Signature &signature);
 
 bool createCpuExecutable(VernonRuntimeContext &context, const Stage &forward, const Stage &backward,
-                         const std::vector<std::string> &gradientPaths, std::shared_ptr<Executable> &executable);
+                         const std::vector<std::string> &gradientPaths, uint64_t staticTapeBytesHint,
+                         std::shared_ptr<Executable> &executable);
 bool createCpuEntryExecutable(VernonRuntimeContext &context, VernonCpuEntryPoint forwardEntry,
                               VernonStringView forwardReflection, VernonStringView forwardName,
                               VernonCpuEntryPoint backwardEntry, VernonStringView backwardReflection,
                               VernonStringView backwardName, VernonStringView forwardProtocol,
                               VernonStringView backwardProtocol, const std::vector<std::string> &gradientPaths,
-                              std::shared_ptr<Executable> &executable);
+                              uint64_t staticTapeBytesHint, std::shared_ptr<Executable> &executable);
 bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffVariant &profiles,
                              VernonLoadedPipeline &pipeline);
 

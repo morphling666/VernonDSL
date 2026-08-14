@@ -63,6 +63,8 @@ struct VernonPythonStructuredVjp {
     std::string forwardModule;
     std::string backwardModule;
     uint64_t tapeBytes{};
+    uint64_t activeOperationCount{};
+    uint64_t recomputationCost{};
     std::vector<std::string> derivativeRules;
     std::vector<VernonStringView> derivativeRuleViews;
 };
@@ -224,6 +226,17 @@ VernonPythonStructuredVjp *vernonCompilerBuildPythonStructuredVjp(VernonStringVi
         return result.release();
     }
     result->tapeBytes = transformed->tapeBytes;
+    const auto activeOperationCount =
+        transformed->backward->getAttrOfType<mlir::IntegerAttr>("vernon.ad.active_operation_count");
+    const auto recomputationCost =
+        transformed->backward->getAttrOfType<mlir::IntegerAttr>("vernon.ad.recomputation_cost");
+    if (!activeOperationCount || !recomputationCost) {
+        result->status = VERNON_STATUS_INTERNAL_ERROR;
+        result->diagnostics = "structured VJP result omitted native telemetry";
+        return result.release();
+    }
+    result->activeOperationCount = activeOperationCount.getValue().getZExtValue();
+    result->recomputationCost = recomputationCost.getValue().getZExtValue();
     result->derivativeRules.assign(transformed->derivativeRules.begin(), transformed->derivativeRules.end());
     result->derivativeRuleViews.reserve(result->derivativeRules.size());
     for (const std::string &rule : result->derivativeRules)
@@ -305,12 +318,14 @@ void vernonCompilerDestroyPythonStructuredVjp(VernonPythonStructuredVjp *result)
 
 VernonPythonStructuredVjpView vernonCompilerGetPythonStructuredVjpView(const VernonPythonStructuredVjp *result) {
     if (!result)
-        return {VERNON_STATUS_INVALID_ARGUMENT, {}, {}, {}, 0, nullptr, 0};
+        return {VERNON_STATUS_INVALID_ARGUMENT, {}, {}, {}, 0, 0, 0, nullptr, 0};
     return {result->status,
             viewOf(result->diagnostics),
             viewOf(result->forwardModule),
             viewOf(result->backwardModule),
             result->tapeBytes,
+            result->activeOperationCount,
+            result->recomputationCost,
             result->derivativeRuleViews.data(),
             result->derivativeRuleViews.size()};
 }

@@ -7,6 +7,7 @@
 #include "llvm/ADT/StringMap.h"
 
 #include <functional>
+#include <initializer_list>
 #include <optional>
 #include <string>
 
@@ -22,15 +23,21 @@ enum class AutodiffPrimalKind {
 struct AutodiffPrimalRequirement {
     AutodiffPrimalKind kind{AutodiffPrimalKind::Operand};
     unsigned index{};
+    SmallVector<unsigned> contributionOperands;
 
-    static AutodiffPrimalRequirement operand(unsigned index) {
-        return AutodiffPrimalRequirement{AutodiffPrimalKind::Operand, index};
+    static AutodiffPrimalRequirement operand(unsigned index,
+                                             std::initializer_list<unsigned> contributionOperands = {}) {
+        return AutodiffPrimalRequirement{AutodiffPrimalKind::Operand, index, contributionOperands};
     }
     static AutodiffPrimalRequirement result(unsigned index) {
-        return AutodiffPrimalRequirement{AutodiffPrimalKind::Result, index};
+        return AutodiffPrimalRequirement{AutodiffPrimalKind::Result, index, {}};
     }
 
-    bool operator==(const AutodiffPrimalRequirement &other) const { return kind == other.kind && index == other.index; }
+    bool isRequiredFor(ArrayRef<unsigned> activeOperands) const;
+
+    bool operator==(const AutodiffPrimalRequirement &other) const {
+        return kind == other.kind && index == other.index && contributionOperands == other.contributionOperands;
+    }
 };
 
 /// The local use-def edges through which differentiable activity propagates.
@@ -47,12 +54,16 @@ struct AutodiffVjpBuildContext {
     ValueRange primalOperands;
     ValueRange primalResults;
     ValueRange resultCotangents;
+    ArrayRef<unsigned> activeOperandIndices;
 
     Value getPrimalOperand(unsigned index) const {
         return index < primalOperands.size() ? primalOperands[index] : Value{};
     }
     Value getPrimalResult(unsigned index) const {
         return index < primalResults.size() ? primalResults[index] : Value{};
+    }
+    bool isOperandActive(unsigned index) const {
+        return activeOperandIndices.empty() || llvm::is_contained(activeOperandIndices, index);
     }
 };
 

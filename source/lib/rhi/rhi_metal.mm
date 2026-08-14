@@ -64,7 +64,7 @@ std::mutex renderingStateMutex;
 VernonRhiDevice invalidDevice() { return {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0}; }
 
 template <typename Handle> uint64_t resourceKey(Handle handle) {
-    return (static_cast<uint64_t>(handle.generation) << 32) | (static_cast<uint64_t>(handle.index) + 1);
+    return vernon::rhi::encodeResourceKey(handle);
 }
 
 bool decodeResourceKey(uint64_t key, uint32_t &index, uint32_t &generation) {

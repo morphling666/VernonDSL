@@ -1093,6 +1093,11 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     EXPECT_EQ(provider->encode_dispatch(provider->user_data, providerCommand, &invalidDispatch),
               VERNON_STATUS_INVALID_ARGUMENT);
     ASSERT_EQ(vernonRhiCommandEncoderBeginRendering(device, command, &rendering), VERNON_RHI_STATUS_OK);
+    constexpr float deferredClear[]{1, 0, 0, 1};
+    ASSERT_EQ(vernonRhiCommandEncoderClearColorAttachment(device, command, 0, deferredClear), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderClearDepthStencilAttachment(
+                  device, command, 0.25f, 2, VERNON_RHI_ATTACHMENT_DEPTH | VERNON_RHI_ATTACHMENT_STENCIL),
+              VERNON_RHI_STATUS_OK);
     VernonRuntimeProviderColorAttachment attachment{};
     attachment.view = imageReference;
     attachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
@@ -1604,6 +1609,28 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
         std::copy_n(result.begin() + center, pixel.size(), pixel.begin());
         return pixel;
     };
+    class ImageReadPass final : public vernon::execution::ComputePass {
+    public:
+        explicit ImageReadPass(vernon::execution::GraphImage image)
+            : vernon::execution::ComputePass("image read"), image_(image) {}
+        void declare() override { read(image_); }
+        VernonRhiStatus execute(vernon::execution::ComputeEncoder &,
+                                const vernon::execution::ExecutionResources &) override {
+            return VERNON_RHI_STATUS_OK;
+        }
+
+    private:
+        vernon::execution::GraphImage image_;
+    };
+    {
+        vernon::execution::ExecutionGraph graph(device);
+        auto staleView = graph.importImage(target, targetView, true);
+        ++staleView.view.generation;
+        graph.emplacePass<ImageReadPass>(staleView);
+        std::string graphError;
+        EXPECT_FALSE(graph.compile(graphError));
+        EXPECT_NE(graphError.find("invalid image resource"), std::string::npos);
+    }
     auto executeGraph = [&](uint32_t passCount) {
         vernon::execution::ExecutionGraph graph(device);
         const auto graphTarget = graph.importImage(target, targetView, true);

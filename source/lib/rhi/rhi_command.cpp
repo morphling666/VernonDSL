@@ -1,5 +1,6 @@
 #include "VernonRHI.h"
 
+#include "logical_resource_record.h"
 #include "rhi_internal.h"
 
 #include <algorithm>
@@ -129,18 +130,14 @@ template <typename Handle> bool validHandle(Handle handle) {
 }
 
 template <typename Handle> uint64_t logicalResourceKey(Handle handle) {
-    return validHandle(handle)
-               ? (static_cast<uint64_t>(handle.generation) << 32) | (static_cast<uint64_t>(handle.index) + 1)
-               : 0;
+    return validHandle(handle) ? vernon::rhi::encodeResourceKey(handle) : 0;
 }
 
 bool sameDevice(VernonRhiDevice left, VernonRhiDevice right) {
     return left.index == right.index && left.generation == right.generation;
 }
 
-uint64_t deviceKey(VernonRhiDevice device) {
-    return (static_cast<uint64_t>(device.generation) << 32) | (static_cast<uint64_t>(device.index) + 1);
-}
+uint64_t deviceKey(VernonRhiDevice device) { return vernon::rhi::encodeResourceKey(device); }
 
 std::shared_ptr<EncoderSlot> lookup(VernonRhiDevice device, VernonRhiCommandEncoder encoder) {
     std::lock_guard<std::mutex> guard(registryMutex);
@@ -415,7 +412,7 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderBarrier(VernonRhiDevice device
               !barriers[index].image_subresources.array_layer_count || !barriers[index].image_subresources.aspects ||
               (barriers[index].image_subresources.aspects & ~allAspects))))
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    const uint64_t key = (static_cast<uint64_t>(encoder.generation) << 32) | (static_cast<uint64_t>(encoder.index) + 1);
+    const uint64_t key = vernon::rhi::encodeResourceKey(encoder);
     for (size_t index = 0; index < barrierCount; ++index) {
         const vernon::rhi::ResourceKind kind =
             barriers[index].is_image ? vernon::rhi::ResourceKind::Image : vernon::rhi::ResourceKind::Buffer;
@@ -538,8 +535,18 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderClearColorAttachment(VernonRhi
     if (!slot || !clearColor)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(slot->mutex);
-    if (!slot->alive || slot->busy || !slot->rendering || slot->finished || !slot->backendRendering || location >= 8)
+    if (!slot->alive || slot->busy || !slot->rendering || slot->finished || location >= 8)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!slot->backendRendering) {
+        const auto operation = std::find_if(slot->colorOperations.begin(), slot->colorOperations.end(),
+                                            [location](const auto &value) { return value.location == location; });
+        if (operation == slot->colorOperations.end())
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        operation->load = VERNON_RHI_LOAD_CLEAR;
+        std::copy(clearColor, clearColor + 4, operation->clear.begin());
+        ++slot->stats.clear_count;
+        return VERNON_RHI_STATUS_OK;
+    }
     const VernonRhiStatus status = vernon::rhi::clearCommandColor(
         device, slot->native, slot->backend, slot->backendRendering, slot->renderX, slot->renderY, slot->renderWidth,
         slot->renderHeight, slot->renderLayers, slot->colorTargets[location], location, clearColor);
@@ -558,8 +565,22 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderClearDepthStencilAttachment(Ve
         (aspects & ~(VERNON_RHI_ATTACHMENT_DEPTH | VERNON_RHI_ATTACHMENT_STENCIL)))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(slot->mutex);
-    if (!slot->alive || slot->busy || !slot->rendering || slot->finished || !slot->backendRendering)
+    if (!slot->alive || slot->busy || !slot->rendering || slot->finished)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!slot->backendRendering) {
+        if (!slot->depthOperation.present)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        if (aspects & VERNON_RHI_ATTACHMENT_DEPTH) {
+            slot->depthOperation.depthLoad = VERNON_RHI_LOAD_CLEAR;
+            slot->depthOperation.clearDepth = clearDepth;
+        }
+        if (aspects & VERNON_RHI_ATTACHMENT_STENCIL) {
+            slot->depthOperation.stencilLoad = VERNON_RHI_LOAD_CLEAR;
+            slot->depthOperation.clearStencil = clearStencil;
+        }
+        ++slot->stats.clear_count;
+        return VERNON_RHI_STATUS_OK;
+    }
     const VernonRhiStatus status = vernon::rhi::clearCommandDepthStencil(
         device, slot->native, slot->backend, slot->backendRendering, slot->renderX, slot->renderY, slot->renderWidth,
         slot->renderHeight, slot->renderLayers, slot->depthTarget, clearDepth, clearStencil, aspects);
@@ -710,9 +731,7 @@ uint64_t vernon::rhi::commandEncoderKey(VernonRhiDevice device, VernonRhiCommand
     if (!slot)
         return 0;
     std::lock_guard<std::mutex> guard(slot->mutex);
-    return slot->alive && !slot->initializing
-               ? (static_cast<uint64_t>(encoder.generation) << 32) | (static_cast<uint64_t>(encoder.index) + 1)
-               : 0;
+    return slot->alive && !slot->initializing ? vernon::rhi::encodeResourceKey(encoder) : 0;
 }
 
 uint64_t vernon::rhi::commandEncoderNative(VernonRhiDevice device, uint64_t key, VernonRhiBackend backend) {
