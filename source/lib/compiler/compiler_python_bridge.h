@@ -25,6 +25,11 @@ typedef struct VernonPythonValueAbiPlanView {
     size_t node_count;
 } VernonPythonValueAbiPlanView;
 
+typedef struct VernonPythonNamedMetricView {
+    VernonStringView name;
+    uint64_t value;
+} VernonPythonNamedMetricView;
+
 typedef struct VernonPythonStructuredVjpView {
     VernonStatus status;
     VernonStringView diagnostics;
@@ -35,6 +40,13 @@ typedef struct VernonPythonStructuredVjpView {
     uint64_t recomputation_cost;
     const VernonStringView *derivative_rules;
     size_t derivative_rule_count;
+    const VernonStringView *required_primal_paths;
+    size_t required_primal_path_count;
+    const VernonPythonNamedMetricView *source_kind_counts;
+    size_t source_kind_count;
+    const VernonPythonNamedMetricView *cost_components;
+    size_t cost_component_count;
+    VernonStringView selected_policy;
 } VernonPythonStructuredVjpView;
 
 /*

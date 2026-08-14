@@ -8,7 +8,7 @@
 // CHECK-NOT: vernon.intrinsic
 // CHECK-NOT: !vernon.buffer
 
-module attributes {vernon.compiler_contract_version = 11 : i64, vernon.pipeline_version = 15 : i64} {
+module attributes {vernon.compiler_contract_version = 12 : i64, vernon.pipeline_version = 16 : i64} {
   func.func @tensor_view_round_trip(
       %view: !vernon.tensor_view<f32, [-1], "read_write", "device">,
       %index: index, %value: f32) {

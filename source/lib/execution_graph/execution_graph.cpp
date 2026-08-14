@@ -702,6 +702,9 @@ bool ExecutionGraph::buildPlan(std::string &error) {
             node.retainedAllocationBytes = differentiable->estimatedRetainedAllocationBytes();
             node.forwardPeakBytes = std::max(node.retainedAllocationBytes, differentiable->estimatedForwardPeakBytes());
             node.replayCost = differentiable->replayCost();
+            node.resourceReloadCost = differentiable->resourceReloadCost();
+            node.recomputationCost = differentiable->recomputationCost();
+            node.deterministicReductionLegal = differentiable->deterministicReductionLegal();
             node.replayable = differentiable->supportsReplay();
             if (!differentiable->hasCheckpointPlanningMetadata()) {
                 error = "differentiable pass '" + passes_[passIndex]->name() +

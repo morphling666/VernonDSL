@@ -2,7 +2,7 @@
 //
 // CHECK: spirv.AtomicExchange <Workgroup> <AcquireRelease>
 
-module attributes {vernon.compiler_contract_version = 11 : i64, vernon.pipeline_version = 15 : i64} {
+module attributes {vernon.compiler_contract_version = 12 : i64, vernon.pipeline_version = 16 : i64} {
   gpu.module @kernels {
     gpu.func @exchange(%storage: memref<1xi32, #spirv.storage_class<Workgroup>>) kernel
         attributes {spirv.entry_point_abi = #spirv.entry_point_abi<workgroup_size = [1, 1, 1]>} {

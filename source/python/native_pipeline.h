@@ -77,6 +77,34 @@ struct StructuredVjp {
         return rules;
     }
 
+    nb::list requiredPrimalPaths() const {
+        VernonPythonStructuredVjpView transformed = current();
+        nb::list paths;
+        for (size_t index = 0; index < transformed.required_primal_path_count; ++index)
+            paths.append(nativeStringView(transformed.required_primal_paths[index]));
+        return paths;
+    }
+
+    nb::dict sourceKindCounts() const {
+        VernonPythonStructuredVjpView transformed = current();
+        nb::dict counts;
+        for (size_t index = 0; index < transformed.source_kind_count; ++index)
+            counts[nativeStringView(transformed.source_kind_counts[index].name).c_str()] =
+                transformed.source_kind_counts[index].value;
+        return counts;
+    }
+
+    nb::dict costComponents() const {
+        VernonPythonStructuredVjpView transformed = current();
+        nb::dict costs;
+        for (size_t index = 0; index < transformed.cost_component_count; ++index)
+            costs[nativeStringView(transformed.cost_components[index].name).c_str()] =
+                transformed.cost_components[index].value;
+        return costs;
+    }
+
+    std::string selectedPolicy() const { return nativeStringView(current().selected_policy); }
+
     nb::dict profiles(const std::string &identity) {
         if (vernonCompilerFinalizePythonStructuredVjp(result.get(), {identity.data(), identity.size()}) !=
             VERNON_STATUS_OK) {

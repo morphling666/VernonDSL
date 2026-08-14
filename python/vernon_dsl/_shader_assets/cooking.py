@@ -301,6 +301,12 @@ def cook_pipeline_asset(
                 {
                     "key": list(variant),
                     "workgroup_size": list(profile_plan.launch.workgroup_size),
+                    "residual_storage": structured.residual_storage_kind,
+                    "static_tape_bytes_hint": profile_plan.tape_bytes,
+                    "required_primal_paths": list(profile_plan.required_primal_paths),
+                    "source_kind_counts": dict(profile_plan.source_kind_counts),
+                    "cost_components": dict(profile_plan.cost_components),
+                    "selected_policy": profile_plan.selected_policy,
                     "profiles": {name: profile_programs[name] for name in ("primal", "forward_with_tape", "backward")},
                 }
             )

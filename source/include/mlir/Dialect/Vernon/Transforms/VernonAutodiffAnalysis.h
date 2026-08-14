@@ -105,6 +105,30 @@ struct AutodiffStorageEffect {
     std::optional<unsigned> versionAfter;
 };
 
+enum class AutodiffIndexProvenanceKind {
+    Constant,
+    Builtin,
+    PrimalArgument,
+    PureExpression,
+    Dynamic,
+};
+
+enum class AutodiffStorageStabilityRequirement {
+    /// The exact version remains the current value for the pullback lifetime.
+    RetainedExactVersion,
+    /// Reverse execution must restore or replay the exact version before load.
+    RestoreExactVersion,
+};
+
+struct AutodiffActiveLoad {
+    Operation *operation{};
+    unsigned identity{};
+    unsigned versionBefore{};
+    SmallVector<Value> indices;
+    SmallVector<AutodiffIndexProvenanceKind> indexProvenance;
+    AutodiffStorageStabilityRequirement stability{AutodiffStorageStabilityRequirement::RestoreExactVersion};
+};
+
 /// Immutable, mode-independent facts shared by semantic JVP and VJP
 /// transforms. The pointed-to IR must outlive this result.
 class VernonAutodiffAnalysisResult {
@@ -117,10 +141,12 @@ public:
     ArrayRef<AutodiffStorageIdentity> getStorageIdentities() const { return storageIdentities; }
     ArrayRef<AutodiffStorageVersion> getStorageVersions() const { return storageVersions; }
     ArrayRef<AutodiffStorageEffect> getStorageEffects() const { return storageEffects; }
+    ArrayRef<AutodiffActiveLoad> getActiveLoads() const { return activeLoads; }
 
     const ValueAbiLayout *getValueAbi(Value value) const;
     const AutodiffStorageIdentity *getStorageIdentity(Value binding) const;
     const AutodiffStorageEffect *getStorageEffect(Operation *operation) const;
+    const AutodiffActiveLoad *getActiveLoad(Operation *operation) const;
     bool isActive(Value value, unsigned abiLeafIndex) const;
     bool isActive(Operation *operation) const;
     bool isActiveStorageVersion(unsigned version, unsigned abiLeafIndex) const;
@@ -138,11 +164,13 @@ private:
     SmallVector<AutodiffStorageIdentity> storageIdentities;
     SmallVector<AutodiffStorageVersion> storageVersions;
     SmallVector<AutodiffStorageEffect> storageEffects;
+    SmallVector<AutodiffActiveLoad> activeLoads;
     SmallVector<SmallVector<unsigned>> storageVersionNodes;
     SmallVector<SmallVector<unsigned>> activeStorageVersionLeaves;
     DenseMap<Value, unsigned> valueAbiIndices;
     DenseMap<Value, unsigned> storageIdentityIndices;
     DenseMap<Operation *, unsigned> storageEffectIndices;
+    DenseMap<Operation *, unsigned> activeLoadIndices;
     DenseSet<Operation *> activeOperationSet;
 };
 

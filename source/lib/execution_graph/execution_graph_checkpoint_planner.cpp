@@ -15,6 +15,13 @@ bool checkedAdd(uint64_t left, uint64_t right, uint64_t &result) {
     return true;
 }
 
+bool checkedMultiply(uint64_t left, uint64_t right, uint64_t &result) {
+    if (right && left > UINT64_MAX / right)
+        return false;
+    result = left * right;
+    return true;
+}
+
 bool checkedAlign(uint64_t value, uint64_t alignment, uint64_t &result) {
     if (!alignment || (alignment & (alignment - 1)) != 0 || !checkedAdd(value, alignment - 1, result))
         return false;
@@ -134,6 +141,33 @@ bool materializeDagCheckpointPlan(const std::vector<AutodiffDagNode> &nodes, con
         !checkedAdd(plan.peakBytes, maximumSegmentPeak, plan.peakBytes) ||
         !checkedAdd(plan.peakBytes, plan.restorationBytes, plan.peakBytes))
         return false;
+    for (const AutodiffDagNode &node : nodes) {
+        plan.deterministicReductionLegal &= node.deterministicReductionLegal;
+        if (!checkedAdd(plan.captureStoreBytes, node.residualBytes, plan.captureStoreBytes) ||
+            !checkedAdd(plan.backwardLoadBytes, node.residualBytes, plan.backwardLoadBytes) ||
+            !checkedAdd(plan.resourceReloadCost, node.resourceReloadCost, plan.resourceReloadCost) ||
+            !checkedAdd(plan.recomputationCost, node.recomputationCost, plan.recomputationCost))
+            return false;
+    }
+    if (plan.replaySegments.size() > 1 && !checkedMultiply(plan.captureStoreBytes, 2, plan.captureStoreBytes))
+        return false;
+    plan.graphReplayCost = plan.replayCost;
+    if (!checkedMultiply(plan.persistentCheckpointBytes, 2, plan.checkpointCopyBytes) ||
+        !checkedAdd(plan.captureStoreBytes, plan.backwardLoadBytes, plan.weightedRuntimeCost) ||
+        !checkedAdd(plan.weightedRuntimeCost, plan.checkpointCopyBytes, plan.weightedRuntimeCost)) {
+        return false;
+    }
+    uint64_t weightedReload = 0;
+    uint64_t weightedRecomputation = 0;
+    if (!checkedMultiply(plan.resourceReloadCost, 4, weightedReload) ||
+        !checkedMultiply(plan.recomputationCost, 8, weightedRecomputation) ||
+        !checkedAdd(plan.weightedRuntimeCost, weightedReload, plan.weightedRuntimeCost) ||
+        !checkedAdd(plan.weightedRuntimeCost, weightedRecomputation, plan.weightedRuntimeCost))
+        return false;
+    uint64_t weightedReplay = 0;
+    if (!checkedMultiply(plan.replayCost, 16, weightedReplay) ||
+        !checkedAdd(plan.weightedRuntimeCost, weightedReplay, plan.weightedRuntimeCost))
+        return false;
     output = std::move(plan);
     return true;
 }
@@ -144,7 +178,7 @@ bool planDagAutodiffCheckpoints(const std::vector<AutodiffDagNode> &nodes, uint6
                                 AutodiffDagCheckpointPlan &output, std::string &error, uint64_t initialStateBytes,
                                 bool initialStateCheckpointable, uint64_t restorationBytes,
                                 bool restorationCheckpointable, uint64_t transactionBytes,
-                                bool transactionCheckpointable) {
+                                bool transactionCheckpointable, AutodiffCheckpointPolicy policy) {
     output = {};
     error.clear();
     if (nodes.size() > UINT32_MAX) {
@@ -220,16 +254,59 @@ bool planDagAutodiffCheckpoints(const std::vector<AutodiffDagNode> &nodes, uint6
     visited.insert(initial.cuts);
     frontier.push(std::move(initial));
     constexpr size_t maximumCandidates = 65536;
+    const bool deterministicReplay = std::all_of(
+        nodes.begin(), nodes.end(), [](const AutodiffDagNode &node) { return node.deterministicReductionLegal; });
     const bool replayable =
+        deterministicReplay &&
         std::all_of(nodes.begin(), nodes.end(), [](const AutodiffDagNode &node) { return node.replayable; });
     bool replayBlocked = false;
+    std::optional<Candidate> bestFeasible;
+    auto policyName = [&]() -> const char * {
+        switch (policy) {
+        case AutodiffCheckpointPolicy::MinMemory:
+            return "min_memory";
+        case AutodiffCheckpointPolicy::Balanced:
+            return "balanced";
+        case AutodiffCheckpointPolicy::MinRuntime:
+            return "min_runtime";
+        }
+        return "balanced";
+    };
+    auto betterFeasible = [&](const Candidate &left, const Candidate &right) {
+        if (policy == AutodiffCheckpointPolicy::MinMemory) {
+            if (left.plan.peakBytes != right.plan.peakBytes)
+                return left.plan.peakBytes < right.plan.peakBytes;
+            if (left.plan.weightedRuntimeCost != right.plan.weightedRuntimeCost)
+                return left.plan.weightedRuntimeCost < right.plan.weightedRuntimeCost;
+        } else if (policy == AutodiffCheckpointPolicy::MinRuntime) {
+            if (left.plan.weightedRuntimeCost != right.plan.weightedRuntimeCost)
+                return left.plan.weightedRuntimeCost < right.plan.weightedRuntimeCost;
+            if (left.plan.peakBytes != right.plan.peakBytes)
+                return left.plan.peakBytes < right.plan.peakBytes;
+        } else {
+            uint64_t leftScore = 0;
+            uint64_t rightScore = 0;
+            if (!checkedAdd(left.plan.weightedRuntimeCost, left.plan.peakBytes, leftScore))
+                leftScore = UINT64_MAX;
+            if (!checkedAdd(right.plan.weightedRuntimeCost, right.plan.peakBytes, rightScore))
+                rightScore = UINT64_MAX;
+            if (leftScore != rightScore)
+                return leftScore < rightScore;
+            if (left.plan.peakBytes != right.plan.peakBytes)
+                return left.plan.peakBytes < right.plan.peakBytes;
+        }
+        return left.cuts < right.cuts;
+    };
     while (!frontier.empty()) {
         Candidate candidate = frontier.top();
         frontier.pop();
         if (candidate.plan.peakBytes <= memoryBudget) {
             candidate.plan.memoryBudget = memoryBudget;
-            output = std::move(candidate.plan);
-            return true;
+            candidate.plan.selectedPolicy = policyName();
+            if (!bestFeasible || betterFeasible(candidate, *bestFeasible))
+                bestFeasible = candidate;
+            if (policy == AutodiffCheckpointPolicy::MinRuntime)
+                continue;
         }
         if (!replayable) {
             replayBlocked |= nodes.size() > 1;
@@ -255,8 +332,14 @@ bool planDagAutodiffCheckpoints(const std::vector<AutodiffDagNode> &nodes, uint6
                 frontier.push(std::move(trial));
         }
     }
-    error = replayBlocked ? "autodiff DAG checkpoint schedule requires replaying a non-replayable node"
-                          : "autodiff DAG checkpoint schedule cannot satisfy the memory budget";
+    if (bestFeasible) {
+        output = std::move(bestFeasible->plan);
+        return true;
+    }
+    error = replayBlocked && !deterministicReplay
+                ? "autodiff DAG checkpoint schedule violates deterministic reduction constraints"
+            : replayBlocked ? "autodiff DAG checkpoint schedule requires replaying a non-replayable node"
+                            : "autodiff DAG checkpoint schedule cannot satisfy the memory budget";
     output = {};
     return false;
 }

@@ -25,8 +25,11 @@ class _CompiledDirectVjp:
     backward_protocol: str
     derivative_groups: tuple[DerivativeGroup, ...]
     tape_bytes_per_invocation: int
+    residual_storage_kind: str
     active_operation_count: int
     recomputation_cost: int
+    resource_reload_cost: int
+    deterministic_reduction_legal: bool
     user_parameters: tuple[str, ...]
     pipeline: Any
     runtime_generation: int
@@ -56,6 +59,8 @@ class _StructuredPullback:
     estimated_tape_bytes: int
     active_operation_count: int
     recomputation_cost: int
+    residual_source_kind: str
+    control_history_kind: str
 
     @property
     def logical_residual_bytes(self) -> int:
@@ -168,6 +173,7 @@ def _invoke_structured_pipeline(
     tape_bytes_per_invocation: int = 0,
     active_operation_count: int = 0,
     recomputation_cost: int = 0,
+    residual_storage_kind: str = "unknown",
 ) -> tuple[Any, _StructuredPullback]:
     _validate_grid(grid)
     derivative_groups = _pipeline_derivative_groups(pipeline)
@@ -198,6 +204,15 @@ def _invoke_structured_pipeline(
         tape_bytes_per_invocation * invocation_count,
         active_operation_count * invocation_count,
         recomputation_cost * invocation_count,
+        (
+            (f"{residual_storage_kind}_capture" if residual_storage_kind in {"static", "dynamic"} else "capture")
+            + ("+pure_rematerialization" if recomputation_cost else "")
+        ),
+        "dynamic_capture"
+        if residual_storage_kind == "dynamic"
+        else "none"
+        if residual_storage_kind == "static"
+        else "unknown",
     )
 
 
@@ -313,8 +328,11 @@ def _compile_direct_vjp(expression: ProgramExpression, arguments: tuple[Any, ...
             backward_protocol=structured.protocols["backward"],
             derivative_groups=derivative_groups,
             tape_bytes_per_invocation=int(structured.plan.tape_bytes),
+            residual_storage_kind=structured.residual_storage_kind,
             active_operation_count=structured.active_operation_count,
             recomputation_cost=structured.recomputation_cost,
+            resource_reload_cost=int(structured.cost_components.get("resource_reload_cost", 0)),
+            deterministic_reduction_legal=True,
             user_parameters=tuple(argument.arg for argument in function.args.args if argument.arg not in builtins),
             pipeline=None,
             runtime_generation=-1,
@@ -346,6 +364,7 @@ def execute_direct_vjp(
         compiled.tape_bytes_per_invocation,
         compiled.active_operation_count,
         compiled.recomputation_cost,
+        compiled.residual_storage_kind,
     )
 
 

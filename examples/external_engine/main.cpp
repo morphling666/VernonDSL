@@ -57,6 +57,10 @@ int main() {
 #if defined(__EMSCRIPTEN__)
     if (!headless) {
         emscripten_set_main_loop_arg(&renderWebFrame, application.release(), 0, 1);
+        // The callback owns and destroys the application. The simulated
+        // infinite loop normally does not return, but keep the fallback path
+        // ownership-safe if the browser runtime does return unexpectedly.
+        return 0;
     }
 #endif
 

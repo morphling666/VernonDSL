@@ -166,10 +166,14 @@ struct PythonComputePass final : vernon::execution::ComputePass, vernon::executi
     uint64_t estimatedRetainedAllocationBytes() const override { return estimatedRetainedAllocationBytes_; }
     uint64_t estimatedForwardPeakBytes() const override { return estimatedForwardPeakBytes_; }
     uint64_t replayCost() const override { return replayCost_; }
+    uint64_t resourceReloadCost() const override { return resourceReloadCost_; }
+    uint64_t recomputationCost() const override { return recomputationCost_; }
+    bool deterministicReductionLegal() const override { return deterministicReductionLegal_; }
     bool hasCheckpointPlanningMetadata() const override { return hasCheckpointPlanningMetadata_; }
     bool supportsReplay() const override { return true; }
     void setAutodiff(const nb::list &gradients, const nb::list &cotangents, uint64_t invocationCount,
-                     uint64_t tapeStride, uint64_t replayCost, bool hasCheckpointPlanningMetadata) {
+                     uint64_t tapeStride, uint64_t replayCost, uint64_t resourceReloadCost, uint64_t recomputationCost,
+                     bool deterministicReductionLegal, bool hasCheckpointPlanningMetadata) {
         const auto convert = [](const nb::list &values) {
             std::vector<vernon::execution::PassDerivativeMapping> result;
             result.reserve(nb::len(values));
@@ -187,19 +191,20 @@ struct PythonComputePass final : vernon::execution::ComputePass, vernon::executi
         };
         gradientMappings_ = convert(gradients);
         cotangentMappings_ = convert(cotangents);
-        const uint64_t effectiveTapeStride = std::max<uint64_t>(tapeStride, 1);
-        if (invocationCount > std::numeric_limits<size_t>::max() ||
-            effectiveTapeStride > std::numeric_limits<size_t>::max() ||
-            invocationCount > std::numeric_limits<uint64_t>::max() / effectiveTapeStride)
+        if (invocationCount > std::numeric_limits<size_t>::max() || tapeStride > std::numeric_limits<size_t>::max() ||
+            (tapeStride && invocationCount > std::numeric_limits<uint64_t>::max() / tapeStride))
             throw std::overflow_error("autodiff checkpoint planning metadata exceeds the host representation");
         size_t forwardPeakBytes = 0;
-        if (!vernon::runtime::ad::hostStaticTapeBatchPureStaticBytes(
-                static_cast<size_t>(invocationCount), static_cast<size_t>(effectiveTapeStride), forwardPeakBytes))
+        if (tapeStride && !vernon::runtime::ad::hostStaticTapeBatchPureStaticBytes(
+                              static_cast<size_t>(invocationCount), static_cast<size_t>(tapeStride), forwardPeakBytes))
             throw std::overflow_error("autodiff checkpoint planning metadata exceeds the host representation");
         estimatedForwardPeakBytes_ = forwardPeakBytes;
         estimatedRetainedAllocationBytes_ = forwardPeakBytes;
-        estimatedResidualBytes_ = invocationCount * effectiveTapeStride;
+        estimatedResidualBytes_ = invocationCount * tapeStride;
         replayCost_ = replayCost;
+        resourceReloadCost_ = resourceReloadCost;
+        recomputationCost_ = recomputationCost;
+        deterministicReductionLegal_ = deterministicReductionLegal;
         hasCheckpointPlanningMetadata_ = hasCheckpointPlanningMetadata;
     }
 
@@ -230,6 +235,9 @@ struct PythonComputePass final : vernon::execution::ComputePass, vernon::executi
     uint64_t estimatedRetainedAllocationBytes_{};
     uint64_t estimatedForwardPeakBytes_{};
     uint64_t replayCost_{};
+    uint64_t resourceReloadCost_{};
+    uint64_t recomputationCost_{};
+    bool deterministicReductionLegal_{true};
     bool hasCheckpointPlanningMetadata_{};
 };
 
@@ -359,6 +367,15 @@ struct PythonCompiledExecutionGraph {
         result["memory_budget"] = checkpointPlan->memoryBudget;
         result["peak_bytes"] = checkpointPlan->peakBytes;
         result["replay_cost"] = checkpointPlan->replayCost;
+        result["capture_store_bytes"] = checkpointPlan->captureStoreBytes;
+        result["backward_load_bytes"] = checkpointPlan->backwardLoadBytes;
+        result["checkpoint_copy_bytes"] = checkpointPlan->checkpointCopyBytes;
+        result["resource_reload_cost"] = checkpointPlan->resourceReloadCost;
+        result["recomputation_cost"] = checkpointPlan->recomputationCost;
+        result["graph_replay_cost"] = checkpointPlan->graphReplayCost;
+        result["weighted_runtime_cost"] = checkpointPlan->weightedRuntimeCost;
+        result["deterministic_reduction_legal"] = checkpointPlan->deterministicReductionLegal;
+        result["selected_policy"] = checkpointPlan->selectedPolicy;
         nb::list resources;
         for (const auto &resource : checkpointPlan->checkpointResources) {
             nb::dict value;

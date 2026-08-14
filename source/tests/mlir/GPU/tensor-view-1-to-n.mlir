@@ -14,7 +14,7 @@
 // CHECK-NOT: vernon.physical_
 // CHECK-NOT: unrealized_conversion_cast
 
-module attributes {vernon.compiler_contract_version = 11 : i64, vernon.pipeline_version = 15 : i64} {
+module attributes {vernon.compiler_contract_version = 12 : i64, vernon.pipeline_version = 16 : i64} {
   "vernon.struct"() {
     sym_name = "Pair",
     fields = ["left:i32", "right:f32"],

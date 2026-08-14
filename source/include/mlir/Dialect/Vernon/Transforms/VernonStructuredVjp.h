@@ -22,6 +22,10 @@ struct StructuredVjpResult {
     func::FuncOp backward;
     uint64_t tapeBytes{};
     SmallVector<std::string> derivativeRules;
+    SmallVector<std::string> requiredPrimalPaths;
+    SmallVector<std::pair<std::string, uint64_t>> sourceKindCounts;
+    SmallVector<std::pair<std::string, uint64_t>> costComponents;
+    std::string selectedPolicy;
 };
 
 /// Builds VJP profiles directly from structured primal IR, including

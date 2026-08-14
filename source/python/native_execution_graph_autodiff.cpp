@@ -111,6 +111,8 @@ struct PythonPassPullback final : vernon::execution::PassPullback {
           estimatedTapeBytesValue(nb::cast<uint64_t>(this->value.attr("estimated_tape_bytes"))),
           activeOperationCountValue(nb::cast<uint64_t>(this->value.attr("active_operation_count"))),
           recomputationCostValue(nb::cast<uint64_t>(this->value.attr("recomputation_cost"))),
+          residualSourceKindValue(nb::cast<std::string>(this->value.attr("residual_source_kind"))),
+          controlHistoryKindValue(nb::cast<std::string>(this->value.attr("control_history_kind"))),
           callbackState(std::move(callbackState)) {}
 
     bool apply(const vernon::execution::NamedGraphAutodiffValues &cotangents,
@@ -142,6 +144,8 @@ struct PythonPassPullback final : vernon::execution::PassPullback {
     uint64_t activeOperationCount() const override { return activeOperationCountValue; }
     uint64_t recomputationCost() const override { return recomputationCostValue; }
     uint64_t tapeContextLimitBytes() const override { return native->tapeContextLimitBytes(); }
+    std::string residualSourceKind() const override { return residualSourceKindValue; }
+    std::string controlHistoryKind() const override { return controlHistoryKindValue; }
 
     nb::object value;
     PythonPullback *native;
@@ -151,6 +155,8 @@ struct PythonPassPullback final : vernon::execution::PassPullback {
     uint64_t estimatedTapeBytesValue;
     uint64_t activeOperationCountValue;
     uint64_t recomputationCostValue;
+    std::string residualSourceKindValue;
+    std::string controlHistoryKindValue;
     std::shared_ptr<PythonGraphCallbackState> callbackState;
 };
 
@@ -268,6 +274,31 @@ void bindExecutionGraphAutodiff(nb::module_ &module) {
                      [](const PythonGraphPullback &value) { return value.pullback->tapeContextLimitBytes(); })
         .def_prop_ro("recomputation_factor",
                      [](const PythonGraphPullback &value) { return value.pullback->recomputationFactor(); })
+        .def_prop_ro("pass_telemetry",
+                     [](const PythonGraphPullback &value) {
+                         nb::list result;
+                         for (const vernon::execution::GraphAutodiffPassTelemetry &item :
+                              value.pullback->passTelemetry()) {
+                             nb::dict telemetry;
+                             telemetry["schedule_offset"] = item.scheduleOffset;
+                             telemetry["pass_name"] = item.passName;
+                             telemetry["residual_source_kind"] = item.residualSourceKind;
+                             telemetry["control_history_kind"] = item.controlHistoryKind;
+                             telemetry["estimated_tape_bytes"] = item.estimatedTapeBytes;
+                             telemetry["logical_residual_bytes"] = item.logicalResidualBytes;
+                             telemetry["resident_tape_bytes"] = item.residentTapeBytes;
+                             telemetry["allocated_tape_bytes"] = item.allocatedTapeBytes;
+                             telemetry["checkpoint_bytes"] = item.checkpointBytes;
+                             telemetry["active_operation_count"] = item.activeOperationCount;
+                             telemetry["recomputation_cost"] = item.recomputationCost;
+                             if (item.controlHistoryBytes)
+                                 telemetry["control_history_bytes"] = *item.controlHistoryBytes;
+                             else
+                                 telemetry["control_history_bytes"] = nb::none();
+                             result.append(std::move(telemetry));
+                         }
+                         return result;
+                     })
         .def_prop_ro("reverse_python_callback_count", &PythonGraphPullback::reversePythonCallbackCount);
     nb::class_<PythonGraphBackwardSubmission>(module, "_GraphBackwardSubmission")
         .def("wait", &PythonGraphBackwardSubmission::wait)

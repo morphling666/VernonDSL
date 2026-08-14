@@ -7,7 +7,7 @@
 // CHECK-DAG: contains internal TensorView descriptor metadata
 // CHECK-DAG: but the vertex output has type
 
-module attributes {vernon.compiler_contract_version = 11 : i64, vernon.pipeline_version = 15 : i64} {
+module attributes {vernon.compiler_contract_version = 12 : i64, vernon.pipeline_version = 16 : i64} {
   func.func @bad_vertex(
       %position: tensor<4xf32> {
         vernon.interface = "input", vernon.location = 0 : i64,

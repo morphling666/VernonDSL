@@ -66,10 +66,12 @@ TEST_F(VernonStructuredVjpTest, GeneratesStorageObjectiveProfilesForScalarRules)
                                StructuredVjpOptions{{"x", "y"}, "forward" + suffix, "backward" + suffix, {"loss"}});
         ASSERT_TRUE(succeeded(result)) << testCase.first.str();
         EXPECT_TRUE(succeeded(verify(*module))) << testCase.first.str();
-        EXPECT_EQ(result->forward.getNumResults(), 1u);
+        const bool noTape = result->tapeBytes == 0;
+        EXPECT_EQ(result->forward.getNumResults(), noTape ? 0u : 1u);
         EXPECT_EQ(result->backward.getNumResults(), 1u);
-        EXPECT_EQ(result->forward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), "static");
-        EXPECT_EQ(result->backward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), "static");
+        StringRef storageKind = noTape ? "none" : "static";
+        EXPECT_EQ(result->forward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), storageKind);
+        EXPECT_EQ(result->backward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), storageKind);
         ASSERT_EQ(result->derivativeRules.size(), 1u);
         EXPECT_EQ(result->derivativeRules.front(), testCase.first.str());
         unsigned backwardBarriers = 0;
@@ -78,7 +80,7 @@ TEST_F(VernonStructuredVjpTest, GeneratesStorageObjectiveProfilesForScalarRules)
     }
 }
 
-TEST_F(VernonStructuredVjpTest, StaticEmittersUseMatchingFixedResidualOffsets) {
+TEST_F(VernonStructuredVjpTest, NoTapeProfileUsesExplicitPrimalArguments) {
     OwningOpRef<ModuleOp> module = parseStorageObjective("arith.mulf");
     ASSERT_TRUE(module);
     FailureOr<StructuredVjpResult> result =
@@ -96,13 +98,15 @@ TEST_F(VernonStructuredVjpTest, StaticEmittersUseMatchingFixedResidualOffsets) {
     });
     llvm::sort(writeOffsets);
     llvm::sort(readOffsets);
-    EXPECT_FALSE(writeOffsets.empty());
+    EXPECT_TRUE(writeOffsets.empty());
     EXPECT_EQ(writeOffsets, readOffsets);
 
     unsigned forwardRegions = 0;
     result->forward.walk([&](AdBeginRegionOp) { ++forwardRegions; });
-    EXPECT_EQ(forwardRegions, 1u);
-    EXPECT_EQ(result->forward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), "static");
+    EXPECT_EQ(forwardRegions, 0u);
+    EXPECT_EQ(result->forward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), "none");
+    EXPECT_EQ(result->tapeBytes, 0u);
+    EXPECT_EQ(result->requiredPrimalPaths, (SmallVector<std::string>{"primal.x", "primal.y"}));
     EXPECT_GT(result->backward->getAttrOfType<IntegerAttr>("vernon.ad.active_operation_count").getInt(), 0);
     EXPECT_GE(result->backward->getAttrOfType<IntegerAttr>("vernon.ad.recomputation_cost").getInt(), 0);
 }
@@ -315,11 +319,12 @@ module {
     });
     EXPECT_EQ(scalarScatterAdds, 2u);
 
-    auto gradient = dyn_cast<TensorViewType>(result->backward.getArgument(4).getType());
+    const unsigned gradientArgument = result->backward.getNumArguments() - 1;
+    auto gradient = dyn_cast<TensorViewType>(result->backward.getArgument(gradientArgument).getType());
     ASSERT_TRUE(gradient);
     EXPECT_TRUE(gradient.getElementType().isF32());
     EXPECT_EQ(gradient.getShape(), ArrayRef<int64_t>({1, 2}));
-    auto ownership = result->backward.getArgAttrOfType<StringAttr>(4, kAccumulationOwnershipAttrName);
+    auto ownership = result->backward.getArgAttrOfType<StringAttr>(gradientArgument, kAccumulationOwnershipAttrName);
     ASSERT_TRUE(ownership);
     EXPECT_EQ(ownership.getValue(), "atomic_shared");
 }

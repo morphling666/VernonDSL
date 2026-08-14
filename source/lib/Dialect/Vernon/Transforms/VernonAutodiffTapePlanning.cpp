@@ -158,12 +158,15 @@ bool isRematerializableDialect(Operation *operation) {
            isa<TupleCreateOp, TupleGetOp, StructCreateOp, StructGetOp>(operation);
 }
 
-FailureOr<AdRematerializationRecipe> buildRematerializationRecipe(Value value, func::FuncOp function) {
+FailureOr<AdRematerializationRecipe> buildRematerializationRecipeImpl(Value value, func::FuncOp function,
+                                                                      llvm::function_ref<bool(Value)> isAvailableRoot) {
     AdRematerializationRecipe recipe;
     recipe.value = value;
     DenseSet<Operation *> planned;
     DenseSet<Value> visiting;
     auto visit = [&](Value current, auto &self) -> LogicalResult {
+        if (isAvailableRoot(current))
+            return success();
         if (auto argument = dyn_cast<BlockArgument>(current)) {
             auto owner = dyn_cast_or_null<func::FuncOp>(argument.getOwner()->getParentOp());
             return success(owner && owner == function && owner.getArgAttr(argument.getArgNumber(), kBuiltinAttrName));
@@ -192,6 +195,36 @@ FailureOr<AdRematerializationRecipe> buildRematerializationRecipe(Value value, f
 }
 
 } // namespace
+
+FailureOr<AdRematerializationRecipe> buildAutodiffRematerializationRecipe(Value value, func::FuncOp function) {
+    return buildRematerializationRecipeImpl(value, function, [](Value) { return false; });
+}
+
+FailureOr<AdRematerializationRecipe>
+buildAutodiffRematerializationRecipe(Value value, func::FuncOp function,
+                                     llvm::function_ref<bool(Value)> isAvailableRoot) {
+    return buildRematerializationRecipeImpl(value, function, isAvailableRoot);
+}
+
+StringRef stringifyAdResidualSourceKind(AdResidualSourceKind kind) {
+    switch (kind) {
+    case AdResidualSourceKind::Builtin:
+        return "builtin";
+    case AdResidualSourceKind::PrimalArgument:
+        return "primal_argument";
+    case AdResidualSourceKind::ExactVersionReload:
+        return "exact_version_reload";
+    case AdResidualSourceKind::PureRematerialization:
+        return "pure_rematerialization";
+    case AdResidualSourceKind::StaticCapture:
+        return "static_capture";
+    case AdResidualSourceKind::DynamicCapture:
+        return "dynamic_capture";
+    case AdResidualSourceKind::Unsupported:
+        return "unsupported";
+    }
+    llvm_unreachable("unknown autodiff residual source kind");
+}
 
 FailureOr<AutodiffTapeLayout> planAutodiffTapeLayout(ArrayRef<AutodiffTapeSlot> slots, uint64_t prefixSize,
                                                      uint64_t prefixAlignment) {
@@ -362,29 +395,30 @@ assignAdMemoryBuffersWithinBudget(ArrayRef<AdResidualInterval> residuals,
         return left.index < right.index;
     });
 
+    SmallVector<AdResidualInterval> minimumMemory = working;
+    for (const AdRematerializationCandidate &candidate : candidates)
+        for (unsigned residualIndex : candidate.residualIndices)
+            minimumMemory[residualIndex].rematerialized = true;
+    FailureOr<AdBufferAssignment> minimumAssignment = assignAdMemoryBuffers(minimumMemory);
+    if (failed(minimumAssignment) || minimumAssignment->peakBytes > budgetBytes)
+        return failure();
+
     for (const ScoredCandidate &scored : order) {
         if (result.buffers.peakBytes <= budgetBytes)
             break;
         const AdRematerializationCandidate &candidate = candidates[scored.index];
-        SmallVector<unsigned> changed;
+        bool changed = false;
         for (unsigned residualIndex : candidate.residualIndices)
             if (!working[residualIndex].rematerialized) {
                 working[residualIndex].rematerialized = true;
                 working[residualIndex].recomputationCost = candidate.recomputationCost;
-                changed.push_back(residualIndex);
+                changed = true;
             }
-        if (changed.empty())
+        if (!changed)
             continue;
         FailureOr<AdBufferAssignment> assignment = assignAdMemoryBuffers(working);
         if (failed(assignment))
             return failure();
-        if (assignment->peakBytes >= result.buffers.peakBytes) {
-            for (unsigned residualIndex : changed) {
-                working[residualIndex].rematerialized = false;
-                working[residualIndex].recomputationCost = 0;
-            }
-            continue;
-        }
         FailureOr<uint64_t> cost = checkedAdd(result.recomputationCost, candidate.recomputationCost);
         if (failed(cost))
             return failure();
@@ -392,8 +426,41 @@ assignAdMemoryBuffersWithinBudget(ArrayRef<AdResidualInterval> residuals,
         result.selectedCandidates[scored.index] = true;
         result.buffers = std::move(*assignment);
     }
-    return result.buffers.peakBytes <= budgetBytes ? FailureOr<AdBudgetedBufferAssignment>(std::move(result))
-                                                   : FailureOr<AdBudgetedBufferAssignment>(failure());
+    if (result.buffers.peakBytes > budgetBytes)
+        return failure();
+
+    // Remove expensive selections that are not required after interactions
+    // between reusable physical buffers have been accounted for.
+    SmallVector<ScoredCandidate> removalOrder;
+    for (const ScoredCandidate &candidate : order)
+        if (result.selectedCandidates[candidate.index])
+            removalOrder.push_back(candidate);
+    llvm::stable_sort(removalOrder, [](const ScoredCandidate &left, const ScoredCandidate &right) {
+        if (left.cost != right.cost)
+            return left.cost > right.cost;
+        return left.index > right.index;
+    });
+    for (const ScoredCandidate &scored : removalOrder) {
+        const AdRematerializationCandidate &candidate = candidates[scored.index];
+        for (unsigned residualIndex : candidate.residualIndices) {
+            working[residualIndex].rematerialized = residuals[residualIndex].rematerialized;
+            working[residualIndex].recomputationCost = residuals[residualIndex].recomputationCost;
+        }
+        FailureOr<AdBufferAssignment> assignment = assignAdMemoryBuffers(working);
+        if (failed(assignment))
+            return failure();
+        if (assignment->peakBytes <= budgetBytes) {
+            result.selectedCandidates[scored.index] = false;
+            result.recomputationCost -= candidate.recomputationCost;
+            result.buffers = std::move(*assignment);
+            continue;
+        }
+        for (unsigned residualIndex : candidate.residualIndices) {
+            working[residualIndex].rematerialized = true;
+            working[residualIndex].recomputationCost = candidate.recomputationCost;
+        }
+    }
+    return result;
 }
 
 FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const VernonAutodiffAnalysisResult &analysis,
@@ -412,7 +479,28 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
     if (failed(verifyAutodiffRuleCoverage(analysis, registry)))
         return failure();
 
+    constexpr uint64_t defaultMemoryBudgetBytes = 64ull * 1024ull * 1024ull;
+    uint64_t memoryBudgetBytes = defaultMemoryBudgetBytes;
+    if (auto budget = function->getAttrOfType<IntegerAttr>("vernon.ad.memory_budget_bytes")) {
+        const APInt &value = budget.getValue();
+        if (value.isNegative() || value.isZero() || value.getActiveBits() > 64) {
+            function.emitError("'vernon.ad.memory_budget_bytes' must be a positive 64-bit integer");
+            return failure();
+        }
+        memoryBudgetBytes = value.getZExtValue();
+    }
+    StringRef selectedPolicy = "min_memory";
+    if (auto policy = function->getAttrOfType<StringAttr>("vernon.ad.planning_policy")) {
+        selectedPolicy = policy.getValue();
+        if (selectedPolicy != "min_memory" && selectedPolicy != "balanced" && selectedPolicy != "min_runtime") {
+            function.emitError("'vernon.ad.planning_policy' must be 'min_memory', 'balanced', or 'min_runtime'");
+            return failure();
+        }
+    }
+
     VernonAutodiffTapePlan plan;
+    plan.memoryPlan.memoryBudgetBytes = memoryBudgetBytes;
+    plan.memoryPlan.selectedPolicy = selectedPolicy.str();
     SmallVector<AdResidualInterval> residuals;
     SmallVector<AdRematerializationRecipe> rematerializations;
     DenseMap<Operation *, uint64_t> operationOrder;
@@ -540,8 +628,158 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
     };
 
     RecordBuilder invocationBuilder;
+    uint64_t captureFixedBytes = plan.invocationHeader.size;
+    for (auto [index, region] : llvm::enumerate(plan.regions)) {
+        FailureOr<uint64_t> withHeader = checkedAdd(captureFixedBytes, region.header.size);
+        FailureOr<uint64_t> withPrefix = succeeded(withHeader)
+                                             ? checkedAdd(*withHeader, regionBuilders[index].prefix.size)
+                                             : FailureOr<uint64_t>(failure());
+        if (failed(withPrefix)) {
+            function.emitError("autodiff minimum tape layout overflows");
+            return failure();
+        }
+        captureFixedBytes = *withPrefix;
+    }
     DenseSet<Value> plannedRequirements;
     DenseSet<Value> plannedResidualValues;
+    DenseSet<Value> plannedSourceValues;
+    uint64_t selectedCaptureBytes = 0;
+    auto isFunctionArgument = [&](Value value) {
+        auto argument = dyn_cast<BlockArgument>(value);
+        return argument && argument.getOwner() == &function.getBody().front();
+    };
+    auto appendSourceSelections = [&](Value value, const ValueAbiLayout &layout, std::optional<unsigned> owner,
+                                      const FailureOr<AdRematerializationRecipe> &recipe) {
+        if (!plannedSourceValues.insert(value).second)
+            return AdResidualSourceKind::Unsupported;
+        AdResidualSourceKind selectedKind = AdResidualSourceKind::Unsupported;
+        for (auto [leafIndex, unused] : llvm::enumerate(layout.leaves)) {
+            (void)unused;
+            AdResidualSourceSelection selection;
+            selection.key.value = value;
+            selection.key.abiLeafIndex = static_cast<unsigned>(leafIndex);
+            const ValueAbiLeaf &leaf = layout.leaves[leafIndex];
+            const uint64_t scalarSize = std::max<uint64_t>(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1);
+            FailureOr<uint64_t> leafBytes = checkedMultiply(scalarSize, leaf.scalarCount);
+            auto addCandidate = [&](AdResidualSourceKind kind, bool current, uint64_t runtimeCost = 0,
+                                    std::optional<unsigned> identity = std::nullopt,
+                                    std::optional<unsigned> version = std::nullopt,
+                                    ArrayRef<Operation *> operations = {}, bool legal = true) {
+                AdResidualSource source;
+                source.key = selection.key;
+                source.kind = kind;
+                source.legal = legal;
+                source.availableInCurrentContract = current;
+                source.storageIdentity = identity;
+                source.versionBefore = version;
+                if (kind == AdResidualSourceKind::StaticCapture || kind == AdResidualSourceKind::DynamicCapture) {
+                    source.captureStoreBytes = succeeded(leafBytes) ? *leafBytes : 0;
+                    source.backwardLoadBytes = succeeded(leafBytes) ? *leafBytes : 0;
+                } else if (kind == AdResidualSourceKind::ExactVersionReload) {
+                    source.resourceReloadCost = runtimeCost;
+                } else if (kind == AdResidualSourceKind::PureRematerialization) {
+                    source.recomputationCost = runtimeCost;
+                }
+                llvm::append_range(source.recipe, operations);
+                selection.candidates.push_back(std::move(source));
+            };
+            if (auto argument = dyn_cast<BlockArgument>(value)) {
+                auto ownerFunction = dyn_cast_or_null<func::FuncOp>(argument.getOwner()->getParentOp());
+                if (ownerFunction == function) {
+                    if (function.getArgAttr(argument.getArgNumber(), kBuiltinAttrName))
+                        addCandidate(AdResidualSourceKind::Builtin, true);
+                    else
+                        // TensorView primals require a retained logical resource
+                        // version. The contract can describe that input, but a
+                        // raw descriptor or unaccounted deep copy is not a
+                        // legal planner source before graph versioning lands.
+                        addCandidate(AdResidualSourceKind::PrimalArgument, !isa<TensorViewType>(argument.getType()));
+                }
+            }
+            if (auto load = value.getDefiningOp<LoadOp>()) {
+                if (const AutodiffActiveLoad *activeLoad = analysis.getActiveLoad(load)) {
+                    const bool reconstructibleIndices =
+                        llvm::none_of(activeLoad->indexProvenance, [](AutodiffIndexProvenanceKind provenance) {
+                            return provenance == AutodiffIndexProvenanceKind::Dynamic;
+                        });
+                    if (reconstructibleIndices)
+                        addCandidate(AdResidualSourceKind::ExactVersionReload, false, 1, activeLoad->identity,
+                                     activeLoad->versionBefore);
+                    else
+                        addCandidate(AdResidualSourceKind::Unsupported, false, 0, activeLoad->identity,
+                                     activeLoad->versionBefore, {}, false);
+                }
+            }
+            if (succeeded(recipe))
+                addCandidate(AdResidualSourceKind::PureRematerialization, true, recipe->estimatedCost, std::nullopt,
+                             std::nullopt, recipe->operations);
+            addCandidate(owner ? AdResidualSourceKind::DynamicCapture : AdResidualSourceKind::StaticCapture, true);
+            auto weightedRuntimeCost = [](const AdResidualSource &candidate) {
+                auto saturatingAdd = [](uint64_t left, uint64_t right) {
+                    return right > std::numeric_limits<uint64_t>::max() - left ? std::numeric_limits<uint64_t>::max()
+                                                                               : left + right;
+                };
+                auto saturatingMultiply = [](uint64_t value, uint64_t weight) {
+                    return value > std::numeric_limits<uint64_t>::max() / weight ? std::numeric_limits<uint64_t>::max()
+                                                                                 : value * weight;
+                };
+                uint64_t result = saturatingAdd(candidate.captureStoreBytes, candidate.backwardLoadBytes);
+                result = saturatingAdd(result, saturatingMultiply(candidate.resourceReloadCost, 4));
+                return saturatingAdd(result, saturatingMultiply(candidate.recomputationCost, 8));
+            };
+            auto score = [&](const AdResidualSource &candidate) {
+                const uint64_t retained = candidate.captureStoreBytes;
+                const uint64_t runtime = weightedRuntimeCost(candidate);
+                if (selectedPolicy == "min_runtime")
+                    return std::pair(runtime, retained);
+                if (selectedPolicy == "balanced") {
+                    const uint64_t balanced = retained > std::numeric_limits<uint64_t>::max() - runtime
+                                                  ? std::numeric_limits<uint64_t>::max()
+                                                  : retained + runtime;
+                    return std::pair(balanced, retained);
+                }
+                return std::pair(retained, runtime);
+            };
+            auto selected = std::prev(selection.candidates.end());
+            auto fitsCaptureBudget = [&](const AdResidualSource &candidate) {
+                const uint64_t padding =
+                    candidate.captureStoreBytes ? std::max<uint64_t>(scalarSize, 1) - 1 : uint64_t{0};
+                const uint64_t fixedBytes = selectedCaptureBytes || !plan.regions.empty() || candidate.captureStoreBytes
+                                                ? captureFixedBytes
+                                                : 0;
+                if (fixedBytes > memoryBudgetBytes || selectedCaptureBytes > memoryBudgetBytes - fixedBytes ||
+                    candidate.captureStoreBytes > memoryBudgetBytes - fixedBytes - selectedCaptureBytes)
+                    return false;
+                return padding <= memoryBudgetBytes - fixedBytes - selectedCaptureBytes - candidate.captureStoreBytes;
+            };
+            for (auto candidate = selection.candidates.begin(); candidate != selection.candidates.end(); ++candidate) {
+                if (!candidate->legal || !candidate->availableInCurrentContract ||
+                    !candidate->deterministicReductionLegal)
+                    continue;
+                if (!fitsCaptureBudget(*candidate))
+                    continue;
+                if (!selected->legal || !selected->availableInCurrentContract ||
+                    !selected->deterministicReductionLegal || !fitsCaptureBudget(*selected) ||
+                    score(*candidate) < score(*selected))
+                    selected = candidate;
+            }
+            if (!fitsCaptureBudget(*selected)) {
+                selection.selectedCandidate = static_cast<unsigned>(selection.candidates.size());
+                plan.memoryPlan.sourceSelections.push_back(std::move(selection));
+                return AdResidualSourceKind::Unsupported;
+            }
+            selectedCaptureBytes += selected->captureStoreBytes
+                                        ? selected->captureStoreBytes + std::max<uint64_t>(scalarSize, 1) - 1
+                                        : uint64_t{0};
+            selection.selectedCandidate = static_cast<unsigned>(std::distance(selection.candidates.begin(), selected));
+            if (selectedKind == AdResidualSourceKind::Unsupported)
+                selectedKind = selected->kind;
+            else if (selectedKind != selected->kind)
+                selectedKind = owner ? AdResidualSourceKind::DynamicCapture : AdResidualSourceKind::StaticCapture;
+            plan.memoryPlan.sourceSelections.push_back(std::move(selection));
+        }
+        return selectedKind;
+    };
     auto appendResidualIntervals = [&](Value value, const ValueAbiLayout &layout, uint64_t lifetimeEnd,
                                        bool rematerialized, uint64_t recomputationCost,
                                        Operation *diagnostic) -> LogicalResult {
@@ -601,8 +839,12 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
                 operation->emitError("cannot lay out a rule-required primal value on the autodiff tape");
                 return failure();
             }
-            FailureOr<AdRematerializationRecipe> recipe = buildRematerializationRecipe(value, function);
-            const bool rematerialized = succeeded(recipe);
+            FailureOr<AdRematerializationRecipe> recipe =
+                buildAutodiffRematerializationRecipe(value, function, isFunctionArgument);
+            AdResidualSourceKind selectedSource = appendSourceSelections(value, *layout, owner, recipe);
+            const bool externalPrimal = selectedSource == AdResidualSourceKind::Builtin ||
+                                        selectedSource == AdResidualSourceKind::PrimalArgument;
+            const bool rematerialized = selectedSource == AdResidualSourceKind::PureRematerialization || externalPrimal;
             if (!rematerialized && failed(builder.add(value, *layout))) {
                 operation->emitError("cannot lay out a rule-required primal value on the autodiff tape");
                 return failure();
@@ -612,7 +854,7 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
             if (failed(appendResidualIntervals(value, *layout, lifetimeEnd, rematerialized,
                                                rematerialized ? recipe->estimatedCost : uint64_t{0}, operation)))
                 return failure();
-            if (rematerialized)
+            if (selectedSource == AdResidualSourceKind::PureRematerialization)
                 rematerializations.push_back(std::move(*recipe));
         }
     }
@@ -625,9 +867,28 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
             if (owner && owner.getArgAttr(argument.getArgNumber(), kBuiltinAttrName))
                 return success();
         }
+        FailureOr<AdRematerializationRecipe> recipe =
+            buildAutodiffRematerializationRecipe(index, function, isFunctionArgument);
+        if (succeeded(recipe)) {
+            const ValueAbiLayout *knownLayout = analysis.getValueAbi(index);
+            FailureOr<ValueAbiLayout> canonical =
+                knownLayout ? FailureOr<ValueAbiLayout>(*knownLayout)
+                            : getValueAbiLayout(index.getType(), function->getParentOfType<ModuleOp>());
+            if (succeeded(canonical)) {
+                AdResidualSourceKind selectedSource =
+                    appendSourceSelections(index, *canonical, owningRegion(index), recipe);
+                if (failed(appendResidualIntervals(index, *canonical, lifetimeEnd, true, recipe->estimatedCost,
+                                                   diagnostic)))
+                    return failure();
+                if (selectedSource == AdResidualSourceKind::PureRematerialization)
+                    rematerializations.push_back(std::move(*recipe));
+                return success();
+            }
+        }
         if (index.getType().isIntOrFloat()) {
             const ValueAbiLayout *layout = analysis.getValueAbi(index);
             if (layout) {
+                appendSourceSelections(index, *layout, owningRegion(index), recipe);
                 if (failed(builder.add(index, *layout)))
                     return failure();
                 return appendResidualIntervals(index, *layout, lifetimeEnd, false, 0, diagnostic);
@@ -636,6 +897,7 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
                 getValueAbiLayout(index.getType(), function->getParentOfType<ModuleOp>());
             if (failed(canonical) || failed(builder.add(index, *canonical)))
                 return failure();
+            appendSourceSelections(index, *canonical, owningRegion(index), recipe);
             return appendResidualIntervals(index, *canonical, lifetimeEnd, false, 0, diagnostic);
         }
         Operation *defining = index.getDefiningOp();
@@ -668,6 +930,56 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
                 return failure();
             }
     }
+    auto appendControlSource = [&](AutodiffTapeRegion &region, AdControlSourceKind controlKind,
+                                   Value reconstructibleValue = {}) {
+        AdResidualSourceSelection selection;
+        selection.key.controlOperation = region.operation;
+        selection.key.controlKind = controlKind;
+        auto add = [&](AdResidualSourceKind kind, bool current, uint64_t cost = 0,
+                       ArrayRef<Operation *> operations = {}) {
+            AdResidualSource candidate;
+            candidate.key = selection.key;
+            candidate.kind = kind;
+            candidate.legal = true;
+            candidate.availableInCurrentContract = current;
+            if (kind == AdResidualSourceKind::PureRematerialization)
+                candidate.recomputationCost = cost;
+            else if (kind == AdResidualSourceKind::DynamicCapture) {
+                candidate.captureStoreBytes = 1;
+                candidate.backwardLoadBytes = 1;
+            }
+            llvm::append_range(candidate.recipe, operations);
+            selection.candidates.push_back(std::move(candidate));
+        };
+        if (reconstructibleValue) {
+            if (auto argument = dyn_cast<BlockArgument>(reconstructibleValue)) {
+                auto owner = dyn_cast_or_null<func::FuncOp>(argument.getOwner()->getParentOp());
+                if (owner == function) {
+                    if (function.getArgAttr(argument.getArgNumber(), kBuiltinAttrName))
+                        add(AdResidualSourceKind::Builtin, true);
+                    else
+                        add(AdResidualSourceKind::PrimalArgument, false);
+                }
+            }
+            FailureOr<AdRematerializationRecipe> recipe =
+                buildAutodiffRematerializationRecipe(reconstructibleValue, function);
+            if (succeeded(recipe))
+                add(AdResidualSourceKind::PureRematerialization, true, recipe->estimatedCost, recipe->operations);
+        }
+        add(AdResidualSourceKind::DynamicCapture, true);
+        // The current profile contract always records control history. Phase 3E
+        // may select a reconstructible candidate only in the versioned profile.
+        selection.selectedCandidate = static_cast<unsigned>(selection.candidates.size() - 1);
+        plan.memoryPlan.sourceSelections.push_back(std::move(selection));
+    };
+    for (AutodiffTapeRegion &region : plan.regions) {
+        if (auto ifOp = dyn_cast<scf::IfOp>(region.operation))
+            appendControlSource(region, AdControlSourceKind::Predicate, ifOp.getCondition());
+        if (region.control.executedCount)
+            appendControlSource(region, AdControlSourceKind::ExecutedCount);
+        if (region.control.exitKind)
+            appendControlSource(region, AdControlSourceKind::ExitKind);
+    }
 
     FailureOr<AutodiffTapeRecord> invocationRecord = std::move(invocationBuilder).finish();
     if (failed(invocationRecord)) {
@@ -698,13 +1010,64 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
     plan.staticTapeBytesHint = *hint;
     plan.memoryPlan.residuals = std::move(residuals);
     plan.memoryPlan.rematerializations = std::move(rematerializations);
-    FailureOr<AdBufferAssignment> assignment = assignAdMemoryBuffers(plan.memoryPlan.residuals);
+    SmallVector<AdRematerializationCandidate> budgetCandidates;
+    budgetCandidates.reserve(plan.memoryPlan.rematerializations.size());
+    DenseSet<Value> budgetCandidateValues;
+    for (const AdRematerializationRecipe &recipe : plan.memoryPlan.rematerializations) {
+        if (!budgetCandidateValues.insert(recipe.value).second)
+            continue;
+        AdRematerializationCandidate candidate;
+        candidate.recomputationCost = recipe.estimatedCost;
+        for (auto [residualIndex, residual] : llvm::enumerate(plan.memoryPlan.residuals))
+            if (residual.value == recipe.value)
+                candidate.residualIndices.push_back(static_cast<unsigned>(residualIndex));
+        if (!candidate.residualIndices.empty())
+            budgetCandidates.push_back(std::move(candidate));
+    }
+    FailureOr<AdBudgetedBufferAssignment> assignment =
+        assignAdMemoryBuffersWithinBudget(plan.memoryPlan.residuals, budgetCandidates, memoryBudgetBytes);
     if (failed(assignment)) {
-        function.emitError("autodiff residual buffer assignment failed");
+        function.emitError() << "no legal autodiff residual plan fits the " << memoryBudgetBytes
+                             << "-byte compiler memory budget";
         return failure();
     }
-    plan.memoryPlan.bufferAssignment = std::move(*assignment);
-    plan.memoryPlan.estimatedPersistentBytes = *hint;
+    plan.memoryPlan.bufferAssignment = std::move(assignment->buffers);
+    const bool selectedCapture =
+        llvm::any_of(plan.memoryPlan.sourceSelections, [](const AdResidualSourceSelection &selection) {
+            if (selection.selectedCandidate >= selection.candidates.size())
+                return true;
+            AdResidualSourceKind kind = selection.candidates[selection.selectedCandidate].kind;
+            return kind == AdResidualSourceKind::StaticCapture || kind == AdResidualSourceKind::DynamicCapture;
+        });
+    const uint64_t retainedTapeBytes = plan.regions.empty() && !selectedCapture ? 0 : *hint;
+    if (retainedTapeBytes > memoryBudgetBytes) {
+        function.emitError() << "no legal autodiff residual plan fits the " << memoryBudgetBytes
+                             << "-byte compiler memory budget";
+        return failure();
+    }
+    plan.memoryPlan.estimatedPersistentBytes = retainedTapeBytes;
+    plan.memoryPlan.costComponents.retainedTapeBytes = retainedTapeBytes;
+    for (const AdResidualSourceSelection &selection : plan.memoryPlan.sourceSelections) {
+        if (selection.selectedCandidate >= selection.candidates.size())
+            continue;
+        const AdResidualSource &source = selection.candidates[selection.selectedCandidate];
+        FailureOr<uint64_t> capture =
+            checkedAdd(plan.memoryPlan.costComponents.captureStoreBytes, source.captureStoreBytes);
+        FailureOr<uint64_t> load =
+            checkedAdd(plan.memoryPlan.costComponents.backwardLoadBytes, source.backwardLoadBytes);
+        FailureOr<uint64_t> reload =
+            checkedAdd(plan.memoryPlan.costComponents.resourceReloadCost, source.resourceReloadCost);
+        FailureOr<uint64_t> recompute =
+            checkedAdd(plan.memoryPlan.costComponents.recomputationCost, source.recomputationCost);
+        if (failed(capture) || failed(load) || failed(reload) || failed(recompute)) {
+            function.emitError("autodiff selected source cost telemetry overflows");
+            return failure();
+        }
+        plan.memoryPlan.costComponents.captureStoreBytes = *capture;
+        plan.memoryPlan.costComponents.backwardLoadBytes = *load;
+        plan.memoryPlan.costComponents.resourceReloadCost = *reload;
+        plan.memoryPlan.costComponents.recomputationCost = *recompute;
+    }
     return plan;
 }
 

@@ -331,6 +331,18 @@ public:
                     }
                     pullback.totalActiveOperationCount = activeOperations;
                     pullback.totalBaseRecomputationCost = recomputationCost;
+                    GraphAutodiffPassTelemetry telemetry;
+                    telemetry.scheduleOffset = offset;
+                    telemetry.passName = compute.name();
+                    telemetry.residualSourceKind = tape->residualSourceKind();
+                    telemetry.controlHistoryKind = tape->controlHistoryKind();
+                    telemetry.estimatedTapeBytes = tape->estimatedTapeBytes();
+                    telemetry.logicalResidualBytes = tape->logicalResidualBytes();
+                    telemetry.residentTapeBytes = tape->residentTapeBytes();
+                    telemetry.allocatedTapeBytes = tape->allocatedTapeBytes();
+                    telemetry.activeOperationCount = tape->activeOperationCount();
+                    telemetry.recomputationCost = tape->recomputationCost();
+                    pullback.passTelemetryValues.push_back(std::move(telemetry));
                 }
                 if (!pullback.observeTapeAllocation(tape->allocatedTapeBytes(), context.temporaryBytes,
                                                     context.temporaryBytesAllocated ? context.temporaryBytes : 0,
@@ -343,6 +355,15 @@ public:
                 if (status != VERNON_RHI_STATUS_OK) {
                     context.error = "execution pass '" + compute.name() + "' failed during graph VJP forward execution";
                     return status;
+                }
+                if (context.collectMetrics) {
+                    GraphAutodiffPassTelemetry telemetry;
+                    telemetry.scheduleOffset = offset;
+                    telemetry.passName = compute.name();
+                    telemetry.residualSourceKind = "none";
+                    telemetry.controlHistoryKind = "none";
+                    telemetry.controlHistoryBytes = uint64_t{0};
+                    pullback.passTelemetryValues.push_back(std::move(telemetry));
                 }
             }
             if (!context.captureCheckpoints || !pullback.plan->hasAutodiffCheckpointPlan)
@@ -593,6 +614,7 @@ public:
     uint64_t observedPeakRuntimeManagedBytes{};
     uint64_t totalActiveOperationCount{};
     uint64_t totalBaseRecomputationCost{};
+    std::vector<GraphAutodiffPassTelemetry> passTelemetryValues;
     bool retainedTapesAvailable{true};
     mutable std::mutex mutex;
 };
@@ -914,6 +936,39 @@ double GraphPullback::recomputationFactor() const {
         impl_->plan->hasAutodiffCheckpointPlan ? impl_->plan->autodiffCheckpointPlan.replayCost : 0;
     return 1.0 + (static_cast<double>(impl_->totalBaseRecomputationCost) + static_cast<double>(replayCost)) /
                      std::max<uint64_t>(impl_->totalActiveOperationCount, 1);
+}
+
+std::vector<GraphAutodiffPassTelemetry> GraphPullback::passTelemetry() const {
+    std::lock_guard lock(impl_->mutex);
+    std::vector<GraphAutodiffPassTelemetry> result = impl_->passTelemetryValues;
+    std::sort(result.begin(), result.end(),
+              [](const GraphAutodiffPassTelemetry &left, const GraphAutodiffPassTelemetry &right) {
+                  return left.scheduleOffset < right.scheduleOffset;
+              });
+    if (impl_->plan->hasAutodiffCheckpointPlan) {
+        const AutodiffDagCheckpointPlan &checkpointPlan = impl_->plan->autodiffCheckpointPlan;
+        std::vector<const AutodiffCheckpointResource *> resources;
+        resources.reserve(checkpointPlan.checkpointResources.size());
+        for (const AutodiffCheckpointResource &resource : checkpointPlan.checkpointResources)
+            resources.push_back(&resource);
+        std::sort(resources.begin(), resources.end(),
+                  [](const AutodiffCheckpointResource *left, const AutodiffCheckpointResource *right) {
+                      return left->offset < right->offset;
+                  });
+        for (size_t index = 0; index < resources.size(); ++index) {
+            const AutodiffCheckpointResource &resource = *resources[index];
+            const uint64_t end =
+                index + 1 < resources.size() ? resources[index + 1]->offset : checkpointPlan.persistentCheckpointBytes;
+            const uint64_t chargedBytes = end >= resource.offset ? end - resource.offset : 0;
+            auto telemetry = std::find_if(result.begin(), result.end(), [&](const GraphAutodiffPassTelemetry &item) {
+                return item.scheduleOffset == resource.producer;
+            });
+            if (telemetry != result.end() &&
+                !checkedAdd(telemetry->checkpointBytes, chargedBytes, telemetry->checkpointBytes))
+                telemetry->checkpointBytes = std::numeric_limits<uint64_t>::max();
+        }
+    }
+    return result;
 }
 
 GraphBackwardSubmission::State GraphBackwardSubmission::state() const { return state_; }

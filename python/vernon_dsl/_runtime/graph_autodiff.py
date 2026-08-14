@@ -163,13 +163,19 @@ class VjpComputePass(ComputePass):
         invocation_count = 0
         tape_stride = 0
         replay_cost = 0
+        resource_reload_cost = 0
+        recomputation_cost = 0
+        deterministic_reduction_legal = True
         if isinstance(self._program, ProgramExpression):
             compiled = _compile_direct_vjp(self._program, self._program_arguments(None))
             workgroup = tuple(int(value) for value in compiled.pipeline.workgroup_size)
             invocation_count = math.prod(count * size for count, size in zip(self._grid, workgroup, strict=True))
             tape_stride = compiled.tape_bytes_per_invocation
             replay_cost = compiled.active_operation_count * invocation_count
-            if replay_cost > 2**64 - 1:
+            resource_reload_cost = compiled.resource_reload_cost * invocation_count
+            recomputation_cost = compiled.recomputation_cost * invocation_count
+            deterministic_reduction_legal = compiled.deterministic_reduction_legal
+            if max(replay_cost, resource_reload_cost, recomputation_cost) > 2**64 - 1:
                 raise OverflowError("autodiff checkpoint planning metadata exceeds uint64")
         self._native_pass.set_autodiff(
             [mapping(path, endpoint) for path, endpoint in self._gradient_endpoints.items()],
@@ -177,6 +183,9 @@ class VjpComputePass(ComputePass):
             invocation_count,
             tape_stride,
             replay_cost,
+            resource_reload_cost,
+            recomputation_cost,
+            deterministic_reduction_legal,
             isinstance(self._program, ProgramExpression),
         )
 
@@ -286,6 +295,10 @@ class GraphPullback:
     @property
     def recomputation_factor(self) -> float:
         return float(self._native.recomputation_factor)
+
+    @property
+    def pass_telemetry(self) -> tuple[dict[str, Any], ...]:
+        return tuple(dict(item) for item in self._native.pass_telemetry)
 
     @property
     def reverse_python_callback_count(self) -> int:

@@ -21,13 +21,23 @@ struct AutodiffDagNode {
     uint64_t forwardPeakBytes{};
     uint64_t replayCost{};
     bool replayable{};
+    uint64_t resourceReloadCost{};
+    uint64_t recomputationCost{};
+    bool deterministicReductionLegal{true};
+};
+
+enum class AutodiffCheckpointPolicy {
+    MinMemory,
+    Balanced,
+    MinRuntime,
 };
 
 bool planDagAutodiffCheckpoints(const std::vector<AutodiffDagNode> &nodes, uint64_t memoryBudget,
                                 AutodiffDagCheckpointPlan &output, std::string &error, uint64_t initialStateBytes = 0,
                                 bool initialStateCheckpointable = true, uint64_t restorationBytes = 0,
                                 bool restorationCheckpointable = true, uint64_t transactionBytes = 0,
-                                bool transactionCheckpointable = true);
+                                bool transactionCheckpointable = true,
+                                AutodiffCheckpointPolicy policy = AutodiffCheckpointPolicy::Balanced);
 
 } // namespace vernon::execution::detail
 

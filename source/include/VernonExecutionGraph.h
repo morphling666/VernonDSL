@@ -161,6 +161,8 @@ public:
     virtual uint64_t activeOperationCount() const = 0;
     virtual uint64_t recomputationCost() const = 0;
     virtual uint64_t tapeContextLimitBytes() const = 0;
+    virtual std::string residualSourceKind() const { return "capture"; }
+    virtual std::string controlHistoryKind() const { return "unknown"; }
 };
 
 class DifferentiablePass {
@@ -178,6 +180,9 @@ public:
     virtual uint64_t estimatedRetainedAllocationBytes() const = 0;
     virtual uint64_t estimatedForwardPeakBytes() const { return estimatedRetainedAllocationBytes(); }
     virtual uint64_t replayCost() const { return 0; }
+    virtual uint64_t resourceReloadCost() const { return 0; }
+    virtual uint64_t recomputationCost() const { return 0; }
+    virtual bool deterministicReductionLegal() const { return true; }
     virtual bool hasCheckpointPlanningMetadata() const { return false; }
     virtual bool supportsReplay() const { return false; }
 };
@@ -351,6 +356,15 @@ struct AutodiffDagCheckpointPlan {
     uint64_t memoryBudget{};
     uint64_t peakBytes{};
     uint64_t replayCost{};
+    uint64_t captureStoreBytes{};
+    uint64_t backwardLoadBytes{};
+    uint64_t checkpointCopyBytes{};
+    uint64_t resourceReloadCost{};
+    uint64_t recomputationCost{};
+    uint64_t graphReplayCost{};
+    uint64_t weightedRuntimeCost{};
+    bool deterministicReductionLegal{true};
+    std::string selectedPolicy{"balanced"};
 };
 
 namespace detail {
@@ -506,6 +520,21 @@ private:
     NamedGraphAutodiffValues gradients_;
 };
 
+struct GraphAutodiffPassTelemetry {
+    uint32_t scheduleOffset{};
+    std::string passName;
+    std::string residualSourceKind{"capture"};
+    std::string controlHistoryKind{"unknown"};
+    uint64_t estimatedTapeBytes{};
+    uint64_t logicalResidualBytes{};
+    uint64_t residentTapeBytes{};
+    uint64_t allocatedTapeBytes{};
+    uint64_t checkpointBytes{};
+    uint64_t activeOperationCount{};
+    uint64_t recomputationCost{};
+    std::optional<uint64_t> controlHistoryBytes;
+};
+
 class GraphPullback {
 public:
     ~GraphPullback();
@@ -522,6 +551,7 @@ public:
     uint64_t peakRuntimeManagedBytes() const;
     uint64_t tapeContextLimitBytes() const;
     double recomputationFactor() const;
+    std::vector<GraphAutodiffPassTelemetry> passTelemetry() const;
 
 private:
     friend class CompiledExecutionGraph;

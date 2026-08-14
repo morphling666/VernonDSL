@@ -197,6 +197,11 @@ struct AutodiffVariant {
     std::string forwardWithTape;
     std::string backward;
     uint64_t staticTapeBytesHint{};
+    std::string residualStorage;
+    std::vector<std::string> requiredPrimalPaths;
+    std::map<std::string, uint64_t> sourceKindCounts;
+    std::map<std::string, uint64_t> costComponents;
+    std::string selectedPolicy;
     AutodiffLaunchPlan launch;
 };
 

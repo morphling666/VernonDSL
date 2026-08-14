@@ -209,6 +209,14 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     canonical = invalidVersion.dump(-1, ' ', false);
     ASSERT_TRUE(!loadWithDirectory(runtime, canonical, directoryUtf8));
 
+    nlohmann::json previousVersion = nlohmann::json::parse(bundle);
+    previousVersion["pipeline_version"] = 15;
+    previousVersion.erase("content_hash");
+    canonical = previousVersion.dump(-1, ' ', false);
+    previousVersion["content_hash"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
+    canonical = previousVersion.dump(-1, ' ', false);
+    ASSERT_TRUE(!loadWithDirectory(runtime, canonical, directoryUtf8));
+
     VernonPipelineBundleLoadOptions shortOptions{};
     shortOptions.struct_size = sizeof(shortOptions) - 1;
     shortOptions.bundle_directory = directoryUtf8.c_str();

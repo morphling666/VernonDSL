@@ -24,6 +24,19 @@ nlohmann::json validAutodiffManifest() {
               {"output_cotangents", nlohmann::json::array({"output"})},
               {"variants", nlohmann::json::array({{{"key", nlohmann::json::array()},
                                                    {"workgroup_size", nlohmann::json::array({1, 1, 1})},
+                                                   {"residual_storage", "static"},
+                                                   {"static_tape_bytes_hint", 16},
+                                                   {"required_primal_paths", nlohmann::json::array()},
+                                                   {"source_kind_counts", {{"static_capture", 1}}},
+                                                   {"cost_components",
+                                                    {{"backward_load_bytes", 4},
+                                                     {"capture_store_bytes", 4},
+                                                     {"checkpoint_copy_bytes", 0},
+                                                     {"graph_replay_cost", 0},
+                                                     {"recomputation_cost", 0},
+                                                     {"resource_reload_cost", 0},
+                                                     {"retained_tape_bytes", 16}}},
+                                                   {"selected_policy", "min_memory"},
                                                    {"profiles",
                                                     {{"primal",
                                                       {{"compute", "primal"},
@@ -101,6 +114,32 @@ TEST(PipelineManifestRequirements, ParsesCanonicalAutodiffProfiles) {
     EXPECT_EQ(manifest.variants[0].backward, "backward");
     EXPECT_EQ(manifest.variants[0].staticTapeBytesHint, 16u);
     EXPECT_EQ(manifest.variants[0].launch.workgroupSize.x, 1u);
+}
+
+TEST(PipelineManifestRequirements, ParsesNoTapeProfilesWithExplicitPrimals) {
+    using vernon::runtime::AutodiffManifest;
+    using vernon::runtime::parseAutodiffManifest;
+    nlohmann::json root = validAutodiffManifest();
+    nlohmann::json &variant = root["autodiff"]["variants"][0];
+    variant["residual_storage"] = "none";
+    variant["static_tape_bytes_hint"] = 0;
+    variant["required_primal_paths"] = nlohmann::json::array({"primal.x"});
+    variant["source_kind_counts"] = {{"primal_argument", 1}};
+    variant["cost_components"]["backward_load_bytes"] = 0;
+    variant["cost_components"]["capture_store_bytes"] = 0;
+    variant["cost_components"]["retained_tape_bytes"] = 0;
+    variant["profiles"]["forward_with_tape"]["outputs"] = nlohmann::json::array();
+    const nlohmann::json primal = {{"path", "primal.x"}, {"type", "f32"}, {"role", "primal"}};
+    const nlohmann::json cotangent = {{"path", "output"}, {"type", "f32"}, {"role", "cotangent"}};
+    variant["profiles"]["backward"]["inputs"] = nlohmann::json::array({primal, cotangent});
+
+    AutodiffManifest manifest;
+    std::string error;
+    ASSERT_TRUE(parseAutodiffManifest(root, manifest, error)) << error;
+    ASSERT_EQ(manifest.variants.size(), 1u);
+    EXPECT_EQ(manifest.variants[0].residualStorage, "none");
+    EXPECT_EQ(manifest.variants[0].staticTapeBytesHint, 0u);
+    EXPECT_EQ(manifest.variants[0].requiredPrimalPaths, std::vector<std::string>{"primal.x"});
 }
 
 TEST(PipelineManifestRequirements, RejectsLegacyAutodiffMetadata) {

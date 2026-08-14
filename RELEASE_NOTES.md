@@ -10,7 +10,7 @@ compiler, offline cooker, and submission-based Runtime/RHI and ExecutionGraph AP
 - Direct CPU compute dispatch and GPU-optional runtime execution.
 - Offscreen graphics pipelines, host readback, PipelineAsset cooking, and
   bundled VernonRuntime CMake sources.
-- Pipeline 15 unifies cooked compute, graphics, and differentiated assets under
+- Pipeline 16 unifies cooked compute, graphics, and differentiated assets under
   the canonical `*.pipeline.json` schema. Differentiated manifests use an
   optional root `autodiff` object.
 - CPU automatic differentiation uses one `dynamic_v2` ABI for direct and
@@ -61,7 +61,7 @@ repository's `python` directory and run commands with
 
 ## Compatibility and lifecycle
 
-This release uses compiler contract 11 and pipeline contract 15. Incompatible
+This release uses compiler contract 12 and pipeline contract 16. Incompatible
 artifacts are rejected rather than silently loaded. The stable API, ABI,
 deprecation, cache, support, and security policies are documented in
 [`PUBLIC_API.md`](PUBLIC_API.md), [`COMPATIBILITY.md`](COMPATIBILITY.md),

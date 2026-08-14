@@ -1,7 +1,8 @@
 # Compatibility policy
 
 VernonDSL has independent release, compiler-contract, and pipeline version
-axes. The 0.1.2 release uses compiler contract 11 and pipeline contract 15.
+axes. The unpublished 0.1.2 release uses compiler contract 12 and pipeline
+contract 16.
 
 ## Release and ABI
 
@@ -21,9 +22,10 @@ unsupported.
 
 Compiler input must carry the exact supported `vernon.compiler_contract_version`.
 Pipeline manifests must carry the exact supported `pipeline_version`.
-Pipeline 15 has one canonical `*.pipeline.json` schema for compute and graphics
+Pipeline 16 has one canonical `*.pipeline.json` schema for compute and graphics
 targets. Supported differentiated assets are CPU-only, use the `dynamic_v2`
-protocol, and carry the optional root `autodiff` object. GPU and graphics
+protocol or its contract-16 no-Tape successor, and carry the optional root
+`autodiff` object. GPU and graphics
 autodiff are deferred and unsupported; ordinary non-AD GPU pipelines remain
 supported. Fields from pipeline 13 are not accepted as current-schema aliases.
 Incompatible input, reflection, manifests, and artifacts are rejected before

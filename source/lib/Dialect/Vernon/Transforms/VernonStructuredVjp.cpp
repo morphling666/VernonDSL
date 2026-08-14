@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffTapePlanning.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffUtils.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Pass/PassRegistry.h"
@@ -786,6 +787,11 @@ public:
             primals.try_emplace(source, value);
     }
 
+    void initializePrimalArguments(ArrayRef<BlockArgument> sources, ValueRange values) {
+        for (auto [source, value] : llvm::zip_equal(sources, values))
+            primals.try_emplace(source, value);
+    }
+
     LogicalResult initializePrimals(OpBuilder &builder) {
         Value zero = createIndexConstant(builder, primal.getLoc(), 0);
         DenseSet<Value> loaded;
@@ -998,23 +1004,53 @@ private:
         return active;
     }
 
+    bool dominatesInsertion(Value value, OpBuilder &builder) {
+        Block *insertionBlock = builder.getInsertionBlock();
+        if (!value || !insertionBlock)
+            return false;
+        Operation *scope = insertionBlock->getParentOp();
+        if (Operation *function = scope->getParentOfType<func::FuncOp>())
+            scope = function;
+        DominanceInfo dominance(scope);
+        if (builder.getInsertionPoint() != insertionBlock->end())
+            return dominance.dominates(value, &*builder.getInsertionPoint());
+        if (value.getParentBlock() == insertionBlock)
+            return true;
+        return dominance.dominates(value.getParentBlock(), insertionBlock);
+    }
+
+    Value availablePrimal(Value source, OpBuilder &builder, const IRMapping *local = nullptr) {
+        if (local)
+            if (Value value = local->lookupOrNull(source))
+                return value;
+        Value value = primals.lookup(source);
+        return dominatesInsertion(value, builder) ? value : Value{};
+    }
+
     FailureOr<Value> materializePrimal(Value value, OpBuilder &builder) {
-        if (Value available = primals.lookup(value))
+        if (Value available = availablePrimal(value, builder))
             return available;
-        Operation *defining = value.getDefiningOp();
-        if (!defining || defining->getNumRegions() != 0 || classifyAutodiffEffect(defining) != AutodiffEffectKind::Pure)
+        FailureOr<AdRematerializationRecipe> recipe = buildAutodiffRematerializationRecipe(
+            value, primal, [&](Value root) { return static_cast<bool>(availablePrimal(root, builder)); });
+        if (failed(recipe))
             return failure();
         IRMapping local;
-        for (Value operand : defining->getOperands()) {
-            FailureOr<Value> materialized = materializePrimal(operand, builder);
-            if (failed(materialized))
-                return failure();
-            local.map(operand, *materialized);
+        for (Operation *operation : recipe->operations) {
+            for (Value operand : operation->getOperands()) {
+                Value materialized = availablePrimal(operand, builder, &local);
+                if (!materialized)
+                    return failure();
+                local.map(operand, materialized);
+            }
+            Operation *clone = builder.clone(*operation, local);
+            for (auto [source, target] : llvm::zip_equal(operation->getResults(), clone->getResults()))
+                local.map(source, target);
         }
-        Operation *clone = builder.clone(*defining, local);
-        for (auto [source, target] : llvm::zip_equal(defining->getResults(), clone->getResults()))
-            primals.try_emplace(source, target);
-        return primals.lookup(value);
+        Value materialized = local.lookupOrNull(value);
+        if (!materialized)
+            return failure();
+        primals[value] = materialized;
+        return materialized;
     }
 
     FailureOr<Value> replaceTensorElement(Value tensorValue, ValueRange indices, Value replacement, OpBuilder &builder,
@@ -1229,14 +1265,21 @@ private:
                 continue;
             Value source = requirement.kind == AutodiffPrimalKind::Operand ? operation.getOperand(requirement.index)
                                                                            : operation.getResult(requirement.index);
-            if (primals.contains(source))
+            if (availablePrimal(source, builder))
                 continue;
             FailureOr<Value> materialized = materializePrimal(source, builder);
             if (failed(materialized))
                 return operation.emitError("cannot rematerialize a rule-required primal value");
             primals.try_emplace(source, *materialized);
         }
-        return reverseScalarOperation(operation, builder, analysis, registry, primals, adjoints);
+        DenseMap<Value, Value> availablePrimals;
+        for (Value operand : operation.getOperands())
+            if (Value available = availablePrimal(operand, builder))
+                availablePrimals.try_emplace(operand, available);
+        for (Value result : operation.getResults())
+            if (Value available = availablePrimal(result, builder))
+                availablePrimals.try_emplace(result, available);
+        return reverseScalarOperation(operation, builder, analysis, registry, availablePrimals, adjoints);
     }
 
     LogicalResult reverseProjection(Operation &operation, Value input, Value result,
@@ -1542,10 +1585,64 @@ private:
     DenseMap<std::pair<unsigned, unsigned>, Value> externalStorageCotangents;
 };
 
+SmallVector<BlockArgument> requiredPrimalArguments(const VernonAutodiffTapePlan &plan) {
+    SmallVector<BlockArgument> result;
+    DenseSet<Value> seen;
+    auto append = [&](Value value) {
+        auto argument = dyn_cast<BlockArgument>(value);
+        if (!argument)
+            return;
+        auto function = dyn_cast_or_null<func::FuncOp>(argument.getOwner()->getParentOp());
+        if (!function || argument.getOwner() != &function.getBody().front())
+            return;
+        if (function.getArgAttr(argument.getArgNumber(), kBuiltinAttrName) || !seen.insert(argument).second)
+            return;
+        result.push_back(argument);
+    };
+    for (const AdResidualSourceSelection &selection : plan.getMemoryPlan().getSourceSelections()) {
+        if (selection.selectedCandidate >= selection.candidates.size())
+            continue;
+        const AdResidualSource &source = selection.candidates[selection.selectedCandidate];
+        if (source.kind == AdResidualSourceKind::PrimalArgument)
+            append(selection.key.value);
+        if (source.kind == AdResidualSourceKind::PureRematerialization)
+            for (Operation *operation : source.recipe)
+                for (Value operand : operation->getOperands())
+                    append(operand);
+    }
+    llvm::sort(result, [](BlockArgument left, BlockArgument right) {
+        auto function = cast<func::FuncOp>(left.getOwner()->getParentOp());
+        auto leftAttr = function.getArgAttrOfType<StringAttr>(left.getArgNumber(), "vernon.source_name");
+        auto rightAttr = function.getArgAttrOfType<StringAttr>(right.getArgNumber(), "vernon.source_name");
+        StringRef leftName = leftAttr ? leftAttr.getValue() : StringRef{};
+        StringRef rightName = rightAttr ? rightAttr.getValue() : StringRef{};
+        return std::tuple(leftName, left.getArgNumber()) < std::tuple(rightName, right.getArgNumber());
+    });
+    return result;
+}
+
+bool requiresLogicalTape(const VernonAutodiffTapePlan &plan) {
+    if (!plan.getRegions().empty())
+        return true;
+    return llvm::any_of(plan.getMemoryPlan().getSourceSelections(), [](const AdResidualSourceSelection &selection) {
+        if (selection.selectedCandidate >= selection.candidates.size())
+            return true;
+        AdResidualSourceKind kind = selection.candidates[selection.selectedCandidate].kind;
+        return kind == AdResidualSourceKind::StaticCapture || kind == AdResidualSourceKind::DynamicCapture;
+    });
+}
+
 FailureOr<func::FuncOp> createStructuredForward(func::FuncOp primal, StringRef symbol,
                                                 const VernonAutodiffTapePlan &plan,
-                                                const ResidualRootLayout &rootLayout) {
+                                                const ResidualRootLayout &rootLayout, bool usesTape) {
     MLIRContext *context = primal.getContext();
+    if (!usesTape) {
+        OpBuilder moduleBuilder(primal);
+        auto forward = cast<func::FuncOp>(primal.clone());
+        forward.setSymName(symbol);
+        moduleBuilder.insert(forward);
+        return forward;
+    }
     Type tapeType = AdTapeType::get(context);
     Type regionType = AdRegionHeaderType::get(context);
     TupleType resultType = TupleType::get(context, {tapeType, regionType});
@@ -1607,19 +1704,26 @@ FailureOr<func::FuncOp> createStructuredBackward(func::FuncOp primal, StringRef 
                                                  const VernonAutodiffAnalysisResult &analysis,
                                                  const VernonAutodiffRuleRegistry &registry,
                                                  const VernonAutodiffTapePlan &plan,
-                                                 const ResidualRootLayout &rootLayout) {
+                                                 const ResidualRootLayout &rootLayout, bool usesTape) {
     MLIRContext *context = primal.getContext();
     Type tapeType = AdTapeType::get(context);
     Type regionType = AdRegionHeaderType::get(context);
     BackwardProfileTypes profileTypes = getBackwardProfileTypes(context, analysis);
     OpBuilder moduleBuilder(primal);
-    SmallVector<Type> backwardArguments = {tapeType, regionType};
+    SmallVector<Type> backwardArguments;
+    if (usesTape) {
+        backwardArguments.push_back(tapeType);
+        backwardArguments.push_back(regionType);
+    }
     SmallVector<BlockArgument> builtinArguments;
     for (BlockArgument argument : primal.getArguments())
         if (primal.getArgAttr(argument.getArgNumber(), kBuiltinAttrName)) {
             builtinArguments.push_back(argument);
             backwardArguments.push_back(argument.getType());
         }
+    SmallVector<BlockArgument> primalArguments = requiredPrimalArguments(plan);
+    for (BlockArgument argument : primalArguments)
+        backwardArguments.push_back(argument.getType());
     llvm::append_range(backwardArguments, profileTypes.shapeSources);
     llvm::append_range(backwardArguments, profileTypes.cotangents);
     llvm::append_range(backwardArguments, profileTypes.storageGradients);
@@ -1634,13 +1738,22 @@ FailureOr<func::FuncOp> createStructuredBackward(func::FuncOp primal, StringRef 
             backward.erase();
     });
     copyProfileFunctionAttrs(primal, backward);
-    SmallVector<DictionaryAttr> backwardArgumentAttrs = {
-        makeInterfaceAttrs(context, "input", "tape", {}, 0),
-        makeInterfaceAttrs(context, "input", "tape_region", {}, 1),
-    };
+    SmallVector<DictionaryAttr> backwardArgumentAttrs;
+    if (usesTape) {
+        backwardArgumentAttrs.push_back(makeInterfaceAttrs(context, "input", "tape", {}, 0));
+        backwardArgumentAttrs.push_back(makeInterfaceAttrs(context, "input", "tape_region", {}, 1));
+    }
     for (BlockArgument argument : builtinArguments)
         backwardArgumentAttrs.push_back(primal.getArgAttrDict(argument.getArgNumber()));
-    const unsigned shapeBase = 2 + builtinArguments.size();
+    const unsigned primalBase = (usesTape ? 2 : 0) + builtinArguments.size();
+    for (auto [index, argument] : llvm::enumerate(primalArguments)) {
+        auto sourceName = primal.getArgAttrOfType<StringAttr>(argument.getArgNumber(), "vernon.source_name");
+        if (!sourceName || sourceName.getValue().empty())
+            return primal.emitError("required backward primal argument has no source name");
+        backwardArgumentAttrs.push_back(makeInterfaceAttrs(context, "input", ("primal." + sourceName.getValue()).str(),
+                                                           {}, primalBase + index, argument.getType()));
+    }
+    const unsigned shapeBase = primalBase + primalArguments.size();
     unsigned shapeSourceIndex = 0;
     for (const AutodiffStorageIdentity &identity : analysis.getStorageIdentities()) {
         if (!hasExternalStorageShapeSource(identity))
@@ -1697,8 +1810,12 @@ FailureOr<func::FuncOp> createStructuredBackward(func::FuncOp primal, StringRef 
 
     Block *entry = backward.addEntryBlock();
     OpBuilder builder = OpBuilder::atBlockEnd(entry);
-    ReverseEmitterCore emitter(primal, analysis, registry, plan, rootLayout, entry->getArgument(1));
-    emitter.initializeBuiltinPrimals(builtinArguments, entry->getArguments().slice(2, builtinArguments.size()));
+    Value rootRegion = usesTape ? entry->getArgument(1) : Value{};
+    ReverseEmitterCore emitter(primal, analysis, registry, plan, rootLayout, rootRegion);
+    const unsigned builtinBase = usesTape ? 2 : 0;
+    emitter.initializeBuiltinPrimals(builtinArguments,
+                                     entry->getArguments().slice(builtinBase, builtinArguments.size()));
+    emitter.initializePrimalArguments(primalArguments, entry->getArguments().slice(primalBase, primalArguments.size()));
     if (failed(emitter.initializePrimals(builder)))
         return failure();
     AdjointMap adjoints;
@@ -1853,16 +1970,17 @@ FailureOr<StructuredVjpResult> buildStructuredVjp(func::FuncOp primal, const Str
 
     FailureOr<ResidualRootLayout> rootLayout = buildDynamicRootLayout(*plan);
     const bool staticResiduals = plan->getRegions().empty();
+    const bool usesTape = requiresLogicalTape(*plan);
     if (staticResiduals)
         rootLayout = buildStaticRootLayout(*plan);
     if (failed(rootLayout))
         return structuredPrimal.emitError("structured VJP root record layout overflow");
     FailureOr<func::FuncOp> forward =
-        createStructuredForward(structuredPrimal, options.forwardSymbol, *plan, *rootLayout);
+        createStructuredForward(structuredPrimal, options.forwardSymbol, *plan, *rootLayout, usesTape);
     if (failed(forward))
         return failure();
-    FailureOr<func::FuncOp> backward =
-        createStructuredBackward(structuredPrimal, options.backwardSymbol, *analysis, registry, *plan, *rootLayout);
+    FailureOr<func::FuncOp> backward = createStructuredBackward(structuredPrimal, options.backwardSymbol, *analysis,
+                                                                registry, *plan, *rootLayout, usesTape);
     if (failed(backward)) {
         forward->erase();
         return failure();
@@ -1872,7 +1990,9 @@ FailureOr<StructuredVjpResult> buildStructuredVjp(func::FuncOp primal, const Str
         backward->erase();
         return structuredPrimal.emitError("generated structured VJP profile failed verification");
     }
-    const StringAttr residualStorage = StringAttr::get(primal.getContext(), staticResiduals ? "static" : "dynamic");
+    const StringAttr residualStorage = StringAttr::get(primal.getContext(), !usesTape         ? "none"
+                                                                            : staticResiduals ? "static"
+                                                                                              : "dynamic");
     (*forward)->setAttr("vernon.ad.residual_storage", residualStorage);
     (*backward)->setAttr("vernon.ad.residual_storage", residualStorage);
     const uint64_t activeOperationCount = llvm::count_if(
@@ -1906,9 +2026,46 @@ FailureOr<StructuredVjpResult> buildStructuredVjp(func::FuncOp primal, const Str
         backward->erase();
         return structuredPrimal.emitError("structured VJP tape statistics hint overflow");
     }
-    const uint64_t tapeBytes =
-        staticResiduals ? rootLayout->stride : plan->getStaticTapeBytesHint() + rootLayout->stride;
-    return StructuredVjpResult{*forward, *backward, tapeBytes, std::move(derivativeRules)};
+    const uint64_t tapeBytes = !usesTape         ? 0
+                               : staticResiduals ? rootLayout->stride
+                                                 : plan->getStaticTapeBytesHint() + rootLayout->stride;
+    SmallVector<std::string> requiredPrimalPaths;
+    for (BlockArgument argument : requiredPrimalArguments(*plan)) {
+        auto sourceName = primal.getArgAttrOfType<StringAttr>(argument.getArgNumber(), "vernon.source_name");
+        if (!sourceName || sourceName.getValue().empty()) {
+            forward->erase();
+            backward->erase();
+            return primal.emitError("required backward primal argument has no source name");
+        }
+        requiredPrimalPaths.push_back(("primal." + sourceName.getValue()).str());
+    }
+    SmallVector<std::pair<std::string, uint64_t>> sourceKindCounts;
+    for (const AdResidualSourceSelection &selection : plan->getMemoryPlan().getSourceSelections()) {
+        if (selection.selectedCandidate >= selection.candidates.size())
+            continue;
+        std::string kind = stringifyAdResidualSourceKind(selection.candidates[selection.selectedCandidate].kind).str();
+        auto existing = llvm::find_if(sourceKindCounts, [&](const auto &entry) { return entry.first == kind; });
+        if (existing == sourceKindCounts.end())
+            sourceKindCounts.emplace_back(std::move(kind), 1);
+        else
+            ++existing->second;
+    }
+    llvm::sort(sourceKindCounts, [](const auto &left, const auto &right) { return left.first < right.first; });
+    const AdPlanCostComponents &costs = plan->getMemoryPlan().getCostComponents();
+    SmallVector<std::pair<std::string, uint64_t>> costComponents = {
+        {"backward_load_bytes", costs.backwardLoadBytes},     {"capture_store_bytes", costs.captureStoreBytes},
+        {"checkpoint_copy_bytes", costs.checkpointCopyBytes}, {"graph_replay_cost", costs.graphReplayCost},
+        {"recomputation_cost", costs.recomputationCost},      {"resource_reload_cost", costs.resourceReloadCost},
+        {"retained_tape_bytes", costs.retainedTapeBytes},
+    };
+    return StructuredVjpResult{*forward,
+                               *backward,
+                               tapeBytes,
+                               std::move(derivativeRules),
+                               std::move(requiredPrimalPaths),
+                               std::move(sourceKindCounts),
+                               std::move(costComponents),
+                               plan->getMemoryPlan().getSelectedPolicy().str()};
 }
 
 std::unique_ptr<Pass> createVernonStructuredVjpPass() { return std::make_unique<VernonStructuredVjpPass>(); }

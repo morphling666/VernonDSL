@@ -3,7 +3,7 @@
 // CHECK: unknown Vernon intrinsic 'unimplemented_cpu_operation'
 // CHECK: in CPU entry 'unsupported_intrinsic'
 
-module attributes {vernon.compiler_contract_version = 11 : i64, vernon.pipeline_version = 15 : i64} {
+module attributes {vernon.compiler_contract_version = 12 : i64, vernon.pipeline_version = 16 : i64} {
   func.func @unsupported_intrinsic(%input: tensor<4xf32>)
       -> tensor<4xf32> {
     %result = "vernon.intrinsic"(%input) <{

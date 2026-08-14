@@ -692,6 +692,20 @@ module {
               1u);
     for (const AutodiffStorageEffect &effect : analysis->getStorageEffects())
         EXPECT_TRUE(analysis->isActive(effect.operation));
+    ASSERT_EQ(analysis->getActiveLoads().size(), 2u);
+    for (const AutodiffActiveLoad &load : analysis->getActiveLoads()) {
+        const AutodiffStorageEffect *effect = analysis->getStorageEffect(load.operation);
+        ASSERT_NE(effect, nullptr);
+        EXPECT_EQ(load.identity, effect->identity);
+        EXPECT_EQ(load.versionBefore, effect->versionBefore);
+        EXPECT_EQ(load.indices.size(), 3u);
+        EXPECT_EQ(load.indexProvenance.size(), load.indices.size());
+        EXPECT_TRUE(llvm::all_of(load.indexProvenance, [](AutodiffIndexProvenanceKind provenance) {
+            return provenance == AutodiffIndexProvenanceKind::PureExpression;
+        }));
+        EXPECT_EQ(load.stability, AutodiffStorageStabilityRequirement::RestoreExactVersion);
+        EXPECT_EQ(analysis->getActiveLoad(load.operation), &load);
+    }
 }
 
 TEST_F(VernonAutodiffAnalysisTest, RejectsUnsupportedActiveOperation) {

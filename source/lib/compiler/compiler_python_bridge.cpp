@@ -67,6 +67,13 @@ struct VernonPythonStructuredVjp {
     uint64_t recomputationCost{};
     std::vector<std::string> derivativeRules;
     std::vector<VernonStringView> derivativeRuleViews;
+    std::vector<std::string> requiredPrimalPaths;
+    std::vector<VernonStringView> requiredPrimalPathViews;
+    std::vector<std::pair<std::string, uint64_t>> sourceKindCounts;
+    std::vector<VernonPythonNamedMetricView> sourceKindCountViews;
+    std::vector<std::pair<std::string, uint64_t>> costComponents;
+    std::vector<VernonPythonNamedMetricView> costComponentViews;
+    std::string selectedPolicy;
 };
 
 extern "C" {
@@ -241,6 +248,20 @@ VernonPythonStructuredVjp *vernonCompilerBuildPythonStructuredVjp(VernonStringVi
     result->derivativeRuleViews.reserve(result->derivativeRules.size());
     for (const std::string &rule : result->derivativeRules)
         result->derivativeRuleViews.push_back(viewOf(rule));
+    result->requiredPrimalPaths.assign(transformed->requiredPrimalPaths.begin(),
+                                       transformed->requiredPrimalPaths.end());
+    result->requiredPrimalPathViews.reserve(result->requiredPrimalPaths.size());
+    for (const std::string &path : result->requiredPrimalPaths)
+        result->requiredPrimalPathViews.push_back(viewOf(path));
+    result->sourceKindCounts.assign(transformed->sourceKindCounts.begin(), transformed->sourceKindCounts.end());
+    result->sourceKindCountViews.reserve(result->sourceKindCounts.size());
+    for (const auto &[name, value] : result->sourceKindCounts)
+        result->sourceKindCountViews.push_back({viewOf(name), value});
+    result->costComponents.assign(transformed->costComponents.begin(), transformed->costComponents.end());
+    result->costComponentViews.reserve(result->costComponents.size());
+    for (const auto &[name, value] : result->costComponents)
+        result->costComponentViews.push_back({viewOf(name), value});
+    result->selectedPolicy = transformed->selectedPolicy;
     auto printProfile = [&](llvm::StringRef keptSymbol, llvm::StringRef removedSymbol,
                             llvm::StringRef profileName) -> mlir::FailureOr<std::string> {
         mlir::OwningOpRef<mlir::ModuleOp> profile(mlir::cast<mlir::ModuleOp>(parsed->clone()));
@@ -318,7 +339,8 @@ void vernonCompilerDestroyPythonStructuredVjp(VernonPythonStructuredVjp *result)
 
 VernonPythonStructuredVjpView vernonCompilerGetPythonStructuredVjpView(const VernonPythonStructuredVjp *result) {
     if (!result)
-        return {VERNON_STATUS_INVALID_ARGUMENT, {}, {}, {}, 0, 0, 0, nullptr, 0};
+        return {
+            VERNON_STATUS_INVALID_ARGUMENT, {}, {}, {}, 0, 0, 0, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, {}};
     return {result->status,
             viewOf(result->diagnostics),
             viewOf(result->forwardModule),
@@ -327,7 +349,14 @@ VernonPythonStructuredVjpView vernonCompilerGetPythonStructuredVjpView(const Ver
             result->activeOperationCount,
             result->recomputationCost,
             result->derivativeRuleViews.data(),
-            result->derivativeRuleViews.size()};
+            result->derivativeRuleViews.size(),
+            result->requiredPrimalPathViews.data(),
+            result->requiredPrimalPathViews.size(),
+            result->sourceKindCountViews.data(),
+            result->sourceKindCountViews.size(),
+            result->costComponentViews.data(),
+            result->costComponentViews.size(),
+            viewOf(result->selectedPolicy)};
 }
 
 } // extern "C"

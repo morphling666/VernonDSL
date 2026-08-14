@@ -2,6 +2,7 @@
 
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffRules.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonGlobalIdIndexProof.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -114,6 +115,33 @@ FailureOr<SmallVector<StringRef>> getDtypes(ArrayAttr attribute) {
 }
 
 bool isDifferentiable(const ValueAbiLeaf &leaf) { return isDifferentiableAutodiffLeaf(leaf.scalarType, leaf.dtype); }
+
+AutodiffIndexProvenanceKind classifyIndexProvenanceImpl(Value value, func::FuncOp function, DenseSet<Value> &visiting) {
+    if (Operation *defining = value.getDefiningOp()) {
+        if (defining->hasTrait<OpTrait::ConstantLike>())
+            return AutodiffIndexProvenanceKind::Constant;
+        if (defining->getNumRegions() == 0 && classifyAutodiffEffect(defining) == AutodiffEffectKind::Pure &&
+            visiting.insert(value).second && llvm::all_of(defining->getOperands(), [&](Value operand) {
+                return classifyIndexProvenanceImpl(operand, function, visiting) != AutodiffIndexProvenanceKind::Dynamic;
+            })) {
+            visiting.erase(value);
+            return AutodiffIndexProvenanceKind::PureExpression;
+        }
+        visiting.erase(value);
+        return AutodiffIndexProvenanceKind::Dynamic;
+    }
+    auto argument = dyn_cast<BlockArgument>(value);
+    if (!argument || argument.getOwner() != &function.getBody().front())
+        return AutodiffIndexProvenanceKind::Dynamic;
+    if (function.getArgAttr(argument.getArgNumber(), kBuiltinAttrName))
+        return AutodiffIndexProvenanceKind::Builtin;
+    return AutodiffIndexProvenanceKind::PrimalArgument;
+}
+
+AutodiffIndexProvenanceKind classifyIndexProvenance(Value value, func::FuncOp function) {
+    DenseSet<Value> visiting;
+    return classifyIndexProvenanceImpl(value, function, visiting);
+}
 
 struct ValueNodes {
     Value value;
@@ -1313,6 +1341,31 @@ LogicalResult AutodiffAnalysisBuilder::collectOperations() {
         result.operations.push_back(AutodiffOperationActivity{operation, effect, operationActive});
         if (operationActive)
             result.activeOperationSet.insert(operation);
+        if (operationActive) {
+            if (auto load = dyn_cast<LoadOp>(operation)) {
+                const AutodiffStorageEffect *storageEffect = result.getStorageEffect(operation);
+                if (!storageEffect) {
+                    load.emitError("active Storage load has no exact-version effect metadata");
+                    status = failure();
+                    return WalkResult::interrupt();
+                }
+                AutodiffActiveLoad activeLoad;
+                activeLoad.operation = operation;
+                activeLoad.identity = storageEffect->identity;
+                activeLoad.versionBefore = storageEffect->versionBefore;
+                llvm::append_range(activeLoad.indices, load.getIndices());
+                for (Value index : load.getIndices())
+                    activeLoad.indexProvenance.push_back(classifyIndexProvenance(index, function));
+                FailureOr<unsigned> loadIndex = checkedUnsigned(result.activeLoads.size());
+                if (failed(loadIndex)) {
+                    load.emitError("active Storage load count exceeds the analysis representation");
+                    status = failure();
+                    return WalkResult::interrupt();
+                }
+                result.activeLoadIndices.try_emplace(operation, *loadIndex);
+                result.activeLoads.push_back(std::move(activeLoad));
+            }
+        }
         if (operationActive &&
             (effect == AutodiffEffectKind::Unsupported || effect == AutodiffEffectKind::ExternallyVisible)) {
             operation->emitError() << "autodiff analysis does not support active " << stringifyAutodiffEffect(effect)
@@ -1381,6 +1434,11 @@ const AutodiffStorageIdentity *VernonAutodiffAnalysisResult::getStorageIdentity(
 const AutodiffStorageEffect *VernonAutodiffAnalysisResult::getStorageEffect(Operation *operation) const {
     auto found = storageEffectIndices.find(operation);
     return found == storageEffectIndices.end() ? nullptr : &storageEffects[found->second];
+}
+
+const AutodiffActiveLoad *VernonAutodiffAnalysisResult::getActiveLoad(Operation *operation) const {
+    auto found = activeLoadIndices.find(operation);
+    return found == activeLoadIndices.end() ? nullptr : &activeLoads[found->second];
 }
 
 bool VernonAutodiffAnalysisResult::isActiveStorageVersion(unsigned version, unsigned abiLeafIndex) const {

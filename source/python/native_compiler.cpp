@@ -68,6 +68,10 @@ void bindNativeCompiler(nb::module_ &module) {
         .def_prop_ro("active_operation_count", &StructuredVjp::activeOperationCount)
         .def_prop_ro("recomputation_cost", &StructuredVjp::recomputationCost)
         .def_prop_ro("derivative_rules", &StructuredVjp::derivativeRules)
+        .def_prop_ro("required_primal_paths", &StructuredVjp::requiredPrimalPaths)
+        .def_prop_ro("source_kind_counts", &StructuredVjp::sourceKindCounts)
+        .def_prop_ro("cost_components", &StructuredVjp::costComponents)
+        .def_prop_ro("selected_policy", &StructuredVjp::selectedPolicy)
         .def("profiles", &StructuredVjp::profiles, nb::arg("identity"));
     module.def("_build_structured_vjp", &buildStructuredVjp, nb::arg("module"), nb::arg("entry"), nb::arg("wrt_paths"),
                nb::arg("output_paths"), nb::arg("forward_symbol"), nb::arg("backward_symbol"));

@@ -23,6 +23,18 @@ from examples.autodiff_smoke_mpc import SmokeFluidSimulation, v_target  # noqa: 
 
 DEFAULT_GRIDS = (32, 64, 128, 256)
 BENCHMARK_TAPE_CONTEXT_LIMIT = 256 * 1024 * 1024
+BASELINE_LOGICAL_BYTES_PER_ACTIVE_CELL = 469.8
+BASELINE_COMPILER_TAPE_HINTS = {
+    "advect": 208,
+    "initialize": 88,
+    "jacobi": 88,
+    "project": 88,
+    "transport": 160,
+}
+GRADIENT_PARITY_TEST = (
+    "python.tests.test_smoke_fluid_graph.SmokeFluidGraphTests."
+    "test_single_step_velocity_gradient_matches_finite_difference"
+)
 
 
 def _rss_bytes() -> int:
@@ -42,7 +54,25 @@ def _cotangents(grid: int) -> dict[str, Any]:
     }
 
 
-def _run_grid(grid: int) -> dict[str, int | float]:
+def _run_gradient_parity_gate() -> None:
+    environment = os.environ.copy()
+    python_path = os.pathsep.join((str(REPOSITORY_ROOT / "python"), str(REPOSITORY_ROOT)))
+    if environment.get("PYTHONPATH"):
+        python_path += os.pathsep + environment["PYTHONPATH"]
+    environment["PYTHONPATH"] = python_path
+    completed = subprocess.run(
+        (sys.executable, "-m", "unittest", GRADIENT_PARITY_TEST),
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(f"finite-difference gradient parity gate failed:\n{detail}")
+
+
+def _run_grid(grid: int) -> dict[str, Any]:
     vd.init(arch=vd.cpu)
     simulation = SmokeFluidSimulation(grid=grid, pressure_iterations=1, differentiable=True)
     target = v_target(grid)
@@ -64,6 +94,7 @@ def _run_grid(grid: int) -> dict[str, int | float]:
     peak_runtime_managed_bytes = pullback.peak_runtime_managed_bytes
     tape_context_limit_bytes = pullback.tape_context_limit_bytes
     recomputation_factor = pullback.recomputation_factor
+    pass_telemetry = pullback.pass_telemetry
     backward_started = time.perf_counter()
     pullback(_cotangents(grid))
     backward_seconds = time.perf_counter() - backward_started
@@ -81,6 +112,16 @@ def _run_grid(grid: int) -> dict[str, int | float]:
         or forward_seconds <= 0
         or backward_seconds <= 0
         or python_reverse_callback_count != 9
+        or sum(int(item["logical_residual_bytes"]) for item in pass_telemetry) != logical_bytes
+        or sum(int(item["resident_tape_bytes"]) for item in pass_telemetry) != resident_bytes
+        or sum(int(item["allocated_tape_bytes"]) for item in pass_telemetry) != allocated_bytes
+        or sum(int(item["checkpoint_bytes"]) for item in pass_telemetry) != checkpoint_bytes
+        or any(
+            item["residual_source_kind"].split("+")[:1] not in [["none"], ["static_capture"], ["dynamic_capture"]]
+            or any(source != "pure_rematerialization" for source in item["residual_source_kind"].split("+")[1:])
+            or item["control_history_kind"] not in {"none", "dynamic_capture"}
+            for item in pass_telemetry
+        )
     ):
         raise RuntimeError("smoke VJP reported inconsistent tape memory telemetry")
     return {
@@ -99,23 +140,30 @@ def _run_grid(grid: int) -> dict[str, int | float]:
         "recomputation_factor": recomputation_factor,
         "python_reverse_callback_count": python_reverse_callback_count,
         "tape_context_limit_bytes": tape_context_limit_bytes,
+        "logical_bytes_per_active_cell": logical_bytes / (grid * grid),
+        "pass_telemetry": pass_telemetry,
     }
 
 
-def _markdown(results: list[dict[str, int | float]]) -> str:
+def _markdown(results: list[dict[str, Any]]) -> str:
     lines = [
         "# Phase 2 smoke autodiff benchmark",
         "",
         "CPU, one warmed forward/backward smoke step per grid, pressure_iterations=1, "
         f"tape context limit={BENCHMARK_TAPE_CONTEXT_LIMIT} bytes.",
         "",
-        "| Grid | Logical residual | Resident | Allocated | Checkpoint | Peak managed | Resident/logical | RSS | "
+        f"Frozen baseline: {BASELINE_LOGICAL_BYTES_PER_ACTIVE_CELL:.1f} logical bytes per active cell; "
+        f"compiler Tape hints per lane={BASELINE_COMPILER_TAPE_HINTS}.",
+        "",
+        "| Grid | Logical residual | Logical/cell | Resident | Allocated | Checkpoint | Peak managed | "
+        "Resident/logical | RSS | "
         "RSS delta | Forward | Backward | Recompute | Python callbacks |",
-        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for result in results:
         lines.append(
-            "| {grid} | {logical_residual_bytes} | {resident_bytes} | {allocated_bytes} | "
+            "| {grid} | {logical_residual_bytes} | {logical_bytes_per_active_cell:.3f} | "
+            "{resident_bytes} | {allocated_bytes} | "
             "{native_checkpoint_bytes} | {peak_runtime_managed_bytes} | {resident_to_logical_ratio:.3f} | "
             "{rss_bytes} | {rss_delta_bytes} | {forward_seconds:.6f}s | {backward_seconds:.6f}s | "
             "{recomputation_factor:.3f} | {python_reverse_callback_count} |".format(**result)
@@ -145,14 +193,21 @@ def main() -> None:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--markdown", type=Path)
     parser.add_argument("--worker-grid", type=int)
+    parser.add_argument(
+        "--skip-gradient-parity",
+        action="store_true",
+        help="skip the finite-difference correctness gate (intended only for profiling iterations)",
+    )
     arguments = parser.parse_args()
     if arguments.worker_grid is not None:
         print(json.dumps(_run_grid(arguments.worker_grid), sort_keys=True))
         return
     if any(grid <= 0 for grid in arguments.grids):
         raise ValueError("grid sizes must be positive")
+    if not arguments.skip_gradient_parity:
+        _run_gradient_parity_gate()
 
-    results: list[dict[str, int | float]] = []
+    results: list[dict[str, Any]] = []
     for grid in arguments.grids:
         completed = subprocess.run(
             (sys.executable, str(Path(__file__).resolve()), "--worker-grid", str(grid)),
@@ -164,7 +219,15 @@ def main() -> None:
         result = json.loads(completed.stdout.strip().splitlines()[-1])
         results.append(result)
         print(json.dumps(result, sort_keys=True))
-    report = {"schema_version": 1, "results": results}
+    report = {
+        "schema_version": 2,
+        "baseline": {
+            "logical_bytes_per_active_cell": BASELINE_LOGICAL_BYTES_PER_ACTIVE_CELL,
+            "compiler_tape_hints_per_lane": BASELINE_COMPILER_TAPE_HINTS,
+            "gradient_parity_test": GRADIENT_PARITY_TEST,
+        },
+        "results": results,
+    }
     if arguments.output is not None:
         arguments.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     if arguments.markdown is not None:

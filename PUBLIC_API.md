@@ -13,7 +13,7 @@ VernonDSL 0.1.2 treats the following installed interfaces as public:
 - the standalone CMake project bundled under `vernon_dsl/runtime_src` and its
   documented Runtime targets;
 - canonical `*.pipeline.json` manifests and artifacts accepted by compiler
-  contract 11 and pipeline contract 15.
+  contract 12 and pipeline contract 16.
 
 The wheel does not install a prebuilt `lib/cmake/VernonRuntime` package into the
 environment. Embedders locate `vernon_dsl/runtime_src` and configure that

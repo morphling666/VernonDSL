@@ -7,7 +7,7 @@
 // CHECK: name = "texture_load"
 // CHECK: name = "texture_store"
 
-module attributes {vernon.compiler_contract_version = 11 : i64, vernon.pipeline_version = 15 : i64} {
+module attributes {vernon.compiler_contract_version = 12 : i64, vernon.pipeline_version = 16 : i64} {
   func.func @storage_main(
       %image: !vernon.texture<"3d", f32, "rgba32_float", "read_write"> {
         vernon.interface = "resource",

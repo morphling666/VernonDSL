@@ -90,6 +90,10 @@ class AutodiffProfilePlan:
     launch: LaunchPlan
     profiles: tuple[AutodiffProfile, ...]
     derivative_groups: tuple[DerivativeGroup, ...] = ()
+    required_primal_paths: tuple[str, ...] = ()
+    source_kind_counts: tuple[tuple[str, int], ...] = ()
+    cost_components: tuple[tuple[str, int], ...] = ()
+    selected_policy: str = "min_memory"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -99,6 +103,10 @@ class AutodiffProfilePlan:
             "derivative_rules_version": self.derivative_rules_version,
             "launch": self.launch.to_dict(),
             "profiles": [profile.to_dict() for profile in self.profiles],
+            "required_primal_paths": list(self.required_primal_paths),
+            "source_kind_counts": dict(self.source_kind_counts),
+            "cost_components": dict(self.cost_components),
+            "selected_policy": self.selected_policy,
         }
 
     @property
@@ -326,6 +334,10 @@ def build_structured_profile_plan(
     primal_mlir: str,
     tape_bytes: int,
     derivative_rules: tuple[str, ...],
+    required_primal_paths: tuple[str, ...],
+    source_kind_counts: tuple[tuple[str, int], ...],
+    cost_components: tuple[tuple[str, int], ...],
+    selected_policy: str,
     workgroup_size: tuple[int, int, int],
 ) -> AutodiffProfilePlan:
     """Build profile metadata without constructing the legacy AD program graph."""
@@ -419,6 +431,10 @@ def build_structured_profile_plan(
         for parameter in entry.parameters
         if parameter.builtin is None
     )
+    backward_primals = tuple(
+        AutodiffBinding(path, _resolve_path(path.removeprefix("primal."), parameters, structs).mlir, "primal")
+        for path in required_primal_paths
+    )
     shape_sources = tuple(
         AutodiffBinding(
             f"shape.{parameter.name}",
@@ -449,13 +465,14 @@ def build_structured_profile_plan(
             "forward_with_tape",
             profile_symbols[1],
             primal_inputs,
-            (AutodiffBinding("tape", f"!vernon.ad_tape<{tape_bytes}>", "tape"),),
+            () if tape_bytes == 0 else (AutodiffBinding("tape", f"!vernon.ad_tape<{tape_bytes}>", "tape"),),
         ),
         AutodiffProfile(
             "backward",
             profile_symbols[2],
             (
-                AutodiffBinding("tape", f"!vernon.ad_tape<{tape_bytes}>", "tape"),
+                *((AutodiffBinding("tape", f"!vernon.ad_tape<{tape_bytes}>", "tape"),) if tape_bytes else ()),
+                *backward_primals,
                 *shape_sources,
                 *cotangents,
                 *storage_gradients,
@@ -474,6 +491,10 @@ def build_structured_profile_plan(
         ),
         profiles,
         derivative_groups,
+        required_primal_paths,
+        source_kind_counts,
+        cost_components,
+        selected_policy,
     )
 
 

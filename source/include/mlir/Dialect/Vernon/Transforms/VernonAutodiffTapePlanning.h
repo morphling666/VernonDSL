@@ -4,6 +4,7 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffRules.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Support/LLVM.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 
 #include <array>
 #include <cstdint>
@@ -137,6 +138,58 @@ struct AdRematerializationRecipe {
     uint64_t estimatedCost{};
 };
 
+enum class AdResidualSourceKind {
+    Builtin,
+    PrimalArgument,
+    ExactVersionReload,
+    PureRematerialization,
+    StaticCapture,
+    DynamicCapture,
+    Unsupported,
+};
+StringRef stringifyAdResidualSourceKind(AdResidualSourceKind kind);
+
+enum class AdControlSourceKind {
+    None,
+    Predicate,
+    ExecutedCount,
+    ExitKind,
+};
+
+struct AdResidualSourceKey {
+    Value value;
+    unsigned abiLeafIndex{};
+    Operation *controlOperation{};
+    AdControlSourceKind controlKind{AdControlSourceKind::None};
+};
+
+struct AdResidualSource {
+    AdResidualSourceKey key;
+    AdResidualSourceKind kind{AdResidualSourceKind::Unsupported};
+    bool legal{};
+    bool availableInCurrentContract{};
+    std::optional<unsigned> storageIdentity;
+    std::optional<unsigned> versionBefore;
+    uint64_t captureStoreBytes{};
+    uint64_t backwardLoadBytes{};
+    uint64_t resourceReloadCost{};
+    uint64_t recomputationCost{};
+    bool deterministicReductionLegal{true};
+    SmallVector<Operation *> recipe;
+};
+
+struct AdResidualSourceSelection {
+    AdResidualSourceKey key;
+    SmallVector<AdResidualSource> candidates;
+    unsigned selectedCandidate{};
+};
+
+/// Shared legality definition used by planning and reverse emission.
+FailureOr<AdRematerializationRecipe> buildAutodiffRematerializationRecipe(Value value, func::FuncOp function);
+FailureOr<AdRematerializationRecipe>
+buildAutodiffRematerializationRecipe(Value value, func::FuncOp function,
+                                     llvm::function_ref<bool(Value)> isAvailableRoot);
+
 struct AdPhysicalBuffer {
     AdMemoryDomain domain{AdMemoryDomain::PersistentResidual};
     uint64_t offset{};
@@ -170,6 +223,16 @@ struct AdBudgetedBufferAssignment {
     uint64_t recomputationCost{};
 };
 
+struct AdPlanCostComponents {
+    uint64_t captureStoreBytes{};
+    uint64_t backwardLoadBytes{};
+    uint64_t resourceReloadCost{};
+    uint64_t recomputationCost{};
+    uint64_t checkpointCopyBytes{};
+    uint64_t graphReplayCost{};
+    uint64_t retainedTapeBytes{};
+};
+
 FailureOr<AdBudgetedBufferAssignment>
 assignAdMemoryBuffersWithinBudget(ArrayRef<AdResidualInterval> residuals,
                                   ArrayRef<AdRematerializationCandidate> candidates, uint64_t budgetBytes);
@@ -178,8 +241,12 @@ class AdMemoryPlan {
 public:
     ArrayRef<AdResidualInterval> getResiduals() const { return residuals; }
     ArrayRef<AdRematerializationRecipe> getRematerializations() const { return rematerializations; }
+    ArrayRef<AdResidualSourceSelection> getSourceSelections() const { return sourceSelections; }
     const AdBufferAssignment &getBufferAssignment() const { return bufferAssignment; }
     uint64_t getEstimatedPersistentBytes() const { return estimatedPersistentBytes; }
+    uint64_t getMemoryBudgetBytes() const { return memoryBudgetBytes; }
+    const AdPlanCostComponents &getCostComponents() const { return costComponents; }
+    StringRef getSelectedPolicy() const { return selectedPolicy; }
 
 private:
     friend FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp, const VernonAutodiffAnalysisResult &,
@@ -187,8 +254,12 @@ private:
 
     SmallVector<AdResidualInterval> residuals;
     SmallVector<AdRematerializationRecipe> rematerializations;
+    SmallVector<AdResidualSourceSelection> sourceSelections;
     AdBufferAssignment bufferAssignment;
+    AdPlanCostComponents costComponents;
+    std::string selectedPolicy{"min_memory"};
     uint64_t estimatedPersistentBytes{};
+    uint64_t memoryBudgetBytes{};
 };
 
 class VernonAutodiffTapePlan {

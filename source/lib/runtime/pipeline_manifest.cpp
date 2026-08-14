@@ -1573,13 +1573,85 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
     std::vector<std::string> gradientPaths;
     std::vector<std::string> cotangentPaths;
     for (const nlohmann::json &value : autodiff["variants"]) {
-        if (!value.is_object() || !hasOnlyKeys(value, {"key", "workgroup_size", "profiles"}) ||
+        if (!value.is_object() ||
+            !hasOnlyKeys(value, {"key", "workgroup_size", "residual_storage", "static_tape_bytes_hint",
+                                 "required_primal_paths", "source_kind_counts", "cost_components", "selected_policy",
+                                 "profiles"}) ||
             !value.contains("key") || !value["key"].is_array() || !value.contains("workgroup_size") ||
-            !value.contains("profiles") || !value["profiles"].is_object()) {
+            !value.contains("residual_storage") || !value["residual_storage"].is_string() ||
+            !value.contains("static_tape_bytes_hint") || !value.contains("required_primal_paths") ||
+            !value["required_primal_paths"].is_array() || !value.contains("source_kind_counts") ||
+            !value["source_kind_counts"].is_object() || !value.contains("cost_components") ||
+            !value["cost_components"].is_object() || !value.contains("selected_policy") ||
+            !value["selected_policy"].is_string() || !value.contains("profiles") || !value["profiles"].is_object()) {
             error = "autodiff variant is invalid";
             return false;
         }
         AutodiffVariant variant;
+        variant.residualStorage = value["residual_storage"].get<std::string>();
+        if (variant.residualStorage != "none" && variant.residualStorage != "static" &&
+            variant.residualStorage != "dynamic") {
+            error = "autodiff residual storage kind is invalid";
+            return false;
+        }
+        if (!parseUint64(value["static_tape_bytes_hint"], variant.staticTapeBytesHint)) {
+            error = "autodiff static Tape hint is invalid";
+            return false;
+        }
+        for (const nlohmann::json &path : value["required_primal_paths"]) {
+            if (!path.is_string() || path.get_ref<const std::string &>().rfind("primal.", 0) != 0 ||
+                !isCanonicalAutodiffPath(path.get_ref<const std::string &>())) {
+                error = "autodiff required primal paths are invalid";
+                return false;
+            }
+            variant.requiredPrimalPaths.push_back(path.get<std::string>());
+        }
+        if (!std::is_sorted(variant.requiredPrimalPaths.begin(), variant.requiredPrimalPaths.end()) ||
+            std::adjacent_find(variant.requiredPrimalPaths.begin(), variant.requiredPrimalPaths.end()) !=
+                variant.requiredPrimalPaths.end()) {
+            error = "autodiff required primal paths are not canonical";
+            return false;
+        }
+        auto parseMetrics = [&](const nlohmann::json &metrics, std::map<std::string, uint64_t> &result) {
+            for (auto row = metrics.begin(); row != metrics.end(); ++row) {
+                uint64_t metric{};
+                if (row.key().empty() || !parseUint64(row.value(), metric))
+                    return false;
+                result.emplace(row.key(), metric);
+            }
+            return true;
+        };
+        if (!parseMetrics(value["source_kind_counts"], variant.sourceKindCounts) ||
+            !parseMetrics(value["cost_components"], variant.costComponents)) {
+            error = "autodiff planning metrics are invalid";
+            return false;
+        }
+        static constexpr std::string_view sourceKinds[] = {
+            "builtin",        "primal_argument", "exact_version_reload", "pure_rematerialization",
+            "static_capture", "dynamic_capture", "unsupported",
+        };
+        for (const auto &[name, unused] : variant.sourceKindCounts) {
+            (void)unused;
+            if (std::find(std::begin(sourceKinds), std::end(sourceKinds), name) == std::end(sourceKinds)) {
+                error = "autodiff source-kind telemetry is invalid";
+                return false;
+            }
+        }
+        static constexpr std::string_view costNames[] = {
+            "backward_load_bytes", "capture_store_bytes",  "checkpoint_copy_bytes", "graph_replay_cost",
+            "recomputation_cost",  "resource_reload_cost", "retained_tape_bytes",
+        };
+        if (variant.costComponents.size() != std::size(costNames))
+            return error = "autodiff cost telemetry is incomplete", false;
+        for (std::string_view name : costNames)
+            if (variant.costComponents.find(std::string(name)) == variant.costComponents.end())
+                return error = "autodiff cost telemetry is incomplete", false;
+        variant.selectedPolicy = value["selected_policy"].get<std::string>();
+        if (variant.selectedPolicy != "min_memory" && variant.selectedPolicy != "balanced" &&
+            variant.selectedPolicy != "min_runtime") {
+            error = "autodiff selected policy is invalid";
+            return false;
+        }
         for (const nlohmann::json &feature : value["key"]) {
             if (!feature.is_string() || feature.get_ref<const std::string &>().empty()) {
                 error = "autodiff variant feature key is invalid";
@@ -1603,6 +1675,7 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
         }
         std::vector<std::string> variantGradientPaths;
         std::vector<std::string> variantCotangentPaths;
+        std::vector<std::string> variantPrimalPaths;
         const char *names[] = {"primal", "forward_with_tape", "backward"};
         std::string *stageIds[] = {&variant.primal, &variant.forwardWithTape, &variant.backward};
         std::string forwardTapeType;
@@ -1641,23 +1714,40 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
                 continue;
             }
             if (index == 1) {
-                if (!allHaveRole(inputs, "primal") || outputs.empty() || outputs.back().value("role", "") != "tape" ||
-                    outputs.back().value("path", "") != "tape" ||
-                    !std::all_of(outputs.begin(), std::prev(outputs.end()),
-                                 [](const nlohmann::json &binding) { return binding.value("role", "") == "primal"; })) {
+                const bool noTape = variant.residualStorage == "none";
+                if (!allHaveRole(inputs, "primal") || (noTape && !outputs.empty()) ||
+                    (!noTape &&
+                     (outputs.empty() || outputs.back().value("role", "") != "tape" ||
+                      outputs.back().value("path", "") != "tape" ||
+                      !std::all_of(outputs.begin(), std::prev(outputs.end()), [](const nlohmann::json &binding) {
+                          return binding.value("role", "") == "primal";
+                      })))) {
                     error = "autodiff forward bindings are invalid";
                     return false;
                 }
-                forwardTapeType = outputs.back().value("type", "");
+                if (!noTape)
+                    forwardTapeType = outputs.back().value("type", "");
                 continue;
             }
-            if (inputs.empty() || inputs[0].value("role", "") != "tape" || inputs[0].value("path", "") != "tape" ||
-                inputs[0].value("type", "") != forwardTapeType) {
+            size_t firstNonTape = 0;
+            if (variant.residualStorage != "none") {
+                if (inputs.empty() || inputs[0].value("role", "") != "tape" || inputs[0].value("path", "") != "tape" ||
+                    inputs[0].value("type", "") != forwardTapeType) {
+                    error = "autodiff backward tape binding is invalid";
+                    return false;
+                }
+                firstNonTape = 1;
+            } else if ((!forwardTapeType.empty() || variant.staticTapeBytesHint != 0) ||
+                       (!inputs.empty() && inputs[0].value("role", "") == "tape")) {
                 error = "autodiff backward tape binding is invalid";
                 return false;
             }
-            for (size_t binding = 1; binding < inputs.size(); ++binding) {
+            for (size_t binding = firstNonTape; binding < inputs.size(); ++binding) {
                 const std::string role = inputs[binding].value("role", "");
+                if (role == "primal") {
+                    variantPrimalPaths.push_back(inputs[binding].value("path", ""));
+                    continue;
+                }
                 if (role == "shape_source")
                     continue;
                 if (role == "gradient") {
@@ -1677,6 +1767,10 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
                 }
                 variantGradientPaths.push_back(binding.value("path", ""));
             }
+        }
+        if (variantPrimalPaths != variant.requiredPrimalPaths) {
+            error = "autodiff required primal bindings disagree with planning metadata";
+            return false;
         }
         if (variantGradientPaths.empty() || variantCotangentPaths.empty() ||
             std::set<std::string>(variantGradientPaths.begin(), variantGradientPaths.end()).size() !=
@@ -1698,8 +1792,13 @@ bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifes
             error = "autodiff variants expose inconsistent cotangent paths";
             return false;
         }
-        if (std::optional<uint64_t> hint = autodiffTapeBytesHint(forwardTapeType))
-            variant.staticTapeBytesHint = *hint;
+        if (variant.residualStorage != "none") {
+            std::optional<uint64_t> reflectedHint = autodiffTapeBytesHint(forwardTapeType);
+            if (!reflectedHint || *reflectedHint != variant.staticTapeBytesHint) {
+                error = "autodiff static Tape hint disagrees with profile bindings";
+                return false;
+            }
+        }
         manifest.variants.push_back(std::move(variant));
     }
     if (manifest.variants.empty()) {

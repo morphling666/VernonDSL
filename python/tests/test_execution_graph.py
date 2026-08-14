@@ -522,8 +522,13 @@ class CpuExecutionGraphTests(unittest.TestCase):
             if not applying_inner:
                 applying_inner = True
                 try:
-                    inner_pullback(None)
-                    self.assertEqual(inner_pullback.reverse_python_callback_count, 5)
+                    inner_pullback(
+                        {
+                            "square": np.ones((1,), dtype=np.float32),
+                            "cube": np.ones((1,), dtype=np.float32),
+                        }
+                    )
+                    self.assertEqual(inner_pullback.reverse_python_callback_count, 3)
                 finally:
                     applying_inner = False
             return add_gradients(left, right)
@@ -537,7 +542,7 @@ class CpuExecutionGraphTests(unittest.TestCase):
             )
 
         self.assertEqual(outer_pullback.reverse_python_callback_count, 3)
-        self.assertEqual(inner_pullback.reverse_python_callback_count, 5)
+        self.assertEqual(inner_pullback.reverse_python_callback_count, 3)
 
     def test_graph_vjp_preserves_accumulation_exception(self) -> None:
         source = vd.storage.from_numpy(np.array([2.0], dtype=np.float32))

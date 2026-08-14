@@ -1090,6 +1090,15 @@ TEST(CompilerCApi, RejectsMissingOrUnsupportedContractVersions) {
     EXPECT_TRUE(view_contains(vernonCompileResultGetDiagnostics(result), "requires vernon.pipeline_version"));
     vernonCompileResultDestroy(result);
 
+    const char previous[] = "module attributes {vernon.compiler_contract_version = 11 : i64, "
+                            "vernon.pipeline_version = 15 : i64} { func.func @empty() { return } }";
+    result = vernonCompilerValidateMlir(context, previous, strlen(previous));
+    ASSERT_TRUE(result);
+    EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_VERIFICATION_ERROR);
+    EXPECT_TRUE(view_contains(vernonCompileResultGetDiagnostics(result), "requires vernon.compiler_contract_version"));
+    EXPECT_TRUE(view_contains(vernonCompileResultGetDiagnostics(result), "requires vernon.pipeline_version"));
+    vernonCompileResultDestroy(result);
+
     const char obsoleteAbi[] =
         "module attributes {" VERNON_MLIR_VERSION_ATTRIBUTES "} { "
         "\"vernon.struct\"() {sym_name = \"Old\", fields = [\"value:i32\"], abi_size = 4 : i64} : () -> () "

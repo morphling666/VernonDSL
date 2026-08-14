@@ -26,8 +26,12 @@ class StructuredVjpBuild:
     profiles: Mapping[str, str]
     protocols: Mapping[str, str]
     uses_dynamic_tape: bool
+    residual_storage_kind: str
     active_operation_count: int
     recomputation_cost: int
+    source_kind_counts: Mapping[str, int]
+    cost_components: Mapping[str, int]
+    selected_policy: str
 
 
 def _validate_nonoverlapping_paths(paths: tuple[str, ...], role: str) -> None:
@@ -161,9 +165,21 @@ def build_structured_vjp(
         frontend.mlir,
         int(transformed.tape_bytes),
         tuple(str(rule) for rule in transformed.derivative_rules),
+        tuple(str(path) for path in transformed.required_primal_paths),
+        tuple(sorted((str(kind), int(count)) for kind, count in transformed.source_kind_counts.items())),
+        tuple(sorted((str(kind), int(cost)) for kind, cost in transformed.cost_components.items())),
+        str(transformed.selected_policy),
         frontend.entry_workgroup_size or (1, 1, 1),
     )
     profiles = MappingProxyType(dict(transformed.profiles(plan.identity)))
+    storage_kinds = {
+        kind
+        for kind in ("none", "static", "dynamic")
+        if all(f'vernon.ad.residual_storage = "{kind}"' in module for module in profiles.values())
+    }
+    if len(storage_kinds) != 1:
+        raise RuntimeError("structured VJP profiles disagree on residual storage classification")
+    residual_storage_kind = storage_kinds.pop()
     return StructuredVjpBuild(
         resolved,
         entry,
@@ -171,8 +187,12 @@ def build_structured_vjp(
         profiles,
         MappingProxyType({"forward_with_tape": "dynamic_v2", "backward": "dynamic_v2"}),
         any("!vernon.ad_tape" in module for module in profiles.values()),
+        residual_storage_kind,
         int(transformed.active_operation_count),
         int(transformed.recomputation_cost),
+        MappingProxyType({str(kind): int(count) for kind, count in transformed.source_kind_counts.items()}),
+        MappingProxyType({str(kind): int(cost) for kind, cost in transformed.cost_components.items()}),
+        str(transformed.selected_policy),
     )
 
 
